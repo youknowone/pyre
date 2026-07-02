@@ -2405,13 +2405,17 @@ pub(crate) unsafe fn byte_w(value: PyObjectRef, noun: &str) -> Result<u8, PyErro
             match i64::try_from(w_long_get_value(indexed)) {
                 Ok(v) => v,
                 Err(_) => {
-                    return Err(PyError::value_error(format!("{noun} must be in range(0, 256)")));
+                    return Err(PyError::value_error(format!(
+                        "{noun} must be in range(0, 256)"
+                    )));
                 }
             }
         }
     };
     if !(0..=255).contains(&v) {
-        return Err(PyError::value_error(format!("{noun} must be in range(0, 256)")));
+        return Err(PyError::value_error(format!(
+            "{noun} must be in range(0, 256)"
+        )));
     }
     Ok(v as u8)
 }
@@ -2473,13 +2477,20 @@ unsafe fn setitem_bytearray_slice(
     index: PyObjectRef,
     value: PyObjectRef,
 ) -> PyResult {
-    // `descr_setitem` materializes the source (`makebytesdata_w`) *before*
-    // unpacking the slice: `__iter__`/`__next__` may mutate the bytearray, so
-    // the slice bounds must be read from the post-materialization length.
-    // (`x[:] = x` stays safe — the source is copied into `sequence2`.)
+    // `descr_setitem`: materialize the source (`makebytesdata_w`) first, then
+    // `_unpack_slice` — evaluate the slice's `__index__` before reading the
+    // length, since both the source's `__iter__`/`__next__` and the slice
+    // components' `__index__` may mutate the bytearray, and the bounds must be
+    // clamped against the post-mutation length. (`x[:] = x` stays safe — the
+    // source is copied into `sequence2`.)
     let sequence2 = bytearray_assign_source(value)?;
+    let (rs, rp, st) = crate::sliceobject::slice_unpack(
+        w_slice_get_start(index),
+        w_slice_get_stop(index),
+        w_slice_get_step(index),
+    )?;
     let len = pyre_object::bytearrayobject::w_bytearray_len(obj) as i64;
-    let (start, stop, step) = normalize_slice(index, len)?;
+    let (start, stop, step, _) = crate::sliceobject::slice_adjust_indices(rs, rp, st, len);
     let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(obj);
     if step == 1 {
         let cur = vec.len();
@@ -11504,13 +11515,20 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
         }
         // `bytearrayobject.py` ass_subscript with a NULL value deletes like a
         // list: a single index removes one byte, a slice removes its selected
-        // bytes (contiguous via drain, extended-step descending).  Slice bounds
-        // are computed before the mutable borrow since `normalize_slice` may
-        // run `__index__` that re-enters.
+        // bytes (contiguous via drain, extended-step descending).  `descr_delitem`
+        // runs `_unpack_slice` — the slice's `__index__` is evaluated before the
+        // length is read, so a mutation during index evaluation is reflected in
+        // the bounds.
         if pyre_object::bytearrayobject::is_bytearray(obj) {
             if is_slice(index) {
+                let (rs, rp, st) = crate::sliceobject::slice_unpack(
+                    w_slice_get_start(index),
+                    w_slice_get_stop(index),
+                    w_slice_get_step(index),
+                )?;
                 let len = pyre_object::bytearrayobject::w_bytearray_len(obj) as i64;
-                let (start, stop, step) = normalize_slice(index, len)?;
+                let (start, stop, step, _) =
+                    crate::sliceobject::slice_adjust_indices(rs, rp, st, len);
                 let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(obj);
                 if step == 1 {
                     let s = start.max(0) as usize;

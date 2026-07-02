@@ -60,16 +60,17 @@ pub fn unwrap_start_stop(
     Ok((start, end))
 }
 
-/// sliceobject.py:170 `W_SliceObject.indices3(space, length)`.
+/// sliceobject.py:130 `W_SliceObject.unpack(space)`.
 ///
-/// Computes the `(start, stop, step)` triple for a slice over a sequence
-/// of `length` items, clipping out-of-bounds endpoints consistently with
-/// extended-slice handling. A zero `step` raises `ValueError`.
-pub fn indices3(
+/// Evaluates `start`/`stop`/`step` through `__index__` **without** reading
+/// the container length: an `__index__` method may mutate the container, so
+/// the length must be consulted only afterwards (`_unpack_slice`). `None`
+/// endpoints map to the open-ended sentinels that [`slice_adjust_indices`]
+/// then clamps. A zero `step` raises `ValueError`.
+pub(crate) fn slice_unpack(
     w_start: PyObjectRef,
     w_stop: PyObjectRef,
     w_step: PyObjectRef,
-    length: i64,
 ) -> Result<(i64, i64, i64), crate::PyError> {
     let step = if unsafe { is_none(w_step) } {
         1
@@ -83,36 +84,69 @@ pub fn indices3(
         }
         step
     };
-
     let start = if unsafe { is_none(w_start) } {
-        if step < 0 { length - 1 } else { 0 }
+        if step < 0 { i64::MAX } else { 0 }
     } else {
-        let mut start = eval_slice_index(w_start)?;
-        if start < 0 {
-            start += length;
-            if start < 0 {
-                start = if step < 0 { -1 } else { 0 };
-            }
-        } else if start >= length {
-            start = if step < 0 { length - 1 } else { length };
-        }
-        start
+        eval_slice_index(w_start)?
     };
-
     let stop = if unsafe { is_none(w_stop) } {
-        if step < 0 { -1 } else { length }
+        if step < 0 { i64::MIN } else { i64::MAX }
     } else {
-        let mut stop = eval_slice_index(w_stop)?;
-        if stop < 0 {
-            stop += length;
-            if stop < 0 {
-                stop = if step < 0 { -1 } else { 0 };
-            }
-        } else if stop >= length {
-            stop = if step < 0 { length - 1 } else { length };
-        }
-        stop
+        eval_slice_index(w_stop)?
     };
+    Ok((start, stop, step))
+}
 
+/// sliceobject.py:139 `W_SliceObject.adjust_indices(start, stop, step, length)`.
+///
+/// Pure arithmetic: clamps the unpacked `(start, stop, step)` against
+/// `length`, clipping out-of-bounds endpoints consistently with
+/// extended-slice handling, and returns the triple plus the resulting
+/// `slicelength`.
+pub(crate) fn slice_adjust_indices(
+    mut start: i64,
+    mut stop: i64,
+    step: i64,
+    length: i64,
+) -> (i64, i64, i64, i64) {
+    if start < 0 {
+        start += length;
+        if start < 0 {
+            start = if step < 0 { -1 } else { 0 };
+        }
+    } else if start >= length {
+        start = if step < 0 { length - 1 } else { length };
+    }
+    if stop < 0 {
+        stop += length;
+        if stop < 0 {
+            stop = if step < 0 { -1 } else { 0 };
+        }
+    } else if stop >= length {
+        stop = if step < 0 { length - 1 } else { length };
+    }
+    let slicelength = if (step < 0 && stop >= start) || (step > 0 && start >= stop) {
+        0
+    } else if step < 0 {
+        (stop - start + 1) / step + 1
+    } else {
+        (stop - start - 1) / step + 1
+    };
+    (start, stop, step, slicelength)
+}
+
+/// sliceobject.py:170 `W_SliceObject.indices3(space, length)`.
+///
+/// Computes the `(start, stop, step)` triple for a slice over a sequence
+/// of `length` items — [`slice_unpack`] then [`slice_adjust_indices`]. A
+/// zero `step` raises `ValueError`.
+pub fn indices3(
+    w_start: PyObjectRef,
+    w_stop: PyObjectRef,
+    w_step: PyObjectRef,
+    length: i64,
+) -> Result<(i64, i64, i64), crate::PyError> {
+    let (start, stop, step) = slice_unpack(w_start, w_stop, w_step)?;
+    let (start, stop, step, _) = slice_adjust_indices(start, stop, step, length);
     Ok((start, stop, step))
 }
