@@ -1792,16 +1792,20 @@ impl VectorizingOptimizer {
     /// This ensures guards fail "early" and relax dependencies, which is
     /// a prerequisite for vectorization.
     ///
-    /// TODO: The full RPython implementation requires:
-    /// - DependencyGraph.imaginary_node() — synthetic graph nodes
-    /// - Node.iterate_paths() — path enumeration with blacklist
-    /// - Path.is_always_pure() — purity analysis along paths
-    /// - Node.remove_edge_to() / edge_to() — graph mutation
-    /// These dependency.rs primitives are not yet ported. Until they are,
-    /// return None unconditionally — the earlier "zero-dep guard" heuristic
+    /// TODO: The full RPython implementation requires these dependency.rs
+    /// primitives:
+    /// - DependencyGraph.imaginary_node() — synthetic graph nodes (ported:
+    ///   `add_imaginary_node`)
+    /// - Node.iterate_paths() — path enumeration with blacklist (ported:
+    ///   `DependencyGraph::iterate_paths`)
+    /// - Path.is_always_pure() — purity analysis along paths (ported)
+    /// - Node.remove_edge_to() / edge_to() — graph mutation (NOT yet ported)
+    /// The graph-mutation half (`edge_to`/`remove_edge_to`) is still missing,
+    /// so return None unconditionally — the earlier "zero-dep guard" heuristic
     /// did not actually rewire the graph the way RPython does, and feeding
     /// the unmodified graph back to the caller as a reschedule basis was a
-    /// silent divergence. mark_guard is similarly stubbed.
+    /// silent divergence. mark_guard is similarly stubbed (failargs blocked
+    /// on #175).
     fn analyse_index_calculations(
         &self,
         _loop_: &VectorLoop,

@@ -353,6 +353,19 @@ impl Node {
         self.adjacent_list_back.len()
     }
 
+    /// dependency.py:246-247 `provides` — forward dependency edges
+    /// (this node → target). Each edge's `target_node()` is the successor.
+    pub fn provides(&self) -> &[Dependency] {
+        &self.adjacent_list
+    }
+
+    /// dependency.py:252-253 `depends` — backward dependency edges. These are
+    /// the reversed back-edges built by `add_edge`, so each edge's
+    /// `target_node()` is the predecessor.
+    pub fn depends(&self) -> &[Dependency] {
+        &self.adjacent_list_back
+    }
+
     /// dependency.py:268: is_after
     pub fn is_after(&self, other_idx: usize) -> bool {
         self.idx > other_idx
@@ -433,6 +446,74 @@ impl DependencyGraph {
         let index = self.nodes.len();
         self.nodes.push(Node::new_imaginary(label));
         index
+    }
+
+    /// dependency.py:303-352 `Node.iterate_paths(to, backwards, path_max_len,
+    /// blacklist)`. Enumerates every path from `from_idx` toward `to`
+    /// (`None` = all maximal paths). Upstream is a generator on `Node`; the
+    /// Rust graph is index-addressed, so this lives on `DependencyGraph` (it
+    /// resolves each edge's target through `self.nodes`) and collects the
+    /// yielded paths into a `Vec`. `backwards` walks `depends()` rather than
+    /// `provides()`; `blacklist` records visited nodes so a path property
+    /// need only be checked once per already-visited subtree.
+    pub fn iterate_paths(
+        &self,
+        from_idx: usize,
+        to: Option<usize>,
+        backwards: bool,
+        path_max_len: i64,
+        blacklist: bool,
+    ) -> Vec<Path> {
+        let mut paths = Vec::new();
+        if Some(from_idx) == to {
+            return paths;
+        }
+        let mut blacklist_visit: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut path = Path::new(vec![from_idx]);
+        // (edge index into the node's iter-direction list, node index, pathlen)
+        let mut worklist: Vec<(usize, usize, i64)> = vec![(0, from_idx, 1)];
+        while let Some((mut index, node_idx, mut pathlen)) = worklist.pop() {
+            let iterdir = if backwards {
+                self.nodes[node_idx].depends()
+            } else {
+                self.nodes[node_idx].provides()
+            };
+            let iterdir_len = iterdir.len();
+            if index >= iterdir_len {
+                // dependency.py:322-324: a leaf reached on its first visit is a
+                // maximal path when no explicit destination was requested.
+                if to.is_none() && index == 0 {
+                    paths.push(path.clone_path());
+                }
+                if blacklist {
+                    blacklist_visit.insert(node_idx);
+                }
+                continue;
+            }
+            let next_node = iterdir[index].target_node();
+            index += 1;
+            // dependency.py:330-334: keep exploring this node's remaining edges,
+            // else mark it fully visited.
+            if index < iterdir_len {
+                worklist.push((index, node_idx, pathlen));
+            } else {
+                blacklist_visit.insert(node_idx);
+            }
+            path.cut_off_at(pathlen as usize);
+            path.walk_node(next_node);
+            // dependency.py:336-339: a blacklisted successor closes the path.
+            if blacklist && blacklist_visit.contains(&next_node) {
+                paths.push(path.clone_path());
+                continue;
+            }
+            pathlen += 1;
+            if Some(next_node) == to || (path_max_len > 0 && pathlen >= path_max_len) {
+                paths.push(path.clone_path());
+            } else {
+                worklist.push((0, next_node, pathlen));
+            }
+        }
+        paths
     }
 
     /// dependency.py:596-644: build_dependencies — construct def-use chains
@@ -1296,6 +1377,23 @@ impl Dependency {
     pub fn because_of(&self, var: OpRef) -> bool {
         self.args.iter().any(|(_, a)| *a == var)
     }
+
+    /// dependency.py:429-430 `target_node` — the `to` endpoint index. For a
+    /// forward (`provides`) edge this is the successor; for a reversed
+    /// `depends` back-edge it is the predecessor.
+    pub fn target_node(&self) -> usize {
+        self.to_idx
+    }
+
+    /// dependency.py:432-433 `origin_node` — the `at` endpoint index.
+    pub fn origin_node(&self) -> usize {
+        self.at_idx
+    }
+
+    /// dependency.py:460-461 `is_failarg`.
+    pub fn is_failarg(&self) -> bool {
+        self.failarg
+    }
 }
 
 // ── dependency.py:473-535: DefTracker ─────────────────────────
@@ -1602,5 +1700,67 @@ mod tests {
         assert_eq!(nodes[0].priority, 7);
         assert_eq!(nodes[1].priority, 7);
         assert!(!nodes[0].is_imaginary());
+    }
+
+    fn imaginary_graph(n: usize) -> DependencyGraph {
+        DependencyGraph {
+            nodes: (0..n).map(|_| Node::new_imaginary("t")).collect(),
+            memory_refs: majit_ir::VecMap::new(),
+            index_vars: majit_ir::VecMap::new(),
+            guards: Vec::new(),
+            invariant_vars: majit_ir::VecMap::new(),
+        }
+    }
+
+    /// Mirror `add_edge` (dependency.py:176-180): a forward edge plus its
+    /// reversed back-edge, so `depends()` sees the predecessor.
+    fn add_test_edge(g: &mut DependencyGraph, from: usize, to: usize) {
+        g.nodes[from].adjacent_list.push(Dependency::new(from, to, None));
+        g.nodes[to]
+            .adjacent_list_back
+            .push(Dependency::new(to, from, None));
+    }
+
+    #[test]
+    fn iterate_paths_enumerates_forward_backward_and_respects_max_len() {
+        // Diamond: 0 -> 1 -> 3 and 0 -> 2 -> 3.
+        let mut g = imaginary_graph(4);
+        add_test_edge(&mut g, 0, 1);
+        add_test_edge(&mut g, 0, 2);
+        add_test_edge(&mut g, 1, 3);
+        add_test_edge(&mut g, 2, 3);
+
+        let fwd = g.iterate_paths(0, Some(3), false, -1, false);
+        assert_eq!(fwd.len(), 2);
+        assert!(fwd.contains(&Path::new(vec![0, 1, 3])));
+        assert!(fwd.contains(&Path::new(vec![0, 2, 3])));
+
+        // to=None yields the maximal root->leaf paths.
+        let maximal = g.iterate_paths(0, None, false, -1, false);
+        assert_eq!(maximal.len(), 2);
+        assert!(maximal.contains(&Path::new(vec![0, 1, 3])));
+        assert!(maximal.contains(&Path::new(vec![0, 2, 3])));
+
+        // backwards walks depends(): predecessor chain 3 -> {1,2} -> 0.
+        let back = g.iterate_paths(3, Some(0), true, -1, false);
+        assert_eq!(back.len(), 2);
+        assert!(back.contains(&Path::new(vec![3, 1, 0])));
+        assert!(back.contains(&Path::new(vec![3, 2, 0])));
+
+        // path_max_len caps enumeration to length-2 prefixes.
+        let capped = g.iterate_paths(0, Some(3), false, 2, false);
+        assert_eq!(capped.len(), 2);
+        assert!(capped.contains(&Path::new(vec![0, 1])));
+        assert!(capped.contains(&Path::new(vec![0, 2])));
+
+        // self == to yields nothing (dependency.py:317-318).
+        assert!(g.iterate_paths(1, Some(1), false, -1, false).is_empty());
+
+        // Edge accessors expose endpoints / failarg flag.
+        assert_eq!(g.nodes[0].provides().len(), 2);
+        assert_eq!(g.nodes[3].depends().len(), 2);
+        assert_eq!(g.nodes[0].provides()[0].target_node(), 1);
+        assert_eq!(g.nodes[0].provides()[0].origin_node(), 0);
+        assert!(!g.nodes[0].provides()[0].is_failarg());
     }
 }
