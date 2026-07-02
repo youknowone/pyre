@@ -559,6 +559,11 @@ fn dispatch_rtype_op(
         // reads through the `items` array out of its `length`/`items`
         // header struct (getfield "items" → getarrayitem).
         (ListRepr, IntegerRepr, "getitem") => committed(r1.rtype_getitem(hop)),
+        // rordereddict.py:441-447 — `pairtype(OrderedDictRepr, rmodel.Repr).rtype_getitem`.
+        // The second receiver is never read in the upstream body (only
+        // `r_dict.key_repr` is), so this wildcards `_` on the key repr class,
+        // same pattern as `(TupleRepr, _, "contains")` below.
+        (OrderedDictRepr, _, "getitem") => committed(r1.rtype_getitem(hop)),
         // rrange.py:34-50 — pair(AbstractRangeRepr, IntegerRepr).rtype_getitem.
         // RangeRepr handles the constant-step + nonneg + dum_nocheck branch
         // (start + index*step); the checkidx, negative-index, and
@@ -644,6 +649,10 @@ fn dispatch_rtype_op(
         (TupleRepr, _, "contains") => {
             committed(super::rtuple::pair_tuple_repr_rtype_contains(r1, r2, hop))
         }
+        // rordereddict.py:464-467 — `pairtype(OrderedDictRepr, rmodel.Repr).rtype_contains`.
+        (OrderedDictRepr, _, "contains") => committed(
+            super::lltypesystem::rordereddict::pair_ordereddict_repr_rtype_contains(r1, r2, hop),
+        ),
         (PtrRepr, IntegerRepr, "setitem") | (InteriorPtrRepr, IntegerRepr, "setitem") => {
             committed(r1.rtype_setitem(hop))
         }

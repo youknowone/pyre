@@ -999,6 +999,17 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
         // Skip-classify so the census falls back to the legacy walker until
         // the general malloc->new path lands (boxing-lowering epic #134/#142).
         || msg.contains("survived fuse_boxing_alloc unfused")
+        // `OrderedDictRepr::require_direct_compare_key` fail-closed gate
+        // (rordereddict.rs) — `build_ll_dict_lookup_helper_graph`'s
+        // `direct_compare_op` hardcodes `ptr_eq` for every `Ptr(_)` key
+        // lltype, which is wrong for keys whose repr defines a real
+        // structural equality (`get_ll_eq_function` returning `Some`, e.g.
+        // `StringRepr::ll_streq`). int/bool/char/unichar keys return `None`
+        // and proceed; every other key repr (str, instance) hits this
+        // TyperError instead of silently miscompiling dict getitem/contains
+        // to pointer-identity comparison. Skip-classify until the
+        // call-based keyeq branch is ported (#140 DictRepr epic, Slice 2+).
+        || msg.contains("dict key eq function not wired")
     // There is no `normalize_unary_op_name: pyre UnaryOp` Skip entry:
     // the 13 typed numeric / ptr / Unsigned casts route through
     // `simple_call(<host_callable>, v)` — reaching
@@ -2161,6 +2172,12 @@ fn classify_unported_reason(reason: &str) -> &'static str {
         // malloc->new lowering (`flowspace_adapter::translate_op` fail-closed
         // guard). The boxing-lowering epic (#134/#142) drains this bucket.
         "UNFUSED-MALLOC (non-numeric boxing struct)"
+    } else if reason.contains("dict key eq function not wired") {
+        // `OrderedDictRepr::require_direct_compare_key` fail-closed gate —
+        // a dict key repr with a custom `get_ll_eq_function` (str, instance)
+        // reached getitem/contains before the call-based keyeq branch of
+        // `build_ll_dict_lookup_helper_graph` was ported. #140 DictRepr epic.
+        "DICT-KEY-EQ (str/instance dict keys)"
     } else if reason.contains("Call with CallTarget::Indirect") {
         "DYN-TRAIT-INDIRECT (lower_indirect_calls)"
     } else if reason.contains("no upstream pair(s1, s2).union() handler") {
