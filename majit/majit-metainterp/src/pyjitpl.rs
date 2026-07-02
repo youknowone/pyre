@@ -5,13 +5,12 @@ pub use dispatch::build_state_field_snapshot;
 pub use dispatch::{
     ClosureRuntime, ClosureRuntimeWithResolver, JitCodeMachine, JitCodeRuntime, JitCodeSym,
     StandaloneFrameStack, authoritative_executor_enabled, cancel_observer_replay,
-    consume_observed_float_call,
-    consume_observed_getfield, consume_observed_int_call, consume_observed_ref_call,
-    consume_observed_void_call, in_observer_mode, in_observer_replay, observer_arg_to_i64,
-    observer_i64_to_value, single_pass_enabled, struct_field_write_effect_info, trace_jitcode,
-    trace_jitcode_observer, trace_jitcode_observer_with_args,
-    trace_jitcode_observer_with_args_and_runtime, trace_jitcode_with_args,
-    trace_jitcode_with_args_and_runtime,
+    consume_observed_float_call, consume_observed_getfield, consume_observed_int_call,
+    consume_observed_ref_call, consume_observed_void_call, in_observer_mode, in_observer_replay,
+    observer_arg_to_i64, observer_i64_to_value, single_pass_enabled,
+    struct_field_write_effect_info, trace_jitcode, trace_jitcode_observer,
+    trace_jitcode_observer_with_args, trace_jitcode_observer_with_args_and_runtime,
+    trace_jitcode_with_args, trace_jitcode_with_args_and_runtime,
 };
 pub use dispatch::{build_vable_snapshot_boxes, build_vref_snapshot_boxes};
 pub use dispatch::{call_int_function, call_ref_function, call_void_function};
@@ -778,8 +777,14 @@ fn normalize_root_loop_entry_contract(
     }
     if jump_targets_current_loop && label_arg_count != jump_arg_count {
         if std::env::var_os("MAJIT_CLOSEDBG").is_some() {
-            eprintln!("@@@CONTRACT label({label_arg_count})={:?}", label_op.map(|op| op.getarglist_operand()));
-            eprintln!("@@@CONTRACT jump({jump_arg_count})={:?}", last_jump.map(|op| op.getarglist_operand()));
+            eprintln!(
+                "@@@CONTRACT label({label_arg_count})={:?}",
+                label_op.map(|op| op.getarglist_operand())
+            );
+            eprintln!(
+                "@@@CONTRACT jump({jump_arg_count})={:?}",
+                last_jump.map(|op| op.getarglist_operand())
+            );
         }
         // RPython compile.py:334: assert jump.numargs() == label.numargs().
         return Err((label_arg_count, jump_arg_count));
@@ -5064,7 +5069,10 @@ impl<M: Clone> MetaInterp<M> {
                 );
             }
             self.warm_state.abort_tracing(green_key, true);
-            if (std::env::var_os("MAJIT_CLOSEDBG").is_some()) { eprintln!("@@@CANCEL-SITE line={}", 4979); } return CompileOutcome::Cancelled;
+            if (std::env::var_os("MAJIT_CLOSEDBG").is_some()) {
+                eprintln!("@@@CANCEL-SITE line={}", 4979);
+            }
+            return CompileOutcome::Cancelled;
         }
 
         self.force_finish_trace = false;
@@ -5292,7 +5300,10 @@ impl<M: Clone> MetaInterp<M> {
                     // abort_tracing — TRACING flag must stay active.
                     if !self.cancelled_too_many_times() {
                         self.exported_state = None;
-                        if (std::env::var_os("MAJIT_CLOSEDBG").is_some()) { eprintln!("@@@CANCEL-SITE line={}", 5207); } return CompileOutcome::Cancelled;
+                        if (std::env::var_os("MAJIT_CLOSEDBG").is_some()) {
+                            eprintln!("@@@CANCEL-SITE line={}", 5207);
+                        }
+                        return CompileOutcome::Cancelled;
                     }
                     {
                         let mut retry_constants = constants_snapshot;
@@ -5467,7 +5478,10 @@ impl<M: Clone> MetaInterp<M> {
                         );
                     }
                     self.cancel_count += 1;
-                    if (std::env::var_os("MAJIT_CLOSEDBG").is_some()) { eprintln!("@@@CANCEL-SITE line={}", 5382); } return CompileOutcome::Cancelled;
+                    if (std::env::var_os("MAJIT_CLOSEDBG").is_some()) {
+                        eprintln!("@@@CANCEL-SITE line={}", 5382);
+                    }
+                    return CompileOutcome::Cancelled;
                 }
             }
         };
@@ -5507,7 +5521,10 @@ impl<M: Clone> MetaInterp<M> {
                     );
                 }
                 self.cancel_count += 1;
-                if (std::env::var_os("MAJIT_CLOSEDBG").is_some()) { eprintln!("@@@CANCEL-SITE line={}", 5422); } return CompileOutcome::Cancelled;
+                if (std::env::var_os("MAJIT_CLOSEDBG").is_some()) {
+                    eprintln!("@@@CANCEL-SITE line={}", 5422);
+                }
+                return CompileOutcome::Cancelled;
             }
         };
 
@@ -5754,7 +5771,10 @@ impl<M: Clone> MetaInterp<M> {
                 }
                 self.warm_state.abort_tracing(green_key, !is_invalid_loop);
                 self.cancel_count += 1;
-                if (std::env::var_os("MAJIT_CLOSEDBG").is_some()) { eprintln!("@@@CANCEL-SITE line={}", 5669); } return CompileOutcome::Cancelled;
+                if (std::env::var_os("MAJIT_CLOSEDBG").is_some()) {
+                    eprintln!("@@@CANCEL-SITE line={}", 5669);
+                }
+                return CompileOutcome::Cancelled;
             }
         };
         match compile_result {
@@ -5920,7 +5940,10 @@ impl<M: Clone> MetaInterp<M> {
                 self.cancel_count += 1;
                 // pyjitpl.py:3025: self.exported_state = None
                 self.exported_state = None;
-                if (std::env::var_os("MAJIT_CLOSEDBG").is_some()) { eprintln!("@@@CANCEL-SITE line={}", 5835); } return CompileOutcome::Cancelled;
+                if (std::env::var_os("MAJIT_CLOSEDBG").is_some()) {
+                    eprintln!("@@@CANCEL-SITE line={}", 5835);
+                }
+                return CompileOutcome::Cancelled;
             }
         }
     }
@@ -6101,7 +6124,10 @@ impl<M: Clone> MetaInterp<M> {
                         green_key, bridge_origin
                     );
                 }
-                if (std::env::var_os("MAJIT_CLOSEDBG").is_some()) { eprintln!("@@@CANCEL-SITE line={}", 6016); } return CompileOutcome::Cancelled;
+                if (std::env::var_os("MAJIT_CLOSEDBG").is_some()) {
+                    eprintln!("@@@CANCEL-SITE line={}", 6016);
+                }
+                return CompileOutcome::Cancelled;
             };
             ctx.recorder
                 .close_loop_with_descr(finish_args, Some(jump_descr));
@@ -6208,7 +6234,10 @@ impl<M: Clone> MetaInterp<M> {
                 // (populated by `start_retrace_from_guard`).  No
                 // `(trace_id, fail_index)` reverse lookup.
                 if !self.compiled_loops.contains_key(&origin_key) {
-                    if (std::env::var_os("MAJIT_CLOSEDBG").is_some()) { eprintln!("@@@CANCEL-SITE line={}", 6123); } return CompileOutcome::Cancelled;
+                    if (std::env::var_os("MAJIT_CLOSEDBG").is_some()) {
+                        eprintln!("@@@CANCEL-SITE line={}", 6123);
+                    }
+                    return CompileOutcome::Cancelled;
                 }
                 let descr_arc = match self.bridge_info() {
                     Some(b) => b.source_descr.clone(),
@@ -6245,7 +6274,10 @@ impl<M: Clone> MetaInterp<M> {
                 // compile a fresh entry bridge and attach it to the
                 // original interpreter green key.
                 let Some((original_green_key, entry_meta)) = entry_bridge else {
-                    if (std::env::var_os("MAJIT_CLOSEDBG").is_some()) { eprintln!("@@@CANCEL-SITE line={}", 6160); } return CompileOutcome::Cancelled;
+                    if (std::env::var_os("MAJIT_CLOSEDBG").is_some()) {
+                        eprintln!("@@@CANCEL-SITE line={}", 6160);
+                    }
+                    return CompileOutcome::Cancelled;
                 };
                 let success = self.compile_entry_bridge(
                     green_key,
@@ -6752,7 +6784,9 @@ impl<M: Clone> MetaInterp<M> {
                     );
                 }
                 if std::env::var_os("MAJIT_SPDIAG").is_some() {
-                    eprintln!("@@@SPDIAG FINISH-compile compiled_loops.insert green_key={green_key}");
+                    eprintln!(
+                        "@@@SPDIAG FINISH-compile compiled_loops.insert green_key={green_key}"
+                    );
                 }
                 token.set_retraced_count(unroll_opt.retraced_count);
                 self.compiled_loops.insert(
