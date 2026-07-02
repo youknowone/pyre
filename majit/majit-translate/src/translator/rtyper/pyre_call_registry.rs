@@ -326,11 +326,47 @@ impl PyreCallRegistry {
                 *leaf_struct_counts.entry(leaf).or_default() += 1;
             }
         }
+        // Reverse index: crate-stripped impl path → full-crate
+        // field-registry key.  Closure Fn-family methods register under
+        // the crate-stripped `self_ty_root` (`for_impl_method`), but the
+        // field registry and the closure receiver classdef both carry the
+        // full-crate spelling, so the closure seed recovers it by keying
+        // each registry root on its post-crate suffix.
+        let mut full_by_stripped: std::collections::HashMap<&str, &str> =
+            std::collections::HashMap::new();
+        for key in reg.fields.keys() {
+            if let Some((_, rest)) = key.split_once("::") {
+                full_by_stripped.entry(rest).or_insert(key.as_str());
+            }
+        }
         for (key, entry) in self.entries.borrow().iter() {
             let segs = key.segments();
             let [.., owner, method] = segs else {
                 continue;
             };
+            // Closure `Fn`/`FnMut`/`FnOnce` impl method.  Every closure
+            // type shares the bare leaf `closure`, so the leaf-ambiguity
+            // guard below would skip it (and duplicate-leaf hardening
+            // already dropped the `closure` field alias).  A closure IS
+            // unambiguous at its full path; recover the full-crate key and
+            // seed the method onto both the `::` struct-root class and the
+            // `.`-joined class the receiver getattr resolves to.  RPython
+            // forbids closures (`_assert_rpythonic`), so there is no
+            // upstream analogue.
+            if owner == "closure" && matches!(method.as_str(), "call_once" | "call" | "call_mut") {
+                let stripped = segs[..segs.len() - 1].join("::");
+                let Some(&reg_key) = full_by_stripped.get(stripped.as_str()) else {
+                    continue;
+                };
+                for qual in [reg_key.to_string(), reg_key.replace("::", ".")] {
+                    let class_host = self.bookkeeper.intern_class_by_qualname(&qual);
+                    class_host.class_set(
+                        method.clone(),
+                        ConstValue::HostObject(entry.host_object.clone()),
+                    );
+                }
+                continue;
+            }
             if !reg.fields.contains_key(owner) {
                 continue;
             }
