@@ -4075,7 +4075,7 @@ mod tests {
             &[object, resolved],
             &[crate::optimizeopt::shortpreamble::PreambleOp {
                 op: std::rc::Rc::new(preamble_op.clone()),
-                res: bound_arg(source).to_boxref(),
+                res: bound_arg(source),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Heap,
                 label_arg_idx: Some(1),
                 invented_name: false,

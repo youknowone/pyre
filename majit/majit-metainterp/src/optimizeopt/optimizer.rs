@@ -3326,11 +3326,10 @@ impl Optimizer {
                         Some(crate::optimizeopt::shortpreamble::PreambleOp {
                             op: preamble_op,
                             // short_op.res travels with the entry as the
-                            // exported `PreambleOp.res` box (the potential-op
-                            // res channel stays BoxRef); the preview
-                            // ProducedShortOp carries a bound producer operand,
-                            // so `to_boxref` re-mints a ptr_eq-stable box.
-                            res: produced.res.to_boxref(),
+                            // exported `PreambleOp.res` operand; the preview
+                            // ProducedShortOp already carries the bound producer
+                            // / const operand, so it moves across unchanged.
+                            res: produced.res.clone(),
                             kind: produced.kind,
                             label_arg_idx,
                             invented_name: produced.invented_name,
@@ -3777,19 +3776,10 @@ impl Optimizer {
                     // position Cell to rewrite. The former bound-box refresh
                     // copied that same `op.pos`; the position-only else-branch
                     // was dead since #173 roots the producer.
-                    // res: a bound box live-tracks its producer through the
-                    // op handle — the producer's `Op.pos` was already
-                    // remapped above, so refreshing the position Cell from
-                    // it is idempotent (no double-map). Position-only mints
-                    // (test fixtures) go through the remap table instead;
-                    // `set_position` is a no-op for InputArg/Const kinds.
-                    if let Some(op) = entry.res.bound_op() {
-                        entry.res.set_position(op.pos.get().raw());
-                    } else {
-                        let mut res_opref = entry.res.to_opref();
-                        remap_opref(&mut res_opref);
-                        entry.res.set_position(res_opref.raw());
-                    }
+                    // res: a producer-bound / const operand live-tracks its
+                    // producer through the carried handle — the producer's
+                    // `Op.pos` was already remapped above, so there is no
+                    // separate position to rewrite (same as `same_as_source`).
                 }
             }
         }
@@ -6916,7 +6906,7 @@ mod tests {
             &[OpRef::int_op(0)],
             &[crate::optimizeopt::shortpreamble::PreambleOp {
                 op: std::rc::Rc::new(preamble_op.clone()),
-                res: rooted_resop_box(Type::Int, 14),
+                res: rooted_resop_operand(Type::Int, 14),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Pure,
                 label_arg_idx: None,
                 invented_name: false,

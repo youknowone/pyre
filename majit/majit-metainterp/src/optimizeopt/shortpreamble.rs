@@ -339,11 +339,11 @@ pub struct PreambleOp {
     /// object across the export/import boundary (upstream `preamble_op` is
     /// one ResOperation object, shortpreamble.py:283-296).
     pub op: majit_ir::OpRc,
-    /// `short_op.res` — the result box this entry produces. Identity-
-    /// bearing on exported entries (threaded from the preview
-    /// `ProducedShortOp.res`); on potential-op entries it is a
-    /// position-only mint that `add_op_to_short` re-resolves via ctx.
-    pub res: majit_ir::box_ref::BoxRef,
+    /// `short_op.res` — the result operand this entry produces. Carried as a
+    /// producer-bound / const [`Operand`] so the canonical operand travels
+    /// with the struct and its `to_boxref()` re-mint at the export boundary
+    /// (`ProducedShortOp.res`) is `Rc::ptr_eq`-stable on the producer.
+    pub res: majit_ir::operand::Operand,
     /// Classification of this operation.
     pub kind: PreambleOpKind,
     /// Index of the argument in the label (None if not a label arg).
@@ -671,7 +671,7 @@ impl ShortBoxes {
             // shortpreamble.py:371-373: const_short_boxes.append(HeapOp(...))
             let label_arg_idx = self.lookup_label_arg(result);
             self.const_short_boxes.push(PreambleOp {
-                res: BoxRef::from_opref(op.pos.get()),
+                res: ctx.materialize_operand_at(op.pos.get()),
                 op: std::rc::Rc::new(op),
                 kind: PreambleOpKind::Heap,
                 label_arg_idx,
@@ -765,6 +765,7 @@ impl ShortBoxes {
         // returns (ptr_eq), keeping the BoxRef-keyed map ptr-stable.
         let _ = ctx.materialize_box_at(arg);
         let arg_box = ctx.materialize_box_at(arg);
+        let arg_res = majit_ir::operand::Operand::from_boxref(&arg_box);
         let mut same_as = Op::new(
             OpCode::same_as_for_type(arg_type),
             &[majit_ir::operand::Operand::from_boxref(&arg_box.clone())],
@@ -776,7 +777,7 @@ impl ShortBoxes {
         self.potential_ops.insert(
             majit_ir::operand::Operand::from_boxref(&arg_box),
             PotentialShortOp::Preamble(PreambleOp {
-                res: arg_box,
+                res: arg_res,
                 op: std::rc::Rc::new(same_as),
                 kind: PreambleOpKind::InputArg,
                 label_arg_idx: Some(live_slot),
@@ -1064,7 +1065,7 @@ impl ShortBoxes {
         let _ = ctx.materialize_box_at(result);
         let key = ctx.materialize_box_at(result);
         let pop = PotentialShortOp::Preamble(PreambleOp {
-            res: BoxRef::from_opref(result),
+            res: majit_ir::operand::Operand::from_boxref(&key),
             op: std::rc::Rc::new(op),
             kind,
             label_arg_idx,
@@ -1132,7 +1133,7 @@ impl CollectedExtendedShortPreambleBuilder {
     pub fn add_guard(&mut self, op: Op) {
         let label_arg_idx = self.lookup_label_arg(op.pos.get());
         self.guards.push(PreambleOp {
-            res: BoxRef::from_opref(op.pos.get()),
+            res: majit_ir::operand::Operand::bound_from_opref(op.pos.get()),
             op: std::rc::Rc::new(op),
             kind: PreambleOpKind::Guard,
             label_arg_idx,
@@ -1145,7 +1146,7 @@ impl CollectedExtendedShortPreambleBuilder {
     pub fn add_pure_op(&mut self, op: Op) {
         let label_arg_idx = self.lookup_label_arg(op.pos.get());
         self.pure_ops.push(PreambleOp {
-            res: BoxRef::from_opref(op.pos.get()),
+            res: majit_ir::operand::Operand::bound_from_opref(op.pos.get()),
             op: std::rc::Rc::new(op),
             kind: PreambleOpKind::Pure,
             label_arg_idx,
@@ -1158,7 +1159,7 @@ impl CollectedExtendedShortPreambleBuilder {
     pub fn add_heap_op(&mut self, op: Op) {
         let label_arg_idx = self.lookup_label_arg(op.pos.get());
         self.heap_ops.push(PreambleOp {
-            res: BoxRef::from_opref(op.pos.get()),
+            res: majit_ir::operand::Operand::bound_from_opref(op.pos.get()),
             op: std::rc::Rc::new(op),
             kind: PreambleOpKind::Heap,
             label_arg_idx,
@@ -1171,7 +1172,7 @@ impl CollectedExtendedShortPreambleBuilder {
     pub fn add_loopinvariant_op(&mut self, op: Op) {
         let label_arg_idx = self.lookup_label_arg(op.pos.get());
         self.loopinvariant_ops.push(PreambleOp {
-            res: BoxRef::from_opref(op.pos.get()),
+            res: majit_ir::operand::Operand::bound_from_opref(op.pos.get()),
             op: std::rc::Rc::new(op),
             kind: PreambleOpKind::LoopInvariant,
             label_arg_idx,
@@ -3295,10 +3296,10 @@ pub(crate) fn produced_short_boxes_from_exported_boxes(
                 ProducedShortOp {
                     kind: entry.kind.clone(),
                     // shortpreamble.py:58/110 short_op.res — the exported
-                    // entry carries the Phase-1 res box across the boundary;
-                    // shed the bound producer box to its live operand (#173
-                    // roots the producer, so this is never position-only).
-                    res: majit_ir::operand::Operand::from_boxref(&entry.res),
+                    // entry carries the Phase-1 res operand across the
+                    // boundary; it already holds the live producer / const
+                    // operand (#173 roots the producer, never position-only).
+                    res: entry.res.clone(),
                     preamble_op: std::rc::Rc::new(preamble_op),
                     invented_name: entry.invented_name,
                     same_as_source: entry.same_as_source.clone(),
@@ -3595,7 +3596,7 @@ mod tests {
                     op.pos.set(OpRef::int_op(7));
                     std::rc::Rc::new(op)
                 },
-                res: rooted_resop_box(Type::Int, 7),
+                res: rooted_resop_operand(Type::Int, 7),
                 kind: PreambleOpKind::Pure,
                 label_arg_idx: None,
                 invented_name: false,
@@ -3607,7 +3608,7 @@ mod tests {
                     op.pos.set(OpRef::int_op(8));
                     std::rc::Rc::new(op)
                 },
-                res: rooted_resop_box(Type::Int, 8),
+                res: rooted_resop_operand(Type::Int, 8),
                 kind: PreambleOpKind::Pure,
                 label_arg_idx: None,
                 invented_name: false,
@@ -3639,7 +3640,7 @@ mod tests {
         let exported = vec![
             PreambleOp {
                 op: std::rc::Rc::new(ovf),
-                res: rooted_resop_box(Type::Int, 20),
+                res: rooted_resop_operand(Type::Int, 20),
                 kind: PreambleOpKind::Pure,
                 label_arg_idx: None,
                 invented_name: false,
@@ -3647,7 +3648,7 @@ mod tests {
             },
             PreambleOp {
                 op: std::rc::Rc::new(guard),
-                res: BoxRef::none(),
+                res: majit_ir::operand::Operand::None,
                 kind: PreambleOpKind::Guard,
                 label_arg_idx: None,
                 invented_name: false,

@@ -1316,7 +1316,7 @@ mod tests {
             Some(idx) => (0..=idx as u32).map(OpRef::int_op).collect(),
             None => vec![OpRef::int_op(0)],
         };
-        let res = ctx.materialize_box_at(source);
+        let res = ctx.materialize_operand_at(source);
         ctx.initialize_imported_short_preamble_builder(
             &short_inputargs,
             &short_inputargs,

@@ -5796,7 +5796,7 @@ mod tests {
             exported_infos,
             vec![PreambleOp {
                 op: std::rc::Rc::new(Op::new(OpCode::SameAsR, &[Operand::from_opref(old_ref)])),
-                res: BoxRef::from_opref(old_ref),
+                res: Operand::bound_from_opref(old_ref),
                 kind: PreambleOpKind::Pure,
                 label_arg_idx: None,
                 invented_name: false,
@@ -6614,7 +6614,7 @@ mod tests {
                     op.pos.set(OpRef::int_op(11));
                     std::rc::Rc::new(op)
                 },
-                res: rooted_resop_box(Type::Int, 11),
+                res: rooted_resop_operand(Type::Int, 11),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Heap,
                 label_arg_idx: Some(1),
                 invented_name: false,
@@ -6683,7 +6683,7 @@ mod tests {
                     op.pos.set(OpRef::int_op(11));
                     std::rc::Rc::new(op)
                 },
-                res: rooted_resop_box(Type::Int, 11),
+                res: rooted_resop_operand(Type::Int, 11),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Pure,
                 label_arg_idx: Some(1),
                 invented_name: false,
@@ -6748,7 +6748,7 @@ mod tests {
                     op.pos.set(OpRef::int_op(11));
                     std::rc::Rc::new(op)
                 },
-                res: rooted_resop_box(Type::Int, 11),
+                res: rooted_resop_operand(Type::Int, 11),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::LoopInvariant,
                 label_arg_idx: Some(1),
                 invented_name: false,
@@ -6813,7 +6813,7 @@ mod tests {
                     op.pos.set(source);
                     std::rc::Rc::new(op)
                 },
-                res: source_box.clone(),
+                res: Operand::from_boxref(&source_box),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::LoopInvariant,
                 label_arg_idx: Some(0),
                 invented_name: false,
@@ -6872,7 +6872,7 @@ mod tests {
                     op.pos.set(OpRef::int_op(20));
                     std::rc::Rc::new(op)
                 },
-                res: rooted_resop_box(Type::Int, 20),
+                res: rooted_resop_operand(Type::Int, 20),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Pure,
                 label_arg_idx: None,
                 invented_name: false,
@@ -6962,7 +6962,7 @@ mod tests {
                     op.pos.set(OpRef::ref_op(19));
                     std::rc::Rc::new(op)
                 },
-                res: rooted_resop_box(Type::Ref, 19),
+                res: rooted_resop_operand(Type::Ref, 19),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Heap,
                 label_arg_idx: None,
                 invented_name: false,
@@ -7062,7 +7062,7 @@ mod tests {
                     op.pos.set(OpRef::int_op(30));
                     std::rc::Rc::new(op)
                 },
-                res: rooted_resop_box(Type::Int, 30),
+                res: rooted_resop_operand(Type::Int, 30),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Pure,
                 label_arg_idx: None,
                 invented_name: true,
