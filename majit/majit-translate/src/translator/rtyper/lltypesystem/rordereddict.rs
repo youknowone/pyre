@@ -22,7 +22,9 @@ use crate::translator::rtyper::lltypesystem::lltype::{
 };
 use crate::translator::rtyper::lltypesystem::rstr::sub_helper_funcptr_constant;
 use crate::translator::rtyper::rdict::{AbstractDictIteratorRepr, AbstractDictRepr};
-use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState};
+use crate::translator::rtyper::rmodel::{
+    RTypeResult, Repr, ReprState, gc_flavor_const, lowlevel_type_const,
+};
 use crate::translator::rtyper::rtyper::{
     ConvertedTo, HighLevelOp, LowLevelFunction, RPythonTyper, constant_with_lltype, exception_args,
     helper_pygraph_from_graph, variable_with_lltype, void_field_const,
@@ -7567,6 +7569,111 @@ pub fn build_ll_dictnext_helper_graph(
     ))
 }
 
+/// Synthesise `ll_dictiter(ITERPTR, d)` (`rordereddict.py:1214-1219`):
+/// allocate a dict iterator, store the source dict, seed the index from
+/// `d.lookup_function_no >> FUNC_SHIFT`, and return the iterator.
+pub fn build_ll_dictiter_helper_graph(
+    name: &str,
+    iter_ptr_lltype: LowLevelType,
+    dict_ptr_lltype: LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    let LowLevelType::Ptr(iter_ptr) = &iter_ptr_lltype else {
+        return Err(TyperError::message(
+            "build_ll_dictiter_helper_graph: iter lltype must be Ptr",
+        ));
+    };
+    let iter_struct = match &iter_ptr.TO {
+        PtrTarget::Struct(st) => st.clone(),
+        other => {
+            return Err(TyperError::message(format!(
+                "build_ll_dictiter_helper_graph: iterator Ptr target must be Struct, got {other:?}"
+            )));
+        }
+    };
+
+    let d_arg = variable_with_lltype("d", dict_ptr_lltype);
+    let startblock = Block::shared(vec![Hlvalue::Variable(d_arg.clone())]);
+    let return_var = variable_with_lltype("result", iter_ptr_lltype.clone());
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    let iter = variable_with_lltype("iter", iter_ptr_lltype);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "malloc",
+        vec![
+            lowlevel_type_const(LowLevelType::Struct(Box::new(iter_struct))),
+            gc_flavor_const()?,
+        ],
+        Hlvalue::Variable(iter.clone()),
+    ));
+    let set_dict_void = variable_with_lltype("v", LowLevelType::Void);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "setfield",
+        vec![
+            Hlvalue::Variable(iter.clone()),
+            void_field_const("dict"),
+            Hlvalue::Variable(d_arg.clone()),
+        ],
+        Hlvalue::Variable(set_dict_void),
+    ));
+    let lookup_function_no = variable_with_lltype("lookup_function_no", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "getfield",
+        vec![
+            Hlvalue::Variable(d_arg),
+            void_field_const("lookup_function_no"),
+        ],
+        Hlvalue::Variable(lookup_function_no.clone()),
+    ));
+    let index = variable_with_lltype("index", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "int_rshift",
+        vec![
+            Hlvalue::Variable(lookup_function_no),
+            constant_with_lltype(ConstValue::Int(FUNC_SHIFT), LowLevelType::Signed),
+        ],
+        Hlvalue::Variable(index.clone()),
+    ));
+    let set_index_void = variable_with_lltype("v", LowLevelType::Void);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "setfield",
+        vec![
+            Hlvalue::Variable(iter.clone()),
+            void_field_const("index"),
+            Hlvalue::Variable(index),
+        ],
+        Hlvalue::Variable(set_index_void),
+    ));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(iter)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["d".to_string()],
+        func,
+    ))
+}
+
+pub fn ll_call_insert_clean_function() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred(
+        "ll_call_insert_clean_function",
+    ))
+}
+
 pub fn ll_call_delete_by_entry_index() -> Result<(), TyperError> {
     Err(ordered_dict_runtime_deferred(
         "ll_call_delete_by_entry_index",
@@ -7641,8 +7748,19 @@ pub fn ll_dict_setitem_with_hash() -> Result<(), TyperError> {
     Err(ordered_dict_runtime_deferred("ll_dict_setitem_with_hash"))
 }
 
-pub fn ll_dict_lookup() -> Result<(), TyperError> {
-    Err(ordered_dict_runtime_deferred("ll_dict_lookup"))
+pub fn ll_dict_lookup(
+    dict_ptr_lltype: LowLevelType,
+    entries_ptr_lltype: LowLevelType,
+    index_elem_lltype: LowLevelType,
+    key_lltype: LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    build_ll_dict_lookup_helper_graph(
+        "ll_dict_lookup",
+        dict_ptr_lltype,
+        entries_ptr_lltype,
+        index_elem_lltype,
+        key_lltype,
+    )
 }
 
 pub fn _ll_dict_setitem_lookup_done() -> Result<(), TyperError> {
@@ -7710,8 +7828,11 @@ pub fn _ll_free_entries() -> Result<(), TyperError> {
     Err(ordered_dict_runtime_deferred("_ll_free_entries"))
 }
 
-pub fn ll_dictiter() -> Result<(), TyperError> {
-    Err(ordered_dict_runtime_deferred("ll_dictiter"))
+pub fn ll_dictiter(
+    iter_ptr_lltype: LowLevelType,
+    dict_ptr_lltype: LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    build_ll_dictiter_helper_graph("ll_dictiter", iter_ptr_lltype, dict_ptr_lltype)
 }
 
 pub fn ll_dictiter_reversed() -> Result<(), TyperError> {
@@ -8442,6 +8563,40 @@ mod tests {
             Some(LowLevelType::Signed),
             "ll_dict_lookup returns Signed"
         );
+    }
+
+    #[test]
+    fn ll_dict_lookup_surface_builds_lookup_graph() {
+        let (dict_ptr, entries_ptr, key_lltype) = sample_dict_lookup_lltypes();
+        let helper = ll_dict_lookup(dict_ptr, entries_ptr, LowLevelType::Unsigned, key_lltype)
+            .expect("ll_dict_lookup");
+        assert_eq!(helper.func.name, "ll_dict_lookup");
+    }
+
+    #[test]
+    fn build_ll_dictiter_allocates_and_initializes_iterator() {
+        let (dict_ptr, _entries_ptr, _key) = sample_dict_lookup_lltypes();
+        let iter_ptr = get_ll_dictiter(dict_ptr.clone());
+        let helper = ll_dictiter(iter_ptr, dict_ptr).expect("ll_dictiter");
+        assert_eq!(helper.func.name, "ll_dictiter");
+        let inner = helper.graph.borrow();
+        let startblock = inner.startblock.borrow();
+        let ops: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|op| op.opname.as_str())
+            .collect();
+        assert_eq!(
+            ops,
+            vec!["malloc", "setfield", "getfield", "int_rshift", "setfield"]
+        );
+        let Hlvalue::Variable(ret) = &inner.returnblock.borrow().inputargs[0] else {
+            panic!("returnblock inputarg must be a Variable");
+        };
+        assert!(matches!(
+            ret.concretetype.borrow().clone(),
+            Some(LowLevelType::Ptr(_))
+        ));
     }
 
     /// `_ll_dictnext` walks the entries array; on a valid entry it advances
