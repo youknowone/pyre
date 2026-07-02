@@ -35,7 +35,6 @@ fn vb_remove(v: &mut Vec<bool>, opref: &OpRef) -> bool {
     }
 }
 
-use majit_ir::box_ref::BoxRef;
 use majit_ir::{EffectInfo, ExtraEffect, GcRef, OpCode, OpRef, Type};
 
 /// Value-equality predicate over constant OpRefs.  Mirrors
@@ -99,11 +98,11 @@ const _HF_VERSION_MAX: u32 = HF_VERSION_MAX;
 /// call.  No separate side table.
 #[derive(Debug, Default)]
 pub struct CacheEntry {
-    cache_anything: vecset::VecMap<OpRef, BoxRef>,
-    cache_seen_allocation: vecset::VecMap<OpRef, BoxRef>,
+    cache_anything: vecset::VecMap<OpRef, OpRef>,
+    cache_seen_allocation: vecset::VecMap<OpRef, OpRef>,
     quasiimmut_seen: Option<VecSet<OpRef>>,
     quasiimmut_seen_refs: Option<VecSet<usize>>,
-    last_const_box: Option<BoxRef>,
+    last_const_box: Option<OpRef>,
 }
 
 impl CacheEntry {
@@ -137,7 +136,7 @@ impl CacheEntry {
     }
 
     /// heapcache.py:84-88 _getdict
-    pub fn _getdict(&self, seen_alloc: bool) -> &vecset::VecMap<OpRef, BoxRef> {
+    pub fn _getdict(&self, seen_alloc: bool) -> &vecset::VecMap<OpRef, OpRef> {
         if seen_alloc {
             &self.cache_seen_allocation
         } else {
@@ -147,7 +146,7 @@ impl CacheEntry {
 
     /// Pyre adapt: Python doesn't need a separate `_mut` accessor;
     /// Rust's borrow checker does.  Mirrors `_getdict`'s body.
-    pub fn _getdict_mut(&mut self, seen_alloc: bool) -> &mut vecset::VecMap<OpRef, BoxRef> {
+    pub fn _getdict_mut(&mut self, seen_alloc: bool) -> &mut vecset::VecMap<OpRef, OpRef> {
         if seen_alloc {
             &mut self.cache_seen_allocation
         } else {
@@ -166,8 +165,7 @@ impl CacheEntry {
         let ref_box = self._unique_const_heuristic(ref_box, oracle);
         let seen_alloc = self._seen_alloc(ref_box, cache);
         self._clear_cache_on_write(seen_alloc);
-        self._getdict_mut(seen_alloc)
-            .insert(ref_box, BoxRef::from_opref(fieldbox));
+        self._getdict_mut(seen_alloc).insert(ref_box, fieldbox);
     }
 
     /// heapcache.py:96-104 _unique_const_heuristic.
@@ -185,13 +183,12 @@ impl CacheEntry {
         if !(ref_box.is_constant() && ref_box.ty() == Some(Type::Ref)) {
             return ref_box;
         }
-        if let Some(last) = &self.last_const_box {
-            let last = last.to_opref();
+        if let Some(last) = self.last_const_box {
             if oracle.same_constant(last, ref_box) {
                 return last;
             }
         }
-        self.last_const_box = Some(BoxRef::from_opref(ref_box));
+        self.last_const_box = Some(ref_box);
         ref_box
     }
 
@@ -206,7 +203,7 @@ impl CacheEntry {
         let seen_alloc = self._seen_alloc(ref_box, cache);
         self._getdict(seen_alloc)
             .get(&ref_box)
-            .map(|fieldbox| cache.maybe_replace_with_const(fieldbox.to_opref()))
+            .map(|fieldbox| cache.maybe_replace_with_const(*fieldbox))
     }
 
     /// heapcache.py:116-119 read_now_known
@@ -219,8 +216,7 @@ impl CacheEntry {
     ) {
         let ref_box = self._unique_const_heuristic(ref_box, oracle);
         let seen_alloc = self._seen_alloc(ref_box, cache);
-        self._getdict_mut(seen_alloc)
-            .insert(ref_box, BoxRef::from_opref(fieldbox));
+        self._getdict_mut(seen_alloc).insert(ref_box, fieldbox);
     }
 
     /// heapcache.py:121-129 invalidate_unescaped — RPython makes this a
@@ -407,7 +403,7 @@ pub struct HeapCache {
     /// freshly-executed calls.
     loopinvariant_descr: Option<u32>,
     loopinvariant_arg0: Option<i64>,
-    loopinvariant_result: Option<BoxRef>,
+    loopinvariant_result: Option<OpRef>,
     loopinvariant_resvalue: Option<i64>,
 
     /// heapcache.py: per-box `_heapc_deps`.
@@ -416,7 +412,7 @@ pub struct HeapCache {
     /// `deps[0]` is the cached array length and `deps[1:]` are escape
     /// dependencies added by `_escape_from_write`. pyre's `OpRef` is a bare
     /// index, so the closest equivalent is a per-op side slot keyed by OpRef.
-    heapc_deps: Vec<Option<Vec<Option<BoxRef>>>>,
+    heapc_deps: Vec<Option<Vec<Option<OpRef>>>>,
 
     /// heapcache.py: oldbox.set_replaced_with_const() in replace_box().
     ///
@@ -424,7 +420,7 @@ pub struct HeapCache {
     /// carries both a position and a typed Box identity, so the key must be
     /// the full `OpRef`, not just `raw()`: `IntOp(n)` and `RefOp(n)` are
     /// different boxes upstream.
-    replaced_with_const: Vec<(OpRef, BoxRef)>,
+    replaced_with_const: Vec<(OpRef, OpRef)>,
 
     /// heapcache.py:176: need_guard_not_invalidated — set True on reset,
     /// consumed by quasi-immut field recording to decide whether to emit
@@ -470,13 +466,7 @@ impl HeapCache {
         self.replaced_with_const
             .iter()
             .rev()
-            .find_map(|(old, new)| {
-                if *old == opref {
-                    Some(new.to_opref())
-                } else {
-                    None
-                }
-            })
+            .find_map(|(old, new)| if *old == opref { Some(*new) } else { None })
             .unwrap_or(opref)
     }
 
@@ -635,7 +625,7 @@ impl HeapCache {
     }
 
     /// RPython-compatible alias.
-    pub fn _get_deps(&mut self, opref: OpRef) -> &mut Vec<Option<BoxRef>> {
+    pub fn _get_deps(&mut self, opref: OpRef) -> &mut Vec<Option<OpRef>> {
         self.update_version(opref);
         let i = opref.raw() as usize;
         if i >= self.heapc_deps.len() {
@@ -661,7 +651,7 @@ impl HeapCache {
     pub fn _escape_from_write(&mut self, r#box: OpRef, fieldbox: OpRef) {
         if self.is_unescaped(r#box) && self.is_unescaped(fieldbox) {
             let deps = self._get_deps(r#box);
-            deps.push(Some(BoxRef::from_opref(fieldbox)));
+            deps.push(Some(fieldbox));
         } else {
             // RPython's `elif fieldbox is not None` — pyre's OpRef is always
             // present (no None equivalent), so the branch always fires.
@@ -710,7 +700,7 @@ impl HeapCache {
                     self.heapc_deps[i] = Some(vec![Some(length)]);
                 }
                 for dep in deps.into_iter().skip(1).flatten() {
-                    self._escape_box(dep.to_opref());
+                    self._escape_box(dep);
                 }
             }
         }
@@ -1014,10 +1004,9 @@ impl HeapCache {
                 .iter_mut()
                 .find(|(existing_old, _)| *existing_old == old)
             {
-                *existing = BoxRef::from_opref(new);
+                *existing = new;
             } else {
-                self.replaced_with_const
-                    .push((old, BoxRef::from_opref(new)));
+                self.replaced_with_const.push((old, new));
             }
         }
     }
@@ -1081,13 +1070,11 @@ impl HeapCache {
         self.known_class.get(opref.raw() as usize).and_then(|v| *v)
     }
 
-    /// Walk every cached *value* box so a `Const` ref survives a moving
+    /// Walk every cached *value* slot so a `ConstPtr` ref survives a moving
     /// minor collection. history.py:314 `ConstPtr.value` is a gcref field
     /// the Python GC traces through the box object graph; pyre stores cached
-    /// values as [`BoxRef`] and forwards each through the canonical
-    /// `BoxRef::walk_const_ptr_refs` (the same path `Op.args` use) — a
-    /// `Const` box's inline `Value::Ref` is forwarded in place, every other
-    /// box kind is a no-op.
+    /// values as flat [`OpRef`] slots and forwards inline `ConstPtr` values in
+    /// place. Every other `OpRef` kind is a no-op.
     ///
     /// Only value slots are walked — these are returned on cache hits and
     /// emitted into the op-graph (`replaced_with_const` /
@@ -1098,8 +1085,10 @@ impl HeapCache {
     /// repopulates (same contract as the `call_pure_results` cache), and an
     /// in-place key rewrite would break the sorted-`VecMap` ordering.
     pub fn walk_const_ptr_refs(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
-        fn forward(slot: &BoxRef, visitor: &mut dyn FnMut(&mut GcRef)) {
-            slot.walk_const_ptr_refs(visitor);
+        fn forward(slot: &mut OpRef, visitor: &mut dyn FnMut(&mut GcRef)) {
+            if let OpRef::ConstPtr(gcref) = slot {
+                visitor(gcref);
+            }
         }
         fn forward_entry(entry: &mut CacheEntry, visitor: &mut dyn FnMut(&mut GcRef)) {
             for value in entry.cache_anything.values_mut() {
@@ -1576,8 +1565,7 @@ impl HeapCache {
                 // The Box identity is the OpRef; its intrinsic `value`
                 // travels with the frontend value slot, so the copy needs no
                 // explicit payload handling.
-                let value =
-                    raw_value.map(|fieldbox| self.maybe_replace_with_const(fieldbox.to_opref()));
+                let value = raw_value.map(|fieldbox| self.maybe_replace_with_const(fieldbox));
                 // heapcache.py:423-429: ...and write it to the dest cell.
                 if let Some(value) = value {
                     let dst_index = dststart + i;
@@ -1596,7 +1584,7 @@ impl HeapCache {
                     entry._clear_cache_on_write(seen_allocation_of_target);
                     entry
                         ._getdict_mut(seen_allocation_of_target)
-                        .insert(dst, BoxRef::from_opref(value));
+                        .insert(dst, value);
                 } else {
                     // heapcache.py:430-436: source had no cached value, so
                     // the dest's existing entry must be invalidated.
@@ -1729,7 +1717,7 @@ impl HeapCache {
         let seen_alloc = self.saw_allocation(array);
         let entry = self.heap_array_cache.get(&descr)?.get(&index_value)?;
         let cached = entry._getdict(seen_alloc).get(&array).cloned()?;
-        Some(self.maybe_replace_with_const(cached.to_opref()))
+        Some(self.maybe_replace_with_const(cached))
     }
 
     /// heapcache.py:573-585 `setarrayitem`. Non-ConstInt index (`None`
@@ -1763,9 +1751,7 @@ impl HeapCache {
         // heapcache.py:577 `indexcache.do_write_with_aliasing(box, ...)`.
         let array = entry._unique_const_heuristic(array, oracle);
         entry._clear_cache_on_write(seen_alloc);
-        entry
-            ._getdict_mut(seen_alloc)
-            .insert(array, BoxRef::from_opref(value));
+        entry._getdict_mut(seen_alloc).insert(array, value);
     }
 
     /// heapcache.py:565-568 `getarrayitem_now_known`. Same canonical
@@ -1789,9 +1775,7 @@ impl HeapCache {
             .entry(index_value)
             .or_insert_with(CacheEntry::new);
         let array = entry._unique_const_heuristic(array, oracle);
-        entry
-            ._getdict_mut(seen_alloc)
-            .insert(array, BoxRef::from_opref(value));
+        entry._getdict_mut(seen_alloc).insert(array, value);
     }
 
     /// Invalidate array caches for a specific array across every descr/index.
@@ -1894,7 +1878,7 @@ impl HeapCache {
             .get(array.raw() as usize)
             .and_then(|deps| deps.as_ref())
             .and_then(|deps| deps.first().cloned().flatten())
-            .map(|length| self.maybe_replace_with_const(length.to_opref()))
+            .map(|length| self.maybe_replace_with_const(length))
     }
 
     /// heapcache.py:588-596 arraylen_now_known
@@ -1918,7 +1902,7 @@ impl HeapCache {
             return;
         }
         let deps = self._get_deps(array);
-        deps[0] = Some(BoxRef::from_opref(length));
+        deps[0] = Some(length);
     }
 
     // ── Likely virtual tracking (heapcache.py is_likely_virtual) ──
@@ -1979,7 +1963,7 @@ impl HeapCache {
         // would emit for a fresh call.  See `loopinvariant_resvalue` for
         // the rationale.
         Some((
-            self.loopinvariant_result.as_ref()?.to_opref(),
+            self.loopinvariant_result?,
             self.loopinvariant_resvalue.unwrap_or(0),
         ))
     }
@@ -2001,7 +1985,7 @@ impl HeapCache {
     ) {
         self.loopinvariant_descr = Some(descr_index);
         self.loopinvariant_arg0 = Some(arg0_int);
-        self.loopinvariant_result = Some(BoxRef::from_opref(result));
+        self.loopinvariant_result = Some(result);
         self.loopinvariant_resvalue = Some(resvalue);
     }
 
