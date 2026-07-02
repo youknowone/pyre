@@ -2771,6 +2771,17 @@ impl<'a> Transformer<'a> {
             let kind = cc.guess_call_kind(op);
             return match kind {
                 crate::call::CallKind::Regular => {
+                    // No `effective_call_result_ty` reconciliation here (only
+                    // the Residual arm below): an INLINED callee threads its
+                    // `Result<(), PyError>` unit `()` result as a live
+                    // `Ref`-carried value — a block inputarg / link arg the
+                    // regalloc must colour — not a droppable void.  Retyping
+                    // it to `Void` leaves an uncolourable carried variable
+                    // that `assembler.rs` `lookup_coloring` rejects.  The
+                    // residual case is different: `residual_call_v` genuinely
+                    // drops the result slot, so the reconciliation is safe
+                    // (and required) only there.  Keep the front-derived
+                    // `result_ty`.
                     self.handle_regular_call(op, target, args, result_ty, graph_name, graph)
                 }
                 crate::call::CallKind::Residual => {
@@ -2819,6 +2830,9 @@ impl<'a> Transformer<'a> {
                     self.handle_builtin_call(op, target, args, result_ty, graph_name, graph)
                 }
                 crate::call::CallKind::Recursive => {
+                    // Raw `result_ty`, no void-Result reconciliation — same
+                    // reason as the Regular arm: the inlined-portal callee
+                    // carries its unit result as a live `Ref`, not a void.
                     self.handle_recursive_call(op, target, args, result_ty, graph_name, graph)
                 }
             };
