@@ -345,7 +345,7 @@ def extract(args: argparse.Namespace) -> None:
         f'host.rustflags=["{crate_attr}"]',
     ]
 
-    for crate in args.crates or ALL_CRATES:
+    for crate in args.crates or DEFAULT_CRATES:
         path, flags = crate_info(root, crate, cargo_features)
         if not path.is_dir():
             raise SystemExit(f"extract-llbc.py: missing crate dir for '{crate}' at {path}")
