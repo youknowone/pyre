@@ -296,12 +296,17 @@ fn normalize_module_filter(module_paths: &[&str]) -> Option<std::collections::Ha
 /// Functions Charon could not extract (opaque body / `null` entry) or
 /// global-initializer bodies are skipped silently — they are not JIT
 /// call targets.  A function whose MIR shape the driver cannot yet lower
-/// produces a [`LowerError`] that is captured per-function: a recognised,
-/// tracked gap (an uninitialised-local read that survives even the
-/// reverse-postorder re-lower) degrades the program by dropping that one
-/// function, while any *unrecognised* lowering failure fails the
-/// whole-program build (the coverage gate at the end of this function) so
-/// a lowering regression cannot pass silently.
+/// produces a [`LowerError`] that is captured per-function: whether it is
+/// a recognised, tracked gap (an uninitialised-local read that survives
+/// even the reverse-postorder re-lower) or any other unrecognised failure,
+/// the function degrades the program by dropping that one function to a
+/// residual call — never a correctness loss.  This mirrors
+/// `exceptiontransform.py:212` `transform_completely`, which transforms
+/// every graph and leaves an un-rewritable one to the residual-call ABI
+/// rather than aborting the build.  The coverage gate at the end of this
+/// function reports the shape-coverage gap (split by category under
+/// `PYRE_MIR_FRONTEND_DEBUG=1`) and proceeds; the check.py suite is the
+/// regression net for a silent fallback.
 fn is_known_lowering_gap(msg: &str) -> bool {
     // The forward-reference shape: a body reads a MIR local on a path the
     // driver has not yet bound (`read of MIR local N before any Assign`).
@@ -859,17 +864,20 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
             for (name, msg) in &regressions {
                 detail.push_str(&format!("\n  - {name}: {msg}"));
             }
-            // Every `Result<T, PyError>` callee attempts the exception-link
-            // lowering, and the rewrite declines the caller / callee shapes
-            // it does not yet recognise.  Those declines are fail-safe — the
-            // graph degrades to a residual call, no miscompile — matching
-            // `exceptiontransform.py:212`, which transforms every graph and
-            // leaves an un-rewritable one to the residual-call ABI.  Report
-            // the shape-coverage gap and proceed; the check.py suite (and its
-            // perf comparison) is the regression net for a silent fallback.
+            // The un-tracked skips: a mix of `Result<T, PyError>` callees
+            // whose exception-link rewrite declined the caller / callee shape
+            // it does not yet recognise and any other MIR shape the driver
+            // cannot yet lower (e.g. a call block exit that does not carry the
+            // tracked value).  All are fail-safe — the graph degrades to a
+            // residual call, no miscompile — matching `exceptiontransform.py:212`,
+            // which transforms every graph and leaves an un-rewritable one to
+            // the residual-call ABI.  Report the shape-coverage gap and
+            // proceed; the check.py suite (and its perf comparison) is the
+            // regression net for a silent fallback.
             eprintln!(
-                "[result-exc] {} function(s) declined the exception-link \
-                 lowering (fail-safe → residual); shape-coverage gap:{detail}",
+                "[mir-coverage] {} function(s) with an unrecognised MIR shape \
+                 degraded to residual (fail-safe → no miscompile); \
+                 shape-coverage gap:{detail}",
                 regressions.len()
             );
         }
