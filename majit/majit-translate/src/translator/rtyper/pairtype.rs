@@ -665,6 +665,10 @@ fn dispatch_rtype_op(
         // reads through the `items` array out of its `length`/`items`
         // header struct (getfield "items" → setarrayitem).
         (ListRepr, IntegerRepr, "setitem") => committed(r1.rtype_setitem(hop)),
+        // rordereddict.py:448-455 — `pairtype(OrderedDictRepr, rmodel.Repr).rtype_setitem`.
+        // Same wildcard-`_` dispatch rationale as the `"getitem"` arm above
+        // (`r_key` is never read, only `r_dict.key_repr`).
+        (OrderedDictRepr, _, "setitem") => committed(r1.rtype_setitem(hop)),
 
         // rptr.py:165-184 — pointer comparison accepts any repr on the
         // other side and coerces both args to the pointer repr.
