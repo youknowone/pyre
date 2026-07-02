@@ -2350,36 +2350,15 @@ unsafe fn setitem_bytearray(obj: PyObjectRef, index: PyObjectRef, value: PyObjec
     if is_slice(index) {
         return setitem_bytearray_slice(obj, index, value);
     }
+    // `descr_setitem`: getindex_w(index) → byte_w(value) → _fixindex(idx).  The
+    // value is coerced to a byte *before* the index bounds are checked, so
+    // `ba[oob] = bad` raises the value's TypeError/ValueError, not IndexError.
     let idx = bytearray_index(index)?;
+    let v = byte_w(value, "byte")?;
     let len = pyre_object::bytearrayobject::w_bytearray_len(obj) as i64;
     let actual = if idx < 0 { len + idx } else { idx };
     if actual >= 0 && actual < len {
-        // The index bounds are checked first, matching `bytearray_ass_subscript`.
-        // `space.byte_w` inlined here, not called: the JIT-hot setitem path
-        // trips the codewriter's Int↔Ref kind-provenance check when it flows
-        // through the shared helper.  Same semantics — `__index__` coercion via
-        // `space.index`, then the `0 <= v < 256` range enforcement.
-        let v = if is_int(value) {
-            w_int_get_value(value)
-        } else {
-            let indexed = space_index(value)?;
-            if is_int(indexed) {
-                w_int_get_value(indexed)
-            } else {
-                // `space.index` may yield a long; one that overflows i64
-                // is necessarily outside 0..256 → the ValueError below.
-                let big = w_long_get_value(indexed);
-                if pyre_object::longobject::jit_bigint_to_i64_fits(big) != 0 {
-                    pyre_object::longobject::jit_bigint_to_i64_value(big)
-                } else {
-                    return Err(PyError::value_error("byte must be in range(0, 256)"));
-                }
-            }
-        };
-        if !(0..=255).contains(&v) {
-            return Err(PyError::value_error("byte must be in range(0, 256)"));
-        }
-        pyre_object::bytearrayobject::w_bytearray_setitem(obj, actual as usize, v as u8);
+        pyre_object::bytearrayobject::w_bytearray_setitem(obj, actual as usize, v);
         return Ok(w_none());
     }
     Err(PyError::new(

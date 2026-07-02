@@ -9221,6 +9221,11 @@ fn init_bytes_type(ns: &mut DictStorage) {
     dict_storage_store(ns, "__new__", make_new_descr(bytes_descr_new));
     dict_storage_store(
         ns,
+        "__bytes__",
+        make_builtin_function_with_arity("__bytes__", bytes_method_bytes, 1),
+    );
+    dict_storage_store(
+        ns,
         "decode",
         make_builtin_function("decode", bytes_method_decode),
     );
@@ -11559,6 +11564,21 @@ pub(crate) fn bytes_method_decode(args: &[PyObjectRef]) -> Result<PyObjectRef, c
 }
 
 /// PyPy: bytesobject.py descr_repr — returns a quoted literal like `b'hello'`.
+fn bytes_method_bytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    // `W_BytesObject.descr_bytes` ("convert this value to exact type bytes"):
+    // an exact `bytes` returns itself; a subclass returns a fresh exact-bytes
+    // copy of its value.
+    crate::type_methods::require_receiver(args, "__bytes__")?;
+    let self_ = args[0];
+    if unsafe { pyre_object::pyobject::is_exact_type(self_, &pyre_object::bytesobject::BYTES_TYPE) }
+    {
+        return Ok(self_);
+    }
+    Ok(pyre_object::bytesobject::w_bytes_from_bytes(unsafe {
+        pyre_object::bytesobject::bytes_like_data(self_)
+    }))
+}
+
 fn bytes_method_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::require_receiver(args, "__repr__")?;
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
