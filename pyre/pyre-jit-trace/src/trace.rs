@@ -1314,7 +1314,13 @@ fn run_perfn_walk(
     // replay applies) is present: drop the capture so the portal degrades
     // to `ContinueRunningNormally`.  This shares its predicate with the
     // store-journal commit below so the two decisions never disagree.
+    //
+    // Bridge walks are excluded: only the loop-free function portal consumes
+    // the finish stash without replaying.  A bridge `Terminate` walk's caller
+    // resumes the region through the blackhole, so keeping the stores here
+    // would double-apply them (once eagerly, once in the blackhole replay).
     let terminate_no_replay = crate::jitcode_dispatch::fbw_no_replay_exit_enabled()
+        && !is_bridge_trace
         && matches!(
             &walk_result,
             Ok((crate::jitcode_dispatch::DispatchOutcome::Terminate, _))
