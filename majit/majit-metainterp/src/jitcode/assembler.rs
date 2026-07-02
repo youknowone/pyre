@@ -68,6 +68,12 @@ pub struct JitCodeBuilder {
     /// `BC_RESIDUAL_CALL_*` operand is a 2-byte index into this pool
     /// (RPython `j`/`d` argcode → `descrs[idx]` dispatch).
     descrs: Vec<RuntimeBhDescr>,
+    /// Switch descriptors emitted before their target labels are known.
+    /// RPython `flatten.py:283-308` stores labels on `SwitchDictDescr`,
+    /// then `assembler.py:201-204` attaches concrete positions after
+    /// label resolution.  Keep the same two-stage flow for runtime-built
+    /// jitcodes.
+    pending_switches: Vec<(u16, Vec<(i64, u16)>)>,
     /// `descr.py:108-120` `gccache._cache_size[STRUCT]` analog: the
     /// per-struct `BhSizeSpec` (size + full `all_fielddescrs`) registered
     /// when a `new` for that struct type is emitted, so a following
@@ -1736,6 +1742,20 @@ impl JitCodeBuilder {
         self.push_u8(a as u8);
         self.push_u8(b as u8);
         self.push_label_ref(label);
+    }
+
+    /// Emit `switch/id`: one int register plus a 2-byte SwitchDictDescr
+    /// index.  RPython `flatten.py:270-308` emits the default path as the
+    /// fall-through after the switch; matching blackhole.py:954-960, a
+    /// missing key leaves the pc at the next instruction.
+    pub fn switch(&mut self, value: u16, cases: &[(i64, u16)]) {
+        self.touch_reg(value);
+        self.write_insn("switch/id");
+        self.push_reg_u8(value, "switch/id value");
+        let const_keys_in_order: Vec<i64> = cases.iter().map(|(key, _)| *key).collect();
+        let descr_idx = self.add_switch_descr(const_keys_in_order);
+        self.push_u16(descr_idx);
+        self.pending_switches.push((descr_idx, cases.to_vec()));
     }
 
     pub fn goto_if_not_int_ne(&mut self, a: u16, b: u16, label: u16) {
@@ -4245,9 +4265,23 @@ impl JitCodeBuilder {
         idx
     }
 
+    fn add_switch_descr(&mut self, mut const_keys_in_order: Vec<i64>) -> u16 {
+        const_keys_in_order.sort();
+        let idx = self.descrs.len() as u16;
+        // RPython creates one SwitchDictDescr object per switch site
+        // (`flatten.py:282-285`), so do not deduplicate.
+        self.descrs
+            .push(RuntimeBhDescr::Descr(CanonicalBhDescr::Switch {
+                dict: std::collections::HashMap::new(),
+                const_keys_in_order,
+            }));
+        idx
+    }
+
     pub fn finish(mut self) -> JitCode {
         self.flush_pending_resulttype();
         self.patch_labels();
+        self.patch_switch_descrs();
         self.patch_const_refs();
         self.patch_const_u8_refs();
         // RPython `jitcode.py:47 self._resulttypes = resulttypes`.
@@ -4766,6 +4800,33 @@ impl JitCodeBuilder {
         }
     }
 
+    fn patch_switch_descrs(&mut self) {
+        for (descr_idx, cases) in std::mem::take(&mut self.pending_switches) {
+            let dict = cases
+                .into_iter()
+                .map(|(key, label_idx)| {
+                    let target = self
+                        .labels
+                        .get(label_idx as usize)
+                        .copied()
+                        .flatten()
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "jitcode switch label {label_idx} was never marked for key {key}"
+                            )
+                        });
+                    (key, target)
+                })
+                .collect();
+            match self.descrs.get_mut(descr_idx as usize) {
+                Some(RuntimeBhDescr::Descr(CanonicalBhDescr::Switch { dict: slot, .. })) => {
+                    *slot = dict;
+                }
+                other => panic!("pending switch descr {descr_idx} is not Switch: {other:?}"),
+            }
+        }
+    }
+
     /// RPython `assembler.py:131-138` resolves a const-source operand
     /// to `count_regs[kind] + len(constants) - 1`. pyre performs the
     /// same resolution as a post-emission pass once per-kind
@@ -4878,6 +4939,7 @@ fn canonical_bh_descr_eq(lhs: &CanonicalBhDescr, rhs: &CanonicalBhDescr) -> bool
             CanonicalBhDescr::VableArray { index: lhs },
             CanonicalBhDescr::VableArray { index: rhs },
         ) => lhs == rhs,
+        (CanonicalBhDescr::Switch { .. }, CanonicalBhDescr::Switch { .. }) => false,
         (
             CanonicalBhDescr::Array {
                 base_size: lhs_base_size,
@@ -5011,6 +5073,7 @@ pub fn live_slots_for_state_field_jit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::blackhole::{BlackholeInterpBuilder, wire_bhimpl_handlers};
     use majit_translate::codewriter::assembler::Assembler;
 
     fn assert_resulttype_after(emit: impl FnOnce(&mut JitCodeBuilder), kind: char) {
@@ -5123,6 +5186,52 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    fn switch_return_jitcode() -> JitCode {
+        let mut builder = JitCodeBuilder::new();
+        let case_a = builder.new_label();
+        let case_b = builder.new_label();
+        let case_c = builder.new_label();
+        builder.switch(0, &[(-3, case_a), (7, case_b), (42, case_c)]);
+        builder.load_const_i_value(1, 10);
+        builder.int_return(1);
+        builder.mark_label(case_a);
+        builder.load_const_i_value(1, 20);
+        builder.int_return(1);
+        builder.mark_label(case_b);
+        builder.load_const_i_value(1, 30);
+        builder.int_return(1);
+        builder.mark_label(case_c);
+        builder.load_const_i_value(1, 40);
+        builder.int_return(1);
+        builder.finish()
+    }
+
+    fn run_switch_blackhole(input: i64) -> i64 {
+        let mut entries: majit_ir::VecMap<String, u8> = majit_ir::VecMap::new();
+        entries.insert("switch/id".to_string(), jitcode::insns::BC_SWITCH);
+        entries.insert("int_copy/i>i".to_string(), jitcode::insns::BC_MOVE_I);
+        entries.insert("int_return/i".to_string(), jitcode::insns::BC_INT_RETURN);
+        let mut builder = BlackholeInterpBuilder::new();
+        builder.setup_insns(&entries);
+        wire_bhimpl_handlers(&mut builder);
+        let mut bh = builder.acquire_interp();
+        bh.setposition(std::sync::Arc::new(switch_return_jitcode()), 0);
+        bh.registers_i[0] = input;
+        let _ = bh.run();
+        bh.tmpreg_i
+    }
+
+    #[test]
+    fn switch_builder_patches_descr_labels_for_blackhole() {
+        // RPython `flatten.py:270-308` + `blackhole.py:954-960` parity:
+        // matching keys jump to attached label positions; misses fall
+        // through to the default path immediately after the switch.
+        assert_eq!(run_switch_blackhole(-3), 20);
+        assert_eq!(run_switch_blackhole(7), 30);
+        assert_eq!(run_switch_blackhole(42), 40);
+        assert_eq!(run_switch_blackhole(99), 10);
     }
 
     #[test]

@@ -119,6 +119,54 @@ pub(crate) fn assign_caller_local_layout(
     (layout, max_pre_bound)
 }
 
+/// Floor for a split sub-JitCode body's flat `next_reg`: the max of the int
+/// and ref identity-slot ends, so body-side `alloc_reg()` never reuses a
+/// reserved identity slot. Inert (0) when `split_dispatch` is off or the
+/// kernel has no identity slots.
+fn split_identity_floor(config: Option<&LowererConfig>) -> u16 {
+    config
+        .filter(|c| c.split_dispatch)
+        .map(|c| {
+            let (int_end, ref_end) = c.split_identity_reg_ends();
+            int_end.max(ref_end)
+        })
+        .unwrap_or(0)
+}
+
+/// Compile-time guard for `split_dispatch`: no caller-local may be pre-bound
+/// into its bank's reserved identity range `[identity_base, identity_end)`.
+/// Those registers hold the virtualizable identity (array base/len, state
+/// scalars) that the arm body's `load/store_state_field` ops address and the
+/// resume path re-derives at deopt; a caller-local packed onto one would share
+/// the physical register and be read as the identity slot (or vice-versa) — a
+/// silent miscompile that the `frame.rs` trim's `is_none()` gate cannot catch,
+/// since the arg writes the slot `Some`. Caller-locals pack densely from reg 0,
+/// so the first int local lands at reg 0 (below `int_identity_base` = 1) and is
+/// safe; this only fires if an arm captures a SECOND identity-range local.
+/// Inert unless `split_dispatch` is on.
+fn assert_no_split_identity_alias(layout: &[CallerLocalLayout], config: Option<&LowererConfig>) {
+    let Some(config) = config.filter(|c| c.split_dispatch) else {
+        return;
+    };
+    let (int_end, ref_end) = config.split_identity_reg_ends();
+    for entry in layout {
+        let (base, end, bank) = match entry.kind {
+            BindingKind::Int => (config.int_identity_base(), int_end, "int"),
+            BindingKind::Ref => (config.ref_identity_base(), ref_end, "ref"),
+            BindingKind::Float => continue,
+        };
+        assert!(
+            !(base <= entry.callee_reg && entry.callee_reg < end),
+            "split_dispatch: caller-local `{}` binds {bank}-reg {} inside the \
+             reserved identity range [{base}, {end}). A split arm may capture at \
+             most {base} {bank} caller-local(s); offset the arg packing past the \
+             identity range or reduce the arm's captured locals.",
+            entry.name,
+            entry.callee_reg,
+        );
+    }
+}
+
 #[allow(private_interfaces)]
 pub(crate) fn try_generate_jitcode_body_parts_with_caller_bindings(
     body: &Expr,
@@ -142,6 +190,7 @@ pub(crate) fn try_generate_jitcode_body_parts_with_caller_bindings(
     lowerer.in_dispatch_arm_body = true;
 
     let (layout, max_pre_bound) = assign_caller_local_layout(caller_locals);
+    assert_no_split_identity_alias(&layout, config);
     for entry in &layout {
         lowerer.bindings.insert(
             entry.name.clone(),
@@ -156,7 +205,10 @@ pub(crate) fn try_generate_jitcode_body_parts_with_caller_bindings(
     // body-side `alloc_reg()` cannot reuse any pre-bound slot in any
     // bank.  Mirrors the `next_reg.max(1)` advance after the
     // pc=Int(0)+program=Ref(0) pre-bind in `lower_dispatch_body`.
-    lowerer.next_reg = lowerer.next_reg.max(max_pre_bound);
+    lowerer.next_reg = lowerer
+        .next_reg
+        .max(max_pre_bound)
+        .max(split_identity_floor(config));
 
     for stmt in &stmts {
         lowerer.lower_stmt(stmt)?;
@@ -206,6 +258,7 @@ pub(crate) fn try_generate_jitcode_pc_return_body_with_caller_bindings(
     lowerer.in_dispatch_arm_body = true;
 
     let (layout, max_pre_bound) = assign_caller_local_layout(caller_locals);
+    assert_no_split_identity_alias(&layout, config);
     for entry in &layout {
         lowerer.bindings.insert(
             entry.name.clone(),
@@ -216,7 +269,10 @@ pub(crate) fn try_generate_jitcode_pc_return_body_with_caller_bindings(
             },
         );
     }
-    lowerer.next_reg = lowerer.next_reg.max(max_pre_bound);
+    lowerer.next_reg = lowerer
+        .next_reg
+        .max(max_pre_bound)
+        .max(split_identity_floor(config));
 
     for stmt in work {
         lowerer.lower_stmt(stmt)?;

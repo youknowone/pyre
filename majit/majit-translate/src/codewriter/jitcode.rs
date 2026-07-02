@@ -1253,6 +1253,7 @@ pub enum BhDescr {
     /// SwitchDictDescr: maps int values to bytecode positions.
     Switch {
         dict: std::collections::HashMap<i64, usize>,
+        const_keys_in_order: Vec<i64>,
     },
     /// Virtualizable field descriptor: index into VirtualizableInfo.static_fields.
     /// NOT a byte offset — the blackhole resolves it via `vinfo.static_fields[index].offset`.
@@ -1575,8 +1576,19 @@ impl BhDescr {
     /// Lookup switch value → position.
     pub fn switch_lookup(&self, value: i64) -> Option<usize> {
         match self {
-            BhDescr::Switch { dict } => dict.get(&value).copied(),
+            BhDescr::Switch { dict, .. } => dict.get(&value).copied(),
             _ => None,
+        }
+    }
+
+    /// Ordered switch keys used by the tracer miss path.
+    pub fn switch_const_keys_in_order(&self) -> &[i64] {
+        match self {
+            BhDescr::Switch {
+                const_keys_in_order,
+                ..
+            } => const_keys_in_order,
+            _ => &[],
         }
     }
 }

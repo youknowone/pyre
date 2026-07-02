@@ -115,6 +115,46 @@ pub(super) fn extract_pat_value_tokens(pat: &Pat) -> Option<Vec<TokenStream>> {
     }
 }
 
+/// Case emitters for `switch_dispatch`.
+///
+/// Literal/path/or arms become direct `cases.push((key, label))` statements.
+/// Range endpoints are emitted as generated-code expressions because const
+/// paths cannot be evaluated inside the proc macro; the user crate resolves
+/// them while building the JitCode.
+pub(super) fn extract_pat_switch_case_tokens(
+    pat: &Pat,
+    arm_label: &syn::Ident,
+) -> Option<Vec<TokenStream>> {
+    match pat {
+        Pat::Lit(_) | Pat::Path(_) | Pat::Ident(_) => {
+            let values = extract_pat_value_tokens(pat)?;
+            Some(
+                values
+                    .into_iter()
+                    .map(|value| quote! { __switch_cases.push(((#value), #arm_label)); })
+                    .collect(),
+            )
+        }
+        Pat::Or(pat_or) => {
+            let mut tokens = Vec::new();
+            for case in &pat_or.cases {
+                tokens.extend(extract_pat_switch_case_tokens(case, arm_label)?);
+            }
+            Some(tokens)
+        }
+        Pat::Range(range) => {
+            let start = range.start.as_ref()?;
+            let end = range.end.as_ref()?;
+            Some(vec![quote! {
+                for __v in ((#start as i64)..=(#end as i64)) {
+                    __switch_cases.push((__v, #arm_label));
+                }
+            }])
+        }
+        _ => None,
+    }
+}
+
 pub(super) fn int_arg_regs(bindings: &[Binding]) -> Option<Vec<u16>> {
     bindings
         .iter()

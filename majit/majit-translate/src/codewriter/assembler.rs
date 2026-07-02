@@ -434,6 +434,8 @@ impl Assembler {
             let AssemblerDescr::PendingSwitch { cases } = descr else {
                 continue;
             };
+            let mut const_keys_in_order: Vec<i64> = cases.iter().map(|(key, _)| *key).collect();
+            const_keys_in_order.sort();
             let dict = cases
                 .iter()
                 .map(|(key, label)| {
@@ -447,7 +449,10 @@ impl Assembler {
                     (*key, target)
                 })
                 .collect();
-            *descr = AssemblerDescr::Ready(crate::jitcode::BhDescr::Switch { dict });
+            *descr = AssemblerDescr::Ready(crate::jitcode::BhDescr::Switch {
+                dict,
+                const_keys_in_order,
+            });
         }
 
         // RPython assembler.py:271-281: jitcode.setup(code, ...)
@@ -4205,7 +4210,7 @@ impl AssemblerDescrKey {
                 result_erased: calldescr.result_erased,
                 effect: EffectInfoKey::from_effect_info(&calldescr.extra_info),
             },
-            crate::jitcode::BhDescr::Switch { dict } => {
+            crate::jitcode::BhDescr::Switch { dict, .. } => {
                 let mut items: Vec<_> = dict.iter().map(|(key, value)| (*key, *value)).collect();
                 items.sort_unstable_by_key(|(key, _)| *key);
                 Self::Switch(items)

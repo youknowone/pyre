@@ -838,6 +838,15 @@ pub trait JitCodeSym {
         self.total_slots()
     }
 
+    /// First int-bank register used as a canonical identity slot
+    /// (`int_scalar_base`). Identity slots occupy `[base, end)`; the base
+    /// keeps the dispatch JitCode's int argument registers (`pc` at i0)
+    /// out of the seeded range. Default 0 for symbols with no reserved
+    /// argument prefix; the macro-generated symbol overrides it.
+    fn int_identity_slots_base(&self) -> usize {
+        0
+    }
+
     /// Bridge state-field JIT's `__JitSym` storage onto
     /// `MIFrame.int_regs` / `int_values` ahead of guard capture.
     ///
@@ -892,6 +901,43 @@ pub trait JitCodeSym {
     /// value-mirror seeding from `JitState::initialize_sym`) is
     /// removed.
     fn populate_frame_int_regs(&self, _frame: &mut MIFrame) {}
+
+    /// [FR] Seed an INLINE recursive-portal callee frame's int register bank
+    /// with its FRESH state as compile-time CONSTANTS (scalars zeroed, virt
+    /// arrays sized at the caller's captured capacity).  The state-field
+    /// dispatch keeps each scalar (e.g. `stackpos`) in a working int register
+    /// threaded through the loop, distinct from the vable shadow; entering the
+    /// callee at offset 0 re-reads that register, so it must hold the fresh 0
+    /// rather than inheriting the caller's promoted value.  Constants (not the
+    /// input-arg OpRefs `populate_frame_int_regs` uses) because an inline
+    /// callee's fresh state is known at the call site.  Slot layout mirrors
+    /// `populate_frame_int_regs` / `live_slots_for_state_field_jit`.  Default
+    /// no-op: shapes without a fresh-entry (ref scalars / opaque carriers)
+    /// never reach the inline path.
+    fn seed_recursive_fresh_frame(&self, _frame: &mut MIFrame) {}
+
+    /// [FR] Snapshot the sym's WORKING scalar (and fixed-array) state before an
+    /// inline recursive-portal callee overwrites it.  `BC_LOAD/STORE_STATE_FIELD`
+    /// read/write the single shared sym (dispatch.rs:2831), not a per-frame
+    /// register, so an inline callee mutates the caller's live scalar state in
+    /// place; the caller's values must be saved here and restored on return.
+    /// Virt-array elements live in the vable shadow (nested separately), so only
+    /// scalars + fixed arrays are captured.  Flat `(OpRef, value)` pairs in
+    /// `state_field` then `state_array` order.  `None` default: non-state-field
+    /// syms never reach the inline path.
+    fn snapshot_inline_scalar_state(&self) -> Option<Vec<(majit_ir::OpRef, i64)>> {
+        None
+    }
+
+    /// [FR] Reset the sym's working scalar/fixed-array state to FRESH (zeroed),
+    /// so the inline callee starts from a clean state rather than inheriting the
+    /// caller's.  Paired with [`Self::snapshot_inline_scalar_state`].
+    fn reset_inline_scalar_state_fresh(&mut self) {}
+
+    /// [FR] Restore the sym's working scalar/fixed-array state from a snapshot
+    /// when the inline callee returns.  Paired with
+    /// [`Self::snapshot_inline_scalar_state`].
+    fn restore_inline_scalar_state(&mut self, _snapshot: Vec<(majit_ir::OpRef, i64)>) {}
 
     /// #184 recursive CALL_ASSEMBLER portal entry: build the fresh-frame
     /// reds for a recursive callee run.
@@ -1029,6 +1075,31 @@ pub trait JitCodeRuntime {
     ) -> Option<i64> {
         None
     }
+}
+
+/// [FR] WIP gate for the state-field recursive-portal Inline re-entry rework.
+/// OFF by default: the state-field `portal_jitcode`-None path keeps its
+/// clean-abort fallback so existing consumers are unaffected. Set
+/// `MAJIT_PORTAL_INLINE=1` to exercise the experimental inline path.
+pub(crate) fn portal_inline_experiment_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("MAJIT_PORTAL_INLINE").is_some());
+    *ENABLED
+}
+
+thread_local! {
+    /// [FR-EXPERIMENT] One stable fresh-callee state per jitdriver, keyed by
+    /// `jd_index`.  A recursive-portal INLINE call re-uses this address as the
+    /// callee's vable identity so the const does not vary across unroll
+    /// iterations (a fresh leak per call bakes an iteration-varying const into
+    /// the callee's recorded ops and the loop never matches a prior iteration).
+    /// The callee's shadow is re-zeroed from `recursive_fresh_entry_reds` each
+    /// call, so re-using one backing object is safe.  Owners are leaked into
+    /// this map to keep the address valid for the process (experiment; a
+    /// trace-scoped arena is the follow-up).
+    static PORTAL_FRESH_STATE: std::cell::RefCell<
+        std::collections::HashMap<usize, majit_ir::GcRef>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
 pub struct ClosureRuntime<FLabel> {
@@ -1430,6 +1501,7 @@ where
                 &virtualizable_snapshot,
                 &virtualref_snapshot,
                 identity_const,
+                Some((sym.int_identity_slots_base(), sym.int_identity_slots_end())),
             );
             for idx in 0..n {
                 // RPython pyjitpl.py:180-193 leaves the parent frame's
@@ -1826,11 +1898,24 @@ where
         crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
     }
 
-    fn pop_exception_frame(&mut self, ctx: &mut TraceCtx) {
+    /// Pop the current frame during a return / exception unwind.  Restores
+    /// the caller's nested standard vable (installed by a recursive-portal
+    /// INLINE frame on push) and returns the frame's nested sym scalar-state
+    /// snapshot, if any, so a `sym`-holding caller can restore it (this
+    /// method has no `sym` in scope).
+    fn pop_exception_frame(&mut self, ctx: &mut TraceCtx) -> Option<Vec<(OpRef, i64)>> {
         if let Some(frame) = self.frames.pop() {
             if frame.inline_frame {
                 ctx.pop_inline_frame();
             }
+            // [FR] A recursive-portal INLINE frame installed its callee's
+            // fresh standard vable on push; restore the caller's on return.
+            if frame.portal_vable_saved {
+                ctx.restore_saved_virtualizable();
+            }
+            frame.portal_scalar_state
+        } else {
+            None
         }
     }
 
@@ -2379,57 +2464,171 @@ where
             // (pyjitpl.py falls to `do_residual_call`; pyre retries).
             return TraceAction::Abort;
         }
-        let portal = match runtime.portal_jitcode(jd_index) {
-            Some(portal) => portal,
+        // pc-aligned portal runtimes (dispatch.rs test fixtures) wire
+        // `portal_jitcode`; enter their portal at `green_pc` as before.
+        if let Some(portal) = runtime.portal_jitcode(jd_index) {
+            let mut portal_frame = MIFrame::setup(portal, green_pc, None, Some(ctx));
+            portal_frame.code_cursor = green_pc;
+            ctx.push_inline_frame((jd_index, green_pc), u32::MAX);
+            portal_frame.inline_frame = true;
+            for (kind, caller_src, callee_dst) in arg_triples {
+                match kind {
+                    JitArgKind::Int => {
+                        let (value, concrete) = self.read_int_reg(caller_src);
+                        portal_frame.int_regs[callee_dst] = Some(value);
+                        portal_frame.int_values[callee_dst] = Some(concrete);
+                    }
+                    JitArgKind::Ref => {
+                        let (value, concrete) = self.read_ref_reg(caller_src);
+                        portal_frame.ref_regs[callee_dst] = Some(value);
+                        portal_frame.ref_values[callee_dst] = Some(concrete);
+                    }
+                    JitArgKind::Float => {
+                        let (value, concrete) = self.read_float_reg(caller_src);
+                        portal_frame.float_regs[callee_dst] = Some(value);
+                        portal_frame.float_values[callee_dst] = Some(concrete);
+                    }
+                }
+            }
+            match result_kind {
+                Some(JitArgKind::Int) => portal_frame.return_i = result_dst,
+                Some(JitArgKind::Ref) => portal_frame.return_r = result_dst,
+                Some(JitArgKind::Float) => portal_frame.return_f = result_dst,
+                None => {}
+            }
+            self.frames.push(portal_frame);
+            return TraceAction::Continue;
+        }
+
+        // State-field production runtime leaves `portal_jitcode` None.  The
+        // Inline path for that shape is the [FR] re-entry rework, WIP and
+        // gated OFF by default so existing consumers keep the clean-abort
+        // fallback (dispatch.rs:2412 legacy behavior).
+        if !portal_inline_experiment_enabled() {
+            return TraceAction::Abort;
+        }
+
+        // [FR] State-field recursive-portal INLINE.  The portal jitcode is
+        // the dispatch-body jitcode currently being traced (one jitcode per
+        // program; self-recursion and same-program leaf calls re-enter the
+        // same body at a different interpreter pc).  The state-field body is
+        // entered at offset 0 with the interpreter pc carried as the `pc`
+        // green and the callee's own reds seeded by `setup_call`, exactly as
+        // a normal trace entry (`__trace_*` builds
+        // `[program(Ref), pc(Int), vable_identity(Ref)]`; setup_call packs
+        // per kind densely so program→ref0, vable→ref1, pc→int0).
+        let portal = self.frames.current_mut().jitcode.clone();
+
+        // The callee runs on a FRESH virtualizable (fresh stack, scalars
+        // zeroed).  `recursive_fresh_entry_reds` yields the extract_live
+        // image [scalars…, &state Ref, len…]; the entry argbox needs only
+        // the vable identity Ref (ref reg 1).  Its concrete shadow is real
+        // memory the inline walk reads/writes until the callee returns.
+        let (fresh_values, fresh_owner) = match sym.recursive_fresh_entry_reds() {
+            Some(pair) => pair,
             None => return TraceAction::Abort,
         };
+        // Reuse a STABLE fresh-callee address per driver (PORTAL_FRESH_STATE):
+        // a new leak per call would bake an iteration-varying const into the
+        // callee's recorded ops.  The shadow is re-zeroed each call, so reuse
+        // is safe.
+        let Some(fresh_ref) = fresh_values.iter().find_map(|v| match v {
+            majit_ir::Value::Ref(r) => Some(*r),
+            _ => None,
+        }) else {
+            return TraceAction::Abort;
+        };
+        let vable_ref = PORTAL_FRESH_STATE.with(|cell| {
+            let mut map = cell.borrow_mut();
+            *map.entry(jd_index).or_insert_with(|| {
+                let _: &'static mut dyn core::any::Any = Box::leak(fresh_owner);
+                fresh_ref
+            })
+        });
+        // The stable address supersedes this call's fresh Ref throughout.
+        let fresh_values: Vec<majit_ir::Value> = fresh_values
+            .into_iter()
+            .map(|v| match v {
+                majit_ir::Value::Ref(_) => majit_ir::Value::Ref(vable_ref),
+                other => other,
+            })
+            .collect();
 
-        // Build the portal frame entering at `green_pc`.  `code_cursor`
-        // must be set explicitly because `MIFrame::new` always starts the
-        // cursor at 0 regardless of the entry pc.
-        //
-        // NOTE: this `code_cursor = green_pc` entry models a *pc-aligned*
-        // portal jitcode (one jitcode per interpreter pc, the full-portal
-        // shape `opimpl_recursive_call` assumes).  The `#[jit_interp]`
-        // state-field JIT instead compiles a single dispatch-body jitcode
-        // entered at offset 0 with the interpreter pc carried as a
-        // green/red value (`trace_jitcode_with_args_and_runtime` resets
-        // `frame.pc = 0` via `setup_call` and tracks the interpreter pc as
-        // `outer_program_pc`).  For that shape this frame setup must instead
-        // enter at offset 0, seed the dispatch body's `program` / `pc` /
-        // fresh-vable reds, and let the inline-frame merge point walk the
-        // callee opcodes to its RETURN.  The state-field production runtime
-        // (`ClosureRuntimeWithResolver`) therefore leaves `portal_jitcode`
-        // at the `None` default so this path aborts cleanly (graceful
-        // interpreter fallback) until that re-entry rework lands; the
-        // pc-aligned form below is exercised only by pc-aligned-portal
-        // runtimes.
-        let mut portal_frame = MIFrame::setup(portal, green_pc, None, Some(ctx));
-        portal_frame.code_cursor = green_pc;
+        // Entry argboxes: greens in declaration order, then the fresh vable
+        // identity.  Kind-dense packing puts the single ref green `program`
+        // in ref0 and the fresh vable in ref1, matching the compiled
+        // dispatch body's entry register layout.
+        let mut argboxes: Vec<(JitArgKind, OpRef, i64)> = Vec::with_capacity(green_srcs.len() + 1);
+        for (i, &(kind, _src)) in green_srcs.iter().enumerate() {
+            let concrete = green_values[i];
+            let opref = match kind {
+                JitArgKind::Ref => OpRef::const_ptr(majit_ir::GcRef(concrete as usize)),
+                _ => OpRef::const_int(concrete),
+            };
+            argboxes.push((kind, opref, concrete));
+        }
+        argboxes.push((
+            JitArgKind::Ref,
+            OpRef::const_ptr(vable_ref),
+            vable_ref.0 as i64,
+        ));
+
+        let mut portal_frame = MIFrame::setup(portal, 0, None, Some(ctx));
+        portal_frame.setup_call(&argboxes);
+        // Seed the callee's working state-field int registers (scalars +
+        // virt-array ptr/len) with fresh CONSTANTS.  `setup_call` only wired
+        // the greens + vable identity; the dispatch re-reads `stackpos` etc.
+        // from these int registers at the callee's offset-0 merge point, so
+        // without this seed the callee inherits the caller's promoted values.
+        sym.seed_recursive_fresh_frame(&mut portal_frame);
         ctx.push_inline_frame((jd_index, green_pc), u32::MAX);
         portal_frame.inline_frame = true;
 
-        for (kind, caller_src, callee_dst) in arg_triples {
-            match kind {
-                JitArgKind::Int => {
-                    let (value, concrete) = self.read_int_reg(caller_src);
-                    portal_frame.int_regs[callee_dst] = Some(value);
-                    portal_frame.int_values[callee_dst] = Some(concrete);
-                }
-                JitArgKind::Ref => {
-                    let (value, concrete) = self.read_ref_reg(caller_src);
-                    portal_frame.ref_regs[callee_dst] = Some(value);
-                    portal_frame.ref_values[callee_dst] = Some(concrete);
-                }
-                JitArgKind::Float => {
-                    let (value, concrete) = self.read_float_reg(caller_src);
-                    portal_frame.float_regs[callee_dst] = Some(value);
-                    portal_frame.float_values[callee_dst] = Some(concrete);
+        // Install the callee's FRESH virtualizable as the standard vable for
+        // the duration of the inline walk (single standard vable nested across
+        // the call), saving the caller's to restore when the frame returns.
+        // `recursive_fresh_entry_reds` yields [scalars…, &state Ref, lengths…]
+        // in extract_live order: the vinfo's scalar field values, then the
+        // vable identity Ref, then one length per array field. The standard
+        // boxes want the fully flattened shape [field0…fieldN, arr0[0]…arr0[L0],
+        // arr1[0]…, vable_ref]; a fresh callee zero-fills every array element
+        // (item_type-typed zero).
+        if let Some(info) = ctx.current_virtualizable_info() {
+            let ref_pos = fresh_values
+                .iter()
+                .position(|v| matches!(v, majit_ir::Value::Ref(_)))
+                .unwrap_or(fresh_values.len());
+            let array_lengths: Vec<usize> = fresh_values[ref_pos.saturating_add(1)..]
+                .iter()
+                .map(|v| match v {
+                    majit_ir::Value::Int(n) => *n as usize,
+                    _ => 0,
+                })
+                .collect();
+            let mut vable_values: Vec<majit_ir::Value> = fresh_values[..ref_pos].to_vec();
+            for (a, &len) in array_lengths.iter().enumerate() {
+                let item_ty = info.array_fields[a].item_type;
+                for _ in 0..len {
+                    vable_values.push(super::heap_value_for_pub(item_ty, 0));
                 }
             }
+            let vable_oprefs: Vec<OpRef> = vable_values
+                .iter()
+                .map(OpRef::const_inline_from_value)
+                .collect();
+            ctx.push_saved_virtualizable();
+            ctx.init_virtualizable_boxes(
+                &info,
+                OpRef::const_ptr(vable_ref),
+                majit_ir::Value::Ref(vable_ref),
+                &vable_oprefs,
+                &vable_values,
+                &array_lengths,
+            );
+            portal_frame.portal_vable_saved = true;
         }
 
-        // Wire the return slot so the portal's `*_return` writes its
+        // Wire the return slot so the callee's typed return writes its
         // result back into the caller's destination register
         // (BC_INLINE_CALL:3348-3350).
         match result_kind {
@@ -2437,6 +2636,15 @@ where
             Some(JitArgKind::Ref) => portal_frame.return_r = result_dst,
             Some(JitArgKind::Float) => portal_frame.return_f = result_dst,
             None => {}
+        }
+
+        // Nest the shared sym's WORKING scalar/fixed-array state: the callee
+        // reads/writes it in place (dispatch.rs:2831 `BC_LOAD/STORE_STATE_FIELD`
+        // hit the single `sym`), so snapshot the caller's, reset to fresh, and
+        // restore when the frame returns (`run_one_step` pop).
+        if let Some(snapshot) = sym.snapshot_inline_scalar_state() {
+            portal_frame.portal_scalar_state = Some(snapshot);
+            sym.reset_inline_scalar_state_fresh();
         }
 
         self.frames.push(portal_frame);
@@ -2633,6 +2841,14 @@ where
             let finished_frame = self.frames.pop().expect("finished frame stack was empty");
             if finished_frame.inline_frame {
                 ctx.pop_inline_frame();
+            }
+            // [FR] Restore the caller's sym scalar/fixed-array state that this
+            // inline recursive-portal frame overwrote, and its nested vable.
+            if let Some(snapshot) = finished_frame.portal_scalar_state.clone() {
+                sym.restore_inline_scalar_state(snapshot);
+            }
+            if finished_frame.portal_vable_saved {
+                ctx.restore_saved_virtualizable();
             }
             if let Some(parent) = self.frames.frames.last_mut() {
                 if let Some((return_kind, callee_src)) =
@@ -3712,6 +3928,55 @@ where
                     ctx, sym, opcode, lhs, rhs, taken, opcode_pc, target,
                 );
             }
+            // RPython `pyjitpl.py:598-617 opimpl_switch`: a hit promotes the
+            // switched value with GUARD_VALUE and jumps to the case target;
+            // a miss records INT_EQ + GUARD_FALSE for every ordered key and
+            // falls through to the default path after the switch.
+            jitcode::insns::BC_SWITCH => {
+                // Canonical `id` encoding (`assembler.py:165-174,
+                // 197-207`): [value:u8][descr:u16].
+                let (opcode_pc, value_idx, descr_idx) = {
+                    let frame = self.frames.current_mut();
+                    let opcode_pc = frame.code_cursor - 1;
+                    (
+                        opcode_pc,
+                        frame.next_u8() as usize,
+                        frame.next_u16() as usize,
+                    )
+                };
+                let descr = self.frames.current_mut().jitcode.exec.descrs[descr_idx]
+                    .as_bh_descr()
+                    .unwrap_or_else(|| panic!("BC_SWITCH descrs[{descr_idx}] is not a BhDescr"))
+                    .clone();
+                let (value_box, concrete_value) = self.read_int_reg(value_idx);
+                if let Some(target) = descr.switch_lookup(concrete_value) {
+                    let const_ref = ctx.const_int(concrete_value);
+                    self.record_state_guard(
+                        ctx,
+                        sym,
+                        OpCode::GuardValue,
+                        &[value_box, const_ref],
+                        opcode_pc,
+                        false,
+                    );
+                    self.set_int_reg(value_idx, Some(const_ref), Some(concrete_value));
+                    self.frames.current_mut().code_cursor = target;
+                } else {
+                    for &key in descr.switch_const_keys_in_order() {
+                        let key_ref = ctx.const_int(key);
+                        let cond = ctx.record_op(OpCode::IntEq, &[value_box, key_ref]);
+                        ctx.set_opref_concrete(cond, majit_ir::Value::Int(0));
+                        self.record_state_guard(
+                            ctx,
+                            sym,
+                            OpCode::GuardFalse,
+                            &[cond],
+                            opcode_pc,
+                            false,
+                        );
+                    }
+                }
+            }
             jitcode::insns::BC_GOTO_IF_NOT_PTR_ISZERO
             | jitcode::insns::BC_GOTO_IF_NOT_PTR_NONZERO => {
                 // Canonical `rL` encoding: [src:u8][target:u16].
@@ -3985,6 +4250,19 @@ where
                         }
                     }
                 }
+                // [FR] pyjitpl.py:1551 `if self.metainterp.portal_call_depth:
+                // return` — a jit_merge_point reached INSIDE an inline
+                // recursive-portal callee is NOT the traced loop's header, so
+                // it is a pure no-op: skip both the auto loop-header stamp and
+                // the close protocol below.  Without this, the callee's merge
+                // point (it shares the caller's dispatch jitcode, entered at
+                // offset 0) resets `seen_loop_header_for_jdindex` to -1, and the
+                // real outer header then falls through instead of closing.  The
+                // payload cursor was already advanced above, so the callee
+                // continues to its next opcode.  Gated to the FR experiment.
+                if portal_inline_experiment_enabled() && ctx.inline_depth() > 0 {
+                    return TraceAction::Continue;
+                }
                 // pyjitpl.py:1547-1556 opimpl_jit_merge_point auto
                 // loop-header.  When `seen_loop_header_for_jdindex < 0`
                 // (no explicit `BC_LOOP_HEADER` has stamped the flag yet),
@@ -4191,13 +4469,6 @@ where
                 let mut sub_frame = MIFrame::setup(sub_jitcode, 0, None, Some(ctx));
                 ctx.push_inline_frame((sub_idx, pc), u32::MAX);
                 sub_frame.inline_frame = true;
-                // State-field-JIT multi-frame snapshot wiring: remember
-                // which descrs slot of the *parent* frame's jitcode
-                // produced this sub-jitcode so `build_state_field_snapshot`
-                // can pack it into the per-frame `SnapshotFrame.jitcode_index`
-                // (resolve_jitcode walks `parent.descrs[idx].as_jitcode()`
-                // on resume).
-                sub_frame.parent_descr_idx = sub_idx as u32;
                 for (kind, caller_src, callee_dst) in arg_triples {
                     match kind {
                         JitArgKind::Int => {
@@ -4278,7 +4549,9 @@ where
                 let src = self.frames.current_mut().next_u8() as usize;
                 let (opref, concrete) = self.read_int_reg(src);
                 let target = self.frames.current_mut().return_i;
-                self.pop_exception_frame(ctx);
+                if let Some(snapshot) = self.pop_exception_frame(ctx) {
+                    sym.restore_inline_scalar_state(snapshot);
+                }
                 if let Some(target_idx) = target {
                     debug_assert!(
                         !self.frames.is_empty(),
@@ -4307,7 +4580,9 @@ where
                 let value = self.frames.current_mut().next_u8() as i8 as i64;
                 let opref = OpRef::ConstInt(value);
                 let target = self.frames.current_mut().return_i;
-                self.pop_exception_frame(ctx);
+                if let Some(snapshot) = self.pop_exception_frame(ctx) {
+                    sym.restore_inline_scalar_state(snapshot);
+                }
                 if let Some(target_idx) = target {
                     debug_assert!(
                         !self.frames.is_empty(),
@@ -4332,7 +4607,9 @@ where
                 let src = self.frames.current_mut().next_u8() as usize;
                 let (opref, concrete) = self.read_ref_reg(src);
                 let target = self.frames.current_mut().return_r;
-                self.pop_exception_frame(ctx);
+                if let Some(snapshot) = self.pop_exception_frame(ctx) {
+                    sym.restore_inline_scalar_state(snapshot);
+                }
                 if let Some(target_idx) = target {
                     debug_assert!(
                         !self.frames.is_empty(),
@@ -4357,7 +4634,9 @@ where
                 let src = self.frames.current_mut().next_u8() as usize;
                 let (opref, concrete) = self.read_float_reg(src);
                 let target = self.frames.current_mut().return_f;
-                self.pop_exception_frame(ctx);
+                if let Some(snapshot) = self.pop_exception_frame(ctx) {
+                    sym.restore_inline_scalar_state(snapshot);
+                }
                 if let Some(target_idx) = target {
                     debug_assert!(
                         !self.frames.is_empty(),
@@ -4379,7 +4658,9 @@ where
             }
             jitcode::insns::BC_VOID_RETURN => {
                 self.clear_exception();
-                self.pop_exception_frame(ctx);
+                if let Some(snapshot) = self.pop_exception_frame(ctx) {
+                    sym.restore_inline_scalar_state(snapshot);
+                }
                 if self.frames.is_empty() {
                     // pyjitpl.py:3202 compile_done_with_this_frame exits=[];
                     // pyjitpl.rs:13136 maps empty finish_arg_types to
@@ -7257,14 +7538,12 @@ pub fn call_void_function(func_ptr: *const (), args: &[i64]) {
 /// `opencoder.py:769 _ensure_parent_resumedata`, so the in-flight inline
 /// call result register is cleared before liveness is read.
 ///
-/// `jitcode_index` mirrors RPython `resume.py:1338-1340`'s `jitcode_pos`
-/// (an index into `metainterp_sd.jitcodes`).  Per-driver pyre layout:
-/// - root frame → `0` sentinel; resume resolves through
-///   `JitDriver::dispatch_jitcode` (the singleton equivalent of
-///   `metainterp_sd.jitcodes[portal_jd.index]`).
-/// - non-root frames → `MIFrame.parent_descr_idx` (set by
-///   `BC_INLINE_CALL` at sub-frame setup); resume walks
-///   `parent.descrs[idx].as_jitcode()`.
+/// `jitcode_index` mirrors RPython `resume.py:1050/1338`'s `jitcode_pos`
+/// (an index into `metainterp_sd.jitcodes`). Every frame — root and inline —
+/// stamps its own ABSOLUTE global index (`JitCode::index`, assigned in
+/// `register_dispatch_jitcode`: root = 0, sub-JitCodes = their flat-registry
+/// slot). Resume resolves it statelessly via `jitcode_registry.get(index)`
+/// with no root/sub branch and no parent-relative `descrs` walk.
 pub fn build_state_field_snapshot(
     frames: &mut MIFrameStack,
     op_live: u8,
@@ -7273,6 +7552,7 @@ pub fn build_state_field_snapshot(
     virtualizable_boxes: &[OpRef],
     virtualref_boxes: &[(OpRef, usize)],
     identity_const: Option<i64>,
+    inline_int_identity: Option<(usize, usize)>,
 ) -> crate::recorder::Snapshot {
     let frame_count = frames.frames.len();
     let mut snapshot_frames = Vec::with_capacity(frame_count);
@@ -7287,22 +7567,25 @@ pub fn build_state_field_snapshot(
         // `after_residual_call` is propagated to the top frame only;
         // parent frames are always "in a call" relative to the top, so
         // pyjitpl.py:194-198's residual-call branch only fires once.
+        // Only NON-root (inline) frames trim their reserved identity-slot
+        // prefix to Const(0) placeholders; the root frame's identity slots
+        // are seeded and must be listed for real so the virtualizable is
+        // reconstructed once at the root.
+        let skip_int_identity = if i == 0 { None } else { inline_int_identity };
         let boxes = frame.get_list_of_active_snapshot_boxes(
             !is_top,
             /* clear_result_register */ !is_top,
             op_live,
             all_liveness,
             if is_top { after_residual_call } else { false },
+            skip_int_identity,
         );
-        let jitcode_index = if i == 0 {
-            // resume.py:1338-1340 — root frame resolves to
-            // `metainterp_sd.jitcodes[portal_jd.index]` (pyre's
-            // `JitDriver::dispatch_jitcode` singleton); the snapshot
-            // value is ignored by the resolve closure.
-            0
-        } else {
-            frame.parent_descr_idx
-        };
+        // resume.py:1050/1338 `jitcode = jitcodes[jitcode_pos]` — stamp each
+        // frame's own ABSOLUTE global jitcode index (`JitCode::index`, assigned
+        // in `register_dispatch_jitcode`: root = 0, sub-frames = their flat
+        // registry slot). The resume decoders resolve it statelessly with no
+        // root/sub branch and no parent-relative descrs walk.
+        let jitcode_index = frame.jitcode.try_index().unwrap_or(0) as u32;
         snapshot_frames.push(crate::recorder::SnapshotFrame {
             jitcode_index,
             pc: frame.pc as u32,
@@ -8458,6 +8741,105 @@ mod tests {
         );
     }
 
+    fn switch_return_jitcode() -> JitCode {
+        let mut builder = JitCodeBuilder::new();
+        let case_a = builder.new_label();
+        let case_b = builder.new_label();
+        let case_c = builder.new_label();
+        builder.switch(0, &[(-3, case_a), (7, case_b), (42, case_c)]);
+        builder.load_const_i_value(1, 10);
+        builder.int_return(1);
+        builder.mark_label(case_a);
+        builder.load_const_i_value(1, 20);
+        builder.int_return(1);
+        builder.mark_label(case_b);
+        builder.load_const_i_value(1, 30);
+        builder.int_return(1);
+        builder.mark_label(case_c);
+        builder.load_const_i_value(1, 40);
+        builder.int_return(1);
+        builder.finish()
+    }
+
+    #[test]
+    fn switch_hit_records_guard_value_and_jumps_to_case() {
+        // RPython `pyjitpl.py:598-606 opimpl_switch` hit path:
+        // promote the switched value with GUARD_VALUE, then jump to the
+        // target from SwitchDictDescr.dict.
+        let jitcode = switch_return_jitcode();
+        let mut ctx = TraceCtx::for_test(1);
+        let mut sym = DummySym::default();
+        let action = trace_jitcode_with_args(
+            &mut ctx,
+            &mut sym,
+            &jitcode,
+            0,
+            |_pc| 0,
+            &[(JitArgKind::Int, OpRef::input_arg_int(0), 7)],
+        );
+        let finish_args = match action {
+            TraceAction::Finish {
+                finish_args,
+                exit_with_exception: false,
+                ..
+            } => finish_args,
+            other => panic!("expected switch hit to finish from case path, got {other:?}"),
+        };
+        assert_eq!(ctx.const_value(finish_args[0]), Some(30));
+        let recorder = ctx.into_recorder();
+        assert!(
+            recorder
+                .ops()
+                .iter()
+                .any(|op| op.opcode == OpCode::GuardValue),
+            "switch hit must promote the matched value",
+        );
+    }
+
+    #[test]
+    fn switch_miss_records_int_eq_guard_false_chain_and_falls_through() {
+        // RPython `pyjitpl.py:607-617 opimpl_switch` miss path:
+        // for each `const_keys_in_order`, emit INT_EQ plus GUARD_FALSE,
+        // then leave pc at the fall-through default path.
+        let jitcode = switch_return_jitcode();
+        let mut ctx = TraceCtx::for_test(1);
+        let mut sym = DummySym::default();
+        let action = trace_jitcode_with_args(
+            &mut ctx,
+            &mut sym,
+            &jitcode,
+            0,
+            |_pc| 0,
+            &[(JitArgKind::Int, OpRef::input_arg_int(0), 99)],
+        );
+        let finish_args = match action {
+            TraceAction::Finish {
+                finish_args,
+                exit_with_exception: false,
+                ..
+            } => finish_args,
+            other => panic!("expected switch miss to finish from default path, got {other:?}"),
+        };
+        assert_eq!(ctx.const_value(finish_args[0]), Some(10));
+        let recorder = ctx.into_recorder();
+        assert_eq!(
+            recorder
+                .ops()
+                .iter()
+                .filter(|op| op.opcode == OpCode::IntEq)
+                .count(),
+            3,
+        );
+        assert_eq!(
+            recorder
+                .ops()
+                .iter()
+                .filter(|op| op.opcode == OpCode::GuardFalse)
+                .count(),
+            3,
+        );
+    }
+
     #[test]
     fn raise_catch_inline_call_routes_to_handler_and_preserves_last_exc_value() {
         // exc payload must be a valid OBJECTPTR (typeptr at offset 0) so
@@ -8885,16 +9267,17 @@ mod tests {
             &[],
             &[],
             None,
+            None,
         );
 
         assert_eq!(snapshot.frames.len(), 1);
         assert!(snapshot.vable_boxes.is_empty());
         assert!(snapshot.vref_boxes.is_empty());
         let f = &snapshot.frames[0];
-        // Root frame jitcode_index is a sentinel `0`; resume resolves
-        // through `JitDriver::dispatch_jitcode` rather than reading this
-        // value (resume.py:1338-1340).
-        assert_eq!(f.jitcode_index, 0);
+        // The snapshot stamps the frame's ABSOLUTE global jitcode index
+        // (`JitCode::index`, set to 7 above); resume resolves `jitcodes[7]`
+        // (resume.py:1050/1338).
+        assert_eq!(f.jitcode_index, 7);
         assert_eq!(f.pc, pc as u32);
         assert_eq!(
             f.boxes,
@@ -8946,6 +9329,7 @@ mod tests {
             &[],
             &[],
             None,
+            None,
         );
 
         let f = &snapshot.frames[0];
@@ -8966,7 +9350,11 @@ mod tests {
         root_builder.live(&mut asm, &[0], &[], &[]);
         let root_live_pc =
             root_builder.current_pos() - (majit_translate::liveness::OFFSET_SIZE + 1);
-        let root_jitcode = std::sync::Arc::new(root_builder.finish());
+        let root_jitcode = {
+            let jc = root_builder.finish();
+            jc.set_index(0);
+            std::sync::Arc::new(jc)
+        };
         let mut root = MIFrame::new(root_jitcode, root_live_pc);
         root.int_regs[0] = Some(majit_ir::OpRef::int_op(100));
         root.int_values[0] = Some(1000);
@@ -8979,9 +9367,15 @@ mod tests {
         sub_builder.load_const_f_value(0, 0);
         sub_builder.live(&mut asm, &[0], &[0], &[0]);
         let sub_pc = sub_builder.current_pos();
-        let sub_jitcode = std::sync::Arc::new(sub_builder.finish());
+        let sub_jitcode = {
+            let jc = sub_builder.finish();
+            // Stamp the sub-JitCode's ABSOLUTE global index; the snapshot
+            // writer reads `JitCode::index` (resume.py:1050), not the
+            // parent-relative descr slot.
+            jc.set_index(3);
+            std::sync::Arc::new(jc)
+        };
         let mut sub = MIFrame::new(sub_jitcode, sub_pc);
-        sub.parent_descr_idx = 3;
         sub.int_regs[0] = Some(majit_ir::OpRef::int_op(11));
         sub.int_values[0] = Some(110);
         sub.ref_regs[0] = Some(majit_ir::OpRef::ref_op(22));
@@ -9000,11 +9394,12 @@ mod tests {
             &[],
             &[],
             None,
+            None,
         );
         assert_eq!(snapshot.frames.len(), 2);
         let root_frame = &snapshot.frames[0];
-        // Root frame jitcode_index is a sentinel `0`; resume resolves
-        // through `JitDriver::dispatch_jitcode` (resume.py:1338-1340).
+        // Root frame stamps its ABSOLUTE global jitcode index (0 = dispatch
+        // slot); resume resolves `jitcodes[0]` (resume.py:1050/1338).
         assert_eq!(root_frame.jitcode_index, 0);
         assert_eq!(
             root_frame.boxes,
@@ -9057,6 +9452,7 @@ mod tests {
             false,
             &[],
             &[],
+            None,
             None,
         );
 

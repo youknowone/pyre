@@ -102,13 +102,26 @@ fn mainloop(program: &Code, num_regs: usize, threshold: u32) -> i64 {
 /// `n` are full i64 words (intentionally > 255 in tests).
 fn count_program(n: i64, step: i64) -> Vec<i64> {
     vec![
-        OP_LOAD, step, 1, // r1 = step
-        OP_LOAD, n, 2, // r2 = n
-        OP_LOAD, 0, 0, // r0 = 0
+        OP_LOAD,
+        step,
+        1, // r1 = step
+        OP_LOAD,
+        n,
+        2, // r2 = n
+        OP_LOAD,
+        0,
+        0, // r0 = 0
         // @l1 = pc 9
-        OP_ADD, 0, 1, 0, // r0 = r0 + r1
-        OP_JUMP_IF_ABOVE, 2, 0, 9, // if r2 > r0 goto @l1
-        OP_RETURN, 0, // return r0
+        OP_ADD,
+        0,
+        1,
+        0, // r0 = r0 + r1
+        OP_JUMP_IF_ABOVE,
+        2,
+        0,
+        9, // if r2 > r0 goto @l1
+        OP_RETURN,
+        0, // return r0
     ]
 }
 

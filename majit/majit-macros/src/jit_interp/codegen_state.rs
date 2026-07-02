@@ -394,6 +394,139 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         })
         .collect();
 
+    // ── seed_recursive_fresh_frame: fresh state as CONSTANTS ──
+    // Same slot layout as `populate_frame_int_regs`, but writes const OpRefs
+    // (a fresh inline callee's state is known at the call site) with fresh
+    // values: scalars 0, fixed-array cells 0, virt-array ptr 0 (the stack is
+    // virtual, its cells live in the vable shadow), virt-array len = caller's
+    // captured capacity (the fresh callee re-allocates at that size).
+    let seed_scalar_parts: Vec<TokenStream> = scalars
+        .iter()
+        .map(|(_, _f)| {
+            quote! {
+                if __slot < frame.int_regs.len() {
+                    frame.int_regs[__slot] = Some(majit_ir::OpRef::const_int(0));
+                    frame.int_values[__slot] = Some(0);
+                }
+                __slot += 1;
+            }
+        })
+        .collect();
+    let seed_array_parts: Vec<TokenStream> = arrays
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            quote! {
+                for __i in 0..self.#fname.len() {
+                    if __slot + __i < frame.int_regs.len() {
+                        frame.int_regs[__slot + __i] = Some(majit_ir::OpRef::const_int(0));
+                        frame.int_values[__slot + __i] = Some(0);
+                    }
+                }
+                __slot += self.#fname.len();
+            }
+        })
+        .collect();
+    let seed_virt_array_parts: Vec<TokenStream> = virt_arrays
+        .iter()
+        .map(|(_, f)| {
+            let len_value_name = quote::format_ident!("{}_len_value", f.name);
+            quote! {
+                if __slot < frame.int_regs.len() {
+                    frame.int_regs[__slot] = Some(majit_ir::OpRef::const_int(0));
+                    frame.int_values[__slot] = Some(0);
+                }
+                __slot += 1;
+                let __cap = self.#len_value_name;
+                if __slot < frame.int_regs.len() {
+                    frame.int_regs[__slot] = Some(majit_ir::OpRef::const_int(__cap));
+                    frame.int_values[__slot] = Some(__cap);
+                }
+                __slot += 1;
+            }
+        })
+        .collect();
+
+    // ── snapshot/reset/restore inline scalar+fixed-array sym state ──
+    // The sym holds the WORKING scalar (and fixed-array) state read/written by
+    // `BC_LOAD/STORE_STATE_FIELD` / `_STATE_ARRAY`.  An inline recursive-portal
+    // callee overwrites it in place, so nest it: snapshot → reset fresh → run →
+    // restore.  Virt arrays are excluded (their cells live in the vable shadow).
+    let snapshot_scalar_parts: Vec<TokenStream> = scalars
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            let value_name = quote::format_ident!("{}_value", f.name);
+            quote! { __out.push((self.#fname, self.#value_name)); }
+        })
+        .collect();
+    let snapshot_array_parts: Vec<TokenStream> = arrays
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            let value_name = quote::format_ident!("{}_values", f.name);
+            quote! {
+                for __i in 0..self.#fname.len() {
+                    __out.push((self.#fname[__i], self.#value_name[__i]));
+                }
+            }
+        })
+        .collect();
+    let reset_scalar_parts: Vec<TokenStream> = scalars
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            let value_name = quote::format_ident!("{}_value", f.name);
+            quote! {
+                self.#fname = majit_ir::OpRef::const_int(0);
+                self.#value_name = 0;
+            }
+        })
+        .collect();
+    let reset_array_parts: Vec<TokenStream> = arrays
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            let value_name = quote::format_ident!("{}_values", f.name);
+            quote! {
+                for __i in 0..self.#fname.len() {
+                    self.#fname[__i] = majit_ir::OpRef::const_int(0);
+                    self.#value_name[__i] = 0;
+                }
+            }
+        })
+        .collect();
+    let restore_inline_scalar_parts: Vec<TokenStream> = scalars
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            let value_name = quote::format_ident!("{}_value", f.name);
+            quote! {
+                if __k < __snapshot.len() {
+                    self.#fname = __snapshot[__k].0;
+                    self.#value_name = __snapshot[__k].1;
+                    __k += 1;
+                }
+            }
+        })
+        .collect();
+    let restore_inline_array_parts: Vec<TokenStream> = arrays
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            let value_name = quote::format_ident!("{}_values", f.name);
+            quote! {
+                for __i in 0..self.#fname.len() {
+                    if __k < __snapshot.len() {
+                        self.#fname[__i] = __snapshot[__k].0;
+                        self.#value_name[__i] = __snapshot[__k].1;
+                        __k += 1;
+                    }
+                }
+            }
+        })
+        .collect();
+
     // ── fail_args ──
     let fail_scalar_parts: Vec<TokenStream> = scalars
         .iter()
@@ -1485,6 +1618,10 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 #int_identity_base + self.total_slots()
             }
 
+            fn int_identity_slots_base(&self) -> usize {
+                #int_identity_base
+            }
+
             fn loop_header_pc(&self) -> usize {
                 self.loop_header_pc
             }
@@ -1578,6 +1715,37 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 #(#populate_virt_array_parts)*
                 let _ = __slot;
                 #(#populate_ref_scalar_parts)*
+            }
+
+            #[allow(unused_assignments, unused_variables)]
+            fn seed_recursive_fresh_frame(
+                &self,
+                frame: &mut majit_metainterp::MIFrame,
+            ) {
+                let mut __slot: usize = #int_identity_base;
+                #(#seed_scalar_parts)*
+                #(#seed_array_parts)*
+                #(#seed_virt_array_parts)*
+                let _ = __slot;
+            }
+
+            fn snapshot_inline_scalar_state(&self) -> Option<Vec<(majit_ir::OpRef, i64)>> {
+                let mut __out: Vec<(majit_ir::OpRef, i64)> = Vec::new();
+                #(#snapshot_scalar_parts)*
+                #(#snapshot_array_parts)*
+                Some(__out)
+            }
+
+            fn reset_inline_scalar_state_fresh(&mut self) {
+                #(#reset_scalar_parts)*
+                #(#reset_array_parts)*
+            }
+
+            #[allow(unused_assignments, unused_variables)]
+            fn restore_inline_scalar_state(&mut self, __snapshot: Vec<(majit_ir::OpRef, i64)>) {
+                let mut __k: usize = 0;
+                #(#restore_inline_scalar_parts)*
+                #(#restore_inline_array_parts)*
             }
 
             #recursive_fresh_entry_reds_override
@@ -1947,6 +2115,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                     __virtualizable_boxes,
                     __virtualref_boxes,
                     __identity_const,
+                    Some((sym.int_identity_slots_base(), sym.int_identity_slots_end())),
                 );
                 let __root = &mut frames.frames[0];
                 __root.int_regs[..__n].copy_from_slice(&__saved_int_regs);

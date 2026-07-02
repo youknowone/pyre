@@ -207,6 +207,81 @@ mod or_pattern {
     }
 }
 
+mod switch_dispatch {
+    use super::Bytecode;
+    use majit_metainterp::jitcode::insns::{BC_GOTO_IF_NOT_INT_EQ, BC_SWITCH};
+    use majit_metainterp::{Assembler, JitDriver};
+
+    const OP_LIT_A: u8 = 3;
+    const OP_LIT_B: u8 = 4;
+    const OP_RANGE_START: u8 = 10;
+    const OP_RANGE_END: u8 = 12;
+    const OP_END: u8 = 99;
+
+    struct SwitchDispatchState {
+        a: i64,
+    }
+
+    #[majit_macros::jit_interp(
+        state = SwitchDispatchState,
+        env = Bytecode,
+        state_fields = { a: int },
+        switch_dispatch = true,
+    )]
+    #[allow(unused_assignments, unused_variables)]
+    fn dispatch_switch_pattern(program: &Bytecode, threshold: u32) -> i64 {
+        let mut driver: JitDriver<SwitchDispatchState> = JitDriver::new(threshold);
+        let mut pc: usize = 0;
+        let mut state = SwitchDispatchState { a: 0 };
+        {
+            use majit_metainterp::JitState as _;
+            state
+                .build_meta(0, program)
+                .install_canonical_liveness(&mut driver);
+        }
+        while pc < program.len() {
+            jit_merge_point!();
+            let opcode = program[pc];
+            pc += 1;
+            match opcode {
+                OP_LIT_A | OP_LIT_B => state.a += 1,
+                OP_RANGE_START..=OP_RANGE_END => state.a += 10,
+                _ => break,
+            }
+        }
+        state.a
+    }
+
+    #[test]
+    fn switch_dispatch_lowers_match_to_single_switch() {
+        let mut asm = Assembler::new();
+        asm.set_canonical_liveness_triple(vec![0], vec![], vec![]);
+        __prebuild_jitcode_liveness_dispatch_switch_pattern(&mut asm);
+        let _ = asm.ensure_canonical_liveness_offset();
+        let dispatch_jc = __dispatch_jitcode_dispatch_switch_pattern(&mut asm, 0i64)
+            .expect("switch dispatch lower must succeed for fixture");
+        let code = &dispatch_jc.code;
+        assert_eq!(
+            code.iter().filter(|&&b| b == BC_SWITCH).count(),
+            1,
+            "switch_dispatch must emit one BC_SWITCH for the top-level dispatch; got bytes {:?}",
+            code
+        );
+        assert_eq!(
+            code.iter().filter(|&&b| b == BC_GOTO_IF_NOT_INT_EQ).count(),
+            0,
+            "switch_dispatch must not emit the old guard chain for the top-level dispatch"
+        );
+    }
+
+    #[test]
+    fn switch_dispatch_fixture_runs_literal_range_and_default() {
+        let program = [OP_LIT_A, OP_RANGE_START, OP_RANGE_END, OP_END];
+        let result = dispatch_switch_pattern(&program, 1);
+        assert_eq!(result, 21);
+    }
+}
+
 #[test]
 fn dispatch_jitcode_contains_loop_back_goto() {
     let mut asm = Assembler::new();

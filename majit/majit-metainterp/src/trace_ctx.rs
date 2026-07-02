@@ -230,6 +230,16 @@ pub struct TraceCtx {
     virtualizable_info: Option<std::sync::Arc<VirtualizableInfo>>,
     /// Lengths of each virtualizable array field, needed for flat index computation.
     virtualizable_array_lengths: Option<Vec<usize>>,
+    /// [FR] Saved standard-virtualizable state, pushed when a recursive-portal
+    /// INLINE frame installs its callee's fresh vable and popped when that
+    /// frame returns — the single standard vable nested across the inline call.
+    #[allow(clippy::type_complexity)]
+    portal_vable_saves: Vec<(
+        Option<Vec<OpRef>>,
+        Option<Vec<Value>>,
+        Option<std::sync::Arc<VirtualizableInfo>>,
+        Option<Vec<usize>>,
+    )>,
     /// Live virtualizable heap pointer (pyjitpl.py:3446 write_boxes target).
     /// Mirrored from `MetaInterp::vable_ptr` at trace/bridge-entry.  Used by
     /// `synchronize_virtualizable` to write `virtualizable_values` back to
@@ -1114,6 +1124,7 @@ impl TraceCtx {
             virtualizable_values: None,
             virtualizable_info: None,
             virtualizable_array_lengths: None,
+            portal_vable_saves: Vec::new(),
             virtualizable_heap_ptr: None,
             header_pc: 0,
             cut_inner_green_key: None,
@@ -1183,6 +1194,7 @@ impl TraceCtx {
             virtualizable_values: None,
             virtualizable_info: None,
             virtualizable_array_lengths: None,
+            portal_vable_saves: Vec::new(),
             virtualizable_heap_ptr: None,
             header_pc: 0,
             cut_inner_green_key: None,
@@ -1684,6 +1696,36 @@ impl TraceCtx {
         }
         self.virtualizable_info = Some(std::sync::Arc::new(info.clone()));
         self.virtualizable_array_lengths = Some(array_lengths.to_vec());
+    }
+
+    /// [FR] The current standard virtualizable's info (shape), if any.  A
+    /// recursive-portal INLINE callee shares the caller's vable shape (same
+    /// kernel), so it seeds its fresh vable with this same info.
+    pub fn current_virtualizable_info(&self) -> Option<std::sync::Arc<VirtualizableInfo>> {
+        self.virtualizable_info.clone()
+    }
+
+    /// [FR] Save the current standard-virtualizable state onto the portal
+    /// nesting stack, before a recursive-portal INLINE frame installs its
+    /// callee's fresh vable via `init_virtualizable_boxes`.
+    pub fn push_saved_virtualizable(&mut self) {
+        self.portal_vable_saves.push((
+            self.virtualizable_boxes.clone(),
+            self.virtualizable_values.clone(),
+            self.virtualizable_info.clone(),
+            self.virtualizable_array_lengths.clone(),
+        ));
+    }
+
+    /// [FR] Restore the caller's standard-virtualizable state when a
+    /// recursive-portal INLINE frame returns.  No-op if the stack is empty.
+    pub fn restore_saved_virtualizable(&mut self) {
+        if let Some((boxes, values, info, lengths)) = self.portal_vable_saves.pop() {
+            self.virtualizable_boxes = boxes;
+            self.virtualizable_values = values;
+            self.virtualizable_info = info;
+            self.virtualizable_array_lengths = lengths;
+        }
     }
 
     /// Collect the current virtualizable boxes (for close_loop / finish).

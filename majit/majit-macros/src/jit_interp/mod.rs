@@ -133,6 +133,10 @@ pub struct JitInterpConfig {
     /// each with its own ≤256 budget) — mirrors `next_instr = self.OPCODE(...)`.
     /// Off by default, so kernels that do not set it are byte-identical.
     pub split_dispatch: bool,
+    /// Opt-in: lower the top-level opcode dispatch discrimination as one
+    /// `switch/id` op instead of a `goto_if_not_int_eq` guard chain. Off by
+    /// default so existing interpreters keep byte-identical dispatch JitCode.
+    pub switch_dispatch: bool,
 }
 
 /// Virtualizable frame field declaration for `#[jit_interp]`.
@@ -462,6 +466,7 @@ impl Parse for JitInterpConfig {
         let mut residual_writes: Vec<ResidualWriteEntry> = Vec::new();
         let mut pool_arrays: Vec<Ident> = Vec::new();
         let mut split_dispatch = false;
+        let mut switch_dispatch = false;
 
         while !input.is_empty() {
             let key: Ident = input.parse()?;
@@ -521,6 +526,9 @@ impl Parse for JitInterpConfig {
                 "split_dispatch" => {
                     split_dispatch = input.parse::<LitBool>()?.value;
                 }
+                "switch_dispatch" => {
+                    switch_dispatch = input.parse::<LitBool>()?.value;
+                }
                 other => {
                     return Err(syn::Error::new(
                         key.span(),
@@ -567,6 +575,7 @@ impl Parse for JitInterpConfig {
             residual_writes,
             pool_arrays,
             split_dispatch,
+            switch_dispatch,
         })
     }
 }
@@ -970,9 +979,10 @@ fn find_traced_loop_body(block: &syn::Block) -> Option<&syn::Block> {
             Expr::While(w) => &w.body,
             _ => continue,
         };
-        let has_merge_point = body.stmts.iter().any(|s| {
-            matches!(s, syn::Stmt::Macro(m) if m.mac.path.is_ident("jit_merge_point"))
-        });
+        let has_merge_point = body
+            .stmts
+            .iter()
+            .any(|s| matches!(s, syn::Stmt::Macro(m) if m.mac.path.is_ident("jit_merge_point")));
         if has_merge_point {
             return Some(body);
         }
@@ -1026,8 +1036,16 @@ impl<'ast, 'a> syn::visit::Visit<'ast> for PlainArrayStoreFinder<'a> {
         use syn::BinOp::*;
         if matches!(
             node.op,
-            AddAssign(_) | SubAssign(_) | MulAssign(_) | DivAssign(_) | RemAssign(_)
-                | BitXorAssign(_) | BitAndAssign(_) | BitOrAssign(_) | ShlAssign(_) | ShrAssign(_)
+            AddAssign(_)
+                | SubAssign(_)
+                | MulAssign(_)
+                | DivAssign(_)
+                | RemAssign(_)
+                | BitXorAssign(_)
+                | BitAndAssign(_)
+                | BitOrAssign(_)
+                | ShlAssign(_)
+                | ShrAssign(_)
         ) {
             self.check_assign_target(&node.left);
         }
@@ -2294,7 +2312,7 @@ mod tests {
         };
         let err = validate(
             quote! { state = S, env = Bytecode, greens = [pc, program],
-                     state_fields = { regs: [int] } },
+            state_fields = { regs: [int] } },
             func,
         )
         .expect_err("loop-carried plain [int] store must be rejected");
@@ -2321,7 +2339,7 @@ mod tests {
         };
         validate(
             quote! { state = S, env = Bytecode, greens = [pc, program],
-                     state_fields = { regs: [int; virt] } },
+            state_fields = { regs: [int; virt] } },
             func,
         )
         .expect("virt array must be accepted");
@@ -2348,7 +2366,7 @@ mod tests {
         };
         validate(
             quote! { state = S, env = Bytecode, greens = [pc, program],
-                     state_fields = { regs: [int] } },
+            state_fields = { regs: [int] } },
             func,
         )
         .expect("read-only plain [int] array must be accepted");

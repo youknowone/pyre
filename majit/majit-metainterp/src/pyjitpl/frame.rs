@@ -84,6 +84,14 @@ pub struct MIFrame {
     pub float_regs: Vec<Option<OpRef>>,
     pub float_values: Vec<Option<i64>>,
     pub inline_frame: bool,
+    /// [FR] True when this is a recursive-portal INLINE frame that installed
+    /// its callee's fresh standard virtualizable; the frame's pop restores the
+    /// caller's saved vable via `TraceCtx::restore_saved_virtualizable`.
+    pub portal_vable_saved: bool,
+    /// [FR] Saved caller sym scalar/fixed-array state for a recursive-portal
+    /// INLINE frame; restored into the shared sym when the frame returns so the
+    /// callee's in-place mutation of the single sym doesn't corrupt the caller.
+    pub portal_scalar_state: Option<Vec<(OpRef, i64)>>,
     pub return_i: Option<usize>,
     pub return_r: Option<usize>,
     pub return_f: Option<usize>,
@@ -125,22 +133,6 @@ pub struct MIFrame {
     pub parent_snapshot: i64,
     /// pyjitpl.py:95 `self.unroll_iterations = 1`.
     pub unroll_iterations: usize,
-    /// State-field-JIT multi-frame snapshot wiring.
-    ///
-    /// For frames pushed by `BC_INLINE_CALL` this holds the index into
-    /// the *parent* frame's `jitcode.descrs` array that the dispatcher
-    /// resolved into the sub-jitcode for this frame
-    /// (`pyjitpl/dispatch.rs` BC_INLINE_CALL `descrs.get(sub_idx)`). Root
-    /// frames (`trace_jitcode` portal entry) carry `u32::MAX`. The
-    /// snapshot-side `build_state_field_snapshot` packs this into
-    /// `SnapshotFrame.jitcode_index` for non-root frames, and the
-    /// resume-side `resolve_jitcode` closure uses it to walk
-    /// `parent.descrs[idx].as_jitcode()`.  RPython's equivalent is `frame.jitcode.index` —
-    /// resolvable through `metainterp_sd.jitcodes[idx]` because RPython
-    /// pre-registers every jitcode globally; per-opcode majit has no
-    /// such global registry, so the parent-relative index threads the
-    /// chain together.
-    pub parent_descr_idx: u32,
 }
 
 impl MIFrame {
@@ -176,6 +168,8 @@ impl MIFrame {
             float_regs: vec![None; regs_and_consts_f],
             float_values: vec![None; regs_and_consts_f],
             inline_frame: false,
+            portal_vable_saved: false,
+            portal_scalar_state: None,
             return_i: None,
             return_r: None,
             return_f: None,
@@ -185,7 +179,6 @@ impl MIFrame {
             pushed_box: None,
             parent_snapshot: -1,
             unroll_iterations: 1,
-            parent_descr_idx: u32::MAX,
         }
     }
 
@@ -790,6 +783,7 @@ impl MIFrame {
         op_live: u8,
         all_liveness: &[u8],
         after_residual_call: bool,
+        skip_int_identity: Option<(usize, usize)>,
     ) -> Vec<SnapshotTagged> {
         const SIZE_LIVE_OP: usize = majit_translate::liveness::OFFSET_SIZE + 1;
         use majit_translate::liveness::{LivenessIterator, decode_offset};
@@ -858,6 +852,19 @@ impl MIFrame {
             while let Some(index) = it.next() {
                 let idx = index as usize;
                 let tagged = if Some(idx) == clear_int_idx {
+                    SnapshotTagged::Const(0, Type::Int)
+                } else if skip_int_identity.is_some_and(|(b, e)| idx >= b && idx < e)
+                    && idx < num_regs_i
+                    && self.int_regs[idx].is_none()
+                {
+                    // A non-root (inline split-dispatch) frame reserves the
+                    // virtualizable identity-slot prefix int[base..end) so its
+                    // register file spans them, but the resume seeder fills only
+                    // the ROOT frame's identity slots — here they are unwritten
+                    // holes. Emit a count-preserving Const(0) placeholder (the
+                    // liveness marker's length_i is baked, so dropping would
+                    // desync the decoder); deopt re-derives the real ptr/len
+                    // from the single reconstructed root virtualizable.
                     SnapshotTagged::Const(0, Type::Int)
                 } else if idx < num_regs_i {
                     let opref = self.int_regs[idx]

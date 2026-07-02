@@ -1889,8 +1889,7 @@ pub(super) fn pc_is_green(config: &LowererConfig) -> bool {
 /// operands read at the same stride. Falls back to the byte descr when the
 /// env type name does not parse as a type.
 pub(super) fn env_array_descr_expr(config: Option<&LowererConfig>) -> proc_macro2::TokenStream {
-    let env_ty = config
-        .and_then(|c| syn::parse_str::<syn::Type>(&c.env_type_name).ok());
+    let env_ty = config.and_then(|c| syn::parse_str::<syn::Type>(&c.env_type_name).ok());
     match env_ty {
         Some(env_ty) => quote::quote! {{
             let __env_item = ::core::mem::size_of::<
@@ -1962,14 +1961,11 @@ fn arm_is_pure_pc_advance(body: &Expr) -> Option<i64> {
         fn visit_expr_break(&mut self, _: &'ast syn::ExprBreak) {
             self.hit = true;
         }
-        fn visit_expr_call(&mut self, c: &'ast syn::ExprCall) {
-            self.hit = true;
-            syn::visit::visit_expr_call(self, c);
-        }
-        fn visit_expr_method_call(&mut self, c: &'ast syn::ExprMethodCall) {
-            self.hit = true;
-            syn::visit::visit_expr_method_call(self, c);
-        }
+        // Residual-call arms ARE eligible to split: their GuardNoException
+        // resume snapshot's identity-slot references resolve through the
+        // sized rd_virtuals (negative virtual numbering) and the reserved
+        // sub-JitCode identity prefix, so they no longer read uninitialized
+        // holes. Only control-flow / loop-header constructs below disqualify.
         fn visit_macro(&mut self, m: &'ast syn::Macro) {
             if let Some(id) = m.path.get_ident() {
                 let n = id.to_string();
@@ -2231,7 +2227,48 @@ pub(super) fn lower_dispatch_chain(
         _ => return default_label,
     };
 
-    for arm in classified_arms {
+    let mut switch_arm_labels: Vec<Option<syn::Ident>> = vec![None; classified_arms.len()];
+    if config.switch_dispatch {
+        let mut switch_case_emitters = Vec::new();
+        for (arm_idx, arm) in classified_arms.iter().enumerate() {
+            if matches!(arm.pat, Pat::Wild(_)) || is_lowercase_binding_pat(&arm.pat) {
+                continue;
+            }
+            let arm_label = lowerer.alloc_label();
+            lowerer.emit_aux(quote::quote! { let #arm_label = __builder.new_label(); });
+            match extract_pat_switch_case_tokens(&arm.pat, &arm_label) {
+                Some(mut emitters) => {
+                    switch_case_emitters.append(&mut emitters);
+                    switch_arm_labels[arm_idx] = Some(arm_label);
+                }
+                None => continue,
+            }
+        }
+        lowerer.emit_aux(quote::quote! {
+            let mut __switch_cases: Vec<(i64, u16)> = Vec::new();
+            #(#switch_case_emitters)*
+        });
+        let live_targets = switch_arm_labels
+            .iter()
+            .filter_map(|label| label.clone())
+            .collect::<Vec<_>>();
+        // RPython flatten.py:270-308 emits one `-live-` before `switch`;
+        // pyjitpl.py:598-617 records GuardValue on a hit and fallback guards
+        // on a miss. The marker keeps the opcode and all case targets live.
+        lowerer.emit_op(
+            OpMeta::live_marker_with(vec![Register::int(opcode_reg)], live_targets),
+            quote::quote! { let _ = __builder.live_placeholder(); },
+        );
+        lowerer.emit_op(
+            OpMeta::linear(OpKind::Aux, vec![Register::int(opcode_reg)], vec![]),
+            quote::quote! {
+                __builder.switch(#opcode_reg as u16, &__switch_cases);
+            },
+        );
+        lowerer.emit_jump(&default_label);
+    }
+
+    for (arm_idx, arm) in classified_arms.iter().enumerate() {
         // `_` wildcard: skip here; handled by the default GOTO below.
         // All other patterns (including Pat::Ident like `OP_NOP`) are
         // treated as constant tests and emitted as goto_if_not_int_eq.
@@ -2239,77 +2276,94 @@ pub(super) fn lower_dispatch_chain(
             continue;
         }
 
-        // Extract token expressions for each value in the pattern.
-        // extract_pat_value_tokens handles Pat::Lit, Pat::Path, Pat::Or.
-        let value_tokens = match extract_pat_value_tokens(&arm.pat) {
-            Some(v) => v,
-            None => continue, // unsupported pattern shape — skip
-        };
-
-        // Allocate a skip label: if opcode ≠ this arm's value, jump here.
-        // Task 1.6 will emit the arm body between the check and this label.
-        let skip_label = lowerer.alloc_label();
-        lowerer.emit_aux(quote::quote! { let #skip_label = __builder.new_label(); });
-
-        let matched_label = if value_tokens.len() > 1 {
-            let label = lowerer.alloc_label();
-            lowerer.emit_aux(quote::quote! { let #label = __builder.new_label(); });
-            Some(label)
+        let mut skip_label = None;
+        if let Some(match_label) = switch_arm_labels[arm_idx].as_ref() {
+            lowerer.emit_label_def(match_label);
+        } else if config.switch_dispatch {
+            continue;
         } else {
-            None
-        };
+            // Extract token expressions for each value in the pattern.
+            // extract_pat_value_tokens handles Pat::Lit, Pat::Path, Pat::Or.
+            let value_tokens = match extract_pat_value_tokens(&arm.pat) {
+                Some(v) => v,
+                None => {
+                    if pat_contains_range(&arm.pat) && !config.split_dispatch {
+                        lowerer.emit_aux(quote::quote! {
+                            compile_error!(
+                                "jit_interp dispatch range patterns require `switch_dispatch = true`"
+                            );
+                        });
+                    }
+                    continue; // unsupported pattern shape — skip
+                }
+            };
 
-        for (value_idx, val_tok) in value_tokens.iter().enumerate() {
-            // Load the pattern constant into a fresh int register.
-            let const_reg = lowerer.alloc_reg();
-            lowerer.emit_op(
-                OpMeta::linear(OpKind::LoadConstI, vec![], vec![Register::int(const_reg)]),
-                quote::quote! {
-                    __builder.load_const_i_value(#const_reg as u16, #val_tok);
-                },
-            );
-            let is_last_value = value_idx + 1 == value_tokens.len();
-            let miss_label = if is_last_value {
-                skip_label.clone()
-            } else {
+            // Allocate a skip label: if opcode ≠ this arm's value, jump here.
+            // Task 1.6 will emit the arm body between the check and this label.
+            let arm_skip_label = lowerer.alloc_label();
+            lowerer.emit_aux(quote::quote! { let #arm_skip_label = __builder.new_label(); });
+            skip_label = Some(arm_skip_label.clone());
+
+            let matched_label = if value_tokens.len() > 1 {
                 let label = lowerer.alloc_label();
                 lowerer.emit_aux(quote::quote! { let #label = __builder.new_label(); });
-                label
+                Some(label)
+            } else {
+                None
             };
-            // RPython flatten.py:258-260 emits `-live-` UNCONDITIONALLY ahead
-            // of every goto_if_not / goto_if_not_<cmp>; optimize_goto_if_not
-            // (jtransform.py:225) tags the fused compare `-live-before`. The
-            // tracer records this guard through record_state_guard →
-            // build_state_field_snapshot, which reads the LIVE marker at
-            // `guard_pc - SIZE_LIVE_OP`. Without a preceding `-live-` the
-            // snapshot mis-decodes the prior op's bytes as a liveness offset
-            // and indexes out of bounds. One marker per chained alternative so
-            // each goto_if_not_int_eq has its own preceding LIVE.
-            lowerer.emit_op(
-                OpMeta::live_marker(),
-                quote::quote! { let _ = __builder.live_placeholder(); },
-            );
-            // Fused goto_if_not_int_eq: branch to the next alternative (or the
-            // arm skip label) if opcode != const.
-            lowerer.emit_op(
-                OpMeta::conditional_guard_int_eq(
-                    Register::int(opcode_reg),
-                    Register::int(const_reg),
-                    miss_label.clone(),
-                ),
-                quote::quote! {
-                    __builder.goto_if_not_int_eq(#opcode_reg as u16, #const_reg as u16, #miss_label);
-                },
-            );
-            if let Some(matched_label) = matched_label.as_ref() {
-                lowerer.emit_jump(matched_label);
-                if !is_last_value {
-                    lowerer.emit_label_def(&miss_label);
+
+            for (value_idx, val_tok) in value_tokens.iter().enumerate() {
+                // Load the pattern constant into a fresh int register.
+                let const_reg = lowerer.alloc_reg();
+                lowerer.emit_op(
+                    OpMeta::linear(OpKind::LoadConstI, vec![], vec![Register::int(const_reg)]),
+                    quote::quote! {
+                        __builder.load_const_i_value(#const_reg as u16, #val_tok);
+                    },
+                );
+                let is_last_value = value_idx + 1 == value_tokens.len();
+                let miss_label = if is_last_value {
+                    arm_skip_label.clone()
+                } else {
+                    let label = lowerer.alloc_label();
+                    lowerer.emit_aux(quote::quote! { let #label = __builder.new_label(); });
+                    label
+                };
+                // RPython flatten.py:258-260 emits `-live-` UNCONDITIONALLY ahead
+                // of every goto_if_not / goto_if_not_<cmp>; optimize_goto_if_not
+                // (jtransform.py:225) tags the fused compare `-live-before`. The
+                // tracer records this guard through record_state_guard →
+                // build_state_field_snapshot, which reads the LIVE marker at
+                // `guard_pc - SIZE_LIVE_OP`. Without a preceding `-live-` the
+                // snapshot mis-decodes the prior op's bytes as a liveness offset
+                // and indexes out of bounds. One marker per chained alternative so
+                // each goto_if_not_int_eq has its own preceding LIVE.
+                lowerer.emit_op(
+                    OpMeta::live_marker(),
+                    quote::quote! { let _ = __builder.live_placeholder(); },
+                );
+                // Fused goto_if_not_int_eq: branch to the next alternative (or the
+                // arm skip label) if opcode != const.
+                lowerer.emit_op(
+                    OpMeta::conditional_guard_int_eq(
+                        Register::int(opcode_reg),
+                        Register::int(const_reg),
+                        miss_label.clone(),
+                    ),
+                    quote::quote! {
+                        __builder.goto_if_not_int_eq(#opcode_reg as u16, #const_reg as u16, #miss_label);
+                    },
+                );
+                if let Some(matched_label) = matched_label.as_ref() {
+                    lowerer.emit_jump(matched_label);
+                    if !is_last_value {
+                        lowerer.emit_label_def(&miss_label);
+                    }
                 }
             }
-        }
-        if let Some(matched_label) = matched_label.as_ref() {
-            lowerer.emit_label_def(matched_label);
+            if let Some(matched_label) = matched_label.as_ref() {
+                lowerer.emit_label_def(matched_label);
+            }
         }
 
         // Green-pc gated inline (Option A, #184): when `pc` is a declared
@@ -2452,23 +2506,33 @@ pub(super) fn lower_dispatch_chain(
                                     .push(Register::new(entry.kind, entry.parent_reg));
                             }
                             let inline_call_emit = match pc_return_reg {
-                                Some(pc_reg) => {
-                                    dispatch_arm_inline_call_tokens_i(&layout, pc_reg)
-                                }
+                                Some(pc_reg) => dispatch_arm_inline_call_tokens_i(&layout, pc_reg),
                                 None => dispatch_arm_inline_call_tokens(&layout),
                             };
-                            let min_i_regs = layout
+                            // Reserve the identity-slot prefix in the sub-JitCode
+                            // register file so int[int_identity_base..int_end) /
+                            // ref[ref_identity_base..ref_end) exist as real
+                            // registers — the arm body's state-field ops address
+                            // them and the resume path re-derives them at deopt.
+                            let (__split_int_end, __split_ref_end) = if config.split_dispatch {
+                                config.split_identity_reg_ends()
+                            } else {
+                                (0u16, 0u16)
+                            };
+                            let min_i_regs = (layout
                                 .iter()
                                 .filter(|e| matches!(e.kind, BindingKind::Int))
                                 .map(|e| e.callee_reg + 1)
                                 .max()
-                                .unwrap_or(0) as u16;
-                            let min_r_regs = layout
+                                .unwrap_or(0) as u16)
+                                .max(__split_int_end);
+                            let min_r_regs = (layout
                                 .iter()
                                 .filter(|e| matches!(e.kind, BindingKind::Ref))
                                 .map(|e| e.callee_reg + 1)
                                 .max()
-                                .unwrap_or(0) as u16;
+                                .unwrap_or(0) as u16)
+                                .max(__split_ref_end);
                             let min_f_regs = layout
                                 .iter()
                                 .filter(|e| matches!(e.kind, BindingKind::Float))
@@ -2606,13 +2670,17 @@ pub(super) fn lower_dispatch_chain(
 
         // Bind the skip label at the end of this arm's guard sequence.
         // Jumping here means "this arm did not match; proceed to next arm".
-        lowerer.emit_label_def(&skip_label);
+        if let Some(skip_label) = skip_label.as_ref() {
+            lowerer.emit_label_def(skip_label);
+        }
     }
 
     // After all arm guards, the default/exit path: unconditional GOTO.
     // default_label is bound at the typed-return emission site in
     // lower_dispatch_body (Task 1.7).
-    lowerer.emit_jump(&default_label);
+    if !config.switch_dispatch {
+        lowerer.emit_jump(&default_label);
+    }
     default_label
 }
 
@@ -2628,6 +2696,14 @@ fn is_lowercase_binding_pat(pat: &Pat) -> bool {
         .chars()
         .next()
         .is_some_and(|c| c.is_ascii_lowercase())
+}
+
+fn pat_contains_range(pat: &Pat) -> bool {
+    match pat {
+        Pat::Range(_) => true,
+        Pat::Or(pat_or) => pat_or.cases.iter().any(pat_contains_range),
+        _ => false,
+    }
 }
 
 /// A.3.5 — emit a `-live-` + `<kind>_guard_value` pair for each declared green.

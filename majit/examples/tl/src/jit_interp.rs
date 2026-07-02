@@ -8,6 +8,9 @@
 /// Reds:   [inputarg, stackpos, stack]  (inputarg is a function parameter — red by nature)
 use majit_metainterp::jit::promote;
 
+// [SPIKE-S0/FR] throwaway compile counter to measure portal-call compile-through.
+pub static SPIKE_COMPILES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 /// Stack rotation — @dont_look_inside in RPython (tl.py:43).
 ///
 /// Operates on the live portion of the stack `stack[0..stackpos]`.
@@ -105,6 +108,10 @@ const PUSHARG: u8 = 22;
 pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
     let mut driver: majit_metainterp::JitDriver<TlState> =
         majit_metainterp::JitDriver::new(threshold);
+    // [SPIKE-S0/FR] count compiled loops.
+    driver.set_on_compile_loop(|_gk, _b, _a| {
+        SPIKE_COMPILES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    });
     let mut pc: usize = 0;
     let mut stacksize: i32 = 0;
     let mut state = TlState {
@@ -393,12 +400,35 @@ mod tests {
         ]
     }
 
+    /// [SPIKE-S0/FR] Measure whether a portal call inside a hot loop compiles
+    /// through. Control = pure loop (no call). Probe = leaf call in loop body.
+    #[test]
+    fn spike_portal_call_compile_through() {
+        use core::sync::atomic::Ordering;
+
+        SPIKE_COMPILES.store(0, Ordering::Relaxed);
+        let bc = sum_bytecode();
+        let mut jit = JitTlInterp::new();
+        let got = jit.run(&bc, 500);
+        let control = SPIKE_COMPILES.load(Ordering::Relaxed);
+        eprintln!("[SPIKE] control sum(500)={got} compiles={control}");
+
+        SPIKE_COMPILES.store(0, Ordering::Relaxed);
+        let bc = call_loop_bytecode();
+        let mut jit = JitTlInterp::new();
+        let got = jit.run(&bc, 500);
+        let probe = SPIKE_COMPILES.load(Ordering::Relaxed);
+        eprintln!("[SPIKE] probe  call_loop(500)={got} compiles={probe}");
+
+        assert_eq!(got, 1500, "leaf-call loop still computes 3*N");
+    }
+
     #[test]
     fn jit_recursive_call_matches_interp() {
         let bc = call_loop_bytecode();
         // Sanity: the interpreter computes 3 * N.
         assert_eq!(interp::interpret(&bc, 4), 12);
-        for a in [1, 2, 3, 5, 10, 50, 100] {
+        for a in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 20, 50, 100] {
             let expected = interp::interpret(&bc, a);
             let mut jit = JitTlInterp::new();
             let got = jit.run(&bc, a);

@@ -37,11 +37,12 @@ mod reexports {
     pub(super) use super::helpers::{
         binding_kind_for_inline_policy, binop_i_emit_tokens, block_has_loop_control,
         expr_has_loop_control, extract_block_tail_int, extract_bool_branch_values,
-        extract_branch_int, extract_pat_literals, extract_pat_value_tokens, extract_stmts,
-        inline_builder_path, inline_call_tokens, inline_float_arg_tokens, inline_int_arg_tokens,
-        inline_prebuild_path, inline_ref_arg_tokens, int_arg_regs, is_supported_float_type,
-        is_supported_int_cast, is_supported_ref_type, opcode_for_assign_binop, opcode_for_binop,
-        stmt_has_loop_control, typed_call_arg_tokens,
+        extract_branch_int, extract_pat_literals, extract_pat_switch_case_tokens,
+        extract_pat_value_tokens, extract_stmts, inline_builder_path, inline_call_tokens,
+        inline_float_arg_tokens, inline_int_arg_tokens, inline_prebuild_path,
+        inline_ref_arg_tokens, int_arg_regs, is_supported_float_type, is_supported_int_cast,
+        is_supported_ref_type, opcode_for_assign_binop, opcode_for_binop, stmt_has_loop_control,
+        typed_call_arg_tokens,
     };
     pub(super) use super::liveness::{
         annotate_live_markers_with_liveness, compute_per_marker_liveness, get_liveness_info,
@@ -190,6 +191,10 @@ pub struct LowererConfig {
     /// sub-JitCode path with a pc-returning `inline_call_<types>_i` instead of
     /// force-inlining them into the dispatch JitCode.  Off → byte-identical.
     pub(super) split_dispatch: bool,
+    /// Source: `JitInterpConfig.switch_dispatch`.  When set, the dispatch
+    /// lowerer emits one RPython-style `switch/id` over opcode cases instead
+    /// of a per-arm guard chain. Off → byte-identical.
+    pub(super) switch_dispatch: bool,
 }
 
 impl LowererConfig {
@@ -211,6 +216,28 @@ impl LowererConfig {
     /// scalar where it expects the green pc.
     pub(super) fn int_identity_base(&self) -> u16 {
         1
+    }
+
+    /// Exclusive end of the int-bank and ref-bank identity-slot ranges
+    /// `[int_identity_base, int_end)` / `[ref_identity_base, ref_end)`.
+    ///
+    /// Mirrors the dispatch JitCode's identity reservation: int identity =
+    /// the scalar slots plus two words (ptr+len) per virtualizable array;
+    /// ref identity = the ref scalars. A split sub-JitCode must reserve the
+    /// SAME prefix so its register file spans the identity slots that the
+    /// arm body's `load/store_state_field` ops address and that the resume
+    /// path re-derives at deopt. Returns `0` for a bank with no identity
+    /// slots so the caller's `.max()` floor is inert there.
+    pub(super) fn split_identity_reg_ends(&self) -> (u16, u16) {
+        let int_end = self.int_identity_base()
+            + self.state_scalars.len() as u16
+            + 2 * self.state_virt_arrays.len() as u16;
+        let ref_end = if self.state_ref_scalars.is_empty() {
+            0
+        } else {
+            self.ref_identity_base() + self.state_ref_scalars.len() as u16
+        };
+        (int_end, ref_end)
     }
 }
 
@@ -771,6 +798,7 @@ impl LowererConfig {
         residual_writes: &[crate::jit_interp::ResidualWriteEntry],
         pool_arrays: &[Ident],
         split_dispatch: bool,
+        switch_dispatch: bool,
     ) -> Self {
         let io_shims = io_shims
             .iter()
@@ -909,6 +937,7 @@ impl LowererConfig {
             residual_writes,
             pool_arrays: pool_arrays.iter().map(|i| i.to_string()).collect(),
             split_dispatch,
+            switch_dispatch,
         }
     }
 
