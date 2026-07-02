@@ -11,6 +11,12 @@
 //!
 //! Generated from CPython `str` predicates over the whole scalar range
 //! (Unicode 16.0.0); regenerate by enumerating `chr(c).isdecimal()` etc.
+//!
+//! Version target: pyre matches CPython 3.14 semantics, whose `unicodedata`
+//! is Unicode 16.0.0.  The in-tree PyPy imports `unicodedb_14_0_0`, so these
+//! tables intentionally carry the newer Unicode version — the predicate shape
+//! is identical, only the covered code points differ.  This is a version
+//! adaptation, not a parity divergence.
 
 const DECIMAL: &[(u32, u32)] = &[
     (0x0030, 0x0039),
