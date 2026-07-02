@@ -1316,16 +1316,10 @@ mod tests {
             Some(idx) => (0..=idx as u32).map(OpRef::int_op).collect(),
             None => vec![OpRef::int_op(0)],
         };
-        // Materialize the canonical ctx boxes for the short inputargs and the
-        // entry res position, rather than minting position-only boxes.
-        let short_inputarg_boxes: Vec<majit_ir::box_ref::BoxRef> = short_inputargs
-            .iter()
-            .map(|&a| ctx.materialize_box_at(a))
-            .collect();
         let res = ctx.materialize_box_at(source);
         ctx.initialize_imported_short_preamble_builder(
             &short_inputargs,
-            &short_inputarg_boxes,
+            &short_inputargs,
             &[crate::optimizeopt::shortpreamble::PreambleOp {
                 op: std::rc::Rc::new(preamble_op),
                 res,

@@ -486,21 +486,19 @@ pub struct ShortBoxes {
     ///
     /// shortpreamble.py:256 `renamed = OpHelpers.inputarg_from_tp(box.type)`
     /// mints a fresh producer-less InputArg box per label slot; the stored
-    /// boxes ARE the short preamble's Label args (shortpreamble.py:443).
-    /// Each entry is a fresh InputArg box whose position is allocated from
+    /// positions ARE the short preamble's Label args (shortpreamble.py:443).
+    /// Each entry is a fresh InputArg position allocated from
     /// the op-position counter (`alloc_op_position_typed`), so its identity
     /// is DISTINCT from the original label arg (`shortpreamble.py:257`
     /// `ShortInputArg(box, renamed)` — `box` and `renamed` are two objects).
     /// `short_inputargs[i]` corresponds to `label_args[i]` positionally.
-    short_inputargs: Vec<BoxRef>,
-    /// Strong-`Rc` rooting pool for the renamed `InputArg` objects whose
-    /// `Weak` the `short_inputargs[i]` boxes hold (`from_bound_inputarg`
-    /// downgrades the `Rc`, box_ref.rs:293). Index-aligned 1:1 with
-    /// `short_inputargs`. Keeps each renamed `AbstractInputArg` alive so the
-    /// box stays bound (`bound_inputarg()` upgrades) until the operand it
-    /// sheds to (`Operand::InputArg`, a strong `Rc::clone`) self-roots it —
-    /// the analog of `TraceIterator.inputargs` rooting the outer-trace
-    /// inputargs (opencoder.py:250-273).
+    short_inputargs: Vec<OpRef>,
+    /// Strong-`Rc` rooting pool for the renamed `InputArg` objects behind
+    /// `short_inputargs[i]`. Index-aligned 1:1 with `short_inputargs`. Keeps
+    /// each renamed `AbstractInputArg` alive so producer-shaped consumers can
+    /// bind that position to `Operand::InputArg` / a bound BoxRef view — the
+    /// analog of `TraceIterator.inputargs` rooting the outer-trace inputargs
+    /// (opencoder.py:250-273).
     short_inputarg_refs: Vec<majit_ir::InputArgRc>,
     /// shortpreamble.py:256 `box = label_args[i]` — the ORIGINAL label-arg
     /// references, kept so `potential_ops`/lookups resolve a label arg by
@@ -743,7 +741,7 @@ impl ShortBoxes {
         // (reads only `(type, position)`).
         let pos = ctx.alloc_op_position_typed(arg_type).raw();
         let renamed_ia = majit_ir::InputArg::from_type_rc(arg_type, pos);
-        let renamed = majit_ir::box_ref::BoxRef::from_bound_inputarg(&renamed_ia);
+        let renamed = renamed_ia.opref();
         // shortpreamble.py:259 `self.potential_ops[box] = ShortInputArg(...)`
         // is a plain dict assignment, so for a box duplicated across the
         // combined list it OVERWRITES: the LAST slot's `ShortInputArg`
@@ -800,7 +798,7 @@ impl ShortBoxes {
     fn renamed_short_inputarg(&self, label_arg_idx: Option<usize>) -> BoxRef {
         let idx = label_arg_idx
             .expect("InputArg short box missing label_arg_idx (set by add_short_input_arg)");
-        self.short_inputargs[idx].clone()
+        majit_ir::box_ref::BoxRef::from_bound_inputarg(&self.short_inputarg_refs[idx])
     }
 
     fn produce_arg(
@@ -1031,7 +1029,7 @@ impl ShortBoxes {
     /// Unconditionally returns `self.short_inputargs`. The pyre fallback
     /// to `label_args.to_vec()` on empty was a TODO — empty
     /// short_inputargs is the legitimate empty-loop case in upstream.
-    pub fn create_short_inputargs(&self, _label_args: &[OpRef]) -> Vec<BoxRef> {
+    pub fn create_short_inputargs(&self, _label_args: &[OpRef]) -> Vec<OpRef> {
         self.short_inputargs.clone()
     }
 
@@ -1375,13 +1373,13 @@ fn imported_const_opref(
 pub(crate) fn classify_short_arg(
     ctx: &mut crate::optimizeopt::OptContext,
     arg: OpRef,
-    short_inputargs: &[BoxRef],
+    short_inputargs: &[OpRef],
     short_args: &[OpRef],
     produced_results: &majit_ir::VecMap<OpRef, OpRef>,
     imported_constants: &mut majit_ir::VecMap<OpRef, OpRef>,
     short_box_const_values: &majit_ir::VecMap<OpRef, majit_ir::Value>,
 ) -> Option<crate::optimizeopt::ImportedShortPureArg> {
-    if let Some(slot) = short_inputargs.iter().position(|i| i.to_opref() == arg) {
+    if let Some(slot) = short_inputargs.iter().position(|i| *i == arg) {
         return short_args
             .get(slot)
             .copied()
@@ -1434,7 +1432,7 @@ impl ProducedShortOp {
         &self,
         ctx: &mut crate::optimizeopt::OptContext,
         exported_infos: &majit_ir::VecMap<BoxRef, crate::optimizeopt::info::OpInfo>,
-        short_inputargs: &[BoxRef],
+        short_inputargs: &[OpRef],
         short_args: &[OpRef],
         result_map: &majit_ir::VecMap<OpRef, OpRef>,
         produced_results: &mut majit_ir::VecMap<OpRef, OpRef>,
@@ -1505,7 +1503,7 @@ impl ProducedShortOp {
     fn produce_pure(
         &self,
         ctx: &mut crate::optimizeopt::OptContext,
-        short_inputargs: &[BoxRef],
+        short_inputargs: &[OpRef],
         short_args: &[OpRef],
         result_map: &majit_ir::VecMap<OpRef, OpRef>,
         produced_results: &mut majit_ir::VecMap<OpRef, OpRef>,
@@ -1657,7 +1655,7 @@ impl ProducedShortOp {
         &self,
         ctx: &mut crate::optimizeopt::OptContext,
         exported_infos: &majit_ir::VecMap<BoxRef, crate::optimizeopt::info::OpInfo>,
-        short_inputargs: &[BoxRef],
+        short_inputargs: &[OpRef],
         short_args: &[OpRef],
         result_map: &majit_ir::VecMap<OpRef, OpRef>,
         produced_results: &majit_ir::VecMap<OpRef, OpRef>,
@@ -1780,7 +1778,7 @@ impl ProducedShortOp {
         &self,
         ctx: &mut crate::optimizeopt::OptContext,
         exported_infos: &majit_ir::VecMap<BoxRef, crate::optimizeopt::info::OpInfo>,
-        short_inputargs: &[BoxRef],
+        short_inputargs: &[OpRef],
         short_args: &[OpRef],
         result_map: &majit_ir::VecMap<OpRef, OpRef>,
         produced_results: &majit_ir::VecMap<OpRef, OpRef>,
@@ -1924,7 +1922,7 @@ impl ProducedShortOp {
     fn produce_loop_invariant(
         &self,
         ctx: &mut crate::optimizeopt::OptContext,
-        short_inputargs: &[BoxRef],
+        short_inputargs: &[OpRef],
         short_args: &[OpRef],
         result_map: &majit_ir::VecMap<OpRef, OpRef>,
         produced_results: &majit_ir::VecMap<OpRef, OpRef>,
@@ -1996,9 +1994,9 @@ struct AbstractShortPreambleBuilderState {
     short_preamble_jump: Vec<majit_ir::OpRc>,
     extra_same_as: Vec<Op>,
     /// shortpreamble.py:430 `self.short_inputargs = short_inputargs` —
-    /// the renamed InputArg boxes; reused verbatim as the Label args
+    /// the renamed InputArg positions; reused verbatim as the Label args
     /// (shortpreamble.py:443 `ResOperation(rop.LABEL, self.short_inputargs[:])`).
-    short_inputargs: Vec<BoxRef>,
+    short_inputargs: Vec<OpRef>,
     /// Known constant OpRefs. In RPython, isinstance(box, Const) is a type
     /// check. In majit, constant OpRefs must be explicitly tracked.
     known_constants: VecSet<OpRef>,
@@ -2121,10 +2119,7 @@ impl AbstractShortPreambleBuilderState {
             let arg_opref = arg.to_opref();
             if self.short_results.contains(&arg_opref)
                 || already_in_short.contains(&arg_opref)
-                || self
-                    .short_inputargs
-                    .iter()
-                    .any(|a| a.to_opref() == arg_opref)
+                || self.short_inputargs.iter().any(|a| *a == arg_opref)
                 || self.known_constants.contains(&arg_opref)
             {
                 continue;
@@ -2257,7 +2252,7 @@ impl ShortPreambleBuilder {
     pub fn new(
         label_args: &[OpRef],
         short_boxes: &[(majit_ir::operand::Operand, ProducedShortOp)],
-        short_inputargs: &[BoxRef],
+        short_inputargs: &[OpRef],
     ) -> Self {
         let mut produced_short_boxes = VecMap::new();
         for (k, v) in short_boxes {
@@ -2286,11 +2281,11 @@ impl ShortPreambleBuilder {
             produced_short_boxes.insert(k.clone(), v.clone());
         }
         // shortpreamble.py:430 `self.short_inputargs = short_inputargs` —
-        // store the caller's renamed-box objects themselves. The empty
+        // store the caller's renamed positions themselves. The empty
         // fallback (test paths without an exported preview list) mints
-        // position-only boxes from the label args once.
+        // position refs from the label args once.
         let short_inputargs = if short_inputargs.is_empty() {
-            label_args.iter().map(|&a| BoxRef::from_opref(a)).collect()
+            label_args.to_vec()
         } else {
             short_inputargs.to_vec()
         };
@@ -2465,7 +2460,8 @@ impl ShortPreambleBuilder {
             .state
             .short_inputargs
             .iter()
-            .map(majit_ir::operand::Operand::from_boxref)
+            .copied()
+            .map(majit_ir::operand::Operand::bound_from_opref)
             .collect();
         result.push(Op::new(OpCode::Label, &short_inputargs_operand));
         result.extend(self.state.short.iter().map(|op| (**op).clone()));
@@ -2490,16 +2486,8 @@ impl ShortPreambleBuilder {
             .iter()
             .map(|op| op.pos.get())
             .collect();
-        // ShortPreamble is the cross-phase (position-domain) export;
-        // shed the boxes to their positions at this boundary.
-        let short_inputargs: Vec<OpRef> = self
-            .state
-            .short_inputargs
-            .iter()
-            .map(|a| a.to_opref())
-            .collect();
         build_short_preamble_struct_from_ops(
-            &short_inputargs,
+            &self.state.short_inputargs,
             &self.state.short,
             &self.state.used_boxes,
             &jump_args,
@@ -2518,7 +2506,7 @@ impl ShortPreambleBuilder {
         &self.state.extra_same_as
     }
 
-    pub fn short_inputargs(&self) -> &[BoxRef] {
+    pub fn short_inputargs(&self) -> &[OpRef] {
         &self.state.short_inputargs
     }
 }
@@ -2537,19 +2525,19 @@ pub struct ExtendedShortPreambleBuilder {
     /// therefore unverifiable (the gate cannot exercise the silent-miss
     /// surface), like the deferred vectorizer maps.
     produced_short_boxes: VecMap<OpRef, ProducedShortOp>,
-    short_inputargs: Vec<BoxRef>,
+    short_inputargs: Vec<OpRef>,
     /// shortpreamble.py:460: self.short = short — single ops list (base + JUMP sentinel)
     short: Vec<Op>,
     /// Tracks which OpRefs are already in `short` (for dedup).
     short_results: VecSet<OpRef>,
     /// Constants tracked for RPython isinstance(arg, Const) checks.
-    known_constants: VecSet<BoxRef>,
+    known_constants: VecSet<OpRef>,
     extra_same_as: Vec<Op>,
     short_preamble_jump: Vec<majit_ir::OpRc>,
     base_extra_same_as: Vec<Op>,
-    label_args: Vec<BoxRef>,
-    used_boxes: Vec<BoxRef>,
-    short_jump_args: Vec<BoxRef>,
+    label_args: Vec<OpRef>,
+    used_boxes: Vec<OpRef>,
+    short_jump_args: Vec<OpRef>,
     pub target_token: u64,
     /// RPython parity: remap Phase 1 preamble OpRefs → current inputargs.
     /// Values are the current-namespace boxes, bound to their producers at
@@ -2574,6 +2562,25 @@ impl ExtendedShortPreambleBuilder {
             }
         }
 
+        fn visit_oprefs(refs: &mut [OpRef], visitor: &mut dyn FnMut(&mut GcRef)) {
+            for r in refs {
+                if let OpRef::ConstPtr(gcref) = r {
+                    visitor(gcref);
+                }
+            }
+        }
+
+        fn visit_opref_set(set: &mut VecSet<OpRef>, visitor: &mut dyn FnMut(&mut GcRef)) {
+            let refs: Vec<OpRef> = set.iter().copied().collect();
+            set.clear();
+            for mut r in refs {
+                if let OpRef::ConstPtr(gcref) = &mut r {
+                    visitor(gcref);
+                }
+                set.insert(r);
+            }
+        }
+
         fn visit_produced(produced: &mut ProducedShortOp, visitor: &mut dyn FnMut(&mut GcRef)) {
             produced.preamble_op.walk_const_ptr_refs_mut(visitor);
             if let Some(source) = produced.same_as_source.as_ref() {
@@ -2584,13 +2591,11 @@ impl ExtendedShortPreambleBuilder {
         for (_, produced) in self.produced_short_boxes.iter_mut() {
             visit_produced(produced, visitor);
         }
-        visit_boxrefs(&self.short_inputargs, visitor);
+        visit_oprefs(&mut self.short_inputargs, visitor);
         for op in &mut self.short {
             op.walk_const_ptr_refs_mut(visitor);
         }
-        for b in self.known_constants.iter() {
-            b.walk_const_ptr_refs(visitor);
-        }
+        visit_opref_set(&mut self.known_constants, visitor);
         for op in &mut self.extra_same_as {
             op.walk_const_ptr_refs_mut(visitor);
         }
@@ -2600,9 +2605,9 @@ impl ExtendedShortPreambleBuilder {
         for op in &mut self.base_extra_same_as {
             op.walk_const_ptr_refs_mut(visitor);
         }
-        visit_boxrefs(&self.label_args, visitor);
-        visit_boxrefs(&self.used_boxes, visitor);
-        visit_boxrefs(&self.short_jump_args, visitor);
+        visit_oprefs(&mut self.label_args, visitor);
+        visit_oprefs(&mut self.used_boxes, visitor);
+        visit_oprefs(&mut self.short_jump_args, visitor);
         // phase1_to_inputarg keys are Phase 1 preamble OpRefs (op result
         // positions, never Const); only the bound values carry const GcRefs.
         for (_, target) in self.phase1_to_inputarg.iter() {
@@ -2716,7 +2721,7 @@ impl ExtendedShortPreambleBuilder {
                     }
                     self.short.clear();
                     self.short_results.clear();
-                    self.label_args = label_args.iter().map(|a| BoxRef::from_opref(*a)).collect();
+                    self.label_args = label_args.to_vec();
                     return false;
                 }
             }
@@ -2724,46 +2729,31 @@ impl ExtendedShortPreambleBuilder {
             self.short.push(op);
         }
         // JUMP sentinel at end (RPython: short[-1] is always JUMP)
-        let jump_args_box: Vec<BoxRef> = short_preamble
-            .jump_args
-            .iter()
-            .map(|arg| {
-                self.phase1_to_inputarg
-                    .get(arg)
-                    .cloned()
-                    .unwrap_or_else(|| {
-                        // Unmapped Phase 1 jump arg (no rename): resolve the
-                        // Phase-2 producer registered at this position — the
-                        // inlined short box op or the label inputarg — so the
-                        // JUMP arg carries the producer object instead of a
-                        // producer-less position-only box. Mirrors the mapped
-                        // arm, which binds via `materialize_box_at`; falls back
-                        // to a position-only box only if no producer exists.
-                        ctx.get_box_replacement_operand_opt(*arg)
-                            .map(|o| o.to_boxref())
-                            .unwrap_or_else(|| BoxRef::from_opref(*arg))
-                    })
-            })
-            .collect();
-        let jump_args_box_operand: Vec<majit_ir::operand::Operand> = jump_args_box
-            .iter()
-            .map(majit_ir::operand::Operand::from_boxref)
-            .collect();
-        self.short
-            .push(Op::new(OpCode::Jump, &jump_args_box_operand));
+        let mut jump_args = Vec::with_capacity(short_preamble.jump_args.len());
+        let mut jump_args_operand = Vec::with_capacity(short_preamble.jump_args.len());
+        for arg in &short_preamble.jump_args {
+            if let Some(target) = self.phase1_to_inputarg.get(arg) {
+                jump_args.push(target.to_opref());
+                jump_args_operand.push(majit_ir::operand::Operand::from_boxref(target));
+            } else {
+                // Unmapped Phase 1 jump arg (no rename): resolve the Phase-2
+                // producer registered at this position — the inlined short box
+                // op or the label inputarg — so the emitted JUMP keeps the
+                // producer binding while `short_jump_args` stores only positions.
+                let operand = ctx
+                    .get_box_replacement_operand_opt(*arg)
+                    .unwrap_or_else(|| ctx.materialize_operand_at(*arg));
+                jump_args.push(operand.to_opref());
+                jump_args_operand.push(operand);
+            }
+        }
+        self.short.push(Op::new(OpCode::Jump, &jump_args_operand));
         // Reset state
         self.extra_same_as = self.base_extra_same_as.clone();
         self.short_preamble_jump.clear();
-        self.label_args = label_args.iter().map(|a| BoxRef::from_opref(*a)).collect();
-        // The struct carries flat OpRef positions; the builder field is
-        // still BoxRef, so re-mint the positions at this boundary.
-        self.used_boxes = short_preamble
-            .used_boxes
-            .iter()
-            .copied()
-            .map(BoxRef::from_opref)
-            .collect();
-        self.short_jump_args = jump_args_box;
+        self.label_args = label_args.to_vec();
+        self.used_boxes = short_preamble.used_boxes.clone();
+        self.short_jump_args = jump_args;
         true
     }
 
@@ -2791,7 +2781,7 @@ impl ExtendedShortPreambleBuilder {
         }
         if self.short_results.contains(&arg)
             || inputargs_set.contains(&arg)
-            || self.known_constants.contains(&BoxRef::from_opref(arg))
+            || self.known_constants.contains(&arg)
             || constants_set.contains(&arg.raw())
         {
             return true;
@@ -2943,11 +2933,10 @@ impl ExtendedShortPreambleBuilder {
                 same_as.pos.set(op);
                 self.extra_same_as.push(same_as);
             }
-            self.label_args.push(resolved_op.clone());
-            // Bind the live preamble producer: `to_opref` is unchanged
-            // (replay_op.pos), and the box now roots replay_op (already held
-            // by short_preamble_jump), so the flattened struct is identical.
-            self.short_jump_args.push(BoxRef::from_bound_op(replay_op));
+            self.label_args.push(resolved_key);
+            // The flattened struct only needs the replay position; the replay
+            // op itself is rooted by short_preamble_jump.
+            self.short_jump_args.push(replay_op.pos.get());
             self.short_preamble_jump.push(replay_op.clone());
         }
     }
@@ -2976,15 +2965,9 @@ impl ExtendedShortPreambleBuilder {
             op.pos.set(current_result);
             self.extra_same_as.push(op);
         }
-        self.label_args.push(result.to_boxref());
-        // Bind the live preamble producer (current_result == preamble_op.pos):
-        // `to_opref` is unchanged and the box roots produced.preamble_op
-        // (already held by short_preamble_jump), so the flattened struct is
-        // identical.
-        self.used_boxes
-            .push(BoxRef::from_bound_op(&produced.preamble_op));
-        self.short_jump_args
-            .push(BoxRef::from_bound_op(&produced.preamble_op));
+        self.label_args.push(result.to_opref());
+        self.used_boxes.push(produced.preamble_op.pos.get());
+        self.short_jump_args.push(produced.preamble_op.pos.get());
         self.short_preamble_jump.push(produced.preamble_op.clone());
     }
 
@@ -3056,8 +3039,8 @@ impl ExtendedShortPreambleBuilder {
             for arg in preamble_op.getarglist().iter() {
                 let arg = arg.to_opref();
                 if self.short_results.contains(&arg)
-                    || self.short_inputargs.iter().any(|a| a.to_opref() == arg)
-                    || self.known_constants.contains(&BoxRef::from_opref(arg))
+                    || self.short_inputargs.iter().any(|a| *a == arg)
+                    || self.known_constants.contains(&arg)
                 {
                     continue;
                 }
@@ -3091,7 +3074,7 @@ impl ExtendedShortPreambleBuilder {
         self.produced_short_boxes.get(&result).cloned()
     }
 
-    pub fn short_inputargs(&self) -> &[BoxRef] {
+    pub fn short_inputargs(&self) -> &[OpRef] {
         &self.short_inputargs
     }
 
@@ -3101,23 +3084,19 @@ impl ExtendedShortPreambleBuilder {
             .iter()
             .map(|op| std::rc::Rc::new(op.clone()))
             .collect();
-        // ShortPreamble is the cross-phase (position-domain) export;
-        // shed the boxes to their positions at this boundary.
-        let short_inputargs: Vec<OpRef> =
-            self.short_inputargs.iter().map(|a| a.to_opref()).collect();
-        let label_args: Vec<OpRef> = self.label_args.iter().map(|b| b.to_opref()).collect();
-        let used_boxes: Vec<OpRef> = self.used_boxes.iter().map(|b| b.to_opref()).collect();
-        let short_jump_args: Vec<OpRef> =
-            self.short_jump_args.iter().map(|b| b.to_opref()).collect();
-        let inputargs = if label_args.is_empty() {
-            &short_inputargs
+        let inputargs = if self.label_args.is_empty() {
+            &self.short_inputargs
         } else {
-            &label_args
+            &self.label_args
         };
-        let mut sp =
-            build_short_preamble_struct_from_ops(inputargs, &ops, &used_boxes, &short_jump_args);
-        if inputargs != &short_inputargs {
-            sp.phase1_inputargs = Some(short_inputargs);
+        let mut sp = build_short_preamble_struct_from_ops(
+            inputargs,
+            &ops,
+            &self.used_boxes,
+            &self.short_jump_args,
+        );
+        if inputargs != self.short_inputargs.as_slice() {
+            sp.phase1_inputargs = Some(self.short_inputargs.clone());
         }
         sp
     }
@@ -3126,11 +3105,11 @@ impl ExtendedShortPreambleBuilder {
         &self.extra_same_as
     }
 
-    pub fn label_args(&self) -> &[BoxRef] {
+    pub fn label_args(&self) -> &[OpRef] {
         &self.label_args
     }
 
-    pub fn jump_args(&self) -> &[BoxRef] {
+    pub fn jump_args(&self) -> &[OpRef] {
         &self.short_jump_args
     }
 
@@ -3340,7 +3319,7 @@ pub(crate) fn produced_short_boxes_from_exported_boxes(
 /// re-running the rename + filter pass.
 pub(crate) fn build_short_preamble_from_produced_boxes(
     label_args: &[OpRef],
-    short_inputargs: &[BoxRef],
+    short_inputargs: &[OpRef],
     produced: &[(OpRef, ProducedShortOp)],
 ) -> ShortPreamble {
     // #146/S8: the builder map keys by the entry res Box (`p.res`, the carried
@@ -3378,7 +3357,7 @@ pub(crate) fn build_short_preamble_from_produced_boxes(
 #[cfg(test)]
 fn build_short_preamble_from_exported_boxes(
     label_args: &[OpRef],
-    short_inputargs: &[BoxRef],
+    short_inputargs: &[OpRef],
     exported_short_boxes: &[PreambleOp],
 ) -> ShortPreamble {
     let produced = produced_short_boxes_from_exported_boxes(exported_short_boxes);
@@ -3638,10 +3617,7 @@ mod tests {
 
         let sp = build_short_preamble_from_exported_boxes(
             &[OpRef::int_op(0), OpRef::int_op(1)],
-            &[
-                rooted_resop_box(Type::Int, 10),
-                rooted_resop_box(Type::Int, 11),
-            ],
+            &[OpRef::int_op(10), OpRef::int_op(11)],
             &exported,
         );
         assert_eq!(sp.ops.len(), 2);
@@ -3654,10 +3630,7 @@ mod tests {
     #[test]
     fn test_build_short_preamble_from_exported_boxes_skips_standalone_overflow_guards() {
         let label_args = vec![OpRef::int_op(10), OpRef::int_op(11)];
-        let short_inputargs = vec![
-            rooted_resop_box(Type::Int, 100),
-            rooted_resop_box(Type::Int, 101),
-        ];
+        let short_inputargs = vec![OpRef::int_op(100), OpRef::int_op(101)];
 
         let mut ovf = Op::new(OpCode::IntAddOvf, &[rop(Type::Int, 10), rop(Type::Int, 11)]);
         ovf.pos.set(OpRef::int_op(20));
@@ -3744,7 +3717,7 @@ mod tests {
         let mut builder = ShortPreambleBuilder::new(
             &[OpRef::int_op(0), OpRef::int_op(1)],
             &produced,
-            &[in0.clone(), in1.clone()],
+            &[OpRef::int_op(0), OpRef::int_op(1)],
         );
 
         let used = builder
@@ -3853,7 +3826,7 @@ mod tests {
         sb.add_pure_op(&mut __ctx, pure);
 
         let produced = sb.produced_ops(&mut __ctx);
-        let renamed10 = sb.create_short_inputargs(&[OpRef::int_op(10)])[0].to_opref();
+        let renamed10 = sb.create_short_inputargs(&[OpRef::int_op(10)])[0];
         // 1 ShortInputArg (label arg 10) + the accepted pure op.
         let non_input: Vec<_> = produced
             .iter()
@@ -4091,15 +4064,15 @@ mod tests {
         assert_eq!(si.len(), 2);
 
         // (A) DISTINCT identity: the renamed box is not the original label arg.
-        assert_ne!(si[0].to_opref(), OpRef::int_op(10));
-        assert_ne!(si[1].to_opref(), OpRef::ref_op(11));
+        assert_ne!(si[0], OpRef::int_op(10));
+        assert_ne!(si[1], OpRef::ref_op(11));
 
         // (B) the renamed boxes are InputArg-kind of the matching type
         // (inputarg_from_tp(box.type)).
-        assert!(matches!(si[0].to_opref(), OpRef::InputArgInt(_)));
-        assert!(matches!(si[1].to_opref(), OpRef::InputArgRef(_)));
-        assert_eq!(si[0].to_opref().ty(), Some(majit_ir::Type::Int));
-        assert_eq!(si[1].to_opref().ty(), Some(majit_ir::Type::Ref));
+        assert!(matches!(si[0], OpRef::InputArgInt(_)));
+        assert!(matches!(si[1], OpRef::InputArgRef(_)));
+        assert_eq!(si[0].ty(), Some(majit_ir::Type::Int));
+        assert_eq!(si[1].ty(), Some(majit_ir::Type::Ref));
 
         // (C) lookups still resolve a label arg by its ORIGINAL opref
         // (shortpreamble.py:259 potential_ops[box]).
@@ -4132,7 +4105,7 @@ mod tests {
         // Two FRESH distinct renamed boxes, one per slot (shortpreamble.py:258).
         let si = sb.create_short_inputargs(&label_args);
         assert_eq!(si.len(), 2);
-        assert_ne!(si[0].to_opref(), si[1].to_opref());
+        assert_ne!(si[0], si[1]);
 
         // The duplicate collapses to ONE produced InputArg entry, keyed at the
         // LAST slot (label_arg_idx == Some(1)), not the first (Some(0)).
@@ -4148,8 +4121,8 @@ mod tests {
 
         // produce_arg returns the LAST slot's renamed box.
         let produced_arg = sb.produce_arg(&mut ctx, OpRef::ref_op(50)).unwrap();
-        assert_eq!(produced_arg.to_opref(), si[1].to_opref());
-        assert_ne!(produced_arg.to_opref(), si[0].to_opref());
+        assert_eq!(produced_arg.to_opref(), si[1]);
+        assert_ne!(produced_arg.to_opref(), si[0]);
 
         // `lookup_label_arg` mirrors `potential_ops[box]`'s last-wins overwrite,
         // resolving the duplicated box to the LAST/live slot. This keeps the
@@ -4175,7 +4148,7 @@ mod tests {
 
         let produced = sb.produced_ops(&mut __ctx);
         let short_inputargs = sb.create_short_inputargs(&[OpRef::int_op(30), OpRef::int_op(31)]);
-        let label_arg_oprefs: Vec<OpRef> = short_inputargs.iter().map(|b| b.to_opref()).collect();
+        let label_arg_oprefs: Vec<OpRef> = short_inputargs.clone();
         // #146/S8: the builder map keys by the entry res Box; re-key the
         // produced_ops list (keyed by `preamble_op.pos`) to res for new() and
         // look up by the res box of the int_op(10) entry.
@@ -4247,11 +4220,8 @@ mod tests {
             .iter()
             .map(|(_, p)| (p.res.clone(), p.clone()))
             .collect();
-        let mut builder = ShortPreambleBuilder::new(
-            &[OpRef::int_op(20)],
-            &entries,
-            &[rooted_resop_box(Type::Int, 20)],
-        );
+        let mut builder =
+            ShortPreambleBuilder::new(&[OpRef::int_op(20)], &entries, &[OpRef::int_op(20)]);
         assert!(builder.add_preamble_op(&alias_res));
         let extra = builder.extra_same_as();
         assert_eq!(extra.len(), 1);
@@ -4269,8 +4239,7 @@ mod tests {
 
     #[test]
     fn test_short_preamble_builder_fallback_keeps_invented_name_alias_identity() {
-        let mut builder =
-            ShortPreambleBuilder::new(&[OpRef::int_op(7)], &[], &[rooted_resop_box(Type::Int, 7)]);
+        let mut builder = ShortPreambleBuilder::new(&[OpRef::int_op(7)], &[], &[OpRef::int_op(7)]);
         let mut replay_op = Op::new(OpCode::GetfieldGcI, &[rop(Type::Int, 30)]);
         replay_op.pos.set(OpRef::int_op(14));
         let pop = crate::optimizeopt::info::PreambleOp {
@@ -4306,8 +4275,7 @@ mod tests {
 
     #[test]
     fn test_extended_short_preamble_builder_fallback_keeps_invented_name_alias_identity() {
-        let sb =
-            ShortPreambleBuilder::new(&[OpRef::int_op(7)], &[], &[rooted_resop_box(Type::Int, 7)]);
+        let sb = ShortPreambleBuilder::new(&[OpRef::int_op(7)], &[], &[OpRef::int_op(7)]);
         let mut builder = ExtendedShortPreambleBuilder::new(0, &sb);
         let mut replay_op = Op::new(OpCode::GetfieldGcI, &[rop(Type::Int, 30)]);
         replay_op.pos.set(OpRef::int_op(14));
@@ -4322,22 +4290,8 @@ mod tests {
 
         builder.add_preamble_op_from_pop(&pop, rooted_resop_box(Type::Int, 41));
 
-        assert_eq!(
-            builder
-                .label_args()
-                .iter()
-                .map(|b| b.to_opref())
-                .collect::<Vec<_>>(),
-            vec![OpRef::int_op(41)]
-        );
-        assert_eq!(
-            builder
-                .jump_args()
-                .iter()
-                .map(|b| b.to_opref())
-                .collect::<Vec<_>>(),
-            vec![OpRef::int_op(14)]
-        );
+        assert_eq!(builder.label_args(), &[OpRef::int_op(41)]);
+        assert_eq!(builder.jump_args(), &[OpRef::int_op(14)]);
         let extra = builder.extra_same_as();
         assert_eq!(extra.len(), 1);
         assert_eq!(extra[0].opcode, OpCode::SameAsI);

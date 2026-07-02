@@ -3709,17 +3709,8 @@ impl Optimizer {
                 for arg in &mut state.renamed_inputargs {
                     remap_boxref(arg);
                 }
-                for arg in &state.short_inputargs {
-                    // A bound short inputarg live-tracks its producer's
-                    // `op.pos`, already remapped by the main loop, so it needs
-                    // no rewrite. Only position-only boxes (test fixtures) carry
-                    // a pre-remap position the table must rewrite.
-                    if arg.bound_op().is_some() || arg.bound_inputarg().is_some() {
-                        continue;
-                    }
-                    let mut opref = arg.to_opref();
-                    remap_opref(&mut opref);
-                    arg.set_position(opref.raw());
+                for arg in &mut state.short_inputargs {
+                    remap_opref(arg);
                 }
                 // exported_infos is keyed by box identity (Rc::ptr_eq), so its keys
                 // need NO position remap — the lookup matches by Rc, not OpRef. The
@@ -6922,7 +6913,7 @@ mod tests {
         ctx.make_constant_box(&b, majit_ir::Value::Int(0));
         ctx.initialize_imported_short_preamble_builder(
             &[OpRef::int_op(0)],
-            &[rooted_resop_box(Type::Int, 0)],
+            &[OpRef::int_op(0)],
             &[crate::optimizeopt::shortpreamble::PreambleOp {
                 op: std::rc::Rc::new(preamble_op.clone()),
                 res: rooted_resop_box(Type::Int, 14),
