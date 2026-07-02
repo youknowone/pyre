@@ -3435,12 +3435,23 @@ impl OptContext {
             let _ = result_type;
             // unroll.py:34-37: potential_extra_ops[op] = preamble_op
             if !is_constant {
-                // unroll.py:35-36: invented_name → get_box_replacement(op)
-                let key = if preamble_op.invented_name {
-                    result
-                } else {
-                    preamble_source
-                };
+                // unroll.py:29/37 `op = preamble_op.op; potential_extra_ops[op]
+                // = preamble_op` — upstream keys by the Box the BODY holds:
+                // heap.py's `_getfield` hands `self.res` (== preamble_op.op)
+                // to body ops directly, so `force_box`'s `pop(get_box_
+                // replacement(arg))` lands on that same object. majit's
+                // Cat-2.2 heap production reverses the chain — `produce_heap_
+                // field` forwards `source → result_opref`, so the terminal
+                // body-visible OpRef is `result`, NOT `preamble_source`.
+                // Key by `result` for every kind: non-invented Pure installs
+                // no forwarding (result == preamble_source, behavior
+                // unchanged), invented already used it, and Heap/LoopInvariant
+                // need it — keying those by `preamble_source` left the entry
+                // unreachable from every consumer (force_box resolves body
+                // args forward, never back), silently dropping the short
+                // box from `used_boxes`/`short_preamble_jump` and emitting a
+                // bridge JUMP one arg short of the target label.
+                let key = result;
                 if crate::optimizeopt::majit_log_enabled() {
                     eprintln!(
                         "[jit] potential_extra_ops.insert key={key:?} source={preamble_source:?} result={result:?} invented={}",
