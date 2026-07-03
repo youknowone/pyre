@@ -1942,6 +1942,248 @@ pub fn build_ll_jit_try_append_multiple_char_helper_graph(
     ))
 }
 
+/// Synthesise `ll_append_charpsize(ll_builder, charp, size)`
+/// (`rbuilder.py:329-341`). Returns `Void`.
+pub fn build_ll_append_charpsize_helper_graph(
+    name: &str,
+    builder_ptr_lltype: LowLevelType,
+    charp_lltype: LowLevelType,
+    buf_lltype: LowLevelType,
+    copy_raw_to_string_fn: Constant,
+    grow_by_fn: Constant,
+) -> Result<PyGraph, TyperError> {
+    let bool_case = |b: bool| Some(constant_with_lltype(ConstValue::Bool(b), LowLevelType::Bool));
+    let void_result = || variable_with_lltype("v", LowLevelType::Void);
+    let none_const = || {
+        Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::None,
+            LowLevelType::Void,
+        ))
+    };
+    let push = |block: &crate::flowspace::model::BlockRef,
+                opname: &str,
+                args: Vec<Hlvalue>,
+                out: Hlvalue| {
+        block
+            .borrow_mut()
+            .operations
+            .push(SpaceOperation::new(opname, args, out));
+    };
+
+    let ll_builder = variable_with_lltype("ll_builder", builder_ptr_lltype.clone());
+    let charp = variable_with_lltype("charp", charp_lltype.clone());
+    let size = variable_with_lltype("size", LowLevelType::Signed);
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(ll_builder.clone()),
+        Hlvalue::Variable(charp.clone()),
+        Hlvalue::Variable(size.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", LowLevelType::Void);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    // Shared tail: current_pos = current_pos + size; copy_raw_to_string(...).
+    let t_llb = variable_with_lltype("ll_builder", builder_ptr_lltype.clone());
+    let t_charp = variable_with_lltype("charp", charp_lltype.clone());
+    let t_size = variable_with_lltype("size", LowLevelType::Signed);
+    let block_tail = Block::shared(vec![
+        Hlvalue::Variable(t_llb.clone()),
+        Hlvalue::Variable(t_charp.clone()),
+        Hlvalue::Variable(t_size.clone()),
+    ]);
+    let t_pos = variable_with_lltype("pos", LowLevelType::Signed);
+    push(
+        &block_tail,
+        "getfield",
+        vec![Hlvalue::Variable(t_llb.clone()), void_field_const("current_pos")],
+        Hlvalue::Variable(t_pos.clone()),
+    );
+    let t_newpos = variable_with_lltype("newpos", LowLevelType::Signed);
+    push(
+        &block_tail,
+        "int_add",
+        vec![Hlvalue::Variable(t_pos.clone()), Hlvalue::Variable(t_size.clone())],
+        Hlvalue::Variable(t_newpos.clone()),
+    );
+    push(
+        &block_tail,
+        "setfield",
+        vec![
+            Hlvalue::Variable(t_llb.clone()),
+            void_field_const("current_pos"),
+            Hlvalue::Variable(t_newpos),
+        ],
+        Hlvalue::Variable(void_result()),
+    );
+    let t_buf = variable_with_lltype("current_buf", buf_lltype.clone());
+    push(
+        &block_tail,
+        "getfield",
+        vec![Hlvalue::Variable(t_llb), void_field_const("current_buf")],
+        Hlvalue::Variable(t_buf.clone()),
+    );
+    push(
+        &block_tail,
+        "direct_call",
+        vec![
+            Hlvalue::Constant(copy_raw_to_string_fn.clone()),
+            Hlvalue::Variable(t_charp),
+            Hlvalue::Variable(t_buf),
+            Hlvalue::Variable(t_pos),
+            Hlvalue::Variable(t_size),
+        ],
+        Hlvalue::Variable(void_result()),
+    );
+    block_tail.closeblock(vec![
+        Link::new(vec![none_const()], Some(graph.returnblock.clone()), None).into_ref(),
+    ]);
+
+    // True arm: copy first part, advance charp, shrink size, grow.
+    let b_llb = variable_with_lltype("ll_builder", builder_ptr_lltype.clone());
+    let b_charp = variable_with_lltype("charp", charp_lltype.clone());
+    let b_size = variable_with_lltype("size", LowLevelType::Signed);
+    let b_part1 = variable_with_lltype("part1", LowLevelType::Signed);
+    let b_pos = variable_with_lltype("current_pos", LowLevelType::Signed);
+    let block_body = Block::shared(vec![
+        Hlvalue::Variable(b_llb.clone()),
+        Hlvalue::Variable(b_charp.clone()),
+        Hlvalue::Variable(b_size.clone()),
+        Hlvalue::Variable(b_part1.clone()),
+        Hlvalue::Variable(b_pos.clone()),
+    ]);
+    let b_buf = variable_with_lltype("current_buf", buf_lltype);
+    push(
+        &block_body,
+        "getfield",
+        vec![Hlvalue::Variable(b_llb.clone()), void_field_const("current_buf")],
+        Hlvalue::Variable(b_buf.clone()),
+    );
+    push(
+        &block_body,
+        "direct_call",
+        vec![
+            Hlvalue::Constant(copy_raw_to_string_fn),
+            Hlvalue::Variable(b_charp.clone()),
+            Hlvalue::Variable(b_buf),
+            Hlvalue::Variable(b_pos),
+            Hlvalue::Variable(b_part1.clone()),
+        ],
+        Hlvalue::Variable(void_result()),
+    );
+    let b_charp2 = variable_with_lltype("charp", charp_lltype);
+    push(
+        &block_body,
+        "direct_ptradd",
+        vec![
+            Hlvalue::Variable(b_charp),
+            Hlvalue::Variable(b_part1.clone()),
+        ],
+        Hlvalue::Variable(b_charp2.clone()),
+    );
+    let b_size2 = variable_with_lltype("size", LowLevelType::Signed);
+    push(
+        &block_body,
+        "int_sub",
+        vec![Hlvalue::Variable(b_size), Hlvalue::Variable(b_part1)],
+        Hlvalue::Variable(b_size2.clone()),
+    );
+    push(
+        &block_body,
+        "direct_call",
+        vec![
+            Hlvalue::Constant(grow_by_fn),
+            Hlvalue::Variable(b_llb.clone()),
+            Hlvalue::Variable(b_size2.clone()),
+        ],
+        Hlvalue::Variable(void_result()),
+    );
+    block_body.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(b_llb),
+                Hlvalue::Variable(b_charp2),
+                Hlvalue::Variable(b_size2),
+            ],
+            Some(block_tail.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    // part1 = current_end - current_pos; if size > part1.
+    let pos0 = variable_with_lltype("current_pos", LowLevelType::Signed);
+    push(
+        &startblock,
+        "getfield",
+        vec![Hlvalue::Variable(ll_builder.clone()), void_field_const("current_pos")],
+        Hlvalue::Variable(pos0.clone()),
+    );
+    let end0 = variable_with_lltype("current_end", LowLevelType::Signed);
+    push(
+        &startblock,
+        "getfield",
+        vec![Hlvalue::Variable(ll_builder.clone()), void_field_const("current_end")],
+        Hlvalue::Variable(end0.clone()),
+    );
+    let part1 = variable_with_lltype("part1", LowLevelType::Signed);
+    push(
+        &startblock,
+        "int_sub",
+        vec![Hlvalue::Variable(end0), Hlvalue::Variable(pos0.clone())],
+        Hlvalue::Variable(part1.clone()),
+    );
+    let too_big = variable_with_lltype("too_big", LowLevelType::Bool);
+    push(
+        &startblock,
+        "int_gt",
+        vec![Hlvalue::Variable(size.clone()), Hlvalue::Variable(part1.clone())],
+        Hlvalue::Variable(too_big.clone()),
+    );
+    startblock.borrow_mut().exitswitch = Some(Hlvalue::Variable(too_big));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(ll_builder.clone()),
+                Hlvalue::Variable(charp.clone()),
+                Hlvalue::Variable(size.clone()),
+                Hlvalue::Variable(part1),
+                Hlvalue::Variable(pos0),
+            ],
+            Some(block_body),
+            bool_case(true),
+        )
+        .into_ref(),
+        Link::new(
+            vec![
+                Hlvalue::Variable(ll_builder),
+                Hlvalue::Variable(charp),
+                Hlvalue::Variable(size),
+            ],
+            Some(block_tail),
+            bool_case(false),
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec![
+            "ll_builder".to_string(),
+            "charp".to_string(),
+            "size".to_string(),
+        ],
+        func,
+    ))
+}
+
 /// Synthesise `ll_append(ll_builder, ll_str)` (`rbuilder.py:155-161`):
 ///
 /// ```python
@@ -4071,6 +4313,50 @@ mod tests {
             panic!("returnblock inputarg must be a Variable");
         };
         assert_eq!(ret.concretetype.borrow().clone(), Some(LowLevelType::Bool));
+    }
+
+    #[test]
+    fn build_ll_append_charpsize_copies_grows_and_merges_tail() {
+        use super::Hlvalue;
+        let helper = super::build_ll_append_charpsize_helper_graph(
+            "ll_append_charpsize",
+            super::STRINGBUILDERPTR.clone(),
+            crate::translator::rtyper::lltypesystem::rffi::CCHARP.clone(),
+            super::STRPTR.clone(),
+            dummy_funcptr_const(),
+            dummy_funcptr_const(),
+        )
+        .expect("build_ll_append_charpsize_helper_graph");
+        assert_eq!(helper.func.name, "ll_append_charpsize");
+        let inner = helper.graph.borrow();
+
+        let startblock = inner.startblock.borrow();
+        let start_ops: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|o| o.opname.as_str())
+            .collect();
+        assert_eq!(start_ops, vec!["getfield", "getfield", "int_sub", "int_gt"]);
+        assert_eq!(startblock.inputargs.len(), 3);
+        assert_eq!(startblock.exits.len(), 2);
+        drop(startblock);
+
+        let (count, all_ops) = walk_ops(&inner.startblock);
+        // start, overrun body, shared tail, returnblock
+        assert_eq!(count, 4);
+        let n = |name: &str| all_ops.iter().filter(|o| o.as_str() == name).count();
+        assert_eq!(n("getfield"), 5); // start pos/end, body buf, tail pos/buf
+        assert_eq!(n("int_sub"), 2); // part1 and size -= part1
+        assert_eq!(n("int_gt"), 1);
+        assert_eq!(n("direct_call"), 3); // first copy, grow_by, final copy
+        assert_eq!(n("direct_ptradd"), 1);
+        assert_eq!(n("int_add"), 1);
+        assert_eq!(n("setfield"), 1);
+
+        let Hlvalue::Variable(ret) = &inner.returnblock.borrow().inputargs[0] else {
+            panic!("returnblock inputarg must be a Variable");
+        };
+        assert_eq!(ret.concretetype.borrow().clone(), Some(LowLevelType::Void));
     }
 
     #[test]
