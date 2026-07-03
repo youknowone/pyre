@@ -778,11 +778,11 @@ fn normalize_root_loop_entry_contract(
         if std::env::var_os("MAJIT_CLOSEDBG").is_some() {
             eprintln!(
                 "@@@CONTRACT label({label_arg_count})={:?}",
-                label_op.map(|op| op.getarglist_operand())
+                label_op.map(|op| op.getarglist())
             );
             eprintln!(
                 "@@@CONTRACT jump({jump_arg_count})={:?}",
-                last_jump.map(|op| op.getarglist_operand())
+                last_jump.map(|op| op.getarglist())
             );
         }
         // RPython compile.py:334: assert jump.numargs() == label.numargs().
@@ -5155,11 +5155,7 @@ impl<M: Clone> MetaInterp<M> {
             // cut_trace_from_with_consts remaps escaped original inputargs to
             // their trace-entry Const via a transient build-time map keyed by
             // `OpRef.raw()`.
-            trace.cut_trace_from_with_consts(
-                start,
-                original_boxes,
-                &ctx.initial_inputarg_consts,
-            )
+            trace.cut_trace_from_with_consts(start, original_boxes, &ctx.initial_inputarg_consts)
         } else {
             trace
         };

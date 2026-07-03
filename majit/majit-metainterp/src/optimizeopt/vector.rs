@@ -1908,7 +1908,7 @@ impl VectorizingOptimizer {
             };
             guard_op.setdescr(descr);
         }
-        guard_op.setfailargs(loop_.label.getarglist_operand());
+        guard_op.setfailargs(loop_.label.getarglist());
     }
 
     // ── Optimization trait helper: try_vectorize ───────────────────────
