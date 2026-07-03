@@ -71,6 +71,13 @@ FBW_INLINE_MULTIFRAME_OFF = False
 # by the dynasm/cranelift backends.
 WASM_ENGINE = "wasmtime"
 
+# The wasm backend has no perf-ratio gate (its run_bench vs_cpython/vs_pypy are
+# None) — its per-bench timeout is only a hang guard. wasm legitimately runs a
+# few× slower than the native backends the base timeouts were tuned for, and
+# slower still on loaded CI runners, so give it extra headroom by default to
+# avoid flaky timeouts. Overridable with --wasm-timeout-scale.
+WASM_TIMEOUT_SCALE = 4.0
+
 BENCH_DIR = "pyre/bench"
 SYNTHETIC_BENCH_DIR = "pyre/bench/synth"
 SNAP_DIR = "pyre/check.snap"
@@ -465,6 +472,11 @@ class Check:
             return self.args.dynasm_timeout_scale
         if backend == "cranelift" and self.args.cranelift_timeout_scale is not None:
             return self.args.cranelift_timeout_scale
+        if backend == "wasm":
+            if self.args.wasm_timeout_scale is not None:
+                return self.args.wasm_timeout_scale
+            # Default wasm headroom composes with --timeout-scale.
+            return WASM_TIMEOUT_SCALE * self.args.timeout_scale
         return self.args.timeout_scale
 
     def _set_pyre(self, backend, path):
@@ -1138,6 +1150,7 @@ def parse_args():
     parser.add_argument("--timeout-scale", type=float, default=1.0)
     parser.add_argument("--dynasm-timeout-scale", type=float, default=None)
     parser.add_argument("--cranelift-timeout-scale", type=float, default=None)
+    parser.add_argument("--wasm-timeout-scale", type=float, default=None)
     parser.add_argument("--snapshot", dest="snapshot_mode", action="store_const", const="record")
     parser.add_argument("--snapshot-diff", dest="snapshot_mode", action="store_const", const="diff")
     parser.add_argument("--threshold", type=float, default=None)
