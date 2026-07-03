@@ -5,7 +5,6 @@ use majit_ir::{EffectInfo, OopSpecIndex, Op, OpCode, OpRef, Value};
 
 use crate::optimizeopt::info::{PtrInfo, PtrInfoExt, VStringVariant};
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
-use majit_ir::box_ref::BoxRef;
 
 pub use crate::optimizeopt::info::{
     StrPtrInfo, VStringConcatInfo, VStringPlainInfo, VStringSliceInfo,

@@ -2464,15 +2464,11 @@ impl ShortPreambleBuilder {
             .collect();
         result.push(Op::new(OpCode::Label, &short_inputargs_operand));
         result.extend(self.state.short.iter().map(|op| (**op).clone()));
-        let jump_args: Vec<BoxRef> = self
+        let jump_args_operand: Vec<majit_ir::operand::Operand> = self
             .state
             .short_preamble_jump
             .iter()
-            .map(BoxRef::from_bound_op)
-            .collect();
-        let jump_args_operand: Vec<majit_ir::operand::Operand> = jump_args
-            .iter()
-            .map(majit_ir::operand::Operand::from_boxref)
+            .map(majit_ir::operand::Operand::from_bound_op)
             .collect();
         result.push(Op::new(OpCode::Jump, &jump_args_operand));
         result
@@ -2555,12 +2551,6 @@ pub struct ExtendedShortPreambleBuilder {
 
 impl ExtendedShortPreambleBuilder {
     pub fn walk_const_ptr_refs_mut(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
-        fn visit_boxrefs(boxes: &[BoxRef], visitor: &mut dyn FnMut(&mut GcRef)) {
-            for b in boxes {
-                b.walk_const_ptr_refs(visitor);
-            }
-        }
-
         fn visit_oprefs(refs: &mut [OpRef], visitor: &mut dyn FnMut(&mut GcRef)) {
             for r in refs {
                 if let OpRef::ConstPtr(gcref) = r {

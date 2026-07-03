@@ -6,7 +6,7 @@
 /// Naming convention: CamelCase variant name, with type suffix I/R/F/N where applicable.
 use smallvec::SmallVec;
 
-use crate::box_ref::{BoxRef, Forwarded};
+use crate::box_ref::Forwarded;
 use crate::descr::DescrRef;
 use crate::operand::Operand;
 use crate::value::{GcRef, Type, Value};

@@ -10341,10 +10341,10 @@ mod intbound_invariant_tests {
     #[should_panic]
     fn setintbound_rejects_non_int_boxes() {
         let ctx = OptContext::new(0);
-        // BoxRef-direct setintbound asserts `op.type_()` is Int/Void per
-        // optimizer.py:116. A Ref-typed BoxRef should trigger the panic.
-        let ref_box = majit_ir::box_ref::BoxRef::new_inputarg(majit_ir::Type::Ref, 0);
-        ctx.setintbound(&Operand::from_boxref(&ref_box), &IntBound::nonnegative());
+        // setintbound asserts `op.type_()` is Int/Void per optimizer.py:116.
+        // A Ref-typed operand should trigger the panic.
+        let ref_op = crate::history::test_support::rooted_inputarg_operand(majit_ir::Type::Ref, 0);
+        ctx.setintbound(&ref_op, &IntBound::nonnegative());
     }
 }
 
