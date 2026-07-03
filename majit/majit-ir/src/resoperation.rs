@@ -475,7 +475,7 @@ impl OpRef {
     /// `0.0 != -0.0`). This is the explicit API name so callers don't reach
     /// for `==`.
     ///
-    /// The same split is mirrored on `BoxRef::same_box` (identity for
+    /// The same split is mirrored on `Operand::same_box` (identity for
     /// ResOp/InputArg, value for Const) reached via `OptContext::same_box`,
     /// for callers holding a stable `Rc<Box>` handle; callers comparing
     /// Const values may use that or `ConstOprefOracle` directly.
@@ -1251,9 +1251,9 @@ pub struct Op {
     ///
     /// `#9` operand-union: each slot is an [`Operand`] — a bound producer
     /// carried by `Rc` (`Op` / `InputArg`) or an inline `Const`. The
-    /// `BoxRef`-keyed accessors (`arg`, `getarglist`, ...) convert on
+    /// operand-keyed accessors (`arg`, `getarglist`, ...) convert on
     /// read/write via `Operand::to_boxref` / `from_boxref` while callers
-    /// still speak `BoxRef`; `from_boxref` of an unbound position-only box
+    /// still speak operand; `from_boxref` of an unbound position-only box
     /// is a contract violation and panics (every source binds its producer).
     pub args: std::cell::RefCell<SmallVec<[Operand; 3]>>,
     /// `resoperation.py:460 ResOpWithDescr._descr` parity.  `RefCell`
@@ -1313,7 +1313,7 @@ pub struct Op {
 
     /// `resoperation.py:233-242 AbstractResOpOrInputArg._forwarded` parity
     /// slot — the canonical forwarding host for a bound ResOp box.
-    /// `Forwarded::None` until a writer sets it; `BoxRef::set_forwarded_*`
+    /// `Forwarded::None` until a writer sets it; `set_forwarded_*`
     /// on a bound box routes here, and `get_forwarded` reads it back.
     pub forwarded: std::cell::RefCell<crate::box_ref::Forwarded>,
 
@@ -1321,8 +1321,8 @@ pub struct Op {
     /// `:612 RefOp._resref` parity (`history.py:803-807 *FrontendOp(pos,
     /// value)`) — the concrete runtime value stamped onto this op
     /// identity at execute-time. The canonical per-identity concrete
-    /// carrier for a bound ResOp box; `BoxRef::get_value`/`set_value`
-    /// route here. `None` until a writer stamps it (trace-time
+    /// carrier for a bound ResOp box; the `get_value`/`set_value`
+    /// accessors route here. `None` until a writer stamps it (trace-time
     /// `set_opref_concrete`); residual calls / guards keep it `None`
     /// until blackhole runs them.
     pub value: std::cell::Cell<Option<crate::value::Value>>,

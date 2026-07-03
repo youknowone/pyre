@@ -788,14 +788,14 @@ pub struct OptHeap {
     /// heapcache.py:493-494 `_check_flag(box, HF_IS_UNESCAPED)` — the set of
     /// unescaped (freshly-allocated, not-yet-escaped) boxes. RPython stores the
     /// flag on the box (`box._heapc_flags`); pyre keeps an OptHeap-owned set
-    /// keyed by `BoxRef` identity (`Rc::ptr_eq`) — box identity, not the retired
+    /// keyed by operand identity (`Rc::ptr_eq`) — box identity, not the retired
     /// `opref.raw()` slot index. OptHeap ownership preserves `setup()`'s per-run
     /// reset, which a per-box flag on a shared `Box` could not bulk-clear.
     unescaped: majit_ir::vec_set::VecSet<Operand>,
     /// heapcache.py:209/298-307/453-455 `box._heapc_deps` — per-Box
     /// dependency list. RPython attaches `_heapc_deps: list | None`
     /// as an attribute on the `RefFrontendOp` Box object itself;
-    /// pyre keeps a side-table keyed by `BoxRef` identity for the same effect.
+    /// pyre keeps a side-table keyed by operand identity for the same effect.
     /// When an unescaped value is stored into an unescaped container,
     /// the value is recorded as a dependency of the container instead
     /// of being immediately escaped. When the container escapes later,
@@ -955,7 +955,7 @@ impl OptHeap {
         // container still escapes a non-constant value.
         //
         // heapcache operates on box objects; resolve both operands to their
-        // canonical `BoxRef` (memoized producer host) so set membership is by
+        // canonical operand (memoized producer host) so set membership is by
         // box identity. A position with no canonical box is not a tracked
         // allocation, so there is nothing to escape or depend on.
         let Some(value_box) = ctx.get_box_replacement_operand_opt(value) else {
@@ -3776,7 +3776,7 @@ mod tests {
     use super::OptHeap;
     use crate::history::test_support::{rooted_inputarg_operand, rooted_resop_operand};
 
-    /// oparser-faithful drop-in for `BoxRef::from_opref(o)` at op-arg /
+    /// oparser-faithful drop-in for `Operand::from_opref(o)` at op-arg /
     /// fail-arg sites where `o` is a bound-at-runtime `OpRef`. Constants shed
     /// to `Operand::Const` (no producer), so they keep the bare `from_opref`
     /// path; `InputArg*` / `{Int,Float,Ref}Op` position-only refs bind to a

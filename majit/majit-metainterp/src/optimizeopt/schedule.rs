@@ -458,7 +458,7 @@ impl VecScheduleState {
     /// producer box we look the position up among the ops already emitted
     /// into `oplist` / `invariant_oplist` (SSA guarantees a producer is
     /// emitted before its consumers). A hit binds to that exact producer
-    /// `Rc` (`BoxRef::from_bound_op` → `Operand::Op`, no mint); a constant
+    /// `Rc` (`Operand::from_bound_op` → `Operand::Op`, no mint); a constant
     /// sheds to `Operand::Const`. A miss for a ResOp/InputArg position
     /// (an inputarg, or a scalar not yet emitted as a vector op) is bound
     /// to a renamer-rooted producer box carrying the same `pos`

@@ -589,14 +589,14 @@ impl UnrollOptimizer {
                 .rfind(|op| op.opcode == OpCode::Jump)
                 .map(|op| op.getarglist().iter().map(|a| a.to_opref()).collect())
                 .unwrap_or_default();
-            // Hand opt_p1 the per-iter BoxRef pool that p1_iter
+            // Hand opt_p1 the per-iter operand pool that p1_iter
             // allocated (slice 77b.A). trace.get_iter() per-call
             // inputarg_from_tp(...) / cls() — each phase optimizes against a
             // fresh Box identity set so _forwarded mutations cannot alias
             // across phases.
             //
-            // Const BoxRefs are NOT cached: `get_box_replacement_box`
-            // allocates `BoxRef::new_const(value)` per call from `const_pool`
+            // Const operands are NOT cached: `get_box_replacement_box`
+            // allocates a fresh const operand per call from `const_pool`
             // (`history.py:220` ConstInt(value) per-call-site parity).
             // opt_p1's entry path seeds `const_pool` from the shared
             // `constants` map (`optimizer.rs:1944`).
@@ -618,7 +618,7 @@ impl UnrollOptimizer {
                 opt_p1.run_optimize_from_inputs(&p1_ops_in, &mut consts_p1, num_inputs, false)?;
             // RPython parity: Phase 1 optimizer may discover new constants
             // via make_constant (e.g., constant-folded heap reads, guard
-            // class pointers). These live on the BoxRef forwarded chain
+            // class pointers). These live on the operand's forwarded chain
             // (and in `ctx.const_pool` for const-namespace OpRefs) but
             // not in `consts_p1` (which was only seeded from the input
             // constants). Merge them back so
@@ -983,14 +983,14 @@ impl UnrollOptimizer {
         // reference these via `imported_label_args`. They are NOT in the
         // `p2_cache` (only raw trace positions are), so leave
         // `phase1_emit_ops` untranslated.
-        // Hand opt_p2 the per-iter BoxRef pool that the Phase 2
+        // Hand opt_p2 the per-iter operand pool that the Phase 2
         // iter allocated. Disjoint from opt_p1's pool — _forwarded mutations
         // recorded against Phase 1 boxes do not alias Phase 2 boxes for the
         // same OpRef raw index, fixing the Rc<Box> split-brain that broke
         // the first 77b attempt.
         //
-        // Const BoxRefs: see opt_p1 plumb above — fresh per-call from
-        // `const_pool` via `BoxRef::new_const(value)`, no dedup.
+        // Const operands: see opt_p1 plumb above — fresh per-call from
+        // `const_pool`, no dedup.
         // unroll.py:119-123 — Phase 2 (peeled loop) raises
         // SpeculativeError on speculative-fold paths; convert
         // to InvalidLoop so the caller's catch handles it.
@@ -2013,9 +2013,9 @@ pub struct ExportedState {
     /// `short_inputarg_refs` instead.
     pub(crate) short_box_producer_roots: Vec<majit_ir::OpRc>,
     /// Shadow stack rooting for GcRef values in exported_infos.
-    /// (BoxRef key, field kind, shadow stack index). The key is the
-    /// `exported_infos` BoxRef key for `InfoPtrInfoConstant` entries; other
-    /// field kinds carry the `BoxRef::none()` sentinel since they never key
+    /// (operand key, field kind, shadow stack index). The key is the
+    /// `exported_infos` operand key for `InfoPtrInfoConstant` entries; other
+    /// field kinds carry the none/empty operand sentinel since they never key
     /// back into `exported_infos`.
     rooted_refs: Vec<(Operand, ExportedGcRefField, usize)>,
     /// Shadow stack slots for every inline `ConstPtr.value` reachable from
@@ -2207,8 +2207,8 @@ impl ExportedState {
             visit_opref(key, visitor);
             visit_produced_short_op(produced, visitor);
         }
-        // The key stays an `OpRef`, not a `BoxRef` (unlike the migrated #108
-        // sites): this is a value-keyed const lookup, and `BoxRef` is ordered
+        // The key stays an `OpRef`, not an `Operand` (unlike the migrated #108
+        // sites): this is a value-keyed const lookup, and an operand is ordered
         // and compared by `Rc` identity (no `Ord`, `Eq` via `Rc::ptr_eq`), so
         // two `ConstPtr` boxes carrying the same gcref would be distinct keys
         // and the dedup the map relies on would break. `visit_opref` already
@@ -2860,7 +2860,7 @@ impl OptUnroll {
         for (_, produced_op) in &short_boxes_for_info {
             let op = produced_op.res.to_opref();
             if !op.is_constant() {
-                // `expand_info` keys the BoxRef-keyed `exported_infos`
+                // `expand_info` keys the operand-keyed `exported_infos`
                 // (#158) on the producer-bound `res`; re-mint its box
                 // (`to_boxref` is `Rc::ptr_eq`-stable on the producer, so
                 // the import lookup still hits).
@@ -3026,7 +3026,7 @@ impl OptUnroll {
         // Keyed by `arg_box`, the ONE canonical Phase-1 box the caller resolved
         // for this arg (shared verbatim with the `next_iteration_args` carry so
         // the import lookup is a ptr_eq hit). The dual OpRef-key insert is gone:
-        // a ptr-stable BoxRef key tracks its position through the shared
+        // a ptr-stable operand key tracks its position through the shared
         // set_position Cell across compaction, so there is no resolved-vs-original
         // OpRef drift left to bridge.
         if infos.contains_key(arg_box) {
@@ -6434,7 +6434,7 @@ mod tests {
         // Use optimize_trace_with_constants_and_inputs to properly set
         // num_inputs so input args don't collide with op positions. Args
         // address inputarg slots via `InputArg*` OpRef variants so the
-        // BoxRef shape (`with_inputarg_types` plants `BoxRef::new_inputarg`)
+        // operand shape (`with_inputarg_types` plants the inputarg operands)
         // and the orthodox `_forwarded` mirror agree on the namespace.
         let mut ops = vec![
             Op::new(
@@ -6484,7 +6484,7 @@ mod tests {
         // receives real AbstractValues.
         ctx.materialize_operand_at(OpRef::int_op(21));
         // Key by the canonical box identity the consumer resolves `int_op(21)`
-        // to, so the BoxRef-keyed lookup hits by `Rc::ptr_eq`.
+        // to, so the operand-keyed lookup hits by `Rc::ptr_eq`.
         let box21 = ctx
             .get_box_replacement_operand_opt(OpRef::int_op(21))
             .expect("int_op(21) bound to a box");

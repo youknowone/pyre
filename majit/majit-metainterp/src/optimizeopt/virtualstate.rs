@@ -828,7 +828,7 @@ impl VirtualState {
                 //         raise VirtualStatesCantMatch()
                 //     else:
                 //         assert isinstance(info, AbstractStructPtrInfo)
-                // BoxRef-routing reader; cached once so the per-field walk below
+                // operand-routing reader; cached once so the per-field walk below
                 // doesn't re-clone PtrInfo per iteration.
                 let info_snapshot = ctx
                     .get_box_replacement_operand_opt(opref)
@@ -881,7 +881,7 @@ impl VirtualState {
             }
             VirtualStateInfo::VArray { items, .. } => {
                 // virtualstate.py:263-275 VArrayStateInfo.enum_forced_boxes
-                // BoxRef-routing reader; cached once so the per-item walk
+                // operand-routing reader; cached once so the per-item walk
                 // below doesn't re-clone PtrInfo per iteration.
                 let info_snapshot = ctx
                     .get_box_replacement_operand_opt(opref)
@@ -2484,12 +2484,12 @@ pub(crate) fn export_state(oprefs: &[OpRef], ctx: &OptContext) -> VirtualState {
 /// then overwrite" pattern from leaking the stub to in-flight recursive
 /// callers.
 pub(crate) struct ExportCache {
-    // Keyed by `BoxRef` identity (`Rc::ptr_eq`, const by value) — the resolved
+    // Keyed by operand identity (`Rc::ptr_eq`, const by value) — the resolved
     // box `get_box_replacement(opref)`. virtualstate.py:712-716 keys `self.info`
     // (a plain identity dict) by `get_box_replacement(box)` and relies on "same
     // resolved box → same key" for finished / in_progress dedup. A bound
     // producer resolves to its one canonical `Rc` (memoized `from_bound_op`),
-    // and value-equal constants merge via `BoxRef`'s `same_constant` (matching
+    // and value-equal constants merge via the operand's `same_constant` (matching
     // RPython's shared-instance dedup; the benign over-merge is on not-virtual
     // const nodes that emit no fail-arg box).
     //
@@ -2497,7 +2497,7 @@ pub(crate) struct ExportCache {
     // bound box (debug-asserted in `export_single_value`). Production forced
     // end-args and `ProducedShortOp.res` (shortpreamble.rs:436
     // `materialize_operand_at`) are bound at creation; an unbound position would
-    // mint a fresh `BoxRef::from_opref` per visit and split the cache, so the
+    // mint a fresh operand from the opref per visit and split the cache, so the
     // assert traps that as a bind-at-alloc gap rather than silently
     // mis-deduping. `VecMap`/`VecSet` are Vec-backed and compare by `Eq` only
     // (never hash), so no GC pointer is hashed here.
@@ -2613,7 +2613,7 @@ fn export_single_value_inner(
         return VirtualStateInfo::Constant(value);
     }
 
-    // BoxRef-routing PtrInfo read (info.py:432 op.get_forwarded()).
+    // operand-routing PtrInfo read (info.py:432 op.get_forwarded()).
     let opref_box = ctx.get_box_replacement_operand_opt(opref);
     if let Some(info) = opref_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
         let info_fielddescrs = info.all_fielddescrs_from_descr();

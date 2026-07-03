@@ -471,7 +471,7 @@ pub struct Optimizer {
     /// set of ops the optimizer has emitted (or that `replace_guard_op`
     /// substituted in place of an emitted op). RPython keys this set by
     /// the op object (`op in self._emittedoperations` is identity-keyed);
-    /// pyre keys by the emitted op's canonical box (`BoxRef`, `Rc::ptr_eq`).
+    /// pyre keys by the emitted op's canonical operand (`Rc::ptr_eq`).
     /// Populated at:
     /// - `emit_operation` after `ctx.emit` (optimizer.py:674
     ///   `self._emittedoperations[op] = None` inside _emit_operation).
@@ -559,7 +559,7 @@ pub(crate) fn merge_backend_constants_from_ctx(
 
     // Iterate every bound ResOp across the canonical `_forwarded` hosts
     // (`new_operations` ∪ `phase1_emit_ops` ∪ `resop_refs`) rather than the
-    // `box_pool` side-table. `BoxRef::write_forwarded`'s bound-precondition
+    // `box_pool` side-table. The forwarded-write's bound-precondition
     // forbids a forwarded write to an unbound box, so every
     // position carrying `Forwarded::Const` has a bound producer `Op`
     // reachable through one of these stores. Body-namespace producers are
@@ -736,11 +736,11 @@ impl Optimizer {
                     // ob_type (offset 0) class pointers — the exporter at
                     // virtualstate.rs:1989 already encodes these as
                     // `Value::Ref(GcRef)`, so `field_ref` is already a
-                    // typed `RefOp` variant carrying `Box(BoxRef::new_const(
-                    // Value::Ref(class_gcref)))` on its `_forwarded` slot
+                    // typed `RefOp` variant carrying a `Value::Ref(class_gcref)`
+                    // const forwarding step on its `_forwarded` slot
                     // (via `make_constant` in the `VirtualStateInfo::Constant`
                     // arm of `apply_imported_virtual_state`). The typed
-                    // variant tag + BoxRef Ref-typed const forwarding are
+                    // variant tag + Ref-typed const forwarding are
                     // the authoritative shape; no extra type marker is
                     // needed at the import side.
                     let _ = (field_descrs, known_class, field_idx);
@@ -2127,7 +2127,7 @@ impl Optimizer {
             .unwrap_or(false);
         if !updated_existing {
             // optimizer.py:142-148: preserve last_guard_pos from old info.
-            // BoxRef-direct read mirrors `info.py:100-103 get_last_guard_pos`
+            // operand-direct read mirrors `info.py:100-103 get_last_guard_pos`
             // — drops the `last_guard_pos(opref)` bridge.
             let old_guard_pos = resolved
                 .ptr_info()
@@ -2423,7 +2423,7 @@ impl Optimizer {
         // fresh per-iteration inputarg set whose TreeLoop-owned strong
         // `InputArgRc`s were dropped, so re-bind them here.
         ctx.ensure_inputarg_bindings();
-        // Bind every input op's resop BoxRef so chain-walker
+        // Bind every input op's resop operand so chain-walker
         // terminals are guaranteed bound before any `&self` reader
         // (e.g. `OptIntBounds::getintbound_box`) reaches a
         // `set_forwarded_*` write. `TraceIterator::next()`
@@ -2902,7 +2902,7 @@ impl Optimizer {
         // via `partial_trace.operations`.
         //
         // pyre's per-iter `TraceIterator::next()` (opencoder.rs:500)
-        // pushes a fresh `BoxRef::new_resop` slot for every visited op
+        // pushes a fresh resop operand slot for every visited op
         // BEFORE the optimizer pipeline decides whether to emit. Two
         // categories of slot escape the `new_operations` carry above
         // and need explicit handling so `Forwarded::Op(Weak<Op>)`
@@ -3141,7 +3141,7 @@ impl Optimizer {
                         // once via `materialize_operand_at` (a `SameAs*` synthetic
                         // in `resop_refs`) so the
                         // export key resolves to one ptr-stable host — the identity
-                        // the #188 `OpRef`→`BoxRef` `ExportCache` rekey requires. The
+                        // the #188 `OpRef`→operand `ExportCache` rekey requires. The
                         // returned `OpRef` is unchanged (synthetic and orphan share
                         // the position), so the exported state is byte-identical.
                         if !resolved.is_none()
@@ -3528,7 +3528,7 @@ impl Optimizer {
             }
 
             // Constant-folded operations that were removed from the trace still
-            // have their box._forwarded = Box(constbox) BoxRef forwarding from
+            // have their box._forwarded = constbox forwarding step from
             // make_constant/seed_constant. If we leave them at their old
             // positions, they can collide with the freshly compacted op
             // positions above (for example old constant v71 vs new live op v71),
@@ -3990,7 +3990,7 @@ impl Optimizer {
             if !front_target_tokens.is_empty() {
                 let mut ctx = self.final_ctx.take().unwrap_or_else(|| {
                     // opencoder.py:259 inputarg_from_tp parity — seed inputarg
-                    // BoxRefs with the producer-side types when available; the
+                    // operands with the producer-side types when available; the
                     // Ref fallback covers the rare case the recorder hasn't
                     // populated `trace_inputargs` (e.g. test-only entry
                     // paths) and matches the historical Type::Void behaviour
@@ -4316,7 +4316,7 @@ impl Optimizer {
         ctx: &mut OptContext,
     ) -> Result<(), crate::optimize::InvalidLoop> {
         // The canonical `OpRc` is threaded in so callers can resolve the
-        // producer directly when they need a bound BoxRef. For this pass the
+        // producer directly when they need a bound operand. For this pass the
         // body reads through this `&Op` view (Deref), behaviour-identical.
         let op: &Op = op_rc;
         // Box.type lives intrinsically on `OpRef.ty()` (variant
@@ -4725,7 +4725,7 @@ impl Optimizer {
         //           op.set_forwarded(ConstInt(opinfo.get_constant_int()))
         if op.result_type() == majit_ir::Type::Int {
             let replaced = ctx.get_replacement_opref(emitted);
-            // BoxRef shim — peek_intbound_box takes &BoxRef per optimizer.py:99-113.
+            // operand shim — peek_intbound_box takes an operand per optimizer.py:99-113.
             let bound = ctx
                 .get_box_replacement_operand_opt(emitted)
                 .as_ref()

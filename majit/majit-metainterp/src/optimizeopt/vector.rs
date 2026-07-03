@@ -2631,11 +2631,11 @@ mod tests {
 
     /// oparser-faithful op-arg / fail-arg box for the position-keyed VectorLoop
     /// fixtures (`rpython/jit/tool/oparser.py`): an `OpRef` that names a producer
-    /// position becomes a rooted bound `BoxRef` (`Operand::Op` / `Operand::InputArg`)
+    /// position becomes a rooted bound operand (`Operand::Op` / `Operand::InputArg`)
     /// whose `to_opref()` is byte-identical to the original `OpRef`, so the
     /// `assign_positions` / `to_opref`-keyed assertions are unchanged; constants and
     /// `None` shed to `Operand::Const` / none as before. Replaces the position-only
-    /// `BoxRef::from_opref` that minted `Operand::Box` at `Op::new`.
+    /// `Operand::from_opref` that minted `Operand::Box` at `Op::new`.
     fn bx(r: OpRef) -> Operand {
         use crate::history::test_support::{rooted_inputarg_operand, rooted_resop_operand};
         match r {

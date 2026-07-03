@@ -310,7 +310,7 @@ pub struct OptPure {
     /// Postponed OVF operation: INT_ADD_OVF, INT_SUB_OVF, INT_MUL_OVF.
     /// pure.py: postponed_op — deferred until GUARD_NO_OVERFLOW is seen.
     postponed_op: Option<Op>,
-    /// Bound `BoxRef` of `postponed_op`, captured from the live `OpRc` at
+    /// Bound operand of `postponed_op`, captured from the live `OpRc` at
     /// postponement. The OVF op is `Remove`d before emit, so its head box
     /// is never bound by the emit path; capturing it here (where the op
     /// object is live) gives `make_equal_to` a bound receiver without an
@@ -790,7 +790,7 @@ impl Default for OptPure {
 
 impl OptPure {
     fn force_box(&mut self, op: &Operand, ctx: &mut OptContext) -> OpRef {
-        // Single resolve through the BoxRef terminal; the OpRef view is the
+        // Single resolve through the operand terminal; the OpRef view is the
         // terminal's `to_opref()` (keystone equivalence, #113), so the prior
         // paired `get_box_replacement` + `get_box_replacement_box` of the
         // same operand was a redundant double walk.

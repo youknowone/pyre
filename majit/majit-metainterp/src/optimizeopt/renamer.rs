@@ -26,7 +26,7 @@ use majit_ir::operand::Operand;
 pub struct Renamer {
     rename_map: VecMap<OpRef, Operand>,
     /// Producer `Rc`s minted by [`Renamer::bound_box`] to back the bound map
-    /// values. The bound `BoxRef` holds only a `Weak<Op>` / `Weak<InputArg>`,
+    /// values. The bound operand holds only a `Weak<Op>` / `Weak<InputArg>`,
     /// so its producer must be rooted for the upgrade to stay live. The
     /// vectorizer's op buffers are `Vec<Op>` (value, not `Rc`), so no live
     /// producer `Rc` is reachable for a renamed-to ResOp position; the renamer

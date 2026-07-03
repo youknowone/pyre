@@ -61,7 +61,7 @@ pub struct OptRewrite {
     /// Convergence: retire this cache and route the bool lookups through the pure
     /// optimizer's get_pure_result / pure_from_args2 (both already present at
     /// pure.rs:498/492) keyed off the pure-op table — coupled to the pure-optimizer
-    /// subsystem. NOT a box-identity rekey target: rekeying the OpRef pair to BoxRef
+    /// subsystem. NOT a box-identity rekey target: rekeying the OpRef pair to operand
     /// would entrench a structure upstream does not have.
     bool_result_cache: majit_ir::VecMap<(OpCode, OpRef, OpRef), OpRef>,
     /// rewrite.py:39: loop_invariant_results — cache for CALL_LOOPINVARIANT results.
@@ -2340,7 +2340,7 @@ mod tests {
 
     /// Producer-position trace spec. A consumer's `args` name the result
     /// positions of earlier producers in the same spec slice, so no op-arg
-    /// is constructed as a position-only `BoxRef::from_opref(...)` box;
+    /// is constructed as a position-only `Operand::from_opref(...)` box;
     /// [`build_specs`] later binds each arg to its producing `OpRc`.
     #[derive(Clone)]
     struct OpSpec {
@@ -2484,7 +2484,7 @@ mod tests {
     fn resolve_op_args_in_ctx(op: &mut Op, ctx: &mut OptContext) {
         // optimizer.py:651-652 setarg loop parity. Direct unit tests that
         // bypass Optimizer::propagate_from_pass_range still need the same
-        // canonical BoxRef args that production passes receive.
+        // canonical operand args that production passes receive.
         for i in 0..op.num_args() {
             let arg = op.arg(i);
             let resolved = match ctx.resolve_operand_operand_opt(&arg) {

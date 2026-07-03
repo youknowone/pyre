@@ -490,7 +490,7 @@ pub struct ShortBoxes {
     /// Strong-`Rc` rooting pool for the renamed `InputArg` objects behind
     /// `short_inputargs[i]`. Index-aligned 1:1 with `short_inputargs`. Keeps
     /// each renamed `AbstractInputArg` alive so producer-shaped consumers can
-    /// bind that position to `Operand::InputArg` / a bound BoxRef view — the
+    /// bind that position to `Operand::InputArg` / a bound operand view — the
     /// analog of `TraceIterator.inputargs` rooting the outer-trace inputargs
     /// (opencoder.py:250-273).
     short_inputarg_refs: Vec<majit_ir::InputArgRc>,
@@ -694,7 +694,7 @@ impl ShortBoxes {
         arg_type: majit_ir::Type,
     ) {
         // shortpreamble.py:255-259 parity: ShortInputArg's BoxType is the
-        // intrinsic `box.type` (BoxInt → same_as_i, BoxRef → same_as_r,
+        // intrinsic `box.type` (BoxInt → same_as_i, ref box → same_as_r,
         // BoxFloat → same_as_f). A `Void` reaching here is a parity
         // violation: RPython has no Void value Box / InputArgVoid class.
         if arg_type == majit_ir::Type::Void {
@@ -2515,7 +2515,7 @@ pub struct ExtendedShortPreambleBuilder {
     /// constructor clone read it), but EVERY key-lookup of it
     /// (insert_dep_recursive / use_box_recursive / use_box /
     /// add_preamble_op_from_pop / add_preamble_op / produced_short_op) is dead
-    /// over the full bench corpus — measured. A #146/S8 `BoxRef` re-key here is
+    /// over the full bench corpus — measured. A #146/S8 operand re-key here is
     /// therefore unverifiable (the gate cannot exercise the silent-miss
     /// surface), like the deferred vectorizer maps.
     produced_short_boxes: VecMap<OpRef, ProducedShortOp>,

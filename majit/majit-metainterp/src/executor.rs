@@ -125,7 +125,7 @@ pub fn do_getarrayitem_gc_f(
 // blackhole fallback wrapper.  Pyre exposes it here in `executor.rs`
 // for `TraceCtx::arraylen_sanity_load` to consume directly without
 // importing the blackhole module.  Array is projected to `i64` from
-// the BoxRef (`arraybox.getref_base()` analog).
+// the operand (`arraybox.getref_base()` analog).
 pub fn do_arraylen_gc(
     cpu: &dyn majit_backend::Backend,
     _metainterp: (),

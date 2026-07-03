@@ -860,7 +860,7 @@ impl PtrInfoExt for PtrInfo {
                 // construction order and the second box does not exist when the
                 // first is sealed. Convergence path if a prebuilt cyclic
                 // immutable virtual ever reaches here: thread a
-                // `memo: &mut Vec<BoxRef>` keyed on the receiver box (BoxRef
+                // `memo: &mut Vec<Operand>` keyed on the receiver box (operand
                 // Rc-identity) mirroring info.py:282-284.
                 if let Some(info) = resolved_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
                     if info.is_virtual() && info.is_immutable_and_filled_with_constants(ctx) {
@@ -1598,7 +1598,7 @@ mod tests {
     impl Descr for TestDescr {}
 
     /// Bound-producer `Operand` at position `int_op(pos)` / `ref_op(pos)`,
-    /// the field-value analog of the old `BoxRef::from_opref` test stand-ins.
+    /// the field-value analog of the old `from_opref` test stand-ins.
     fn field_op(tp: Type, pos: u32) -> Operand {
         crate::history::test_support::rooted_resop_operand(tp, pos)
     }

@@ -4,7 +4,7 @@
 //! a `majit-metainterp → majit-ir` circular dep.
 //!
 //! Pure data + leaf methods only. Methods that need `Op` / `OptContext`
-//! / `BoxRef` from `majit-metainterp` live as extension traits in
+//! from `majit-metainterp` live as extension traits in
 //! `metainterp::optimizeopt::info`.
 
 use crate::field_entry::{FieldEntry, PreambleOp};

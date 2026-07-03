@@ -1754,7 +1754,7 @@ impl OptVirtualize {
         // virtualize.py:151: `CONST_NULL.same_constant(objbox)` — only a
         // Ref-typed null constant matches; a plain ConstInt(0) does not.
         // `get_box_replacement` resolves const-namespace OpRefs to their
-        // on-demand `BoxRef::new_const` and walks the chain terminal;
+        // on-demand `Forwarded::Const` and walks the chain terminal;
         // `is_const_null` reads `const_value()` and tolerates an unbound
         // terminal (non-const -> false), so the null check is read-only.
         let obj_box = ctx
@@ -2858,7 +2858,7 @@ mod tests {
     /// Canonicalize an op's args the way the production driver does in
     /// `Optimizer::propagate_forward` (optimizer.py:651-652 setarg loop):
     /// resolve each arg through the box environment so the op carries the
-    /// canonical BoxRef that the handlers read via
+    /// canonical operand that the handlers read via
     /// `op.arg(i).get_box_replacement(false)`. Tests that drive a pass's
     /// `propagate_forward` directly bypass that loop, so they must
     /// canonicalize explicitly before invoking the handler.

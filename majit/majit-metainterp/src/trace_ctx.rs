@@ -1355,10 +1355,10 @@ impl TraceCtx {
         self.recorder.set_concrete_at(opref.raw(), concrete)
     }
 
-    /// `BoxRef::get_value` reader — the concrete value stamped onto
+    /// `get_value` reader — the concrete value stamped onto
     /// this OpRef's frontend value slot (`history.py:803 *FrontendOp(pos,
     /// value)` analog).  Const variants delegate to
-    /// `BoxKind::Const { value, .. }` directly.
+    /// `Forwarded::Const { value, .. }` directly.
     ///
     /// PyPy's normal record path attaches the value at FrontendOp
     /// construction time (execute() runs before record()), so for any
@@ -1370,7 +1370,7 @@ impl TraceCtx {
     /// `record_op*`.  Callers MUST treat `None` as the exceptional
     /// branch (skip the sanity check, leave the cache entry alone);
     /// silently substituting `Value::Void` would conflate "unstamped"
-    /// with "stamped Void", which the `BoxRef::set_value` type-check
+    /// with "stamped Void", which the `set_value` type-check
     /// already forbids.
     pub fn lookup_opref_concrete(&self, opref: OpRef) -> Option<Value> {
         if opref.is_constant() {

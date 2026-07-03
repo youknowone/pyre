@@ -5328,7 +5328,7 @@ impl<M: Clone> MetaInterp<M> {
                         simple_opt.snapshot_vref_boxes = snapshot_vref_map.clone();
                         simple_opt.snapshot_frame_pcs = snapshot_pc_map.clone();
                         simple_opt.call_pure_results = call_pure_results.clone();
-                        // Forward the recorder's BoxRef pool — the retry path
+                        // Forward the recorder's operand pool — the retry path
                         // uses the same upstream `Rc<Box>` allocations from
                         // the original trace.
                         //
@@ -9447,7 +9447,7 @@ impl<M: Clone> MetaInterp<M> {
         // and heap knowledge through `decode_box` at :153-157.
         //
         // Pyre stamps the `frontend_boxes` concrete values onto the
-        // bridge inputarg BoxRefs here, so `runtime_value_of` and
+        // bridge inputarg operands here, so `runtime_value_of` and
         // `cls_of_box` consumers in the optimizer can read them.
         if let Some(frontend_boxes) = self.pending_frontend_boxes.as_deref() {
             // bridgeopt.py:126 `assert len(frontend_boxes) == len(liveboxes)` —

@@ -340,7 +340,7 @@ impl OptString {
     }
 
     /// Run `f` against the VStringPlainInfo of `op`, auto-mirroring the
-    /// BoxRef snapshot after mutation via OptContext::with_ptr_info_mut.
+    /// operand snapshot after mutation via OptContext::with_ptr_info_mut.
     /// Returns `None` if the box has no PtrInfo, is not Str, or its variant
     /// is not Plain.
     fn with_plain_info_mut<R>(
@@ -2357,7 +2357,7 @@ mod tests {
         // vstring.py:452 make_nonnull_str(op, mode_unicode) installs a
         // non-virtual StrPtrInfo with `mode = 1` so that later getstrlen
         // selects UNICODELEN instead of STRLEN.
-        // Synthetic-OpRef test fixture: lazy-allocate BoxRef for the unicode_ref slot.
+        // Synthetic-OpRef test fixture: lazy-allocate the operand for the unicode_ref slot.
         let unicode_box = ctx.materialize_operand_at(unicode_ref);
         ctx.make_nonnull_str(&unicode_box, 1);
 

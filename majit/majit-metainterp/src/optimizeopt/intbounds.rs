@@ -72,7 +72,7 @@ pub fn print_rewrite_rule_statistics() {
 /// `OptIntBounds(Optimization)` has NO own bounds storage —
 /// all bound state lives on `box._forwarded` and is accessed via the base
 /// class `Optimization.getintbound`/`setintbound` (optimizer.py:99-125).
-/// In majit the equivalent is the `BoxRef`'s `_forwarded` slot
+/// In majit the equivalent is the operand's `_forwarded` slot
 /// (`Forwarded::Info(OpInfo::IntBound(_))`) accessed via
 /// `ctx.getintbound`/`ctx.setintbound`/`ctx.with_intbound_mut`.
 pub struct OptIntBounds {
@@ -103,14 +103,14 @@ impl OptIntBounds {
         ctx.getintbound_handle(&b).borrow().clone()
     }
 
-    /// `BoxRef`-terminal variant of [`getintbound_box`]: reads the bound off
+    /// operand-terminal variant of [`getintbound_box`]: reads the bound off
     /// an operand already resolved to its `_forwarded` terminal (the box
     /// `resolve_box` returns), so no second `get_box_replacement` walk.
     pub(super) fn getintbound_b(&self, b: &Operand, ctx: &mut OptContext) -> IntBound {
         ctx.getintbound_handle(b).borrow().clone()
     }
 
-    /// `BoxRef`-operand variant of [`getintbound_box`]. optimizer.py:99
+    /// operand variant of [`getintbound_box`]. optimizer.py:99
     /// `getintbound(self, op)` does `op = get_box_replacement(op)` then reads
     /// the bound; this takes that resolve box-native via `resolve_box_box`,
     /// without collapsing the operand to an `OpRef` first.
@@ -119,7 +119,7 @@ impl OptIntBounds {
         ctx.getintbound_handle(&b).borrow().clone()
     }
 
-    /// Resolve an operand to its forwarded terminal `BoxRef`, the `op =
+    /// Resolve an operand to its forwarded terminal, the `op =
     /// get_box_replacement(op)` step shared by every `optimize_INT_*` body
     /// (intbounds.py / optimizer.py:343). The dispatch-entry rebind
     /// registers a canonical host for every operand, so `get_box_replacement`
@@ -557,7 +557,7 @@ impl OptIntBounds {
         //     self.optimizer.setintbound(op, array.getlenbound(None))
         // `getlenbound` lazily fills `ArrayPtrInfo.lenbound` (`info.py:573`).
         // `with_ensured_ptr_info_arg0` mutates the PtrInfo object stored in
-        // the BoxRef's authoritative `_forwarded` slot.
+        // the operand's authoritative `_forwarded` slot.
         let bound = ctx.with_ensured_ptr_info_arg0(op, |mut array| array.getlenbound(None));
         if let Some(bound) = bound {
             // optimizer.py:115 setintbound(op, ...): `op` is the result box.
@@ -585,7 +585,7 @@ impl OptIntBounds {
         ctx.make_nonnull_str(&arg0_box, 0);
         // `getlenbound` is a lazy-fill mutator on `StrPtrInfo.lenbound`
         // (`vstring.py:62`). Route through `with_ensured_ptr_info_arg0`
-        // so the BoxRef-held StrPtrInfo is updated in place.
+        // so the operand-held StrPtrInfo is updated in place.
         let bound = ctx.with_ensured_ptr_info_arg0(op, |mut info| info.getlenbound(Some(0)));
         if let Some(bound) = bound {
             let pos_box = ctx.get_box_replacement_operand(op.pos.get());
@@ -601,7 +601,7 @@ impl OptIntBounds {
         let arg0_box = ctx.resolve_operand_operand(&op.arg(0));
         ctx.make_nonnull_str(&arg0_box, 1);
         // Same wrapper rationale as `postprocess_strlen` — lazy-fill
-        // mutation on StrPtrInfo.lenbound needs BoxRef mirror.
+        // mutation on StrPtrInfo.lenbound needs operand mirror.
         let bound = ctx.with_ensured_ptr_info_arg0(op, |mut info| info.getlenbound(Some(1)));
         if let Some(bound) = bound {
             let pos_box = ctx.get_box_replacement_operand(op.pos.get());
@@ -850,7 +850,7 @@ impl OptIntBounds {
     /// Find the operation that produced `box_` by searching new_operations.
     /// RPython's `as_operation(box)` checks `_emittedoperations` directly;
     /// majit's flat OpRef model requires a positional lookup. #188 rekeys
-    /// `new_operations` / `emitted_operations` to BoxRef identity, at which
+    /// `new_operations` / `emitted_operations` to operand identity, at which
     /// point this positional scan collapses to the `_emittedoperations`
     /// membership test on the box.
     fn find_producing_op<'a>(&self, box_: &Operand, ctx: &'a OptContext) -> Option<&'a Op> {
