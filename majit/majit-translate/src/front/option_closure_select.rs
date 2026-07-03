@@ -422,31 +422,42 @@ mod tests {
         let (g, a) = build_and_rewrite(ClosureCombinator::Map, "map");
         assert!(residual_gone(&g, "map"), "residual map call removed");
         assert_eq!(
-            count_calls(&g, |t| matches!(t, CallTarget::Method { name, .. } if name == "call_once")),
+            count_calls(
+                &g,
+                |t| matches!(t, CallTarget::Method { name, .. } if name == "call_once")
+            ),
             1,
             "the Some arm calls the closure once"
         );
         assert_eq!(g.blocks[a].exits.len(), 2, "A branches to Some/None arms");
         // Two `Option` ctors: Some(f(x)) in the then arm, None in the else arm.
-        let ctors = count_calls(&g, |t| {
-            matches!(t, CallTarget::SyntheticTransparentCtor { name, .. } if name == "Option")
-        });
+        let ctors = count_calls(
+            &g,
+            |t| matches!(t, CallTarget::SyntheticTransparentCtor { name, .. } if name == "Option"),
+        );
         assert_eq!(ctors, 2, "map builds Some(U) and None");
     }
 
     #[test]
     fn and_then_forwards_some_call_and_builds_none() {
         let (g, a) = build_and_rewrite(ClosureCombinator::AndThen, "and_then");
-        assert!(residual_gone(&g, "and_then"), "residual and_then call removed");
+        assert!(
+            residual_gone(&g, "and_then"),
+            "residual and_then call removed"
+        );
         assert_eq!(
-            count_calls(&g, |t| matches!(t, CallTarget::Method { name, .. } if name == "call_once")),
+            count_calls(
+                &g,
+                |t| matches!(t, CallTarget::Method { name, .. } if name == "call_once")
+            ),
             1,
             "the Some arm calls the closure once"
         );
         // Only the None arm builds an Option; the Some arm forwards the call.
-        let ctors = count_calls(&g, |t| {
-            matches!(t, CallTarget::SyntheticTransparentCtor { name, .. } if name == "Option")
-        });
+        let ctors = count_calls(
+            &g,
+            |t| matches!(t, CallTarget::SyntheticTransparentCtor { name, .. } if name == "Option"),
+        );
         assert_eq!(ctors, 1, "and_then builds only None");
         assert_eq!(g.blocks[a].exits.len(), 2);
     }
@@ -459,14 +470,18 @@ mod tests {
             "residual unwrap_or_else call removed"
         );
         assert_eq!(
-            count_calls(&g, |t| matches!(t, CallTarget::Method { name, .. } if name == "call_once")),
+            count_calls(
+                &g,
+                |t| matches!(t, CallTarget::Method { name, .. } if name == "call_once")
+            ),
             1,
             "the None arm calls the niladic closure once"
         );
         // No Option is built — result is a bare T.
-        let ctors = count_calls(&g, |t| {
-            matches!(t, CallTarget::SyntheticTransparentCtor { name, .. } if name == "Option")
-        });
+        let ctors = count_calls(
+            &g,
+            |t| matches!(t, CallTarget::SyntheticTransparentCtor { name, .. } if name == "Option"),
+        );
         assert_eq!(ctors, 0, "unwrap_or_else returns a bare value");
         assert_eq!(g.blocks[a].exits.len(), 2);
     }
@@ -490,8 +505,12 @@ mod tests {
             .unwrap();
         g.push_op_var(a, OpKind::ConstInt(9), true).unwrap();
         g.set_return(a, None);
-        let rewritten = rewire_closure_select_call_sites(&mut g, &[site(ClosureCombinator::Map, result)]);
+        let rewritten =
+            rewire_closure_select_call_sites(&mut g, &[site(ClosureCombinator::Map, result)]);
         assert_eq!(rewritten, 0, "a non-last-op call declines");
-        assert!(!residual_gone(&g, "map"), "residual call survives on decline");
+        assert!(
+            !residual_gone(&g, "map"),
+            "residual call survives on decline"
+        );
     }
 }

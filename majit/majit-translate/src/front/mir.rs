@@ -1662,7 +1662,10 @@ pub fn lower_fun_decl_with_static_addrs(
         // `__discriminant` comparison; no block split, so it needs no
         // reachability sweep.  Same fail-safe contract as the diamonds above.
         if !lo.is_none_sites.is_empty() {
-            crate::front::option_is_none::rewire_is_none_call_sites(&mut lo.graph, &lo.is_none_sites);
+            crate::front::option_is_none::rewire_is_none_call_sites(
+                &mut lo.graph,
+                &lo.is_none_sites,
+            );
         }
         // The `Option::map`/`and_then`/`unwrap_or_else` closure-select rewrite
         // (`front::option_closure_select`) splits the residual call block into a
@@ -5768,6 +5771,53 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `core::intrinsics::discriminant_value(v)` reads the integer
+                // tag of the enum `*v` — the intrinsic (call) form of
+                // `Rvalue::Discriminant`.  Emit the same synthetic
+                // `__discriminant` `FieldRead` instead of leaving the graph-less
+                // intrinsic extern.  The owner is derived from the arg's enum
+                // type (peeling the `&T` ref), keyed to the enum base identity
+                // so it resolves at the tag's real byte position; an
+                // unresolvable type falls back to the unowned read (offset 0),
+                // matching `Rvalue::Discriminant`'s `None` path.
+                if args.len() == 1
+                    && fmt_path_ends_with(&segments, &["intrinsics", "discriminant_value"])
+                {
+                    let (owner_root, owner_id) = match first_arg_ty
+                        .as_ref()
+                        .and_then(|t| self.tyref_ref_adt_def_id(t))
+                        .and_then(|id| self.llbc.type_by_id(id))
+                        .map(|td| td.item_meta.name_path())
+                    {
+                        Some(name_path) => {
+                            let canon = strip_crate_prefix(&name_path);
+                            let sid = majit_ir::descr::StructId::from_canonical(&canon);
+                            (Some(canon), Some(sid))
+                        }
+                        None => (None, None),
+                    };
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::FieldRead {
+                            base: args[0].clone(),
+                            field: crate::model::FieldDescriptor {
+                                name: "__discriminant".to_string(),
+                                owner_root,
+                                owner_id,
+                            },
+                            ty: ValueType::Int,
+                            pure: true,
+                        },
+                    });
+                    self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 let alias =
                     if let Some(payload) = self.expect_on_const_ok(&segments, &args, &arg_locals) {
                         // Identity unwrap: the receiver variable was bound
@@ -6065,11 +6115,8 @@ impl<'a> Lowering<'a> {
         } = &op_kind
             && args.len() == 1
             && (name == "is_none" || name == "is_some")
-            && let Some(site) = self.recognize_is_none_site(
-                first_arg_ty.as_ref(),
-                &result_var,
-                name == "is_some",
-            )
+            && let Some(site) =
+                self.recognize_is_none_site(first_arg_ty.as_ref(), &result_var, name == "is_some")
         {
             self.is_none_sites.push(site);
         }
