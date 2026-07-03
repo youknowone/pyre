@@ -3,10 +3,10 @@ use std::sync::OnceLock;
 
 use crate::bytecode::{BinaryOperator, ComparisonOperator, ConvertValueOparg};
 use pyre_object::{
-    PY_NULL, PyObjectRef, is_instance, is_list, is_range_iter, is_seq_iter, is_str, is_tuple,
-    w_dict_new, w_dict_store_checked, w_int_get_value, w_int_new, w_list_getitem, w_list_len,
-    w_list_new, w_str_from_wtf8, w_str_get_wtf8, w_str_len, w_tuple_getitem, w_tuple_len,
-    w_tuple_new,
+    PY_NULL, PyObjectRef, W_SeqIterObject, is_instance, is_list, is_range_iter, is_seq_iter,
+    is_str, is_tuple, w_dict_new, w_dict_store_checked, w_int_get_value, w_int_new, w_list_getitem,
+    w_list_len, w_list_new, w_range_iter_has_next, w_range_iter_next, w_str_from_wtf8,
+    w_str_get_wtf8, w_str_len, w_tuple_getitem, w_tuple_len, w_tuple_new,
 };
 use rustpython_wtf8::{Wtf8, Wtf8Buf};
 
@@ -1218,9 +1218,197 @@ pub fn ensure_range_iter(iter: PyObjectRef) -> Result<(), PyError> {
     )))
 }
 
-/// Residual FOR_ITER `space.next` for all iterator kinds. Exhaustion is
-/// signalled as a null return that the trailing for-iter GuardNonnull
-/// catches, side-exiting to the interpreter exhaustion path. A real exception is
+/// Current length of the sequence a `W_SeqIterObject` walks. `None` for a
+/// payload outside list/tuple/str/array, leaving callers to fall back to
+/// the length captured at iterator creation.  The covered set mirrors the
+/// item-fetch arms of `baseobjspace::next` / `range_iter_next_or_null`, so
+/// `range_iter_continues` and the next-value helper stay consistent (a
+/// payload one can fetch from is a payload one can length).
+///
+/// # Safety
+/// `seq` must be a valid object pointer.
+unsafe fn seq_iter_current_len(seq: PyObjectRef) -> Option<i64> {
+    unsafe {
+        if is_list(seq) {
+            Some(w_list_len(seq) as i64)
+        } else if is_tuple(seq) {
+            Some(w_tuple_len(seq) as i64)
+        } else if is_str(seq) {
+            // Code-point count, not byte count (matches the str seq-iter
+            // seed in baseobjspace::iter).
+            Some(w_str_len(seq) as i64)
+        } else if pyre_object::interp_array::is_array(seq) {
+            Some(pyre_object::interp_array::w_array_len(seq) as i64)
+        } else {
+            None
+        }
+    }
+}
+
+pub fn range_iter_continues(iter: PyObjectRef) -> Result<bool, PyError> {
+    unsafe {
+        if is_range_iter(iter) {
+            return Ok(w_range_iter_has_next(iter));
+        }
+        if pyre_object::is_long_range_iter(iter) {
+            return Ok(pyre_object::w_long_range_iter_has_next(iter));
+        }
+        if is_seq_iter(iter) {
+            let si = &*(iter as *const W_SeqIterObject);
+            // A cleared sequence (exhausted cursor, iterobject.py:90-98) has no
+            // more items — a re-iteration of an exhausted iterator stops here
+            // without dereferencing the freed sequence.
+            if si.seq.is_null() {
+                return Ok(false);
+            }
+            // sequenceiterator re-reads the live sequence length and PyPy's
+            // W_FastListIterObject.descr_next ends on a getitem IndexError;
+            // neither snapshots a length. Read the CURRENT sequence length so
+            // an element appended during iteration is observed (and a removed
+            // tail ends the loop) rather than the length captured at iterator
+            // creation.
+            let len = seq_iter_current_len(si.seq).unwrap_or(si.length);
+            return Ok(si.index < len);
+        }
+    }
+    Err(PyError::type_error("not an iterator"))
+}
+
+pub fn range_iter_next_or_null(iter: PyObjectRef) -> Result<PyObjectRef, PyError> {
+    unsafe {
+        if is_range_iter(iter) {
+            return Ok(w_range_iter_next(iter).unwrap_or(PY_NULL));
+        }
+        if pyre_object::is_long_range_iter(iter) {
+            return Ok(pyre_object::w_long_range_iter_next(iter).unwrap_or(PY_NULL));
+        }
+        if is_seq_iter(iter) {
+            let si = &mut *(iter as *mut W_SeqIterObject);
+            // An exhausted cursor cleared its sequence (iterobject.py:90-98
+            // `self.w_seq = None`); a re-entry stays exhausted without
+            // dereferencing the freed sequence.
+            if si.seq.is_null() {
+                return Ok(PY_NULL);
+            }
+            let idx = si.index;
+            // Bounds come from the sequence's CURRENT state (see
+            // range_iter_continues): getitem returns None past the live
+            // length, so an element appended during iteration is yielded and a
+            // removed tail ends the loop. Mirrors baseobjspace::next.
+            let item = if is_list(si.seq) {
+                w_list_getitem(si.seq, idx)
+            } else if is_tuple(si.seq) {
+                w_tuple_getitem(si.seq, idx)
+            } else if is_str(si.seq) {
+                // Box the idx-th code point as a one-character str, reading
+                // the WTF-8 view so a lone surrogate is yielded instead of
+                // panicking. Only `iter(str)` through the builtin reaches here
+                // with a str payload (the GET_ITER opcode materialises a char
+                // list); without this arm `seq_iter_current_len` would say
+                // "more" while this helper returned PY_NULL forever, hanging
+                // the loop. Mirrors baseobjspace::next.
+                let s = w_str_get_wtf8(si.seq);
+                let mut found: Option<PyObjectRef> = None;
+                let mut n = 0i64;
+                for cp in s.code_points() {
+                    if n == idx {
+                        let mut one = Wtf8Buf::new();
+                        one.push(cp);
+                        found = Some(w_str_from_wtf8(one));
+                        break;
+                    }
+                    n += 1;
+                }
+                found
+            } else if pyre_object::interp_array::is_array(si.seq) {
+                if (idx as usize) < pyre_object::interp_array::w_array_len(si.seq) {
+                    Some(pyre_object::interp_array::w_array_unpack_item(
+                        si.seq,
+                        idx as usize,
+                    ))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(v) = item {
+                si.index += 1;
+                return Ok(v);
+            }
+            // iterobject.py:96-98 — clear the sequence ref on exhaustion so a
+            // held iterator's `__reduce__`/`__length_hint__` report it as an
+            // exhausted cursor (matches the generic-`__getitem__` arm of
+            // `baseobjspace::next`).
+            si.seq = PY_NULL;
+            return Ok(PY_NULL);
+        }
+    }
+    Err(PyError::type_error("not an iterator"))
+}
+
+#[majit_macros::dont_look_inside]
+pub extern "C" fn jit_range_iter_next_or_null(iter: i64) -> i64 {
+    match range_iter_next_or_null(iter as PyObjectRef) {
+        Ok(value) => value as i64,
+        Err(err) => panic!("range iter next failed in JIT: {err}"),
+    }
+}
+
+/// A sequence iterator whose payload is not one of the inline fast types
+/// (list/tuple/str/array, see `seq_iter_current_len`) is a generic
+/// sequence-protocol iterator: `next` fetches each item through
+/// `space.getitem` (iterobject.py W_SeqIterObject.descr_next), so it is
+/// driven by `baseobjspace::next` rather than the inline range helper.  An
+/// exhausted cursor (null seq) routes here too so the trailing StopIteration
+/// is raised by `next`.
+///
+/// # Safety
+/// `iter` must be a valid object pointer.
+unsafe fn is_generic_seq_iter(iter: PyObjectRef) -> bool {
+    unsafe {
+        is_seq_iter(iter) && {
+            let seq = (*(iter as *const W_SeqIterObject)).seq;
+            seq.is_null() || seq_iter_current_len(seq).is_none()
+        }
+    }
+}
+
+/// FOR_ITER iterator kinds that advance through `space.next` rather than
+/// the inline range helper: generic sequence-protocol iterators, generators,
+/// itertools/enumerate/reversed/filter/map/zip/dictview/sre, callable
+/// iterators, and user `__next__` instances. Shared so the interpreter
+/// `iter_next` and the tracer agree on which iterators take the `space.next`
+/// leg.
+pub fn via_space_next(iter: PyObjectRef) -> bool {
+    unsafe {
+        is_generic_seq_iter(iter)
+            || is_instance(iter)
+            || pyre_object::generator::is_generator(iter)
+            || pyre_object::interp_itertools::is_repeat(iter)
+            || pyre_object::interp_itertools::is_count(iter)
+            || pyre_object::interp_itertools::is_takewhile(iter)
+            || pyre_object::interp_itertools::is_dropwhile(iter)
+            || pyre_object::interp_itertools::is_filterfalse(iter)
+            || pyre_object::interp_itertools::is_pairwise(iter)
+            || pyre_object::interp_itertools::is_cycle(iter)
+            || pyre_object::functional::is_enumerate(iter)
+            || pyre_object::functional::is_reversed(iter)
+            || pyre_object::functional::is_filter(iter)
+            || pyre_object::functional::is_map(iter)
+            || pyre_object::functional::is_zip(iter)
+            || pyre_object::operation::is_callable_iterator(iter)
+            || pyre_object::dictmultiobject::is_dict_view_iterator(iter)
+            || pyre_object::interp_sre::is_sre_scanner(iter)
+            || crate::module::r#struct::is_unpack_iter(iter)
+    }
+}
+
+/// Residual FOR_ITER `space.next` for the `via_space_next` iterator kinds.
+/// Exhaustion is signalled the same way as the range fast path: a null
+/// return that the trailing for-iter GuardNonnull catches, side-exiting to
+/// the interpreter which re-runs FOR_ITER and ends the loop (eval.rs
+/// `iter_next` maps StopIteration to exhausted). A *real* exception is
 /// published into BOTH the backend exception cells (so the compiled trace /
 /// blackhole GuardNoException side-exits) AND `BH_LAST_EXC_VALUE` (so the
 /// full-body walk's `execute_residual_call` returns Err and records the
@@ -1282,24 +1470,25 @@ mod tests {
     }
 
     #[test]
-    fn test_space_next_range_iter_semantics() {
+    fn test_range_iter_helpers_share_iterator_semantics() {
         let iter = pyre_object::w_range_iter_new(1, 2, 1);
-        let first = crate::baseobjspace::next(iter).unwrap();
-        let second = crate::baseobjspace::next(iter).unwrap();
-        let done = crate::baseobjspace::next(iter);
+        assert!(range_iter_continues(iter).unwrap());
+        let first = range_iter_next_or_null(iter).unwrap();
+        let second = range_iter_next_or_null(iter).unwrap();
+        let done = range_iter_next_or_null(iter).unwrap();
         unsafe {
             assert_eq!(w_int_get_value(first), 1);
             assert_eq!(w_int_get_value(second), 2);
-            assert!(matches!(done.unwrap_err().kind, PyErrorKind::StopIteration));
+            assert!(done.is_null());
         }
     }
 
     #[test]
-    fn test_jit_next_range_iter_semantics() {
+    fn test_jit_range_iter_helper_shares_iterator_semantics() {
         let iter = pyre_object::w_range_iter_new(1, 2, 1);
-        let first = jit_next(iter as i64) as PyObjectRef;
-        let second = jit_next(iter as i64) as PyObjectRef;
-        let done = jit_next(iter as i64) as PyObjectRef;
+        let first = jit_range_iter_next_or_null(iter as i64) as PyObjectRef;
+        let second = jit_range_iter_next_or_null(iter as i64) as PyObjectRef;
+        let done = jit_range_iter_next_or_null(iter as i64) as PyObjectRef;
         unsafe {
             assert_eq!(w_int_get_value(first), 1);
             assert_eq!(w_int_get_value(second), 2);
@@ -1319,22 +1508,20 @@ mod tests {
     #[test]
     fn seq_iter_observes_list_growth_during_iteration() {
         // listiterator re-reads the live list size each step, so an append
-        // during iteration is observed. `space.next` must read the current
-        // length, not the length captured at iterator creation.
+        // during iteration is observed. range_iter_continues /
+        // range_iter_next_or_null must read the CURRENT length, not the length
+        // captured at iterator creation — otherwise `for x in xs:
+        // xs.append(...)` stops at the initial length.
         let list = pyre_object::w_list_new(vec![w_int_new(0)]);
         let iter = pyre_object::w_seq_iter_new(list, 1);
         let mut seen = Vec::new();
-        loop {
-            match crate::baseobjspace::next(iter) {
-                Ok(v) => {
-                    let x = unsafe { w_int_get_value(v) };
-                    seen.push(x);
-                    if unsafe { pyre_object::w_list_len(list) } < 5 {
-                        unsafe { pyre_object::w_list_append(list, w_int_new(x + 1)) };
-                    }
-                }
-                Err(e) if e.kind == PyErrorKind::StopIteration => break,
-                Err(e) => panic!("unexpected seq-iter error: {e}"),
+        while range_iter_continues(iter).unwrap() {
+            let v = range_iter_next_or_null(iter).unwrap();
+            assert!(!v.is_null());
+            let x = unsafe { w_int_get_value(v) };
+            seen.push(x);
+            if unsafe { pyre_object::w_list_len(list) } < 5 {
+                unsafe { pyre_object::w_list_append(list, w_int_new(x + 1)) };
             }
         }
         assert_eq!(seen, vec![0, 1, 2, 3, 4]);
@@ -1344,24 +1531,23 @@ mod tests {
     fn seq_iter_over_str_payload_yields_codepoints_and_terminates() {
         // `iter(str)` through the builtin (baseobjspace::iter) makes a seq-iter
         // with a STR payload (the GET_ITER opcode instead materialises a char
-        // list). `space.next` must fetch, advance, and terminate for that
-        // payload.
+        // list). range_iter_continues / range_iter_next_or_null must fetch and
+        // advance for that payload too; otherwise `continues` stays true while
+        // `next` returns PY_NULL forever, hanging `for c in iter(s)`.
         let s = pyre_object::unicodeobject::box_str_constant(Wtf8::new("abcde"));
         let iter = pyre_object::w_seq_iter_new(s, 5);
         let mut count = 0;
-        loop {
-            match crate::baseobjspace::next(iter) {
-                Ok(v) => {
-                    assert!(!v.is_null(), "str seq-iter yielded NULL");
-                    count += 1;
-                    assert!(
-                        count <= 5,
-                        "str seq-iter did not terminate (infinite-loop regression)"
-                    );
-                }
-                Err(e) if e.kind == PyErrorKind::StopIteration => break,
-                Err(e) => panic!("unexpected str seq-iter error: {e}"),
-            }
+        while range_iter_continues(iter).unwrap() {
+            let v = range_iter_next_or_null(iter).unwrap();
+            assert!(
+                !v.is_null(),
+                "str seq-iter yielded NULL while continues==true"
+            );
+            count += 1;
+            assert!(
+                count <= 5,
+                "str seq-iter did not terminate (infinite-loop regression)"
+            );
         }
         assert_eq!(count, 5);
     }
