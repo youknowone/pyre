@@ -471,6 +471,27 @@ pub fn inner_close_enabled() -> bool {
     *FLAG.get_or_init(|| single_pass_enabled() || std::env::var_os("PYRE_INNER_CLOSE").is_some())
 }
 
+/// pyjitpl.py:3021 `same_greenkey` parity for the header-close gate: close the
+/// loop only when EVERY green matches the trace-start header, not just the pc
+/// green.  The dispatch model's `header_matches` compares only `mp_green_pc`; a
+/// jitdriver with extra scalar greens (e.g. aheui's `stackok` / `is_queue`) can
+/// revisit the header pc under a *different* full green key, which RPython keeps
+/// tracing past.
+///
+/// DORMANT scaffolding (default-off preserves the pc-only close).  Enabling it
+/// in isolation HANGS aheui logo: the stricter close correctly declines the
+/// header pc when `stackok`/`is_queue` differ from trace-start, but the dispatch
+/// model lacks RPython's rest of `reached_loop_header` (pyjitpl.py:2974-3060) —
+/// the unconditional `GUARD_FUTURE_CONDITION`, `live_arg_boxes = greens + reds`,
+/// and the reverse scan of `current_merge_points` with `append` on no match — so
+/// the trace never finds an outer match and spins.  Landing same_greenkey
+/// therefore requires those pieces together (Codex §2 cluster), not this gate
+/// alone; kept as the entry point + comparison primitive for that rework.
+pub fn same_greenkey_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("PYRE_SAME_GREENKEY").is_some())
+}
+
 /// Walker-as-tracer (`PYRE_AUTHORITATIVE`): when set, the `run_to_end` walk is
 /// the SOLE authoritative executor for a trace — residual calls execute exactly
 /// once during the walk and the outer mainloop must neither replay them nor
@@ -4415,8 +4436,30 @@ where
                     } else {
                         ctx.header_pc
                     };
-                    let header_matches =
-                        mp_green_pc.map_or(true, |pc| pc == close_target_pc as i64);
+                    let pc_matches = mp_green_pc.map_or(true, |pc| pc == close_target_pc as i64);
+                    // pyjitpl.py:3021 same_greenkey: beyond the pc, require every
+                    // int green (aheui's stackok / is_queue, …) to equal the
+                    // trace-start header's.  A primary trace's header is
+                    // current_merge_points[0]; a bridge closes into its parent
+                    // loop, whose full greens are not tracked here, so restrict
+                    // the extra check to primary traces.  Gated (default keeps the
+                    // pc-only close) until verified byte-neutral.
+                    let same_greenkey = if same_greenkey_enabled() && !ctx.is_bridge_trace {
+                        ctx.current_merge_points.first().map_or(true, |hdr| {
+                            let hdr_ints: Vec<i64> = hdr
+                                .green_boxes
+                                .iter()
+                                .filter_map(|b| match b.opref {
+                                    majit_ir::OpRef::ConstInt(v) => Some(v),
+                                    _ => None,
+                                })
+                                .collect();
+                            hdr_ints == mp_green_ints
+                        })
+                    } else {
+                        true
+                    };
+                    let header_matches = pc_matches && same_greenkey;
                     if std::env::var_os("MAJIT_MPTRACE").is_some() {
                         eprintln!(
                             "@@@MPTRACE visit pc={mp_green_pc:?} header_pc={} close_target={close_target_pc} matches={header_matches} num_ops={}",
