@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use majit_ir::box_ref::BoxRef;
+use majit_ir::operand::Operand;
 use majit_ir::{ArrayDescr, FieldDescr, GcRef, Value};
 
 /// `model.py:39 AbstractCPU` (subset) — services hosted on
@@ -31,14 +31,14 @@ pub trait Cpu: Send + Sync {
     /// concrete `Value::Ref` or when the Ref is null.  Backends that
     /// enable `gcremovetypeptr` route through `model.py:266+` and
     /// override this method to consult the GC header instead.
-    fn cls_of_box(&self, box_: &BoxRef) -> i64;
+    fn cls_of_box(&self, box_: &Operand) -> i64;
 
     /// `model.py:199-201 cpu.cls_of_box` lowered to the raw `getref_base`
     /// payload — the `lltype.cast_opaque_ptr(OBJECTPTR, base).typeptr`
     /// step.  Callers that already hold a `GcRef` (e.g. `ConstPtrInfo`
     /// which stores the const ref directly) reach the typeptr read
     /// through this primitive instead of synthesizing a temporary
-    /// `BoxRef` chain.  The default `cls_of_box` delegates here.
+    /// const operand.  The default `cls_of_box` delegates here.
     fn cls_of_gcref(&self, gcref: GcRef) -> i64;
 
     /// `model.py:209+ cpu.bh_getfield_gc_i / _r / _f`:
@@ -335,7 +335,7 @@ pub trait Cpu: Send + Sync {
 pub struct DefaultCpu;
 
 impl Cpu for DefaultCpu {
-    fn cls_of_box(&self, box_: &BoxRef) -> i64 {
+    fn cls_of_box(&self, box_: &Operand) -> i64 {
         // resoperation.py:57-68 walker to the terminal Const.
         match box_.get_box_replacement(false).const_value() {
             Some(Value::Ref(gcref)) if !gcref.is_null() => self.cls_of_gcref(gcref),
@@ -394,13 +394,13 @@ impl Cpu for DefaultCpu {
 
 /// `Arc<dyn Cpu>` factory for callers that previously installed a bare
 /// `fn(i64) -> i64` hook.  Wraps the fn pointer in a struct that
-/// extracts the raw Ref value from the BoxRef before invoking the
+/// extracts the raw Ref value from the operand before invoking the
 /// closure, so existing `set_cls_of_box(fn)` call sites continue to
 /// receive the raw runtime payload.
 pub fn cpu_from_cls_of_box_fn(f: fn(i64) -> i64) -> Arc<dyn Cpu> {
     struct ClosureCpu(fn(i64) -> i64);
     impl Cpu for ClosureCpu {
-        fn cls_of_box(&self, box_: &BoxRef) -> i64 {
+        fn cls_of_box(&self, box_: &Operand) -> i64 {
             let raw = match box_.get_box_replacement(false).const_value() {
                 Some(Value::Ref(gcref)) => gcref.0 as i64,
                 _ => 0,

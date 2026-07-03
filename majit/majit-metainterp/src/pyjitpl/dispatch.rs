@@ -1921,7 +1921,7 @@ where
 
     fn read_typeptr_from_exception(&self, exc_value: i64) -> i64 {
         // model.py:199-201: ConstPtr wrap then cpu.cls_of_box(box).
-        let const_box = majit_ir::box_ref::BoxRef::new_const(majit_ir::Value::Ref(
+        let const_box = majit_ir::operand::Operand::const_from_value(majit_ir::Value::Ref(
             majit_ir::GcRef(exc_value as usize),
         ));
         self.cpu.cls_of_box(&const_box)

@@ -5737,7 +5737,7 @@ impl OptContext {
     /// never the `_forwarded` chain) via `runtime_value_of`, then returns
     /// `ptr2int(typeptr)`, the immortal vtable address as a plain integer.
     ///
-    /// Unlike `cls_of_box(&BoxRef)` (which walks `get_box_replacement` to
+    /// Unlike `cls_of_box(&Operand)` (which walks `get_box_replacement` to
     /// reach a Const terminal), this resolves through the no-forward
     /// `runtime_value_of`: virtualstate's KnownClass arms read the runtime
     /// box itself, with no optimizer-tracked / forwarded precedence. Returns
@@ -5746,7 +5746,7 @@ impl OptContext {
     pub fn runtime_cls_of(&self, opref: OpRef) -> Option<i64> {
         match self.runtime_value_of(opref)? {
             Value::Ref(gcref) if !gcref.is_null() => {
-                let synth = majit_ir::box_ref::BoxRef::new_const(Value::Ref(gcref));
+                let synth = Operand::const_from_value(Value::Ref(gcref));
                 let typeptr = self.cpu.cls_of_box(&synth);
                 if typeptr == 0 { None } else { Some(typeptr) }
             }
@@ -7598,15 +7598,16 @@ impl OptContext {
     pub fn cls_of_box(&self, op: &Operand) -> Option<i64> {
         // model.py:199-201 `cpu.cls_of_box(box)` returns `ConstInt(ptr2int(
         // typeptr))` — the immortal vtable address as a plain integer, never
-        // a traced ref. DefaultCpu walks the BoxRef to its Const terminal and
-        // dereferences the typeptr-at-offset-0. Returns 0 for non-Ref / null.
-        let typeptr = self.cpu.cls_of_box(&op.to_boxref());
+        // a traced ref. DefaultCpu walks the operand to its Const terminal
+        // and dereferences the typeptr-at-offset-0. Returns 0 for
+        // non-Ref / null.
+        let typeptr = self.cpu.cls_of_box(op);
         if typeptr != 0 {
             return Some(typeptr);
         }
         // resoperation.py:612-642 `RefOp._resref` fallback — when the
-        // BoxRef chain has no Const terminal, read the mixin slot
-        // directly off the resolved box.  Wrap as a synthetic Const so
+        // forwarding chain has no Const terminal, read the mixin slot
+        // directly off the resolved operand.  Wrap as a synthetic Const so
         // the typeptr deref goes through the same `cpu.cls_of_box`
         // path (preserves gcremovetypeptr overrides).
         let resolved = op.get_box_replacement(false);
@@ -7620,7 +7621,7 @@ impl OptContext {
             Value::Ref(gcref) if !gcref.is_null() => {}
             _ => return None,
         }
-        let synth = majit_ir::box_ref::BoxRef::new_const(value);
+        let synth = Operand::const_from_value(value);
         let typeptr = self.cpu.cls_of_box(&synth);
         if typeptr == 0 { None } else { Some(typeptr) }
     }

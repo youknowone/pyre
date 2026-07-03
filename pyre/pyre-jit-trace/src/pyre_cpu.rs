@@ -20,7 +20,7 @@
 
 use std::sync::{Arc, OnceLock};
 
-use majit_ir::box_ref::BoxRef;
+use majit_ir::operand::Operand;
 use majit_ir::{ArrayDescr, Descr, FieldDescr, GcRef, Type};
 use majit_metainterp::cpu::{Cpu, DefaultCpu};
 use pyre_object::unicodeobject::{
@@ -169,7 +169,7 @@ impl Default for PyreCpu {
 }
 
 impl Cpu for PyreCpu {
-    fn cls_of_box(&self, box_: &BoxRef) -> i64 {
+    fn cls_of_box(&self, box_: &Operand) -> i64 {
         self.0.cls_of_box(box_)
     }
     fn cls_of_gcref(&self, gcref: GcRef) -> i64 {
