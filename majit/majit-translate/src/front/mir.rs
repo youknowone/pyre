@@ -1664,6 +1664,19 @@ pub fn lower_fun_decl_with_static_addrs(
         if !lo.is_none_sites.is_empty() {
             crate::front::option_is_none::rewire_is_none_call_sites(&mut lo.graph, &lo.is_none_sites);
         }
+        // The `Option::map`/`and_then`/`unwrap_or_else` closure-select rewrite
+        // (`front::option_closure_select`) splits the residual call block into a
+        // `__discriminant` diamond, same post-lowering shape and fail-safe
+        // contract as `map_or`; gate the reachability sweep on an actual
+        // rewrite.
+        let closure_select_rewritten = if lo.closure_select_sites.is_empty() {
+            0
+        } else {
+            crate::front::option_closure_select::rewire_closure_select_call_sites(
+                &mut lo.graph,
+                &lo.closure_select_sites,
+            )
+        };
         if !lo.result_exc_call_results.is_empty()
             || result_exc_callee
             || next_rewritten > 0
@@ -1672,6 +1685,7 @@ pub fn lower_fun_decl_with_static_addrs(
             || bool_then_rewritten > 0
             || unwrap_or_rewritten > 0
             || map_or_rewritten > 0
+            || closure_select_rewritten > 0
         {
             crate::model::clear_unreachable_blocks(&mut lo.graph);
         }
@@ -2025,6 +2039,11 @@ struct Lowering<'a> {
     /// the discriminant comparison the `front::option_is_none` post-pass
     /// synthesizes in place (see [`crate::front::option_is_none::IsNoneSite`]).
     is_none_sites: Vec<crate::front::option_is_none::IsNoneSite>,
+    /// `Option::map`/`and_then`/`unwrap_or_else(opt, closure)` call sites
+    /// recorded for the discriminant closure-select the
+    /// `front::option_closure_select` post-pass synthesizes (see
+    /// [`crate::front::option_closure_select::ClosureSelectSite`]).
+    closure_select_sites: Vec<crate::front::option_closure_select::ClosureSelectSite>,
 }
 
 impl<'a> Lowering<'a> {
@@ -2185,6 +2204,7 @@ impl<'a> Lowering<'a> {
             unwrap_or_sites: Vec::new(),
             map_or_sites: Vec::new(),
             is_none_sites: Vec::new(),
+            closure_select_sites: Vec::new(),
         })
     }
 
@@ -6053,6 +6073,40 @@ impl<'a> Lowering<'a> {
         {
             self.is_none_sites.push(site);
         }
+        // Capture `Option::map`/`and_then`/`unwrap_or_else(opt, closure)` sites
+        // for the discriminant closure-select `front::option_closure_select`
+        // synthesizes.  All three are Opaque (foreign `core`) with the `Option`
+        // ADT receiver, so `first_is_self` routes them to a two-arg
+        // `CallTarget::Method` (receiver `args[0]`, closure env `args[1]`).
+        // Resolving the `Option` field owners + closure `call_once` owner needs
+        // the receiver type (`first_arg_ty`), the env type (`second_arg_ty`),
+        // and the result type (`call.dest.ty`), all in hand here;
+        // `recognize_closure_select_site` also confirms the receiver is an
+        // `Option`.  A resolution miss leaves the residual call.
+        if let OpKind::Call {
+            target: CallTarget::Method { name, .. },
+            args,
+            ..
+        } = &op_kind
+            && args.len() == 2
+            && let Some(kind) = match name.as_str() {
+                "map" => Some(crate::front::option_closure_select::ClosureCombinator::Map),
+                "and_then" => Some(crate::front::option_closure_select::ClosureCombinator::AndThen),
+                "unwrap_or_else" => {
+                    Some(crate::front::option_closure_select::ClosureCombinator::UnwrapOrElse)
+                }
+                _ => None,
+            }
+            && let Some(site) = self.recognize_closure_select_site(
+                kind,
+                first_arg_ty.as_ref(),
+                second_arg_ty.as_ref(),
+                &call.dest.ty,
+                &result_var,
+            )
+        {
+            self.closure_select_sites.push(site);
+        }
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(result_var.clone()),
             kind: op_kind,
@@ -7526,6 +7580,57 @@ impl<'a> Lowering<'a> {
             call_once_owner,
             payload_ty,
             result_ty,
+        })
+    }
+
+    /// Resolve a recognized `Option::map`/`and_then`/`unwrap_or_else(opt,
+    /// closure)` call into a
+    /// [`crate::front::option_closure_select::ClosureSelectSite`] — the `Option`
+    /// enum root + `Some` variant owners, the closure env's `call_once` owner,
+    /// the payload type `T`, and the closure's `call_once` result type (`U` for
+    /// `map`, `Option<U>` for `and_then`, `T` for `unwrap_or_else`).  `None`
+    /// (leaving the residual call) when the receiver is not a resolvable
+    /// `Option`, the closure env does not resolve to an ADT, or (for `map`) the
+    /// result is not an `Option`.
+    fn recognize_closure_select_site(
+        &self,
+        kind: crate::front::option_closure_select::ClosureCombinator,
+        recv_ty: Option<&TyRef>,
+        env_ty: Option<&TyRef>,
+        dest_ty: &TyRef,
+        result_var: &Variable,
+    ) -> Option<crate::front::option_closure_select::ClosureSelectSite> {
+        use crate::front::option_closure_select::ClosureCombinator;
+        let recv_ty = recv_ty?;
+        if !crate::front::result_exc::tyref_is_option(recv_ty, self.llbc) {
+            return None;
+        }
+        let def_id = self.tyref_adt_def_id(recv_ty)?;
+        let td = self.llbc.type_by_id(def_id)?;
+        let option_owner = td.item_meta.name_path();
+        let some_owner = Self::tagged_pair_payload_owner(td, &option_owner, 1)?;
+        let payload_ty = self.tyref_option_payload_value_type(recv_ty)?;
+        let env_def_id = self.tyref_ref_adt_def_id(env_ty?)?;
+        let env_td = self.llbc.type_by_id(env_def_id)?;
+        let call_once_owner = env_td.item_meta.name_path();
+        // The type the closure's `call_once` returns: `map`'s dest is
+        // `Option<U>` and its closure returns `U` (the dest payload);
+        // `and_then`'s dest is `Option<U>` returned directly; `unwrap_or_else`'s
+        // dest is the bare `T`.
+        let call_result_ty = match kind {
+            ClosureCombinator::Map => self.tyref_option_payload_value_type(dest_ty)?,
+            ClosureCombinator::AndThen | ClosureCombinator::UnwrapOrElse => {
+                tyref_to_value_type(dest_ty, self.llbc)
+            }
+        };
+        Some(crate::front::option_closure_select::ClosureSelectSite {
+            kind,
+            result_var: result_var.clone(),
+            option_owner,
+            some_owner,
+            call_once_owner,
+            payload_ty,
+            call_result_ty,
         })
     }
 

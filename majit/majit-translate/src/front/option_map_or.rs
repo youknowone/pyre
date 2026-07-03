@@ -342,7 +342,7 @@ fn rewire_one_map_or_site(graph: &mut FunctionGraph, site: &MapOrSite) -> Result
 /// `value`, returning the narrowed value — the same cast `result_narrow_root`
 /// appends after a `*mut <registered ADT>` call result.  `value` unchanged when
 /// no narrowing was absorbed.
-fn emit_narrow(
+pub(crate) fn emit_narrow(
     graph: &mut FunctionGraph,
     block: BlockId,
     value: Variable,
