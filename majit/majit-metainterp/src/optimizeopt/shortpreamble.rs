@@ -340,8 +340,8 @@ pub struct PreambleOp {
     pub op: majit_ir::OpRc,
     /// `short_op.res` — the result operand this entry produces. Carried as a
     /// producer-bound / const [`Operand`] so the canonical operand travels
-    /// with the struct and its `to_boxref()` re-mint at the export boundary
-    /// (`ProducedShortOp.res`) is `Rc::ptr_eq`-stable on the producer.
+    /// with the struct to the export boundary (`ProducedShortOp.res`),
+    /// `Rc::ptr_eq`-stable on the producer.
     pub res: majit_ir::operand::Operand,
     /// Classification of this operation.
     pub kind: PreambleOpKind,
@@ -1291,8 +1291,8 @@ pub struct ProducedShortOp {
     /// `PreambleOp.op` operand (upstream `produce_op` passes `self.res`).
     /// Always a producer-bound / const operand (`materialize_operand_at` on
     /// the preview, `res.bound_op()`-rooted exported entries per #173), never
-    /// position-only — so its `to_boxref()` re-mint at the `expand_info`
-    /// boundary is `Rc::ptr_eq`-stable on the producer.
+    /// position-only — so the same operand reaches the `expand_info`
+    /// boundary, `Rc::ptr_eq`-stable on the producer.
     pub res: majit_ir::operand::Operand,
     /// The preamble operation to replay.
     pub preamble_op: majit_ir::OpRc,

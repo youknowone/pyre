@@ -107,8 +107,8 @@ impl Optimization for OptEarlyForce {
                 let arg_is_virtual = ctx.is_virtual(&op.arg(i));
                 if arg_is_virtual {
                     // A virtual resolves to a bound alloc op, so the native
-                    // resolver yields its terminal operand with no from_boxref
-                    // bridge; force_box reads the operand's own opref and
+                    // resolver yields its terminal operand directly (no box
+                    // round-trip); force_box reads the operand's own opref and
                     // drives every make_equal_to / set_ptr_info receiver off it.
                     let arg_op = ctx
                         .resolve_operand_operand_opt(&op.arg(i))

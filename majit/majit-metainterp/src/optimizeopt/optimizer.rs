@@ -1553,7 +1553,7 @@ impl Optimizer {
         // populated with the canonical box, so this matches iff the raw op is the
         // canonical op — exactly PyPy's `op in _emittedoperations`.
         // A constant is never an emitted op; short-circuit before resolving so
-        // `from_boxref` never mints a throwaway Const key (which would harmlessly
+        // resolving never mints a throwaway Const key (which would harmlessly
         // miss anyway, since no Const is ever inserted into the emit set).
         if opref.is_constant() {
             return None;

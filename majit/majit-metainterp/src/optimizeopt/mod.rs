@@ -2296,7 +2296,7 @@ impl OptContext {
         // forwards the result to the same `Const`, so the op is a tautology
         // `result = ConstInt(value)`). A constant operand binds directly; a
         // position-only `from_opref(pos_ref)` self-reference would have no live
-        // producer and `from_boxref` rejects it (#9).
+        // producer and `from_opref` rejects it (#9).
         let mut op = Op::new(
             OpCode::SameAsI,
             &[Operand::const_from_value(Value::Int(value))],
@@ -6256,8 +6256,8 @@ impl OptContext {
         // sheds straight to a live-tracking operand. A NONE hole resolves to
         // `Operand::None`, a Const to `Operand::Const`; a producerless,
         // non-Const position has no operand to bind and panics at
-        // `Operand::from_opref` — the same contract `store_final_boxes`'
-        // former `Operand::from_boxref` step enforced (#9).
+        // `Operand::from_opref` — the same contract the operand-union
+        // `_args` model enforces (#9).
         let final_operands: Vec<Operand> = liveboxes
             .iter()
             .map(|a| {

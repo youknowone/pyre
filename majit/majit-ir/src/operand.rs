@@ -101,7 +101,7 @@ impl Operand {
     /// inline (the non-position `OpRef` arms); a
     /// position-only ref (a `*Op` / `InputArg*` with no producer `Rc`) has no
     /// `Operand` representation under the #9 union and panics, the same
-    /// invariant tripwire as [`Operand::from_boxref`]. Callers route bound
+    /// #9 invariant tripwire the operand-union relies on. Callers route bound
     /// positions through [`from_bound_op`](Self::from_bound_op) /
     /// [`from_bound_inputarg`](Self::from_bound_inputarg) and reach here only on
     /// `None` / `Const`.
@@ -125,8 +125,7 @@ impl Operand {
     /// binds to a freshly-minted synthetic producer (`SameAs*` / `InputArg`)
     /// carrying the same `pos`. The returned `Operand::Op` / `Operand::InputArg`
     /// holds a strong `Rc`, so the synthetic producer stays alive for exactly as
-    /// long as the operand is stored — no external root table (unlike the
-    /// `Weak`-backed [`bound_box_from_opref`](crate::box_ref::bound_box_from_opref)).
+    /// long as the operand is stored — no external root table.
     /// The vector optimizer's guard-strengthening / accumulation stitching uses
     /// this where its producer buffers hold `Op` values (not `OpRc`), so no real
     /// producer `Rc` is reachable to bind — `guard.py` emits fresh boxes,

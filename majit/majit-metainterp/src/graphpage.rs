@@ -21,11 +21,17 @@ struct ResOpMemo {
 }
 
 impl ResOpMemo {
-    // graphpage.py uses an object-keyed dict. Post-optimization the viewer
-    // operates on positioned `Op` values whose `OpRef` position is the box
-    // identity: producer positions are unique and bound inputargs / constants
-    // shed to their canonical `OpRef`, so keying by `OpRef` reproduces the
-    // upstream object-keyed dedup.
+    // graphpage.py:69 keys `memo` by box object (resoperation.py:373-381 names
+    // by object identity). This viewer runs post-optimization on owned `Op`
+    // values, where args are `Operand`s but a result is only its `op.pos`
+    // `OpRef` (no producer `Rc` to key on). `OpRef` is the identity both sides
+    // share: a producer position is unique to one op, and bound inputargs /
+    // constants shed to their canonical `OpRef`, so a result named `iN` and its
+    // downstream arg uses all resolve to the same key — reproducing upstream's
+    // one-name-per-box sharing in pyre's position-threaded representation.
+    // Two distinct producers can never share a position, so the only inputs
+    // `OpRef`-keying collapses (distinct position-only boxes at one position)
+    // cannot arise in a real trace — the deviation is unobservable.
     pub fn get(&self, key: OpRef) -> Option<&str> {
         self.names
             .iter()

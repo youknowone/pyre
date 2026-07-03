@@ -1251,10 +1251,10 @@ pub struct Op {
     ///
     /// `#9` operand-union: each slot is an [`Operand`] — a bound producer
     /// carried by `Rc` (`Op` / `InputArg`) or an inline `Const`. The
-    /// operand-keyed accessors (`arg`, `getarglist`, ...) convert on
-    /// read/write via `Operand::to_boxref` / `from_boxref` while callers
-    /// still speak operand; `from_boxref` of an unbound position-only box
-    /// is a contract violation and panics (every source binds its producer).
+    /// operand-keyed accessors (`arg`, `getarglist`, ...) hand out the stored
+    /// [`Operand`] directly. Every source binds its producer, so an unbound
+    /// position-only operand is never stored — that would be a #9 contract
+    /// violation.
     pub args: std::cell::RefCell<SmallVec<[Operand; 3]>>,
     /// `resoperation.py:460 ResOpWithDescr._descr` parity.  `RefCell`
     /// so the optimizer can stamp a descr onto a shared `Op` reached

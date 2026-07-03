@@ -2006,8 +2006,8 @@ pub struct ExportedState {
     /// exported short-box `res` is bound to (`res.bound_op()`) alive into
     /// Phase 2. A short-box `res` carries only a `Weak<Op>`; the Phase-1
     /// OptContext that owns the strong `OpRc` drops at the peel boundary, so
-    /// without this carry `Operand::from_boxref(res)` upgrades a dead Weak →
-    /// None and panics (operand.rs:253). Populated at export from
+    /// without this carry `res` (a `Weak<Op>`) upgrades to a dead producer at
+    /// Phase 2 and its accessors panic. Populated at export from
     /// `res.bound_op()` while still alive; InputArg-kind res (`bound_inputarg`,
     /// not `bound_op`) contributes nothing here and is rooted via
     /// `short_inputarg_refs` instead.
@@ -2861,9 +2861,9 @@ impl OptUnroll {
             let op = produced_op.res.to_opref();
             if !op.is_constant() {
                 // `expand_info` keys the operand-keyed `exported_infos`
-                // (#158) on the producer-bound `res`; re-mint its box
-                // (`to_boxref` is `Rc::ptr_eq`-stable on the producer, so
-                // the import lookup still hits).
+                // (#158) on the producer-bound `res`, which is
+                // `Rc::ptr_eq`-stable on the producer, so the import lookup
+                // still hits.
                 self.expand_info(op, &produced_op.res, ctx, exported_int_bounds, &mut infos);
             }
         }
@@ -3043,7 +3043,7 @@ impl OptUnroll {
         // `arg_box` is the canonical Phase-1 box, which can be position-only
         // (a virtual field box), so read its PtrInfo directly off the box —
         // exactly what `peek_ptr_info` does (`get_box_replacement(false)
-        // .ptr_info()`, `self`-independent) — without the `from_boxref`
+        // .ptr_info()`, `self`-independent) — without the `from_opref`
         // position-only panic.
         let arg_pi = arg_box
             .get_box_replacement(false)
