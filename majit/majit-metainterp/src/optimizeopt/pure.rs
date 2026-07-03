@@ -1473,7 +1473,7 @@ mod tests {
     fn run_pure(
         num_inputs: u32,
         specs: &[OpSpec],
-        constants: &mut majit_ir::VecMap<u32, majit_ir::Value>,
+        constants: &mut majit_ir::ConstMap<majit_ir::Value>,
         extra_passes: &[fn() -> Box<dyn crate::optimizeopt::Optimization>],
         seed_guard_snapshots: bool,
     ) -> Vec<Op> {
@@ -1517,7 +1517,7 @@ mod tests {
                 op_spec(OpCode::IntAdd, &[Arg::In(0), Arg::In(1)]),
                 op_spec(OpCode::IntAdd, &[Arg::In(0), Arg::In(1)]),
             ],
-            &mut majit_ir::VecMap::new(),
+            &mut majit_ir::ConstMap::new(),
             &[],
             false,
         );
@@ -1537,7 +1537,7 @@ mod tests {
                 op_spec(OpCode::IntAdd, &[Arg::In(0), Arg::In(1)]),
                 op_spec(OpCode::IntAdd, &[Arg::In(0), Arg::In(2)]),
             ],
-            &mut majit_ir::VecMap::new(),
+            &mut majit_ir::ConstMap::new(),
             &[],
             false,
         );
@@ -1555,7 +1555,7 @@ mod tests {
                 op_spec(OpCode::IntAdd, &[Arg::In(0), Arg::In(1)]),
                 op_spec(OpCode::IntAdd, &[Arg::In(1), Arg::In(0)]),
             ],
-            &mut majit_ir::VecMap::new(),
+            &mut majit_ir::ConstMap::new(),
             &[],
             false,
         );
@@ -1573,7 +1573,7 @@ mod tests {
                 op_spec(OpCode::IntSub, &[Arg::In(0), Arg::In(1)]),
                 op_spec(OpCode::IntSub, &[Arg::In(1), Arg::In(0)]),
             ],
-            &mut majit_ir::VecMap::new(),
+            &mut majit_ir::ConstMap::new(),
             &[],
             false,
         );
@@ -1591,7 +1591,7 @@ mod tests {
                 op_spec(OpCode::IntAdd, &[Arg::In(0), Arg::In(1)]),
                 op_spec(OpCode::IntMul, &[Arg::In(0), Arg::In(1)]),
             ],
-            &mut majit_ir::VecMap::new(),
+            &mut majit_ir::ConstMap::new(),
             &[],
             false,
         );
@@ -1611,7 +1611,7 @@ mod tests {
                 op_spec(OpCode::IntAdd, &[Arg::In(0), Arg::In(1)]),
                 op_spec(OpCode::IntAdd, &[Arg::In(0), Arg::In(1)]),
             ],
-            &mut majit_ir::VecMap::new(),
+            &mut majit_ir::ConstMap::new(),
             &[],
             false,
         );
@@ -1625,7 +1625,7 @@ mod tests {
         let result = run_pure(
             2,
             &[op_spec(OpCode::CallPureI, &[Arg::In(0), Arg::In(1)])],
-            &mut majit_ir::VecMap::new(),
+            &mut majit_ir::ConstMap::new(),
             &[],
             false,
         );
@@ -1659,7 +1659,7 @@ mod tests {
         let result = opt
             .optimize_with_constants_and_inputs_oprc(
                 &ops,
-                &mut majit_ir::VecMap::new(),
+                &mut majit_ir::ConstMap::new(),
                 inputs.len(),
             )
             .expect("test: unexpected InvalidLoop");
@@ -1685,7 +1685,7 @@ mod tests {
         let result = opt
             .optimize_with_constants_and_inputs_oprc(
                 &ops,
-                &mut majit_ir::VecMap::new(),
+                &mut majit_ir::ConstMap::new(),
                 inputs.len(),
             )
             .expect("test: unexpected InvalidLoop");
@@ -1718,7 +1718,7 @@ mod tests {
                     arr_descr.clone(),
                 ),
             ],
-            &mut majit_ir::VecMap::new(),
+            &mut majit_ir::ConstMap::new(),
             &[],
             false,
         );
@@ -1747,7 +1747,7 @@ mod tests {
                     arr_descr.clone(),
                 ),
             ],
-            &mut majit_ir::VecMap::new(),
+            &mut majit_ir::ConstMap::new(),
             &[],
             false,
         );
@@ -1765,7 +1765,7 @@ mod tests {
                 op_spec(OpCode::IntNeg, &[Arg::In(0)]),
                 op_spec(OpCode::IntNeg, &[Arg::In(0)]),
             ],
-            &mut majit_ir::VecMap::new(),
+            &mut majit_ir::ConstMap::new(),
             &[],
             false,
         );
@@ -1790,7 +1790,7 @@ mod tests {
         let result = opt
             .optimize_with_constants_and_inputs_oprc(
                 &ops,
-                &mut majit_ir::VecMap::new(),
+                &mut majit_ir::ConstMap::new(),
                 inputs.len(),
             )
             .expect("test: unexpected InvalidLoop");
@@ -1829,7 +1829,7 @@ mod tests {
         let result = opt
             .optimize_with_constants_and_inputs_oprc(
                 &ops,
-                &mut majit_ir::VecMap::new(),
+                &mut majit_ir::ConstMap::new(),
                 num_inputs as usize,
             )
             .expect("test: unexpected InvalidLoop");
@@ -1895,7 +1895,7 @@ mod tests {
                 op_spec(OpCode::IntXor, &[Arg::In(0), Arg::In(1)]),
                 op_spec(OpCode::IntXor, &[Arg::In(1), Arg::In(0)]),
             ],
-            &mut majit_ir::VecMap::new(),
+            &mut majit_ir::ConstMap::new(),
             &[],
             false,
         );
@@ -1911,7 +1911,7 @@ mod tests {
                 op_spec(OpCode::IntAnd, &[Arg::In(0), Arg::In(1)]),
                 op_spec(OpCode::IntAnd, &[Arg::In(1), Arg::In(0)]),
             ],
-            &mut majit_ir::VecMap::new(),
+            &mut majit_ir::ConstMap::new(),
             &[],
             false,
         );
@@ -1929,7 +1929,7 @@ mod tests {
                 op_spec(OpCode::IntLt, &[Arg::In(0), Arg::In(1)]),
                 op_spec(OpCode::IntLt, &[Arg::In(0), Arg::In(1)]),
             ],
-            &mut majit_ir::VecMap::new(),
+            &mut majit_ir::ConstMap::new(),
             &[],
             false,
         );
@@ -1956,7 +1956,7 @@ mod tests {
         let result = opt
             .optimize_with_constants_and_inputs_oprc(
                 &ops,
-                &mut majit_ir::VecMap::new(),
+                &mut majit_ir::ConstMap::new(),
                 inputs.len(),
             )
             .expect("test: unexpected InvalidLoop");
@@ -1978,7 +1978,7 @@ mod tests {
                 op_spec(OpCode::SetfieldGc, &[Arg::In(0), Arg::In(1)]), // not pure, kept
                 op_spec(OpCode::IntAdd, &[Arg::In(0), Arg::In(1)]), // pure dup, eliminated
             ],
-            &mut majit_ir::VecMap::new(),
+            &mut majit_ir::ConstMap::new(),
             &[],
             false,
         );
@@ -2003,7 +2003,7 @@ mod tests {
                 op_spec(OpCode::CallLoopinvariantI, &[func.clone(), Arg::In(0)]),
                 op_spec(OpCode::CallLoopinvariantI, &[func, Arg::In(0)]),
             ],
-            &mut majit_ir::VecMap::new(),
+            &mut majit_ir::ConstMap::new(),
             &[rewrite_pass],
             false,
         );
@@ -2024,7 +2024,7 @@ mod tests {
                 op_spec(OpCode::CallLoopinvariantI, &[Arg::In(0), Arg::In(1)]),
                 op_spec(OpCode::CallLoopinvariantI, &[Arg::In(0), Arg::In(2)]),
             ],
-            &mut majit_ir::VecMap::new(),
+            &mut majit_ir::ConstMap::new(),
             &[rewrite_pass],
             false,
         );
@@ -2045,7 +2045,7 @@ mod tests {
             let result = run_pure(
                 1,
                 &[op_spec(loopinv_op, &[Arg::In(0)])],
-                &mut majit_ir::VecMap::new(),
+                &mut majit_ir::ConstMap::new(),
                 &[rewrite_pass],
                 false,
             );
@@ -2076,7 +2076,7 @@ mod tests {
         let result = run_pure(
             1,
             &specs,
-            &mut majit_ir::VecMap::new(),
+            &mut majit_ir::ConstMap::new(),
             &[rewrite_pass],
             false,
         );
@@ -2099,7 +2099,7 @@ mod tests {
                 op_spec(OpCode::IntAdd, &[Arg::In(0), Arg::In(1)]), // pure dup → removed
                 op_spec(OpCode::CallLoopinvariantI, &[func, Arg::In(2)]), // loopinv dup → removed
             ],
-            &mut majit_ir::VecMap::new(),
+            &mut majit_ir::ConstMap::new(),
             &[rewrite_pass],
             false,
         );
@@ -2123,7 +2123,7 @@ mod tests {
                 // Use the result in a finish to prevent dead code elimination
                 op_spec(OpCode::Finish, &[Arg::Prod(0)]),
             ],
-            &mut majit_ir::VecMap::new(),
+            &mut majit_ir::ConstMap::new(),
             &[],
             false,
         );
@@ -2145,7 +2145,7 @@ mod tests {
                 ),
                 op_spec(OpCode::Finish, &[Arg::Prod(0)]),
             ],
-            &mut majit_ir::VecMap::new(),
+            &mut majit_ir::ConstMap::new(),
             &[],
             false,
         );
@@ -2166,7 +2166,7 @@ mod tests {
                 op_spec(OpCode::GuardNoOverflow, &[]),
                 op_spec(OpCode::Finish, &[]),
             ],
-            &mut majit_ir::VecMap::new(),
+            &mut majit_ir::ConstMap::new(),
             &[],
             true,
         );
@@ -2192,7 +2192,7 @@ mod tests {
                 op_spec(OpCode::GuardNoOverflow, &[]),
                 op_spec(OpCode::Finish, &[]),
             ],
-            &mut majit_ir::VecMap::new(),
+            &mut majit_ir::ConstMap::new(),
             &[],
             true,
         );
@@ -2370,7 +2370,7 @@ mod tests {
                 op_spec(OpCode::GuardNoException, &[]), // should be removed
                 op_spec(OpCode::Finish, &[]),
             ],
-            &mut majit_ir::VecMap::new(),
+            &mut majit_ir::ConstMap::new(),
             &[],
             true,
         );
@@ -2940,7 +2940,7 @@ mod tests {
                     &[Arg::In(1), Arg::In(2), Arg::In(3)],
                 ),
             ],
-            &mut majit_ir::VecMap::new(),
+            &mut majit_ir::ConstMap::new(),
             &[],
             false,
         );
@@ -2971,7 +2971,7 @@ mod tests {
         opt.record_call_pure_result(vec![Value::Int(0xCAFE), Value::Int(7)], Value::Int(42));
         opt.add_pass(Box::new(OptPure::new()));
 
-        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
         let result = opt
             .optimize_with_constants_and_inputs_oprc(&ops, &mut constants, inputs.len())
             .expect("test: unexpected InvalidLoop");
@@ -3044,7 +3044,7 @@ mod tests {
         );
         opt.add_pass(Box::new(OptPure::new()));
 
-        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
         let result = opt
             .optimize_with_constants_and_inputs_oprc(&ops, &mut constants, inputs.len())
             .expect("test: unexpected InvalidLoop");

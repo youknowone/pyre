@@ -89,7 +89,7 @@ pub struct ShortPreamble {
     /// Production short preamble ops embed inline `Const*` OpRefs
     /// directly, matching RPython where `_map_args` passes Const boxes
     /// through unchanged. This map is therefore empty on production paths.
-    pub constants: majit_ir::VecMap<u32, majit_ir::Const>,
+    pub constants: majit_ir::ConstMap<majit_ir::Const>,
     /// RPython parity: PtrInfo for each inputarg, from Phase 1 export.
     /// shortpreamble.py:414-425: preamble_op.set_forwarded(info)
     /// Used by inline_short_preamble to propagate PtrInfo to jump_args
@@ -114,7 +114,7 @@ impl ShortPreamble {
             used_boxes: Vec::new(),
             jump_args: Vec::new(),
             exported_state: None,
-            constants: majit_ir::VecMap::new(),
+            constants: majit_ir::ConstMap::new(),
             phase1_inputargs: None,
             inputarg_infos: Vec::new(),
         }
@@ -288,7 +288,7 @@ impl CollectedShortPreambleBuilder {
             used_boxes: Vec::new(),
             jump_args: Vec::new(),
             exported_state,
-            constants: majit_ir::VecMap::new(),
+            constants: majit_ir::ConstMap::new(),
             phase1_inputargs: None,
             inputarg_infos: Vec::new(),
         }
@@ -1217,7 +1217,7 @@ impl CollectedExtendedShortPreambleBuilder {
             used_boxes: Vec::new(),
             jump_args: Vec::new(),
             exported_state,
-            constants: majit_ir::VecMap::new(),
+            constants: majit_ir::ConstMap::new(),
             phase1_inputargs: None,
             inputarg_infos: Vec::new(),
         }
@@ -2198,7 +2198,7 @@ fn build_short_preamble_struct_from_ops(
     // RPython parity: `shortpreamble.py` keeps no `loop_constants` side
     // table — `arg` IS the `Const` box, so `_map_args(mapping, args)`
     // (`unroll.py:364`) passes it through unchanged.
-    let constants: majit_ir::VecMap<u32, majit_ir::Const> = majit_ir::VecMap::new();
+    let constants: majit_ir::ConstMap<majit_ir::Const> = majit_ir::ConstMap::new();
     ShortPreamble {
         ops: entries,
         inputargs: short_inputargs.to_vec(),
@@ -3234,7 +3234,7 @@ pub(crate) fn extract_short_preamble(peeled_ops: &[Op]) -> ShortPreamble {
         used_boxes: Vec::new(),
         jump_args: Vec::new(),
         exported_state: None,
-        constants: majit_ir::VecMap::new(),
+        constants: majit_ir::ConstMap::new(),
         phase1_inputargs: None,
         inputarg_infos: Vec::new(),
     }

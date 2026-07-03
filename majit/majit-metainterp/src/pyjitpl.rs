@@ -261,7 +261,7 @@ pub(crate) struct CompiledTrace {
     /// type with value, so `Const` carries both — the legacy
     /// `(constants: HashMap<u32, i64>, constant_types: HashMap<u32, Type>)`
     /// parallel pair has been collapsed.
-    pub(crate) constants: majit_ir::VecMap<u32, majit_ir::Const>,
+    pub(crate) constants: majit_ir::ConstMap<majit_ir::Const>,
     /// Static exit metadata for each guard/finish in this trace.
     pub(crate) exit_layouts: majit_ir::VecMap<u32, StoredExitLayout>,
     /// Static exit metadata for terminal FINISH/JUMP ops, keyed by op index.
@@ -490,7 +490,7 @@ impl Drop for CompileSnapshotRootsGuard {
 
 fn snapshot_map_from_trace_snapshots(
     trace_snapshots: &[crate::recorder::Snapshot],
-    constants: &mut majit_ir::VecMap<u32, majit_ir::Value>,
+    constants: &mut majit_ir::ConstMap<majit_ir::Value>,
 ) -> (
     SnapshotBoxes,
     SnapshotFrameSizes,
@@ -4778,7 +4778,7 @@ impl<M: Clone> MetaInterp<M> {
         &self,
         inputargs: &mut Vec<InputArg>,
         ops: &mut Vec<majit_ir::OpRc>,
-        constants: &mut majit_ir::VecMap<u32, majit_ir::Value>,
+        constants: &mut majit_ir::ConstMap<majit_ir::Value>,
         driver_descriptor: Option<&crate::jitdriver::JitDriverStaticData>,
         orig_vable_ptr: *const u8,
     ) {
@@ -5168,7 +5168,7 @@ impl<M: Clone> MetaInterp<M> {
         // (history.py:227/268/314), so there is no legacy TraceCtx
         // ConstantPool to drain — this backend typed-constant egress map
         // starts fresh.
-        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
 
         // Materialize Vec<Op> from the trace's `Vec<OpRc>` so the
         // optimizer's `&[Op]` surface gets owned data. The deep-clone
@@ -6165,7 +6165,7 @@ impl<M: Clone> MetaInterp<M> {
         // The recorder carries Const values inline on the OpRef variants
         // (history.py:227/268/314), so there is no legacy TraceCtx
         // ConstantPool to snapshot — this typed-constant map starts fresh.
-        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
         let call_pure_results = ctx.call_pure_results.clone();
         let trace_snapshots = ctx.snapshots().to_vec();
         let (
@@ -6413,7 +6413,7 @@ impl<M: Clone> MetaInterp<M> {
             // The recorder carries Const values inline on the OpRef variants
             // (history.py:227/268/314), so there is no legacy TraceCtx
             // ConstantPool to snapshot — this typed-constant map starts fresh.
-            let constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
+            let constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
             let initial_inputarg_consts = ctx.initial_inputarg_consts.clone();
             let call_pure_results = ctx.take_call_pure_results();
 
@@ -6985,7 +6985,7 @@ impl<M: Clone> MetaInterp<M> {
         // (history.py:227/268/314), so there is no legacy TraceCtx
         // ConstantPool to drain — this backend typed-constant egress map
         // starts fresh.
-        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
 
         let num_ops_before = trace_ops.len();
         let mut optimizer = if let Some(config) = vable_config {
@@ -7396,7 +7396,7 @@ impl<M: Clone> MetaInterp<M> {
         // (history.py:227/268/314), so there is no legacy TraceCtx
         // ConstantPool to drain — this backend typed-constant egress map
         // starts fresh.
-        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
 
         if crate::majit_log_enabled() {
             eprintln!("--- simple loop trace (before opt) ---");
@@ -9350,7 +9350,7 @@ impl<M: Clone> MetaInterp<M> {
         meta: M,
         bridge_ops: &[majit_ir::Op],
         bridge_inputargs: &[majit_ir::InputArg],
-        bridge_constants: majit_ir::VecMap<u32, majit_ir::Const>,
+        bridge_constants: majit_ir::ConstMap<majit_ir::Const>,
         snapshot_boxes: SnapshotBoxes,
         snapshot_frame_sizes: SnapshotFrameSizes,
         snapshot_vable_boxes: SnapshotBoxes,
@@ -9416,7 +9416,7 @@ impl<M: Clone> MetaInterp<M> {
         // history.py:220 box.type parity: promote the legacy `i64` pool
         // to a typed `Value` map for the optimizer's intrinsic Const
         // class identity.
-        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = bridge_constants
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = bridge_constants
             .iter()
             .map(|(&k, c)| (k, c.to_value()))
             .collect();
@@ -9796,7 +9796,7 @@ impl<M: Clone> MetaInterp<M> {
         fail_descr: &dyn majit_ir::FailDescr,
         bridge_ops: &[majit_ir::Op],
         bridge_inputargs: &[majit_ir::InputArg],
-        bridge_constants: majit_ir::VecMap<u32, majit_ir::Const>,
+        bridge_constants: majit_ir::ConstMap<majit_ir::Const>,
         snapshot_boxes: SnapshotBoxes,
         snapshot_frame_sizes: SnapshotFrameSizes,
         snapshot_vable_boxes: SnapshotBoxes,
@@ -10032,7 +10032,7 @@ impl<M: Clone> MetaInterp<M> {
         }
         // history.py:220 box.type parity: promote the legacy `i64` pool
         // to a typed `Value` map.
-        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = bridge_constants
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = bridge_constants
             .iter()
             .map(|(&k, c)| (k, c.to_value()))
             .collect();
@@ -18726,7 +18726,7 @@ mod tests {
                 start_descr,
             ),
         ];
-        let mut constants: majit_ir::VecMap<u32, majit_ir::Const> = majit_ir::VecMap::new();
+        let mut constants: majit_ir::ConstMap<majit_ir::Const> = majit_ir::ConstMap::new();
         constants.insert(100, majit_ir::Const::Int(1));
         constants.insert(101, majit_ir::Const::Int(2));
         let mut traces = majit_ir::VecMap::new();
@@ -18909,7 +18909,7 @@ mod tests {
             CompiledTrace {
                 inputargs: vec![],
                 ops: vec![],
-                constants: majit_ir::VecMap::new(),
+                constants: majit_ir::ConstMap::new(),
                 exit_layouts,
                 terminal_exit_layouts: majit_ir::VecMap::new(),
             },
@@ -19005,7 +19005,7 @@ mod tests {
             CompiledTrace {
                 inputargs: vec![],
                 ops: vec![],
-                constants: majit_ir::VecMap::new(),
+                constants: majit_ir::ConstMap::new(),
                 exit_layouts,
                 terminal_exit_layouts: majit_ir::VecMap::new(),
             },
@@ -19124,7 +19124,7 @@ mod tests {
             green_key,
             &inputargs,
             ops,
-            majit_ir::VecMap::new(),
+            majit_ir::ConstMap::new(),
         );
 
         let (trace_id, fail_index) = {
@@ -19257,7 +19257,7 @@ mod tests {
         green_key: u64,
         inputargs: &[InputArg],
         ops: Vec<Op>,
-        constants_typed: majit_ir::VecMap<u32, majit_ir::Const>,
+        constants_typed: majit_ir::ConstMap<majit_ir::Const>,
     ) {
         meta.backend.set_constants_pool(constants_typed.clone());
         let mut token = JitCellToken::new(green_key + 1000);
@@ -19367,7 +19367,7 @@ mod tests {
             green_key,
             &inputargs,
             ops,
-            majit_ir::VecMap::new(),
+            majit_ir::ConstMap::new(),
         );
 
         let (trace_id, fail_index) = {
@@ -19445,7 +19445,7 @@ mod tests {
             green_key,
             &inputargs,
             ops,
-            majit_ir::VecMap::new(),
+            majit_ir::ConstMap::new(),
         );
 
         let (trace_id, fail_index, expected_source_op_index, expected_rd_numb, expected_exit_types) = {
@@ -19543,7 +19543,7 @@ mod tests {
             green_key,
             &inputargs,
             ops,
-            majit_ir::VecMap::new(),
+            majit_ir::ConstMap::new(),
         );
 
         let (trace_id, fail_index, descr_arc) = {
@@ -19648,7 +19648,7 @@ mod tests {
             guard_op,
             mk_op(OpCode::Finish, &[OpRef::int_op(0)], OpRef::NONE.raw()),
         ];
-        let mut constants: majit_ir::VecMap<u32, majit_ir::Const> = majit_ir::VecMap::new();
+        let mut constants: majit_ir::ConstMap<majit_ir::Const> = majit_ir::ConstMap::new();
         constants.insert(
             100,
             majit_ir::Const::Int(maybe_force_and_return_void as *const () as usize as i64),
@@ -20748,7 +20748,7 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-        let mut constants: majit_ir::VecMap<u32, majit_ir::Const> = majit_ir::VecMap::new();
+        let mut constants: majit_ir::ConstMap<majit_ir::Const> = majit_ir::ConstMap::new();
         constants.insert(100, majit_ir::Const::Int(1));
         constants.insert(101, majit_ir::Const::Int(0));
         attach_procedure_to_interp_entry(&mut meta, green_key, &inputargs, ops, constants);

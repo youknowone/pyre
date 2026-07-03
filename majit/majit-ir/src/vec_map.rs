@@ -10,6 +10,17 @@
 
 pub use vecmap_rs::VecMap;
 
+/// The compiled-trace constant pool: position → constant value.
+///
+/// Backed by [`indexmap::IndexMap`] rather than [`VecMap`] because the pool is
+/// built by inserting one entry per const-folded position (up to the full
+/// trace length) and read back by keyed lookup and in-order iteration.
+/// `VecMap`'s `entry`/`get`/`insert` are linear scans (`iter().position`), so a
+/// large trace's pool made those O(n²); `IndexMap` gives O(1) keyed access
+/// while preserving insertion order, so codegen that iterates the pool is
+/// unaffected.
+pub type ConstMap<V> = indexmap::IndexMap<u32, V>;
+
 impl<V> crate::resoperation::ConstLookup<V> for VecMap<u32, V> {
     fn lookup(&self, key: u32) -> Option<&V> {
         self.get(&key)

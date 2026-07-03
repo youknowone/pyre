@@ -835,7 +835,7 @@ pub struct DynasmBackend {
     /// Each `Const` carries its value (read via `as_raw_i64()`) and type
     /// (read via `get_type()` for the GC rewriter's `v.type` check), so
     /// there is no separate type side-table.
-    constants: majit_ir::VecMap<u32, majit_ir::Const>,
+    constants: majit_ir::ConstMap<majit_ir::Const>,
     /// llmodel.py:64-69 self.vtable_offset — byte offset of the typeptr
     /// field inside instance objects. None when gcremovetypeptr is enabled.
     vtable_offset: Option<usize>,
@@ -934,7 +934,7 @@ impl DynasmBackend {
             cpu_tracker: Arc::new(majit_backend::CpuTotalTracker::default()),
             next_trace_id: 1,
             next_header_pc: 0,
-            constants: majit_ir::VecMap::new(),
+            constants: majit_ir::ConstMap::new(),
             vtable_offset: None,
             descr_attachments: Arc::new(std::sync::RwLock::new(
                 crate::guard::CpuDescrAttachments::default(),
@@ -1343,7 +1343,7 @@ impl DynasmBackend {
     fn collect_classptr_typeid_table(
         &self,
         ops: &[Op],
-        const_pool: &majit_ir::VecMap<u32, majit_ir::Const>,
+        const_pool: &majit_ir::ConstMap<majit_ir::Const>,
     ) -> majit_ir::VecMap<i64, u32> {
         let mut table = majit_ir::VecMap::new();
         if self.vtable_offset.is_some() || DYNASM_ACTIVE_GC.with(|cell| cell.borrow().is_none()) {
@@ -1969,7 +1969,7 @@ impl Backend for DynasmBackend {
         })
     }
 
-    fn set_constants_pool(&mut self, constants: majit_ir::VecMap<u32, majit_ir::Const>) {
+    fn set_constants_pool(&mut self, constants: majit_ir::ConstMap<majit_ir::Const>) {
         self.constants = constants;
     }
 

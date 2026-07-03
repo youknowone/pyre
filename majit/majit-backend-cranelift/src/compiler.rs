@@ -4303,7 +4303,7 @@ fn op_dereferences_first_arg(opcode: majit_ir::OpCode) -> bool {
 fn validate_oprefs_for_compile(
     inputargs: &[InputArg],
     ops: &[Op],
-    constants: &majit_ir::VecMap<u32, majit_ir::Const>,
+    constants: &majit_ir::ConstMap<majit_ir::Const>,
 ) -> Result<(), BackendError> {
     let num_inputs = inputargs.len();
     // RPython rewrite.py:397 + regalloc invariant: at the current op,
@@ -7447,7 +7447,7 @@ pub struct CraneliftBackend {
     /// the raw `i64` via `as_raw_i64()` and the GC rewriter reads the
     /// `v.type == 'r'` discriminant via `get_type()` — no separate
     /// type side-table.
-    constants: majit_ir::VecMap<u32, majit_ir::Const>,
+    constants: majit_ir::ConstMap<majit_ir::Const>,
     /// compile.py: self.metainterp_sd.callinfocollection — used by
     /// recovery_layout building for VStr/VUni Concat/Slice func ptr
     /// lookups (resume.py:1143-1188).
@@ -7661,7 +7661,7 @@ impl CraneliftBackend {
             cpu_tracker: Arc::new(majit_backend::CpuTotalTracker::default()),
             module,
             func_ctx,
-            constants: majit_ir::VecMap::new(),
+            constants: majit_ir::ConstMap::new(),
             callinfocollection: None,
             func_counter: 0,
             trace_counter: 1,
@@ -7938,7 +7938,7 @@ impl CraneliftBackend {
         &mut self,
         inputargs: &[InputArg],
         ops: &[Op],
-        constants: &majit_ir::VecMap<u32, majit_ir::Const>,
+        constants: &majit_ir::ConstMap<majit_ir::Const>,
     ) -> (Vec<Op>, Vec<GcRef>) {
         let mut normalized = normalize_ops_for_codegen_simple(inputargs, ops);
         inject_builtin_string_descrs(&mut normalized);
@@ -14900,7 +14900,7 @@ impl majit_backend::Backend for CraneliftBackend {
         Ok(info)
     }
 
-    fn set_constants_pool(&mut self, constants: majit_ir::VecMap<u32, majit_ir::Const>) {
+    fn set_constants_pool(&mut self, constants: majit_ir::ConstMap<majit_ir::Const>) {
         self.constants = constants;
     }
 

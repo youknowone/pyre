@@ -1692,7 +1692,7 @@ pub(crate) fn decode_values_with_layout(
 
 pub(crate) fn normalize_closing_jump_args(
     ops: Vec<majit_ir::OpRc>,
-    constants: &majit_ir::VecMap<u32, majit_ir::Value>,
+    constants: &majit_ir::ConstMap<majit_ir::Value>,
     num_inputs: usize,
 ) -> Vec<majit_ir::OpRc> {
     let Some(label_args) = ops
@@ -1800,7 +1800,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
     vable_array_lengths: &[usize],
     num_red_args: usize,
     index_of_virtualizable: usize,
-    constants: &mut majit_ir::VecMap<u32, majit_ir::Value>,
+    constants: &mut majit_ir::ConstMap<majit_ir::Value>,
 ) {
     // TODO (Rust language constraint, not a logic
     // divergence): RPython `compile.py:425-461` calls
@@ -2570,7 +2570,7 @@ pub fn compile_tmp_callback(
     // Inline-Const carries each Const value directly on its OpRef
     // variant (history.py:227/268/314), so the backend pool is left
     // empty for `compile_tmp_callback`.
-    backend.set_constants_pool(majit_ir::VecMap::new());
+    backend.set_constants_pool(majit_ir::ConstMap::new());
     // The backend boundary takes `&[InputArg]` by value (the flat OpRef
     // encoding survives past this point); identity ends here.
     let backend_inputargs: Vec<InputArg> =
@@ -2747,7 +2747,7 @@ mod tests {
         };
         let mut ops: Vec<majit_ir::OpRc> = vec![op0, op1, op2];
         let mut inputargs = vec![InputArg::new_ref(0), InputArg::new_ref(1)];
-        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
 
         patch_new_loop_to_load_virtualizable_fields(
             &mut ops,
@@ -2824,7 +2824,7 @@ mod tests {
             InputArg::new_ref(1),
             InputArg::new_ref(2),
         ];
-        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
 
         let mut ops: Vec<majit_ir::OpRc> = ops.into_iter().map(std::rc::Rc::new).collect();
         patch_new_loop_to_load_virtualizable_fields(

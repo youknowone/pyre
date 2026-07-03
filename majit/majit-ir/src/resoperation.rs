@@ -1709,6 +1709,12 @@ impl<V> ConstLookup<V> for std::collections::HashMap<u32, V> {
     }
 }
 
+impl<V> ConstLookup<V> for indexmap::IndexMap<u32, V> {
+    fn lookup(&self, key: u32) -> Option<&V> {
+        self.get(&key)
+    }
+}
+
 /// Format a trace (list of ops) with optional constants for debugging.
 ///
 /// Generic over the constants value type so both the optimizer-side

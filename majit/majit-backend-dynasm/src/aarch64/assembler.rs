@@ -247,7 +247,7 @@ pub struct AssemblerARM64<'a> {
     /// Constants: OpRef index (>= 10000) → typed `Const` value. The box
     /// variant carries its own type (`Const::get_type`), so no separate
     /// constant-type map is needed.
-    constants: majit_ir::VecMap<u32, majit_ir::Const>,
+    constants: majit_ir::ConstMap<majit_ir::Const>,
     /// Next available frame slot index.
     next_slot: usize,
     /// Condition code from the most recent CMP/TEST instruction,
@@ -409,7 +409,7 @@ impl<'a> AssemblerARM64<'a> {
     pub(crate) fn new(
         trace_id: u64,
         header_pc: u64,
-        constants: majit_ir::VecMap<u32, majit_ir::Const>,
+        constants: majit_ir::ConstMap<majit_ir::Const>,
         vtable_offset: Option<usize>,
         classptr_to_typeid: VecMap<i64, u32>,
         guard_gc_type_info: Option<GuardGcTypeInfo>,

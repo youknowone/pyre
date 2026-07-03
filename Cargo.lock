@@ -1440,6 +1440,7 @@ dependencies = [
 name = "majit-ir"
 version = "0.0.2"
 dependencies = [
+ "indexmap",
  "serde",
  "smallvec",
  "vecmap-rs",

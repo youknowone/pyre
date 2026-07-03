@@ -1390,7 +1390,7 @@ impl majit_backend::Backend for WasmBackend {
         })
     }
 
-    fn set_constants_pool(&mut self, constants: majit_ir::VecMap<u32, majit_ir::Const>) {
+    fn set_constants_pool(&mut self, constants: majit_ir::ConstMap<majit_ir::Const>) {
         self.constants.clear();
         for (&k, c) in constants.iter() {
             self.constants.insert(k, c.as_raw_i64());

@@ -2966,7 +2966,7 @@ mod tests {
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(VectorizingOptimizer::new()));
         let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecMap::new(), 1024);
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::new(), 1024);
 
         let labels = result
             .iter()
@@ -3350,7 +3350,7 @@ mod tests {
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(VectorizingOptimizer::new()));
         let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecMap::new(), 1024);
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::new(), 1024);
 
         assert!(
             result.iter().any(|op| op.opcode == OpCode::Label),
@@ -3607,7 +3607,7 @@ mod tests {
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(VectorizingOptimizer::new()));
         let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecMap::new(), 1024);
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::new(), 1024);
         assert!(!result.is_empty());
     }
 
@@ -3635,7 +3635,7 @@ mod tests {
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(VectorizingOptimizer::new()));
         let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecMap::new(), 1024);
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::new(), 1024);
         assert!(result.iter().any(|op| op.opcode == OpCode::Label));
         assert!(result.iter().any(|op| op.opcode == OpCode::Jump));
     }

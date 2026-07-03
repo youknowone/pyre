@@ -17,3 +17,4 @@ test-support = []
 smallvec = { workspace = true }
 serde = { workspace = true }
 vecmap_rs = { workspace = true }
+indexmap = { workspace = true }

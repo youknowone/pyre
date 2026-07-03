@@ -503,9 +503,9 @@ pub struct Optimizer {
 /// constant classes — `Value::Void` panics rather than fabricate a
 /// nonexistent `ConstVoid`.
 pub(crate) fn lower_typed_constants_to_const_pool(
-    constants: &majit_ir::VecMap<u32, majit_ir::Value>,
-) -> majit_ir::VecMap<u32, majit_ir::Const> {
-    let mut pool = majit_ir::VecMap::new();
+    constants: &majit_ir::ConstMap<majit_ir::Value>,
+) -> majit_ir::ConstMap<majit_ir::Const> {
+    let mut pool = majit_ir::ConstMap::new();
     for (&k, v) in constants {
         pool.insert(k, v.to_const());
     }
@@ -533,7 +533,7 @@ fn live_runtime_positions<'a>(ops: impl IntoIterator<Item = &'a Op>) -> Vec<bool
 
 pub(crate) fn sanitize_backend_constants_for_ops<'a>(
     ops: impl IntoIterator<Item = &'a Op>,
-    constants: &mut majit_ir::VecMap<u32, majit_ir::Value>,
+    constants: &mut majit_ir::ConstMap<majit_ir::Value>,
 ) {
     let live_positions = live_runtime_positions(ops);
     constants
@@ -553,7 +553,7 @@ pub(crate) fn sanitize_backend_constants_for_ops<'a>(
 /// `constant_types` side table.
 pub(crate) fn merge_backend_constants_from_ctx(
     ctx: &OptContext,
-    constants: &mut majit_ir::VecMap<u32, majit_ir::Value>,
+    constants: &mut majit_ir::ConstMap<majit_ir::Value>,
 ) {
     let live_positions = live_runtime_positions(ctx.new_operations.iter().map(|rc| rc.as_ref()));
 
@@ -2187,7 +2187,7 @@ impl Optimizer {
     /// Returns the optimized operation list.
     /// optimizer.py:517: propagate_all_forward(trace, call_pure_results, flush)
     pub fn propagate_all_forward(&mut self, ops: &[Op]) -> Vec<Op> {
-        self.optimize_with_constants(ops, &mut majit_ir::VecMap::new())
+        self.optimize_with_constants(ops, &mut majit_ir::ConstMap::new())
     }
 
     /// Run all optimization passes, with known constants pre-populated.
@@ -2203,7 +2203,7 @@ impl Optimizer {
     pub fn optimize_with_constants(
         &mut self,
         ops: &[Op],
-        constants: &mut majit_ir::VecMap<u32, majit_ir::Value>,
+        constants: &mut majit_ir::ConstMap<majit_ir::Value>,
     ) -> Vec<Op> {
         self.optimize_with_constants_and_inputs(ops, constants, 0)
     }
@@ -2219,7 +2219,7 @@ impl Optimizer {
     pub fn optimize_with_constants_and_inputs(
         &mut self,
         ops: &[Op],
-        constants: &mut majit_ir::VecMap<u32, majit_ir::Value>,
+        constants: &mut majit_ir::ConstMap<majit_ir::Value>,
         num_inputs: usize,
     ) -> Vec<Op> {
         // `_at` traffics in `OpRc`; this `&[Op]` overload wraps each op in a
@@ -2251,7 +2251,7 @@ impl Optimizer {
     pub fn optimize_with_constants_and_inputs_oprc(
         &mut self,
         ops: &[majit_ir::OpRc],
-        constants: &mut majit_ir::VecMap<u32, majit_ir::Value>,
+        constants: &mut majit_ir::ConstMap<majit_ir::Value>,
         num_inputs: usize,
     ) -> Result<Vec<majit_ir::OpRc>, crate::optimize::InvalidLoop> {
         self.run_optimize_from_inputs(ops, constants, num_inputs, true)
@@ -2260,7 +2260,7 @@ impl Optimizer {
     pub(crate) fn run_optimize_from_inputs(
         &mut self,
         ops: &[majit_ir::OpRc],
-        constants: &mut majit_ir::VecMap<u32, majit_ir::Value>,
+        constants: &mut majit_ir::ConstMap<majit_ir::Value>,
         num_inputs: usize,
         input_ops_from_ops: bool,
     ) -> Result<Vec<majit_ir::OpRc>, crate::optimize::InvalidLoop> {
@@ -2296,7 +2296,7 @@ impl Optimizer {
     pub fn optimize_with_constants_and_inputs_at(
         &mut self,
         ops: &[majit_ir::OpRc],
-        constants: &mut majit_ir::VecMap<u32, majit_ir::Value>,
+        constants: &mut majit_ir::ConstMap<majit_ir::Value>,
         num_inputs: usize,
         inputarg_base: u32,
         start_next_pos: u32,
@@ -3847,7 +3847,7 @@ impl Optimizer {
     pub(crate) fn optimize_bridge(
         &mut self,
         ops: &[majit_ir::OpRc],
-        constants: &mut majit_ir::VecMap<u32, majit_ir::Value>,
+        constants: &mut majit_ir::ConstMap<majit_ir::Value>,
         num_inputs: usize,
         front_target_tokens: &mut Vec<crate::history::TargetToken>,
         runtime_boxes: &[OpRef],
@@ -5743,7 +5743,7 @@ mod tests {
             ],
         )];
         let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecMap::new(), 1024);
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::new(), 1024);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::IntAdd);
     }
@@ -5765,7 +5765,7 @@ mod tests {
             ],
         )];
         ops[0].pos.set(OpRef::int_op(2));
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecMap::new(), 2);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::new(), 2);
 
         assert_eq!(
             hits.get(),
@@ -5829,7 +5829,7 @@ mod tests {
         let mut opt = Optimizer::default_pipeline();
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecMap::new(), 3);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::new(), 3);
 
         let call_count = result
             .iter()
@@ -6002,7 +6002,7 @@ mod tests {
         let mut opt = Optimizer::default_pipeline();
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecMap::new(), 3);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::new(), 3);
 
         let call_positions: majit_ir::vec_set::VecSet<_> = result
             .iter()
@@ -6049,7 +6049,7 @@ mod tests {
         opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
         let num_inputs = inputs.len();
         let result = opt
-            .optimize_with_constants_and_inputs_oprc(&ops, &mut majit_ir::VecMap::new(), num_inputs)
+            .optimize_with_constants_and_inputs_oprc(&ops, &mut majit_ir::ConstMap::new(), num_inputs)
             .expect("test: unexpected InvalidLoop");
         // The duplicate INT_ADD should be eliminated by CSE (OptPure).
         let add_count = result.iter().filter(|o| o.opcode == OpCode::IntAdd).count();
@@ -6079,7 +6079,7 @@ mod tests {
         ops[1].pos.set(OpRef::int_op(4));
         ops[2].pos.set(OpRef::int_op(5));
         ops[3].pos.set(OpRef::int_op(6));
-        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
         constants.insert(1u32, majit_ir::Value::Int(27));
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3);
 
@@ -6122,7 +6122,7 @@ mod tests {
         ops[1].pos.set(OpRef::int_op(4));
         ops[2].pos.set(OpRef::int_op(5));
         ops[3].pos.set(OpRef::int_op(6));
-        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
         constants.insert(1u32, majit_ir::Value::Int(27));
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3);
 
@@ -6150,7 +6150,7 @@ mod tests {
             ],
         )];
         ops[0].pos.set(OpRef::int_op(3));
-        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
         constants.insert(0u32, majit_ir::Value::Int(40));
         constants.insert(1u32, majit_ir::Value::Int(5));
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3);
@@ -6172,7 +6172,7 @@ mod tests {
             ],
         )];
         ops[0].pos.set(OpRef::int_op(3));
-        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
         constants.insert(0u32, majit_ir::Value::Int(40));
         constants.insert(1u32, majit_ir::Value::Int(5));
         constants.insert(3u32, majit_ir::Value::Int(1));
@@ -6202,7 +6202,7 @@ mod tests {
         ops[0].pos.set(OpRef::int_op(2));
         ops[1].pos.set(OpRef::void_op(3));
 
-        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
 
         assert_eq!(result.len(), 1);
@@ -6248,7 +6248,7 @@ mod tests {
         let num_inputs = inputs.len();
         opt.snapshot_boxes = seed_empty_guard_snapshots_oprc(&ops);
         let result = opt
-            .optimize_with_constants_and_inputs_oprc(&ops, &mut majit_ir::VecMap::new(), num_inputs)
+            .optimize_with_constants_and_inputs_oprc(&ops, &mut majit_ir::ConstMap::new(), num_inputs)
             .expect("test: unexpected InvalidLoop");
         let ctx = OptContext::new(result.len());
         // Just verify the counting methods work
@@ -6273,7 +6273,7 @@ mod tests {
 
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecMap::new(), 0);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::new(), 0);
 
         assert!(
             result.iter().any(|op| op.opcode == OpCode::GuardValue),
@@ -6329,7 +6329,7 @@ mod tests {
         ops[0].pos.set(OpRef::int_op(2));
         ops[1].pos.set(OpRef::void_op(3));
 
-        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
 
         // force_all_lazy_setfields emits lazy SetfieldGc before JUMP.
@@ -6416,7 +6416,7 @@ mod tests {
         ops[0].pos.set(OpRef::int_op(2));
         ops[1].pos.set(OpRef::void_op(3));
 
-        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
 
         for set_op in result.iter().filter(|op| op.opcode == OpCode::SetfieldGc) {
@@ -6476,7 +6476,7 @@ mod tests {
         ops[0].pos.set(OpRef::int_op(2));
         ops[1].pos.set(OpRef::void_op(3));
 
-        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
 
         let new_positions: majit_ir::vec_set::VecSet<_> = result
@@ -6547,7 +6547,7 @@ mod tests {
         }
 
         let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecMap::new(), 1024);
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::new(), 1024);
         let guard = result
             .iter()
             .find(|op| op.opcode == OpCode::GuardTrue)
@@ -6613,7 +6613,7 @@ mod tests {
             &[rooted_resop_operand(Type::Int, 50)],
         )));
 
-        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
         let result = opt
             .optimize_with_constants_and_inputs_at(&[], &mut constants, 3, 0, 0, false)
             .expect("empty trace must not produce InvalidLoop");
@@ -6966,7 +6966,7 @@ mod tests {
         let num_inputs = inputs.len();
         opt.snapshot_boxes = seed_guard_snapshots_with_oprc(&ops, |_| vec![x_ref, y_ref]);
         let result = opt
-            .optimize_with_constants_and_inputs_oprc(&ops, &mut majit_ir::VecMap::new(), num_inputs)
+            .optimize_with_constants_and_inputs_oprc(&ops, &mut majit_ir::ConstMap::new(), num_inputs)
             .expect("test: unexpected InvalidLoop");
 
         let guard = result
