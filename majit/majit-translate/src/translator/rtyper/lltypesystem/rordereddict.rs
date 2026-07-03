@@ -8310,25 +8310,36 @@ impl DictIteratorRepr {
     /// inline tuple allocation, same idiom as
     /// [`crate::translator::rtyper::rtuple::TupleRepr::newtuple_cached`]
     /// reading `hop.r_result`.
-    fn variant_items(&self, hop: &HighLevelOp, v_entries: Hlvalue, v_index: Hlvalue) -> RTypeResult {
+    fn variant_items(
+        &self,
+        hop: &HighLevelOp,
+        v_entries: Hlvalue,
+        v_index: Hlvalue,
+    ) -> RTypeResult {
         let v_key = self
             .variant_keys(hop, v_entries.clone(), v_index.clone())?
             .ok_or_else(|| {
-                TyperError::message("DictIteratorRepr.variant_items: variant_keys produced no value")
+                TyperError::message(
+                    "DictIteratorRepr.variant_items: variant_keys produced no value",
+                )
             })?;
-        let v_value = self.variant_values(hop, v_entries, v_index)?.ok_or_else(|| {
-            TyperError::message("DictIteratorRepr.variant_items: variant_values produced no value")
+        let v_value = self
+            .variant_values(hop, v_entries, v_index)?
+            .ok_or_else(|| {
+                TyperError::message(
+                    "DictIteratorRepr.variant_items: variant_values produced no value",
+                )
+            })?;
+        let r_result = hop.r_result.borrow().clone().ok_or_else(|| {
+            TyperError::message("DictIteratorRepr.variant_items: hop.r_result missing")
         })?;
-        let r_result = hop
-            .r_result
-            .borrow()
-            .clone()
-            .ok_or_else(|| TyperError::message("DictIteratorRepr.variant_items: hop.r_result missing"))?;
         let any_r: &dyn std::any::Any = r_result.as_ref();
         let r_tuple = any_r
             .downcast_ref::<crate::translator::rtyper::rtuple::TupleRepr>()
             .ok_or_else(|| {
-                TyperError::message("DictIteratorRepr.variant_items: hop.r_result is not a TupleRepr")
+                TyperError::message(
+                    "DictIteratorRepr.variant_items: hop.r_result is not a TupleRepr",
+                )
             })?;
         let v_tuple = crate::translator::rtyper::rtuple::TupleRepr::newtuple(
             &mut hop.llops.borrow_mut(),
@@ -8457,7 +8468,9 @@ impl Repr for DictIteratorRepr {
                 GenopResult::LLType(dict_lltype),
             )
             .ok_or_else(|| {
-                TyperError::message("DictIteratorRepr.rtype_next: getfield 'dict' returned no value")
+                TyperError::message(
+                    "DictIteratorRepr.rtype_next: getfield 'dict' returned no value",
+                )
             })?;
         // ENTRIES = DICT.TO.entries ; v_entries = getfield(v_dict, 'entries')
         let v_entries = hop
@@ -8669,8 +8682,9 @@ mod tests {
     fn build_ll_dictiter_helper_mints_dict_and_shifted_index() {
         let dict_lltype = sample_dict_ptr_lltype();
         let iter_lltype = get_ll_dictiter(dict_lltype.clone());
-        let helper = build_ll_dictiter_helper_graph("ll_dictiter", iter_lltype.clone(), dict_lltype)
-            .expect("build_ll_dictiter_helper_graph");
+        let helper =
+            build_ll_dictiter_helper_graph("ll_dictiter", iter_lltype.clone(), dict_lltype)
+                .expect("build_ll_dictiter_helper_graph");
         assert_eq!(helper.func.name, "ll_dictiter");
         let inner = helper.graph.borrow();
 
@@ -8705,7 +8719,9 @@ mod tests {
     fn make_iterator_repr_yields_dictiteratorrepr_and_rejects_reversed_variant() {
         let r_dict = sample_ordered_dict_repr();
 
-        let it = r_dict.make_iterator_repr(&[], false).expect("make_iterator_repr");
+        let it = r_dict
+            .make_iterator_repr(&[], false)
+            .expect("make_iterator_repr");
         assert_eq!(it.class_name(), "DictIteratorRepr");
         assert_eq!(it.repr_class_id(), ReprClassId::DictIteratorRepr);
 
@@ -8775,9 +8791,11 @@ mod tests {
             llops.clone(),
         );
         hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
-        hop.args_s.borrow_mut().push(SomeValue::Dict(
-            crate::annotator::model::SomeDict::new(dictdef),
-        ));
+        hop.args_s
+            .borrow_mut()
+            .push(SomeValue::Dict(crate::annotator::model::SomeDict::new(
+                dictdef,
+            )));
         hop.args_r.borrow_mut().push(Some(r_dict_arc));
 
         let result = iter_repr
@@ -8791,7 +8809,10 @@ mod tests {
             panic!("expected Constant funcptr as direct_call arg 0");
         };
         let dbg = format!("{:?}", c.value);
-        assert!(dbg.contains("ll_dictiter"), "expected 'll_dictiter' in {dbg}");
+        assert!(
+            dbg.contains("ll_dictiter"),
+            "expected 'll_dictiter' in {dbg}"
+        );
     }
 
     /// `next(iter)` rtypes through `DictIteratorRepr::rtype_next`
@@ -9341,9 +9362,14 @@ mod tests {
     #[test]
     fn ll_dict_lookup_surface_builds_lookup_graph() {
         let (dict_ptr, entries_ptr, key_lltype) = sample_dict_lookup_lltypes();
-        let helper =
-            ll_dict_lookup(dict_ptr, entries_ptr, LowLevelType::Unsigned, key_lltype, None)
-                .expect("ll_dict_lookup");
+        let helper = ll_dict_lookup(
+            dict_ptr,
+            entries_ptr,
+            LowLevelType::Unsigned,
+            key_lltype,
+            None,
+        )
+        .expect("ll_dict_lookup");
         assert_eq!(helper.func.name, "ll_dict_lookup");
     }
 

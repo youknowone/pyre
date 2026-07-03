@@ -54,6 +54,24 @@ def test_slice():
 test_slice()
 
 
+def test_compare_buffer_exporters():
+    # A memoryview compares equal to any operand exporting the same
+    # contiguous bytes, not just another memoryview or a bytes-like object:
+    # array.array is a non-bytes contiguous exporter.
+    m = memoryview(b"abc")
+    assert m == array.array("b", [97, 98, 99])
+    assert not (m != array.array("b", [97, 98, 99]))
+    assert m != array.array("b", [97, 98, 100])
+    assert m == memoryview(array.array("b", [97, 98, 99]))
+    # A non-buffer operand yields NotImplemented, so the comparison falls
+    # through to identity (never equal, never raises).
+    assert m != 123
+    assert m != "abc"
+
+
+test_compare_buffer_exporters()
+
+
 def test_resizable():
     # PyPy has no export lock: descr_releasebuffer is a no-op and bytearray
     # mutators never check exports, so resizing a bytearray while a memoryview

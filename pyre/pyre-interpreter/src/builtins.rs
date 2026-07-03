@@ -1233,9 +1233,12 @@ fn memoryview_exit(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     memoryview_release(&args[..1])
 }
 
-/// The raw logical bytes (`view.as_str`) of a memoryview-or-bytes-like
-/// operand, or `None` when it is neither (so `__eq__` returns
-/// NotImplemented).  `descr__cmp` compares the two `as_str` byte strings.
+/// The raw logical bytes (`view.as_str`) of an operand that exports a
+/// contiguous buffer, or `None` when it exports none (so `__eq__` returns
+/// NotImplemented).  `descr__cmp` compares the two `as_str` byte strings,
+/// mirroring `space.buffer_w(w_other, space.BUF_CONTIG_RO)`: a memoryview,
+/// a bytes-like object, or a non-bytes contiguous exporter (`array.array`)
+/// are all gathered to bytes and compared.
 unsafe fn memoryview_operand_bytes(obj: PyObjectRef) -> Option<Vec<u8>> {
     unsafe {
         if pyre_object::memoryview::is_w_memoryview(obj) {
@@ -1249,9 +1252,6 @@ unsafe fn memoryview_operand_bytes(obj: PyObjectRef) -> Option<Vec<u8>> {
         if pyre_object::bytesobject::is_bytes_like(obj) {
             return Some(pyre_object::bytesobject::bytes_like_data(obj).to_vec());
         }
-        // `memory_richcompare` acquires any contiguous buffer of the operand
-        // (`space.buffer_w(w_other, BUF_CONTIG_RO)`), so an `array` compares by
-        // its element bytes too; a non-buffer operand yields NotImplemented.
         if let Ok(Some(b)) = crate::typedef::buffer_as_bytes_like(obj) {
             return Some(pyre_object::bytesobject::bytes_like_data(b).to_vec());
         }
