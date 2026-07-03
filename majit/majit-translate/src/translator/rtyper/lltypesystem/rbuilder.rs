@@ -606,6 +606,154 @@ pub fn build_ll_shrink_final_helper_graph(
     ))
 }
 
+/// Synthesise `ll_build(ll_builder)` (`rbuilder.py:356-363`):
+///
+/// ```python
+/// if ll_builder.extra_pieces:
+///     ll_fold_pieces(ll_builder)
+/// elif ll_builder.current_pos != ll_builder.total_size:
+///     ll_shrink_final(ll_builder)
+/// return ll_builder.current_buf
+/// ```
+///
+/// `ll_fold_pieces` / `ll_shrink_final` are baked in as `direct_call`
+/// callee consts. The three arms merge into a returnblock-feeding tail
+/// that reads `current_buf` (`buf_lltype` = `STRPTR`/`UNICODEPTR`).
+pub fn build_ll_build_helper_graph(
+    name: &str,
+    builder_ptr_lltype: LowLevelType,
+    buf_lltype: LowLevelType,
+    fold_pieces_fn: Constant,
+    shrink_final_fn: Constant,
+) -> Result<PyGraph, TyperError> {
+    let bool_case = |b: bool| Some(constant_with_lltype(ConstValue::Bool(b), LowLevelType::Bool));
+    let void_call_result = || variable_with_lltype("v", LowLevelType::Void);
+
+    let ll_builder = variable_with_lltype("ll_builder", builder_ptr_lltype.clone());
+    let startblock = Block::shared(vec![Hlvalue::Variable(ll_builder.clone())]);
+    let return_var = variable_with_lltype("result", buf_lltype.clone());
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    // Tail merge block: return ll_builder.current_buf.
+    let llb_ret = variable_with_lltype("ll_builder", builder_ptr_lltype.clone());
+    let block_ret = Block::shared(vec![Hlvalue::Variable(llb_ret.clone())]);
+    let buf = variable_with_lltype("buf", buf_lltype);
+    block_ret.borrow_mut().operations.push(SpaceOperation::new(
+        "getfield",
+        vec![
+            Hlvalue::Variable(llb_ret),
+            void_field_const("current_buf"),
+        ],
+        Hlvalue::Variable(buf.clone()),
+    ));
+    block_ret.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(buf)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    // fold arm: ll_fold_pieces(ll_builder).
+    let llb_fold = variable_with_lltype("ll_builder", builder_ptr_lltype.clone());
+    let block_fold = Block::shared(vec![Hlvalue::Variable(llb_fold.clone())]);
+    block_fold.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![Hlvalue::Constant(fold_pieces_fn), Hlvalue::Variable(llb_fold.clone())],
+        Hlvalue::Variable(void_call_result()),
+    ));
+    block_fold.closeblock(vec![
+        Link::new(vec![Hlvalue::Variable(llb_fold)], Some(block_ret.clone()), None).into_ref(),
+    ]);
+
+    // shrink arm: ll_shrink_final(ll_builder).
+    let llb_shrink = variable_with_lltype("ll_builder", builder_ptr_lltype.clone());
+    let block_shrink = Block::shared(vec![Hlvalue::Variable(llb_shrink.clone())]);
+    block_shrink.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![Hlvalue::Constant(shrink_final_fn), Hlvalue::Variable(llb_shrink.clone())],
+        Hlvalue::Variable(void_call_result()),
+    ));
+    block_shrink.closeblock(vec![
+        Link::new(vec![Hlvalue::Variable(llb_shrink)], Some(block_ret.clone()), None).into_ref(),
+    ]);
+
+    // elif block: current_pos != total_size.
+    let llb_elif = variable_with_lltype("ll_builder", builder_ptr_lltype);
+    let block_elif = Block::shared(vec![Hlvalue::Variable(llb_elif.clone())]);
+    let pos = variable_with_lltype("current_pos", LowLevelType::Signed);
+    block_elif.borrow_mut().operations.push(SpaceOperation::new(
+        "getfield",
+        vec![Hlvalue::Variable(llb_elif.clone()), void_field_const("current_pos")],
+        Hlvalue::Variable(pos.clone()),
+    ));
+    let tot = variable_with_lltype("total_size", LowLevelType::Signed);
+    block_elif.borrow_mut().operations.push(SpaceOperation::new(
+        "getfield",
+        vec![Hlvalue::Variable(llb_elif.clone()), void_field_const("total_size")],
+        Hlvalue::Variable(tot.clone()),
+    ));
+    let needs_shrink = variable_with_lltype("needs_shrink", LowLevelType::Bool);
+    block_elif.borrow_mut().operations.push(SpaceOperation::new(
+        "int_ne",
+        vec![Hlvalue::Variable(pos), Hlvalue::Variable(tot)],
+        Hlvalue::Variable(needs_shrink.clone()),
+    ));
+    block_elif.borrow_mut().exitswitch = Some(Hlvalue::Variable(needs_shrink));
+    block_elif.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(llb_elif.clone())],
+            Some(block_shrink),
+            bool_case(true),
+        )
+        .into_ref(),
+        Link::new(vec![Hlvalue::Variable(llb_elif)], Some(block_ret), bool_case(false)).into_ref(),
+    ]);
+
+    // start block: if ll_builder.extra_pieces.
+    let extra = variable_with_lltype("extra", STRINGPIECEPTR.clone());
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "getfield",
+        vec![
+            Hlvalue::Variable(ll_builder.clone()),
+            void_field_const("extra_pieces"),
+        ],
+        Hlvalue::Variable(extra.clone()),
+    ));
+    let has_extra = variable_with_lltype("has_extra", LowLevelType::Bool);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "ptr_nonzero",
+        vec![Hlvalue::Variable(extra)],
+        Hlvalue::Variable(has_extra.clone()),
+    ));
+    startblock.borrow_mut().exitswitch = Some(Hlvalue::Variable(has_extra));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(ll_builder.clone())],
+            Some(block_fold),
+            bool_case(true),
+        )
+        .into_ref(),
+        Link::new(vec![Hlvalue::Variable(ll_builder)], Some(block_elif), bool_case(false)).into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["ll_builder".to_string()],
+        func,
+    ))
+}
+
 /// RPython `class BaseStringBuilderRepr(AbstractStringBuilderRepr)`.
 #[derive(Debug, Default)]
 pub struct BaseStringBuilderRepr;
@@ -871,6 +1019,65 @@ mod tests {
             panic!("returnblock inputarg must be a Variable");
         };
         assert_eq!(ret.concretetype.borrow().clone(), Some(LowLevelType::Void));
+    }
+
+    #[test]
+    fn build_ll_build_branches_extra_then_shrink_and_returns_current_buf() {
+        use super::Hlvalue;
+        let helper = super::build_ll_build_helper_graph(
+            "ll_build",
+            super::STRINGBUILDERPTR.clone(),
+            super::STRPTR.clone(),
+            dummy_funcptr_const(),
+            dummy_funcptr_const(),
+        )
+        .expect("build_ll_build_helper_graph");
+        assert_eq!(helper.func.name, "ll_build");
+        let inner = helper.graph.borrow();
+
+        // start: getfield extra_pieces; ptr_nonzero; 2-way branch.
+        let startblock = inner.startblock.borrow();
+        let start_ops: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|o| o.opname.as_str())
+            .collect();
+        assert_eq!(start_ops, vec!["getfield", "ptr_nonzero"]);
+        assert_eq!(startblock.exits.len(), 2);
+        drop(startblock);
+
+        // Walk every reachable block, tallying op frequencies.
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![inner.startblock.clone()];
+        let mut all_ops: Vec<String> = Vec::new();
+        let mut count = 0usize;
+        while let Some(b) = stack.pop() {
+            if !seen.insert(std::rc::Rc::as_ptr(&b) as usize) {
+                continue;
+            }
+            count += 1;
+            let bb = b.borrow();
+            for op in &bb.operations {
+                all_ops.push(op.opname.clone());
+            }
+            for link in &bb.exits {
+                if let Some(t) = link.borrow().target.clone() {
+                    stack.push(t);
+                }
+            }
+        }
+        // start, fold, elif, shrink, ret, returnblock
+        assert_eq!(count, 6);
+        let n = |name: &str| all_ops.iter().filter(|o| o.as_str() == name).count();
+        assert_eq!(n("getfield"), 4); // extra_pieces, current_pos, total_size, current_buf
+        assert_eq!(n("ptr_nonzero"), 1);
+        assert_eq!(n("int_ne"), 1);
+        assert_eq!(n("direct_call"), 2); // fold + shrink arms
+
+        let Hlvalue::Variable(ret) = &inner.returnblock.borrow().inputargs[0] else {
+            panic!("returnblock inputarg must be a Variable");
+        };
+        assert_eq!(ret.concretetype.borrow().clone(), Some(super::STRPTR.clone()));
     }
 
     #[test]
