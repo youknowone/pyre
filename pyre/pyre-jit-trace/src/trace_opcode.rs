@@ -7178,26 +7178,39 @@ impl MIFrame {
         // range_iter_continues errors for a non-range iterator, aborting the
         // trace.
         let concrete_continues = range_iter_continues(concrete_iter)?;
-        let concrete_step = unsafe {
-            (*(concrete_iter as *const pyre_object::functional::W_IntRangeIterator)).step
-        };
-        let concrete_current = unsafe {
-            (*(concrete_iter as *const pyre_object::functional::W_IntRangeIterator)).current
-        };
-
-        // Delegate to auto-generated function (RPython jitcode parity:
-        // getfield(current/remaining/step) → remaining guard →
-        // int_add_ovf → guard_no_overflow → setfield current/remaining).
-        let gen_result: Option<(OpRef, i64)> = self.with_ctx(|this, ctx| {
-            Ok::<_, PyError>(crate::generated_iter_next_value(
-                this,
-                ctx,
-                iter,
-                concrete_continues,
-                concrete_step,
-                concrete_current,
-            ))
-        })?;
+        // The inline field path reads the scalar current/remaining/step layout
+        // of `W_IntRangeIterator` and emits `guard_range_iter`. Only an
+        // int-range iterator has that layout — a long-range iterator carries
+        // wrapped bigint fields and a sequence iterator carries seq/index — so
+        // reading those offsets off a non-range iterator yields garbage and the
+        // class guard would only ever deopt. Gate the inline path on
+        // `is_range_iter`; long-range and seq iterators fall through to the
+        // residual `trace_iter_next_value` (`jit_range_iter_next_or_null`
+        // dispatches range / long-range / seq correctly at runtime).
+        let gen_result: Option<(OpRef, i64)> =
+            if unsafe { pyre_object::functional::is_range_iter(concrete_iter) } {
+                let concrete_step = unsafe {
+                    (*(concrete_iter as *const pyre_object::functional::W_IntRangeIterator)).step
+                };
+                let concrete_current = unsafe {
+                    (*(concrete_iter as *const pyre_object::functional::W_IntRangeIterator)).current
+                };
+                // Delegate to auto-generated function (RPython jitcode parity:
+                // getfield(current/remaining/step) → remaining guard →
+                // int_add_ovf → guard_no_overflow → setfield current/remaining).
+                self.with_ctx(|this, ctx| {
+                    Ok::<_, PyError>(crate::generated_iter_next_value(
+                        this,
+                        ctx,
+                        iter,
+                        concrete_continues,
+                        concrete_step,
+                        concrete_current,
+                    ))
+                })?
+            } else {
+                None
+            };
         let next = if let Some((opref, cv)) = gen_result {
             FrontendOp::new(opref, ConcreteValue::Int(cv))
         } else {
