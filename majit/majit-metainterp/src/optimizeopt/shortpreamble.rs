@@ -2108,10 +2108,13 @@ impl AbstractShortPreambleBuilderState {
             // pass; otherwise append the arg (the dep replay op itself)
             // and consume the marker.
             let Some(dep) = arg.bound_op() else { continue };
-            if matches!(&*dep.forwarded.borrow(), majit_ir::box_ref::Forwarded::None) {
+            if matches!(
+                &*dep.forwarded.borrow(),
+                majit_ir::forwarding::Forwarded::None
+            ) {
                 continue;
             }
-            *dep.forwarded.borrow_mut() = majit_ir::box_ref::Forwarded::None;
+            *dep.forwarded.borrow_mut() = majit_ir::forwarding::Forwarded::None;
             let dep_canonical = dep.pos.get();
             if !self.short_results.contains(&dep_canonical)
                 && !already_in_short.contains(&dep_canonical)
@@ -2137,7 +2140,7 @@ impl AbstractShortPreambleBuilderState {
         // shortpreamble.py:401-402: `info = preamble_op.get_forwarded();
         // preamble_op.set_forwarded(None)` — consume the own marker so a
         // later consumer's arg walk doesn't re-append this op.
-        *preamble_op.forwarded.borrow_mut() = majit_ir::box_ref::Forwarded::None;
+        *preamble_op.forwarded.borrow_mut() = majit_ir::forwarding::Forwarded::None;
         // shortpreamble.py:405-406: info.make_guards(preamble_op, self.short, optimizer)
         self.short
             .extend(result_guards.iter().cloned().map(std::rc::Rc::new));
@@ -2247,7 +2250,7 @@ impl ShortPreambleBuilder {
             // (mod.rs guard), so the marker is unambiguous; Op::clone
             // resets `forwarded`, so built ShortPreamble copies never
             // carry it.
-            *v.preamble_op.forwarded.borrow_mut() = majit_ir::box_ref::Forwarded::Info(
+            *v.preamble_op.forwarded.borrow_mut() = majit_ir::forwarding::Forwarded::Info(
                 crate::optimizeopt::info::OpInfo::EmptyInfo(crate::optimizeopt::info::EmptyInfo),
             );
             // Const res boxes are ptr-unstable (minted fresh per resolution),

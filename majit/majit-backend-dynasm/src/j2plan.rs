@@ -636,7 +636,7 @@ mod tests {
 
     use super::{GuardKind, IntBinKind, IntCmpKind, LirOp, TracePlan};
 
-    use majit_ir::box_ref::bound_operand_from_opref as rb;
+    use majit_ir::forwarding::bound_operand_from_opref as rb;
 
     #[test]
     fn lowers_simple_integer_loop_shape() {

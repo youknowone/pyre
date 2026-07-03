@@ -3476,7 +3476,7 @@ mod tests {
         );
     }
 
-    use majit_ir::box_ref::bound_operand_from_opref as rb;
+    use majit_ir::forwarding::bound_operand_from_opref as rb;
 
     #[derive(Debug)]
     struct TestCallAssemblerDescr {

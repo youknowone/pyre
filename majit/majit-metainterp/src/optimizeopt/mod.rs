@@ -1968,7 +1968,7 @@ impl OptContext {
                 // `op`. Mirrors `emit`'s live-synthetic catch-up so a
                 // supersession chain (stand-in → extra-producer → emitted op)
                 // stays transitively resolvable to the final producer.
-                use majit_ir::box_ref::ForwardingHost;
+                use majit_ir::forwarding::ForwardingHost;
                 superseded.set_forwarded_op(op);
             }
         }
@@ -1984,12 +1984,12 @@ impl OptContext {
     /// permanently `None`), `None` for sentinel `OpRef::none()` and
     /// for ResOp positions whose producer is not in any canonical
     /// store (`new_operations` / `phase1_emit_ops` / `resop_refs`).
-    pub(crate) fn read_forwarded(&self, opref: OpRef) -> Option<majit_ir::box_ref::Forwarded> {
+    pub(crate) fn read_forwarded(&self, opref: OpRef) -> Option<majit_ir::forwarding::Forwarded> {
         if opref.is_none() {
             return None;
         }
         if opref.is_constant() {
-            return Some(majit_ir::box_ref::Forwarded::None);
+            return Some(majit_ir::forwarding::Forwarded::None);
         }
         match opref {
             OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) => {
@@ -2054,12 +2054,12 @@ impl OptContext {
             OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) => {
                 let idx = opref.raw() as usize;
                 if let Some(ia) = self.inputarg_refs.get(idx) {
-                    *ia.forwarded.borrow_mut() = majit_ir::box_ref::Forwarded::None;
+                    *ia.forwarded.borrow_mut() = majit_ir::forwarding::Forwarded::None;
                 }
             }
             _ => {
                 if let Some(op) = self.find_producer_op(opref) {
-                    *op.forwarded.borrow_mut() = majit_ir::box_ref::Forwarded::None;
+                    *op.forwarded.borrow_mut() = majit_ir::forwarding::Forwarded::None;
                 }
             }
         }
@@ -2575,7 +2575,7 @@ impl OptContext {
     /// The position-keyed replacement for the retired
     /// `box_pool.get_at_position(raw)` const probe in `allocate_next_pos_raw`.
     fn position_is_const_forwarded(&self, raw: u32) -> bool {
-        use majit_ir::box_ref::Forwarded;
+        use majit_ir::forwarding::Forwarded;
         let idx = raw as usize;
         // `resop_refs` is keyed by the full type-tagged `OpRef`; a raw `u32`
         // can host more than one entry (typed vs untyped). Any host at this
@@ -2828,7 +2828,7 @@ impl OptContext {
             // `live_synthetics`), so its `Weak` upgrades and the chain reaches
             // `op_rc`.
             if !std::rc::Rc::ptr_eq(&synth, &op_rc) {
-                use majit_ir::box_ref::ForwardingHost;
+                use majit_ir::forwarding::ForwardingHost;
                 synth.set_forwarded_op(&op_rc);
             }
         }
@@ -3545,16 +3545,16 @@ impl OptContext {
             let forwarded = ctx.read_forwarded(arg)?;
             use crate::optimizeopt::info::OpInfo;
             match &forwarded {
-                majit_ir::box_ref::Forwarded::Info(OpInfo::EmptyInfo(_)) => {
+                majit_ir::forwarding::Forwarded::Info(OpInfo::EmptyInfo(_)) => {
                     Some(ForwardedInfo::Empty)
                 }
-                majit_ir::box_ref::Forwarded::Info(OpInfo::Ptr(info)) => {
+                majit_ir::forwarding::Forwarded::Info(OpInfo::Ptr(info)) => {
                     Some(ForwardedInfo::Ptr(info.borrow().clone()))
                 }
-                majit_ir::box_ref::Forwarded::Info(OpInfo::IntBound(b)) => {
+                majit_ir::forwarding::Forwarded::Info(OpInfo::IntBound(b)) => {
                     Some(ForwardedInfo::Int(b.borrow().clone()))
                 }
-                majit_ir::box_ref::Forwarded::Info(OpInfo::FloatConstInfo(f)) => {
+                majit_ir::forwarding::Forwarded::Info(OpInfo::FloatConstInfo(f)) => {
                     Some(ForwardedInfo::FloatConst(f.getconst()))
                 }
                 _ => None,
@@ -3727,20 +3727,22 @@ impl OptContext {
         let result = {
             let fwd = self.read_forwarded(source)?;
             match &fwd {
-                majit_ir::box_ref::Forwarded::Info(OpInfo::EmptyInfo(e)) => {
+                majit_ir::forwarding::Forwarded::Info(OpInfo::EmptyInfo(e)) => {
                     Some(OpInfo::EmptyInfo(*e))
                 }
-                majit_ir::box_ref::Forwarded::Info(OpInfo::Ptr(p)) => Some(OpInfo::Ptr(p.clone())),
-                majit_ir::box_ref::Forwarded::Info(OpInfo::IntBound(ib)) => {
+                majit_ir::forwarding::Forwarded::Info(OpInfo::Ptr(p)) => {
+                    Some(OpInfo::Ptr(p.clone()))
+                }
+                majit_ir::forwarding::Forwarded::Info(OpInfo::IntBound(ib)) => {
                     Some(OpInfo::IntBound(ib.clone()))
                 }
                 // info.py:851 FloatConstInfo planted via
                 // `set_preamble_forwarded_info` (shortpreamble.py:416
                 // `preamble_op.set_forwarded(info)`).
-                majit_ir::box_ref::Forwarded::Info(OpInfo::FloatConstInfo(f)) => {
+                majit_ir::forwarding::Forwarded::Info(OpInfo::FloatConstInfo(f)) => {
                     Some(OpInfo::FloatConstInfo(*f))
                 }
-                majit_ir::box_ref::Forwarded::Const(c) => {
+                majit_ir::forwarding::Forwarded::Const(c) => {
                     // optimizer.py:329-338 `getinfo` parity for the Const
                     // terminal — Refs surface as `ConstPtrInfo`, Floats as
                     // `FloatConstInfo`, Ints as `IntBound::from_constant`.
@@ -4277,7 +4279,7 @@ impl OptContext {
         // optimizer.py:393 opinfo = op.get_forwarded()
         use crate::optimizeopt::info::OpInfo;
         let info_to_transfer: Option<OpInfo> = match &op.get_forwarded() {
-            majit_ir::box_ref::Forwarded::Info(
+            majit_ir::forwarding::Forwarded::Info(
                 opinfo @ (OpInfo::Ptr(_) | OpInfo::IntBound(_) | OpInfo::FloatConstInfo(_)),
             ) => Some(opinfo.clone()),
             _ => None,
@@ -4798,7 +4800,7 @@ impl OptContext {
         if arg.bound_op().is_none() {
             return;
         }
-        if !matches!(arg.get_forwarded(), majit_ir::box_ref::Forwarded::None) {
+        if !matches!(arg.get_forwarded(), majit_ir::forwarding::Forwarded::None) {
             return;
         }
         let Some(canon) = self.get_box_replacement_operand_opt(arg.to_opref()) else {
@@ -5041,7 +5043,7 @@ impl OptContext {
         }
         // `resoperation.py:235 _forwarded = None` — slot is None until
         // `set_forwarded` writes. `op.get_forwarded() is not None`.
-        !matches!(op.get_forwarded(), majit_ir::box_ref::Forwarded::None)
+        !matches!(op.get_forwarded(), majit_ir::forwarding::Forwarded::None)
     }
 
     /// True only when opref has a non-const forwarding redirect.
@@ -5062,7 +5064,7 @@ impl OptContext {
         }
         matches!(
             &op.get_forwarded(),
-            majit_ir::box_ref::Forwarded::Op(_) | majit_ir::box_ref::Forwarded::InputArg(_)
+            majit_ir::forwarding::Forwarded::Op(_) | majit_ir::forwarding::Forwarded::InputArg(_)
         )
     }
 
@@ -5102,7 +5104,7 @@ impl OptContext {
         } else {
             // optimizer.py:432 `box.set_forwarded(constbox)`, gated on
             // `Forwarded::None` per the no-clobber rule documented above.
-            if matches!(box_.get_forwarded(), majit_ir::box_ref::Forwarded::None) {
+            if matches!(box_.get_forwarded(), majit_ir::forwarding::Forwarded::None) {
                 box_.set_forwarded_const(majit_ir::Const::from_value(value));
             }
         }
@@ -5190,10 +5192,10 @@ impl OptContext {
             ));
         }
         match &resolved.get_forwarded() {
-            majit_ir::box_ref::Forwarded::Info(OpInfo::IntBound(rc)) => {
+            majit_ir::forwarding::Forwarded::Info(OpInfo::IntBound(rc)) => {
                 return IntBoundHandle::live(std::rc::Rc::clone(rc));
             }
-            majit_ir::box_ref::Forwarded::None => {}
+            majit_ir::forwarding::Forwarded::None => {}
             _ => {
                 return IntBoundHandle::const_(crate::optimizeopt::intutils::IntBound::unbounded());
             }
@@ -5254,7 +5256,7 @@ impl OptContext {
         // When cur is a non-None non-IntBound (e.g. RawBufferPtrInfo on a
         // raw-pointer Int), upstream's outer `if cur is not None` already
         // consumed control; the else branch only runs when cur is None.
-        use majit_ir::box_ref::Forwarded as BoxFwd;
+        use majit_ir::forwarding::Forwarded as BoxFwd;
         if matches!(op.get_forwarded(), BoxFwd::None) {
             op.set_forwarded_info(OpInfo::int_bound(bound.clone()));
         }
@@ -5285,7 +5287,7 @@ impl OptContext {
         F: FnOnce(&mut crate::optimizeopt::intutils::IntBound) -> R,
     {
         use crate::optimizeopt::info::OpInfo;
-        use majit_ir::box_ref::Forwarded;
+        use majit_ir::forwarding::Forwarded;
         // optimizer.py:99-100: assert op.type == 'i'. Active in release
         // builds per upstream. Void-typed phantoms (`materialize_operand_at` lazy-alloc)
         // are accepted because they are placeholder boxes pending recorder
@@ -5600,7 +5602,7 @@ impl OptContext {
     /// precedence over the box's own observed value.
     ///
     /// `None` for an own slot that carries no value: pyre's value slots are
-    /// `Option<Value>` (resoperation.rs / box_ref.rs) where RPython's are
+    /// `Option<Value>` (resoperation.rs / forwarding.rs) where RPython's are
     /// `_resint=0` / `_resref=NULL` defaults, so an unobserved box reads as
     /// `None` here. Callers (`runtime_nonnull`, IntBounded, `runtime_cls_of`,
     /// `get_runtime_field`) treat `None` as "no runtime guidance" and refuse
@@ -7000,7 +7002,7 @@ impl OptContext {
     /// mutation) use `.same_info()` / `.borrow()` / `.borrow_mut()`.
     pub fn getrawptrinfo_handle(&self, op: &Operand) -> Option<PtrInfoHandle> {
         use crate::optimizeopt::info::OpInfo;
-        use majit_ir::box_ref::Forwarded;
+        use majit_ir::forwarding::Forwarded;
         // info.py:867 — `assert op.type == 'i'`.
         debug_assert_eq!(
             op.type_(),
@@ -7041,13 +7043,13 @@ impl OptContext {
                 std::mem::discriminant(other),
             ),
             // Terminal of `get_box_replacement(false)` can only be `None`
-            // or `Info(_)` per the chain walker (box_ref.rs:295-322); a
+            // or `Info(_)` per the chain walker (forwarding.rs); a
             // `Forwarded::Const` terminal is materialized inline by the
             // walker into a fresh operand whose own slot is None.
             Forwarded::Const(_) | Forwarded::Op(_) | Forwarded::InputArg(_) => {
                 unreachable!(
                     "getrawptrinfo: chain terminal must not carry Forwarded::Const \
-                 (box_ref.rs:295 get_box_replacement walker invariant)",
+                 (forwarding.rs get_box_replacement walker invariant)",
                 )
             }
         }
@@ -7086,7 +7088,7 @@ impl OptContext {
     /// See `getrawptrinfo_handle` for the variant semantics.
     pub fn getptrinfo_handle(&self, op: &Operand) -> Option<PtrInfoHandle> {
         use crate::optimizeopt::info::OpInfo;
-        use majit_ir::box_ref::Forwarded;
+        use majit_ir::forwarding::Forwarded;
         match op.type_() {
             // info.py:881-882 — `if op.type == 'i': return getrawptrinfo(op)`.
             majit_ir::Type::Int => return self.getrawptrinfo_handle(op),
@@ -7129,13 +7131,13 @@ impl OptContext {
                 std::mem::discriminant(other),
             ),
             // Terminal of `get_box_replacement(false)` can only be `None`
-            // or `Info(_)` per the chain walker (box_ref.rs:295-322); a
+            // or `Info(_)` per the chain walker (forwarding.rs); a
             // `Forwarded::Const` terminal is materialized inline by the
             // walker into a fresh operand whose own slot is None.
             Forwarded::Const(_) | Forwarded::Op(_) | Forwarded::InputArg(_) => {
                 unreachable!(
                     "getptrinfo: chain terminal must not carry Forwarded::Const \
-                 (box_ref.rs:295 get_box_replacement walker invariant)",
+                 (forwarding.rs get_box_replacement walker invariant)",
                 )
             }
         }
@@ -7558,7 +7560,7 @@ impl OptContext {
     /// the method take `&self`).
     pub fn getnullness(&self, op: &Operand) -> i8 {
         use crate::optimizeopt::info::OpInfo;
-        use majit_ir::box_ref::Forwarded;
+        use majit_ir::forwarding::Forwarded;
         // optimizer.py:128: if op.type == 'r' or self.is_raw_ptr(op):
         //
         // `Box.type` is intrinsic in upstream — never Void. In pyre,
@@ -7680,7 +7682,7 @@ impl OptContext {
             return;
         }
         let b = self.materialize_operand_at(terminal);
-        let already_set = !matches!(b.get_forwarded(), majit_ir::box_ref::Forwarded::None);
+        let already_set = !matches!(b.get_forwarded(), majit_ir::forwarding::Forwarded::None);
         if !already_set {
             b.set_forwarded_info(OpInfo::ptr(info));
         }
@@ -7987,7 +7989,7 @@ impl OptContext {
         // forwarded slot is either `Forwarded::None` or `Forwarded::Info(_)`
         // (Box variants are consumed during walk). The skip condition maps
         // directly to "Info present".
-        if matches!(op.get_forwarded(), majit_ir::box_ref::Forwarded::Info(_)) {
+        if matches!(op.get_forwarded(), majit_ir::forwarding::Forwarded::Info(_)) {
             return;
         }
         // optimizer.py:451: op.set_forwarded(info.NonNullPtrInfo())
@@ -8335,7 +8337,7 @@ impl OptContext {
     /// Used by force_box to mutate info in-place (RPython parity).
     pub fn take_ptr_info(&self, op: &Operand) -> Option<PtrInfo> {
         use crate::optimizeopt::info::OpInfo;
-        use majit_ir::box_ref::Forwarded;
+        use majit_ir::forwarding::Forwarded;
         let resolved = op.get_box_replacement(false);
         // Read terminal's `_forwarded` slot; clone the PtrInfo (if any),
         // drop the Ref borrow, then clear the slot via interior
@@ -8478,7 +8480,7 @@ mod boxref_forwarding_tests {
     use crate::history::test_support::{bound_inputarg_operand, bound_resop_operand};
     use crate::optimizeopt::info::{OpInfo, PtrInfo};
     use crate::optimizeopt::intutils::IntBound;
-    use majit_ir::box_ref::Forwarded as BoxForwarded;
+    use majit_ir::forwarding::Forwarded as BoxForwarded;
     use majit_ir::{InputArgRc, OpRef, Type, Value};
 
     fn ctx_with_two_int_boxes() -> (OptContext, Operand, Operand, Vec<InputArgRc>) {
@@ -9531,7 +9533,7 @@ mod boxref_forwarding_tests {
         old_box.clear_forwarded();
         assert!(matches!(
             &old_box.get_forwarded(),
-            majit_ir::box_ref::Forwarded::None,
+            majit_ir::forwarding::Forwarded::None,
         ));
     }
 

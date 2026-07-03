@@ -85,14 +85,14 @@ fn is_trace_runtime_ref(opref: OpRef, constants: &majit_ir::VecMap<u32, majit_ir
 /// (`PtrInfo::Instance.known_class` is an immortal vtable integer, not a
 /// traced ref, so it is not rooted.)
 fn root_forwarded_gcref(
-    forwarded: &majit_ir::box_ref::Forwarded,
+    forwarded: &majit_ir::forwarding::Forwarded,
     info_constant_field: ExportedGcRefField,
     const_ref_field: ExportedGcRefField,
     dummy_key: Operand,
     rooted_refs: &mut Vec<(Operand, ExportedGcRefField, usize)>,
 ) {
     use crate::optimizeopt::info::{OpInfo, PtrInfo};
-    if let majit_ir::box_ref::Forwarded::Info(OpInfo::Ptr(rc)) = forwarded {
+    if let majit_ir::forwarding::Forwarded::Info(OpInfo::Ptr(rc)) = forwarded {
         let info = rc.borrow();
         match &*info {
             PtrInfo::Constant(gcref) if !gcref.is_null() => {
@@ -103,7 +103,7 @@ fn root_forwarded_gcref(
             // (ConstInt), never a traced ref — no rooting needed.
             _ => {}
         }
-    } else if let majit_ir::box_ref::Forwarded::Const(majit_ir::Const::Ref(gcref)) = forwarded
+    } else if let majit_ir::forwarding::Forwarded::Const(majit_ir::Const::Ref(gcref)) = forwarded
         && !gcref.is_null()
     {
         let ss_idx = majit_gc::shadow_stack::push(*gcref);
@@ -116,12 +116,12 @@ fn root_forwarded_gcref(
 /// post-GC GcRef. Matches PyPy `_forwarded` Python object reference
 /// semantics — the cell stays, only its content updates.
 fn refresh_forwarded_ptrinfo_constant(
-    forwarded: &std::cell::RefCell<majit_ir::box_ref::Forwarded>,
+    forwarded: &std::cell::RefCell<majit_ir::forwarding::Forwarded>,
     updated: majit_ir::GcRef,
 ) {
     use crate::optimizeopt::info::{OpInfo, PtrInfo};
     let rc = match &*forwarded.borrow() {
-        majit_ir::box_ref::Forwarded::Info(OpInfo::Ptr(rc))
+        majit_ir::forwarding::Forwarded::Info(OpInfo::Ptr(rc))
             if matches!(&*rc.borrow(), PtrInfo::Constant(_)) =>
         {
             Some(rc.clone())
@@ -137,16 +137,16 @@ fn refresh_forwarded_ptrinfo_constant(
 /// post-GC GcRef. Matches PyPy `_forwarded` Python object reference
 /// semantics — the chain terminal stays a Const, only its GcRef updates.
 fn refresh_forwarded_const_ref(
-    forwarded: &std::cell::RefCell<majit_ir::box_ref::Forwarded>,
+    forwarded: &std::cell::RefCell<majit_ir::forwarding::Forwarded>,
     updated: majit_ir::GcRef,
 ) {
     let is_const_ref = matches!(
         &*forwarded.borrow(),
-        majit_ir::box_ref::Forwarded::Const(majit_ir::Const::Ref(_))
+        majit_ir::forwarding::Forwarded::Const(majit_ir::Const::Ref(_))
     );
     if is_const_ref {
         *forwarded.borrow_mut() =
-            majit_ir::box_ref::Forwarded::Const(majit_ir::Const::Ref(updated));
+            majit_ir::forwarding::Forwarded::Const(majit_ir::Const::Ref(updated));
     }
 }
 
@@ -2160,13 +2160,15 @@ impl ExportedState {
         }
 
         fn visit_forwarded(
-            forwarded: &std::cell::RefCell<majit_ir::box_ref::Forwarded>,
+            forwarded: &std::cell::RefCell<majit_ir::forwarding::Forwarded>,
             visitor: &mut dyn FnMut(&mut GcRef),
         ) {
             let mut forwarded = forwarded.borrow_mut();
             match &mut *forwarded {
-                majit_ir::box_ref::Forwarded::Info(info) => visit_op_info(info, visitor),
-                majit_ir::box_ref::Forwarded::Const(majit_ir::Const::Ref(gcref)) => visitor(gcref),
+                majit_ir::forwarding::Forwarded::Info(info) => visit_op_info(info, visitor),
+                majit_ir::forwarding::Forwarded::Const(majit_ir::Const::Ref(gcref)) => {
+                    visitor(gcref)
+                }
                 _ => {}
             }
         }

@@ -10,7 +10,7 @@
 //! position→producer registry, no `Op::box_cache` memoization, and no
 //! position-only ref fabrication.
 //!
-//! Strong `Rc` (not the `Weak` of [`Forwarded`](crate::box_ref::Forwarded)):
+//! Strong `Rc` (not the `Weak` of [`Forwarded`](crate::forwarding::Forwarded)):
 //! operands must keep their producers alive. The trace already holds the 1st
 //! strong ref in `Trace.ops: Vec<OpRc>` (#103); an operand `Rc<Op>` is a 2nd
 //! strong ref on the acyclic SSA use-before-def DAG (operands reference
@@ -20,7 +20,7 @@
 //! `Operand` directly, and the `from_bound_*` constructors bind each producer
 //! identity at construction.
 
-use crate::box_ref::{
+use crate::forwarding::{
     Forwarded, ForwardingHost, IntBoundBorrow, IntBoundBorrowMut, PtrInfoBorrow, PtrInfoBorrowMut,
 };
 use crate::intbound::IntBound;
@@ -157,7 +157,7 @@ impl Operand {
     }
 
     /// Flat-`OpRef` view for the OpRef-keyed side tables, `op.pos`
-    /// comparisons, and backend/gc encoding (`box_ref.rs:494` parity). This
+    /// comparisons, and backend/gc encoding (`forwarding.rs` parity). This
     /// is the PERMANENT handoff boundary where the optimizer's operand
     /// identity converts to the backend's `OpRef` encoding; it is
     /// re-expressed, never retired. An `Op` reads its (post-compaction)
@@ -169,7 +169,7 @@ impl Operand {
             Operand::Op(op) => op.pos.get(),
             Operand::InputArg(ia) => OpRef::input_arg_typed(ia.index, ia.tp),
             // Re-encodes from the live `Cell` value, so a GC-moved `ConstPtr`
-            // reads back at its post-move address (box_ref.rs:510-514 parity).
+            // reads back at its post-move address (forwarding.rs parity).
             Operand::Const(cell) => match cell.get() {
                 Value::Int(v) => OpRef::const_int(v),
                 Value::Float(v) => OpRef::const_float(v),
@@ -222,7 +222,7 @@ impl Operand {
         }
     }
 
-    /// Raw `ConstInt` value with no `IntBound` synthesis (`box_ref.rs:480`
+    /// Raw `ConstInt` value with no `IntBound` synthesis (`forwarding.rs`
     /// parity).
     pub fn const_int(&self) -> Option<i64> {
         match self {
@@ -488,7 +488,7 @@ impl Operand {
     pub fn walk_const_ptr_refs(&self, visitor: &mut dyn FnMut(&mut GcRef)) {
         match self {
             // Forward an inline `ConstPtr` `GcRef` in place through the cell's
-            // get/visit/set cycle (box_ref.rs:561-568 parity) — no `&mut self`
+            // get/visit/set cycle (forwarding.rs parity) — no `&mut self`
             // needed, so `Op.args` GC walks keep their shared `borrow()`.
             Operand::Const(cell) => {
                 let mut v = cell.get();
@@ -504,7 +504,7 @@ impl Operand {
 
 impl PartialEq for Operand {
     /// Object identity — pure `Rc::ptr_eq`
-    /// (`box_ref.rs:1050`): `AbstractValue` defines no `__eq__`
+    /// (`forwarding.rs`): `AbstractValue` defines no `__eq__`
     /// (`resoperation.py:29-39`), so every plain box-keyed dict keys by `is`.
     /// `Op` / `InputArg` / `Const` each carry an `Rc`, so `==` is `ptr_eq` on
     /// that producer/const handle; two `none()` sentinels match (Python's

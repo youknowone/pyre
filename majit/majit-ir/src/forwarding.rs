@@ -1,8 +1,8 @@
 //! `_forwarded` slot mirror of RPython's `AbstractResOpOrInputArg`.
 //!
 //! Direct port of the shared forwarding slot from
-//! `rpython/jit/metainterp/resoperation.py:233 AbstractResOpOrInputArg`,
-//! carried on `Op` / `InputArg` themselves (`resoperation.py:233` / `:700`).
+//! `rpython/jit/metainterp/resoperation.py AbstractResOpOrInputArg`,
+//! carried on `Op` / `InputArg` themselves (`resoperation.py`).
 //! The optimizer holds producer identities as [`crate::operand::Operand`];
 //! this module hosts the [`Forwarded`] slot variant, the [`ForwardingHost`]
 //! trait that exposes the `get_forwarded` / `set_forwarded_*` /
@@ -24,7 +24,7 @@ use crate::{OpRef, Type};
 
 /// Variant of the `_forwarded` slot.
 ///
-/// `Const` is an `AbstractValue` subclass too (`history.py:220
+/// `Const` is an `AbstractValue` subclass too (`history.py
 /// ConstInt`), so forwarding to a constant is its own shape: `Const`
 /// is a value-typed `Copy` payload with no `_forwarded` slot of its
 /// own, unlike `ResOp`/`InputArg`. Keeping it as a separate variant
@@ -33,7 +33,7 @@ use crate::{OpRef, Type};
 pub enum Forwarded {
     None,
 
-    /// `resoperation.py:250 AbstractResOp` forwarding — direct
+    /// `resoperation.py AbstractResOp` forwarding — direct
     /// `Weak<Op>` reference. The chain walker upgrades the `Weak` into a
     /// producer-bound `Operand::Op` (via `Operand::from_bound_op`) and
     /// continues from there. A dropped `Weak` terminates the chain at the predecessor
@@ -41,14 +41,14 @@ pub enum Forwarded {
     /// underlying object alive through the trace `operations` list).
     Op(Weak<Op>),
 
-    /// `resoperation.py:699 AbstractInputArg` forwarding — direct
+    /// `resoperation.py AbstractInputArg` forwarding — direct
     /// `Weak<InputArg>` reference. Same chain-walk semantics as `Op`
     /// (producer-bound `Operand::from_bound_inputarg` materialization). RPython
     /// uses this for inputarg→inputarg redirects in bridge import and
-    /// retrace remap (compile.py:478 / unroll.py:497).
+    /// retrace remap (compile.py / unroll.py).
     InputArg(Weak<InputArg>),
 
-    /// `history.py:220 ConstInt` / `:261 ConstFloat` / `:307 ConstPtr`
+    /// `history.py ConstInt` / `ConstFloat` / `ConstPtr`
     /// — forwarding terminates here; the constant value is carried
     /// inline. Chain walkers stop on this variant (`not_const=true`
     /// returns the pre-Const box; `not_const=false` materializes a
@@ -56,19 +56,19 @@ pub enum Forwarded {
     ///
     /// PyPy has no analog (callers hold the Python `Const` object
     /// directly); `box_to_opref` reconstructs the inline-Const OpRef
-    /// from the payload value (history.py:227/268/314).
+    /// from the payload value (history.py/268/314).
     Const(Const),
 
-    /// `optimizeopt/info.py:17 AbstractInfo (is_info_class = True)` family —
+    /// `optimizeopt/info.py AbstractInfo (is_info_class = True)` family —
     /// `PtrInfo`, `IntBound`, `FloatConstInfo`, `EmptyInfo`, etc.
     Info(OpInfo),
     // No `VectorInfo` variant here yet — PRE-EXISTING-ADAPTATION, not parity.
     // RPython attaches vectorizer scratch to the op itself:
-    // `op.set_forwarded(VectorizationInfo(op))` (`vector.py:54-56
-    // setup_vectorization`, read back by `schedule.py:20-28 forwarded_vecinfo`),
+    // `op.set_forwarded(VectorizationInfo(op))` (`vector.py
+    // setup_vectorization`, read back by `schedule.py forwarded_vecinfo`),
     // and re-propagates it across its SINGLE clone path `copy_resop`
-    // (`vector.py:35-40`), which COPIES the already-resolved struct — INT_SIGNEXT's
-    // arg1 bytesize is resolved once at setup time (`resoperation.py:181-186`) and
+    // (`vector.py`), which COPIES the already-resolved struct — INT_SIGNEXT's
+    // arg1 bytesize is resolved once at setup time (`resoperation.py`) and
     // never recomputed on clone. So the INT_SIGNEXT dynamic-arg concern argues FOR
     // attach-and-copy, not against it. pyre instead keys the scratch in the
     // OpRef-keyed `VecScheduleState.vecinfo_cache` (optimizeopt/schedule.rs)
@@ -82,18 +82,18 @@ pub enum Forwarded {
     // INT_SIGNEXT stamp. That touches the shared `_forwarded` core (GC-adjacent)
     // and the vectorizer is off by default, so it needs x86_64 + vectorizer-on
     // validation before landing. `Op.vecinfo` (resoperation.rs) is the SEPARATE
-    // permanent `resoperation.py:511-518` VecOp datatype/bytesize/signed/count
+    // permanent `resoperation.py` VecOp datatype/bytesize/signed/count
     // store and stays.
 }
 
-/// `resoperation.py:233 AbstractResOpOrInputArg` — the shared `_forwarded`
-/// host. Both `Op` (`AbstractResOp`, resoperation.py:250) and `InputArg`
-/// (`AbstractInputArg`, resoperation.py:699) carry a
+/// `resoperation.py AbstractResOpOrInputArg` — the shared `_forwarded`
+/// host. Both `Op` (`AbstractResOp`, resoperation.py) and `InputArg`
+/// (`AbstractInputArg`, resoperation.py) carry a
 /// `forwarded: RefCell<Forwarded>` slot and inherit `get_forwarded` /
 /// `set_forwarded` from this base class; the Rust mirror is a shared trait
 /// whose one required method exposes that slot. The `ptr_info` / `int_bound`
 /// readers project the `Forwarded::Info` payload (the
-/// `optimizer.py:99-113 getptrinfo` / `getintbound` reads of
+/// `optimizer.py getptrinfo` / `getintbound` reads of
 /// `box.get_forwarded()`), re-homed here so production can read forwarding
 /// state straight off a producer identity.
 ///
@@ -101,10 +101,10 @@ pub enum Forwarded {
 /// `InputArg` to these impls — the canonical forwarding logic lives on the
 /// bound `Op` / `InputArg`.
 pub trait ForwardingHost {
-    /// The canonical `_forwarded` slot (`resoperation.py:235`).
+    /// The canonical `_forwarded` slot (`resoperation.py`).
     fn forwarded_cell(&self) -> &RefCell<Forwarded>;
 
-    /// Pointer-identity probes backing the `resoperation.py:241
+    /// Pointer-identity probes backing the `resoperation.py
     /// assert forwarded_to is not self` self-cycle guard. A different
     /// concrete type can never be `self`, so the cross-type default is
     /// `false`; each host overrides only its own-type probe.
@@ -115,19 +115,19 @@ pub trait ForwardingHost {
         false
     }
 
-    /// `resoperation.py:237 get_forwarded` — clone the slot.
+    /// `resoperation.py get_forwarded` — clone the slot.
     fn get_forwarded(&self) -> Forwarded {
         self.forwarded_cell().borrow().clone()
     }
 
-    /// `resoperation.py:242 self._forwarded = forwarded_to` — the slot write
+    /// `resoperation.py self._forwarded = forwarded_to` — the slot write
     /// shared by every typed setter. Prefer the typed `set_forwarded_*`,
-    /// which carry the `:241` self-cycle assert.
+    /// which carry the self-cycle assert.
     fn store_forwarded(&self, value: Forwarded) {
         *self.forwarded_cell().borrow_mut() = value;
     }
 
-    /// `optimizer.py:394 op.set_forwarded(newop)` — Op target.
+    /// `optimizer.py op.set_forwarded(newop)` — Op target.
     fn set_forwarded_op(&self, target: &crate::resoperation::OpRc) {
         assert!(
             !self.is_same_op(target),
@@ -136,7 +136,7 @@ pub trait ForwardingHost {
         self.store_forwarded(Forwarded::Op(Rc::downgrade(target)));
     }
 
-    /// `compile.py:478` / `unroll.py:497` InputArg→InputArg redirect.
+    /// `compile.py` / `unroll.py` InputArg→InputArg redirect.
     fn set_forwarded_inputarg(&self, target: &crate::value::InputArgRc) {
         assert!(
             !self.is_same_inputarg(target),
@@ -146,13 +146,13 @@ pub trait ForwardingHost {
         self.store_forwarded(Forwarded::InputArg(Rc::downgrade(target)));
     }
 
-    /// `optimizer.py:432 make_constant(box, constbox)` — terminate the chain
+    /// `optimizer.py make_constant(box, constbox)` — terminate the chain
     /// in an inline constant value.
     fn set_forwarded_const(&self, value: Const) {
         self.store_forwarded(Forwarded::Const(value));
     }
 
-    /// `resoperation.py:53 set_forwarded(forwarded_to)` — Info target.
+    /// `resoperation.py set_forwarded(forwarded_to)` — Info target.
     fn set_forwarded_info(&self, info: OpInfo) {
         self.store_forwarded(Forwarded::Info(info));
     }
@@ -162,7 +162,7 @@ pub trait ForwardingHost {
         self.store_forwarded(Forwarded::None);
     }
 
-    /// `optimizer.py:99-113 getptrinfo` — project a `Forwarded::Info(Ptr)`
+    /// `optimizer.py getptrinfo` — project a `Forwarded::Info(Ptr)`
     /// into a shared borrow guard. Other states yield `None`. Does not walk
     /// the chain; the caller advances to the terminal identity first.
     fn ptr_info(&self) -> Option<PtrInfoBorrow> {
@@ -188,7 +188,7 @@ pub trait ForwardingHost {
         }
     }
 
-    /// `optimizer.py:99-113 getintbound`.
+    /// `optimizer.py getintbound`.
     fn int_bound(&self) -> Option<IntBoundBorrow> {
         match self.get_forwarded() {
             Forwarded::Info(OpInfo::IntBound(rc)) => Some(IntBoundBorrow::new(rc)),

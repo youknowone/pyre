@@ -19,7 +19,7 @@ use majit_backend_dynasm::runner::DynasmBackend;
 
 static EXCEPTION_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
-use majit_ir::box_ref::bound_operand_from_opref as rb;
+use majit_ir::forwarding::bound_operand_from_opref as rb;
 
 #[test]
 fn test_just_finish() {

@@ -131,7 +131,7 @@ impl EnsuredPtrInfo {
     /// clone of the live `Rc<RefCell<PtrInfo>>` cell and an exclusive
     /// `RefCell` borrow — drop it before any sibling write to the same
     /// box's `_forwarded` slot.
-    pub fn as_mut(&mut self) -> Option<majit_ir::box_ref::PtrInfoBorrowMut> {
+    pub fn as_mut(&mut self) -> Option<majit_ir::forwarding::PtrInfoBorrowMut> {
         match self {
             EnsuredPtrInfo::Constant { .. } => None,
             EnsuredPtrInfo::Forwarded(o) => o.ptr_info_mut(),

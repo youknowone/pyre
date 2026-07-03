@@ -19,7 +19,7 @@ fn make_op(opcode: OpCode, args: &[OpRef], pos: OpRef) -> Op {
     op
 }
 
-use majit_ir::box_ref::bound_operand_from_opref as rb;
+use majit_ir::forwarding::bound_operand_from_opref as rb;
 
 fn make_guard(opcode: OpCode, args: &[OpRef], fail_args: &[OpRef]) -> Op {
     let bx: Vec<Operand> = args.iter().map(|a| rb(*a)).collect();

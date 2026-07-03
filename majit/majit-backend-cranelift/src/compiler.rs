@@ -16427,7 +16427,7 @@ mod tests {
         std::rc::Rc::new(o)
     }
 
-    use majit_ir::box_ref::bound_operand_from_opref as rb;
+    use majit_ir::forwarding::bound_operand_from_opref as rb;
 
     /// llsupport/gc.py:563 GcLLDescr_framework
     ///   .get_typeid_from_classptr_if_gcremovetypeptr

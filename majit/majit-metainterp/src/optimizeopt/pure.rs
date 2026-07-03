@@ -1485,7 +1485,7 @@ mod tests {
         }
         opt.add_pass(Box::new(OptPure::new()));
         // `producers` is held to the end of the call so every `from_bound_op`
-        // arg box's `Weak<Op>` upgrade stays live (box_ref.rs:788). The
+        // arg box's `Weak<Op>` upgrade stays live (forwarding.rs). The
         // guard-snapshot path wraps the seeded `Vec<Op>` in fresh Rcs whose
         // args still point at `producers`, so those originals must outlive the
         // run.

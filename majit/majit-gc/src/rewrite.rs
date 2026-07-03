@@ -3266,7 +3266,7 @@ mod tests {
         op
     }
 
-    use majit_ir::box_ref::bound_operand_from_opref as ro;
+    use majit_ir::forwarding::bound_operand_from_opref as ro;
 
     fn mk_op_with_descr(opcode: OpCode, args: &[OpRef], pos: u32, descr: DescrRef) -> Op {
         let args: Vec<Operand> = args.iter().map(|a| ro(*a)).collect();

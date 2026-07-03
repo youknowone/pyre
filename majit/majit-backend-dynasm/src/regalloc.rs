@@ -6036,7 +6036,7 @@ mod tests {
     use majit_ir::operand::Operand;
     use majit_ir::{InputArg, Op, OpCode, OpRef, Type};
 
-    use majit_ir::box_ref::bound_operand_from_opref as rb;
+    use majit_ir::forwarding::bound_operand_from_opref as rb;
 
     fn make_op(opcode: OpCode, pos: u32, args: &[OpRef]) -> Op {
         let bx: Vec<Operand> = args.iter().map(|a| rb(*a)).collect();

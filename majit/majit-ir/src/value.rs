@@ -278,7 +278,7 @@ pub struct InputArg {
     /// the canonical forwarding host for a bound InputArg box.
     /// `Forwarded::None` until a writer sets it; `set_forwarded_*`
     /// on a bound box routes here.
-    pub forwarded: std::cell::RefCell<crate::box_ref::Forwarded>,
+    pub forwarded: std::cell::RefCell<crate::forwarding::Forwarded>,
     /// `resoperation.py:719/727/739 InputArgInt/Float/Ref` carry the
     /// concrete runtime value on the frontend-arg object itself (the
     /// `_resint`/`_resfloat`/`_resref` mixin slot, `history.py:803-807`).
@@ -307,7 +307,7 @@ impl InputArg {
         InputArg {
             tp: self.tp,
             index: self.index,
-            forwarded: std::cell::RefCell::new(crate::box_ref::Forwarded::None),
+            forwarded: std::cell::RefCell::new(crate::forwarding::Forwarded::None),
             value: std::cell::Cell::new(None),
         }
     }
@@ -329,7 +329,7 @@ impl InputArg {
         InputArg {
             tp: Type::Int,
             index,
-            forwarded: std::cell::RefCell::new(crate::box_ref::Forwarded::None),
+            forwarded: std::cell::RefCell::new(crate::forwarding::Forwarded::None),
             value: std::cell::Cell::new(None),
         }
     }
@@ -338,7 +338,7 @@ impl InputArg {
         InputArg {
             tp: Type::Ref,
             index,
-            forwarded: std::cell::RefCell::new(crate::box_ref::Forwarded::None),
+            forwarded: std::cell::RefCell::new(crate::forwarding::Forwarded::None),
             value: std::cell::Cell::new(None),
         }
     }
@@ -347,7 +347,7 @@ impl InputArg {
         InputArg {
             tp: Type::Float,
             index,
-            forwarded: std::cell::RefCell::new(crate::box_ref::Forwarded::None),
+            forwarded: std::cell::RefCell::new(crate::forwarding::Forwarded::None),
             value: std::cell::Cell::new(None),
         }
     }
@@ -363,7 +363,7 @@ impl InputArg {
         InputArg {
             tp,
             index,
-            forwarded: std::cell::RefCell::new(crate::box_ref::Forwarded::None),
+            forwarded: std::cell::RefCell::new(crate::forwarding::Forwarded::None),
             value: std::cell::Cell::new(None),
         }
     }

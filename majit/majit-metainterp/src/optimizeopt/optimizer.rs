@@ -574,7 +574,7 @@ pub(crate) fn merge_backend_constants_from_ctx(
         }
         let idx = pos.raw() as usize;
         let value = match op.forwarded.borrow().clone() {
-            majit_ir::box_ref::Forwarded::Const(c) => c.to_value(),
+            majit_ir::forwarding::Forwarded::Const(c) => c.to_value(),
             _ => return,
         };
         // A ref constant is never resolved from this backend pool: a referenced
@@ -652,7 +652,7 @@ impl Optimizer {
         let Some(forwarded) = ctx.read_forwarded(op.pos.get()) else {
             return false;
         };
-        if !matches!(forwarded, majit_ir::box_ref::Forwarded::Const(_)) {
+        if !matches!(forwarded, majit_ir::forwarding::Forwarded::Const(_)) {
             return false;
         }
         op.num_args() == 0 || op.getarglist().iter().all(|arg| arg.is_none())
@@ -3557,7 +3557,7 @@ impl Optimizer {
                 }
                 if !matches!(
                     op.forwarded.borrow().clone(),
-                    majit_ir::box_ref::Forwarded::Const(_)
+                    majit_ir::forwarding::Forwarded::Const(_)
                 ) {
                     return;
                 }
@@ -5953,7 +5953,7 @@ mod tests {
         // get_b_type) rather than the original fixture's dangling position 8
         // (the void guard_b): a bound synthetic at a void position has no
         // forwardable result box, so IntBounds' getintbound would write
-        // forwarded onto an unbound box (box_ref.rs:788). The add result is
+        // forwarded onto an unbound box (forwarding.rs). The add result is
         // unused either way — this only keeps its operands resolvable.
         let add = Op::new(
             OpCode::IntAdd,

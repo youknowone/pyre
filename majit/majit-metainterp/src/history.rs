@@ -1055,7 +1055,7 @@ mod tests {
     }
 
     // Bound-box drop-ins for op-arg / fail-arg sites. Each binds a rooted
-    // synthetic producer (box_ref.rs `test_support`) so the arg sheds to
+    // synthetic producer (forwarding.rs `test_support`) so the arg sheds to
     // `Operand::InputArg` / `Operand::Op` (never the position-only
     // `Operand::Box`); `to_opref()` is preserved, so position-keyed
     // assertions still hold.

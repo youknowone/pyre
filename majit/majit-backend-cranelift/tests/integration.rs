@@ -72,7 +72,7 @@ fn make_descr(_index: u32) -> DescrRef {
     majit_backend::make_resume_guard_descr_typed(Vec::new())
 }
 
-use majit_ir::box_ref::bound_operand_from_opref as rb;
+use majit_ir::forwarding::bound_operand_from_opref as rb;
 
 // ---------------------------------------------------------------------------
 // Test 1: Simple arithmetic (trace -> optimize -> compile -> execute)
