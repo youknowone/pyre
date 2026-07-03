@@ -1647,6 +1647,16 @@ pub fn lower_fun_decl_with_static_addrs(
                 &lo.unwrap_or_sites,
             )
         };
+        // The `Option::unwrap` guard rewrite (`front::option_unwrap`) splits the
+        // residual `unwrap` call block into a `__discriminant` guard whose
+        // `Some` arm extracts `__pos_0` and whose `None` arm raises the implicit
+        // `AssertionError`; same fail-safe contract as `unwrap_or`, gate the
+        // reachability sweep on an actual rewrite.
+        let unwrap_rewritten = if lo.unwrap_sites.is_empty() {
+            0
+        } else {
+            crate::front::option_unwrap::rewire_unwrap_call_sites(&mut lo.graph, &lo.unwrap_sites)
+        };
         // The `Option::map_or` closure-select rewrite (`front::option_map_or`)
         // splits the residual `map_or` call block into a `__discriminant`
         // diamond whose `Some` arm calls the closure, same post-lowering shape
@@ -1700,6 +1710,7 @@ pub fn lower_fun_decl_with_static_addrs(
             || option_try_stats.rewritten > 0
             || bool_then_rewritten > 0
             || unwrap_or_rewritten > 0
+            || unwrap_rewritten > 0
             || map_or_rewritten > 0
             || closure_select_rewritten > 0
         {
@@ -2052,6 +2063,10 @@ struct Lowering<'a> {
     /// resolved `Option` owners the arms' field reads need (see
     /// [`crate::front::option_unwrap_or::UnwrapOrSite`]).
     unwrap_or_sites: Vec<crate::front::option_unwrap_or::UnwrapOrSite>,
+    /// `Option::unwrap(opt)` call sites recorded for the discriminant guard the
+    /// `front::option_unwrap` post-pass synthesizes (see
+    /// [`crate::front::option_unwrap::UnwrapSite`]).
+    unwrap_sites: Vec<crate::front::option_unwrap::UnwrapSite>,
     /// `Option::map_or(opt, default, closure)` call sites recorded for the
     /// discriminant closure-select the `front::option_map_or` post-pass
     /// synthesizes (see [`crate::front::option_map_or::MapOrSite`]).
@@ -2224,6 +2239,7 @@ impl<'a> Lowering<'a> {
             bool_then_sites: Vec::new(),
             bigint_div_rem_sites: Vec::new(),
             unwrap_or_sites: Vec::new(),
+            unwrap_sites: Vec::new(),
             map_or_sites: Vec::new(),
             is_none_sites: Vec::new(),
             closure_select_sites: Vec::new(),
@@ -6200,6 +6216,24 @@ impl<'a> Lowering<'a> {
         {
             self.unwrap_or_sites.push(site);
         }
+        // Capture `Option::unwrap(opt)` sites for the discriminant guard
+        // `front::option_unwrap` synthesizes.  Like `unwrap_or`, `unwrap`'s body
+        // is Opaque (foreign `core`) and its receiver is the `Option` ADT, so
+        // `first_is_self` routes it to a `CallTarget::Method` (receiver in
+        // `args[0]`, the sole argument).  `recognize_unwrap_site` confirms the
+        // receiver is an `Option` (not `Result`).  A resolution miss leaves the
+        // residual call — an unregistered callee the rtyper census Skips.
+        if let OpKind::Call {
+            target: CallTarget::Method { name, .. },
+            args,
+            ..
+        } = &op_kind
+            && args.len() == 1
+            && name == "unwrap"
+            && let Some(site) = self.recognize_unwrap_site(first_arg_ty.as_ref(), &result_var)
+        {
+            self.unwrap_sites.push(site);
+        }
         // Capture `Option::map_or(opt, default, closure)` sites for the
         // discriminant closure-select `front::option_map_or` synthesizes.
         // Like `unwrap_or`, `map_or`'s body is Opaque (foreign `core`) and its
@@ -7688,6 +7722,35 @@ impl<'a> Lowering<'a> {
             result_var: result_var.clone(),
             option_owner,
             is_some,
+        })
+    }
+
+    /// Resolve a recognized `Option::unwrap(opt)` call into an
+    /// [`crate::front::option_unwrap::UnwrapSite`] — the `Option` enum root +
+    /// `Some` variant owners and the payload type the discriminant-guard
+    /// post-pass needs.  `None` (leaving the residual call) when the receiver
+    /// type is not a resolvable `Option`.  Guards on `Option` specifically —
+    /// `Result::unwrap` shares the method name but its `Ok`/`Err` tags do not
+    /// match `Some`=1/`None`=0.
+    fn recognize_unwrap_site(
+        &self,
+        recv_ty: Option<&TyRef>,
+        result_var: &Variable,
+    ) -> Option<crate::front::option_unwrap::UnwrapSite> {
+        let recv_ty = recv_ty?;
+        if !crate::front::result_exc::tyref_is_option(recv_ty, self.llbc) {
+            return None;
+        }
+        let def_id = self.tyref_adt_def_id(recv_ty)?;
+        let td = self.llbc.type_by_id(def_id)?;
+        let option_owner = td.item_meta.name_path();
+        let some_owner = Self::tagged_pair_payload_owner(td, &option_owner, 1)?;
+        let payload_ty = self.tyref_option_payload_value_type(recv_ty)?;
+        Some(crate::front::option_unwrap::UnwrapSite {
+            result_var: result_var.clone(),
+            option_owner,
+            some_owner,
+            payload_ty,
         })
     }
 

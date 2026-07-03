@@ -80,6 +80,7 @@ pub(crate) mod option_closure_select;
 pub(crate) mod option_is_none;
 pub(crate) mod option_map_or;
 pub(crate) mod option_try;
+pub(crate) mod option_unwrap;
 pub(crate) mod option_unwrap_or;
 pub(crate) mod result_exc;
 pub mod semantic;
