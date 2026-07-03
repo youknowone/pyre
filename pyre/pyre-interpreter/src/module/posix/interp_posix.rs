@@ -441,6 +441,13 @@ pub fn register_module(ns: &mut DictStorage) {
             } else {
                 0o777
             };
+            // Open the fd non-inheritable (PEP 446) so the descriptor does not
+            // leak across exec into child processes: O_CLOEXEC on unix,
+            // O_NOINHERIT on Windows (O_CLOEXEC is unix-only in libc).
+            #[cfg(unix)]
+            let flags = flags | libc::O_CLOEXEC;
+            #[cfg(windows)]
+            let flags = flags | libc::O_NOINHERIT;
             let c_path = std::ffi::CString::new(path.as_bytes())
                 .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
             let fd = unsafe { libc::open(c_path.as_ptr(), flags, mode as libc::c_uint) };
