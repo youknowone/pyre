@@ -1472,6 +1472,58 @@ impl<S: JitState> JitDriver<S> {
         self.meta.trace_ctx().map(|ctx| ctx.green_key())
     }
 
+    /// pyjitpl.py:3015-3030 compile_loop + raise_if_successful bookkeeping,
+    /// shared by the `CloseLoop` and `CloseLoopWithArgs` arms.  Captures the
+    /// `(green_key, header_pc)` BEFORE `compile_loop` drains the trace ctx (so a
+    /// later bridge into this loop can resolve its parent loop's header pc — its
+    /// JUMP close target), compiles, and on success records the loop-header pc
+    /// and stashes the just-compiled key for the single-pass direct-entry hook.
+    fn compile_and_record_loop(
+        &mut self,
+        jump_args: &[OpRef],
+        meta: S::Meta,
+    ) -> crate::CompileOutcome {
+        let loop_header_pc = self.meta.trace_ctx().map(|c| c.header_pc);
+        let loop_green_key = self.current_trace_green_key();
+        if std::env::var_os("MAJIT_CLOSEDBG").is_some() {
+            eprintln!(
+                "@@@CLOSE LOOP-COMPILE green_key={} header_pc={} jump_args={}",
+                loop_green_key.map(|k| k as i64).unwrap_or(-1),
+                loop_header_pc.map(|p| p as i64).unwrap_or(-1),
+                jump_args.len()
+            );
+        }
+        let outcome = self.meta.compile_loop(jump_args, meta);
+        if std::env::var_os("MAJIT_CLOSEDBG").is_some() {
+            eprintln!(
+                "@@@CLOSE LOOP-COMPILE outcome={:?}",
+                match &outcome {
+                    crate::CompileOutcome::Compiled { .. } => "Compiled",
+                    crate::CompileOutcome::Cancelled => "Cancelled",
+                    crate::CompileOutcome::Aborted => "Aborted",
+                }
+            );
+        }
+        if matches!(outcome, crate::CompileOutcome::Compiled { .. }) {
+            if let (Some(gk), Some(hp)) = (loop_green_key, loop_header_pc) {
+                self.meta.record_loop_header_pc(gk, hp);
+            }
+            if let Some(k) = self.meta.last_compiled_key() {
+                if let Some(hp) = loop_header_pc {
+                    self.meta.record_loop_header_pc(k, hp);
+                }
+                // Single-pass: stash the just-compiled loop's key so the
+                // merge-point hook can directly enter it with the walk-final
+                // state instead of re-interpreting the walked body
+                // (cross-loop-cut: this is cut_inner_green_key).
+                if crate::single_pass_enabled() {
+                    self.meta.single_pass_compiled_key = Some(k);
+                }
+            }
+        }
+        outcome
+    }
+
     /// ResumeFromInterpDescr parity: data needed to compile an entry bridge
     /// from the currently active trace.
     ///
@@ -1946,48 +1998,7 @@ impl<S: JitState> JitDriver<S> {
                         .meta
                         .trace_ctx()
                         .and_then(|ctx| S::close_loop_live_values(ctx, sym, &meta, &jump_args));
-                    // pyjitpl.py:3015-3030 compile_loop + raise_if_successful.
-                    // Capture (green_key, header_pc) before compile_loop drains
-                    // the trace ctx, so a later bridge into this loop can resolve
-                    // its parent loop's header pc (its JUMP close target).
-                    let __loop_header_pc = self.meta.trace_ctx().map(|c| c.header_pc);
-                    let __loop_green_key = self.current_trace_green_key();
-                    if std::env::var_os("MAJIT_CLOSEDBG").is_some() {
-                        eprintln!(
-                            "@@@CLOSE LOOP-COMPILE green_key={} header_pc={} jump_args={}",
-                            __loop_green_key.map(|k| k as i64).unwrap_or(-1),
-                            __loop_header_pc.map(|p| p as i64).unwrap_or(-1),
-                            jump_args.len()
-                        );
-                    }
-                    let outcome = self.meta.compile_loop(&jump_args, meta);
-                    if std::env::var_os("MAJIT_CLOSEDBG").is_some() {
-                        eprintln!(
-                            "@@@CLOSE LOOP-COMPILE outcome={:?}",
-                            match &outcome {
-                                crate::CompileOutcome::Compiled { .. } => "Compiled",
-                                crate::CompileOutcome::Cancelled => "Cancelled",
-                                crate::CompileOutcome::Aborted => "Aborted",
-                            }
-                        );
-                    }
-                    if matches!(outcome, crate::CompileOutcome::Compiled { .. }) {
-                        if let (Some(gk), Some(hp)) = (__loop_green_key, __loop_header_pc) {
-                            self.meta.record_loop_header_pc(gk, hp);
-                        }
-                        if let Some(k) = self.meta.last_compiled_key() {
-                            if let Some(hp) = __loop_header_pc {
-                                self.meta.record_loop_header_pc(k, hp);
-                            }
-                            // Single-pass: stash the just-compiled loop's key so
-                            // the merge-point hook can directly enter it with the
-                            // walk-final state instead of re-interpreting the
-                            // walked body (cross-loop-cut: this is cut_inner_green_key).
-                            if crate::single_pass_enabled() {
-                                self.meta.single_pass_compiled_key = Some(k);
-                            }
-                        }
-                    }
+                    let outcome = self.compile_and_record_loop(&jump_args, meta);
                     match outcome {
                         crate::CompileOutcome::Compiled { .. } => {
                             // pyjitpl.py:3119-3123 raise_if_successful →
@@ -2121,48 +2132,7 @@ impl<S: JitState> JitDriver<S> {
                         .meta
                         .trace_ctx()
                         .and_then(|ctx| S::close_loop_live_values(ctx, sym, &meta, &jump_args));
-                    // pyjitpl.py:3015-3030 compile_loop + raise_if_successful.
-                    // Capture (green_key, header_pc) before compile_loop drains
-                    // the trace ctx, so a later bridge into this loop can resolve
-                    // its parent loop's header pc (its JUMP close target).
-                    let __loop_header_pc = self.meta.trace_ctx().map(|c| c.header_pc);
-                    let __loop_green_key = self.current_trace_green_key();
-                    if std::env::var_os("MAJIT_CLOSEDBG").is_some() {
-                        eprintln!(
-                            "@@@CLOSE LOOP-COMPILE green_key={} header_pc={} jump_args={}",
-                            __loop_green_key.map(|k| k as i64).unwrap_or(-1),
-                            __loop_header_pc.map(|p| p as i64).unwrap_or(-1),
-                            jump_args.len()
-                        );
-                    }
-                    let outcome = self.meta.compile_loop(&jump_args, meta);
-                    if std::env::var_os("MAJIT_CLOSEDBG").is_some() {
-                        eprintln!(
-                            "@@@CLOSE LOOP-COMPILE outcome={:?}",
-                            match &outcome {
-                                crate::CompileOutcome::Compiled { .. } => "Compiled",
-                                crate::CompileOutcome::Cancelled => "Cancelled",
-                                crate::CompileOutcome::Aborted => "Aborted",
-                            }
-                        );
-                    }
-                    if matches!(outcome, crate::CompileOutcome::Compiled { .. }) {
-                        if let (Some(gk), Some(hp)) = (__loop_green_key, __loop_header_pc) {
-                            self.meta.record_loop_header_pc(gk, hp);
-                        }
-                        if let Some(k) = self.meta.last_compiled_key() {
-                            if let Some(hp) = __loop_header_pc {
-                                self.meta.record_loop_header_pc(k, hp);
-                            }
-                            // Single-pass: stash the just-compiled loop's key so
-                            // the merge-point hook can directly enter it with the
-                            // walk-final state instead of re-interpreting the
-                            // walked body (cross-loop-cut: this is cut_inner_green_key).
-                            if crate::single_pass_enabled() {
-                                self.meta.single_pass_compiled_key = Some(k);
-                            }
-                        }
-                    }
+                    let outcome = self.compile_and_record_loop(&jump_args, meta);
                     match outcome {
                         crate::CompileOutcome::Compiled { .. } => {
                             // pyjitpl.py:3119-3123 raise_if_successful →
@@ -4739,10 +4709,16 @@ impl<S: JitState> JitDriver<S> {
 
             if should_bridge {
                 // compile.py:704-709: _trace_and_compile_from_bridge
+                // resume.py:924/993 `_prepare(storage)`: apply the guard's pending
+                // heap writes (`rd_pendingfields`) to the live storage BEFORE
+                // reconstructing state, so `on_guard_failure` (the interpreter's
+                // recover) reads the post-write heap. Both PyPy rebuild paths
+                // (`rebuild_from_resumedata`, `blackhole_from_resumedata`) share
+                // `_prepare`; run it before the reconstruction, not after.
+                materialize_pending_fields(&exit_layout, &raw_values);
                 // Restore state for bridge tracing start point.
                 let resume_pc = on_guard_failure(state, &result_meta, &raw_values, &exit_layout);
                 let resume_pc = resume_pc.unwrap_or(guard_resume_pc);
-                materialize_pending_fields(&exit_layout, &raw_values);
                 self.sync_after(state, &result_meta, descriptor.as_ref());
 
                 let bridge_ok =
@@ -4888,9 +4864,11 @@ impl<S: JitState> JitDriver<S> {
             }
 
             // Legacy fallback: no rd_numb or jitcode resolution failed.
+            // resume.py:993 `_prepare(storage)`: pending heap writes before
+            // reconstruction (mirrors the bridge branch above).
+            materialize_pending_fields(&exit_layout, &raw_values);
             let resume_pc = on_guard_failure(state, &result_meta, &raw_values, &exit_layout);
             let resume_pc = resume_pc.unwrap_or(target_pc);
-            materialize_pending_fields(&exit_layout, &raw_values);
             self.sync_after(state, &result_meta, descriptor.as_ref());
             return Some(resume_pc);
         } // end loop { run_compiled ... }
