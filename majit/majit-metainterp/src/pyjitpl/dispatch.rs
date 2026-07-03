@@ -6964,6 +6964,14 @@ where
             }
         }
         let value = eval_binop_i(opcode, lhs_value, rhs_value);
+        // pyjitpl.py `_record_helper_pure`: a pure op whose args are all
+        // constants folds to its constant result at trace time and records
+        // nothing.  Every opcode routed here is a pure int/uint arithmetic or
+        // comparison, so an all-constant pair yields a constant destination.
+        if lhs.is_constant() && rhs.is_constant() {
+            self.set_int_reg(dst, Some(ctx.const_int(value)), Some(value));
+            return;
+        }
         let opref = ctx.record_op(opcode, &[lhs, rhs]);
         // `Box(value)` parity: stamp the result OpRef with its
         // runtime concrete so downstream `box_value(opref)` consumers
@@ -6985,6 +6993,11 @@ where
         };
         let (src, src_value) = self.read_int_reg(src_idx);
         let value = eval_unary_i(opcode, src_value);
+        // `_record_helper_pure`: a constant source folds to a constant result.
+        if src.is_constant() {
+            self.set_int_reg(dst, Some(ctx.const_int(value)), Some(value));
+            return;
+        }
         let opref = ctx.record_op(opcode, &[src]);
         ctx.set_opref_concrete(opref, majit_ir::Value::Int(value));
         self.set_int_reg(dst, Some(opref), Some(value));

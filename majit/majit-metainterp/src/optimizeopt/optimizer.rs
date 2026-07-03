@@ -5765,7 +5765,8 @@ mod tests {
             ],
         )];
         ops[0].pos.set(OpRef::int_op(2));
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::new(), 2);
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::new(), 2);
 
         assert_eq!(
             hits.get(),
@@ -5829,7 +5830,8 @@ mod tests {
         let mut opt = Optimizer::default_pipeline();
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::new(), 3);
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::new(), 3);
 
         let call_count = result
             .iter()
@@ -6002,7 +6004,8 @@ mod tests {
         let mut opt = Optimizer::default_pipeline();
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::new(), 3);
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::new(), 3);
 
         let call_positions: majit_ir::vec_set::VecSet<_> = result
             .iter()
@@ -6049,7 +6052,11 @@ mod tests {
         opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
         let num_inputs = inputs.len();
         let result = opt
-            .optimize_with_constants_and_inputs_oprc(&ops, &mut majit_ir::ConstMap::new(), num_inputs)
+            .optimize_with_constants_and_inputs_oprc(
+                &ops,
+                &mut majit_ir::ConstMap::new(),
+                num_inputs,
+            )
             .expect("test: unexpected InvalidLoop");
         // The duplicate INT_ADD should be eliminated by CSE (OptPure).
         let add_count = result.iter().filter(|o| o.opcode == OpCode::IntAdd).count();
@@ -6248,7 +6255,11 @@ mod tests {
         let num_inputs = inputs.len();
         opt.snapshot_boxes = seed_empty_guard_snapshots_oprc(&ops);
         let result = opt
-            .optimize_with_constants_and_inputs_oprc(&ops, &mut majit_ir::ConstMap::new(), num_inputs)
+            .optimize_with_constants_and_inputs_oprc(
+                &ops,
+                &mut majit_ir::ConstMap::new(),
+                num_inputs,
+            )
             .expect("test: unexpected InvalidLoop");
         let ctx = OptContext::new(result.len());
         // Just verify the counting methods work
@@ -6273,7 +6284,8 @@ mod tests {
 
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::new(), 0);
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::new(), 0);
 
         assert!(
             result.iter().any(|op| op.opcode == OpCode::GuardValue),
@@ -6966,7 +6978,11 @@ mod tests {
         let num_inputs = inputs.len();
         opt.snapshot_boxes = seed_guard_snapshots_with_oprc(&ops, |_| vec![x_ref, y_ref]);
         let result = opt
-            .optimize_with_constants_and_inputs_oprc(&ops, &mut majit_ir::ConstMap::new(), num_inputs)
+            .optimize_with_constants_and_inputs_oprc(
+                &ops,
+                &mut majit_ir::ConstMap::new(),
+                num_inputs,
+            )
             .expect("test: unexpected InvalidLoop");
 
         let guard = result
