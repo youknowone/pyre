@@ -950,6 +950,237 @@ pub fn build_ll_grow_and_append_helper_graph(
     ))
 }
 
+/// Synthesise `ll_jit_append(ll_builder, ll_str)` (`rbuilder.py:164-169`):
+///
+/// ```python
+/// if ll_jit_try_append_slice(ll_builder, ll_str, 0, len(ll_str.chars)):
+///     return
+/// ll_append_res0(ll_builder, ll_str)
+/// ```
+///
+/// `ll_jit_try_append_slice` / `ll_append_res0` are `direct_call` callee
+/// consts. Returns `Void`.
+pub fn build_ll_jit_append_helper_graph(
+    name: &str,
+    builder_ptr_lltype: LowLevelType,
+    buf_lltype: LowLevelType,
+    chars_array_ptr_lltype: LowLevelType,
+    try_append_slice_fn: Constant,
+    res0_fn: Constant,
+) -> Result<PyGraph, TyperError> {
+    let void_result = || variable_with_lltype("v", LowLevelType::Void);
+    let none_const = || {
+        Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::None,
+            LowLevelType::Void,
+        ))
+    };
+    let bool_case = |b: bool| Some(constant_with_lltype(ConstValue::Bool(b), LowLevelType::Bool));
+
+    let ll_builder = variable_with_lltype("ll_builder", builder_ptr_lltype.clone());
+    let ll_str = variable_with_lltype("ll_str", buf_lltype.clone());
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(ll_builder.clone()),
+        Hlvalue::Variable(ll_str.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", LowLevelType::Void);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    // fallback: ll_append_res0(ll_builder, ll_str).
+    let fb_llb = variable_with_lltype("ll_builder", builder_ptr_lltype);
+    let fb_str = variable_with_lltype("ll_str", buf_lltype);
+    let block_fb = Block::shared(vec![
+        Hlvalue::Variable(fb_llb.clone()),
+        Hlvalue::Variable(fb_str.clone()),
+    ]);
+    block_fb.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![Hlvalue::Constant(res0_fn), Hlvalue::Variable(fb_llb), Hlvalue::Variable(fb_str)],
+        Hlvalue::Variable(void_result()),
+    ));
+    block_fb.closeblock(vec![
+        Link::new(vec![none_const()], Some(graph.returnblock.clone()), None).into_ref(),
+    ]);
+
+    // startblock: len(ll_str.chars); handled = try_append_slice(...); branch.
+    let chars = variable_with_lltype("chars", chars_array_ptr_lltype);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "getsubstruct",
+        vec![
+            Hlvalue::Variable(ll_str.clone()),
+            constant_with_lltype(ConstValue::byte_str("chars"), LowLevelType::Void),
+        ],
+        Hlvalue::Variable(chars.clone()),
+    ));
+    let len = variable_with_lltype("length", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "getarraysize",
+        vec![Hlvalue::Variable(chars)],
+        Hlvalue::Variable(len.clone()),
+    ));
+    let handled = variable_with_lltype("handled", LowLevelType::Bool);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![
+            Hlvalue::Constant(try_append_slice_fn),
+            Hlvalue::Variable(ll_builder.clone()),
+            Hlvalue::Variable(ll_str.clone()),
+            constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed),
+            Hlvalue::Variable(len),
+        ],
+        Hlvalue::Variable(handled.clone()),
+    ));
+    startblock.borrow_mut().exitswitch = Some(Hlvalue::Variable(handled));
+    startblock.closeblock(vec![
+        // handled -> return.
+        Link::new(vec![none_const()], Some(graph.returnblock.clone()), bool_case(true)).into_ref(),
+        // not handled -> fallback.
+        Link::new(
+            vec![Hlvalue::Variable(ll_builder), Hlvalue::Variable(ll_str)],
+            Some(block_fb),
+            bool_case(false),
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["ll_builder".to_string(), "ll_str".to_string()],
+        func,
+    ))
+}
+
+/// Synthesise `ll_jit_append_slice(ll_builder, ll_str, start, end)`
+/// (`rbuilder.py:198-203`):
+///
+/// ```python
+/// if ll_jit_try_append_slice(ll_builder, ll_str, start, end - start):
+///     return
+/// ll_append_res_slice(ll_builder, ll_str, start, end)
+/// ```
+///
+/// `ll_jit_try_append_slice` / `ll_append_res_slice` are `direct_call`
+/// callee consts. Returns `Void`.
+pub fn build_ll_jit_append_slice_helper_graph(
+    name: &str,
+    builder_ptr_lltype: LowLevelType,
+    buf_lltype: LowLevelType,
+    try_append_slice_fn: Constant,
+    res_slice_fn: Constant,
+) -> Result<PyGraph, TyperError> {
+    let void_result = || variable_with_lltype("v", LowLevelType::Void);
+    let none_const = || {
+        Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::None,
+            LowLevelType::Void,
+        ))
+    };
+    let bool_case = |b: bool| Some(constant_with_lltype(ConstValue::Bool(b), LowLevelType::Bool));
+
+    let ll_builder = variable_with_lltype("ll_builder", builder_ptr_lltype.clone());
+    let ll_str = variable_with_lltype("ll_str", buf_lltype.clone());
+    let start = variable_with_lltype("start", LowLevelType::Signed);
+    let end = variable_with_lltype("end", LowLevelType::Signed);
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(ll_builder.clone()),
+        Hlvalue::Variable(ll_str.clone()),
+        Hlvalue::Variable(start.clone()),
+        Hlvalue::Variable(end.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", LowLevelType::Void);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    // fallback: ll_append_res_slice(ll_builder, ll_str, start, end).
+    let fb_llb = variable_with_lltype("ll_builder", builder_ptr_lltype);
+    let fb_str = variable_with_lltype("ll_str", buf_lltype);
+    let fb_start = variable_with_lltype("start", LowLevelType::Signed);
+    let fb_end = variable_with_lltype("end", LowLevelType::Signed);
+    let block_fb = Block::shared(vec![
+        Hlvalue::Variable(fb_llb.clone()),
+        Hlvalue::Variable(fb_str.clone()),
+        Hlvalue::Variable(fb_start.clone()),
+        Hlvalue::Variable(fb_end.clone()),
+    ]);
+    block_fb.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![
+            Hlvalue::Constant(res_slice_fn),
+            Hlvalue::Variable(fb_llb),
+            Hlvalue::Variable(fb_str),
+            Hlvalue::Variable(fb_start),
+            Hlvalue::Variable(fb_end),
+        ],
+        Hlvalue::Variable(void_result()),
+    ));
+    block_fb.closeblock(vec![
+        Link::new(vec![none_const()], Some(graph.returnblock.clone()), None).into_ref(),
+    ]);
+
+    // startblock: size = end - start; handled = try_append_slice(...); branch.
+    let size = variable_with_lltype("size", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "int_sub",
+        vec![Hlvalue::Variable(end.clone()), Hlvalue::Variable(start.clone())],
+        Hlvalue::Variable(size.clone()),
+    ));
+    let handled = variable_with_lltype("handled", LowLevelType::Bool);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![
+            Hlvalue::Constant(try_append_slice_fn),
+            Hlvalue::Variable(ll_builder.clone()),
+            Hlvalue::Variable(ll_str.clone()),
+            Hlvalue::Variable(start.clone()),
+            Hlvalue::Variable(size),
+        ],
+        Hlvalue::Variable(handled.clone()),
+    ));
+    startblock.borrow_mut().exitswitch = Some(Hlvalue::Variable(handled));
+    startblock.closeblock(vec![
+        Link::new(vec![none_const()], Some(graph.returnblock.clone()), bool_case(true)).into_ref(),
+        Link::new(
+            vec![
+                Hlvalue::Variable(ll_builder),
+                Hlvalue::Variable(ll_str),
+                Hlvalue::Variable(start),
+                Hlvalue::Variable(end),
+            ],
+            Some(block_fb),
+            bool_case(false),
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec![
+            "ll_builder".to_string(),
+            "ll_str".to_string(),
+            "start".to_string(),
+            "end".to_string(),
+        ],
+        func,
+    ))
+}
+
 /// Synthesise `ll_grow_by(ll_builder, needed)` (`rbuilder.py:96-115`):
 ///
 /// ```python
@@ -2313,6 +2544,70 @@ mod tests {
             }
         }
         (count, all_ops)
+    }
+
+    #[test]
+    fn build_ll_jit_append_tries_slice_then_falls_back_to_res0() {
+        use super::Hlvalue;
+        let helper = super::build_ll_jit_append_helper_graph(
+            "ll_jit_append",
+            super::STRINGBUILDERPTR.clone(),
+            super::STRPTR.clone(),
+            super::STRPTR.clone(),
+            dummy_funcptr_const(),
+            dummy_funcptr_const(),
+        )
+        .expect("build_ll_jit_append_helper_graph");
+        assert_eq!(helper.func.name, "ll_jit_append");
+        let inner = helper.graph.borrow();
+        let startblock = inner.startblock.borrow();
+        let ops: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|o| o.opname.as_str())
+            .collect();
+        assert_eq!(ops, vec!["getsubstruct", "getarraysize", "direct_call"]);
+        assert_eq!(startblock.exits.len(), 2);
+        drop(startblock);
+        let (count, all_ops) = walk_ops(&inner.startblock);
+        assert_eq!(count, 3); // start, fallback, returnblock
+        assert_eq!(all_ops.iter().filter(|o| o.as_str() == "direct_call").count(), 2);
+        let Hlvalue::Variable(ret) = &inner.returnblock.borrow().inputargs[0] else {
+            panic!("returnblock inputarg must be a Variable");
+        };
+        assert_eq!(ret.concretetype.borrow().clone(), Some(LowLevelType::Void));
+    }
+
+    #[test]
+    fn build_ll_jit_append_slice_tries_slice_then_falls_back_to_res_slice() {
+        use super::Hlvalue;
+        let helper = super::build_ll_jit_append_slice_helper_graph(
+            "ll_jit_append_slice",
+            super::STRINGBUILDERPTR.clone(),
+            super::STRPTR.clone(),
+            dummy_funcptr_const(),
+            dummy_funcptr_const(),
+        )
+        .expect("build_ll_jit_append_slice_helper_graph");
+        assert_eq!(helper.func.name, "ll_jit_append_slice");
+        let inner = helper.graph.borrow();
+        let startblock = inner.startblock.borrow();
+        let ops: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|o| o.opname.as_str())
+            .collect();
+        assert_eq!(ops, vec!["int_sub", "direct_call"]);
+        assert_eq!(startblock.inputargs.len(), 4);
+        assert_eq!(startblock.exits.len(), 2);
+        drop(startblock);
+        let (count, all_ops) = walk_ops(&inner.startblock);
+        assert_eq!(count, 3);
+        assert_eq!(all_ops.iter().filter(|o| o.as_str() == "direct_call").count(), 2);
+        let Hlvalue::Variable(ret) = &inner.returnblock.borrow().inputargs[0] else {
+            panic!("returnblock inputarg must be a Variable");
+        };
+        assert_eq!(ret.concretetype.borrow().clone(), Some(LowLevelType::Void));
     }
 
     #[test]
