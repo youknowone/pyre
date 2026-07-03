@@ -352,7 +352,9 @@ struct RewriteState {
     /// we emit an operation that can trigger a collection or on LABEL.
     wb_applied: VecSet<OpRef>,
     /// Forwarding map from original result OpRefs to rewritten result boxes.
-    forwarding: VecMap<OpRef, Operand>,
+    /// Keyed lookup only (`resolve`/`record_result_mapping`), never iterated
+    /// in order, so a hash map keeps the per-op resolve O(1) on long traces.
+    forwarding: std::collections::HashMap<OpRef, Operand>,
 
     // ── Array length tracking (rewrite.py:59 _known_lengths) ──
     /// Maps array OpRef → known length. Populated when NEW_ARRAY has a
@@ -453,7 +455,7 @@ impl RewriteState {
             previous_size: 0,
             last_malloced_ref: Operand::none(),
             wb_applied: VecSet::new(),
-            forwarding: VecMap::new(),
+            forwarding: std::collections::HashMap::new(),
             known_lengths: VecMap::new(),
             pending_zeros: Vec::new(),
             initialized_indices: VecMap::new(),
