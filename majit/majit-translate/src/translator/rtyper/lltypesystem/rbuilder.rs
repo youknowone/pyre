@@ -16,6 +16,7 @@ use crate::flowspace::model::{
     SpaceOperation, Variable,
 };
 use crate::flowspace::pygraph::PyGraph;
+use crate::translator::backendopt::constfold::WE_ARE_JITTED_TAG_ID;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
     ForwardReference, LowLevelType, Ptr, PtrTarget, Struct,
@@ -1364,6 +1365,147 @@ pub fn build_ll__ll_append_multiple_char_helper_graph(
     Ok(helper_pygraph_from_graph(
         graph,
         vec!["ll_builder".to_string(), "char".to_string(), "times".to_string()],
+        func,
+    ))
+}
+
+/// Synthesise `ll_append(ll_builder, ll_str)` (`rbuilder.py:155-161`):
+///
+/// ```python
+/// if jit.we_are_jitted():
+///     ll_jit_append(ll_builder, ll_str)
+/// else:
+///     # no-jit case: inline the logic of _ll_append() in the caller
+///     _ll_append(ll_builder, ll_str, 0, len(ll_str.chars))
+/// ```
+///
+/// `jit.we_are_jitted()` rtypes to the identity-bearing symbolic
+/// `Constant(ConstValue::SpecTag(WE_ARE_JITTED_TAG_ID), Bool)`
+/// (`jit.py:397-406`), emitted here as the branch exitswitch.
+/// `replace_we_are_jitted` folds it to `false` on the interpreter
+/// path and `jtransform` folds it to `true` on the JIT path.
+/// `ll_jit_append` / `_ll_append` are `direct_call` callee consts.
+/// Returns `Void`.
+pub fn build_ll_append_helper_graph(
+    name: &str,
+    builder_ptr_lltype: LowLevelType,
+    buf_lltype: LowLevelType,
+    chars_array_ptr_lltype: LowLevelType,
+    jit_append_fn: Constant,
+    ll_append_fn: Constant,
+) -> Result<PyGraph, TyperError> {
+    let void_result = || variable_with_lltype("v", LowLevelType::Void);
+    let none_const = || {
+        Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::None,
+            LowLevelType::Void,
+        ))
+    };
+    let bool_case = |b: bool| Some(constant_with_lltype(ConstValue::Bool(b), LowLevelType::Bool));
+
+    let ll_builder = variable_with_lltype("ll_builder", builder_ptr_lltype.clone());
+    let ll_str = variable_with_lltype("ll_str", buf_lltype.clone());
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(ll_builder.clone()),
+        Hlvalue::Variable(ll_str.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", LowLevelType::Void);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    // jit arm: ll_jit_append(ll_builder, ll_str).
+    let jit_llb = variable_with_lltype("ll_builder", builder_ptr_lltype.clone());
+    let jit_str = variable_with_lltype("ll_str", buf_lltype.clone());
+    let block_jit = Block::shared(vec![
+        Hlvalue::Variable(jit_llb.clone()),
+        Hlvalue::Variable(jit_str.clone()),
+    ]);
+    block_jit.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![
+            Hlvalue::Constant(jit_append_fn),
+            Hlvalue::Variable(jit_llb),
+            Hlvalue::Variable(jit_str),
+        ],
+        Hlvalue::Variable(void_result()),
+    ));
+    block_jit.closeblock(vec![
+        Link::new(vec![none_const()], Some(graph.returnblock.clone()), None).into_ref(),
+    ]);
+
+    // no-jit arm: _ll_append(ll_builder, ll_str, 0, len(ll_str.chars)).
+    let nj_llb = variable_with_lltype("ll_builder", builder_ptr_lltype);
+    let nj_str = variable_with_lltype("ll_str", buf_lltype);
+    let block_nojit = Block::shared(vec![
+        Hlvalue::Variable(nj_llb.clone()),
+        Hlvalue::Variable(nj_str.clone()),
+    ]);
+    let chars = variable_with_lltype("chars", chars_array_ptr_lltype);
+    block_nojit.borrow_mut().operations.push(SpaceOperation::new(
+        "getsubstruct",
+        vec![
+            Hlvalue::Variable(nj_str.clone()),
+            constant_with_lltype(ConstValue::byte_str("chars"), LowLevelType::Void),
+        ],
+        Hlvalue::Variable(chars.clone()),
+    ));
+    let len = variable_with_lltype("length", LowLevelType::Signed);
+    block_nojit.borrow_mut().operations.push(SpaceOperation::new(
+        "getarraysize",
+        vec![Hlvalue::Variable(chars)],
+        Hlvalue::Variable(len.clone()),
+    ));
+    block_nojit.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![
+            Hlvalue::Constant(ll_append_fn),
+            Hlvalue::Variable(nj_llb),
+            Hlvalue::Variable(nj_str),
+            constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed),
+            Hlvalue::Variable(len),
+        ],
+        Hlvalue::Variable(void_result()),
+    ));
+    block_nojit.closeblock(vec![
+        Link::new(vec![none_const()], Some(graph.returnblock.clone()), None).into_ref(),
+    ]);
+
+    // startblock: branch on `we_are_jitted()` symbolic. The exitswitch
+    // is the identity-bearing `SpecTag` constant so `replace_symbolic`
+    // (interpreter path) / `jtransform` (JIT path) can fold the branch.
+    startblock.borrow_mut().exitswitch = Some(Hlvalue::Constant(Constant::with_concretetype(
+        ConstValue::SpecTag(WE_ARE_JITTED_TAG_ID),
+        LowLevelType::Bool,
+    )));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(ll_builder.clone()),
+                Hlvalue::Variable(ll_str.clone()),
+            ],
+            Some(block_jit),
+            bool_case(true),
+        )
+        .into_ref(),
+        Link::new(
+            vec![Hlvalue::Variable(ll_builder), Hlvalue::Variable(ll_str)],
+            Some(block_nojit),
+            bool_case(false),
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["ll_builder".to_string(), "ll_str".to_string()],
         func,
     ))
 }
@@ -3005,6 +3147,46 @@ mod tests {
         assert_eq!(n("direct_call"), 1); // ll_grow_by
         assert_eq!(n("setfield"), 1); // current_pos = end
 
+        let Hlvalue::Variable(ret) = &inner.returnblock.borrow().inputargs[0] else {
+            panic!("returnblock inputarg must be a Variable");
+        };
+        assert_eq!(ret.concretetype.borrow().clone(), Some(LowLevelType::Void));
+    }
+
+    #[test]
+    fn build_ll_append_branches_on_we_are_jitted_symbolic() {
+        use super::Hlvalue;
+        let helper = super::build_ll_append_helper_graph(
+            "ll_append",
+            super::STRINGBUILDERPTR.clone(),
+            super::STRPTR.clone(),
+            super::STRPTR.clone(),
+            dummy_funcptr_const(),
+            dummy_funcptr_const(),
+        )
+        .expect("build_ll_append_helper_graph");
+        assert_eq!(helper.func.name, "ll_append");
+        let inner = helper.graph.borrow();
+        let startblock = inner.startblock.borrow();
+        // startblock only branches; no ops.
+        assert!(startblock.operations.is_empty());
+        assert_eq!(startblock.exits.len(), 2);
+        // exitswitch is the identity-bearing we_are_jitted SpecTag const.
+        match &startblock.exitswitch {
+            Some(Hlvalue::Constant(c)) => assert_eq!(
+                c.value,
+                super::ConstValue::SpecTag(super::WE_ARE_JITTED_TAG_ID)
+            ),
+            other => panic!("exitswitch must be the SpecTag constant, got {other:?}"),
+        }
+        drop(startblock);
+        let (count, all_ops) = walk_ops(&inner.startblock);
+        // start, jit arm, no-jit arm, returnblock.
+        assert_eq!(count, 4);
+        // jit arm: ll_jit_append; no-jit arm: getsubstruct+getarraysize+_ll_append.
+        assert_eq!(all_ops.iter().filter(|o| o.as_str() == "direct_call").count(), 2);
+        assert_eq!(all_ops.iter().filter(|o| o.as_str() == "getsubstruct").count(), 1);
+        assert_eq!(all_ops.iter().filter(|o| o.as_str() == "getarraysize").count(), 1);
         let Hlvalue::Variable(ret) = &inner.returnblock.borrow().inputargs[0] else {
             panic!("returnblock inputarg must be a Variable");
         };
