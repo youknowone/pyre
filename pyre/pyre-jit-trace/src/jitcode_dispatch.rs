@@ -5793,6 +5793,16 @@ fn try_execute_residual_call_via_executor(
     // the `for_iter_next` consume itself never counts).
     let user_frame_snapshot = (!provably_side_effect_free && fbw_foriter_inflight_active())
         .then(pyre_interpreter::call::frame_entry_count);
+    // #73/#267: the user-frame gate above excludes the `for_iter_next` consume
+    // itself, so sample the frame odometer separately for it — a user-defined
+    // iterator's `__next__`/`__getitem__` runs Python bytecode (the odometer
+    // advances) while a builtin iterator's next runs at the C level (it does
+    // not).  The operand-stack mirror cannot yet reconcile the inline sub-walk
+    // that the user iterator's bytecode drives, so the post-call decline uses
+    // this to keep the legacy resume for a user-iterator FOR_ITER while a
+    // builtin FOR_ITER stays modeled.
+    let foriter_frame_snapshot = (helper == majit_ir::PyreHelperKind::ForIterNext)
+        .then(pyre_interpreter::call::frame_entry_count);
     let exec_result = {
         let _suspend = majit_metainterp::TraceContinuationSuspendGuard::enter();
         majit_metainterp::executor::execute_residual_call(call_descr, func_ptr, &args)
@@ -5862,6 +5872,19 @@ fn try_execute_residual_call_via_executor(
             );
         }
         fbw_mark_foriter_body_effect_since_consume();
+    }
+    // #73/#267: a user-defined iterator's FOR_ITER runs its item producer
+    // (`__next__`/`__getitem__`) as an inline sub-walk whose operand-stack
+    // boundaries the mirror does not yet reconcile — keeping the mirror valid
+    // across such a FOR_ITER grafts a corrupt box at a loop-body guard resume
+    // ("not an iterator").  Decline the mirror for the rest of this walk (the
+    // legacy resume, unchanged from the pre-`ResultToTos` behaviour) when the
+    // `for_iter_next` consume entered a user frame; a BUILTIN iterator's
+    // consume runs at the C level (no user frame) and stays modeled.
+    let foriter_entered_user_frame = foriter_frame_snapshot
+        .is_some_and(|before| pyre_interpreter::call::frame_entry_count() != before);
+    if foriter_entered_user_frame {
+        ctx.vstack_valid = false;
     }
     match exec_result {
         Ok(result_i64) => {
@@ -5945,6 +5968,20 @@ fn try_execute_residual_call_via_executor(
                     result_i64 as usize as pyre_object::PyObjectRef,
                     body_pc,
                 );
+                // #73/#267: the item lands on the operand-stack TOS through the
+                // codewriter's `pin!` slot binding (FOR_ITER lowering), not a
+                // `setarrayitem_vable_r` push, and the residual result is
+                // stamped via `set_opref_concrete`, not `write_ref_reg` — so
+                // neither mirror chokepoint sees the item and `vstack_last_ref`
+                // still holds whatever inner box the ForIterNext produced.  Seed
+                // it with the item OpRef so the FOR_ITER boundary
+                // (`ResultToTos`) places the item, not a stale box, on the new
+                // TOS.  Reached for a builtin iterator only: a user-defined
+                // iterator already latched `vstack_valid = false` above
+                // (`foriter_entered_user_frame`), so this seed is inert for it
+                // (`vstack_last_ref` is consumed only while the mirror is
+                // valid).
+                ctx.vstack_last_ref = recorded;
                 if fbw_debug_abort_enabled() {
                     let item = result_i64 as usize as pyre_object::PyObjectRef;
                     let intval = if unsafe { pyre_object::pyobject::is_int(item) } {
@@ -8261,9 +8298,22 @@ fn classify_vstack_opcode(
             VstackOpClass::MultiResultFromShadow
         }
 
-        // Everything else (FOR_ITER, TO_BOOL if present as a distinct
-        // variant, …) is not modeled — decline and fall back to the legacy
-        // read.
+        // FOR_ITER (continue arm): peeks the iterator (kept on the stack) and
+        // pushes the yielded item on the new TOS (net +1) — the same shape as
+        // the value producers above, so the item is `vstack_last_ref`.  The
+        // item never reaches either mirror chokepoint on its own (the
+        // `for_iter_next` residual result is stamped via `set_opref_concrete`,
+        // not `write_ref_reg`, and the item lands on TOS through the
+        // codewriter's `pin!` slot binding, not a `setarrayitem_vable_r`
+        // push), so the residual-execution path seeds `vstack_last_ref` with
+        // the item OpRef explicitly (the `ForIterNext` capture site).  The
+        // exhaustion arm pushes no item, but it is a non-fallthrough guard
+        // exit, so the boundary's `sequential` gate suppresses this per-op
+        // effect there.
+        Instruction::ForIter { .. } => VstackOpClass::ResultToTos,
+
+        // Everything else (TO_BOOL if present as a distinct variant, …) is
+        // not modeled — decline and fall back to the legacy read.
         _ => VstackOpClass::Unmodeled,
     }
 }
