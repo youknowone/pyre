@@ -381,6 +381,7 @@ unsafe fn builtin_structural_hash(obj: PyObjectRef) -> i64 {
 /// trait-dispatch sites; runtime polymorphic dispatch (i.e. when only
 /// a `PyObjectRef` is in hand) goes through the free function
 /// [`w_dict_get_strategy`].
+#[allow(non_camel_case_types)]
 pub trait W_DictMultiObject {
     /// `dictmultiobject.py:49-50 W_DictMultiObject.get_strategy`
     /// abstract method, overridden by `W_DictObject` (`:321-322`) and

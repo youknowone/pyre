@@ -1747,7 +1747,7 @@ fn rewrite_body(
                                 .as_ref()
                                 .cloned()
                                 .unwrap_or_else(|| syn::parse_quote!(pc));
-                            let stacksize_expr = args
+                            let _stacksize_expr = args
                                 .stacksize
                                 .as_ref()
                                 .cloned()

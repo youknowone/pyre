@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Generate `JitCode` builders and the generic `__trace_*` wrapper.
 
 use proc_macro2::TokenStream;

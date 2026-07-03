@@ -1,4 +1,16 @@
-#![allow(ambiguous_glob_reexports, dead_code, unused_assignments, unused_unsafe)]
+#![allow(
+    ambiguous_glob_reexports,
+    dead_code,
+    non_snake_case,
+    unconditional_recursion,
+    unsafe_op_in_unsafe_fn,
+    unused_assignments,
+    unused_doc_comments,
+    unused_imports,
+    unused_mut,
+    unused_unsafe,
+    unused_variables
+)]
 
 //! pyre-interpreter — the Python interpreter.
 //!

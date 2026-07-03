@@ -206,7 +206,7 @@ fn install_handler(signum: i32, handler: libc::sighandler_t) -> bool {
 /// handler so it is delivered at the next interpreter checkpoint.
 #[cfg(unix)]
 pub fn pypysig_setflag(signum: i32) -> bool {
-    install_handler(signum, signal_setflag_handler as usize)
+    install_handler(signum, signal_setflag_handler as *const () as usize)
 }
 
 /// `signals.c:75-87 pypysig_default` — restore the OS default action.

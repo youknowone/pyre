@@ -4,7 +4,14 @@
 // suppression until those ports are collapsed into generated modules or deleted.
 // TODO(pyre-jit-cleanup): move these to generated modules/items as each
 // scaffolding block graduates.
-#![allow(dead_code, unused_assignments, unused_doc_comments, unused_macros)]
+#![allow(
+    dead_code,
+    unsafe_op_in_unsafe_fn,
+    unused_assignments,
+    unused_doc_comments,
+    unused_imports,
+    unused_macros
+)]
 
 //! pyre-jit: Auto-generated JIT for pyre.
 //!

@@ -39,6 +39,7 @@ impl Default for Entry {
 /// counter.py:16 JitCounter
 pub struct JitCounter {
     /// counter.py:86 size
+    #[allow(dead_code)]
     size: usize,
     /// counter.py:87 shift
     shift: u32,

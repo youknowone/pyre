@@ -1,4 +1,10 @@
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    unpredictable_function_pointer_comparisons,
+    unused_imports,
+    unused_mut,
+    unused_variables
+)]
 
 //! `majit-meta`: Meta-tracing automation layer for the majit JIT framework.
 //!

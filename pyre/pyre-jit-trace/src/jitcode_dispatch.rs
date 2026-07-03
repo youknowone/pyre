@@ -10247,7 +10247,7 @@ fn walker_record_guard_exception(ctx: &mut WalkContext<'_, '_>, pc: usize) {
         ConcreteValue::Ref(p) if !p.is_null() => p,
         _ => {
             ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
-            walker_capture_snapshot_for_last_guard(ctx, pc);
+            let _ = walker_capture_snapshot_for_last_guard(ctx, pc);
             return;
         }
     };
@@ -10264,7 +10264,7 @@ fn walker_record_guard_exception(ctx: &mut WalkContext<'_, '_>, pc: usize) {
     let exc_type_const = ctx.trace_ctx.const_int(exc_type_ptr);
     ctx.trace_ctx
         .record_guard(OpCode::GuardException, &[exc_type_const], 0);
-    walker_capture_snapshot_for_last_guard(ctx, pc);
+    let _ = walker_capture_snapshot_for_last_guard(ctx, pc);
 }
 
 fn direct_call_release_gil(

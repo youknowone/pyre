@@ -12,7 +12,7 @@ use majit_ir::resumedata::{
     PendingFieldLayoutSummary, ResumeValueKind, ResumeValueLayoutSummary, ResumeVirtualKind,
     ResumeVirtualLayoutSummary, opt_descr_arc_ptr_eq,
 };
-use majit_ir::{ArrayDescrInfo, Const, DescrRef, FieldDescrInfo, Type};
+use majit_ir::{ArrayDescrInfo, Const, DescrRef, FieldDescrInfo};
 
 use crate::ExitValueSourceLayout;
 

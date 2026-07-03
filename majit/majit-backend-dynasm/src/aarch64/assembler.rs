@@ -1420,7 +1420,7 @@ impl<'a> AssemblerARM64<'a> {
         // (x30), which is safe here: a bridge reuses the originating loop's
         // stack frame and reloads lr from it at `_call_footer`, treating lr
         // as call-clobbered scratch throughout the body.
-        let helper_addr = crate::runner::dynasm_realloc_frame as i64;
+        let helper_addr = crate::runner::dynasm_realloc_frame as *const () as i64;
         self.emit_mov_imm64(17, helper_addr);
         dynasm!(self.mc ; .arch aarch64
             ; blr x17

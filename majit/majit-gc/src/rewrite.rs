@@ -20,6 +20,7 @@ use crate::{GcRewriter, WriteBarrierDescr};
 fn mk_op(opcode: OpCode, args: &[Operand]) -> Op {
     Op::new(opcode, args)
 }
+#[allow(dead_code)]
 fn mk_op_descr(opcode: OpCode, args: &[Operand], descr: DescrRef) -> Op {
     Op::with_descr(opcode, args, descr)
 }
