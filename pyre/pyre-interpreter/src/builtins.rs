@@ -2162,6 +2162,50 @@ unsafe fn stream_encoding_errors(stream: PyObjectRef) -> (String, String) {
 }
 
 /// `print(*args)` — write space-separated str representations to stdout.
+/// The sink `print()` uses when no explicit `file=` is given, resolved from
+/// the live `sys.stdout` on each call — `bltinmodule.c builtin_print` /
+/// `app_io.py print_` map `file is None` to `sys.stdout`, so a Python-level
+/// `sys.stdout = ...` redirects `print()`.
+enum DefaultPrintTarget {
+    /// Unmodified default stdout (`sys.stdout is sys.__stdout__`): keep pyre's
+    /// native `print_output` path (its strict-utf-8 `print_render` render and
+    /// direct write), leaving default output and surrogate handling unchanged.
+    Native,
+    /// A rebound `sys.stdout`; write through its `write` / `flush` methods.
+    Rebound(PyObjectRef),
+    /// `sys.stdout` is `None`; emit nothing (builtin_print returns `None`).
+    Silent,
+}
+
+/// Resolve `print()`'s default sink from the live `sys` module.
+///
+/// Only a user redirect (`sys.stdout` rebound to some object other than the
+/// saved `sys.__stdout__`) is routed through Python `write` / `flush`; the
+/// unmodified default keeps the native path. A missing `sys.stdout` attribute
+/// raises `RuntimeError("lost sys.stdout")` as builtin_print does.
+fn resolve_default_print_target() -> Result<DefaultPrintTarget, crate::PyError> {
+    let Some(sys_mod) = crate::importing::get_sys_module("sys") else {
+        // No `sys` yet (very early bootstrap) — native path.
+        return Ok(DefaultPrintTarget::Native);
+    };
+    let stdout = match crate::baseobjspace::getattr_str(sys_mod, "stdout") {
+        Ok(w) => w,
+        Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
+            return Err(crate::PyError::runtime_error("lost sys.stdout"));
+        }
+        Err(e) => return Err(e),
+    };
+    if unsafe { pyre_object::is_none(stdout) } {
+        return Ok(DefaultPrintTarget::Silent);
+    }
+    if let Ok(orig) = crate::baseobjspace::getattr_str(sys_mod, "__stdout__") {
+        if std::ptr::eq(orig, stdout) {
+            return Ok(DefaultPrintTarget::Native);
+        }
+    }
+    Ok(DefaultPrintTarget::Rebound(stdout))
+}
+
 fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // Check if last arg is a kwargs dict (from CALL_KW builtin dispatch).
     // Distinguished from regular dict args by __pyre_kw__ marker key.
@@ -2191,6 +2235,18 @@ fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         (&args[..args.len() - 1], end_obj, sep_obj, file_obj, flush)
     } else {
         (args, None, None, None, false)
+    };
+
+    // With no explicit `file` (absent or `file=None`), the sink is the live
+    // `sys.stdout`, resolved per call so a Python-level rebinding redirects
+    // `print()`.  The unmodified default keeps the native path (`file = None`).
+    let file = match file {
+        Some(f) => Some(f),
+        None => match resolve_default_print_target()? {
+            DefaultPrintTarget::Native => None,
+            DefaultPrintTarget::Rebound(fp) => Some(fp),
+            DefaultPrintTarget::Silent => return Ok(w_none()),
+        },
     };
 
     // `bltinmodule.c print_impl` writes incrementally: `str(arg)`, then the
