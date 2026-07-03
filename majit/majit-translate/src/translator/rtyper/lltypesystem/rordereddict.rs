@@ -220,26 +220,25 @@ impl OrderedDictRepr {
         }))
     }
 
-    /// Fail-closed gate for the landmine `build_ll_dict_lookup_helper_graph`'s
-    /// doc comment flags: `direct_compare_op` hardcodes `ptr_eq` for every
-    /// `Ptr(_)` key lltype, which is wrong for keys whose repr defines a real
-    /// structural equality (`get_ll_eq_function` returning `Some`, e.g.
-    /// `StringRepr::ll_streq`). int/bool/char/unichar keys return `None`
-    /// (direct-compare is correct for them) and proceed; every other key
-    /// repr fails closed here instead of silently miscompiling to
-    /// pointer-identity comparison.
+    /// Fail-closed gate for the still-unported `custom_eq_hash` (`r_dict`)
+    /// path: `get_ll_dict` (`rordereddict.py:137-147`) wires `d.keyeq` to
+    /// `ll_keyeq_custom`, which reads the runtime `d.fnkeyeq` PBC funcptr
+    /// field, and `d.paranoia` is `True` (`not simple_hash_eq`) — the
+    /// mutation-restart branch (`ll_dict_lookup`'s recursive
+    /// `return ll_dict_lookup(d, key, hash, store_flag, T)`) is genuinely
+    /// live for that case and unported here. Plain (`not custom_eq_hash`)
+    /// dicts route entirely through `self.base.key_repr.get_ll_eq_function`
+    /// instead (`rordereddict.py:220-222`) — see
+    /// [`build_ll_dict_lookup_helper_graph`]'s doc comment for how that
+    /// `d.keyeq` value (e.g. `StringRepr::ll_streq` for str keys, `None` for
+    /// identity keys) is wired into the direct-compare fallback.
     fn require_direct_compare_key(&self, hop: &HighLevelOp) -> Result<(), TyperError> {
-        if self
-            .base
-            .key_repr
-            .get_ll_eq_function(&hop.rtyper)?
-            .is_some()
-        {
+        let _ = hop;
+        if self.base.custom_eq_hash {
             return Err(TyperError::message(format!(
-                "OrderedDictRepr: dict key eq function not wired into \
-                 build_ll_dict_lookup_helper_graph's direct_compare (key repr {} \
-                 defines a custom get_ll_eq_function — str/instance keys need the \
-                 call-based keyeq branch, not yet ported)",
+                "OrderedDictRepr: custom_eq_hash (r_dict) dict key eq function not wired into \
+                 build_ll_dict_lookup_helper_graph (key repr {} uses the runtime d.fnkeyeq PBC \
+                 funcptr + d.paranoia mutation-restart — not yet ported)",
                 self.base.key_repr.class_name()
             )));
         }
@@ -267,6 +266,17 @@ impl OrderedDictRepr {
             })?;
         let hash_fn_const = sub_helper_funcptr_constant(rtyper, &hash_fn)?;
 
+        // `d.keyeq` for a plain (non-custom_eq_hash) dict is the key repr's
+        // own `get_ll_eq_function` result — `None` for identity keys
+        // (int/bool/char/unichar/instance-without-__eq__), `Some(ll_streq)`
+        // for str keys (`rordereddict.py:150-157`).
+        let eq_fn_const = self
+            .base
+            .key_repr
+            .get_ll_eq_function(rtyper)?
+            .map(|eq_fn| sub_helper_funcptr_constant(rtyper, &eq_fn))
+            .transpose()?;
+
         let dict_ptr = self.lowleveltype.clone();
         let entries_ptr = self.entries_ptr_lltype();
         let key_lltype = self.DICTKEY.clone();
@@ -275,6 +285,7 @@ impl OrderedDictRepr {
             let dict_ptr = dict_ptr.clone();
             let entries_ptr = entries_ptr.clone();
             let key_lltype = key_lltype.clone();
+            let eq_fn_const = eq_fn_const.clone();
             rtyper.lowlevel_helper_function_with_builder(
                 "ll_dict_lookup",
                 vec![
@@ -291,6 +302,7 @@ impl OrderedDictRepr {
                         entries_ptr.clone(),
                         LowLevelType::Unsigned,
                         key_lltype.clone(),
+                        eq_fn_const.clone(),
                     )
                 },
             )?
@@ -1703,8 +1715,13 @@ fn lltype_must_clear_gc_ptr(lltype: &LowLevelType) -> bool {
 ///     index = rffi.cast(lltype.Signed, indexes[intmask(i)])
 ///     if index >= VALID_OFFSET:
 ///         checkingkey = entries[index - VALID_OFFSET].key
-///         if checkingkey == key:                 # direct_compare, keyeq is None
+///         if direct_compare and checkingkey == key:
 ///             return index - VALID_OFFSET
+///         if d.keyeq is not None and entries.entry_hash(d, index - VALID_OFFSET) == hash:
+///             found = d.keyeq(checkingkey, key)
+///             if d.paranoia: ...                 # restart on mutation, r_dict-only
+///             if found:
+///                 return index - VALID_OFFSET
 ///         deletedslot = -1
 ///     elif index == DELETED:
 ///         deletedslot = intmask(i)
@@ -1726,19 +1743,47 @@ fn lltype_must_clear_gc_ptr(lltype: &LowLevelType) -> bool {
 ///             return -1
 ///         elif index >= VALID_OFFSET:
 ///             checkingkey = entries[index - VALID_OFFSET].key
-///             if checkingkey == key:
+///             if direct_compare and checkingkey == key:
 ///                 return index - VALID_OFFSET
+///             if d.keyeq is not None and entries.entry_hash(d, index - VALID_OFFSET) == hash:
+///                 found = d.keyeq(checkingkey, key)
+///                 if found:
+///                     return index - VALID_OFFSET
 ///         elif deletedslot == -1:
 ///             deletedslot = intmask(i)
 ///         perturb >>= PERTURB_SHIFT
 /// ```
 ///
-/// **Scope (faithful subset):** simple-hash-eq + `direct_compare`. The
-/// `d.keyeq is not None` / `d.paranoia` branches (custom `__eq__`, PBC
-/// `hlinvoke`, lookup restart) are skipped — they are statically dead when
-/// `keyeq is None`, exactly as RPython folds them. All `DICTINDEX_*` widths
-/// collapse to `Ptr(GcArray(Unsigned))`, so this one graph serves every
-/// `FUNC_*` width (the `T`/`ll_call_lookup_function` 4-way dispatch is inert).
+/// **Scope (faithful subset):** `direct_compare` is always `True` here (no
+/// key repr this file wires sets `no_direct_compare`, e.g. `ll_streq` does
+/// not — see `rint.py:627`/`_rweakkeydict.py:107` for the two upstream cases
+/// that do, both out of scope). `d.keyeq` is `eq_fn_const` — `None` for
+/// identity keys (int/bool/char/unichar/instance-without-`__eq__`, matching
+/// `get_ll_eq_function() -> None`, `rordereddict.py:150-157`), or the key
+/// repr's `get_ll_eq_function()` result for keys with real structural
+/// equality (`Some(ll_streq)` for str). When `eq_fn_const` is `Some`, a
+/// direct-compare miss falls through to `direct_call(eq_fn_const,
+/// checkingkey, key)` at both comparison sites, exactly mirroring `d.keyeq(
+/// checkingkey, key)`. `d.paranoia` is `False` for every dict this repr
+/// builds (`custom_eq_hash` is rejected earlier by
+/// [`OrderedDictRepr::require_direct_compare_key`]), so the mutation-restart
+/// branch is statically dead and stays unported, exactly as RPython folds it.
+///
+/// **Simplification (disclosed, correctness-preserving):** the
+/// `entries.entry_hash(d, index) == hash` precheck ahead of `d.keyeq(...)`
+/// is a pure performance short-circuit — `ll_streq` (or any `get_ll_eq_function`
+/// result) is a full, hash-independent content-equality function, so calling
+/// it unconditionally on every direct-compare miss cannot change the boolean
+/// outcome, only skip a possible early-out. This graph omits the precheck
+/// rather than threading the original `hash` value through the in-loop
+/// `perturb`-carrying block cycle (`loop_body`/`loop_notfree`/`loop_valid`/
+/// `loop_deleted`/`perturb_shift`), which drops `hash` after `loop_init`
+/// derives `perturb = r_uint(hash)` and never carries it further. Revisit if
+/// dict lookups become hot on the corpus.
+///
+/// All `DICTINDEX_*` widths collapse to `Ptr(GcArray(Unsigned))`, so this one
+/// graph serves every `FUNC_*` width (the `T`/`ll_call_lookup_function`
+/// 4-way dispatch is inert).
 ///
 /// **Unsigned arithmetic is load-bearing, not cosmetic:** `i` and `perturb`
 /// are `r_uint`. `perturb >>= PERTURB_SHIFT` is a *logical* shift
@@ -1755,16 +1800,19 @@ fn lltype_must_clear_gc_ptr(lltype: &LowLevelType) -> bool {
 /// standalone `_ll_write_indexes` helper remains for the non-inlined callers
 /// (`ll_dict_store_clean`, reindex) ported in later slices.
 ///
-/// 13-block CFG (plus the returnblock). First-try-before-loop mirrors the
-/// "do the first try before any looping" optimisation; the loop body
-/// re-derives `i`, reads the slot, and 3-way branches FREE / VALID / DELETED
-/// before the `perturb` shift back-edge.
+/// 13-block CFG (plus the returnblock) when `eq_fn_const` is `None`, 15-block
+/// when `Some` (one extra `direct_call(eq_fn_const, ...)` block per
+/// comparison site). First-try-before-loop mirrors the "do the first try
+/// before any looping" optimisation; the loop body re-derives `i`, reads the
+/// slot, and 3-way branches FREE / VALID / DELETED before the `perturb`
+/// shift back-edge.
 pub fn build_ll_dict_lookup_helper_graph(
     name: &str,
     dict_ptr_lltype: LowLevelType,
     entries_ptr_lltype: LowLevelType,
     index_elem_lltype: LowLevelType,
     key_lltype: LowLevelType,
+    eq_fn_const: Option<Constant>,
 ) -> Result<PyGraph, TyperError> {
     let indexes_ptr_lltype = _ll_ptr_to_array_of(index_elem_lltype.clone());
     let eq_op = direct_compare_op(&key_lltype)?;
@@ -2088,30 +2136,117 @@ pub fn build_ll_dict_lookup_helper_graph(
         &fv_eq,
     );
     block_first_valid.borrow_mut().exitswitch = Some(var(&fv_eq));
-    block_first_valid.closeblock(vec![
-        Link::new(
-            vec![var(&fv_slot)],
-            Some(graph.returnblock.clone()),
-            Some(bool_true()),
-        )
-        .into_ref(),
-        Link::new(
-            vec![
-                var(&fv_d),
-                var(&fv_entries),
-                var(&fv_indexes),
-                var(&fv_mask),
-                var(&fv_key),
-                var(&fv_sf),
-                var(&fv_hash),
-                var(&fv_i),
-                signed(-1),
-            ],
-            Some(block_loop_init.clone()),
-            Some(bool_false()),
-        )
-        .into_ref(),
-    ]);
+    let fv_loop_init_args = vec![
+        var(&fv_d),
+        var(&fv_entries),
+        var(&fv_indexes),
+        var(&fv_mask),
+        var(&fv_key),
+        var(&fv_sf),
+        var(&fv_hash),
+        var(&fv_i),
+        signed(-1),
+    ];
+    if let Some(eq_fn) = eq_fn_const.clone() {
+        // d.keyeq is not None (rordereddict.py:1052-1055): direct-compare
+        // missed, fall through to a call-based content compare via the key
+        // repr's get_ll_eq_function (ll_streq for str keys).
+        let fkc_d = new_var("d", dict_ptr_lltype.clone());
+        let fkc_entries = new_var("entries", entries_ptr_lltype.clone());
+        let fkc_indexes = new_var("indexes", indexes_ptr_lltype.clone());
+        let fkc_mask = new_var("mask_u", uns());
+        let fkc_key = new_var("key", key_lltype.clone());
+        let fkc_sf = new_var("store_flag", sig());
+        let fkc_hash = new_var("hash", sig());
+        let fkc_i = new_var("i", uns());
+        let fkc_slot = new_var("slot", sig());
+        let fkc_ckey = new_var("checkingkey", key_lltype.clone());
+        let block_first_keyeq_call = Block::shared(vec![
+            var(&fkc_d),
+            var(&fkc_entries),
+            var(&fkc_indexes),
+            var(&fkc_mask),
+            var(&fkc_key),
+            var(&fkc_sf),
+            var(&fkc_hash),
+            var(&fkc_i),
+            var(&fkc_slot),
+            var(&fkc_ckey),
+        ]);
+        block_first_valid.closeblock(vec![
+            Link::new(
+                vec![var(&fv_slot)],
+                Some(graph.returnblock.clone()),
+                Some(bool_true()),
+            )
+            .into_ref(),
+            Link::new(
+                vec![
+                    var(&fv_d),
+                    var(&fv_entries),
+                    var(&fv_indexes),
+                    var(&fv_mask),
+                    var(&fv_key),
+                    var(&fv_sf),
+                    var(&fv_hash),
+                    var(&fv_i),
+                    var(&fv_slot),
+                    var(&fv_ckey),
+                ],
+                Some(block_first_keyeq_call.clone()),
+                Some(bool_false()),
+            )
+            .into_ref(),
+        ]);
+
+        let fkc_found = new_var("found", LowLevelType::Bool);
+        push(
+            &block_first_keyeq_call,
+            "direct_call",
+            vec![Hlvalue::Constant(eq_fn), var(&fkc_ckey), var(&fkc_key)],
+            &fkc_found,
+        );
+        block_first_keyeq_call.borrow_mut().exitswitch = Some(var(&fkc_found));
+        block_first_keyeq_call.closeblock(vec![
+            Link::new(
+                vec![var(&fkc_slot)],
+                Some(graph.returnblock.clone()),
+                Some(bool_true()),
+            )
+            .into_ref(),
+            Link::new(
+                vec![
+                    var(&fkc_d),
+                    var(&fkc_entries),
+                    var(&fkc_indexes),
+                    var(&fkc_mask),
+                    var(&fkc_key),
+                    var(&fkc_sf),
+                    var(&fkc_hash),
+                    var(&fkc_i),
+                    signed(-1),
+                ],
+                Some(block_loop_init.clone()),
+                Some(bool_false()),
+            )
+            .into_ref(),
+        ]);
+    } else {
+        block_first_valid.closeblock(vec![
+            Link::new(
+                vec![var(&fv_slot)],
+                Some(graph.returnblock.clone()),
+                Some(bool_true()),
+            )
+            .into_ref(),
+            Link::new(
+                fv_loop_init_args,
+                Some(block_loop_init.clone()),
+                Some(bool_false()),
+            )
+            .into_ref(),
+        ]);
+    }
 
     // ===== block_first_notvalid: DELETED vs pristine FREE. =====
     let nv_i_s = new_var("i_s", sig());
@@ -2402,30 +2537,119 @@ pub fn build_ll_dict_lookup_helper_graph(
         &lv_eq,
     );
     block_loop_valid.borrow_mut().exitswitch = Some(var(&lv_eq));
-    block_loop_valid.closeblock(vec![
-        Link::new(
-            vec![var(&lv_slot)],
-            Some(graph.returnblock.clone()),
-            Some(bool_true()),
-        )
-        .into_ref(),
-        Link::new(
-            vec![
-                var(&lv_d),
-                var(&lv_entries),
-                var(&lv_indexes),
-                var(&lv_mask),
-                var(&lv_key),
-                var(&lv_sf),
-                var(&lv_perturb),
-                var(&lv_i),
-                var(&lv_ds),
-            ],
-            Some(block_perturb_shift.clone()),
-            Some(bool_false()),
-        )
-        .into_ref(),
-    ]);
+    let lv_perturb_shift_args = vec![
+        var(&lv_d),
+        var(&lv_entries),
+        var(&lv_indexes),
+        var(&lv_mask),
+        var(&lv_key),
+        var(&lv_sf),
+        var(&lv_perturb),
+        var(&lv_i),
+        var(&lv_ds),
+    ];
+    if let Some(eq_fn) = eq_fn_const.clone() {
+        // d.keyeq is not None (rordereddict.py:1092-1095), in-loop mirror of
+        // the first-try block_first_keyeq_call fallback above.
+        let lkc_d = new_var("d", dict_ptr_lltype.clone());
+        let lkc_entries = new_var("entries", entries_ptr_lltype.clone());
+        let lkc_indexes = new_var("indexes", indexes_ptr_lltype.clone());
+        let lkc_mask = new_var("mask_u", uns());
+        let lkc_key = new_var("key", key_lltype.clone());
+        let lkc_sf = new_var("store_flag", sig());
+        let lkc_perturb = new_var("perturb", uns());
+        let lkc_i = new_var("i", uns());
+        let lkc_ds = new_var("deletedslot", sig());
+        let lkc_slot = new_var("slot", sig());
+        let lkc_ckey = new_var("checkingkey", key_lltype.clone());
+        let block_loop_keyeq_call = Block::shared(vec![
+            var(&lkc_d),
+            var(&lkc_entries),
+            var(&lkc_indexes),
+            var(&lkc_mask),
+            var(&lkc_key),
+            var(&lkc_sf),
+            var(&lkc_perturb),
+            var(&lkc_i),
+            var(&lkc_ds),
+            var(&lkc_slot),
+            var(&lkc_ckey),
+        ]);
+        block_loop_valid.closeblock(vec![
+            Link::new(
+                vec![var(&lv_slot)],
+                Some(graph.returnblock.clone()),
+                Some(bool_true()),
+            )
+            .into_ref(),
+            Link::new(
+                vec![
+                    var(&lv_d),
+                    var(&lv_entries),
+                    var(&lv_indexes),
+                    var(&lv_mask),
+                    var(&lv_key),
+                    var(&lv_sf),
+                    var(&lv_perturb),
+                    var(&lv_i),
+                    var(&lv_ds),
+                    var(&lv_slot),
+                    var(&lv_ckey),
+                ],
+                Some(block_loop_keyeq_call.clone()),
+                Some(bool_false()),
+            )
+            .into_ref(),
+        ]);
+
+        let lkc_found = new_var("found", LowLevelType::Bool);
+        push(
+            &block_loop_keyeq_call,
+            "direct_call",
+            vec![Hlvalue::Constant(eq_fn), var(&lkc_ckey), var(&lkc_key)],
+            &lkc_found,
+        );
+        block_loop_keyeq_call.borrow_mut().exitswitch = Some(var(&lkc_found));
+        block_loop_keyeq_call.closeblock(vec![
+            Link::new(
+                vec![var(&lkc_slot)],
+                Some(graph.returnblock.clone()),
+                Some(bool_true()),
+            )
+            .into_ref(),
+            Link::new(
+                vec![
+                    var(&lkc_d),
+                    var(&lkc_entries),
+                    var(&lkc_indexes),
+                    var(&lkc_mask),
+                    var(&lkc_key),
+                    var(&lkc_sf),
+                    var(&lkc_perturb),
+                    var(&lkc_i),
+                    var(&lkc_ds),
+                ],
+                Some(block_perturb_shift.clone()),
+                Some(bool_false()),
+            )
+            .into_ref(),
+        ]);
+    } else {
+        block_loop_valid.closeblock(vec![
+            Link::new(
+                vec![var(&lv_slot)],
+                Some(graph.returnblock.clone()),
+                Some(bool_true()),
+            )
+            .into_ref(),
+            Link::new(
+                lv_perturb_shift_args,
+                Some(block_perturb_shift.clone()),
+                Some(bool_false()),
+            )
+            .into_ref(),
+        ]);
+    }
 
     // ===== block_loop_deleted: record first deleted slot (deletedslot == -1). =====
     let ld_i_s = new_var("i_s", sig());
@@ -7756,6 +7980,7 @@ pub fn ll_dict_lookup(
     entries_ptr_lltype: LowLevelType,
     index_elem_lltype: LowLevelType,
     key_lltype: LowLevelType,
+    eq_fn_const: Option<Constant>,
 ) -> Result<PyGraph, TyperError> {
     build_ll_dict_lookup_helper_graph(
         "ll_dict_lookup",
@@ -7763,6 +7988,7 @@ pub fn ll_dict_lookup(
         entries_ptr_lltype,
         index_elem_lltype,
         key_lltype,
+        eq_fn_const,
     )
 }
 
@@ -8463,6 +8689,40 @@ mod tests {
         )
     }
 
+    /// Str-keyed sample `(dict_ptr, entries_ptr, key_lltype)` for the lookup
+    /// builder, derived from a freshly built `OrderedDictRepr`.
+    fn sample_dict_lookup_str_key_lltypes() -> (LowLevelType, LowLevelType, LowLevelType) {
+        let ann = Rc::new(RPythonAnnotator::new(None, None, None, false));
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper.initialize_exceptiondata().expect("rtyper init");
+        let dictdef = DictDef::new(
+            None,
+            SomeValue::String(SomeString::new(false, false)),
+            SomeValue::Integer(SomeInteger::default()),
+            false,
+            false,
+            false,
+        );
+        let repr = OrderedDictRepr::new(
+            rtyper,
+            string_repr() as Arc<dyn Repr>,
+            signed_repr() as Arc<dyn Repr>,
+            dictdef,
+            None,
+            false,
+            false,
+        )
+        .expect("ordered dict repr");
+        let entries_ptr = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Array(repr.DICTENTRYARRAY.clone()),
+        }));
+        (
+            repr.lowleveltype().clone(),
+            entries_ptr,
+            repr.DICTKEY.clone(),
+        )
+    }
+
     /// Walk every block reachable from `start`, returning the visited block
     /// count and the flattened op-name list.
     fn walk_blocks(start: &BlockRef) -> (usize, Vec<String>) {
@@ -8502,6 +8762,7 @@ mod tests {
             entries_ptr,
             LowLevelType::Unsigned,
             key_lltype,
+            None,
         )
         .expect("build_ll_dict_lookup_helper_graph");
         assert_eq!(helper.func.name, "ll_dict_lookup");
@@ -8556,6 +8817,12 @@ mod tests {
                 "lookup CFG must emit {needed}, got {ops:?}"
             );
         }
+        // eq_fn_const is None (identity/int keys) — no keyeq call branch, no
+        // direct_call anywhere in the CFG.
+        assert!(
+            !ops.iter().any(|o| o == "direct_call"),
+            "eq_fn_const=None must stay direct-compare-only, got {ops:?}"
+        );
 
         // Returns the Signed entry slot (index - VALID_OFFSET) or -1.
         let Hlvalue::Variable(ret) = &inner.returnblock.borrow().inputargs[0] else {
@@ -8571,8 +8838,9 @@ mod tests {
     #[test]
     fn ll_dict_lookup_surface_builds_lookup_graph() {
         let (dict_ptr, entries_ptr, key_lltype) = sample_dict_lookup_lltypes();
-        let helper = ll_dict_lookup(dict_ptr, entries_ptr, LowLevelType::Unsigned, key_lltype)
-            .expect("ll_dict_lookup");
+        let helper =
+            ll_dict_lookup(dict_ptr, entries_ptr, LowLevelType::Unsigned, key_lltype, None)
+                .expect("ll_dict_lookup");
         assert_eq!(helper.func.name, "ll_dict_lookup");
     }
 
@@ -8600,6 +8868,39 @@ mod tests {
             ret.concretetype.borrow().clone(),
             Some(LowLevelType::Ptr(_))
         ));
+    }
+
+    /// When `eq_fn_const` is `Some` (str keys), a direct-compare miss at
+    /// both comparison sites falls through to `direct_call(eq_fn_const,
+    /// checkingkey, key)` instead of returning -1/continuing unconditionally
+    /// — `d.keyeq(checkingkey, key)` (`rordereddict.py:1052-1055,1092-1095`).
+    /// Validate the block count grows by exactly the 2 new keyeq-call blocks
+    /// and that `direct_call` reaches the minted `ll_streq` funcptr.
+    #[test]
+    fn build_ll_dict_lookup_wires_keyeq_call_for_str_keys() {
+        let (dict_ptr, entries_ptr, key_lltype) = sample_dict_lookup_str_key_lltypes();
+        let eq_fn = dummy_funcptr_const();
+        let helper = build_ll_dict_lookup_helper_graph(
+            "ll_dict_lookup",
+            dict_ptr,
+            entries_ptr,
+            LowLevelType::Unsigned,
+            key_lltype,
+            Some(eq_fn),
+        )
+        .expect("build_ll_dict_lookup_helper_graph");
+        let inner = helper.graph.borrow();
+
+        let (block_count, ops) = walk_blocks(&inner.startblock);
+        assert_eq!(
+            block_count, 16,
+            "13 work blocks + 2 keyeq-call blocks + returnblock"
+        );
+        let direct_call_count = ops.iter().filter(|o| *o == "direct_call").count();
+        assert_eq!(
+            direct_call_count, 2,
+            "one direct_call per comparison site (first-try + in-loop), got {ops:?}"
+        );
     }
 
     /// `_ll_dictnext` walks the entries array; on a valid entry it advances
@@ -9086,11 +9387,13 @@ mod tests {
         assert!(format!("{:?}", c.value).contains("ll_dict_contains"));
     }
 
-    /// The eq-gate fails closed for str keys instead of silently routing
-    /// through `build_ll_dict_lookup_helper_graph`'s `ptr_eq` direct-compare
-    /// (Slice 0 landmine).
+    /// The eq-gate lets plain (non-`custom_eq_hash`) str keys through: the
+    /// direct-compare `ptr_eq` landmine from Slice 0 is now covered by the
+    /// `d.keyeq`-fallback wiring in `build_ll_dict_lookup_helper_graph`
+    /// (`ll_streq`, via `key_repr.get_ll_eq_function()`), so
+    /// `OrderedDictRepr::rtype_getitem` succeeds like the int-key case.
     #[test]
-    fn ordereddictrepr_rtype_getitem_str_key_fails_closed_on_eq_gate() {
+    fn ordereddictrepr_rtype_getitem_str_key_emits_direct_call_chain() {
         use crate::translator::rtyper::rtyper::LowLevelOpList;
 
         let ann = Rc::new(RPythonAnnotator::new(None, None, None, false));
@@ -9137,7 +9440,7 @@ mod tests {
                 Hlvalue::Variable(v_result),
             ),
             vec![],
-            llops,
+            llops.clone(),
         );
         hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
         hop.args_s
@@ -9148,13 +9451,18 @@ mod tests {
             Some(string_repr() as Arc<dyn Repr>),
         ]);
 
-        let err = repr
+        let result = repr
             .rtype_getitem(&hop)
-            .expect_err("str-keyed dict getitem must fail closed on the eq-gate");
-        assert!(
-            err.to_string().contains("dict key eq function not wired"),
-            "expected the eq-gate message, got {err}"
-        );
+            .unwrap_or_else(|err| panic!("OrderedDictRepr::rtype_getitem: {err:?}"));
+        assert!(matches!(result, Some(Hlvalue::Variable(_))));
+
+        let ops = llops.borrow();
+        assert_eq!(ops.ops.len(), 1);
+        assert_eq!(ops.ops[0].opname, "direct_call");
+        let Hlvalue::Constant(c) = &ops.ops[0].args[0] else {
+            panic!("expected Constant funcptr as direct_call arg 0");
+        };
+        assert!(format!("{:?}", c.value).contains("ll_dict_getitem"));
     }
 
     /// `ll_dict_store_clean` probes for the first `FREE` slot (no key
@@ -9953,10 +10261,10 @@ mod tests {
         assert!(format!("{:?}", c.value).contains("ll_dict_setdefault"));
     }
 
-    /// The eq-gate fails closed for str keys on delitem too — Slice 4 keeps
-    /// every lookup-dependent helper routed through `lookup_chain_helpers`.
+    /// The eq-gate lets plain str keys through on delitem too, same
+    /// `d.keyeq`-fallback wiring as getitem/contains/setitem.
     #[test]
-    fn ordereddictrepr_rtype_delitem_str_key_fails_closed_on_eq_gate() {
+    fn ordereddictrepr_rtype_delitem_str_key_emits_direct_call_chain() {
         use crate::translator::rtyper::rtyper::LowLevelOpList;
 
         let ann = Rc::new(RPythonAnnotator::new(None, None, None, false));
@@ -10003,7 +10311,7 @@ mod tests {
                 Hlvalue::Variable(v_result),
             ),
             vec![],
-            llops,
+            llops.clone(),
         );
         hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
         hop.args_s
@@ -10014,20 +10322,25 @@ mod tests {
             Some(string_repr() as Arc<dyn Repr>),
         ]);
 
-        let err = repr
+        let result = repr
             .rtype_delitem(&hop)
-            .expect_err("str-keyed dict delitem must fail closed on the eq-gate");
-        assert!(
-            err.to_string().contains("dict key eq function not wired"),
-            "expected the eq-gate message, got {err}"
-        );
+            .unwrap_or_else(|err| panic!("OrderedDictRepr::rtype_delitem: {err:?}"));
+        assert!(result.is_none(), "rtype_delitem returns None (Void op)");
+
+        let ops = llops.borrow();
+        assert_eq!(ops.ops.len(), 1);
+        assert_eq!(ops.ops[0].opname, "direct_call");
+        let Hlvalue::Constant(c) = &ops.ops[0].args[0] else {
+            panic!("expected Constant funcptr as direct_call arg 0");
+        };
+        assert!(format!("{:?}", c.value).contains("ll_dict_delitem"));
     }
 
-    /// The eq-gate fails closed for str keys on setitem too — same
+    /// The eq-gate lets plain str keys through on setitem too — same
     /// `lookup_chain_helpers`/`require_direct_compare_key` gate as
-    /// getitem/contains.
+    /// getitem/contains/delitem.
     #[test]
-    fn ordereddictrepr_rtype_setitem_str_key_fails_closed_on_eq_gate() {
+    fn ordereddictrepr_rtype_setitem_str_key_emits_direct_call_chain() {
         use crate::translator::rtyper::rtyper::LowLevelOpList;
 
         let ann = Rc::new(RPythonAnnotator::new(None, None, None, false));
@@ -10080,7 +10393,7 @@ mod tests {
                 Hlvalue::Variable(v_result),
             ),
             vec![],
-            llops,
+            llops.clone(),
         );
         hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
         hop.args_s.borrow_mut().extend([
@@ -10094,12 +10407,17 @@ mod tests {
             Some(signed_repr() as Arc<dyn Repr>),
         ]);
 
-        let err = repr
+        let result = repr
             .rtype_setitem(&hop)
-            .expect_err("str-keyed dict setitem must fail closed on the eq-gate");
-        assert!(
-            err.to_string().contains("dict key eq function not wired"),
-            "expected the eq-gate message, got {err}"
-        );
+            .unwrap_or_else(|err| panic!("OrderedDictRepr::rtype_setitem: {err:?}"));
+        assert!(result.is_none(), "rtype_setitem returns None (Void op)");
+
+        let ops = llops.borrow();
+        assert_eq!(ops.ops.len(), 1);
+        assert_eq!(ops.ops[0].opname, "direct_call");
+        let Hlvalue::Constant(c) = &ops.ops[0].args[0] else {
+            panic!("expected Constant funcptr as direct_call arg 0");
+        };
+        assert!(format!("{:?}", c.value).contains("ll_dict_setitem"));
     }
 }
