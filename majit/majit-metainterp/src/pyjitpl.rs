@@ -5242,10 +5242,10 @@ impl<M: Clone> MetaInterp<M> {
         // vectors so the optimizer can rebuild fail_args from snapshot in
         // store_final_boxes_in_guard (RPython ResumeDataVirtualAdder.finish).
         let (
-            snapshot_map,
+            mut snapshot_map,
             snapshot_frame_size_map,
-            snapshot_vable_map,
-            snapshot_vref_map,
+            mut snapshot_vable_map,
+            mut snapshot_vref_map,
             snapshot_pc_map,
         ) = snapshot_map_from_trace_snapshots(&trace_snapshots, &mut constants);
         // history.py:220/261/307 — `Const{Int,Float,Ptr}.type` is an
@@ -5257,10 +5257,19 @@ impl<M: Clone> MetaInterp<M> {
         unroll_opt.snapshot_vable_boxes = snapshot_vable_map.clone();
         unroll_opt.snapshot_vref_boxes = snapshot_vref_map.clone();
         unroll_opt.snapshot_frame_pcs = snapshot_pc_map.clone();
+        // Root BOTH the phase-1 clones (read during optimization) AND the
+        // originals (re-cloned into `simple_opt` on the InvalidLoop retry
+        // below). A moving GC during phase 1 forwards each inline `ConstPtr`
+        // in place; without rooting the originals the retry clone would carry
+        // a stale pre-move gcref. `snapshot_frame_sizes` / `snapshot_frame_pcs`
+        // hold no gcrefs, so they need no roots.
         self.compile_snapshot_refs = collect_snapshot_const_ptr_slots(&mut [
             &mut unroll_opt.snapshot_boxes,
             &mut unroll_opt.snapshot_vable_boxes,
             &mut unroll_opt.snapshot_vref_boxes,
+            &mut snapshot_map,
+            &mut snapshot_vable_map,
+            &mut snapshot_vref_map,
         ]);
 
         // RPython compile.py:278-294 parity: Phase 1 results must survive

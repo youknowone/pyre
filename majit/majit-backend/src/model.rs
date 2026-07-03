@@ -336,8 +336,12 @@ pub struct DefaultCpu;
 
 impl Cpu for DefaultCpu {
     fn cls_of_box(&self, box_: &Operand) -> i64 {
-        // resoperation.py:57-68 walker to the terminal Const.
-        match box_.get_box_replacement(false).const_value() {
+        // resoperation.py:57-68 walker, then read the concrete ref off the
+        // resolved operand. model.py:199-201 `box.getref_base().typeptr`
+        // reads any ref-carrying box, so a bound `Op` / `InputArg` with a
+        // stamped `Value::Ref` must resolve too — `get_value()`, not the
+        // const-only `const_value()`.
+        match box_.get_box_replacement(false).get_value() {
             Some(Value::Ref(gcref)) if !gcref.is_null() => self.cls_of_gcref(gcref),
             _ => 0,
         }
@@ -401,7 +405,9 @@ pub fn cpu_from_cls_of_box_fn(f: fn(i64) -> i64) -> Arc<dyn Cpu> {
     struct ClosureCpu(fn(i64) -> i64);
     impl Cpu for ClosureCpu {
         fn cls_of_box(&self, box_: &Operand) -> i64 {
-            let raw = match box_.get_box_replacement(false).const_value() {
+            // `get_value()` (not const-only `const_value()`) so a bound
+            // producer carrying a stamped `Value::Ref` yields its payload.
+            let raw = match box_.get_box_replacement(false).get_value() {
                 Some(Value::Ref(gcref)) => gcref.0 as i64,
                 _ => 0,
             };
