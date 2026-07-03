@@ -346,6 +346,14 @@ jobs:
         test -s build/llbc/pyre-object.ullbc
         test -s build/llbc/pyre-interpreter.ullbc
         test -s build/llbc/pyre-jit.ullbc
+    - name: Add wasm32 target (Linux only)
+      # check.py adds wasm to its default backends when this target is
+      # installed, so this is what makes the Linux leg build and run the wasm
+      # backend too. wasm output is platform-independent, so exercising it on
+      # one OS is enough — macOS/Windows keep no wasm32 target and stay on the
+      # native backends.
+      if: runner.os == 'Linux'
+      run: rustup target add wasm32-unknown-unknown
     - name: Run pyre/check.py
       env:
         PYRE_CHECK_PYTHON3: ${{ steps.cpython.outputs.python-path }}
