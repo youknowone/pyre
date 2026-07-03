@@ -381,12 +381,9 @@ impl PreambleOp {
                 let preamble_arg = sb.produce_arg(ctx, self.op.arg(0).to_opref())?;
                 let args: smallvec::SmallVec<[majit_ir::operand::Operand; 3]> =
                     if self.op.opcode.is_getfield() {
-                        smallvec::smallvec![majit_ir::operand::Operand::from_boxref(&preamble_arg)]
+                        smallvec::smallvec![preamble_arg]
                     } else {
-                        smallvec::smallvec![
-                            majit_ir::operand::Operand::from_boxref(&preamble_arg),
-                            self.op.arg(1)
-                        ]
+                        smallvec::smallvec![preamble_arg, self.op.arg(1)]
                     };
                 self.op.copy_and_change(self.op.opcode, Some(&args), None)
             }
@@ -404,7 +401,6 @@ impl PreambleOp {
                     .iter()
                     .map(|arg| {
                         sb.produce_arg(ctx, arg.to_opref())
-                            .map(|b| majit_ir::operand::Operand::from_boxref(&b))
                     })
                     .collect::<Option<smallvec::SmallVec<[majit_ir::operand::Operand; 3]>>>()?;
                 let opnum = if self.op.opcode.is_call() {
@@ -431,7 +427,6 @@ impl PreambleOp {
                     .iter()
                     .map(|arg| {
                         sb.produce_arg(ctx, arg.to_opref())
-                            .map(|b| majit_ir::operand::Operand::from_boxref(&b))
                     })
                     .collect::<Option<smallvec::SmallVec<[majit_ir::operand::Operand; 3]>>>()?;
                 let opnum = match self.op.opcode {
@@ -790,17 +785,17 @@ impl ShortBoxes {
     /// export time, the same substitution the import rename pass performed
     /// (`produced_short_boxes_from_exported_boxes`, `short_inputargs[position
     /// of arg in label_args]`).
-    fn renamed_short_inputarg(&self, label_arg_idx: Option<usize>) -> BoxRef {
+    fn renamed_short_inputarg(&self, label_arg_idx: Option<usize>) -> majit_ir::operand::Operand {
         let idx = label_arg_idx
             .expect("InputArg short box missing label_arg_idx (set by add_short_input_arg)");
-        majit_ir::box_ref::BoxRef::from_bound_inputarg(&self.short_inputarg_refs[idx])
+        majit_ir::operand::Operand::from_bound_inputarg(&self.short_inputarg_refs[idx])
     }
 
     fn produce_arg(
         &mut self,
         ctx: &mut crate::optimizeopt::OptContext,
         opref: OpRef,
-    ) -> Option<BoxRef> {
+    ) -> Option<majit_ir::operand::Operand> {
         // shortpreamble.py:284 `if op in self.produced_short_boxes` — the
         // dict membership is Box identity; resolve the position to its
         // canonical box once for both identity-keyed checks. Const args
@@ -822,7 +817,7 @@ impl ShortBoxes {
                     let label_arg_idx = existing.label_arg_idx;
                     return Some(self.renamed_short_inputarg(label_arg_idx));
                 }
-                return Some(BoxRef::from_bound_op(&existing.preamble_op));
+                return Some(majit_ir::operand::Operand::from_bound_op(&existing.preamble_op));
             }
             if self.boxes_in_production.contains(&okey) {
                 return None;
@@ -830,13 +825,13 @@ impl ShortBoxes {
         }
         // shortpreamble.py:288 isinstance(op, Const) → return op.
         if opref.is_constant() {
-            return Some(BoxRef::from_opref(opref));
+            return Some(majit_ir::operand::Operand::from_opref(opref));
         }
         // pyre tracks iteration-known constants (body-typed OpRefs proven
         // constant for this pass) in `known_constants`; those are this
         // stage's `Const` boxes, mirroring `use_box`/`insert_dep_recursive`.
         if self.known_constants.contains(&opref) {
-            return Some(ctx.materialize_box_at(opref));
+            return Some(ctx.materialize_operand_at(opref));
         }
         if self
             .potential_ops
@@ -850,7 +845,7 @@ impl ShortBoxes {
             if produced.kind == PreambleOpKind::InputArg {
                 return Some(self.renamed_short_inputarg(produced.label_arg_idx));
             }
-            return Some(BoxRef::from_bound_op(&produced.preamble_op));
+            return Some(majit_ir::operand::Operand::from_bound_op(&produced.preamble_op));
         }
         // shortpreamble.py:295-296 `else: return None`. Every label arg is
         // registered as a ShortInputArg in `potential_ops`
@@ -987,14 +982,10 @@ impl ShortBoxes {
             };
             // shortpreamble.py:277-278: copy_and_change(opnum, [preamble_arg] + args[1:])
             let mut new_args = vec![preamble_arg];
-            new_args.extend_from_slice(&getfield_op.getarglist()[1..]);
-            let new_args_operand: Vec<majit_ir::operand::Operand> = new_args
-                .iter()
-                .map(majit_ir::operand::Operand::from_boxref)
-                .collect();
+            new_args.extend_from_slice(&getfield_op.getarglist_operand()[1..]);
             let mut new_op = Op::with_descr(
                 getfield_op.opcode,
-                &new_args_operand,
+                &new_args,
                 getfield_op
                     .getdescr()
                     .unwrap_or_else(|| panic!("const_short_boxes heap op without descr")),
@@ -2552,7 +2543,7 @@ pub struct ExtendedShortPreambleBuilder {
     /// `setup()` insertion (the mapping values in unroll.py:396 are the
     /// jump-arg Box objects themselves), so the remap `setarg` writes
     /// produce live-tracking bound operands instead of frozen positions.
-    phase1_to_inputarg: majit_ir::VecMap<OpRef, BoxRef>,
+    phase1_to_inputarg: majit_ir::VecMap<OpRef, majit_ir::operand::Operand>,
     /// B.6.4 canonical dedup keyed by `produced.preamble_op.pos`. Mirrors
     /// `AbstractShortPreambleBuilderState.recorded_canonical_results` —
     /// `produced_short_boxes` carries dual entries (source-key plus
@@ -2684,7 +2675,7 @@ impl ExtendedShortPreambleBuilder {
                     if let Some(&current_inputarg) = label_args.get(label_idx) {
                         if phase1_ref != current_inputarg {
                             self.phase1_to_inputarg
-                                .insert(phase1_ref, ctx.materialize_box_at(current_inputarg));
+                                .insert(phase1_ref, ctx.materialize_operand_at(current_inputarg));
                         }
                     }
                 }
@@ -2708,10 +2699,7 @@ impl ExtendedShortPreambleBuilder {
             for i in 0..op.num_args() {
                 let arg = op.arg(i);
                 if let Some(remapped) = self.phase1_to_inputarg.get(&arg.to_opref()) {
-                    op.setarg(
-                        i,
-                        majit_ir::operand::Operand::from_boxref(&remapped.clone()),
-                    );
+                    op.setarg(i, remapped.clone());
                 }
             }
             // RPython use_box arg loop: insert missing deps before this op.
@@ -2742,7 +2730,7 @@ impl ExtendedShortPreambleBuilder {
         for arg in &short_preamble.jump_args {
             if let Some(target) = self.phase1_to_inputarg.get(arg) {
                 jump_args.push(target.to_opref());
-                jump_args_operand.push(majit_ir::operand::Operand::from_boxref(target));
+                jump_args_operand.push(target.clone());
             } else {
                 // Unmapped Phase 1 jump arg (no rename): resolve the Phase-2
                 // producer registered at this position — the inlined short box
@@ -2827,10 +2815,7 @@ impl ExtendedShortPreambleBuilder {
         for i in 0..dep_op.num_args() {
             let a = dep_op.arg(i);
             if let Some(remapped) = self.phase1_to_inputarg.get(&a.to_opref()) {
-                dep_op.setarg(
-                    i,
-                    majit_ir::operand::Operand::from_boxref(&remapped.clone()),
-                );
+                dep_op.setarg(i, remapped.clone());
             }
         }
         // Recurse into dep's own args first (transitive). If any sub-dep
@@ -3016,7 +3001,7 @@ impl ExtendedShortPreambleBuilder {
         for i in 0..remapped.num_args() {
             let arg = remapped.arg(i);
             if let Some(r) = self.phase1_to_inputarg.get(&arg.to_opref()) {
-                remapped.setarg(i, majit_ir::operand::Operand::from_boxref(&r.clone()));
+                remapped.setarg(i, r.clone());
             }
         }
         remapped
