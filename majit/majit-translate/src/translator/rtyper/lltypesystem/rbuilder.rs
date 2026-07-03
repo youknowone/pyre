@@ -11,11 +11,19 @@
 
 use std::sync::LazyLock;
 
+use crate::flowspace::model::{
+    Block, BlockRefExt, ConstValue, Constant, FunctionGraph, GraphFunc, Hlvalue, Link,
+    SpaceOperation,
+};
+use crate::flowspace::pygraph::PyGraph;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
     ForwardReference, LowLevelType, Ptr, PtrTarget, Struct,
 };
 use crate::translator::rtyper::lltypesystem::rstr::{STRPTR, UNICODEPTR};
+use crate::translator::rtyper::rtyper::{
+    helper_pygraph_from_graph, variable_with_lltype, void_field_const,
+};
 
 fn ptr_to_lowlevel(target: LowLevelType) -> LowLevelType {
     match target {
@@ -205,6 +213,88 @@ pub fn ll_getlength() -> Result<(), TyperError> {
     Err(builder_runtime_deferred("ll_getlength"))
 }
 
+/// Synthesise `ll_getlength(ll_builder)` (`rbuilder.py:347-350`):
+/// `ll_builder.total_size - (ll_builder.current_end - ll_builder.current_pos)`.
+pub fn build_ll_getlength_helper_graph(
+    name: &str,
+    builder_ptr_lltype: LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    let ll_builder = variable_with_lltype("ll_builder", builder_ptr_lltype);
+    let startblock = Block::shared(vec![Hlvalue::Variable(ll_builder.clone())]);
+    let return_var = variable_with_lltype("result", LowLevelType::Signed);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    let current_end = variable_with_lltype("current_end", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "getfield",
+        vec![
+            Hlvalue::Variable(ll_builder.clone()),
+            void_field_const("current_end"),
+        ],
+        Hlvalue::Variable(current_end.clone()),
+    ));
+    let current_pos = variable_with_lltype("current_pos", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "getfield",
+        vec![
+            Hlvalue::Variable(ll_builder.clone()),
+            void_field_const("current_pos"),
+        ],
+        Hlvalue::Variable(current_pos.clone()),
+    ));
+    let num_chars_missing_from_last_piece =
+        variable_with_lltype("num_chars_missing_from_last_piece", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "int_sub",
+        vec![
+            Hlvalue::Variable(current_end),
+            Hlvalue::Variable(current_pos),
+        ],
+        Hlvalue::Variable(num_chars_missing_from_last_piece.clone()),
+    ));
+    let total_size = variable_with_lltype("total_size", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "getfield",
+        vec![
+            Hlvalue::Variable(ll_builder),
+            void_field_const("total_size"),
+        ],
+        Hlvalue::Variable(total_size.clone()),
+    ));
+    let result = variable_with_lltype("result", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "int_sub",
+        vec![
+            Hlvalue::Variable(total_size),
+            Hlvalue::Variable(num_chars_missing_from_last_piece),
+        ],
+        Hlvalue::Variable(result.clone()),
+    ));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(result)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["ll_builder".to_string()],
+        func,
+    ))
+}
+
 pub fn ll_build() -> Result<(), TyperError> {
     Err(builder_runtime_deferred("ll_build"))
 }
@@ -343,6 +433,35 @@ mod tests {
         let err = super::ll_append_multiple_char().expect_err("multiple-char helper is deferred");
         assert!(err.is_missing_rtype_operation());
         assert!(err.to_string().contains("ll_append_multiple_char"));
+    }
+
+    #[test]
+    fn build_ll_getlength_reads_fields_and_returns_signed_length() {
+        use super::Hlvalue;
+        let helper =
+            super::build_ll_getlength_helper_graph("ll_getlength", super::STRINGBUILDERPTR.clone())
+                .expect("build_ll_getlength_helper_graph");
+        assert_eq!(helper.func.name, "ll_getlength");
+        let inner = helper.graph.borrow();
+        let startblock = inner.startblock.borrow();
+        // total_size - (current_end - current_pos)
+        let ops: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|op| op.opname.as_str())
+            .collect();
+        assert_eq!(
+            ops,
+            vec!["getfield", "getfield", "int_sub", "getfield", "int_sub"]
+        );
+        assert_eq!(startblock.inputargs.len(), 1);
+        let Hlvalue::Variable(ret) = &inner.returnblock.borrow().inputargs[0] else {
+            panic!("returnblock inputarg must be a Variable");
+        };
+        assert_eq!(
+            ret.concretetype.borrow().clone(),
+            Some(LowLevelType::Signed)
+        );
     }
 
     #[test]
