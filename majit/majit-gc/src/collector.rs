@@ -2089,17 +2089,26 @@ impl MiniMarkGC {
 
     /// incminimark.py:1489-1493 write_barrier(addr_struct):
     /// if the object has GCFLAG_TRACK_YOUNG_PTRS, call remember_young_pointer.
-    /// The barrier is only ever called on header-bearing GC objects — every
-    /// heap PyFrame now carries a GcHeader via `FrameBox`, and every other
-    /// managed object via the GC allocator / `lltype::malloc_typed`. Nursery
-    /// objects never have TRACK_YOUNG_PTRS, so the flag test alone selects the
-    /// old-gen objects that may now point to young.
+    /// Nursery objects never have TRACK_YOUNG_PTRS, so the flag test alone
+    /// selects the old-gen objects that may now point to young.
+    ///
+    /// Unlike incminimark — where every struct is GC-managed and the barrier
+    /// only ever receives a header-bearing GC object — pyre runs a hybrid heap:
+    /// host-side allocators (`w_list_new`, `w_dict_new`, …) fall back to a bare
+    /// `Box::into_raw` when no GC hook is installed (bootstrap / import-time
+    /// objects), producing PyObjects that are not in any managed generation and
+    /// whose `obj - 8` word is Rust allocator metadata, not a `GcHeader`. Such
+    /// an object legitimately reaches the interpreter barrier sites (a slice
+    /// store on a bootstrap list, a namespace store on an import-time dict), so
+    /// the barrier must ignore any address the GC does not own rather than read
+    /// its non-header word. This centralizes the `try_gc_owns_object` guard that
+    /// `object_array.rs` / `list_write_barrier` already apply per call site.
     pub fn do_write_barrier(&mut self, obj: GcRef) {
         // incminimark's write_barrier receives a typed, non-null struct pointer.
         // pyre's GcRef is nullable (GcRef::NULL is the sentinel) and reaches the
         // safe `write_barrier`/`gc_write_barrier` entry points, so guard null
         // before reading `header_of(obj)`; the card variant guards it likewise.
-        if obj.is_null() {
+        if obj.is_null() || !self.is_managed_heap_object(obj.0) {
             return;
         }
         let hdr = unsafe { header_of(obj.0) };
@@ -2128,7 +2137,9 @@ impl MiniMarkGC {
     /// to remember_young_pointer_from_array2 (card path) or
     /// remember_young_pointer (generic).
     pub fn do_write_barrier_card(&mut self, obj: GcRef, index: usize, card_page_shift: u32) {
-        if obj.is_null() {
+        // A non-GC (`Box::into_raw`) PyObject can reach the barrier here too;
+        // ignore any address the GC does not own (see `do_write_barrier`).
+        if obj.is_null() || !self.is_managed_heap_object(obj.0) {
             return;
         }
         let hdr = unsafe { header_of(obj.0) };
