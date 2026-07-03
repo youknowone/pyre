@@ -3138,8 +3138,8 @@ impl Optimizer {
                         // operand, so each `bound_from_opref` fallback returns a
                         // distinct Rc (ptr-Eq-unstable) and `export_single_value` logs it as an
                         // unbound export key. Bind the canonical `_forwarded` host
-                        // once via `materialize_box_at` (a `SameAs*` synthetic in
-                        // `resop_refs`, memoized through `Op::box_cache`) so the
+                        // once via `materialize_operand_at` (a `SameAs*` synthetic
+                        // in `resop_refs`) so the
                         // export key resolves to one ptr-stable host — the identity
                         // the #188 `OpRef`→`BoxRef` `ExportCache` rekey requires. The
                         // returned `OpRef` is unchanged (synthetic and orphan share
@@ -3148,7 +3148,7 @@ impl Optimizer {
                             && !resolved.is_constant()
                             && ctx.get_box_replacement_operand_opt(resolved).is_none()
                         {
-                            ctx.materialize_box_at(resolved);
+                            ctx.materialize_operand_at(resolved);
                         }
                         resolved
                     })

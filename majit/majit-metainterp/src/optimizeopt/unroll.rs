@@ -6483,7 +6483,7 @@ mod tests {
         // Bind the export-input position at its source (a forced end-arg is a
         // bound box in production); virtualstate.py:711-720 create_state
         // receives real AbstractValues.
-        ctx.materialize_box_at(OpRef::int_op(21));
+        ctx.materialize_operand_at(OpRef::int_op(21));
         // Key by the canonical box identity the consumer resolves `int_op(21)`
         // to, so the BoxRef-keyed lookup hits by `Rc::ptr_eq`.
         let box21 = ctx
@@ -6544,7 +6544,7 @@ mod tests {
         // position at its source so every value reaching export_single_value
         // has a canonical box (virtualstate.py:711-720 create_state receives
         // real AbstractValues, never bare positions).
-        ctx.materialize_box_at(OpRef::int_op(21));
+        ctx.materialize_operand_at(OpRef::int_op(21));
         ctx.preamble_end_args = Some(vec![OpRef::int_op(21)]);
 
         let exported = export_state(&[OpRef::int_op(0)], &[], &mut optimizer, &mut ctx, None);
@@ -6608,8 +6608,8 @@ mod tests {
         // and result are bound boxes in production (label arg / ProducedShortOp.res
         // = materialize_box_at, shortpreamble.rs:436). virtualstate.py:711-720
         // create_state receives real AbstractValues, never bare positions.
-        ctx.materialize_box_at(OpRef::int_op(10));
-        ctx.materialize_box_at(OpRef::int_op(11));
+        ctx.materialize_operand_at(OpRef::int_op(10));
+        ctx.materialize_operand_at(OpRef::int_op(11));
 
         let exported = export_state(
             &[OpRef::int_op(10), OpRef::int_op(11)],
@@ -6676,8 +6676,8 @@ mod tests {
         // Bind export-input positions at their source (label arg /
         // ProducedShortOp.res = materialize_box_at, shortpreamble.rs:436);
         // virtualstate.py:711-720 create_state receives real AbstractValues.
-        ctx.materialize_box_at(OpRef::int_op(12));
-        ctx.materialize_box_at(OpRef::int_op(11));
+        ctx.materialize_operand_at(OpRef::int_op(12));
+        ctx.materialize_operand_at(OpRef::int_op(11));
 
         let exported = export_state(
             &[OpRef::int_op(12), OpRef::int_op(11)],
@@ -6742,8 +6742,8 @@ mod tests {
         // Bind export-input positions at their source (label arg /
         // ProducedShortOp.res = materialize_box_at, shortpreamble.rs:436);
         // virtualstate.py:711-720 create_state receives real AbstractValues.
-        ctx.materialize_box_at(OpRef::int_op(10));
-        ctx.materialize_box_at(OpRef::int_op(11));
+        ctx.materialize_operand_at(OpRef::int_op(10));
+        ctx.materialize_operand_at(OpRef::int_op(11));
 
         let exported = export_state(
             &[OpRef::int_op(10), OpRef::int_op(11)],
@@ -6964,13 +6964,13 @@ mod tests {
         // make_equal_to, but the test still walks the get_box_replacement
         // chain inside force_box's add_preamble_op, so install a manual
         // forwarding to the body-visible OpRef to exercise that path.
-        let b_src = ctx.materialize_box_at(OpRef::ref_op(19));
+        let b_src = ctx.materialize_operand_at(OpRef::ref_op(19));
         let b_tgt = ctx
             .get_box_replacement_operand_opt(OpRef::ref_op(14))
             .unwrap_or_else(|| ctx.materialize_operand_at(OpRef::ref_op(14)));
-        ctx.make_equal_to(&Operand::from_boxref(&b_src), &b_tgt);
+        ctx.make_equal_to(&b_src, &b_tgt);
         let pop = crate::optimizeopt::info::PreambleOp {
-            op: Operand::from_boxref(&b_src),
+            op: b_src.clone(),
             invented_name: produced.invented_name,
             same_as_source: produced.same_as_source.clone(),
             preamble_op: produced.preamble_op,
@@ -7065,9 +7065,9 @@ mod tests {
         // Bind export-input positions at their source (IntAdd operands /
         // same-as alias are bound boxes in production); virtualstate.py:711-720
         // create_state receives real AbstractValues, never bare positions.
-        ctx.materialize_box_at(OpRef::int_op(12));
-        ctx.materialize_box_at(OpRef::int_op(13));
-        ctx.materialize_box_at(OpRef::int_op(14));
+        ctx.materialize_operand_at(OpRef::int_op(12));
+        ctx.materialize_operand_at(OpRef::int_op(13));
+        ctx.materialize_operand_at(OpRef::int_op(14));
 
         let exported = export_state(
             &[OpRef::int_op(12), OpRef::int_op(13), OpRef::int_op(14)],

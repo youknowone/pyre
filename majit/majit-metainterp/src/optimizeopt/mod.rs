@@ -2924,20 +2924,16 @@ impl OptContext {
         )> = exported_short_boxes
             .iter()
             .map(|entry| {
-                // `materialize_box_at`, not `from_bound_op`: a
+                // `materialize_operand_at`, not `from_bound_op`: a
                 // const-folded entry carries an inline-Const pos,
-                // which resolves to its Const box. The map keys by this res
-                // box (#146/S8); the single-op re-export lookup (pure.rs)
-                // reproduces it via `materialize_box_at(source)`.
-                //
-                // materialize_box_at is NON-idempotent for an unregistered
-                // ResOp pos: the first call mints a fresh `new_resop` box and
-                // registers a synthetic producer; subsequent calls resolve
-                // that synthetic to a stable `from_bound_op` box. The lookup is
-                // itself a subsequent call, so the warm-up call registers the
-                // synthetic and the second (stable) box is the real key.
+                // which resolves to its Const operand. The map keys by this
+                // res operand (#146/S8); the single-op re-export lookup
+                // (pure.rs) reproduces it via `materialize_operand_at(source)`.
+                // The operand's identity is the canonical `_forwarded` host
+                // Rc (a synthetic producer registered on first
+                // materialization), stable across calls, so no warm-up is
+                // needed for the lookup keys to be ptr_eq.
                 let pos = entry.op.pos.get();
-                let _ = self.materialize_box_at(pos);
                 let res = self.materialize_operand_at(pos);
                 (
                     res.clone(),

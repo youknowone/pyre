@@ -647,9 +647,8 @@ impl ShortBoxes {
         self.known_constants.insert(opref);
     }
 
-    fn add_op(&mut self, key: BoxRef, pop: PotentialShortOp) {
-        self.potential_ops
-            .insert(majit_ir::operand::Operand::from_boxref(&key), pop);
+    fn add_op(&mut self, key: majit_ir::operand::Operand, pop: PotentialShortOp) {
+        self.potential_ops.insert(key, pop);
     }
 
     /// Add a pure operation as a short-box candidate.
@@ -760,22 +759,17 @@ impl ShortBoxes {
         // original `box`; the SAME_AS replay arg is that box. Exported
         // entries carry original positions and are renamed to the matching
         // `short_inputargs` slot at import (`produced_short_boxes_from_exported_boxes`).
-        // Warm up the canonical box so `arg_box` (the `potential_ops` key) is
-        // the memoized box every later `materialize_box_at(arg)` lookup also
-        // returns (ptr_eq), keeping the BoxRef-keyed map ptr-stable.
-        let _ = ctx.materialize_box_at(arg);
-        let arg_box = ctx.materialize_box_at(arg);
-        let arg_res = majit_ir::operand::Operand::from_boxref(&arg_box);
-        let mut same_as = Op::new(
-            OpCode::same_as_for_type(arg_type),
-            &[majit_ir::operand::Operand::from_boxref(&arg_box.clone())],
-        );
+        // The operand's identity is the canonical `_forwarded` host Rc
+        // (registered on first materialization), so every later
+        // `materialize_operand_at(arg)` lookup returns the same key (ptr_eq).
+        let arg_res = ctx.materialize_operand_at(arg);
+        let mut same_as = Op::new(OpCode::same_as_for_type(arg_type), &[arg_res.clone()]);
         same_as.pos.set(arg);
         // shortpreamble.py:259 `self.potential_ops[box] = ShortInputArg(...)`
-        // — keyed by the label-arg Box itself; `arg_box` is its canonical
-        // (producer-bound) box, shared with `res`.
+        // — keyed by the label-arg Box itself; `arg_res` is its canonical
+        // (producer-bound) operand, shared with `res`.
         self.potential_ops.insert(
-            majit_ir::operand::Operand::from_boxref(&arg_box),
+            arg_res.clone(),
             PotentialShortOp::Preamble(PreambleOp {
                 res: arg_res,
                 op: std::rc::Rc::new(same_as),
@@ -1057,25 +1051,20 @@ impl ShortBoxes {
     ) {
         let result = op.pos.get();
         // shortpreamble.py:290 `self.potential_ops[op]` — keyed by the
-        // producer's result Box; resolve the position to its canonical box.
-        // The first `materialize_box_at` on an unregistered ResOp position
-        // mints a placeholder distinct from the memoized synthetic returned
-        // by every subsequent call; warm it up so the insert key here and
+        // producer's result Box; resolve the position to its canonical
+        // operand. Its identity is the canonical `_forwarded` host Rc
+        // (registered on first materialization), so the insert key here and
         // the lookup keys in `materialize_one`/`produce_arg` are ptr_eq.
-        let _ = ctx.materialize_box_at(result);
-        let key = ctx.materialize_box_at(result);
+        let key = ctx.materialize_operand_at(result);
         let pop = PotentialShortOp::Preamble(PreambleOp {
-            res: majit_ir::operand::Operand::from_boxref(&key),
+            res: key.clone(),
             op: std::rc::Rc::new(op),
             kind,
             label_arg_idx,
             invented_name: false,
             same_as_source: None,
         });
-        let next = match self
-            .potential_ops
-            .get(&majit_ir::operand::Operand::from_boxref(&key))
-        {
+        let next = match self.potential_ops.get(&key) {
             Some(prev) => PotentialShortOp::Compound(CompoundOp {
                 res: result,
                 one: Box::new(pop),
@@ -1709,9 +1698,7 @@ impl ProducedShortOp {
         }
         let mut getfield_op = Op::new(
             OpCode::getfield_for_type(result_type),
-            &[majit_ir::operand::Operand::from_boxref(
-                &ctx.materialize_box_at(obj_resolved),
-            )],
+            &[ctx.materialize_operand_at(obj_resolved)],
         );
         getfield_op.setdescr(descr.clone());
         // Cat-2.2 dual-slot rule (mod.rs:1817 replay_pos): replay.pos =

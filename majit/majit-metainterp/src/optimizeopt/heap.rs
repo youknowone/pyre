@@ -4616,7 +4616,7 @@ mod tests {
         let mut ctx = OptContext::new(ops.len());
         let cidx = ctx.materialize_operand_at(idx);
         ctx.make_constant_box(&cidx, majit_ir::Value::Int(3));
-        ctx.materialize_box_at(OpRef::ref_op(100));
+        ctx.materialize_operand_at(OpRef::ref_op(100));
 
         let mut pass = OptHeap::new();
         pass.setup();
@@ -4632,9 +4632,7 @@ mod tests {
                         if __ar.is_none() {
                             arg.clone()
                         } else {
-                            Operand::from_boxref(
-                                &ctx.materialize_box_at(__ar).get_box_replacement(false),
-                            )
+                            ctx.materialize_operand_at(__ar).get_box_replacement(false)
                         }
                     }
                 };
@@ -4741,7 +4739,7 @@ mod tests {
         // Register a producer for the rhs operand position so the forced
         // lazy setarrayitem resolves it to a bound `Operand::Op` producer
         // rather than minting a position-only `Operand::Box`.
-        ctx.materialize_box_at(OpRef::int_op(101));
+        ctx.materialize_operand_at(OpRef::int_op(101));
 
         let mut pass = OptHeap::new();
         pass.setup();
@@ -5058,9 +5056,9 @@ mod tests {
         // Register producers for the external operand positions so the
         // forced lazy setarrayitem resolves its args to bound `Operand::Op`
         // producers rather than minting a position-only `Operand::Box`.
-        ctx.materialize_box_at(OpRef::int_op(100));
-        ctx.materialize_box_at(OpRef::int_op(101));
-        ctx.materialize_box_at(OpRef::int_op(102));
+        ctx.materialize_operand_at(OpRef::int_op(100));
+        ctx.materialize_operand_at(OpRef::int_op(101));
+        ctx.materialize_operand_at(OpRef::int_op(102));
 
         let mut pass = OptHeap::new();
         pass.setup();
@@ -5773,7 +5771,7 @@ mod tests {
         // Register a producer for the stored rhs operand position so the
         // call-forced lazy setarrayitem resolves it to a bound `Operand::Op`
         // producer rather than minting a position-only `Operand::Box`.
-        ctx.materialize_box_at(OpRef::int_op(10));
+        ctx.materialize_operand_at(OpRef::int_op(10));
 
         let mut pass = OptHeap::new();
         pass.setup();
@@ -6358,7 +6356,7 @@ mod tests {
         // Bind the variable index input box before the pass: post-resolver
         // op.arg(1) must be bound for getintbound to install its IntBound on
         // `_forwarded` (the real recorder binds input args).
-        ctx.materialize_box_at(idx);
+        ctx.materialize_operand_at(idx);
 
         for op in &ops {
             let mut resolved = op.clone();
@@ -6457,7 +6455,7 @@ mod tests {
         // Bind the variable index input box before the pass: post-resolver
         // op.arg(1) must be bound for getintbound to install its IntBound on
         // `_forwarded` (the real recorder binds input args).
-        ctx.materialize_box_at(idx);
+        ctx.materialize_operand_at(idx);
 
         for op in &ops {
             let mut resolved = op.clone();
@@ -6772,8 +6770,8 @@ mod tests {
         // Register producers for the external operand positions so the
         // forced lazy setarrayitem resolves its args to bound `Operand::Op`
         // producers rather than minting a position-only `Operand::Box`.
-        ctx.materialize_box_at(OpRef::int_op(100));
-        ctx.materialize_box_at(OpRef::int_op(101));
+        ctx.materialize_operand_at(OpRef::int_op(100));
+        ctx.materialize_operand_at(OpRef::int_op(101));
 
         let mut pass = OptHeap::new();
         pass.setup();

@@ -1757,7 +1757,7 @@ mod tests {
         // operands are leaf values with no producing op in this fixture slice;
         // without a registered producer, a later force/emit resolves such an
         // arg to a position-only `from_opref` box that mints `Operand::Box`.
-        // `materialize_box_at` binds a `SameAs*` synthetic at the same position
+        // `materialize_operand_at` binds a `SameAs*` synthetic at the same position
         // (oparser's leaf-var wiring), so resolution sheds to `Operand::Op`.
         // Positions produced by a trace op are skipped — materializing a
         // synthetic there would shadow the real producer and defeat
@@ -1768,7 +1768,7 @@ mod tests {
             for i in 0..op.num_args() {
                 let r = op.arg(i).to_opref();
                 if !r.is_none() && !r.is_constant() && !produced.contains(&r) {
-                    ctx.materialize_box_at(r);
+                    ctx.materialize_operand_at(r);
                 }
             }
         }
@@ -2142,7 +2142,7 @@ mod tests {
         // slice can't resolve the char statically and falls to the residual.
         // Materialize so the residual re-emits start as a bound box.
         let start_ref = OpRef::int_op(300);
-        ctx.materialize_box_at(start_ref);
+        ctx.materialize_operand_at(start_ref);
         let b = ctx.materialize_operand_at(OpRef::int_op(301));
         ctx.make_constant_box(&b, Value::Int(2)); // length
 
@@ -2225,10 +2225,10 @@ mod tests {
         // STRGETITEM (and its INT_ADD index) re-emit them as bound boxes
         // (`Operand::Op`) rather than position-only `from_opref` boxes.
         let src_ref = OpRef::ref_op(10);
-        ctx.materialize_box_at(src_ref);
+        ctx.materialize_operand_at(src_ref);
         // Non-constant start so the static fold misses → residual path.
         let start_ref = OpRef::int_op(300);
-        ctx.materialize_box_at(start_ref);
+        ctx.materialize_operand_at(start_ref);
         let b = ctx.materialize_operand_at(OpRef::int_op(301));
         ctx.make_constant_box(&b, Value::Int(3)); // slice length
 
@@ -2237,7 +2237,7 @@ mod tests {
 
         // STRGETITEM(slice, index) with a non-constant index.
         let index_ref = OpRef::int_op(302);
-        ctx.materialize_box_at(index_ref);
+        ctx.materialize_operand_at(index_ref);
         let pos = ctx.alloc_op_position_typed(majit_ir::Type::Int);
         let mut getitem = Op::new(OpCode::Strgetitem, &[rop(11), iop(302)]);
         getitem.pos.set(pos);
@@ -2275,7 +2275,7 @@ mod tests {
         // it as a bound box rather than a position-only `from_opref` box.
         let vleft_ref = OpRef::ref_op(10);
         let vright_ref = OpRef::ref_op(11);
-        ctx.materialize_box_at(vright_ref);
+        ctx.materialize_operand_at(vright_ref);
         set_vstring_plain(&mut ctx, vleft_ref, vec![None; 2]);
         let concat_ref = OpRef::ref_op(12);
         set_vstring_concat(&mut ctx, concat_ref, vleft_ref, vright_ref);
