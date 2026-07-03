@@ -630,6 +630,85 @@ pub(crate) fn build_ll_strlen_helper_graph(
     ))
 }
 
+/// Synthesise `mallocstr` / `mallocunicode` (`lltypesystem/rstr.py:35-46`):
+///
+/// ```python
+/// def mallocstr(length):
+///     ll_assert(length >= 0, "negative string length")
+///     r = malloc(TP, length)
+///     if not we_are_translated() or not malloc_zero_filled:
+///         r.hash = 0
+///     return r
+/// ```
+///
+/// Single block: `malloc_varsize(STR/UNICODE, gc, length)` then
+/// `setfield(r, 'hash', 0)`. `ll_assert` is a translation-time no-op, and
+/// the zero-fill guard collapses to always initialising the hash field
+/// (matching the inline `mallocstr` shape emitted by the int-to-string
+/// helpers). `name` selects the helper identity (`"mallocstr"` /
+/// `"mallocunicode"`) and `ptr_lltype` selects `Ptr(STR)` vs
+/// `Ptr(UNICODE)`.
+pub(crate) fn build_ll_mallocstr_helper_graph(
+    name: &str,
+    ptr_lltype: LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    use crate::translator::rtyper::rmodel::{gc_flavor_const, lowlevel_type_const};
+
+    let struct_lltype = struct_lltype_from_strptr(&ptr_lltype)?;
+    let signed_const = |n: i64| constant_with_lltype(ConstValue::Int(n), LowLevelType::Signed);
+    let hash_field_const =
+        || constant_with_lltype(ConstValue::byte_str("hash"), LowLevelType::Void);
+
+    let length_arg = variable_with_lltype("length", LowLevelType::Signed);
+    let startblock = Block::shared(vec![Hlvalue::Variable(length_arg.clone())]);
+    let return_var = variable_with_lltype("result", ptr_lltype.clone());
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    let result = variable_with_lltype("r", ptr_lltype);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "malloc_varsize",
+        vec![
+            lowlevel_type_const(struct_lltype),
+            gc_flavor_const()?,
+            Hlvalue::Variable(length_arg),
+        ],
+        Hlvalue::Variable(result.clone()),
+    ));
+    let set_hash = variable_with_lltype("set", LowLevelType::Void);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "setfield",
+        vec![
+            Hlvalue::Variable(result.clone()),
+            hash_field_const(),
+            signed_const(0),
+        ],
+        Hlvalue::Variable(set_hash),
+    ));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(result)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["length".to_string()],
+        func,
+    ))
+}
+
 /// Synthesise `LLHelpers.ll_chr2str` (`lltypesystem/rstr.py:363-369`):
 ///
 /// ```python
@@ -9107,6 +9186,70 @@ mod tests {
     #[test]
     fn build_ll_strlen_rejects_non_ptr_input_lltype() {
         let err = build_ll_strlen_helper_graph("ll_strlen", LowLevelType::Char)
+            .expect_err("non-Ptr input must fail");
+        assert!(format!("{err:?}").contains("Ptr(STR/UNICODE)"));
+    }
+
+    /// rstr.py:35-46 — `mallocstr(length)` lowers to
+    /// `malloc_varsize(STR, gc, length)` + `setfield(r, 'hash', 0)`,
+    /// returning `Ptr(STR)`.
+    #[test]
+    fn build_ll_mallocstr_emits_malloc_varsize_then_hash_zero() {
+        let helper = build_ll_mallocstr_helper_graph("mallocstr", STRPTR.clone())
+            .expect("build_ll_mallocstr_helper_graph");
+        assert_eq!(helper.func.name, "mallocstr");
+        let inner = helper.graph.borrow();
+        let startblock = inner.startblock.borrow();
+        let opnames: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|op| op.opname.as_str())
+            .collect();
+        assert_eq!(opnames, vec!["malloc_varsize", "setfield"]);
+        // setfield's field-name constant is `"hash"`, value constant 0.
+        let setfield_args = &startblock.operations[1].args;
+        assert_eq!(setfield_args.len(), 3);
+        let Hlvalue::Constant(field) = &setfield_args[1] else {
+            panic!("setfield field-name must be a Constant");
+        };
+        assert!(matches!(field.value, ConstValue::ByteStr(ref b) if b == b"hash"));
+        let Hlvalue::Constant(zero) = &setfield_args[2] else {
+            panic!("setfield value must be a Constant");
+        };
+        assert!(matches!(zero.value, ConstValue::Int(0)));
+        // The returned value carries `Ptr(STR)`.
+        let Hlvalue::Variable(ret) = &inner.returnblock.borrow().inputargs[0] else {
+            panic!("returnblock inputarg must be a Variable");
+        };
+        assert_eq!(ret.concretetype.borrow().clone(), Some(STRPTR.clone()));
+        assert_eq!(startblock.inputargs.len(), 1);
+    }
+
+    /// `mallocunicode` is the `Ptr(UNICODE)` mirror — same op sequence,
+    /// distinct struct/pointer lltype and helper identity.
+    #[test]
+    fn build_ll_mallocunicode_mirrors_mallocstr_against_unicode() {
+        let helper = build_ll_mallocstr_helper_graph("mallocunicode", UNICODEPTR.clone())
+            .expect("build_ll_mallocstr_helper_graph for UNICODE");
+        assert_eq!(helper.func.name, "mallocunicode");
+        let inner = helper.graph.borrow();
+        let startblock = inner.startblock.borrow();
+        let opnames: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|op| op.opname.as_str())
+            .collect();
+        assert_eq!(opnames, vec!["malloc_varsize", "setfield"]);
+        let Hlvalue::Variable(ret) = &inner.returnblock.borrow().inputargs[0] else {
+            panic!("returnblock inputarg must be a Variable");
+        };
+        assert_eq!(ret.concretetype.borrow().clone(), Some(UNICODEPTR.clone()));
+    }
+
+    /// `mallocstr` is only meaningful against `Ptr(STR/UNICODE)`.
+    #[test]
+    fn build_ll_mallocstr_rejects_non_ptr_input_lltype() {
+        let err = build_ll_mallocstr_helper_graph("mallocstr", LowLevelType::Char)
             .expect_err("non-Ptr input must fail");
         assert!(format!("{err:?}").contains("Ptr(STR/UNICODE)"));
     }
