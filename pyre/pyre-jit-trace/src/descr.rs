@@ -3724,7 +3724,7 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
         }
         BhDescr::Call { calldescr } => make_call_descr_from_bh(calldescr),
         BhDescr::JitCode { jitcode_index, .. } => make_jitcode_descr(*jitcode_index),
-        BhDescr::Switch { dict } => Arc::new(PyreSwitchDescr::new(dict.clone())),
+        BhDescr::Switch { dict, .. } => Arc::new(PyreSwitchDescr::new(dict.clone())),
         BhDescr::VableField { index } => majit_ir::descr::vable_static_field_descr(*index as u16),
         BhDescr::VableArray { index } => majit_ir::descr::vable_array_field_descr(*index as u16),
         BhDescr::VtableMethod {
