@@ -252,6 +252,13 @@ pub struct UnrollOptimizer {
     /// because the unroll optimizer owns the inner phase optimizers while the
     /// registered GC walker enters through MetaInterp.
     pub compile_snapshot_root_slots: Option<usize>,
+    /// Snapshot-root slots that must stay rooted across every phase's
+    /// `replace_compile_snapshot_roots`. pyjitpl installs the caller-owned
+    /// original snapshot maps here so a moving GC during unroll forwards their
+    /// inline `ConstPtr`s in place — the `InvalidLoop` retry re-clones those
+    /// originals and would otherwise read a stale pre-move gcref. Prepended to
+    /// each phase's slot list rather than overwritten.
+    pub persistent_snapshot_root_slots: Vec<usize>,
 }
 
 impl UnrollOptimizer {
@@ -289,6 +296,7 @@ impl UnrollOptimizer {
             cpu: crate::cpu::default_cpu(),
             phase2_input_ops_seed: None,
             compile_snapshot_root_slots: None,
+            persistent_snapshot_root_slots: Vec::new(),
         }
     }
 
@@ -316,8 +324,10 @@ impl UnrollOptimizer {
             // `MetaInterp.compile_snapshot_refs` for the duration of one
             // compile. Unroll phases run on the same thread as the registered
             // root walker.
+            let mut all = self.persistent_snapshot_root_slots.clone();
+            all.extend(slots);
             unsafe {
-                *(addr as *mut Vec<usize>) = slots;
+                *(addr as *mut Vec<usize>) = all;
             }
         }
     }

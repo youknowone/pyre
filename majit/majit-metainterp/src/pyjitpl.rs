@@ -5257,12 +5257,20 @@ impl<M: Clone> MetaInterp<M> {
         unroll_opt.snapshot_vable_boxes = snapshot_vable_map.clone();
         unroll_opt.snapshot_vref_boxes = snapshot_vref_map.clone();
         unroll_opt.snapshot_frame_pcs = snapshot_pc_map.clone();
-        // Root BOTH the phase-1 clones (read during optimization) AND the
-        // originals (re-cloned into `simple_opt` on the InvalidLoop retry
-        // below). A moving GC during phase 1 forwards each inline `ConstPtr`
-        // in place; without rooting the originals the retry clone would carry
-        // a stale pre-move gcref. `snapshot_frame_sizes` / `snapshot_frame_pcs`
-        // hold no gcrefs, so they need no roots.
+        // The original snapshot maps are re-cloned into `simple_opt` on the
+        // InvalidLoop retry below, so they must stay rooted across the WHOLE
+        // unroll. Each phase's `replace_compile_snapshot_roots` overwrites the
+        // root list, so register the originals as the persistent base (prepended
+        // to every phase's slots) rather than only up front — otherwise a moving
+        // GC after the first phase replace leaves them with stale pre-move
+        // gcrefs. `snapshot_frame_sizes` / `snapshot_frame_pcs` hold no gcrefs.
+        unroll_opt.persistent_snapshot_root_slots = collect_snapshot_const_ptr_slots(&mut [
+            &mut snapshot_map,
+            &mut snapshot_vable_map,
+            &mut snapshot_vref_map,
+        ]);
+        // Until the first phase replace, also root unroll_opt's own clones (the
+        // phase-1 source) alongside the persistent originals.
         self.compile_snapshot_refs = collect_snapshot_const_ptr_slots(&mut [
             &mut unroll_opt.snapshot_boxes,
             &mut unroll_opt.snapshot_vable_boxes,
@@ -5317,6 +5325,16 @@ impl<M: Clone> MetaInterp<M> {
                         return CompileOutcome::Cancelled;
                     }
                     {
+                        // Unroll's last `replace_compile_snapshot_roots` may
+                        // have left dangling phase slots (its inner optimizer
+                        // dropped on the InvalidLoop return). Re-root just the
+                        // live originals before the clones below allocate and
+                        // can move the GC.
+                        self.compile_snapshot_refs = collect_snapshot_const_ptr_slots(&mut [
+                            &mut snapshot_map,
+                            &mut snapshot_vable_map,
+                            &mut snapshot_vref_map,
+                        ]);
                         let mut retry_constants = constants_snapshot;
                         let mut simple_opt = Optimizer::default_pipeline();
                         // history.py:220/261/307: `Const.type` /
@@ -5332,6 +5350,16 @@ impl<M: Clone> MetaInterp<M> {
                         simple_opt.snapshot_vable_boxes = snapshot_vable_map.clone();
                         simple_opt.snapshot_vref_boxes = snapshot_vref_map.clone();
                         simple_opt.snapshot_frame_pcs = snapshot_pc_map.clone();
+                        // `run_optimize_from_inputs` (and the `.to_vec()` /
+                        // `Rc::new` allocations before it) can move the GC via
+                        // constant_fold_alloc. Root simple_opt's own snapshot
+                        // copies so their inline ConstPtrs are forwarded in
+                        // place; the originals are no longer read past this point.
+                        self.compile_snapshot_refs = collect_snapshot_const_ptr_slots(&mut [
+                            &mut simple_opt.snapshot_boxes,
+                            &mut simple_opt.snapshot_vable_boxes,
+                            &mut simple_opt.snapshot_vref_boxes,
+                        ]);
                         simple_opt.call_pure_results = call_pure_results.clone();
                         // Forward the recorder's operand pool — the retry path
                         // uses the same upstream `Rc<Box>` allocations from
