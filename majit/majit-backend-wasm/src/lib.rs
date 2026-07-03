@@ -1351,7 +1351,7 @@ impl majit_backend::Backend for WasmBackend {
                 .rev()
                 .find(|op| op.opcode == majit_ir::OpCode::Jump)
                 .is_some_and(|jump| {
-                    jump.getarglist_operand().iter().any(|arg| match arg {
+                    jump.getarglist().iter().any(|arg| match arg {
                         majit_ir::operand::Operand::Op(producer) => {
                             is_inductive_arith(producer.opcode)
                         }

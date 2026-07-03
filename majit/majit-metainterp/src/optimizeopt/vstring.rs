@@ -1056,7 +1056,7 @@ impl OptString {
         // fall back to its canonical materialized stand-in rather than the
         // total resolver's position-only panic.
         let args: Vec<Operand> = op
-            .getarglist_operand()
+            .getarglist()
             .iter()
             .map(|a| match ctx.resolve_operand_operand_opt(a) {
                 Some(resolved) => resolved,

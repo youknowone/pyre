@@ -1636,17 +1636,21 @@ impl Op {
 
 impl std::fmt::Display for Op {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // history.py:227/268/314 — Const boxes carry their value inline.
-        // Render those via `const_value()`; bound ResOp / InputArg boxes
-        // render as `v<pos>` from `position()`; `None` boxes render as `_`.
-        fn write_arg(f: &mut std::fmt::Formatter<'_>, arg: &BoxRef) -> std::fmt::Result {
+        // history.py:227/268/314 — Const operands carry their value inline.
+        // Render those via `const_value()`; bound ResOp / InputArg operands
+        // render as `v<pos>` from their producer position; `None` renders
+        // as `_`.
+        fn write_arg(
+            f: &mut std::fmt::Formatter<'_>,
+            arg: &crate::operand::Operand,
+        ) -> std::fmt::Result {
             match arg.const_value() {
                 Some(Value::Int(v)) => write!(f, "{v}"),
                 Some(Value::Float(v)) => write!(f, "{v}"),
                 Some(Value::Ref(v)) => write!(f, "ptr({:#x})", v.0),
-                _ => match arg.position() {
-                    Some(pos) => write!(f, "v{pos}"),
-                    None => write!(f, "_"),
+                _ => match arg.to_opref() {
+                    OpRef::None => write!(f, "_"),
+                    r => write!(f, "v{}", r.raw()),
                 },
             }
         }
@@ -1665,7 +1669,7 @@ impl std::fmt::Display for Op {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
-                    write_arg(f, &arg.to_boxref())?;
+                    write_arg(f, arg)?;
                 }
                 write!(f, "]")?;
             }
@@ -1721,7 +1725,7 @@ pub fn format_trace<V: std::fmt::Debug, T: AsRef<Op>, C: ConstLookup<V>>(
     // raw position with constants-map lookup.
     fn render_arg<V: std::fmt::Debug, C: ConstLookup<V>>(
         out: &mut String,
-        arg: &BoxRef,
+        arg: &crate::operand::Operand,
         constants: &C,
     ) {
         use std::fmt::Write;
@@ -1729,15 +1733,16 @@ pub fn format_trace<V: std::fmt::Debug, T: AsRef<Op>, C: ConstLookup<V>>(
             Some(Value::Int(v)) => write!(out, "{v}").unwrap(),
             Some(Value::Float(v)) => write!(out, "{v}").unwrap(),
             Some(Value::Ref(v)) => write!(out, "ptr({:#x})", v.0).unwrap(),
-            _ => match arg.position() {
-                Some(pos) => {
+            _ => match arg.to_opref() {
+                OpRef::None => write!(out, "_").unwrap(),
+                r => {
+                    let pos = r.raw();
                     if let Some(val) = constants.lookup(pos) {
                         write!(out, "{val:?}").unwrap();
                     } else {
                         write!(out, "v{pos}").unwrap();
                     }
                 }
-                None => write!(out, "_").unwrap(),
             },
         }
     }
@@ -1773,7 +1778,7 @@ pub fn format_trace<V: std::fmt::Debug, T: AsRef<Op>, C: ConstLookup<V>>(
                 if i > 0 {
                     write!(out, ", ").unwrap();
                 }
-                render_arg(&mut out, &arg.to_boxref(), constants);
+                render_arg(&mut out, arg, constants);
             }
             write!(out, "]").unwrap();
         }

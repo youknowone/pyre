@@ -982,7 +982,7 @@ impl ShortBoxes {
             };
             // shortpreamble.py:277-278: copy_and_change(opnum, [preamble_arg] + args[1:])
             let mut new_args = vec![preamble_arg];
-            new_args.extend_from_slice(&getfield_op.getarglist_operand()[1..]);
+            new_args.extend_from_slice(&getfield_op.getarglist()[1..]);
             let mut new_op = Op::with_descr(
                 getfield_op.opcode,
                 &new_args,
@@ -2310,11 +2310,11 @@ impl ShortPreambleBuilder {
             // the dependency check is by the arg Box identity.
             if self
                 .produced_short_boxes
-                .get(&majit_ir::operand::Operand::from_boxref(arg))
+                .get(arg)
                 .is_some()
             {
                 let _ =
-                    self.use_box_recursive(&majit_ir::operand::Operand::from_boxref(arg), visiting);
+                    self.use_box_recursive(arg, visiting);
             }
         }
         visiting.remove(result);

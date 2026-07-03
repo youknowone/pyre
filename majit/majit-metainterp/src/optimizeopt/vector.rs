@@ -2234,7 +2234,7 @@ impl VectorLoop {
         // vector.py:284 — bump count once for the alignment pass.
         let unroll_count = if align_unroll_once { count + 1 } else { count };
         let original_body = self.operations.clone();
-        let label_args = self.label.getarglist_operand();
+        let label_args = self.label.getarglist();
         let jump_args = self.jump.getarglist_copy();
 
         // vector.py:281-283: prohibited opcodes — not duplicated during unroll

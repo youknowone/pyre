@@ -397,7 +397,7 @@ impl<'a> ResOpGen<'a> {
             let operations = self.graphs[graphindex].procedure.get_operations();
             for op in operations {
                 for arg in op.getarglist() {
-                    self.add_link_for_box(&mut links, &arg);
+                    self.add_link_for_box(&mut links, &arg.to_boxref());
                 }
                 if op.result_type() != Type::Void && !op.pos.get().is_none() {
                     let result = BoxRef::from_opref(op.pos.get());

@@ -2741,7 +2741,7 @@ impl GcRewriterImpl {
         // rewrite.py:672-683 — store each arg at _ll_initial_locs[i] with
         // per-arg itemsize from getarraydescr_for_frame(arg.type).
         let arglist: Vec<Operand> = op
-            .getarglist_operand()
+            .getarglist()
             .iter()
             .map(|a| st.resolve(a.clone()))
             .collect();

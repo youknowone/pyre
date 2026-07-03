@@ -458,14 +458,14 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
                     // type-shaped descr): reconstruct per-arg from the
                     // failarg variant tag (`opref.ty()`). Production FINISH
                     // always matches the descr arity.
-                    op.getarglist_operand()
+                    op.getarglist()
                         .iter()
                         .map(finish_arg_type)
                         .collect()
                 }
             } else {
                 // No descr — synthetic test FINISH only.
-                op.getarglist_operand()
+                op.getarglist()
                     .iter()
                     .map(finish_arg_type)
                     .collect()
@@ -1705,7 +1705,7 @@ pub(crate) fn normalize_closing_jump_args(
         .iter()
         .rev()
         .find(|op| op.opcode == OpCode::Label)
-        .map(|op| op.getarglist_operand())
+        .map(|op| op.getarglist())
     else {
         return ops;
     };

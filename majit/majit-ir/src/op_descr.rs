@@ -267,33 +267,23 @@ impl Op {
         self.fail_arg_types.borrow().is_some()
     }
 
-    /// `resoperation.py:281 AbstractResOp.getarglist` parity — the operand
-    /// list as `BoxRef`s.  Subclass mixins (`UnaryOp`, `BinaryOp`, ...,
-    /// `N_aryOp`) implement this differently; pyre collapses them into a
-    /// single SmallVec slot.
+    /// `resoperation.py:281 AbstractResOp.getarglist` parity — the stored
+    /// [`Operand`](crate::operand::Operand) args.  Subclass mixins
+    /// (`UnaryOp`, `BinaryOp`, ..., `N_aryOp`) implement this differently;
+    /// pyre collapses them into a single SmallVec slot.
     ///
-    /// `#9` operand-union flip: `args` now stores [`Operand`], so this
-    /// materializes an owned `SmallVec` of `BoxRef`s (convert-on-read via
-    /// `Operand::to_boxref`) rather than borrowing the slot — the old `Ref`
-    /// view is no longer expressible. The owned `SmallVec` derefs to
-    /// `&[BoxRef]`, so iterate/index/`&`-coercion callers are unchanged; it
-    /// also drops the `RefCell` borrow at the call boundary, so a caller may
-    /// freely `setarg` afterwards.
-    pub fn getarglist(&self) -> smallvec::SmallVec<[crate::box_ref::BoxRef; 3]> {
-        self.args.borrow().iter().map(|o| o.to_boxref()).collect()
-    }
-
-    /// `Operand`-yielding form of [`getarglist`](Self::getarglist): the stored
-    /// `Operand` args directly, with no `to_boxref` round-trip.
-    pub fn getarglist_operand(&self) -> smallvec::SmallVec<[crate::operand::Operand; 3]> {
+    /// Returns an owned `SmallVec` (clones of the `Rc`-cheap operands)
+    /// rather than borrowing the slot, dropping the `RefCell` borrow at
+    /// the call boundary so a caller may freely `setarg` afterwards.
+    pub fn getarglist(&self) -> smallvec::SmallVec<[crate::operand::Operand; 3]> {
         self.args.borrow().iter().cloned().collect()
     }
 
     /// `resoperation.py:284 AbstractResOp.getarglist_copy` parity —
     /// `N_aryOp.getarglist_copy` returns `self._args[:]`; pyre returns
-    /// an owned `SmallVec` of `BoxRef`s (convert-on-read).
-    pub fn getarglist_copy(&self) -> smallvec::SmallVec<[crate::box_ref::BoxRef; 3]> {
-        self.args.borrow().iter().map(|o| o.to_boxref()).collect()
+    /// an owned `SmallVec` of the stored operands.
+    pub fn getarglist_copy(&self) -> smallvec::SmallVec<[crate::operand::Operand; 3]> {
+        self.args.borrow().iter().cloned().collect()
     }
 
     /// `resoperation.py:277 AbstractResOp.initarglist` parity — bulk

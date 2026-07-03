@@ -1259,7 +1259,7 @@ impl Optimization for OptPure {
             // (shortpreamble.py:425 — the replay op carries the same Box
             // objects); reuse them instead of re-deriving position-only
             // echoes from the OpRef table.
-            let imported_args = entry.pop.preamble_op.getarglist_operand();
+            let imported_args = entry.pop.preamble_op.getarglist();
             let mut imported_op = Op::new(entry.opcode, &imported_args);
             imported_op.pos.set(entry.result);
             if let Some(d) = entry.descr.clone() {
