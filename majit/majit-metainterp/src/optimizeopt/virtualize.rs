@@ -1918,7 +1918,7 @@ impl OptVirtualize {
         let b_old = Operand::from_bound_op(op_rc);
         let b_forced = ctx
             .get_box_replacement_operand_opt(forced_resolved)
-            .expect("forced virtual terminal must resolve to a BoxRef");
+            .expect("forced virtual terminal must resolve to a bound operand");
         ctx.make_equal_to(&b_old, &b_forced);
         // self.last_emitted_operation = REMOVED
         self.last_emitted_was_removed = true;
@@ -3020,7 +3020,7 @@ mod tests {
         );
         let v_box = ctx
             .get_box_replacement_operand_opt(OpRef::input_arg_ref(0))
-            .expect("standard virtualizable BoxRef populated");
+            .expect("standard virtualizable operand populated");
         assert!(
             ctx.is_virtualizable(&v_box),
             "Virtualizable PtrInfo must survive force_box"
@@ -3258,7 +3258,7 @@ mod tests {
 
         let vbox = ctx
             .get_box_replacement_operand_opt(OpRef::input_arg_ref(0))
-            .expect("standard virtualizable BoxRef populated");
+            .expect("standard virtualizable operand populated");
         let Some(PtrInfo::Virtualizable(vstate)) = ctx.peek_ptr_info(&vbox) else {
             panic!("expected standard virtualizable ptr info on OpRef::input_arg_ref(0)");
         };
@@ -3772,7 +3772,7 @@ mod tests {
 
         let inputarg_box = ctx
             .get_box_replacement_operand_opt(OpRef::ref_op(0))
-            .expect("inputarg BoxRef populated");
+            .expect("inputarg operand populated");
         let info = ctx
             .peek_ptr_info(&inputarg_box)
             .expect("virtual info missing");

@@ -4538,17 +4538,11 @@ mod tests {
         // `opclasses[INT_ADD].arity` = 2). The operands bind to synthetic
         // producers (kept alive by `_lp`/`_rp`) so `Op::new` carries
         // `Operand::Op`, not an unbound position-only box.
-        let (lhs_box, _lp) = crate::box_ref::test_support::bound_resop_box(Type::Int, 0);
-        let (rhs_box, _rp) = crate::box_ref::test_support::bound_resop_box(Type::Int, 1);
-        let lhs = lhs_box.to_opref();
-        let rhs = rhs_box.to_opref();
-        let op = Op::new(
-            OpCode::IntAdd,
-            &[
-                Operand::from_boxref(&lhs_box),
-                Operand::from_boxref(&rhs_box),
-            ],
-        );
+        let lhs_op = crate::box_ref::test_support::bound_resop_operand(Type::Int, 0);
+        let rhs_op = crate::box_ref::test_support::bound_resop_operand(Type::Int, 1);
+        let lhs = lhs_op.to_opref();
+        let rhs = rhs_op.to_opref();
+        let op = Op::new(OpCode::IntAdd, &[lhs_op.clone(), rhs_op.clone()]);
         assert_eq!(op.opcode, OpCode::IntAdd);
         assert_eq!(op.num_args(), 2);
         assert_eq!(op.arg(0).to_opref(), lhs);
@@ -4561,17 +4555,11 @@ mod tests {
 
     #[test]
     fn test_op_getarg() {
-        let (lhs_box, _lp) = crate::box_ref::test_support::bound_resop_box(Type::Int, 10);
-        let (rhs_box, _rp) = crate::box_ref::test_support::bound_resop_box(Type::Int, 20);
-        let lhs = lhs_box.to_opref();
-        let rhs = rhs_box.to_opref();
-        let op = Op::new(
-            OpCode::IntAdd,
-            &[
-                Operand::from_boxref(&lhs_box),
-                Operand::from_boxref(&rhs_box),
-            ],
-        );
+        let lhs_op = crate::box_ref::test_support::bound_resop_operand(Type::Int, 10);
+        let rhs_op = crate::box_ref::test_support::bound_resop_operand(Type::Int, 20);
+        let lhs = lhs_op.to_opref();
+        let rhs = rhs_op.to_opref();
+        let op = Op::new(OpCode::IntAdd, &[lhs_op.clone(), rhs_op.clone()]);
         assert_eq!(op.arg(0).to_opref(), lhs);
         assert_eq!(op.arg(1).to_opref(), rhs);
     }

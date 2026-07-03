@@ -2657,7 +2657,7 @@ impl Optimizer {
                         let (fresh, b_fresh) = ctx.reserve_virtual_box(tp);
                         let b_source = ctx
                             .get_box_replacement_operand_opt(source)
-                            .expect("Phase 2 source inputarg must have a materialized BoxRef slot");
+                            .expect("Phase 2 source inputarg must have a materialized operand slot");
                         ctx.make_equal_to(&b_source, &b_fresh);
                         fresh
                     } else {
@@ -4714,7 +4714,7 @@ impl Optimizer {
         if op.opcode.returns_bool() {
             let bound_box = ctx
                 .get_box_replacement_operand_opt(emitted)
-                .expect("just-emitted op resolves to a bound BoxRef");
+                .expect("just-emitted op resolves to a bound operand");
             ctx.with_intbound_mut(&bound_box, |bound| bound.make_bool());
         }
         // optimizer.py:603-611: after emit, promote IntBound→Const.

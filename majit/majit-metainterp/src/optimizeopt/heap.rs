@@ -4323,7 +4323,7 @@ mod tests {
         op.setarg(
             0,
             ctx.resolve_operand_operand_opt(&op.arg(0))
-                .expect("constant receiver resolves to a BoxRef"),
+                .expect("constant receiver resolves to an operand"),
         );
 
         let _ = heap.optimize_getfield(&op, &std::rc::Rc::new(op.clone()), &mut ctx);

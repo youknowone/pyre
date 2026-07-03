@@ -1589,7 +1589,7 @@ impl OptString {
                 if did_shrink {
                     // vstring.py:849: self.make_equal_to(op, op.getarg(1))
                     let b_old = Operand::from_bound_op(op_rc);
-                    let b_arg1 = arg1_box.expect("body-namespace OpRef must have a BoxRef slot");
+                    let b_arg1 = arg1_box.expect("body-namespace OpRef must have an operand slot");
                     ctx.make_equal_to(&b_old, &b_arg1);
                     return OptimizationResult::Remove;
                 }

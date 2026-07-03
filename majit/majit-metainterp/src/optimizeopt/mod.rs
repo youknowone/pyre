@@ -5167,7 +5167,7 @@ impl OptContext {
         // pyre placeholder-box tolerance shared with `setintbound`.
         assert!(
             matches!(op.type_(), majit_ir::Type::Int | majit_ir::Type::Void),
-            "getintbound_handle: expected 'i'-typed BoxRef, got {:?}",
+            "getintbound_handle: expected 'i'-typed operand, got {:?}",
             op.type_()
         );
         let resolved = op.get_box_replacement(false);
@@ -5234,7 +5234,7 @@ impl OptContext {
         // OpRef yet" tolerance.
         assert!(
             matches!(op.type_(), majit_ir::Type::Int | majit_ir::Type::Void),
-            "setintbound: expected 'i'-typed BoxRef, got {:?}",
+            "setintbound: expected 'i'-typed operand, got {:?}",
             op.type_()
         );
         // optimizer.py:117: op = get_box_replacement(op)
@@ -5293,7 +5293,7 @@ impl OptContext {
         // Const/InputArg.
         assert!(
             matches!(op.type_(), majit_ir::Type::Int | majit_ir::Type::Void),
-            "with_intbound_mut: expected 'i'-typed BoxRef, got {:?}",
+            "with_intbound_mut: expected 'i'-typed operand, got {:?}",
             op.type_()
         );
         // optimizer.py:101: op = get_box_replacement(op)
@@ -7005,7 +7005,7 @@ impl OptContext {
         debug_assert_eq!(
             op.type_(),
             majit_ir::Type::Int,
-            "getrawptrinfo_handle: expected 'i'-typed BoxRef"
+            "getrawptrinfo_handle: expected 'i'-typed operand"
         );
         // info.py:868 — `op = op.get_box_replacement()`.
         let terminal = op.get_box_replacement(false);
@@ -7013,7 +7013,7 @@ impl OptContext {
         debug_assert_eq!(
             terminal.type_(),
             majit_ir::Type::Int,
-            "getrawptrinfo_handle: terminal expected 'i'-typed BoxRef"
+            "getrawptrinfo_handle: terminal expected 'i'-typed operand"
         );
         // info.py:870-871 — `if isinstance(op, ConstInt): return ConstPtrInfo(op)`.
         if let Some(Value::Int(bits)) = terminal.const_value() {
@@ -8585,7 +8585,7 @@ mod boxref_forwarding_tests {
         // `newop.set_forwarded(opinfo)`). old now forwards to new.
         match &b1.get_forwarded() {
             BoxForwarded::Info(OpInfo::IntBound(b)) => assert_eq!(b.borrow().lower, 7),
-            other => panic!("BoxRef[1] should carry IntBound, got {:?}", other),
+            other => panic!("operand[1] should carry IntBound, got {:?}", other),
         }
         // old's slot now points to new. Bound-InputArg target routes through
         // `set_forwarded_inputarg`, so the slot carries
@@ -8847,7 +8847,7 @@ mod boxref_forwarding_tests {
         let source_p2_box = ctx.get_box_replacement_operand(source_p2);
         let via_box = ctx
             .peek_ptr_info(&source_p2_box)
-            .expect("BoxRef path must see info");
+            .expect("operand path must see info");
         assert!(matches!(via_box, PtrInfo::NonNull { .. }));
 
         // Chain walk lands on target_p1.
