@@ -3662,46 +3662,13 @@ impl Optimizer {
                         *opref = opref.with_raw(new_pos);
                     }
                 };
-                let remap_boxref = |arg: &mut majit_ir::box_ref::BoxRef| {
-                    // A bound box live-tracks its producer's `op.pos`, already
-                    // moved to the new dense slot by the main loop above, so it
-                    // needs no rewrite — and a `from_opref` re-mint would sever
-                    // the bound carry into a stale position-only box. Only
-                    // position-only boxes (test fixtures) carry a pre-remap
-                    // position the table must rewrite.
-                    if arg.bound_op().is_some() || arg.bound_inputarg().is_some() {
-                        return;
-                    }
-                    let mut opref = arg.to_opref();
-                    remap_opref(&mut opref);
-                    *arg = majit_ir::box_ref::BoxRef::from_opref(opref);
-                };
-                // next_iteration_args now carries the canonical Phase-1 boxes that
-                // double as exported_infos keys. Remap by `set_position` (as
-                // short_inputargs below) to preserve box identity across
-                // compaction: a `from_opref` re-mint would sever the ptr_eq carry
-                // that import_state's exported_infos lookup depends on.
-                for arg in &state.next_iteration_args {
-                    // A bound arg live-tracks its producer's `op.pos`, already
-                    // remapped by the main loop, so it needs no `set_position`;
-                    // its Rc identity (the exported_infos key) is preserved
-                    // untouched. Only position-only args (test fixtures) carry a
-                    // pre-remap position the table must rewrite.
-                    if arg.bound_op().is_some() || arg.bound_inputarg().is_some() {
-                        continue;
-                    }
-                    let opref = arg.to_opref();
-                    // Const args carry their value inline (no body position):
-                    // `set_position` is a Const no-op and `opref.raw()` panics on
-                    // an inline-Const OpRef, so skip them. Their Rc identity (the
-                    // exported_infos key) is preserved untouched.
-                    if opref.is_constant() {
-                        continue;
-                    }
-                    let mut opref = opref;
-                    remap_opref(&mut opref);
-                    arg.set_position(opref.raw());
-                }
+                // next_iteration_args carries the canonical Phase-1 operands
+                // that double as exported_infos keys. They need NO remap: a
+                // bound operand live-tracks its producer's `op.pos` (already
+                // moved to the new dense slot by the main loop above), a Const
+                // carries its value inline (no body position), and Operand has
+                // no position-only form — so every carried identity (the
+                // exported_infos key) is preserved untouched.
                 for arg in &mut state.end_args {
                     remap_opref(arg);
                 }

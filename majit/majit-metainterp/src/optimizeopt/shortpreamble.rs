@@ -1432,7 +1432,10 @@ impl ProducedShortOp {
     pub fn produce_op(
         &self,
         ctx: &mut crate::optimizeopt::OptContext,
-        exported_infos: &majit_ir::VecMap<BoxRef, crate::optimizeopt::info::OpInfo>,
+        exported_infos: &majit_ir::VecMap<
+            majit_ir::operand::Operand,
+            crate::optimizeopt::info::OpInfo,
+        >,
         short_inputargs: &[OpRef],
         short_args: &[OpRef],
         result_map: &majit_ir::VecMap<OpRef, OpRef>,
@@ -1653,7 +1656,10 @@ impl ProducedShortOp {
     fn produce_heap_field(
         &self,
         ctx: &mut crate::optimizeopt::OptContext,
-        exported_infos: &majit_ir::VecMap<BoxRef, crate::optimizeopt::info::OpInfo>,
+        exported_infos: &majit_ir::VecMap<
+            majit_ir::operand::Operand,
+            crate::optimizeopt::info::OpInfo,
+        >,
         short_inputargs: &[OpRef],
         short_args: &[OpRef],
         result_map: &majit_ir::VecMap<OpRef, OpRef>,
@@ -1697,7 +1703,7 @@ impl ProducedShortOp {
         //     setinfo_from_preamble(g.getarg(0), exported_infos[...])
         // Pass the Rc handle (unroll.py:61 identity preservation).
         if let Some(crate::optimizeopt::info::OpInfo::Ptr(rc)) =
-            exported_infos.get(&object_arg.to_boxref())
+            exported_infos.get(&object_arg)
         {
             ctx.setinfo_from_preamble(obj_resolved, rc, Some(exported_infos));
         }
@@ -1776,7 +1782,10 @@ impl ProducedShortOp {
     fn produce_heap_array_item(
         &self,
         ctx: &mut crate::optimizeopt::OptContext,
-        exported_infos: &majit_ir::VecMap<BoxRef, crate::optimizeopt::info::OpInfo>,
+        exported_infos: &majit_ir::VecMap<
+            majit_ir::operand::Operand,
+            crate::optimizeopt::info::OpInfo,
+        >,
         short_inputargs: &[OpRef],
         short_args: &[OpRef],
         result_map: &majit_ir::VecMap<OpRef, OpRef>,
@@ -1832,7 +1841,7 @@ impl ProducedShortOp {
         // before ensuring heap/array PtrInfo.
         // Pass the Rc handle (unroll.py:61 identity preservation).
         if let Some(crate::optimizeopt::info::OpInfo::Ptr(rc)) =
-            exported_infos.get(&object_arg.to_boxref())
+            exported_infos.get(&object_arg)
         {
             ctx.setinfo_from_preamble(obj_resolved, rc, Some(exported_infos));
         }

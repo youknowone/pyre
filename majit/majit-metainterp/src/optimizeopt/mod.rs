@@ -2989,7 +2989,7 @@ impl OptContext {
         result_map: &majit_ir::VecMap<OpRef, OpRef>,
         mut imported_constants: &mut majit_ir::VecMap<OpRef, OpRef>,
         exported_infos: &majit_ir::VecMap<
-            majit_ir::box_ref::BoxRef,
+            majit_ir::operand::Operand,
             crate::optimizeopt::info::OpInfo,
         >,
     ) -> bool {
@@ -3080,7 +3080,7 @@ impl OptContext {
             if produced_op.res.to_opref().is_constant() {
                 continue;
             }
-            if let Some(info) = exported_infos.get(&produced_op.res.to_boxref()) {
+            if let Some(info) = exported_infos.get(&produced_op.res) {
                 self.set_preamble_forwarded_info(replay_pos(*source, produced_op), info);
             }
         }
@@ -3790,7 +3790,7 @@ impl OptContext {
         op: OpRef,
         preamble_info_handle: &std::rc::Rc<std::cell::RefCell<PtrInfo>>,
         exported_infos: Option<
-            &majit_ir::VecMap<majit_ir::box_ref::BoxRef, crate::optimizeopt::info::OpInfo>,
+            &majit_ir::VecMap<majit_ir::operand::Operand, crate::optimizeopt::info::OpInfo>,
         >,
     ) {
         let op = self.get_replacement_opref(op);
@@ -3843,11 +3843,11 @@ impl OptContext {
                 // `RawBufferPtrInfo.all_items()` is also empty), so the import
                 // never iterates raw-buffer slots and never calls
                 // `clear_forwarded` on a `from_opref`-minted unbound box.
-                let items: Vec<majit_ir::box_ref::BoxRef> = preamble_info_handle
+                let items: Vec<majit_ir::operand::Operand> = preamble_info_handle
                     .borrow()
                     .all_items()
                     .iter()
-                    .map(|(_, e)| e.as_seen_box())
+                    .map(|(_, e)| e.as_seen_operand())
                     .collect();
                 self.setinfo_from_preamble_list(&items, infos);
             }
@@ -3948,9 +3948,9 @@ impl OptContext {
     /// logic, so this method becomes the literal unroll.py loop body.
     fn setinfo_from_preamble_list(
         &mut self,
-        items: &[majit_ir::box_ref::BoxRef],
+        items: &[majit_ir::operand::Operand],
         exported_infos: &majit_ir::VecMap<
-            majit_ir::box_ref::BoxRef,
+            majit_ir::operand::Operand,
             crate::optimizeopt::info::OpInfo,
         >,
     ) {
@@ -3995,7 +3995,7 @@ impl OptContext {
         op: OpRef,
         preamble_info: &crate::optimizeopt::info::OpInfo,
         exported_infos: &majit_ir::VecMap<
-            majit_ir::box_ref::BoxRef,
+            majit_ir::operand::Operand,
             crate::optimizeopt::info::OpInfo,
         >,
     ) {
@@ -4065,7 +4065,7 @@ impl OptContext {
         op: OpRef,
         preamble_info: &crate::optimizeopt::info::OpInfo,
         exported_infos: Option<
-            &majit_ir::VecMap<majit_ir::box_ref::BoxRef, crate::optimizeopt::info::OpInfo>,
+            &majit_ir::VecMap<majit_ir::operand::Operand, crate::optimizeopt::info::OpInfo>,
         >,
     ) {
         use crate::optimizeopt::info::OpInfo;

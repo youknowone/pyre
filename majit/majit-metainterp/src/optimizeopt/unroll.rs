@@ -89,8 +89,8 @@ fn root_forwarded_gcref(
     forwarded: &majit_ir::box_ref::Forwarded,
     info_constant_field: ExportedGcRefField,
     const_ref_field: ExportedGcRefField,
-    dummy_key: BoxRef,
-    rooted_refs: &mut Vec<(BoxRef, ExportedGcRefField, usize)>,
+    dummy_key: Operand,
+    rooted_refs: &mut Vec<(Operand, ExportedGcRefField, usize)>,
 ) {
     use crate::optimizeopt::info::{OpInfo, PtrInfo};
     if let majit_ir::box_ref::Forwarded::Info(OpInfo::Ptr(rc)) = forwarded {
@@ -1899,8 +1899,11 @@ impl Default for UnrollOptimizer {
 pub struct ExportedState {
     /// Label args at the end of the preamble (after forcing).
     pub end_args: Vec<OpRef>,
-    /// Args for the next iteration (before forcing).
-    pub next_iteration_args: Vec<BoxRef>,
+    /// Args for the next iteration (before forcing). unroll.py:467
+    /// `next_iteration_args = end_args` — the SAME canonical box objects
+    /// (producer-bound / const [`Operand`]s) used as `exported_infos` keys,
+    /// so the import-state lookup is an identity hit.
+    pub next_iteration_args: Vec<Operand>,
     /// Types of end_args as determined by Phase 1 optimization.
     /// Used by Phase 2 import_state to propagate unboxed types.
     pub end_arg_types: Vec<Type>,
@@ -1912,8 +1915,10 @@ pub struct ExportedState {
     /// RPython stores one of `PtrInfo` / `IntBound` / `FloatConstInfo` per box,
     /// dispatched via `isinstance` in `setinfo_from_preamble` (unroll.py:53-98).
     /// Majit uses the existing `OpInfo` enum (info.rs:137) as the discriminated
-    /// union of these three cases.
-    pub exported_infos: majit_ir::VecMap<BoxRef, crate::optimizeopt::info::OpInfo>,
+    /// union of these three cases. Keyed by box object identity ([`Operand`]
+    /// `Eq` = producer / const-cell `Rc::ptr_eq`), matching RPython's plain
+    /// box-keyed dict.
+    pub exported_infos: majit_ir::VecMap<Operand, crate::optimizeopt::info::OpInfo>,
     /// RPython shortpreamble.py: produced short boxes in preamble order.
     /// This preserves the original preamble ops so the active path can build
     /// short preambles without re-extracting them from the peeled trace.
@@ -2013,7 +2018,7 @@ pub struct ExportedState {
     /// `exported_infos` BoxRef key for `InfoPtrInfoConstant` entries; other
     /// field kinds carry the `BoxRef::none()` sentinel since they never key
     /// back into `exported_infos`.
-    rooted_refs: Vec<(BoxRef, ExportedGcRefField, usize)>,
+    rooted_refs: Vec<(Operand, ExportedGcRefField, usize)>,
     /// Shadow stack slots for every inline `ConstPtr.value` reachable from
     /// this ExportedState's Rust object graph. RPython traces these fields as
     /// normal Const object attributes; pyre records the walk order and copies
@@ -2056,9 +2061,9 @@ impl ExportedState {
     /// unroll.py: ExportedState.__init__
     pub fn new(
         end_args: Vec<OpRef>,
-        next_iteration_args: Vec<BoxRef>,
+        next_iteration_args: Vec<Operand>,
         virtual_state: crate::optimizeopt::virtualstate::VirtualState,
-        exported_infos: majit_ir::VecMap<BoxRef, crate::optimizeopt::info::OpInfo>,
+        exported_infos: majit_ir::VecMap<Operand, crate::optimizeopt::info::OpInfo>,
         exported_short_boxes: Vec<crate::optimizeopt::shortpreamble::PreambleOp>,
         renamed_inputargs: Vec<OpRef>,
         short_inputargs: Vec<OpRef>,
@@ -2127,9 +2132,9 @@ impl ExportedState {
             }
         }
 
-        fn visit_boxrefs(boxes: &[BoxRef], visitor: &mut dyn FnMut(&mut GcRef)) {
-            for b in boxes {
-                b.walk_const_ptr_refs(visitor);
+        fn visit_operands(operands: &[Operand], visitor: &mut dyn FnMut(&mut GcRef)) {
+            for o in operands {
+                o.walk_const_ptr_refs(visitor);
             }
         }
 
@@ -2190,7 +2195,7 @@ impl ExportedState {
         }
 
         visit_oprefs(&mut self.end_args, visitor);
-        visit_boxrefs(&self.next_iteration_args, visitor);
+        visit_operands(&self.next_iteration_args, visitor);
         self.virtual_state.walk_const_ptr_refs_mut(visitor);
         for (key, info) in self.exported_infos.iter_entries_mut() {
             key.walk_const_ptr_refs(visitor);
@@ -2367,7 +2372,7 @@ impl ExportedState {
         self.release_roots();
         self.shadow_stack_base = majit_gc::shadow_stack::depth();
         // ── exported_infos GcRef fields ──
-        let mut keys: Vec<BoxRef> = self.exported_infos.keys().cloned().collect();
+        let mut keys: Vec<Operand> = self.exported_infos.keys().cloned().collect();
         // Sort for determinism via the key's resolved OpRef position. Const
         // variants (history.py:189-220) sort separately via the inline
         // payload — `.raw()` would panic on inline-Const OpRefs.
@@ -2401,8 +2406,8 @@ impl ExportedState {
         // VirtualStateInfo::KnownClass, Virtual{known_class}, Constant(Ref)
         // The rooted_refs `key` slot here just tags the field origin;
         // these entries dispatch on the field kind and never key back into
-        // `exported_infos`, so use the producer-less `BoxRef::none()` sentinel.
-        let dummy_key = BoxRef::none();
+        // `exported_infos`, so use the `Operand::None` sentinel.
+        let dummy_key = Operand::None;
         for (i, entry) in self.virtual_state.state.iter().enumerate() {
             match &entry.info {
                 // KnownClass.class_ptr and Virtual.known_class are immortal
@@ -2433,7 +2438,7 @@ impl ExportedState {
             {
                 let ss_idx = majit_gc::shadow_stack::push(*gcref);
                 self.rooted_refs.push((
-                    BoxRef::none(),
+                    Operand::None,
                     ExportedGcRefField::ShortBoxConstValue(key),
                     ss_idx,
                 ));
@@ -2722,25 +2727,26 @@ impl OptUnroll {
         // the same post-force, post-flush state RPython feeds in.
         let virtual_state = crate::optimizeopt::virtualstate::export_state(&end_args, ctx);
         // unroll.py:459-461: infos = {}; for arg in end_args: _expand_info(arg, infos)
-        let mut infos: majit_ir::VecMap<BoxRef, crate::optimizeopt::info::OpInfo> =
+        let mut infos: majit_ir::VecMap<Operand, crate::optimizeopt::info::OpInfo> =
             majit_ir::VecMap::new();
         // Resolve the ONE canonical box per end_arg up front: it is the
         // exported_infos key AND (unroll.py:467 next_iteration_args = end_args)
         // the carried import key, so they are the identical Rc and import_state's
-        // lookup is a ptr_eq hit for const / inputarg / resop alike. Computing it
-        // once is load-bearing for Const: get_box_replacement_box mints a fresh
-        // Const box per call, so two calls would NOT be ptr_eq.
-        let end_arg_boxes: Vec<BoxRef> = end_args
+        // lookup is an identity hit for const / inputarg / resop alike. Computing
+        // it once keeps a single canonical Const cell per arg (Operand::Const
+        // compares by cell identity, so re-resolving is tolerable but one cell
+        // mirrors RPython's single Const box object).
+        let end_arg_boxes: Vec<Operand> = end_args
             .iter()
             .map(|&a| match ctx.get_box_replacement_operand_opt(a) {
-                Some(o) => o.to_boxref(),
+                Some(o) => o,
                 // The None arm fires only for an unregistered ResOp position
                 // (Const / InputArg always resolve); #157 drained those fires
-                // to zero. materialize_box_at mints+registers a canonical
-                // synthetic so this key is ptr-stable and a later resolve hits
-                // the same host — not a producer-less from_opref box that would
-                // miss the exported_infos / next_iteration_args ptr_eq carry.
-                None => ctx.materialize_box_at(a),
+                // to zero. materialize_operand_at mints+registers a canonical
+                // synthetic so this key is identity-stable and a later resolve
+                // hits the same host — preserving the exported_infos /
+                // next_iteration_args identity carry.
+                None => ctx.materialize_operand_at(a),
             })
             .collect();
         for (arg, arg_box) in end_args.iter().zip(end_arg_boxes.iter()) {
@@ -2754,12 +2760,12 @@ impl OptUnroll {
         // unroll.py:464-465: for arg in label_args: _expand_info(arg, infos)
         for &arg in &label_args {
             let arg_box = match ctx.get_box_replacement_operand_opt(arg) {
-                Some(o) => o.to_boxref(),
+                Some(o) => o,
                 // Same canonical-key fallback as end_arg_boxes above: an
                 // unregistered ResOp position (drained to zero by #157) mints a
-                // canonical synthetic instead of a producer-less from_opref box,
-                // keeping the exported_infos key ptr-stable.
-                None => ctx.materialize_box_at(arg),
+                // canonical registered synthetic, keeping the exported_infos
+                // key identity-stable.
+                None => ctx.materialize_operand_at(arg),
             };
             self.expand_info(arg, &arg_box, ctx, exported_int_bounds, &mut infos);
         }
@@ -2859,13 +2865,7 @@ impl OptUnroll {
                 // (#158) on the producer-bound `res`; re-mint its box
                 // (`to_boxref` is `Rc::ptr_eq`-stable on the producer, so
                 // the import lookup still hits).
-                self.expand_info(
-                    op,
-                    &produced_op.res.to_boxref(),
-                    ctx,
-                    exported_int_bounds,
-                    &mut infos,
-                );
+                self.expand_info(op, &produced_op.res, ctx, exported_int_bounds, &mut infos);
             }
         }
 
@@ -2891,7 +2891,7 @@ impl OptUnroll {
         // import lookup is a ptr_eq hit. Each box's `.to_opref()` yields the
         // resolved (post-forwarding) position, so consumers that read `.to_opref()`
         // see the same value the prior `get_replacement_opref` form produced.
-        let resolved_next_iteration_args: Vec<BoxRef> = end_arg_boxes;
+        let resolved_next_iteration_args: Vec<Operand> = end_arg_boxes;
         // Phase B B1: `produced_short_boxes` is derived from
         // `exported_short_boxes` lazily at the consumer site
         // (`build_short_preamble_from_produced_boxes` in `import_state`)
@@ -3009,12 +3009,12 @@ impl OptUnroll {
     fn expand_info(
         &self,
         arg: OpRef,
-        arg_box: &BoxRef,
+        arg_box: &Operand,
         ctx: &OptContext,
         exported_int_bounds: Option<
             &majit_ir::VecMap<majit_ir::operand::Operand, crate::optimizeopt::intutils::IntBound>,
         >,
-        infos: &mut majit_ir::VecMap<BoxRef, crate::optimizeopt::info::OpInfo>,
+        infos: &mut majit_ir::VecMap<Operand, crate::optimizeopt::info::OpInfo>,
     ) {
         // unroll.py:438-443 `_expand_info`:
         //     if arg in infos:
@@ -3068,7 +3068,7 @@ impl OptUnroll {
         exported_int_bounds: Option<
             &majit_ir::VecMap<majit_ir::operand::Operand, crate::optimizeopt::intutils::IntBound>,
         >,
-        infos: &mut majit_ir::VecMap<BoxRef, crate::optimizeopt::info::OpInfo>,
+        infos: &mut majit_ir::VecMap<Operand, crate::optimizeopt::info::OpInfo>,
     ) {
         let opref_box = ctx.get_box_replacement_operand_opt(opref);
         // unroll.py:445-450 `_expand_infos_from_virtual`:
@@ -3089,7 +3089,7 @@ impl OptUnroll {
             return;
         };
         for (_, entry) in info.all_items() {
-            let field_box = entry.as_seen_box();
+            let field_box = entry.as_seen_operand();
             if field_box.to_opref().is_none() {
                 continue;
             }
@@ -4238,7 +4238,10 @@ impl OptUnroll {
         &self,
         opref: OpRef,
         info: &crate::optimizeopt::info::OpInfo,
-        exported_infos: &majit_ir::VecMap<BoxRef, crate::optimizeopt::info::OpInfo>,
+        exported_infos: &majit_ir::VecMap<
+            majit_ir::operand::Operand,
+            crate::optimizeopt::info::OpInfo,
+        >,
         ctx: &mut OptContext,
     ) {
         ctx.setinfo_from_preamble_item(opref, info, exported_infos);
@@ -5539,8 +5542,8 @@ mod tests {
         let exported = ExportedState::new(
             vec![OpRef::int_op(52)],
             vec![
-                rooted_resop_box(Type::Int, 109),
-                BoxRef::from_opref(OpRef::const_int(3)),
+                rooted_resop_operand(Type::Int, 109),
+                Operand::from_opref(OpRef::const_int(3)),
             ],
             crate::optimizeopt::virtualstate::VirtualState::new(Vec::new()),
             majit_ir::VecMap::new(),
@@ -5769,7 +5772,7 @@ mod tests {
         let new_ref = OpRef::const_ptr(new);
         let mut exported_infos = majit_ir::VecMap::new();
         exported_infos.insert(
-            BoxRef::from_opref(old_ref),
+            Operand::from_opref(old_ref),
             OpInfo::ptr(PtrInfo::Constant(old)),
         );
         let mut short_box_const_values = majit_ir::VecMap::new();
@@ -5779,7 +5782,7 @@ mod tests {
 
         let mut state = ExportedState::new(
             vec![old_ref],
-            vec![BoxRef::from_opref(old_ref)],
+            vec![Operand::from_opref(old_ref)],
             VirtualState::new(vec![VirtualStateInfo::Constant(Value::Ref(old))]),
             exported_infos,
             vec![PreambleOp {
@@ -6781,7 +6784,7 @@ mod tests {
         let func_ptr = 0xBEEF;
         let func = OpRef::const_int(func_ptr);
         let source = OpRef::int_op(11);
-        let source_box = rooted_resop_box(Type::Int, 11);
+        let source_box = rooted_resop_operand(Type::Int, 11);
         let phase2_result = OpRef::int_op(3);
         let exported = ExportedState::new(
             vec![source],
@@ -6794,7 +6797,7 @@ mod tests {
                     op.pos.set(source);
                     std::rc::Rc::new(op)
                 },
-                res: Operand::from_boxref(&source_box),
+                res: source_box.clone(),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::LoopInvariant,
                 label_arg_idx: Some(0),
                 invented_name: false,
