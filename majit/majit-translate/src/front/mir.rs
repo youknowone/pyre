@@ -1657,6 +1657,13 @@ pub fn lower_fun_decl_with_static_addrs(
         } else {
             crate::front::option_map_or::rewire_map_or_call_sites(&mut lo.graph, &lo.map_or_sites)
         };
+        // The `Option::is_none`/`is_some` rewrite (`front::option_is_none`)
+        // replaces the residual predicate call in place with a
+        // `__discriminant` comparison; no block split, so it needs no
+        // reachability sweep.  Same fail-safe contract as the diamonds above.
+        if !lo.is_none_sites.is_empty() {
+            crate::front::option_is_none::rewire_is_none_call_sites(&mut lo.graph, &lo.is_none_sites);
+        }
         if !lo.result_exc_call_results.is_empty()
             || result_exc_callee
             || next_rewritten > 0
@@ -2014,6 +2021,10 @@ struct Lowering<'a> {
     /// discriminant closure-select the `front::option_map_or` post-pass
     /// synthesizes (see [`crate::front::option_map_or::MapOrSite`]).
     map_or_sites: Vec<crate::front::option_map_or::MapOrSite>,
+    /// `Option::is_none(opt)` / `Option::is_some(opt)` call sites recorded for
+    /// the discriminant comparison the `front::option_is_none` post-pass
+    /// synthesizes in place (see [`crate::front::option_is_none::IsNoneSite`]).
+    is_none_sites: Vec<crate::front::option_is_none::IsNoneSite>,
 }
 
 impl<'a> Lowering<'a> {
@@ -2173,6 +2184,7 @@ impl<'a> Lowering<'a> {
             bool_then_sites: Vec::new(),
             unwrap_or_sites: Vec::new(),
             map_or_sites: Vec::new(),
+            is_none_sites: Vec::new(),
         })
     }
 
@@ -6018,6 +6030,29 @@ impl<'a> Lowering<'a> {
         {
             self.map_or_sites.push(site);
         }
+        // Capture `Option::is_none(opt)` / `Option::is_some(opt)` sites for the
+        // discriminant comparison `front::option_is_none` synthesizes in place.
+        // Both are Opaque (foreign `core`) with the `Option` ADT receiver, so
+        // `first_is_self` routes them to a one-arg `CallTarget::Method`.  The
+        // `Option` enum root owning `__discriminant` comes from the receiver
+        // type (`first_arg_ty`), in hand here; `recognize_is_none_site` also
+        // confirms the receiver is an `Option`.  A resolution miss leaves the
+        // residual call — an unregistered callee the rtyper census Skips.
+        if let OpKind::Call {
+            target: CallTarget::Method { name, .. },
+            args,
+            ..
+        } = &op_kind
+            && args.len() == 1
+            && (name == "is_none" || name == "is_some")
+            && let Some(site) = self.recognize_is_none_site(
+                first_arg_ty.as_ref(),
+                &result_var,
+                name == "is_some",
+            )
+        {
+            self.is_none_sites.push(site);
+        }
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(result_var.clone()),
             kind: op_kind,
@@ -7400,6 +7435,31 @@ impl<'a> Lowering<'a> {
             option_owner,
             some_owner,
             payload_ty,
+        })
+    }
+
+    /// Resolve a recognized `Option::is_none(opt)` / `Option::is_some(opt)`
+    /// call into an [`crate::front::option_is_none::IsNoneSite`] — the
+    /// `Option` enum root owning `__discriminant`.  `None` (leaving the
+    /// residual call) when the receiver is not a resolvable `Option`; guarding
+    /// on `Option` since a custom type could share the method name.
+    fn recognize_is_none_site(
+        &self,
+        recv_ty: Option<&TyRef>,
+        result_var: &Variable,
+        is_some: bool,
+    ) -> Option<crate::front::option_is_none::IsNoneSite> {
+        let recv_ty = recv_ty?;
+        if !crate::front::result_exc::tyref_is_option(recv_ty, self.llbc) {
+            return None;
+        }
+        let def_id = self.tyref_adt_def_id(recv_ty)?;
+        let td = self.llbc.type_by_id(def_id)?;
+        let option_owner = td.item_meta.name_path();
+        Some(crate::front::option_is_none::IsNoneSite {
+            result_var: result_var.clone(),
+            option_owner,
+            is_some,
         })
     }
 
