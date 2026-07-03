@@ -20,7 +20,8 @@ use crate::op_info::OpInfo;
 use crate::ptr_info::PtrInfo;
 use crate::resoperation::Op;
 use crate::value::{Const, InputArg};
-use crate::{OpRef, Type};
+#[cfg(feature = "test-support")]
+use crate::OpRef;
 
 /// Variant of the `_forwarded` slot.
 ///
@@ -231,118 +232,80 @@ impl ForwardingHost for InputArg {
     }
 }
 
-pub struct PtrInfoBorrow {
-    inner: std::cell::Ref<'static, PtrInfo>,
-    _rc: Rc<std::cell::RefCell<PtrInfo>>,
+/// Owning borrow guard: a shared `Ref<T>` transmuted to `'static`, kept
+/// sound by holding the source `Rc<RefCell<T>>` alongside it.
+///
+/// SAFETY invariant (centralised here for all guard types): `_rc` keeps
+/// the `RefCell` allocation alive for at least as long as `Self` exists,
+/// so the `'static` `Ref` never dangles. Struct fields drop in
+/// declaration order, so `inner` (the borrow) is released before `_rc`
+/// drops the allocation.
+pub struct BorrowGuard<T: 'static> {
+    inner: std::cell::Ref<'static, T>,
+    _rc: Rc<std::cell::RefCell<T>>,
 }
 
-impl PtrInfoBorrow {
-    pub(crate) fn new(rc: Rc<std::cell::RefCell<PtrInfo>>) -> Self {
-        // SAFETY: see struct doc — _rc keeps the RefCell allocation
-        // alive for at least as long as Self exists.
-        let r: std::cell::Ref<'_, PtrInfo> = rc.borrow();
-        let r: std::cell::Ref<'static, PtrInfo> = unsafe { std::mem::transmute(r) };
+impl<T> BorrowGuard<T> {
+    pub(crate) fn new(rc: Rc<std::cell::RefCell<T>>) -> Self {
+        // SAFETY: see the type-level invariant above.
+        let r: std::cell::Ref<'_, T> = rc.borrow();
+        let r: std::cell::Ref<'static, T> = unsafe { std::mem::transmute(r) };
         Self { inner: r, _rc: rc }
     }
 }
 
-impl std::ops::Deref for PtrInfoBorrow {
-    type Target = PtrInfo;
-    fn deref(&self) -> &PtrInfo {
+impl<T> std::ops::Deref for BorrowGuard<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
         &self.inner
     }
 }
 
-impl std::fmt::Debug for PtrInfoBorrow {
+impl<T: std::fmt::Debug> std::fmt::Debug for BorrowGuard<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Debug::fmt(&*self.inner, f)
     }
 }
 
-/// Mutable counterpart of `PtrInfoBorrow`.  Holds the inner `RefCell`
-/// exclusive borrow; conflicts with concurrent `PtrInfoBorrow` /
-/// `PtrInfoBorrowMut` on the same handle panic at runtime per
-/// `RefCell` semantics.
-pub struct PtrInfoBorrowMut {
-    inner: std::cell::RefMut<'static, PtrInfo>,
-    _rc: Rc<std::cell::RefCell<PtrInfo>>,
+/// Mutable counterpart of [`BorrowGuard`]. Holds the inner `RefCell`
+/// exclusive borrow; a concurrent shared or exclusive borrow on the same
+/// handle panics at runtime per `RefCell` semantics. Same `'static`
+/// transmute + drop-order invariant as [`BorrowGuard`].
+pub struct BorrowGuardMut<T: 'static> {
+    inner: std::cell::RefMut<'static, T>,
+    _rc: Rc<std::cell::RefCell<T>>,
 }
 
-impl PtrInfoBorrowMut {
-    pub(crate) fn new(rc: Rc<std::cell::RefCell<PtrInfo>>) -> Self {
-        // SAFETY: see `PtrInfoBorrow::new`.
-        let r: std::cell::RefMut<'_, PtrInfo> = rc.borrow_mut();
-        let r: std::cell::RefMut<'static, PtrInfo> = unsafe { std::mem::transmute(r) };
+impl<T> BorrowGuardMut<T> {
+    pub(crate) fn new(rc: Rc<std::cell::RefCell<T>>) -> Self {
+        // SAFETY: see the [`BorrowGuard`] type-level invariant.
+        let r: std::cell::RefMut<'_, T> = rc.borrow_mut();
+        let r: std::cell::RefMut<'static, T> = unsafe { std::mem::transmute(r) };
         Self { inner: r, _rc: rc }
     }
 }
 
-impl std::ops::Deref for PtrInfoBorrowMut {
-    type Target = PtrInfo;
-    fn deref(&self) -> &PtrInfo {
+impl<T> std::ops::Deref for BorrowGuardMut<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
         &self.inner
     }
 }
 
-impl std::ops::DerefMut for PtrInfoBorrowMut {
-    fn deref_mut(&mut self) -> &mut PtrInfo {
+impl<T> std::ops::DerefMut for BorrowGuardMut<T> {
+    fn deref_mut(&mut self) -> &mut T {
         &mut self.inner
     }
 }
 
-/// Owning borrow guard for `int_bound()`.  Same shape as
-/// `PtrInfoBorrow` but parameterised on `IntBound`.
-pub struct IntBoundBorrow {
-    inner: std::cell::Ref<'static, IntBound>,
-    _rc: Rc<std::cell::RefCell<IntBound>>,
-}
-
-impl IntBoundBorrow {
-    pub(crate) fn new(rc: Rc<std::cell::RefCell<IntBound>>) -> Self {
-        let r: std::cell::Ref<'_, IntBound> = rc.borrow();
-        let r: std::cell::Ref<'static, IntBound> = unsafe { std::mem::transmute(r) };
-        Self { inner: r, _rc: rc }
-    }
-}
-
-impl std::ops::Deref for IntBoundBorrow {
-    type Target = IntBound;
-    fn deref(&self) -> &IntBound {
-        &self.inner
-    }
-}
-
-impl std::fmt::Debug for IntBoundBorrow {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Debug::fmt(&*self.inner, f)
-    }
-}
-
-pub struct IntBoundBorrowMut {
-    inner: std::cell::RefMut<'static, IntBound>,
-    _rc: Rc<std::cell::RefCell<IntBound>>,
-}
-
-impl IntBoundBorrowMut {
-    pub(crate) fn new(rc: Rc<std::cell::RefCell<IntBound>>) -> Self {
-        let r: std::cell::RefMut<'_, IntBound> = rc.borrow_mut();
-        let r: std::cell::RefMut<'static, IntBound> = unsafe { std::mem::transmute(r) };
-        Self { inner: r, _rc: rc }
-    }
-}
-
-impl std::ops::Deref for IntBoundBorrowMut {
-    type Target = IntBound;
-    fn deref(&self) -> &IntBound {
-        &self.inner
-    }
-}
-
-impl std::ops::DerefMut for IntBoundBorrowMut {
-    fn deref_mut(&mut self) -> &mut IntBound {
-        &mut self.inner
-    }
-}
+/// Owning shared borrow guard for `ptr_info()`.
+pub type PtrInfoBorrow = BorrowGuard<PtrInfo>;
+/// Owning exclusive borrow guard for `ptr_info_mut()`.
+pub type PtrInfoBorrowMut = BorrowGuardMut<PtrInfo>;
+/// Owning shared borrow guard for `int_bound()`.
+pub type IntBoundBorrow = BorrowGuard<IntBound>;
+/// Owning exclusive borrow guard for `int_bound_mut()`.
+pub type IntBoundBorrowMut = BorrowGuardMut<IntBound>;
 
 /// Turn an `OpRef` into a **bound** [`Operand`](crate::operand::Operand) for
 /// op-argument / fail-arg fixtures: `None` / `Const` shed inline, an
@@ -362,8 +325,8 @@ pub fn bound_operand_from_opref(a: OpRef) -> crate::operand::Operand {
 /// operands directly must do the same.
 #[cfg(test)]
 pub(crate) mod test_support {
-    use super::{OpRef, Type};
     use crate::operand::Operand;
+    use crate::{OpRef, Type};
     use crate::resoperation::{Op, OpCode};
 
     /// A self-rooting bound `Operand::Op` at `position`: the returned operand

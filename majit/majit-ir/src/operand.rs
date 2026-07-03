@@ -55,8 +55,8 @@ pub enum Operand {
     /// shares the same const object (`getarglist_copy` reuses the same
     /// `Const`). Value equality is the opt-in `same_constant` (history.py:211),
     /// surfaced as [`same_box`](Self::same_box). This is the same shared-cell
-    /// in-place-forward contract the const-kind `Forwarded::Const { value:
-    /// Cell<Value> }` carrier provided. The forwarding visitor is
+    /// in-place-forward contract the const-kind `Forwarded::Const(Const)`
+    /// carrier provided. The forwarding visitor is
     /// idempotent on an already-forwarded object (collector.rs:1133), so a
     /// const cell reachable from two slots forwards safely.
     Const(Rc<Cell<Value>>),

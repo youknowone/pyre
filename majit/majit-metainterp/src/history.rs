@@ -1055,10 +1055,10 @@ mod tests {
     }
 
     // Bound-box drop-ins for op-arg / fail-arg sites. Each binds a rooted
-    // synthetic producer (forwarding.rs `test_support`) so the arg sheds to
-    // `Operand::InputArg` / `Operand::Op` (never the position-only
-    // `Operand::Box`); `to_opref()` is preserved, so position-keyed
-    // assertions still hold.
+    // synthetic producer (local `rooted_*_operand` helpers) so the arg sheds
+    // to `Operand::InputArg` / `Operand::Op` (never a bare position-only
+    // `OpRef`); `to_opref()` is preserved, so position-keyed assertions
+    // still hold.
     fn iarg_box(pos: u32) -> Operand {
         rooted_inputarg_operand(Type::Int, pos)
     }
