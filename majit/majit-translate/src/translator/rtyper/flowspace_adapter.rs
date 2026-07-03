@@ -1817,7 +1817,21 @@ pub fn translate_op(
                     // convert_from_to has no common base → typer error), and
                     // two `()` values meeting at a join can never union.
                     let host = if owner_path.is_empty() {
-                        if matches!(name.as_str(), "Tuple" | "Array" | "Closure") {
+                        // Match the aggregate-kind placeholder tag by its
+                        // instantiation-stripped root so a per-shape tuple
+                        // (`Tuple<f64,f64>`, `Tuple<BigInt,BigInt>`) interns
+                        // by its full suffixed qualname exactly as bare
+                        // `Tuple` does — `canonical_struct_name` keys the
+                        // cache by the whole `Tuple<…>` string, so every
+                        // construction site of one shape shares one Arc and
+                        // matches the field-projection side's interned class.
+                        // Without this a suffixed tuple falls to the fresh-Arc
+                        // branch below and mints a distinct `Tuple<f64,f64>`
+                        // per site → `commonbase` None → UnionError at a join.
+                        if matches!(
+                            majit_ir::descr::strip_instantiation_suffix(&name),
+                            "Tuple" | "Array" | "Closure"
+                        ) {
                             call_registry.bookkeeper().intern_class_by_qualname(&name)
                         } else {
                             HostObject::new_class(name.clone(), Vec::new())
