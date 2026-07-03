@@ -1770,6 +1770,154 @@ pub fn build_ll_jit_append_helper_graph(
     ))
 }
 
+/// Synthesise `ll_append_char(ll_builder, char)` (`rbuilder.py:178-184`):
+///
+/// ```python
+/// jit.conditional_call(ll_builder.current_pos == ll_builder.current_end,
+///                      ll_grow_by, ll_builder, 1)
+/// pos = ll_builder.current_pos
+/// ll_builder.current_pos = pos + 1
+/// ll_builder.current_buf.chars[pos] = char
+/// ```
+///
+/// `jit.conditional_call(cond, func, *args)` rtypes to the single
+/// `jit_conditional_call` op (`jit.py:1377-1394`); the op is complete
+/// on its own (the backend performs the guarded call), so no
+/// `we_are_jitted()` wrapper is emitted — same shape as
+/// [`build_ll_strhash_helper_graph`]'s `jit_conditional_call_value`.
+/// `ll_grow_by` is the `direct_call`-style funcptr const. `current_pos`
+/// is re-read after the conditional call since `ll_grow_by` may reset
+/// it. Returns `Void`.
+pub fn build_ll_append_char_helper_graph(
+    name: &str,
+    builder_ptr_lltype: LowLevelType,
+    char_lltype: LowLevelType,
+    chars_array_ptr_lltype: LowLevelType,
+    buf_lltype: LowLevelType,
+    grow_by_fn: Constant,
+) -> Result<PyGraph, TyperError> {
+    let void_result = || variable_with_lltype("v", LowLevelType::Void);
+    let none_const = || {
+        Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::None,
+            LowLevelType::Void,
+        ))
+    };
+
+    let ll_builder = variable_with_lltype("ll_builder", builder_ptr_lltype);
+    let char = variable_with_lltype("char", char_lltype);
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(ll_builder.clone()),
+        Hlvalue::Variable(char.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", LowLevelType::Void);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    // cond = (ll_builder.current_pos == ll_builder.current_end).
+    let pos0 = variable_with_lltype("pos", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "getfield",
+        vec![Hlvalue::Variable(ll_builder.clone()), void_field_const("current_pos")],
+        Hlvalue::Variable(pos0.clone()),
+    ));
+    let end0 = variable_with_lltype("end", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "getfield",
+        vec![Hlvalue::Variable(ll_builder.clone()), void_field_const("current_end")],
+        Hlvalue::Variable(end0.clone()),
+    ));
+    let cond = variable_with_lltype("cond", LowLevelType::Bool);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "int_eq",
+        vec![Hlvalue::Variable(pos0), Hlvalue::Variable(end0)],
+        Hlvalue::Variable(cond.clone()),
+    ));
+
+    // jit.conditional_call(cond, ll_grow_by, ll_builder, 1).
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "jit_conditional_call",
+        vec![
+            Hlvalue::Variable(cond),
+            Hlvalue::Constant(grow_by_fn),
+            Hlvalue::Variable(ll_builder.clone()),
+            constant_with_lltype(ConstValue::Int(1), LowLevelType::Signed),
+        ],
+        Hlvalue::Variable(void_result()),
+    ));
+
+    // pos = ll_builder.current_pos (re-read after possible grow).
+    let pos = variable_with_lltype("pos", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "getfield",
+        vec![Hlvalue::Variable(ll_builder.clone()), void_field_const("current_pos")],
+        Hlvalue::Variable(pos.clone()),
+    ));
+    // ll_builder.current_pos = pos + 1.
+    let newpos = variable_with_lltype("newpos", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "int_add",
+        vec![
+            Hlvalue::Variable(pos.clone()),
+            constant_with_lltype(ConstValue::Int(1), LowLevelType::Signed),
+        ],
+        Hlvalue::Variable(newpos.clone()),
+    ));
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "setfield",
+        vec![
+            Hlvalue::Variable(ll_builder.clone()),
+            void_field_const("current_pos"),
+            Hlvalue::Variable(newpos),
+        ],
+        Hlvalue::Variable(void_result()),
+    ));
+
+    // ll_builder.current_buf.chars[pos] = char.
+    let buf = variable_with_lltype("buf", buf_lltype);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "getfield",
+        vec![Hlvalue::Variable(ll_builder), void_field_const("current_buf")],
+        Hlvalue::Variable(buf.clone()),
+    ));
+    let chars = variable_with_lltype("chars", chars_array_ptr_lltype);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "getsubstruct",
+        vec![
+            Hlvalue::Variable(buf),
+            constant_with_lltype(ConstValue::byte_str("chars"), LowLevelType::Void),
+        ],
+        Hlvalue::Variable(chars.clone()),
+    ));
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "setarrayitem",
+        vec![
+            Hlvalue::Variable(chars),
+            Hlvalue::Variable(pos),
+            Hlvalue::Variable(char),
+        ],
+        Hlvalue::Variable(void_result()),
+    ));
+
+    startblock.closeblock(vec![
+        Link::new(vec![none_const()], Some(graph.returnblock.clone()), None).into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["ll_builder".to_string(), "char".to_string()],
+        func,
+    ))
+}
+
 /// Synthesise `ll_append_slice(ll_builder, ll_str, start, end)`
 /// (`rbuilder.py:189-195`):
 ///
@@ -3488,6 +3636,50 @@ mod tests {
         assert_eq!(all_ops.iter().filter(|o| o.as_str() == "direct_call").count(), 2);
         assert_eq!(all_ops.iter().filter(|o| o.as_str() == "getsubstruct").count(), 1);
         assert_eq!(all_ops.iter().filter(|o| o.as_str() == "getarraysize").count(), 1);
+        let Hlvalue::Variable(ret) = &inner.returnblock.borrow().inputargs[0] else {
+            panic!("returnblock inputarg must be a Variable");
+        };
+        assert_eq!(ret.concretetype.borrow().clone(), Some(LowLevelType::Void));
+    }
+
+    #[test]
+    fn build_ll_append_char_conditional_grows_then_writes_char() {
+        use super::Hlvalue;
+        let helper = super::build_ll_append_char_helper_graph(
+            "ll_append_char",
+            super::STRINGBUILDERPTR.clone(),
+            LowLevelType::Char,
+            super::STRPTR.clone(), // chars array ptr placeholder
+            super::STRPTR.clone(),
+            dummy_funcptr_const(),
+        )
+        .expect("build_ll_append_char_helper_graph");
+        assert_eq!(helper.func.name, "ll_append_char");
+        let inner = helper.graph.borrow();
+        let startblock = inner.startblock.borrow();
+        let ops: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|o| o.opname.as_str())
+            .collect();
+        assert_eq!(
+            ops,
+            vec![
+                "getfield",             // current_pos (for ==)
+                "getfield",             // current_end
+                "int_eq",               // current_pos == current_end
+                "jit_conditional_call", // conditional_call(cond, ll_grow_by, ...)
+                "getfield",             // current_pos (re-read)
+                "int_add",              // pos + 1
+                "setfield",             // current_pos = pos + 1
+                "getfield",             // current_buf
+                "getsubstruct",         // buf.chars
+                "setarrayitem",         // chars[pos] = char
+            ]
+        );
+        // Single straight-line block + returnblock.
+        assert_eq!(startblock.exits.len(), 1);
+        drop(startblock);
         let Hlvalue::Variable(ret) = &inner.returnblock.borrow().inputargs[0] else {
             panic!("returnblock inputarg must be a Variable");
         };
