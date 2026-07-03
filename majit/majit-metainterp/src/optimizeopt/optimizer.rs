@@ -6934,7 +6934,7 @@ mod tests {
         ctx.set_potential_extra_op(
             OpRef::int_op(14),
             crate::optimizeopt::info::PreambleOp {
-                op: rooted_resop_box(Type::Int, 14),
+                op: rooted_resop_operand(Type::Int, 14),
                 invented_name: false,
                 preamble_op: {
                     let mut op = majit_ir::Op::new(

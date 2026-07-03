@@ -1350,7 +1350,7 @@ mod tests {
                     std::rc::Rc::new(same_as)
                 });
             let pop = crate::optimizeopt::info::PreambleOp {
-                op: ctx.materialize_box_at(source),
+                op: ctx.materialize_operand_at(source),
                 invented_name: false,
                 preamble_op: replay,
                 // Non-invented imported pure re-export: no SameAs alias.

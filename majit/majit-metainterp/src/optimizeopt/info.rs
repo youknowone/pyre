@@ -1590,7 +1590,6 @@ pub use majit_ir::ptr_info::{
 mod tests {
     use super::*;
     use crate::optimizeopt::OptContext;
-    use majit_ir::box_ref::BoxRef;
     use majit_ir::{Descr, OpCode, Value};
     use std::sync::Arc;
 
@@ -1931,7 +1930,7 @@ mod tests {
         );
         replay.pos.set(OpRef::int_op(88));
         let pop = PreambleOp {
-            op: BoxRef::from_opref(OpRef::int_op(88)),
+            op: majit_ir::operand::Operand::bound_from_opref(OpRef::int_op(88)),
             invented_name: false,
             preamble_op: std::rc::Rc::new(replay),
             same_as_source: None,
@@ -1964,7 +1963,7 @@ mod tests {
             )],
         );
         let pop = PreambleOp {
-            op: BoxRef::from_opref(OpRef::int_op(88)),
+            op: majit_ir::operand::Operand::bound_from_opref(OpRef::int_op(88)),
             invented_name: false,
             preamble_op: std::rc::Rc::new(replay),
             same_as_source: None,

@@ -89,11 +89,11 @@ impl Optimization for OptEarlyForce {
                 // when no extra op is queued for this arg.
                 if let Some(tracked) = ctx.take_potential_extra_op(arg) {
                     // shortpreamble.py:434: the resolved Box is handed
-                    // to the builder; fall back to the operand's own box.
+                    // to the builder; fall back to the operand itself.
                     let arg_b = arg_opnd
                         .as_ref()
-                        .map(|o| o.to_boxref())
-                        .unwrap_or_else(|| op.arg(i).to_boxref());
+                        .cloned()
+                        .unwrap_or_else(|| op.arg(i).clone());
                     if let Some(builder) = ctx.active_short_preamble_producer_mut() {
                         builder.add_preamble_op_from_pop(&tracked, arg_b);
                     } else if let Some(builder) = ctx.imported_short_preamble_builder.as_mut() {

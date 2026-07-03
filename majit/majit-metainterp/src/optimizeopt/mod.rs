@@ -405,7 +405,7 @@ impl ImportedShortPureOp {
     /// Construct with auto-generated PreambleOp from fields.
     ///
     /// `ctx` binds the replay op's operands to their canonical producers
-    /// (`materialize_box_at`) — shortpreamble.py:425 seeds the replay
+    /// (`materialize_operand_at`) — shortpreamble.py:425 seeds the replay
     /// `preamble_op` with the SAME Box objects the body sees, so the
     /// operands must carry producer identity, not a position-only echo.
     pub fn new(
@@ -416,7 +416,7 @@ impl ImportedShortPureOp {
         result: OpRef,
         source: OpRef,
         invented_name: bool,
-        same_as_source: Option<majit_ir::box_ref::BoxRef>,
+        same_as_source: Option<majit_ir::operand::Operand>,
     ) -> Self {
         let replay_args: Vec<OpRef> = args
             .iter()
@@ -472,7 +472,7 @@ impl ImportedShortPureOp {
         // pyre's `source` IS the alt identifier for invented (the synthetic
         // alias allocated by the compound-dedup pass at
         // shortpreamble.rs:478-491) and IS self.res for non-invented.
-        let pop_op = ctx.materialize_box_at(source);
+        let pop_op = ctx.materialize_operand_at(source);
         ImportedShortPureOp {
             opcode,
             descr,
@@ -10478,7 +10478,7 @@ mod imported_short_preamble_fallback_tests {
         // pop.op carries the body-visible OpRef directly (no forwarding chain
         // installed for non-invented Pure).
         let pop = crate::optimizeopt::info::PreambleOp {
-            op: majit_ir::box_ref::BoxRef::from_opref(OpRef::int_op(41)),
+            op: majit_ir::operand::Operand::bound_from_opref(OpRef::int_op(41)),
             invented_name: false,
             preamble_op: std::rc::Rc::new(replay_op),
             same_as_source: None,

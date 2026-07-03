@@ -6869,9 +6869,9 @@ mod tests {
             .produced_short_op(&src20)
             .unwrap();
         let pop = crate::optimizeopt::info::PreambleOp {
-            op: rooted_resop_box(Type::Int, 20),
+            op: rooted_resop_operand(Type::Int, 20),
             invented_name: produced.invented_name,
-            same_as_source: produced.same_as_source.as_ref().map(|o| o.to_boxref()),
+            same_as_source: produced.same_as_source.clone(),
             preamble_op: produced.preamble_op,
         };
         let forced = ctx.force_op_from_preamble_op(&pop);
@@ -6967,9 +6967,9 @@ mod tests {
             .unwrap_or_else(|| ctx.materialize_operand_at(OpRef::ref_op(14)));
         ctx.make_equal_to(&Operand::from_boxref(&b_src), &b_tgt);
         let pop = crate::optimizeopt::info::PreambleOp {
-            op: b_src.clone(),
+            op: Operand::from_boxref(&b_src),
             invented_name: produced.invented_name,
-            same_as_source: produced.same_as_source.as_ref().map(|o| o.to_boxref()),
+            same_as_source: produced.same_as_source.clone(),
             preamble_op: produced.preamble_op,
         };
         let forced = ctx.force_op_from_preamble_op(&pop);

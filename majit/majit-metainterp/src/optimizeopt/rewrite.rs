@@ -2069,14 +2069,13 @@ impl Optimization for OptRewrite {
                             // info seeded at result_opref's slot per the
                             // dual-slot rule (mod.rs:1817 replay_pos).
                             let replay_pos = ctx.get_replacement_opref(source);
-                            let source_box = ctx.materialize_box_at(source);
-                            let mut replay =
-                                Op::new(OpCode::SameAsI, &[Operand::from_boxref(&source_box)]);
+                            let source_op = ctx.materialize_operand_at(source);
+                            let mut replay = Op::new(OpCode::SameAsI, &[source_op.clone()]);
                             replay.pos.set(replay_pos);
                             self.loop_invariant_results.insert(
                                 func_val,
                                 LoopInvariantEntry::Preamble(PreambleOp {
-                                    op: source_box,
+                                    op: source_op,
                                     invented_name: false,
                                     preamble_op: std::rc::Rc::new(replay),
                                     // Non-invented loop-invariant producer: the

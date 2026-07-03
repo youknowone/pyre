@@ -4088,7 +4088,7 @@ mod tests {
             info.set_preamble_field(
                 OptHeap::field_slot_index(descr),
                 PreambleOp {
-                    op: bound_arg(source).to_boxref(),
+                    op: bound_arg(source),
                     invented_name: false,
                     preamble_op: std::rc::Rc::new(preamble_op),
                     same_as_source: None,

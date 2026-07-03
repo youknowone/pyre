@@ -1610,12 +1610,10 @@ impl ProducedShortOp {
                     args,
                     result: result_opref,
                     pop: crate::optimizeopt::info::PreambleOp {
-                        op: ctx.materialize_box_at(source),
+                        op: ctx.materialize_operand_at(source),
                         invented_name: self.invented_name,
                         preamble_op: p.preamble_op.clone(),
-                        // info-force channel stays BoxRef-carried; the bound
-                        // producer operand re-mints a ptr_eq-stable box.
-                        same_as_source: self.same_as_source.as_ref().map(|o| o.to_boxref()),
+                        same_as_source: self.same_as_source.clone(),
                     },
                 }
             }
@@ -1627,7 +1625,7 @@ impl ProducedShortOp {
                 result_opref,
                 source,
                 self.invented_name,
-                self.same_as_source.as_ref().map(|o| o.to_boxref()),
+                self.same_as_source.clone(),
             ),
         };
         ctx.imported_short_pure_ops.push(imported);
@@ -1737,10 +1735,10 @@ impl ProducedShortOp {
             .unwrap_or_else(|| std::rc::Rc::new(getfield_op.clone()));
         let pop = crate::optimizeopt::info::PreambleOp {
             // PreambleOp.op carries the Box itself (shortpreamble.py:12).
-            op: ctx.materialize_box_at(source),
+            op: ctx.materialize_operand_at(source),
             invented_name: self.invented_name,
             preamble_op: replay_rc,
-            same_as_source: self.same_as_source.as_ref().map(|o| o.to_boxref()),
+            same_as_source: self.same_as_source.clone(),
         };
         let parent_descr = getfield_op
             .with_field_descr(|fd| fd.get_parent_descr())
@@ -1868,10 +1866,10 @@ impl ProducedShortOp {
             .unwrap_or_else(|| std::rc::Rc::new(getarrayitem_op.clone()));
         let pop = crate::optimizeopt::info::PreambleOp {
             // PreambleOp.op carries the Box itself (shortpreamble.py:12).
-            op: ctx.materialize_box_at(source),
+            op: ctx.materialize_operand_at(source),
             invented_name: self.invented_name,
             preamble_op: replay_rc,
-            same_as_source: self.same_as_source.as_ref().map(|o| o.to_boxref()),
+            same_as_source: self.same_as_source.clone(),
         };
         let obj_box = ctx.get_box_replacement_operand_opt(obj_resolved);
         if obj_resolved.is_constant()
@@ -2420,7 +2418,7 @@ impl ShortPreambleBuilder {
     pub fn add_preamble_op_from_pop(
         &mut self,
         preamble_op: &crate::optimizeopt::info::PreambleOp,
-        resolved_op: majit_ir::box_ref::BoxRef,
+        resolved_op: majit_ir::operand::Operand,
     ) {
         // shortpreamble.py:432-440: unconditional add_preamble_op. The carried
         // pop reproduces the builder map entry's record — `op` resolves to the
@@ -2429,36 +2427,25 @@ impl ShortPreambleBuilder {
         // produced_short_boxes lookup is no longer consulted here (#149/S8f).
         let replay_op = &preamble_op.preamble_op;
         // shortpreamble.py:435 `op = preamble_op.op.get_box_replacement()`:
-        // for non-invented entries the resolved Box IS the preamble-defined
+        // for non-invented entries the resolved operand IS the preamble-defined
         // res, so the `used_boxes` label slot always has a producer at
         // label fall-through. pyre's Cat-2.2 heap import resolves through
         // `make_equal_to(source, result)` to a fresh body-visible OpRef with
         // NO preamble producer — the flat-OpRef analogue of an invented
         // name. Emit the same defining alias the invented arm uses
-        // (`same_as(resolved) = carried preamble box`) whenever the resolved
-        // slot differs from the carried box, so the extended label slot is
-        // defined in the preamble exactly as upstream's Box identity
+        // (`same_as(resolved) = carried preamble operand`) whenever the resolved
+        // slot differs from the carried operand, so the extended label slot is
+        // defined in the preamble exactly as upstream's box identity
         // guarantees.
         let (needs_alias, alias_source) = if preamble_op.invented_name {
-            (
-                true,
-                preamble_op
-                    .same_as_source
-                    .as_ref()
-                    .map(majit_ir::operand::Operand::from_boxref),
-            )
+            (true, preamble_op.same_as_source.clone())
         } else if resolved_op.to_opref() != preamble_op.op.to_opref() {
-            (
-                true,
-                Some(majit_ir::operand::Operand::from_boxref(&preamble_op.op)),
-            )
+            (true, Some(preamble_op.op.clone()))
         } else {
             (false, None)
         };
-        // The info-force `PreambleOp` still carries BoxRef; shed its bound
-        // producer boxes to operands for the operand-carrying record API.
         self.state.record_imported_preamble_use(
-            majit_ir::operand::Operand::from_boxref(&resolved_op),
+            resolved_op,
             replay_op,
             needs_alias,
             alias_source,
@@ -2914,7 +2901,7 @@ impl ExtendedShortPreambleBuilder {
     pub fn add_preamble_op_from_pop(
         &mut self,
         preamble_op: &crate::optimizeopt::info::PreambleOp,
-        resolved_op: majit_ir::box_ref::BoxRef,
+        resolved_op: majit_ir::operand::Operand,
     ) {
         let resolved_key = resolved_op.to_opref();
         let lookup_key = if self
@@ -2927,10 +2914,7 @@ impl ExtendedShortPreambleBuilder {
             preamble_op.op.to_opref()
         };
         if let Some(produced) = self.produced_short_boxes.get(&lookup_key).cloned() {
-            self.add_tracked_preamble_op(
-                majit_ir::operand::Operand::from_boxref(&resolved_op),
-                &produced,
-            );
+            self.add_tracked_preamble_op(resolved_op, &produced);
         } else {
             // shortpreamble.py:465-476: same pattern via replay_op.
             let replay_op = &preamble_op.preamble_op;
@@ -2946,7 +2930,8 @@ impl ExtendedShortPreambleBuilder {
             let alias_source = if preamble_op.invented_name {
                 // shortpreamble.py:436-437: alias the carried original
                 // (same_as_source), matching `add_tracked_preamble_op`; the
-                // resolved box is the release fallback when none was threaded.
+                // resolved operand is the release fallback when none was
+                // threaded.
                 debug_assert!(
                     preamble_op.same_as_source.is_some(),
                     "invented_name without same_as_source at {:?}",
@@ -2966,7 +2951,7 @@ impl ExtendedShortPreambleBuilder {
             if let Some(source) = alias_source {
                 let mut same_as = Op::new(
                     OpCode::same_as_for_type(replay_op.result_type()),
-                    &[majit_ir::operand::Operand::from_boxref(&source)],
+                    &[source],
                 );
                 same_as.pos.set(op);
                 self.extra_same_as.push(same_as);
@@ -4281,15 +4266,15 @@ mod tests {
         let mut replay_op = Op::new(OpCode::GetfieldGcI, &[rop(Type::Int, 30)]);
         replay_op.pos.set(OpRef::int_op(14));
         let pop = crate::optimizeopt::info::PreambleOp {
-            op: rooted_resop_box(Type::Int, 14),
+            op: rooted_resop_operand(Type::Int, 14),
             invented_name: true,
             preamble_op: std::rc::Rc::new(replay_op),
             // Imported invented-name pop carries the original it aliases;
             // the else arm reads it to emit `same_as(source)`.
-            same_as_source: Some(rooted_resop_box(Type::Int, 14)),
+            same_as_source: Some(rooted_resop_operand(Type::Int, 14)),
         };
 
-        builder.add_preamble_op_from_pop(&pop, rooted_resop_box(Type::Int, 41));
+        builder.add_preamble_op_from_pop(&pop, rooted_resop_operand(Type::Int, 41));
 
         assert_eq!(builder.used_boxes(), &[OpRef::int_op(41)]);
         assert_eq!(builder.short_preamble_jump().len(), 1);
@@ -4318,15 +4303,15 @@ mod tests {
         let mut replay_op = Op::new(OpCode::GetfieldGcI, &[rop(Type::Int, 30)]);
         replay_op.pos.set(OpRef::int_op(14));
         let pop = crate::optimizeopt::info::PreambleOp {
-            op: rooted_resop_box(Type::Int, 14),
+            op: rooted_resop_operand(Type::Int, 14),
             invented_name: true,
             preamble_op: std::rc::Rc::new(replay_op),
             // Imported invented-name pop carries the original it aliases;
             // the else arm reads it to emit `same_as(source)`.
-            same_as_source: Some(rooted_resop_box(Type::Int, 14)),
+            same_as_source: Some(rooted_resop_operand(Type::Int, 14)),
         };
 
-        builder.add_preamble_op_from_pop(&pop, rooted_resop_box(Type::Int, 41));
+        builder.add_preamble_op_from_pop(&pop, rooted_resop_operand(Type::Int, 41));
 
         assert_eq!(builder.label_args(), &[OpRef::int_op(41)]);
         assert_eq!(builder.jump_args(), &[OpRef::int_op(14)]);
