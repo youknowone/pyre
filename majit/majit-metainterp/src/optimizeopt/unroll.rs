@@ -26,7 +26,6 @@ use crate::optimizeopt::{
     SnapshotFrameSizes, next_snapshot_pos, snapshot_get, snapshot_insert,
 };
 use crate::resume::SnapshotBox;
-use majit_ir::box_ref::BoxRef;
 
 /// `unroll.py:119-123`:
 ///
@@ -3922,7 +3921,7 @@ impl OptUnroll {
             // minting here.
             let b_source = ctx
                 .get_box_replacement_operand_opt(source)
-                .expect("import_state source must have a materialized BoxRef slot");
+                .expect("import_state source must have a materialized operand slot");
             // `target` is a Phase-1 next-iteration ref whose producer may not
             // be carried into this rebuilt context; materialize its canonical
             // host instead of fabricating a position-only box (`make_equal_to`
@@ -4879,7 +4878,8 @@ fn assemble_peeled_trace_with_jump_args(
     let mut emitted_at: majit_ir::VecMap<OpRef, majit_ir::OpRc> = majit_ir::VecMap::new();
     for (op_idx, op) in p2_ops.iter().enumerate() {
         let mut new_op = (**op).clone();
-        let mut original_args = op.getarglist_copy();
+        let mut original_args: Vec<OpRef> =
+            op.getarglist_copy().iter().map(|a| a.to_opref()).collect();
         if let Some(&mapped_pos) = body_result_remap.get(&op.pos.get()) {
             new_op.pos.set(mapped_pos);
         }
@@ -4939,7 +4939,7 @@ fn assemble_peeled_trace_with_jump_args(
             let mut extra_inner_set = majit_ir::vec_set::VecSet::new();
             let label_arg_set: majit_ir::vec_set::VecSet<OpRef> = original_args
                 .iter()
-                .map(|a| a.to_opref())
+                .copied()
                 .filter(|arg| !arg.is_none())
                 .collect();
             for later_op in p2_ops.iter().skip(op_idx + 1) {
@@ -5017,7 +5017,7 @@ fn assemble_peeled_trace_with_jump_args(
                     &visible_before_label,
                 );
                 extended_args.push(mapped_arg);
-                original_args.push(BoxRef::from_opref(source_arg));
+                original_args.push(source_arg);
             }
             let mut extended_args_box: smallvec::SmallVec<[majit_ir::operand::Operand; 3]> =
                 smallvec::SmallVec::with_capacity(extended_args.len());
@@ -5116,11 +5116,10 @@ fn assemble_peeled_trace_with_jump_args(
                     if seen_body_defs.contains(&a.to_opref())
                         && !visible_before_label.contains(&a.to_opref())
                     {
-                        let boxed = match emitted_at.get(&mapped) {
-                            Some(rc) => BoxRef::from_bound_op(rc),
-                            None => BoxRef::from_opref(mapped),
+                        *a = match emitted_at.get(&mapped) {
+                            Some(rc) => majit_ir::operand::Operand::from_bound_op(rc),
+                            None => majit_ir::operand::Operand::from_opref(mapped),
                         };
-                        *a = majit_ir::operand::Operand::from_boxref(&boxed);
                     }
                 }
             }
