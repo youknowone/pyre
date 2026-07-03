@@ -1196,6 +1196,7 @@ pub enum BhDescr {
         /// raw native pointer-array (`add_ptr_array_descr`); threaded
         /// through the round-trip so the reconstructed `SimpleArrayDescr`
         /// keeps the flag and `make_guards` suppresses `GUARD_GC_TYPE`.
+        #[serde(default = "bh_gc_managed_default")]
         is_gc_managed: bool,
     },
     /// Interior-field descriptor: for getinteriorfield/setinteriorfield

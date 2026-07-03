@@ -86,6 +86,26 @@ impl Drop for TraceContinuationSuspendGuard {
     }
 }
 
+/// Diagnostic env gates read once and cached — these are checked on the hot
+/// back-edge / guard-failure paths that run every loop iteration, so re-reading
+/// the environment per call would add a syscall to each iteration.
+fn spdiag_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("MAJIT_SPDIAG").is_some())
+}
+fn no_bridge_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("MAJIT_NO_BRIDGE").is_some())
+}
+fn guardlog_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("MAJIT_GUARDLOG").is_some())
+}
+fn failvals_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("MAJIT_FAILVALS").is_some())
+}
+
 /// `resume.py:993-1007 _prepare_pendingfields` parity for the bridge /
 /// deopt path — replay deferred SetfieldGc / SetarrayitemGc writes
 /// via descr-method dispatch (`resume.py:1509-1518` setfield,
@@ -1743,18 +1763,19 @@ impl<S: JitState> JitDriver<S> {
                 if crate::single_pass_enabled() {
                     // Resume pc is the walk-final green pc the dispatch stashed
                     // (an interpreter program pc, NOT the JitCode op cursor). The
-                    // walk-final reds come from the register-bank snapshot the
-                    // dispatch took at the close merge point (the post-walk S1
-                    // state at the state-field identity slots) — NOT the Sym
-                    // value shadow (which is the trace-START S0 snapshot and
-                    // would make the compiled loop re-run the first iteration).
-                    // aheui's reds are state fields, never merge-point operands.
-                    // aheui's loop-carried state lives in the shared storage the
-                    // walk already advanced; the merge-point hook's `recover`
-                    // re-derives the cache fields from it. So no reds need to
-                    // ride through `single_pass_outcome` — only the resume pc.
-                    // (A state-field JIT without a storage-backed `recover` would
-                    // instead source reds here; none that close exist today.)
+                    // reds vector published here is INTENTIONALLY empty: a
+                    // state-field JIT (aheui) carries its loop-carried state in
+                    // the shared storage the walk already advanced, and the
+                    // merge-point hook's `recover` re-derives the cache fields
+                    // (stacksize, selected/storage refs) from it. `dispatch`
+                    // does populate `ctx.walk_final_reds` from the merge point's
+                    // red-operand slots, but that register-bank snapshot is NOT a
+                    // valid `restore_values` source for the state-field model —
+                    // those slots do not map to native state fields, so restoring
+                    // them would write the wrong values; only `recover` is
+                    // authoritative here. A JIT whose merge point carries real red
+                    // operands would instead source reds here, but none that
+                    // close exist today.
                     let pc = self.meta.trace_ctx().and_then(|ctx| ctx.walk_final_pc);
                     if let Some(p) = pc {
                         self.meta.single_pass_outcome = Some((p, Vec::new()));
@@ -2538,7 +2559,7 @@ impl<S: JitState> JitDriver<S> {
             return None;
         }
 
-        if std::env::var_os("MAJIT_SPDIAG").is_some() {
+        if spdiag_enabled() {
             eprintln!(
                 "@@@SPDIAG back_edge target_pc={target_pc} green_key={green_key} has_compiled={}",
                 self.meta.has_compiled_loop(green_key)
@@ -2628,7 +2649,7 @@ impl<S: JitState> JitDriver<S> {
                     raw_values.len()
                 );
             }
-            if std::env::var_os("MAJIT_FAILVALS").is_some() {
+            if failvals_enabled() {
                 eprintln!(
                     "@@@FAILVALS fail_index={} resume_pc={} raw_values={:?}",
                     fail_index,
@@ -2652,7 +2673,7 @@ impl<S: JitState> JitDriver<S> {
             // resume defects from the blackhole path.
             let should_bridge = must_compile
                 && !majit_metainterp::MetaInterp::<S::Meta>::stack_almost_full()
-                && std::env::var_os("MAJIT_NO_BRIDGE").is_none();
+                && !no_bridge_enabled();
 
             // compile.py:710 recovery_layout header_pc parity:
             // guard resume_pc comes from the guard's recovery metadata.
@@ -3046,7 +3067,7 @@ impl<S: JitState> JitDriver<S> {
             &live_values,
         ) {
             BackEdgeAction::StartedTracing => {
-                if std::env::var_os("MAJIT_SPDIAG").is_some() {
+                if spdiag_enabled() {
                     eprintln!(
                         "@@@SPDIAG StartedTracing target_pc={target_pc} green_key={green_key}"
                     );
@@ -3096,7 +3117,7 @@ impl<S: JitState> JitDriver<S> {
             &live_values,
         ) {
             BackEdgeAction::StartedTracing => {
-                if std::env::var_os("MAJIT_SPDIAG").is_some() {
+                if spdiag_enabled() {
                     eprintln!(
                         "@@@SPDIAG StartedTracing target_pc={target_pc} green_key={green_key}"
                     );
@@ -3121,7 +3142,7 @@ impl<S: JitState> JitDriver<S> {
         state: &mut S,
         env: &S::Env,
     ) {
-        if std::env::var_os("MAJIT_SPDIAG").is_some() {
+        if spdiag_enabled() {
             eprintln!("@@@SPDIAG maybe_start_tracing target_pc={target_pc} green_key={green_key}");
         }
         let meta = state.build_meta(target_pc, env);
@@ -3147,7 +3168,7 @@ impl<S: JitState> JitDriver<S> {
         ) {
             BackEdgeAction::Interpret => {}
             BackEdgeAction::StartedTracing => {
-                if std::env::var_os("MAJIT_SPDIAG").is_some() {
+                if spdiag_enabled() {
                     eprintln!(
                         "@@@SPDIAG StartedTracing target_pc={target_pc} green_key={green_key}"
                     );
@@ -4626,7 +4647,7 @@ impl<S: JitState> JitDriver<S> {
             let result_exc = result.exception.exc_value;
 
             if is_finish || fail_index == u32::MAX {
-                if std::env::var_os("MAJIT_GUARDLOG").is_some() {
+                if guardlog_enabled() {
                     eprintln!(
                         "@@@FINISH key={} trace={} is_finish={} ntyped={}",
                         key_hash,
@@ -4693,7 +4714,7 @@ impl<S: JitState> JitDriver<S> {
             // resume defects from the blackhole path.
             let should_bridge = must_compile
                 && !majit_metainterp::MetaInterp::<S::Meta>::stack_almost_full()
-                && std::env::var_os("MAJIT_NO_BRIDGE").is_none();
+                && !no_bridge_enabled();
 
             // compile.py:710 recovery_layout header_pc parity:
             // guard resume_pc comes from the guard's recovery metadata.
@@ -4702,8 +4723,7 @@ impl<S: JitState> JitDriver<S> {
                 .map(|pc| pc as usize)
                 .unwrap_or(target_pc);
 
-            if std::env::var_os("MAJIT_GUARDLOG").is_some() && !is_finish && fail_index != u32::MAX
-            {
+            if guardlog_enabled() && !is_finish && fail_index != u32::MAX {
                 let preview: Vec<i64> = raw_values.iter().take(6).map(|v| *v as i64).collect();
                 eprintln!(
                     "@@@GUARD key={} trace={} fail={} resume_pc={} bridge={} nvals={} vals={:?}",

@@ -1881,6 +1881,15 @@ fn rewrite_body(
                                 if let Some(__next_pc) =
                                     #driver.take_authoritative_next_pc()
                                 {
+                                    // Cancel the observer-replay handover the
+                                    // walk's `ObserverGuard::drop` queued: the
+                                    // authoritative walker executed the opcode
+                                    // and native skips its dispatch, so nothing
+                                    // re-runs the body — leaving the replay queue
+                                    // set would make the next opcode consume this
+                                    // opcode's stale calls (same cleanup the
+                                    // single-pass branch below performs).
+                                    majit_metainterp::cancel_observer_replay();
                                     // Propagate the walk's scalar state fields
                                     // (e.g. SEL's new `selected`) from the live
                                     // sym into native state BEFORE recover, so

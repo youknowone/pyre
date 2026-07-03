@@ -5070,7 +5070,7 @@ impl<M: Clone> MetaInterp<M> {
             }
             self.warm_state.abort_tracing(green_key, true);
             if (std::env::var_os("MAJIT_CLOSEDBG").is_some()) {
-                eprintln!("@@@CANCEL-SITE line={}", 4979);
+                eprintln!("@@@CANCEL-SITE line={}", line!());
             }
             return CompileOutcome::Cancelled;
         }
@@ -5301,7 +5301,7 @@ impl<M: Clone> MetaInterp<M> {
                     if !self.cancelled_too_many_times() {
                         self.exported_state = None;
                         if (std::env::var_os("MAJIT_CLOSEDBG").is_some()) {
-                            eprintln!("@@@CANCEL-SITE line={}", 5207);
+                            eprintln!("@@@CANCEL-SITE line={}", line!());
                         }
                         return CompileOutcome::Cancelled;
                     }
@@ -5479,7 +5479,7 @@ impl<M: Clone> MetaInterp<M> {
                     }
                     self.cancel_count += 1;
                     if (std::env::var_os("MAJIT_CLOSEDBG").is_some()) {
-                        eprintln!("@@@CANCEL-SITE line={}", 5382);
+                        eprintln!("@@@CANCEL-SITE line={}", line!());
                     }
                     return CompileOutcome::Cancelled;
                 }
@@ -5522,7 +5522,7 @@ impl<M: Clone> MetaInterp<M> {
                 }
                 self.cancel_count += 1;
                 if (std::env::var_os("MAJIT_CLOSEDBG").is_some()) {
-                    eprintln!("@@@CANCEL-SITE line={}", 5422);
+                    eprintln!("@@@CANCEL-SITE line={}", line!());
                 }
                 return CompileOutcome::Cancelled;
             }
@@ -5772,7 +5772,7 @@ impl<M: Clone> MetaInterp<M> {
                 self.warm_state.abort_tracing(green_key, !is_invalid_loop);
                 self.cancel_count += 1;
                 if (std::env::var_os("MAJIT_CLOSEDBG").is_some()) {
-                    eprintln!("@@@CANCEL-SITE line={}", 5669);
+                    eprintln!("@@@CANCEL-SITE line={}", line!());
                 }
                 return CompileOutcome::Cancelled;
             }
@@ -5941,7 +5941,7 @@ impl<M: Clone> MetaInterp<M> {
                 // pyjitpl.py:3025: self.exported_state = None
                 self.exported_state = None;
                 if (std::env::var_os("MAJIT_CLOSEDBG").is_some()) {
-                    eprintln!("@@@CANCEL-SITE line={}", 5835);
+                    eprintln!("@@@CANCEL-SITE line={}", line!());
                 }
                 return CompileOutcome::Cancelled;
             }
@@ -6125,7 +6125,7 @@ impl<M: Clone> MetaInterp<M> {
                     );
                 }
                 if (std::env::var_os("MAJIT_CLOSEDBG").is_some()) {
-                    eprintln!("@@@CANCEL-SITE line={}", 6016);
+                    eprintln!("@@@CANCEL-SITE line={}", line!());
                 }
                 return CompileOutcome::Cancelled;
             };
@@ -6235,7 +6235,7 @@ impl<M: Clone> MetaInterp<M> {
                 // `(trace_id, fail_index)` reverse lookup.
                 if !self.compiled_loops.contains_key(&origin_key) {
                     if (std::env::var_os("MAJIT_CLOSEDBG").is_some()) {
-                        eprintln!("@@@CANCEL-SITE line={}", 6123);
+                        eprintln!("@@@CANCEL-SITE line={}", line!());
                     }
                     return CompileOutcome::Cancelled;
                 }
@@ -6275,7 +6275,7 @@ impl<M: Clone> MetaInterp<M> {
                 // original interpreter green key.
                 let Some((original_green_key, entry_meta)) = entry_bridge else {
                     if (std::env::var_os("MAJIT_CLOSEDBG").is_some()) {
-                        eprintln!("@@@CANCEL-SITE line={}", 6160);
+                        eprintln!("@@@CANCEL-SITE line={}", line!());
                     }
                     return CompileOutcome::Cancelled;
                 };
