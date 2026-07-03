@@ -3777,6 +3777,10 @@ impl Repr for InstanceRepr {
     ///     return self.convert_const_exact(value)
     /// ```
     ///
+    /// For the root `object` repr, `self.classdef` is `None`.
+    /// RPython `rclass.py:786-790` delegates in that arm because
+    /// `classdesc.py:251` makes `classdef.commonbase(None) == None`.
+    ///
     /// The `classdef == self.classdef` exact-match arm dispatches into
     /// [`InstanceRepr::convert_const_exact`] (rclass.py:794-802) via
     /// [`getinstancerepr`], which recovers the owning `Arc<Self>` from
@@ -3852,26 +3856,21 @@ impl Repr for InstanceRepr {
             //              self.classdef: raise TyperError(...)`.
             //   Subclass-relationship check; self must be a base of the
             //   value's class.
-            let self_cd = self.classdef.as_ref().ok_or_else(|| {
-                TyperError::message(format!(
-                    "InstanceRepr.convert_const: cannot delegate via root \
-                     InstanceRepr (classdef=None) to {:?}",
-                    classdef.borrow().name
-                ))
-            })?;
-            let common = ClassDef::commonbase(&classdef, self_cd).ok_or_else(|| {
-                TyperError::message(format!(
-                    "not an instance of {:?}: {:?}",
-                    self_cd.borrow().name,
-                    host_obj.qualname()
-                ))
-            })?;
-            if !Rc::ptr_eq(&common, self_cd) {
-                return Err(TyperError::message(format!(
-                    "not an instance of {:?}: {:?}",
-                    self_cd.borrow().name,
-                    host_obj.qualname()
-                )));
+            if let Some(self_cd) = self.classdef.as_ref() {
+                let common = ClassDef::commonbase(&classdef, self_cd).ok_or_else(|| {
+                    TyperError::message(format!(
+                        "not an instance of {:?}: {:?}",
+                        self_cd.borrow().name,
+                        host_obj.qualname()
+                    ))
+                })?;
+                if !Rc::ptr_eq(&common, self_cd) {
+                    return Err(TyperError::message(format!(
+                        "not an instance of {:?}: {:?}",
+                        self_cd.borrow().name,
+                        host_obj.qualname()
+                    )));
+                }
             }
             // upstream: `rinstance = getinstancerepr(rtyper, classdef);
             //            result = rinstance.convert_const(value);
@@ -5593,6 +5592,49 @@ mod tests {
             panic!("convert_const(None) must produce LLPtr, got {:?}", c.value);
         };
         assert!(!ptr.nonzero(), "null_instance must be a null pointer");
+    }
+
+    #[test]
+    fn instance_repr_root_convert_const_delegates_and_upcasts() {
+        // rclass.py:786-790 delegates mismatched classdefs through the
+        // concrete InstanceRepr and upcasts. For the root repr,
+        // classdesc.py:251 makes `classdef.commonbase(None) == None`,
+        // so the guard is vacuously satisfied.
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::flowspace::model::HostObject;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("init exceptiondata");
+        let host = HostObject::new_class("RootDelegated", vec![]);
+        let entry = ann.bookkeeper.getdesc(&host).unwrap();
+        let DescEntry::Class(rc) = &entry else {
+            unreachable!()
+        };
+        let cd = crate::annotator::classdesc::ClassDesc::getuniqueclassdef(rc).unwrap();
+        let concrete = getinstancerepr(&rtyper, Some(&cd), Flavor::Gc).expect("concrete repr");
+        Repr::setup(concrete.as_ref() as &dyn Repr).expect("setup concrete InstanceRepr");
+        let root = getinstancerepr(&rtyper, None, Flavor::Gc).expect("root repr");
+        assert!(root.classdef.is_none(), "test must exercise the root repr");
+        Repr::setup(root.as_ref() as &dyn Repr).expect("setup root InstanceRepr");
+        rtyper.call_all_setups().expect("call_all_setups");
+        crate::translator::rtyper::normalizecalls::assign_inheritance_ids(&ann);
+
+        let prebuilt = HostObject::new_instance(host.clone(), vec![]);
+        let c = (root.as_ref() as &dyn Repr)
+            .convert_const(&ConstValue::HostObject(prebuilt))
+            .expect("root convert_const delegates");
+        assert_eq!(c.concretetype.as_ref(), Some(root.lowleveltype()));
+        let ConstValue::LLPtr(ptr) = &c.value else {
+            panic!("convert_const must produce LLPtr, got {:?}", c.value);
+        };
+        assert!(ptr.nonzero());
+        assert_eq!(
+            concrete.iprebuiltinstances.borrow().len(),
+            1,
+            "root conversion must route through the concrete InstanceRepr"
+        );
     }
 
     #[test]
