@@ -1619,12 +1619,13 @@ impl<M: Clone> MetaInterp<M> {
         }
         // pyjitpl.py:3290-3306 — `initialize_virtualizable` /
         // `force_start_tracing` / `setup_tracing` snapshot inputarg
-        // constants into `initial_inputarg_consts`. Each is a
-        // `BoxKind::Const` box; a Ref entry's inline gcref is forwarded
-        // through the canonical `BoxRef::walk_const_ptr_refs` — history.py:314
-        // `ConstPtr.value` is a gcref attribute of the Box.
-        for b in trace_ctx.initial_inputarg_consts.iter() {
-            b.walk_const_ptr_refs(&mut visitor);
+        // constants into `initial_inputarg_consts`. Each is an inline-const
+        // `OpRef`; a `ConstPtr` entry's inline gcref is forwarded in place —
+        // history.py:314 `ConstPtr.value` is a gcref attribute of the Box.
+        for r in trace_ctx.initial_inputarg_consts.iter_mut() {
+            if let OpRef::ConstPtr(gcref) = r {
+                visitor(gcref);
+            }
         }
         // heapcache.py:50-104 — the heapcache caches field values /
         // replacements / loop-invariant results as `OpRef`. With inline
@@ -2991,10 +2992,11 @@ impl<M: Clone> MetaInterp<M> {
                 .map(|value| {
                     let opref = ctx.recorder.record_input_arg(value.get_type());
                     // history.py:227/268/314 — Const{Int,Float,Ptr}.value
-                    // is inline on the Box itself; snapshot the value into a
-                    // `BoxKind::Const` box (GC-walked once via
-                    // `BoxRef::walk_const_ptr_refs`).
-                    ctx.initial_inputarg_consts.push(BoxRef::new_const(*value));
+                    // is inline on the Box itself; snapshot the value as an
+                    // inline-const OpRef (a ConstPtr gcref is GC-forwarded
+                    // in place by walk_active_trace_refs).
+                    ctx.initial_inputarg_consts
+                        .push(OpRef::const_inline_from_value(value));
                     opref
                 })
                 .collect()
@@ -3551,10 +3553,12 @@ impl<M: Clone> MetaInterp<M> {
                 ctx.set_trace_limit(self.warm_state.trace_limit() as usize);
                 ctx.callinfocollection = self.callinfocollection.clone();
                 // history.py:227/268/314 — Const{Int,Float,Ptr}.value
-                // is inline on the Box; snapshot each value into a
-                // `BoxKind::Const` box (GC-walked via walk_const_ptr_refs).
-                ctx.initial_inputarg_consts =
-                    live_values.iter().map(|v| BoxRef::new_const(*v)).collect();
+                // is inline on the Box; snapshot each value as an
+                // inline-const OpRef (ConstPtr gcrefs GC-forwarded in place).
+                ctx.initial_inputarg_consts = live_values
+                    .iter()
+                    .map(OpRef::const_inline_from_value)
+                    .collect();
                 if let Some(ref descriptor) = driver_descriptor {
                     ctx.set_driver_descriptor(descriptor.clone());
                 }
@@ -3824,9 +3828,12 @@ impl<M: Clone> MetaInterp<M> {
         ctx.set_trace_limit(self.warm_state.trace_limit() as usize);
         ctx.callinfocollection = self.callinfocollection.clone();
         // history.py:227/268/314 — Const{Int,Float,Ptr}.value is inline
-        // on the Box; snapshot each value into a `BoxKind::Const` box
-        // (GC-walked via walk_const_ptr_refs).
-        ctx.initial_inputarg_consts = live_values.iter().map(|v| BoxRef::new_const(*v)).collect();
+        // on the Box; snapshot each value as an inline-const OpRef
+        // (ConstPtr gcrefs GC-forwarded in place).
+        ctx.initial_inputarg_consts = live_values
+            .iter()
+            .map(OpRef::const_inline_from_value)
+            .collect();
         if let Some(ref descriptor) = driver_descriptor {
             ctx.set_driver_descriptor(descriptor.clone());
         }
@@ -4845,8 +4852,8 @@ impl<M: Clone> MetaInterp<M> {
         let from_consts = driver_descriptor
             .and_then(|driver| driver.virtualizable_arg_index())
             .and_then(|idx| ctx.initial_inputarg_consts.get(idx))
-            .and_then(|const_box| match const_box.const_value() {
-                Some(majit_ir::Value::Ref(gcref)) => Some(gcref.0 as *const u8),
+            .and_then(|const_ref| match const_ref {
+                OpRef::ConstPtr(gcref) => Some(gcref.0 as *const u8),
                 _ => None,
             });
         if let Some(ptr) = from_consts {
@@ -5146,14 +5153,12 @@ impl<M: Clone> MetaInterp<M> {
             }
             // cut_trace_from_with_consts remaps escaped original inputargs to
             // their trace-entry Const via a transient build-time map keyed by
-            // `OpRef.raw()` — derive the inline-Const OpRef view here (not a
-            // persistent GC store, so no stale-pointer hazard).
-            let inputarg_consts: Vec<OpRef> = ctx
-                .initial_inputarg_consts
-                .iter()
-                .map(|b| b.to_opref())
-                .collect();
-            trace.cut_trace_from_with_consts(start, original_boxes, &inputarg_consts)
+            // `OpRef.raw()`.
+            trace.cut_trace_from_with_consts(
+                start,
+                original_boxes,
+                &ctx.initial_inputarg_consts,
+            )
         } else {
             trace
         };
@@ -6430,13 +6435,7 @@ impl<M: Clone> MetaInterp<M> {
                         header_pc,
                     );
                 }
-                // Inline-Const OpRef view for the transient cut_trace remap
-                // (keyed by `OpRef.raw()`; not a persistent GC store).
-                let inputarg_consts: Vec<OpRef> = initial_inputarg_consts
-                    .iter()
-                    .map(|b| b.to_opref())
-                    .collect();
-                trace.cut_trace_from_with_consts(start, original_boxes, &inputarg_consts)
+                trace.cut_trace_from_with_consts(start, original_boxes, &initial_inputarg_consts)
             } else {
                 trace
             };

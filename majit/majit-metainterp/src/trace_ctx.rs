@@ -22,7 +22,6 @@
 use crate::heapcache::HeapCache;
 use crate::opencoder::Box as OcBox;
 use crate::recorder::Trace;
-use majit_ir::box_ref::BoxRef;
 use majit_ir::{DescrRef, GreenKey, OpCode, OpRef, Type, Value};
 
 use majit_backend::JitCellToken;
@@ -330,13 +329,12 @@ pub struct TraceCtx {
     /// Used by force_finish_trace segmenting to record the guard-point pc.
     pub last_traced_pc: usize,
     /// GC-safe constant value snapshot for each initial inputarg at trace
-    /// start. Each entry is a `BoxKind::Const` box mirroring
+    /// start. Each entry is an inline-const `OpRef` mirroring
     /// history.py:227/268/314 (`Const*.value` lives on the box); the inline
-    /// gcref of a Ref entry is forwarded once through the canonical
-    /// `BoxRef::walk_const_ptr_refs` by `MetaInterp::walk_active_trace_refs`.
-    /// Used by cut_trace_from to remap escaped original inputargs to their
-    /// stable Const value.
-    pub initial_inputarg_consts: Vec<BoxRef>,
+    /// gcref of a `ConstPtr` entry is forwarded in place by
+    /// `MetaInterp::walk_active_trace_refs`. Used by cut_trace_from to
+    /// remap escaped original inputargs to their stable Const value.
+    pub initial_inputarg_consts: Vec<OpRef>,
     /// Single-pass tracing (`PYRE_SINGLE_PASS`): the resume-aligned bytecode
     /// pc the walk closed back to, captured at the CloseLoop decision point
     /// in the JitCode dispatch. `None` for every trace unless single-pass
@@ -1521,11 +1519,11 @@ impl TraceCtx {
     /// ordinary `OpRef(index)`, matching RPython's `original_boxes` list.
     pub fn initial_inputarg_argbox(&self, index: usize) -> Option<(JitArgKind, OpRef, i64)> {
         let tp = self.recorder.inputarg_types().get(index).copied()?;
-        let const_box = self.initial_inputarg_consts.get(index)?;
+        let const_ref = self.initial_inputarg_consts.get(index)?;
         // history.py:227/268/314 — Const{Int,Float,Ptr}.value lives inline
         // on the Box; read it and resolve the raw bits (Int→value,
         // Float→bit pattern, Ref→gcref address).
-        let bits = match const_box.const_value()? {
+        let bits = match const_ref.inline_const_to_value()? {
             Value::Int(v) => v,
             Value::Float(v) => v.to_bits() as i64,
             Value::Ref(r) => r.0 as i64,
