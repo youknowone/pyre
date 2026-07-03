@@ -1456,7 +1456,12 @@ impl SharedOpcodeHandler for PyFrame {
     }
 
     fn peek_at(&mut self, depth: usize) -> Result<Self::Value, PyError> {
-        if self.valuestackdepth <= self.nlocals() + depth {
+        // `valuestackdepth` is a `usize` field (seeded unsigned) whereas
+        // `nlocals() + depth` seeds signed; cast both to `i64` (lowered as
+        // `intmask`, identity on non-negative counts) so the guard compares
+        // within one signedness instead of tripping the rtyper's
+        // signed-vs-unsigned refusal.
+        if (self.valuestackdepth as i64) <= (self.nlocals() + depth) as i64 {
             return Err(stack_underflow_error("interpreter peek"));
         }
         Ok(PyFrame::peek_at(self, depth))
