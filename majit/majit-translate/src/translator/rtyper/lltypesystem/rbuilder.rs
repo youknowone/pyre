@@ -628,7 +628,6 @@ pub fn build_ll_grow_and_append_helper_graph(
     piece_struct: LowLevelType,
     buf_lltype: LowLevelType,
     chars_array_ptr_lltype: LowLevelType,
-    mallocfn: Constant,
     copy_fn: Constant,
     grow_by_fn: Constant,
 ) -> Result<PyGraph, TyperError> {
@@ -5921,7 +5920,6 @@ mod tests {
             super::STRINGPIECE.clone(),
             super::STRPTR.clone(),
             super::STRPTR.clone(), // chars array ptr placeholder
-            dummy_funcptr_const(),
             dummy_funcptr_const(),
             dummy_funcptr_const(),
         )
