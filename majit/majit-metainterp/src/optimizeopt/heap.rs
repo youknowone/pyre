@@ -1944,9 +1944,14 @@ impl OptHeap {
             // keep the getfield cache and re-read a stale global
             // (`acc = acc + a; acc = acc + b` at module level dropped the
             // first term).  A mutable out-of-universe descr is therefore
-            // conservatively invalidated by every non-elidable call.
+            // conservatively invalidated by every non-elidable call — but
+            // only once bitstrings have run: before that, a u32::MAX
+            // `effect_idx` just means the fixture never stamped the slot, so
+            // the identity fallback below is the correct arbiter.
             let writes_field = ei.check_write_descr_field(effect_idx)
-                || (effect_idx == u32::MAX && !descr.is_always_pure())
+                || (majit_ir::effectinfo::compute_bitstrings_has_run()
+                    && effect_idx == u32::MAX
+                    && !descr.is_always_pure())
                 || (!majit_ir::effectinfo::compute_bitstrings_has_run()
                     && ei.writes_field_descr_by_identity(&descr));
             if writes_field {
@@ -1979,7 +1984,9 @@ impl OptHeap {
             // call's write bitstring can name it — conservatively treat
             // every non-elidable call as writing it.
             let write = ei.check_write_descr_array(effect_idx)
-                || (effect_idx == u32::MAX && !descr.is_always_pure());
+                || (majit_ir::effectinfo::compute_bitstrings_has_run()
+                    && effect_idx == u32::MAX
+                    && !descr.is_always_pure());
             if !read && !write {
                 continue;
             }
