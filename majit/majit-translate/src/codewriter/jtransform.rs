@@ -2964,6 +2964,16 @@ impl<'a> Transformer<'a> {
                     return prepend_const_prefix(&mut const_prefix_ops, result);
                 }
             }
+            // jtransform.py:503-504 — rgc.* oopspecs → _handle_rgc_call.
+            // Unhandled spellings return `None` and fall through to the
+            // residual-call path.
+            if base.starts_with("rgc.") {
+                if let Some(result) =
+                    self._handle_rgc_call(base, op, target, args, result_ty, graph_name, graph)
+                {
+                    return prepend_const_prefix(&mut const_prefix_ops, result);
+                }
+            }
             // NOTE: conditional_call!/conditional_call_elidable!/record_known_result!
             // are handled by jitcode_lower (proc-macro level), NOT here.
             // The codewriter AST parser does not expand macro_rules!, so these
@@ -3099,6 +3109,45 @@ impl<'a> Transformer<'a> {
                     },
                 }]))
             }
+            _ => None,
+        }
+    }
+
+    /// Port of `jtransform.py:2193 _handle_rgc_call`, `ll_shrink_array` arm:
+    ///
+    /// ```python
+    /// def _handle_rgc_call(self, op, oopspec_name, args):
+    ///     if oopspec_name == 'rgc.ll_shrink_array':
+    ///         return self._handle_oopspec_call(op, args,
+    ///                     EffectInfo.OS_SHRINK_ARRAY, EffectInfo.EF_CAN_RAISE)
+    /// ```
+    ///
+    /// Lowers to a `residual_call` whose calldescr carries the `ShrinkArray`
+    /// oopspecindex and the `CanRaise` effect, so `handle_residual_call`
+    /// appends the trailing `-live-`.  Other `rgc.*` spellings return `None`
+    /// and fall through to the residual-call path.
+    fn _handle_rgc_call(
+        &mut self,
+        oopspec_name: &str,
+        op: &SpaceOperation,
+        target: &CallTarget,
+        args: &[crate::flowspace::model::Variable],
+        result_ty: &ValueType,
+        graph_name: &str,
+        graph: &mut FunctionGraph,
+    ) -> Option<RewriteResult> {
+        match oopspec_name {
+            "rgc.ll_shrink_array" => Some(self._handle_oopspec_call(
+                graph,
+                op,
+                target,
+                args,
+                result_ty,
+                graph_name,
+                OopSpecIndex::ShrinkArray,
+                Some(majit_ir::descr::ExtraEffect::CanRaise),
+                None,
+            )),
             _ => None,
         }
     }
@@ -8201,7 +8250,11 @@ mod tests {
             panic!("expected Replace");
         };
         assert_eq!(ops.len(), 1);
-        let OpKind::LoweredBlackholeOp { opname, args: bh_args } = &ops[0].kind else {
+        let OpKind::LoweredBlackholeOp {
+            opname,
+            args: bh_args,
+        } = &ops[0].kind
+        else {
             panic!("expected LoweredBlackholeOp, got {:?}", ops[0].kind);
         };
         assert_eq!(opname, "copystrcontent");
@@ -8249,6 +8302,103 @@ mod tests {
         assert!(
             transformer
                 ._handle_stroruni_call("stroruni.concat", &op, &args)
+                .is_none()
+        );
+    }
+
+    /// jtransform.py:2193-2195 — `rgc.ll_shrink_array` lowers to a residual
+    /// call carrying the `ShrinkArray` oopspecindex and `CanRaise` effect,
+    /// so `handle_residual_call` appends a trailing `-live-`.
+    #[test]
+    fn rgc_ll_shrink_array_lowers_to_shrink_array_residual_call() {
+        use crate::call::CallControl;
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
+        use crate::translator::rtyper::rtyper::variable_with_lltype;
+
+        let mut cc = CallControl::new();
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+
+        let mut graph = FunctionGraph::new("shrink");
+        let p = variable_with_lltype("p", STRPTR.clone());
+        let smaller = variable_with_lltype("smallerlength", LowLevelType::Signed);
+        let args = vec![p, smaller];
+        let result_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "result".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let result_ty = ValueType::Ref(None);
+        let target = CallTarget::function_path(["ll_shrink_array"]);
+        let op = SpaceOperation {
+            result: Some(result_var),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: args.clone(),
+                result_ty: result_ty.clone(),
+            },
+        };
+        let rewritten = transformer
+            ._handle_rgc_call(
+                "rgc.ll_shrink_array",
+                &op,
+                &target,
+                &args,
+                &result_ty,
+                "shrink",
+                &mut graph,
+            )
+            .expect("ll_shrink_array must be handled");
+        let RewriteResult::Replace(ops) = rewritten else {
+            panic!("expected Replace");
+        };
+        assert!(
+            ops.iter()
+                .any(|o| matches!(o.kind, OpKind::CallResidual { .. })),
+            "expected a CallResidual, got {ops:?}"
+        );
+        // CanRaise → trailing -live-.
+        assert!(
+            matches!(ops.last().map(|o| &o.kind), Some(OpKind::Live)),
+            "CanRaise oopspec call must append a trailing -live-"
+        );
+    }
+
+    /// Other `rgc.*` spellings are not ported and fall through to the
+    /// residual-call path.
+    #[test]
+    fn rgc_unported_spellings_fall_through() {
+        use crate::call::CallControl;
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::rtyper::variable_with_lltype;
+
+        let mut cc = CallControl::new();
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        let mut graph = FunctionGraph::new("rgc_other");
+        let args = vec![variable_with_lltype("x", LowLevelType::Signed)];
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::Live,
+        };
+        assert!(
+            transformer
+                ._handle_rgc_call(
+                    "rgc.something_else",
+                    &op,
+                    &CallTarget::function_path(["something_else"]),
+                    &args,
+                    &ValueType::Void,
+                    "rgc_other",
+                    &mut graph,
+                )
                 .is_none()
         );
     }

@@ -5337,7 +5337,8 @@ impl Repr for UnicodeBuilderRepr {
 /// RPython `stringbuilder_repr = StringBuilderRepr()`.
 pub fn stringbuilder_repr() -> Arc<StringBuilderRepr> {
     static REPR: OnceLock<Arc<StringBuilderRepr>> = OnceLock::new();
-    REPR.get_or_init(|| Arc::new(StringBuilderRepr::new())).clone()
+    REPR.get_or_init(|| Arc::new(StringBuilderRepr::new()))
+        .clone()
 }
 
 /// RPython `unicodebuilder_repr = UnicodeBuilderRepr()`.
@@ -6431,9 +6432,7 @@ mod tests {
     /// variable unchanged.
     fn build_builder_unary_hop(
         rtyper: std::rc::Rc<crate::translator::rtyper::rtyper::RPythonTyper>,
-        llops: std::rc::Rc<
-            std::cell::RefCell<crate::translator::rtyper::rtyper::LowLevelOpList>,
-        >,
+        llops: std::rc::Rc<std::cell::RefCell<crate::translator::rtyper::rtyper::LowLevelOpList>>,
         opname: &str,
         builder_ptr_lltype: LowLevelType,
         result_lltype: LowLevelType,
@@ -6458,11 +6457,11 @@ mod tests {
             llops,
         );
         hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
-        hop.args_s.borrow_mut().push(
-            crate::annotator::model::SomeValue::Ptr(
+        hop.args_s
+            .borrow_mut()
+            .push(crate::annotator::model::SomeValue::Ptr(
                 crate::translator::rtyper::lltypesystem::lltype::SomePtr::new(*inner),
-            ),
-        );
+            ));
         hop.args_r.borrow_mut().push(Some(repr));
         hop
     }
@@ -6471,10 +6470,8 @@ mod tests {
         std::rc::Rc<crate::annotator::annrpython::RPythonAnnotator>,
         std::rc::Rc<crate::translator::rtyper::rtyper::RPythonTyper>,
     ) {
-        let ann =
-            crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
-        let rtyper =
-            std::rc::Rc::new(crate::translator::rtyper::rtyper::RPythonTyper::new(&ann));
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let rtyper = std::rc::Rc::new(crate::translator::rtyper::rtyper::RPythonTyper::new(&ann));
         rtyper
             .initialize_exceptiondata()
             .expect("initialize_exceptiondata in test setup");
@@ -6484,9 +6481,7 @@ mod tests {
     }
 
     fn assert_single_direct_call_to(
-        llops: &std::rc::Rc<
-            std::cell::RefCell<crate::translator::rtyper::rtyper::LowLevelOpList>,
-        >,
+        llops: &std::rc::Rc<std::cell::RefCell<crate::translator::rtyper::rtyper::LowLevelOpList>>,
         helper_name: &str,
     ) {
         use crate::flowspace::model::Hlvalue;
@@ -6497,7 +6492,10 @@ mod tests {
             panic!("expected Constant funcptr, got {:?}", ops.ops[0].args[0]);
         };
         let dbg = format!("{:?}", c.value);
-        assert!(dbg.contains(helper_name), "expected funcptr '{helper_name}' in {dbg}");
+        assert!(
+            dbg.contains(helper_name),
+            "expected funcptr '{helper_name}' in {dbg}"
+        );
     }
 
     /// rbuilder.py:42-45 — `rtype_method_getlength` lowers to a single
