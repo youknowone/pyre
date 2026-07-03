@@ -324,6 +324,7 @@ fn emit_helper_call_target_fn(
     let wrapper = match helper_call_kind_for_return(&func.sig.output) {
         HelperCallKind::Void => quote! {
             #[doc(hidden)]
+            #[allow(non_snake_case)]
             #vis extern "C" fn #trace_target_name(#(#wrapper_params),*) {
                 #helper_name(#(#converted_args),*);
             }
@@ -342,6 +343,7 @@ fn emit_helper_call_target_fn(
             };
             quote! {
                 #[doc(hidden)]
+                #[allow(non_snake_case)]
                 #vis extern "C" fn #trace_target_name(#(#wrapper_params),*) -> i64 {
                     #converted_return
                 }
@@ -353,6 +355,7 @@ fn emit_helper_call_target_fn(
             };
             let float_wrapper = quote! {
                 #[doc(hidden)]
+                #[allow(non_snake_case)]
                 #vis extern "C" fn #trace_target_name(#(#wrapper_params),*) -> f64 {
                     #helper_name(#(#converted_args),*)
                 }
@@ -367,6 +370,7 @@ fn emit_helper_call_target_fn(
             };
             let concrete_wrapper = quote! {
                 #[doc(hidden)]
+                #[allow(non_snake_case)]
                 #vis extern "C" fn #concrete_target_name(#(#wrapper_params),*) -> i64 {
                     #concrete_return
                 }
@@ -578,6 +582,7 @@ fn emit_helper_policy_fn(
     // (`RFFI_ERR_NONE`, `rffi.py:80`).
     Ok(quote! {
         #[doc(hidden)]
+        #[allow(non_snake_case)]
         #vis fn #helper_name() -> (u8, *const (), *const (), *const (), *const (), i32) {
             #body
         }
@@ -1903,6 +1908,7 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
 
         #[doc(hidden)]
+        #[allow(non_snake_case)]
         pub(crate) fn #policy_name() -> (u8, *const (), *const (), *const (), *const (), i32) {
             (
                 #inferred_policy_code,

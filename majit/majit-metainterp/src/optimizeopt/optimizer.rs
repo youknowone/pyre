@@ -6887,7 +6887,7 @@ mod tests {
         let (mut seeded_ops, snapshots) =
             super::super::seed_empty_guard_snapshots(std::slice::from_ref(&op));
         ctx.snapshot_boxes = snapshots;
-        opt.emit_operation(seeded_ops.pop().unwrap(), &mut ctx, false);
+        let _ = opt.emit_operation(seeded_ops.pop().unwrap(), &mut ctx, false);
 
         assert!(!ctx.in_final_emission);
         assert!(ctx.new_operations.iter().any(|op| op.opcode == OpCode::New));
@@ -6953,7 +6953,7 @@ mod tests {
         let (mut seeded_ops, snapshots) =
             super::super::seed_empty_guard_snapshots(std::slice::from_ref(&guard));
         ctx.snapshot_boxes = snapshots;
-        opt.emit_operation(seeded_ops.pop().unwrap(), &mut ctx, false);
+        let _ = opt.emit_operation(seeded_ops.pop().unwrap(), &mut ctx, false);
 
         let sp = ctx
             .build_imported_short_preamble()

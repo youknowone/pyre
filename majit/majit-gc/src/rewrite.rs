@@ -1,3 +1,5 @@
+#![cfg_attr(test, allow(unused_variables))]
+
 /// GC rewriter — transforms high-level allocation and store operations
 /// into GC-aware lower-level IR before code generation.
 ///

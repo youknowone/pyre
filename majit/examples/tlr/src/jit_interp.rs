@@ -7,6 +7,10 @@
 
 pub type Bytecode = [u8];
 
+#[expect(
+    dead_code,
+    reason = "the jit_interp macro resolves bytecode reads through this trait surface"
+)]
 trait BytecodeExt {
     fn get_op(&self, pc: usize) -> u8;
 }
@@ -53,7 +57,7 @@ fn mainloop(program: &Bytecode, initial_a: i64, threshold: u32) -> i64 {
     let mut driver: majit_metainterp::JitDriver<TlrState> =
         majit_metainterp::JitDriver::new(threshold);
     let mut pc: usize = 0;
-    let mut stacksize: i32 = 0;
+    let _stacksize: i32 = 0;
     let mut state = TlrState {
         a: initial_a,
         regs: Vec::new(),

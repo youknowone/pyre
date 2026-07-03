@@ -10,7 +10,8 @@
     unused_assignments,
     unused_doc_comments,
     unused_imports,
-    unused_macros
+    unused_macros,
+    unused_mut
 )]
 
 //! pyre-jit: Auto-generated JIT for pyre.

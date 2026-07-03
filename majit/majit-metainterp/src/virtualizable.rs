@@ -1339,29 +1339,31 @@ impl VableArrayInfo {
 /// layout described by `info`.
 #[cfg(test)]
 unsafe fn read_virtualizable_boxes(info: &VirtualizableInfo, obj_ptr: *const u8) -> Vec<i64> {
-    let mut boxes = Vec::with_capacity(info.num_static_extra_boxes);
+    unsafe {
+        let mut boxes = Vec::with_capacity(info.num_static_extra_boxes);
 
-    // Read static fields
-    for field in &info.static_fields {
-        let val = match field.field_type {
-            Type::Int => {
-                let ptr = obj_ptr.add(field.offset) as *const i64;
-                *ptr
-            }
-            Type::Float => {
-                let ptr = obj_ptr.add(field.offset) as *const f64;
-                f64::to_bits(*ptr) as i64
-            }
-            Type::Ref => {
-                let ptr = obj_ptr.add(field.offset) as *const i64;
-                *ptr
-            }
-            Type::Void => 0,
-        };
-        boxes.push(val);
+        // Read static fields
+        for field in &info.static_fields {
+            let val = match field.field_type {
+                Type::Int => {
+                    let ptr = obj_ptr.add(field.offset) as *const i64;
+                    *ptr
+                }
+                Type::Float => {
+                    let ptr = obj_ptr.add(field.offset) as *const f64;
+                    f64::to_bits(*ptr) as i64
+                }
+                Type::Ref => {
+                    let ptr = obj_ptr.add(field.offset) as *const i64;
+                    *ptr
+                }
+                Type::Void => 0,
+            };
+            boxes.push(val);
+        }
+
+        boxes
     }
-
-    boxes
 }
 
 /// Writes values back from JIT representation to a virtualizable heap object.
@@ -1373,20 +1375,22 @@ unsafe fn read_virtualizable_boxes(info: &VirtualizableInfo, obj_ptr: *const u8)
 /// layout described by `info`.
 #[cfg(test)]
 unsafe fn write_virtualizable_boxes(info: &VirtualizableInfo, obj_ptr: *mut u8, boxes: &[i64]) {
-    for (i, field) in info.static_fields.iter().enumerate() {
-        if i >= boxes.len() {
-            break;
-        }
-        match field.field_type {
-            Type::Int | Type::Ref => {
-                let ptr = obj_ptr.add(field.offset) as *mut i64;
-                *ptr = boxes[i];
+    unsafe {
+        for (i, field) in info.static_fields.iter().enumerate() {
+            if i >= boxes.len() {
+                break;
             }
-            Type::Float => {
-                let ptr = obj_ptr.add(field.offset) as *mut f64;
-                *ptr = f64::from_bits(boxes[i] as u64);
+            match field.field_type {
+                Type::Int | Type::Ref => {
+                    let ptr = obj_ptr.add(field.offset) as *mut i64;
+                    *ptr = boxes[i];
+                }
+                Type::Float => {
+                    let ptr = obj_ptr.add(field.offset) as *mut f64;
+                    *ptr = f64::from_bits(boxes[i] as u64);
+                }
+                Type::Void => {}
             }
-            Type::Void => {}
         }
     }
 }
@@ -1400,8 +1404,10 @@ unsafe fn write_virtualizable_boxes(info: &VirtualizableInfo, obj_ptr: *mut u8, 
 /// The caller must ensure `obj_ptr` points to a valid object.
 #[cfg(test)]
 unsafe fn reset_vable_token(info: &VirtualizableInfo, obj_ptr: *mut u8) {
-    let token_ptr = obj_ptr.add(info.token_offset) as *mut usize;
-    *token_ptr = 0;
+    unsafe {
+        let token_ptr = obj_ptr.add(info.token_offset) as *mut usize;
+        *token_ptr = 0;
+    }
 }
 
 /// Check if the vable_token is non-null (JIT code may be active).
@@ -1431,7 +1437,9 @@ unsafe fn force_virtualizable(
     obj_ptr: *mut u8,
     force_fn: impl FnOnce(u64),
 ) {
-    info.force_now(obj_ptr, force_fn);
+    unsafe {
+        info.force_now(obj_ptr, force_fn);
+    }
 }
 
 /// Read array lengths from a virtualizable heap object.
@@ -1443,7 +1451,7 @@ unsafe fn force_virtualizable(
 /// The caller must ensure `obj_ptr` points to a valid virtualizable object.
 #[cfg(test)]
 unsafe fn read_array_lengths(info: &VirtualizableInfo, obj_ptr: *const u8) -> Vec<usize> {
-    info.read_array_lengths_from_heap(obj_ptr)
+    unsafe { info.read_array_lengths_from_heap(obj_ptr) }
 }
 
 /// Read a virtualizable's array field contents from the heap.
@@ -1459,18 +1467,20 @@ unsafe fn read_virtualizable_array(
     obj_ptr: *const u8,
     length: usize,
 ) -> Vec<i64> {
-    let mut values = Vec::with_capacity(length);
-    for i in 0..length {
-        let array_ptr = array_info.data_ptr(obj_ptr);
-        let item_offset = array_info.items_offset + i * array_info.item_size;
-        let val = match array_info.item_type {
-            Type::Int | Type::Ref => *(array_ptr.add(item_offset) as *const i64),
-            Type::Float => f64::to_bits(*(array_ptr.add(item_offset) as *const f64)) as i64,
-            Type::Void => 0,
-        };
-        values.push(val);
+    unsafe {
+        let mut values = Vec::with_capacity(length);
+        for i in 0..length {
+            let array_ptr = array_info.data_ptr(obj_ptr);
+            let item_offset = array_info.items_offset + i * array_info.item_size;
+            let val = match array_info.item_type {
+                Type::Int | Type::Ref => *(array_ptr.add(item_offset) as *const i64),
+                Type::Float => f64::to_bits(*(array_ptr.add(item_offset) as *const f64)) as i64,
+                Type::Void => 0,
+            };
+            values.push(val);
+        }
+        values
     }
-    values
 }
 
 /// symbolic.py:get_array_token → itemsize = sizeof(ARRAY.OF).
@@ -1512,19 +1522,21 @@ pub fn item_size_for_type(ty: Type) -> usize {
 /// The caller must ensure `obj_ptr` is valid and the array has sufficient space.
 #[cfg(test)]
 unsafe fn write_virtualizable_array(array_info: &VableArrayInfo, obj_ptr: *mut u8, values: &[i64]) {
-    for (i, &val) in values.iter().enumerate() {
-        let array_ptr = array_info.data_ptr(obj_ptr.cast_const()) as *mut u8;
-        let item_offset = array_info.items_offset + i * array_info.item_size;
-        match array_info.item_type {
-            Type::Int | Type::Ref => {
-                let ptr = array_ptr.add(item_offset) as *mut i64;
-                *ptr = val;
+    unsafe {
+        for (i, &val) in values.iter().enumerate() {
+            let array_ptr = array_info.data_ptr(obj_ptr.cast_const()) as *mut u8;
+            let item_offset = array_info.items_offset + i * array_info.item_size;
+            match array_info.item_type {
+                Type::Int | Type::Ref => {
+                    let ptr = array_ptr.add(item_offset) as *mut i64;
+                    *ptr = val;
+                }
+                Type::Float => {
+                    let ptr = array_ptr.add(item_offset) as *mut f64;
+                    *ptr = f64::from_bits(val as u64);
+                }
+                Type::Void => {}
             }
-            Type::Float => {
-                let ptr = array_ptr.add(item_offset) as *mut f64;
-                *ptr = f64::from_bits(val as u64);
-            }
-            Type::Void => {}
         }
     }
 }

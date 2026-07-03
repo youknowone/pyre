@@ -12,6 +12,7 @@
 //! line-by-line control flow through a small runtime trait so the test process
 //! is not actually forked.
 
+#[cfg(unix)]
 use std::ffi::CString;
 use std::io::{self, BufRead, Write};
 
@@ -89,14 +90,30 @@ type Pid = i32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ForkResult {
+    #[cfg_attr(
+        not(unix),
+        expect(dead_code, reason = "fork parent result is only constructed on Unix")
+    )]
     Parent(Pid),
+    #[cfg_attr(
+        not(unix),
+        expect(dead_code, reason = "fork child result is only constructed on Unix")
+    )]
     Child,
     NotSupported,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WaitStatus {
+    #[cfg_attr(
+        not(unix),
+        expect(dead_code, reason = "wait exit status is only constructed on Unix")
+    )]
     Exited(i32),
+    #[cfg_attr(
+        not(unix),
+        expect(dead_code, reason = "wait signal status is only constructed on Unix")
+    )]
     Signaled(i32),
     Other(i32),
 }
@@ -109,7 +126,15 @@ trait CheckpointRuntime {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WaitError {
+    #[cfg_attr(
+        not(unix),
+        expect(dead_code, reason = "EINTR wait retry is only constructed on Unix")
+    )]
     Interrupted,
+    #[cfg_attr(
+        not(unix),
+        expect(dead_code, reason = "wait errno is only constructed on Unix")
+    )]
     Other(i32),
 }
 
@@ -360,6 +385,13 @@ fn restart_process_real() -> Result<(), TaskError> {
     })
 }
 
+#[cfg_attr(
+    not(unix),
+    expect(
+        dead_code,
+        reason = "OS-error formatting is only used by Unix syscalls"
+    )
+)]
 fn last_os_task_error(context: &str) -> TaskError {
     TaskError {
         message: format!("{context} failed: {}", io::Error::last_os_error()),

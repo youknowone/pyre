@@ -48,6 +48,10 @@ extern "C" fn storage_roll(stack_ptr: usize, stackpos: i64, r: i64) {
 
 pub type Bytecode = [u8];
 
+#[expect(
+    dead_code,
+    reason = "the jit_interp macro resolves bytecode reads through this trait surface"
+)]
 trait BytecodeExt {
     fn get_op(&self, pc: usize) -> u8;
 }
@@ -113,7 +117,7 @@ pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
         SPIKE_COMPILES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     });
     let mut pc: usize = 0;
-    let mut stacksize: i32 = 0;
+    let stacksize: i32 = 0;
     let mut state = TlState {
         stackpos: 0,
         stack: vec![0i64; program.len()],

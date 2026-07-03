@@ -8,8 +8,7 @@
 
 use majit_metainterp::jitcode::insns::{
     BC_ABORT, BC_GETARRAYITEM_GC_I, BC_GOTO_IF_NOT_INT_EQ, BC_INLINE_CALL, BC_INT_ADD,
-    BC_INT_GUARD_VALUE, BC_INT_RETURN, BC_JIT_MERGE_POINT, BC_JIT_MERGE_POINT_C, BC_LIVE,
-    BC_STORE_STATE_FIELD,
+    BC_INT_RETURN, BC_JIT_MERGE_POINT, BC_JIT_MERGE_POINT_C, BC_LIVE, BC_STORE_STATE_FIELD,
 };
 use majit_metainterp::{Assembler, BC_GOTO, JitCode, JitDriver};
 
@@ -144,9 +143,9 @@ fn dispatch_arm_subjitcode_lowers_state_field_write() {
 }
 
 mod or_pattern {
-    use super::{Bytecode, BytecodeExt, OP_INC_A, OP_NOP};
+    use super::{Bytecode, OP_INC_A, OP_NOP};
     use majit_metainterp::jitcode::insns::BC_INLINE_CALL;
-    use majit_metainterp::{Assembler, BC_GOTO, JitCode, JitDriver};
+    use majit_metainterp::{Assembler, BC_GOTO, JitDriver};
 
     struct OrDispatchState {
         a: i64,
@@ -401,7 +400,7 @@ fn dispatch_jitcode_emits_typed_return_for_default_arm() {
 }
 
 mod pre_promote {
-    use crate::BytecodeExt;
+
     use majit_metainterp::{Assembler, JitDriver};
 
     struct PromoteState {
@@ -538,7 +537,7 @@ fn register_dispatch_jitcode_stores_singleton() {
 /// non-empty. A.2.2-A.2.4 add lower-side recognition for the new surfaces
 /// (oparg fetch, last_instr store position) and pin shape via dedicated tests.
 mod oparg_minimal {
-    use crate::BytecodeExt;
+
     use majit_metainterp::{Assembler, JitDriver};
 
     struct OpargState {
@@ -597,7 +596,7 @@ mod oparg_minimal {
         // `#stacksize_expr = 0i32;`).  All examples that wire
         // `can_enter_jit!()` declare `let mut stacksize: i32 = 0;` in the
         // function scope; the OP_JUMP_BACK arm below requires the same.
-        let mut stacksize: i32 = 0;
+        let stacksize: i32 = 0;
         let mut state = OpargState {
             last_instr: 0,
             acc: 0,
@@ -1181,7 +1180,7 @@ mod oparg_minimal {
 /// `while opcode == EXTENDED_ARG` form, so the test asserts the body
 /// is non-empty.
 mod oparg_extended {
-    use crate::BytecodeExt;
+
     use majit_metainterp::jitcode::insns::{
         BC_ABORT, BC_GETARRAYITEM_GC_I, BC_INT_MUL, BC_INT_OR, BC_JIT_MERGE_POINT,
         BC_JIT_MERGE_POINT_C,
@@ -1398,7 +1397,7 @@ mod oparg_extended {
 /// `resolve_greens` must resolve the `pc` ident to register `i0` and emit
 /// `greens_i = [0]` in the `jit_merge_point` payload.
 mod oparg_with_pc_green {
-    use crate::BytecodeExt;
+
     use majit_metainterp::{Assembler, JitDriver};
 
     struct PcGreenState {
@@ -1647,7 +1646,7 @@ mod oparg_with_pc_green {
 ///   greens_base + 6: reds_r_len   = 0  (program is green)
 ///   greens_base + 7: reds_f_len   = 0
 mod oparg_with_pypy_parity_greens {
-    use crate::BytecodeExt;
+
     use majit_metainterp::{Assembler, JitDriver};
 
     struct ParityState {
@@ -1791,7 +1790,7 @@ mod oparg_with_pypy_parity_greens {
 /// `lower_value_expr` already handles `BinOp::Le` on int state fields, so
 /// no extension to the expression vocabulary is required by this fixture.
 mod oparg_with_body_local_state_le_green {
-    use crate::BytecodeExt;
+
     use majit_metainterp::{Assembler, JitDriver};
 
     struct LeGreenState {
@@ -2000,6 +1999,10 @@ mod oparg_with_body_local_method_call_green {
             0
         }
 
+        #[expect(
+            dead_code,
+            reason = "shape-test fixture mirrors the interpreter program API"
+        )]
         fn len(&self) -> usize {
             self.bytes.len()
         }
@@ -2277,7 +2280,7 @@ mod oparg_with_body_local_method_call_green {
 /// or shifts the merge-point payload trips this fixture rather than
 /// silently regressing rpaheui parity.
 mod oparg_with_full_4_green_parity {
-    use crate::BytecodeExt;
+
     use majit_metainterp::{Assembler, JitDriver};
 
     struct FullParityState {

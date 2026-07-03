@@ -14,7 +14,7 @@ fn validate_wasm(bytes: &[u8]) {
 
 fn make_op(opcode: OpCode, args: &[OpRef], pos: OpRef) -> Op {
     let bx: Vec<Operand> = args.iter().map(|a| rb(*a)).collect();
-    let mut op = Op::new(opcode, &bx);
+    let op = Op::new(opcode, &bx);
     op.pos.set(pos);
     op
 }
@@ -23,7 +23,7 @@ use majit_ir::box_ref::bound_operand_from_opref as rb;
 
 fn make_guard(opcode: OpCode, args: &[OpRef], fail_args: &[OpRef]) -> Op {
     let bx: Vec<Operand> = args.iter().map(|a| rb(*a)).collect();
-    let mut op = Op::new(opcode, &bx);
+    let op = Op::new(opcode, &bx);
     op.setfailargs(smallvec![rb(fail_args[0]); 0]);
     let mut fa: smallvec::SmallVec<[Operand; 3]> = smallvec::SmallVec::new();
     for &a in fail_args {
@@ -37,7 +37,7 @@ fn make_guard(opcode: OpCode, args: &[OpRef], fail_args: &[OpRef]) -> Op {
 fn test_empty_trace() {
     let inputargs = vec![InputArg::from_type(Type::Int, 0)];
     let ops = vec![{
-        let mut op = Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]);
+        let op = Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]);
         op.setfailargs(smallvec![rb(OpRef::input_arg_int(0))]);
         op
     }];
@@ -159,7 +159,7 @@ fn test_float_ops() {
             OpRef::int_op(8),
         ),
         {
-            let mut op = Op::new(OpCode::Finish, &[rb(OpRef::float_op(7))]);
+            let op = Op::new(OpCode::Finish, &[rb(OpRef::float_op(7))]);
             op.setfailargs(smallvec![rb(OpRef::float_op(7))]);
             op
         },
@@ -199,7 +199,7 @@ fn test_call_generates_import() {
             OpRef::int_op(1),
         ),
         {
-            let mut op = Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))]);
+            let op = Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))]);
             op.setfailargs(smallvec![rb(OpRef::int_op(1))]);
             op
         },
@@ -284,13 +284,13 @@ fn test_guard_types() {
         ),
         // GuardNoOverflow (0 args)
         {
-            let mut op = Op::new(OpCode::GuardNoOverflow, &[]);
+            let op = Op::new(OpCode::GuardNoOverflow, &[]);
             op.setfailargs(smallvec![rb(OpRef::input_arg_int(0))]);
             op
         },
         // GuardNotInvalidated (0 args, always pass)
         {
-            let mut op = Op::new(OpCode::GuardNotInvalidated, &[]);
+            let op = Op::new(OpCode::GuardNotInvalidated, &[]);
             op.setfailargs(smallvec![rb(OpRef::input_arg_int(0))]);
             op
         },
@@ -332,13 +332,13 @@ fn test_exception_guards() {
         Op::new(OpCode::Label, &[rb(OpRef::input_arg_int(0))]),
         // GuardNoException — 0 args, fails when an exception is pending.
         {
-            let mut op = Op::new(OpCode::GuardNoException, &[]);
+            let op = Op::new(OpCode::GuardNoException, &[]);
             op.setfailargs(smallvec![rb(OpRef::input_arg_int(0))]);
             op
         },
         // GuardException(expected_type) — caught value bound to int_op(1).
         {
-            let mut op = Op::new(OpCode::GuardException, &[rb(OpRef::input_arg_int(0))]);
+            let op = Op::new(OpCode::GuardException, &[rb(OpRef::input_arg_int(0))]);
             op.pos.set(OpRef::int_op(1));
             op.setfailargs(smallvec![rb(OpRef::input_arg_int(0))]);
             op
@@ -585,7 +585,7 @@ fn test_sameas_and_conversions() {
             OpRef::int_op(9),
         ),
         {
-            let mut op = Op::new(OpCode::Finish, &[rb(OpRef::int_op(9))]);
+            let op = Op::new(OpCode::Finish, &[rb(OpRef::int_op(9))]);
             op.setfailargs(smallvec![rb(OpRef::int_op(9))]);
             op
         },
@@ -624,7 +624,7 @@ fn test_overflow_ops() {
             OpRef::int_op(2),
         ),
         {
-            let mut op = Op::new(OpCode::GuardNoOverflow, &[]);
+            let op = Op::new(OpCode::GuardNoOverflow, &[]);
             op.setfailargs(smallvec![rb(OpRef::int_op(2))]);
             op
         },
@@ -634,12 +634,12 @@ fn test_overflow_ops() {
             OpRef::int_op(3),
         ),
         {
-            let mut op = Op::new(OpCode::GuardNoOverflow, &[]);
+            let op = Op::new(OpCode::GuardNoOverflow, &[]);
             op.setfailargs(smallvec![rb(OpRef::int_op(3))]);
             op
         },
         {
-            let mut op = Op::new(OpCode::Finish, &[rb(OpRef::int_op(2))]);
+            let op = Op::new(OpCode::Finish, &[rb(OpRef::int_op(2))]);
             op.setfailargs(smallvec![rb(OpRef::int_op(2))]);
             op
         },

@@ -8129,8 +8129,8 @@ mod tests {
 
         fn recursive_fresh_alloc_free_targets(&self) -> Option<(*const (), *const ())> {
             Some((
-                test_recursive_fresh_alloc as usize as *const (),
-                test_recursive_fresh_free as usize as *const (),
+                test_recursive_fresh_alloc as *const () as usize as *const (),
+                test_recursive_fresh_free as *const () as usize as *const (),
             ))
         }
     }

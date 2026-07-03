@@ -8,7 +8,6 @@ use majit_backend::{
     Backend, ExitFrameLayout, ExitRecoveryLayout, ExitValueSourceLayout, JitCellToken,
 };
 use majit_backend_cranelift::{CraneliftBackend, force_token_to_dead_frame, jit_exc_raise};
-use majit_ir::box_ref::BoxRef;
 use majit_ir::operand::Operand;
 use majit_ir::{
     ArrayDescr, Descr, DescrRef, FieldDescr, GcRef, InputArg, Op, OpCode, OpRef, Type, Value,
@@ -1022,6 +1021,10 @@ impl majit_ir::CallDescr for TestCallDescr {
     }
 }
 
+#[expect(
+    dead_code,
+    reason = "optimizer descriptor fixture helper retained for coverage parity"
+)]
 fn field_descr(idx: u32) -> DescrRef {
     Arc::new(TestFieldDescr {
         idx,
@@ -1029,6 +1032,10 @@ fn field_descr(idx: u32) -> DescrRef {
     })
 }
 
+#[expect(
+    dead_code,
+    reason = "optimizer descriptor fixture helper retained for coverage parity"
+)]
 fn immutable_field_descr(idx: u32) -> DescrRef {
     Arc::new(TestFieldDescr {
         idx,
@@ -1036,6 +1043,10 @@ fn immutable_field_descr(idx: u32) -> DescrRef {
     })
 }
 
+#[expect(
+    dead_code,
+    reason = "optimizer descriptor fixture helper retained for coverage parity"
+)]
 fn call_descr_can_raise(idx: u32) -> DescrRef {
     Arc::new(TestCallDescr {
         idx,

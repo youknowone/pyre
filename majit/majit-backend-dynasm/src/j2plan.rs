@@ -632,7 +632,7 @@ fn add_refs(live: &mut Vec<OpRef>, args: &[OpRef]) {
 
 #[cfg(test)]
 mod tests {
-    use majit_ir::{InputArg, Op, OpCode, OpRc, OpRef, Type};
+    use majit_ir::{InputArg, Op, OpCode, OpRef, Type};
 
     use super::{GuardKind, IntBinKind, IntCmpKind, LirOp, TracePlan};
 
@@ -644,19 +644,19 @@ mod tests {
         let c1 = OpRef::const_int(1);
         let c10 = OpRef::const_int(10);
 
-        let mut label = Op::new(OpCode::Label, &[rb(i0)]);
+        let label = Op::new(OpCode::Label, &[rb(i0)]);
         label.pos.set(OpRef::int_op(10));
 
-        let mut add = Op::new(OpCode::IntAdd, &[rb(i0), rb(c1)]);
+        let add = Op::new(OpCode::IntAdd, &[rb(i0), rb(c1)]);
         add.pos.set(OpRef::int_op(1));
 
-        let mut lt = Op::new(OpCode::IntLt, &[rb(OpRef::int_op(1)), rb(c10)]);
+        let lt = Op::new(OpCode::IntLt, &[rb(OpRef::int_op(1)), rb(c10)]);
         lt.pos.set(OpRef::int_op(2));
 
-        let mut guard = Op::new(OpCode::GuardTrue, &[rb(OpRef::int_op(2))]);
+        let guard = Op::new(OpCode::GuardTrue, &[rb(OpRef::int_op(2))]);
         guard.pos.set(OpRef::int_op(3));
         guard.setfailargs(vec![rb(OpRef::int_op(1))].into());
-        let mut jump = Op::new(OpCode::Jump, &[rb(OpRef::int_op(1))]);
+        let jump = Op::new(OpCode::Jump, &[rb(OpRef::int_op(1))]);
         jump.pos.set(OpRef::int_op(4));
 
         let plan = TracePlan::build(
@@ -694,16 +694,16 @@ mod tests {
         let i0 = OpRef::int_op(0);
         let c1 = OpRef::const_int(1);
 
-        let mut add = Op::new(OpCode::IntAdd, &[rb(i0), rb(c1)]);
+        let add = Op::new(OpCode::IntAdd, &[rb(i0), rb(c1)]);
         add.pos.set(OpRef::int_op(1));
 
-        let mut is_true = Op::new(OpCode::IntIsTrue, &[rb(OpRef::int_op(1))]);
+        let is_true = Op::new(OpCode::IntIsTrue, &[rb(OpRef::int_op(1))]);
         is_true.pos.set(OpRef::int_op(2));
 
-        let mut guard = Op::new(OpCode::GuardTrue, &[rb(OpRef::int_op(2))]);
+        let guard = Op::new(OpCode::GuardTrue, &[rb(OpRef::int_op(2))]);
         guard.pos.set(OpRef::int_op(3));
         guard.setfailargs(vec![rb(OpRef::int_op(1))].into());
-        let mut finish = Op::new(OpCode::Finish, &[]);
+        let finish = Op::new(OpCode::Finish, &[]);
         finish.pos.set(OpRef::int_op(4));
 
         let plan = TracePlan::build(
@@ -733,16 +733,16 @@ mod tests {
         let i0 = OpRef::int_op(0);
         let c1 = OpRef::const_int(1);
 
-        let mut add = Op::new(OpCode::IntAdd, &[rb(i0), rb(c1)]);
+        let add = Op::new(OpCode::IntAdd, &[rb(i0), rb(c1)]);
         add.pos.set(OpRef::int_op(1));
 
-        let mut is_true = Op::new(OpCode::IntIsTrue, &[rb(OpRef::int_op(1))]);
+        let is_true = Op::new(OpCode::IntIsTrue, &[rb(OpRef::int_op(1))]);
         is_true.pos.set(OpRef::int_op(2));
 
-        let mut guard = Op::new(OpCode::GuardTrue, &[rb(OpRef::int_op(2))]);
+        let guard = Op::new(OpCode::GuardTrue, &[rb(OpRef::int_op(2))]);
         guard.pos.set(OpRef::int_op(3));
         guard.setfailargs(vec![rb(OpRef::int_op(1))].into());
-        let mut jump = Op::new(OpCode::Jump, &[rb(OpRef::int_op(1))]);
+        let jump = Op::new(OpCode::Jump, &[rb(OpRef::int_op(1))]);
         jump.pos.set(OpRef::int_op(4));
 
         let plan = TracePlan::build(
@@ -762,7 +762,7 @@ mod tests {
         let offset = OpRef::const_int(16);
         let size = OpRef::const_int(8);
 
-        let mut load = Op::new(
+        let load = Op::new(
             OpCode::GcLoadIndexedI,
             &[rb(base), rb(index), rb(scale), rb(offset), rb(size)],
         );
@@ -816,7 +816,7 @@ mod tests {
     #[test]
     fn lowers_misc_opcode_without_fallback() {
         let i0 = OpRef::int_op(0);
-        let mut same_as = Op::new(OpCode::SameAsI, &[rb(i0)]);
+        let same_as = Op::new(OpCode::SameAsI, &[rb(i0)]);
         same_as.pos.set(OpRef::int_op(1));
         let debug = Op::new(OpCode::JitDebug, &[]);
 
@@ -846,10 +846,10 @@ mod tests {
     #[test]
     fn lowers_remaining_guard_kinds_without_fallback() {
         let i0 = OpRef::int_op(0);
-        let mut is_object = Op::new(OpCode::GuardIsObject, &[rb(i0)]);
+        let is_object = Op::new(OpCode::GuardIsObject, &[rb(i0)]);
         is_object.pos.set(OpRef::int_op(1));
         is_object.setfailargs(vec![rb(i0)].into());
-        let mut future = Op::new(OpCode::GuardFutureCondition, &[]);
+        let future = Op::new(OpCode::GuardFutureCondition, &[]);
         future.pos.set(OpRef::int_op(2));
         future.setfailargs(vec![rb(i0)].into());
         let plan = TracePlan::build(

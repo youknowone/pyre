@@ -5,7 +5,7 @@
 use majit_ir::{VecMap, VecMapExt, VecSet};
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 
 use cranelift_codegen::Context;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
@@ -505,6 +505,10 @@ struct RegisteredLoopTarget {
     /// 0 for FINISH traces (no JUMP/Label).
     header_pc: u64,
     /// RPython greenkey hash: function identifier for guard lookup.
+    #[expect(
+        dead_code,
+        reason = "registered loop targets retain green-key identity for bridge metadata"
+    )]
     green_key: u64,
     caller_prefix_layout: Option<ExitRecoveryLayout>,
     code_ptr: *const u8,
@@ -567,7 +571,15 @@ struct LoopTargetEntry {
     /// contract (compile.py:183-203 record_loop_or_bridge).
     fail_descrs: Box<[DescrRef]>,
     /// Position-aligned `FailDescrCell` wrappers — see `CompiledLoop`.
+    #[expect(
+        dead_code,
+        reason = "keeps baked fail-descr cells alive for parity with loop-code entries"
+    )]
     fail_descr_cells: Box<[Arc<majit_ir::FailDescrCell>]>,
+    #[expect(
+        dead_code,
+        reason = "loop-code entries retain input arity for the external-JUMP path"
+    )]
     num_inputs: usize,
     num_ref_roots: usize,
     max_output_slots: usize,
@@ -1086,6 +1098,10 @@ fn var(idx: u32) -> Variable {
 }
 
 /// Convert a slice of Values to a Vec of BlockArgs for Cranelift 0.130 branch instructions.
+#[expect(
+    dead_code,
+    reason = "kept as the Cranelift BlockArg adapter while typed branch lowering uses block_args_to"
+)]
 fn block_args(vals: &[CValue]) -> Vec<BlockArg> {
     vals.iter().copied().map(BlockArg::from).collect()
 }
@@ -1576,6 +1592,10 @@ struct GcRootSlotGuard {
 }
 
 impl GcRootSlotGuard {
+    #[expect(
+        dead_code,
+        reason = "constructor is paired with GcRootSlotGuard's retained RAII path"
+    )]
     fn new(slots: Vec<*mut GcRef>) -> Self {
         if slots.is_empty() {
             return Self {
@@ -3148,7 +3168,7 @@ fn call_assembler_guard_failure_inner(
         return handle as i64;
     }
 
-    let target = unsafe { &*fast_lookup_ca_target(token_number) };
+    let _target = unsafe { &*fast_lookup_ca_target(token_number) };
 
     // `history.py:109-114` `AbstractDescr.show(cpu, descr_gcref)`
     // parity.  `fail_descr_ptr` is the JIT-baked
@@ -6616,6 +6636,10 @@ pub(crate) fn fail_descr_set_trace_info(fd: &dyn FailDescr, trace_info: Compiled
 /// `ResumeGuardDescr::external_jump_target` slot.  Returns `None` for
 /// descrs without a `ResumeGuardDescr` meta AND for regular guard
 /// descrs (the common case).
+#[expect(
+    dead_code,
+    reason = "external-JUMP descr query is retained for bridge dispatch parity"
+)]
 pub(crate) fn fail_descr_external_jump_target(descr: &DescrRef) -> Option<DescrRef> {
     descr
         .as_any()
@@ -6826,6 +6850,10 @@ struct JitExecResult {
 }
 
 impl JitExecResult {
+    #[expect(
+        dead_code,
+        reason = "documents the JitFrame header layout for direct frame access"
+    )]
     const HEADER_WORDS: usize = (JF_FRAME_ITEM0_OFS as usize) / 8;
 
     /// Read jf_frame[index] as i64.
@@ -7177,6 +7205,10 @@ fn run_compiled_code_inner(
 }
 
 struct GuardInfo {
+    #[expect(
+        dead_code,
+        reason = "guard metadata keeps the assigned fail index alongside emitted layouts"
+    )]
     fail_index: u32,
     can_have_bridge: bool,
     fail_arg_refs: Vec<OpRef>,
@@ -7719,6 +7751,10 @@ impl CraneliftBackend {
     /// Delegates to the installed `GcAllocator`. RPython resolves the
     /// typeid through `cpu.gc_ll_descr`; in majit the gc_ll_descr role
     /// is filled by the active GC runtime registered via set_gc_allocator.
+    #[expect(
+        dead_code,
+        reason = "GC type-id lookup hook is retained for gcremovetypeptr parity"
+    )]
     fn lookup_typeid_from_classptr(&self, classptr: usize) -> Option<u32> {
         with_cranelift_gc(|gc| gc.get_typeid_from_classptr_if_gcremovetypeptr(classptr)).flatten()
     }
@@ -13889,7 +13925,7 @@ fn collect_guards(
     header_pc: u64,
     source_guard: Option<(u64, u32)>,
     caller_layout: Option<&ExitRecoveryLayout>,
-    constants: &majit_ir::VecMap<u32, i64>,
+    _constants: &majit_ir::VecMap<u32, i64>,
     attached_descrs: majit_backend::AttachedDescrPtrs,
 ) -> Result<(), BackendError> {
     let type_index = OpTypeIndex::new(inputargs, ops);
@@ -16380,9 +16416,9 @@ mod tests {
     use majit_gc::flags;
     use majit_gc::header::{GcHeader, header_of};
     use majit_gc::trace::TypeInfo;
-    use majit_ir::box_ref::BoxRef;
     use majit_ir::descr::{Descr, EffectInfo, ExtraEffect, SizeDescr};
     use majit_ir::operand::Operand;
+    use std::sync::Mutex;
 
     fn mk_op(opcode: OpCode, args: &[OpRef], pos: u32) -> majit_ir::OpRc {
         let bx: Vec<Operand> = args.iter().map(|a| rb(*a)).collect();
@@ -16655,6 +16691,10 @@ mod tests {
         12.5
     }
 
+    #[expect(
+        dead_code,
+        reason = "ref-forcing residual-call test fixture retained for parity"
+    )]
     extern "C" fn maybe_force_and_return_ref(
         force_token: i64,
         flag: i64,
@@ -17300,7 +17340,7 @@ mod tests {
         let mut backend = CraneliftBackend::new();
 
         let inputargs = vec![InputArg::new_int(0), InputArg::new_ref(1)];
-        let mut guard = mk_op(
+        let guard = mk_op(
             OpCode::GuardTrue,
             &[OpRef::input_arg_int(0)],
             OpRef::NONE.raw(),
@@ -17508,7 +17548,7 @@ mod tests {
         let mut backend = CraneliftBackend::new();
 
         let inputargs = vec![InputArg::new_int(0)];
-        let mut guard = mk_op(
+        let guard = mk_op(
             OpCode::GuardFalse,
             &[OpRef::input_arg_int(0)],
             OpRef::NONE.raw(),
@@ -17603,7 +17643,7 @@ mod tests {
         let mut backend = CraneliftBackend::new();
 
         let inputargs = vec![InputArg::new_int(0)];
-        let mut guard = mk_op(
+        let guard = mk_op(
             OpCode::GuardFalse,
             &[OpRef::input_arg_int(0)],
             OpRef::NONE.raw(),
@@ -17672,7 +17712,7 @@ mod tests {
 
         let bridge_fail_descr_arc = mk_test_resume_guard_descr(190, vec![Type::Int]);
         let bridge_fail_descr = bridge_fail_descr_arc.as_fail_descr().unwrap();
-        let mut bridge_guard = mk_op(
+        let bridge_guard = mk_op(
             OpCode::GuardFalse,
             &[OpRef::input_arg_int(0)],
             OpRef::NONE.raw(),
@@ -17742,7 +17782,7 @@ mod tests {
         let mut backend = CraneliftBackend::new();
 
         let inputargs = vec![InputArg::new_int(0)];
-        let mut root_guard = mk_op(
+        let root_guard = mk_op(
             OpCode::GuardFalse,
             &[OpRef::input_arg_int(0)],
             OpRef::NONE.raw(),
@@ -17808,7 +17848,7 @@ mod tests {
 
         let bridge_fail_descr_arc = mk_test_resume_guard_descr(290, vec![Type::Int]);
         let bridge_fail_descr = bridge_fail_descr_arc.as_fail_descr().unwrap();
-        let mut bridge_guard = mk_op(
+        let bridge_guard = mk_op(
             OpCode::GuardFalse,
             &[OpRef::input_arg_int(0)],
             OpRef::NONE.raw(),
@@ -18331,7 +18371,7 @@ mod tests {
         let descr = make_call_descr(vec![Type::Int], Type::Void);
 
         let inputargs = vec![InputArg::new_int(0)];
-        let mut guard = mk_op(OpCode::GuardException, &[OpRef::int_op(101)], 1);
+        let guard = mk_op(OpCode::GuardException, &[OpRef::int_op(101)], 1);
         guard.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
@@ -18379,7 +18419,7 @@ mod tests {
         let descr = make_call_descr(vec![Type::Int], Type::Void);
 
         let inputargs = vec![InputArg::new_int(0)];
-        let mut guard = mk_op(OpCode::GuardException, &[OpRef::int_op(101)], 1);
+        let guard = mk_op(OpCode::GuardException, &[OpRef::int_op(101)], 1);
         guard.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
@@ -18420,7 +18460,7 @@ mod tests {
         let descr = make_call_descr(vec![Type::Int], Type::Void);
 
         let inputargs = vec![InputArg::new_int(0)];
-        let mut guard = mk_op(OpCode::GuardNoException, &[], OpRef::NONE.raw());
+        let guard = mk_op(OpCode::GuardNoException, &[], OpRef::NONE.raw());
         guard.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
@@ -18471,7 +18511,7 @@ mod tests {
         let descr = make_call_descr(vec![Type::Int], Type::Void);
 
         let inputargs = vec![InputArg::new_int(0)];
-        let mut guard = mk_op(OpCode::GuardNoException, &[], OpRef::NONE.raw());
+        let guard = mk_op(OpCode::GuardNoException, &[], OpRef::NONE.raw());
         guard.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
@@ -18526,7 +18566,7 @@ mod tests {
         let descr = make_call_descr(vec![Type::Int], Type::Void);
 
         let inputargs = vec![InputArg::new_int(0)];
-        let mut guard = mk_op(OpCode::GuardException, &[OpRef::int_op(101)], 3);
+        let guard = mk_op(OpCode::GuardException, &[OpRef::int_op(101)], 3);
         guard.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
@@ -18598,7 +18638,7 @@ mod tests {
         let descr = make_call_descr(vec![Type::Int], Type::Void);
 
         let inputargs = vec![InputArg::new_int(0)];
-        let mut guard = mk_op(OpCode::GuardNoException, &[], OpRef::NONE.raw());
+        let guard = mk_op(OpCode::GuardNoException, &[], OpRef::NONE.raw());
         guard.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
@@ -20568,7 +20608,7 @@ mod tests {
         let mut backend = CraneliftBackend::new();
 
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
-        let mut guard_op = mk_op(
+        let guard_op = mk_op(
             OpCode::GuardTrue,
             &[OpRef::input_arg_int(0)],
             OpRef::NONE.raw(),
@@ -20664,7 +20704,7 @@ mod tests {
             InputArg::new_float(1),
             InputArg::new_ref(2),
         ];
-        let mut guard_op = mk_op(
+        let guard_op = mk_op(
             OpCode::GuardTrue,
             &[OpRef::input_arg_int(0)],
             OpRef::NONE.raw(),
@@ -20714,7 +20754,7 @@ mod tests {
             InputArg::new_float(2),
             InputArg::new_ref(3),
         ];
-        let mut guard_op = mk_op(
+        let guard_op = mk_op(
             OpCode::GuardTrue,
             &[OpRef::input_arg_int(0)],
             OpRef::NONE.raw(),
@@ -20914,7 +20954,7 @@ mod tests {
         let mut backend = CraneliftBackend::new();
         let descr = make_call_descr(vec![Type::Ref, Type::Int], Type::Void);
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
-        let mut guard_op = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.raw());
+        let guard_op = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.raw());
         guard_op.setfailargs(smallvec::smallvec![
             rb(OpRef::input_arg_int(1)),
             rb(OpRef::input_arg_int(0)),
@@ -20990,7 +21030,7 @@ mod tests {
         let mut backend = CraneliftBackend::new();
         let descr = make_call_descr(vec![Type::Ref, Type::Int], Type::Void);
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
-        let mut guard_op = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.raw());
+        let guard_op = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.raw());
         guard_op.setfailargs(smallvec::smallvec![
             rb(OpRef::input_arg_int(1)),
             rb(OpRef::input_arg_int(0)),
@@ -21065,7 +21105,7 @@ mod tests {
         // and its guard) must be rejected at compile time.
         let descr = make_call_descr(vec![Type::Ref, Type::Int], Type::Int);
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
-        let mut guard_op = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.raw());
+        let guard_op = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.raw());
         guard_op.setfailargs(smallvec::smallvec![
             rb(OpRef::input_arg_int(1)),
             rb(OpRef::int_op(3)),
@@ -21124,7 +21164,7 @@ mod tests {
         let mut backend = CraneliftBackend::new();
         let descr = make_call_descr(vec![Type::Ref, Type::Int], Type::Int);
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
-        let mut guard_op = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.raw());
+        let guard_op = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.raw());
         guard_op.setfailargs(smallvec::smallvec![
             rb(OpRef::input_arg_int(1)),
             rb(OpRef::int_op(3)),
@@ -21195,7 +21235,7 @@ mod tests {
         let mut backend = CraneliftBackend::new();
         let descr = make_call_descr(vec![Type::Ref, Type::Int], Type::Float);
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
-        let mut guard_op = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.raw());
+        let guard_op = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.raw());
         guard_op.setfailargs(smallvec::smallvec![
             rb(OpRef::input_arg_int(1)),
             rb(OpRef::float_op(3)),
@@ -21638,7 +21678,7 @@ mod tests {
         let loop_descr = make_label_descr(1500_260);
 
         let inputargs = vec![InputArg::new_int(0)];
-        let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(1)], OpRef::NONE.raw());
+        let guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(1)], OpRef::NONE.raw());
         guard.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
         let root_ops = vec![
             mk_op_with_descr(
@@ -21712,7 +21752,7 @@ mod tests {
         let loop_descr = make_label_descr(1500_259);
 
         let inputargs = vec![InputArg::new_int(0)];
-        let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(1)], OpRef::NONE.raw());
+        let guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(1)], OpRef::NONE.raw());
         guard.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
         let root_ops = vec![
             mk_op_with_descr(
@@ -21789,7 +21829,7 @@ mod tests {
             InputArg::new_int(1),
             InputArg::new_ref(2),
         ];
-        let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(4)], OpRef::NONE.raw());
+        let guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(4)], OpRef::NONE.raw());
         guard.setfailargs(smallvec::smallvec![
             rb(OpRef::input_arg_ref(0)),
             rb(OpRef::input_arg_int(1)),
@@ -21889,7 +21929,7 @@ mod tests {
         let body_descr = make_label_descr(1500_266);
 
         let inputargs = vec![InputArg::new_int(0)];
-        let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(1)], OpRef::NONE.raw());
+        let guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(1)], OpRef::NONE.raw());
         guard.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
         let root_ops = vec![
             mk_op_with_descr(
@@ -21974,7 +22014,7 @@ mod tests {
         let final_descr = make_label_descr(1500_270);
 
         let inputargs = vec![InputArg::new_int(0)];
-        let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(1)], OpRef::NONE.raw());
+        let guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(1)], OpRef::NONE.raw());
         guard.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
         let root_ops = vec![
             mk_op_with_descr(
@@ -22087,7 +22127,7 @@ mod tests {
         let final_descr = make_label_descr(1500_282);
 
         let inputargs = vec![InputArg::new_int(0)];
-        let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(1)], OpRef::NONE.raw());
+        let guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(1)], OpRef::NONE.raw());
         guard.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
         let root_ops = vec![
             mk_op_with_descr(
@@ -22205,7 +22245,7 @@ mod tests {
         let final_descr = make_label_descr(1500_291);
 
         let inputargs = vec![InputArg::new_int(0)];
-        let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw());
+        let guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw());
         guard.setfailargs(smallvec::smallvec![rb(OpRef::int_op(1))]);
         let root_ops = vec![
             // Peeled preamble: runs once on the initial host entry, before the
@@ -22695,7 +22735,7 @@ mod tests {
         backend.set_constants(consts);
         let size_arg = OpRef::int_op(10000);
         let inputargs = vec![];
-        let mut guard = mk_op(OpCode::GuardNonnull, &[OpRef::ref_op(2)], OpRef::NONE.raw());
+        let guard = mk_op(OpCode::GuardNonnull, &[OpRef::ref_op(2)], OpRef::NONE.raw());
         guard.setfailargs(smallvec::smallvec![
             rb(OpRef::ref_op(0)),
             rb(OpRef::ref_op(1)),
@@ -23468,7 +23508,7 @@ mod tests {
         let mut backend = CraneliftBackend::new();
 
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
-        let mut guard1 = mk_op(
+        let guard1 = mk_op(
             OpCode::GuardTrue,
             &[OpRef::input_arg_int(0)],
             OpRef::NONE.raw(),
@@ -23482,7 +23522,7 @@ mod tests {
             &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
             2,
         );
-        let mut guard2 = mk_op(OpCode::GuardFalse, &[OpRef::int_op(2)], OpRef::NONE.raw());
+        let guard2 = mk_op(OpCode::GuardFalse, &[OpRef::int_op(2)], OpRef::NONE.raw());
         guard2.setfailargs(smallvec::smallvec![rb(OpRef::int_op(2))]);
         let ops = vec![
             mk_op(
@@ -23537,7 +23577,7 @@ mod tests {
             InputArg::new_ref(1),
             InputArg::new_float(2),
         ];
-        let mut guard = mk_op(
+        let guard = mk_op(
             OpCode::GuardTrue,
             &[OpRef::input_arg_int(0)],
             OpRef::NONE.raw(),
@@ -23609,7 +23649,7 @@ mod tests {
             ),
             mk_op(OpCode::IntGt, &[OpRef::int_op(1), OpRef::int_op(101)], 2),
             {
-                let mut g = mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw());
+                let g = mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw());
                 g.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
                 g
             },

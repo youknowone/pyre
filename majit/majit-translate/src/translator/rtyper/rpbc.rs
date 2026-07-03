@@ -18,6 +18,7 @@
 //! `jtransform` only sees `OpKind::IndirectCall` for indirect dispatch.
 
 #![allow(private_interfaces)]
+#![cfg_attr(test, allow(non_snake_case))]
 
 use std::cell::RefCell;
 use std::collections::HashMap;

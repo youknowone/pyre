@@ -248,6 +248,7 @@ struct MismatchedTypedState {
     acc: f64,
 }
 
+#[expect(dead_code, reason = "fixture type used by trait impl parity coverage")]
 struct TypedRestoreOnlyState {
     frame: usize,
     acc: f64,
@@ -417,6 +418,7 @@ impl JitState for VirtualizableSyncState {
     }
 }
 
+#[expect(dead_code, reason = "fixture type used by trait impl parity coverage")]
 struct NamedVirtualizableSyncState {
     frame: usize,
     stack: i64,
@@ -427,12 +429,17 @@ struct NamedVirtualizableSyncState {
 }
 
 #[repr(C)]
+#[expect(
+    dead_code,
+    reason = "heap-layout fixture for auto-virtualizable parity"
+)]
 struct AutoVirtualizableFrame {
     token: u64,
     stackpos: i64,
     stack_ptr: *mut u8,
 }
 
+#[expect(dead_code, reason = "fixture type used by trait impl parity coverage")]
 struct AutoVirtualizableState {
     frame: usize,
     stackpos: i64,

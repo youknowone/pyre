@@ -137,7 +137,7 @@ mod tests {
     fn test_loop_sum() {
         // sum = 0; i = 10; while i > 0: sum += i; i -= 1
         // Exercises: Jump, JumpIfFalse, StoreVar, LoadVar, Sub, Add, Gt
-        let prog = vec![
+        let _prog = vec![
             ByteCode::LoadConst(0),  //  0: push 0
             ByteCode::StoreVar(0),   //  1: sum = 0     (var a)
             ByteCode::LoadConst(10), //  2: push 10
@@ -159,7 +159,7 @@ mod tests {
                                        // Re-layout with correct targets:
         ];
         // Correct layout:
-        let prog = vec![
+        let _prog = vec![
             ByteCode::LoadConst(0),  //  0
             ByteCode::StoreVar(0),   //  1: sum = 0
             ByteCode::LoadConst(10), //  2

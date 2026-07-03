@@ -105,6 +105,7 @@ pub fn singlefloat2int(x: f32) -> i64 {
     x.to_bits() as i32 as i64
 }
 
+#[cfg(target_pointer_width = "64")]
 fn compute_hash_float(f: f64) -> i64 {
     if !f.is_finite() {
         if f.is_infinite() {
@@ -142,6 +143,7 @@ fn signed_intmask(x: i64) -> i64 {
     }
 }
 
+#[cfg(target_pointer_width = "64")]
 fn frexp(f: f64) -> (f64, i32) {
     debug_assert!(f.is_finite());
     debug_assert_ne!(f, 0.0);

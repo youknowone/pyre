@@ -526,6 +526,13 @@ fn wasm_jitframe_tid() -> u32 {
 /// marked bit, so marking those indices exposes each home's `GcRef` (the high
 /// word stays unmarked). Returns `[data_word_count, word0, ...]` in `usize`
 /// words (GCMAP array layout: `gcmap[0]` = number of data words).
+#[cfg_attr(
+    not(target_arch = "wasm32"),
+    expect(
+        dead_code,
+        reason = "native test builds compile the wasm backend without running wasm frame entry"
+    )
+)]
 fn build_home_gcmap(home_count: usize) -> Box<[usize]> {
     let sign = std::mem::size_of::<isize>();
     let bits_per_word = std::mem::size_of::<usize>() * 8;

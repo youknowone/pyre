@@ -1275,6 +1275,10 @@ pub(crate) mod test_support {
 
     /// InputArg counterpart of [`bound_resop_operand`]: a self-rooting
     /// `Operand::InputArg` at `index`.
+    #[expect(
+        dead_code,
+        reason = "test-support helper retained for external fixture builders"
+    )]
     pub(crate) fn bound_inputarg_operand(tp: Type, index: u32) -> crate::operand::Operand {
         let (b, _ia) = bound_inputarg_box(tp, index);
         crate::operand::Operand::from_boxref(&b)
@@ -1372,6 +1376,7 @@ mod tests {
     /// InputArg counterpart of `bound_resop` — binds a fresh `BoxRef::new_inputarg`
     /// to a fresh `InputArgRc` so writes land on `inputarg.forwarded`
     /// (resoperation.py:700).
+    #[expect(dead_code, reason = "test helper retained for bound inputarg coverage")]
     fn bound_inputarg(tp: Type, index: u32) -> (BoxRef, InputArgRc) {
         let b = BoxRef::new_inputarg(tp, index);
         let ia = std::rc::Rc::new(InputArg::from_type(tp, index));

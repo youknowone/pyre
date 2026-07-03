@@ -60,6 +60,10 @@ fn test_functions_still_callable() {
 
 #[jit_module]
 mod empty_module {
+    #[expect(
+        dead_code,
+        reason = "plain function is intentionally skipped by jit_module discovery"
+    )]
     pub fn plain_fn() -> i64 {
         42
     }
@@ -176,6 +180,10 @@ mod impl_walk_module {
         }
 
         // No JIT attribute — must be skipped by discovery.
+        #[expect(
+            dead_code,
+            reason = "plain method is intentionally skipped by jit_module discovery"
+        )]
         pub fn ignore_me(_x: i64) -> i64 {
             0
         }

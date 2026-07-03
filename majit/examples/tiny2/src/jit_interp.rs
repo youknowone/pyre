@@ -78,6 +78,10 @@ struct Tiny2State {
 
 pub type Bytecode = [u8];
 
+#[expect(
+    dead_code,
+    reason = "the jit_interp macro resolves bytecode reads through this trait surface"
+)]
 trait BytecodeExt {
     fn get_op(&self, pc: usize) -> u8;
 }
@@ -103,7 +107,7 @@ fn mainloop(program: &Bytecode, num_args: usize, args_out: &mut [i64], threshold
     let mut driver: majit_metainterp::JitDriver<Tiny2State> =
         majit_metainterp::JitDriver::new(threshold);
     let mut pc: usize = 0;
-    let mut stacksize: i32 = 0;
+    let stacksize: i32 = 0;
     let mut state = Tiny2State {
         stackpos: num_args as i64,
         stack: vec![0i64; program.len()],

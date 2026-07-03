@@ -160,6 +160,7 @@ const ADDRESSABLE_SIZE: f64 = 9_223_372_036_854_775_808.0; // 2**63
 /// env.py:100-110 `get_total_memory_darwin`. Clamp the probed total memory:
 /// fall back to the addressable size when the probe failed (`<= 0`) and cap it
 /// at the addressable size otherwise.
+#[cfg(target_os = "macos")]
 fn get_total_memory_darwin(result: i64) -> f64 {
     if result <= 0 {
         ADDRESSABLE_SIZE

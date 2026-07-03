@@ -64,15 +64,40 @@ mod imports {
 pub fn compile_module(wasm_bytes: &[u8]) -> u32 {
     let ptr = wasm_bytes.as_ptr() as u32;
     let len = wasm_bytes.len() as u32;
-    unsafe { imports::jit_compile_wasm(ptr, len) }
+    #[cfg(feature = "web")]
+    {
+        imports::jit_compile_wasm(ptr, len)
+    }
+    #[cfg(not(feature = "web"))]
+    {
+        unsafe { imports::jit_compile_wasm(ptr, len) }
+    }
 }
 
 /// Execute a compiled JIT function with the given frame pointer.
 pub fn execute(func_id: u32, frame_ptr: u32) -> u32 {
-    unsafe { imports::jit_execute_wasm(func_id, frame_ptr) }
+    #[cfg(feature = "web")]
+    {
+        imports::jit_execute_wasm(func_id, frame_ptr)
+    }
+    #[cfg(not(feature = "web"))]
+    {
+        unsafe { imports::jit_execute_wasm(func_id, frame_ptr) }
+    }
 }
 
 /// Free a compiled JIT function.
+#[expect(
+    dead_code,
+    reason = "host bindings expose free for embedder parity even though the backend does not call it yet"
+)]
 pub fn free(func_id: u32) {
-    unsafe { imports::jit_free_wasm(func_id) }
+    #[cfg(feature = "web")]
+    {
+        imports::jit_free_wasm(func_id)
+    }
+    #[cfg(not(feature = "web"))]
+    {
+        unsafe { imports::jit_free_wasm(func_id) }
+    }
 }

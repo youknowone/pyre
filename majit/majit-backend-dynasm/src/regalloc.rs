@@ -6032,21 +6032,21 @@ fn loc_eq(a: &Loc, b: &Loc) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use majit_ir::VecMap;
+
     use majit_ir::operand::Operand;
-    use majit_ir::{InputArg, Op, OpCode, OpRc, OpRef, Type};
+    use majit_ir::{InputArg, Op, OpCode, OpRef, Type};
 
     use majit_ir::box_ref::bound_operand_from_opref as rb;
 
     fn make_op(opcode: OpCode, pos: u32, args: &[OpRef]) -> Op {
         let bx: Vec<Operand> = args.iter().map(|a| rb(*a)).collect();
-        let mut op = Op::new(opcode, &bx);
+        let op = Op::new(opcode, &bx);
         op.pos.set(OpRef::int_op(pos));
         op
     }
 
     fn make_guard(opcode: OpCode, pos: u32, args: &[OpRef], fail_args: &[OpRef]) -> Op {
-        let mut op = make_op(opcode, pos, args);
+        let op = make_op(opcode, pos, args);
         op.setfailargs(fail_args.iter().map(|a| rb(*a)).collect());
         op
     }
@@ -6204,14 +6204,14 @@ mod tests {
 
         let inputargs = vec![InputArg::from_type(Type::Int, i0.raw())];
 
-        let mut add = Op::new(OpCode::IntAdd, &[rb(i0), rb(c1)]);
+        let add = Op::new(OpCode::IntAdd, &[rb(i0), rb(c1)]);
         add.pos.set(i1);
-        let mut is_true = Op::new(OpCode::IntIsTrue, &[rb(i1)]);
+        let is_true = Op::new(OpCode::IntIsTrue, &[rb(i1)]);
         is_true.pos.set(i2);
-        let mut guard = Op::new(OpCode::GuardTrue, &[rb(i2)]);
+        let guard = Op::new(OpCode::GuardTrue, &[rb(i2)]);
         guard.pos.set(OpRef::int_op(3));
         guard.setfailargs(vec![rb(i1)].into());
-        let mut finish = Op::new(OpCode::Finish, &[]);
+        let finish = Op::new(OpCode::Finish, &[]);
         finish.pos.set(OpRef::int_op(4));
         finish.setfailargs(vec![].into());
         finish.set_fail_arg_types(vec![]);
@@ -6298,9 +6298,9 @@ mod tests {
             InputArg::from_type(Type::Int, i1.raw()),
         ];
 
-        let mut raw = Op::new(OpCode::IntIsTrue, &[rb(i0)]);
+        let raw = Op::new(OpCode::IntIsTrue, &[rb(i0)]);
         raw.pos.set(i2);
-        let mut finish = Op::new(OpCode::Finish, &[rb(i1)]);
+        let finish = Op::new(OpCode::Finish, &[rb(i1)]);
         finish.pos.set(OpRef::int_op(3));
         let ops = vec![raw, finish];
 
@@ -6342,10 +6342,10 @@ mod tests {
             InputArg::from_type(Type::Int, i1.raw()),
         ];
 
-        let mut raw = Op::new(OpCode::GuardTrue, &[rb(i0)]);
+        let raw = Op::new(OpCode::GuardTrue, &[rb(i0)]);
         raw.pos.set(OpRef::int_op(2));
         raw.setfailargs(vec![].into());
-        let mut finish = Op::new(OpCode::Finish, &[rb(i1)]);
+        let finish = Op::new(OpCode::Finish, &[rb(i1)]);
         finish.pos.set(OpRef::int_op(3));
         let ops = vec![raw, finish];
 
@@ -6379,9 +6379,9 @@ mod tests {
             InputArg::from_type(Type::Ref, i1.raw()),
         ];
 
-        let mut raw = Op::new(OpCode::GcLoadI, &[rb(i0), rb(c0), rb(c8)]);
+        let raw = Op::new(OpCode::GcLoadI, &[rb(i0), rb(c0), rb(c8)]);
         raw.pos.set(i2);
-        let mut finish = Op::new(OpCode::Finish, &[rb(i1)]);
+        let finish = Op::new(OpCode::Finish, &[rb(i1)]);
         finish.pos.set(OpRef::int_op(3));
         let ops = vec![raw, finish];
 
@@ -6424,7 +6424,7 @@ mod tests {
         ];
 
         let raw = Op::new(OpCode::GcStore, &[rb(i0), rb(c0), rb(i2), rb(c8)]);
-        let mut finish = Op::new(OpCode::Finish, &[rb(i1)]);
+        let finish = Op::new(OpCode::Finish, &[rb(i1)]);
         finish.pos.set(OpRef::int_op(3));
         let ops = vec![raw, finish];
 
@@ -6460,9 +6460,9 @@ mod tests {
             InputArg::from_type(Type::Int, i1.raw()),
         ];
 
-        let mut raw = Op::new(OpCode::SameAsI, &[rb(i0)]);
+        let raw = Op::new(OpCode::SameAsI, &[rb(i0)]);
         raw.pos.set(i2);
-        let mut finish = Op::new(OpCode::Finish, &[rb(i1)]);
+        let finish = Op::new(OpCode::Finish, &[rb(i1)]);
         finish.pos.set(OpRef::int_op(3));
         let ops = vec![raw, finish];
 

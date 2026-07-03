@@ -46,7 +46,7 @@ fn mainloop(program: &Code, num_regs: usize, threshold: u32) -> i64 {
         COMPILES.fetch_add(1, Ordering::Relaxed);
     });
     let mut pc: usize = 0;
-    let mut stacksize: i32 = 0;
+    let _stacksize: i32 = 0;
     let mut state = VmState {
         regs: vec![0; num_regs],
     };

@@ -6,6 +6,7 @@ use std::time::Instant;
 
 /// Mandelbrot set in Brainfuck (compact version).
 /// Source: https://github.com/erikdubbelboer/brainfuck-jit
+#[expect(dead_code, reason = "kept as the benchmark corpus fixture")]
 const MANDELBROT: &[u8] = b"+++++++++++++[->++>>>+++++>++>+<<<<<<]>>>>>++++++>--->>>>>>>\
 ++++++++[->+++++++++<]>[->+>+>+>+<<<<]+++>>+>+>+++++[>++>++++++<<-]+>>+>+>>>>>++>++>++>+\
 +>++>++>++>++>++>++<<<<<<<<<<<<<<<[>[->+<]>[-<+>>>>+<<<]>>>>>[->>>>>>>>>+<<<<<<<<<]>>>>>>\

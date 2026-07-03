@@ -6,6 +6,10 @@ use crate::interp::{ADD, JUMP_IF_ABOVE, LOAD, RETURN};
 
 pub type Bytecode = [u8];
 
+#[expect(
+    dead_code,
+    reason = "the jit_interp macro resolves bytecode reads through this trait surface"
+)]
 trait BytecodeExt {
     fn get_op(&self, pc: usize) -> u8;
 }
@@ -45,7 +49,7 @@ fn mainloop(
     let mut driver: majit_metainterp::JitDriver<TinyFrameState> =
         majit_metainterp::JitDriver::new(threshold);
     let mut pc: usize = 0;
-    let mut stacksize: i32 = 0;
+    let _stacksize: i32 = 0;
     let mut state = TinyFrameState {
         regs: vec![0; num_regs],
     };

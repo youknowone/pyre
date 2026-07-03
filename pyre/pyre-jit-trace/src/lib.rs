@@ -1,6 +1,7 @@
 #![allow(
     dead_code,
     non_snake_case,
+    private_interfaces,
     unsafe_op_in_unsafe_fn,
     unused_doc_comments,
     unused_imports,

@@ -46,9 +46,12 @@ mod custom_getrandom {
     }
 }
 
+#[cfg(any(feature = "web", feature = "wasm-host"))]
 use pyre_interpreter::*;
 
+#[cfg(any(feature = "web", feature = "wasm-host"))]
 use std::cell::RefCell;
+#[cfg(any(feature = "web", feature = "wasm-host"))]
 use std::sync::Once;
 
 // Diagnostic counting allocator (feature `heap-prof`): wraps the platform
@@ -334,8 +337,10 @@ pub extern "C" fn pyre_jit_set_wasm_ca(enabled: u32) {
     majit_backend_wasm::set_wasm_ca_enabled(enabled != 0);
 }
 
+#[cfg(any(feature = "web", feature = "wasm-host"))]
 static PANIC_HOOK: Once = Once::new();
 
+#[cfg(any(feature = "web", feature = "wasm-host"))]
 fn install_panic_hook() {
     PANIC_HOOK.call_once(|| {
         std::panic::set_hook(Box::new(|info| {
@@ -350,10 +355,12 @@ fn install_panic_hook() {
     });
 }
 
+#[cfg(any(feature = "web", feature = "wasm-host"))]
 thread_local! {
     static OUTPUT_BUF: RefCell<String> = RefCell::new(String::new());
 }
 
+#[cfg(any(feature = "web", feature = "wasm-host"))]
 fn install_wasm_print_hook() {
     pyre_interpreter::set_print_hook(|s| {
         OUTPUT_BUF.with(|buf| buf.borrow_mut().push_str(s));
@@ -364,6 +371,7 @@ fn install_wasm_print_hook() {
 ///
 /// Host-agnostic core shared by the `web` (wasm-bindgen) and `wasm-host`
 /// (C-ABI) entry points below.
+#[cfg(any(feature = "web", feature = "wasm-host"))]
 fn run_python_impl(source: &str) -> String {
     install_panic_hook();
     #[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
