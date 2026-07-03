@@ -3010,7 +3010,7 @@ impl<'a> Lowering<'a> {
                 // consumes the rvalue, so `.N` reads of the local can
                 // later emit a symmetric `FieldRead __pos_<N>` carrying
                 // the same owner (see `resolve_place`).
-                let positional_owner = self.positional_aggregate_owner(&rvalue);
+                let positional_owner = self.positional_aggregate_owner(&rvalue, &dest_ty);
                 let (op, result_var) = self.build_rvalue(mir_bb, rvalue, &dest_ty)?;
                 // The destination local takes on the freshly-minted
                 // result Variable. Subsequent reads of the local
@@ -3746,10 +3746,27 @@ impl<'a> Lowering<'a> {
                         (owner_path, ctor_name, field_names)
                     }
                     None => {
-                        let leaf = aggregate_ctor_name(&kind);
                         // Synthetic placeholders for non-Adt aggregates
                         // (`Tuple`, `Array`, `Closure`) — they have no
-                        // user-defined class to resolve into.
+                        // user-defined class to resolve into.  A non-empty
+                        // tuple carries its per-shape `<…>` suffix (gate) so
+                        // its `__pos_N` attrs do not collide with other-shape
+                        // tuples on one global class; the suffix matches
+                        // `positional_aggregate_owner` (Site-A reads) and
+                        // `tyref_tuple_suffix` (Site-B reads).
+                        // The per-shape `<…>` suffix is rendered from the
+                        // destination place type, not the `AggregateKind` head:
+                        // Charon's `AggregateKind::Adt(Tuple, …)` carries no
+                        // element `types`, so keying off it would spell a bare
+                        // `Tuple` on the write while the `.N` projection reads
+                        // (which do see `place.ty`'s element types) spell the
+                        // suffixed owner — a write/read owner split.  `dest_ty`
+                        // is that same `place.ty`, so both sides agree.
+                        let leaf = format!(
+                            "{}{}",
+                            aggregate_ctor_name(&kind),
+                            tyref_tuple_suffix(dest_ty, self.llbc)
+                        );
                         let positional =
                             (0..arg_vars.len()).map(|i| format!("__pos_{i}")).collect();
                         (Vec::new(), leaf, positional)
@@ -4194,6 +4211,13 @@ impl<'a> Lowering<'a> {
                         }
                         // idx == 0: fall through to the base-collapse below.
                     } else {
+                        // Same spelling the construction-side FieldWrite
+                        // chain records for builtin tuple aggregates
+                        // (`aggregate_ctor_name` id atom + the per-shape
+                        // `<…>` suffix rendered from this tuple's element
+                        // types), so read and write attrs key under one
+                        // owner.
+                        let owner = format!("Tuple{}", tyref_tuple_suffix(&inner.ty, self.llbc));
                         let base = self.resolve_place(mir_bb, *inner)?;
                         let bb_id = self.block_id[mir_bb];
                         let ty = tyref_to_value_type(&place_ty, self.llbc);
@@ -4204,15 +4228,7 @@ impl<'a> Lowering<'a> {
                             result: Some(res.clone()),
                             kind: OpKind::FieldRead {
                                 base,
-                                field: FieldDescriptor::new(
-                                    format!("__pos_{idx}"),
-                                    // Same spelling the construction-side
-                                    // FieldWrite chain records for builtin
-                                    // tuple aggregates (`aggregate_ctor_name`
-                                    // id atom), so read and write attrs key
-                                    // under one owner.
-                                    Some("Tuple".to_string()),
-                                ),
+                                field: FieldDescriptor::new(format!("__pos_{idx}"), Some(owner)),
                                 ty,
                                 pure: false,
                             },
@@ -4356,10 +4372,18 @@ impl<'a> Lowering<'a> {
     /// Returns `None` for Adt aggregates: their `.field` reads already
     /// take the typed [`Self::resolve_adt_field`] path and never reach
     /// the collapse fallback.
-    fn positional_aggregate_owner(&self, rvalue: &Rvalue) -> Option<String> {
+    fn positional_aggregate_owner(&self, rvalue: &Rvalue, dest_ty: &TyRef) -> Option<String> {
         match rvalue {
             Rvalue::Aggregate(kind, _) if self.resolve_aggregate_adt(kind).is_none() => {
-                Some(aggregate_ctor_name(kind))
+                // Suffix from `dest_ty` (the tuple `place.ty`, element types
+                // present), matching the construction-side `build_rvalue`
+                // owner and the Site-B projection read; the `AggregateKind`
+                // head carries no element `types`.
+                Some(format!(
+                    "{}{}",
+                    aggregate_ctor_name(kind),
+                    tyref_tuple_suffix(dest_ty, self.llbc)
+                ))
             }
             _ => None,
         }
@@ -6007,8 +6031,7 @@ impl<'a> Lowering<'a> {
             && second_arg_ty
                 .as_ref()
                 .is_some_and(|t| tyref_is_opaque_bigint(t, self.llbc))
-            && let Some(residual) =
-                crate::front::bigint_binop::bigint_binop_residual_path(segments)
+            && let Some(residual) = crate::front::bigint_binop::bigint_binop_residual_path(segments)
         {
             OpKind::Call {
                 target: CallTarget::FunctionPath { segments: residual },
@@ -6041,8 +6064,7 @@ impl<'a> Lowering<'a> {
                     ValueType::Int | ValueType::Unsigned
                 )
             })
-            && let Some(residual) =
-                crate::front::bigint_binop::bigint_shift_residual_path(segments)
+            && let Some(residual) = crate::front::bigint_binop::bigint_shift_residual_path(segments)
         {
             OpKind::Call {
                 target: CallTarget::FunctionPath { segments: residual },
@@ -11521,6 +11543,66 @@ fn render_adt_type_args(
                 .filter(|s| s != "Global" && s != "RandomState")
                 .collect()
         })
+        .unwrap_or_default()
+}
+
+/// A non-empty synthetic tuple aggregate's classdef carries a `<T0,T1,…>`
+/// suffix rendered from its element types, so `(BigInt,BigInt)` and `(f64,f64)`
+/// get distinct classdefs instead of colliding on the shared `__pos_N`
+/// attributes of one global `Tuple` class — the `generalize_attr` UnionError
+/// that walls every graph mixing tuple element categories (`bigint_truediv`,
+/// …) off the two-phase rtyper.  On by default; `PYRE_TUPLE_PER_SHAPE_CLASSDEF=0`
+/// is the kill switch that restores the single global `Tuple` classdef.
+fn tuple_per_shape_enabled() -> bool {
+    !matches!(
+        std::env::var("PYRE_TUPLE_PER_SHAPE_CLASSDEF").as_deref(),
+        Ok("0") | Ok("false")
+    )
+}
+
+/// The per-shape `<…>` suffix for a synthetic tuple whose Charon ADT
+/// descriptor is `adt` (`{"id":"Tuple","generics":{"types":[…]}}`), or `""`
+/// when the gate is off, `adt` is not a `"Tuple"`, or the tuple is the unit
+/// `()` (empty type list — kept bare `"Tuple"` so the unit-value special-cases
+/// in `jtransform` / `unit_variant_fold` still match).  Rendered via the same
+/// [`render_adt_type_args`] both the construction and the projection derive
+/// from the tuple's `place.ty` node (NOT the element-type-less `AggregateKind`
+/// head), so the `__pos_N` read and write owners agree.
+fn tuple_shape_suffix(adt: &serde_json::Map<String, serde_json::Value>, llbc: &Llbc) -> String {
+    if !tuple_per_shape_enabled() {
+        return String::new();
+    }
+    if adt.get("id").and_then(serde_json::Value::as_str) != Some("Tuple") {
+        return String::new();
+    }
+    let args = render_adt_type_args(adt, llbc, 0);
+    if args.is_empty() {
+        return String::new();
+    }
+    format!("<{}>", args.join(","))
+}
+
+/// The per-shape tuple suffix for a place/operand [`TyRef`] — used by BOTH the
+/// construction side (the aggregate's destination `place.ty`) and the
+/// projection side (the read place's `.ty`), where the tuple type is `ty`'s
+/// `{"Adt": {"id":"Tuple", …}}` node.  Keying both off the same `place.ty`
+/// source (rather than the element-type-less `AggregateKind` head) makes the
+/// `__pos_N` write and read owners agree.  `""` for non-tuple / gate-off /
+/// unit; see [`tuple_shape_suffix`].
+fn tyref_tuple_suffix(ty: &TyRef, llbc: &Llbc) -> String {
+    let value = match ty {
+        TyRef::Inline { value: (_, v) } => v,
+        TyRef::Other(v) => v,
+        TyRef::Dedup { id } => match llbc.dedup_body(*id) {
+            Some(v) => v,
+            None => return String::new(),
+        },
+    };
+    value
+        .as_object()
+        .and_then(|m| m.get("Adt"))
+        .and_then(serde_json::Value::as_object)
+        .map(|adt| tuple_shape_suffix(adt, llbc))
         .unwrap_or_default()
 }
 

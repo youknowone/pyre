@@ -4496,6 +4496,31 @@ impl FunctionGraph {
         self.alloc_value_var_with_type(ConcreteType::Unknown)
     }
 
+    /// The `__pos_N` field owner an existing read/write of `result_var`
+    /// already uses — the per-shape tuple classdef the projection side minted
+    /// (`Tuple<…>` under `PYRE_TUPLE_PER_SHAPE_CLASSDEF`, else bare `Tuple`).
+    /// A front synth that rebuilds a tuple bound to `result_var` keys its
+    /// `FieldWrite` owner off this so writes match the destructure reads
+    /// whether the per-shape suffix is on or off. Defaults to `"Tuple"` when
+    /// no positional access of `result_var` is present.
+    pub(crate) fn tuple_owner_for_var(
+        &self,
+        result_var: &crate::flowspace::model::Variable,
+    ) -> String {
+        self.blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .find_map(|op| match &op.kind {
+                OpKind::FieldRead { base, field, .. }
+                    if base == result_var && field.name.starts_with("__pos_") =>
+                {
+                    field.owner_root.clone()
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| "Tuple".to_string())
+    }
+
     /// Mint a fresh value [`crate::flowspace::model::Variable`] with its
     /// [`ConcreteType`] stamped at construction — pyre's analogue of
     /// upstream `Variable(concretetype=...)` (RPython

@@ -108,9 +108,12 @@ fn rewire_one_bigint_div_rem_site(
     };
 
     // --- Structural validation passed; splice the producer. ---
+    // Key the rebuilt tuple's `__pos_N` owner off the destructure reads so
+    // the writes land on the same (possibly per-shape-suffixed) classdef.
+    let owner = graph.tuple_owner_for_var(&site.result_var);
     let q = graph.alloc_value_var();
     let r = graph.alloc_value_var();
-    let inserts = build_div_rem_tuple(&site.result_var, num, den, q, r);
+    let inserts = build_div_rem_tuple(&site.result_var, num, den, q, r, &owner);
 
     let ops = &mut graph.blocks[a].operations;
     ops.remove(call_idx);
@@ -130,14 +133,14 @@ fn functionpath(segments: &[&str]) -> CallTarget {
 /// A synthetic-`Tuple` `__pos_<idx>` `FieldWrite` of a `Ref` element, matching
 /// the `Rvalue::Aggregate` non-Adt tuple chain (owner_root `"Tuple"`, element
 /// ty `Ref(None)`).
-fn tuple_field_write(base: &Variable, idx: usize, value: Variable) -> SpaceOperation {
+fn tuple_field_write(base: &Variable, idx: usize, value: Variable, owner: &str) -> SpaceOperation {
     SpaceOperation {
         result: None,
         kind: OpKind::FieldWrite {
             base: base.clone(),
             field: FieldDescriptor {
                 name: format!("__pos_{idx}"),
-                owner_root: Some("Tuple".to_string()),
+                owner_root: Some(owner.to_string()),
                 owner_id: None,
             },
             value: LinkArg::Value(value),
@@ -156,6 +159,7 @@ fn build_div_rem_tuple(
     den: Variable,
     q: Variable,
     r: Variable,
+    owner: &str,
 ) -> [SpaceOperation; 5] {
     [
         SpaceOperation {
@@ -177,13 +181,13 @@ fn build_div_rem_tuple(
         SpaceOperation {
             result: Some(result_var.clone()),
             kind: OpKind::Call {
-                target: CallTarget::synthetic_transparent_ctor("Tuple".to_string()),
+                target: CallTarget::synthetic_transparent_ctor(owner.to_string()),
                 args: Vec::new(),
-                result_ty: ValueType::Ref(Some("Tuple".to_string())),
+                result_ty: ValueType::Ref(Some(owner.to_string())),
             },
         },
-        tuple_field_write(result_var, 0, q),
-        tuple_field_write(result_var, 1, r),
+        tuple_field_write(result_var, 0, q, owner),
+        tuple_field_write(result_var, 1, r, owner),
     ]
 }
 
@@ -248,17 +252,26 @@ mod tests {
         );
         assert_eq!(rewritten, 1, "the div_rem site must be rewritten");
         assert_eq!(calls_to(&g, "div_rem"), 0, "residual div_rem call removed");
-        assert_eq!(calls_to(&g, "jit_bigint_div"), 1, "quotient residual emitted");
-        assert_eq!(calls_to(&g, "jit_bigint_rem"), 1, "remainder residual emitted");
+        assert_eq!(
+            calls_to(&g, "jit_bigint_div"),
+            1,
+            "quotient residual emitted"
+        );
+        assert_eq!(
+            calls_to(&g, "jit_bigint_rem"),
+            1,
+            "remainder residual emitted"
+        );
         // The aggregate: __pos_0 + __pos_1 writes on the result var.
         let pos_writes: Vec<usize> = g
             .blocks
             .iter()
             .flat_map(|blk| &blk.operations)
             .filter_map(|op| match &op.kind {
-                OpKind::FieldWrite { field, .. } if field.name.starts_with("__pos_") => {
-                    field.name.strip_prefix("__pos_").and_then(|n| n.parse().ok())
-                }
+                OpKind::FieldWrite { field, .. } if field.name.starts_with("__pos_") => field
+                    .name
+                    .strip_prefix("__pos_")
+                    .and_then(|n| n.parse().ok()),
                 _ => None,
             })
             .collect();
@@ -289,13 +302,13 @@ mod tests {
             .unwrap();
         g.set_return(a, None);
 
-        let rewritten = rewire_bigint_div_rem_call_sites(
-            &mut g,
-            &[BigIntDivRemSite {
-                result_var: result,
-            }],
-        );
+        let rewritten =
+            rewire_bigint_div_rem_call_sites(&mut g, &[BigIntDivRemSite { result_var: result }]);
         assert_eq!(rewritten, 0, "a non-binary producer declines");
-        assert_eq!(calls_to(&g, "div_rem"), 1, "residual call survives on decline");
+        assert_eq!(
+            calls_to(&g, "div_rem"),
+            1,
+            "residual call survives on decline"
+        );
     }
 }
