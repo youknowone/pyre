@@ -213,7 +213,13 @@ impl Trace {
     /// measured 0 hits across the corpus. `#[cfg(test)]` fixtures that build
     /// position-only synthetic operands bind a synthetic producer via
     /// `bound_from_opref` (`to_opref`-identical) rather than panicking.
-    fn box_for_operand(&self, r: OpRef) -> Operand {
+    /// Deterministic per recorded position: a ResOp / InputArg operand always
+    /// binds to the SAME producer `Rc` (`self.ops` / `self.inputargs` are dense
+    /// and immutable once recorded), so two calls for the same `OpRef` return
+    /// `Operand`s that compare equal under `Operand::eq` (`Rc::ptr_eq`). This is
+    /// the real box object — `MIFrame.registers_r` holds these in `pyjitpl.py` —
+    /// so consumers can key by box identity instead of flat `OpRef`.
+    pub(crate) fn box_for_operand(&self, r: OpRef) -> Operand {
         if r.is_none() || r.is_constant() {
             return Operand::from_opref(r);
         }
@@ -667,6 +673,33 @@ mod tests {
         rec.cut(saved);
         assert_eq!(rec.num_ops(), 0);
         assert_eq!(rec.num_inputargs(), 1);
+    }
+
+    #[test]
+    fn box_for_operand_is_deterministic_per_position() {
+        // The canonical Operand bridge must be stable per recorded position: the
+        // same OpRef always binds to the same producer Rc, so a consumer can key
+        // by box identity (Operand::eq = Rc::ptr_eq) instead of flat OpRef and
+        // still get the "same value -> same key" behaviour, matching the
+        // box-object-keyed dicts in heapcache.py / registers_r in pyjitpl.py.
+        let mut rec = Trace::new();
+        let i0 = rec.record_input_arg(Type::Int);
+        let i1 = rec.record_op(OpCode::IntAdd, &[i0, i0]);
+
+        // ResOp position: two calls resolve to the SAME producer box.
+        let a = rec.box_for_operand(i1);
+        let b = rec.box_for_operand(i1);
+        assert_eq!(a, b, "same position must yield ptr_eq-equal Operands");
+        assert_eq!(a.to_opref(), i1, "Operand round-trips to its OpRef");
+
+        // InputArg position: same invariant.
+        let ia_a = rec.box_for_operand(i0);
+        let ia_b = rec.box_for_operand(i0);
+        assert_eq!(ia_a, ia_b);
+        assert_eq!(ia_a.to_opref(), i0);
+
+        // Distinct positions are distinct boxes.
+        assert_ne!(rec.box_for_operand(i0), rec.box_for_operand(i1));
     }
 
     #[test]

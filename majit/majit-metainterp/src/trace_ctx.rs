@@ -1389,6 +1389,18 @@ impl TraceCtx {
     /// fields (history.py:680,696). The standard-virtualizable shadow
     /// restores the value of the portal's red-virtualizable inputarg
     /// whose Box identity is recycled across loop iterations.
+    /// Canonical `Operand` (box object) for a value `OpRef`. The trace-record
+    /// analogue of the box objects RPython holds in `MIFrame.registers_r`
+    /// (`pyjitpl.py`): it surfaces the recorder's real per-op `Rc<Op>` /
+    /// `Rc<InputArg>` identity so consumers can key by box identity
+    /// (`Operand::eq` = `Rc::ptr_eq`) rather than flat `OpRef` position, matching
+    /// the box-keyed dicts upstream (e.g. `heapcache.py` `cache_anything[ref_box]`).
+    /// Deterministic: the same recorded position always yields an `Operand`
+    /// wrapping the same producer `Rc`.
+    pub fn operand_for(&self, opref: OpRef) -> majit_ir::operand::Operand {
+        self.recorder.box_for_operand(opref)
+    }
+
     pub fn box_value(&self, opref: OpRef) -> Option<Value> {
         if let Some(v) = opref.inline_const_to_value() {
             return Some(v);
