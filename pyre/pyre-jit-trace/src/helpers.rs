@@ -228,13 +228,29 @@ pub fn emit_trace_call_void(ctx: &mut TraceCtx, helper: *const (), args: &[OpRef
     ctx.call_void(helper, args);
 }
 
-pub fn emit_trace_call_void_typed(
+/// Record a void residual whose hand-written `extern "C"` helper returns a
+/// dummy machine word (`-> i64`, value ignored) — the convention of this
+/// module's i64-ABI wrappers ([`jit_store_name_to_namespace`],
+/// [`jit_list_append`]). The word-ABI descr lets a signature-exact backend
+/// lowering (wasm direct `call_indirect`) call the helper in-module. A
+/// helper that genuinely returns `()` must use `ctx.call_void_typed`
+/// instead.
+///
+/// `effect_info`: these helpers write the heap (namespace cells, list
+/// storage), so the caller must supply the effect — normally
+/// `EffectInfo::MOST_GENERAL` (`graphanalyze.py:60
+/// analyze_external_call` top for an unanalyzed external writer).  The
+/// opcode-default empty write set would let optheap CSE a getfield
+/// across the call: `acc = acc + a; acc = acc + b` at module level then
+/// reuses the pre-store cell value and drops the first term.
+pub fn emit_trace_call_void_word_abi(
     ctx: &mut TraceCtx,
     helper: *const (),
     args: &[OpRef],
     arg_types: &[Type],
+    effect_info: majit_ir::EffectInfo,
 ) {
-    ctx.call_void_typed(helper, args, arg_types);
+    ctx.call_void_typed_word_abi(helper, args, arg_types, effect_info);
 }
 
 pub fn emit_trace_call_may_force_ref_typed(
@@ -371,11 +387,18 @@ pub fn emit_trace_store_name_to_namespace(
     value: OpRef,
 ) {
     let [name_ptr, name_len] = trace_name_args(ctx, name);
-    emit_trace_call_void_typed(
+    // The helper runs `w_dict_setitem_str` → ModuleDictStrategy
+    // `write_cell` — an in-place `ObjectMutableCell.w_value` write with
+    // no version bump, exactly what `load_name_value`'s cell fast path
+    // reads back as `GetfieldGcR(cell)`.  MOST_GENERAL makes the
+    // optimizer drop that field cache so the next LOAD re-reads the
+    // cell instead of reusing the pre-store value.
+    emit_trace_call_void_word_abi(
         ctx,
         jit_store_name_to_namespace as *const (),
         &[namespace, name_ptr, name_len, value],
         &[Type::Ref, Type::Int, Type::Int, Type::Ref],
+        majit_ir::EffectInfo::MOST_GENERAL,
     );
 }
 
@@ -622,11 +645,15 @@ pub trait TraceHelperAccess {
 
     fn trace_list_append(&mut self, list: OpRef, value: OpRef) -> Result<(), PyError> {
         self.with_trace_ctx(|ctx| {
-            emit_trace_call_void_typed(
+            // Writes the list's strategy storage (may also realloc it);
+            // see `emit_trace_call_void_word_abi` — an unanalyzed
+            // external writer records MOST_GENERAL.
+            emit_trace_call_void_word_abi(
                 ctx,
                 jit_list_append as *const (),
                 &[list, value],
                 &[Type::Ref, Type::Ref],
+                majit_ir::EffectInfo::MOST_GENERAL,
             );
         });
         self.trace_record_no_exception_guard();

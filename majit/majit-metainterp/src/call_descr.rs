@@ -546,6 +546,31 @@ pub fn make_call_descr_with_effect(
     result_type: Type,
     effect_info: EffectInfo,
 ) -> DescrRef {
+    let (result_signed, result_size) = result_metadata(result_type);
+    make_call_descr_sized(arg_types, result_type, result_signed, result_size, effect_info)
+}
+
+/// [`make_call_descr_with_effect`] variant for hand-written `extern "C"`
+/// helpers recorded as void residuals whose C signature actually RETURNS a
+/// dummy machine word (`fn(i64×n) -> i64`, value ignored). The descr keeps
+/// `result_type = Void` (the recorded op is `CallN` with no result box) but
+/// carries `result_size = 8` where a plain void descr carries 0, so a
+/// backend that emits signature-exact direct calls (wasm `call_indirect`)
+/// can select the `(i64×n) -> i64` type and drop the result. Reflective
+/// dispatch paths never read `result_size` for a void result, and the field
+/// participates in the interning key, so word-ABI descrs never collapse
+/// with plain void descrs of the same shape.
+pub fn make_call_descr_void_word_abi(arg_types: &[Type], effect_info: EffectInfo) -> DescrRef {
+    make_call_descr_sized(arg_types, Type::Void, false, 8, effect_info)
+}
+
+fn make_call_descr_sized(
+    arg_types: &[Type],
+    result_type: Type,
+    result_signed: bool,
+    result_size: usize,
+    effect_info: EffectInfo,
+) -> DescrRef {
     // `effectinfo.py:182-184` invariant: no new `EffectInfo` may be
     // constructed after `compute_bitstrings` has run; PyPy enforces this
     // implicitly through codewriter lifecycle ordering, with `Ellipsis`
@@ -569,7 +594,6 @@ pub fn make_call_descr_with_effect(
              runs (codewriter setup phase).\n  effect_info: {effect_info:?}"
         );
     }
-    let (result_signed, result_size) = result_metadata(result_type);
     // effectinfo.py:144-146: `if tgt_func: key += (object(),)  # don't
     // care about caching in this case` — release-gil targets bypass the
     // EffectInfo._cache via a fresh object() key.  The call descr still

@@ -3048,19 +3048,32 @@ impl TraceCtx {
         arg_types: &[Type],
         ret_type: Type,
     ) -> OpRef {
-        let func_ref = OpRef::const_int(func_ptr as usize as i64);
         let descr = crate::call_descr::make_call_descr_for_opcode(opcode, arg_types, ret_type);
+        self.record_call_with_descr(opcode, func_ptr, args, descr)
+    }
+
+    /// Shared record tail for the `call_*_typed` family: prepend the funcbox,
+    /// invalidate heap caches, record the op with `descr`.
+    ///
+    /// pyjitpl.py:2683-2684 `_record_helper_varargs` parity:
+    /// `heapcache.invalidate_caches_varargs(...)` runs BEFORE
+    /// `self.history.record(...)`.  Routes every CALL family record
+    /// through `invalidate_caches_varargs` so the elidable /
+    /// loopinvariant / arraycopy / arraymove fast-paths inside
+    /// `clear_caches_varargs` (heapcache.py:341-376) run exactly once
+    /// per call.  The previous escape-only path
+    /// (`_escape_argboxes + invalidate_caches_for_escaped`) skipped
+    /// those branches.
+    fn record_call_with_descr(
+        &mut self,
+        opcode: OpCode,
+        func_ptr: *const (),
+        args: &[OpRef],
+        descr: majit_ir::DescrRef,
+    ) -> OpRef {
+        let func_ref = OpRef::const_int(func_ptr as usize as i64);
         let mut call_args = vec![func_ref];
         call_args.extend_from_slice(args);
-        // pyjitpl.py:2683-2684 `_record_helper_varargs` parity:
-        // `heapcache.invalidate_caches_varargs(...)` runs BEFORE
-        // `self.history.record(...)`.  Routes every CALL family record
-        // through `invalidate_caches_varargs` so the elidable /
-        // loopinvariant / arraycopy / arraymove fast-paths inside
-        // `clear_caches_varargs` (heapcache.py:341-376) run exactly once
-        // per call.  The previous escape-only path
-        // (`_escape_argboxes + invalidate_caches_for_escaped`) skipped
-        // those branches.
         if let Some(call_descr) = descr.as_call_descr() {
             let oracle: &dyn crate::heapcache::SameConstantOracle =
                 &crate::history::ConstOprefOracle;
@@ -3084,6 +3097,30 @@ impl TraceCtx {
         let _ = self.call_typed(OpCode::CallN, func_ptr, args, arg_types, Type::Void);
     }
 
+    /// [`call_void_typed`] for hand-written `extern "C"` helpers whose C
+    /// signature returns a dummy machine word (`-> i64`, value ignored).
+    /// Records the same `CallN` op through a descr that carries the true
+    /// callee ABI (`make_call_descr_void_word_abi`) so a signature-exact
+    /// backend lowering can call it directly.
+    ///
+    /// `effect_info` is caller-supplied because these helpers WRITE the
+    /// heap (namespace dict cells, list storage): the opcode default
+    /// (`default_effect_info`, empty write sets) would tell the
+    /// optimizer the call touches no tracked field, letting optheap CSE
+    /// a getfield across the call and read a stale value.  An
+    /// unanalyzed external writer follows `graphanalyze.py:60
+    /// analyze_external_call` top: `EffectInfo::MOST_GENERAL`.
+    pub fn call_void_typed_word_abi(
+        &mut self,
+        func_ptr: *const (),
+        args: &[OpRef],
+        arg_types: &[Type],
+        effect_info: majit_ir::EffectInfo,
+    ) {
+        let descr = crate::call_descr::make_call_descr_void_word_abi(arg_types, effect_info);
+        let _ = self.record_call_with_descr(OpCode::CallN, func_ptr, args, descr);
+    }
+
     /// `call_typed` variant that preserves the caller-supplied `EffectInfo`
     /// instead of re-deriving the default for the opcode. Mirrors
     /// `pyjitpl.py:1995-2068 do_residual_call` parity: PyPy passes the
@@ -3100,30 +3137,9 @@ impl TraceCtx {
         ret_type: Type,
         effect_info: majit_ir::EffectInfo,
     ) -> OpRef {
-        let func_ref = OpRef::const_int(func_ptr as usize as i64);
         let descr =
             crate::call_descr::make_call_descr_with_effect(arg_types, ret_type, effect_info);
-        let mut call_args = vec![func_ref];
-        call_args.extend_from_slice(args);
-        // pyjitpl.py:2683-2684 `_record_helper_varargs` parity (see
-        // `call_typed` for the full rationale): invalidate before record.
-        if let Some(call_descr) = descr.as_call_descr() {
-            let oracle: &dyn crate::heapcache::SameConstantOracle =
-                &crate::history::ConstOprefOracle;
-            let const_value = |opref: OpRef| match opref.inline_const_to_value() {
-                Some(majit_ir::Value::Int(n)) => Some(n),
-                _ => None,
-            };
-            self.heap_cache.invalidate_caches_varargs(
-                opcode,
-                Some(call_descr.get_extra_info()),
-                &call_args,
-                oracle,
-                const_value,
-            );
-        }
-        self.recorder
-            .record_op_with_descr(opcode, &call_args, descr.clone())
+        self.record_call_with_descr(opcode, func_ptr, args, descr)
     }
 
     pub fn call_void_typed_with_effect(
