@@ -9,7 +9,7 @@
 
 #![allow(non_snake_case, non_upper_case_globals)]
 
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use crate::flowspace::model::{
     Block, BlockRefExt, ConstValue, Constant, FunctionGraph, GraphFunc, Hlvalue, Link,
@@ -22,6 +22,7 @@ use crate::translator::rtyper::lltypesystem::lltype::{
     ForwardReference, LowLevelType, Ptr, PtrTarget, Struct,
 };
 use crate::translator::rtyper::lltypesystem::rstr::{STRPTR, UNICODEPTR};
+use crate::translator::rtyper::rmodel::{Repr, ReprState};
 use crate::translator::rtyper::rtyper::{
     constant_with_lltype, helper_pygraph_from_graph, variable_with_lltype, void_field_const,
 };
@@ -5166,13 +5167,16 @@ pub fn build_ll_build_helper_graph(
 pub struct BaseStringBuilderRepr;
 
 /// RPython `class StringBuilderRepr(BaseStringBuilderRepr)`.
-#[derive(Debug, Default)]
-pub struct StringBuilderRepr;
+#[derive(Debug)]
+pub struct StringBuilderRepr {
+    state: ReprState,
+}
 
 impl StringBuilderRepr {
-    /// RPython `StringBuilderRepr.lowleveltype = lltype.Ptr(STRINGBUILDER)`.
-    pub fn lowleveltype(&self) -> &'static LowLevelType {
-        &STRINGBUILDERPTR
+    pub fn new() -> Self {
+        StringBuilderRepr {
+            state: ReprState::new(),
+        }
     }
 
     /// RPython `StringBuilderRepr.basetp = STR`.
@@ -5181,14 +5185,38 @@ impl StringBuilderRepr {
     }
 }
 
+impl Default for StringBuilderRepr {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Repr for StringBuilderRepr {
+    /// RPython `StringBuilderRepr.lowleveltype = lltype.Ptr(STRINGBUILDER)`.
+    fn lowleveltype(&self) -> &LowLevelType {
+        &STRINGBUILDERPTR
+    }
+
+    fn state(&self) -> &ReprState {
+        &self.state
+    }
+
+    fn class_name(&self) -> &'static str {
+        "StringBuilderRepr"
+    }
+}
+
 /// RPython `class UnicodeBuilderRepr(BaseStringBuilderRepr)`.
-#[derive(Debug, Default)]
-pub struct UnicodeBuilderRepr;
+#[derive(Debug)]
+pub struct UnicodeBuilderRepr {
+    state: ReprState,
+}
 
 impl UnicodeBuilderRepr {
-    /// RPython `UnicodeBuilderRepr.lowleveltype = lltype.Ptr(UNICODEBUILDER)`.
-    pub fn lowleveltype(&self) -> &'static LowLevelType {
-        &UNICODEBUILDERPTR
+    pub fn new() -> Self {
+        UnicodeBuilderRepr {
+            state: ReprState::new(),
+        }
     }
 
     /// RPython `UnicodeBuilderRepr.basetp = UNICODE`.
@@ -5197,23 +5225,44 @@ impl UnicodeBuilderRepr {
     }
 }
 
-static STRINGBUILDER_REPR: LazyLock<StringBuilderRepr> = LazyLock::new(StringBuilderRepr::default);
-static UNICODEBUILDER_REPR: LazyLock<UnicodeBuilderRepr> =
-    LazyLock::new(UnicodeBuilderRepr::default);
+impl Default for UnicodeBuilderRepr {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Repr for UnicodeBuilderRepr {
+    /// RPython `UnicodeBuilderRepr.lowleveltype = lltype.Ptr(UNICODEBUILDER)`.
+    fn lowleveltype(&self) -> &LowLevelType {
+        &UNICODEBUILDERPTR
+    }
+
+    fn state(&self) -> &ReprState {
+        &self.state
+    }
+
+    fn class_name(&self) -> &'static str {
+        "UnicodeBuilderRepr"
+    }
+}
 
 /// RPython `stringbuilder_repr = StringBuilderRepr()`.
-pub fn stringbuilder_repr() -> &'static StringBuilderRepr {
-    &STRINGBUILDER_REPR
+pub fn stringbuilder_repr() -> Arc<StringBuilderRepr> {
+    static REPR: OnceLock<Arc<StringBuilderRepr>> = OnceLock::new();
+    REPR.get_or_init(|| Arc::new(StringBuilderRepr::new())).clone()
 }
 
 /// RPython `unicodebuilder_repr = UnicodeBuilderRepr()`.
-pub fn unicodebuilder_repr() -> &'static UnicodeBuilderRepr {
-    &UNICODEBUILDER_REPR
+pub fn unicodebuilder_repr() -> Arc<UnicodeBuilderRepr> {
+    static REPR: OnceLock<Arc<UnicodeBuilderRepr>> = OnceLock::new();
+    REPR.get_or_init(|| Arc::new(UnicodeBuilderRepr::new()))
+        .clone()
 }
 
 #[cfg(test)]
 mod tests {
     use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+    use crate::translator::rtyper::rmodel::Repr;
 
     #[test]
     fn stringpiece_prev_piece_points_back_to_stringpiece() {
@@ -5268,6 +5317,22 @@ mod tests {
             super::stringbuilder_repr().lowleveltype(),
             super::unicodebuilder_repr().lowleveltype()
         );
+    }
+
+    #[test]
+    fn builder_reprs_impl_repr_trait_and_coerce_to_dyn() {
+        let sb = super::stringbuilder_repr();
+        assert_eq!(sb.class_name(), "StringBuilderRepr");
+        assert_eq!(sb.lowleveltype(), &*super::STRINGBUILDERPTR);
+
+        let ub = super::unicodebuilder_repr();
+        assert_eq!(ub.class_name(), "UnicodeBuilderRepr");
+        assert_eq!(ub.lowleveltype(), &*super::UNICODEBUILDERPTR);
+
+        // The reprs must be usable as `Arc<dyn Repr>` so the rtyper's
+        // `inputarg` / `gendirectcall` machinery can consume them.
+        let _dyn_sb: std::sync::Arc<dyn Repr> = super::stringbuilder_repr();
+        let _dyn_ub: std::sync::Arc<dyn Repr> = super::unicodebuilder_repr();
     }
 
     #[test]
