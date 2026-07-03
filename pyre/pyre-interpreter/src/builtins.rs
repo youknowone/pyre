@@ -2446,9 +2446,19 @@ pub fn builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 /// and the `__pyre_kw__` marker can be removed.
 pub(crate) fn split_builtin_kwargs(args: &[PyObjectRef]) -> (&[PyObjectRef], Option<PyObjectRef>) {
     if let Some(&last) = args.last() {
-        if unsafe {
-            is_dict(last) && pyre_object::w_dict_lookup(last, w_str_new("__pyre_kw__")).is_some()
-        } {
+        // `call_with_kwargs` appends the marker only when the call carried
+        // keywords, so a genuine marker always holds `__pyre_kw__` *and* at
+        // least one real keyword entry.  A dict passed positionally that merely
+        // contains `__pyre_kw__` and nothing else (`len({'__pyre_kw__': True})`)
+        // is a value, not the marker, and must not be stripped.
+        let is_marker = unsafe {
+            is_dict(last)
+                && pyre_object::w_dict_lookup(last, w_str_new("__pyre_kw__")).is_some()
+                && pyre_object::w_dict_str_entries(last)
+                    .iter()
+                    .any(|(key, _)| key != "__pyre_kw__")
+        };
+        if is_marker {
             return (&args[..args.len() - 1], Some(last));
         }
     }
@@ -2622,6 +2632,14 @@ fn parse_single_required(
     fn_name: &str,
 ) -> Result<PyObjectRef, crate::PyError> {
     let (positional, kwargs) = split_builtin_kwargs(args);
+    // Fast path for the hot fixed-arity call (`len(x)` / `abs(x)`): one
+    // positional and no keywords binds directly, skipping the Signature /
+    // Arguments / scope allocation the general keyword and arity-error path
+    // needs.  Zero or surplus positionals, or any keyword, fall through so the
+    // `_match_signature` TypeError is still raised.
+    if kwargs.is_none() && positional.len() == 1 {
+        return Ok(positional[0]);
+    }
     let mut keyword_names_w: Vec<PyObjectRef> = Vec::new();
     let mut keywords_w: Vec<PyObjectRef> = Vec::new();
     if let Some(dict) = kwargs {
