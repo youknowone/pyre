@@ -884,7 +884,7 @@ fn force_box_impl(
     // `op` is the bound operand of the virtual being forced (callers resolve to
     // the chain terminal before delegating). The OpRef view drives op identity
     // (pos, logging, alloc-vs-original comparisons); the operand drives every
-    // make_equal_to / set_ptr_info receiver, so no `materialize_box_at` round-trip is
+    // make_equal_to / set_ptr_info receiver, so no `materialize_operand_at` round-trip is
     // needed for the forwarding writes.
     let opref = op.to_opref();
 

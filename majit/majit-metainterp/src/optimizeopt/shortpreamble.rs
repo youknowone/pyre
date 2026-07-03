@@ -460,7 +460,7 @@ pub struct ShortBoxes {
     /// shortpreamble.py:249 self.potential_ops = OrderedDict()
     /// Keyed by the producer's result Box, compared by object identity
     /// (shortpreamble.py:259/290) — every insert/lookup resolves its
-    /// position through `ctx.materialize_box_at`, which memoizes one box
+    /// position through `ctx.materialize_operand_at`, which memoizes one box
     /// per producer, so the same position yields the same object. Const
     /// results never key this map (they route to `const_short_boxes`).
     potential_ops: VecMap<majit_ir::operand::Operand, PotentialShortOp>,
@@ -468,7 +468,7 @@ pub struct ShortBoxes {
     /// (insertion order preserved by VecMap for deterministic export.)
     /// Keyed by the result Box (`shortop.res`), compared by object
     /// identity (shortpreamble.py:317/338) — lookups resolve their
-    /// position through `ctx.materialize_box_at`, which memoizes one
+    /// position through `ctx.materialize_operand_at`, which memoizes one
     /// box per producer, so the same position yields the same object.
     produced_short_boxes: VecMap<majit_ir::operand::Operand, ProducedShortOp>,
     /// shortpreamble.py: const_short_boxes
@@ -2226,7 +2226,7 @@ pub struct ShortPreambleBuilder {
     /// (produce_arg/use_box/add_op_to_short). #146/S8 re-keyed this from the
     /// flat-OpRef position (which needed a dual source/result_opref key for
     /// invented names) to the single carried res box: `self.res` at the
-    /// cross-peel produce loop, `materialize_box_at(pos)` at the single-op
+    /// cross-peel produce loop, `materialize_operand_at(pos)` at the single-op
     /// re-export. The carried box is invariant to the replay-position aliasing
     /// the dual key compensated for, so the two entries collapse to one. The
     /// PYRE_S8B_HARNESS census measured this lookup agreeing with the former
@@ -2260,7 +2260,7 @@ impl ShortPreambleBuilder {
             // so they can never be a stable box-identity key; export already
             // filters const short boxes (optimizer.rs:2942) so this is inert
             // for the live path, and the single-op re-export passes the
-            // memoized `materialize_box_at(pos)` box.
+            // memoized `materialize_operand_at(pos)` box.
             if k.to_opref().is_constant() {
                 continue;
             }

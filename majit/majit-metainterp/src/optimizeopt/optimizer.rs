@@ -1368,7 +1368,7 @@ impl Optimizer {
                 // label slot and write the imported state through it. An
                 // unresolvable slot (`OpRef::NONE`, e.g. the MISS fallback
                 // above) yields `None` and the write no-ops — matching the
-                // prior `materialize_box_at(OpRef::NONE) -> None` behavior.
+                // prior `materialize_operand_at(OpRef::NONE) -> None` behavior.
                 if let Some(box_) = ctx.get_box_replacement_operand_opt(opref) {
                     Self::apply_imported_virtual_state(info, &box_, ctx);
                 }
@@ -2857,7 +2857,7 @@ impl Optimizer {
                 let forced = self.force_box(original.to_opref(), &mut ctx);
                 // Operand writes carry the canonical box: resolve the chain
                 // terminal, materializing the host when the forced position
-                // has no producer yet (mirrors the materialize_box_at arm
+                // has no producer yet (mirrors the materialize_operand_at arm
                 // above; never a position-only fabrication).
                 let b_forced = match ctx.get_box_replacement_operand_opt(forced) {
                     Some(b) => b,
@@ -2911,8 +2911,8 @@ impl Optimizer {
         //   - Unbound orphan: the pipeline folded/dropped the op so
         //     `ctx.emit` never ran. Synthesize a `SameAs` stand-in
         //     and bind the slot.
-        //   - Synthetic-bound: a forward reference reached `materialize_box_at`
-        //     first; `materialize_box_at` minted a `SameAs` stand-in into
+        //   - Synthetic-bound: a forward reference reached `materialize_operand_at`
+        //     first; `materialize_operand_at` minted a `SameAs` stand-in into
         //     `ctx.resop_refs[idx]` and `bind_op`'ed it. When `emit`
         //     never arrived to upgrade the binding to a real producer,
         //     the stand-in itself is the chain target carrier.
@@ -3279,7 +3279,7 @@ impl Optimizer {
                         for i in 0..preamble_op.num_args() {
                             let arg = preamble_op.arg(i);
                             // The `OpRef::none()` sentinel has no producer box
-                            // (`materialize_box_at` doc) — routing it through the
+                            // (`materialize_operand_at` doc) — routing it through the
                             // producer lookup is meaningless and trips the
                             // `get_box_replacement` "box must exist" debug tripwire.
                             if arg.is_none() {
@@ -4349,7 +4349,7 @@ impl Optimizer {
             // producer is registered yet — a short-preamble / bridge operand
             // dispatched mid-pass through `send_extra_operation`, whose
             // producer is neither emitted nor in `resop_refs` —
-            // `resolve_box_box_opt` returns None. `materialize_box_at`
+            // `resolve_box_box_opt` returns None. `materialize_operand_at`
             // then mints and registers the canonical `_forwarded` host (the
             // "Box always exists" invariant, resoperation.py:233) and we walk
             // it to its terminal, so the stored arg is BOUND on every dispatch
@@ -4777,7 +4777,7 @@ impl Optimizer {
             // `optimizer.py:137-151` where `isinstance(opinfo,
             // InstancePtrInfo)` mutates in place.
             // optimizer.py:137-152 `make_constant_class` always updates
-            // `_forwarded` — `materialize_box_at` materializes the Box so the
+            // `_forwarded` — `materialize_operand_at` materializes the Box so the
             // write is never silently skipped. Same materializer feeds
             // the `last_guard_pos` read; `info.py:91-103
             // get_last_guard_pos` reads the PtrInfo field (None if no

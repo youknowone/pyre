@@ -96,7 +96,7 @@ pub fn copy_str_content(
     // vstring.py:341-347: determine inline threshold M using intbound
     // A producer-less operand has no forwarded bound; getintbound returns
     // unbounded for it, so resolve-or-unbounded matches the prior
-    // materialize_box_at (mint synthetic → unbounded) behavior without minting.
+    // materialize_operand_at (mint synthetic → unbounded) behavior without minting.
     let srcoffset_bound = ctx
         .resolve_operand_operand_opt(srcoffsetbox)
         .map(|b| ctx.getintbound_handle(&b).borrow().clone())
@@ -1826,7 +1826,7 @@ mod tests {
         // producer in `resop_refs`. A later force/emit then resolves the char
         // arg to that bound box (sheds to `Operand::Op`) instead of a
         // position-only `from_opref` box (which would mint `Operand::Box`).
-        // `materialize_box_at` keeps the box's `to_opref()` at the same
+        // `materialize_operand_at` keeps the box's `to_opref()` at the same
         // position, so the char-identity assertions still hold.
         let char_boxes: Vec<Option<Operand>> = chars
             .into_iter()
@@ -1850,7 +1850,7 @@ mod tests {
         let b = ctx.materialize_operand_at(opref);
         // Materialize the child refs so they carry a bound synthetic producer; a
         // residual emit then sheds them to `Operand::Op` instead of panicking on
-        // a position-only `from_opref` box. `materialize_box_at` keeps each
+        // a position-only `from_opref` box. `materialize_operand_at` keeps each
         // box's `to_opref()` at the same position, so identity assertions hold.
         let vleft_box = ctx.materialize_operand_at(vleft);
         let vright_box = ctx.materialize_operand_at(vright);
@@ -1877,7 +1877,7 @@ mod tests {
         // Materialize the source/start/length refs so they carry a bound
         // synthetic producer; a residual emit then sheds them to `Operand::Op`
         // instead of panicking on a position-only `from_opref` box.
-        // `materialize_box_at` keeps each box's `to_opref()` at the same
+        // `materialize_operand_at` keeps each box's `to_opref()` at the same
         // position, so identity assertions hold.
         let s_box = ctx.materialize_operand_at(s);
         let start_box = ctx.materialize_operand_at(start);

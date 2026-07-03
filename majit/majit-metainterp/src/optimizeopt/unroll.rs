@@ -1979,7 +1979,7 @@ pub struct ExportedState {
     pub patchguardop: Option<majit_ir::Op>,
     /// `OptContext::next_pos` at end of Phase 1 — strict upper bound of
     /// every OpRef Phase 1 allocated, including intermediates folded /
-    /// forwarded away. `reserve_pos_typed` skips `materialize_box_at` on the
+    /// forwarded away. `reserve_pos_typed` skips `materialize_operand_at` on the
     /// zero-inputarg / retrace baselines (`optimizeopt/mod.rs:2026`),
     /// so capturing `ctx.next_pos` at export is the only reliable
     /// floor. Phase 2 / retrace seed their TraceIterator namespace
@@ -2914,7 +2914,7 @@ impl OptUnroll {
         // `OptContext::next_pos` is the strict upper bound on raw OpRefs
         // Phase 1 allocated, including intermediates folded / forwarded
         // away before any structure-stored field could observe them.
-        // `reserve_pos_typed` skips `materialize_box_at` on the zero-inputarg /
+        // `reserve_pos_typed` skips `materialize_operand_at` on the zero-inputarg /
         // retrace baselines (`optimizeopt/mod.rs:2026`), so capturing
         // `ctx.next_pos` at export is the only reliable floor for
         // `opref_high_water()` to feed retrace's `start_fresh`.
@@ -2951,7 +2951,7 @@ impl OptUnroll {
                 }
                 // S-0.C: `box_pool[*ia_opref].bound_inputarg()` resolves
                 // to the same `InputArgRc` as `inputarg_refs[idx]` after
-                // `ensure_inputarg_bindings` / `materialize_box_at`'s InputArg
+                // `ensure_inputarg_bindings` / `materialize_operand_at`'s InputArg
                 // placeholder arm have run (both write the canonical
                 // `InputArgRc` matching the OpRef's type). Drop the
                 // box_pool fallback — fall through to a fresh `InputArg`
@@ -4924,7 +4924,7 @@ fn assemble_peeled_trace_with_jump_args(
                 // "box always exists" materializer (parity with the start_label
                 // / jump_source / extended_label_arg sites above) so the arg
                 // carries a bound `Operand::Op`/`InputArg` instead of a
-                // position-only box. `materialize_box_at(mapped).to_opref() ==
+                // position-only box. `materialize_operand_at(mapped).to_opref() ==
                 // mapped`, so the rewritten arg is OpRef-identical.
                 let boxed = match emitted_at.get(&mapped) {
                     Some(rc) => majit_ir::operand::Operand::from_bound_op(rc),
@@ -6606,7 +6606,7 @@ mod tests {
             });
         // Bind export-input positions at their source: the GETFIELD receiver
         // and result are bound boxes in production (label arg / ProducedShortOp.res
-        // = materialize_box_at, shortpreamble.rs:436). virtualstate.py:711-720
+        // = materialize_operand_at, shortpreamble.rs:436). virtualstate.py:711-720
         // create_state receives real AbstractValues, never bare positions.
         ctx.materialize_operand_at(OpRef::int_op(10));
         ctx.materialize_operand_at(OpRef::int_op(11));
@@ -6674,7 +6674,7 @@ mod tests {
                 same_as_source: None,
             });
         // Bind export-input positions at their source (label arg /
-        // ProducedShortOp.res = materialize_box_at, shortpreamble.rs:436);
+        // ProducedShortOp.res = materialize_operand_at, shortpreamble.rs:436);
         // virtualstate.py:711-720 create_state receives real AbstractValues.
         ctx.materialize_operand_at(OpRef::int_op(12));
         ctx.materialize_operand_at(OpRef::int_op(11));
@@ -6740,7 +6740,7 @@ mod tests {
             });
 
         // Bind export-input positions at their source (label arg /
-        // ProducedShortOp.res = materialize_box_at, shortpreamble.rs:436);
+        // ProducedShortOp.res = materialize_operand_at, shortpreamble.rs:436);
         // virtualstate.py:711-720 create_state receives real AbstractValues.
         ctx.materialize_operand_at(OpRef::int_op(10));
         ctx.materialize_operand_at(OpRef::int_op(11));

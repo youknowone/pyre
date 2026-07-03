@@ -314,7 +314,7 @@ pub struct OptPure {
     /// postponement. The OVF op is `Remove`d before emit, so its head box
     /// is never bound by the emit path; capturing it here (where the op
     /// object is live) gives `make_equal_to` a bound receiver without an
-    /// `materialize_box_at` round-trip through the opref.
+    /// `materialize_operand_at` round-trip through the opref.
     postponed_box: Option<Operand>,
     /// Indices into new_operations of emitted CALL_PURE ops.
     /// pure.py: call_pure_positions — tracked for short preamble generation.
@@ -1337,7 +1337,7 @@ mod tests {
             // Production threads the builder's replay Rc into the pop
             // (produce_op family); mirror that here so use_box receives
             // the same object the builder entry carries. The builder keys by
-            // its entry res (`materialize_box_at(pos)`); `source_box` is the
+            // its entry res (`materialize_operand_at(pos)`); `source_box` is the
             // memoized box for the same position, so the lookup hits.
             let replay = ctx
                 .imported_short_preamble_builder
@@ -2660,7 +2660,7 @@ mod tests {
         );
         // Production threads the builder's replay Rc into the pop
         // (produce_pure); mirror it so use_box sees one object. #146/S8: the
-        // builder keys by the entry res box (`materialize_box_at(pos)`); the
+        // builder keys by the entry res box (`materialize_operand_at(pos)`); the
         // memoized box for the same position hits.
         let src1 = ctx.materialize_operand_at(OpRef::int_op(1));
         if let Some(p) = ctx

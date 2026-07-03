@@ -2496,7 +2496,7 @@ pub(crate) struct ExportCache {
     // bind-at-alloc invariant: every position reaching export resolves to a
     // bound box (debug-asserted in `export_single_value`). Production forced
     // end-args and `ProducedShortOp.res` (shortpreamble.rs:436
-    // `materialize_box_at`) are bound at creation; an unbound position would
+    // `materialize_operand_at`) are bound at creation; an unbound position would
     // mint a fresh `BoxRef::from_opref` per visit and split the cache, so the
     // assert traps that as a bind-at-alloc gap rather than silently
     // mis-deduping. `VecMap`/`VecSet` are Vec-backed and compare by `Eq` only

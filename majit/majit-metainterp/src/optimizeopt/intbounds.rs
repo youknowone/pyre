@@ -1824,7 +1824,7 @@ impl Optimization for OptIntBounds {
             // arg position carries none. Resolve the canonical box once and
             // key the export by box identity (`Rc::ptr_eq`), matching RPython's
             // `box._forwarded` IntBound storage. `&OptContext` here forbids the
-            // `materialize_box_at` fallback, so an unbound arg is simply skipped.
+            // `materialize_operand_at` fallback, so an unbound arg is simply skipped.
             let Some(arg_box) = ctx.get_box_replacement_operand_opt(arg) else {
                 continue;
             };
@@ -2068,7 +2068,7 @@ mod tests {
             // optimizer.py:651-652 setarg loop parity. Mirror
             // `propagate_from_pass_range`'s dispatch-entry rebind: mint +
             // register a canonical host for producer-less operands (via
-            // `materialize_box_at`) so the pass's `get_box_replacement`
+            // `materialize_operand_at`) so the pass's `get_box_replacement`
             // resolves to a bound terminal instead of an unbound `from_opref`
             // box.
             for i in 0..resolved_op.num_args() {

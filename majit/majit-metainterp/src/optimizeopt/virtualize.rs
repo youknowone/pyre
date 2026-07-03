@@ -2866,7 +2866,7 @@ mod tests {
         for i in 0..op.num_args() {
             // Mirror the production driver's `None` arm (optimizer.rs:3687):
             // an unbound operand whose root is not a sentinel is minted and
-            // registered via `materialize_box_at`, then walked to its
+            // registered via `materialize_operand_at`, then walked to its
             // terminal — cloning the orig arg would skip canonicalization.
             let canonical = match ctx.resolve_operand_operand_opt(&op.arg(i)) {
                 Some(b) => b,
