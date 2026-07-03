@@ -7515,13 +7515,15 @@ fn fd_read(fd: i32, n: Option<usize>) -> std::io::Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Wrap raw bytes from an fd read into `bytes` (binary mode) or `str`
-/// (text mode), matching the file object's open mode.
-fn fd_bytes_to_obj(self_obj: PyObjectRef, data: Vec<u8>) -> PyObjectRef {
+/// Wrap raw bytes from a file read into `bytes` (binary mode) or decode them
+/// through the text stream's codec/error handler.
+fn fd_bytes_to_obj(self_obj: PyObjectRef, data: Vec<u8>) -> Result<PyObjectRef, crate::PyError> {
     if file_is_binary(self_obj) {
-        pyre_object::bytesobject::w_bytes_from_bytes(&data)
+        Ok(pyre_object::bytesobject::w_bytes_from_bytes(&data))
     } else {
-        w_str_new(&String::from_utf8_lossy(&data))
+        let (encoding, errors) = unsafe { stream_encoding_errors(self_obj) };
+        let w_bytes = pyre_object::bytesobject::w_bytes_from_bytes(&data);
+        crate::typedef::bytes_method_decode(&[w_bytes, w_str_new(&encoding), w_str_new(&errors)])
     }
 }
 
@@ -7545,7 +7547,7 @@ fn file_method_read(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
         #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
         {
             let data = fd_read(fd, n).map_err(fd_io_err)?;
-            return Ok(fd_bytes_to_obj(args[0], data));
+            return fd_bytes_to_obj(args[0], data);
         }
         #[cfg(any(not(feature = "host_env"), target_arch = "wasm32"))]
         {
@@ -7572,7 +7574,7 @@ fn file_method_read(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     let end = n.min(remaining.len());
     let chunk = remaining[..end].to_vec();
     file_set_pos(args[0], pos + end);
-    Ok(fd_bytes_to_obj(args[0], chunk))
+    fd_bytes_to_obj(args[0], chunk)
 }
 
 fn file_method_readline(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -7609,7 +7611,7 @@ fn file_method_readline(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
                     break;
                 }
             }
-            return Ok(fd_bytes_to_obj(args[0], out));
+            return fd_bytes_to_obj(args[0], out);
         }
         #[cfg(any(not(feature = "host_env"), target_arch = "wasm32"))]
         {
@@ -7622,7 +7624,7 @@ fn file_method_readline(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     let data = file_get_data(args[0]);
     let pos = file_get_pos(args[0]);
     if pos >= data.len() {
-        return Ok(fd_bytes_to_obj(args[0], Vec::new()));
+        return fd_bytes_to_obj(args[0], Vec::new());
     }
     let rest = &data[pos..];
     let mut end = rest
@@ -7635,7 +7637,7 @@ fn file_method_readline(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     }
     let line = rest[..end].to_vec();
     file_set_pos(args[0], pos + end);
-    Ok(fd_bytes_to_obj(args[0], line))
+    fd_bytes_to_obj(args[0], line)
 }
 
 fn file_method_readlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -7723,6 +7725,13 @@ fn file_method_write(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
             pyre_object::bytesobject::w_bytes_from_bytes(&prev),
         );
         let _ = crate::baseobjspace::setattr_str(args[0], "__file_dirty__", w_bool_from(true));
+        let append = crate::baseobjspace::getattr_str(args[0], "__file_mode__")
+            .ok()
+            .map(|mode| pyre_object::w_str_get_value(mode).contains('a'))
+            .unwrap_or(false);
+        if !append {
+            file_flush_dirty(args[0])?;
+        }
         Ok(w_int_new(len as i64))
     }
 }
@@ -7842,23 +7851,71 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     if args.is_empty() {
         return Err(crate::PyError::type_error("open() missing 'file' argument"));
     }
-    let path_obj = args[0];
+    let (open_pos, open_kwargs) = split_builtin_kwargs(args);
+    kwarg_reject_unknown(
+        open_kwargs,
+        &[
+            "file",
+            "mode",
+            "buffering",
+            "encoding",
+            "errors",
+            "newline",
+            "closefd",
+            "opener",
+        ],
+        "open",
+    )?;
+    let path_obj = resolve_pos_or_kw(open_pos.first().copied(), open_kwargs, "file", "open", 1)?
+        .ok_or_else(|| crate::PyError::type_error("open() missing 'file' argument"))?;
+    let mode_obj = resolve_pos_or_kw(open_pos.get(1).copied(), open_kwargs, "mode", "open", 2)?;
+    let encoding_obj =
+        resolve_pos_or_kw(open_pos.get(3).copied(), open_kwargs, "encoding", "open", 4)?;
+    let errors_obj = resolve_pos_or_kw(open_pos.get(4).copied(), open_kwargs, "errors", "open", 5)?;
+    let str_or_none =
+        |obj: Option<PyObjectRef>, name: &str| -> Result<Option<String>, crate::PyError> {
+            match obj {
+                Some(o) if unsafe { pyre_object::is_str(o) } => Ok(Some(unsafe {
+                    pyre_object::w_str_get_value(o)
+                        .to_ascii_lowercase()
+                        .replace('_', "-")
+                })),
+                Some(o) if unsafe { pyre_object::is_none(o) } => Ok(None),
+                Some(o) => Err(crate::PyError::type_error(format!(
+                    "open() argument '{name}' must be str or None, not {}",
+                    crate::type_methods::arg_type_name(o)
+                ))),
+                None => Ok(None),
+            }
+        };
+    let encoding = str_or_none(encoding_obj, "encoding")?.unwrap_or_else(|| "utf-8".to_string());
+    let errors = str_or_none(errors_obj, "errors")?.unwrap_or_else(|| "strict".to_string());
+    let mode: String = match mode_obj {
+        Some(m) if unsafe { pyre_object::is_str(m) } => unsafe {
+            pyre_object::w_str_get_value(m).to_string()
+        },
+        Some(m) if unsafe { pyre_object::is_none(m) } => "r".to_string(),
+        Some(m) => {
+            return Err(crate::PyError::type_error(format!(
+                "open() argument 'mode' must be str, not {}",
+                crate::type_methods::arg_type_name(m)
+            )));
+        }
+        None => "r".to_string(),
+    };
 
     // Integer file descriptor → fd-backed file object, reading/writing
     // through the descriptor directly (io.open(fd, ...) — used by
     // subprocess pipe handling).
     if unsafe { pyre_object::is_int(path_obj) } {
         let fd = unsafe { pyre_object::w_int_get_value(path_obj) } as i32;
-        let mode: String = if args.len() >= 2 && unsafe { pyre_object::is_str(args[1]) } {
-            unsafe { pyre_object::w_str_get_value(args[1]).to_string() }
-        } else {
-            "r".to_string()
-        };
         let binary = mode.contains('b');
         let wrapper = pyre_object::w_instance_new(file_wrapper_type());
         let _ = crate::baseobjspace::setattr_str(wrapper, "__file_fd__", w_int_new(fd as i64));
         let _ = crate::baseobjspace::setattr_str(wrapper, "__file_binary__", w_bool_from(binary));
         let _ = crate::baseobjspace::setattr_str(wrapper, "__file_mode__", w_str_new(&mode));
+        let _ = crate::baseobjspace::setattr_str(wrapper, "encoding", w_str_new(&encoding));
+        let _ = crate::baseobjspace::setattr_str(wrapper, "errors", w_str_new(&errors));
         let _ = crate::baseobjspace::setattr_str(wrapper, "name", w_int_new(fd as i64));
         let _ = crate::baseobjspace::setattr_str(wrapper, "mode", w_str_new(&mode));
         let _ = crate::baseobjspace::setattr_str(wrapper, "closed", w_bool_from(false));
@@ -7892,18 +7949,6 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
             ));
         }
     };
-    let mode: String = if args.len() >= 2 {
-        unsafe {
-            if pyre_object::is_str(args[1]) {
-                pyre_object::w_str_get_value(args[1]).to_string()
-            } else {
-                "r".to_string()
-            }
-        }
-    } else {
-        "r".to_string()
-    };
-
     let binary = mode.contains('b');
     let writing = mode.contains('w') || mode.contains('a') || mode.contains('x');
     let reading = mode.contains('r') || !writing;
@@ -7912,7 +7957,6 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     // (e.g. `tempfile.NamedTemporaryFile` creates the temp file and records
     // its name in the opener). Call it with `(file, flags)` and wrap the
     // returned fd directly.
-    let (_open_pos, open_kwargs) = split_builtin_kwargs(args);
     if let Some(opener) = kwarg_get(open_kwargs, "opener") {
         if !unsafe { pyre_object::is_none(opener) } {
             let flags = open_flags_for_mode(&mode);
@@ -7926,6 +7970,8 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
             let _ =
                 crate::baseobjspace::setattr_str(wrapper, "__file_binary__", w_bool_from(binary));
             let _ = crate::baseobjspace::setattr_str(wrapper, "__file_mode__", w_str_new(&mode));
+            let _ = crate::baseobjspace::setattr_str(wrapper, "encoding", w_str_new(&encoding));
+            let _ = crate::baseobjspace::setattr_str(wrapper, "errors", w_str_new(&errors));
             let _ = crate::baseobjspace::setattr_str(wrapper, "name", path_obj);
             let _ = crate::baseobjspace::setattr_str(wrapper, "mode", w_str_new(&mode));
             let _ = crate::baseobjspace::setattr_str(wrapper, "closed", w_bool_from(false));
@@ -7979,6 +8025,8 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     // this a path-backed `open(p, 'rb').readline()` would hand back `str`,
     // breaking `tokenize.detect_encoding` (`first.startswith(BOM_UTF8)`).
     let _ = crate::baseobjspace::setattr_str(wrapper, "__file_binary__", w_bool_from(binary));
+    let _ = crate::baseobjspace::setattr_str(wrapper, "encoding", w_str_new(&encoding));
+    let _ = crate::baseobjspace::setattr_str(wrapper, "errors", w_str_new(&errors));
     let _ = crate::baseobjspace::setattr_str(wrapper, "name", w_str_new(&path));
     let _ = crate::baseobjspace::setattr_str(wrapper, "mode", w_str_new(&mode));
     let _ = crate::baseobjspace::setattr_str(wrapper, "closed", w_bool_from(false));
