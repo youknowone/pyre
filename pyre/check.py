@@ -410,7 +410,31 @@ def wasm_outputs_match(output, expected):
 # Backends rendered in fixed-column displays, in order. Any enabled backend not
 # listed here still runs and is counted; it just falls outside the fixed columns.
 ALL_BACKENDS = ("dynasm", "cranelift", "wasm")
+
+
+def _wasm_target_installed():
+    """Whether the wasm backend can be built here.
+
+    The only extra prerequisite over the native backends is the
+    `wasm32-unknown-unknown` rustup target (the wasmtime runtime is embedded
+    in `pyre-wasm-runner`, not an external tool). If it is missing, the wasm
+    build would `rustup target add`-fail, so wasm stays out of the default set.
+    """
+    try:
+        proc = subprocess.run(
+            ["rustup", "target", "list", "--installed"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0 and "wasm32-unknown-unknown" in proc.stdout.split()
+
+
+# wasm joins the defaults only where its target is installed, so a plain
+# `check.py` on an unconfigured machine still runs just the native backends.
 DEFAULT_BACKENDS = ("dynasm", "cranelift")
+if _wasm_target_installed():
+    DEFAULT_BACKENDS = (*DEFAULT_BACKENDS, "wasm")
 
 # ── Check runner ─────────────────────────────────────────────────────
 
