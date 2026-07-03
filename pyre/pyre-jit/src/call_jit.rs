@@ -2125,14 +2125,13 @@ fn bridge_source_identity_from_descr(
 /// On failure (trace abort, start failure), returns false so the caller
 /// falls through to resume_in_blackhole (RPython pyjitpl.py:2906-2907
 /// SwitchToBlackhole → run_blackhole_interp_to_cancel_tracing).
-/// Runtime toggle for the otherwise-dormant wasm bridge tracer (default off).
-/// Set by the runner via the `pyre_jit_set_enable_bridges` export so chaining
-/// can be enabled/measured without rebuilding the guest module. Kept off by
-/// default — chaining does not yet resolve the bench timeouts and re-enabling
-/// it surfaces a loop-closing bridge livelock on some traces (fannkuch).
+/// Runtime toggle for the wasm bridge tracer (default ON). The runner's
+/// `pyre_jit_set_enable_bridges` export flips it (`PYRE_WASM_ENABLE_BRIDGES=0`
+/// disables) so chaining can be A/B-measured without rebuilding the guest
+/// module.
 #[cfg(target_arch = "wasm32")]
 pub static WASM_BRIDGES_ENABLED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+    std::sync::atomic::AtomicBool::new(true);
 
 /// Set the wasm bridge-tracer enable flag (see `WASM_BRIDGES_ENABLED`).
 #[cfg(target_arch = "wasm32")]
@@ -2184,21 +2183,9 @@ pub fn trace_and_compile_from_bridge(
         return false;
     };
 
-    // The wasm bridge tracer stays dormant. Inter-trace chaining (this path's
-    // loop-closing `return_call_indirect` bridges) is implemented and runs
-    // correctly in-module, but it does not resolve the wasm bench timeouts: the
-    // dominant per-iteration cost is the residual-call host crossings the trace
-    // already performs (~33 `jit_call` round-trips per bool_arithmetic iteration
-    // — every int/float op and box is a residual call routed guest→host→guest
-    // through the `jit_call` trampoline, ~15µs each). Chaining removes only the
-    // per-guard-exit round-trips, not these per-op ones, so an allocating hot
-    // loop stays ~50x slower than native (which inlines the arithmetic). The fix
-    // is a separate wasm-codegen epic: emit residual calls as direct guest→guest
-    // `call_indirect` (no host trampoline) or inline int/float arithmetic in the
-    // trace. Keeping the bridge tracer dormant avoids the chained loop's residual
-    // old-gen growth (the in-loop GC reclamation story, gated on a faithful
-    // incremental-major pacing fix that is not yet safe) until that lands.
-    // Removing this re-enables the (otherwise complete and verified) chaining.
+    // Wasm bridge tracer kill switch (`WASM_BRIDGES_ENABLED`, default ON):
+    // declining here drops every guard failure to blackhole-from-guard, the
+    // chaining-free fallback, for A/B measurement.
     #[cfg(target_arch = "wasm32")]
     if !WASM_BRIDGES_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
         let _ = (
@@ -2271,36 +2258,6 @@ pub fn trace_and_compile_from_bridge(
             "[jit][bridge-trace] start key={} trace={} fail={} resume_pc={}",
             green_key, trace_id, fail_index, resume_pc
         );
-        if trace_id == 2 && fail_index == 2 && resume_pc == 153 {
-            let debug_values: Vec<String> = raw_values
-                .iter()
-                .zip(exit_layout.exit_types.iter())
-                .enumerate()
-                .map(|(idx, (&raw, &tp))| match tp {
-                    majit_ir::Type::Ref => {
-                        let obj = raw as pyre_object::PyObjectRef;
-                        let detail = unsafe {
-                            if obj.is_null() {
-                                "null".to_string()
-                            } else if pyre_object::is_float(obj) {
-                                format!("float({})", pyre_object::w_float_get_value(obj))
-                            } else if pyre_object::is_int(obj) {
-                                format!("int({})", pyre_object::w_int_get_value(obj))
-                            } else if pyre_object::is_list(obj) {
-                                "list".to_string()
-                            } else {
-                                format!("ref({:#x})", obj as usize)
-                            }
-                        };
-                        format!("#{idx}:Ref {detail}")
-                    }
-                    majit_ir::Type::Int => format!("#{idx}:Int {}", raw),
-                    majit_ir::Type::Float => format!("#{idx}:Float {}", f64::from_bits(raw as u64)),
-                    majit_ir::Type::Void => format!("#{idx}:Void"),
-                })
-                .collect();
-            eprintln!("[jit][bridge-raw] {}", debug_values.join(", "));
-        }
     }
 
     // compile.py:714: start_retrace_from_guard + set bridge_info.
@@ -2317,7 +2274,6 @@ pub fn trace_and_compile_from_bridge(
         }
         return false;
     }
-
     // RPython pyjitpl.py:3101 _prepare_exception_resumption +
     // pyjitpl.py:3132 prepare_resume_from_failure parity:
     // For exception guard bridges (GUARD_EXCEPTION / GUARD_NO_EXCEPTION),

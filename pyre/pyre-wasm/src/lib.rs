@@ -317,13 +317,17 @@ pub extern "C" fn pyre_jit_mc_diag(i: u32) -> u64 {
     majit_metainterp::mc_diag(i as usize)
 }
 
-/// Enable the otherwise-dormant wasm bridge tracer (inter-trace chaining) at
-/// runtime, set by the host runner from an env flag. Exported (not an import)
-/// for the same function-index-stability reason as the diag readers.
+/// Toggle the wasm bridge tracer (inter-trace chaining, default ON) at
+/// runtime, set by the host runner from `PYRE_WASM_ENABLE_BRIDGES`. Exported
+/// (not an import) for the same function-index-stability reason as the diag
+/// readers.
 #[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
 #[unsafe(no_mangle)]
 pub extern "C" fn pyre_jit_set_enable_bridges(enabled: u32) {
     pyre_jit::call_jit::set_wasm_bridges_enabled(enabled != 0);
+    // Backend-side mirror: `execute_token` sizes every host frame's Ref-home
+    // region for cross-trace chaining when this is on.
+    majit_backend_wasm::set_wasm_bridges_enabled(enabled != 0);
 }
 
 /// Enable the self-recursive CALL_ASSEMBLER guest→guest `call_indirect` arm
@@ -335,6 +339,15 @@ pub extern "C" fn pyre_jit_set_enable_bridges(enabled: u32) {
 #[unsafe(no_mangle)]
 pub extern "C" fn pyre_jit_set_wasm_ca(enabled: u32) {
     majit_backend_wasm::set_wasm_ca_enabled(enabled != 0);
+}
+
+/// Toggle the inline nursery-bump allocation fast path (default ON;
+/// `PYRE_WASM_INLINE_ALLOC=0` kill switch). Same plumbing rationale as
+/// `pyre_jit_set_wasm_ca`.
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn pyre_jit_set_inline_alloc(enabled: u32) {
+    majit_backend_wasm::set_wasm_inline_alloc_enabled(enabled != 0);
 }
 
 #[cfg(any(feature = "web", feature = "wasm-host"))]
@@ -376,6 +389,13 @@ fn run_python_impl(source: &str) -> String {
     install_panic_hook();
     #[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
     residual_host::install();
+    // Eagerly install pyre-jit's hooks (pyrex real_main does the same at
+    // boot): the dict `eq_w` / `hash_w` / `hash_str` /
+    // `compares_by_identity` trampolines must be live before
+    // `install_builtin_modules` / `import` builds the first str- or
+    // object-keyed dict, not only after the first JIT-traced bytecode
+    // (`dict_eq_hook::missing_hash_hook` fails fast otherwise).
+    pyre_jit::eval::init_jit_hooks();
     pyre_interpreter::importing::install_builtin_modules();
     // Give the import machinery a source of module bytes. The browser has no
     // filesystem, so the web build serves the embedded stdlib closure from an
@@ -527,6 +547,18 @@ mod host_abi {
     #[unsafe(no_mangle)]
     pub extern "C" fn pyre_gc_nursery_bytes() -> u64 {
         pyre_jit::wasm_gc_heap_stats().1 as u64
+    }
+
+    /// Diagnostic: minor collections run so far, or 0 if no GC is installed.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn pyre_gc_minor_collections() -> u64 {
+        pyre_jit::wasm_gc_collection_counts().0 as u64
+    }
+
+    /// Diagnostic: major collections run so far, or 0 if no GC is installed.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn pyre_gc_major_collections() -> u64 {
+        pyre_jit::wasm_gc_collection_counts().1 as u64
     }
 
     /// Run the UTF-8 Python source at `ptr[..len]`. Returns a packed

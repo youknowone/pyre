@@ -90,6 +90,14 @@ struct Host {
     /// already hold the `Caller<Host>`, and the runner is single-threaded.
     jit_compile_count: u64,
     jit_execute_count: u64,
+    /// Diagnostic: per-op residual-call host crossings (`env.jit_call`
+    /// trampoline invocations). Compare against `jit_execute_count` to test
+    /// whether per-op crossings or per-guard-exit crossings dominate.
+    jit_call_count: u64,
+    /// Diagnostic (PYRE_WASM_EXEC_TRACE=1): histogram of (trace func_id,
+    /// guard-exit fail_index) over every host round-trip, so we can see which
+    /// guard keeps returning to the host instead of chaining in-module.
+    exec_hist: std::collections::BTreeMap<(u32, u32), u64>,
 }
 
 fn main() {
@@ -236,22 +244,33 @@ fn run(module_path: &PathBuf, source: &str) -> Result<i32> {
     let run_python = instance.get_typed_func::<(u32, u32), u64>(&mut store, "pyre_run_python")?;
     let dealloc = instance.get_typed_func::<(u32, u32), ()>(&mut store, "pyre_dealloc")?;
 
-    // Enable the otherwise-dormant wasm bridge tracer (inter-trace chaining) when
-    // PYRE_WASM_ENABLE_BRIDGES is set, so chaining can be measured without
-    // rebuilding the guest. No-op if the export is absent (older modules).
-    if std::env::var_os("PYRE_WASM_ENABLE_BRIDGES").is_some() {
+    // Wasm bridge tracer (inter-trace chaining) is ON by default in the guest;
+    // PYRE_WASM_ENABLE_BRIDGES=0 disables it (any other value re-enables) for
+    // A/B measurement. No-op if the export is absent (older modules).
+    if let Ok(v) = std::env::var("PYRE_WASM_ENABLE_BRIDGES") {
         if let Ok(f) = instance.get_typed_func::<u32, ()>(&mut store, "pyre_jit_set_enable_bridges")
         {
-            f.call(&mut store, 1)?;
+            f.call(&mut store, u32::from(v != "0"))?;
         }
     }
 
-    // Enable the self-recursive CALL_ASSEMBLER guest→guest `call_indirect` arm
-    // (`PYRE_WASM_CA`). The guest has no environment, so the flag is plumbed
-    // through this export. No-op if the export is absent (older modules).
-    if std::env::var_os("PYRE_WASM_CA").is_some() {
+    // Inline nursery-bump allocation fast path is ON by default in the guest;
+    // PYRE_WASM_INLINE_ALLOC=0 disables it (any other value re-enables) for
+    // A/B measurement. No-op if the export is absent (older modules).
+    if let Ok(v) = std::env::var("PYRE_WASM_INLINE_ALLOC") {
+        if let Ok(f) = instance.get_typed_func::<u32, ()>(&mut store, "pyre_jit_set_inline_alloc") {
+            f.call(&mut store, u32::from(v != "0"))?;
+        }
+    }
+
+    // Self-recursive CALL_ASSEMBLER guest→guest `call_indirect` arm is ON by
+    // default in the guest; PYRE_WASM_CA=0 disables it (any other value
+    // re-enables) for A/B measurement. The guest has no environment, so the
+    // flag is plumbed through this export. No-op if the export is absent
+    // (older modules).
+    if let Ok(v) = std::env::var("PYRE_WASM_CA") {
         if let Ok(f) = instance.get_typed_func::<u32, ()>(&mut store, "pyre_jit_set_wasm_ca") {
-            f.call(&mut store, 1)?;
+            f.call(&mut store, u32::from(v != "0"))?;
         }
     }
 
@@ -287,6 +306,14 @@ fn run(module_path: &PathBuf, source: &str) -> Result<i32> {
             .unwrap_or(0);
         let gc_nursery = instance
             .get_typed_func::<(), u64>(&mut store, "pyre_gc_nursery_bytes")
+            .and_then(|f| f.call(&mut store, ()))
+            .unwrap_or(0);
+        let gc_minors = instance
+            .get_typed_func::<(), u64>(&mut store, "pyre_gc_minor_collections")
+            .and_then(|f| f.call(&mut store, ()))
+            .unwrap_or(0);
+        let gc_majors = instance
+            .get_typed_func::<(), u64>(&mut store, "pyre_gc_major_collections")
             .and_then(|f| f.call(&mut store, ()))
             .unwrap_or(0);
         // `heap-prof` builds only: net-live guest-heap bytes/count. Distinguishes
@@ -327,11 +354,13 @@ fn run(module_path: &PathBuf, source: &str) -> Result<i32> {
                 "loopclosing",
                 "src_preamble",
                 "ml_descr_none",
-                "ml_nonlast",
+                "ml_unsafe_label",
                 "ml_arity_mismatch",
                 "decl_noadvance",
                 "ca_cell_set",
                 "ca_cells_zero",
+                "decl_ca_chain",
+                "reserved15",
             ];
             let mut parts = Vec::new();
             for (i, lbl) in labels.iter().enumerate() {
@@ -348,9 +377,19 @@ fn run(module_path: &PathBuf, source: &str) -> Result<i32> {
                 "descr0_skip",
                 "busy_skip",
                 "FIRED",
-                "reserved",
+                "stack_full",
                 "retrace_entered",
                 "retrace_bailed",
+                "cb_entered",
+                "cb_invalidloop",
+                "cb_retrace_req",
+                "cb_arity_giveup",
+                "sbt_entered",
+                "sbt_not_faildescr",
+                "sbt_no_jct",
+                "sbt_no_meta",
+                "sbt_cant_trace",
+                "sbt_short_vals",
             ];
             let mut parts = Vec::new();
             for (i, lbl) in labels.iter().enumerate() {
@@ -363,16 +402,28 @@ fn run(module_path: &PathBuf, source: &str) -> Result<i32> {
         }
         let host = store.data();
         eprintln!(
-            "[jit-stats] compiles={} executes={} linear_mem={} gc_oldgen={} gc_nursery={} \
-             heap_live_bytes={} heap_live_count={}",
+            "[jit-stats] compiles={} executes={} jit_calls={} linear_mem={} gc_oldgen={} gc_nursery={} \
+             gc_minors={} gc_majors={} heap_live_bytes={} heap_live_count={}",
             host.jit_compile_count,
             host.jit_execute_count,
+            host.jit_call_count,
             lin_mem,
             gc_oldgen,
             gc_nursery,
+            gc_minors,
+            gc_majors,
             heap_live_bytes,
             heap_live_count,
         );
+        if !host.exec_hist.is_empty() {
+            let mut v: Vec<_> = host.exec_hist.iter().collect();
+            v.sort_by(|a, b| b.1.cmp(a.1));
+            for ((func_id, fail_index), n) in v.into_iter().take(8) {
+                eprintln!(
+                    "[jit-stats] exec_hist func_id={func_id} fail_index={fail_index} roundtrips={n}"
+                );
+            }
+        }
     }
     let packed = match run_result {
         Ok(p) => p,
@@ -756,14 +807,27 @@ fn jit_execute(caller: &mut Caller<'_, Host>, func_id: u32, frame_ptr: u32) -> R
     };
     let mut results = [Val::I32(0)];
     trace.call(&mut *caller, &[Val::I32(frame_ptr as i32)], &mut results)?;
-    Ok(match results[0] {
+    let ret = match results[0] {
         Val::I32(x) => x as u32,
         _ => 0,
-    })
+    };
+    // Diagnostic: record which (trace, guard-exit fail_index) round-tripped.
+    if std::env::var_os("PYRE_WASM_EXEC_TRACE").is_some() {
+        if let Some(mem) = caller.data().memory {
+            let fail_index = read_u32(&mem, &*caller, frame_ptr as usize);
+            *caller
+                .data_mut()
+                .exec_hist
+                .entry((func_id, fail_index))
+                .or_insert(0) += 1;
+        }
+    }
+    Ok(ret)
 }
 
 /// Dispatch a residual call requested by a running trace.
 fn jit_call_trampoline(caller: &mut Caller<'_, Host>, frame_ptr: u32) -> Result<()> {
+    caller.data_mut().jit_call_count += 1;
     let memory = caller.data().memory.context("memory")?;
     let table = caller.data().table.context("table")?;
     let frame = frame_ptr as usize;

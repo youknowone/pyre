@@ -52,8 +52,11 @@ fn test_empty_trace() {
         0,
         0,
         0,
-        0, // fail_index_base
-        0, // external_jump_slot
+        None, // nursery
+        0,    // fail_index_base
+        true, // is_loop
+        0,    // external_jump_slot
+        0,    // external_jump_key
         codegen::CaParams::default(),
     )
     .expect("wasm codegen should succeed");
@@ -113,8 +116,11 @@ fn test_int_add_loop() {
         0,
         0,
         0,
-        0, // fail_index_base
-        0, // external_jump_slot
+        None, // nursery
+        0,    // fail_index_base
+        true, // is_loop
+        0,    // external_jump_slot
+        0,    // external_jump_key
         codegen::CaParams::default(),
     )
     .expect("wasm codegen should succeed");
@@ -176,8 +182,11 @@ fn test_float_ops() {
         0,
         0,
         0,
-        0, // fail_index_base
-        0, // external_jump_slot
+        None, // nursery
+        0,    // fail_index_base
+        true, // is_loop
+        0,    // external_jump_slot
+        0,    // external_jump_key
         codegen::CaParams::default(),
     )
     .expect("wasm codegen should succeed");
@@ -215,8 +224,11 @@ fn test_call_generates_import() {
         0,
         0,
         0,
-        0, // fail_index_base
-        0, // external_jump_slot
+        None, // nursery
+        0,    // fail_index_base
+        true, // is_loop
+        0,    // external_jump_slot
+        0,    // external_jump_key
         codegen::CaParams::default(),
     )
     .expect("wasm codegen should succeed");
@@ -311,8 +323,11 @@ fn test_guard_types() {
         0,
         0,
         0,
-        0, // fail_index_base
-        0, // external_jump_slot
+        None, // nursery
+        0,    // fail_index_base
+        true, // is_loop
+        0,    // external_jump_slot
+        0,    // external_jump_key
         codegen::CaParams::default(),
     )
     .expect("wasm codegen should succeed");
@@ -357,8 +372,11 @@ fn test_exception_guards() {
         0,
         0,
         0,
-        0, // fail_index_base
-        0, // external_jump_slot
+        None, // nursery
+        0,    // fail_index_base
+        true, // is_loop
+        0,    // external_jump_slot
+        0,    // external_jump_key
         codegen::CaParams::default(),
     )
     .expect("wasm codegen should succeed");
@@ -399,8 +417,11 @@ fn test_guard_gc_type_uses_immediate_typeid() {
         0,
         0,
         0,
-        0, // fail_index_base
-        0, // external_jump_slot
+        None, // nursery
+        0,    // fail_index_base
+        true, // is_loop
+        0,    // external_jump_slot
+        0,    // external_jump_key
         codegen::CaParams::default(),
     )
     .expect("wasm codegen should succeed");
@@ -463,8 +484,11 @@ fn test_guard_is_object_lowers_to_typeinfo_test() {
         0,
         0,
         0,
-        0, // fail_index_base
-        0, // external_jump_slot
+        None, // nursery
+        0,    // fail_index_base
+        true, // is_loop
+        0,    // external_jump_slot
+        0,    // external_jump_key
         codegen::CaParams::default(),
     )
     .expect("wasm codegen should succeed when supports_guard_gc_type=true");
@@ -515,8 +539,11 @@ fn test_guard_subclass_lowers_to_subclassrange_check() {
         0,
         0,
         0,
-        0, // fail_index_base
-        0, // external_jump_slot
+        None, // nursery
+        0,    // fail_index_base
+        true, // is_loop
+        0,    // external_jump_slot
+        0,    // external_jump_key
         codegen::CaParams::default(),
     )
     .expect("wasm codegen should succeed when supports_guard_gc_type=true");
@@ -534,8 +561,11 @@ fn test_guard_subclass_lowers_to_subclassrange_check() {
         0,
         0,
         0,
-        0, // fail_index_base
-        0, // external_jump_slot
+        None, // nursery
+        0,    // fail_index_base
+        true, // is_loop
+        0,    // external_jump_slot
+        0,    // external_jump_key
         codegen::CaParams::default(),
     )
     .expect("wasm codegen should succeed when vtable_offset is set");
@@ -602,8 +632,11 @@ fn test_sameas_and_conversions() {
         0,
         0,
         0,
-        0, // fail_index_base
-        0, // external_jump_slot
+        None, // nursery
+        0,    // fail_index_base
+        true, // is_loop
+        0,    // external_jump_slot
+        0,    // external_jump_key
         codegen::CaParams::default(),
     )
     .expect("wasm codegen should succeed");
@@ -656,8 +689,11 @@ fn test_overflow_ops() {
         0,
         0,
         0,
-        0, // fail_index_base
-        0, // external_jump_slot
+        None, // nursery
+        0,    // fail_index_base
+        true, // is_loop
+        0,    // external_jump_slot
+        0,    // external_jump_key
         codegen::CaParams::default(),
     )
     .expect("wasm codegen should succeed");
@@ -714,8 +750,11 @@ fn test_single_label_peeled_loop_validates() {
         0,
         0,
         0,
-        0, // fail_index_base
-        0, // external_jump_slot
+        None, // nursery
+        0,    // fail_index_base
+        true, // is_loop
+        0,    // external_jump_slot
+        0,    // external_jump_key
         codegen::CaParams::default(),
     )
     .expect("wasm codegen should succeed");
@@ -779,8 +818,11 @@ fn test_multi_label_peeled_resumes_at_last_label_validates() {
         0,
         0,
         0,
-        0, // fail_index_base
-        0, // external_jump_slot
+        None, // nursery
+        0,    // fail_index_base
+        true, // is_loop
+        0,    // external_jump_slot
+        0,    // external_jump_key
         codegen::CaParams::default(),
     )
     .expect("wasm codegen should succeed");

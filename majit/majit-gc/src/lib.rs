@@ -57,6 +57,14 @@ pub mod flags {
     pub const DUMMY: u64 = 1 << 12;
 }
 
+/// True when the `gc_stress` test feature is compiled in: every allocation
+/// may then run a full collection inside `alloc_with_type`, so JIT fast
+/// paths that bypass it (inline nursery bump) must stay disabled or the
+/// stress coverage silently shrinks to non-JIT allocations.
+pub fn gc_stress_enabled() -> bool {
+    cfg!(feature = "gc_stress")
+}
+
 /// Write barrier descriptor — information the JIT needs to emit write barrier checks.
 ///
 /// From rpython/jit/backend/llsupport/gc.py WriteBarrierDescr.
@@ -372,6 +380,23 @@ pub trait GcAllocator: Send {
     /// allocators with no byte accounting.
     fn heap_byte_stats(&self) -> (usize, usize) {
         (0, 0)
+    }
+
+    /// Diagnostic only: `(minor_collections, major_collections)` run so far.
+    /// Used to attribute run time to collection cadence (e.g. old-gen churn
+    /// driving repeated majors). Default `(0, 0)` for stub allocators.
+    fn collection_counts(&self) -> (usize, usize) {
+        (0, 0)
+    }
+
+    /// Whether a JIT inline nursery bump of `type_id` is equivalent to
+    /// `alloc_with_type`'s fast path: the type registers no destructor and is
+    /// not a weakref (either would need a side-list push at allocation, i.e.
+    /// the slow path). Mirrors rewrite.py's malloc fast-path eligibility
+    /// (types with finalizers/weakrefs keep the call). Default `false` so
+    /// stub allocators keep the helper path.
+    fn type_alloc_is_plain(&self, _type_id: u32) -> bool {
+        false
     }
 
     /// Look up the fixed-object size for a registered GC type.

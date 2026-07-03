@@ -67,6 +67,13 @@ pub fn wasm_gc_heap_stats() -> (usize, usize) {
     majit_backend_wasm::active_gc_heap_stats()
 }
 
+/// Diagnostic only: `(minor_collections, major_collections)` of the wasm
+/// backend's GC on this thread. Companion to [`wasm_gc_heap_stats`].
+#[cfg(target_arch = "wasm32")]
+pub fn wasm_gc_collection_counts() -> (usize, usize) {
+    majit_backend_wasm::active_gc_collection_counts()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

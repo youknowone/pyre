@@ -2806,6 +2806,17 @@ impl GcAllocator for MiniMarkGC {
         self.alloc_in_oldgen(type_id, total_size)
     }
 
+    fn collection_counts(&self) -> (usize, usize) {
+        (self.minor_collections, self.major_collections)
+    }
+
+    fn type_alloc_is_plain(&self, type_id: u32) -> bool {
+        (type_id as usize) < self.types.len() && {
+            let info = self.types.get(type_id);
+            info.destructor.is_none() && !info.is_weakref
+        }
+    }
+
     fn is_managed_heap_object(&self, addr: usize) -> bool {
         self.is_valid_gc_object(addr) && (self.nursery.contains(addr) || self.oldgen.contains(addr))
     }

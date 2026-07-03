@@ -31,9 +31,9 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 /// did not resolve (target_ord None), 9 = target_ord Some but != last label,
 /// 10 = arity mismatch, 11 = loop-closing bridge advances no loop-carried value
 /// (guard side-trace that would livelock the chained loop).
-pub static BRIDGE_DIAG: [AtomicU64; 14] = {
+pub static BRIDGE_DIAG: [AtomicU64; 16] = {
     const Z: AtomicU64 = AtomicU64::new(0);
-    [Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z]
+    [Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z]
 };
 
 /// Read a `BRIDGE_DIAG` tally (saturating index). Surfaced to the host through
@@ -90,7 +90,43 @@ fn is_inductive_arith(opcode: majit_ir::OpCode) -> bool {
     )
 }
 
-use failguard::{CompiledWasmLoop, WasmFailDescr, WasmFrameData};
+/// Per-guard (per-trace order), per-fail-arg: whether the value was produced
+/// by induction-advancing arithmetic in the part of the trace that re-runs on
+/// every pass — the ops after the loop-header (last) LABEL, or the WHOLE trace
+/// when it has no LABEL (a bridge, or a Label-less recursion loop, whose body
+/// runs in full each pass). Such a fail arg is fresh in the failing iteration,
+/// so a loop-closing bridge that JUMPs it verbatim still advances the chained
+/// loop⇄bridge cycle (`compile_bridge`'s livelock check).
+fn guard_fail_args_advanced(
+    ops: &[majit_ir::Op],
+    guard_exits: &[codegen::GuardExit],
+) -> Vec<Vec<bool>> {
+    let start = ops
+        .iter()
+        .rposition(|op| op.opcode == majit_ir::OpCode::Label)
+        .map_or(0, |p| p + 1);
+    let advanced_ids: std::collections::HashSet<u32> = ops[start..]
+        .iter()
+        .filter(|op| is_inductive_arith(op.opcode))
+        .map(|op| op.pos.get())
+        .filter(|r| *r != majit_ir::OpRef::NONE && !r.is_constant())
+        .map(|r| r.raw())
+        .collect();
+    guard_exits
+        .iter()
+        .map(|g| {
+            g.fail_arg_refs
+                .iter()
+                .map(|r| !r.is_constant() && advanced_ids.contains(&r.raw()))
+                .collect()
+        })
+        .collect()
+}
+
+use failguard::{
+    ChainedTraceMeta, CompiledWasmLoop, LabelTarget, WasmFailDescr, WasmFrameData, fail_descr_base,
+    global_fail_descr, label_target, publish_label_target, register_fail_descrs,
+};
 use majit_backend::{AsmInfo, BackendError, DeadFrame, JitCellToken};
 use majit_gc::GcAllocator;
 use majit_ir::{FailDescr, GcRef, InputArg, Op, OpRc, Value};
@@ -177,6 +213,59 @@ fn with_wasm_active_gc<R>(f: impl FnOnce(&dyn GcAllocator) -> R) -> Option<R> {
 /// runner split GC-retained memory from host-heap growth.
 pub fn active_gc_heap_stats() -> (usize, usize) {
     with_wasm_active_gc(|gc| gc.heap_byte_stats()).unwrap_or((0, 0))
+}
+
+/// Diagnostic: `(minor_collections, major_collections)` of the active GC, or
+/// `(0, 0)` when none is installed. Companion to [`active_gc_heap_stats`].
+pub fn active_gc_collection_counts() -> (usize, usize) {
+    with_wasm_active_gc(|gc| gc.collection_counts()).unwrap_or((0, 0))
+}
+
+/// Assemble the inline nursery-bump parameters for this trace's `New` /
+/// `NewWithVtable` ops (rewrite.py malloc-fast-path eligibility over the
+/// gc.py:525-531 nursery address surface), or `None` when no GC is active,
+/// the `gc_stress` feature is compiled in (the fast path would bypass its
+/// per-allocation stress collections), or no allocation op qualifies.
+fn nursery_alloc_params(ops: &[Op]) -> Option<codegen::NurseryAllocParams> {
+    if majit_gc::gc_stress_enabled() || !wasm_inline_alloc_enabled() {
+        return None;
+    }
+    let tids: std::collections::HashSet<u32> = ops
+        .iter()
+        .filter_map(|op| match op.opcode {
+            majit_ir::OpCode::New | majit_ir::OpCode::NewWithVtable => {
+                Some(op.getdescr()?.as_size_descr()?.type_id())
+            }
+            majit_ir::OpCode::NewArray | majit_ir::OpCode::NewArrayClear => {
+                Some(op.getdescr()?.as_array_descr()?.type_id())
+            }
+            _ => None,
+        })
+        .collect();
+    if tids.is_empty() {
+        return None;
+    }
+    with_wasm_active_gc(|gc| {
+        let free_addr = gc.nursery_free_addr();
+        let top_addr = gc.nursery_top_addr();
+        if free_addr == 0 || top_addr == 0 {
+            return None;
+        }
+        let plain_tids: std::collections::HashSet<u32> = tids
+            .iter()
+            .copied()
+            .filter(|&t| gc.type_alloc_is_plain(t))
+            .collect();
+        if plain_tids.is_empty() {
+            return None;
+        }
+        Some(codegen::NurseryAllocParams {
+            free_addr: free_addr as u32,
+            top_addr: top_addr as u32,
+            large_threshold: gc.max_nursery_object_size(),
+            plain_tids,
+        })
+    })?
 }
 
 /// `majit_gc::CollectOldgenFn` installed by `set_gc_allocator`. Drives the
@@ -318,16 +407,36 @@ pub extern "C" fn wasm_jit_write_barrier(obj: i64) -> i64 {
     0
 }
 
+thread_local! {
+    /// Live CA callee frames in recursion order (mirrors the CA entries on
+    /// the jf shadow stack): `(frame_addr, alloc_capacity_bytes)`. Popped
+    /// into [`CA_FRAME_POOL`] by `wasm_jit_ca_pop_frame`.
+    static CA_ACTIVE_FRAMES: std::cell::RefCell<Vec<(usize, usize)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// LIFO pool of retired CA callee frames available for reuse. Strict CA
+    /// recursion order means the top entry is almost always the geometry the
+    /// next call wants, so the whole recursion runs on a handful of frames
+    /// instead of allocating one per call. Entries stay registered as libc
+    /// jitframes and are never freed (bounded by peak recursion depth).
+    static CA_FRAME_POOL: std::cell::RefCell<Vec<(usize, usize)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// Self-recursive CALL_ASSEMBLER (`PYRE_WASM_CA`) callee-frame allocation
-/// trampoline. Allocates the callee's execution frame as a real GC-managed
-/// `JitFrame` in **old-gen** (non-moving ⇒ the frame pointer the callee holds in
-/// its wasm local 0 never dangles across a collection; `alloc_in_oldgen` never
-/// itself collects, so the caller's still-unrooted Ref locals stay valid),
-/// initializes its header + per-frame `jf_gcmap` (covering the callee's input +
-/// home Ref slots), and pushes it on the jitframe shadow stack so a
-/// mid-recursion collection forwards those Refs via the gcmap custom trace.
+/// helper. Allocates the callee's execution frame as a **libc-jitframe**
+/// (malloc memory, like dynasm's `execute_token` calloc frames — registered
+/// via `register_libc_jitframe` so the collector's jf-root walk traces its
+/// gcmap-marked Ref slots), initializes its header + per-frame `jf_gcmap`
+/// (covering the callee's input + home Ref slots), and pushes it on the
+/// jitframe shadow stack so a mid-recursion collection forwards those Refs
+/// via the registered libc-jitframe tracer. Malloc (not nursery/old-gen)
+/// keeps the frame non-moving AND off the GC's `bytes_made_old_since_cycle`
+/// accounting — a per-call old-gen frame made every recursion level look
+/// like heap growth and drove back-to-back major collections (fib: 1704
+/// majors for one bench run). Frames are pooled LIFO on pop and re-zeroed on
+/// reuse, so steady-state recursion performs no allocator calls at all.
 /// Returns the frame base (codegen adds `FIRST_ITEM_OFFSET` for the
-/// bespoke-layout frame pointer), or 0 if no GC / type id is installed.
+/// bespoke-layout frame pointer), or 0 on allocation failure.
 ///
 /// Each callee frame self-describes through its own per-frame gcmap, so
 /// mixed-geometry frames from distinct CA bridges are each forwarded by their
@@ -335,34 +444,59 @@ pub extern "C" fn wasm_jit_write_barrier(obj: i64) -> i64 {
 /// frame's interior as a smaller frame's slots.
 pub extern "C" fn wasm_jit_ca_alloc_frame(frame_bytes: i64, gcmap_ptr: i64) -> i64 {
     use majit_backend::jitframe::JitFrame;
-    let tid = wasm_jitframe_tid();
-    if tid == 0 {
-        return 0;
-    }
     let depth = frame_bytes as usize / std::mem::size_of::<isize>();
-    let frame = wasm_alloc_oldgen_typed(tid, JitFrame::alloc_size(depth));
-    if frame.0 == 0 {
-        return 0;
-    }
-    let jf = frame.0 as *mut JitFrame;
+    let alloc_size = JitFrame::alloc_size(depth);
+    // Reuse the pool top when it is large enough (`>=` also covers a smaller
+    // bridge nesting inside a larger one). A too-small top is left in place —
+    // the fresh frame below re-pools on top of it in LIFO order.
+    let reused = CA_FRAME_POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        match pool.last() {
+            Some(&(_, cap)) if cap >= alloc_size => pool.pop(),
+            _ => None,
+        }
+    });
+    let (addr, cap) = match reused {
+        Some((addr, cap)) => {
+            // `JitFrame::init` expects zero-filled memory, and the gcmap-marked
+            // slots must not expose the previous run's stale Refs to a tracer.
+            unsafe { std::ptr::write_bytes(addr as *mut u8, 0, alloc_size) };
+            (addr, cap)
+        }
+        None => {
+            let layout = std::alloc::Layout::from_size_align(alloc_size, 16)
+                .expect("CA frame layout overflow");
+            let p = unsafe { std::alloc::alloc_zeroed(layout) };
+            if p.is_null() {
+                return 0;
+            }
+            majit_gc::shadow_stack::register_libc_jitframe(p as usize);
+            (p as usize, alloc_size)
+        }
+    };
+    let jf = addr as *mut JitFrame;
     unsafe {
         JitFrame::init(jf, std::ptr::null(), depth);
         (*jf).jf_gcmap = gcmap_ptr as *const u8;
     }
-    majit_gc::shadow_stack::push_jf(frame);
-    frame.0 as i64
+    CA_ACTIVE_FRAMES.with(|v| v.borrow_mut().push((addr, cap)));
+    majit_gc::shadow_stack::push_jf(GcRef(addr));
+    addr as i64
 }
 
 /// Companion to [`wasm_jit_ca_alloc_frame`]: pop the top jitframe shadow-stack
-/// entry on CA-arm exit (the callee frame just ran to finish/deopt). The CA
-/// recursion is strict LIFO — each level pushes one frame before its
-/// `call_indirect` and pops after, and a deopt resume runs on the host's own
-/// shadow stack — so removing the top entry releases exactly this callee's
-/// frame.
+/// entry on CA-arm exit (the callee frame just ran to finish/deopt) and move
+/// the frame into the reuse pool. The CA recursion is strict LIFO — each level
+/// pushes one frame before its `call_indirect` and pops after, and a deopt
+/// resume runs on the host's own shadow stack — so removing the top entry
+/// releases exactly this callee's frame.
 pub extern "C" fn wasm_jit_ca_pop_frame(_frame_base: i64) -> i64 {
     let depth = majit_gc::shadow_stack::jf_depth();
     if depth > 0 {
         majit_gc::shadow_stack::pop_jf_to(depth - 1);
+    }
+    if let Some(entry) = CA_ACTIVE_FRAMES.with(|v| v.borrow_mut().pop()) {
+        CA_FRAME_POOL.with(|pool| pool.borrow_mut().push(entry));
     }
     0
 }
@@ -464,22 +598,26 @@ pub struct WasmBackend {
     constants: majit_ir::VecMap<u32, i64>,
     /// llmodel.py:64-69 self.vtable_offset.
     vtable_offset: Option<usize>,
-    /// `PYRE_WASM_CA` (default off): compile a self-recursive single-int
-    /// `CallAssemblerR` bridge into an in-module `call_indirect` into the source
-    /// loop's table slot (guest→guest recursion) instead of declining it to a
-    /// per-call host round-trip. Read from the process-global [`WASM_CA_ENABLED`]
-    /// at construction so flag-off is byte-identical. Slice 1 is correct only
-    /// under a huge nursery (the fresh callee frames are not GC-rooted; see the
-    /// CA arm in codegen).
+    /// `PYRE_WASM_CA` (default ON; `=0` kill switch): compile a self-recursive
+    /// single-int `CallAssemblerR` bridge into an in-module `call_indirect`
+    /// into the source loop's table slot (guest→guest recursion) instead of
+    /// declining it to a per-call host round-trip. Read from the
+    /// process-global [`WASM_CA_ENABLED`] at construction so flag-off is
+    /// byte-identical. Callee frames are GC-visible libc-jitframes
+    /// (per-frame `jf_gcmap`, jf-shadow-stack rooted; see
+    /// `wasm_jit_ca_alloc_frame`), so the arm is collection-safe at any
+    /// nursery size.
     wasm_ca_enabled: bool,
 }
 
-/// Process-global toggle for the self-recursive CALL_ASSEMBLER arm. The wasm
-/// guest has no environment (`std::env::var` always fails there), so the host
-/// runner reads `PYRE_WASM_CA` and flips this through the `pyre_jit_set_wasm_ca`
-/// export — mirroring how `pyre_jit_set_enable_bridges` plumbs the bridge tracer
-/// flag. `WasmBackend::new` snapshots it.
-static WASM_CA_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Process-global toggle for the self-recursive CALL_ASSEMBLER arm, default
+/// ON (without it the fib recursion shape round-trips through the host per
+/// call — suite `fib_recursive` times out). The wasm guest has no environment
+/// (`std::env::var` always fails there), so the host runner reads
+/// `PYRE_WASM_CA` (`=0` disables) and flips this through the
+/// `pyre_jit_set_wasm_ca` export — mirroring how `pyre_jit_set_enable_bridges`
+/// plumbs the bridge tracer flag. `WasmBackend::new` snapshots it.
+static WASM_CA_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// Host entry point for the `pyre_jit_set_wasm_ca` export (and native tests).
 pub fn set_wasm_ca_enabled(enabled: bool) {
@@ -492,6 +630,43 @@ pub fn set_wasm_ca_enabled(enabled: bool) {
 /// bridge in-module instead of round-tripping to the host.
 pub fn wasm_ca_enabled() -> bool {
     WASM_CA_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Process-global toggle for in-module bridge chaining, mirroring
+/// `call_jit::WASM_BRIDGES_ENABLED` (the tracer-side flag the
+/// `pyre_jit_set_enable_bridges` export sets; the export pushes it here too).
+/// `execute_token` reads it to size every host frame's Ref-home region at
+/// least `failguard::FRAME_REF_HOME_FLOOR` — the sizing the frame-fit accept
+/// check in `compile_bridge` relies on — while keeping the flag-off frame
+/// layout untouched. Default ON (`PYRE_WASM_ENABLE_BRIDGES=0` disables via
+/// the runner).
+static WASM_BRIDGES_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Host entry point for the `pyre_jit_set_enable_bridges` export (and tests).
+pub fn set_wasm_bridges_enabled(enabled: bool) {
+    WASM_BRIDGES_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether in-module bridge chaining is enabled (see `WASM_BRIDGES_ENABLED`).
+pub fn wasm_bridges_enabled() -> bool {
+    WASM_BRIDGES_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Inline nursery-bump allocation fast path (rewrite.py malloc fast path;
+/// see `codegen::NurseryAllocParams`). Default ON; `PYRE_WASM_INLINE_ALLOC=0`
+/// (plumbed by the runner through `pyre_jit_set_inline_alloc`) is the kill
+/// switch — every `New*` then goes back through the allocation helper call.
+static WASM_INLINE_ALLOC_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Toggle the inline nursery-bump fast path (kill switch plumbing).
+pub fn set_wasm_inline_alloc_enabled(enabled: bool) {
+    WASM_INLINE_ALLOC_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn wasm_inline_alloc_enabled() -> bool {
+    WASM_INLINE_ALLOC_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// GC type id of the `JitFrame`. The single registration authority is `eval.rs`
@@ -510,6 +685,9 @@ pub fn set_wasm_jitframe_tid(id: u32) {
     WASM_JITFRAME_TID.store(id, std::sync::atomic::Ordering::Relaxed);
 }
 
+// Only read on the wasm32 execute_token path (CA frame allocs use libc
+// jitframes and no longer consume the tid).
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 fn wasm_jitframe_tid() -> u32 {
     WASM_JITFRAME_TID.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -867,25 +1045,21 @@ fn bridge_is_self_recursive_int_ca(ops: &[Op], source_loop_number: u64) -> bool 
 /// enter: `frame[0]` holds the exit `fail_index`, `frame[1..]` the exit slots,
 /// and the pending-exception cell is captured with `jit_exc_take` exactly as
 /// `execute_token` does after a GuardNoException / GuardException exit.
-/// `compiled_ptr` is the source loop's [`CompiledWasmLoop`] (baked into the
-/// trace by `compile_bridge`) whose `fail_descrs` resolves the index — the
-/// loop's own and its chained bridges' exits share that one array.
-///
 /// `pyre-jit`'s `call_jit::wasm_ca_resume_deopt` calls this, then drives the
 /// resulting `DeadFrame` through the same `get_latest_descr_arc` /
 /// `get_*_value` / `grab_exc_value` Backend path the host's outermost deopt
 /// handling uses, so the in-guest deopt completes identically.
-pub fn dead_frame_from_ran_frame(compiled_ptr: usize, frame_ptr: usize) -> DeadFrame {
-    let compiled = unsafe { &*(compiled_ptr as *const CompiledWasmLoop) };
+///
+/// `frame[0]` resolves through the GLOBAL fail-index space
+/// (`failguard::global_fail_descr`) — the exit may belong to a bridge chained
+/// past the source loop. `_compiled_ptr` (the source loop's metadata address,
+/// baked into the CA arm) is kept in the trace ABI but no longer consulted.
+pub fn dead_frame_from_ran_frame(_compiled_ptr: usize, frame_ptr: usize) -> DeadFrame {
     let frame = frame_ptr as *const i64;
     let exc_value = jit_exc_take();
     let fail_index = unsafe { *frame } as u32;
-    let fail_descr = compiled
-        .fail_descrs
-        .borrow()
-        .get(fail_index as usize)
-        .expect("invalid fail_index from in-guest CA callee frame")
-        .clone();
+    let fail_descr =
+        global_fail_descr(fail_index).expect("invalid fail_index from in-guest CA callee frame");
     let num_outputs = fail_descr.fail_arg_types.len();
     let raw_values: Vec<i64> = (0..num_outputs)
         .map(|i| unsafe { *frame.add(1 + i) })
@@ -1036,6 +1210,10 @@ impl majit_backend::Backend for WasmBackend {
         let alloc_fn_ptr = wasm_jit_alloc as *const () as usize as i64;
         let alloc_array_fn_ptr = wasm_jit_alloc_array as *const () as usize as i64;
         let wb_fn_ptr = wasm_jit_write_barrier as *const () as usize as i64;
+        // Exit indices come from the global fail-index space so a cross-trace
+        // chain's `frame[0]` resolves regardless of which module wrote it
+        // (`failguard::FAIL_DESCR_REGISTRY`).
+        let fail_index_base = fail_descr_base();
         let (wasm_bytes, guard_exits, num_ref_homes, bridge_cells_base, bridge_cells_owner) =
             codegen::build_wasm_module(
                 inputargs,
@@ -1047,8 +1225,11 @@ impl majit_backend::Backend for WasmBackend {
                 alloc_fn_ptr,
                 alloc_array_fn_ptr,
                 wb_fn_ptr,
-                0, // fail_index_base: a loop owns fail indices [0, num_guards)
+                nursery_alloc_params(ops).as_ref(),
+                fail_index_base,
+                true,                         // is_loop
                 0, // external_jump_slot: a loop's JUMP is a local back-edge `br`
+                0, // external_jump_key: unused without an external JUMP
                 codegen::CaParams::default(), // a loop never emits the CA arm
             )?;
 
@@ -1065,6 +1246,7 @@ impl majit_backend::Backend for WasmBackend {
                 })
             })
             .collect();
+        register_fail_descrs(&fail_descrs);
 
         let max_output_slots = guard_exits
             .iter()
@@ -1098,23 +1280,86 @@ impl majit_backend::Backend for WasmBackend {
         // Skip a LABEL whose descr is not loop-target-backed (`set_label_block_id`
         // would panic on a non-`AtomicU32` slot).
         let mut label_block_id: u32 = 0;
-        let mut last_label_num_args: usize = 0;
+        let mut label_descrs: Vec<usize> = Vec::new();
         for op in ops.iter() {
             if op.opcode != majit_ir::OpCode::Label {
                 continue;
             }
+            // Descr identity of each label, in ordinal order, so
+            // `compile_bridge` can resolve which of THIS loop's labels a
+            // closing JUMP targets by Arc identity (the JUMP and the LABEL
+            // share the descr). The stamped `label_block_id` alone cannot: a
+            // loop retraced into several specializations re-stamps a shared
+            // descr, and every specialization's start label carries ordinal
+            // 0 — a bridge targeting ANOTHER specialization's label would
+            // otherwise be mis-chained into this one.
+            label_descrs.push(
+                op.getdescr()
+                    .map(|d| std::sync::Arc::as_ptr(&d) as *const () as usize)
+                    .unwrap_or(0),
+            );
             if let Some(descr) = op.getdescr() {
                 if let Some(target) = descr.as_loop_target_descr() {
                     target.set_label_block_id(label_block_id);
                 }
             }
-            last_label_num_args = op.getarglist().len();
             label_block_id += 1;
         }
-        // Ordinal of the LAST LABEL (the one codegen emits the `loop` at); 0 when
-        // there are no labels (then `has_preamble` is false and it is unused).
-        let last_label_block_id = label_block_id.saturating_sub(1);
-        let is_single_label_peeled = codegen::is_single_label_peeled(ops);
+        // Per-label resume metadata (ordinal order) for `compile_bridge`'s
+        // accept condition: a loop-closing bridge may resume at ANY label via
+        // the entry `br_table`, provided its JUMP arity matches that label's
+        // arg count and the label's args are the complete live set of the
+        // trace remainder.
+        let label_num_args = codegen::label_arg_counts(ops);
+        let label_resume_safe = codegen::label_resume_safety(ops);
+        // Per-guard, per-fail-arg induction-advance flags for
+        // `compile_bridge`'s livelock check (see `guard_fail_args_advanced`).
+        let guard_fail_arg_advanced = guard_fail_args_advanced(ops, &guard_exits);
+
+        // Publish this loop's enterable labels so a loop-closing bridge from
+        // ANY loop can chain into them in-module (jump-to-existing-trace). A
+        // peeled loop's labels are each enterable through the entry br_table
+        // (key = ordinal + 1). A non-peeled loop has no dispatch: only its
+        // FIRST label is enterable — through the plain entry (key 0), whose
+        // input loader reads `num_inputs` positional slots — and only when
+        // the label's arity equals that (the standard loop shape, whose
+        // first label's args ARE the inputargs).
+        if has_preamble {
+            let last = label_descrs.len().saturating_sub(1);
+            for (j, &id) in label_descrs.iter().enumerate() {
+                if id == 0 {
+                    continue;
+                }
+                publish_label_target(
+                    id,
+                    LabelTarget {
+                        func_handle,
+                        key: j as u32 + 1,
+                        num_args: label_num_args[j],
+                        resume_safe: label_resume_safe[j],
+                        is_last_label: j == last,
+                        num_ref_homes,
+                    },
+                );
+            }
+        } else if let Some(&id) = label_descrs.first() {
+            if id != 0 && label_num_args.first() == Some(&inputargs.len()) {
+                publish_label_target(
+                    id,
+                    LabelTarget {
+                        func_handle,
+                        key: 0,
+                        num_args: inputargs.len(),
+                        resume_safe: true,
+                        // No real ops precede a non-peeled loop's header, so
+                        // an entry re-run lands at the header without any
+                        // advancing segment — the livelock check applies.
+                        is_last_label: true,
+                        num_ref_homes,
+                    },
+                );
+            }
+        }
 
         let compiled = CompiledWasmLoop {
             trace_id,
@@ -1127,13 +1372,14 @@ impl majit_backend::Backend for WasmBackend {
             bridge_cells_base,
             num_guard_cells: guard_exits.len(),
             has_preamble,
-            is_single_label_peeled,
-            last_label_block_id,
-            last_label_num_args,
+            label_descrs,
+            guard_fail_arg_advanced,
             bridge_descr_ranges: std::cell::RefCell::new(Vec::new()),
+            chained_trace_meta: std::cell::RefCell::new(std::collections::HashMap::new()),
             _bridge_cells_owner: bridge_cells_owner,
             _bridge_owned_cells: std::cell::RefCell::new(Vec::new()),
             ca_bridge_ref_homes: std::cell::Cell::new(0),
+            ca_active: std::cell::Cell::new(false),
         };
 
         token.compiled = Some(Box::new(compiled));
@@ -1206,20 +1452,17 @@ impl majit_backend::Backend for WasmBackend {
         // Scalars read from the source loop up front, so the immutable borrow of
         // `original_token` is released before the `&mut self` codegen calls.
         let (
-            source_loop_trace_id,
-            source_cells_base,
-            source_num_cells,
+            source_guard,
+            source_is_direct,
             source_num_ref_homes,
             source_func_handle,
             source_has_preamble,
-            source_is_single_label_peeled,
-            source_last_label_block_id,
-            source_last_label_num_args,
-            base,
             source_max_output_slots,
             source_num_inputs,
             source_loop_finish_fi,
             source_compiled_ptr,
+            source_ca_active,
+            source_has_bridges,
         ) = {
             let source_loop = original_token
                 .compiled
@@ -1240,29 +1483,102 @@ impl majit_backend::Backend for WasmBackend {
                 .find(|d| d.is_finish)
                 .map(|d| d.fail_index)
                 .unwrap_or(0);
+            // Resolve the failing guard's owning trace by the descr's
+            // `trace_id`: the source loop itself, or one of the bridges
+            // already chained onto it (`chained_trace_meta`) — a NESTED
+            // sub-bridge source. Either way the resolution yields the owning
+            // trace's guard-cell array, cell count, and the guard's
+            // per-fail-arg advance flags. `None` = foreign trace (declined
+            // below, diag 3).
+            let is_direct = source_trace_id == source_loop.trace_id;
+            let guard = if is_direct {
+                Some((
+                    source_loop.bridge_cells_base,
+                    source_loop.num_guard_cells,
+                    source_loop
+                        .guard_fail_arg_advanced
+                        .get(source_fail_index as usize)
+                        .cloned()
+                        .unwrap_or_default(),
+                ))
+            } else {
+                source_loop
+                    .chained_trace_meta
+                    .borrow()
+                    .get(&source_trace_id)
+                    .map(|m| {
+                        (
+                            m.cells_base,
+                            m.num_cells,
+                            m.guard_fail_arg_advanced
+                                .get(source_fail_index as usize)
+                                .cloned()
+                                .unwrap_or_default(),
+                        )
+                    })
+            };
             (
-                source_loop.trace_id,
-                source_loop.bridge_cells_base,
-                source_loop.num_guard_cells,
+                guard,
+                is_direct,
                 source_loop.num_ref_homes,
                 source_loop.func_handle,
                 source_loop.has_preamble,
-                source_loop.is_single_label_peeled,
-                source_loop.last_label_block_id,
-                source_loop.last_label_num_args,
-                source_loop.fail_descrs.borrow().len() as u32,
                 source_loop.max_output_slots,
                 source_loop.num_inputs,
                 loop_finish_fi,
-                // Address of the source loop's metadata, baked into the CA arm so
-                // `wasm_ca_resume_deopt` can resolve a deopted callee's
-                // `fail_descrs`. Same lifetime assumption as `source_func_handle`
-                // below: a recompile invalidates this bridge before the loop's
-                // `CompiledWasmLoop` is replaced, so the arm is unreachable with a
-                // stale pointer.
+                // Address of the source loop's metadata, baked into the CA arm
+                // (opaque cookie in the deopt-helper ABI; `frame[0]` resolution
+                // itself goes through the global fail-index space). Same
+                // lifetime assumption as `source_func_handle` below: a
+                // recompile invalidates this bridge before the loop's
+                // `CompiledWasmLoop` is replaced, so the arm is unreachable
+                // with a stale pointer.
                 source_loop as *const CompiledWasmLoop as usize as u64,
+                source_loop.ca_active.get(),
+                !source_loop.bridge_descr_ranges.borrow().is_empty(),
             )
         };
+
+        // The failing guard must belong to the source loop or to a bridge
+        // already chained onto it, and its per-trace index must have a cell in
+        // that trace's array. A foreign descr has no cell to flip; decline so
+        // the metainterp keeps the correct interpreter fallback rather than
+        // installing an unreachable bridge module.
+        let Some((source_cells_base, source_num_cells, source_fail_arg_advanced)) = source_guard
+        else {
+            diag_bump(3); // declined: source guard's trace is not chained here
+            return Err(BackendError::Unsupported(
+                "wasm backend: bridge source guard is not a direct loop guard".into(),
+            ));
+        };
+        if source_fail_index as usize >= source_num_cells {
+            diag_bump(3);
+            return Err(BackendError::Unsupported(
+                "wasm backend: bridge source guard index has no dispatch cell".into(),
+            ));
+        }
+        // The CA arm bakes source-LOOP metadata (finish index, compiled ptr);
+        // restrict it to direct loop guards. A CA-shaped bridge on a nested
+        // guard then fails codegen's CALL_ASSEMBLER handling — a deterministic
+        // decline.
+        let allow_ca = allow_ca && source_is_direct;
+        // The CA arm and further bridge chaining do not compose yet: a chained
+        // bridge deopting inside the CA recursion trips a resume seam that
+        // reads a clobbered class (wrong output on suite
+        // `recursion_memo_branch` / `generator_tree_recursion`; each mechanism
+        // alone is correct). Until that seam is fixed, a recursion gets ONE of
+        // the two: the CA lift only for a loop with no chained bridges yet,
+        // and no further chaining once the CA cell is live — the declined
+        // guard falls back to host round-trips, which handle it correctly.
+        let allow_ca = allow_ca && !source_has_bridges;
+        if !allow_ca && source_ca_active {
+            diag_bump(14); // declined: source recursion is CA-active
+            return Err(BackendError::Unsupported(
+                "wasm backend: source recursion is CA-active; further bridge \
+                 chaining declined"
+                    .into(),
+            ));
+        }
 
         // A loop-closing bridge (terminal JUMP, no local LABEL) re-enters the
         // source loop through `source_func_handle` — the function entry. For a
@@ -1271,14 +1587,17 @@ impl majit_backend::Backend for WasmBackend {
         // instead of resuming at the LABEL, so the induction variable never
         // advances: an infinite loop (the wasm chaining hang on nbody / fannkuch).
         //
-        // A SINGLE-label peeled loop carries the resume-at-LABEL dispatch: the
-        // loop-closing JUMP arm sets the frame dispatch key, so re-entering
-        // through `source_func_handle` skips the preamble and resumes at the
-        // LABEL — chaining stays in-module. Only a MULTI-label peeled loop (the
-        // br_table form is a follow-up) still re-runs its preamble, so decline
-        // it; the guard then falls back to blackhole resume and
-        // `declined_bridge_guards` stops the metainterp re-tracing it. Non-peeled
-        // loops (entry == LABEL) re-enter correctly and keep chaining.
+        // A peeled loop carries the resume-at-LABEL dispatch: the loop-closing
+        // JUMP arm sets the frame dispatch key to `target label ordinal + 1`,
+        // so re-entering through `source_func_handle` `br_table`s to that
+        // label's resume loader — chaining stays in-module. The bridge is
+        // accepted when its JUMP's target label is recoverable from the descr,
+        // the arities match, and the label's args are the complete live set of
+        // the trace remainder (`label_resume_safe`); otherwise decline — the
+        // guard then falls back to blackhole resume and
+        // `declined_bridge_guards` stops the metainterp re-tracing it.
+        // Non-peeled loops (entry == LABEL) re-enter correctly and keep
+        // chaining.
         let bridge_is_loop_closing = {
             let has_label = ops.iter().any(|op| op.opcode == majit_ir::OpCode::Label);
             let has_jump = ops.iter().any(|op| op.opcode == majit_ir::OpCode::Jump);
@@ -1290,43 +1609,77 @@ impl majit_backend::Backend for WasmBackend {
         if source_has_preamble {
             diag_bump(7); // source loop has preamble
         }
-        if bridge_is_loop_closing && source_has_preamble {
-            // The peeled source resumes at its LAST label (where the `loop` is)
-            // via the resume-at-LABEL dispatch. Accept this bridge only if its
-            // terminal JUMP re-enters at that last label: a single-label source
-            // has only that one label, so accept directly; a multi-label source
-            // is accepted only when the JUMP's target ordinal — recovered from
-            // its descr, which the source LABEL stamped with `set_label_block_id`
-            // (shared by Arc identity) — equals the source's last label and the
-            // arities match. Any other target (a non-last label) needs the
-            // deferred br_table, so decline → blackhole resume, and
-            // `declined_bridge_guards` stops the metainterp re-tracing it.
-            let resumes_at_last_label = source_is_single_label_peeled || {
-                let closing_jump = ops
-                    .iter()
-                    .rev()
-                    .find(|op| op.opcode == majit_ir::OpCode::Jump);
-                let target_ord = closing_jump
-                    .and_then(|j| j.getdescr())
-                    .and_then(|d| d.as_loop_target_descr().map(|t| t.label_block_id()));
-                let arity = closing_jump.map_or(0, |j| j.getarglist().len());
-                // Sub-breakdown of why a multi-label bridge does not resume at the
-                // last label (diagnostic: distinguishes the S2-needing non-last
-                // case from a stripped descr or an arity mismatch).
-                match target_ord {
-                    None => diag_bump(8),                                       // descr stripped
-                    Some(k) if k != source_last_label_block_id => diag_bump(9), // non-last label
-                    _ if arity != source_last_label_num_args => diag_bump(10),  // arity mismatch
-                    _ => {}
+        // Resolve the terminal JUMP's target label BY DESCR IDENTITY through
+        // the `LABEL_TARGETS` registry — the JUMP and its target LABEL share
+        // the loop-target descr Arc, and every compiled loop published its
+        // enterable labels there. The stamped `label_block_id` ordinal is NOT
+        // identity: a retraced loop has several sibling specializations whose
+        // start labels all carry ordinal 0, and a bridge legitimately closes
+        // into a SIBLING (jump-to-existing-trace) — the registry resolves the
+        // owning module's table slot and resume key, so the tail call chains
+        // into the RIGHT loop, own or sibling. Decline when the target is
+        // unpublished (descr stripped, or its loop declined/was dropped), the
+        // JUMP arity differs from the label's arg count (the resume loader
+        // reads exactly that many positional frame slots), the label's args
+        // are not the complete live set of the target trace's remainder
+        // (`resume_safe` — resuming there would read a null local), or the
+        // target loop's Ref-home region exceeds what the chain's entry frame
+        // is guaranteed to carry (`max(source homes, FRAME_REF_HOME_FLOOR)` —
+        // the frame `execute_token` sized for the loop the chain entered
+        // through; requiring target ≤ that bound keeps every hop within the
+        // entry frame by induction, since the entry frame itself is sized to
+        // at least the floor). Ref homes are the only variable requirement:
+        // value slots are bounded by codegen's `CALL_AREA_FIRST_SLOT` decline,
+        // below the constant `MIN_FRAME_BYTES / 8` value region every host
+        // frame carries. A declined guard falls back to blackhole resume and
+        // `declined_bridge_guards` stops the metainterp re-tracing it.
+        let mut external_jump_key: u32 = 0;
+        let mut external_jump_slot: u32 = source_func_handle;
+        let mut resumes_at_loop_header = false;
+        if bridge_is_loop_closing {
+            let closing_jump = ops
+                .iter()
+                .rev()
+                .find(|op| op.opcode == majit_ir::OpCode::Jump);
+            let target = closing_jump
+                .and_then(|j| j.getdescr())
+                .map(|d| std::sync::Arc::as_ptr(&d) as *const () as usize)
+                .filter(|id| *id != 0)
+                .and_then(label_target);
+            let arity = closing_jump.map_or(0, |j| j.getarglist().len());
+            let accepted_target = match target {
+                // Descr stripped, or the target label was never published.
+                None => {
+                    diag_bump(8);
+                    false
                 }
-                matches!(target_ord, Some(k) if k == source_last_label_block_id)
-                    && arity == source_last_label_num_args
+                Some(t) if arity != t.num_args => {
+                    diag_bump(10); // arity mismatch
+                    false
+                }
+                Some(t) if !t.resume_safe => {
+                    diag_bump(9); // label args not the full live set
+                    false
+                }
+                Some(t)
+                    if t.num_ref_homes
+                        > source_num_ref_homes.max(failguard::FRAME_REF_HOME_FLOOR) =>
+                {
+                    diag_bump(4); // target Ref homes exceed the entry frame's bound
+                    false
+                }
+                Some(t) => {
+                    external_jump_key = t.key;
+                    external_jump_slot = t.func_handle;
+                    resumes_at_loop_header = t.is_last_label;
+                    true
+                }
             };
-            if !resumes_at_last_label {
-                diag_bump(2); // declined: peeled source, JUMP not resuming at last label
+            if !accepted_target {
+                diag_bump(2); // declined: JUMP target not chainable
                 return Err(BackendError::Unsupported(
-                    "wasm backend: loop-closing bridge re-enters a peeled loop at a \
-                     non-last label (resume-at-LABEL br_table deferred)"
+                    "wasm backend: loop-closing bridge JUMP target is not a \
+                     chainable published label"
                         .into(),
                 ));
             }
@@ -1345,7 +1698,29 @@ impl majit_backend::Backend for WasmBackend {
         // to blackhole resume and `declined_bridge_guards` stops the metainterp
         // re-tracing it. A genuinely advancing loop-closing bridge (an `i += 1`
         // counter feeding a JUMP arg) passes and keeps chaining.
-        if bridge_is_loop_closing {
+        //
+        // The check only concerns a bridge that lands directly AT the loop
+        // header (the target's last label, or the entry of a non-peeled
+        // loop): only then can the guard re-fail on byte-identical state. A
+        // resume at an EARLIER label executes the segment between that label
+        // and the header — the peeled iteration — which advances the state
+        // before the loop re-runs, so no advance is required of the bridge
+        // itself.
+        if bridge_is_loop_closing && resumes_at_loop_header {
+            // Bridge input position `k` reads frame slot `k`, where the source
+            // guard spilled its k-th fail arg — so an `InputArg` JUMP arg is a
+            // verbatim reload of source fail arg `k`. The advance for such an
+            // arg may have happened in the SOURCE loop's body before the guard
+            // (an `i += 1` preceding the failing branch): the source recorded
+            // per-fail-arg whether the value was produced by induction-
+            // advancing arithmetic within the failing iteration
+            // (`guard_fail_arg_advanced`), so consult that alongside the
+            // in-bridge producers.
+            let input_pos: std::collections::HashMap<u32, usize> = inputargs
+                .iter()
+                .enumerate()
+                .map(|(k, ia)| (ia.index, k))
+                .collect();
             let advances = ops
                 .iter()
                 .rev()
@@ -1355,10 +1730,37 @@ impl majit_backend::Backend for WasmBackend {
                         majit_ir::operand::Operand::Op(producer) => {
                             is_inductive_arith(producer.opcode)
                         }
+                        majit_ir::operand::Operand::InputArg(ia) => {
+                            input_pos.get(&ia.index).is_some_and(|&k| {
+                                source_fail_arg_advanced.get(k).copied().unwrap_or(false)
+                            })
+                        }
                         _ => false,
                     })
                 });
-            if !advances {
+            // Loop state carried on the HEAP (a permutation array flipped via
+            // setarrayitem, an object field bumped via setfield, a residual
+            // call's arbitrary effects) advances the cycle without any JUMP
+            // arg showing inductive arithmetic. The shield only exists to
+            // refuse PROVABLY static bridges, so any state-mutating op counts
+            // as an advance.
+            let mutates_heap = ops.iter().any(|op| {
+                use majit_ir::OpCode::*;
+                op.opcode.is_call()
+                    || matches!(
+                        op.opcode,
+                        SetfieldGc
+                            | SetfieldRaw
+                            | SetarrayitemGc
+                            | SetarrayitemRaw
+                            | GcStore
+                            | GcStoreIndexed
+                            | RawStore
+                            | Strsetitem
+                            | Unicodesetitem
+                    )
+            });
+            if !advances && !mutates_heap {
                 diag_bump(11); // declined: loop-closing bridge advances no loop-carried value
                 return Err(BackendError::Unsupported(
                     "wasm backend: loop-closing bridge advances no loop-carried value \
@@ -1366,20 +1768,6 @@ impl majit_backend::Backend for WasmBackend {
                         .into(),
                 ));
             }
-        }
-
-        // This simple chaining handles a bridge attached directly to one of the
-        // source loop's own guards (the common loop-exit continuation). A nested
-        // bridge (source guard living in another bridge) or a foreign descr has
-        // no cell in this loop's array; decline so the metainterp keeps the
-        // correct interpreter fallback rather than installing an unreachable
-        // bridge module.
-        if source_trace_id != source_loop_trace_id || source_fail_index as usize >= source_num_cells
-        {
-            diag_bump(3); // declined: not a direct loop guard
-            return Err(BackendError::Unsupported(
-                "wasm backend: bridge source guard is not a direct loop guard".into(),
-            ));
         }
 
         self.collect_constants_from_ops(ops);
@@ -1407,8 +1795,24 @@ impl majit_backend::Backend for WasmBackend {
         // region and a minor collection mid-recursion reclaims it, leaving a later
         // deopt to read zeroed nursery memory. `count_ref_homes` matches the
         // `num_ref_homes` `build_wasm_module` returns below.
+        //
+        // With bridge chaining on, the recursion can also chain into NESTED
+        // bridges (and sibling loops via loop-closing tail calls) while running
+        // ON a CA callee frame — and those were accepted against the
+        // `FRAME_REF_HOME_FLOOR` bound `execute_token` guarantees for HOST
+        // frames. The callee frame must give the same guarantee, or a chained
+        // bridge homes/reads Ref slots past the frame's sized (and gcmap-walked)
+        // region — wrong-value corruption (suite `recursion_memo_branch` /
+        // `generator_tree_recursion`). Mirror `execute_token`'s `chain_floor`.
+        let chain_floor = if wasm_bridges_enabled() {
+            failguard::FRAME_REF_HOME_FLOOR
+        } else {
+            0
+        };
         let ca_ref_homes = if allow_ca {
-            source_num_ref_homes.max(codegen::count_ref_homes(inputargs, ops))
+            source_num_ref_homes
+                .max(codegen::count_ref_homes(inputargs, ops))
+                .max(chain_floor)
         } else {
             source_num_ref_homes
         };
@@ -1436,7 +1840,10 @@ impl majit_backend::Backend for WasmBackend {
             codegen::CaParams::default()
         };
 
-        let (wasm_bytes, guard_exits, num_ref_homes, _bridge_cells_base, bridge_cells_owner) =
+        // This bridge's exit indices come from the global fail-index space,
+        // like every trace's (`failguard::FAIL_DESCR_REGISTRY`).
+        let base = fail_descr_base();
+        let (wasm_bytes, guard_exits, num_ref_homes, bridge_cells_base, bridge_cells_owner) =
             codegen::build_wasm_module(
                 inputargs,
                 ops,
@@ -1447,17 +1854,24 @@ impl majit_backend::Backend for WasmBackend {
                 alloc_fn_ptr,
                 alloc_array_fn_ptr,
                 wb_fn_ptr,
+                nursery_alloc_params(ops).as_ref(),
                 base,
-                // A loop-closing bridge's terminal JUMP re-enters the source loop
-                // through its table slot via a tail call.
-                source_func_handle,
+                false, // is_loop
+                // A loop-closing bridge's terminal JUMP re-enters the target
+                // loop (own or sibling, resolved via `LABEL_TARGETS`) through
+                // its table slot via a tail call, resuming at the label
+                // `external_jump_key` selects.
+                external_jump_slot,
+                external_jump_key,
                 ca_params,
             )?;
 
-        // The bridge runs in the source loop's fixed-size frame, so it must not
-        // address more Ref-home slots than the loop reserved. If it would,
-        // decline: the host round-trip path allocates a frame sized for the
-        // bridge. The bridge's value/output slots need no separate bound check:
+        // The bridge runs in the chain's entry frame, so it must not address
+        // more Ref-home slots than that frame is guaranteed to carry —
+        // `max(source loop's homes, FRAME_REF_HOME_FLOOR)`, the same inductive
+        // bound as the JUMP-target check above. If it would, decline: the host
+        // round-trip path allocates a frame sized for the bridge.
+        // The bridge's value/output slots need no separate bound check:
         // `build_wasm_module` already declined this bridge (above, via `?`) if
         // its value slots reach `CALL_AREA_FIRST_SLOT` (codegen.rs), and
         // `execute_token` floors the frame at `MIN_FRAME_BYTES/8` slots — which
@@ -1470,11 +1884,11 @@ impl majit_backend::Backend for WasmBackend {
         // (`callee_frame_bytes`), and the outermost call runs in the host entry
         // frame `F0`, which `execute_token` widens via `ca_bridge_ref_homes`
         // (set below). So its home writes never overflow.
-        if !allow_ca && num_ref_homes > source_num_ref_homes {
+        if !allow_ca && num_ref_homes > source_num_ref_homes.max(failguard::FRAME_REF_HOME_FLOOR) {
             diag_bump(4); // declined: ref-home overflow
             return Err(BackendError::Unsupported(format!(
-                "wasm backend: bridge needs {num_ref_homes} ref homes, source loop has \
-                 {source_num_ref_homes}"
+                "wasm backend: bridge needs {num_ref_homes} ref homes, entry frame bound is \
+                 max({source_num_ref_homes}, floor)"
             )));
         }
 
@@ -1491,6 +1905,7 @@ impl majit_backend::Backend for WasmBackend {
                 })
             })
             .collect();
+        register_fail_descrs(&bridge_descrs);
 
         // Register the bridge module into the shared table, then publish its
         // descrs and flip the source guard's cell. Order matters: the descrs
@@ -1522,11 +1937,23 @@ impl majit_backend::Backend for WasmBackend {
                 let start = descrs.len();
                 descrs.extend(bridge_descrs);
                 source_loop.bridge_descr_ranges.borrow_mut().push((
+                    source_trace_id,
                     source_fail_index,
                     start,
                     count,
                 ));
             }
+            // Publish this bridge's own guard-dispatch metadata so a hot guard
+            // INSIDE it can chain a nested sub-bridge (same resolution the
+            // loop's own guards get, keyed by this bridge's trace_id).
+            source_loop.chained_trace_meta.borrow_mut().insert(
+                trace_id,
+                ChainedTraceMeta {
+                    cells_base: bridge_cells_base,
+                    num_cells: guard_exits.len(),
+                    guard_fail_arg_advanced: guard_fail_args_advanced(ops, &guard_exits),
+                },
+            );
             // The bridge module lives as long as this source loop, so hand its
             // own cell array (if any) to the loop, freed when the loop drops.
             if let Some(owner) = bridge_cells_owner {
@@ -1539,6 +1966,9 @@ impl majit_backend::Backend for WasmBackend {
             if allow_ca {
                 let prev = source_loop.ca_bridge_ref_homes.get();
                 source_loop.ca_bridge_ref_homes.set(prev.max(num_ref_homes));
+                // Freeze this recursion to the CA mechanism: no further bridge
+                // chains here (see the decline above the codegen call).
+                source_loop.ca_active.set(true);
             }
         }
 
@@ -1659,7 +2089,7 @@ impl majit_backend::Backend for WasmBackend {
     fn compiled_bridge_fail_descr_layouts(
         &self,
         original_token: &JitCellToken,
-        _source_trace_id: u64,
+        source_trace_id: u64,
         source_fail_index: u32,
     ) -> Option<Vec<majit_backend::FailDescrLayout>> {
         let compiled = original_token
@@ -1672,8 +2102,8 @@ impl majit_backend::Backend for WasmBackend {
             .borrow()
             .iter()
             .rev()
-            .find(|r| r.0 == source_fail_index)
-            .map(|&(_, start, count)| (start, count))?;
+            .find(|r| r.0 == source_trace_id && r.1 == source_fail_index)
+            .map(|&(_, _, start, count)| (start, count))?;
         let descrs = compiled.fail_descrs.borrow();
         let layouts = descrs
             .get(start..start + count)?
@@ -1714,7 +2144,7 @@ impl majit_backend::Backend for WasmBackend {
     fn store_bridge_guard_hashes(
         &self,
         token: &JitCellToken,
-        _source_trace_id: u64,
+        source_trace_id: u64,
         source_fail_index: u32,
         hashes: &[u64],
     ) {
@@ -1730,8 +2160,8 @@ impl majit_backend::Backend for WasmBackend {
             .borrow()
             .iter()
             .rev()
-            .find(|r| r.0 == source_fail_index)
-            .map(|&(_, start, count)| (start, count))
+            .find(|r| r.0 == source_trace_id && r.1 == source_fail_index)
+            .map(|&(_, _, start, count)| (start, count))
         else {
             return;
         };
@@ -1772,9 +2202,19 @@ impl majit_backend::Backend for WasmBackend {
         // outermost call in this frame and may home more Refs than the loop, so
         // size for the LARGER of the two (`ca_bridge_ref_homes`); the extra slots
         // are zeroed and GC-rooted below exactly like the loop's own homes.
+        // With bridge chaining on, a cross-trace tail call can land in a loop
+        // or bridge homing more Refs than this one, so also size at least
+        // `FRAME_REF_HOME_FLOOR` — the bound `compile_bridge`'s frame-fit
+        // accept checks rely on. Flag-off keeps the exact old sizing.
+        let chain_floor = if wasm_bridges_enabled() {
+            failguard::FRAME_REF_HOME_FLOOR
+        } else {
+            0
+        };
         let eff_ref_homes = compiled
             .num_ref_homes
-            .max(compiled.ca_bridge_ref_homes.get());
+            .max(compiled.ca_bridge_ref_homes.get())
+            .max(chain_floor);
         let frame_size = base_slots + 1 + eff_ref_homes;
         #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
         {
@@ -1837,12 +2277,11 @@ impl majit_backend::Backend for WasmBackend {
 
                 let exc_value = jit_exc_take();
                 let fail_index = unsafe { *(items_base as *const i64) } as u32;
-                let fail_descr = compiled
-                    .fail_descrs
-                    .borrow()
-                    .get(fail_index as usize)
-                    .expect("invalid fail_index from compiled wasm")
-                    .clone();
+                // Global fail-index space: a cross-trace chain may exit through
+                // a sibling loop's guard, so `frame[0]` never resolves against
+                // this loop's own `fail_descrs`.
+                let fail_descr =
+                    global_fail_descr(fail_index).expect("invalid fail_index from compiled wasm");
                 let num_outputs = fail_descr.fail_arg_types.len();
                 let raw_values: Vec<i64> = (0..num_outputs)
                     .map(|i| unsafe { *((items_base + fsb + i * 8) as *const i64) })
@@ -1891,12 +2330,9 @@ impl majit_backend::Backend for WasmBackend {
             }
             let exc_value = jit_exc_take();
             let fail_index = frame[0] as u32;
-            let fail_descr = compiled
-                .fail_descrs
-                .borrow()
-                .get(fail_index as usize)
-                .expect("invalid fail_index from compiled wasm")
-                .clone();
+            // Global fail-index space (see the CA-path resolution above).
+            let fail_descr =
+                global_fail_descr(fail_index).expect("invalid fail_index from compiled wasm");
             let num_outputs = fail_descr.fail_arg_types.len();
             let raw_values: Vec<i64> = (0..num_outputs).map(|i| frame[1 + i]).collect();
             DeadFrame {

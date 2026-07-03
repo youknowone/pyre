@@ -313,18 +313,55 @@ fn has_ref_store_op(ops: &[Op], ref_homes: &RefHomes) -> bool {
         .any(|op| write_barrier_base(op, ref_homes).is_some())
 }
 
-/// Emit a write-barrier trampoline call on `base_ref` before a ref-storing
-/// field/array store. The host helper `wasm_jit_write_barrier` checks
-/// TRACK_YOUNG_PTRS and remembers an old→young store, standing in for the
-/// `COND_CALL_GC_WB` the native GC rewrite pass inserts. Operand-stack-neutral:
-/// every push is consumed by a store or the call.
+/// Emit a write-barrier check on `base_ref` before a ref-storing field/array
+/// store, standing in for the `COND_CALL_GC_WB` the native GC rewrite pass
+/// inserts. When the residual type family is declared (`residual_type_base`),
+/// the TRACK_YOUNG_PTRS flag is tested INLINE (assembler.py:2382
+/// `genop_discard_cond_call_gc_wb` — test the header flag byte, jump over the
+/// slow call when clear) and only a flagged old object takes the
+/// `wasm_jit_write_barrier` `call_indirect`; a young or already-remembered
+/// base skips the helper entirely. Otherwise the unconditional helper routes
+/// through the `jit_call` host trampoline (the helper re-checks the flag).
+/// Operand-stack-neutral: every push is consumed by a store, the call, or
+/// the result drop.
 fn emit_write_barrier(
     sink: &mut InstructionSink<'_>,
     constants: &majit_ir::VecMap<u32, i64>,
-    jit_call: u32,
+    jit_call_idx: Option<u32>,
+    residual_type_base: Option<u32>,
     wb_fn_ptr: i64,
     base_ref: OpRef,
 ) {
+    if let Some(base) = residual_type_base {
+        // Header word is a u64 at `obj - GcHeader::SIZE` with the flags in
+        // its upper half (`FLAG_SHIFT == 32`), so on little-endian wasm32 the
+        // flags live in the i32 at `obj - 4`; TRACK_YOUNG_PTRS is flag bit 0.
+        const FLAGS_HALF_BACKOFS: i32 = (majit_gc::header::GcHeader::SIZE / 2) as i32;
+        const WB_FLAG: i32 = majit_gc::flags::TRACK_YOUNG_PTRS as i32;
+        const _: () = assert!(majit_gc::header::FLAG_SHIFT == 32);
+        const _: () = assert!(majit_gc::flags::TRACK_YOUNG_PTRS <= u32::MAX as u64);
+        emit_resolve(sink, constants, base_ref);
+        sink.i32_wrap_i64();
+        sink.i32_const(FLAGS_HALF_BACKOFS);
+        sink.i32_sub();
+        sink.i32_load(MemArg {
+            offset: 0,
+            align: 2,
+            memory_index: 0,
+        });
+        sink.i32_const(WB_FLAG);
+        sink.i32_and();
+        sink.if_(BlockType::Empty);
+        emit_resolve(sink, constants, base_ref);
+        sink.i32_const(wb_fn_ptr as i32);
+        sink.call_indirect(0, base + 1);
+        sink.drop(); // returns 0; ignored
+        sink.end();
+        return;
+    }
+    let Some(jit_call) = jit_call_idx else {
+        return;
+    };
     // func_ptr = wasm_jit_write_barrier
     sink.local_get(0);
     sink.i64_const(wb_fn_ptr);
@@ -479,6 +516,62 @@ fn residual_call_i64_arity(op: &Op) -> Option<usize> {
     Some(nargs)
 }
 
+/// Void-recorded counterpart of [`residual_call_i64_arity`]: an eligible
+/// void residual CALL whose descr records the dummy-word C ABI
+/// (`result_size == 8`, minted by `make_call_descr_void_word_abi`) — the
+/// callee is really `(i64×n) -> i64` with the result ignored, so it lowers
+/// through the same i64 type family with a trailing `drop`. A plain void
+/// descr (`result_size == 0`) may target a genuinely `()`-returning callee
+/// OR a word-returning one (the reflective host trampoline absorbs the
+/// difference), so it stays on `jit_call`. Same force/GIL/cond exclusions
+/// as the i64 family.
+fn residual_call_void_word_arity(op: &Op) -> Option<usize> {
+    use OpCode::*;
+    if !matches!(op.opcode, CallN | CallPureN | CallLoopinvariantN) {
+        return None;
+    }
+    let descr = op.getdescr()?;
+    let cd = descr.as_call_descr()?;
+    if cd.result_type() != Type::Void || cd.result_size() != 8 {
+        return None;
+    }
+    let arg_types = cd.arg_types();
+    if arg_types
+        .iter()
+        .any(|t| !matches!(t, Type::Int | Type::Ref))
+    {
+        return None;
+    }
+    let nargs = op.getarglist().len().saturating_sub(1);
+    if arg_types.len() != nargs {
+        return None;
+    }
+    Some(nargs)
+}
+
+/// Arity of `op`'s in-module `(i64×n) -> i64` lowering, if it has one: an
+/// eligible residual CALL (word-result or word-ABI void), a `New*`
+/// allocation (the `wasm_jit_alloc*` helper targets are plain
+/// `extern "C" fn(i64×n) -> i64` table entries), or a ref-storing store
+/// (its `wasm_jit_write_barrier` helper takes 1 arg). All of these share
+/// the residual-call type family, so one max covers them.
+fn direct_helper_i64_arity(op: &Op, ref_homes: &RefHomes) -> Option<usize> {
+    if let Some(n) = residual_call_i64_arity(op) {
+        return Some(n);
+    }
+    if let Some(n) = residual_call_void_word_arity(op) {
+        return Some(n);
+    }
+    match op.opcode {
+        // wasm_jit_alloc(type_id, size)
+        OpCode::New | OpCode::NewWithVtable => Some(2),
+        // wasm_jit_alloc_array(type_id, base_size, item_size, length, len_offset)
+        OpCode::NewArray | OpCode::NewArrayClear => Some(5),
+        // wasm_jit_write_barrier(base)
+        _ => write_barrier_base(op, ref_homes).map(|_| 1),
+    }
+}
+
 fn has_call_ops(ops: &[Op]) -> bool {
     // Allocation ops (`New*`, `Newstr`/`Newunicode`) also reach the host via
     // the `jit_call` trampoline, so the import must be present for them too.
@@ -609,9 +702,10 @@ pub struct CaParams {
     /// `fail_descrs`.
     pub source_compiled_ptr: u64,
     /// `__indirect_function_table` slot (`fn as usize`) of
-    /// `lib.rs::wasm_jit_ca_alloc_frame`. The CA arm routes through the
-    /// `jit_call` trampoline to allocate each callee frame as a GC-managed
-    /// old-gen `JitFrame` (push_jf-rooted, traced by its own per-frame gcmap).
+    /// `lib.rs::wasm_jit_ca_alloc_frame`, which allocates each callee frame as
+    /// a GC-managed old-gen `JitFrame` (push_jf-rooted, traced by its own
+    /// per-frame gcmap). `call_indirect`ed in-module through the residual
+    /// `(i64,i64)->i64` type when declared, else via the `jit_call` trampoline.
     pub ca_alloc_fn_ptr: i64,
     /// `__indirect_function_table` slot of `lib.rs::wasm_jit_ca_pop_frame`,
     /// called on CA-arm exit to pop the callee frame off the jitframe shadow
@@ -621,6 +715,25 @@ pub struct CaParams {
     /// callee frame's CA input + home Ref slots; baked into each frame's
     /// `jf_gcmap` field at alloc time.
     pub callee_gcmap_ptr: i64,
+}
+
+/// Inline nursery-bump fast-path parameters for `New`/`NewWithVtable`
+/// (rewrite.py's malloc fast path over the gc.py:525-531
+/// `get_nursery_free_addr`/`get_nursery_top_addr` surface, which the x86
+/// backend lowers as `malloc_cond`: load free, bump, compare top, call the
+/// slow path only on overflow). `None` keeps every allocation on the
+/// `wasm_jit_alloc` helper call.
+pub struct NurseryAllocParams {
+    /// Linear-memory address of the GC's `nursery_free` bump pointer.
+    pub free_addr: u32,
+    /// Linear-memory address of the GC's `nursery_top` limit pointer.
+    pub top_addr: u32,
+    /// `max_nursery_object_size` — a total size above this allocates in
+    /// old-gen, so the inline path only applies below it.
+    pub large_threshold: usize,
+    /// Type ids whose allocation is a plain bump + header write (no
+    /// destructor / weakref side-list registration).
+    pub plain_tids: std::collections::HashSet<u32>,
 }
 
 /// Build a wasm module from majit IR.
@@ -634,7 +747,14 @@ pub fn build_wasm_module(
     alloc_fn_ptr: i64,
     alloc_array_fn_ptr: i64,
     wb_fn_ptr: i64,
+    // Inline nursery-bump fast path for eligible `New`/`NewWithVtable`
+    // (see `NurseryAllocParams`); `None` keeps allocations on the helper.
+    nursery: Option<&NurseryAllocParams>,
     fail_index_base: u32,
+    // Whether this trace is compiled as a LOOP (`compile_loop`) rather than a
+    // bridge. The base alone cannot tell them apart: both draw it from the
+    // global fail-index space (`failguard::fail_descr_base`).
+    is_loop: bool,
     // Table slot of the loop a JUMP-with-no-local-LABEL re-enters (a loop-closing
     // bridge). `0` for a loop trace (its JUMP is a local back-edge `br`) and for a
     // straight-line bridge (no JUMP). When set, the terminal external JUMP writes
@@ -642,18 +762,22 @@ pub fn build_wasm_module(
     // loop's table slot — a wasm tail call, so the loop⇄bridge cycle runs at
     // constant stack depth instead of growing one frame per iteration.
     external_jump_slot: u32,
+    // Resume-at-LABEL dispatch key for the terminal external JUMP (`target
+    // label ordinal + 1`, or 0 for a non-peeled target); see `build_function`.
+    external_jump_key: u32,
     // Self-recursive CALL_ASSEMBLER arm parameters (`PYRE_WASM_CA`); `emit_ca`
     // off keeps the module byte-identical.
     ca: CaParams,
 ) -> Result<(Vec<u8>, Vec<GuardExit>, usize, u32, Option<Box<[u32]>>), BackendError> {
     let (mut guards, num_vars) = collect_guards_and_vars(inputargs, ops);
 
-    // A bridge's guard/finish exits share one fail-index namespace with the
-    // source loop they attach to: their descrs are appended to the source
-    // loop's `fail_descrs` (so `execute_token` resolves `fail_descrs[frame[0]]`
-    // uniformly), and `frame[0]` carries the global index. `build_function`
-    // seeds its `guard_idx` counter with this base so each exit writes
-    // `base + local`; mirror that here on the returned `GuardExit.fail_index`.
+    // Every trace's guard/finish exits draw their indices from ONE global
+    // fail-index space (`failguard::FAIL_DESCR_REGISTRY`): a cross-trace chain
+    // can exit through a sibling loop's guard, so `frame[0]` must be
+    // resolvable without knowing which chained module wrote it.
+    // `build_function` seeds its `guard_idx` counter with this base so each
+    // exit writes `base + local`; mirror that here on the returned
+    // `GuardExit.fail_index`.
     for g in &mut guards {
         g.fail_index += fail_index_base;
     }
@@ -668,14 +792,17 @@ pub fn build_wasm_module(
     // trace reads it and `compile_bridge` (guest-side) writes it. On native
     // builds the trace is never executed, so `alloc_bridge_cells` returns 0 and
     // the dispatch is omitted entirely — the module stays byte-identical.
-    // A loop-closing bridge needs a `Label` to chain into; the
-    // self-recursive CALL_ASSEMBLER case (`PYRE_WASM_CA`) chains a guard exit of
-    // a Label-less recursion loop (`fail_index_base == 0` ⇒ a loop, not a
-    // bridge) into its CA bridge, so allocate cells for that too. Gated on the
-    // flag, so flag-off stays byte-identical.
+    // Label-less traces that still want guard cells: the self-recursive
+    // CALL_ASSEMBLER case (`PYRE_WASM_CA`) chains a guard exit of a Label-less
+    // recursion LOOP (`is_loop`, not a bridge) into its CA bridge; and with
+    // bridge chaining on, a BRIDGE's own guards chain nested sub-bridges the
+    // same way (a hot guard inside a chained bridge would otherwise round-trip
+    // to the host forever). Both gated on their runtime flags, so flag-off
+    // stays byte-identical.
     let want_dispatch = !guards.is_empty()
         && (ops.iter().any(|op| op.opcode == OpCode::Label)
-            || (fail_index_base == 0 && crate::wasm_ca_enabled()));
+            || (is_loop && crate::wasm_ca_enabled())
+            || (!is_loop && crate::wasm_bridges_enabled()));
     let (cells_base, cells_owner) = if want_dispatch {
         alloc_bridge_cells(guards.len())
     } else {
@@ -740,11 +867,24 @@ pub fn build_wasm_module(
     let needs_table = needs_call || bridge_dispatch || ca.emit_ca;
 
     // In-module residual calls (`WASM_DIRECT_RESIDUAL_CALL`): the largest
-    // eligible `(i64×n)->i64` residual-call arity in this trace, or `None` if
-    // there are none. Each distinct arity `0..=max` gets its own function type
-    // (declared below) so the CALL arm can `call_indirect` with a static type.
+    // eligible `(i64×n)->i64` arity in this trace — residual CALLs (word
+    // result or word-ABI void) plus the `New*` / write-barrier helper
+    // targets, which share the same uniform-i64 ABI — or `None` if there
+    // are none. Each distinct arity `0..=max` gets its own function type
+    // (declared below) so those arms can `call_indirect` with a static type.
     let residual_max_arity = if WASM_DIRECT_RESIDUAL_CALL {
-        ops.iter().filter_map(residual_call_i64_arity).max()
+        let scanned = ops
+            .iter()
+            .filter_map(|op| direct_helper_i64_arity(op, &ref_homes))
+            .max();
+        if ca.emit_ca {
+            // The CA arm's frame helpers (`wasm_jit_ca_alloc_frame(frame_bytes,
+            // gcmap_ptr)` / `wasm_jit_ca_pop_frame(frame_base)`) lower through
+            // this same `(i64×n)->i64` family; make sure arity 2 is declared.
+            Some(scanned.map_or(2, |m| m.max(2)))
+        } else {
+            scanned
+        }
     } else {
         None
     };
@@ -846,11 +986,13 @@ pub fn build_wasm_module(
         alloc_fn_ptr,
         alloc_array_fn_ptr,
         wb_fn_ptr,
+        nursery,
         &ref_homes,
         cells_base,
         bridge_dispatch,
         fail_index_base,
         external_jump_slot,
+        external_jump_key,
         residual_max_arity.map(|_| residual_type_base),
         ca,
         bridge_finish_fi,
@@ -881,14 +1023,21 @@ fn build_function(
     alloc_fn_ptr: i64,
     alloc_array_fn_ptr: i64,
     wb_fn_ptr: i64,
+    nursery: Option<&NurseryAllocParams>,
     ref_homes: &RefHomes,
     cells_base: u32,
     bridge_dispatch: bool,
     fail_index_base: u32,
     external_jump_slot: u32,
+    // Resume-at-LABEL dispatch key the terminal external JUMP writes before
+    // tail-calling `external_jump_slot`: `target label ordinal + 1`, so the
+    // target's entry `br_table` lands on that label's resume loader. `0` when
+    // the target is not peeled (no dispatch reads the slot).
+    external_jump_key: u32,
     // Base wasm type index of the `(i64×n)->i64` residual-call types (type
     // `residual_type_base + n` for arity `n`), or `None` when the trace has no
-    // eligible residual call so the CALL arm always uses the `jit_call` path.
+    // eligible residual call / `New*` / write barrier, so those arms always
+    // use the `jit_call` path.
     residual_type_base: Option<u32>,
     // Self-recursive CALL_ASSEMBLER arm (`PYRE_WASM_CA`). `ca.emit_ca` off keeps
     // the body byte-identical.
@@ -913,9 +1062,13 @@ fn build_function(
     // flag-off module keeps exactly one i32 local (byte-identical).
     let ca_cfp_local = num_vars + UMULHI_SCRATCH + 2;
     let ca_fi_local = num_vars + UMULHI_SCRATCH + 3;
+    // One more i32 scratch when the inline nursery-bump fast path is armed:
+    // it holds the loaded `nursery_free` across the bump/commit sequence.
+    let base_i32_locals: u32 = if ca.emit_ca { 3 } else { 1 };
+    let alloc_scratch_local = num_vars + UMULHI_SCRATCH + 1 + base_i32_locals;
     let mut func = Function::new(vec![
         (num_vars + UMULHI_SCRATCH, ValType::I64),
-        (if ca.emit_ca { 3 } else { 1 }, ValType::I32),
+        (base_i32_locals + nursery.is_some() as u32, ValType::I32),
     ]);
     let mut sink = func.instructions();
 
@@ -937,37 +1090,61 @@ fn build_function(
     let loop_label_idx = ops.iter().rposition(|op| op.opcode == OpCode::Label);
     let has_loop = loop_label_idx.is_some();
 
-    // A Label-less recursion loop with bridge dispatch (`PYRE_WASM_CA`): there is
-    // no `loop`, but its guard/Finish exits still need to `br` to the function
-    // epilogue so the epilogue's cell dispatch can chain a failing guard into its
-    // CA bridge (instead of each guard early-returning to the host). Wrap the
-    // body in one exit `block` and route exits through it, exactly as a loop
-    // does. Only loops reach here (`bridge_dispatch` is gated on
-    // `fail_index_base == 0` for the Label-less case), so a CA bridge — itself
-    // Label-less — keeps its byte-identical straight-line layout.
-    let ca_straightline_dispatch = !has_loop && bridge_dispatch;
+    // A Label-less trace with bridge dispatch — a `PYRE_WASM_CA` recursion
+    // loop, or (chaining on) a bridge whose own guards chain nested
+    // sub-bridges: there is no `loop`, but its guard/Finish exits still need
+    // to `br` to the function epilogue so the epilogue's cell dispatch can
+    // chain a failing guard in-module (instead of each guard early-returning
+    // to the host). Wrap the body in one exit `block` and route exits through
+    // it, exactly as a loop does. A loop-closing bridge's terminal external
+    // JUMP is unaffected — `return_call_indirect` leaves the function from
+    // inside the block.
+    let straightline_dispatch = !has_loop && bridge_dispatch;
 
     // Resume-at-LABEL: a peeled loop wraps its preamble in a dispatch so a
-    // loop-closing bridge can re-enter AT the (last) LABEL — where the `loop`
-    // is — skipping the preamble, in-module instead of round-tripping through
-    // the host. Keyed on the peeled shape (single- OR multi-label); every other
-    // trace (non-peeled loop, straight-line, bridge) keeps its byte-identical
-    // layout. The dispatch resumes only at the LAST label, so the wrapper is
-    // byte-identical whether the source is single- or multi-label — the
-    // multi-label-but-non-last-label case is declined in `compile_bridge`.
+    // loop-closing bridge can re-enter AT any LABEL — key = label ordinal + 1
+    // — skipping the code before it, in-module instead of round-tripping
+    // through the host. Keyed on the peeled shape (single- OR multi-label);
+    // every other trace (non-peeled loop, straight-line, bridge) keeps its
+    // byte-identical layout. Each label gets a (past_loader, loader) block
+    // pair; the entry `br_table` jumps to the keyed label's resume loader,
+    // and the fall-through path `br`s over each loader. Key 0 (and any
+    // out-of-range key) runs the function from its entry (the preamble).
     let key_dispatch = is_resumable_peeled(ops);
+    let num_labels = ops.iter().filter(|op| op.opcode == OpCode::Label).count();
+    let all_label_args: Vec<Vec<OpRef>> = if key_dispatch {
+        ops.iter()
+            .filter(|op| op.opcode == OpCode::Label)
+            .map(|op| op.getarglist().iter().map(|a| a.to_opref()).collect())
+            .collect()
+    } else {
+        Vec::new()
+    };
     if key_dispatch {
         // block $exit (A) — guard/Finish exits br here -> epilogue.
-        // block $past_loader (B) — the preamble path br's over the resume loader.
-        // block $skip_preamble (C) — a resuming bridge br's out of here, past the
-        //   preamble + entry loader, landing in the resume loader.
+        // Per label j (opened outermost = last label):
+        //   block $past_loader_j (B_j) — the fall-through path br's over the
+        //     label-j resume loader.
+        //   block $loader_j (C_j) — the `br_table` lands here (its end) for
+        //     key j+1: the label-j resume loader.
+        // block $dispatch (D) — key 0 br's here: run from the entry.
         sink.block(BlockType::Empty); // A $exit
-        sink.block(BlockType::Empty); // B $past_loader
-        sink.block(BlockType::Empty); // C $skip_preamble
+        for _ in 0..num_labels {
+            sink.block(BlockType::Empty); // B_j (j descending)
+            sink.block(BlockType::Empty); // C_j
+        }
+        sink.block(BlockType::Empty); // D $dispatch
         sink.local_get(0);
         sink.i64_load(mem64(DISPATCH_KEY_OFS));
         sink.i32_wrap_i64();
-        sink.br_if(0); // key != 0 -> resume: skip the preamble + entry loader
+        // Depths at this point, innermost first: D=0, then (C_j, B_j) pairs
+        // with C_j at 2j+1. Entry j+1 of the table targets C_j; entry 0 and
+        // the default target D (the entry path).
+        let br_targets: Vec<u32> = std::iter::once(0)
+            .chain((0..num_labels as u32).map(|j| 2 * j + 1))
+            .collect();
+        sink.br_table(br_targets, 0);
+        sink.end(); // end D $dispatch — key-0 entry path continues here
     }
 
     // Load inputs from frame into locals, and store Ref inputs to their homes.
@@ -996,62 +1173,70 @@ fn build_function(
     }
 
     // Non-key_dispatch loop: the single exit block A (preamble + body share it).
-    // key_dispatch already opened A/B/C above. A Label-less CA dispatch loop also
-    // opens A so its guard/Finish exits `br` out to the epilogue.
-    if (has_loop || ca_straightline_dispatch) && !key_dispatch {
+    // key_dispatch already opened A/B/C above. A Label-less dispatch trace (CA
+    // loop, or a bridge chaining nested sub-bridges) also opens A so its
+    // guard/Finish exits `br` out to the epilogue.
+    if (has_loop || straightline_dispatch) && !key_dispatch {
         sink.block(BlockType::Empty);
     }
 
     // Seed with the fail-index base so each guard/finish exit writes
-    // `base + local` into `frame[0]` (loops pass 0; bridges pass the source
-    // loop's descr count so their indices land past the loop's). The local
+    // `base + local` into `frame[0]` (every trace passes the next free index
+    // of the global fail-index space, `failguard::fail_descr_base`). The local
     // `guard_idx` counter and `collect_guards_and_vars`'s `fail_index` counter
     // increment in lockstep over the same ops, so the value written matches the
     // returned `GuardExit.fail_index` (also offset by the base).
     let mut guard_idx = fail_index_base;
     let mut in_loop_body = false;
+    let mut labels_passed = 0usize;
 
     for (op_idx, op) in ops.iter().enumerate() {
-        if Some(op_idx) == loop_label_idx {
-            if key_dispatch {
-                // End of the preamble (key-0 path). Branch over the resume
-                // loader to the loop, then close C, emit the loader (resume
-                // path only), close B, and open the loop. From inside C, `br 1`
-                // targets B's end (just before the loop), skipping the loader.
-                sink.br(1); // preamble done -> past_loader, over the resume loader
-                sink.end(); // end C $skip_preamble (resume path lands here)
-                // Resume loader: a loop-closing bridge wrote each label arg into
-                // frame slot i (positionally, matching the in-loop JUMP move);
-                // load them into the label-arg locals and refresh their Ref
-                // homes, mirroring the JUMP's ref-home refresh below. The
-                // preamble path skipped this via the `br 1` above.
-                let label_args = find_label_args(ops);
-                for (i, la) in label_args.iter().enumerate() {
+        if op.opcode == OpCode::Label && key_dispatch {
+            // End of the segment before label j (key-0 / earlier-label path).
+            // Branch over the resume loader, then close C_j, emit the loader
+            // (resume path only), and close B_j. From inside C_j, `br 1`
+            // targets B_j's end, skipping the loader.
+            sink.br(1); // segment done -> past_loader_j, over the resume loader
+            sink.end(); // end C_j (the br_table lands here for key j+1)
+            // Resume loader: a loop-closing bridge wrote each label arg into
+            // frame slot i (positionally, matching the in-loop JUMP move);
+            // load them into the label-arg locals and refresh their Ref
+            // homes, mirroring the JUMP's ref-home refresh below. The
+            // fall-through path skipped this via the `br 1` above.
+            for (i, la) in all_label_args[labels_passed].iter().enumerate() {
+                sink.local_get(0);
+                sink.i64_load(mem64(FRAME_SLOT_BASE + i as u64 * SLOT_SIZE));
+                sink.local_set(1 + la.raw());
+                if let Some(h) = ref_homes.home(*la) {
                     sink.local_get(0);
-                    sink.i64_load(mem64(FRAME_SLOT_BASE + i as u64 * SLOT_SIZE));
-                    sink.local_set(1 + la.raw());
-                    if let Some(h) = ref_homes.home(*la) {
-                        sink.local_get(0);
-                        sink.local_get(1 + la.raw());
-                        sink.i64_store(mem64(HOME_SLOT_BASE + h as u64 * SLOT_SIZE));
-                    }
+                    sink.local_get(1 + la.raw());
+                    sink.i64_store(mem64(HOME_SLOT_BASE + h as u64 * SLOT_SIZE));
                 }
-                sink.end(); // end B $past_loader
             }
+            sink.end(); // end B_j $past_loader
+            labels_passed += 1;
+        }
+        if Some(op_idx) == loop_label_idx {
             sink.loop_(BlockType::Empty);
             in_loop_body = true;
         }
         // Depth (from statement level) of the enclosing `block` that guard
         // exits `br` to. Without `key_dispatch`: preamble = 0, loop body = 1
         // (the `loop` sits between the body and block A). With `key_dispatch`
-        // the preamble sits two blocks deeper (inside B and C), so it br's to
-        // depth 2; the body is unchanged at 1 (B and C close before the loop).
-        // `None` for straight-line traces (no block emitted).
+        // a segment that still has `num_labels - labels_passed` labels ahead
+        // sits inside that many (B_j, C_j) pairs, so it br's to depth
+        // `2 * remaining`; the body is unchanged at 1 (every pair closes
+        // before the loop). `None` for straight-line traces (no block
+        // emitted).
         let block_exit_depth = match (has_loop, in_loop_body) {
-            // Label-less CA dispatch loop: one exit block A (depth 0), no `loop`.
-            (false, _) if ca_straightline_dispatch => Some(0u32),
+            // Label-less dispatch trace: one exit block A (depth 0), no `loop`.
+            (false, _) if straightline_dispatch => Some(0u32),
             (false, _) => None,
-            (true, false) => Some(if key_dispatch { 2u32 } else { 0u32 }),
+            (true, false) => Some(if key_dispatch {
+                2 * (num_labels - labels_passed) as u32
+            } else {
+                0u32
+            }),
             (true, true) => Some(1u32),
         };
         match op.opcode {
@@ -1079,15 +1264,15 @@ fn build_function(
                     sink.i64_store(mem64(FRAME_SLOT_BASE + i as u64 * SLOT_SIZE));
                 }
                 // Set the resume-at-LABEL dispatch key so a peeled target
-                // re-enters at its (last) LABEL — skipping the preamble — instead
-                // of re-running it from the function entry. Harmless for a
-                // non-peeled target, which has no dispatch and ignores the slot.
-                // `compile_bridge` only compiles this bridge when its JUMP
-                // resumes at the target's last label (always so for a single-
-                // label source; checked via the JUMP descr for a multi-label
-                // one), so key 1 always lands at the `loop`.
+                // re-enters at the JUMP's target LABEL — skipping the code
+                // before it — instead of re-running the function from its
+                // entry. `compile_bridge` resolves the target label ordinal
+                // from the JUMP descr and passes `ordinal + 1` here; the
+                // target's entry `br_table` lands on that label's resume
+                // loader. Harmless for a non-peeled target, which has no
+                // dispatch and ignores the slot (`external_jump_key` 0).
                 sink.local_get(0); // frame_ptr
-                sink.i64_const(1); // dispatch key = resume at LABEL
+                sink.i64_const(external_jump_key as i64); // dispatch key
                 sink.i64_store(mem64(DISPATCH_KEY_OFS));
                 sink.local_get(0); // frame_ptr argument to the loop
                 sink.i32_const(external_jump_slot as i32); // table slot
@@ -1515,10 +1700,15 @@ fn build_function(
                 }
             }
             OpCode::SetfieldGc | OpCode::SetfieldRaw => {
-                if let (Some(jit_call), Some(base)) =
-                    (jit_call_idx, write_barrier_base(op, ref_homes))
-                {
-                    emit_write_barrier(&mut sink, constants, jit_call, wb_fn_ptr, base);
+                if let Some(base) = write_barrier_base(op, ref_homes) {
+                    emit_write_barrier(
+                        &mut sink,
+                        constants,
+                        jit_call_idx,
+                        residual_type_base,
+                        wb_fn_ptr,
+                        base,
+                    );
                 }
                 emit_resolve(&mut sink, constants, op.arg(0).to_opref()); // struct ptr
                 sink.i32_wrap_i64();
@@ -1599,10 +1789,15 @@ fn build_function(
                 }
             }
             OpCode::SetarrayitemGc | OpCode::SetarrayitemRaw => {
-                if let (Some(jit_call), Some(base)) =
-                    (jit_call_idx, write_barrier_base(op, ref_homes))
-                {
-                    emit_write_barrier(&mut sink, constants, jit_call, wb_fn_ptr, base);
+                if let Some(base) = write_barrier_base(op, ref_homes) {
+                    emit_write_barrier(
+                        &mut sink,
+                        constants,
+                        jit_call_idx,
+                        residual_type_base,
+                        wb_fn_ptr,
+                        base,
+                    );
                 }
                 emit_array_addr(&mut sink, constants, op);
                 emit_resolve(&mut sink, constants, op.arg(2).to_opref()); // value
@@ -1644,10 +1839,15 @@ fn build_function(
                 }
             }
             OpCode::SetinteriorfieldGc => {
-                if let (Some(jit_call), Some(base)) =
-                    (jit_call_idx, write_barrier_base(op, ref_homes))
-                {
-                    emit_write_barrier(&mut sink, constants, jit_call, wb_fn_ptr, base);
+                if let Some(base) = write_barrier_base(op, ref_homes) {
+                    emit_write_barrier(
+                        &mut sink,
+                        constants,
+                        jit_call_idx,
+                        residual_type_base,
+                        wb_fn_ptr,
+                        base,
+                    );
                 }
                 emit_resolve(&mut sink, constants, op.arg(0).to_opref());
                 sink.i32_wrap_i64();
@@ -2066,35 +2266,44 @@ fn build_function(
             // Refs still hold pre-call (from-space) addresses on return, so
             // reload them from the (forwarded) homes after the call.
             OpCode::CallAssemblerR if ca.emit_ca => {
-                let jit_call =
-                    jit_call_idx.expect("CA arm needs jit_call for the frame trampolines");
                 let vi = op.pos.get().raw();
                 // `external_jump_slot` is the source loop's table slot (the CA
                 // self-target), plumbed by `compile_bridge`.
                 let self_slot = external_jump_slot as i32;
 
-                // Allocate the callee frame as a GC JitFrame via the jit_call
-                // trampoline (`wasm_jit_ca_alloc_frame(frame_bytes, gcmap_ptr)`);
-                // the call slots live in THIS (caller) frame at local 0.
+                // Allocate the callee frame as a GC JitFrame
+                // (`wasm_jit_ca_alloc_frame(frame_bytes, gcmap_ptr)` — a plain
+                // `(i64,i64)->i64` table entry that never itself collects, so
+                // it lowers like an eligible residual call when the type family
+                // is declared; otherwise via the jit_call trampoline).
                 // `ca_cfp_local = frame_base + FIRST_ITEM_OFFSET` is the
                 // bespoke-layout frame pointer — every `mem64(OFS)` below is
                 // relative to it, exactly as the source loop reads its local 0.
-                sink.local_get(0);
-                sink.i64_const(ca.ca_alloc_fn_ptr);
-                sink.i64_store(mem64(CALL_FUNC_OFS));
-                sink.local_get(0);
-                sink.i64_const(2);
-                sink.i64_store(mem64(CALL_NARGS_OFS));
-                sink.local_get(0);
-                sink.i64_const(ca.callee_frame_bytes as i64);
-                sink.i64_store(mem64(CALL_ARGS_OFS));
-                sink.local_get(0);
-                sink.i64_const(ca.callee_gcmap_ptr);
-                sink.i64_store(mem64(CALL_ARGS_OFS + SLOT_SIZE));
-                sink.local_get(0);
-                sink.call(jit_call);
-                sink.local_get(0);
-                sink.i64_load(mem64(CALL_RESULT_OFS));
+                if let Some(base) = residual_type_base {
+                    sink.i64_const(ca.callee_frame_bytes as i64);
+                    sink.i64_const(ca.callee_gcmap_ptr);
+                    sink.i32_const(ca.ca_alloc_fn_ptr as i32);
+                    sink.call_indirect(0, base + 2);
+                } else {
+                    let jit_call =
+                        jit_call_idx.expect("CA arm needs jit_call for the frame trampolines");
+                    sink.local_get(0);
+                    sink.i64_const(ca.ca_alloc_fn_ptr);
+                    sink.i64_store(mem64(CALL_FUNC_OFS));
+                    sink.local_get(0);
+                    sink.i64_const(2);
+                    sink.i64_store(mem64(CALL_NARGS_OFS));
+                    sink.local_get(0);
+                    sink.i64_const(ca.callee_frame_bytes as i64);
+                    sink.i64_store(mem64(CALL_ARGS_OFS));
+                    sink.local_get(0);
+                    sink.i64_const(ca.callee_gcmap_ptr);
+                    sink.i64_store(mem64(CALL_ARGS_OFS + SLOT_SIZE));
+                    sink.local_get(0);
+                    sink.call(jit_call);
+                    sink.local_get(0);
+                    sink.i64_load(mem64(CALL_RESULT_OFS));
+                }
                 sink.i32_wrap_i64();
                 sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
                 sink.i32_add();
@@ -2156,19 +2365,31 @@ fn build_function(
                     sink.drop();
                 }
                 // Pop the callee frame off the jitframe shadow stack (strict
-                // LIFO) via the jit_call trampoline (`wasm_jit_ca_pop_frame`).
-                sink.local_get(0);
-                sink.i64_const(ca.ca_pop_fn_ptr);
-                sink.i64_store(mem64(CALL_FUNC_OFS));
-                sink.local_get(0);
-                sink.i64_const(1);
-                sink.i64_store(mem64(CALL_NARGS_OFS));
-                sink.local_get(0);
-                sink.local_get(ca_cfp_local);
-                sink.i64_extend_i32_u();
-                sink.i64_store(mem64(CALL_ARGS_OFS));
-                sink.local_get(0);
-                sink.call(jit_call);
+                // LIFO) via `wasm_jit_ca_pop_frame` — same direct-vs-trampoline
+                // split as the alloc above (the pop only shrinks the shadow
+                // stack; it never allocates or collects).
+                if let Some(base) = residual_type_base {
+                    sink.local_get(ca_cfp_local);
+                    sink.i64_extend_i32_u();
+                    sink.i32_const(ca.ca_pop_fn_ptr as i32);
+                    sink.call_indirect(0, base + 1);
+                    sink.drop(); // returns 0; ignored
+                } else {
+                    let jit_call =
+                        jit_call_idx.expect("CA arm needs jit_call for the frame trampolines");
+                    sink.local_get(0);
+                    sink.i64_const(ca.ca_pop_fn_ptr);
+                    sink.i64_store(mem64(CALL_FUNC_OFS));
+                    sink.local_get(0);
+                    sink.i64_const(1);
+                    sink.i64_store(mem64(CALL_NARGS_OFS));
+                    sink.local_get(0);
+                    sink.local_get(ca_cfp_local);
+                    sink.i64_extend_i32_u();
+                    sink.i64_store(mem64(CALL_ARGS_OFS));
+                    sink.local_get(0);
+                    sink.call(jit_call);
+                }
                 // The callee recursion minor-collected; this bridge's other live
                 // Ref locals are now stale. Reload them from the forwarded homes.
                 // Skip the result `vi`: its local holds the just-read callee output
@@ -2231,6 +2452,20 @@ fn build_function(
                     }
                     // store-on-def (end of loop) homes a Ref result, so the
                     // direct path must NOT `continue` past it.
+                } else if let (Some(base), Some(nargs)) =
+                    (residual_type_base, residual_call_void_word_arity(op))
+                {
+                    // Direct in-module word-ABI void residual call: the callee
+                    // really is `(i64×n)->i64` (descr result_size == 8), so use
+                    // the i64 family and drop the dummy result.
+                    let call_args = &op.getarglist()[1..];
+                    for arg in call_args {
+                        emit_resolve(&mut sink, constants, arg.to_opref());
+                    }
+                    emit_resolve(&mut sink, constants, op.arg(0).to_opref());
+                    sink.i32_wrap_i64();
+                    sink.call_indirect(0, base + nargs as u32);
+                    sink.drop();
                 } else {
                     let jit_call = jit_call_idx.expect("CALL op present but jit_call not imported");
 
@@ -2290,7 +2525,6 @@ fn build_function(
             // `jit_call` trampoline to the `wasm_jit_alloc` helper, then write
             // the vtable / length fields with pointer-width (i32) stores.
             OpCode::New | OpCode::NewWithVtable => {
-                let jit_call = jit_call_idx.expect("New op present but jit_call not imported");
                 let vi = op.pos.get().raw();
                 // llmodel.py:778-782: size, type_id, vtable from the size descr.
                 let descr = op.getdescr();
@@ -2299,32 +2533,131 @@ fn build_function(
                     (sd.size() as i64, sd.type_id() as i64, sd.vtable())
                 });
 
-                // func_ptr = wasm_jit_alloc
-                sink.local_get(0);
-                sink.i64_const(alloc_fn_ptr);
-                sink.i64_store(mem64(CALL_FUNC_OFS));
-                // num_args = 2
-                sink.local_get(0);
-                sink.i64_const(2);
-                sink.i64_store(mem64(CALL_NARGS_OFS));
-                // arg0 = type_id
-                sink.local_get(0);
-                sink.i64_const(type_id);
-                sink.i64_store(mem64(CALL_ARGS_OFS));
-                // arg1 = size
-                sink.local_get(0);
-                sink.i64_const(size);
-                sink.i64_store(mem64(CALL_ARGS_OFS + SLOT_SIZE));
-                // call trampoline
-                sink.local_get(0);
-                sink.call(jit_call);
+                // Inline nursery bump (rewrite.py malloc fast path, x86
+                // `malloc_cond`): total = align8(max(header+size, MIN)); if
+                // `free + total` fits below `nursery_top`, commit the bump and
+                // write the header word (tid, no flags — young objects carry
+                // none) inline; otherwise fall to the collecting helper.
+                // Restricted to plain types (no destructor/weakref side-list)
+                // under the large-object threshold, exactly the helper's own
+                // fast path.
+                let total_size = {
+                    use majit_gc::header::GcHeader;
+                    ((GcHeader::SIZE + size as usize).max(GcHeader::MIN_NURSERY_OBJ_SIZE) + 7) & !7
+                };
+                let inline_nursery = nursery.filter(|na| {
+                    total_size <= na.large_threshold
+                        && u32::try_from(type_id).is_ok_and(|t| na.plain_tids.contains(&t))
+                });
+                if let (Some(base), Some(na)) = (residual_type_base, inline_nursery) {
+                    // free = *nursery_free; new_free = free + total
+                    sink.i32_const(na.free_addr as i32);
+                    sink.i32_load(MemArg {
+                        offset: 0,
+                        align: 2,
+                        memory_index: 0,
+                    });
+                    sink.local_tee(alloc_scratch_local);
+                    sink.i32_const(total_size as i32);
+                    sink.i32_add();
+                    // new_free > *nursery_top → slow path
+                    sink.i32_const(na.top_addr as i32);
+                    sink.i32_load(MemArg {
+                        offset: 0,
+                        align: 2,
+                        memory_index: 0,
+                    });
+                    sink.i32_gt_u();
+                    sink.if_(BlockType::Result(ValType::I64));
+                    // Slow: collecting helper. The collection may have moved
+                    // every other live Ref; reload them from their (forwarded)
+                    // homes — only here, the fast path moves nothing. Skip the
+                    // fresh result (still on the operand stack; its home is
+                    // written by store-on-def below).
+                    sink.i64_const(type_id);
+                    sink.i64_const(size);
+                    sink.i32_const(alloc_fn_ptr as i32);
+                    sink.call_indirect(0, base + 2);
+                    emit_reload_refs_from_homes(
+                        &mut sink,
+                        ref_homes,
+                        (!OpRef::raw_is_constant(vi)).then_some(vi),
+                    );
+                    sink.else_();
+                    // Commit: *nursery_free = free + total.
+                    sink.i32_const(na.free_addr as i32);
+                    sink.local_get(alloc_scratch_local);
+                    sink.i32_const(total_size as i32);
+                    sink.i32_add();
+                    sink.i32_store(MemArg {
+                        offset: 0,
+                        align: 2,
+                        memory_index: 0,
+                    });
+                    // Header word: `GcHeader::new(tid)` — flags 0.
+                    sink.local_get(alloc_scratch_local);
+                    sink.i64_const(type_id);
+                    sink.i64_store(MemArg {
+                        offset: 0,
+                        align: 3,
+                        memory_index: 0,
+                    });
+                    // Result payload pointer = free + header size.
+                    sink.local_get(alloc_scratch_local);
+                    sink.i32_const(majit_gc::header::GcHeader::SIZE as i32);
+                    sink.i32_add();
+                    sink.i64_extend_i32_u();
+                    sink.end();
+                    if !OpRef::raw_is_constant(vi) {
+                        sink.local_set(1 + vi);
+                    } else {
+                        sink.drop();
+                    }
+                } else if let Some(base) = residual_type_base {
+                    // Direct in-module allocation: `wasm_jit_alloc(type_id, size)`
+                    // is a plain `(i64,i64)->i64` table entry, so call it like an
+                    // eligible residual call — no host hop. Its fn ptr is a table
+                    // index on wasm32.
+                    sink.i64_const(type_id);
+                    sink.i64_const(size);
+                    sink.i32_const(alloc_fn_ptr as i32);
+                    sink.call_indirect(0, base + 2);
+                    if !OpRef::raw_is_constant(vi) {
+                        sink.local_set(1 + vi);
+                    } else {
+                        sink.drop();
+                    }
+                } else {
+                    let jit_call = jit_call_idx.expect("New op present but jit_call not imported");
+                    // func_ptr = wasm_jit_alloc
+                    sink.local_get(0);
+                    sink.i64_const(alloc_fn_ptr);
+                    sink.i64_store(mem64(CALL_FUNC_OFS));
+                    // num_args = 2
+                    sink.local_get(0);
+                    sink.i64_const(2);
+                    sink.i64_store(mem64(CALL_NARGS_OFS));
+                    // arg0 = type_id
+                    sink.local_get(0);
+                    sink.i64_const(type_id);
+                    sink.i64_store(mem64(CALL_ARGS_OFS));
+                    // arg1 = size
+                    sink.local_get(0);
+                    sink.i64_const(size);
+                    sink.i64_store(mem64(CALL_ARGS_OFS + SLOT_SIZE));
+                    // call trampoline
+                    sink.local_get(0);
+                    sink.call(jit_call);
+
+                    if !OpRef::raw_is_constant(vi) {
+                        // result pointer
+                        sink.local_get(0);
+                        sink.i64_load(mem64(CALL_RESULT_OFS));
+                        sink.local_set(1 + vi);
+                    }
+                }
 
                 if !OpRef::raw_is_constant(vi) {
-                    // result pointer
-                    sink.local_get(0);
-                    sink.i64_load(mem64(CALL_RESULT_OFS));
-                    sink.local_set(1 + vi);
-
                     // llmodel.py:779-781 write_int_at_mem(res, vtable_offset,
                     // WORD, vtable). The `ob_type` field is pointer-width: 4
                     // bytes on wasm32 (GuardClass reads it as i32), so store
@@ -2347,12 +2680,15 @@ fn build_function(
                 // The collecting allocation may have moved every other live
                 // Ref; reload them from their (forwarded) homes. Skip the fresh
                 // result — it was allocated after the collection and its home is
-                // written by store-on-def below.
-                let skip = (!OpRef::raw_is_constant(vi)).then_some(vi);
-                emit_reload_refs_from_homes(&mut sink, ref_homes, skip);
+                // written by store-on-def below. The inline-bump path already
+                // emitted this reload inside its slow arm (the fast bump moves
+                // nothing).
+                if residual_type_base.is_none() || inline_nursery.is_none() {
+                    let skip = (!OpRef::raw_is_constant(vi)).then_some(vi);
+                    emit_reload_refs_from_homes(&mut sink, ref_homes, skip);
+                }
             }
             OpCode::NewArray | OpCode::NewArrayClear => {
-                let jit_call = jit_call_idx.expect("NewArray op present but jit_call not imported");
                 let vi = op.pos.get().raw();
                 let descr = op.getdescr();
                 let ad = descr.as_ref().and_then(|d| d.as_array_descr());
@@ -2364,46 +2700,166 @@ fn build_function(
                     .map_or(0i64, |ld| ld.offset() as i64);
                 let type_id = ad.map_or(0i64, |ad| ad.type_id() as i64);
 
-                // func_ptr = wasm_jit_alloc_array
-                sink.local_get(0);
-                sink.i64_const(alloc_array_fn_ptr);
-                sink.i64_store(mem64(CALL_FUNC_OFS));
-                // num_args = 5
-                sink.local_get(0);
-                sink.i64_const(5);
-                sink.i64_store(mem64(CALL_NARGS_OFS));
-                // arg0 = type_id
-                sink.local_get(0);
-                sink.i64_const(type_id);
-                sink.i64_store(mem64(CALL_ARGS_OFS));
-                // arg1 = base_size
-                sink.local_get(0);
-                sink.i64_const(base_size);
-                sink.i64_store(mem64(CALL_ARGS_OFS + SLOT_SIZE));
-                // arg2 = item_size
-                sink.local_get(0);
-                sink.i64_const(item_size);
-                sink.i64_store(mem64(CALL_ARGS_OFS + 2 * SLOT_SIZE));
-                // arg3 = length (op.arg(0))
-                sink.local_get(0);
-                emit_resolve(&mut sink, constants, op.arg(0).to_opref());
-                sink.i64_store(mem64(CALL_ARGS_OFS + 3 * SLOT_SIZE));
-                // arg4 = len_offset
-                sink.local_get(0);
-                sink.i64_const(len_offset);
-                sink.i64_store(mem64(CALL_ARGS_OFS + 4 * SLOT_SIZE));
-                // call trampoline
-                sink.local_get(0);
-                sink.call(jit_call);
-
-                if !OpRef::raw_is_constant(vi) {
+                // Inline nursery bump for a CONSTANT-length array of a plain
+                // type under the large-object threshold (same fast path as the
+                // `New` arm — the total is a compile-time constant, and the
+                // nursery is bulk-zeroed on reset so `NewArrayClear`'s cleared
+                // items come for free, exactly like the helper). Writes the
+                // header word and the length field inline. A runtime-length
+                // array keeps the helper call.
+                let inline_nursery_total = const_operand_value(constants, op.arg(0).to_opref())
+                    .and_then(|len| {
+                        use majit_gc::header::GcHeader;
+                        let len = usize::try_from(len).ok()?;
+                        let payload = (base_size as usize)
+                            .checked_add((item_size as usize).checked_mul(len)?)?;
+                        let total =
+                            ((GcHeader::SIZE + payload).max(GcHeader::MIN_NURSERY_OBJ_SIZE) + 7)
+                                & !7;
+                        let na = nursery.filter(|na| {
+                            total <= na.large_threshold
+                                && u32::try_from(type_id).is_ok_and(|t| na.plain_tids.contains(&t))
+                        })?;
+                        Some((total, len, na))
+                    });
+                if let (Some(base), Some((total_size, length, na))) =
+                    (residual_type_base, inline_nursery_total)
+                {
+                    // free = *nursery_free; new_free = free + total
+                    sink.i32_const(na.free_addr as i32);
+                    sink.i32_load(MemArg {
+                        offset: 0,
+                        align: 2,
+                        memory_index: 0,
+                    });
+                    sink.local_tee(alloc_scratch_local);
+                    sink.i32_const(total_size as i32);
+                    sink.i32_add();
+                    sink.i32_const(na.top_addr as i32);
+                    sink.i32_load(MemArg {
+                        offset: 0,
+                        align: 2,
+                        memory_index: 0,
+                    });
+                    sink.i32_gt_u();
+                    sink.if_(BlockType::Result(ValType::I64));
+                    // Slow: collecting helper; reload the other live Refs from
+                    // their (forwarded) homes — only here, the fast bump moves
+                    // nothing.
+                    sink.i64_const(type_id);
+                    sink.i64_const(base_size);
+                    sink.i64_const(item_size);
+                    sink.i64_const(length as i64);
+                    sink.i64_const(len_offset);
+                    sink.i32_const(alloc_array_fn_ptr as i32);
+                    sink.call_indirect(0, base + 5);
+                    emit_reload_refs_from_homes(
+                        &mut sink,
+                        ref_homes,
+                        (!OpRef::raw_is_constant(vi)).then_some(vi),
+                    );
+                    sink.else_();
+                    // Commit: *nursery_free = free + total.
+                    sink.i32_const(na.free_addr as i32);
+                    sink.local_get(alloc_scratch_local);
+                    sink.i32_const(total_size as i32);
+                    sink.i32_add();
+                    sink.i32_store(MemArg {
+                        offset: 0,
+                        align: 2,
+                        memory_index: 0,
+                    });
+                    // Header word: `GcHeader::new(tid)` — flags 0.
+                    sink.local_get(alloc_scratch_local);
+                    sink.i64_const(type_id);
+                    sink.i64_store(MemArg {
+                        offset: 0,
+                        align: 3,
+                        memory_index: 0,
+                    });
+                    // Length field (usize, 4 bytes on wasm32) at
+                    // `payload + len_offset`.
+                    sink.local_get(alloc_scratch_local);
+                    sink.i32_const(length as i32);
+                    sink.i32_store(MemArg {
+                        offset: majit_gc::header::GcHeader::SIZE as u64 + len_offset as u64,
+                        align: 2,
+                        memory_index: 0,
+                    });
+                    // Result payload pointer = free + header size.
+                    sink.local_get(alloc_scratch_local);
+                    sink.i32_const(majit_gc::header::GcHeader::SIZE as i32);
+                    sink.i32_add();
+                    sink.i64_extend_i32_u();
+                    sink.end();
+                    if !OpRef::raw_is_constant(vi) {
+                        sink.local_set(1 + vi);
+                    } else {
+                        sink.drop();
+                    }
+                } else if let Some(base) = residual_type_base {
+                    // Direct in-module allocation, like the `New` arm:
+                    // `wasm_jit_alloc_array(type_id, base_size, item_size,
+                    // length, len_offset)` is a `(i64×5)->i64` table entry.
+                    sink.i64_const(type_id);
+                    sink.i64_const(base_size);
+                    sink.i64_const(item_size);
+                    emit_resolve(&mut sink, constants, op.arg(0).to_opref());
+                    sink.i64_const(len_offset);
+                    sink.i32_const(alloc_array_fn_ptr as i32);
+                    sink.call_indirect(0, base + 5);
+                    if !OpRef::raw_is_constant(vi) {
+                        sink.local_set(1 + vi);
+                    } else {
+                        sink.drop();
+                    }
+                } else {
+                    let jit_call =
+                        jit_call_idx.expect("NewArray op present but jit_call not imported");
+                    // func_ptr = wasm_jit_alloc_array
                     sink.local_get(0);
-                    sink.i64_load(mem64(CALL_RESULT_OFS));
-                    sink.local_set(1 + vi);
+                    sink.i64_const(alloc_array_fn_ptr);
+                    sink.i64_store(mem64(CALL_FUNC_OFS));
+                    // num_args = 5
+                    sink.local_get(0);
+                    sink.i64_const(5);
+                    sink.i64_store(mem64(CALL_NARGS_OFS));
+                    // arg0 = type_id
+                    sink.local_get(0);
+                    sink.i64_const(type_id);
+                    sink.i64_store(mem64(CALL_ARGS_OFS));
+                    // arg1 = base_size
+                    sink.local_get(0);
+                    sink.i64_const(base_size);
+                    sink.i64_store(mem64(CALL_ARGS_OFS + SLOT_SIZE));
+                    // arg2 = item_size
+                    sink.local_get(0);
+                    sink.i64_const(item_size);
+                    sink.i64_store(mem64(CALL_ARGS_OFS + 2 * SLOT_SIZE));
+                    // arg3 = length (op.arg(0))
+                    sink.local_get(0);
+                    emit_resolve(&mut sink, constants, op.arg(0).to_opref());
+                    sink.i64_store(mem64(CALL_ARGS_OFS + 3 * SLOT_SIZE));
+                    // arg4 = len_offset
+                    sink.local_get(0);
+                    sink.i64_const(len_offset);
+                    sink.i64_store(mem64(CALL_ARGS_OFS + 4 * SLOT_SIZE));
+                    // call trampoline
+                    sink.local_get(0);
+                    sink.call(jit_call);
+
+                    if !OpRef::raw_is_constant(vi) {
+                        sink.local_get(0);
+                        sink.i64_load(mem64(CALL_RESULT_OFS));
+                        sink.local_set(1 + vi);
+                    }
                 }
-                // `wasm_jit_alloc_array` collects; reload other live Refs.
-                let skip = (!OpRef::raw_is_constant(vi)).then_some(vi);
-                emit_reload_refs_from_homes(&mut sink, ref_homes, skip);
+                // `wasm_jit_alloc_array` collects; reload other live Refs. The
+                // inline-bump path already emitted this inside its slow arm.
+                if residual_type_base.is_none() || inline_nursery_total.is_none() {
+                    let skip = (!OpRef::raw_is_constant(vi)).then_some(vi);
+                    emit_reload_refs_from_homes(&mut sink, ref_homes, skip);
+                }
             }
 
             // ── Misc ──
@@ -2507,11 +2963,11 @@ fn build_function(
     if has_loop {
         sink.end(); // end loop
         sink.end(); // end block
-    } else if ca_straightline_dispatch {
-        sink.end(); // end exit block A (no `loop` in a Label-less CA loop)
+    } else if straightline_dispatch {
+        sink.end(); // end exit block A (Label-less dispatch trace, no `loop`)
     }
 
-    // Epilogue bridge dispatch (loop traces only). Control reaches here only
+    // Epilogue bridge dispatch. Control reaches here only
     // after a guard `br`'d out of the exit block, having written its
     // `fail_index` into `frame[0]`. Look up that guard's bridge slot in the
     // shared cell array; if a bridge has been compiled (slot != 0), tail into
@@ -2521,10 +2977,9 @@ fn build_function(
     // (no bridge yet) this is inert and behavior is unchanged.
     if bridge_dispatch {
         // slot = *(cells_base + (fail_index - fail_index_base) * 4)
-        // The cell array is local to this trace (one i32 per local guard), so a
-        // bridge whose `frame[0]` carries a base-offset global index subtracts
-        // the base back to a local cell index. Loops pass base 0 → no subtract,
-        // keeping their module byte-identical.
+        // The cell array is local to this trace (one i32 per local guard);
+        // `frame[0]` carries the GLOBAL fail index, so subtract this trace's
+        // base back to a local cell index.
         sink.i32_const(cells_base as i32);
         sink.local_get(0);
         sink.i64_load(mem64(0)); // frame[0] = fail_index
@@ -2555,15 +3010,14 @@ fn build_function(
 
 /// A peeled loop — real work (the unrolled first iteration = preamble) precedes
 /// the loop-header LABEL — whether it carries one LABEL or several. `loop` is
-/// emitted at the LAST label, so `build_function` wraps the preamble in the
-/// resume-at-LABEL dispatch (keyed on the frame dispatch-key slot) and a
-/// loop-closing bridge re-enters AT that last label, skipping the preamble,
-/// in-module. `build_function` keys its preamble-skip wrapper on this predicate;
-/// `compile_loop` records it on `CompiledWasmLoop`. The decline `compile_bridge`
-/// lifts is finer-grained: a single-label source is accepted directly
-/// (`is_single_label_peeled`), a multi-label source only when the bridge's JUMP
-/// targets that last label (recovered from its descr) — every other multi-label
-/// target needs the deferred br_table and stays declined.
+/// emitted at the LAST label, so `build_function` wraps the trace in the
+/// resume-at-LABEL entry `br_table` (keyed on the frame dispatch-key slot,
+/// key = label ordinal + 1) and a loop-closing bridge re-enters at ANY of the
+/// loop's labels, in-module. `build_function` keys its wrapper on this
+/// predicate; `compile_loop` records it on `CompiledWasmLoop` as
+/// `has_preamble`. `compile_bridge` accepts a loop-closing bridge only when
+/// its JUMP's descr identifies one of the source loop's OWN labels
+/// (`label_descrs`) with matching arity and a resume-safe live set.
 pub fn is_resumable_peeled(ops: &[Op]) -> bool {
     let Some(last_label) = ops.iter().rposition(|op| op.opcode == OpCode::Label) else {
         return false;
@@ -2573,14 +3027,67 @@ pub fn is_resumable_peeled(ops: &[Op]) -> bool {
         .any(|op| op.opcode != OpCode::Label)
 }
 
-/// The single-label subset of `is_resumable_peeled`: exactly one LABEL. A
-/// loop-closing bridge into such a loop always targets that sole label, so
-/// `compile_bridge` accepts it without recovering the target ordinal. Kept a
-/// distinct predicate (not folded into `is_resumable_peeled`) so the bridge
-/// accept-condition can treat single- and multi-label sources differently.
+/// The single-label subset of `is_resumable_peeled`: exactly one LABEL.
+/// No longer consulted by the bridge accept-condition (which resolves the
+/// JUMP's target label by descr identity uniformly); kept as a shape
+/// predicate for tests.
 pub fn is_single_label_peeled(ops: &[Op]) -> bool {
     let label_count = ops.iter().filter(|op| op.opcode == OpCode::Label).count();
     is_resumable_peeled(ops) && label_count == 1
+}
+
+/// Argument count of each `LABEL`, in ordinal order (the same ordinals
+/// `compile_loop` stamps via `set_label_block_id`). `compile_bridge` declines
+/// a loop-closing bridge whose JUMP arity differs from its target label's
+/// count, since the resume loader reads exactly that many positional frame
+/// slots.
+pub fn label_arg_counts(ops: &[Op]) -> Vec<usize> {
+    ops.iter()
+        .filter(|op| op.opcode == OpCode::Label)
+        .map(|op| op.getarglist().len())
+        .collect()
+}
+
+/// Per-label resume safety, in ordinal order: label `j` is safe to resume at
+/// when every op after it references only values that are constants, defined
+/// after the label, or listed in the label's own args — i.e. the label's args
+/// are the complete live set, so the resume loader reconstructs every value
+/// the remainder of the trace reads. A value defined before the label and
+/// read after it without being a label arg would resume as a null local (the
+/// resume path skips the entry loader and every earlier segment). Guard fail
+/// args count as reads — they spill into the deopt frame.
+pub fn label_resume_safety(ops: &[Op]) -> Vec<bool> {
+    ops.iter()
+        .enumerate()
+        .filter(|(_, op)| op.opcode == OpCode::Label)
+        .map(|(p, label)| {
+            let mut live: std::collections::HashSet<u32> = label
+                .getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .filter(|r| *r != OpRef::NONE && !r.is_constant())
+                .map(|r| r.raw())
+                .collect();
+            for op in &ops[p + 1..] {
+                let args = op.getarglist();
+                let arg_reads = args.iter().map(|a| a.to_opref());
+                let fail_reads = op
+                    .getfailargs()
+                    .map(|fa| fa.iter().map(|a| a.to_opref()).collect::<Vec<_>>())
+                    .unwrap_or_default();
+                for r in arg_reads.chain(fail_reads) {
+                    if r != OpRef::NONE && !r.is_constant() && !live.contains(&r.raw()) {
+                        return false;
+                    }
+                }
+                let res = op.pos.get();
+                if res != OpRef::NONE && !res.is_constant() {
+                    live.insert(res.raw());
+                }
+            }
+            true
+        })
+        .collect()
 }
 
 fn find_label_args(ops: &[Op]) -> Vec<OpRef> {
@@ -2609,6 +3116,16 @@ fn emit_resolve(
     } else {
         sink.local_get(1 + opref.raw());
     }
+}
+
+/// Compile-time value of a constant operand (what `emit_resolve` would push
+/// as `i64.const`), or `None` for a runtime value.
+fn const_operand_value(constants: &majit_ir::VecMap<u32, i64>, opref: OpRef) -> Option<i64> {
+    opref.is_constant().then(|| {
+        opref
+            .inline_const_bits()
+            .unwrap_or_else(|| constants.get(&opref.raw()).copied().unwrap_or(0))
+    })
 }
 
 /// Extract field offset from op's descr (FieldDescr).

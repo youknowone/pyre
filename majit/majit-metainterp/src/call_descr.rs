@@ -547,7 +547,13 @@ pub fn make_call_descr_with_effect(
     effect_info: EffectInfo,
 ) -> DescrRef {
     let (result_signed, result_size) = result_metadata(result_type);
-    make_call_descr_sized(arg_types, result_type, result_signed, result_size, effect_info)
+    make_call_descr_sized(
+        arg_types,
+        result_type,
+        result_signed,
+        result_size,
+        effect_info,
+    )
 }
 
 /// [`make_call_descr_with_effect`] variant for hand-written `extern "C"`
