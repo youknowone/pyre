@@ -4236,6 +4236,94 @@ pub fn build_ll_append_res_slice_helper_graph(
     ))
 }
 
+/// Synthesise the `make_func_for_size(N)` residual helpers
+/// (`rbuilder.py:217-228`):
+///
+/// ```python
+/// ll_append_0_N(ll_builder, ll_str):
+///     _ll_append(ll_builder, ll_str, 0, N)
+/// ll_append_start_N(ll_builder, ll_str, start):
+///     _ll_append(ll_builder, ll_str, start, N)
+/// ```
+///
+/// `start_is_zero` selects the two-argument `ll_append_0_N` shape vs the
+/// three-argument `ll_append_start_N` shape. `_ll_append` is baked in as a
+/// `direct_call` callee const. Returns `Void`.
+pub fn build_ll_append_sized_helper_graph(
+    name: &str,
+    builder_ptr_lltype: LowLevelType,
+    buf_lltype: LowLevelType,
+    start_is_zero: bool,
+    n: i64,
+    ll_append_fn: Constant,
+) -> Result<PyGraph, TyperError> {
+    let void_result = || variable_with_lltype("v", LowLevelType::Void);
+    let none_const = || {
+        Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::None,
+            LowLevelType::Void,
+        ))
+    };
+    let signed = |x: i64| constant_with_lltype(ConstValue::Int(x), LowLevelType::Signed);
+
+    let ll_builder = variable_with_lltype("ll_builder", builder_ptr_lltype);
+    let ll_str = variable_with_lltype("ll_str", buf_lltype);
+    let start = if start_is_zero {
+        None
+    } else {
+        Some(variable_with_lltype("start", LowLevelType::Signed))
+    };
+    let mut inputargs = vec![
+        Hlvalue::Variable(ll_builder.clone()),
+        Hlvalue::Variable(ll_str.clone()),
+    ];
+    if let Some(start) = &start {
+        inputargs.push(Hlvalue::Variable(start.clone()));
+    }
+    let startblock = Block::shared(inputargs);
+    let return_var = variable_with_lltype("result", LowLevelType::Void);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    let start_arg = match start {
+        Some(start) => Hlvalue::Variable(start),
+        None => signed(0),
+    };
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![
+            Hlvalue::Constant(ll_append_fn),
+            Hlvalue::Variable(ll_builder),
+            Hlvalue::Variable(ll_str),
+            start_arg,
+            signed(n),
+        ],
+        Hlvalue::Variable(void_result()),
+    ));
+    startblock.closeblock(vec![
+        Link::new(vec![none_const()], Some(graph.returnblock.clone()), None).into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    let argnames = if start_is_zero {
+        vec!["ll_builder".to_string(), "ll_str".to_string()]
+    } else {
+        vec![
+            "ll_builder".to_string(),
+            "ll_str".to_string(),
+            "start".to_string(),
+        ]
+    };
+    Ok(helper_pygraph_from_graph(graph, argnames, func))
+}
+
 /// Synthesise `_ll_append(ll_builder, ll_str, start, size)`
 /// (`rbuilder.py:80-89`):
 ///
@@ -5975,6 +6063,41 @@ mod tests {
             panic!("returnblock inputarg must be a Variable");
         };
         assert_eq!(ret.concretetype.borrow().clone(), Some(LowLevelType::Void));
+    }
+
+    #[test]
+    fn build_ll_append_sized_calls_ll_append_with_constant_size() {
+        use super::Hlvalue;
+
+        for (name, start_is_zero, expected_inputargs) in [
+            ("ll_append_0_5", true, 2usize),
+            ("ll_append_start_5", false, 3usize),
+        ] {
+            let helper = super::build_ll_append_sized_helper_graph(
+                name,
+                super::STRINGBUILDERPTR.clone(),
+                super::STRPTR.clone(),
+                start_is_zero,
+                5,
+                dummy_funcptr_const(),
+            )
+            .expect("build_ll_append_sized_helper_graph");
+            assert_eq!(helper.func.name, name);
+            let inner = helper.graph.borrow();
+            let (count, all_ops) = walk_ops(&inner.startblock);
+            assert_eq!(count, 2);
+            assert_eq!(all_ops, vec!["direct_call".to_string()]);
+
+            let startblock = inner.startblock.borrow();
+            assert_eq!(startblock.inputargs.len(), expected_inputargs);
+            assert_eq!(startblock.operations[0].args.len(), 5);
+            drop(startblock);
+
+            let Hlvalue::Variable(ret) = &inner.returnblock.borrow().inputargs[0] else {
+                panic!("returnblock inputarg must be a Variable");
+            };
+            assert_eq!(ret.concretetype.borrow().clone(), Some(LowLevelType::Void));
+        }
     }
 
     #[test]
