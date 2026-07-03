@@ -2755,16 +2755,19 @@ pub(crate) fn build_ll_malloc_indexes_and_choose_lookup_helper_graph(
 /// ```
 ///
 /// **Scope note:** the `else` arm rehashes a "prebuilt dictionary frozen by
-/// translation" (`ll_dict_rehash_after_translation`, `rordereddict.py:955-977`)
-/// — a translation-time-only RPython concept with no analogue in this JIT.
-/// Every dict this port can construct comes from `ll_newdict`
-/// (`num_live_items == 0` at construction), and no write path exists yet
-/// (Slice 3), so `num_live_items != 0` while `lookup_function_no ==
-/// FUNC_MUST_REINDEX` is unreachable for any census-reachable dict today.
-/// This builder ports only the reachable `num_live_items == 0` branch
-/// straight-line (no runtime check), matching the "statically dead branch"
-/// precedent in [`build_ll_dict_lookup_helper_graph`]'s doc comment. Revisit
-/// once Slice 3's write path lands.
+/// translation" (`ll_dict_rehash_after_translation`, `rordereddict.py:955-977`,
+/// `@jit.dont_look_inside`) — a translation-time-only RPython concept with no
+/// analogue in this runtime JIT, which constructs every dict at run time.
+/// `lookup_function_no` is written to `FUNC_MUST_REINDEX` in exactly one place
+/// (`ll_no_initial_index`, at `ll_newdict`, where `num_live_items == 0`); the
+/// write path's `ll_dict_reindex` stamps a concrete `FUNC_BYTE/SHORT/INT/LONG`
+/// selector instead, and `ll_dict_remove_deleted_items` only clears the high
+/// bits (`&= FUNC_MASK`). So `ll_ensure_indexes` reaches this helper only while
+/// `num_live_items == 0`; the `num_live_items != 0` else arm stays unreachable.
+/// Re-verified after the Slice 3/4 write + delete paths landed. This builder
+/// ports only the reachable `num_live_items == 0` branch straight-line (no
+/// runtime check), matching the "statically dead branch" precedent in
+/// [`build_ll_dict_lookup_helper_graph`]'s doc comment.
 pub(crate) fn build_ll_dict_create_initial_index_helper_graph(
     name: &str,
     dict_ptr_lltype: LowLevelType,
