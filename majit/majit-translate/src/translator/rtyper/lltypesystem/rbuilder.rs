@@ -951,6 +951,157 @@ pub fn build_ll_grow_and_append_helper_graph(
     ))
 }
 
+/// Synthesise `ll_append_multiple_char(ll_builder, char, times)`
+/// (`rbuilder.py:275-280`):
+///
+/// ```python
+/// if jit.we_are_jitted():
+///     if ll_jit_try_append_multiple_char(ll_builder, char, times):
+///         return
+/// _ll_append_multiple_char(ll_builder, char, times)
+/// ```
+///
+/// Outer branch is the `we_are_jitted()` symbolic exitswitch (see
+/// [`build_ll_append_helper_graph`]); its true arm runs the inner
+/// `ll_jit_try_append_multiple_char` guard. The `we_are_jitted()`-false
+/// and guard-failed edges both fall through to a shared block that
+/// `direct_call`s `_ll_append_multiple_char`. All callees are baked in
+/// as `direct_call` consts. Returns `Void`.
+pub fn build_ll_append_multiple_char_helper_graph(
+    name: &str,
+    builder_ptr_lltype: LowLevelType,
+    char_lltype: LowLevelType,
+    jit_try_fn: Constant,
+    append_multiple_char_fn: Constant,
+) -> Result<PyGraph, TyperError> {
+    let void_result = || variable_with_lltype("v", LowLevelType::Void);
+    let none_const = || {
+        Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::None,
+            LowLevelType::Void,
+        ))
+    };
+    let bool_case = |b: bool| Some(constant_with_lltype(ConstValue::Bool(b), LowLevelType::Bool));
+
+    let ll_builder = variable_with_lltype("ll_builder", builder_ptr_lltype.clone());
+    let char = variable_with_lltype("char", char_lltype.clone());
+    let times = variable_with_lltype("times", LowLevelType::Signed);
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(ll_builder.clone()),
+        Hlvalue::Variable(char.clone()),
+        Hlvalue::Variable(times.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", LowLevelType::Void);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    // Shared fallback: _ll_append_multiple_char(ll_builder, char, times).
+    let fb_llb = variable_with_lltype("ll_builder", builder_ptr_lltype.clone());
+    let fb_char = variable_with_lltype("char", char_lltype.clone());
+    let fb_times = variable_with_lltype("times", LowLevelType::Signed);
+    let block_fb = Block::shared(vec![
+        Hlvalue::Variable(fb_llb.clone()),
+        Hlvalue::Variable(fb_char.clone()),
+        Hlvalue::Variable(fb_times.clone()),
+    ]);
+    block_fb.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![
+            Hlvalue::Constant(append_multiple_char_fn),
+            Hlvalue::Variable(fb_llb),
+            Hlvalue::Variable(fb_char),
+            Hlvalue::Variable(fb_times),
+        ],
+        Hlvalue::Variable(void_result()),
+    ));
+    block_fb.closeblock(vec![
+        Link::new(vec![none_const()], Some(graph.returnblock.clone()), None).into_ref(),
+    ]);
+
+    // jit arm: handled = ll_jit_try_append_multiple_char(...); branch.
+    let jit_llb = variable_with_lltype("ll_builder", builder_ptr_lltype.clone());
+    let jit_char = variable_with_lltype("char", char_lltype);
+    let jit_times = variable_with_lltype("times", LowLevelType::Signed);
+    let block_jit = Block::shared(vec![
+        Hlvalue::Variable(jit_llb.clone()),
+        Hlvalue::Variable(jit_char.clone()),
+        Hlvalue::Variable(jit_times.clone()),
+    ]);
+    let handled = variable_with_lltype("handled", LowLevelType::Bool);
+    block_jit.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![
+            Hlvalue::Constant(jit_try_fn),
+            Hlvalue::Variable(jit_llb.clone()),
+            Hlvalue::Variable(jit_char.clone()),
+            Hlvalue::Variable(jit_times.clone()),
+        ],
+        Hlvalue::Variable(handled.clone()),
+    ));
+    block_jit.borrow_mut().exitswitch = Some(Hlvalue::Variable(handled));
+    block_jit.closeblock(vec![
+        // handled -> return.
+        Link::new(vec![none_const()], Some(graph.returnblock.clone()), bool_case(true)).into_ref(),
+        // not handled -> shared fallback.
+        Link::new(
+            vec![
+                Hlvalue::Variable(jit_llb),
+                Hlvalue::Variable(jit_char),
+                Hlvalue::Variable(jit_times),
+            ],
+            Some(block_fb.clone()),
+            bool_case(false),
+        )
+        .into_ref(),
+    ]);
+
+    // startblock: branch on `we_are_jitted()` symbolic exitswitch.
+    startblock.borrow_mut().exitswitch = Some(Hlvalue::Constant(Constant::with_concretetype(
+        ConstValue::SpecTag(WE_ARE_JITTED_TAG_ID),
+        LowLevelType::Bool,
+    )));
+    let arm_args = |llb: &Variable, c: &Variable, t: &Variable| {
+        vec![
+            Hlvalue::Variable(llb.clone()),
+            Hlvalue::Variable(c.clone()),
+            Hlvalue::Variable(t.clone()),
+        ]
+    };
+    startblock.closeblock(vec![
+        Link::new(
+            arm_args(&ll_builder, &char, &times),
+            Some(block_jit),
+            bool_case(true),
+        )
+        .into_ref(),
+        // we_are_jitted() false -> shared fallback.
+        Link::new(
+            arm_args(&ll_builder, &char, &times),
+            Some(block_fb),
+            bool_case(false),
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec![
+            "ll_builder".to_string(),
+            "char".to_string(),
+            "times".to_string(),
+        ],
+        func,
+    ))
+}
+
 /// Synthesise `_ll_append_multiple_char(ll_builder, char, times)`
 /// (`rbuilder.py:283-297`):
 ///
@@ -3374,6 +3525,42 @@ mod tests {
         // jit arm: ll_jit_append_slice; no-jit arm: int_sub + _ll_append.
         assert_eq!(all_ops.iter().filter(|o| o.as_str() == "direct_call").count(), 2);
         assert_eq!(all_ops.iter().filter(|o| o.as_str() == "int_sub").count(), 1);
+        let Hlvalue::Variable(ret) = &inner.returnblock.borrow().inputargs[0] else {
+            panic!("returnblock inputarg must be a Variable");
+        };
+        assert_eq!(ret.concretetype.borrow().clone(), Some(LowLevelType::Void));
+    }
+
+    #[test]
+    fn build_ll_append_multiple_char_nested_jit_guard_shares_fallback() {
+        use super::Hlvalue;
+        let helper = super::build_ll_append_multiple_char_helper_graph(
+            "ll_append_multiple_char",
+            super::STRINGBUILDERPTR.clone(),
+            LowLevelType::Char,
+            dummy_funcptr_const(),
+            dummy_funcptr_const(),
+        )
+        .expect("build_ll_append_multiple_char_helper_graph");
+        assert_eq!(helper.func.name, "ll_append_multiple_char");
+        let inner = helper.graph.borrow();
+        let startblock = inner.startblock.borrow();
+        assert!(startblock.operations.is_empty());
+        assert_eq!(startblock.exits.len(), 2);
+        match &startblock.exitswitch {
+            Some(Hlvalue::Constant(c)) => assert_eq!(
+                c.value,
+                super::ConstValue::SpecTag(super::WE_ARE_JITTED_TAG_ID)
+            ),
+            other => panic!("exitswitch must be the SpecTag constant, got {other:?}"),
+        }
+        drop(startblock);
+        // start, jit-guard, shared fallback, returnblock — the fallback
+        // block is shared by both false edges, so the walk sees 4 blocks.
+        let (count, all_ops) = walk_ops(&inner.startblock);
+        assert_eq!(count, 4);
+        // jit-guard direct_call + fallback direct_call = 2.
+        assert_eq!(all_ops.iter().filter(|o| o.as_str() == "direct_call").count(), 2);
         let Hlvalue::Variable(ret) = &inner.returnblock.borrow().inputargs[0] else {
             panic!("returnblock inputarg must be a Variable");
         };
