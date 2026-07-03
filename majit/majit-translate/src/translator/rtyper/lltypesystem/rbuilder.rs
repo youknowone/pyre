@@ -606,6 +606,182 @@ pub fn build_ll_shrink_final_helper_graph(
     ))
 }
 
+/// Synthesise `ll_grow_by(ll_builder, needed)` (`rbuilder.py:96-115`):
+///
+/// ```python
+/// try:
+///     needed = ovfcheck(needed + ll_builder.total_size)
+///     needed = ovfcheck(needed + 63) & ~63
+///     total_size = ovfcheck(ll_builder.total_size + needed)
+/// except OverflowError:
+///     raise MemoryError
+/// new_string = ll_builder.mallocfn(needed)
+/// old_piece = lltype.malloc(PIECE)
+/// old_piece.buf = ll_builder.current_buf
+/// old_piece.prev_piece = ll_builder.extra_pieces
+/// ll_builder.current_buf = new_string
+/// ll_builder.current_pos = 0
+/// ll_builder.current_end = needed
+/// ll_builder.total_size = total_size
+/// ll_builder.extra_pieces = old_piece
+/// ```
+///
+/// The `ovfcheck`s lower to bare `int_add_ovf` ops (the exception
+/// transformer attaches overflow edges later); the `except OverflowError:
+/// raise MemoryError` is a MemoryError path, which this port leaves
+/// unmodelled — MemoryError is an implicit (always-possible) exception, not
+/// a Python-level one the caller's flow graph handles (same precedent as
+/// `rlist.rs` `build_ll_extend_helper_graph` and `rordereddict.rs`
+/// `build_ll_dict_setitem_lookup_done_helper_graph`'s `_ll_dict_rescue`).
+/// `~63` is the `int_and` mask `-64`. `mallocfn` is a `direct_call` callee
+/// const; `piece_struct` is `PIECE` (`STRINGPIECE`/`UNICODEPIECE`).
+/// Debug-only `ll_assert` omitted. Returns `Void`.
+pub fn build_ll_grow_by_helper_graph(
+    name: &str,
+    builder_ptr_lltype: LowLevelType,
+    piece_ptr_lltype: LowLevelType,
+    piece_struct: LowLevelType,
+    buf_lltype: LowLevelType,
+    mallocfn: Constant,
+) -> Result<PyGraph, TyperError> {
+    use crate::translator::rtyper::rmodel::{gc_flavor_const, lowlevel_type_const};
+
+    let void_result = || variable_with_lltype("v", LowLevelType::Void);
+    let none_const = || {
+        Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::None,
+            LowLevelType::Void,
+        ))
+    };
+    let signed = |n: i64| constant_with_lltype(ConstValue::Int(n), LowLevelType::Signed);
+
+    let ll_builder = variable_with_lltype("ll_builder", builder_ptr_lltype);
+    let needed = variable_with_lltype("needed", LowLevelType::Signed);
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(ll_builder.clone()),
+        Hlvalue::Variable(needed.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", LowLevelType::Void);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+    let push = |opname: &str, args: Vec<Hlvalue>, out: Hlvalue| {
+        startblock
+            .borrow_mut()
+            .operations
+            .push(SpaceOperation::new(opname, args, out));
+    };
+
+    // orig_total = ll_builder.total_size (read once; the 3rd ovfcheck uses the
+    // pre-update field value).
+    let orig_total = variable_with_lltype("total_size", LowLevelType::Signed);
+    push(
+        "getfield",
+        vec![Hlvalue::Variable(ll_builder.clone()), void_field_const("total_size")],
+        Hlvalue::Variable(orig_total.clone()),
+    );
+    // needed = ovfcheck(needed + total_size)
+    let needed1 = variable_with_lltype("needed", LowLevelType::Signed);
+    push(
+        "int_add_ovf",
+        vec![Hlvalue::Variable(needed), Hlvalue::Variable(orig_total.clone())],
+        Hlvalue::Variable(needed1.clone()),
+    );
+    // needed = ovfcheck(needed + 63) & ~63
+    let needed2 = variable_with_lltype("needed", LowLevelType::Signed);
+    push(
+        "int_add_ovf",
+        vec![Hlvalue::Variable(needed1), signed(63)],
+        Hlvalue::Variable(needed2.clone()),
+    );
+    let needed3 = variable_with_lltype("needed", LowLevelType::Signed);
+    push(
+        "int_and",
+        vec![Hlvalue::Variable(needed2), signed(-64)],
+        Hlvalue::Variable(needed3.clone()),
+    );
+    // total_size = ovfcheck(total_size + needed)
+    let total_new = variable_with_lltype("total_size", LowLevelType::Signed);
+    push(
+        "int_add_ovf",
+        vec![Hlvalue::Variable(orig_total), Hlvalue::Variable(needed3.clone())],
+        Hlvalue::Variable(total_new.clone()),
+    );
+    // new_string = ll_builder.mallocfn(needed)
+    let new_string = variable_with_lltype("new_string", buf_lltype.clone());
+    push(
+        "direct_call",
+        vec![Hlvalue::Constant(mallocfn), Hlvalue::Variable(needed3.clone())],
+        Hlvalue::Variable(new_string.clone()),
+    );
+    // old_piece = lltype.malloc(PIECE)
+    let old_piece = variable_with_lltype("old_piece", piece_ptr_lltype.clone());
+    push(
+        "malloc",
+        vec![lowlevel_type_const(piece_struct), gc_flavor_const()?],
+        Hlvalue::Variable(old_piece.clone()),
+    );
+    // old_piece.buf = ll_builder.current_buf
+    let cur_buf = variable_with_lltype("current_buf", buf_lltype);
+    push(
+        "getfield",
+        vec![Hlvalue::Variable(ll_builder.clone()), void_field_const("current_buf")],
+        Hlvalue::Variable(cur_buf.clone()),
+    );
+    push(
+        "setfield",
+        vec![Hlvalue::Variable(old_piece.clone()), void_field_const("buf"), Hlvalue::Variable(cur_buf)],
+        Hlvalue::Variable(void_result()),
+    );
+    // old_piece.prev_piece = ll_builder.extra_pieces
+    let cur_extra = variable_with_lltype("extra_pieces", piece_ptr_lltype);
+    push(
+        "getfield",
+        vec![Hlvalue::Variable(ll_builder.clone()), void_field_const("extra_pieces")],
+        Hlvalue::Variable(cur_extra.clone()),
+    );
+    push(
+        "setfield",
+        vec![
+            Hlvalue::Variable(old_piece.clone()),
+            void_field_const("prev_piece"),
+            Hlvalue::Variable(cur_extra),
+        ],
+        Hlvalue::Variable(void_result()),
+    );
+    // ll_builder.current_buf = new_string; current_pos = 0; current_end = needed;
+    // total_size = total_size; extra_pieces = old_piece.
+    for (field, value) in [
+        ("current_buf", Hlvalue::Variable(new_string)),
+        ("current_pos", signed(0)),
+        ("current_end", Hlvalue::Variable(needed3)),
+        ("total_size", Hlvalue::Variable(total_new)),
+        ("extra_pieces", Hlvalue::Variable(old_piece)),
+    ] {
+        push(
+            "setfield",
+            vec![Hlvalue::Variable(ll_builder.clone()), void_field_const(field), value],
+            Hlvalue::Variable(void_result()),
+        );
+    }
+    startblock.closeblock(vec![
+        Link::new(vec![none_const()], Some(graph.returnblock.clone()), None).into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["ll_builder".to_string(), "needed".to_string()],
+        func,
+    ))
+}
+
 /// Synthesise `ll_append_res0(ll_builder, ll_str)` (`rbuilder.py:172-173`):
 /// `_ll_append(ll_builder, ll_str, 0, len(ll_str.chars))`. `_ll_append` is
 /// baked in as a `direct_call` callee const. Returns `Void`.
@@ -1793,6 +1969,56 @@ mod tests {
             }
         }
         (count, all_ops)
+    }
+
+    #[test]
+    fn build_ll_grow_by_ovf_arith_mallocs_piece_and_relinks_buffer() {
+        use super::Hlvalue;
+        let helper = super::build_ll_grow_by_helper_graph(
+            "ll_grow_by",
+            super::STRINGBUILDERPTR.clone(),
+            super::STRINGPIECEPTR.clone(),
+            super::STRINGPIECE.clone(),
+            super::STRPTR.clone(),
+            dummy_funcptr_const(),
+        )
+        .expect("build_ll_grow_by_helper_graph");
+        assert_eq!(helper.func.name, "ll_grow_by");
+        let inner = helper.graph.borrow();
+        let startblock = inner.startblock.borrow();
+        let ops: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|o| o.opname.as_str())
+            .collect();
+        assert_eq!(
+            ops,
+            vec![
+                "getfield",     // total_size (read once)
+                "int_add_ovf",  // needed + total_size
+                "int_add_ovf",  // needed + 63
+                "int_and",      // & ~63
+                "int_add_ovf",  // total_size + needed
+                "direct_call",  // mallocfn
+                "malloc",       // old_piece
+                "getfield",     // current_buf
+                "setfield",     // old_piece.buf
+                "getfield",     // extra_pieces
+                "setfield",     // old_piece.prev_piece
+                "setfield",     // current_buf
+                "setfield",     // current_pos
+                "setfield",     // current_end
+                "setfield",     // total_size
+                "setfield",     // extra_pieces
+            ]
+        );
+        assert_eq!(startblock.inputargs.len(), 2);
+        // No exception edge: MemoryError path unmodelled -> single exit.
+        assert_eq!(startblock.exits.len(), 1);
+        let Hlvalue::Variable(ret) = &inner.returnblock.borrow().inputargs[0] else {
+            panic!("returnblock inputarg must be a Variable");
+        };
+        assert_eq!(ret.concretetype.borrow().clone(), Some(LowLevelType::Void));
     }
 
     #[test]
