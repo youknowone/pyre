@@ -1229,6 +1229,18 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         pyerror_type_error as *const (),
     );
 
+    // `PyError::to_exc_object` — residual exception materialization emitted by
+    // the two-phase rtyper for `PyError.to_exc_object()` call sites.  This uses
+    // the same impl-method CallPath shape as `type_error`, resolving to
+    // `["PyError", "to_exc_object"]` after the crate segment is stripped.
+    let pyerror_to_exc_object: fn(&crate::PyError) -> pyre_object::PyObjectRef =
+        crate::PyError::to_exc_object;
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::PyError::to_exc_object",
+        pyerror_to_exc_object as *const (),
+    );
+
     // RPython convention (cross-reference `support.py:255-271` for
     // the C-trunc helpers, `rint.py:398/495` for the Python-floor
     // ones) is to keep the two semantic flavours under DISTINCT
