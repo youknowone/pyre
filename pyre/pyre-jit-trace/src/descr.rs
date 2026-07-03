@@ -2887,7 +2887,7 @@ fn simple_descr_group_from_bh_size(
             spec.size,
             spec.type_id as u32,
             spec.type_id,
-            spec.vtable,
+            spec.vtable as usize,
             spec.is_gc_managed,
             &field_specs,
         )
@@ -3623,7 +3623,7 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
                 // TODO: `make_size_descr_with_type_and_vtable`
                 // takes the u32 gc tid; `*type_id` is the u64 cache key.
                 // Truncate `as u32` until gc_cache routing.
-                make_size_descr_with_type_and_vtable(*size, *type_id as u32, *vtable)
+                make_size_descr_with_type_and_vtable(*size, *type_id as u32, *vtable as usize)
             } else {
                 let spec = majit_translate::jitcode::BhSizeSpec {
                     size: *size,

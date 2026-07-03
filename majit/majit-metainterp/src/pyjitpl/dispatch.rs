@@ -616,7 +616,7 @@ fn size_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> majit_ir::DescrR
                 *size,
                 *type_id as u32,
                 *type_id,
-                *vtable,
+                *vtable as usize,
                 *is_gc_managed,
                 &specs,
             );
@@ -682,7 +682,7 @@ fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, majit_i
                         p.size,
                         p.type_id as u32,
                         p.type_id,
-                        p.vtable,
+                        p.vtable as usize,
                         p.is_gc_managed,
                         &specs,
                     );

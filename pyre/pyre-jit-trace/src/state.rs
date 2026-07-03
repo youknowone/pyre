@@ -5684,7 +5684,7 @@ fn bh_size_descr_from_size_descr(
         // descr.py type_id is the dense GC tid for alloc_nursery_typed,
         // not the cache_key structural identity
         type_id: size_descr.type_id() as u64,
-        vtable,
+        vtable: vtable as u64,
         owner: String::new(),
         all_fielddescrs: majit_translate::jitcode::bh_field_specs_from_size_descr(size_descr),
         // Round-trip the GC-header flag off the descr.

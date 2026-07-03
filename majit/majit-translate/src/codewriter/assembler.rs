@@ -1524,7 +1524,7 @@ impl Assembler {
                 let descr_idx = self.emit_ready_descr(crate::jitcode::BhDescr::Size {
                     size: spec.size,
                     type_id: spec.type_id,
-                    vtable: *vtable as usize,
+                    vtable: *vtable as u64,
                     // `STRUCT._name` identity is left empty for the transient
                     // `bh_new_with_vtable` size descr; the gc_cache hit keys on
                     // `type_id` (`path_hash(owner)`), not this field.
@@ -3373,7 +3373,7 @@ fn bh_size_spec_from_descr(sd: &dyn majit_ir::descr::SizeDescr) -> crate::jitcod
         // which lands on a DIFFERENT cache slot than the analyzer's
         // path_hash key, polluting cross-path identity.
         type_id: sd.cache_key(),
-        vtable: sd.vtable(),
+        vtable: sd.vtable() as u64,
         // Round-trip the GC-header flag off the descr so a raw native
         // struct stays raw through the inverse path (it must not regain
         // a spurious `GUARD_GC_TYPE`).
@@ -4070,7 +4070,7 @@ enum AssemblerDescrKey {
         size: usize,
         /// u64 cache-key surrogate matching `BhDescr::Size.type_id`.
         type_id: u64,
-        vtable: usize,
+        vtable: u64,
         owner: String,
         all_fielddescrs: Vec<crate::jitcode::BhFieldSpec>,
     },

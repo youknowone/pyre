@@ -1076,7 +1076,15 @@ pub struct BhSizeSpec {
     /// :bh_size_spec_from_callcontrol`), so the two routes converge on
     /// the same `LLType::Struct(u64)` cache key in `gc_cache._cache_size`.
     pub type_id: u64,
-    pub vtable: usize,
+    /// ob_type pointer captured in the PRODUCING process (build script
+    /// for `opcode_descrs.bin`, live runtime for tracer-minted specs).
+    /// Declared `u64`, not `usize`: the spec crosses the build→runtime
+    /// serialization boundary, and a 64-bit host pointer must survive
+    /// deserialization on a 32-bit (wasm32) runtime instead of failing
+    /// bincode's width check. Cross-process values are stale under ASLR
+    /// either way — consumers treat them as opaque identity words and
+    /// re-resolve real vtables via `type_id` → `gc_cache` publish.
+    pub vtable: u64,
     /// True when the struct carries a GC header (`ref - 8` type-id word),
     /// false for a natively-allocated raw struct registered via
     /// `register_struct_layout`.  Threaded to `SimpleSizeDescr.is_gc_managed`
@@ -1226,7 +1234,10 @@ pub enum BhDescr {
         /// u64 `path_hash(module_path::Struct)` — see
         /// `BhSizeSpec.type_id` doc for full identity rationale.
         type_id: u64,
-        vtable: usize,
+        /// See `BhSizeSpec.vtable`: producer-process ob_type pointer,
+        /// `u64` for wire-width stability across the build→runtime
+        /// (and 64→32-bit) serialization boundary.
+        vtable: u64,
         /// RPython `STRUCT._name` identity (empty when the size descr
         /// is built transiently for `bh_new` / `bh_new_with_vtable`
         /// dispatch and the struct identity is already encoded in the
@@ -1323,7 +1334,7 @@ impl BhDescr {
 
     pub fn get_vtable(&self) -> usize {
         match self {
-            BhDescr::Size { vtable, .. } => *vtable,
+            BhDescr::Size { vtable, .. } => *vtable as usize,
             _ => 0,
         }
     }

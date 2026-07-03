@@ -5496,7 +5496,7 @@ fn allocate_with_vtable(descr: &dyn majit_ir::SizeDescr) -> usize {
         size,
         // `descr.py:108-118` cache identity via `SizeDescr.cache_key()`.
         type_id: descr.cache_key(),
-        vtable,
+        vtable: vtable as u64,
         owner: String::new(),
         all_fielddescrs: majit_translate::jitcode::bh_field_specs_from_size_descr(descr),
         is_gc_managed: descr.is_gc_managed(),
@@ -7641,7 +7641,7 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
                     size: descr_size,
                     // Note: u32 gc tid widened to u64 cache key slot.
                     type_id: descr_index as u64,
-                    vtable,
+                    vtable: vtable as u64,
                     owner: String::new(),
                     all_fielddescrs: majit_translate::jitcode::bh_field_specs_from_size_descr(sd),
                     is_gc_managed: sd.is_gc_managed(),

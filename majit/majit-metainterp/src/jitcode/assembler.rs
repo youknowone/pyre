@@ -438,7 +438,7 @@ impl JitCodeBuilder {
         let descr = self.add_bh_descr(CanonicalBhDescr::Size {
             size,
             type_id,
-            vtable,
+            vtable: vtable as u64,
             owner: String::new(),
             all_fielddescrs: Vec::new(),
             is_gc_managed: true,
