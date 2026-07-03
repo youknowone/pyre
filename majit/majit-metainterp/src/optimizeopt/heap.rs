@@ -1931,7 +1931,22 @@ impl OptHeap {
             // this exact field descr by pointer identity.  Gated on
             // `!compute_bitstrings_has_run()` so the translated interpreter's
             // bitstring path is unchanged.
+            //
+            // STRUCTURAL ADAPTATION (no heap.py analog): upstream every
+            // cached descr is inside the `compute_bitstrings` universe, so
+            // the bitcheck is total.  Pyre also caches RUNTIME-minted
+            // descrs (`ei_index` unset even after bitstrings ran — e.g.
+            // the module-global cell fold's mutable
+            // `ObjectMutableCell.w_value`).  No call's write bitstring can
+            // ever name such a descr, so a bitcheck miss proves nothing;
+            // treating it as "not written" let a namespace-store residual
+            // (analyzed write set, which cannot include the runtime descr)
+            // keep the getfield cache and re-read a stale global
+            // (`acc = acc + a; acc = acc + b` at module level dropped the
+            // first term).  A mutable out-of-universe descr is therefore
+            // conservatively invalidated by every non-elidable call.
             let writes_field = ei.check_write_descr_field(effect_idx)
+                || (effect_idx == u32::MAX && !descr.is_always_pure())
                 || (!majit_ir::effectinfo::compute_bitstrings_has_run()
                     && ei.writes_field_descr_by_identity(&descr));
             if writes_field {
@@ -1959,7 +1974,12 @@ impl OptHeap {
             .collect();
         for (descr_idx, descr, effect_idx) in array_descrs {
             let read = ei.check_readonly_descr_array(effect_idx);
-            let write = ei.check_write_descr_array(effect_idx);
+            // See the field loop above: a RUNTIME-minted array descr
+            // (`ei_index` unset) is outside the bitstring universe, so no
+            // call's write bitstring can name it — conservatively treat
+            // every non-elidable call as writing it.
+            let write = ei.check_write_descr_array(effect_idx)
+                || (effect_idx == u32::MAX && !descr.is_always_pure());
             if !read && !write {
                 continue;
             }
