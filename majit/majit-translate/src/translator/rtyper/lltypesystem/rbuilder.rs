@@ -22,7 +22,7 @@ use crate::translator::rtyper::lltypesystem::lltype::{
 };
 use crate::translator::rtyper::lltypesystem::rstr::{STRPTR, UNICODEPTR};
 use crate::translator::rtyper::rtyper::{
-    helper_pygraph_from_graph, variable_with_lltype, void_field_const,
+    constant_with_lltype, helper_pygraph_from_graph, variable_with_lltype, void_field_const,
 };
 
 fn ptr_to_lowlevel(target: LowLevelType) -> LowLevelType {
@@ -358,6 +358,142 @@ pub fn build_ll_bool_helper_graph(
     ))
 }
 
+/// Synthesise `ll_new(init_size)` (`rbuilder.py:446-455` / `469-478`):
+///
+/// ```python
+/// init_size = intmask(min(r_uint(init_size), r_uint(1280)))
+/// ll_builder = lltype.malloc(STRINGBUILDER)
+/// ll_builder.current_buf = ll_builder.mallocfn(init_size)
+/// ll_builder.current_pos = 0
+/// ll_builder.current_end = init_size
+/// ll_builder.total_size = init_size
+/// return ll_builder
+/// ```
+///
+/// `min` is `rbuiltin.ll_min` (`rbuiltin.py:238`) and `mallocfn` is the
+/// specialization's `staticAdtMethod(rstr.mallocstr / mallocunicode)`
+/// (`rbuilder.py:54`/`72`) — both baked in as `direct_call` callee consts,
+/// mirroring [`build_ll_call_lookup_function_helper_graph`]. `buf_lltype`
+/// is `STRPTR`/`UNICODEPTR` (the `current_buf` field and `mallocfn` result).
+pub fn build_ll_new_helper_graph(
+    name: &str,
+    builder_ptr_lltype: LowLevelType,
+    builder_struct: LowLevelType,
+    buf_lltype: LowLevelType,
+    min_fn: Constant,
+    mallocfn: Constant,
+) -> Result<PyGraph, TyperError> {
+    use crate::translator::rtyper::rmodel::{gc_flavor_const, lowlevel_type_const};
+
+    let init_size = variable_with_lltype("init_size", LowLevelType::Signed);
+    let startblock = Block::shared(vec![Hlvalue::Variable(init_size.clone())]);
+    let return_var = variable_with_lltype("result", builder_ptr_lltype.clone());
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+    let void_result = || variable_with_lltype("v", LowLevelType::Void);
+
+    // init_size = intmask(min(r_uint(init_size), r_uint(1280)))
+    let uint_size = variable_with_lltype("uint_size", LowLevelType::Unsigned);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "cast_int_to_uint",
+        vec![Hlvalue::Variable(init_size)],
+        Hlvalue::Variable(uint_size.clone()),
+    ));
+    let uint_min = variable_with_lltype("uint_min", LowLevelType::Unsigned);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![
+            Hlvalue::Constant(min_fn),
+            Hlvalue::Variable(uint_size),
+            constant_with_lltype(ConstValue::Int(1280), LowLevelType::Unsigned),
+        ],
+        Hlvalue::Variable(uint_min.clone()),
+    ));
+    let size = variable_with_lltype("size", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "cast_uint_to_int",
+        vec![Hlvalue::Variable(uint_min)],
+        Hlvalue::Variable(size.clone()),
+    ));
+
+    // ll_builder = lltype.malloc(STRINGBUILDER)
+    let ll_builder = variable_with_lltype("ll_builder", builder_ptr_lltype);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "malloc",
+        vec![lowlevel_type_const(builder_struct), gc_flavor_const()?],
+        Hlvalue::Variable(ll_builder.clone()),
+    ));
+
+    // ll_builder.current_buf = ll_builder.mallocfn(init_size)
+    let current_buf = variable_with_lltype("current_buf", buf_lltype);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![Hlvalue::Constant(mallocfn), Hlvalue::Variable(size.clone())],
+        Hlvalue::Variable(current_buf.clone()),
+    ));
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "setfield",
+        vec![
+            Hlvalue::Variable(ll_builder.clone()),
+            void_field_const("current_buf"),
+            Hlvalue::Variable(current_buf),
+        ],
+        Hlvalue::Variable(void_result()),
+    ));
+    // ll_builder.current_pos = 0
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "setfield",
+        vec![
+            Hlvalue::Variable(ll_builder.clone()),
+            void_field_const("current_pos"),
+            constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed),
+        ],
+        Hlvalue::Variable(void_result()),
+    ));
+    // ll_builder.current_end = init_size
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "setfield",
+        vec![
+            Hlvalue::Variable(ll_builder.clone()),
+            void_field_const("current_end"),
+            Hlvalue::Variable(size.clone()),
+        ],
+        Hlvalue::Variable(void_result()),
+    ));
+    // ll_builder.total_size = init_size
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "setfield",
+        vec![
+            Hlvalue::Variable(ll_builder.clone()),
+            void_field_const("total_size"),
+            Hlvalue::Variable(size),
+        ],
+        Hlvalue::Variable(void_result()),
+    ));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(ll_builder)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["init_size".to_string()],
+        func,
+    ))
+}
+
 /// RPython `class BaseStringBuilderRepr(AbstractStringBuilderRepr)`.
 #[derive(Debug, Default)]
 pub struct BaseStringBuilderRepr;
@@ -536,6 +672,55 @@ mod tests {
             panic!("returnblock inputarg must be a Variable");
         };
         assert_eq!(ret.concretetype.borrow().clone(), Some(LowLevelType::Bool));
+    }
+
+    fn dummy_funcptr_const() -> super::Constant {
+        super::Constant::with_concretetype(super::ConstValue::None, LowLevelType::Void)
+    }
+
+    #[test]
+    fn build_ll_new_clamps_size_mallocs_builder_and_inits_fields() {
+        use super::Hlvalue;
+        let helper = super::build_ll_new_helper_graph(
+            "ll_new",
+            super::STRINGBUILDERPTR.clone(),
+            super::STRINGBUILDER.clone(),
+            super::STRPTR.clone(),
+            dummy_funcptr_const(),
+            dummy_funcptr_const(),
+        )
+        .expect("build_ll_new_helper_graph");
+        assert_eq!(helper.func.name, "ll_new");
+        let inner = helper.graph.borrow();
+        let startblock = inner.startblock.borrow();
+        // intmask(min(r_uint(init_size), 1280)); malloc; mallocfn; 4 setfields
+        let ops: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|op| op.opname.as_str())
+            .collect();
+        assert_eq!(
+            ops,
+            vec![
+                "cast_int_to_uint",
+                "direct_call",
+                "cast_uint_to_int",
+                "malloc",
+                "direct_call",
+                "setfield",
+                "setfield",
+                "setfield",
+                "setfield",
+            ]
+        );
+        assert_eq!(startblock.inputargs.len(), 1);
+        let Hlvalue::Variable(ret) = &inner.returnblock.borrow().inputargs[0] else {
+            panic!("returnblock inputarg must be a Variable");
+        };
+        assert_eq!(
+            ret.concretetype.borrow().clone(),
+            Some(super::STRINGBUILDERPTR.clone())
+        );
     }
 
     #[test]
