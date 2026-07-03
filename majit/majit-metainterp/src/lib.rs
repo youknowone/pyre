@@ -412,12 +412,18 @@ pub fn register_stack_almost_full_hook(f: fn() -> bool) {
 /// Diagnostic-only guard-failure → bridge-trace gate tallies, read out via
 /// the `pyre_jit_mc_diag` guest export. Index legend: 0 = must_compile_with_values
 /// entered, 1 = declined_bridge_guards short-circuit, 2 = descr_addr==0 skip,
-/// 3 = status-busy skip, 4 = jitcounter FIRED (true), 5 = reserved (unused),
-/// 6 = start_retrace_from_guard entered, 7 = start_retrace bailed (source loop
-/// evicted: compiled_loops miss).
-pub static MC_DIAG: [std::sync::atomic::AtomicU64; 8] = {
+/// 3 = status-busy skip, 4 = jitcounter FIRED (true), 5 = stack_almost_full
+/// returned true, 6 = start_retrace_from_guard entered, 7 = start_retrace bailed
+/// (source loop evicted: compiled_loops miss), 8 = compile_bridge entered (trace
+/// closed → backend request path), 9 = compile_bridge InvalidLoop discard, 10 =
+/// compile_bridge retrace_requested return, 11 = compile_bridge arity giveup
+/// return (JUMP args != target LABEL args), 12 = start_bridge_tracing entered,
+/// 13 = sbt early: descr not FailDescr, 14 = sbt early: no owning jct, 15 = sbt
+/// early: no compiled_meta, 16 = sbt early: !can_trace, 17 = sbt early:
+/// fail_values too short.
+pub static MC_DIAG: [std::sync::atomic::AtomicU64; 18] = {
     const Z: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    [Z, Z, Z, Z, Z, Z, Z, Z]
+    [Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z]
 };
 
 /// Read an `MC_DIAG` tally (saturating). Surfaced via `pyre_jit_mc_diag`.
@@ -442,7 +448,11 @@ pub fn mc_diag_bump(i: usize) {
 #[inline]
 pub fn stack_almost_full() -> bool {
     if let Some(f) = STACK_ALMOST_FULL_FN.get() {
-        f()
+        let r = f();
+        if r {
+            mc_diag_bump(5); // stack_almost_full returned true
+        }
+        r
     } else {
         false
     }

@@ -9808,6 +9808,7 @@ impl<M: Clone> MetaInterp<M> {
         snapshot_frame_pcs: SnapshotFramePcs,
         call_pure_results: majit_ir::VecMap<Vec<Value>, Value>,
     ) -> bool {
+        crate::mc_diag_bump(8); // compile_bridge entered
         if !self.compiled_loops.contains_key(&green_key) {
             return false;
         }
@@ -10101,6 +10102,7 @@ impl<M: Clone> MetaInterp<M> {
             // speculative heap access proven ill-typed (now a deferred
             // `InvalidLoop` signal, not a panic), discards the bridge.
             Err(inv) => {
+                crate::mc_diag_bump(9); // compile_bridge InvalidLoop discard
                 if crate::majit_log_enabled() {
                     eprintln!(
                         "[jit] compile_bridge: InvalidLoop(\"{}\") at key={} fail_index={}",
@@ -10117,6 +10119,7 @@ impl<M: Clone> MetaInterp<M> {
         // directly; missing-constant recovery from source_trace is
         // pyre-only and violates bridge pool isolation.
         if retrace_requested {
+            crate::mc_diag_bump(10); // compile_bridge retrace_requested return
             // compile.py:1079: metainterp.retrace_needed(new_trace, info)
             // Save partial trace + exported state so the next loop-header's
             // compile_loop → compile_retrace can produce a new specialization.
@@ -10198,6 +10201,7 @@ impl<M: Clone> MetaInterp<M> {
             if let Some(target_len) = target_len {
                 let jump_len = jump.getarglist().len();
                 if target_len != 0 && jump_len != target_len {
+                    crate::mc_diag_bump(11); // compile_bridge arity giveup return
                     if crate::majit_log_enabled() {
                         eprintln!(
                             "[jit] compile_bridge giveup: JUMP args {jump_len} != \
@@ -10429,7 +10433,7 @@ impl<M: Clone> MetaInterp<M> {
                 // op-lowering gaps) may be resolved on a differently-shaped
                 // retrace. Record the source guard so `must_compile_with_values`
                 // stops firing for it; the guard then resolves through blackhole
-                // resume (the always-correct fallback the dormant path uses).
+                // resume (the always-correct fallback).
                 if matches!(e, majit_backend::BackendError::Unsupported(_))
                     && self.backend.bridge_decline_is_terminal()
                 {

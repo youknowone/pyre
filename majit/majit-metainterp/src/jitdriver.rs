@@ -4201,25 +4201,30 @@ impl<S: JitState> JitDriver<S> {
         raw_fail_values: &[i64],
         resume_pc: usize,
     ) -> bool {
+        majit_metainterp::mc_diag_bump(12); // start_bridge_tracing entered
         // compile.py:725-729 `_trace_and_compile_from_bridge` raises
         // `compile.giveup()` when the descr's owning JitCellToken weakref
         // is dead (memmgr-evicted).  Pyre signals the same outcome by
         // returning false; also returns false if the descr is not a
         // FailDescr at all (e.g. a synthetic terminal-exit Descr).
         let Some(descr_fd) = descr_arc.as_fail_descr() else {
+            majit_metainterp::mc_diag_bump(13); // sbt early: descr not FailDescr
             return false;
         };
         let Some(jct) = majit_backend::descr_owning_jct(descr_fd) else {
+            majit_metainterp::mc_diag_bump(14); // sbt early: no owning jct
             return false;
         };
         let green_key = jct.green_key;
         let trace_id = descr_fd.trace_id();
         let fail_index = descr_fd.fail_index_per_trace();
         let Some(_loop_meta) = self.meta.get_compiled_meta(green_key).cloned() else {
+            majit_metainterp::mc_diag_bump(15); // sbt early: no compiled_meta
             return false;
         };
 
         if !state.can_trace() {
+            majit_metainterp::mc_diag_bump(16); // sbt early: !can_trace
             return false;
         }
 
@@ -4236,6 +4241,7 @@ impl<S: JitState> JitDriver<S> {
         // trace_id, fail_index)` reverse lookup.
         let fail_arg_count = descr_fd.fail_arg_types().len();
         let Some(frontend_fail_values) = raw_fail_values.get(..fail_arg_count) else {
+            majit_metainterp::mc_diag_bump(17); // sbt early: fail_values too short
             return false;
         };
 

@@ -1339,6 +1339,30 @@ fn run_perfn_walk(
     // `terminate_no_replay` exit also keeps the stores: the portal returns
     // the walk's result without replaying, exactly like the loop-flush
     // commit.
+    if is_bridge_trace && crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+        let outcome_kind = match &walk_result {
+            Ok((crate::jitcode_dispatch::DispatchOutcome::Continue, _)) => "Continue",
+            Ok((crate::jitcode_dispatch::DispatchOutcome::Terminate, _)) => "Terminate",
+            Ok((crate::jitcode_dispatch::DispatchOutcome::SubReturn { .. }, _)) => "SubReturn",
+            Ok((crate::jitcode_dispatch::DispatchOutcome::SubRaise { .. }, _)) => "SubRaise",
+            Ok((crate::jitcode_dispatch::DispatchOutcome::SwitchToBlackhole { .. }, _)) => {
+                "SwitchToBlackhole"
+            }
+            Ok((crate::jitcode_dispatch::DispatchOutcome::CloseLoop { .. }, _)) => "CloseLoop",
+            Ok((crate::jitcode_dispatch::DispatchOutcome::CompileTracePending { .. }, _)) => {
+                "CompileTracePending"
+            }
+            Ok((_, _)) => "OtherOk",
+            Err(_) => "Err",
+        };
+        eprintln!(
+            "[fbw-bridge-epilogue] committed={} store_journal_len={} unjournaled={} outcome={}",
+            WALK_END_FLUSH_COMMITTED.with(|c| c.get()),
+            crate::jitcode_dispatch::fbw_store_journal_len(),
+            crate::jitcode_dispatch::fbw_has_unjournaled_effect(),
+            outcome_kind,
+        );
+    }
     if WALK_END_FLUSH_COMMITTED.with(|c| c.get()) || terminate_no_replay {
         crate::jitcode_dispatch::fbw_store_journal_commit();
     } else {

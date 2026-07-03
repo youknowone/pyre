@@ -12566,9 +12566,16 @@ fn dispatch_residual_call_iRd_kind(
         && ctx.is_full_body_walk
         && dst_bank == 'v'
         && ei.pyre_helper == majit_ir::PyreHelperKind::StoreSubscr
-        && try_walker_specialize_store_subscr(ctx, op.pc, &r_args)?.is_some()
     {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
+        if try_walker_specialize_store_subscr(ctx, op.pc, &r_args)?.is_some() {
+            return Ok((DispatchOutcome::Continue, op.next_pc));
+        } else if ctx.trace_ctx.is_bridge_trace && fbw_debug_abort_enabled() {
+            eprintln!(
+                "[fbw-store-fallthrough] bridge STORE_SUBSCR fell to GENERIC residual at pc={} \
+                 (specialization declined — unjournaled concrete store)",
+                op.pc
+            );
+        }
     }
 
     // #195 / #73: virtualize an arity-2 plain-int BUILD_TUPLE
