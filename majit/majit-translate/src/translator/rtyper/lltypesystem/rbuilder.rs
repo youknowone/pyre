@@ -494,6 +494,118 @@ pub fn build_ll_new_helper_graph(
     ))
 }
 
+/// Synthesise `ll_shrink_final(ll_builder)` (`rbuilder.py:365-372`):
+///
+/// ```python
+/// final_size = ll_builder.current_pos
+/// ll_assert(final_size <= ll_builder.total_size, "...")   # debug-only, omitted
+/// buf = rgc.ll_shrink_array(ll_builder.current_buf, final_size)
+/// ll_builder.current_buf = buf
+/// ll_builder.current_end = final_size
+/// ll_builder.total_size = final_size
+/// ```
+///
+/// `rgc.ll_shrink_array` (`rgc.py:471`) is baked in as a `direct_call`
+/// callee const (`shrink_array_fn`); `buf_lltype` is `STRPTR`/`UNICODEPTR`.
+/// Returns `Void`.
+pub fn build_ll_shrink_final_helper_graph(
+    name: &str,
+    builder_ptr_lltype: LowLevelType,
+    buf_lltype: LowLevelType,
+    shrink_array_fn: Constant,
+) -> Result<PyGraph, TyperError> {
+    let ll_builder = variable_with_lltype("ll_builder", builder_ptr_lltype);
+    let startblock = Block::shared(vec![Hlvalue::Variable(ll_builder.clone())]);
+    let return_var = variable_with_lltype("result", LowLevelType::Void);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+    let void_result = || variable_with_lltype("v", LowLevelType::Void);
+    let none_const = || {
+        Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::None,
+            LowLevelType::Void,
+        ))
+    };
+
+    // final_size = ll_builder.current_pos
+    let final_size = variable_with_lltype("final_size", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "getfield",
+        vec![
+            Hlvalue::Variable(ll_builder.clone()),
+            void_field_const("current_pos"),
+        ],
+        Hlvalue::Variable(final_size.clone()),
+    ));
+    // buf = rgc.ll_shrink_array(ll_builder.current_buf, final_size)
+    let old_buf = variable_with_lltype("old_buf", buf_lltype.clone());
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "getfield",
+        vec![
+            Hlvalue::Variable(ll_builder.clone()),
+            void_field_const("current_buf"),
+        ],
+        Hlvalue::Variable(old_buf.clone()),
+    ));
+    let buf = variable_with_lltype("buf", buf_lltype);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![
+            Hlvalue::Constant(shrink_array_fn),
+            Hlvalue::Variable(old_buf),
+            Hlvalue::Variable(final_size.clone()),
+        ],
+        Hlvalue::Variable(buf.clone()),
+    ));
+    // ll_builder.current_buf = buf
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "setfield",
+        vec![
+            Hlvalue::Variable(ll_builder.clone()),
+            void_field_const("current_buf"),
+            Hlvalue::Variable(buf),
+        ],
+        Hlvalue::Variable(void_result()),
+    ));
+    // ll_builder.current_end = final_size
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "setfield",
+        vec![
+            Hlvalue::Variable(ll_builder.clone()),
+            void_field_const("current_end"),
+            Hlvalue::Variable(final_size.clone()),
+        ],
+        Hlvalue::Variable(void_result()),
+    ));
+    // ll_builder.total_size = final_size
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "setfield",
+        vec![
+            Hlvalue::Variable(ll_builder),
+            void_field_const("total_size"),
+            Hlvalue::Variable(final_size),
+        ],
+        Hlvalue::Variable(void_result()),
+    ));
+    startblock.closeblock(vec![
+        Link::new(vec![none_const()], Some(graph.returnblock.clone()), None).into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["ll_builder".to_string()],
+        func,
+    ))
+}
+
 /// RPython `class BaseStringBuilderRepr(AbstractStringBuilderRepr)`.
 #[derive(Debug, Default)]
 pub struct BaseStringBuilderRepr;
@@ -721,6 +833,44 @@ mod tests {
             ret.concretetype.borrow().clone(),
             Some(super::STRINGBUILDERPTR.clone())
         );
+    }
+
+    #[test]
+    fn build_ll_shrink_final_reads_pos_shrinks_buf_and_updates_fields() {
+        use super::Hlvalue;
+        let helper = super::build_ll_shrink_final_helper_graph(
+            "ll_shrink_final",
+            super::STRINGBUILDERPTR.clone(),
+            super::STRPTR.clone(),
+            dummy_funcptr_const(),
+        )
+        .expect("build_ll_shrink_final_helper_graph");
+        assert_eq!(helper.func.name, "ll_shrink_final");
+        let inner = helper.graph.borrow();
+        let startblock = inner.startblock.borrow();
+        // final_size = current_pos; buf = shrink(current_buf, final_size); 3 setfields
+        let ops: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|op| op.opname.as_str())
+            .collect();
+        assert_eq!(
+            ops,
+            vec![
+                "getfield",
+                "getfield",
+                "direct_call",
+                "setfield",
+                "setfield",
+                "setfield",
+            ]
+        );
+        assert_eq!(startblock.inputargs.len(), 1);
+        // Void return.
+        let Hlvalue::Variable(ret) = &inner.returnblock.borrow().inputargs[0] else {
+            panic!("returnblock inputarg must be a Variable");
+        };
+        assert_eq!(ret.concretetype.borrow().clone(), Some(LowLevelType::Void));
     }
 
     #[test]
