@@ -1680,6 +1680,19 @@ pub fn lower_fun_decl_with_static_addrs(
                 &lo.closure_select_sites,
             )
         };
+        // The `bigint::BigInt::div_rem()` producer rewrite
+        // (`front::bigint_div_rem`) splices the residual `div_rem` call in
+        // place with `jit_bigint_div` / `jit_bigint_rem` residuals + a
+        // synthetic-`Tuple` `(quotient, remainder)` aggregate.  It touches no
+        // control flow (no fresh blocks, no detached edges), so it does not
+        // gate the reachability sweep; fail-safe, so a structural mismatch
+        // leaves the residual call (rtyper Skip).
+        if !lo.bigint_div_rem_sites.is_empty() {
+            crate::front::bigint_div_rem::rewire_bigint_div_rem_call_sites(
+                &mut lo.graph,
+                &lo.bigint_div_rem_sites,
+            );
+        }
         if !lo.result_exc_call_results.is_empty()
             || result_exc_callee
             || next_rewritten > 0
@@ -2028,6 +2041,11 @@ struct Lowering<'a> {
     /// resolved ctor/method owners the arms need (see
     /// [`crate::front::bool_then::BoolThenSite`]).
     bool_then_sites: Vec<crate::front::bool_then::BoolThenSite>,
+    /// `bigint::BigInt::div_rem()` call sites recorded for the modeled
+    /// `(quotient, remainder)` tuple producer the `front::bigint_div_rem`
+    /// post-pass synthesizes (see
+    /// [`crate::front::bigint_div_rem::BigIntDivRemSite`]).
+    bigint_div_rem_sites: Vec<crate::front::bigint_div_rem::BigIntDivRemSite>,
     /// `Option::unwrap_or(opt, default)` call sites recorded for the
     /// discriminant value-select the `front::option_unwrap_or` post-pass
     /// synthesizes after the body lowering completes.  Each carries the
@@ -2204,6 +2222,7 @@ impl<'a> Lowering<'a> {
             checked_arith_call_results: Vec::new(),
             option_try_sites: Vec::new(),
             bool_then_sites: Vec::new(),
+            bigint_div_rem_sites: Vec::new(),
             unwrap_or_sites: Vec::new(),
             map_or_sites: Vec::new(),
             is_none_sites: Vec::new(),
@@ -6050,6 +6069,24 @@ impl<'a> Lowering<'a> {
                 self.recognize_bool_then_site(&call.dest.ty, second_arg_ty.as_ref(), &result_var)
         {
             self.bool_then_sites.push(site);
+        }
+        // Capture `bigint::BigInt::div_rem()` sites for the modeled
+        // `(quotient, remainder)` tuple producer `front::bigint_div_rem`
+        // synthesizes.  Opaque foreign 2-arg FunctionPath (numerator,
+        // denominator); the `(BigInt, BigInt)` tuple owner is the synthetic
+        // `"Tuple"` constant, so only the result var is recorded.
+        if let OpKind::Call {
+            target: CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } = &op_kind
+            && args.len() == 2
+            && fmt_path_ends_with(segments, &["bigint", "BigInt", "div_rem"])
+        {
+            self.bigint_div_rem_sites
+                .push(crate::front::bigint_div_rem::BigIntDivRemSite {
+                    result_var: result_var.clone(),
+                });
         }
         // Capture `Option::unwrap_or(opt, default)` sites for the
         // discriminant value-select `front::option_unwrap_or` synthesizes.

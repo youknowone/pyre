@@ -488,6 +488,20 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::bigint_gc_type_id",
         pyre_object::longobject::bigint_gc_type_id as *const (),
     );
+    // `jit_bigint_div` / `jit_bigint_rem` residualize the `div_rem()` tuple
+    // synth (`front::bigint_div_rem`): the foreign malachite `div_rem` returns
+    // a `(BigInt, BigInt)` the tracer models as a `__pos_0`/`__pos_1` tuple
+    // sourced from these two `#[dont_look_inside]` calls, bound by path.
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::jit_bigint_div",
+        crate::objspace::descroperation::jit_bigint_div as *const (),
+    );
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::jit_bigint_rem",
+        crate::objspace::descroperation::jit_bigint_rem as *const (),
+    );
 
     for (nargs, (module_path, root_path)) in CALLABLE_HELPER_PATHS.iter().enumerate() {
         if let Some(fnptr) = crate::runtime_ops::callable_call_helper(nargs) {

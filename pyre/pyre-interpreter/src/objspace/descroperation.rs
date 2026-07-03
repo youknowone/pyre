@@ -92,6 +92,29 @@ fn bigint_to_f64(a: BigInt) -> f64 {
     jit_bigint_to_f64_or_inf(&a)
 }
 
+/// `rbigint.divmod`'s truncated quotient — the `.0` of `num_integer::div_rem`
+/// on two bare `*const BigInt` payloads. The foreign malachite `div_rem`
+/// returns a `(BigInt, BigInt)` tuple the tracer cannot model, so the front
+/// `div_rem` synth (`front::bigint_div_rem`) replaces the call with the
+/// quotient (this) + remainder ([`jit_bigint_rem`]) sourcing a modeled 2-tuple.
+/// Allocates the result via the COLLECTING nursery (a gcmap-rooted residual,
+/// its operand pointers rooted across the alloc), matching the arithmetic
+/// residuals. Returns a freshly heap-allocated `*mut BigInt` (as i64).
+#[majit_macros::dont_look_inside]
+pub extern "C" fn jit_bigint_div(a: i64, b: i64) -> i64 {
+    let (a, b) = (a as *const BigInt, b as *const BigInt);
+    unsafe { pyre_object::longobject::alloc_bigint_nursery_collecting((&*a).div_rem(&*b).0) as i64 }
+}
+
+/// `rbigint.divmod`'s truncated remainder — the `.1` of `num_integer::div_rem`.
+/// See [`jit_bigint_div`]; the two share the `(BigInt, BigInt)` semantics the
+/// `front::bigint_div_rem` synth reassembles into a modeled tuple.
+#[majit_macros::dont_look_inside]
+pub extern "C" fn jit_bigint_rem(a: i64, b: i64) -> i64 {
+    let (a, b) = (a as *const BigInt, b as *const BigInt);
+    unsafe { pyre_object::longobject::alloc_bigint_nursery_collecting((&*a).div_rem(&*b).1) as i64 }
+}
+
 #[majit_macros::elidable]
 fn float_copysign(mag: f64, sign: f64) -> f64 {
     if sign.is_sign_negative() {
