@@ -327,12 +327,17 @@ fn memoryview_pack_value(
             Err(bad_type())
         }
     };
-    let int_val = || -> Result<i64, crate::PyError> {
+    // Integer formats coerce via `__index__` (`pack_single`/`PyNumber_Index`),
+    // not an exact-int check; a value with no `__index__` is the format error.
+    let as_index = || -> Result<PyObjectRef, crate::PyError> {
         if unsafe { pyre_object::is_int_or_long(w_val) } {
-            crate::baseobjspace::int_w(w_val).map_err(|_| bad_type())
+            Ok(w_val)
         } else {
-            Err(bad_type())
+            unsafe { crate::baseobjspace::space_index(w_val) }.map_err(|_| bad_type())
         }
+    };
+    let int_val = || -> Result<i64, crate::PyError> {
+        crate::baseobjspace::int_w(as_index()?).map_err(|_| bad_type())
     };
     let bytes = match memoryview_format_code(fmt) {
         b'b' => {
@@ -370,10 +375,7 @@ fn memoryview_pack_value(
             v.to_ne_bytes().to_vec()
         }
         b'L' | b'Q' | b'N' | b'P' => {
-            if !unsafe { pyre_object::is_int_or_long(w_val) } {
-                return Err(bad_type());
-            }
-            let v = crate::baseobjspace::uint_w(w_val).map_err(|_| bad_type())?;
+            let v = crate::baseobjspace::uint_w(as_index()?).map_err(|_| bad_type())?;
             v.to_ne_bytes().to_vec()
         }
         b'f' => {
@@ -780,6 +782,11 @@ fn memoryview_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
                 )));
             }
             let packed = memoryview_pack_value(&fmt, isz, value)?;
+            // memory_ass_sub: pack the value, then re-check release before the
+            // write — the value's `__index__`/`__float__` coercion may have
+            // released the view (`bytes_from_value` → `_check_released` →
+            // `setbytes`).
+            memoryview_check_released(mv)?;
             let start = memoryview_start_from_tuple(mv, index)?;
             let addr = (offset + start) as usize;
             let full =
@@ -800,6 +807,8 @@ fn memoryview_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
             return Err(crate::PyError::index_error("index out of bounds"));
         }
         let packed = memoryview_pack_value(&fmt, isz, value)?;
+        // Re-check release after value coercion (see tuple path above).
+        memoryview_check_released(mv)?;
         let addr = (offset + i * stride0) as usize;
         let full = memoryview_backing_bytes_mut(backing).expect("writable backing checked above");
         full[addr..addr + isz].copy_from_slice(&packed);
