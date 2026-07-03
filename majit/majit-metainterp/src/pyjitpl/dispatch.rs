@@ -1087,21 +1087,6 @@ pub(crate) fn portal_inline_experiment_enabled() -> bool {
     *ENABLED
 }
 
-thread_local! {
-    /// [FR-EXPERIMENT] One stable fresh-callee state per jitdriver, keyed by
-    /// `jd_index`.  A recursive-portal INLINE call re-uses this address as the
-    /// callee's vable identity so the const does not vary across unroll
-    /// iterations (a fresh leak per call bakes an iteration-varying const into
-    /// the callee's recorded ops and the loop never matches a prior iteration).
-    /// The callee's shadow is re-zeroed from `recursive_fresh_entry_reds` each
-    /// call, so re-using one backing object is safe.  Owners are leaked into
-    /// this map to keep the address valid for the process (experiment; a
-    /// trace-scoped arena is the follow-up).
-    static PORTAL_FRESH_STATE: std::cell::RefCell<
-        std::collections::HashMap<usize, majit_ir::GcRef>,
-    > = std::cell::RefCell::new(std::collections::HashMap::new());
-}
-
 pub struct ClosureRuntime<FLabel> {
     label_at: FLabel,
 }
@@ -2501,154 +2486,12 @@ where
         }
 
         // State-field production runtime leaves `portal_jitcode` None.  The
-        // Inline path for that shape is the [FR] re-entry rework, WIP and
-        // gated OFF by default so existing consumers keep the clean-abort
-        // fallback (dispatch.rs:2412 legacy behavior).
-        if !portal_inline_experiment_enabled() {
-            return TraceAction::Abort;
-        }
-
-        // [FR] State-field recursive-portal INLINE.  The portal jitcode is
-        // the dispatch-body jitcode currently being traced (one jitcode per
-        // program; self-recursion and same-program leaf calls re-enter the
-        // same body at a different interpreter pc).  The state-field body is
-        // entered at offset 0 with the interpreter pc carried as the `pc`
-        // green and the callee's own reds seeded by `setup_call`, exactly as
-        // a normal trace entry (`__trace_*` builds
-        // `[program(Ref), pc(Int), vable_identity(Ref)]`; setup_call packs
-        // per kind densely so program→ref0, vable→ref1, pc→int0).
-        let portal = self.frames.current_mut().jitcode.clone();
-
-        // The callee runs on a FRESH virtualizable (fresh stack, scalars
-        // zeroed).  `recursive_fresh_entry_reds` yields the extract_live
-        // image [scalars…, &state Ref, len…]; the entry argbox needs only
-        // the vable identity Ref (ref reg 1).  Its concrete shadow is real
-        // memory the inline walk reads/writes until the callee returns.
-        let (fresh_values, fresh_owner) = match sym.recursive_fresh_entry_reds() {
-            Some(pair) => pair,
-            None => return TraceAction::Abort,
-        };
-        // Reuse a STABLE fresh-callee address per driver (PORTAL_FRESH_STATE):
-        // a new leak per call would bake an iteration-varying const into the
-        // callee's recorded ops.  The shadow is re-zeroed each call, so reuse
-        // is safe.
-        let Some(fresh_ref) = fresh_values.iter().find_map(|v| match v {
-            majit_ir::Value::Ref(r) => Some(*r),
-            _ => None,
-        }) else {
-            return TraceAction::Abort;
-        };
-        let vable_ref = PORTAL_FRESH_STATE.with(|cell| {
-            let mut map = cell.borrow_mut();
-            *map.entry(jd_index).or_insert_with(|| {
-                let _: &'static mut dyn core::any::Any = Box::leak(fresh_owner);
-                fresh_ref
-            })
-        });
-        // The stable address supersedes this call's fresh Ref throughout.
-        let fresh_values: Vec<majit_ir::Value> = fresh_values
-            .into_iter()
-            .map(|v| match v {
-                majit_ir::Value::Ref(_) => majit_ir::Value::Ref(vable_ref),
-                other => other,
-            })
-            .collect();
-
-        // Entry argboxes: greens in declaration order, then the fresh vable
-        // identity.  Kind-dense packing puts the single ref green `program`
-        // in ref0 and the fresh vable in ref1, matching the compiled
-        // dispatch body's entry register layout.
-        let mut argboxes: Vec<(JitArgKind, OpRef, i64)> = Vec::with_capacity(green_srcs.len() + 1);
-        for (i, &(kind, _src)) in green_srcs.iter().enumerate() {
-            let concrete = green_values[i];
-            let opref = match kind {
-                JitArgKind::Ref => OpRef::const_ptr(majit_ir::GcRef(concrete as usize)),
-                _ => OpRef::const_int(concrete),
-            };
-            argboxes.push((kind, opref, concrete));
-        }
-        argboxes.push((
-            JitArgKind::Ref,
-            OpRef::const_ptr(vable_ref),
-            vable_ref.0 as i64,
-        ));
-
-        let mut portal_frame = MIFrame::setup(portal, 0, None, Some(ctx));
-        portal_frame.setup_call(&argboxes);
-        // Seed the callee's working state-field int registers (scalars +
-        // virt-array ptr/len) with fresh CONSTANTS.  `setup_call` only wired
-        // the greens + vable identity; the dispatch re-reads `stackpos` etc.
-        // from these int registers at the callee's offset-0 merge point, so
-        // without this seed the callee inherits the caller's promoted values.
-        sym.seed_recursive_fresh_frame(&mut portal_frame);
-        ctx.push_inline_frame((jd_index, green_pc), u32::MAX);
-        portal_frame.inline_frame = true;
-
-        // Install the callee's FRESH virtualizable as the standard vable for
-        // the duration of the inline walk (single standard vable nested across
-        // the call), saving the caller's to restore when the frame returns.
-        // `recursive_fresh_entry_reds` yields [scalars…, &state Ref, lengths…]
-        // in extract_live order: the vinfo's scalar field values, then the
-        // vable identity Ref, then one length per array field. The standard
-        // boxes want the fully flattened shape [field0…fieldN, arr0[0]…arr0[L0],
-        // arr1[0]…, vable_ref]; a fresh callee zero-fills every array element
-        // (item_type-typed zero).
-        if let Some(info) = ctx.current_virtualizable_info() {
-            let ref_pos = fresh_values
-                .iter()
-                .position(|v| matches!(v, majit_ir::Value::Ref(_)))
-                .unwrap_or(fresh_values.len());
-            let array_lengths: Vec<usize> = fresh_values[ref_pos.saturating_add(1)..]
-                .iter()
-                .map(|v| match v {
-                    majit_ir::Value::Int(n) => *n as usize,
-                    _ => 0,
-                })
-                .collect();
-            let mut vable_values: Vec<majit_ir::Value> = fresh_values[..ref_pos].to_vec();
-            for (a, &len) in array_lengths.iter().enumerate() {
-                let item_ty = info.array_fields[a].item_type;
-                for _ in 0..len {
-                    vable_values.push(super::heap_value_for_pub(item_ty, 0));
-                }
-            }
-            let vable_oprefs: Vec<OpRef> = vable_values
-                .iter()
-                .map(OpRef::const_inline_from_value)
-                .collect();
-            ctx.push_saved_virtualizable();
-            ctx.init_virtualizable_boxes(
-                &info,
-                OpRef::const_ptr(vable_ref),
-                majit_ir::Value::Ref(vable_ref),
-                &vable_oprefs,
-                &vable_values,
-                &array_lengths,
-            );
-            portal_frame.portal_vable_saved = true;
-        }
-
-        // Wire the return slot so the callee's typed return writes its
-        // result back into the caller's destination register
-        // (BC_INLINE_CALL:3348-3350).
-        match result_kind {
-            Some(JitArgKind::Int) => portal_frame.return_i = result_dst,
-            Some(JitArgKind::Ref) => portal_frame.return_r = result_dst,
-            Some(JitArgKind::Float) => portal_frame.return_f = result_dst,
-            None => {}
-        }
-
-        // Nest the shared sym's WORKING scalar/fixed-array state: the callee
-        // reads/writes it in place (dispatch.rs:2831 `BC_LOAD/STORE_STATE_FIELD`
-        // hit the single `sym`), so snapshot the caller's, reset to fresh, and
-        // restore when the frame returns (`run_one_step` pop).
-        if let Some(snapshot) = sym.snapshot_inline_scalar_state() {
-            portal_frame.portal_scalar_state = Some(snapshot);
-            sym.reset_inline_scalar_state_fresh();
-        }
-
-        self.frames.push(portal_frame);
-        TraceAction::Continue
+        // former inline re-entry path recorded a fresh per-driver callee
+        // vable identity leaked for the process lifetime — no RPython/PyPy
+        // analog (PyPy reconstructs the callee vable from resumedata per
+        // resume) — so it is removed.  This shape aborts to the clean
+        // CALL_ASSEMBLER / retry fallback until a trace-scoped rebuild lands.
+        TraceAction::Abort
     }
 
     /// pyjitpl.py:1425-1432 `do_recursive_call(assembler_call=True)` for a
