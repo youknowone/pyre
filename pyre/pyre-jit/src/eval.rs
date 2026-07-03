@@ -2070,10 +2070,21 @@ thread_local! {
         // back into the static PyType structs so that ll_issubclass
         // (rclass.py:1133-1137) can read them directly from the typeptr.
         gc.freeze_types();
-        for (&classptr, &_tid) in &pytype_to_tid {
-            if let Some((min, max)) = gc.subclass_range(classptr) {
-                let tp = unsafe { &*(classptr as *const pyre_object::pyobject::PyType) };
-                pyre_object::pyobject::assign_subclass_range(tp, min, max);
+        // This writeback replaces every static `subclassrange_{min,max}`
+        // with the GC-tid numbering, which differs from the preorder
+        // numbering the interpreter seeds via `compute_subclass_ranges_from`.
+        // Publish the whole batch inside one seqlock write section so a
+        // concurrent interpreter `ll_issubclass` observes either the
+        // all-preorder or the all-GC set, never a half-swapped mix — a mixed
+        // read makes `ll_issubclass(TypeError, BaseException)` spuriously
+        // false.
+        {
+            let _range_guard = pyre_object::pyobject::subclass_range_write_guard();
+            for (&classptr, &_tid) in &pytype_to_tid {
+                if let Some((min, max)) = gc.subclass_range(classptr) {
+                    let tp = unsafe { &*(classptr as *const pyre_object::pyobject::PyType) };
+                    pyre_object::pyobject::assign_subclass_range(tp, min, max);
+                }
             }
         }
         d.set_gc_allocator(Box::new(gc));

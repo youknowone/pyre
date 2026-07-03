@@ -4,8 +4,9 @@
 //! Concrete types (W_IntObject, W_BoolObject, etc.) embed this header as their
 //! first field, enabling safe pointer casts between `*mut PyObject` and typed pointers.
 
+use std::sync::Mutex;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicI64, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicPtr, AtomicU64, Ordering};
 
 /// Type descriptor for Python objects — corresponds to RPython's OBJECT_VTABLE
 /// (rclass.py:167-174).
@@ -262,11 +263,16 @@ pub unsafe fn ll_type(obj: PyObjectRef) -> *const PyType {
 ///   `int_between(cls.subclassrange_min, subcls.subclassrange_min, cls.subclassrange_max)`
 #[inline]
 pub fn ll_issubclass(subcls: &PyType, cls: &PyType) -> bool {
-    let cls_min = cls.subclassrange_min.load(Ordering::Relaxed);
-    let subcls_min = subcls.subclassrange_min.load(Ordering::Relaxed);
-    let cls_max = cls.subclassrange_max.load(Ordering::Relaxed);
-    // int_between(a, b, c) ≡ a <= b < c
-    cls_min <= subcls_min && subcls_min < cls_max
+    // Seqlock read: a concurrent one-time batch re-stamp (interpreter
+    // preorder ids vs JIT GC-tid ids) must not be observed half-applied, or
+    // `cls`/`subcls` could carry mismatched numberings.
+    subclass_range_read(|| {
+        let cls_min = cls.subclassrange_min.load(Ordering::Relaxed);
+        let subcls_min = subcls.subclassrange_min.load(Ordering::Relaxed);
+        let cls_max = cls.subclassrange_max.load(Ordering::Relaxed);
+        // int_between(a, b, c) ≡ a <= b < c
+        cls_min <= subcls_min && subcls_min < cls_max
+    })
 }
 
 /// rclass.py:1139-1140 `ll_issubclass_const(subcls, minid, maxid)`.
@@ -275,9 +281,13 @@ pub fn ll_issubclass(subcls: &PyType, cls: &PyType) -> bool {
 /// constants. Used by the JIT when the target class is constant-folded.
 #[inline]
 pub fn ll_issubclass_const(subcls: &PyType, minid: i64, maxid: i64) -> bool {
-    let subcls_min = subcls.subclassrange_min.load(Ordering::Relaxed);
-    // int_between(a, b, c) ≡ a <= b < c
-    minid <= subcls_min && subcls_min < maxid
+    // Seqlock read: `minid`/`maxid` are baked from one numbering, so
+    // `subcls_min` must be read from a matching (fully-published) batch.
+    subclass_range_read(|| {
+        let subcls_min = subcls.subclassrange_min.load(Ordering::Relaxed);
+        // int_between(a, b, c) ≡ a <= b < c
+        minid <= subcls_min && subcls_min < maxid
+    })
 }
 
 /// rclass.py:1143-1147 `ll_isinstance(obj, cls)`.
@@ -337,6 +347,84 @@ pub fn assign_subclass_range(tp: &PyType, min: i64, max: i64) {
     tp.subclassrange_max.store(max, Ordering::Relaxed);
 }
 
+/// Sequence lock (seqlock) guarding the batch (re)stamping of the static
+/// `subclassrange_{min,max}` fields.  Two independent initializers write
+/// them with *different* numberings: the interpreter's
+/// `compute_subclass_ranges_from` (preorder ids rooted at `INSTANCE_TYPE`)
+/// and the JIT's GC-tid writeback (`eval.rs`, from `assign_inheritance_ids`,
+/// which collapses every per-`ExcKind` PyType onto one tid).  Each set is
+/// internally consistent, but a reader that observes a half-completed swap —
+/// some types already re-stamped, others not — can see a parent/child pair
+/// carrying mismatched numberings and wrongly conclude the child is not a
+/// subclass.
+///
+/// A seqlock, not a mutex/rwlock, because this is free-threaded (`nogil`):
+/// the writes happen once at startup while `ll_issubclass` is a hot,
+/// concurrently-read path.  Optimistic readers touch only `SUBCLASS_RANGE_SEQ`
+/// with plain loads (no read-side atomic RMW), so once both one-time inits
+/// settle and the sequence stops changing, concurrent readers share that
+/// cache line read-only with no cross-core contention.  Even = stable,
+/// odd = a batch write is in flight.
+static SUBCLASS_RANGE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Serializes the (rare, one-time) writers against each other so the seqlock
+/// parity stays well-formed; readers never touch it.
+static SUBCLASS_RANGE_WRITER_LOCK: Mutex<()> = Mutex::new(());
+
+/// RAII write section for a batch subclass-range update.  Held by
+/// `compute_subclass_ranges_from` and the JIT GC-tid writeback in `eval.rs`
+/// for the whole batch: entering makes the sequence odd (optimistic readers
+/// retry), dropping publishes the writes and makes it even again.
+pub struct SubclassRangeWriteGuard {
+    _writers: std::sync::MutexGuard<'static, ()>,
+    seq: u64,
+}
+
+/// Enter a subclass-range write section (see [`SubclassRangeWriteGuard`]).
+pub fn subclass_range_write_guard() -> SubclassRangeWriteGuard {
+    let writers = SUBCLASS_RANGE_WRITER_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    // Serialized by the writer lock, so this load/store pair is race-free.
+    let seq = SUBCLASS_RANGE_SEQ.load(Ordering::Relaxed).wrapping_add(1);
+    SUBCLASS_RANGE_SEQ.store(seq, Ordering::Relaxed);
+    std::sync::atomic::fence(Ordering::Release);
+    SubclassRangeWriteGuard {
+        _writers: writers,
+        seq,
+    }
+}
+
+impl Drop for SubclassRangeWriteGuard {
+    fn drop(&mut self) {
+        // Publish the batch, then leave the write section (sequence even).
+        std::sync::atomic::fence(Ordering::Release);
+        SUBCLASS_RANGE_SEQ.store(self.seq.wrapping_add(1), Ordering::Release);
+    }
+}
+
+/// Optimistic seqlock read: run `read` (which loads the relevant
+/// `subclassrange_*` atomics) and retry until it lands in a window with no
+/// concurrent batch write, so the returned value reflects one coherent
+/// numbering.  In steady state (sequence stable) this is two plain loads of
+/// `SUBCLASS_RANGE_SEQ` plus one acquire fence — no read-side RMW.
+#[inline]
+fn subclass_range_read<T>(read: impl Fn() -> T) -> T {
+    loop {
+        let seq1 = SUBCLASS_RANGE_SEQ.load(Ordering::Acquire);
+        if seq1 & 1 != 0 {
+            std::hint::spin_loop();
+            continue;
+        }
+        let value = read();
+        std::sync::atomic::fence(Ordering::Acquire);
+        let seq2 = SUBCLASS_RANGE_SEQ.load(Ordering::Relaxed);
+        if seq1 == seq2 {
+            return value;
+        }
+    }
+}
+
 /// Compute preorder subclass IDs for every PyType reachable from
 /// `INSTANCE_TYPE` through the supplied `(subtype, parent)` pairs and
 /// write them via `assign_subclass_range`. Mirrors
@@ -363,6 +451,10 @@ pub fn compute_subclass_ranges_from(
     for chain in pairs_chains {
         pairs.extend_from_slice(chain);
     }
+    // Serialize against the JIT GC-tid writeback and publish the batch
+    // atomically w.r.t. seqlock readers so none observes a half-renumbered
+    // hierarchy.
+    let _range_guard = subclass_range_write_guard();
     let mut counter: i64 = 1;
     for root in roots {
         visit_preorder(root, &pairs, &mut counter);
