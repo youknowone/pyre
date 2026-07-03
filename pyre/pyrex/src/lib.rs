@@ -22,6 +22,18 @@ enum RunMode {
     Command(String),
     Module(String),
     Repl,
+    /// `pyre interact <executable> [args…]` — run the trusted sandbox
+    /// controller (`pypy/sandbox/pypy_interact.py`) over an untrusted child.
+    Interact {
+        exe: String,
+        args: Vec<String>,
+        tmpdir: Option<String>,
+        lib_root: Option<String>,
+        timeout: Option<f64>,
+        allow_net: bool,
+        log_file: Option<String>,
+        verbose: bool,
+    },
 }
 
 fn usage(binary_name: &str) -> String {
@@ -40,6 +52,10 @@ Options:
 file   : program read from script file
 -      : program read from stdin (default; interactive mode if a tty)
 arg ...: arguments passed to program in sys.argv[1:]
+
+Subcommands:
+interact [--tmp DIR] [--lib DIR] [--timeout SECS] [--heapsize N] [--log FILE] [--allow-net] [--verbose] <exe> [arg ...]
+       : run the trusted sandbox controller over an untrusted sandbox binary
 "
     )
 }
@@ -89,6 +105,10 @@ fn parse_args(
             }
             Value(script) => {
                 let script = script.string()?;
+                if script == "interact" {
+                    let mode = parse_interact(&mut parser)?;
+                    return Ok((mode, inspect, quiet, no_site, vec![]));
+                }
                 if script == "-" {
                     return Ok((RunMode::Repl, inspect, quiet, no_site, vec![]));
                 }
@@ -101,25 +121,154 @@ fn parse_args(
     Ok((RunMode::Repl, inspect, quiet, no_site, vec![]))
 }
 
+/// Parse a `--heapsize` value (`pypy_interact.py:88-102`): a byte count with an
+/// optional `k`/`m`/`g` suffix. pyre's GC has no runtime heap-limit knob, so the
+/// value is validated and accepted for CLI-surface parity but not enforced
+/// (accept-and-ignore); a non-positive or malformed value is a usage error.
+fn parse_heapsize(value: &str) -> Result<u64, lexopt::Error> {
+    let value = value.trim().to_ascii_lowercase();
+    let (digits, mult) = match value.strip_suffix('k') {
+        Some(d) => (d, 1024u64),
+        None => match value.strip_suffix('m') {
+            Some(d) => (d, 1024 * 1024),
+            None => match value.strip_suffix('g') {
+                Some(d) => (d, 1024 * 1024 * 1024),
+                None => (value.as_str(), 1),
+            },
+        },
+    };
+    let n: u64 = digits.parse().map_err(|_| {
+        lexopt::Error::Custom(format!("interact: invalid --heapsize value: {value}").into())
+    })?;
+    let bytes = n.checked_mul(mult).ok_or_else(|| {
+        lexopt::Error::Custom(format!("interact: --heapsize overflow: {value}").into())
+    })?;
+    if bytes == 0 {
+        return Err(lexopt::Error::Custom(
+            "interact: --heapsize must be positive".into(),
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Parse the `interact` subcommand: `pyre interact [--tmp DIR] [--lib DIR]
+/// [--timeout SECS] [--heapsize N] [--log FILE] [--allow-net] [--verbose]
+/// <executable> [program args…]`. The first positional is the untrusted sandbox
+/// binary; everything after it is passed through as that program's arguments.
+fn parse_interact(parser: &mut lexopt::Parser) -> Result<RunMode, lexopt::Error> {
+    let mut tmpdir = None;
+    let mut lib_root = None;
+    let mut timeout = None;
+    let mut allow_net = false;
+    let mut log_file = None;
+    let mut verbose = false;
+    while let Some(arg) = parser.next()? {
+        match arg {
+            Long("tmp") => tmpdir = Some(parser.value()?.string()?),
+            Long("lib") => lib_root = Some(parser.value()?.string()?),
+            Long("timeout") => {
+                let secs: f64 = parser.value()?.parse()?;
+                // `Duration::from_secs_f64` panics on NaN/inf/negative; reject
+                // them here as a usage error instead.
+                if !secs.is_finite() || secs < 0.0 {
+                    return Err(lexopt::Error::Custom(
+                        format!(
+                            "interact: --timeout must be a non-negative finite number (got {secs})"
+                        )
+                        .into(),
+                    ));
+                }
+                timeout = Some(secs);
+            }
+            // pypy_interact.py:88: validated and accepted for CLI parity, but
+            // pyre has no runtime heap-limit knob, so the value is discarded.
+            Long("heapsize") => {
+                parse_heapsize(&parser.value()?.string()?)?;
+            }
+            // setlogfile (sandlib.py:334): append the guest's stdin to FILE.
+            Long("log") => log_file = Some(parser.value()?.string()?),
+            // VirtualizedSocketProc (sandlib.py:546): opt in to `tcp://host:port`
+            // os.open mediation. Off by default so the sandbox stays
+            // network-closed.
+            Long("allow-net") => allow_net = true,
+            Long("verbose") => verbose = true,
+            Value(exe) => {
+                let exe = exe.string()?;
+                let args = drain_args(parser)?;
+                return Ok(RunMode::Interact {
+                    exe,
+                    args,
+                    tmpdir,
+                    lib_root,
+                    timeout,
+                    allow_net,
+                    log_file,
+                    verbose,
+                });
+            }
+            _ => return Err(arg.unexpected()),
+        }
+    }
+    Err(lexopt::Error::Custom(
+        "interact: missing <executable> argument".into(),
+    ))
+}
+
+/// The working directory to seed `sys.path` with. Under sandbox it is read from
+/// the controller (the virtual `/tmp`) through the seam, so an untrusted child
+/// never learns the trusted parent's real working directory; off sandbox it is
+/// the process cwd.
+fn sys_path_cwd() -> std::path::PathBuf {
+    #[cfg(feature = "sandbox")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        if let Ok(bytes) = pyre_interpreter::host_seam::ops::getcwd() {
+            return std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&bytes));
+        }
+        Path::new(".").to_path_buf()
+    }
+    #[cfg(not(feature = "sandbox"))]
+    {
+        std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf())
+    }
+}
+
 pub fn main_entry(binary_name: &'static str) {
+    // The sandboxed child runs single-threaded like pypy-c-sandbox: it neither
+    // manages signals (the controller does) nor spawns a worker thread, so it
+    // issues no sigprocmask/clone syscalls. Run `real_main` directly.
+    //
+    // Skipping the dedicated interpreter thread does not lose stack-overflow
+    // protection: the recursion limit is a native byte budget (~3.75 MiB at the
+    // default 5000), not a frame counter, and `stack_check` raises RecursionError
+    // before the budget is exceeded — well under the main thread's default ~8 MiB
+    // stack. A child that raises the limit far past that, or shrinks the stack
+    // via ulimit, gets a SIGSEGV reaped by the trusted controller, not an escape.
+    #[cfg(feature = "sandbox")]
+    real_main(binary_name);
+
     // Block async signals on this (the process's original) thread so the
     // kernel delivers process-directed signals to the interpreter thread
     // spawned below, where they can interrupt blocking syscalls.  The
     // interpreter thread inherits this mask and unblocks them at the top of
     // `real_main`.
-    pyre_interpreter::module::signal::signalstate::block_async_signals_on_origin_thread();
-    std::thread::Builder::new()
-        .stack_size(256 * 1024 * 1024)
-        .spawn(|| real_main(binary_name))
-        .expect("spawn main thread")
-        .join()
-        .unwrap();
+    #[cfg(not(feature = "sandbox"))]
+    {
+        pyre_interpreter::module::signal::signalstate::block_async_signals_on_origin_thread();
+        std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(|| real_main(binary_name))
+            .expect("spawn main thread")
+            .join()
+            .unwrap();
+    }
 }
 
 fn real_main(binary_name: &str) {
     // Receive process-directed async signals on this thread (see
     // `main_entry`) so blocking syscalls here are interrupted by Ctrl-C /
-    // alarms.
+    // alarms.  The sandboxed child does not touch the signal mask.
+    #[cfg(not(feature = "sandbox"))]
     pyre_interpreter::module::signal::signalstate::unblock_async_signals_on_interp_thread();
     // Suppress panic messages for the optimizer's silent control-flow panics
     // (InvalidLoop, SpeculativeError) — these are caught by catch_unwind in
@@ -153,27 +302,60 @@ fn real_main(binary_name: &str) {
         }
     };
 
-    // pypy/interpreter/app_main.py:824-825 parity for the standalone
-    // launcher: untranslated hosts need a higher startup recursion limit
-    // than translated PyPy's default 1000 because each host-language
-    // frame is larger. Pyre is likewise running on Rust frames here, so
-    // raise the startup budget before executing user code.
-    pyre_interpreter::stack_check::set_recursion_limit(5000)
-        .expect("startup recursion limit must be applicable");
+    // The `interact` controller does not run the embedded interpreter; it only
+    // spawns and relays for an untrusted child, so it skips the interpreter
+    // bootstrap (recursion budget, JIT hooks) entirely.
+    let is_interact = matches!(mode, RunMode::Interact { .. });
 
-    // Eagerly install pyre-jit's hooks into pyre-interpreter so that
-    // sys.settrace / set_jit_param routing is live from the very first
-    // user statement, not only after the first JIT-traced bytecode.
-    pyre_jit::eval::init_jit_hooks();
+    // The interactive REPL drives raw stdin/stdout directly, which under sandbox
+    // are the controller's marshalling pipes — running it would corrupt the
+    // protocol and bypass fd-0 mediation. Reject REPL / `-i` in sandbox builds.
+    #[cfg(feature = "sandbox")]
+    if !is_interact && (matches!(mode, RunMode::Repl) || inspect) {
+        eprintln!("{binary_name}: interactive mode is unavailable in the sandbox");
+        std::process::exit(2);
+    }
+
+    if !is_interact {
+        // pypy/interpreter/app_main.py:824-825 parity for the standalone
+        // launcher: untranslated hosts need a higher startup recursion limit
+        // than translated PyPy's default 1000 because each host-language
+        // frame is larger. Pyre is likewise running on Rust frames here, so
+        // raise the startup budget before executing user code.
+        pyre_interpreter::stack_check::set_recursion_limit(5000)
+            .expect("startup recursion limit must be applicable");
+
+        // Eagerly install pyre-jit's hooks into pyre-interpreter so that
+        // sys.settrace / set_jit_param routing is live from the very first
+        // user statement, not only after the first JIT-traced bytecode.
+        pyre_jit::eval::init_jit_hooks();
+    }
 
     // Record `-S` before the first `import sys` so `sys.flags.no_site`
     // reflects whether site initialization was skipped.
     importing::set_no_site(no_site);
 
+    // OS-level hardening (default-on in any Linux `sandbox` build): lock the
+    // sandboxed child to a host-neutral syscall allowlist so any un-mediated
+    // syscall — a missed reroute, the linked host_env crate, or one reached by a
+    // memory-safety exploit — is denied by the kernel (the analog of RPython's
+    // os_level_sandboxing). The compile-out seam is the primary mechanism; this
+    // kernel allowlist is the defense-in-depth backstop, always installed here so
+    // it cannot be forgotten. The `interact` controller keeps full syscall access
+    // (it spawns and relays for the child), so it is excluded. Set
+    // PYRE_SANDBOX_NO_SECCOMP to bypass when debugging the allowlist.
+    #[cfg(all(target_os = "linux", feature = "sandbox"))]
+    if !is_interact && std::env::var_os("PYRE_SANDBOX_NO_SECCOMP").is_none() {
+        if let Err(e) = pyre_sandbox::seccomp::install_runtime_filter() {
+            eprintln!("{binary_name}: failed to install sandbox seccomp filter: {e}");
+            std::process::exit(1);
+        }
+    }
+
     match mode {
         RunMode::Command(cmd) => {
             // Initialize sys.path with CWD for -c mode.
-            let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
+            let cwd = sys_path_cwd();
             importing::init_sys_path(&cwd);
             let mut argv = vec!["-c".to_string()];
             argv.extend(args);
@@ -186,7 +368,7 @@ fn real_main(binary_name: &str) {
         RunMode::Module(module) => {
             // `-m`: sys.path[0] is the cwd (runpy resets argv[0] to the
             // module's resolved origin via `_run_module_as_main`).
-            let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
+            let cwd = sys_path_cwd();
             importing::init_sys_path(&cwd);
             let mut argv = vec![module.clone()];
             argv.extend(args);
@@ -197,14 +379,30 @@ fn real_main(binary_name: &str) {
             }
         }
         RunMode::Script(path) => {
-            let source = match std::fs::read_to_string(&path) {
+            // Under sandbox the script is read through the seam so the controller
+            // VFS mediates it, the same channel module imports use; off sandbox
+            // it is a plain host read.
+            #[cfg(feature = "sandbox")]
+            let read = importing::read_source_to_string(Path::new(&path));
+            #[cfg(not(feature = "sandbox"))]
+            let read = std::fs::read_to_string(&path);
+            let source = match read {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("{binary_name}: cannot open '{path}': {e}");
                     std::process::exit(1);
                 }
             };
-            // Initialize sys.path with the script's directory.
+            // Initialize sys.path with the script's directory. Under sandbox,
+            // `canonicalize()` issues raw host-FS syscalls (realpath) past the
+            // seccomp lockdown and resolves against the real filesystem, not the
+            // controller VFS; use the virtual path as given instead.
+            #[cfg(feature = "sandbox")]
+            let script_dir = Path::new(&path)
+                .parent()
+                .unwrap_or(Path::new("."))
+                .to_path_buf();
+            #[cfg(not(feature = "sandbox"))]
             let script_dir = Path::new(&path)
                 .parent()
                 .unwrap_or(Path::new("."))
@@ -222,9 +420,82 @@ fn real_main(binary_name: &str) {
         }
         RunMode::Repl => {
             // Initialize sys.path with CWD for REPL mode.
-            let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
+            let cwd = sys_path_cwd();
             importing::init_sys_path(&cwd);
             repl::run_repl(quiet, no_site);
+        }
+        RunMode::Interact {
+            exe,
+            args,
+            tmpdir,
+            lib_root,
+            timeout,
+            allow_net,
+            log_file,
+            verbose,
+        } => {
+            #[cfg(unix)]
+            run_interact(
+                binary_name,
+                exe,
+                args,
+                tmpdir,
+                lib_root,
+                timeout,
+                allow_net,
+                log_file,
+                verbose,
+            );
+            #[cfg(not(unix))]
+            {
+                let _ = (
+                    exe, args, tmpdir, lib_root, timeout, allow_net, log_file, verbose,
+                );
+                eprintln!(
+                    "{binary_name}: 'interact' (sandbox controller) is only supported on Unix"
+                );
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+/// `pyre interact` — drive the trusted sandbox controller over the untrusted
+/// `exe`, then exit with the child's return code. Port of
+/// `pypy/sandbox/pypy_interact.py`'s `main`. Unix-only: the controller relies
+/// on a fork/fd-based child, so non-unix hosts reject `interact` at dispatch.
+#[cfg(unix)]
+fn run_interact(
+    binary_name: &str,
+    exe: String,
+    args: Vec<String>,
+    tmpdir: Option<String>,
+    lib_root: Option<String>,
+    timeout: Option<f64>,
+    allow_net: bool,
+    log_file: Option<String>,
+    _verbose: bool,
+) {
+    use pyre_sandbox::controller::PyPySandboxedProc;
+
+    let tmpdir = tmpdir.map(std::path::PathBuf::from);
+    let lib_root = lib_root.map(std::path::PathBuf::from);
+    let timeout = timeout.map(std::time::Duration::from_secs_f64);
+    let log_file = log_file.map(std::path::PathBuf::from);
+
+    let mut proc =
+        match PyPySandboxedProc::new(&exe, &args, tmpdir, lib_root, timeout, allow_net, log_file) {
+            Ok(proc) => proc,
+            Err(e) => {
+                eprintln!("{binary_name}: cannot start sandbox '{exe}': {e}");
+                std::process::exit(1);
+            }
+        };
+    match proc.interact() {
+        Ok(code) => std::process::exit(code),
+        Err(e) => {
+            eprintln!("{binary_name}: sandbox controller error: {e}");
+            std::process::exit(1);
         }
     }
 }
@@ -531,5 +802,23 @@ fn system_exit_code(e: &pyre_interpreter::PyError) -> i32 {
             eprintln!("{text}");
             1
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_heapsize;
+
+    #[test]
+    fn heapsize_suffixes_and_validation() {
+        // pypy_interact.py:88-102: k/m/g multipliers, decimal fallback.
+        assert_eq!(parse_heapsize("512").unwrap(), 512);
+        assert_eq!(parse_heapsize("64k").unwrap(), 64 * 1024);
+        assert_eq!(parse_heapsize("128M").unwrap(), 128 * 1024 * 1024);
+        assert_eq!(parse_heapsize("2g").unwrap(), 2 * 1024 * 1024 * 1024);
+        // non-positive and malformed values are usage errors.
+        assert!(parse_heapsize("0").is_err());
+        assert!(parse_heapsize("abc").is_err());
+        assert!(parse_heapsize("").is_err());
     }
 }

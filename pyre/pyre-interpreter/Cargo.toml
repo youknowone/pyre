@@ -9,6 +9,10 @@ description = "Python bytecode interpreter for pyre"
 [features]
 default = ["host_env"]
 host_env = ["dep:rustpython-host_env"]
+# RPython-style sandbox: route every OS call through host_seam's marshalling
+# trampoline instead of the real syscall. Implies host_env (same call surface,
+# swapped bodies); the real-vs-trampoline choice lives only inside host_seam.
+sandbox = ["host_env", "dep:pyre-sandbox"]
 cranelift = ["majit-metainterp/cranelift"]
 dynasm = ["majit-metainterp/dynasm"]
 # Embed the pure-Python stdlib closure needed for `import re` into the binary
@@ -35,6 +39,7 @@ num-integer = { workspace = true }
 pymath = { workspace = true }
 sre-engine = { workspace = true }
 rustpython-host_env = { workspace = true, optional = true }
+pyre-sandbox = { workspace = true, optional = true }
 libc = { workspace = true }
 siphasher = { workspace = true }
 caseless = { workspace = true }

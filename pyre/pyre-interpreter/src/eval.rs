@@ -392,7 +392,18 @@ unsafe fn walk_type_dicts_gc(forward: &mut dyn FnMut(&mut PyObjectRef)) {
 /// the rescan-everything-every-minor behavior).
 fn gc_prebuilt_remember_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("PYRE_GC_PREBUILT_REMEMBER").as_deref() != Ok("0"))
+    *ENABLED.get_or_init(|| {
+        #[cfg(not(feature = "sandbox"))]
+        {
+            std::env::var("PYRE_GC_PREBUILT_REMEMBER").as_deref() != Ok("0")
+        }
+        // The host env is off-limits under sandbox; keep the parity default
+        // (the prebuilt-remember minor-collection skip enabled).
+        #[cfg(feature = "sandbox")]
+        {
+            true
+        }
+    })
 }
 
 fn walk_pyframe_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
@@ -2143,6 +2154,7 @@ impl ControlFlowOpcodeHandler for PyFrame {
     /// pyopcode.py:180-183 RETURN_VALUE — frame_finished_execution = True
     /// when the returning path exits the frame (matched by StepResult::Return).
     fn finish_value(&mut self, value: Self::Value) -> Result<StepResult<Self::Value>, PyError> {
+        #[cfg(not(feature = "sandbox"))]
         if std::env::var_os("PYRE_INTERP_RETURN_LOG").is_some() {
             unsafe {
                 let code_ptr = crate::pyframe::pyframe_get_pycode(self);
@@ -3435,7 +3447,7 @@ impl OpcodeStepExecutor for PyFrame {
     fn print_expr(&mut self, val: PyObjectRef) -> Result<(), PyError> {
         if !unsafe { pyre_object::is_none(val) } {
             let s = unsafe { crate::py_repr(val)? };
-            println!("{}", s);
+            crate::host_seam::emit_stdout(format!("{s}\n").as_bytes());
         }
         Ok(())
     }

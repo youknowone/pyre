@@ -632,10 +632,15 @@ pub fn register_module(ns: &mut DictStorage) {
     dict_storage_store(ns, "hexversion", w_int_new(0x030e06f0));
     // sys.executable — absolute path to the running interpreter so that
     // subprocess spawns via `sys.executable` resolve.
+    #[cfg(not(feature = "sandbox"))]
     let executable = std::env::current_exe()
         .ok()
         .and_then(|p| p.to_str().map(str::to_owned))
         .unwrap_or_else(|| "pyre".to_owned());
+    // Under sandbox a fixed placeholder: current_exe() leaks the host binary
+    // path (and username), and subprocess spawning is unavailable anyway.
+    #[cfg(feature = "sandbox")]
+    let executable = "/bin/pyre".to_owned();
     dict_storage_store(ns, "executable", w_str_new(&executable));
     // sys.prefix / exec_prefix
     dict_storage_store(ns, "prefix", w_str_new(""));
@@ -798,66 +803,30 @@ pub fn register_module(ns: &mut DictStorage) {
     dict_storage_store(ns, "warnoptions", w_list_new(vec![]));
     // sys.builtin_module_names — tuple of names of modules compiled into
     // the interpreter. PyPy: pypy/module/sys/state.py get_builtin_module_names.
-    // Pyre: include all stub/native built-ins from importing.rs.
+    // Pyre: include all stub/native built-ins from importing.rs. The host-access
+    // modules importing.rs omits under `sandbox` are gated out here too, so the
+    // advertised set matches what is actually importable.
+    #[allow(unused_mut)]
+    let mut builtin_names = vec![
+        "__pypy__", "_abc", "_bisect", "_blake2", "_codecs", "_collections",
+        "_collections_abc", "_contextvars", "_csv", "_datetime", "_decimal",
+        "_functools", "_hashlib", "_heapq", "_imp", "_io", "_json", "_locale",
+        "_md5", "_opcode", "_operator", "_pickle", "_random", "_sha1", "_sha2",
+        "_sha3", "_signal", "_socket", "_sre", "_stat", "_string", "_struct",
+        "_thread", "_tokenize", "_tracemalloc", "_typing", "_warnings", "_weakref",
+        "atexit", "binascii", "builtins", "errno", "fcntl", "grp", "itertools",
+        "marshal", "math", "cmath", "operator", "posix", "pwd", "select", "sys",
+        "time",
+    ];
+    // Host-access modules registered only in non-sandbox builds (importing.rs);
+    // under `sandbox` they are omitted, so drop them from the advertised set
+    // in place — the surrounding order is left untouched.
+    #[cfg(feature = "sandbox")]
+    builtin_names.retain(|n| !matches!(*n, "_signal" | "_socket" | "fcntl" | "grp" | "pwd" | "select"));
     dict_storage_store(
         ns,
         "builtin_module_names",
-        w_tuple_new(vec![
-            w_str_new("__pypy__"),
-            w_str_new("_abc"),
-            w_str_new("_bisect"),
-            w_str_new("_blake2"),
-            w_str_new("_codecs"),
-            w_str_new("_collections"),
-            w_str_new("_collections_abc"),
-            w_str_new("_contextvars"),
-            w_str_new("_csv"),
-            w_str_new("_datetime"),
-            w_str_new("_decimal"),
-            w_str_new("_functools"),
-            w_str_new("_hashlib"),
-            w_str_new("_heapq"),
-            w_str_new("_imp"),
-            w_str_new("_io"),
-            w_str_new("_json"),
-            w_str_new("_locale"),
-            w_str_new("_md5"),
-            w_str_new("_opcode"),
-            w_str_new("_operator"),
-            w_str_new("_pickle"),
-            w_str_new("_random"),
-            w_str_new("_sha1"),
-            w_str_new("_sha2"),
-            w_str_new("_sha3"),
-            w_str_new("_signal"),
-            w_str_new("_socket"),
-            w_str_new("_sre"),
-            w_str_new("_stat"),
-            w_str_new("_string"),
-            w_str_new("_struct"),
-            w_str_new("_thread"),
-            w_str_new("_tokenize"),
-            w_str_new("_tracemalloc"),
-            w_str_new("_typing"),
-            w_str_new("_warnings"),
-            w_str_new("_weakref"),
-            w_str_new("atexit"),
-            w_str_new("binascii"),
-            w_str_new("builtins"),
-            w_str_new("errno"),
-            w_str_new("fcntl"),
-            w_str_new("grp"),
-            w_str_new("itertools"),
-            w_str_new("marshal"),
-            w_str_new("math"),
-            w_str_new("cmath"),
-            w_str_new("operator"),
-            w_str_new("posix"),
-            w_str_new("pwd"),
-            w_str_new("select"),
-            w_str_new("sys"),
-            w_str_new("time"),
-        ]),
+        w_tuple_new(builtin_names.into_iter().map(w_str_new).collect()),
     );
     // sys.stdlib_module_names — frozenset of stdlib module names, read by
     // `traceback.TracebackException` (`wrong_name in sys.stdlib_module_names`)
@@ -1094,20 +1063,35 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
     // `backslashreplace` → escaped) instead of panicking in `w_str_get_value`.
     let write_fn = if to_stderr {
         crate::make_builtin_function("write", |args| {
-            use std::io::Write;
             if let Some(s_obj) = pick_str(args) {
                 let bytes = crate::type_methods::encode_object(s_obj, "utf-8", "backslashreplace")?;
-                let _ = std::io::stderr().write_all(&bytes);
+                // Under sandbox fd 1 is the marshalling pipe, so a raw write
+                // would corrupt the protocol: route through ll_os_write(2,…)
+                // and let the controller relay it to its own stderr.
+                #[cfg(not(feature = "sandbox"))]
+                {
+                    use std::io::Write;
+                    let _ = std::io::stderr().write_all(&bytes);
+                }
+                #[cfg(feature = "sandbox")]
+                crate::host_seam::ops::write(2, &bytes)
+                    .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
                 return Ok(w_int_new(unsafe { w_str_len(s_obj) } as i64));
             }
             Ok(w_int_new(0))
         })
     } else {
         crate::make_builtin_function("write", |args| {
-            use std::io::Write;
             if let Some(s_obj) = pick_str(args) {
                 let bytes = crate::type_methods::encode_object(s_obj, "utf-8", "strict")?;
-                let _ = std::io::stdout().write_all(&bytes);
+                #[cfg(not(feature = "sandbox"))]
+                {
+                    use std::io::Write;
+                    let _ = std::io::stdout().write_all(&bytes);
+                }
+                #[cfg(feature = "sandbox")]
+                crate::host_seam::ops::write(1, &bytes)
+                    .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
                 return Ok(w_int_new(unsafe { w_str_len(s_obj) } as i64));
             }
             Ok(w_int_new(0))
@@ -1118,9 +1102,14 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
         stream,
         "flush",
         crate::make_builtin_function("flush", |_| {
-            use std::io::Write;
-            let _ = std::io::stdout().flush();
-            let _ = std::io::stderr().flush();
+            // The sandbox path writes unbuffered ll_os_write requests, so there
+            // is nothing to flush (and the real fds are the marshalling pipe).
+            #[cfg(not(feature = "sandbox"))]
+            {
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+                let _ = std::io::stderr().flush();
+            }
             Ok(w_none())
         }),
     );

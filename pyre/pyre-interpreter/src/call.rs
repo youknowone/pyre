@@ -89,7 +89,16 @@ pub fn clear_call_error() {
 /// bool residual instead of `std::env::var`'s `Result<String, VarError>` ABI.
 #[majit_macros::dont_look_inside]
 pub fn pyre_debug_call_enabled() -> bool {
-    std::env::var("PYRE_DEBUG_CALL").is_ok()
+    // The debug knob reads the real process env; under sandbox host access must
+    // go through the seam, so report disabled rather than touch the host env.
+    #[cfg(not(feature = "sandbox"))]
+    {
+        std::env::var("PYRE_DEBUG_CALL").is_ok()
+    }
+    #[cfg(feature = "sandbox")]
+    {
+        false
+    }
 }
 
 use pyre_object::{PY_NULL, PyObjectRef};
@@ -1834,6 +1843,9 @@ pub fn call_function_impl_raw(callable: PyObjectRef, args: &[PyObjectRef]) -> Py
     match call_function_impl_result(callable, args) {
         Ok(result) => result,
         Err(e) => {
+            // Debug diagnostic reads the real process env + writes real stderr;
+            // keep it out of the sandbox build (host access must go the seam).
+            #[cfg(not(feature = "sandbox"))]
             if pyre_debug_call_enabled() {
                 eprintln!("[call_function_impl] error: {}", e.message);
             }
@@ -2739,21 +2751,25 @@ fn build_class_inner(
     // Create frame with class_locals set AND closure from enclosing scope.
     // PyPy: executes class body with w_locals = fresh dict, w_globals = module globals,
     // and the closure tuple is passed through for LOAD_DEREF access.
-    // Debug: dump code object for __class__ cell investigation
-    let code_ref = unsafe { &*func_code };
-    if std::env::var("PYRE_DEBUG_CLASS").is_ok() {
-        eprintln!("[build_class] name={name}");
-        eprintln!("  varnames: {:?}", code_ref.varnames);
-        eprintln!("  cellvars: {:?}", code_ref.cellvars);
-        eprintln!("  freevars: {:?}", code_ref.freevars);
-        eprintln!(
-            "  nlocals={} ncells={} nfree={}",
-            code_ref.varnames.len(),
-            code_ref.cellvars.len(),
-            code_ref.freevars.len()
-        );
-        for (i, instr) in code_ref.instructions.iter().enumerate().take(20) {
-            eprintln!("  {i}: {:?}", instr);
+    // Debug: dump code object for __class__ cell investigation. Reads the real
+    // process env + writes real stderr, so keep it out of the sandbox build.
+    #[cfg(not(feature = "sandbox"))]
+    {
+        let code_ref = unsafe { &*func_code };
+        if std::env::var("PYRE_DEBUG_CLASS").is_ok() {
+            eprintln!("[build_class] name={name}");
+            eprintln!("  varnames: {:?}", code_ref.varnames);
+            eprintln!("  cellvars: {:?}", code_ref.cellvars);
+            eprintln!("  freevars: {:?}", code_ref.freevars);
+            eprintln!(
+                "  nlocals={} ncells={} nfree={}",
+                code_ref.varnames.len(),
+                code_ref.cellvars.len(),
+                code_ref.freevars.len()
+            );
+            for (i, instr) in code_ref.instructions.iter().enumerate().take(20) {
+                eprintln!("  {i}: {:?}", instr);
+            }
         }
     }
 

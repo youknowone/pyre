@@ -52,10 +52,15 @@ crate::py_module! {
             {
                 crate::dict_storage_store(ns, "clock_getres",
                     crate::make_builtin_function_with_arity("clock_getres", t::clock_getres, 1));
-                crate::dict_storage_store(ns, "clock_settime",
-                    crate::make_builtin_function_with_arity("clock_settime", t::clock_settime, 2));
-                crate::dict_storage_store(ns, "clock_settime_ns",
-                    crate::make_builtin_function_with_arity("clock_settime_ns", t::clock_settime_ns, 2));
+                // clock_settime{,_ns} set the system clock (a privileged
+                // syscall that escapes mediation); omit them under sandbox.
+                #[cfg(not(feature = "sandbox"))]
+                {
+                    crate::dict_storage_store(ns, "clock_settime",
+                        crate::make_builtin_function_with_arity("clock_settime", t::clock_settime, 2));
+                    crate::dict_storage_store(ns, "clock_settime_ns",
+                        crate::make_builtin_function_with_arity("clock_settime_ns", t::clock_settime_ns, 2));
+                }
             }
             crate::dict_storage_store(ns, "CLOCK_REALTIME",
                 pyre_object::w_int_new(libc::CLOCK_REALTIME as i64));
@@ -79,6 +84,24 @@ crate::py_module! {
             )))]
             crate::dict_storage_store(ns, "CLOCK_THREAD_CPUTIME_ID",
                 pyre_object::w_int_new(libc::CLOCK_THREAD_CPUTIME_ID as i64));
+        }
+        // localtime/mktime/ctime/strftime consult $TZ + /etc/localtime (and
+        // the LC_TIME locale DB), reading host state outside the controller;
+        // gmtime (UTC) and asctime (fixed C format) stay pure.
+        #[cfg(feature = "sandbox")]
+        {
+            fn tz_unavailable(
+                _: &[pyre_object::PyObjectRef],
+            ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+                Err(crate::host_seam::stub("this time function"))
+            }
+            for name in ["localtime", "mktime", "ctime", "strftime"] {
+                crate::dict_storage_store(
+                    ns,
+                    name,
+                    crate::make_builtin_function(name, tz_unavailable),
+                );
+            }
         }
         #[cfg(not(all(unix, feature = "host_env")))]
         let _ = ns;

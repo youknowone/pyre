@@ -2006,6 +2006,7 @@ dependencies = [
  "pyre-macros",
  "pyre-native",
  "pyre-object",
+ "pyre-sandbox",
  "rustpython-compiler",
  "rustpython-compiler-core",
  "rustpython-host_env",
@@ -2105,6 +2106,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pyre-sandbox"
+version = "0.0.2"
+dependencies = [
+ "indexmap",
+ "libc",
+ "tempfile",
+]
+
+[[package]]
 name = "pyre-wasm"
 version = "0.0.2"
 dependencies = [
@@ -2148,6 +2158,7 @@ dependencies = [
  "pyre-interpreter",
  "pyre-jit",
  "pyre-object",
+ "pyre-sandbox",
  "rustpython-compiler",
  "rustyline",
 ]

@@ -1059,7 +1059,11 @@ fn read_source_line(filename: &str, lineno: i64) -> Option<String> {
     }
     #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
     {
-        let content = rustpython_host_env::fs::read_to_string(filename).ok()?;
+        // Read through the import machinery's source provider, not std::fs:
+        // under sandbox that routes the read through the seam to the controller
+        // VFS, so a guest-controlled traceback path cannot leak a host file.
+        let content =
+            crate::importing::read_source_to_string(std::path::Path::new(filename)).ok()?;
         content
             .lines()
             .nth((lineno - 1) as usize)
@@ -1078,8 +1082,12 @@ fn read_source_line(filename: &str, lineno: i64) -> Option<String> {
 }
 
 pub fn eprint_exception(err: &PyError, include_traceback: bool) {
-    let mut stderr = std::io::stderr().lock();
-    let _ = write_exception(&mut stderr, err, include_traceback);
+    // Buffer then emit through the host_seam so the traceback rides the same
+    // mediated stderr as sys.stderr under sandbox (raw fd 2 would bypass the
+    // controller / corrupt nothing but escape the seam).
+    let mut buf: Vec<u8> = Vec::new();
+    let _ = write_exception(&mut buf, err, include_traceback);
+    crate::host_seam::emit_stderr(&buf);
 }
 
 pub fn get_cleared_operation_error(_space: PyObjectRef) -> OperationError {

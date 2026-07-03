@@ -8,6 +8,11 @@
 //!
 //! When the feature is off (every native build) this returns immediately and
 //! produces nothing.
+//!
+//! This build script runs on the host at compile time — it is not part of the
+//! sandbox binary — so the sandbox compile-out fence (`ci/clippy-sandbox`) does
+//! not apply to its host filesystem/env access.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use std::path::Path;
 

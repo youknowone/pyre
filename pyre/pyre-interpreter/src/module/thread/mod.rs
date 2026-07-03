@@ -147,7 +147,13 @@ fn start_new_thread(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
 // host_env we always return 1 (single-threaded sentinel).
 #[crate::pyre_function]
 fn get_ident() -> i64 {
-    #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
+    // The sandboxed child is a single logical thread; do not leak the real
+    // thread id (host state), return the single-threaded sentinel instead.
+    #[cfg(all(
+        feature = "host_env",
+        not(target_arch = "wasm32"),
+        not(feature = "sandbox")
+    ))]
     {
         return rustpython_host_env::thread::current_thread_id() as i64;
     }
@@ -165,11 +171,14 @@ fn get_ident() -> i64 {
 //   * Other Unix:    pthread_self  (no true TID concept)
 #[crate::pyre_function]
 fn get_native_id() -> i64 {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(all(
+        not(feature = "sandbox"),
+        any(target_os = "linux", target_os = "android")
+    ))]
     {
         return unsafe { libc::syscall(libc::SYS_gettid) } as i64;
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(all(not(feature = "sandbox"), target_os = "macos"))]
     {
         let mut tid: u64 = 0;
         let rc = unsafe { libc::pthread_threadid_np(0, &mut tid as *mut u64) };
@@ -179,13 +188,17 @@ fn get_native_id() -> i64 {
         return unsafe { libc::pthread_self() } as i64;
     }
     #[cfg(all(
+        not(feature = "sandbox"),
         unix,
         not(any(target_os = "linux", target_os = "android", target_os = "macos"))
     ))]
     {
         return unsafe { libc::pthread_self() } as i64;
     }
-    #[cfg(not(unix))]
+    // Sandbox and non-unix: a fixed single-thread sentinel — the sandboxed
+    // child must not issue the raw `gettid`/`pthread_self` that would expose the
+    // real kernel/pthread id.
+    #[allow(unreachable_code)]
     {
         1
     }

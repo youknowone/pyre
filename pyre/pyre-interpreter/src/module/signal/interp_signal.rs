@@ -350,8 +350,10 @@ fn report_wakeup_fd_error(errno_val: i32) {
     };
     #[cfg(not(unix))]
     let msg = format!("error {errno_val}");
-    eprintln!("Exception ignored when trying to write to the signal wakeup fd:");
-    eprintln!("OSError: [Errno {errno_val}] {msg}");
+    crate::host_seam::emit_stderr(
+        b"Exception ignored when trying to write to the signal wakeup fd:\n",
+    );
+    crate::host_seam::emit_stderr(format!("OSError: [Errno {errno_val}] {msg}\n").as_bytes());
 }
 
 impl AsyncActionOps for CheckSignalAction {
@@ -526,7 +528,12 @@ pub fn register_module(ns: &mut DictStorage) {
         crate::make_builtin_function_with_arity(
             "raise_signal",
             |args| {
-                #[cfg(feature = "host_env")]
+                #[cfg(feature = "sandbox")]
+                {
+                    let _ = args;
+                    return Err(crate::host_seam::stub("signal.raise_signal"));
+                }
+                #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
                 {
                     let signum = if let Some(&a) = args.first() {
                         unsafe { pyre_object::w_int_get_value(a) as i32 }
@@ -639,7 +646,12 @@ pub fn register_module(ns: &mut DictStorage) {
             crate::make_builtin_function_with_arity(
                 "alarm",
                 |args| {
-                    #[cfg(feature = "host_env")]
+                    #[cfg(feature = "sandbox")]
+                    {
+                        let _ = args;
+                        return Err(crate::host_seam::stub("signal.alarm"));
+                    }
+                    #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
                     {
                         let secs = if let Some(&a) = args.first() {
                             unsafe { pyre_object::w_int_get_value(a) as u32 }
@@ -667,7 +679,11 @@ pub fn register_module(ns: &mut DictStorage) {
             crate::make_builtin_function_with_arity(
                 "pause",
                 |_| {
-                    #[cfg(feature = "host_env")]
+                    #[cfg(feature = "sandbox")]
+                    {
+                        return Err(crate::host_seam::stub("signal.pause"));
+                    }
+                    #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
                     {
                         rustpython_host_env::signal::pause();
                         Ok(pyre_object::w_none())
@@ -687,7 +703,12 @@ pub fn register_module(ns: &mut DictStorage) {
             ns,
             "setitimer",
             crate::make_builtin_function("setitimer", |args| {
-                #[cfg(feature = "host_env")]
+                #[cfg(feature = "sandbox")]
+                {
+                    let _ = args;
+                    return Err(crate::host_seam::stub("signal.setitimer"));
+                }
+                #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
                 {
                     if args.len() < 2 {
                         return Err(crate::PyError::type_error(
@@ -738,7 +759,12 @@ pub fn register_module(ns: &mut DictStorage) {
             crate::make_builtin_function_with_arity(
                 "getitimer",
                 |args| {
-                    #[cfg(feature = "host_env")]
+                    #[cfg(feature = "sandbox")]
+                    {
+                        let _ = args;
+                        return Err(crate::host_seam::stub("signal.getitimer"));
+                    }
+                    #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
                     {
                         if args.is_empty() {
                             return Err(crate::PyError::type_error(
@@ -917,7 +943,12 @@ pub fn register_module(ns: &mut DictStorage) {
             crate::make_builtin_function_with_arity(
                 "pthread_kill",
                 |args| {
-                    #[cfg(feature = "host_env")]
+                    #[cfg(feature = "sandbox")]
+                    {
+                        let _ = args;
+                        return Err(crate::host_seam::stub("signal.pthread_kill"));
+                    }
+                    #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
                     {
                         if args.len() < 2 {
                             return Err(crate::PyError::type_error(
@@ -956,7 +987,12 @@ pub fn register_module(ns: &mut DictStorage) {
             crate::make_builtin_function_with_arity(
                 "pthread_sigmask",
                 |args| {
-                    #[cfg(feature = "host_env")]
+                    #[cfg(feature = "sandbox")]
+                    {
+                        let _ = args;
+                        return Err(crate::host_seam::stub("signal.pthread_sigmask"));
+                    }
+                    #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
                     {
                         if args.len() < 2 {
                             return Err(crate::PyError::type_error(
@@ -1054,7 +1090,14 @@ pub fn register_module(ns: &mut DictStorage) {
             ns,
             "pidfd_send_signal",
             crate::make_builtin_function("pidfd_send_signal", |args| {
-                #[cfg(feature = "host_env")]
+                // Delivers a signal cross-process via a direct syscall, bypassing
+                // the controller; the `kill`/`killpg` twins are already stubbed.
+                #[cfg(feature = "sandbox")]
+                {
+                    let _ = args;
+                    return Err(crate::host_seam::stub("signal.pidfd_send_signal"));
+                }
+                #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
                 {
                     if args.len() < 2 {
                         return Err(crate::PyError::type_error(

@@ -1,0 +1,68 @@
+# Sandbox compile-out fence.
+#
+# This config is applied ONLY by the dedicated sandbox clippy CI job, which
+# points clippy at this directory via `CLIPPY_CONF_DIR`. Normal builds and
+# normal `cargo clippy` never discover it (it is not an ancestor of any crate),
+# so day-to-day development is unaffected.
+#
+# It forbids raw host-OS access in the `--features sandbox` build of the
+# untrusted interpreter. Under sandbox every mediated OS call must go through
+# `crate::host_seam::ops::*`, which marshals the request to the trusted
+# controller; a direct `std::fs`/`std::env`/`std::io` stdio/`std::process`/
+# `std::net` call would bypass the seam and escape the sandbox. Because clippy
+# only sees code that actually compiles under the feature set, the
+# `#[cfg(not(feature = "sandbox"))]` real-syscall paths are invisible here — a
+# clean run therefore proves no raw host call survives in sandbox-live code.
+#
+# The trusted controller lives in the separate `pyre-sandbox` crate and is not
+# linted by this job (it lints `-p pyre-interpreter` only).
+
+disallowed-methods = [
+    # Filesystem entry points
+    { path = "std::fs::read", reason = "raw host FS read; route through crate::host_seam::ops" },
+    { path = "std::fs::write", reason = "raw host FS write; route through crate::host_seam::ops" },
+    { path = "std::fs::read_to_string", reason = "raw host FS read; route through crate::host_seam::ops" },
+    { path = "std::fs::read_link", reason = "raw host FS access; route through crate::host_seam::ops" },
+    { path = "std::fs::read_dir", reason = "raw host FS listdir; route through crate::host_seam::ops" },
+    { path = "std::fs::metadata", reason = "raw host FS stat; route through crate::host_seam::ops" },
+    { path = "std::fs::symlink_metadata", reason = "raw host FS lstat; route through crate::host_seam::ops" },
+    { path = "std::fs::canonicalize", reason = "raw host FS access; route through crate::host_seam::ops" },
+    { path = "std::fs::remove_file", reason = "host FS mutation is forbidden in the sandbox" },
+    { path = "std::fs::remove_dir", reason = "host FS mutation is forbidden in the sandbox" },
+    { path = "std::fs::remove_dir_all", reason = "host FS mutation is forbidden in the sandbox" },
+    { path = "std::fs::create_dir", reason = "host FS mutation is forbidden in the sandbox" },
+    { path = "std::fs::create_dir_all", reason = "host FS mutation is forbidden in the sandbox" },
+    { path = "std::fs::rename", reason = "host FS mutation is forbidden in the sandbox" },
+    { path = "std::fs::copy", reason = "host FS mutation is forbidden in the sandbox" },
+    { path = "std::fs::hard_link", reason = "host FS mutation is forbidden in the sandbox" },
+    { path = "std::fs::set_permissions", reason = "host FS mutation is forbidden in the sandbox" },
+    # Process environment
+    { path = "std::env::var", reason = "raw process env; route through crate::host_seam::ops::getenv" },
+    { path = "std::env::var_os", reason = "raw process env; route through crate::host_seam::ops::getenv" },
+    { path = "std::env::vars", reason = "raw process env; route through crate::host_seam::ops::envitems" },
+    { path = "std::env::vars_os", reason = "raw process env; route through crate::host_seam::ops::envitems" },
+    { path = "std::env::set_var", reason = "host env mutation is forbidden in the sandbox" },
+    { path = "std::env::remove_var", reason = "host env mutation is forbidden in the sandbox" },
+    { path = "std::env::current_dir", reason = "raw host cwd; route through crate::host_seam::ops::getcwd" },
+    { path = "std::env::set_current_dir", reason = "host cwd mutation is forbidden in the sandbox" },
+    { path = "std::env::current_exe", reason = "leaks the real executable path; forbidden in the sandbox" },
+    { path = "std::env::temp_dir", reason = "leaks a real host path; forbidden in the sandbox" },
+    # Standard streams (the marshalling pipe is the only sanctioned raw stdio)
+    { path = "std::io::stdout", reason = "raw stdout; route through crate::host_seam::ops::write" },
+    { path = "std::io::stderr", reason = "raw stderr; route through crate::host_seam::ops::write" },
+    { path = "std::io::stdin", reason = "raw stdin; mediated by the controller" },
+    { path = "std::io::_print", reason = "print!/println! writes real stdout; route through the host_seam" },
+    { path = "std::io::_eprint", reason = "eprint!/eprintln! writes real stderr; route through the host_seam" },
+    # Process control
+    { path = "std::process::exit", reason = "raw process exit; the controller owns process lifetime" },
+    { path = "std::process::abort", reason = "raw process abort; the controller owns process lifetime" },
+]
+
+disallowed-types = [
+    { path = "std::fs::File", reason = "raw host file handle; route file I/O through crate::host_seam::ops" },
+    { path = "std::fs::OpenOptions", reason = "raw host file open; route through crate::host_seam::ops::open" },
+    { path = "std::process::Command", reason = "process spawn is forbidden in the sandbox" },
+    { path = "std::net::TcpStream", reason = "raw network; use the mediated tcp:// controller path" },
+    { path = "std::net::TcpListener", reason = "raw network listen is forbidden in the sandbox" },
+    { path = "std::net::UdpSocket", reason = "raw network is forbidden in the sandbox" },
+]

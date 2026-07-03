@@ -3,6 +3,10 @@
 //! Verbatim move of the inline block previously in importing.rs.
 
 use crate::DictStorage;
+// Under sandbox, name libc through the seam facade so any direct syscall call
+// in this module is a compile error (only types/constants/pure fns resolve).
+#[cfg(feature = "sandbox")]
+use crate::host_seam::sys as libc;
 
 /// Raise `_locale.Error` with the supplied message.  Mirrors
 /// `interp_locale.py:15-20 make_error`.
@@ -177,6 +181,9 @@ pub fn register_module(ns: &mut DictStorage) {
     crate::dict_storage_store(ns, "Error", w_error);
 
     // localeconv() — numeric/monetary parameters of the current locale.
+    // Reads the host locale DB; under sandbox the stub override below replaces
+    // it, so the real body (and its libc/host_env calls) is compiled out.
+    #[cfg(not(feature = "sandbox"))]
     crate::dict_storage_store(
         ns,
         "localeconv",
@@ -249,6 +256,9 @@ pub fn register_module(ns: &mut DictStorage) {
             0,
         ),
     );
+    // setlocale() mutates/reads the host locale (and $LANG/$LC_*); stubbed under
+    // sandbox, so the real body is compiled out.
+    #[cfg(not(feature = "sandbox"))]
     crate::dict_storage_store(
         ns,
         "setlocale",
@@ -302,6 +312,9 @@ pub fn register_module(ns: &mut DictStorage) {
             }
         }),
     );
+    // nl_langinfo() reads the active-locale codeset/DB; stubbed under sandbox,
+    // so the real body is compiled out.
+    #[cfg(not(feature = "sandbox"))]
     crate::dict_storage_store(
         ns,
         "nl_langinfo",
@@ -362,7 +375,7 @@ pub fn register_module(ns: &mut DictStorage) {
         crate::make_builtin_function_with_arity(
             "strcoll",
             |args| {
-                #[cfg(all(unix, feature = "host_env"))]
+                #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
                 {
                     if args.len() < 2
                         || !unsafe { pyre_object::is_str(args[0]) && pyre_object::is_str(args[1]) }
@@ -381,7 +394,7 @@ pub fn register_module(ns: &mut DictStorage) {
                         rustpython_host_env::locale::strcoll(&c1, &c2) as i64,
                     ));
                 }
-                #[cfg(not(all(unix, feature = "host_env")))]
+                #[cfg(not(all(unix, feature = "host_env", not(feature = "sandbox"))))]
                 {
                     if args.len() < 2
                         || !unsafe { pyre_object::is_str(args[0]) && pyre_object::is_str(args[1]) }
@@ -390,9 +403,10 @@ pub fn register_module(ns: &mut DictStorage) {
                             "strcoll: arguments must be strings",
                         ));
                     }
-                    // No libc collation available — fall back to
-                    // lexical bytewise comparison.  Pure computation,
-                    // no I/O, so the sandbox principle is unaffected.
+                    // No libc collation available (or sandbox build) — fall back
+                    // to lexical bytewise comparison.  Pure computation, no I/O;
+                    // under sandbox this keeps the fixed "C" collation and never
+                    // calls host libc collation, which would leak host LC_COLLATE.
                     let s1 = unsafe { pyre_object::w_str_get_value(args[0]).to_string() };
                     let s2 = unsafe { pyre_object::w_str_get_value(args[1]).to_string() };
                     let ord = match s1.as_str().cmp(s2.as_str()) {
@@ -418,7 +432,7 @@ pub fn register_module(ns: &mut DictStorage) {
                         "strxfrm() argument must be str",
                     ));
                 }
-                #[cfg(all(unix, feature = "host_env"))]
+                #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
                 {
                     let sv = unsafe { pyre_object::w_str_get_value(s).to_string() };
                     let c = std::ffi::CString::new(sv.as_bytes())
@@ -430,9 +444,11 @@ pub fn register_module(ns: &mut DictStorage) {
                     // surrogateescape.
                     Ok(pyre_object::w_str_new(&String::from_utf8_lossy(&out)))
                 }
-                #[cfg(not(all(unix, feature = "host_env")))]
+                #[cfg(not(all(unix, feature = "host_env", not(feature = "sandbox"))))]
                 {
-                    // No libc collation available — the transform is identity.
+                    // No libc collation available (or sandbox build) — the
+                    // transform is identity, keeping the fixed "C" locale and
+                    // never reaching host libc strxfrm.
                     Ok(s)
                 }
             },
@@ -448,4 +464,22 @@ pub fn register_module(ns: &mut DictStorage) {
             0,
         ),
     );
+    // setlocale/localeconv/nl_langinfo read the host locale database (and the
+    // active $LANG/$LC_* environment); stub them so the sandbox observes only
+    // the fixed "C" locale defaults already exposed above, never host state.
+    #[cfg(feature = "sandbox")]
+    {
+        fn locale_unavailable(
+            _: &[pyre_object::PyObjectRef],
+        ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+            Err(crate::host_seam::stub("this locale function"))
+        }
+        for name in ["setlocale", "localeconv", "nl_langinfo"] {
+            crate::dict_storage_store(
+                ns,
+                name,
+                crate::make_builtin_function(name, locale_unavailable),
+            );
+        }
+    }
 }

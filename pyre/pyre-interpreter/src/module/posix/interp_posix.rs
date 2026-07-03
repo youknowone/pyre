@@ -7,6 +7,10 @@
 use crate::DictStorage;
 use crate::importing::host::{fs as host_fs, os as host_os};
 use pyre_object::PyObjectRef;
+// Under sandbox, name libc through the seam facade so any direct syscall call
+// in this module is a compile error (only types/constants/pure fns resolve).
+#[cfg(feature = "sandbox")]
+use crate::host_seam::sys as libc;
 
 /// `posix.stat_result` — a real structseq (tuple subclass) so `st[0]`,
 /// `len(st)`, iteration and `isinstance(st, tuple)` all work, matching
@@ -150,7 +154,22 @@ pub fn register_module(ns: &mut DictStorage) {
     // PyPy equivalent: posix.State.startup → _convertenviron copies
     // os.environ.items() into w_environ at interpreter startup.
     let w_environ = pyre_object::w_dict_new();
-    #[cfg(feature = "host_env")]
+    #[cfg(feature = "sandbox")]
+    {
+        // The controller delivers the virtual environment as (bytes, bytes).
+        if let Ok(items) = crate::host_seam::ops::envitems() {
+            for (k_bytes, v_bytes) in items {
+                unsafe {
+                    pyre_object::w_dict_store(
+                        w_environ,
+                        pyre_object::w_bytes_from_bytes(&k_bytes),
+                        pyre_object::w_bytes_from_bytes(&v_bytes),
+                    );
+                }
+            }
+        }
+    }
+    #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
     {
         // On POSIX, posix.environ stores bytes → bytes. os.py's
         // _create_environ_mapping wraps this dict in an _Environ object that
@@ -178,21 +197,38 @@ pub fn register_module(ns: &mut DictStorage) {
     // scandir/listdir do not accept a file descriptor. HAVE_LSTAT remains so
     // os.stat is reported in supports_follow_symlinks (follow_symlinks=False
     // works).
+    // Under sandbox the fd-relative host probes/mutators (fchdir/fchmod/fchown/
+    // fexecve/fpathconf/fstatvfs/ftruncate) are replaced with raising stubs, so
+    // drop their capability bits — otherwise os.py picks an fd-relative path
+    // that deterministically fails.
+    let have_functions: &[&str] = &[
+        #[cfg(not(feature = "sandbox"))]
+        "HAVE_FCHDIR",
+        #[cfg(not(feature = "sandbox"))]
+        "HAVE_FCHMOD",
+        #[cfg(not(feature = "sandbox"))]
+        "HAVE_FCHOWN",
+        #[cfg(not(feature = "sandbox"))]
+        "HAVE_FEXECVE",
+        #[cfg(not(feature = "sandbox"))]
+        "HAVE_FPATHCONF",
+        #[cfg(not(feature = "sandbox"))]
+        "HAVE_FSTATVFS",
+        #[cfg(not(feature = "sandbox"))]
+        "HAVE_FTRUNCATE",
+        "HAVE_FUTIMENS",
+        "HAVE_FUTIMES",
+        "HAVE_LSTAT",
+    ];
     crate::dict_storage_store(
         ns,
         "_have_functions",
-        pyre_object::w_list_new(vec![
-            pyre_object::w_str_new("HAVE_FCHDIR"),
-            pyre_object::w_str_new("HAVE_FCHMOD"),
-            pyre_object::w_str_new("HAVE_FCHOWN"),
-            pyre_object::w_str_new("HAVE_FEXECVE"),
-            pyre_object::w_str_new("HAVE_FPATHCONF"),
-            pyre_object::w_str_new("HAVE_FSTATVFS"),
-            pyre_object::w_str_new("HAVE_FTRUNCATE"),
-            pyre_object::w_str_new("HAVE_FUTIMENS"),
-            pyre_object::w_str_new("HAVE_FUTIMES"),
-            pyre_object::w_str_new("HAVE_LSTAT"),
-        ]),
+        pyre_object::w_list_new(
+            have_functions
+                .iter()
+                .map(|&n| pyre_object::w_str_new(n))
+                .collect(),
+        ),
     );
     // POSIX constants — real libc values (cross-platform subset).
     for (name, val) in [
@@ -441,19 +477,28 @@ pub fn register_module(ns: &mut DictStorage) {
             } else {
                 0o777
             };
-            // Open the fd non-inheritable (PEP 446) so the descriptor does not
-            // leak across exec into child processes: O_CLOEXEC on unix,
-            // O_NOINHERIT on Windows (O_CLOEXEC is unix-only in libc).
-            #[cfg(unix)]
-            let flags = flags | libc::O_CLOEXEC;
-            #[cfg(windows)]
-            let flags = flags | libc::O_NOINHERIT;
-            let c_path = std::ffi::CString::new(path.as_bytes())
-                .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
-            let fd = unsafe { libc::open(c_path.as_ptr(), flags, mode as libc::c_uint) };
-            if fd < 0 {
-                return Err(io_err(std::io::Error::last_os_error(), &path));
-            }
+            #[cfg(not(feature = "sandbox"))]
+            let fd = {
+                // Open the fd non-inheritable (PEP 446) so the descriptor does
+                // not leak across exec into child processes: O_CLOEXEC on unix,
+                // O_NOINHERIT on Windows (O_CLOEXEC is unix-only in libc). Moot
+                // under sandbox, where the controller hands out virtual fds, so
+                // it is applied only here.
+                #[cfg(unix)]
+                let flags = flags | libc::O_CLOEXEC;
+                #[cfg(windows)]
+                let flags = flags | libc::O_NOINHERIT;
+                let c_path = std::ffi::CString::new(path.as_bytes())
+                    .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
+                let fd = unsafe { libc::open(c_path.as_ptr(), flags, mode as libc::c_uint) };
+                if fd < 0 {
+                    return Err(io_err(std::io::Error::last_os_error(), &path));
+                }
+                fd
+            };
+            #[cfg(feature = "sandbox")]
+            let fd = crate::host_seam::ops::open(path.as_bytes(), flags, mode)
+                .map_err(|e| crate::host_seam::seam_os_err(e, &path))?;
             Ok(pyre_object::w_int_new(fd as i64))
         }),
     );
@@ -469,10 +514,15 @@ pub fn register_module(ns: &mut DictStorage) {
                     return Err(crate::PyError::type_error("close() requires 1 argument"));
                 }
                 let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::c_int;
-                let ret = unsafe { libc::close(fd) };
-                if ret < 0 {
-                    return Err(io_err(std::io::Error::last_os_error(), ""));
+                #[cfg(not(feature = "sandbox"))]
+                {
+                    let ret = unsafe { libc::close(fd) };
+                    if ret < 0 {
+                        return Err(io_err(std::io::Error::last_os_error(), ""));
+                    }
                 }
+                #[cfg(feature = "sandbox")]
+                crate::host_seam::ops::close(fd).map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
                 Ok(pyre_object::w_none())
             },
             1,
@@ -490,13 +540,30 @@ pub fn register_module(ns: &mut DictStorage) {
                     return Err(crate::PyError::type_error("read() requires 2 arguments"));
                 }
                 let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::c_int;
-                let n = (unsafe { pyre_object::w_int_get_value(args[1]) }) as usize;
-                let mut buf = vec![0u8; n];
-                let ret = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, n as _) };
-                if ret < 0 {
-                    return Err(io_err(std::io::Error::last_os_error(), ""));
+                let n_signed = unsafe { pyre_object::w_int_get_value(args[1]) };
+                // A negative size would wrap to a huge `usize` (and allocation);
+                // os.read rejects it with EINVAL, matching the host read(2).
+                if n_signed < 0 {
+                    return Err(crate::PyError::os_error_with_errno(
+                        libc::EINVAL,
+                        "read: negative size",
+                    ));
                 }
-                buf.truncate(ret as usize);
+                let n = n_signed as usize;
+                #[cfg(not(feature = "sandbox"))]
+                let buf = {
+                    let mut buf = vec![0u8; n];
+                    let ret =
+                        unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, n as _) };
+                    if ret < 0 {
+                        return Err(io_err(std::io::Error::last_os_error(), ""));
+                    }
+                    buf.truncate(ret as usize);
+                    buf
+                };
+                #[cfg(feature = "sandbox")]
+                let buf = crate::host_seam::ops::read(fd, n as i64)
+                    .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
                 Ok(pyre_object::w_bytes_from_bytes(&buf))
             },
             2,
@@ -525,13 +592,20 @@ pub fn register_module(ns: &mut DictStorage) {
                         ));
                     }
                 };
-                let ret = unsafe {
-                    libc::write(fd, data.as_ptr() as *const libc::c_void, data.len() as _)
+                #[cfg(not(feature = "sandbox"))]
+                let ret = {
+                    let ret = unsafe {
+                        libc::write(fd, data.as_ptr() as *const libc::c_void, data.len() as _)
+                    };
+                    if ret < 0 {
+                        return Err(io_err(std::io::Error::last_os_error(), ""));
+                    }
+                    ret as i64
                 };
-                if ret < 0 {
-                    return Err(io_err(std::io::Error::last_os_error(), ""));
-                }
-                Ok(pyre_object::w_int_new(ret as i64))
+                #[cfg(feature = "sandbox")]
+                let ret = crate::host_seam::ops::write(fd, &data)
+                    .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
+                Ok(pyre_object::w_int_new(ret))
             },
             2,
         ),
@@ -550,11 +624,18 @@ pub fn register_module(ns: &mut DictStorage) {
                 let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::c_int;
                 let offset = (unsafe { pyre_object::w_int_get_value(args[1]) }) as libc::off_t;
                 let whence = (unsafe { pyre_object::w_int_get_value(args[2]) }) as libc::c_int;
-                let ret = unsafe { libc::lseek(fd, offset, whence) };
-                if ret < 0 {
-                    return Err(io_err(std::io::Error::last_os_error(), ""));
-                }
-                Ok(pyre_object::w_int_new(ret as i64))
+                #[cfg(not(feature = "sandbox"))]
+                let ret = {
+                    let ret = unsafe { libc::lseek(fd, offset, whence) };
+                    if ret < 0 {
+                        return Err(io_err(std::io::Error::last_os_error(), ""));
+                    }
+                    ret as i64
+                };
+                #[cfg(feature = "sandbox")]
+                let ret = crate::host_seam::ops::lseek(fd, offset as i64, whence)
+                    .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
+                Ok(pyre_object::w_int_new(ret))
             },
             3,
         ),
@@ -568,12 +649,18 @@ pub fn register_module(ns: &mut DictStorage) {
             return Err(crate::PyError::type_error("unlink() requires 1 argument"));
         }
         let path = extract_path(args[0])?;
-        let c_path = std::ffi::CString::new(path.as_bytes())
-            .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
-        let ret = unsafe { libc::unlink(c_path.as_ptr()) };
-        if ret < 0 {
-            return Err(io_err(std::io::Error::last_os_error(), &path));
+        #[cfg(not(feature = "sandbox"))]
+        {
+            let c_path = std::ffi::CString::new(path.as_bytes())
+                .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
+            let ret = unsafe { libc::unlink(c_path.as_ptr()) };
+            if ret < 0 {
+                return Err(io_err(std::io::Error::last_os_error(), &path));
+            }
         }
+        #[cfg(feature = "sandbox")]
+        crate::host_seam::ops::unlink(path.as_bytes())
+            .map_err(|e| crate::host_seam::seam_os_err(e, &path))?;
         Ok(pyre_object::w_none())
     }
     crate::dict_storage_store(
@@ -590,6 +677,10 @@ pub fn register_module(ns: &mut DictStorage) {
     // ── posix.readlink(path, *, dir_fd=None) ──
     // Returns the symlink target; a non-symlink raises OSError(EINVAL), which
     // `posixpath.realpath` relies on to stop following links.
+    // Under sandbox readlink is unavailable (the controller has no ll_os
+    // readlink handler); the stub override loop registers a raising stub, so
+    // keep the raw std::fs::read_link body out of the sandbox build.
+    #[cfg(not(feature = "sandbox"))]
     crate::dict_storage_store(
         ns,
         "readlink",
@@ -620,20 +711,29 @@ pub fn register_module(ns: &mut DictStorage) {
             } else {
                 0o777
             };
-            let c_path = std::ffi::CString::new(path.as_bytes())
-                .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
-            #[cfg(unix)]
-            let ret = unsafe { libc::mkdir(c_path.as_ptr(), _mode as libc::mode_t) };
-            #[cfg(windows)]
-            let ret = unsafe { libc::mkdir(c_path.as_ptr()) };
-            if ret < 0 {
-                return Err(io_err(std::io::Error::last_os_error(), &path));
+            #[cfg(not(feature = "sandbox"))]
+            {
+                let c_path = std::ffi::CString::new(path.as_bytes())
+                    .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
+                #[cfg(unix)]
+                let ret = unsafe { libc::mkdir(c_path.as_ptr(), _mode as libc::mode_t) };
+                #[cfg(windows)]
+                let ret = unsafe { libc::mkdir(c_path.as_ptr()) };
+                if ret < 0 {
+                    return Err(io_err(std::io::Error::last_os_error(), &path));
+                }
             }
+            #[cfg(feature = "sandbox")]
+            crate::host_seam::ops::mkdir(path.as_bytes(), _mode)
+                .map_err(|e| crate::host_seam::seam_os_err(e, &path))?;
             Ok(pyre_object::w_none())
         }),
     );
 
     // ── posix.rmdir(path) ──
+    // Mutates the host filesystem; stubbed under sandbox, so the real body
+    // (and its libc call) is compiled out.
+    #[cfg(not(feature = "sandbox"))]
     crate::dict_storage_store(
         ns,
         "rmdir",
@@ -731,14 +831,27 @@ pub fn register_module(ns: &mut DictStorage) {
             } else {
                 extract_path(args[0])?
             };
-            let entries = host_fs::read_dir(&path).map_err(|e| io_err(e, &path))?;
-            let mut items = Vec::new();
-            for entry in entries {
-                let entry = entry.map_err(|e| io_err(e, &path))?;
-                let name = entry.file_name();
-                items.push(pyre_object::w_str_new(&name.to_string_lossy()));
+            #[cfg(feature = "sandbox")]
+            {
+                let names = crate::host_seam::ops::listdir(path.as_bytes())
+                    .map_err(|e| crate::host_seam::seam_os_err(e, &path))?;
+                let items = names
+                    .into_iter()
+                    .map(|n| pyre_object::w_str_new(&String::from_utf8_lossy(&n)))
+                    .collect();
+                return Ok(pyre_object::w_list_new(items));
             }
-            Ok(pyre_object::w_list_new(items))
+            #[cfg(not(feature = "sandbox"))]
+            {
+                let entries = host_fs::read_dir(&path).map_err(|e| io_err(e, &path))?;
+                let mut items = Vec::new();
+                for entry in entries {
+                    let entry = entry.map_err(|e| io_err(e, &path))?;
+                    let name = entry.file_name();
+                    items.push(pyre_object::w_str_new(&name.to_string_lossy()));
+                }
+                Ok(pyre_object::w_list_new(items))
+            }
         }),
     );
 
@@ -753,6 +866,13 @@ pub fn register_module(ns: &mut DictStorage) {
                     return Ok(pyre_object::w_bool_from(false));
                 }
                 let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
+                #[cfg(feature = "sandbox")]
+                {
+                    return Ok(pyre_object::w_bool_from(
+                        crate::host_seam::ops::isatty(fd).unwrap_or(false),
+                    ));
+                }
+                #[cfg(not(feature = "sandbox"))]
                 Ok(pyre_object::w_bool_from(host_os::isatty(fd)))
             },
             1,
@@ -770,7 +890,13 @@ pub fn register_module(ns: &mut DictStorage) {
                     return Err(crate::PyError::type_error("urandom() requires 1 argument"));
                 }
                 let n = (unsafe { pyre_object::w_int_get_value(args[0]) }) as usize;
+                #[cfg(not(feature = "sandbox"))]
                 let buf = host_os::urandom(n).unwrap_or_else(|_| vec![0u8; n]);
+                // Route host entropy through the trusted controller instead of
+                // reaching host getrandom directly.
+                #[cfg(feature = "sandbox")]
+                let buf = crate::host_seam::ops::urandom(n as i64)
+                    .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
                 Ok(pyre_object::w_bytes_from_bytes(&buf))
             },
             1,
@@ -786,6 +912,9 @@ pub fn register_module(ns: &mut DictStorage) {
     crate::dict_storage_store(ns, "terminal_size", terminal_size_seq_type());
 
     // ── posix.get_terminal_size(fd=1) → os.terminal_size(columns, lines) ──
+    // Inspects the controlling terminal via ioctl(TIOCGWINSZ); stubbed under
+    // sandbox, so the real body is compiled out.
+    #[cfg(not(feature = "sandbox"))]
     crate::dict_storage_store(
         ns,
         "get_terminal_size",
@@ -860,7 +989,9 @@ pub fn register_module(ns: &mut DictStorage) {
     // `Metadata`/`MetadataExt` does not surface it, so read it with a raw
     // `stat`/`lstat`/`fstat`; on failure default to 0 (the primary
     // metadata read already succeeded).
-    #[cfg(target_os = "macos")]
+    // Under sandbox the stat path is mediated (st_flags arrives over the wire),
+    // so this raw-libc helper is compiled out.
+    #[cfg(all(target_os = "macos", not(feature = "sandbox")))]
     fn macos_path_st_flags(path: &str, follow: bool) -> u32 {
         let Ok(c) = std::ffi::CString::new(path) else {
             return 0;
@@ -879,7 +1010,7 @@ pub fn register_module(ns: &mut DictStorage) {
             }
         }
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", not(feature = "sandbox")))]
     fn macos_fd_st_flags(fd: i32) -> u32 {
         unsafe {
             let mut st: libc::stat = std::mem::zeroed();
@@ -1046,6 +1177,62 @@ pub fn register_module(ns: &mut DictStorage) {
         let _ = st_flags;
         crate::_structseq::new_instance_with_extra(stat_result_seq_type(), seq, extras)
     }
+    /// Build a `stat_result` from the sandbox wire `StatBuf` (sandbox build
+    /// only, hence unix-only): the controller delivers the 10 protocol fields
+    /// plus integer atime/mtime/ctime; the sub-second and block/device extras
+    /// are whatever `StatBuf` carries (zero over the wire). Mirrors the unix
+    /// slot/extra layout of `make_stat_result`.
+    #[cfg(feature = "sandbox")]
+    fn make_stat_result_from_statbuf(st: &crate::host_seam::StatBuf) -> pyre_object::PyObjectRef {
+        let st_atime = st.atime;
+        let st_mtime = st.mtime;
+        let st_ctime = st.ctime;
+        let st_atime_ns = st.atime * 1_000_000_000 + st.atime_nsec;
+        let st_mtime_ns = st.mtime * 1_000_000_000 + st.mtime_nsec;
+        let st_ctime_ns = st.ctime * 1_000_000_000 + st.ctime_nsec;
+        let seq = vec![
+            pyre_object::w_int_new(st.mode as i64),
+            pyre_object::w_int_new(st.ino as i64),
+            pyre_object::w_int_new(st.dev as i64),
+            pyre_object::w_int_new(st.nlink as i64),
+            pyre_object::w_int_new(st.uid as i64),
+            pyre_object::w_int_new(st.gid as i64),
+            pyre_object::w_int_new(st.size as i64),
+            pyre_object::w_int_new(st_atime),
+            pyre_object::w_int_new(st_mtime),
+            pyre_object::w_int_new(st_ctime),
+        ];
+        let st_atime_f = st_atime as f64 + 1e-9 * (st_atime_ns - st_atime * 1_000_000_000) as f64;
+        let st_mtime_f = st_mtime as f64 + 1e-9 * (st_mtime_ns - st_mtime * 1_000_000_000) as f64;
+        let st_ctime_f = st_ctime as f64 + 1e-9 * (st_ctime_ns - st_ctime * 1_000_000_000) as f64;
+        #[allow(unused_mut)]
+        let mut extras = vec![
+            ("st_atime", pyre_object::w_float_new(st_atime_f)),
+            ("st_mtime", pyre_object::w_float_new(st_mtime_f)),
+            ("st_ctime", pyre_object::w_float_new(st_ctime_f)),
+            ("st_atime_ns", pyre_object::w_int_new(st_atime_ns)),
+            ("st_mtime_ns", pyre_object::w_int_new(st_mtime_ns)),
+            ("st_ctime_ns", pyre_object::w_int_new(st_ctime_ns)),
+            (
+                "nsec_atime",
+                pyre_object::w_int_new(st_atime_ns.rem_euclid(1_000_000_000)),
+            ),
+            (
+                "nsec_mtime",
+                pyre_object::w_int_new(st_mtime_ns.rem_euclid(1_000_000_000)),
+            ),
+            (
+                "nsec_ctime",
+                pyre_object::w_int_new(st_ctime_ns.rem_euclid(1_000_000_000)),
+            ),
+            ("st_blksize", pyre_object::w_int_new(st.blksize as i64)),
+            ("st_blocks", pyre_object::w_int_new(st.blocks as i64)),
+            ("st_rdev", pyre_object::w_int_new(st.rdev as i64)),
+        ];
+        #[cfg(target_os = "macos")]
+        extras.push(("st_flags", pyre_object::w_int_new(st.st_flags as i64)));
+        crate::_structseq::new_instance_with_extra(stat_result_seq_type(), seq, extras)
+    }
     fn stat_impl(
         args: &[pyre_object::PyObjectRef],
         follow_symlinks: bool,
@@ -1057,25 +1244,38 @@ pub fn register_module(ns: &mut DictStorage) {
         let path_str = crate::gateway::fsencode_w(path_obj).map_err(|_| {
             crate::PyError::type_error("stat: path should be string, bytes, os.PathLike")
         })?;
-        let meta = if follow_symlinks {
-            host_fs::metadata(&path_str)
-        } else {
-            host_fs::symlink_metadata(&path_str)
-        };
-        match meta {
-            Ok(m) => {
-                #[cfg(target_os = "macos")]
-                let st_flags = macos_path_st_flags(&path_str, follow_symlinks);
-                #[cfg(not(target_os = "macos"))]
-                let st_flags = 0u32;
-                Ok(make_stat_result(&m, st_flags))
+        #[cfg(feature = "sandbox")]
+        {
+            let buf = if follow_symlinks {
+                crate::host_seam::ops::stat(path_str.as_bytes())
+            } else {
+                crate::host_seam::ops::lstat(path_str.as_bytes())
             }
-            Err(e) => {
-                let kind = e.raw_os_error().unwrap_or(2);
-                Err(crate::PyError::os_error_with_errno(
-                    kind,
-                    format!("{}: '{}'", e, path_str),
-                ))
+            .map_err(|e| crate::host_seam::seam_os_err(e, &path_str))?;
+            return Ok(make_stat_result_from_statbuf(&buf));
+        }
+        #[cfg(not(feature = "sandbox"))]
+        {
+            let meta = if follow_symlinks {
+                host_fs::metadata(&path_str)
+            } else {
+                host_fs::symlink_metadata(&path_str)
+            };
+            match meta {
+                Ok(m) => {
+                    #[cfg(target_os = "macos")]
+                    let st_flags = macos_path_st_flags(&path_str, follow_symlinks);
+                    #[cfg(not(target_os = "macos"))]
+                    let st_flags = 0u32;
+                    Ok(make_stat_result(&m, st_flags))
+                }
+                Err(e) => {
+                    let kind = e.raw_os_error().unwrap_or(2);
+                    Err(crate::PyError::os_error_with_errno(
+                        kind,
+                        format!("{}: '{}'", e, path_str),
+                    ))
+                }
             }
         }
     }
@@ -1160,9 +1360,9 @@ pub fn register_module(ns: &mut DictStorage) {
         };
         match meta {
             Ok(m) => {
-                #[cfg(target_os = "macos")]
+                #[cfg(all(target_os = "macos", not(feature = "sandbox")))]
                 let st_flags = macos_path_st_flags(&path, follow);
-                #[cfg(not(target_os = "macos"))]
+                #[cfg(not(all(target_os = "macos", not(feature = "sandbox"))))]
                 let st_flags = 0u32;
                 Ok(make_stat_result(&m, st_flags))
             }
@@ -1344,7 +1544,13 @@ pub fn register_module(ns: &mut DictStorage) {
                     return Err(crate::PyError::type_error("fstat() missing argument"));
                 }
                 let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
-                #[cfg(unix)]
+                #[cfg(feature = "sandbox")]
+                {
+                    let buf = crate::host_seam::ops::fstat(fd)
+                        .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
+                    Ok(make_stat_result_from_statbuf(&buf))
+                }
+                #[cfg(all(unix, not(feature = "sandbox")))]
                 {
                     use std::os::unix::io::FromRawFd;
                     let f = unsafe { std::fs::File::from_raw_fd(fd) };
@@ -1364,7 +1570,7 @@ pub fn register_module(ns: &mut DictStorage) {
                         )),
                     }
                 }
-                #[cfg(not(unix))]
+                #[cfg(not(any(unix, feature = "sandbox")))]
                 Err(crate::PyError::os_error_with_errno(
                     9,
                     "fstat unsupported".to_string(),
@@ -1383,13 +1589,22 @@ pub fn register_module(ns: &mut DictStorage) {
         crate::make_builtin_function_with_arity(
             "getcwd",
             |_| {
-                #[cfg(feature = "host_env")]
+                #[cfg(feature = "sandbox")]
                 {
-                    if let Ok(cwd) = host_os::current_dir() {
-                        return Ok(pyre_object::w_str_new(&cwd.to_string_lossy()));
-                    }
+                    let cwd = crate::host_seam::ops::getcwd()
+                        .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
+                    Ok(pyre_object::w_str_new(&String::from_utf8_lossy(&cwd)))
                 }
-                Ok(pyre_object::w_str_new(""))
+                #[cfg(not(feature = "sandbox"))]
+                {
+                    #[cfg(feature = "host_env")]
+                    {
+                        if let Ok(cwd) = host_os::current_dir() {
+                            return Ok(pyre_object::w_str_new(&cwd.to_string_lossy()));
+                        }
+                    }
+                    Ok(pyre_object::w_str_new(""))
+                }
             },
             0,
         ),
@@ -1401,21 +1616,31 @@ pub fn register_module(ns: &mut DictStorage) {
         crate::make_builtin_function_with_arity(
             "getcwdb",
             |_| {
-                #[cfg(feature = "host_env")]
+                #[cfg(feature = "sandbox")]
                 {
-                    if let Ok(cwd) = host_os::current_dir() {
-                        return Ok(pyre_object::w_bytes_from_bytes(
-                            cwd.as_os_str().as_encoded_bytes(),
-                        ));
-                    }
+                    let cwd = crate::host_seam::ops::getcwd()
+                        .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
+                    Ok(pyre_object::w_bytes_from_bytes(&cwd))
                 }
-                Ok(pyre_object::w_bytes_from_bytes(b""))
+                #[cfg(not(feature = "sandbox"))]
+                {
+                    #[cfg(feature = "host_env")]
+                    {
+                        if let Ok(cwd) = host_os::current_dir() {
+                            return Ok(pyre_object::w_bytes_from_bytes(
+                                cwd.as_os_str().as_encoded_bytes(),
+                            ));
+                        }
+                    }
+                    Ok(pyre_object::w_bytes_from_bytes(b""))
+                }
             },
             0,
         ),
     );
-    // os.getuid / geteuid / getgid / getegid — real syscalls.
-    #[cfg(unix)]
+    // os.getuid / geteuid / getgid / getegid — real syscalls (the sandbox
+    // build routes these through the controller instead, see below).
+    #[cfg(all(unix, not(feature = "sandbox")))]
     unsafe extern "C" {
         fn getuid() -> u32;
         fn geteuid() -> u32;
@@ -1428,11 +1653,17 @@ pub fn register_module(ns: &mut DictStorage) {
         crate::make_builtin_function_with_arity(
             "getuid",
             |_| {
-                #[cfg(unix)]
+                #[cfg(feature = "sandbox")]
+                {
+                    let v = crate::host_seam::ops::getuid()
+                        .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
+                    return Ok(pyre_object::w_int_new(v));
+                }
+                #[cfg(all(unix, not(feature = "sandbox")))]
                 unsafe {
                     return Ok(pyre_object::w_int_new(getuid() as i64));
                 }
-                #[cfg(not(unix))]
+                #[cfg(not(any(unix, feature = "sandbox")))]
                 Ok(pyre_object::w_int_new(0))
             },
             0,
@@ -1444,11 +1675,17 @@ pub fn register_module(ns: &mut DictStorage) {
         crate::make_builtin_function_with_arity(
             "geteuid",
             |_| {
-                #[cfg(unix)]
+                #[cfg(feature = "sandbox")]
+                {
+                    let v = crate::host_seam::ops::geteuid()
+                        .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
+                    return Ok(pyre_object::w_int_new(v));
+                }
+                #[cfg(all(unix, not(feature = "sandbox")))]
                 unsafe {
                     return Ok(pyre_object::w_int_new(geteuid() as i64));
                 }
-                #[cfg(not(unix))]
+                #[cfg(not(any(unix, feature = "sandbox")))]
                 Ok(pyre_object::w_int_new(0))
             },
             0,
@@ -1460,11 +1697,17 @@ pub fn register_module(ns: &mut DictStorage) {
         crate::make_builtin_function_with_arity(
             "getgid",
             |_| {
-                #[cfg(unix)]
+                #[cfg(feature = "sandbox")]
+                {
+                    let v = crate::host_seam::ops::getgid()
+                        .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
+                    return Ok(pyre_object::w_int_new(v));
+                }
+                #[cfg(all(unix, not(feature = "sandbox")))]
                 unsafe {
                     return Ok(pyre_object::w_int_new(getgid() as i64));
                 }
-                #[cfg(not(unix))]
+                #[cfg(not(any(unix, feature = "sandbox")))]
                 Ok(pyre_object::w_int_new(0))
             },
             0,
@@ -1476,11 +1719,17 @@ pub fn register_module(ns: &mut DictStorage) {
         crate::make_builtin_function_with_arity(
             "getegid",
             |_| {
-                #[cfg(unix)]
+                #[cfg(feature = "sandbox")]
+                {
+                    let v = crate::host_seam::ops::getegid()
+                        .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
+                    return Ok(pyre_object::w_int_new(v));
+                }
+                #[cfg(all(unix, not(feature = "sandbox")))]
                 unsafe {
                     return Ok(pyre_object::w_int_new(getegid() as i64));
                 }
-                #[cfg(not(unix))]
+                #[cfg(not(any(unix, feature = "sandbox")))]
                 Ok(pyre_object::w_int_new(0))
             },
             0,
@@ -1513,7 +1762,13 @@ pub fn register_module(ns: &mut DictStorage) {
                     return Ok(pyre_object::w_none());
                 }
             };
-            #[cfg(feature = "host_env")]
+            #[cfg(feature = "sandbox")]
+            {
+                if let Ok(Some(value)) = crate::host_seam::ops::getenv(key.as_bytes()) {
+                    return Ok(pyre_object::w_str_new(&String::from_utf8_lossy(&value)));
+                }
+            }
+            #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
             {
                 if let Ok(value) = host_os::var(&key) {
                     return Ok(pyre_object::w_str_new(&value));
@@ -1545,6 +1800,13 @@ pub fn register_module(ns: &mut DictStorage) {
                             return Err(crate::PyError::type_error("strerror() requires 1 argument"));
                         }
                     };
+                    #[cfg(feature = "sandbox")]
+                    {
+                        let msg = crate::host_seam::ops::strerror(code)
+                            .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
+                        return Ok(pyre_object::w_str_new(&String::from_utf8_lossy(&msg)));
+                    }
+                    #[cfg(not(feature = "sandbox"))]
                     Ok(pyre_object::w_str_new(
                         &rustpython_host_env::time::strerror(code),
                     ))
@@ -1770,6 +2032,7 @@ pub fn register_module(ns: &mut DictStorage) {
         );
 
         // os.getppid() -> int
+        #[cfg(not(feature = "sandbox"))]
         crate::dict_storage_store(
             ns,
             "getppid",
@@ -1895,6 +2158,7 @@ pub fn register_module(ns: &mut DictStorage) {
         );
 
         // os.dup(fd) -> new_fd
+        #[cfg(not(feature = "sandbox"))]
         crate::dict_storage_store(
             ns,
             "dup",
@@ -1916,6 +2180,7 @@ pub fn register_module(ns: &mut DictStorage) {
         );
 
         // os.dup2(fd, fd2, inheritable=True) -> fd2
+        #[cfg(not(feature = "sandbox"))]
         crate::dict_storage_store(
             ns,
             "dup2",
@@ -1934,6 +2199,7 @@ pub fn register_module(ns: &mut DictStorage) {
         );
 
         // os.fsync(fd)
+        #[cfg(not(feature = "sandbox"))]
         crate::dict_storage_store(
             ns,
             "fsync",
@@ -1956,6 +2222,7 @@ pub fn register_module(ns: &mut DictStorage) {
 
         // os.fdatasync(fd) — falls back to fsync on macOS, which has no
         // fdatasync syscall but exposes the same semantics through fsync.
+        #[cfg(not(feature = "sandbox"))]
         crate::dict_storage_store(
             ns,
             "fdatasync",
@@ -1982,6 +2249,7 @@ pub fn register_module(ns: &mut DictStorage) {
         );
 
         // os.mkfifo(path, mode=0o666) -> None
+        #[cfg(not(feature = "sandbox"))]
         crate::dict_storage_store(
             ns,
             "mkfifo",
@@ -2006,6 +2274,7 @@ pub fn register_module(ns: &mut DictStorage) {
         );
 
         // os.kill(pid, sig) / os.killpg(pgid, sig)
+        #[cfg(not(feature = "sandbox"))]
         crate::dict_storage_store(
             ns,
             "kill",
@@ -2026,6 +2295,7 @@ pub fn register_module(ns: &mut DictStorage) {
                 2,
             ),
         );
+        #[cfg(not(feature = "sandbox"))]
         crate::dict_storage_store(
             ns,
             "killpg",
@@ -2140,6 +2410,7 @@ pub fn register_module(ns: &mut DictStorage) {
         );
 
         // os.symlink(src, dst, target_is_directory=False) -> None
+        #[cfg(not(feature = "sandbox"))]
         crate::dict_storage_store(
             ns,
             "symlink",
@@ -2249,6 +2520,14 @@ pub fn register_module(ns: &mut DictStorage) {
                 }
                 let path = extract_path(args[0])?;
                 let mode = (unsafe { pyre_object::w_int_get_value(args[1]) }) as u8;
+                #[cfg(feature = "sandbox")]
+                {
+                    return Ok(pyre_object::w_bool_from(
+                        crate::host_seam::ops::access(path.as_bytes(), mode as i32)
+                            .unwrap_or(false),
+                    ));
+                }
+                #[cfg(not(feature = "sandbox"))]
                 match host_posix::check_access(std::path::Path::new(&path), mode) {
                     Ok(ok) => Ok(pyre_object::w_bool_from(ok)),
                     Err(_) => Ok(pyre_object::w_bool_from(false)),
@@ -2389,7 +2668,7 @@ pub fn register_module(ns: &mut DictStorage) {
         // wrappers don't do manual retry (relies on PEP 475 OS-level retry),
         // matching pyre-wide convention rather than introducing a single
         // outlier.
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(all(any(target_os = "linux", target_os = "macos"), not(feature = "sandbox")))]
         crate::dict_storage_store(
             ns,
             "sendfile",
@@ -3005,6 +3284,62 @@ pub fn register_module(ns: &mut DictStorage) {
                 3,
             ),
         );
+    }
+
+    // The trampoline only mediates the curated ll_os/ll_time surface, so the
+    // real impls registered above for process control, fd duplication, host
+    // filesystem mutation and privilege changes would otherwise reach libc
+    // directly under sandbox.  Overwrite each with a raising stub, mirroring the
+    // RPython sandbox where unsupported externals are simply unavailable.  The
+    // mediated names (open/read/write/close/lseek/stat/access/getcwd/listdir/
+    // getenv/isatty/strerror/get{u,g}id/unlink/mkdir) are intentionally absent
+    // here — they stay live through host_seam.
+    #[cfg(feature = "sandbox")]
+    {
+        fn sandbox_unavailable(_: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+            Err(crate::host_seam::stub("this OS operation"))
+        }
+        for name in [
+            // process creation / control
+            "fork", "forkpty", "system", "popen", "execv", "execve", "execvp",
+            "execvpe", "spawnv", "spawnve", "spawnvp", "spawnvpe", "posix_spawn",
+            "posix_spawnp", "abort", "_exit", "register_at_fork", "wait", "waitpid",
+            "kill", "killpg",
+            // file-descriptor duplication / pipes / ttys / cross-fd copy +
+            // inheritance control (set_inheritable would mutate a real fd).
+            "dup", "dup2", "dup3", "pipe", "pipe2", "openpty", "login_tty",
+            "sendfile", "set_inheritable",
+            // host filesystem mutation that bypasses the controller
+            "chmod", "fchmod", "lchmod", "chown", "fchown", "lchown", "chroot",
+            "chdir", "fchdir", "link", "symlink", "truncate", "ftruncate",
+            "rename", "rmdir", "mkfifo", "mknod",
+            // privilege / scheduling
+            "setuid", "setgid", "setreuid", "setregid", "setresuid", "setresgid",
+            "setgroups", "initgroups", "setsid", "setpgid", "setpgrp", "nice",
+            "setpriority", "sched_get_priority_max", "sched_get_priority_min",
+            // durability + real process environment mutation
+            "sync", "fsync", "fdatasync", "setenv", "unsetenv", "putenv",
+            // host filesystem inspection that bypasses the controller VFS.
+            // DirEntry is a type, but its is_dir/is_file/stat/inode methods stat
+            // a guest-controlled `path` via host_fs, so neutralise it too (its
+            // only producer, scandir, is already stubbed here).
+            "readlink", "scandir", "DirEntry", "statvfs", "fstatvfs",
+            // host process / environment information leaks
+            "getpid", "getppid", "uname", "getlogin", "getloadavg",
+            "getpriority", "times", "umask", "getgroups", "cpu_count",
+            "_cpu_count", "getresuid", "getresgid",
+            // host system-configuration probes; pathconf consults a
+            // guest-controlled path on the real filesystem.
+            "pathconf", "fpathconf", "sysconf",
+            // terminal / tty inspection + control
+            "tcgetpgrp", "tcsetpgrp", "get_terminal_size", "ttyname",
+        ] {
+            crate::dict_storage_store(
+                ns,
+                name,
+                crate::make_builtin_function(name, sandbox_unavailable),
+            );
+        }
     }
 
     crate::dict_storage_store(ns, "error", crate::typedef::w_object());

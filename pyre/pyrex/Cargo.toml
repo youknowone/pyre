@@ -33,6 +33,14 @@ dynasm = ["jit", "pyre-jit/dynasm"]
 # so mimalloc roughly halves bignum-heavy workloads (fib_loop beats PyPy).
 # Enable with e.g. `--features dynasm,mimalloc`.
 mimalloc = ["dep:mimalloc"]
+# Build the interpreter as an RPython-style sandbox client: every mediated OS
+# call routes through host_seam's marshalling trampoline (see pyre-interpreter).
+sandbox = ["pyre-interpreter/sandbox"]
+# Backwards-compatible alias. The seccomp-bpf syscall allowlist is now installed
+# by default in any Linux `sandbox` build (see the install site in lib.rs and
+# pyre-sandbox::seccomp), so this adds nothing over `sandbox`; it is retained so
+# `--features seccomp` keeps working.
+seccomp = ["sandbox"]
 
 [dependencies]
 pyre-object = { workspace = true }
@@ -44,3 +52,8 @@ rustpython-compiler = { workspace = true }
 dirs = { workspace = true }
 rustyline = { workspace = true }
 mimalloc = { version = "0.1", optional = true }
+
+# The sandbox controller (`pyre interact`) and the seccomp backstop are
+# unix-only; on other targets `pyre-sandbox` is neither referenced nor linked.
+[target.'cfg(unix)'.dependencies]
+pyre-sandbox = { workspace = true }

@@ -144,11 +144,16 @@ impl W_Random {
         #[default(pyre_object::w_none())] w_n: PyObjectRef,
     ) -> Result<(), crate::PyError> {
         // None: seed from os.urandom(8); fall back to a time-based int only
-        // when urandom raises (interp_random.py:28).
+        // when urandom raises (interp_random.py:28). Under sandbox the entropy
+        // comes from the trusted controller, not host getrandom.
         let w_n = if unsafe { is_none(w_n) } {
-            match crate::importing::host::os::urandom(8) {
-                Ok(buf) => w_bytes_from_bytes(&buf),
-                Err(_) => w_int_new(seed_from_time() as i64),
+            #[cfg(not(feature = "sandbox"))]
+            let entropy = crate::importing::host::os::urandom(8).ok();
+            #[cfg(feature = "sandbox")]
+            let entropy = crate::host_seam::ops::urandom(8).ok();
+            match entropy {
+                Some(buf) => w_bytes_from_bytes(&buf),
+                None => w_int_new(seed_from_time() as i64),
             }
         } else {
             w_n
@@ -254,11 +259,18 @@ impl W_Random {
 
 /// Time-based fallback seed — `int(time.time() * 256)`.
 fn seed_from_time() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0);
+    // Under sandbox the clock is read through the trusted controller, not the
+    // host directly.
+    #[cfg(feature = "sandbox")]
+    let secs = crate::host_seam::ops::time().unwrap_or(0.0);
+    #[cfg(not(feature = "sandbox"))]
+    let secs = {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0)
+    };
     (secs * 256.0) as u64
 }
 

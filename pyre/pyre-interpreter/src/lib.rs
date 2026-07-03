@@ -37,6 +37,35 @@ pub mod executioncontext;
 pub mod frame_array;
 pub mod function;
 pub mod gateway;
+// The OS-call seam (real syscalls vs. sandbox marshalling trampolines). Unix
+// only: the real bodies use libc and the unix `OsStr`/`OsString` byte views.
+#[cfg(unix)]
+pub mod host_seam;
+
+// On non-unix targets (wasm) the seam is configured out, but the diagnostic
+// stdio emitters need neither libc nor the sandbox trampoline (sandbox is
+// unix-only). Provide them so the shared `crate::host_seam::emit_*` call sites
+// resolve everywhere; the bodies mirror the non-sandbox emit path.
+#[cfg(not(unix))]
+pub mod host_seam {
+    /// Emit bytes to the interpreter's stdout (fd 1).
+    pub fn emit_stdout(bytes: &[u8]) {
+        use std::io::Write;
+        let _ = std::io::stdout().write_all(bytes);
+    }
+
+    /// Emit bytes to the interpreter's stderr (fd 2).
+    pub fn emit_stderr(bytes: &[u8]) {
+        use std::io::Write;
+        let _ = std::io::stderr().write_all(bytes);
+    }
+
+    /// Flush the interpreter's stdout (fd 1).
+    pub fn flush_stdout() {
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+    }
+}
 pub mod jit_fnaddr;
 pub mod listobject;
 pub mod opcode_ops;
@@ -45,7 +74,6 @@ pub mod pyopcode;
 pub mod pytraceback;
 pub mod reduce_protocol;
 pub mod runtime_ops;
-pub mod sandbox;
 pub mod shared_opcode;
 pub mod sliceobject;
 pub mod stack_check;
@@ -830,6 +858,12 @@ pub fn print_output(s: &str) {
         if let Some(hook) = *h.borrow() {
             hook(s);
         } else {
+            // Under sandbox fd 1 is the marshalling pipe, so route program
+            // output through ll_os_write(1,…) for the controller to relay; a
+            // raw `print!` would corrupt the protocol stream.
+            #[cfg(all(unix, feature = "sandbox"))]
+            let _ = crate::host_seam::ops::write(1, s.as_bytes());
+            #[cfg(not(all(unix, feature = "sandbox")))]
             print!("{s}");
         }
     });

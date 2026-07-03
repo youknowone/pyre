@@ -4,6 +4,11 @@
 
 use pyre_object::*;
 
+// Under sandbox, name libc through the seam facade so any direct syscall call
+// in this module is a compile error (only types/constants/pure fns resolve).
+#[cfg(feature = "sandbox")]
+use crate::host_seam::sys as libc;
+
 #[cfg(feature = "host_env")]
 use rustpython_host_env::time as host_time;
 use std::sync::OnceLock;
@@ -40,11 +45,16 @@ fn monotonic_seconds() -> f64 {
 /// Wall-clock seconds since the unix epoch, falling back to 0 on
 /// `SystemTimeError`.  Routes through `host_env::time` when enabled.
 fn duration_since_epoch() -> std::time::Duration {
-    #[cfg(feature = "host_env")]
+    #[cfg(feature = "sandbox")]
+    {
+        let secs = crate::host_seam::ops::time().unwrap_or(0.0).max(0.0);
+        std::time::Duration::from_secs_f64(secs)
+    }
+    #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
     {
         host_time::duration_since_system_now().unwrap_or_default()
     }
-    #[cfg(not(feature = "host_env"))]
+    #[cfg(not(any(feature = "host_env", feature = "sandbox")))]
     {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -159,7 +169,14 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         return Ok(w_none());
     }
     let dur = std::time::Duration::from_nanos(timeout_ns as u64);
-    #[cfg(all(unix, feature = "host_env"))]
+    #[cfg(feature = "sandbox")]
+    {
+        // The controller services the sleep; signal handling is its concern.
+        crate::host_seam::ops::sleep(dur.as_secs_f64())
+            .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
+        Ok(w_none())
+    }
+    #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
     {
         // `interp_time.py:622-710 time_sleep` — sleep toward a monotonic
         // deadline; on EINTR deliver any pending signal and retry with the
@@ -186,7 +203,7 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             }
         }
     }
-    #[cfg(not(all(unix, feature = "host_env")))]
+    #[cfg(not(any(all(unix, feature = "host_env"), feature = "sandbox")))]
     {
         std::thread::sleep(dur);
         Ok(w_none())
@@ -236,19 +253,28 @@ pub fn perf_counter_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 /// reporting a bogus zero.
 #[cfg(all(unix, feature = "host_env"))]
 fn process_time_nanos() -> Result<i128, crate::PyError> {
-    if let Ok(d) = host_time::clock_gettime(host_time::ClockId::CLOCK_PROCESS_CPUTIME_ID) {
-        return Ok(d.as_nanos() as i128);
+    #[cfg(feature = "sandbox")]
+    {
+        let secs =
+            crate::host_seam::ops::clock().map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
+        Ok((secs * 1_000_000_000.0) as i128)
     }
-    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
-    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } == 0 {
-        let tv_ns = |tv: &libc::timeval| -> i128 {
-            tv.tv_sec as i128 * 1_000_000_000 + tv.tv_usec as i128 * 1_000
-        };
-        return Ok(tv_ns(&usage.ru_utime) + tv_ns(&usage.ru_stime));
+    #[cfg(not(feature = "sandbox"))]
+    {
+        if let Ok(d) = host_time::clock_gettime(host_time::ClockId::CLOCK_PROCESS_CPUTIME_ID) {
+            return Ok(d.as_nanos() as i128);
+        }
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } == 0 {
+            let tv_ns = |tv: &libc::timeval| -> i128 {
+                tv.tv_sec as i128 * 1_000_000_000 + tv.tv_usec as i128 * 1_000
+            };
+            return Ok(tv_ns(&usage.ru_utime) + tv_ns(&usage.ru_stime));
+        }
+        Err(crate::PyError::runtime_error(
+            "the processor time used is not available or its value cannot be represented",
+        ))
     }
-    Err(crate::PyError::runtime_error(
-        "the processor time used is not available or its value cannot be represented",
-    ))
 }
 
 #[cfg(not(all(unix, feature = "host_env")))]
@@ -317,7 +343,12 @@ pub fn clock_gettime_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 }
 
 /// time.clock_settime(clk_id, time: float) → None
-#[cfg(all(unix, feature = "host_env", not(target_os = "redox")))]
+#[cfg(all(
+    unix,
+    feature = "host_env",
+    not(target_os = "redox"),
+    not(feature = "sandbox")
+))]
 pub fn clock_settime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() < 2 {
         return Err(crate::PyError::type_error(
@@ -359,7 +390,12 @@ pub fn clock_settime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
 }
 
 /// time.clock_settime_ns(clk_id, time: int) → None
-#[cfg(all(unix, feature = "host_env", not(target_os = "redox")))]
+#[cfg(all(
+    unix,
+    feature = "host_env",
+    not(target_os = "redox"),
+    not(feature = "sandbox")
+))]
 pub fn clock_settime_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() < 2 {
         return Err(crate::PyError::type_error(
@@ -863,8 +899,15 @@ pub fn strftime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             "time.strftime is unavailable on wasm32",
         ))
     }
+    // strftime consults $TZ/tzname (%Z/%z) and the LC_TIME locale DB; under
+    // sandbox the registration is stubbed, so the real body is compiled out.
+    #[cfg(all(unix, feature = "sandbox"))]
+    {
+        let _ = c_fmt;
+        Err(crate::host_seam::stub("time.strftime"))
+    }
     // strftime is available on both Unix and Windows CRT.
-    #[cfg(unix)]
+    #[cfg(all(unix, not(feature = "sandbox")))]
     {
         let libc_tm = c_tm_to_libc_tm(&tm);
         let mut buf = vec![0u8; 256];

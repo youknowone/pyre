@@ -38,6 +38,7 @@ members = [
     "pyre/pyre-macros",
     "pyre/pyre-native",
     "pyre/pyre-interpreter",
+    "pyre/pyre-sandbox",
     "pyre/pyre-module",
     "pyre/pyre-jit",
     "pyre/pyre-jit-trace",
@@ -53,6 +54,7 @@ pyre-object = { version = "0.0.2", path = "pyre/pyre-object" }
 pyre-macros = { version = "0.0.2", path = "pyre/pyre-macros" }
 pyre-native = { version = "0.0.2", path = "pyre/pyre-native" }
 pyre-interpreter = { version = "0.0.2", path = "pyre/pyre-interpreter" }
+pyre-sandbox = { version = "0.0.2", path = "pyre/pyre-sandbox" }
 pyre-module = { version = "0.0.2", path = "pyre/pyre-module" }
 pyre-jit = { version = "0.0.2", path = "pyre/pyre-jit" }
 pyre-jit-trace = { version = "0.0.2", path = "pyre/pyre-jit-trace" }

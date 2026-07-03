@@ -1,7 +1,7 @@
 use indexmap::IndexMap;
 use std::cell::Cell;
 use std::fs;
-use std::io::{self, Cursor, Read};
+use std::io::{self, Cursor, Read, Seek};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -12,6 +12,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub type Mode = u32;
 pub type FsNode = Rc<dyn FSObject>;
 pub type VfsResult<T> = Result<T, VfsError>;
+
+/// A readable + seekable handle — the Rust shape of vfs.py's file-like objects
+/// (`cStringIO.StringIO` for in-memory `File`, an `open(...)` handle for
+/// `RealFile`). The controller needs `Seek` to service `ll_os_lseek`.
+pub trait ReadSeek: Read + Seek {}
+impl<T: Read + Seek> ReadSeek for T {}
 
 // vfs.py:4
 pub const UID: u32 = 1000;
@@ -146,8 +152,18 @@ pub trait FSObject {
         })
     }
 
+    // vfs.py only defines `join` on `Dir`/`RealDir`; a non-directory raising on
+    // `join` is the Rust equivalent of the `AttributeError`/`ENOTDIR` a file
+    // would produce when `translate_path` walks into it.
+    fn join(&self, name: &str) -> VfsResult<FsNode> {
+        Err(VfsError {
+            errno: ENOTDIR,
+            object: name.to_owned(),
+        })
+    }
+
     // vfs.py:52
-    fn open(&self) -> VfsResult<Box<dyn Read>> {
+    fn open(&self) -> VfsResult<Box<dyn ReadSeek>> {
         Err(VfsError {
             errno: EACCES,
             object: "self".to_owned(),
@@ -175,14 +191,6 @@ impl Dir {
             entries,
         }
     }
-
-    // vfs.py:65
-    pub fn join(&self, name: &str) -> VfsResult<FsNode> {
-        self.entries.get(name).cloned().ok_or_else(|| VfsError {
-            errno: ENOENT,
-            object: name.to_owned(),
-        })
-    }
 }
 
 impl FSObject for Dir {
@@ -199,6 +207,14 @@ impl FSObject for Dir {
     // vfs.py:63
     fn keys(&self) -> VfsResult<Vec<String>> {
         Ok(self.entries.keys().cloned().collect())
+    }
+
+    // vfs.py:65
+    fn join(&self, name: &str) -> VfsResult<FsNode> {
+        self.entries.get(name).cloned().ok_or_else(|| VfsError {
+            errno: ENOENT,
+            object: name.to_owned(),
+        })
     }
 }
 
@@ -235,6 +251,40 @@ impl RealDir {
     pub fn repr(&self) -> String {
         format!("<RealDir {}>", self.path.display())
     }
+}
+
+impl FSObject for RealDir {
+    // Rust support for vfs.py:15
+    fn state(&self) -> &FSObjectState {
+        &self.state
+    }
+
+    // vfs.py:60
+    fn kind(&self) -> Mode {
+        S_IFDIR
+    }
+
+    // vfs.py:87
+    fn keys(&self) -> VfsResult<Vec<String>> {
+        let mut names = Vec::new();
+        for entry in fs::read_dir(&self.path)
+            .map_err(|err| io_error(err, self.path.display().to_string()))?
+        {
+            let entry = entry.map_err(|err| io_error(err, self.path.display().to_string()))?;
+            // The VFS is keyed by `String`, so a non-UTF-8 host filename is
+            // decoded lossily (U+FFFD) instead of preserved as raw bytes like
+            // PyPy's os.listdir. A lossy name only fails to resolve through the
+            // single-`Normal`-component jail in `join`; it cannot escape.
+            names.push(entry.file_name().to_string_lossy().into_owned());
+        }
+        if !self.show_dotfiles {
+            names.retain(|name| !name.starts_with('.'));
+        }
+        for excl in &self.exclude {
+            names.retain(|name| !name.to_lowercase().ends_with(excl));
+        }
+        Ok(names)
+    }
 
     // vfs.py:94
     //
@@ -249,12 +299,18 @@ impl RealDir {
     // child names only).  This keeps the join inside `self.path`
     // unconditionally — the rest of the sandbox depends on that
     // invariant.
-    pub fn join(&self, name: &str) -> VfsResult<FsNode> {
-        if name.is_empty()
-            || name == ".."
-            || name.contains(std::path::MAIN_SEPARATOR)
-            || std::path::Path::new(name).is_absolute()
-        {
+    fn join(&self, name: &str) -> VfsResult<FsNode> {
+        // A child name must be exactly one ordinary path component. Reject both
+        // separators explicitly (the VFS is platform-neutral, so `\` is barred on
+        // unix too) and require a single `Component::Normal`, which also turns
+        // away `..`, the empty string, absolute paths, and Windows drive-prefixed
+        // names like `C:` / `C:foo` (neither absolute nor separator-bearing, yet
+        // they would escape the base on join).
+        let mut components = std::path::Path::new(name).components();
+        let single_normal_child =
+            matches!(components.next(), Some(std::path::Component::Normal(_)))
+                && components.next().is_none();
+        if name.contains(['/', '\\']) || !single_normal_child {
             return Err(VfsError {
                 errno: ENOENT,
                 object: name.to_owned(),
@@ -302,36 +358,6 @@ impl RealDir {
     }
 }
 
-impl FSObject for RealDir {
-    // Rust support for vfs.py:15
-    fn state(&self) -> &FSObjectState {
-        &self.state
-    }
-
-    // vfs.py:60
-    fn kind(&self) -> Mode {
-        S_IFDIR
-    }
-
-    // vfs.py:87
-    fn keys(&self) -> VfsResult<Vec<String>> {
-        let mut names = Vec::new();
-        for entry in fs::read_dir(&self.path)
-            .map_err(|err| io_error(err, self.path.display().to_string()))?
-        {
-            let entry = entry.map_err(|err| io_error(err, self.path.display().to_string()))?;
-            names.push(entry.file_name().to_string_lossy().into_owned());
-        }
-        if !self.show_dotfiles {
-            names.retain(|name| !name.starts_with('.'));
-        }
-        for excl in &self.exclude {
-            names.retain(|name| !name.to_lowercase().ends_with(excl));
-        }
-        Ok(names)
-    }
-}
-
 // vfs.py:115
 pub struct File {
     state: FSObjectState,
@@ -365,7 +391,7 @@ impl FSObject for File {
     }
 
     // vfs.py:121
-    fn open(&self) -> VfsResult<Box<dyn Read>> {
+    fn open(&self) -> VfsResult<Box<dyn ReadSeek>> {
         Ok(Box::new(Cursor::new(self.data.clone())))
     }
 }
@@ -412,15 +438,15 @@ impl FSObject for RealFile {
     }
 
     // vfs.py:133
-    fn open(&self) -> VfsResult<Box<dyn Read>> {
+    fn open(&self) -> VfsResult<Box<dyn ReadSeek>> {
         fs::File::open(&self.path)
-            .map(|file| Box::new(file) as Box<dyn Read>)
+            .map(|file| Box::new(file) as Box<dyn ReadSeek>)
             .map_err(|err| io_error(err, self.path.display().to_string()))
     }
 }
 
 // vfs.py:25
-fn is_dir(mode: Mode) -> bool {
+pub fn is_dir(mode: Mode) -> bool {
     (mode & S_IFMT) == S_IFDIR
 }
 
@@ -429,5 +455,132 @@ fn io_error(err: io::Error, object: String) -> VfsError {
     VfsError {
         errno: err.raw_os_error().unwrap_or(EIO),
         object,
+    }
+}
+
+// Port of rpython/translator/sandbox/test/test_vfs.py.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // POSIX access() mode bits.
+    const R_OK: Mode = 4;
+    const W_OK: Mode = 2;
+    const X_OK: Mode = 1;
+
+    fn read_all(node: &FsNode) -> Vec<u8> {
+        let mut data = Vec::new();
+        node.open().unwrap().read_to_end(&mut data).unwrap();
+        data
+    }
+
+    // `FsNode` is not `Debug`, so `Result::unwrap_err` is unavailable on a
+    // `VfsResult<FsNode>`; extract the errno of an expected failure by hand.
+    fn errno_of(r: VfsResult<FsNode>) -> i32 {
+        match r {
+            Ok(_) => panic!("expected an error"),
+            Err(e) => e.errno,
+        }
+    }
+
+    fn sorted_keys(node: &FsNode) -> Vec<String> {
+        let mut names = node.keys().unwrap();
+        names.sort();
+        names
+    }
+
+    // test_vfs.py:22 test_dir
+    #[test]
+    fn test_dir() {
+        let mut entries: IndexMap<String, FsNode> = IndexMap::new();
+        entries.insert("foo".to_owned(), Rc::new(Dir::default()));
+        let d = Dir::new(entries);
+
+        assert_eq!(d.keys().unwrap(), vec!["foo".to_owned()]);
+        assert!(d.open().is_err());
+        assert!(d.getsize().is_ok());
+
+        let d1 = d.join("foo").unwrap();
+        assert!(is_dir(d1.kind()));
+        assert_eq!(d1.keys().unwrap(), Vec::<String>::new());
+
+        // join('bar') raises
+        assert!(d.join("bar").is_err());
+
+        let st = d.stat().unwrap();
+        assert!(is_dir(st.st_mode));
+        assert!(d.access(R_OK | X_OK).unwrap());
+        assert!(!d.access(W_OK).unwrap());
+    }
+
+    // test_vfs.py:36 test_file
+    #[test]
+    fn test_file() {
+        let f = File::new("hello world");
+        assert_eq!(f.kind() & S_IFMT, S_IFREG);
+        assert!(f.keys().is_err());
+        assert_eq!(f.getsize().unwrap(), 11);
+        assert_eq!(
+            read_all(&(Rc::new(File::new("hello world")) as FsNode)),
+            b"hello world"
+        );
+
+        let st = f.stat().unwrap();
+        assert_eq!(st.st_mode & S_IFMT, S_IFREG);
+        assert_eq!(st.st_size, 11);
+        assert!(f.access(R_OK).unwrap());
+        assert!(!f.access(W_OK).unwrap());
+    }
+
+    // test_vfs.py:51 — RealDir/RealFile keys + join + read.
+    #[test]
+    fn test_realdir_realfile() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("file1"), b"somedata1").unwrap();
+        std::fs::write(tmp.path().join(".hidden"), b"secret").unwrap();
+        std::fs::create_dir(tmp.path().join("subdir1")).unwrap();
+        std::fs::write(tmp.path().join("subdir1/subfile1"), b"spam").unwrap();
+
+        let v = RealDir::new(tmp.path(), false, false, Vec::new());
+        // dotfiles hidden by default
+        assert_eq!(
+            {
+                let mut k = v.keys().unwrap();
+                k.sort();
+                k
+            },
+            vec!["file1".to_owned(), "subdir1".to_owned()]
+        );
+
+        assert_eq!(read_all(&v.join("file1").unwrap()), b"somedata1");
+
+        let sub = v.join("subdir1").unwrap();
+        assert!(is_dir(sub.kind()));
+        assert_eq!(sorted_keys(&sub), vec!["subfile1".to_owned()]);
+
+        // missing + hidden + traversal are all ENOENT
+        assert!(v.join("does_not_exist").is_err());
+        assert!(v.join(".hidden").is_err());
+        assert_eq!(errno_of(v.join("..")), ENOENT);
+        assert_eq!(errno_of(v.join("subdir1/subfile1")), ENOENT);
+    }
+
+    // test_vfs.py:100 test_realdir_exclude — case-insensitive suffix exclusion.
+    #[test]
+    fn test_realdir_exclude() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("thing.yes"), b"").unwrap();
+        std::fs::write(tmp.path().join("thing.no"), b"").unwrap();
+
+        let v = RealDir::new(tmp.path(), false, false, vec![".no".to_owned()]);
+        let keys = v.keys().unwrap();
+        assert!(keys.contains(&"thing.yes".to_owned()));
+        assert!(!keys.contains(&"thing.no".to_owned()));
+
+        assert!(v.join("thing.yes").is_ok());
+        assert!(v.join("thing.no").is_err());
+        // case variants are excluded too
+        assert!(v.join("thing.No").is_err());
+        assert!(v.join("thing.NO").is_err());
     }
 }

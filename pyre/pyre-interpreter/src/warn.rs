@@ -17,5 +17,5 @@ pub fn warn_deprecation(msg: &str) {
 /// _warnings/interp_warnings.py:263: do_warn(space, w_message, w_category, stacklevel-1)
 /// do_warn_explicit formats: "{filename}:{lineno}: {category}: {message}"
 pub fn warn(msg: &str, category: &str) {
-    eprintln!("{category}: {msg}");
+    crate::host_seam::emit_stderr(format!("{category}: {msg}\n").as_bytes());
 }

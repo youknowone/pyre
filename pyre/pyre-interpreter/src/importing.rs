@@ -68,7 +68,7 @@ pub(crate) mod host {
         }
     }
 }
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
 use host::fs as host_fs;
 use host::os as host_os;
 
@@ -122,9 +122,27 @@ fn with_source_provider<R>(f: impl FnOnce(&dyn SourceProvider) -> R) -> R {
     f(&*provider)
 }
 
-#[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
+/// Read a source file through the installed [`SourceProvider`] — the
+/// seam-mediated VFS under sandbox, the host FS otherwise. Traceback rendering
+/// uses this so it honours the same jail as the import machinery instead of
+/// reaching `std::fs` for a guest-controlled path.
+#[cfg(feature = "host_env")]
+pub fn read_source_to_string(path: &Path) -> std::io::Result<String> {
+    with_source_provider(|p| p.read_to_string(path))
+}
+
+#[cfg(all(
+    feature = "host_env",
+    not(target_arch = "wasm32"),
+    not(feature = "sandbox")
+))]
 fn default_source_provider() -> std::rc::Rc<dyn SourceProvider> {
     std::rc::Rc::new(HostFsProvider)
+}
+
+#[cfg(all(feature = "host_env", not(target_arch = "wasm32"), feature = "sandbox"))]
+fn default_source_provider() -> std::rc::Rc<dyn SourceProvider> {
+    std::rc::Rc::new(SeamSourceProvider)
 }
 
 #[cfg(all(feature = "host_env", target_arch = "wasm32"))]
@@ -136,10 +154,18 @@ fn default_source_provider() -> std::rc::Rc<dyn SourceProvider> {
 /// runner's real-FS path.  `is_file`/`is_dir` go straight to `std::fs::
 /// metadata` via the `Path` methods (matching the historical `find_in_dirs`
 /// probes); reads route through the host_env `fs` shim.
-#[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
+#[cfg(all(
+    feature = "host_env",
+    not(target_arch = "wasm32"),
+    not(feature = "sandbox")
+))]
 struct HostFsProvider;
 
-#[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
+#[cfg(all(
+    feature = "host_env",
+    not(target_arch = "wasm32"),
+    not(feature = "sandbox")
+))]
 impl SourceProvider for HostFsProvider {
     fn is_file(&self, path: &Path) -> bool {
         path.is_file()
@@ -149,6 +175,59 @@ impl SourceProvider for HostFsProvider {
     }
     fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
         host_fs::read_to_string(path)
+    }
+}
+
+/// Sandbox provider: every import probe and source read round-trips through the
+/// host_seam trampoline to the trusted controller, which enforces the virtual
+/// filesystem policy (read-only, path-jailed). Replaces `HostFsProvider` so the
+/// import machinery cannot `std::fs` its way to an attacker-chosen host path
+/// (e.g. `sys.path.append('/etc'); __import__('shadow')`).
+#[cfg(all(feature = "host_env", feature = "sandbox"))]
+struct SeamSourceProvider;
+
+#[cfg(all(feature = "host_env", feature = "sandbox"))]
+impl SeamSourceProvider {
+    fn stat_mode(path: &Path) -> Option<u32> {
+        use std::os::unix::ffi::OsStrExt;
+        crate::host_seam::ops::stat(path.as_os_str().as_bytes())
+            .ok()
+            .map(|s| s.mode)
+    }
+}
+
+#[cfg(all(feature = "host_env", feature = "sandbox"))]
+impl SourceProvider for SeamSourceProvider {
+    fn is_file(&self, path: &Path) -> bool {
+        Self::stat_mode(path).is_some_and(|m| m & libc::S_IFMT as u32 == libc::S_IFREG as u32)
+    }
+    fn is_dir(&self, path: &Path) -> bool {
+        Self::stat_mode(path).is_some_and(|m| m & libc::S_IFMT as u32 == libc::S_IFDIR as u32)
+    }
+    fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
+        use std::os::unix::ffi::OsStrExt;
+        fn to_io(e: crate::host_seam::SeamError) -> std::io::Error {
+            match e {
+                crate::host_seam::SeamError::Os(errno) => std::io::Error::from_raw_os_error(errno),
+                _ => std::io::Error::other("sandbox source read failed"),
+            }
+        }
+        let bytes = path.as_os_str().as_bytes();
+        let fd = crate::host_seam::ops::open(bytes, libc::O_RDONLY, 0).map_err(to_io)?;
+        let mut data = Vec::new();
+        loop {
+            match crate::host_seam::ops::read(fd, 65536) {
+                Ok(chunk) if chunk.is_empty() => break,
+                Ok(chunk) => data.extend_from_slice(&chunk),
+                Err(e) => {
+                    let _ = crate::host_seam::ops::close(fd);
+                    return Err(to_io(e));
+                }
+            }
+        }
+        let _ = crate::host_seam::ops::close(fd);
+        String::from_utf8(data)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "source not utf-8"))
     }
 }
 
@@ -401,31 +480,47 @@ pub fn install_builtin_modules() {
     pyre_install_module!("__pypy__" => crate::module::__pypy__::init);
     pyre_install_module!("__pypy__.builders" => crate::module::__pypy__::builders::init);
 
-    #[cfg(not(target_arch = "wasm32"))]
-    pyre_install_module!("_signal"(signal));
     pyre_install_module!(atexit);
-    #[cfg(not(target_arch = "wasm32"))]
-    pyre_install_module!(pwd);
-    #[cfg(not(target_arch = "wasm32"))]
-    pyre_install_module!(grp);
-    #[cfg(unix)]
-    pyre_install_module!(resource);
-    #[cfg(unix)]
-    pyre_install_module!(fcntl);
-    #[cfg(unix)]
-    pyre_install_module!(syslog);
-    pyre_install_module!(select);
-    pyre_install_module!(termios);
-    pyre_install_module!(_socket);
-    #[cfg(not(target_arch = "wasm32"))]
-    pyre_install_module!(mmap);
-    #[cfg(not(target_arch = "wasm32"))]
+    // faulthandler installs host signal handlers and writes tracebacks to a raw
+    // fd, neither of which is mediated; like the other host-access modules below
+    // the sandbox interpreter omits it (PyPy keeps it out of default_modules
+    // under translation.sandbox).
+    #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
     pyre_install_module!(faulthandler);
-    pyre_install_module!(_ctypes);
-    #[cfg(not(target_arch = "wasm32"))]
-    pyre_install_module!(_posixshmem);
-    pyre_install_module!(_posixsubprocess);
-    pyre_install_module!(_multiprocessing);
+
+    // Host-access modules — network (`_socket`), arbitrary FFI (`_ctypes`),
+    // subprocess/`fork`+`exec` (`_posixsubprocess`), shared memory
+    // (`_multiprocessing`/`_posixshmem`), system log, fd/tty control
+    // (`fcntl`/`termios`/`select`/`resource`), real signals, and the host
+    // user/group databases (`pwd`/`grp`).  None belong to the mediated
+    // ll_os/ll_time surface, so the sandbox interpreter omits them entirely:
+    // `import _socket` then raises ModuleNotFoundError, as in a build whose
+    // syscall code is absent.
+    #[cfg(not(feature = "sandbox"))]
+    {
+        #[cfg(not(target_arch = "wasm32"))]
+        pyre_install_module!("_signal"(signal));
+        #[cfg(not(target_arch = "wasm32"))]
+        pyre_install_module!(pwd);
+        #[cfg(not(target_arch = "wasm32"))]
+        pyre_install_module!(grp);
+        #[cfg(unix)]
+        pyre_install_module!(resource);
+        #[cfg(unix)]
+        pyre_install_module!(fcntl);
+        #[cfg(unix)]
+        pyre_install_module!(syslog);
+        pyre_install_module!(select);
+        pyre_install_module!(termios);
+        pyre_install_module!(_socket);
+        #[cfg(not(target_arch = "wasm32"))]
+        pyre_install_module!(mmap);
+        pyre_install_module!(_ctypes);
+        #[cfg(not(target_arch = "wasm32"))]
+        pyre_install_module!(_posixshmem);
+        pyre_install_module!(_posixsubprocess);
+        pyre_install_module!(_multiprocessing);
+    }
     pyre_install_module!(_locale);
     pyre_install_module!(_random);
     pyre_install_module!(_pickle);
@@ -676,8 +771,19 @@ pub fn init_sys_path(script_dir: &Path) {
         path.clear();
         // Script directory first (PyPy: first entry in sys.path)
         path.push(script_dir.to_path_buf());
-        // Current working directory as fallback
-        if let Ok(cwd) = host_os::current_dir() {
+        // Current working directory as fallback. Under sandbox read it through
+        // the seam so it resolves to the controller's virtual cwd (`/tmp`)
+        // rather than leaking the trusted parent's real working directory.
+        #[cfg(feature = "sandbox")]
+        let cwd = {
+            use std::os::unix::ffi::OsStrExt;
+            crate::host_seam::ops::getcwd()
+                .ok()
+                .map(|b| PathBuf::from(std::ffi::OsStr::from_bytes(&b)))
+        };
+        #[cfg(not(feature = "sandbox"))]
+        let cwd = host_os::current_dir().ok();
+        if let Some(cwd) = cwd {
             if cwd != script_dir {
                 path.push(cwd);
             }
@@ -693,7 +799,7 @@ pub fn init_sys_path(script_dir: &Path) {
 ///
 /// PyPy equivalent: initpath.py walks up from the executable to a
 /// directory containing `lib-python/X.Y`.
-#[cfg(feature = "host_env")]
+#[cfg(all(feature = "host_env", not(feature = "sandbox")))]
 fn find_intree_stdlib() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let mut dir = exe.parent();
@@ -717,31 +823,49 @@ fn find_intree_stdlib() -> Option<PathBuf> {
 /// PyPy equivalent: initpath.py scans for lib-python/X.Y at startup.
 #[cfg(feature = "host_env")]
 pub(crate) fn detect_stdlib_path() -> Option<PathBuf> {
-    // Explicit override.
-    if let Ok(p) = host_os::var("PYRE_STDLIB") {
-        let path = PathBuf::from(p);
-        if path.is_dir() {
+    // Under sandbox the controller provisions the stdlib mount via
+    // `PYRE_STDLIB`; trust it verbatim — the seam-backed SourceProvider
+    // mediates every subsequent read — and never read `current_exe` or spawn
+    // a `python3` subprocess (both escape the controller).
+    #[cfg(feature = "sandbox")]
+    {
+        // Read through the env seam so the lookup reaches the controller's
+        // virtual environment (the child's real env was cleared at spawn); the
+        // controller seeds PYRE_STDLIB to the `--lib` mount at `/bin/lib`.
+        use std::os::unix::ffi::OsStrExt;
+        return crate::host_seam::ops::getenv(b"PYRE_STDLIB")
+            .ok()
+            .flatten()
+            .map(|bytes| PathBuf::from(std::ffi::OsStr::from_bytes(&bytes)));
+    }
+    #[cfg(not(feature = "sandbox"))]
+    {
+        // Explicit override.
+        if let Ok(p) = host_os::var("PYRE_STDLIB") {
+            let path = PathBuf::from(p);
+            if path.is_dir() {
+                return Some(path);
+            }
+        }
+        // Vendored in-tree stdlib, located relative to the executable.
+        if let Some(path) = find_intree_stdlib() {
             return Some(path);
         }
+        // Last resort: borrow a host CPython's stdlib.
+        let output = std::process::Command::new("python3")
+            .args([
+                "-c",
+                "import sysconfig; print(sysconfig.get_paths()['stdlib'])",
+            ])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let s = String::from_utf8(output.stdout).ok()?;
+        let path = PathBuf::from(s.trim());
+        if path.is_dir() { Some(path) } else { None }
     }
-    // Vendored in-tree stdlib, located relative to the executable.
-    if let Some(path) = find_intree_stdlib() {
-        return Some(path);
-    }
-    // Last resort: borrow a host CPython's stdlib.
-    let output = std::process::Command::new("python3")
-        .args([
-            "-c",
-            "import sysconfig; print(sysconfig.get_paths()['stdlib'])",
-        ])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let s = String::from_utf8(output.stdout).ok()?;
-    let path = PathBuf::from(s.trim());
-    if path.is_dir() { Some(path) } else { None }
 }
 
 /// Add a directory to sys.path.

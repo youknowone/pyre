@@ -2281,8 +2281,7 @@ fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if flush {
         match file {
             None => {
-                use std::io::Write;
-                let _ = std::io::stdout().flush();
+                crate::host_seam::flush_stdout();
             }
             Some(fp) => {
                 let r = crate::baseobjspace::call_method(fp, "flush", &[]);
@@ -7381,8 +7380,13 @@ fn init_file_wrapper_type(ns: &mut DictStorage) {
                 if let Some(fd) = file_get_fd(args[0]) {
                     #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
                     {
+                        #[cfg(not(feature = "sandbox"))]
                         return Ok(w_bool_from(
                             unsafe { libc::lseek(fd, 0, libc::SEEK_CUR) } >= 0,
+                        ));
+                        #[cfg(feature = "sandbox")]
+                        return Ok(w_bool_from(
+                            crate::host_seam::ops::lseek(fd, 0, libc::SEEK_CUR).is_ok(),
                         ));
                     }
                     #[cfg(any(not(feature = "host_env"), target_arch = "wasm32"))]
@@ -7411,10 +7415,17 @@ fn init_file_wrapper_type(ns: &mut DictStorage) {
                     .unwrap_or(0) as i32;
                 #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
                 {
-                    let pos = unsafe { libc::lseek(fd, offset as libc::off_t, whence) };
-                    if pos < 0 {
-                        return Err(fd_io_err(std::io::Error::last_os_error()));
-                    }
+                    #[cfg(not(feature = "sandbox"))]
+                    let pos = {
+                        let pos = unsafe { libc::lseek(fd, offset as libc::off_t, whence) };
+                        if pos < 0 {
+                            return Err(fd_io_err(std::io::Error::last_os_error()));
+                        }
+                        pos
+                    };
+                    #[cfg(feature = "sandbox")]
+                    let pos = crate::host_seam::ops::lseek(fd, offset, whence)
+                        .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
                     return Ok(w_int_new(pos as i64));
                 }
                 #[cfg(any(not(feature = "host_env"), target_arch = "wasm32"))]
@@ -7440,10 +7451,17 @@ fn init_file_wrapper_type(ns: &mut DictStorage) {
                 if let Some(fd) = file_get_fd(args[0]) {
                     #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
                     {
-                        let pos = unsafe { libc::lseek(fd, 0, libc::SEEK_CUR) };
-                        if pos < 0 {
-                            return Err(fd_io_err(std::io::Error::last_os_error()));
-                        }
+                        #[cfg(not(feature = "sandbox"))]
+                        let pos = {
+                            let pos = unsafe { libc::lseek(fd, 0, libc::SEEK_CUR) };
+                            if pos < 0 {
+                                return Err(fd_io_err(std::io::Error::last_os_error()));
+                            }
+                            pos
+                        };
+                        #[cfg(feature = "sandbox")]
+                        let pos = crate::host_seam::ops::lseek(fd, 0, libc::SEEK_CUR)
+                            .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
                         return Ok(w_int_new(pos as i64));
                     }
                     #[cfg(any(not(feature = "host_env"), target_arch = "wasm32"))]
@@ -7522,8 +7540,28 @@ fn file_is_binary(self_obj: PyObjectRef) -> bool {
         .unwrap_or(false)
 }
 
+/// Reduce a [`SeamError`] to a `std::io::Error` so the fd helpers keep their
+/// `io::Result` signature (the caller's `fd_io_err` then maps it to `OSError`).
+#[cfg(all(feature = "host_env", not(target_arch = "wasm32"), feature = "sandbox"))]
+fn seam_to_io(e: crate::host_seam::SeamError) -> std::io::Error {
+    match e {
+        crate::host_seam::SeamError::Os(errno) => std::io::Error::from_raw_os_error(errno),
+        _ => std::io::Error::other("sandbox error"),
+    }
+}
+
 #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
 fn fd_read_into(fd: i32, buf: &mut [u8]) -> std::io::Result<usize> {
+    #[cfg(feature = "sandbox")]
+    {
+        // The controller services one read per request; copy the reply (at most
+        // `buf.len()` bytes) into the caller's buffer.
+        let data = crate::host_seam::ops::read(fd, buf.len() as i64).map_err(seam_to_io)?;
+        let n = data.len().min(buf.len());
+        buf[..n].copy_from_slice(&data[..n]);
+        return Ok(n);
+    }
+    #[cfg(not(feature = "sandbox"))]
     loop {
         // `count` is `size_t` on Unix but `c_uint` on Windows; `as _` casts
         // to whichever the platform's `libc::read` expects.
@@ -7733,13 +7771,21 @@ fn file_method_write(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         };
         #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
         {
-            // `count` is `size_t` on Unix but `c_uint` on Windows.
-            let n =
-                unsafe { libc::write(fd, bytes.as_ptr() as *const libc::c_void, bytes.len() as _) };
-            if n < 0 {
-                return Err(fd_io_err(std::io::Error::last_os_error()));
-            }
-            return Ok(w_int_new(n as i64));
+            #[cfg(not(feature = "sandbox"))]
+            let n = {
+                // `count` is `size_t` on Unix but `c_uint` on Windows.
+                let n = unsafe {
+                    libc::write(fd, bytes.as_ptr() as *const libc::c_void, bytes.len() as _)
+                };
+                if n < 0 {
+                    return Err(fd_io_err(std::io::Error::last_os_error()));
+                }
+                n as i64
+            };
+            #[cfg(feature = "sandbox")]
+            let n = crate::host_seam::ops::write(fd, &bytes)
+                .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
+            return Ok(w_int_new(n));
         }
         #[cfg(any(not(feature = "host_env"), target_arch = "wasm32"))]
         {
@@ -7794,13 +7840,27 @@ fn file_method_close(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
             .map(|v| unsafe { pyre_object::is_bool(v) && pyre_object::w_bool_get_value(v) })
             .unwrap_or(false);
         if !already {
-            #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
-            unsafe {
-                libc::close(fd);
+            // Mark closed first so the fd is not reusable even if the underlying
+            // close reports an error, then surface that error (matching
+            // _io.FileIO.close).
+            let _ = crate::baseobjspace::setattr_str(args[0], "closed", w_bool_from(true));
+            #[cfg(all(
+                feature = "host_env",
+                not(target_arch = "wasm32"),
+                not(feature = "sandbox")
+            ))]
+            // SAFETY: close(2) on the file object's own fd.
+            if unsafe { libc::close(fd) } < 0 {
+                let e = std::io::Error::last_os_error();
+                return Err(crate::PyError::os_error_with_errno(
+                    e.raw_os_error().unwrap_or(0),
+                    format!("close: {e}"),
+                ));
             }
+            #[cfg(all(feature = "host_env", not(target_arch = "wasm32"), feature = "sandbox"))]
+            crate::host_seam::ops::close(fd).map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
             #[cfg(any(not(feature = "host_env"), target_arch = "wasm32"))]
             let _ = fd;
-            crate::baseobjspace::setattr_str(args[0], "closed", w_bool_from(true))?;
         }
         return Ok(w_none());
     }
@@ -7813,39 +7873,50 @@ fn file_method_close(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
 /// Write a writable file's dirty in-memory buffer out to disk, leaving the
 /// object open. Shared by `close` and `flush`.
 fn file_flush_dirty(obj: PyObjectRef) -> Result<(), crate::PyError> {
-    let dirty = crate::baseobjspace::getattr_str(obj, "__file_dirty__")
-        .ok()
-        .map(|v| unsafe { pyre_object::is_bool(v) && pyre_object::w_bool_get_value(v) })
-        .unwrap_or(false);
-    if !dirty {
-        return Ok(());
+    // Under sandbox every file object is fd-backed (opens go through the seam)
+    // and the controller enforces read-only, so a dirty writable buffer never
+    // reaches here; keep the raw std::fs write out of the sandbox build.
+    #[cfg(feature = "sandbox")]
+    {
+        let _ = obj;
+        Ok(())
     }
-    if let (Ok(name), Ok(mode)) = (
-        crate::baseobjspace::getattr_str(obj, "__file_name__"),
-        crate::baseobjspace::getattr_str(obj, "__file_mode__"),
-    ) {
-        let name_s = unsafe { pyre_object::w_str_get_value(name).to_string() };
-        let mode_s = unsafe { pyre_object::w_str_get_value(mode).to_string() };
-        let data = file_get_data(obj);
-        let append = mode_s.contains('a');
-        let write_res = if append {
-            std::fs::OpenOptions::new()
-                .append(true)
-                .create(true)
-                .open(&name_s)
-                .and_then(|mut f| std::io::Write::write_all(&mut f, &data))
-        } else {
-            std::fs::write(&name_s, &data)
-        };
-        if let Err(e) = write_res {
-            return Err(crate::PyError::os_error_with_errno(
-                e.raw_os_error().unwrap_or(5),
-                format!("{e}: '{name_s}'"),
-            ));
+    #[cfg(not(feature = "sandbox"))]
+    {
+        let dirty = crate::baseobjspace::getattr_str(obj, "__file_dirty__")
+            .ok()
+            .map(|v| unsafe { pyre_object::is_bool(v) && pyre_object::w_bool_get_value(v) })
+            .unwrap_or(false);
+        if !dirty {
+            return Ok(());
         }
-        crate::baseobjspace::setattr_str(obj, "__file_dirty__", w_bool_from(false))?;
+        if let (Ok(name), Ok(mode)) = (
+            crate::baseobjspace::getattr_str(obj, "__file_name__"),
+            crate::baseobjspace::getattr_str(obj, "__file_mode__"),
+        ) {
+            let name_s = unsafe { pyre_object::w_str_get_value(name).to_string() };
+            let mode_s = unsafe { pyre_object::w_str_get_value(mode).to_string() };
+            let data = file_get_data(obj);
+            let append = mode_s.contains('a');
+            let write_res = if append {
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .create(true)
+                    .open(&name_s)
+                    .and_then(|mut f| std::io::Write::write_all(&mut f, &data))
+            } else {
+                std::fs::write(&name_s, &data)
+            };
+            if let Err(e) = write_res {
+                return Err(crate::PyError::os_error_with_errno(
+                    e.raw_os_error().unwrap_or(5),
+                    format!("{e}: '{name_s}'"),
+                ));
+            }
+            crate::baseobjspace::setattr_str(obj, "__file_dirty__", w_bool_from(false))?;
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 /// `flush()` — push any buffered writes to disk without closing. For
@@ -8027,58 +8098,82 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
         }
     }
 
-    let data: Vec<u8> = if reading && !mode.contains('w') && !mode.contains('x') {
-        #[cfg(any(not(feature = "host_env"), target_arch = "wasm32"))]
-        {
-            // Sandbox-intentional: with the host_env feature off the
-            // interpreter must not reach `std::fs` directly.  Callers in
-            // sandbox builds route file I/O through the VFS shim instead;
-            // returning NotImplementedError keeps the open() builtin from
-            // silently leaking real-FS reads here.
-            let _ = (binary, &path);
-            return Err(crate::PyError::not_implemented(
-                "open() for reading requires host_env feature",
-            ));
-        }
-        #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
-        let read_result = rustpython_host_env::fs::read(&path);
-        #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
-        match read_result {
-            // Hold the exact file bytes; text-mode reads decode on the way
-            // out (`fd_bytes_to_obj`), so non-UTF-8 content is preserved.
-            Ok(bytes) => bytes,
-            Err(_e) if writing => Vec::new(),
-            Err(e) => {
-                return Err(crate::PyError::os_error_with_errno(
-                    e.raw_os_error().unwrap_or(2),
-                    format!("{e}: '{path}'"),
+    // The sandbox routes the whole open→read/write→close chain through the
+    // controller: acquire a real fd via the trampoline and hand back an
+    // fd-backed wrapper. The in-memory `host_env::fs::read` path below would
+    // otherwise read the real filesystem, escaping the sandbox.
+    #[cfg(feature = "sandbox")]
+    {
+        let _ = (reading, writing);
+        let flags = open_flags_for_mode(&mode);
+        let fd = crate::host_seam::ops::open(path.as_bytes(), flags, 0o666)
+            .map_err(|e| crate::host_seam::seam_os_err(e, &path))?;
+        let wrapper = pyre_object::w_instance_new(file_wrapper_type());
+        let _ = crate::baseobjspace::setattr_str(wrapper, "__file_fd__", w_int_new(fd as i64));
+        let _ = crate::baseobjspace::setattr_str(wrapper, "__file_binary__", w_bool_from(binary));
+        let _ = crate::baseobjspace::setattr_str(wrapper, "__file_mode__", w_str_new(&mode));
+        let _ = crate::baseobjspace::setattr_str(wrapper, "encoding", w_str_new(&encoding));
+        let _ = crate::baseobjspace::setattr_str(wrapper, "errors", w_str_new(&errors));
+        let _ = crate::baseobjspace::setattr_str(wrapper, "name", path_obj);
+        let _ = crate::baseobjspace::setattr_str(wrapper, "mode", w_str_new(&mode));
+        let _ = crate::baseobjspace::setattr_str(wrapper, "closed", w_bool_from(false));
+        Ok(wrapper)
+    }
+    #[cfg(not(feature = "sandbox"))]
+    {
+        let data: Vec<u8> = if reading && !mode.contains('w') && !mode.contains('x') {
+            #[cfg(any(not(feature = "host_env"), target_arch = "wasm32"))]
+            {
+                // Sandbox-intentional: with the host_env feature off the
+                // interpreter must not reach `std::fs` directly.  Callers in
+                // sandbox builds route file I/O through the VFS shim instead;
+                // returning NotImplementedError keeps the open() builtin from
+                // silently leaking real-FS reads here.
+                let _ = (binary, &path);
+                return Err(crate::PyError::not_implemented(
+                    "open() for reading requires host_env feature",
                 ));
             }
-        }
-    } else {
-        Vec::new()
-    };
+            #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
+            let read_result = rustpython_host_env::fs::read(&path);
+            #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
+            match read_result {
+                // Hold the exact file bytes; text-mode reads decode on the way
+                // out (`fd_bytes_to_obj`), so non-UTF-8 content is preserved.
+                Ok(bytes) => bytes,
+                Err(_e) if writing => Vec::new(),
+                Err(e) => {
+                    return Err(crate::PyError::os_error_with_errno(
+                        e.raw_os_error().unwrap_or(2),
+                        format!("{e}: '{path}'"),
+                    ));
+                }
+            }
+        } else {
+            Vec::new()
+        };
 
-    let wrapper = pyre_object::w_instance_new(file_wrapper_type());
-    let _ = crate::baseobjspace::setattr_str(
-        wrapper,
-        "__file_data__",
-        pyre_object::bytesobject::w_bytes_from_bytes(&data),
-    );
-    let _ = crate::baseobjspace::setattr_str(wrapper, "__file_pos__", w_int_new(0));
-    let _ = crate::baseobjspace::setattr_str(wrapper, "__file_name__", w_str_new(&path));
-    let _ = crate::baseobjspace::setattr_str(wrapper, "__file_mode__", w_str_new(&mode));
-    // Carry binary-ness so read/readline wrap their chunks as `bytes` in
-    // binary mode (`'rb'`), matching the fd-backed branch above.  Without
-    // this a path-backed `open(p, 'rb').readline()` would hand back `str`,
-    // breaking `tokenize.detect_encoding` (`first.startswith(BOM_UTF8)`).
-    let _ = crate::baseobjspace::setattr_str(wrapper, "__file_binary__", w_bool_from(binary));
-    let _ = crate::baseobjspace::setattr_str(wrapper, "encoding", w_str_new(&encoding));
-    let _ = crate::baseobjspace::setattr_str(wrapper, "errors", w_str_new(&errors));
-    let _ = crate::baseobjspace::setattr_str(wrapper, "name", w_str_new(&path));
-    let _ = crate::baseobjspace::setattr_str(wrapper, "mode", w_str_new(&mode));
-    let _ = crate::baseobjspace::setattr_str(wrapper, "closed", w_bool_from(false));
-    Ok(wrapper)
+        let wrapper = pyre_object::w_instance_new(file_wrapper_type());
+        let _ = crate::baseobjspace::setattr_str(
+            wrapper,
+            "__file_data__",
+            pyre_object::bytesobject::w_bytes_from_bytes(&data),
+        );
+        let _ = crate::baseobjspace::setattr_str(wrapper, "__file_pos__", w_int_new(0));
+        let _ = crate::baseobjspace::setattr_str(wrapper, "__file_name__", w_str_new(&path));
+        let _ = crate::baseobjspace::setattr_str(wrapper, "__file_mode__", w_str_new(&mode));
+        // Carry binary-ness so read/readline wrap their chunks as `bytes` in
+        // binary mode (`'rb'`), matching the fd-backed branch above.  Without
+        // this a path-backed `open(p, 'rb').readline()` would hand back `str`,
+        // breaking `tokenize.detect_encoding` (`first.startswith(BOM_UTF8)`).
+        let _ = crate::baseobjspace::setattr_str(wrapper, "__file_binary__", w_bool_from(binary));
+        let _ = crate::baseobjspace::setattr_str(wrapper, "encoding", w_str_new(&encoding));
+        let _ = crate::baseobjspace::setattr_str(wrapper, "errors", w_str_new(&errors));
+        let _ = crate::baseobjspace::setattr_str(wrapper, "name", w_str_new(&path));
+        let _ = crate::baseobjspace::setattr_str(wrapper, "mode", w_str_new(&mode));
+        let _ = crate::baseobjspace::setattr_str(wrapper, "closed", w_bool_from(false));
+        Ok(wrapper)
+    }
 }
 
 // ── _io.TextIOWrapper — thin text layer over a binary buffer ─────────
