@@ -1059,7 +1059,7 @@ impl Optimizer {
             let op_rc = std::rc::Rc::new(op);
             ctx.emitted_operations
                 .insert(majit_ir::operand::Operand::from_bound_op(&op_rc));
-            ctx.new_operations.push(op_rc);
+            ctx.push_new_operation(op_rc);
             // Update the field to reference the SameAs result.
             entries[*entry_idx].fields[*field_idx].1 = fresh;
         }
@@ -3502,6 +3502,12 @@ impl Optimizer {
             let jump_op = ctx.new_operations.remove(jump_idx);
             ctx.new_operations.push(jump_op);
         }
+        // `new_operations_index` intentionally not maintained across this
+        // finalization tail (jump reorder + the position remap below): it
+        // feeds `find_producer_op`, which is only queried during the forward
+        // propagate/emit phase that precedes this point. The context is
+        // cleared (`clear_newoperations`) before any reuse re-enters that
+        // phase.
 
         // Remap ALL positions: virtual inputs go to num_inputs..final_num_inputs,
         // This ensures no position collisions between input block params and ops.
@@ -4098,6 +4104,10 @@ impl Optimizer {
             Err(()) => {
                 if !front_target_tokens.is_empty() {
                     ctx.new_operations.truncate(post_force_len);
+                    // The rolled-back attempt left stale entries for the
+                    // truncated ops; `send_extra_operation` below queries
+                    // `find_producer_op`, so resync the index to the survivors.
+                    ctx.rebuild_new_operations_index();
                     // unroll.py:196,238-242 jump_to_preamble parity: the jump-to
                     // jitcell is `jump_op.getdescr()` = terminal_jump's own
                     // recorded descr (the preamble of the loop the trace closed
@@ -4146,6 +4156,9 @@ impl Optimizer {
         // VS is recomputed inside that call from the current (post-force)
         // jump_op.getarglist() — no pre-snapshot is reused.
         ctx.new_operations.truncate(post_force_len);
+        // `try_jump_to_existing_trace` below queries `find_producer_op`;
+        // resync the index to the post-truncate survivors first.
+        ctx.rebuild_new_operations_index();
         let vs2 = match Self::try_jump_to_existing_trace(
             &opt_unroll,
             &jump_args,
@@ -4181,6 +4194,9 @@ impl Optimizer {
         }
         if !front_target_tokens.is_empty() {
             ctx.new_operations.truncate(post_force_len);
+            // Resync the index to the survivors before `send_extra_operation`
+            // queries `find_producer_op` (drops the rolled-back attempt's ops).
+            ctx.rebuild_new_operations_index();
             // unroll.py:196,238-242 jump_to_preamble parity: keep jump_op's own
             // (forced) args so send_extra_operation's Virtualize pass forces the
             // still-virtual ref args, AND keep its recorded descr. That descr is

@@ -528,6 +528,16 @@ use crate::optimizeopt::info::PtrInfoExt;
 pub struct OptContext {
     /// The output operation list being built.
     pub new_operations: Vec<majit_ir::OpRc>,
+    /// O(1) `OpRef → OpRc` index mirroring `new_operations`, keyed by each
+    /// op's result position. `find_producer_op`'s highest-priority lookup
+    /// otherwise scans `new_operations` with `iter().rfind(...)`, which is
+    /// O(n) per call and O(n²) over a whole trace — the dominant cost when
+    /// optimizing a large loop (e.g. aheui's ~64k-op whole-program trace).
+    /// Maintained incrementally by `push_new_operation` (insert overwrites,
+    /// so the last push at a position wins, matching the `rfind`
+    /// last-occurrence semantics); rebuilt by `rebuild_new_operations_index`
+    /// after the rare structural mutations, and cleared with the context.
+    pub(crate) new_operations_index: std::collections::HashMap<OpRef, majit_ir::OpRc>,
     /// optimizer.py:246 `self._emittedoperations = {}` — the result boxes
     /// of ops emitted by THIS optimizer run, keyed by box identity
     /// (`Rc::ptr_eq`) to mirror the upstream dict keyed by the `op` object.
@@ -1622,6 +1632,7 @@ impl OptContext {
     pub fn new(estimated_ops: usize) -> Self {
         OptContext {
             new_operations: Vec::with_capacity(estimated_ops),
+            new_operations_index: std::collections::HashMap::with_capacity(estimated_ops),
             emitted_operations: majit_ir::vec_set::VecSet::new(),
             num_inputs: 0,
             inputarg_base: 0,
@@ -1824,8 +1835,8 @@ impl OptContext {
         if opref.is_none() || opref.is_constant() {
             return None;
         }
-        if let Some(op) = self.new_operations.iter().rfind(|op| op.pos.get() == opref) {
-            return Some(op.clone());
+        if let Some(op) = self.new_operations_index.get(&opref).cloned() {
+            return Some(op);
         }
         if let Some(op) = self.phase1_emit_ops_index.get(&opref).cloned() {
             return Some(op);
@@ -1853,6 +1864,27 @@ impl OptContext {
         self.input_ops_index.reserve(self.input_ops.len());
         for op in &self.input_ops {
             self.input_ops_index.insert(op.pos.get(), op.clone());
+        }
+    }
+
+    /// Append an emitted op and mirror it into `new_operations_index` so
+    /// `find_producer_op`'s highest-priority lookup stays O(1). Insert
+    /// overwrites, so the last push at a given position wins — matching the
+    /// `iter().rfind(...)` (last-occurrence) scan the index replaces.
+    pub(crate) fn push_new_operation(&mut self, op: majit_ir::OpRc) {
+        self.new_operations_index.insert(op.pos.get(), op.clone());
+        self.new_operations.push(op);
+    }
+
+    /// Rebuild `new_operations_index` from the current `new_operations`.
+    /// Called after the rare structural mutations (tail truncate, jump
+    /// reorder) that the incremental `push_new_operation` maintenance cannot
+    /// track by itself.
+    pub(crate) fn rebuild_new_operations_index(&mut self) {
+        self.new_operations_index.clear();
+        self.new_operations_index.reserve(self.new_operations.len());
+        for op in &self.new_operations {
+            self.new_operations_index.insert(op.pos.get(), op.clone());
         }
     }
 
@@ -2159,6 +2191,7 @@ impl OptContext {
     ) -> Self {
         OptContext {
             new_operations: Vec::with_capacity(estimated_ops),
+            new_operations_index: std::collections::HashMap::with_capacity(estimated_ops),
             emitted_operations: majit_ir::vec_set::VecSet::new(),
             num_inputs: num_inputs as u32,
             inputarg_base,
@@ -2790,7 +2823,7 @@ impl OptContext {
                 // marked emitted or it stays invisible to producer matching.
                 self.emitted_operations
                     .insert(majit_ir::operand::Operand::from_bound_op(&reused));
-                self.new_operations.push(reused);
+                self.push_new_operation(reused);
                 return op_pos;
             }
         }
@@ -2835,7 +2868,7 @@ impl OptContext {
         // optimizer.py:674 `self._emittedoperations[op] = None`.
         self.emitted_operations
             .insert(majit_ir::operand::Operand::from_bound_op(&op_rc));
-        self.new_operations.push(op_rc);
+        self.push_new_operation(op_rc);
         pos_ref
     }
 
@@ -6775,6 +6808,7 @@ impl OptContext {
     /// Clear the output operation list (used when restarting optimization).
     pub fn clear_newoperations(&mut self) {
         self.new_operations.clear();
+        self.new_operations_index.clear();
         // Reset next_pos to the iteration's first fresh OpRef position
         // (right after the inputarg slice in the OpRef namespace), but
         // never below the prior iteration's watermark. The context
