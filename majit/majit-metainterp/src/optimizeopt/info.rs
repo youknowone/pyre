@@ -57,10 +57,10 @@ pub enum EnsuredPtrInfo {
         /// Optional runtime hook for `getstrlen1(mode)` lookups.
         string_length_resolver: Option<StringLengthResolver>,
     },
-    /// `arg0.get_forwarded()` — BoxRef-routed mutable handle. Each
+    /// `arg0.get_forwarded()` — operand-routed mutable handle. Each
     /// `as_mut()` call re-borrows the inner `RefCell`. Produced when the
     /// opref resolves to a bound `Op`/`InputArg`.
-    ForwardedBox(majit_ir::box_ref::BoxRef),
+    Forwarded(majit_ir::operand::Operand),
 }
 
 impl EnsuredPtrInfo {
@@ -118,8 +118,8 @@ impl EnsuredPtrInfo {
                     Some(IntBound::from_constant(length))
                 }
             }
-            EnsuredPtrInfo::ForwardedBox(bx) => {
-                bx.ptr_info_mut().and_then(|mut p| p.getlenbound(mode))
+            EnsuredPtrInfo::Forwarded(o) => {
+                o.ptr_info_mut().and_then(|mut p| p.getlenbound(mode))
             }
         }
     }
@@ -127,8 +127,8 @@ impl EnsuredPtrInfo {
     /// Mutable access to the underlying `PtrInfo`. Returns `None` for the
     /// `Constant` variant — PyPy's `ConstPtrInfo.setfield/setitem` route
     /// through `optheap.const_infos`, not through the constant box's own
-    /// info slot (info.py:738-752). The `ForwardedBox` variant returns
-    /// `None` if the BoxRef's `_forwarded` slot does not currently hold
+    /// info slot (info.py:738-752). The `Forwarded` variant returns
+    /// `None` if the operand's `_forwarded` slot does not currently hold
     /// `Forwarded::Info(OpInfo::Ptr(_))`. The returned guard owns an `Rc`
     /// clone of the live `Rc<RefCell<PtrInfo>>` cell and an exclusive
     /// `RefCell` borrow — drop it before any sibling write to the same
@@ -136,7 +136,7 @@ impl EnsuredPtrInfo {
     pub fn as_mut(&mut self) -> Option<majit_ir::box_ref::PtrInfoBorrowMut> {
         match self {
             EnsuredPtrInfo::Constant { .. } => None,
-            EnsuredPtrInfo::ForwardedBox(bx) => bx.ptr_info_mut(),
+            EnsuredPtrInfo::Forwarded(o) => o.ptr_info_mut(),
         }
     }
 

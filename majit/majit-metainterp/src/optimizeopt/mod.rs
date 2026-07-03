@@ -8239,11 +8239,9 @@ impl OptContext {
         ) {
             // optimizer.py:469: return opinfo. The matches! above required
             // arg0_box to carry a virtual/known PtrInfo, so the terminal
-            // BoxRef is already resolved — reuse it instead of re-minting.
-            let bx = arg0_box
-                .expect("matched PtrInfo implies a resolved arg0 operand")
-                .to_boxref();
-            return EnsuredPtrInfo::ForwardedBox(bx);
+            // operand is already resolved — reuse it instead of re-minting.
+            let o = arg0_box.expect("matched PtrInfo implies a resolved arg0 operand");
+            return EnsuredPtrInfo::Forwarded(o);
         }
         let last_guard_pos = if let Some(opinfo) =
             arg0_box.as_ref().and_then(|o| self.peek_ptr_info(o))
@@ -8369,12 +8367,12 @@ impl OptContext {
         // optimizer.py:497: opinfo.last_guard_pos = last_guard_pos
         new_info.set_last_guard_pos(last_guard_pos);
         // optimizer.py:498: arg0.set_forwarded(opinfo)
-        let bx = self.materialize_box_at(arg0);
+        let o = self.materialize_operand_at(arg0);
         use crate::optimizeopt::info::OpInfo;
-        bx.set_forwarded_info(OpInfo::ptr(new_info));
-        // optimizer.py:499: return opinfo — hand back the BoxRef so subsequent
-        // mutations land on the authoritative slot.
-        EnsuredPtrInfo::ForwardedBox(bx)
+        o.set_forwarded_info(OpInfo::ptr(new_info));
+        // optimizer.py:499: return opinfo — hand back the operand so
+        // subsequent mutations land on the authoritative slot.
+        EnsuredPtrInfo::Forwarded(o)
     }
 
     /// optimizer.py:453-462: make_nonnull_str(op, mode) line-by-line port.
