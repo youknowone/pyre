@@ -3,7 +3,6 @@
 //! RPython parity target:
 //! `rpython/jit/metainterp/optimizeopt/rawbuffer.py`.
 
-use crate::box_ref::BoxRef;
 use crate::{DescrRef, GcRef, OpRef};
 
 /// rawbuffer.py:13 RawBuffer — 4 parallel lists: offsets, lengths, descrs, values.
@@ -21,7 +20,7 @@ pub struct RawBuffer {
     /// rawbuffer.py:16: self.descrs — per-entry ArrayDescr.
     descrs: Vec<DescrRef>,
     /// rawbuffer.py:17: self.values
-    values: Vec<BoxRef>,
+    values: Vec<OpRef>,
 }
 
 /// rawbuffer.py:4 `InvalidRawOperation` — base class caught by the optimizer.
@@ -97,15 +96,15 @@ impl RawBuffer {
     }
 
     pub fn values(&self) -> Vec<OpRef> {
-        self.values.iter().map(|b| b.to_opref()).collect()
+        self.values.clone()
     }
 
-    /// Forward each stored value's inline const gcref through the canonical
-    /// BoxRef-Const walk. Replaces the old `values_mut()` round-trip used by
-    /// the PtrInfo GC walker.
-    pub fn walk_const_ptr_refs(&self, visitor: &mut dyn FnMut(&mut GcRef)) {
-        for b in &self.values {
-            b.walk_const_ptr_refs(visitor);
+    /// Forward each stored value's inline `ConstPtr` gcref in place.
+    pub fn walk_const_ptr_refs(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
+        for value in &mut self.values {
+            if let OpRef::ConstPtr(gcref) = value {
+                visitor(gcref);
+            }
         }
     }
 
@@ -115,7 +114,7 @@ impl RawBuffer {
             .copied()
             .zip(self.lengths.iter().copied())
             .zip(self.descrs.iter())
-            .zip(self.values.iter().map(|b| b.to_opref()))
+            .zip(self.values.iter().copied())
             .map(|(((offset, length), descr), value)| (offset, length, descr, value))
     }
 
@@ -132,7 +131,7 @@ impl RawBuffer {
             .zip(lengths)
             .zip(descrs)
             .zip(values)
-            .map(|(((offset, length), descr), value)| (offset, length, descr, value.to_opref()))
+            .map(|(((offset, length), descr), value)| (offset, length, descr, value))
             .collect()
     }
 
@@ -191,7 +190,7 @@ impl RawBuffer {
                     .into());
                 }
                 // rawbuffer.py:102: only replace value, keep existing descr.
-                self.values[i] = BoxRef::from_opref(value);
+                self.values[i] = value;
                 return Ok(());
             } else if wo > offset {
                 break;
@@ -242,7 +241,7 @@ impl RawBuffer {
         self.offsets.insert(insert_pos, offset);
         self.lengths.insert(insert_pos, length);
         self.descrs.insert(insert_pos, descr);
-        self.values.insert(insert_pos, BoxRef::from_opref(value));
+        self.values.insert(insert_pos, value);
         Ok(())
     }
 
@@ -264,7 +263,7 @@ impl RawBuffer {
                     }
                     .into());
                 }
-                return Ok(self.values[i].to_opref());
+                return Ok(self.values[i]);
             }
         }
         Err(InvalidRawRead::UninitializedRead { offset, length }.into())
@@ -404,6 +403,25 @@ mod tests {
         assert_eq!(buf.offsets()[0], 0);
         assert_eq!(buf.offsets()[1], 8);
         assert_eq!(buf.offsets()[2], 16);
+    }
+
+    #[test]
+    fn rawbuffer_walk_const_ptr_refs_forwards_value() {
+        let mut buf = make_buf(16);
+        let d = int_descr();
+        buf.write_value(0, 8, d.clone(), OpRef::const_ptr(GcRef(0x10)))
+            .unwrap();
+
+        buf.walk_const_ptr_refs(&mut |gcref| {
+            if *gcref == GcRef(0x10) {
+                *gcref = GcRef(0x20);
+            }
+        });
+
+        assert_eq!(
+            buf.read_value(0, 8, &d).unwrap(),
+            OpRef::const_ptr(GcRef(0x20))
+        );
     }
 
     /// test_rawbuffer.py:66 test_unpack_descrs
