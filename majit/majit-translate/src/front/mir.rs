@@ -4582,6 +4582,19 @@ impl<'a> Lowering<'a> {
             DecodedConst::Int(n) => Some(OpKind::ConstInt(n)),
             DecodedConst::Bool(b) => Some(OpKind::ConstBool(b)),
             DecodedConst::Float(bits) => Some(OpKind::ConstFloat(bits)),
+            // A `const NAME: &str = "..."` global reads as a named-const
+            // fold, not a static address; without this arm the read falls
+            // through to a residual `FunctionPath` Call on the const path
+            // (`ATTR_W_OBJ_WEAK` etc.) the registry cannot bind.  Emit the
+            // same synthetic `__str_const` the `build_rvalue` const path
+            // uses (result kind `Ref` — a `&str` literal is `Ptr(STR)`).
+            DecodedConst::Str(s) => Some(OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec!["__str_const".to_string(), s],
+                },
+                args: vec![],
+                result_ty: ValueType::Ref(None),
+            }),
             _ => None,
         }
     }
