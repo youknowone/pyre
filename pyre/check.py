@@ -5,8 +5,10 @@ Cross-platform Python translation of pyre/check.sh.
 """
 
 import argparse
+import math
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import time
@@ -343,6 +345,68 @@ def default_binary(backend):
     return f"./target/release/{name}{EXE}"
 
 
+# Relative tolerance for wasm float outputs ONLY (see `wasm_outputs_match`).
+WASM_FLOAT_RTOL = 1e-9
+
+
+def wasm_outputs_match(output, expected):
+    """Bench-output comparison for the wasm backend, allowing a bounded
+    float divergence — used ONLY for benches explicitly opted in with
+    run_bench(..., wasm_float_tol=True). No blanket wasm allowance exists;
+    today only nbody is marked, and every other wasm bench stays byte-exact.
+
+    Root cause (measured, not guessed): the wasm guest and native pyre run
+    the SAME libm source, but libm's transcendentals (`pow` is the FreeBSD
+    `e_pow.c` hi/lo split) bottom out on ARCH-SPECIFIC building blocks
+    (`libm/src/math/arch/aarch64.rs`). On aarch64 those land on hardware-tuned
+    ops that match the platform macOS libm — so native pyre matches
+    CPython/PyPy bit-for-bit — while wasm32 gets the generic software
+    fallbacks. That is a ~0.5-ULP-per-op gap that accumulates (nbody: 5M pow
+    calls -> ~1490 ULP, 3e-13 relative, in the printed energy). It is an
+    unfixable target-ISA codegen gap, not a miscompile: an FMA-fusion
+    hypothesis was tested and refuted (fp-contract=fast on the wasm build is
+    a no-op — wasm32 scalar has no FMA instruction — and libm's pow uses no
+    mul_add), forcing native unfused would break native parity with the
+    platform reference, and host-libm callbacks were rejected (they make wasm
+    output vary by host machine, which we do not want).
+
+    So float tokens are compared with a relative tolerance `WASM_FLOAT_RTOL`
+    (1e-9 — ~4 orders looser than the observed 3e-13 drift, ~3 orders
+    TIGHTER than the smallest real value bug seen, 5.7e-6). Every non-float
+    token (ints, strings, non-finite floats) still must match byte-for-byte,
+    so an int off-by-one can never slip through."""
+    if output == expected:
+        return True
+    out_lines, exp_lines = output.splitlines(), expected.splitlines()
+    if len(out_lines) != len(exp_lines):
+        return False
+    for out_line, exp_line in zip(out_lines, exp_lines):
+        if out_line == exp_line:
+            continue
+        out_toks, exp_toks = out_line.split(), exp_line.split()
+        if len(out_toks) != len(exp_toks):
+            return False
+        for out_tok, exp_tok in zip(out_toks, exp_toks):
+            if out_tok == exp_tok:
+                continue
+            # Only finite float-shaped tokens (decimal point or exponent)
+            # get tolerance; ints/strings/nan/inf must match byte-for-byte
+            # above, so an int off-by-one can never slip through.
+            def _floaty(tok):
+                return "." in tok or "e" in tok or "E" in tok
+            if not (_floaty(out_tok) and _floaty(exp_tok)):
+                return False
+            try:
+                a, b = float(out_tok), float(exp_tok)
+            except ValueError:
+                return False
+            if not (math.isfinite(a) and math.isfinite(b)):
+                return False
+            if abs(a - b) > WASM_FLOAT_RTOL * max(abs(a), abs(b)):
+                return False
+    return True
+
+
 # Backends rendered in fixed-column displays, in order. Any enabled backend not
 # listed here still runs and is counted; it just falls outside the fixed columns.
 ALL_BACKENDS = ("dynasm", "cranelift", "wasm")
@@ -663,6 +727,7 @@ class Check:
     def _run_backend_bench(
         self, backend, name, script, timeout,
         vs_cpython, vs_pypy, t_cpython, t_pypy, pypy_output,
+        wasm_float_tol=False,
     ):
         pyre_bin = self._pyre(backend)
         effective_timeout = scaled_timeout(timeout, self._timeout_scale(backend))
@@ -691,7 +756,17 @@ class Check:
             self._append_comparison(backend, name, t_cpython, t_pypy, "FAIL")
             return
 
-        if output != pypy_output:
+        # Every backend requires byte-identical output. The sole exception is a
+        # bench explicitly marked wasm_float_tol=True AND run on the wasm
+        # backend: wasm32's scalar ISA cannot reproduce the platform libm's
+        # arch-tuned pow, so its transcendental-heavy output drifts by a bounded
+        # amount (see `wasm_outputs_match`). This is opt-in per bench, never a
+        # blanket wasm allowance — every other wasm bench stays byte-exact.
+        if backend == "wasm" and wasm_float_tol:
+            matched = wasm_outputs_match(output, pypy_output)
+        else:
+            matched = output == pypy_output
+        if not matched:
             exp = pypy_output[:60]
             act = output[:60]
             self._record(backend, False, name, "wrong output")
@@ -751,7 +826,7 @@ class Check:
         self, name, script, timeout,
         dynasm_vs_cpython=None, dynasm_vs_pypy=None,
         cranelift_vs_cpython=None, cranelift_vs_pypy=None,
-        skip_backends=(),
+        skip_backends=(), wasm_float_tol=False,
     ):
         need_cpython = False
         if (
@@ -819,6 +894,7 @@ class Check:
             self._run_backend_bench(
                 backend, name, script, timeout,
                 vs_cpython, vs_pypy, t_cpython, t_pypy, pypy_output,
+                wasm_float_tol=wasm_float_tol,
             )
 
     # ── synthetic parity suite ──
@@ -1148,7 +1224,7 @@ def main():
         chk.run_bench("nested_loop",    f"{B}/nested_loop.py",          5,       None,    2,       None,    3)
         chk.run_bench("raise_catch",    f"{B}/raise_catch_loop.py",     5,       None,    1.5,     None,    2.5)
         chk.run_bench("spectral_norm",  f"{B}/spectral_norm.py",        5,       2,       7,       2,       7)
-        chk.run_bench("nbody",          f"{B}/nbody.py",               10,       3,       None,    3,       None)
+        chk.run_bench("nbody",          f"{B}/nbody.py",               10,       3,       None,    3,       None,    wasm_float_tol=True)
         chk.run_bench("fannkuch",       f"{B}/fannkuch.py",            30,       1,       5,       2,       None)
 
     if not args.no_synthetic:
