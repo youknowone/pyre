@@ -22,8 +22,9 @@ fn loads_fixture_corpus() {
     // 6 base fns (straight_line_add, branch_loop_sum, strategy_len,
     // parse_one, desugar_mix, tuple_roundtrip) + `bool_then_closure` and
     // the two local fns Charon emits for its `|| x + 1` closure (the
-    // closure body and its transparent `<Impl>::call_once` inherent method).
-    assert_eq!(local_count, 9, "9 local fns expected");
+    // closure body and its transparent `<Impl>::call_once` inherent method)
+    // + `option_source` and `option_question_mark` (the Option `?` fixture).
+    assert_eq!(local_count, 11, "11 local fns expected");
 }
 
 #[test]
