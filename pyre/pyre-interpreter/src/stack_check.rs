@@ -903,11 +903,11 @@ mod tests {
             sp,
             "a concurrent global-cache refresh must not perturb this thread's captured base"
         );
-        assert_eq!(
-            pyre_stack_get_end(),
-            foreign,
-            "the global cache is shared and may hold another thread's base"
-        );
+        // The global cache itself is not asserted here: it is process-wide and
+        // any other test thread running interpreter code refreshes it via
+        // pyre_stack_too_big_slowpath first-time capture, so its value is racy
+        // by construction — which is exactly why the invariant is read from the
+        // TLS mirror (captured_base) above.
         reset_all();
     }
 }
