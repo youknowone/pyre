@@ -786,6 +786,15 @@ pub struct ExecutionContext {
 
 pub type PyExecutionContext = ExecutionContext;
 
+/// `ExecutionContext.get_builtin()` cache read. This concrete accessor keeps
+/// the rtyper from having to bind generic `std::cell::Cell<T>::get` while
+/// preserving the exact `Cell<PyObjectRef>` storage used by the PyPy-parity
+/// builtin-module cache.
+#[majit_macros::dont_look_inside]
+pub fn execution_context_builtin_cache_get(ec: &ExecutionContext) -> PyObjectRef {
+    ec.builtin_dict_cache.get()
+}
+
 /// Byte offset of `sys_exc_value` within `ExecutionContext`, for the JIT's
 /// GETFIELD_GC/SETFIELD_GC lowering of PUSH_EXC_INFO / POP_EXCEPT.
 pub const EC_SYS_EXC_VALUE_OFFSET: usize = std::mem::offset_of!(ExecutionContext, sys_exc_value);
@@ -1675,7 +1684,7 @@ impl ExecutionContext {
     /// `pick_builtin` `if w_builtin is space.builtin: return space.builtin`)
     /// observe the same object every call.
     pub fn get_builtin(&self) -> PyObjectRef {
-        let cached = self.builtin_dict_cache.get();
+        let cached = execution_context_builtin_cache_get(self);
         if !cached.is_null() {
             return cached;
         }

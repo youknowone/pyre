@@ -570,6 +570,12 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     );
     push_alias_pair(
         &mut entries,
+        "pyre_object::longobject::jit_bigint_sign_i64",
+        "pyre_object::jit_bigint_sign_i64",
+        pyre_object::jit_bigint_sign_i64 as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
         "pyre_object::longobject::jit_bigint_to_f64_or_inf",
         "pyre_object::jit_bigint_to_f64_or_inf",
         pyre_object::jit_bigint_to_f64_or_inf as *const (),
@@ -669,6 +675,24 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::dict_eq_hook::hash_str_hooked",
         "pyre_object::hash_str_hooked",
         pyre_object::dict_eq_hook::hash_str_hooked as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::jit_float_abs",
+        "pyre_interpreter::jit_float_abs",
+        crate::objspace::descroperation::jit_float_abs as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::call::pyre_debug_call_enabled",
+        "pyre_interpreter::pyre_debug_call_enabled",
+        crate::call::pyre_debug_call_enabled as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::executioncontext::execution_context_builtin_cache_get",
+        "pyre_interpreter::execution_context_builtin_cache_get",
+        crate::executioncontext::execution_context_builtin_cache_get as *const (),
     );
     push_alias_pair(
         &mut entries,
@@ -1583,6 +1607,10 @@ pub fn jit_static_int_values() -> Vec<(&'static str, i64)> {
             "tagged_int::CAN_BE_TAGGED",
             pyre_object::tagged_int::CAN_BE_TAGGED as i64,
         ),
+        // `i64::MAX` reached as `core::num::<Impl>::MAX` in `getindex_w`'s
+        // overflow clamp. Charon leaves the associated const as a global
+        // accessor path, so bake the native signed max value.
+        ("core::num::<Impl>::MAX", i64::MAX),
     ]
 }
 

@@ -286,7 +286,7 @@ pub fn box_bigint_constant(value: &BigInt) -> PyObjectRef {
 pub unsafe fn w_long_fits_int(obj: PyObjectRef) -> bool {
     unsafe {
         let big = w_long_get_value(obj);
-        i64::try_from(big).is_ok()
+        jit_bigint_to_i64_fits(big) != 0
     }
 }
 
@@ -340,7 +340,7 @@ pub extern "C" fn jit_w_long_fits_int(obj: i64) -> i64 {
 /// raw op in the same trace.
 pub extern "C" fn jit_bigint_fits_int(num: i64) -> i64 {
     let num = num as *const BigInt;
-    unsafe { i64::try_from(&*num).is_ok() as i64 }
+    unsafe { jit_bigint_to_i64_fits(&*num) }
 }
 
 /// `rbigint.fits_int()` (`rpython/rlib/rbigint.py:490`) on a borrowed
@@ -359,6 +359,18 @@ pub fn jit_bigint_to_i64_value(num: &BigInt) -> i64 {
     i64::try_from(num).unwrap_or_else(|_| {
         panic!("jit_bigint_to_i64_value: BigInt out of i64 range - fits guard violated")
     })
+}
+
+/// `rbigint.sign` / sign-digit use (`rpython/rlib/rbigint.py`) on a borrowed
+/// BigInt payload. Returns the scalar signum (-1, 0, +1) so the two-phase
+/// rtyper never has to model malachite's `Sign` enum ABI.
+#[majit_macros::dont_look_inside]
+pub fn jit_bigint_sign_i64(num: &BigInt) -> i64 {
+    match num.sign() {
+        malachite_bigint::Sign::Minus => -1,
+        malachite_bigint::Sign::NoSign => 0,
+        malachite_bigint::Sign::Plus => 1,
+    }
 }
 
 /// `rbigint.tofloat()` (`rpython/rlib/rbigint.py:503`) on a borrowed BigInt
@@ -552,9 +564,10 @@ pub extern "C" fn jit_w_long_cmp(a: i64, b: i64) -> i64 {
 pub extern "C" fn jit_bigint_result_box(num: i64) -> i64 {
     let num = num as *mut BigInt;
     unsafe {
-        match i64::try_from(&*num) {
-            Ok(v) => crate::intobject::w_int_new(v) as usize as i64,
-            Err(_) => w_long_from_raw(num) as usize as i64,
+        if jit_bigint_to_i64_fits(&*num) != 0 {
+            crate::intobject::w_int_new(jit_bigint_to_i64_value(&*num)) as usize as i64
+        } else {
+            w_long_from_raw(num) as usize as i64
         }
     }
 }

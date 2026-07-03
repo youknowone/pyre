@@ -153,18 +153,18 @@ fn ldexp_pow2(m: f64, mut exp: i64) -> f64 {
 /// Port of CPython `Objects/longobject.c long_true_divide`.
 #[majit_macros::elidable]
 fn bigint_truediv(a: BigInt, b: BigInt) -> Result<f64, PyError> {
-    use malachite_bigint::Sign;
-
-    if b.sign() == Sign::NoSign {
+    let a_sign = pyre_object::longobject::jit_bigint_sign_i64(&a);
+    let b_sign = pyre_object::longobject::jit_bigint_sign_i64(&b);
+    if b_sign == 0 {
         return Err(PyError::zero_division("division by zero"));
     }
-    if a.sign() == Sign::NoSign {
+    if a_sign == 0 {
         return Ok(0.0);
     }
 
-    let negate = (a.sign() == Sign::Minus) != (b.sign() == Sign::Minus);
-    let a_abs = if a.sign() == Sign::Minus { -a } else { a };
-    let b_abs = if b.sign() == Sign::Minus { -b } else { b };
+    let negate = (a_sign < 0) != (b_sign < 0);
+    let a_abs = if a_sign < 0 { -a } else { a };
+    let b_abs = if b_sign < 0 { -b } else { b };
 
     let a_bits = a_abs.bits() as i64;
     let b_bits = b_abs.bits() as i64;
@@ -199,7 +199,7 @@ fn bigint_truediv(a: BigInt, b: BigInt) -> Result<f64, PyError> {
     };
 
     let (q, r) = num.div_rem(&den);
-    let inexact = r.sign() != Sign::NoSign;
+    let inexact = pyre_object::longobject::jit_bigint_sign_i64(&r) != 0;
 
     // Drop the low `extra` bits of `q`, rounding half-to-even with `inexact` as
     // the sticky bit. `extra` is 2 or 3; in the subnormal range the second term
@@ -429,7 +429,7 @@ fn alloc_result_bigint(value: BigInt, collecting: bool) -> i64 {
 /// publishes the exception and returns 0 so the trailing `GUARD_NO_EXCEPTION`
 /// deopts.
 fn bigint_floordiv_core(a: &BigInt, b: &BigInt, collecting: bool) -> i64 {
-    if b.sign() == malachite_bigint::Sign::NoSign {
+    if pyre_object::longobject::jit_bigint_sign_i64(b) == 0 {
         crate::runtime_ops::jit_publish_exception(
             PyError::zero_division("integer division or modulo by zero").to_exc_object(),
         );
@@ -440,7 +440,7 @@ fn bigint_floordiv_core(a: &BigInt, b: &BigInt, collecting: bool) -> i64 {
 }
 
 fn bigint_mod_core(a: &BigInt, b: &BigInt, collecting: bool) -> i64 {
-    if b.sign() == malachite_bigint::Sign::NoSign {
+    if pyre_object::longobject::jit_bigint_sign_i64(b) == 0 {
         // `%` alone reports "integer modulo by zero".
         crate::runtime_ops::jit_publish_exception(
             PyError::zero_division("integer modulo by zero").to_exc_object(),
@@ -452,7 +452,7 @@ fn bigint_mod_core(a: &BigInt, b: &BigInt, collecting: bool) -> i64 {
 }
 
 fn bigint_lshift_core(a: &BigInt, b: &BigInt, collecting: bool) -> i64 {
-    if b.sign() == malachite_bigint::Sign::Minus {
+    if pyre_object::longobject::jit_bigint_sign_i64(b) < 0 {
         crate::runtime_ops::jit_publish_exception(
             PyError::value_error("negative shift count").to_exc_object(),
         );
@@ -463,7 +463,7 @@ fn bigint_lshift_core(a: &BigInt, b: &BigInt, collecting: bool) -> i64 {
     let shift = if jit_bigint_to_i64_fits(b) != 0 {
         jit_bigint_to_i64_value(b) as usize
     } else {
-        if a.sign() == malachite_bigint::Sign::NoSign {
+        if pyre_object::longobject::jit_bigint_sign_i64(a) == 0 {
             return alloc_result_bigint(BigInt::from(0), collecting);
         }
         crate::runtime_ops::jit_publish_exception(
@@ -475,7 +475,7 @@ fn bigint_lshift_core(a: &BigInt, b: &BigInt, collecting: bool) -> i64 {
 }
 
 fn bigint_rshift_core(a: &BigInt, b: &BigInt, collecting: bool) -> i64 {
-    if b.sign() == malachite_bigint::Sign::Minus {
+    if pyre_object::longobject::jit_bigint_sign_i64(b) < 0 {
         crate::runtime_ops::jit_publish_exception(
             PyError::value_error("negative shift count").to_exc_object(),
         );
@@ -486,7 +486,7 @@ fn bigint_rshift_core(a: &BigInt, b: &BigInt, collecting: bool) -> i64 {
     let shift = if jit_bigint_to_i64_fits(b) != 0 {
         jit_bigint_to_i64_value(b) as usize
     } else {
-        let val = if a.sign() == malachite_bigint::Sign::Minus {
+        let val = if pyre_object::longobject::jit_bigint_sign_i64(a) < 0 {
             -1
         } else {
             0
@@ -704,14 +704,14 @@ unsafe fn long_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         return Ok(w_float_new(float_pow_raw(fa, fb)?));
     }
     // longobject.py:229: `if not exp_bigint: return int_pow(0)` → 1.
-    if vb.sign() == malachite_bigint::Sign::NoSign {
+    if pyre_object::longobject::jit_bigint_sign_i64(&vb) == 0 {
         return Ok(w_int_new(1));
     }
     // longobject.py:224-231: rbigint.pow handles arbitrary exponents.
     // Short-circuit trivial bases before the u32 narrowing so that
     // 1 ** huge, (-1) ** huge, 0 ** huge succeed.
     let va = as_bigint(a);
-    if va.sign() == malachite_bigint::Sign::NoSign {
+    if pyre_object::longobject::jit_bigint_sign_i64(&va) == 0 {
         return Ok(w_int_new(0));
     }
     if va == BigInt::from(1) {
@@ -775,7 +775,7 @@ unsafe fn long_lshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         jit_bigint_to_i64_value(&vb) as usize
     } else {
         let va = as_bigint(a);
-        if va.sign() == malachite_bigint::Sign::NoSign {
+        if pyre_object::longobject::jit_bigint_sign_i64(&va) == 0 {
             return Ok(w_int_new(0));
         }
         return Err(PyError::overflow_error("shift count too large"));
@@ -794,11 +794,13 @@ unsafe fn long_rshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         jit_bigint_to_i64_value(&vb) as usize
     } else {
         let va = as_bigint(a);
-        return Ok(w_int_new(if va.sign() == malachite_bigint::Sign::Minus {
-            -1
-        } else {
-            0
-        }));
+        return Ok(w_int_new(
+            if pyre_object::longobject::jit_bigint_sign_i64(&va) < 0 {
+                -1
+            } else {
+                0
+            },
+        ));
     };
     Ok(bigint_result(bigint_rshift(as_bigint(a), shift)))
 }
@@ -2538,6 +2540,15 @@ enum FloatPowError {
     Py(PyError),
 }
 
+/// Float scalar helper for the rtyper residual surface. Mirrors RPython's
+/// lltype-level math helper pattern (`rpython/rtyper/lltypesystem/module/
+/// ll_math.py`) while keeping Rust's `f64::abs` intrinsic ABI out of the
+/// two-phase rtyper.
+#[majit_macros::dont_look_inside]
+pub fn jit_float_abs(v: f64) -> f64 {
+    v.abs()
+}
+
 /// floatobject.py:865 `_pow`.
 fn float_pow_inner(x: f64, y: f64) -> Result<f64, FloatPowError> {
     // floatobject.py:800-801
@@ -2558,7 +2569,7 @@ fn float_pow_inner(x: f64, y: f64) -> Result<f64, FloatPowError> {
     }
     // floatobject.py:815-827
     if y.is_infinite() {
-        let ax = x.abs();
+        let ax = jit_float_abs(x);
         if ax == 1.0 {
             return Ok(1.0);
         }
@@ -2570,9 +2581,9 @@ fn float_pow_inner(x: f64, y: f64) -> Result<f64, FloatPowError> {
     }
     // floatobject.py:828-842
     if x.is_infinite() {
-        let y_is_odd = y.abs() % 2.0 == 1.0;
+        let y_is_odd = jit_float_abs(y) % 2.0 == 1.0;
         return Ok(if y > 0.0 {
-            if y_is_odd { x } else { x.abs() }
+            if y_is_odd { x } else { jit_float_abs(x) }
         } else if y_is_odd {
             float_copysign(0.0, x)
         } else {
@@ -2593,7 +2604,7 @@ fn float_pow_inner(x: f64, y: f64) -> Result<f64, FloatPowError> {
             return Err(FloatPowError::Domain);
         }
         bx = -bx;
-        negate_result = y.abs() % 2.0 == 1.0;
+        negate_result = jit_float_abs(y) % 2.0 == 1.0;
     }
     // floatobject.py:864-869
     if bx == 1.0 {

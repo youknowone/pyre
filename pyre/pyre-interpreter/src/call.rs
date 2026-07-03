@@ -83,6 +83,15 @@ pub fn clear_call_error() {
         slot.borrow_mut().take();
     });
 }
+
+/// Cold debug flag probe for `call_function_impl_raw`. This is a
+/// `dont_look_inside` scalar wrapper so the two-phase rtyper sees a plain
+/// bool residual instead of `std::env::var`'s `Result<String, VarError>` ABI.
+#[majit_macros::dont_look_inside]
+pub fn pyre_debug_call_enabled() -> bool {
+    std::env::var("PYRE_DEBUG_CALL").is_ok()
+}
+
 use pyre_object::{PY_NULL, PyObjectRef};
 
 use crate::eval::eval_frame_plain;
@@ -1825,7 +1834,7 @@ pub fn call_function_impl_raw(callable: PyObjectRef, args: &[PyObjectRef]) -> Py
     match call_function_impl_result(callable, args) {
         Ok(result) => result,
         Err(e) => {
-            if std::env::var("PYRE_DEBUG_CALL").is_ok() {
+            if pyre_debug_call_enabled() {
                 eprintln!("[call_function_impl] error: {}", e.message);
             }
             set_call_error(e);
