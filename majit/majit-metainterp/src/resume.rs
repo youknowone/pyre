@@ -456,9 +456,7 @@ impl BoxEnv for SimpleBoxEnv {
         // keyed liveboxes/cached maps reject a position-only box). The method
         // is never reached in non-test builds, where `from_opref` is retained.
         #[cfg(test)]
-        let b = majit_ir::operand::Operand::from_boxref(
-            &crate::history::test_support::rooted_box_from_opref(root),
-        );
+        let b = crate::history::test_support::rooted_operand_from_opref(root);
         #[cfg(not(test))]
         let b = majit_ir::operand::Operand::from_opref(root);
         self.box_cache.borrow_mut().insert(root, b.clone());
@@ -4580,12 +4578,10 @@ mod tests {
         // bound to a rooted producer so they shed to Operand::InputArg / Op.
         // Under ptr_eq keying they stay distinct keys (PyPy `box is box`),
         // never collapsed by a shared raw slot index.
-        let input = majit_ir::operand::Operand::from_boxref(
-            &crate::history::test_support::rooted_box_from_opref(majit_ir::OpRef::input_arg_int(0)),
-        );
-        let op = majit_ir::operand::Operand::from_boxref(
-            &crate::history::test_support::rooted_box_from_opref(majit_ir::OpRef::int_op(0)),
-        );
+        let input =
+            crate::history::test_support::rooted_operand_from_opref(majit_ir::OpRef::input_arg_int(0));
+        let op =
+            crate::history::test_support::rooted_operand_from_opref(majit_ir::OpRef::int_op(0));
 
         liveboxes.insert(input.clone(), UNASSIGNED);
         liveboxes.insert(op.clone(), UNASSIGNEDVIRTUAL);
@@ -4953,9 +4949,7 @@ mod tests {
                 }
                 // Synthesize a rooted bound producer so the box sheds to
                 // `Operand::Op`/`InputArg` for the Operand-keyed liveboxes map.
-                let b = majit_ir::operand::Operand::from_boxref(
-                    &crate::history::test_support::rooted_box_from_opref(root),
-                );
+                let b = crate::history::test_support::rooted_operand_from_opref(root);
                 self.box_cache.borrow_mut().insert(root, b.clone());
                 b
             }

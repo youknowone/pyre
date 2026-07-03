@@ -5306,7 +5306,7 @@ impl Default for Optimizer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::history::test_support::{rooted_resop_box, rooted_resop_operand};
+    use crate::history::test_support::rooted_resop_operand;
     use majit_ir::Type;
     use majit_ir::descr::make_size_descr;
     use majit_ir::descr::{CallDescr, EffectInfo, ExtraEffect, OopSpecIndex};
@@ -5866,17 +5866,16 @@ mod tests {
             majit_ir::Type::Ref,
         ];
 
-        // Position-only op-args / fail-args replaced by the `rooted_resop_box`
-        // drop-in (box_ref.rs test_support: a bound ResOp box whose synthetic
-        // producer is rooted in the thread-local pool; sheds to `Operand::Op`,
-        // `to_opref`s to the same `(type, position)` so position-keyed
-        // resolution is unchanged). CallMayForceR's result is consumed as a Ref
-        // by the getfields/fail-args, so its result refs are `Type::Ref` at the
-        // call position; the resume-only free fail-vars (2000..3003) and the
-        // dangling positions stay `Type::Int` exactly as the fixture wired them.
-        // Detached fail-arg synthetics resolve to themselves (the `same_box`
-        // arm, mod.rs:4637), deferring to the OpRef store — no `Operand::Box`.
-        use crate::history::test_support::rooted_resop_box;
+        // Position-only op-args / fail-args replaced by the `rooted_resop_operand`
+        // drop-in (a bound ResOp operand whose synthetic producer is rooted in
+        // the thread-local pool; sheds to `Operand::Op`, `to_opref`s to the same
+        // `(type, position)` so position-keyed resolution is unchanged).
+        // CallMayForceR's result is consumed as a Ref by the getfields/fail-args,
+        // so its result refs are `Type::Ref` at the call position; the resume-only
+        // free fail-vars (2000..3003) and the dangling positions stay `Type::Int`
+        // exactly as the fixture wired them. Detached fail-arg synthetics resolve
+        // to themselves (the `same_box` arm, mod.rs:4637), deferring to the OpRef
+        // store — no `Operand::Box`.
         let mut call_a = Op::with_descr(
             OpCode::CallMayForceR,
             &[
@@ -6946,7 +6945,7 @@ mod tests {
         let (ops, inputs) = b.build();
         // The GuardTrue (ops[1]) keeps both header inputs as fail args; bind
         // them to the same canonical InputArg boxes the header threads.
-        ops[1].setfailargs(vec![Operand::from_boxref(&x), Operand::from_boxref(&y)].into());
+        ops[1].setfailargs(vec![x.clone(), y.clone()].into());
         opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
         let num_inputs = inputs.len();
         opt.snapshot_boxes = seed_guard_snapshots_with_oprc(&ops, |_| vec![x_ref, y_ref]);

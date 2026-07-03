@@ -3774,9 +3774,7 @@ mod tests {
     use majit_ir::operand::Operand;
 
     use super::OptHeap;
-    use crate::history::test_support::{
-        rooted_inputarg_operand, rooted_resop_box, rooted_resop_operand,
-    };
+    use crate::history::test_support::{rooted_inputarg_operand, rooted_resop_operand};
 
     /// oparser-faithful drop-in for `BoxRef::from_opref(o)` at op-arg /
     /// fail-arg sites where `o` is a bound-at-runtime `OpRef`. Constants shed
@@ -4577,14 +4575,14 @@ mod tests {
     fn test_getarrayitem_non_pure_invalidated_by_setarrayitem() {
         let d = descr(0);
         let idx = OpRef::int_op(50);
-        let new_val_box = rooted_resop_box(Type::Ref, 102);
+        let new_val_box = rooted_resop_operand(Type::Ref, 102);
         let mut ops = vec![
             // r1 = getarrayitem_gc_r(p0, i_idx)
             Op::with_descr(
                 OpCode::GetarrayitemGcR,
                 &[
-                    Operand::from_boxref(&rooted_resop_box(Type::Ref, 100)),
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, idx.raw())),
+                    rooted_resop_operand(Type::Ref, 100),
+                    rooted_resop_operand(Type::Int, idx.raw()),
                 ],
                 d.clone(),
             ),
@@ -4592,9 +4590,9 @@ mod tests {
             Op::with_descr(
                 OpCode::SetarrayitemGc,
                 &[
-                    Operand::from_boxref(&rooted_resop_box(Type::Ref, 100)),
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, idx.raw())),
-                    Operand::from_boxref(&new_val_box),
+                    rooted_resop_operand(Type::Ref, 100),
+                    rooted_resop_operand(Type::Int, idx.raw()),
+                    new_val_box.clone(),
                 ],
                 d.clone(),
             ),
@@ -4602,8 +4600,8 @@ mod tests {
             Op::with_descr(
                 OpCode::GetarrayitemGcR,
                 &[
-                    Operand::from_boxref(&rooted_resop_box(Type::Ref, 100)),
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, idx.raw())),
+                    rooted_resop_operand(Type::Ref, 100),
+                    rooted_resop_operand(Type::Int, idx.raw()),
                 ],
                 d.clone(),
             ),

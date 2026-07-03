@@ -2792,7 +2792,6 @@ impl Drop for Trace {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use majit_ir::box_ref::BoxRef;
     use std::sync::Arc;
 
     /// Test fixture equivalent of RPython's `metainterp_sd` fixture used
@@ -2897,29 +2896,11 @@ mod tests {
         OpRef::void_op(pos)
     }
 
-    /// Bind a position-only `OpRef` arg to a producer-bound `BoxRef`,
+    /// Bind a position-only `OpRef` arg to a producer-bound `Operand`,
     /// oparser-faithful (`rpython/jit/tool/oparser.py` `self.vars[arg]`):
     /// body / inputarg refs shed to `Operand::Op` / `Operand::InputArg` via
     /// the rooted drop-in (same `to_opref()`), constants shed to
-    /// `Operand::Const`. Neither mints the position-only `Operand::Box`.
-    fn box_arg(opref: OpRef) -> BoxRef {
-        use crate::history::test_support::{rooted_inputarg_box, rooted_resop_box};
-        use majit_ir::Type;
-        match opref {
-            OpRef::InputArgInt(x) => rooted_inputarg_box(Type::Int, x),
-            OpRef::InputArgFloat(x) => rooted_inputarg_box(Type::Float, x),
-            OpRef::InputArgRef(x) => rooted_inputarg_box(Type::Ref, x),
-            OpRef::IntOp(x) => rooted_resop_box(Type::Int, x),
-            OpRef::FloatOp(x) => rooted_resop_box(Type::Float, x),
-            OpRef::RefOp(x) => rooted_resop_box(Type::Ref, x),
-            OpRef::VoidOp(x) => rooted_resop_box(Type::Void, x),
-            // Constants / None shed without minting Operand::Box.
-            _ => BoxRef::from_opref(opref),
-        }
-    }
-
-    /// `Operand`-returning twin of [`box_arg`]: identical resolution, but yields
-    /// the `Operand` directly (== `Operand::from_boxref(&box_arg(opref))`).
+    /// `Operand::Const`.
     fn box_arg_operand(opref: OpRef) -> majit_ir::operand::Operand {
         use crate::history::test_support::{rooted_inputarg_operand, rooted_resop_operand};
         use majit_ir::Type;

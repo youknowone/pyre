@@ -2141,40 +2141,13 @@ mod tests {
 
     fn make_op(opcode: OpCode, args: &[OpRef], pos: u32) -> Op {
         // oparser-faithful (rpython/jit/tool/oparser.py): each position-only
-        // ResOp arg is bound to a synthetic producer of the matching type so
-        // it sheds to `Operand::Op` (not the position-only `Operand::Box`);
-        // constant / input-arg / none refs shed to `Operand::Const` /
-        // `Operand::InputArg` / nothing via `from_opref` and never mint.
-        let box_args: Vec<majit_ir::box_ref::BoxRef> = args
+        // ResOp / InputArg arg is bound to a rooted synthetic producer of the
+        // matching type so it sheds to `Operand::Op` / `Operand::InputArg`;
+        // constant / none refs shed to `Operand::Const` / nothing and never
+        // mint.
+        let op_args: Vec<majit_ir::operand::Operand> = args
             .iter()
-            .map(|a| match *a {
-                OpRef::IntOp(n) => {
-                    crate::history::test_support::rooted_resop_box(majit_ir::Type::Int, n)
-                }
-                OpRef::FloatOp(n) => {
-                    crate::history::test_support::rooted_resop_box(majit_ir::Type::Float, n)
-                }
-                OpRef::RefOp(n) => {
-                    crate::history::test_support::rooted_resop_box(majit_ir::Type::Ref, n)
-                }
-                OpRef::VoidOp(n) => {
-                    crate::history::test_support::rooted_resop_box(majit_ir::Type::Void, n)
-                }
-                OpRef::InputArgInt(n) => {
-                    crate::history::test_support::rooted_inputarg_box(majit_ir::Type::Int, n)
-                }
-                OpRef::InputArgFloat(n) => {
-                    crate::history::test_support::rooted_inputarg_box(majit_ir::Type::Float, n)
-                }
-                OpRef::InputArgRef(n) => {
-                    crate::history::test_support::rooted_inputarg_box(majit_ir::Type::Ref, n)
-                }
-                other => majit_ir::box_ref::BoxRef::from_opref(other),
-            })
-            .collect();
-        let op_args: Vec<majit_ir::operand::Operand> = box_args
-            .iter()
-            .map(majit_ir::operand::Operand::from_boxref)
+            .map(|a| crate::history::test_support::rooted_operand_from_opref(*a))
             .collect();
         let mut op = Op::new(opcode, &op_args);
         op.pos.set(OpRef::op_typed(pos, op.result_type()));

@@ -2337,7 +2337,6 @@ mod tests {
     use super::*;
     use crate::optimizeopt::optimizer::Optimizer;
     use majit_ir::GcRef;
-    use majit_ir::box_ref::BoxRef;
 
     /// Producer-position trace spec. A consumer's `args` name the result
     /// positions of earlier producers in the same spec slice, so no op-arg
@@ -3483,9 +3482,9 @@ mod tests {
         // Bound oparser graph: i0/i1 are header InputArgs, v = IntGt(i0, i1)
         // a live producer, and GUARD_VALUE's expected operand is the literal
         // ConstInt(0) — so every arg sheds to Operand::{InputArg,Op,Const}.
-        use crate::history::test_support::bound_inputarg_box;
-        let (_i0, i0_rc) = bound_inputarg_box(majit_ir::Type::Int, 0);
-        let (_i1, i1_rc) = bound_inputarg_box(majit_ir::Type::Int, 1);
+        use crate::history::test_support::bound_inputarg_operand;
+        let (_i0, i0_rc) = bound_inputarg_operand(majit_ir::Type::Int, 0);
+        let (_i1, i1_rc) = bound_inputarg_operand(majit_ir::Type::Int, 1);
         // A live producer for v (IntGt result) at int_op(2); the OpRc is held
         // in `int_gt` so the from_bound_op box's Weak upgrade stays live.
         let int_gt = std::rc::Rc::new(Op::new(
@@ -3558,7 +3557,7 @@ mod tests {
         // x * (-1.0) → FLOAT_NEG(x)
         let mut b = crate::history::test_support::TraceBuilder::new();
         let x = b.input(majit_ir::Type::Float, 0);
-        let neg_one = BoxRef::new_const(Value::Float(-1.0));
+        let neg_one = Operand::const_from_value(Value::Float(-1.0));
         let prod = b.op(OpCode::FloatMul, &[x, neg_one]);
         b.op(OpCode::Finish, &[prod]);
         let (ops, inputs) = b.build();
@@ -3578,7 +3577,7 @@ mod tests {
     fn test_cond_call_n_zero_removes() {
         // COND_CALL_N(0, func, args...) → removed (condition is false)
         let mut b = crate::history::test_support::TraceBuilder::new();
-        let cond = BoxRef::new_const(Value::Int(0));
+        let cond = Operand::const_from_value(Value::Int(0));
         let func = b.input(majit_ir::Type::Int, 0);
         let arg = b.input(majit_ir::Type::Int, 1);
         b.op(OpCode::CondCallN, &[cond, func, arg]);
@@ -3602,7 +3601,7 @@ mod tests {
     fn test_cond_call_n_nonzero_converts() {
         // COND_CALL_N(1, func, args...) → CALL_N(func, args...)
         let mut b = crate::history::test_support::TraceBuilder::new();
-        let cond = BoxRef::new_const(Value::Int(1));
+        let cond = Operand::const_from_value(Value::Int(1));
         let func = b.input(majit_ir::Type::Int, 0);
         let arg = b.input(majit_ir::Type::Int, 1);
         b.op(OpCode::CondCallN, &[cond, func, arg]);

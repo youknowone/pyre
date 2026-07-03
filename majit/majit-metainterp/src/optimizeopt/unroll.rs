@@ -5522,7 +5522,7 @@ impl Optimization for OptUnroll {
 mod tests {
     use super::*;
     use crate::history::test_support::{
-        rooted_inputarg_operand, rooted_resop_box, rooted_resop_operand,
+        rooted_inputarg_operand, rooted_resop_operand,
     };
     use crate::optimizeopt::optimizer::Optimizer;
     use majit_ir::GcRef;
@@ -6576,11 +6576,11 @@ mod tests {
         // (optimizer.rs:2937/2942 set `exported_short_inputargs` and
         // `exported_short_inputarg_refs` in lockstep); the context channel
         // stores their positions.
-        let (si0, ia0) = crate::history::test_support::bound_inputarg_box(
+        let (si0, ia0) = crate::history::test_support::bound_inputarg_operand(
             Type::Int,
             ctx.alloc_op_position_typed(Type::Int).raw(),
         );
-        let (si1, ia1) = crate::history::test_support::bound_inputarg_box(
+        let (si1, ia1) = crate::history::test_support::bound_inputarg_operand(
             Type::Int,
             ctx.alloc_op_position_typed(Type::Int).raw(),
         );
@@ -6591,7 +6591,7 @@ mod tests {
                 op: {
                     let mut op = Op::with_descr(
                         OpCode::GetfieldGcI,
-                        &[Operand::from_boxref(&si0)],
+                        &[si0.clone()],
                         field_descr.clone(),
                     );
                     op.pos.set(OpRef::int_op(11));
@@ -7031,15 +7031,15 @@ mod tests {
         // pool, matching production (optimizer.rs:2937/2942 set
         // `exported_short_inputargs` / `exported_short_inputarg_refs` in
         // lockstep); the context channel stores their positions.
-        let (si0, ia0) = crate::history::test_support::bound_inputarg_box(
+        let (si0, ia0) = crate::history::test_support::bound_inputarg_operand(
             Type::Int,
             ctx.alloc_op_position_typed(Type::Int).raw(),
         );
-        let (si1, ia1) = crate::history::test_support::bound_inputarg_box(
+        let (si1, ia1) = crate::history::test_support::bound_inputarg_operand(
             Type::Int,
             ctx.alloc_op_position_typed(Type::Int).raw(),
         );
-        let (si2, ia2) = crate::history::test_support::bound_inputarg_box(
+        let (si2, ia2) = crate::history::test_support::bound_inputarg_operand(
             Type::Int,
             ctx.alloc_op_position_typed(Type::Int).raw(),
         );
@@ -7048,10 +7048,7 @@ mod tests {
         ctx.exported_short_boxes
             .push(crate::optimizeopt::shortpreamble::PreambleOp {
                 op: {
-                    let mut op = Op::new(
-                        OpCode::IntAdd,
-                        &[Operand::from_boxref(&si0), Operand::from_boxref(&si1)],
-                    );
+                    let mut op = Op::new(OpCode::IntAdd, &[si0.clone(), si1.clone()]);
                     op.pos.set(OpRef::int_op(30));
                     std::rc::Rc::new(op)
                 },

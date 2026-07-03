@@ -94,7 +94,7 @@ impl Optimization for OptSimplify {
 mod tests {
     use super::*;
     use crate::history::test_support::TraceBuilder;
-    use majit_ir::box_ref::BoxRef;
+    use majit_ir::operand::Operand;
     use majit_ir::{OpRc, OpRef, Type};
 
     /// Seed empty guard snapshots over the canonical `OpRc` slice in place
@@ -216,7 +216,7 @@ mod tests {
             let arity = opcode.arity().unwrap_or(0) as u32;
             // `arity` header inputargs, then the op consuming them.
             let mut b = TraceBuilder::new();
-            let args: Vec<BoxRef> = (0..arity).map(|i| b.input(Type::Int, i)).collect();
+            let args: Vec<Operand> = (0..arity).map(|i| b.input(Type::Int, i)).collect();
             b.op(opcode, &args);
             let result = run_trace(b);
             assert!(result.is_empty(), "{:?} should be removed", opcode);

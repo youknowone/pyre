@@ -35,7 +35,6 @@ use majit_ir::operand::Operand;
 use majit_ir::vec_set::VecSet;
 use majit_ir::{GcRef, Op, OpCode, OpRef};
 
-use majit_ir::box_ref::BoxRef;
 
 use crate::optimizeopt::virtualstate::VirtualState;
 use majit_ir::VecMap;
@@ -3361,13 +3360,12 @@ fn build_short_preamble_from_exported_boxes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::history::test_support::{rooted_resop_box, rooted_resop_operand};
+    use crate::history::test_support::rooted_resop_operand;
     use majit_ir::operand::Operand;
     use majit_ir::{Op, OpCode, OpRc, OpRef, Type};
 
     /// oparser-faithful op-arg minter: a rooted resop producer shed to its
-    /// `Operand::Op` face (`from_boxref`). Op-arg slices take `Operand`, while
-    /// fail-args / builder side-tables keep the bare `rooted_resop_box` BoxRef.
+    /// `Operand::Op` face. Op-arg slices take `Operand`.
     fn rop(ty: Type, pos: u32) -> Operand {
         rooted_resop_operand(ty, pos)
     }
@@ -3664,32 +3662,26 @@ mod tests {
         // so the dependency lookup hits and `Op::new` round-trips the same box
         // through `getarglist()` (vs a position-only `from_opref`, which would
         // mint a non-`ptr_eq` arg box).
-        let in0 = rooted_resop_box(Type::Int, 0);
-        let in1 = rooted_resop_box(Type::Int, 1);
+        let in0 = rooted_resop_operand(Type::Int, 0);
+        let in1 = rooted_resop_operand(Type::Int, 1);
         let producer7 = {
-            let mut op = Op::new(
-                OpCode::IntAdd,
-                &[Operand::from_boxref(&in0), Operand::from_boxref(&in1)],
-            );
+            let mut op = Op::new(OpCode::IntAdd, &[in0.clone(), in1.clone()]);
             op.pos.set(OpRef::int_op(7));
             std::rc::Rc::new(op)
         };
-        let res7 = BoxRef::from_bound_op(&producer7);
+        let res7 = Operand::from_bound_op(&producer7);
         let producer8 = {
-            let mut op = Op::new(
-                OpCode::IntMul,
-                &[Operand::from_boxref(&res7), Operand::from_boxref(&in1)],
-            );
+            let mut op = Op::new(OpCode::IntMul, &[res7.clone(), in1.clone()]);
             op.pos.set(OpRef::int_op(8));
             std::rc::Rc::new(op)
         };
-        let res8 = BoxRef::from_bound_op(&producer8);
+        let res8 = Operand::from_bound_op(&producer8);
         let produced = vec![
             (
-                Operand::from_boxref(&res7),
+                res7.clone(),
                 ProducedShortOp {
                     kind: PreambleOpKind::Pure,
-                    res: Operand::from_boxref(&res7),
+                    res: res7.clone(),
                     preamble_op: producer7,
                     invented_name: false,
                     same_as_source: None,
@@ -3697,10 +3689,10 @@ mod tests {
                 },
             ),
             (
-                Operand::from_boxref(&res8),
+                res8.clone(),
                 ProducedShortOp {
                     kind: PreambleOpKind::Pure,
-                    res: Operand::from_boxref(&res8),
+                    res: res8.clone(),
                     preamble_op: producer8,
                     invented_name: false,
                     same_as_source: None,
@@ -3714,11 +3706,9 @@ mod tests {
             &[OpRef::int_op(0), OpRef::int_op(1)],
         );
 
-        let used = builder
-            .add_op_to_short(&Operand::from_boxref(&res8))
-            .unwrap();
-        assert!(builder.add_preamble_op(&Operand::from_boxref(&res7)));
-        assert!(builder.add_preamble_op(&Operand::from_boxref(&res8)));
+        let used = builder.add_op_to_short(&res8).unwrap();
+        assert!(builder.add_preamble_op(&res7));
+        assert!(builder.add_preamble_op(&res8));
         assert_eq!(used.opcode, OpCode::IntMul);
         let short = builder.build_short_preamble();
         assert_eq!(short[1].opcode, OpCode::IntAdd);

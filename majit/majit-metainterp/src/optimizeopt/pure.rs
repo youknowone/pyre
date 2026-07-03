@@ -1304,7 +1304,6 @@ impl Optimization for OptPure {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use majit_ir::box_ref::BoxRef;
 
     fn initialize_imported_short_pure_builder(
         ctx: &mut OptContext,
@@ -1377,18 +1376,18 @@ mod tests {
 
     /// One argument of an [`OpSpec`] in the oparser-faithful bound DAG
     /// (`rpython/jit/tool/oparser.py`). Each variant resolves to a *bound*
-    /// `BoxRef` at [`build_trace`] time so the arg sheds to
+    /// `Operand` at [`build_trace`] time so the arg sheds to
     /// `Operand::{InputArg,Op,Const}` — never the position-only
-    /// `Operand::Box` minted by `BoxRef::from_opref`.
+    /// `Operand::Box`.
     #[derive(Clone)]
     enum Arg {
-        /// Header input var (oparser `[i0]`): `BoxRef::new_inputarg` bound
-        /// to a rooted `InputArg`, sheds to `Operand::InputArg`.
+        /// Header input var (oparser `[i0]`): a rooted `InputArg`-bound
+        /// operand, sheds to `Operand::InputArg`.
         In(u32),
         /// Earlier producer's result, referenced by the producing op's
         /// index in the spec slice (`from_bound_op`, sheds to `Operand::Op`).
         Prod(usize),
-        /// Const literal arg (`BoxRef::new_const`, sheds to `Operand::Const`).
+        /// Const literal arg (`const_from_value`, sheds to `Operand::Const`).
         Const(Value),
     }
 
@@ -1431,9 +1430,9 @@ mod tests {
         let mut input_types = vec![Type::Int; num_inputs as usize];
         let mut ops: Vec<OpRc> = Vec::new();
         // Lazily bind a header input box, recording its type from first use.
-        let mut input_boxes: Vec<Option<BoxRef>> = vec![None; num_inputs as usize];
+        let mut input_boxes: Vec<Option<Operand>> = vec![None; num_inputs as usize];
         for (i, spec) in specs.iter().enumerate() {
-            let args: Vec<BoxRef> = spec
+            let arg_ops: Vec<Operand> = spec
                 .args
                 .iter()
                 .map(|a| match a {
@@ -1441,15 +1440,16 @@ mod tests {
                         let slot = *idx as usize;
                         input_boxes[slot]
                             .get_or_insert_with(|| {
-                                crate::history::test_support::rooted_inputarg_box(Type::Int, *idx)
+                                crate::history::test_support::rooted_inputarg_operand(
+                                    Type::Int, *idx,
+                                )
                             })
                             .clone()
                     }
-                    Arg::Prod(pos) => BoxRef::from_bound_op(&ops[*pos]),
-                    Arg::Const(v) => BoxRef::new_const(*v),
+                    Arg::Prod(pos) => Operand::from_bound_op(&ops[*pos]),
+                    Arg::Const(v) => Operand::const_from_value(*v),
                 })
                 .collect();
-            let arg_ops: Vec<Operand> = args.iter().map(Operand::from_boxref).collect();
             let op = match &spec.descr {
                 Some(d) => std::rc::Rc::new(Op::with_descr(spec.opcode, &arg_ops, d.clone())),
                 None => std::rc::Rc::new(Op::new(spec.opcode, &arg_ops)),
