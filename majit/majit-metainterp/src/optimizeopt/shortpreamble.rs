@@ -2028,13 +2028,13 @@ impl AbstractShortPreambleBuilderState {
         &mut self,
         op: majit_ir::operand::Operand,
         replay_op: &majit_ir::OpRc,
-        invented_name: bool,
+        needs_alias: bool,
         same_as_source: Option<majit_ir::operand::Operand>,
     ) {
         if !self.recorded_canonical_results.insert(replay_op.pos.get()) {
             return;
         }
-        if invented_name {
+        if needs_alias {
             // shortpreamble.py:436-437: extra_same_as carries the resolved
             // box itself; a producer-bound box sheds to a live operand.
             //
@@ -2047,7 +2047,7 @@ impl AbstractShortPreambleBuilderState {
             // kept as a release safety net.
             debug_assert!(
                 same_as_source.is_some(),
-                "invented_name without same_as_source at {:?}",
+                "needs_alias without same_as_source at {:?}",
                 replay_op.pos.get()
             );
             let source = same_as_source.unwrap_or_else(|| op.clone());
@@ -2428,16 +2428,40 @@ impl ShortPreambleBuilder {
         // threaded through `field_entry::PreambleOp` — so the
         // produced_short_boxes lookup is no longer consulted here (#149/S8f).
         let replay_op = &preamble_op.preamble_op;
+        // shortpreamble.py:435 `op = preamble_op.op.get_box_replacement()`:
+        // for non-invented entries the resolved Box IS the preamble-defined
+        // res, so the `used_boxes` label slot always has a producer at
+        // label fall-through. pyre's Cat-2.2 heap import resolves through
+        // `make_equal_to(source, result)` to a fresh body-visible OpRef with
+        // NO preamble producer — the flat-OpRef analogue of an invented
+        // name. Emit the same defining alias the invented arm uses
+        // (`same_as(resolved) = carried preamble box`) whenever the resolved
+        // slot differs from the carried box, so the extended label slot is
+        // defined in the preamble exactly as upstream's Box identity
+        // guarantees.
+        let (needs_alias, alias_source) = if preamble_op.invented_name {
+            (
+                true,
+                preamble_op
+                    .same_as_source
+                    .as_ref()
+                    .map(majit_ir::operand::Operand::from_boxref),
+            )
+        } else if resolved_op.to_opref() != preamble_op.op.to_opref() {
+            (
+                true,
+                Some(majit_ir::operand::Operand::from_boxref(&preamble_op.op)),
+            )
+        } else {
+            (false, None)
+        };
         // The info-force `PreambleOp` still carries BoxRef; shed its bound
         // producer boxes to operands for the operand-carrying record API.
         self.state.record_imported_preamble_use(
             majit_ir::operand::Operand::from_boxref(&resolved_op),
             replay_op,
-            preamble_op.invented_name,
-            preamble_op
-                .same_as_source
-                .as_ref()
-                .map(majit_ir::operand::Operand::from_boxref),
+            needs_alias,
+            alias_source,
         );
     }
 
@@ -2914,7 +2938,12 @@ impl ExtendedShortPreambleBuilder {
                 return;
             }
             let op = resolved_key;
-            if preamble_op.invented_name {
+            // shortpreamble.py:436-437 plus the Cat-2.2 fresh-slot case: a
+            // non-invented pop whose resolved slot differs from the carried
+            // preamble box has no preamble producer for the label slot (see
+            // ShortPreambleBuilder::add_preamble_op_from_pop); emit the same
+            // defining alias with the carried box as source.
+            let alias_source = if preamble_op.invented_name {
                 // shortpreamble.py:436-437: alias the carried original
                 // (same_as_source), matching `add_tracked_preamble_op`; the
                 // resolved box is the release fallback when none was threaded.
@@ -2923,10 +2952,18 @@ impl ExtendedShortPreambleBuilder {
                     "invented_name without same_as_source at {:?}",
                     replay_op.pos.get()
                 );
-                let source = preamble_op
-                    .same_as_source
-                    .clone()
-                    .unwrap_or_else(|| resolved_op.clone());
+                Some(
+                    preamble_op
+                        .same_as_source
+                        .clone()
+                        .unwrap_or_else(|| resolved_op.clone()),
+                )
+            } else if resolved_key != preamble_op.op.to_opref() {
+                Some(preamble_op.op.clone())
+            } else {
+                None
+            };
+            if let Some(source) = alias_source {
                 let mut same_as = Op::new(
                     OpCode::same_as_for_type(replay_op.result_type()),
                     &[majit_ir::operand::Operand::from_boxref(&source)],
