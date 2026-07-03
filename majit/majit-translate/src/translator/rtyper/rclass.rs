@@ -3856,6 +3856,13 @@ impl Repr for InstanceRepr {
             //              self.classdef: raise TyperError(...)`.
             //   Subclass-relationship check; self must be a base of the
             //   value's class.
+            // When `self.classdef` is None — the root `object` InstanceRepr,
+            // which pyre's `Ref(None)` erasure lands a known-class constant on
+            // — upstream `classdef.commonbase(self.classdef)` returns None (the
+            // `while other is not None` loop exits immediately), so `None !=
+            // None` is false and the delegate path below applies
+            // unconditionally: the root is a base of every class. Only run the
+            // subclass-relationship guard for a concrete `self.classdef`.
             if let Some(self_cd) = self.classdef.as_ref() {
                 let common = ClassDef::commonbase(&classdef, self_cd).ok_or_else(|| {
                     TyperError::message(format!(
