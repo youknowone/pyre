@@ -1076,8 +1076,20 @@ pub extern "C" fn jit_sequence_getitem(seq: i64, index: i64) -> i64 {
 }
 
 pub fn unpack_sequence_exact(seq: PyObjectRef, count: usize) -> Result<Vec<PyObjectRef>, PyError> {
-    // Fast path for known sequence types
-    if let Ok(len) = sequence_len(seq) {
+    // Fast path only for exact built-in sequence types. Subclasses and other
+    // instances may define custom `__iter__` that must be honored.
+    let exact_sequence_len = unsafe {
+        if pyre_object::is_exact_tuple(seq) {
+            Some(w_tuple_len(seq))
+        } else if pyre_object::is_exact_list(seq) {
+            Some(w_list_len(seq))
+        } else if pyre_object::is_exact_type(seq, &pyre_object::STR_TYPE) {
+            Some(w_str_len(seq))
+        } else {
+            None
+        }
+    };
+    if let Some(len) = exact_sequence_len {
         if len != count {
             // `baseobjspace.py:1041-1053 _unpackiterable_known_length_jitlook`
             // raises ValueError on length mismatch.

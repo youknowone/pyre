@@ -19,7 +19,13 @@ use std::sync::OnceLock;
 fn sys_namespace_type() -> PyObjectRef {
     static TYPE: OnceLock<usize> = OnceLock::new();
     let raw = *TYPE.get_or_init(|| {
-        let tp = crate::typedef::make_builtin_type("sys.namespace", |_| {});
+        let tp = crate::typedef::make_builtin_type("sys.namespace", |ns| {
+            crate::dict_storage_store(
+                ns,
+                "__init__",
+                crate::make_builtin_function("__init__", sys_namespace_init),
+            );
+        });
         // The stubs want a per-instance mapdict store; a `__dict__`
         // rawdict key would instead claim the typedef manages the dict
         // (typedef.py:40) and suppress the mapdict one
@@ -29,6 +35,33 @@ fn sys_namespace_type() -> PyObjectRef {
         tp as usize
     });
     raw as PyObjectRef
+}
+
+fn sys_namespace_init(args: &[PyObjectRef]) -> crate::PyResult {
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let Some(&self_obj) = positional.first() else {
+        return Err(crate::PyError::type_error(
+            "__init__() missing 1 required positional argument: 'self'",
+        ));
+    };
+    if positional.len() > 1 {
+        return Err(crate::PyError::type_error(
+            "types.SimpleNamespace() takes no positional arguments",
+        ));
+    }
+    if let Some(dict) = kwargs {
+        unsafe {
+            for (key, value) in pyre_object::w_dict_items(dict) {
+                if pyre_object::is_str(key)
+                    && pyre_object::w_str_get_wtf8(key).as_str() == Ok("__pyre_kw__")
+                {
+                    continue;
+                }
+                crate::baseobjspace::setattr(self_obj, key, value)?;
+            }
+        }
+    }
+    Ok(w_none())
 }
 
 /// Allocate a fresh stub instance whose type supports `setattr`. Used for

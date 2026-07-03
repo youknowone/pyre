@@ -1,10 +1,10 @@
 //! gc module — PyPy: `pypy/module/gc/`.
 //!
-//! Partial port of `interp_gc.py`.  `collect` drives a full mark-sweep
-//! through the active GC (`majit_gc::collect_full` via `try_gc_collect`);
-//! `enable` / `disable` / `isenabled` accept calls but pyre has no
-//! generational threshold knob; `get_referrers` / `get_referents` return
-//! empty lists; the DEBUG_* constants match CPython values.
+//! Partial port of `interp_gc.py`.  `collect` is currently a no-op because
+//! collection at arbitrary interpreter depth needs shadowstack coverage for
+//! Rust-stack-only `PyObjectRef`s; `enable` / `disable` / `isenabled` accept
+//! calls but pyre has no generational threshold knob; `get_referrers` /
+//! `get_referents` return empty lists; the DEBUG_* constants are stubbed.
 
 use pyre_object::*;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -30,7 +30,17 @@ crate::py_module! {
         // `interp_gc.py:7-26 collect` — argument `generation` ignored per
         // upstream.  MethodCache / MapAttrCache clears (`:14-17`) skipped
         // because pyre has no equivalent caches.
-        "collect"       / 1 = |_| { gc_hook::try_gc_collect(); Ok(w_int_new(0)) },
+        "collect"       / 1 = |_| {
+            // A real collection here needs a shadowstack pass over interpreter
+            // Rust-stack `PyObjectRef`s; see the full-collect trampoline doc in
+            // `pyre-jit/src/eval.rs`. Even the non-moving old-gen major is
+            // unsound at arbitrary interpreter depth because marking cannot see
+            // Rust-stack-only references. Until that shadowstack pass exists,
+            // `collect` is a no-op and collections happen only at the JIT's own
+            // safepoints / the gated interpreter safepoint
+            // (`pyre-object/src/gc_interp.rs`).
+            Ok(w_int_new(0))
+        },
         "disable"       / 0 = |_| { GC_ENABLED.store(false, Ordering::Relaxed); Ok(w_none()) },
         "enable"        / 0 = |_| { GC_ENABLED.store(true, Ordering::Relaxed); Ok(w_none()) },
         "isenabled"     / 0 = |_| Ok(w_bool_from(GC_ENABLED.load(Ordering::Relaxed))),
