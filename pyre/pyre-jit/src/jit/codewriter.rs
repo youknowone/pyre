@@ -9042,41 +9042,40 @@ impl CodeWriter {
                         // interpreter on side-exit; the trace only records the
                         // continuing iteration (the loop closes at the back-edge).
                         Instruction::ForIter { delta } => {
-                            // Read the iterator from its value-stack slot via a
-                            // loop-carried `getarrayitem_vable_r` rather than the
-                            // pre-trace register holding the GET_ITER result: the
-                            // FOR_ITER pc sits just past the loop-header
-                            // `jit_merge_point`, so a register written before the
-                            // merge is stale (the merge rebinds the slot's
-                            // loop-input).  Reading the vable slot binds the
-                            // operand from the merge-point reds.  TOS is the
-                            // iterator (`current_depth - 1`).
+                            // Source `next()`'s iterator argument from the
+                            // loop-carried operand Variable at TOS
+                            // (`current_state.stack.last()`, the merge-rebound
+                            // loop-input the runtime vstack mirror holds as an
+                            // InputArgRef), mirroring RPython `space.next(
+                            // peekvalue())`.  Feeding a real operand Variable
+                            // gives the loop-carried iterator a genuine SSA
+                            // reader, so the graph allocator assigns it a
+                            // DISTINCT live color and `compute_liveness` marks it
+                            // live at the FOR_ITER `-live-` marker; both cascades
+                            // let `build_pcdep_color_slots` keep the
+                            // `(iter_color -> nlocals+0)` operand entry at this
+                            // guard pc.  Without a reader (the prior portal-only
+                            // `getarrayitem_vable_r` reload was defined-and-
+                            // consumed inside the opcode) the loop-carried
+                            // iterator color is dropped from both `pcdep` and the
+                            // `-live-` R-bank, so a guard-pc resume (M3) cannot
+                            // reconstruct the kept iterator operand slot and
+                            // re-executes FOR_ITER on a non-iterator.  GET_ITER's
+                            // `setarrayitem_vable_r` still populates the vable
+                            // image (blackhole/interp read), so dropping the
+                            // reload is safe; DCE removes it.  TOS is the iterator
+                            // (`current_depth - 1`).
                             let iter_slot_depth = current_depth.saturating_sub(1);
-                            let iter_value: super::flow::FlowValue = if is_portal {
-                                let stack_slot =
-                                    (stack_base_absolute + iter_slot_depth as usize) as i64;
-                                let v_slot: super::flow::FlowValue =
-                                    super::flow::Constant::signed(stack_slot).into();
-                                let v_iter = emit_graph_op_with_result(
-                                    &mut graph,
-                                    &current_block.block(),
-                                    "getarrayitem_vable_r",
-                                    vable_getarrayitem_ref_graph_args(
-                                        frame_var.into(),
-                                        v_slot.into(),
-                                    ),
-                                    Kind::Ref,
-                                    py_pc as i64,
-                                );
-                                pin!(Some(v_iter), stack_base + iter_slot_depth);
-                                v_iter.into()
-                            } else {
-                                current_state
-                                    .stack
-                                    .last()
-                                    .cloned()
-                                    .unwrap_or_else(|| fresh_ref_value(&mut graph).into())
-                            };
+                            let iter_value: super::flow::FlowValue = current_state
+                                .stack
+                                .last()
+                                .cloned()
+                                .unwrap_or_else(|| fresh_ref_value(&mut graph).into());
+                            if is_portal {
+                                if let super::flow::FlowValue::Variable(v) = &iter_value {
+                                    pin!(Some(*v), stack_base + iter_slot_depth);
+                                }
+                            }
                             let next_var = residual_call!(
                                 for_iter_next_fn_idx,
                                 CallFlavor::MayForce,
