@@ -99,20 +99,99 @@ fn bigint_to_f64(a: BigInt) -> f64 {
 /// quotient (this) + remainder ([`jit_bigint_rem`]) sourcing a modeled 2-tuple.
 /// Allocates the result via the COLLECTING nursery (a gcmap-rooted residual,
 /// its operand pointers rooted across the alloc), matching the arithmetic
-/// residuals. Returns a freshly heap-allocated `*mut BigInt` (as i64).
+/// residuals. Returns a freshly heap-allocated `*mut BigInt` — a `ref`-token
+/// return so the CodeWriter models the result as a traced GcRef.
 #[majit_macros::dont_look_inside]
-pub extern "C" fn jit_bigint_div(a: i64, b: i64) -> i64 {
+pub extern "C" fn jit_bigint_div(a: i64, b: i64) -> *mut BigInt {
     let (a, b) = (a as *const BigInt, b as *const BigInt);
-    unsafe { pyre_object::longobject::alloc_bigint_nursery_collecting((&*a).div_rem(&*b).0) as i64 }
+    unsafe { pyre_object::longobject::alloc_bigint_nursery_collecting((&*a).div_rem(&*b).0) }
 }
 
 /// `rbigint.divmod`'s truncated remainder — the `.1` of `num_integer::div_rem`.
 /// See [`jit_bigint_div`]; the two share the `(BigInt, BigInt)` semantics the
 /// `front::bigint_div_rem` synth reassembles into a modeled tuple.
 #[majit_macros::dont_look_inside]
-pub extern "C" fn jit_bigint_rem(a: i64, b: i64) -> i64 {
+pub extern "C" fn jit_bigint_rem(a: i64, b: i64) -> *mut BigInt {
     let (a, b) = (a as *const BigInt, b as *const BigInt);
-    unsafe { pyre_object::longobject::alloc_bigint_nursery_collecting((&*a).div_rem(&*b).1) as i64 }
+    unsafe { pyre_object::longobject::alloc_bigint_nursery_collecting((&*a).div_rem(&*b).1) }
+}
+
+// ── BigInt binary-operator residuals ─────────────────────────────────
+// The foreign malachite operator impls (`<BigInt as BitAnd>::bitand`, …)
+// are Opaque in the LLBC, so a traced-into caller (`bigint_truediv`) emits
+// an unregistered `<Impl>` FunctionPath call the census Skips. `front::mir`
+// retargets each such call — guarded on both operands resolving to the
+// opaque `BigInt` ADT — to the matching residual below. Both operands and
+// the result are the classdef-less `*mut BigInt` GcRef the front models a
+// `BigInt` as: the operands arrive as i64-encoded pointers (a faithful ABI
+// pass) and the result is returned as `*mut BigInt` so the return token is
+// `ref` (a traced GcRef), matching the front's `Ref(None)` result type. Each
+// allocates the fresh result in the collecting nursery, its operand pointers
+// rooted across the alloc. The `#[dont_look_inside]` sibling of the elidable
+// `longobject::jit_bigint_*` opcode-payload helpers (which the front cannot
+// residualize because only `dont_look_inside` callees are registered).
+
+/// `rbigint.and_` payload — `&BigInt & &BigInt`. See the module note above.
+#[majit_macros::dont_look_inside]
+pub extern "C" fn jit_bigint_and(a: i64, b: i64) -> *mut BigInt {
+    let (a, b) = (a as *const BigInt, b as *const BigInt);
+    unsafe { pyre_object::longobject::alloc_bigint_nursery_collecting(&*a & &*b) }
+}
+
+/// `rbigint.or_` payload — `&BigInt | &BigInt`. See [`jit_bigint_and`].
+#[majit_macros::dont_look_inside]
+pub extern "C" fn jit_bigint_or(a: i64, b: i64) -> *mut BigInt {
+    let (a, b) = (a as *const BigInt, b as *const BigInt);
+    unsafe { pyre_object::longobject::alloc_bigint_nursery_collecting(&*a | &*b) }
+}
+
+/// `rbigint.xor_` payload — `&BigInt ^ &BigInt`. See [`jit_bigint_and`].
+#[majit_macros::dont_look_inside]
+pub extern "C" fn jit_bigint_xor(a: i64, b: i64) -> *mut BigInt {
+    let (a, b) = (a as *const BigInt, b as *const BigInt);
+    unsafe { pyre_object::longobject::alloc_bigint_nursery_collecting(&*a ^ &*b) }
+}
+
+/// `rbigint.sub` payload — `&BigInt - &BigInt`. See [`jit_bigint_and`].
+#[majit_macros::dont_look_inside]
+pub extern "C" fn jit_bigint_sub(a: i64, b: i64) -> *mut BigInt {
+    let (a, b) = (a as *const BigInt, b as *const BigInt);
+    unsafe { pyre_object::longobject::alloc_bigint_nursery_collecting(&*a - &*b) }
+}
+
+/// `rbigint.mul` payload — `&BigInt * &BigInt`. See [`jit_bigint_and`].
+#[majit_macros::dont_look_inside]
+pub extern "C" fn jit_bigint_mul(a: i64, b: i64) -> *mut BigInt {
+    let (a, b) = (a as *const BigInt, b as *const BigInt);
+    unsafe { pyre_object::longobject::alloc_bigint_nursery_collecting(&*a * &*b) }
+}
+
+/// `rbigint.add` payload — `&BigInt + &BigInt`. See [`jit_bigint_and`].
+#[majit_macros::dont_look_inside]
+pub extern "C" fn jit_bigint_add(a: i64, b: i64) -> *mut BigInt {
+    let (a, b) = (a as *const BigInt, b as *const BigInt);
+    unsafe { pyre_object::longobject::alloc_bigint_nursery_collecting(&*a + &*b) }
+}
+
+// ── BigInt shift-by-`usize` residuals ────────────────────────────────
+// `<BigInt as Shl<usize>>::shl` / `Shr<usize>::shr` — the shift amount is a
+// plain machine integer, NOT a `BigInt`, so `b` is the count value itself
+// (not a pointer). `front::mir` retargets these separately, guarded on the
+// first operand being the opaque `BigInt` ADT and the second being an
+// integer. See the operator-residual module note above.
+
+/// `rbigint.lshift` by a machine `usize` — `&BigInt << (b as usize)`.
+#[majit_macros::dont_look_inside]
+pub extern "C" fn jit_bigint_shl(a: i64, b: i64) -> *mut BigInt {
+    let a = a as *const BigInt;
+    unsafe { pyre_object::longobject::alloc_bigint_nursery_collecting(&*a << (b as usize)) }
+}
+
+/// `rbigint.rshift` by a machine `usize` — `&BigInt >> (b as usize)`.
+#[majit_macros::dont_look_inside]
+pub extern "C" fn jit_bigint_shr(a: i64, b: i64) -> *mut BigInt {
+    let a = a as *const BigInt;
+    unsafe { pyre_object::longobject::alloc_bigint_nursery_collecting(&*a >> (b as usize)) }
 }
 
 #[majit_macros::elidable]
@@ -240,15 +319,13 @@ fn bigint_truediv(a: BigInt, b: BigInt) -> Result<f64, PyError> {
         dropped
     };
 
-    let mantissa = match mantissa_big.to_u64() {
-        Some(v) => v,
-        None => {
-            return Err(PyError::new(
-                PyErrorKind::OverflowError,
-                "integer division result too large for a float",
-            ));
-        }
-    };
+    if pyre_object::longobject::jit_bigint_to_u64_fits(&mantissa_big) == 0 {
+        return Err(PyError::new(
+            PyErrorKind::OverflowError,
+            "integer division result too large for a float",
+        ));
+    }
+    let mantissa = pyre_object::longobject::jit_bigint_to_u64_value(&mantissa_big);
 
     // `mantissa` has at most DBL_MANT_DIG bits, so it is exact in `f64`; scale it
     // by 2^exponent with a non-raising ldexp that preserves subnormal results.

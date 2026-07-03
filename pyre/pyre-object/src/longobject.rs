@@ -361,6 +361,25 @@ pub fn jit_bigint_to_i64_value(num: &BigInt) -> i64 {
     })
 }
 
+/// `BigInt::to_u64().is_some()` on a borrowed BigInt payload. Scalar half of
+/// the `BigInt::to_u64()` split so the two-phase rtyper never has to model an
+/// `Option<u64>` ABI. Companion of [`jit_bigint_to_u64_value`].
+#[majit_macros::dont_look_inside]
+pub fn jit_bigint_to_u64_fits(num: &BigInt) -> i64 {
+    use num_traits::ToPrimitive;
+    num.to_u64().is_some() as i64
+}
+
+/// `BigInt::to_u64()` on a borrowed BigInt payload. Callers must first check
+/// [`jit_bigint_to_u64_fits`]; a `None` here means that guard was violated.
+#[majit_macros::dont_look_inside]
+pub fn jit_bigint_to_u64_value(num: &BigInt) -> u64 {
+    use num_traits::ToPrimitive;
+    num.to_u64().unwrap_or_else(|| {
+        panic!("jit_bigint_to_u64_value: BigInt exceeds u64 range - fits guard violated")
+    })
+}
+
 /// `rbigint.sign` / sign-digit use (`rpython/rlib/rbigint.py`) on a borrowed
 /// BigInt payload. Returns the scalar signum (-1, 0, +1) so the two-phase
 /// rtyper never has to model malachite's `Sign` enum ABI.

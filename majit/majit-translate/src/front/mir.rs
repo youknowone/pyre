@@ -5985,6 +5985,74 @@ impl<'a> Lowering<'a> {
             op_kind
         };
 
+        // Retarget a foreign BigInt binary-operator call (`<BigInt as
+        // BitAnd>::bitand`, …) to its `#[dont_look_inside]` `jit_bigint_*`
+        // residual.  The malachite operator body is Opaque, and both operands
+        // and the result are the classdef-less `*mut BigInt` GcRef the front
+        // models a `BigInt` as, so the i64-ABI residual is a faithful pointer
+        // pass.  Guarded on both operands resolving to the opaque `BigInt` ADT
+        // so a same-named operator on another type is never mis-retargeted; a
+        // pure target swap (args + result var unchanged), fail-safe by
+        // construction (a non-BigInt / unlisted operator leaves the residual
+        // `<Impl>` call the census Skips).
+        let op_kind = if let OpKind::Call {
+            target: CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } = &op_kind
+            && args.len() == 2
+            && first_arg_ty
+                .as_ref()
+                .is_some_and(|t| tyref_is_opaque_bigint(t, self.llbc))
+            && second_arg_ty
+                .as_ref()
+                .is_some_and(|t| tyref_is_opaque_bigint(t, self.llbc))
+            && let Some(residual) =
+                crate::front::bigint_binop::bigint_binop_residual_path(segments)
+        {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments: residual },
+                args: args.clone(),
+                result_ty: ValueType::Ref(None),
+            }
+        } else {
+            op_kind
+        };
+
+        // Retarget a foreign BigInt shift call (`<BigInt as Shl<usize>>::shl`,
+        // …) to its `jit_bigint_{shl,shr}` residual.  Split from the binary
+        // retarget above because the shift amount is a machine integer, not a
+        // `BigInt`: the guard requires the first operand to be the opaque
+        // `BigInt` ADT and the second to be an integer, so the residual reads
+        // `b` as the shift count rather than as a `*mut BigInt` pointer.  Same
+        // pure-target-swap, fail-safe contract.
+        let op_kind = if let OpKind::Call {
+            target: CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } = &op_kind
+            && args.len() == 2
+            && first_arg_ty
+                .as_ref()
+                .is_some_and(|t| tyref_is_opaque_bigint(t, self.llbc))
+            && second_arg_ty.as_ref().is_some_and(|t| {
+                matches!(
+                    tyref_to_value_type(t, self.llbc),
+                    ValueType::Int | ValueType::Unsigned
+                )
+            })
+            && let Some(residual) =
+                crate::front::bigint_binop::bigint_shift_residual_path(segments)
+        {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments: residual },
+                args: args.clone(),
+                result_ty: ValueType::Ref(None),
+            }
+        } else {
+            op_kind
+        };
+
         // Allocate the result Variable and bind it to the destination
         // local before pushing the op, so subsequent reads see the
         // freshly-minted Variable.
@@ -10324,6 +10392,22 @@ fn dont_look_inside_return_token(output: &TyRef, llbc: &Llbc) -> Option<String> 
         ValueType::Void | ValueType::State | ValueType::Unknown => return None,
     };
     Some(token.to_string())
+}
+
+/// True when `ty` (after stripping `&`/`&mut`/`*` wrappers) resolves to the
+/// foreign opaque `malachite_bigint::bigint::BigInt` ADT.  Guards the
+/// BigInt binary-operator retarget (`front::bigint_binop`) so a same-named
+/// operator (`BitAnd`/`Sub`/`Mul`/…) on any other type is never redirected to
+/// a `jit_bigint_*` residual that would misread its non-BigInt pointer.
+fn tyref_is_opaque_bigint(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_node(ty, llbc)
+        .and_then(|n| strip_ty_wrappers(n, llbc))
+        .and_then(adt_node_def_id)
+        .and_then(|id| llbc.type_by_id(id))
+        .is_some_and(|td| {
+            matches!(td.kind, TypeDeclKind::Opaque)
+                && td.item_meta.name_path().ends_with("bigint::BigInt")
+        })
 }
 
 /// Classify a struct field [`TyRef`] into the RPython `lltype` register

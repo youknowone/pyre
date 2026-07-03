@@ -502,6 +502,52 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::objspace::descroperation::jit_bigint_rem",
         crate::objspace::descroperation::jit_bigint_rem as *const (),
     );
+    // `jit_bigint_{and,or,xor,sub,mul}` residualize the foreign BigInt binary
+    // operators (`<BigInt as BitAnd>::bitand`, …) the `front::mir` retarget
+    // (`front::bigint_binop`) redirects when both operands are the opaque
+    // `BigInt` ADT.  Each returns a fresh `*mut BigInt` (as i64), bound by path.
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::jit_bigint_and",
+        crate::objspace::descroperation::jit_bigint_and as *const (),
+    );
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::jit_bigint_or",
+        crate::objspace::descroperation::jit_bigint_or as *const (),
+    );
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::jit_bigint_xor",
+        crate::objspace::descroperation::jit_bigint_xor as *const (),
+    );
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::jit_bigint_sub",
+        crate::objspace::descroperation::jit_bigint_sub as *const (),
+    );
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::jit_bigint_mul",
+        crate::objspace::descroperation::jit_bigint_mul as *const (),
+    );
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::jit_bigint_add",
+        crate::objspace::descroperation::jit_bigint_add as *const (),
+    );
+    // `jit_bigint_{shl,shr}` residualize the BigInt shift-by-`usize` operators
+    // (`<BigInt as Shl<usize>>::shl`, …); `b` is the machine shift count.
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::jit_bigint_shl",
+        crate::objspace::descroperation::jit_bigint_shl as *const (),
+    );
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::jit_bigint_shr",
+        crate::objspace::descroperation::jit_bigint_shr as *const (),
+    );
 
     for (nargs, (module_path, root_path)) in CALLABLE_HELPER_PATHS.iter().enumerate() {
         if let Some(fnptr) = crate::runtime_ops::callable_call_helper(nargs) {
@@ -581,6 +627,18 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::longobject::jit_bigint_to_i64_value",
         "pyre_object::jit_bigint_to_i64_value",
         pyre_object::jit_bigint_to_i64_value as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::longobject::jit_bigint_to_u64_fits",
+        "pyre_object::jit_bigint_to_u64_fits",
+        pyre_object::jit_bigint_to_u64_fits as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::longobject::jit_bigint_to_u64_value",
+        "pyre_object::jit_bigint_to_u64_value",
+        pyre_object::jit_bigint_to_u64_value as *const (),
     );
     push_alias_pair(
         &mut entries,
