@@ -1,6 +1,7 @@
 use crate::bytecode::{
-    BinaryOperator, CodeObject, CodeUnit, ComparisonOperator, ConstantData, Instruction,
-    IntrinsicFunction1, IntrinsicFunction2, OpArg, OpArgState, RaiseKind, SpecialMethod,
+    BinaryOperator, BuildSliceArgCount, CodeObject, CodeUnit, CommonConstant, ComparisonOperator,
+    ConstantData, ConvertValueOparg, Instruction, IntrinsicFunction1, IntrinsicFunction2, Invert,
+    MakeFunctionFlag, OpArg, OpArgState, RaiseKind, SpecialMethod,
 };
 
 use crate::{
@@ -1588,6 +1589,166 @@ pub fn var_nums_to_second_index(
     var_nums.get(op_arg).idx_2().as_usize()
 }
 
+/// Rtyper residual helper for label oparg decode sites. Keep the
+/// third-party `Arg::get` call inside a first-party scalar wrapper so
+/// opcode handlers do not need to register the external generic method.
+#[inline]
+#[majit_macros::dont_look_inside]
+pub fn label_arg_to_usize(
+    delta: crate::bytecode::Arg<crate::bytecode::oparg::Label>,
+    op_arg: OpArg,
+) -> usize {
+    delta.get(op_arg).as_usize()
+}
+
+/// Decode a forward jump target as one residual scalar call. The
+/// `CodeUnits::deref` slice stays inside the helper body and never
+/// crosses the two-phase residual ABI.
+#[inline]
+#[majit_macros::dont_look_inside]
+pub fn jump_target_forward_decoded(
+    code: &CodeObject,
+    next_instr: usize,
+    delta: crate::bytecode::Arg<crate::bytecode::oparg::Label>,
+    op_arg: OpArg,
+) -> usize {
+    jump_target_forward(&code.instructions, next_instr, delta.get(op_arg).as_usize())
+}
+
+/// Forward jump helper for opcodes whose target is already the raw
+/// instruction oparg, not an `Arg<Label>` field.
+#[inline]
+#[majit_macros::dont_look_inside]
+pub fn jump_target_forward_from_oparg(
+    code: &CodeObject,
+    next_instr: usize,
+    op_arg: OpArg,
+) -> usize {
+    jump_target_forward(&code.instructions, next_instr, op_arg_as_usize(op_arg))
+}
+
+/// Backward jump counterpart of [`jump_target_forward_decoded`].
+#[inline]
+#[majit_macros::dont_look_inside]
+pub fn jump_target_backward_decoded(
+    code: &CodeObject,
+    next_instr: usize,
+    delta: crate::bytecode::Arg<crate::bytecode::oparg::Label>,
+    op_arg: OpArg,
+) -> usize {
+    jump_target_backward(&code.instructions, next_instr, delta.get(op_arg).as_usize())
+}
+
+/// Decode `BINARY_OP`'s enum oparg behind a first-party residual helper.
+#[inline]
+#[majit_macros::dont_look_inside]
+pub fn binary_op_arg(
+    op: crate::bytecode::Arg<crate::bytecode::oparg::BinaryOperator>,
+    op_arg: OpArg,
+) -> BinaryOperator {
+    op.get(op_arg)
+}
+
+/// Decode `COMPARE_OP`'s enum oparg behind a first-party residual helper.
+#[inline]
+#[majit_macros::dont_look_inside]
+pub fn comparison_op_arg(
+    opname: crate::bytecode::Arg<crate::bytecode::oparg::ComparisonOperator>,
+    op_arg: OpArg,
+) -> ComparisonOperator {
+    opname.get(op_arg)
+}
+
+/// Decode containment/identity inversion flags behind a first-party helper.
+#[inline]
+#[majit_macros::dont_look_inside]
+pub fn invert_arg(
+    invert: crate::bytecode::Arg<crate::bytecode::oparg::Invert>,
+    op_arg: OpArg,
+) -> Invert {
+    invert.get(op_arg)
+}
+
+/// Decode `BUILD_SLICE`'s argument-count enum behind a first-party helper.
+#[inline]
+#[majit_macros::dont_look_inside]
+pub fn build_slice_arg(
+    argc: crate::bytecode::Arg<crate::bytecode::oparg::BuildSliceArgCount>,
+    op_arg: OpArg,
+) -> BuildSliceArgCount {
+    argc.get(op_arg)
+}
+
+/// Decode `LOAD_COMMON_CONSTANT`'s enum oparg behind a first-party helper.
+#[inline]
+#[majit_macros::dont_look_inside]
+pub fn common_constant_arg(
+    idx: crate::bytecode::Arg<crate::bytecode::oparg::CommonConstant>,
+    op_arg: OpArg,
+) -> CommonConstant {
+    idx.get(op_arg)
+}
+
+/// Decode `CONVERT_VALUE`'s enum oparg behind a first-party helper.
+#[inline]
+#[majit_macros::dont_look_inside]
+pub fn convert_value_arg(
+    conv: crate::bytecode::Arg<crate::bytecode::oparg::ConvertValueOparg>,
+    op_arg: OpArg,
+) -> ConvertValueOparg {
+    conv.get(op_arg)
+}
+
+/// Decode `LOAD_SPECIAL`'s enum oparg behind a first-party helper.
+#[inline]
+#[majit_macros::dont_look_inside]
+pub fn special_method_arg(
+    method: crate::bytecode::Arg<crate::bytecode::oparg::SpecialMethod>,
+    op_arg: OpArg,
+) -> SpecialMethod {
+    method.get(op_arg)
+}
+
+/// Decode `SET_FUNCTION_ATTRIBUTE`'s flag oparg behind a first-party helper.
+#[inline]
+#[majit_macros::dont_look_inside]
+pub fn make_function_flag_arg(
+    flag: crate::bytecode::Arg<crate::bytecode::oparg::MakeFunctionFlag>,
+    op_arg: OpArg,
+) -> MakeFunctionFlag {
+    flag.get(op_arg)
+}
+
+/// Decode `CALL_INTRINSIC_1`'s enum oparg behind a first-party helper.
+#[inline]
+#[majit_macros::dont_look_inside]
+pub fn intrinsic_function_1_arg(
+    func: crate::bytecode::Arg<crate::bytecode::oparg::IntrinsicFunction1>,
+    op_arg: OpArg,
+) -> IntrinsicFunction1 {
+    func.get(op_arg)
+}
+
+/// Decode `CALL_INTRINSIC_2`'s enum oparg behind a first-party helper.
+#[inline]
+#[majit_macros::dont_look_inside]
+pub fn intrinsic_function_2_arg(
+    func: crate::bytecode::Arg<crate::bytecode::oparg::IntrinsicFunction2>,
+    op_arg: OpArg,
+) -> IntrinsicFunction2 {
+    func.get(op_arg)
+}
+
+/// Decode `RAISE_VARARGS` to the executor's compact usize kind.
+#[inline]
+#[majit_macros::dont_look_inside]
+pub fn raise_kind_arg_as_usize(
+    argc: crate::bytecode::Arg<crate::bytecode::oparg::RaiseKind>,
+    op_arg: OpArg,
+) -> usize {
+    raise_kind_as_usize(argc.get(op_arg))
+}
+
 /// Walker-fold helper for `code.varnames.len()` — `Vec::len` is a std
 /// method the analyzer cannot tag elidable from its definition site,
 /// so the bounds-check upper bound reaches the walker as an unfolded
@@ -1757,11 +1918,7 @@ where
     let Instruction::JumpForward { delta } = instruction else {
         unreachable!()
     };
-    executor.jump_forward(jump_target_forward(
-        &code.instructions,
-        next_instr,
-        delta.get(op_arg).as_usize(),
-    ))?;
+    executor.jump_forward(jump_target_forward_decoded(code, next_instr, delta, op_arg))?;
     Ok(StepResult::Continue)
 }
 
@@ -1778,10 +1935,8 @@ where
     let Instruction::JumpBackward { delta } = instruction else {
         unreachable!()
     };
-    let step = executor.jump_backward(jump_target_backward(
-        &code.instructions,
-        next_instr,
-        delta.get(op_arg).as_usize(),
+    let step = executor.jump_backward(jump_target_backward_decoded(
+        code, next_instr, delta, op_arg,
     ))?;
     // Rebuild the StepResult per variant so the Result-of-PyError
     // lowering sees a concrete `Ok(StepResult::_)` shell to rewrite. A
@@ -1814,11 +1969,7 @@ where
     let Instruction::PopJumpIfFalse { delta } = instruction else {
         unreachable!()
     };
-    executor.pop_jump_if_false(jump_target_forward(
-        &code.instructions,
-        next_instr,
-        delta.get(op_arg).as_usize(),
-    ))?;
+    executor.pop_jump_if_false(jump_target_forward_decoded(code, next_instr, delta, op_arg))?;
     Ok(StepResult::Continue)
 }
 
@@ -1835,11 +1986,7 @@ where
     let Instruction::PopJumpIfTrue { delta } = instruction else {
         unreachable!()
     };
-    executor.pop_jump_if_true(jump_target_forward(
-        &code.instructions,
-        next_instr,
-        delta.get(op_arg).as_usize(),
-    ))?;
+    executor.pop_jump_if_true(jump_target_forward_decoded(code, next_instr, delta, op_arg))?;
     Ok(StepResult::Continue)
 }
 
@@ -1856,11 +2003,7 @@ where
     let Instruction::ForIter { delta } = instruction else {
         unreachable!()
     };
-    executor.for_iter(jump_target_forward(
-        &code.instructions,
-        next_instr,
-        delta.get(op_arg).as_usize(),
-    ))?;
+    executor.for_iter(jump_target_forward_decoded(code, next_instr, delta, op_arg))?;
     Ok(StepResult::Continue)
 }
 
@@ -1874,11 +2017,7 @@ pub fn execute_pop_jump_if_none<E: OpcodeStepExecutor>(
     let Instruction::PopJumpIfNone { delta } = instruction else {
         unreachable!()
     };
-    executor.pop_jump_if_none(jump_target_forward(
-        &code.instructions,
-        next_instr,
-        delta.get(op_arg).as_usize(),
-    ))?;
+    executor.pop_jump_if_none(jump_target_forward_decoded(code, next_instr, delta, op_arg))?;
     Ok(StepResult::Continue)
 }
 
@@ -1892,11 +2031,7 @@ pub fn execute_pop_jump_if_not_none<E: OpcodeStepExecutor>(
     let Instruction::PopJumpIfNotNone { delta } = instruction else {
         unreachable!()
     };
-    executor.pop_jump_if_not_none(jump_target_forward(
-        &code.instructions,
-        next_instr,
-        delta.get(op_arg).as_usize(),
-    ))?;
+    executor.pop_jump_if_not_none(jump_target_forward_decoded(code, next_instr, delta, op_arg))?;
     Ok(StepResult::Continue)
 }
 
@@ -1912,7 +2047,7 @@ where
     let Instruction::JumpBackwardNoInterrupt { delta } = instruction else {
         unreachable!()
     };
-    let tgt = delta.get(op_arg).as_usize();
+    let tgt = label_arg_to_usize(delta, op_arg);
     executor.set_next_instr(next_instr - tgt)?;
     Ok(StepResult::Continue)
 }
@@ -1923,7 +2058,7 @@ pub fn execute_send<E: OpcodeStepExecutor>(
     op_arg: OpArg,
     next_instr: usize,
 ) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
-    let target = jump_target_forward(&code.instructions, next_instr, op_arg_as_usize(op_arg));
+    let target = jump_target_forward_from_oparg(code, next_instr, op_arg);
     executor.send_value(target)?;
     Ok(StepResult::Continue)
 }
@@ -2029,7 +2164,7 @@ where
     // it needs to close the final isinstance fork (Position-2
     // adaptation; the adapter cannot enumerate the variant
     // universe from `syn::ItemFn` alone).
-    let name = match method.get(op_arg) {
+    let name = match special_method_arg(method, op_arg) {
         SpecialMethod::Enter => "__enter__",
         SpecialMethod::Exit => "__exit__",
         SpecialMethod::AEnter => "__aenter__",
@@ -2460,7 +2595,7 @@ pub fn execute_build_slice<E: OpcodeStepExecutor>(
     let Instruction::BuildSlice { argc } = instruction else {
         unreachable!()
     };
-    executor.build_slice(argc.get(op_arg))?;
+    executor.build_slice(build_slice_arg(argc, op_arg))?;
     Ok(StepResult::Continue)
 }
 
@@ -2499,7 +2634,7 @@ where
     let Instruction::BinaryOp { op } = instruction else {
         unreachable!()
     };
-    executor.binary_op(op.get(op_arg))?;
+    executor.binary_op(binary_op_arg(op, op_arg))?;
     Ok(StepResult::Continue)
 }
 
@@ -2514,7 +2649,7 @@ where
     let Instruction::CompareOp { opname } = instruction else {
         unreachable!()
     };
-    executor.compare_op(opname.get(op_arg))?;
+    executor.compare_op(comparison_op_arg(opname, op_arg))?;
     Ok(StepResult::Continue)
 }
 
@@ -2526,7 +2661,7 @@ pub fn execute_contains_op<E: OpcodeStepExecutor>(
     let Instruction::ContainsOp { invert } = instruction else {
         unreachable!()
     };
-    executor.contains_op(invert.get(op_arg))?;
+    executor.contains_op(invert_arg(invert, op_arg))?;
     Ok(StepResult::Continue)
 }
 
@@ -2538,7 +2673,7 @@ pub fn execute_is_op<E: OpcodeStepExecutor>(
     let Instruction::IsOp { invert } = instruction else {
         unreachable!()
     };
-    executor.is_op(invert.get(op_arg))?;
+    executor.is_op(invert_arg(invert, op_arg))?;
     Ok(StepResult::Continue)
 }
 
@@ -2550,7 +2685,7 @@ pub fn execute_raise_varargs<E: OpcodeStepExecutor>(
     let Instruction::RaiseVarargs { argc } = instruction else {
         unreachable!()
     };
-    executor.raise_varargs(raise_kind_as_usize(argc.get(op_arg)))?;
+    executor.raise_varargs(raise_kind_arg_as_usize(argc, op_arg))?;
     Ok(StepResult::Continue)
 }
 
@@ -2706,7 +2841,7 @@ pub fn execute_load_common_constant<E: OpcodeStepExecutor>(
     let Instruction::LoadCommonConstant { idx } = instruction else {
         unreachable!()
     };
-    executor.load_common_constant(idx.get(op_arg))?;
+    executor.load_common_constant(common_constant_arg(idx, op_arg))?;
     Ok(StepResult::Continue)
 }
 
@@ -2718,7 +2853,7 @@ pub fn execute_convert_value<E: OpcodeStepExecutor>(
     let Instruction::ConvertValue { oparg: conv } = instruction else {
         unreachable!()
     };
-    executor.convert_value(conv.get(op_arg))?;
+    executor.convert_value(convert_value_arg(conv, op_arg))?;
     Ok(StepResult::Continue)
 }
 
@@ -2742,7 +2877,7 @@ pub fn execute_set_function_attribute<E: OpcodeStepExecutor>(
     let Instruction::SetFunctionAttribute { flag } = instruction else {
         unreachable!()
     };
-    executor.set_function_attribute_with_flag(flag.get(op_arg))?;
+    executor.set_function_attribute_with_flag(make_function_flag_arg(flag, op_arg))?;
     Ok(StepResult::Continue)
 }
 
@@ -2754,7 +2889,7 @@ pub fn execute_call_intrinsic_1<E: OpcodeStepExecutor>(
     let Instruction::CallIntrinsic1 { func } = instruction else {
         unreachable!()
     };
-    executor.call_intrinsic_1(func.get(op_arg))?;
+    executor.call_intrinsic_1(intrinsic_function_1_arg(func, op_arg))?;
     Ok(StepResult::Continue)
 }
 
@@ -2766,7 +2901,7 @@ pub fn execute_call_intrinsic_2<E: OpcodeStepExecutor>(
     let Instruction::CallIntrinsic2 { func } = instruction else {
         unreachable!()
     };
-    executor.call_intrinsic_2(func.get(op_arg))?;
+    executor.call_intrinsic_2(intrinsic_function_2_arg(func, op_arg))?;
     Ok(StepResult::Continue)
 }
 

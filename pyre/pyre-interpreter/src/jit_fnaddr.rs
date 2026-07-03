@@ -1042,6 +1042,180 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         var_nums_to_second_index as *const (),
     );
 
+    // Opcode oparg decode helpers for two-phase lifting. These wrap
+    // RustPython's generic `Arg::get` and `CodeUnits::deref` surfaces
+    // behind first-party residual calls whose return values are the
+    // scalar/enum values consumed by the opcode handlers.
+    let label_arg_to_usize: fn(
+        crate::bytecode::Arg<crate::bytecode::oparg::Label>,
+        crate::bytecode::OpArg,
+    ) -> usize = crate::pyopcode::label_arg_to_usize;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::pyopcode::label_arg_to_usize",
+        "pyre_interpreter::label_arg_to_usize",
+        label_arg_to_usize as *const (),
+    );
+
+    let jump_target_forward_decoded: fn(
+        &crate::CodeObject,
+        usize,
+        crate::bytecode::Arg<crate::bytecode::oparg::Label>,
+        crate::bytecode::OpArg,
+    ) -> usize = crate::pyopcode::jump_target_forward_decoded;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::pyopcode::jump_target_forward_decoded",
+        "pyre_interpreter::jump_target_forward_decoded",
+        jump_target_forward_decoded as *const (),
+    );
+
+    let jump_target_forward_from_oparg: fn(
+        &crate::CodeObject,
+        usize,
+        crate::bytecode::OpArg,
+    ) -> usize = crate::pyopcode::jump_target_forward_from_oparg;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::pyopcode::jump_target_forward_from_oparg",
+        "pyre_interpreter::jump_target_forward_from_oparg",
+        jump_target_forward_from_oparg as *const (),
+    );
+
+    let jump_target_backward_decoded: fn(
+        &crate::CodeObject,
+        usize,
+        crate::bytecode::Arg<crate::bytecode::oparg::Label>,
+        crate::bytecode::OpArg,
+    ) -> usize = crate::pyopcode::jump_target_backward_decoded;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::pyopcode::jump_target_backward_decoded",
+        "pyre_interpreter::jump_target_backward_decoded",
+        jump_target_backward_decoded as *const (),
+    );
+
+    let binary_op_arg: fn(
+        crate::bytecode::Arg<crate::bytecode::oparg::BinaryOperator>,
+        crate::bytecode::OpArg,
+    ) -> crate::bytecode::BinaryOperator = crate::pyopcode::binary_op_arg;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::pyopcode::binary_op_arg",
+        "pyre_interpreter::binary_op_arg",
+        binary_op_arg as *const (),
+    );
+
+    let comparison_op_arg: fn(
+        crate::bytecode::Arg<crate::bytecode::oparg::ComparisonOperator>,
+        crate::bytecode::OpArg,
+    ) -> crate::bytecode::ComparisonOperator = crate::pyopcode::comparison_op_arg;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::pyopcode::comparison_op_arg",
+        "pyre_interpreter::comparison_op_arg",
+        comparison_op_arg as *const (),
+    );
+
+    let invert_arg: fn(
+        crate::bytecode::Arg<crate::bytecode::oparg::Invert>,
+        crate::bytecode::OpArg,
+    ) -> crate::bytecode::Invert = crate::pyopcode::invert_arg;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::pyopcode::invert_arg",
+        "pyre_interpreter::invert_arg",
+        invert_arg as *const (),
+    );
+
+    let build_slice_arg: fn(
+        crate::bytecode::Arg<crate::bytecode::oparg::BuildSliceArgCount>,
+        crate::bytecode::OpArg,
+    ) -> crate::bytecode::BuildSliceArgCount = crate::pyopcode::build_slice_arg;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::pyopcode::build_slice_arg",
+        "pyre_interpreter::build_slice_arg",
+        build_slice_arg as *const (),
+    );
+
+    let common_constant_arg: fn(
+        crate::bytecode::Arg<crate::bytecode::oparg::CommonConstant>,
+        crate::bytecode::OpArg,
+    ) -> crate::bytecode::CommonConstant = crate::pyopcode::common_constant_arg;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::pyopcode::common_constant_arg",
+        "pyre_interpreter::common_constant_arg",
+        common_constant_arg as *const (),
+    );
+
+    let convert_value_arg: fn(
+        crate::bytecode::Arg<crate::bytecode::oparg::ConvertValueOparg>,
+        crate::bytecode::OpArg,
+    ) -> crate::bytecode::ConvertValueOparg = crate::pyopcode::convert_value_arg;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::pyopcode::convert_value_arg",
+        "pyre_interpreter::convert_value_arg",
+        convert_value_arg as *const (),
+    );
+
+    let special_method_arg: fn(
+        crate::bytecode::Arg<crate::bytecode::oparg::SpecialMethod>,
+        crate::bytecode::OpArg,
+    ) -> crate::bytecode::SpecialMethod = crate::pyopcode::special_method_arg;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::pyopcode::special_method_arg",
+        "pyre_interpreter::special_method_arg",
+        special_method_arg as *const (),
+    );
+
+    let make_function_flag_arg: fn(
+        crate::bytecode::Arg<crate::bytecode::oparg::MakeFunctionFlag>,
+        crate::bytecode::OpArg,
+    ) -> crate::bytecode::MakeFunctionFlag = crate::pyopcode::make_function_flag_arg;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::pyopcode::make_function_flag_arg",
+        "pyre_interpreter::make_function_flag_arg",
+        make_function_flag_arg as *const (),
+    );
+
+    let intrinsic_function_1_arg: fn(
+        crate::bytecode::Arg<crate::bytecode::oparg::IntrinsicFunction1>,
+        crate::bytecode::OpArg,
+    ) -> crate::bytecode::IntrinsicFunction1 = crate::pyopcode::intrinsic_function_1_arg;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::pyopcode::intrinsic_function_1_arg",
+        "pyre_interpreter::intrinsic_function_1_arg",
+        intrinsic_function_1_arg as *const (),
+    );
+
+    let intrinsic_function_2_arg: fn(
+        crate::bytecode::Arg<crate::bytecode::oparg::IntrinsicFunction2>,
+        crate::bytecode::OpArg,
+    ) -> crate::bytecode::IntrinsicFunction2 = crate::pyopcode::intrinsic_function_2_arg;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::pyopcode::intrinsic_function_2_arg",
+        "pyre_interpreter::intrinsic_function_2_arg",
+        intrinsic_function_2_arg as *const (),
+    );
+
+    let raise_kind_arg_as_usize: fn(
+        crate::bytecode::Arg<crate::bytecode::oparg::RaiseKind>,
+        crate::bytecode::OpArg,
+    ) -> usize = crate::pyopcode::raise_kind_arg_as_usize;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::pyopcode::raise_kind_arg_as_usize",
+        "pyre_interpreter::raise_kind_arg_as_usize",
+        raise_kind_arg_as_usize as *const (),
+    );
+
     // `PyError::type_error` — invoked by `stack_underflow_error`'s body
     // (`shared_opcode.rs:181-183`). The codewriter resolves it to the
     // 2-segment CallPath `["PyError", "type_error"]` (impl-method shape:
