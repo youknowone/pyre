@@ -311,6 +311,53 @@ pub fn ll_bool() -> Result<(), TyperError> {
     Err(builder_runtime_deferred("ll_bool"))
 }
 
+/// Synthesise `ll_bool(ll_builder)` (`rbuilder.py:417-418`):
+/// `ll_builder != nullptr(lltype.typeOf(ll_builder).TO)`.
+pub fn build_ll_bool_helper_graph(
+    name: &str,
+    builder_ptr_lltype: LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    let ll_builder = variable_with_lltype("ll_builder", builder_ptr_lltype.clone());
+    let startblock = Block::shared(vec![Hlvalue::Variable(ll_builder.clone())]);
+    let return_var = variable_with_lltype("result", LowLevelType::Bool);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    // result = ptr_ne(ll_builder, nullptr(TO))
+    let null_builder = Hlvalue::Constant(Constant::with_concretetype(
+        ConstValue::None,
+        builder_ptr_lltype,
+    ));
+    let result = variable_with_lltype("result", LowLevelType::Bool);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "ptr_ne",
+        vec![Hlvalue::Variable(ll_builder), null_builder],
+        Hlvalue::Variable(result.clone()),
+    ));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(result)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["ll_builder".to_string()],
+        func,
+    ))
+}
+
 /// RPython `class BaseStringBuilderRepr(AbstractStringBuilderRepr)`.
 #[derive(Debug, Default)]
 pub struct BaseStringBuilderRepr;
@@ -462,6 +509,33 @@ mod tests {
             ret.concretetype.borrow().clone(),
             Some(LowLevelType::Signed)
         );
+    }
+
+    #[test]
+    fn build_ll_bool_compares_pointer_against_null_and_returns_bool() {
+        use super::Hlvalue;
+        let helper = super::build_ll_bool_helper_graph("ll_bool", super::STRINGBUILDERPTR.clone())
+            .expect("build_ll_bool_helper_graph");
+        assert_eq!(helper.func.name, "ll_bool");
+        let inner = helper.graph.borrow();
+        let startblock = inner.startblock.borrow();
+        // ll_builder != nullptr(TO)
+        let ops: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|op| op.opname.as_str())
+            .collect();
+        assert_eq!(ops, vec!["ptr_ne"]);
+        assert_eq!(startblock.inputargs.len(), 1);
+        // second arg is the null pointer constant of the builder's own type.
+        let Hlvalue::Constant(null_arg) = &startblock.operations[0].args[1] else {
+            panic!("ptr_ne second arg must be a null Constant");
+        };
+        assert_eq!(null_arg.value, super::ConstValue::None);
+        let Hlvalue::Variable(ret) = &inner.returnblock.borrow().inputargs[0] else {
+            panic!("returnblock inputarg must be a Variable");
+        };
+        assert_eq!(ret.concretetype.borrow().clone(), Some(LowLevelType::Bool));
     }
 
     #[test]
