@@ -606,6 +606,201 @@ pub fn build_ll_shrink_final_helper_graph(
     ))
 }
 
+/// Synthesise `_ll_append(ll_builder, ll_str, start, size)`
+/// (`rbuilder.py:80-89`):
+///
+/// ```python
+/// pos = ll_builder.current_pos
+/// end = ll_builder.current_end
+/// if (end - pos) < size:
+///     ll_grow_and_append(ll_builder, ll_str, start, size)
+/// else:
+///     ll_builder.current_pos = pos + size
+///     ll_builder.copy_string_contents(ll_str, ll_builder.current_buf,
+///                                     start, pos, size)
+/// ```
+///
+/// `ll_grow_and_append` / `copy_string_contents` are baked in as
+/// `direct_call` callee consts. `buf_lltype` = `STRPTR`/`UNICODEPTR`
+/// (both `ll_str` and `current_buf`). Returns `Void`.
+pub fn build_ll__ll_append_helper_graph(
+    name: &str,
+    builder_ptr_lltype: LowLevelType,
+    buf_lltype: LowLevelType,
+    grow_and_append_fn: Constant,
+    copy_fn: Constant,
+) -> Result<PyGraph, TyperError> {
+    let bool_case = |b: bool| Some(constant_with_lltype(ConstValue::Bool(b), LowLevelType::Bool));
+    let void_result = || variable_with_lltype("v", LowLevelType::Void);
+    let none_const = || {
+        Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::None,
+            LowLevelType::Void,
+        ))
+    };
+
+    let ll_builder = variable_with_lltype("ll_builder", builder_ptr_lltype.clone());
+    let ll_str = variable_with_lltype("ll_str", buf_lltype.clone());
+    let start = variable_with_lltype("start", LowLevelType::Signed);
+    let size = variable_with_lltype("size", LowLevelType::Signed);
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(ll_builder.clone()),
+        Hlvalue::Variable(ll_str.clone()),
+        Hlvalue::Variable(start.clone()),
+        Hlvalue::Variable(size.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", LowLevelType::Void);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    // grow arm: ll_grow_and_append(ll_builder, ll_str, start, size).
+    let g_llb = variable_with_lltype("ll_builder", builder_ptr_lltype.clone());
+    let g_str = variable_with_lltype("ll_str", buf_lltype.clone());
+    let g_start = variable_with_lltype("start", LowLevelType::Signed);
+    let g_size = variable_with_lltype("size", LowLevelType::Signed);
+    let block_grow = Block::shared(vec![
+        Hlvalue::Variable(g_llb.clone()),
+        Hlvalue::Variable(g_str.clone()),
+        Hlvalue::Variable(g_start.clone()),
+        Hlvalue::Variable(g_size.clone()),
+    ]);
+    block_grow.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![
+            Hlvalue::Constant(grow_and_append_fn),
+            Hlvalue::Variable(g_llb),
+            Hlvalue::Variable(g_str),
+            Hlvalue::Variable(g_start),
+            Hlvalue::Variable(g_size),
+        ],
+        Hlvalue::Variable(void_result()),
+    ));
+    block_grow.closeblock(vec![
+        Link::new(vec![none_const()], Some(graph.returnblock.clone()), None).into_ref(),
+    ]);
+
+    // copy arm: current_pos = pos + size; copy_string_contents(...).
+    let c_llb = variable_with_lltype("ll_builder", builder_ptr_lltype);
+    let c_str = variable_with_lltype("ll_str", buf_lltype.clone());
+    let c_start = variable_with_lltype("start", LowLevelType::Signed);
+    let c_size = variable_with_lltype("size", LowLevelType::Signed);
+    let c_pos = variable_with_lltype("pos", LowLevelType::Signed);
+    let block_copy = Block::shared(vec![
+        Hlvalue::Variable(c_llb.clone()),
+        Hlvalue::Variable(c_str.clone()),
+        Hlvalue::Variable(c_start.clone()),
+        Hlvalue::Variable(c_size.clone()),
+        Hlvalue::Variable(c_pos.clone()),
+    ]);
+    let c_newpos = variable_with_lltype("newpos", LowLevelType::Signed);
+    block_copy.borrow_mut().operations.push(SpaceOperation::new(
+        "int_add",
+        vec![Hlvalue::Variable(c_pos.clone()), Hlvalue::Variable(c_size.clone())],
+        Hlvalue::Variable(c_newpos.clone()),
+    ));
+    block_copy.borrow_mut().operations.push(SpaceOperation::new(
+        "setfield",
+        vec![
+            Hlvalue::Variable(c_llb.clone()),
+            void_field_const("current_pos"),
+            Hlvalue::Variable(c_newpos),
+        ],
+        Hlvalue::Variable(void_result()),
+    ));
+    let c_buf = variable_with_lltype("current_buf", buf_lltype);
+    block_copy.borrow_mut().operations.push(SpaceOperation::new(
+        "getfield",
+        vec![Hlvalue::Variable(c_llb), void_field_const("current_buf")],
+        Hlvalue::Variable(c_buf.clone()),
+    ));
+    block_copy.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![
+            Hlvalue::Constant(copy_fn),
+            Hlvalue::Variable(c_str),
+            Hlvalue::Variable(c_buf),
+            Hlvalue::Variable(c_start),
+            Hlvalue::Variable(c_pos),
+            Hlvalue::Variable(c_size),
+        ],
+        Hlvalue::Variable(void_result()),
+    ));
+    block_copy.closeblock(vec![
+        Link::new(vec![none_const()], Some(graph.returnblock.clone()), None).into_ref(),
+    ]);
+
+    // startblock: pos/end read; branch on (end - pos) < size.
+    let pos = variable_with_lltype("pos", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "getfield",
+        vec![Hlvalue::Variable(ll_builder.clone()), void_field_const("current_pos")],
+        Hlvalue::Variable(pos.clone()),
+    ));
+    let end = variable_with_lltype("end", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "getfield",
+        vec![Hlvalue::Variable(ll_builder.clone()), void_field_const("current_end")],
+        Hlvalue::Variable(end.clone()),
+    ));
+    let avail = variable_with_lltype("avail", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "int_sub",
+        vec![Hlvalue::Variable(end), Hlvalue::Variable(pos.clone())],
+        Hlvalue::Variable(avail.clone()),
+    ));
+    let too_small = variable_with_lltype("too_small", LowLevelType::Bool);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "int_lt",
+        vec![Hlvalue::Variable(avail), Hlvalue::Variable(size.clone())],
+        Hlvalue::Variable(too_small.clone()),
+    ));
+    startblock.borrow_mut().exitswitch = Some(Hlvalue::Variable(too_small));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(ll_builder.clone()),
+                Hlvalue::Variable(ll_str.clone()),
+                Hlvalue::Variable(start.clone()),
+                Hlvalue::Variable(size.clone()),
+            ],
+            Some(block_grow),
+            bool_case(true),
+        )
+        .into_ref(),
+        Link::new(
+            vec![
+                Hlvalue::Variable(ll_builder),
+                Hlvalue::Variable(ll_str),
+                Hlvalue::Variable(start),
+                Hlvalue::Variable(size),
+                Hlvalue::Variable(pos),
+            ],
+            Some(block_copy),
+            bool_case(false),
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec![
+            "ll_builder".to_string(),
+            "ll_str".to_string(),
+            "start".to_string(),
+            "size".to_string(),
+        ],
+        func,
+    ))
+}
+
 /// Synthesise `ll_fold_pieces(ll_builder)` (`rbuilder.py:374-412`):
 ///
 /// ```python
@@ -1448,6 +1643,48 @@ mod tests {
             }
         }
         (count, all_ops)
+    }
+
+    #[test]
+    fn build_ll__ll_append_branches_grow_vs_inline_copy() {
+        use super::Hlvalue;
+        let helper = super::build_ll__ll_append_helper_graph(
+            "_ll_append",
+            super::STRINGBUILDERPTR.clone(),
+            super::STRPTR.clone(),
+            dummy_funcptr_const(),
+            dummy_funcptr_const(),
+        )
+        .expect("build_ll__ll_append_helper_graph");
+        assert_eq!(helper.func.name, "_ll_append");
+        let inner = helper.graph.borrow();
+
+        let startblock = inner.startblock.borrow();
+        let start_ops: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|o| o.opname.as_str())
+            .collect();
+        assert_eq!(start_ops, vec!["getfield", "getfield", "int_sub", "int_lt"]);
+        assert_eq!(startblock.inputargs.len(), 4);
+        assert_eq!(startblock.exits.len(), 2);
+        drop(startblock);
+
+        let (count, all_ops) = walk_ops(&inner.startblock);
+        // start, grow, copy, returnblock
+        assert_eq!(count, 4);
+        let n = |name: &str| all_ops.iter().filter(|o| o.as_str() == name).count();
+        assert_eq!(n("getfield"), 3); // current_pos, current_end, current_buf
+        assert_eq!(n("int_sub"), 1);
+        assert_eq!(n("int_lt"), 1);
+        assert_eq!(n("int_add"), 1);
+        assert_eq!(n("setfield"), 1);
+        assert_eq!(n("direct_call"), 2); // grow_and_append, copy_string_contents
+
+        let Hlvalue::Variable(ret) = &inner.returnblock.borrow().inputargs[0] else {
+            panic!("returnblock inputarg must be a Variable");
+        };
+        assert_eq!(ret.concretetype.borrow().clone(), Some(LowLevelType::Void));
     }
 
     #[test]
