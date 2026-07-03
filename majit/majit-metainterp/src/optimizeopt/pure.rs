@@ -1441,7 +1441,8 @@ mod tests {
                         input_boxes[slot]
                             .get_or_insert_with(|| {
                                 crate::history::test_support::rooted_inputarg_operand(
-                                    Type::Int, *idx,
+                                    Type::Int,
+                                    *idx,
                                 )
                             })
                             .clone()

@@ -267,9 +267,9 @@ pub fn deserialize_optimizer_knowledge(
             if raw_ref != 0 {
                 // bridgeopt.py:145 `optimizer.cpu.cls_of_box(box)` — the
                 // runtime box is a `ConstPtr` carrying the GcRef payload.
-                let const_box = majit_ir::operand::Operand::const_from_value(
-                    majit_ir::Value::Ref(majit_ir::GcRef(raw_ref as usize)),
-                );
+                let const_box = majit_ir::operand::Operand::const_from_value(majit_ir::Value::Ref(
+                    majit_ir::GcRef(raw_ref as usize),
+                ));
                 let cls = cpu.cls_of_box(&const_box);
                 // optimizer.py:137-152 `make_constant_class` updates
                 // `_forwarded` after `get_box_replacement`. `livebox` is a

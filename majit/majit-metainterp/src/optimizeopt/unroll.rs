@@ -5521,9 +5521,7 @@ impl Optimization for OptUnroll {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::history::test_support::{
-        rooted_inputarg_operand, rooted_resop_operand,
-    };
+    use crate::history::test_support::{rooted_inputarg_operand, rooted_resop_operand};
     use crate::optimizeopt::optimizer::Optimizer;
     use majit_ir::GcRef;
     use majit_ir::operand::Operand;
@@ -6589,11 +6587,8 @@ mod tests {
         ctx.exported_short_boxes
             .push(crate::optimizeopt::shortpreamble::PreambleOp {
                 op: {
-                    let mut op = Op::with_descr(
-                        OpCode::GetfieldGcI,
-                        &[si0.clone()],
-                        field_descr.clone(),
-                    );
+                    let mut op =
+                        Op::with_descr(OpCode::GetfieldGcI, &[si0.clone()], field_descr.clone());
                     op.pos.set(OpRef::int_op(11));
                     std::rc::Rc::new(op)
                 },

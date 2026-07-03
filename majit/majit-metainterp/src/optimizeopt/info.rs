@@ -118,9 +118,7 @@ impl EnsuredPtrInfo {
                     Some(IntBound::from_constant(length))
                 }
             }
-            EnsuredPtrInfo::Forwarded(o) => {
-                o.ptr_info_mut().and_then(|mut p| p.getlenbound(mode))
-            }
+            EnsuredPtrInfo::Forwarded(o) => o.ptr_info_mut().and_then(|mut p| p.getlenbound(mode)),
         }
     }
 

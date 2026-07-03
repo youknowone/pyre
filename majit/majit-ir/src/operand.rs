@@ -21,8 +21,7 @@
 //! identity at construction.
 
 use crate::box_ref::{
-    Forwarded, ForwardingHost, IntBoundBorrow, IntBoundBorrowMut, PtrInfoBorrow,
-    PtrInfoBorrowMut,
+    Forwarded, ForwardingHost, IntBoundBorrow, IntBoundBorrowMut, PtrInfoBorrow, PtrInfoBorrowMut,
 };
 use crate::intbound::IntBound;
 use crate::op_info::OpInfo;

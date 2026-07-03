@@ -8539,10 +8539,7 @@ mod boxref_forwarding_tests {
         let consumer_arg = ctx.materialize_operand_at(pos2);
 
         // The producer emits at pos 2.
-        let mut producer = Op::new(
-            OpCode::IntLt,
-            &[b0.clone(), b1.clone()],
-        );
+        let mut producer = Op::new(OpCode::IntLt, &[b0.clone(), b1.clone()]);
         producer.pos.set(pos2);
         ctx.emit(producer);
 
@@ -8829,10 +8826,7 @@ mod boxref_forwarding_tests {
         let source_p2 = OpRef::input_arg_ref(2);
 
         // Step 1: import_state's `source.set_forwarded(target)` equivalent.
-        ctx.make_equal_to(
-            &source_box,
-            &placeholder_target,
-        );
+        ctx.make_equal_to(&source_box, &placeholder_target);
 
         // Step 2: setinfo_from_preamble's terminal write.
         // `setinfo_from_preamble(source, info)` first walks the chain via
@@ -8899,10 +8893,7 @@ mod boxref_forwarding_tests {
 
         // import_state's make_equal_to fires, but the body import chose NOT to import
         // info (e.g. exported_infos didn't carry an entry for target_p1).
-        ctx.make_equal_to(
-            &source_box,
-            &placeholder_target,
-        );
+        ctx.make_equal_to(&source_box, &placeholder_target);
 
         // operand-path reader: chain walks source → placeholder → None.
         let source_p2_box = ctx.get_box_replacement_operand(source_p2);
@@ -9032,20 +9023,14 @@ mod boxref_forwarding_tests {
             avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
         });
         ctx.set_ptr_info(&b, info);
-        assert!(
-            ctx.peek_ptr_info(&b)
-                .is_some_and(|i| i.is_virtual())
-        );
+        assert!(ctx.peek_ptr_info(&b).is_some_and(|i| i.is_virtual()));
         assert!(ctx.is_virtual(&b));
     }
 
     #[test]
     fn h3_2c_is_virtual_returns_false_for_nonnull_only() {
         let (mut ctx, b) = ctx_with_one_ref_box();
-        ctx.set_ptr_info(
-            &b,
-            PtrInfo::NonNull { last_guard_pos: -1 },
-        );
+        ctx.set_ptr_info(&b, PtrInfo::NonNull { last_guard_pos: -1 });
         assert!(!ctx.is_virtual(&b));
     }
 
@@ -9058,14 +9043,8 @@ mod boxref_forwarding_tests {
     #[test]
     fn h3_2c_is_nonnull_matches_set_info() {
         let (mut ctx, b) = ctx_with_one_ref_box();
-        ctx.set_ptr_info(
-            &b,
-            PtrInfo::NonNull { last_guard_pos: -1 },
-        );
-        assert!(
-            ctx.peek_ptr_info(&b)
-                .is_some_and(|i| i.is_nonnull())
-        );
+        ctx.set_ptr_info(&b, PtrInfo::NonNull { last_guard_pos: -1 });
+        assert!(ctx.peek_ptr_info(&b).is_some_and(|i| i.is_nonnull()));
         assert!(ctx.is_nonnull(&b));
     }
 
@@ -9082,9 +9061,7 @@ mod boxref_forwarding_tests {
         let legacy = ctx
             .peek_intbound(OpRef::input_arg_int(0))
             .expect("legacy bound");
-        let via_box = ctx
-            .peek_intbound_box(&b0)
-            .expect("box bound");
+        let via_box = ctx.peek_intbound_box(&b0).expect("box bound");
         assert!(legacy.is_constant());
         assert_eq!(legacy.get_constant_int(), 42);
         assert!(via_box.is_constant());
@@ -9100,14 +9077,10 @@ mod boxref_forwarding_tests {
     #[test]
     fn h3_2c_last_guard_pos_matches_legacy_when_pool_plumbed() {
         let (mut ctx, b) = ctx_with_one_ref_box();
-        ctx.set_ptr_info(
-            &b,
-            PtrInfo::NonNull { last_guard_pos: 5 },
-        );
+        ctx.set_ptr_info(&b, PtrInfo::NonNull { last_guard_pos: 5 });
         assert_eq!(ctx.last_guard_pos(&b), Some(5));
         assert_eq!(
-            ctx.peek_ptr_info(&b)
-                .and_then(|i| i.get_last_guard_pos()),
+            ctx.peek_ptr_info(&b).and_then(|i| i.get_last_guard_pos()),
             Some(5)
         );
     }
@@ -9122,10 +9095,7 @@ mod boxref_forwarding_tests {
     fn h3_2c_last_guard_pos_returns_none_when_no_recorded_guard() {
         let (mut ctx, b) = ctx_with_one_ref_box();
         // info.py:91 last_guard_pos == -1 → get_last_guard_pos returns None.
-        ctx.set_ptr_info(
-            &b,
-            PtrInfo::NonNull { last_guard_pos: -1 },
-        );
+        ctx.set_ptr_info(&b, PtrInfo::NonNull { last_guard_pos: -1 });
         assert!(ctx.last_guard_pos(&b).is_none());
     }
 
@@ -9151,10 +9121,7 @@ mod boxref_forwarding_tests {
     #[test]
     fn h3_2c_is_virtualizable_returns_false_for_nonnull_only() {
         let (mut ctx, b) = ctx_with_one_ref_box();
-        ctx.set_ptr_info(
-            &b,
-            PtrInfo::NonNull { last_guard_pos: -1 },
-        );
+        ctx.set_ptr_info(&b, PtrInfo::NonNull { last_guard_pos: -1 });
         assert!(!ctx.is_virtualizable(&b));
     }
 
@@ -9167,10 +9134,7 @@ mod boxref_forwarding_tests {
     #[test]
     fn h3_2c_has_ptr_info_matches_set_info() {
         let (mut ctx, b) = ctx_with_one_ref_box();
-        ctx.set_ptr_info(
-            &b,
-            PtrInfo::NonNull { last_guard_pos: -1 },
-        );
+        ctx.set_ptr_info(&b, PtrInfo::NonNull { last_guard_pos: -1 });
         assert!(ctx.has_ptr_info(&b));
         assert!(ctx.peek_ptr_info(&b).is_some());
     }
@@ -9184,13 +9148,8 @@ mod boxref_forwarding_tests {
     #[test]
     fn h3_2c_peek_ptr_info_returns_set_info() {
         let (mut ctx, b) = ctx_with_one_ref_box();
-        ctx.set_ptr_info(
-            &b,
-            PtrInfo::NonNull { last_guard_pos: 5 },
-        );
-        let via_box = ctx
-            .peek_ptr_info(&b)
-            .expect("box clone");
+        ctx.set_ptr_info(&b, PtrInfo::NonNull { last_guard_pos: 5 });
+        let via_box = ctx.peek_ptr_info(&b).expect("box clone");
         assert!(matches!(via_box, PtrInfo::NonNull { last_guard_pos: 5 }));
     }
 
@@ -9208,10 +9167,7 @@ mod boxref_forwarding_tests {
     #[test]
     fn h3_2c_with_ptr_info_mut_mirrors_after_mutation_when_pool_plumbed() {
         let (mut ctx, b) = ctx_with_one_ref_box();
-        ctx.set_ptr_info(
-            &b,
-            PtrInfo::NonNull { last_guard_pos: 0 },
-        );
+        ctx.set_ptr_info(&b, PtrInfo::NonNull { last_guard_pos: 0 });
         // Pre-condition: operand snapshot matches legacy at pos 0.
         assert_eq!(ctx.last_guard_pos(&b), Some(0));
         // Mutate inner state via closure.
@@ -9225,8 +9181,7 @@ mod boxref_forwarding_tests {
         // Post-condition: operand snapshot reflects mutation (mirror ran).
         assert_eq!(ctx.last_guard_pos(&b), Some(42));
         assert_eq!(
-            ctx.peek_ptr_info(&b)
-                .and_then(|i| i.get_last_guard_pos()),
+            ctx.peek_ptr_info(&b).and_then(|i| i.get_last_guard_pos()),
             Some(42)
         );
     }
@@ -9250,10 +9205,7 @@ mod boxref_forwarding_tests {
     #[test]
     fn ptr_info_handle_live_identity_propagates_mutation() {
         let (mut ctx, b) = ctx_with_one_ref_box();
-        ctx.set_ptr_info(
-            &b,
-            PtrInfo::NonNull { last_guard_pos: 0 },
-        );
+        ctx.set_ptr_info(&b, PtrInfo::NonNull { last_guard_pos: 0 });
         let h1 = ctx
             .getptrinfo_handle(&b)
             .expect("Live handle for installed PtrInfo");
@@ -9416,10 +9368,7 @@ mod boxref_forwarding_tests {
         let (b, _ia_b) = bound_inputarg_operand(Type::Ref, 1);
         let (c, _ia_c) = bound_inputarg_operand(Type::Ref, 2);
         ctx.seed_boxes_canonical(&[a.clone(), b.clone(), c.clone()]);
-        ctx.set_ptr_info(
-            &a,
-            PtrInfo::NonNull { last_guard_pos: 7 },
-        );
+        ctx.set_ptr_info(&a, PtrInfo::NonNull { last_guard_pos: 7 });
 
         ctx.make_equal_to(&a, &b);
         ctx.make_equal_to(&b, &c);
@@ -9458,10 +9407,7 @@ mod boxref_forwarding_tests {
         let old_handle = ctx.getintbound_handle(&old_box);
         assert!(matches!(old_handle, IntBoundHandle::Live(_)));
 
-        ctx.make_equal_to(
-            &old_box,
-            &new_box,
-        );
+        ctx.make_equal_to(&old_box, &new_box);
         let new_handle = ctx.getintbound_handle(&new_box);
         assert!(
             old_handle.ptr_eq(&new_handle),
@@ -9490,18 +9436,12 @@ mod boxref_forwarding_tests {
         let (old_box, _ia_old) = bound_inputarg_operand(Type::Ref, 0);
         let (new_box, _ia_new) = bound_inputarg_operand(Type::Ref, 1);
         ctx.seed_boxes_canonical(&[old_box.clone(), new_box.clone()]);
-        ctx.set_ptr_info(
-            &old_box,
-            PtrInfo::NonNull { last_guard_pos: 0 },
-        );
+        ctx.set_ptr_info(&old_box, PtrInfo::NonNull { last_guard_pos: 0 });
 
         let old_handle = ctx
             .getptrinfo_handle(&old_box)
             .expect("install populated _forwarded on old");
-        ctx.make_equal_to(
-            &old_box,
-            &new_box,
-        );
+        ctx.make_equal_to(&old_box, &new_box);
         let new_handle = ctx
             .getptrinfo_handle(&new_box)
             .expect("PtrInfo transferred to new via clone of Rc cell");
@@ -9539,10 +9479,7 @@ mod boxref_forwarding_tests {
         let old_handle = ctx.getintbound_handle(&old_box);
         assert!(matches!(old_handle, IntBoundHandle::Live(_)));
 
-        ctx.make_equal_to(
-            &old_box,
-            &new_box,
-        );
+        ctx.make_equal_to(&old_box, &new_box);
         let new_handle = ctx.getintbound_handle(&new_box);
         assert!(
             old_handle.ptr_eq(&new_handle),
@@ -9558,18 +9495,12 @@ mod boxref_forwarding_tests {
         let (old_box, _ia_old) = bound_inputarg_operand(Type::Ref, 0);
         let (new_box, _ia_new) = bound_inputarg_operand(Type::Ref, 1);
         ctx.seed_boxes_canonical(&[old_box.clone(), new_box.clone()]);
-        ctx.set_ptr_info(
-            &old_box,
-            PtrInfo::NonNull { last_guard_pos: 0 },
-        );
+        ctx.set_ptr_info(&old_box, PtrInfo::NonNull { last_guard_pos: 0 });
 
         let old_handle = ctx
             .getptrinfo_handle(&old_box)
             .expect("populated _forwarded on old");
-        ctx.make_equal_to(
-            &old_box,
-            &new_box,
-        );
+        ctx.make_equal_to(&old_box, &new_box);
         let new_handle = ctx
             .getptrinfo_handle(&new_box)
             .expect("PtrInfo transferred to new via clone of Rc cell");

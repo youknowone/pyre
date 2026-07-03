@@ -391,11 +391,7 @@ impl<'a> ResOpGen<'a> {
         links
     }
 
-    fn add_link_for_box(
-        &mut self,
-        links: &mut Vec<(String, (String, (u8, u8, u8)))>,
-        box_: OpRef,
-    ) {
+    fn add_link_for_box(&mut self, links: &mut Vec<(String, (String, (u8, u8, u8)))>, box_: OpRef) {
         let short = self.repr_short(box_);
         if short.len() > 1
             && matches!(short.as_bytes()[0], b'i' | b'r' | b'f')

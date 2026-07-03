@@ -1431,11 +1431,7 @@ impl PtrInfo {
                 .map(|fd| fd.field_type())
                 .unwrap_or(Type::Int);
             let opcode = OpCode::getfield_for_type(tp);
-            result.push(Op::with_descr(
-                opcode,
-                &[structbox.clone()],
-                descr,
-            ));
+            result.push(Op::with_descr(opcode, &[structbox.clone()], descr));
         };
         if let PtrInfo::Virtual(v) = self {
             for (field_idx, value) in &v.fields {

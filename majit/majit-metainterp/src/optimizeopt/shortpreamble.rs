@@ -35,7 +35,6 @@ use majit_ir::operand::Operand;
 use majit_ir::vec_set::VecSet;
 use majit_ir::{GcRef, Op, OpCode, OpRef};
 
-
 use crate::optimizeopt::virtualstate::VirtualState;
 use majit_ir::VecMap;
 
@@ -398,9 +397,7 @@ impl PreambleOp {
                     .op
                     .getarglist()
                     .iter()
-                    .map(|arg| {
-                        sb.produce_arg(ctx, arg.to_opref())
-                    })
+                    .map(|arg| sb.produce_arg(ctx, arg.to_opref()))
                     .collect::<Option<smallvec::SmallVec<[majit_ir::operand::Operand; 3]>>>()?;
                 let opnum = if self.op.opcode.is_call() {
                     match self.op.opcode {
@@ -424,9 +421,7 @@ impl PreambleOp {
                     .op
                     .getarglist()
                     .iter()
-                    .map(|arg| {
-                        sb.produce_arg(ctx, arg.to_opref())
-                    })
+                    .map(|arg| sb.produce_arg(ctx, arg.to_opref()))
                     .collect::<Option<smallvec::SmallVec<[majit_ir::operand::Operand; 3]>>>()?;
                 let opnum = match self.op.opcode {
                     OpCode::CallI => OpCode::CallLoopinvariantI,
@@ -816,7 +811,9 @@ impl ShortBoxes {
                     let label_arg_idx = existing.label_arg_idx;
                     return Some(self.renamed_short_inputarg(label_arg_idx));
                 }
-                return Some(majit_ir::operand::Operand::from_bound_op(&existing.preamble_op));
+                return Some(majit_ir::operand::Operand::from_bound_op(
+                    &existing.preamble_op,
+                ));
             }
             if self.boxes_in_production.contains(&okey) {
                 return None;
@@ -844,7 +841,9 @@ impl ShortBoxes {
             if produced.kind == PreambleOpKind::InputArg {
                 return Some(self.renamed_short_inputarg(produced.label_arg_idx));
             }
-            return Some(majit_ir::operand::Operand::from_bound_op(&produced.preamble_op));
+            return Some(majit_ir::operand::Operand::from_bound_op(
+                &produced.preamble_op,
+            ));
         }
         // shortpreamble.py:295-296 `else: return None`. Every label arg is
         // registered as a ShortInputArg in `potential_ops`
@@ -1681,9 +1680,7 @@ impl ProducedShortOp {
         // shortpreamble.py:66-68: if g.getarg(0) in exported_infos:
         //     setinfo_from_preamble(g.getarg(0), exported_infos[...])
         // Pass the Rc handle (unroll.py:61 identity preservation).
-        if let Some(crate::optimizeopt::info::OpInfo::Ptr(rc)) =
-            exported_infos.get(&object_arg)
-        {
+        if let Some(crate::optimizeopt::info::OpInfo::Ptr(rc)) = exported_infos.get(&object_arg) {
             ctx.setinfo_from_preamble(obj_resolved, rc, Some(exported_infos));
         }
         let mut getfield_op = Op::new(
@@ -1817,9 +1814,7 @@ impl ProducedShortOp {
         // getarrayitem: if the base object has exported info, import it
         // before ensuring heap/array PtrInfo.
         // Pass the Rc handle (unroll.py:61 identity preservation).
-        if let Some(crate::optimizeopt::info::OpInfo::Ptr(rc)) =
-            exported_infos.get(&object_arg)
-        {
+        if let Some(crate::optimizeopt::info::OpInfo::Ptr(rc)) = exported_infos.get(&object_arg) {
             ctx.setinfo_from_preamble(obj_resolved, rc, Some(exported_infos));
         }
         let index_const = ctx.make_constant_int(index);
@@ -2307,13 +2302,8 @@ impl ShortPreambleBuilder {
             }
             // shortpreamble.py:284-285 `if op in self.produced_short_boxes`:
             // the dependency check is by the arg Box identity.
-            if self
-                .produced_short_boxes
-                .get(arg)
-                .is_some()
-            {
-                let _ =
-                    self.use_box_recursive(arg, visiting);
+            if self.produced_short_boxes.get(arg).is_some() {
+                let _ = self.use_box_recursive(arg, visiting);
             }
         }
         visiting.remove(result);
@@ -2430,12 +2420,8 @@ impl ShortPreambleBuilder {
         } else {
             (false, None)
         };
-        self.state.record_imported_preamble_use(
-            resolved_op,
-            replay_op,
-            needs_alias,
-            alias_source,
-        );
+        self.state
+            .record_imported_preamble_use(resolved_op, replay_op, needs_alias, alias_source);
     }
 
     pub fn add_preamble_op(&mut self, result: &majit_ir::operand::Operand) -> bool {
@@ -2919,10 +2905,8 @@ impl ExtendedShortPreambleBuilder {
                 None
             };
             if let Some(source) = alias_source {
-                let mut same_as = Op::new(
-                    OpCode::same_as_for_type(replay_op.result_type()),
-                    &[source],
-                );
+                let mut same_as =
+                    Op::new(OpCode::same_as_for_type(replay_op.result_type()), &[source]);
                 same_as.pos.set(op);
                 self.extra_same_as.push(same_as);
             }

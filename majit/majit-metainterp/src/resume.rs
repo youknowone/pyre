@@ -237,7 +237,10 @@ impl SnapshotBox {
     }
 
     pub fn typed(opref: majit_ir::OpRef, tp: majit_ir::Type) -> Self {
-        SnapshotBox { opref, tp: Some(tp) }
+        SnapshotBox {
+            opref,
+            tp: Some(tp),
+        }
     }
 
     /// The trace-position `OpRef` view of this slot.
@@ -4578,8 +4581,9 @@ mod tests {
         // bound to a rooted producer so they shed to Operand::InputArg / Op.
         // Under ptr_eq keying they stay distinct keys (PyPy `box is box`),
         // never collapsed by a shared raw slot index.
-        let input =
-            crate::history::test_support::rooted_operand_from_opref(majit_ir::OpRef::input_arg_int(0));
+        let input = crate::history::test_support::rooted_operand_from_opref(
+            majit_ir::OpRef::input_arg_int(0),
+        );
         let op =
             crate::history::test_support::rooted_operand_from_opref(majit_ir::OpRef::int_op(0));
 
