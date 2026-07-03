@@ -15,13 +15,13 @@
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
 
+#[cfg(feature = "test-support")]
+use crate::OpRef;
 use crate::intbound::IntBound;
 use crate::op_info::OpInfo;
 use crate::ptr_info::PtrInfo;
 use crate::resoperation::Op;
 use crate::value::{Const, InputArg};
-#[cfg(feature = "test-support")]
-use crate::OpRef;
 
 /// Variant of the `_forwarded` slot.
 ///
@@ -326,8 +326,8 @@ pub fn bound_operand_from_opref(a: OpRef) -> crate::operand::Operand {
 #[cfg(test)]
 pub(crate) mod test_support {
     use crate::operand::Operand;
-    use crate::{OpRef, Type};
     use crate::resoperation::{Op, OpCode};
+    use crate::{OpRef, Type};
 
     /// A self-rooting bound `Operand::Op` at `position`: the returned operand
     /// holds a strong `Rc` to the synthetic `SameAs*` / `Jump` producer, so it

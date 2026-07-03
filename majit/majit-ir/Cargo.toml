@@ -7,8 +7,8 @@ repository.workspace = true
 description = "Intermediate representation for majit JIT compiler"
 
 [features]
-# Exposes `box_ref::test_support` cross-crate so downstream test suites
-# (backends / gc / jit-trace) can build bound BoxRefs from a single helper
+# Exposes `forwarding::test_support` cross-crate so downstream test suites
+# (backends / gc / jit-trace) can build bound Operands from a single helper
 # instead of duplicating it. Enabled only from `[dev-dependencies]`, so it
 # never reaches a production build (resolver = "2").
 test-support = []
