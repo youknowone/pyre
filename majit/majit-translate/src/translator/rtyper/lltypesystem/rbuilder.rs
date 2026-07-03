@@ -606,6 +606,156 @@ pub fn build_ll_shrink_final_helper_graph(
     ))
 }
 
+/// Synthesise `ll_append_res0(ll_builder, ll_str)` (`rbuilder.py:172-173`):
+/// `_ll_append(ll_builder, ll_str, 0, len(ll_str.chars))`. `_ll_append` is
+/// baked in as a `direct_call` callee const. Returns `Void`.
+pub fn build_ll_append_res0_helper_graph(
+    name: &str,
+    builder_ptr_lltype: LowLevelType,
+    buf_lltype: LowLevelType,
+    chars_array_ptr_lltype: LowLevelType,
+    ll_append_fn: Constant,
+) -> Result<PyGraph, TyperError> {
+    let void_result = || variable_with_lltype("v", LowLevelType::Void);
+    let none_const = || {
+        Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::None,
+            LowLevelType::Void,
+        ))
+    };
+
+    let ll_builder = variable_with_lltype("ll_builder", builder_ptr_lltype);
+    let ll_str = variable_with_lltype("ll_str", buf_lltype);
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(ll_builder.clone()),
+        Hlvalue::Variable(ll_str.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", LowLevelType::Void);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    // len(ll_str.chars)
+    let chars = variable_with_lltype("chars", chars_array_ptr_lltype);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "getsubstruct",
+        vec![
+            Hlvalue::Variable(ll_str.clone()),
+            constant_with_lltype(ConstValue::byte_str("chars"), LowLevelType::Void),
+        ],
+        Hlvalue::Variable(chars.clone()),
+    ));
+    let len = variable_with_lltype("length", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "getarraysize",
+        vec![Hlvalue::Variable(chars)],
+        Hlvalue::Variable(len.clone()),
+    ));
+    // _ll_append(ll_builder, ll_str, 0, len)
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![
+            Hlvalue::Constant(ll_append_fn),
+            Hlvalue::Variable(ll_builder),
+            Hlvalue::Variable(ll_str),
+            constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed),
+            Hlvalue::Variable(len),
+        ],
+        Hlvalue::Variable(void_result()),
+    ));
+    startblock.closeblock(vec![
+        Link::new(vec![none_const()], Some(graph.returnblock.clone()), None).into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["ll_builder".to_string(), "ll_str".to_string()],
+        func,
+    ))
+}
+
+/// Synthesise `ll_append_res_slice(ll_builder, ll_str, start, end)`
+/// (`rbuilder.py:206-207`): `_ll_append(ll_builder, ll_str, start,
+/// end - start)`. `_ll_append` baked in as a `direct_call` callee const.
+/// Returns `Void`.
+pub fn build_ll_append_res_slice_helper_graph(
+    name: &str,
+    builder_ptr_lltype: LowLevelType,
+    buf_lltype: LowLevelType,
+    ll_append_fn: Constant,
+) -> Result<PyGraph, TyperError> {
+    let void_result = || variable_with_lltype("v", LowLevelType::Void);
+    let none_const = || {
+        Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::None,
+            LowLevelType::Void,
+        ))
+    };
+
+    let ll_builder = variable_with_lltype("ll_builder", builder_ptr_lltype);
+    let ll_str = variable_with_lltype("ll_str", buf_lltype);
+    let start = variable_with_lltype("start", LowLevelType::Signed);
+    let end = variable_with_lltype("end", LowLevelType::Signed);
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(ll_builder.clone()),
+        Hlvalue::Variable(ll_str.clone()),
+        Hlvalue::Variable(start.clone()),
+        Hlvalue::Variable(end.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", LowLevelType::Void);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    // size = end - start
+    let size = variable_with_lltype("size", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "int_sub",
+        vec![Hlvalue::Variable(end), Hlvalue::Variable(start.clone())],
+        Hlvalue::Variable(size.clone()),
+    ));
+    // _ll_append(ll_builder, ll_str, start, size)
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![
+            Hlvalue::Constant(ll_append_fn),
+            Hlvalue::Variable(ll_builder),
+            Hlvalue::Variable(ll_str),
+            Hlvalue::Variable(start),
+            Hlvalue::Variable(size),
+        ],
+        Hlvalue::Variable(void_result()),
+    ));
+    startblock.closeblock(vec![
+        Link::new(vec![none_const()], Some(graph.returnblock.clone()), None).into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec![
+            "ll_builder".to_string(),
+            "ll_str".to_string(),
+            "start".to_string(),
+            "end".to_string(),
+        ],
+        func,
+    ))
+}
+
 /// Synthesise `_ll_append(ll_builder, ll_str, start, size)`
 /// (`rbuilder.py:80-89`):
 ///
@@ -1643,6 +1793,59 @@ mod tests {
             }
         }
         (count, all_ops)
+    }
+
+    #[test]
+    fn build_ll_append_res0_computes_len_then_calls_ll_append() {
+        use super::Hlvalue;
+        let helper = super::build_ll_append_res0_helper_graph(
+            "ll_append_res0",
+            super::STRINGBUILDERPTR.clone(),
+            super::STRPTR.clone(),
+            super::STRPTR.clone(), // chars array ptr placeholder
+            dummy_funcptr_const(),
+        )
+        .expect("build_ll_append_res0_helper_graph");
+        assert_eq!(helper.func.name, "ll_append_res0");
+        let inner = helper.graph.borrow();
+        let startblock = inner.startblock.borrow();
+        let ops: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|o| o.opname.as_str())
+            .collect();
+        assert_eq!(ops, vec!["getsubstruct", "getarraysize", "direct_call"]);
+        assert_eq!(startblock.inputargs.len(), 2);
+        let Hlvalue::Variable(ret) = &inner.returnblock.borrow().inputargs[0] else {
+            panic!("returnblock inputarg must be a Variable");
+        };
+        assert_eq!(ret.concretetype.borrow().clone(), Some(LowLevelType::Void));
+    }
+
+    #[test]
+    fn build_ll_append_res_slice_subtracts_then_calls_ll_append() {
+        use super::Hlvalue;
+        let helper = super::build_ll_append_res_slice_helper_graph(
+            "ll_append_res_slice",
+            super::STRINGBUILDERPTR.clone(),
+            super::STRPTR.clone(),
+            dummy_funcptr_const(),
+        )
+        .expect("build_ll_append_res_slice_helper_graph");
+        assert_eq!(helper.func.name, "ll_append_res_slice");
+        let inner = helper.graph.borrow();
+        let startblock = inner.startblock.borrow();
+        let ops: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|o| o.opname.as_str())
+            .collect();
+        assert_eq!(ops, vec!["int_sub", "direct_call"]);
+        assert_eq!(startblock.inputargs.len(), 4);
+        let Hlvalue::Variable(ret) = &inner.returnblock.borrow().inputargs[0] else {
+            panic!("returnblock inputarg must be a Variable");
+        };
+        assert_eq!(ret.concretetype.borrow().clone(), Some(LowLevelType::Void));
     }
 
     #[test]
