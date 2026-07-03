@@ -1619,6 +1619,156 @@ pub fn build_ll_jit_append_helper_graph(
     ))
 }
 
+/// Synthesise `ll_append_slice(ll_builder, ll_str, start, end)`
+/// (`rbuilder.py:189-195`):
+///
+/// ```python
+/// if jit.we_are_jitted():
+///     ll_jit_append_slice(ll_builder, ll_str, start, end)
+/// else:
+///     # no-jit case: inline the logic of _ll_append() in the caller
+///     _ll_append(ll_builder, ll_str, start, end - start)
+/// ```
+///
+/// Branches on the `we_are_jitted()` symbolic exitswitch (see
+/// [`build_ll_append_helper_graph`]). `ll_jit_append_slice` /
+/// `_ll_append` are `direct_call` callee consts. Returns `Void`.
+pub fn build_ll_append_slice_helper_graph(
+    name: &str,
+    builder_ptr_lltype: LowLevelType,
+    buf_lltype: LowLevelType,
+    jit_append_slice_fn: Constant,
+    ll_append_fn: Constant,
+) -> Result<PyGraph, TyperError> {
+    let void_result = || variable_with_lltype("v", LowLevelType::Void);
+    let none_const = || {
+        Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::None,
+            LowLevelType::Void,
+        ))
+    };
+    let bool_case = |b: bool| Some(constant_with_lltype(ConstValue::Bool(b), LowLevelType::Bool));
+
+    let ll_builder = variable_with_lltype("ll_builder", builder_ptr_lltype.clone());
+    let ll_str = variable_with_lltype("ll_str", buf_lltype.clone());
+    let start = variable_with_lltype("start", LowLevelType::Signed);
+    let end = variable_with_lltype("end", LowLevelType::Signed);
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(ll_builder.clone()),
+        Hlvalue::Variable(ll_str.clone()),
+        Hlvalue::Variable(start.clone()),
+        Hlvalue::Variable(end.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", LowLevelType::Void);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    // jit arm: ll_jit_append_slice(ll_builder, ll_str, start, end).
+    let jit_llb = variable_with_lltype("ll_builder", builder_ptr_lltype.clone());
+    let jit_str = variable_with_lltype("ll_str", buf_lltype.clone());
+    let jit_start = variable_with_lltype("start", LowLevelType::Signed);
+    let jit_end = variable_with_lltype("end", LowLevelType::Signed);
+    let block_jit = Block::shared(vec![
+        Hlvalue::Variable(jit_llb.clone()),
+        Hlvalue::Variable(jit_str.clone()),
+        Hlvalue::Variable(jit_start.clone()),
+        Hlvalue::Variable(jit_end.clone()),
+    ]);
+    block_jit.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![
+            Hlvalue::Constant(jit_append_slice_fn),
+            Hlvalue::Variable(jit_llb),
+            Hlvalue::Variable(jit_str),
+            Hlvalue::Variable(jit_start),
+            Hlvalue::Variable(jit_end),
+        ],
+        Hlvalue::Variable(void_result()),
+    ));
+    block_jit.closeblock(vec![
+        Link::new(vec![none_const()], Some(graph.returnblock.clone()), None).into_ref(),
+    ]);
+
+    // no-jit arm: _ll_append(ll_builder, ll_str, start, end - start).
+    let nj_llb = variable_with_lltype("ll_builder", builder_ptr_lltype);
+    let nj_str = variable_with_lltype("ll_str", buf_lltype);
+    let nj_start = variable_with_lltype("start", LowLevelType::Signed);
+    let nj_end = variable_with_lltype("end", LowLevelType::Signed);
+    let block_nojit = Block::shared(vec![
+        Hlvalue::Variable(nj_llb.clone()),
+        Hlvalue::Variable(nj_str.clone()),
+        Hlvalue::Variable(nj_start.clone()),
+        Hlvalue::Variable(nj_end.clone()),
+    ]);
+    let size = variable_with_lltype("size", LowLevelType::Signed);
+    block_nojit.borrow_mut().operations.push(SpaceOperation::new(
+        "int_sub",
+        vec![Hlvalue::Variable(nj_end), Hlvalue::Variable(nj_start.clone())],
+        Hlvalue::Variable(size.clone()),
+    ));
+    block_nojit.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![
+            Hlvalue::Constant(ll_append_fn),
+            Hlvalue::Variable(nj_llb),
+            Hlvalue::Variable(nj_str),
+            Hlvalue::Variable(nj_start),
+            Hlvalue::Variable(size),
+        ],
+        Hlvalue::Variable(void_result()),
+    ));
+    block_nojit.closeblock(vec![
+        Link::new(vec![none_const()], Some(graph.returnblock.clone()), None).into_ref(),
+    ]);
+
+    // startblock: branch on `we_are_jitted()` symbolic exitswitch.
+    startblock.borrow_mut().exitswitch = Some(Hlvalue::Constant(Constant::with_concretetype(
+        ConstValue::SpecTag(WE_ARE_JITTED_TAG_ID),
+        LowLevelType::Bool,
+    )));
+    let arm_args = |llb: &Variable, s: &Variable, st: &Variable, en: &Variable| {
+        vec![
+            Hlvalue::Variable(llb.clone()),
+            Hlvalue::Variable(s.clone()),
+            Hlvalue::Variable(st.clone()),
+            Hlvalue::Variable(en.clone()),
+        ]
+    };
+    startblock.closeblock(vec![
+        Link::new(
+            arm_args(&ll_builder, &ll_str, &start, &end),
+            Some(block_jit),
+            bool_case(true),
+        )
+        .into_ref(),
+        Link::new(
+            arm_args(&ll_builder, &ll_str, &start, &end),
+            Some(block_nojit),
+            bool_case(false),
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec![
+            "ll_builder".to_string(),
+            "ll_str".to_string(),
+            "start".to_string(),
+            "end".to_string(),
+        ],
+        func,
+    ))
+}
+
 /// Synthesise `ll_jit_append_slice(ll_builder, ll_str, start, end)`
 /// (`rbuilder.py:198-203`):
 ///
@@ -3187,6 +3337,43 @@ mod tests {
         assert_eq!(all_ops.iter().filter(|o| o.as_str() == "direct_call").count(), 2);
         assert_eq!(all_ops.iter().filter(|o| o.as_str() == "getsubstruct").count(), 1);
         assert_eq!(all_ops.iter().filter(|o| o.as_str() == "getarraysize").count(), 1);
+        let Hlvalue::Variable(ret) = &inner.returnblock.borrow().inputargs[0] else {
+            panic!("returnblock inputarg must be a Variable");
+        };
+        assert_eq!(ret.concretetype.borrow().clone(), Some(LowLevelType::Void));
+    }
+
+    #[test]
+    fn build_ll_append_slice_branches_on_we_are_jitted_symbolic() {
+        use super::Hlvalue;
+        let helper = super::build_ll_append_slice_helper_graph(
+            "ll_append_slice",
+            super::STRINGBUILDERPTR.clone(),
+            super::STRPTR.clone(),
+            dummy_funcptr_const(),
+            dummy_funcptr_const(),
+        )
+        .expect("build_ll_append_slice_helper_graph");
+        assert_eq!(helper.func.name, "ll_append_slice");
+        let inner = helper.graph.borrow();
+        let startblock = inner.startblock.borrow();
+        assert!(startblock.operations.is_empty());
+        assert_eq!(startblock.exits.len(), 2);
+        match &startblock.exitswitch {
+            Some(Hlvalue::Constant(c)) => assert_eq!(
+                c.value,
+                super::ConstValue::SpecTag(super::WE_ARE_JITTED_TAG_ID)
+            ),
+            other => panic!("exitswitch must be the SpecTag constant, got {other:?}"),
+        }
+        assert_eq!(startblock.inputargs.len(), 4);
+        drop(startblock);
+        let (count, all_ops) = walk_ops(&inner.startblock);
+        // start, jit arm, no-jit arm, returnblock.
+        assert_eq!(count, 4);
+        // jit arm: ll_jit_append_slice; no-jit arm: int_sub + _ll_append.
+        assert_eq!(all_ops.iter().filter(|o| o.as_str() == "direct_call").count(), 2);
+        assert_eq!(all_ops.iter().filter(|o| o.as_str() == "int_sub").count(), 1);
         let Hlvalue::Variable(ret) = &inner.returnblock.borrow().inputargs[0] else {
             panic!("returnblock inputarg must be a Variable");
         };
