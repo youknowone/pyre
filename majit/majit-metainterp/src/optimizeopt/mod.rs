@@ -2075,16 +2075,16 @@ impl OptContext {
     /// OpRef through the same canonical hosts production uses, returning a
     /// fresh `BoxRef` bound to the seeded `Op` / `InputArg`.
     #[cfg(test)]
-    pub(crate) fn seed_boxes_canonical(&mut self, boxes: &[majit_ir::box_ref::BoxRef]) {
-        for b in boxes {
-            if let Some(ia) = b.bound_inputarg() {
+    pub(crate) fn seed_boxes_canonical(&mut self, operands: &[Operand]) {
+        for o in operands {
+            if let Some(ia) = o.bound_inputarg() {
                 let idx = ia.index as usize;
                 if idx >= self.inputarg_refs.len() {
                     self.inputarg_refs
                         .resize_with(idx + 1, || std::rc::Rc::new(majit_ir::InputArg::new_int(0)));
                 }
                 self.inputarg_refs[idx] = ia;
-            } else if let Some(op) = b.bound_op() {
+            } else if let Some(op) = o.bound_op() {
                 self.resop_refs.insert(op.pos.get(), op);
             }
         }
@@ -8475,16 +8475,16 @@ mod boxref_forwarding_tests {
     //! `setintbound`, `make_constant`, `make_equal_to`) install PyPy-style
     //! forwarding state on the authoritative BoxRef slot.
     use super::*;
-    use crate::history::test_support::{bound_inputarg_box, bound_resop_box};
+    use crate::history::test_support::{bound_inputarg_operand, bound_resop_operand};
     use crate::optimizeopt::info::{OpInfo, PtrInfo};
     use crate::optimizeopt::intutils::IntBound;
-    use majit_ir::box_ref::{BoxRef, Forwarded as BoxForwarded};
+    use majit_ir::box_ref::Forwarded as BoxForwarded;
     use majit_ir::{InputArgRc, OpRef, Type, Value};
 
-    fn ctx_with_two_int_boxes() -> (OptContext, BoxRef, BoxRef, Vec<InputArgRc>) {
+    fn ctx_with_two_int_boxes() -> (OptContext, Operand, Operand, Vec<InputArgRc>) {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 2, 0, 2);
-        let (b0, ia0) = bound_inputarg_box(Type::Int, 0);
-        let (b1, ia1) = bound_inputarg_box(Type::Int, 1);
+        let (b0, ia0) = bound_inputarg_operand(Type::Int, 0);
+        let (b1, ia1) = bound_inputarg_operand(Type::Int, 1);
         ctx.seed_boxes_canonical(&[b0.clone(), b1.clone()]);
         (ctx, b0, b1, vec![ia0, ia1])
     }
@@ -8499,7 +8499,7 @@ mod boxref_forwarding_tests {
     #[test]
     fn h3_1_replace_op_mirrors_box_forward() {
         let (mut ctx, b0, b1, ia_holder) = ctx_with_two_int_boxes();
-        ctx.make_equal_to(&Operand::from_boxref(&b0), &Operand::from_boxref(&b1));
+        ctx.make_equal_to(&b0, &b1);
         assert!(matches!(b0.get_forwarded(), BoxForwarded::InputArg(_)));
         let walked = b0.get_box_replacement(false);
         assert!(std::rc::Rc::ptr_eq(
@@ -8525,8 +8525,8 @@ mod boxref_forwarding_tests {
     fn s2_forward_reference_consumer_follows_emitted_producer() {
         use majit_ir::resoperation::{Op, OpCode};
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 2, 0, 2);
-        let (b0, _ia0) = bound_inputarg_box(Type::Int, 0);
-        let (b1, _ia1) = bound_inputarg_box(Type::Int, 1);
+        let (b0, _ia0) = bound_inputarg_operand(Type::Int, 0);
+        let (b1, _ia1) = bound_inputarg_operand(Type::Int, 1);
         ctx.seed_boxes_canonical(&[b0.clone(), b1.clone()]);
 
         // pos 2 = an INT_LT result not yet emitted; mint the stand-in the
@@ -8541,7 +8541,7 @@ mod boxref_forwarding_tests {
         // The producer emits at pos 2.
         let mut producer = Op::new(
             OpCode::IntLt,
-            &[Operand::from_boxref(&b0), Operand::from_boxref(&b1)],
+            &[b0.clone(), b1.clone()],
         );
         producer.pos.set(pos2);
         ctx.emit(producer);
@@ -8567,7 +8567,7 @@ mod boxref_forwarding_tests {
     #[test]
     fn h3_1_clear_forwarded_resets_box_forward() {
         let (mut ctx, b0, b1, _ia_holder) = ctx_with_two_int_boxes();
-        ctx.make_equal_to(&Operand::from_boxref(&b0), &Operand::from_boxref(&b1));
+        ctx.make_equal_to(&b0, &b1);
         b0.clear_forwarded();
         assert!(matches!(b0.get_forwarded(), BoxForwarded::None));
     }
@@ -8579,8 +8579,8 @@ mod boxref_forwarding_tests {
     fn h3_1_replace_op_transfers_int_bound_to_new() {
         let (mut ctx, b0, b1, ia_holder) = ctx_with_two_int_boxes();
         let bound = IntBound::from_constant(7);
-        ctx.setintbound(&Operand::from_boxref(&b0), &bound);
-        ctx.make_equal_to(&Operand::from_boxref(&b0), &Operand::from_boxref(&b1));
+        ctx.setintbound(&b0, &bound);
+        ctx.make_equal_to(&b0, &b1);
         // After: old's IntBound transferred to new (PyPy:
         // `newop.set_forwarded(opinfo)`). old now forwards to new.
         match &b1.get_forwarded() {
@@ -8608,12 +8608,12 @@ mod boxref_forwarding_tests {
         let (mut ctx, b0, _b1, _ia_holder) = ctx_with_two_int_boxes();
         // Seed an IntBound on old.
         let bound = IntBound::from_constant(42);
-        ctx.setintbound(&Operand::from_boxref(&b0), &bound);
+        ctx.setintbound(&b0, &bound);
         // Forward to an inline-Const target — history.py:227 ConstInt.value
         // carries the value on the Box itself, no const_pool seed needed.
         let const_opref = OpRef::const_int(42);
         let b_const = ctx.materialize_operand_at(const_opref);
-        ctx.make_equal_to(&Operand::from_boxref(&b0), &b_const);
+        ctx.make_equal_to(&b0, &b_const);
         // The IntBound on old is gone (overwritten by Forwarded::Op(const)).
         // Const targets do not carry transferred info — PyPy skips this case.
         match &b0.get_forwarded() {
@@ -8627,10 +8627,10 @@ mod boxref_forwarding_tests {
     fn h3_1_set_ptr_info_mirrors_box_info() {
         // PtrInfo applies to ref-typed boxes.
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 1, 0, 1);
-        let (b, _ia) = bound_inputarg_box(Type::Ref, 0);
+        let (b, _ia) = bound_inputarg_operand(Type::Ref, 0);
         ctx.seed_boxes_canonical(&[b.clone()]);
         let info = PtrInfo::NonNull { last_guard_pos: -1 };
-        ctx.set_ptr_info(&Operand::from_boxref(&b), info);
+        ctx.set_ptr_info(&b, info);
         match &b.get_forwarded() {
             BoxForwarded::Info(OpInfo::Ptr(rc))
                 if matches!(&*rc.borrow(), PtrInfo::NonNull { .. }) => {}
@@ -8646,9 +8646,9 @@ mod boxref_forwarding_tests {
     fn audit_a_make_nonnull_preserves_box_constant_slot() {
         use majit_ir::GcRef;
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 1, 0, 1);
-        let (b, _ia) = bound_inputarg_box(Type::Ref, 0);
+        let (b, _ia) = bound_inputarg_operand(Type::Ref, 0);
         ctx.seed_boxes_canonical(&[b.clone()]);
-        ctx.make_constant_arg(&Operand::from_boxref(&b), Value::Ref(GcRef(0xdead_beef)));
+        ctx.make_constant_arg(&b, Value::Ref(GcRef(0xdead_beef)));
         match &b.get_forwarded() {
             BoxForwarded::Const(majit_ir::Const::Ref(g)) => {
                 assert_eq!(*g, GcRef(0xdead_beef));
@@ -8660,7 +8660,7 @@ mod boxref_forwarding_tests {
         }
         // Use the BoxRef form because `make_nonnull` writes to the box's
         // forwarded slot.
-        ctx.make_nonnull(&Operand::from_boxref(&b));
+        ctx.make_nonnull(&b);
         match &b.get_forwarded() {
             BoxForwarded::Const(majit_ir::Const::Ref(g)) => {
                 assert_eq!(
@@ -8684,8 +8684,8 @@ mod boxref_forwarding_tests {
     #[test]
     fn audit_a_chain_walker_reaches_constant_through_forwarded_const() {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 2, 0, 2);
-        let (b0, _ia0) = bound_inputarg_box(Type::Int, 0);
-        let (b1, _ia1) = bound_inputarg_box(Type::Int, 1);
+        let (b0, _ia0) = bound_inputarg_operand(Type::Int, 0);
+        let (b1, _ia1) = bound_inputarg_operand(Type::Int, 1);
         ctx.seed_boxes_canonical(&[b0.clone(), b1.clone()]);
         // (a) Const-namespace OpRef terminates at a Const box.
         let const_opref = OpRef::const_int(7);
@@ -8700,7 +8700,7 @@ mod boxref_forwarding_tests {
         b1.set_forwarded_const(majit_ir::Const::Int(42));
         assert!(b1.get_box_replacement(false).is_constant());
         // Negative case: BoxRef with no constant forwarding.
-        let (nb, _ia_nb) = bound_inputarg_box(Type::Int, 0);
+        let (nb, _ia_nb) = bound_inputarg_operand(Type::Int, 0);
         assert!(!nb.get_box_replacement(false).is_constant());
     }
 
@@ -8709,7 +8709,7 @@ mod boxref_forwarding_tests {
     #[test]
     fn h3_1_make_constant_mirrors_box_info_constant() {
         let (mut ctx, b0, _b1, _ia_holder) = ctx_with_two_int_boxes();
-        ctx.make_constant_arg(&Operand::from_boxref(&b0), Value::Int(42));
+        ctx.make_constant_arg(&b0, Value::Int(42));
         match &b0.get_forwarded() {
             BoxForwarded::Const(majit_ir::Const::Int(v)) => {
                 assert_eq!(*v, 42);
@@ -8723,7 +8723,7 @@ mod boxref_forwarding_tests {
     fn h3_1_setintbound_mirrors_box_info() {
         let (mut ctx, b0, _b1, _ia_holder) = ctx_with_two_int_boxes();
         let bound = IntBound::from_constant(7);
-        ctx.setintbound(&Operand::from_boxref(&b0), &bound);
+        ctx.setintbound(&b0, &bound);
         match &b0.get_forwarded() {
             BoxForwarded::Info(OpInfo::IntBound(b)) => {
                 let b = b.borrow();
@@ -8745,7 +8745,7 @@ mod boxref_forwarding_tests {
         let (mut ctx, b0, _b1, _ia_holder) = ctx_with_two_int_boxes();
         let const_opref = OpRef::const_int(42);
         let b_const = ctx.materialize_operand_at(const_opref);
-        ctx.make_equal_to(&Operand::from_boxref(&b0), &b_const);
+        ctx.make_equal_to(&b0, &b_const);
         match &b0.get_forwarded() {
             BoxForwarded::Const(majit_ir::Const::Int(v)) => {
                 assert_eq!(*v, 42);
@@ -8763,7 +8763,7 @@ mod boxref_forwarding_tests {
         let (mut ctx, b0, b1, _ia_holder) = ctx_with_two_int_boxes();
         let const_opref = OpRef::const_int(42);
         let b_const = ctx.materialize_operand_at(const_opref);
-        ctx.make_equal_to(&Operand::from_boxref(&b0), &b_const);
+        ctx.make_equal_to(&b0, &b_const);
 
         assert_eq!(
             ctx.get_box_replacement_operand(OpRef::input_arg_typed(0, Type::Int))
@@ -8775,7 +8775,7 @@ mod boxref_forwarding_tests {
             OpRef::input_arg_typed(0, Type::Int)
         );
 
-        ctx.make_equal_to(&Operand::from_boxref(&b1), &Operand::from_boxref(&b0));
+        ctx.make_equal_to(&b1, &b0);
         assert_eq!(
             ctx.get_box_replacement_operand(OpRef::input_arg_typed(1, Type::Int))
                 .to_opref(),
@@ -8811,10 +8811,10 @@ mod boxref_forwarding_tests {
         // so place Ref-typed boxes on both sides — the test models a
         // preamble RefOp result acting as the import target.
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 4, 0, 4);
-        let (placeholder_target, _op_target) = bound_resop_box(Type::Ref, 0);
-        let (placeholder_other, _op_other) = bound_resop_box(Type::Ref, 1);
-        let (source_box, _ia_source) = bound_inputarg_box(Type::Ref, 2);
-        let (other_box, _ia_other) = bound_inputarg_box(Type::Ref, 3);
+        let (placeholder_target, _op_target) = bound_resop_operand(Type::Ref, 0);
+        let (placeholder_other, _op_other) = bound_resop_operand(Type::Ref, 1);
+        let (source_box, _ia_source) = bound_inputarg_operand(Type::Ref, 2);
+        let (other_box, _ia_other) = bound_inputarg_operand(Type::Ref, 3);
         ctx.seed_boxes_canonical(&[
             placeholder_target.clone(),
             placeholder_other.clone(),
@@ -8830,8 +8830,8 @@ mod boxref_forwarding_tests {
 
         // Step 1: import_state's `source.set_forwarded(target)` equivalent.
         ctx.make_equal_to(
-            &Operand::from_boxref(&source_box),
-            &Operand::from_boxref(&placeholder_target),
+            &source_box,
+            &placeholder_target,
         );
 
         // Step 2: setinfo_from_preamble's terminal write.
@@ -8883,10 +8883,10 @@ mod boxref_forwarding_tests {
         // Same Ref-typed alignment as the sibling test: forwarding a Ref
         // source to the placeholder requires placeholder type to match
         // (PyPy `box.type` invariant; `make_equal_to` cross-type assertion).
-        let (placeholder_target, _op_target) = bound_resop_box(Type::Ref, 0);
-        let (placeholder_other, _op_other) = bound_resop_box(Type::Ref, 1);
-        let (source_box, _ia_source) = bound_inputarg_box(Type::Ref, 2);
-        let (other_box, _ia_other) = bound_inputarg_box(Type::Ref, 3);
+        let (placeholder_target, _op_target) = bound_resop_operand(Type::Ref, 0);
+        let (placeholder_other, _op_other) = bound_resop_operand(Type::Ref, 1);
+        let (source_box, _ia_source) = bound_inputarg_operand(Type::Ref, 2);
+        let (other_box, _ia_other) = bound_inputarg_operand(Type::Ref, 3);
         ctx.seed_boxes_canonical(&[
             placeholder_target.clone(),
             placeholder_other.clone(),
@@ -8900,8 +8900,8 @@ mod boxref_forwarding_tests {
         // import_state's make_equal_to fires, but the body import chose NOT to import
         // info (e.g. exported_infos didn't carry an entry for target_p1).
         ctx.make_equal_to(
-            &Operand::from_boxref(&source_box),
-            &Operand::from_boxref(&placeholder_target),
+            &source_box,
+            &placeholder_target,
         );
 
         // BoxRef-routing reader: chain walks source → placeholder → None.
@@ -8948,7 +8948,7 @@ mod boxref_forwarding_tests {
     #[test]
     fn h3_2b_get_box_replacement_box_walks_forwarded_chain() {
         let (mut ctx, b0, b1, ia_holder) = ctx_with_two_int_boxes();
-        ctx.make_equal_to(&Operand::from_boxref(&b0), &Operand::from_boxref(&b1));
+        ctx.make_equal_to(&b0, &b1);
         let got = ctx
             .get_box_replacement_operand_opt(OpRef::input_arg_typed(0, Type::Int))
             .expect("bound box resolves");
@@ -8990,7 +8990,7 @@ mod boxref_forwarding_tests {
     #[test]
     fn h3_2b_get_box_replacement_box_stops_at_info_terminal() {
         let (mut ctx, b0, _b1, ia_holder) = ctx_with_two_int_boxes();
-        ctx.setintbound(&Operand::from_boxref(&b0), &IntBound::from_constant(7));
+        ctx.setintbound(&b0, &IntBound::from_constant(7));
         let got = ctx
             .get_box_replacement_operand_opt(OpRef::input_arg_typed(0, Type::Int))
             .expect("canonical store resolves the slot");
@@ -9006,9 +9006,9 @@ mod boxref_forwarding_tests {
     // BoxRef-routing helpers `is_virtual` / `is_nonnull` read the same
     // `_forwarded` slot that PyPy's getptrinfo() inspects.
 
-    fn ctx_with_one_ref_box() -> (OptContext, BoxRef) {
+    fn ctx_with_one_ref_box() -> (OptContext, Operand) {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 1, 0, 1);
-        let (b, ia) = bound_inputarg_box(Type::Ref, 0);
+        let (b, ia) = bound_inputarg_operand(Type::Ref, 0);
         ctx.seed_boxes_canonical(&[b.clone()]);
         // Keep the InputArgRc alive in ctx so the Weak<InputArg> in
         // `b.inputarg_handle` upgrades across the test body.
@@ -9031,59 +9031,59 @@ mod boxref_forwarding_tests {
             last_guard_pos: -1,
             avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
         });
-        ctx.set_ptr_info(&Operand::from_boxref(&b), info);
+        ctx.set_ptr_info(&b, info);
         assert!(
-            ctx.peek_ptr_info(&Operand::from_boxref(&b))
+            ctx.peek_ptr_info(&b)
                 .is_some_and(|i| i.is_virtual())
         );
-        assert!(ctx.is_virtual(&Operand::from_boxref(&b)));
+        assert!(ctx.is_virtual(&b));
     }
 
     #[test]
     fn h3_2c_is_virtual_returns_false_for_nonnull_only() {
         let (mut ctx, b) = ctx_with_one_ref_box();
         ctx.set_ptr_info(
-            &Operand::from_boxref(&b),
+            &b,
             PtrInfo::NonNull { last_guard_pos: -1 },
         );
-        assert!(!ctx.is_virtual(&Operand::from_boxref(&b)));
+        assert!(!ctx.is_virtual(&b));
     }
 
     #[test]
     fn h3_2c_is_virtual_returns_false_for_unset() {
         let (ctx, b) = ctx_with_one_ref_box();
-        assert!(!ctx.is_virtual(&Operand::from_boxref(&b)));
+        assert!(!ctx.is_virtual(&b));
     }
 
     #[test]
     fn h3_2c_is_nonnull_matches_set_info() {
         let (mut ctx, b) = ctx_with_one_ref_box();
         ctx.set_ptr_info(
-            &Operand::from_boxref(&b),
+            &b,
             PtrInfo::NonNull { last_guard_pos: -1 },
         );
         assert!(
-            ctx.peek_ptr_info(&Operand::from_boxref(&b))
+            ctx.peek_ptr_info(&b)
                 .is_some_and(|i| i.is_nonnull())
         );
-        assert!(ctx.is_nonnull(&Operand::from_boxref(&b)));
+        assert!(ctx.is_nonnull(&b));
     }
 
     #[test]
     fn h3_2c_is_nonnull_returns_false_for_unset() {
         let (ctx, b) = ctx_with_one_ref_box();
-        assert!(!ctx.is_nonnull(&Operand::from_boxref(&b)));
+        assert!(!ctx.is_nonnull(&b));
     }
 
     #[test]
     fn h3_2c_peek_intbound_box_matches_legacy_when_pool_plumbed() {
         let (mut ctx, b0, _b1, _ia_holder) = ctx_with_two_int_boxes();
-        ctx.setintbound(&Operand::from_boxref(&b0), &IntBound::from_constant(42));
+        ctx.setintbound(&b0, &IntBound::from_constant(42));
         let legacy = ctx
             .peek_intbound(OpRef::input_arg_int(0))
             .expect("legacy bound");
         let via_box = ctx
-            .peek_intbound_box(&Operand::from_boxref(&b0))
+            .peek_intbound_box(&b0)
             .expect("box bound");
         assert!(legacy.is_constant());
         assert_eq!(legacy.get_constant_int(), 42);
@@ -9094,19 +9094,19 @@ mod boxref_forwarding_tests {
     #[test]
     fn h3_2c_peek_intbound_box_returns_none_for_unset() {
         let (ctx, b0, _b1, _ia_holder) = ctx_with_two_int_boxes();
-        assert!(ctx.peek_intbound_box(&Operand::from_boxref(&b0)).is_none());
+        assert!(ctx.peek_intbound_box(&b0).is_none());
     }
 
     #[test]
     fn h3_2c_last_guard_pos_matches_legacy_when_pool_plumbed() {
         let (mut ctx, b) = ctx_with_one_ref_box();
         ctx.set_ptr_info(
-            &Operand::from_boxref(&b),
+            &b,
             PtrInfo::NonNull { last_guard_pos: 5 },
         );
-        assert_eq!(ctx.last_guard_pos(&Operand::from_boxref(&b)), Some(5));
+        assert_eq!(ctx.last_guard_pos(&b), Some(5));
         assert_eq!(
-            ctx.peek_ptr_info(&Operand::from_boxref(&b))
+            ctx.peek_ptr_info(&b)
                 .and_then(|i| i.get_last_guard_pos()),
             Some(5)
         );
@@ -9115,7 +9115,7 @@ mod boxref_forwarding_tests {
     #[test]
     fn h3_2c_last_guard_pos_returns_none_for_unset() {
         let (ctx, b) = ctx_with_one_ref_box();
-        assert!(ctx.last_guard_pos(&Operand::from_boxref(&b)).is_none());
+        assert!(ctx.last_guard_pos(&b).is_none());
     }
 
     #[test]
@@ -9123,17 +9123,17 @@ mod boxref_forwarding_tests {
         let (mut ctx, b) = ctx_with_one_ref_box();
         // info.py:91 last_guard_pos == -1 → get_last_guard_pos returns None.
         ctx.set_ptr_info(
-            &Operand::from_boxref(&b),
+            &b,
             PtrInfo::NonNull { last_guard_pos: -1 },
         );
-        assert!(ctx.last_guard_pos(&Operand::from_boxref(&b)).is_none());
+        assert!(ctx.last_guard_pos(&b).is_none());
     }
 
     #[test]
     fn h3_2c_is_virtualizable_via_box_matches_legacy_when_pool_plumbed() {
         let (mut ctx, b) = ctx_with_one_ref_box();
         ctx.set_ptr_info(
-            &Operand::from_boxref(&b),
+            &b,
             PtrInfo::Virtualizable(crate::optimizeopt::info::VirtualizableFieldState {
                 fields: Vec::new(),
                 field_descrs: Vec::new(),
@@ -9141,9 +9141,9 @@ mod boxref_forwarding_tests {
                 last_guard_pos: -1,
             }),
         );
-        assert!(ctx.is_virtualizable(&Operand::from_boxref(&b)));
+        assert!(ctx.is_virtualizable(&b));
         assert!(matches!(
-            ctx.peek_ptr_info(&Operand::from_boxref(&b)),
+            ctx.peek_ptr_info(&b),
             Some(PtrInfo::Virtualizable(_))
         ));
     }
@@ -9152,44 +9152,44 @@ mod boxref_forwarding_tests {
     fn h3_2c_is_virtualizable_returns_false_for_nonnull_only() {
         let (mut ctx, b) = ctx_with_one_ref_box();
         ctx.set_ptr_info(
-            &Operand::from_boxref(&b),
+            &b,
             PtrInfo::NonNull { last_guard_pos: -1 },
         );
-        assert!(!ctx.is_virtualizable(&Operand::from_boxref(&b)));
+        assert!(!ctx.is_virtualizable(&b));
     }
 
     #[test]
     fn h3_2c_is_virtualizable_returns_false_for_unset() {
         let (ctx, b) = ctx_with_one_ref_box();
-        assert!(!ctx.is_virtualizable(&Operand::from_boxref(&b)));
+        assert!(!ctx.is_virtualizable(&b));
     }
 
     #[test]
     fn h3_2c_has_ptr_info_matches_set_info() {
         let (mut ctx, b) = ctx_with_one_ref_box();
         ctx.set_ptr_info(
-            &Operand::from_boxref(&b),
+            &b,
             PtrInfo::NonNull { last_guard_pos: -1 },
         );
-        assert!(ctx.has_ptr_info(&Operand::from_boxref(&b)));
-        assert!(ctx.peek_ptr_info(&Operand::from_boxref(&b)).is_some());
+        assert!(ctx.has_ptr_info(&b));
+        assert!(ctx.peek_ptr_info(&b).is_some());
     }
 
     #[test]
     fn h3_2c_has_ptr_info_returns_false_for_unset() {
         let (ctx, b) = ctx_with_one_ref_box();
-        assert!(!ctx.has_ptr_info(&Operand::from_boxref(&b)));
+        assert!(!ctx.has_ptr_info(&b));
     }
 
     #[test]
     fn h3_2c_peek_ptr_info_returns_set_info() {
         let (mut ctx, b) = ctx_with_one_ref_box();
         ctx.set_ptr_info(
-            &Operand::from_boxref(&b),
+            &b,
             PtrInfo::NonNull { last_guard_pos: 5 },
         );
         let via_box = ctx
-            .peek_ptr_info(&Operand::from_boxref(&b))
+            .peek_ptr_info(&b)
             .expect("box clone");
         assert!(matches!(via_box, PtrInfo::NonNull { last_guard_pos: 5 }));
     }
@@ -9197,7 +9197,7 @@ mod boxref_forwarding_tests {
     #[test]
     fn h3_2c_peek_ptr_info_returns_none_for_unset() {
         let (ctx, b) = ctx_with_one_ref_box();
-        assert!(ctx.peek_ptr_info(&Operand::from_boxref(&b)).is_none());
+        assert!(ctx.peek_ptr_info(&b).is_none());
     }
 
     // `with_ptr_info_mut(box, |info| ...)` runs a closure against the
@@ -9209,23 +9209,23 @@ mod boxref_forwarding_tests {
     fn h3_2c_with_ptr_info_mut_mirrors_after_mutation_when_pool_plumbed() {
         let (mut ctx, b) = ctx_with_one_ref_box();
         ctx.set_ptr_info(
-            &Operand::from_boxref(&b),
+            &b,
             PtrInfo::NonNull { last_guard_pos: 0 },
         );
         // Pre-condition: BoxRef snapshot matches legacy at pos 0.
-        assert_eq!(ctx.last_guard_pos(&Operand::from_boxref(&b)), Some(0));
+        assert_eq!(ctx.last_guard_pos(&b), Some(0));
         // Mutate inner state via closure.
         let returned = ctx
-            .with_ptr_info_mut(&Operand::from_boxref(&b), |info| {
+            .with_ptr_info_mut(&b, |info| {
                 info.set_last_guard_pos(42);
                 "ok"
             })
             .expect("closure runs");
         assert_eq!(returned, "ok");
         // Post-condition: BoxRef snapshot reflects mutation (mirror ran).
-        assert_eq!(ctx.last_guard_pos(&Operand::from_boxref(&b)), Some(42));
+        assert_eq!(ctx.last_guard_pos(&b), Some(42));
         assert_eq!(
-            ctx.peek_ptr_info(&Operand::from_boxref(&b))
+            ctx.peek_ptr_info(&b)
                 .and_then(|i| i.get_last_guard_pos()),
             Some(42)
         );
@@ -9236,7 +9236,7 @@ mod boxref_forwarding_tests {
         let (ctx, b) = ctx_with_one_ref_box();
         // No PtrInfo installed at OpRef(0).
         let invoked = std::cell::Cell::new(false);
-        let result = ctx.with_ptr_info_mut(&Operand::from_boxref(&b), |_info| {
+        let result = ctx.with_ptr_info_mut(&b, |_info| {
             invoked.set(true);
         });
         assert!(result.is_none());
@@ -9251,14 +9251,14 @@ mod boxref_forwarding_tests {
     fn ptr_info_handle_live_identity_propagates_mutation() {
         let (mut ctx, b) = ctx_with_one_ref_box();
         ctx.set_ptr_info(
-            &Operand::from_boxref(&b),
+            &b,
             PtrInfo::NonNull { last_guard_pos: 0 },
         );
         let h1 = ctx
-            .getptrinfo_handle(&Operand::from_boxref(&b))
+            .getptrinfo_handle(&b)
             .expect("Live handle for installed PtrInfo");
         let h2 = ctx
-            .getptrinfo_handle(&Operand::from_boxref(&b))
+            .getptrinfo_handle(&b)
             .expect("second call must return another clone of the same cell");
         assert!(
             h1.same_info(&h2),
@@ -9299,7 +9299,7 @@ mod boxref_forwarding_tests {
         use crate::optimizeopt::info::OpInfo;
         use majit_ir::{GcRef, Type};
 
-        let (b, _op) = bound_resop_box(Type::Ref, 0);
+        let (b, _op) = bound_resop_operand(Type::Ref, 0);
         b.set_forwarded_info(OpInfo::ptr(PtrInfo::Constant(GcRef(0x1000))));
         let live = PtrInfoHandle::Live(
             b.ptr_info_handle()
@@ -9322,9 +9322,9 @@ mod boxref_forwarding_tests {
         use majit_ir::Type;
 
         let mut ctx = OptContext::with_num_inputs(0, 0);
-        let (b, _op) = bound_resop_box(Type::Int, 0);
-        let h1 = ctx.getintbound_handle(&Operand::from_boxref(&b));
-        let h2 = ctx.getintbound_handle(&Operand::from_boxref(&b));
+        let (b, _op) = bound_resop_operand(Type::Int, 0);
+        let h1 = ctx.getintbound_handle(&b);
+        let h2 = ctx.getintbound_handle(&b);
         assert!(
             h1.ptr_eq(&h2),
             "Live handles for the same box must share the same Rc cell"
@@ -9412,23 +9412,23 @@ mod boxref_forwarding_tests {
     #[test]
     fn chain_walk_preserves_ptr_info_rc_identity_across_two_hops() {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 3, 0, 3);
-        let (a, _ia_a) = bound_inputarg_box(Type::Ref, 0);
-        let (b, _ia_b) = bound_inputarg_box(Type::Ref, 1);
-        let (c, _ia_c) = bound_inputarg_box(Type::Ref, 2);
+        let (a, _ia_a) = bound_inputarg_operand(Type::Ref, 0);
+        let (b, _ia_b) = bound_inputarg_operand(Type::Ref, 1);
+        let (c, _ia_c) = bound_inputarg_operand(Type::Ref, 2);
         ctx.seed_boxes_canonical(&[a.clone(), b.clone(), c.clone()]);
         ctx.set_ptr_info(
-            &Operand::from_boxref(&a),
+            &a,
             PtrInfo::NonNull { last_guard_pos: 7 },
         );
 
-        ctx.make_equal_to(&Operand::from_boxref(&a), &Operand::from_boxref(&b));
-        ctx.make_equal_to(&Operand::from_boxref(&b), &Operand::from_boxref(&c));
+        ctx.make_equal_to(&a, &b);
+        ctx.make_equal_to(&b, &c);
 
         let h_a = ctx
-            .getptrinfo_handle(&Operand::from_boxref(&a))
+            .getptrinfo_handle(&a)
             .expect("chain a -> b -> c must surface c's _forwarded slot");
         let h_c = ctx
-            .getptrinfo_handle(&Operand::from_boxref(&c))
+            .getptrinfo_handle(&c)
             .expect("c carries the transferred PtrInfo");
         assert!(
             h_a.same_info(&h_c),
@@ -9447,22 +9447,22 @@ mod boxref_forwarding_tests {
     #[test]
     fn replace_op_preserves_int_bound_rc_identity() {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 2, 0, 2);
-        let (old_box, _ia_old) = bound_inputarg_box(Type::Int, 0);
-        let (new_box, _ia_new) = bound_inputarg_box(Type::Int, 1);
+        let (old_box, _ia_old) = bound_inputarg_operand(Type::Int, 0);
+        let (new_box, _ia_new) = bound_inputarg_operand(Type::Int, 1);
         ctx.seed_boxes_canonical(&[old_box.clone(), new_box.clone()]);
         ctx.setintbound(
-            &Operand::from_boxref(&old_box),
+            &old_box,
             &crate::optimizeopt::intutils::IntBound::unbounded(),
         );
 
-        let old_handle = ctx.getintbound_handle(&Operand::from_boxref(&old_box));
+        let old_handle = ctx.getintbound_handle(&old_box);
         assert!(matches!(old_handle, IntBoundHandle::Live(_)));
 
         ctx.make_equal_to(
-            &Operand::from_boxref(&old_box),
-            &Operand::from_boxref(&new_box),
+            &old_box,
+            &new_box,
         );
-        let new_handle = ctx.getintbound_handle(&Operand::from_boxref(&new_box));
+        let new_handle = ctx.getintbound_handle(&new_box);
         assert!(
             old_handle.ptr_eq(&new_handle),
             "make_equal_to must transfer the same Rc cell for IntBound"
@@ -9487,23 +9487,23 @@ mod boxref_forwarding_tests {
     #[test]
     fn replace_op_preserves_ptr_info_rc_identity() {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 2, 0, 2);
-        let (old_box, _ia_old) = bound_inputarg_box(Type::Ref, 0);
-        let (new_box, _ia_new) = bound_inputarg_box(Type::Ref, 1);
+        let (old_box, _ia_old) = bound_inputarg_operand(Type::Ref, 0);
+        let (new_box, _ia_new) = bound_inputarg_operand(Type::Ref, 1);
         ctx.seed_boxes_canonical(&[old_box.clone(), new_box.clone()]);
         ctx.set_ptr_info(
-            &Operand::from_boxref(&old_box),
+            &old_box,
             PtrInfo::NonNull { last_guard_pos: 0 },
         );
 
         let old_handle = ctx
-            .getptrinfo_handle(&Operand::from_boxref(&old_box))
+            .getptrinfo_handle(&old_box)
             .expect("install populated _forwarded on old");
         ctx.make_equal_to(
-            &Operand::from_boxref(&old_box),
-            &Operand::from_boxref(&new_box),
+            &old_box,
+            &new_box,
         );
         let new_handle = ctx
-            .getptrinfo_handle(&Operand::from_boxref(&new_box))
+            .getptrinfo_handle(&new_box)
             .expect("PtrInfo transferred to new via clone of Rc cell");
         assert!(
             old_handle.same_info(&new_handle),
@@ -9528,22 +9528,22 @@ mod boxref_forwarding_tests {
     #[test]
     fn make_equal_to_preserves_int_bound_rc_identity() {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 2, 0, 2);
-        let (old_box, _ia_old) = bound_inputarg_box(Type::Int, 0);
-        let (new_box, _ia_new) = bound_inputarg_box(Type::Int, 1);
+        let (old_box, _ia_old) = bound_inputarg_operand(Type::Int, 0);
+        let (new_box, _ia_new) = bound_inputarg_operand(Type::Int, 1);
         ctx.seed_boxes_canonical(&[old_box.clone(), new_box.clone()]);
         ctx.setintbound(
-            &Operand::from_boxref(&old_box),
+            &old_box,
             &crate::optimizeopt::intutils::IntBound::unbounded(),
         );
 
-        let old_handle = ctx.getintbound_handle(&Operand::from_boxref(&old_box));
+        let old_handle = ctx.getintbound_handle(&old_box);
         assert!(matches!(old_handle, IntBoundHandle::Live(_)));
 
         ctx.make_equal_to(
-            &Operand::from_boxref(&old_box),
-            &Operand::from_boxref(&new_box),
+            &old_box,
+            &new_box,
         );
-        let new_handle = ctx.getintbound_handle(&Operand::from_boxref(&new_box));
+        let new_handle = ctx.getintbound_handle(&new_box);
         assert!(
             old_handle.ptr_eq(&new_handle),
             "make_equal_to must transfer the same Rc cell for IntBound"
@@ -9555,23 +9555,23 @@ mod boxref_forwarding_tests {
     #[test]
     fn make_equal_to_preserves_ptr_info_rc_identity() {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 2, 0, 2);
-        let (old_box, _ia_old) = bound_inputarg_box(Type::Ref, 0);
-        let (new_box, _ia_new) = bound_inputarg_box(Type::Ref, 1);
+        let (old_box, _ia_old) = bound_inputarg_operand(Type::Ref, 0);
+        let (new_box, _ia_new) = bound_inputarg_operand(Type::Ref, 1);
         ctx.seed_boxes_canonical(&[old_box.clone(), new_box.clone()]);
         ctx.set_ptr_info(
-            &Operand::from_boxref(&old_box),
+            &old_box,
             PtrInfo::NonNull { last_guard_pos: 0 },
         );
 
         let old_handle = ctx
-            .getptrinfo_handle(&Operand::from_boxref(&old_box))
+            .getptrinfo_handle(&old_box)
             .expect("populated _forwarded on old");
         ctx.make_equal_to(
-            &Operand::from_boxref(&old_box),
-            &Operand::from_boxref(&new_box),
+            &old_box,
+            &new_box,
         );
         let new_handle = ctx
-            .getptrinfo_handle(&Operand::from_boxref(&new_box))
+            .getptrinfo_handle(&new_box)
             .expect("PtrInfo transferred to new via clone of Rc cell");
         assert!(
             old_handle.same_info(&new_handle),
@@ -9585,15 +9585,15 @@ mod boxref_forwarding_tests {
     #[test]
     fn clear_forwarded_drops_int_bound() {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 1, 0, 1);
-        let (old_box, ia) = bound_inputarg_box(Type::Int, 0);
+        let (old_box, ia) = bound_inputarg_operand(Type::Int, 0);
         ctx.seed_boxes_canonical(&[old_box.clone()]);
         ctx.inputarg_refs = vec![ia];
         ctx.setintbound(
-            &Operand::from_boxref(&old_box),
+            &old_box,
             &crate::optimizeopt::intutils::IntBound::unbounded(),
         );
         assert!(matches!(
-            ctx.getintbound_handle(&Operand::from_boxref(&old_box)),
+            ctx.getintbound_handle(&old_box),
             IntBoundHandle::Live(_),
         ));
 

@@ -264,6 +264,27 @@ pub(crate) mod test_support {
         (b, op)
     }
 
+    /// `Operand` + host form of [`bound_inputarg_box`]: the operand IS the
+    /// producer handle, so forwarding asserts read the same canonical
+    /// `InputArg` host the operand routes writes to.
+    pub(crate) fn bound_inputarg_operand(tp: Type, index: u32) -> (Operand, InputArgRc) {
+        let ia = std::rc::Rc::new(InputArg::from_type(tp, index));
+        (Operand::from_bound_inputarg(&ia), ia)
+    }
+
+    /// `Operand` + host form of [`bound_resop_box`].
+    pub(crate) fn bound_resop_operand(tp: Type, position: u32) -> (Operand, OpRc) {
+        let opcode = match tp {
+            Type::Int => OpCode::SameAsI,
+            Type::Float => OpCode::SameAsF,
+            Type::Ref => OpCode::SameAsR,
+            Type::Void => OpCode::Jump,
+        };
+        let op = std::rc::Rc::new(Op::new(opcode, &[]));
+        op.pos.set(OpRef::op_typed(position, tp));
+        (Operand::from_bound_op(&op), op)
+    }
+
     thread_local! {
         static PRODUCER_ROOTS: std::cell::RefCell<Vec<std::rc::Rc<dyn std::any::Any>>> =
             const { std::cell::RefCell::new(Vec::new()) };
