@@ -299,9 +299,9 @@ impl UnrollOptimizer {
             for slot in map.iter_mut() {
                 if let Some(boxes) = slot {
                     for sb in boxes {
-                        if let Some(majit_ir::Value::Ref(gcref)) = sb.opref_box.const_value() {
+                        if let majit_ir::OpRef::ConstPtr(gcref) = sb.opref {
                             if !gcref.is_null() {
-                                slots.push((&sb.opref_box as *const BoxRef) as usize);
+                                slots.push((&mut sb.opref as *mut majit_ir::OpRef) as usize);
                             }
                         }
                     }

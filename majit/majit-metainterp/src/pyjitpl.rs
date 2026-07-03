@@ -442,9 +442,9 @@ fn collect_snapshot_const_ptr_slots(maps: &mut [&mut SnapshotBoxes]) -> Vec<usiz
         for slot in map.iter_mut() {
             if let Some(boxes) = slot {
                 for sb in boxes {
-                    if let Some(majit_ir::Value::Ref(gcref)) = sb.opref_box.const_value() {
+                    if let majit_ir::OpRef::ConstPtr(gcref) = sb.opref {
                         if !gcref.is_null() {
-                            slots.push((&sb.opref_box as *const BoxRef) as usize);
+                            slots.push((&mut sb.opref as *mut majit_ir::OpRef) as usize);
                         }
                     }
                 }
@@ -1167,10 +1167,11 @@ pub struct MetaInterp<M: Clone> {
     /// loop depends on. After compilation, the caller registers the loop's
     /// invalidation flag on each dep. Cleared on each compile attempt.
     pub last_quasi_immutable_deps: Vec<(u64, u32)>,
-    /// Addresses of live `SnapshotBox.opref_box` `BoxRef`s holding a `Const`
-    /// reference during compilation. RPython traces the `ConstPtr.value` field
-    /// in place; pyre's root walker follows these slots directly so a moving
-    /// GC updates the snapshot boxes the optimizer will read.
+    /// Addresses of live `SnapshotBox.opref` slots holding an inline
+    /// `ConstPtr` reference during compilation. RPython traces the
+    /// `ConstPtr.value` field in place; pyre's root walker follows these
+    /// slots directly so a moving GC updates the snapshot boxes the
+    /// optimizer will read.
     pub(crate) compile_snapshot_refs: Vec<usize>,
     /// Set by compile_bridge when optimizer returns retrace_requested=true.
     /// Checked by compile_bridge_trace to return RetraceNeeded.
@@ -1650,16 +1651,17 @@ impl<M: Clone> MetaInterp<M> {
     /// compilation. Cleared after compilation completes.
     pub fn walk_compile_snapshot_refs(&mut self, mut visitor: impl FnMut(&mut GcRef)) {
         for &slot_addr in &self.compile_snapshot_refs {
-            // SAFETY: entries are collected from `SnapshotBox.opref_box` slots
+            // SAFETY: entries are collected from `SnapshotBox.opref` slots
             // owned by the in-flight optimizer/OptContext and cleared at every
             // compile exit. The extra-root walker runs on the same thread while
             // compilation is paused for GC, mirroring RPython's in-place field
             // update of `ConstPtr.value`.
-            let b = unsafe { &*(slot_addr as *const BoxRef) };
-            // Forward the snapshot slot's inline const gcref through the
-            // canonical BoxRef-Const walk; the `Cell` get/set inside forwards
-            // the moved address in place (an in-place `ConstPtr.value` update).
-            b.walk_const_ptr_refs(&mut visitor);
+            let r = unsafe { &mut *(slot_addr as *mut majit_ir::OpRef) };
+            // Forward the snapshot slot's inline const gcref in place (an
+            // in-place `ConstPtr.value` update).
+            if let majit_ir::OpRef::ConstPtr(gcref) = r {
+                visitor(gcref);
+            }
         }
     }
 

@@ -222,39 +222,32 @@ pub struct Snapshot {
 /// variant on every read.
 #[derive(Debug, Clone)]
 pub struct SnapshotBox {
-    /// The box this snapshot slot references, stored as a `BoxRef` so a
-    /// `Const{Ptr}` slot's inline gcref is GC-forwarded in place through the
-    /// canonical `BoxRef::walk_const_ptr_refs` (history.py:314
-    /// `ConstPtr.value`). Read the trace-position `OpRef` view via
-    /// [`SnapshotBox::opref`].
-    pub opref_box: majit_ir::box_ref::BoxRef,
+    /// The trace-position ref this snapshot slot references. A
+    /// `Const{Ptr}` slot carries its gcref inline (history.py:314
+    /// `ConstPtr.value`); during compilation the snapshot root walker
+    /// (`walk_compile_snapshot_refs`) forwards it in place through a
+    /// collected `*mut OpRef` slot address.
+    pub opref: majit_ir::OpRef,
     pub tp: Option<majit_ir::Type>,
 }
 
 impl SnapshotBox {
     pub fn untyped(opref: majit_ir::OpRef) -> Self {
-        SnapshotBox {
-            opref_box: majit_ir::box_ref::BoxRef::from_opref(opref),
-            tp: None,
-        }
+        SnapshotBox { opref, tp: None }
     }
 
     pub fn typed(opref: majit_ir::OpRef, tp: majit_ir::Type) -> Self {
-        SnapshotBox {
-            opref_box: majit_ir::box_ref::BoxRef::from_opref(opref),
-            tp: Some(tp),
-        }
+        SnapshotBox { opref, tp: Some(tp) }
     }
 
-    /// The trace-position `OpRef` view of this slot (inverse of
-    /// `BoxRef::from_opref`).
+    /// The trace-position `OpRef` view of this slot.
     pub fn opref(&self) -> majit_ir::OpRef {
-        self.opref_box.to_opref()
+        self.opref
     }
 
     pub fn map_opref(&self, f: impl FnOnce(majit_ir::OpRef) -> majit_ir::OpRef) -> Self {
         SnapshotBox {
-            opref_box: majit_ir::box_ref::BoxRef::from_opref(f(self.opref())),
+            opref: f(self.opref),
             tp: self.tp,
         }
     }
