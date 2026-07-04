@@ -3283,8 +3283,8 @@ struct RegisterLayout {
     ///
     /// NOTE: this is the FRAME-LENGTH bound. Stack slots are NOT pinned to
     /// identity colors — like body locals they are freely chordal-colored,
-    /// and the compile-time-local `stack_slot_color_map[d]` records each
-    /// stack slot `d`'s actual (possibly non-identity) color. Tail entries
+    /// so a resume records each live stack slot `d`'s actual (possibly
+    /// non-identity) color in the per-PC `pcdep_color_slots` map. Tail entries
     /// `d >= max(depth_at_pc)` never appear in any SSA op, so regalloc
     /// leaves them at their pre-rename pass-through color; the runtime
     /// decoder bounds its reverse lookup to the live depth at the resume PC.
@@ -11329,26 +11329,35 @@ impl CodeWriter {
             slot_pre_color(portal_ec_reg),
         );
 
-        // Graph-side register allocation: record each
-        // Python-semantic stack slot's post-regalloc color. With the
-        // input-arg pinning removed (regalloc.rs `enforce_input_args`
-        // no longer rotates stack slots), the chordal coloring may
-        // coalesce disjointly-live stack slots into the same color.
-        //
-        // Compile-time-local: runtime decoders read the per-PC
-        // `pcdep_color_slots`; this flat map only seeds the
-        // `result_color_at_pc` precompute in `finalize_jitcode` (the
-        // call-result slot is not a live Variable at the return PC, so
-        // it carries no pcdep entry). Length is `code.max_stackdepth`
-        // (= CPython `co_stacksize`) so every `depth_at_pc` index below
-        // the static peak resolves.
-        let stack_map_len = max_stackdepth as u16;
-        let mut stack_slot_color_map: Vec<u16> = Vec::with_capacity(stack_map_len as usize);
-        for d in 0..stack_map_len {
-            let pre = slot_pre_color(stack_base + d);
-            let post = super::regalloc::rename_lookup(&alloc_result.rename, Kind::Ref, pre);
-            stack_slot_color_map.push(post);
-        }
+        // result_color_at_pc: the call-result operand-stack slot's color
+        // (top of stack = depth - 1) at each Python pc, so the inline
+        // multiframe capture (`compute_inline_caller_frame`) finds the
+        // not-yet-produced result register. The call-result slot is not a
+        // live Variable at the return PC, so it carries no `pcdep_color_slots`
+        // entry; source its color directly from the operand-stack slot's
+        // post-regalloc canonical Ref color. With the input-arg pinning
+        // removed (`enforce_input_args` no longer rotates stack slots), the
+        // chordal coloring may coalesce disjointly-live stack slots into the
+        // same color, so read the per-slot color rather than assume
+        // `color == slot`. `u16::MAX` where the stack is empty or `depth - 1`
+        // is past the static peak (`code.max_stackdepth` = CPython
+        // `co_stacksize`), which the runtime decoder treats as "no result
+        // slot".
+        let result_color_at_pc: Vec<u16> = depth_at_pc
+            .iter()
+            .map(|&d| {
+                let d = d as usize;
+                if d == 0 || d - 1 >= max_stackdepth {
+                    u16::MAX
+                } else {
+                    super::regalloc::rename_lookup(
+                        &alloc_result.rename,
+                        Kind::Ref,
+                        slot_pre_color(stack_base + (d - 1) as u16),
+                    )
+                }
+            })
+            .collect();
         // #348: per-PC color↔slot resume map — the production resume path.
         // Built from the same per-PC snapshot + splice coloring the injectivity
         // check validated. `filter_liveness_in_place` derives the `-live-`
@@ -11486,7 +11495,7 @@ impl CodeWriter {
             is_portal,
             has_abort,
             num_regs,
-            stack_slot_color_map,
+            result_color_at_pc,
             pcdep_color_slots,
             const_ref_slots_at_pc,
         )
@@ -11526,7 +11535,7 @@ impl CodeWriter {
         is_portal: bool,
         has_abort: bool,
         num_regs: super::assembler::NumRegs,
-        stack_slot_color_map: Vec<u16>,
+        result_color_at_pc: Vec<u16>,
         pcdep_color_slots: Vec<Vec<(u16, u16)>>,
         const_ref_slots_at_pc: Vec<Vec<(u16, i64)>>,
     ) -> PyJitCode {
@@ -11608,24 +11617,6 @@ impl CodeWriter {
         // does not carry PyFrame layout data; keep it in PyJitCodeMetadata
         // and attach it to BlackholeInterpreter setup when pyre needs it.
         let frame_stack_base = code.varnames.len() + pyre_interpreter::pyframe::ncells(code);
-
-        // #73 result_color_at_pc: the call-result operand-stack slot's color
-        // (top of stack = depth - 1) at each Python pc, so the inline
-        // multiframe capture (`compute_inline_caller_frame`) finds the
-        // not-yet-produced result register without reading the flat
-        // `stack_slot_color_map` at runtime. `u16::MAX` where the stack is
-        // empty (no result slot).
-        let result_color_at_pc: Vec<u16> = depth_at_pc
-            .iter()
-            .map(|&d| {
-                let d = d as usize;
-                if d == 0 {
-                    u16::MAX
-                } else {
-                    stack_slot_color_map.get(d - 1).copied().unwrap_or(u16::MAX)
-                }
-            })
-            .collect();
 
         let metadata = PyJitCodeMetadata {
             pc_map: pc_map_bytes,
