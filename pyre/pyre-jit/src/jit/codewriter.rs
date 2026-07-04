@@ -9763,10 +9763,88 @@ impl CodeWriter {
                         }
 
                         // PopJumpIfNone / PopJumpIfNotNone: pops 1. Net: -1.
-                        Instruction::PopJumpIfNone { .. }
-                        | Instruction::PopJumpIfNotNone { .. } => {
-                            pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            emit_abort_permanent!(py_pc);
+                        //
+                        // `flowcontext.py` folds these to a static
+                        // `is None` constant test with no residual guard.
+                        // The meta-trace analog composes two already-ported
+                        // front-end ops: `is`/`is_not` against the immortal
+                        // `None` singleton (`pyobject_const_ref_value(w_none())`
+                        // — GC-safe to const-fold; `None` never moves), then
+                        // `bool` on that Ref result to feed the generic Bool
+                        // exitswitch.  Both variants jump on TRUE, so the exit
+                        // wiring is identical to POP_JUMP_IF_TRUE; the only
+                        // difference is `is` (POP_JUMP_IF_NONE) vs `is_not`
+                        // (POP_JUMP_IF_NOT_NONE).
+                        Instruction::PopJumpIfNone { delta }
+                        | Instruction::PopJumpIfNotNone { delta } => {
+                            let invert_kind = match instruction {
+                                Instruction::PopJumpIfNone { .. } => {
+                                    pyre_interpreter::bytecode::Invert::No
+                                }
+                                _ => pyre_interpreter::bytecode::Invert::Yes,
+                            };
+                            let target_py_pc = jump_target_forward(
+                                code,
+                                num_instrs,
+                                py_pc + 1,
+                                delta.get(op_arg).as_usize(),
+                            );
+                            let cond_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let cond_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            if let super::flow::FlowValue::Variable(v) = &cond_value {
+                                pin!(Some(*v), cond_reg);
+                            }
+                            // `x is None` / `x is not None` — the None singleton
+                            // is const-folded as a Ref operand.
+                            let none_value = pyobject_const_ref_value(pyre_object::w_none());
+                            let is_value = emit_frontend_is_op(
+                                &mut graph,
+                                &current_block.block(),
+                                cond_value,
+                                none_value,
+                                invert_kind,
+                                py_pc as i64,
+                            );
+                            let bool_value = emit_frontend_bool(
+                                &mut graph,
+                                &current_block.block(),
+                                is_value.into(),
+                                py_pc as i64,
+                            );
+                            // flowcontext.py:756-763 `block.exitswitch = w_cond`.
+                            current_block.block().borrow_mut().exitswitch =
+                                Some(super::flow::ExitSwitch::Value(bool_value.into()));
+                            let scratch_truth = ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
+                            pin!(Some(bool_value), scratch_truth);
+                            let fallthrough_py_pc = py_pc + 1;
+                            if target_py_pc < num_instrs && fallthrough_py_pc < num_instrs {
+                                // Jump-on-TRUE: mirror POP_JUMP_IF_TRUE — the
+                                // TRUE link is the jump target, so mergeblock the
+                                // target FIRST, then append the FALSE
+                                // (fallthrough) link.  `needs_fallthrough = false`
+                                // suppresses the PC-sequential walker's spurious
+                                // fallthrough injection (see PopJumpIfTrue).
+                                mergeblock(
+                                    code,
+                                    &mut graph,
+                                    &mut joinpoints,
+                                    &current_block,
+                                    &{
+                                        let mut branch_state = current_state.clone();
+                                        branch_state.next_offset = target_py_pc;
+                                        branch_state.blocklist =
+                                            frame_blocks_for_offset(code, target_py_pc);
+                                        branch_state
+                                    },
+                                    target_py_pc,
+                                    &mut pendingblocks,
+                                    &mut all_walker_blocks,
+                                );
+                                set_last_bool_exitcase(&current_block.block(), true);
+                                emit_goto_if_not!(scratch_truth, fallthrough_py_pc);
+                                set_last_bool_exitcase(&current_block.block(), false);
+                                needs_fallthrough = false;
+                            }
                         }
 
                         // SetAdd(i): peek set, pop value. Net: -1.
