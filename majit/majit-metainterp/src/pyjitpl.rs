@@ -5325,11 +5325,18 @@ impl<M: Clone> MetaInterp<M> {
                         return CompileOutcome::Cancelled;
                     }
                     {
-                        // Unroll's last `replace_compile_snapshot_roots` may
-                        // have left dangling phase slots (its inner optimizer
-                        // dropped on the InvalidLoop return). Re-root just the
-                        // live originals before the clones below allocate and
-                        // can move the GC.
+                        // The retry MOVES the original snapshot maps into
+                        // simple_opt below rather than cloning them: a `Vec` move
+                        // leaves the heap buffers — and the root slots collected
+                        // here — in place, so there is no unrooted-clone window
+                        // where a moving GC could stale a half-built copy. Re-root
+                        // the live originals first (dropping any dangling phase
+                        // slots unroll's last `replace_compile_snapshot_roots`
+                        // left); those slots then follow the buffers into
+                        // simple_opt and keep forwarding their inline ConstPtrs
+                        // across `run_optimize_from_inputs` (which can move the GC
+                        // via constant_fold_alloc). The originals are not read
+                        // past this point.
                         self.compile_snapshot_refs = collect_snapshot_const_ptr_slots(&mut [
                             &mut snapshot_map,
                             &mut snapshot_vable_map,
@@ -5345,21 +5352,13 @@ impl<M: Clone> MetaInterp<M> {
                             trace.inputargs.iter().map(|ia| ia.tp).collect();
                         simple_opt.trace_inputargs =
                             majit_ir::OpRef::inputarg_refs(&inputarg_types);
-                        simple_opt.snapshot_boxes = snapshot_map.clone();
-                        simple_opt.snapshot_frame_sizes = snapshot_frame_size_map.clone();
-                        simple_opt.snapshot_vable_boxes = snapshot_vable_map.clone();
-                        simple_opt.snapshot_vref_boxes = snapshot_vref_map.clone();
-                        simple_opt.snapshot_frame_pcs = snapshot_pc_map.clone();
-                        // `run_optimize_from_inputs` (and the `.to_vec()` /
-                        // `Rc::new` allocations before it) can move the GC via
-                        // constant_fold_alloc. Root simple_opt's own snapshot
-                        // copies so their inline ConstPtrs are forwarded in
-                        // place; the originals are no longer read past this point.
-                        self.compile_snapshot_refs = collect_snapshot_const_ptr_slots(&mut [
-                            &mut simple_opt.snapshot_boxes,
-                            &mut simple_opt.snapshot_vable_boxes,
-                            &mut simple_opt.snapshot_vref_boxes,
-                        ]);
+                        // Move, not clone: keeps the rooted buffers in place so
+                        // the slots collected above now point into simple_opt.
+                        simple_opt.snapshot_boxes = snapshot_map;
+                        simple_opt.snapshot_frame_sizes = snapshot_frame_size_map;
+                        simple_opt.snapshot_vable_boxes = snapshot_vable_map;
+                        simple_opt.snapshot_vref_boxes = snapshot_vref_map;
+                        simple_opt.snapshot_frame_pcs = snapshot_pc_map;
                         simple_opt.call_pure_results = call_pure_results.clone();
                         // Forward the recorder's operand pool — the retry path
                         // uses the same upstream `Rc<Box>` allocations from
