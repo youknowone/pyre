@@ -6,8 +6,8 @@
 # (`flag` -> CONST), so a guard failure on the not-taken arm must restore
 # `flag`, not the taken-path CONST.  Reading the guard-pc register file
 # directly restores the stale CONST and silently miscompiles `kept_and`
-# (over-counting toward `11 * N`: 2197063 instead of 1466663); the positional
-# `kept_stack_subst` recovery restores the kept `flag` correctly.
+# (over-counting toward `11 * N`: 2197063 instead of 1466663); the walk-level
+# box mirror restores the kept `flag` correctly.
 #
 # `kept_stack_branch_depths.py` uses composite `(i % k)` left operands that
 # const-fold differently and side-step this defect; each loop here pins the

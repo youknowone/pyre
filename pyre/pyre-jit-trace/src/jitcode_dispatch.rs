@@ -1124,8 +1124,8 @@ pub enum DispatchError {
     /// tested value on the value stack across the branch (`COPY` / `TO_BOOL`
     /// / `POP_JUMP_IF_*`). The full-body walk's single-frame guard snapshot
     /// rebuilds locals + the post-opcode operand stack from the live register
-    /// banks; a single depth-1 kept temp is recovered positionally
-    /// (`kept_stack_subst` in `collect_outer_active_boxes`).  Depth > 1 is
+    /// banks; a single depth-1 kept temp is recovered from the walk-level box
+    /// mirror (`vstack`) in `collect_outer_active_boxes`.  Depth > 1 is
     /// supported only when the not-taken edge's decoded `ref_copy` moves
     /// (`#420`) cover every distinct kept resume color AND each move's source
     /// resolves to a live register value; that resolved set then drives the
@@ -6463,116 +6463,8 @@ fn collect_outer_active_boxes(
         }
         active.push(v);
     }
-    // #124 kept-stack recovery (gated by `guard_py_pc`, set on the
-    // branch-guard snapshot path).  A branch guard's not-taken arm
-    // resumes at a merge point whose live Ref colors are filled by the
-    // not-taken edge's register move — colors the walk has NOT written at
-    // the guard point, because that move executes only when the branch is
-    // taken at runtime.  Reading `registers_r[merge_color]` there yields a
-    // stale/color-reused box (the #124 corruption: it decodes to a wrong
-    // or null value on the odd-path iteration).  The kept operand-stack
-    // value lives instead in the guard-pc-only color the edge move reads
-    // from.  Recover `{resume merge color -> guard-pc kept value}`
-    // positionally: the not-taken arm preserves the bottom of the operand
-    // stack, so guard-only Ref colors (live at the guard, dead at resume),
-    // taken in ascending color order (the splice colors operand-stack
-    // slots in push order), supply the values for resume-only Ref colors
-    // that name a stack slot, in ascending semantic-slot order.
-    let kept_stack_subst: std::collections::HashMap<u32, OpRef> = match guard_py_pc {
-        Some(gpc) if gpc != entry_py_pc && owns_vable => {
-            let guard_banks = crate::state::frame_liveness_reg_indices_by_bank_at(
-                outer_jitcode_index as i32,
-                gpc as i32,
-            );
-            let resume_set: std::collections::HashSet<u32> = banks.ref_.iter().copied().collect();
-            let guard_set: std::collections::HashSet<u32> =
-                guard_banks.ref_.iter().copied().collect();
-            // Guard-only Ref colors carrying a real walk value.
-            let mut guard_only: Vec<u32> = guard_banks
-                .ref_
-                .iter()
-                .copied()
-                .filter(|c| !resume_set.contains(c))
-                .filter(|&c| {
-                    regs_r
-                        .get(c as usize)
-                        .copied()
-                        .is_some_and(|v| v != OpRef::NONE)
-                })
-                .collect();
-            guard_only.sort_unstable();
-            // Resume-only Ref colors naming an operand-stack slot.
-            let mut resume_only_stack: Vec<(usize, u32)> = banks
-                .ref_
-                .iter()
-                .copied()
-                .filter(|c| !guard_set.contains(c))
-                .filter_map(|c| {
-                    let s = crate::state::semantic_ref_slot_for_reg_color(
-                        nlocals,
-                        valid_stack_only,
-                        pcdep_opt.unwrap_or(&[]),
-                        c as usize,
-                    )?;
-                    (s >= nlocals).then_some((s, c))
-                })
-                .collect();
-            resume_only_stack.sort_unstable();
-            if std::env::var_os("PYRE_DIAG124C").is_some() {
-                eprintln!(
-                    "[diag124c] guard_py_pc={gpc} entry_py_pc={entry_py_pc} \
-                     guard_live_r={:?} resume_live_r={:?} guard_only={guard_only:?} \
-                     resume_only_stack={resume_only_stack:?}",
-                    guard_banks.ref_, banks.ref_,
-                );
-            }
-            let mut subst: std::collections::HashMap<u32, OpRef> = resume_only_stack
-                .into_iter()
-                .zip(guard_only)
-                .map(|((_, resume_color), guard_color)| {
-                    (resume_color, regs_r[guard_color as usize])
-                })
-                .collect();
-            // Live-across kept stack slot: a Ref color live at BOTH the
-            // guard and the resume point (same color) names an operand-
-            // stack slot the not-taken arm preserves.  The walker wrote
-            // its value into the color-indexed `registers_r` bank, but the
-            // `virtualizable_boxes` shadow the owns_vable read sources from
-            // is never updated on the walker path (only the retired trait
-            // `write_stack_slot` writes it), so the shadow returns a stale
-            // trace-seed box.  Supply the walker bank value directly.  Only
-            // genuinely live-across colors qualify (a guard-pc-only scratch
-            // reusing the color is excluded by the `guard_set` membership
-            // test), so a speculatively const-folded kept value absent from
-            // the guard register state still falls through unchanged.
-            for &c in &banks.ref_ {
-                if !guard_set.contains(&c) || subst.contains_key(&c) {
-                    continue;
-                }
-                let Some(s) = crate::state::semantic_ref_slot_for_reg_color(
-                    nlocals,
-                    valid_stack_only,
-                    pcdep_opt.unwrap_or(&[]),
-                    c as usize,
-                ) else {
-                    continue;
-                };
-                if s < nlocals {
-                    continue;
-                }
-                if let Some(v) = regs_r.get(c as usize).copied() {
-                    if v != OpRef::NONE {
-                        subst.insert(c, v);
-                    }
-                }
-            }
-            subst
-        }
-        _ => std::collections::HashMap::new(),
-    };
     // #420: exact not-taken edge-move recovery, keyed by resume-merge color.
-    // Takes precedence over the positional `kept_stack_subst` heuristic — the
-    // guard trampoline's `ref_copy(dst <- src)` gave this kept slot's live
+    // The guard trampoline's `ref_copy(dst <- src)` gave this kept slot's live
     // guard-pc source value directly, exact for any kept-stack depth.
     let kept_recovered: std::collections::HashMap<u32, OpRef> = BRANCH_GUARD_KEPT_RECOVERED
         .with(|c| c.borrow().iter().map(|&(dst, v)| (dst as u32, v)).collect());
@@ -6615,15 +6507,6 @@ fn collect_outer_active_boxes(
             // Edge-move-resolved kept operand; overrides the unwritten
             // merge-color read for this not-taken-arm operand-stack slot.
             active.push(rv);
-            continue;
-        }
-        if let Some(&subst) = kept_stack_subst.get(&idx) {
-            // The guard-pc kept value overrides the (unwritten) merge-color
-            // read for this not-taken-arm operand-stack slot.
-            if subst == OpRef::NONE {
-                panic!("{}", dump_ctx("ref", idx));
-            }
-            active.push(subst);
             continue;
         }
         let fallback = || {
@@ -9912,10 +9795,10 @@ fn walker_capture_snapshot_for_last_guard_impl(
             // snapshot's resume pc on the guard coordinate makes the encoder
             // liveness window (`collect_outer_active_boxes`), the blackhole
             // `setposition`, and the cranelift bridge re-trace entry all agree
-            // — the kept operand stack is naturally live at the guard pc, so
-            // the positional `kept_stack_subst` recovery (gpc == entry_py_pc)
-            // is skipped.  A non-branch guard carries no guard pc, so it keeps
-            // the merge `py_pc` and its exact `pc_map` translation.
+            // — the kept operand stack is naturally live at the guard pc and is
+            // recovered from the walk-level box mirror in
+            // `collect_outer_active_boxes`.  A non-branch guard carries no guard
+            // pc, so it keeps the merge `py_pc` and its exact `pc_map` translation.
             let liveness_py_pc = guard_py_pc.unwrap_or(py_pc);
             // The snapshot resume pc folds in the bit-14 marker for a try-block
             // residual call so the decode routes through
