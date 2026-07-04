@@ -3425,6 +3425,13 @@ pub struct LoweringContext {
     /// shape); `bh_unary_invert_fn` computes `~value` (a user `__invert__`
     /// may force virtualizables → `MayForce`).
     pub unary_invert_fn_idx: u16,
+    /// `unary_positive_fn` descrs-pool index.  UNARY_POSITIVE records the
+    /// object-space `pos(value)` op (pyopcode.py:649) lowered to
+    /// `residual_call_r_r(ConstInt(fn_idx), ListR([value]), Descr) → reg` via
+    /// [`lower_unary_positive_hlop_to_insn`] (the single-Ref FORMAT_SIMPLE
+    /// shape); `bh_unary_positive_fn` computes `+value` (a user `__pos__`
+    /// may force virtualizables → `MayForce`).
+    pub unary_positive_fn_idx: u16,
     /// `unary_not_fn` descrs-pool index.  UNARY_NOT records the object-space
     /// `not_(value)` op (pyopcode.py:651) lowered to
     /// `residual_call_r_r(ConstInt(fn_idx), ListR([value]), Descr) → reg` via
@@ -4972,6 +4979,9 @@ where
     if let Some(insn) = lower_unary_invert_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
+    if let Some(insn) = lower_unary_positive_hlop_to_insn(op, ctx, get_register, lower_constant) {
+        return Some(insn);
+    }
     if let Some(insn) = lower_unary_not_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
@@ -5445,6 +5455,42 @@ where
     };
     Some(build_residual_call_r_r_insn_from_operands(
         ctx.unary_invert_fn_idx,
+        vec![value],
+        CallFlavor::MayForce,
+        majit_ir::PyreHelperKind::None,
+        dst_reg,
+    ))
+}
+
+/// Lower the UNARY_POSITIVE object-space op `pos(value)` → `result: Ref`
+/// (pyopcode.py:649 `unaryoperation("pos")`) to
+/// `residual_call_r_r(ConstInt(unary_positive_fn_idx), ListR([value]),
+/// Descr) → reg`, the single-Ref [`lower_format_simple_hlop_to_insn`] shape.
+/// `bh_unary_positive_fn` computes `+value`; a user `__pos__` may force
+/// virtualizables → `MayForce`.
+///
+/// Returns `None` for non-`pos` opnames so the caller can fall through
+/// to other lowering arms.
+pub fn lower_unary_positive_hlop_to_insn<F, LC>(
+    op: &super::flow::SpaceOperation,
+    ctx: &LoweringContext,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
+{
+    if op.opname != "pos" || op.args.len() != 1 {
+        return None;
+    }
+    let value = operand_for_value_arg(&op.args[0], get_register, lower_constant)?;
+    let dst_reg = match &op.result {
+        Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
+        _ => return None,
+    };
+    Some(build_residual_call_r_r_insn_from_operands(
+        ctx.unary_positive_fn_idx,
         vec![value],
         CallFlavor::MayForce,
         majit_ir::PyreHelperKind::None,
@@ -7255,6 +7301,7 @@ mod tests {
             make_cell_fn_idx: 0,
             unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
+            unary_positive_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
             list_extend_fn_idx: 0,
@@ -7415,6 +7462,7 @@ mod tests {
             make_cell_fn_idx: 0,
             unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
+            unary_positive_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
             list_extend_fn_idx: 0,
@@ -7562,6 +7610,7 @@ mod tests {
             make_cell_fn_idx: 0,
             unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
+            unary_positive_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
             list_extend_fn_idx: 0,
@@ -7672,6 +7721,7 @@ mod tests {
             make_cell_fn_idx: 0,
             unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
+            unary_positive_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
             list_extend_fn_idx: 0,
@@ -7826,6 +7876,7 @@ mod tests {
             make_cell_fn_idx: 0,
             unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
+            unary_positive_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
             list_extend_fn_idx: 0,
@@ -8025,6 +8076,7 @@ mod tests {
             make_cell_fn_idx: 0,
             unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
+            unary_positive_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
             list_extend_fn_idx: 0,
@@ -8273,6 +8325,7 @@ mod tests {
             make_cell_fn_idx: 0,
             unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
+            unary_positive_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
             list_extend_fn_idx: 0,
@@ -8387,6 +8440,7 @@ mod tests {
             make_cell_fn_idx: 0,
             unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
+            unary_positive_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
             list_extend_fn_idx: 0,
@@ -8445,6 +8499,7 @@ mod tests {
             make_cell_fn_idx: 0,
             unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
+            unary_positive_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
             list_extend_fn_idx: 0,
@@ -8580,6 +8635,7 @@ mod tests {
             make_cell_fn_idx: 0,
             unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
+            unary_positive_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
             list_extend_fn_idx: 0,
@@ -8673,6 +8729,7 @@ mod tests {
             make_cell_fn_idx: 0,
             unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
+            unary_positive_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
             list_extend_fn_idx: 0,
@@ -8737,6 +8794,7 @@ mod tests {
             make_cell_fn_idx: 0,
             unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
+            unary_positive_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
             list_extend_fn_idx: 0,
@@ -8793,6 +8851,7 @@ mod tests {
             make_cell_fn_idx: 0,
             unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
+            unary_positive_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
             list_extend_fn_idx: 0,
@@ -8856,6 +8915,7 @@ mod tests {
             make_cell_fn_idx: 0,
             unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
+            unary_positive_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
             list_extend_fn_idx: 0,
@@ -8946,6 +9006,7 @@ mod tests {
             make_cell_fn_idx: 0,
             unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
+            unary_positive_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
             list_extend_fn_idx: 0,
@@ -8999,6 +9060,7 @@ mod tests {
             make_cell_fn_idx: 0,
             unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
+            unary_positive_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
             list_extend_fn_idx: 0,
@@ -9066,6 +9128,7 @@ mod tests {
             make_cell_fn_idx: 0,
             unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
+            unary_positive_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
             list_extend_fn_idx: 0,
@@ -9212,6 +9275,7 @@ mod tests {
             make_cell_fn_idx: 0,
             unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
+            unary_positive_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
             list_extend_fn_idx: 0,
@@ -9280,6 +9344,7 @@ mod tests {
             make_cell_fn_idx: 0,
             unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
+            unary_positive_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
             list_extend_fn_idx: 0,
@@ -9363,6 +9428,7 @@ mod tests {
             make_cell_fn_idx: 0,
             unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
+            unary_positive_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
             list_extend_fn_idx: 0,
@@ -9422,6 +9488,7 @@ mod tests {
             make_cell_fn_idx: 0,
             unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
+            unary_positive_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
             list_extend_fn_idx: 0,
@@ -9481,6 +9548,7 @@ mod tests {
             make_cell_fn_idx: 0,
             unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
+            unary_positive_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
             list_extend_fn_idx: 0,
@@ -9545,6 +9613,7 @@ mod tests {
             make_cell_fn_idx: 0,
             unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
+            unary_positive_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
             list_extend_fn_idx: 0,
@@ -9623,6 +9692,7 @@ mod tests {
             make_cell_fn_idx: 0,
             unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
+            unary_positive_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
             list_extend_fn_idx: 0,
@@ -10800,6 +10870,7 @@ mod tests {
             make_cell_fn_idx: 0,
             unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
+            unary_positive_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
             list_extend_fn_idx: 0,
@@ -11100,6 +11171,7 @@ mod tests {
             make_cell_fn_idx: 0,
             unary_negative_fn_idx: 0,
             unary_invert_fn_idx: 0,
+            unary_positive_fn_idx: 0,
             unary_not_fn_idx: 0,
             load_fast_check_fn_idx: 0,
             list_extend_fn_idx: 0,
@@ -11291,6 +11363,7 @@ mod tests {
             store_deref_value_fn_idx: 114,
             make_cell_fn_idx: 115,
             store_slice_fn_idx: 116,
+            unary_positive_fn_idx: 117,
         };
         let code_const = Constant::new(
             super::super::flow::ConstantValue::Signed(0x2000),
@@ -12196,6 +12269,75 @@ mod tests {
                 assert!(
                     matches!(args[0], Operand::ConstInt(109)),
                     "unary_invert_fn pool index, got {:?}",
+                    args[0]
+                );
+                match &args[1] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Ref);
+                        assert!(
+                            matches!(&list.content[..], [Operand::Register(r)] if r.index == 101),
+                            "ListR = [value], got {:?}",
+                            list.content
+                        );
+                    }
+                    other => panic!("expected ListR, got {other:?}"),
+                }
+                assert_eq!(
+                    result,
+                    Some(Register {
+                        kind: Kind::Ref,
+                        index: 102
+                    }),
+                );
+            }
+            _ => panic!("expected Insn::Op, got {insn:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_unary_positive_hlop_emits_unary_positive_fn_residual() {
+        // `pos(value)` →
+        // `residual_call_r_r(ConstInt(unary_positive_fn_idx), ListR([value]),
+        // Descr) → reg` (MayForce — a user `__pos__` may run Python).
+        // Same single-Ref shape as FORMAT_SIMPLE.
+        let value_var = Variable::new(VariableId(8), Kind::Ref);
+        let result_var = Variable::new(VariableId(9), Kind::Ref);
+        let (ctx, _, _) = load_attr_lowering_fixture();
+        let op = super::super::flow::SpaceOperation::new(
+            "pos",
+            vec![value_var.into()],
+            Some(result_var.into()),
+            0,
+        );
+        let mut get_register = |var: Variable| match var.id {
+            VariableId(8) => Register {
+                kind: Kind::Ref,
+                index: 101,
+            },
+            VariableId(9) => Register {
+                kind: Kind::Ref,
+                index: 102,
+            },
+            _ => panic!("unexpected var id {:?}", var.id),
+        };
+        let mut lower_constant = super::flatten_constant_operand_for_test;
+        let insn = super::lower_unary_positive_hlop_to_insn(
+            &op,
+            &ctx,
+            &mut get_register,
+            &mut lower_constant,
+        )
+        .expect("1-arg unary_positive lowering must succeed");
+        match insn {
+            Insn::Op {
+                opname,
+                args,
+                result,
+            } => {
+                assert_eq!(opname, "residual_call_r_r");
+                assert!(
+                    matches!(args[0], Operand::ConstInt(117)),
+                    "unary_positive_fn pool index, got {:?}",
                     args[0]
                 );
                 match &args[1] {

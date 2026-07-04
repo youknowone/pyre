@@ -170,6 +170,11 @@ pub fn unary_invert_value(value: PyObjectRef) -> Result<PyObjectRef, PyError> {
     invert(value)
 }
 
+pub fn unary_positive_value(value: PyObjectRef) -> Result<PyObjectRef, PyError> {
+    let value = crate::baseobjspace::unwrap_cell(value);
+    crate::baseobjspace::pos(value)
+}
+
 pub fn truth_value(value: PyObjectRef) -> Result<bool, PyError> {
     let value = crate::baseobjspace::unwrap_cell(value);
     is_true(value)
@@ -488,9 +493,11 @@ mod tests {
         assert!(!truth_value(w_int_new(0)).unwrap());
         let neg = unary_negative_value(w_int_new(4)).expect("unary negate should succeed");
         let inv = unary_invert_value(w_int_new(5)).expect("unary invert should succeed");
+        let pos = unary_positive_value(w_int_new(6)).expect("unary positive should succeed");
         unsafe {
             assert_eq!(w_int_get_value(neg), -4);
             assert_eq!(w_int_get_value(inv), !5);
+            assert_eq!(w_int_get_value(pos), 6);
         }
     }
 

@@ -4790,6 +4790,22 @@ pub extern "C" fn bh_unary_invert_fn(value: i64) -> i64 {
     }
 }
 
+/// UNARY_POSITIVE residual (`pos` HLOp → `residual_call_r_r`).  Computes
+/// `+value` through `opcode_ops::unary_positive_value` (`pos`); a user
+/// `__pos__` may run Python (`MayForce`).  On error the exception is
+/// published through `BH_LAST_EXC_VALUE` for the trailing
+/// `GuardNoException` and the call returns 0.
+pub extern "C" fn bh_unary_positive_fn(value: i64) -> i64 {
+    match pyre_interpreter::opcode_ops::unary_positive_value(value as pyre_object::PyObjectRef) {
+        Ok(result) => result as i64,
+        Err(err) => {
+            let exc_obj = err.to_exc_object();
+            publish_residual_call_exception(exc_obj as i64);
+            0
+        }
+    }
+}
+
 /// UNARY_NOT residual (`unary_not` HLOp → `residual_call_r_r`).  Returns
 /// `not value` as a bool object via `opcode_ops::truth_value`.  A user
 /// `__bool__` / `__len__` may run Python (`MayForce`), matching the

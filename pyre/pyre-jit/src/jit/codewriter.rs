@@ -3402,6 +3402,7 @@ struct FnPtrIndices {
     make_cell_fn: HelperHandle,
     unary_negative_fn: HelperHandle,
     unary_invert_fn: HelperHandle,
+    unary_positive_fn: HelperHandle,
     unary_not_fn: HelperHandle,
     load_fast_check_fn: HelperHandle,
     list_extend_fn: HelperHandle,
@@ -3891,6 +3892,13 @@ fn register_helper_fn_pointers(
         cpu.list_append_fn as *const (),
         CallFlavor::Plain,
     );
+    // `bh_unary_positive_fn` computes `+value`; a user `__pos__` may run
+    // Python → `MayForce`.  Appended last to preserve fn_ptr indices.
+    let unary_positive_fn = bind(
+        assembler,
+        cpu.unary_positive_fn as *const (),
+        CallFlavor::MayForce,
+    );
     FnPtrIndices {
         call_fn,
         load_global_fn,
@@ -3956,6 +3964,7 @@ fn register_helper_fn_pointers(
         unpack_ex_fn,
         get_iter_fn,
         for_iter_next_fn,
+        unary_positive_fn,
     }
 }
 
@@ -5351,6 +5360,11 @@ impl CodeWriter {
                     idx: unary_invert_fn_idx,
                     flavor: _unary_invert_fn_flavor,
                 },
+            unary_positive_fn:
+                HelperHandle {
+                    idx: unary_positive_fn_idx,
+                    flavor: _unary_positive_fn_flavor,
+                },
             unary_not_fn:
                 HelperHandle {
                     idx: unary_not_fn_idx,
@@ -5475,6 +5489,7 @@ impl CodeWriter {
                 make_cell_fn_idx,
                 unary_negative_fn_idx,
                 unary_invert_fn_idx,
+                unary_positive_fn_idx,
                 unary_not_fn_idx,
                 load_fast_check_fn_idx,
                 list_extend_fn_idx,
@@ -10091,10 +10106,37 @@ impl CodeWriter {
                         }
 
                         // CallIntrinsic1: pops 1, pushes 1 (result may differ). Net: 0.
-                        Instruction::CallIntrinsic1 { .. } => {
-                            let _ = current_state.stack.pop();
-                            push_fresh_ref(&mut current_state, &mut graph);
-                            emit_abort_permanent!(py_pc);
+                        // UnaryPositive (`+value`, pyopcode.rs:1390 → space.pos)
+                        // is lowered to the object-space `pos(value)` op, the
+                        // single-Ref FORMAT_SIMPLE shape (mirrors UNARY_INVERT);
+                        // the other intrinsics remain unported → abort_permanent.
+                        Instruction::CallIntrinsic1 { func } => {
+                            use pyre_interpreter::bytecode::IntrinsicFunction1;
+                            match func.get(op_arg) {
+                                IntrinsicFunction1::UnaryPositive => {
+                                    let val_reg = emit_popvalue_ref!(current_depth, py_pc);
+                                    let val_value =
+                                        pop_ref_or_fresh(&mut current_state, &mut graph);
+                                    if let super::flow::FlowValue::Variable(v) = &val_value {
+                                        pin!(Some(*v), val_reg);
+                                    }
+                                    let result_value = emit_graph_op_with_result(
+                                        &mut graph,
+                                        &current_block.block(),
+                                        "pos",
+                                        vec![val_value.into()],
+                                        Kind::Ref,
+                                        py_pc as i64,
+                                    );
+                                    pin!(Some(result_value), stack_base + current_depth);
+                                    push_and_bump!(result_value.into(), py_pc);
+                                }
+                                _ => {
+                                    let _ = current_state.stack.pop();
+                                    push_fresh_ref(&mut current_state, &mut graph);
+                                    emit_abort_permanent!(py_pc);
+                                }
+                            }
                         }
 
                         // CallIntrinsic2: variant-dependent stack effect.
