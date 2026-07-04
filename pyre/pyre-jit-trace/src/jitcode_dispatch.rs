@@ -10030,6 +10030,49 @@ fn walker_capture_snapshot_for_last_guard_impl(
                     Some(jp) => jp as i32,
                     None => majit_ir::resumedata::NO_JITCODE_PC,
                 }
+            } else if m366_nonbranch_pc_enabled() && after_residual_call {
+                // #366: extend the direct-pc carry to the after-residual-call
+                // guard family (`GuardException`/`GuardNoException`/
+                // `GuardNotForced`/`GuardAlwaysFails` — exactly what the
+                // `after_residual_call` bool tracks, `walker_capture_snapshot_for_last_guard`).
+                // These resume AFTER the residual call at the marker the
+                // decoder already resolves for this guard, so carrying it
+                // directly makes decode consult the carried word instead of
+                // the bit-14-marked / plain `py_pc → pc_map` translation.
+                //
+                // Which marker the decoder resolves depends on the sub-case
+                // captured in `marker_call_py_pc` (set above at the CALL pc):
+                //   * `Some(call_py_pc)` — the residual call is in a try-block
+                //     (FOR_ITER-next catch resume): decode routes the bit-14
+                //     word through `after_residual_call_resume_pc_for`, so carry
+                //     that same post-call catch `-live-` offset.
+                //   * `None` — plain sequential residual call resuming at the
+                //     next opcode's start marker: decode routes the plain word
+                //     through `pc_map`, so carry `resume_jitcode_pc_for(py_pc)`.
+                //     `py_pc == liveness_py_pc` here: the residual-call path
+                //     never stashes `BRANCH_GUARD_JITCODE_PC` (only kept-stack
+                //     branch guards do), so `guard_jc_pc_raw == usize::MAX` and
+                //     `guard_py_pc` is `None`.
+                // Both offsets are the SAME physical post-call `-live-` insn by
+                // codewriter construction (the plain fallthrough re-key and the
+                // catch-predecessor anchor resolve to one marker), so the
+                // carried value is identical to the decoder's fallback by
+                // construction — encoder reg-bank window and decoder liveness
+                // stay symmetric, and both pass `can_decode_live_vars` (a
+                // `-live-` marker). Fall back to the sentinel on a map miss.
+                let marker = unsafe {
+                    let jc = &*sym.jitcode;
+                    match marker_call_py_pc {
+                        Some(call_py_pc) => jc
+                            .payload
+                            .after_residual_call_resume_pc_for(call_py_pc as usize),
+                        None => jc.payload.resume_jitcode_pc_for(py_pc as usize),
+                    }
+                };
+                match marker {
+                    Some(jp) => jp as i32,
+                    None => majit_ir::resumedata::NO_JITCODE_PC,
+                }
             } else {
                 majit_ir::resumedata::NO_JITCODE_PC
             };
