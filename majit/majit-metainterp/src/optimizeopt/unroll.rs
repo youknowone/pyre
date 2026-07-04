@@ -4815,7 +4815,11 @@ fn assemble_peeled_trace_with_jump_args(
             .max(max_p2_pos)
             .saturating_add(1),
     );
-    let mut body_result_remap: majit_ir::VecMap<OpRef, OpRef> = majit_ir::VecMap::new();
+    // Keyed lookup only (`get`/`insert`, never iterated — codegen order comes
+    // from the `p2_ops` walk below), so a hash map keeps each per-op remap O(1)
+    // instead of the VecMap linear `get_index_of` scan on long peeled traces.
+    let mut body_result_remap: std::collections::HashMap<OpRef, OpRef> =
+        std::collections::HashMap::new();
     let visible_before_label: majit_ir::vec_set::VecSet<OpRef> = full_label_args
         .iter()
         .copied()
@@ -4831,7 +4835,8 @@ fn assemble_peeled_trace_with_jump_args(
     // RPython's Box identity makes this implicit — the alias's Box is
     // the same Python object that body ops already hold. Pyre's flat
     // OpRef model needs an explicit forwarding registration here.
-    let mut assembly_alias_remap: majit_ir::VecMap<OpRef, OpRef> = majit_ir::VecMap::new();
+    let mut assembly_alias_remap: std::collections::HashMap<OpRef, OpRef> =
+        std::collections::HashMap::new();
     // Keep the assembly-only alias map separate from the general `_forwarded`
     // walk. PyPy has object identity for these short-preamble boxes; pyre needs
     // the explicit jump_source -> label_arg substitution, but must not follow
@@ -4887,7 +4892,8 @@ fn assemble_peeled_trace_with_jump_args(
     // Combined-trace position → emitted clone, so remap hits bind to the
     // body clone producer instead of re-minting a position-only box (SSA:
     // a remapped arg's target clone was pushed in an earlier iteration).
-    let mut emitted_at: majit_ir::VecMap<OpRef, majit_ir::OpRc> = majit_ir::VecMap::new();
+    let mut emitted_at: std::collections::HashMap<OpRef, majit_ir::OpRc> =
+        std::collections::HashMap::new();
     for (op_idx, op) in p2_ops.iter().enumerate() {
         let mut new_op = (**op).clone();
         let mut original_args: Vec<OpRef> =
@@ -4901,8 +4907,8 @@ fn assemble_peeled_trace_with_jump_args(
         // installed Const forwarding after the guard was emitted, and PyPy keeps
         // the guard's original runtime argument.
         let remap_body_arg = |arg: OpRef,
-                              assembly_alias_remap: &majit_ir::VecMap<OpRef, OpRef>,
-                              body_result_remap: &majit_ir::VecMap<OpRef, OpRef>,
+                              assembly_alias_remap: &std::collections::HashMap<OpRef, OpRef>,
+                              body_result_remap: &std::collections::HashMap<OpRef, OpRef>,
                               seen_body_defs: &majit_ir::vec_set::VecSet<OpRef>,
                               visible_before_label: &majit_ir::vec_set::VecSet<OpRef>|
          -> OpRef {
