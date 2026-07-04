@@ -19,6 +19,26 @@ const _: () = assert!(
         == std::mem::size_of::<Rc<PyExecutionContext>>()
 );
 
+/// `types.FrameType` — the PyType every `PyFrame`'s `ob_header` points at.
+/// pyframe.py `class PyFrame(W_Root)` with `typedef.py:736 PyFrame.typedef
+/// = TypeDef("frame", ...)`. The descriptors (`f_back`, `f_locals`, …) are
+/// attached to this type by the `frame` typedef; until then it is a bare
+/// identity tag so a frame carries a valid `ob_type` like every other
+/// W_Root (mirrors `pytraceback::PYTRACEBACK_TYPE`).
+pub static FRAME_TYPE: PyType = new_pytype("frame");
+
+/// Build the `ob_header` for a freshly-created `PyFrame` — `ob_type`
+/// pinned to [`FRAME_TYPE`], `w_class` the cached `W_TypeObject`
+/// (null during bootstrap before `init_typeobjects`). Mirrors
+/// `pytraceback::pytraceback_new`'s header construction.
+#[inline]
+fn frame_ob_header() -> PyObject {
+    PyObject {
+        ob_type: &FRAME_TYPE as *const PyType,
+        w_class: get_instantiate(&FRAME_TYPE),
+    }
+}
+
 /// Execution frame for a single Python code block.
 ///
 /// Unified `locals_cells_stack_w` array layout:
@@ -38,6 +58,12 @@ const _: () = assert!(
 /// in registers. A "force" flushes them back to the heap.
 #[repr(C)]
 pub struct PyFrame {
+    /// `PyObject` prefix (`ob_type` / `w_class`) making the frame a
+    /// Python-visible `W_Root` — `pyframe.py class PyFrame(W_Root)`.
+    /// `ob_type` points at [`FRAME_TYPE`]. Kept at offset 0 like every
+    /// other `PyObject`-layout struct so `ob_type` reads land on the
+    /// typeptr the JIT `GuardClass` / `type()` expect.
+    pub ob_header: PyObject,
     /// Raw pointer to the shared execution context.
     /// The top-level frame leaks the Rc via `Rc::into_raw`.
     /// Callee frames just copy the pointer (no atomic refcount ops).
@@ -1134,6 +1160,7 @@ impl PyFrame {
             crate::w_code_frame_stores_global(code as PyObjectRef, w_globals);
         }
         let mut frame = PyFrame {
+            ob_header: frame_ob_header(),
             execution_context,
             pycode: code,
             locals_cells_stack_w: unsafe {
@@ -1253,6 +1280,7 @@ impl PyFrame {
             crate::w_code_frame_stores_global(code as PyObjectRef, w_globals);
         }
         let mut frame = PyFrame {
+            ob_header: frame_ob_header(),
             execution_context,
             pycode: code,
             locals_cells_stack_w: unsafe {
@@ -1297,6 +1325,7 @@ impl PyFrame {
         // so inline-frame STORE_GLOBAL is recorded as deferred IR (no concrete
         // write during the walk) and the compiled loop applies it exactly once.
         let mut frame = FrameBox::new(PyFrame {
+            ob_header: frame_ob_header(),
             execution_context: self.execution_context,
             pycode: self.pycode,
             locals_cells_stack_w: unsafe { alloc_fixed_array_from_vec(self.locals_w().to_vec()) },
@@ -2317,6 +2346,7 @@ impl PyFrame {
         }
 
         let mut frame = PyFrame {
+            ob_header: frame_ob_header(),
             execution_context,
             pycode: code,
             locals_cells_stack_w,
@@ -2631,6 +2661,7 @@ pub fn createframe_obj(
     let size = num_locals + num_cells + max_stack;
     let w_builtin = crate::baseobjspace::frame_builtin_obj(w_globals, execution_context);
     let mut frame = FrameBox::new(PyFrame {
+        ob_header: frame_ob_header(),
         execution_context,
         pycode: code,
         locals_cells_stack_w: unsafe { alloc_fixed_array_with_header(size, PY_NULL) },

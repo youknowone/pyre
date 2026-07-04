@@ -1324,7 +1324,11 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     build_object_descr_group_with_def_path(
         std::mem::size_of::<pyre_interpreter::pyframe::PyFrame>(),
         PYFRAME_GC_TYPE_ID,
-        0,
+        // `NewWithVtable` writes this typeptr at `cpu.vtable_offset`
+        // (`OB_TYPE_OFFSET = 0`), populating the frame's `ob_header.ob_type`
+        // so a JIT-built inline callee frame carries the same `frame` type
+        // tag as a `FrameBox`-constructed one.
+        &pyre_interpreter::pyframe::FRAME_TYPE as *const _ as usize,
         &[
             (
                 "PyFrame.locals_cells_stack_w",
