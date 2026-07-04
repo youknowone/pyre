@@ -9931,6 +9931,10 @@ impl CodeWriter {
                             current_depth = current_depth.saturating_sub(1);
                             current_state.stack.push(result);
                             current_depth += 1;
+                            // Genuine trace boundary: flowspace rejects END_SEND
+                            // with `unsupported_rpython("async iteration is not
+                            // RPython")` — the generated JIT cannot trace it
+                            // either, so abort_permanent is parity-correct.
                             emit_abort_permanent!(py_pc);
                         }
 
@@ -10215,6 +10219,10 @@ impl CodeWriter {
                             }
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
+                            // Genuine trace boundary: flowspace rejects
+                            // BUILD_INTERPOLATION with `unsupported_rpython(
+                            // "f-strings and template strings are not RPython")`
+                            // — abort is parity-correct.
                             emit_abort_permanent!(py_pc);
                         }
 
@@ -10225,6 +10233,10 @@ impl CodeWriter {
                             }
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
+                            // Genuine trace boundary: flowspace rejects
+                            // BUILD_TEMPLATE with `unsupported_rpython("f-strings
+                            // and template strings are not RPython")` — abort is
+                            // parity-correct.
                             emit_abort_permanent!(py_pc);
                         }
 
@@ -10288,6 +10300,10 @@ impl CodeWriter {
                         Instruction::GetLen => {
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
+                            // Genuine trace boundary: flowspace rejects GET_LEN
+                            // with `unsupported_rpython("GET_LEN is used by match
+                            // statements (not RPython)")` — abort is
+                            // parity-correct.
                             emit_abort_permanent!(py_pc);
                         }
 
@@ -10317,6 +10333,10 @@ impl CodeWriter {
                         Instruction::LoadFromDictOrDeref { .. } => {
                             let _ = current_state.stack.pop();
                             push_fresh_ref(&mut current_state, &mut graph);
+                            // Genuine trace boundary: flowspace rejects
+                            // LOAD_FROM_DICT_OR_DEREF with `unsupported_rpython(
+                            // "closure cell mutation is not RPython")` — abort is
+                            // parity-correct.
                             emit_abort_permanent!(py_pc);
                         }
 
@@ -10436,6 +10456,11 @@ impl CodeWriter {
                             push_and_bump!(result_value.into(), py_pc);
                         }
 
+                        // Genuine trace boundaries: flowspace rejects both —
+                        // LOAD_LOCALS with `unsupported_rpython("locals() is not
+                        // RPython")` and LOAD_BUILD_CLASS with `unsupported_rpython(
+                        // "defining classes inside functions is not RPython")`.
+                        // abort is parity-correct.
                         Instruction::LoadLocals | Instruction::LoadBuildClass => {
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
@@ -10559,6 +10584,10 @@ impl CodeWriter {
                         Instruction::GetYieldFromIter => {
                             let _ = current_state.stack.pop();
                             push_fresh_ref(&mut current_state, &mut graph);
+                            // Genuine trace boundary: flowspace rejects
+                            // GET_YIELD_FROM_ITER with `unsupported_rpython(
+                            // "`yield from` is not supported by flowspace yet")`
+                            // — abort is parity-correct.
                             emit_abort_permanent!(py_pc);
                         }
 
@@ -10698,6 +10727,10 @@ impl CodeWriter {
                         // ExitInitCheck: no-op in pyre (pyopcode.rs:2069). Net: 0.
                         // RustPython pops the __init__ return value, but pyre's
                         // dispatch is a plain Ok(StepResult::Continue).
+                        // Genuine trace boundary: flowspace rejects
+                        // EXIT_INIT_CHECK with `unsupported_rpython("`__init__`
+                        // return-None check is not RPython")` — abort is
+                        // parity-correct.
                         Instruction::ExitInitCheck => {
                             emit_abort_permanent!(py_pc);
                         }
@@ -10726,6 +10759,9 @@ impl CodeWriter {
                         Instruction::Send { .. } => {
                             let _ = current_state.stack.pop();
                             push_fresh_ref(&mut current_state, &mut graph);
+                            // Genuine trace boundary: flowspace rejects SEND with
+                            // `unsupported_rpython("async iteration is not
+                            // RPython")` — abort is parity-correct.
                             emit_abort_permanent!(py_pc);
                         }
 
@@ -10758,6 +10794,10 @@ impl CodeWriter {
                             }
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
+                            // Genuine trace boundary: flowspace rejects
+                            // CLEANUP_THROW with `unsupported_rpython("async
+                            // iteration is not RPython")` — abort is
+                            // parity-correct.
                             emit_abort_permanent!(py_pc);
                         }
 
@@ -10766,6 +10806,10 @@ impl CodeWriter {
                         Instruction::MatchSequence => {
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
+                            // Genuine trace boundary: flowspace rejects
+                            // MATCH_SEQUENCE with `unsupported_rpython("structural
+                            // pattern matching is not RPython")` — abort is
+                            // parity-correct.
                             emit_abort_permanent!(py_pc);
                         }
 
