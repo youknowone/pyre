@@ -1276,7 +1276,16 @@ pub(crate) fn bind_kwargs_to_signature(
     }
 
     if !unmatched_kw_names.is_empty() {
-        let msg = format_unknown_kwds_err(fname, &unmatched_kw_names);
+        // parse_obj (argument.py:377-380) rewrites the unknown-keyword message
+        // to "takes no keyword arguments" when the signature accepts no keywords
+        // at all (no **kwargs and no keyword-only params). Every BuiltinCode
+        // call routes through parse_obj (gateway.py funcrun / funcrun_obj), so
+        // the rewrite applies at any arity, not just the single-argument form.
+        let msg = if !has_varkw && sig.num_kwonlyargnames() == 0 {
+            format!("{}() takes no keyword arguments", fname)
+        } else {
+            format_unknown_kwds_err(fname, &unmatched_kw_names)
+        };
         return Err(crate::PyError::type_error(msg));
     }
 
