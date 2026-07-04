@@ -471,27 +471,6 @@ pub fn inner_close_enabled() -> bool {
     *FLAG.get_or_init(|| single_pass_enabled() || std::env::var_os("PYRE_INNER_CLOSE").is_some())
 }
 
-/// pyjitpl.py:3021 `same_greenkey` parity for the header-close gate: close the
-/// loop only when EVERY green matches the trace-start header, not just the pc
-/// green.  The dispatch model's `header_matches` compares only `mp_green_pc`; a
-/// jitdriver with extra scalar greens (e.g. aheui's `stackok` / `is_queue`) can
-/// revisit the header pc under a *different* full green key, which RPython keeps
-/// tracing past.
-///
-/// DORMANT scaffolding (default-off preserves the pc-only close).  Enabling it
-/// in isolation HANGS aheui logo: the stricter close correctly declines the
-/// header pc when `stackok`/`is_queue` differ from trace-start, but the dispatch
-/// model lacks RPython's rest of `reached_loop_header` (pyjitpl.py:2974-3060) —
-/// the unconditional `GUARD_FUTURE_CONDITION`, `live_arg_boxes = greens + reds`,
-/// and the reverse scan of `current_merge_points` with `append` on no match — so
-/// the trace never finds an outer match and spins.  Landing same_greenkey
-/// therefore requires those pieces together (Codex §2 cluster), not this gate
-/// alone; kept as the entry point + comparison primitive for that rework.
-pub fn same_greenkey_enabled() -> bool {
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("PYRE_SAME_GREENKEY").is_some())
-}
-
 /// Walker-as-tracer (`PYRE_AUTHORITATIVE`): when set, the `run_to_end` walk is
 /// the SOLE authoritative executor for a trace — residual calls execute exactly
 /// once during the walk and the outer mainloop must neither replay them nor
@@ -4187,6 +4166,12 @@ where
                 // MAJIT_PCSEQ diagnostic: all int-green constants at this merge
                 // point (pc plus any scalar greens like aheui's stackok/is_queue).
                 let mut mp_green_ints: Vec<i64> = Vec::new();
+                // pyjitpl.py:3912 same_greenkey compares EVERY green, not just
+                // the int slot.  Capture the ref (slot 1) and float (slot 2)
+                // green constants too so the header-close gate compares the full
+                // green tuple against the captured header greens (`header_greens`).
+                let mut mp_green_refs: Vec<i64> = Vec::new();
+                let mut mp_green_floats: Vec<i64> = Vec::new();
                 // Single-pass tracing: the walk closes back to an interpreter
                 // program pc; capture it (below, gated) so the merge-point hook
                 // can resume the native loop there. Gated so the
@@ -4273,6 +4258,24 @@ where
                                 mp_green_ints.push(v);
                             }
                         }
+                        // pyjitpl.py:3912 same_greenkey: ref (slot 1) and float
+                        // (slot 2) green constants for the full-green header
+                        // compare.  `equal_whatever(Float, ..)` compares f64 bits,
+                        // so store the float green's `to_bits`.
+                        if slot == 1 {
+                            if let Some(majit_ir::OpRef::ConstPtr(v)) =
+                                frame.ref_regs.get(reg_idx).copied().flatten()
+                            {
+                                mp_green_refs.push(v.0 as i64);
+                            }
+                        }
+                        if slot == 2 {
+                            if let Some(majit_ir::OpRef::ConstFloat(v)) =
+                                frame.float_regs.get(reg_idx).copied().flatten()
+                            {
+                                mp_green_floats.push(v.to_bits() as i64);
+                            }
+                        }
                         debug_assert!(
                             reg_idx < max,
                             "BC_JIT_MERGE_POINT: register byte {reg} \
@@ -4333,7 +4336,8 @@ where
                 if std::env::var_os("MAJIT_PCSEQ").is_some() {
                     let sf: Vec<Option<i64>> = (0..3).map(|i| sym.state_field_value(i)).collect();
                     eprintln!(
-                        "@@@PCSEQ mp pc={mp_green_pc:?} greens={mp_green_ints:?} sf={sf:?} num_ops={} seen_lh={}",
+                        "@@@PCSEQ mp pc={mp_green_pc:?} greens={mp_green_ints:?} refs={mp_green_refs:?} floats={mp_green_floats:?} hdr={:?} sf={sf:?} num_ops={} seen_lh={}",
+                        ctx.header_greens,
                         ctx.num_ops(),
                         self.seen_loop_header_for_jdindex,
                     );
@@ -4390,6 +4394,19 @@ where
                         self.seen_loop_header_for_jdindex = jdindex as i32;
                     }
                 }
+                // pyjitpl.py:3029-3030 `current_merge_points.append(...)`: the
+                // FIRST merge-point visit of a primary trace is the loop header;
+                // snapshot its concrete green constants (grouped by IR slot) as
+                // the `same_greenkey` reference for every later visit.  Bridges
+                // close through the compiled-loop registry, not this reference,
+                // so they never capture it.
+                if !ctx.is_bridge_trace && ctx.header_greens.is_none() {
+                    ctx.header_greens = Some((
+                        mp_green_ints.clone(),
+                        mp_green_refs.clone(),
+                        mp_green_floats.clone(),
+                    ));
+                }
                 // pyjitpl.py:1559-1573 opimpl_jit_merge_point close-loop
                 // protocol — read the per-driver flag stamped by the
                 // previous iteration's `BC_LOOP_HEADER` or by the
@@ -4437,26 +4454,37 @@ where
                         ctx.header_pc
                     };
                     let pc_matches = mp_green_pc.map_or(true, |pc| pc == close_target_pc as i64);
-                    // pyjitpl.py:3021 same_greenkey: beyond the pc, require every
-                    // int green (aheui's stackok / is_queue, …) to equal the
-                    // trace-start header's.  A primary trace's header is
-                    // current_merge_points[0]; a bridge closes into its parent
-                    // loop, whose full greens are not tracked here, so restrict
-                    // the extra check to primary traces.  Gated (default keeps the
-                    // pc-only close) until verified byte-neutral.
-                    let same_greenkey = if same_greenkey_enabled() && !ctx.is_bridge_trace {
-                        ctx.current_merge_points.first().map_or(true, |hdr| {
-                            let hdr_ints: Vec<i64> = hdr
-                                .green_boxes
-                                .iter()
-                                .filter_map(|b| match b.opref {
-                                    majit_ir::OpRef::ConstInt(v) => Some(v),
-                                    _ => None,
-                                })
-                                .collect();
-                            hdr_ints == mp_green_ints
-                        })
+                    // pyjitpl.py:3021/3912 same_greenkey: beyond the pc, close
+                    // only when EVERY green (aheui's stackok / is_queue, the
+                    // `program` ref, …) equals the trace-start header's.  Compare
+                    // element-wise against the header greens captured on the first
+                    // visit (`header_greens`) — the SAME merge-point green
+                    // vocabulary — which is `Box.same_constant` per Const type
+                    // (ConstInt/ConstFloat bitwise, ConstPtr pointer identity),
+                    // exactly what plain slot-grouped `Vec` equality performs.
+                    // The reference is NOT `green_key_values` (the
+                    // back-edge/can_enter_jit key carries a different arity) nor
+                    // `current_merge_points[0].green_boxes` (InputArg placeholders,
+                    // no Const → an always-empty filter that would decline every
+                    // close and hang).
+                    let same_greenkey = if ctx.is_bridge_trace {
+                        // A bridge closes by JUMPing into its parent loop via the
+                        // compiled-loop registry (`has_compiled_targets` =
+                        // get_procedure_token analog), keyed by the (pc, code)
+                        // green-key hash.  The parent loop's full green tuple is
+                        // not threaded to the bridge ctx, and pyre's u64 green key
+                        // does not encode scalar greens beyond (pc, code), so a
+                        // full-green bridge match would need the registry re-keyed
+                        // by the full green hash — a separate change.  Keep the
+                        // registry/pc close for bridges.
+                        true
+                    } else if let Some((h_ints, h_refs, h_floats)) = ctx.header_greens.as_ref() {
+                        &mp_green_ints == h_ints
+                            && &mp_green_refs == h_refs
+                            && &mp_green_floats == h_floats
                     } else {
+                        // Header greens not captured (no prior visit): the (pc,
+                        // code) hash is the loop identity — fall back to pc-only.
                         true
                     };
                     let header_matches = pc_matches && same_greenkey;

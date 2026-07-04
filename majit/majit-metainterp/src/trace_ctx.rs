@@ -271,6 +271,17 @@ pub struct TraceCtx {
     /// tracing with their trace positions. First visit records the key +
     /// position; second visit closes the loop.
     pub(crate) current_merge_points: Vec<MergePoint>,
+    /// pyjitpl.py:3912 `same_greenkey` reference — the trace-start loop
+    /// header's concrete green constants, grouped by IR register slot
+    /// (`(ints, refs, floats)`).  Captured on the first merge-point visit of a
+    /// primary trace (the header), then compared element-wise against every
+    /// later visit's greens to decline closing when a scalar green (aheui's
+    /// `stackok` / `is_queue`) differs from the header.  `None` until captured;
+    /// bridges never populate it (they close through the compiled-loop
+    /// registry).  This is the merge-point green vocabulary — distinct from
+    /// `green_key_values`, the back-edge/can_enter_jit key, which carries a
+    /// different arity and cannot be compared against a merge point directly.
+    pub(crate) header_greens: Option<(Vec<i64>, Vec<i64>, Vec<i64>)>,
     /// pyjitpl.py:2979 reached_loop_header parity: callback to check
     /// has_compiled_targets(ptoken) for a given green key. Bridge traces
     /// skip loop headers without compiled targets. Live lookup (not snapshot)
@@ -1159,6 +1170,7 @@ impl TraceCtx {
                     .collect(),
                 header_pc: 0,
             }],
+            header_greens: None,
             heap_cache: HeapCache::new(),
             force_finish: false,
             last_traced_pc: 0,
@@ -1232,6 +1244,7 @@ impl TraceCtx {
                     .collect(),
                 header_pc: 0,
             }],
+            header_greens: None,
             heap_cache: HeapCache::new(),
             force_finish: false,
             last_traced_pc: 0,
