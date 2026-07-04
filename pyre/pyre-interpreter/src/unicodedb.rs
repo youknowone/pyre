@@ -435,6 +435,25 @@ pub fn isdecimal(c: char) -> bool {
     in_ranges(DECIMAL, c)
 }
 
+/// The decimal value (0-9) of a `Numeric_Type=Decimal` scalar, or `None`.
+/// Every `Nd` range spans exactly the ten digits `0..9` in order, so the
+/// value is the offset from the range start.
+pub fn decimal_value(c: char) -> Option<u32> {
+    let cp = c as u32;
+    let idx = DECIMAL
+        .binary_search_by(|&(lo, hi)| {
+            if hi < cp {
+                core::cmp::Ordering::Less
+            } else if lo > cp {
+                core::cmp::Ordering::Greater
+            } else {
+                core::cmp::Ordering::Equal
+            }
+        })
+        .ok()?;
+    Some(cp - DECIMAL[idx].0)
+}
+
 /// `Numeric_Type` in Decimal or Digit.
 pub fn isdigit(c: char) -> bool {
     in_ranges(DIGIT, c)

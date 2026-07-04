@@ -4798,19 +4798,19 @@ pub fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
             }
             return ensure_baseint_result(w_obj, obj);
         }
-        // intobject.py:1026-1034: str
-        unsafe {
-            if is_str(obj) {
-                return parse_int_from_str(w_str_get_value(obj), 10);
-            }
-            // intobject.py:1035-1038: bytes / bytearray
-            if pyre_object::bytesobject::is_bytes_like(obj) {
-                let data = pyre_object::bytesobject::bytes_like_data(obj);
-                let s = String::from_utf8_lossy(data);
-                return parse_int_from_str(&s, 10);
-            }
+        // intobject.py:1047 — unicode is normalized through
+        // `unicode_to_decimal_w` so non-ASCII decimal digits parse.
+        if unsafe { is_str(obj) } {
+            let s = unsafe { w_str_get_value(obj) };
+            return parse_int_from_str(&unicode_to_decimal(s), 10);
         }
-        // intobject.py:1040-1050: buffer interface fallback → TypeError
+        // intobject.py:1056-1070 — bytes / bytearray, then any object
+        // exposing a readable buffer (`space.charbuf_w`).
+        if let Some(src) = crate::typedef::buffer_as_bytes_like(obj)? {
+            let data = unsafe { pyre_object::bytesobject::bytes_like_data(src) };
+            let s = String::from_utf8_lossy(data);
+            return parse_int_from_str(&s, 10);
+        }
         return Err(crate::PyError::type_error(format!(
             "int() argument must be a string, a bytes-like object or a real number, not '{}'",
             crate::type_methods::arg_type_name(obj)
@@ -4820,9 +4820,11 @@ pub fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     // intobject.py:1051-1072: w_base is not None — parse with base
     let base = getindex_w_for_base(w_base.unwrap())?;
     unsafe {
+        // intobject.py:1079 — unicode normalized through `unicode_to_decimal_w`.
         if is_str(obj) {
-            return parse_int_from_str(w_str_get_value(obj), base);
+            return parse_int_from_str(&unicode_to_decimal(w_str_get_value(obj)), base);
         }
+        // With an explicit base only str / bytes / bytearray are accepted.
         if pyre_object::bytesobject::is_bytes_like(obj) {
             let data = pyre_object::bytesobject::bytes_like_data(obj);
             let s = String::from_utf8_lossy(data);
@@ -4916,6 +4918,32 @@ pub(crate) fn getindex_w(w_obj: PyObjectRef) -> Result<i64, crate::PyError> {
         "int() second argument must be an integer, not '{}'",
         unsafe { (*(*w_obj).ob_type).name }
     )))
+}
+
+/// `unicodeobject.py unicode_to_decimal_w` — normalize a unicode string for
+/// numeric parsing: a non-ASCII decimal digit (`Numeric_Type=Decimal`)
+/// becomes its ASCII digit and non-ASCII whitespace becomes a space, so
+/// `int("４２")` and `float("١٫٥")`-style inputs parse.  An all-ASCII string
+/// is returned untouched.
+fn unicode_to_decimal(s: &str) -> std::borrow::Cow<'_, str> {
+    if s.is_ascii() {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c as u32 > 127 {
+            if c.is_whitespace() {
+                out.push(' ');
+                continue;
+            }
+            if let Some(v) = crate::unicodedb::decimal_value(c) {
+                out.push((b'0' + v as u8) as char);
+                continue;
+            }
+        }
+        out.push(c);
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 /// Parse an integer from a string with the given base.
@@ -5036,7 +5064,11 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             ));
         }
         if is_str(obj) {
-            let s = w_str_get_value(obj);
+            let raw = w_str_get_value(obj);
+            // floatobject.py:242 — unicode is normalized through
+            // `unicode_to_decimal_w` before `_string_to_float`, so non-ASCII
+            // decimal digits parse.
+            let s = unicode_to_decimal(raw);
             // `float_from_string` strips PEP 515 underscore separators
             // (between digits only) before parsing.
             if let Some(cleaned) = strip_numeric_underscores(s.trim()) {
@@ -5047,7 +5079,7 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             // `floatobject.py:descr_new` — message uses single-quoted str:
             // "could not convert string to float: '<s>'".
             return Err(crate::PyError::value_error(format!(
-                "could not convert string to float: '{s}'"
+                "could not convert string to float: '{raw}'"
             )));
         }
     }
@@ -5094,11 +5126,11 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             )));
         }
     }
-    // floatobject.py:247-255 — a bytes-like value falls through to
-    // `charbuf_w`, decoded and parsed like a str; an unparseable value reprs
-    // as `b'...'` in the error (space.repr / `%R`).
-    if unsafe { pyre_object::bytesobject::is_bytes_like(obj) } {
-        let data = unsafe { pyre_object::bytesobject::bytes_like_data(obj) };
+    // floatobject.py:247-255 — a readable buffer (`charbuf_w`: bytes /
+    // bytearray / array / memoryview) is decoded and parsed like a str; an
+    // unparseable value reprs as `b'...'` in the error (space.repr / `%R`).
+    if let Some(src) = crate::typedef::buffer_as_bytes_like(obj)? {
+        let data = unsafe { pyre_object::bytesobject::bytes_like_data(src) };
         let decoded = String::from_utf8_lossy(data);
         if let Some(cleaned) = strip_numeric_underscores(decoded.trim()) {
             if let Ok(v) = cleaned.parse::<f64>() {
