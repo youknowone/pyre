@@ -279,22 +279,24 @@ pub fn portal_red_pre_regalloc_slots(nlocals: usize, max_stackdepth: usize) -> (
     (portal_frame_reg, portal_ec_reg)
 }
 
-/// `#124` Approach B master switch (`PYRE_M3_JITCODE_PC`, default off).
+/// `#124` Approach B master switch (`PYRE_M3_JITCODE_PC`, default on).
 ///
-/// When enabled, a kept-stack branch guard resumes at its carried direct
-/// JitCode pc and the encoder collects the guard-pc live box set directly
-/// rather than the resume-pc set patched by the positional kept-stack
-/// heuristic.  Default off: for a depth-1 leading-`and` short-circuit
-/// (`x = local and CONST`) the guard-pc box set holds the *taken*-path value
-/// for the kept operand-stack slot, so the direct-pc path restores that value
-/// on the not-taken arm and silently miscompiles (`flag and 11`: 2197063 vs
-/// 1466663).  The positional heuristic recovers the not-taken kept value
-/// correctly — depth-1 via `kept_stack_subst` and depth > 1 via the not-taken
-/// edge's decoded `ref_copy` parallel moves (`#420`,
-/// `jitcode_dispatch.rs decode_branch_trampoline_ref_moves`), the authoritative
-/// kept-value source while M3 is off.  Set `PYRE_M3_JITCODE_PC=1` to opt back
-/// into the direct-pc path for validating the future snapshot-before-guard fix
-/// (#124/#281).
+/// A kept-stack branch guard resumes at its carried direct JitCode pc and the
+/// encoder collects the guard-pc live box set directly — the faithful
+/// per-bytecode resume that retires the lossy `pc_map` (`#73`).  The opt-out
+/// `PYRE_M3_JITCODE_PC=0` restores the legacy positional kept-stack heuristic,
+/// which resumes past the pop through `pc_map` and recovers the not-taken kept
+/// value out of band: depth 1 via `kept_stack_subst`, depth > 1 via the
+/// not-taken edge's decoded `ref_copy` parallel moves
+/// (`decode_branch_trampoline_ref_moves`, `#420`).
+///
+/// The direct-pc path once miscompiled a depth-1 leading-`and` short-circuit
+/// (`x = local and CONST`): the symbolic bridge seeded the kept operand
+/// concrete, its residual compare const-folded, and `generate_guard` skipped
+/// the now-`Const` condition, so the not-taken arm restored the taken-path
+/// value (`flag and 11`: 2197063 vs 1466663).  `setup_bridge_sym` now withholds
+/// that concrete seed on the guard-pc kept-stack resume, so the kept operand
+/// stays a symbolic input arg and its guard fires per iteration.
 pub(crate) fn m3_jitcode_pc_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M3_JITCODE_PC") {
@@ -302,7 +304,7 @@ pub(crate) fn m3_jitcode_pc_enabled() -> bool {
             let v = v.to_string_lossy();
             v != "0" && !v.eq_ignore_ascii_case("false")
         }
-        None => false,
+        None => true,
     })
 }
 
