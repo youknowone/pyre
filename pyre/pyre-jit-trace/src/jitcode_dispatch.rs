@@ -9993,18 +9993,35 @@ fn walker_capture_snapshot_for_last_guard_impl(
             let guard_jitcode_pc: i32 = if guard_jc_pc_raw != usize::MAX {
                 guard_jc_pc_raw as i32
             } else if m366_nonbranch_pc_enabled()
+                && !after_residual_call
                 && matches!(
                     ctx.trace_ctx.last_guard_opcode(),
-                    Some(OpCode::GuardValue | OpCode::GuardClass)
+                    Some(
+                        OpCode::GuardValue
+                            | OpCode::GuardClass
+                            | OpCode::GuardTrue
+                            | OpCode::GuardFalse
+                    )
                 )
             {
                 // #366: carry the `-live-` marker offset (`resume_jitcode_pc_for(
-                // py_pc)`), NOT the raw guard `op_pc`.  A specialization guard
-                // resumes by re-executing its own opcode at `py_pc` with a
-                // deterministic operand stack, so this marker is a valid
-                // startpoint AND identical to the decoder's `pc_map` fallback —
-                // the two windows stay symmetric.  Fall back to the sentinel if
-                // `py_pc` has no `pc_map` entry (portal-bridge / out-of-range).
+                // py_pc)`), NOT the raw guard `op_pc`.  Reached only on the
+                // sentinel path (`guard_jc_pc_raw == usize::MAX`): the
+                // specialization guards (`GuardValue`/`GuardClass`) and the
+                // depth-0 branch guards (`GuardTrue`/`GuardFalse`, kept-stack
+                // depth>0 branches take the first arm carrying `op.pc`).  For
+                // every guard here the decoder's baseline already resolves
+                // `pc_map[py_pc]` — the same `py_pc` and the same forward
+                // lookup — so carrying `resume_jitcode_pc_for(py_pc)` is
+                // identical to that fallback by construction, keeping the
+                // encoder reg-bank window and decoder liveness symmetric.  It is
+                // a valid startpoint (`can_decode_live_vars` holds: the baseline
+                // decodes `pc_map[py_pc]` without `_missing_liveness` today).
+                // The `after_residual_call` family is excluded — it routes
+                // through the separate `after_residual_call_resume_pc` map + the
+                // bit-14 marker, so `pc_map[py_pc]` would name a different
+                // offset.  Fall back to the sentinel if `py_pc` has no `pc_map`
+                // entry (portal-bridge / out-of-range).
                 let marker = unsafe {
                     let jc = &*sym.jitcode;
                     jc.payload.resume_jitcode_pc_for(py_pc as usize)
