@@ -658,7 +658,8 @@ pub fn prod(args: &[PyObjectRef]) -> PyResult {
     let is_kwargs = unsafe {
         let last = *args.last().unwrap();
         pyre_object::is_dict(last)
-            && pyre_object::w_dict_lookup(last, pyre_object::w_str_new("__pyre_kw__")).is_some()
+            && pyre_object::w_dict_lookup(last, pyre_object::w_str_new("__pyre_kw__"))
+                .is_some_and(pyre_object::kw_marker::is_kw_marker_sentinel)
     };
     let (positional, start) = if is_kwargs {
         let kwargs = *args.last().unwrap();

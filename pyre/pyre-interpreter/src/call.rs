@@ -1390,7 +1390,7 @@ pub fn call_with_kwargs(
                     pyre_object::w_dict_store(
                         kwargs_dict,
                         pyre_object::w_str_new("__pyre_kw__"),
-                        pyre_object::w_bool_from(true),
+                        pyre_object::kw_marker::w_kw_marker_sentinel(),
                     );
                 }
                 for (key, value) in kwargs {
@@ -2540,7 +2540,8 @@ pub(crate) fn real_build_class(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
         let last = args[args.len() - 1];
         if unsafe { pyre_object::is_dict(last) }
             && unsafe {
-                pyre_object::w_dict_lookup(last, pyre_object::w_str_new("__pyre_kw__")).is_some()
+                pyre_object::w_dict_lookup(last, pyre_object::w_str_new("__pyre_kw__"))
+                    .is_some_and(pyre_object::kw_marker::is_kw_marker_sentinel)
             }
         {
             let w_metaclass =
@@ -3202,7 +3203,7 @@ fn pack_pyre_kwargs(kw_items: &[(PyObjectRef, PyObjectRef)]) -> PyObjectRef {
         pyre_object::w_dict_store(
             kw_dict,
             pyre_object::w_str_new("__pyre_kw__"),
-            pyre_object::w_bool_from(true),
+            pyre_object::kw_marker::w_kw_marker_sentinel(),
         );
         for (k, v) in kw_items {
             pyre_object::w_dict_store(kw_dict, *k, *v);

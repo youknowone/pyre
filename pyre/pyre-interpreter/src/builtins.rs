@@ -2228,7 +2228,9 @@ fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let is_kwargs = !args.is_empty()
         && unsafe {
             let last = *args.last().unwrap();
-            is_dict(last) && pyre_object::w_dict_lookup(last, w_str_new("__pyre_kw__")).is_some()
+            is_dict(last)
+                && pyre_object::w_dict_lookup(last, w_str_new("__pyre_kw__"))
+                    .is_some_and(pyre_object::kw_marker::is_kw_marker_sentinel)
         };
     let (positional, end, sep, file, flush) = if is_kwargs {
         let kwargs = *args.last().unwrap();
@@ -2476,17 +2478,15 @@ pub fn builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 /// and the `__pyre_kw__` marker can be removed.
 pub(crate) fn split_builtin_kwargs(args: &[PyObjectRef]) -> (&[PyObjectRef], Option<PyObjectRef>) {
     if let Some(&last) = args.last() {
-        // `call_with_kwargs` appends the marker only when the call carried
-        // keywords, so a genuine marker always holds `__pyre_kw__` *and* at
-        // least one real keyword entry.  A dict passed positionally that merely
-        // contains `__pyre_kw__` and nothing else (`len({'__pyre_kw__': True})`)
-        // is a value, not the marker, and must not be stripped.
+        // The marker dict stores an unforgeable sentinel under `__pyre_kw__`
+        // (`call_with_kwargs`), so detection is by value identity.  A dict
+        // passed positionally that merely contains a `__pyre_kw__` string key
+        // (`float({'__pyre_kw__': True})`) carries a different value and is a
+        // value, not the marker, so it must not be stripped.
         let is_marker = unsafe {
             is_dict(last)
-                && pyre_object::w_dict_lookup(last, w_str_new("__pyre_kw__")).is_some()
-                && pyre_object::w_dict_str_entries(last)
-                    .iter()
-                    .any(|(key, _)| key != "__pyre_kw__")
+                && pyre_object::w_dict_lookup(last, w_str_new("__pyre_kw__"))
+                    .is_some_and(pyre_object::kw_marker::is_kw_marker_sentinel)
         };
         if is_marker {
             return (&args[..args.len() - 1], Some(last));
@@ -2554,7 +2554,9 @@ pub(crate) fn kwarg_reject_unknown(
 /// CALL_KW builtin dispatch appends — i.e. the call carried keywords.
 pub(crate) fn has_builtin_kwargs(args: &[PyObjectRef]) -> bool {
     matches!(args.last(), Some(&last) if unsafe {
-        is_dict(last) && pyre_object::w_dict_lookup(last, w_str_new("__pyre_kw__")).is_some()
+        is_dict(last)
+            && pyre_object::w_dict_lookup(last, w_str_new("__pyre_kw__"))
+                .is_some_and(pyre_object::kw_marker::is_kw_marker_sentinel)
     })
 }
 
@@ -5315,11 +5317,12 @@ pub(crate) fn builtin_dict_ctor(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
         if is_dict(src) {
             // PyPy: descr_init → shallow copy when first arg is a dict.
             // `dict(**kwargs)` reaches here with the `__pyre_kw__`-tagged
-            // kwargs vehicle as the source; the marker is an interp-level
-            // sentinel, never a real key, so drop it during the copy.
+            // kwargs vehicle as the source; its marker entry carries the
+            // unforgeable sentinel value, so drop that entry by identity — a
+            // real `__pyre_kw__` string key in a copied user dict is kept.
             let dict = w_dict_new();
             for (k, v) in pyre_object::w_dict_items(src) {
-                if is_str(k) && pyre_object::w_str_get_wtf8(k).as_str() == Ok("__pyre_kw__") {
+                if pyre_object::kw_marker::is_kw_marker_sentinel(v) {
                     continue;
                 }
                 w_dict_store(dict, k, v);

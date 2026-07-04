@@ -3225,7 +3225,8 @@ fn split_kwargs(
         if !last.is_null()
             && unsafe { pyre_object::is_dict(last) }
             && unsafe {
-                pyre_object::w_dict_lookup(last, pyre_object::w_str_new("__pyre_kw__")).is_some()
+                pyre_object::w_dict_lookup(last, pyre_object::w_str_new("__pyre_kw__"))
+                    .is_some_and(pyre_object::kw_marker::is_kw_marker_sentinel)
             }
         {
             return (&args[..args.len() - 1], Some(last));

@@ -36,6 +36,7 @@ pub mod interp_itertools;
 pub mod interp_sre;
 pub mod intobject;
 pub mod iterobject;
+pub mod kw_marker;
 pub mod kwargsdict;
 pub mod listobject;
 pub mod lltype;
