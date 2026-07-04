@@ -1999,9 +1999,8 @@ unsafe fn detect_list_setitem_strategy(
 ///
 /// RPython jitcode for range.__next__:
 ///   getfield(current) → getfield(remaining) → getfield(step) →
-///   remaining > 0 guard → int_add_ovf(current,step) →
-///   guard_no_overflow → setfield(current, next) →
-///   setfield(remaining, remaining - 1)
+///   remaining > 0 guard → int_add(current,step) →
+///   setfield(current, next) → setfield(remaining, remaining - 1)
 ///
 /// Returns (current_opref, concrete_current) or None if should fall back.
 #[inline]
@@ -2014,11 +2013,6 @@ pub fn generated_iter_next_value(
     concrete_current: i64,
 ) -> Option<(majit_ir::OpRef, i64)> {
     use majit_ir::OpCode;
-
-    // Overflow check: if current + step overflows, fall back.
-    if concrete_continues && concrete_current.checked_add(concrete_step).is_none() {
-        return None;
-    }
 
     frame.guard_range_iter(ctx, iter);
 
@@ -2041,8 +2035,11 @@ pub fn generated_iter_next_value(
         return Some((zero, 0));
     }
 
-    let next_current = ctx.record_op(OpCode::IntAddOvf, &[current, step]);
-    frame.generate_guard(ctx, OpCode::GuardNoOverflow, &[]);
+    // The cursor advance mirrors `w_range_iter_next`'s `current + step` (a
+    // plain wrapping add, not `ovfcheck`) — RPython `W_IntRangeIterator.next`
+    // uses `int_add` for the cursor write too, so emit `IntAdd` rather than
+    // `int_add_ovf`/`guard_no_overflow`.
+    let next_current = ctx.record_op(OpCode::IntAdd, &[current, step]);
     let ri_descr = crate::descr::range_iter_current_descr();
     let ri_descr_idx = ri_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[iter, next_current], ri_descr);
@@ -2051,10 +2048,8 @@ pub fn generated_iter_next_value(
     let remaining_descr = crate::descr::range_iter_remaining_descr();
     let remaining_descr_idx = remaining_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[iter, next_remaining], remaining_descr);
-    // Overflow already pre-checked above (`concrete_current.checked_add`)
-    // so the wrapping add reproduces `IntAddOvf`'s runtime value.
     let next_current_value = majit_ir::Value::Int(concrete_current.wrapping_add(concrete_step));
-    // Stamp the `IntAddOvf` result so downstream `box_value` consumers
+    // Stamp the `IntAdd` result so downstream `box_value` consumers
     // see the runtime concrete (matches RPython Box propagation
     // through arithmetic ops).
     ctx.set_opref_concrete(next_current, next_current_value);
