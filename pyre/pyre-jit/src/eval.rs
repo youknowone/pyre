@@ -576,6 +576,77 @@ unsafe fn memoryview_object_destructor(obj_addr: usize) {
     }
 }
 
+/// Custom trace for `PyFrame` (type id [`PYFRAME_GC_TYPE_ID`]).
+///
+/// Forwards exactly the frame-owned GC slots that the interpreter root
+/// walker `pyre-interpreter::eval::walk_pyframe_roots` visits per frame,
+/// so a type-directed trace of a header-tagged `PyFrame` sees the same
+/// root set the ad-hoc walker does.  A flat `gc_ptr_offsets` list cannot
+/// express two of those slots: the `locals_cells_stack_w` items when the
+/// array is a stationary `std::alloc` block (regime-a — the collector
+/// never enters `trace_and_update_object` on a non-nursery array so its
+/// varsize walker never runs), and the `debugdata->{w_locals, w_f_trace}`
+/// refs, which live one pointer indirection away inside a non-GC
+/// `malloc`'d `FrameDebugData`.  Both require a custom trace.
+///
+/// Forwarded (mirrors `walk_pyframe_roots` eval.rs:496-556):
+///   - `f_backref` — the parent frame pointer.
+///   - `pycode` — visited to match the walker; inert while code objects
+///     are Box-immortal (`is_nursery_object_start` short-circuits).
+///   - `locals_cells_stack_w` — the array pointer.  When the array is a
+///     GC-managed (moving) nursery block its slot is forwarded and the
+///     type-9 varsize walker forwards the items; when it is a stationary
+///     `std::alloc` block each item is forwarded in place — the same
+///     regime split as `list_object_custom_trace` / `tuple_object_custom_trace`.
+///   - `f_generator_nowref`, `w_yielding_from`, `w_builtin`, `w_globals`
+///     — the ref-bearing statics.
+///   - `debugdata->w_locals`, `debugdata->w_f_trace` — null-guarded.
+///
+/// Excluded (matches the walker): `execution_context` (persistent, not
+/// GC), `debugdata`/`lastblock` (non-GC heap), the module-dict / method-
+/// cache / prebuilt-family global walks (those are not frame-owned; the
+/// root walker performs them once per collection, not per frame).
+unsafe fn pyframe_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    let frame = unsafe { &mut *(obj_addr as *mut PyFrame) };
+
+    f(&mut frame.f_backref as *mut *mut PyFrame as *mut majit_ir::GcRef);
+    f(&mut frame.pycode as *mut *const () as *mut majit_ir::GcRef);
+
+    // locals_cells_stack_w: forward the array pointer, then its items.
+    let array = frame.locals_cells_stack_w;
+    if !array.is_null() {
+        if pyre_object::gc_hook::try_gc_owns_object(array as *mut u8) {
+            // GC-managed (moving) nursery block: hand the collector the
+            // array field slot; the type-9 varsize walker forwards the
+            // items once the array itself is copied.
+            f(&mut frame.locals_cells_stack_w as *mut *mut pyre_object::FixedObjectArray
+                as *mut majit_ir::GcRef);
+        } else {
+            // Stationary `std::alloc` block (type_id 0, never entered by
+            // `trace_and_update_object`): forward each item in place. Walk
+            // the FULL fixed-length array, not just the live prefix —
+            // matching `walk_pyframe_roots` (eval.rs:626), which forwards
+            // popped-in-transit argument slots past `valuestackdepth`.
+            let arr = unsafe { &mut *array };
+            let base = arr.items_mut_ptr();
+            for i in 0..arr.len() {
+                f(unsafe { base.add(i) } as *mut majit_ir::GcRef);
+            }
+        }
+    }
+
+    f(&mut frame.f_generator_nowref as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    f(&mut frame.w_yielding_from as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    f(&mut frame.w_builtin as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    f(&mut frame.w_globals as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+
+    if !frame.debugdata.is_null() {
+        let d = unsafe { &mut *frame.debugdata };
+        f(&mut d.w_locals as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+        f(&mut d.w_f_trace as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    }
+}
+
 /// RPython jitexc.py:53 ContinueRunningNormally parity.
 pub(crate) enum LoopResult {
     Done(PyResult),
@@ -1392,50 +1463,26 @@ thread_local! {
         // `pyre-interpreter::pyframe::PyFrame` — execution frame for a
         // Python code block. NOT an `rclass.OBJECT`-shaped instance
         // (no `ob_type` header — virtualizable struct laid out for the
-        // JIT virtualize pass), so register through `with_gc_ptrs`
+        // JIT virtualize pass), so register with a bare size + trace hook
         // rather than `object_subclass`.
         //
-        // GC-traceable fields (the standard nursery tracer forwards
-        // these when a nursery `PyFrame` survives a minor collection):
-        //   - `locals_cells_stack_w`: `*mut FixedObjectArray` — when
-        //     `emit_new_pyframe_inline_self_recursive` emits
-        //     `NewArrayClear` for the locals array the array itself
-        //     lives in the nursery, so its pointer must be forwarded.
-        //   - `f_generator_nowref` / `w_yielding_from`: `PyObjectRef`
-        //     slots that may point at nursery objects.
-        //   - `f_backref`: `*mut PyFrame` — once chained inline calls
-        //     produce nested nursery `PyFrame`s the parent pointer
-        //     must be forwarded to the new address.
-        // Excluded: `execution_context` (Rc::into_raw, persistent),
-        // `pycode` (static PyCode), `debugdata` / `lastblock`
-        // (heap-allocated, not GC), `w_globals` (Box-allocated
-        // DictStorage, not GC).
+        // The trace hook `pyframe_object_custom_trace` forwards exactly
+        // the frame-owned GC slots `walk_pyframe_roots` visits per frame.
+        // A flat `gc_ptr_offsets` list cannot express two of them — the
+        // `locals_cells_stack_w` items when the array is a stationary
+        // `std::alloc` block, and the `debugdata->{w_locals, w_f_trace}`
+        // refs one indirection away — so a custom trace is required.
+        // `custom_trace` fully replaces offset tracing on both the minor
+        // (collector.rs:1471) and major-mark (collector.rs:1746) paths.
         //
-        // `walk_pyframe_roots` (`pyre-interpreter::eval`) still walks
-        // `CURRENT_FRAME → f_backref` and visits the items inside
-        // `locals_cells_stack_w`; that path covers `std::alloc`-backed
-        // PyFrames today and is the entry point that hands control to
-        // the standard tracer for nursery-backed frames once
-        // it is taught about forwarding.
-        let pyframe_tid = gc.register_type(majit_gc::trace::TypeInfo::with_gc_ptrs(
+        // Only frames stamped with this type id (nursery frames from
+        // `emit_new_pyframe_inline_self_recursive`) are traced this way.
+        // `std::alloc`-backed `FrameBox` / callee-arena frames carry
+        // `type_id = 0`, sit outside the GC heap, and are reached only as
+        // roots via `walk_pyframe_roots` / `walk_jit_callee_frame_roots`.
+        let pyframe_tid = gc.register_type(majit_gc::trace::TypeInfo::with_custom_trace(
             std::mem::size_of::<pyre_interpreter::pyframe::PyFrame>(),
-            vec![
-                pyre_interpreter::pyframe::PYFRAME_LOCALS_CELLS_STACK_OFFSET,
-                pyre_interpreter::pyframe::PYFRAME_F_GENERATOR_NOWREF_OFFSET,
-                pyre_interpreter::pyframe::PYFRAME_W_YIELDING_FROM_OFFSET,
-                pyre_interpreter::pyframe::PYFRAME_F_BACKREF_OFFSET,
-                // Lazy-cached canonical W_DictObject sibling for
-                // `frame.w_globals`.  Once `get_w_globals` resolves
-                // the pointer it stays alive for the frame's lifetime
-                // (`dict_storage_to_dict` mirror_target invariant), so
-                // the slot must be visited by the nursery tracer to
-                // forward the dict pointer if it survives a minor
-                // collection.  Excluded slots (`w_globals`,
-                // `execution_context`, `pycode`, `debugdata`,
-                // `lastblock`) all point at non-nursery memory and
-                // remain off-list.
-                pyre_interpreter::pyframe::PYFRAME_W_GLOBALS_OFFSET,
-            ],
+            pyframe_object_custom_trace,
         ));
         debug_assert_eq!(pyframe_tid, PYFRAME_GC_TYPE_ID);
         // `W_DictProxyObject` carries a single GC-traceable
