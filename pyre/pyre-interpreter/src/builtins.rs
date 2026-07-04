@@ -5065,6 +5065,22 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             )));
         }
     }
+    // floatobject.py:247-255 — a bytes-like value falls through to
+    // `charbuf_w`, decoded and parsed like a str; an unparseable value reprs
+    // as `b'...'` in the error (space.repr / `%R`).
+    if unsafe { pyre_object::bytesobject::is_bytes_like(obj) } {
+        let data = unsafe { pyre_object::bytesobject::bytes_like_data(obj) };
+        let decoded = String::from_utf8_lossy(data);
+        if let Some(cleaned) = strip_numeric_underscores(decoded.trim()) {
+            if let Ok(v) = cleaned.parse::<f64>() {
+                return Ok(floatobject::w_float_new(v));
+            }
+        }
+        let r = unsafe { crate::py_repr(obj)? };
+        return Err(crate::PyError::value_error(format!(
+            "could not convert string to float: {r}"
+        )));
+    }
     Err(crate::PyError::type_error(format!(
         "float() argument must be a string or a real number, not '{}'",
         crate::type_methods::arg_type_name(obj)
