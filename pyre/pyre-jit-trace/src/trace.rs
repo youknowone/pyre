@@ -1071,6 +1071,38 @@ fn run_perfn_walk(
                     }
                 }
             }
+        } else {
+            // Loop trace: seed operand-stack loop-input registers from
+            // sym.registers_r.  RPython's MIFrame registers are populated
+            // by executing every opcode (including jit_merge_point, which
+            // binds the reds); pyre's walker enters PAST the merge point,
+            // so loop-carried operand-stack variables (e.g. the FOR_ITER
+            // iterator on TOS) are left OpRef::NONE without this seed.
+            // The vable shadow (virtualizable_boxes) holds the correct
+            // InputArgRef for each slot, but vable_getarrayitem_ref routes
+            // through is_nonstandard_virtualizable when the reader OpRef's
+            // concrete is the usize::MAX sentinel (= NONE), so the
+            // standard fast path is never reached.  Seed the operand-stack
+            // colors (nlocals .. nlocals+stack_depth) from sym.registers_r
+            // — the same InputArgRef values init_symbolic placed there.
+            // Clamp to the jitcode's num_regs_r so the argboxes vector
+            // never exceeds the callee register bank size.
+            let nl = sym.nlocals;
+            let num_regs_r = pjc.jitcode.num_regs_r() as usize;
+            let stack_depth = sym.registers_r.len().saturating_sub(nl);
+            for i in 0..stack_depth {
+                let color = nl + i;
+                if color >= num_regs_r {
+                    break;
+                }
+                let opref = sym.registers_r[nl + i];
+                if !opref.is_none() {
+                    if reserved_red_colors.contains(&(color as u8)) {
+                        continue;
+                    }
+                    seed(color as u8, opref);
+                }
+            }
         }
         v
     };
