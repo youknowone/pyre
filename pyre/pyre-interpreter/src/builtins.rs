@@ -1557,7 +1557,15 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
         )
     });
     namespace.get_or_insert_with("abs", || {
-        make_module_builtin_function_with_arity("abs", builtin_abs, 1)
+        // operation.py `abs(space, w_val)` — one positional-or-keyword `val`
+        // bound by the gateway Signature, so `abs` no longer receives the
+        // `__pyre_kw__` marker dict.
+        crate::gateway::make_module_builtin_function_with_arity_and_sig(
+            "abs",
+            builtin_abs,
+            1,
+            crate::gateway::Signature::new(vec!["val"], None, None, 0, 0),
+        )
     });
     namespace.get_or_insert_with("min", || make_module_builtin_function("min", builtin_min));
     namespace.get_or_insert_with("max", || make_module_builtin_function("max", builtin_max));
@@ -2403,8 +2411,14 @@ fn builtin_len(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 /// `abs(x)` — return the absolute value of a number.
 pub fn builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    // operation.py `abs(space, w_val)` — one positional-or-keyword `val`.
-    let obj = parse_single_required(args, "val", "abs")?;
+    // operation.py `abs(space, w_val)`.  The gateway Signature binds the keyword
+    // form at the call site, so a single positional argument is `val` (even a
+    // dict holding the marker key); index it directly and route a wrong
+    // positional count through the gateway for the `_match_signature` arity error.
+    let obj = match args {
+        [val] => *val,
+        _ => parse_single_required(args, "val", "abs")?,
+    };
     unsafe {
         if is_bool(obj) {
             return Ok(w_int_new(w_bool_get_value(obj) as i64));
