@@ -6194,17 +6194,17 @@ impl<'a> Lowering<'a> {
                     result_var: result_var.clone(),
                 });
         }
-        // Capture `Option::unwrap_or(opt, default)` sites for the
-        // discriminant value-select `front::option_unwrap_or` synthesizes.
-        // `unwrap_or`'s body is Opaque (foreign `core`), but its receiver is
-        // the `Option` ADT, so `first_is_self` routes it to a
-        // `CallTarget::Method` (receiver in `args[0]`, default in `args[1]`),
-        // NOT a raw FunctionPath.  Resolving the `Option` field owners needs
-        // the receiver's `Option` type (`first_arg_ty`), in hand here;
-        // `recognize_unwrap_or_site` also confirms the receiver is an `Option`
-        // (not `Result`, whose variant tags differ).  A resolution miss
-        // leaves the residual call — an unregistered callee the rtyper census
-        // Skips, so no graph regresses.
+        // Capture `Option::unwrap_or(opt, default)` /
+        // `Result::unwrap_or(res, default)` sites for the discriminant
+        // value-select `front::option_unwrap_or` synthesizes.  `unwrap_or`'s
+        // body is Opaque (foreign `core`), but its receiver is the enum ADT, so
+        // `first_is_self` routes it to a `CallTarget::Method` (receiver in
+        // `args[0]`, default in `args[1]`), NOT a raw FunctionPath.  Resolving
+        // the enum field owners needs the receiver's type (`first_arg_ty`), in
+        // hand here; `recognize_unwrap_or_site` classifies `Option` vs `Result`
+        // (their `Some`=1 / `Ok`=0 payload tags differ) and records the
+        // polarity.  A resolution miss leaves the residual call — an
+        // unregistered callee the rtyper census Skips, so no graph regresses.
         if let OpKind::Call {
             target: CallTarget::Method { name, .. },
             args,
@@ -7670,33 +7670,51 @@ impl<'a> Lowering<'a> {
         })
     }
 
-    /// Resolve a recognized `Option::unwrap_or(opt, default)` call into an
-    /// [`crate::front::option_unwrap_or::UnwrapOrSite`] — the `Option` enum
-    /// root + `Some` variant owners and the payload type the value-select
-    /// post-pass needs.  `None` (leaving the residual call) when the receiver
-    /// type is not a resolvable `Option`.
+    /// Resolve a recognized `Option::unwrap_or(opt, default)` /
+    /// `Result::unwrap_or(res, default)` call into an
+    /// [`crate::front::option_unwrap_or::UnwrapOrSite`] — the enum root +
+    /// payload-variant owners and the payload type the value-select post-pass
+    /// needs.  `None` (leaving the residual call) when the receiver type is not
+    /// a resolvable `Option` or `Result`.  The payload variant differs by enum:
+    /// `Option::Some = 1` (`None = 0`), `Result::Ok = 0` (`Err = 1`) — recorded
+    /// in `payload_on_disc_true` so the post-pass branches to the right arm.
     fn recognize_unwrap_or_site(
         &self,
         recv_ty: Option<&TyRef>,
         result_var: &Variable,
     ) -> Option<crate::front::option_unwrap_or::UnwrapOrSite> {
-        // Receiver `Option`: enum root + `Some` variant owners + payload.
-        // Guard on `Option` specifically — `Result::unwrap_or` shares the
-        // method name but its `Ok`/`Err` tags do not match `Some`=1/`None`=0.
         let recv_ty = recv_ty?;
-        if !crate::front::result_exc::tyref_is_option(recv_ty, self.llbc) {
-            return None;
-        }
+        // The payload variant discriminant (`Some`=1 / `Ok`=0) both classifies
+        // the receiver enum and picks the value-select polarity.  `Result<_,
+        // PyError>` is excluded — that instantiation is the exception-transform's
+        // domain (`front::result_exc` rewrites its `Ok`/`Err` into exception
+        // edges, not a switchable discriminant value), so its `unwrap_or` is
+        // left residual (Skip) rather than risk a value-select on an
+        // exception-form value.  Only `Option` and plain-error `Result` (e.g.
+        // `io::Result`) select here.
+        let (payload_disc, payload_on_disc_true) =
+            if crate::front::result_exc::tyref_is_option(recv_ty, self.llbc) {
+                (1, true)
+            } else if crate::front::result_exc::tyref_is_result(recv_ty, self.llbc)
+                && !crate::front::result_exc::tyref_is_result_of_pyerror(recv_ty, self.llbc)
+            {
+                (0, false)
+            } else {
+                return None;
+            };
         let def_id = self.tyref_adt_def_id(recv_ty)?;
         let td = self.llbc.type_by_id(def_id)?;
-        let option_owner = td.item_meta.name_path();
-        let some_owner = Self::tagged_pair_payload_owner(td, &option_owner, 1)?;
+        let enum_owner = td.item_meta.name_path();
+        let payload_owner = Self::tagged_pair_payload_owner(td, &enum_owner, payload_disc)?;
+        // The payload `T` is the first type arg for both `Option<T>` and
+        // `Result<T, E>`.
         let payload_ty = self.tyref_option_payload_value_type(recv_ty)?;
         Some(crate::front::option_unwrap_or::UnwrapOrSite {
             result_var: result_var.clone(),
-            option_owner,
-            some_owner,
+            enum_owner,
+            payload_owner,
             payload_ty,
+            payload_on_disc_true,
         })
     }
 

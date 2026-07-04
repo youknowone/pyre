@@ -189,14 +189,17 @@ fn lowers_tuple_roundtrip_with_symmetric_positional_field_reads() {
     }
 
     // Exactly one synthetic ctor (the genuine tuple) and its two-field
-    // `__pos_0` / `__pos_1` construction chain.
+    // `__pos_0` / `__pos_1` construction chain.  The per-shape tuple classdef
+    // (default-ON) keys the owner on the tuple's element types, so the owner is
+    // the suffixed `Tuple<i64,i64>` — the construction and projection sides must
+    // agree on that exact spelling (the symmetry asserted below).
     assert_eq!(ctor_count, 1, "expected one tuple SyntheticTransparentCtor");
     field_writes.sort();
     assert_eq!(
         field_writes,
         vec![
-            ("__pos_0".to_string(), Some("Tuple".to_string())),
-            ("__pos_1".to_string(), Some("Tuple".to_string())),
+            ("__pos_0".to_string(), Some("Tuple<i64,i64>".to_string())),
+            ("__pos_1".to_string(), Some("Tuple<i64,i64>".to_string())),
         ],
         "tuple construction must emit a __pos_0 / __pos_1 FieldWrite chain"
     );
@@ -208,8 +211,8 @@ fn lowers_tuple_roundtrip_with_symmetric_positional_field_reads() {
     assert_eq!(
         field_reads,
         vec![
-            ("__pos_0".to_string(), Some("Tuple".to_string())),
-            ("__pos_1".to_string(), Some("Tuple".to_string())),
+            ("__pos_0".to_string(), Some("Tuple<i64,i64>".to_string())),
+            ("__pos_1".to_string(), Some("Tuple<i64,i64>".to_string())),
         ],
         "tuple reads must emit __pos_0 / __pos_1 FieldReads (owner_root \
          matching the FieldWrite chain) and *Checked .0 reads must collapse"

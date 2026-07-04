@@ -140,6 +140,22 @@ pub(crate) fn tyref_is_option(ty: &TyRef, llbc: &Llbc) -> bool {
     adt_path_of(body, llbc).as_deref() == Some("core::option::Option")
 }
 
+/// True when `ty` is any `core::result::Result<T, E>` (error type
+/// unconstrained) — the guard for combinators like `Result::unwrap_or` that
+/// discard the error and so do not care about `E`.  For the `Result<T,
+/// PyError>` exception-transform guard use [`tyref_is_result_of_pyerror`].
+pub(crate) fn tyref_is_result(ty: &TyRef, llbc: &Llbc) -> bool {
+    let body = match ty {
+        TyRef::Inline { value: (_, v) } => v,
+        TyRef::Other(v) => v,
+        TyRef::Dedup { id } => match llbc.dedup_body(*id) {
+            Some(v) => v,
+            None => return false,
+        },
+    };
+    adt_path_of(body, llbc).as_deref() == Some("core::result::Result")
+}
+
 /// The per-instantiation `<…>` suffix for a scoped callee's
 /// `Result<T, PyError>` return type, or `None` when the instantiation is
 /// not Ref-shaped (bool/int payloads stay on the bare `Result::Ok`

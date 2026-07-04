@@ -97,7 +97,9 @@ fn rewire_one_unwrap_site(graph: &mut FunctionGraph, site: &UnwrapSite) -> Resul
     // pushing it) so removing it leaves the receiver construction as the tail.
     let call_idx = graph.blocks[a].operations.len() - 1;
     if graph.blocks[a].operations[call_idx].result.as_ref() != Some(&site.result_var) {
-        return Err(format!("{name}: unwrap call is not the last op of block {a}"));
+        return Err(format!(
+            "{name}: unwrap call is not the last op of block {a}"
+        ));
     }
     // Capture the receiver `Option` operand (the sole argument).
     let opt = match &graph.blocks[a].operations[call_idx].kind {
@@ -280,11 +282,7 @@ mod tests {
         let raises = g
             .blocks
             .iter()
-            .filter(|blk| {
-                blk.exits
-                    .iter()
-                    .any(|link| link.target == g.exceptblock)
-            })
+            .filter(|blk| blk.exits.iter().any(|link| link.target == g.exceptblock))
             .count();
         assert_eq!(raises, 1, "the None arm raises to exceptblock");
     }
