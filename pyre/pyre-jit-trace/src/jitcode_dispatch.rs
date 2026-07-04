@@ -7227,6 +7227,34 @@ pub(crate) fn fbw_loop_callee_ca_enabled() -> bool {
     })
 }
 
+/// `PYRE_M366_NONBRANCH_PC` (#366, default OFF): carry a direct JitCode
+/// resume pc for the non-branch specialization guards (`GuardValue` /
+/// `GuardClass`) instead of the `NO_JITCODE_PC` sentinel, so their resume
+/// decode consults the carried word rather than the stored Python pc →
+/// `pc_map` translation.
+///
+/// The carried word is `resume_jitcode_pc_for(py_pc)` — the SAME `-live-`
+/// marker offset the `pc_map` fallback returns — not the guard op's raw
+/// `op_pc`.  These guards resume by re-executing their own opcode at
+/// `orgpc` with a deterministic operand stack (no kept temp), so the
+/// marker `pc_map[py_pc]` names is a valid startpoint (`can_decode_live_vars`
+/// holds) AND identical to what the decoder would translate to — the encoder
+/// (`collect_outer_active_boxes` reg banks) and decoder (`setposition` /
+/// liveness) resolve the same offset, keeping the box layout symmetric.
+/// Carrying the raw `op_pc` (which may sit mid-opcode, `op_pc != pc_map[
+/// py_pc]`) is what broke the earlier attempt; anchoring to the marker
+/// avoids that.  Default OFF until the corpus-wide equality is validated.
+pub(crate) fn m366_nonbranch_pc_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M366_NONBRANCH_PC") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => false,
+    })
+}
+
 /// `PYRE_FBW_VABLE_SCALAR_CA` (default OFF) — sub-mode of
 /// [`fbw_loop_callee_ca_enabled`]. When on, the gap-10 loop-callee
 /// CALL_ASSEMBLER passes the callee's loop-carried locals as scalar
@@ -9964,6 +9992,27 @@ fn walker_capture_snapshot_for_last_guard_impl(
             // — the two windows diverge and the decoded box layout mismatches.
             let guard_jitcode_pc: i32 = if guard_jc_pc_raw != usize::MAX {
                 guard_jc_pc_raw as i32
+            } else if m366_nonbranch_pc_enabled()
+                && matches!(
+                    ctx.trace_ctx.last_guard_opcode(),
+                    Some(OpCode::GuardValue | OpCode::GuardClass)
+                )
+            {
+                // #366: carry the `-live-` marker offset (`resume_jitcode_pc_for(
+                // py_pc)`), NOT the raw guard `op_pc`.  A specialization guard
+                // resumes by re-executing its own opcode at `py_pc` with a
+                // deterministic operand stack, so this marker is a valid
+                // startpoint AND identical to the decoder's `pc_map` fallback —
+                // the two windows stay symmetric.  Fall back to the sentinel if
+                // `py_pc` has no `pc_map` entry (portal-bridge / out-of-range).
+                let marker = unsafe {
+                    let jc = &*sym.jitcode;
+                    jc.payload.resume_jitcode_pc_for(py_pc as usize)
+                };
+                match marker {
+                    Some(jp) => jp as i32,
+                    None => majit_ir::resumedata::NO_JITCODE_PC,
+                }
             } else {
                 majit_ir::resumedata::NO_JITCODE_PC
             };
