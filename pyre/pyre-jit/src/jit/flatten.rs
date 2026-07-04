@@ -3432,6 +3432,15 @@ pub struct LoweringContext {
     /// shape); `bh_unary_positive_fn` computes `+value` (a user `__pos__`
     /// may force virtualizables → `MayForce`).
     pub unary_positive_fn_idx: u16,
+    /// `load_common_constant_fn` descrs-pool index.  LOAD_COMMON_CONSTANT
+    /// records the `load_common_constant(disc)` HLOp lowered to
+    /// `residual_call_ir_r(ConstInt(fn_idx), ListI([disc]), ListR([]),
+    /// Descr) → reg` via [`lower_load_common_constant_hlop_to_insn`] (the
+    /// `(Int) → Ref` int-only shape, empty `ListR`).
+    /// `bh_load_common_constant_fn` re-resolves the discriminant through
+    /// the shared `opcode_ops::load_common_constant_value`; the `all`/`any`
+    /// variants allocate a builtin function → `MayForce`.
+    pub load_common_constant_fn_idx: u16,
     /// `unary_not_fn` descrs-pool index.  UNARY_NOT records the object-space
     /// `not_(value)` op (pyopcode.py:651) lowered to
     /// `residual_call_r_r(ConstInt(fn_idx), ListR([value]), Descr) → reg` via
@@ -4982,6 +4991,9 @@ where
     if let Some(insn) = lower_unary_positive_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
+    if let Some(insn) = lower_load_common_constant_hlop_to_insn(op, ctx, get_register) {
+        return Some(insn);
+    }
     if let Some(insn) = lower_unary_not_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
@@ -5612,6 +5624,52 @@ where
             Operand::ConstInt(ctx.convert_value_fn_idx as i64),
             Operand::ListOfKind(ListOfKind::new(Kind::Int, vec![Operand::ConstInt(conv)])),
             Operand::ListOfKind(ListOfKind::new(Kind::Ref, vec![value])),
+            descr_operand,
+        ],
+        dst_reg,
+    ))
+}
+
+/// Lower the LOAD_COMMON_CONSTANT pyre HLOp `load_common_constant(disc)`
+/// → `result: Ref` to `residual_call_ir_r(ConstInt(
+/// load_common_constant_fn_idx), ListI([disc]), ListR([]), Descr) → reg`,
+/// the `(Int) → Ref` int-only shape (empty `ListR`, sibling of the
+/// box_int form).  `disc` is the compile-time `CommonConstant`
+/// discriminant; `bh_load_common_constant_fn` re-resolves it.  Flavor is
+/// `MayForce` (the `all`/`any` variants allocate a fresh builtin
+/// function); unlike box_int, no `BoxInt` helper tag — the result is a
+/// resolved object, not a boxed int.
+///
+/// Returns `None` for non-`load_common_constant` opnames so the caller can
+/// fall through to other lowering arms.
+pub fn lower_load_common_constant_hlop_to_insn<F>(
+    op: &super::flow::SpaceOperation,
+    ctx: &LoweringContext,
+    get_register: &mut F,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+{
+    if op.opname != "load_common_constant" || op.args.len() != 1 {
+        return None;
+    }
+    let disc = const_int_for_value_arg(&op.args[0])?;
+    let dst_reg = match &op.result {
+        Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
+        _ => return None,
+    };
+    let effect_info = effect_info_for_call_flavor(CallFlavor::MayForce);
+    let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
+        effect_info,
+        arg_kinds: vec![Kind::Int],
+        result_kind: Some(Kind::Ref),
+    }));
+    Some(Insn::op_with_result(
+        "residual_call_ir_r",
+        vec![
+            Operand::ConstInt(ctx.load_common_constant_fn_idx as i64),
+            Operand::ListOfKind(ListOfKind::new(Kind::Int, vec![Operand::ConstInt(disc)])),
+            Operand::ListOfKind(ListOfKind::new(Kind::Ref, vec![])),
             descr_operand,
         ],
         dst_reg,
@@ -10473,6 +10531,7 @@ mod tests {
             make_cell_fn_idx: 115,
             store_slice_fn_idx: 116,
             unary_positive_fn_idx: 118,
+            load_common_constant_fn_idx: 119,
             ..Default::default()
         };
         let code_const = Constant::new(
@@ -11581,6 +11640,77 @@ mod tests {
                         );
                     }
                     other => panic!("expected ListR, got {other:?}"),
+                }
+                assert_eq!(
+                    result,
+                    Some(Register {
+                        kind: Kind::Ref,
+                        index: 102
+                    }),
+                );
+            }
+            _ => panic!("expected Insn::Op, got {insn:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_load_common_constant_hlop_emits_residual() {
+        // `load_common_constant(disc)` →
+        // `residual_call_ir_r(ConstInt(load_common_constant_fn_idx),
+        // ListI([disc]), ListR([]), Descr) → reg` (MayForce — the `all`/`any`
+        // variants allocate).  `disc = 0` is AssertionError; the empty ListR
+        // distinguishes the `(Int) → Ref` int-only shape from the `(Int, Ref)`
+        // convert_value shape.
+        let result_var = Variable::new(VariableId(9), Kind::Ref);
+        let (ctx, _, _) = load_attr_lowering_fixture();
+        let op = super::super::flow::SpaceOperation::new(
+            "load_common_constant",
+            vec![Constant::signed(0).into()],
+            Some(result_var.into()),
+            0,
+        );
+        let mut get_register = |var: Variable| match var.id {
+            VariableId(9) => Register {
+                kind: Kind::Ref,
+                index: 102,
+            },
+            _ => panic!("unexpected var id {:?}", var.id),
+        };
+        let insn = super::lower_load_common_constant_hlop_to_insn(&op, &ctx, &mut get_register)
+            .expect("load_common_constant lowering must succeed");
+        match insn {
+            Insn::Op {
+                opname,
+                args,
+                result,
+            } => {
+                assert_eq!(opname, "residual_call_ir_r");
+                assert!(
+                    matches!(args[0], Operand::ConstInt(119)),
+                    "load_common_constant_fn pool index, got {:?}",
+                    args[0]
+                );
+                match &args[1] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Int);
+                        assert!(
+                            matches!(&list.content[..], [Operand::ConstInt(0)]),
+                            "ListI = [disc], got {:?}",
+                            list.content
+                        );
+                    }
+                    other => panic!("expected ListI, got {other:?}"),
+                }
+                match &args[2] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Ref);
+                        assert!(
+                            list.content.is_empty(),
+                            "ListR must be empty, got {:?}",
+                            list.content
+                        );
+                    }
+                    other => panic!("expected empty ListR, got {other:?}"),
                 }
                 assert_eq!(
                     result,

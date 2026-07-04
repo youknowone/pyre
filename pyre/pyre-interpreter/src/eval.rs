@@ -2509,45 +2509,11 @@ impl OpcodeStepExecutor for PyFrame {
 
     // ── LoadCommonConstant ──
     fn load_common_constant(&mut self, cc: crate::bytecode::CommonConstant) -> Result<(), PyError> {
-        use crate::bytecode::CommonConstant;
-        let val = match cc {
-            CommonConstant::AssertionError => {
-                // `LOAD_ASSERTION_ERROR` pushes the `AssertionError` class
-                // itself, so `assert x` raises `AssertionError()` and
-                // `assert x, msg` raises `AssertionError(msg)`.
-                crate::builtins::lookup_exc_class("AssertionError").unwrap_or_else(|| {
-                    crate::typedef::gettypeobject(
-                        &pyre_object::interp_exceptions::EXC_ASSERTION_ERROR_TYPE,
-                    )
-                })
-            }
-            CommonConstant::NotImplementedError => {
-                crate::builtins::lookup_exc_class("NotImplementedError").unwrap_or_else(|| {
-                    crate::make_builtin_function("NotImplementedError", |_args| {
-                        Err(crate::PyError::type_error("not implemented"))
-                    })
-                })
-            }
-            CommonConstant::BuiltinTuple => {
-                crate::typedef::gettypeobject(&pyre_object::pyobject::TUPLE_TYPE)
-            }
-            CommonConstant::BuiltinAll => crate::make_module_builtin_function_with_arity(
-                "all",
-                crate::builtins::builtin_all_fn,
-                1,
-            ),
-            CommonConstant::BuiltinAny => crate::make_module_builtin_function_with_arity(
-                "any",
-                crate::builtins::builtin_any_fn,
-                1,
-            ),
-            CommonConstant::BuiltinList => {
-                crate::typedef::gettypeobject(&pyre_object::pyobject::LIST_TYPE)
-            }
-            CommonConstant::BuiltinSet => {
-                crate::typedef::gettypeobject(&pyre_object::pyobject::LIST_TYPE)
-            }
-        };
+        // `LOAD_ASSERTION_ERROR` pushes the `AssertionError` class itself,
+        // so `assert x` raises `AssertionError()` and `assert x, msg`
+        // raises `AssertionError(msg)`.  The resolution is shared with the
+        // JIT residual via `opcode_ops::load_common_constant_value`.
+        let val = crate::opcode_ops::load_common_constant_value(cc);
         self.push(val);
         Ok(())
     }

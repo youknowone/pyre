@@ -175,6 +175,10 @@ pub struct Cpu {
     /// `bh_unary_positive_fn(value)` — UNARY_POSITIVE `+value` residual
     /// (a user `__pos__` may run Python → fallible).
     pub unary_positive_fn: extern "C" fn(i64) -> i64,
+    /// `bh_load_common_constant_fn(disc)` — LOAD_COMMON_CONSTANT residual
+    /// resolving a `CommonConstant` discriminant to its pushed object
+    /// (allocates for the `all`/`any` builtin variants → `MayForce`).
+    pub load_common_constant_fn: extern "C" fn(i64) -> i64,
     /// `bh_unary_not_fn(value)` — UNARY_NOT `not value` residual returning a
     /// bool (a user `__bool__` / `__len__` may run Python; infallible).
     pub unary_not_fn: extern "C" fn(i64) -> i64,
@@ -358,6 +362,7 @@ impl Cpu {
             unary_negative_fn: crate::call_jit::bh_unary_negative_fn,
             unary_invert_fn: crate::call_jit::bh_unary_invert_fn,
             unary_positive_fn: crate::call_jit::bh_unary_positive_fn,
+            load_common_constant_fn: crate::call_jit::bh_load_common_constant_fn,
             unary_not_fn: crate::call_jit::bh_unary_not_fn,
             load_fast_check_fn: crate::call_jit::bh_load_fast_check_fn,
             compare_fn: crate::call_jit::bh_compare_fn,

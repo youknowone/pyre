@@ -4806,6 +4806,21 @@ pub extern "C" fn bh_unary_positive_fn(value: i64) -> i64 {
     }
 }
 
+/// LOAD_COMMON_CONSTANT residual (`load_common_constant` HLOp →
+/// `residual_call_ir_r`).  `disc` is the `CommonConstant` discriminant
+/// (0-6).  Resolves the pushed object through the shared
+/// `opcode_ops::load_common_constant_value`, matching the interpreter:
+/// immortal type/exception classes for the class variants, a freshly
+/// built builtin function for `all`/`any` (hence `MayForce` — it
+/// allocates).  Runs no user code and never raises; an out-of-range
+/// discriminant (corrupt bytecode) returns PY_NULL.
+pub extern "C" fn bh_load_common_constant_fn(disc: i64) -> i64 {
+    match pyre_interpreter::bytecode::CommonConstant::try_from(disc as u32) {
+        Ok(cc) => pyre_interpreter::opcode_ops::load_common_constant_value(cc) as i64,
+        Err(_) => pyre_object::PY_NULL as i64,
+    }
+}
+
 /// UNARY_NOT residual (`unary_not` HLOp → `residual_call_r_r`).  Returns
 /// `not value` as a bool object via `opcode_ops::truth_value`.  A user
 /// `__bool__` / `__len__` may run Python (`MayForce`), matching the

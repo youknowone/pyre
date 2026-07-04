@@ -184,6 +184,50 @@ pub fn bool_value_from_truth(value: bool) -> PyObjectRef {
     w_bool_from(value)
 }
 
+/// LOAD_COMMON_CONSTANT — resolve a `CommonConstant` to the object the
+/// interpreter pushes.  Shared by the interpreter's `load_common_constant`
+/// handler and the JIT residual `bh_load_common_constant_fn` so both
+/// resolve identical objects (immortal type/exception classes for the
+/// class variants; a freshly built builtin function for `all`/`any`).
+pub fn load_common_constant_value(cc: crate::bytecode::CommonConstant) -> PyObjectRef {
+    use crate::bytecode::CommonConstant;
+    match cc {
+        CommonConstant::AssertionError => {
+            crate::builtins::lookup_exc_class("AssertionError").unwrap_or_else(|| {
+                crate::typedef::gettypeobject(
+                    &pyre_object::interp_exceptions::EXC_ASSERTION_ERROR_TYPE,
+                )
+            })
+        }
+        CommonConstant::NotImplementedError => {
+            crate::builtins::lookup_exc_class("NotImplementedError").unwrap_or_else(|| {
+                crate::make_builtin_function("NotImplementedError", |_args| {
+                    Err(crate::PyError::type_error("not implemented"))
+                })
+            })
+        }
+        CommonConstant::BuiltinTuple => {
+            crate::typedef::gettypeobject(&pyre_object::pyobject::TUPLE_TYPE)
+        }
+        CommonConstant::BuiltinAll => crate::make_module_builtin_function_with_arity(
+            "all",
+            crate::builtins::builtin_all_fn,
+            1,
+        ),
+        CommonConstant::BuiltinAny => crate::make_module_builtin_function_with_arity(
+            "any",
+            crate::builtins::builtin_any_fn,
+            1,
+        ),
+        CommonConstant::BuiltinList => {
+            crate::typedef::gettypeobject(&pyre_object::pyobject::LIST_TYPE)
+        }
+        CommonConstant::BuiltinSet => {
+            crate::typedef::gettypeobject(&pyre_object::pyobject::LIST_TYPE)
+        }
+    }
+}
+
 /// LIST_EXTEND — extend `list` in place with the items of `iterable`.
 /// Shared by the interpreter's `list_extend` handler and the JIT residual
 /// `bh_list_extend_fn`.  Mirrors `list.extend`: fast paths for list/tuple

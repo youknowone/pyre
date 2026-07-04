@@ -3409,6 +3409,7 @@ struct FnPtrIndices {
     unary_negative_fn: HelperHandle,
     unary_invert_fn: HelperHandle,
     unary_positive_fn: HelperHandle,
+    load_common_constant_fn: HelperHandle,
     unary_not_fn: HelperHandle,
     load_fast_check_fn: HelperHandle,
     list_extend_fn: HelperHandle,
@@ -3905,6 +3906,14 @@ fn register_helper_fn_pointers(
         cpu.unary_positive_fn as *const (),
         CallFlavor::MayForce,
     );
+    // `bh_load_common_constant_fn` resolves a CommonConstant discriminant;
+    // the `all`/`any` variants allocate a builtin function → `MayForce`.
+    // Appended last to preserve fn_ptr indices.
+    let load_common_constant_fn = bind(
+        assembler,
+        cpu.load_common_constant_fn as *const (),
+        CallFlavor::MayForce,
+    );
     FnPtrIndices {
         call_fn,
         load_global_fn,
@@ -3971,6 +3980,7 @@ fn register_helper_fn_pointers(
         get_iter_fn,
         for_iter_next_fn,
         unary_positive_fn,
+        load_common_constant_fn,
     }
 }
 
@@ -5371,6 +5381,11 @@ impl CodeWriter {
                     idx: unary_positive_fn_idx,
                     flavor: _unary_positive_fn_flavor,
                 },
+            load_common_constant_fn:
+                HelperHandle {
+                    idx: load_common_constant_fn_idx,
+                    flavor: _load_common_constant_fn_flavor,
+                },
             unary_not_fn:
                 HelperHandle {
                     idx: unary_not_fn_idx,
@@ -5496,6 +5511,7 @@ impl CodeWriter {
                 unary_negative_fn_idx,
                 unary_invert_fn_idx,
                 unary_positive_fn_idx,
+                load_common_constant_fn_idx,
                 unary_not_fn_idx,
                 load_fast_check_fn_idx,
                 list_extend_fn_idx,
@@ -10385,9 +10401,42 @@ impl CodeWriter {
                         }
 
                         // Loads that push +1.
-                        Instruction::LoadCommonConstant { .. }
-                        | Instruction::LoadLocals
-                        | Instruction::LoadBuildClass => {
+                        // LoadCommonConstant(idx): pushes 1 (the resolved
+                        // CommonConstant object). Net +1.
+                        //
+                        // `flowcontext.py` resolves LOAD_COMMON_CONSTANT to a
+                        // static const push (exception class, builtin type, or
+                        // `all`/`any` via find_global).  The meta-trace records a
+                        // `load_common_constant(disc)` HLOp lowered to
+                        // `residual_call_ir_r(load_common_constant_fn,
+                        // ListI[disc], ListR[])`.  `disc` is the compile-time
+                        // `CommonConstant` discriminant baked as a constant;
+                        // `bh_load_common_constant_fn` re-resolves it through the
+                        // shared `opcode_ops::load_common_constant_value`.  The
+                        // `all`/`any` variants allocate a builtin function, so
+                        // the residual is `MayForce` — a fresh object each call,
+                        // never const-folded.
+                        Instruction::LoadCommonConstant { idx } => {
+                            let disc: u32 =
+                                pyre_interpreter::pyopcode::common_constant_arg(idx, op_arg).into();
+                            let result_value = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "load_common_constant",
+                                vec![
+                                    super::flow::FlowValue::Constant(
+                                        super::flow::Constant::signed(disc as i64),
+                                    )
+                                    .into(),
+                                ],
+                                Kind::Ref,
+                                py_pc as i64,
+                            );
+                            pin!(Some(result_value), stack_base + current_depth);
+                            push_and_bump!(result_value.into(), py_pc);
+                        }
+
+                        Instruction::LoadLocals | Instruction::LoadBuildClass => {
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
                             emit_abort_permanent!(py_pc);
