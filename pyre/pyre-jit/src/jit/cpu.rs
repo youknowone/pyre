@@ -91,6 +91,9 @@ pub struct Cpu {
     ) -> i64,
     /// `bhimpl_load_global` — namespace/code from getfield_vable_r plus live frame.
     pub load_global_fn: extern "C" fn(i64, i64, i64, i64) -> i64,
+    /// `bh_load_from_dict_or_globals_fn(dict, code, frame, namei)` —
+    /// LOAD_FROM_DICT_OR_GLOBALS: try the popped mapping then frame globals.
+    pub load_from_dict_or_globals_fn: extern "C" fn(i64, i64, i64, i64) -> i64,
     /// LOOKUP_METHOD attribute half — `(obj, code, name_idx) → attr`.
     /// Reproduces `PyFrame::load_method`'s `getattr` for blackhole resume.
     pub load_attr_fn: extern "C" fn(i64, i64, i64) -> i64,
@@ -352,6 +355,7 @@ impl Cpu {
             call_fn_13: crate::call_jit::bh_call_fn_13,
             call_fn_14: crate::call_jit::bh_call_fn_14,
             load_global_fn: crate::call_jit::bh_load_global_fn,
+            load_from_dict_or_globals_fn: crate::call_jit::bh_load_from_dict_or_globals_fn,
             load_attr_fn: crate::call_jit::bh_load_attr_fn,
             load_method_self_fn: crate::call_jit::bh_load_method_self_fn,
             store_attr_fn: crate::call_jit::bh_store_attr_fn,

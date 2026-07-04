@@ -3468,6 +3468,7 @@ struct FnPtrIndices {
     unary_positive_fn: HelperHandle,
     load_common_constant_fn: HelperHandle,
     list_to_tuple_fn: HelperHandle,
+    load_from_dict_or_globals_fn: HelperHandle,
     unary_not_fn: HelperHandle,
     load_fast_check_fn: HelperHandle,
     list_extend_fn: HelperHandle,
@@ -4004,6 +4005,13 @@ fn register_helper_fn_pointers(
         cpu.list_to_tuple_fn as *const (),
         CallFlavor::MayForce,
     );
+    // `bh_load_from_dict_or_globals_fn` may run a user `__getattr__` on the
+    // mapping → `MayForce`.  Appended last to preserve fn_ptr indices.
+    let load_from_dict_or_globals_fn = bind(
+        assembler,
+        cpu.load_from_dict_or_globals_fn as *const (),
+        CallFlavor::MayForce,
+    );
     FnPtrIndices {
         call_fn,
         load_global_fn,
@@ -4077,6 +4085,7 @@ fn register_helper_fn_pointers(
         map_add_fn,
         dict_merge_fn,
         list_to_tuple_fn,
+        load_from_dict_or_globals_fn,
     }
 }
 
@@ -5487,6 +5496,11 @@ impl CodeWriter {
                     idx: list_to_tuple_fn_idx,
                     flavor: _list_to_tuple_fn_flavor,
                 },
+            load_from_dict_or_globals_fn:
+                HelperHandle {
+                    idx: load_from_dict_or_globals_fn_idx,
+                    flavor: _load_from_dict_or_globals_fn_flavor,
+                },
             unary_not_fn:
                 HelperHandle {
                     idx: unary_not_fn_idx,
@@ -5639,6 +5653,7 @@ impl CodeWriter {
                 unary_positive_fn_idx,
                 load_common_constant_fn_idx,
                 list_to_tuple_fn_idx,
+                load_from_dict_or_globals_fn_idx,
                 unary_not_fn_idx,
                 load_fast_check_fn_idx,
                 list_extend_fn_idx,
@@ -10548,10 +10563,45 @@ impl CodeWriter {
 
                         // LoadFromDictOrGlobals: pops 1 (dict), pushes 1 (result). Net: 0.
                         // Replace shadow value. eval.rs:2028.
-                        Instruction::LoadFromDictOrGlobals { .. } => {
-                            let _ = current_state.stack.pop();
-                            push_fresh_ref(&mut current_state, &mut graph);
-                            emit_abort_permanent!(py_pc);
+                        // LoadFromDictOrGlobals(i): pop dict, push result. Net 0.
+                        // `flowcontext.py` resolves via find_global, but the op
+                        // carries a runtime dict operand so it lowers to a
+                        // residual: `load_from_dict_or_globals(dict, code, frame,
+                        // namei)` → `residual_call_ir_r(fn, ListI[namei],
+                        // ListR[dict, code, frame])`.  `bh_load_from_dict_or_
+                        // globals_fn` tries `getattr(dict, name)` then the live
+                        // frame's globals (GC-safe when the frame owns w_code,
+                        // like bh_load_global_fn), else NameError.  `namei` is a
+                        // direct co_names index.
+                        Instruction::LoadFromDictOrGlobals { i } => {
+                            let name_idx = i.get(op_arg) as usize;
+                            let dict_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let dict_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            if let super::flow::FlowValue::Variable(v) = &dict_value {
+                                pin!(Some(*v), dict_reg);
+                            }
+                            let code_const: super::flow::FlowValue = super::flow::Constant::new(
+                                super::flow::ConstantValue::Signed(w_code as i64),
+                                Some(Kind::Ref),
+                            )
+                            .into();
+                            let name_idx_const: super::flow::FlowValue =
+                                super::flow::Constant::signed(name_idx as i64).into();
+                            let result_value = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "load_from_dict_or_globals",
+                                vec![
+                                    dict_value.into(),
+                                    code_const.into(),
+                                    frame_var.into(),
+                                    name_idx_const.into(),
+                                ],
+                                Kind::Ref,
+                                py_pc as i64,
+                            );
+                            pin!(Some(result_value), stack_base + current_depth);
+                            push_and_bump!(result_value.into(), py_pc);
                         }
 
                         // LoadFromDictOrDeref: structural adaptation — CPython pops dict,

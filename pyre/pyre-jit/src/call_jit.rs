@@ -3756,6 +3756,67 @@ pub extern "C" fn bh_load_global_fn(
     0
 }
 
+/// LOAD_FROM_DICT_OR_GLOBALS residual (`load_from_dict_or_globals` HLOp →
+/// `residual_call_ir_r`).  Mirrors `eval.rs::load_from_dict_or_globals`:
+/// try `getattr_str(dict, name)` on the popped mapping first, then fall
+/// back to the live frame's globals, else NameError.  `namei` is a direct
+/// `code.names` index (no LOAD_GLOBAL push-null low-bit shift).
+///
+/// GC-safety: the globals are read from the LIVE frame when it owns this
+/// `w_code` (`frame.pycode == w_code`), matching `bh_load_global_fn`, so a
+/// relocated module dict is followed rather than a const-folded dangling
+/// pointer.  A user `__getattr__`/`__getitem__` on the mapping may run
+/// Python (`MayForce`).
+pub extern "C" fn bh_load_from_dict_or_globals_fn(
+    dict_ptr: i64,
+    w_code_ptr: i64,
+    frame_ptr: i64,
+    namei: i64,
+) -> i64 {
+    let code = unsafe {
+        &*(pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef)
+            as *const pyre_interpreter::CodeObject)
+    };
+    let idx = namei as usize;
+    if idx >= code.names.len() {
+        return 0;
+    }
+    let varname = code.names[idx].as_ref();
+    let dict = dict_ptr as pyre_object::PyObjectRef;
+
+    // Try the popped mapping first (`getattr_str`), matching the
+    // interpreter's `if let Ok(val) = getattr_str(dict, name)` fast path.
+    match pyre_interpreter::baseobjspace::getattr_str(dict, varname) {
+        Ok(val) => return val as i64,
+        Err(_) => {}
+    }
+
+    // Fall back to the live frame's globals (GC-safe when the frame owns
+    // this w_code; else the promoted w_code's own globals).
+    let parent_frame_ptr = frame_ptr as *const PyFrame;
+    let w_globals = if !parent_frame_ptr.is_null()
+        && unsafe { (*parent_frame_ptr).pycode } as usize == w_code_ptr as usize
+    {
+        unsafe { (*parent_frame_ptr).get_w_globals() }
+    } else {
+        unsafe { pyre_interpreter::w_code_get_w_globals(w_code_ptr as pyre_object::PyObjectRef) }
+    };
+    if !w_globals.is_null() {
+        if let Some(val) =
+            unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(w_globals, varname) }
+        {
+            return val as i64;
+        }
+    }
+
+    let err = pyre_interpreter::PyError::name_error_with_name(
+        format!("name '{varname}' is not defined"),
+        varname,
+    );
+    publish_residual_call_exception(err.to_exc_object() as i64);
+    0
+}
+
 /// `LOAD_ATTR` / method-form `LOAD_ATTR` residual for the standalone
 /// (blackhole / deopt) per-CodeObject jitcode.  pyre's codewriter cannot
 /// rtype `getattr` into `getfield_gc` (`rclass.py:838 rtype_getattr`

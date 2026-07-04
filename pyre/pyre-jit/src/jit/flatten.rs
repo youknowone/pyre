@@ -3448,6 +3448,15 @@ pub struct LoweringContext {
     /// FORMAT_SIMPLE shape); `bh_list_to_tuple_fn` allocates a fresh tuple
     /// (non-list → TypeError → `MayForce`).
     pub list_to_tuple_fn_idx: u16,
+    /// `load_from_dict_or_globals_fn` descrs-pool index.
+    /// LOAD_FROM_DICT_OR_GLOBALS records `load_from_dict_or_globals(dict,
+    /// code, frame, namei)` lowered to `residual_call_ir_r(ConstInt(fn_idx),
+    /// ListI([namei]), ListR([dict, code, frame]), Descr) → reg` via
+    /// [`lower_load_from_dict_or_globals_hlop_to_insn`] (the three-Ref
+    /// IMPORT_NAME shape); `bh_load_from_dict_or_globals_fn` tries the
+    /// popped mapping then the live frame globals (user `__getattr__` →
+    /// `MayForce`).
+    pub load_from_dict_or_globals_fn_idx: u16,
     /// `unary_not_fn` descrs-pool index.  UNARY_NOT records the object-space
     /// `not_(value)` op (pyopcode.py:651) lowered to
     /// `residual_call_r_r(ConstInt(fn_idx), ListR([value]), Descr) → reg` via
@@ -4987,6 +4996,11 @@ where
     if let Some(insn) = lower_import_from_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
+    if let Some(insn) =
+        lower_load_from_dict_or_globals_hlop_to_insn(op, ctx, get_register, lower_constant)
+    {
+        return Some(insn);
+    }
     if let Some(insn) = lower_load_super_attr_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
@@ -5841,6 +5855,58 @@ where
                 vec![Operand::ConstInt(name_idx)],
             )),
             Operand::ListOfKind(ListOfKind::new(Kind::Ref, vec![module, code])),
+            descr_operand,
+        ],
+        dst_reg,
+    ))
+}
+
+/// Lower the LOAD_FROM_DICT_OR_GLOBALS HLOp `load_from_dict_or_globals(
+/// dict, code, frame, namei)` → `result: Ref` to `residual_call_ir_r(
+/// ConstInt(fn_idx), ListI([namei]), ListR([dict, code, frame]), Descr) →
+/// reg` — the three-Ref IMPORT_NAME shape.
+/// `bh_load_from_dict_or_globals_fn` tries the popped mapping via
+/// `getattr` then the live frame globals; a user `__getattr__` may run
+/// Python (`MayForce`).
+///
+/// Returns `None` for non-`load_from_dict_or_globals` opnames so the
+/// caller can fall through to other lowering arms.
+pub fn lower_load_from_dict_or_globals_hlop_to_insn<F, LC>(
+    op: &super::flow::SpaceOperation,
+    ctx: &LoweringContext,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
+{
+    if op.opname != "load_from_dict_or_globals" || op.args.len() != 4 {
+        return None;
+    }
+    let dict = operand_for_value_arg(&op.args[0], get_register, lower_constant)?;
+    let code = operand_for_value_arg(&op.args[1], get_register, lower_constant)?;
+    let frame = operand_for_value_arg(&op.args[2], get_register, lower_constant)?;
+    let name_idx = const_int_for_value_arg(&op.args[3])?;
+    let dst_reg = match &op.result {
+        Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
+        _ => return None,
+    };
+    let effect_info = effect_info_for_call_flavor(CallFlavor::MayForce);
+    let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
+        effect_info,
+        arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Int],
+        result_kind: Some(Kind::Ref),
+    }));
+    Some(Insn::op_with_result(
+        "residual_call_ir_r",
+        vec![
+            Operand::ConstInt(ctx.load_from_dict_or_globals_fn_idx as i64),
+            Operand::ListOfKind(ListOfKind::new(
+                Kind::Int,
+                vec![Operand::ConstInt(name_idx)],
+            )),
+            Operand::ListOfKind(ListOfKind::new(Kind::Ref, vec![dict, code, frame])),
             descr_operand,
         ],
         dst_reg,
@@ -10642,6 +10708,7 @@ mod tests {
             map_add_fn_idx: 123,
             dict_merge_fn_idx: 124,
             list_to_tuple_fn_idx: 125,
+            load_from_dict_or_globals_fn_idx: 126,
             ..Default::default()
         };
         let code_const = Constant::new(
@@ -12205,6 +12272,106 @@ mod tests {
                             }
                             other => {
                                 panic!("ListR must be [self, cls, code], got {other:?}")
+                            }
+                        }
+                    }
+                    other => panic!("expected ListR, got {other:?}"),
+                }
+                assert_eq!(
+                    result,
+                    Some(Register {
+                        kind: Kind::Ref,
+                        index: 102
+                    }),
+                );
+            }
+            _ => panic!("expected Insn::Op, got {insn:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_load_from_dict_or_globals_hlop_emits_residual() {
+        // `load_from_dict_or_globals(dict, code, frame, name_idx)` →
+        // `residual_call_ir_r(ConstInt(load_from_dict_or_globals_fn_idx),
+        // ListI([name_idx]), ListR([dict, code, frame]), Descr) → reg`
+        // (MayForce — a mapping `__getattr__` may run).  Same three-Ref
+        // shape as IMPORT_NAME/LOAD_SUPER_ATTR; `frame` is the portal
+        // frame input Variable, `code` a compile-time `ConstRef`.
+        let dict_var = Variable::new(VariableId(8), Kind::Ref);
+        let frame_var = Variable::new(VariableId(10), Kind::Ref);
+        let result_var = Variable::new(VariableId(9), Kind::Ref);
+        let (ctx, code_const, name_idx_const) = load_attr_lowering_fixture();
+        let op = super::super::flow::SpaceOperation::new(
+            "load_from_dict_or_globals",
+            vec![
+                dict_var.into(),
+                code_const.into(),
+                frame_var.into(),
+                name_idx_const.into(),
+            ],
+            Some(result_var.into()),
+            0,
+        );
+        let mut get_register = |var: Variable| match var.id {
+            VariableId(8) => Register {
+                kind: Kind::Ref,
+                index: 101,
+            },
+            VariableId(10) => Register {
+                kind: Kind::Ref,
+                index: 103,
+            },
+            VariableId(9) => Register {
+                kind: Kind::Ref,
+                index: 102,
+            },
+            _ => panic!("unexpected var id {:?}", var.id),
+        };
+        let mut lower_constant = super::flatten_constant_operand_for_test;
+        let insn = super::lower_load_from_dict_or_globals_hlop_to_insn(
+            &op,
+            &ctx,
+            &mut get_register,
+            &mut lower_constant,
+        )
+        .expect("4-arg load_from_dict_or_globals lowering must succeed");
+        match insn {
+            Insn::Op {
+                opname,
+                args,
+                result,
+            } => {
+                assert_eq!(opname, "residual_call_ir_r");
+                assert!(
+                    matches!(args[0], Operand::ConstInt(126)),
+                    "load_from_dict_or_globals_fn pool index, got {:?}",
+                    args[0]
+                );
+                match &args[1] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Int);
+                        assert!(
+                            matches!(&list.content[..], [Operand::ConstInt(5)]),
+                            "ListI = [name_idx], got {:?}",
+                            list.content
+                        );
+                    }
+                    other => panic!("expected ListI, got {other:?}"),
+                }
+                match &args[2] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Ref);
+                        match &list.content[..] {
+                            [
+                                Operand::Register(d),
+                                Operand::ConstRef(0x2000),
+                                Operand::Register(f),
+                            ] => {
+                                assert_eq!(d.index, 101, "leading Ref operand must be dict");
+                                assert_eq!(f.index, 103, "third Ref operand must be frame");
+                            }
+                            other => {
+                                panic!("ListR must be [dict, code, frame], got {other:?}")
                             }
                         }
                     }
