@@ -91,19 +91,24 @@ fn type_name(obj: PyObjectRef) -> String {
     }
 }
 
-/// `bytes` / `bytearray` / `memoryview` are the buffer-supporting objects the
-/// wrapper accepts.
+/// Any buffer exporter is accepted: `bytes`, `bytearray`, `array`, and
+/// `memoryview` (`buffer_w(w_obj, BUF_FULL_RO)`).
 fn is_buffer_like(obj: PyObjectRef) -> bool {
-    unsafe { pyre_object::is_bytes(obj) || pyre_object::is_bytearray(obj) || is_memoryview(obj) }
+    unsafe {
+        pyre_object::is_bytes(obj)
+            || pyre_object::is_bytearray(obj)
+            || pyre_object::interp_array::is_array(obj)
+            || is_memoryview(obj)
+    }
 }
 
 fn is_memoryview(obj: PyObjectRef) -> bool {
     unsafe { pyre_object::memoryview::is_w_memoryview(obj) }
 }
 
-/// Extract `(contents, readonly)` from a buffer-supporting object: `bytes`
-/// is read-only, `bytearray` is mutable, and a `memoryview` reports both
-/// through its own contents and `readonly` flag.
+/// Extract `(contents, readonly)` from a buffer exporter: `bytes` is
+/// read-only, `bytearray` and `array` are mutable, and a `memoryview` reports
+/// both through its own contents and `readonly` flag.
 pub(crate) fn buffer_view(obj: PyObjectRef) -> Result<(Vec<u8>, bool), PyError> {
     unsafe {
         if pyre_object::is_bytes(obj) {
@@ -112,6 +117,12 @@ pub(crate) fn buffer_view(obj: PyObjectRef) -> Result<(Vec<u8>, bool), PyError> 
         if pyre_object::is_bytearray(obj) {
             return Ok((
                 pyre_object::bytearrayobject::w_bytearray_data(obj).to_vec(),
+                false,
+            ));
+        }
+        if pyre_object::interp_array::is_array(obj) {
+            return Ok((
+                pyre_object::interp_array::w_array_bytes(obj).to_vec(),
                 false,
             ));
         }
