@@ -7636,10 +7636,7 @@ impl JitState for PyreJitState {
         // short resumes) it was added for.  Only reachable with the guard-pc
         // resume coordinate live (the `pc_map` baseline resumes past the pop, so
         // the kept temp is absent from its frame and never seeded).
-        if seed_bridge_locals
-            && crate::pyjitcode::m3_jitcode_pc_enabled()
-            && frame0.jitcode_pc != majit_ir::resumedata::NO_JITCODE_PC
-        {
+        if seed_bridge_locals && frame0.jitcode_pc != majit_ir::resumedata::NO_JITCODE_PC {
             seed_bridge_locals = false;
         }
         let mut value_cursor = 0usize;

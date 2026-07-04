@@ -9914,12 +9914,9 @@ fn walker_capture_snapshot_for_last_guard_impl(
             // `setposition`, and the cranelift bridge re-trace entry all agree
             // — the kept operand stack is naturally live at the guard pc, so
             // the positional `kept_stack_subst` recovery (gpc == entry_py_pc)
-            // is skipped.  Flag-off, `resume_py_pc` stays `py_pc`.
-            let liveness_py_pc = if crate::pyjitcode::m3_jitcode_pc_enabled() {
-                guard_py_pc.unwrap_or(py_pc)
-            } else {
-                py_pc
-            };
+            // is skipped.  A non-branch guard carries no guard pc, so it keeps
+            // the merge `py_pc` and its exact `pc_map` translation.
+            let liveness_py_pc = guard_py_pc.unwrap_or(py_pc);
             // The snapshot resume pc folds in the bit-14 marker for a try-block
             // residual call so the decode routes through
             // `after_residual_call_resume_pc_for` (the call's OWN post-call

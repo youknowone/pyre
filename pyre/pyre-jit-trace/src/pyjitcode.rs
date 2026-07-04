@@ -279,35 +279,6 @@ pub fn portal_red_pre_regalloc_slots(nlocals: usize, max_stackdepth: usize) -> (
     (portal_frame_reg, portal_ec_reg)
 }
 
-/// `#124` Approach B master switch (`PYRE_M3_JITCODE_PC`, default on).
-///
-/// A kept-stack branch guard resumes at its carried direct JitCode pc and the
-/// encoder collects the guard-pc live box set directly — the faithful
-/// per-bytecode resume that retires the lossy `pc_map` (`#73`).  The opt-out
-/// `PYRE_M3_JITCODE_PC=0` restores the legacy positional kept-stack heuristic,
-/// which resumes past the pop through `pc_map` and recovers the not-taken kept
-/// value out of band: depth 1 via `kept_stack_subst`, depth > 1 via the
-/// not-taken edge's decoded `ref_copy` parallel moves
-/// (`decode_branch_trampoline_ref_moves`, `#420`).
-///
-/// The direct-pc path once miscompiled a depth-1 leading-`and` short-circuit
-/// (`x = local and CONST`): the symbolic bridge seeded the kept operand
-/// concrete, its residual compare const-folded, and `generate_guard` skipped
-/// the now-`Const` condition, so the not-taken arm restored the taken-path
-/// value (`flag and 11`: 2197063 vs 1466663).  `setup_bridge_sym` now withholds
-/// that concrete seed on the guard-pc kept-stack resume, so the kept operand
-/// stays a symbolic input arg and its guard fires per iteration.
-pub(crate) fn m3_jitcode_pc_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M3_JITCODE_PC") {
-        Some(v) => {
-            let v = v.to_string_lossy();
-            v != "0" && !v.eq_ignore_ascii_case("false")
-        }
-        None => true,
-    })
-}
-
 impl PyJitCode {
     pub fn new(payload: PyJitCodePayload) -> Self {
         Self {
@@ -471,23 +442,21 @@ impl PyJitCode {
     /// The encoder (box collection) and decoder (box count + setposition)
     /// both funnel through this with identical `(raw_pc, carried, op_live)`,
     /// so the chosen offset — and hence the live-box layout — is symmetric
-    /// by construction.  Gated by [`m3_jitcode_pc_enabled`]: with the flag
-    /// off the carried word is ignored and behaviour is identical to
-    /// [`Self::resolve_resume_pc`].
+    /// by construction.
     ///
     /// The carried word is preferred only when it is a `-live-`-anchored
-    /// coordinate ([`JitCode::can_decode_live_vars`]); a startpoint that is
-    /// not so anchored (a synthesized specialization guard's `may_force`
-    /// CALL op) falls through to the `pc_map` translation so
-    /// `get_live_vars_info` never hits `_missing_liveness`.
+    /// coordinate ([`JitCode::can_decode_live_vars`]).  A guard with no
+    /// carried coordinate (`NO_JITCODE_PC`, set by every non-branch guard)
+    /// or a startpoint that is not so anchored (a synthesized specialization
+    /// guard's `may_force` CALL op) falls through to the `pc_map` translation
+    /// so `get_live_vars_info` never hits `_missing_liveness`.
     pub fn resolve_resume_pc_with_jitcode_pc(
         &self,
         raw_pc: i32,
         carried: i32,
         op_live: u8,
     ) -> Option<usize> {
-        if m3_jitcode_pc_enabled() && carried != majit_ir::resumedata::NO_JITCODE_PC && carried >= 0
-        {
+        if carried != majit_ir::resumedata::NO_JITCODE_PC && carried >= 0 {
             let jp = carried as usize;
             if self.jitcode.can_decode_live_vars(jp, op_live) {
                 return Some(jp);
