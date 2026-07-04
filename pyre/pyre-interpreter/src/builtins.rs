@@ -5040,9 +5040,22 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
         if let Some(method) = unsafe { crate::baseobjspace::lookup_in_type(tp, "__float__") } {
             let result = crate::call::call_function_impl_result(method, &[obj])?;
             unsafe {
-                // floatobject.py:228 — exact float check (no subclass support yet)
                 if is_float(result) {
-                    return Ok(result);
+                    // floatobject.py:228-238 — an exact float is returned as-is;
+                    // a strict subclass warns (deprecated) and is converted to a
+                    // base float value.
+                    if is_exact_type(result, &FLOAT_TYPE) {
+                        return Ok(result);
+                    }
+                    let value_type = crate::type_methods::arg_type_name(obj);
+                    let result_type = crate::type_methods::arg_type_name(result);
+                    crate::warn::warn_deprecation(&format!(
+                        "{value_type}.__float__ returned non-float (type {result_type}).  \
+                         The ability to return an instance of a strict subclass of \
+                         float is deprecated, and may be removed in a future version \
+                         of Python."
+                    ));
+                    return Ok(floatobject::w_float_new(w_float_get_value(result)));
                 }
             }
             // descroperation.py:891 — __float__ returned non-float (type '%T')
