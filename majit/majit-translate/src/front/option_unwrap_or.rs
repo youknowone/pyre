@@ -45,7 +45,9 @@
 
 use crate::flowspace::model::Variable;
 use crate::front::bool_then::{close_goto_mixed, map_source, reproduce_exit_args};
-use crate::model::{FieldDescriptor, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType};
+use crate::model::{
+    CallTarget, FieldDescriptor, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType,
+};
 
 /// A recognized `Option::unwrap_or(opt, default)` call site captured during
 /// body lowering (`front::mir` `recognize_unwrap_or_site`).  The owner
@@ -101,15 +103,49 @@ fn rewire_one_unwrap_or_site(graph: &mut FunctionGraph, site: &UnwrapOrSite) -> 
         })
         .ok_or_else(|| format!("{name}: unwrap_or result var has no producer block"))?;
 
-    // The call must be A's last op (lower_call closes the block right after
-    // pushing it) so removing it leaves the receiver/default construction as
-    // the block tail.
-    let call_idx = graph.blocks[a].operations.len() - 1;
-    if graph.blocks[a].operations[call_idx].result.as_ref() != Some(&site.result_var) {
+    // Index of the `unwrap_or` call op within block A.
+    let call_idx = graph.blocks[a]
+        .operations
+        .iter()
+        .position(|op| op.result.as_ref() == Some(&site.result_var))
+        .expect("result var producer resolved to block A above");
+    let last_idx = graph.blocks[a].operations.len() - 1;
+    // The call sits at the block tail, optionally followed by a single
+    // `__pyre_cast_instance(result)` narrowing op.  `lower_call` appends that
+    // cast when the payload is a `*mut <registered ADT>` (a raw-pointer
+    // `Option` payload) and reassigns the destination local to the narrowed
+    // var, so the continuation consumes `narrowed`, not the raw call result.
+    // The cast is jitcode-identity (`cast_pointer` → `same_as`); carry it into
+    // each arm so B keeps receiving a narrowed value.  `out_var` is the value
+    // block B actually consumes for the select result.
+    let (cast, out_var): (Option<(Vec<String>, ValueType)>, Variable) = if call_idx == last_idx {
+        (None, site.result_var.clone())
+    } else if call_idx == last_idx - 1 {
+        let tail = &graph.blocks[a].operations[last_idx];
+        match (&tail.kind, tail.result.clone()) {
+            (
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    args,
+                    result_ty,
+                },
+                Some(narrowed),
+            ) if segments.first().map(String::as_str) == Some("__pyre_cast_instance")
+                && args.as_slice() == std::slice::from_ref(&site.result_var) =>
+            {
+                (Some((segments.clone(), result_ty.clone())), narrowed)
+            }
+            _ => {
+                return Err(format!(
+                    "{name}: unwrap_or call is not the last op of block {a}"
+                ));
+            }
+        }
+    } else {
         return Err(format!(
             "{name}: unwrap_or call is not the last op of block {a}"
         ));
-    }
+    };
     // Capture the receiver `Option` + default operands.
     let (opt, default) = match &graph.blocks[a].operations[call_idx].kind {
         OpKind::Call { args, .. } if args.len() == 2 => (args[0].clone(), args[1].clone()),
@@ -136,12 +172,12 @@ fn rewire_one_unwrap_or_site(graph: &mut FunctionGraph, site: &UnwrapOrSite) -> 
     let b_target = saved_exit.target;
 
     // `carried` = the distinct live Values A forwards to B other than the
-    // payload itself; each must be threaded through the diamond arms to reach
-    // B (a fresh block cannot see A-scope Variables directly).
+    // select output itself; each must be threaded through the diamond arms to
+    // reach B (a fresh block cannot see A-scope Variables directly).
     let mut carried: Vec<Variable> = Vec::new();
     for arg in &saved_exit.args {
         if let LinkArg::Value(v) = arg
-            && *v != site.result_var
+            && *v != out_var
             && !carried.contains(v)
         {
             carried.push(v.clone());
@@ -182,10 +218,11 @@ fn rewire_one_unwrap_or_site(graph: &mut FunctionGraph, site: &UnwrapOrSite) -> 
             pure: true,
         },
     });
+    let then_value = emit_narrow(graph, then_bb, &cast, payload);
     let then_link_args = reproduce_exit_args(
         &saved_exit,
-        &site.result_var,
-        &payload,
+        &out_var,
+        &then_value,
         &then_sources,
         &then_inputs,
         &name,
@@ -195,10 +232,11 @@ fn rewire_one_unwrap_or_site(graph: &mut FunctionGraph, site: &UnwrapOrSite) -> 
     // `else_bb`: forward `default` as the result.
     let default_in_else = map_source(&else_sources, &else_inputs, &default)
         .ok_or_else(|| format!("{name}: default value not threaded into None arm"))?;
+    let else_value = emit_narrow(graph, else_bb, &cast, default_in_else);
     let else_link_args = reproduce_exit_args(
         &saved_exit,
-        &site.result_var,
-        &default_in_else,
+        &out_var,
+        &else_value,
         &else_sources,
         &else_inputs,
         &name,
@@ -211,6 +249,12 @@ fn rewire_one_unwrap_or_site(graph: &mut FunctionGraph, site: &UnwrapOrSite) -> 
     // `bool(disc)` selects the `Some` (then) arm.  The receiver/default
     // construction ops stay as A's tail.
     let a_id = graph.blocks[a].id;
+    // Drop the trailing narrowing cast (if any) first so `call_idx` stays valid,
+    // then the `unwrap_or` call — both are subsumed by the diamond (the cast is
+    // re-emitted per arm).
+    if cast.is_some() {
+        graph.blocks[a].operations.remove(last_idx);
+    }
     graph.blocks[a].operations.remove(call_idx);
     let disc = graph.alloc_value_var();
     graph.block_mut(a_id).operations.push(SpaceOperation {
@@ -228,6 +272,33 @@ fn rewire_one_unwrap_or_site(graph: &mut FunctionGraph, site: &UnwrapOrSite) -> 
     });
     graph.set_branch(a_id, disc, then_bb, then_sources, else_bb, else_sources);
     Ok(())
+}
+
+/// Re-emit the `__pyre_cast_instance` narrowing the residual call carried into
+/// an arm's `raw` payload value.  `None` (no cast on the original result) is a
+/// pass-through: the raw value flows on unchanged.  The cast is jitcode-identity
+/// (`cast_pointer` → `same_as`), so duplicating it per arm is sound.
+fn emit_narrow(
+    graph: &mut FunctionGraph,
+    bb: crate::model::BlockId,
+    cast: &Option<(Vec<String>, ValueType)>,
+    raw: Variable,
+) -> Variable {
+    let Some((segments, result_ty)) = cast else {
+        return raw;
+    };
+    let narrowed = graph.alloc_value_var();
+    graph.block_mut(bb).operations.push(SpaceOperation {
+        result: Some(narrowed.clone()),
+        kind: OpKind::Call {
+            target: CallTarget::FunctionPath {
+                segments: segments.clone(),
+            },
+            args: vec![raw],
+            result_ty: result_ty.clone(),
+        },
+    });
+    narrowed
 }
 
 #[cfg(test)]
@@ -325,6 +396,79 @@ mod tests {
             arms_to_b, 2,
             "both diamond arms forward to the continuation"
         );
+    }
+
+    /// A raw-pointer payload (`Option<*mut PyObject>`) makes `lower_call`
+    /// append a `__pyre_cast_instance(result)` narrowing op after the
+    /// `unwrap_or` call, so the call is the block's second-to-last op and the
+    /// continuation consumes the *narrowed* var.  The rewrite must tolerate
+    /// that trailing identity cast: lift to the discriminant select and apply
+    /// the same narrowing to each arm's payload so B still receives a narrowed
+    /// value.
+    #[test]
+    fn rewrite_lifts_unwrap_or_with_trailing_narrowing_cast() {
+        let mut g = FunctionGraph::new("test_unwrap_or_cast");
+        let a = g.startblock;
+        let opt = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let default = g.push_op_var(a, OpKind::ConstInt(42), true).unwrap();
+        let result = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: unwrap_or_target(),
+                    args: vec![opt.clone(), default.clone()],
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        // The narrowing cast `lower_call` appends for a `*mut <registered ADT>`
+        // result; the continuation consumes its `narrowed` var, not `result`.
+        let narrowed = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec!["__pyre_cast_instance".into(), "PyObject".into()],
+                    },
+                    args: vec![result.clone()],
+                    result_ty: ValueType::Ref(Some("PyObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+
+        let (b, _b_args) = g.create_block_with_arg_vars(1);
+        g.set_return(b, None);
+        g.set_goto(a, b, vec![narrowed.clone()]);
+
+        let mut site = option_site(result.clone());
+        site.payload_ty = ValueType::Ref(None);
+        let rewritten = rewire_unwrap_or_call_sites(&mut g, &[site]);
+        assert_eq!(rewritten, 1, "the trailing-cast unwrap_or site is rewritten");
+
+        // No residual `unwrap_or` call survives (the two arm casts remain).
+        assert!(
+            !g.blocks.iter().flat_map(|blk| &blk.operations).any(|op| {
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    if segments.last().map(String::as_str) == Some("unwrap_or"))
+            }),
+            "residual unwrap_or call removed"
+        );
+        // Block A branches two ways after reading the discriminant.
+        assert_eq!(g.blocks[a.0].exits.len(), 2, "A branches to Some/None arms");
+        // Each arm applies the narrowing cast to its payload (Some: __pos_0,
+        // None: default), so two casts remain in the arms.
+        let arm_casts = g
+            .blocks
+            .iter()
+            .flat_map(|blk| &blk.operations)
+            .filter(|op| {
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    if segments.first().map(String::as_str) == Some("__pyre_cast_instance"))
+            })
+            .count();
+        assert_eq!(arm_casts, 2, "each diamond arm narrows its payload");
     }
 
     /// A call block whose last op is not the recorded result declines
