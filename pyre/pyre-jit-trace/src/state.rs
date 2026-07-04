@@ -7618,7 +7618,30 @@ impl JitState for PyreJitState {
         // out) once validated, mirroring the LoadGlobal-fold / multiframe
         // gap-10 flips; the opt-out keeps the prior symbolic-bridge
         // behavior available for A/B.
-        let seed_bridge_locals = std::env::var("PYRE_FBW_BRIDGE_LOCAL_SEED").as_deref() != Ok("0");
+        let mut seed_bridge_locals =
+            std::env::var("PYRE_FBW_BRIDGE_LOCAL_SEED").as_deref() != Ok("0");
+        // A branch-guard kept-stack resume (`frame0.jitcode_pc` carries the
+        // guard's own jitcode pc; only kept-stack branch guards set it) resumes
+        // AT the guard pc with the not-taken arm's operand-stack temps still
+        // live (`lo <= x <= hi` keeps `x` below the compare truth; short-circuit
+        // `and`/`or` and the conditional expression keep their left operand).
+        // Stamping a concrete on such a kept operand freezes a downstream branch
+        // that consumes it: `x <= hi`'s residual compare const-folds against the
+        // seeded `x` to a `Const` bool, and `generate_guard` skips the guard for
+        // a `Const` condition (`isinstance(box, Const): return`) — so the second
+        // branch direction is pinned to the resuming iteration's `x` and the
+        // loop over/under-counts.  The kept operand must stay a symbolic input
+        // arg here (the guard fires, the value is guarded, not folded); the seed
+        // stays on the non-kept-stack resumes (guard_value / guard_class / plain
+        // short resumes) it was added for.  Only reachable with the guard-pc
+        // resume coordinate live (the `pc_map` baseline resumes past the pop, so
+        // the kept temp is absent from its frame and never seeded).
+        if seed_bridge_locals
+            && crate::pyjitcode::m3_jitcode_pc_enabled()
+            && frame0.jitcode_pc != majit_ir::resumedata::NO_JITCODE_PC
+        {
+            seed_bridge_locals = false;
+        }
         let mut value_cursor = 0usize;
         for &reg_idx in &reg_indices.int {
             let value = &frame0.values[value_cursor];
