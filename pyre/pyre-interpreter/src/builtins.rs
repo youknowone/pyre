@@ -1546,7 +1546,15 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
         crate::typedef::gettypeobject(&pyre_object::functional::RANGE_TYPE)
     });
     namespace.get_or_insert_with("len", || {
-        make_module_builtin_function_with_arity("len", builtin_len, 1)
+        // operation.py `len(space, w_obj)` — one positional-or-keyword `obj`
+        // bound by the gateway Signature, so `len` no longer receives the
+        // `__pyre_kw__` marker dict.
+        crate::gateway::make_module_builtin_function_with_arity_and_sig(
+            "len",
+            builtin_len,
+            1,
+            crate::gateway::Signature::new(vec!["obj"], None, None, 0, 0),
+        )
     });
     namespace.get_or_insert_with("abs", || {
         make_module_builtin_function_with_arity("abs", builtin_abs, 1)
@@ -2380,7 +2388,15 @@ pub fn is_builtin_len_function(callable: PyObjectRef) -> bool {
 /// `len(obj)` — return the length of an object.
 /// `len(obj)` — PyPy: operation.py len → space.len_w
 fn builtin_len(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    // operation.py `len(space, w_obj)` — one positional-or-keyword `obj`.
+    // operation.py `len(space, w_obj)`.  The gateway Signature binds the keyword
+    // form at the call site, so `args` is positional only and never carries the
+    // `__pyre_kw__` marker: a single argument is `obj` (even a dict that holds
+    // the marker key), so index it directly.  A wrong positional count carries
+    // no single-dict value, so route it through the gateway for the faithful
+    // `_match_signature` arity error.
+    if let [obj] = args {
+        return crate::baseobjspace::len(*obj);
+    }
     let obj = parse_single_required(args, "obj", "len")?;
     crate::baseobjspace::len(obj)
 }

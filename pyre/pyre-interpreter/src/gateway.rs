@@ -812,6 +812,28 @@ pub fn make_module_builtin_function_with_arity(
     crate::function_new_builtin(code as *const (), name.to_string(), pyre_object::PY_NULL)
 }
 
+/// `make_module_builtin_function_with_arity` additionally carrying an argument
+/// `Signature` so the keyword-call path binds arguments by name at the call
+/// site — the builtin then receives only positional slots and never the
+/// `__pyre_kw__` marker dict. A `*args`/`**kwargs`/kw-only signature is demoted
+/// to `HOPELESS` (as in `make_builtin_function_with_arity_and_maybe_sig`).
+pub fn make_module_builtin_function_with_arity_and_sig(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    arity: u16,
+    signature: Signature,
+) -> PyObjectRef {
+    let arity =
+        if signature.has_vararg() || signature.has_kwarg() || signature.num_kwonlyargnames() > 0 {
+            HOPELESS
+        } else {
+            arity
+        };
+    let sig: *const Signature = Box::into_raw(Box::new(signature));
+    let code = builtin_code_new_full(name, func, None, arity, sig);
+    crate::function_new_builtin(code as *const (), name.to_string(), pyre_object::PY_NULL)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
