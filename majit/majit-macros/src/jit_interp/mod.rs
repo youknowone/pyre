@@ -126,6 +126,15 @@ pub struct JitInterpConfig {
     /// identity (not the arg shape alone).  Empty for interpreters with no
     /// pool-array indexing.
     pub pool_arrays: Vec<PoolArrayEntry>,
+    /// Struct field type declarations for ref-kind field access through
+    /// `ref(T)` state scalars and non-state ref bindings.  Declared as
+    /// `ref_fields = { Struct::field => PointeeType, ... }`.  When the
+    /// lowerer encounters `state.<ref_scalar>.<field>` or `<binding>.<field>`
+    /// and `(Struct, field)` is listed here, it emits `getfield_gc_r` /
+    /// `setfield_gc_r` (ref-kind) instead of the default `_gc_i` (int-kind).
+    /// The `PointeeType` is recorded so subsequent field access on the
+    /// returned ref can resolve its struct layout.
+    pub ref_fields: Vec<RefFieldEntry>,
     /// Opt-in: route pure forward-advancing dispatch arms (those whose body
     /// only does work then `pc += N`, with no back-edge / `can_enter_jit!` /
     /// early return) through the per-arm sub-JitCode path with a pc-returning
@@ -320,6 +329,21 @@ pub struct PoolArrayEntry {
     pub getter: Path,
 }
 
+/// One entry in `ref_fields = { Struct::field => PointeeType, ... }`.
+/// Declares that `Struct.field` is a ref-kind (pointer) field whose pointee
+/// is `PointeeType`.  The lowerer uses this to emit `getfield_gc_r` /
+/// `setfield_gc_r` for the field access, and tags the resulting ref binding
+/// with `pointee_type` so subsequent field access on it resolves the layout.
+#[derive(Clone)]
+pub struct RefFieldEntry {
+    /// The struct that owns the field (e.g. `Stack`, `Node`).
+    pub struct_type: Path,
+    /// The field name within the struct (e.g. `head`, `next`).
+    pub field: Ident,
+    /// The struct the pointer points to (e.g. `Node`).
+    pub pointee_type: Path,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CallPolicyKind {
     ResidualVoid,
@@ -480,6 +504,7 @@ impl Parse for JitInterpConfig {
         let mut recursive_entry: Option<Path> = None;
         let mut residual_writes: Vec<ResidualWriteEntry> = Vec::new();
         let mut pool_arrays: Vec<PoolArrayEntry> = Vec::new();
+        let mut ref_fields: Vec<RefFieldEntry> = Vec::new();
         let mut split_dispatch = false;
         let mut switch_dispatch = false;
 
@@ -534,6 +559,9 @@ impl Parse for JitInterpConfig {
                 "pool_arrays" => {
                     pool_arrays = parse_pool_arrays_map(input)?;
                 }
+                "ref_fields" => {
+                    ref_fields = parse_ref_fields_map(input)?;
+                }
                 "split_dispatch" => {
                     split_dispatch = input.parse::<LitBool>()?.value;
                 }
@@ -585,6 +613,7 @@ impl Parse for JitInterpConfig {
             recursive_entry,
             residual_writes,
             pool_arrays,
+            ref_fields,
             split_dispatch,
             switch_dispatch,
         })
@@ -629,6 +658,43 @@ fn parse_pool_arrays_map(input: ParseStream) -> syn::Result<Vec<PoolArrayEntry>>
         content.parse::<Token![=>]>()?;
         let getter: Path = content.parse()?;
         entries.push(PoolArrayEntry { base, getter });
+        let _ = content.parse::<Token![,]>();
+    }
+    Ok(entries)
+}
+
+/// Parse `ref_fields = { Struct::field => PointeeType, ... }`.
+/// Each entry declares that `Struct.field` is a ref-kind (pointer) field
+/// whose pointee is `PointeeType`.  The path `Struct::field` is parsed as
+/// a single `Path` and then split: the last segment is the field name, the
+/// remaining prefix is the struct type.
+fn parse_ref_fields_map(input: ParseStream) -> syn::Result<Vec<RefFieldEntry>> {
+    let content;
+    braced!(content in input);
+    let mut entries = Vec::new();
+    while !content.is_empty() {
+        let full_path: Path = content.parse()?;
+        // Split the last segment as the field name.
+        let mut segments: Vec<_> = full_path.segments.into_iter().collect();
+        if segments.len() < 2 {
+            return Err(syn::Error::new_spanned(
+                &full_path.leading_colon,
+                "ref_fields entry must be `Struct::field => Pointee`",
+            ));
+        }
+        let field_seg = segments.pop().unwrap();
+        let field = field_seg.ident;
+        let struct_type = syn::Path {
+            leading_colon: full_path.leading_colon,
+            segments: segments.into_iter().collect(),
+        };
+        content.parse::<Token![=>]>()?;
+        let pointee_type: Path = content.parse()?;
+        entries.push(RefFieldEntry {
+            struct_type,
+            field,
+            pointee_type,
+        });
         let _ = content.parse::<Token![,]>();
     }
     Ok(entries)

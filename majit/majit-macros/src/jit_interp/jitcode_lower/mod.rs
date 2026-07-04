@@ -186,6 +186,11 @@ pub struct LowererConfig {
     /// whose arg0 is the `base` lowers to `getarrayitem_gc_r` instead of a
     /// residual CALL_R.  Source: `JitInterpConfig.pool_arrays`.
     pub(super) pool_arrays: Vec<(String, Vec<String>)>,
+    /// Ref-kind struct field declarations.  Key = `"StructType::field"`,
+    /// value = `(struct_path, field_ident, pointee_path)`.  When the lowerer
+    /// encounters a field access and the `(struct, field)` pair matches, it
+    /// emits `getfield_gc_r` / `setfield_gc_r` (ref-kind) instead of `_gc_i`.
+    pub(super) ref_fields: HashMap<String, (syn::Path, Ident, syn::Path)>,
     /// Source: `JitInterpConfig.split_dispatch`.  When set, the dispatch lowerer
     /// routes pure forward-advancing green-pc arms through the per-arm
     /// sub-JitCode path with a pc-returning `inline_call_<types>_i` instead of
@@ -797,6 +802,7 @@ impl LowererConfig {
         env_type: &Ident,
         residual_writes: &[crate::jit_interp::ResidualWriteEntry],
         pool_arrays: &[crate::jit_interp::PoolArrayEntry],
+        ref_fields: &[crate::jit_interp::RefFieldEntry],
         split_dispatch: bool,
         switch_dispatch: bool,
     ) -> Self {
@@ -937,6 +943,28 @@ impl LowererConfig {
                 })
             })
             .collect();
+        // Build the ref_fields lookup: key = "StructLastSegment::field",
+        // value = (struct_path, field_ident, pointee_path).
+        let ref_fields_map: HashMap<String, (syn::Path, Ident, syn::Path)> = ref_fields
+            .iter()
+            .map(|entry| {
+                let struct_name = entry
+                    .struct_type
+                    .segments
+                    .last()
+                    .map(|s| s.ident.to_string())
+                    .unwrap_or_default();
+                let key = format!("{}::{}", struct_name, entry.field);
+                (
+                    key,
+                    (
+                        entry.struct_type.clone(),
+                        entry.field.clone(),
+                        entry.pointee_type.clone(),
+                    ),
+                )
+            })
+            .collect();
         Self {
             io_shims,
             calls,
@@ -955,6 +983,7 @@ impl LowererConfig {
             state_type_name: state_type.to_string(),
             env_type_name: env_type.to_string(),
             residual_writes,
+            ref_fields: ref_fields_map,
             pool_arrays: pool_arrays
                 .iter()
                 .map(|entry| {
