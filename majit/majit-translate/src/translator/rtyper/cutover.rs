@@ -644,7 +644,32 @@ fn collect_divergences(
         // A kind the legacy walker resolved must match the real path;
         // conversely the real path must not resolve a kind for a value
         // the legacy walker left Unknown.
-        let diverges = if legacy_kind != ConcreteType::Unknown {
+        //
+        // Exception: the real path refining a boxed-pointer (`GcRef`)
+        // slot to `Void` is sound, not a divergence.  On a `Match` the
+        // real path's concretetype is what gets committed and emitted
+        // (`codewriter.rs` commits `real_value_to_var`), and the real
+        // (annotate→rtype) path is the authoritative parity path.  The
+        // shape is the uniform `Result` exception-link lowering
+        // extracting a `?`-propagated `Ok(())` as a unit: the legacy
+        // walker keeps the boxed `Result` as `GcRef`, while the real path
+        // types the extracted unit `Void`.  A `Void` value has no boxed
+        // consumer — nothing reads the dropped `GcRef` slot as a pointer.
+        // `real=Void` is a positive `()` result (the `None | Some("()")`
+        // return-type arm), never the `Unknown` "real path did not type
+        // it" default, so accepting it does not admit an untyped slot.
+        //
+        // Scoped to `legacy=GcRef` only: a `legacy=Signed` slot the real
+        // path types `Void` is NOT accepted — the legacy walker's scalar
+        // is a live integer the emit path still colors (proven by
+        // `object_key_for_checked`'s `lookup_coloring` panic on a
+        // `Some(Void)` value referenced under an `Int` regalloc class), so
+        // that pairing is a genuine data-kind divergence, not a unit drop.
+        let real_refines_gcref_to_void =
+            legacy_kind == ConcreteType::GcRef && real_kind == ConcreteType::Void;
+        let diverges = if real_refines_gcref_to_void {
+            false
+        } else if legacy_kind != ConcreteType::Unknown {
             real_kind != legacy_kind
         } else {
             real_present.is_some()
@@ -2845,6 +2870,93 @@ mod tests {
         assert_eq!(
             lowleveltype_to_concrete(&LowLevelType::Void).expect("supported lltype"),
             ConcreteType::Void
+        );
+    }
+
+    /// Build a single-value passthrough graph (`start(v1) -> return(v1)`)
+    /// whose `v1` is reachable, publish `legacy_kind` onto `v1`, and diff
+    /// it against a `real_state` that types `v1` as `real_kind`.  Returns
+    /// the divergence list `collect_divergences` produces.
+    fn diff_single_var(legacy_kind: ConcreteType, real_kind: ConcreteType) -> Vec<String> {
+        let mut graph = LegacyGraph::new("diff_single_var");
+        let vars = mint_vars(&mut graph, 2);
+        let v1_var = vars[1].clone();
+        let startblock = Block {
+            id: graph.startblock,
+            inputargs: block_inputargs(&vars, &[1]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![link_to_returnblock(
+                vec![LinkArg::Value(v1_var.clone())],
+                graph.returnblock,
+            )],
+            framestate: None,
+            dead: false,
+        };
+        let returnblock = Block {
+            id: graph.returnblock,
+            inputargs: block_inputargs(&vars, &[1]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        };
+        graph.blocks = vec![startblock, returnblock];
+        crate::model::FunctionGraph::set_concretetype_of_inline(&v1_var, legacy_kind);
+        let mut real_state = HashMap::new();
+        real_state.insert(v1_var, real_kind);
+        collect_divergences(&real_state, &graph)
+    }
+
+    #[test]
+    fn collect_divergences_accepts_gcref_refined_to_void() {
+        // The real path refining a boxed-`Result` `GcRef` slot to the
+        // `?`-extracted `Ok(())` unit (`Void`) is sound, not a
+        // divergence: a `Void` value is dropped from register allocation
+        // (`flatten.py:377,386`), so no consumer reads the slot as a
+        // pointer.
+        assert!(
+            diff_single_var(ConcreteType::GcRef, ConcreteType::Void).is_empty(),
+            "legacy=GcRef, real=Void is a sound unit refinement, not a divergence"
+        );
+    }
+
+    #[test]
+    fn collect_divergences_rejects_signed_refined_to_void() {
+        // The refinement is GcRef-specific.  A `legacy=Signed` slot the
+        // real path types `Void` is NOT a sound unit drop: the legacy
+        // walker's scalar is a live integer the emit path still colors
+        // (`object_key_for_checked` panicked in `lookup_coloring` on a
+        // `Some(Void)` value referenced under an `Int` regalloc class), so
+        // this pairing is a genuine data-kind divergence.
+        assert_eq!(
+            diff_single_var(ConcreteType::Signed, ConcreteType::Void).len(),
+            1,
+            "legacy=Signed, real=Void is a data-kind divergence, not the accepted GcRef unit drop"
+        );
+    }
+
+    #[test]
+    fn collect_divergences_rejects_gcref_vs_signed() {
+        // A data-kind conflict (boxed pointer vs decoded integer) is a
+        // real divergence, not covered by the Void refinement.
+        assert_eq!(
+            diff_single_var(ConcreteType::GcRef, ConcreteType::Signed).len(),
+            1,
+            "legacy=GcRef, real=Signed is a real data-kind divergence"
+        );
+    }
+
+    #[test]
+    fn collect_divergences_rejects_void_refined_to_gcref() {
+        // The refinement is one-directional: the legacy walker resolving
+        // a real=Void slot to GcRef is still a divergence (the real path
+        // dropped a value the legacy walker kept as a pointer).
+        assert_eq!(
+            diff_single_var(ConcreteType::Void, ConcreteType::GcRef).len(),
+            1,
+            "legacy=Void, real=GcRef is not the accepted refinement direction"
         );
     }
 
