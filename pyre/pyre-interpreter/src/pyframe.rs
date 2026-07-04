@@ -286,8 +286,55 @@ pub struct FrameBox {
 }
 
 impl FrameBox {
-    /// Move `frame` onto the heap behind a zeroed GC header.
+    /// Move `frame` onto the heap behind a GC header.
+    ///
+    /// `pyframe.py class PyFrame(W_Root)` — an executing frame is a normal
+    /// GC object whose lifetime is its reachability.  When the GC hook is
+    /// installed this allocates a non-moving old-gen `PYFRAME_GC_TYPE_ID`
+    /// block (the same `try_gc_alloc_stable` path every `W_*` uses, e.g.
+    /// `function.rs:373`); the block is reclaimed by a major mark-sweep
+    /// once no root (`walk_pyframe_roots` over the `CURRENT_FRAME` /
+    /// `f_backref` chain) reaches it, so `Drop` performs no manual free
+    /// (`executioncontext.py:91-107 leave` frees nothing either).
+    ///
+    /// Before the hook is wired (bootstrap, tests) `try_gc_alloc_stable`
+    /// returns `None`; fall back to the `std::alloc` `GcFramePrefix` box,
+    /// which `Drop` frees manually.  The two regimes share one memory
+    /// layout — an 8-byte GC header immediately before the frame body — so
+    /// every reader (`frame - GC_HEADER_SIZE` write-barrier header,
+    /// `pyframe_object_custom_trace`) is regime-independent; `Drop`
+    /// distinguishes them with `try_gc_owns_object`.
     pub fn new(frame: PyFrame) -> Self {
+        if let Some(raw) = pyre_object::gc_hook::try_gc_alloc_stable(
+            PYFRAME_GC_TYPE_ID,
+            std::mem::size_of::<PyFrame>(),
+        )
+        .filter(|p| !p.is_null())
+        {
+            pyre_object::gc_interp::note_alloc();
+            let ptr = raw as *mut PyFrame;
+            unsafe {
+                std::ptr::write(ptr, frame);
+            }
+            // The old-gen frame may hold pointers to freshly nursery-born
+            // argument / locals objects; remember it for the next minor
+            // tracer, exactly as `generator.rs:72` does for a stable
+            // generator wrapping young frame contents.
+            pyre_object::gc_hook::try_gc_write_barrier(raw);
+            return FrameBox { ptr };
+        }
+        FrameBox::new_boxed(frame)
+    }
+
+    /// Allocate a frame that is NOT GC-managed even when the GC hook is
+    /// installed — a plain `std::alloc` `GcFramePrefix` box reclaimed by
+    /// `Drop`.  Used for tracer snapshots (`snapshot_for_tracing`), which
+    /// a tracer holds off the `CURRENT_FRAME` chain across an entire
+    /// `trace_bytecode` walk: a major cycle can complete mid-walk, and no
+    /// root reaches the snapshot, so GC lifetime would reclaim it while the
+    /// tracer still reads it.  A deterministic scope-end free is correct
+    /// for these transient, tracer-private copies.
+    pub fn new_boxed(frame: PyFrame) -> Self {
         let raw = Box::into_raw(Box::new(GcFramePrefix {
             gc_header: 0,
             frame,
@@ -327,13 +374,21 @@ impl FrameBox {
     /// needs for the borrowed-`&mut self` case.
     pub fn into_generator(mut self) -> crate::PyResult {
         self.fix_array_ptrs();
+        // A suspended generator frame is off the call chain — `f_back` is
+        // None until a resume re-links it (`executioncontext.py enter`
+        // rebinds `f_backref = topframeref`; pyre does the same at
+        // `execute_frame`).  Null it now so the generator's custom trace,
+        // which greys the frame block and recurses `f_backref`, never greys
+        // the (possibly already-freed) caller frame captured at suspend.
+        self.f_backref = std::ptr::null_mut();
         let frame_ptr = self.into_raw();
         // `w_generator_new` allocates and may trigger a collection. Until the
-        // generator owns `frame_ptr`, the frame's locals/args live only in its
-        // `locals_cells_stack_w` — the caller has already dropped them from its
-        // own stack — so root that slot across the allocation. The frame struct
-        // itself is a plain heap allocation (not a nursery object), so only the
-        // locals array needs protecting.
+        // generator owns `frame_ptr` (and its custom trace greys the frame
+        // block), the frame's locals/args live only in its
+        // `locals_cells_stack_w` — the caller has already dropped them from
+        // its own stack — so root that slot across the allocation. The frame
+        // block is non-moving (old-gen when GC-managed, `std::alloc`
+        // otherwise), so only the locals array needs protecting.
         let _root = LocalsRoot::new(frame_ptr);
         let generator = pyre_object::generator::w_generator_new(frame_ptr as *mut u8);
         unsafe {
@@ -360,6 +415,17 @@ impl std::ops::DerefMut for FrameBox {
 
 impl Drop for FrameBox {
     fn drop(&mut self) {
+        // GC-managed (old-gen) frames are reclaimed by a major mark-sweep
+        // when no root reaches them (`pyframe.py class PyFrame(W_Root)`;
+        // `executioncontext.py:91-107 leave` frees nothing).  Their
+        // `PyFrame::drop` side effects (freeing the locals array / debug
+        // data / block chain) run from the registered `PYFRAME_GC_TYPE_ID`
+        // destructor at sweep, not here.  Only the `std::alloc` fallback
+        // box is freed manually — reconstruct and drop it, which runs
+        // `PyFrame::drop` for that block.
+        if pyre_object::gc_hook::try_gc_owns_object(self.ptr as *mut u8) {
+            return;
+        }
         unsafe {
             let prefix = (self.ptr as *mut u8).sub(GC_HEADER_SIZE) as *mut GcFramePrefix;
             drop(Box::from_raw(prefix));
@@ -440,7 +506,33 @@ unsafe fn clear_block_chain(ptr: &mut *mut FrameBlock) {
 
 impl Drop for PyFrame {
     fn drop(&mut self) {
-        if !self.locals_cells_stack_w.is_null() {
+        // Reached only for a `std::alloc`-backed frame (the `FrameBox`
+        // fallback box, or a bare stack `PyFrame`): its `locals_cells_stack_w`
+        // is always a `std::alloc` array, so free it here.  GC-managed frames
+        // never run `PyFrame::drop` (their `FrameBox::drop` returns early);
+        // their contents are freed by the `PYFRAME_GC_TYPE_ID` destructor.
+        unsafe { self.free_owned_contents(true) };
+    }
+}
+
+impl PyFrame {
+    /// Free the frame's owned off-GC resources — the `locals_cells_stack_w`
+    /// array, the `FrameDebugData` box, and the `FrameBlock` chain.  Shared
+    /// by `Drop for PyFrame` (the `std::alloc` fallback path) and the
+    /// `PYFRAME_GC_TYPE_ID` destructor (`pyframe_object_destructor`) run when
+    /// a GC-managed frame is swept.
+    ///
+    /// `free_locals_array` gates freeing `locals_cells_stack_w`: it is a
+    /// `std::alloc` block for every `FrameBox`/stack frame (free it), but a
+    /// GC-managed `PY_OBJECT_ARRAY_GC_TYPE_ID` array for a JIT-built inline
+    /// frame (the GC sweeps it — freeing it here would double-free).  The
+    /// caller decides by querying `try_gc_owns_object` on the array.
+    ///
+    /// # Safety
+    /// Runs at most once per frame — the pointers are nulled as they are
+    /// freed so a second call is a no-op.
+    pub unsafe fn free_owned_contents(&mut self, free_locals_array: bool) {
+        if free_locals_array && !self.locals_cells_stack_w.is_null() {
             unsafe { dealloc_array_with_gc_header(self.locals_cells_stack_w) };
             self.locals_cells_stack_w = std::ptr::null_mut();
         }
@@ -449,9 +541,7 @@ impl Drop for PyFrame {
             clear_block_chain(&mut self.lastblock);
         }
     }
-}
 
-impl PyFrame {
     /// Access locals_cells_stack_w (deref the pointer).
     #[inline]
     pub fn locals_w(&self) -> &FixedObjectArray {
@@ -1316,15 +1406,27 @@ impl PyFrame {
     /// recording a trace to keep the real frame state unchanged until the
     /// interpreter actually executes the same path.
     pub fn snapshot_for_tracing(&self) -> FrameBox {
-        // Frame-LOCAL state (locals_cells_stack_w / valuestackdepth / last_instr)
-        // is COPIED, so snapshot mutations to locals/stack are discarded — that
-        // is the abort-safety the snapshot exists for.  `w_globals` (below) is
-        // the SAME dict ptr, so a concrete shared-heap write during recording
-        // would leak to the real heap and double-apply on the compiled loop's
-        // re-run.  Gap 10 removed that path: the concrete executor is retired,
-        // so inline-frame STORE_GLOBAL is recorded as deferred IR (no concrete
-        // write during the walk) and the compiled loop applies it exactly once.
-        let mut frame = FrameBox::new(PyFrame {
+        // A tracer holds this snapshot off the `CURRENT_FRAME` chain across
+        // the whole `trace_bytecode` walk, during which a major GC cycle can
+        // complete; no root reaches it, so it must NOT have GC lifetime —
+        // `new_boxed` gives it a deterministic scope-end free.
+        let mut frame = FrameBox::new_boxed(self.build_snapshot_frame());
+        // fix_array_ptrs AFTER Box allocation: inline_buf ptr must
+        // point to the heap-allocated frame, not a stale stack address.
+        frame.fix_array_ptrs();
+        frame
+    }
+
+    /// Build the copied `PyFrame` value shared by the tracer snapshot and
+    /// the generator snapshot.  Frame-LOCAL state (`locals_cells_stack_w` /
+    /// `valuestackdepth` / `last_instr`) is COPIED, so snapshot mutations to
+    /// locals/stack are discarded — the abort-safety the snapshot exists
+    /// for.  `w_globals` is the SAME dict ptr, so a concrete shared-heap
+    /// write during recording would leak to the real heap and double-apply
+    /// on the compiled loop's re-run; Gap 10 removed that path (inline-frame
+    /// STORE_GLOBAL records as deferred IR, applied exactly once).
+    fn build_snapshot_frame(&self) -> PyFrame {
+        PyFrame {
             ob_header: frame_ob_header(),
             execution_context: self.execution_context,
             pycode: self.pycode,
@@ -1341,9 +1443,16 @@ impl PyFrame {
             f_backref: self.f_backref,
             w_builtin: self.w_builtin,
             w_globals: self.w_globals,
-        });
-        // fix_array_ptrs AFTER Box allocation: inline_buf ptr must
-        // point to the heap-allocated frame, not a stale stack address.
+        }
+    }
+
+    /// Snapshot a borrowed frame into a GC-managed owned frame for
+    /// `initialize_as_generator`.  Unlike `snapshot_for_tracing` this uses
+    /// `FrameBox::new` (GC lifetime): a generator's suspended frame lives as
+    /// long as the generator object reaches it (`generator.py` holds the
+    /// frame), and the generator's custom trace greys the frame block.
+    pub fn snapshot_for_generator(&self) -> FrameBox {
+        let mut frame = FrameBox::new(self.build_snapshot_frame());
         frame.fix_array_ptrs();
         frame
     }
@@ -2391,8 +2500,10 @@ impl PyFrame {
         // pyframe.py:259 wraps `self` directly. A borrowed `&mut self` cannot
         // hand ownership to the generator, so snapshot into an owned FrameBox
         // first. Callers that already own a FrameBox should use
-        // `FrameBox::into_generator` to skip this copy.
-        self.snapshot_for_tracing().into_generator()
+        // `FrameBox::into_generator` to skip this copy.  Use the GC-managed
+        // snapshot: the generator owns the frame for its whole life, off the
+        // `CURRENT_FRAME` chain, so its lifetime is GC reachability.
+        self.snapshot_for_generator().into_generator()
     }
 
     #[inline]
