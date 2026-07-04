@@ -1308,19 +1308,18 @@ fn float_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         crate::builtins::has_real_kwargs(kwargs),
     )?;
     let value = crate::builtins::builtin_float(value_positional)?;
-    if cls.is_null() || !unsafe { pyre_object::is_type(cls) } {
-        return Ok(value);
-    }
-    let float_typeobj = gettypefor(&pyre_object::FLOAT_TYPE);
-    if float_typeobj.map_or(false, |t| std::ptr::eq(cls, t)) {
-        return Ok(value);
-    }
-    // Subclass path — allocate a fresh W_FloatObject so setattr/w_class
-    // on it don't clobber the value-cached singleton.
+    // tp_new_wrapper (subclass_to_tag) rejects a non-type or non-subtype cls
+    // and returns None for base `float`; a strict subclass retags a fresh
+    // W_FloatObject so setattr / w_class on it don't clobber the value-cached
+    // singleton.
+    let sub = match subclass_to_tag(cls, &pyre_object::FLOAT_TYPE)? {
+        Some(sub) => sub,
+        None => return Ok(value),
+    };
     let float_val = unsafe { pyre_object::w_float_get_value(value) };
     let obj = pyre_object::w_float_new(float_val);
     unsafe {
-        (*obj).w_class = cls;
+        (*obj).w_class = sub;
     }
     Ok(obj)
 }
