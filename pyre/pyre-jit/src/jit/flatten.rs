@@ -3148,7 +3148,7 @@ fn flatten_descr_by_ptr(descr: &super::flow::DescrByPtr) -> Operand {
 /// family; `compare_op_fn_idx` covers the COMPARE_OP family.
 /// `truth_fn_idx`, `setitem_fn_idx`, etc. cover
 /// one per HLOp family that the lowering pass brings online.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct LoweringContext {
     /// `binary_op_fn` descrs-pool index — see codewriter.rs:3081
     /// (`descrs.intern_int_method_index("binary_op_fn", ...)`) for
@@ -7273,39 +7273,7 @@ mod tests {
             compare_op_fn_idx: 13,
             truth_fn_idx: 17,
             store_subscr_fn_idx: 19,
-            getattr_fn_idx: 0,
-            load_name_fn_idx: 0,
-            store_name_fn_idx: 0,
-            store_global_fn_idx: 0,
-            newtuple_from_array_fn_idx: 0,
-            newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 15],
-            load_attr_fn_idx: 0,
-            load_method_self_fn_idx: 0,
-            store_attr_fn_idx: 0,
-            build_map_from_array_fn_idx: 0,
-            binary_slice_fn_idx: 0,
-            delete_subscr_fn_idx: 0,
-            delete_attr_fn_idx: 0,
-            build_set_from_array_fn_idx: 0,
-            build_string_from_array_fn_idx: 0,
-            format_simple_fn_idx: 0,
-            format_with_spec_fn_idx: 0,
-            convert_value_fn_idx: 0,
-            import_name_fn_idx: 0,
-            import_from_fn_idx: 0,
-            load_super_attr_fn_idx: 0,
-            super_attr_unwrap_fn_idx: 0,
-            load_deref_value_fn_idx: 0,
-            store_deref_value_fn_idx: 0,
-            make_cell_fn_idx: 0,
-            unary_negative_fn_idx: 0,
-            unary_invert_fn_idx: 0,
-            unary_positive_fn_idx: 0,
-            unary_not_fn_idx: 0,
-            load_fast_check_fn_idx: 0,
-            list_extend_fn_idx: 0,
-            store_slice_fn_idx: 0,
+            ..Default::default()
         };
         let mut on = SSARepr::new("setattr_on");
         let mut on_regallocs = make_regallocs();
@@ -7434,39 +7402,7 @@ mod tests {
             compare_op_fn_idx: 13,
             truth_fn_idx: 17,
             store_subscr_fn_idx: 19,
-            getattr_fn_idx: 0,
-            load_name_fn_idx: 0,
-            store_name_fn_idx: 0,
-            store_global_fn_idx: 0,
-            newtuple_from_array_fn_idx: 0,
-            newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 15],
-            load_attr_fn_idx: 0,
-            load_method_self_fn_idx: 0,
-            store_attr_fn_idx: 0,
-            build_map_from_array_fn_idx: 0,
-            binary_slice_fn_idx: 0,
-            delete_subscr_fn_idx: 0,
-            delete_attr_fn_idx: 0,
-            build_set_from_array_fn_idx: 0,
-            build_string_from_array_fn_idx: 0,
-            format_simple_fn_idx: 0,
-            format_with_spec_fn_idx: 0,
-            convert_value_fn_idx: 0,
-            import_name_fn_idx: 0,
-            import_from_fn_idx: 0,
-            load_super_attr_fn_idx: 0,
-            super_attr_unwrap_fn_idx: 0,
-            load_deref_value_fn_idx: 0,
-            store_deref_value_fn_idx: 0,
-            make_cell_fn_idx: 0,
-            unary_negative_fn_idx: 0,
-            unary_invert_fn_idx: 0,
-            unary_positive_fn_idx: 0,
-            unary_not_fn_idx: 0,
-            load_fast_check_fn_idx: 0,
-            list_extend_fn_idx: 0,
-            store_slice_fn_idx: 0,
+            ..Default::default()
         };
 
         let mut ssarepr = SSARepr::new("retired_families");
@@ -7582,39 +7518,7 @@ mod tests {
             compare_op_fn_idx: 13,
             truth_fn_idx: 17,
             store_subscr_fn_idx: 19,
-            getattr_fn_idx: 0,
-            load_name_fn_idx: 0,
-            store_name_fn_idx: 0,
-            store_global_fn_idx: 0,
-            newtuple_from_array_fn_idx: 0,
-            newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 15],
-            load_attr_fn_idx: 0,
-            load_method_self_fn_idx: 0,
-            store_attr_fn_idx: 0,
-            build_map_from_array_fn_idx: 0,
-            binary_slice_fn_idx: 0,
-            delete_subscr_fn_idx: 0,
-            delete_attr_fn_idx: 0,
-            build_set_from_array_fn_idx: 0,
-            build_string_from_array_fn_idx: 0,
-            format_simple_fn_idx: 0,
-            format_with_spec_fn_idx: 0,
-            convert_value_fn_idx: 0,
-            import_name_fn_idx: 0,
-            import_from_fn_idx: 0,
-            load_super_attr_fn_idx: 0,
-            super_attr_unwrap_fn_idx: 0,
-            load_deref_value_fn_idx: 0,
-            store_deref_value_fn_idx: 0,
-            make_cell_fn_idx: 0,
-            unary_negative_fn_idx: 0,
-            unary_invert_fn_idx: 0,
-            unary_positive_fn_idx: 0,
-            unary_not_fn_idx: 0,
-            load_fast_check_fn_idx: 0,
-            list_extend_fn_idx: 0,
-            store_slice_fn_idx: 0,
+            ..Default::default()
         };
 
         let mut ssarepr = SSARepr::new("trailing_live");
@@ -7693,39 +7597,7 @@ mod tests {
             compare_op_fn_idx: 13,
             truth_fn_idx: 17,
             store_subscr_fn_idx: 19,
-            getattr_fn_idx: 0,
-            load_name_fn_idx: 0,
-            store_name_fn_idx: 0,
-            store_global_fn_idx: 0,
-            newtuple_from_array_fn_idx: 0,
-            newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 15],
-            load_attr_fn_idx: 0,
-            load_method_self_fn_idx: 0,
-            store_attr_fn_idx: 0,
-            build_map_from_array_fn_idx: 0,
-            binary_slice_fn_idx: 0,
-            delete_subscr_fn_idx: 0,
-            delete_attr_fn_idx: 0,
-            build_set_from_array_fn_idx: 0,
-            build_string_from_array_fn_idx: 0,
-            format_simple_fn_idx: 0,
-            format_with_spec_fn_idx: 0,
-            convert_value_fn_idx: 0,
-            import_name_fn_idx: 0,
-            import_from_fn_idx: 0,
-            load_super_attr_fn_idx: 0,
-            super_attr_unwrap_fn_idx: 0,
-            load_deref_value_fn_idx: 0,
-            store_deref_value_fn_idx: 0,
-            make_cell_fn_idx: 0,
-            unary_negative_fn_idx: 0,
-            unary_invert_fn_idx: 0,
-            unary_positive_fn_idx: 0,
-            unary_not_fn_idx: 0,
-            load_fast_check_fn_idx: 0,
-            list_extend_fn_idx: 0,
-            store_slice_fn_idx: 0,
+            ..Default::default()
         };
 
         let mut ssarepr = SSARepr::new("multi_block_lowering");
@@ -7848,39 +7720,7 @@ mod tests {
             compare_op_fn_idx: 13,
             truth_fn_idx: 17,
             store_subscr_fn_idx: 19,
-            getattr_fn_idx: 0,
-            load_name_fn_idx: 0,
-            store_name_fn_idx: 0,
-            store_global_fn_idx: 0,
-            newtuple_from_array_fn_idx: 0,
-            newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 15],
-            load_attr_fn_idx: 0,
-            load_method_self_fn_idx: 0,
-            store_attr_fn_idx: 0,
-            build_map_from_array_fn_idx: 0,
-            binary_slice_fn_idx: 0,
-            delete_subscr_fn_idx: 0,
-            delete_attr_fn_idx: 0,
-            build_set_from_array_fn_idx: 0,
-            build_string_from_array_fn_idx: 0,
-            format_simple_fn_idx: 0,
-            format_with_spec_fn_idx: 0,
-            convert_value_fn_idx: 0,
-            import_name_fn_idx: 0,
-            import_from_fn_idx: 0,
-            load_super_attr_fn_idx: 0,
-            super_attr_unwrap_fn_idx: 0,
-            load_deref_value_fn_idx: 0,
-            store_deref_value_fn_idx: 0,
-            make_cell_fn_idx: 0,
-            unary_negative_fn_idx: 0,
-            unary_invert_fn_idx: 0,
-            unary_positive_fn_idx: 0,
-            unary_not_fn_idx: 0,
-            load_fast_check_fn_idx: 0,
-            list_extend_fn_idx: 0,
-            store_slice_fn_idx: 0,
+            ..Default::default()
         };
 
         let mut ssarepr = SSARepr::new("pyre_walker_2exit");
@@ -8048,39 +7888,7 @@ mod tests {
             compare_op_fn_idx: 13,
             truth_fn_idx: 17,
             store_subscr_fn_idx: 19,
-            getattr_fn_idx: 0,
-            load_name_fn_idx: 0,
-            store_name_fn_idx: 0,
-            store_global_fn_idx: 0,
-            newtuple_from_array_fn_idx: 0,
-            newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 15],
-            load_attr_fn_idx: 0,
-            load_method_self_fn_idx: 0,
-            store_attr_fn_idx: 0,
-            build_map_from_array_fn_idx: 0,
-            binary_slice_fn_idx: 0,
-            delete_subscr_fn_idx: 0,
-            delete_attr_fn_idx: 0,
-            build_set_from_array_fn_idx: 0,
-            build_string_from_array_fn_idx: 0,
-            format_simple_fn_idx: 0,
-            format_with_spec_fn_idx: 0,
-            convert_value_fn_idx: 0,
-            import_name_fn_idx: 0,
-            import_from_fn_idx: 0,
-            load_super_attr_fn_idx: 0,
-            super_attr_unwrap_fn_idx: 0,
-            load_deref_value_fn_idx: 0,
-            store_deref_value_fn_idx: 0,
-            make_cell_fn_idx: 0,
-            unary_negative_fn_idx: 0,
-            unary_invert_fn_idx: 0,
-            unary_positive_fn_idx: 0,
-            unary_not_fn_idx: 0,
-            load_fast_check_fn_idx: 0,
-            list_extend_fn_idx: 0,
-            store_slice_fn_idx: 0,
+            ..Default::default()
         });
 
         let mut regallocs = perform_register_allocation_all_kinds(&graph);
@@ -8294,42 +8102,7 @@ mod tests {
         let op = SpaceOperation::new("add", vec![lhs.into(), rhs.into()], Some(result.into()), 42);
         let ctx = LoweringContext {
             binary_op_fn_idx: 7,
-            compare_op_fn_idx: 0,
-            truth_fn_idx: 0,
-            store_subscr_fn_idx: 0,
-            getattr_fn_idx: 0,
-            load_name_fn_idx: 0,
-            store_name_fn_idx: 0,
-            store_global_fn_idx: 0,
-            newtuple_from_array_fn_idx: 0,
-            newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 15],
-            load_attr_fn_idx: 0,
-            load_method_self_fn_idx: 0,
-            store_attr_fn_idx: 0,
-            build_map_from_array_fn_idx: 0,
-            binary_slice_fn_idx: 0,
-            delete_subscr_fn_idx: 0,
-            delete_attr_fn_idx: 0,
-            build_set_from_array_fn_idx: 0,
-            build_string_from_array_fn_idx: 0,
-            format_simple_fn_idx: 0,
-            format_with_spec_fn_idx: 0,
-            convert_value_fn_idx: 0,
-            import_name_fn_idx: 0,
-            import_from_fn_idx: 0,
-            load_super_attr_fn_idx: 0,
-            super_attr_unwrap_fn_idx: 0,
-            load_deref_value_fn_idx: 0,
-            store_deref_value_fn_idx: 0,
-            make_cell_fn_idx: 0,
-            unary_negative_fn_idx: 0,
-            unary_invert_fn_idx: 0,
-            unary_positive_fn_idx: 0,
-            unary_not_fn_idx: 0,
-            load_fast_check_fn_idx: 0,
-            list_extend_fn_idx: 0,
-            store_slice_fn_idx: 0,
+            ..Default::default()
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -8409,42 +8182,7 @@ mod tests {
         let op = SpaceOperation::new("bool", vec![v.into()], Some(r.into()), 0);
         let ctx = LoweringContext {
             binary_op_fn_idx: 7,
-            compare_op_fn_idx: 0,
-            truth_fn_idx: 0,
-            store_subscr_fn_idx: 0,
-            getattr_fn_idx: 0,
-            load_name_fn_idx: 0,
-            store_name_fn_idx: 0,
-            store_global_fn_idx: 0,
-            newtuple_from_array_fn_idx: 0,
-            newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 15],
-            load_attr_fn_idx: 0,
-            load_method_self_fn_idx: 0,
-            store_attr_fn_idx: 0,
-            build_map_from_array_fn_idx: 0,
-            binary_slice_fn_idx: 0,
-            delete_subscr_fn_idx: 0,
-            delete_attr_fn_idx: 0,
-            build_set_from_array_fn_idx: 0,
-            build_string_from_array_fn_idx: 0,
-            format_simple_fn_idx: 0,
-            format_with_spec_fn_idx: 0,
-            convert_value_fn_idx: 0,
-            import_name_fn_idx: 0,
-            import_from_fn_idx: 0,
-            load_super_attr_fn_idx: 0,
-            super_attr_unwrap_fn_idx: 0,
-            load_deref_value_fn_idx: 0,
-            store_deref_value_fn_idx: 0,
-            make_cell_fn_idx: 0,
-            unary_negative_fn_idx: 0,
-            unary_invert_fn_idx: 0,
-            unary_positive_fn_idx: 0,
-            unary_not_fn_idx: 0,
-            load_fast_check_fn_idx: 0,
-            list_extend_fn_idx: 0,
-            store_slice_fn_idx: 0,
+            ..Default::default()
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -8468,42 +8206,7 @@ mod tests {
         let result = Variable::new(VariableId(2), Kind::Ref);
         let ctx = LoweringContext {
             binary_op_fn_idx: 11,
-            compare_op_fn_idx: 0,
-            truth_fn_idx: 0,
-            store_subscr_fn_idx: 0,
-            getattr_fn_idx: 0,
-            load_name_fn_idx: 0,
-            store_name_fn_idx: 0,
-            store_global_fn_idx: 0,
-            newtuple_from_array_fn_idx: 0,
-            newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 15],
-            load_attr_fn_idx: 0,
-            load_method_self_fn_idx: 0,
-            store_attr_fn_idx: 0,
-            build_map_from_array_fn_idx: 0,
-            binary_slice_fn_idx: 0,
-            delete_subscr_fn_idx: 0,
-            delete_attr_fn_idx: 0,
-            build_set_from_array_fn_idx: 0,
-            build_string_from_array_fn_idx: 0,
-            format_simple_fn_idx: 0,
-            format_with_spec_fn_idx: 0,
-            convert_value_fn_idx: 0,
-            import_name_fn_idx: 0,
-            import_from_fn_idx: 0,
-            load_super_attr_fn_idx: 0,
-            super_attr_unwrap_fn_idx: 0,
-            load_deref_value_fn_idx: 0,
-            store_deref_value_fn_idx: 0,
-            make_cell_fn_idx: 0,
-            unary_negative_fn_idx: 0,
-            unary_invert_fn_idx: 0,
-            unary_positive_fn_idx: 0,
-            unary_not_fn_idx: 0,
-            load_fast_check_fn_idx: 0,
-            list_extend_fn_idx: 0,
-            store_slice_fn_idx: 0,
+            ..Default::default()
         };
 
         let hlop = SpaceOperation::new("sub", vec![lhs.into(), rhs.into()], Some(result.into()), 0);
@@ -8603,43 +8306,8 @@ mod tests {
         let result = Variable::new(VariableId(2), Kind::Ref);
         let op = SpaceOperation::new("lt", vec![lhs.into(), rhs.into()], Some(result.into()), 7);
         let ctx = LoweringContext {
-            binary_op_fn_idx: 0,
             compare_op_fn_idx: 13,
-            truth_fn_idx: 0,
-            store_subscr_fn_idx: 0,
-            getattr_fn_idx: 0,
-            load_name_fn_idx: 0,
-            store_name_fn_idx: 0,
-            store_global_fn_idx: 0,
-            newtuple_from_array_fn_idx: 0,
-            newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 15],
-            load_attr_fn_idx: 0,
-            load_method_self_fn_idx: 0,
-            store_attr_fn_idx: 0,
-            build_map_from_array_fn_idx: 0,
-            binary_slice_fn_idx: 0,
-            delete_subscr_fn_idx: 0,
-            delete_attr_fn_idx: 0,
-            build_set_from_array_fn_idx: 0,
-            build_string_from_array_fn_idx: 0,
-            format_simple_fn_idx: 0,
-            format_with_spec_fn_idx: 0,
-            convert_value_fn_idx: 0,
-            import_name_fn_idx: 0,
-            import_from_fn_idx: 0,
-            load_super_attr_fn_idx: 0,
-            super_attr_unwrap_fn_idx: 0,
-            load_deref_value_fn_idx: 0,
-            store_deref_value_fn_idx: 0,
-            make_cell_fn_idx: 0,
-            unary_negative_fn_idx: 0,
-            unary_invert_fn_idx: 0,
-            unary_positive_fn_idx: 0,
-            unary_not_fn_idx: 0,
-            load_fast_check_fn_idx: 0,
-            list_extend_fn_idx: 0,
-            store_slice_fn_idx: 0,
+            ..Default::default()
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -8697,43 +8365,8 @@ mod tests {
         let result = Variable::new(VariableId(2), Kind::Ref);
         let op = SpaceOperation::new("is", vec![lhs.into(), rhs.into()], Some(result.into()), 11);
         let ctx = LoweringContext {
-            binary_op_fn_idx: 0,
             compare_op_fn_idx: 13,
-            truth_fn_idx: 0,
-            store_subscr_fn_idx: 0,
-            getattr_fn_idx: 0,
-            load_name_fn_idx: 0,
-            store_name_fn_idx: 0,
-            store_global_fn_idx: 0,
-            newlist_from_array_fn_idx: 0,
-            newtuple_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 15],
-            load_attr_fn_idx: 0,
-            load_method_self_fn_idx: 0,
-            store_attr_fn_idx: 0,
-            build_map_from_array_fn_idx: 0,
-            binary_slice_fn_idx: 0,
-            delete_subscr_fn_idx: 0,
-            delete_attr_fn_idx: 0,
-            build_set_from_array_fn_idx: 0,
-            build_string_from_array_fn_idx: 0,
-            format_simple_fn_idx: 0,
-            format_with_spec_fn_idx: 0,
-            convert_value_fn_idx: 0,
-            import_name_fn_idx: 0,
-            import_from_fn_idx: 0,
-            load_super_attr_fn_idx: 0,
-            super_attr_unwrap_fn_idx: 0,
-            load_deref_value_fn_idx: 0,
-            store_deref_value_fn_idx: 0,
-            make_cell_fn_idx: 0,
-            unary_negative_fn_idx: 0,
-            unary_invert_fn_idx: 0,
-            unary_positive_fn_idx: 0,
-            unary_not_fn_idx: 0,
-            load_fast_check_fn_idx: 0,
-            list_extend_fn_idx: 0,
-            store_slice_fn_idx: 0,
+            ..Default::default()
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -8764,41 +8397,7 @@ mod tests {
         let ctx = LoweringContext {
             binary_op_fn_idx: 7,
             compare_op_fn_idx: 13,
-            truth_fn_idx: 0,
-            store_subscr_fn_idx: 0,
-            getattr_fn_idx: 0,
-            load_name_fn_idx: 0,
-            store_name_fn_idx: 0,
-            store_global_fn_idx: 0,
-            newtuple_from_array_fn_idx: 0,
-            newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 15],
-            load_attr_fn_idx: 0,
-            load_method_self_fn_idx: 0,
-            store_attr_fn_idx: 0,
-            build_map_from_array_fn_idx: 0,
-            binary_slice_fn_idx: 0,
-            delete_subscr_fn_idx: 0,
-            delete_attr_fn_idx: 0,
-            build_set_from_array_fn_idx: 0,
-            build_string_from_array_fn_idx: 0,
-            format_simple_fn_idx: 0,
-            format_with_spec_fn_idx: 0,
-            convert_value_fn_idx: 0,
-            import_name_fn_idx: 0,
-            import_from_fn_idx: 0,
-            load_super_attr_fn_idx: 0,
-            super_attr_unwrap_fn_idx: 0,
-            load_deref_value_fn_idx: 0,
-            store_deref_value_fn_idx: 0,
-            make_cell_fn_idx: 0,
-            unary_negative_fn_idx: 0,
-            unary_invert_fn_idx: 0,
-            unary_positive_fn_idx: 0,
-            unary_not_fn_idx: 0,
-            load_fast_check_fn_idx: 0,
-            list_extend_fn_idx: 0,
-            store_slice_fn_idx: 0,
+            ..Default::default()
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -8819,43 +8418,8 @@ mod tests {
         let rhs = Variable::new(VariableId(1), Kind::Ref);
         let result = Variable::new(VariableId(2), Kind::Ref);
         let ctx = LoweringContext {
-            binary_op_fn_idx: 0,
             compare_op_fn_idx: 17,
-            truth_fn_idx: 0,
-            store_subscr_fn_idx: 0,
-            getattr_fn_idx: 0,
-            load_name_fn_idx: 0,
-            store_name_fn_idx: 0,
-            store_global_fn_idx: 0,
-            newtuple_from_array_fn_idx: 0,
-            newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 15],
-            load_attr_fn_idx: 0,
-            load_method_self_fn_idx: 0,
-            store_attr_fn_idx: 0,
-            build_map_from_array_fn_idx: 0,
-            binary_slice_fn_idx: 0,
-            delete_subscr_fn_idx: 0,
-            delete_attr_fn_idx: 0,
-            build_set_from_array_fn_idx: 0,
-            build_string_from_array_fn_idx: 0,
-            format_simple_fn_idx: 0,
-            format_with_spec_fn_idx: 0,
-            convert_value_fn_idx: 0,
-            import_name_fn_idx: 0,
-            import_from_fn_idx: 0,
-            load_super_attr_fn_idx: 0,
-            super_attr_unwrap_fn_idx: 0,
-            load_deref_value_fn_idx: 0,
-            store_deref_value_fn_idx: 0,
-            make_cell_fn_idx: 0,
-            unary_negative_fn_idx: 0,
-            unary_invert_fn_idx: 0,
-            unary_positive_fn_idx: 0,
-            unary_not_fn_idx: 0,
-            load_fast_check_fn_idx: 0,
-            list_extend_fn_idx: 0,
-            store_slice_fn_idx: 0,
+            ..Default::default()
         };
         let hlop = SpaceOperation::new("eq", vec![lhs.into(), rhs.into()], Some(result.into()), 0);
         let mut get_register = identity_register_mapper();
@@ -8883,43 +8447,8 @@ mod tests {
         let result = Variable::new(VariableId(1), Kind::Int);
         let op = SpaceOperation::new("bool", vec![cond.into()], Some(result.into()), 5);
         let ctx = LoweringContext {
-            binary_op_fn_idx: 0,
-            compare_op_fn_idx: 0,
             truth_fn_idx: 23,
-            store_subscr_fn_idx: 0,
-            getattr_fn_idx: 0,
-            load_name_fn_idx: 0,
-            store_name_fn_idx: 0,
-            store_global_fn_idx: 0,
-            newtuple_from_array_fn_idx: 0,
-            newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 15],
-            load_attr_fn_idx: 0,
-            load_method_self_fn_idx: 0,
-            store_attr_fn_idx: 0,
-            build_map_from_array_fn_idx: 0,
-            binary_slice_fn_idx: 0,
-            delete_subscr_fn_idx: 0,
-            delete_attr_fn_idx: 0,
-            build_set_from_array_fn_idx: 0,
-            build_string_from_array_fn_idx: 0,
-            format_simple_fn_idx: 0,
-            format_with_spec_fn_idx: 0,
-            convert_value_fn_idx: 0,
-            import_name_fn_idx: 0,
-            import_from_fn_idx: 0,
-            load_super_attr_fn_idx: 0,
-            super_attr_unwrap_fn_idx: 0,
-            load_deref_value_fn_idx: 0,
-            store_deref_value_fn_idx: 0,
-            make_cell_fn_idx: 0,
-            unary_negative_fn_idx: 0,
-            unary_invert_fn_idx: 0,
-            unary_positive_fn_idx: 0,
-            unary_not_fn_idx: 0,
-            load_fast_check_fn_idx: 0,
-            list_extend_fn_idx: 0,
-            store_slice_fn_idx: 0,
+            ..Default::default()
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -8974,43 +8503,8 @@ mod tests {
         let result = Variable::new(VariableId(1), Kind::Int);
         let op = SpaceOperation::new("neg", vec![cond.into()], Some(result.into()), 0);
         let ctx = LoweringContext {
-            binary_op_fn_idx: 0,
-            compare_op_fn_idx: 0,
             truth_fn_idx: 23,
-            store_subscr_fn_idx: 0,
-            getattr_fn_idx: 0,
-            load_name_fn_idx: 0,
-            store_name_fn_idx: 0,
-            store_global_fn_idx: 0,
-            newtuple_from_array_fn_idx: 0,
-            newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 15],
-            load_attr_fn_idx: 0,
-            load_method_self_fn_idx: 0,
-            store_attr_fn_idx: 0,
-            build_map_from_array_fn_idx: 0,
-            binary_slice_fn_idx: 0,
-            delete_subscr_fn_idx: 0,
-            delete_attr_fn_idx: 0,
-            build_set_from_array_fn_idx: 0,
-            build_string_from_array_fn_idx: 0,
-            format_simple_fn_idx: 0,
-            format_with_spec_fn_idx: 0,
-            convert_value_fn_idx: 0,
-            import_name_fn_idx: 0,
-            import_from_fn_idx: 0,
-            load_super_attr_fn_idx: 0,
-            super_attr_unwrap_fn_idx: 0,
-            load_deref_value_fn_idx: 0,
-            store_deref_value_fn_idx: 0,
-            make_cell_fn_idx: 0,
-            unary_negative_fn_idx: 0,
-            unary_invert_fn_idx: 0,
-            unary_positive_fn_idx: 0,
-            unary_not_fn_idx: 0,
-            load_fast_check_fn_idx: 0,
-            list_extend_fn_idx: 0,
-            store_slice_fn_idx: 0,
+            ..Default::default()
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -9028,43 +8522,8 @@ mod tests {
         let cond = Variable::new(VariableId(0), Kind::Ref);
         let result = Variable::new(VariableId(1), Kind::Int);
         let ctx = LoweringContext {
-            binary_op_fn_idx: 0,
-            compare_op_fn_idx: 0,
             truth_fn_idx: 31,
-            store_subscr_fn_idx: 0,
-            getattr_fn_idx: 0,
-            load_name_fn_idx: 0,
-            store_name_fn_idx: 0,
-            store_global_fn_idx: 0,
-            newtuple_from_array_fn_idx: 0,
-            newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 15],
-            load_attr_fn_idx: 0,
-            load_method_self_fn_idx: 0,
-            store_attr_fn_idx: 0,
-            build_map_from_array_fn_idx: 0,
-            binary_slice_fn_idx: 0,
-            delete_subscr_fn_idx: 0,
-            delete_attr_fn_idx: 0,
-            build_set_from_array_fn_idx: 0,
-            build_string_from_array_fn_idx: 0,
-            format_simple_fn_idx: 0,
-            format_with_spec_fn_idx: 0,
-            convert_value_fn_idx: 0,
-            import_name_fn_idx: 0,
-            import_from_fn_idx: 0,
-            load_super_attr_fn_idx: 0,
-            super_attr_unwrap_fn_idx: 0,
-            load_deref_value_fn_idx: 0,
-            store_deref_value_fn_idx: 0,
-            make_cell_fn_idx: 0,
-            unary_negative_fn_idx: 0,
-            unary_invert_fn_idx: 0,
-            unary_positive_fn_idx: 0,
-            unary_not_fn_idx: 0,
-            load_fast_check_fn_idx: 0,
-            list_extend_fn_idx: 0,
-            store_slice_fn_idx: 0,
+            ..Default::default()
         };
         let hlop = SpaceOperation::new("bool", vec![cond.into()], Some(result.into()), 0);
         let mut get_register = identity_register_mapper();
@@ -9096,43 +8555,8 @@ mod tests {
             11,
         );
         let ctx = LoweringContext {
-            binary_op_fn_idx: 0,
-            compare_op_fn_idx: 0,
-            truth_fn_idx: 0,
             store_subscr_fn_idx: 41,
-            getattr_fn_idx: 0,
-            load_name_fn_idx: 0,
-            store_name_fn_idx: 0,
-            store_global_fn_idx: 0,
-            newtuple_from_array_fn_idx: 0,
-            newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 15],
-            load_attr_fn_idx: 0,
-            load_method_self_fn_idx: 0,
-            store_attr_fn_idx: 0,
-            build_map_from_array_fn_idx: 0,
-            binary_slice_fn_idx: 0,
-            delete_subscr_fn_idx: 0,
-            delete_attr_fn_idx: 0,
-            build_set_from_array_fn_idx: 0,
-            build_string_from_array_fn_idx: 0,
-            format_simple_fn_idx: 0,
-            format_with_spec_fn_idx: 0,
-            convert_value_fn_idx: 0,
-            import_name_fn_idx: 0,
-            import_from_fn_idx: 0,
-            load_super_attr_fn_idx: 0,
-            super_attr_unwrap_fn_idx: 0,
-            load_deref_value_fn_idx: 0,
-            store_deref_value_fn_idx: 0,
-            make_cell_fn_idx: 0,
-            unary_negative_fn_idx: 0,
-            unary_invert_fn_idx: 0,
-            unary_positive_fn_idx: 0,
-            unary_not_fn_idx: 0,
-            load_fast_check_fn_idx: 0,
-            list_extend_fn_idx: 0,
-            store_slice_fn_idx: 0,
+            ..Default::default()
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -9243,43 +8667,8 @@ mod tests {
         // Wrong opname.
         let op = SpaceOperation::new("getitem", vec![v.into(), v.into(), v.into()], None, 0);
         let ctx = LoweringContext {
-            binary_op_fn_idx: 0,
-            compare_op_fn_idx: 0,
-            truth_fn_idx: 0,
             store_subscr_fn_idx: 41,
-            getattr_fn_idx: 0,
-            load_name_fn_idx: 0,
-            store_name_fn_idx: 0,
-            store_global_fn_idx: 0,
-            newtuple_from_array_fn_idx: 0,
-            newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 15],
-            load_attr_fn_idx: 0,
-            load_method_self_fn_idx: 0,
-            store_attr_fn_idx: 0,
-            build_map_from_array_fn_idx: 0,
-            binary_slice_fn_idx: 0,
-            delete_subscr_fn_idx: 0,
-            delete_attr_fn_idx: 0,
-            build_set_from_array_fn_idx: 0,
-            build_string_from_array_fn_idx: 0,
-            format_simple_fn_idx: 0,
-            format_with_spec_fn_idx: 0,
-            convert_value_fn_idx: 0,
-            import_name_fn_idx: 0,
-            import_from_fn_idx: 0,
-            load_super_attr_fn_idx: 0,
-            super_attr_unwrap_fn_idx: 0,
-            load_deref_value_fn_idx: 0,
-            store_deref_value_fn_idx: 0,
-            make_cell_fn_idx: 0,
-            unary_negative_fn_idx: 0,
-            unary_invert_fn_idx: 0,
-            unary_positive_fn_idx: 0,
-            unary_not_fn_idx: 0,
-            load_fast_check_fn_idx: 0,
-            list_extend_fn_idx: 0,
-            store_slice_fn_idx: 0,
+            ..Default::default()
         };
         let mut get_register = identity_register_mapper();
         let mut lower_constant = test_constant_lowering();
@@ -9312,43 +8701,8 @@ mod tests {
         let key = Variable::new(VariableId(1), Kind::Ref);
         let value = Variable::new(VariableId(2), Kind::Ref);
         let ctx = LoweringContext {
-            binary_op_fn_idx: 0,
-            compare_op_fn_idx: 0,
-            truth_fn_idx: 0,
             store_subscr_fn_idx: 53,
-            getattr_fn_idx: 0,
-            load_name_fn_idx: 0,
-            store_name_fn_idx: 0,
-            store_global_fn_idx: 0,
-            newtuple_from_array_fn_idx: 0,
-            newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 15],
-            load_attr_fn_idx: 0,
-            load_method_self_fn_idx: 0,
-            store_attr_fn_idx: 0,
-            build_map_from_array_fn_idx: 0,
-            binary_slice_fn_idx: 0,
-            delete_subscr_fn_idx: 0,
-            delete_attr_fn_idx: 0,
-            build_set_from_array_fn_idx: 0,
-            build_string_from_array_fn_idx: 0,
-            format_simple_fn_idx: 0,
-            format_with_spec_fn_idx: 0,
-            convert_value_fn_idx: 0,
-            import_name_fn_idx: 0,
-            import_from_fn_idx: 0,
-            load_super_attr_fn_idx: 0,
-            super_attr_unwrap_fn_idx: 0,
-            load_deref_value_fn_idx: 0,
-            store_deref_value_fn_idx: 0,
-            make_cell_fn_idx: 0,
-            unary_negative_fn_idx: 0,
-            unary_invert_fn_idx: 0,
-            unary_positive_fn_idx: 0,
-            unary_not_fn_idx: 0,
-            load_fast_check_fn_idx: 0,
-            list_extend_fn_idx: 0,
-            store_slice_fn_idx: 0,
+            ..Default::default()
         };
         let hlop = SpaceOperation::new(
             "setitem",
@@ -9400,39 +8754,7 @@ mod tests {
             compare_op_fn_idx: 19,
             truth_fn_idx: 31,
             store_subscr_fn_idx: 53,
-            getattr_fn_idx: 0,
-            load_name_fn_idx: 0,
-            store_name_fn_idx: 0,
-            store_global_fn_idx: 0,
-            newtuple_from_array_fn_idx: 0,
-            newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 15],
-            load_attr_fn_idx: 0,
-            load_method_self_fn_idx: 0,
-            store_attr_fn_idx: 0,
-            build_map_from_array_fn_idx: 0,
-            binary_slice_fn_idx: 0,
-            delete_subscr_fn_idx: 0,
-            delete_attr_fn_idx: 0,
-            build_set_from_array_fn_idx: 0,
-            build_string_from_array_fn_idx: 0,
-            format_simple_fn_idx: 0,
-            format_with_spec_fn_idx: 0,
-            convert_value_fn_idx: 0,
-            import_name_fn_idx: 0,
-            import_from_fn_idx: 0,
-            load_super_attr_fn_idx: 0,
-            super_attr_unwrap_fn_idx: 0,
-            load_deref_value_fn_idx: 0,
-            store_deref_value_fn_idx: 0,
-            make_cell_fn_idx: 0,
-            unary_negative_fn_idx: 0,
-            unary_invert_fn_idx: 0,
-            unary_positive_fn_idx: 0,
-            unary_not_fn_idx: 0,
-            load_fast_check_fn_idx: 0,
-            list_extend_fn_idx: 0,
-            store_slice_fn_idx: 0,
+            ..Default::default()
         };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -9460,39 +8782,7 @@ mod tests {
             compare_op_fn_idx: 19,
             truth_fn_idx: 31,
             store_subscr_fn_idx: 53,
-            getattr_fn_idx: 0,
-            load_name_fn_idx: 0,
-            store_name_fn_idx: 0,
-            store_global_fn_idx: 0,
-            newtuple_from_array_fn_idx: 0,
-            newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 15],
-            load_attr_fn_idx: 0,
-            load_method_self_fn_idx: 0,
-            store_attr_fn_idx: 0,
-            build_map_from_array_fn_idx: 0,
-            binary_slice_fn_idx: 0,
-            delete_subscr_fn_idx: 0,
-            delete_attr_fn_idx: 0,
-            build_set_from_array_fn_idx: 0,
-            build_string_from_array_fn_idx: 0,
-            format_simple_fn_idx: 0,
-            format_with_spec_fn_idx: 0,
-            convert_value_fn_idx: 0,
-            import_name_fn_idx: 0,
-            import_from_fn_idx: 0,
-            load_super_attr_fn_idx: 0,
-            super_attr_unwrap_fn_idx: 0,
-            load_deref_value_fn_idx: 0,
-            store_deref_value_fn_idx: 0,
-            make_cell_fn_idx: 0,
-            unary_negative_fn_idx: 0,
-            unary_invert_fn_idx: 0,
-            unary_positive_fn_idx: 0,
-            unary_not_fn_idx: 0,
-            load_fast_check_fn_idx: 0,
-            list_extend_fn_idx: 0,
-            store_slice_fn_idx: 0,
+            ..Default::default()
         };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -9520,39 +8810,7 @@ mod tests {
             compare_op_fn_idx: 19,
             truth_fn_idx: 31,
             store_subscr_fn_idx: 53,
-            getattr_fn_idx: 0,
-            load_name_fn_idx: 0,
-            store_name_fn_idx: 0,
-            store_global_fn_idx: 0,
-            newtuple_from_array_fn_idx: 0,
-            newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 15],
-            load_attr_fn_idx: 0,
-            load_method_self_fn_idx: 0,
-            store_attr_fn_idx: 0,
-            build_map_from_array_fn_idx: 0,
-            binary_slice_fn_idx: 0,
-            delete_subscr_fn_idx: 0,
-            delete_attr_fn_idx: 0,
-            build_set_from_array_fn_idx: 0,
-            build_string_from_array_fn_idx: 0,
-            format_simple_fn_idx: 0,
-            format_with_spec_fn_idx: 0,
-            convert_value_fn_idx: 0,
-            import_name_fn_idx: 0,
-            import_from_fn_idx: 0,
-            load_super_attr_fn_idx: 0,
-            super_attr_unwrap_fn_idx: 0,
-            load_deref_value_fn_idx: 0,
-            store_deref_value_fn_idx: 0,
-            make_cell_fn_idx: 0,
-            unary_negative_fn_idx: 0,
-            unary_invert_fn_idx: 0,
-            unary_positive_fn_idx: 0,
-            unary_not_fn_idx: 0,
-            load_fast_check_fn_idx: 0,
-            list_extend_fn_idx: 0,
-            store_slice_fn_idx: 0,
+            ..Default::default()
         };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -9585,39 +8843,7 @@ mod tests {
             compare_op_fn_idx: 19,
             truth_fn_idx: 31,
             store_subscr_fn_idx: 53,
-            getattr_fn_idx: 0,
-            load_name_fn_idx: 0,
-            store_name_fn_idx: 0,
-            store_global_fn_idx: 0,
-            newtuple_from_array_fn_idx: 0,
-            newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 15],
-            load_attr_fn_idx: 0,
-            load_method_self_fn_idx: 0,
-            store_attr_fn_idx: 0,
-            build_map_from_array_fn_idx: 0,
-            binary_slice_fn_idx: 0,
-            delete_subscr_fn_idx: 0,
-            delete_attr_fn_idx: 0,
-            build_set_from_array_fn_idx: 0,
-            build_string_from_array_fn_idx: 0,
-            format_simple_fn_idx: 0,
-            format_with_spec_fn_idx: 0,
-            convert_value_fn_idx: 0,
-            import_name_fn_idx: 0,
-            import_from_fn_idx: 0,
-            load_super_attr_fn_idx: 0,
-            super_attr_unwrap_fn_idx: 0,
-            load_deref_value_fn_idx: 0,
-            store_deref_value_fn_idx: 0,
-            make_cell_fn_idx: 0,
-            unary_negative_fn_idx: 0,
-            unary_invert_fn_idx: 0,
-            unary_positive_fn_idx: 0,
-            unary_not_fn_idx: 0,
-            load_fast_check_fn_idx: 0,
-            list_extend_fn_idx: 0,
-            store_slice_fn_idx: 0,
+            ..Default::default()
         };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -9664,39 +8890,7 @@ mod tests {
             compare_op_fn_idx: 19,
             truth_fn_idx: 31,
             store_subscr_fn_idx: 53,
-            getattr_fn_idx: 0,
-            load_name_fn_idx: 0,
-            store_name_fn_idx: 0,
-            store_global_fn_idx: 0,
-            newtuple_from_array_fn_idx: 0,
-            newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 15],
-            load_attr_fn_idx: 0,
-            load_method_self_fn_idx: 0,
-            store_attr_fn_idx: 0,
-            build_map_from_array_fn_idx: 0,
-            binary_slice_fn_idx: 0,
-            delete_subscr_fn_idx: 0,
-            delete_attr_fn_idx: 0,
-            build_set_from_array_fn_idx: 0,
-            build_string_from_array_fn_idx: 0,
-            format_simple_fn_idx: 0,
-            format_with_spec_fn_idx: 0,
-            convert_value_fn_idx: 0,
-            import_name_fn_idx: 0,
-            import_from_fn_idx: 0,
-            load_super_attr_fn_idx: 0,
-            super_attr_unwrap_fn_idx: 0,
-            load_deref_value_fn_idx: 0,
-            store_deref_value_fn_idx: 0,
-            make_cell_fn_idx: 0,
-            unary_negative_fn_idx: 0,
-            unary_invert_fn_idx: 0,
-            unary_positive_fn_idx: 0,
-            unary_not_fn_idx: 0,
-            load_fast_check_fn_idx: 0,
-            list_extend_fn_idx: 0,
-            store_slice_fn_idx: 0,
+            ..Default::default()
         };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
@@ -10837,45 +10031,7 @@ mod tests {
         start.closeblock(exits);
 
         let mut ssarepr = SSARepr::new(name);
-        let ctx = LoweringContext {
-            binary_op_fn_idx: 0,
-            compare_op_fn_idx: 0,
-            truth_fn_idx: 0,
-            store_subscr_fn_idx: 0,
-            getattr_fn_idx: 0,
-            load_name_fn_idx: 0,
-            store_name_fn_idx: 0,
-            store_global_fn_idx: 0,
-            newtuple_from_array_fn_idx: 0,
-            newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 15],
-            load_attr_fn_idx: 0,
-            load_method_self_fn_idx: 0,
-            store_attr_fn_idx: 0,
-            build_map_from_array_fn_idx: 0,
-            binary_slice_fn_idx: 0,
-            delete_subscr_fn_idx: 0,
-            delete_attr_fn_idx: 0,
-            build_set_from_array_fn_idx: 0,
-            build_string_from_array_fn_idx: 0,
-            format_simple_fn_idx: 0,
-            format_with_spec_fn_idx: 0,
-            convert_value_fn_idx: 0,
-            import_name_fn_idx: 0,
-            import_from_fn_idx: 0,
-            load_super_attr_fn_idx: 0,
-            super_attr_unwrap_fn_idx: 0,
-            load_deref_value_fn_idx: 0,
-            store_deref_value_fn_idx: 0,
-            make_cell_fn_idx: 0,
-            unary_negative_fn_idx: 0,
-            unary_invert_fn_idx: 0,
-            unary_positive_fn_idx: 0,
-            unary_not_fn_idx: 0,
-            load_fast_check_fn_idx: 0,
-            list_extend_fn_idx: 0,
-            store_slice_fn_idx: 0,
-        };
+        let ctx = LoweringContext::default();
         flatten_graph_for_test_with_lowering(&graph, &mut ssarepr, ctx, Some(cpu));
         ssarepr
     }
@@ -11138,45 +10294,7 @@ mod tests {
         let result_var = Variable::new(VariableId(9), Kind::Ref);
         let mut call_fn_idx_by_nargs = [0u16; 15];
         call_fn_idx_by_nargs[0] = 42;
-        let ctx = LoweringContext {
-            binary_op_fn_idx: 0,
-            compare_op_fn_idx: 0,
-            truth_fn_idx: 0,
-            store_subscr_fn_idx: 0,
-            getattr_fn_idx: 0,
-            load_name_fn_idx: 0,
-            store_name_fn_idx: 0,
-            store_global_fn_idx: 0,
-            newtuple_from_array_fn_idx: 0,
-            newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs,
-            load_attr_fn_idx: 0,
-            load_method_self_fn_idx: 0,
-            store_attr_fn_idx: 0,
-            build_map_from_array_fn_idx: 0,
-            binary_slice_fn_idx: 0,
-            delete_subscr_fn_idx: 0,
-            delete_attr_fn_idx: 0,
-            build_set_from_array_fn_idx: 0,
-            build_string_from_array_fn_idx: 0,
-            format_simple_fn_idx: 0,
-            format_with_spec_fn_idx: 0,
-            convert_value_fn_idx: 0,
-            import_name_fn_idx: 0,
-            import_from_fn_idx: 0,
-            load_super_attr_fn_idx: 0,
-            super_attr_unwrap_fn_idx: 0,
-            load_deref_value_fn_idx: 0,
-            store_deref_value_fn_idx: 0,
-            make_cell_fn_idx: 0,
-            unary_negative_fn_idx: 0,
-            unary_invert_fn_idx: 0,
-            unary_positive_fn_idx: 0,
-            unary_not_fn_idx: 0,
-            load_fast_check_fn_idx: 0,
-            list_extend_fn_idx: 0,
-            store_slice_fn_idx: 0,
-        };
+        let ctx = LoweringContext::default();
         let null_or_self_var = Variable::new(VariableId(10), Kind::Ref);
         let op = super::super::flow::SpaceOperation::new(
             "simple_call",
@@ -11327,19 +10445,10 @@ mod tests {
     /// `co_names` index) the 4-arg HLOp shape threads through.
     fn load_attr_lowering_fixture() -> (LoweringContext, Constant, Constant) {
         let ctx = LoweringContext {
-            binary_op_fn_idx: 0,
-            compare_op_fn_idx: 0,
-            truth_fn_idx: 0,
-            store_subscr_fn_idx: 0,
-            newtuple_from_array_fn_idx: 0,
-            newlist_from_array_fn_idx: 0,
-            call_fn_idx_by_nargs: [0; 15],
-            getattr_fn_idx: 0,
             load_attr_fn_idx: 91,
             load_method_self_fn_idx: 92,
             load_name_fn_idx: 93,
             store_name_fn_idx: 94,
-            store_global_fn_idx: 0,
             store_attr_fn_idx: 95,
             build_map_from_array_fn_idx: 96,
             binary_slice_fn_idx: 97,
@@ -11363,7 +10472,8 @@ mod tests {
             store_deref_value_fn_idx: 114,
             make_cell_fn_idx: 115,
             store_slice_fn_idx: 116,
-            unary_positive_fn_idx: 117,
+            unary_positive_fn_idx: 118,
+            ..Default::default()
         };
         let code_const = Constant::new(
             super::super::flow::ConstantValue::Signed(0x2000),
@@ -12225,17 +11335,25 @@ mod tests {
         }
     }
 
-    #[test]
-    fn lower_unary_invert_hlop_emits_unary_invert_fn_residual() {
-        // `invert(value)` →
-        // `residual_call_r_r(ConstInt(unary_invert_fn_idx), ListR([value]),
-        // Descr) → reg` (MayForce — a user `__invert__` may run Python).
-        // Same single-Ref shape as FORMAT_SIMPLE.
+    /// Shared body for the single-Ref unary HLOp lowerings (`invert`, `pos`,
+    /// `not_`): each records `<op_name>(value)` and lowers to
+    /// `residual_call_r_r(ConstInt(expected_fn_idx), ListR([value]), Descr)`
+    /// returning reg. `lower` selects the specific `lower_unary_*_hlop_to_insn`.
+    fn assert_unary_lowering_emits_residual(
+        op_name: &str,
+        expected_fn_idx: i64,
+        lower: impl FnOnce(
+            &super::super::flow::SpaceOperation,
+            &LoweringContext,
+            &mut dyn FnMut(Variable) -> Register,
+            &mut dyn FnMut(&Constant) -> Operand,
+        ) -> Option<Insn>,
+    ) {
         let value_var = Variable::new(VariableId(8), Kind::Ref);
         let result_var = Variable::new(VariableId(9), Kind::Ref);
         let (ctx, _, _) = load_attr_lowering_fixture();
         let op = super::super::flow::SpaceOperation::new(
-            "invert",
+            op_name,
             vec![value_var.into()],
             Some(result_var.into()),
             0,
@@ -12252,13 +11370,8 @@ mod tests {
             _ => panic!("unexpected var id {:?}", var.id),
         };
         let mut lower_constant = super::flatten_constant_operand_for_test;
-        let insn = super::lower_unary_invert_hlop_to_insn(
-            &op,
-            &ctx,
-            &mut get_register,
-            &mut lower_constant,
-        )
-        .expect("1-arg unary_invert lowering must succeed");
+        let insn = lower(&op, &ctx, &mut get_register, &mut lower_constant)
+            .unwrap_or_else(|| panic!("1-arg {op_name} lowering must succeed"));
         match insn {
             Insn::Op {
                 opname,
@@ -12267,8 +11380,8 @@ mod tests {
             } => {
                 assert_eq!(opname, "residual_call_r_r");
                 assert!(
-                    matches!(args[0], Operand::ConstInt(109)),
-                    "unary_invert_fn pool index, got {:?}",
+                    matches!(args[0], Operand::ConstInt(idx) if idx == expected_fn_idx),
+                    "{op_name}_fn pool index {expected_fn_idx}, got {:?}",
                     args[0]
                 );
                 match &args[1] {
@@ -12292,140 +11405,30 @@ mod tests {
             }
             _ => panic!("expected Insn::Op, got {insn:?}"),
         }
+    }
+
+    #[test]
+    fn lower_unary_invert_hlop_emits_unary_invert_fn_residual() {
+        // MayForce — a user `__invert__` may run Python.
+        assert_unary_lowering_emits_residual("invert", 109, |op, ctx, gr, lc| {
+            super::lower_unary_invert_hlop_to_insn(op, ctx, &mut |v| gr(v), &mut |c| lc(c))
+        });
     }
 
     #[test]
     fn lower_unary_positive_hlop_emits_unary_positive_fn_residual() {
-        // `pos(value)` →
-        // `residual_call_r_r(ConstInt(unary_positive_fn_idx), ListR([value]),
-        // Descr) → reg` (MayForce — a user `__pos__` may run Python).
-        // Same single-Ref shape as FORMAT_SIMPLE.
-        let value_var = Variable::new(VariableId(8), Kind::Ref);
-        let result_var = Variable::new(VariableId(9), Kind::Ref);
-        let (ctx, _, _) = load_attr_lowering_fixture();
-        let op = super::super::flow::SpaceOperation::new(
-            "pos",
-            vec![value_var.into()],
-            Some(result_var.into()),
-            0,
-        );
-        let mut get_register = |var: Variable| match var.id {
-            VariableId(8) => Register {
-                kind: Kind::Ref,
-                index: 101,
-            },
-            VariableId(9) => Register {
-                kind: Kind::Ref,
-                index: 102,
-            },
-            _ => panic!("unexpected var id {:?}", var.id),
-        };
-        let mut lower_constant = super::flatten_constant_operand_for_test;
-        let insn = super::lower_unary_positive_hlop_to_insn(
-            &op,
-            &ctx,
-            &mut get_register,
-            &mut lower_constant,
-        )
-        .expect("1-arg unary_positive lowering must succeed");
-        match insn {
-            Insn::Op {
-                opname,
-                args,
-                result,
-            } => {
-                assert_eq!(opname, "residual_call_r_r");
-                assert!(
-                    matches!(args[0], Operand::ConstInt(117)),
-                    "unary_positive_fn pool index, got {:?}",
-                    args[0]
-                );
-                match &args[1] {
-                    Operand::ListOfKind(list) => {
-                        assert_eq!(list.kind, Kind::Ref);
-                        assert!(
-                            matches!(&list.content[..], [Operand::Register(r)] if r.index == 101),
-                            "ListR = [value], got {:?}",
-                            list.content
-                        );
-                    }
-                    other => panic!("expected ListR, got {other:?}"),
-                }
-                assert_eq!(
-                    result,
-                    Some(Register {
-                        kind: Kind::Ref,
-                        index: 102
-                    }),
-                );
-            }
-            _ => panic!("expected Insn::Op, got {insn:?}"),
-        }
+        // MayForce — a user `__pos__` may run Python.
+        assert_unary_lowering_emits_residual("pos", 118, |op, ctx, gr, lc| {
+            super::lower_unary_positive_hlop_to_insn(op, ctx, &mut |v| gr(v), &mut |c| lc(c))
+        });
     }
 
     #[test]
     fn lower_unary_not_hlop_emits_unary_not_fn_residual() {
-        // `not_(value)` →
-        // `residual_call_r_r(ConstInt(unary_not_fn_idx), ListR([value]),
-        // Descr) → reg` (MayForce — a user `__bool__` / `__len__` may run
-        // Python).  Same single-Ref shape as FORMAT_SIMPLE.
-        let value_var = Variable::new(VariableId(8), Kind::Ref);
-        let result_var = Variable::new(VariableId(9), Kind::Ref);
-        let (ctx, _, _) = load_attr_lowering_fixture();
-        let op = super::super::flow::SpaceOperation::new(
-            "not_",
-            vec![value_var.into()],
-            Some(result_var.into()),
-            0,
-        );
-        let mut get_register = |var: Variable| match var.id {
-            VariableId(8) => Register {
-                kind: Kind::Ref,
-                index: 101,
-            },
-            VariableId(9) => Register {
-                kind: Kind::Ref,
-                index: 102,
-            },
-            _ => panic!("unexpected var id {:?}", var.id),
-        };
-        let mut lower_constant = super::flatten_constant_operand_for_test;
-        let insn =
-            super::lower_unary_not_hlop_to_insn(&op, &ctx, &mut get_register, &mut lower_constant)
-                .expect("1-arg unary_not lowering must succeed");
-        match insn {
-            Insn::Op {
-                opname,
-                args,
-                result,
-            } => {
-                assert_eq!(opname, "residual_call_r_r");
-                assert!(
-                    matches!(args[0], Operand::ConstInt(110)),
-                    "unary_not_fn pool index, got {:?}",
-                    args[0]
-                );
-                match &args[1] {
-                    Operand::ListOfKind(list) => {
-                        assert_eq!(list.kind, Kind::Ref);
-                        assert!(
-                            matches!(&list.content[..], [Operand::Register(r)] if r.index == 101),
-                            "ListR = [value], got {:?}",
-                            list.content
-                        );
-                    }
-                    other => panic!("expected ListR, got {other:?}"),
-                }
-                assert_eq!(
-                    result,
-                    Some(Register {
-                        kind: Kind::Ref,
-                        index: 102
-                    }),
-                );
-            }
-            _ => panic!("expected Insn::Op, got {insn:?}"),
-        }
+        // MayForce — a user `__bool__` / `__len__` may run Python.
+        assert_unary_lowering_emits_residual("not_", 110, |op, ctx, gr, lc| {
+            super::lower_unary_not_hlop_to_insn(op, ctx, &mut |v| gr(v), &mut |c| lc(c))
+        });
     }
 
     #[test]
