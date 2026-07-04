@@ -4405,21 +4405,20 @@ fn ptr_nullity_record(
         OpCode::PtrEq
     };
     let result = ctx.trace_ctx.record_op(opcode, &[box_, null_const]);
-    // Concrete stamp: prefer the box's own value carrier.  Inside an inline
-    // sub-walk the operand is often a callee argument whose concrete pointer
-    // lives only in the walk's ref-register shadow (seeded by
-    // `run_sub_jitcode_walk` / the inline-call setup), not on the box, so fall
-    // back to that shadow there.  A non-`Ref` shadow (`Null`) means the
-    // pointer is untracked, not provably null — leave the result symbolic.
+    // Concrete stamp: prefer the box's own value carrier (constant pool /
+    // standard-virtualizable shadow / `set_opref_concrete` stamp).  When the
+    // OpRef has no intrinsic concrete (e.g. a residual-call result whose
+    // executor was gated off, or an inline sub-walk callee argument whose
+    // concrete pointer lives only in the walk's ref-register shadow), fall
+    // back to the register's concrete shadow (`concrete_registers_r`).
+    // A non-`Ref` shadow (`Null`) means the pointer is untracked, not
+    // provably null — leave the result symbolic.
     let nonnull = match ctx.trace_ctx.box_value(box_) {
         Some(majit_ir::Value::Ref(r)) => Some(r.0 != 0),
-        _ if INLINE_SUBWALK_CAPTURE_BOUNDARY.with(|c| c.get()) => {
-            match read_ref_reg_concrete(code, op, 0, ctx) {
-                ConcreteValue::Ref(p) => Some(!p.is_null()),
-                _ => None,
-            }
-        }
-        _ => None,
+        _ => match read_ref_reg_concrete(code, op, 0, ctx) {
+            ConcreteValue::Ref(p) => Some(!p.is_null()),
+            _ => None,
+        },
     };
     if let Some(nonnull) = nonnull {
         ctx.trace_ctx
