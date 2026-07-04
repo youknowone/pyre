@@ -110,6 +110,17 @@ pub struct Cpu {
     /// LIST_EXTEND residual — `(list, iterable) → void` (`list.extend(iterable)`,
     /// list peeked + mutated in place).
     pub list_extend_fn: extern "C" fn(i64, i64) -> i64,
+    /// SET_ADD residual — `(set, value) → void` (`set.add(value)`, peeked).
+    pub set_add_fn: extern "C" fn(i64, i64) -> i64,
+    /// SET_UPDATE residual — `(set, iterable) → void` (`set.update`, peeked).
+    pub set_update_fn: extern "C" fn(i64, i64) -> i64,
+    /// DICT_UPDATE residual — `(dict, source) → void` (`dict.update`, peeked).
+    pub dict_update_fn: extern "C" fn(i64, i64) -> i64,
+    /// MAP_ADD residual — `(dict, key, value) → void` (`dict[key]=value`, peeked).
+    pub map_add_fn: extern "C" fn(i64, i64, i64) -> i64,
+    /// DICT_MERGE residual — `(dict, source, callable) → void` (`**` merge,
+    /// peeked; callable only for error-message prefixes).
+    pub dict_merge_fn: extern "C" fn(i64, i64, i64) -> i64,
     /// LIST_APPEND residual — `(list, value) → void` (`list.append(value)`,
     /// list peeked + mutated in place).  The full-body walker's #171 fold
     /// intercepts it (`PyreHelperKind::ListAppendValue`); this is the decline
@@ -346,6 +357,11 @@ impl Cpu {
             delete_subscr_fn: crate::call_jit::bh_delete_subscr_fn,
             delete_attr_fn: crate::call_jit::bh_delete_attr_fn,
             list_extend_fn: crate::call_jit::bh_list_extend_fn,
+            set_add_fn: crate::call_jit::bh_set_add_fn,
+            set_update_fn: crate::call_jit::bh_set_update_fn,
+            dict_update_fn: crate::call_jit::bh_dict_update_fn,
+            map_add_fn: crate::call_jit::bh_map_add_fn,
+            dict_merge_fn: crate::call_jit::bh_dict_merge_fn,
             list_append_fn: pyre_object::listobject::jit_list_append,
             format_simple_fn: crate::call_jit::bh_format_simple_fn,
             format_with_spec_fn: crate::call_jit::bh_format_with_spec_fn,

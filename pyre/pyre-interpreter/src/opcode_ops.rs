@@ -274,6 +274,163 @@ pub fn list_extend_value(list: PyObjectRef, iterable: PyObjectRef) -> Result<(),
     Ok(())
 }
 
+/// SET_ADD — `set.add(value)` (or `list.append` for the list-shaped
+/// accumulator).  Shared by the interpreter's `set_add` and the JIT
+/// residual `bh_set_add_fn`.  `set` is peeked, mutated in place.
+pub fn set_add_value(set: PyObjectRef, value: PyObjectRef) -> Result<(), PyError> {
+    unsafe {
+        if pyre_object::is_set_or_frozenset(set) {
+            pyre_object::w_set_add(set, value);
+        } else if pyre_object::is_list(set) {
+            pyre_object::w_list_append(set, value);
+        }
+    }
+    Ok(())
+}
+
+/// SET_UPDATE — `set.update(iterable)` (or `list.extend` for the
+/// list-shaped accumulator).  Shared by the interpreter's `set_update`
+/// and the JIT residual `bh_set_update_fn`.  `set` is peeked, mutated in
+/// place; a user iterator may run Python.
+pub fn set_update_value(set: PyObjectRef, iterable: PyObjectRef) -> Result<(), PyError> {
+    unsafe {
+        if pyre_object::is_set_or_frozenset(set) {
+            let items = crate::builtins::collect_iterable(iterable)?;
+            for item in items {
+                pyre_object::w_set_add(set, item);
+            }
+        } else if pyre_object::is_list(set) {
+            if pyre_object::is_list(iterable) {
+                let items = pyre_object::w_list_items_copy_as_vec(iterable);
+                for item in items {
+                    pyre_object::w_list_append(set, item);
+                }
+            } else if pyre_object::is_tuple(iterable) {
+                for item in pyre_object::w_tuple_items_copy_as_vec(iterable) {
+                    pyre_object::w_list_append(set, item);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// MAP_ADD — `dict[key] = value`.  Shared by the interpreter's `map_add`
+/// and the JIT residual `bh_map_add_fn`.  `dict` is peeked, mutated in
+/// place; runs no user code (raw dict store).
+pub fn map_add_value(
+    dict: PyObjectRef,
+    key: PyObjectRef,
+    value: PyObjectRef,
+) -> Result<(), PyError> {
+    unsafe {
+        pyre_object::w_dict_store(dict, key, value);
+    }
+    Ok(())
+}
+
+/// DICT_UPDATE — `dict.update(source)` with the `ismapping` gate.  Shared
+/// by the interpreter's `dict_update` and the JIT residual
+/// `bh_dict_update_fn`.  Non-mapping surfaces "'<T>' object is not a
+/// mapping"; a `keys()`/`__getitem__` may run Python.
+pub fn dict_update_value(dict: PyObjectRef, source: PyObjectRef) -> Result<(), PyError> {
+    unsafe {
+        if pyre_object::is_dict(source) {
+            for (k, v) in pyre_object::w_dict_items(source) {
+                pyre_object::w_dict_store(dict, k, v);
+            }
+            return Ok(());
+        }
+    }
+    let keys_method = match crate::baseobjspace::getattr_str(source, "keys") {
+        Ok(m) => m,
+        Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
+            let type_name = unsafe { (*(*source).ob_type).name };
+            return Err(PyError::type_error(format!(
+                "'{type_name}' object is not a mapping"
+            )));
+        }
+        Err(e) => return Err(e),
+    };
+    let keys_obj = crate::call::call_function_impl_result(keys_method, &[])?;
+    let keys = crate::builtins::collect_iterable(keys_obj)?;
+    for key in keys {
+        let val = crate::baseobjspace::getitem(source, key)?;
+        unsafe { pyre_object::w_dict_store(dict, key, val) };
+    }
+    Ok(())
+}
+
+/// Resolve callable display prefix for `**kwargs` error messages
+/// (e.g. `"foo() "`), or `""` when unresolvable.
+fn callable_prefix(w_callable: PyObjectRef) -> String {
+    if w_callable.is_null() {
+        return String::new();
+    }
+    unsafe {
+        if crate::is_function(w_callable) {
+            let name = crate::function_get_qualname(w_callable);
+            return format!("{name}() ");
+        }
+        if pyre_object::is_type(w_callable) {
+            let name = pyre_object::w_type_get_name(w_callable);
+            return format!("{name}() ");
+        }
+    }
+    String::new()
+}
+
+/// DICT_MERGE — merge `source` into `dict` with duplicate-key checks.
+/// Shared by the interpreter's `dict_merge` and the JIT residual
+/// `bh_dict_merge_fn`.  `w_callable` is the peeked callable used only for
+/// error-message prefixes; a `keys()`/`__getitem__` may run Python.
+pub fn dict_merge_value(
+    dict: PyObjectRef,
+    source: PyObjectRef,
+    w_callable: PyObjectRef,
+) -> Result<(), PyError> {
+    let prefix = callable_prefix(w_callable);
+    unsafe {
+        if pyre_object::is_dict(source) {
+            for (k, v) in pyre_object::w_dict_items(source) {
+                if pyre_object::w_dict_lookup(dict, k).is_some() {
+                    let key_str = crate::display::py_str(k)?;
+                    return Err(PyError::type_error(format!(
+                        "{prefix}got multiple values for keyword argument '{key_str}'"
+                    )));
+                }
+                pyre_object::w_dict_store(dict, k, v);
+            }
+            return Ok(());
+        }
+    }
+    let keys_method = match crate::baseobjspace::getattr_str(source, "keys") {
+        Ok(m) => m,
+        Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
+            let type_name = unsafe { (*(*source).ob_type).name };
+            return Err(PyError::type_error(format!(
+                "{prefix}argument after ** must be a mapping, not {type_name}"
+            )));
+        }
+        Err(e) => return Err(e),
+    };
+    let keys_obj = crate::call::call_function_impl_result(keys_method, &[])?;
+    let keys = crate::builtins::collect_iterable(keys_obj)?;
+    for key in keys {
+        let val = crate::baseobjspace::getitem(source, key)?;
+        unsafe {
+            if pyre_object::w_dict_lookup(dict, key).is_some() {
+                let key_str = crate::display::py_str(key)?;
+                return Err(PyError::type_error(format!(
+                    "{prefix}got multiple values for keyword argument '{key_str}'"
+                )));
+            }
+            pyre_object::w_dict_store(dict, key, val);
+        }
+    }
+    Ok(())
+}
+
 #[majit_macros::jit_may_force]
 pub extern "C" fn jit_truth_value(value: i64) -> i64 {
     match truth_value(value as PyObjectRef) {

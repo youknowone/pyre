@@ -811,111 +811,6 @@ pub fn set_current_exception(exc: PyObjectRef) {
     }
 }
 
-/// `pyopcode.py:1524-1532 DICT_UPDATE` — update `dict` from a mapping
-/// source via the `keys()` + `__getitem__` protocol.  Falls back to
-/// direct `w_dict_items` for exact-dict sources.
-fn dict_update_from_mapping(dict: PyObjectRef, source: PyObjectRef) -> Result<(), PyError> {
-    unsafe {
-        if pyre_object::is_dict(source) {
-            for (k, v) in pyre_object::w_dict_items(source) {
-                pyre_object::w_dict_store(dict, k, v);
-            }
-            return Ok(());
-        }
-    }
-    // pyopcode.py:2005-2006: only AttributeError → TypeError; others propagate
-    let keys_method = match crate::baseobjspace::getattr_str(source, "keys") {
-        Ok(m) => m,
-        Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
-            let type_name = unsafe { (*(*source).ob_type).name };
-            return Err(PyError::type_error(format!(
-                "'{type_name}' object is not a mapping"
-            )));
-        }
-        Err(e) => return Err(e),
-    };
-    let keys_obj = crate::call::call_function_impl_result(keys_method, &[])?;
-    let keys = crate::builtins::collect_iterable(keys_obj)?;
-    for key in keys {
-        let val = crate::baseobjspace::getitem(source, key)?;
-        unsafe { pyre_object::w_dict_store(dict, key, val) };
-    }
-    Ok(())
-}
-
-/// Resolve callable display prefix for `**kwargs` error messages.
-/// Returns e.g. `"foo()"` or just `""` when unresolvable.
-fn callable_prefix(w_callable: PyObjectRef) -> String {
-    if w_callable.is_null() {
-        return String::new();
-    }
-    unsafe {
-        if crate::is_function(w_callable) {
-            let name = crate::function_get_qualname(w_callable);
-            return format!("{name}() ");
-        }
-        if pyre_object::is_type(w_callable) {
-            let name = pyre_object::w_type_get_name(w_callable);
-            return format!("{name}() ");
-        }
-    }
-    String::new()
-}
-
-/// pyopcode.py:1979-2026 `_dict_merge` — merge `source` into `dict`.
-/// Dict path checks duplicates; mapping path does keys/getitem/setitem
-/// without extra validation (string key check is CALL_FUNCTION_EX's job).
-fn dict_merge_from_mapping(
-    dict: PyObjectRef,
-    source: PyObjectRef,
-    w_callable: PyObjectRef,
-) -> Result<(), PyError> {
-    let prefix = callable_prefix(w_callable);
-
-    unsafe {
-        if pyre_object::is_dict(source) {
-            for (k, v) in pyre_object::w_dict_items(source) {
-                if pyre_object::w_dict_lookup(dict, k).is_some() {
-                    // pyopcode.py:1987 — %S is str(key)
-                    let key_str = crate::display::py_str(k)?;
-                    return Err(PyError::type_error(format!(
-                        "{prefix}got multiple values for keyword argument '{key_str}'"
-                    )));
-                }
-                pyre_object::w_dict_store(dict, k, v);
-            }
-            return Ok(());
-        }
-    }
-    // pyopcode.py:2005-2006: only AttributeError → TypeError; others propagate
-    let keys_method = match crate::baseobjspace::getattr_str(source, "keys") {
-        Ok(m) => m,
-        Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
-            let type_name = unsafe { (*(*source).ob_type).name };
-            return Err(PyError::type_error(format!(
-                "{prefix}argument after ** must be a mapping, not {type_name}"
-            )));
-        }
-        Err(e) => return Err(e),
-    };
-    // pyopcode.py:2021 _dict_merge_loop: keys/getitem/contains/setitem
-    let keys_obj = crate::call::call_function_impl_result(keys_method, &[])?;
-    let keys = crate::builtins::collect_iterable(keys_obj)?;
-    for key in keys {
-        let val = crate::baseobjspace::getitem(source, key)?;
-        unsafe {
-            if pyre_object::w_dict_lookup(dict, key).is_some() {
-                let key_str = crate::display::py_str(key)?;
-                return Err(PyError::type_error(format!(
-                    "{prefix}got multiple values for keyword argument '{key_str}'"
-                )));
-            }
-            pyre_object::w_dict_store(dict, key, val);
-        }
-    }
-    Ok(())
-}
-
 pub fn normalize_raise_value(value: PyObjectRef) -> PyObjectRef {
     unsafe {
         if crate::baseobjspace::exception_is_valid_obj_as_class_w(value) {
@@ -3356,7 +3251,7 @@ impl OpcodeStepExecutor for PyFrame {
     fn dict_update(&mut self, i: usize) -> Result<(), PyError> {
         let source = self.pop();
         let dict = PyFrame::peek_at(self, i - 1);
-        dict_update_from_mapping(dict, source)
+        crate::opcode_ops::dict_update_value(dict, source)
     }
 
     // ── DictMerge ──
@@ -3372,7 +3267,7 @@ impl OpcodeStepExecutor for PyFrame {
         } else {
             pyre_object::PY_NULL
         };
-        dict_merge_from_mapping(dict, source, w_callable)
+        crate::opcode_ops::dict_merge_value(dict, source, w_callable)
     }
 
     // ── MapAdd ──
@@ -3382,10 +3277,7 @@ impl OpcodeStepExecutor for PyFrame {
         let value = self.pop();
         let key = self.pop();
         let dict = PyFrame::peek_at(self, i - 1);
-        unsafe {
-            pyre_object::w_dict_store(dict, key, value);
-        }
-        Ok(())
+        crate::opcode_ops::map_add_value(dict, key, value)
     }
 
     // ── SetAdd ──
@@ -3394,14 +3286,7 @@ impl OpcodeStepExecutor for PyFrame {
     fn set_add(&mut self, i: usize) -> Result<(), PyError> {
         let value = self.pop();
         let set = PyFrame::peek_at(self, i - 1);
-        unsafe {
-            if pyre_object::is_set_or_frozenset(set) {
-                pyre_object::w_set_add(set, value);
-            } else if pyre_object::is_list(set) {
-                pyre_object::w_list_append(set, value);
-            }
-        }
-        Ok(())
+        crate::opcode_ops::set_add_value(set, value)
     }
 
     // ── none_value ──
@@ -4085,26 +3970,7 @@ impl OpcodeStepExecutor for PyFrame {
     fn set_update(&mut self, i: usize) -> Result<(), PyError> {
         let iterable = self.pop();
         let set = PyFrame::peek_at(self, i - 1);
-        unsafe {
-            if pyre_object::is_set_or_frozenset(set) {
-                let items = crate::builtins::collect_iterable(iterable)?;
-                for item in items {
-                    pyre_object::w_set_add(set, item);
-                }
-            } else if pyre_object::is_list(set) {
-                if pyre_object::is_list(iterable) {
-                    let items = pyre_object::w_list_items_copy_as_vec(iterable);
-                    for item in items {
-                        pyre_object::w_list_append(set, item);
-                    }
-                } else if pyre_object::is_tuple(iterable) {
-                    for item in pyre_object::w_tuple_items_copy_as_vec(iterable) {
-                        pyre_object::w_list_append(set, item);
-                    }
-                }
-            }
-        }
-        Ok(())
+        crate::opcode_ops::set_update_value(set, iterable)
     }
 
     // ── BuildSlice ──

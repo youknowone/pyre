@@ -1851,6 +1851,24 @@ fn pop_and_decr_depth(state: &mut FrameState, depth: &mut u16) {
     *depth = depth.saturating_sub(1);
 }
 
+/// PEEK(oparg) the accumulator container without popping it — the
+/// residual mutates it in place and it stays live on the stack.  Mirrors
+/// the ListExtend inline peek: after the operands are popped, the
+/// container sits at `len - oparg` (oparg counts from the new TOS).
+/// Returns a fresh Ref when the shadow stack is too shallow.
+fn peek_container_or_fresh(
+    state: &FrameState,
+    oparg: usize,
+    graph: &mut super::flow::FunctionGraph,
+) -> super::flow::FlowValue {
+    let len = state.stack.len();
+    if oparg >= 1 && oparg <= len {
+        state.stack[len - oparg].clone()
+    } else {
+        fresh_ref_value(graph)
+    }
+}
+
 fn null_stack_sentinel() -> super::flow::FlowValue {
     // CPython's PUSH_NULL / LOAD_GLOBAL(push_null) stack marker.  The
     // runtime side emits `PY_NULL = 0` via `emit_pushvalue_ref_const!`;
@@ -2560,6 +2578,45 @@ fn emit_frontend_list_extend(
         block,
         "list_extend",
         vec![list.into(), iterable.into()],
+        None,
+        offset,
+    );
+}
+
+/// 2-Ref void accumulator HLOp emitter (SET_ADD / SET_UPDATE /
+/// DICT_UPDATE) — the peeked container is mutated in place.  Mirrors
+/// `emit_frontend_list_extend`; the caller passes the opname.
+fn emit_frontend_accumulate_2(
+    block: &super::flow::BlockRef,
+    opname: &'static str,
+    container: super::flow::FlowValue,
+    operand: super::flow::FlowValue,
+    offset: i64,
+) {
+    record_graph_op(
+        block,
+        opname,
+        vec![container.into(), operand.into()],
+        None,
+        offset,
+    );
+}
+
+/// 3-Ref void accumulator HLOp emitter (MAP_ADD / DICT_MERGE) — the
+/// peeked container is mutated in place.  `a`/`b` are key/value for
+/// MAP_ADD, or source/callable for DICT_MERGE.
+fn emit_frontend_accumulate_3(
+    block: &super::flow::BlockRef,
+    opname: &'static str,
+    container: super::flow::FlowValue,
+    a: super::flow::FlowValue,
+    b: super::flow::FlowValue,
+    offset: i64,
+) {
+    record_graph_op(
+        block,
+        opname,
+        vec![container.into(), a.into(), b.into()],
         None,
         offset,
     );
@@ -3413,6 +3470,11 @@ struct FnPtrIndices {
     unary_not_fn: HelperHandle,
     load_fast_check_fn: HelperHandle,
     list_extend_fn: HelperHandle,
+    set_add_fn: HelperHandle,
+    set_update_fn: HelperHandle,
+    dict_update_fn: HelperHandle,
+    map_add_fn: HelperHandle,
+    dict_merge_fn: HelperHandle,
     list_append_fn: HelperHandle,
     store_slice_fn: HelperHandle,
     get_iter_fn: HelperHandle,
@@ -3914,6 +3976,26 @@ fn register_helper_fn_pointers(
         cpu.load_common_constant_fn as *const (),
         CallFlavor::MayForce,
     );
+    // Comprehension/display accumulators (`bh_set_add_fn` etc.) mutate a
+    // peeked container in place; a user `__hash__`/iterator may run Python
+    // → `MayForce`.  Appended last to preserve fn_ptr indices.
+    let set_add_fn = bind(assembler, cpu.set_add_fn as *const (), CallFlavor::MayForce);
+    let set_update_fn = bind(
+        assembler,
+        cpu.set_update_fn as *const (),
+        CallFlavor::MayForce,
+    );
+    let dict_update_fn = bind(
+        assembler,
+        cpu.dict_update_fn as *const (),
+        CallFlavor::MayForce,
+    );
+    let map_add_fn = bind(assembler, cpu.map_add_fn as *const (), CallFlavor::MayForce);
+    let dict_merge_fn = bind(
+        assembler,
+        cpu.dict_merge_fn as *const (),
+        CallFlavor::MayForce,
+    );
     FnPtrIndices {
         call_fn,
         load_global_fn,
@@ -3981,6 +4063,11 @@ fn register_helper_fn_pointers(
         for_iter_next_fn,
         unary_positive_fn,
         load_common_constant_fn,
+        set_add_fn,
+        set_update_fn,
+        dict_update_fn,
+        map_add_fn,
+        dict_merge_fn,
     }
 }
 
@@ -5401,6 +5488,31 @@ impl CodeWriter {
                     idx: list_extend_fn_idx,
                     flavor: _list_extend_fn_flavor,
                 },
+            set_add_fn:
+                HelperHandle {
+                    idx: set_add_fn_idx,
+                    flavor: _set_add_fn_flavor,
+                },
+            set_update_fn:
+                HelperHandle {
+                    idx: set_update_fn_idx,
+                    flavor: _set_update_fn_flavor,
+                },
+            dict_update_fn:
+                HelperHandle {
+                    idx: dict_update_fn_idx,
+                    flavor: _dict_update_fn_flavor,
+                },
+            map_add_fn:
+                HelperHandle {
+                    idx: map_add_fn_idx,
+                    flavor: _map_add_fn_flavor,
+                },
+            dict_merge_fn:
+                HelperHandle {
+                    idx: dict_merge_fn_idx,
+                    flavor: _dict_merge_fn_flavor,
+                },
             list_append_fn:
                 HelperHandle {
                     idx: list_append_fn_idx,
@@ -5515,6 +5627,11 @@ impl CodeWriter {
                 unary_not_fn_idx,
                 load_fast_check_fn_idx,
                 list_extend_fn_idx,
+                set_add_fn_idx,
+                set_update_fn_idx,
+                dict_update_fn_idx,
+                map_add_fn_idx,
+                dict_merge_fn_idx,
                 store_slice_fn_idx,
             });
         }
@@ -9528,11 +9645,29 @@ impl CodeWriter {
 
                         // MapAdd(i): peek dict at stack[i], pop value + key. Net: -2.
                         // eval.rs map_add.
-                        Instruction::MapAdd { .. } => {
-                            for _ in 0..2 {
-                                pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            }
-                            emit_abort_permanent!(py_pc);
+                        // MapAdd(i): PEEK(i) dict (mutated in place), pop value
+                        // (TOS) then key (TOS1). Net: -2.  `map_add(dict, key,
+                        // value)` via the 3-Ref `map_add` residual (`dict[key] =
+                        // value`).  eval.rs map_add: value = pop(), key = pop(),
+                        // dict = peek_at(i - 1).
+                        Instruction::MapAdd { i } => {
+                            let oparg = i.get(op_arg) as usize;
+                            current_depth = current_depth.saturating_sub(1);
+                            emit_vsd!(current_depth, py_pc);
+                            let value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            current_depth = current_depth.saturating_sub(1);
+                            emit_vsd!(current_depth, py_pc);
+                            let key = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let dict_value =
+                                peek_container_or_fresh(&current_state, oparg, &mut graph);
+                            emit_frontend_accumulate_3(
+                                &current_block.block(),
+                                "map_add",
+                                dict_value,
+                                key,
+                                value,
+                                py_pc as i64,
+                            );
                         }
 
                         // ── Remaining instructions: stack-effect-only accounting ──
@@ -9864,9 +9999,26 @@ impl CodeWriter {
                         }
 
                         // SetAdd(i): peek set, pop value. Net: -1.
-                        Instruction::SetAdd { .. } => {
-                            pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            emit_abort_permanent!(py_pc);
+                        // SetAdd(i): PEEK(i) set (mutated in place), pop value.
+                        // Net: -1.  `set_add(set, value)` via the `set_add`
+                        // residual (`set.add(value)` / `list.append`).
+                        Instruction::SetAdd { i } => {
+                            let oparg = i.get(op_arg) as usize;
+                            current_depth = current_depth.saturating_sub(1);
+                            emit_vsd!(current_depth, py_pc);
+                            let value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let set_value = peek_container_or_fresh(
+                                &current_state,
+                                oparg,
+                                &mut graph,
+                            );
+                            emit_frontend_accumulate_2(
+                                &current_block.block(),
+                                "set_add",
+                                set_value,
+                                value,
+                                py_pc as i64,
+                            );
                         }
 
                         // ListExtend(i): PEEK(i) list (mutated in place, stays
@@ -9898,15 +10050,69 @@ impl CodeWriter {
                         }
 
                         // SetUpdate(i): peek set, pop iterable. Net: -1.
-                        Instruction::SetUpdate { .. } => {
-                            pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            emit_abort_permanent!(py_pc);
+                        // SetUpdate(i): PEEK(i) set (mutated in place), pop
+                        // iterable. Net: -1.  `set_update(set, iterable)` via the
+                        // `set_update` residual (`set.update` / `list.extend`).
+                        Instruction::SetUpdate { i } => {
+                            let oparg = i.get(op_arg) as usize;
+                            current_depth = current_depth.saturating_sub(1);
+                            emit_vsd!(current_depth, py_pc);
+                            let iterable = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let set_value =
+                                peek_container_or_fresh(&current_state, oparg, &mut graph);
+                            emit_frontend_accumulate_2(
+                                &current_block.block(),
+                                "set_update",
+                                set_value,
+                                iterable,
+                                py_pc as i64,
+                            );
                         }
 
-                        // DictUpdate(i) / DictMerge(i): peek dict, pop source. Net: -1.
-                        Instruction::DictUpdate { .. } | Instruction::DictMerge { .. } => {
-                            pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            emit_abort_permanent!(py_pc);
+                        // DictUpdate(i): PEEK(i) dict (mutated in place), pop
+                        // source. Net: -1.  `dict_update(dict, source)` via the
+                        // `dict_update` residual (`dict.update` with ismapping
+                        // gate).
+                        Instruction::DictUpdate { i } => {
+                            let oparg = i.get(op_arg) as usize;
+                            current_depth = current_depth.saturating_sub(1);
+                            emit_vsd!(current_depth, py_pc);
+                            let source = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let dict_value =
+                                peek_container_or_fresh(&current_state, oparg, &mut graph);
+                            emit_frontend_accumulate_2(
+                                &current_block.block(),
+                                "dict_update",
+                                dict_value,
+                                source,
+                                py_pc as i64,
+                            );
+                        }
+
+                        // DictMerge(i): PEEK(i) dict (mutated in place), pop
+                        // source.  The callable at `peekvalue(oparg + 2)` is
+                        // peeked (never popped) for `**kwargs` error prefixes.
+                        // Net: -1.  `dict_merge(dict, source, callable)` via the
+                        // 3-Ref `dict_merge` residual.  `pyopcode.py:1514`.
+                        Instruction::DictMerge { i } => {
+                            let oparg = i.get(op_arg) as usize;
+                            current_depth = current_depth.saturating_sub(1);
+                            emit_vsd!(current_depth, py_pc);
+                            let source = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let dict_value =
+                                peek_container_or_fresh(&current_state, oparg, &mut graph);
+                            // callable = peekvalue(oparg + 2) after the source pop
+                            // → stack offset (oparg + 3) from the new TOS.
+                            let callable_value =
+                                peek_container_or_fresh(&current_state, oparg + 3, &mut graph);
+                            emit_frontend_accumulate_3(
+                                &current_block.block(),
+                                "dict_merge",
+                                dict_value,
+                                source,
+                                callable_value,
+                                py_pc as i64,
+                            );
                         }
 
                         // SetFunctionAttribute: pops func (TOS), pops attr (TOS1),

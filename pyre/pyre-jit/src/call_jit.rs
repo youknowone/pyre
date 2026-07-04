@@ -4143,6 +4143,81 @@ pub extern "C" fn bh_list_extend_fn(list: i64, iterable: i64) -> i64 {
     0
 }
 
+/// SET_ADD residual (`set_add` HLOp → `residual_call_r_v`).  Runs
+/// `set.add(value)` (or `list.append`) through the shared
+/// `opcode_ops::set_add_value`; `set` is peeked and mutated in place.
+/// A user `__hash__`/`__eq__` can run Python (`MayForce`).  Void result.
+pub extern "C" fn bh_set_add_fn(set: i64, value: i64) -> i64 {
+    if let Err(err) = pyre_interpreter::opcode_ops::set_add_value(
+        set as pyre_object::PyObjectRef,
+        value as pyre_object::PyObjectRef,
+    ) {
+        publish_residual_call_exception(err.to_exc_object() as i64);
+    }
+    0
+}
+
+/// SET_UPDATE residual (`set_update` HLOp → `residual_call_r_v`).  Runs
+/// `set.update(iterable)` (or `list.extend`) through the shared
+/// `opcode_ops::set_update_value`; `set` is peeked and mutated in place.
+/// A user iterator / `__hash__` can run Python (`MayForce`).  Void result.
+pub extern "C" fn bh_set_update_fn(set: i64, iterable: i64) -> i64 {
+    if let Err(err) = pyre_interpreter::opcode_ops::set_update_value(
+        set as pyre_object::PyObjectRef,
+        iterable as pyre_object::PyObjectRef,
+    ) {
+        publish_residual_call_exception(err.to_exc_object() as i64);
+    }
+    0
+}
+
+/// DICT_UPDATE residual (`dict_update` HLOp → `residual_call_r_v`).  Runs
+/// `dict.update(source)` with the ismapping gate through the shared
+/// `opcode_ops::dict_update_value`; `dict` is peeked and mutated in
+/// place.  A `keys()`/`__getitem__`/`__hash__` can run Python
+/// (`MayForce`).  Void result.
+pub extern "C" fn bh_dict_update_fn(dict: i64, source: i64) -> i64 {
+    if let Err(err) = pyre_interpreter::opcode_ops::dict_update_value(
+        dict as pyre_object::PyObjectRef,
+        source as pyre_object::PyObjectRef,
+    ) {
+        publish_residual_call_exception(err.to_exc_object() as i64);
+    }
+    0
+}
+
+/// MAP_ADD residual (`map_add` HLOp → `residual_call_r_v`).  Runs
+/// `dict[key] = value` through the shared `opcode_ops::map_add_value`;
+/// `dict` is peeked and mutated in place.  A user key `__hash__`/`__eq__`
+/// can run Python (`MayForce`).  Void result.
+pub extern "C" fn bh_map_add_fn(dict: i64, key: i64, value: i64) -> i64 {
+    if let Err(err) = pyre_interpreter::opcode_ops::map_add_value(
+        dict as pyre_object::PyObjectRef,
+        key as pyre_object::PyObjectRef,
+        value as pyre_object::PyObjectRef,
+    ) {
+        publish_residual_call_exception(err.to_exc_object() as i64);
+    }
+    0
+}
+
+/// DICT_MERGE residual (`dict_merge` HLOp → `residual_call_r_v`).  Runs
+/// `dict.update(source)` with duplicate-key checks through the shared
+/// `opcode_ops::dict_merge_value`; `dict` is peeked and mutated in place.
+/// `w_callable` is the peeked callable used only for error-message
+/// prefixes.  A `keys()`/`__getitem__`/`__hash__` can run Python
+/// (`MayForce`).  Void result.
+pub extern "C" fn bh_dict_merge_fn(dict: i64, source: i64, w_callable: i64) -> i64 {
+    if let Err(err) = pyre_interpreter::opcode_ops::dict_merge_value(
+        dict as pyre_object::PyObjectRef,
+        source as pyre_object::PyObjectRef,
+        w_callable as pyre_object::PyObjectRef,
+    ) {
+        publish_residual_call_exception(err.to_exc_object() as i64);
+    }
+    0
+}
+
 /// Compute the LOOKUP_METHOD `null_or_self` for blackhole LOAD_ATTR resume,
 /// given the already-resolved `attr` from [`bh_load_attr_fn`].  Delegates to
 /// the shared `compute_load_method_bound`, a pure MRO inspection that never

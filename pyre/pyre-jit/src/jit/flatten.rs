@@ -3464,6 +3464,18 @@ pub struct LoweringContext {
     /// DELETE_SUBSCR shape); `bh_list_extend_fn` extends the list in place
     /// from an arbitrary iterable (user `__iter__`/`__next__` → `MayForce`).
     pub list_extend_fn_idx: u16,
+    /// Comprehension/display accumulator residual descrs-pool indices.
+    /// SET_ADD/SET_UPDATE/DICT_UPDATE record 2-Ref void HLOps
+    /// (`set_add(set, value)` etc.), MAP_ADD/DICT_MERGE record 3-Ref void
+    /// HLOps (`map_add(dict, key, value)`, `dict_merge(dict, source,
+    /// callable)`), all lowered to `residual_call_r_v` via
+    /// [`lower_accumulator_hlop_to_insn`]; the `bh_*` residuals mutate the
+    /// peeked container in place (user `__hash__`/iterator → `MayForce`).
+    pub set_add_fn_idx: u16,
+    pub set_update_fn_idx: u16,
+    pub dict_update_fn_idx: u16,
+    pub map_add_fn_idx: u16,
+    pub dict_merge_fn_idx: u16,
     /// `store_slice_fn` descrs-pool index.  STORE_SLICE records the
     /// `store_slice(obj, start, stop, value)` HLOp lowered to
     /// `residual_call_r_v(ConstInt(fn_idx), ListR([obj, start, stop, value]),
@@ -4947,6 +4959,9 @@ where
     if let Some(insn) = lower_list_extend_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
+    if let Some(insn) = lower_accumulator_hlop_to_insn(op, ctx, get_register, lower_constant) {
+        return Some(insn);
+    }
     if let Some(insn) = lower_delete_attr_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
@@ -5957,6 +5972,50 @@ where
     Some(build_residual_call_r_v_insn_from_operands(
         ctx.list_extend_fn_idx,
         vec![list_operand, iterable_operand],
+        CallFlavor::MayForce,
+        majit_ir::PyreHelperKind::None,
+    ))
+}
+
+/// Lower the comprehension/display accumulator HLOps to `residual_call_r_v`
+/// (void, N Ref operands, `MayForce`).  Each mutates a peeked container in
+/// place through its `bh_*` residual:
+/// - `set_add(set, value)` / `set_update(set, iterable)` /
+///   `dict_update(dict, source)` — 2 Ref operands.
+/// - `map_add(dict, key, value)` / `dict_merge(dict, source, callable)` —
+///   3 Ref operands.
+///
+/// Returns `None` for any other opname so the caller can fall through to
+/// other lowering arms.
+pub fn lower_accumulator_hlop_to_insn<F, LC>(
+    op: &super::flow::SpaceOperation,
+    ctx: &LoweringContext,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
+{
+    let (fn_idx, argc) = match op.opname.as_str() {
+        "set_add" => (ctx.set_add_fn_idx, 2),
+        "set_update" => (ctx.set_update_fn_idx, 2),
+        "dict_update" => (ctx.dict_update_fn_idx, 2),
+        "map_add" => (ctx.map_add_fn_idx, 3),
+        "dict_merge" => (ctx.dict_merge_fn_idx, 3),
+        _ => return None,
+    };
+    if op.args.len() != argc || op.result.is_some() {
+        return None;
+    }
+    let operands: Vec<Operand> = op
+        .args
+        .iter()
+        .map(|arg| flatten_arg_with_lowering(arg, get_register, lower_constant))
+        .collect();
+    Some(build_residual_call_r_v_insn_from_operands(
+        fn_idx,
+        operands,
         CallFlavor::MayForce,
         majit_ir::PyreHelperKind::None,
     ))
@@ -10532,6 +10591,11 @@ mod tests {
             store_slice_fn_idx: 116,
             unary_positive_fn_idx: 118,
             load_common_constant_fn_idx: 119,
+            set_add_fn_idx: 120,
+            set_update_fn_idx: 121,
+            dict_update_fn_idx: 122,
+            map_add_fn_idx: 123,
+            dict_merge_fn_idx: 124,
             ..Default::default()
         };
         let code_const = Constant::new(
@@ -11721,6 +11785,92 @@ mod tests {
                 );
             }
             _ => panic!("expected Insn::Op, got {insn:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_accumulator_hlops_emit_residual_call_r_v() {
+        // 2-Ref `set_add(set, value)` and 3-Ref `map_add(dict, key, value)`
+        // both lower to `residual_call_r_v(ConstInt(fn_idx), ListR([...]),
+        // Descr)` (void, MayForce).  Confirms opname→fn_idx dispatch, the
+        // Ref-operand count, and the absence of a result Register.
+        let (ctx, _, _) = load_attr_lowering_fixture();
+        let mut get_register = |var: Variable| match var.id {
+            VariableId(1) => Register {
+                kind: Kind::Ref,
+                index: 101,
+            },
+            VariableId(2) => Register {
+                kind: Kind::Ref,
+                index: 102,
+            },
+            VariableId(3) => Register {
+                kind: Kind::Ref,
+                index: 103,
+            },
+            other => panic!("unexpected var id {other:?}"),
+        };
+        let mut lower_constant = super::flatten_constant_operand_for_test;
+
+        // 2-Ref: set_add → fn_idx 120, ListR = [set, value].
+        let set = Variable::new(VariableId(1), Kind::Ref);
+        let value = Variable::new(VariableId(2), Kind::Ref);
+        let op = super::super::flow::SpaceOperation::new(
+            "set_add",
+            vec![set.into(), value.into()],
+            None,
+            0,
+        );
+        let insn =
+            super::lower_accumulator_hlop_to_insn(&op, &ctx, &mut get_register, &mut lower_constant)
+                .expect("set_add lowering must succeed");
+        match insn {
+            Insn::Op {
+                opname,
+                args,
+                result,
+            } => {
+                assert_eq!(opname, "residual_call_r_v");
+                assert!(matches!(args[0], Operand::ConstInt(120)));
+                match &args[1] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Ref);
+                        assert_eq!(list.content.len(), 2, "set_add is 2-Ref");
+                    }
+                    other => panic!("expected ListR, got {other:?}"),
+                }
+                assert_eq!(result, None, "void residual has no result");
+            }
+            _ => panic!("expected Insn::Op, got {insn:?}"),
+        }
+
+        // 3-Ref: map_add → fn_idx 123, ListR = [dict, key, value].
+        let key = Variable::new(VariableId(3), Kind::Ref);
+        let op3 = super::super::flow::SpaceOperation::new(
+            "map_add",
+            vec![set.into(), key.into(), value.into()],
+            None,
+            0,
+        );
+        let insn3 = super::lower_accumulator_hlop_to_insn(
+            &op3,
+            &ctx,
+            &mut get_register,
+            &mut lower_constant,
+        )
+        .expect("map_add lowering must succeed");
+        match insn3 {
+            Insn::Op { opname, args, .. } => {
+                assert_eq!(opname, "residual_call_r_v");
+                assert!(matches!(args[0], Operand::ConstInt(123)));
+                match &args[1] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.content.len(), 3, "map_add is 3-Ref");
+                    }
+                    other => panic!("expected ListR, got {other:?}"),
+                }
+            }
+            _ => panic!("expected Insn::Op, got {insn3:?}"),
         }
     }
 
