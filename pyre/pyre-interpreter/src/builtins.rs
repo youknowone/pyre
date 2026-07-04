@@ -2234,6 +2234,20 @@ fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         };
     let (positional, end, sep, file, flush) = if is_kwargs {
         let kwargs = *args.last().unwrap();
+        // app_io.py print_ — the app-level signature is
+        // `(*args, sep, end, file, flush)`, so any other keyword is an
+        // unexpected-keyword TypeError.
+        for (k, _) in unsafe { pyre_object::w_dict_items(kwargs) } {
+            let name = unsafe { pyre_object::w_str_get_wtf8(k) };
+            match name.as_str() {
+                Ok("__pyre_kw__") | Ok("sep") | Ok("end") | Ok("file") | Ok("flush") => {}
+                _ => {
+                    return Err(crate::PyError::type_error(format!(
+                        "print() got an unexpected keyword argument '{name}'"
+                    )));
+                }
+            }
+        }
         let end_val = unsafe { pyre_object::w_dict_lookup(kwargs, w_str_new("end")) };
         let sep_val = unsafe { pyre_object::w_dict_lookup(kwargs, w_str_new("sep")) };
         // The type check is up front; the str() rendering happens at write
@@ -5096,6 +5110,8 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             "could not convert string to float: {r}"
         )));
     }
+    // The message uses the modern "real number" wording (3.14) rather than
+    // the older "a number" phrasing.
     Err(crate::PyError::type_error(format!(
         "float() argument must be a string or a real number, not '{}'",
         crate::type_methods::arg_type_name(obj)

@@ -1216,17 +1216,11 @@ pub(crate) fn bind_kwargs_to_signature(
     let has_varkw = sig.kwargname.is_some();
     let n_pos = pos_args.len();
 
-    // argument.py:235-236 — too many positionals and no `*args` to absorb.
-    if n_pos > n_pos_params && !has_varargs {
-        return Err(crate::PyError::type_error(format!(
-            "{}() takes {} positional argument{} but {} {} given",
-            fname,
-            n_pos_params,
-            if n_pos_params != 1 { "s" } else { "" },
-            n_pos,
-            if n_pos != 1 { "were" } else { "was" },
-        )));
-    }
+    // argument.py:235-236 — flag too many positionals with no `*args` to
+    // absorb, but do not raise yet: argument.py:289 raises it only after
+    // keyword matching, so a duplicate/positional-only/unknown-keyword error
+    // on the same call wins first.
+    let too_many_args = n_pos > n_pos_params && !has_varargs;
 
     let mut result = vec![pyre_object::PY_NULL; nparams];
     for i in 0..n_pos.min(n_pos_params) {
@@ -1287,6 +1281,19 @@ pub(crate) fn bind_kwargs_to_signature(
             format_unknown_kwds_err(fname, &unmatched_kw_names)
         };
         return Err(crate::PyError::type_error(msg));
+    }
+
+    // argument.py:289 — too-many-positionals is raised last, after the
+    // keyword-matching errors above.
+    if too_many_args {
+        return Err(crate::PyError::type_error(format!(
+            "{}() takes {} positional argument{} but {} {} given",
+            fname,
+            n_pos_params,
+            if n_pos_params != 1 { "s" } else { "" },
+            n_pos,
+            if n_pos != 1 { "were" } else { "was" },
+        )));
     }
 
     // Pack `*args` / `**kwargs` tails — argument.py _match_signature 207-259.
@@ -1386,13 +1393,6 @@ pub fn call_with_kwargs(
             let mut full_args = pos_args.to_vec();
             if !kwargs.is_empty() {
                 let kwargs_dict = pyre_object::w_dict_new();
-                unsafe {
-                    pyre_object::w_dict_store(
-                        kwargs_dict,
-                        pyre_object::w_str_new("__pyre_kw__"),
-                        pyre_object::kw_marker::w_kw_marker_sentinel(),
-                    );
-                }
                 for (key, value) in kwargs {
                     unsafe {
                         pyre_object::w_dict_store(
@@ -1401,6 +1401,17 @@ pub fn call_with_kwargs(
                             *value,
                         );
                     }
+                }
+                // Store the marker last so a user keyword literally named
+                // `__pyre_kw__` cannot overwrite the sentinel: the reserved
+                // key always resolves to the sentinel value that detection
+                // compares by identity.
+                unsafe {
+                    pyre_object::w_dict_store(
+                        kwargs_dict,
+                        pyre_object::w_str_new("__pyre_kw__"),
+                        pyre_object::kw_marker::w_kw_marker_sentinel(),
+                    );
                 }
                 full_args.push(kwargs_dict);
                 // Step 2 of the Arguments port: when this is a profiled
@@ -3200,14 +3211,16 @@ fn build_class_inner(
 fn pack_pyre_kwargs(kw_items: &[(PyObjectRef, PyObjectRef)]) -> PyObjectRef {
     let kw_dict = pyre_object::w_dict_new();
     unsafe {
+        for (k, v) in kw_items {
+            pyre_object::w_dict_store(kw_dict, *k, *v);
+        }
+        // Marker stored last so a user keyword named `__pyre_kw__` cannot
+        // overwrite the sentinel detection compares by identity.
         pyre_object::w_dict_store(
             kw_dict,
             pyre_object::w_str_new("__pyre_kw__"),
             pyre_object::kw_marker::w_kw_marker_sentinel(),
         );
-        for (k, v) in kw_items {
-            pyre_object::w_dict_store(kw_dict, *k, *v);
-        }
     }
     kw_dict
 }
