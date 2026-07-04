@@ -5109,7 +5109,6 @@ pub extern "C" fn bh_load_common_constant_fn(disc: i64) -> i64 {
         Err(_) => pyre_object::PY_NULL as i64,
     }
 }
-
 /// UNARY_NOT residual (`unary_not` HLOp → `residual_call_r_r`).  Returns
 /// `not value` as a bool object via `opcode_ops::truth_value`.  A user
 /// `__bool__` / `__len__` may run Python (`MayForce`), matching the

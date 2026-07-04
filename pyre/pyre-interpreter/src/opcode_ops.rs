@@ -194,7 +194,6 @@ pub fn list_to_tuple_value(value: PyObjectRef) -> Result<PyObjectRef, PyError> {
     }
     Err(PyError::type_error("expected list for list_to_tuple"))
 }
-
 pub fn truth_value(value: PyObjectRef) -> Result<bool, PyError> {
     let value = crate::baseobjspace::unwrap_cell(value);
     is_true(value)
