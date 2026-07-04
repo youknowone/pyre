@@ -408,6 +408,12 @@ impl FrameState {
         }
     }
 
+    fn clear_local_value(&mut self, reg: usize) {
+        if let Some(slot) = self.locals_w.get_mut(reg) {
+            *slot = None;
+        }
+    }
+
     fn copy<F>(&self, fresh_variable: &mut F) -> Self
     where
         F: FnMut(Option<Kind>) -> super::flow::Variable,
@@ -9351,17 +9357,40 @@ impl CodeWriter {
 
                         // LoadFastAndClear: push local, clear it. Net: +1.
                         // pyopcode.py LOAD_FAST_AND_CLEAR / eval.rs:2052-2058.
+                        // LOAD_FAST_AND_CLEAR: push the local's value (like
+                        // LOAD_FAST, but no unbound-slot error — a cleared slot
+                        // reads as NULL) then clear the slot to NULL.  Net: +1.
+                        // flowcontext.rs LoadFastAndClear reads `locals_w[idx]`
+                        // and sets it to `None`; the runtime local read + NULL
+                        // clear is the vable dual-write below (portal-gated,
+                        // mirroring LOAD_FAST + the pyframe.py:411 NULL slot
+                        // clear).  Used by comprehension/`except*` scope save.
                         Instruction::LoadFastAndClear { var_num } => {
-                            let idx = var_num.get(op_arg).as_usize();
-                            let value = current_state
-                                .local_value_at(idx)
-                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                            if idx < current_state.locals_w.len() {
-                                current_state.locals_w[idx] = None;
+                            let reg = var_num.get(op_arg).as_usize() as u16;
+                            emit_load_fast_ref!(current_depth, reg, py_pc);
+                            if is_portal {
+                                // Clear the LOCAL slot to NULL:
+                                // `setarrayitem_vable_r(locals_cells_stack_w,
+                                // local_slot, ConstRef(0))`, the same
+                                // NULL-slot write pyframe.py uses for
+                                // `popvalue_maybe_none` (Constant::none() →
+                                // ConstRef(0)).
+                                let local_slot = local_to_vable_slot(reg as usize) as i64;
+                                let v_idx: super::flow::FlowValue =
+                                    super::flow::Constant::signed(local_slot).into();
+                                record_graph_op(
+                                    &current_block.block(),
+                                    "setarrayitem_vable_r",
+                                    vable_setarrayitem_ref_graph_args(
+                                        frame_var.into(),
+                                        v_idx.into(),
+                                        super::flow::Constant::none().into(),
+                                    ),
+                                    None,
+                                    py_pc as i64,
+                                );
                             }
-                            current_state.stack.push(value);
-                            current_depth += 1;
-                            emit_abort_permanent!(py_pc);
+                            current_state.clear_local_value(reg as usize);
                         }
 
                         // ListAppend(i): peek list at stack[i], pop value. Net: -1.
