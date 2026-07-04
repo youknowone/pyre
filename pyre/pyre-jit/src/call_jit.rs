@@ -4881,6 +4881,22 @@ pub extern "C" fn bh_unary_positive_fn(value: i64) -> i64 {
     }
 }
 
+/// CALL_INTRINSIC_1 ListToTuple residual (`list_to_tuple` HLOp →
+/// `residual_call_r_r`).  Converts a list to a tuple through the shared
+/// `opcode_ops::list_to_tuple_value`; allocates a fresh tuple, and a
+/// non-list operand raises TypeError (`MayForce`).  On error the
+/// exception is published through `BH_LAST_EXC_VALUE` for the trailing
+/// `GuardNoException` and the call returns 0.
+pub extern "C" fn bh_list_to_tuple_fn(value: i64) -> i64 {
+    match pyre_interpreter::opcode_ops::list_to_tuple_value(value as pyre_object::PyObjectRef) {
+        Ok(result) => result as i64,
+        Err(err) => {
+            publish_residual_call_exception(err.to_exc_object() as i64);
+            0
+        }
+    }
+}
+
 /// LOAD_COMMON_CONSTANT residual (`load_common_constant` HLOp →
 /// `residual_call_ir_r`).  `disc` is the `CommonConstant` discriminant
 /// (0-6).  Resolves the pushed object through the shared

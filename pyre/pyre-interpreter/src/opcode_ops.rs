@@ -175,6 +175,20 @@ pub fn unary_positive_value(value: PyObjectRef) -> Result<PyObjectRef, PyError> 
     crate::baseobjspace::pos(value)
 }
 
+/// CALL_INTRINSIC_1 ListToTuple — convert a list to a tuple (star
+/// unpacking).  Shared by the interpreter's `list_to_tuple` and the JIT
+/// residual `bh_list_to_tuple_fn`.  Allocates a fresh tuple; a non-list
+/// operand raises TypeError.
+pub fn list_to_tuple_value(value: PyObjectRef) -> Result<PyObjectRef, PyError> {
+    unsafe {
+        if pyre_object::is_list(value) {
+            let items = pyre_object::w_list_items_copy_as_vec(value);
+            return Ok(pyre_object::w_tuple_new(items));
+        }
+    }
+    Err(PyError::type_error("expected list for list_to_tuple"))
+}
+
 pub fn truth_value(value: PyObjectRef) -> Result<bool, PyError> {
     let value = crate::baseobjspace::unwrap_cell(value);
     is_true(value)

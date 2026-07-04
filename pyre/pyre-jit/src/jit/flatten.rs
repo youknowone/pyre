@@ -3441,6 +3441,13 @@ pub struct LoweringContext {
     /// the shared `opcode_ops::load_common_constant_value`; the `all`/`any`
     /// variants allocate a builtin function → `MayForce`.
     pub load_common_constant_fn_idx: u16,
+    /// `list_to_tuple_fn` descrs-pool index.  CALL_INTRINSIC_1 ListToTuple
+    /// records the `list_to_tuple(value)` HLOp lowered to
+    /// `residual_call_r_r(ConstInt(fn_idx), ListR([value]), Descr) → reg`
+    /// via [`lower_list_to_tuple_hlop_to_insn`] (the single-Ref
+    /// FORMAT_SIMPLE shape); `bh_list_to_tuple_fn` allocates a fresh tuple
+    /// (non-list → TypeError → `MayForce`).
+    pub list_to_tuple_fn_idx: u16,
     /// `unary_not_fn` descrs-pool index.  UNARY_NOT records the object-space
     /// `not_(value)` op (pyopcode.py:651) lowered to
     /// `residual_call_r_r(ConstInt(fn_idx), ListR([value]), Descr) → reg` via
@@ -5006,6 +5013,9 @@ where
     if let Some(insn) = lower_unary_positive_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
+    if let Some(insn) = lower_list_to_tuple_hlop_to_insn(op, ctx, get_register, lower_constant) {
+        return Some(insn);
+    }
     if let Some(insn) = lower_load_common_constant_hlop_to_insn(op, ctx, get_register) {
         return Some(insn);
     }
@@ -5518,6 +5528,41 @@ where
     };
     Some(build_residual_call_r_r_insn_from_operands(
         ctx.unary_positive_fn_idx,
+        vec![value],
+        CallFlavor::MayForce,
+        majit_ir::PyreHelperKind::None,
+        dst_reg,
+    ))
+}
+
+/// Lower the CALL_INTRINSIC_1 ListToTuple HLOp `list_to_tuple(value)` →
+/// `result: Ref` to `residual_call_r_r(ConstInt(list_to_tuple_fn_idx),
+/// ListR([value]), Descr) → reg`, the single-Ref FORMAT_SIMPLE shape.
+/// `bh_list_to_tuple_fn` allocates a fresh tuple (non-list → TypeError →
+/// `MayForce`).
+///
+/// Returns `None` for non-`list_to_tuple` opnames so the caller can fall
+/// through to other lowering arms.
+pub fn lower_list_to_tuple_hlop_to_insn<F, LC>(
+    op: &super::flow::SpaceOperation,
+    ctx: &LoweringContext,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
+{
+    if op.opname != "list_to_tuple" || op.args.len() != 1 {
+        return None;
+    }
+    let value = operand_for_value_arg(&op.args[0], get_register, lower_constant)?;
+    let dst_reg = match &op.result {
+        Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
+        _ => return None,
+    };
+    Some(build_residual_call_r_r_insn_from_operands(
+        ctx.list_to_tuple_fn_idx,
         vec![value],
         CallFlavor::MayForce,
         majit_ir::PyreHelperKind::None,
@@ -10596,6 +10641,7 @@ mod tests {
             dict_update_fn_idx: 122,
             map_add_fn_idx: 123,
             dict_merge_fn_idx: 124,
+            list_to_tuple_fn_idx: 125,
             ..Default::default()
         };
         let code_const = Constant::new(
@@ -11543,6 +11589,14 @@ mod tests {
         // MayForce — a user `__pos__` may run Python.
         assert_unary_lowering_emits_residual("pos", 118, |op, ctx, gr, lc| {
             super::lower_unary_positive_hlop_to_insn(op, ctx, &mut |v| gr(v), &mut |c| lc(c))
+        });
+    }
+
+    #[test]
+    fn lower_list_to_tuple_hlop_emits_list_to_tuple_fn_residual() {
+        // MayForce — allocates a fresh tuple / non-list raises TypeError.
+        assert_unary_lowering_emits_residual("list_to_tuple", 125, |op, ctx, gr, lc| {
+            super::lower_list_to_tuple_hlop_to_insn(op, ctx, &mut |v| gr(v), &mut |c| lc(c))
         });
     }
 

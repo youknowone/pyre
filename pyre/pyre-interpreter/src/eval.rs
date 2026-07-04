@@ -3303,13 +3303,7 @@ impl OpcodeStepExecutor for PyFrame {
     // ── list_to_tuple ──
     // PyPy intrinsic: convert list to tuple (used in star unpacking).
     fn list_to_tuple(&mut self, val: PyObjectRef) -> Result<PyObjectRef, PyError> {
-        unsafe {
-            if pyre_object::is_list(val) {
-                let items = pyre_object::w_list_items_copy_as_vec(val);
-                return Ok(pyre_object::w_tuple_new(items));
-            }
-        }
-        Err(PyError::type_error("expected list for list_to_tuple"))
+        crate::opcode_ops::list_to_tuple_value(val)
     }
 
     // ── print_expr ──

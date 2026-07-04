@@ -3467,6 +3467,7 @@ struct FnPtrIndices {
     unary_invert_fn: HelperHandle,
     unary_positive_fn: HelperHandle,
     load_common_constant_fn: HelperHandle,
+    list_to_tuple_fn: HelperHandle,
     unary_not_fn: HelperHandle,
     load_fast_check_fn: HelperHandle,
     list_extend_fn: HelperHandle,
@@ -3996,6 +3997,13 @@ fn register_helper_fn_pointers(
         cpu.dict_merge_fn as *const (),
         CallFlavor::MayForce,
     );
+    // `bh_list_to_tuple_fn` allocates a fresh tuple / can raise TypeError →
+    // `MayForce`.  Appended last to preserve fn_ptr indices.
+    let list_to_tuple_fn = bind(
+        assembler,
+        cpu.list_to_tuple_fn as *const (),
+        CallFlavor::MayForce,
+    );
     FnPtrIndices {
         call_fn,
         load_global_fn,
@@ -4068,6 +4076,7 @@ fn register_helper_fn_pointers(
         dict_update_fn,
         map_add_fn,
         dict_merge_fn,
+        list_to_tuple_fn,
     }
 }
 
@@ -5473,6 +5482,11 @@ impl CodeWriter {
                     idx: load_common_constant_fn_idx,
                     flavor: _load_common_constant_fn_flavor,
                 },
+            list_to_tuple_fn:
+                HelperHandle {
+                    idx: list_to_tuple_fn_idx,
+                    flavor: _list_to_tuple_fn_flavor,
+                },
             unary_not_fn:
                 HelperHandle {
                     idx: unary_not_fn_idx,
@@ -5624,6 +5638,7 @@ impl CodeWriter {
                 unary_invert_fn_idx,
                 unary_positive_fn_idx,
                 load_common_constant_fn_idx,
+                list_to_tuple_fn_idx,
                 unary_not_fn_idx,
                 load_fast_check_fn_idx,
                 list_extend_fn_idx,
@@ -10453,30 +10468,37 @@ impl CodeWriter {
                         // the other intrinsics remain unported → abort_permanent.
                         Instruction::CallIntrinsic1 { func } => {
                             use pyre_interpreter::bytecode::IntrinsicFunction1;
-                            match func.get(op_arg) {
-                                IntrinsicFunction1::UnaryPositive => {
-                                    let val_reg = emit_popvalue_ref!(current_depth, py_pc);
-                                    let val_value =
-                                        pop_ref_or_fresh(&mut current_state, &mut graph);
-                                    if let super::flow::FlowValue::Variable(v) = &val_value {
-                                        pin!(Some(*v), val_reg);
-                                    }
-                                    let result_value = emit_graph_op_with_result(
-                                        &mut graph,
-                                        &current_block.block(),
-                                        "pos",
-                                        vec![val_value.into()],
-                                        Kind::Ref,
-                                        py_pc as i64,
-                                    );
-                                    pin!(Some(result_value), stack_base + current_depth);
-                                    push_and_bump!(result_value.into(), py_pc);
+                            // UnaryPositive→`pos`, ListToTuple→`list_to_tuple`
+                            // are the two portable CALL_INTRINSIC_1 variants
+                            // (flowcontext.rs:2422-2431 record real ops); both
+                            // are single-Ref→Ref residuals.  Every other variant
+                            // is `unsupported_rpython` (flowcontext.rs:2435) —
+                            // abort_permanent is parity-correct there.
+                            let opname = match func.get(op_arg) {
+                                IntrinsicFunction1::UnaryPositive => Some("pos"),
+                                IntrinsicFunction1::ListToTuple => Some("list_to_tuple"),
+                                _ => None,
+                            };
+                            if let Some(opname) = opname {
+                                let val_reg = emit_popvalue_ref!(current_depth, py_pc);
+                                let val_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                                if let super::flow::FlowValue::Variable(v) = &val_value {
+                                    pin!(Some(*v), val_reg);
                                 }
-                                _ => {
-                                    let _ = current_state.stack.pop();
-                                    push_fresh_ref(&mut current_state, &mut graph);
-                                    emit_abort_permanent!(py_pc);
-                                }
+                                let result_value = emit_graph_op_with_result(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    opname,
+                                    vec![val_value.into()],
+                                    Kind::Ref,
+                                    py_pc as i64,
+                                );
+                                pin!(Some(result_value), stack_base + current_depth);
+                                push_and_bump!(result_value.into(), py_pc);
+                            } else {
+                                let _ = current_state.stack.pop();
+                                push_fresh_ref(&mut current_state, &mut graph);
+                                emit_abort_permanent!(py_pc);
                             }
                         }
 
