@@ -7119,6 +7119,16 @@ impl<'a> Lowering<'a> {
     /// supplies the length through the rtyper's `len` op, the same
     /// routing [`is_concrete_iter_constructor`] gives the container
     /// `iter`.
+    ///
+    /// `FixedObjectArray::len` (`pyre-object/src/object_array.rs`) is the
+    /// `locals_cells_stack_w` `Ptr(GcArray(PyObjectRef))` accessor whose
+    /// body reads the `len` header prefix.  The receiver annotates to a
+    /// `SomeList` (GcArray model), so entering the body drives a
+    /// `getattr(SomeList, "len")` on the header field, which dead-ends at
+    /// `Cannot find attribute "len"` — the header prefix is the array's
+    /// length, read through the `len` op (`arraylen_gc`), not a user
+    /// attribute.  Recognising the call retargets it to `__len` so the
+    /// body is never entered, the same treatment `Vec::len` gets.
     fn is_container_len(&self, reg: &RegularCall) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
@@ -7126,7 +7136,9 @@ impl<'a> Lowering<'a> {
         self.llbc.fn_by_id(*id).is_some_and(|fd| {
             matches!(
                 fd.item_meta.name_path().as_str(),
-                "core::slice::<Impl>::len" | "alloc::vec::<Impl>::len"
+                "core::slice::<Impl>::len"
+                    | "alloc::vec::<Impl>::len"
+                    | "pyre_object::object_array::<Impl>::len"
             )
         })
     }
