@@ -35,11 +35,10 @@ pub struct GcConfig {
 /// env.py:17-36 `_read_float_and_factor_from_env`. Parse `varname` as a float
 /// with an optional `k`/`m`/`g` size suffix (optionally followed by `b`/`B`),
 /// returning `(value, factor)`. `None` mirrors PyPy's `(0.0, 0)` absent /
-/// unparseable result, which callers treat as "unset".  A non-finite parse
-/// (`inf`/`nan`/overflow, which `f64::from_str` accepts but `float`+`r_uint`
-/// does not survive — `int(inf)`/`r_uint(inf)` raise) is treated as unset too,
-/// so callers fall back to the default instead of computing a `usize::MAX`
-/// byte count.
+/// unparseable result, which callers treat as "unset". `float(realvalue)`
+/// accepts `inf`/`nan`, so this parser passes them through unchanged;
+/// non-finite handling happens at the `int`/`r_uint` conversion sites, as
+/// upstream where `int(inf)`/`r_uint(inf)` raise.
 fn read_float_and_factor_from_env(varname: &str) -> Option<(f64, f64)> {
     let raw = std::env::var(varname).ok()?;
     let mut value = raw.trim();
@@ -60,7 +59,7 @@ fn read_float_and_factor_from_env(varname: &str) -> Option<(f64, f64)> {
         Some(b'g') | Some(b'G') => (&value[..value.len() - 1], 1024.0 * 1024.0 * 1024.0),
         _ => (value, 1.0),
     };
-    let parsed = number.parse::<f64>().ok().filter(|v| v.is_finite())?;
+    let parsed = number.parse::<f64>().ok()?;
     Some((parsed, factor))
 }
 
@@ -69,10 +68,12 @@ fn read_float_and_factor_from_env(varname: &str) -> Option<(f64, f64)> {
 /// fall back to the default, mirroring PyPy's `if x > 0` guards. PyPy's
 /// `read_uint_from_env` r_uint-wraps a negative product to a huge positive; pyre
 /// treats non-positive as unset, differing only on nonsensical negative input.
+/// A non-finite product is treated as unset too: `int(inf)`/`r_uint(inf)` raise
+/// upstream, so we fall back to the default instead of a `usize::MAX` byte count.
 fn read_uint_from_env(varname: &str) -> Option<usize> {
     let (value, factor) = read_float_and_factor_from_env(varname)?;
     let bytes = value * factor;
-    (bytes > 0.0).then_some(bytes as usize)
+    (bytes.is_finite() && bytes > 0.0).then_some(bytes as usize)
 }
 
 /// env.py:46-50 `read_float_from_env`: the plain float, but only when no size
