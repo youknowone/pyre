@@ -326,13 +326,19 @@ pub fn register_module(ns: &mut DictStorage) {
                     "frame index must not be negative",
                 ));
             }
-            // `vm.py:43-54 getframe`: starts from the top frame and
-            // walks `f_back` `depth` times.  The `f is None` guard runs
-            // at the *start* of every iteration including the first, so
-            // a missing top frame must raise rather than fabricate a
-            // stub.  Pyre's previous code returned an empty namespace
-            // when `current` was null, which masked stack-exhaustion.
-            let mut current = crate::eval::CURRENT_FRAME.with(|cf| cf.get());
+            // `vm.py:44-54 getframe`: start from
+            // `ec.gettopframe_nohidden()` and walk
+            // `ec.getnextframe_nohidden(f)` `depth` times, so
+            // `hidden_applevel` gateway / bridge frames are skipped
+            // (matching `f_back`).  The `f is None` guard runs at the
+            // *start* of every iteration including the first, so a
+            // missing top frame raises rather than fabricating a stub.
+            let ec = current_execution_context();
+            let mut current = if ec.is_null() {
+                std::ptr::null_mut()
+            } else {
+                unsafe { (*ec).gettopframe_nohidden() }
+            };
             let mut remaining = depth_signed as usize;
             loop {
                 if current.is_null() {
@@ -342,7 +348,8 @@ pub fn register_module(ns: &mut DictStorage) {
                     break;
                 }
                 remaining -= 1;
-                current = unsafe { (*current).get_f_back() };
+                current =
+                    crate::executioncontext::ExecutionContext::getnextframe_nohidden(current);
             }
             // `pyframe.py:767 f_back = GetSetProperty(PyFrame.fget_f_back)`.
             // Return the live `PyFrame` itself as the user-visible `frame`

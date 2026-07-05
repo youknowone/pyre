@@ -3372,18 +3372,85 @@ fn init_dict_view_values_type(ns: &mut DictStorage) {
 /// )
 /// ```
 ///
-/// Pyre wires `tb_lasti`, `tb_lineno`, `tb_next`, `__dir__`.  Gaps
-/// with cited convergence paths:
-///   - `tb_frame` returns `None` — needs `PyFrame` to grow a
-///     `PyObject` header (`pyframe.rs:39` currently `repr(C)`
-///     without one).  Snapshot stub (using `w_code` + `lineno` +
-///     recursive `tb_next.tb_frame` for `f_back`) is the bridge.
-///   - `__new__` needs the same `PyFrame` W_Root surface (per
-///     `pytraceback.py:67` `space.interp_w(PyFrame, w_frame)`).
-///   - `__reduce__` / `__setstate__` (`:74-97`) need the
-///     `_pickle_support.traceback_new` builtin module which pyre
-///     hasn't ported.
+/// Pyre wires `tb_lasti`, `tb_lineno`, `tb_next`, `tb_frame`,
+/// `__new__`, `__dir__`.
+///   - `tb_frame` returns the live `PyFrame` (`FRAME_TYPE`) when it is
+///     GC-owned, else a `sys.namespace` stub for a non-Gc / freed
+///     frame (see the getter below).
+///   - `__new__` = `TracebackType(tb_next, tb_frame, tb_lasti,
+///     tb_lineno)` (3.7+ constructor), taking a live `frame` object.
+///   - `__reduce__` / `__setstate__` are intentionally NOT wired:
+///     CPython 3.14 tracebacks are not picklable (`pickle.dumps(tb)`
+///     raises `TypeError: cannot pickle 'traceback' object`, and
+///     `traceback` has no `__setstate__`).  PyPy's `_pickle_support`
+///     path is PyPy-specific and would add non-CPython behavior, so it
+///     is deliberately omitted (behavior authority = CPython 3.14).
+/// `TracebackType(tb_next, tb_frame, tb_lasti, tb_lineno)` — the 3.7+
+/// traceback constructor.  `args[0]` is the class; the four positional
+/// arguments follow.  `tb_next` is a traceback or `None`; `tb_frame`
+/// must be a `frame`; `tb_lasti` / `tb_lineno` are ints.  CPython's
+/// `tb_lasti` is a byte offset, so it is halved to pyre's instruction-
+/// unit form for storage (the `tb_lasti` getter multiplies back by 2).
+fn traceback_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() != 5 {
+        return Err(crate::PyError::type_error(format!(
+            "TracebackType() takes exactly 4 arguments ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+    let w_next = args[1];
+    let w_frame = args[2];
+    let w_lasti = args[3];
+    let w_lineno = args[4];
+
+    // tb_next: a traceback or None.
+    let next = if unsafe { pyre_object::is_none(w_next) } {
+        pyre_object::PY_NULL
+    } else if unsafe { crate::pytraceback::is_pytraceback(w_next) } {
+        w_next
+    } else {
+        return Err(crate::PyError::type_error(format!(
+            "expected traceback object or None, got '{}'",
+            type_name_of(w_next)
+        )));
+    };
+
+    // tb_frame: must be a `frame` object (`FRAME_TYPE`).
+    if w_frame.is_null()
+        || !unsafe { pyre_object::py_type_check(w_frame, &crate::pyframe::FRAME_TYPE) }
+    {
+        return Err(crate::PyError::type_error(format!(
+            "TracebackType() argument 'tb_frame' must be frame, not {}",
+            type_name_of(w_frame)
+        )));
+    }
+    let frame = w_frame as *mut crate::pyframe::PyFrame;
+
+    // tb_lasti / tb_lineno: integers.  `tb_lasti` arrives as a CPython
+    // byte offset; store the instruction-unit form (`/ 2`).
+    if !unsafe { pyre_object::is_int(w_lasti) } {
+        return Err(crate::PyError::type_error(format!(
+            "an integer is required (got type {})",
+            type_name_of(w_lasti)
+        )));
+    }
+    if !unsafe { pyre_object::is_int(w_lineno) } {
+        return Err(crate::PyError::type_error(format!(
+            "an integer is required (got type {})",
+            type_name_of(w_lineno)
+        )));
+    }
+    let lasti = unsafe { pyre_object::w_int_get_value(w_lasti) } / 2;
+    let lineno = unsafe { pyre_object::w_int_get_value(w_lineno) };
+    let w_code = unsafe { (*frame).fget_f_code() };
+
+    Ok(crate::pytraceback::w_pytraceback_new(
+        frame, lasti, next, lineno, w_code,
+    ))
+}
+
 fn init_pytraceback_type(ns: &mut DictStorage) {
+    dict_storage_store(ns, "__new__", make_new_descr(traceback_descr_new));
     // pytraceback.py:45-49 descr_get_tb_lasti / descr_set_tb_lasti.
     //
     // pyre stores `lasti` as an instruction-unit index (`PyFrame.last_instr`
@@ -3520,9 +3587,17 @@ fn init_pytraceback_type(ns: &mut DictStorage) {
     // `pytraceback_object_custom_trace`, so a GC-owned frame is still
     // alive here.  The guard must match the custom_trace's guard
     // (`try_gc_owns_object`): only frames forwarded as managed edges
-    // survive; a non-Gc frame (Box tracer snapshot / already-freed arena
-    // callee, never forwarded) falls back to the `sys.namespace` stub
+    // survive; a non-Gc frame falls back to the `sys.namespace` stub
     // built from the retained `w_code` + stamped line number.
+    //
+    // A frame is non-Gc only when the GC stable-alloc hook was never
+    // installed: that hook (and the whole GC subsystem) is set up inside
+    // the JIT-driver initializer, which `PYRE_JIT=0` short-circuits, so
+    // in interpreter-only runs every frame is a `std::alloc` box freed on
+    // return — returning it would be a use-after-free.  On the shipping
+    // JIT path frames are GC-owned oldgen blocks and the stub is dead.
+    // Decoupling GC init from the JIT driver (letting the fallback go)
+    // is tracked separately.
     let frame_getter = make_builtin_function_with_arity(
         "tb_frame",
         |args| {
@@ -3671,10 +3746,13 @@ fn init_frame_type(ns: &mut DictStorage) {
             if f.is_null() {
                 return Ok(pyre_object::w_none());
             }
-            let back = unsafe { &*f }.get_f_back();
+            let back = unsafe { &*f }.fget_f_back();
             Ok(if back.is_null() {
                 pyre_object::w_none()
             } else {
+                // Exposing the frame to app level: mark escaped so the JIT
+                // materialises it (pyframe.py:176), mirroring `_getframe`.
+                unsafe { (*back).mark_as_escaped() };
                 back as pyre_object::PyObjectRef
             })
         },
@@ -3686,7 +3764,14 @@ fn init_frame_type(ns: &mut DictStorage) {
         make_getset_descriptor_named(back_getter, "f_back"),
     );
 
-    // f_lasti — read-only instruction-unit index (pyframe.py:770).
+    // f_lasti — read-only bytecode offset (pyframe.py:770).
+    //
+    // pyre stores `last_instr` as an instruction-unit index (increments
+    // by 1 per instruction); CPython's `f_lasti` is a byte offset
+    // (2 bytes per code unit).  Report the byte-offset form (× 2) so
+    // `dis` / `code.co_positions()` consumers that do `f_lasti // 2`
+    // recover the right instruction — the same adaptation `tb_lasti`
+    // uses (`typedef.rs` tb_lasti getter).
     let lasti_getter = make_builtin_function_with_arity(
         "f_lasti",
         |args| {
@@ -3694,7 +3779,9 @@ fn init_frame_type(ns: &mut DictStorage) {
             if f.is_null() {
                 return Ok(pyre_object::w_none());
             }
-            Ok(pyre_object::w_int_new(unsafe { &*f }.fget_f_lasti() as i64))
+            Ok(pyre_object::w_int_new(
+                unsafe { &*f }.fget_f_lasti() as i64 * 2,
+            ))
         },
         2,
     );

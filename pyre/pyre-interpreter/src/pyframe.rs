@@ -939,7 +939,7 @@ fn mark_compatible_stack(mut from_stack: i64, target_stack: i64) -> bool {
 /// (`frameobject.c explain_incompatible_stack`).
 fn mark_explain_incompatible_stack(target_stack: i64) -> &'static str {
     if target_stack == MARK_OVERFLOWED {
-        return "stack is too deep to analyze";
+        return "stack too deep to analyze";
     }
     if target_stack == MARK_UNINITIALIZED {
         return "can't jump into an exception handler, or code may be unreachable";
@@ -1074,11 +1074,17 @@ fn mark_stacks(code: &CodeObject, len: usize) -> Vec<i64> {
                     stacks[next_i] = next_stack;
                 }
                 Instruction::ForIter { delta } => {
+                    // Fall-through: iterator stays on the stack, the loop
+                    // variable (Object) is pushed above it.  Exhaustion
+                    // branch: the iterator stays on the stack (net 0) — it
+                    // is popped later by `POP_ITER`, matching the runtime
+                    // stack effect (liveness.rs ForIter `(d+1, d)`).  No
+                    // loop variable is pushed on that branch.
                     let target_stack = mark_push_value(next_stack, StackKind::Object);
                     stacks[next_i] = target_stack;
                     let j = next_i + delta.get(op_arg).as_usize();
                     if j <= len {
-                        stacks[j] = target_stack;
+                        stacks[j] = next_stack;
                     }
                 }
                 Instruction::EndAsyncFor => {
@@ -1086,7 +1092,15 @@ fn mark_stacks(code: &CodeObject, len: usize) -> Vec<i64> {
                     stacks[next_i] = next_stack;
                 }
                 Instruction::PushExcInfo => {
-                    next_stack = mark_push_value(next_stack, StackKind::Except);
+                    // Runtime (codewriter PushExcInfo): pop the new
+                    // exception, push the previous exception (Except slot),
+                    // then push the new exception back (Object).  Net +1,
+                    // but the shape is `[.., Except, Object]` — model both
+                    // slots so `f_lineno` jump validation matches the live
+                    // handler stack.
+                    let below = mark_pop_value(next_stack);
+                    next_stack = mark_push_value(below, StackKind::Except);
+                    next_stack = mark_push_value(next_stack, StackKind::Object);
                     stacks[next_i] = next_stack;
                 }
                 Instruction::PopExcept => {
@@ -2320,10 +2334,16 @@ impl PyFrame {
         w_builtin
     }
 
-    /// PyPy-compatible `fget_f_back`.
+    /// pyframe.py:764 `fget_f_back` — the next non-hidden frame, i.e.
+    /// `ExecutionContext.getnextframe_nohidden(self)`, skipping
+    /// `hidden_applevel` gateway / bridge frames.  The plain
+    /// `get_f_back()` accessor (used internally, including by the
+    /// nohidden walker itself) returns the raw `f_backref` link.
     #[inline]
     pub fn fget_f_back(&self) -> *mut PyFrame {
-        self.get_f_back()
+        crate::executioncontext::ExecutionContext::getnextframe_nohidden(
+            self as *const PyFrame as *mut PyFrame,
+        )
     }
 
     /// pyframe.py:641-642 fget_code → self.getcode().  Returns the `PyCode`
@@ -2545,14 +2565,11 @@ impl PyFrame {
                 "can't jump from the 'call' trace event of a new frame",
             ));
         }
-        // Can't jump from a `yield` statement (the frame is mid-yield).
-        if let Some((crate::bytecode::Instruction::YieldValue { .. }, _)) =
-            crate::pyopcode::decode_instruction_at(self.code(), self.last_instr as usize)
-        {
-            return Err(crate::PyError::value_error(
-                "can't jump from a yield statement",
-            ));
-        }
+        // A jump from a frame suspended at `YIELD_VALUE` is permitted
+        // (`frame_lineno_set_impl` lists `PY_MONITORING_EVENT_PY_YIELD`
+        // in the same allowed group as line/jump events); the pending
+        // yield value is accounted for by the `is_suspended` unwind
+        // below, so no early rejection here.
         // Only allow jumps when tracing a `line` event (`is_in_line_tracing`).
         if !self.getdebug().map_or(false, |d| d.is_in_line_tracing) {
             return Err(crate::PyError::value_error(
@@ -2615,7 +2632,7 @@ impl PyFrame {
                 }
             } else if err < 0 {
                 if start_stack == MARK_OVERFLOWED {
-                    msg = "stack is too deep to analyze".to_string();
+                    msg = "stack too deep to analyze".to_string();
                 } else if start_stack == MARK_UNINITIALIZED {
                     msg = "can't jump from unreachable code".to_string();
                 } else {
