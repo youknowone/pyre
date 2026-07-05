@@ -79,39 +79,45 @@ pub(crate) fn format_float_repr(val: f64) -> String {
     rustpython_literal::float::to_string(val)
 }
 
-/// `rutf8.py:660 make_utf8_escape_function` (`quotes=True`) parity —
-/// pick the outer quote (prefer single, switch to double iff the string
-/// contains a single but no double), then escape backslash, the matching
-/// quote, common whitespace, and control characters.  Lone surrogate code
-/// points are escaped via `char_escape_helper` (`rutf8.py:647`) as
-/// `\uXXXX`.  Non-control scalar values pass through verbatim.
+/// `repr`-style string escaping: pick the outer quote (prefer `'`, switch
+/// to `"` when the value contains `'` but not `"`), escape the backslash,
+/// the chosen quote, whitespace and non-printable code points, and render
+/// lone surrogates as `\uXXXX`. Delegates to the shared escape engine in
+/// `rustpython_literal::escape`.
 pub(crate) fn format_wtf8_repr(s: &Wtf8) -> String {
-    let bytes = s.as_bytes();
-    let has_single = bytes.contains(&b'\'');
-    let has_double = bytes.contains(&b'"');
-    let quote = if has_single && !has_double { '"' } else { '\'' };
-    let mut out = String::with_capacity(bytes.len() + 2);
-    out.push(quote);
-    for cp in s.code_points() {
-        match cp.to_char() {
-            Some('\\') => out.push_str("\\\\"),
-            Some('\t') => out.push_str("\\t"),
-            Some('\n') => out.push_str("\\n"),
-            Some('\r') => out.push_str("\\r"),
-            Some(c) if c == quote => {
+    use rustpython_literal::escape::{Quote, UnicodeEscape};
+    let escape = UnicodeEscape::with_preferred_quote(s, Quote::Single);
+    let mut out = String::new();
+    escape.str_repr().write(&mut out).unwrap();
+    out
+}
+
+/// `bytearrayobject.py W_BytearrayObject.descr_repr` — `bytearray(b'...')`.
+/// The outer quote prefers `'`, flipping to `"` only when the data holds a
+/// `'` but no `"`; the body always backslash-escapes `'` and `\` and never
+/// escapes `"`, so a `'` survives as `\'` even under a `"` outer quote.
+fn bytearray_repr_string(data: &[u8]) -> String {
+    let has_single = data.contains(&b'\'');
+    let has_double = data.contains(&b'"');
+    let quote = if has_single && !has_double { b'"' } else { b'\'' };
+    let mut out = String::with_capacity(data.len() + 14);
+    out.push_str("bytearray(b");
+    out.push(quote as char);
+    for &c in data {
+        match c {
+            b'\'' | b'\\' => {
                 out.push('\\');
-                out.push(c);
+                out.push(c as char);
             }
-            Some(c) if (c as u32) < 0x20 || (c as u32) == 0x7f => {
-                out.push_str(&format!("\\x{:02x}", c as u32));
-            }
-            Some(c) => out.push(c),
-            // Lone surrogate (0xD800-0xDFFF) — char_escape_helper emits
-            // `\u` + four hex digits for codepoints in [0x100, 0x10000).
-            None => out.push_str(&format!("\\u{:04x}", cp.to_u32())),
+            b'\t' => out.push_str("\\t"),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            0x20..=0x7e => out.push(c as char),
+            _ => out.push_str(&format!("\\x{c:02x}")),
         }
     }
-    out.push(quote);
+    out.push(quote as char);
+    out.push(')');
     out
 }
 
@@ -471,31 +477,21 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
                 py_repr(pyre_object::sliceobject::w_slice_get_step(obj))?,
             )
         } else if pyre_object::is_bytes_like(obj) {
-            // `pypy/objspace/std/bytesobject.py W_BytesObject.descr_repr`
-            // and `bytearrayobject.py W_BytearrayObject.descr_repr` —
-            // ASCII-printable bytes pass through, control bytes use
-            // `\xNN`, single quotes get backslash-escaped (or the outer
-            // quote flips to double when both quote kinds appear, but
-            // pyre keeps the simpler single-quote form for now).
-            // bytearray wraps the bytes literal: `bytearray(b'...')`.
+            // `bytesobject.py W_BytesObject.descr_repr` — ASCII-printable
+            // bytes pass through, control/high bytes use `\xNN`, and the
+            // outer quote prefers `'`, flipping to `"` when the data holds a
+            // `'` but no `"`.
             let data = pyre_object::bytes_like_data(obj);
-            let mut body = String::with_capacity(data.len() + 4);
-            body.push_str("b'");
-            for &b in data {
-                match b {
-                    b'\\' => body.push_str("\\\\"),
-                    b'\'' => body.push_str("\\'"),
-                    b'\n' => body.push_str("\\n"),
-                    b'\r' => body.push_str("\\r"),
-                    b'\t' => body.push_str("\\t"),
-                    0x20..=0x7e => body.push(b as char),
-                    _ => body.push_str(&format!("\\x{b:02x}")),
-                }
-            }
-            body.push('\'');
             if pyre_object::bytearrayobject::is_bytearray(obj) {
-                format!("bytearray({body})")
+                // `bytearrayobject.py W_BytearrayObject.descr_repr` differs
+                // from the bytes form: it chooses the same outer quote but
+                // always backslash-escapes an inner `'` (never `"`), so the
+                // shared bytes escaper cannot express it.
+                bytearray_repr_string(data)
             } else {
+                let escape = rustpython_literal::escape::AsciiEscape::new_repr(data);
+                let mut body = String::new();
+                escape.bytes_repr().write(&mut body).unwrap();
                 body
             }
         } else if pyre_object::is_set_or_frozenset(obj) {
