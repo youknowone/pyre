@@ -371,6 +371,19 @@ impl CodeWriter {
                         );
                     }
                 }
+                // Hydrate the *legacy* Variables (the map keys) jtransform
+                // reads through `FunctionGraph::concretetype_of` with the
+                // real path's resolved kinds now, before jtransform's
+                // `make_three_lists_from_vars` partitions residual-call args
+                // by kind.  The commit loop above stamps the typed flowspace
+                // Variables (the `.values()`), but a residual `dont_look_inside`
+                // decode helper's argument list is partitioned off the legacy
+                // key Variable's cell — left at the pre-real kind until the
+                // post-jtransform `apply_from_flowspace_variables` bridges it,
+                // by which point the arg already sits in the wrong kind list.
+                // Bridging here keeps the partition consistent with the kind
+                // the assembler later reads.
+                crate::codewriter::type_state::apply_from_flowspace_variables(&real_value_to_var);
                 Some(real_value_to_var)
             }
             Ok(crate::translator::rtyper::cutover::DualGateOutcome::Skip(reason)) => {

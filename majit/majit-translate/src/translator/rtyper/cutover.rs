@@ -812,22 +812,32 @@ fn collect_divergences(
         let real_refines_gcref_to_void = legacy_kind == ConcreteType::GcRef
             && real_kind == ConcreteType::Void
             && !colored_operands.contains(var);
-        // A `legacy=GcRef, real=Signed` pair is deliberately NOT accepted.
-        // The pairing is directionally ambiguous: for a derived integer
-        // (`idx = load_fast_var_num_to_index(var_num, op_arg)` consumed only
-        // by `idx < code_varnames_len(code)`) the real `Signed` is the
-        // correct refinement of the legacy walker's conservative `GcRef`
-        // backfill (`legacy_resolve.rs:374-378`); but for an erased
-        // `<E>::Value` element (e.g. `set_update`'s `item` fed to
-        // `w_set_add(set, item)` / `w_list_append`, a `W_Root` Ref) the real
-        // path *mistypes* the pointer as `Signed` while the legacy `GcRef` is
-        // correct.  Both cases carry the identical `(GcRef, Signed)`
-        // signature, so no acceptance rule keyed on the pair alone is sound —
-        // accepting it lets the mistyped erased element lift and crash in
-        // `emit_list_of_kind` (`assembler.rs:2169`: item kind Int vs the
-        // `ListOfKind(Ref)` the Call signature declares).  Keep it a
-        // divergence → Skip to legacy; the real fix is typing the erased
-        // element as Ref in the annotate path, not widening this gate.
+        // A `legacy=GcRef, real=Signed` pair is accepted: the real
+        // (annotate→rtype) path is authoritative and it refined a genuine
+        // integer.  The hitters are oparg-decoded values — a `LOAD_FAST`
+        // index (`load_fast_var_num_to_index(var_num, op_arg)` consumed by
+        // `idx < code_varnames_len`), an `IS_OP` / `CONVERT_VALUE` /
+        // `BUILD_SLICE` discriminant read off an `Arg<T>` marker field, a
+        // `JUMP_*` delta — all bare bytecode operands the rtyper types
+        // `Signed` (matching upstream, where a bytecode oparg is a plain
+        // int).  The legacy walker's `GcRef` is the pyre-only conservative
+        // `Unknown → GcRef` backfill (`legacy_resolve.rs:374-378`), which has
+        // no RPython analogue (upstream's rtyper never leaves a value
+        // untyped, so it never defaults to ref); it is the divergent side.
+        //
+        // This pair once appeared unacceptable because accepting it crashed
+        // `emit_list_of_kind` (`assembler.rs:2169`).  That crash was a phase
+        // ordering artifact, not a real mistype: a residual `dont_look_inside`
+        // decode helper's argument list is partitioned by kind at jtransform
+        // time (`make_three_lists_from_vars`), and the real path's kind was
+        // committed onto the typed flowspace Variable but not the legacy key
+        // Variable jtransform reads — so the arg was partitioned `ref` while
+        // later colored `int`.  Hydrating the legacy Variables before
+        // jtransform (`dual_gate_publish_concretetypes` →
+        // `apply_from_flowspace_variables`) keeps the partition and the
+        // coloring consistent, and the crash does not recur.
+        let real_refines_gcref_to_signed =
+            legacy_kind == ConcreteType::GcRef && real_kind == ConcreteType::Signed;
         // A duplicate phi inputarg the real path's `remove_duplicate_inputargs`
         // merged away is untyped in the real graph (its column no longer
         // exists) while the legacy walker types the retained identity.  The
@@ -858,6 +868,7 @@ fn collect_divergences(
             && real_present.is_none()
             && dead_op_results.contains(var);
         let diverges = if real_refines_gcref_to_void
+            || real_refines_gcref_to_signed
             || real_dropped_duplicate_inputarg
             || real_dropped_dead_op_result
         {
@@ -3434,19 +3445,15 @@ mod tests {
     }
 
     #[test]
-    fn collect_divergences_rejects_gcref_vs_signed() {
-        // A `(GcRef, Signed)` pair is a real divergence, not an accepted
-        // refinement.  The signature is directionally ambiguous — a derived
-        // integer index (real=Signed correct) and an erased Ref element the
-        // real path mistypes as Signed (`set_update`'s `item`, legacy=GcRef
-        // correct) share the identical pair — so it must Skip to legacy
-        // rather than let the mistyped case lift and crash in
-        // `emit_list_of_kind`.
-        assert_eq!(
-            diff_single_var(ConcreteType::GcRef, ConcreteType::Signed).len(),
-            1,
-            "legacy=GcRef, real=Signed is a directionally-ambiguous data-kind \
-             divergence"
+    fn collect_divergences_accepts_gcref_refined_to_signed() {
+        // A `(GcRef, Signed)` pair is an accepted refinement: the real path
+        // resolved a genuine integer (an oparg-decoded index / discriminant /
+        // delta) where the legacy walker left the pyre-only conservative
+        // `Unknown → GcRef` backfill.  Real is authoritative, so the graph
+        // lifts via real rather than Skipping to legacy.
+        assert!(
+            diff_single_var(ConcreteType::GcRef, ConcreteType::Signed).is_empty(),
+            "legacy=GcRef, real=Signed is an accepted real refinement"
         );
     }
 
