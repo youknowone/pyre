@@ -512,21 +512,14 @@ pub(crate) fn lower_typed_constants_to_const_pool(
     pool
 }
 
-fn live_runtime_positions<'a>(ops: impl IntoIterator<Item = &'a Op>) -> Vec<bool> {
-    let mut live_indices: Vec<usize> = Vec::new();
-    let mut live_limit = 0usize;
+fn live_runtime_positions<'a>(ops: impl IntoIterator<Item = &'a Op>) -> bit_set::BitSet {
+    let mut live_positions = bit_set::BitSet::new();
     for op in ops {
         let pos = op.pos.get();
         if pos.is_none() || pos.is_constant() {
             continue;
         }
-        let idx = pos.raw() as usize;
-        live_limit = live_limit.max(idx + 1);
-        live_indices.push(idx);
-    }
-    let mut live_positions = vec![false; live_limit];
-    for idx in live_indices {
-        live_positions[idx] = true;
+        live_positions.insert(pos.raw() as usize);
     }
     live_positions
 }
@@ -536,8 +529,7 @@ pub(crate) fn sanitize_backend_constants_for_ops<'a>(
     constants: &mut majit_ir::ConstMap<majit_ir::Value>,
 ) {
     let live_positions = live_runtime_positions(ops);
-    constants
-        .retain(|idx, _| (*idx as usize) >= live_positions.len() || !live_positions[*idx as usize]);
+    constants.retain(|idx, _| !live_positions.contains(*idx as usize));
 }
 
 /// Export newly-discovered constants from `OptContext` into the
@@ -589,7 +581,7 @@ pub(crate) fn merge_backend_constants_from_ctx(
         if matches!(value, majit_ir::Value::Ref(_)) {
             return;
         }
-        if idx < live_positions.len() && live_positions[idx] {
+        if live_positions.contains(idx) {
             return;
         }
         let key = OptContext::op_ref_for_value(idx as u32, &value).raw();
@@ -3458,14 +3450,19 @@ impl Optimizer {
         // Manual filter (instead of `.retain`) because the predicate
         // borrows `ctx` while `ctx.new_operations` would be borrowed
         // mutably by `retain`.
-        let keep: Vec<bool> = ctx
+        let keep: bit_set::BitSet = ctx
             .new_operations
             .iter()
-            .map(|op| !Self::is_constant_placeholder_op(op, &ctx))
+            .enumerate()
+            .filter(|(_, op)| !Self::is_constant_placeholder_op(op, &ctx))
+            .map(|(i, _)| i)
             .collect();
-        let mut keep_iter = keep.into_iter();
-        ctx.new_operations
-            .retain(|_| keep_iter.next().unwrap_or(true));
+        let mut idx = 0usize;
+        ctx.new_operations.retain(|_| {
+            let kept = keep.contains(idx);
+            idx += 1;
+            kept
+        });
 
         // Drain remaining extra ops. send_extra_operation may raise
         // InvalidLoop; propagate it.

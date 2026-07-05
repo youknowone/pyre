@@ -1955,11 +1955,11 @@ struct Lowering<'a> {
     /// MIR locals that are live when entering each block. Non-entry
     /// blocks receive these through `Block.inputargs`, and predecessor
     /// edges pass the matching current Variables via `Link.args`.
-    block_live_in: Vec<Vec<bool>>,
+    block_live_in: Vec<bit_set::BitSet>,
     block_entry_local_var: Vec<Vec<Option<Variable>>>,
     block_entry_positional_aggregate_locals: Vec<std::collections::HashMap<usize, String>>,
-    block_positional_seen: Vec<Vec<bool>>,
-    block_positional_conflict: Vec<Vec<bool>>,
+    block_positional_seen: Vec<bit_set::BitSet>,
+    block_positional_conflict: Vec<bit_set::BitSet>,
     /// Maps each MIR local whose current binding was produced by a
     /// positional [`Rvalue::Aggregate`] (tuple / array / closure — any
     /// kind for which [`Lowering::resolve_aggregate_adt`] returns
@@ -2202,9 +2202,7 @@ impl<'a> Lowering<'a> {
             for local_idx in 0..n_locals {
                 if !block_live_in
                     .get(mir_bb)
-                    .and_then(|locals| locals.get(local_idx))
-                    .copied()
-                    .unwrap_or(false)
+                    .map_or(false, |s| s.contains(local_idx))
                 {
                     continue;
                 }
@@ -2225,8 +2223,8 @@ impl<'a> Lowering<'a> {
             block_live_in,
             block_entry_local_var,
             block_entry_positional_aggregate_locals,
-            block_positional_seen: vec![vec![false; n_locals]; body.body.len()],
-            block_positional_conflict: vec![vec![false; n_locals]; body.body.len()],
+            block_positional_seen: vec![bit_set::BitSet::with_capacity(n_locals); body.body.len()],
+            block_positional_conflict: vec![bit_set::BitSet::with_capacity(n_locals); body.body.len()],
             positional_aggregate_locals: std::collections::HashMap::new(),
             binop_result_locals: compute_binop_result_locals(body),
             index_elem_alias: std::collections::HashMap::new(),
@@ -8812,18 +8810,13 @@ impl<'a> Lowering<'a> {
             for local_idx in 1..=self.arg_count {
                 locals.push(local_idx);
             }
-            for (local_idx, live) in self
-                .block_live_in
-                .get(target_bb)
-                .into_iter()
-                .flat_map(|v| v.iter())
-                .copied()
-                .enumerate()
-            {
-                if live && (local_idx == 0 || local_idx > self.arg_count) {
-                    return Err(LowerError::Unsupported(format!(
-                        "edge to startblock bb0 requires non-argument MIR local {local_idx}"
-                    )));
+            if let Some(live_set) = self.block_live_in.get(target_bb) {
+                for local_idx in live_set.iter() {
+                    if local_idx == 0 || local_idx > self.arg_count {
+                        return Err(LowerError::Unsupported(format!(
+                            "edge to startblock bb0 requires non-argument MIR local {local_idx}"
+                        )));
+                    }
                 }
             }
             return Ok(locals);
@@ -8831,27 +8824,19 @@ impl<'a> Lowering<'a> {
         Ok(self
             .block_live_in
             .get(target_bb)
-            .map(|locals| {
-                locals
-                    .iter()
-                    .copied()
-                    .enumerate()
-                    .filter_map(|(idx, live)| live.then_some(idx))
-                    .collect()
-            })
+            .map(|live_set| live_set.iter().collect())
             .unwrap_or_default())
     }
 
     fn merge_positional_aggregate_state(&mut self, target_bb: usize, local_idx: usize) {
         if target_bb >= self.block_positional_seen.len()
-            || local_idx >= self.block_positional_seen[target_bb].len()
-            || self.block_positional_conflict[target_bb][local_idx]
+            || self.block_positional_conflict[target_bb].contains(local_idx)
         {
             return;
         }
         let incoming = self.positional_aggregate_locals.get(&local_idx).cloned();
-        if !self.block_positional_seen[target_bb][local_idx] {
-            self.block_positional_seen[target_bb][local_idx] = true;
+        if !self.block_positional_seen[target_bb].contains(local_idx) {
+            self.block_positional_seen[target_bb].insert(local_idx);
             if let Some(owner) = incoming {
                 self.block_entry_positional_aggregate_locals[target_bb].insert(local_idx, owner);
             }
@@ -8861,7 +8846,7 @@ impl<'a> Lowering<'a> {
             .get(&local_idx)
             .cloned();
         if current != incoming {
-            self.block_positional_conflict[target_bb][local_idx] = true;
+            self.block_positional_conflict[target_bb].insert(local_idx);
             self.block_entry_positional_aggregate_locals[target_bb].remove(&local_idx);
         }
     }
@@ -9324,7 +9309,7 @@ fn compute_index_write_extra_live(body: &Unstructured, llbc: &Llbc) -> Vec<Vec<u
     extra
 }
 
-fn compute_mir_liveness(body: &Unstructured, extra_live: &[Vec<usize>]) -> Vec<Vec<bool>> {
+fn compute_mir_liveness(body: &Unstructured, extra_live: &[Vec<usize>]) -> Vec<bit_set::BitSet> {
     use bit_set::BitSet;
 
     let n_blocks = body.body.len();
@@ -9428,15 +9413,7 @@ fn compute_mir_liveness(body: &Unstructured, extra_live: &[Vec<usize>]) -> Vec<V
         }
     }
 
-    let mut result = vec![vec![false; n_locals]; n_blocks];
-    for (bb_idx, locals) in live_in.into_iter().enumerate() {
-        for local_idx in locals.iter() {
-            if local_idx < n_locals {
-                result[bb_idx][local_idx] = true;
-            }
-        }
-    }
-    result
+    live_in
 }
 
 fn push_successor(
@@ -15515,14 +15492,14 @@ mod tests {
         // the index-write `extra_live` set, so pass an empty extra_live.
         let live = super::compute_mir_liveness(&body, &[]);
         assert!(
-            live[1][2],
+            live[1].contains(2),
             "loop-carried index local _2 must be live-in at the loop block bb1"
         );
         // Sanity: the array base _1 (read as the projection inner) is
         // also live-in, and the throwaway temp _3 (defined before its
         // only use within bb1) is not.
-        assert!(live[1][1], "array base _1 must be live-in at bb1");
-        assert!(!live[1][3], "temp _3 is block-local, not live-in at bb1");
+        assert!(live[1].contains(1), "array base _1 must be live-in at bb1");
+        assert!(!live[1].contains(3), "temp _3 is block-local, not live-in at bb1");
     }
 
     #[test]

@@ -10,14 +10,7 @@
 /// - Cache invalidation on calls and side-effecting operations
 /// - Lazy set emission: SETFIELD_GC is delayed until a guard or side-effecting op forces it
 /// - GUARD_NOT_INVALIDATED deduplication
-#[inline(always)]
-fn vb_set(v: &mut Vec<bool>, i: u32) {
-    let i = i as usize;
-    if i >= v.len() {
-        v.resize(i + 1, false);
-    }
-    v[i] = true;
-}
+use bit_set::BitSet;
 
 #[inline(always)]
 fn use_untranslated_heap_ordering() -> bool {
@@ -784,7 +777,7 @@ pub struct OptHeap {
     /// a GUARD_NO_EXCEPTION, ensuring correct exception semantics.
     postponed_op: Option<Op>,
     // ── Aliasing analysis state — RPython: PtrInfo flags ──
-    seen_allocation: Vec<bool>,
+    seen_allocation: BitSet,
     /// heapcache.py:493-494 `_check_flag(box, HF_IS_UNESCAPED)` — the set of
     /// unescaped (freshly-allocated, not-yet-escaped) boxes. RPython stores the
     /// flag on the box (`box._heapc_flags`); pyre keeps an OptHeap-owned set
@@ -839,7 +832,7 @@ impl OptHeap {
             cached_arrayitems: Vec::new(),
             seen_guard_not_invalidated: false,
             postponed_op: None,
-            seen_allocation: Vec::new(),
+            seen_allocation: BitSet::new(),
             unescaped: majit_ir::vec_set::VecSet::new(),
             heapc_deps: majit_ir::VecMap::new(),
             last_emitted_removed: false,
@@ -1748,11 +1741,7 @@ impl OptHeap {
                 if flush_owners.contains(&owner) {
                     return;
                 }
-                let allocated_here = self
-                    .seen_allocation
-                    .get(owner.raw() as usize)
-                    .copied()
-                    .unwrap_or(false);
+                let allocated_here = self.seen_allocation.contains(owner.raw() as usize);
                 let escaped = ctx
                     .get_box_replacement_operand_opt(owner)
                     .as_ref()
@@ -2947,7 +2936,7 @@ impl OptHeap {
         // Track allocations for aliasing analysis.
         // Allocated objects are always non-null.
         if opcode.is_malloc() {
-            vb_set(&mut self.seen_allocation, op.pos.get().raw());
+            self.seen_allocation.insert(op.pos.get().raw() as usize);
             if let Some(new_box) = ctx.get_box_replacement_operand_opt(op.pos.get()) {
                 self.unescaped.insert(new_box);
             }
@@ -3070,7 +3059,7 @@ impl OptHeap {
 
             // ── heap.py: Allocation tracking ──
             OpCode::New | OpCode::NewWithVtable | OpCode::NewArray | OpCode::NewArrayClear => {
-                vb_set(&mut self.seen_allocation, op.pos.get().raw());
+                self.seen_allocation.insert(op.pos.get().raw() as usize);
                 if let Some(new_box) = ctx.get_box_replacement_operand_opt(op.pos.get()) {
                     self.unescaped.insert(new_box);
                 }
@@ -3378,7 +3367,7 @@ impl Optimization for OptHeap {
         self.cached_arrayitems.clear();
         self.seen_guard_not_invalidated = false;
         self.postponed_op = None;
-        self.seen_allocation.clear();
+        self.seen_allocation = BitSet::new();
         self.unescaped.clear();
         self.heapc_deps.clear();
         self.last_emitted_removed = false;

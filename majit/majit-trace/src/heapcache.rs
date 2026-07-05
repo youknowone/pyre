@@ -7,33 +7,8 @@
 /// Translated from rpython/jit/metainterp/heapcache.py.
 use std::marker::PhantomData;
 
+use bit_set::BitSet;
 use majit_ir::vec_set::VecSet;
-
-// Vec<bool> helpers — RPython stores these as FrontendOp flags, not sets.
-#[inline(always)]
-fn vb_insert(v: &mut Vec<bool>, opref: OpRef) {
-    if opref.is_constant() {
-        return;
-    }
-    let i = opref.raw() as usize;
-    if i >= v.len() {
-        v.resize(i + 1, false);
-    }
-    v[i] = true;
-}
-#[inline(always)]
-fn vb_remove(v: &mut Vec<bool>, opref: &OpRef) -> bool {
-    if opref.is_constant() {
-        return false;
-    }
-    let i = opref.raw() as usize;
-    if i < v.len() && v[i] {
-        v[i] = false;
-        true
-    } else {
-        false
-    }
-}
 
 use majit_ir::{EffectInfo, ExtraEffect, GcRef, OpCode, OpRef, Type};
 
@@ -378,18 +353,18 @@ pub struct HeapCache {
     /// heapcache.py: `quasi_immut_known`.
     quasi_immut_known: VecSet<(OpRef, u32)>,
 
-    /// RPython: FrontendOp flag. Vec<bool> indexed by OpRef.0.
-    is_unescaped: Vec<bool>,
+    /// RPython: FrontendOp flag. BitSet indexed by OpRef.0.
+    is_unescaped: BitSet,
 
-    /// RPython: FrontendOp flag. Vec<bool> indexed by OpRef.0.
-    seen_allocation: Vec<bool>,
+    /// RPython: FrontendOp flag. BitSet indexed by OpRef.0.
+    seen_allocation: BitSet,
 
     /// RPython: FrontendOp flag. Vec<u8> indexed by OpRef.0.
     /// 0 = unknown, 1 = non-null, 2 = null.
     known_nullity: Vec<u8>,
 
-    /// RPython: FrontendOp flag. Vec<bool> indexed by OpRef.0.
-    likely_virtual: Vec<bool>,
+    /// RPython: FrontendOp flag. BitSet indexed by OpRef.0.
+    likely_virtual: BitSet,
 
     /// heapcache.py: loop-invariant call result cache.
     /// RPython stores exactly ONE result: (descr, arg0_int) → result.
@@ -441,10 +416,10 @@ impl HeapCache {
             heap_array_cache: vecset::VecMap::new(),
             known_class: Vec::new(),
             quasi_immut_known: VecSet::new(),
-            is_unescaped: Vec::new(),
-            seen_allocation: Vec::new(),
+            is_unescaped: BitSet::new(),
+            seen_allocation: BitSet::new(),
             known_nullity: Vec::new(),
-            likely_virtual: Vec::new(),
+            likely_virtual: BitSet::new(),
             loopinvariant_descr: None,
             loopinvariant_arg0: None,
             loopinvariant_result: None,
@@ -554,18 +529,17 @@ impl HeapCache {
         let flags = self.flags_for_ref(opref) | u32::from(flag);
         self.set_flags_for_ref(opref, flags);
         // Keep mirrors: boolean flags used by this Rust implementation.
+        let i = opref.raw() as usize;
         match flag {
             HF_SEEN_ALLOCATION => {
-                vb_insert(&mut self.seen_allocation, opref);
+                self.seen_allocation.insert(i);
             }
             HF_KNOWN_CLASS => {
-                let i = opref.raw() as usize;
                 if i >= self.known_class.len() {
                     self.known_class.resize(i + 1, None);
                 }
             }
             HF_KNOWN_NULLITY => {
-                let i = opref.raw() as usize;
                 if i >= self.known_nullity.len() {
                     self.known_nullity.resize(i + 1, 0);
                 }
@@ -574,10 +548,10 @@ impl HeapCache {
                 }
             }
             HF_IS_UNESCAPED => {
-                vb_insert(&mut self.is_unescaped, opref);
+                self.is_unescaped.insert(i);
             }
             HF_LIKELY_VIRTUAL => {
-                vb_insert(&mut self.likely_virtual, opref);
+                self.likely_virtual.insert(i);
             }
             // HF_NONSTD_VABLE has no mirror — heapc_flags is the source of truth.
             _ => {}
@@ -594,31 +568,26 @@ impl HeapCache {
         }
         let updated = flags & !u32::from(flag);
         self.set_flags_for_ref(opref, updated);
+        let i = opref.raw() as usize;
         match flag {
             HF_IS_UNESCAPED => {
-                vb_remove(&mut self.is_unescaped, &opref);
+                self.is_unescaped.remove(i);
             }
             HF_LIKELY_VIRTUAL => {
-                vb_remove(&mut self.likely_virtual, &opref);
+                self.likely_virtual.remove(i);
             }
             HF_SEEN_ALLOCATION => {
-                vb_remove(&mut self.seen_allocation, &opref);
+                self.seen_allocation.remove(i);
             }
             HF_KNOWN_NULLITY => {
-                {
-                    let _i = opref.raw() as usize;
-                    if _i < self.known_nullity.len() {
-                        self.known_nullity[_i] = 0;
-                    }
-                };
+                if i < self.known_nullity.len() {
+                    self.known_nullity[i] = 0;
+                }
             }
             HF_KNOWN_CLASS => {
-                {
-                    let _i = opref.raw() as usize;
-                    if _i < self.known_class.len() {
-                        self.known_class[_i] = None;
-                    }
-                };
+                if i < self.known_class.len() {
+                    self.known_class[i] = None;
+                }
             }
             _ => {}
         }
@@ -682,9 +651,11 @@ impl HeapCache {
         if opref.is_constant() {
             return;
         }
-        if !vb_remove(&mut self.is_unescaped, &opref) {
+        let i = opref.raw() as usize;
+        if !self.is_unescaped.contains(i) {
             return;
         }
+        self.is_unescaped.remove(i);
         // RPython remove_flags(box, HF_LIKELY_VIRTUAL | HF_IS_UNESCAPED).
         // _remove_flag updates heapc_flags AND mirrors HF_IS_UNESCAPED /
         // HF_LIKELY_VIRTUAL Vec<bool> back out, so the version-gated
@@ -2071,10 +2042,10 @@ impl HeapCache {
         // a version bump cannot invalidate them. Clear them explicitly.
         self.known_class.clear();
         self.quasi_immut_known.clear();
-        self.is_unescaped.clear();
-        self.seen_allocation.clear();
+        self.is_unescaped = BitSet::new();
+        self.seen_allocation = BitSet::new();
         self.known_nullity.clear();
-        self.likely_virtual.clear();
+        self.likely_virtual = BitSet::new();
         self.heapc_deps.clear();
         // history.py:644-668 FO_REPLACED_WITH_CONST is stored on the
         // FrontendOp's `position_and_flags` field, so RPython's flag
