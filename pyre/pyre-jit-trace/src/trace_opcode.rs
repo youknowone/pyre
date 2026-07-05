@@ -7214,6 +7214,25 @@ impl MIFrame {
         let next = if let Some((opref, cv)) = gen_result {
             FrontendOp::new(opref, ConcreteValue::Int(cv))
         } else {
+            // Pin the runtime iterator to the concrete residual kind before the
+            // opaque `jit_range_iter_next_or_null` call. A polymorphic FOR_ITER
+            // greenkey can dispatch a `via_space_next` iterator (generator /
+            // user `__next__` / itertools / …) into this compiled trace; the
+            // residual only handles range / long-range / seq and would `panic!`
+            // on any other kind. `guard_class` deopts the mismatching iterator
+            // to the interpreter, mirroring `guard_range_iter` on the inline
+            // leg. The residual `else` reaches only long-range and inline-seq
+            // (int-range took the inline leg above), so dispatch on
+            // `is_long_range_iter` vs the seq fallback.
+            self.with_ctx(|this, ctx| {
+                let expected =
+                    if unsafe { pyre_object::functional::is_long_range_iter(concrete_iter) } {
+                        &pyre_object::functional::LONG_RANGE_ITER_TYPE as *const PyType
+                    } else {
+                        &pyre_object::iterobject::SEQ_ITER_TYPE as *const PyType
+                    };
+                this.guard_class(ctx, iter, expected);
+            });
             let opref = self.trace_iter_next_value(iter)?;
             FrontendOp::void(opref)
         };

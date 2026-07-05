@@ -468,11 +468,19 @@ pub fn emit_trace_compare_value(
 }
 
 pub fn emit_trace_range_iter_next_or_null(ctx: &mut TraceCtx, iter: OpRef) -> OpRef {
-    emit_trace_call_ref_typed(
-        ctx,
+    // The residual advances the iterator cursor (`W_SeqIterObject.index` /
+    // long-range fields), and the long-range leg allocates a fresh bigint, so
+    // it both writes the heap and can collect. `emit_trace_call_ref_typed`'s
+    // `default_effect_info()` declares an empty write set (cached heap state
+    // survives), which would let optheap CSE an iterator/seq getfield across
+    // the call. Record `MOST_GENERAL` (RandomEffects + can_invalidate +
+    // can_collect) like the other unanalyzed external-writer residuals
+    // (`emit_trace_call_void_word_abi`, `emit_trace_build_flat`).
+    ctx.call_ref_typed_with_effect(
         jit_range_iter_next_or_null as *const (),
         &[iter],
         &[Type::Ref],
+        majit_ir::EffectInfo::MOST_GENERAL,
     )
 }
 
@@ -682,8 +690,14 @@ pub trait TraceHelperAccess {
     }
 
     fn trace_iter_next_value(&mut self, iter: OpRef) -> Result<OpRef, PyError> {
+        // `jit_range_iter_next_or_null` returns value-or-null (null =
+        // exhaustion, caught by the trailing for-iter GuardNonnull) and
+        // `panic!`s rather than raising on any other iterator kind — which the
+        // caller's `guard_class` now makes unreachable. It never sets the
+        // thread-local exception, so no trailing GuardNoException (mirrors the
+        // inline range leg and `trace_bool_value_from_truth`'s cannot-raise
+        // rationale).
         let result = self.with_trace_ctx(|ctx| emit_trace_range_iter_next_or_null(ctx, iter));
-        self.trace_record_no_exception_guard();
         Ok(result)
     }
 
