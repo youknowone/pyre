@@ -2571,9 +2571,22 @@ fn compute_bridge_root_parent_frame(
     let resume_py_pc = root_pc as u32;
     // Null the not-yet-produced call-result slot before collecting the active
     // boxes (the reconstructed callee supplies it on `SubReturn`), mirroring
-    // `compute_inline_caller_frame`.  Operate on a clone of `registers_r` so
-    // `root_sym` stays a shared borrow.
-    let mut regs_r = root_sym.registers_r.clone();
+    // `compute_inline_caller_frame`.  Operate on a clone so `root_sym` stays a
+    // shared borrow.
+    //
+    // `collect_outer_active_boxes` reads the Ref bank by abstract register
+    // color (`_get_list_of_active_boxes`, pyjitpl.py:216-233), so it needs the
+    // color-indexed `f.registers_r` (`consume_boxes`, resume.py:1055), NOT the
+    // slot-indexed semantic mirror `setup_bridge_sym` left in
+    // `sym.registers_r`.  The mirror leaves an operand live across the resumed
+    // call (e.g. `t1` in `return fib(n-1)+fib(n-2)`) at `OpRef::NONE` under its
+    // color, which resolves to a NULL const and aborts the second residual
+    // call.  Prefer the persisted color decode; fall back to `registers_r` for
+    // non-bridge callers (`bridge_registers_r == None`).
+    let mut regs_r = root_sym
+        .bridge_registers_r
+        .clone()
+        .unwrap_or_else(|| root_sym.registers_r.clone());
     if let Some(result_color) = crate::state::result_color_at_pc_at(jitcode_index as i32, root_pc) {
         if result_color < regs_r.len() {
             regs_r[result_color] = trace_ctx.const_ref(pyre_object::PY_NULL as i64);

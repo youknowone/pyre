@@ -1974,6 +1974,27 @@ pub struct PyreSym {
     /// back to NONE, and so the full-body-walk argbox seed can recover the
     /// kept conditional-expression / short-circuit value (#124).
     pub(crate) bridge_stack_oprefs: Option<Vec<OpRef>>,
+    /// The color-indexed Ref register bank as `consume_boxes`
+    /// (resume.py:1055) fills `f.registers_r` — one box per abstract
+    /// register color the guard's resume numbering named. This is the
+    /// authoritative `_get_list_of_active_boxes` (pyjitpl.py:216-233)
+    /// source: it reads `registers_r[color]` by color at snapshot time.
+    ///
+    /// `sym.registers_r` diverges from this on the Ref bank: for the
+    /// tracer's own LOAD_FAST/STORE_FAST reads pyre needs a SEMANTIC
+    /// slot-indexed mirror (`[locals.., stack_tail..]`) because the
+    /// per-CodeObject regalloc colors a slot at a color other than its
+    /// slot index. `setup_bridge_sym` therefore overwrites
+    /// `sym.registers_r` with that mirror and `init_symbolic` rebuilds it
+    /// again from `bridge_local_oprefs`/`bridge_stack_oprefs`, so the
+    /// color-indexed decode is lost from `sym.registers_r`. The int/float
+    /// banks keep their color decode (init_symbolic rebuilds only the Ref
+    /// bank), so only Ref needs this side field. A cross-frame bridge
+    /// resume snapshot (`compute_bridge_root_parent_frame`) reads this to
+    /// recover an operand live across a resumed call (e.g. `t1` in
+    /// `return fib(n-1)+fib(n-2)`) that the semantic mirror does not carry
+    /// by color.
+    pub(crate) bridge_registers_r: Option<Vec<OpRef>>,
     /// Bridge-specific override for symbolic_local_types.
     /// virtualizable.py:44 + interp_jit.py:25-31: locals_cells_stack_w[*]
     /// is a W_Root array → all items are Type::Ref. setup_bridge_sym
@@ -3803,6 +3824,7 @@ impl PyreSym {
             nlocals: 0,
             bridge_local_oprefs: None,
             bridge_stack_oprefs: None,
+            bridge_registers_r: None,
             bridge_local_types: None,
             vable_last_instr: OpRef::NONE,
             vable_pycode: OpRef::NONE,
@@ -8191,6 +8213,13 @@ impl JitState for PyreJitState {
         // kept conditional-expression / short-circuit value.
         sym.bridge_stack_oprefs = Some(bridge_stack);
         sym.bridge_local_types = Some(bridge_local_types);
+        // consume_boxes (resume.py:1055) fills `f.registers_r` by abstract
+        // register color; keep that color-indexed decode so a cross-frame
+        // bridge resume snapshot can read `registers_r[color]`
+        // (`_get_list_of_active_boxes`, pyjitpl.py:216-233). `sym.registers_r`
+        // is about to be overwritten with the slot-indexed semantic mirror and
+        // then rebuilt by init_symbolic, losing this color decode.
+        sym.bridge_registers_r = Some(bridge_registers_r.clone());
 
         // pyjitpl.py:3424 `rebuild_state_after_failure` tail —
         // `consume_virtualref_boxes` (resume.py:1093):
