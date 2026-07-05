@@ -6754,9 +6754,8 @@ fn patch_frame_traceback_descriptors() {
         let descrs: Vec<PyObjectRef> = ns
             .entries()
             .filter_map(|(_, &descr)| {
-                (!descr.is_null()
-                    && unsafe { pyre_object::typedef::is_getset_property(descr) })
-                .then_some(descr)
+                (!descr.is_null() && unsafe { pyre_object::typedef::is_getset_property(descr) })
+                    .then_some(descr)
             })
             .collect();
         for descr in descrs {

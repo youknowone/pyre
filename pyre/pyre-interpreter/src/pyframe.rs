@@ -2581,16 +2581,25 @@ impl PyFrame {
                 "can't jump from the 'call' trace event of a new frame",
             ));
         }
-        // A jump from a frame suspended at `YIELD_VALUE` is permitted
+        // Jumps are allowed from a `line` trace event, and — outside a
+        // line event — only when the frame is suspended at `YIELD_VALUE`
         // (`frame_lineno_set_impl` lists `PY_MONITORING_EVENT_PY_YIELD`
-        // in the same allowed group as line/jump events); the pending
+        // in the same allowed group as line/jump events).  The pending
         // yield value is accounted for by the `is_suspended` unwind
-        // below, so no early rejection here.
-        // Only allow jumps when tracing a `line` event (`is_in_line_tracing`).
+        // below.  pyframe.py:685-689:
+        //     if not d.is_in_line_tracing:
+        //         if ord(code[self.last_instr]) != YIELD_VALUE:
+        //             raise "can only jump from a 'line' trace event"
         if !self.getdebug().map_or(false, |d| d.is_in_line_tracing) {
-            return Err(crate::PyError::value_error(
-                "can only jump from a 'line' trace event",
-            ));
+            let at_yield = matches!(
+                crate::pyopcode::decode_instruction_at(self.code(), self.last_instr as usize),
+                Some((crate::bytecode::Instruction::YieldValue { .. }, _))
+            );
+            if !at_yield {
+                return Err(crate::PyError::value_error(
+                    "can only jump from a 'line' trace event",
+                ));
+            }
         }
         // `frame_is_suspended` — a generator/coroutine frame that has
         // started, is not currently running, and is not exhausted has a

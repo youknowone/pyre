@@ -1319,7 +1319,15 @@ impl ExecutionContext {
             unsafe {
                 let d = (*frame).getorcreatedebug(init_lineno);
                 if d.f_lineno == lineno {
-                    d.f_lineno = old_lineno;
+                    // executioncontext.py:397-404 — for generator/coroutine
+                    // resumptions (`event == 'call'` while `last_instr >= 0`)
+                    // keep `d.f_lineno` at the yield line so the instruction
+                    // right after `YIELD_VALUE` (still on the same source
+                    // line) does not fire a spurious line event; skip the
+                    // restore in that case.
+                    if event != "call" || (*frame).last_instr < 0 {
+                        d.f_lineno = old_lineno;
+                    }
                 }
                 d.is_in_line_tracing = prev_line_tracing;
             }
