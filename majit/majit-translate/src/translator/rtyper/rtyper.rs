@@ -5286,12 +5286,16 @@ fn lowlevel_overflow_check_wrapper_graph(
     Ok(helper_pygraph_from_graph(graph, argnames, func))
 }
 
-fn direct_call_operation(
+/// Build the `functionptr` constant that names `ll_function`'s helper
+/// graph — the callee const a `direct_call` operation takes as its first
+/// argument. Reused wherever a synthesised graph embeds another low-level
+/// helper as a `direct_call` callee (e.g. the StringBuilder `ll_build` /
+/// `ll_append*` closures wiring their `ll_fold_pieces` / `ll_grow_by`
+/// sub-helpers as constants).
+pub(crate) fn functionptr_const(
     rtyper: &RPythonTyper,
     ll_function: &LowLevelFunction,
-    args_v: Vec<Hlvalue>,
-    result: Variable,
-) -> Result<SpaceOperation, TyperError> {
+) -> Result<Constant, TyperError> {
     let graph = ll_function.graph.as_ref().ok_or_else(|| {
         TyperError::missing_rtype_operation(format!(
             "low-level helper {} has no annotated helper graph",
@@ -5316,8 +5320,19 @@ fn direct_call_operation(
         )));
     }
     let func_ptr_type = LowLevelType::Ptr(Box::new(func_ptr._TYPE.clone()));
-    let c_func = inputconst_from_lltype(&func_ptr_type, &ConstValue::LLPtr(Box::new(func_ptr)))
-        .expect("functionptr constant must match Ptr(FuncType)");
+    Ok(
+        inputconst_from_lltype(&func_ptr_type, &ConstValue::LLPtr(Box::new(func_ptr)))
+            .expect("functionptr constant must match Ptr(FuncType)"),
+    )
+}
+
+fn direct_call_operation(
+    rtyper: &RPythonTyper,
+    ll_function: &LowLevelFunction,
+    args_v: Vec<Hlvalue>,
+    result: Variable,
+) -> Result<SpaceOperation, TyperError> {
+    let c_func = functionptr_const(rtyper, ll_function)?;
     let mut call_args = Vec::with_capacity(args_v.len() + 1);
     call_args.push(Hlvalue::Constant(c_func));
     call_args.extend(args_v);
@@ -7030,6 +7045,24 @@ mod tests {
                         .is_some_and(|target| BlockKey::of(target) == BlockKey::of(&exceptblock))
             }));
         }
+    }
+
+    #[test]
+    fn functionptr_const_names_helper_graph_with_matching_signature() {
+        let (_ann, rtyper) = make_live_rtyper();
+        let llfn = rtyper
+            .lowlevel_helper_function("ll_check_chr", vec![LowLevelType::Signed], LowLevelType::Void)
+            .unwrap();
+        let c_func = super::functionptr_const(&rtyper, &llfn).expect("functionptr const");
+        let Some(LowLevelType::Ptr(ptr)) = &c_func.concretetype else {
+            panic!("functionptr const must be Ptr(Func), got {:?}", c_func.concretetype);
+        };
+        let PtrTarget::Func(func_type) = &ptr.TO else {
+            panic!("functionptr const Ptr.TO must be Func, got {:?}", ptr.TO);
+        };
+        assert_eq!(func_type.args, vec![LowLevelType::Signed]);
+        assert_eq!(func_type.result, LowLevelType::Void);
+        assert!(matches!(c_func.value, ConstValue::LLPtr(_)));
     }
 
     #[test]
