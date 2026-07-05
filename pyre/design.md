@@ -34,7 +34,7 @@ Rust, and a PyPy-equivalent (pyre) on top of that.**
 | RPython translator (flowspace → annotator → rtyper) | **majit-translate** (`front/ast` → `flowspace/` → `annotator/` → `rtyper/`) over **Charon LLBC** artifacts | Same pipeline, same module names, run at `cargo build` time over extracted `.ullbc` instead of live bytecode. |
 | `jtransform`/codewriter → JitCode | **codewriter/** → JitCode | Identical role. |
 | metainterp, optimizer, resume, blackhole | **majit-metainterp / majit-trace** | Line-by-line port of the *tracing* JIT (pyjitpl5 lineage), not the 2007 PE JIT. |
-| x86/ARM/… hand-written backends (~300k LOC) | **majit-backend-cranelift / -dynasm / -wasm** | Machine-code generation delegated downward; see §3.4. |
+| x86/ARM/… hand-written backends (~300k LOC) | **majit-backend-dynasm / -cranelift / -wasm** | Three thin backends behind one trait, current primary dynasm; see §3.4. |
 | incminimark GC | **majit-gc** (nursery + oldgen + incremental + card marking) | Port of the winner, not of Boehm/refcount/mark-sweep. |
 | sandbox transform | **rsandbox** | Compile-time sandbox aspect. |
 | `pypy/interpreter/` + `pypy/objspace/std/` | **pyre-interpreter + pyre-object** | Structural port, same names, same relative locations. |
@@ -165,17 +165,67 @@ Consequences that are already policy:
   aspect-layer concern* (majit-gc), not by sprinkling atomics through
   pyre-object.
 
-### 3.4 Backends: answer D08.2's open question with "delegate"
+**GC under free threading (settled 2026-07, gh#396).** The architecture is a
+**stop-the-world safepoint harness around an unchanged incminimark core** —
+the HotSpot/SGen shape, explicitly not PEP 703's non-moving route.
+
+- *Contract restatement.* What incminimark actually relies on is (a)
+  exclusive heap access during each collection **step**, (b) enumerability
+  of all roots at that instant, (c) all inter-step mutations caught by the
+  write barrier. The GIL was PyPy's implementation of (a); safepoints are
+  pyre's implementation of the same contract. The audit that this holds for
+  the *incremental* major is source-verified: major slices already execute
+  at minor-collection time (`minor_collection_with_major_progress`,
+  incminimark.py:824), hence inside STW windows; the barrier is deliberately
+  newvalue-agnostic ("the incremental GC nowadays relies on this fact",
+  incminimark.py:1516-1518) and its records are consumed at the next minor
+  (VISITED clear + `more_objects_to_trace` re-append, incminimark.py:
+  2079-2083). Concurrency therefore lives entirely in the harness — mutator
+  registry, safepoint polls (allocation sites, runtime entry/exit, loop
+  back-edges: precisely the sites where the existing rooting invariant
+  already holds), TLABs, per-thread store buffers — and the ported
+  collection algorithms are not rewritten.
+- *Moving nursery is kept.* JIT inline nursery allocation is a performance
+  pillar; embedder-boundary pointer stability is solved by pinning (upstream
+  already has it: `GCFLAG_PINNED`, incminimark.py:148) or oldgen promotion,
+  not by adopting a non-moving allocator.
+- *Deviation zones are exactly four*, and everything else remains parity
+  (N2): (1) allocation front-end, single bump pointer → per-thread TLAB
+  chunks carved from the one nursery region (per-chunk pinning walls);
+  (2) the barrier **producer** side — atomic header-flag RMW, per-thread
+  SSBs flushing into the canonical `old_objects_pointing_to_young`, so the
+  consumer code stays a line-by-line port; (3) codegen addressing:
+  `nursery_free` baked static address → thread-context-relative, with the
+  inline fast-path shape unchanged; (4) the safepoint subsystem itself,
+  which has no upstream counterpart (and therefore no merge surface).
+- *Non-options, with their failure mode*: a GIL (contradicts this section);
+  per-access locks on the GC handle (fixes the data race, not the
+  moving-collector root-visibility race — demonstrated by the gh#396
+  cargo-test heap corruption); interior mutability without synchronization
+  (hides the UB); per-thread heaps (breaks shared-heap semantics, and
+  process-global caches already made it flaky in practice); a concurrent
+  non-STW collector (requires rewriting incminimark's tracing/evacuation).
+- *TLS discipline refined*: thread-local state is legitimate exactly where
+  the design is per-thread (TLABs, mutator contexts); what is forbidden is
+  a TLS raw pointer into unsynchronized shared mutable state — the gh#396
+  defect. Staged execution plan (P0 soundness core → P1 TLAB/SSB/back-edge
+  polls → P2 `_thread` + object-model epic) is recorded on gh#396.
+
+### 3.4 Backends: three thin backends, not six hand-written
 
 D08.2 closed with a research question: can the meta-JIT sit on a lower-level
 code generator that owns regalloc/instruction selection? RPython answered
-"no" by default and paid ~300k LOC of hand-written backends. pyre answers
-**yes**: Cranelift (plus dynasm where measured to matter, plus wasm as a
-target of its own). The trade is explicit: we accept a less specialized
-lowest layer in exchange for not owning six instruction sets. When Cranelift
-is the bottleneck (compile latency, missing patterns), the recourse ladder
-is: fix usage → dynasm fast path → upstream Cranelift work — not a
-hand-written pyre backend.
+"no" by default and paid ~300k LOC of hand-written backends. pyre's answer is
+to keep **three thin backends behind one trait** rather than owning six full
+instruction sets. The current primary is **dynasm** — direct machine-code
+emission via dynasm-rs, favored for compile latency and fine control;
+**Cranelift** is the portable option that does take regalloc/instruction
+selection downward (the literal "yes" to D08.2's question); **wasm** is a
+target of its own. The trade is explicit: a less specialized lowest layer in
+exchange for not owning six instruction sets. When a backend is the
+bottleneck (compile latency, missing patterns), the recourse ladder is: fix
+usage → dynasm fast path → upstream Cranelift work — not a hand-written pyre
+backend.
 
 ### 3.5 What is explicitly *not* on the map (anti-roadmap)
 
@@ -206,6 +256,18 @@ why the original failed:
   compiler front-end is not an extension point.
 - **Naive refcounting**, conservative GC as default, or any GC not derived
   from the incminimark lineage.
+
+**Anti-roadmap vs. provisional alternatives — a distinction.** The
+exclusions above concern *re-adopting a mechanism PyPy abandoned* (ropes,
+multimethods, ootype…) as a default; reversing one requires the §6
+justification. They say nothing about pyre's own **provisional
+implementations** of the *winning* mechanisms. Where the faithful port is not
+yet in place, a simpler alternative is an acceptable **interim** — provided
+the orthodox port stays the target (A6/N2), the deviation is tracked
+(A7, §3.1), and it remains **reversible to the canonical implementation**.
+Shipping an alternative now never forecloses correcting to the orthodox one
+when measurement or need calls for it; that correction is expected, not a
+policy change.
 
 ### 3.6 Configuration: small supported matrix, build-time resolution
 

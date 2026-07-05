@@ -87,10 +87,10 @@ are tracked by a census, not accepted silently.
 
 RPython maintains **hand-written assembler backends** for x86, ARM, AArch64, s390x, and PPC (~300K LOC).
 
-majit delegates instruction selection and register allocation downward and keeps three thin backends behind one `Backend` trait (`majit-backend`, the `AbstractCPU` analog):
+majit keeps three thin backends behind one `Backend` trait (`majit-backend`, the `AbstractCPU` analog) instead of hand-writing a full backend per ISA:
 
-- **majit-backend-cranelift** — the portable default ([Cranelift](https://cranelift.dev/))
-- **majit-backend-dynasm** — direct machine-code emission via dynasm-rs where measured to matter
+- **majit-backend-dynasm** — the current primary backend: direct machine-code emission via dynasm-rs (low compile latency)
+- **majit-backend-cranelift** — portable option that delegates instruction selection and register allocation downward ([Cranelift](https://cranelift.dev/))
 - **majit-backend-wasm** — emits WebAssembly trace modules (browser via wasm-bindgen, or native embedders like wasmi/wasmtime)
 
 ### GC
