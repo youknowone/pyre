@@ -637,6 +637,14 @@ pub enum PyreHelperKind {
     /// The recognition has no bound-method callable to pin: the list and
     /// value arrive directly as the residual's Ref operands.
     ListAppendValue,
+    /// `bh_call_function_ex_fn(callable, self_or_null, starargs,
+    /// kwargs_or_null)` — the CALL_FUNCTION_EX residual.  Both `self_or_null`
+    /// (arg index 1) and `kwargs_or_null` (arg index 3) are `PY_NULL`
+    /// sentinels the helper checks before use (`self_or_null` is prepended
+    /// as arg0 only when non-null; a null `kwargs_or_null` skips the `**`
+    /// merge), so a concrete-NULL there is the normal shape — not the broken
+    /// baked-NULL-globals shape the walker's may-force NULL-ref gate rejects.
+    CallFunctionEx,
 }
 
 impl EffectInfo {

@@ -5199,11 +5199,20 @@ fn walker_abort_if_mayforce_null_ref_arg(
     // FBW path can own the raise instead of declining to the trait.
     let is_raise_varargs = fbw_raise_enabled()
         && call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::RaiseVarargs;
+    // `bh_call_function_ex_fn(callable, self_or_null, starargs, kwargs_or_null)`
+    // — `self_or_null` (arg 1) and `kwargs_or_null` (arg 3) are checked
+    // `PY_NULL` sentinels (never dereferenced when null), so a concrete-NULL
+    // there is the normal `f(*args)` / no-`**` shape, not the broken baked-NULL.
+    let is_call_function_ex =
+        call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::CallFunctionEx;
     for (i, &ty) in call_descr.arg_types().iter().enumerate() {
         if ty != majit_ir::Type::Ref {
             continue;
         }
         if is_call_fn && i == 1 {
+            continue;
+        }
+        if is_call_function_ex && (i == 1 || i == 3) {
             continue;
         }
         if is_raise_varargs && i + 1 == call_descr.arg_types().len() {

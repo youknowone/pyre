@@ -3654,55 +3654,15 @@ impl OpcodeStepExecutor for PyFrame {
     fn call_function_ex(&mut self) -> Result<(), PyError> {
         let kwargs_or_null = self.pop();
         let args_obj = self.pop();
-        let _null = self.pop();
+        let self_or_null = self.pop();
         let callable = self.pop();
-
-        // argument.py unpack_combined_starargs equivalent: fast-path tuple
-        // and list so common bytecode emits avoid iter protocol overhead;
-        // fall back to the iter protocol for arbitrary iterables.
-        let args: Vec<PyObjectRef> = unsafe {
-            if pyre_object::is_tuple(args_obj) {
-                let n = pyre_object::w_tuple_len(args_obj);
-                (0..n as i64)
-                    .filter_map(|i| pyre_object::w_tuple_getitem(args_obj, i))
-                    .collect()
-            } else if pyre_object::is_list(args_obj) {
-                let n = pyre_object::w_list_len(args_obj);
-                (0..n as i64)
-                    .filter_map(|i| pyre_object::w_list_getitem(args_obj, i))
-                    .collect()
-            } else {
-                crate::builtins::collect_iterable(args_obj)?
-            }
-        };
-
-        // Merge the `**` mapping into the call.  argument.py:106-150
-        // `_combine_starstarargs_wrapped` accepts any mapping — the dict fast
-        // path or an arbitrary object via `keys()` / `__getitem__` — raising
-        // "argument after ** must be a mapping" for a non-mapping and
-        // "keywords must be strings" for a non-str key.
-        if !kwargs_or_null.is_null() {
-            let mut keyword_names_w: Vec<PyObjectRef> = Vec::new();
-            let mut keywords_w: Vec<PyObjectRef> = Vec::new();
-            crate::argument::combine_starstarargs_wrapped(
-                &mut keyword_names_w,
-                &mut keywords_w,
-                kwargs_or_null,
-                callable,
-            )?;
-            if !keyword_names_w.is_empty() {
-                let entries: Vec<(rustpython_wtf8::Wtf8Buf, PyObjectRef)> = keyword_names_w
-                    .iter()
-                    .zip(keywords_w.iter())
-                    .map(|(&k, &v)| (unsafe { pyre_object::w_str_get_wtf8(k) }.to_owned(), v))
-                    .collect();
-                let result = crate::call::call_with_kwargs(self, callable, &args, &entries)?;
-                self.push(result);
-                return Ok(());
-            }
-        }
-
-        let result = call_callable(self, callable, &args)?;
+        let result = crate::call::call_function_ex(
+            self,
+            callable,
+            self_or_null,
+            args_obj,
+            kwargs_or_null,
+        )?;
         self.push(result);
         Ok(())
     }

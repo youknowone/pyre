@@ -3653,6 +3653,58 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
     }
 }
 
+/// CALL_FUNCTION_EX residual (`call_function_ex(callable, self_or_null,
+/// starargs, kwargs_or_null)` HLOp → `residual_call_r_r`).  Unpacks the
+/// `*` iterable and merges the `**` mapping through the shared
+/// `call::call_function_ex`, then dispatches.  Resolves the parent frame
+/// from the execution context like [`bh_call_fn_impl`], and runs the
+/// nested Python call under `force_plain_eval` (blackhole.py:1225
+/// `bhimpl_residual_call_*` is an opaque CPU call — no JIT re-entry).
+/// MayForce: unpacking an arbitrary iterable / mapping and the dispatched
+/// call may run Python.
+pub extern "C" fn bh_call_function_ex_fn(
+    callable: i64,
+    self_or_null: i64,
+    starargs: i64,
+    kwargs_or_null: i64,
+) -> i64 {
+    let ec = pyre_interpreter::call::getexecutioncontext();
+    let parent_frame_ptr: *const PyFrame = if ec.is_null() {
+        std::ptr::null()
+    } else {
+        unsafe { (*ec).gettopframe() as *const PyFrame }
+    };
+    assert!(
+        !parent_frame_ptr.is_null(),
+        "bh_call_function_ex_fn requires a live parent PyFrame from \
+         getexecutioncontext().gettopframe(); the eval loop must pin the \
+         execution context before any residual call"
+    );
+    let saved_ctx = pyre_interpreter::call::take_last_exec_ctx();
+    unsafe {
+        pyre_interpreter::call::set_last_exec_ctx((*parent_frame_ptr).execution_context);
+    }
+    let parent_frame = unsafe { &mut *(parent_frame_ptr as *mut PyFrame) };
+    let result = {
+        let _plain_guard = pyre_interpreter::call::force_plain_eval();
+        pyre_interpreter::call::call_function_ex(
+            parent_frame,
+            callable as PyObjectRef,
+            self_or_null as PyObjectRef,
+            starargs as PyObjectRef,
+            kwargs_or_null as PyObjectRef,
+        )
+    };
+    pyre_interpreter::call::set_last_exec_ctx(saved_ctx);
+    match result {
+        Ok(result) => result as i64,
+        Err(err) => {
+            publish_residual_call_exception(err.to_exc_object() as i64);
+            0
+        }
+    }
+}
+
 /// `_load_global` residual (pyopcode.py:958-969).  Resolves the namespace via
 /// the executing frame's `get_w_globals_storage()` when the live frame OWNS this
 /// `w_code` (`frame.pycode == w_code`) — honoring an `exec(code, ns)`

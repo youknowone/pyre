@@ -3457,6 +3457,13 @@ pub struct LoweringContext {
     /// popped mapping then the live frame globals (user `__getattr__` →
     /// `MayForce`).
     pub load_from_dict_or_globals_fn_idx: u16,
+    /// `call_function_ex_fn` descrs-pool index.  CALL_FUNCTION_EX records
+    /// `call_function_ex(callable, self_or_null, starargs, kwargs_or_null)`
+    /// lowered to `residual_call_r_r(ConstInt(fn_idx), ListR([callable,
+    /// self_or_null, starargs, kwargs_or_null]), Descr) → reg` via
+    /// [`lower_call_function_ex_hlop_to_insn`]; `bh_call_function_ex_fn`
+    /// unpacks `*`/`**` and dispatches (user code → `MayForce`).
+    pub call_function_ex_fn_idx: u16,
     /// `unary_not_fn` descrs-pool index.  UNARY_NOT records the object-space
     /// `not_(value)` op (pyopcode.py:651) lowered to
     /// `residual_call_r_r(ConstInt(fn_idx), ListR([value]), Descr) → reg` via
@@ -4355,6 +4362,32 @@ where
                 vec![array_operand],
                 CallFlavor::MayForce,
                 majit_ir::PyreHelperKind::None,
+                dst_reg,
+            ))
+        }
+        "call_function_ex" => {
+            // CALL_FUNCTION_EX: `call_function_ex(callable, self_or_null,
+            // starargs, kwargs_or_null)` → `residual_call_r_r(ConstInt(
+            // call_function_ex_fn_idx), ListR([callable, self_or_null,
+            // starargs, kwargs_or_null]), Descr) → reg`.  Unpacks `*`/`**`
+            // and dispatches (runs user code) → `MayForce`.
+            if op.args.len() != 4 {
+                return None;
+            }
+            let ref_operands: Vec<Operand> = op
+                .args
+                .iter()
+                .map(|arg| flatten_arg_with_lowering(arg, get_register, lower_constant))
+                .collect();
+            let dst_reg = match &op.result {
+                Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
+                _ => return None,
+            };
+            Some(build_residual_call_r_r_insn_from_operands(
+                ctx.call_function_ex_fn_idx,
+                ref_operands,
+                CallFlavor::MayForce,
+                majit_ir::PyreHelperKind::CallFunctionEx,
                 dst_reg,
             ))
         }
@@ -10709,6 +10742,7 @@ mod tests {
             dict_merge_fn_idx: 124,
             list_to_tuple_fn_idx: 125,
             load_from_dict_or_globals_fn_idx: 126,
+            call_function_ex_fn_idx: 127,
             ..Default::default()
         };
         let code_const = Constant::new(
@@ -11038,6 +11072,106 @@ mod tests {
                             "ListR = [array], got {:?}",
                             list.content
                         );
+                    }
+                    other => panic!("expected ListR, got {other:?}"),
+                }
+                assert_eq!(
+                    result,
+                    Some(Register {
+                        kind: Kind::Ref,
+                        index: 102
+                    }),
+                );
+            }
+            _ => panic!("expected Insn::Op, got {insn:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_call_function_ex_emits_residual() {
+        // `call_function_ex(callable, self_or_null, starargs, kwargs_or_null)`
+        // → `residual_call_r_r(ConstInt(call_function_ex_fn_idx), ListR([
+        // callable, self_or_null, starargs, kwargs_or_null]), Descr) → reg`
+        // (MayForce — unpack + dispatch run user code).
+        let callable_var = Variable::new(VariableId(8), Kind::Ref);
+        let self_var = Variable::new(VariableId(10), Kind::Ref);
+        let starargs_var = Variable::new(VariableId(11), Kind::Ref);
+        let kwargs_var = Variable::new(VariableId(12), Kind::Ref);
+        let result_var = Variable::new(VariableId(9), Kind::Ref);
+        let (ctx, _, _) = load_attr_lowering_fixture();
+        let op = super::super::flow::SpaceOperation::new(
+            "call_function_ex",
+            vec![
+                callable_var.into(),
+                self_var.into(),
+                starargs_var.into(),
+                kwargs_var.into(),
+            ],
+            Some(result_var.into()),
+            0,
+        );
+        let mut get_register = |var: Variable| match var.id {
+            VariableId(8) => Register {
+                kind: Kind::Ref,
+                index: 101,
+            },
+            VariableId(10) => Register {
+                kind: Kind::Ref,
+                index: 103,
+            },
+            VariableId(11) => Register {
+                kind: Kind::Ref,
+                index: 104,
+            },
+            VariableId(12) => Register {
+                kind: Kind::Ref,
+                index: 105,
+            },
+            VariableId(9) => Register {
+                kind: Kind::Ref,
+                index: 102,
+            },
+            _ => panic!("unexpected var id {:?}", var.id),
+        };
+        let mut lower_constant = super::flatten_constant_operand_for_test;
+        let insn = super::lower_tuple_build_hlop_to_insn(
+            &op,
+            &ctx,
+            &mut get_register,
+            &mut lower_constant,
+        )
+        .expect("4-arg call_function_ex lowering must succeed");
+        match insn {
+            Insn::Op {
+                opname,
+                args,
+                result,
+            } => {
+                assert_eq!(opname, "residual_call_r_r");
+                assert!(
+                    matches!(args[0], Operand::ConstInt(127)),
+                    "call_function_ex_fn pool index, got {:?}",
+                    args[0]
+                );
+                match &args[1] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Ref);
+                        match &list.content[..] {
+                            [
+                                Operand::Register(c),
+                                Operand::Register(s),
+                                Operand::Register(sa),
+                                Operand::Register(kw),
+                            ] => {
+                                assert_eq!(c.index, 101, "arg0 must be callable");
+                                assert_eq!(s.index, 103, "arg1 must be self_or_null");
+                                assert_eq!(sa.index, 104, "arg2 must be starargs");
+                                assert_eq!(kw.index, 105, "arg3 must be kwargs_or_null");
+                            }
+                            other => panic!(
+                                "ListR must be [callable, self, starargs, kwargs], got {other:?}"
+                            ),
+                        }
                     }
                     other => panic!("expected ListR, got {other:?}"),
                 }

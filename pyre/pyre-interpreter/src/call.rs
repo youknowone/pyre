@@ -637,6 +637,67 @@ pub fn call_callable(frame: &mut PyFrame, callable: PyObjectRef, args: &[PyObjec
     call_callable_with_mode(frame, callable, args, CallMode::Jit)
 }
 
+/// CALL_FUNCTION_EX helper — unpack `starargs`, merge the `**` mapping, and
+/// call.  Factored out of the interpreter's `call_function_ex` so the JIT
+/// residual (`bh_call_function_ex_fn`) shares one implementation.  Mirrors
+/// `argument.py` unpack_combined_starargs + `_combine_starstarargs_wrapped`:
+/// a tuple/list stararg takes the fast path, any other iterable goes through
+/// the iter protocol; a non-null `**` mapping accepts the dict fast path or
+/// `keys()`/`__getitem__`.  `self_or_null` is the pre-callable stack slot —
+/// a non-null value prepends as arg0.
+pub fn call_function_ex(
+    frame: &mut PyFrame,
+    callable: PyObjectRef,
+    self_or_null: PyObjectRef,
+    starargs: PyObjectRef,
+    kwargs_or_null: PyObjectRef,
+) -> PyResult {
+    let mut args: Vec<PyObjectRef> = unsafe {
+        if pyre_object::is_tuple(starargs) {
+            let n = pyre_object::w_tuple_len(starargs);
+            (0..n as i64)
+                .filter_map(|i| pyre_object::w_tuple_getitem(starargs, i))
+                .collect()
+        } else if pyre_object::is_list(starargs) {
+            let n = pyre_object::w_list_len(starargs);
+            (0..n as i64)
+                .filter_map(|i| pyre_object::w_list_getitem(starargs, i))
+                .collect()
+        } else {
+            crate::builtins::collect_iterable(starargs)?
+        }
+    };
+    if !self_or_null.is_null() && !unsafe { pyre_object::is_none(self_or_null) } {
+        args.insert(0, self_or_null);
+    }
+
+    // Merge the `**` mapping into the call.  argument.py:106-150
+    // `_combine_starstarargs_wrapped` accepts any mapping — the dict fast
+    // path or an arbitrary object via `keys()` / `__getitem__` — raising
+    // "argument after ** must be a mapping" for a non-mapping and
+    // "keywords must be strings" for a non-str key.
+    if !kwargs_or_null.is_null() {
+        let mut keyword_names_w: Vec<PyObjectRef> = Vec::new();
+        let mut keywords_w: Vec<PyObjectRef> = Vec::new();
+        crate::argument::combine_starstarargs_wrapped(
+            &mut keyword_names_w,
+            &mut keywords_w,
+            kwargs_or_null,
+            callable,
+        )?;
+        if !keyword_names_w.is_empty() {
+            let entries: Vec<(Wtf8Buf, PyObjectRef)> = keyword_names_w
+                .iter()
+                .zip(keywords_w.iter())
+                .map(|(&k, &v)| (unsafe { pyre_object::w_str_get_wtf8(k) }.to_owned(), v))
+                .collect();
+            return call_with_kwargs(frame, callable, &args, &entries);
+        }
+    }
+
+    call_callable(frame, callable, &args)
+}
+
 /// `typeobject.c type_call` is the metaclass's `tp_call`; calling a class
 /// dispatches through `type(cls).__call__`.  The base `type` has no
 /// `__call__` dict entry — the implicit `__new__`/`__init__` path below is

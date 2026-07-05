@@ -3469,6 +3469,7 @@ struct FnPtrIndices {
     load_common_constant_fn: HelperHandle,
     list_to_tuple_fn: HelperHandle,
     load_from_dict_or_globals_fn: HelperHandle,
+    call_function_ex_fn: HelperHandle,
     unary_not_fn: HelperHandle,
     load_fast_check_fn: HelperHandle,
     list_extend_fn: HelperHandle,
@@ -4012,6 +4013,13 @@ fn register_helper_fn_pointers(
         cpu.load_from_dict_or_globals_fn as *const (),
         CallFlavor::MayForce,
     );
+    // `bh_call_function_ex_fn` unpacks `*`/`**` and dispatches, running
+    // Python → `MayForce`.  Appended last to preserve fn_ptr indices.
+    let call_function_ex_fn = bind(
+        assembler,
+        cpu.call_function_ex_fn as *const (),
+        CallFlavor::MayForce,
+    );
     FnPtrIndices {
         call_fn,
         load_global_fn,
@@ -4086,6 +4094,7 @@ fn register_helper_fn_pointers(
         dict_merge_fn,
         list_to_tuple_fn,
         load_from_dict_or_globals_fn,
+        call_function_ex_fn,
     }
 }
 
@@ -5501,6 +5510,11 @@ impl CodeWriter {
                     idx: load_from_dict_or_globals_fn_idx,
                     flavor: _load_from_dict_or_globals_fn_flavor,
                 },
+            call_function_ex_fn:
+                HelperHandle {
+                    idx: call_function_ex_fn_idx,
+                    flavor: _call_function_ex_fn_flavor,
+                },
             unary_not_fn:
                 HelperHandle {
                     idx: unary_not_fn_idx,
@@ -5654,6 +5668,7 @@ impl CodeWriter {
                 load_common_constant_fn_idx,
                 list_to_tuple_fn_idx,
                 load_from_dict_or_globals_fn_idx,
+                call_function_ex_fn_idx,
                 unary_not_fn_idx,
                 load_fast_check_fn_idx,
                 list_extend_fn_idx,
@@ -9888,14 +9903,50 @@ impl CodeWriter {
                             push_and_bump!(result_value.into(), py_pc);
                         }
 
-                        // CallFunctionEx: pops callable+null+args+kwargs_or_null (4), pushes 1. Net: -3.
+                        // CallFunctionEx: pops callable+null+args+kwargs_or_null
+                        // (4), pushes 1. Net: -3.  Stack top→bottom is
+                        // kwargs_or_null, starargs, self_or_null, callable
+                        // (eval.rs:3636-3639).  Lowers to `call_function_ex(
+                        // callable, self_or_null, starargs, kwargs_or_null)` →
+                        // `residual_call_r_r(call_function_ex_fn, ListR[...])`;
+                        // `bh_call_function_ex_fn` unpacks `*`/`**` and
+                        // dispatches (MayForce).
                         Instruction::CallFunctionEx => {
-                            for _ in 0..4 {
-                                pop_and_decr_depth(&mut current_state, &mut current_depth);
+                            let kwargs_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let kwargs_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            if let super::flow::FlowValue::Variable(v) = &kwargs_value {
+                                pin!(Some(*v), kwargs_reg);
                             }
-                            push_fresh_ref(&mut current_state, &mut graph);
-                            current_depth += 1;
-                            emit_abort_permanent!(py_pc);
+                            let starargs_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let starargs_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            if let super::flow::FlowValue::Variable(v) = &starargs_value {
+                                pin!(Some(*v), starargs_reg);
+                            }
+                            let self_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let self_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            if let super::flow::FlowValue::Variable(v) = &self_value {
+                                pin!(Some(*v), self_reg);
+                            }
+                            let callable_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let callable_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            if let super::flow::FlowValue::Variable(v) = &callable_value {
+                                pin!(Some(*v), callable_reg);
+                            }
+                            let result_value = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "call_function_ex",
+                                vec![
+                                    callable_value.into(),
+                                    self_value.into(),
+                                    starargs_value.into(),
+                                    kwargs_value.into(),
+                                ],
+                                Kind::Ref,
+                                py_pc as i64,
+                            );
+                            pin!(Some(result_value), stack_base + current_depth);
+                            push_and_bump!(result_value.into(), py_pc);
                         }
 
                         // DeleteSubscr: pops 2 (index, obj). Net: -2.
