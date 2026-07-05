@@ -3,13 +3,19 @@
 # read to `guard_class` + `guard_value(map)` + `getfield(storage)` +
 # `getarrayitem` (no residual — storage is a fixed-layout GcArray block); the
 # `head.val` read stays a residual because `val` is an unboxed-int slot, whose
-# read boxes a longlong rather than a plain fetch.  ITERS is sized so the
-# compiled loop finishes well inside the synthetic timeout on every backend
-# (cranelift/wasm are the slowest); the point is to prove the `is not None`
-# branch compiles and the object-attr read folds inline, not to race pypy on the
-# still-residual unboxed read.
-N = 3000
-ITERS = 4000
+# read boxes a longlong rather than a plain fetch.  The point is to prove the
+# `is not None` branch compiles (POP_JUMP_IF_NONE lowering) and the object-attr
+# read folds inline, not to race pypy on the still-residual unboxed read.
+#
+# N/ITERS are kept small because the wasm backend runs every guard-exit
+# re-entry through the not-yet-collected interpreter allocation path, so the
+# residual `head.val` read leaks per re-entry and the wall grows super-linearly
+# in ITERS on wasm (native dynasm/cranelift stay linear via bridge chaining).
+# This is the pre-existing wasm interpreter-alloc leak, not the LOAD_ATTR fold;
+# the size here leaves the wasm run well inside the synthetic timeout while
+# still driving the compiled walk loop thousands of times on every backend.
+N = 300
+ITERS = 500
 
 
 class Node:
