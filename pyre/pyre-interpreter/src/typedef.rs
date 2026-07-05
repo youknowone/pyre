@@ -3572,10 +3572,9 @@ fn init_pytraceback_type(ns: &mut DictStorage) {
 /// (`args[1]`) is a live `PyFrame` object (its `ob_header.ob_type` is
 /// `FRAME_TYPE`); every field access casts it to `*mut PyFrame`.  A read
 /// through a null / already-freed receiver returns `None` rather than
-/// dereferencing.  `f_lineno`'s setter uses the existing simplified
-/// `fset_f_lineno` (the full `mark_stacks` jump validation is a separate
-/// port); the read-only getsets and `f_trace*` setters mirror
-/// `pyframe.py:641-806` directly.
+/// dereferencing.  `f_lineno`'s setter is [`PyFrame::fset_f_lineno`],
+/// which validates the line-jump via `mark_stacks`; the read-only getsets
+/// and `f_trace*` setters mirror `pyframe.py:641-806` directly.
 fn init_frame_type(ns: &mut DictStorage) {
     use crate::pyframe::PyFrame;
 
@@ -3705,8 +3704,9 @@ fn init_frame_type(ns: &mut DictStorage) {
 
     // f_lineno — read/write (pyframe.py:654 fget_f_lineno / :666 fset).
     // The getter returns `None` for an untraced frame whose line is -1;
-    // the setter uses pyre's simplified `fset_f_lineno` (full mark_stacks
-    // jump validation is a separate port).
+    // the setter is `fset_f_lineno`, which validates the debugger
+    // line-jump via `mark_stacks` and raises `ValueError` on an illegal
+    // target (only permitted from within a trace function).
     let lineno_getter = make_builtin_function_with_arity(
         "f_lineno",
         |args| {
@@ -3743,7 +3743,7 @@ fn init_frame_type(ns: &mut DictStorage) {
             }
             let new_lineno = crate::baseobjspace::int_w(args[2])
                 .map_err(|_| crate::PyError::value_error("lineno must be an integer"))?;
-            unsafe { &mut *f }.fset_f_lineno(new_lineno as isize);
+            unsafe { &mut *f }.fset_f_lineno(new_lineno as isize)?;
             Ok(pyre_object::w_none())
         },
         3,

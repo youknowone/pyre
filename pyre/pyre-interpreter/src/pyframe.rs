@@ -784,6 +784,391 @@ pub fn offset2lineno(code: &CodeObject, stopat: isize) -> usize {
         .unwrap_or(lineno)
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// `f_lineno` jump validation — a port of CPython 3.14's `mark_stacks`
+// (`Objects/frameobject.c`).
+//
+// PyPy's `fset_f_lineno` (`pyframe.py`) validates a debugger line-jump
+// against the 3.11-era block model: it scans for `SETUP_LOOP` /
+// `SETUP_FINALLY` / `END_FINALLY` / `POP_BLOCK` and walks `co_lnotab`.
+// pyre runs 3.14-structural bytecode where those block-setup opcodes are
+// pseudo-ops the compiler lowers into `co_exceptiontable`; there is no
+// `co_lnotab`.  A line-by-line PyPy port is therefore impossible — the
+// opcodes it inspects don't exist here.  The behaviour-correct 3.14
+// equivalent is `mark_stacks`: a fixpoint reachability analysis that
+// abstracts each operand-stack slot to a `Kind`, so a jump is admitted
+// only when the source and target abstract stacks are compatible.
+// ─────────────────────────────────────────────────────────────────────
+
+/// `frameobject.c` `Kind` — the abstract contents of one operand-stack
+/// slot.  Packed 3 bits per slot into an `i64` (`BITS_PER_BLOCK = 3`),
+/// so the abstract stack of up to `MAX_STACK_ENTRIES = 21` slots is a
+/// single integer that can be compared for equality across paths.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(i64)]
+enum StackKind {
+    Iterator = 1,
+    Except = 2,
+    Object = 3,
+    Null = 4,
+    Lasti = 5,
+}
+
+const MARK_BITS_PER_BLOCK: i64 = 3;
+const MARK_MASK: i64 = (1 << MARK_BITS_PER_BLOCK) - 1;
+/// `1 << (63 - BITS_PER_BLOCK)` — a stack whose unsigned value is at or
+/// above this would lose its top slot when shifted left.  The negative
+/// sentinels (`OVERFLOWED` / `UNINITIALIZED`) reinterpret as huge
+/// unsigned values, so this test also propagates them.
+const MARK_WILL_OVERFLOW: u64 = 1u64 << (63 - MARK_BITS_PER_BLOCK);
+
+/// `frameobject.c` sentinels for a per-instruction abstract stack.
+const MARK_UNINITIALIZED: i64 = -2;
+const MARK_OVERFLOWED: i64 = -1;
+const MARK_EMPTY_STACK: i64 = 0;
+
+#[inline]
+fn mark_push_value(stack: i64, kind: StackKind) -> i64 {
+    mark_push_kind_bits(stack, kind as i64)
+}
+
+/// `push_value` with the kind supplied as raw bits — used by `COPY`,
+/// which re-pushes a slot peeked from the stack (whose kind is not
+/// statically one of the [`StackKind`] variants).
+#[inline]
+fn mark_push_kind_bits(stack: i64, kind_bits: i64) -> i64 {
+    if (stack as u64) >= MARK_WILL_OVERFLOW {
+        MARK_OVERFLOWED
+    } else {
+        (stack << MARK_BITS_PER_BLOCK) | kind_bits
+    }
+}
+
+#[inline]
+fn mark_pop_value(stack: i64) -> i64 {
+    // Arithmetic right shift preserves the OVERFLOWED / UNINITIALIZED
+    // sentinels (both negative).
+    stack >> MARK_BITS_PER_BLOCK
+}
+
+#[inline]
+fn mark_top_of_stack(stack: i64) -> i64 {
+    stack & MARK_MASK
+}
+
+#[inline]
+fn mark_peek(stack: i64, n: i64) -> i64 {
+    (stack >> (MARK_BITS_PER_BLOCK * (n - 1))) & MARK_MASK
+}
+
+#[inline]
+fn mark_stack_swap(stack: i64, n: i64) -> i64 {
+    let top = mark_top_of_stack(stack);
+    let nth = mark_peek(stack, n);
+    let shift = MARK_BITS_PER_BLOCK * (n - 1);
+    let stack = stack & !(MARK_MASK << shift) | (top << shift);
+    (stack & !MARK_MASK) | nth
+}
+
+/// `frameobject.c pop_to_level` — pop the abstract stack down to `level`
+/// slots.
+#[inline]
+fn mark_pop_to_level(mut stack: i64, level: i32) -> i64 {
+    let mut depth = 0i64;
+    let mut s = stack;
+    while s > MARK_EMPTY_STACK {
+        s = mark_pop_value(s);
+        depth += 1;
+    }
+    while depth > level as i64 {
+        stack = mark_pop_value(stack);
+        depth -= 1;
+    }
+    stack
+}
+
+/// True when a jump from `from` kind to `to` kind is admissible
+/// (`frameobject.c compatible_kind`).
+#[inline]
+fn mark_compatible_kind(from: i64, to: i64) -> bool {
+    if to == 0 {
+        return false;
+    }
+    if to == StackKind::Object as i64 {
+        return from != StackKind::Null as i64;
+    }
+    if to == StackKind::Null as i64 {
+        return true;
+    }
+    from == to
+}
+
+/// `frameobject.c compatible_stack` — pop `from_stack` to the target
+/// depth, then compare each slot's kind.
+fn mark_compatible_stack(mut from_stack: i64, target_stack: i64) -> bool {
+    if from_stack < 0 || target_stack < 0 {
+        return false;
+    }
+    let mut to = target_stack;
+    // Depth of each packed stack.
+    let depth = |mut s: i64| -> i64 {
+        let mut d = 0;
+        while s > MARK_EMPTY_STACK {
+            s = mark_pop_value(s);
+            d += 1;
+        }
+        d
+    };
+    while depth(from_stack) > depth(to) {
+        from_stack = mark_pop_value(from_stack);
+    }
+    while to > MARK_EMPTY_STACK {
+        if from_stack <= MARK_EMPTY_STACK {
+            return false;
+        }
+        if !mark_compatible_kind(mark_top_of_stack(from_stack), mark_top_of_stack(to)) {
+            return false;
+        }
+        from_stack = mark_pop_value(from_stack);
+        to = mark_pop_value(to);
+    }
+    from_stack == MARK_EMPTY_STACK
+}
+
+/// Diagnostic for an incompatible target stack
+/// (`frameobject.c explain_incompatible_stack`).
+fn mark_explain_incompatible_stack(target_stack: i64) -> &'static str {
+    if target_stack == MARK_OVERFLOWED {
+        return "stack is too deep to analyze";
+    }
+    if target_stack == MARK_UNINITIALIZED {
+        return "can't jump into an exception handler, or code may be unreachable";
+    }
+    let top = mark_top_of_stack(target_stack);
+    if top == StackKind::Except as i64 {
+        "can't jump into an 'except' block as there's no exception"
+    } else if top == StackKind::Lasti as i64 {
+        "can't jump into a re-raising block as there's no location"
+    } else if top == StackKind::Object as i64 || top == StackKind::Null as i64 {
+        "incompatible stacks"
+    } else if top == StackKind::Iterator as i64 {
+        "can't jump into the body of a for loop"
+    } else {
+        "incompatible stacks"
+    }
+}
+
+/// `frameobject.c marklines` — the source line that starts at each
+/// instruction-unit index (`-1` where no line change begins).
+fn mark_lines(code: &CodeObject, len: usize) -> Vec<i32> {
+    let mut lines = vec![-1i32; len];
+    let first = code.first_line_number.map(|n| n.get() as i32).unwrap_or(1);
+    let mut last_line = -1i32;
+    for i in 0..len {
+        // `locations[i].0` is the start SourceLocation of unit `i`.
+        let line = code
+            .locations
+            .get(i)
+            .map(|(start, _)| start.line.get() as i32)
+            .unwrap_or(first);
+        if line != last_line && line != -1 {
+            lines[i] = line;
+            last_line = line;
+        }
+    }
+    lines
+}
+
+/// `frameobject.c first_line_not_before` — the smallest line `>= line`
+/// present in `lines`, or `-1`.
+fn mark_first_line_not_before(lines: &[i32], line: i32) -> i32 {
+    let mut result = i32::MAX;
+    for &l in lines {
+        if l < result && l >= line {
+            result = l;
+        }
+    }
+    if result == i32::MAX { -1 } else { result }
+}
+
+/// `frameobject.c mark_stacks` — fixpoint abstract-interpretation of the
+/// operand stack.  Returns `stacks[i]` = the packed abstract stack on
+/// entry to unit `i` (`UNINITIALIZED` where unreachable), length
+/// `len + 1`.
+fn mark_stacks(code: &CodeObject, len: usize) -> Vec<i64> {
+    use crate::bytecode::Instruction;
+
+    let mut stacks = vec![MARK_UNINITIALIZED; len + 1];
+    stacks[0] = MARK_EMPTY_STACK;
+
+    let mut todo = true;
+    while todo {
+        todo = false;
+        // ── Scan instructions ──
+        let mut i = 0usize;
+        while i < len {
+            let mut next_stack = stacks[i];
+            let Some((opcode, op_arg)) = crate::pyopcode::decode_instruction_at(code, i) else {
+                i += 1;
+                continue;
+            };
+            // `decode_instruction_at` already accumulates EXTENDED_ARG
+            // prefixes into `op_arg` at the real opcode's index.  Mirror
+            // CPython's inner `while opcode == EXTENDED_ARG` loop by
+            // propagating this unit's entry stack onto the following unit
+            // (the next prefix or the real opcode), so an instruction with
+            // an EXTENDED_ARG prefix inherits the prefix's entry stack.
+            if matches!(opcode, Instruction::ExtendedArg) {
+                if i + 1 < stacks.len() {
+                    stacks[i + 1] = next_stack;
+                }
+                i += 1;
+                continue;
+            }
+            let raw_arg: u32 = op_arg.into();
+            let caches = opcode.cache_entries();
+            let next_i = i + caches + 1;
+
+            if next_stack == MARK_UNINITIALIZED {
+                i = next_i;
+                continue;
+            }
+
+            // Relative jump targets are measured from `next_i` (past the
+            // opcode's cache slots), matching `absolutize_jump_target`.
+            match opcode {
+                Instruction::PopJumpIfFalse { delta }
+                | Instruction::PopJumpIfTrue { delta }
+                | Instruction::PopJumpIfNone { delta }
+                | Instruction::PopJumpIfNotNone { delta } => {
+                    let j = next_i + delta.get(op_arg).as_usize();
+                    next_stack = mark_pop_value(next_stack);
+                    if j <= len {
+                        stacks[j] = next_stack;
+                    }
+                    stacks[next_i] = next_stack;
+                }
+                Instruction::Send { delta } => {
+                    let j = next_i + delta.get(op_arg).as_usize();
+                    if j <= len {
+                        stacks[j] = next_stack;
+                    }
+                    stacks[next_i] = next_stack;
+                }
+                Instruction::JumpForward { delta } => {
+                    let j = next_i + delta.get(op_arg).as_usize();
+                    if j <= len {
+                        stacks[j] = next_stack;
+                    }
+                }
+                Instruction::JumpBackward { delta }
+                | Instruction::JumpBackwardNoInterrupt { delta } => {
+                    let j = next_i.saturating_sub(delta.get(op_arg).as_usize());
+                    if stacks[j] == MARK_UNINITIALIZED && j < i {
+                        todo = true;
+                    }
+                    stacks[j] = next_stack;
+                }
+                Instruction::GetIter | Instruction::GetAiter => {
+                    next_stack = mark_push_value(mark_pop_value(next_stack), StackKind::Iterator);
+                    stacks[next_i] = next_stack;
+                }
+                Instruction::ForIter { delta } => {
+                    let target_stack = mark_push_value(next_stack, StackKind::Object);
+                    stacks[next_i] = target_stack;
+                    let j = next_i + delta.get(op_arg).as_usize();
+                    if j <= len {
+                        stacks[j] = target_stack;
+                    }
+                }
+                Instruction::EndAsyncFor => {
+                    next_stack = mark_pop_value(mark_pop_value(next_stack));
+                    stacks[next_i] = next_stack;
+                }
+                Instruction::PushExcInfo => {
+                    next_stack = mark_push_value(next_stack, StackKind::Except);
+                    stacks[next_i] = next_stack;
+                }
+                Instruction::PopExcept => {
+                    next_stack = mark_pop_value(next_stack);
+                    stacks[next_i] = next_stack;
+                }
+                Instruction::ReturnValue => {
+                    // End of a path.
+                }
+                Instruction::RaiseVarargs { .. } | Instruction::Reraise { .. } => {
+                    // End of a path.
+                }
+                Instruction::PushNull => {
+                    next_stack = mark_push_value(next_stack, StackKind::Null);
+                    stacks[next_i] = next_stack;
+                }
+                Instruction::LoadGlobal { .. } => {
+                    next_stack = mark_push_value(next_stack, StackKind::Object);
+                    if raw_arg & 1 != 0 {
+                        next_stack = mark_push_value(next_stack, StackKind::Null);
+                    }
+                    stacks[next_i] = next_stack;
+                }
+                Instruction::LoadAttr { .. } => {
+                    if raw_arg & 1 != 0 {
+                        next_stack = mark_pop_value(next_stack);
+                        next_stack = mark_push_value(next_stack, StackKind::Object);
+                        next_stack = mark_push_value(next_stack, StackKind::Null);
+                    }
+                    stacks[next_i] = next_stack;
+                }
+                Instruction::Swap { .. } => {
+                    next_stack = mark_stack_swap(next_stack, raw_arg as i64);
+                    stacks[next_i] = next_stack;
+                }
+                Instruction::Copy { .. } => {
+                    next_stack =
+                        mark_push_kind_bits(next_stack, mark_peek(next_stack, raw_arg as i64));
+                    stacks[next_i] = next_stack;
+                }
+                _ => {
+                    // `PyCompile_OpcodeStackEffect(opcode, oparg)` — the
+                    // net slot delta, with every pushed slot abstracted to
+                    // Object.
+                    let mut delta = opcode.stack_effect(raw_arg);
+                    while delta < 0 {
+                        next_stack = mark_pop_value(next_stack);
+                        delta += 1;
+                    }
+                    while delta > 0 {
+                        next_stack = mark_push_value(next_stack, StackKind::Object);
+                        delta -= 1;
+                    }
+                    stacks[next_i] = next_stack;
+                }
+            }
+            i = next_i;
+        }
+
+        // ── Scan the exception table ──
+        for entry in crate::pycode::decode_exceptiontable(&code.exceptiontable) {
+            let start_offset = (entry.start / 2) as usize;
+            let handler = (entry.target / 2) as usize;
+            let level = entry.depth as i32;
+            let lasti = entry.lasti;
+            if start_offset >= stacks.len() || handler >= stacks.len() {
+                continue;
+            }
+            if stacks[start_offset] != MARK_UNINITIALIZED && stacks[handler] == MARK_UNINITIALIZED {
+                todo = true;
+                let mut target_stack = mark_pop_to_level(stacks[start_offset], level);
+                if lasti {
+                    target_stack = mark_push_value(target_stack, StackKind::Lasti);
+                }
+                target_stack = mark_push_value(target_stack, StackKind::Except);
+                stacks[handler] = target_stack;
+            }
+        }
+    }
+    stacks
+}
+
 /// pyframe.py:105-106 — cell + free variable slot count.
 ///
 /// Returns the number of *extra* slots beyond `varnames` needed for
@@ -2127,10 +2512,145 @@ impl PyFrame {
         }
     }
 
-    /// pyframe.py:680 fset_f_lineno (simplified — full version validates jumps)
-    #[inline]
-    pub fn fset_f_lineno(&mut self, new_f_lineno: isize) {
-        self.getorcreate_debug_data(-1).f_lineno = new_f_lineno;
+    /// `frameobject.c frame_lineno_set` — set the line the frame will
+    /// resume at, validating the jump against [`mark_stacks`].
+    ///
+    /// Only a trace function may jump (`get_w_f_trace()` non-null); the
+    /// jump target must land on a real source line, must not enter an
+    /// exception handler / for-loop body / re-raise block, and the source
+    /// and target abstract operand stacks must be compatible.  On success
+    /// the operand stack is unwound to the target depth (closing dropped
+    /// values, restoring `exc_info` for popped `Except` slots) and
+    /// `last_instr` is repointed.
+    ///
+    /// Deviation: `frame_lineno_set` also binds `None` to any local the
+    /// compiler proved live-but-unbound at the target (the `PyStackRef_None`
+    /// pass over `co_localspluskinds`).  pyre keeps unbound locals as
+    /// `PY_NULL` guarded by `LOAD_FAST_CHECK`, so that pass is omitted; the
+    /// only observable difference is an `UnboundLocalError` where the
+    /// jumped-to code reads such a local before assigning it, versus
+    /// silently seeing `None`.
+    pub fn fset_f_lineno(&mut self, new_f_lineno: isize) -> Result<(), crate::PyError> {
+        // frame_lineno_set: you can only jump from within a trace
+        // function, not via `_getframe` / similar hackery.
+        if self.get_w_f_trace().is_null() {
+            return Err(crate::PyError::value_error(
+                "f_lineno can only be set by a trace function.",
+            ));
+        }
+        // A newly-entered frame (call event) has no dispatched
+        // instruction yet.
+        if self.last_instr == -1 {
+            return Err(crate::PyError::value_error(
+                "can't jump from the 'call' trace event of a new frame",
+            ));
+        }
+        // Can't jump from a `yield` statement (the frame is mid-yield).
+        if let Some((crate::bytecode::Instruction::YieldValue { .. }, _)) =
+            crate::pyopcode::decode_instruction_at(self.code(), self.last_instr as usize)
+        {
+            return Err(crate::PyError::value_error(
+                "can't jump from a yield statement",
+            ));
+        }
+        // Only allow jumps when tracing a `line` event (`is_in_line_tracing`).
+        if !self.getdebug().map_or(false, |d| d.is_in_line_tracing) {
+            return Err(crate::PyError::value_error(
+                "can only jump from a 'line' trace event",
+            ));
+        }
+        // `frame_is_suspended` — a generator/coroutine frame that has
+        // started, is not currently running, and is not exhausted has a
+        // pending `yield` value on the stack that the resume will pop, so
+        // the unwind must account for it.
+        let is_suspended = if self._is_generator_or_coroutine() {
+            let w_gen = self.get_generator();
+            !w_gen.is_null()
+                && unsafe {
+                    pyre_object::generator::w_generator_is_started(w_gen)
+                        && !pyre_object::generator::w_generator_is_running(w_gen)
+                        && !pyre_object::generator::w_generator_is_exhausted(w_gen)
+                }
+        } else {
+            false
+        };
+
+        let code = self.code();
+        let len = code.instructions.len();
+        let first_line = code.first_line_number.map(|n| n.get() as i32).unwrap_or(1);
+
+        let mut new_lineno = new_f_lineno as i32;
+        if new_lineno < first_line {
+            return Err(crate::PyError::value_error(format!(
+                "line {new_lineno} comes before the current code block"
+            )));
+        }
+
+        let lines = mark_lines(code, len);
+        new_lineno = mark_first_line_not_before(&lines, new_lineno);
+        if new_lineno < 0 {
+            return Err(crate::PyError::value_error(format!(
+                "line {new_f_lineno} comes after the current code block"
+            )));
+        }
+
+        let stacks = mark_stacks(code, len);
+        let last_instr = self.last_instr as usize;
+        let start_stack = *stacks.get(last_instr).unwrap_or(&MARK_UNINITIALIZED);
+
+        let mut best_stack = MARK_OVERFLOWED;
+        let mut best_addr: isize = -1;
+        let mut err: i32 = -1;
+        let mut msg: String = "cannot find bytecode for specified line".to_string();
+        for i in 0..len {
+            if lines[i] != new_lineno {
+                continue;
+            }
+            let target_stack = stacks[i];
+            if mark_compatible_stack(start_stack, target_stack) {
+                err = 0;
+                if target_stack > best_stack {
+                    best_stack = target_stack;
+                    best_addr = i as isize;
+                }
+            } else if err < 0 {
+                if start_stack == MARK_OVERFLOWED {
+                    msg = "stack is too deep to analyze".to_string();
+                } else if start_stack == MARK_UNINITIALIZED {
+                    msg = "can't jump from unreachable code".to_string();
+                } else {
+                    msg = mark_explain_incompatible_stack(target_stack).to_string();
+                    err = 1;
+                }
+            }
+        }
+        if err != 0 {
+            return Err(crate::PyError::value_error(msg));
+        }
+
+        // Unwind the operand stack from `start_stack` down to
+        // `best_stack`, closing dropped values.  A dropped `Except` slot
+        // restores the previous `exc_info` (pyre keeps the active
+        // exception in the TLS current-exception slot, saved beneath the
+        // handler on the value stack — see `push_exc_info`).
+        let mut cur_stack = start_stack;
+        if is_suspended {
+            // Account for the value popped by yield.
+            cur_stack = mark_pop_value(cur_stack);
+        }
+        while cur_stack > best_stack {
+            let popped = self.popvalue();
+            if mark_top_of_stack(cur_stack) == StackKind::Except as i64 {
+                // The popped value is the saved previous exception; make
+                // it current again.
+                crate::eval::set_current_exception(popped);
+            }
+            cur_stack = mark_pop_value(cur_stack);
+        }
+
+        self.getorcreate_debug_data(-1).f_lineno = new_lineno as isize;
+        self.last_instr = best_addr;
+        Ok(())
     }
 
     /// PyPy-compatible `setfastscope`.
@@ -2951,5 +3471,90 @@ mod tests {
 
         let loaded = load_const_from_code(&code, ellipsis_index);
         assert_eq!(loaded, pyre_object::special::w_ellipsis());
+    }
+
+    // ── mark_stacks (f_lineno jump validation) ──
+
+    use super::{
+        StackKind, mark_compatible_stack, mark_first_line_not_before, mark_lines, mark_stacks,
+        MARK_EMPTY_STACK, MARK_UNINITIALIZED,
+    };
+
+    #[test]
+    fn mark_stacks_entry_is_empty_and_reachable() {
+        let code = crate::compile_exec("x = 1\ny = x + 1\n").expect("compile");
+        let len = code.instructions.len();
+        let stacks = mark_stacks(&code, len);
+        // Entry to the first instruction is the empty stack.
+        assert_eq!(stacks[0], MARK_EMPTY_STACK);
+        // Every real (decodable, non-cache) instruction is reachable in
+        // straight-line code — none stay UNINITIALIZED.
+        for pc in 0..len {
+            if let Some((instr, _)) = crate::pyopcode::decode_instruction_at(&code, pc) {
+                if matches!(instr, crate::bytecode::Instruction::Cache) {
+                    continue;
+                }
+                assert_ne!(
+                    stacks[pc], MARK_UNINITIALIZED,
+                    "pc {pc} ({instr:?}) should be reachable"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mark_stacks_for_iter_target_carries_iterator() {
+        // The FOR_ITER body sees the iterator underneath the loop var, so
+        // the abstract stack at the body has an Iterator slot at bottom.
+        let code = crate::compile_exec("t = 0\nfor i in range(3):\n    t += i\n").expect("compile");
+        let len = code.instructions.len();
+        let stacks = mark_stacks(&code, len);
+        // Find a GET_ITER; the slot it produces is Iterator and stays on
+        // the stack through the loop body.
+        let mut saw_iterator_slot = false;
+        for pc in 0..len {
+            if stacks[pc] > MARK_EMPTY_STACK
+                && (stacks[pc] & 0b111 == StackKind::Iterator as i64
+                    || (stacks[pc] >> 3) & 0b111 == StackKind::Iterator as i64)
+            {
+                saw_iterator_slot = true;
+                break;
+            }
+        }
+        assert!(
+            saw_iterator_slot,
+            "a for-loop's abstract stacks should contain an Iterator slot"
+        );
+    }
+
+    #[test]
+    fn mark_lines_and_first_line_not_before() {
+        let code = crate::compile_exec("a = 1\nb = 2\nc = 3\n").expect("compile");
+        let len = code.instructions.len();
+        let lines = mark_lines(&code, len);
+        let first = code.first_line_number.map(|n| n.get() as i32).unwrap_or(1);
+        // The earliest recorded line is the first source line.
+        let min_line = lines.iter().copied().filter(|&l| l >= 0).min().unwrap();
+        assert_eq!(min_line, first);
+        // A request before the code resolves to the first line.
+        assert_eq!(mark_first_line_not_before(&lines, first), first);
+        // A request past the end resolves to -1.
+        assert_eq!(mark_first_line_not_before(&lines, first + 1000), -1);
+    }
+
+    #[test]
+    fn compatible_stack_same_and_incompatible() {
+        // Identical stacks are compatible.
+        assert!(mark_compatible_stack(MARK_EMPTY_STACK, MARK_EMPTY_STACK));
+        // An Object target accepts an Iterator source popped to depth, but
+        // an Iterator target rejects an Object source (can't fabricate a
+        // loop iterator).
+        let obj = super::mark_push_value(MARK_EMPTY_STACK, StackKind::Object);
+        let iter = super::mark_push_value(MARK_EMPTY_STACK, StackKind::Iterator);
+        assert!(mark_compatible_stack(iter, obj), "Object target accepts any non-Null");
+        assert!(
+            !mark_compatible_stack(obj, iter),
+            "Iterator target rejects Object source"
+        );
     }
 }
