@@ -8934,6 +8934,15 @@ fn vstack_enter_exception_handler(
 /// `resume_jitcode_pc_for`, used by the full-body walk to stamp a guard's
 /// snapshot with the Python opcode the blackhole resumes (and re-executes)
 /// at — matching the trait path's `orgpc` snapshot coordinate.
+/// `PYRE_PCMAP_BLOCKHEAD_AUDIT` enables the corpus-diff assertion that the
+/// precomputed `block_head_py_by_jit_pc` table reproduces the legacy
+/// `pc_map.iter().position()` block-head scan.  Diagnostic only; off in
+/// production.
+fn block_head_audit_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_BLOCKHEAD_AUDIT").is_some())
+}
+
 pub(crate) fn python_pc_for_jitcode_pc(metadata: &crate::PyJitCodeMetadata, jit_pc: usize) -> u32 {
     // Exact inverse: `first_jit_pc_by_py_pc[py]` is the byte offset of the
     // FIRST instruction opcode `py` emitted (`usize::MAX` = the PC emitted
@@ -8951,7 +8960,30 @@ pub(crate) fn python_pc_for_jitcode_pc(metadata: &crate::PyJitCodeMetadata, jit_
     // positions never collide with marker positions (each byte belongs
     // to exactly one instruction), so this test only fires for block
     // heads.
-    if let Some(py) = metadata.pc_map.iter().position(|&m| m == jit_pc) {
+    //
+    // The `block_head_py_by_jit_pc` table is the precomputed inverse of this
+    // block-head case (marker byte offset → smallest resuming py_pc), built
+    // from the same `pc_map` bytes at compile time, so a lookup is equal to
+    // the `pc_map.iter().position()` scan by construction.  Drained installs
+    // carry it; skeleton / portal-bridge / fixture installs leave it empty
+    // and keep the legacy scan below.
+    if !metadata.block_head_py_by_jit_pc.is_empty() {
+        if let Ok(i) = metadata
+            .block_head_py_by_jit_pc
+            .binary_search_by_key(&jit_pc, |&(off, _)| off)
+        {
+            let py = metadata.block_head_py_by_jit_pc[i].1;
+            if block_head_audit_enabled() {
+                let scanned = metadata.pc_map.iter().position(|&m| m == jit_pc);
+                assert_eq!(
+                    scanned,
+                    Some(py as usize),
+                    "block_head_py_by_jit_pc diverges from pc_map.position at jit_pc={jit_pc}"
+                );
+            }
+            return py;
+        }
+    } else if let Some(py) = metadata.pc_map.iter().position(|&m| m == jit_pc) {
         return py as u32;
     }
     let first_jit = &metadata.first_jit_pc_by_py_pc;

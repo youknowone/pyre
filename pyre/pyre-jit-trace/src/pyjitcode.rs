@@ -102,6 +102,17 @@ pub struct PyJitCodeMetadata {
     /// guard resume coordinates, which this table provides.  Same length
     /// as `pc_map`.
     pub first_jit_pc_by_py_pc: Vec<usize>,
+    /// Inverse of `pc_map`'s block-head case: each distinct `-live-` marker
+    /// byte offset that some PC resolves to → the SMALLEST py_pc that resolves
+    /// there (the start of that marker's carry-forward run in `pc_map`).
+    /// Sorted ascending by jitcode offset for binary search.  Replaces the
+    /// `pc_map.iter().position(|&m| m == jit_pc)` block-head scan in
+    /// `python_pc_for_jitcode_pc` (a coordinate landing exactly on a marker is
+    /// a block head — branch/catch target — and belongs to the first opcode
+    /// resuming there).  Equal to `position()` by construction; empty for
+    /// skeleton / portal-bridge / fixture metadata, where the legacy scan
+    /// remains the fallback.
+    pub block_head_py_by_jit_pc: Vec<(usize, u32)>,
     /// Value-stack depth at each Python PC, in slots above stack_base.
     pub depth_at_py_pc: Vec<u16>,
     /// Post-regalloc Ref-bank color of the call-result operand-stack slot
@@ -537,6 +548,7 @@ impl PyJitCode {
                 pc_map: Vec::new(),
                 after_residual_call_resume_pc: Vec::new(),
                 first_jit_pc_by_py_pc: Vec::new(),
+                block_head_py_by_jit_pc: Vec::new(),
                 depth_at_py_pc: Vec::new(),
                 result_color_at_pc: Vec::new(),
                 // u16::MAX sentinel mirrors `canonical_bridge::install_portal_for`

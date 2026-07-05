@@ -12611,6 +12611,21 @@ impl CodeWriter {
             first_jit_pc_by_py_pc[*py_pc] = combined_bytes[first_insn_base + k];
         }
 
+        // Block-head inverse: for each distinct marker byte offset, record the
+        // FIRST (smallest) py_pc that resolves to it.  Ascending `py` iteration
+        // with first-write-wins reproduces `pc_map.iter().position(|&m| m == off)`
+        // exactly, indexed for binary search.
+        let mut block_head_py_by_jit_pc: Vec<(usize, u32)> = Vec::new();
+        {
+            let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+            for (py, &off) in pc_map_bytes.iter().enumerate() {
+                if seen.insert(off) {
+                    block_head_py_by_jit_pc.push((off, py as u32));
+                }
+            }
+            block_head_py_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
+        }
+
         // call.py:148 `jd.mainjitcode.jitdriver_sd = jd`. RPython mutates
         // the shell returned by `grab_initial_jitcodes`; pyre still
         // builds the populated `JitCode` as the final codewriter step, so
@@ -12636,6 +12651,7 @@ impl CodeWriter {
             pc_map: pc_map_bytes,
             after_residual_call_resume_pc,
             first_jit_pc_by_py_pc,
+            block_head_py_by_jit_pc,
             depth_at_py_pc: depth_at_pc,
             result_color_at_pc,
             portal_frame_reg,

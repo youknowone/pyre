@@ -11607,6 +11607,7 @@ mod tests {
                 pc_map: vec![0],
                 after_residual_call_resume_pc: vec![None],
                 first_jit_pc_by_py_pc: vec![0],
+                block_head_py_by_jit_pc: vec![(0, 0)],
                 depth_at_py_pc: vec![2],
                 result_color_at_pc: Vec::new(),
                 portal_frame_reg: 0,
