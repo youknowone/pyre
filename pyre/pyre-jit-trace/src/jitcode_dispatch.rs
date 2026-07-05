@@ -6911,22 +6911,6 @@ fn fbw_inline_recursion_count(w_code: usize) -> usize {
     FBW_INLINE_CODE_STACK.with(|s| s.borrow().iter().filter(|&&c| c == w_code).count())
 }
 
-/// Bounded-recursion unroll depth for the self-recursive single-int callee.
-/// `PYRE_FBW_REC_UNROLL=<n>` inlines the first `n` recursion levels into the
-/// trace (mirroring `max_unroll_recursion`, `pyjitpl.py:1389-1416`) before
-/// folding the deeper tail to a recursive-portal `CALL_ASSEMBLER`, clamped to
-/// [`FBW_MAX_MULTIFRAME_DEPTH`] so every unrolled level keeps a valid multiframe
-/// resume snapshot.  Unset / `0` → `None` (disabled: the callee folds to a
-/// depth-0 CA tail, the prior behaviour).
-fn fbw_unroll_bound() -> Option<usize> {
-    let n: usize = std::env::var("PYRE_FBW_REC_UNROLL")
-        .ok()?
-        .trim()
-        .parse()
-        .ok()?;
-    (n > 0).then(|| n.min(FBW_MAX_MULTIFRAME_DEPTH))
-}
-
 thread_local! {
     /// FBW inline callee concrete-locals shadow: for each user function
     /// currently inlined by the sub-walk, a per-slot (`localsplus` index)
@@ -11937,17 +11921,10 @@ fn try_walker_inline_user_call(
             if fbw_carrier_resume() {
                 return Ok(None);
             }
-            // Bounded unroll (`pyjitpl.py:1389-1416`): inline the first `n`
-            // recursion levels into the trace, folding to the recursive-portal
-            // `CALL_ASSEMBLER` tail only once this callee is already `n` deep on
-            // the inline stack.  Disabled (`None`) keeps the depth-0 CA tail
-            // (fold every self-recursive call immediately).
-            match fbw_unroll_bound() {
-                Some(n) if fbw_inline_recursion_count(callee_code_key) < n => {
-                    // depth < n: fall through to the multiframe inline below.
-                }
-                _ => return Ok(None),
-            }
+            // A self-recursive single-int callee folds to the recursive-portal
+            // `CALL_ASSEMBLER` tail (`try_walker_call_assembler_self_recursive`),
+            // reached by returning `Ok(None)` here.
+            return Ok(None);
         }
     }
     // #68: under `PYRE_FBW_INLINE_MULTIFRAME`, a forward-branch-bearing callee
@@ -11962,11 +11939,7 @@ fn try_walker_inline_user_call(
     // intermediate callee jitcode) by `compute_inline_caller_frame`, bounded by
     // a depth cap on the inline stack (the `n_parents == n_callees` valve in
     // the snapshot path is the real desync safety net).
-    // Bounded unroll drives the same multiframe inline path, so enabling the
-    // unroll (`PYRE_FBW_REC_UNROLL`) implies multiframe eligibility for the
-    // self-recursive callee whose depth-0..n-1 levels fell through above.
-    let multiframe_eligible =
-        !strict_inlinable && (fbw_inline_multiframe_enabled() || fbw_unroll_bound().is_some());
+    let multiframe_eligible = !strict_inlinable && fbw_inline_multiframe_enabled();
     let callee_frame_reg = if multiframe_eligible {
         crate::state::ensure_jitcode_index(callee_code_key as *const ())
             .map(|jc| crate::state::portal_red_regs_at(jc).0)
