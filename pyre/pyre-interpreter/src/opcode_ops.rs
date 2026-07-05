@@ -177,8 +177,14 @@ pub fn unary_positive_value(value: PyObjectRef) -> Result<PyObjectRef, PyError> 
 
 /// CALL_INTRINSIC_1 ListToTuple — convert a list to a tuple (star
 /// unpacking).  Shared by the interpreter's `list_to_tuple` and the JIT
-/// residual `bh_list_to_tuple_fn`.  Allocates a fresh tuple; a non-list
-/// operand raises TypeError.
+/// residual `bh_list_to_tuple_fn`.  Allocates a fresh tuple.
+///
+/// pyopcode.py does `space.call_function(space.w_tuple, w_l)` (accepts any
+/// iterable); the compiler only ever emits INTRINSIC_LIST_TO_TUPLE right
+/// after a `BUILD_LIST` + `LIST_EXTEND` chain, so the operand is always an
+/// exact list.  A non-iterable `*arg` is already rejected upstream by
+/// LIST_EXTEND ("argument after * must be an iterable"), so the non-list
+/// TypeError below is an unreachable defensive guard.
 pub fn list_to_tuple_value(value: PyObjectRef) -> Result<PyObjectRef, PyError> {
     unsafe {
         if pyre_object::is_list(value) {
