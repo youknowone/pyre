@@ -70,78 +70,6 @@ fn make_sys_namespace_instance() -> PyObjectRef {
     w_instance_new(sys_namespace_type())
 }
 
-/// TODO: pyre does not yet expose `PyFrame` as a
-/// Python-visible W_Root with a typedef carrying
-/// `f_back/f_locals/f_globals/f_code/f_lineno` GetSetProperty
-/// descriptors (`pypy/interpreter/pyframe.py:769-786`).  The proper
-/// port mirrors `W_PyFrame.typedef` and lets `frame.f_back` walk the
-/// real execution chain via `fget_f_back`.  Until that lands,
-/// `sys._getframe` returns a `sys.namespace` stub populated from the
-/// PyFrame fields by hand.
-///
-/// To avoid the pre-fix degradation where `f_back` was always `None`
-/// — breaking the canonical `while f: f = f.f_back` traversal — this
-/// helper walks the entire `f_back` chain eagerly and links each
-/// stub to the previous one via its own `f_back` slot, mirroring the
-/// PyPy frame chain shape one stub at a time.  The cost is one stub
-/// allocation per live frame on every `_getframe` call; an
-/// acceptable price for stack-walking parity until the proper
-/// PyFrame typedef port lands.
-fn build_frame_stub_chain(
-    top: *mut crate::pyframe::PyFrame,
-) -> Result<PyObjectRef, crate::PyError> {
-    let mut frames: Vec<*mut crate::pyframe::PyFrame> = Vec::new();
-    let mut cursor = top;
-    while !cursor.is_null() {
-        frames.push(cursor);
-        cursor = unsafe { (*cursor).get_f_back() };
-    }
-    let mut prev_stub: PyObjectRef = w_none();
-    let mut top_stub: PyObjectRef = w_none();
-    // Build from oldest to newest so each stub can attach the
-    // already-built older stub as its `f_back`.  The final
-    // (innermost) stub becomes the return value.
-    for &frame_ptr in frames.iter().rev() {
-        let stub = make_sys_namespace_instance();
-        let frame_ref = unsafe { &mut *frame_ptr };
-        // `pyframe.py:540-545 getdictscope`: PyPy materialises
-        // `f_locals` by running `fast2locals()` and exposing the
-        // resulting `debugdata.w_locals` dict.  `fast2locals` writes through
-        // the live locals mapping and can raise, so propagate the error rather
-        // than masking it as an empty `f_locals`.
-        let w_locals_obj = frame_ref.getdictscope()?;
-        // pyframe.py:128 get_w_globals_storage returns the globals dict object.  The
-        // canonical `w_globals` is seeded by every frame constructor and
-        // is the source of truth for the frame's globals.
-        let w_globals = frame_ref.get_w_globals();
-        let pycode = frame_ref.pycode as pyre_object::PyObjectRef;
-        let lineno = frame_ref.fget_f_lineno() as i64;
-        crate::baseobjspace::setdictvalue(
-            stub,
-            "f_globals",
-            if w_globals.is_null() {
-                pyre_object::w_none()
-            } else {
-                w_globals
-            },
-        );
-        crate::baseobjspace::setdictvalue(
-            stub,
-            "f_locals",
-            if w_locals_obj.is_null() {
-                w_dict_new()
-            } else {
-                w_locals_obj
-            },
-        );
-        crate::baseobjspace::setdictvalue(stub, "f_code", pycode);
-        crate::baseobjspace::setdictvalue(stub, "f_back", prev_stub);
-        crate::baseobjspace::setdictvalue(stub, "f_lineno", w_int_new(lineno));
-        prev_stub = stub;
-        top_stub = stub;
-    }
-    Ok(top_stub)
-}
 
 /// Build a `sys.namespace` frame stub for `traceback.tb_frame`
 /// (`typedef.rs init_pytraceback_type`).
@@ -416,17 +344,14 @@ pub fn register_module(ns: &mut DictStorage) {
                 remaining -= 1;
                 current = unsafe { (*current).get_f_back() };
             }
-            // `pyframe.py:773 f_back = GetSetProperty(W_PyFrame
-            // .fget_f_back)` returns the previous PyFrame in the
-            // execution chain.  Pyre exposes frames as `sys.namespace`
-            // stubs (see TODO on
-            // `make_sys_namespace_instance` — the proper port is to
-            // surface PyFrame as a typedef-described user-visible
-            // type).  Within the stub model, walk the `f_back` chain
-            // greedily so each stub's `f_back` points to the next
-            // stub instead of `None`, otherwise traversal patterns
-            // (`while f: f = f.f_back`) terminate at depth 1.
-            build_frame_stub_chain(current)
+            // `pyframe.py:767 f_back = GetSetProperty(PyFrame.fget_f_back)`.
+            // Return the live `PyFrame` itself as the user-visible `frame`
+            // object (`FRAME_TYPE` typedef); `f_back` chains lazily through
+            // the getset.  Mark it escaped so the JIT keeps the frame
+            // materialised for the exposed reference (pyframe.py:176
+            // `mark_as_escaped`).
+            unsafe { (*current).mark_as_escaped() };
+            Ok(current as pyre_object::PyObjectRef)
         }),
     );
     // sys.exc_info() → (type, value, traceback)

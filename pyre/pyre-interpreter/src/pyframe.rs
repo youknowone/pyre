@@ -1941,6 +1941,78 @@ impl PyFrame {
         self.get_f_back()
     }
 
+    /// pyframe.py:641-642 fget_code → self.getcode().  Returns the `PyCode`
+    /// wrapper object (`self.pycode`) itself, which is what `frame.f_code`
+    /// yields to Python — not the inner `CodeObject`.
+    #[inline]
+    pub fn fget_f_code(&self) -> PyObjectRef {
+        self.pycode as PyObjectRef
+    }
+
+    /// pyframe.py:849-853 descr_repr — `<frame at 0x…, file '…', line …,
+    /// code …>` via `getrepr(space, "frame", moreinfo)`.
+    pub fn descr_repr(&self) -> String {
+        let code = self.code();
+        format!(
+            "<frame at {:p}, file '{}', line {}, code {}>",
+            self as *const PyFrame,
+            code.source_path.as_str(),
+            self.get_last_lineno(),
+            code.obj_name.as_str(),
+        )
+    }
+
+    /// pyframe.py:805-846 descr_clear — `F.clear()`: clear most references
+    /// held by the frame.  Refuses on an executing (non-generator) frame or
+    /// a running generator; otherwise clears `w_f_trace`, resets `w_locals`
+    /// to a fresh dict, and replaces every local / cell / free var / stack
+    /// slot (cells are rebound to fresh empty cells so a shared inner/outer
+    /// cell is not mutated).
+    pub fn descr_clear(&mut self) -> Result<(), crate::PyError> {
+        if !self.frame_finished_execution {
+            if !self._is_generator_or_coroutine() {
+                return Err(crate::PyError::runtime_error(
+                    "cannot clear an executing frame",
+                ));
+            }
+            let w_gen = self.get_generator();
+            if !w_gen.is_null() {
+                if unsafe { pyre_object::generator::w_generator_is_running(w_gen) } {
+                    return Err(crate::PyError::runtime_error(
+                        "cannot clear an executing frame",
+                    ));
+                }
+                unsafe { pyre_object::generator::w_generator_set_exhausted(w_gen) };
+            }
+        }
+
+        if let Some(debug) = self.getdebug() {
+            let had_locals = !debug.w_locals.is_null();
+            let d = self.getorcreate_debug_data(-1);
+            d.w_f_trace = pyre_object::PY_NULL;
+            if had_locals {
+                d.w_locals = unsafe { pyre_object::w_dict_new() };
+            }
+        }
+
+        // Clear locals, cell/free vars, and the stack.  A cell slot is
+        // rebound to a fresh empty cell (not mutated in place, since it may
+        // still be shared by an inner/outer function).
+        let len = self.locals_w().len();
+        for i in 0..len {
+            let w_oldvalue = self.locals_w()[i];
+            let w_newvalue = if !w_oldvalue.is_null() && unsafe { pyre_object::is_cell(w_oldvalue) }
+            {
+                pyre_object::w_cell_new(pyre_object::PY_NULL)
+            } else {
+                pyre_object::PY_NULL
+            };
+            self.locals_w_mut()[i] = w_newvalue;
+        }
+        self.valuestackdepth = 0;
+        Ok(())
+    }
+
     /// pyframe.py:773 fget_f_lasti → space.newint(self.last_instr)
     #[inline]
     pub fn fget_f_lasti(&self) -> isize {

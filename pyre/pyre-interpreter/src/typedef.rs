@@ -445,6 +445,16 @@ pub fn init_typeobjects() {
             traceback_type as usize,
         );
 
+        // frame — PyPy: typedef.py:736-753 PyFrame.typedef.
+        // `assert not PyFrame.typedef.acceptable_as_base_class` (typedef.py:754)
+        // — no `__new__`, cannot be subclassed.
+        let frame_type = new_typeobject_with_base("frame", init_frame_type, object_type);
+        unsafe { pyre_object::w_type_set_acceptable_as_base_class(frame_type, false) };
+        reg.insert(
+            &crate::pyframe::FRAME_TYPE as *const PyType as usize,
+            frame_type as usize,
+        );
+
         // function — PyPy: funcobject.py
         // Functions are descriptors: function.__get__ returns a bound method.
         let function_type = new_typeobject_with_base("function", init_function_type, object_type);
@@ -3551,6 +3561,348 @@ fn init_pytraceback_type(ns: &mut DictStorage) {
                     pyre_object::w_str_new("tb_lasti"),
                     pyre_object::w_str_new("tb_lineno"),
                 ]))
+            },
+            1,
+        ),
+    );
+}
+
+/// `pypy/interpreter/typedef.py:736-753 PyFrame.typedef` — the `frame`
+/// type's getset descriptors + `clear` / `__repr__`.  The receiver
+/// (`args[1]`) is a live `PyFrame` object (its `ob_header.ob_type` is
+/// `FRAME_TYPE`); every field access casts it to `*mut PyFrame`.  A read
+/// through a null / already-freed receiver returns `None` rather than
+/// dereferencing.  `f_lineno`'s setter uses the existing simplified
+/// `fset_f_lineno` (the full `mark_stacks` jump validation is a separate
+/// port); the read-only getsets and `f_trace*` setters mirror
+/// `pyframe.py:641-806` directly.
+fn init_frame_type(ns: &mut DictStorage) {
+    use crate::pyframe::PyFrame;
+
+    // Helper: resolve the receiver to `&mut PyFrame`, or return `w_none()`
+    // (the closures each inline this because Rust closures can't share a
+    // borrow-returning helper cleanly).
+    fn frame_ptr(w_obj: pyre_object::PyObjectRef) -> *mut PyFrame {
+        w_obj as *mut PyFrame
+    }
+
+    // f_code — read-only; the `PyCode` wrapper (pyframe.py:641 fget_code).
+    let code_getter = make_builtin_function_with_arity(
+        "f_code",
+        |args| {
+            let f = frame_ptr(args[1]);
+            if f.is_null() {
+                return Ok(pyre_object::w_none());
+            }
+            Ok(unsafe { &*f }.fget_f_code())
+        },
+        2,
+    );
+    dict_storage_store(
+        ns,
+        "f_code",
+        make_getset_descriptor_named(code_getter, "f_code"),
+    );
+
+    // f_globals — read-only (pyframe.py:647 fget_w_globals).
+    let globals_getter = make_builtin_function_with_arity(
+        "f_globals",
+        |args| {
+            let f = frame_ptr(args[1]);
+            if f.is_null() {
+                return Ok(pyre_object::w_none());
+            }
+            let w = unsafe { &*f }.get_w_globals();
+            Ok(if w.is_null() { pyre_object::w_none() } else { w })
+        },
+        2,
+    );
+    dict_storage_store(
+        ns,
+        "f_globals",
+        make_getset_descriptor_named(globals_getter, "f_globals"),
+    );
+
+    // f_locals — read-only; runs `fast2locals` (pyframe.py:644
+    // fget_getdictscope), so it needs `&mut` and can raise.
+    let locals_getter = make_builtin_function_with_arity(
+        "f_locals",
+        |args| {
+            let f = frame_ptr(args[1]);
+            if f.is_null() {
+                return Ok(pyre_object::w_none());
+            }
+            let w = unsafe { &mut *f }.getdictscope()?;
+            Ok(if w.is_null() { pyre_object::w_dict_new() } else { w })
+        },
+        2,
+    );
+    dict_storage_store(
+        ns,
+        "f_locals",
+        make_getset_descriptor_named(locals_getter, "f_locals"),
+    );
+
+    // f_back — read-only; the next non-hidden frame (pyframe.py:767).
+    let back_getter = make_builtin_function_with_arity(
+        "f_back",
+        |args| {
+            let f = frame_ptr(args[1]);
+            if f.is_null() {
+                return Ok(pyre_object::w_none());
+            }
+            let back = unsafe { &*f }.get_f_back();
+            Ok(if back.is_null() {
+                pyre_object::w_none()
+            } else {
+                back as pyre_object::PyObjectRef
+            })
+        },
+        2,
+    );
+    dict_storage_store(
+        ns,
+        "f_back",
+        make_getset_descriptor_named(back_getter, "f_back"),
+    );
+
+    // f_lasti — read-only instruction-unit index (pyframe.py:770).
+    let lasti_getter = make_builtin_function_with_arity(
+        "f_lasti",
+        |args| {
+            let f = frame_ptr(args[1]);
+            if f.is_null() {
+                return Ok(pyre_object::w_none());
+            }
+            Ok(pyre_object::w_int_new(unsafe { &*f }.fget_f_lasti() as i64))
+        },
+        2,
+    );
+    dict_storage_store(
+        ns,
+        "f_lasti",
+        make_getset_descriptor_named(lasti_getter, "f_lasti"),
+    );
+
+    // f_builtins — read-only builtin dict (pyframe.py:761).
+    let builtins_getter = make_builtin_function_with_arity(
+        "f_builtins",
+        |args| {
+            let f = frame_ptr(args[1]);
+            if f.is_null() {
+                return Ok(pyre_object::w_none());
+            }
+            let w = unsafe { &*f }.fget_f_builtins();
+            Ok(if w.is_null() { pyre_object::w_none() } else { w })
+        },
+        2,
+    );
+    dict_storage_store(
+        ns,
+        "f_builtins",
+        make_getset_descriptor_named(builtins_getter, "f_builtins"),
+    );
+
+    // f_lineno — read/write (pyframe.py:654 fget_f_lineno / :666 fset).
+    // The getter returns `None` for an untraced frame whose line is -1;
+    // the setter uses pyre's simplified `fset_f_lineno` (full mark_stacks
+    // jump validation is a separate port).
+    let lineno_getter = make_builtin_function_with_arity(
+        "f_lineno",
+        |args| {
+            let f = frame_ptr(args[1]);
+            if f.is_null() {
+                return Ok(pyre_object::w_none());
+            }
+            let frame = unsafe { &*f };
+            let lineno = frame.get_last_lineno();
+            if frame.get_w_f_trace().is_null() {
+                if lineno == -1 {
+                    return Ok(pyre_object::w_none());
+                }
+                return Ok(pyre_object::w_int_new(lineno as i64));
+            }
+            let lineno = if lineno == -1 {
+                frame
+                    .code()
+                    .first_line_number
+                    .map_or(-1, |n| n.get() as isize)
+            } else {
+                lineno
+            };
+            Ok(pyre_object::w_int_new(lineno as i64))
+        },
+        2,
+    );
+    let lineno_setter = make_builtin_function_with_arity(
+        "f_lineno",
+        |args| {
+            let f = frame_ptr(args[1]);
+            if f.is_null() {
+                return Ok(pyre_object::w_none());
+            }
+            let new_lineno = crate::baseobjspace::int_w(args[2])
+                .map_err(|_| crate::PyError::value_error("lineno must be an integer"))?;
+            unsafe { &mut *f }.fset_f_lineno(new_lineno as isize);
+            Ok(pyre_object::w_none())
+        },
+        3,
+    );
+    dict_storage_store(
+        ns,
+        "f_lineno",
+        make_getset_property_named(
+            lineno_getter,
+            lineno_setter,
+            pyre_object::PY_NULL,
+            "f_lineno",
+        ),
+    );
+
+    // f_trace — read/write/delete (pyframe.py:773-785).
+    let trace_getter = make_builtin_function_with_arity(
+        "f_trace",
+        |args| {
+            let f = frame_ptr(args[1]);
+            if f.is_null() {
+                return Ok(pyre_object::w_none());
+            }
+            let w = unsafe { &*f }.fget_f_trace();
+            Ok(if w.is_null() { pyre_object::w_none() } else { w })
+        },
+        2,
+    );
+    let trace_setter = make_builtin_function_with_arity(
+        "f_trace",
+        |args| {
+            let f = frame_ptr(args[1]);
+            if !f.is_null() {
+                unsafe { &mut *f }.fset_f_trace(args[2]);
+            }
+            Ok(pyre_object::w_none())
+        },
+        3,
+    );
+    let trace_deleter = make_builtin_function_with_arity(
+        "f_trace",
+        |args| {
+            let f = frame_ptr(args[1]);
+            if !f.is_null() {
+                unsafe { &mut *f }.fdel_f_trace();
+            }
+            Ok(pyre_object::w_none())
+        },
+        2,
+    );
+    dict_storage_store(
+        ns,
+        "f_trace",
+        make_getset_property_named(trace_getter, trace_setter, trace_deleter, "f_trace"),
+    );
+
+    // f_trace_lines — read/write bool (pyframe.py:787-791).
+    let trace_lines_getter = make_builtin_function_with_arity(
+        "f_trace_lines",
+        |args| {
+            let f = frame_ptr(args[1]);
+            if f.is_null() {
+                return Ok(pyre_object::w_none());
+            }
+            Ok(pyre_object::w_bool_from(
+                unsafe { &*f }.fget_f_trace_lines(),
+            ))
+        },
+        2,
+    );
+    let trace_lines_setter = make_builtin_function_with_arity(
+        "f_trace_lines",
+        |args| {
+            let f = frame_ptr(args[1]);
+            if !f.is_null() {
+                let v = crate::baseobjspace::is_true(args[2])?;
+                unsafe { &mut *f }.fset_f_trace_lines(v);
+            }
+            Ok(pyre_object::w_none())
+        },
+        3,
+    );
+    dict_storage_store(
+        ns,
+        "f_trace_lines",
+        make_getset_property_named(
+            trace_lines_getter,
+            trace_lines_setter,
+            pyre_object::PY_NULL,
+            "f_trace_lines",
+        ),
+    );
+
+    // f_trace_opcodes — read/write bool (pyframe.py:793-797).
+    let trace_opcodes_getter = make_builtin_function_with_arity(
+        "f_trace_opcodes",
+        |args| {
+            let f = frame_ptr(args[1]);
+            if f.is_null() {
+                return Ok(pyre_object::w_none());
+            }
+            Ok(pyre_object::w_bool_from(
+                unsafe { &*f }.fget_f_trace_opcodes(),
+            ))
+        },
+        2,
+    );
+    let trace_opcodes_setter = make_builtin_function_with_arity(
+        "f_trace_opcodes",
+        |args| {
+            let f = frame_ptr(args[1]);
+            if !f.is_null() {
+                let v = crate::baseobjspace::is_true(args[2])?;
+                unsafe { &mut *f }.fset_f_trace_opcodes(v);
+            }
+            Ok(pyre_object::w_none())
+        },
+        3,
+    );
+    dict_storage_store(
+        ns,
+        "f_trace_opcodes",
+        make_getset_property_named(
+            trace_opcodes_getter,
+            trace_opcodes_setter,
+            pyre_object::PY_NULL,
+            "f_trace_opcodes",
+        ),
+    );
+
+    // clear() — interp2app (pyframe.py:805 descr_clear).
+    dict_storage_store(
+        ns,
+        "clear",
+        make_builtin_function_with_arity(
+            "clear",
+            |args| {
+                let f = frame_ptr(args[0]);
+                if !f.is_null() {
+                    unsafe { &mut *f }.descr_clear()?;
+                }
+                Ok(pyre_object::w_none())
+            },
+            1,
+        ),
+    );
+
+    // __repr__ — interp2app (pyframe.py:849 descr_repr).
+    dict_storage_store(
+        ns,
+        "__repr__",
+        make_builtin_function_with_arity(
+            "__repr__",
+            |args| {
+                let f = frame_ptr(args[0]);
+                if f.is_null() {
+                    return Ok(pyre_object::w_str_new("<frame (null)>"));
+                }
+                Ok(pyre_object::w_str_new(&unsafe { &*f }.descr_repr()))
             },
             1,
         ),
