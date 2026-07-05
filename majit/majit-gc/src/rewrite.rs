@@ -1,5 +1,6 @@
 #![cfg_attr(test, allow(unused_variables))]
 
+use indexmap::{IndexMap, IndexSet};
 /// GC rewriter — transforms high-level allocation and store operations
 /// into GC-aware lower-level IR before code generation.
 ///
@@ -15,7 +16,7 @@ use majit_ir::Type;
 use majit_ir::descr::{DescrRef, FieldDescr, SizeDescr};
 use majit_ir::operand::Operand;
 use majit_ir::resoperation::{Op, OpCode, OpRef};
-use majit_ir::{Const, ConstMap, GcRef, Value, VecMap, VecSet};
+use majit_ir::{Const, ConstMap, GcRef, Value};
 
 use crate::{GcRewriter, WriteBarrierDescr};
 
@@ -350,7 +351,7 @@ struct RewriteState {
     /// whose write barrier has already been emitted (freshly allocated
     /// objects, or objects we already issued a WB for). Cleared whenever
     /// we emit an operation that can trigger a collection or on LABEL.
-    wb_applied: VecSet<OpRef>,
+    wb_applied: IndexSet<OpRef>,
     /// Forwarding map from original result OpRefs to rewritten result boxes.
     /// Keyed lookup only (`resolve`/`record_result_mapping`), never iterated
     /// in order, so a hash map keeps the per-op resolve O(1) on long traces.
@@ -360,7 +361,7 @@ struct RewriteState {
     /// Maps array OpRef → known length. Populated when NEW_ARRAY has a
     /// constant length operand (rewrite.py:551). Cleared on LABEL
     /// (rewrite.py:1005) and emitting_an_operation_that_can_collect.
-    known_lengths: VecMap<OpRef, usize>,
+    known_lengths: IndexMap<OpRef, usize>,
 
     // ── Pending zero tracking ──
     /// Deferred ZERO_ARRAY ops that may be optimized away if subsequent
@@ -368,7 +369,7 @@ struct RewriteState {
     pending_zeros: Vec<PendingZero>,
     /// Tracks which array indices have been explicitly SET since the
     /// pending zero was recorded. Keyed by array OpRef index.
-    initialized_indices: VecMap<OpRef, VecSet<usize>>,
+    initialized_indices: IndexMap<OpRef, IndexSet<usize>>,
     /// rewrite.py:61 `_delayed_zero_setfields = {}`.
     ///
     /// Map from base OpRef → set of byte-offsets of zero-init SETFIELD_GC
@@ -378,7 +379,7 @@ struct RewriteState {
     /// pending at the next can-collect / flush point is emitted as
     /// `GC_STORE(ptr, ofs, 0, WORD)` by `emit_pending_zeros`
     /// (rewrite.py:761-766).
-    _delayed_zero_setfields: VecMap<OpRef, VecSet<i64>>,
+    _delayed_zero_setfields: IndexMap<OpRef, IndexSet<i64>>,
 
     // ── INT_ADD/INT_SUB constant-fold tracking (rewrite.py:64) ──
     /// `_constant_additions[box]` = `(older_box, constant_add)` for an
@@ -393,7 +394,7 @@ struct RewriteState {
     /// ported.  The parity skeleton is kept here so the structural
     /// presence matches upstream and the consumer can be wired without
     /// re-introducing the field.
-    _constant_additions: VecMap<OpRef, (Operand, i64)>,
+    _constant_additions: IndexMap<OpRef, (Operand, i64)>,
     /// Reserved next constant index in the passed-in constant namespace.
     /// Current GC-rewrite parity emits fresh `ConstInt` values inline
     /// (`history.py:227`) instead of allocating pool entries, so this is
@@ -409,7 +410,7 @@ struct RewriteState {
     /// input op list. The main dispatch loop checks for a substitution
     /// at iteration `i` and swaps the rewritten op in place of the
     /// original (rewrite.py:366-367).
-    changed_ops: VecMap<usize, Op>,
+    changed_ops: IndexMap<usize, Op>,
 
     /// rewrite.py:96-99 `get_box_replacement` — source→replacement mapping
     /// for ops that `transform_to_gc_load` has forwarded to a lowered
@@ -420,7 +421,7 @@ struct RewriteState {
     /// keyed by the main-loop iteration index (stashed in
     /// `current_i`) and consumed by `emit_maybe_forwarded` when the
     /// outer dispatch reaches the op's emission site.
-    forwarded_ops: VecMap<usize, Op>,
+    forwarded_ops: IndexMap<usize, Op>,
     /// Current main-loop iteration index, set by the outer dispatch
     /// before invoking `transform_to_gc_load` / `handle_*` helpers.
     /// Read by `set_forwarded` / `emit_maybe_forwarded` to key the
@@ -434,14 +435,14 @@ struct RewriteState {
     gcrefs_output_list: Vec<GcRef>,
     /// rewrite.py:353 `gcrefs_map` — dedup map from a reference constant
     /// (keyed by `GcRef.0`) to its index in `gcrefs_output_list`.
-    gcrefs_map: VecMap<usize, u32>,
+    gcrefs_map: IndexMap<usize, u32>,
     /// rewrite.py:354 `gcrefs_recently_loaded` — CSE cache from a gc_table
     /// index to the `LoadFromGcTable` result box already emitted in the
     /// current basic block. Reset at every Label (rewrite.py:1005). Reuse
     /// across a can-collect point is sound: the load result is a Ref box,
     /// so the register allocator keeps it in the GC map and the collector
     /// forwards the held copy.
-    gcrefs_recently_loaded: VecMap<u32, Operand>,
+    gcrefs_recently_loaded: IndexMap<u32, Operand>,
 }
 
 impl RewriteState {
@@ -454,20 +455,20 @@ impl RewriteState {
             pending_malloc_total: 0,
             previous_size: 0,
             last_malloced_ref: Operand::none(),
-            wb_applied: VecSet::new(),
+            wb_applied: IndexSet::new(),
             forwarding: std::collections::HashMap::new(),
-            known_lengths: VecMap::new(),
+            known_lengths: IndexMap::new(),
             pending_zeros: Vec::new(),
-            initialized_indices: VecMap::new(),
-            _delayed_zero_setfields: VecMap::new(),
-            _constant_additions: VecMap::new(),
+            initialized_indices: IndexMap::new(),
+            _delayed_zero_setfields: IndexMap::new(),
+            _constant_additions: IndexMap::new(),
             next_const_idx: 0,
-            changed_ops: VecMap::new(),
-            forwarded_ops: VecMap::new(),
+            changed_ops: IndexMap::new(),
+            forwarded_ops: IndexMap::new(),
             current_i: 0,
             gcrefs_output_list: Vec::new(),
-            gcrefs_map: VecMap::new(),
-            gcrefs_recently_loaded: VecMap::new(),
+            gcrefs_map: IndexMap::new(),
+            gcrefs_recently_loaded: IndexMap::new(),
         }
     }
 
@@ -806,7 +807,7 @@ impl RewriteState {
     /// rewrite.py:84-91 `delayed_zero_setfields(op)` — get-or-create the
     /// per-base byte-offset set, resolving `r` through the forwarding
     /// map first (RPython calls `get_box_replacement(op)` here).
-    fn delayed_zero_setfields(&mut self, r: &Operand) -> &mut VecSet<i64> {
+    fn delayed_zero_setfields(&mut self, r: &Operand) -> &mut IndexSet<i64> {
         let key = self.resolve(r.clone()).to_opref();
         self._delayed_zero_setfields.entry(key).or_default()
     }

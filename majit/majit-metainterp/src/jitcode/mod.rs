@@ -340,7 +340,7 @@ pub struct JitCodeExecState {
     /// slot keeps the bridge per callsite; keying by int-const pool slot
     /// would collapse distinct trace targets that share a concrete
     /// pointer.
-    pub call_descr_to_call_target: majit_ir::VecMap<u16, JitCallTarget>,
+    pub call_descr_to_call_target: indexmap::IndexMap<u16, JitCallTarget>,
     /// Bytecode offset of the `BC_JIT_MERGE_POINT(_C)` opcode byte for
     /// the dispatch JitCode emitted by `lower_dispatch_body`.  `None`
     /// for non-dispatch JitCodes (helpers, sub-arms) — exactly one

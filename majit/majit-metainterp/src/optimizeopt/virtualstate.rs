@@ -23,7 +23,7 @@ use std::cell::Cell;
 use std::ops::Deref;
 use std::rc::Rc;
 
-use majit_ir::vec_set::VecSet;
+use indexmap::IndexSet;
 
 use majit_ir::descr::descr_identity;
 use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type, Value};
@@ -77,8 +77,8 @@ impl VirtualStatesCantMatch {
 pub(crate) struct GenerateGuardState<'a> {
     pub ctx: &'a mut OptContext,
     pub extra_guards: &'a mut Vec<GuardRequirement>,
-    pub renum: majit_ir::VecMap<i32, i32>,
-    pub bad: VecSet<*const VirtualStateInfoNode>,
+    pub renum: indexmap::IndexMap<i32, i32>,
+    pub bad: IndexSet<*const VirtualStateInfoNode>,
     pub force_boxes: bool,
 }
 
@@ -550,7 +550,7 @@ impl VirtualState {
     /// next `enum_top_level` traversal mirrors a fresh RPython
     /// VirtualState.__init__ over fresh subclass instances.
     fn reset_positions(state: &[Rc<VirtualStateInfoNode>]) {
-        let mut visited: majit_ir::vec_set::VecSet<usize> = majit_ir::vec_set::VecSet::new();
+        let mut visited: indexmap::IndexSet<usize> = indexmap::IndexSet::new();
         for node in state {
             Self::reset_positions_walk(node, &mut visited);
         }
@@ -558,7 +558,7 @@ impl VirtualState {
 
     fn reset_positions_walk(
         node: &Rc<VirtualStateInfoNode>,
-        visited: &mut majit_ir::vec_set::VecSet<usize>,
+        visited: &mut indexmap::IndexSet<usize>,
     ) {
         let key = Rc::as_ptr(node) as usize;
         if visited.contains(&key) {
@@ -602,7 +602,7 @@ impl VirtualState {
     /// recursive nested Rcs participate in the dedup.
     pub fn count_forced_boxes_for_entry_static(
         rc: &Rc<VirtualStateInfoNode>,
-        visited: &mut majit_ir::VecMap<usize, OpRef>,
+        visited: &mut indexmap::IndexMap<usize, OpRef>,
     ) -> usize {
         // RPython virtualstate.py:111 first-visit guard via
         // `position == -1` — every visited node is recorded so a later
@@ -629,7 +629,7 @@ impl VirtualState {
 
     fn count_forced_boxes_for_entry(
         info: &VirtualStateInfo,
-        visited: &mut majit_ir::VecMap<usize, OpRef>,
+        visited: &mut indexmap::IndexMap<usize, OpRef>,
     ) -> usize {
         match info {
             VirtualStateInfo::Constant(_) => 0,
@@ -666,7 +666,7 @@ impl VirtualState {
     /// `is_some()` check, leaking NONE into downstream lookups.
     fn count_forced_boxes_for_entry_rc(
         rc: &Rc<VirtualStateInfoNode>,
-        visited: &mut majit_ir::VecMap<usize, OpRef>,
+        visited: &mut indexmap::IndexMap<usize, OpRef>,
     ) -> usize {
         let key = Rc::as_ptr(rc) as usize;
         if visited.contains_key(&key) {
@@ -1107,8 +1107,8 @@ impl VirtualState {
         let mut state = GenerateGuardState {
             ctx,
             extra_guards: &mut guards,
-            renum: majit_ir::VecMap::new(),
-            bad: VecSet::new(),
+            renum: indexmap::IndexMap::new(),
+            bad: IndexSet::new(),
             force_boxes: false,
         };
         // virtualstate.py:640-642 `for i in range(len(self.state)):
@@ -1196,8 +1196,8 @@ impl VirtualState {
         let mut state = GenerateGuardState {
             ctx,
             extra_guards: &mut guards,
-            renum: majit_ir::VecMap::new(),
-            bad: VecSet::new(),
+            renum: indexmap::IndexMap::new(),
+            bad: IndexSet::new(),
             force_boxes,
         };
         // virtualstate.py:24-37 `GenerateGuardState.renum` and :84-94
@@ -1215,7 +1215,7 @@ impl VirtualState {
         // the same expected virtual node (the trace assumes two values
         // are aliased but the incoming disagrees), and short-circuits
         // duplicate visits to a node already proven compatible. The same
-        // `VecMap` instance is threaded through every recursive call
+        // `IndexMap` instance is threaded through every recursive call
         // (virtualstate.py:174-176 struct field, :260-261 array item,
         // :325-326 interior field) so nested virtual nodes share the
         // alias namespace with their top-level parents. Now lives on
@@ -2163,8 +2163,8 @@ impl Clone for VirtualState {
     /// subclass instances per VirtualState — this manual impl reproduces
     /// that invariant.
     fn clone(&self) -> Self {
-        let mut cache: majit_ir::VecMap<*const VirtualStateInfoNode, Rc<VirtualStateInfoNode>> =
-            majit_ir::VecMap::new();
+        let mut cache: indexmap::IndexMap<*const VirtualStateInfoNode, Rc<VirtualStateInfoNode>> =
+            indexmap::IndexMap::new();
         let cloned: Vec<Rc<VirtualStateInfoNode>> = self
             .state
             .iter()
@@ -2179,7 +2179,7 @@ impl Clone for VirtualState {
 /// `<VirtualState as Clone>::clone`.
 fn deep_clone_node(
     src: &Rc<VirtualStateInfoNode>,
-    cache: &mut majit_ir::VecMap<*const VirtualStateInfoNode, Rc<VirtualStateInfoNode>>,
+    cache: &mut indexmap::IndexMap<*const VirtualStateInfoNode, Rc<VirtualStateInfoNode>>,
 ) -> Rc<VirtualStateInfoNode> {
     let key = Rc::as_ptr(src);
     if let Some(hit) = cache.get(&key) {
@@ -2499,17 +2499,17 @@ pub(crate) struct ExportCache {
     // `materialize_operand_at`) are bound at creation; an unbound position would
     // mint a fresh operand from the opref per visit and split the cache, so the
     // assert traps that as a bind-at-alloc gap rather than silently
-    // mis-deduping. `VecMap`/`VecSet` are Vec-backed and compare by `Eq` only
+    // mis-deduping. `IndexMap`/`IndexSet` are Vec-backed and compare by `Eq` only
     // (never hash), so no GC pointer is hashed here.
-    pub finished: majit_ir::VecMap<majit_ir::operand::Operand, Rc<VirtualStateInfoNode>>,
-    pub in_progress: majit_ir::vec_set::VecSet<majit_ir::operand::Operand>,
+    pub finished: indexmap::IndexMap<majit_ir::operand::Operand, Rc<VirtualStateInfoNode>>,
+    pub in_progress: indexmap::IndexSet<majit_ir::operand::Operand>,
 }
 
 impl ExportCache {
     pub fn new() -> Self {
         Self {
-            finished: majit_ir::VecMap::new(),
-            in_progress: majit_ir::vec_set::VecSet::new(),
+            finished: indexmap::IndexMap::new(),
+            in_progress: indexmap::IndexSet::new(),
         }
     }
 }

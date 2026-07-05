@@ -7,6 +7,7 @@ repository.workspace = true
 description = "Cranelift code generation backend for majit JIT compiler"
 
 [dependencies]
+indexmap = { workspace = true }
 majit-ir = { workspace = true }
 majit-backend = { workspace = true }
 majit-translate = { workspace = true }

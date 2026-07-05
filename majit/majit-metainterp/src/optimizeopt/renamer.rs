@@ -8,7 +8,7 @@ use std::rc::Rc;
 use majit_ir::resoperation::{Op, OpCode, OpRc};
 use majit_ir::{InputArg, OpRef, Type};
 
-use majit_ir::VecMap;
+use indexmap::IndexMap;
 use majit_ir::operand::Operand;
 
 /// renamer.py:3-58: Renamer — maps old OpRefs to new OpRefs during unrolling.
@@ -24,7 +24,7 @@ use majit_ir::operand::Operand;
 /// `OpRef`), so the only observable change is the box KIND (bound vs
 /// position-only).
 pub struct Renamer {
-    rename_map: VecMap<OpRef, Operand>,
+    rename_map: IndexMap<OpRef, Operand>,
     /// Producer `Rc`s minted by [`Renamer::bound_box`] to back the bound map
     /// values. The bound operand holds only a `Weak<Op>` / `Weak<InputArg>`,
     /// so its producer must be rooted for the upgrade to stay live. The
@@ -41,7 +41,7 @@ pub struct Renamer {
 impl Renamer {
     pub fn new() -> Self {
         Renamer {
-            rename_map: VecMap::new(),
+            rename_map: IndexMap::new(),
             producer_roots: Vec::new(),
         }
     }

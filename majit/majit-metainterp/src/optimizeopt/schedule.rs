@@ -3,6 +3,7 @@
 //! Mirrors RPython's `schedule.py`: pack groups, accumulation tracking,
 //! guard analysis, and vector scheduling state.
 
+use indexmap::{IndexMap, IndexSet};
 use majit_ir::operand::Operand;
 use majit_ir::{Op, OpCode, OpRc, OpRef, Type};
 
@@ -111,7 +112,7 @@ impl GuardAnalysis {
     /// A guard is hoistable if its arguments are loop-invariant
     /// (not produced by any op in the loop body).
     pub fn analyze(ops: &[Op]) -> Self {
-        let mut body_results: majit_ir::vec_set::VecSet<OpRef> = majit_ir::vec_set::VecSet::new();
+        let mut body_results: indexmap::IndexSet<OpRef> = indexmap::IndexSet::new();
         for op in ops {
             if !op.pos.get().is_none() {
                 body_results.insert(op.pos.get());
@@ -150,7 +151,7 @@ impl GuardAnalysis {
 /// pack/unpack/expand operations, and manages the output op list.
 pub struct VecScheduleState {
     /// Map from scalar OpRef → (index_in_vector, vector OpRef).
-    pub box_to_vbox: majit_ir::VecMap<OpRef, (usize, OpRef)>,
+    pub box_to_vbox: indexmap::IndexMap<OpRef, (usize, OpRef)>,
     /// Output operations (vector + remaining scalar).
     ///
     /// `Vec<OpRc>` (not `Vec<Op>`): each emitted op is the canonical producer
@@ -163,18 +164,18 @@ pub struct VecScheduleState {
     /// Cost model for profitability analysis.
     pub costmodel: CostModel,
     /// schedule.py:587-588: expanded_map — tracks expanded scalars.
-    pub expanded_map: majit_ir::VecMap<OpRef, Vec<(OpRef, i32)>>,
+    pub expanded_map: indexmap::IndexMap<OpRef, Vec<(OpRef, i32)>>,
     /// schedule.py:591: inputargs of the loop label.
-    pub inputargs: majit_ir::VecMap<OpRef, ()>,
+    pub inputargs: indexmap::IndexMap<OpRef, ()>,
     /// schedule.py:38,723: invariant_vector_vars — vector ops created by expand()
     /// for loop-invariant scalars (constants and inputargs). Populated in
     /// expand() (schedule.py:554-555), called from prepare_arguments().
-    pub invariant_vector_vars: majit_ir::vec_set::VecSet<OpRef>,
+    pub invariant_vector_vars: indexmap::IndexSet<OpRef>,
     /// schedule.py:532: invariant_oplist — ops to emit before the loop.
     /// `Vec<OpRc>` for the same producer-identity reason as `oplist`.
     pub invariant_oplist: Vec<OpRc>,
     /// schedule.py:595: accumulation info.
-    pub accumulation: majit_ir::VecMap<OpRef, AccumEntry>,
+    pub accumulation: indexmap::IndexMap<OpRef, AccumEntry>,
     /// Next OpRef counter for newly created vector ops.
     next_pos: u32,
     /// `schedule.py:20-28 forwarded_vecinfo(op)` scratch, keyed by full `OpRef`
@@ -199,23 +200,23 @@ pub struct VecScheduleState {
     /// `resoperation.py:111-127 VecOperationNew` datatype/bytesize/signed/count
     /// that survives `copy_and_change`, cleared for non-vector ops by
     /// `vector.py:58-60 teardown_vectorization`.
-    vecinfo_cache: majit_ir::VecMap<OpRef, majit_ir::VectorizationInfo>,
+    vecinfo_cache: indexmap::IndexMap<OpRef, majit_ir::VectorizationInfo>,
 }
 
 impl VecScheduleState {
     pub fn new(start_pos: u32) -> Self {
         VecScheduleState {
-            box_to_vbox: majit_ir::VecMap::new(),
+            box_to_vbox: indexmap::IndexMap::new(),
             oplist: Vec::new(),
             renamer: super::renamer::Renamer::new(),
             costmodel: CostModel::new(),
-            expanded_map: majit_ir::VecMap::new(),
-            inputargs: majit_ir::VecMap::new(),
-            invariant_vector_vars: majit_ir::vec_set::VecSet::new(),
+            expanded_map: indexmap::IndexMap::new(),
+            inputargs: indexmap::IndexMap::new(),
+            invariant_vector_vars: indexmap::IndexSet::new(),
             invariant_oplist: Vec::new(),
-            accumulation: majit_ir::VecMap::new(),
+            accumulation: indexmap::IndexMap::new(),
             next_pos: start_pos,
-            vecinfo_cache: majit_ir::VecMap::new(),
+            vecinfo_cache: indexmap::IndexMap::new(),
         }
     }
 
@@ -627,7 +628,7 @@ impl VecScheduleState {
     pub fn post_schedule(
         &mut self,
         loop_: &mut crate::optimizeopt::vector::VectorLoop,
-        seen: &mut majit_ir::vec_set::VecSet<OpRef>,
+        seen: &mut indexmap::IndexSet<OpRef>,
     ) {
         // schedule.py:763 → base SchedulerState.post_schedule (schedule.py:108-116),
         // inlined here. schedule.py:111-114 resolve_delayed is omitted: majit has
@@ -659,10 +660,10 @@ impl VecScheduleState {
             // schedule.py:769-773: prefix_label.
             //   args = loop.label.getarglist_copy() + self.invariant_vector_vars
             let mut args = loop_.label.getarglist();
-            // invariant_vector_vars is a VecSet (insertion-ordered re-export of
+            // invariant_vector_vars is a IndexSet (insertion-ordered re-export of
             // vecmap_rs::VecSet), so iterating reproduces RPython's list-append
             // order. RPython's list may hold dups but expand() only appends fresh
-            // boxes, so VecSet's de-dup is a no-op here. Each invariant var is a
+            // boxes, so IndexSet's de-dup is a no-op here. Each invariant var is a
             // vector op now living in `loop_.prefix`; bind to that producer box.
             // Collected first so the per-var bind can take `&mut self.renamer`
             // (the bound-box synthesis for an inputarg-position miss).
@@ -742,7 +743,7 @@ impl VecScheduleState {
         // schedule.py:614-632: multi-arg → intersect candidates at correct positions.
         // For each arg position i, collect vecops that expanded arg at index i.
         // A vecop is valid only if it appears at every position — intersect.
-        let mut possible: majit_ir::VecMap<OpRef, bool> = majit_ir::VecMap::new();
+        let mut possible: indexmap::IndexMap<OpRef, bool> = indexmap::IndexMap::new();
         for (i, arg) in args.iter().enumerate() {
             let expansions = match self.expanded_map.get(arg) {
                 Some(e) => e,

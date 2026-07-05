@@ -595,7 +595,7 @@ pub struct WasmBackend {
     cpu_tracker: std::sync::Arc<majit_backend::CpuTotalTracker>,
     trace_counter: u64,
     /// Optimizer constant pool (constant-namespace OpRef → i64 value).
-    constants: majit_ir::VecMap<u32, i64>,
+    constants: indexmap::IndexMap<u32, i64>,
     /// llmodel.py:64-69 self.vtable_offset.
     vtable_offset: Option<usize>,
 }
@@ -703,7 +703,7 @@ impl WasmBackend {
         WasmBackend {
             cpu_tracker: std::sync::Arc::new(majit_backend::CpuTotalTracker::default()),
             trace_counter: 0,
-            constants: majit_ir::VecMap::new(),
+            constants: indexmap::IndexMap::new(),
             vtable_offset: None,
         }
     }

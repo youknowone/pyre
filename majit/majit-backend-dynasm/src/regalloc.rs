@@ -12,7 +12,8 @@
 ///   compute_vars_longevity — regalloc.py:1173
 ///   valid_addressing_size  — regalloc.py:1236
 ///   get_scale              — regalloc.py:1239
-use majit_ir::{VecMap, VecMapExt};
+use indexmap::IndexMap;
+use majit_ir::VecMapExt;
 
 use crate::arch::*;
 use crate::gcmap::{allocate_gcmap, gcmap_set_bit};
@@ -252,24 +253,24 @@ impl FixedRegisterPositions {
 /// regalloc.py:1054 LifetimeManager — manages Lifetime info for all variables.
 pub struct LifetimeManager {
     // Insertion-ordered map (`IndexMap`) rather than the Vec-backed
-    // `VecMap`: every register-allocation location query
+    // `IndexMap`: every register-allocation location query
     // (`RegisterManager::loc`/`_sync_var_to_stack`/`spill_*`,
     // `FrameManager::get`/`bind`/`get_new_loc`) resolves a variable through
     // `lifetimes.get(v)`, and a Vec-backed `get` is O(n) — making regalloc
     // O(n^2) on very large traces (aheui's logo whole-program loop spends
-    // ~all its backend time in `VecMap::get_index_of` here). regalloc.py:1054
+    // ~all its backend time in `IndexMap::get_index_of` here). regalloc.py:1054
     // keys longevity by a dict (O(1)); `IndexMap` restores that O(1) lookup
-    // while keeping the insertion-ordered iteration `VecMap` provided.
+    // while keeping the insertion-ordered iteration `IndexMap` provided.
     lifetimes: indexmap::IndexMap<OpRef, Lifetime>,
     /// regalloc.py:1064 maps register → FixedRegisterPositions
-    pub fixed_register_use: VecMap<RegLoc, FixedRegisterPositions>,
+    pub fixed_register_use: IndexMap<RegLoc, FixedRegisterPositions>,
 }
 
 impl LifetimeManager {
     pub fn new() -> Self {
         LifetimeManager {
             lifetimes: indexmap::IndexMap::new(),
-            fixed_register_use: VecMap::new(),
+            fixed_register_use: IndexMap::new(),
         }
     }
 
@@ -774,7 +775,7 @@ pub struct RegisterManager {
 /// silently substitute `0`, which would miscompile the constant as zero.
 /// Panic at the parity hole instead, matching the Cranelift backend's
 /// `missing_legacy_constant`.
-fn const_bits_or_panic(v: OpRef, constants: &majit_ir::VecMap<u32, i64>, where_: &str) -> i64 {
+fn const_bits_or_panic(v: OpRef, constants: &indexmap::IndexMap<u32, i64>, where_: &str) -> i64 {
     if let Some(bits) = v.inline_const_bits() {
         return bits;
     }
@@ -1251,7 +1252,7 @@ impl RegisterManager {
         must_exist: bool,
         longevity: &mut LifetimeManager,
         fm: &mut FrameManager,
-        constants: &majit_ir::VecMap<u32, i64>,
+        constants: &indexmap::IndexMap<u32, i64>,
     ) -> Loc {
         if v.is_constant() {
             // history.py:227/268/314 — inline-Const variants carry the
@@ -1297,7 +1298,7 @@ impl RegisterManager {
         v: OpRef,
         forbidden_vars: &[OpRef],
         selected_reg: Option<RegLoc>,
-        constants: &majit_ir::VecMap<u32, i64>,
+        constants: &indexmap::IndexMap<u32, i64>,
         longevity: &mut LifetimeManager,
         fm: &mut FrameManager,
         pending_moves: &mut Vec<(Loc, Loc)>,
@@ -1327,7 +1328,7 @@ impl RegisterManager {
         need_lower_byte: bool,
         longevity: &mut LifetimeManager,
         fm: &mut FrameManager,
-        constants: &majit_ir::VecMap<u32, i64>,
+        constants: &indexmap::IndexMap<u32, i64>,
         pending_moves: &mut Vec<(Loc, Loc)>,
     ) -> Loc {
         if v.is_constant() {
@@ -1381,7 +1382,7 @@ impl RegisterManager {
         forbidden_vars: &[OpRef],
         longevity: &mut LifetimeManager,
         fm: &mut FrameManager,
-        constants: &majit_ir::VecMap<u32, i64>,
+        constants: &indexmap::IndexMap<u32, i64>,
         pending_moves: &mut Vec<(Loc, Loc)>,
     ) -> Loc {
         if v.is_constant() {
@@ -1573,7 +1574,7 @@ impl RegisterManager {
     // ── x86-specific methods ──
 
     /// x86/regalloc.py:55 convert_to_imm
-    pub fn convert_to_imm(&self, v: OpRef, constants: &majit_ir::VecMap<u32, i64>) -> Loc {
+    pub fn convert_to_imm(&self, v: OpRef, constants: &indexmap::IndexMap<u32, i64>) -> Loc {
         debug_assert!(v.is_constant());
         // x86/regalloc.py:58-61: a non-null `ConstPtr` whose object can
         // still move must never be baked as an immediate — `remove_constptr`
@@ -1661,7 +1662,7 @@ pub struct RegAlloc<'a> {
     /// Frame manager — x86/regalloc.py:132 X86FrameManager
     pub fm: FrameManager,
     /// Constants map (OpRef const_index → i64 value).
-    pub constants: majit_ir::VecMap<u32, i64>,
+    pub constants: indexmap::IndexMap<u32, i64>,
     /// Pending register moves to be emitted by the assembler.
     /// Each entry is (source_loc, dest_loc).
     pub pending_moves: Vec<(Loc, Loc)>,
@@ -1709,7 +1710,7 @@ pub struct RegAlloc<'a> {
 impl<'a> RegAlloc<'a> {
     /// x86/regalloc.py:170
     pub fn new(
-        constants: majit_ir::VecMap<u32, i64>,
+        constants: indexmap::IndexMap<u32, i64>,
         inputargs: &'a [InputArg],
         operations: &'a [Op],
     ) -> Self {
@@ -1960,7 +1961,7 @@ impl<'a> RegAlloc<'a> {
 
     /// x86/regalloc.py:291 _update_bindings — bind bridge inputargs to their locations.
     fn _update_bindings(&mut self, locs: &[Loc], inputargs: &[InputArg]) {
-        let mut used: VecMap<RegLoc, ()> = VecMap::new();
+        let mut used: IndexMap<RegLoc, ()> = IndexMap::new();
 
         // x86/regalloc.py:295-312
         for (iarg, loc) in inputargs.iter().zip(locs.iter()) {
@@ -6216,7 +6217,7 @@ mod tests {
         finish.setfailargs(vec![].into());
         finish.set_fail_arg_types(vec![]);
 
-        let constants: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
+        let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
 
         let ops = vec![add, is_true, guard, finish];
         let mut ra = RegAlloc::new(constants, &inputargs, &ops);
@@ -6256,7 +6257,7 @@ mod tests {
         let store = Op::new(OpCode::GcStore, &[rb(i0), rb(c0), rb(i0)]);
         let ops = vec![store];
 
-        let mut ra = RegAlloc::new(majit_ir::VecMap::new(), &inputargs, &ops);
+        let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
         ra.prepare_loop();
         ra.j2_ops[0] = crate::j2plan::LirOp::Finish { args: vec![i0] };
 
@@ -6304,7 +6305,7 @@ mod tests {
         finish.pos.set(OpRef::int_op(3));
         let ops = vec![raw, finish];
 
-        let mut ra = RegAlloc::new(majit_ir::VecMap::new(), &inputargs, &ops);
+        let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
         ra.prepare_loop();
         let expected_argloc = ra.loc(i1, Type::Int);
         ra.j2_ops[0] = crate::j2plan::LirOp::IntUnary {
@@ -6349,7 +6350,7 @@ mod tests {
         finish.pos.set(OpRef::int_op(3));
         let ops = vec![raw, finish];
 
-        let mut ra = RegAlloc::new(majit_ir::VecMap::new(), &inputargs, &ops);
+        let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
         ra.prepare_loop();
         let expected_argloc = ra.loc(i1, Type::Int);
         ra.j2_ops[0] = crate::j2plan::LirOp::Guard {
@@ -6385,7 +6386,7 @@ mod tests {
         finish.pos.set(OpRef::int_op(3));
         let ops = vec![raw, finish];
 
-        let mut ra = RegAlloc::new(majit_ir::VecMap::new(), &inputargs, &ops);
+        let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
         ra.prepare_loop();
         let expected_argloc = ra.loc(i1, Type::Ref);
         ra.j2_ops[0] = crate::j2plan::LirOp::Load {
@@ -6428,7 +6429,7 @@ mod tests {
         finish.pos.set(OpRef::int_op(3));
         let ops = vec![raw, finish];
 
-        let mut ra = RegAlloc::new(majit_ir::VecMap::new(), &inputargs, &ops);
+        let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
         ra.prepare_loop();
         let expected_argloc = ra.loc(i1, Type::Ref);
         ra.j2_ops[0] = crate::j2plan::LirOp::Store {
@@ -6466,7 +6467,7 @@ mod tests {
         finish.pos.set(OpRef::int_op(3));
         let ops = vec![raw, finish];
 
-        let mut ra = RegAlloc::new(majit_ir::VecMap::new(), &inputargs, &ops);
+        let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
         ra.prepare_loop();
         let expected_argloc = ra.loc(i1, Type::Int);
         ra.j2_ops[0] = crate::j2plan::LirOp::Opcode {
@@ -6504,7 +6505,7 @@ mod tests {
         let inputargs = vec![InputArg::from_type(Type::Ref, i0.raw())];
         let ops = vec![make_guard(OpCode::GuardNotForced2, 0, &[], &[i0])];
 
-        let mut ra = RegAlloc::new(majit_ir::VecMap::new(), &inputargs, &ops);
+        let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
         ra.prepare_loop();
         let output = ra.walk_operations();
 

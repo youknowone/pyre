@@ -133,7 +133,7 @@ impl std::error::Error for AssemblerError {}
 /// (shared descriptor table, liveness encoding, etc.)
 pub struct Assembler {
     /// RPython: Assembler.insns — map {opcode_key: opcode_number}
-    insns: majit_ir::VecMap<String, u8>,
+    insns: indexmap::IndexMap<String, u8>,
     /// Next candidate for the translator-only `setdefault` fallback
     /// (`assembler.py:220`). RPython grows `self.insns` densely from
     /// zero; pyre keeps canonical / extension `BC_*` bytes reserved for
@@ -149,8 +149,8 @@ pub struct Assembler {
     /// Upstream `assembler.py:26` + `:197-203` keeps a Python dict to
     /// deduplicate AbstractDescr objects before emitting the two-byte 'd'
     /// operand; the no-HashMap house rule replaces the dict with a
-    /// VecMap linear-scan lookup.
-    descr_dict: majit_ir::VecMap<AssemblerDescrKey, usize>,
+    /// IndexMap linear-scan lookup.
+    descr_dict: indexmap::IndexMap<AssemblerDescrKey, usize>,
     /// RPython: `Assembler.indirectcalltargets` — merged `IndirectCallTargets`
     /// sidecars from every `residual_call` emitted during assembly
     /// (`assembler.py:208-209`).  RPython stores `JitCode` objects; we
@@ -178,7 +178,7 @@ pub struct Assembler {
     pub all_liveness_length: usize,
     /// RPython: Assembler.all_liveness_positions — dedup cache.
     /// Maps (live_i set, live_r set, live_f set) → offset in all_liveness.
-    all_liveness_positions: majit_ir::VecMap<(VecSet<u8>, VecSet<u8>, VecSet<u8>), usize>,
+    all_liveness_positions: indexmap::IndexMap<(VecSet<u8>, VecSet<u8>, VecSet<u8>), usize>,
     /// RPython: Assembler.num_liveness_ops (assembler.py:32).
     pub num_liveness_ops: usize,
     /// State-field JIT canonical "all-live" liveness triple, set once at
@@ -216,17 +216,17 @@ impl Assembler {
     /// RPython: `Assembler.__init__()` (assembler.py:21-32).
     pub fn new() -> Self {
         Self {
-            insns: majit_ir::VecMap::new(),
+            insns: indexmap::IndexMap::new(),
             dynamic_byte_cursor: 0,
             descrs: Vec::new(),
-            descr_dict: majit_ir::VecMap::new(),
+            descr_dict: indexmap::IndexMap::new(),
             indirectcalltargets: std::collections::HashSet::new(),
             list_of_addr2name: Vec::new(),
             count_jitcodes: 0,
             seen_raw_objects: std::collections::HashSet::new(),
             all_liveness: Vec::new(),
             all_liveness_length: 0,
-            all_liveness_positions: majit_ir::VecMap::new(),
+            all_liveness_positions: indexmap::IndexMap::new(),
             num_liveness_ops: 0,
             canonical_liveness_triple: None,
             canonical_liveness_offset: None,
@@ -378,9 +378,9 @@ impl Assembler {
             num_regs_f,
             label_positions: HashMap::new(),
             tlabel_fixups: Vec::new(),
-            startpoints: majit_ir::vec_set::VecSet::new(),
-            alllabels: majit_ir::vec_set::VecSet::new(),
-            resulttypes: majit_ir::VecMap::new(),
+            startpoints: indexmap::IndexSet::new(),
+            alllabels: indexmap::IndexSet::new(),
+            resulttypes: indexmap::IndexMap::new(),
         };
 
         // RPython assembler.py:41-44:
@@ -2856,13 +2856,13 @@ struct AssemblyState {
     num_regs_f: usize,
     label_positions: HashMap<Label, usize>,
     tlabel_fixups: Vec<(Label, usize)>,
-    startpoints: majit_ir::vec_set::VecSet<usize>,
+    startpoints: indexmap::IndexSet<usize>,
     /// RPython assembler.py:176: positions in bytecode where TLabel operands
     /// are written. Used by JitCode.follow_jump() for verification.
-    alllabels: majit_ir::vec_set::VecSet<usize>,
+    alllabels: indexmap::IndexSet<usize>,
     /// RPython assembler.py:217-219: map from bytecode offset (after `->`)
     /// to result kind character. Recorded when encoding result registers.
-    resulttypes: majit_ir::VecMap<usize, char>,
+    resulttypes: indexmap::IndexMap<usize, char>,
 }
 
 /// RPython: getkind(v.concretetype)[0] → 'i', 'r', 'f', 'v'.
@@ -3899,7 +3899,7 @@ impl Assembler {
     /// via `register_func_name()`.
     /// RPython: Assembler.insns — the opcode table. Needed by
     /// BlackholeInterpBuilder::setup_insns() to build the dispatch table.
-    pub fn insns(&self) -> &majit_ir::VecMap<String, u8> {
+    pub fn insns(&self) -> &indexmap::IndexMap<String, u8> {
         &self.insns
     }
 
@@ -4341,9 +4341,9 @@ mod tests {
             num_regs_f: 0,
             label_positions: HashMap::new(),
             tlabel_fixups: Vec::new(),
-            startpoints: majit_ir::vec_set::VecSet::new(),
-            alllabels: majit_ir::vec_set::VecSet::new(),
-            resulttypes: majit_ir::VecMap::new(),
+            startpoints: indexmap::IndexSet::new(),
+            alllabels: indexmap::IndexSet::new(),
+            resulttypes: indexmap::IndexMap::new(),
         }
     }
 

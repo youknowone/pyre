@@ -7,7 +7,7 @@
 use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicI32, Ordering};
 
-use majit_ir::vec_set::VecSet;
+use indexmap::IndexSet;
 
 use crate::optimizeopt::schedule::Pack;
 use majit_ir::operand::Operand;
@@ -409,13 +409,13 @@ impl Node {
 pub struct DependencyGraph {
     pub nodes: Vec<Node>,
     /// dependency.py:567: memory_refs — node index → MemoryRef
-    pub memory_refs: majit_ir::VecMap<usize, MemoryRef>,
+    pub memory_refs: indexmap::IndexMap<usize, MemoryRef>,
     /// dependency.py:569: index_vars — OpRef → IndexVar
-    pub index_vars: majit_ir::VecMap<OpRef, IndexVar>,
+    pub index_vars: indexmap::IndexMap<OpRef, IndexVar>,
     /// dependency.py:571: guards — guard node indices
     pub guards: Vec<usize>,
     /// dependency.py:565: invariant_vars — loop-invariant variables
-    pub invariant_vars: majit_ir::VecMap<OpRef, ()>,
+    pub invariant_vars: indexmap::IndexMap<OpRef, ()>,
 }
 
 impl DependencyGraph {
@@ -430,10 +430,10 @@ impl DependencyGraph {
 
         let mut graph = DependencyGraph {
             nodes,
-            memory_refs: majit_ir::VecMap::new(),
-            index_vars: majit_ir::VecMap::new(),
+            memory_refs: indexmap::IndexMap::new(),
+            index_vars: indexmap::IndexMap::new(),
             guards: Vec::new(),
-            invariant_vars: majit_ir::VecMap::new(),
+            invariant_vars: indexmap::IndexMap::new(),
         };
 
         graph.build_dependencies(ops, constant_of);
@@ -905,10 +905,10 @@ impl DependencyGraph {
     /// args come from independent sources (no data dependency between them).
     pub fn find_packable_groups(&self) -> Vec<Pack> {
         let mut groups: Vec<Pack> = Vec::new();
-        let mut used: VecSet<usize> = VecSet::new();
+        let mut used: IndexSet<usize> = IndexSet::new();
 
         // Group by opcode
-        let mut by_opcode: majit_ir::VecMap<OpCode, Vec<usize>> = majit_ir::VecMap::new();
+        let mut by_opcode: indexmap::IndexMap<OpCode, Vec<usize>> = indexmap::IndexMap::new();
         for (i, node) in self.nodes.iter().enumerate() {
             let Some(op) = node.getoperation() else {
                 continue;
@@ -1473,7 +1473,7 @@ impl Dependency {
 /// that define it, enabling def-use chain queries.
 pub struct DefTracker {
     /// OpRef → list of (defining node index, optional memory ref cell)
-    pub defs: majit_ir::VecMap<OpRef, Vec<(usize, Option<usize>)>>,
+    pub defs: indexmap::IndexMap<OpRef, Vec<(usize, Option<usize>)>>,
     /// Nodes with side effects (non-pure).
     pub non_pure: Vec<usize>,
 }
@@ -1481,7 +1481,7 @@ pub struct DefTracker {
 impl DefTracker {
     pub fn new(_graph: &DependencyGraph) -> Self {
         DefTracker {
-            defs: majit_ir::VecMap::new(),
+            defs: indexmap::IndexMap::new(),
             non_pure: Vec::new(),
         }
     }
@@ -1545,9 +1545,9 @@ impl DefTracker {
 /// combinations, and recognizes array access patterns for MemoryRef.
 pub struct IntegralForwardModification<'a> {
     /// OpRef → IndexVar mapping
-    pub index_vars: majit_ir::VecMap<OpRef, IndexVar>,
+    pub index_vars: indexmap::IndexMap<OpRef, IndexVar>,
     /// Node index → MemoryRef mapping
-    pub memory_refs: majit_ir::VecMap<usize, MemoryRef>,
+    pub memory_refs: indexmap::IndexMap<usize, MemoryRef>,
     /// Callback to resolve constant OpRef → i64 value.
     /// dependency.py:885-888: is_const_integral + box.getint()
     constant_of: &'a dyn Fn(OpRef) -> Option<i64>,
@@ -1556,8 +1556,8 @@ pub struct IntegralForwardModification<'a> {
 impl<'a> IntegralForwardModification<'a> {
     pub fn new(constant_of: &'a dyn Fn(OpRef) -> Option<i64>) -> Self {
         IntegralForwardModification {
-            index_vars: majit_ir::VecMap::new(),
-            memory_refs: majit_ir::VecMap::new(),
+            index_vars: indexmap::IndexMap::new(),
+            memory_refs: indexmap::IndexMap::new(),
             constant_of,
         }
     }
@@ -1775,10 +1775,10 @@ mod tests {
     fn imaginary_graph(n: usize) -> DependencyGraph {
         DependencyGraph {
             nodes: (0..n).map(|_| Node::new_imaginary("t")).collect(),
-            memory_refs: majit_ir::VecMap::new(),
-            index_vars: majit_ir::VecMap::new(),
+            memory_refs: indexmap::IndexMap::new(),
+            index_vars: indexmap::IndexMap::new(),
             guards: Vec::new(),
-            invariant_vars: majit_ir::VecMap::new(),
+            invariant_vars: indexmap::IndexMap::new(),
         }
     }
 
@@ -1840,10 +1840,10 @@ mod tests {
         let op = || Op::new(OpCode::IntAdd, &[int_operand(0), int_operand(1)]);
         DependencyGraph {
             nodes: (0..n).map(|i| Node::new(op(), i)).collect(),
-            memory_refs: majit_ir::VecMap::new(),
-            index_vars: majit_ir::VecMap::new(),
+            memory_refs: indexmap::IndexMap::new(),
+            index_vars: indexmap::IndexMap::new(),
             guards: Vec::new(),
-            invariant_vars: majit_ir::VecMap::new(),
+            invariant_vars: indexmap::IndexMap::new(),
         }
     }
 

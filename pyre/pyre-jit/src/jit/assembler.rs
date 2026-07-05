@@ -10,7 +10,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
-use majit_ir::{VecMap, VecMapExt};
+use indexmap::IndexMap;
+use majit_ir::VecMapExt;
 use majit_metainterp::jitcode::{JitCallArg, JitCode, JitCodeBuilder};
 use vecset::VecSet;
 
@@ -49,7 +50,7 @@ pub struct Assembler {
     /// records only the actually-emitted well-known keys with their runtime
     /// opcode byte. That is sufficient for the lazy `finish_setup` cache
     /// refresh in `pyre_jit_trace::state`.
-    insns: VecMap<String, u8>,
+    insns: IndexMap<String, u8>,
     /// `assembler.py:29` `self.all_liveness = []`.
     all_liveness: Vec<u8>,
     /// `assembler.py:30` `self.all_liveness_length = 0`.
@@ -108,7 +109,7 @@ impl std::hash::Hash for ArcByPtr {
 struct AssemblyState {
     builder: JitCodeBuilder,
     /// `assembler.py:59` `self.label_positions = {}`.
-    label_positions: VecMap<String, usize>,
+    label_positions: IndexMap<String, usize>,
     /// Builder adapter for `Label/TLabel` name → builder label id.
     /// RPython stores bytecode positions directly in `label_positions`; this
     /// extra vector exists only because `JitCodeBuilder` patches jumps by
@@ -132,7 +133,7 @@ impl Assembler {
     }
 
     /// Snapshot of the emitted well-known `opname/argcodes` keys.
-    pub fn insns_snapshot(&self) -> VecMap<String, u8> {
+    pub fn insns_snapshot(&self) -> IndexMap<String, u8> {
         self.insns.clone()
     }
 
@@ -208,7 +209,7 @@ impl Assembler {
 
         let mut state = AssemblyState {
             builder,
-            label_positions: VecMap::new(),
+            label_positions: IndexMap::new(),
             builder_labels: Vec::new(),
         };
 
@@ -408,7 +409,7 @@ impl Assembler {
     }
 }
 
-static WELLKNOWN_BH_INSNS: LazyLock<majit_ir::VecMap<&'static str, u8>> =
+static WELLKNOWN_BH_INSNS: LazyLock<indexmap::IndexMap<&'static str, u8>> =
     LazyLock::new(majit_metainterp::jitcode::wellknown_bh_insns);
 
 fn is_adapter_only_helper_call_family(opname: &str) -> bool {

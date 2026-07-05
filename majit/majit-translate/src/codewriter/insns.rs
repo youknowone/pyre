@@ -26,7 +26,7 @@
 //! stability adaptation should be documented at the table site —
 //! see slice #86f.
 
-use majit_ir::VecMap;
+use indexmap::IndexMap;
 
 // Canonical RPython keys filling free low bytes (`blackhole.py:1149-1525`).
 // One byte per `(opname, argcodes)` per `assembler.py:221
@@ -568,7 +568,7 @@ pub fn insn_byte(key: &str) -> u8 {
 /// the dynamic-allocation path without tripping the runtime decoder.
 pub fn insn_byte_opt(key: &str) -> Option<u8> {
     use std::sync::OnceLock;
-    static TABLE: OnceLock<VecMap<&'static str, u8>> = OnceLock::new();
+    static TABLE: OnceLock<IndexMap<&'static str, u8>> = OnceLock::new();
     let table = TABLE.get_or_init(|| {
         // Build-time consumers (`JitCodeBuilder::write_insn`) lookup any
         // canonical opname (RPython parity) AND any pyre-only Rust-
@@ -650,8 +650,8 @@ pub fn is_reserved_opcode_byte(byte: u8) -> bool {
 ///   `i` int reg, `r` ref reg, `f` float reg, `c` short-const int,
 ///   `I/R/F` constant-pool int/ref/float, `L` label, `d` descr,
 ///   `N` `ListOfKind` (mixed-kind literal list).
-pub fn wellknown_bh_insns() -> VecMap<&'static str, u8> {
-    let mut m = VecMap::new();
+pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
+    let mut m = IndexMap::new();
 
     // pyjitpl.py:2236-2243 — fields `setup_insns` probes explicitly.
     m.insert("live/", BC_LIVE);
@@ -1148,8 +1148,8 @@ pub fn wellknown_bh_insns() -> VecMap<&'static str, u8> {
 /// `wellknown_bh_insns()` at OnceLock init time, so build-time
 /// `write_insn(...)` callers resolve transparently. Runtime dispatch
 /// reads `BC_*` constants directly and is unaffected.
-pub fn pyre_extension_insns() -> VecMap<&'static str, u8> {
-    let mut m = VecMap::new();
+pub fn pyre_extension_insns() -> IndexMap<&'static str, u8> {
+    let mut m = IndexMap::new();
     // Borrow-checker abort signals.
     m.insert("abort/", BC_ABORT);
     m.insert("abort_permanent/", BC_ABORT_PERMANENT);

@@ -372,15 +372,16 @@ pub fn jitcode_for_instruction(instruction: &Instruction) -> Option<Arc<JitCode>
 /// the equivalent `Assembler.insns` object on the translated staticdata /
 /// blackhole-builder path; pyre's `LazyLock` is the binary-embedded form
 /// of that same single translated table.
-static INSNS_OPNAME_TO_BYTE: LazyLock<majit_ir::VecMap<String, u8>> = LazyLock::new(|| {
+static INSNS_OPNAME_TO_BYTE: LazyLock<indexmap::IndexMap<String, u8>> = LazyLock::new(|| {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/opcode_insns.bin"));
-    let mut table: majit_ir::VecMap<String, u8> = bincode::deserialize(BYTES).unwrap_or_else(|e| {
-        panic!(
-            "pyre-jit-trace: failed to deserialize opcode_insns.bin \
+    let mut table: indexmap::IndexMap<String, u8> =
+        bincode::deserialize(BYTES).unwrap_or_else(|e| {
+            panic!(
+                "pyre-jit-trace: failed to deserialize opcode_insns.bin \
                      ({} bytes): {e}",
-            BYTES.len(),
-        )
-    });
+                BYTES.len(),
+            )
+        });
     // Overlay the canonical `wellknown_bh_insns` and pyre-only
     // `pyre_extension_insns` keys so the runtime table covers every
     // opname a `BlackholeInterpBuilder` could be asked to dispatch.
@@ -398,8 +399,8 @@ static INSNS_OPNAME_TO_BYTE: LazyLock<majit_ir::VecMap<String, u8>> = LazyLock::
     // tests) treat opname coverage as a property of the codebase,
     // not of which paths the build observed.
     fn overlay_insns(
-        table: &mut majit_ir::VecMap<String, u8>,
-        source: &majit_ir::VecMap<&'static str, u8>,
+        table: &mut indexmap::IndexMap<String, u8>,
+        source: &indexmap::IndexMap<&'static str, u8>,
     ) {
         for (key, byte) in source.iter() {
             let owned = (*key).to_string();
@@ -439,7 +440,7 @@ static INSNS_BYTE_TO_OPNAME: LazyLock<HashMap<u8, String>> = LazyLock::new(|| {
 });
 
 /// RPython `setup_insns(insns)` — full opname → opcode-byte table.
-pub fn insns_opname_to_byte() -> &'static majit_ir::VecMap<String, u8> {
+pub fn insns_opname_to_byte() -> &'static indexmap::IndexMap<String, u8> {
     &INSNS_OPNAME_TO_BYTE
 }
 

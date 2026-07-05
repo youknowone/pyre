@@ -7,7 +7,8 @@
 use crate::regalloc::LifetimeManager;
 use crate::regloc::{EAX, ECX, EDX, RegLoc};
 use crate::x86::callbuilder::{ARGUMENTS_GPR, ARGUMENTS_XMM};
-use majit_ir::{Op, OpCode, OpRc, OpRef, Type, VecMap};
+use indexmap::IndexMap;
+use majit_ir::{Op, OpCode, OpRc, OpRef, Type};
 
 /// regalloc.py:26-28.
 pub const SAVE_DEFAULT_REGS: u8 = 0;
@@ -23,7 +24,7 @@ pub struct RegisterHints {
     /// Box object; pyre's `OpRef` is a flat `u32` so constant values
     /// are looked up through this map.  Structural equivalent of
     /// `isinstance(arg, ConstInt) and arg.value`.
-    constants: VecMap<u32, i64>,
+    constants: IndexMap<u32, i64>,
 }
 
 impl RegisterHints {
@@ -32,7 +33,7 @@ impl RegisterHints {
         _save_around_call_regs_xmm: Vec<RegLoc>,
         all_regs_gpr: Vec<RegLoc>,
         all_regs_xmm: Vec<RegLoc>,
-        constants: VecMap<u32, i64>,
+        constants: IndexMap<u32, i64>,
     ) -> Self {
         RegisterHints {
             save_around_call_regs_gpr,

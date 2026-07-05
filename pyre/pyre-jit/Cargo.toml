@@ -29,6 +29,7 @@ wasm-web = ["majit-backend-wasm/web"]
 wasm-host = ["majit-backend-wasm/host-import"]
 
 [dependencies]
+indexmap = { workspace = true }
 pyre-object = { workspace = true }
 pyre-interpreter = { workspace = true }
 num-traits = { workspace = true }

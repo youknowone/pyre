@@ -13,7 +13,7 @@
 ///   uses a trait-object chain rather than inheritance. The standalone
 ///   `optimize_vector()` function provides the RPython-shaped entry point.
 ///
-use majit_ir::vec_set::VecSet;
+use indexmap::{IndexMap, IndexSet};
 
 use majit_ir::operand::Operand;
 use majit_ir::{Op, OpCode, OpRc, OpRef};
@@ -21,7 +21,6 @@ use majit_ir::{Op, OpCode, OpRc, OpRef};
 use crate::optimizeopt::dependency::{DependencyGraph, schedule_operations};
 use crate::optimizeopt::renamer::Renamer;
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
-use majit_ir::VecMap;
 
 pub use crate::jitexc::{NotAProfitableLoop, NotAVectorizeableLoop};
 pub use crate::optimizeopt::dependency::Node;
@@ -47,14 +46,14 @@ pub use crate::optimizeopt::schedule::{
 /// Maps opcodes to their estimated cost in abstract units.
 pub struct GenericCostModel {
     /// Per-opcode cost overrides: opcode -> cost.
-    per_opcode_cost: majit_ir::VecMap<OpCode, i32>,
+    per_opcode_cost: indexmap::IndexMap<OpCode, i32>,
     /// Default cost for opcodes not in the override map.
     default_cost: i32,
 }
 
 impl GenericCostModel {
     pub fn new() -> Self {
-        let mut costs: majit_ir::VecMap<OpCode, i32> = majit_ir::VecMap::new();
+        let mut costs: indexmap::IndexMap<OpCode, i32> = indexmap::IndexMap::new();
         // vector.py: memory ops are more expensive than ALU ops
         costs.insert(OpCode::GetarrayitemGcI, 3);
         costs.insert(OpCode::GetarrayitemGcR, 3);
@@ -929,7 +928,7 @@ pub fn optimize_vector(
     vec_size: usize,
     info: &mut crate::optimizeopt::version::LoopVersionInfo,
     user_code: bool,
-) -> Result<(Vec<Op>, majit_ir::VecMap<OpRef, i64>), VectorizeError> {
+) -> Result<(Vec<Op>, indexmap::IndexMap<OpRef, i64>), VectorizeError> {
     // vector.py:126-128
     if loop_.operations.is_empty() {
         return Err(VectorizeError::NotVectorizeable);
@@ -1200,7 +1199,7 @@ impl VectorizingOptimizer {
         loop_: &mut VectorLoop,
         info: &mut crate::optimizeopt::version::LoopVersionInfo,
         user_code: bool,
-    ) -> Result<(Vec<Op>, majit_ir::VecMap<OpRef, i64>), VectorizeError> {
+    ) -> Result<(Vec<Op>, indexmap::IndexMap<OpRef, i64>), VectorizeError> {
         // vector.py:221
         self.orig_label_args = Some(
             loop_
@@ -1301,7 +1300,7 @@ impl VectorizingOptimizer {
         for arg in loop_.label.getarglist().iter() {
             sched_state.inputargs.insert(arg.to_opref(), ());
         }
-        let mut seen: VecSet<OpRef> = loop_
+        let mut seen: IndexSet<OpRef> = loop_
             .label
             .getarglist()
             .iter()
@@ -1399,7 +1398,7 @@ impl VectorizingOptimizer {
         }
 
         // Build node→pack mapping
-        let mut node_to_pack: majit_ir::VecMap<usize, usize> = majit_ir::VecMap::new();
+        let mut node_to_pack: indexmap::IndexMap<usize, usize> = indexmap::IndexMap::new();
         for (pi, group) in packset.packs.iter().enumerate() {
             for &idx in &group.members {
                 node_to_pack.insert(idx, pi);
@@ -1807,7 +1806,7 @@ impl VectorizingOptimizer {
         // vector.py:530-533: zero_deps = every node with no backward deps.
         // Keyed by node position (like `guards`, `Path`, and the final loop),
         // not `Node.idx` — an imaginary node's idx is a synthetic sentinel.
-        let mut zero_deps: VecSet<usize> = VecSet::new();
+        let mut zero_deps: IndexSet<usize> = IndexSet::new();
         for (i, node) in graph.nodes.iter().enumerate() {
             if node.depends_count() == 0 {
                 zero_deps.insert(i);
@@ -1989,7 +1988,7 @@ impl VectorizingOptimizer {
         for &arg in &self.label_args {
             sched_state.inputargs.insert(arg, ());
         }
-        let mut seen: VecSet<OpRef> = self.label_args.iter().copied().collect();
+        let mut seen: IndexSet<OpRef> = self.label_args.iter().copied().collect();
 
         // accumulate_prepare
         for pack in &profitable {
@@ -2081,7 +2080,7 @@ impl VectorizingOptimizer {
         }
 
         // Build node→pack mapping
-        let mut node_to_pack: majit_ir::VecMap<usize, usize> = majit_ir::VecMap::new();
+        let mut node_to_pack: indexmap::IndexMap<usize, usize> = indexmap::IndexMap::new();
         for (pi, group) in profitable.iter().enumerate() {
             for &idx in &group.members {
                 node_to_pack.insert(idx, pi);
@@ -2253,7 +2252,7 @@ impl VectorLoop {
         // consumers, so a renamed arg resolves to the canonical producer box
         // (`Operand::from_bound_op`, no mint). A miss (label/inputarg/outer
         // position with no producer in this buffer) stays `from_opref`.
-        let mut produced: VecMap<OpRef, OpRc> = VecMap::new();
+        let mut produced: IndexMap<OpRef, OpRc> = IndexMap::new();
         // Recover the producer box for a renamed position. A hit in `produced`
         // (a copied op pushed to `unrolled`) or `original_body` (a
         // first-iteration loop-carried producer) binds to that exact `OpRc`
@@ -2264,7 +2263,7 @@ impl VectorLoop {
         // A nested `fn` (not a closure) so it can take `&mut renamer` without
         // capturing it, leaving `renamer.rename_box` / `start_renaming` free.
         fn bind_unroll(
-            produced: &VecMap<OpRef, OpRc>,
+            produced: &IndexMap<OpRef, OpRc>,
             original_body: &[OpRc],
             renamer: &mut Renamer,
             renamed: OpRef,
@@ -2449,7 +2448,7 @@ fn pre_emit_guard_accum(state: &VecScheduleState, op: &mut Op) {
 pub(crate) fn ensure_args_unpacked(
     state: &mut VecScheduleState,
     op: &mut Op,
-    seen: &mut VecSet<OpRef>,
+    seen: &mut IndexSet<OpRef>,
 ) {
     // schedule.py:702-706: unpack immediate-use args
     for j in 0..op.num_args() {
@@ -2781,7 +2780,7 @@ mod tests {
     /// invariant vector var is appended to a fresh prefix_label and jump.
     #[test]
     fn test_post_schedule_routes_invariants_to_prefix() {
-        use majit_ir::vec_set::VecSet;
+        use indexmap::IndexSet;
 
         // loop: label(i0, i1) { i_add } jump(i0, i1)
         let label = Op::new(
@@ -2829,7 +2828,7 @@ mod tests {
         // (schedule.py:116) moves it into loop_.operations.
         st.oplist = body.iter().cloned().map(std::rc::Rc::new).collect();
 
-        let mut seen: VecSet<OpRef> = vloop
+        let mut seen: IndexSet<OpRef> = vloop
             .label
             .getarglist()
             .iter()
@@ -2869,7 +2868,7 @@ mod tests {
     /// prefix/prefix_label empty and the jump arglist unchanged.
     #[test]
     fn test_post_schedule_no_invariants_leaves_label_and_jump() {
-        use majit_ir::vec_set::VecSet;
+        use indexmap::IndexSet;
 
         let label = Op::new(
             OpCode::Label,
@@ -2887,7 +2886,7 @@ mod tests {
 
         let mut st = VecScheduleState::new(100);
         st.oplist = body.iter().cloned().map(std::rc::Rc::new).collect();
-        let mut seen: VecSet<OpRef> = vloop
+        let mut seen: IndexSet<OpRef> = vloop
             .label
             .getarglist()
             .iter()
@@ -2994,7 +2993,7 @@ mod tests {
     /// would leave the Jump referencing the folded scalar.
     #[test]
     fn test_post_schedule_unpacks_packed_member_carried_to_jump() {
-        use majit_ir::vec_set::VecSet;
+        use indexmap::IndexSet;
 
         fn run(member_in_seen: bool) -> (OpRef, bool) {
             let member_ref = OpRef::int_op(7); // scalar result folded into a pack
@@ -3012,7 +3011,7 @@ mod tests {
 
             // seen seeded as the scheduling loop leaves it: always the label
             // args; the packed member only when reproducing the buggy path.
-            let mut seen: VecSet<OpRef> = vloop
+            let mut seen: IndexSet<OpRef> = vloop
                 .label
                 .getarglist()
                 .iter()

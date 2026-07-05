@@ -1,3 +1,4 @@
+use indexmap::IndexMap;
 use majit_ir::operand::Operand;
 /// OptRewrite: algebraic simplification and constant folding.
 ///
@@ -63,22 +64,22 @@ pub struct OptRewrite {
     /// pure.rs:498/492) keyed off the pure-op table — coupled to the pure-optimizer
     /// subsystem. NOT a box-identity rekey target: rekeying the OpRef pair to operand
     /// would entrench a structure upstream does not have.
-    bool_result_cache: majit_ir::VecMap<(OpCode, OpRef, OpRef), OpRef>,
+    bool_result_cache: indexmap::IndexMap<(OpCode, OpRef, OpRef), OpRef>,
     /// rewrite.py:39: loop_invariant_results — cache for CALL_LOOPINVARIANT results.
     /// Key: function pointer (arg0 as i64).
     /// Value: Direct(OpRef) or Preamble(PreambleOp) — RPython isinstance check.
-    loop_invariant_results: majit_ir::VecMap<i64, LoopInvariantEntry>,
+    loop_invariant_results: indexmap::IndexMap<i64, LoopInvariantEntry>,
     /// rewrite.py:40: loop_invariant_producer — maps func_ptr → emitted Call op.
     /// Used by produce_potential_short_preamble_ops (rewrite.py:45-47).
-    loop_invariant_producer: majit_ir::VecMap<i64, Op>,
+    loop_invariant_producer: indexmap::IndexMap<i64, Op>,
 }
 
 impl OptRewrite {
     pub fn new() -> Self {
         OptRewrite {
-            bool_result_cache: majit_ir::VecMap::new(),
-            loop_invariant_results: majit_ir::VecMap::new(),
-            loop_invariant_producer: majit_ir::VecMap::new(),
+            bool_result_cache: indexmap::IndexMap::new(),
+            loop_invariant_results: indexmap::IndexMap::new(),
+            loop_invariant_producer: indexmap::IndexMap::new(),
         }
     }
 

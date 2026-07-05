@@ -36,6 +36,7 @@ pub mod vstring;
 
 use crate::optimizeopt::intutils::{IntBound, IntBoundMakeGuards};
 use crate::resume::SnapshotBox;
+use indexmap::{IndexMap, IndexSet};
 use info::{EnsuredPtrInfo, PtrInfo};
 use majit_ir::operand::Operand;
 use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type, Value};
@@ -548,7 +549,7 @@ pub struct OptContext {
     /// A Phase-2 lookup that followed a label arg to its Phase-1 producer
     /// would re-express a per-iteration value in terms of the PREAMBLE's
     /// entry value, which the loop header does not carry per-iteration.
-    pub emitted_operations: majit_ir::vec_set::VecSet<majit_ir::operand::Operand>,
+    pub emitted_operations: indexmap::IndexSet<majit_ir::operand::Operand>,
     /// Number of input arguments, used to offset emitted op positions
     /// so that variable indices don't collide with input arg indices.
     num_inputs: u32,
@@ -630,7 +631,7 @@ pub struct OptContext {
     /// by pointer address. PyPy uses `new_ref_dict()`; the house rule
     /// forbids hash containers, so pyre uses a Vec-backed associative
     /// container with linear-scan lookup.
-    pub const_infos: majit_ir::VecMap<usize, crate::optimizeopt::info::PtrInfo>,
+    pub const_infos: indexmap::IndexMap<usize, crate::optimizeopt::info::PtrInfo>,
     /// Dedup imported short fact uses so the builder stays in first-use
     /// order. PyPy uses dict-as-set; pyre uses a Vec with linear-scan
     /// dedup (small per trace).
@@ -786,7 +787,7 @@ pub struct OptContext {
     /// (or differently-typed) position sharing a raw `u32` are distinct
     /// entries instead of evicting each other in a raw-indexed slot.
     // Insertion-ordered map (`IndexMap`) rather than the Vec-backed
-    // `VecMap`: `find_producer_op` does `resop_refs.get(&opref)` once per
+    // `IndexMap`: `find_producer_op` does `resop_refs.get(&opref)` once per
     // live box of every guard inside `store_final_boxes_in_guard`, and a
     // Vec-backed `get` is O(n), making the box-numbering O(n^2) on very
     // large traces (aheui's logo loop spends ~all its compile time there).
@@ -1633,7 +1634,7 @@ impl OptContext {
         OptContext {
             new_operations: Vec::with_capacity(estimated_ops),
             new_operations_index: std::collections::HashMap::with_capacity(estimated_ops),
-            emitted_operations: majit_ir::vec_set::VecSet::new(),
+            emitted_operations: indexmap::IndexSet::new(),
             num_inputs: 0,
             inputarg_base: 0,
             next_pos: 0,
@@ -1645,7 +1646,7 @@ impl OptContext {
             imported_virtual_args: None,
             imported_loop_invariant_results: Vec::new(),
             imported_short_preamble_builder: None,
-            const_infos: majit_ir::VecMap::new(),
+            const_infos: indexmap::IndexMap::new(),
             imported_short_preamble_used: Vec::new(),
 
             potential_extra_ops: Vec::new(),
@@ -2192,7 +2193,7 @@ impl OptContext {
         OptContext {
             new_operations: Vec::with_capacity(estimated_ops),
             new_operations_index: std::collections::HashMap::with_capacity(estimated_ops),
-            emitted_operations: majit_ir::vec_set::VecSet::new(),
+            emitted_operations: indexmap::IndexSet::new(),
             num_inputs: num_inputs as u32,
             inputarg_base,
             next_pos: start_next_pos,
@@ -2204,7 +2205,7 @@ impl OptContext {
             imported_virtual_args: None,
             imported_loop_invariant_results: Vec::new(),
             imported_short_preamble_builder: None,
-            const_infos: majit_ir::VecMap::new(),
+            const_infos: indexmap::IndexMap::new(),
             imported_short_preamble_used: Vec::new(),
 
             potential_extra_ops: Vec::new(),
@@ -3014,10 +3015,10 @@ impl OptContext {
         short_args: &[OpRef],
         short_inputargs: &[OpRef],
         short_boxes: &[(OpRef, crate::optimizeopt::shortpreamble::ProducedShortOp)],
-        short_box_const_values: &majit_ir::VecMap<OpRef, majit_ir::Value>,
-        result_map: &majit_ir::VecMap<OpRef, OpRef>,
-        mut imported_constants: &mut majit_ir::VecMap<OpRef, OpRef>,
-        exported_infos: &majit_ir::VecMap<
+        short_box_const_values: &indexmap::IndexMap<OpRef, majit_ir::Value>,
+        result_map: &indexmap::IndexMap<OpRef, OpRef>,
+        mut imported_constants: &mut indexmap::IndexMap<OpRef, OpRef>,
+        exported_infos: &indexmap::IndexMap<
             majit_ir::operand::Operand,
             crate::optimizeopt::info::OpInfo,
         >,
@@ -3125,7 +3126,7 @@ impl OptContext {
         let mut produced: Vec<(OpRef, ProducedShortOp)> = Vec::with_capacity(short_boxes.len());
         let mut builder_entries: Vec<(majit_ir::operand::Operand, ProducedShortOp)> =
             Vec::with_capacity(short_boxes.len());
-        let mut produced_results: majit_ir::VecMap<OpRef, OpRef> = majit_ir::VecMap::new();
+        let mut produced_results: indexmap::IndexMap<OpRef, OpRef> = indexmap::IndexMap::new();
         // shortpreamble.py:PreambleOp.add_op_to_short — Pure ops whose
         // opcode is a Call get rewritten to the CallPure* equivalent so
         // the short preamble can replay the cached call without
@@ -3159,8 +3160,8 @@ impl OptContext {
         // `produce_arg` path.
         let resolve_arg = |arg: OpRef,
                            ctx: &mut Self,
-                           produced_results: &majit_ir::VecMap<OpRef, OpRef>,
-                           imported_constants: &mut majit_ir::VecMap<OpRef, OpRef>|
+                           produced_results: &indexmap::IndexMap<OpRef, OpRef>,
+                           imported_constants: &mut indexmap::IndexMap<OpRef, OpRef>|
          -> Option<OpRef> {
             crate::optimizeopt::shortpreamble::classify_short_arg(
                 ctx,
@@ -3180,7 +3181,7 @@ impl OptContext {
         // arg is the dep's replay op OBJECT (upstream returns
         // `produced_short_boxes[op].preamble_op`). Bind dep args to the
         // dep entry's replay Rc (the same dual-key dict the builder will
-        // hold — last insert wins, matching VecMap overwrite), so
+        // hold — last insert wins, matching IndexMap overwrite), so
         // `use_box` reads deps off the operand binding instead of a
         // position-keyed side map. Slot / Const args keep the positional
         // materialization.
@@ -3821,7 +3822,7 @@ impl OptContext {
         op: OpRef,
         preamble_info_handle: &std::rc::Rc<std::cell::RefCell<PtrInfo>>,
         exported_infos: Option<
-            &majit_ir::VecMap<majit_ir::operand::Operand, crate::optimizeopt::info::OpInfo>,
+            &indexmap::IndexMap<majit_ir::operand::Operand, crate::optimizeopt::info::OpInfo>,
         >,
     ) {
         let op = self.get_replacement_opref(op);
@@ -3980,7 +3981,7 @@ impl OptContext {
     fn setinfo_from_preamble_list(
         &mut self,
         items: &[majit_ir::operand::Operand],
-        exported_infos: &majit_ir::VecMap<
+        exported_infos: &indexmap::IndexMap<
             majit_ir::operand::Operand,
             crate::optimizeopt::info::OpInfo,
         >,
@@ -4025,7 +4026,7 @@ impl OptContext {
         &mut self,
         op: OpRef,
         preamble_info: &crate::optimizeopt::info::OpInfo,
-        exported_infos: &majit_ir::VecMap<
+        exported_infos: &indexmap::IndexMap<
             majit_ir::operand::Operand,
             crate::optimizeopt::info::OpInfo,
         >,
@@ -4096,7 +4097,7 @@ impl OptContext {
         op: OpRef,
         preamble_info: &crate::optimizeopt::info::OpInfo,
         exported_infos: Option<
-            &majit_ir::VecMap<majit_ir::operand::Operand, crate::optimizeopt::info::OpInfo>,
+            &indexmap::IndexMap<majit_ir::operand::Operand, crate::optimizeopt::info::OpInfo>,
         >,
     ) {
         use crate::optimizeopt::info::OpInfo;

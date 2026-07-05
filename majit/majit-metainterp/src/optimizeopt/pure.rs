@@ -1,3 +1,4 @@
+use indexmap::IndexMap;
 use majit_ir::operand::Operand;
 /// Pure operation optimization (Common Subexpression Elimination).
 ///
@@ -338,7 +339,7 @@ pub struct OptPure {
     /// optimizer.py: call_pure_results passed into propagate_all_forward.
     /// RPython keys are lists of constant boxes (value-based equality).
     /// Keys are the constant Values that _can_optimize_call_pure builds.
-    call_pure_results: majit_ir::VecMap<Vec<Value>, Value>,
+    call_pure_results: indexmap::IndexMap<Vec<Value>, Value>,
     /// shortpreamble.py:124-126: PureOp.produce_op stores PreambleOp in
     /// optpure's cache. In majit, PreambleOp entries stored here are
     /// searched with forwarding-aware matching (force_preamble_op pattern).
@@ -370,7 +371,7 @@ impl OptPure {
             last_emitted_was_removed: false,
             known_result_call_pure: Vec::new(),
             extra_call_pure: Vec::new(),
-            call_pure_results: majit_ir::VecMap::new(),
+            call_pure_results: indexmap::IndexMap::new(),
             preamble_pure_ops: Vec::new(),
         }
     }
@@ -1223,7 +1224,7 @@ impl Optimization for OptPure {
         // preamble_pure_ops also NOT cleared — populated during import.
     }
 
-    fn set_call_pure_results(&mut self, results: &majit_ir::VecMap<Vec<Value>, Value>) {
+    fn set_call_pure_results(&mut self, results: &indexmap::IndexMap<Vec<Value>, Value>) {
         self.call_pure_results = results.clone();
     }
 
@@ -1823,7 +1824,7 @@ mod tests {
             last_emitted_was_removed: false,
             known_result_call_pure: Vec::new(),
             extra_call_pure: Vec::new(),
-            call_pure_results: majit_ir::VecMap::new(),
+            call_pure_results: indexmap::IndexMap::new(),
             preamble_pure_ops: Vec::new(),
         }));
         let result = opt

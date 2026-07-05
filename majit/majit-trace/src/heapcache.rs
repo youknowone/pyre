@@ -8,7 +8,7 @@
 use std::marker::PhantomData;
 
 use bit_set::BitSet;
-use majit_ir::vec_set::VecSet;
+use indexmap::IndexSet;
 
 use majit_ir::{EffectInfo, ExtraEffect, GcRef, OpCode, OpRef, Type};
 
@@ -75,8 +75,8 @@ const _HF_VERSION_MAX: u32 = HF_VERSION_MAX;
 pub struct CacheEntry {
     cache_anything: vecset::VecMap<OpRef, OpRef>,
     cache_seen_allocation: vecset::VecMap<OpRef, OpRef>,
-    quasiimmut_seen: Option<VecSet<OpRef>>,
-    quasiimmut_seen_refs: Option<VecSet<usize>>,
+    quasiimmut_seen: Option<IndexSet<OpRef>>,
+    quasiimmut_seen_refs: Option<IndexSet<usize>>,
     last_const_box: Option<OpRef>,
 }
 
@@ -351,7 +351,7 @@ pub struct HeapCache {
 
     /// Quasi-immutable fields known in this trace.
     /// heapcache.py: `quasi_immut_known`.
-    quasi_immut_known: VecSet<(OpRef, u32)>,
+    quasi_immut_known: IndexSet<(OpRef, u32)>,
 
     /// RPython: FrontendOp flag. BitSet indexed by OpRef.0.
     is_unescaped: BitSet,
@@ -415,7 +415,7 @@ impl HeapCache {
             heap_cache: vecset::VecMap::new(),
             heap_array_cache: vecset::VecMap::new(),
             known_class: Vec::new(),
-            quasi_immut_known: VecSet::new(),
+            quasi_immut_known: IndexSet::new(),
             is_unescaped: BitSet::new(),
             seen_allocation: BitSet::new(),
             known_nullity: Vec::new(),

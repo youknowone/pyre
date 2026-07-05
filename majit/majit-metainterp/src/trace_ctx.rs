@@ -22,6 +22,7 @@
 use crate::heapcache::HeapCache;
 use crate::opencoder::Box as OcBox;
 use crate::recorder::Trace;
+use indexmap::IndexMap;
 use majit_ir::{DescrRef, GreenKey, OpCode, OpRef, Type, Value};
 
 use majit_backend::JitCellToken;
@@ -374,7 +375,7 @@ pub struct TraceCtx {
     /// pyjitpl.py:2397: call_pure_results — maps constant argument tuples
     /// to their concrete result values, recorded during tracing.
     /// Passed to the optimizer for cross-iteration CALL_PURE folding.
-    pub(crate) call_pure_results: majit_ir::VecMap<Vec<Value>, Value>,
+    pub(crate) call_pure_results: indexmap::IndexMap<Vec<Value>, Value>,
     /// Cached `warmstate.trace_limit` snapshot for this tracing session.
     /// pyjitpl.py:2789 reads `self.jitdriver_sd.warmstate.trace_limit` each
     /// call; pyre snapshots it at `setup_tracing` time (warmstate owns the
@@ -1185,7 +1186,7 @@ impl TraceCtx {
             portal_call_depth_fn: None,
             seen_loop_header_for_jdindex: -1,
             callinfocollection: None,
-            call_pure_results: majit_ir::VecMap::new(),
+            call_pure_results: indexmap::IndexMap::new(),
             trace_limit: DEFAULT_TRACE_LIMIT,
             snapshots: Vec::new(),
             resumekey_original_loop_token: None,
@@ -1259,7 +1260,7 @@ impl TraceCtx {
             portal_call_depth_fn: None,
             seen_loop_header_for_jdindex: -1,
             callinfocollection: None,
-            call_pure_results: majit_ir::VecMap::new(),
+            call_pure_results: indexmap::IndexMap::new(),
             trace_limit: DEFAULT_TRACE_LIMIT,
             snapshots: Vec::new(),
             resumekey_original_loop_token: None,

@@ -1,19 +1,11 @@
-//! Associative map used by majit.
-//!
-//! Previously backed by `vecmap_rs::VecMap` (linear-scan Vec). Replaced by
-//! `indexmap::IndexMap` for O(1) keyed access while preserving insertion order.
-//! The `VecMap` name is kept as a type alias to minimise churn across callers.
+//! Helpers and type aliases for `indexmap::IndexMap`.
 
-pub use indexmap::IndexMap as VecMap;
-
-/// The compiled-trace constant pool: position → constant value.
+/// The compiled-trace constant pool: position -> constant value.
 ///
 /// Backed by [`indexmap::IndexMap`] rather than a linear-scan Vec because the
 /// pool is built by inserting one entry per const-folded position (up to the
 /// full trace length) and read back by keyed lookup and in-order iteration.
 pub type ConstMap<V> = indexmap::IndexMap<u32, V>;
-
-// ConstLookup already implemented via ConstMap = IndexMap<u32, V> = VecMap<u32, V>.
 
 /// `entry().or_insert_with(...)` / `entry().or_default()` shortcuts.
 pub trait VecMapExt<K, V> {

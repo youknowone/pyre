@@ -17,6 +17,7 @@ pub use dispatch::{call_int_function, call_ref_function, call_void_function};
 pub use dispatch::{eval_binop_f, eval_binop_i, eval_float_cmp, eval_unary_f, eval_unary_i};
 pub use frame::{MIFrame, MIFrameStack};
 
+use indexmap::IndexMap;
 use std::sync::Arc;
 
 use crate::optimizeopt::optimizer::{Optimizer, PendingBridgeRd};
@@ -186,7 +187,7 @@ struct SimpleCompileViews<'a> {
 
 fn make_simple_compile_views<'a>(
     trace: &'a TreeLoop,
-    call_pure_results: &'a majit_ir::VecMap<Vec<Value>, Value>,
+    call_pure_results: &'a indexmap::IndexMap<Vec<Value>, Value>,
     enable_opts: &'a [String],
 ) -> SimpleCompileViews<'a> {
     let data = compile::SimpleCompileData::new(trace, None, call_pure_results, enable_opts);
@@ -263,9 +264,9 @@ pub(crate) struct CompiledTrace {
     /// parallel pair has been collapsed.
     pub(crate) constants: majit_ir::ConstMap<majit_ir::Const>,
     /// Static exit metadata for each guard/finish in this trace.
-    pub(crate) exit_layouts: majit_ir::VecMap<u32, StoredExitLayout>,
+    pub(crate) exit_layouts: indexmap::IndexMap<u32, StoredExitLayout>,
     /// Static exit metadata for terminal FINISH/JUMP ops, keyed by op index.
-    pub(crate) terminal_exit_layouts: majit_ir::VecMap<usize, StoredExitLayout>,
+    pub(crate) terminal_exit_layouts: indexmap::IndexMap<usize, StoredExitLayout>,
 }
 
 #[derive(Debug, Clone)]
@@ -811,7 +812,7 @@ pub(crate) struct CompiledEntry<M> {
     /// Trace id of the root compiled loop.
     pub(crate) root_trace_id: u64,
     /// Metadata for the root loop and any attached bridges, keyed by trace id.
-    pub(crate) traces: majit_ir::VecMap<u64, CompiledTrace>,
+    pub(crate) traces: indexmap::IndexMap<u64, CompiledTrace>,
     /// RPython parity: previous compiled entries for this green_key.
     /// In RPython, JitCellToken keeps all target_tokens' code alive.
     /// In majit, each retrace produces a new Cranelift function;
@@ -1057,12 +1058,12 @@ pub struct ActiveTraceSession<M: Clone> {
 pub struct MetaInterp<M: Clone> {
     pub(crate) warm_state: WarmEnterState,
     pub(crate) backend: BackendImpl,
-    pub(crate) compiled_loops: majit_ir::VecMap<u64, CompiledEntry<M>>,
+    pub(crate) compiled_loops: indexmap::IndexMap<u64, CompiledEntry<M>>,
     /// Loop-header bytecode pc per compiled-loop green key. A bridge trace
     /// (`is_bridge_trace`) closes by jumping to its parent loop, which lives
     /// at this header pc — not at the bridge's own `resume_pc`. Recorded when
     /// a loop compiles; queried at `start_bridge_tracing`.
-    pub(crate) loop_header_pcs: majit_ir::VecMap<u64, usize>,
+    pub(crate) loop_header_pcs: indexmap::IndexMap<u64, usize>,
     pub(crate) tracing: Option<TraceCtx>,
     /// Single-pass tracing (`PYRE_SINGLE_PASS`): the `(walk_final_pc,
     /// walk_final_reds)` snapshot copied off the active `TraceCtx` at the
@@ -1190,7 +1191,7 @@ pub struct MetaInterp<M: Clone> {
     /// even when Phase 2 raises InvalidLoop. Indexed by `green_key`; entries
     /// are added on InvalidLoop and removed when the next retrace succeeds,
     /// so the active set is bounded by the count of in-flight retraces.
-    pending_preamble_tokens: majit_ir::VecMap<u64, Vec<crate::history::TargetToken>>,
+    pending_preamble_tokens: indexmap::IndexMap<u64, Vec<crate::history::TargetToken>>,
     // pyjitpl.py:2289 `self.staticdata.all_descrs = self.cpu.setup_descrs()` now
     // lives on MetaInterpStaticData (RPython `metainterp_sd.all_descrs`).
     // Access via `self.staticdata.all_descrs` / `&mut self.staticdata.all_descrs`.
@@ -1367,7 +1368,7 @@ pub struct MetaInterp<M: Clone> {
     /// Memoized symbolic names for boxes (debug/log output only).
     /// Pyre uses simple `OpRef → String` mapping; populated lazily by
     /// the on-demand log formatter.
-    pub box_names_memo: majit_ir::VecMap<OpRef, String>,
+    pub box_names_memo: indexmap::IndexMap<OpRef, String>,
 
     /// pyjitpl.py:2412 `self.trace_length_at_last_tco = -1`.
     ///
@@ -1636,11 +1637,11 @@ impl<M: Clone> MetaInterp<M> {
         // a forwarded lookup key misses and repopulates, like
         // `call_pure_results` below.)
         trace_ctx.heap_cache_mut().walk_const_ptr_refs(&mut visitor);
-        // NOTE: `trace_ctx.call_pure_results: VecMap<Vec<Value>, Value>`
+        // NOTE: `trace_ctx.call_pure_results: IndexMap<Vec<Value>, Value>`
         // (pyjitpl.py:3572-3573) also stores Ref slots. RPython's
         // args_dict stores Const boxes and the GC traces their gcrefs
         // through the Python object graph. Pyre stores concrete
-        // `Value::Ref(GcRef)` entries in a linear VecMap; this active
+        // `Value::Ref(GcRef)` entries in a linear IndexMap; this active
         // trace walker does not rewrite that cache yet. Stale entries
         // miss after a moving collection and are repopulated by the next
         // CALL_PURE recording.
@@ -1805,7 +1806,7 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         _owning_key: u64,
         entry: CompiledEntry<M>,
-        merged_traces: &mut majit_ir::VecMap<u64, CompiledTrace>,
+        merged_traces: &mut indexmap::IndexMap<u64, CompiledTrace>,
     ) -> Vec<std::sync::Weak<JitCellToken>> {
         // `entry.token` is already `Weak<JitCellToken>`; push it directly.
         let mut previous_tokens = Vec::with_capacity(1 + entry.previous_tokens.len());
@@ -2166,7 +2167,7 @@ impl<M: Clone> MetaInterp<M> {
             self.backend
                 .compiled_trace_fail_descr_layouts(token, trace_id)
         }) {
-            let mut merged: majit_ir::VecMap<u32, CompiledExitLayout> = majit_ir::VecMap::new();
+            let mut merged: indexmap::IndexMap<u32, CompiledExitLayout> = indexmap::IndexMap::new();
             for layout in exit_layouts.drain(..) {
                 merged.insert(layout.fail_index, layout);
             }
@@ -2219,8 +2220,8 @@ impl<M: Clone> MetaInterp<M> {
             self.backend
                 .compiled_trace_terminal_exit_layouts(token, trace_id)
         }) {
-            let mut merged: majit_ir::VecMap<usize, CompiledTerminalExitLayout> =
-                majit_ir::VecMap::new();
+            let mut merged: indexmap::IndexMap<usize, CompiledTerminalExitLayout> =
+                indexmap::IndexMap::new();
             for layout in terminal_exit_layouts.drain(..) {
                 merged.insert(layout.op_index, layout);
             }
@@ -2268,8 +2269,8 @@ impl<M: Clone> MetaInterp<M> {
         let mut this = MetaInterp {
             warm_state: WarmEnterState::new(threshold),
             backend: BackendImpl::new(),
-            compiled_loops: majit_ir::VecMap::new(),
-            loop_header_pcs: majit_ir::VecMap::new(),
+            compiled_loops: indexmap::IndexMap::new(),
+            loop_header_pcs: indexmap::IndexMap::new(),
             tracing: None,
             single_pass_outcome: None,
             single_pass_compiled_key: None,
@@ -2300,7 +2301,7 @@ impl<M: Clone> MetaInterp<M> {
             compile_snapshot_refs: Vec::new(),
             retrace_after_bridge: false,
             declined_bridge_guards: std::collections::HashSet::new(),
-            pending_preamble_tokens: majit_ir::VecMap::new(),
+            pending_preamble_tokens: indexmap::IndexMap::new(),
             pending_frontend_boxes: None,
             cpu: crate::cpu::default_cpu(),
             issubclass: Some(default_issubclass),
@@ -2320,7 +2321,7 @@ impl<M: Clone> MetaInterp<M> {
             class_of_last_exc_is_const: false,
             forced_virtualizable: 0,
             ovf_flag: false,
-            box_names_memo: majit_ir::VecMap::new(),
+            box_names_memo: indexmap::IndexMap::new(),
             trace_length_at_last_tco: -1,
             active_trace_session: None,
             bridge_info: None,
@@ -4719,12 +4720,12 @@ impl<M: Clone> MetaInterp<M> {
     pub fn finish_trace_for_parity(
         &mut self,
         finish_args: &[OpRef],
-    ) -> Option<(TreeLoop, majit_ir::VecMap<u32, i64>)> {
+    ) -> Option<(TreeLoop, indexmap::IndexMap<u32, i64>)> {
         self.force_finish_trace = false;
         let mut ctx = self.tracing.take()?;
         let green_key = ctx.green_key;
         ctx.finish(finish_args, crate::make_fail_descr(finish_args.len()));
-        let constants = majit_ir::VecMap::new();
+        let constants = indexmap::IndexMap::new();
         let trace = ctx.into_tree_loop();
         self.warm_state.abort_tracing(green_key, false);
         // pyjitpl.py:2897 / 2934 `finally: profiler.end_tracing()`.
@@ -5881,7 +5882,7 @@ impl<M: Clone> MetaInterp<M> {
                 let mut next_global_opref = unroll_opt
                     .next_global_opref
                     .max(compute_next_global_opref(&inputargs, &compiled_ops));
-                let mut traces = majit_ir::VecMap::new();
+                let mut traces = indexmap::IndexMap::new();
                 traces.insert(
                     trace_id,
                     CompiledTrace {
@@ -6216,7 +6217,7 @@ impl<M: Clone> MetaInterp<M> {
             &mut snapshot_vable_boxes,
             &mut snapshot_vref_boxes,
         ]);
-        // Lower the typed `Value` pool to the dense `VecMap<u32, Const>`
+        // Lower the typed `Value` pool to the dense `IndexMap<u32, Const>`
         // shape the bridge compilation helpers consume.
         let bridge_constants =
             crate::optimizeopt::optimizer::lower_typed_constants_to_const_pool(&constants);
@@ -6785,7 +6786,7 @@ impl<M: Clone> MetaInterp<M> {
                 let mut next_global_opref = unroll_opt
                     .next_global_opref
                     .max(compute_next_global_opref(&inputargs, &combined_ops));
-                let mut traces = majit_ir::VecMap::new();
+                let mut traces = indexmap::IndexMap::new();
                 traces.insert(
                     trace_id,
                     CompiledTrace {
@@ -7284,7 +7285,7 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 self.take_back_all_descrs(std::mem::take(&mut optimizer.all_descrs));
                 let mut next_global_opref = compute_next_global_opref(&inputargs, &optimized_ops);
-                let mut traces = majit_ir::VecMap::new();
+                let mut traces = indexmap::IndexMap::new();
                 traces.insert(
                     trace_id,
                     CompiledTrace {
@@ -7643,7 +7644,7 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 self.take_back_all_descrs(std::mem::take(&mut optimizer.all_descrs));
                 let mut next_global_opref = compute_next_global_opref(&inputargs, &compiled_ops);
-                let mut traces = majit_ir::VecMap::new();
+                let mut traces = indexmap::IndexMap::new();
                 traces.insert(
                     trace_id,
                     CompiledTrace {
@@ -9692,7 +9693,7 @@ impl<M: Clone> MetaInterp<M> {
                 self.take_back_all_descrs(std::mem::take(&mut optimizer.all_descrs));
                 let mut next_global_opref =
                     compute_next_global_opref(bridge_inputargs, &optimized_ops);
-                let mut traces = majit_ir::VecMap::new();
+                let mut traces = indexmap::IndexMap::new();
                 traces.insert(
                     trace_id,
                     CompiledTrace {
@@ -9838,7 +9839,7 @@ impl<M: Clone> MetaInterp<M> {
         snapshot_vable_boxes: SnapshotBoxes,
         snapshot_vref_boxes: SnapshotBoxes,
         snapshot_frame_pcs: SnapshotFramePcs,
-        call_pure_results: majit_ir::VecMap<Vec<Value>, Value>,
+        call_pure_results: indexmap::IndexMap<Vec<Value>, Value>,
     ) -> bool {
         crate::mc_diag_bump(8); // compile_bridge entered
         if !self.compiled_loops.contains_key(&green_key) {
@@ -14578,7 +14579,7 @@ pub struct MetaInterpStaticData {
     /// across the metainterp / trace / bridge pipelines (mirroring
     /// `all_descrs` above).
     pub dispatch_array_descr_cache:
-        std::sync::Mutex<majit_ir::VecMap<DispatchArrayDescrKey, DescrRef>>,
+        std::sync::Mutex<indexmap::IndexMap<DispatchArrayDescrKey, DescrRef>>,
     /// pyjitpl.py:2199-2200 `self.profiler = ProfilerClass()` —
     /// `metainterp_sd.profiler` is the shared counter sink hit from
     /// every metainterp / optimizer / heapcache / tracer site
@@ -14612,12 +14613,13 @@ pub struct MetaInterpStaticData {
 #[derive(Debug, Default)]
 pub struct MetaInterpGlobalData {
     /// pyjitpl.py:2308-2318 `addr2name`: `fnaddr → name` for debugging.
-    pub addr2name: Option<majit_ir::VecMap<usize, String>>,
+    pub addr2name: Option<indexmap::IndexMap<usize, String>>,
     /// pyjitpl.py:2326-2343 `indirectcall_dict`: `fnaddr → JitCode`.
     /// Stores the current runtime-adapter `JitCode`; the helper that
     /// builds this dict is intentionally type-agnostic so canonical
     /// codewriter jitcodes can reuse the same semantics.
-    pub indirectcall_dict: Option<majit_ir::VecMap<usize, std::sync::Arc<crate::jitcode::JitCode>>>,
+    pub indirectcall_dict:
+        Option<indexmap::IndexMap<usize, std::sync::Arc<crate::jitcode::JitCode>>>,
     /// pyjitpl.py:2293-2303 `initialized` — guards `_setup_once` so the
     /// runtime side-effects (profiler start, jitlog setup) fire once.
     pub initialized: bool,
@@ -14626,8 +14628,8 @@ pub struct MetaInterpGlobalData {
 fn build_indirectcall_dict<T>(
     targets: &[std::sync::Arc<T>],
     fnaddr_of: impl Fn(&T) -> usize,
-) -> majit_ir::VecMap<usize, std::sync::Arc<T>> {
-    let mut d: majit_ir::VecMap<usize, std::sync::Arc<T>> = majit_ir::VecMap::new();
+) -> indexmap::IndexMap<usize, std::sync::Arc<T>> {
+    let mut d: indexmap::IndexMap<usize, std::sync::Arc<T>> = indexmap::IndexMap::new();
     for jitcode in targets {
         let fnaddr = fnaddr_of(jitcode);
         debug_assert!(
@@ -14641,7 +14643,7 @@ fn build_indirectcall_dict<T>(
 
 fn bytecode_for_address_in_targets<T>(
     targets: &[std::sync::Arc<T>],
-    cache: &mut Option<majit_ir::VecMap<usize, std::sync::Arc<T>>>,
+    cache: &mut Option<indexmap::IndexMap<usize, std::sync::Arc<T>>>,
     fnaddress: usize,
     fnaddr_of: impl Fn(&T) -> usize,
 ) -> Option<std::sync::Arc<T>> {
@@ -14983,7 +14985,7 @@ impl MetaInterpStaticData {
     ///
     /// Pyre's blackhole-side `setup_insns` lives separately in
     /// `crate::blackhole::BlackholeInterpBuilder::setup_insns`.
-    pub fn setup_insns(&mut self, insns: &majit_ir::VecMap<String, u8>) {
+    pub fn setup_insns(&mut self, insns: &indexmap::IndexMap<String, u8>) {
         // pyjitpl.py:2228-2229: opcode_names/opcode_implementations init.
         // RPython sizes by `len(insns)` because its assembler assigns
         // opnums sequentially from 0, so `len(insns) == max(opnum) + 1`.
@@ -15372,7 +15374,7 @@ impl MetaInterpStaticData {
     pub fn get_name_from_address(&self, addr: usize) -> String {
         let mut gd = self.globaldata.lock().unwrap();
         let dict = gd.addr2name.get_or_insert_with(|| {
-            let mut d: majit_ir::VecMap<usize, String> = majit_ir::VecMap::new();
+            let mut d: indexmap::IndexMap<usize, String> = indexmap::IndexMap::new();
             for (i, key) in self._addr2name_keys.iter().enumerate() {
                 if let Some(value) = self._addr2name_values.get(i) {
                     d.insert(*key, value.clone());
@@ -18054,7 +18056,7 @@ mod metainterp_static_data_tests {
     #[test]
     fn setup_insns_populates_opcode_names() {
         let mut sd = MetaInterpStaticData::new();
-        let mut insns: majit_ir::VecMap<String, u8> = majit_ir::VecMap::new();
+        let mut insns: indexmap::IndexMap<String, u8> = indexmap::IndexMap::new();
         insns.insert("foo".to_string(), 0u8);
         insns.insert("bar".to_string(), 1u8);
         sd.setup_insns(&insns);
@@ -18067,7 +18069,7 @@ mod metainterp_static_data_tests {
     fn setup_insns_caches_opcode_ids_or_minus_one() {
         // pyjitpl.py:2236-2243: each cached id is `insns.get(...) ?? -1`.
         let mut sd = MetaInterpStaticData::new();
-        let mut insns: majit_ir::VecMap<String, u8> = majit_ir::VecMap::new();
+        let mut insns: indexmap::IndexMap<String, u8> = indexmap::IndexMap::new();
         insns.insert("live/".to_string(), 5u8);
         insns.insert("goto/L".to_string(), 6u8);
         insns.insert("catch_exception/L".to_string(), 7u8);
@@ -18090,7 +18092,7 @@ mod metainterp_static_data_tests {
     #[test]
     fn setup_insns_leaves_missing_opcode_ids_at_minus_one() {
         let mut sd = MetaInterpStaticData::new();
-        let mut insns: majit_ir::VecMap<String, u8> = majit_ir::VecMap::new();
+        let mut insns: indexmap::IndexMap<String, u8> = indexmap::IndexMap::new();
         insns.insert("foo".to_string(), 0u8);
         sd.setup_insns(&insns);
         assert_eq!(sd.op_live, -1);
@@ -18765,15 +18767,15 @@ mod tests {
         let mut constants: majit_ir::ConstMap<majit_ir::Const> = majit_ir::ConstMap::new();
         constants.insert(100, majit_ir::Const::Int(1));
         constants.insert(101, majit_ir::Const::Int(2));
-        let mut traces = majit_ir::VecMap::new();
+        let mut traces = indexmap::IndexMap::new();
         traces.insert(
             trace_id,
             CompiledTrace {
                 inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
                 ops: ops.into_iter().map(std::rc::Rc::new).collect(),
                 constants,
-                exit_layouts: majit_ir::VecMap::new(),
-                terminal_exit_layouts: majit_ir::VecMap::new(),
+                exit_layouts: indexmap::IndexMap::new(),
+                terminal_exit_layouts: indexmap::IndexMap::new(),
             },
         );
         meta.warm_state_mut()
@@ -18919,7 +18921,7 @@ mod tests {
             pending_field_layouts: vec![],
         };
 
-        let mut exit_layouts: majit_ir::VecMap<u32, StoredExitLayout> = majit_ir::VecMap::new();
+        let mut exit_layouts: indexmap::IndexMap<u32, StoredExitLayout> = indexmap::IndexMap::new();
         exit_layouts.insert(
             fail_index,
             StoredExitLayout {
@@ -18939,7 +18941,7 @@ mod tests {
             },
         );
 
-        let mut traces = majit_ir::VecMap::new();
+        let mut traces = indexmap::IndexMap::new();
         traces.insert(
             trace_id,
             CompiledTrace {
@@ -18947,7 +18949,7 @@ mod tests {
                 ops: vec![],
                 constants: majit_ir::ConstMap::new(),
                 exit_layouts,
-                terminal_exit_layouts: majit_ir::VecMap::new(),
+                terminal_exit_layouts: indexmap::IndexMap::new(),
             },
         );
 
@@ -19009,7 +19011,7 @@ mod tests {
         writer.patch_current_size(0);
         let rd_numb = writer.create_numbering();
 
-        let mut exit_layouts: majit_ir::VecMap<u32, StoredExitLayout> = majit_ir::VecMap::new();
+        let mut exit_layouts: indexmap::IndexMap<u32, StoredExitLayout> = indexmap::IndexMap::new();
         exit_layouts.insert(
             fail_index,
             StoredExitLayout {
@@ -19035,7 +19037,7 @@ mod tests {
             },
         );
 
-        let mut traces = majit_ir::VecMap::new();
+        let mut traces = indexmap::IndexMap::new();
         traces.insert(
             trace_id,
             CompiledTrace {
@@ -19043,7 +19045,7 @@ mod tests {
                 ops: vec![],
                 constants: majit_ir::ConstMap::new(),
                 exit_layouts,
-                terminal_exit_layouts: majit_ir::VecMap::new(),
+                terminal_exit_layouts: indexmap::IndexMap::new(),
             },
         );
 
@@ -19331,7 +19333,7 @@ mod tests {
             trace_id,
             &mut terminal_exit_layouts,
         );
-        let mut traces = majit_ir::VecMap::new();
+        let mut traces = indexmap::IndexMap::new();
         traces.insert(
             trace_id,
             CompiledTrace {
@@ -20176,7 +20178,7 @@ mod tests {
                 meta: (),
                 front_target_tokens: Vec::new(),
                 root_trace_id: 0,
-                traces: majit_ir::VecMap::new(),
+                traces: indexmap::IndexMap::new(),
                 previous_tokens: Vec::new(),
                 next_global_opref: 0,
             },

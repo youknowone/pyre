@@ -10,6 +10,7 @@
 //! ISNULL) lives in `OptRewrite` (`rewrite.rs`) and `OptIntBounds`
 //! (`intbounds.rs`), folding via box-attached `getptrinfo`/`getintbound` +
 //! `make_constant` — `rewrite.py` `optimize_GUARD_*`.
+use indexmap::IndexMap;
 use majit_ir::{Op, OpCode, OpRef};
 
 use crate::optimizeopt::OptContext;
@@ -41,7 +42,7 @@ impl Guard {
         index: usize,
         guard_op: Op,
         cmp_op: Op,
-        index_vars: &majit_ir::VecMap<OpRef, IndexVar>,
+        index_vars: &indexmap::IndexMap<OpRef, IndexVar>,
     ) -> Self {
         let lhs_arg = cmp_op.arg(0).to_opref();
         let lhs = index_vars
@@ -71,7 +72,7 @@ impl Guard {
         index: usize,
         guard_op: &Op,
         cmp_op: &Op,
-        index_vars: &majit_ir::VecMap<OpRef, IndexVar>,
+        index_vars: &indexmap::IndexMap<OpRef, IndexVar>,
     ) -> Option<Self> {
         if !guard_op.opcode.is_guard() {
             return None;
@@ -157,9 +158,9 @@ impl Guard {
         var: &IndexVar,
         old_arg: OpRef,
         new_ops: &mut Vec<Op>,
-        renamer: &mut majit_ir::VecMap<OpRef, OpRef>,
+        renamer: &mut indexmap::IndexMap<OpRef, OpRef>,
         next_const_pos: &mut u32,
-        const_values: &mut majit_ir::VecMap<OpRef, i64>,
+        const_values: &mut indexmap::IndexMap<OpRef, i64>,
     ) -> OpRef {
         if var.is_identity() {
             return var.var;
@@ -198,9 +199,9 @@ impl Guard {
         other: &Guard,
         label_args: &[OpRef],
         new_ops: &mut Vec<Op>,
-        renamer: &mut majit_ir::VecMap<OpRef, OpRef>,
+        renamer: &mut indexmap::IndexMap<OpRef, OpRef>,
         next_const_pos: &mut u32,
-        const_values: &mut majit_ir::VecMap<OpRef, i64>,
+        const_values: &mut indexmap::IndexMap<OpRef, i64>,
     ) -> Option<Op> {
         if self.op.opcode != other.op.opcode {
             return None;
@@ -364,9 +365,9 @@ impl Guard {
     pub fn emit_operations(
         &mut self,
         new_ops: &mut Vec<Op>,
-        renamer: &mut majit_ir::VecMap<OpRef, OpRef>,
+        renamer: &mut indexmap::IndexMap<OpRef, OpRef>,
         next_const_pos: &mut u32,
-        const_values: &mut majit_ir::VecMap<OpRef, i64>,
+        const_values: &mut indexmap::IndexMap<OpRef, i64>,
     ) {
         // guard.py:136-137: lhs/rhs via emit_varops
         let lhs = Self::emit_varops(
@@ -445,36 +446,36 @@ impl Guard {
 /// proper descr/fail_args, and optionally eliminates array bound checks.
 pub struct GuardStrengthenOpt {
     /// guard.py:168
-    pub index_vars: majit_ir::VecMap<OpRef, IndexVar>,
+    pub index_vars: indexmap::IndexMap<OpRef, IndexVar>,
     /// guard.py:169
     _newoperations: Vec<Op>,
     /// guard.py:170
     pub strength_reduced: usize,
     /// guard.py:171
-    pub strongest_guards: majit_ir::VecMap<OpRef, Vec<Guard>>,
+    pub strongest_guards: indexmap::IndexMap<OpRef, Vec<Guard>>,
     /// guard.py:172
-    guards: majit_ir::VecMap<usize, Option<Guard>>,
+    guards: indexmap::IndexMap<usize, Option<Guard>>,
     /// renamer.py: Renamer — maps old OpRef → new OpRef for renamed vars.
-    renamer: majit_ir::VecMap<OpRef, OpRef>,
+    renamer: indexmap::IndexMap<OpRef, OpRef>,
     /// Zero-based counter for constant-namespace OpRef allocation.
     next_const_pos: u32,
     /// Materialized constant values: OpRef → i64.
     /// RPython uses ConstInt boxes inline; majit stores const values here.
-    pub const_values: majit_ir::VecMap<OpRef, i64>,
+    pub const_values: indexmap::IndexMap<OpRef, i64>,
 }
 
 impl GuardStrengthenOpt {
     /// guard.py:167
-    pub fn new(index_vars: majit_ir::VecMap<OpRef, IndexVar>) -> Self {
+    pub fn new(index_vars: indexmap::IndexMap<OpRef, IndexVar>) -> Self {
         GuardStrengthenOpt {
             index_vars,
             _newoperations: Vec::new(),
             strength_reduced: 0,
-            strongest_guards: majit_ir::VecMap::new(),
-            guards: majit_ir::VecMap::new(),
-            renamer: majit_ir::VecMap::new(),
+            strongest_guards: indexmap::IndexMap::new(),
+            guards: indexmap::IndexMap::new(),
+            renamer: indexmap::IndexMap::new(),
             next_const_pos: 0,
-            const_values: majit_ir::VecMap::new(),
+            const_values: indexmap::IndexMap::new(),
         }
     }
 
@@ -540,7 +541,7 @@ impl GuardStrengthenOpt {
     }
 
     fn set_guard(
-        guards: &mut majit_ir::VecMap<usize, Option<Guard>>,
+        guards: &mut indexmap::IndexMap<usize, Option<Guard>>,
         idx: usize,
         val: Option<Guard>,
     ) {
@@ -550,7 +551,7 @@ impl GuardStrengthenOpt {
     /// guard.py:221-249: eliminate_guards(loop)
     pub fn eliminate_guards(&mut self, ops: &[Op]) -> Vec<Op> {
         // guard.py:222: self.renamer = Renamer()
-        self.renamer = majit_ir::VecMap::new();
+        self.renamer = indexmap::IndexMap::new();
         self._newoperations = Vec::with_capacity(ops.len());
 
         // Take guards out of self to satisfy borrow checker.
@@ -627,7 +628,7 @@ impl GuardStrengthenOpt {
         info: &mut super::version::LoopVersionInfo,
         label_args: &[OpRef],
         user_code: bool,
-    ) -> (Vec<Op>, majit_ir::VecMap<OpRef, i64>) {
+    ) -> (Vec<Op>, indexmap::IndexMap<OpRef, i64>) {
         self.collect_guard_information(ops);
         let mut result = self.eliminate_guards(ops);
 
@@ -725,7 +726,7 @@ impl GuardStrengthenOpt {
 
         // guard.py:283-299
         let mut opt_ops: Vec<Option<Op>> = ops.drain(..).map(Some).collect();
-        let guards_snapshot: majit_ir::VecMap<OpRef, Vec<Guard>> = self.strongest_guards.clone();
+        let guards_snapshot: indexmap::IndexMap<OpRef, Vec<Guard>> = self.strongest_guards.clone();
         for guards in guards_snapshot.values() {
             if guards.len() <= 1 {
                 continue;
@@ -794,7 +795,7 @@ impl GuardStrengthenOpt {
 
 impl Default for GuardStrengthenOpt {
     fn default() -> Self {
-        Self::new(majit_ir::VecMap::new())
+        Self::new(indexmap::IndexMap::new())
     }
 }
 

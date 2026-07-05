@@ -1,3 +1,4 @@
+use indexmap::IndexMap;
 use majit_ir::operand::Operand;
 /// Integer bounds optimization pass.
 ///
@@ -1817,8 +1818,8 @@ impl Optimization for OptIntBounds {
         &self,
         args: &[OpRef],
         ctx: &OptContext,
-    ) -> majit_ir::VecMap<majit_ir::operand::Operand, IntBound> {
-        let mut exported = majit_ir::VecMap::new();
+    ) -> indexmap::IndexMap<majit_ir::operand::Operand, IntBound> {
+        let mut exported = indexmap::IndexMap::new();
         for &arg in args {
             // An IntBound only lives on a value-bearing box; an unresolvable
             // arg position carries none. Resolve the canonical box once and

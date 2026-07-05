@@ -38,6 +38,7 @@ fn sort_array_index_entries_untranslated<T>(entries: &mut [(i64, T)]) {
     }
 }
 
+use indexmap::{IndexMap, IndexSet};
 use majit_ir::{
     DescrRef, OopSpecIndex, Op, OpCode, OpRef, Value, VecMapExt, descr::descr_identity,
 };
@@ -664,7 +665,7 @@ impl ArrayCachedItem {
 /// 1:1.
 struct ArrayCacheSubMap {
     /// heap.py:302: const_indexes = {} (int -> ArrayCachedItem)
-    const_indexes: majit_ir::VecMap<i64, ArrayCachedItem>,
+    const_indexes: indexmap::IndexMap<i64, ArrayCachedItem>,
     /// heap.py:305-306: cached_varindex_triples = None
     /// List of (arrayinfo, indexbox, resbox). RPython uses Python object
     /// identity for arrayinfo; majit uses the canonical array OpRef.
@@ -674,7 +675,7 @@ struct ArrayCacheSubMap {
 impl ArrayCacheSubMap {
     fn new() -> Self {
         ArrayCacheSubMap {
-            const_indexes: majit_ir::VecMap::new(),
+            const_indexes: indexmap::IndexMap::new(),
             cached_varindex_triples: None,
         }
     }
@@ -784,7 +785,7 @@ pub struct OptHeap {
     /// keyed by operand identity (`Rc::ptr_eq`) — box identity, not the retired
     /// `opref.raw()` slot index. OptHeap ownership preserves `setup()`'s per-run
     /// reset, which a per-box flag on a shared `Box` could not bulk-clear.
-    unescaped: majit_ir::vec_set::VecSet<Operand>,
+    unescaped: indexmap::IndexSet<Operand>,
     /// heapcache.py:209/298-307/453-455 `box._heapc_deps` — per-Box
     /// dependency list. RPython attaches `_heapc_deps: list | None`
     /// as an attribute on the `RefFrontendOp` Box object itself;
@@ -793,7 +794,7 @@ pub struct OptHeap {
     /// the value is recorded as a dependency of the container instead
     /// of being immediately escaped. When the container escapes later,
     /// all its dependencies are transitively escaped.
-    heapc_deps: majit_ir::VecMap<Operand, Vec<Operand>>,
+    heapc_deps: indexmap::IndexMap<Operand, Vec<Operand>>,
 
     /// heap.py:27 Optimization.last_emitted_operation is REMOVED.
     /// Set to true when `_optimize_CALL_DICT_LOOKUP` folds a lookup;
@@ -803,7 +804,7 @@ pub struct OptHeap {
     /// Consecutive dict lookups on the same dict+key are deduplicated.
     /// Inner key uses `DictArgKey` so Const args compare by value
     /// (util.py:100 args_dict / args_eq via history.py:204 same_box).
-    cached_dict_reads: majit_ir::VecMap<usize, majit_ir::VecMap<[DictArgKey; 2], OpRef>>,
+    cached_dict_reads: indexmap::IndexMap<usize, indexmap::IndexMap<[DictArgKey; 2], OpRef>>,
     /// heap.py:560: corresponding_array_descrs — maps extradescrs[1] (entries
     /// array descr) → extradescrs[0] dict identity.
     ///
@@ -816,13 +817,13 @@ pub struct OptHeap {
     /// to mirror PyPy's `dict[arraydescr]` "later registration wins" idiom
     /// (the registration is gated by a `cached_dict_reads` first-encounter
     /// check, so duplicates are rare anyway — see `_optimize_call_dict_lookup`).
-    corresponding_array_descrs: majit_ir::VecMap<u32, (DescrRef, usize)>,
+    corresponding_array_descrs: indexmap::IndexMap<u32, (DescrRef, usize)>,
     /// Fields known to be quasi-immutable: (obj box, field_idx) -> cached value
     /// OpRef. Keyed by the object's `Operand` identity (heap keys structs by box,
     /// not by the retired `opref.raw()` slot). Populated by QUASIIMMUT_FIELD,
     /// consumed by subsequent GETFIELD_GC_*. Survives calls (guarded by
     /// GUARD_NOT_INVALIDATED).
-    quasi_immut_cache: majit_ir::VecMap<(Operand, usize), OpRef>,
+    quasi_immut_cache: indexmap::IndexMap<(Operand, usize), OpRef>,
 }
 
 impl OptHeap {
@@ -833,12 +834,12 @@ impl OptHeap {
             seen_guard_not_invalidated: false,
             postponed_op: None,
             seen_allocation: BitSet::new(),
-            unescaped: majit_ir::vec_set::VecSet::new(),
-            heapc_deps: majit_ir::VecMap::new(),
+            unescaped: indexmap::IndexSet::new(),
+            heapc_deps: indexmap::IndexMap::new(),
             last_emitted_removed: false,
-            cached_dict_reads: majit_ir::VecMap::new(),
-            corresponding_array_descrs: majit_ir::VecMap::new(),
-            quasi_immut_cache: majit_ir::VecMap::new(),
+            cached_dict_reads: indexmap::IndexMap::new(),
+            corresponding_array_descrs: indexmap::IndexMap::new(),
+            quasi_immut_cache: indexmap::IndexMap::new(),
         }
     }
 
@@ -1527,7 +1528,7 @@ impl OptHeap {
         // re-register and diverge from RPython.
         if !self.cached_dict_reads.contains_key(&descr1_id) {
             self.cached_dict_reads
-                .insert(descr1_id, majit_ir::VecMap::new());
+                .insert(descr1_id, indexmap::IndexMap::new());
             self.corresponding_array_descrs
                 .insert(descr2.index(), (descr2, descr1_id));
         }

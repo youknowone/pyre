@@ -21,6 +21,7 @@ description = "Garbage collector for majit JIT runtime"
 gc_stress = []
 
 [dependencies]
+indexmap = { workspace = true }
 majit-ir = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]

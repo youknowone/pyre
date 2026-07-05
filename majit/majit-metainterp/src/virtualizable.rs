@@ -14,6 +14,7 @@
 //!
 //! This module provides the Rust equivalent of RPython's `virtualizable.py`.
 
+use indexmap::IndexMap;
 use std::sync::{Arc, Weak};
 
 use majit_ir::{DescrRef, Type, descr::descr_identity};
@@ -190,10 +191,10 @@ pub struct VirtualizableInfo {
     _array_field_struct_descrs: Vec<DescrRef>,
     /// virtualizable.py:81-82: self.static_field_by_descrs = {descr: i ...}
     /// Map from descriptor identity (Arc pointer address) to field index.
-    pub static_field_by_descrs: majit_ir::VecMap<usize, usize>,
+    pub static_field_by_descrs: indexmap::IndexMap<usize, usize>,
     /// virtualizable.py:83-84: self.array_field_by_descrs = {descr: i ...}
     /// Map from descriptor identity (Arc pointer address) to array field index.
-    pub array_field_by_descrs: majit_ir::VecMap<usize, usize>,
+    pub array_field_by_descrs: indexmap::IndexMap<usize, usize>,
     /// virtualizable.py:294-295 `clear_vable_ptr`: function pointer to
     /// `clear_vable_token`, callable from JIT-compiled COND_CALL.
     /// Signature: `extern "C" fn(*mut u8)`. Stored as raw address so
@@ -281,8 +282,8 @@ impl VirtualizableInfo {
             _array_field_descrs: Vec::new(),
             _static_field_struct_descrs: Vec::new(),
             _array_field_struct_descrs: Vec::new(),
-            static_field_by_descrs: majit_ir::VecMap::new(),
-            array_field_by_descrs: majit_ir::VecMap::new(),
+            static_field_by_descrs: indexmap::IndexMap::new(),
+            array_field_by_descrs: indexmap::IndexMap::new(),
             clear_vable_ptr: None,
             clear_vable_descr: None,
             identity_ref_bank_index: None,
@@ -434,7 +435,7 @@ impl VirtualizableInfo {
         // arc identities under the same idx — `vable_getfield_int`'s
         // identity lookup then resolves whichever descr the walker
         // hands it.
-        self.static_field_by_descrs = majit_ir::VecMap::new();
+        self.static_field_by_descrs = indexmap::IndexMap::new();
         for (i, d) in self._static_field_descrs.iter().enumerate() {
             self.static_field_by_descrs.insert(descr_identity(d), i);
             let canonical = majit_ir::descr::vable_static_field_descr(i as u16);
@@ -442,7 +443,7 @@ impl VirtualizableInfo {
                 .insert(descr_identity(&canonical), i);
         }
         // virtualizable.py:83-84: self.array_field_by_descrs = {descr: i ...}
-        self.array_field_by_descrs = majit_ir::VecMap::new();
+        self.array_field_by_descrs = indexmap::IndexMap::new();
         for (i, d) in self._array_field_descrs.iter().enumerate() {
             self.array_field_by_descrs.insert(descr_identity(d), i);
             let canonical = majit_ir::descr::vable_array_field_descr(i as u16);
@@ -724,7 +725,7 @@ impl VirtualizableInfo {
     }
 
     /// virtualizable.py:81: vinfo.static_field_by_descrs[fielddescr]
-    /// Descriptor-identity lookup (linear scan via VecMap).
+    /// Descriptor-identity lookup (linear scan via IndexMap).
     pub fn static_field_by_descr(&self, descr: &DescrRef) -> Option<usize> {
         self.static_field_by_descrs
             .get(&descr_identity(descr))
@@ -732,7 +733,7 @@ impl VirtualizableInfo {
     }
 
     /// virtualizable.py:83: vinfo.array_field_by_descrs[arrayfielddescr]
-    /// Descriptor-identity lookup (linear scan via VecMap).
+    /// Descriptor-identity lookup (linear scan via IndexMap).
     pub fn array_field_by_descr(&self, descr: &DescrRef) -> Option<usize> {
         self.array_field_by_descrs
             .get(&descr_identity(descr))

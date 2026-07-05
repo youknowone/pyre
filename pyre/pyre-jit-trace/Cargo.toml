@@ -13,6 +13,7 @@ dynasm = ["dep:majit-backend-dynasm", "majit-metainterp/dynasm"]
 test-support = []
 
 [dependencies]
+indexmap = { workspace = true }
 pyre-object = { workspace = true }
 pyre-interpreter = { workspace = true }
 rustpython-wtf8 = { workspace = true }

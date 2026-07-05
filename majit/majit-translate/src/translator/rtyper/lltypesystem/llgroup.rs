@@ -38,15 +38,15 @@ pub type r_halfword = u32;
 
 static NEXT_GROUP_ID: AtomicUsize = AtomicUsize::new(1);
 static NEXT_MEMBER_ID: AtomicUsize = AtomicUsize::new(1);
-static MEMBERSHIP: OnceLock<Mutex<majit_ir::VecMap<usize, GroupPtr>>> = OnceLock::new();
-static OUTDATED: OnceLock<Mutex<majit_ir::VecMap<usize, String>>> = OnceLock::new();
+static MEMBERSHIP: OnceLock<Mutex<indexmap::IndexMap<usize, GroupPtr>>> = OnceLock::new();
+static OUTDATED: OnceLock<Mutex<indexmap::IndexMap<usize, String>>> = OnceLock::new();
 
-fn membership() -> &'static Mutex<majit_ir::VecMap<usize, GroupPtr>> {
-    MEMBERSHIP.get_or_init(|| Mutex::new(majit_ir::VecMap::new()))
+fn membership() -> &'static Mutex<indexmap::IndexMap<usize, GroupPtr>> {
+    MEMBERSHIP.get_or_init(|| Mutex::new(indexmap::IndexMap::new()))
 }
 
-fn outdated() -> &'static Mutex<majit_ir::VecMap<usize, String>> {
-    OUTDATED.get_or_init(|| Mutex::new(majit_ir::VecMap::new()))
+fn outdated() -> &'static Mutex<indexmap::IndexMap<usize, String>> {
+    OUTDATED.get_or_init(|| Mutex::new(indexmap::IndexMap::new()))
 }
 
 /// Stand-in for a raw struct pointer inserted into an llgroup.
@@ -167,7 +167,7 @@ pub struct GroupPtr {
 /// RPython `member_of_group(structptr)`.
 ///
 /// RPython stores `_membership = weakref.WeakValueDictionary()`. Group members
-/// here are stable symbolic carriers, so a `VecMap` keyed by member identity is
+/// here are stable symbolic carriers, so a `IndexMap` keyed by member identity is
 /// the direct dict-shaped counterpart without introducing a separate
 /// Rust-native collection.
 pub fn member_of_group(structptr: &GroupMember) -> Option<GroupPtr> {

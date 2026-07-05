@@ -17,6 +17,7 @@
 ///
 /// OpRefs in the peeled iteration are remapped to new positions so they
 /// don't collide with the original ops.
+use indexmap::{IndexMap, IndexSet};
 use majit_ir::operand::Operand;
 use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type, Value, VecMapExt};
 
@@ -234,7 +235,7 @@ pub struct UnrollOptimizer {
     pub callinfocollection: Option<std::sync::Arc<majit_ir::CallInfoCollection>>,
     /// compile.py:221 + optimizer.py:530: call_pure_results from tracing.
     /// Passed through to the inner Optimizer for cross-iteration CALL_PURE folding.
-    pub call_pure_results: majit_ir::VecMap<Vec<majit_ir::Value>, majit_ir::Value>,
+    pub call_pure_results: indexmap::IndexMap<Vec<majit_ir::Value>, majit_ir::Value>,
     /// `optimizer.cpu` (model.py:39 `AbstractCPU`) backref, carried into
     /// the inner phase-1/phase-2 `Optimizer.cpu` at spawn time so
     /// `cpu.cls_of_box(runtime_box)` reads (virtualstate.py:601/:608/:620)
@@ -292,7 +293,7 @@ impl UnrollOptimizer {
             phase1_patchguardop: None,
             next_global_opref: 0,
             callinfocollection: None,
-            call_pure_results: majit_ir::VecMap::new(),
+            call_pure_results: indexmap::IndexMap::new(),
             cpu: crate::cpu::default_cpu(),
             phase2_input_ops_seed: None,
             compile_snapshot_root_slots: None,
@@ -711,10 +712,10 @@ impl UnrollOptimizer {
                         next_iteration_args: Vec::new(),
                         end_arg_types: Vec::new(),
                         virtual_state: state.virtual_state.clone(),
-                        exported_infos: majit_ir::VecMap::new(),
+                        exported_infos: indexmap::IndexMap::new(),
                         exported_short_boxes: Vec::new(),
                         short_boxes: Vec::new(),
-                        short_box_const_values: majit_ir::VecMap::new(),
+                        short_box_const_values: indexmap::IndexMap::new(),
                         short_preamble: None,
                         renamed_inputargs: state.renamed_inputargs.clone(),
                         short_inputargs: Vec::new(),
@@ -1253,8 +1254,7 @@ impl UnrollOptimizer {
                 // short_preamble_jump / extra_same_as fill via the
                 // canonical RPython path.
                 {
-                    let mut visited_force: majit_ir::vec_set::VecSet<OpRef> =
-                        majit_ir::vec_set::VecSet::new();
+                    let mut visited_force: indexmap::IndexSet<OpRef> = indexmap::IndexSet::new();
                     for op in p2_ops.iter() {
                         if op.opcode == OpCode::Jump {
                             // The terminal jump's args are already
@@ -1445,8 +1445,7 @@ impl UnrollOptimizer {
             // when two virtuals share the same OpRef. Allocate fresh
             // OpRefs for duplicates so the LABEL carries independent slots.
             {
-                let mut seen_used: majit_ir::vec_set::VecSet<OpRef> =
-                    majit_ir::vec_set::VecSet::new();
+                let mut seen_used: indexmap::IndexSet<OpRef> = indexmap::IndexSet::new();
                 let mut next_fresh = current_label_args
                     .iter()
                     .copied()
@@ -1799,7 +1798,7 @@ impl UnrollOptimizer {
         // RPython Box parity: drop duplicate-position ops. In RPython
         // each Box is unique so collisions can't happen. Keep first.
         {
-            let mut seen: majit_ir::vec_set::VecSet<u32> = majit_ir::vec_set::VecSet::new();
+            let mut seen: indexmap::IndexSet<u32> = indexmap::IndexSet::new();
             combined.retain(|op| {
                 if op.pos.get().is_none() || op.result_type() == Type::Void {
                     return true;
@@ -1845,7 +1844,7 @@ impl UnrollOptimizer {
     /// unroll.py: _map_args(mapping, arglist)
     /// Remap a list of OpRefs through a forwarding mapping.
     /// Constant OpRefs are left unchanged because they are not remapped.
-    pub fn map_args(mapping: &majit_ir::VecMap<OpRef, OpRef>, args: &[OpRef]) -> Vec<OpRef> {
+    pub fn map_args(mapping: &indexmap::IndexMap<OpRef, OpRef>, args: &[OpRef]) -> Vec<OpRef> {
         args.iter()
             .map(|&arg| mapping.get(&arg).copied().unwrap_or(arg))
             .collect()
@@ -1927,7 +1926,7 @@ pub struct ExportedState {
     /// union of these three cases. Keyed by box object identity ([`Operand`]
     /// `Eq` = producer / const-cell `Rc::ptr_eq`), matching RPython's plain
     /// box-keyed dict.
-    pub exported_infos: majit_ir::VecMap<Operand, crate::optimizeopt::info::OpInfo>,
+    pub exported_infos: indexmap::IndexMap<Operand, crate::optimizeopt::info::OpInfo>,
     /// RPython shortpreamble.py: produced short boxes in preamble order.
     /// This preserves the original preamble ops so the active path can build
     /// short preambles without re-extracting them from the peeled trace.
@@ -1960,7 +1959,7 @@ pub struct ExportedState {
     /// already does this at `optimizer.rs:1927`; bridges and unit tests
     /// remain the open cases). At that point `classify_short_arg` can
     /// read the box's `const_value()` exclusively.
-    pub short_box_const_values: majit_ir::VecMap<OpRef, majit_ir::Value>,
+    pub short_box_const_values: indexmap::IndexMap<OpRef, majit_ir::Value>,
     /// Short preamble builder for bridge entry.
     pub short_preamble: Option<crate::optimizeopt::shortpreamble::ShortPreamble>,
     /// Renamed inputargs from the preamble. Each OpRef is a typed
@@ -2072,7 +2071,7 @@ impl ExportedState {
         end_args: Vec<OpRef>,
         next_iteration_args: Vec<Operand>,
         virtual_state: crate::optimizeopt::virtualstate::VirtualState,
-        exported_infos: majit_ir::VecMap<Operand, crate::optimizeopt::info::OpInfo>,
+        exported_infos: indexmap::IndexMap<Operand, crate::optimizeopt::info::OpInfo>,
         exported_short_boxes: Vec<crate::optimizeopt::shortpreamble::PreambleOp>,
         renamed_inputargs: Vec<OpRef>,
         short_inputargs: Vec<OpRef>,
@@ -2100,7 +2099,7 @@ impl ExportedState {
             exported_infos,
             exported_short_boxes,
             short_boxes,
-            short_box_const_values: majit_ir::VecMap::new(),
+            short_box_const_values: indexmap::IndexMap::new(),
             short_preamble: None,
             renamed_inputargs,
             short_inputargs,
@@ -2577,8 +2576,8 @@ impl ExportedState {
             // Re-share slots that originally aliased: walk the snapshot
             // map and copy each group's first canonical Rc into every
             // peer slot, restoring the pre-GC `Rc::as_ptr` equivalences.
-            let mut canonical_by_old: majit_ir::VecMap<usize, Rc<VirtualStateInfoNode>> =
-                majit_ir::VecMap::new();
+            let mut canonical_by_old: indexmap::IndexMap<usize, Rc<VirtualStateInfoNode>> =
+                indexmap::IndexMap::new();
             for (slot_idx, &old_ptr) in original_ptrs.iter().enumerate() {
                 let entry = canonical_by_old.entry_or_insert_with(old_ptr, || {
                     Rc::clone(&self.virtual_state.state[slot_idx])
@@ -2729,7 +2728,7 @@ impl OptUnroll {
         optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
         ctx: &mut OptContext,
         exported_int_bounds: Option<
-            &majit_ir::VecMap<majit_ir::operand::Operand, crate::optimizeopt::intutils::IntBound>,
+            &indexmap::IndexMap<majit_ir::operand::Operand, crate::optimizeopt::intutils::IntBound>,
         >,
     ) -> ExportedState {
         // unroll.py:454: end_args = [force_at_the_end_of_preamble(a) ...]
@@ -2746,8 +2745,8 @@ impl OptUnroll {
         // the same post-force, post-flush state RPython feeds in.
         let virtual_state = crate::optimizeopt::virtualstate::export_state(&end_args, ctx);
         // unroll.py:459-461: infos = {}; for arg in end_args: _expand_info(arg, infos)
-        let mut infos: majit_ir::VecMap<Operand, crate::optimizeopt::info::OpInfo> =
-            majit_ir::VecMap::new();
+        let mut infos: indexmap::IndexMap<Operand, crate::optimizeopt::info::OpInfo> =
+            indexmap::IndexMap::new();
         // Resolve the ONE canonical box per end_arg up front: it is the
         // exported_infos key AND (unroll.py:467 next_iteration_args = end_args)
         // the carried import key, so they are the identical Rc and import_state's
@@ -3031,9 +3030,9 @@ impl OptUnroll {
         arg_box: &Operand,
         ctx: &OptContext,
         exported_int_bounds: Option<
-            &majit_ir::VecMap<majit_ir::operand::Operand, crate::optimizeopt::intutils::IntBound>,
+            &indexmap::IndexMap<majit_ir::operand::Operand, crate::optimizeopt::intutils::IntBound>,
         >,
-        infos: &mut majit_ir::VecMap<Operand, crate::optimizeopt::info::OpInfo>,
+        infos: &mut indexmap::IndexMap<Operand, crate::optimizeopt::info::OpInfo>,
     ) {
         // unroll.py:438-443 `_expand_info`:
         //     if arg in infos:
@@ -3085,9 +3084,9 @@ impl OptUnroll {
         opref: OpRef,
         ctx: &OptContext,
         exported_int_bounds: Option<
-            &majit_ir::VecMap<majit_ir::operand::Operand, crate::optimizeopt::intutils::IntBound>,
+            &indexmap::IndexMap<majit_ir::operand::Operand, crate::optimizeopt::intutils::IntBound>,
         >,
-        infos: &mut majit_ir::VecMap<Operand, crate::optimizeopt::info::OpInfo>,
+        infos: &mut indexmap::IndexMap<Operand, crate::optimizeopt::info::OpInfo>,
     ) {
         let opref_box = ctx.get_box_replacement_operand_opt(opref);
         // unroll.py:445-450 `_expand_infos_from_virtual`:
@@ -3562,7 +3561,7 @@ impl OptUnroll {
              the backend (merge_backend_constants_from_ctx no longer exports ctx.const_pool)"
         );
 
-        let mut mapping: majit_ir::VecMap<OpRef, OpRef> = majit_ir::VecMap::new();
+        let mut mapping: indexmap::IndexMap<OpRef, OpRef> = indexmap::IndexMap::new();
 
         // unroll.py:393 `assert len(short_inputargs) == len(jump_args)` —
         // the mapping below is positional, so a length mismatch misaligns
@@ -4033,7 +4032,7 @@ impl OptUnroll {
         // before `produce_op` runs; majit must allocate the result OpRef
         // with the typed allocator so `opref_type` resolution doesn't
         // depend on a downstream type-registration patch.
-        let mut result_map: majit_ir::VecMap<OpRef, OpRef> = majit_ir::VecMap::new();
+        let mut result_map: indexmap::IndexMap<OpRef, OpRef> = indexmap::IndexMap::new();
         for (source, produced) in &exported_state.short_boxes {
             let result_type = produced.preamble_op.result_type();
             let result = match produced.kind {
@@ -4087,7 +4086,7 @@ impl OptUnroll {
                 result_map.insert(*source, result);
             }
         }
-        let mut imported_constants: majit_ir::VecMap<OpRef, OpRef> = majit_ir::VecMap::new();
+        let mut imported_constants: indexmap::IndexMap<OpRef, OpRef> = indexmap::IndexMap::new();
         let from_short_boxes = ctx.initialize_imported_short_preamble_builder_from_short_boxes(
             &short_args,
             &exported_state.short_inputargs,
@@ -4114,7 +4113,7 @@ impl OptUnroll {
         // `Some(source)` (Phase 1 OpRef = `self.res`); for invented Pure the
         // value is the body-visible OpRef per `replay_pos` in
         // `initialize_imported_short_preamble_builder_from_short_boxes`.
-        let mut produced_results: majit_ir::VecMap<OpRef, OpRef> = majit_ir::VecMap::new();
+        let mut produced_results: indexmap::IndexMap<OpRef, OpRef> = indexmap::IndexMap::new();
         for (_, produced) in &exported_state.short_boxes {
             let produced_result = produced.produce_op(
                 ctx,
@@ -4164,7 +4163,7 @@ impl OptUnroll {
         opref: OpRef,
         ctx: &OptContext,
         exported_int_bounds: Option<
-            &majit_ir::VecMap<majit_ir::operand::Operand, crate::optimizeopt::intutils::IntBound>,
+            &indexmap::IndexMap<majit_ir::operand::Operand, crate::optimizeopt::intutils::IntBound>,
         >,
     ) -> Option<crate::optimizeopt::info::OpInfo> {
         use crate::optimizeopt::info::{FloatConstInfo, OpInfo, PtrInfo};
@@ -4257,7 +4256,7 @@ impl OptUnroll {
         &self,
         opref: OpRef,
         info: &crate::optimizeopt::info::OpInfo,
-        exported_infos: &majit_ir::VecMap<
+        exported_infos: &indexmap::IndexMap<
             majit_ir::operand::Operand,
             crate::optimizeopt::info::OpInfo,
         >,
@@ -4274,7 +4273,7 @@ pub(crate) fn export_state(
     optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
     ctx: &mut OptContext,
     exported_int_bounds: Option<
-        &majit_ir::VecMap<majit_ir::operand::Operand, crate::optimizeopt::intutils::IntBound>,
+        &indexmap::IndexMap<majit_ir::operand::Operand, crate::optimizeopt::intutils::IntBound>,
     >,
 ) -> ExportedState {
     OptUnroll::new().export_state_with_bounds(
@@ -4611,8 +4610,8 @@ fn assemble_peeled_trace_with_jump_args(
     // typed variants from `inputarg_types` so this set's OpRefs match the
     // typed mints used at trace start / Phase 2 import under variant-aware
     // Eq.
-    let preamble_defs: majit_ir::vec_set::VecSet<OpRef> = {
-        let mut s: majit_ir::vec_set::VecSet<OpRef> = (0..body_num_inputs)
+    let preamble_defs: indexmap::IndexSet<OpRef> = {
+        let mut s: indexmap::IndexSet<OpRef> = (0..body_num_inputs)
             .map(|i| {
                 let pos = inputarg_base + i as u32;
                 // history.py:220 box.type / resoperation.py:719/727/739
@@ -4689,8 +4688,7 @@ fn assemble_peeled_trace_with_jump_args(
     // OpRef can be appended directly to full_label_args — the JUMP's
     // mapped_base_args path picks up the corresponding fresh value on the
     // next iteration. The filter only needs to skip filtered_extra_jump_args.
-    let mut carried_source_slots: majit_ir::vec_set::VecSet<OpRef> =
-        majit_ir::vec_set::VecSet::new();
+    let mut carried_source_slots: indexmap::IndexSet<OpRef> = indexmap::IndexSet::new();
     carried_source_slots.extend(filtered_extra_jump_args.iter().copied());
     // `label_set` tracks which OpRefs are already carried by the label so
     // that the body-use-before-def pass doesn't add the same OpRef twice
@@ -4700,10 +4698,10 @@ fn assemble_peeled_trace_with_jump_args(
     // is NOT the Issue 1 dedup — which drops distinct Boxes that happen
     // to share an OpRef — it is RPython parity: the same Box appears
     // once in the label arglist.
-    let mut label_set: majit_ir::vec_set::VecSet<OpRef> = full_label_args.iter().copied().collect();
+    let mut label_set: indexmap::IndexSet<OpRef> = full_label_args.iter().copied().collect();
     let mut fallthrough_aliases = Vec::new();
     {
-        let mut seen_body_defs = majit_ir::vec_set::VecSet::new();
+        let mut seen_body_defs = indexmap::IndexSet::new();
         for op in p2_ops {
             // compile.py assembles the loop LABEL from `label_op` plus
             // short-preamble `used_boxes`; the terminal JUMP's target-local
@@ -4825,10 +4823,10 @@ fn assemble_peeled_trace_with_jump_args(
     );
     // Keyed lookup only (`get`/`insert`, never iterated — codegen order comes
     // from the `p2_ops` walk below), so a hash map keeps each per-op remap O(1)
-    // instead of the VecMap linear `get_index_of` scan on long peeled traces.
+    // instead of the IndexMap linear `get_index_of` scan on long peeled traces.
     let mut body_result_remap: std::collections::HashMap<OpRef, OpRef> =
         std::collections::HashMap::new();
-    let visible_before_label: majit_ir::vec_set::VecSet<OpRef> = full_label_args
+    let visible_before_label: indexmap::IndexSet<OpRef> = full_label_args
         .iter()
         .copied()
         .chain(preamble_defs.iter().copied())
@@ -4893,10 +4891,9 @@ fn assemble_peeled_trace_with_jump_args(
         }
     }
 
-    let mut seen_body_defs = majit_ir::vec_set::VecSet::new();
+    let mut seen_body_defs = indexmap::IndexSet::new();
     let mut current_inner_label_index: Option<usize> = None;
-    let mut defs_since_inner_label: majit_ir::vec_set::VecSet<OpRef> =
-        majit_ir::vec_set::VecSet::new();
+    let mut defs_since_inner_label: indexmap::IndexSet<OpRef> = indexmap::IndexSet::new();
     // Combined-trace position → emitted clone, so remap hits bind to the
     // body clone producer instead of re-minting a position-only box (SSA:
     // a remapped arg's target clone was pushed in an earlier iteration).
@@ -4917,8 +4914,8 @@ fn assemble_peeled_trace_with_jump_args(
         let remap_body_arg = |arg: OpRef,
                               assembly_alias_remap: &std::collections::HashMap<OpRef, OpRef>,
                               body_result_remap: &std::collections::HashMap<OpRef, OpRef>,
-                              seen_body_defs: &majit_ir::vec_set::VecSet<OpRef>,
-                              visible_before_label: &majit_ir::vec_set::VecSet<OpRef>|
+                              seen_body_defs: &indexmap::IndexSet<OpRef>,
+                              visible_before_label: &indexmap::IndexSet<OpRef>|
          -> OpRef {
             if let Some(&mapped) = assembly_alias_remap.get(&arg) {
                 return mapped;
@@ -4960,10 +4957,10 @@ fn assemble_peeled_trace_with_jump_args(
             }
         }
         if new_op.opcode == OpCode::Label {
-            let mut seen_after_label_defs = majit_ir::vec_set::VecSet::new();
+            let mut seen_after_label_defs = indexmap::IndexSet::new();
             let mut extra_inner_sources = Vec::new();
-            let mut extra_inner_set = majit_ir::vec_set::VecSet::new();
-            let label_arg_set: majit_ir::vec_set::VecSet<OpRef> = original_args
+            let mut extra_inner_set = indexmap::IndexSet::new();
+            let label_arg_set: indexmap::IndexSet<OpRef> = original_args
                 .iter()
                 .copied()
                 .filter(|arg| !arg.is_none())
@@ -5180,7 +5177,7 @@ fn assemble_peeled_trace_with_jump_args(
                 extra_live_args.push(arg);
             }
             if !extra_live_args.is_empty() {
-                let existing: majit_ir::vec_set::VecSet<OpRef> = result[label_idx]
+                let existing: indexmap::IndexSet<OpRef> = result[label_idx]
                     .getarglist()
                     .iter()
                     .map(|a| a.to_opref())
@@ -5309,7 +5306,11 @@ impl OptUnroll {
     /// closes that collision and lets the Box.type invariant enforce
     /// itself uniformly at `emit()` / `emit_extra()` /
     /// `propagate_from_pass_range`.
-    fn peel_iteration(&self, jump_op: &Op, ctx: &mut OptContext) -> majit_ir::VecMap<OpRef, OpRef> {
+    fn peel_iteration(
+        &self,
+        jump_op: &Op,
+        ctx: &mut OptContext,
+    ) -> indexmap::IndexMap<OpRef, OpRef> {
         // First pass: reserve peeled-iteration positions, tagged with each
         // source op's result type ( `OpRef.ty()`
         // matches RPython's `box.type` at allocation time).
@@ -5318,7 +5319,7 @@ impl OptUnroll {
             .iter()
             .map(|op| ctx.reserve_pos_typed(op.result_type()))
             .collect();
-        let mut ref_map: majit_ir::VecMap<OpRef, OpRef> = majit_ir::VecMap::new();
+        let mut ref_map: indexmap::IndexMap<OpRef, OpRef> = indexmap::IndexMap::new();
         for (op, &new_pos) in self.buffer.iter().zip(peeled_positions.iter()) {
             ref_map.insert(op.pos.get(), new_pos);
         }
@@ -5368,7 +5369,7 @@ impl OptUnroll {
             .iter()
             .map(|op| ctx.reserve_pos_typed(op.result_type()))
             .collect();
-        let mut orig_ref_map: majit_ir::VecMap<OpRef, OpRef> = majit_ir::VecMap::new();
+        let mut orig_ref_map: indexmap::IndexMap<OpRef, OpRef> = indexmap::IndexMap::new();
         for (op, &new_pos) in self.buffer.iter().zip(body_positions.iter()) {
             orig_ref_map.insert(op.pos.get(), new_pos);
         }
@@ -5425,7 +5426,7 @@ fn fresh_snapshot_key(ctx: &OptContext) -> i32 {
 
 fn remap_snapshot_boxes(
     boxes: &[SnapshotBox],
-    ref_map: &majit_ir::VecMap<OpRef, OpRef>,
+    ref_map: &indexmap::IndexMap<OpRef, OpRef>,
 ) -> Vec<SnapshotBox> {
     boxes
         .iter()
@@ -5436,7 +5437,7 @@ fn remap_snapshot_boxes(
 fn clone_guard_snapshot_remapped(
     ctx: &mut OptContext,
     guard: &mut Op,
-    ref_map: &majit_ir::VecMap<OpRef, OpRef>,
+    ref_map: &indexmap::IndexMap<OpRef, OpRef>,
 ) {
     let old_pos = guard.rd_resume_position.get();
     if old_pos < 0 {
@@ -5569,7 +5570,7 @@ mod tests {
                 Operand::from_opref(OpRef::const_int(3)),
             ],
             crate::optimizeopt::virtualstate::VirtualState::new(Vec::new()),
-            majit_ir::VecMap::new(),
+            indexmap::IndexMap::new(),
             Vec::new(),
             vec![OpRef::int_op(14)],
             vec![OpRef::int_op(23)],
@@ -5793,12 +5794,12 @@ mod tests {
         let new = GcRef(0x2222_0000);
         let old_ref = OpRef::const_ptr(old);
         let new_ref = OpRef::const_ptr(new);
-        let mut exported_infos = majit_ir::VecMap::new();
+        let mut exported_infos = indexmap::IndexMap::new();
         exported_infos.insert(
             Operand::from_opref(old_ref),
             OpInfo::ptr(PtrInfo::Constant(old)),
         );
-        let mut short_box_const_values = majit_ir::VecMap::new();
+        let mut short_box_const_values = indexmap::IndexMap::new();
         short_box_const_values.insert(old_ref, Value::Ref(old));
         let mut constants = majit_ir::ConstMap::new();
         constants.insert(0, majit_ir::Const::Ref(old));
@@ -6501,8 +6502,8 @@ mod tests {
         use crate::optimizeopt::intutils::IntBound;
 
         let mut ctx = crate::optimizeopt::OptContext::with_num_inputs(4, 0);
-        let mut exported_bounds: majit_ir::VecMap<majit_ir::operand::Operand, IntBound> =
-            majit_ir::VecMap::new();
+        let mut exported_bounds: indexmap::IndexMap<majit_ir::operand::Operand, IntBound> =
+            indexmap::IndexMap::new();
         // Bind the export-input position at its source (a forced end-arg is a
         // bound box in production); virtualstate.py:711-720 create_state
         // receives real AbstractValues.
@@ -6810,7 +6811,7 @@ mod tests {
             vec![source],
             vec![source_box.clone()],
             crate::optimizeopt::virtualstate::VirtualState::new(Vec::new()),
-            majit_ir::VecMap::new(),
+            indexmap::IndexMap::new(),
             vec![crate::optimizeopt::shortpreamble::PreambleOp {
                 op: {
                     let mut op = Op::new(OpCode::CallLoopinvariantI, &[Operand::from_opref(func)]);

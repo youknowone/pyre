@@ -6,7 +6,7 @@
 
 use majit_ir::{Op, OpRef};
 
-use majit_ir::VecMap;
+use indexmap::IndexMap;
 
 /// version.py:9-86: LoopVersionInfo(BasicLoopInfo)
 ///
@@ -17,7 +17,7 @@ pub struct LoopVersionInfo {
     /// version.py:19 — ordered list of fail indices for tracked guards.
     pub descrs: Vec<u32>,
     /// version.py:20 — maps fail_index → LoopVersion.
-    pub leads_to: VecMap<u32, LoopVersion>,
+    pub leads_to: IndexMap<u32, LoopVersion>,
     /// version.py:21 — insertion index for track(). -1 means append.
     insert_index: i32,
     /// version.py:22 — compiled loop versions.
@@ -29,7 +29,7 @@ impl LoopVersionInfo {
     pub fn new() -> Self {
         LoopVersionInfo {
             descrs: Vec::new(),
-            leads_to: VecMap::new(),
+            leads_to: IndexMap::new(),
             insert_index: -1,
             versions: Vec::new(),
         }

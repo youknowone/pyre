@@ -12,6 +12,7 @@
 //! through `Arc<dyn Descr>` shared ownership; the only structural
 //! difference vs upstream is the use of cells, not a separate module.
 
+use indexmap::{IndexMap, IndexSet};
 use std::cell::UnsafeCell;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -262,7 +263,7 @@ impl<'a> CompileData<'a> {
 pub struct PreambleCompileData<'a> {
     pub base: CompileData<'a>,
     pub runtime_boxes: &'a [OpRef],
-    pub call_pure_results: &'a majit_ir::VecMap<Vec<Value>, Value>,
+    pub call_pure_results: &'a indexmap::IndexMap<Vec<Value>, Value>,
     pub enable_opts: &'a [String],
 }
 
@@ -270,7 +271,7 @@ impl<'a> PreambleCompileData<'a> {
     pub fn new(
         trace: &'a TreeLoop,
         runtime_boxes: &'a [OpRef],
-        call_pure_results: &'a majit_ir::VecMap<Vec<Value>, Value>,
+        call_pure_results: &'a indexmap::IndexMap<Vec<Value>, Value>,
         enable_opts: &'a [String],
     ) -> Self {
         Self {
@@ -286,7 +287,7 @@ impl<'a> PreambleCompileData<'a> {
 pub struct SimpleCompileData<'a> {
     pub base: CompileData<'a>,
     pub resumestorage: Option<&'a ResumeStorage>,
-    pub call_pure_results: &'a majit_ir::VecMap<Vec<Value>, Value>,
+    pub call_pure_results: &'a indexmap::IndexMap<Vec<Value>, Value>,
     pub enable_opts: &'a [String],
 }
 
@@ -294,7 +295,7 @@ impl<'a> SimpleCompileData<'a> {
     pub fn new(
         trace: &'a TreeLoop,
         resumestorage: Option<&'a ResumeStorage>,
-        call_pure_results: &'a majit_ir::VecMap<Vec<Value>, Value>,
+        call_pure_results: &'a indexmap::IndexMap<Vec<Value>, Value>,
         enable_opts: &'a [String],
     ) -> Self {
         Self {
@@ -311,7 +312,7 @@ pub struct BridgeCompileData<'a> {
     pub base: CompileData<'a>,
     pub runtime_boxes: &'a [OpRef],
     pub resumestorage: Option<&'a ResumeStorage>,
-    pub call_pure_results: &'a majit_ir::VecMap<Vec<Value>, Value>,
+    pub call_pure_results: &'a indexmap::IndexMap<Vec<Value>, Value>,
     pub inline_short_preamble: bool,
     pub enable_opts: &'a [String],
 }
@@ -321,7 +322,7 @@ impl<'a> BridgeCompileData<'a> {
         trace: &'a TreeLoop,
         runtime_boxes: &'a [OpRef],
         resumestorage: Option<&'a ResumeStorage>,
-        call_pure_results: &'a majit_ir::VecMap<Vec<Value>, Value>,
+        call_pure_results: &'a indexmap::IndexMap<Vec<Value>, Value>,
         inline_short_preamble: bool,
         enable_opts: &'a [String],
     ) -> Self {
@@ -341,7 +342,7 @@ pub struct UnrolledLoopData<'a> {
     pub base: CompileData<'a>,
     pub celltoken: &'a Arc<JitCellToken>,
     pub state: &'a crate::optimizeopt::unroll::ExportedState,
-    pub call_pure_results: &'a majit_ir::VecMap<Vec<Value>, Value>,
+    pub call_pure_results: &'a indexmap::IndexMap<Vec<Value>, Value>,
     pub enable_opts: &'a [String],
 }
 
@@ -350,7 +351,7 @@ impl<'a> UnrolledLoopData<'a> {
         trace: &'a TreeLoop,
         celltoken: &'a Arc<JitCellToken>,
         state: &'a crate::optimizeopt::unroll::ExportedState,
-        call_pure_results: &'a majit_ir::VecMap<Vec<Value>, Value>,
+        call_pure_results: &'a indexmap::IndexMap<Vec<Value>, Value>,
         enable_opts: &'a [String],
     ) -> Self {
         Self {
@@ -375,12 +376,12 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
     ops: &[T],
     pc: u64,
 ) -> (
-    majit_ir::VecMap<u32, crate::resume::ResumeLayoutSummary>,
-    majit_ir::VecMap<u32, StoredExitLayout>,
+    indexmap::IndexMap<u32, crate::resume::ResumeLayoutSummary>,
+    indexmap::IndexMap<u32, StoredExitLayout>,
 ) {
-    let mut result: majit_ir::VecMap<u32, crate::resume::ResumeLayoutSummary> =
-        majit_ir::VecMap::new();
-    let mut exit_layouts: majit_ir::VecMap<u32, StoredExitLayout> = majit_ir::VecMap::new();
+    let mut result: indexmap::IndexMap<u32, crate::resume::ResumeLayoutSummary> =
+        indexmap::IndexMap::new();
+    let mut exit_layouts: indexmap::IndexMap<u32, StoredExitLayout> = indexmap::IndexMap::new();
     let mut fail_index = 0u32;
     let mut resume_memo = ResumeDataLoopMemo::new();
     // history.py:220/261/307 — each fail-arg's type is intrinsic on the Box
@@ -1081,7 +1082,7 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
 }
 
 pub(crate) fn merge_backend_exit_layouts<T: AsRef<majit_ir::Op>>(
-    exit_layouts: &mut majit_ir::VecMap<u32, StoredExitLayout>,
+    exit_layouts: &mut indexmap::IndexMap<u32, StoredExitLayout>,
     backend_layouts: &[FailDescrLayout],
     ops: &[T],
 ) {
@@ -1199,7 +1200,7 @@ pub(crate) fn merge_backend_exit_layouts<T: AsRef<majit_ir::Op>>(
 /// Guards that HAVE recovery_layout (all production guards after backend
 /// merge) must satisfy the full invariant. Guards without (only possible
 /// in unit tests with mock backends) are warned but not fatal.
-pub(crate) fn validate_exit_layouts(exit_layouts: &majit_ir::VecMap<u32, StoredExitLayout>) {
+pub(crate) fn validate_exit_layouts(exit_layouts: &indexmap::IndexMap<u32, StoredExitLayout>) {
     for (&fail_index, layout) in exit_layouts {
         if layout.resolve_is_finish() {
             continue;
@@ -1403,7 +1404,7 @@ pub(crate) fn enrich_resume_layout_with_frame_stack(
 }
 
 pub(crate) fn merge_backend_terminal_exit_layouts<T: AsRef<majit_ir::Op>>(
-    terminal_exit_layouts: &mut majit_ir::VecMap<usize, StoredExitLayout>,
+    terminal_exit_layouts: &mut indexmap::IndexMap<usize, StoredExitLayout>,
     backend_layouts: &[TerminalExitLayout],
     ops: &[T],
 ) {
@@ -1614,8 +1615,8 @@ pub(crate) fn infer_terminal_exit_layout<T: AsRef<majit_ir::Op>>(
 pub(crate) fn build_terminal_exit_layouts<T: AsRef<majit_ir::Op>>(
     inputargs: &[InputArg],
     ops: &[T],
-) -> majit_ir::VecMap<usize, StoredExitLayout> {
-    let mut layouts: majit_ir::VecMap<usize, StoredExitLayout> = majit_ir::VecMap::new();
+) -> indexmap::IndexMap<usize, StoredExitLayout> {
+    let mut layouts: indexmap::IndexMap<usize, StoredExitLayout> = indexmap::IndexMap::new();
     for (op_index, op) in ops.iter().enumerate() {
         let op = op.as_ref();
         if op.opcode != OpCode::Finish && op.opcode != OpCode::Jump {
@@ -1704,7 +1705,7 @@ pub(crate) fn normalize_closing_jump_args(
         return ops;
     };
 
-    let defined: majit_ir::vec_set::VecSet<OpRef> = ops
+    let defined: indexmap::IndexSet<OpRef> = ops
         .iter()
         .filter(|op| op.result_type() != majit_ir::Type::Void && !op.pos.get().is_none())
         .map(|op| op.pos.get())
@@ -2179,8 +2180,8 @@ pub(crate) fn strip_stray_overflow_guards(ops: Vec<majit_ir::OpRc>) -> Vec<majit
 }
 
 pub(crate) fn enrich_guard_resume_layouts_for_trace(
-    resume_layouts: &mut majit_ir::VecMap<u32, crate::resume::ResumeLayoutSummary>,
-    exit_layouts: &mut majit_ir::VecMap<u32, StoredExitLayout>,
+    resume_layouts: &mut indexmap::IndexMap<u32, crate::resume::ResumeLayoutSummary>,
+    exit_layouts: &mut indexmap::IndexMap<u32, StoredExitLayout>,
     trace_id: u64,
     inputargs: &[InputArg],
     trace_info: Option<&CompiledTraceInfo>,
@@ -2203,7 +2204,7 @@ pub(crate) fn enrich_guard_resume_layouts_for_trace(
 }
 
 pub(crate) fn patch_guard_recovery_layouts_for_trace(
-    exit_layouts: &mut majit_ir::VecMap<u32, StoredExitLayout>,
+    exit_layouts: &mut indexmap::IndexMap<u32, StoredExitLayout>,
 ) {
     // Backend no longer caches a per-descr recovery layout; the
     // metainterp's `StoredExitLayout.recovery_layout` cache is the
@@ -2225,7 +2226,7 @@ pub(crate) fn patch_backend_terminal_recovery_layouts_for_trace(
     backend: &mut dyn majit_backend::Backend,
     token: &majit_backend::JitCellToken,
     trace_id: u64,
-    terminal_exit_layouts: &mut majit_ir::VecMap<usize, StoredExitLayout>,
+    terminal_exit_layouts: &mut indexmap::IndexMap<usize, StoredExitLayout>,
 ) {
     for (&op_index, exit_layout) in terminal_exit_layouts.iter_mut() {
         let Some(resume_layout) = exit_layout.resume_layout.as_ref() else {

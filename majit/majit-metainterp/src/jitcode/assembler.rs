@@ -3,6 +3,7 @@
 /// RPython codewriter/assembler.py: assembler that emits bytecodes into a
 /// JitCode object. This remains in metainterp only as transitional pyre ABI
 /// glue until callers consume `majit_translate::assembler::Assembler`.
+use indexmap::{IndexMap, IndexSet};
 use std::cmp::max;
 
 use majit_backend::JitCellToken;
@@ -30,13 +31,13 @@ pub struct JitCodeBuilder {
     /// against runtime-emitted bytecode.  Recording happens through
     /// `start_instr` / `write_insn`; every helper that pushes an opcode
     /// byte goes through one of those.
-    startpoints: majit_ir::vec_set::VecSet<usize>,
+    startpoints: indexmap::IndexSet<usize>,
     /// RPython `assembler.py:176` `self.alllabels.add(len(self.code))` —
     /// every TLabel emit records the bytecode offset of the 2-byte
     /// label slot so `JitCode.follow_jump` (RPython `jitcode.py:108-109`)
     /// can fire its non-translated `assert position in self._alllabels`
     /// debug check.  Populated by `push_label_ref`.
-    alllabels: majit_ir::vec_set::VecSet<usize>,
+    alllabels: indexmap::IndexSet<usize>,
     num_regs_i: u16,
     num_regs_r: u16,
     num_regs_f: u16,
@@ -93,7 +94,7 @@ pub struct JitCodeBuilder {
     /// different trace wrappers that share a concrete function pointer.
     /// Drained into `JitCodeExecState.call_descr_to_call_target` at
     /// `finish()`.
-    call_descr_to_call_target: majit_ir::VecMap<u16, JitCallTarget>,
+    call_descr_to_call_target: indexmap::IndexMap<u16, JitCallTarget>,
     /// RPython `jitcode.py:47 self._resulttypes = resulttypes` —
     /// per-instruction result-kind char keyed by end-of-instruction
     /// position (`assembler.py:217-219`).  Consumed by
@@ -105,7 +106,7 @@ pub struct JitCodeBuilder {
     /// — pyre's encoding writes operands AFTER the opcode byte, so
     /// `self.code.len()` after the last `push_u*` call equals the
     /// end-of-instruction position the reader sees as `frame.pc`.
-    resulttypes: majit_ir::VecMap<usize, char>,
+    resulttypes: indexmap::IndexMap<usize, char>,
     /// Pending result-kind for a generic `write_insn("...>X")` call.
     /// RPython records the kind after all operands have been emitted
     /// (`assembler.py:217-219`).  In this builder the opcode helper
@@ -5283,7 +5284,7 @@ mod tests {
     }
 
     fn run_switch_blackhole(input: i64) -> i64 {
-        let mut entries: majit_ir::VecMap<String, u8> = majit_ir::VecMap::new();
+        let mut entries: indexmap::IndexMap<String, u8> = indexmap::IndexMap::new();
         entries.insert("switch/id".to_string(), jitcode::insns::BC_SWITCH);
         entries.insert("int_copy/i>i".to_string(), jitcode::insns::BC_MOVE_I);
         entries.insert("int_return/i".to_string(), jitcode::insns::BC_INT_RETURN);

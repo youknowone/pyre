@@ -6,6 +6,7 @@
 //!
 //! This is the RPython equivalent of `rpython/jit/metainterp/resume.py`.
 
+use indexmap::{IndexMap, IndexSet};
 use std::cell::UnsafeCell;
 use std::sync::Arc;
 
@@ -91,7 +92,7 @@ pub const TAG_CONST_OFFSET: i32 = 0;
 /// canonical [`Operand`](majit_ir::operand::Operand) (`Rc::ptr_eq` on the
 /// producer = PyPy `box is box`), the faithful port of the dict-by-`is` —
 /// `Operand` IS the box object `resume.py liveboxes` stores; the no-HashMap
-/// house rule keeps the `VecMap` backing (linear scan, dict-assignment
+/// house rule keeps the `IndexMap` backing (linear scan, dict-assignment
 /// semantics, preserved insertion order). Two reaches of one logical box
 /// resolve to one producer Rc (via `from_bound_op`/`from_bound_inputarg`) and
 /// collapse to one key; distinct boxes — e.g. an `InputArg` vs a `ResOp`
@@ -106,13 +107,13 @@ pub const TAG_CONST_OFFSET: i32 = 0;
 /// debug builds rather than silently producing an out-of-RPython-shape
 /// numbering state.
 pub struct LiveboxMap {
-    entries: majit_ir::VecMap<majit_ir::operand::Operand, i16>,
+    entries: indexmap::IndexMap<majit_ir::operand::Operand, i16>,
 }
 
 impl LiveboxMap {
     pub fn new() -> Self {
         Self {
-            entries: majit_ir::VecMap::new(),
+            entries: indexmap::IndexMap::new(),
         }
     }
 
@@ -166,7 +167,7 @@ pub struct NumberingState {
     /// raw u32 — pyre's flat-OpRef stand-in for PyPy's `box is box`
     /// identity. See `LiveboxMap` (resume.rs:98) for the matching
     /// typed-key convention.
-    pub livebox_types: majit_ir::VecMap<majit_ir::OpRef, majit_ir::Type>,
+    pub livebox_types: indexmap::IndexMap<majit_ir::OpRef, majit_ir::Type>,
 }
 
 impl NumberingState {
@@ -176,7 +177,7 @@ impl NumberingState {
             liveboxes: LiveboxMap::new(),
             num_boxes: 0,
             num_virtuals: 0,
-            livebox_types: majit_ir::VecMap::new(),
+            livebox_types: indexmap::IndexMap::new(),
         }
     }
     pub fn append_short(&mut self, item: i16) {
@@ -401,26 +402,26 @@ pub use majit_ir::BoxEnv;
 /// Simple BoxEnv implementation backed by constant/type associative containers.
 /// Used in tests and for simple snapshot numbering.
 pub struct SimpleBoxEnv {
-    pub constants: majit_ir::VecMap<u32, (i64, majit_ir::Type)>,
-    pub replacements: majit_ir::VecMap<u32, majit_ir::OpRef>,
-    pub types: majit_ir::VecMap<u32, majit_ir::Type>,
-    pub virtuals: majit_ir::vec_set::VecSet<u32>,
-    pub virtual_fields: majit_ir::VecMap<u32, majit_ir::VirtualFieldsInfo>,
+    pub constants: indexmap::IndexMap<u32, (i64, majit_ir::Type)>,
+    pub replacements: indexmap::IndexMap<u32, majit_ir::OpRef>,
+    pub types: indexmap::IndexMap<u32, majit_ir::Type>,
+    pub virtuals: indexmap::IndexSet<u32>,
+    pub virtual_fields: indexmap::IndexMap<u32, majit_ir::VirtualFieldsInfo>,
     /// #160/S11: one canonical box `Operand` per replacement-walked OpRef. This
     /// env holds no producer Ops, so it memoizes here to give `Rc::ptr_eq` dedup
     /// parity with production (where `from_bound_op` memoizes on the Op).
-    box_cache: std::cell::RefCell<majit_ir::VecMap<majit_ir::OpRef, majit_ir::operand::Operand>>,
+    box_cache: std::cell::RefCell<indexmap::IndexMap<majit_ir::OpRef, majit_ir::operand::Operand>>,
 }
 
 impl SimpleBoxEnv {
     pub fn new() -> Self {
         SimpleBoxEnv {
-            constants: majit_ir::VecMap::new(),
-            replacements: majit_ir::VecMap::new(),
-            types: majit_ir::VecMap::new(),
-            virtuals: majit_ir::vec_set::VecSet::new(),
-            virtual_fields: majit_ir::VecMap::new(),
-            box_cache: std::cell::RefCell::new(majit_ir::VecMap::new()),
+            constants: indexmap::IndexMap::new(),
+            replacements: indexmap::IndexMap::new(),
+            types: indexmap::IndexMap::new(),
+            virtuals: indexmap::IndexSet::new(),
+            virtual_fields: indexmap::IndexMap::new(),
+            box_cache: std::cell::RefCell::new(indexmap::IndexMap::new()),
         }
     }
 }
@@ -1994,7 +1995,7 @@ impl EncodedResumeData {
         let mut rd_numb = Vec::new();
         // resume.py:138 numb_state.liveboxes — compact TAGBOX numbering state.
         let mut liveboxes: Vec<usize> = Vec::new();
-        let mut box_map: majit_ir::VecMap<usize, usize> = majit_ir::VecMap::new();
+        let mut box_map: indexmap::IndexMap<usize, usize> = indexmap::IndexMap::new();
 
         // resume.py:234-235: reserve slots for items_resume_section and count.
         rd_numb.push(0); // [0] = items_resume_section (patched later)
@@ -3170,15 +3171,15 @@ pub struct ResumeDataLoopMemo {
     /// We store (value, type) pairs to preserve type information.
     consts: Vec<majit_ir::Const>,
     /// resume.py:148 — large integers (outside TAGINT range) → tagged const.
-    large_ints: majit_ir::VecMap<i64, i16>,
+    large_ints: indexmap::IndexMap<i64, i16>,
     /// resume.py:149 — ref pointers → tagged const.
-    refs: majit_ir::VecMap<i64, i16>,
+    refs: indexmap::IndexMap<i64, i16>,
     /// resume.py:147 self.consts — constant pool for encode_shared.
     /// Becomes storage.rd_consts (resume.py:467).
     ///
     /// resume.py:150-151 — cached box/virtual numbering.
-    pub cached_boxes: majit_ir::VecMap<majit_ir::operand::Operand, i32>,
-    pub cached_virtuals: majit_ir::VecMap<majit_ir::operand::Operand, i32>,
+    pub cached_boxes: indexmap::IndexMap<majit_ir::operand::Operand, i32>,
+    pub cached_virtuals: indexmap::IndexMap<majit_ir::operand::Operand, i32>,
     /// resume.py:153-155 — statistics.
     pub nvirtuals: usize,
     pub nvholes: usize,
@@ -3189,10 +3190,10 @@ impl ResumeDataLoopMemo {
     pub fn new() -> Self {
         ResumeDataLoopMemo {
             consts: Vec::new(),
-            large_ints: majit_ir::VecMap::new(),
-            refs: majit_ir::VecMap::new(),
-            cached_boxes: majit_ir::VecMap::new(),
-            cached_virtuals: majit_ir::VecMap::new(),
+            large_ints: indexmap::IndexMap::new(),
+            refs: indexmap::IndexMap::new(),
+            cached_boxes: indexmap::IndexMap::new(),
+            cached_virtuals: indexmap::IndexMap::new(),
             nvirtuals: 0,
             nvholes: 0,
             nvreused: 0,
@@ -3212,7 +3213,7 @@ impl ResumeDataLoopMemo {
         &mut self,
         source: &ResumeValueSource,
         liveboxes: &mut Vec<usize>,
-        box_map: &mut majit_ir::VecMap<usize, usize>,
+        box_map: &mut indexmap::IndexMap<usize, usize>,
     ) -> i64 {
         match source {
             // resume.py:214-224: new box → liveboxes[box] = tag(num_boxes, TAGBOX)
@@ -3516,7 +3517,7 @@ impl ResumeDataLoopMemo {
         &mut self,
         liveboxes: &mut Vec<Option<majit_ir::OpRef>>,
         new_liveboxes: &mut LiveboxMap,
-        virtual_fields: &majit_ir::VecMap<majit_ir::OpRef, majit_ir::VirtualFieldsInfo>,
+        virtual_fields: &indexmap::IndexMap<majit_ir::OpRef, majit_ir::VirtualFieldsInfo>,
         num_env_virtuals: usize,
         numb_state: &NumberingState,
         env: &dyn majit_ir::BoxEnv,
@@ -4002,7 +4003,7 @@ impl ResumeDataLoopMemo {
         Vec<majit_ir::Const>,
         Vec<std::rc::Rc<majit_ir::RdVirtualInfo>>,
         Vec<majit_ir::OpRef>,
-        majit_ir::VecMap<majit_ir::OpRef, majit_ir::Type>,
+        indexmap::IndexMap<majit_ir::OpRef, majit_ir::Type>,
     ) {
         let num_env_virtuals = numb_state.num_virtuals;
 
@@ -4015,7 +4016,7 @@ impl ResumeDataLoopMemo {
 
         // resume.py:414-426: iterate liveboxes_from_env, discover virtual
         // fields. RPython walks the dict in insertion order; pyre's
-        // `LiveboxMap` is built on `VecMap` (resume.rs:98) so the
+        // `LiveboxMap` is built on `IndexMap` (resume.rs:98) so the
         // `.iter()` sequence already matches that order, which the
         // virtual worklist drain below relies on for byte-identical
         // visitor_walk_recursive sequencing. Sorting by tag would
@@ -4033,8 +4034,8 @@ impl ResumeDataLoopMemo {
         // (resume.py:419-426 visitor_walk_recursive pattern). Keyed by
         // typed OpRef so the same_box (resoperation.py:38) identity is
         // preserved end-to-end through the worklist drain.
-        let mut virtual_fields: majit_ir::VecMap<majit_ir::OpRef, majit_ir::VirtualFieldsInfo> =
-            majit_ir::VecMap::new();
+        let mut virtual_fields: indexmap::IndexMap<majit_ir::OpRef, majit_ir::VirtualFieldsInfo> =
+            indexmap::IndexMap::new();
 
         // resume.py:419-426: visitor_walk_recursive — worklist for nested virtuals.
         let mut virtual_worklist: Vec<majit_ir::OpRef> = Vec::new();
@@ -4279,7 +4280,7 @@ impl ResumeDataLoopMemo {
         let mut rd_numb = Vec::new();
         // resume.py:138 compact TAGBOX numbering state.
         let mut liveboxes: Vec<usize> = Vec::new();
-        let mut box_map: majit_ir::VecMap<usize, usize> = majit_ir::VecMap::new();
+        let mut box_map: indexmap::IndexMap<usize, usize> = indexmap::IndexMap::new();
 
         // resume.py:234-235: reserve slots
         rd_numb.push(0); // [0] = items_resume_section
@@ -4912,24 +4913,24 @@ mod tests {
     fn test_number_boxes_uses_replacement_type_for_virtual_classification() {
         use majit_ir::OpRef;
         struct RefOnlyVirtualEnv {
-            constants: majit_ir::VecMap<u32, (i64, majit_ir::Type)>,
-            replacements: majit_ir::VecMap<u32, majit_ir::OpRef>,
-            types: majit_ir::VecMap<u32, majit_ir::Type>,
-            virtuals: majit_ir::vec_set::VecSet<u32>,
-            virtual_fields: majit_ir::VecMap<u32, majit_ir::VirtualFieldsInfo>,
+            constants: indexmap::IndexMap<u32, (i64, majit_ir::Type)>,
+            replacements: indexmap::IndexMap<u32, majit_ir::OpRef>,
+            types: indexmap::IndexMap<u32, majit_ir::Type>,
+            virtuals: indexmap::IndexSet<u32>,
+            virtual_fields: indexmap::IndexMap<u32, majit_ir::VirtualFieldsInfo>,
             box_cache:
-                std::cell::RefCell<majit_ir::VecMap<majit_ir::OpRef, majit_ir::operand::Operand>>,
+                std::cell::RefCell<indexmap::IndexMap<majit_ir::OpRef, majit_ir::operand::Operand>>,
         }
 
         impl RefOnlyVirtualEnv {
             fn new() -> Self {
                 Self {
-                    constants: majit_ir::VecMap::new(),
-                    replacements: majit_ir::VecMap::new(),
-                    types: majit_ir::VecMap::new(),
-                    virtuals: majit_ir::vec_set::VecSet::new(),
-                    virtual_fields: majit_ir::VecMap::new(),
-                    box_cache: std::cell::RefCell::new(majit_ir::VecMap::new()),
+                    constants: indexmap::IndexMap::new(),
+                    replacements: indexmap::IndexMap::new(),
+                    types: indexmap::IndexMap::new(),
+                    virtuals: indexmap::IndexSet::new(),
+                    virtual_fields: indexmap::IndexMap::new(),
+                    box_cache: std::cell::RefCell::new(indexmap::IndexMap::new()),
                 }
             }
         }

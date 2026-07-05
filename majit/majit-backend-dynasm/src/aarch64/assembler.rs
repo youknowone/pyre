@@ -9,7 +9,8 @@
 ///   _assemble — assembler.py:779 (walk ops + emit code)
 ///   patch_jump_for_descr — assembler.py:965
 ///   redirect_call_assembler — assembler.py:1138
-use majit_ir::{VecMap, VecMapExt};
+use indexmap::IndexMap;
+use majit_ir::VecMapExt;
 use std::sync::Arc;
 
 // aarch64/assembler.py parity: aarch64-only backend.
@@ -224,7 +225,7 @@ pub struct AssemblerARM64<'a> {
 
     // ── State tracking for code generation ──
     /// Maps OpRef → jitframe slot index. `IndexMap` (O(1) get/insert), not the
-    /// Vec-backed `VecMap`: `resolve_opref` reads this per emitted op during
+    /// Vec-backed `IndexMap`: `resolve_opref` reads this per emitted op during
     /// codegen and the sync loop inserts one entry per live var, so a Vec-`get`
     /// is O(n) and makes `_assemble` O(n^2) on large traces — `get_index_of`
     /// inlines into `_assemble` and dominated aheui's logo compile. The box→
@@ -256,7 +257,7 @@ pub struct AssemblerARM64<'a> {
     guard_success_cc: Option<u8>,
     /// x86/assembler.py:93 target_tokens_currently_compiling parity.
     /// Keyed by descriptor pointer identity (PyPy uses Python `is`).
-    target_tokens_currently_compiling: VecMap<usize, DynamicLabel>,
+    target_tokens_currently_compiling: IndexMap<usize, DynamicLabel>,
     compiled_target_tokens: Vec<majit_ir::DescrRef>,
     /// llmodel.py:64-69 self.vtable_offset — typeptr field byte offset.
     /// `None` corresponds to RPython's gcremovetypeptr config.
@@ -264,14 +265,14 @@ pub struct AssemblerARM64<'a> {
     /// llsupport/gc.py:563 vtable→typeid table, materialized by the runner
     /// via gc_ll_descr.get_typeid_from_classptr_if_gcremovetypeptr. Used by
     /// the gcremovetypeptr branch of `_cmp_guard_class`.
-    classptr_to_typeid: VecMap<i64, u32>,
+    classptr_to_typeid: IndexMap<i64, u32>,
     /// TYPE_INFO / CLASSTYPE constants for `GUARD_IS_OBJECT` and
     /// `GUARD_SUBCLASS`, fetched by the runner from the active gc_ll_descr.
     guard_gc_type_info: Option<GuardGcTypeInfo>,
     /// Constant classptr → `(subclassrange_min, subclassrange_max)`, matching
     /// `loc_check_against_class.getint()` field reads in
     /// `aarch64/opassembler.py:695-698`.
-    classptr_to_subclass_range: VecMap<i64, (i64, i64)>,
+    classptr_to_subclass_range: IndexMap<i64, (i64, i64)>,
     /// Dynamic label at the function entry for self-recursive CALL_ASSEMBLER.
     self_entry_label: Option<DynamicLabel>,
     /// Leaked pointer holding the resolved entry address for self-recursive
@@ -280,7 +281,7 @@ pub struct AssemblerARM64<'a> {
     /// assembler.py:320 descr._ll_function_addr parity:
     /// Maps call_target_token → compiled code address for CALL_ASSEMBLER.
     /// Populated by the runner before compilation, from registered loop targets.
-    call_assembler_targets: VecMap<u64, usize>,
+    call_assembler_targets: IndexMap<u64, usize>,
     /// opassembler.py:1177 _finish_gcmap.
     finish_gcmap: Option<*mut usize>,
     /// opassembler.py:1215 gcmap_for_finish.
@@ -411,9 +412,9 @@ impl<'a> AssemblerARM64<'a> {
         header_pc: u64,
         constants: majit_ir::ConstMap<majit_ir::Const>,
         vtable_offset: Option<usize>,
-        classptr_to_typeid: VecMap<i64, u32>,
+        classptr_to_typeid: IndexMap<i64, u32>,
         guard_gc_type_info: Option<GuardGcTypeInfo>,
-        classptr_to_subclass_range: VecMap<i64, (i64, i64)>,
+        classptr_to_subclass_range: IndexMap<i64, (i64, i64)>,
         attached_descrs: crate::guard::AttachedDescrPtrs,
         cpu_handle: crate::guard::CpuDescrHandle,
         inputargs: &'a [InputArg],
@@ -441,7 +442,7 @@ impl<'a> AssemblerARM64<'a> {
             constants,
             next_slot: 0,
             guard_success_cc: None,
-            target_tokens_currently_compiling: VecMap::new(),
+            target_tokens_currently_compiling: IndexMap::new(),
             compiled_target_tokens: Vec::new(),
             vtable_offset,
             classptr_to_typeid,
@@ -449,7 +450,7 @@ impl<'a> AssemblerARM64<'a> {
             classptr_to_subclass_range,
             self_entry_label: None,
             self_entry_addr_ptr: Box::into_raw(Box::new(0usize)),
-            call_assembler_targets: VecMap::new(),
+            call_assembler_targets: IndexMap::new(),
             finish_gcmap: None,
             gcmap_for_finish: {
                 let gcmap = allocate_gcmap(1, JITFRAME_FIXED_SIZE);
@@ -773,7 +774,7 @@ impl<'a> AssemblerARM64<'a> {
 
     fn remap_frame_layout(&mut self, src_locations: &[Loc], dst_locations: &[Loc], tmpreg: Loc) {
         let mut pending_dests = dst_locations.len() as i32;
-        let mut srccount: VecMap<i32, i32> = VecMap::new();
+        let mut srccount: IndexMap<i32, i32> = IndexMap::new();
         for dst in dst_locations {
             srccount.insert(Self::loc_as_key(dst), 0);
         }
@@ -818,7 +819,7 @@ impl<'a> AssemblerARM64<'a> {
                 }
             }
             if !progress {
-                let mut sources: VecMap<i32, Loc> = VecMap::new();
+                let mut sources: IndexMap<i32, Loc> = IndexMap::new();
                 for i in 0..dst_locations.len() {
                     sources.insert(Self::loc_as_key(&dst_locations[i]), src_locations[i]);
                 }
@@ -860,7 +861,7 @@ impl<'a> AssemblerARM64<'a> {
         tmpreg2: Loc,
     ) {
         let mut extrapushes = Vec::new();
-        let mut dst_keys = VecMap::new();
+        let mut dst_keys = IndexMap::new();
         for loc in dst_locations1 {
             dst_keys.insert(Self::loc_as_key(loc), ());
         }
@@ -1788,7 +1789,7 @@ impl<'a> AssemblerARM64<'a> {
 
     /// assembler.py:320 descr._ll_function_addr parity: store
     /// call_target_token → code_addr mappings for CALL_ASSEMBLER.
-    pub fn set_call_assembler_targets(&mut self, targets: VecMap<u64, usize>) {
+    pub fn set_call_assembler_targets(&mut self, targets: IndexMap<u64, usize>) {
         self.call_assembler_targets = targets;
     }
 
@@ -1944,7 +1945,7 @@ impl<'a> AssemblerARM64<'a> {
 
         // RegAlloc keeps the raw `i64` value map; project it from the
         // typed pool at this boundary (each Const carries its own type).
-        let ra_constants: majit_ir::VecMap<u32, i64> = self
+        let ra_constants: indexmap::IndexMap<u32, i64> = self
             .constants
             .iter()
             .map(|(&k, c)| (k, c.as_raw_i64()))
@@ -4691,7 +4692,7 @@ impl<'a> AssemblerARM64<'a> {
         // jump.py:1-64 remap_frame_layout: topological order with
         // cycle breaking via push/pop.
         // srccount[dst] = number of times dst appears as a src
-        let mut srccount: VecMap<i32, i32> = VecMap::new();
+        let mut srccount: IndexMap<i32, i32> = IndexMap::new();
         for m in &moves {
             srccount.entry_or_default(m.1); // ensure dst exists
         }

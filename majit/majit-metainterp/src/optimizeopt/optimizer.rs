@@ -1,7 +1,3 @@
-/// Main optimization driver.
-///
-/// Translated from rpython/jit/metainterp/optimizeopt/optimizer.py.
-/// Chains multiple optimization passes and drives operations through them.
 use crate::optimizeopt::OptContext;
 use crate::optimizeopt::{
     earlyforce::OptEarlyForce,
@@ -12,6 +8,11 @@ use crate::optimizeopt::{
     virtualize::{OptVirtualize, VirtualizableConfig},
     vstring::OptString,
 };
+/// Main optimization driver.
+///
+/// Translated from rpython/jit/metainterp/optimizeopt/optimizer.py.
+/// Chains multiple optimization passes and drives operations through them.
+use indexmap::{IndexMap, IndexSet};
 use majit_ir::operand::Operand;
 use majit_ir::{DescrRef, Op, OpCode, OpRef, Type};
 
@@ -96,7 +97,7 @@ pub trait Optimization {
     /// Only OptPure consumes this; other passes ignore it.
     fn set_call_pure_results(
         &mut self,
-        _results: &majit_ir::VecMap<Vec<majit_ir::Value>, majit_ir::Value>,
+        _results: &indexmap::IndexMap<Vec<majit_ir::Value>, majit_ir::Value>,
     ) {
     }
 
@@ -180,8 +181,8 @@ pub trait Optimization {
         &self,
         _args: &[OpRef],
         _ctx: &OptContext,
-    ) -> majit_ir::VecMap<majit_ir::operand::Operand, IntBound> {
-        majit_ir::VecMap::new()
+    ) -> indexmap::IndexMap<majit_ir::operand::Operand, IntBound> {
+        indexmap::IndexMap::new()
     }
 
     /// optimizer.py: is_virtual(opref)
@@ -317,7 +318,7 @@ pub struct Optimizer {
     /// (via get_constant_box) → result value, carried across
     /// loop iterations so the optimizer can constant-fold repeated
     /// pure calls. RPython uses value-based equality for keys.
-    pub call_pure_results: majit_ir::VecMap<Vec<majit_ir::Value>, majit_ir::Value>,
+    pub call_pure_results: indexmap::IndexMap<Vec<majit_ir::Value>, majit_ir::Value>,
     /// optimizer.py: `_last_guard_op` — tracks the last emitted guard
     /// for guard sharing and descriptor fusion.
     ///
@@ -338,7 +339,7 @@ pub struct Optimizer {
     /// `ctx.resolve_to_operand(op.pos)` so insert and lookup agree on the
     /// canonical producer. Guard ops are never Const, so the key is always a
     /// ptr-stable ResOp producer.
-    replaces_guard: majit_ir::VecMap<majit_ir::operand::Operand, Op>,
+    replaces_guard: indexmap::IndexMap<majit_ir::operand::Operand, Op>,
     /// optimizer.py: `pendingfields` — heap fields that need to be
     /// written back before the next guard (lazy set forcing).
     pendingfields: Vec<Op>,
@@ -483,7 +484,7 @@ pub struct Optimizer {
     /// matches the optional `required_opnum`. The lookup resolves the
     /// queried opref through `ctx.get_box_replacement` so it compares the
     /// same canonical box the insert recorded.
-    pub emitted_operations: majit_ir::vec_set::VecSet<majit_ir::operand::Operand>,
+    pub emitted_operations: indexmap::IndexSet<majit_ir::operand::Operand>,
     /// One-shot explicit `input_ops` seed for the next
     /// `optimize_with_constants_and_inputs_at` run. When `Some`, the
     /// canonical producer `Rc<Op>` slice is used directly as
@@ -495,7 +496,7 @@ pub struct Optimizer {
 }
 
 /// Lower a typed-`Value` constants pool into the dense
-/// `VecMap<u32, Const>` shape consumed by pyre-side guard metadata
+/// `IndexMap<u32, Const>` shape consumed by pyre-side guard metadata
 /// builders, CompiledTrace storage, and the backend's
 /// `set_constants_pool` boundary.
 ///
@@ -903,7 +904,7 @@ impl Optimizer {
         // Non-virtual states advance label_slot without creating entries.
         // Virtual states create entries with fields from label_args.
         // Build a map from inputarg_index to imported_virtual for virtual lookup.
-        let mut iv_map: majit_ir::VecMap<usize, &ImportedVirtual> = majit_ir::VecMap::new();
+        let mut iv_map: indexmap::IndexMap<usize, &ImportedVirtual> = indexmap::IndexMap::new();
         for iv in &self.imported_virtuals {
             iv_map.insert(iv.inputarg_index, iv);
         }
@@ -919,7 +920,7 @@ impl Optimizer {
         // The map value caches the imported Phase 2 OpRef for the first
         // visit so subsequent revisits resolve to the same box (mirroring
         // RPython's setinfo_from_preamble.get_forwarded sharing).
-        let mut walk_visited: majit_ir::VecMap<usize, OpRef> = majit_ir::VecMap::new();
+        let mut walk_visited: indexmap::IndexMap<usize, OpRef> = indexmap::IndexMap::new();
         for (state_idx, state_info) in all_states.iter().enumerate() {
             if let Some(iv) = iv_map.get(&state_idx).copied() {
                 // Virtual state: process fields recursively, consuming slots
@@ -1066,8 +1067,8 @@ impl Optimizer {
         // entries sharing a head dedupe. A producer-less head resolves to
         // None and is never dedupable (matching the prior fresh-unbound-box
         // behaviour); its `set_ptr_info` is skipped below anyway.
-        let mut installed_heads: majit_ir::vec_set::VecSet<majit_ir::operand::Operand> =
-            majit_ir::vec_set::VecSet::new();
+        let mut installed_heads: indexmap::IndexSet<majit_ir::operand::Operand> =
+            indexmap::IndexSet::new();
         for entry in entries {
             let head_box = ctx.get_box_replacement_operand_opt(entry.head);
             if let Some(hk) = &head_box {
@@ -1146,7 +1147,7 @@ impl Optimizer {
         imported_label_args: &[OpRef],
         label_slot: &mut usize,
         ctx: &mut OptContext,
-        walk_visited: &mut majit_ir::VecMap<usize, OpRef>,
+        walk_visited: &mut indexmap::IndexMap<usize, OpRef>,
     ) -> OpRef {
         let key = std::rc::Rc::as_ptr(rc) as usize;
         if let Some(&cached) = walk_visited.get(&key) {
@@ -1171,7 +1172,7 @@ impl Optimizer {
         imported_label_args: &[OpRef],
         label_slot: &mut usize,
         ctx: &mut OptContext,
-        walk_visited: &mut majit_ir::VecMap<usize, OpRef>,
+        walk_visited: &mut indexmap::IndexMap<usize, OpRef>,
     ) -> OpRef {
         use crate::optimizeopt::virtualstate::VirtualStateInfo;
 
@@ -1374,9 +1375,9 @@ impl Optimizer {
             passes: Vec::new(),
             pureop_historylength: crate::jit::PARAMETERS.pureop_historylength as usize,
             final_num_inputs: 0,
-            call_pure_results: majit_ir::VecMap::new(),
+            call_pure_results: indexmap::IndexMap::new(),
             last_guard_op_idx: None,
-            replaces_guard: majit_ir::VecMap::new(),
+            replaces_guard: indexmap::IndexMap::new(),
             pendingfields: Vec::new(),
             can_replace_guards: true,
             quasi_immutable_deps: Vec::new(),
@@ -1411,7 +1412,7 @@ impl Optimizer {
             opt_guards_emitted: 0,
             opt_guards_shared_emitted: 0,
             cpu: crate::cpu::default_cpu(),
-            emitted_operations: majit_ir::vec_set::VecSet::new(),
+            emitted_operations: indexmap::IndexSet::new(),
             explicit_input_ops_seed: None,
         }
     }
@@ -1902,8 +1903,7 @@ impl Optimizer {
     /// The exported loop state should record the boxes that survive the end of
     /// the preamble after virtuals have been forced into a loop-carried shape.
     pub fn force_at_the_end_of_preamble(&mut self, opref: OpRef, ctx: &mut OptContext) -> OpRef {
-        let mut rec: majit_ir::vec_set::VecSet<majit_ir::operand::Operand> =
-            majit_ir::vec_set::VecSet::new();
+        let mut rec: indexmap::IndexSet<majit_ir::operand::Operand> = indexmap::IndexSet::new();
         self.force_at_the_end_of_preamble_rec(opref, ctx, &mut rec)
     }
 
@@ -1911,7 +1911,7 @@ impl Optimizer {
         &mut self,
         opref: OpRef,
         ctx: &mut OptContext,
-        rec: &mut majit_ir::vec_set::VecSet<majit_ir::operand::Operand>,
+        rec: &mut indexmap::IndexSet<majit_ir::operand::Operand>,
     ) -> OpRef {
         let resolved = ctx.get_replacement_opref(opref);
         let resolved_operand = ctx.get_box_replacement_operand_opt(opref);
@@ -2619,8 +2619,7 @@ impl Optimizer {
                     OpRef::input_arg_typed(pos, ctx.inputarg_type_at_strict(i))
                 })
                 .collect();
-            let source_set: majit_ir::vec_set::VecSet<OpRef> =
-                typed_inputargs.iter().copied().collect();
+            let source_set: indexmap::IndexSet<OpRef> = typed_inputargs.iter().copied().collect();
             let targetargs: Vec<OpRef> = (0..n)
                 .map(|i| {
                     let source = typed_inputargs[i];
@@ -2993,13 +2992,12 @@ impl Optimizer {
                 // per phase; majit's flat OpRef space needs an explicit SameAs
                 // alias so nia[j] points outside the body inputarg position range.
                 {
-                    let mut seen: majit_ir::vec_set::VecSet<OpRef> =
-                        majit_ir::vec_set::VecSet::new();
+                    let mut seen: indexmap::IndexSet<OpRef> = indexmap::IndexSet::new();
                     // RPython parity: positions already holding an emitted op
                     // are phase 1 results, not body inputarg sources. Only
                     // the UNUSED positions in 0..num_inputs correspond to
                     // trace inputargs (`InputArgRef/Int/Float` in RPython).
-                    let emitted_positions: majit_ir::vec_set::VecSet<OpRef> = ctx
+                    let emitted_positions: indexmap::IndexSet<OpRef> = ctx
                         .new_operations
                         .iter()
                         .map(|op| op.pos.get())
@@ -3510,7 +3508,7 @@ impl Optimizer {
         // This ensures no position collisions between input block params and ops.
         if num_virtual_inputs > 0 {
             let fni = self.final_num_inputs as u32;
-            let mut remap: majit_ir::VecMap<u32, u32> = majit_ir::VecMap::new();
+            let mut remap: indexmap::IndexMap<u32, u32> = indexmap::IndexMap::new();
 
             // Virtual input positions: optimizer used num_inputs+k, backend needs num_inputs+k
             for k in 0..num_virtual_inputs {
@@ -4258,8 +4256,9 @@ impl Optimizer {
         &self,
         args: &[OpRef],
         ctx: &mut OptContext,
-    ) -> majit_ir::VecMap<majit_ir::operand::Operand, crate::optimizeopt::intutils::IntBound> {
-        let mut exported = majit_ir::VecMap::new();
+    ) -> indexmap::IndexMap<majit_ir::operand::Operand, crate::optimizeopt::intutils::IntBound>
+    {
+        let mut exported = indexmap::IndexMap::new();
         for pass in &self.passes {
             // Each pass resolves through the same `ctx`, so a box for one
             // canonical position is memoized to a single `Rc` — entries across
@@ -6004,7 +6003,7 @@ mod tests {
         let result =
             opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::new(), 3);
 
-        let call_positions: majit_ir::vec_set::VecSet<_> = result
+        let call_positions: indexmap::IndexSet<_> = result
             .iter()
             .filter(|op| op.opcode == OpCode::CallMayForceR)
             .map(|op| op.pos.get())
@@ -6488,7 +6487,7 @@ mod tests {
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
 
-        let new_positions: majit_ir::vec_set::VecSet<_> = result
+        let new_positions: indexmap::IndexSet<_> = result
             .iter()
             .filter(|op| op.opcode == OpCode::New)
             .map(|op| op.pos.get().raw())
@@ -7056,7 +7055,7 @@ mod tests {
             fields: Vec::new(),
             field_descrs: Vec::new(),
         };
-        let mut walk_visited = majit_ir::VecMap::new();
+        let mut walk_visited = indexmap::IndexMap::new();
         let mut label_slot = 0usize;
         let head = Optimizer::import_virtual_state_from_label_args(
             &info,

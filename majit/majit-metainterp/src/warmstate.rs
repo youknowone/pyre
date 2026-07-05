@@ -5,6 +5,7 @@
 /// complete, we compile it and cache the result.
 ///
 /// Reference: rpython/jit/metainterp/warmstate.py WarmEnterState, BaseBaseJitCell
+use indexmap::IndexMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -317,7 +318,7 @@ pub struct WarmEnterState {
     /// a different pre-computed increment to tick(hash, increment).
     pub counter: JitCounter,
     /// Per-greenkey cells, keyed by the hash of the green key.
-    cells: majit_ir::VecMap<u64, BaseJitCell>,
+    cells: indexmap::IndexMap<u64, BaseJitCell>,
     /// Compilation threshold (copied from counter for easy access).
     threshold: u32,
     /// warmstate.py:254: increment_threshold = compute_threshold(threshold).
@@ -346,7 +347,7 @@ pub struct WarmEnterState {
     /// Maps a quasi-immutable field key (hash of object_id + field_index)
     /// to the set of green_key_hashes whose compiled loops depend on that field.
     /// When a quasi-immutable field is mutated, all dependent loops are invalidated.
-    quasiimmut_deps: majit_ir::VecMap<u64, Vec<u64>>,
+    quasiimmut_deps: indexmap::IndexMap<u64, Vec<u64>>,
     // Function-entry hotness rides on the shared `counter: JitCounter`
     // below (warmstate.py:467 — maybe_compile_and_run's tick + reset
     // goes through the common timetable, not a separate HashMap).
@@ -451,7 +452,7 @@ impl WarmEnterState {
         let increment_function_threshold = counter.compute_threshold(DEFAULT_FUNCTION_THRESHOLD);
         WarmEnterState {
             counter,
-            cells: majit_ir::VecMap::new(),
+            cells: indexmap::IndexMap::new(),
             threshold,
             increment_threshold,
             trace_eagerness: DEFAULT_TRACE_EAGERNESS,
@@ -462,7 +463,7 @@ impl WarmEnterState {
             trace_limit: DEFAULT_TRACE_LIMIT,
             tracing_generation: 0,
             jitlog,
-            quasiimmut_deps: majit_ir::VecMap::new(),
+            quasiimmut_deps: indexmap::IndexMap::new(),
             vectorize: false,
             vec_all: false,
             vec_cost: 0,

@@ -6,7 +6,8 @@
 /// - Write barrier with remembered set for old-to-young pointers
 ///
 /// Modeled after incminimark's minor/major collection.
-use majit_ir::{GcRef, VecMap, VecSet};
+use indexmap::{IndexMap, IndexSet};
+use majit_ir::GcRef;
 
 use crate::GcAllocator;
 use crate::flags;
@@ -471,7 +472,7 @@ pub struct MiniMarkGC {
     /// the surviving destructor list at the end of each major cycle.
     oldgen_external_bytes: usize,
     /// Pinned nursery objects that must not be moved during minor collection.
-    pinned_objects: VecSet<usize>,
+    pinned_objects: IndexSet<usize>,
     /// minimark.py:338 `nursery_objects_shadows = AddressDict()`.
     /// Maps nursery object payload address → pre-allocated old-gen
     /// shadow payload address.  When `id()` or `identityhash()` is
@@ -486,7 +487,7 @@ pub struct MiniMarkGC {
     /// arithmetically from the GC `type_info_group` base; pyre's GC
     /// keeps an explicit table because frontends register vtables
     /// independently of any translator pipeline.
-    vtable_to_type_id: VecMap<usize, u32>,
+    vtable_to_type_id: IndexMap<usize, u32>,
     /// `gc.py:603-622 _setup_guard_is_object` instance state.
     /// `_infobits_offset` is the byte offset of `infobits` inside
     /// `TYPE_INFO`; `_infobits_offset_plus` is the additional offset
@@ -579,10 +580,10 @@ impl MiniMarkGC {
             threshold_bytes_made_old: 0,
             pressure_since_minor: 0,
             oldgen_external_bytes: 0,
-            pinned_objects: VecSet::new(),
+            pinned_objects: IndexSet::new(),
             nursery_objects_shadows: std::collections::HashMap::new(),
             compiled_code_registry: CompiledCodeRegistry::new(),
-            vtable_to_type_id: VecMap::new(),
+            vtable_to_type_id: IndexMap::new(),
             _infobits_offset: 0,
             _infobits_offset_plus: 0,
             _T_IS_RPYTHON_INSTANCE_BYTE: 0,
