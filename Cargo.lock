@@ -611,7 +611,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.2",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -724,7 +724,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1191,7 +1191,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "160f2eade097f30263b548aae5deb12ad349c909baa710fa24b92c9090b2e006"
 dependencies = [
  "scopeguard",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1549,6 +1549,17 @@ dependencies = [
  "libm",
  "malachite-base",
  "wide",
+]
+
+[[package]]
+name = "malachite-q"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "be2add95162aede090c48f0ee51bea7d328847ce3180aa44588111f846cc116b"
+dependencies = [
+ "itertools",
+ "malachite-base",
+ "malachite-nz",
 ]
 
 [[package]]
@@ -2014,6 +2025,7 @@ dependencies = [
  "pyre-native",
  "pyre-object",
  "pyre-sandbox",
+ "rustpython-common",
  "rustpython-compiler",
  "rustpython-compiler-core",
  "rustpython-host_env",
@@ -2400,7 +2412,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2423,6 +2435,29 @@ dependencies = [
  "rustpython-ruff_text_size",
  "rustpython-wtf8",
  "thiserror 2.0.18",
+ "unicode_names2 2.0.0",
+]
+
+[[package]]
+name = "rustpython-common"
+version = "0.5.0"
+source = "git+https://github.com/RustPython/RustPython.git?rev=83ce1a7cad790dcf95886f119c1585ee4089a41c#83ce1a7cad790dcf95886f119c1585ee4089a41c"
+dependencies = [
+ "ascii",
+ "bitflags 2.11.1",
+ "getrandom 0.4.2",
+ "itertools",
+ "libc",
+ "lock_api",
+ "malachite-base",
+ "malachite-bigint",
+ "malachite-q",
+ "num-complex",
+ "num-traits",
+ "radium",
+ "rustpython-literal",
+ "rustpython-wtf8",
+ "siphasher",
  "unicode_names2 2.0.0",
 ]
 
@@ -2799,7 +2834,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "psm",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -2862,7 +2897,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3755,7 +3790,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

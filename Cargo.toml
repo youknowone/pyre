@@ -61,6 +61,7 @@ pyre-jit-trace = { version = "0.0.2", path = "pyre/pyre-jit-trace" }
 pyre-wasm = { version = "0.0.2", path = "pyre/pyre-wasm" }
 pyrex = { version = "0.0.2", path = "pyre/pyrex" }
 
+rustpython-common = { git = "https://github.com/RustPython/RustPython.git", rev = "83ce1a7cad790dcf95886f119c1585ee4089a41c" }
 rustpython-literal = { git = "https://github.com/RustPython/RustPython.git", rev = "83ce1a7cad790dcf95886f119c1585ee4089a41c" }
 rustpython-compiler = { git = "https://github.com/RustPython/RustPython.git", rev = "83ce1a7cad790dcf95886f119c1585ee4089a41c" }
 rustpython-compiler-core = { git = "https://github.com/RustPython/RustPython.git", rev = "83ce1a7cad790dcf95886f119c1585ee4089a41c" }
