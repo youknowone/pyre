@@ -2601,6 +2601,16 @@ fn compute_bridge_root_parent_frame(
         jitcode_index,
         resume_py_pc,
         None,
+        // Paused ROOT (outermost caller) frame: the sentinel is
+        // correct-by-construction, not a lossy deferral.  `resume_py_pc` is a
+        // CALL-return fallthrough opcode boundary where `pc_map` is lossless
+        // (no kept operand-stack temp), so the frame resumes through the plain
+        // `py_pc → pc_map` path — matching the emit-side sentinel the paused
+        // caller word carries elsewhere.  It must NOT be "upgraded" to a direct
+        // pc without a real per-frame `MIFrame.pc` for the whole caller chain
+        // (the `#124`/task#50 register↔value-stack rework); the only
+        // pc_map-independent carried coordinate today is the kept-stack branch
+        // guard's own `op.pc`.
         majit_ir::resumedata::NO_JITCODE_PC,
         None,
     );
@@ -8943,6 +8953,21 @@ fn block_head_audit_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_BLOCKHEAD_AUDIT").is_some())
 }
 
+/// `PYRE_PCMAP_CARRY_AUDIT` enables the assertion that the ONLY carried
+/// `guard_jitcode_pc` word not derivable from `pc_map` is the kept-stack
+/// branch guard's own `op.pc` (the walker `MIFrame.pc`, stashed in
+/// `BRANCH_GUARD_JITCODE_PC`).  Every other carried word equals
+/// `resume_jitcode_pc_for(py_pc)` / `after_residual_call_resume_pc_for(..)`
+/// — a `pc_map` read relocated from decode to encode, not an independent
+/// coordinate.  This certifies the `pc_map`-deletion precondition: the map
+/// stays load-bearing until the kept-stack coordinate is re-sourced off the
+/// walker `op.pc` for every frame (the `#124`/task#50 register↔value-stack
+/// rework).  Diagnostic only; off in production.
+fn carry_audit_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_CARRY_AUDIT").is_some())
+}
+
 pub(crate) fn python_pc_for_jitcode_pc(metadata: &crate::PyJitCodeMetadata, jit_pc: usize) -> u32 {
     // Exact inverse: `first_jit_pc_by_py_pc[py]` is the byte offset of the
     // FIRST instruction opcode `py` emitted (`usize::MAX` = the PC emitted
@@ -10025,6 +10050,23 @@ fn walker_capture_snapshot_for_last_guard_impl(
             // `entry_py_pc`, and for a non-branch guard `op_pc != pc_map[py_pc]`
             // — the two windows diverge and the decoded box layout mismatches.
             let guard_jitcode_pc: i32 = if guard_jc_pc_raw != usize::MAX {
+                // The kept-stack branch guard's own `op.pc` (walker
+                // `MIFrame.pc`) — the ONE carried word not sourced from
+                // `pc_map`.  Certify that: it must differ from the `pc_map`
+                // round-trip of its resume `py_pc`, or `pc_map` would already
+                // suffice and the carry would be a pure relocation.
+                if carry_audit_enabled() {
+                    let jc = unsafe { &*sym.jitcode };
+                    let roundtrip =
+                        guard_py_pc.and_then(|gp| jc.payload.resume_jitcode_pc_for(gp as usize));
+                    assert_ne!(
+                        roundtrip,
+                        Some(guard_jc_pc_raw),
+                        "kept-stack guard op.pc={guard_jc_pc_raw} equals \
+                         pc_map[guard_py_pc={guard_py_pc:?}] — carry would be a \
+                         pc_map relocation, not an independent coordinate"
+                    );
+                }
                 guard_jc_pc_raw as i32
             } else if m366_nonbranch_pc_enabled()
                 && !after_residual_call
