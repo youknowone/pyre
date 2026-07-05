@@ -8,208 +8,25 @@ use std::sync::OnceLock;
 
 use crate::PyFrame;
 
-fn trace_frame_type() -> PyObjectRef {
-    static TYPE: OnceLock<usize> = OnceLock::new();
-    let raw = *TYPE.get_or_init(|| {
-        let tp = crate::typedef::make_builtin_type("frame", |_| {});
-        // The wrapper wants a per-instance mapdict store; a `__dict__`
-        // rawdict key would instead claim the typedef manages the dict
-        // (typedef.py:40) and suppress the mapdict one
-        // (typeobject.py:253-257), so flip `hasdict` directly — the
-        // `create_dict_slot` flag flip (typeobject.py:1222-1226).
-        unsafe { pyre_object::w_type_set_hasdict(tp, true) };
-        tp as usize
-    });
-    raw as PyObjectRef
-}
-
-/// Copy callback-visible mutations on the trace-frame wrapper back to
-/// the live `PyFrame`'s debug data.
+/// Return the live `PyFrame` as the Python-visible `frame` object passed
+/// to a trace / profile callback.
 ///
-/// PyPy's `_trace` passes the live frame to the callback (`jit.hint(
-/// frame, access_directly=False)`), so `frame.f_trace = local` and
-/// `frame.f_lineno = N` from inside the callback land directly on
-/// `frame.debug`.  Pyre wraps the frame in a `pyre_object` instance
-/// because `PyFrame` is not itself a `PyObject`, so a setattr on the
-/// wrapper would otherwise stay isolated.  After the callback returns,
-/// read the wrapper's mutated attributes and propagate the changes to
-/// the live frame, preserving the user-visible semantics for the
-/// common case (debugger setting `frame.f_trace` to a per-frame
-/// callback while returning `None`).
-///
-/// The `_trace` w_result branch still wins (`executioncontext.py:386-
-/// 391`): a non-None callback return value overrides whichever value
-/// the setattr left behind, matching CPython issue11992 bug-for-bug
-/// compatibility.
-fn flush_trace_frame_writeback(
-    frame: *mut PyFrame,
-    w_frame: PyObjectRef,
-    init_lineno: isize,
-) -> Result<(), crate::PyError> {
-    if frame.is_null() || w_frame.is_null() {
-        return Ok(());
-    }
-    let new_f_trace = match crate::baseobjspace::getattr_str(w_frame, "f_trace") {
-        Ok(v) => v,
-        Err(_) => return Ok(()),
-    };
-    // pyframe.py:785-791 fset_f_trace:
-    //   if space.is_w(w_trace, space.w_None):
-    //       self.getorcreatedebug().w_f_trace = None
-    //   else:
-    //       d = self.getorcreatedebug()
-    //       d.w_f_trace = w_trace
-    //       d.f_lineno = self.get_last_lineno()
-    // The non-None branch also realigns f_lineno to the current
-    // bytecode line so trace events fire from the new tracer's
-    // perspective immediately.
-    unsafe {
-        let d = (*frame).getorcreatedebug(init_lineno);
-        let is_clear = new_f_trace.is_null() || new_f_trace == pyre_object::w_none();
-        if is_clear {
-            d.w_f_trace = pyre_object::PY_NULL;
-        } else if new_f_trace != d.w_f_trace {
-            d.w_f_trace = new_f_trace;
-            d.f_lineno = (*frame).get_last_lineno();
-        }
-    }
-    if let Ok(new_f_lineno_obj) = crate::baseobjspace::getattr_str(w_frame, "f_lineno") {
-        if !new_f_lineno_obj.is_null() && unsafe { pyre_object::is_int(new_f_lineno_obj) } {
-            let new_lineno = unsafe { pyre_object::w_int_get_value(new_f_lineno_obj) };
-            // TODO: pyframe.py:683-764
-            // `PyFrame.fset_f_lineno` is the upstream setter. It runs
-            // line-jump validation against the bytecode (block stack
-            // unwinding through SETUP_LOOP/SETUP_EXCEPT, code address
-            // recomputation via PyCode._signature_addr_to_line, and
-            // last_instr realignment). Pyre's wrapper writes only
-            // debug.f_lineno because PyFrame is not yet a PyObject
-            // and the validator's PyCode internals (try/except
-            // boundaries, generator restart guards) are not exposed
-            // through the wrapper interface. The full setter port
-            // is gated on the PyFrame ↔ PyObject identity epic.
-            unsafe {
-                let d = (*frame).getorcreatedebug(init_lineno);
-                d.f_lineno = new_lineno as isize;
-            }
-        }
-    }
-    // pyframe.py:799-806 fset_f_trace_lines / fset_f_trace_opcodes.
-    // Both setters apply `space.is_true(w_trace)` to coerce arbitrary
-    // truthy values; pyre's `is_true` is the equivalent.
-    if let Ok(new_lines_obj) = crate::baseobjspace::getattr_str(w_frame, "f_trace_lines") {
-        if !new_lines_obj.is_null() {
-            let new_lines = unsafe { crate::baseobjspace::is_true(new_lines_obj) }?;
-            unsafe {
-                (*frame).getorcreatedebug(init_lineno).f_trace_lines = new_lines;
-            }
-        }
-    }
-    if let Ok(new_opcodes_obj) = crate::baseobjspace::getattr_str(w_frame, "f_trace_opcodes") {
-        if !new_opcodes_obj.is_null() {
-            let new_opcodes = unsafe { crate::baseobjspace::is_true(new_opcodes_obj) }?;
-            unsafe {
-                (*frame).getorcreatedebug(init_lineno).f_trace_opcodes = new_opcodes;
-            }
-        }
-    }
-    Ok(())
-}
-
+/// `pyframe.py:_trace` hands the callback the real frame
+/// (`jit.hint(frame, access_directly=False)`).  Now that `PyFrame` is a
+/// W_Root (`FRAME_TYPE` typedef), pyre does the same: the callback's
+/// `frame.f_lineno = N` / `frame.f_trace = local` land directly on the
+/// live frame's getsets, so no `sys.namespace` wrapper and no
+/// writeback pass is needed.  The frame is the current executing frame
+/// (on the `CURRENT_FRAME` chain and thus GC-rooted) for the whole
+/// callback, so returning it is safe; mark it escaped so the JIT keeps
+/// it materialised while the callback holds a reference
+/// (`pyframe.py:176 mark_as_escaped`).
 fn wrap_trace_frame(frame: *mut PyFrame) -> PyObjectRef {
     if frame.is_null() {
         return pyre_object::w_none();
     }
-    let w_frame = pyre_object::w_instance_new(trace_frame_type());
-    unsafe {
-        let frame_ref = &mut *frame;
-        // `pyframe.py:766 fget_f_globals` returns `self.w_globals`
-        // (already a W_DictObject).  Pyre's eager `w_globals` slot
-        // matches that identity; reading it here avoids a second
-        // `dict_storage_to_dict` round-trip below.
-        let w_globals = frame_ref.get_w_globals();
-        let w_locals = frame_ref.get_w_locals();
-        let w_trace = frame_ref.get_w_f_trace();
-        // pypy/interpreter/pyframe.py:154 fget_f_back walks the
-        // f_backref vref to materialise the parent frame.  Pyre's
-        // wrapper has to do the same eagerly because the wrapper is a
-        // plain pyre_object instance (no `__getattr__` slot wired to
-        // the live struct yet).  Recursion depth tracks
-        // the live stack depth, which is bounded by Python's
-        // recursion limit; the wrappers are short-lived (allocated
-        // per callback invocation) so the per-trace overhead scales
-        // with stack depth rather than total executed bytecodes.
-        let f_back_obj = wrap_trace_frame(frame_ref.get_f_back());
-        crate::baseobjspace::setdictvalue(w_frame, "f_code", frame_ref.pycode as PyObjectRef);
-        crate::baseobjspace::setdictvalue(w_frame, "f_back", f_back_obj);
-        // pyframe.py:768-771 fget_f_builtins → self.get_builtin().getdict(space)
-        crate::baseobjspace::setdictvalue(w_frame, "f_builtins", frame_ref.fget_f_builtins());
-        // `pyframe.py:766 fget_f_globals` returns `self.w_globals`
-        // directly — same identity as `module.__dict__` so trace
-        // hooks (`sys.settrace`) observe `frame.f_globals is
-        // module.__dict__`.  Pyre routes through
-        // `dict_storage_to_dict` which returns the canonical dict
-        // wrapper paired with the storage (mirror_target invariant);
-        // allocating a fresh dict per trace callback would silently
-        // break that identity.  `f_locals` follows the same shape (PyPy
-        // `pyframe.py:546 fast2locals` then `self.debugdata.w_locals`).
-        crate::baseobjspace::setdictvalue(
-            w_frame,
-            "f_globals",
-            if w_globals.is_null() {
-                pyre_object::w_none()
-            } else {
-                w_globals
-            },
-        );
-        crate::baseobjspace::setdictvalue(
-            w_frame,
-            "f_locals",
-            // pyframe.py:546 fast2locals (run by the trace gate before this
-            // callback) caches the locals mapping in `w_locals`; expose
-            // it directly.  A frame with no locals bound surfaces as None.
-            if w_locals.is_null() {
-                pyre_object::w_none()
-            } else {
-                w_locals
-            },
-        );
-        crate::baseobjspace::setdictvalue(
-            w_frame,
-            "f_lineno",
-            pyre_object::w_int_new(frame_ref.fget_f_lineno() as i64),
-        );
-        crate::baseobjspace::setdictvalue(
-            w_frame,
-            "f_lasti",
-            pyre_object::w_int_new(frame_ref.fget_f_lasti() as i64),
-        );
-        crate::baseobjspace::setdictvalue(
-            w_frame,
-            "f_trace",
-            if w_trace.is_null() {
-                pyre_object::w_none()
-            } else {
-                w_trace
-            },
-        );
-        // pyframe.py:796-806 fget_f_trace_lines / fget_f_trace_opcodes
-        // — exposed as bools.  PyPy stores the live values on the
-        // frame's debug data; pyre's wrapper mirrors them so the user
-        // callback can read or set them.  flush_trace_frame_writeback
-        // copies the wrapper's post-callback values back onto the
-        // live frame.
-        crate::baseobjspace::setdictvalue(
-            w_frame,
-            "f_trace_lines",
-            pyre_object::w_bool_from(frame_ref.get_f_trace_lines()),
-        );
-        crate::baseobjspace::setdictvalue(
-            w_frame,
-            "f_trace_opcodes",
-            pyre_object::w_bool_from(frame_ref.get_f_trace_opcodes()),
-        );
-    }
-    w_frame
+    unsafe { (*frame).mark_as_escaped() };
+    frame as PyObjectRef
 }
 
 /// pypy/interpreter/executioncontext.py:10-15 app_profile_call.
@@ -1480,13 +1297,9 @@ impl ExecutionContext {
                     w_callback,
                     &[frame_obj, w_event, w_arg],
                 );
-                // Mirror in-callback `frame.f_trace = local` /
-                // `frame.f_lineno = N` mutations back onto the live
-                // PyFrame before processing w_result. PyPy passes the
-                // raw frame to the callback, so its setattrs land
-                // directly; pyre runs the callback against a wrapper
-                // and must propagate explicitly.
-                flush_trace_frame_writeback(frame, frame_obj, init_lineno)?;
+                // The callback received the live frame, so its
+                // `frame.f_trace = local` / `frame.f_lineno = N` setattrs
+                // already landed on the frame's getsets — no writeback pass.
                 let w_result = call_result?;
                 if w_result != pyre_object::w_none() {
                     unsafe {

@@ -1405,6 +1405,16 @@ fn eval_loop(frame: &mut PyFrame) -> PyResult {
                 }
                 return Err(err);
             }
+            // A trace callback may perform a debugger line-jump by setting
+            // `frame.f_lineno` (`PyFrame::fset_f_lineno` → `last_instr =
+            // best_addr`).  Honour it: if a tracer is installed and it
+            // moved `last_instr` off the instruction we were about to
+            // dispatch, resume from the jump target instead of `pc`.  The
+            // `gettrace` null-check keeps this off the no-tracer hot path.
+            if unsafe { !(*ec).gettrace().is_null() } && frame.last_instr as usize != pc {
+                next_instr = frame.last_instr as usize;
+                continue;
+            }
         }
         let (opcode_pc, instruction, op_arg) = decode_instruction_for_dispatch(code, pc)?;
         let fallthrough = opcode_pc + 1;
