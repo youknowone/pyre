@@ -3073,17 +3073,20 @@ impl<'a> Transformer<'a> {
     /// if oopspec_name == 'stroruni.copy_contents':
     ///     if SoU.TO == rstr.STR:      new_op = 'copystrcontent'
     ///     elif SoU.TO == rstr.UNICODE: new_op = 'copyunicodecontent'
+    ///     else: assert 0
     ///     return SpaceOperation(new_op, args, op.result)
     /// ```
     ///
     /// `SoU = args[0].concretetype` selects the STR vs UNICODE spelling;
-    /// pyre reads it from the flowspace `Variable::concretetype()`
-    /// (`Ptr(STR)` / `Ptr(UNICODE)`), matching the `Array(UniChar)`
-    /// detection `jtransform_opname.rs::is_unichar_array_ptr` uses on the
-    /// Spine-B path.  The resulting `copystrcontent` / `copyunicodecontent`
-    /// op is emitted as [`OpKind::LoweredBlackholeOp`], the same
-    /// representation the Spine-B string transducer produces, so flatten /
-    /// assembly already lower it to the matching jitcode bytecode.
+    /// pyre reads it from the flowspace `Variable::concretetype()` via
+    /// [`stroruni_first_arg_kind`]. Only `Ptr(STR)` maps to `copystrcontent`
+    /// and only `Ptr(UNICODE)` maps to `copyunicodecontent`; `Ptr(BYTEARRAY)`
+    /// (upstream `raise NotSupported`, `jtransform.py:2074`) and any other
+    /// operand shape (`else: assert 0`) return `None`, falling through to the
+    /// residual-call path — pyre's `NotSupported` analogue. The resulting op
+    /// is emitted as [`OpKind::LoweredBlackholeOp`], the same representation
+    /// the Spine-B string transducer produces, so flatten / assembly already
+    /// lower it to the matching jitcode bytecode.
     ///
     /// The `concat` / `slice` / `equal` / `cmp` / `copy_string_to_raw` arms
     /// are not ported yet; those spellings return `None` and fall through to
@@ -3096,10 +3099,12 @@ impl<'a> Transformer<'a> {
     ) -> Option<RewriteResult> {
         match oopspec_name {
             "stroruni.copy_contents" => {
-                let opname = if stroruni_first_arg_is_unicode(args.first()?) {
-                    "copyunicodecontent"
-                } else {
-                    "copystrcontent"
+                let opname = match stroruni_first_arg_kind(args.first()?) {
+                    StrOrUniKind::Str => "copystrcontent",
+                    StrOrUniKind::Unicode => "copyunicodecontent",
+                    // BYTEARRAY → NotSupported; any other shape → assert 0.
+                    // Both fall through to the residual-call path.
+                    StrOrUniKind::ByteArray | StrOrUniKind::Other => return None,
                 };
                 Some(RewriteResult::Replace(vec![SpaceOperation {
                     result: op.result.clone(),
@@ -5720,34 +5725,45 @@ fn call_target_matches_loose(pattern: &CallTarget, target: &CallTarget) -> bool 
 /// distinct names (e.g. `jit_debug`, `int_isconstant`); for list/dict/str
 /// specs RPython uses dedicated OS_* indices. This helper currently maps
 /// the cases that have a direct OopSpecIndex equivalent.
-/// Whether a `stroruni.*` oopspec call's first argument is a `Ptr(UNICODE)`
-/// (chars array of `UniChar`) rather than `Ptr(STR)` (chars array of `Char`).
-///
-/// Mirrors `_handle_stroruni_call`'s `SoU.TO == rstr.STR / rstr.UNICODE`
-/// discriminator (`jtransform.py:2058-2073`), reading the operand's
-/// `Ptr(STR/UNICODE)` concretetype and inspecting the pointee struct's inline
-/// `chars` array element type — the same `Array(UniChar)` test
-/// `jtransform_opname.rs::is_unichar_array_ptr` applies on the Spine-B path.
-/// Non-string / untyped operands return `false`.
-fn stroruni_first_arg_is_unicode(var: &crate::flowspace::model::Variable) -> bool {
+/// The `SoU.TO` discriminant of a `stroruni.*` oopspec's first argument:
+/// `Ptr(STR)` (`rpy_string`), `Ptr(UNICODE)` (`rpy_unicode`), or
+/// `Ptr(BYTEARRAY)` (`rpy_bytearray`). `Other` covers any non-string /
+/// untyped operand.
+enum StrOrUniKind {
+    Str,
+    Unicode,
+    ByteArray,
+    Other,
+}
+
+/// Classify a `stroruni.*` oopspec call's first argument by its pointee
+/// struct, mirroring `_handle_stroruni_call`'s
+/// `SoU.TO == rstr.STR / rstr.UNICODE / rbytearray.BYTEARRAY` chain
+/// (`jtransform.py:2058-2076`). `STR` and `BYTEARRAY` both carry a `chars`
+/// array of `Char`, so the struct name (`rpy_string` / `rpy_unicode` /
+/// `rpy_bytearray`) is the discriminant, matching upstream's `SoU.TO`
+/// identity comparison against the module-global structs.
+fn stroruni_first_arg_kind(var: &crate::flowspace::model::Variable) -> StrOrUniKind {
     use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
     let Some(LowLevelType::Ptr(ptr)) = var.concretetype() else {
-        return false;
+        return StrOrUniKind::Other;
     };
     let pointee = match ptr.TO {
         PtrTarget::ForwardReference(fwd) => match fwd.resolved() {
             Some(resolved) => resolved,
-            None => return false,
+            None => return StrOrUniKind::Other,
         },
         other => LowLevelType::from(other),
     };
     let LowLevelType::Struct(s) = pointee else {
-        return false;
+        return StrOrUniKind::Other;
     };
-    matches!(
-        s.getattr_field_type("chars"),
-        Some(LowLevelType::Array(arr)) if matches!(arr.OF, LowLevelType::UniChar)
-    )
+    match s._name.as_str() {
+        "rpy_string" => StrOrUniKind::Str,
+        "rpy_unicode" => StrOrUniKind::Unicode,
+        "rpy_bytearray" => StrOrUniKind::ByteArray,
+        _ => StrOrUniKind::Other,
+    }
 }
 
 fn map_user_oopspec_to_index(spec: &str) -> majit_ir::descr::OopSpecIndex {
@@ -8284,6 +8300,26 @@ mod tests {
             panic!("expected LoweredBlackholeOp");
         };
         assert_eq!(opname, "copyunicodecontent");
+    }
+
+    /// jtransform.py:2074 — a `Ptr(BYTEARRAY)` first argument is unsupported
+    /// (`raise NotSupported`); pyre returns `None` so the call falls through
+    /// to the residual-call path instead of misclassifying it as `STR`.
+    #[test]
+    fn stroruni_copy_contents_bytearray_falls_through() {
+        use crate::translator::rtyper::lltypesystem::rbytearray::BYTEARRAYPTR;
+        let config = GraphTransformConfig::default();
+        let transformer = Transformer::new(&config);
+        let args = stroruni_copy_contents_args(BYTEARRAYPTR.clone());
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::Live,
+        };
+        assert!(
+            transformer
+                ._handle_stroruni_call("stroruni.copy_contents", &op, &args)
+                .is_none()
+        );
     }
 
     /// The not-yet-ported `stroruni.*` spellings (concat / slice / equal /
