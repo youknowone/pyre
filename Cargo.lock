@@ -2022,6 +2022,7 @@ dependencies = [
 name = "pyre-jit"
 version = "0.0.2"
 dependencies = [
+ "bit-set",
  "majit-backend",
  "majit-backend-cranelift",
  "majit-backend-dynasm",

@@ -14,3 +14,4 @@ def main():
 
 result = main()
 print(result)
+# Expected: 20000 * sum(sum(range(x)) for x in [1,2,3,4,5]) = 20000 * 20 = 400000

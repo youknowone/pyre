@@ -12123,10 +12123,9 @@ impl CodeWriter {
         // nbody/nested_loop/spectral_norm.
         {
             // Build the set of FOR_ITER body PCs: py_pc in
-            // [for_iter_pc + 1, exhaust_target) for each ForIter instruction.
-            let mut foriter_body_pcs: std::collections::HashSet<usize> =
-                std::collections::HashSet::new();
-            {
+            // [for_iter_pc, exhaust_target) for each ForIter instruction.
+            let foriter_body_pcs = {
+                let mut pcs = bit_set::BitSet::with_capacity(num_instrs);
                 let mut scan_state = pyre_interpreter::OpArgState::default();
                 for scan_pc in 0..num_instrs {
                     let (scan_instr, scan_arg) = scan_state.get(code.instructions[scan_pc]);
@@ -12139,19 +12138,20 @@ impl CodeWriter {
                         // Include the FOR_ITER pc itself (for the
                         // continues guard) and all body PCs up to
                         // the exhaustion target.
-                        foriter_body_pcs.insert(scan_pc);
-                        for body_pc in (scan_pc + 1)..exhaust_target {
-                            foriter_body_pcs.insert(body_pc);
+                        pcs.insert(scan_pc);
+                        for body_pc in (scan_pc + 1)..exhaust_target.min(num_instrs) {
+                            pcs.insert(body_pc);
                         }
                     }
                 }
-            }
+                pcs
+            };
             let mut marker_before: Vec<bool> = vec![false; spliced.insns.len()];
             for &(py_pc, pos) in &spliced.pc_first_insn_pos {
                 if py_pc < 0 {
                     continue;
                 }
-                if !foriter_body_pcs.contains(&(py_pc as usize)) {
+                if !foriter_body_pcs.contains(py_pc as usize) {
                     continue;
                 }
                 let already = pos
