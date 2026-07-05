@@ -771,7 +771,6 @@ type JitDriverPair = (
     std::sync::Arc<majit_metainterp::virtualizable::VirtualizableInfo>,
 );
 
-
 thread_local! {
     static GC_SUBSYSTEM_INSTALLED: Cell<bool> = const { Cell::new(false) };
 }
@@ -788,8 +787,9 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     // descendant. The size is `sizeof(PyObject)` because instances
     // tagged with `&INSTANCE_TYPE` (i.e. user `object()` calls)
     // carry only the `ob_type` header.
-    let object_tid =
-        gc.register_type(TypeInfo::object(std::mem::size_of::<pyre_object::PyObject>()));
+    let object_tid = gc.register_type(TypeInfo::object(
+        std::mem::size_of::<pyre_object::PyObject>(),
+    ));
     debug_assert_eq!(object_tid, OBJECT_GC_TYPE_ID);
     // W_IntObject / W_FloatObject carry `PyObject.ob_type` at offset 0,
     // matching RPython `rclass.OBJECT` layout (T_IS_RPYTHON_INSTANCE,
@@ -816,9 +816,7 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     // host-side tracer that invokes `jitframe_trace` directly so
     // Refs pinned to frame slots are visible to GC across minor
     // collections triggered by CallMallocNursery slow paths.
-    majit_gc::shadow_stack::register_libc_jitframe_tracer(
-        pyre_libc_jitframe_tracer,
-    );
+    majit_gc::shadow_stack::register_libc_jitframe_tracer(pyre_libc_jitframe_tracer);
     // virtualref.py — JIT_VIRTUAL_REF as a proper GC type.
     // Layout: super_.typeptr(u64, offset 0) | virtual_token(*mut u8, offset 8) | forced(*mut u8, offset 16)
     //
@@ -842,7 +840,10 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     // allocation to move under the GC.
     let vref_tid = gc.register_type(majit_gc::trace::TypeInfo::with_gc_ptrs(
         std::mem::size_of::<majit_metainterp::virtualref::JitVirtualRef>(),
-        vec![std::mem::offset_of!(majit_metainterp::virtualref::JitVirtualRef, forced)],
+        vec![std::mem::offset_of!(
+            majit_metainterp::virtualref::JitVirtualRef,
+            forced
+        )],
     ));
     debug_assert_eq!(vref_tid, VREF_GC_TYPE_ID);
     // Tell the virtualref optimizer about the registered type id.
@@ -991,8 +992,8 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     // `#[pyre_class(... type_id = N)]` attribute is out of step
     // with the registration order here.
     let register_pyre_class = |gc: &mut MiniMarkGC,
-                                   pytype_to_tid: &mut HashMap<usize, u32>,
-                                   descr: &'static pyre_object::lltype::PyreClassDescriptor|
+                               pytype_to_tid: &mut HashMap<usize, u32>,
+                               descr: &'static pyre_object::lltype::PyreClassDescriptor|
      -> u32 {
         let tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
             descr.object_size,
@@ -1114,12 +1115,11 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     // (`pypy/interpreter/function.py:706 BuiltinFunction`) but its
     // instances are the same Rust struct, so the vtable map sends
     // both PyTypes to `function_tid`.
-    let function_tid =
-        gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
-            std::mem::size_of::<pyre_interpreter::function::Function>(),
-            object_tid,
-            pyre_interpreter::function::FUNCTION_GC_PTR_OFFSETS.to_vec(),
-        ));
+    let function_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
+        std::mem::size_of::<pyre_interpreter::function::Function>(),
+        object_tid,
+        pyre_interpreter::function::FUNCTION_GC_PTR_OFFSETS.to_vec(),
+    ));
     debug_assert_eq!(function_tid, FUNCTION_GC_TYPE_ID);
     majit_gc::GcAllocator::register_vtable_for_type(
         &mut gc,
@@ -1147,14 +1147,12 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     register_pyre_class(
         &mut gc,
         &mut pytype_to_tid,
-        <pyre_object::nestedscope::Cell
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        <pyre_object::nestedscope::Cell as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
     register_pyre_class(
         &mut gc,
         &mut pytype_to_tid,
-        <pyre_object::function::Method
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        <pyre_object::function::Method as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
     register_pyre_class(
         &mut gc,
@@ -1169,8 +1167,7 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     register_pyre_class(
         &mut gc,
         &mut pytype_to_tid,
-        <pyre_object::descriptor::W_Super
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        <pyre_object::descriptor::W_Super as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
     // W_Property (3 PyObjectRef fields: fget/fset/fdel),
     // StaticMethod and ClassMethod (1 PyObjectRef
@@ -1180,20 +1177,17 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     register_pyre_class(
         &mut gc,
         &mut pytype_to_tid,
-        <pyre_object::descriptor::W_Property
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        <pyre_object::descriptor::W_Property as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
     register_pyre_class(
         &mut gc,
         &mut pytype_to_tid,
-        <pyre_object::function::StaticMethod
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        <pyre_object::function::StaticMethod as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
     register_pyre_class(
         &mut gc,
         &mut pytype_to_tid,
-        <pyre_object::function::ClassMethod
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        <pyre_object::function::ClassMethod as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
     // UnionType (PEP 604 `X | Y`) — typed payload via `#[pyre_class]`.
     // Pre-registered ahead of the foreign-pytype loop because that
@@ -1238,8 +1232,7 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     register_pyre_class(
         &mut gc,
         &mut pytype_to_tid,
-        <pyre_object::typedef::W_MemberDescr
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        <pyre_object::typedef::W_MemberDescr as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
     // W_BytesObject (immutable byte sequence) carries a raw
     // `*const Vec<u8>` (`data`) and a `usize` length, neither a
@@ -1292,10 +1285,7 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
         &pyre_object::DICT_TYPE as *const _ as usize,
         w_dict_tid,
     );
-    pytype_to_tid.insert(
-        &pyre_object::DICT_TYPE as *const _ as usize,
-        w_dict_tid,
-    );
+    pytype_to_tid.insert(&pyre_object::DICT_TYPE as *const _ as usize, w_dict_tid);
     // W_SetObject carries `items: *mut Vec<PyObjectRef>`. Register a
     // custom trace hook so GC forwarding updates indirect element slots.
     // Both `set` and `frozenset` PyTypes share this Rust struct/tid.
@@ -1383,13 +1373,9 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
             31 => pyre_object::interp_exceptions::ExcKind::BufferError,
             _ => unreachable!(),
         };
-        let pytype_ptr = pyre_object::interp_exceptions::exc_kind_to_pytype(kind)
-            as *const _ as usize;
-        majit_gc::GcAllocator::register_vtable_for_type(
-            &mut gc,
-            pytype_ptr,
-            w_exception_tid,
-        );
+        let pytype_ptr =
+            pyre_object::interp_exceptions::exc_kind_to_pytype(kind) as *const _ as usize;
+        majit_gc::GcAllocator::register_vtable_for_type(&mut gc, pytype_ptr, w_exception_tid);
         pytype_to_tid.insert(pytype_ptr, w_exception_tid);
     }
     // GeneratorIterator carries `frame_ptr: *mut u8` (opaque
@@ -1435,10 +1421,7 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
         &pyre_object::TYPE_TYPE as *const _ as usize,
         w_type_tid,
     );
-    pytype_to_tid.insert(
-        &pyre_object::TYPE_TYPE as *const _ as usize,
-        w_type_tid,
-    );
+    pytype_to_tid.insert(&pyre_object::TYPE_TYPE as *const _ as usize, w_type_tid);
     // W_UnicodeObject carries a `*mut String` (raw heap) plus a
     // `usize` length. No direct `PyObjectRef` field. Pre-registered
     // so the foreign-pytype loop's `sizeof(PyObject)` approximation
@@ -1486,10 +1469,7 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
         &pyre_object::MODULE_TYPE as *const _ as usize,
         w_module_tid,
     );
-    pytype_to_tid.insert(
-        &pyre_object::MODULE_TYPE as *const _ as usize,
-        w_module_tid,
-    );
+    pytype_to_tid.insert(&pyre_object::MODULE_TYPE as *const _ as usize, w_module_tid);
     // `pyre-interpreter::pyframe::PyFrame` — execution frame for a
     // Python code block. NOT an `rclass.OBJECT`-shaped instance
     // (no `ob_type` header — virtualizable struct laid out for the
@@ -1721,11 +1701,7 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
             std::mem::size_of::<pyre_object::PyObject>(),
             parent_tid,
         ));
-        majit_gc::GcAllocator::register_vtable_for_type(
-            &mut gc,
-            pytype_ptr,
-            tid,
-        );
+        majit_gc::GcAllocator::register_vtable_for_type(&mut gc, pytype_ptr, tid);
         pytype_to_tid.insert(pytype_ptr, tid);
     }
     // `pypy/objspace/std/dictmultiobject.py:328 W_ModuleDictObject`
@@ -1986,8 +1962,7 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     // `W_BASE_EXCEPTION_GC_TYPE_ID`; unmapped slots also fall back to
     // it which is harmless because every reachable kind is
     // assigned its own tid by the loop below.
-    let mut per_exc_tid: [u32; EXC_KIND_COUNT] =
-        [W_BASE_EXCEPTION_GC_TYPE_ID; EXC_KIND_COUNT];
+    let mut per_exc_tid: [u32; EXC_KIND_COUNT] = [W_BASE_EXCEPTION_GC_TYPE_ID; EXC_KIND_COUNT];
     per_exc_tid[ExcKind::BaseException as u8 as usize] = w_exception_tid;
     for (kind, parent_kind) in exc_hierarchy {
         let parent_tid = parent_kind
@@ -2098,22 +2073,19 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     register_pyre_class(
         &mut gc,
         &mut pytype_to_tid,
-        <pyre_object::functional::W_Filter
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        <pyre_object::functional::W_Filter as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
     // W_Map (`map`) — AUTO-ID; `w_fun` / `w_iterators` are traced edges.
     register_pyre_class(
         &mut gc,
         &mut pytype_to_tid,
-        <pyre_object::functional::W_Map
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        <pyre_object::functional::W_Map as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
     // W_Zip (`zip`) — AUTO-ID; `w_iterators` is a traced edge.
     register_pyre_class(
         &mut gc,
         &mut pytype_to_tid,
-        <pyre_object::functional::W_Zip
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        <pyre_object::functional::W_Zip as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
     // W_Cycle (`itertools.cycle`) — typed payload via `#[pyre_class]` in
     // AUTO-ID mode.  Unlike the other itertools iterators, its `saved`
@@ -2134,8 +2106,7 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     register_pyre_class(
         &mut gc,
         &mut pytype_to_tid,
-        <pyre_object::interp_array::W_Array
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        <pyre_object::interp_array::W_Array as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
     // W_MemoryView (`memoryview`) — typed payload via `#[pyre_class]` in
     // AUTO-ID mode.  Its geometry and backing live in an off-heap
@@ -2220,7 +2191,11 @@ fn install_gc_into_backend(gc: Box<dyn majit_gc::GcAllocator>) {
 fn install_gc_into_backend(gc: Box<dyn majit_gc::GcAllocator>) {
     majit_backend_cranelift::install_gc_standalone(gc);
 }
-#[cfg(all(feature = "dynasm", not(feature = "cranelift"), not(target_arch = "wasm32")))]
+#[cfg(all(
+    feature = "dynasm",
+    not(feature = "cranelift"),
+    not(target_arch = "wasm32")
+))]
 fn install_gc_into_backend(gc: Box<dyn majit_gc::GcAllocator>) {
     majit_backend_dynasm::runner::install_gc_standalone(gc);
 }
@@ -2313,13 +2288,9 @@ fn install_pyre_object_hooks() {
         pyre_object_gc_charge_oldgen_external_trampoline,
     );
     pyre_object::register_gc_collect_hook(pyre_object_gc_collect_trampoline);
-    pyre_object::gc_hook::register_gc_collect_oldgen_hook(
-        pyre_object_gc_collect_oldgen_trampoline,
-    );
+    pyre_object::gc_hook::register_gc_collect_oldgen_hook(pyre_object_gc_collect_oldgen_trampoline);
     pyre_object::gc_hook::register_gc_heap_stats_hook(pyre_object_gc_heap_stats_trampoline);
-    pyre_object::gc_hook::register_gc_jitframe_empty_hook(
-        pyre_object_gc_jitframe_empty_trampoline,
-    );
+    pyre_object::gc_hook::register_gc_jitframe_empty_hook(pyre_object_gc_jitframe_empty_trampoline);
     pyre_object::register_gc_root_hooks(
         pyre_object_gc_add_root_trampoline,
         pyre_object_gc_remove_root_trampoline,
@@ -2329,9 +2300,7 @@ fn install_pyre_object_hooks() {
         pyre_object_gc_current_object_address_trampoline,
     );
     pyre_object::register_gc_write_barrier_hook(pyre_object_gc_write_barrier_trampoline);
-    pyre_object::gc_hook::register_gc_identity_hash_hook(
-        pyre_object_gc_identity_hash_trampoline,
-    );
+    pyre_object::gc_hook::register_gc_identity_hash_hook(pyre_object_gc_identity_hash_trampoline);
 }
 
 /// Initialize the GC subsystem independently of the JIT driver.

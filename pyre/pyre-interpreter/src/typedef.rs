@@ -3592,13 +3592,11 @@ fn init_pytraceback_type(ns: &mut DictStorage) {
     // built from the retained `w_code` + stamped line number.
     //
     // A frame is non-Gc only when the GC stable-alloc hook was never
-    // installed: that hook (and the whole GC subsystem) is set up inside
-    // the JIT-driver initializer, which `PYRE_JIT=0` short-circuits, so
-    // in interpreter-only runs every frame is a `std::alloc` box freed on
-    // return — returning it would be a use-after-free.  On the shipping
-    // JIT path frames are GC-owned oldgen blocks and the stub is dead.
-    // Decoupling GC init from the JIT driver (letting the fallback go)
-    // is tracked separately.
+    // pytraceback.py:34 descr_get_tb_frame — return the live `PyFrame`
+    // itself (`FRAME_TYPE` typedef) as the user-visible `frame` object.
+    // The GC subsystem is installed at boot (`init_gc_subsystem`), so all
+    // frames — including under `PYRE_JIT=0` — are GC-owned oldgen blocks
+    // that stay alive as long as the traceback references them.
     let frame_getter = make_builtin_function_with_arity(
         "tb_frame",
         |args| {
@@ -3607,22 +3605,14 @@ fn init_pytraceback_type(ns: &mut DictStorage) {
                 return Ok(pyre_object::w_none());
             }
             let frame = unsafe { crate::pytraceback::w_pytraceback_get_frame(tb) };
-            if !frame.is_null() && pyre_object::gc_hook::try_gc_owns_object(frame as *mut u8) {
-                // Mark escaped so the JIT keeps the frame materialised for
-                // the exposed reference (pyframe.py:176 `mark_as_escaped`),
-                // mirroring `sys._getframe`.
-                unsafe { (*frame).mark_as_escaped() };
-                return Ok(frame as pyre_object::PyObjectRef);
+            if frame.is_null() {
+                return Ok(pyre_object::w_none());
             }
-            let (w_code, lineno) = unsafe {
-                (
-                    crate::pytraceback::w_pytraceback_get_w_code(tb),
-                    crate::pytraceback::w_pytraceback_get_lineno(tb),
-                )
-            };
-            Ok(crate::module::sys::vm::make_traceback_frame_stub(
-                w_code, lineno,
-            ))
+            // Mark escaped so the JIT keeps the frame materialised for
+            // the exposed reference (pyframe.py:176 `mark_as_escaped`),
+            // mirroring `sys._getframe`.
+            unsafe { (*frame).mark_as_escaped() };
+            Ok(frame as pyre_object::PyObjectRef)
         },
         2,
     );

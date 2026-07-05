@@ -71,45 +71,6 @@ fn make_sys_namespace_instance() -> PyObjectRef {
 }
 
 
-/// Build a `sys.namespace` frame stub for `traceback.tb_frame`
-/// (`typedef.rs init_pytraceback_type`).
-///
-/// A traceback outlives its frame — `PyTraceback.frame` dangles once
-/// the frame is freed — so the live `f_locals`/`f_globals` cannot be
-/// read back the way `build_frame_stub_chain` reads them from a still
-/// live `_getframe` stack.  The stub therefore carries only the data
-/// the traceback retains: `f_code` (from the stamped `w_code`) and
-/// `f_lineno` (from the stamped line number), plus empty
-/// `f_globals`/`f_locals` dicts, a `None` `f_back`, and a no-op
-/// `clear`.  That is enough for `traceback.clear_frames`
-/// (`tb.tb_frame.clear()`) and `unittest`'s
-/// `'__unittest' in tb.tb_frame.f_globals` traceback filter to run
-/// without `AttributeError`.  Reusing the `sys.namespace` type keeps
-/// `types.FrameType` (`type(tb.tb_frame)`) identical to
-/// `type(sys._getframe())`.
-pub(crate) fn make_traceback_frame_stub(w_code: PyObjectRef, lineno: i64) -> PyObjectRef {
-    let stub = make_sys_namespace_instance();
-    crate::baseobjspace::setdictvalue(stub, "f_globals", w_dict_new());
-    crate::baseobjspace::setdictvalue(stub, "f_locals", w_dict_new());
-    // `traceback._compute_suggestion_error` reads `frame.f_builtins` to
-    // build "did you mean" hints for a NameError; an empty dict keeps that
-    // path from raising while simply offering no builtin-name suggestions.
-    crate::baseobjspace::setdictvalue(stub, "f_builtins", w_dict_new());
-    crate::baseobjspace::setdictvalue(
-        stub,
-        "f_code",
-        if w_code.is_null() { w_none() } else { w_code },
-    );
-    crate::baseobjspace::setdictvalue(stub, "f_lineno", w_int_new(lineno));
-    crate::baseobjspace::setdictvalue(stub, "f_back", w_none());
-    crate::baseobjspace::setdictvalue(
-        stub,
-        "clear",
-        crate::make_builtin_function("clear", |_| Ok(w_none())),
-    );
-    stub
-}
-
 /// `pypy/module/sys/vm.py:217 space.getexecutioncontext()` access for
 /// `sys.gettrace`/`settrace`/`getprofile`/`setprofile`.
 ///

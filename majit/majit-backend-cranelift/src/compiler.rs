@@ -368,12 +368,8 @@ pub fn install_gc_standalone(mut gc: Box<dyn GcAllocator>) {
     majit_gc::set_active_alloc_nursery_collecting_typed(Some(
         alloc_nursery_collecting_typed_via_active_runtime,
     ));
-    majit_gc::set_active_charge_memory_pressure(Some(
-        charge_memory_pressure_via_active_runtime,
-    ));
-    majit_gc::set_active_charge_oldgen_external(Some(
-        charge_oldgen_external_via_active_runtime,
-    ));
+    majit_gc::set_active_charge_memory_pressure(Some(charge_memory_pressure_via_active_runtime));
+    majit_gc::set_active_charge_oldgen_external(Some(charge_oldgen_external_via_active_runtime));
     majit_gc::set_active_alloc_oldgen_typed(Some(alloc_oldgen_typed_via_active_runtime));
     majit_gc::set_active_collect_full(Some(collect_full_via_active_runtime));
     majit_gc::set_active_collect_oldgen(Some(collect_oldgen_nonmoving_via_active_runtime));
