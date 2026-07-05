@@ -2335,8 +2335,8 @@ pub fn dispatch_via_miframe(
     // `fbw_foriter_body_pc_from_op_pc` read it.  This is the PRODUCTION
     // default tracer: `trace.rs` enters `full_body_walk_trace` whenever
     // `PYRE_FULL_BODY_WALK` is not explicitly `0` (the env gate defaults ON),
-    // so `FULL_BODY_SNAPSHOT_SYM` is non-null on every default-JIT and
-    // `PYRE_57_INLINE_NEXT=1` run.  `PYRE_FULL_BODY_WALK=0` is the only opt-out
+    // so `FULL_BODY_SNAPSHOT_SYM` is non-null on every default-JIT
+    // run.  `PYRE_FULL_BODY_WALK=0` is the only opt-out
     // (the transitional trait leg), which leaves the pointer null.
     let _full_body_guard = FullBodySnapshotSymGuard::set(sym_ptr);
 

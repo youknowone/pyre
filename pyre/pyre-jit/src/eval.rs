@@ -3622,10 +3622,7 @@ fn unsupported_jit_shape(code: &pyre_interpreter::CodeObject) -> UnsupportedJitS
     // `list.append`/`STORE_SUBSCR` cannot deliver or rewind that effect, so the
     // iteration is silently dropped (#57). Bodies with no explicit
     // mutation/call and no nested `FOR_ITER` cannot reach that path — verified
-    // against the battery and adversarial mutation probes. `PYRE_57_INLINE_NEXT=0`
-    // is a kill-switch that restores the pre-flip behaviour (every FOR_ITER
-    // frame runs in the interpreter). Callees are allowed to enter the JIT; this
-    // is not a structural region boundary.
+    // against the battery and adversarial mutation probes.
     let mut arg_state = pyre_interpreter::OpArgState::default();
     let mut has_for_iter = false;
     for unit in code.instructions.iter().copied() {
