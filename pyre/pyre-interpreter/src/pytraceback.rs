@@ -75,9 +75,11 @@ pub const PYTRACEBACK_W_NEXT_OFFSET: usize = std::mem::offset_of!(PyTraceback, w
 pub const PYTRACEBACK_LINENO_OFFSET: usize = std::mem::offset_of!(PyTraceback, lineno);
 pub const PYTRACEBACK_W_CODE_OFFSET: usize = std::mem::offset_of!(PyTraceback, w_code);
 
-/// GC type id assigned to `PyTraceback`.  Next free slot after
-/// `W_DICT_VIEW_ITERATOR_GC_TYPE_ID = 42` in pyre-object.
-pub const PYTRACEBACK_GC_TYPE_ID: u32 = 43;
+/// GC type id assigned to `PyTraceback`.  Pre-registered in
+/// `pyre-jit/src/eval.rs` immediately after `PyCode`
+/// (`W_CODE_GC_TYPE_ID = 43`), so it takes the next slot (44); the
+/// registration site pins this with a `debug_assert_eq!`.
+pub const PYTRACEBACK_GC_TYPE_ID: u32 = 44;
 
 pub const PYTRACEBACK_OBJECT_SIZE: usize = std::mem::size_of::<PyTraceback>();
 
@@ -109,7 +111,7 @@ pub fn w_pytraceback_new(
     pyre_object::gc_roots::pin_root(w_next);
     pyre_object::gc_roots::pin_root(w_code);
 
-    pyre_object::lltype::malloc_typed(PyTraceback {
+    let value = PyTraceback {
         ob_header: PyObject {
             ob_type: &PYTRACEBACK_TYPE as *const PyType,
             w_class: get_instantiate(&PYTRACEBACK_TYPE),
@@ -119,7 +121,34 @@ pub fn w_pytraceback_new(
         w_next,
         lineno,
         w_code,
-    }) as PyObjectRef
+    };
+
+    // Executing frames are GC-managed non-moving oldgen blocks
+    // (`PYFRAME_GC_TYPE_ID`); to keep `tb_frame` alive across the
+    // traceback's lifetime the traceback itself must be a GC object
+    // whose `pytraceback_object_custom_trace` forwards the `frame`
+    // edge.  Allocate into oldgen (non-moving — raw `*mut PyTraceback`
+    // readers and the exception `w_traceback` chain hold bare
+    // pointers), mirroring `FrameBox::new` (`pyframe.rs:307`).  Before
+    // the GC hook is wired (bootstrap, tests) `try_gc_alloc_stable`
+    // returns `None`; fall back to the leaked `malloc_typed` block.
+    if let Some(raw) =
+        pyre_object::gc_hook::try_gc_alloc_stable(PYTRACEBACK_GC_TYPE_ID, PYTRACEBACK_OBJECT_SIZE)
+            .filter(|p| !p.is_null())
+    {
+        pyre_object::gc_interp::note_alloc();
+        let ptr = raw as *mut PyTraceback;
+        unsafe {
+            std::ptr::write(ptr, value);
+        }
+        // The oldgen traceback references the freshly-born `w_next` /
+        // `w_code` (and, once GC-owned, the frame); remember it for the
+        // next minor tracer.
+        pyre_object::gc_hook::try_gc_write_barrier(raw);
+        return ptr as PyObjectRef;
+    }
+
+    pyre_object::lltype::malloc_typed(value) as PyObjectRef
 }
 
 /// # Safety
@@ -318,7 +347,7 @@ mod tests {
 
     #[test]
     fn pytraceback_gc_type_id_matches_descr() {
-        assert_eq!(PYTRACEBACK_GC_TYPE_ID, 43);
+        assert_eq!(PYTRACEBACK_GC_TYPE_ID, 44);
         assert_eq!(
             <PyTraceback as pyre_object::lltype::GcType>::type_id(),
             PYTRACEBACK_GC_TYPE_ID

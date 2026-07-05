@@ -345,6 +345,40 @@ unsafe fn generator_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut 
     }
 }
 
+/// Custom trace for `PyTraceback` (`pytraceback.py:17 PyTraceback`).
+///
+/// PyPy's `PyTraceback.frame` is a normal `PyFrame` W_Root, so its
+/// tracer reaches the frame (and thence its locals / `f_backref`
+/// chain) through the ordinary reference.  Pyre stores `frame` as a
+/// raw `*mut PyFrame` and the two `PyObjectRef` slots (`w_next`,
+/// `w_code`) inline; none are reachable through `gc_ptr_offsets`
+/// (the type was registered with empty offsets), so forward all three
+/// here:
+///
+///   * `w_next` — the chained caller-side traceback link.
+///   * `w_code` — the raising frame's PyCode snapshot (kept alive so
+///     source-path / function-name metadata survives).
+///   * `frame` — forwarded as a managed edge **only** when
+///     `try_gc_owns_object(frame)` holds (an executing/oldgen frame,
+///     `PYFRAME_GC_TYPE_ID`).  Mark greys the frame block and its own
+///     `pyframe_object_custom_trace` recurses into locals/cells/
+///     valuestack and the `f_backref` chain, so a frame reachable only
+///     through a live traceback (the whole point of `tb_frame`) is not
+///     reclaimed.  A non-Gc frame (Box tracer snapshot / arena callee,
+///     already freed by the time the traceback escapes) is left
+///     dangling exactly as before — never dereferenced.
+unsafe fn pytraceback_object_custom_trace(
+    obj_addr: usize,
+    f: &mut dyn FnMut(*mut majit_ir::GcRef),
+) {
+    let tb = unsafe { &mut *(obj_addr as *mut pyre_interpreter::pytraceback::PyTraceback) };
+    f(&mut tb.w_next as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    f(&mut tb.w_code as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    if !tb.frame.is_null() && pyre_object::gc_hook::try_gc_owns_object(tb.frame as *mut u8) {
+        f(&mut tb.frame as *mut *mut pyre_interpreter::pyframe::PyFrame as *mut majit_ir::GcRef);
+    }
+}
+
 unsafe fn dict_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     // Strategy-side dispatch — `W_DictObject.dstorage: *mut u8` erases
     // the storage layout, so each strategy walks its own native shape
@@ -631,8 +665,10 @@ unsafe fn pyframe_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut ma
             // GC-managed (moving) nursery block: hand the collector the
             // array field slot; the type-9 varsize walker forwards the
             // items once the array itself is copied.
-            f(&mut frame.locals_cells_stack_w as *mut *mut pyre_object::FixedObjectArray
-                as *mut majit_ir::GcRef);
+            f(
+                &mut frame.locals_cells_stack_w as *mut *mut pyre_object::FixedObjectArray
+                    as *mut majit_ir::GcRef,
+            );
         } else {
             // Stationary `std::alloc` block (type_id 0, never entered by
             // `trace_and_update_object`): forward each item in place. Walk
@@ -1654,6 +1690,35 @@ thread_local! {
             &pyre_interpreter::pycode::CODE_TYPE as *const _ as usize,
             w_code_tid,
         );
+        // `pytraceback.py:17 PyTraceback` — pre-registered here, right
+        // after PyCode, with a custom trace that forwards `w_next` /
+        // `w_code` and (when GC-owned) the raw `frame` edge so a frame
+        // reachable only through `tb.tb_frame` survives.  Like PyCode it
+        // stays in `all_foreign_pytypes()` and is skipped by the loop's
+        // `contains_key` guard, so the net register-call count through
+        // `W_MODULE_DICT_GC_TYPE_ID = 48` is unchanged (one explicit
+        // registration here, one fewer from the loop) — no downstream
+        // hardcoded tid shifts.  Allocation routes through
+        // `try_gc_alloc_stable` (`w_pytraceback_new`), so the trace fires
+        // for real oldgen tracebacks.
+        let w_pytraceback_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
+            std::mem::size_of::<pyre_interpreter::pytraceback::PyTraceback>(),
+            object_tid,
+            pytraceback_object_custom_trace,
+        ));
+        debug_assert_eq!(
+            w_pytraceback_tid,
+            pyre_interpreter::pytraceback::PYTRACEBACK_GC_TYPE_ID
+        );
+        majit_gc::GcAllocator::register_vtable_for_type(
+            &mut gc,
+            &pyre_interpreter::pytraceback::PYTRACEBACK_TYPE as *const _ as usize,
+            w_pytraceback_tid,
+        );
+        pytype_to_tid.insert(
+            &pyre_interpreter::pytraceback::PYTRACEBACK_TYPE as *const _ as usize,
+            w_pytraceback_tid,
+        );
         // W_ObjectObject's PyType (`INSTANCE_TYPE`) stays bound to
         // `object_tid` (`OBJECT_GC_TYPE_ID = 0`) in `pytype_to_tid`:
         // it is the `object` root, and giving the *vtable* a separate
@@ -1672,10 +1737,11 @@ thread_local! {
         // `int_between(cls.min, subcls.min, cls.max)` (rclass.py:1133).
         // `pyre_object::pyobject::all_foreign_pytypes()` covers object
         // module PyTypes; `pyre_interpreter::all_foreign_pytypes()`
-        // covers interpreter-level PyTypes (PYTRACEBACK_TYPE /
-        // FUNCTION_TYPE / BUILTIN_CODE_TYPE) that flow through tracing as
-        // constant callable/code pointers.  `CODE_TYPE` is pre-registered
-        // above (tid 43) and so skipped here by the `contains_key` guard.
+        // covers interpreter-level PyTypes (FUNCTION_TYPE /
+        // BUILTIN_CODE_TYPE) that flow through tracing as constant
+        // callable/code pointers.  `CODE_TYPE` and `PYTRACEBACK_TYPE` are
+        // both pre-registered above and so skipped here by the
+        // `contains_key` guard.
         for (pytype, parent) in pyre_object::pyobject::all_foreign_pytypes()
             .iter()
             .chain(pyre_interpreter::all_foreign_pytypes().iter())

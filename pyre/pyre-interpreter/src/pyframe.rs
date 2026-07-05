@@ -3476,8 +3476,8 @@ mod tests {
     // ── mark_stacks (f_lineno jump validation) ──
 
     use super::{
-        StackKind, mark_compatible_stack, mark_first_line_not_before, mark_lines, mark_stacks,
-        MARK_EMPTY_STACK, MARK_UNINITIALIZED,
+        MARK_EMPTY_STACK, MARK_UNINITIALIZED, StackKind, mark_compatible_stack,
+        mark_first_line_not_before, mark_lines, mark_stacks,
     };
 
     #[test]
@@ -3551,7 +3551,10 @@ mod tests {
         // loop iterator).
         let obj = super::mark_push_value(MARK_EMPTY_STACK, StackKind::Object);
         let iter = super::mark_push_value(MARK_EMPTY_STACK, StackKind::Iterator);
-        assert!(mark_compatible_stack(iter, obj), "Object target accepts any non-Null");
+        assert!(
+            mark_compatible_stack(iter, obj),
+            "Object target accepts any non-Null"
+        );
         assert!(
             !mark_compatible_stack(obj, iter),
             "Iterator target rejects Object source"

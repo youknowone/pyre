@@ -3514,16 +3514,29 @@ fn init_pytraceback_type(ns: &mut DictStorage) {
         make_getset_property_named(next_getter, next_setter, pyre_object::PY_NULL, "tb_next"),
     );
 
-    // pytraceback.py:34 descr_get_tb_frame — `PyFrame` is not a
-    // Python-visible W_Root, so return a `sys.namespace` frame stub
-    // built from the data the traceback retains (`w_code` + stamped
-    // line number).  Convergence path documented in `pytraceback.rs`.
+    // pytraceback.py:34 descr_get_tb_frame — return the live `PyFrame`
+    // itself (`FRAME_TYPE` typedef) as the user-visible `frame` object.
+    // The traceback keeps the raising frame's chain reachable through
+    // `pytraceback_object_custom_trace`, so a GC-owned frame is still
+    // alive here.  The guard must match the custom_trace's guard
+    // (`try_gc_owns_object`): only frames forwarded as managed edges
+    // survive; a non-Gc frame (Box tracer snapshot / already-freed arena
+    // callee, never forwarded) falls back to the `sys.namespace` stub
+    // built from the retained `w_code` + stamped line number.
     let frame_getter = make_builtin_function_with_arity(
         "tb_frame",
         |args| {
             let tb = args[1];
             if tb.is_null() {
                 return Ok(pyre_object::w_none());
+            }
+            let frame = unsafe { crate::pytraceback::w_pytraceback_get_frame(tb) };
+            if !frame.is_null() && pyre_object::gc_hook::try_gc_owns_object(frame as *mut u8) {
+                // Mark escaped so the JIT keeps the frame materialised for
+                // the exposed reference (pyframe.py:176 `mark_as_escaped`),
+                // mirroring `sys._getframe`.
+                unsafe { (*frame).mark_as_escaped() };
+                return Ok(frame as pyre_object::PyObjectRef);
             }
             let (w_code, lineno) = unsafe {
                 (
@@ -3612,7 +3625,11 @@ fn init_frame_type(ns: &mut DictStorage) {
                 return Ok(pyre_object::w_none());
             }
             let w = unsafe { &*f }.get_w_globals();
-            Ok(if w.is_null() { pyre_object::w_none() } else { w })
+            Ok(if w.is_null() {
+                pyre_object::w_none()
+            } else {
+                w
+            })
         },
         2,
     );
@@ -3632,7 +3649,11 @@ fn init_frame_type(ns: &mut DictStorage) {
                 return Ok(pyre_object::w_none());
             }
             let w = unsafe { &mut *f }.getdictscope()?;
-            Ok(if w.is_null() { pyre_object::w_dict_new() } else { w })
+            Ok(if w.is_null() {
+                pyre_object::w_dict_new()
+            } else {
+                w
+            })
         },
         2,
     );
@@ -3692,7 +3713,11 @@ fn init_frame_type(ns: &mut DictStorage) {
                 return Ok(pyre_object::w_none());
             }
             let w = unsafe { &*f }.fget_f_builtins();
-            Ok(if w.is_null() { pyre_object::w_none() } else { w })
+            Ok(if w.is_null() {
+                pyre_object::w_none()
+            } else {
+                w
+            })
         },
         2,
     );
@@ -3768,7 +3793,11 @@ fn init_frame_type(ns: &mut DictStorage) {
                 return Ok(pyre_object::w_none());
             }
             let w = unsafe { &*f }.fget_f_trace();
-            Ok(if w.is_null() { pyre_object::w_none() } else { w })
+            Ok(if w.is_null() {
+                pyre_object::w_none()
+            } else {
+                w
+            })
         },
         2,
     );
