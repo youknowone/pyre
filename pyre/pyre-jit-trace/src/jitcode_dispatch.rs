@@ -10188,7 +10188,7 @@ fn compute_inline_caller_frame(
     }
     let (jitcode_index, fallthrough_py_pc, code_ptr) = unsafe {
         let jc = &*caller_sym.jitcode;
-        if jc.payload.code_ptr.is_null() || jc.payload.metadata.pc_map.is_empty() {
+        if jc.payload.code_ptr.is_null() || !jc.payload.is_populated() {
             return None;
         }
         let call_py = python_pc_for_jitcode_pc(&jc.payload.metadata, call_jit_pc) as usize;
@@ -10267,7 +10267,7 @@ fn compute_nested_inline_caller_frame(
 ) -> Option<InlineParentFrame> {
     let jitcode_index = crate::state::ensure_jitcode_index(caller_code as *const ())? as u32;
     let pjc = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32)?;
-    if pjc.metadata.pc_map.is_empty() || pjc.code_ptr.is_null() {
+    if !pjc.is_populated() || pjc.code_ptr.is_null() {
         return None;
     }
     let call_py = python_pc_for_jitcode_pc(&pjc.metadata, call_jit_pc) as usize;
@@ -10359,7 +10359,7 @@ fn walker_capture_multi_frame_inline_snapshot(
     let Some(callee_pjc) = crate::state::pyjitcode_for_jitcode_index(callee_jitcode_index) else {
         return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: callee_op_pc });
     };
-    if callee_pjc.metadata.pc_map.is_empty() || callee_pjc.code_ptr.is_null() {
+    if !callee_pjc.is_populated() || callee_pjc.code_ptr.is_null() {
         return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: callee_op_pc });
     }
     let callee_py_pc = unsafe {
