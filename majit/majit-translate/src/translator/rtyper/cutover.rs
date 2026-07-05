@@ -659,10 +659,14 @@ fn colored_operand_vars(graph: &LegacyGraph) -> std::collections::HashSet<Variab
             if link.target != graph.exceptblock {
                 continue;
             }
-            for arg in &link.args {
-                if let crate::model::LinkArg::Value(v) = arg {
-                    operands.insert(v.clone());
-                }
+            // `flatten.py:139-143 make_return`: the 2-arg exception link emits
+            // `raise` coloring ONLY `args[1]` (the exception *value* / evalue);
+            // `args[0]` (the exception *type* / etype) is not passed to
+            // `getcolor`.  Mirror that — color the evalue operand alone, so a
+            // `real=Void` refinement on the (uncolored) etype is not falsely
+            // treated as a colored divergence.
+            if let Some(crate::model::LinkArg::Value(v)) = link.args.get(1) {
+                operands.insert(v.clone());
             }
         }
     }
@@ -736,10 +740,22 @@ fn dead_op_result_vars(graph: &LegacyGraph) -> std::collections::HashSet<Variabl
     }
     let mut dead = std::collections::HashSet::new();
     for block in &graph.blocks {
-        for op in &block.operations {
+        // `canremove(op, block)` (`simplify.py:441`) also excludes the
+        // block's `raising_op` — `block.operations[-1]` whenever the block
+        // raises (`block.canraise()`, exitswitch is `c_last_exception`).  A
+        // `canremove`-classified op parked there as an overflow / bounds /
+        // zero-divide check must keep its result: the raise side effect is
+        // observable, so the real path does NOT drop it either.
+        let raising_op_idx = if block.canraise() && !block.operations.is_empty() {
+            Some(block.operations.len() - 1)
+        } else {
+            None
+        };
+        for (i, op) in block.operations.iter().enumerate() {
             if let Some(r) = &op.result
                 && !op_read.contains(r)
                 && op_result_can_remove(&op.kind)
+                && Some(i) != raising_op_idx
             {
                 dead.insert(r.clone());
             }
@@ -3426,16 +3442,61 @@ mod tests {
 
     #[test]
     fn collect_divergences_rejects_gcref_to_void_on_raise_operand() {
-        // A `GcRef`→`Void` refinement on a var the emit path colors is
-        // NOT the sound dropped-unit case: the exceptblock raise operand
-        // is colored unconditionally (`make_return` 2-arg arm,
-        // `flatten.py:143`), so a `Void` there hits the uncolored-`Void`
-        // `getcolor` panic.  Keep it a divergence → Skip.
+        // A `GcRef`→`Void` refinement on the raise *evalue* (the exceptblock
+        // link `args[1]`, the only exception operand `flatten.py:143` colors)
+        // is NOT the sound dropped-unit case: a `Void` there hits the
+        // uncolored-`Void` `getcolor` panic.  `diff_single_raise_operand`
+        // forwards `v1` into both link positions, so it occupies `args[1]`.
+        // Keep it a divergence → Skip.
         assert_eq!(
             diff_single_raise_operand(ConcreteType::GcRef, ConcreteType::Void).len(),
             1,
-            "legacy=GcRef, real=Void on a colored raise operand is a divergence, \
+            "legacy=GcRef, real=Void on a colored raise evalue is a divergence, \
              not the accepted returnblock unit drop"
+        );
+    }
+
+    #[test]
+    fn colored_operand_vars_colors_only_the_raise_evalue() {
+        // `flatten.py:139-143`: the 2-arg exception link emits `raise`
+        // coloring ONLY `args[1]` (the evalue); `args[0]` (the etype) is not
+        // passed to `getcolor`.  Build `start(etype, evalue) -> exceptblock`
+        // with distinct operands and confirm only the evalue is colored.
+        let mut graph = LegacyGraph::new("raise_operand_probe");
+        let vars = mint_vars(&mut graph, 2);
+        let etype = vars[0].clone();
+        let evalue = vars[1].clone();
+        let startblock = Block {
+            id: graph.startblock,
+            inputargs: block_inputargs(&vars, &[0, 1]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![crate::model::Link::new_mixed(
+                vec![LinkArg::Value(etype.clone()), LinkArg::Value(evalue.clone())],
+                graph.exceptblock,
+                None,
+            )],
+            framestate: None,
+            dead: false,
+        };
+        let exceptblock = Block {
+            id: graph.exceptblock,
+            inputargs: block_inputargs(&vars, &[0, 1]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        };
+        graph.blocks = vec![startblock, exceptblock];
+        let colored = colored_operand_vars(&graph);
+        assert!(
+            colored.contains(&evalue),
+            "the raise evalue (args[1]) is colored"
+        );
+        assert!(
+            !colored.contains(&etype),
+            "the raise etype (args[0]) is NOT colored"
         );
     }
 
@@ -3917,6 +3978,67 @@ mod tests {
             diff_dead_op_result(ConcreteType::Signed).is_empty(),
             "a Signed dead op result of a canremove op is the dead-var-pass \
              artifact, not a divergence"
+        );
+    }
+
+    #[test]
+    fn dead_op_result_vars_excludes_the_raising_op() {
+        // `canremove(op, block)` also excludes `block.raising_op`
+        // (`simplify.py:441`): a `canremove`-classified op that is the last
+        // op of a raising block (exitswitch `LastException`) keeps its result
+        // even when unread, because the raise side effect is observable.  Two
+        // graphs with an identical unread `ArrayRead` last op differ only in
+        // whether the block raises; the read is classified dead in the
+        // non-raising graph and NOT in the raising one.
+        let build = |raises: bool| {
+            let mut graph = LegacyGraph::new("raising_probe");
+            let vars = mint_vars(&mut graph, 3);
+            let base = vars[0].clone();
+            let index = vars[1].clone();
+            let dead = vars[2].clone();
+            let read = crate::model::SpaceOperation {
+                result: Some(dead.clone()),
+                kind: crate::model::OpKind::ArrayRead {
+                    base: base.clone(),
+                    index: index.clone(),
+                    item_ty: ValueType::Int,
+                    array_type_id: None,
+                    nolength: false,
+                    pure: false,
+                },
+            };
+            let (exitswitch, exits) = if raises {
+                (
+                    Some(crate::model::ExitSwitch::LastException),
+                    vec![
+                        link_to_returnblock(vec![], graph.returnblock),
+                        crate::model::Link::new_mixed(vec![], graph.exceptblock, None),
+                    ],
+                )
+            } else {
+                (None, vec![link_to_returnblock(vec![], graph.returnblock)])
+            };
+            let block = Block {
+                id: graph.startblock,
+                inputargs: block_inputargs(&vars, &[0, 1]),
+                operations: vec![read],
+                exitswitch,
+                exits,
+                framestate: None,
+                dead: false,
+            };
+            graph.blocks = vec![block];
+            (graph, dead)
+        };
+        let (nonraising, dead_n) = build(false);
+        assert!(
+            dead_op_result_vars(&nonraising).contains(&dead_n),
+            "an unread canremove op result in a non-raising block is dead"
+        );
+        let (raising, dead_r) = build(true);
+        assert!(
+            !dead_op_result_vars(&raising).contains(&dead_r),
+            "the raising op's result is NOT dead even when unread"
         );
     }
 
