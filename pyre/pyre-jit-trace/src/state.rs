@@ -5166,13 +5166,14 @@ fn rd_virtual_at(
     rd_virtuals.and_then(|v| v.get(vidx)).map(|rc| &**rc)
 }
 
-/// P2 multi-frame bridge drain (`PYRE_P2_DRAIN`, default OFF): gates BOTH the
-/// `set_bridge_inline_carrier` decision and the `trace.rs` carrier drain. The
-/// carrier overrides the trace-start pc to the outermost frame's pc, which is
-/// only correct when the drain actually rebuilds + traces the reconstructed
-/// callee framestack forward; without the drain a carrier resume would resume
-/// the innermost frame at the root pc. Until the drain is net-positive the gate
-/// stays off so the bridge falls back to the single-frame resume.
+/// P2 multi-frame bridge drain (`PYRE_P2_DRAIN`, default OFF): gates the
+/// `trace.rs` carrier drain sub-walk+inject deviation. The carrier itself is
+/// installed for every `frames.len() > 1` resume (safety floor: a carrier routes
+/// a hot multi-frame guard to the `CarrierAbort` blackhole instead of the
+/// degenerate root-at-innermost-pc bridge); this gate only selects the drain
+/// driver over the default framestack path. Until the drain is net-positive the
+/// gate stays off so a carrier resume falls through to the framestack walk /
+/// clean abort.
 pub(crate) fn p2_drain_enabled() -> bool {
     std::env::var_os("PYRE_P2_DRAIN").is_some()
 }
@@ -8303,7 +8304,7 @@ impl JitState for PyreJitState {
                 resume_data.frames.len()
             );
         }
-        if (p2_drain_enabled() || p2_framestack_enabled()) && resume_data.frames.len() > 1 {
+        if resume_data.frames.len() > 1 {
             let root_pc_valid = resume_data.frames[0].pc >= 0;
             let root_pc = if root_pc_valid {
                 resume_data.frames[0].pc as usize
