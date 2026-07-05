@@ -2125,22 +2125,6 @@ fn bridge_source_identity_from_descr(
 /// On failure (trace abort, start failure), returns false so the caller
 /// falls through to resume_in_blackhole (RPython pyjitpl.py:2906-2907
 /// SwitchToBlackhole → run_blackhole_interp_to_cancel_tracing).
-/// Runtime toggle for the wasm bridge tracer (default ON). The runner's
-/// `pyre_jit_set_enable_bridges` export flips it (`PYRE_WASM_ENABLE_BRIDGES=0`
-/// disables) so chaining can be A/B-measured without rebuilding the guest
-/// module.
-#[cfg(target_arch = "wasm32")]
-pub static WASM_BRIDGES_ENABLED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(true);
-
-/// Set the wasm bridge-tracer enable flag (see `WASM_BRIDGES_ENABLED`).
-#[cfg(target_arch = "wasm32")]
-pub fn set_wasm_bridges_enabled(enabled: bool) {
-    WASM_BRIDGES_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
-}
-
-// On wasm the early decline makes the native bridge body unreachable when the
-// tracer is disabled; the suppression is intentional and wasm-only.
 // dont_look_inside: bridge-compile machinery the tracer must not enter.
 #[cfg_attr(target_arch = "wasm32", allow(unreachable_code))]
 #[majit_macros::dont_look_inside]
@@ -2182,23 +2166,6 @@ pub fn trace_and_compile_from_bridge(
         // the caller into `resume_in_blackhole` (pyjitpl.py:711).
         return false;
     };
-
-    // Wasm bridge tracer kill switch (`WASM_BRIDGES_ENABLED`, default ON):
-    // declining here drops every guard failure to blackhole-from-guard, the
-    // chaining-free fallback, for A/B measurement.
-    #[cfg(target_arch = "wasm32")]
-    if !WASM_BRIDGES_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
-        let _ = (
-            frame,
-            raw_values,
-            exit_layout,
-            guard_exc,
-            green_key,
-            trace_id,
-            fail_index,
-        );
-        return false;
-    }
 
     let info = {
         let (_, info) = crate::eval::driver_pair();

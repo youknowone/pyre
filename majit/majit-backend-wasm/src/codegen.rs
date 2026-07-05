@@ -751,10 +751,6 @@ pub fn build_wasm_module(
     // (see `NurseryAllocParams`); `None` keeps allocations on the helper.
     nursery: Option<&NurseryAllocParams>,
     fail_index_base: u32,
-    // Whether this trace is compiled as a LOOP (`compile_loop`) rather than a
-    // bridge. The base alone cannot tell them apart: both draw it from the
-    // global fail-index space (`failguard::fail_descr_base`).
-    is_loop: bool,
     // Table slot of the loop a JUMP-with-no-local-LABEL re-enters (a loop-closing
     // bridge). `0` for a loop trace (its JUMP is a local back-edge `br`) and for a
     // straight-line bridge (no JUMP). When set, the terminal external JUMP writes
@@ -792,17 +788,12 @@ pub fn build_wasm_module(
     // trace reads it and `compile_bridge` (guest-side) writes it. On native
     // builds the trace is never executed, so `alloc_bridge_cells` returns 0 and
     // the dispatch is omitted entirely — the module stays byte-identical.
-    // Label-less traces that still want guard cells: the self-recursive
-    // CALL_ASSEMBLER case (`PYRE_WASM_CA`) chains a guard exit of a Label-less
-    // recursion LOOP (`is_loop`, not a bridge) into its CA bridge; and with
-    // bridge chaining on, a BRIDGE's own guards chain nested sub-bridges the
+    // Label-less traces still want guard cells: the self-recursive
+    // CALL_ASSEMBLER case chains a guard exit of a Label-less recursion LOOP
+    // into its CA bridge, and a BRIDGE's own guards chain nested sub-bridges the
     // same way (a hot guard inside a chained bridge would otherwise round-trip
-    // to the host forever). Both gated on their runtime flags, so flag-off
-    // stays byte-identical.
-    let want_dispatch = !guards.is_empty()
-        && (ops.iter().any(|op| op.opcode == OpCode::Label)
-            || (is_loop && crate::wasm_ca_enabled())
-            || (!is_loop && crate::wasm_bridges_enabled()));
+    // to the host forever). So any guarded trace wants dispatch cells.
+    let want_dispatch = !guards.is_empty();
     let (cells_base, cells_owner) = if want_dispatch {
         alloc_bridge_cells(guards.len())
     } else {

@@ -11267,8 +11267,8 @@ fn output_type_is_objectptr(ty: &TyRef, llbc: &Llbc) -> bool {
 ///     keys on a leaf-ish form after stripping wrappers).
 ///
 /// Shapes the resolver does not yet recognise produce a `??<key>:<json>`
-/// marker so the differential gate (`PYRE_STRUCT_DIFF`) surfaces them
-/// for a follow-up widening rather than silently mislabelling a field.
+/// marker that surfaces them for a follow-up widening rather than silently
+/// mislabelling a field.
 fn tyref_to_ast_string(ty: &TyRef, llbc: &Llbc) -> String {
     let body = match ty {
         TyRef::Inline { value: (_, v) } => Some(v),

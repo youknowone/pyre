@@ -244,36 +244,6 @@ fn run(module_path: &PathBuf, source: &str) -> Result<i32> {
     let run_python = instance.get_typed_func::<(u32, u32), u64>(&mut store, "pyre_run_python")?;
     let dealloc = instance.get_typed_func::<(u32, u32), ()>(&mut store, "pyre_dealloc")?;
 
-    // Wasm bridge tracer (inter-trace chaining) is ON by default in the guest;
-    // PYRE_WASM_ENABLE_BRIDGES=0 disables it (any other value re-enables) for
-    // A/B measurement. No-op if the export is absent (older modules).
-    if let Ok(v) = std::env::var("PYRE_WASM_ENABLE_BRIDGES") {
-        if let Ok(f) = instance.get_typed_func::<u32, ()>(&mut store, "pyre_jit_set_enable_bridges")
-        {
-            f.call(&mut store, u32::from(v != "0"))?;
-        }
-    }
-
-    // Inline nursery-bump allocation fast path is ON by default in the guest;
-    // PYRE_WASM_INLINE_ALLOC=0 disables it (any other value re-enables) for
-    // A/B measurement. No-op if the export is absent (older modules).
-    if let Ok(v) = std::env::var("PYRE_WASM_INLINE_ALLOC") {
-        if let Ok(f) = instance.get_typed_func::<u32, ()>(&mut store, "pyre_jit_set_inline_alloc") {
-            f.call(&mut store, u32::from(v != "0"))?;
-        }
-    }
-
-    // Self-recursive CALL_ASSEMBLER guest→guest `call_indirect` arm is ON by
-    // default in the guest; PYRE_WASM_CA=0 disables it (any other value
-    // re-enables) for A/B measurement. The guest has no environment, so the
-    // flag is plumbed through this export. No-op if the export is absent
-    // (older modules).
-    if let Ok(v) = std::env::var("PYRE_WASM_CA") {
-        if let Ok(f) = instance.get_typed_func::<u32, ()>(&mut store, "pyre_jit_set_wasm_ca") {
-            f.call(&mut store, u32::from(v != "0"))?;
-        }
-    }
-
     let src = source.as_bytes();
     let len = src.len() as u32;
     let in_ptr = if len == 0 {

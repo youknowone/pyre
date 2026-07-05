@@ -623,8 +623,9 @@ pub struct WalkContext<'frame, 'static_a: 'frame> {
     /// and `stack_sync` falls back to the legacy read (zero regression).
     ///
     /// SLICE 1 (#423): infrastructure landed fully INERT — the mirror is
-    /// maintained but the snapshot read stays LEGACY unless `PYRE_VSTACK_USE`
-    /// is set; `PYRE_VSTACK_DIAG` only logs mirror-vs-legacy disagreement.
+    /// maintained as side-data but the snapshot read stays LEGACY (no
+    /// authoritative flip is wired); `PYRE_VSTACK_DIAG` only logs
+    /// mirror-vs-legacy disagreement.
     pub vstack_boxes: Vec<OpRef>,
     /// #73: the absolute operand-stack depth `vstack_boxes` currently
     /// reflects — the depth ON ENTRY to the Python opcode at
@@ -1318,7 +1319,7 @@ pub fn step(
     // reconciles the previous opcode's stack effect into `ctx.vstack_boxes`
     // BEFORE this op runs.  Writes ONLY the new `vstack_*` fields — never
     // the existing registers / snapshot / control flow — so the mirror is
-    // pure side-data until a later slice flips `PYRE_VSTACK_USE`.  No-op
+    // pure side-data until a later slice makes the read authoritative.  No-op
     // unless the full-body walk owns the virtualizable shadow and the
     // mirror is still valid.
     step_vstack_mirror(ctx, pc);
@@ -2499,8 +2500,8 @@ pub fn dispatch_via_miframe(
         // Seed at the FIRST-walked jitcode pc (`position`), not `entry_py_pc`,
         // so the first `step_vstack_mirror` is a no-op (no spurious
         // entry-boundary reconcile of the not-yet-executed first opcode).
-        // Pure side-data: the snapshot read stays LEGACY unless a later slice
-        // flips `PYRE_VSTACK_USE`.
+        // Pure side-data: the snapshot read stays LEGACY until a later slice
+        // makes it authoritative.
         seed_vstack_mirror(&mut wc, sym, position);
         let outcome = walk(jitcode_code, position, &mut wc);
         // Read final last_exc_value before wc drops so the borrow
@@ -12526,9 +12527,8 @@ fn dispatch_residual_call_iRd_kind(
     // replacing the opaque `bh_call_fn` residual (orthodox descent of the
     // real `w_list_append` body; see `try_walker_orthodox_list_append`).  The
     // call arrives as `CallFn` with `dst_bank == 'r'` (the None result is a
-    // Ref, not void) and `r_args = [bound-method, PY_NULL, value]`.  Default
-    // ON (`PYRE_171_ORTHODOX=0` opts out); falls through to the
-    // residual for any non-matching shape (SAFE).  The eager append rides
+    // Ref, not void) and `r_args = [bound-method, PY_NULL, value]`.  Falls
+    // through to the residual for any non-matching shape (SAFE).  The eager append rides
     // `FBW_APPEND_JOURNAL`, whose commit/rollback epilogues run on FBW walk
     // ends (same lifecycle as the STORE_SUBSCR store journal).
     //
@@ -12553,8 +12553,8 @@ fn dispatch_residual_call_iRd_kind(
     // does not, verified by a two-list alternating-receiver append stress
     // (any wrong receiver box corrupts the cross-checked lists) and the
     // parity suite folding function-entry helper appends on both backends.
-    // #171 ORTHODOX descent (default ON — `PYRE_171_ORTHODOX=0` opts out):
-    // descend the real `w_list_append` body, recording its array ops native.
+    // #171 ORTHODOX descent: descend the real `w_list_append` body,
+    // recording its array ops native.
     // A decline (`None`) falls through to the generic residual below; an
     // un-lowered in-body helper aborts the trace (graceful interpreter
     // fallback).  Gated to top full-body frames, not inside a sub-walk.
@@ -12563,7 +12563,6 @@ fn dispatch_residual_call_iRd_kind(
         && !INLINE_SUBWALK_CAPTURE_BOUNDARY.with(|c| c.get())
         && dst_bank == 'r'
         && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
-        && pyre_171_orthodox_enabled()
         && try_walker_orthodox_list_append(ctx, code, op, &r_args, dst)?.is_some()
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
@@ -12576,8 +12575,7 @@ fn dispatch_residual_call_iRd_kind(
     // bound-method callable), so it arrives with `dst_bank == 'v'`.  Fold it
     // through the same `w_list_append` descent as the CallFn method-call form.
     // Gated to top full-body frames, not inside a sub-walk (same
-    // caller-side-effect doubling concern as the CallFn form).  Default ON
-    // (`PYRE_171_ORTHODOX=0` opts out).
+    // caller-side-effect doubling concern as the CallFn form).
     if ctx.is_authoritative_executor
         && ctx.is_full_body_walk
         && !INLINE_SUBWALK_CAPTURE_BOUNDARY.with(|c| c.get())
@@ -12593,9 +12591,7 @@ fn dispatch_residual_call_iRd_kind(
         // point in `try_walker_orthodox_list_append_opcode` is side-effect-free
         // (it declines BEFORE emitting any IR), so surfacing the abort here is
         // safe.  Mirrors the pre-#171 `emit_abort_permanent` lowering.
-        if pyre_171_orthodox_enabled()
-            && try_walker_orthodox_list_append_opcode(ctx, code, op, &r_args, dst)?.is_some()
-        {
+        if try_walker_orthodox_list_append_opcode(ctx, code, op, &r_args, dst)?.is_some() {
             return Ok((DispatchOutcome::Continue, op.next_pc));
         }
         return Err(DispatchError::UnfoldableListAppendResidualUnsupported { pc: op.pc });
@@ -15355,28 +15351,6 @@ fn try_walker_specialize_builtin_len(
     Ok(Some(()))
 }
 
-/// #171 orthodox descent gate (default ON — `PYRE_171_ORTHODOX=0` opts
-/// out).  The descent of the real `w_list_append` charon body is the
-/// `list.append` int-storage specialization; an unresolved in-body helper
-/// declines via `OrthodoxSubWalkTraceUnsupported` (graceful interpreter
-/// fallback), so a stale build-time jitcode never commits a wrong trace.
-fn pyre_171_orthodox_enabled() -> bool {
-    std::env::var("PYRE_171_ORTHODOX").as_deref() != Ok("0")
-}
-
-/// #171 object-storage append gate (default ON — `PYRE_171_OBJ_APPEND=0`
-/// opts out): extend the orthodox `list.append` descent to object-strategy
-/// lists (a `Ref` value stored into the object items block) in addition to
-/// the int-storage specialization.  Shares the orthodox-fold entry gate
-/// (authoritative full-body walk, not inside an inline sub-walk — see the
-/// call site), so the object path carries the same loop/full-body
-/// restriction as the int fold; an unresolved object-store leaf declines
-/// via `OrthodoxSubWalkTraceUnsupported` (graceful interpreter fallback),
-/// so a miss never commits a wrong trace.
-fn pyre_171_obj_append_enabled() -> bool {
-    std::env::var("PYRE_171_OBJ_APPEND").as_deref() != Ok("0")
-}
-
 /// Global descr-pool sub-jitcode lookup (resolves a global jitcode index
 /// through `ALL_JITCODES`, mirroring the shadow walker's lookup).  A
 /// build-time canonical sub-body (`w_list_append`) carries no per-fn descr
@@ -15409,7 +15383,7 @@ static GLOBAL_SUB_JITCODE_LOOKUP_FN: fn(usize) -> Option<SubJitCodeBody> =
 /// BEFORE emitting any IR for a non-matching shape (SAFE fallback to the fold
 /// / residual).
 ///
-/// STATUS (default ON — `PYRE_171_ORTHODOX=0` opts out): the descr-pool
+/// STATUS: the descr-pool
 /// wiring, the host-static const relocation, and the list header field
 /// descr-group bridge (`make_descr_from_bh` strategy/length/items →
 /// `W_LIST_DESCR_GROUP`) are all in place — the strategy `switch` and the
@@ -15554,12 +15528,10 @@ unsafe fn orthodox_list_append_recognize(
     let int_ok = pyre_object::w_list_uses_int_storage(inner_self)
         && pyre_object::is_plain_int1(value)
         && !pyre_object::pyobject::is_long(value);
-    // Object-storage extension (default ON, `PYRE_171_OBJ_APPEND=0` opts
-    // out): any non-null `Ref` value stored into the object items block —
-    // no unboxing, so the value carries no type precondition.
-    let obj_ok = pyre_171_obj_append_enabled()
-        && pyre_object::w_list_uses_object_storage(inner_self)
-        && !value.is_null();
+    // Object-storage extension: any non-null `Ref` value stored into the
+    // object items block — no unboxing, so the value carries no type
+    // precondition.
+    let obj_ok = pyre_object::w_list_uses_object_storage(inner_self) && !value.is_null();
     // Float-storage specialization: a strict `W_FloatObject` stored
     // unboxed. `FloatListStrategy.is_correct_type` (listobject.py:2061) is
     // `type(w_obj) is W_FloatObject`, the strict predicate the body's Float
@@ -15633,7 +15605,7 @@ fn orthodox_list_append_commit(
     // enforces ob_type==INT_TYPE at runtime.  The value's integer payload
     // stays symbolic — only its class is pinned.
     //
-    // Object-storage append (`PYRE_171_OBJ_APPEND`) stores the value as a
+    // Object-storage append stores the value as a
     // plain GC ref with no unboxing, so it carries no type precondition —
     // skip the INT_TYPE pin (the sub-walk's object-storage store path does
     // not read the value's class).

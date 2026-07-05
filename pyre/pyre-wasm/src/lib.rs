@@ -317,39 +317,6 @@ pub extern "C" fn pyre_jit_mc_diag(i: u32) -> u64 {
     majit_metainterp::mc_diag(i as usize)
 }
 
-/// Toggle the wasm bridge tracer (inter-trace chaining, default ON) at
-/// runtime, set by the host runner from `PYRE_WASM_ENABLE_BRIDGES`. Exported
-/// (not an import) for the same function-index-stability reason as the diag
-/// readers.
-#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn pyre_jit_set_enable_bridges(enabled: u32) {
-    pyre_jit::call_jit::set_wasm_bridges_enabled(enabled != 0);
-    // Backend-side mirror: `execute_token` sizes every host frame's Ref-home
-    // region for cross-trace chaining when this is on.
-    majit_backend_wasm::set_wasm_bridges_enabled(enabled != 0);
-}
-
-/// Enable the self-recursive CALL_ASSEMBLER guest→guest `call_indirect` arm
-/// (`PYRE_WASM_CA`) at runtime, set by the host runner from an env flag. The
-/// guest has no environment, so this export is the only way to reach the flag;
-/// same export-not-import / function-index-stability rationale as the diag
-/// readers and `pyre_jit_set_enable_bridges`.
-#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn pyre_jit_set_wasm_ca(enabled: u32) {
-    majit_backend_wasm::set_wasm_ca_enabled(enabled != 0);
-}
-
-/// Toggle the inline nursery-bump allocation fast path (default ON;
-/// `PYRE_WASM_INLINE_ALLOC=0` kill switch). Same plumbing rationale as
-/// `pyre_jit_set_wasm_ca`.
-#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn pyre_jit_set_inline_alloc(enabled: u32) {
-    majit_backend_wasm::set_wasm_inline_alloc_enabled(enabled != 0);
-}
-
 #[cfg(any(feature = "web", feature = "wasm-host"))]
 static PANIC_HOOK: Once = Once::new();
 

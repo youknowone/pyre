@@ -227,7 +227,7 @@ pub fn active_gc_collection_counts() -> (usize, usize) {
 /// the `gc_stress` feature is compiled in (the fast path would bypass its
 /// per-allocation stress collections), or no allocation op qualifies.
 fn nursery_alloc_params(ops: &[Op]) -> Option<codegen::NurseryAllocParams> {
-    if majit_gc::gc_stress_enabled() || !wasm_inline_alloc_enabled() {
+    if majit_gc::gc_stress_enabled() {
         return None;
     }
     let tids: std::collections::HashSet<u32> = ops
@@ -598,75 +598,6 @@ pub struct WasmBackend {
     constants: majit_ir::VecMap<u32, i64>,
     /// llmodel.py:64-69 self.vtable_offset.
     vtable_offset: Option<usize>,
-    /// `PYRE_WASM_CA` (default ON; `=0` kill switch): compile a self-recursive
-    /// single-int `CallAssemblerR` bridge into an in-module `call_indirect`
-    /// into the source loop's table slot (guest→guest recursion) instead of
-    /// declining it to a per-call host round-trip. Read from the
-    /// process-global [`WASM_CA_ENABLED`] at construction so flag-off is
-    /// byte-identical. Callee frames are GC-visible libc-jitframes
-    /// (per-frame `jf_gcmap`, jf-shadow-stack rooted; see
-    /// `wasm_jit_ca_alloc_frame`), so the arm is collection-safe at any
-    /// nursery size.
-    wasm_ca_enabled: bool,
-}
-
-/// Process-global toggle for the self-recursive CALL_ASSEMBLER arm, default
-/// ON (without it the fib recursion shape round-trips through the host per
-/// call — suite `fib_recursive` times out). The wasm guest has no environment
-/// (`std::env::var` always fails there), so the host runner reads
-/// `PYRE_WASM_CA` (`=0` disables) and flips this through the
-/// `pyre_jit_set_wasm_ca` export — mirroring how `pyre_jit_set_enable_bridges`
-/// plumbs the bridge tracer flag. `WasmBackend::new` snapshots it.
-static WASM_CA_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-
-/// Host entry point for the `pyre_jit_set_wasm_ca` export (and native tests).
-pub fn set_wasm_ca_enabled(enabled: bool) {
-    WASM_CA_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Whether the self-recursive CALL_ASSEMBLER arm is enabled. Read by `codegen`
-/// to allocate bridge-dispatch cells for a guarded *loop* even when it has no
-/// `Label` (the fib recursion shape), so its guard exit can chain into the CA
-/// bridge in-module instead of round-tripping to the host.
-pub fn wasm_ca_enabled() -> bool {
-    WASM_CA_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// Process-global toggle for in-module bridge chaining, mirroring
-/// `call_jit::WASM_BRIDGES_ENABLED` (the tracer-side flag the
-/// `pyre_jit_set_enable_bridges` export sets; the export pushes it here too).
-/// `execute_token` reads it to size every host frame's Ref-home region at
-/// least `failguard::FRAME_REF_HOME_FLOOR` — the sizing the frame-fit accept
-/// check in `compile_bridge` relies on — while keeping the flag-off frame
-/// layout untouched. Default ON (`PYRE_WASM_ENABLE_BRIDGES=0` disables via
-/// the runner).
-static WASM_BRIDGES_ENABLED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(true);
-
-/// Host entry point for the `pyre_jit_set_enable_bridges` export (and tests).
-pub fn set_wasm_bridges_enabled(enabled: bool) {
-    WASM_BRIDGES_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Whether in-module bridge chaining is enabled (see `WASM_BRIDGES_ENABLED`).
-pub fn wasm_bridges_enabled() -> bool {
-    WASM_BRIDGES_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// Inline nursery-bump allocation fast path (rewrite.py malloc fast path;
-/// see `codegen::NurseryAllocParams`). Default ON; `PYRE_WASM_INLINE_ALLOC=0`
-/// (plumbed by the runner through `pyre_jit_set_inline_alloc`) is the kill
-/// switch — every `New*` then goes back through the allocation helper call.
-static WASM_INLINE_ALLOC_ENABLED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(true);
-
-/// Toggle the inline nursery-bump fast path (kill switch plumbing).
-pub fn set_wasm_inline_alloc_enabled(enabled: bool) {
-    WASM_INLINE_ALLOC_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
-}
-
-fn wasm_inline_alloc_enabled() -> bool {
-    WASM_INLINE_ALLOC_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// GC type id of the `JitFrame`. The single registration authority is `eval.rs`
@@ -774,7 +705,6 @@ impl WasmBackend {
             trace_counter: 0,
             constants: majit_ir::VecMap::new(),
             vtable_offset: None,
-            wasm_ca_enabled: WASM_CA_ENABLED.load(std::sync::atomic::Ordering::Relaxed),
         }
     }
 
@@ -1227,7 +1157,6 @@ impl majit_backend::Backend for WasmBackend {
                 wb_fn_ptr,
                 nursery_alloc_params(ops).as_ref(),
                 fail_index_base,
-                true,                         // is_loop
                 0, // external_jump_slot: a loop's JUMP is a local back-edge `br`
                 0, // external_jump_key: unused without an external JUMP
                 codegen::CaParams::default(), // a loop never emits the CA arm
@@ -1429,14 +1358,13 @@ impl majit_backend::Backend for WasmBackend {
 
         // is_loop=false: a bridge's terminal JUMP with no LABEL is a loop-closing
         // bridge whose re-entry target is plumbed via `external_jump_slot`.
-        // PYRE_WASM_CA: lift the CALL_ASSEMBLER decline for a self-recursive
-        // single-int bridge (the fib shape) so the CA arm lowers it to an
-        // in-module `call_indirect` into the source loop instead.
+        // Lift the CALL_ASSEMBLER decline for a self-recursive single-int bridge
+        // (the fib shape) so the CA arm lowers it to an in-module `call_indirect`
+        // into the source loop instead.
         // The CA arm must be able to complete a callee deopt; without the
         // registered `wasm_ca_resume_deopt` slot it could not, so decline the
         // lift (the host round-trip path still handles the CALL_ASSEMBLER).
-        let allow_ca = self.wasm_ca_enabled
-            && ca_deopt_helper_slot() != 0
+        let allow_ca = ca_deopt_helper_slot() != 0
             && bridge_is_self_recursive_int_ca(ops, original_token.number);
         if let Some(reason) = wasm_unsupported_trace_reason(ops, false, allow_ca) {
             diag_bump(1); // declined: CALL_ASSEMBLER
@@ -1796,19 +1724,15 @@ impl majit_backend::Backend for WasmBackend {
         // deopt to read zeroed nursery memory. `count_ref_homes` matches the
         // `num_ref_homes` `build_wasm_module` returns below.
         //
-        // With bridge chaining on, the recursion can also chain into NESTED
-        // bridges (and sibling loops via loop-closing tail calls) while running
-        // ON a CA callee frame — and those were accepted against the
-        // `FRAME_REF_HOME_FLOOR` bound `execute_token` guarantees for HOST
-        // frames. The callee frame must give the same guarantee, or a chained
-        // bridge homes/reads Ref slots past the frame's sized (and gcmap-walked)
-        // region — wrong-value corruption (suite `recursion_memo_branch` /
-        // `generator_tree_recursion`). Mirror `execute_token`'s `chain_floor`.
-        let chain_floor = if wasm_bridges_enabled() {
-            failguard::FRAME_REF_HOME_FLOOR
-        } else {
-            0
-        };
+        // The recursion can also chain into NESTED bridges (and sibling loops via
+        // loop-closing tail calls) while running ON a CA callee frame — and those
+        // were accepted against the `FRAME_REF_HOME_FLOOR` bound `execute_token`
+        // guarantees for HOST frames. The callee frame must give the same
+        // guarantee, or a chained bridge homes/reads Ref slots past the frame's
+        // sized (and gcmap-walked) region — wrong-value corruption (suite
+        // `recursion_memo_branch` / `generator_tree_recursion`). Mirror
+        // `execute_token`'s `chain_floor`.
+        let chain_floor = failguard::FRAME_REF_HOME_FLOOR;
         let ca_ref_homes = if allow_ca {
             source_num_ref_homes
                 .max(codegen::count_ref_homes(inputargs, ops))
@@ -1856,7 +1780,6 @@ impl majit_backend::Backend for WasmBackend {
                 wb_fn_ptr,
                 nursery_alloc_params(ops).as_ref(),
                 base,
-                false, // is_loop
                 // A loop-closing bridge's terminal JUMP re-enters the target
                 // loop (own or sibling, resolved via `LABEL_TARGETS`) through
                 // its table slot via a tail call, resuming at the label
@@ -2198,19 +2121,14 @@ impl majit_backend::Backend for WasmBackend {
         // and the Ref-home region (now at HOME_SLOT_BASE = MIN_FRAME_BYTES + 8).
         // `vec![0i64]` zeroes it, so a fresh host entry reads key 0 (preamble).
         //
-        // A self-recursive CALL_ASSEMBLER bridge (`PYRE_WASM_CA`) runs its
-        // outermost call in this frame and may home more Refs than the loop, so
-        // size for the LARGER of the two (`ca_bridge_ref_homes`); the extra slots
-        // are zeroed and GC-rooted below exactly like the loop's own homes.
-        // With bridge chaining on, a cross-trace tail call can land in a loop
-        // or bridge homing more Refs than this one, so also size at least
-        // `FRAME_REF_HOME_FLOOR` — the bound `compile_bridge`'s frame-fit
-        // accept checks rely on. Flag-off keeps the exact old sizing.
-        let chain_floor = if wasm_bridges_enabled() {
-            failguard::FRAME_REF_HOME_FLOOR
-        } else {
-            0
-        };
+        // A self-recursive CALL_ASSEMBLER bridge runs its outermost call in this
+        // frame and may home more Refs than the loop, so size for the LARGER of
+        // the two (`ca_bridge_ref_homes`); the extra slots are zeroed and
+        // GC-rooted below exactly like the loop's own homes.
+        // A cross-trace tail call can land in a loop or bridge homing more Refs
+        // than this one, so also size at least `FRAME_REF_HOME_FLOOR` — the bound
+        // `compile_bridge`'s frame-fit accept checks rely on.
+        let chain_floor = failguard::FRAME_REF_HOME_FLOOR;
         let eff_ref_homes = compiled
             .num_ref_homes
             .max(compiled.ca_bridge_ref_homes.get())
@@ -2243,7 +2161,7 @@ impl majit_backend::Backend for WasmBackend {
             // frame pointer keeps every local-0-relative codegen access
             // unchanged. (See `build_home_gcmap` for the wasm32 Signed-item
             // layout.)
-            if wasm_ca_enabled() && wasm_jitframe_tid() != 0 {
+            if wasm_jitframe_tid() != 0 {
                 use majit_backend::jitframe::{FIRST_ITEM_OFFSET, JitFrame};
                 let sign = std::mem::size_of::<isize>();
                 // Data region (frame_size i64 slots) expressed in Signed items.

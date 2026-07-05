@@ -31,12 +31,9 @@
 //! `program.functions` carry the per-method graphs the rest of the
 //! pipeline consumes.  `auto_discover_workspace_llbc_paths` in `lib.rs`
 //! resolves `<workspace>/build/llbc/{pyre-object,pyre-interpreter,pyre-jit}.ullbc`
-//! when `PYRE_MIR_FRONTEND_LLBC` is unset; that canonical set is
-//! REQUIRED.  Setting
-//! `PYRE_REQUIRE_MIR_FRONTEND=1` makes
-//! `build_semantic_program_via_active_frontend` panic when no LLBC source
-//! resolves, so production builds (which set the flag in
-//! `pyre/check.py::build_backend`) assert that graphs come from MIR.
+//! when `PYRE_MIR_FRONTEND_LLBC` is unset; that canonical set is REQUIRED.
+//! `build_semantic_program_via_active_frontend` panics when no LLBC source
+//! resolves, so every build asserts that graphs come from MIR.
 //!
 //! Per-method graphs come straight from MIR.  `extract_trait_impls` /
 //! `extract_inherent_impl_methods` index `program.functions` via
