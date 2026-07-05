@@ -748,6 +748,52 @@ fn dead_op_result_vars(graph: &LegacyGraph) -> std::collections::HashSet<Variabl
     dead
 }
 
+/// Results of a synthetic `FieldRead("__discriminant")` that feed a block
+/// exitswitch — the tag read a Rust `match` lowers to (`front/mir.rs:1184`
+/// `Rvalue::Discriminant` → `FieldRead("__discriminant")`, then the switch
+/// terminator reads that result as `ExitSwitch::Value`).
+///
+/// The legacy walker types this tag `Signed` (`ty: Int` at the producer,
+/// `legacy_annotator.rs:273`).  The real (annotate→rtype) path lowers the
+/// enclosing `Result`/`StepResult` through the uniform exception-transform
+/// (`front/result_exc.rs`), which **rebuilds** the discriminant-switch block
+/// with its own freshly-minted tag Variable; the projection back onto the
+/// legacy graph (`project_value_to_var`) is keyed by Variable identity, so the
+/// legacy tag Variable has no twin and reads `real=None` even though the real
+/// graph types its own tag `Signed` and emits the switch from it.  This is the
+/// same rebuilt-identity artifact as [`duplicate_inputarg_vars`] /
+/// [`dead_op_result_vars`], scoped to the switch-feeding discriminant read.
+fn switch_discriminant_read_vars(graph: &LegacyGraph) -> std::collections::HashSet<Variable> {
+    use crate::model::OpKind;
+    // Vars a block exitswitch reads (Value or the fused-compare args).
+    let mut switch_read: std::collections::HashSet<Variable> = std::collections::HashSet::new();
+    for block in &graph.blocks {
+        match &block.exitswitch {
+            Some(crate::model::ExitSwitch::Value(v)) => {
+                switch_read.insert(v.clone());
+            }
+            Some(crate::model::ExitSwitch::Fused { args, .. }) => {
+                for v in args {
+                    switch_read.insert(v.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = std::collections::HashSet::new();
+    for block in &graph.blocks {
+        for op in &block.operations {
+            if let (Some(r), OpKind::FieldRead { field, .. }) = (&op.result, &op.kind)
+                && field.name == "__discriminant"
+                && switch_read.contains(r)
+            {
+                out.insert(r.clone());
+            }
+        }
+    }
+    out
+}
+
 /// Whether an op's result may be dropped when unread, mirroring RPython's
 /// `transform_dead_op_vars` `canremove(op, block)` gate (`simplify.py:441`):
 /// only side-effect-free ops (`op.opname in CanRemove`) have their result
@@ -801,6 +847,7 @@ fn collect_divergences(
     let colored_operands = colored_operand_vars(legacy_graph);
     let duplicate_inputargs = duplicate_inputarg_vars(legacy_graph);
     let dead_op_results = dead_op_result_vars(legacy_graph);
+    let switch_discriminant_reads = switch_discriminant_read_vars(legacy_graph);
     let mut divergences = Vec::new();
     for (pos, var) in legacy_graph.iter_variables().iter().enumerate() {
         // `iterblocks()` parity: the real path annotates only the
@@ -910,10 +957,17 @@ fn collect_divergences(
         // this set, because a mistyped element is op-read (fed to `w_set_add`
         // / `w_list_append`) and so excluded by the `op_operand_vars` scan.
         let real_dropped_dead_op_result = real_present.is_none() && dead_op_results.contains(var);
+        // A `match`-lowered `__discriminant` tag the real path's Result/StepResult
+        // exc-transform rebuilt with a fresh switch Variable: the legacy tag
+        // reads `real=None` (no twin under its identity) though the real graph
+        // types and switches on its own tag.  See [`switch_discriminant_read_vars`].
+        let real_rebuilt_switch_discriminant =
+            real_present.is_none() && switch_discriminant_reads.contains(var);
         let diverges = if real_refines_gcref_to_void
             || real_refines_gcref_to_signed
             || real_dropped_duplicate_inputarg
             || real_dropped_dead_op_result
+            || real_rebuilt_switch_discriminant
         {
             false
         } else if legacy_kind != ConcreteType::Unknown {
@@ -3501,6 +3555,168 @@ mod tests {
             diff_dead_call_result(ConcreteType::GcRef).len(),
             1,
             "a GcRef dead Call result is not a canremove drop → still diverges"
+        );
+    }
+
+    /// Build start → mid → {a, b} where `mid` reads `base.__discriminant`
+    /// into `disc` and switches on it (`ExitSwitch::Value(disc)`).  The real
+    /// path leaves `disc` untyped (`real=None`) — the rebuilt-switch identity
+    /// artifact — so accepting it as non-divergent is the assertion.
+    fn diff_switch_discriminant(legacy_kind: ConcreteType) -> Vec<String> {
+        let mut graph = LegacyGraph::new("diff_switch_discriminant");
+        let vars = mint_vars(&mut graph, 3);
+        let base = vars[0].clone();
+        let disc = vars[1].clone();
+        let mid_id = crate::model::BlockId(7);
+        let a_id = crate::model::BlockId(8);
+        let b_id = crate::model::BlockId(9);
+        let startblock = Block {
+            id: graph.startblock,
+            inputargs: block_inputargs(&vars, &[0]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![crate::model::Link::new_mixed(
+                vec![LinkArg::Value(base.clone())],
+                mid_id,
+                None,
+            )],
+            framestate: None,
+            dead: false,
+        };
+        let read = crate::model::SpaceOperation {
+            result: Some(disc.clone()),
+            kind: crate::model::OpKind::FieldRead {
+                base: base.clone(),
+                field: crate::model::FieldDescriptor {
+                    name: "__discriminant".to_string(),
+                    owner_root: Some("pyopcode::StepResult".to_string()),
+                    owner_id: None,
+                },
+                ty: ValueType::Int,
+                pure: true,
+            },
+        };
+        let midblock = Block {
+            id: mid_id,
+            inputargs: block_inputargs(&vars, &[0]),
+            operations: vec![read],
+            exitswitch: Some(crate::model::ExitSwitch::Value(disc.clone())),
+            exits: vec![
+                crate::model::Link::new_mixed(vec![], a_id, None),
+                crate::model::Link::new_mixed(vec![], b_id, None),
+            ],
+            framestate: None,
+            dead: false,
+        };
+        let mk_tail = |id| Block {
+            id,
+            inputargs: vec![],
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![link_to_returnblock(vec![], graph.returnblock)],
+            framestate: None,
+            dead: false,
+        };
+        let ablock = mk_tail(a_id);
+        let bblock = mk_tail(b_id);
+        let returnblock = Block {
+            id: graph.returnblock,
+            inputargs: vec![],
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        };
+        graph.blocks = vec![startblock, midblock, ablock, bblock, returnblock];
+        crate::model::FunctionGraph::set_concretetype_of_inline(&disc, legacy_kind);
+        let real_state = HashMap::new();
+        collect_divergences(&real_state, &graph)
+    }
+
+    #[test]
+    fn collect_divergences_accepts_switch_discriminant_rebuilt() {
+        // A `__discriminant` read feeding a block exitswitch that the real
+        // path's Result/StepResult exc-transform rebuilt with a fresh switch
+        // Variable reads `real=None` under the legacy tag's identity — the
+        // rebuilt-switch artifact, accepted for either legacy kind.
+        assert!(
+            diff_switch_discriminant(ConcreteType::Signed).is_empty(),
+            "a Signed __discriminant switch read the real path rebuilt is not a \
+             divergence"
+        );
+        assert!(
+            diff_switch_discriminant(ConcreteType::GcRef).is_empty(),
+            "a GcRef __discriminant switch read the real path rebuilt is not a \
+             divergence"
+        );
+    }
+
+    #[test]
+    fn switch_discriminant_read_vars_requires_a_switch() {
+        // The classifier only collects a `__discriminant` read whose result
+        // feeds an exitswitch.  A forward-only discriminant read (no switch)
+        // is NOT in the set — it would fall through to the dead-op gate
+        // instead, so the rebuilt-switch acceptance never over-reaches to a
+        // non-switch read.  Rebuild the two graphs and inspect the classifier
+        // directly (via `collect_divergences`'s construction path is opaque,
+        // so reconstruct the same graphs the diff helper builds).
+        let build = |feeds_switch: bool| {
+            let mut graph = LegacyGraph::new("classify_probe");
+            let vars = mint_vars(&mut graph, 3);
+            let base = vars[0].clone();
+            let disc = vars[1].clone();
+            let mid_id = crate::model::BlockId(7);
+            let a_id = crate::model::BlockId(8);
+            let read = crate::model::SpaceOperation {
+                result: Some(disc.clone()),
+                kind: crate::model::OpKind::FieldRead {
+                    base: base.clone(),
+                    field: crate::model::FieldDescriptor {
+                        name: "__discriminant".to_string(),
+                        owner_root: Some("pyopcode::StepResult".to_string()),
+                        owner_id: None,
+                    },
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+            };
+            let (exitswitch, exits) = if feeds_switch {
+                (
+                    Some(crate::model::ExitSwitch::Value(disc.clone())),
+                    vec![crate::model::Link::new_mixed(vec![], a_id, None)],
+                )
+            } else {
+                (
+                    None,
+                    vec![crate::model::Link::new_mixed(
+                        vec![LinkArg::Value(disc.clone())],
+                        a_id,
+                        None,
+                    )],
+                )
+            };
+            let midblock = Block {
+                id: mid_id,
+                inputargs: block_inputargs(&vars, &[0]),
+                operations: vec![read],
+                exitswitch,
+                exits,
+                framestate: None,
+                dead: false,
+            };
+            graph.blocks = vec![midblock];
+            (graph, disc)
+        };
+        let (switch_graph, disc_s) = build(true);
+        assert!(
+            switch_discriminant_read_vars(&switch_graph).contains(&disc_s),
+            "a __discriminant read feeding a switch is classified"
+        );
+        let (fwd_graph, disc_f) = build(false);
+        assert!(
+            !switch_discriminant_read_vars(&fwd_graph).contains(&disc_f),
+            "a forward-only __discriminant read is NOT classified"
         );
     }
 
