@@ -11788,6 +11788,14 @@ fn try_walker_inline_user_call(
     if pyre_helper != majit_ir::PyreHelperKind::CallFn {
         return Ok(None);
     }
+    // An inline sub-walk inside a FOR_ITER body captures guards with
+    // the loop-header outer_active_boxes, but vable sync writes mid-body
+    // shadow state. On deopt the mismatch replays the last body
+    // iteration. Decline the inline; the call still executes concretely
+    // as a normal residual.
+    if fbw_foriter_inflight_active() {
+        return Ok(None);
+    }
     if r_args.is_empty() {
         return Ok(None);
     }
