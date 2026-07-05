@@ -123,6 +123,7 @@ impl<'c> Lowerer<'c> {
                 reg: vable_reg,
                 kind: BindingKind::Ref,
                 depends_on_stack: false,
+                struct_type: None,
             },
         );
         self.next_reg = self.next_reg.max(vable_reg.saturating_add(1));

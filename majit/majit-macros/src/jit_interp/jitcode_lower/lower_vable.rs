@@ -66,6 +66,7 @@ impl<'c> Lowerer<'c> {
             reg: result_reg,
             kind: BindingKind::Int,
             depends_on_stack: false,
+            struct_type: None,
         })
     }
 
@@ -463,6 +464,7 @@ impl<'c> Lowerer<'c> {
                     reg,
                     kind,
                     depends_on_stack: false,
+                    struct_type: None,
                 });
             }
         }
@@ -546,6 +548,7 @@ impl<'c> Lowerer<'c> {
             reg,
             kind,
             depends_on_stack: false,
+            struct_type: None,
         })
     }
 
@@ -592,6 +595,7 @@ impl<'c> Lowerer<'c> {
             reg,
             kind: BindingKind::Int,
             depends_on_stack: false,
+            struct_type: None,
         })
     }
 
@@ -633,6 +637,7 @@ impl<'c> Lowerer<'c> {
                 reg,
                 kind: BindingKind::Int,
                 depends_on_stack: false,
+                struct_type: None,
             });
         }
         // ref(T) scalar: read into the ref register bank so a subsequent
@@ -660,6 +665,7 @@ impl<'c> Lowerer<'c> {
                 reg,
                 kind: BindingKind::Ref,
                 depends_on_stack: false,
+                struct_type: None,
             });
         }
         None
@@ -700,7 +706,8 @@ impl<'c> Lowerer<'c> {
             .map(|s| s.ident.to_string())
             .unwrap_or_default();
         let ref_field_key = format!("{}::{}", struct_last, member_name);
-        let is_ref_field = config.ref_fields.contains_key(&ref_field_key);
+        let ref_field_entry = config.ref_fields.get(&ref_field_key);
+        let is_ref_field = ref_field_entry.is_some();
         // Raw (headerless) ref-scalar pointee → `is_gc_managed = false`, a
         // distinct descriptor id from any GC `new_struct` of the same type.
         let tid = struct_type_id(&struct_path, false);
@@ -744,6 +751,8 @@ impl<'c> Lowerer<'c> {
                 reg: result_reg,
                 kind: BindingKind::Ref,
                 depends_on_stack: false,
+                struct_type: ref_field_entry
+                    .map(|(_, _, pointee_path)| pointee_path.clone()),
             })
         } else {
             // Int-kind field (default) → getfield_gc_i.
@@ -776,6 +785,108 @@ impl<'c> Lowerer<'c> {
                 reg: result_reg,
                 kind: BindingKind::Int,
                 depends_on_stack: false,
+                struct_type: None,
+            })
+        }
+    }
+
+    /// Field read on an arbitrary local ref binding with known struct type:
+    /// `<ident>.<field>` where `<ident>` was bound as `BindingKind::Ref` with
+    /// a non-None `struct_type`.  Uses the same `ref_fields` config as
+    /// `lower_state_ref_field_getfield` to determine whether the field is
+    /// ref-kind or int-kind.
+    pub(super) fn lower_ref_binding_getfield(&mut self, expr: &Expr) -> Option<Binding> {
+        let config = self.config?;
+        let Expr::Field(field) = expr else {
+            return None;
+        };
+        // Base must be a simple ident (a local variable), not `state.x.y`.
+        let Expr::Path(path) = &*field.base else {
+            return None;
+        };
+        let ident = path.path.get_ident()?;
+        let binding = self.bindings.get(&ident.to_string())?.clone();
+        if !matches!(binding.kind, BindingKind::Ref) {
+            return None;
+        }
+        let struct_path = binding.struct_type.as_ref()?.clone();
+        let member = field.member.clone();
+        let member_name = named_member(&field.member)?;
+        let struct_last = struct_path
+            .segments
+            .last()
+            .map(|s| s.ident.to_string())
+            .unwrap_or_default();
+        let ref_field_key = format!("{}::{}", struct_last, member_name);
+        let ref_field_entry = config.ref_fields.get(&ref_field_key);
+        let is_ref_field = ref_field_entry.is_some();
+        let tid = struct_type_id(&struct_path, false);
+        let base_reg = binding.reg;
+        let result_reg = self.alloc_reg();
+        if is_ref_field {
+            self.emit_op(
+                OpMeta::linear(
+                    OpKind::Vable,
+                    vec![Register::ref_(base_reg)],
+                    vec![Register::ref_(result_reg)],
+                ),
+                quote! {
+                    __builder.register_struct_layout(
+                        ::core::mem::size_of::<#struct_path>(),
+                        #tid,
+                        false,
+                        &[(
+                            ::core::mem::offset_of!(#struct_path, #member),
+                            true,
+                            stringify!(#member),
+                        )],
+                    );
+                    __builder.getfield_gc_r(
+                        #result_reg,
+                        #base_reg,
+                        ::core::mem::offset_of!(#struct_path, #member),
+                        #tid,
+                    );
+                },
+            );
+            Some(Binding {
+                reg: result_reg,
+                kind: BindingKind::Ref,
+                depends_on_stack: false,
+                struct_type: ref_field_entry
+                    .map(|(_, _, pointee_path)| pointee_path.clone()),
+            })
+        } else {
+            self.emit_op(
+                OpMeta::linear(
+                    OpKind::Vable,
+                    vec![Register::ref_(base_reg)],
+                    vec![Register::int(result_reg)],
+                ),
+                quote! {
+                    __builder.register_struct_layout(
+                        ::core::mem::size_of::<#struct_path>(),
+                        #tid,
+                        false,
+                        &[(
+                            ::core::mem::offset_of!(#struct_path, #member),
+                            false,
+                            stringify!(#member),
+                        )],
+                    );
+                    __builder.getfield_gc_i(
+                        #result_reg,
+                        #base_reg,
+                        ::core::mem::offset_of!(#struct_path, #member),
+                        #tid,
+                    );
+                },
+            );
+            Some(Binding {
+                reg: result_reg,
+                kind: BindingKind::Int,
+                depends_on_stack: false,
+                struct_type: None,
             })
         }
     }
@@ -856,6 +967,7 @@ impl<'c> Lowerer<'c> {
             reg: result_reg,
             kind: BindingKind::Ref,
             depends_on_stack: base.depends_on_stack || index.depends_on_stack,
+            struct_type: None,
         })
     }
 
@@ -967,6 +1079,103 @@ impl<'c> Lowerer<'c> {
         Some(())
     }
 
+    /// Field WRITE on an arbitrary local ref binding with known struct type:
+    /// `<ident>.<field> = <expr>` where `<ident>` was bound as
+    /// `BindingKind::Ref` with a non-None `struct_type`.
+    pub(super) fn lower_ref_binding_setfield(&mut self, expr: &Expr) -> Option<()> {
+        let config = self.config?;
+        let Expr::Assign(assign) = expr else {
+            return None;
+        };
+        let Expr::Field(field) = &*assign.left else {
+            return None;
+        };
+        // Base must be a simple ident (a local variable), not `state.x.y`.
+        let Expr::Path(path) = &*field.base else {
+            return None;
+        };
+        let ident = path.path.get_ident()?;
+        let binding = self.bindings.get(&ident.to_string())?.clone();
+        if !matches!(binding.kind, BindingKind::Ref) {
+            return None;
+        }
+        let struct_path = binding.struct_type.as_ref()?.clone();
+        let member = field.member.clone();
+        let member_name = named_member(&field.member)?;
+        let struct_last = struct_path
+            .segments
+            .last()
+            .map(|s| s.ident.to_string())
+            .unwrap_or_default();
+        let ref_field_key = format!("{}::{}", struct_last, member_name);
+        let is_ref_field = config.ref_fields.contains_key(&ref_field_key);
+        let tid = struct_type_id(&struct_path, false);
+        let base_reg = binding.reg;
+        let rhs = self.lower_value_expr(&assign.right)?;
+        if is_ref_field {
+            if !matches!(rhs.kind, BindingKind::Ref) {
+                return None;
+            }
+            let src = rhs.reg;
+            self.emit_op(
+                OpMeta::linear(
+                    OpKind::SetfieldGc,
+                    vec![Register::ref_(base_reg), Register::ref_(src)],
+                    vec![],
+                ),
+                quote! {
+                    __builder.register_struct_layout(
+                        ::core::mem::size_of::<#struct_path>(),
+                        #tid,
+                        false,
+                        &[(
+                            ::core::mem::offset_of!(#struct_path, #member),
+                            true,
+                            stringify!(#member),
+                        )],
+                    );
+                    __builder.setfield_gc_r(
+                        #base_reg,
+                        #src,
+                        ::core::mem::offset_of!(#struct_path, #member),
+                        #tid,
+                    );
+                },
+            );
+        } else {
+            if !matches!(rhs.kind, BindingKind::Int) {
+                return None;
+            }
+            let src = rhs.reg;
+            self.emit_op(
+                OpMeta::linear(
+                    OpKind::SetfieldGc,
+                    vec![Register::ref_(base_reg), Register::int(src)],
+                    vec![],
+                ),
+                quote! {
+                    __builder.register_struct_layout(
+                        ::core::mem::size_of::<#struct_path>(),
+                        #tid,
+                        false,
+                        &[(
+                            ::core::mem::offset_of!(#struct_path, #member),
+                            false,
+                            stringify!(#member),
+                        )],
+                    );
+                    __builder.setfield_gc_i(
+                        #base_reg,
+                        #src,
+                        ::core::mem::offset_of!(#struct_path, #member),
+                        #tid,
+                    );
+                },
+            );
+        }
+        Some(())
+    }
+
     /// Recognizes `state.array[index]` for array state fields.
     /// Virtualizable arrays bail to the standard vable path; flattened arrays
     /// emit `load_state_array`.
@@ -1010,6 +1219,7 @@ impl<'c> Lowerer<'c> {
             reg,
             kind: BindingKind::Int,
             depends_on_stack: false,
+            struct_type: None,
         })
     }
 }

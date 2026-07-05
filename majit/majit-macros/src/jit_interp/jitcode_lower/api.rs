@@ -198,6 +198,7 @@ pub(crate) fn try_generate_jitcode_body_parts_with_caller_bindings(
                 reg: entry.callee_reg,
                 kind: entry.kind,
                 depends_on_stack: false,
+                struct_type: None,
             },
         );
     }
@@ -266,6 +267,7 @@ pub(crate) fn try_generate_jitcode_pc_return_body_with_caller_bindings(
                 reg: entry.callee_reg,
                 kind: entry.kind,
                 depends_on_stack: false,
+                struct_type: None,
             },
         );
     }
@@ -393,6 +395,7 @@ pub(crate) fn generate_inline_helper_jitcode_with_calls(
                 reg,
                 kind: binding_kind,
                 depends_on_stack: false,
+                struct_type: None,
             },
         );
     }

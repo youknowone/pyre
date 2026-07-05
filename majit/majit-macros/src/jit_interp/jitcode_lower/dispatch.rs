@@ -241,6 +241,7 @@ mod collect_arm_caller_locals_tests {
                         reg: *reg,
                         kind: *kind,
                         depends_on_stack: false,
+                        struct_type: None,
                     },
                 )
             })
@@ -414,6 +415,7 @@ mod assign_caller_local_layout_tests {
             reg: parent_reg,
             kind,
             depends_on_stack: false,
+            struct_type: None,
         }
     }
 
@@ -999,6 +1001,7 @@ fn try_lower_inner_byte_fetch(
             reg: aliased_reg,
             kind: BindingKind::Int,
             depends_on_stack: false,
+            struct_type: None,
         },
     );
     true
@@ -1393,6 +1396,7 @@ fn try_lower_opcode_fetch_stmt(lowerer: &mut Lowerer, stmt: &Stmt) -> bool {
                                         reg: binding.reg,
                                         kind: binding.kind,
                                         depends_on_stack: false,
+                                        struct_type: None,
                                     },
                                 );
                                 lowerer.opcode_var_name = Some(name);
@@ -1446,6 +1450,7 @@ fn try_lower_opcode_fetch_stmt(lowerer: &mut Lowerer, stmt: &Stmt) -> bool {
                             reg: result_reg,
                             kind: BindingKind::Int,
                             depends_on_stack: false,
+                            struct_type: None,
                         },
                     );
                     // Slice ε.1: record the consumer's chosen
@@ -2093,6 +2098,7 @@ impl<'c> Lowerer<'c> {
                         reg: pc_reg,
                         kind: BindingKind::Int,
                         depends_on_stack: false,
+                        struct_type: None,
                     },
                 );
                 return Some(());
@@ -3262,6 +3268,7 @@ pub(crate) fn lower_dispatch_body(
             reg: 0,
             kind: BindingKind::Ref,
             depends_on_stack: false,
+            struct_type: None,
         },
     );
     // i0 = pc (Int). Advance next_reg past i0 so opcode_reg gets i1.
@@ -3271,6 +3278,7 @@ pub(crate) fn lower_dispatch_body(
             reg: 0,
             kind: BindingKind::Int,
             depends_on_stack: false,
+            struct_type: None,
         },
     );
     // State-field scalars occupy reserved identity-slot prefixes:

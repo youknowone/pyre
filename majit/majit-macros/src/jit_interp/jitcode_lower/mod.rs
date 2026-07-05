@@ -1076,6 +1076,11 @@ pub(super) struct Binding {
     pub(super) reg: u16,
     pub(super) kind: BindingKind,
     pub(super) depends_on_stack: bool,
+    /// When this binding is a Ref pointing to a known struct, tracks the
+    /// struct type so that subsequent field access (`binding.field`) can
+    /// resolve `offset_of!` and `ref_fields` without the `state.<ref>`
+    /// two-level pattern.
+    pub(super) struct_type: Option<syn::Path>,
 }
 
 /// Mirror of RPython `rpython/jit/codewriter/flatten.py:Register(kind, index)`.
@@ -1891,6 +1896,7 @@ mod tests {
             reg,
             kind,
             depends_on_stack: false,
+            struct_type: None,
         }
     }
 

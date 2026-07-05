@@ -39,6 +39,11 @@ impl<'c> Lowerer<'c> {
         if let Some(binding) = self.lower_state_ref_field_getfield(expr) {
             return Some(binding);
         }
+        // Field read on a local ref binding with known struct type:
+        // `<binding>.<field>` → getfield_gc_i/getfield_gc_r.
+        if let Some(binding) = self.lower_ref_binding_getfield(expr) {
+            return Some(binding);
+        }
         if let Some(binding) = self.lower_state_array_read(expr) {
             return Some(binding);
         }
@@ -94,6 +99,7 @@ impl<'c> Lowerer<'c> {
                     reg,
                     kind: BindingKind::Int,
                     depends_on_stack: false,
+                    struct_type: None,
                 })
             }
             // Bool comparisons (`stackok == false`) ride the int channel:
@@ -112,6 +118,7 @@ impl<'c> Lowerer<'c> {
                     reg,
                     kind: BindingKind::Int,
                     depends_on_stack: false,
+                    struct_type: None,
                 })
             }
             Expr::Path(ExprPath { path, .. }) => {
@@ -246,6 +253,7 @@ impl<'c> Lowerer<'c> {
             reg: result_reg,
             kind: BindingKind::Ref,
             depends_on_stack,
+            struct_type: Some(struct_path.clone()),
         })
     }
 
@@ -1148,6 +1156,7 @@ impl<'c> Lowerer<'c> {
             reg,
             kind: result_kind,
             depends_on_stack,
+            struct_type: None,
         })
     }
 
@@ -1266,6 +1275,7 @@ impl<'c> Lowerer<'c> {
             reg,
             kind: result_kind,
             depends_on_stack,
+            struct_type: None,
         })
     }
 
@@ -1339,6 +1349,7 @@ impl<'c> Lowerer<'c> {
             depends_on_stack: cond.depends_on_stack
                 || then_binding.depends_on_stack
                 || else_binding.depends_on_stack,
+            struct_type: None,
         })
     }
 
@@ -1370,6 +1381,7 @@ impl<'c> Lowerer<'c> {
                     reg,
                     kind: BindingKind::Int,
                     depends_on_stack: cond.depends_on_stack,
+                    struct_type: None,
                 })
             }
             _ => None,
@@ -1397,6 +1409,7 @@ impl<'c> Lowerer<'c> {
                     reg,
                     kind: BindingKind::Int,
                     depends_on_stack: inner.depends_on_stack,
+                    struct_type: None,
                 })
             }
             _ => None,
@@ -1425,6 +1438,7 @@ impl<'c> Lowerer<'c> {
             reg,
             kind: BindingKind::Int,
             depends_on_stack: lhs.depends_on_stack || rhs.depends_on_stack,
+            struct_type: None,
         })
     }
 
@@ -1508,6 +1522,7 @@ impl<'c> Lowerer<'c> {
             reg: result_reg,
             kind: BindingKind::Int,
             depends_on_stack,
+            struct_type: None,
         })
     }
 
@@ -1601,6 +1616,7 @@ mod tests {
             reg,
             kind,
             depends_on_stack: false,
+            struct_type: None,
         }
     }
 

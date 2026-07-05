@@ -524,6 +524,7 @@ impl<'c> Lowerer<'c> {
             reg: result_reg,
             kind: BindingKind::Int,
             depends_on_stack,
+            struct_type: None,
         })
     }
 }
