@@ -12236,9 +12236,13 @@ mod tests {
             None,
             0,
         );
-        let insn =
-            super::lower_accumulator_hlop_to_insn(&op, &ctx, &mut get_register, &mut lower_constant)
-                .expect("set_add lowering must succeed");
+        let insn = super::lower_accumulator_hlop_to_insn(
+            &op,
+            &ctx,
+            &mut get_register,
+            &mut lower_constant,
+        )
+        .expect("set_add lowering must succeed");
         match insn {
             Insn::Op {
                 opname,

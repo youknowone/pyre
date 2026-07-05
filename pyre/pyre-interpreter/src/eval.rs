@@ -3656,13 +3656,8 @@ impl OpcodeStepExecutor for PyFrame {
         let args_obj = self.pop();
         let self_or_null = self.pop();
         let callable = self.pop();
-        let result = crate::call::call_function_ex(
-            self,
-            callable,
-            self_or_null,
-            args_obj,
-            kwargs_or_null,
-        )?;
+        let result =
+            crate::call::call_function_ex(self, callable, self_or_null, args_obj, kwargs_or_null)?;
         self.push(result);
         Ok(())
     }

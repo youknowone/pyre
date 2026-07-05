@@ -206,13 +206,12 @@ pub fn bool_value_from_truth(value: bool) -> PyObjectRef {
 pub fn load_common_constant_value(cc: crate::bytecode::CommonConstant) -> PyObjectRef {
     use crate::bytecode::CommonConstant;
     match cc {
-        CommonConstant::AssertionError => {
-            crate::builtins::lookup_exc_class("AssertionError").unwrap_or_else(|| {
+        CommonConstant::AssertionError => crate::builtins::lookup_exc_class("AssertionError")
+            .unwrap_or_else(|| {
                 crate::typedef::gettypeobject(
                     &pyre_object::interp_exceptions::EXC_ASSERTION_ERROR_TYPE,
                 )
-            })
-        }
+            }),
         CommonConstant::NotImplementedError => {
             crate::builtins::lookup_exc_class("NotImplementedError").unwrap_or_else(|| {
                 crate::make_builtin_function("NotImplementedError", |_args| {
@@ -237,7 +236,7 @@ pub fn load_common_constant_value(cc: crate::bytecode::CommonConstant) -> PyObje
             crate::typedef::gettypeobject(&pyre_object::pyobject::LIST_TYPE)
         }
         CommonConstant::BuiltinSet => {
-            crate::typedef::gettypeobject(&pyre_object::pyobject::LIST_TYPE)
+            crate::typedef::gettypeobject(&pyre_object::setobject::SET_TYPE)
         }
     }
 }

@@ -4037,20 +4037,76 @@ fn register_helper_fn_pointers(
     // Per-arity `bh_call_kw_<n>` CALL_KW helpers resolve keyword args and
     // dispatch, running Python → `MayForce`.  Appended last to preserve
     // fn_ptr indices.
-    let call_kw_fn_0 = bind(assembler, cpu.call_kw_fn_0 as *const (), CallFlavor::MayForce);
-    let call_kw_fn_1 = bind(assembler, cpu.call_kw_fn_1 as *const (), CallFlavor::MayForce);
-    let call_kw_fn_2 = bind(assembler, cpu.call_kw_fn_2 as *const (), CallFlavor::MayForce);
-    let call_kw_fn_3 = bind(assembler, cpu.call_kw_fn_3 as *const (), CallFlavor::MayForce);
-    let call_kw_fn_4 = bind(assembler, cpu.call_kw_fn_4 as *const (), CallFlavor::MayForce);
-    let call_kw_fn_5 = bind(assembler, cpu.call_kw_fn_5 as *const (), CallFlavor::MayForce);
-    let call_kw_fn_6 = bind(assembler, cpu.call_kw_fn_6 as *const (), CallFlavor::MayForce);
-    let call_kw_fn_7 = bind(assembler, cpu.call_kw_fn_7 as *const (), CallFlavor::MayForce);
-    let call_kw_fn_8 = bind(assembler, cpu.call_kw_fn_8 as *const (), CallFlavor::MayForce);
-    let call_kw_fn_9 = bind(assembler, cpu.call_kw_fn_9 as *const (), CallFlavor::MayForce);
-    let call_kw_fn_10 = bind(assembler, cpu.call_kw_fn_10 as *const (), CallFlavor::MayForce);
-    let call_kw_fn_11 = bind(assembler, cpu.call_kw_fn_11 as *const (), CallFlavor::MayForce);
-    let call_kw_fn_12 = bind(assembler, cpu.call_kw_fn_12 as *const (), CallFlavor::MayForce);
-    let call_kw_fn_13 = bind(assembler, cpu.call_kw_fn_13 as *const (), CallFlavor::MayForce);
+    let call_kw_fn_0 = bind(
+        assembler,
+        cpu.call_kw_fn_0 as *const (),
+        CallFlavor::MayForce,
+    );
+    let call_kw_fn_1 = bind(
+        assembler,
+        cpu.call_kw_fn_1 as *const (),
+        CallFlavor::MayForce,
+    );
+    let call_kw_fn_2 = bind(
+        assembler,
+        cpu.call_kw_fn_2 as *const (),
+        CallFlavor::MayForce,
+    );
+    let call_kw_fn_3 = bind(
+        assembler,
+        cpu.call_kw_fn_3 as *const (),
+        CallFlavor::MayForce,
+    );
+    let call_kw_fn_4 = bind(
+        assembler,
+        cpu.call_kw_fn_4 as *const (),
+        CallFlavor::MayForce,
+    );
+    let call_kw_fn_5 = bind(
+        assembler,
+        cpu.call_kw_fn_5 as *const (),
+        CallFlavor::MayForce,
+    );
+    let call_kw_fn_6 = bind(
+        assembler,
+        cpu.call_kw_fn_6 as *const (),
+        CallFlavor::MayForce,
+    );
+    let call_kw_fn_7 = bind(
+        assembler,
+        cpu.call_kw_fn_7 as *const (),
+        CallFlavor::MayForce,
+    );
+    let call_kw_fn_8 = bind(
+        assembler,
+        cpu.call_kw_fn_8 as *const (),
+        CallFlavor::MayForce,
+    );
+    let call_kw_fn_9 = bind(
+        assembler,
+        cpu.call_kw_fn_9 as *const (),
+        CallFlavor::MayForce,
+    );
+    let call_kw_fn_10 = bind(
+        assembler,
+        cpu.call_kw_fn_10 as *const (),
+        CallFlavor::MayForce,
+    );
+    let call_kw_fn_11 = bind(
+        assembler,
+        cpu.call_kw_fn_11 as *const (),
+        CallFlavor::MayForce,
+    );
+    let call_kw_fn_12 = bind(
+        assembler,
+        cpu.call_kw_fn_12 as *const (),
+        CallFlavor::MayForce,
+    );
+    let call_kw_fn_13 = bind(
+        assembler,
+        cpu.call_kw_fn_13 as *const (),
+        CallFlavor::MayForce,
+    );
     FnPtrIndices {
         call_fn,
         load_global_fn,
@@ -10297,11 +10353,8 @@ impl CodeWriter {
                             current_depth = current_depth.saturating_sub(1);
                             emit_vsd!(current_depth, py_pc);
                             let value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            let set_value = peek_container_or_fresh(
-                                &current_state,
-                                oparg,
-                                &mut graph,
-                            );
+                            let set_value =
+                                peek_container_or_fresh(&current_state, oparg, &mut graph);
                             emit_frontend_accumulate_2(
                                 &current_block.block(),
                                 "set_add",

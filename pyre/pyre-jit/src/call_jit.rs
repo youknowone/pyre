@@ -3562,13 +3562,7 @@ fn bh_call_kw_impl(
     let parent_frame = unsafe { &mut *(parent_frame_ptr as *mut PyFrame) };
     let result = {
         let _plain_guard = pyre_interpreter::call::force_plain_eval();
-        pyre_interpreter::call::call_kw(
-            parent_frame,
-            callable,
-            null_or_self,
-            positional,
-            kwnames,
-        )
+        pyre_interpreter::call::call_kw(parent_frame, callable, null_or_self, positional, kwnames)
     };
     pyre_interpreter::call::set_last_exec_ctx(saved_ctx);
     match result {

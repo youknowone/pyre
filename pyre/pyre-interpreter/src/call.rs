@@ -664,7 +664,13 @@ pub fn call_function_ex(
                 .filter_map(|i| pyre_object::w_list_getitem(starargs, i))
                 .collect()
         } else {
-            crate::builtins::collect_iterable(starargs)?
+            // argument.py:92-104 `_combine_starargs_wrapped` — a non-tuple/list
+            // stararg unpacks through `fixedview`, and a non-iterable surfaces
+            // "argument after * must be an iterable, not %T" (not the bare
+            // `iter()` TypeError).
+            let mut unpacked: Vec<PyObjectRef> = Vec::new();
+            crate::argument::combine_starargs_wrapped(&mut unpacked, starargs, callable)?;
+            unpacked
         }
     };
     if !self_or_null.is_null() && !unsafe { pyre_object::is_none(self_or_null) } {
