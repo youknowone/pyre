@@ -4512,7 +4512,7 @@ fn filter_liveness_in_place(
         // map non-empty and the runtime on the correct (overlay) path.
         {
             let pcdep = pcdep_color_slots;
-            // #367: publish each member PC's OWN per-PC color→slot entry, NOT
+            // Publish each member PC's OWN per-PC color→slot entry, NOT
             // the cross-PC union. The folded `-live-` marker's `union_r` makes
             // the conservative-superset live SET correct (preserving extra
             // registers never harms), but UNIONing the (color, slot) inversion
