@@ -548,7 +548,10 @@ impl<'a> GraphFlattener<'a> {
     /// invariant.
     pub fn getcolor(&mut self, var: &Variable) -> Register {
         let (kind, color) = self.kind_color_of(var).unwrap_or_else(|| {
-            panic!("getcolor: Variable {var:?} not assigned a color by regalloc")
+            panic!(
+                "getcolor: Variable {var:?} not assigned a color by regalloc (graph {:?})",
+                self.graph.name,
+            )
         });
         let key = (
             kind,

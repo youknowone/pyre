@@ -54,7 +54,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-use crate::codewriter::type_state::ConcreteType;
+use crate::codewriter::type_state::{valuetype_to_concrete, ConcreteType};
 use crate::flowspace::argument::Signature;
 use crate::flowspace::model::{
     Block, BlockRefExt, ConstValue, Constant, GraphFunc, Hlvalue, Link, Variable,
@@ -616,6 +616,59 @@ fn reachable_defined_vars(graph: &LegacyGraph) -> std::collections::HashSet<Vari
     vars
 }
 
+/// Variables the emit path *colors* — every position where flatten runs
+/// `getcolor(v)` / the assembler runs `lookup_coloring(v)` on a value.
+/// Upstream `regalloc.perform_register_allocation` colors only the three
+/// value kinds (`int`/`ref`/`float`, `regalloc.py:6-8`); a `void` value
+/// is never colored and is structurally filtered at each use site.  A
+/// var appearing here therefore cannot legitimately be `Void`: it must
+/// carry a colorable kind, so the `GcRef`→`Void` refinement accepted for
+/// dropped-unit results (see [`collect_divergences`]) is unsound for it.
+///
+/// The colored positions:
+/// - op operands (`serialize_op`/`flatten_list`, `flatten.py:355-374`),
+/// - the block `exitswitch` (`goto_if_not` / `switch`,
+///   `flatten.py:259/265`, including fused compare operands),
+/// - operands forwarded on a Link into the `exceptblock` — the raise
+///   value colored by `make_return`'s 2-arg arm (`flatten.py:143`).
+///
+/// A var forwarded only into the `returnblock` is *not* included: the
+/// 1-arg return arm emits `void_return` without coloring when the kind
+/// is void (`flatten.py:135-136`), which is exactly the sound dropped-unit
+/// case the refinement targets.
+fn colored_operand_vars(graph: &LegacyGraph) -> std::collections::HashSet<Variable> {
+    let mut operands = std::collections::HashSet::new();
+    for block in &graph.blocks {
+        for op in &block.operations {
+            for v in crate::front::result_exc::op_operand_vars(&op.kind) {
+                operands.insert(v);
+            }
+        }
+        match &block.exitswitch {
+            Some(crate::model::ExitSwitch::Value(v)) => {
+                operands.insert(v.clone());
+            }
+            Some(crate::model::ExitSwitch::Fused { args, .. }) => {
+                for v in args {
+                    operands.insert(v.clone());
+                }
+            }
+            Some(crate::model::ExitSwitch::LastException) | None => {}
+        }
+        for link in &block.exits {
+            if link.target != graph.exceptblock {
+                continue;
+            }
+            for arg in &link.args {
+                if let crate::model::LinkArg::Value(v) = arg {
+                    operands.insert(v.clone());
+                }
+            }
+        }
+    }
+    operands
+}
+
 /// Diff the real path's per-Variable kinds against the legacy walker's
 /// kinds committed onto the same legacy Variables.  Walks
 /// [`FunctionGraph::iter_variables`] for a deterministic, slot-free
@@ -628,6 +681,7 @@ fn collect_divergences(
     legacy_graph: &LegacyGraph,
 ) -> Vec<String> {
     let reachable_vars = reachable_defined_vars(legacy_graph);
+    let colored_operands = colored_operand_vars(legacy_graph);
     let mut divergences = Vec::new();
     for (pos, var) in legacy_graph.iter_variables().iter().enumerate() {
         // `iterblocks()` parity: the real path annotates only the
@@ -665,8 +719,19 @@ fn collect_divergences(
         // `object_key_for_checked`'s `lookup_coloring` panic on a
         // `Some(Void)` value referenced under an `Int` regalloc class), so
         // that pairing is a genuine data-kind divergence, not a unit drop.
-        let real_refines_gcref_to_void =
-            legacy_kind == ConcreteType::GcRef && real_kind == ConcreteType::Void;
+        //
+        // Further excluded: any var the emit path *colors* (see
+        // [`colored_operand_vars`]) cannot legitimately be `Void` —
+        // upstream never color-allocates the void kind, so a `real=Void`
+        // refinement on a colored operand hits the uncolored-Void
+        // `getcolor` / `lookup_coloring` panic.  The "no boxed consumer"
+        // premise holds only for a genuinely dropped unit (a value
+        // forwarded solely into the `returnblock`, emitted as
+        // `void_return` without coloring).  Keep the colored case a
+        // divergence → Skip to legacy.
+        let real_refines_gcref_to_void = legacy_kind == ConcreteType::GcRef
+            && real_kind == ConcreteType::Void
+            && !colored_operands.contains(var);
         let diverges = if real_refines_gcref_to_void {
             false
         } else if legacy_kind != ConcreteType::Unknown {
@@ -2653,6 +2718,68 @@ fn run_phase_b_rtype_isolated(
     // lands, take()+finish() rtyper.annmixlevel here.
 }
 
+/// Backfill the low-level type of a call-result Variable the real path
+/// left untyped, from the front-end `OpKind::Call { result_ty }` the
+/// call site declared.
+///
+/// Charon does not monomorphize generics, so a call returning an erased
+/// associated type — `<E as SharedOpcodeHandler>::Value` for the
+/// generic opcode-executor family, whose two impls both bind it to a
+/// gc-ref value (`PyObjectRef` / `FrontendOp`) — reaches the annotator
+/// as a projection the rtyper never narrows to a concrete repr.  Its
+/// result Variable's `concretetype` cell stays `None`, so
+/// [`project_value_to_var`] omits it and [`collect_divergences`] reads
+/// `real=Unknown` against the legacy walker's `GcRef` — the legacy
+/// walker types the same slot from this identical `result_ty` at
+/// `legacy_resolve::infer_concrete_from_op` (`OpKind::Call { result_ty }
+/// => valuetype_to_concrete(result_ty)`), plus its final GcRef backfill.
+///
+/// Mirror that single rule into the real path so the two converge: for a
+/// call result whose declared `result_ty` projects to `GcRef`, stamp the
+/// canonical `GCREF` pointer onto the twin.  Scoped to `Ref` only — an
+/// `Int`/`Float`/`Void` *declared* result (`result_ty`) is a genuine kind
+/// question, not the erased-pointer gap, and `GcRef` is the sole kind
+/// whose value is unconditionally colorable (the `Void` slot has no
+/// regalloc class — see the `collect_divergences` `object_key_for_checked`
+/// note).
+///
+/// Overrides both the untyped (`None`) twin and a twin the rtyper
+/// collapsed to `Void`: a call the front-end declared pointer-returning
+/// (`result_ty` projects to `GcRef`) is never legitimately void — a
+/// genuinely void call carries `result_ty == Void` and is filtered by
+/// the guard — so a `Void` twin is the same erased-`<E>::Value` artifact
+/// as a `None` twin, reached when the rtyper defaulted the un-narrowed
+/// projection to unit.  It would otherwise be colored by
+/// `emit_call_result_arg` (the op's declared non-void `result_kind`
+/// forces the `>X` result argcode, `assembler.rs:2226`) and panic in
+/// `lookup_coloring`.  A twin the rtyper *positively* typed `Signed` /
+/// `Float` is left untouched — that is a real kind conflict → Skip.
+fn backfill_untyped_call_results(legacy: &LegacyGraph, value_to_var: &LegacyToTyped) {
+    use crate::translator::rtyper::lltypesystem::lltype::GCREF;
+    for block in &legacy.blocks {
+        for op in &block.operations {
+            let crate::model::OpKind::Call { result_ty, .. } = &op.kind else {
+                continue;
+            };
+            if valuetype_to_concrete(result_ty) != ConcreteType::GcRef {
+                continue;
+            }
+            let Some(legacy_result) = &op.result else {
+                continue;
+            };
+            let Some(typed) = value_to_var.get(legacy_result) else {
+                continue;
+            };
+            let twin_kind = typed
+                .concretetype()
+                .map(|lltype| lowleveltype_to_concrete(&lltype).unwrap_or(ConcreteType::Unknown));
+            if matches!(twin_kind, None | Some(ConcreteType::Void)) {
+                typed.set_concretetype(Some(GCREF.clone()));
+            }
+        }
+    }
+}
+
 /// Two-phase publish: derive the [`DualGateOutcome`] for `legacy` from the
 /// prepass cache instead of re-running the real path. Mirrors
 /// [`dual_gate_check_with_registry`]'s legacy-baseline comparison (the
@@ -2699,6 +2826,13 @@ pub(crate) fn dual_gate_outcome_from_cache(
             ));
         }
     }
+
+    // Carry the front-end call `result_ty` into the real path: stamp the
+    // canonical `GCREF` onto call results the rtyper left untyped because
+    // Charon erased their generic `<E>::Value` associated return type. This
+    // mirrors the legacy walker's identical `result_ty`-driven typing so the
+    // two paths converge instead of diverging at `real=Unknown`.
+    backfill_untyped_call_results(legacy, &value_to_var);
 
     // Legacy-baseline comparison oracle (the `dual_gate_check_with_registry`
     // pattern): the real path is trusted only when it agrees with the proven
@@ -2915,10 +3049,67 @@ mod tests {
         // `?`-extracted `Ok(())` unit (`Void`) is sound, not a
         // divergence: a `Void` value is dropped from register allocation
         // (`flatten.py:377,386`), so no consumer reads the slot as a
-        // pointer.
+        // pointer.  `diff_single_var` forwards `v1` only into the
+        // returnblock, whose 1-arg `make_return` arm emits `void_return`
+        // without coloring — the sound dropped-unit case.
         assert!(
             diff_single_var(ConcreteType::GcRef, ConcreteType::Void).is_empty(),
             "legacy=GcRef, real=Void is a sound unit refinement, not a divergence"
+        );
+    }
+
+    /// Build `start(v1) -> exceptblock(v1)` — `v1` is forwarded as the
+    /// exceptblock raise operand, which `make_return`'s 2-arg arm colors
+    /// unconditionally (`flatten.py:143`).  Publish `legacy_kind` onto
+    /// `v1` and diff against a `real_state` typing it `real_kind`.
+    fn diff_single_raise_operand(
+        legacy_kind: ConcreteType,
+        real_kind: ConcreteType,
+    ) -> Vec<String> {
+        let mut graph = LegacyGraph::new("diff_single_raise_operand");
+        let vars = mint_vars(&mut graph, 2);
+        let v1_var = vars[1].clone();
+        let startblock = Block {
+            id: graph.startblock,
+            inputargs: block_inputargs(&vars, &[1]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![crate::model::Link::new_mixed(
+                vec![LinkArg::Value(v1_var.clone()), LinkArg::Value(v1_var.clone())],
+                graph.exceptblock,
+                None,
+            )],
+            framestate: None,
+            dead: false,
+        };
+        let exceptblock = Block {
+            id: graph.exceptblock,
+            inputargs: block_inputargs(&vars, &[1, 1]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        };
+        graph.blocks = vec![startblock, exceptblock];
+        crate::model::FunctionGraph::set_concretetype_of_inline(&v1_var, legacy_kind);
+        let mut real_state = HashMap::new();
+        real_state.insert(v1_var, real_kind);
+        collect_divergences(&real_state, &graph)
+    }
+
+    #[test]
+    fn collect_divergences_rejects_gcref_to_void_on_raise_operand() {
+        // A `GcRef`→`Void` refinement on a var the emit path colors is
+        // NOT the sound dropped-unit case: the exceptblock raise operand
+        // is colored unconditionally (`make_return` 2-arg arm,
+        // `flatten.py:143`), so a `Void` there hits the uncolored-`Void`
+        // `getcolor` panic.  Keep it a divergence → Skip.
+        assert_eq!(
+            diff_single_raise_operand(ConcreteType::GcRef, ConcreteType::Void).len(),
+            1,
+            "legacy=GcRef, real=Void on a colored raise operand is a divergence, \
+             not the accepted returnblock unit drop"
         );
     }
 
