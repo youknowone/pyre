@@ -8856,11 +8856,17 @@ impl CodeWriter {
                         }
 
                         Instruction::WithExceptStart => {
-                            // CPython 3.14: `WITH_EXCEPT_START` leaves the existing
-                            // stack entries intact and pushes the exit-function
-                            // result on top. Preserve the net `+1` stack effect in
-                            // the shadow graph and fall back to the interpreter for
+                            // `WITH_EXCEPT_START` leaves the existing stack
+                            // entries intact and pushes the exit-function result
+                            // on top. Preserve the net `+1` stack effect in the
+                            // shadow graph and fall back to the interpreter for
                             // the actual helper call semantics.
+                            //
+                            // Portable (flowspace records a `direct_call` /
+                            // `indirect_call`) but latent: a `with` block's
+                            // exception table prevents the enclosing loop/callee
+                            // from ever reaching a JIT token, so this abort is
+                            // never reached in practice — no residual yet.
                             emit_abort_permanent!(py_pc);
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
@@ -8986,7 +8992,13 @@ impl CodeWriter {
                         Instruction::MakeFunction { .. } => {
                             // Pops code object (TOS), pushes function. Net: 0.
                             // Replace shadow value so SET_FUNCTION_ATTRIBUTE sees func.
-                            // RustPython: (1 pushed, 1 popped).
+                            // (1 pushed, 1 popped).
+                            //
+                            // Portable (flowspace `newfunction`) but latent:
+                            // function definition is a def-time op, not a hot-loop
+                            // body, and MAKE_FUNCTION + SET_FUNCTION_ATTRIBUTE must
+                            // port as a pair (the flowspace fold resolves the code
+                            // constant to a Constant closure). No residual yet.
                             let _ = current_state.stack.pop();
                             push_fresh_ref(&mut current_state, &mut graph);
                             emit_abort_permanent!(py_pc);
@@ -9458,6 +9470,18 @@ impl CodeWriter {
                         // Pops: kwnames + argc args + null_or_self + callable = argc + 3.
                         // Pushes: result. Net stack effect: -(argc + 2).
                         // pyopcode.py CALL_FUNCTION_KW / CALL_KW / eval.rs:2570-2726.
+                        //
+                        // Portable (flowspace records `call_function` with a
+                        // constant kwnames tuple) and demonstrable (a CALL_KW
+                        // in an inlined callee aborts the callee jitcode), but
+                        // still aborts: the residual is variadic (a per-arity
+                        // `bh_call_kw_N(callable, self_or_null, kwnames, args...)`
+                        // family, mirroring the `Call` `call_fn_N` family) and
+                        // `eval.rs::call_kw`'s `call_user_function_resolved`
+                        // fast path must be routed through `force_plain_eval`
+                        // to avoid JIT re-entry from a blackhole residual.
+                        // Tracked as a follow-up (see the CALL_FUNCTION_EX port
+                        // `47682545e6` for the fixed-arity template).
                         Instruction::CallKw { argc } => {
                             let nargs = argc.get(op_arg) as usize;
                             // Pop kwnames + nargs args + null_or_self + callable.
@@ -10200,6 +10224,10 @@ impl CodeWriter {
                         // pushes same func back. Net: -1. Preserve func identity.
                         // eval.rs:1907-1908: func = pop(), attr = pop().
                         Instruction::SetFunctionAttribute { .. } => {
+                            // Portable (flowspace `newfunction` with constant
+                            // defaults) but latent: the def-time partner of
+                            // MAKE_FUNCTION; ports as a pair with it. No residual
+                            // yet.
                             let func = pop_ref_or_fresh(&mut current_state, &mut graph);
                             current_depth = current_depth.saturating_sub(1);
                             let _ = current_state.stack.pop(); // attr
@@ -10572,6 +10600,13 @@ impl CodeWriter {
                         // SetFunctionTypeParams: pops type_params (TOS), leaves func. Net: -1.
                         // Other variants: general pop 2, push 1. Net: -1.
                         // pyopcode.rs:1302-1316.
+                        //
+                        // Only SetTypeparamDefault is portable (flowspace
+                        // `set_typeparam_default` pure op); the rest are genuine
+                        // boundaries (`unsupported_rpython`).  The portable one is
+                        // deeply latent — a PEP 695 def-time intrinsic that
+                        // imports `_typing` and calls a Python helper, never a hot
+                        // loop body. No residual.
                         Instruction::CallIntrinsic2 { func } => {
                             use pyre_interpreter::bytecode::IntrinsicFunction2;
                             match func.get(op_arg) {
@@ -10603,6 +10638,14 @@ impl CodeWriter {
 
                         // LoadSpecial: pops 1 (obj), pushes 2 (callable, self_or_null). Net: +1.
                         // pyopcode.rs:2059 delegates to load_method; eval.rs:2365 pops 1 pushes 2.
+                        //
+                        // Enter/Exit are portable (flowspace records a
+                        // `record_maybe_raise_op`), AEnter/AExit are a genuine
+                        // async boundary (`unsupported_rpython("async with is not
+                        // RPython")`).  The portable Enter/Exit half is latent:
+                        // LOAD_SPECIAL only heads a `with` block, whose exception
+                        // table blocks token creation (see WITH_EXCEPT_START), so
+                        // this abort is never reached in practice. No residual yet.
                         Instruction::LoadSpecial { .. } => {
                             pop_and_decr_depth(&mut current_state, &mut current_depth);
                             push_fresh_ref(&mut current_state, &mut graph);
@@ -11070,6 +11113,15 @@ impl CodeWriter {
                         // YieldValue: pops yielded value, pushes placeholder back. Net: 0.
                         // Replace shadow value. rpython/flowspace/flowcontext.py:721,
                         // liveness.rs:569, assemble.py:1543.
+                        //
+                        // Fundamentally unsound to port: YIELD_VALUE suspends the
+                        // frame (StepResult::Yield), resuming later in a different
+                        // stack context — a residual call cannot express that.
+                        // flowspace's `record_pure_op("yield")` is an analysis
+                        // artifact (flow purity, not runtime effect-freedom), not
+                        // a signal that a residual is possible.  A JIT traces one
+                        // continuous execution, so abort_permanent is the only
+                        // parity-correct choice.
                         Instruction::YieldValue { .. } => {
                             let _ = current_state.stack.pop();
                             push_fresh_ref(&mut current_state, &mut graph);
@@ -11077,6 +11129,11 @@ impl CodeWriter {
                         }
 
                         // ReturnGenerator: pushes 1. Net: +1.
+                        // Portable (a plain push-None in flowspace) but useless:
+                        // it only heads a generator/coroutine body, whose
+                        // YIELD_VALUE aborts anyway (frame suspension is not
+                        // traceable), so a residual would never let a generator
+                        // loop compile. No residual.
                         Instruction::ReturnGenerator => {
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
