@@ -4264,6 +4264,30 @@ fn filter_liveness_in_place(
             "filter_liveness_in_place: walker_tracked_pc_live_indices must be Some with one \
              entry per Python PC since label retirement retired per-PC label emission",
         );
+    // FOR_ITER body PCs: used to scope Slice B's per-PC frame-live
+    // re-add below. While-loop body PCs are excluded to prevent
+    // perf regressions (wider liveness → more live-across-loop colors
+    // → more spills).
+    let foriter_body_pcs = {
+        let n = code.instructions.len();
+        let mut pcs = bit_set::BitSet::with_capacity(n);
+        let mut scan_state = pyre_interpreter::OpArgState::default();
+        for scan_pc in 0..n {
+            let (scan_instr, scan_arg) = scan_state.get(code.instructions[scan_pc]);
+            if let pyre_interpreter::Instruction::ForIter { delta } = scan_instr {
+                let exhaust_target = pyre_interpreter::jump_target_forward(
+                    &code.instructions,
+                    scan_pc + 1,
+                    delta.get(scan_arg).as_usize(),
+                );
+                pcs.insert(scan_pc);
+                for body_pc in (scan_pc + 1)..exhaust_target.min(n) {
+                    pcs.insert(body_pc);
+                }
+            }
+        }
+        pcs
+    };
     // Run `compute_liveness` + `remove_repeated_live` and resolve each
     // Python PC's `-live-` marker to its POST-merge SSARepr index.
     // `liveness.rs`'s public API (`compute_liveness`,
@@ -4443,24 +4467,19 @@ fn filter_liveness_in_place(
             };
             pc_live_r.retain(|idx| lv_live.contains(idx));
             // Re-add the per-PC frame-live colors the SSA-backward retain
-            // dropped.  `lv_live` is the PC's `pcdep_color_slots` colors — the
-            // TRUE per-program-point set of restorable frame slots (locals +
-            // live operand-stack tail).  A loop-carried operand-stack value —
-            // the FOR_ITER iterator, or any value pushed before the loop body
-            // and re-read only after the back-edge — is frame-live at a body PC
-            // but SSA-backward-DEAD there (its next read is across the loop
-            // back-edge, which `compute_liveness` does not carry into a
-            // mid-block marker), so `pc_live_r` omits it and the guard snapshot
-            // captured at this PC leaves the slot `OpRef::NONE` -> `PY_NULL`.
-            // The runtime resume snapshot must name every live frame slot at
-            // the PC (`pyjitpl.py:222-233` reads `registers_r[index]` for each
-            // `-live-`-named index), so name the full frame-live set — matching
-            // the portal-red re-add just below.  Every `lv_live` color is
-            // frame-backed by construction (it came from `pcdep_color_slots`),
-            // so this cannot surface a scratch color the retain guards against.
-            for &idx in lv_live.iter() {
-                if !pc_live_r.contains(&idx) {
-                    pc_live_r.push(idx);
+            // dropped — FOR_ITER body PCs only.  A loop-carried operand-
+            // stack value (the iterator) is frame-live at a body PC but
+            // SSA-backward-DEAD there, so `pc_live_r` omits it and the
+            // guard snapshot leaves the slot `OpRef::NONE`.  Re-adding
+            // `lv_live` names the full restorable set for FOR_ITER body
+            // guards.  While-loop body PCs are excluded: widening their
+            // liveness changes the resume layout and causes perf
+            // regressions (int_loop/float_loop/nested_loop).
+            if foriter_body_pcs.contains(py_pc) {
+                for &idx in lv_live.iter() {
+                    if !pc_live_r.contains(&idx) {
+                        pc_live_r.push(idx);
+                    }
                 }
             }
 

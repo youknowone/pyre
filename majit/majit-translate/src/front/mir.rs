@@ -2224,7 +2224,10 @@ impl<'a> Lowering<'a> {
             block_entry_local_var,
             block_entry_positional_aggregate_locals,
             block_positional_seen: vec![bit_set::BitSet::with_capacity(n_locals); body.body.len()],
-            block_positional_conflict: vec![bit_set::BitSet::with_capacity(n_locals); body.body.len()],
+            block_positional_conflict: vec![
+                bit_set::BitSet::with_capacity(n_locals);
+                body.body.len()
+            ],
             positional_aggregate_locals: std::collections::HashMap::new(),
             binop_result_locals: compute_binop_result_locals(body),
             index_elem_alias: std::collections::HashMap::new(),
@@ -15499,7 +15502,10 @@ mod tests {
         // also live-in, and the throwaway temp _3 (defined before its
         // only use within bb1) is not.
         assert!(live[1].contains(1), "array base _1 must be live-in at bb1");
-        assert!(!live[1].contains(3), "temp _3 is block-local, not live-in at bb1");
+        assert!(
+            !live[1].contains(3),
+            "temp _3 is block-local, not live-in at bb1"
+        );
     }
 
     #[test]
