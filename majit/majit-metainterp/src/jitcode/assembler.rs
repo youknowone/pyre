@@ -525,7 +525,11 @@ impl JitCodeBuilder {
         // FieldDescr.get_parent_descr() Weak reference dangles.
         if let Some(existing) = self.struct_size_specs.get_mut(&type_id) {
             for nf in new_fields {
-                if !existing.all_fielddescrs.iter().any(|ef| ef.offset == nf.offset) {
+                if !existing
+                    .all_fielddescrs
+                    .iter()
+                    .any(|ef| ef.offset == nf.offset)
+                {
                     existing.all_fielddescrs.push(nf);
                 }
             }
@@ -4884,10 +4888,7 @@ impl JitCodeBuilder {
     /// SizeDescr with all fields populated by `heaptracker.all_fielddescrs`).
     fn patch_field_descr_parents(&mut self) {
         for entry in &mut self.descrs {
-            if let RuntimeBhDescr::Descr(CanonicalBhDescr::Field {
-                parent, ..
-            }) = entry
-            {
+            if let RuntimeBhDescr::Descr(CanonicalBhDescr::Field { parent, .. }) = entry {
                 if let Some(p) = parent {
                     if let Some(final_spec) = self.struct_size_specs.get(&p.type_id) {
                         *p = final_spec.clone();

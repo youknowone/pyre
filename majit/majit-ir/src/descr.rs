@@ -1156,14 +1156,15 @@ impl GcCache {
         };
         if should_insert {
             self._cache_size.insert(key.clone(), descr.clone());
-            self._cache_size_order
-                .retain(|d| {
-                    // Remove the old entry for this key (if any) from the
-                    // ordered vec so a stale orphan never appears.
-                    d.as_size_descr()
-                        .map(|sd| sd.cache_key() != descr.as_size_descr().map(|s| s.cache_key()).unwrap_or(0))
-                        .unwrap_or(true)
-                });
+            self._cache_size_order.retain(|d| {
+                // Remove the old entry for this key (if any) from the
+                // ordered vec so a stale orphan never appears.
+                d.as_size_descr()
+                    .map(|sd| {
+                        sd.cache_key() != descr.as_size_descr().map(|s| s.cache_key()).unwrap_or(0)
+                    })
+                    .unwrap_or(true)
+            });
             if !arc_in_vec(&self._cache_size_order, &descr) {
                 self._cache_size_order.push(descr);
             }
@@ -1210,7 +1211,8 @@ impl GcCache {
             // Remove stale entry from _order if present.
             if let Some(old) = inner.get(&field_name) {
                 let old_ref: DescrRef = old.clone() as DescrRef;
-                self._cache_field_order.retain(|d| !Arc::ptr_eq(d, &old_ref));
+                self._cache_field_order
+                    .retain(|d| !Arc::ptr_eq(d, &old_ref));
             }
             inner.insert(field_name, descr.clone());
             let as_ref: DescrRef = descr as DescrRef;

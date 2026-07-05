@@ -751,8 +751,7 @@ impl<'c> Lowerer<'c> {
                 reg: result_reg,
                 kind: BindingKind::Ref,
                 depends_on_stack: false,
-                struct_type: ref_field_entry
-                    .map(|(_, _, pointee_path)| pointee_path.clone()),
+                struct_type: ref_field_entry.map(|(_, _, pointee_path)| pointee_path.clone()),
             })
         } else {
             // Int-kind field (default) → getfield_gc_i.
@@ -853,8 +852,7 @@ impl<'c> Lowerer<'c> {
                 reg: result_reg,
                 kind: BindingKind::Ref,
                 depends_on_stack: false,
-                struct_type: ref_field_entry
-                    .map(|(_, _, pointee_path)| pointee_path.clone()),
+                struct_type: ref_field_entry.map(|(_, _, pointee_path)| pointee_path.clone()),
             })
         } else {
             self.emit_op(

@@ -141,6 +141,13 @@ pub struct JitInterpConfig {
     /// the lowerer sets `Binding.struct_type` to the declared type so
     /// subsequent `result.field` access resolves through `ref_fields`.
     pub call_returns: Vec<(Path, Path)>,
+    /// Struct literal → concrete allocator mapping for the concrete path.
+    /// `struct_allocs = { StructType => allocator_func, ... }`.  When the
+    /// concrete-path `RefFieldRewriter` encounters a struct literal
+    /// `StructType { f0: v0, f1: v1 }`, it rewrites the literal to
+    /// `allocator_func(v0, v1)`.  The JIT path already handles struct
+    /// literals natively via `lower_struct_value` (New + SetfieldGc).
+    pub struct_allocs: Vec<(Path, Path)>,
     /// Opt-in: route pure forward-advancing dispatch arms (those whose body
     /// only does work then `pc += N`, with no back-edge / `can_enter_jit!` /
     /// early return) through the per-arm sub-JitCode path with a pc-returning
@@ -514,6 +521,7 @@ impl Parse for JitInterpConfig {
         let mut pool_arrays: Vec<PoolArrayEntry> = Vec::new();
         let mut ref_fields: Vec<RefFieldEntry> = Vec::new();
         let mut call_returns: Vec<(Path, Path)> = Vec::new();
+        let mut struct_allocs: Vec<(Path, Path)> = Vec::new();
         let mut split_dispatch = false;
         let mut switch_dispatch = false;
 
@@ -574,6 +582,9 @@ impl Parse for JitInterpConfig {
                 "call_returns" => {
                     call_returns = parse_call_returns_map(input)?;
                 }
+                "struct_allocs" => {
+                    struct_allocs = parse_call_returns_map(input)?;
+                }
                 "split_dispatch" => {
                     split_dispatch = input.parse::<LitBool>()?.value;
                 }
@@ -627,6 +638,7 @@ impl Parse for JitInterpConfig {
             pool_arrays,
             ref_fields,
             call_returns,
+            struct_allocs,
             split_dispatch,
             switch_dispatch,
         })
@@ -1306,6 +1318,10 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
         // When `let x = func(...)` and func is in this map, `x` is recorded
         // as a local ref binding pointing to the declared struct type.
         call_returns: std::collections::HashMap<Vec<String>, syn::Path>,
+        // `struct_allocs` entries: struct type segments → allocator function path.
+        // When `let x = StructType { f0, f1 }` and StructType is in this map,
+        // the concrete path rewrites the struct literal to `allocator(f0, f1)`.
+        struct_allocs: std::collections::HashMap<Vec<String>, syn::Path>,
     }
     impl RefFieldRewriter {
         // For `e == state.<ref_scalar>`, return the `ref(T)` struct path.
@@ -1339,14 +1355,18 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
 
         // Record a local binding as pointing to a struct type.
         fn record_local_ref(&mut self, name: &str, struct_type: syn::Path) {
-            self.local_ref_types
-                .insert(name.to_string(), struct_type);
+            self.local_ref_types.insert(name.to_string(), struct_type);
         }
 
         // Check if a call expression's function is in `call_returns`.
         fn call_return_type(&self, func: &Expr) -> Option<syn::Path> {
             let Expr::Path(p) = func else { return None };
-            let segs: Vec<String> = p.path.segments.iter().map(|s| s.ident.to_string()).collect();
+            let segs: Vec<String> = p
+                .path
+                .segments
+                .iter()
+                .map(|s| s.ident.to_string())
+                .collect();
             self.call_returns.get(&segs).cloned()
         }
     }
@@ -1369,9 +1389,7 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
                         };
                         let mut rhs = (*assign.right).clone();
                         self.visit_expr_mut(&mut rhs);
-                        if let Some(pointee) =
-                            self.field_pointee(&struct_path, &member_name)
-                        {
+                        if let Some(pointee) = self.field_pointee(&struct_path, &member_name) {
                             // Ref-kind field → cast RHS from usize to *mut Pointee.
                             *expr = syn::parse_quote! {
                                 unsafe { (*(#base as *mut #struct_path)).#member = #rhs as *mut #pointee }
@@ -1404,8 +1422,7 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
                         syn::Member::Named(id) => id.to_string(),
                         _ => String::new(),
                     };
-                    let is_ref_field =
-                        self.field_pointee(&struct_path, &member_name).is_some();
+                    let is_ref_field = self.field_pointee(&struct_path, &member_name).is_some();
                     if is_ref_field {
                         // Ref-kind field → cast to usize (JIT ref bank).
                         *expr = syn::parse_quote! {
@@ -1451,8 +1468,7 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
                         syn::Member::Named(id) => id.to_string(),
                         _ => String::new(),
                     };
-                    let is_ref_field =
-                        self.field_pointee(&struct_path, &member_name).is_some();
+                    let is_ref_field = self.field_pointee(&struct_path, &member_name).is_some();
                     if is_ref_field {
                         // Ref-kind field → cast result to usize (JIT ref bank).
                         *expr = syn::parse_quote! {
@@ -1555,11 +1571,33 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
                     if let Expr::Call(call) = &*init.expr {
                         if let Some(struct_type) = self.call_return_type(&call.func) {
                             if let syn::Pat::Ident(pat_ident) = &local.pat {
-                                self.record_local_ref(
-                                    &pat_ident.ident.to_string(),
-                                    struct_type,
-                                );
+                                self.record_local_ref(&pat_ident.ident.to_string(), struct_type);
                             }
+                        }
+                    }
+                }
+            }
+            // Rewrite struct literal inits on the concrete path:
+            // `let x = StructType { f0: v0, f1: v1 }` where StructType is
+            // in `struct_allocs` → `let x = allocator_func(v0, v1)`.
+            // The JIT path handles struct literals via `lower_struct_value`
+            // (New + SetfieldGc); this rewrite makes the concrete path
+            // produce the same allocation through the runtime allocator.
+            if let syn::Stmt::Local(local) = stmt {
+                if let Some(init) = &mut local.init {
+                    if let Expr::Struct(s) = &*init.expr {
+                        let segs: Vec<String> = s
+                            .path
+                            .segments
+                            .iter()
+                            .map(|seg| seg.ident.to_string())
+                            .collect();
+                        if let Some(alloc_func) = self.struct_allocs.get(&segs).cloned() {
+                            let field_args: Vec<Expr> =
+                                s.fields.iter().map(|f| f.expr.clone()).collect();
+                            init.expr = Box::new(syn::parse_quote! {
+                                #alloc_func(#(#field_args),*)
+                            });
                         }
                     }
                 }
@@ -1599,8 +1637,21 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
                 .call_returns
                 .iter()
                 .map(|(func, ret_type)| {
-                    let segs: Vec<String> = func.segments.iter().map(|s| s.ident.to_string()).collect();
+                    let segs: Vec<String> =
+                        func.segments.iter().map(|s| s.ident.to_string()).collect();
                     (segs, ret_type.clone())
+                })
+                .collect();
+            let struct_allocs_map: std::collections::HashMap<Vec<String>, syn::Path> = config
+                .struct_allocs
+                .iter()
+                .map(|(struct_path, alloc_func)| {
+                    let segs: Vec<String> = struct_path
+                        .segments
+                        .iter()
+                        .map(|s| s.ident.to_string())
+                        .collect();
+                    (segs, alloc_func.clone())
                 })
                 .collect();
             RefFieldRewriter {
@@ -1608,6 +1659,7 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
                 field_pointees,
                 local_ref_types: std::collections::HashMap::new(),
                 call_returns: call_returns_map,
+                struct_allocs: struct_allocs_map,
             }
             .visit_block_mut(&mut block);
         }
