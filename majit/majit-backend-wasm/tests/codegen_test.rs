@@ -54,7 +54,6 @@ fn test_empty_trace() {
         0,
         None, // nursery
         0,    // fail_index_base
-        true, // is_loop
         0,    // external_jump_slot
         0,    // external_jump_key
         codegen::CaParams::default(),
@@ -118,7 +117,6 @@ fn test_int_add_loop() {
         0,
         None, // nursery
         0,    // fail_index_base
-        true, // is_loop
         0,    // external_jump_slot
         0,    // external_jump_key
         codegen::CaParams::default(),
@@ -184,7 +182,6 @@ fn test_float_ops() {
         0,
         None, // nursery
         0,    // fail_index_base
-        true, // is_loop
         0,    // external_jump_slot
         0,    // external_jump_key
         codegen::CaParams::default(),
@@ -226,7 +223,6 @@ fn test_call_generates_import() {
         0,
         None, // nursery
         0,    // fail_index_base
-        true, // is_loop
         0,    // external_jump_slot
         0,    // external_jump_key
         codegen::CaParams::default(),
@@ -325,7 +321,6 @@ fn test_guard_types() {
         0,
         None, // nursery
         0,    // fail_index_base
-        true, // is_loop
         0,    // external_jump_slot
         0,    // external_jump_key
         codegen::CaParams::default(),
@@ -374,7 +369,6 @@ fn test_exception_guards() {
         0,
         None, // nursery
         0,    // fail_index_base
-        true, // is_loop
         0,    // external_jump_slot
         0,    // external_jump_key
         codegen::CaParams::default(),
@@ -419,7 +413,6 @@ fn test_guard_gc_type_uses_immediate_typeid() {
         0,
         None, // nursery
         0,    // fail_index_base
-        true, // is_loop
         0,    // external_jump_slot
         0,    // external_jump_key
         codegen::CaParams::default(),
@@ -486,7 +479,6 @@ fn test_guard_is_object_lowers_to_typeinfo_test() {
         0,
         None, // nursery
         0,    // fail_index_base
-        true, // is_loop
         0,    // external_jump_slot
         0,    // external_jump_key
         codegen::CaParams::default(),
@@ -541,7 +533,6 @@ fn test_guard_subclass_lowers_to_subclassrange_check() {
         0,
         None, // nursery
         0,    // fail_index_base
-        true, // is_loop
         0,    // external_jump_slot
         0,    // external_jump_key
         codegen::CaParams::default(),
@@ -563,7 +554,6 @@ fn test_guard_subclass_lowers_to_subclassrange_check() {
         0,
         None, // nursery
         0,    // fail_index_base
-        true, // is_loop
         0,    // external_jump_slot
         0,    // external_jump_key
         codegen::CaParams::default(),
@@ -634,7 +624,6 @@ fn test_sameas_and_conversions() {
         0,
         None, // nursery
         0,    // fail_index_base
-        true, // is_loop
         0,    // external_jump_slot
         0,    // external_jump_key
         codegen::CaParams::default(),
@@ -691,7 +680,6 @@ fn test_overflow_ops() {
         0,
         None, // nursery
         0,    // fail_index_base
-        true, // is_loop
         0,    // external_jump_slot
         0,    // external_jump_key
         codegen::CaParams::default(),
@@ -752,7 +740,6 @@ fn test_single_label_peeled_loop_validates() {
         0,
         None, // nursery
         0,    // fail_index_base
-        true, // is_loop
         0,    // external_jump_slot
         0,    // external_jump_key
         codegen::CaParams::default(),
@@ -820,7 +807,6 @@ fn test_multi_label_peeled_resumes_at_last_label_validates() {
         0,
         None, // nursery
         0,    // fail_index_base
-        true, // is_loop
         0,    // external_jump_slot
         0,    // external_jump_key
         codegen::CaParams::default(),
