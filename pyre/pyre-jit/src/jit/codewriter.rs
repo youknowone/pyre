@@ -12645,6 +12645,7 @@ impl CodeWriter {
             max_stackdepth: code.max_stackdepth as usize,
             pcdep_color_slots,
             const_ref_slots_at_pc,
+            is_drained: true,
         };
 
         PyJitCode::from_parts(

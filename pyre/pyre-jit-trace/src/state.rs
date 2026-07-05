@@ -9304,6 +9304,7 @@ mod tests {
         let mut pyjit = crate::PyJitCode::skeleton(raw_code);
         pyjit.jitcode = std::sync::Arc::new(builder.finish());
         pyjit.metadata.pc_map.resize(code.instructions.len(), 0);
+        pyjit.metadata.is_drained = true;
         METAINTERP_SD.with(|r| {
             r.borrow_mut()
                 .set_jitcodes_from_make_result(vec![std::sync::Arc::new(pyjit)]);
@@ -9370,6 +9371,7 @@ mod tests {
         let mut pyjit = crate::PyJitCode::skeleton(raw_code);
         pyjit.jitcode = std::sync::Arc::new(runtime_jc);
         pyjit.metadata.pc_map.push(0);
+        pyjit.metadata.is_drained = true;
         let inner_jc = JitCode {
             index: 0,
             payload: std::sync::Arc::new(pyjit),
@@ -11614,6 +11616,7 @@ mod tests {
                 max_stackdepth: 0,
                 pcdep_color_slots: Vec::new(),
                 const_ref_slots_at_pc: Vec::new(),
+                is_drained: true,
             },
             std::ptr::null(),
             false,
@@ -12414,7 +12417,18 @@ mod indirectcalltargets_tests {
 
     fn populated_pyjit(raw_code: *const CodeObject) -> Arc<crate::PyJitCode> {
         let mut pyjit = crate::PyJitCode::skeleton(raw_code);
+        // A drained PerCodeObject install has non-empty `code` and
+        // `is_drained` set; give the fixture both so it is not classified
+        // as a skeleton (`is_skeleton()` now tests `code.is_empty()`).
+        let runtime_jc = majit_metainterp::jitcode::JitCode::new("populated_pyjit_test");
+        runtime_jc.set_body(majit_translate::jitcode::JitCodeBody {
+            code: vec![majit_metainterp::jitcode::insns::BC_LIVE, 0, 0],
+            startpoints: Some([0_usize].into_iter().collect()),
+            ..Default::default()
+        });
+        pyjit.jitcode = Arc::new(runtime_jc);
         pyjit.metadata.pc_map.push(0);
+        pyjit.metadata.is_drained = true;
         Arc::new(pyjit)
     }
 

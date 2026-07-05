@@ -30,11 +30,15 @@
 //!
 //! A `PyJitCode` is one of three modes, encoded across two flags:
 //!
-//! | mode             | `jitcode.code` | `metadata.pc_map` | predicate                |
-//! |------------------|----------------|--------------------|--------------------------|
-//! | Skeleton         | empty          | empty              | [`PyJitCode::is_skeleton`]       |
-//! | PortalBridge     | non-empty      | empty              | [`PyJitCode::is_portal_bridge`]  |
-//! | PerCodeObject    | non-empty      | non-empty          | [`PyJitCode::is_populated`]      |
+//! | mode             | `jitcode.code` | `metadata.is_drained` | predicate                |
+//! |------------------|----------------|-----------------------|--------------------------|
+//! | Skeleton         | empty          | false                 | [`PyJitCode::is_skeleton`]       |
+//! | PortalBridge     | non-empty      | false                 | [`PyJitCode::is_portal_bridge`]  |
+//! | PerCodeObject    | non-empty      | true                  | [`PyJitCode::is_populated`]      |
+//!
+//! `is_drained` tracks the setup-time drain (`codewriter.rs` `finalize_jitcode`
+//! populates the per-PC maps); it replaces the older `pc_map.is_empty()` test
+//! so the mode classification is independent of the translation table.
 //!
 //! `code` and `pc_map` are independent because the portal-bridged
 //! install ([`crate::canonical_bridge::install_portal_for`]) reuses
@@ -177,6 +181,16 @@ pub struct PyJitCodeMetadata {
     /// leaves empty after the `pcdep_color_slots` color→slot inversion.
     /// Indexed by `py_pc`; empty for jitcodes with no inlined-callee resume.
     pub const_ref_slots_at_pc: Vec<Vec<(u16, i64)>>,
+    /// True once `assembler.assemble`'s setup-time drain has run and stamped
+    /// the per-Python-PC maps (`codewriter.rs` `finalize_jitcode`). The
+    /// install-mode discriminators ([`PyJitCode::is_populated`] /
+    /// [`PyJitCode::is_portal_bridge`]) read this flag instead of testing
+    /// `pc_map.is_empty()`, so the mode classification no longer depends on
+    /// the translation table's population state — a step toward retiring
+    /// `pc_map`. Set to `true` exactly where `pc_map` is populated (drained
+    /// PerCodeObject installs); `false` for skeletons and portal-bridge
+    /// installs, which leave `pc_map` empty.
+    pub is_drained: bool,
 }
 
 /// Compiled JitCode plus pyre-only metadata.
@@ -375,7 +389,7 @@ impl PyJitCode {
     /// PerCodeObject mode in the discriminator table on the module
     /// doc.
     pub fn is_populated(&self) -> bool {
-        !self.metadata.pc_map.is_empty()
+        self.metadata.is_drained
     }
 
     /// Resolve a Python bytecode PC to the JitCode byte offset where
@@ -470,13 +484,14 @@ impl PyJitCode {
     /// nor `pc_map` populated yet. See the discriminator table on
     /// the module doc.
     ///
-    /// Strictly equivalent to `!is_populated() && !is_portal_bridge()`
-    /// (DeMorgan-expanded: `pc_map.is_empty() && (code.is_empty() ||
-    /// !pc_map.is_empty())` reduces to the conjunction below).
-    /// Callers prefer this name over the negated-pair form because it
-    /// names the third mode in the discriminator table directly.
+    /// Strictly equivalent to `!is_populated() && !is_portal_bridge()`.
+    /// A skeleton is the only mode with empty `code` (portal-bridge and
+    /// PerCodeObject both fill `code`; the fourth combination code-empty/
+    /// drained is not produced by any path, module doc), so the empty-`code`
+    /// test alone names the third mode in the discriminator table directly.
+    /// Callers prefer this name over the negated-pair form.
     pub fn is_skeleton(&self) -> bool {
-        self.jitcode.code.is_empty() && self.metadata.pc_map.is_empty()
+        self.jitcode.code.is_empty()
     }
 
     /// Is this `PyJitCode` a portal-bridged install (G.3a
@@ -486,9 +501,9 @@ impl PyJitCode {
     ///   * `jitcode.code` non-empty (rules out `PyJitCode::skeleton`,
     ///     which clones `Arc::new(RuntimeJitCode::default())` whose
     ///     `code` is empty).
-    ///   * `metadata.pc_map` empty (rules out drained CodeWriter
-    ///     installs, whose setup-time drain populates `pc_map` to
-    ///     `code.instructions.len()`).
+    ///   * `!metadata.is_drained` (rules out drained CodeWriter installs,
+    ///     whose setup-time drain sets `is_drained` when it populates the
+    ///     per-Python-PC maps).
     ///
     /// Used by readers that have to branch on portal-mode semantics —
     /// portal entry has no per-Python-PC `pc_map` because the portal
@@ -502,7 +517,7 @@ impl PyJitCode {
     /// `jd.mainjitcode`; production readers still branch on this predicate
     /// only for explicit bridge-probe installs.
     pub fn is_portal_bridge(&self) -> bool {
-        !self.jitcode.code.is_empty() && self.metadata.pc_map.is_empty()
+        !self.jitcode.code.is_empty() && !self.metadata.is_drained
     }
 
     /// Empty `PyJitCode` slot inserted by `CallControl::get_jitcode`
@@ -538,6 +553,7 @@ impl PyJitCode {
                 max_stackdepth: 0,
                 pcdep_color_slots: Vec::new(),
                 const_ref_slots_at_pc: Vec::new(),
+                is_drained: false,
             },
             code_ptr,
             false,

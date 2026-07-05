@@ -9996,6 +9996,7 @@ mod tests {
         let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
         pyjit.jitcode = Arc::new(runtime_jc);
         pyjit.metadata.pc_map.push(0);
+        pyjit.metadata.is_drained = true;
         let inner_jc = crate::state::JitCode {
             index: 0,
             payload: Arc::new(pyjit),
@@ -10072,6 +10073,7 @@ mod tests {
         let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
         pyjit.jitcode = Arc::new(runtime_jc);
         pyjit.metadata.pc_map.push(0);
+        pyjit.metadata.is_drained = true;
         pyjit.metadata.depth_at_py_pc.push(1);
         // Per-PC (color, slot) entries the codewriter publishes at pc 0:
         // local 0 -> color 0 (slot 0), local 1 -> color 1 (slot 1), and the
