@@ -11092,7 +11092,10 @@ mod tests {
         // `call_function_ex(callable, self_or_null, starargs, kwargs_or_null)`
         // → `residual_call_r_r(ConstInt(call_function_ex_fn_idx), ListR([
         // callable, self_or_null, starargs, kwargs_or_null]), Descr) → reg`
-        // (MayForce — unpack + dispatch run user code).
+        // (MayForce — unpack + dispatch run user code).  The `call_function_ex`
+        // arm lives in the shared opname dispatcher `lower_tuple_build_hlop_to_insn`
+        // (alongside newtuple/build_map/build_set), so that is the entry point
+        // exercised here.
         let callable_var = Variable::new(VariableId(8), Kind::Ref);
         let self_var = Variable::new(VariableId(10), Kind::Ref);
         let starargs_var = Variable::new(VariableId(11), Kind::Ref);
