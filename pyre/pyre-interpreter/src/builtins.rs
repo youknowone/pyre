@@ -5392,28 +5392,20 @@ pub(crate) fn builtin_dict_ctor(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
         }
         return Ok(dict);
     }
-    // Construct from iterable of (key, value) pairs.
+    // Construct from iterable of (key, value) pairs — dictmultiobject.py
+    // update1_pairs coerces each pair with `space.fixedview` (any 2-element
+    // iterable), not just tuple/list.
     let dict = w_dict_new();
     let items = collect_iterable(src)?;
-    for pair in items {
-        let (k, v) = unsafe {
-            if is_tuple(pair) && w_tuple_len(pair) == 2 {
-                (
-                    w_tuple_getitem(pair, 0).unwrap(),
-                    w_tuple_getitem(pair, 1).unwrap(),
-                )
-            } else if is_list(pair) && w_list_len(pair) == 2 {
-                (
-                    w_list_getitem(pair, 0).unwrap(),
-                    w_list_getitem(pair, 1).unwrap(),
-                )
-            } else {
-                return Err(crate::PyError::type_error(
-                    "dict update sequence element is not a 2-element sequence",
-                ));
-            }
-        };
-        unsafe { w_dict_store(dict, k, v) };
+    for (i, pair) in items.into_iter().enumerate() {
+        let elems = collect_iterable(pair)?;
+        if elems.len() != 2 {
+            return Err(crate::PyError::value_error(format!(
+                "dictionary update sequence element #{i} has length {}; 2 is required",
+                elems.len()
+            )));
+        }
+        unsafe { w_dict_store(dict, elems[0], elems[1]) };
     }
     Ok(dict)
 }

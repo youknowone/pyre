@@ -953,77 +953,11 @@ pub(crate) fn resolve_kwargs(
     let posonlyarg_count = code.posonlyarg_count as usize;
     let fname = unsafe { crate::function_get_qualname(target_func) };
 
-    // `argument.py:235-236` — too-many positional args with no *vararg.
-    // The kwargs path counts only positional args (`n_pos`); kwargs are
-    // matched separately via _match_keywords.
-    if n_pos > n_pos_params && !has_varargs {
-        let ndefaults = {
-            let defaults = unsafe { crate::function_get_defaults(target_func) };
-            if !defaults.is_null() {
-                let defaults = crate::baseobjspace::unwrap_cell(defaults);
-                if unsafe { pyre_object::is_tuple(defaults) } {
-                    unsafe { pyre_object::w_tuple_len(defaults) }
-                } else {
-                    0
-                }
-            } else {
-                0
-            }
-        };
-        let takes_str = if ndefaults > 0 {
-            format!(
-                "from {} to {} positional arguments",
-                n_pos_params - ndefaults,
-                n_pos_params
-            )
-        } else {
-            format!(
-                "{} positional argument{}",
-                n_pos_params,
-                if n_pos_params != 1 { "s" } else { "" }
-            )
-        };
-        // argument.py:571 ArgErrTooMany.getmsg
-        let nkwonly_given = if nkw > 0 {
-            let nkwonly = code.kwonlyarg_count as usize;
-            (0..nkw)
-                .filter(|&ki| {
-                    let kw_name = unsafe { pyre_object::w_tuple_getitem(kwarg_names, ki as i64) };
-                    if let Some(kw_obj) = kw_name {
-                        if !unsafe { pyre_object::is_str(kw_obj) } {
-                            return false;
-                        }
-                        let kw_s = unsafe { pyre_object::w_str_get_value_opt(kw_obj) };
-                        (0..nkwonly)
-                            .any(|j| Some(&*code.varnames[skip_cls + n_pos_params + j]) == kw_s)
-                    } else {
-                        false
-                    }
-                })
-                .count()
-        } else {
-            0
-        };
-        let given_str = if nkwonly_given > 0 {
-            format!(
-                "{} positional argument{} (and {} keyword-only argument{}) were given",
-                n_pos,
-                if n_pos != 1 { "s" } else { "" },
-                nkwonly_given,
-                if nkwonly_given != 1 { "s" } else { "" },
-            )
-        } else {
-            format!(
-                "{} {} given",
-                n_pos,
-                if n_pos != 1 { "were" } else { "was" }
-            )
-        };
-        return Err(crate::PyError::type_error(format!(
-            "{}() takes {} but {}",
-            fname, takes_str, given_str
-        )));
-    }
+    // `argument.py:235-236` — flag too-many positional args with no *vararg
+    // (kwargs are matched separately). The error is raised after keyword
+    // matching (`argument.py:289`) so a duplicate/positional-only/unknown-
+    // keyword error on the same call wins first.
+    let too_many_args = n_pos > n_pos_params && !has_varargs;
 
     // Start with PY_NULL for all effective params
     let mut result = vec![pyre_object::PY_NULL; nparams];
@@ -1098,6 +1032,77 @@ pub(crate) fn resolve_kwargs(
     if !unmatched_kw_names.is_empty() {
         let msg = format_unknown_kwds_err(&fname, &unmatched_kw_names);
         return Err(crate::PyError::type_error(msg));
+    }
+
+    // `argument.py:289` — too-many-positionals raised here, after the
+    // keyword-matching errors above.
+    if too_many_args {
+        let ndefaults = {
+            let defaults = unsafe { crate::function_get_defaults(target_func) };
+            if !defaults.is_null() {
+                let defaults = crate::baseobjspace::unwrap_cell(defaults);
+                if unsafe { pyre_object::is_tuple(defaults) } {
+                    unsafe { pyre_object::w_tuple_len(defaults) }
+                } else {
+                    0
+                }
+            } else {
+                0
+            }
+        };
+        let takes_str = if ndefaults > 0 {
+            format!(
+                "from {} to {} positional arguments",
+                n_pos_params - ndefaults,
+                n_pos_params
+            )
+        } else {
+            format!(
+                "{} positional argument{}",
+                n_pos_params,
+                if n_pos_params != 1 { "s" } else { "" }
+            )
+        };
+        // argument.py:571 ArgErrTooMany.getmsg
+        let nkwonly_given = if nkw > 0 {
+            let nkwonly = code.kwonlyarg_count as usize;
+            (0..nkw)
+                .filter(|&ki| {
+                    let kw_name = unsafe { pyre_object::w_tuple_getitem(kwarg_names, ki as i64) };
+                    if let Some(kw_obj) = kw_name {
+                        if !unsafe { pyre_object::is_str(kw_obj) } {
+                            return false;
+                        }
+                        let kw_s = unsafe { pyre_object::w_str_get_value_opt(kw_obj) };
+                        (0..nkwonly)
+                            .any(|j| Some(&*code.varnames[skip_cls + n_pos_params + j]) == kw_s)
+                    } else {
+                        false
+                    }
+                })
+                .count()
+        } else {
+            0
+        };
+        let given_str = if nkwonly_given > 0 {
+            format!(
+                "{} positional argument{} (and {} keyword-only argument{}) were given",
+                n_pos,
+                if n_pos != 1 { "s" } else { "" },
+                nkwonly_given,
+                if nkwonly_given != 1 { "s" } else { "" },
+            )
+        } else {
+            format!(
+                "{} {} given",
+                n_pos,
+                if n_pos != 1 { "were" } else { "was" }
+            )
+        };
+        return Err(crate::PyError::type_error(format!(
+            "{}() takes {} but {}",
+            fname, takes_str, given_str
+        )));
     }
 
     // Fill positional defaults (PyPy: _match_signature defs_w)
@@ -1382,6 +1387,35 @@ pub fn call_with_kwargs(
             {
                 let fname = unsafe { crate::builtin_code_name(code as pyre_object::PyObjectRef) };
                 let bound = bind_kwargs_to_signature(sig, fname, pos_args, kwargs)?;
+                // Under an active C-level profiler the call must still emit
+                // `c_call_trace` / `c_return_trace`, so route the bound flat
+                // slice through the profile-aware path like the marker branch
+                // below rather than invoking the builtin directly.
+                let frame_ptr = frame as *mut PyFrame;
+                if unsafe { (*frame_ptr).get_is_being_profiled() } {
+                    let keyword_names_w: Vec<pyre_object::PyObjectRef> = kwargs
+                        .iter()
+                        .map(|(k, _)| pyre_object::w_str_from_wtf8(k.clone()))
+                        .collect();
+                    let keywords_w: Vec<pyre_object::PyObjectRef> =
+                        kwargs.iter().map(|(_, v)| *v).collect();
+                    let arguments = crate::argument::Arguments::with_kw(
+                        pos_args,
+                        &keyword_names_w,
+                        &keywords_w,
+                    );
+                    let w_res = crate::baseobjspace::call_args_and_c_profile_args(
+                        unsafe { &mut *frame_ptr },
+                        callable,
+                        &arguments,
+                        &bound,
+                    );
+                    if w_res == pyre_object::PY_NULL {
+                        return Err(take_call_error()
+                            .unwrap_or_else(|| crate::PyError::value_error("call failed")));
+                    }
+                    return Ok(w_res);
+                }
                 // `bound` is already the final flat slice (positional slots
                 // plus packed `*args` / `**kwargs` tail), so invoke the
                 // builtin directly — routing back through `call_callable`
@@ -1468,44 +1502,11 @@ pub fn call_with_kwargs(
             let has_varargs = code.flags.contains(crate::CodeFlags::VARARGS);
             let fname = unsafe { crate::function_get_qualname(callable) };
 
-            // `argument.py:235-236` — too-many positional args with no *vararg.
-            if pos_args.len() > n_pos_params && !has_varargs {
-                let ndefaults = {
-                    let defaults = unsafe { crate::function_get_defaults(callable) };
-                    if !defaults.is_null() {
-                        let defaults = crate::baseobjspace::unwrap_cell(defaults);
-                        if unsafe { pyre_object::is_tuple(defaults) } {
-                            unsafe { pyre_object::w_tuple_len(defaults) }
-                        } else {
-                            0
-                        }
-                    } else {
-                        0
-                    }
-                };
-                let takes_str = if ndefaults > 0 {
-                    format!(
-                        "from {} to {} positional arguments",
-                        n_pos_params - ndefaults,
-                        n_pos_params
-                    )
-                } else {
-                    format!(
-                        "{} positional argument{}",
-                        n_pos_params,
-                        if n_pos_params != 1 { "s" } else { "" }
-                    )
-                };
-                let given_str = format!(
-                    "{} {}",
-                    pos_args.len(),
-                    if pos_args.len() != 1 { "were" } else { "was" }
-                );
-                return Err(crate::PyError::type_error(format!(
-                    "{}() takes {} but {} given",
-                    fname, takes_str, given_str
-                )));
-            }
+            // `argument.py:235-236` — flag too-many positional args with no
+            // *vararg; the error is raised after keyword matching
+            // (`argument.py:289`) so a duplicate/positional-only/unknown-keyword
+            // error on the same call wins first.
+            let too_many_args = pos_args.len() > n_pos_params && !has_varargs;
 
             // Build parameter array
             let mut result = vec![pyre_object::PY_NULL; total_params];
@@ -1562,6 +1563,46 @@ pub fn call_with_kwargs(
             if !unmatched_kw_names.is_empty() {
                 let msg = format_unknown_kwds_err(&fname, &unmatched_kw_names);
                 return Err(crate::PyError::type_error(msg));
+            }
+
+            // `argument.py:289` — too-many-positionals raised here, after the
+            // keyword-matching errors above.
+            if too_many_args {
+                let ndefaults = {
+                    let defaults = unsafe { crate::function_get_defaults(callable) };
+                    if !defaults.is_null() {
+                        let defaults = crate::baseobjspace::unwrap_cell(defaults);
+                        if unsafe { pyre_object::is_tuple(defaults) } {
+                            unsafe { pyre_object::w_tuple_len(defaults) }
+                        } else {
+                            0
+                        }
+                    } else {
+                        0
+                    }
+                };
+                let takes_str = if ndefaults > 0 {
+                    format!(
+                        "from {} to {} positional arguments",
+                        n_pos_params - ndefaults,
+                        n_pos_params
+                    )
+                } else {
+                    format!(
+                        "{} positional argument{}",
+                        n_pos_params,
+                        if n_pos_params != 1 { "s" } else { "" }
+                    )
+                };
+                let given_str = format!(
+                    "{} {}",
+                    pos_args.len(),
+                    if pos_args.len() != 1 { "were" } else { "was" }
+                );
+                return Err(crate::PyError::type_error(format!(
+                    "{}() takes {} but {} given",
+                    fname, takes_str, given_str
+                )));
             }
 
             // Fill positional defaults from __defaults__ tuple.

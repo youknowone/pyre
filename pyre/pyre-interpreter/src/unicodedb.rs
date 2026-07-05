@@ -436,8 +436,10 @@ pub fn isdecimal(c: char) -> bool {
 }
 
 /// The decimal value (0-9) of a `Numeric_Type=Decimal` scalar, or `None`.
-/// Every `Nd` range spans exactly the ten digits `0..9` in order, so the
-/// value is the offset from the range start.
+/// Each `Nd` block is ten digits `0..9` in order; a table range may merge
+/// several consecutive blocks (e.g. the five mathematical digit blocks at
+/// `0x1D7CE..0x1D7FF`), so the value is the offset from the range start
+/// modulo ten.
 pub fn decimal_value(c: char) -> Option<u32> {
     let cp = c as u32;
     let idx = DECIMAL
@@ -451,7 +453,7 @@ pub fn decimal_value(c: char) -> Option<u32> {
             }
         })
         .ok()?;
-    Some(cp - DECIMAL[idx].0)
+    Some((cp - DECIMAL[idx].0) % 10)
 }
 
 /// `Numeric_Type` in Decimal or Digit.
