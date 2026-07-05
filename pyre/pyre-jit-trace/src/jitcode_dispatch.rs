@@ -7223,8 +7223,9 @@ pub(crate) fn fbw_builtin_fold_enabled() -> bool {
 /// `PYRE_FBW_LOADATTR_FOLD` — gate the full-body-walker LOAD_ATTR fast path
 /// ([`try_walker_specialize_load_attr`]).  When on, a monomorphic plain
 /// instance-attribute read folds to guards + inline storage read instead of the
-/// opaque `getattr_fn` residual.  Default OFF until byte-exact + GC-soak verified
-/// (Slice C flips it on); `0`/`false` opts out as the kill switch.
+/// opaque `getattr_fn` residual.  Default ON (`0`/`false` opts out as the kill
+/// switch); verified byte-exact on synth dynasm + cranelift and GC-soak clean
+/// under `PYPY_GC_NURSERY=131072` on instance-heavy benches.
 fn fbw_loadattr_fold_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_LOADATTR_FOLD") {
@@ -7232,7 +7233,7 @@ fn fbw_loadattr_fold_enabled() -> bool {
             let v = v.to_string_lossy();
             v != "0" && !v.eq_ignore_ascii_case("false")
         }
-        None => false,
+        None => true,
     })
 }
 
@@ -14174,9 +14175,9 @@ fn try_walker_specialize_load_attr(
     };
     // `mapdict.py:1495-1533` resolution, returning the fold ingredients (the
     // read is left to the caller so it can be folded to a guarded inline read).
-    let Some((_w_type, _version_tag, map, storageindex)) =
-        (unsafe { pyre_interpreter::objspace::std::mapdict::load_attr_fast_path(concrete_obj, &name) })
-    else {
+    let Some((_w_type, _version_tag, map, storageindex)) = (unsafe {
+        pyre_interpreter::objspace::std::mapdict::load_attr_fast_path(concrete_obj, &name)
+    }) else {
         return Ok(None);
     };
 
@@ -14198,7 +14199,8 @@ fn try_walker_specialize_load_attr(
     // pointer is a stable identity guarded as an opaque word (object_map_descr
     // is Int-typed).  Skipped when the field read already const-folds to the map
     // (heapcache hit).
-    let map_op = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, obj, crate::descr::object_map_descr());
+    let map_op =
+        crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, obj, crate::descr::object_map_descr());
     if ctx.trace_ctx.box_value(map_op) != Some(majit_ir::Value::Int(map as i64)) {
         let map_const = ctx.trace_ctx.const_int(map as i64);
         walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[map_op, map_const])?;
@@ -14208,8 +14210,11 @@ fn try_walker_specialize_load_attr(
     // the inline value read (`mapdict.py:914-916`).  `storageindex` is a green
     // constant (the map guard pinned it); `trace_items_block_getitem_value`
     // stamps the dst's concrete shadow from the live block slot.
-    let block =
-        crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, obj, crate::descr::object_storage_descr());
+    let block = crate::state::opimpl_getfield_gc_r(
+        ctx.trace_ctx,
+        obj,
+        crate::descr::object_storage_descr(),
+    );
     let idx_const = ctx.trace_ctx.const_int(storageindex as i64);
     let value = crate::state::trace_items_block_getitem_value(ctx.trace_ctx, block, idx_const);
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, value)?;

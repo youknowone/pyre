@@ -1,13 +1,15 @@
-# The walk loop's hot body is a single `head.next` LOAD_ATTR.  The mapdict
-# fast path folds the type/version_tag/map guards and drops the getattr MRO
-# walk, but the storage read is still a per-iteration residual call (instance
-# storage is a Rust `Vec`, not an inline-readable GcArray), so this bench walks
-# a heavier attribute path than the arithmetic synth benches.  ITERS is sized
-# so the compiled loop finishes well inside the synthetic timeout on every
-# backend (cranelift is the slowest); the point is to prove the `is not None`
-# branch compiles and takes the attr fast path, not to race pypy on the read.
+# The walk loop's hot body reads `head.val` (an int) and `head.next` (the next
+# node).  The full-body-walker LOAD_ATTR fold folds the object-typed `head.next`
+# read to `guard_class` + `guard_value(map)` + `getfield(storage)` +
+# `getarrayitem` (no residual — storage is a fixed-layout GcArray block); the
+# `head.val` read stays a residual because `val` is an unboxed-int slot, whose
+# read boxes a longlong rather than a plain fetch.  ITERS is sized so the
+# compiled loop finishes well inside the synthetic timeout on every backend
+# (cranelift/wasm are the slowest); the point is to prove the `is not None`
+# branch compiles and the object-attr read folds inline, not to race pypy on the
+# still-residual unboxed read.
 N = 3000
-ITERS = 2000
+ITERS = 4000
 
 
 class Node:

@@ -1537,8 +1537,7 @@ impl MapdictObject for pyre_object::W_ObjectObject {
             None => {
                 let storage_needed = unsafe { (*map).storage_needed() };
                 unsafe {
-                    let old_len =
-                        pyre_object::object_array::items_block_capacity(self.storage);
+                    let old_len = pyre_object::object_array::items_block_capacity(self.storage);
                     self.storage = pyre_object::object_array::grow_instance_items_block(
                         self.storage,
                         storage_needed,

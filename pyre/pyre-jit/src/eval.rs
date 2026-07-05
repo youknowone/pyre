@@ -429,8 +429,7 @@ unsafe fn object_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut maj
     // is keeping the block off the sweep list. Mirrors `list_object_custom_trace`
     // forwarding `int_items.block` / `float_items.block`. Guard on GC ownership:
     // a `std::alloc` fallback block (no GC hook) is not GC-managed.
-    if !inst.storage.is_null()
-        && pyre_object::gc_hook::try_gc_owns_object(inst.storage as *mut u8)
+    if !inst.storage.is_null() && pyre_object::gc_hook::try_gc_owns_object(inst.storage as *mut u8)
     {
         let storage_slot = std::ptr::addr_of_mut!(inst.storage);
         f(storage_slot as *mut majit_ir::GcRef);

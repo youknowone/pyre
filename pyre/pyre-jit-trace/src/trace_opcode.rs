@@ -8811,8 +8811,11 @@ impl MIFrame {
                 // slot is written by STORE_ATTR); a grow bumps the map and the
                 // `guard_value(map)` above deopts before any stale cached block
                 // is read.
-                let block =
-                    crate::state::opimpl_getfield_gc_r(ctx, obj.opref, crate::descr::object_storage_descr());
+                let block = crate::state::opimpl_getfield_gc_r(
+                    ctx,
+                    obj.opref,
+                    crate::descr::object_storage_descr(),
+                );
                 crate::state::trace_items_block_getitem_value(ctx, block, idx_const)
             } else {
                 // Kill switch: the pre-migration residual fetch (one call, but
