@@ -3531,6 +3531,10 @@ fn for_iter_body_op_is_jit_safe(instr: pyre_interpreter::Instruction) -> bool {
             | I::JumpForward { .. }
             | I::JumpBackward { .. }
             | I::JumpBackwardNoInterrupt { .. }
+            // nested FOR_ITER: the inner loop's iterator setup and iteration
+            | I::GetIter
+            | I::ForIter { .. }
+            | I::EndFor
             // oparg prefix + inline-cache padding (no-ops in the body scan)
             | I::ExtendedArg
             | I::Cache
