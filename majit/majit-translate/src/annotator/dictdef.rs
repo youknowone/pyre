@@ -266,17 +266,25 @@ pub struct DictDef {
 
 impl std::fmt::Debug for DictDef {
     /// Parity with `DictDef.__repr__` (dictdef.py:116):
-    /// `'<{%r: %r}>'`, recursion-guarded (shared [`ListDef`] guard) so a
+    /// `'<{%r: %r}>'`, recursion-guarded (shared [`ReprGuard`]) so a
     /// self-referential key/value type elides instead of overflowing.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let id = Rc::as_ptr(&self.inner) as usize;
-        let Some(_guard) = super::listdef::ReprGuard::enter(id) else {
+        let Some(_guard) = super::repr_guard::ReprGuard::enter(id) else {
             return f.write_str("<{...}>");
         };
-        let k = self.inner.dictkey.borrow();
-        let key = k.borrow();
-        let v = self.inner.dictvalue.borrow();
-        let val = v.borrow();
+        let Ok(k) = self.inner.dictkey.try_borrow() else {
+            return f.write_str("<{...}>");
+        };
+        let Ok(key) = k.try_borrow() else {
+            return f.write_str("<{...}>");
+        };
+        let Ok(v) = self.inner.dictvalue.try_borrow() else {
+            return f.write_str("<{...}>");
+        };
+        let Ok(val) = v.try_borrow() else {
+            return f.write_str("<{...}>");
+        };
         write!(f, "<{{{:?}: {:?}}}>", key.s_value, val.s_value)
     }
 }

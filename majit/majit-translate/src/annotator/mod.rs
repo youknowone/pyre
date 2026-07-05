@@ -40,6 +40,7 @@ pub mod exception;
 pub mod listdef;
 pub mod model;
 pub mod policy;
+pub(crate) mod repr_guard;
 pub mod signature;
 pub mod specialize;
 pub mod unaryop;
