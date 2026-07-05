@@ -5756,7 +5756,7 @@ fn vstr_plain_info_allocate(
 fn abstract_virtual_struct_info_setfields(
     decoder: &mut ResumeDataDirectReader,
     allocator: &dyn BlackholeAllocator,
-    struct_ptr: i64,
+    index: usize,
     fielddescrs: &[majit_ir::FieldDescrInfo],
     fields: &[(u32, VirtualFieldSource)],
 ) {
@@ -5772,17 +5772,27 @@ fn abstract_virtual_struct_info_setfields(
         // — pyre dispatches by descr_info.field_type because pyre's
         //   fielddescrs collection holds the spec form, not the live
         //   FieldDescr Arc that RPython passes to decoder.setfield.
+        //
+        // decode_field_source* may materialize a nested virtual, whose
+        // allocation can trigger a minor collection that relocates this
+        // struct.  RPython's `struct` local is GC-traced and forwarded in
+        // place; pyre's is a raw i64, so re-read the forwarded pointer from
+        // the rooted virtuals_ptr_cache[index] slot after each decode and
+        // before the write (see getvirtual_ptr at the `bad cache` comment).
         match descr_info.field_type {
             majit_ir::Type::Ref => {
                 let value = decoder.decode_field_source(source);
+                let struct_ptr = decoder.virtuals_cache.get_ptr(index);
                 allocator.bh_setfield_gc_r(struct_ptr, value, descr_info);
             }
             majit_ir::Type::Float => {
                 let value = decoder.decode_field_source_float(source);
+                let struct_ptr = decoder.virtuals_cache.get_ptr(index);
                 allocator.bh_setfield_gc_f(struct_ptr, value, descr_info);
             }
             _ => {
                 let value = decoder.decode_field_source_int(source);
+                let struct_ptr = decoder.virtuals_cache.get_ptr(index);
                 allocator.bh_setfield_gc_i(struct_ptr, value, descr_info);
             }
         }
@@ -5844,11 +5854,13 @@ impl VirtualInfoBlackholeExt for VirtualInfo {
                 abstract_virtual_struct_info_setfields(
                     decoder,
                     allocator,
-                    obj,
+                    index,
                     fielddescrs,
                     fields,
                 );
-                obj
+                // re-read the forwarded pointer (setfields may have triggered
+                // a relocating minor collection); return the live cache slot.
+                decoder.virtuals_cache.get_ptr(index)
             }
             VirtualInfo::VStruct {
                 typedescr,
@@ -5866,11 +5878,13 @@ impl VirtualInfoBlackholeExt for VirtualInfo {
                 abstract_virtual_struct_info_setfields(
                     decoder,
                     allocator,
-                    obj,
+                    index,
                     fielddescrs,
                     fields,
                 );
-                obj
+                // re-read the forwarded pointer (setfields may have triggered
+                // a relocating minor collection); return the live cache slot.
+                decoder.virtuals_cache.get_ptr(index)
             }
             VirtualInfo::VArray {
                 arraydescr,
@@ -5896,22 +5910,29 @@ impl VirtualInfoBlackholeExt for VirtualInfo {
                     .map_or(false, |ad| ad.is_array_of_floats());
                 if let Some(ad) = arraydescr.as_ref() {
                     for (i, source) in items.iter().enumerate() {
+                        // decode_field_source may materialize a nested virtual
+                        // and relocate this array; re-read the forwarded
+                        // pointer from the rooted cache slot before the write
+                        // (same hazard as abstract_virtual_struct_info_setfields).
                         if is_pointers {
                             // resume.py:659: decoder.bh_setarrayitem_gc_r(array, i, num, arraydescr)
                             let value = decoder.decode_field_source(source);
+                            let array = decoder.virtuals_cache.get_ptr(index);
                             allocator.bh_setarrayitem_gc_r(array, i, value, ad);
                         } else if is_floats {
                             // resume.py:664: decoder.bh_setarrayitem_gc_f(array, i, num, arraydescr)
                             let value = decoder.decode_field_source_float(source);
+                            let array = decoder.virtuals_cache.get_ptr(index);
                             allocator.bh_setarrayitem_gc_f(array, i, value, ad);
                         } else {
                             // resume.py:669: decoder.bh_setarrayitem_gc_i(array, i, num, arraydescr)
                             let value = decoder.decode_field_source_int(source);
+                            let array = decoder.virtuals_cache.get_ptr(index);
                             allocator.bh_setarrayitem_gc_i(array, i, value, ad);
                         }
                     }
                 }
-                array
+                decoder.virtuals_cache.get_ptr(index)
             }
             // resume.py:748-760: VArrayStructInfo.allocate
             VirtualInfo::VArrayStruct {
@@ -5947,10 +5968,10 @@ impl VirtualInfoBlackholeExt for VirtualInfo {
                             continue;
                         }
                         // resume.py:757: decoder.setinteriorfield(i, array, num, self.fielddescrs[j])
-                        decoder.setinteriorfield(i, array, source, &fielddescrs[j], allocator);
+                        decoder.setinteriorfield(i, index, source, &fielddescrs[j], allocator);
                     }
                 }
-                array
+                decoder.virtuals_cache.get_ptr(index)
             }
             // resume.py:766-775 VStrPlainInfo.allocate
             VirtualInfo::VStrPlain { chars } => {
@@ -7045,7 +7066,7 @@ impl<'a> ResumeDataDirectReader<'a> {
     pub fn setinteriorfield(
         &mut self,
         index: usize,
-        array: i64,
+        virtual_index: usize,
         source: &VirtualFieldSource,
         descr: &majit_ir::DescrRef,
         allocator: &dyn BlackholeAllocator,
@@ -7056,14 +7077,20 @@ impl<'a> ResumeDataDirectReader<'a> {
         let is_float = descr
             .as_interior_field_descr()
             .map_or(false, |ifd| ifd.field_descr().is_float_field());
+        // decode_field_source* may materialize a nested virtual and relocate
+        // the array; re-read the forwarded pointer from the rooted cache slot
+        // before the write (same hazard as abstract_virtual_struct_info_setfields).
         if is_pointer {
             let value = self.decode_field_source(source);
+            let array = self.virtuals_cache.get_ptr(virtual_index);
             allocator.bh_setinteriorfield_gc_r(array, index, value, descr);
         } else if is_float {
             let value = self.decode_field_source_float(source);
+            let array = self.virtuals_cache.get_ptr(virtual_index);
             allocator.bh_setinteriorfield_gc_f(array, index, value, descr);
         } else {
             let value = self.decode_field_source_int(source);
+            let array = self.virtuals_cache.get_ptr(virtual_index);
             allocator.bh_setinteriorfield_gc_i(array, index, value, descr);
         }
     }
@@ -7275,7 +7302,20 @@ pub fn blackhole_from_resumedata<'a>(
     drop(_cc_guard);
 
     // resume.py:1404: virtualizable pointer read by consume_vable_info.
-    let virtualizable_ptr = resumereader.virtualizable_ptr;
+    // The virtualizable is the frame being resumed; RPython keeps it live in
+    // the GC-traced resume reader across the frame-chain build.  pyre has no
+    // GC transform, so root the reader's `virtualizable_ptr` slot for the
+    // chain-build window below: a multi-frame resume runs `consume_one_section`
+    // per caller, which materializes virtuals (allocator) and can trigger a
+    // minor collection.  That relocates the young virtualizable frame; an
+    // unrooted bare copy would then point at from-space (a freed frame whose
+    // `locals_cells_stack_w` reads null).  Registering the slot makes the root
+    // walker forward it in place, mirroring `ResumeDeadframeRoots`.
+    unsafe {
+        majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_mut(
+            &mut resumereader.virtualizable_ptr,
+        ));
+    }
 
     // resume.py:1332-1343
     // Build chain bottom-up: first frame acquired is the outermost.
@@ -7320,6 +7360,11 @@ pub fn blackhole_from_resumedata<'a>(
 
         curbh = Some(Box::new(nextbh));
     }
+
+    // Read the (possibly forwarded) virtualizable pointer back from the rooted
+    // reader slot: a minor collection during the loop above rewrites it in
+    // place to the to-space address.
+    let virtualizable_ptr = resumereader.virtualizable_ptr;
 
     curbh.map(|b| (*b, virtualizable_ptr))
 }
