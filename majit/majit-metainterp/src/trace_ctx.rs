@@ -3151,6 +3151,13 @@ impl TraceCtx {
         // until that store is itself moved to `Vec<Option<Value>>`.
         let stored = concrete.unwrap_or(Value::Ref(majit_ir::GcRef(usize::MAX)));
         self.set_virtualizable_entry_at(index, value, stored);
+        // Keep the heapcache consistent: if a prior nonstandard getfield
+        // cached a value for this field (e.g., before a replace_box made
+        // the OpRef match the standard_box), updating the virtualizable
+        // shadow without clearing the heapcache leaves a stale entry
+        // that the next nonstandard getfield would hit.
+        let field_index = fielddescr.index();
+        self.heapcache_setfield_cached(vable_opref, field_index, value);
         // pyjitpl.py:3446 write_boxes parity: mirror the updated
         // shadow slot back into the live virtualizable.
         self.synchronize_virtualizable();
