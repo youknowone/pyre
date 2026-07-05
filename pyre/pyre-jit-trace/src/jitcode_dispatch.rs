@@ -7243,7 +7243,9 @@ pub(crate) fn fbw_loop_callee_ca_enabled() -> bool {
 /// liveness) resolve the same offset, keeping the box layout symmetric.
 /// Carrying the raw `op_pc` (which may sit mid-opcode, `op_pc != pc_map[
 /// py_pc]`) is what broke the earlier attempt; anchoring to the marker
-/// avoids that.  Default OFF until the corpus-wide equality is validated.
+/// avoids that.  Default ON — corpus-wide OFF/ON byte-equality validated on
+/// both backends (171/171 dynasm + cranelift); opt out with
+/// `PYRE_M366_NONBRANCH_PC=0`.
 pub(crate) fn m366_nonbranch_pc_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M366_NONBRANCH_PC") {
@@ -7251,7 +7253,7 @@ pub(crate) fn m366_nonbranch_pc_enabled() -> bool {
             let v = v.to_string_lossy();
             v != "0" && !v.eq_ignore_ascii_case("false")
         }
-        None => false,
+        None => true,
     })
 }
 
