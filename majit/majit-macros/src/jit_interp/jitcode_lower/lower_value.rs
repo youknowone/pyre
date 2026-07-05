@@ -676,11 +676,18 @@ impl<'c> Lowerer<'c> {
                             __builder.residual_call_ref_canonical_via_target(__fn_idx, __typed_args, #reg);
                         },
                     );
+                    // Check `call_returns` config for a declared return
+                    // struct type, enabling subsequent `result.field`
+                    // access to resolve through `ref_fields`.
+                    let func_segments = canonical_expr_segments(func);
+                    let struct_type = func_segments.and_then(|segs| {
+                        self.config.and_then(|c| c.call_returns.get(&segs).cloned())
+                    });
                     return Some(Binding {
                         reg,
                         kind: BindingKind::Ref,
                         depends_on_stack: false,
-                        struct_type: None,
+                        struct_type,
                     });
                 }
                 crate::jit_interp::CallPolicyKind::ResidualIntWrapped

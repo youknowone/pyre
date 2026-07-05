@@ -135,6 +135,12 @@ pub struct JitInterpConfig {
     /// The `PointeeType` is recorded so subsequent field access on the
     /// returned ref can resolve its struct layout.
     pub ref_fields: Vec<RefFieldEntry>,
+    /// Struct type annotations for ref-returning call results.
+    /// `call_returns = { func_path => StructType, ... }`.  When a
+    /// `residual_ref` (or similar ref-returning) call result is bound,
+    /// the lowerer sets `Binding.struct_type` to the declared type so
+    /// subsequent `result.field` access resolves through `ref_fields`.
+    pub call_returns: Vec<(Path, Path)>,
     /// Opt-in: route pure forward-advancing dispatch arms (those whose body
     /// only does work then `pc += N`, with no back-edge / `can_enter_jit!` /
     /// early return) through the per-arm sub-JitCode path with a pc-returning
@@ -507,6 +513,7 @@ impl Parse for JitInterpConfig {
         let mut residual_writes: Vec<ResidualWriteEntry> = Vec::new();
         let mut pool_arrays: Vec<PoolArrayEntry> = Vec::new();
         let mut ref_fields: Vec<RefFieldEntry> = Vec::new();
+        let mut call_returns: Vec<(Path, Path)> = Vec::new();
         let mut split_dispatch = false;
         let mut switch_dispatch = false;
 
@@ -564,6 +571,9 @@ impl Parse for JitInterpConfig {
                 "ref_fields" => {
                     ref_fields = parse_ref_fields_map(input)?;
                 }
+                "call_returns" => {
+                    call_returns = parse_call_returns_map(input)?;
+                }
                 "split_dispatch" => {
                     split_dispatch = input.parse::<LitBool>()?.value;
                 }
@@ -616,6 +626,7 @@ impl Parse for JitInterpConfig {
             residual_writes,
             pool_arrays,
             ref_fields,
+            call_returns,
             split_dispatch,
             switch_dispatch,
         })
@@ -670,6 +681,21 @@ fn parse_pool_arrays_map(input: ParseStream) -> syn::Result<Vec<PoolArrayEntry>>
 /// whose pointee is `PointeeType`.  The path `Struct::field` is parsed as
 /// a single `Path` and then split: the last segment is the field name, the
 /// remaining prefix is the struct type.
+/// Parse `call_returns = { func_path => StructType, ... }`.
+fn parse_call_returns_map(input: ParseStream) -> syn::Result<Vec<(Path, Path)>> {
+    let content;
+    braced!(content in input);
+    let mut entries = Vec::new();
+    while !content.is_empty() {
+        let func_path: Path = content.parse()?;
+        content.parse::<Token![=>]>()?;
+        let return_type: Path = content.parse()?;
+        entries.push((func_path, return_type));
+        let _ = content.parse::<Token![,]>();
+    }
+    Ok(entries)
+}
+
 fn parse_ref_fields_map(input: ParseStream) -> syn::Result<Vec<RefFieldEntry>> {
     let content;
     braced!(content in input);
@@ -1276,6 +1302,10 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
         // Local variable name -> struct type it points to (for ref bindings
         // returned from getfield_gc_r on state ref scalars or other locals).
         local_ref_types: std::collections::HashMap<String, syn::Path>,
+        // `call_returns` entries: canonical func path segments → return struct type.
+        // When `let x = func(...)` and func is in this map, `x` is recorded
+        // as a local ref binding pointing to the declared struct type.
+        call_returns: std::collections::HashMap<Vec<String>, syn::Path>,
     }
     impl RefFieldRewriter {
         // For `e == state.<ref_scalar>`, return the `ref(T)` struct path.
@@ -1311,6 +1341,13 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
         fn record_local_ref(&mut self, name: &str, struct_type: syn::Path) {
             self.local_ref_types
                 .insert(name.to_string(), struct_type);
+        }
+
+        // Check if a call expression's function is in `call_returns`.
+        fn call_return_type(&self, func: &Expr) -> Option<syn::Path> {
+            let Expr::Path(p) = func else { return None };
+            let segs: Vec<String> = p.path.segments.iter().map(|s| s.ident.to_string()).collect();
+            self.call_returns.get(&segs).cloned()
         }
     }
     impl VisitMut for RefFieldRewriter {
@@ -1513,6 +1550,18 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
                             }
                         }
                     }
+                    // `let x = func(...)` where func is in `call_returns` →
+                    // record x as a local ref binding with the declared type.
+                    if let Expr::Call(call) = &*init.expr {
+                        if let Some(struct_type) = self.call_return_type(&call.func) {
+                            if let syn::Pat::Ident(pat_ident) = &local.pat {
+                                self.record_local_ref(
+                                    &pat_ident.ident.to_string(),
+                                    struct_type,
+                                );
+                            }
+                        }
+                    }
                 }
             }
             // Now run the default visitor which will rewrite the init expr.
@@ -1546,10 +1595,19 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
                     (key, entry.pointee_type.clone())
                 })
                 .collect();
+            let call_returns_map: std::collections::HashMap<Vec<String>, syn::Path> = config
+                .call_returns
+                .iter()
+                .map(|(func, ret_type)| {
+                    let segs: Vec<String> = func.segments.iter().map(|s| s.ident.to_string()).collect();
+                    (segs, ret_type.clone())
+                })
+                .collect();
             RefFieldRewriter {
                 ref_fields,
                 field_pointees,
                 local_ref_types: std::collections::HashMap::new(),
+                call_returns: call_returns_map,
             }
             .visit_block_mut(&mut block);
         }

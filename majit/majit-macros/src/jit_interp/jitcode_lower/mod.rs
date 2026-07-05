@@ -191,6 +191,11 @@ pub struct LowererConfig {
     /// encounters a field access and the `(struct, field)` pair matches, it
     /// emits `getfield_gc_r` / `setfield_gc_r` (ref-kind) instead of `_gc_i`.
     pub(super) ref_fields: HashMap<String, (syn::Path, Ident, syn::Path)>,
+    /// Return struct type for ref-returning calls.  Key = canonical func
+    /// path segments, value = struct type path.  When a `residual_ref` call
+    /// result is bound, the lowerer sets `Binding.struct_type` from this map
+    /// so subsequent `result.field` accesses resolve through `ref_fields`.
+    pub(super) call_returns: HashMap<Vec<String>, syn::Path>,
     /// Source: `JitInterpConfig.split_dispatch`.  When set, the dispatch lowerer
     /// routes pure forward-advancing green-pc arms through the per-arm
     /// sub-JitCode path with a pc-returning `inline_call_<types>_i` instead of
@@ -806,6 +811,7 @@ impl LowererConfig {
         residual_writes: &[crate::jit_interp::ResidualWriteEntry],
         pool_arrays: &[crate::jit_interp::PoolArrayEntry],
         ref_fields: &[crate::jit_interp::RefFieldEntry],
+        call_returns: &[(Path, Path)],
         split_dispatch: bool,
         switch_dispatch: bool,
     ) -> Self {
@@ -987,6 +993,10 @@ impl LowererConfig {
             env_type_name: env_type.to_string(),
             residual_writes,
             ref_fields: ref_fields_map,
+            call_returns: call_returns
+                .iter()
+                .map(|(func, ret_type)| (canonical_path_segments(func), ret_type.clone()))
+                .collect(),
             pool_arrays: pool_arrays
                 .iter()
                 .map(|entry| {
