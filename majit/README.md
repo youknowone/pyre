@@ -2,7 +2,7 @@
 
 **M**eta-tr**A**cing **JIT** compiler framework — or, if you prefer, **Ma**gical **JIT**.
 
-majit is a Rust port of [RPython's JIT infrastructure](https://rpython.readthedocs.io/en/latest/jit/index.html). Given an interpreter written in Rust, majit automatically generates a tracing JIT compiler for it.
+majit is a Rust port of [RPython's JIT infrastructure](https://rpython.readthedocs.io/en/latest/jit/index.html). Given an interpreter written in Rust, majit generates a tracing JIT compiler for it.
 
 ## What it does
 
@@ -27,18 +27,19 @@ fn mainloop(program: &Program, state: &mut State, driver: &mut JitDriver<State>)
 }
 ```
 
-Hot loops are detected, traced, optimized, and compiled to native code via Cranelift. Guard failures fall back to the interpreter transparently.
+Hot loops are detected, traced, optimized, and compiled to native code. Guard failures fall back to the interpreter transparently.
 
 ## Similarities with RPython
 
-majit and the RPython JIT share the same core ideas:
+majit and the RPython JIT share the same core ideas — and, per the project's parity rule, the same module names and data structures:
 
 - **Meta-tracing**: traces the interpreter itself, optimizing at the interpreter execution level rather than the bytecode level
 - **Guard-based speculation**: records type/value assumptions as guards; deoptimizes to the interpreter on failure
 - **Trace → Optimize → Compile → Execute pipeline**
-- **8-pass optimizer**: IntBounds, Rewrite, Virtualize, String, Pure, Guard, Simplify, Heap
+- **optimizeopt pass pipeline**: IntBounds, Rewrite, Virtualize, String, Pure, Guard, Simplify, Heap (plus generated rewrite rules in `ruleopt`)
 - **Escape analysis**: eliminates virtual object allocations (NEW → field tracking → force on escape)
 - **Resume/blackhole deoptimization**: restores interpreter state on guard failure
+- **Hint vocabulary**: `promote`, greens/reds, `elidable`, `dont_look_inside`, virtualizables, quasi-immutable fields — same names, same need-oriented placement
 
 ## Differences from RPython
 
@@ -46,7 +47,7 @@ majit and the RPython JIT share the same core ideas:
 
 RPython translates a **restricted Python subset** to C at compile time. The annotator infers types, and the rtyper lowers them to low-level representations. JIT hints (`jit_merge_point`, `promote`, `elidable`, etc.) are inserted directly into Python source.
 
-majit works with **plain Rust**. No type inference is needed (the Rust compiler already handles that), and JIT hints are provided as proc-macro attributes:
+majit works with **plain Rust**. Type recovery is not needed (the Rust compiler already did it), and JIT hints are proc-macro attributes:
 
 | RPython | majit |
 |---------|-------|
@@ -56,29 +57,47 @@ majit works with **plain Rust**. No type inference is needed (the Rust compiler 
 | `driver.jit_merge_point(...)` | `jit_merge_point!(driver, ...)` |
 | `driver.can_enter_jit(...)` | `can_enter_jit!(driver, ...)` |
 
-### Translation vs analysis
+### Translation: live image vs extracted artifacts
 
-RPython's codewriter **fully translates** RPython source into JitCode (bytecode). All types and control flow are finalized at translation time.
+RPython analyses a **live program image** (full Python runs as a preprocessor, then flowspace/annotator/rtyper analyse the loaded functions) and its codewriter translates the interpreter into JitCode bytecode that the meta-interpreter executes.
 
-majit **auto-generates and injects trace code at build time**. There are two paths:
+majit runs the **same pipeline at `cargo build` time over extracted artifacts**. There are two front-ends:
 
-1. **`majit-analyze` path (used by pyre-jit)**: `build.rs` calls `majit_analyze::analyze_multiple_pipeline_with_config()` to parse interpreter sources and run the canonical graph pipeline, then `generate_trace_code_from_pipeline()` to produce trace helper functions, writing them to `OUT_DIR/jit_trace_gen.rs`. The main crate pulls them in via `include!`. This path extracts opcode dispatch arms, resolves cross-file trait impls, classifies helpers, collects type layouts, and treats the graph pipeline as the single translator source-of-truth.
+1. **Charon LLBC path (used by pyre)**: the interpreter crates are extracted
+   to `.ullbc` low-level IR with [Charon](https://github.com/AeneasVerif/charon)
+   (`scripts/install-charon.py`, `scripts/extract-llbc.py`), and
+   **majit-translate** consumes them through the RPython pipeline shape —
+   `front` → `flowspace/` → `annotator/` → `rtyper/` → `codewriter/` — to
+   produce JitCode. `majit-charon-reader` is the input layer. Like RPython's
+   frozen image, extraction can go stale: source changes are invisible until
+   re-extraction (fingerprint skipping handles the common case).
 
-2. **`#[jit_interp]` proc-macro path (used by aheui-mjit)**: `build.rs` reads the interpreter source, extracts opcode match arms, and auto-generates a JIT mainloop annotated with `#[jit_interp]`, writing it to `OUT_DIR/jit_mainloop_gen.rs`. The proc macro lowers `while`/`loop` to branch bytecodes, `match` to guard chains, and `for` loops to abort fallback (equivalent to RPython's `@dont_look_inside`).
+2. **`#[jit_interp]` proc-macro path (used by aheui-mjit and `examples/`)**:
+   `build.rs` reads the interpreter source, extracts opcode match arms, and
+   generates a JIT mainloop annotated with `#[jit_interp]`. The proc macro
+   lowers `while`/`loop` to branch bytecodes, `match` to guard chains, and
+   unsupported shapes to residual-call fallback (the `@dont_look_inside`
+   equivalent).
 
-Both paths achieve **automatic generation and injection**. The remaining difference from RPython is **generality** — how many interpreter shapes and complex CFG patterns can be directly lowered, rather than falling back to opaque residual calls.
+The remaining gap to RPython is **generality**: how many interpreter shapes
+lower directly instead of falling back to opaque residual calls. Fallbacks
+are tracked by a census, not accepted silently.
 
 ### Backend
 
-RPython maintains **6 hand-written assembler backends** for x86, ARM, AArch64, s390x, and PPC (~300K LOC).
+RPython maintains **hand-written assembler backends** for x86, ARM, AArch64, s390x, and PPC (~300K LOC).
 
-majit uses a single [Cranelift](https://cranelift.dev/) backend for all platforms. Cranelift handles ISA-specific code generation, register allocation, and instruction selection, greatly reducing backend code.
+majit delegates instruction selection and register allocation downward and keeps three thin backends behind one `Backend` trait (`majit-backend`, the `AbstractCPU` analog):
+
+- **majit-backend-cranelift** — the portable default ([Cranelift](https://cranelift.dev/))
+- **majit-backend-dynasm** — direct machine-code emission via dynasm-rs where measured to matter
+- **majit-backend-wasm** — emits WebAssembly trace modules (browser via wasm-bindgen, or native embedders like wasmi/wasmtime)
 
 ### GC
 
 RPython's incminimark GC is deeply integrated with the JIT and uses an lltype-based low-level memory model.
 
-majit's GC (`majit-gc`) implements the same algorithms (nursery + oldgen + incremental marking + card marking) but operates on top of Rust's ownership model. JIT-GC integration hooks (`jit_remember_young_pointer`, `gc_step`, `pin`/`unpin`) are also provided.
+majit's GC (`majit-gc`) ports the same lineage (nursery + oldgen + incremental marking + card marking) on top of Rust's ownership model, with the JIT-GC integration hooks (`jit_remember_young_pointer`, `gc_step`, `pin`/`unpin`) and shadow-stack root finding.
 
 ### SIMD
 
@@ -89,26 +108,36 @@ majit uses Cranelift's `I64X2`/`F64X2` SIMD types for platform-independent vecto
 ## Crate structure
 
 ```
-majit/                          # facade crate (re-exports all below)
-├── majit-ir/                   # IR: OpCode, Type, Value, Descr traits
-├── majit-opt/                  # Optimizer: 8-pass pipeline + auxiliaries
-├── majit-trace/                # Tracing: hot counter, recorder, warm state
-├── majit-codegen/              # Backend abstraction: Backend trait
-├── majit-codegen-cranelift/    # Cranelift backend: native code generation
-├── majit-meta/                 # Meta-interpreter: JitDriver, MetaInterp, resume
-├── majit-gc/                   # GC: nursery, oldgen, incremental, card marking
-├── majit-macros/               # Proc macros: #[jit_driver], #[jit_interp], etc.
-├── majit-runtime/              # Runtime: jit_merge_point!, can_enter_jit!
-├── majit-analyze/              # Static analyzer: source → trace code generation
-└── examples/                   # 8 toy interpreters (tlr, tl, tla, tiny2, ...)
+majit/                        # facade crate (re-exports the crates below)
+├── majit-ir/                 # IR: resoperation model, Descr, effectinfo, intbounds, resume data
+├── majit-trace/              # Tracing engine: hot counters, recorder, warm state
+├── majit-metainterp/         # Meta-interpreter: pyjitpl, optimizeopt/ruleopt, resume,
+│                             #   blackhole, warmspot/warmstate, virtualizable, heapcache
+├── majit-translate/          # Build-time translation pipeline:
+│                             #   front → flowspace → annotator → rtyper → codewriter
+├── majit-charon-reader/      # Parser for Charon .llbc/.ullbc JSON (majit-translate input)
+├── majit-backend/            # Backend trait (AbstractCPU parity)
+├── majit-backend-cranelift/  # Cranelift code generation
+├── majit-backend-dynasm/     # dynasm-rs direct machine-code backend
+├── majit-backend-wasm/       # WebAssembly backend (wasm-encoder)
+├── majit-gc/                 # GC: nursery + oldgen + incremental + card marking
+├── majit-macros/             # Proc macros: #[jit_driver], #[elidable], #[dont_look_inside], …
+├── charon-corpus/            # Checked-in LLBC corpus for translate tests
+└── examples/                 # 11 toy interpreters (tl, tla, tlc, tlr, tiny2, tiny3,
+                              #   tinyframe, braininterp, calc, dualtape, i64env)
 ```
 
-## Performance
+Consumers today: **pyre** (`pyre-jit`, `pyre-jit-trace` — the Charon path),
+**aheui-mjit** and the in-tree `examples/` (the proc-macro path). majit never
+depends on pyre; the multi-consumer setup is deliberate — it is the proof of
+generality, the role RPython's non-Python interpreters played.
 
-| Interpreter | Program | Interpreter | JIT | Speedup |
-|------------|---------|-------------|-----|---------|
-| aheuijit | logo.aheui | 6.1s | 0.05s | **110x** |
-| pyre | fib(20) | — | correct result | JIT works |
+## Verification
+
+- `cargo test` per crate (run with a backend feature, e.g. `--features dynasm`).
+- The dual-backend synthetic suite `python3 ./pyre/check.py` runs every pyre
+  fixture under both native backends and byte-compares output; it is the
+  acceptance gate for JIT changes, alongside the benchmark suite.
 
 ## License
 
