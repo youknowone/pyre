@@ -1,5 +1,12 @@
+# The walk loop's hot body is a single `head.next` LOAD_ATTR, which still
+# emits a per-iteration `bh_load_attr_fn` residual (no inline-cache / map
+# specialization yet), so this bench walks a slower attribute path than the
+# arithmetic synth benches.  ITERS is sized so the compiled loop finishes well
+# inside the synthetic timeout on every backend (cranelift is the slowest);
+# the point is to prove the `is not None` branch compiles at all, not to race
+# pypy on attribute loads.
 N = 3000
-ITERS = 20000
+ITERS = 2000
 
 
 class Node:
