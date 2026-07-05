@@ -3564,15 +3564,7 @@ impl CallControl {
                 // guard, `std::ptr::copy(s,d,n)` would leaf-match
                 // unrelated 2-arg `copy` impl methods and corrupt
                 // `getcalldescr`'s arity check.
-                //
-                // `PYRE_STRICT_TARGET_TO_PATH=1` (audit-only) disables
-                // the leaf-match outright so a CI sweep can quantify
-                // how often the cross-module fallback fires.  Production
-                // runs leave the env var unset.
                 if segments.len() > 2 {
-                    return Some(path);
-                }
-                if std::env::var_os("PYRE_STRICT_TARGET_TO_PATH").is_some() {
                     return Some(path);
                 }
                 if let Some(leaf) = segments.last() {
@@ -3727,15 +3719,8 @@ impl CallControl {
                     // falls through to the trait resolution path, which mirrors
                     // Rust's name-resolution ambiguity error rather than
                     // silently picking one.
-                    //
-                    // `PYRE_STRICT_TARGET_TO_PATH=1` disables the
-                    // receiver-leaf fallback alongside the FunctionPath
-                    // branch above so audit sweeps observe both fallback
-                    // surfaces consistently.
-                    if std::env::var_os("PYRE_STRICT_TARGET_TO_PATH").is_none() {
-                        if let Some(path) = self.suffix_match_impl_method(receiver, name.as_str()) {
-                            return Some(path);
-                        }
+                    if let Some(path) = self.suffix_match_impl_method(receiver, name.as_str()) {
+                        return Some(path);
                     }
                 }
                 // Fall back to trait method resolution for polymorphic calls.

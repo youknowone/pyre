@@ -1424,12 +1424,6 @@ impl<S: JitState> JitDriver<S> {
         env: &S::Env,
     ) -> Option<usize> {
         let dbg = std::env::var_os("MAJIT_CLOSEDBG").is_some();
-        if std::env::var_os("PYRE_NO_DE").is_some() {
-            // W2 diagnostic: skip direct-entry into the compiled inner loop;
-            // fall back to plain interpretation from the close pc.
-            self.meta.single_pass_compiled_key.take();
-            return None;
-        }
         let key = match self.meta.single_pass_compiled_key.take() {
             Some(k) => k,
             None => {

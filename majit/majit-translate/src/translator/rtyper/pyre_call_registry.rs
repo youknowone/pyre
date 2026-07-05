@@ -591,16 +591,9 @@ impl PyreCallRegistry {
     ///   distinct from a same-leaf free function.
     /// - Multi-match aliases of the same source (identical
     ///   `host_object` Arc identity) converge on a single resolution.
-    ///
-    /// `PYRE_STRICT_TARGET_TO_PATH=1` (audit-only) disables the
-    /// cross-module safety net, keeping the strict-mode envelope
-    /// consistent across registry-build and codewriter call resolution.
     pub fn lookup_with_leaf_match(&self, key: &FunctionPathKey) -> Option<Rc<PyreFunctionEntry>> {
         if let Some(entry) = self.lookup(key) {
             return Some(entry);
-        }
-        if std::env::var_os("PYRE_STRICT_TARGET_TO_PATH").is_some() {
-            return None;
         }
         let segments = key.segments();
         if segments.is_empty() || segments.len() > 2 {

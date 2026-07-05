@@ -25,7 +25,9 @@ this pass; the rest are load-bearing kill switches for open reworks.
 
 Hardwired ON. Behaviour is byte-identical (each was default-ON already; only
 the opt-out capability is gone). The **wasm trio** removed the env read +
-guest export + `set_*` + `AtomicBool` static, reader fns collapsed to `true`;
+guest export + `set_*` + `AtomicBool` static; the constant-`true` reader fns
+were then deleted outright and their call sites folded (including the dead
+`is_loop` parameter of `build_wasm_module` this exposed);
 verified compile-clean on native `majit-backend-wasm`, native
 `pyre-jit`+`pyre-wasm-runner` (`--features dynasm`), and the wasm32
 `pyre-wasm --features wasm-host` guest. The **#171 pair** inlined the
@@ -42,6 +44,46 @@ the branch ships.
 | PYRE_WASM_INLINE_ALLOC | inline nursery-bump alloc fast path | same | `gc_stress` still forces the helper-call path, so the stress override survives |
 | PYRE_171_ORTHODOX | orthodox `w_list_append` charon-body descent (int-storage) | #171 PR#318/#322 MERGED | epic merged; user-approved retirement 2026-07-05 (overriding the standing user-curated note for this cleanup) |
 | PYRE_171_OBJ_APPEND | orthodox descent for object-strategy lists | same | same; the `&& enabled()` conjuncts were inlined, helpers deleted |
+
+## §1b — Default-OFF experiments retired 2026-07-05 (4)
+
+Second pass over §5's "default-OFF experiments": each gate was judged against
+the vendored RPython/PyPy source — is the ON-path a WIP parity port (keep) or
+a pyre-invented mechanism that contradicts the PyPy design and can never
+become default (delete the ON-path)? Four were removed (−299/+5 across 6
+files); default behaviour is byte-identical since every deleted path was
+opt-in dead code.
+
+| var | ON-path | why permanently unlandable |
+|---|---|---|
+| PYRE_KEPT_OVERRIDE | `StackSource` bytecode-provenance lattice sourcing a kept stack slot from a local at bridge resume (~230 L, liveness.rs + state.rs consumer) | no PyPy analog — resume rebuilds the operand stack from resume-data boxes, never re-analyzes bytecode; the guard-half was already deleted as vstack-mirror-superseded in PR#292 (`910ffd4e64`), this was the orphaned bridge-half |
+| PYRE_RELAX_124 | force-bypass of the two kept-stack branch-guard declines | known-unsound diagnostic: regressed 23/25→17/25 on the #124 corpus in an earlier retirement; the sanctioned route is the vstack mirror (#73/#423), under which the declines die naturally |
+| PYRE_NO_DE | suppress single-pass direct entry, fall back to re-interpretation | W2-era diagnostic (W2 refuted); direct entry is the `ContinueRunningNormally` portal shape itself |
+| PYRE_STRICT_TARGET_TO_PATH | audit probe disabling the cross-module leaf-match fallbacks in call-target→CallPath resolution (3 sites) | one-time #91 quantification sweep; development since has refined the fallback (suffix-carrier, alias-cluster dedup), i.e. the fallback is the accepted adaptation endpoint |
+
+**Deferred, not retired** (active on other branches; touching them on pc-map
+would only manufacture conflicts):
+
+- **P2 quintet** (`PYRE_P2_DRAIN`, `_FRAMESTACK`, `_COMPILE`, `_FS_COMPILE`,
+  `_AUTHORITATIVE`) — one dependency tree, owned by the #215 session on
+  `fib_recursive` (PR#374). A full scaffold deletion (`765b24e3ba`, −1931 L)
+  was authored there and then deliberately reverted + reset away: the carrier
+  turned out load-bearing (without it a `frames.len()>1` resume compiles a
+  degenerate single-frame bridge — wrong values/SEGV), and `8731115130` now
+  installs it unconditionally, leaving the gates as driver selectors only.
+  Their fate belongs to that branch.
+- **PYRE_SAME_GREENKEY** — the gated path is broken by construction (its
+  ConstInt filter over `green_boxes` InputArg placeholders is always empty, so
+  it declines every close and hangs); the real fix (close compares ALL greens
+  vs `header_greens`, gate dropped) already exists on the local `aheui` branch
+  (`019a494e13`). Delegated there untouched.
+
+**Judged KEEP** (genuine WIP parity ports): `PYRE_SINGLE_PASS` +
+`PYRE_AUTHORITATIVE` (two stages of the gh#344 single-executor epic;
+rework.md F2 "must finish"), `PYRE_INNER_CLOSE` (the missing half of
+`pyjitpl.py:3018-3060 reached_loop_header`; implied ON by single-pass, and
+`PYRE_NO_INNER_CLOSE` stays with it), `PYRE_FBW_VABLE_SCALAR_CA` (S0 seam of
+the vable-owner rework toward `direct_assembler_call` scalar args).
 
 ## §2 — Not gates (11): Rust identifiers, not env vars
 
@@ -114,11 +156,12 @@ Kept as-is; listed for completeness.
   `_GIN`, `_INLINE_RECOG`, `PYRE_WASM_DUMP_ALL_TRACES`, `_DUMP_BAD_TRACE`,
   `_EXEC_TRACE`, `_JIT_STATS`, `PYRE_INTERP_RETURN_LOG`, `PYRE_NBODY_DEBUG`,
   `PYRE_DEBUG_CALL`, `PYRE_DEBUG_CLASS`.
-- **Default-OFF experiments (~14)** — not "already activated", so out of scope:
-  `PYRE_FBW_VABLE_SCALAR_CA`, `PYRE_SINGLE_PASS`, `PYRE_KEPT_OVERRIDE`,
-  `PYRE_P2_AUTHORITATIVE`, `_COMPILE`, `_DRAIN`, `_FRAMESTACK`, `_FS_COMPILE`,
-  `PYRE_AUTHORITATIVE`, `PYRE_STRICT_TARGET_TO_PATH`, `PYRE_SAME_GREENKEY`,
-  `PYRE_INNER_CLOSE`, `PYRE_RELAX_124`, `PYRE_NO_DE`.
+- **Default-OFF experiments (10 remaining)** — triaged in §1b (4 retired, 4
+  kept as WIP parity ports, 6 deferred to their owning branches):
+  `PYRE_FBW_VABLE_SCALAR_CA`, `PYRE_SINGLE_PASS`, `PYRE_AUTHORITATIVE`,
+  `PYRE_INNER_CLOSE` (keep); `PYRE_P2_AUTHORITATIVE`, `_COMPILE`, `_DRAIN`,
+  `_FRAMESTACK`, `_FS_COMPILE` (fib_recursive/PR#374), `PYRE_SAME_GREENKEY`
+  (aheui).
 - **Config / value / master switches (~18)** — tuning, paths, modes; keep:
   `PYRE_FBW_REC_UNROLL`, `PYRE_WALKER_STORE_SUBSCR_FNADDR`,
   `PYRE_MIR_FRONTEND_LLBC`, `PYRE_WASM_ENGINE`, `_FUEL`, `_MODULE`, `_NO_CACHE`,
@@ -131,11 +174,11 @@ Kept as-is; listed for completeness.
 
 | bucket | count |
 |---|---|
-| retired this pass | 5 |
+| retired (§1 default-ON pass + §1b default-OFF pass) | 5 + 4 |
 | not gates (identifiers) | 11 |
 | dead (no read site) | 9 |
 | live default-ON, kept until epic closes | ~28 |
 | diagnostics (OFF) | ~34 |
-| default-OFF experiments | ~14 |
+| default-OFF experiments (4 keep + 6 deferred) | 10 |
 | config / value / master | ~18 |
 | test harness | 1 |

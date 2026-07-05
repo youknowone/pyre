@@ -15,19 +15,6 @@ fn skip_caches(code: &CodeObject, mut pos: usize) -> usize {
     pos
 }
 
-/// Provenance of one operand-stack slot in the forward source analysis.
-/// `Local(idx)` means the slot definitely holds the value of local `idx`
-/// (it was pushed by a `LOAD_FAST idx` and carried unchanged); `Other`
-/// means the slot's value is computed / merged / unknown.  The analysis is
-/// CONSERVATIVE: any opcode it does not model precisely produces `Other`,
-/// so a recovered `Local(idx)` is only ever reported when certain — a wrong
-/// provenance is never emitted, the worst case is declining to recover.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum StackSource {
-    Local(u32),
-    Other,
-}
-
 /// codewriter/liveness.py parity: bytecode liveness analysis.
 /// For each bytecode PC, tracks which locals are live (may be read
 /// on some path before being reassigned) and the operand stack depth.
@@ -56,15 +43,6 @@ pub struct LiveVars {
     /// RPython JitCode treats stack as registers with liveness.
     /// For Python bytecodes, stack depth determines which slots are live.
     stack_depth_at: Vec<usize>,
-    /// Per-PC operand-stack slot provenance at ENTRY to the PC (before the
-    /// op executes), `None` for unreachable PCs.  Slot 0 is the bottom of
-    /// the operand stack (above locals/cells).  Feeds the #124 kept-stack
-    /// resume recovery: a short-circuit `and`/`or` guard keeps the tested
-    /// local on the not-taken arm, but the walk executed the taken arm and
-    /// folded a constant into the kept slot's reused register — so the
-    /// guard-pc source `Local(idx)` lets the snapshot read the live local
-    /// box (`registers_r[local_color_map[idx]]`) instead of the stale fold.
-    stack_source_at: Vec<Option<Vec<StackSource>>>,
 }
 
 impl LiveVars {
@@ -79,7 +57,6 @@ impl LiveVars {
                 defined_bits: Vec::new(),
                 words_per_pc: 0,
                 stack_depth_at: Vec::new(),
-                stack_source_at: Vec::new(),
             };
         }
         let nlocals = code.varnames.len().max(1);
@@ -307,59 +284,6 @@ impl LiveVars {
             }
         }
 
-        // Forward operand-stack provenance analysis (#124 kept-stack
-        // recovery).  `before[pc]` = source stack at ENTRY to pc.  Monotone
-        // toward `Other` (merges only widen specific→Other), so the
-        // worklist converges; depths agree with `stack_depth_at` (the
-        // authoritative height), this only tracks each slot's source.
-        let mut before: Vec<Option<Vec<StackSource>>> = vec![None; n + 1];
-        // Gated experimental feature (#124 kept-stack provenance); default off
-        // so the baseline pays no analysis cost.  Leaving `before` all-`None`
-        // makes `stack_slot_source_local` return `None` everywhere (the
-        // consumer override then never fires).
-        let kept_provenance_on = std::env::var_os("PYRE_KEPT_OVERRIDE").is_some();
-        before[0] = Some(Vec::new());
-        let mut src_changed = kept_provenance_on;
-        // A monotone analysis (slots only widen Local->Other, lengths fixed on
-        // first touch) converges in O(n) sweeps; cap as a backstop so a
-        // pathological CFG can never hang the tracer.  Exhausting the cap
-        // leaves some pcs less precise, which the consumer tolerates.
-        let mut src_iters = 0usize;
-        let src_iter_cap = n + 4;
-        while src_changed && src_iters < src_iter_cap {
-            src_iters += 1;
-            src_changed = false;
-            for pc in 0..n {
-                let Some(entry) = before[pc].clone() else {
-                    continue;
-                };
-                let Some((instr, op_arg)) = pyre_interpreter::decode_instruction_at(code, pc)
-                else {
-                    src_changed |= merge_source_stack(&mut before[pc + 1], &entry);
-                    continue;
-                };
-                let (ft, br) = source_stack_effects(&instr, op_arg, &entry);
-                if !is_unconditional_jump(&instr) {
-                    src_changed |= merge_source_stack(&mut before[pc + 1], &ft);
-                }
-                if let Some(tgt) = target_pc(code, &instr, pc, op_arg) {
-                    if tgt <= n {
-                        src_changed |= merge_source_stack(&mut before[tgt], &br);
-                    }
-                }
-                // Exception-handler entries: the unwinder rebuilds the value
-                // stack, so every slot is non-local — model as all-`Other`
-                // sized to the handler entry depth.
-                for &(s, e, tgt, hdepth) in &exc_handlers {
-                    if pc >= s && pc < e && tgt <= n {
-                        let handler = vec![StackSource::Other; hdepth];
-                        src_changed |= merge_source_stack(&mut before[tgt], &handler);
-                    }
-                }
-            }
-        }
-        let stack_source_at = before;
-
         // Forward must-analysis: a local is defined at PC `p` iff it
         // has been stored on every path reaching `p`. Entry set is
         // the function's argument slots; each join intersects (AND).
@@ -497,19 +421,6 @@ impl LiveVars {
             defined_bits,
             words_per_pc,
             stack_depth_at,
-            stack_source_at,
-        }
-    }
-
-    /// Source local of operand-stack `slot` (0 = bottom) at ENTRY to `pc`,
-    /// or `None` when the slot is computed/merged/unknown or `pc` is
-    /// unreachable.  The #124 kept-stack recovery reads this at a branch
-    /// guard's pc to source the kept operand from the live local instead of
-    /// the reused (stale-fold) register.
-    pub fn stack_slot_source_local(&self, pc: usize, slot: usize) -> Option<u32> {
-        match self.stack_source_at.get(pc)?.as_ref()?.get(slot)? {
-            StackSource::Local(idx) => Some(*idx),
-            StackSource::Other => None,
         }
     }
 
@@ -633,149 +544,6 @@ fn propagate_defined(
     }
     if changed {
         worklist.push(target);
-    }
-}
-
-/// Stack effects: (fallthrough_depth, branch_depth).
-/// Returns new absolute stack depths after the instruction.
-/// Merge `incoming` into the entry source stack at a PC. First touch
-/// installs it; later touches widen any disagreeing slot to `Other`
-/// (monotone, so the worklist converges). Returns whether anything changed.
-fn merge_source_stack(slot: &mut Option<Vec<StackSource>>, incoming: &[StackSource]) -> bool {
-    match slot {
-        None => {
-            *slot = Some(incoming.to_vec());
-            true
-        }
-        Some(existing) => {
-            if existing.len() != incoming.len() {
-                // Depth disagreement (a pc reached at two different stack
-                // depths). Keep the first-seen length and report no change —
-                // flipping to the incoming length each visit would oscillate
-                // forever (the merge would never reach a fixpoint).  The
-                // consumer reads a specific slot and tolerates an absent /
-                // out-of-range source, so keeping the first length is safe.
-                return false;
-            }
-            let mut changed = false;
-            for (e, i) in existing.iter_mut().zip(incoming.iter()) {
-                if *e != StackSource::Other && *e != *i {
-                    *e = StackSource::Other;
-                    changed = true;
-                }
-            }
-            changed
-        }
-    }
-}
-
-/// Rebuild a source stack at `target_d` slots conservatively from `before`.
-/// Pure pushes keep the lower slots and add `Other` on top; a net-zero op
-/// replaces only the top with `Other` (TO_BOOL / unary); a net pop clears to
-/// all-`Other` (single-pop vs multi-pop-push is indistinguishable by depth,
-/// so the safe choice is to drop provenance).
-fn rebuild_other(before: &[StackSource], target_d: usize) -> Vec<StackSource> {
-    let d = before.len();
-    if target_d > d {
-        let mut s = before.to_vec();
-        s.resize(target_d, StackSource::Other);
-        s
-    } else if target_d == d {
-        let mut s = before.to_vec();
-        if let Some(last) = s.last_mut() {
-            *last = StackSource::Other;
-        }
-        s
-    } else {
-        vec![StackSource::Other; target_d]
-    }
-}
-
-/// Forward per-slot source effect of `instr` on the entry source stack
-/// `before`, returning `(fall_through, branch_target)` source stacks.
-/// Precise for the opcodes a short-circuit `and`/`or` (and the surrounding
-/// loop body) uses — `LOAD_FAST` pushes `Local`, `COPY` duplicates, `SWAP`
-/// reorders, true no-ops pass through — and conservatively `Other` for
-/// everything else (sized from `stack_effects`, the authoritative depth).
-fn source_stack_effects(
-    instr: &pyre_interpreter::bytecode::Instruction,
-    op_arg: pyre_interpreter::OpArg,
-    before: &[StackSource],
-) -> (Vec<StackSource>, Vec<StackSource>) {
-    use pyre_interpreter::bytecode::Instruction;
-    let d = before.len();
-    let same = |s: Vec<StackSource>| (s.clone(), s);
-    match instr {
-        Instruction::Nop
-        | Instruction::Resume { .. }
-        | Instruction::Cache
-        | Instruction::NotTaken
-        | Instruction::ExtendedArg
-        | Instruction::DeleteFast { .. }
-        | Instruction::DeleteName { .. }
-        | Instruction::DeleteGlobal { .. }
-        | Instruction::DeleteDeref { .. }
-        | Instruction::CopyFreeVars { .. } => same(before.to_vec()),
-        Instruction::LoadFast { var_num }
-        | Instruction::LoadFastBorrow { var_num }
-        | Instruction::LoadFastCheck { var_num }
-        | Instruction::LoadFastAndClear { var_num } => {
-            let mut s = before.to_vec();
-            s.push(StackSource::Local(var_num.get(op_arg).as_usize() as u32));
-            same(s)
-        }
-        Instruction::LoadFastLoadFast { var_nums }
-        | Instruction::LoadFastBorrowLoadFastBorrow { var_nums } => {
-            let pair = var_nums.get(op_arg);
-            let mut s = before.to_vec();
-            s.push(StackSource::Local(u32::from(pair.idx_1())));
-            s.push(StackSource::Local(u32::from(pair.idx_2())));
-            same(s)
-        }
-        Instruction::Copy { i } => {
-            // COPY i duplicates the i-th value from the top (1-based).
-            let idx = i.get(op_arg) as usize;
-            let src = if idx >= 1 && idx <= d {
-                before[d - idx]
-            } else {
-                StackSource::Other
-            };
-            let mut s = before.to_vec();
-            s.push(src);
-            same(s)
-        }
-        Instruction::Swap { i } => {
-            // SWAP i exchanges the top with the i-th value from the top.
-            let idx = i.get(op_arg) as usize;
-            let mut s = before.to_vec();
-            if d >= 1 && idx >= 1 && idx <= d {
-                s.swap(d - 1, d - idx);
-            }
-            same(s)
-        }
-        Instruction::PopTop
-        | Instruction::PopJumpIfTrue { .. }
-        | Instruction::PopJumpIfFalse { .. }
-        | Instruction::PopJumpIfNone { .. }
-        | Instruction::PopJumpIfNotNone { .. } => {
-            // POP_TOP and POP_JUMP_IF_* pop exactly the top value (the latter
-            // on BOTH the fall-through and the branch arm); every operand-stack
-            // slot below is untouched and keeps its source.  Modeling this
-            // precisely — instead of the conservative `rebuild_other` net-pop
-            // wipe — keeps a short-circuit `and`/`or`'s operand BELOW the
-            // popped condition/value (e.g. `acc` kept on the stack across the
-            // guard in `acc = acc + (a or b)`, where the not-taken arm's
-            // `POP_TOP` would otherwise drop `acc`'s provenance) `Local`-sourced
-            // through the merge, so the bridge/blackhole can recover it from the
-            // live local instead of a reused (stale-fold) merge color.
-            let mut s = before.to_vec();
-            s.pop();
-            same(s)
-        }
-        _ => {
-            let (ft_d, br_d) = stack_effects(instr, op_arg, d);
-            (rebuild_other(before, ft_d), rebuild_other(before, br_d))
-        }
     }
 }
 

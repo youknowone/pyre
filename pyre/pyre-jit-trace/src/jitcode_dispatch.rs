@@ -18452,7 +18452,6 @@ fn handle(
                 };
                 let kept_stack = resume_depth.is_some_and(|d| d > 0);
                 let depth_gt_1 = resume_depth.is_some_and(|d| d > 1);
-                let relax_124 = std::env::var_os("PYRE_RELAX_124").is_some();
                 // #73 mirror-sourced kept-stack compile: a kept-stack guard
                 // COMPILES whenever the walk-level operand-stack mirror
                 // (`ctx.vstack_boxes`) covers EVERY kept resume slot
@@ -18583,7 +18582,7 @@ fn handle(
                 // wrong depth, so a kept-stack arm in a later function would skip
                 // the decline and silently miscompile.  `kept_stack` reads the
                 // correct per-function depth and closes that gap.
-                if (kept_stack || kept_stack_any_leg) && !relax_124 && !mirror_covers_kept {
+                if (kept_stack || kept_stack_any_leg) && !mirror_covers_kept {
                     let liveness =
                         branch_arm_resume_ref_liveness(other_target, ctx.outer_jitcode_index);
                     // Hazard (1): the not-taken arm reads a regular Ref register
@@ -18664,8 +18663,7 @@ fn handle(
                 // INVALID mirror (an undermodeled walk: inline sub-walk /
                 // Unmodeled opcode) leaves the kept slots without a reliable
                 // per-slot source, so decline → interpreter (correct).
-                // `PYRE_RELAX_124` forces depth > 1 through for diagnosis.
-                if depth_gt_1 && !relax_124 && !ctx.vstack_valid {
+                if depth_gt_1 && !ctx.vstack_valid {
                     return Err(DispatchError::BranchGuardKeptStackUnsupported { pc: op.pc });
                 }
                 ctx.trace_ctx.record_guard(opcode, &[valuebox], 0);
