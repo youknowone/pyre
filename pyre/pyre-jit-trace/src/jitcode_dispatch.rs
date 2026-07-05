@@ -8837,7 +8837,7 @@ fn vstack_enter_exception_handler(
 /// `resume_jitcode_pc_for`, used by the full-body walk to stamp a guard's
 /// snapshot with the Python opcode the blackhole resumes (and re-executes)
 /// at — matching the trait path's `orgpc` snapshot coordinate.
-fn python_pc_for_jitcode_pc(metadata: &crate::PyJitCodeMetadata, jit_pc: usize) -> u32 {
+pub(crate) fn python_pc_for_jitcode_pc(metadata: &crate::PyJitCodeMetadata, jit_pc: usize) -> u32 {
     // Exact inverse: `first_jit_pc_by_py_pc[py]` is the byte offset of the
     // FIRST instruction opcode `py` emitted (`usize::MAX` = the PC emitted
     // no jitcode of its own), so the containing opcode is the largest `py`

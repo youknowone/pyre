@@ -1257,6 +1257,7 @@ pub fn frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
         let length_i = all_liveness[off] as u32;
         let length_r = all_liveness[off + 1] as u32;
         let length_f = all_liveness[off + 2] as u32;
+        // #367 diagnostic removed — use post-decode logging instead.
         let mut cursor = off + 3;
         use majit_translate::liveness::LivenessIterator;
 
@@ -1482,6 +1483,23 @@ pub(crate) struct BridgeSemanticMaps {
 }
 
 pub(crate) fn bridge_semantic_maps_at(jitcode_index: i32, pc: i32) -> BridgeSemanticMaps {
+    bridge_semantic_maps_at_with_jitcode_pc(jitcode_index, pc, majit_ir::resumedata::NO_JITCODE_PC)
+}
+
+/// #367: when a kept-stack branch guard carries the guard's own jitcode
+/// coordinate (`jitcode_pc != NO_JITCODE_PC`), the pcdep/depth tables
+/// must be keyed at the GUARD's Python PC — the encode side
+/// (`collect_outer_active_boxes`) already keys its pcdep by
+/// `liveness_py_pc = guard_py_pc`, and the liveness decode
+/// (`frame_liveness_reg_indices_by_bank_at_with_jitcode_pc`) resolves
+/// through the carried `jitcode_pc`. Without this the decode-side
+/// color→slot inversion reads the merge-target PC's pcdep (where the
+/// computed kept temp is dead), leaving the temp as `OpRef::NONE`.
+pub(crate) fn bridge_semantic_maps_at_with_jitcode_pc(
+    jitcode_index: i32,
+    pc: i32,
+    jitcode_pc: i32,
+) -> BridgeSemanticMaps {
     ensure_finish_setup();
     METAINTERP_SD.with(|r| {
         let sd = r.borrow();
@@ -1516,7 +1534,21 @@ pub(crate) fn bridge_semantic_maps_at(jitcode_index: i32, pc: i32) -> BridgeSema
         // coordinate the Ref bank uses when the marker is set; that change is
         // deferred to the symbolic-stack work (#423) since an unvalidated
         // resume-coordinate flip can itself miscompile.
-        let real_pc = majit_ir::resumedata::decode_resume_pc(pc).0 as usize;
+        //
+        // #367: when the carried `jitcode_pc` is set (kept-stack branch
+        // guard), resolve the guard's Python PC from the jitcode coordinate
+        // and use it for the pcdep/depth lookup, matching the encode side's
+        // `liveness_py_pc = guard_py_pc` keying. The guard PC is where the
+        // computed kept operand-stack temps are live; at the merge-target PC
+        // they've been consumed and carry no pcdep entry.
+        let real_pc = if jitcode_pc != majit_ir::resumedata::NO_JITCODE_PC && jitcode_pc >= 0 {
+            crate::jitcode_dispatch::python_pc_for_jitcode_pc(
+                &payload.metadata,
+                jitcode_pc as usize,
+            ) as usize
+        } else {
+            majit_ir::resumedata::decode_resume_pc(pc).0 as usize
+        };
         let stack_depth_at_pc = payload
             .metadata
             .depth_at_py_pc
@@ -7581,6 +7613,14 @@ impl JitState for PyreJitState {
             frame0.pc,
             frame0.jitcode_pc,
         );
+        // #367: for a kept-stack branch guard, the vable's
+        // `valuestackdepth` may reflect the merge-target depth (consumed
+        // stack) rather than the guard's deeper live depth. The guard PC's
+        // pcdep `stack_depth_at_pc` (from `depth_at_py_pc`, resolved through
+        // the carried `jitcode_pc`) IS the guard-time depth. Use the larger
+        // of the two so the color→slot inversion covers the kept temps.
+        // This is deferred until after `maps` is read (below, line ~7754)
+        // via a re-adjustment of the semantic mirror length.
         let stack_only = bridge_valuestackdepth.saturating_sub(nlocals);
         let bridge_reg_len = nlocals + stack_only;
         let mut bridge_registers_r = vec![OpRef::NONE; bridge_reg_len];
@@ -7618,25 +7658,12 @@ impl JitState for PyreJitState {
         // out) once validated, mirroring the LoadGlobal-fold / multiframe
         // gap-10 flips; the opt-out keeps the prior symbolic-bridge
         // behavior available for A/B.
-        let mut seed_bridge_locals =
-            std::env::var("PYRE_FBW_BRIDGE_LOCAL_SEED").as_deref() != Ok("0");
-        // A branch-guard kept-stack resume (`frame0.jitcode_pc` carries the
-        // guard's own jitcode pc; only kept-stack branch guards set it) resumes
-        // AT the guard pc with the not-taken arm's operand-stack temps still
-        // live (`lo <= x <= hi` keeps `x` below the compare truth; short-circuit
-        // `and`/`or` and the conditional expression keep their left operand).
-        // Stamping a concrete on such a kept operand freezes a downstream branch
-        // that consumes it: `x <= hi`'s residual compare const-folds against the
-        // seeded `x` to a `Const` bool, and `generate_guard` skips the guard for
-        // a `Const` condition (`isinstance(box, Const): return`) — so the second
-        // branch direction is pinned to the resuming iteration's `x` and the
-        // loop over/under-counts.  The kept operand must stay a symbolic input
-        // arg here (the guard fires, the value is guarded, not folded); the seed
-        // stays on the non-kept-stack resumes (guard_value / guard_class / plain
-        // short resumes) it was added for.  Only reachable with the guard-pc
-        // resume coordinate live (the `pc_map` baseline resumes past the pop, so
-        // the kept temp is absent from its frame and never seeded).
-        if seed_bridge_locals && frame0.jitcode_pc != majit_ir::resumedata::NO_JITCODE_PC {
+        let mut seed_bridge_locals = std::env::var("PYRE_FBW_BRIDGE_LOCAL_SEED").as_deref() != Ok("0");
+        // #367: kept-stack branch-guard bridges disable the concrete
+        // seed pending full Blocker 2 validation.
+        if seed_bridge_locals
+            && frame0.jitcode_pc != majit_ir::resumedata::NO_JITCODE_PC
+        {
             seed_bridge_locals = false;
         }
         let mut value_cursor = 0usize;
@@ -7709,7 +7736,6 @@ impl JitState for PyreJitState {
             sym.registers_f[reg_idx] = resolved;
             value_cursor += 1;
         }
-        let semantic_prefix_len = nlocals + stack_only;
         // Reconstruct the slot-indexed semantic register file
         // (`[locals.., stack_tail..]`) from the color-indexed resume decode.
         // The decode just filled `bridge_registers_r` by abstract-register
@@ -7723,7 +7749,39 @@ impl JitState for PyreJitState {
         // `[0,nlocals)` prefix to identity colors (now retired). Invert each
         // live color to its slot via `semantic_ref_slot_for_reg_color` so the
         // mirror is correct under freely-colored locals.
-        let maps = crate::state::bridge_semantic_maps_at(frame0.jitcode_index, frame0.pc);
+        let maps = crate::state::bridge_semantic_maps_at_with_jitcode_pc(
+            frame0.jitcode_index,
+            frame0.pc,
+            frame0.jitcode_pc,
+        );
+        // #367: for a kept-stack branch guard, the vable's runtime
+        // `valuestackdepth` reflects the merge-target depth (post
+        // consumption) rather than the guard's deeper live depth. The
+        // guard-PC pcdep `stack_depth_at_pc` IS the guard-time depth
+        // (with kept temps live). Widen `semantic_prefix_len` to the
+        // pcdep depth so the color→slot inversion covers kept temps.
+        let stack_only = stack_only.max(maps.stack_depth_at_pc);
+        let semantic_prefix_len = nlocals + stack_only;
+        // Extend bridge_registers_r to cover the wider depth.
+        if bridge_registers_r.len() < semantic_prefix_len {
+            bridge_registers_r.resize(semantic_prefix_len, OpRef::NONE);
+        }
+        if majit_metainterp::majit_log_enabled()
+            && frame0.jitcode_pc != majit_ir::resumedata::NO_JITCODE_PC
+        {
+            let old_so = bridge_valuestackdepth.saturating_sub(nlocals);
+            eprintln!(
+                "[jit][#367-bridge] jitcode_pc={} pc={} pcdep={:?} \
+                 depth_at_guard={} vsd={} stack_only={}→{}",
+                frame0.jitcode_pc,
+                frame0.pc,
+                maps.pcdep_entries,
+                maps.stack_depth_at_pc,
+                bridge_valuestackdepth,
+                old_so,
+                stack_only,
+            );
+        }
         // virtualizable.py:86-98 + pyjitpl.py:3430 synchronize_virtualizable:
         // the frame's `locals_cells_stack_w` array (the vable image) is the
         // authoritative post-guard source for the frame's locals. At an
