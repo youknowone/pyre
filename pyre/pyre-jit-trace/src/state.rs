@@ -899,7 +899,7 @@ pub(crate) fn sub_jitcode_body_for_code(
 /// no payload is installed or the jitcode was never colored (empty
 /// `pcdep_color_slots`, a portal/skeleton install whose colors are
 /// slot-identity).
-pub(crate) fn sub_jitcode_entry_param_colors(code: *const ()) -> Option<Vec<(u16, u16)>> {
+pub(crate) fn sub_jitcode_entry_param_colors(code: *const ()) -> Option<Vec<(u8, u16, u16)>> {
     if code.is_null() {
         return None;
     }
@@ -1365,7 +1365,7 @@ pub fn seed_compiled_trace_jitcode_test_state(
 /// `d`) into the post-rename register color the dispatcher would touch
 /// at a given PC — colors are per-program-point, so a flat
 /// slot-arithmetic lookup does not exist.
-pub fn pcdep_color_slots_at(jitcode_index: i32, py_pc: i32) -> Vec<(u16, u16)> {
+pub fn pcdep_color_slots_at(jitcode_index: i32, py_pc: i32) -> Vec<(u8, u16, u16)> {
     ensure_finish_setup();
     METAINTERP_SD.with(|r| {
         let sd = r.borrow();
@@ -1411,7 +1411,7 @@ pub fn pcdep_color_names_frame_slot_at(jitcode_index: i32, pc: usize, color: u16
         sd.jitcodes
             .get(jitcode_index as usize)
             .and_then(|jc| jc.payload.metadata.pcdep_color_slots.get(pc))
-            .is_some_and(|entries| entries.iter().any(|&(c, _)| c == color))
+            .is_some_and(|entries| entries.iter().any(|&(b, c, _)| b == 1 && c == color))
     })
 }
 
@@ -1479,7 +1479,9 @@ pub(crate) struct BridgeSemanticMaps {
     /// authoritative color→slot inversion (the same per-program-point color
     /// space the `-live-` markers and encode side use), superseding the flat
     /// `local_color_map` / `stack_color_map` for this bridge.
-    pub pcdep_entries: Vec<(u16, u16)>,
+    /// Tuples: `(bank, color, slot)` where bank = Kind::index()
+    /// (0=Int, 1=Ref, 2=Float).
+    pub pcdep_entries: Vec<(u8, u16, u16)>,
 }
 
 pub(crate) fn bridge_semantic_maps_at(jitcode_index: i32, pc: i32) -> BridgeSemanticMaps {
@@ -1542,10 +1544,16 @@ pub(crate) fn bridge_semantic_maps_at_with_jitcode_pc(
         // computed kept operand-stack temps are live; at the merge-target PC
         // they've been consumed and carry no pcdep entry.
         let real_pc = if jitcode_pc != majit_ir::resumedata::NO_JITCODE_PC && jitcode_pc >= 0 {
-            crate::jitcode_dispatch::python_pc_for_jitcode_pc(
-                &payload.metadata,
-                jitcode_pc as usize,
-            ) as usize
+            let jp = jitcode_pc as usize;
+            // Validate with `can_decode_live_vars` — symmetric with the
+            // liveness decode in `resolve_resume_pc_with_jitcode_pc`.
+            // A non-decodable carried coordinate falls back to the
+            // merge-target PC so liveness and pcdep key the same point.
+            if payload.jitcode.can_decode_live_vars(jp, sd.op_live) {
+                crate::jitcode_dispatch::python_pc_for_jitcode_pc(&payload.metadata, jp) as usize
+            } else {
+                majit_ir::resumedata::decode_resume_pc(pc).0 as usize
+            }
         } else {
             majit_ir::resumedata::decode_resume_pc(pc).0 as usize
         };
@@ -1577,16 +1585,31 @@ pub(crate) fn bridge_semantic_maps_at_with_jitcode_pc(
 /// resume PC of a jitcode. The pcdep color map records live Variables only;
 /// `reconstruct_inline_recipe` uses this to refill the registerless constant
 /// slots an inlined-callee guard resume leaves empty after the color→slot
-/// inversion. Keyed by the marker-stripped `real_pc`, the same coordinate
-/// `bridge_semantic_maps_at` keys its `pcdep_entries` by.
-pub(crate) fn const_ref_slots_at_pc_at(jitcode_index: i32, pc: i32) -> Vec<(u16, i64)> {
+/// inversion. Keyed by the guard's Python PC — when the carried
+/// `jitcode_pc` is set, resolves through `python_pc_for_jitcode_pc` so
+/// the constant lookup uses the same coordinate as `pcdep_entries` and
+/// the liveness decode.
+pub(crate) fn const_ref_slots_at_pc_at(
+    jitcode_index: i32,
+    pc: i32,
+    jitcode_pc: i32,
+) -> Vec<(u16, i64)> {
     ensure_finish_setup();
     METAINTERP_SD.with(|r| {
         let sd = r.borrow();
         let Some(jc) = sd.jitcodes.get(jitcode_index as usize) else {
             return Vec::new();
         };
-        let real_pc = majit_ir::resumedata::decode_resume_pc(pc).0 as usize;
+        let real_pc = if jitcode_pc != majit_ir::resumedata::NO_JITCODE_PC && jitcode_pc >= 0 {
+            let jp = jitcode_pc as usize;
+            if jc.payload.jitcode.can_decode_live_vars(jp, sd.op_live) {
+                crate::jitcode_dispatch::python_pc_for_jitcode_pc(&jc.payload.metadata, jp) as usize
+            } else {
+                majit_ir::resumedata::decode_resume_pc(pc).0 as usize
+            }
+        } else {
+            majit_ir::resumedata::decode_resume_pc(pc).0 as usize
+        };
         jc.payload
             .metadata
             .const_ref_slots_at_pc
@@ -1640,28 +1663,38 @@ pub fn portal_red_regs_at(jitcode_index: i32) -> (u16, u16) {
 pub(crate) fn semantic_ref_slot_for_reg_color(
     nlocals: usize,
     stack_only: usize,
-    pcdep_entries: &[(u16, u16)],
+    pcdep_entries: &[(u8, u16, u16)],
     reg: usize,
 ) -> Option<usize> {
-    // #348 Part (2): the per-PC `(color, slot)` map is the authoritative
-    // color→slot inversion at this resume PC — each slot's TRUE per-program-
-    // point color rather than a flat one-color-per-slot label. Prefer the
-    // smallest operand-stack slot carrying this color, else the smallest local
-    // slot (entries are sorted by `(color, slot)`, so locals precede stack
-    // within a color). A stack slot counts only while it is below the live
-    // stack depth (`stack_only`) at THIS resume — the per-PC entries are gated
-    // by the compile-time depth, which can exceed the runtime `stack_only`
-    // (portal-bridge stale vsd, residual-call fallthrough).
+    semantic_slot_for_reg_color(nlocals, stack_only, pcdep_entries, 1, reg)
+}
+
+/// Per-PC `(bank, color, slot)` map inversion: given a register bank and
+/// color, return the semantic `locals_cells_stack_w` slot it maps to at the
+/// current PC. Prefer stack slots over locals (stack_match.or(local_match)).
+pub(crate) fn semantic_slot_for_reg_color(
+    nlocals: usize,
+    stack_only: usize,
+    pcdep_entries: &[(u8, u16, u16)],
+    bank: u8,
+    reg: usize,
+) -> Option<usize> {
+    // The per-PC `(bank, color, slot)` map is the authoritative color→slot
+    // inversion at this resume PC — each slot's TRUE per-program-point
+    // color rather than a flat one-color-per-slot label. Prefer the
+    // smallest operand-stack slot carrying this color, else the smallest
+    // local slot (entries are sorted by `(bank, color, slot)`, so locals
+    // precede stack within a color). A stack slot counts only while it is
+    // below the live stack depth (`stack_only`) at THIS resume — the
+    // per-PC entries are gated by the compile-time depth, which can
+    // exceed the runtime `stack_only` (portal-bridge stale vsd,
+    // residual-call fallthrough).
     //
-    // #73: an empty map yields None (no live color owns this slot at this pc);
-    // the flat `stack_slot_color_map` / `pyre_color_for_semantic_local` scan
-    // this used to fall back to is retired — on the corpus it was only ever
-    // reached at degenerate (nlocals=0, stack_only=0) resume points where the
-    // scan returned None regardless.
+    // An empty map yields None (no live color owns this slot at this pc).
     let mut local_match: Option<usize> = None;
     let mut stack_match: Option<usize> = None;
-    for &(color, slot) in pcdep_entries {
-        if color as usize != reg {
+    for &(b, color, slot) in pcdep_entries {
+        if b != bank || color as usize != reg {
             continue;
         }
         let s = slot as usize;
@@ -5502,7 +5535,10 @@ fn reconstruct_inline_recipe(
     // local on the operand stack lands at its stack slot, not its color.
     let mut registers_r = vec![OpRef::NONE; valuestackdepth];
     let mut concrete_r = vec![majit_ir::Value::Void; valuestackdepth];
-    for &(color, slot) in &maps.pcdep_entries {
+    for &(bank, color, slot) in &maps.pcdep_entries {
+        if bank != 1 {
+            continue;
+        } // Ref bank only
         let s = slot as usize;
         let c = color as usize;
         if s < valuestackdepth && c < by_color_r.len() && by_color_r[c] != OpRef::NONE {
@@ -5513,7 +5549,7 @@ fn reconstruct_inline_recipe(
 
     // Refill registerless operand-stack constants the color map omits (an
     // inlined callee has no value-stack resumedata to rematerialize them from).
-    for (slot, raw) in const_ref_slots_at_pc_at(frame.jitcode_index, frame.pc) {
+    for (slot, raw) in const_ref_slots_at_pc_at(frame.jitcode_index, frame.pc, frame.jitcode_pc) {
         let s = slot as usize;
         if s < valuestackdepth {
             registers_r[s] = ctx.const_ref(raw);
@@ -7891,7 +7927,13 @@ impl JitState for PyreJitState {
             // `s >= semantic_prefix_len` guard.  #73: pcdep is the SOLE
             // color→slot source here; the flat `local_color_map` /
             // `stack_color_map` fallback is drained.
-            for &(color, slot) in &maps.pcdep_entries {
+            for &(bank, color, slot) in &maps.pcdep_entries {
+                // Only Ref-bank colors map to bridge_registers_r slots.
+                // Int/Float bank entries are structurally recorded but
+                // currently unreachable (operand stack is always Ref).
+                if bank != 1 {
+                    continue;
+                }
                 let s = slot as usize;
                 if s >= semantic_prefix_len {
                     continue;
@@ -9343,7 +9385,7 @@ mod tests {
         // (abs slot nlocals+0 = 2). With the stack slot in the live window
         // (stack_only=1) the inverse prefers the stack slot.
         assert_eq!(
-            semantic_ref_slot_for_reg_color(2, 1, &[(0, 0), (0, 2), (1, 1)], 0),
+            semantic_ref_slot_for_reg_color(2, 1, &[(1, 0, 0), (1, 0, 2), (1, 1, 1)], 0),
             Some(2),
         );
     }
@@ -9353,7 +9395,7 @@ mod tests {
         // Color 1 is owned only by local slot 1 (the sole live operand-stack
         // slot carries color 3), so the inverse falls through to the local.
         assert_eq!(
-            semantic_ref_slot_for_reg_color(2, 1, &[(1, 1), (3, 2), (4, 0)], 1),
+            semantic_ref_slot_for_reg_color(2, 1, &[(1, 1, 1), (1, 3, 2), (1, 4, 0)], 1),
             Some(1),
         );
     }
@@ -9362,7 +9404,7 @@ mod tests {
     fn semantic_ref_slot_ignores_dead_local_color_reuse() {
         // A dead local is simply absent from the per-PC entries (they record
         // only live slots), so color 0 has no live owner here -> None.
-        assert_eq!(semantic_ref_slot_for_reg_color(2, 0, &[(1, 1)], 0), None,);
+        assert_eq!(semantic_ref_slot_for_reg_color(2, 0, &[(1, 1, 1)], 0), None,);
     }
 
     #[test]
@@ -9374,9 +9416,16 @@ mod tests {
         // (None) — its stack slot sits past the live window (3 >= stack_only)
         // — so `collect_outer_active_boxes` substitutes a CONST_NULL
         // placeholder rather than reading an unpopulated register.
-        let pcdep = [(2u16, 0u16), (2, 1), (2, 2), (3, 3), (4, 4), (5, 5)];
+        let pcdep = [
+            (1u8, 2u16, 0u16),
+            (1, 2, 1),
+            (1, 2, 2),
+            (1, 3, 3),
+            (1, 4, 4),
+            (1, 5, 5),
+        ];
         assert_eq!(semantic_ref_slot_for_reg_color(2, 3, &pcdep, 5), None,);
-        assert!(pcdep.iter().any(|&(c, _)| c == 5));
+        assert!(pcdep.iter().any(|&(_, c, _)| c == 5));
     }
 
     /// Encode<->decode resume-symmetry round trip over a NON-IDENTITY,
@@ -9411,12 +9460,12 @@ mod tests {
         // one entry per live local (slot = local index) plus one per
         // compile-time operand-stack slot (slot = nlocals + depth). Sorted by
         // (color, slot) so locals precede stack within a shared color.
-        let mut pcdep: Vec<(u16, u16)> = Vec::new();
+        let mut pcdep: Vec<(u8, u16, u16)> = Vec::new();
         for (i, &c) in local_map.iter().enumerate() {
-            pcdep.push((c, i as u16));
+            pcdep.push((1, c, i as u16));
         }
         for (d, &c) in stack_map.iter().enumerate() {
-            pcdep.push((c, (nlocals + d) as u16));
+            pcdep.push((1, c, (nlocals + d) as u16));
         }
         pcdep.sort();
 

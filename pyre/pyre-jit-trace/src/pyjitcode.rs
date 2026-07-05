@@ -148,12 +148,13 @@ pub struct PyJitCodeMetadata {
     /// `nlocals + ncells + max_stackdepth`). Sized to the static peak, not
     /// `max(depth_at_pc)` — JIT-traced PCs may not reach `co_stacksize`.
     pub max_stackdepth: usize,
-    /// #348 Part (2): per-Python-PC color↔slot map for the live restorable
-    /// Ref frame slots. Indexed by `py_pc`; each entry is the list of
-    /// `(color, semantic_slot)` for the slots live and restorable at that
-    /// PC, sorted by color. The semantic slot is the unified
-    /// `locals_cells_stack_w` index (local `i` for `i < nlocals`,
-    /// `nlocals + d` for operand-stack depth `d`).
+    /// Per-Python-PC bank-tagged color↔slot map for the live restorable
+    /// frame slots. Indexed by `py_pc`; each entry is `(bank, color, slot)`
+    /// where bank = `Kind::index()` (0=Int, 1=Ref, 2=Float), color is the
+    /// post-regalloc register within that bank, and slot is the unified
+    /// `locals_cells_stack_w` semantic index (local `i` for `i < nlocals`,
+    /// `nlocals + d` for operand-stack depth `d`). Sorted by
+    /// `(bank, color, slot)`.
     ///
     /// Records each slot's TRUE per-program-point SSA color — the runtime
     /// analog of RPython's compile-time baked register operands. Stack
@@ -166,7 +167,7 @@ pub struct PyJitCodeMetadata {
     /// then. When populated, the `-live-` markers carry the SAME per-PC
     /// colors (built by `filter_liveness_in_place` off this map), so
     /// encode/decode/`-live-` stay in one consistent color space.
-    pub pcdep_color_slots: Vec<Vec<(u16, u16)>>,
+    pub pcdep_color_slots: Vec<Vec<(u8, u16, u16)>>,
     /// Per-Python-PC operand-stack Ref CONSTANTS (`(semantic_slot, raw_ref)`).
     /// `pcdep_color_slots` records live restorable Variables only; for the
     /// virtualizable ROOT frame the operand-stack constants are rematerialized

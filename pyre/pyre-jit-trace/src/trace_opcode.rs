@@ -1617,7 +1617,7 @@ impl MIFrame {
                 pcdep_entries,
             )
         };
-        let pcdep_opt: Option<&[(u16, u16)]> =
+        let pcdep_opt: Option<&[(u8, u16, u16)]> =
             (!pcdep_entries.is_empty()).then(|| pcdep_entries.as_slice());
         // SSA-authoritative live_r: Ref bank entries go
         // through the read_live / lazy-fill / materialize pipeline to
@@ -10080,7 +10080,7 @@ mod tests {
         pyjit
             .metadata
             .pcdep_color_slots
-            .push(vec![(0, 0), (0, 2), (1, 1)]);
+            .push(vec![(1, 0, 0), (1, 0, 2), (1, 1, 1)]);
         let inner_jc = crate::state::JitCode {
             index: 0,
             payload: Arc::new(pyjit),

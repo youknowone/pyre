@@ -8262,8 +8262,8 @@ mod tests {
     fn pcdep_color_for_slot(jitcode_index: i32, py_pc: usize, slot: usize) -> Option<u32> {
         pyre_jit_trace::state::pcdep_color_slots_at(jitcode_index, py_pc as i32)
             .iter()
-            .find(|&&(_, s)| s as usize == slot)
-            .map(|&(c, _)| u32::from(c))
+            .find(|&&(b, _, s)| b == 1 && s as usize == slot)
+            .map(|&(_, c, _)| u32::from(c))
     }
 
     /// Find the first Python PC where every requested local slot and

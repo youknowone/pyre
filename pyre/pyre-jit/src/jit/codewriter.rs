@@ -4238,7 +4238,7 @@ fn register_helper_fn_pointers(
 fn filter_liveness_in_place(
     ssarepr: &mut super::flatten::SSARepr,
     code: &CodeObject,
-    pcdep_color_slots: &[Vec<(u16, u16)>],
+    pcdep_color_slots: &[Vec<(u8, u16, u16)>],
     portal_frame_reg: u16,
     portal_ec_reg: u16,
     walker_tracked_pc_live_indices: Option<&[usize]>,
@@ -4248,7 +4248,7 @@ fn filter_liveness_in_place(
     Vec<usize>,
     Vec<Option<usize>>,
     Vec<Option<usize>>,
-    Vec<Vec<(u16, u16)>>,
+    Vec<Vec<(u8, u16, u16)>>,
 ) {
     use super::flatten::{Kind as SsaKind, Operand as SsaOperand};
     // Per-PC `-live-` positions are required: the post-merge
@@ -4368,7 +4368,7 @@ fn filter_liveness_in_place(
     // `(color, slot)` entries restricted to the marker's surviving colors,
     // and publish it to EVERY member PC — exactly the conservative-superset
     // semantics a per-program-point coloring guarantees.
-    let mut marker_pcdep: Vec<Vec<(u16, u16)>> = vec![Vec::new(); walker_tracked.len()];
+    let mut marker_pcdep: Vec<Vec<(u8, u16, u16)>> = vec![Vec::new(); walker_tracked.len()];
 
     for (insn_idx, py_pcs) in groups {
         // Original snapshot is the same for every PC in the group
@@ -4446,7 +4446,13 @@ fn filter_liveness_in_place(
                 // `-live-` markers stay consistent with the inversion.
                 let mut s: std::collections::BTreeSet<u16> = pcdep_color_slots
                     .get(py_pc)
-                    .map(|entries| entries.iter().map(|&(color, _)| color).collect())
+                    .map(|entries| {
+                        entries
+                            .iter()
+                            .filter(|&&(b, _, _)| b == 1)
+                            .map(|&(_, color, _)| color)
+                            .collect()
+                    })
                     .unwrap_or_default();
                 // Portal red args (`pypy/module/pypyjit/interp_jit.py:67
                 // reds = ['frame', 'ec']`) reach `live_r` through the
@@ -4566,11 +4572,14 @@ fn filter_liveness_in_place(
             // Restrict to the marker's live colors so every shipped color
             // inverts to a marker-alive register.
             for &py_pc in &py_pcs {
-                let mut pc_entries: Vec<(u16, u16)> = Vec::new();
+                let mut pc_entries: Vec<(u8, u16, u16)> = Vec::new();
                 if let Some(entries) = pcdep.get(py_pc) {
-                    for &(color, slot) in entries {
-                        if union_r.contains(&color) || (slot as usize) < nlocals {
-                            pc_entries.push((color, slot));
+                    for &(bank, color, slot) in entries {
+                        if bank == 1 && (union_r.contains(&color) || (slot as usize) < nlocals) {
+                            pc_entries.push((bank, color, slot));
+                        } else if bank != 1 {
+                            // Int/Float bank entries pass through
+                            pc_entries.push((bank, color, slot));
                         }
                     }
                 }
@@ -4787,31 +4796,26 @@ fn resolve_const_ref_slot(c: &super::flow::Constant) -> Option<i64> {
 fn build_pcdep_color_slots(
     pcdep_slot_var: &[Vec<(u16, u32)>],
     pcdep_slot_var_resume: &[Vec<(u16, u32)>],
-    coloring: &std::collections::HashMap<super::flow::VariableId, u16>,
-    live_oracle: &std::collections::HashMap<super::flow::VariableId, u16>,
+    colorings: [&std::collections::HashMap<super::flow::VariableId, u16>; 3],
+    live_oracles: [&std::collections::HashMap<super::flow::VariableId, u16>; 3],
     rename: &[Vec<u16>; 3],
     code: &CodeObject,
     depth_at_pc: &[u16],
-) -> Vec<Vec<(u16, u16)>> {
+) -> Vec<Vec<(u8, u16, u16)>> {
     let lv = pyre_jit_trace::state::liveness_for(code as *const _);
     let nlocals = code.varnames.len();
-    let mut out: Vec<Vec<(u16, u16)>> = vec![Vec::new(); pcdep_slot_var.len()];
+    let mut out: Vec<Vec<(u8, u16, u16)>> = vec![Vec::new(); pcdep_slot_var.len()];
     for py_pc in 0..pcdep_slot_var.len() {
         if !lv.is_reachable(py_pc) {
             continue;
         }
         let depth = depth_at_pc.get(py_pc).copied().unwrap_or(0) as usize;
-        // Per-slot color, keyed by semantic slot.
+        // Per-slot (bank, color), keyed by semantic slot.
         //
-        // #355 B2-proper: build the map from the PRE-dispatch resume-depth
-        // Variable snapshot ALONE. B1 proved that snapshot fully subsumes the
-        // flat base (every flat-base survivor is either a resume-depth Variable
-        // here, or a deep-stack Constant the value-stack resumedata
-        // rematerializes from the const pool); B2 proved those constants are
-        // redundant. So the resume-depth Variables, joined through the splice
-        // coloring, are the sole live source — no flat base, no constant
-        // entries.
-        let mut slot_color: std::collections::BTreeMap<u16, u16> =
+        // Build the map from the PRE-dispatch resume-depth Variable
+        // snapshot. Each variable belongs to exactly one bank (Int/Ref/Float);
+        // try all three and record the one that contains the variable.
+        let mut slot_bank_color: std::collections::BTreeMap<u16, (u8, u16)> =
             std::collections::BTreeMap::new();
         let src: &[(u16, u32)] = pcdep_slot_var_resume
             .get(py_pc)
@@ -4825,18 +4829,23 @@ fn build_pcdep_color_slots(
             } else if slot_us - nlocals >= depth {
                 continue;
             }
-            if !live_oracle.contains_key(&super::flow::VariableId(var_id)) {
-                continue;
+            let vid = super::flow::VariableId(var_id);
+            // Find the bank this variable belongs to.
+            for (bank_idx, kind) in [Kind::Int, Kind::Ref, Kind::Float].iter().enumerate() {
+                if !live_oracles[bank_idx].contains_key(&vid) {
+                    continue;
+                }
+                let Some(&pre) = colorings[bank_idx].get(&vid) else {
+                    continue;
+                };
+                let color = super::regalloc::rename_lookup(rename, *kind, pre);
+                slot_bank_color.insert(slot, (bank_idx as u8, color));
+                break;
             }
-            let Some(&pre) = coloring.get(&super::flow::VariableId(var_id)) else {
-                continue;
-            };
-            let color = super::regalloc::rename_lookup(rename, Kind::Ref, pre);
-            slot_color.insert(slot, color);
         }
-        let mut entries: Vec<(u16, u16)> = slot_color
+        let mut entries: Vec<(u8, u16, u16)> = slot_bank_color
             .into_iter()
-            .map(|(slot, color)| (color, slot))
+            .map(|(slot, (bank, color))| (bank, color, slot))
             .collect();
         entries.sort_unstable();
         entries.dedup();
@@ -4847,8 +4856,8 @@ fn build_pcdep_color_slots(
 
 fn validate_pcdep_color_map(
     pcdep_slot_var: &[Vec<(u16, u32)>],
-    coloring: &std::collections::HashMap<super::flow::VariableId, u16>,
-    live_oracle: &std::collections::HashMap<super::flow::VariableId, u16>,
+    colorings: [&std::collections::HashMap<super::flow::VariableId, u16>; 3],
+    live_oracles: [&std::collections::HashMap<super::flow::VariableId, u16>; 3],
     rename: &[Vec<u16>; 3],
     code: &CodeObject,
     depth_at_pc: &[u16],
@@ -4859,9 +4868,10 @@ fn validate_pcdep_color_map(
     let nlocals = code.varnames.len();
     let mut checked = 0usize;
     let mut inj_violations = 0usize;
-    // Reused per PC: pcdep_color -> (Variable.id, slot) that owns it, to
-    // detect two DIFFERENT live Variables colliding on one color.
-    let mut color_owner: std::collections::HashMap<u16, (u32, usize)> =
+    // Reused per PC: (bank, pcdep_color) -> (Variable.id, slot) that owns
+    // it, to detect two DIFFERENT live Variables colliding on one color
+    // within the same bank.
+    let mut color_owner: std::collections::HashMap<(u8, u16), (u32, usize)> =
         std::collections::HashMap::new();
     for (py_pc, snap) in pcdep_slot_var.iter().enumerate() {
         if snap.is_empty() || !live_vars.is_reachable(py_pc) {
@@ -4871,15 +4881,15 @@ fn validate_pcdep_color_map(
         color_owner.clear();
         for &(slot, var_id) in snap {
             let slot = slot as usize;
-            // Restorable gate: the resume only restores Variables the gate-
-            // off graph regalloc colored (the `walker_slot_for_variable_live`
-            // mask). A leaked operand-stack Ref minted by
-            // `color_leaked_arg_variables` sits in the severed dead region,
-            // gets a splice color but never restores — exclude it so the
-            // check matches resume reality (and the interference filter).
-            if !live_oracle.contains_key(&super::flow::VariableId(var_id)) {
+            let vid = super::flow::VariableId(var_id);
+            // Determine the bank this variable belongs to.
+            let Some((bank_idx, kind)) = [Kind::Int, Kind::Ref, Kind::Float]
+                .iter()
+                .enumerate()
+                .find(|(bi, _)| live_oracles[*bi].contains_key(&vid))
+            else {
                 continue;
-            }
+            };
             // Liveness gate: a slot's value is only captured when the slot
             // is live here.
             if slot < nlocals {
@@ -4890,17 +4900,16 @@ fn validate_pcdep_color_map(
                 continue; // stack slot above the live depth
             }
             // PC-dependent (true SSA) color of the Variable in this slot.
-            let Some(&pre) = coloring.get(&super::flow::VariableId(var_id)) else {
+            let Some(&pre) = colorings[bank_idx].get(&vid) else {
                 continue; // dead / const-folded Variable carries no color
             };
-            let pcdep_color = super::regalloc::rename_lookup(rename, Kind::Ref, pre);
+            let pcdep_color = super::regalloc::rename_lookup(rename, *kind, pre);
             checked += 1;
-            // SOUNDNESS: same color owned by two DIFFERENT live Variables
-            // that are NOT value-equivalent (not in one coalesce group). A
-            // benign same-value alias (copy-coalesced) shares the color
-            // legitimately; a different-value clash would make color-indexed
-            // resume ambiguous.
-            if let Some(&(owner_var, owner_slot)) = color_owner.get(&pcdep_color) {
+            // SOUNDNESS: same (bank, color) owned by two DIFFERENT live
+            // Variables that are NOT value-equivalent (not in one coalesce
+            // group). Colors from different banks are independent namespaces.
+            let key = (bank_idx as u8, pcdep_color);
+            if let Some(&(owner_var, owner_slot)) = color_owner.get(&key) {
                 if owner_var != var_id
                     && uf_find(value_parent, var_id) != uf_find(value_parent, owner_var)
                 {
@@ -4908,13 +4917,13 @@ fn validate_pcdep_color_map(
                     if inj_violations <= 20 {
                         eprintln!(
                             "PCDEP[{label}] INJ-VIOLATION: pc={py_pc} slot={slot} \
-                             color={pcdep_color} var={var_id} clashes_with \
+                             color={pcdep_color} bank={bank_idx} var={var_id} clashes_with \
                              slot={owner_slot} var={owner_var}",
                         );
                     }
                 }
             } else {
-                color_owner.insert(pcdep_color, (var_id, slot));
+                color_owner.insert(key, (var_id, slot));
             }
         }
     }
@@ -12350,11 +12359,19 @@ impl CodeWriter {
         // production resume source. Proven byte-identical to the flat-base
         // path on both backends (corpus gate_changed=0 + resume-critical
         // kept-stack repros).
-        let pcdep_color_slots: Vec<Vec<(u16, u16)>> = build_pcdep_color_slots(
+        let pcdep_color_slots: Vec<Vec<(u8, u16, u16)>> = build_pcdep_color_slots(
             &pcdep_slot_var,
             &pcdep_slot_var_resume,
-            &splice_regallocs[Kind::Ref.index()].coloring,
-            &graph_regallocs[Kind::Ref.index()].coloring,
+            [
+                &splice_regallocs[Kind::Int.index()].coloring,
+                &splice_regallocs[Kind::Ref.index()].coloring,
+                &splice_regallocs[Kind::Float.index()].coloring,
+            ],
+            [
+                &graph_regallocs[Kind::Int.index()].coloring,
+                &graph_regallocs[Kind::Ref.index()].coloring,
+                &graph_regallocs[Kind::Float.index()].coloring,
+            ],
             &alloc_result.rename,
             code,
             &depth_at_pc,
@@ -12373,8 +12390,16 @@ impl CodeWriter {
             );
             validate_pcdep_color_map(
                 &pcdep_slot_var,
-                &splice_regallocs[Kind::Ref.index()].coloring,
-                &graph_regallocs[Kind::Ref.index()].coloring,
+                [
+                    &splice_regallocs[Kind::Int.index()].coloring,
+                    &splice_regallocs[Kind::Ref.index()].coloring,
+                    &splice_regallocs[Kind::Float.index()].coloring,
+                ],
+                [
+                    &graph_regallocs[Kind::Int.index()].coloring,
+                    &graph_regallocs[Kind::Ref.index()].coloring,
+                    &graph_regallocs[Kind::Float.index()].coloring,
+                ],
                 &alloc_result.rename,
                 code,
                 &depth_at_pc,
@@ -12392,8 +12417,16 @@ impl CodeWriter {
             // `inj_violations=0`).
             validate_pcdep_color_map(
                 &pcdep_slot_var_resume,
-                &splice_regallocs[Kind::Ref.index()].coloring,
-                &graph_regallocs[Kind::Ref.index()].coloring,
+                [
+                    &splice_regallocs[Kind::Int.index()].coloring,
+                    &splice_regallocs[Kind::Ref.index()].coloring,
+                    &splice_regallocs[Kind::Float.index()].coloring,
+                ],
+                [
+                    &graph_regallocs[Kind::Int.index()].coloring,
+                    &graph_regallocs[Kind::Ref.index()].coloring,
+                    &graph_regallocs[Kind::Float.index()].coloring,
+                ],
                 &alloc_result.rename,
                 code,
                 &depth_at_pc,
@@ -12517,7 +12550,7 @@ impl CodeWriter {
         has_abort: bool,
         num_regs: super::assembler::NumRegs,
         result_color_at_pc: Vec<u16>,
-        pcdep_color_slots: Vec<Vec<(u16, u16)>>,
+        pcdep_color_slots: Vec<Vec<(u8, u16, u16)>>,
         const_ref_slots_at_pc: Vec<Vec<(u16, i64)>>,
     ) -> PyJitCode {
         // call.py:167-169 — `(fnaddr, calldescr) = get_jitcode_calldescr(graph);
@@ -13998,7 +14031,8 @@ mod tests {
 
         // Drive `lv_live` via the per-PC map: color 0 (the live local `x`) maps
         // to slot 0, so the LV∩SSA retain keeps color 0 and drops color 7.
-        let pcdep_color_slots: Vec<Vec<(u16, u16)>> = vec![vec![(0, 0)]; code.instructions.len()];
+        let pcdep_color_slots: Vec<Vec<(u8, u16, u16)>> =
+            vec![vec![(1, 0, 0)]; code.instructions.len()];
         let (post_remove_live_indices, _after_call_post_merge, _first_insn_post_merge, _) =
             filter_liveness_in_place(
                 &mut ssarepr,
@@ -14068,7 +14102,8 @@ mod tests {
 
         // Drive `lv_live` via the per-PC map (color 0 = live local `x`), then
         // assert the splice path clears the Int/Float banks.
-        let pcdep_color_slots: Vec<Vec<(u16, u16)>> = vec![vec![(0, 0)]; code.instructions.len()];
+        let pcdep_color_slots: Vec<Vec<(u8, u16, u16)>> =
+            vec![vec![(1, 0, 0)]; code.instructions.len()];
         let (post_remove_live_indices, _after_call_post_merge, _first_insn_post_merge, _) =
             filter_liveness_in_place(
                 &mut ssarepr,

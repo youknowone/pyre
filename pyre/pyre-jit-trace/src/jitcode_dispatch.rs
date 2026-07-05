@@ -6532,7 +6532,7 @@ fn collect_outer_active_boxes(
     // so for them `pcdep_opt` is `None`, `semantic_ref_slot_for_reg_color`
     // returns `None`, and every live color falls to the `regs_r[color]`
     // walk-bank read.
-    let pcdep_entries: Vec<(u16, u16)> = if sym.jitcode.is_null() {
+    let pcdep_entries: Vec<(u8, u16, u16)> = if sym.jitcode.is_null() {
         Vec::new()
     } else {
         unsafe {
@@ -6545,7 +6545,7 @@ fn collect_outer_active_boxes(
                 .unwrap_or_default()
         }
     };
-    let pcdep_opt: Option<&[(u16, u16)]> =
+    let pcdep_opt: Option<&[(u8, u16, u16)]> =
         (!pcdep_entries.is_empty()).then(|| pcdep_entries.as_slice());
     // Int / Float bank diagnostic panic: pyre's banks are sized to the
     // jitcode's `num_regs_X`, which the codewriter co-publishes with the
@@ -9261,9 +9261,10 @@ fn kept_stack_has_boxed_int_hazard(
         for s in 0..depth {
             let slot = (nlocals + s) as u16;
             // Live Variable slot: inspect its concrete register value.
-            if let Some(color) =
-                pcdep.and_then(|e| e.iter().find_map(|&(c, sl)| (sl == slot).then_some(c)))
-            {
+            if let Some(color) = pcdep.and_then(|e| {
+                e.iter()
+                    .find_map(|&(b, c, sl)| (b == 1 && sl == slot).then_some(c))
+            }) {
                 let boxed = match concrete_registers_r.get(color as usize) {
                     Some(ConcreteValue::Int(v)) => !(0..256).contains(v),
                     Some(ConcreteValue::Ref(p)) => raw_is_boxed_int(*p),
@@ -12090,8 +12091,11 @@ fn try_walker_inline_user_call(
             // the callee entry PC.  A param dead at entry carries no entry
             // color — the body never reads it, so skip seeding rather than
             // clobber a live register.
-            Some(entries) => match entries.iter().find(|&&(_, slot)| slot as usize == i) {
-                Some(&(color, _)) => color as usize,
+            Some(entries) => match entries
+                .iter()
+                .find(|&&(b, _, slot)| b == 1 && slot as usize == i)
+            {
+                Some(&(_, color, _)) => color as usize,
                 None => continue,
             },
             // Portal / skeleton install (empty `pcdep_color_slots`): colors
