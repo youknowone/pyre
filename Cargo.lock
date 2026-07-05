@@ -2017,6 +2017,7 @@ dependencies = [
  "rustpython-compiler",
  "rustpython-compiler-core",
  "rustpython-host_env",
+ "rustpython-literal",
  "rustpython-sre_engine",
  "rustpython-wtf8",
  "siphasher",

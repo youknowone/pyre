@@ -71,62 +71,12 @@ unsafe fn dunder_returned_non_string(name: &str, result: PyObjectRef) -> crate::
     crate::PyError::type_error(format!("{name} returned non-string (type '{type_name}')"))
 }
 
-/// `pypy/objspace/std/floatobject.py W_FloatObject.descr_repr` parity.
-/// CPython prints lowercase `nan` / `inf`, uses scientific notation for
-/// magnitudes outside `[1e-4, 1e17)` (approximately), and otherwise
-/// uses positional form with at most 17 significant digits.  Pyre's
-/// approximation:
-///   - integral floats in the positional band → `"<n>.0"`
-///   - magnitude < 1e-4 or >= 1e16 → `"{:e}"` with explicit sign
-///   - otherwise → Rust's `Display` (`{}`)
+/// `floatobject.py W_FloatObject.descr_repr` — the shortest decimal string
+/// that round-trips to `val` (lowercase `nan`/`inf`, signed two-digit
+/// exponents, `.0` on integral values). Delegates to the shortest-repr
+/// formatter in `rustpython_literal::float`.
 pub(crate) fn format_float_repr(val: f64) -> String {
-    if val.is_nan() {
-        return "nan".to_string();
-    }
-    if val.is_infinite() {
-        return if val < 0.0 {
-            "-inf".to_string()
-        } else {
-            "inf".to_string()
-        };
-    }
-    let abs = val.abs();
-    if val == 0.0 {
-        return if val.is_sign_negative() {
-            "-0.0".to_string()
-        } else {
-            "0.0".to_string()
-        };
-    }
-    if abs >= 1e16 || abs < 1e-4 {
-        // Build `{m}e[+|-]NN` in CPython's float_repr style:
-        // exponent is signed, two-digit minimum.  Rust's `{:e}` emits
-        // unsigned exponent with no padding (`1e100`); rewrite to match
-        // CPython's `1e+100` / `1.5e-10`.
-        let raw = format!("{val:e}");
-        if let Some(epos) = raw.find('e') {
-            let (mantissa, exp) = raw.split_at(epos);
-            let exp = &exp[1..]; // drop 'e'
-            let (sign, mag) = if let Some(rest) = exp.strip_prefix('-') {
-                ("-", rest)
-            } else if let Some(rest) = exp.strip_prefix('+') {
-                ("+", rest)
-            } else {
-                ("+", exp)
-            };
-            let mag_padded = if mag.len() < 2 {
-                format!("0{mag}")
-            } else {
-                mag.to_string()
-            };
-            return format!("{mantissa}e{sign}{mag_padded}");
-        }
-        return raw;
-    }
-    if val.fract() == 0.0 {
-        return format!("{val:.1}");
-    }
-    format!("{val}")
+    rustpython_literal::float::to_string(val)
 }
 
 /// `rutf8.py:660 make_utf8_escape_function` (`quotes=True`) parity —

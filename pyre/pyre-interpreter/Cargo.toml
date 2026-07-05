@@ -26,6 +26,7 @@ pyre-object = { workspace = true }
 pyre-macros = { workspace = true }
 pyre-native = { workspace = true }
 rustpython-wtf8 = { workspace = true }
+rustpython-literal = { workspace = true }
 majit-gc = { workspace = true }
 majit-ir = { workspace = true }
 majit-macros = { workspace = true }

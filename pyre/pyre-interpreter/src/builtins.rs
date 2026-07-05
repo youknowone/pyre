@@ -4952,9 +4952,10 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
         if is_str(obj) {
             let s = w_str_get_value(obj);
             // `float_from_string` strips PEP 515 underscore separators
-            // (between digits only) before parsing.
+            // (between digits only) before parsing; the numeric conversion
+            // uses the Python-literal float grammar.
             if let Some(cleaned) = strip_numeric_underscores(s.trim()) {
-                if let Ok(v) = cleaned.parse::<f64>() {
+                if let Some(v) = rustpython_literal::float::parse_str(&cleaned) {
                     return Ok(floatobject::w_float_new(v));
                 }
             }
