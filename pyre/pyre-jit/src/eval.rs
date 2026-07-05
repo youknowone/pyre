@@ -3535,13 +3535,39 @@ fn for_iter_body_op_is_jit_safe(instr: pyre_interpreter::Instruction) -> bool {
             | I::GetIter
             | I::ForIter { .. }
             | I::EndFor
+            // sequence unpacking / tuple/slice build: stack-only operations
+            // that produce immutable objects, no heap mutation
+            | I::UnpackSequence { .. }
+            | I::UnpackEx { .. }
+            | I::BuildTuple { .. }
+            | I::BuildSlice { .. }
+            // read-only subscript/membership: lowered to residual calls,
+            // no heap mutation
+            | I::BinarySlice
+            | I::ContainsOp { .. }
+            // string formatting: produces immutable strings
+            | I::FormatSimple
+            | I::ConvertValue { .. }
+            | I::BuildString { .. }
+            // misc read-only: len(), iterator cleanup, local delete,
+            // closure variable read
+            | I::GetLen
+            | I::PopIter
+            | I::DeleteFast { .. }
+            | I::LoadDeref { .. }
             // function calls and global reads: the Layer 2 dynamic defense
             // (body_effect_candidate + fbw_foriter_inflight_take) handles
             // walk-abort safety, and inline sub-walks are declined when a
             // FOR_ITER item is in-flight (try_walker_inline_user_call).
             | I::Call { .. }
+            | I::CallKw { .. }
             | I::LoadGlobal { .. }
             | I::Resume { .. }
+            // container builders: produce new heap objects but do not mutate
+            // existing ones; walk-abort just drops the incomplete object
+            | I::BuildList { .. }
+            | I::BuildSet { .. }
+            | I::BuildMap { .. }
             // oparg prefix + inline-cache padding (no-ops in the body scan)
             | I::ExtendedArg
             | I::Cache
@@ -3650,9 +3676,7 @@ fn unsupported_jit_shape(code: &pyre_interpreter::CodeObject) -> UnsupportedJitS
         // side-exit resumes through the lossy carry-forward `pc_map` and lands
         // at the exceptional copy with an empty stack (see
         // `for_iter_frame_is_finally_duplicated`).
-        if !for_iter_bodies_all_jit_safe(code)
-            || for_iter_frame_is_finally_duplicated(code)
-        {
+        if !for_iter_bodies_all_jit_safe(code) || for_iter_frame_is_finally_duplicated(code) {
             return UnsupportedJitShape::CurrentFrameOnly;
         }
     }

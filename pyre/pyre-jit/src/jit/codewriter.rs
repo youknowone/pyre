@@ -12129,8 +12129,7 @@ impl CodeWriter {
             {
                 let mut scan_state = pyre_interpreter::OpArgState::default();
                 for scan_pc in 0..num_instrs {
-                    let (scan_instr, scan_arg) =
-                        scan_state.get(code.instructions[scan_pc]);
+                    let (scan_instr, scan_arg) = scan_state.get(code.instructions[scan_pc]);
                     if let Instruction::ForIter { delta } = scan_instr {
                         let exhaust_target = pyre_interpreter::jump_target_forward(
                             &code.instructions,

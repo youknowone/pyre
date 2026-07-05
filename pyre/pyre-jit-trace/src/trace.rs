@@ -1115,9 +1115,7 @@ fn run_perfn_walk(
             let num_regs_r = pjc.jitcode.num_regs_r() as usize;
             let stack_depth = sym.registers_r.len().saturating_sub(nl);
             // Read the live frame's locals_cells_stack_w for concrete ptrs.
-            let frame_ref = unsafe {
-                &*(cf_addr as *const pyre_interpreter::pyframe::PyFrame)
-            };
+            let frame_ref = unsafe { &*(cf_addr as *const pyre_interpreter::pyframe::PyFrame) };
             let frame_slots: &[pyre_object::PyObjectRef] = unsafe {
                 if !frame_ref.locals_cells_stack_w.is_null() {
                     (*frame_ref.locals_cells_stack_w).as_slice()

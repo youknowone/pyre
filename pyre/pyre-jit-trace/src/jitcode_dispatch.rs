@@ -6615,8 +6615,7 @@ fn collect_outer_active_boxes(
                         // iterator).  Read the shadow first; fall back to the
                         // walk register only when the shadow slot is NULL
                         // (a mid-opcode transient the portal never wrote).
-                        let shadow_is_real =
-                            vbox.is_some_and(|b| !opref_is_null_const_ptr(b));
+                        let shadow_is_real = vbox.is_some_and(|b| !opref_is_null_const_ptr(b));
                         if shadow_is_real {
                             vbox.unwrap_or_else(fallback)
                         } else {
