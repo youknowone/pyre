@@ -891,7 +891,7 @@ pub struct FuncType {
 }
 
 /// RPython `Struct`/`GcStruct` (`lltype.py:258-380`).
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Struct {
     pub _name: String,
     pub _flds: frozendict<ConcretetypePlaceholder>,
@@ -908,6 +908,19 @@ pub struct Struct {
     /// same distinction upstream Python makes via per-instance
     /// `_runtime_type_info` attrs.
     pub _runtime_type_info: Option<Box<_opaque>>,
+}
+
+impl std::fmt::Debug for Struct {
+    /// Parity with `Struct.__str__` short form (lltype.py:350-355):
+    /// `"Struct name { field_names }"` — the field NAMES only, never the
+    /// field TYPES in `_flds`. Descending into `_flds` re-expands
+    /// recursive / DAG-shared struct graphs (e.g. `pyframe::PyFrame`
+    /// reached through a `Ptr` in its own fields) into a
+    /// combinatorially huge string, overflowing the stack when a
+    /// `where_info` diagnostic formats a variable's concretetype.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Struct {} {{ {} }}", self._name, self._names.join(", "))
+    }
 }
 
 /// RPython `Array`/`GcArray` (`lltype.py:420-489`).
@@ -6945,6 +6958,36 @@ mod tests {
         let mut right_hasher = std::collections::hash_map::DefaultHasher::new();
         rhs.hash(&mut right_hasher);
         assert_eq!(left_hasher.finish(), right_hasher.finish());
+    }
+
+    #[test]
+    fn debug_of_recursive_struct_type_terminates() {
+        // A recursive struct type — a struct with a `Ptr` field pointing
+        // back to itself, e.g. `pyframe::PyFrame` — is legal. Formatting
+        // its `LowLevelType` must terminate instead of recursing forever:
+        // `Struct`'s `Debug` prints field NAMES only (`Struct.__str__`
+        // short form, lltype.py:350-355), so it never descends into
+        // `f_back`'s self-referential pointer type.
+        let fwd = ForwardReference::gc();
+        let s = Struct::gc(
+            "PyFrame",
+            vec![(
+                "f_back".into(),
+                LowLevelType::Ptr(Box::new(Ptr {
+                    TO: PtrTarget::ForwardReference(fwd.clone()),
+                })),
+            )],
+        );
+        fwd.r#become(LowLevelType::Struct(Box::new(s.clone()))).unwrap();
+
+        // Must format without overflowing the stack, both directly and
+        // through the resolved forward reference.
+        let via_struct = format!("{:?}", LowLevelType::Struct(Box::new(s)));
+        assert!(via_struct.contains("Struct PyFrame"), "{via_struct}");
+        assert!(via_struct.contains("f_back"), "{via_struct}");
+
+        let via_fwd = format!("{:?}", LowLevelType::ForwardReference(Box::new(fwd)));
+        assert!(via_fwd.contains("PyFrame"), "{via_fwd}");
     }
 
     #[test]

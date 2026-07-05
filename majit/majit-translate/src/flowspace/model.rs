@@ -3508,7 +3508,6 @@ pub type LinkArg = Option<Hlvalue>;
 ///
 /// `__slots__ = "args target exitcase llexitcase prevblock
 ///              last_exception last_exc_value".split()`.
-#[derive(Debug)]
 pub struct Link {
     /// RPython `Link.args` — mixed list of var/const, with transient
     /// merge links allowed to carry `None` for undefined locals.
@@ -3534,6 +3533,33 @@ pub struct Link {
     pub last_exception: Option<Hlvalue>,
     /// RPython `Link.last_exc_value` — sibling of `last_exception`.
     pub last_exc_value: Option<Hlvalue>,
+}
+
+impl std::fmt::Debug for Link {
+    /// Parity with `Link.__repr__` (model.py:161): the shallow
+    /// `"link from <prevblock> to <target>"` form. `str()` on the endpoint
+    /// blocks is `Block::str_repr` (`Block.__str__`), which never follows
+    /// `Block.exits` — so, unlike `#[derive(Debug)]`, formatting a Link
+    /// cannot recurse around the `Block.exits`/`Link.target` CFG cycle.
+    /// Borrows defensively: a Debug may run from a panic/error path with an
+    /// endpoint block already borrowed.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fn block_str(b: &BlockRef) -> String {
+            match b.try_borrow() {
+                Ok(block) => block.str_repr(),
+                Err(_) => "<block>".to_string(),
+            }
+        }
+        let prevblock = match self.prevblock.as_ref().and_then(Weak::upgrade) {
+            Some(rc) => block_str(&rc),
+            None => "None".to_string(),
+        };
+        let target = match &self.target {
+            Some(rc) => block_str(rc),
+            None => "None".to_string(),
+        };
+        write!(f, "link from {prevblock} to {target}")
+    }
 }
 
 impl Link {
@@ -3635,7 +3661,6 @@ impl Link {
 ///
 /// `__slots__ = "inputargs operations exitswitch exits blockcolor
 ///              generation".split()`.
-#[derive(Debug)]
 pub struct Block {
     /// RPython `Block.inputargs` — mixed list of variable/const.
     pub inputargs: Vec<Hlvalue>,
@@ -3656,7 +3681,50 @@ pub struct Block {
     pub generation: Option<u32>,
 }
 
+impl std::fmt::Debug for Block {
+    /// Parity with `Block.__repr__` / `Block.__str__` (model.py:191-212):
+    /// a shallow one-line summary (`block@<offset> with <n> exits`), never
+    /// the full recursive dump of inputarg annotations, operations and
+    /// exits that `#[derive(Debug)]` produces. Descending through each
+    /// inputarg's `annotation` (SomeValue) and `concretetype`
+    /// (LowLevelType) — both self-referential for recursive types such as
+    /// `pyframe::PyFrame` — overflows the stack when a `where_info`
+    /// diagnostic formats a block (rtyper.rs `with_where`).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Block.__repr__
+        write!(f, "{} with {} exits", self.str_repr(), self.exits.len())?;
+        if let Some(sw) = &self.exitswitch {
+            write!(f, "({sw})")?;
+        }
+        Ok(())
+    }
+}
+
 impl Block {
+    /// RPython `Block.__str__` (model.py:191): the shallow one-line label
+    /// (`block@<offset>[<inputarg>...]`, or `return`/`raise`/`codeless
+    /// block`). Never follows `exits`, so it is safe to format from a
+    /// `Link` endpoint without recursing around the CFG cycle.
+    pub(crate) fn str_repr(&self) -> String {
+        let mut txt = if let Some(op) = self.operations.first() {
+            format!("block@{}", op.offset)
+        } else if self.exits.is_empty() && self.inputargs.len() == 1 {
+            "return block".to_string()
+        } else if self.exits.is_empty() && self.inputargs.len() == 2 {
+            "raise block".to_string()
+        } else {
+            "codeless block".to_string()
+        };
+        if let Some(first) = self.inputargs.first() {
+            if self.inputargs.len() > 1 {
+                txt = format!("{txt}[{first}...]");
+            } else {
+                txt = format!("{txt}[{first}]");
+            }
+        }
+        txt
+    }
+
     /// RPython `Block.__init__(inputargs)`.
     pub fn new(inputargs: Vec<Hlvalue>) -> Self {
         Block {
@@ -6119,5 +6187,27 @@ mod tests {
             HostObject::new_class("pkg.C", vec![]),
         );
         assert!(bm.is_host_executable());
+    }
+
+    #[test]
+    fn debug_of_cyclic_block_and_link_terminates() {
+        // A block whose sole exit links back to itself is a legal CFG
+        // cycle (`while True: pass`). `#[derive(Debug)]` walked
+        // Block.exits -> Link.target -> Block.exits ... forever and
+        // overflowed the stack when a diagnostic formatted it. The shallow
+        // Block.__str__ / Link.__repr__ reprs must terminate instead.
+        let v = Hlvalue::Variable(Variable::new());
+        let blk: BlockRef = Rc::new(RefCell::new(Block::new(vec![v.clone()])));
+        let link = Link::new(vec![v], Some(blk.clone()), None).into_ref();
+        // BlockRefExt::closeblock wires link.prevblock = blk and
+        // blk.exits = [link], closing the self-loop.
+        blk.closeblock(vec![link.clone()]);
+
+        let link_repr = format!("{:?}", link.borrow());
+        assert!(link_repr.starts_with("link from "), "got: {link_repr}");
+        assert!(link_repr.matches("block").count() >= 1, "got: {link_repr}");
+
+        let block_repr = format!("{:?}", blk.borrow());
+        assert!(block_repr.contains("with 1 exits"), "got: {block_repr}");
     }
 }

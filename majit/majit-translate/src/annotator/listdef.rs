@@ -35,6 +35,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
+use std::fmt;
 use std::rc::{Rc, Weak};
 
 use super::bookkeeper::{Bookkeeper, PositionKey};
@@ -512,9 +513,73 @@ pub(crate) struct ListDefInner {
 }
 
 /// RPython `class ListDef` (listdef.py:120-204).
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ListDef {
     pub(crate) inner: Rc<ListDefInner>,
+}
+
+thread_local! {
+    /// Recursion guard for `Debug` of the interior-mutable annotation
+    /// nodes ([`ListDef`] / [`super::dictdef::DictDef`]), whose shared
+    /// `listitem` can point back to a `SomeValue::List` / `Dict` that
+    /// owns them — a legal self-referential annotation such as
+    /// `l = []; l.append(l)`. Mirrors the thread-local `reprdict` guard
+    /// in `SomeObject.__repr__` (model.py:68-90): a node already being
+    /// formatted renders as an elision instead of recursing forever.
+    static REPR_GUARD: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+}
+
+/// RAII token for [`REPR_GUARD`]. [`ReprGuard::enter`] returns `None`
+/// when `id` is already on the stack (a cycle), signalling the caller
+/// to elide rather than recurse; the pushed id is popped on drop.
+pub(crate) struct ReprGuard(usize);
+
+impl ReprGuard {
+    pub(crate) fn enter(id: usize) -> Option<ReprGuard> {
+        REPR_GUARD.with(|g| {
+            let mut g = g.borrow_mut();
+            if g.contains(&id) {
+                None
+            } else {
+                g.push(id);
+                Some(ReprGuard(id))
+            }
+        })
+    }
+}
+
+impl Drop for ReprGuard {
+    fn drop(&mut self) {
+        REPR_GUARD.with(|g| {
+            let mut g = g.borrow_mut();
+            if let Some(pos) = g.iter().rposition(|&x| x == self.0) {
+                g.remove(pos);
+            }
+        });
+    }
+}
+
+impl fmt::Debug for ListDef {
+    /// Parity with `ListDef.__repr__` (listdef.py:175):
+    /// `'<[%r]%s%s%s%s>'`, recursion-guarded so a self-referential
+    /// element type elides instead of overflowing the stack.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let id = Rc::as_ptr(&self.inner) as usize;
+        let Some(_guard) = ReprGuard::enter(id) else {
+            return f.write_str("<[...]>");
+        };
+        let li = self.inner.listitem.borrow();
+        let item = li.borrow();
+        write!(
+            f,
+            "<[{:?}]{}{}{}{}>",
+            item.s_value,
+            if item.mutated { "m" } else { "" },
+            if item.resized { "r" } else { "" },
+            if item.immutable { "I" } else { "" },
+            if item.must_not_resize { "!R" } else { "" },
+        )
+    }
 }
 
 impl ListDef {
@@ -791,6 +856,22 @@ mod tests {
 
     fn bk() -> Rc<Bookkeeper> {
         Rc::new(Bookkeeper::new())
+    }
+
+    #[test]
+    fn debug_of_self_referential_list_terminates() {
+        use super::super::model::SomeList;
+        // A list whose element type is itself (RPython `l = []; l.append(l)`)
+        // is a legal, self-referential annotation. Formatting it must break
+        // the cycle instead of recursing forever, mirroring the reprdict
+        // recursion guard in `SomeObject.__repr__` (model.py:68).
+        let ld = ListDef::new(None, SomeValue::Impossible, false, false);
+        // Close the cycle: listitem.s_value := SomeList(ld).
+        ld.listitem_rc().borrow_mut().s_value =
+            SomeValue::List(SomeList::new(ld.clone()));
+        // Must terminate (no stack overflow) and mark the elided cycle.
+        let rendered = format!("{:?}", SomeValue::List(SomeList::new(ld.clone())));
+        assert!(rendered.contains("..."), "cycle not elided: {rendered}");
     }
 
     #[test]
