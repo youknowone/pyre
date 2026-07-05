@@ -7227,6 +7227,19 @@ pub(crate) fn fbw_builtin_fold_enabled() -> bool {
 /// switch); verified byte-exact on synth dynasm + cranelift and GC-soak clean
 /// under `PYPY_GC_NURSERY=131072` on instance-heavy benches.
 fn fbw_loadattr_fold_enabled() -> bool {
+    // The fold's guarded inline read (guard_class + guard_value(map) +
+    // getfield(storage) + getarrayitem) is correct on the native backends,
+    // but its guards' resume snapshot does not round-trip through the wasm
+    // blackhole-resume decoder: wasm re-enters `blackhole_from_resumedata` on
+    // every guard exit (no bridge chaining, #62), and a folded read that flows
+    // into a later deopt either indexes an empty const pool (`decode_ref`
+    // panic) or materialises the wrong slot value (a closure `cell` read as a
+    // plain attribute).  wasm also gains nothing from the fold — the hot loop
+    // still runs interpreter-bound there (#62), so the residual it replaces is
+    // not on wasm's critical path.  Disable on wasm; keep it on natively.
+    if cfg!(target_arch = "wasm32") {
+        return false;
+    }
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_LOADATTR_FOLD") {
         Some(v) => {
