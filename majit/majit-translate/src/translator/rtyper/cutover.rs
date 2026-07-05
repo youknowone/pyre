@@ -794,6 +794,85 @@ fn switch_discriminant_read_vars(graph: &LegacyGraph) -> std::collections::HashS
     out
 }
 
+/// Results of a variant-payload `FieldRead` whose *only* op consumer is a
+/// `FieldWrite` of the same field name — the extract-then-repack of an
+/// identity `match` re-wrap (`match step { Return(v) => Ok(Return(v)),
+/// CloseLoop { jump_args, loop_header_pc } => Ok(CloseLoop { .. }), … }`,
+/// `pyopcode.rs:1945`).  Each arm reads the incoming variant's payload
+/// (`FieldRead("__pos_0" | "loop_header_pc", owner = StepResult::Variant)`)
+/// and immediately writes it into a freshly-built outgoing variant
+/// (`FieldWrite(same field, owner = StepResult<…>::Variant)`).
+///
+/// The real path lowers the enclosing `Result` through the uniform
+/// exception-transform (`front/result_exc.rs`), which recognises the `Ok(step)`
+/// identity and **elides** the whole extract-repack, so the legacy read result
+/// is never typed under its own Variable identity (`real=None`) — the same
+/// rebuilt-block artifact as [`switch_discriminant_read_vars`], for the payload
+/// projection rather than the tag.  Requiring the sole op-use to be a same-name
+/// `FieldWrite` keeps this from over-reaching a payload the arm actually
+/// consumes (a non-identity `match` that transforms the value flows the read
+/// into some other op, so it is excluded).
+fn repack_payload_read_vars(graph: &LegacyGraph) -> std::collections::HashSet<Variable> {
+    use crate::model::OpKind;
+    // For each candidate FieldRead result, the field name it reads.
+    let mut read_field: HashMap<Variable, String> = HashMap::new();
+    for block in &graph.blocks {
+        for op in &block.operations {
+            if let (Some(r), OpKind::FieldRead { field, .. }) = (&op.result, &op.kind)
+                && field.name != "__discriminant"
+            {
+                read_field.insert(r.clone(), field.name.clone());
+            }
+        }
+    }
+    if read_field.is_empty() {
+        return std::collections::HashSet::new();
+    }
+    // Tally every op-use of each candidate: `repack` counts a use as the
+    // `value` operand of a same-field `FieldWrite`; `other` counts any other
+    // op-use.  A candidate survives only when it has ≥1 repack use and no
+    // other use (a genuinely consumed payload has an `other` use).
+    let mut repack_use: HashMap<Variable, bool> = HashMap::new();
+    let mut other_use: std::collections::HashSet<Variable> = std::collections::HashSet::new();
+    for block in &graph.blocks {
+        for op in &block.operations {
+            // A same-field `FieldWrite` value operand is the repack use; the
+            // `base` operand (the target struct) is a different use and is
+            // handled by the generic operand scan below.
+            if let OpKind::FieldWrite {
+                field,
+                value: crate::model::LinkArg::Value(v),
+                ..
+            } = &op.kind
+                && let Some(read_name) = read_field.get(v)
+                && *read_name == field.name
+            {
+                repack_use.insert(v.clone(), true);
+            }
+            for used in crate::front::result_exc::op_operand_vars(&op.kind) {
+                if !read_field.contains_key(&used) {
+                    continue;
+                }
+                // Re-derive whether THIS op is the matching same-field
+                // `FieldWrite` value use; every other operand position counts
+                // as an `other` use that disqualifies the candidate.
+                let is_repack_value = matches!(
+                    &op.kind,
+                    OpKind::FieldWrite { field, value: crate::model::LinkArg::Value(vv), .. }
+                        if vv == &used && read_field.get(&used) == Some(&field.name)
+                );
+                if !is_repack_value {
+                    other_use.insert(used);
+                }
+            }
+        }
+    }
+    read_field
+        .into_keys()
+        .filter(|v| repack_use.contains_key(v) && !other_use.contains(v))
+        .collect()
+}
+
 /// Whether an op's result may be dropped when unread, mirroring RPython's
 /// `transform_dead_op_vars` `canremove(op, block)` gate (`simplify.py:441`):
 /// only side-effect-free ops (`op.opname in CanRemove`) have their result
@@ -848,6 +927,7 @@ fn collect_divergences(
     let duplicate_inputargs = duplicate_inputarg_vars(legacy_graph);
     let dead_op_results = dead_op_result_vars(legacy_graph);
     let switch_discriminant_reads = switch_discriminant_read_vars(legacy_graph);
+    let repack_payload_reads = repack_payload_read_vars(legacy_graph);
     let mut divergences = Vec::new();
     for (pos, var) in legacy_graph.iter_variables().iter().enumerate() {
         // `iterblocks()` parity: the real path annotates only the
@@ -963,11 +1043,18 @@ fn collect_divergences(
         // types and switches on its own tag.  See [`switch_discriminant_read_vars`].
         let real_rebuilt_switch_discriminant =
             real_present.is_none() && switch_discriminant_reads.contains(var);
+        // A variant-payload read whose sole consumer is the identity re-wrap's
+        // repacking `FieldWrite`: the real path's exc-transform elided the
+        // extract-repack, so the legacy read is untyped.  See
+        // [`repack_payload_read_vars`].
+        let real_elided_repack_payload =
+            real_present.is_none() && repack_payload_reads.contains(var);
         let diverges = if real_refines_gcref_to_void
             || real_refines_gcref_to_signed
             || real_dropped_duplicate_inputarg
             || real_dropped_dead_op_result
             || real_rebuilt_switch_discriminant
+            || real_elided_repack_payload
         {
             false
         } else if legacy_kind != ConcreteType::Unknown {
@@ -3717,6 +3804,90 @@ mod tests {
         assert!(
             !switch_discriminant_read_vars(&fwd_graph).contains(&disc_f),
             "a forward-only __discriminant read is NOT classified"
+        );
+    }
+
+    /// Build a single block that reads `base.field` into `pay` and, when
+    /// `repack` is set, writes `pay` back into `dst.field` (the extract→repack
+    /// of an identity `match` re-wrap).  With `repack=false` the read result
+    /// is instead fed to a `Call` (a genuine consumer), so it is NOT a repack
+    /// payload.
+    fn build_payload_graph(repack: bool) -> (LegacyGraph, Variable) {
+        let mut graph = LegacyGraph::new("payload_probe");
+        let vars = mint_vars(&mut graph, 4);
+        let base = vars[0].clone();
+        let pay = vars[1].clone();
+        let dst = vars[2].clone();
+        let field = crate::model::FieldDescriptor {
+            name: "loop_header_pc".to_string(),
+            owner_root: Some("StepResult::CloseLoop".to_string()),
+            owner_id: None,
+        };
+        let read = crate::model::SpaceOperation {
+            result: Some(pay.clone()),
+            kind: crate::model::OpKind::FieldRead {
+                base: base.clone(),
+                field: field.clone(),
+                ty: ValueType::Int,
+                pure: false,
+            },
+        };
+        let consumer = if repack {
+            crate::model::SpaceOperation {
+                result: None,
+                kind: crate::model::OpKind::FieldWrite {
+                    base: dst.clone(),
+                    field: crate::model::FieldDescriptor {
+                        name: "loop_header_pc".to_string(),
+                        owner_root: Some(
+                            "pyre_interpreter::pyopcode::StepResult<*mut PyObject>::CloseLoop"
+                                .to_string(),
+                        ),
+                        owner_id: None,
+                    },
+                    value: crate::model::LinkArg::Value(pay.clone()),
+                    ty: ValueType::Ref(None),
+                },
+            }
+        } else {
+            crate::model::SpaceOperation {
+                result: Some(dst.clone()),
+                kind: crate::model::OpKind::Call {
+                    target: crate::model::CallTarget::FunctionPath {
+                        segments: vec!["consume".into()],
+                    },
+                    args: vec![pay.clone()],
+                    result_ty: ValueType::Int,
+                },
+            }
+        };
+        let block = Block {
+            id: graph.startblock,
+            inputargs: block_inputargs(&vars, &[0]),
+            operations: vec![read, consumer],
+            exitswitch: None,
+            exits: vec![link_to_returnblock(vec![], graph.returnblock)],
+            framestate: None,
+            dead: false,
+        };
+        graph.blocks = vec![block];
+        (graph, pay)
+    }
+
+    #[test]
+    fn repack_payload_read_vars_classifies_only_same_field_writeback() {
+        // A payload read whose sole consumer is a same-field `FieldWrite` is
+        // the extract→repack artifact and is classified; the same read fed to
+        // any other op (here a `Call`) is a genuine use and is NOT classified.
+        let (repack_graph, pay_r) = build_payload_graph(true);
+        assert!(
+            repack_payload_read_vars(&repack_graph).contains(&pay_r),
+            "a payload read consumed only by a same-field FieldWrite is classified"
+        );
+        let (consumed_graph, pay_c) = build_payload_graph(false);
+        assert!(
+            !repack_payload_read_vars(&consumed_graph).contains(&pay_c),
+            "a payload read fed to a real consumer is NOT classified"
         );
     }
 
