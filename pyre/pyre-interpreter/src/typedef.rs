@@ -910,6 +910,7 @@ pub fn init_typeobjects() {
     });
 
     patch_builtin_function_descriptors();
+    patch_frame_traceback_descriptors();
     patch_getset_descriptor_metadata();
     patch_typeobject_descriptor_names();
 }
@@ -6720,6 +6721,46 @@ fn patch_builtin_function_descriptors() {
                 // mutate / write back dance.
                 unsafe { pyre_object::typedef::w_getset_set_reqcls(descr, bf_type) };
             }
+        }
+    }
+}
+
+/// typedef.py:736-770 — `PyFrame.typedef` / `PyTraceback.typedef` build
+/// their getsets as `GetSetProperty(PyFrame.fget_*, cls=PyFrame)` /
+/// `GetSetProperty(PyTraceback.descr_*, cls=PyTraceback)`.  The `cls`
+/// stamps `reqcls`, so a getset invoked with a foreign receiver
+/// (`type(f).f_code.__get__(1, int)`) raises the descriptor
+/// `TypeError` in `__get__`/`__set__` instead of reaching the closure,
+/// which casts the receiver straight to `*mut PyFrame` /
+/// `*mut PyTraceback` and would otherwise read at struct offsets on
+/// arbitrary memory.  The frame/traceback getsets are created
+/// reqcls-less (`make_getset_descriptor_named`), so patch the slot in
+/// place once both typeobjects exist — the same shape as
+/// `patch_builtin_function_descriptors`.
+fn patch_frame_traceback_descriptors() {
+    for layout in [
+        &crate::pyframe::FRAME_TYPE as *const PyType,
+        &crate::pytraceback::PYTRACEBACK_TYPE as *const PyType,
+    ] {
+        let w_type = gettypefor(layout).unwrap_or(pyre_object::PY_NULL);
+        if w_type.is_null() {
+            continue;
+        }
+        let dict_ptr = unsafe { pyre_object::w_type_get_dict_ptr(w_type) } as *mut DictStorage;
+        if dict_ptr.is_null() {
+            continue;
+        }
+        let ns = unsafe { &*dict_ptr };
+        let descrs: Vec<PyObjectRef> = ns
+            .entries()
+            .filter_map(|(_, &descr)| {
+                (!descr.is_null()
+                    && unsafe { pyre_object::typedef::is_getset_property(descr) })
+                .then_some(descr)
+            })
+            .collect();
+        for descr in descrs {
+            unsafe { pyre_object::typedef::w_getset_set_reqcls(descr, w_type) };
         }
     }
 }

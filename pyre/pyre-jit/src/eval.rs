@@ -4034,6 +4034,23 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                 } {
                     return LoopResult::Done(Err(err));
                 }
+                // A trace callback may perform a debugger line-jump by
+                // setting `frame.f_lineno` (`fset_f_lineno` → `last_instr
+                // = best_addr`).  The opcode for this iteration was
+                // decoded from the pre-jump `pc`; honour the jump by
+                // restarting the loop so the target is re-decoded,
+                // mirroring the interpreter loop's post-trace redirect.
+                // The baseline set before the trace is `last_instr =
+                // opcode_pc` (line above); a moved `last_instr` is the
+                // jump target.  This loop reads `pc = frame.next_instr()`
+                // (= `last_instr + 1`) at the top, so rebase the target
+                // through `set_last_instr_from_next_instr` for the next
+                // iteration to land on it rather than one past it.
+                if frame.last_instr as usize != opcode_pc {
+                    let jump_target = frame.last_instr as usize;
+                    frame.set_last_instr_from_next_instr(jump_target);
+                    continue;
+                }
             } else {
                 // executioncontext.py:163-165 — `actionflag.
                 // decrement_ticker(decr_by)` runs every bytecode, and

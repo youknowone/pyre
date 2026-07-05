@@ -2367,12 +2367,15 @@ impl PyFrame {
         )
     }
 
-    /// pyframe.py:805-846 descr_clear — `F.clear()`: clear most references
-    /// held by the frame.  Refuses on an executing (non-generator) frame or
-    /// a running generator; otherwise clears `w_f_trace`, resets `w_locals`
-    /// to a fresh dict, and replaces every local / cell / free var / stack
-    /// slot (cells are rebound to fresh empty cells so a shared inner/outer
-    /// cell is not mutated).
+    /// `frame_clear` (`frame.clear()`): clear most references held by the
+    /// frame.  Refuses on an executing (non-generator) frame or a running
+    /// generator (`"cannot clear an executing frame"`) and on a generator
+    /// frame suspended at a `yield` (`"cannot clear a suspended frame"`);
+    /// a not-yet-started or already-exhausted generator is finalized
+    /// (marked exhausted).  Otherwise clears `w_f_trace`, resets
+    /// `w_locals` to a fresh dict, and replaces every local / cell / free
+    /// var / stack slot (cells are rebound to fresh empty cells so a
+    /// shared inner/outer cell is not mutated).
     pub fn descr_clear(&mut self) -> Result<(), crate::PyError> {
         if !self.frame_finished_execution {
             if !self._is_generator_or_coroutine() {
@@ -2387,6 +2390,19 @@ impl PyFrame {
                         "cannot clear an executing frame",
                     ));
                 }
+                // A generator started but not exhausted is suspended at a
+                // `yield`; clearing it would drop the live operand stack
+                // out from under a later `resume`, so refuse.
+                let suspended = unsafe {
+                    pyre_object::generator::w_generator_is_started(w_gen)
+                        && !pyre_object::generator::w_generator_is_exhausted(w_gen)
+                };
+                if suspended {
+                    return Err(crate::PyError::runtime_error(
+                        "cannot clear a suspended frame",
+                    ));
+                }
+                // Not started or already exhausted: finalize.
                 unsafe { pyre_object::generator::w_generator_set_exhausted(w_gen) };
             }
         }
