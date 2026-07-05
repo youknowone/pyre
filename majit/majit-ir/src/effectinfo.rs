@@ -653,6 +653,20 @@ pub enum PyreHelperKind {
     /// rejects.  `kwnames` (arg index 2) is the constant kwnames tuple and
     /// is always a live Ref.
     CallKw,
+    /// `load_attr_fn(obj, code, name_idx)` — the plain (non-method) LOAD_ATTR
+    /// residual (`lower_getattr_hlop_to_insn` → `space.getattr`).  The Ref
+    /// operands are the receiver and the jitcode's own PyCode; the Int operand
+    /// is the co_names index.  The full-body walker recognises this tag to fold
+    /// a monomorphic instance-attribute read (`mapdict.py:1479-1537
+    /// LOAD_ATTR_caching`) to `guard_class(obj, w_type)` +
+    /// `guard_value(getfield(obj, map), map)` + `getfield(obj, storage)` +
+    /// `getarrayitem_gc_r(block, C_storageindex)` (the inline read
+    /// `mapdict.py:914-916 _mapdict_read_storage`), eliding the opaque
+    /// `CALL_MAY_FORCE` MRO-walk residual.  Falls through to the residual for
+    /// every shape the storage read cannot cover (non-instance receiver, custom
+    /// `__getattribute__`, data descriptor, unboxed slot, attribute absent from
+    /// this instance's map).
+    LoadAttr,
 }
 
 impl EffectInfo {

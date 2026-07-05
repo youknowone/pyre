@@ -5191,7 +5191,15 @@ where
         Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
         _ => return None,
     };
-    let effect_info = effect_info_for_call_flavor(CallFlavor::MayForce);
+    let mut effect_info = effect_info_for_call_flavor(CallFlavor::MayForce);
+    // Tag the LOAD_ATTR helper calldescr so the full-body walker recognizes the
+    // call and folds a monomorphic instance-attribute read to a guarded inline
+    // storage read (`try_walker_specialize_load_attr`) instead of recording the
+    // opaque `CALL_MAY_FORCE` getattr MRO-walk.  The tag is the recognition
+    // vehicle (the walker crate cannot match the helper by fnaddr); a decline
+    // falls back to this same residual, so tagging is behaviour-preserving when
+    // the fold is disabled or the receiver shape is unsupported.
+    effect_info.pyre_helper = majit_ir::PyreHelperKind::LoadAttr;
     let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
         effect_info,
         arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Int],
