@@ -1937,6 +1937,31 @@ thread_local! {
             &pyre_object::pyobject::COMPLEX_TYPE as *const _ as usize,
             w_complex_tid,
         );
+        // `W_ObjectObject.storage` block — the mapdict instance attribute-value
+        // array (`mapdict.py:910`, `Ptr(GcArray(OBJECTPTR))`).  Registered as a
+        // GC **leaf** varsize (`items_have_gc_ptrs=false`): the block is a MIXED
+        // boxed/unboxed array (a `firstunwrapped` unboxed slot holds a raw
+        // `*mut Vec<i64>`, not an object), so the collector must NOT inline-walk
+        // its items as `PY_OBJECT_ARRAY_GC_TYPE_ID` (9) does.  The owning
+        // instance's `object_object_custom_trace` walks the interior instead,
+        // consulting the map to skip unboxed slots
+        // (`instance_walk_boxed_storage`), and forwards this block pointer to
+        // keep the (non-moving, stable-allocated) block marked live.  Length at
+        // offset 0 (the `ItemsBlock.capacity` header), 8-byte ref items.
+        // Registered here, immediately after `W_COMPLEX_GC_TYPE_ID = 54`, so it
+        // takes tid 55 before the runtime-numbered `#[pyre_class]` / per-ExcKind
+        // registrations below.
+        let w_mapdict_storage_tid = gc.register_type(TypeInfo::varsize(
+            pyre_object::object_array::ITEMS_BLOCK_ITEMS_OFFSET,
+            std::mem::size_of::<pyre_object::pyobject::PyObjectRef>(),
+            0,
+            false,
+            Vec::new(),
+        ));
+        debug_assert_eq!(
+            w_mapdict_storage_tid,
+            pyre_object::object_array::W_MAPDICT_STORAGE_GC_TYPE_ID,
+        );
         // `#[pyre_class]`-emitted typed-payload registrations.  Each
         // entry is one line consuming the macro-generated
         // `PyreClassDescriptor` static; `register_pyre_class` asserts

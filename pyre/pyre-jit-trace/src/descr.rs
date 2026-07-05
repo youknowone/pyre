@@ -1867,6 +1867,22 @@ pub fn object_map_descr() -> DescrRef {
     )
 }
 
+/// `W_ObjectObject.storage` (`objectobject.rs:40`) — `self.storage` of
+/// `MapdictStorageMixin` (`mapdict.py:910`), a `Ptr(GcArray(OBJECTPTR))` block
+/// of attribute values. Read as a `Ref` (the block pointer) so the LOAD_ATTR
+/// fast path can then `getarrayitem_gc_r` the value at the green-constant
+/// `storageindex` (`mapdict.py:914-916` `_mapdict_read_storage`), mirroring
+/// `list_items_descr` → `pyobject_gcarray_descr`. Mutable: STORE_ATTR grows /
+/// replaces the block.
+pub fn object_storage_descr() -> DescrRef {
+    make_field_descr(
+        core::mem::offset_of!(pyre_object::W_ObjectObject, storage),
+        8,
+        Type::Ref,
+        false,
+    )
+}
+
 /// rlist.py:116 `l.length` — live length of a list under the Object
 /// strategy. Under Integer/Float strategies this field is 0 and
 /// consumers must dispatch on `list.strategy` first.

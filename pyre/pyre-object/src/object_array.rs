@@ -26,6 +26,19 @@ pub const GC_INT_ARRAY_GC_TYPE_ID: u32 = 41;
 /// `GcLLDescr_framework.init_array_descr`.
 pub const GC_FLOAT_ARRAY_GC_TYPE_ID: u32 = 42;
 
+/// GC type id for the `W_ObjectObject.storage` block — the mapdict instance
+/// attribute-value array (`mapdict.py:910` `self.storage`, a
+/// `Ptr(GcArray(OBJECTPTR))`). Distinct from `PY_OBJECT_ARRAY_GC_TYPE_ID` (9,
+/// list/tuple items) because the mapdict storage is a MIXED array: most slots
+/// are boxed `PyObjectRef`, but a `firstunwrapped` `UnboxedPlainAttribute` slot
+/// holds a raw erased `*mut Vec<i64>` that must NOT be forwarded as an object.
+/// So this tid is registered as a GC **leaf** (`items_have_gc_ptrs=false`) — the
+/// collector does not walk the block's interior; the owning instance's
+/// `object_object_custom_trace` walks it instead, consulting the map to skip
+/// unboxed slots (`instance_walk_boxed_storage`). Registered at the tail of the
+/// tid chain (after `W_COMPLEX_GC_TYPE_ID = 54`) so no hardcoded constant shifts.
+pub const W_MAPDICT_STORAGE_GC_TYPE_ID: u32 = 55;
+
 /// `#[repr(C)] { capacity, items: [PyObjectRef; 0] }` — the single-block
 /// inline-varsize GcArray body used by `W_ListObject.items` /
 /// `W_TupleObject.items` / `DictStorage.values`.
@@ -160,6 +173,90 @@ pub unsafe fn grow_list_items_block(
 /// `alloc_list_items_block` / `grow_list_items_block`. No-op on null.
 pub unsafe fn dealloc_list_items_block(block: *mut ItemsBlock) {
     unsafe { dealloc_items_block(block) }
+}
+
+// ─── mapdict instance-storage block: stable GcArray(OBJECTPTR) ────────────
+//
+// `W_ObjectObject.storage` (`mapdict.py:910` `self.storage`) is a
+// `Ptr(GcArray(OBJECTPTR))`. Unlike list/tuple item blocks (nursery,
+// `PY_OBJECT_ARRAY_GC_TYPE_ID`, inline-traced), the mapdict storage is a MIXED
+// boxed/unboxed array, so it is allocated `stable` (non-moving old-gen) under a
+// LEAF tid (`W_MAPDICT_STORAGE_GC_TYPE_ID`) and its interior is walked only by
+// the instance's `object_object_custom_trace` (map-masked). Stable allocation
+// mirrors the instance's own `try_gc_alloc_stable` (objectobject.rs) and the
+// `TypedItemsBlock` int/float backing blocks: a non-moving block means the
+// instance's `storage` pointer never needs rewriting on a minor GC, and the
+// `try_gc_alloc_stable` hook does not collect, so no shadow-stack pinning of the
+// incoming values is needed (unlike the collecting-nursery `*_gc` allocators).
+
+/// Allocate a fresh stable `ItemsBlock` holding `values`, tagged
+/// `W_MAPDICT_STORAGE_GC_TYPE_ID` (leaf). Capacity is exactly `values.len()`
+/// (mapdict grows one attribute at a time, mapdict.py:942-959; the map is the
+/// length authority so no overallocation is needed). Every slot is written, so
+/// the block is safe to expose to the collector immediately. Falls back to the
+/// `std::alloc` [`alloc_items_block`] when no GC hook is installed (pure
+/// interpreter / early startup). A 0-length `values` yields a header-only block.
+pub unsafe fn alloc_instance_items_block(values: &[PyObjectRef]) -> *mut ItemsBlock {
+    let cap = values.len();
+    unsafe {
+        let block = alloc_mapdict_storage_block(cap);
+        let base = items_block_items_base(block);
+        for (i, v) in values.iter().enumerate() {
+            *base.add(i) = *v;
+        }
+        block
+    }
+}
+
+/// Grow (or shrink) an instance storage block to `new_cap`, copying `live_len`
+/// existing items from `old`, NULL-filling any spare tail, and deallocating
+/// `old`. `old` may be null (fresh allocation). Stable allocation keeps `old`'s
+/// address across the (non-collecting) allocation of the new block, so the live
+/// items are copied directly. mapdict.py:942-959 `_add_attr` grow-by-one.
+pub unsafe fn grow_instance_items_block(
+    old: *mut ItemsBlock,
+    new_cap: usize,
+    live_len: usize,
+) -> *mut ItemsBlock {
+    unsafe {
+        let fresh = alloc_mapdict_storage_block(new_cap);
+        let new_base = items_block_items_base(fresh);
+        let copy = live_len.min(new_cap);
+        if !old.is_null() && copy > 0 {
+            std::ptr::copy_nonoverlapping(items_block_items_base(old), new_base, copy);
+        }
+        for i in copy..new_cap {
+            *new_base.add(i) = PY_NULL;
+        }
+        if !old.is_null() {
+            dealloc_instance_items_block(old);
+        }
+        fresh
+    }
+}
+
+/// Deallocate an instance storage block. A GC-managed (stable) block is
+/// reclaimed by the collector and must never be freed here; the `std::alloc`
+/// fallback block is freed. No-op on null. `try_gc_owns_object` discriminates.
+pub unsafe fn dealloc_instance_items_block(block: *mut ItemsBlock) {
+    unsafe { dealloc_items_block(block) }
+}
+
+/// Stable leaf-block allocator for mapdict storage. Routes through
+/// `try_gc_alloc_stable(W_MAPDICT_STORAGE_GC_TYPE_ID, payload)`; the capacity
+/// header is set, items are left uninitialised (the caller writes every slot
+/// before exposing the block). Falls back to `std::alloc` [`alloc_items_block`]
+/// when no GC hook is installed. `cap` may be zero (header-only block).
+unsafe fn alloc_mapdict_storage_block(cap: usize) -> *mut ItemsBlock {
+    let payload = ITEMS_BLOCK_ITEMS_OFFSET + cap * std::mem::size_of::<PyObjectRef>();
+    if let Some(raw) = crate::gc_hook::try_gc_alloc_stable(W_MAPDICT_STORAGE_GC_TYPE_ID, payload) {
+        if !raw.is_null() {
+            let block = raw as *mut ItemsBlock;
+            unsafe { (*block).capacity = cap };
+            return block;
+        }
+    }
+    unsafe { alloc_items_block(cap) }
 }
 
 /// Route object-strategy `ItemsBlock` allocations through the moving
