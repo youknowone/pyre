@@ -5200,23 +5200,6 @@ pub(crate) fn p2_drain_enabled() -> bool {
     std::env::var_os("PYRE_P2_DRAIN").is_some()
 }
 
-/// Shape A multi-frame bridge resume (`PYRE_P2_FRAMESTACK`, default OFF).
-/// Routes the multi-frame carrier to `drive_bridge_framestack_walk`, which
-/// reconstructs the deepest callee frame (`setup_reconstructed_callee_frame`)
-/// and sub-walks it, then aborts the trace cleanly instead of compiling the
-/// reconstruction bridge. The sub-walk specializes recursive calls to the
-/// captured base-case instance rather than folding them to a live
-/// `CALL_ASSEMBLER`, and the reconstructed-frame dst delivery does not line up
-/// with `make_result_of_lastop`, so compiling the bridge is unsound; the safe
-/// abort degrades multi-frame resumes to the interpreter with correct results.
-/// A faithful `rebuild_from_resumedata` (resume.py:1042) register-based rebuild
-/// with a continuous cross-frame forward walk is the walker-arch rework that
-/// makes compiling this bridge sound. Gated separately from `PYRE_P2_DRAIN` so
-/// the drain path and the OFF baseline stay byte-identical.
-pub(crate) fn p2_framestack_enabled() -> bool {
-    std::env::var_os("PYRE_P2_FRAMESTACK").is_some()
-}
-
 fn reconstruct_inline_recipe(
     ctx: &mut majit_metainterp::TraceCtx,
     frame: &majit_ir::resumedata::RebuiltFrame,

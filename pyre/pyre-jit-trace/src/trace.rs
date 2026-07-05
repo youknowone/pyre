@@ -144,21 +144,23 @@ pub fn trace_bytecode(
     // (trace_opcode.rs:3323-3424) and don't call init_symbolic; this path
     // handles the root frame push.
     sym.init_symbolic(ctx, cf_addr);
-    // Issue #215 item 2 (P2 drain, `PYRE_P2_DRAIN`): drive the multiframe
-    // bridge-carrier resume via the full-body walker (reconstruct the in-flight
-    // callee framestack + walk innermost-first) instead of aborting to a no-JIT
-    // re-interpret below.  Default off → the carrier abort path is unchanged.
+    // Issue #215 item 2: drive the multiframe bridge-carrier resume via the
+    // full-body walker (reconstruct the in-flight callee framestack + walk
+    // innermost-first) instead of aborting to a no-JIT re-interpret below.
     if let Some(ref carrier) = carrier {
-        // Shape A (`PYRE_P2_FRAMESTACK`): the orthodox driver-trampoline resume
-        // takes precedence over the `PYRE_P2_DRAIN` sub-walk+inject deviation.
-        if crate::state::p2_framestack_enabled() {
-            let action = drive_bridge_framestack_walk(ctx, sym, w_code, start_pc, cf_addr, carrier);
-            return (action, concrete_frame);
-        }
+        // A multi-frame bridge resume is driven by the orthodox framestack
+        // trampoline (`rebuild_from_resumedata` resume.py:1042-1057 + the
+        // continuous interpret loop): reconstruct the resumed callee framestack
+        // and walk it forward. Without it a present carrier falls through to the
+        // degenerate `Trait::CarrierAbort` below, which never compiles the bridge
+        // and re-aborts on every guard failure. The `PYRE_P2_DRAIN`
+        // sub-walk+inject shape is a separate unsound deviation, kept gated off.
         if crate::state::p2_drain_enabled() {
             let action = drive_bridge_carrier_walk(ctx, sym, w_code, start_pc, cf_addr, carrier);
             return (action, concrete_frame);
         }
+        let action = drive_bridge_framestack_walk(ctx, sym, w_code, start_pc, cf_addr, carrier);
+        return (action, concrete_frame);
     }
     // Issue #73 walker-as-tracer foundation probe (slice #1, gated).
     // `PYRE_WALK_PERFN_JITCODE=1` attempts to walk the per-CodeObject
@@ -582,10 +584,10 @@ fn drive_bridge_carrier_walk(
     TraceAction::Abort
 }
 
-/// Shape A orthodox multi-frame bridge resume (`PYRE_P2_FRAMESTACK`).
+/// Shape A orthodox multi-frame bridge resume: the default driver for a
+/// single-recipe (depth-1) carrier.
 ///
-/// Replaces the [`drive_bridge_carrier_walk`] sub-walk+inject deviation with a
-/// driver-managed framestack trampoline that mirrors RPython's
+/// A driver-managed framestack trampoline that mirrors RPython's
 /// `rebuild_from_resumedata` (resume.py:1042-1057) + continuous interpret loop:
 ///
 ///   1. The reconstructed callee framestack is held in the DRIVER (owned
@@ -596,7 +598,7 @@ fn drive_bridge_carrier_walk(
 ///      `walk()` (`drive_bridge_carrier_subwalk` shape). Because the frame
 ///      traces forward, its own recursive calls fold to a live `CALL_ASSEMBLER`
 ///      (the self-recursive fold, `try_walker_call_assembler_self_recursive`) —
-///      NOT unrolled into frame reconstruction. `PYRE_P2_FRAMESTACK` therefore
+///      NOT unrolled into frame reconstruction. The framestack walk therefore
 ///      supersedes bounded unroll for the resumed recursion.
 ///   3. A frame's `SubReturn` is delivered into its PARENT frame's dst register
 ///      via `make_result_of_lastop` (`pyjitpl.py:258-275`) — the parent then
@@ -608,17 +610,13 @@ fn drive_bridge_carrier_walk(
 /// `CALL_ASSEMBLER` result, not a reconstructed-frame arg slot) and the
 /// missing-`CALL_ASSEMBLER` bug (recursion stays a call boundary).
 ///
-/// **Build status**: gated OFF by default, and SAFE to enable. This slice wires
-/// the gate, reconstructs the deepest callee frame, and sub-walks it, then
-/// aborts the trace cleanly rather than compiling the reconstruction bridge:
-/// the sub-walk specializes the recursion to the captured base-case instance
-/// and the reconstructed-frame dst delivery does not line up with
-/// `make_result_of_lastop`, so compiling the bridge is unsound (SEGV / wrong
-/// value). A sound compiled multi-frame bridge needs the register-based
-/// `rebuild_from_resumedata` + continuous cross-frame forward walk described
-/// above (steps 1-3), which is a walker-architecture rework. Until that lands
-/// the clean abort degrades a multi-frame resume to a no-JIT re-interpret with
-/// the correct result, so `PYRE_P2_FRAMESTACK=1` is safe (no SEGV).
+/// A single-recipe carrier drives the outer continuation via
+/// [`drive_outer_continuation_and_map`] and compiles the whole cross-frame
+/// bridge. `recipes.len() != 1` (depth≥2, #343) and any setup/continuation
+/// failure fall through to `SafeAbortReconstruction`, which cuts the whole
+/// reconstruction and re-interprets with the correct result (no SEGV). The
+/// [`drive_bridge_carrier_walk`] sub-walk+inject shape (`PYRE_P2_DRAIN`) is a
+/// separate unsound deviation, kept gated off.
 fn drive_bridge_framestack_walk(
     ctx: &mut TraceCtx,
     sym: &mut PyreSym,
@@ -714,34 +712,30 @@ fn drive_bridge_framestack_walk(
         ctx.dump_trace_ops_diag("framestack-subwalk-end");
     }
 
-    // SAFE ON: do NOT compile the continuation yet — abort cleanly after the
-    // sub-walk. The sub-walk drives the deepest reconstructed callee frame
-    // (WITH its emitted vable) forward and records into `ctx`: it emits the two
-    // live `CALL_ASSEMBLER` for the callee recursion ([p2-ca] EMIT=2) and its
+    // The sub-walk drives the deepest reconstructed callee frame (WITH its
+    // emitted vable) forward and records into `ctx`: it emits the two live
+    // `CALL_ASSEMBLER` for the callee recursion ([p2-ca] EMIT=2) and its
     // in-callee guards encode resume snapshots against the paused root
     // (`FullBodySnapshotSymGuard`, snapshot_data_len>0), returning a live
-    // `SubReturn` result. That continuation is a VALID bridge fragment; the only
-    // reason it is discarded is the `cut_trace` below. Compiling the whole
-    // multiframe bridge is the walker-arch rework (task #41): keep the vable,
-    // do NOT cut, deliver the sub-walk result into the outer frame's call dst
-    // via `make_result_of_lastop` (physical slot), and continue the outer walk
-    // from its resume pc so the outer's second call + ADD join the same bridge.
-    // Retiring the vable is REFUTED: local reads lower to `getarrayitem_vable`,
-    // which aborts `VableBoxNotSeeded` on an unseeded base — the orthodox resume
-    // rebuilds the frame virtualizable (`rebuild_from_resumedata` resume.py:1042
-    // fills the jitcode registers; the Python locals live in the rebuilt vable).
-    // Until #41 lands, the clean abort re-interprets (correct result), so
-    // `PYRE_P2_FRAMESTACK` is safe to enable (no SEGV).
-    // #41 continuous cross-frame walk (`PYRE_P2_FS_COMPILE`, off by default →
-    // safe-ON path unchanged): after the deepest callee sub-walk returns its
-    // result, continue the OUTER (root portal) frame forward from its resume pc
-    // WITHOUT cutting — appending to the sub-walk's `ctx` so the sub-walk's live
-    // `CALL_ASSEMBLER` continuation stays in the compiled bridge. The callee
+    // `SubReturn` result. The vable is load-bearing: local reads lower to
+    // `getarrayitem_vable`, which aborts `VableBoxNotSeeded` on an unseeded base
+    // — the orthodox resume rebuilds the frame virtualizable
+    // (`rebuild_from_resumedata` resume.py:1042 fills the jitcode registers; the
+    // Python locals live in the rebuilt vable).
+    //
+    // #41 continuous cross-frame walk: after the deepest callee sub-walk returns
+    // its result, continue the OUTER (root portal) frame forward from its resume
+    // pc WITHOUT cutting — appending to the sub-walk's `ctx` so the sub-walk's
+    // live `CALL_ASSEMBLER` continuation stays in the compiled bridge. The callee
     // result is delivered into the outer's call-dst register
     // (`make_result_of_lastop`), never a resume color, so the outer resumes with
     // the 1st-call result live and records its 2nd call + ADD + return.
     if let Some(result) = subwalk_result {
-        if carrier.recipes.len() == 1 && std::env::var_os("PYRE_P2_FS_COMPILE").is_some() {
+        // A single-recipe (depth-1) reconstruction continues the OUTER frame
+        // forward and compiles the whole cross-frame bridge. `recipes.len() != 1`
+        // (depth≥2) and any continuation-setup failure fall through to the clean
+        // `SafeAbortReconstruction` below (correct no-JIT re-interpret).
+        if carrier.recipes.len() == 1 {
             if let Some(action) = drive_outer_continuation_and_map(
                 ctx, sym, w_code, root_pc, cf_addr, result, pre_pos,
             ) {
