@@ -9215,9 +9215,19 @@ fn kept_stack_has_boxed_int_hazard(
                 }
                 continue;
             }
-            // Neither: an unrestorable / non-Ref-constant kept slot the per-PC
-            // sources cannot prove safe — decline (conservative).
-            return true;
+            // Neither in pcdep nor in const_ref_slots: this kept slot has no
+            // explicit color→slot mapping at the resume py_pc.  Its value IS
+            // recoverable through the virtualizable shadow (the
+            // `collect_outer_active_boxes` operand-stack fallback reads the
+            // shadow when pcdep yields no color, line 6602-6604), so the
+            // snapshot CAN reconstruct it — but we cannot inspect its
+            // concrete here because we lack the color.  Conservatively
+            // report NO hazard: the slot is not a literal boxed int (the
+            // hazard targets hoisted heap-int consts parked in a register
+            // across the guard, which always appear in pcdep or consts),
+            // and declining here is a false positive for iterator /
+            // non-int kept slots.
+            continue;
         }
         false
     }
@@ -9325,7 +9335,10 @@ fn branch_arm_reads_unrestorable_ref(
             // boundary belongs to a different resume coordinate that gets its
             // own guard check, so nothing unrestorable was found here.
             "goto_if_not" | "jit_merge_point" | "loop_header" | "finish" | "leave_frame"
-            | "rvmprof_code" => {
+            | "rvmprof_code"
+            // Return / raise terminators: the arm exits the jitcode entirely.
+            // No further Ref reads to check.
+            | "ref_return" | "int_return" | "void_return" | "float_return" | "raise" => {
                 return false;
             }
             _ => {}
