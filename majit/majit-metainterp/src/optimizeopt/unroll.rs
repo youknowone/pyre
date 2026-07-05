@@ -2208,7 +2208,11 @@ impl ExportedState {
         visit_oprefs(&mut self.end_args, visitor);
         visit_operands(&self.next_iteration_args, visitor);
         self.virtual_state.walk_const_ptr_refs_mut(visitor);
-        for (key, info) in self.exported_infos.iter_entries_mut() {
+        // Operand hashes by Rc pointer identity, so walking interior GcRefs
+        // does not alter the key's hash — safe to borrow key immutably while
+        // mutating values. Key GcRefs are walked through interior mutability
+        // (Operand wraps Rc<RefCell<..>>).
+        for (key, info) in self.exported_infos.iter_mut() {
             key.walk_const_ptr_refs(visitor);
             visit_op_info(info, visitor);
         }
@@ -2226,9 +2230,13 @@ impl ExportedState {
         // and the dedup the map relies on would break. `visit_opref` already
         // forwards the key's inline gcref canonically, and `visit_value`
         // forwards the stored `Value::Ref`, so the slot is GC-safe as-is.
-        for (key, value) in self.short_box_const_values.iter_entries_mut() {
-            visit_opref(key, visitor);
-            visit_value(value, visitor);
+        // OpRef keys may carry GcRef values whose hash changes after
+        // forwarding; drain and reinsert to maintain index integrity.
+        let consts: Vec<_> = self.short_box_const_values.drain(..).collect();
+        for (mut key, mut value) in consts {
+            visit_opref(&mut key, visitor);
+            visit_value(&mut value, visitor);
+            self.short_box_const_values.insert(key, value);
         }
         if let Some(short_preamble) = self.short_preamble.as_mut() {
             short_preamble.walk_const_ptr_refs_mut(visitor);

@@ -89,7 +89,7 @@ num-integer = "0.1"
 bit-set = "0.10"
 vecset = "0.0.4"
 vecmap_rs = { package = "vecmap-rs", version = "0.2.4", features = ["serde"] }
-indexmap = "2.14"
+indexmap = { version = "2.14", features = ["serde"] }
 paste = "1"
 unicode-xid = "0.2"
 

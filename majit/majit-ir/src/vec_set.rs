@@ -1,8 +1,7 @@
-//! Insertion-order, Vec-backed membership set used to replace small
-//! `HashSet`s per the house no-HashMap rule.
+//! Insertion-order membership set used by majit.
 //!
-//! Re-export `vecmap-rs`'s `VecSet` instead of carrying a local copy.  This
-//! crate's set has the semantics we need here: insertion order is preserved
-//! and membership operations require only `Eq`, not `Ord`.
+//! Previously backed by `vecmap_rs::VecSet` (linear-scan Vec). Replaced by
+//! `indexmap::IndexSet` for O(1) membership checks while preserving insertion
+//! order. The `VecSet` name is kept as a type alias to minimise churn.
 
-pub use vecmap_rs::VecSet;
+pub use indexmap::IndexSet as VecSet;
