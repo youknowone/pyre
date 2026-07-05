@@ -1483,14 +1483,24 @@ impl MapdictObject for pyre_object::W_ObjectObject {
     }
     fn _mapdict_read_storage(&self, storageindex: usize) -> PyObjectRef {
         // mapdict.py:914-916. A read is always preceded by the
-        // `_set_mapdict_increase_storage1` that made `storage` non-null.
-        let storage: &Vec<PyObjectRef> = unsafe { &*self.storage };
-        storage[storageindex]
+        // `_set_mapdict_increase_storage1` that made `storage` non-null; the
+        // block is exact-size (capacity == map.storage_needed()), so
+        // `storageindex` (from this instance's map) is always in range.
+        unsafe {
+            let base = pyre_object::object_array::items_block_items_base(self.storage);
+            *base.add(storageindex)
+        }
     }
     fn _mapdict_write_storage(&mut self, storageindex: usize, value: PyObjectRef) {
-        // mapdict.py:918-919.
-        let storage: &mut Vec<PyObjectRef> = unsafe { &mut *self.storage };
-        storage[storageindex] = value;
+        // mapdict.py:918-919. The instance is the remembered-set root: the
+        // collector reaches the (non-moving, stable) storage block only through
+        // this instance's `object_object_custom_trace`, which walks the block's
+        // boxed slots in place, so remembering the instance keeps a young value
+        // stored into an old-gen instance's block forwarded on a minor GC.
+        unsafe {
+            let base = pyre_object::object_array::items_block_items_base(self.storage);
+            *base.add(storageindex) = value;
+        }
         instance_write_barrier(self as *const Self as PyObjectRef);
     }
     fn _mapdict_storage_length(&self) -> usize {
@@ -1521,32 +1531,51 @@ impl MapdictObject for pyre_object::W_ObjectObject {
                 self._mapdict_write_storage(storageindex, erase_unboxed(Box::new(new_list)));
             }
             // mapdict.py:935-938: truncate storage to the parent map's size.
+            // The block is exact-size, so shrink it to a fresh cap-N block; the
+            // dropped tail slots are gone with the old block. NULL-fill is
+            // implicit in `grow_instance_items_block` (new_cap <= live_len here).
             None => {
                 let storage_needed = unsafe { (*map).storage_needed() };
-                let storage: &mut Vec<PyObjectRef> = unsafe { &mut *self.storage };
-                storage.truncate(storage_needed);
+                unsafe {
+                    let old_len =
+                        pyre_object::object_array::items_block_capacity(self.storage);
+                    self.storage = pyre_object::object_array::grow_instance_items_block(
+                        self.storage,
+                        storage_needed,
+                        old_len,
+                    );
+                }
+                instance_write_barrier(self as *const Self as PyObjectRef);
             }
         }
         self.map = map as *const u8;
     }
     fn _set_mapdict_increase_storage1(&mut self, map: MapRef, value: PyObjectRef) {
-        // grow storage by one, append value (mapdict.py:942-959). The
-        // first grow allocates the storage list (was `None`).
-        if self.storage.is_null() {
-            self.storage = Box::into_raw(Box::new(Vec::new()));
+        // grow storage by one, append value (mapdict.py:942-959). The first
+        // grow allocates the storage block (was `None`). The block is exact-size,
+        // so `old_len` is the current capacity and the new block has one more slot.
+        unsafe {
+            let old_len = pyre_object::object_array::items_block_capacity(self.storage);
+            let block = pyre_object::object_array::grow_instance_items_block(
+                self.storage,
+                old_len + 1,
+                old_len,
+            );
+            let base = pyre_object::object_array::items_block_items_base(block);
+            *base.add(old_len) = value;
+            self.storage = block;
         }
-        let storage: &mut Vec<PyObjectRef> = unsafe { &mut *self.storage };
-        storage.push(value);
         self.map = map as *const u8;
         instance_write_barrier(self as *const Self as PyObjectRef);
     }
     fn _set_mapdict_storage_and_map(&mut self, storage: Vec<PyObjectRef>, map: MapRef) {
-        // mapdict.py:961-964. The replacement list is heap-owned exactly like
-        // the first grow; an existing list has its contents replaced in place.
-        if self.storage.is_null() {
-            self.storage = Box::into_raw(Box::new(storage));
-        } else {
-            unsafe { *self.storage = storage };
+        // mapdict.py:961-964. The incoming `Vec` comes from a lightweight
+        // `Object` carrier (delete/copy transplant); convert it to a fresh
+        // exact-size storage block, freeing any prior block.
+        unsafe {
+            let old = self.storage;
+            self.storage = pyre_object::object_array::alloc_instance_items_block(&storage);
+            pyre_object::object_array::dealloc_instance_items_block(old);
         }
         self.map = map as *const u8;
         instance_write_barrier(self as *const Self as PyObjectRef);
@@ -2945,12 +2974,14 @@ pub unsafe fn instance_walk_boxed_storage(obj: PyObjectRef, f: &mut dyn FnMut(*m
         if inst.storage.is_null() {
             return;
         }
-        let storage: &mut Vec<PyObjectRef> = &mut *inst.storage;
+        // The storage block is exact-size (capacity == map.storage_needed()).
+        let len = pyre_object::object_array::items_block_capacity(inst.storage);
+        let base = pyre_object::object_array::items_block_items_base(inst.storage);
         // Build a per-storage-index mask of unboxed (`Vec<i64>`) slots by
-        // walking the map's `PlainAttribute` back-chain. Sized to
-        // `storage.len()` (robust to a transiently-longer map during a
-        // grow); the `storageindex < len` guard keeps it in bounds.
-        let mut unboxed = vec![false; storage.len()];
+        // walking the map's `PlainAttribute` back-chain. Sized to the block
+        // capacity (robust to a transiently-longer map during a grow); the
+        // `storageindex < len` guard keeps it in bounds.
+        let mut unboxed = vec![false; len];
         let mut node = inst.map as MapRef;
         loop {
             if node.is_null() {
@@ -2968,12 +2999,12 @@ pub unsafe fn instance_walk_boxed_storage(obj: PyObjectRef, f: &mut dyn FnMut(*m
                 MapNode::Terminator(_) => break,
             }
         }
-        for (i, slot) in storage.iter_mut().enumerate() {
+        for i in 0..len {
             if unboxed[i] {
                 // Erased unboxed `Vec<i64>` slot — an off-GC raw pointer
                 // the collector must not treat as an object; skip it.
             } else {
-                f(slot as *mut PyObjectRef);
+                f(base.add(i));
             }
         }
     }

@@ -36,8 +36,13 @@ pub struct W_ObjectObject {
     pub ob_header: PyObject,
     /// `self.map` (`mapdict.py:907`); erased `*const MapNode`.
     pub map: *const u8,
-    /// `self.storage` (`mapdict.py:910`); null = `None`.
-    pub storage: *mut Vec<PyObjectRef>,
+    /// `self.storage` (`mapdict.py:910`) — a `Ptr(GcArray(OBJECTPTR))` block of
+    /// attribute values (`ItemsBlock`, tagged `W_MAPDICT_STORAGE_GC_TYPE_ID`).
+    /// null = `None`, the `_mapdict_init_empty` empty state (`mapdict.py:910`).
+    /// The block is a mixed boxed/unboxed array; the mapdict layer
+    /// (`pyre-interpreter`) reads/writes it through `crate::object_array`
+    /// helpers, and `object_object_custom_trace` walks its boxed slots.
+    pub storage: *mut crate::object_array::ItemsBlock,
 }
 
 /// Fixed payload size of the `[ob_header | map | storage]` instance
