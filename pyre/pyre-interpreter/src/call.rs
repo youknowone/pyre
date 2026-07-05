@@ -1221,6 +1221,16 @@ pub(crate) fn bind_kwargs_to_signature(
     let has_varkw = sig.kwargname.is_some();
     let n_pos = pos_args.len();
 
+    // A METH_O-style builtin accepts no keyword arguments — every parameter
+    // positional-only, no `**kwargs`, no keyword-only — so any keyword is
+    // rejected with the "takes no keyword arguments" form (e.g. `len`, `abs`).
+    if !kwargs.is_empty() && !has_varkw && sig.num_kwonlyargnames() == 0 && posonly == n_pos_params
+    {
+        return Err(crate::PyError::type_error(format!(
+            "{fname}() takes no keyword arguments"
+        )));
+    }
+
     // argument.py:235-236 — flag too many positionals with no `*args` to
     // absorb, but do not raise yet: argument.py:289 raises it only after
     // keyword matching, so a duplicate/positional-only/unknown-keyword error

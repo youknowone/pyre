@@ -1546,25 +1546,25 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
         crate::typedef::gettypeobject(&pyre_object::functional::RANGE_TYPE)
     });
     namespace.get_or_insert_with("len", || {
-        // operation.py `len(space, w_obj)` — one positional-or-keyword `obj`
-        // bound by the gateway Signature, so `len` no longer receives the
-        // `__pyre_kw__` marker dict.
+        // operation.py `len(space, w_obj)` — one positional-only `obj`, so
+        // `len` no longer receives the `__pyre_kw__` marker dict and any
+        // keyword is rejected with "takes no keyword arguments".
         crate::gateway::make_module_builtin_function_with_arity_and_sig(
             "len",
             builtin_len,
             1,
-            crate::gateway::Signature::new(vec!["obj"], None, None, 0, 0),
+            crate::gateway::Signature::new(vec!["obj"], None, None, 0, 1),
         )
     });
     namespace.get_or_insert_with("abs", || {
-        // operation.py `abs(space, w_val)` — one positional-or-keyword `val`
-        // bound by the gateway Signature, so `abs` no longer receives the
-        // `__pyre_kw__` marker dict.
+        // operation.py `abs(space, w_val)` — one positional-only `val`, so
+        // `abs` no longer receives the `__pyre_kw__` marker dict and any
+        // keyword is rejected with "takes no keyword arguments".
         crate::gateway::make_module_builtin_function_with_arity_and_sig(
             "abs",
             builtin_abs,
             1,
-            crate::gateway::Signature::new(vec!["val"], None, None, 0, 0),
+            crate::gateway::Signature::new(vec!["val"], None, None, 0, 1),
         )
     });
     namespace.get_or_insert_with("min", || make_module_builtin_function("min", builtin_min));
