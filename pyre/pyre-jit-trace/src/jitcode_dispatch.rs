@@ -2939,7 +2939,10 @@ pub(crate) fn drive_outer_frame_continuation(
         );
         let mut cursor = 0usize;
         for &color in &banks.int {
-            let v = outer_active_boxes.get(cursor).copied().unwrap_or(OpRef::NONE);
+            let v = outer_active_boxes
+                .get(cursor)
+                .copied()
+                .unwrap_or(OpRef::NONE);
             cursor += 1;
             let c = color as usize;
             if c < regs_i.len() && v != OpRef::NONE {
@@ -2950,7 +2953,10 @@ pub(crate) fn drive_outer_frame_continuation(
             }
         }
         for &color in &banks.ref_ {
-            let v = outer_active_boxes.get(cursor).copied().unwrap_or(OpRef::NONE);
+            let v = outer_active_boxes
+                .get(cursor)
+                .copied()
+                .unwrap_or(OpRef::NONE);
             cursor += 1;
             let c = color as usize;
             if c < regs_r.len() && v != OpRef::NONE {
@@ -2963,7 +2969,10 @@ pub(crate) fn drive_outer_frame_continuation(
             }
         }
         for &color in &banks.float {
-            let v = outer_active_boxes.get(cursor).copied().unwrap_or(OpRef::NONE);
+            let v = outer_active_boxes
+                .get(cursor)
+                .copied()
+                .unwrap_or(OpRef::NONE);
             cursor += 1;
             let c = color as usize;
             if c < regs_f.len() && v != OpRef::NONE {

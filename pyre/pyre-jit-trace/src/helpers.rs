@@ -1132,10 +1132,9 @@ pub fn emit_new_pyframe_inline_with_params(
     ec: OpRef,
 ) -> OpRef {
     use crate::descr::{
-        pyframe_code_descr, pyframe_execution_context_descr, pyframe_f_backref_descr,
-        pyframe_f_generator_nowref_descr, pyframe_locals_cells_stack_descr,
+        pyframe_code_descr, pyframe_execution_context_descr, pyframe_locals_cells_stack_descr,
         pyframe_next_instr_descr, pyframe_size_descr, pyframe_stack_depth_descr,
-        pyframe_w_globals_obj_descr, pyframe_w_yielding_from_descr,
+        pyframe_w_globals_obj_descr,
     };
     use crate::state::pyobject_gcarray_descr;
 
@@ -1218,22 +1217,12 @@ pub fn emit_new_pyframe_inline_with_params(
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, neg_one], last_instr_descr);
     ctx.heapcache_setfield_cached(new_frame, last_instr_idx, neg_one);
 
-    let null_ref = ctx.const_ref(pyre_object::PY_NULL as i64);
-
-    let generator_descr = pyframe_f_generator_nowref_descr();
-    let generator_idx = generator_descr.index();
-    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, null_ref], generator_descr);
-    ctx.heapcache_setfield_cached(new_frame, generator_idx, null_ref);
-
-    let yielding_descr = pyframe_w_yielding_from_descr();
-    let yielding_idx = yielding_descr.index();
-    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, null_ref], yielding_descr);
-    ctx.heapcache_setfield_cached(new_frame, yielding_idx, null_ref);
-
-    let backref_descr = pyframe_f_backref_descr();
-    let backref_idx = backref_descr.index();
-    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, null_ref], backref_descr);
-    ctx.heapcache_setfield_cached(new_frame, backref_idx, null_ref);
+    // pyframe.py:76-79 `f_generator_nowref`/`w_yielding_from`/`f_backref`
+    // are class-level defaults (None/None/vref_None), never assigned in the
+    // frame constructor. The trace of frame construction therefore emits no
+    // setfield for them; the freshly allocated payload is already zeroed
+    // (zero_gc_pointers_inside, incminimark.py:960), so the fields read back
+    // as PY_NULL. No explicit store here.
 
     new_frame
 }
@@ -1249,10 +1238,8 @@ pub fn emit_new_pyframe_inline_self_recursive(
 ) -> OpRef {
     use crate::descr::{
         int_intval_descr, pyframe_code_descr, pyframe_execution_context_descr,
-        pyframe_f_backref_descr, pyframe_f_generator_nowref_descr,
         pyframe_locals_cells_stack_descr, pyframe_next_instr_descr, pyframe_size_descr,
-        pyframe_stack_depth_descr, pyframe_w_globals_obj_descr, pyframe_w_yielding_from_descr,
-        w_int_size_descr,
+        pyframe_stack_depth_descr, pyframe_w_globals_obj_descr, w_int_size_descr,
     };
     use crate::state::pyobject_gcarray_descr;
 
@@ -1336,22 +1323,12 @@ pub fn emit_new_pyframe_inline_self_recursive(
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, neg_one], last_instr_descr);
     ctx.heapcache_setfield_cached(new_frame, last_instr_idx, neg_one);
 
-    let null_ref = ctx.const_ref(pyre_object::PY_NULL as i64);
-
-    let generator_descr = pyframe_f_generator_nowref_descr();
-    let generator_idx = generator_descr.index();
-    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, null_ref], generator_descr);
-    ctx.heapcache_setfield_cached(new_frame, generator_idx, null_ref);
-
-    let yielding_descr = pyframe_w_yielding_from_descr();
-    let yielding_idx = yielding_descr.index();
-    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, null_ref], yielding_descr);
-    ctx.heapcache_setfield_cached(new_frame, yielding_idx, null_ref);
-
-    let backref_descr = pyframe_f_backref_descr();
-    let backref_idx = backref_descr.index();
-    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, null_ref], backref_descr);
-    ctx.heapcache_setfield_cached(new_frame, backref_idx, null_ref);
+    // pyframe.py:76-79 `f_generator_nowref`/`w_yielding_from`/`f_backref`
+    // are class-level defaults (None/None/vref_None), never assigned in the
+    // frame constructor. The trace of frame construction therefore emits no
+    // setfield for them; the freshly allocated payload is already zeroed
+    // (zero_gc_pointers_inside, incminimark.py:960), so the fields read back
+    // as PY_NULL. No explicit store here.
 
     new_frame
 }
