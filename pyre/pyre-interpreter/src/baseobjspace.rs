@@ -26,7 +26,9 @@ use rustpython_wtf8::{CodePoint, Wtf8, Wtf8Buf};
 
 // ── Re-exports from split-out modules ────────────────────────────────
 pub use crate::objspace::descroperation::*;
-pub(crate) use crate::objspace::std::formatting::{format_g_like, normalise_exponent};
+pub(crate) use crate::objspace::std::formatting::{
+    format_g_like, format_no_type_prec, normalise_exponent,
+};
 
 // ── Pending dict-key-callback error slot ─────────────────────────────
 // The `r_dict(eq_w, hash_w)` callbacks (`pyre_object_hash_w_trampoline`

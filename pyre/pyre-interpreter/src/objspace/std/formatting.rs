@@ -373,6 +373,58 @@ pub(crate) fn format_g_like(abs: f64, prec: usize, upper: bool, alt_form: bool) 
     }
 }
 
+/// Format an absolute float for the empty presentation type with an explicit
+/// precision (or alt-form).  Like `%g` with `prec` significant digits, but the
+/// scientific cutoff is one lower (`exp >= prec - 1`) and a fixed result always
+/// shows a fractional part — a bare integer keeps a trailing `.0`, and alt-form
+/// retains the requested trailing zeros.
+pub(crate) fn format_no_type_prec(abs: f64, prec: usize, alt_form: bool) -> String {
+    if !abs.is_finite() {
+        return format!("{abs}");
+    }
+    let prec = prec.max(1);
+    // 0.0 has no `log10`; its decimal point sits one past the leading digit.
+    let exp = if abs == 0.0 {
+        0
+    } else {
+        abs.log10().floor() as i32
+    };
+    if exp < -4 || exp >= prec as i32 - 1 {
+        let raw = normalise_exponent(&format!("{:.*e}", prec - 1, abs), false);
+        let Some(epos) = raw.find('e') else {
+            return raw;
+        };
+        let (mantissa, exp_part) = raw.split_at(epos);
+        let mantissa = if alt_form {
+            mantissa.to_string()
+        } else {
+            trim_trailing_zeros(mantissa)
+        };
+        // Alt-form advertises the point even when the mantissa is a bare digit.
+        let mantissa = if alt_form && !mantissa.contains('.') {
+            format!("{mantissa}.")
+        } else {
+            mantissa
+        };
+        return format!("{mantissa}{exp_part}");
+    }
+    let dec = (prec as i32 - 1 - exp).max(0) as usize;
+    let raw = format!("{abs:.dec$}");
+    if alt_form {
+        return if raw.contains('.') { raw } else { format!("{raw}.") };
+    }
+    let body = if raw.contains('.') {
+        trim_trailing_zeros(&raw)
+    } else {
+        raw
+    };
+    if body.contains('.') {
+        body
+    } else {
+        format!("{body}.0")
+    }
+}
+
 /// Convert Rust's `{:e}` / `{:E}` exponent encoding (no sign, minimal
 /// width — `1.5e3` / `1.5e-3`) to PyPy / CPython `%e`-style
 /// (`1.5e+03` / `1.5e-03` — explicit sign, exponent zero-padded to at

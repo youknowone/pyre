@@ -9,6 +9,8 @@
 //! Separated from space.rs to avoid bloating the hot-path compilation
 //! unit. Method functions are registered into TypeDef at startup.
 
+use malachite_bigint::BigInt;
+use num_traits::ToPrimitive;
 use pyre_object::*;
 use rustpython_wtf8::{CodePoint, Wtf8, Wtf8Buf};
 
@@ -915,7 +917,9 @@ fn str_method_format_core(
     kwargs_dict: Option<PyObjectRef>,
     mapping: Option<PyObjectRef>,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let fmt = unsafe { pyre_object::w_str_get_value(fmt_obj) };
+    // Read the template as WTF-8 so a lone surrogate in a literal run (or a
+    // surrogate arg spliced in) survives instead of panicking.
+    let fmt = unsafe { pyre_object::w_str_get_wtf8(fmt_obj) };
     let mut auto_idx = 0usize;
     // `newformat.py` auto_numbering_state — `None` = ANS_INIT, `Some(true)`
     // = ANS_AUTO (empty `{}` fields), `Some(false)` = ANS_MANUAL (numbered
@@ -939,7 +943,7 @@ fn str_method_format_core(
 /// `"{:{}}".format(42, ">5")` consumes positional args 0 then 1.
 /// `depth` bounds that recursion (the markup recursion limit is 2).
 fn format_render(
-    fmt: &str,
+    fmt: &Wtf8,
     positional: &[PyObjectRef],
     kwargs_dict: Option<PyObjectRef>,
     mapping: Option<PyObjectRef>,
@@ -947,6 +951,9 @@ fn format_render(
     numbering: &mut Option<bool>,
     depth: u32,
 ) -> Result<Wtf8Buf, crate::PyError> {
+    use rustpython_common::format::{
+        FieldName, FieldNamePart, FieldType, FormatPart, FormatString, FromTemplate,
+    };
     let lookup_kwarg = |name: &str| -> Result<Option<PyObjectRef>, crate::PyError> {
         if let Some(m) = mapping {
             // `newformat.format_method(... w_mapping, True)` resolves
@@ -963,293 +970,171 @@ fn format_render(
         Ok(None)
     };
 
+    if depth == 0 {
+        return Err(crate::PyError::value_error("Max string recursion exceeded"));
+    }
+    let parsed = FormatString::from_str(fmt).map_err(|e| format_parse_err(e, fmt))?;
     let mut result = Wtf8Buf::new();
-    let bytes = fmt.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'{' {
-            if i + 1 < bytes.len() && bytes[i + 1] == b'{' {
-                result.push_char('{');
-                i += 2;
+    for part in &parsed.format_parts {
+        let (field_name, conversion_spec, format_spec) = match part {
+            FormatPart::Literal(literal) => {
+                result.push_wtf8(literal);
                 continue;
             }
-            i += 1;
-            let field_start = i;
-            // Track brace depth so a nested `{...}` inside the format
-            // spec is captured whole rather than ending the field at the
-            // spec's first `}`.
-            let mut brace_depth = 1;
-            while i < bytes.len() {
-                if bytes[i] == b'{' {
-                    brace_depth += 1;
-                } else if bytes[i] == b'}' {
-                    brace_depth -= 1;
-                    if brace_depth == 0 {
-                        break;
-                    }
-                }
-                i += 1;
-            }
-            let field_text = &fmt[field_start..i];
-            if i < bytes.len() {
-                i += 1;
-            }
+            FormatPart::Field {
+                field_name,
+                conversion_spec,
+                format_spec,
+            } => (field_name, conversion_spec, format_spec),
+        };
 
-            // `newformat.py:_parse_field` — split the replacement field
-            // into the argument name, an optional `!conversion`, and the
-            // trailing `:spec`.  A `:` or `!` inside `[...]` is part of an
-            // item key, not a separator, so brackets are skipped over.
-            let fb = field_text.as_bytes();
-            let mut p = 0;
-            let mut name_end = fb.len();
-            let mut conversion: Option<char> = None;
-            let mut spec = String::new();
-            while p < fb.len() {
-                let c = fb[p];
-                if c == b':' || c == b'!' {
-                    name_end = p;
-                    if c == b'!' {
-                        p += 1;
-                        if p < fb.len() {
-                            conversion = Some(fb[p] as char);
-                            p += 1;
-                        }
-                        if p < fb.len() && fb[p] == b':' {
-                            p += 1;
-                        }
-                    } else {
-                        p += 1;
-                    }
-                    spec = field_text.get(p..).unwrap_or("").to_string();
-                    break;
-                } else if c == b'[' {
-                    while p + 1 < fb.len() && fb[p + 1] != b']' {
-                        p += 1;
-                    }
-                }
-                p += 1;
-            }
-            let name = &field_text[..name_end];
-
-            // `newformat.py:_get_argument` — the argument name is the
-            // prefix up to the first `[` or `.`; the remainder is a chain
-            // of attribute / item lookups resolved by
-            // `resolve_format_lookups`.
-            let nb = name.as_bytes();
-            let mut k = 0;
-            while k < nb.len() && nb[k] != b'[' && nb[k] != b'.' {
-                k += 1;
-            }
-            let base = &name[..k];
-            let rest = &name[k..];
-
-            // pypy/objspace/std/newformat.py:1066-1071 Template.get_arg:
-            // missing positional → IndexError "Replacement index N out of
-            // range for positional args tuple"; missing keyword →
-            // KeyError(name).
-            let w_arg = if base.is_empty() {
+        // `_get_argument` — resolve the base argument named by the field,
+        // threading the auto-/manual-numbering state (`None` = uncommitted,
+        // `Some(true)` = automatic `{}`, `Some(false)` = manual `{0}`).
+        let FieldName { field_type, parts } =
+            FieldName::parse(field_name).map_err(|e| format_parse_err(e, fmt))?;
+        let mut val = match field_type {
+            FieldType::Auto => {
                 if let Some(false) = *numbering {
-                    return Err(crate::PyError::new(
-                        crate::PyErrorKind::ValueError,
+                    return Err(crate::PyError::value_error(
                         "cannot switch from manual field specification to automatic \
-                         field numbering"
-                            .to_string(),
+                         field numbering",
                     ));
                 }
                 *numbering = Some(true);
                 let idx = *auto_idx;
                 *auto_idx += 1;
-                match positional.get(idx).copied() {
-                    Some(v) => v,
-                    None => {
-                        return Err(crate::PyError::new(
-                            crate::PyErrorKind::IndexError,
-                            format!(
-                                "Replacement index {idx} out of range for positional args tuple"
-                            ),
-                        ));
-                    }
-                }
-            } else if let Ok(idx) = base.parse::<usize>() {
+                index_positional(positional, idx)?
+            }
+            FieldType::Index(idx) => {
                 if let Some(true) = *numbering {
-                    return Err(crate::PyError::new(
-                        crate::PyErrorKind::ValueError,
+                    return Err(crate::PyError::value_error(
                         "cannot switch from automatic field numbering to manual \
-                         field specification"
-                            .to_string(),
+                         field specification",
                     ));
                 }
                 *numbering = Some(false);
-                match positional.get(idx).copied() {
-                    Some(v) => v,
-                    None => {
-                        return Err(crate::PyError::new(
-                            crate::PyErrorKind::IndexError,
-                            format!(
-                                "Replacement index {idx} out of range for positional args tuple"
-                            ),
-                        ));
-                    }
-                }
-            } else {
-                match lookup_kwarg(base)? {
-                    Some(v) => v,
-                    None => {
-                        return Err(crate::PyError::new(
-                            crate::PyErrorKind::KeyError,
-                            format!("'{base}'"),
-                        ));
-                    }
-                }
-            };
-            let val = resolve_format_lookups(w_arg, rest)?;
-
-            // `newformat.py:_convert_field` — `!s`/`!r`/`!a` apply
-            // str / repr / ascii before the format spec.
-            let converted = match conversion {
-                None => val,
-                // `!s` is `str(self)`, preserved in WTF-8 so a lone
-                // surrogate (a str, or an exception with a str argument)
-                // passes through unchanged.
-                Some('s') => pyre_object::w_str_from_wtf8(unsafe { crate::py_str_wtf8(val)? }),
-                Some('r') => pyre_object::w_str_new(&unsafe { crate::py_repr(val)? }),
-                Some('a') => pyre_object::w_str_new(&crate::builtins::py_ascii(val)?),
-                Some(c) => {
-                    return Err(crate::PyError::new(
-                        crate::PyErrorKind::ValueError,
-                        format!("Unknown conversion specifier {c}"),
-                    ));
-                }
-            };
-            // A spec containing `{` is itself a template: render it
-            // (sharing the numbering state) before applying it.  A
-            // rendered spec is expected to be valid text (format specs
-            // do not carry surrogates).
-            let resolved_spec: String = if spec.bytes().any(|b| b == b'{') {
-                if depth == 0 {
-                    return Err(crate::PyError::new(
-                        crate::PyErrorKind::ValueError,
-                        "Max string recursion exceeded".to_string(),
-                    ));
-                }
-                let nested = format_render(
-                    &spec,
-                    positional,
-                    kwargs_dict,
-                    mapping,
-                    auto_idx,
-                    numbering,
-                    depth - 1,
-                )?;
-                match nested.as_str() {
-                    Ok(v) => v.to_string(),
-                    Err(_) => String::new(),
-                }
-            } else {
-                spec
-            };
-            let formatted = format_value_dispatch(converted, &resolved_spec)?;
-            result.push_wtf8(&formatted);
-        } else if bytes[i] == b'}' && i + 1 < bytes.len() && bytes[i + 1] == b'}' {
-            result.push_char('}');
-            i += 2;
-        } else if bytes[i] == b'}' {
-            // A lone `}` (not `}}`) is emitted literally.
-            result.push_char('}');
-            i += 1;
-        } else {
-            // Literal run up to the next brace; `{` / `}` are single
-            // ASCII bytes that never occur inside a multi-byte
-            // sequence, so the run is itself valid text and copies
-            // whole (a byte-at-a-time `as char` would mojibake
-            // non-ASCII literals).
-            let start = i;
-            while i < bytes.len() && bytes[i] != b'{' && bytes[i] != b'}' {
-                i += 1;
+                index_positional(positional, idx)?
             }
-            result.push_str(&fmt[start..i]);
+            FieldType::Keyword(name) => {
+                let name_str = name.as_str().unwrap_or("");
+                match lookup_kwarg(name_str)? {
+                    Some(v) => v,
+                    None => {
+                        return Err(crate::PyError::key_error_with_key(
+                            pyre_object::w_str_from_wtf8(name),
+                        ));
+                    }
+                }
+            }
+        };
+
+        // `_resolve_lookups` — walk the `.attr` / `[element]` chain; a
+        // bracketed all-digit element is an integer index, anything else a
+        // string key (already classified by `FieldNamePart`).
+        for name_part in &parts {
+            val = match name_part {
+                FieldNamePart::Attribute(attr) => {
+                    crate::baseobjspace::getattr_str(val, attr.as_str().unwrap_or(""))?
+                }
+                FieldNamePart::Index(idx) => {
+                    crate::baseobjspace::getitem(val, pyre_object::w_int_new(*idx as i64))?
+                }
+                FieldNamePart::StringIndex(key) => {
+                    crate::baseobjspace::getitem(val, pyre_object::w_str_from_wtf8(key.clone()))?
+                }
+            };
         }
+
+        // A spec containing `{` is itself a template: render it (sharing the
+        // numbering state and the recursion budget) before applying it.
+        let resolved_spec = if format_spec.as_bytes().contains(&b'{') {
+            format_render(
+                format_spec,
+                positional,
+                kwargs_dict,
+                mapping,
+                auto_idx,
+                numbering,
+                depth - 1,
+            )?
+        } else {
+            format_spec.clone()
+        };
+
+        // `_convert_field` — `!s`/`!r`/`!a` apply str / repr / ascii before
+        // the format spec; any other conversion char is an error.  `!s`
+        // preserves WTF-8 so a lone surrogate passes through unchanged.
+        let converted = match conversion_spec {
+            None => val,
+            Some(cp) => match cp.to_char_lossy() {
+                's' => pyre_object::w_str_from_wtf8(unsafe { crate::py_str_wtf8(val)? }),
+                'r' => pyre_object::w_str_new(&unsafe { crate::py_repr(val)? }),
+                'a' => pyre_object::w_str_new(&crate::builtins::py_ascii(val)?),
+                c => {
+                    return Err(crate::PyError::value_error(format!(
+                        "Unknown conversion specifier {c}"
+                    )));
+                }
+            },
+        };
+        let formatted = format_value_dispatch(converted, resolved_spec.as_str().unwrap_or(""))?;
+        result.push_wtf8(&formatted);
     }
     Ok(result)
 }
 
-/// `newformat.py:_resolve_lookups` — walk the `.attr` / `[element]`
-/// suffix of a replacement-field name, resolving each step against
-/// `w_obj` via `getattr` / `getitem`.  A bracketed element made only
-/// of decimal digits is an integer index; anything else is a string
-/// key (`_parse_int` returns -1 for non-numeric elements).
-fn resolve_format_lookups(w_obj: PyObjectRef, rest: &str) -> Result<PyObjectRef, crate::PyError> {
-    let rb = rest.as_bytes();
-    let mut w_obj = w_obj;
-    let mut i = 0;
-    while i < rb.len() {
-        let c = rb[i];
-        if c == b'.' {
-            i += 1;
-            let start = i;
-            while i < rb.len() && rb[i] != b'[' && rb[i] != b'.' {
-                i += 1;
-            }
-            if start == i {
-                return Err(crate::PyError::new(
-                    crate::PyErrorKind::ValueError,
-                    "Empty attribute in format string".to_string(),
-                ));
-            }
-            w_obj = crate::baseobjspace::getattr_str(w_obj, &rest[start..i])?;
-        } else if c == b'[' {
-            i += 1;
-            let start = i;
-            let mut got_bracket = false;
-            while i < rb.len() {
-                if rb[i] == b']' {
-                    got_bracket = true;
-                    break;
-                }
-                i += 1;
-            }
-            if got_bracket {
-                let elem = &rest[start..i];
-                i += 1;
-                let numeric = elem.len() > 0 && elem.bytes().all(|b| b.is_ascii_digit());
-                let w_item = if numeric {
-                    match elem.parse::<i64>() {
-                        Ok(idx) => pyre_object::w_int_new(idx),
-                        Err(_) => pyre_object::w_str_new(elem),
-                    }
-                } else {
-                    pyre_object::w_str_new(elem)
-                };
-                w_obj = crate::baseobjspace::getitem(w_obj, w_item)?;
-            } else {
-                return Err(crate::PyError::new(
-                    crate::PyErrorKind::ValueError,
-                    "Missing ']' in format string".to_string(),
-                ));
-            }
-        } else {
-            return Err(crate::PyError::new(
-                crate::PyErrorKind::ValueError,
-                "Only '[' and '.' may follow ']' in format string".to_string(),
-            ));
-        }
-    }
-    Ok(w_obj)
+/// Fetch positional argument `idx`, raising the `str.format` IndexError for
+/// an out-of-range replacement index.
+fn index_positional(
+    positional: &[PyObjectRef],
+    idx: usize,
+) -> Result<PyObjectRef, crate::PyError> {
+    positional.get(idx).copied().ok_or_else(|| {
+        crate::PyError::index_error(format!(
+            "Replacement index {idx} out of range for positional args tuple"
+        ))
+    })
 }
 
-/// Mini Python format-spec parser — `pypy/objspace/std/newformat.py
-/// _parse_spec`.  Recognises the subset pyre exercises today:
-/// `[fill][align][sign][#][0][width][grouping][.precision][type]`.
-/// `alt_form` (the `#` flag) is now stored on the parsed spec so int /
-/// float formatters can apply the base prefix or trailing-zero
-/// preservation per PyPy `newformat.py:454-468`.  `grouping` holds the
-/// thousands separator (`,` or `_`) parsed at `newformat.py:501-512`.
+/// Map a template parse error to the matching `str.format` ValueError.
+/// `FormatString` reports `UnmatchedBracket` for both a lone trailing `{`
+/// and an opened-but-unclosed field, so the trailing byte disambiguates the
+/// two CPython messages.
+fn format_parse_err(err: rustpython_common::format::FormatParseError, fmt: &Wtf8) -> crate::PyError {
+    use rustpython_common::format::FormatParseError as E;
+    let msg = match err {
+        E::UnmatchedBracket => {
+            if fmt.as_bytes().last() == Some(&b'{') {
+                "Single '{' encountered in format string"
+            } else {
+                "expected '}' before end of string"
+            }
+        }
+        E::MissingStartBracket => "Single '}' encountered in format string",
+        E::UnescapedStartBracketInLiteral => "Single '{' encountered in format string",
+        E::MissingRightBracket => "expected '}' before end of string",
+        E::EmptyAttribute => "Empty attribute in format string",
+        E::UnknownConversion => "expected ':' after conversion specifier",
+        // The template parser accepts only one bracket layer in a spec and
+        // reports a second as `InvalidFormatSpecifier`; that is the markup
+        // recursion limit being hit.
+        E::InvalidFormatSpecifier => "Max string recursion exceeded",
+        E::InvalidCharacterAfterRightBracket => "Only '[' and '.' may follow ']' in format string",
+        E::TooManyDecimalDigits => "Too many decimal digits in format string",
+    };
+    crate::PyError::value_error(msg)
+}
+
+/// Geometry of a format spec: `[fill][align][sign][#][0][width][grouping]
+/// [.precision][type]`.  Only the presentation types the shared engine
+/// cannot format correctly — integer `c` and non-finite floats — read
+/// this back; every other case parses through `FormatSpec` directly.
 struct ParsedSpec {
     fill: char,
     align: Option<char>,
     sign: Option<char>,
     alt_form: bool,
-    zero_pad: bool,
     width: usize,
     grouping: Option<char>,
     precision: Option<usize>,
@@ -1280,13 +1165,8 @@ fn parse_spec(spec: &str) -> ParsedSpec {
         alt_form = true;
         i += 1;
     }
-    let mut zero_pad = false;
     if i < n && chars[i] == '0' {
-        zero_pad = true;
-        // `pypy/objspace/std/newformat.py:454-460` — the `0` flag
-        // implies `fill='0', align='='` when no explicit fill /
-        // align were provided.  Without this, `f"{-7:=05d}"`
-        // would left-fill with spaces instead of zeros.
+        // The `0` flag implies `fill='0', align='='` when neither was given.
         if align.is_none() {
             align = Some('=');
         }
@@ -1300,8 +1180,6 @@ fn parse_spec(spec: &str) -> ParsedSpec {
         width = width * 10 + (chars[i] as u8 - b'0') as usize;
         i += 1;
     }
-    // `pypy/objspace/std/newformat.py:501-512` — the thousands
-    // separator (`,` or `_`) sits between width and `.precision`.
     let mut grouping: Option<char> = None;
     if i < n && matches!(chars[i], ',' | '_') {
         grouping = Some(chars[i]);
@@ -1323,7 +1201,6 @@ fn parse_spec(spec: &str) -> ParsedSpec {
         align,
         sign,
         alt_form,
-        zero_pad,
         width,
         grouping,
         precision,
@@ -1331,10 +1208,8 @@ fn parse_spec(spec: &str) -> ParsedSpec {
     }
 }
 
-/// `pypy/objspace/std/newformat.py:740 _group_digits` — insert the
-/// thousands separator `sep` into a run of plain digits every
-/// `interval` positions counted from the right (3 for decimal
-/// presentations, 4 for `_` on binary / octal / hex).
+/// Insert the thousands separator `sep` into a run of plain digits every
+/// `interval` positions counted from the right.
 fn group_digits(digits: &str, sep: char, interval: usize) -> String {
     let chars: Vec<char> = digits.chars().collect();
     let len = chars.len();
@@ -1348,9 +1223,9 @@ fn group_digits(digits: &str, sep: char, interval: usize) -> String {
     out
 }
 
-/// Group only the leading integer run of a numeric body (the digits
-/// before any `.`, exponent, or `%`), leaving the fractional / suffix
-/// portion untouched.  Float groupings always use interval 3.
+/// Group only the leading integer run of a numeric body (the digits before
+/// any `.`, exponent, or `%`), leaving the fractional / suffix portion
+/// untouched.  Float groupings always use interval 3.
 fn group_integer_prefix(body: &str, sep: char) -> String {
     let int_len = body.chars().take_while(|c| c.is_ascii_digit()).count();
     if int_len <= 3 {
@@ -1360,6 +1235,50 @@ fn group_integer_prefix(body: &str, sep: char) -> String {
     format!("{}{}", group_digits(int_part, sep, 3), rest)
 }
 
+/// Group the leading integer run of `body` while sign-aware zero-padding it
+/// to `field` characters (the width less the sign).  Leading zeros are added
+/// to the integer run *before* grouping so the padding is itself grouped,
+/// matching the `0`-flag / `=`-alignment interaction.  Only the digit run is
+/// touched, so an exponent (`e+30`) or fractional tail is never separated.
+fn group_integer_zero_padded(body: &str, sep: char, field: usize) -> String {
+    let int_len = body.chars().take_while(|c| c.is_ascii_digit()).count();
+    let (int_part, tail) = body.split_at(int_len);
+    let disp = std::cmp::max(field as i32, body.len() as i32);
+    let int_digit_cnt = disp - tail.len() as i32;
+    format!("{}{tail}", separate_integer(int_part, 3, sep, int_digit_cnt))
+}
+
+/// Pad the digit string `int_str` with leading zeros to a display width of
+/// `disp_digit_cnt` and insert `sep` every `inter` digits.  The pad count is
+/// reduced by the separators that will occupy width, and a leading separator
+/// is avoided when the display width is an exact group boundary.
+fn separate_integer(int_str: &str, inter: i32, sep: char, disp_digit_cnt: i32) -> String {
+    let mag_len = int_str.len() as i32;
+    let offset = i32::from(disp_digit_cnt % (inter + 1) == 0);
+    let disp = disp_digit_cnt + offset;
+    let pad_cnt = disp - mag_len;
+    let sep_cnt = disp / (inter + 1);
+    if pad_cnt > 0 && pad_cnt - sep_cnt > 0 {
+        let padded = format!("{}{int_str}", "0".repeat((pad_cnt - sep_cnt) as usize));
+        insert_separator(padded, inter, sep, sep_cnt)
+    } else {
+        insert_separator(int_str.to_string(), inter, sep, (mag_len - 1) / inter)
+    }
+}
+
+/// Insert `sep` into `s` at every `inter`-digit boundary from the right,
+/// `sep_cnt` times.
+fn insert_separator(mut s: String, inter: i32, sep: char, sep_cnt: i32) -> String {
+    let len = s.len() as i32;
+    for i in 1..=sep_cnt {
+        s.insert((len - inter * i) as usize, sep);
+    }
+    s
+}
+
+/// Pad `body` to `width` characters with `fill`, honouring the numeric
+/// alignments.  `=` splits a leading sign (and `0x`/`0o`/`0b` base prefix)
+/// from the digits and inserts the fill between them.
 fn pad_to_width(body: String, fill: char, align: char, width: usize) -> String {
     if body.chars().count() >= width {
         return body;
@@ -1386,13 +1305,6 @@ fn pad_to_width(body: String, fill: char, align: char, width: usize) -> String {
             }
             s
         }
-        // `pypy/objspace/std/newformat.py:454-468` — `=` alignment
-        // splits the leading sign / base prefix from the digit body
-        // and inserts fill BETWEEN them, so `f"{-7:=05d}"` renders
-        // as `"-0007"` (sign then zeros then digits) instead of
-        // `"000-7"`.  Numeric bodies the int / float paths emit
-        // start with at most one sign char (`-`/`+`/space) followed
-        // by an optional base prefix (`0x`/`0X`/`0o`/`0b`).
         '=' => {
             let mut chars = body.chars().peekable();
             let mut prefix = String::new();
@@ -1402,7 +1314,6 @@ fn pad_to_width(body: String, fill: char, align: char, width: usize) -> String {
                     chars.next();
                 }
             }
-            // Optional alt-form base prefix: 0x / 0X / 0o / 0b.
             let rest_so_far: String = chars.clone().collect();
             if rest_so_far.len() >= 2 && rest_so_far.as_bytes()[0] == b'0' {
                 let next = rest_so_far.as_bytes()[1];
@@ -1423,7 +1334,6 @@ fn pad_to_width(body: String, fill: char, align: char, width: usize) -> String {
             s
         }
         _ => {
-            // Default `>` (right-align) for any unknown sigil.
             let mut s = String::with_capacity(width);
             for _ in 0..need {
                 s.push(fill);
@@ -1431,6 +1341,91 @@ fn pad_to_width(body: String, fill: char, align: char, width: usize) -> String {
             s.push_str(&body);
             s
         }
+    }
+}
+
+/// A `&str` paired with its precomputed code-point count, adapting a
+/// str body to the `CharLen + Deref<str>` bound `FormatSpec::format_string`
+/// requires for width padding.
+struct CharLenStr<'a>(&'a str, usize);
+
+impl std::ops::Deref for CharLenStr<'_> {
+    type Target = str;
+    fn deref(&self) -> &str {
+        self.0
+    }
+}
+
+impl rustpython_common::format::CharLen for CharLenStr<'_> {
+    fn char_len(&self) -> usize {
+        self.1
+    }
+}
+
+/// Render a presentation-type code for the "Unknown format code" message:
+/// printable ASCII (`0x21..=0x7f`) verbatim, anything else as `\x{hex}`.
+fn unknown_code_display(c: char) -> String {
+    if ('\u{21}'..='\u{7f}').contains(&c) {
+        c.to_string()
+    } else {
+        format!("\\x{:x}", c as u32)
+    }
+}
+
+/// Map a `FormatSpec` engine error to the matching Python exception.
+/// `spec` and `type_name` supply the value's format spec and type for the
+/// messages that name them; `integer` selects the integer-specific text
+/// for the `z` presentation code.
+fn format_spec_err(
+    err: rustpython_common::format::FormatSpecError,
+    spec: &str,
+    type_name: &str,
+    integer: bool,
+) -> crate::PyError {
+    use rustpython_common::format::FormatSpecError as E;
+    match err {
+        E::DecimalDigitsTooMany => {
+            crate::PyError::value_error("Too many decimal digits in format string")
+        }
+        // An integer never accepts a precision, so its presence is reported
+        // before the value is range-checked — the size never surfaces.
+        E::PrecisionTooBig if integer => {
+            crate::PyError::value_error("Precision not allowed in integer format specifier")
+        }
+        E::PrecisionTooBig => crate::PyError::value_error("precision too big"),
+        E::InvalidFormatSpecifier => crate::PyError::value_error(format!(
+            "Invalid format specifier '{spec}' for object of type '{type_name}'"
+        )),
+        E::UnspecifiedFormat(c1, c2) => {
+            crate::PyError::value_error(format!("Cannot specify '{c1}' with '{c2}'."))
+        }
+        E::ExclusiveFormat(c1, c2) => {
+            crate::PyError::value_error(format!("Cannot specify both '{c1}' and '{c2}'."))
+        }
+        E::UnknownFormatCode(c, _) if integer && c == 'z' => crate::PyError::value_error(
+            "Negative zero coercion (z) not allowed in integer format specifier",
+        ),
+        E::UnknownFormatCode(c, _) => crate::PyError::value_error(format!(
+            "Unknown format code '{}' for object of type '{type_name}'",
+            unknown_code_display(c)
+        )),
+        E::PrecisionNotAllowed => {
+            crate::PyError::value_error("Precision not allowed in integer format specifier")
+        }
+        E::NotAllowed(s) => crate::PyError::value_error(format!(
+            "{s} not allowed with integer format specifier 'c'"
+        )),
+        E::UnableToConvert => crate::PyError::value_error("Unable to convert int to float"),
+        E::CodeNotInRange => crate::PyError::overflow_error("%c arg not in range(0x110000)"),
+        E::ZeroPadding => {
+            crate::PyError::value_error("Zero padding is not allowed in complex format specifier")
+        }
+        E::AlignmentFlag => crate::PyError::value_error(
+            "'=' alignment flag is not allowed in complex format specifier",
+        ),
+        E::NotImplemented(c, s) => crate::PyError::value_error(format!(
+            "Format code '{c}' for object of type '{s}' not implemented yet"
+        )),
     }
 }
 
@@ -1555,68 +1550,371 @@ pub fn builtin_value_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 }
 
 fn format_with_spec(val: PyObjectRef, spec: &str) -> Result<Wtf8Buf, crate::PyError> {
-    let p = parse_spec(spec);
+    use rustpython_common::format::FormatSpec;
     unsafe {
-        if pyre_object::is_int(val) || pyre_object::is_bool(val) {
-            let v = if pyre_object::is_bool(val) {
-                pyre_object::w_bool_get_value(val) as i64
+        // `int` / `bool` / `long` share the integer formatter.  The `c`
+        // character type is formatted here instead — the shared engine pads
+        // by byte length rather than code point — and the float presentation
+        // codes (`e`/`f`/`g`/`%`) format the `f64` conversion of the value.
+        if pyre_object::is_int(val) || pyre_object::is_bool(val) || pyre_object::is_long(val) {
+            let type_name = arg_type_name(val);
+            let big = if pyre_object::is_bool(val) {
+                BigInt::from(pyre_object::w_bool_get_value(val) as i64)
             } else {
-                pyre_object::w_int_get_value(val)
+                crate::builtins::obj_to_bigint(val)
             };
-            // `newformat.py:1018-1026` — the `c` presentation type
-            // formats the integer as the single Unicode character
-            // `chr(v)`, then pads as text (default left align).
-            if p.ty == 'c' {
-                let body = u32::try_from(v)
-                    .ok()
-                    .and_then(char::from_u32)
-                    .map_or_else(|| format!("{v}"), |c| c.to_string());
-                // `c` keeps the integer default alignment (right).
-                let align = p.align.unwrap_or('>');
-                return Ok(Wtf8Buf::from_string(pad_to_width(
-                    body, p.fill, align, p.width,
-                )));
+            let parsed = FormatSpec::parse(spec);
+            if spec.ends_with('c') && parsed.is_ok() {
+                return format_char(&big, spec);
             }
-            // Float-style spec on int: coerce to f64 (matches CPython
-            // `int.__format__('.3f')` behaviour).  `%` is a float-only
-            // presentation type, so route ints through it too.
-            if matches!(p.ty, 'f' | 'F' | 'e' | 'E' | 'g' | 'G' | '%') {
-                return Ok(Wtf8Buf::from_string(format_float(v as f64, &p)));
+            // A float presentation code formats the `f64` conversion (`n` and
+            // the integer bases keep full integer precision instead).
+            if matches!(parse_spec(spec).ty, 'e' | 'E' | 'f' | 'F' | 'g' | 'G' | '%') {
+                let f = big.to_f64().unwrap_or(f64::INFINITY);
+                if f.is_infinite() {
+                    return Err(crate::PyError::overflow_error(
+                        "int too large to convert to float",
+                    ));
+                }
+                return format_finite_float(f, spec);
             }
-            return Ok(Wtf8Buf::from_string(format_int(v, &p)));
+            let parsed = parsed.map_err(|e| format_spec_err(e, spec, &type_name, true))?;
+            let s = parsed
+                .format_int(&big)
+                .map_err(|e| format_spec_err(e, spec, &type_name, true))?;
+            return Ok(Wtf8Buf::from_string(s));
         }
         if pyre_object::is_float(val) {
             let v = pyre_object::floatobject::w_float_get_value(val);
-            return Ok(Wtf8Buf::from_string(format_float(v, &p)));
+            // `inf` / `nan` go through the local formatter — the shared engine
+            // inserts the digit-grouping separator into their padding.
+            if v.is_nan() || v.is_infinite() {
+                return format_nonfinite(v, spec);
+            }
+            return format_finite_float(v, spec);
         }
         if pyre_object::is_str(val) {
-            // Read the WTF-8 view so a lone-surrogate body formats and
-            // pads by code point instead of panicking.
             let full = pyre_object::w_str_get_wtf8(val);
-            let body = if let Some(prec) = p.precision {
-                let mut t = Wtf8Buf::new();
-                let mut n = 0usize;
-                for cp in full.code_points() {
-                    if n >= prec {
-                        break;
-                    }
-                    t.push(cp);
-                    n += 1;
-                }
-                t
-            } else {
-                full.to_wtf8_buf()
-            };
-            let align = p.align.unwrap_or('<');
-            return Ok(pad_wtf8(&body, p.fill, align, p.width));
+            // The shared string formatter rejects grouping and numeric types
+            // but not a sign or `=` alignment, which are also disallowed for
+            // strings.
+            reject_string_sign_align(spec)?;
+            // A valid-UTF-8 body goes through the shared string formatter,
+            // which pads by code point.
+            if let Ok(valid) = full.as_str() {
+                let parsed = FormatSpec::parse(spec)
+                    .map_err(|e| format_spec_err(e, spec, "str", false))?;
+                let s = parsed
+                    .format_string(&CharLenStr(valid, valid.chars().count()))
+                    .map_err(|e| format_spec_err(e, spec, "str", false))?;
+                return Ok(Wtf8Buf::from_string(s));
+            }
+            // A body carrying a lone surrogate cannot be handed to the
+            // `&str`-typed formatter, so pad it by code point here.
+            return format_surrogate_str(full, spec);
         }
-        Ok(Wtf8Buf::from_string(pad_to_width(
-            crate::py_str(val)?,
-            p.fill,
-            p.align.unwrap_or('<'),
-            p.width,
-        )))
+        // Reached only for the rare builtin type whose `__format__` is the
+        // inherited default yet still routes here with a non-empty spec;
+        // format its `str()` through the shared string formatter.
+        let s = crate::py_str(val)?;
+        let parsed = FormatSpec::parse(spec)
+            .map_err(|e| format_spec_err(e, spec, &arg_type_name(val), false))?;
+        let out = parsed
+            .format_string(&CharLenStr(&s, s.chars().count()))
+            .map_err(|e| format_spec_err(e, spec, &arg_type_name(val), false))?;
+        Ok(Wtf8Buf::from_string(out))
     }
+}
+
+/// Reject a sign flag or `=` alignment in a string format spec — both are
+/// disallowed for `str` values but accepted by the shared formatter.  Only
+/// the *explicit* alignment is inspected: a leading `0` flag (which the
+/// shared parser normalises to `=`) is a zero fill and stays legal for text.
+fn reject_string_sign_align(spec: &str) -> Result<(), crate::PyError> {
+    let chars: Vec<char> = spec.chars().collect();
+    let n = chars.len();
+    let mut i = 0;
+    let mut align: Option<char> = None;
+    if n >= 2 && matches!(chars[1], '<' | '>' | '=' | '^') {
+        align = Some(chars[1]);
+        i = 2;
+    } else if n >= 1 && matches!(chars[0], '<' | '>' | '=' | '^') {
+        align = Some(chars[0]);
+        i = 1;
+    }
+    if align == Some('=') {
+        return Err(crate::PyError::value_error(
+            "'=' alignment not allowed in string format specifier",
+        ));
+    }
+    if i < n && matches!(chars[i], '+' | '-' | ' ') {
+        return Err(crate::PyError::value_error(if chars[i] == ' ' {
+            "Space not allowed in string format specifier"
+        } else {
+            "Sign not allowed in string format specifier"
+        }));
+    }
+    Ok(())
+}
+
+/// Format a `str` value whose WTF-8 body carries a lone surrogate, which
+/// the shared `&str`-typed formatter cannot accept.  Only the geometry
+/// codes that make sense for text — `[fill][align][width][.precision]`
+/// and an optional `s` type — are honoured; a numeric presentation type
+/// raises the same "unknown format code" error the valid-UTF-8 path does.
+/// A sign / `=` alignment is rejected by the caller.
+fn format_surrogate_str(body: &Wtf8, spec: &str) -> Result<Wtf8Buf, crate::PyError> {
+    let chars: Vec<char> = spec.chars().collect();
+    let n = chars.len();
+    let mut i = 0;
+    let mut fill = ' ';
+    let mut align = '<';
+    if n >= 2 && matches!(chars[1], '<' | '>' | '=' | '^') {
+        fill = chars[0];
+        align = chars[1];
+        i = 2;
+    } else if n >= 1 && matches!(chars[0], '<' | '>' | '=' | '^') {
+        align = chars[0];
+        i = 1;
+    }
+    let mut width = 0usize;
+    while i < n && chars[i].is_ascii_digit() {
+        width = width * 10 + (chars[i] as u8 - b'0') as usize;
+        i += 1;
+    }
+    let mut precision: Option<usize> = None;
+    if i < n && chars[i] == '.' {
+        i += 1;
+        let mut p = 0usize;
+        while i < n && chars[i].is_ascii_digit() {
+            p = p * 10 + (chars[i] as u8 - b'0') as usize;
+            i += 1;
+        }
+        precision = Some(p);
+    }
+    if i < n {
+        let ty = chars[i];
+        if ty != 's' {
+            return Err(crate::PyError::value_error(format!(
+                "Unknown format code '{ty}' for object of type 'str'"
+            )));
+        }
+        i += 1;
+    }
+    if i != n {
+        return Err(crate::PyError::value_error(format!(
+            "Invalid format specifier '{spec}' for object of type 'str'"
+        )));
+    }
+    let body = if let Some(prec) = precision {
+        let mut t = Wtf8Buf::new();
+        for (k, cp) in body.code_points().enumerate() {
+            if k >= prec {
+                break;
+            }
+            t.push(cp);
+        }
+        t
+    } else {
+        body.to_wtf8_buf()
+    };
+    Ok(pad_wtf8(&body, fill, align, width))
+}
+
+/// Format an integer through the `c` presentation type: reject the flags
+/// that make no sense for a single character, map the value to its code
+/// point, then pad by code point.  The caller has already confirmed the
+/// spec parses and ends in `c`.
+fn format_char(num: &BigInt, spec: &str) -> Result<Wtf8Buf, crate::PyError> {
+    let p = parse_spec(spec);
+    // Rejection order matches the reference: grouping, then precision, then
+    // sign, then alternate form — each beats the value range check.
+    if let Some(sep) = p.grouping {
+        return Err(crate::PyError::value_error(format!(
+            "Cannot specify '{sep}' with 'c'."
+        )));
+    }
+    if p.precision.is_some() {
+        return Err(crate::PyError::value_error(
+            "Precision not allowed in integer format specifier",
+        ));
+    }
+    if p.sign.is_some() {
+        return Err(crate::PyError::value_error(
+            "Sign not allowed with integer format specifier 'c'",
+        ));
+    }
+    if p.alt_form {
+        return Err(crate::PyError::value_error(
+            "Alternate form (#) not allowed with integer format specifier 'c'",
+        ));
+    }
+    let cp = match num.to_i64() {
+        None => {
+            return Err(crate::PyError::overflow_error(
+                "Python int too large to convert to C long",
+            ));
+        }
+        Some(n) => match u32::try_from(n).ok().and_then(CodePoint::from_u32) {
+            Some(cp) => cp,
+            None => {
+                return Err(crate::PyError::overflow_error(
+                    "%c arg not in range(0x110000)",
+                ));
+            }
+        },
+    };
+    let mut body = Wtf8Buf::new();
+    body.push(cp);
+    // `c` keeps the integer default alignment (right).
+    Ok(pad_wtf8(&body, p.fill, p.align.unwrap_or('>'), p.width))
+}
+
+/// Format `inf` / `nan`: validate the presentation type, then emit the
+/// signed word (`inf` / `nan`, upper-cased for `E`/`F`/`G`, `%`-suffixed
+/// for the percentage type) padded to width.  Grouping only validates
+/// here — a non-finite value has no digits to separate.
+fn format_nonfinite(v: f64, spec: &str) -> Result<Wtf8Buf, crate::PyError> {
+    let p = parse_spec(spec);
+    validate_float_spec(spec, &p)?;
+    let upper = matches!(p.ty, 'E' | 'F' | 'G');
+    let word = match (v.is_nan(), upper) {
+        (true, false) => "nan",
+        (true, true) => "NAN",
+        (false, false) => "inf",
+        (false, true) => "INF",
+    };
+    let mut magnitude = String::from(word);
+    if p.ty == '%' {
+        magnitude.push('%');
+    }
+    // A NaN carries no meaningful sign, so it takes only an explicit sign
+    // flag; an infinity takes its own sign.
+    let sign = if v.is_sign_negative() && !v.is_nan() {
+        "-"
+    } else {
+        match p.sign {
+            Some('+') => "+",
+            Some(' ') => " ",
+            _ => "",
+        }
+    };
+    let body = format!("{sign}{magnitude}");
+    Ok(Wtf8Buf::from_string(pad_to_width(
+        body,
+        p.fill,
+        p.align.unwrap_or('>'),
+        p.width,
+    )))
+}
+
+/// Validate a float presentation spec against the reference rules,
+/// independent of the value.  Structural errors (bad flag order, a
+/// precision beyond `i32`, trailing garbage) come from the shared parser
+/// for their exact messages; the type and grouping-with-`n` checks are
+/// applied on top.
+fn validate_float_spec(spec: &str, p: &ParsedSpec) -> Result<(), crate::PyError> {
+    rustpython_common::format::FormatSpec::parse(spec)
+        .map_err(|e| format_spec_err(e, spec, "float", false))?;
+    if !matches!(p.ty, '\0' | 'e' | 'E' | 'f' | 'F' | 'g' | 'G' | 'n' | '%') {
+        return Err(crate::PyError::value_error(format!(
+            "Unknown format code '{}' for object of type 'float'",
+            unknown_code_display(p.ty)
+        )));
+    }
+    if let Some(sep) = p.grouping
+        && p.ty == 'n'
+    {
+        return Err(crate::PyError::value_error(format!(
+            "Cannot specify '{sep}' with 'n'."
+        )));
+    }
+    Ok(())
+}
+
+/// Format a finite `f64` through `spec`.  Fixed-point (`f`/`F`) and
+/// locale-general (`n`) presentations pad and group exactly through the shared
+/// engine, so delegate them.  The exponent and general forms stay local: the
+/// shared grouping splits only on the decimal point (corrupting an exponent
+/// into `1e,+20`) and its empty-type precision picks exponent notation where a
+/// fixed form is required.
+fn format_finite_float(v: f64, spec: &str) -> Result<Wtf8Buf, crate::PyError> {
+    let p = parse_spec(spec);
+    validate_float_spec(spec, &p)?;
+    if matches!(p.ty, 'f' | 'F' | 'n') {
+        let parsed = rustpython_common::format::FormatSpec::parse(spec)
+            .map_err(|e| format_spec_err(e, spec, "float", false))?;
+        let s = parsed
+            .format_float(v)
+            .map_err(|e| format_spec_err(e, spec, "float", false))?;
+        return Ok(Wtf8Buf::from_string(s));
+    }
+    Ok(Wtf8Buf::from_string(format_float(v, &p)))
+}
+
+/// Format a finite float through the presentation-type `p.ty`, applying
+/// sign, alt-form trailing dot, integer-run grouping, and width padding.
+fn format_float(v: f64, p: &ParsedSpec) -> String {
+    let prec = p.precision.unwrap_or(6);
+    // Format on `v.abs()` so the sign is reattached exactly once below;
+    // Rust's `{:e}`/`{:E}` would otherwise emit it too.
+    let abs = v.abs();
+    let body = match p.ty {
+        // Rust's `{:e}` emits a sign-less, minimal exponent ("e2"); C-style
+        // formatting wants an explicit, two-digit exponent ("e+02").
+        'e' => crate::baseobjspace::normalise_exponent(&format!("{abs:.prec$e}"), false),
+        'E' => crate::baseobjspace::normalise_exponent(&format!("{abs:.prec$E}"), true),
+        'f' | 'F' => format!("{abs:.prec$}"),
+        // Percent type: scale by 100, format fixed, suffix `%`.
+        '%' => format!("{:.*}%", prec, abs * 100.0),
+        // `g`/`G` format general with trailing zeros trimmed unless alt-form
+        // keeps them; `n` matches `g` with locale grouping (none in C).
+        'g' | 'G' | 'n' => crate::baseobjspace::format_g_like(abs, prec, p.ty == 'G', p.alt_form),
+        '\0' => {
+            // No presentation type formats like `repr()`; an explicit precision
+            // switches to a `g`-like form with a lower scientific cutoff, while
+            // bare alt-form only guarantees the trailing dot (added below).
+            match p.precision {
+                Some(_) => crate::baseobjspace::format_no_type_prec(abs, prec, p.alt_form),
+                None => crate::display::format_float_repr(abs),
+            }
+        }
+        _ => format!("{abs}"),
+    };
+    let sign_char = if v.is_sign_negative() && !v.is_nan() {
+        "-"
+    } else {
+        match p.sign {
+            Some('+') => "+",
+            Some(' ') => " ",
+            _ => "",
+        }
+    };
+    // Alt-form `#` keeps the decimal point even when no fractional digits
+    // remain; it sits before the exponent (`e`) or percent (`%`) suffix.
+    let body = if p.alt_form
+        && !body.contains('.')
+        && matches!(p.ty, 'e' | 'E' | 'f' | 'F' | 'g' | 'G' | '%' | '\0')
+    {
+        match body.find(['e', 'E', '%']) {
+            Some(pos) => format!("{}.{}", &body[..pos], &body[pos..]),
+            None => format!("{body}."),
+        }
+    } else {
+        body
+    };
+    let align = p.align.unwrap_or('>');
+    let body = match p.grouping {
+        // Sign-aware zero padding groups the pad zeros together with the
+        // digits, so the width must be threaded into the grouping step.
+        Some(sep) if align == '=' && p.fill == '0' => {
+            group_integer_zero_padded(&body, sep, p.width.saturating_sub(sign_char.len()))
+        }
+        Some(sep) => group_integer_prefix(&body, sep),
+        None => body,
+    };
+    let body = format!("{sign_char}{body}");
+    pad_to_width(body, p.fill, align, p.width)
 }
 
 /// Pad a WTF-8 string body to `width` code points with `fill`,
@@ -1648,127 +1946,6 @@ fn pad_wtf8(body: &Wtf8, fill: char, align: char, width: usize) -> Wtf8Buf {
         }
     }
     out
-}
-
-fn format_int(v: i64, p: &ParsedSpec) -> String {
-    let abs = v.unsigned_abs();
-    let digits = match p.ty {
-        'x' => format!("{abs:x}"),
-        'X' => format!("{abs:X}"),
-        'o' => format!("{abs:o}"),
-        'b' => format!("{abs:b}"),
-        _ => format!("{abs}"),
-    };
-    // `newformat.py:646-651` — `,` always groups by 3; `_` groups by 4
-    // for the bit presentations (b/o/x/X) and by 3 otherwise.
-    let digits = if let Some(sep) = p.grouping {
-        let interval = if sep == '_' && matches!(p.ty, 'x' | 'X' | 'o' | 'b') {
-            4
-        } else {
-            3
-        };
-        group_digits(&digits, sep, interval)
-    } else {
-        digits
-    };
-    let sign_char = if v < 0 {
-        "-"
-    } else {
-        match p.sign {
-            Some('+') => "+",
-            Some(' ') => " ",
-            _ => "",
-        }
-    };
-    // `pypy/objspace/std/newformat.py:454-460` — alt-form `#`
-    // prepends the matching base prefix for x/X/o/b; ignored for
-    // d / decimal.
-    let alt_prefix = if p.alt_form {
-        match p.ty {
-            'x' => "0x",
-            'X' => "0X",
-            'o' => "0o",
-            'b' => "0b",
-            _ => "",
-        }
-    } else {
-        ""
-    };
-    let body = format!("{sign_char}{alt_prefix}{digits}");
-    // `pypy/objspace/std/newformat.py:454-468` — when zero_pad is
-    // set, parse_spec already promoted `align = '='` and `fill =
-    // '0'` so `pad_to_width` performs the sign-aware insertion.
-    let align = p.align.unwrap_or('>');
-    pad_to_width(body, p.fill, align, p.width)
-}
-
-fn format_float(v: f64, p: &ParsedSpec) -> String {
-    let prec = p.precision.unwrap_or(6);
-    // Always format on `v.abs()` so the sign is reattached exactly
-    // once below.  Rust's `{:e}` / `{:E}` include the sign already,
-    // which previously duplicated `-` for negative values; using
-    // `abs()` consistently fixes that.
-    let abs = v.abs();
-    let body = match p.ty {
-        // `pypy/objspace/std/newformat.py` `format_e_g_complex`
-        // mirrors C printf — the exponent has an explicit sign and
-        // is zero-padded to two digits ("e+02", "E-04").  Rust's
-        // `{:e}` emits a sign-less, minimal exponent ("e2"), so
-        // route through `normalise_exponent` here.
-        'e' => crate::baseobjspace::normalise_exponent(&format!("{abs:.prec$e}"), false),
-        'E' => crate::baseobjspace::normalise_exponent(&format!("{abs:.prec$E}"), true),
-        'f' | 'F' => format!("{:.*}", prec, abs),
-        // `newformat.py` percent type: scale by 100, format fixed, suffix `%`.
-        '%' => format!("{:.*}%", prec, abs * 100.0),
-        // `g`/`G` always format `general`: default precision 6, trailing
-        // zeros trimmed unless alt-form keeps them.  `n` matches `g` but
-        // takes its digit grouping from the locale (none in the C locale).
-        'g' | 'G' | 'n' => crate::baseobjspace::format_g_like(abs, prec, p.ty == 'G', p.alt_form),
-        '\0' => {
-            // No presentation type formats like `repr()` — the shortest
-            // round-trip string, which keeps the trailing `.0` for whole
-            // values.  An explicit precision (or `#`) switches to `g`.
-            if p.precision.is_some() || p.alt_form {
-                crate::baseobjspace::format_g_like(abs, prec, false, p.alt_form)
-            } else {
-                crate::display::format_float_repr(abs)
-            }
-        }
-        _ => format!("{}", abs),
-    };
-    let sign_char = if v.is_sign_negative() && !v.is_nan() {
-        "-"
-    } else {
-        match p.sign {
-            Some('+') => "+",
-            Some(' ') => " ",
-            _ => "",
-        }
-    };
-    // `pypy/objspace/std/newformat.py:464-468` — alt-form `#` keeps
-    // the trailing dot (and trailing zeros) for floats so the
-    // requested precision is visible even when the value is whole.
-    // Cheapest expression: append `.` if missing.
-    let body = if p.alt_form
-        && !body.contains('.')
-        && matches!(p.ty, 'e' | 'E' | 'f' | 'F' | 'g' | 'G' | '\0')
-    {
-        format!("{body}.")
-    } else {
-        body
-    };
-    // `newformat.py:646-648` — float groupings always use interval 3,
-    // applied to the integer run only (the fractional / exponent / `%`
-    // suffix is left untouched).
-    let body = match p.grouping {
-        Some(sep) => group_integer_prefix(&body, sep),
-        None => body,
-    };
-    let body = format!("{sign_char}{body}");
-    // Same `=`/`'0'` promotion as `format_int`; pad_to_width does
-    // the sign-aware insertion.
-    let align = p.align.unwrap_or('>');
-    pad_to_width(body, p.fill, align, p.width)
 }
 
 /// runicode.py:333 unicode_encode_utf_8 + interp_codecs.py
