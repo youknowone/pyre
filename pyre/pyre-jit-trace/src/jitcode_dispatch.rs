@@ -2899,9 +2899,71 @@ pub(crate) fn drive_outer_frame_continuation(
         regs_f[num_regs_f + i] = ctx.const_float(v);
     }
 
+    let root_frame = compute_bridge_root_parent_frame(root_sym, ctx, root_pc)?;
+    let outer_jitcode_index = root_frame.jitcode_index;
+    let outer_active_boxes = root_frame.boxes.clone();
+
+    // Seed the full live outer-frame register file, matching `consume_boxes`
+    // (resume.py:1054-1055 + `_callback_i/_r/_f`) which fills every live
+    // register color of `framestack[-1]` from the resume numbering.  Without
+    // this only `frame_reg`/`call_dst_reg` are bound: an operand live across
+    // the resumed call (e.g. the first result of `return fib(n-1)+fib(n-2)`)
+    // stays `OpRef::NONE`, and the second residual call aborts with
+    // `ResidualCallArgUnbound`.
+    //
+    // `root_frame.boxes` already holds each live register's resolved box in
+    // `banks.int ++ banks.ref_ ++ banks.float` liveness order
+    // (`collect_outer_active_boxes`), applying the color->slot inversion the
+    // Ref bank needs.  Re-query the same (deterministic) liveness banks to
+    // recover each box's register color and scatter it into the color-indexed
+    // walker banks.  Only live colors are touched; dead slots stay
+    // `OpRef::NONE` so a later guard snapshot cannot capture a stale operand.
+    {
+        let banks = crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
+            outer_jitcode_index as i32,
+            root_pc as i32,
+            majit_ir::resumedata::NO_JITCODE_PC,
+        );
+        let mut cursor = 0usize;
+        for &color in &banks.int {
+            let v = outer_active_boxes.get(cursor).copied().unwrap_or(OpRef::NONE);
+            cursor += 1;
+            let c = color as usize;
+            if c < regs_i.len() && v != OpRef::NONE {
+                regs_i[c] = v;
+                if let Some(majit_ir::Value::Int(n)) = ctx.box_value(v) {
+                    concrete_i[c] = ConcreteValue::Int(n);
+                }
+            }
+        }
+        for &color in &banks.ref_ {
+            let v = outer_active_boxes.get(cursor).copied().unwrap_or(OpRef::NONE);
+            cursor += 1;
+            let c = color as usize;
+            if c < regs_r.len() && v != OpRef::NONE {
+                regs_r[c] = v;
+                if let Some(majit_ir::Value::Ref(majit_ir::GcRef(ptr))) = ctx.box_value(v) {
+                    if ptr != 0 && ptr != usize::MAX {
+                        concrete_r[c] = ConcreteValue::Ref(ptr as pyre_object::PyObjectRef);
+                    }
+                }
+            }
+        }
+        for &color in &banks.float {
+            let v = outer_active_boxes.get(cursor).copied().unwrap_or(OpRef::NONE);
+            cursor += 1;
+            let c = color as usize;
+            if c < regs_f.len() && v != OpRef::NONE {
+                regs_f[c] = v;
+            }
+        }
+    }
+
     // Seed the standard virtualizable identity (frame) so the outer's vable
     // reads hit the standard fast path, and the delivered callee result into the
-    // outer's call-dst register (`make_result_of_lastop`).
+    // outer's call-dst register (`make_result_of_lastop`).  These overwrite the
+    // scattered snapshot values (the call-dst slot was nulled in
+    // `compute_bridge_root_parent_frame` for the not-yet-produced result).
     if frame_reg < regs_r.len() {
         regs_r[frame_reg] = frame_box;
         if let Some(majit_ir::Value::Ref(majit_ir::GcRef(ptr))) = ctx.box_value(frame_box) {
@@ -2914,10 +2976,6 @@ pub(crate) fn drive_outer_frame_continuation(
             concrete_r[call_dst_reg] = ConcreteValue::Ref(ptr as pyre_object::PyObjectRef);
         }
     }
-
-    let root_frame = compute_bridge_root_parent_frame(root_sym, ctx, root_pc)?;
-    let outer_jitcode_index = root_frame.jitcode_index;
-    let outer_active_boxes = root_frame.boxes.clone();
 
     let root_code = jc.code.as_slice();
     let lookup_ref: &SubJitCodeLookup = &sub_jitcode_lookup;
