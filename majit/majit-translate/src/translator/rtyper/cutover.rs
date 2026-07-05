@@ -54,7 +54,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-use crate::codewriter::type_state::{valuetype_to_concrete, ConcreteType};
+use crate::codewriter::type_state::{ConcreteType, valuetype_to_concrete};
 use crate::flowspace::argument::Signature;
 use crate::flowspace::model::{
     Block, BlockRefExt, ConstValue, Constant, GraphFunc, Hlvalue, Link, Variable,
@@ -739,12 +739,51 @@ fn dead_op_result_vars(graph: &LegacyGraph) -> std::collections::HashSet<Variabl
         for op in &block.operations {
             if let Some(r) = &op.result
                 && !op_read.contains(r)
+                && op_result_can_remove(&op.kind)
             {
                 dead.insert(r.clone());
             }
         }
     }
     dead
+}
+
+/// Whether an op's result may be dropped when unread, mirroring RPython's
+/// `transform_dead_op_vars` `canremove(op, block)` gate (`simplify.py:441`):
+/// only side-effect-free ops (`op.opname in CanRemove`) have their result
+/// binding removed; a store, a call, a guard, or the block's raising op keeps
+/// its result even when locally unread.  The upstream `CanRemove` set is the
+/// pure reads/arithmetic/constructors (`getattr`/`getitem`/`len`/`lt`/`eq`/
+/// `add`/`isinstance`/`newtuple`/… + `enum_ops_without_sideeffects`); the
+/// pyre `OpKind` equivalents are the field/array/interior reads, the length
+/// read, the arithmetic/comparison `BinOp`/`UnaryOp`, the `isinstance` test,
+/// the immutable-field record, and the tuple/list constructors.  Every op
+/// that mutates, calls, guards, forces, or aborts is excluded — its unread
+/// result is NOT a dead-var-pass artifact, so a `real=None` on it is a genuine
+/// typing divergence rather than a dropped binding.
+fn op_result_can_remove(kind: &crate::model::OpKind) -> bool {
+    use crate::model::OpKind;
+    matches!(
+        kind,
+        OpKind::FieldRead { .. }
+            | OpKind::ArrayRead { .. }
+            | OpKind::ArrayLen { .. }
+            | OpKind::InteriorFieldRead { .. }
+            | OpKind::BinOp { .. }
+            | OpKind::UnaryOp { .. }
+            | OpKind::IsInstance { .. }
+            | OpKind::VtableMethodPtr { .. }
+            | OpKind::RecordQuasiImmutField { .. }
+            | OpKind::NewTuple { .. }
+            | OpKind::NewList { .. }
+            | OpKind::ConstInt(_)
+            | OpKind::ConstBool(_)
+            | OpKind::ConstFloat(_)
+            | OpKind::ConstRef(_)
+            | OpKind::ConstRefNull
+            | OpKind::ConstRefAddr(_)
+            | OpKind::ConstSymbolic { .. }
+    )
 }
 
 /// Diff the real path's per-Variable kinds against the legacy walker's
@@ -849,24 +888,28 @@ fn collect_divergences(
             && real_present.is_none()
             && duplicate_inputargs.contains(var);
         // A dead op *result* — no op or exitswitch reads it, only `Link.args`
-        // forwarding does — is dropped by the real path's
-        // `transform_dead_op_vars` (`simplify.py:422`), so it is untyped in
+        // forwarding does, and its op is `canremove`-eligible
+        // ([`op_result_can_remove`]) — is dropped by the real path's
+        // `transform_dead_op_vars` (`simplify.py:441`), so it is untyped in
         // the real graph while the legacy walker types every op result.  The
-        // hitters are erased-element `getarrayitem` reads whose value is
-        // never observed: `swap_values`'s two write-back positions and
-        // `store_local_value`'s dead read half (the paired `setarrayitem` is
-        // the only live effect).  `real=None` here is the dead-result
-        // artifact, not a kind divergence — scoped to `legacy=GcRef` (the
-        // erased `<E>::Value` element family) so a genuine `Signed`/`Float`
-        // dropped result is never silently accepted.  The acceptance is
-        // constrained to the `real_present.is_none()` (untyped) case: a
-        // *positively-typed* result whose kind conflicts (the rejected
-        // `set_update` element mistyped `Signed`) is never in this set,
-        // because a mistyped element is op-read (fed to `w_set_add` /
-        // `w_list_append`) and so excluded by the `op_operand_vars` scan.
-        let real_dropped_dead_op_result = legacy_kind == ConcreteType::GcRef
-            && real_present.is_none()
-            && dead_op_results.contains(var);
+        // hitters span both register banks: erased-element `getarrayitem`
+        // reads never observed (`swap_values`'s write-back positions,
+        // `store_local_value`'s dead read half), and dead scalar bounds
+        // checks (`idx < code_varnames_len` `lt`, a fieldless-enum `getfield`)
+        // whose branch the real path folded — `delete_*` / `import_*` /
+        // `load_super_attr` / `w_bytes_getitem` / `bigint_external_bytes`.
+        // `real=None` here is the dead-result artifact, not a kind divergence.
+        // Not scoped by legacy kind: the `canremove` gate on
+        // [`dead_op_result_vars`] already excludes every side-effecting /
+        // call / store / guard op, so a `real=None` on a value in this set is
+        // always the dropped binding — the legacy kind it carries (`GcRef` for
+        // an erased element, `Signed` for a folded comparison) is irrelevant.
+        // The acceptance stays constrained to the `real_present.is_none()`
+        // (untyped) case: a *positively-typed* result whose kind conflicts
+        // (the rejected `set_update` element mistyped `Signed`) is never in
+        // this set, because a mistyped element is op-read (fed to `w_set_add`
+        // / `w_list_append`) and so excluded by the `op_operand_vars` scan.
+        let real_dropped_dead_op_result = real_present.is_none() && dead_op_results.contains(var);
         let diverges = if real_refines_gcref_to_void
             || real_refines_gcref_to_signed
             || real_dropped_duplicate_inputarg
@@ -3214,7 +3257,10 @@ mod tests {
             operations: vec![],
             exitswitch: None,
             exits: vec![crate::model::Link::new_mixed(
-                vec![LinkArg::Value(v1_var.clone()), LinkArg::Value(v1_var.clone())],
+                vec![
+                    LinkArg::Value(v1_var.clone()),
+                    LinkArg::Value(v1_var.clone()),
+                ],
                 graph.exceptblock,
                 None,
             )],
@@ -3379,6 +3425,85 @@ mod tests {
         collect_divergences(&real_state, &graph)
     }
 
+    /// Same shape as [`diff_dead_op_result`], but `mid` defines the dead
+    /// result through a side-effecting `Call` (a non-`canremove` op).  The
+    /// real path cannot drop a call result — the call must still run for its
+    /// effect — so `dead_op_result_vars` must NOT classify it, and the
+    /// untyped `real=None` stays a divergence.
+    fn diff_dead_call_result(legacy_kind: ConcreteType) -> Vec<String> {
+        let mut graph = LegacyGraph::new("diff_dead_call_result");
+        let vars = mint_vars(&mut graph, 3);
+        let base = vars[0].clone();
+        let index = vars[1].clone();
+        let dead = vars[2].clone();
+        let mid_id = crate::model::BlockId(7);
+        let startblock = Block {
+            id: graph.startblock,
+            inputargs: block_inputargs(&vars, &[0, 1]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![crate::model::Link::new_mixed(
+                vec![LinkArg::Value(base.clone()), LinkArg::Value(index.clone())],
+                mid_id,
+                None,
+            )],
+            framestate: None,
+            dead: false,
+        };
+        let midblock = Block {
+            id: mid_id,
+            inputargs: block_inputargs(&vars, &[0, 1]),
+            operations: vec![crate::model::SpaceOperation {
+                result: Some(dead.clone()),
+                kind: crate::model::OpKind::Call {
+                    target: crate::model::CallTarget::FunctionPath {
+                        segments: vec!["side_effect".into()],
+                    },
+                    args: vec![base.clone(), index.clone()],
+                    result_ty: ValueType::Ref(None),
+                },
+            }],
+            exitswitch: None,
+            exits: vec![link_to_returnblock(
+                vec![LinkArg::Value(dead.clone())],
+                graph.returnblock,
+            )],
+            framestate: None,
+            dead: false,
+        };
+        let returnblock = Block {
+            id: graph.returnblock,
+            inputargs: block_inputargs(&vars, &[2]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        };
+        graph.blocks = vec![startblock, midblock, returnblock];
+        crate::model::FunctionGraph::set_concretetype_of_inline(&dead, legacy_kind);
+        let real_state = HashMap::new();
+        collect_divergences(&real_state, &graph)
+    }
+
+    #[test]
+    fn collect_divergences_rejects_dead_call_result_dropped() {
+        // A dead result of a side-effecting `Call` is NOT `canremove`, so the
+        // `canremove` gate on `dead_op_result_vars` excludes it: an untyped
+        // `real=None` on such a var is a genuine divergence, not the
+        // dead-var-pass artifact.  Holds for either legacy kind.
+        assert_eq!(
+            diff_dead_call_result(ConcreteType::Signed).len(),
+            1,
+            "a Signed dead Call result is not a canremove drop → still diverges"
+        );
+        assert_eq!(
+            diff_dead_call_result(ConcreteType::GcRef).len(),
+            1,
+            "a GcRef dead Call result is not a canremove drop → still diverges"
+        );
+    }
+
     #[test]
     fn collect_divergences_accepts_gcref_dead_op_result_dropped() {
         // A `legacy=GcRef` op result no op reads (only link-forwarded) is
@@ -3394,13 +3519,17 @@ mod tests {
     }
 
     #[test]
-    fn collect_divergences_rejects_signed_dead_op_result_dropped() {
-        // Scoped to `GcRef`: a `legacy=Signed` dead op result is still a
-        // divergence (the erased-`<E>::Value` element family is GcRef-only).
-        assert_eq!(
-            diff_dead_op_result(ConcreteType::Signed).len(),
-            1,
-            "a Signed dead op result left untyped is still a divergence"
+    fn collect_divergences_accepts_signed_dead_op_result_dropped() {
+        // A `legacy=Signed` dead op result of a `canremove` op (here the
+        // `ArrayRead`) is likewise the `transform_dead_op_vars` drop artifact,
+        // not a divergence: the `canremove` gate on `dead_op_result_vars`
+        // already excludes every side-effecting op, so the dropped binding is
+        // sound regardless of the kind the legacy walker assigned it (a folded
+        // `idx < len` bounds check is Signed, a dead element read is GcRef).
+        assert!(
+            diff_dead_op_result(ConcreteType::Signed).is_empty(),
+            "a Signed dead op result of a canremove op is the dead-var-pass \
+             artifact, not a divergence"
         );
     }
 
