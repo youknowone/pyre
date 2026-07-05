@@ -252,6 +252,14 @@ impl pyre_interpreter::SharedOpcodeHandler for crate::state::MIFrame {
                 result_concrete = crate::state::ConcreteValue::from_pyobj(result);
             }
         }
+        // mapdict.py:1479-1537 LOAD_ATTR fast path: fold a plain instance-attr
+        // read to guarded inline storage access; falls back to the residual
+        // getattr below for every other shape.
+        if !c_obj.is_null() {
+            if let Some(opref) = self.try_load_attr_fast_path(obj, c_obj, name)? {
+                return Ok(crate::state::FrontendOp::new(opref, result_concrete));
+            }
+        }
         let opref = self.trace_load_attr(obj.opref, name)?;
         Ok(crate::state::FrontendOp::new(opref, result_concrete))
     }

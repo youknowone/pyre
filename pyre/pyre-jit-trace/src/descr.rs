@@ -1851,6 +1851,22 @@ pub fn type_version_tag_descr() -> DescrRef {
     )
 }
 
+/// `W_ObjectObject.map` (`objectobject.rs:38`) — the erased `*const MapNode`
+/// instance shape pointer, `self.map` of PyPy's `MapdictStorageMixin`
+/// (`mapdict.py:907`). Read as an opaque `Int` word so the LOAD_ATTR fast path
+/// can `guard_value` it to a constant map (`jit.promote(self.map)`,
+/// mapdict.py:905), after which the resolved `storageindex` is a green
+/// constant. The map nodes are interned + immortal, so the pointer is a stable
+/// identity and the guard need not treat it as a GC ref.
+pub fn object_map_descr() -> DescrRef {
+    make_field_descr(
+        core::mem::offset_of!(pyre_object::W_ObjectObject, map),
+        8,
+        Type::Int,
+        false,
+    )
+}
+
 /// rlist.py:116 `l.length` — live length of a list under the Object
 /// strategy. Under Integer/Float strategies this field is 0 and
 /// consumers must dispatch on `list.strategy` first.

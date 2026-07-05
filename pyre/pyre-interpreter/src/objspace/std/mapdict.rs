@@ -1156,6 +1156,80 @@ unsafe fn load_attr_slowpath(
     crate::baseobjspace::getattr_str(w_obj, name)
 }
 
+/// The JIT LOAD_ATTR fast-path resolver: the `load_attr_slowpath`
+/// (mapdict.py:1492-1537) resolution steps, but instead of reading the value it
+/// returns the ingredients the meta-tracer needs to fold the read to a guarded
+/// inline `storage[storageindex]` — `(w_type, version_tag, map, storageindex)`.
+///
+/// Returns `None` (leave the access on the residual `space.getattr`) for every
+/// shape the inline read cannot cover: non-instance receiver, missing map,
+/// custom `__getattribute__`, uncacheable `version_tag`, a data-descriptor /
+/// `INVALID` classification, an attribute not present on this instance's map,
+/// or an unboxed slot (whose read boxes a longlong — not a plain slot fetch).
+/// This is the mapdict analog of `baseobjspace::load_method_fast_path`, sharing
+/// the same gates so the symbolic trace and the concrete frame agree.
+///
+/// # Safety
+/// `w_obj` must be a live object.
+pub unsafe fn load_attr_fast_path(
+    w_obj: PyObjectRef,
+    name: &str,
+) -> Option<(PyObjectRef, u64, MapRef, usize)> {
+    // mapdict.py:1495 `if map is not None:` — also filters non-instances.
+    let map = unsafe { mapdict_map_or_null(w_obj) };
+    if map.is_null() {
+        return None;
+    }
+    // mapdict.py:1496 `w_type = map.terminator.w_cls`.
+    let w_type = unsafe { (*(*map).terminator()).as_terminator() }.w_cls;
+    if w_type.is_null() {
+        return None;
+    }
+    // mapdict.py:1497-1499 — a custom `__getattribute__` handles the access;
+    // not soundly foldable to a storage read.
+    if unsafe { crate::baseobjspace::getattribute_if_not_from_object(w_type) }.is_some() {
+        return None;
+    }
+    // mapdict.py:1500-1501 `version_tag = w_type.version_tag(); if is not None:`.
+    let version_tag = unsafe { crate::baseobjspace::w_type_version_tag(w_type) };
+    if version_tag == 0 {
+        return None;
+    }
+    // mapdict.py:1504-1524 `_pure_lookup_where_with_method_cache` + classify.
+    let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where(w_type, name) };
+    let (attrkind, is_slot) = unsafe { classify_attr(w_type, w_descr, false) };
+    // mapdict.py:1526 `if attrkind != INVALID:`.
+    if attrkind == INVALID {
+        return None;
+    }
+    let attrname = if is_slot { "slot" } else { name };
+    // mapdict.py:1527 `attr = map.find_map_attr(attrname, attrkind)`.
+    let attr = unsafe { find_map_attr(map, Wtf8::new(attrname), attrkind) }?;
+    let p = unsafe { (*attr).as_plain() };
+    // The inline read is a plain `storage[storageindex]` fetch; an unboxed slot
+    // (mapdict.py:591-601) instead boxes a longlong out of a shared list, so
+    // leave it on the residual.
+    if p.unboxed.is_some() {
+        return None;
+    }
+    Some((w_type, version_tag, map, p.storageindex))
+}
+
+/// mapdict.py:914-916 `_mapdict_read_storage(storageindex)` for a
+/// `W_ObjectObject` — the boxed-slot read the JIT LOAD_ATTR fast path folds
+/// to. `load_attr_fast_path` already established that the resolved attribute
+/// is a boxed plain slot (not unboxed), so this is a straight
+/// `storage[storageindex]` fetch with no conversion.
+///
+/// # Safety
+/// `w_obj` must be a live `W_ObjectObject` whose `storage` holds at least
+/// `storageindex + 1` slots — guaranteed when `storageindex` came from this
+/// instance's map via `load_attr_fast_path`.
+pub unsafe fn read_boxed_storage(w_obj: PyObjectRef, storageindex: usize) -> PyObjectRef {
+    let inst = unsafe { &*(w_obj as *const pyre_object::W_ObjectObject) };
+    inst._mapdict_read_storage(storageindex)
+}
+
 /// mapdict.py:1574-1586 `STORE_ATTR_caching`. The interpreter STORE_ATTR fast
 /// path (reached only under `not we_are_jitted()`): a monomorphic hit writes
 /// straight through the cached attribute; anything else drops to

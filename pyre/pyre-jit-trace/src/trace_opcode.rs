@@ -8723,6 +8723,75 @@ impl TraceHelperAccess for MIFrame {
 // (see majit/majit-translate/src/codegen.rs::generate_trait_impls).
 
 impl MIFrame {
+    /// `mapdict.py:1479-1537 LOAD_ATTR_caching/slowpath` JIT fast path for a
+    /// plain (non-method) instance attribute.  Returns `Some(value_op)` after
+    /// recording the guarded inline read; returns `None` (recording nothing)
+    /// when the predicate does not hold, so the caller records the residual
+    /// getattr fallback.
+    ///
+    /// The recorded shape mirrors PyPy's promoted-mapdict read:
+    /// `guard_class(obj, C_type)` + `guard_value(obj.version_tag, C_vtag)`
+    /// (the "default `__getattribute__`, no data-descriptor shadow" invariant,
+    /// deopting when `mutated()` bumps the tag) + `guard_value(obj.map, C_map)`
+    /// (`jit.promote(self.map)`), after which the resolved `storageindex` is a
+    /// green constant and the value comes from a single `jit_mapdict_read`
+    /// storage fetch — replacing `getattr_str`'s MRO walk + name hash +
+    /// descriptor dispatch.  Scope is the boxed plain-instance-attribute hit
+    /// (`load_attr_fast_path`); every other shape (data descriptors, unboxed
+    /// slots, custom `__getattribute__`, missing map) falls back to the
+    /// unchanged residual, so behaviour is identical, only foldability differs.
+    pub(crate) fn try_load_attr_fast_path(
+        &mut self,
+        obj: FrontendOp,
+        concrete_obj: PyObjectRef,
+        name: &str,
+    ) -> Result<Option<OpRef>, PyError> {
+        // mapdict.py:1495-1533 resolution, shared with the concrete
+        // interpreter so the symbolic trace and the concrete frame agree on
+        // the receiver shape.  `None` = every unsupported shape → residual.
+        let (w_type, version_tag, map, storageindex) =
+            match unsafe { pyre_interpreter::objspace::std::mapdict::load_attr_fast_path(
+                concrete_obj, name,
+            ) } {
+                Some(tuple) => tuple,
+                None => return Ok(None),
+            };
+
+        let value_op = self.with_ctx(|this, ctx| {
+            // mapdict.py:1496 `w_type = map.terminator.w_cls` → pin the
+            // receiver type so `version_tag` is a green constant.
+            this.guard_class(ctx, obj.opref, w_type as *const PyType);
+            let w_type_const = ctx.const_ref(w_type as i64);
+            // mapdict.py:1500 `version_tag = w_type.version_tag()`: read the
+            // live `_version_tag` field and `guard_value` it to a constant so
+            // the "no data-descriptor shadow / default __getattribute__"
+            // classification stays valid; the guard deopts when `mutated()`
+            // bumps the tag.
+            let vt_op =
+                opimpl_getfield_gc_i(ctx, w_type_const, crate::descr::type_version_tag_descr());
+            this.implement_guard_value(ctx, vt_op, version_tag as i64);
+            // mapdict.py:905 `jit.promote(self.map)`: read the instance map
+            // pointer and `guard_value` it to the constant map.  With the map
+            // pinned, the `storageindex` resolved off it (mapdict.py:427,
+            // an `_immutable_field_`) is a valid green constant; the guard
+            // deopts if the instance's shape changes.
+            let map_op = opimpl_getfield_gc_i(ctx, obj.opref, crate::descr::object_map_descr());
+            this.implement_guard_value(ctx, map_op, map as i64);
+            // mapdict.py:914-916 `_mapdict_read_storage(storageindex)`: the
+            // live value read.  Not pure (the slot is written by STORE_ATTR),
+            // so it stays a residual — but `storageindex` is a green constant
+            // and the guards above removed the lookup, leaving one fetch.
+            let idx_const = ctx.const_int(storageindex as i64);
+            crate::helpers::emit_trace_call_ref_typed(
+                ctx,
+                crate::helpers::jit_mapdict_read as *const (),
+                &[obj.opref, idx_const],
+                &[Type::Ref, Type::Int],
+            )
+        });
+        Ok(Some(value_op))
+    }
+
     /// `callmethod.py:25-85 LOAD_METHOD` JIT fast path.  Returns `true` after
     /// recording the folded method-dispatch sequence and pushing the two
     /// stack values; returns `false` (recording nothing) when the predicate

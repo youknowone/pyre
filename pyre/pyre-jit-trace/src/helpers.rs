@@ -225,6 +225,27 @@ pub extern "C" fn jit_instance_getdictvalue(w_obj: i64, w_name: i64) -> i64 {
     w_value.unwrap_or(PY_NULL) as i64
 }
 
+/// mapdict.py:914-916 `_mapdict_read_storage(storageindex)` — the LOAD_ATTR
+/// fast-path storage read.  A plain `extern "C"` i64-ABI wrapper recorded as a
+/// residual call, like [`jit_instance_getdictvalue`]: the value changes per
+/// instance so it is not folded, but `storageindex` is a green constant (the
+/// fast path resolved it off the promoted map) and the surrounding class / map
+/// / version_tag guards already established the shape, so this replaces
+/// `getattr_str`'s MRO walk + name hash + descriptor dispatch with a single
+/// `storage[index]` fetch.  Null receiver / non-instance returns `PY_NULL`
+/// (the fast path pinned the receiver type with `guard_class`, so this only
+/// guards against a torn recording).
+pub extern "C" fn jit_mapdict_read(w_obj: i64, storageindex: i64) -> i64 {
+    let w_obj = w_obj as PyObjectRef;
+    if w_obj.is_null() || !unsafe { is_instance(w_obj) } {
+        return PY_NULL as i64;
+    }
+    unsafe {
+        pyre_interpreter::objspace::std::mapdict::read_boxed_storage(w_obj, storageindex as usize)
+            as i64
+    }
+}
+
 pub fn emit_trace_call_void(ctx: &mut TraceCtx, helper: *const (), args: &[OpRef]) {
     ctx.call_void(helper, args);
 }
