@@ -72,6 +72,10 @@ venv/*
 benchmark/*
 benchmarks/*
 
+# Build output binaries
+pyre-cranelift
+pyre-dynasm
+
 # Rust / Cargo
 /target
 
