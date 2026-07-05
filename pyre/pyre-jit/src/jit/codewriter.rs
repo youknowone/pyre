@@ -11404,6 +11404,11 @@ impl CodeWriter {
                         // CPython 3.12/3.13 semantics; PyPy pops 3 (w_exc, w_prev, aiter)
                         // on the StopAsyncIteration path (assemble.py:1578). Structural
                         // adaptation: pyre targets CPython opcode shape here.
+                        //
+                        // Genuine trace boundary: flowspace rejects END_ASYNC_FOR
+                        // with `unsupported_rpython` (the async cluster —
+                        // GET_AITER/GET_AWAITABLE/GET_ANEXT/SEND/END_ASYNC_FOR —
+                        // `async for` is not RPython), so abort is parity-correct.
                         Instruction::EndAsyncFor => {
                             for _ in 0..2 {
                                 pop_and_decr_depth(&mut current_state, &mut current_depth);
