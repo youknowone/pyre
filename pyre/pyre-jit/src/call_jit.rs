@@ -3526,6 +3526,97 @@ bh_call_fn_arity!(bh_call_fn_12; a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a1
 bh_call_fn_arity!(bh_call_fn_13; a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12);
 bh_call_fn_arity!(bh_call_fn_14; a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13);
 
+/// CALL_KW residual shared body (`call_kw(callable, self_or_null,
+/// positional, kwnames)` HLOp → per-arity `residual_call_r_r`).  Resolves
+/// the parent frame from the execution context like [`bh_call_fn_impl`],
+/// then runs keyword resolution + the dispatched call under
+/// `force_plain_eval` (blackhole.py:1225 `bhimpl_residual_call_*` is an
+/// opaque CPU call — no JIT re-entry; `call_kw`'s
+/// `call_user_function_resolved` fast path routes through the JIT-aware
+/// `get_eval_fn()`, so the guard is what keeps it on `eval_frame_plain`).
+/// `positional` is `arg0..argN-1` in positional order (keyword tail
+/// included); `kwnames` is the constant kwnames tuple.  MayForce: keyword
+/// binding and the dispatched call may run Python.
+fn bh_call_kw_impl(
+    callable: PyObjectRef,
+    null_or_self: PyObjectRef,
+    kwnames: PyObjectRef,
+    positional: &[PyObjectRef],
+) -> i64 {
+    let ec = pyre_interpreter::call::getexecutioncontext();
+    let parent_frame_ptr: *const PyFrame = if ec.is_null() {
+        std::ptr::null()
+    } else {
+        unsafe { (*ec).gettopframe() as *const PyFrame }
+    };
+    assert!(
+        !parent_frame_ptr.is_null(),
+        "bh_call_kw_impl requires a live parent PyFrame from \
+         getexecutioncontext().gettopframe(); the eval loop must pin the \
+         execution context before any residual call"
+    );
+    let saved_ctx = pyre_interpreter::call::take_last_exec_ctx();
+    unsafe {
+        pyre_interpreter::call::set_last_exec_ctx((*parent_frame_ptr).execution_context);
+    }
+    let parent_frame = unsafe { &mut *(parent_frame_ptr as *mut PyFrame) };
+    let result = {
+        let _plain_guard = pyre_interpreter::call::force_plain_eval();
+        pyre_interpreter::call::call_kw(
+            parent_frame,
+            callable,
+            null_or_self,
+            positional,
+            kwnames,
+        )
+    };
+    pyre_interpreter::call::set_last_exec_ctx(saved_ctx);
+    match result {
+        Ok(result) => result as i64,
+        Err(err) => {
+            publish_residual_call_exception(err.to_exc_object() as i64);
+            0
+        }
+    }
+}
+
+/// Per-arity `bh_call_kw_<n>` thunks for the CALL_KW residual, ABI
+/// `(callable, null_or_self, kwnames, arg0..arg{n-1})` = 3 + n i64 params.
+/// The backend dispatch tops out at `MAX_HOST_CALL_ARITY` = 16 i64 args, so
+/// the kwnames slot leaves room for nargs 0..=13; CALL_KW with nargs > 13
+/// falls through to `emit_abort_permanent!`.
+macro_rules! bh_call_kw_arity {
+    ($name:ident; $($arg:ident),* $(,)?) => {
+        pub extern "C" fn $name(
+            callable: i64,
+            null_or_self: i64,
+            kwnames: i64,
+            $($arg: i64),*
+        ) -> i64 {
+            bh_call_kw_impl(
+                callable as PyObjectRef,
+                null_or_self as PyObjectRef,
+                kwnames as PyObjectRef,
+                &[$($arg as PyObjectRef),*],
+            )
+        }
+    };
+}
+bh_call_kw_arity!(bh_call_kw_0;);
+bh_call_kw_arity!(bh_call_kw_1; a0);
+bh_call_kw_arity!(bh_call_kw_2; a0, a1);
+bh_call_kw_arity!(bh_call_kw_3; a0, a1, a2);
+bh_call_kw_arity!(bh_call_kw_4; a0, a1, a2, a3);
+bh_call_kw_arity!(bh_call_kw_5; a0, a1, a2, a3, a4);
+bh_call_kw_arity!(bh_call_kw_6; a0, a1, a2, a3, a4, a5);
+bh_call_kw_arity!(bh_call_kw_7; a0, a1, a2, a3, a4, a5, a6);
+bh_call_kw_arity!(bh_call_kw_8; a0, a1, a2, a3, a4, a5, a6, a7);
+bh_call_kw_arity!(bh_call_kw_9; a0, a1, a2, a3, a4, a5, a6, a7, a8);
+bh_call_kw_arity!(bh_call_kw_10; a0, a1, a2, a3, a4, a5, a6, a7, a8, a9);
+bh_call_kw_arity!(bh_call_kw_11; a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10);
+bh_call_kw_arity!(bh_call_kw_12; a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
+bh_call_kw_arity!(bh_call_kw_13; a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12);
+
 /// blackhole.py:1224 bhimpl_residual_call: cpu.bh_call_r.
 /// RPython: cpu.bh_call_r (llmodel.py:816) invokes calldescr.call_stub_r
 /// directly — a plain function-pointer call, no portal_runner indirection.

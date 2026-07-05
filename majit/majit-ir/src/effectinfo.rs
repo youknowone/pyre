@@ -645,6 +645,14 @@ pub enum PyreHelperKind {
     /// merge), so a concrete-NULL there is the normal shape — not the broken
     /// baked-NULL-globals shape the walker's may-force NULL-ref gate rejects.
     CallFunctionEx,
+    /// `bh_call_kw_<n>(callable, null_or_self, kwnames, arg0..arg{n-1})` —
+    /// the CALL_KW residual.  `null_or_self` (arg index 1) is a `PY_NULL`
+    /// sentinel the helper checks before use (prepended as arg0 only when
+    /// non-null), so a concrete-NULL there is the normal shape — not the
+    /// broken baked-NULL-globals shape the walker's may-force NULL-ref gate
+    /// rejects.  `kwnames` (arg index 2) is the constant kwnames tuple and
+    /// is always a live Ref.
+    CallKw,
 }
 
 impl EffectInfo {

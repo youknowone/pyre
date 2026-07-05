@@ -3482,6 +3482,20 @@ struct FnPtrIndices {
     store_slice_fn: HelperHandle,
     get_iter_fn: HelperHandle,
     for_iter_next_fn: HelperHandle,
+    call_kw_fn_0: HelperHandle,
+    call_kw_fn_1: HelperHandle,
+    call_kw_fn_2: HelperHandle,
+    call_kw_fn_3: HelperHandle,
+    call_kw_fn_4: HelperHandle,
+    call_kw_fn_5: HelperHandle,
+    call_kw_fn_6: HelperHandle,
+    call_kw_fn_7: HelperHandle,
+    call_kw_fn_8: HelperHandle,
+    call_kw_fn_9: HelperHandle,
+    call_kw_fn_10: HelperHandle,
+    call_kw_fn_11: HelperHandle,
+    call_kw_fn_12: HelperHandle,
+    call_kw_fn_13: HelperHandle,
 }
 
 /// Register every blackhole helper fn pointer with the assembler in
@@ -4020,6 +4034,23 @@ fn register_helper_fn_pointers(
         cpu.call_function_ex_fn as *const (),
         CallFlavor::MayForce,
     );
+    // Per-arity `bh_call_kw_<n>` CALL_KW helpers resolve keyword args and
+    // dispatch, running Python → `MayForce`.  Appended last to preserve
+    // fn_ptr indices.
+    let call_kw_fn_0 = bind(assembler, cpu.call_kw_fn_0 as *const (), CallFlavor::MayForce);
+    let call_kw_fn_1 = bind(assembler, cpu.call_kw_fn_1 as *const (), CallFlavor::MayForce);
+    let call_kw_fn_2 = bind(assembler, cpu.call_kw_fn_2 as *const (), CallFlavor::MayForce);
+    let call_kw_fn_3 = bind(assembler, cpu.call_kw_fn_3 as *const (), CallFlavor::MayForce);
+    let call_kw_fn_4 = bind(assembler, cpu.call_kw_fn_4 as *const (), CallFlavor::MayForce);
+    let call_kw_fn_5 = bind(assembler, cpu.call_kw_fn_5 as *const (), CallFlavor::MayForce);
+    let call_kw_fn_6 = bind(assembler, cpu.call_kw_fn_6 as *const (), CallFlavor::MayForce);
+    let call_kw_fn_7 = bind(assembler, cpu.call_kw_fn_7 as *const (), CallFlavor::MayForce);
+    let call_kw_fn_8 = bind(assembler, cpu.call_kw_fn_8 as *const (), CallFlavor::MayForce);
+    let call_kw_fn_9 = bind(assembler, cpu.call_kw_fn_9 as *const (), CallFlavor::MayForce);
+    let call_kw_fn_10 = bind(assembler, cpu.call_kw_fn_10 as *const (), CallFlavor::MayForce);
+    let call_kw_fn_11 = bind(assembler, cpu.call_kw_fn_11 as *const (), CallFlavor::MayForce);
+    let call_kw_fn_12 = bind(assembler, cpu.call_kw_fn_12 as *const (), CallFlavor::MayForce);
+    let call_kw_fn_13 = bind(assembler, cpu.call_kw_fn_13 as *const (), CallFlavor::MayForce);
     FnPtrIndices {
         call_fn,
         load_global_fn,
@@ -4095,6 +4126,20 @@ fn register_helper_fn_pointers(
         list_to_tuple_fn,
         load_from_dict_or_globals_fn,
         call_function_ex_fn,
+        call_kw_fn_0,
+        call_kw_fn_1,
+        call_kw_fn_2,
+        call_kw_fn_3,
+        call_kw_fn_4,
+        call_kw_fn_5,
+        call_kw_fn_6,
+        call_kw_fn_7,
+        call_kw_fn_8,
+        call_kw_fn_9,
+        call_kw_fn_10,
+        call_kw_fn_11,
+        call_kw_fn_12,
+        call_kw_fn_13,
     }
 }
 
@@ -5580,6 +5625,76 @@ impl CodeWriter {
                     idx: for_iter_next_fn_idx,
                     flavor: _for_iter_next_fn_flavor,
                 },
+            call_kw_fn_0:
+                HelperHandle {
+                    idx: call_kw_fn_0_idx,
+                    flavor: _call_kw_fn_0_flavor,
+                },
+            call_kw_fn_1:
+                HelperHandle {
+                    idx: call_kw_fn_1_idx,
+                    flavor: _call_kw_fn_1_flavor,
+                },
+            call_kw_fn_2:
+                HelperHandle {
+                    idx: call_kw_fn_2_idx,
+                    flavor: _call_kw_fn_2_flavor,
+                },
+            call_kw_fn_3:
+                HelperHandle {
+                    idx: call_kw_fn_3_idx,
+                    flavor: _call_kw_fn_3_flavor,
+                },
+            call_kw_fn_4:
+                HelperHandle {
+                    idx: call_kw_fn_4_idx,
+                    flavor: _call_kw_fn_4_flavor,
+                },
+            call_kw_fn_5:
+                HelperHandle {
+                    idx: call_kw_fn_5_idx,
+                    flavor: _call_kw_fn_5_flavor,
+                },
+            call_kw_fn_6:
+                HelperHandle {
+                    idx: call_kw_fn_6_idx,
+                    flavor: _call_kw_fn_6_flavor,
+                },
+            call_kw_fn_7:
+                HelperHandle {
+                    idx: call_kw_fn_7_idx,
+                    flavor: _call_kw_fn_7_flavor,
+                },
+            call_kw_fn_8:
+                HelperHandle {
+                    idx: call_kw_fn_8_idx,
+                    flavor: _call_kw_fn_8_flavor,
+                },
+            call_kw_fn_9:
+                HelperHandle {
+                    idx: call_kw_fn_9_idx,
+                    flavor: _call_kw_fn_9_flavor,
+                },
+            call_kw_fn_10:
+                HelperHandle {
+                    idx: call_kw_fn_10_idx,
+                    flavor: _call_kw_fn_10_flavor,
+                },
+            call_kw_fn_11:
+                HelperHandle {
+                    idx: call_kw_fn_11_idx,
+                    flavor: _call_kw_fn_11_flavor,
+                },
+            call_kw_fn_12:
+                HelperHandle {
+                    idx: call_kw_fn_12_idx,
+                    flavor: _call_kw_fn_12_flavor,
+                },
+            call_kw_fn_13:
+                HelperHandle {
+                    idx: call_kw_fn_13_idx,
+                    flavor: _call_kw_fn_13_flavor,
+                },
         } = register_helper_fn_pointers(&mut assembler, self.cpu());
 
         // codewriter.py:37 `portal_jd = self.callcontrol.jitdriver_sd_from_portal_graph(graph)`
@@ -5678,6 +5793,22 @@ impl CodeWriter {
                 map_add_fn_idx,
                 dict_merge_fn_idx,
                 store_slice_fn_idx,
+                call_kw_idx_by_nargs: [
+                    call_kw_fn_0_idx,
+                    call_kw_fn_1_idx,
+                    call_kw_fn_2_idx,
+                    call_kw_fn_3_idx,
+                    call_kw_fn_4_idx,
+                    call_kw_fn_5_idx,
+                    call_kw_fn_6_idx,
+                    call_kw_fn_7_idx,
+                    call_kw_fn_8_idx,
+                    call_kw_fn_9_idx,
+                    call_kw_fn_10_idx,
+                    call_kw_fn_11_idx,
+                    call_kw_fn_12_idx,
+                    call_kw_fn_13_idx,
+                ],
             });
         }
 
@@ -9471,26 +9602,80 @@ impl CodeWriter {
                         // Pushes: result. Net stack effect: -(argc + 2).
                         // pyopcode.py CALL_FUNCTION_KW / CALL_KW / eval.rs:2570-2726.
                         //
-                        // Portable (flowspace records `call_function` with a
-                        // constant kwnames tuple) and demonstrable (a CALL_KW
-                        // in an inlined callee aborts the callee jitcode), but
-                        // still aborts: the residual is variadic (a per-arity
-                        // `bh_call_kw_N(callable, self_or_null, kwnames, args...)`
-                        // family, mirroring the `Call` `call_fn_N` family) and
-                        // `eval.rs::call_kw`'s `call_user_function_resolved`
-                        // fast path must be routed through `force_plain_eval`
-                        // to avoid JIT re-entry from a blackhole residual.
-                        // Tracked as a follow-up (see the CALL_FUNCTION_EX port
-                        // `47682545e6` for the fixed-arity template).
+                        // Records `call_kw(callable, null_or_self, kwnames,
+                        // arg0..argN-1)` → `residual_call_r_r(call_kw_fn_N,
+                        // ListR([...])`; `bh_call_kw_N` resolves keyword args
+                        // against the callable and dispatches (running user
+                        // code) under `force_plain_eval` so the
+                        // `call_user_function_resolved` fast path stays on
+                        // `eval_frame_plain` (no JIT re-entry from a blackhole
+                        // residual).  nargs > 13 keeps the `abort_permanent`
+                        // branch: the per-arity helper family tops out at
+                        // nargs=13 (callable + null_or_self + kwnames + 13 args
+                        // = 16 i64, the backend dispatch ceiling), mirroring
+                        // the `Call` nargs>14 clamp.
                         Instruction::CallKw { argc } => {
                             let nargs = argc.get(op_arg) as usize;
-                            // Pop kwnames + nargs args + null_or_self + callable.
-                            for _ in 0..nargs + 3 {
-                                pop_and_decr_depth(&mut current_state, &mut current_depth);
+                            if nargs > 13 {
+                                // Pop kwnames + nargs args + null_or_self + callable.
+                                for _ in 0..nargs + 3 {
+                                    pop_and_decr_depth(&mut current_state, &mut current_depth);
+                                }
+                                push_fresh_ref(&mut current_state, &mut graph);
+                                current_depth += 1;
+                                emit_abort_permanent!(py_pc);
+                            } else {
+                                // Pop order (top→bottom): kwnames, arg{N-1}..arg0,
+                                // null_or_self, callable — mirroring the
+                                // interpreter's `call_kw` stack reads.
+                                let kwnames_reg = emit_popvalue_ref!(current_depth, py_pc);
+                                let kwnames_value =
+                                    pop_ref_or_fresh(&mut current_state, &mut graph);
+                                if let super::flow::FlowValue::Variable(v) = &kwnames_value {
+                                    pin!(Some(*v), kwnames_reg);
+                                }
+                                let mut arg_values_rev = Vec::with_capacity(nargs);
+                                for _ in 0..nargs {
+                                    let arg_reg = emit_popvalue_ref!(current_depth, py_pc);
+                                    let arg_value =
+                                        pop_ref_or_fresh(&mut current_state, &mut graph);
+                                    if let super::flow::FlowValue::Variable(v) = &arg_value {
+                                        pin!(Some(*v), arg_reg);
+                                    }
+                                    arg_values_rev.push(arg_value);
+                                }
+                                let self_reg = emit_popvalue_ref!(current_depth, py_pc);
+                                let self_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                                if let super::flow::FlowValue::Variable(v) = &self_value {
+                                    pin!(Some(*v), self_reg);
+                                }
+                                let callable_reg = emit_popvalue_ref!(current_depth, py_pc);
+                                let callable_value =
+                                    pop_ref_or_fresh(&mut current_state, &mut graph);
+                                if let super::flow::FlowValue::Variable(v) = &callable_value {
+                                    pin!(Some(*v), callable_reg);
+                                }
+                                // Graph op args: callable, null_or_self, kwnames,
+                                // arg0..argN-1 (pops were top-first, so reverse).
+                                let mut op_args: Vec<super::flow::SpaceOperationArg> =
+                                    Vec::with_capacity(nargs + 3);
+                                op_args.push(callable_value.into());
+                                op_args.push(self_value.into());
+                                op_args.push(kwnames_value.into());
+                                for arg in arg_values_rev.into_iter().rev() {
+                                    op_args.push(arg.into());
+                                }
+                                let result_value = emit_graph_op_with_result(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    "call_kw",
+                                    op_args,
+                                    Kind::Ref,
+                                    py_pc as i64,
+                                );
+                                pin!(Some(result_value), stack_base + current_depth);
+                                push_and_bump!(result_value.into(), py_pc);
                             }
-                            push_fresh_ref(&mut current_state, &mut graph);
-                            current_depth += 1;
-                            emit_abort_permanent!(py_pc);
                         }
 
                         Instruction::Swap { i } => {

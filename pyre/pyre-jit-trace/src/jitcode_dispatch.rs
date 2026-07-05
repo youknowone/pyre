@@ -5205,6 +5205,11 @@ fn walker_abort_if_mayforce_null_ref_arg(
     // there is the normal `f(*args)` / no-`**` shape, not the broken baked-NULL.
     let is_call_function_ex =
         call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::CallFunctionEx;
+    // `bh_call_kw_N(callable, null_or_self, kwnames, args...)` — `null_or_self`
+    // (arg 1) is a checked `PY_NULL` sentinel (prepended as arg0 only when
+    // non-null), so a concrete-NULL there is the normal plain-call shape.
+    let is_call_kw =
+        call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::CallKw;
     for (i, &ty) in call_descr.arg_types().iter().enumerate() {
         if ty != majit_ir::Type::Ref {
             continue;
@@ -5213,6 +5218,9 @@ fn walker_abort_if_mayforce_null_ref_arg(
             continue;
         }
         if is_call_function_ex && (i == 1 || i == 3) {
+            continue;
+        }
+        if is_call_kw && i == 1 {
             continue;
         }
         if is_raise_varargs && i + 1 == call_descr.arg_types().len() {

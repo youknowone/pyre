@@ -3506,6 +3506,15 @@ pub struct LoweringContext {
     /// four-Ref STORE_SUBSCR shape); `bh_store_slice_fn` builds a `slice` and
     /// runs `setitem` (user `__setitem__`/`__index__` → `MayForce`).
     pub store_slice_fn_idx: u16,
+    /// Per-arity `call_kw_fn` descrs-pool indices, indexed by nargs
+    /// (`call_kw_idx_by_nargs[nargs]`): `[u16; 14]` covers nargs 0..=13.
+    /// CALL_KW records `call_kw(callable, null_or_self, kwnames, arg0..
+    /// argN-1)` lowered to `residual_call_r_r(ConstInt(fn_idx), ListR([
+    /// callable, null_or_self, kwnames, args...]), Descr) → reg` via
+    /// [`lower_call_kw_hlop_to_insn`]; `bh_call_kw_<n>` resolves keyword
+    /// args and dispatches (user code → `MayForce`).  A CALL_KW with
+    /// nargs > 13 takes the `abort_permanent` branch and records no HLOp.
+    pub call_kw_idx_by_nargs: [u16; 14],
 }
 
 /// Map a BINARY_OP HLOp opname (`add`/.../`xor`/`getitem` plus the
@@ -4388,6 +4397,39 @@ where
                 ref_operands,
                 CallFlavor::MayForce,
                 majit_ir::PyreHelperKind::CallFunctionEx,
+                dst_reg,
+            ))
+        }
+        "call_kw" => {
+            // CALL_KW: `call_kw(callable, null_or_self, kwnames, arg0..
+            // argN-1)` → `residual_call_r_r(ConstInt(
+            // call_kw_idx_by_nargs[nargs]), ListR([callable, null_or_self,
+            // kwnames, args...]), Descr) → reg`.  nargs = args.len() - 3
+            // (callable + null_or_self + kwnames).  Resolves keyword args and
+            // dispatches (runs user code) → `MayForce`.  nargs > 13 records
+            // no HLOp (the walker takes `abort_permanent`), so a graph-side
+            // `call_kw` past the table is non-orthodox → passthrough.
+            if op.args.len() < 3 {
+                return None;
+            }
+            let nargs = op.args.len() - 3;
+            if nargs >= ctx.call_kw_idx_by_nargs.len() {
+                return None;
+            }
+            let ref_operands: Vec<Operand> = op
+                .args
+                .iter()
+                .map(|arg| flatten_arg_with_lowering(arg, get_register, lower_constant))
+                .collect();
+            let dst_reg = match &op.result {
+                Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
+                _ => return None,
+            };
+            Some(build_residual_call_r_r_insn_from_operands(
+                ctx.call_kw_idx_by_nargs[nargs],
+                ref_operands,
+                CallFlavor::MayForce,
+                majit_ir::PyreHelperKind::CallKw,
                 dst_reg,
             ))
         }
@@ -10743,6 +10785,11 @@ mod tests {
             list_to_tuple_fn_idx: 125,
             load_from_dict_or_globals_fn_idx: 126,
             call_function_ex_fn_idx: 127,
+            call_kw_idx_by_nargs: {
+                let mut t = [0u16; 14];
+                t[2] = 130;
+                t
+            },
             ..Default::default()
         };
         let code_const = Constant::new(
@@ -11173,6 +11220,116 @@ mod tests {
                             }
                             other => panic!(
                                 "ListR must be [callable, self, starargs, kwargs], got {other:?}"
+                            ),
+                        }
+                    }
+                    other => panic!("expected ListR, got {other:?}"),
+                }
+                assert_eq!(
+                    result,
+                    Some(Register {
+                        kind: Kind::Ref,
+                        index: 102
+                    }),
+                );
+            }
+            _ => panic!("expected Insn::Op, got {insn:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_call_kw_emits_residual() {
+        // `call_kw(callable, null_or_self, kwnames, arg0, arg1)` (nargs=2)
+        // → `residual_call_r_r(ConstInt(call_kw_idx_by_nargs[2]), ListR([
+        // callable, null_or_self, kwnames, arg0, arg1]), Descr) → reg`
+        // (MayForce — keyword resolution + dispatch run user code).  The
+        // `call_kw` arm lives in the shared opname dispatcher
+        // `lower_tuple_build_hlop_to_insn`, so that is the entry point here.
+        let callable_var = Variable::new(VariableId(8), Kind::Ref);
+        let self_var = Variable::new(VariableId(10), Kind::Ref);
+        let kwnames_var = Variable::new(VariableId(11), Kind::Ref);
+        let arg0_var = Variable::new(VariableId(12), Kind::Ref);
+        let arg1_var = Variable::new(VariableId(13), Kind::Ref);
+        let result_var = Variable::new(VariableId(9), Kind::Ref);
+        let (ctx, _, _) = load_attr_lowering_fixture();
+        let op = super::super::flow::SpaceOperation::new(
+            "call_kw",
+            vec![
+                callable_var.into(),
+                self_var.into(),
+                kwnames_var.into(),
+                arg0_var.into(),
+                arg1_var.into(),
+            ],
+            Some(result_var.into()),
+            0,
+        );
+        let mut get_register = |var: Variable| match var.id {
+            VariableId(8) => Register {
+                kind: Kind::Ref,
+                index: 101,
+            },
+            VariableId(10) => Register {
+                kind: Kind::Ref,
+                index: 103,
+            },
+            VariableId(11) => Register {
+                kind: Kind::Ref,
+                index: 104,
+            },
+            VariableId(12) => Register {
+                kind: Kind::Ref,
+                index: 105,
+            },
+            VariableId(13) => Register {
+                kind: Kind::Ref,
+                index: 106,
+            },
+            VariableId(9) => Register {
+                kind: Kind::Ref,
+                index: 102,
+            },
+            _ => panic!("unexpected var id {:?}", var.id),
+        };
+        let mut lower_constant = super::flatten_constant_operand_for_test;
+        let insn = super::lower_tuple_build_hlop_to_insn(
+            &op,
+            &ctx,
+            &mut get_register,
+            &mut lower_constant,
+        )
+        .expect("5-arg call_kw (nargs=2) lowering must succeed");
+        match insn {
+            Insn::Op {
+                opname,
+                args,
+                result,
+            } => {
+                assert_eq!(opname, "residual_call_r_r");
+                assert!(
+                    matches!(args[0], Operand::ConstInt(130)),
+                    "call_kw_idx_by_nargs[2] pool index, got {:?}",
+                    args[0]
+                );
+                match &args[1] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Ref);
+                        match &list.content[..] {
+                            [
+                                Operand::Register(c),
+                                Operand::Register(s),
+                                Operand::Register(kw),
+                                Operand::Register(a0),
+                                Operand::Register(a1),
+                            ] => {
+                                assert_eq!(c.index, 101, "arg0 must be callable");
+                                assert_eq!(s.index, 103, "arg1 must be null_or_self");
+                                assert_eq!(kw.index, 104, "arg2 must be kwnames");
+                                assert_eq!(a0.index, 105, "arg3 must be arg0");
+                                assert_eq!(a1.index, 106, "arg4 must be arg1");
+                            }
+                            other => panic!(
+                                "ListR must be [callable, null_or_self, kwnames, arg0, arg1], got {other:?}"
                             ),
                         }
                     }
