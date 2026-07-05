@@ -1851,6 +1851,48 @@ pub fn type_version_tag_descr() -> DescrRef {
     )
 }
 
+/// `W_ObjectObject` SizeDescr group (`objectobject.rs:34-46`) — the instance
+/// layout `[ob_type | w_class | map | storage]`.  Built with a parent SizeDescr
+/// (unlike a bare [`make_field_descr`]) so a `getfield_gc` on `map` / `storage`
+/// resolves `FieldDescr.get_parent_descr()` in the optimizer's
+/// `ensure_ptr_info_arg0` (`optimizer.py:478`); the LOAD_ATTR fold reads these
+/// fields inline, so they must carry the owning struct's SizeDescr.
+///
+/// Only `map` and `storage` are enumerated (the header `ob_type`/`w_class` are
+/// read through their own `ob_type_descr` / `w_class_descr`).  `map` is an
+/// opaque `Int` word (interned immortal map nodes — not a GC ref, stays off
+/// `gc_fielddescrs`); `storage` is a `Ref` block pointer (enters
+/// `gc_fielddescrs` so a `setfield_gc` emits the write barrier).
+static W_OBJECT_OBJECT_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_object_descr_group_with_def_path(
+        pyre_object::W_OBJECT_OBJECT_SIZE,
+        pyre_object::objectobject::W_OBJECT_OBJECT_GC_TYPE_ID,
+        &pyre_object::pyobject::INSTANCE_TYPE as *const _ as usize,
+        &[
+            (
+                "W_ObjectObject.map",
+                core::mem::offset_of!(pyre_object::W_ObjectObject, map),
+                8,
+                Type::Int,
+                false,
+                false,
+                false,
+            ),
+            (
+                "W_ObjectObject.storage",
+                core::mem::offset_of!(pyre_object::W_ObjectObject, storage),
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+        ],
+        "W_ObjectObject",
+        "objectobject::W_ObjectObject",
+    )
+});
+
 /// `W_ObjectObject.map` (`objectobject.rs:38`) — the erased `*const MapNode`
 /// instance shape pointer, `self.map` of PyPy's `MapdictStorageMixin`
 /// (`mapdict.py:907`). Read as an opaque `Int` word so the LOAD_ATTR fast path
@@ -1859,12 +1901,7 @@ pub fn type_version_tag_descr() -> DescrRef {
 /// constant. The map nodes are interned + immortal, so the pointer is a stable
 /// identity and the guard need not treat it as a GC ref.
 pub fn object_map_descr() -> DescrRef {
-    make_field_descr(
-        core::mem::offset_of!(pyre_object::W_ObjectObject, map),
-        8,
-        Type::Int,
-        false,
-    )
+    field_descr_from_group(&W_OBJECT_OBJECT_DESCR_GROUP, 0)
 }
 
 /// `W_ObjectObject.storage` (`objectobject.rs:40`) — `self.storage` of
@@ -1875,12 +1912,7 @@ pub fn object_map_descr() -> DescrRef {
 /// `list_items_descr` → `pyobject_gcarray_descr`. Mutable: STORE_ATTR grows /
 /// replaces the block.
 pub fn object_storage_descr() -> DescrRef {
-    make_field_descr(
-        core::mem::offset_of!(pyre_object::W_ObjectObject, storage),
-        8,
-        Type::Ref,
-        false,
-    )
+    field_descr_from_group(&W_OBJECT_OBJECT_DESCR_GROUP, 1)
 }
 
 /// rlist.py:116 `l.length` — live length of a list under the Object
