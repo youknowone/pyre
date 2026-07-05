@@ -305,10 +305,14 @@ fn close_inherited_fds() -> io::Result<()> {
     // Bounded brute-force close(2) loop; closing an unopened fd is a harmless
     // error. SAFETY: only raw sysconf/close syscalls, no allocation.
     unsafe fn close_from_brute_force() {
-        let max = libc::sysconf(libc::_SC_OPEN_MAX);
-        let max = if max < 0 { 1024 } else { max as i32 };
-        for fd in 3..max {
-            libc::close(fd);
+        // SAFETY: sysconf(_SC_OPEN_MAX) and close(2) over a bounded fd range;
+        // closing an unopened fd is a harmless error.
+        unsafe {
+            let max = libc::sysconf(libc::_SC_OPEN_MAX);
+            let max = if max < 0 { 1024 } else { max as i32 };
+            for fd in 3..max {
+                libc::close(fd);
+            }
         }
     }
     #[cfg(target_os = "linux")]

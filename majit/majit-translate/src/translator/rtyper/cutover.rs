@@ -3472,7 +3472,10 @@ mod tests {
             operations: vec![],
             exitswitch: None,
             exits: vec![crate::model::Link::new_mixed(
-                vec![LinkArg::Value(etype.clone()), LinkArg::Value(evalue.clone())],
+                vec![
+                    LinkArg::Value(etype.clone()),
+                    LinkArg::Value(evalue.clone()),
+                ],
                 graph.exceptblock,
                 None,
             )],

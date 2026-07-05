@@ -346,6 +346,14 @@ fn real_main(binary_name: &str) {
     // PYRE_SANDBOX_NO_SECCOMP to bypass when debugging the allowlist.
     #[cfg(all(target_os = "linux", feature = "sandbox"))]
     if !is_interact && std::env::var_os("PYRE_SANDBOX_NO_SECCOMP").is_none() {
+        // The GC is built lazily on the first allocation, and its Linux
+        // construction reads `/proc/meminfo` (`get_total_memory`) — a direct
+        // `openat` the filter below traps. Force the per-thread JIT driver, and
+        // with it `MiniMarkGC::new`, to run now, while file opens are still
+        // allowed; the post-lockdown allocations reuse the constructed GC and
+        // issue no `openat`. Same warm-up-before-filter shape as the `gmtime_r`
+        // tz-cache prime in `install_runtime_filter`.
+        pyre_jit::eval::driver_pair();
         if let Err(e) = pyre_sandbox::seccomp::install_runtime_filter() {
             eprintln!("{binary_name}: failed to install sandbox seccomp filter: {e}");
             std::process::exit(1);
