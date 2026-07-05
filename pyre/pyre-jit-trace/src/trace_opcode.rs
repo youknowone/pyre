@@ -8749,13 +8749,12 @@ impl MIFrame {
         // mapdict.py:1495-1533 resolution, shared with the concrete
         // interpreter so the symbolic trace and the concrete frame agree on
         // the receiver shape.  `None` = every unsupported shape → residual.
-        let (w_type, version_tag, map, storageindex) =
-            match unsafe { pyre_interpreter::objspace::std::mapdict::load_attr_fast_path(
-                concrete_obj, name,
-            ) } {
-                Some(tuple) => tuple,
-                None => return Ok(None),
-            };
+        let (w_type, version_tag, map, storageindex) = match unsafe {
+            pyre_interpreter::objspace::std::mapdict::load_attr_fast_path(concrete_obj, name)
+        } {
+            Some(tuple) => tuple,
+            None => return Ok(None),
+        };
 
         let value_op = self.with_ctx(|this, ctx| {
             // mapdict.py:1496 `w_type = map.terminator.w_cls` → pin the
