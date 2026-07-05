@@ -3535,6 +3535,13 @@ fn for_iter_body_op_is_jit_safe(instr: pyre_interpreter::Instruction) -> bool {
             | I::GetIter
             | I::ForIter { .. }
             | I::EndFor
+            // function calls and global reads: the Layer 2 dynamic defense
+            // (body_effect_candidate + fbw_foriter_inflight_take) handles
+            // walk-abort safety, and inline sub-walks are declined when a
+            // FOR_ITER item is in-flight (try_walker_inline_user_call).
+            | I::Call { .. }
+            | I::LoadGlobal { .. }
+            | I::Resume { .. }
             // oparg prefix + inline-cache padding (no-ops in the body scan)
             | I::ExtendedArg
             | I::Cache
