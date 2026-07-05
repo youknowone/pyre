@@ -867,8 +867,7 @@ mod tests {
         // recursion guard in `SomeObject.__repr__` (model.py:68).
         let ld = ListDef::new(None, SomeValue::Impossible, false, false);
         // Close the cycle: listitem.s_value := SomeList(ld).
-        ld.listitem_rc().borrow_mut().s_value =
-            SomeValue::List(SomeList::new(ld.clone()));
+        ld.listitem_rc().borrow_mut().s_value = SomeValue::List(SomeList::new(ld.clone()));
         // Must terminate (no stack overflow) and mark the elided cycle.
         let rendered = format!("{:?}", SomeValue::List(SomeList::new(ld.clone())));
         assert!(rendered.contains("..."), "cycle not elided: {rendered}");

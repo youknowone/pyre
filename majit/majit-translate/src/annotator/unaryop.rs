@@ -794,6 +794,24 @@ fn init_someobject_defaults(
                         }
                     }
                 }
+                // A raw-pointer `p.is_null()` whose receiver Charon erases to
+                // a pointer-to-collection (`*mut Vec<T>` → `SomeList`,
+                // `*mut DictStorage` → `SomeDict`) reaches this `SomeObject`
+                // base getattr rather than the `SomeInstance` `is_null` arm.
+                // `front::mir` already routed it as `CallTarget::Method {
+                // name: "is_null", receiver_root: "mut_ptr"/"const_ptr" }`,
+                // which `jtransform` lowers to `ptr_iszero` regardless of the
+                // receiver repr; answer the getattr with the same
+                // `ptr_method_is_null` bound method so the result types as
+                // `SomeBool`.  Last-resort (after `find_method` + the constant
+                // path), so a real `is_null` member is never shadowed.
+                if attr == "is_null" && matches!(s_self, SomeValue::List(_) | SomeValue::Dict(_)) {
+                    return SomeValue::BuiltinMethod(SomeBuiltinMethod::new(
+                        "ptr_method_is_null",
+                        s_self.clone(),
+                        "is_null",
+                    ));
+                }
                 panic!(
                     "AnnotatorError: Cannot find attribute {:?} on {:?}",
                     attr, s_self

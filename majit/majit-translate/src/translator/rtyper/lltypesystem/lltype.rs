@@ -6978,7 +6978,8 @@ mod tests {
                 })),
             )],
         );
-        fwd.r#become(LowLevelType::Struct(Box::new(s.clone()))).unwrap();
+        fwd.r#become(LowLevelType::Struct(Box::new(s.clone())))
+            .unwrap();
 
         // Must format without overflowing the stack, both directly and
         // through the resolved forward reference.
