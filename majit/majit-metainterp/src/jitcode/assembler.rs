@@ -4315,6 +4315,7 @@ impl JitCodeBuilder {
         self.patch_labels();
         self.patch_switch_descrs();
         self.patch_const_refs();
+        self.patch_field_descr_parents();
         self.patch_const_u8_refs();
         // RPython `jitcode.py:47 self._resulttypes = resulttypes`.
         // Upstream `assembler.py:217-219` records the result-kind
@@ -4855,6 +4856,43 @@ impl JitCodeBuilder {
                     *slot = dict;
                 }
                 other => panic!("pending switch descr {descr_idx} is not Switch: {other:?}"),
+            }
+        }
+    }
+
+    /// descr.py:218-239 parity: `get_field_descr(STRUCT, fieldname)` sets
+    /// `fielddescr.parent_descr = get_size_descr(STRUCT)` — the parent
+    /// always carries the COMPLETE struct layout known at that point.
+    ///
+    /// During emission each `add_struct_field_descr` snapshots the
+    /// `struct_size_specs` entry as `parent`.  Since `register_struct_layout`
+    /// accumulates fields incrementally (each getfield/setfield site
+    /// registers only the field it accesses), an early snapshot may contain
+    /// fewer fields than the final merged spec.  This matters at runtime:
+    /// `field_descr_ref_from_bh` builds a `SizeDescr` from the parent's
+    /// `all_fielddescrs`, and the optimizer's `StructPtrInfo.init_fields`
+    /// allocates one slot per field.  A partial parent → too few slots →
+    /// cross-type forward when different-typed fields land in the same
+    /// slot, or a dangling Weak when a later call creates a fuller
+    /// SizeDescr that the cache rejects.
+    ///
+    /// Fix: after all emit is done, walk every `BhDescr::Field` whose
+    /// `parent` carries a type_id present in `struct_size_specs` and
+    /// replace the parent snapshot with the final (fully merged) spec.
+    /// This is the pyre analogue of PyPy always calling `get_size_descr`
+    /// at descr-creation time (which returns the single canonical
+    /// SizeDescr with all fields populated by `heaptracker.all_fielddescrs`).
+    fn patch_field_descr_parents(&mut self) {
+        for entry in &mut self.descrs {
+            if let RuntimeBhDescr::Descr(CanonicalBhDescr::Field {
+                parent, ..
+            }) = entry
+            {
+                if let Some(p) = parent {
+                    if let Some(final_spec) = self.struct_size_specs.get(&p.type_id) {
+                        *p = final_spec.clone();
+                    }
+                }
             }
         }
     }

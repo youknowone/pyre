@@ -1130,17 +1130,43 @@ impl GcCache {
     /// subsequent calls with the same key keep the original Arc, matching
     /// PyPy `cache[STRUCT] = sizedescr` semantics.
     pub fn register_keyed_size(&mut self, key: LLType, descr: DescrRef) {
-        // `descr.py:25-47 setup_descrs` iterates the keyed `_cache_*`
-        // dicts (per PyPy `setdescrs.py`: `for key, value in cache.iteritems()`).
-        // On cache hit we MUST NOT push the caller's losing Arc onto
-        // `_cache_size_order` — `setup_descrs()` would otherwise
-        // enumerate an orphan descr that has no map slot, breaking the
-        // PyPy invariant that every `all_descrs` member is reachable
-        // via `cache[key]`.  Only push when the entry was freshly
-        // inserted (i.e. our Arc is the one stored in the map).
-        let entry = self._cache_size.entry(key).or_insert_with(|| descr.clone());
-        if Arc::ptr_eq(entry, &descr) && !arc_in_vec(&self._cache_size_order, &descr) {
-            self._cache_size_order.push(descr);
+        // descr.py:108-118 `get_size_descr` populates `all_fielddescrs`
+        // from `heaptracker.all_fielddescrs(STRUCT)` — the COMPLETE field
+        // set — before caching.  pyre's incremental `register_struct_layout`
+        // may produce multiple `make_simple_descr_group_keyed` calls for
+        // the same struct with progressively more fields.  To match PyPy's
+        // invariant that the cached SizeDescr always carries the full known
+        // layout, replace an existing entry when the new descr has MORE
+        // fields.  This prevents `StructPtrInfo.init_fields` from under-
+        // allocating slots, which causes cross-type forwards when different-
+        // typed fields map to the same slot.
+        let should_insert = match self._cache_size.get(&key) {
+            None => true,
+            Some(existing) => {
+                let existing_count = existing
+                    .as_size_descr()
+                    .map(|sd| sd.all_fielddescrs().len())
+                    .unwrap_or(0);
+                let new_count = descr
+                    .as_size_descr()
+                    .map(|sd| sd.all_fielddescrs().len())
+                    .unwrap_or(0);
+                new_count > existing_count
+            }
+        };
+        if should_insert {
+            self._cache_size.insert(key.clone(), descr.clone());
+            self._cache_size_order
+                .retain(|d| {
+                    // Remove the old entry for this key (if any) from the
+                    // ordered vec so a stale orphan never appears.
+                    d.as_size_descr()
+                        .map(|sd| sd.cache_key() != descr.as_size_descr().map(|s| s.cache_key()).unwrap_or(0))
+                        .unwrap_or(true)
+                });
+            if !arc_in_vec(&self._cache_size_order, &descr) {
+                self._cache_size_order.push(descr);
+            }
         }
     }
 
@@ -1163,14 +1189,30 @@ impl GcCache {
         field_name: String,
         descr: Arc<SimpleFieldDescr>,
     ) {
-        // `descr.py:25-47 setup_descrs` cache-iteration invariant —
-        // only the descr actually stored in `_cache_field[struct_key]
-        // [field_name]` enters `all_descrs`.  Skip the `_order` push
-        // on cache hit so the losing Arc never appears as an orphan.
+        // descr.py:218-239 `get_field_descr`: `cachedict[fieldname] =
+        // fielddescr` with `fielddescr.parent_descr = get_size_descr(STRUCT)`.
+        // In PyPy the parent SizeDescr is always the single canonical one
+        // (populated with ALL fields) so the Weak is always valid.
+        //
+        // pyre's incremental path may replace the cached SizeDescr with a
+        // fuller one (register_keyed_size upgrade).  When that happens,
+        // existing field descrs' Weak parent back-references point to the
+        // OLD (now-dropped) SizeDescr → get_parent_descr() returns None.
+        // Detect this by checking whether the existing entry's parent_descr
+        // Weak can still upgrade; if not, replace it with the new descr
+        // whose parent Weak points to the current (upgraded) SizeDescr.
         let inner = self._cache_field.entry(struct_key).or_default();
-        let entry = inner.entry(field_name).or_insert_with(|| descr.clone());
-        let stored: Arc<SimpleFieldDescr> = entry.clone();
-        if Arc::ptr_eq(&stored, &descr) {
+        let should_replace = inner
+            .get(&field_name)
+            .map(|existing| existing.get_parent_descr().is_none())
+            .unwrap_or(true); // no entry yet → insert
+        if should_replace {
+            // Remove stale entry from _order if present.
+            if let Some(old) = inner.get(&field_name) {
+                let old_ref: DescrRef = old.clone() as DescrRef;
+                self._cache_field_order.retain(|d| !Arc::ptr_eq(d, &old_ref));
+            }
+            inner.insert(field_name, descr.clone());
             let as_ref: DescrRef = descr as DescrRef;
             if !arc_in_vec(&self._cache_field_order, &as_ref) {
                 self._cache_field_order.push(as_ref);
