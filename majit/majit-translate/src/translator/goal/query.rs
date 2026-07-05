@@ -123,6 +123,8 @@ fn some_value_class_name(s: &SomeValue) -> String {
         SomeValue::BuiltinMethod(_) => "SomeBuiltinMethod",
         SomeValue::WeakRef(_) => "SomeWeakRef",
         SomeValue::TypeOf(_) => "SomeTypeOf",
+        SomeValue::StringBuilder(_) => "SomeStringBuilder",
+        SomeValue::UnicodeBuilder(_) => "SomeUnicodeBuilder",
     }
     .to_string()
 }

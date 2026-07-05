@@ -201,6 +201,8 @@ fn render_somevalue(value: &crate::annotator::model::SomeValue) -> String {
         SomeValue::BuiltinMethod(_) => "SomeBuiltinMethod()".into(),
         SomeValue::WeakRef(_) => "SomeWeakRef()".into(),
         SomeValue::TypeOf(_) => "SomeTypeOf(...)".into(),
+        SomeValue::StringBuilder(_) => "SomeStringBuilder()".into(),
+        SomeValue::UnicodeBuilder(_) => "SomeUnicodeBuilder()".into(),
     }
 }
 

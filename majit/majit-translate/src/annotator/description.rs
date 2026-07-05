@@ -1165,6 +1165,8 @@ impl FunctionDesc {
                 SomeValueTag::BuiltinMethod => "SomeBuiltinMethod",
                 SomeValueTag::WeakRef => "SomeWeakRef",
                 SomeValueTag::TypeOf => "SomeTypeOf",
+                SomeValueTag::StringBuilder => "SomeStringBuilder",
+                SomeValueTag::UnicodeBuilder => "SomeUnicodeBuilder",
             }
         }
 

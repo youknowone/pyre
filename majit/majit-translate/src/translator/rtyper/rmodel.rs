@@ -3254,6 +3254,17 @@ pub fn rtyper_makerepr(
         SomeValue::LLADTMeth(adtmeth) => {
             Ok(std::sync::Arc::new(LLADTMethRepr::new(adtmeth)) as std::sync::Arc<dyn Repr>)
         }
+        // rstring.py:1224-1226 / 1264-1266 — SomeStringBuilder /
+        // SomeUnicodeBuilder rtyper_makerepr return the module-global
+        // stringbuilder_repr / unicodebuilder_repr singletons.
+        SomeValue::StringBuilder(_) => Ok(
+            crate::translator::rtyper::lltypesystem::rbuilder::stringbuilder_repr()
+                as std::sync::Arc<dyn Repr>,
+        ),
+        SomeValue::UnicodeBuilder(_) => Ok(
+            crate::translator::rtyper::lltypesystem::rbuilder::unicodebuilder_repr()
+                as std::sync::Arc<dyn Repr>,
+        ),
     }
 }
 
@@ -4809,5 +4820,19 @@ mod tests {
         ));
         let err = rtyper_makerepr(&sv, &rtyper).expect_err("should surface self-weak error");
         assert!(err.to_string().contains("self-weak"));
+    }
+
+    #[test]
+    fn rtyper_makerepr_stringbuilder_returns_builder_reprs() {
+        use crate::annotator::model::{SomeStringBuilder, SomeUnicodeBuilder};
+        let rtyper = rtyper_for_tests();
+
+        let sb = SomeValue::StringBuilder(SomeStringBuilder::new());
+        let r = rtyper_makerepr(&sb, &rtyper).expect("stringbuilder repr");
+        assert_eq!(r.class_name(), "StringBuilderRepr");
+
+        let ub = SomeValue::UnicodeBuilder(SomeUnicodeBuilder::new());
+        let r = rtyper_makerepr(&ub, &rtyper).expect("unicodebuilder repr");
+        assert_eq!(r.class_name(), "UnicodeBuilderRepr");
     }
 }

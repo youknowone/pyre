@@ -902,6 +902,40 @@ impl Default for SomeUnicodeBuilder {
     }
 }
 
+impl SomeObjectTrait for SomeStringBuilder {
+    fn knowntype(&self) -> KnownType {
+        KnownType::Object
+    }
+    fn immutable(&self) -> bool {
+        false
+    }
+    fn is_constant(&self) -> bool {
+        self.base.const_box.is_some()
+    }
+    fn can_be_none(&self) -> bool {
+        // upstream: default `SomeObject.can_be_none()` = True, no
+        // override on SomeStringBuilder.
+        true
+    }
+}
+
+impl SomeObjectTrait for SomeUnicodeBuilder {
+    fn knowntype(&self) -> KnownType {
+        KnownType::Object
+    }
+    fn immutable(&self) -> bool {
+        false
+    }
+    fn is_constant(&self) -> bool {
+        self.base.const_box.is_some()
+    }
+    fn can_be_none(&self) -> bool {
+        // upstream: default `SomeObject.can_be_none()` = True, no
+        // override on SomeUnicodeBuilder.
+        true
+    }
+}
+
 /// RPython `class SomeByteArray(SomeStringOrUnicode)`
 /// (model.py:304-306). Differs from its siblings in `immutable = False`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2116,6 +2150,8 @@ pub enum SomeValue {
     BuiltinMethod(SomeBuiltinMethod),
     WeakRef(SomeWeakRef),
     TypeOf(SomeTypeOf),
+    StringBuilder(SomeStringBuilder),
+    UnicodeBuilder(SomeUnicodeBuilder),
 }
 
 /// Discriminant-only view of [`SomeValue`]. Parity mirror of RPython's
@@ -2159,6 +2195,8 @@ pub enum SomeValueTag {
     BuiltinMethod,
     WeakRef,
     TypeOf,
+    StringBuilder,
+    UnicodeBuilder,
 }
 
 impl SomeValueTag {
@@ -2204,6 +2242,11 @@ impl SomeValueTag {
             T::Builtin => &[T::Builtin, T::Object],
             T::BuiltinMethod => &[T::BuiltinMethod, T::Object],
             T::WeakRef => &[T::WeakRef, T::Object],
+            // rlib/rstring.py SomeStringBuilder / SomeUnicodeBuilder are
+            // flat SomeObject subclasses; dispatch resolves to self then
+            // Object.
+            T::StringBuilder => &[T::StringBuilder, T::Object],
+            T::UnicodeBuilder => &[T::UnicodeBuilder, T::Object],
             // SomeImpossibleValue is the lattice bottom; it still
             // deserves an Object fallback so registries can bind
             // catch-all defaults keyed on Object.
@@ -2266,6 +2309,8 @@ impl SomeValue {
             SomeValue::BuiltinMethod(_) => T::BuiltinMethod,
             SomeValue::WeakRef(_) => T::WeakRef,
             SomeValue::TypeOf(_) => T::TypeOf,
+            SomeValue::StringBuilder(_) => T::StringBuilder,
+            SomeValue::UnicodeBuilder(_) => T::UnicodeBuilder,
         }
     }
 
@@ -2399,6 +2444,8 @@ impl SomeValue {
             SomeValue::BuiltinMethod(s) => s.base.const_box.as_ref(),
             SomeValue::WeakRef(s) => s.base.const_box.as_ref(),
             SomeValue::TypeOf(s) => s.base.const_box.as_ref(),
+            SomeValue::StringBuilder(s) => s.base.const_box.as_ref(),
+            SomeValue::UnicodeBuilder(s) => s.base.const_box.as_ref(),
         };
         cb.map(|c| &c.value)
     }
@@ -2446,6 +2493,8 @@ impl SomeValue {
             SomeValue::BuiltinMethod(s) => s.base.const_box = Some(c),
             SomeValue::WeakRef(s) => s.base.const_box = Some(c),
             SomeValue::TypeOf(s) => s.base.const_box = Some(c),
+            SomeValue::StringBuilder(s) => s.base.const_box = Some(c),
+            SomeValue::UnicodeBuilder(s) => s.base.const_box = Some(c),
         }
     }
 
@@ -2586,6 +2635,8 @@ impl SomeObjectTrait for SomeValue {
             SomeValue::BuiltinMethod(s) => s.knowntype(),
             SomeValue::WeakRef(s) => s.knowntype(),
             SomeValue::TypeOf(s) => s.knowntype(),
+            SomeValue::StringBuilder(s) => s.knowntype(),
+            SomeValue::UnicodeBuilder(s) => s.knowntype(),
         }
     }
 
@@ -2623,6 +2674,8 @@ impl SomeObjectTrait for SomeValue {
             SomeValue::BuiltinMethod(s) => s.immutable(),
             SomeValue::WeakRef(s) => s.immutable(),
             SomeValue::TypeOf(s) => s.immutable(),
+            SomeValue::StringBuilder(s) => s.immutable(),
+            SomeValue::UnicodeBuilder(s) => s.immutable(),
         }
     }
 
@@ -2660,6 +2713,8 @@ impl SomeObjectTrait for SomeValue {
             SomeValue::BuiltinMethod(s) => s.is_constant(),
             SomeValue::WeakRef(s) => s.is_constant(),
             SomeValue::TypeOf(s) => s.is_constant(),
+            SomeValue::StringBuilder(s) => s.is_constant(),
+            SomeValue::UnicodeBuilder(s) => s.is_constant(),
         }
     }
 
@@ -2702,6 +2757,8 @@ impl SomeObjectTrait for SomeValue {
             SomeValue::BuiltinMethod(s) => s.can_be_none(),
             SomeValue::WeakRef(s) => s.can_be_none(),
             SomeValue::TypeOf(s) => s.can_be_none(),
+            SomeValue::StringBuilder(s) => s.can_be_none(),
+            SomeValue::UnicodeBuilder(s) => s.can_be_none(),
         }
     }
 }
@@ -3420,6 +3477,8 @@ pub fn not_const(s: &SomeValue) -> SomeValue {
         SomeValue::BuiltinMethod(v) => v.base.const_box = None,
         SomeValue::WeakRef(v) => v.base.const_box = None,
         SomeValue::TypeOf(v) => v.base.const_box = None,
+        SomeValue::StringBuilder(v) => v.base.const_box = None,
+        SomeValue::UnicodeBuilder(v) => v.base.const_box = None,
         // Impossible / PBC / None_ handled above (early-return).
         SomeValue::Impossible | SomeValue::PBC(_) | SomeValue::None_(_) => unreachable!(),
     }
