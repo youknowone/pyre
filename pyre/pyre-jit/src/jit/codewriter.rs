@@ -12998,10 +12998,12 @@ pub fn find_branch_target_pcs(code: &pyre_interpreter::CodeObject) -> VecSet<usi
         // Forward conditional / unconditional jumps.  Targets compute
         // via `jump_target_forward(code, num_instrs, py_pc + 1, delta)`
         // matching the walker's PopJumpIfFalse / PopJumpIfTrue /
-        // JumpForward arms.
+        // PopJumpIfNone / PopJumpIfNotNone / JumpForward arms.
         let forward_delta = match scan_instr {
             Instruction::PopJumpIfFalse { delta }
             | Instruction::PopJumpIfTrue { delta }
+            | Instruction::PopJumpIfNone { delta }
+            | Instruction::PopJumpIfNotNone { delta }
             | Instruction::JumpForward { delta }
             | Instruction::ForIter { delta } => Some(delta.get(scan_arg).as_usize()),
             _ => None,
@@ -13023,6 +13025,8 @@ pub fn find_branch_target_pcs(code: &pyre_interpreter::CodeObject) -> VecSet<usi
                 scan_instr,
                 Instruction::PopJumpIfFalse { .. }
                     | Instruction::PopJumpIfTrue { .. }
+                    | Instruction::PopJumpIfNone { .. }
+                    | Instruction::PopJumpIfNotNone { .. }
                     | Instruction::ForIter { .. }
             ) && fallthrough < num_instrs
             {

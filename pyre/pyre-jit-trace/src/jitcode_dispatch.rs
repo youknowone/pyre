@@ -12065,6 +12065,30 @@ fn try_walker_inline_user_call(
         if pyre_interpreter::ncells(callee_code) != 0 {
             return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });
         }
+        // POP_JUMP_IF_NONE / POP_JUMP_IF_NOT_NONE lower to an `is`/`is_not`
+        // identity residual call whose operands must be Ref (the codewriter
+        // PopJumpIfNone arm), then a branch guard.  When the multiframe inline
+        // int-specializes the tested local, the mid-body guard resume cannot
+        // source that operand's Ref form from the callee register banks
+        // (`collect_callee_active_boxes` would read a stale/mismatched box), so
+        // the encoded liveness stream disagrees with the decoder
+        // (`resume.rs decode_ref: unexpected tag`) and the caller frame is
+        // corrupted.  Decline to the ordinary residual call (trait leg) until
+        // the multi-frame resume reboxes int-specialized identity operands.
+        // POP_JUMP_IF_TRUE/FALSE stay inlinable: their `bool` truth folds in the
+        // int bank, so no Ref rebox is needed.
+        if (0..callee_code.instructions.len()).any(|pc| {
+            matches!(
+                pyre_interpreter::decode_instruction_at(callee_code, pc),
+                Some((
+                    pyre_interpreter::bytecode::Instruction::PopJumpIfNone { .. }
+                        | pyre_interpreter::bytecode::Instruction::PopJumpIfNotNone { .. },
+                    _
+                ))
+            )
+        }) {
+            return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });
+        }
         let nlocals = callee_code.varnames.len();
         let frame_array_size = nlocals + callee_code.max_stackdepth as usize;
 
