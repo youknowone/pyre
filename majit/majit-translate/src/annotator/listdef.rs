@@ -663,13 +663,13 @@ impl ListDef {
     ///
     /// Records a read location for eventual `notify_update()` reflow,
     /// then returns the current element annotation. `position_key` is
-    /// `Option` — upstream's `bookkeeper.position_key` is `None`
-    /// outside of a reflow frame, and stashing that `None` in
-    /// `listitem.read_locations` is legal (Python dict keys accept
-    /// `None`). The Rust port's `HashSet<PositionKey>` can only hold
-    /// `Some` values, so `None` is dropped from the read-locations set
-    /// — the subsequent `s_value.clone()` return still matches
-    /// upstream behaviour.
+    /// `Option` because some callers (list builtins) have no reflow
+    /// position and pass `None`. Dropping that `None` is faithful, not a
+    /// divergence: `read_locations` is consumed by `reflowfromposition`
+    /// (annrpython.py:338-340), which unpacks `graph, block, index =
+    /// position_key` — a `None` member would crash the reflow loop, so
+    /// upstream's set only ever holds real positions. The Rust port's
+    /// `HashSet<PositionKey>` encodes that invariant in the type.
     pub(crate) fn read_item(&self, position_key: Option<PositionKey>) -> SomeValue {
         let li = self.inner.listitem.borrow().clone();
         let mut li_mut = li.borrow_mut();

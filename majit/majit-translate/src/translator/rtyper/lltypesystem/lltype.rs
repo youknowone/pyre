@@ -912,14 +912,21 @@ pub struct Struct {
 
 impl std::fmt::Debug for Struct {
     /// Parity with `Struct.__str__` short form (lltype.py:350-355):
-    /// `"Struct name { field_names }"` — the field NAMES only, never the
-    /// field TYPES in `_flds`. Descending into `_flds` re-expands
-    /// recursive / DAG-shared struct graphs (e.g. `pyframe::PyFrame`
-    /// reached through a `Ptr` in its own fields) into a
+    /// `"%s %s { %s }" % (self.__class__.__name__, self._name,
+    /// ', '.join(self._names))` — the class name (`Struct`/`GcStruct`) and
+    /// field NAMES only, never the field TYPES in `_flds`. Descending into
+    /// `_flds` re-expands recursive / DAG-shared struct graphs (e.g.
+    /// `pyframe::PyFrame` reached through a `Ptr` in its own fields) into a
     /// combinatorially huge string, overflowing the stack when a
     /// `where_info` diagnostic formats a variable's concretetype.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Struct {} {{ {} }}", self._name, self._names.join(", "))
+        write!(
+            f,
+            "{} {} {{ {} }}",
+            self._class_name(),
+            self._name,
+            self._names.join(", ")
+        )
     }
 }
 
@@ -4140,15 +4147,22 @@ impl Struct {
         self._arrayfld.is_some()
     }
 
+    /// Upstream `self.__class__.__name__` for the `Struct`/`GcStruct` pair:
+    /// `GcStruct` when gc-kinded, else `Struct`. The Rust port collapses the
+    /// `Struct`/`RttiStruct`/`GcStruct` class hierarchy into one type, so the
+    /// class name is recovered from `_gckind`.
+    fn _class_name(&self) -> &'static str {
+        match self._gckind {
+            GcKind::Gc => "GcStruct",
+            _ => "Struct",
+        }
+    }
+
     /// RPython `Struct._short_name` (`lltype.py:358-359`) —
     /// `"<class_name> <struct_name>"` where `class_name` is `Struct` or
     /// `GcStruct` depending on `_gckind`.
     pub fn _short_name(&self) -> String {
-        let kind = match self._gckind {
-            GcKind::Gc => "GcStruct",
-            _ => "Struct",
-        };
-        format!("{} {}", kind, self._name)
+        format!("{} {}", self._class_name(), self._name)
     }
 
     /// RPython `Struct._first_struct` (`lltype.py:296-303`). Returns the
@@ -6984,7 +6998,9 @@ mod tests {
         // Must format without overflowing the stack, both directly and
         // through the resolved forward reference.
         let via_struct = format!("{:?}", LowLevelType::Struct(Box::new(s)));
-        assert!(via_struct.contains("Struct PyFrame"), "{via_struct}");
+        // `Struct::gc` is gc-kinded, so the class name is `GcStruct`
+        // (upstream `self.__class__.__name__`), not the base `Struct`.
+        assert!(via_struct.contains("GcStruct PyFrame"), "{via_struct}");
         assert!(via_struct.contains("f_back"), "{via_struct}");
 
         let via_fwd = format!("{:?}", LowLevelType::ForwardReference(Box::new(fwd)));
