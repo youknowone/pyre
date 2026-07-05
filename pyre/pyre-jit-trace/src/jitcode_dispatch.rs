@@ -6603,22 +6603,27 @@ fn collect_outer_active_boxes(
                     let vbox = trace_ctx.virtualizable_box_at(nvs + s_idx);
                     let walk_box = regs_r.get(color).copied();
                     if s_idx >= nlocals {
-                        // Operand-stack slot.  The vable shadow is synced to
-                        // the stack only at merge points (`close_loop_args_at`),
-                        // so a slot pushed mid-opcode (the two operands a
-                        // `BINARY_OP` / `BINARY_SUBSCR` value-guard resumes
-                        // before) is stale in the shadow — either an unset
-                        // NULL `ConstPtr` or a stale `getfield` ResOp that
-                        // evaluates to NULL at the guard.  The walk register
-                        // file holds the live SSA box; read it directly
-                        // (trait `get_list_of_active_boxes` parity).  Without
-                        // this the snapshot encodes a NULL operand that the
-                        // blackhole re-executes the opcode with (`bh_binary_op_fn`
-                        // "binary op on null operand") and the bridge re-trace
-                        // constant-folds into `CallR(binop, null, null, ...)`.
-                        match walk_box {
-                            Some(v) if v != OpRef::NONE => v,
-                            _ => vbox.unwrap_or_else(fallback),
+                        // Operand-stack slot.  The authoritative source is the
+                        // virtualizable shadow (`setarrayitem_vable_r` keeps it
+                        // current on every push/store).  The walk register file
+                        // (`registers_r[color]`) is NOT authoritative for stack
+                        // slots: stack-slot `write_ref_reg` was retired, so the
+                        // register may hold a stale value from a prior SSA def
+                        // that shared the same color (e.g. a green scratch ref
+                        // like `pycode_var` whose tiny live range lets the
+                        // chordal coloring assign it the same color as an
+                        // iterator).  Read the shadow first; fall back to the
+                        // walk register only when the shadow slot is NULL
+                        // (a mid-opcode transient the portal never wrote).
+                        let shadow_is_real =
+                            vbox.is_some_and(|b| !opref_is_null_const_ptr(b));
+                        if shadow_is_real {
+                            vbox.unwrap_or_else(fallback)
+                        } else {
+                            match walk_box {
+                                Some(v) if v != OpRef::NONE && !opref_is_null_const_ptr(v) => v,
+                                _ => vbox.unwrap_or_else(fallback),
+                            }
                         }
                     } else {
                         // Local slot.  Written to the shadow on every
