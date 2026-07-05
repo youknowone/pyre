@@ -694,6 +694,59 @@ fn duplicate_inputarg_vars(graph: &LegacyGraph) -> std::collections::HashSet<Var
     dups
 }
 
+/// Op-*result* Variables that no reachable op or exitswitch reads — their
+/// only consumers are `Link.args` forwardings (dead phi-threads).  This is
+/// the op-result analogue of the dead non-entry-block inputarg
+/// [`reachable_defined_vars`] already excludes: the real path's
+/// `transform_dead_op_vars` (`simplify.py:422`) drops the result binding of
+/// such a value, so `setup_block_entry` never types it, whereas the legacy
+/// walker types every op result.
+///
+/// The concrete hitters are element reads whose value is never observed: a
+/// `swap_values` `getarrayitem(localsplus, idx)` on the two write-back
+/// positions, or a `store_local_value` `getarrayitem` whose read half is
+/// dead (the paired `setarrayitem` is the only live effect).  The read
+/// value forwards through phi links into the returnblock but no op consumes
+/// it, so `real=None` here is the dead-result artifact, not a kind
+/// divergence.
+///
+/// Reads counted: op operands (`op_operand_vars`, which includes an
+/// `ArrayWrite`/`FieldWrite` value operand — a written-back read is live and
+/// excluded here) and the exitswitch (Value / fused compare).  `Link.args`
+/// forwarding is deliberately NOT counted, matching `reachable_defined_vars`.
+fn dead_op_result_vars(graph: &LegacyGraph) -> std::collections::HashSet<Variable> {
+    let mut op_read: std::collections::HashSet<Variable> = std::collections::HashSet::new();
+    for block in &graph.blocks {
+        for op in &block.operations {
+            for v in crate::front::result_exc::op_operand_vars(&op.kind) {
+                op_read.insert(v);
+            }
+        }
+        match &block.exitswitch {
+            Some(crate::model::ExitSwitch::Value(v)) => {
+                op_read.insert(v.clone());
+            }
+            Some(crate::model::ExitSwitch::Fused { args, .. }) => {
+                for v in args {
+                    op_read.insert(v.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut dead = std::collections::HashSet::new();
+    for block in &graph.blocks {
+        for op in &block.operations {
+            if let Some(r) = &op.result
+                && !op_read.contains(r)
+            {
+                dead.insert(r.clone());
+            }
+        }
+    }
+    dead
+}
+
 /// Diff the real path's per-Variable kinds against the legacy walker's
 /// kinds committed onto the same legacy Variables.  Walks
 /// [`FunctionGraph::iter_variables`] for a deterministic, slot-free
@@ -708,6 +761,7 @@ fn collect_divergences(
     let reachable_vars = reachable_defined_vars(legacy_graph);
     let colored_operands = colored_operand_vars(legacy_graph);
     let duplicate_inputargs = duplicate_inputarg_vars(legacy_graph);
+    let dead_op_results = dead_op_result_vars(legacy_graph);
     let mut divergences = Vec::new();
     for (pos, var) in legacy_graph.iter_variables().iter().enumerate() {
         // `iterblocks()` parity: the real path annotates only the
@@ -784,7 +838,29 @@ fn collect_divergences(
         let real_dropped_duplicate_inputarg = legacy_kind == ConcreteType::GcRef
             && real_present.is_none()
             && duplicate_inputargs.contains(var);
-        let diverges = if real_refines_gcref_to_void || real_dropped_duplicate_inputarg {
+        // A dead op *result* — no op or exitswitch reads it, only `Link.args`
+        // forwarding does — is dropped by the real path's
+        // `transform_dead_op_vars` (`simplify.py:422`), so it is untyped in
+        // the real graph while the legacy walker types every op result.  The
+        // hitters are erased-element `getarrayitem` reads whose value is
+        // never observed: `swap_values`'s two write-back positions and
+        // `store_local_value`'s dead read half (the paired `setarrayitem` is
+        // the only live effect).  `real=None` here is the dead-result
+        // artifact, not a kind divergence — scoped to `legacy=GcRef` (the
+        // erased `<E>::Value` element family) so a genuine `Signed`/`Float`
+        // dropped result is never silently accepted.  The acceptance is
+        // constrained to the `real_present.is_none()` (untyped) case: a
+        // *positively-typed* result whose kind conflicts (the rejected
+        // `set_update` element mistyped `Signed`) is never in this set,
+        // because a mistyped element is op-read (fed to `w_set_add` /
+        // `w_list_append`) and so excluded by the `op_operand_vars` scan.
+        let real_dropped_dead_op_result = legacy_kind == ConcreteType::GcRef
+            && real_present.is_none()
+            && dead_op_results.contains(var);
+        let diverges = if real_refines_gcref_to_void
+            || real_dropped_duplicate_inputarg
+            || real_dropped_dead_op_result
+        {
             false
         } else if legacy_kind != ConcreteType::Unknown {
             real_kind != legacy_kind
@@ -3226,6 +3302,95 @@ mod tests {
         // Real path merged the duplicate column away → `v1` untyped.
         let real_state = HashMap::new();
         collect_divergences(&real_state, &graph)
+    }
+
+    /// Build start → mid → return where `mid` defines an `ArrayRead` result
+    /// (`vars[2]`) that no op or exitswitch reads — it is only forwarded on
+    /// the link into the returnblock (a dead phi-thread).  `dead_op_result_vars`
+    /// classifies it; the real path leaves it untyped (`real=None`).
+    fn diff_dead_op_result(legacy_kind: ConcreteType) -> Vec<String> {
+        let mut graph = LegacyGraph::new("diff_dead_op_result");
+        let vars = mint_vars(&mut graph, 3);
+        let base = vars[0].clone();
+        let index = vars[1].clone();
+        let dead = vars[2].clone();
+        let mid_id = crate::model::BlockId(7);
+        let startblock = Block {
+            id: graph.startblock,
+            inputargs: block_inputargs(&vars, &[0, 1]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![crate::model::Link::new_mixed(
+                vec![LinkArg::Value(base.clone()), LinkArg::Value(index.clone())],
+                mid_id,
+                None,
+            )],
+            framestate: None,
+            dead: false,
+        };
+        // `mid` reads `base[index]` into `dead`, then forwards `dead` on the
+        // link into the returnblock without any op consuming it.
+        let midblock = Block {
+            id: mid_id,
+            inputargs: block_inputargs(&vars, &[0, 1]),
+            operations: vec![crate::model::SpaceOperation {
+                result: Some(dead.clone()),
+                kind: crate::model::OpKind::ArrayRead {
+                    base: base.clone(),
+                    index: index.clone(),
+                    item_ty: ValueType::Ref(None),
+                    array_type_id: None,
+                    nolength: false,
+                    pure: false,
+                },
+            }],
+            exitswitch: None,
+            exits: vec![link_to_returnblock(
+                vec![LinkArg::Value(dead.clone())],
+                graph.returnblock,
+            )],
+            framestate: None,
+            dead: false,
+        };
+        let returnblock = Block {
+            id: graph.returnblock,
+            inputargs: block_inputargs(&vars, &[2]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        };
+        graph.blocks = vec![startblock, midblock, returnblock];
+        crate::model::FunctionGraph::set_concretetype_of_inline(&dead, legacy_kind);
+        // Real path dropped the dead op result → `dead` untyped.
+        let real_state = HashMap::new();
+        collect_divergences(&real_state, &graph)
+    }
+
+    #[test]
+    fn collect_divergences_accepts_gcref_dead_op_result_dropped() {
+        // A `legacy=GcRef` op result no op reads (only link-forwarded) is
+        // dropped by the real path's `transform_dead_op_vars`, reading
+        // `real=Unknown` — the dead-result artifact for erased-element
+        // `getarrayitem` reads (swap_values / store_local_value), not a
+        // divergence.
+        assert!(
+            diff_dead_op_result(ConcreteType::GcRef).is_empty(),
+            "a GcRef dead op result dropped by transform_dead_op_vars is not a \
+             divergence"
+        );
+    }
+
+    #[test]
+    fn collect_divergences_rejects_signed_dead_op_result_dropped() {
+        // Scoped to `GcRef`: a `legacy=Signed` dead op result is still a
+        // divergence (the erased-`<E>::Value` element family is GcRef-only).
+        assert_eq!(
+            diff_dead_op_result(ConcreteType::Signed).len(),
+            1,
+            "a Signed dead op result left untyped is still a divergence"
+        );
     }
 
     #[test]
