@@ -374,25 +374,6 @@ pub fn dict_update_value(dict: PyObjectRef, source: PyObjectRef) -> Result<(), P
     Ok(())
 }
 
-/// Resolve callable display prefix for `**kwargs` error messages
-/// (e.g. `"foo() "`), or `""` when unresolvable.
-fn callable_prefix(w_callable: PyObjectRef) -> String {
-    if w_callable.is_null() {
-        return String::new();
-    }
-    unsafe {
-        if crate::is_function(w_callable) {
-            let name = crate::function_get_qualname(w_callable);
-            return format!("{name}() ");
-        }
-        if pyre_object::is_type(w_callable) {
-            let name = pyre_object::w_type_get_name(w_callable);
-            return format!("{name}() ");
-        }
-    }
-    String::new()
-}
-
 /// DICT_MERGE — merge `source` into `dict` with duplicate-key checks.
 /// Shared by the interpreter's `dict_merge` and the JIT residual
 /// `bh_dict_merge_fn`.  `w_callable` is the peeked callable used only for
@@ -402,28 +383,60 @@ pub fn dict_merge_value(
     source: PyObjectRef,
     w_callable: PyObjectRef,
 ) -> Result<(), PyError> {
-    let prefix = callable_prefix(w_callable);
-    unsafe {
-        if pyre_object::is_dict(source) {
-            for (k, v) in pyre_object::w_dict_items(source) {
-                if pyre_object::w_dict_lookup(dict, k).is_some() {
-                    let key_str = crate::display::py_str(k)?;
-                    return Err(PyError::type_error(format!(
-                        "{prefix}got multiple values for keyword argument '{key_str}'"
-                    )));
+    // pyopcode.py:1979 `_dict_merge`.
+    let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
+    // `space.isinstance_w(w_dict, space.w_dict)` accepts dict subclasses;
+    // a non-dict target is a RuntimeError, not a TypeError.
+    if !unsafe { crate::baseobjspace::isinstance_w(dict, w_dict_type) } {
+        let type_name = unsafe { (*(*dict).ob_type).name };
+        return Err(PyError::new(
+            crate::PyErrorKind::RuntimeError,
+            format!("expected a dict, got {type_name}"),
+        ));
+    }
+    // `space.len_w` is a generic `__len__` dispatch — a raw `w_dict_len`
+    // would be UB on a dict subclass whose layout is not `W_DictObject`.
+    let l1 = crate::baseobjspace::len_w(dict)?;
+    let source_is_dict = unsafe { crate::baseobjspace::isinstance_w(source, w_dict_type) };
+    if !source_is_dict {
+        // `if not space.ismapping_w(w_item): raise oefmt(... "%s argument
+        // after ** must be a mapping, not %T")`.
+        if !crate::baseobjspace::ismapping_w(source) {
+            let type_name = unsafe { (*(*source).ob_type).name };
+            return Err(crate::argument::raise_type_error(
+                w_callable,
+                format!("argument after ** must be a mapping, not {type_name}"),
+            ));
+        }
+    } else {
+        // Dict source fast paths: an empty target merges without the
+        // duplicate check (`update1`); an empty source is a no-op.  The raw
+        // items walk is exact-dict only — a dict subclass may override
+        // `keys()` / `__getitem__`, so it falls through to the generic loop.
+        let l2 = crate::baseobjspace::len_w(source)?;
+        if l1 == 0 && unsafe { pyre_object::is_dict(source) } {
+            unsafe {
+                for (k, v) in pyre_object::w_dict_items(source) {
+                    pyre_object::w_dict_store(dict, k, v);
                 }
-                pyre_object::w_dict_store(dict, k, v);
             }
             return Ok(());
         }
+        if l2 == 0 {
+            return Ok(());
+        }
     }
+    // `_dict_merge_loop`: iterate `iter(w_item.keys())`, look each value up
+    // with `space.getitem`, reject a key already present in the target with
+    // `"%s got multiple values for keyword argument '%S'"`, then store.
     let keys_method = match crate::baseobjspace::getattr_str(source, "keys") {
         Ok(m) => m,
         Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
             let type_name = unsafe { (*(*source).ob_type).name };
-            return Err(PyError::type_error(format!(
-                "{prefix}argument after ** must be a mapping, not {type_name}"
-            )));
+            return Err(crate::argument::raise_type_error(
+                w_callable,
+                format!("argument after ** must be a mapping, not {type_name}"),
+            ));
         }
         Err(e) => return Err(e),
     };
@@ -431,15 +444,14 @@ pub fn dict_merge_value(
     let keys = crate::builtins::collect_iterable(keys_obj)?;
     for key in keys {
         let val = crate::baseobjspace::getitem(source, key)?;
-        unsafe {
-            if pyre_object::w_dict_lookup(dict, key).is_some() {
-                let key_str = crate::display::py_str(key)?;
-                return Err(PyError::type_error(format!(
-                    "{prefix}got multiple values for keyword argument '{key_str}'"
-                )));
-            }
-            pyre_object::w_dict_store(dict, key, val);
+        if crate::baseobjspace::contains(dict, key)? {
+            let key_str = unsafe { crate::display::py_str(key) }?;
+            return Err(crate::argument::raise_type_error(
+                w_callable,
+                format!("got multiple values for keyword argument '{key_str}'"),
+            ));
         }
+        unsafe { pyre_object::w_dict_store(dict, key, val) };
     }
     Ok(())
 }
