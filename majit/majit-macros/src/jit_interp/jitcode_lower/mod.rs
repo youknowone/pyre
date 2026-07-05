@@ -420,6 +420,7 @@ pub(super) fn call_policy_effect_slot(
         | K::ResidualVoidWrapped
         | K::ResidualInt
         | K::ResidualIntWrapped
+        | K::ResidualRef
         | K::ResidualRefWrapped
         | K::ResidualFloatWrapped => Some(CondCallEffectSlot::CanRaise),
 
@@ -522,7 +523,8 @@ pub(super) fn call_policy_result_kind(
         | K::InlineInt
         | K::InlinePipelineInt => Some(CallResultKind::Int),
 
-        K::ResidualRefWrapped
+        K::ResidualRef
+        | K::ResidualRefWrapped
         | K::ResidualRefCannotRaiseWrapped
         | K::MayForceRefWrapped
         | K::LoopInvariantRefWrapped
@@ -562,6 +564,7 @@ pub(super) fn call_policy_is_wrapped(kind: crate::jit_interp::CallPolicyKind) ->
             | K::ElidableIntWrapped
             | K::ElidableIntCannotRaiseWrapped
             | K::ElidableIntOrMemerrorWrapped
+            | K::ResidualRef
             | K::ResidualRefWrapped
             | K::ResidualRefCannotRaiseWrapped
             | K::MayForceRefWrapped

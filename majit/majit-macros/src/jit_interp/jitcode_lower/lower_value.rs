@@ -662,6 +662,27 @@ impl<'c> Lowerer<'c> {
                         },
                     );
                 }
+                // Non-wrapped ref-returning call (value position).
+                crate::jit_interp::CallPolicyKind::ResidualRef => {
+                    let typed_args = typed_call_arg_tokens(&arg_bindings);
+                    let reg = self.alloc_reg();
+                    let __arg_regs: Vec<Register> =
+                        arg_bindings.iter().map(Register::from_binding).collect();
+                    self.emit_op(
+                        OpMeta::linear(OpKind::Call, __arg_regs, vec![Register::ref_(reg)]),
+                        quote! {
+                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                            let __typed_args = #typed_args;
+                            __builder.residual_call_ref_canonical_via_target(__fn_idx, __typed_args, #reg);
+                        },
+                    );
+                    return Some(Binding {
+                        reg,
+                        kind: BindingKind::Ref,
+                        depends_on_stack: false,
+                        struct_type: None,
+                    });
+                }
                 crate::jit_interp::CallPolicyKind::ResidualIntWrapped
                 | crate::jit_interp::CallPolicyKind::ResidualIntCannotRaiseWrapped
                 | crate::jit_interp::CallPolicyKind::MayForceIntWrapped

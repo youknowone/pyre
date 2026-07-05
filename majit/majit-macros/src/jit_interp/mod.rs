@@ -389,6 +389,7 @@ pub(crate) enum CallPolicyKind {
     // `_can_raise` but distinguishes memory-only failure modes.
     ElidableIntOrMemerror,
     ElidableIntOrMemerrorWrapped,
+    ResidualRef,
     ResidualRefWrapped,
     /// `EF_CANNOT_RAISE` for ref-returning residual helpers.
     /// Mirrors `ResidualIntCannotRaiseWrapped`; the unwrapped variant
@@ -462,6 +463,7 @@ pub(crate) fn parse_call_policy_kind(kind: &Ident) -> Option<CallPolicyKind> {
         "elidable_int_cannot_raise_wrapped" => CallPolicyKind::ElidableIntCannotRaiseWrapped,
         "elidable_int_or_memerror" => CallPolicyKind::ElidableIntOrMemerror,
         "elidable_int_or_memerror_wrapped" => CallPolicyKind::ElidableIntOrMemerrorWrapped,
+        "residual_ref" => CallPolicyKind::ResidualRef,
         "residual_ref_wrapped" => CallPolicyKind::ResidualRefWrapped,
         "residual_ref_cannot_raise_wrapped" => CallPolicyKind::ResidualRefCannotRaiseWrapped,
         "may_force_ref_wrapped" => CallPolicyKind::MayForceRefWrapped,
@@ -1889,7 +1891,8 @@ fn rewrite_body(
             | CallPolicyKind::MayForceIntWrapped
             | CallPolicyKind::ReleaseGilIntWrapped
             | CallPolicyKind::LoopInvariantIntWrapped => Some(ObserverReplayKind::Int),
-            CallPolicyKind::ResidualRefWrapped
+            CallPolicyKind::ResidualRef
+            | CallPolicyKind::ResidualRefWrapped
             | CallPolicyKind::ResidualRefCannotRaiseWrapped
             | CallPolicyKind::MayForceRefWrapped
             | CallPolicyKind::LoopInvariantRefWrapped => Some(ObserverReplayKind::Ref),
