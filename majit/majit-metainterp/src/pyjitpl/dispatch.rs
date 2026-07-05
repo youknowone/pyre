@@ -411,33 +411,46 @@ pub fn consume_observed_getfield(obj: usize, offset: usize) -> Option<i64> {
     }
     OBSERVED_CALLS.with(|q| {
         let mut q = q.borrow_mut();
-        let Some(front) = q.front() else {
+        if q.is_empty() {
             OBSERVER_REPLAY.with(|m| m.set(false));
             return None;
-        };
+        }
         if observer_debug() {
             eprintln!("[observer] consume getfield obj={obj:#x} offset={offset}");
         }
-        match front {
-            ObservedCall::Getfield {
-                obj: observed_obj,
-                offset: observed_offset,
-                result,
-            } if *observed_obj == obj && *observed_offset == offset => {
-                let result = *result;
-                q.pop_front();
-                if q.is_empty() {
-                    OBSERVER_REPLAY.with(|m| m.set(false));
-                }
-                Some(result)
-            }
-            other => observed_call_mismatch(
+        // Field reads may interleave differently between the observer walk
+        // (which executes JitCode IR ops) and the concrete replay (which
+        // executes Rust source order).  E.g. the walk may read Stack.size
+        // before Stack.head for a stackok guard, while the concrete path
+        // reads head first in OP_POP.  Scan the queue for the matching
+        // (obj, offset) entry instead of requiring strict FIFO order.
+        // Only Getfield entries are reordered; Void/Int/Ref/Float calls
+        // retain their FIFO position — a Getfield is never swapped past a
+        // non-Getfield boundary (the interleaving only happens between
+        // consecutive Getfield entries within the same opcode group).
+        let pos = q.iter().position(|entry| {
+            matches!(entry, ObservedCall::Getfield {
+                obj: o, offset: off, ..
+            } if *o == obj && *off == offset)
+        });
+        let Some(idx) = pos else {
+            let front = q.front().unwrap();
+            observed_call_mismatch(
                 "getfield",
                 obj as *const (),
                 &[obj as i64, offset as i64],
-                other,
-            ),
+                front,
+            )
+        };
+        let entry = q.remove(idx).unwrap();
+        let result = match entry {
+            ObservedCall::Getfield { result, .. } => result,
+            _ => unreachable!(),
+        };
+        if q.is_empty() {
+            OBSERVER_REPLAY.with(|m| m.set(false));
         }
+        Some(result)
     })
 }
 
