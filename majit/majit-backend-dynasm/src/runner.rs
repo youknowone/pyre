@@ -120,6 +120,47 @@ fn with_dynasm_active_gc<R>(f: impl FnOnce(&dyn majit_gc::GcAllocator) -> R) -> 
     })
 }
 
+/// Store a GC allocator in the dynasm backend thread-local and register
+/// the `majit_gc::set_active_*` function-pointer hooks, without
+/// requiring a `DynasmBackend` instance.  This allows the GC subsystem
+/// to be installed at boot (via `init_gc_subsystem`) before the JIT
+/// driver is constructed.
+pub fn install_gc_standalone(mut gc: Box<dyn majit_gc::GcAllocator>) {
+    gc.freeze_types();
+    let supports_guard_gc_type = gc.supports_guard_gc_type();
+    DYNASM_ACTIVE_GC.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        *guard = Some(gc);
+        let raw = guard
+            .as_deref_mut()
+            .map(|gc| gc as *mut dyn majit_gc::GcAllocator);
+        DYNASM_ACTIVE_GC_RAW.with(|raw_cell| raw_cell.set(raw));
+    });
+    majit_gc::set_active_gc_guard_hooks(majit_gc::ActiveGcGuardHooks {
+        check_is_object: Some(dynasm_check_is_object),
+        get_actual_typeid: Some(dynasm_get_actual_typeid),
+        subclass_range: Some(dynasm_subclass_range),
+        typeid_subclass_range: Some(dynasm_typeid_subclass_range),
+        typeid_is_object: Some(dynasm_typeid_is_object),
+        can_move: Some(dynasm_can_move),
+        supports_guard_gc_type,
+    });
+    majit_gc::set_active_alloc_nursery_typed(Some(dynasm_alloc_nursery_typed));
+    majit_gc::set_active_alloc_nursery_collecting_typed(Some(
+        dynasm_alloc_nursery_collecting_typed,
+    ));
+    majit_gc::set_active_charge_memory_pressure(Some(dynasm_charge_memory_pressure));
+    majit_gc::set_active_charge_oldgen_external(Some(dynasm_charge_oldgen_external));
+    majit_gc::set_active_alloc_oldgen_typed(Some(dynasm_alloc_oldgen_typed));
+    majit_gc::set_active_collect_full(Some(dynasm_collect_full));
+    majit_gc::set_active_collect_oldgen(Some(dynasm_collect_oldgen_nonmoving));
+    majit_gc::set_active_heap_stats(Some(dynasm_heap_stats));
+    majit_gc::set_active_root_hooks(Some(dynasm_gc_add_root), Some(dynasm_gc_remove_root));
+    majit_gc::set_active_gc_owns_object(Some(dynasm_gc_owns_object));
+    majit_gc::set_active_gc_id_or_identityhash(Some(dynasm_id_or_identityhash));
+    majit_gc::set_active_write_barrier(Some(dynasm_gc_write_barrier));
+}
+
 /// Clear both `DYNASM_ACTIVE_GC` and `DYNASM_ACTIVE_GC_RAW`. Callers
 /// that want to drop the active dynasm GC must go through this helper
 /// rather than mutating `DYNASM_ACTIVE_GC` directly, otherwise the raw
@@ -1254,49 +1295,8 @@ impl DynasmBackend {
     /// Dynasm does not have cranelift's runtime-id indirection, so it
     /// mirrors wasm: the live allocator is stored in a thread-local and
     /// exposed through backend-agnostic `majit_gc::ActiveGcGuardHooks`.
-    pub fn set_gc_allocator(&mut self, mut gc: Box<dyn majit_gc::GcAllocator>) {
-        gc.freeze_types();
-        let supports_guard_gc_type = gc.supports_guard_gc_type();
-        DYNASM_ACTIVE_GC.with(|cell| {
-            let mut guard = cell.borrow_mut();
-            // Drop the previous allocator first so reentrant
-            // `dynasm_gc_owns_object` queries from its drop body still
-            // resolve old-heap addresses through the raw mirror — it
-            // keeps pointing at the live old box throughout the drop
-            // body. Publishing the new raw pointer before the drop
-            // would route those queries to the new allocator, which
-            // does not know about old-heap addresses. After the drop
-            // returns no further reentry is possible on this thread
-            // before the raw mirror is republished synchronously below.
-            *guard = Some(gc);
-            let raw = guard
-                .as_deref_mut()
-                .map(|gc| gc as *mut dyn majit_gc::GcAllocator);
-            DYNASM_ACTIVE_GC_RAW.with(|raw_cell| raw_cell.set(raw));
-        });
-        majit_gc::set_active_gc_guard_hooks(majit_gc::ActiveGcGuardHooks {
-            check_is_object: Some(dynasm_check_is_object),
-            get_actual_typeid: Some(dynasm_get_actual_typeid),
-            subclass_range: Some(dynasm_subclass_range),
-            typeid_subclass_range: Some(dynasm_typeid_subclass_range),
-            typeid_is_object: Some(dynasm_typeid_is_object),
-            can_move: Some(dynasm_can_move),
-            supports_guard_gc_type,
-        });
-        majit_gc::set_active_alloc_nursery_typed(Some(dynasm_alloc_nursery_typed));
-        majit_gc::set_active_alloc_nursery_collecting_typed(Some(
-            dynasm_alloc_nursery_collecting_typed,
-        ));
-        majit_gc::set_active_charge_memory_pressure(Some(dynasm_charge_memory_pressure));
-        majit_gc::set_active_charge_oldgen_external(Some(dynasm_charge_oldgen_external));
-        majit_gc::set_active_alloc_oldgen_typed(Some(dynasm_alloc_oldgen_typed));
-        majit_gc::set_active_collect_full(Some(dynasm_collect_full));
-        majit_gc::set_active_collect_oldgen(Some(dynasm_collect_oldgen_nonmoving));
-        majit_gc::set_active_heap_stats(Some(dynasm_heap_stats));
-        majit_gc::set_active_root_hooks(Some(dynasm_gc_add_root), Some(dynasm_gc_remove_root));
-        majit_gc::set_active_gc_owns_object(Some(dynasm_gc_owns_object));
-        majit_gc::set_active_gc_id_or_identityhash(Some(dynasm_id_or_identityhash));
-        majit_gc::set_active_write_barrier(Some(dynasm_gc_write_barrier));
+    pub fn set_gc_allocator(&mut self, gc: Box<dyn majit_gc::GcAllocator>) {
+        install_gc_standalone(gc);
     }
 
     /// llmodel.py:64-69 self.vtable_offset configuration.

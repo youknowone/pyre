@@ -346,6 +346,47 @@ fn ensure_jitframe_type_registered(gc: &mut dyn GcAllocator) -> Option<u32> {
     Some(id)
 }
 
+/// Store a GC allocator in the cranelift backend thread-local and
+/// register the `majit_gc::set_active_*` function-pointer hooks,
+/// without requiring a `CraneliftBackend` instance.
+pub fn install_gc_standalone(mut gc: Box<dyn GcAllocator>) {
+    let jitframe_type_id = ensure_jitframe_type_registered(gc.as_mut());
+    gc.freeze_types();
+    let supports_guard_gc_type = gc.supports_guard_gc_type();
+    set_cranelift_active_gc(Some(gc));
+    set_cranelift_jitframe_type_id(jitframe_type_id);
+    majit_gc::set_active_gc_guard_hooks(majit_gc::ActiveGcGuardHooks {
+        check_is_object: Some(check_is_object_via_active_runtime),
+        get_actual_typeid: Some(get_actual_typeid_via_active_runtime),
+        subclass_range: Some(subclass_range_via_active_runtime),
+        typeid_subclass_range: Some(typeid_subclass_range_via_active_runtime),
+        typeid_is_object: Some(typeid_is_object_via_active_runtime),
+        can_move: Some(can_move_via_active_runtime),
+        supports_guard_gc_type,
+    });
+    majit_gc::set_active_alloc_nursery_typed(Some(alloc_nursery_typed_via_active_runtime));
+    majit_gc::set_active_alloc_nursery_collecting_typed(Some(
+        alloc_nursery_collecting_typed_via_active_runtime,
+    ));
+    majit_gc::set_active_charge_memory_pressure(Some(
+        charge_memory_pressure_via_active_runtime,
+    ));
+    majit_gc::set_active_charge_oldgen_external(Some(
+        charge_oldgen_external_via_active_runtime,
+    ));
+    majit_gc::set_active_alloc_oldgen_typed(Some(alloc_oldgen_typed_via_active_runtime));
+    majit_gc::set_active_collect_full(Some(collect_full_via_active_runtime));
+    majit_gc::set_active_collect_oldgen(Some(collect_oldgen_nonmoving_via_active_runtime));
+    majit_gc::set_active_heap_stats(Some(heap_stats_via_active_runtime));
+    majit_gc::set_active_root_hooks(
+        Some(gc_add_root_via_active_runtime),
+        Some(gc_remove_root_via_active_runtime),
+    );
+    majit_gc::set_active_gc_owns_object(Some(gc_owns_object_via_active_runtime));
+    majit_gc::set_active_gc_id_or_identityhash(Some(id_or_identityhash_via_active_runtime));
+    majit_gc::set_active_write_barrier(Some(gc_write_barrier_via_active_runtime));
+}
+
 /// Follow jf_forward chain to get the final jitframe address.
 ///
 /// RPython jitframe.py:54-57 jitframe_resolve:
@@ -7766,56 +7807,8 @@ impl CraneliftBackend {
         backend
     }
 
-    pub fn set_gc_allocator(&mut self, mut gc: Box<dyn GcAllocator>) {
-        let jitframe_type_id = ensure_jitframe_type_registered(gc.as_mut());
-        // gctypelayout.encode_type_shapes_now parity: close the
-        // type-registration phase before any compile embeds the
-        // type_info_group base address. After this, register_type
-        // panics and every is_object type's subclassrange is filled
-        // in by the preorder walk in assign_inheritance_ids.
-        gc.freeze_types();
-        let supports_guard_gc_type = gc.supports_guard_gc_type();
-        // `llmodel.py:58` `self.gc_ll_descr = get_ll_description(...)` —
-        // single owning slot per CPU. Replaces any prior allocator on
-        // this thread; the implicit drop of the old `Box` is the
-        // RPython `cpu.gc_ll_descr = …` assignment's parity.
-        set_cranelift_active_gc(Some(gc));
-        set_cranelift_jitframe_type_id(jitframe_type_id);
-        // Publish the backend's GC-guard seam through the
-        // backend-agnostic shims so the optimizer (majit-metainterp)
-        // and blackhole executor can reach the live allocator without
-        // taking a cranelift dependency. Mirrors RPython's
-        // `self.optimizer.cpu.check_is_object(...)` access path.
-        majit_gc::set_active_gc_guard_hooks(majit_gc::ActiveGcGuardHooks {
-            check_is_object: Some(check_is_object_via_active_runtime),
-            get_actual_typeid: Some(get_actual_typeid_via_active_runtime),
-            subclass_range: Some(subclass_range_via_active_runtime),
-            typeid_subclass_range: Some(typeid_subclass_range_via_active_runtime),
-            typeid_is_object: Some(typeid_is_object_via_active_runtime),
-            can_move: Some(can_move_via_active_runtime),
-            supports_guard_gc_type,
-        });
-        majit_gc::set_active_alloc_nursery_typed(Some(alloc_nursery_typed_via_active_runtime));
-        majit_gc::set_active_alloc_nursery_collecting_typed(Some(
-            alloc_nursery_collecting_typed_via_active_runtime,
-        ));
-        majit_gc::set_active_charge_memory_pressure(Some(
-            charge_memory_pressure_via_active_runtime,
-        ));
-        majit_gc::set_active_charge_oldgen_external(Some(
-            charge_oldgen_external_via_active_runtime,
-        ));
-        majit_gc::set_active_alloc_oldgen_typed(Some(alloc_oldgen_typed_via_active_runtime));
-        majit_gc::set_active_collect_full(Some(collect_full_via_active_runtime));
-        majit_gc::set_active_collect_oldgen(Some(collect_oldgen_nonmoving_via_active_runtime));
-        majit_gc::set_active_heap_stats(Some(heap_stats_via_active_runtime));
-        majit_gc::set_active_root_hooks(
-            Some(gc_add_root_via_active_runtime),
-            Some(gc_remove_root_via_active_runtime),
-        );
-        majit_gc::set_active_gc_owns_object(Some(gc_owns_object_via_active_runtime));
-        majit_gc::set_active_gc_id_or_identityhash(Some(id_or_identityhash_via_active_runtime));
-        majit_gc::set_active_write_barrier(Some(gc_write_barrier_via_active_runtime));
+    pub fn set_gc_allocator(&mut self, gc: Box<dyn GcAllocator>) {
+        install_gc_standalone(gc);
     }
 
     // `set_constants_pool`, `set_next_trace_id`, `set_next_header_pc`

@@ -208,6 +208,36 @@ fn with_wasm_active_gc<R>(f: impl FnOnce(&dyn GcAllocator) -> R) -> Option<R> {
     })
 }
 
+/// Store a GC allocator in the wasm backend thread-local and register
+/// the `majit_gc::set_active_*` function-pointer hooks, without
+/// requiring a `WasmBackend` instance.
+pub fn install_gc_standalone(mut gc: Box<dyn majit_gc::GcAllocator>) {
+    gc.freeze_types();
+    let supports_guard_gc_type = gc.supports_guard_gc_type();
+    WASM_ACTIVE_GC.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        *guard = Some(gc);
+        let raw = guard.as_deref_mut().map(|gc| gc as *mut dyn GcAllocator);
+        WASM_ACTIVE_GC_RAW.with(|raw_cell| raw_cell.set(raw));
+    });
+    majit_gc::set_active_gc_guard_hooks(majit_gc::ActiveGcGuardHooks {
+        check_is_object: Some(wasm_check_is_object),
+        get_actual_typeid: Some(wasm_get_actual_typeid),
+        subclass_range: Some(wasm_subclass_range),
+        typeid_subclass_range: Some(wasm_typeid_subclass_range),
+        typeid_is_object: Some(wasm_typeid_is_object),
+        can_move: None,
+        supports_guard_gc_type,
+    });
+    majit_gc::set_active_alloc_nursery_typed(Some(wasm_alloc_nursery_typed));
+    majit_gc::set_active_alloc_oldgen_typed(Some(wasm_alloc_oldgen_typed));
+    majit_gc::set_active_root_hooks(Some(wasm_gc_add_root), Some(wasm_gc_remove_root));
+    majit_gc::set_active_gc_owns_object(Some(wasm_gc_owns_object));
+    majit_gc::set_active_write_barrier(Some(wasm_active_gc_write_barrier));
+    majit_gc::set_active_collect_oldgen(Some(wasm_collect_oldgen_nonmoving));
+    majit_gc::set_active_heap_stats(Some(active_gc_heap_stats));
+}
+
 /// Diagnostic only: `(oldgen_total_bytes, nursery_used_bytes)` of the GC owned
 /// by this thread's wasm backend, or `(0, 0)` if none is installed. Lets a host
 /// runner split GC-retained memory from host-heap growth.
@@ -723,37 +753,8 @@ impl WasmBackend {
     /// `ActiveGcGuardHooks` so the backend-agnostic optimizer /
     /// blackhole executor reach the live allocator without taking a
     /// wasm dependency.
-    pub fn set_gc_allocator(&mut self, mut gc: Box<dyn majit_gc::GcAllocator>) {
-        // gctypelayout.encode_type_shapes_now parity: close the
-        // type-registration phase before any compile embeds the
-        // type_info_group base address. Mirrors
-        // `CraneliftBackend::set_gc_allocator`. The JitFrame type is registered
-        // by eval.rs before this point (it pushes the id via
-        // `set_wasm_jitframe_tid`); the gc arrives already frozen here.
-        gc.freeze_types();
-        let supports_guard_gc_type = gc.supports_guard_gc_type();
-        WASM_ACTIVE_GC.with(|cell| {
-            let mut guard = cell.borrow_mut();
-            *guard = Some(gc);
-            let raw = guard.as_deref_mut().map(|gc| gc as *mut dyn GcAllocator);
-            WASM_ACTIVE_GC_RAW.with(|raw_cell| raw_cell.set(raw));
-        });
-        majit_gc::set_active_gc_guard_hooks(majit_gc::ActiveGcGuardHooks {
-            check_is_object: Some(wasm_check_is_object),
-            get_actual_typeid: Some(wasm_get_actual_typeid),
-            subclass_range: Some(wasm_subclass_range),
-            typeid_subclass_range: Some(wasm_typeid_subclass_range),
-            typeid_is_object: Some(wasm_typeid_is_object),
-            can_move: None,
-            supports_guard_gc_type,
-        });
-        majit_gc::set_active_alloc_nursery_typed(Some(wasm_alloc_nursery_typed));
-        majit_gc::set_active_alloc_oldgen_typed(Some(wasm_alloc_oldgen_typed));
-        majit_gc::set_active_root_hooks(Some(wasm_gc_add_root), Some(wasm_gc_remove_root));
-        majit_gc::set_active_gc_owns_object(Some(wasm_gc_owns_object));
-        majit_gc::set_active_write_barrier(Some(wasm_active_gc_write_barrier));
-        majit_gc::set_active_collect_oldgen(Some(wasm_collect_oldgen_nonmoving));
-        majit_gc::set_active_heap_stats(Some(active_gc_heap_stats));
+    pub fn set_gc_allocator(&mut self, gc: Box<dyn majit_gc::GcAllocator>) {
+        install_gc_standalone(gc);
     }
 
     /// llmodel.py:64-69 self.vtable_offset configuration.
