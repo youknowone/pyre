@@ -669,6 +669,31 @@ fn colored_operand_vars(graph: &LegacyGraph) -> std::collections::HashSet<Variab
     operands
 }
 
+/// Variables that appear more than once within a single block's
+/// `inputargs` — duplicate phi columns.  The real path runs
+/// `remove_duplicate_inputargs` (`model::remove_duplicate_inputargs`, the
+/// `simplify.py:565-568 remove_identical_vars_SSA` port) before rtyping:
+/// when two inputarg columns of one block carry identical phi-args, they
+/// collapse to one representative and the removed column's Variable is
+/// unioned away, so `setup_block_entry` never types that identity.  The
+/// legacy walker keeps both columns as the one Variable and types it, so
+/// the dual-gate reads the merged-away column as `real=Unknown` — a false
+/// divergence, since the value IS emitted through the surviving
+/// representative (same kind).  This mirrors the dead-phi exemption
+/// [`reachable_defined_vars`] already documents, for the dedup case.
+fn duplicate_inputarg_vars(graph: &LegacyGraph) -> std::collections::HashSet<Variable> {
+    let mut dups = std::collections::HashSet::new();
+    for block in &graph.blocks {
+        let mut seen = std::collections::HashSet::new();
+        for ia in &block.inputargs {
+            if !seen.insert(ia.clone()) {
+                dups.insert(ia.clone());
+            }
+        }
+    }
+    dups
+}
+
 /// Diff the real path's per-Variable kinds against the legacy walker's
 /// kinds committed onto the same legacy Variables.  Walks
 /// [`FunctionGraph::iter_variables`] for a deterministic, slot-free
@@ -682,6 +707,7 @@ fn collect_divergences(
 ) -> Vec<String> {
     let reachable_vars = reachable_defined_vars(legacy_graph);
     let colored_operands = colored_operand_vars(legacy_graph);
+    let duplicate_inputargs = duplicate_inputarg_vars(legacy_graph);
     let mut divergences = Vec::new();
     for (pos, var) in legacy_graph.iter_variables().iter().enumerate() {
         // `iterblocks()` parity: the real path annotates only the
@@ -732,7 +758,17 @@ fn collect_divergences(
         let real_refines_gcref_to_void = legacy_kind == ConcreteType::GcRef
             && real_kind == ConcreteType::Void
             && !colored_operands.contains(var);
-        let diverges = if real_refines_gcref_to_void {
+        // A duplicate phi inputarg the real path's `remove_duplicate_inputargs`
+        // merged away is untyped in the real graph (its column no longer
+        // exists) while the legacy walker types the retained identity.  The
+        // value is emitted through the surviving representative, so
+        // `real=Unknown` here is a dedup artifact, not a kind divergence —
+        // scoped to `legacy=GcRef` (the erased `<E>::Value` phi family) so a
+        // genuine `Signed`/`Float` merged column is never silently accepted.
+        let real_dropped_duplicate_inputarg = legacy_kind == ConcreteType::GcRef
+            && real_present.is_none()
+            && duplicate_inputargs.contains(var);
+        let diverges = if real_refines_gcref_to_void || real_dropped_duplicate_inputarg {
             false
         } else if legacy_kind != ConcreteType::Unknown {
             real_kind != legacy_kind
@@ -3110,6 +3146,94 @@ mod tests {
             1,
             "legacy=GcRef, real=Void on a colored raise operand is a divergence, \
              not the accepted returnblock unit drop"
+        );
+    }
+
+    /// Build `start(v1) -> mid(v1, v1) -> return()` where `v1` is a
+    /// within-block DUPLICATE inputarg of `mid` (read by a `same_as` op so
+    /// it stays reachable), publish `legacy_kind` onto `v1`, and diff
+    /// against a `real_state` that leaves it untyped — the shape
+    /// `remove_duplicate_inputargs` collapses in the real path.
+    fn diff_duplicate_inputarg(legacy_kind: ConcreteType) -> Vec<String> {
+        let mut graph = LegacyGraph::new("diff_duplicate_inputarg");
+        let vars = mint_vars(&mut graph, 3);
+        let v1 = vars[1].clone();
+        let mid_id = crate::model::BlockId(7);
+        let startblock = Block {
+            id: graph.startblock,
+            inputargs: block_inputargs(&vars, &[1]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![crate::model::Link::new_mixed(
+                vec![LinkArg::Value(v1.clone()), LinkArg::Value(v1.clone())],
+                mid_id,
+                None,
+            )],
+            framestate: None,
+            dead: false,
+        };
+        // `mid` carries `v1` twice as inputargs (the duplicate column) and
+        // reads it via a `FieldRead` base so `reachable_defined_vars` keeps
+        // it (an unread inputarg would be dropped as a dead phi).
+        let midblock = Block {
+            id: mid_id,
+            inputargs: block_inputargs(&vars, &[1, 1]),
+            operations: vec![crate::model::SpaceOperation {
+                result: Some(vars[2].clone()),
+                kind: crate::model::OpKind::FieldRead {
+                    base: v1.clone(),
+                    field: crate::model::FieldDescriptor {
+                        name: "f".to_string(),
+                        owner_root: None,
+                        owner_id: None,
+                    },
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+            }],
+            exitswitch: None,
+            exits: vec![link_to_returnblock(vec![], graph.returnblock)],
+            framestate: None,
+            dead: false,
+        };
+        let returnblock = Block {
+            id: graph.returnblock,
+            inputargs: vec![],
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        };
+        graph.blocks = vec![startblock, midblock, returnblock];
+        crate::model::FunctionGraph::set_concretetype_of_inline(&v1, legacy_kind);
+        // Real path merged the duplicate column away → `v1` untyped.
+        let real_state = HashMap::new();
+        collect_divergences(&real_state, &graph)
+    }
+
+    #[test]
+    fn collect_divergences_accepts_gcref_duplicate_inputarg_dropped() {
+        // A `legacy=GcRef` duplicate phi inputarg the real path's
+        // `remove_duplicate_inputargs` merged away reads `real=Unknown`, but
+        // the value is emitted through the surviving representative — a dedup
+        // artifact, not a divergence.
+        assert!(
+            diff_duplicate_inputarg(ConcreteType::GcRef).is_empty(),
+            "a GcRef duplicate inputarg dropped by remove_duplicate_inputargs \
+             is not a divergence"
+        );
+    }
+
+    #[test]
+    fn collect_divergences_rejects_signed_duplicate_inputarg_dropped() {
+        // Scoped to `GcRef`: a `legacy=Signed` untyped duplicate is still a
+        // divergence (the erased-`<E>::Value` phi family is GcRef-only; a
+        // scalar merged column must not be silently accepted).
+        assert_eq!(
+            diff_duplicate_inputarg(ConcreteType::Signed).len(),
+            1,
+            "a Signed duplicate inputarg left untyped is still a divergence"
         );
     }
 
