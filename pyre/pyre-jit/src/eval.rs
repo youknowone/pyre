@@ -3638,17 +3638,11 @@ fn unsupported_jit_shape(code: &pyre_interpreter::CodeObject) -> UnsupportedJitS
         }
     }
     if has_for_iter {
-        // Kill-switch: `PYRE_57_INLINE_NEXT=0` restores the pre-flip behaviour
-        // (all FOR_ITER frames interpreted).
-        static FOR_ITER_JIT_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let disabled = *FOR_ITER_JIT_DISABLED
-            .get_or_init(|| std::env::var("PYRE_57_INLINE_NEXT").as_deref() == Ok("0"));
-        // A `finally`-duplicated loop also stays interpreted: its exhaustion
+        // A `finally`-duplicated loop stays interpreted: its exhaustion
         // side-exit resumes through the lossy carry-forward `pc_map` and lands
         // at the exceptional copy with an empty stack (see
         // `for_iter_frame_is_finally_duplicated`).
-        if disabled
-            || !for_iter_bodies_all_jit_safe(code)
+        if !for_iter_bodies_all_jit_safe(code)
             || for_iter_frame_is_finally_duplicated(code)
         {
             return UnsupportedJitShape::CurrentFrameOnly;
