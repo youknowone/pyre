@@ -515,17 +515,38 @@ impl JitCodeBuilder {
         is_gc_managed: bool,
         fields: &[(usize, bool, &str)],
     ) {
-        let all_fielddescrs = Self::field_specs_from_layout(fields);
-        self.struct_size_specs.insert(
-            type_id,
-            BhSizeSpec {
-                size,
+        let new_fields = Self::field_specs_from_layout(fields);
+        // Merge into existing spec if present — each getfield/setfield
+        // site registers only the field it accesses, so the complete
+        // layout accumulates across multiple register_struct_layout
+        // calls for the same type_id.  Without merging, a later call
+        // would overwrite the spec and lose earlier fields, causing
+        // `field_descr_ref_from_bh` to produce incomplete layouts whose
+        // FieldDescr.get_parent_descr() Weak reference dangles.
+        if let Some(existing) = self.struct_size_specs.get_mut(&type_id) {
+            for nf in new_fields {
+                if !existing.all_fielddescrs.iter().any(|ef| ef.offset == nf.offset) {
+                    existing.all_fielddescrs.push(nf);
+                }
+            }
+            // Re-sort by offset and re-index so index_in_parent stays
+            // deterministic (same as field_specs_from_layout).
+            existing.all_fielddescrs.sort_by_key(|f| f.offset);
+            for (idx, f) in existing.all_fielddescrs.iter_mut().enumerate() {
+                f.index_in_parent = idx;
+            }
+        } else {
+            self.struct_size_specs.insert(
                 type_id,
-                vtable: 0,
-                is_gc_managed,
-                all_fielddescrs,
-            },
-        );
+                BhSizeSpec {
+                    size,
+                    type_id,
+                    vtable: 0,
+                    is_gc_managed,
+                    all_fielddescrs: new_fields,
+                },
+            );
+        }
     }
 
     /// Build `Vec<BhFieldSpec>` from a `(offset, is_ref, name)` layout,
