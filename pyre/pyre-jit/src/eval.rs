@@ -2248,8 +2248,11 @@ fn install_gc_root_walkers() {
     // normally traced by the translated GC. Walk its value slots
     // explicitly until the table is folded into the object layout.
     majit_gc::shadow_stack::register_extra_root_walker(pyre_interpreter_side_table_root_walker);
-    // signal_handler_root_walker is registered inside the JIT_DRIVER init
-    // (not here) because the HANDLERS dict may not exist yet at boot.
+    // Signal handler dict walker — the dict may not exist yet (null-check
+    // in walk_signal_handler_roots guards this), but the walker must be
+    // registered here so PYRE_JIT=0 paths also get it.
+    #[cfg(not(target_arch = "wasm32"))]
+    majit_gc::shadow_stack::register_extra_root_walker(signal_handler_root_walker);
     // `GcWeakrefBox` instances are immortal, so the collector never
     // relocates / retains their inline `inner` Weakref pointer. Walk
     // those slots as roots so a cached weakref's boxed Weakref stays
@@ -2423,12 +2426,6 @@ thread_local! {
         // `majit_metainterp::MetaInterp::walk_active_trace_refs`.
         majit_gc::shadow_stack::register_extra_root_walker(active_trace_root_walker);
         majit_gc::shadow_stack::register_extra_root_walker(compile_snapshot_root_walker);
-        // The signal-handler HANDLERS dict may not exist at boot (before
-        // the signal module imports), so register this walker here
-        // (after the interpreter has started) rather than in
-        // init_gc_subsystem().
-        #[cfg(not(target_arch = "wasm32"))]
-        majit_gc::shadow_stack::register_extra_root_walker(signal_handler_root_walker);
         d.set_vtable_offset(Some(pyre_object::pyobject::OB_TYPE_OFFSET));
         // resume.py:1367 — BlackholeAllocator for virtual materialization.
         d.register_blackhole_allocator(PyreBlackholeAllocator);
