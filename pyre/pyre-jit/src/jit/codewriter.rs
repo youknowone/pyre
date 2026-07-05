@@ -12111,24 +12111,48 @@ impl CodeWriter {
             }
             spliced.insns = new_insns;
         }
-        // Per-PC leading `-live-` (marker PRESENCE).  `jtransform.py` puts a
-        // `-live-` before every deopt-capable op (int_add_ovf :386,
-        // guard_value/promote :611/:632/:649, two before jit_merge_point
-        // :1708/:1710).  pyre emits `-live-` only trailing-after-calls, so a
-        // FOR_ITER body guard (GuardClass / GuardNoOverflow lowered from a
-        // residual BinaryOp helper) has no marker of its own:
-        // `derive_pc_live_indices_from_sparse` rounds its PC back to the
-        // FOR_ITER header marker, whose resume coordinate is not the body's.
-        // Give each pc-carrying op its own leading marker so its PC resolves to
-        // itself.  The marker's live args stay empty here; `compute_liveness`
-        // (inside `filter_liveness_in_place`) fills each from the stream's
-        // backward analysis.  Skip a PC already immediately preceded by a
-        // `-live-` (the entry / block-entry / branch / canraise markers above)
-        // so this is additive only where a marker was lacking.
+        // Per-PC leading `-live-` (marker PRESENCE), scoped to FOR_ITER body
+        // PCs.  `jtransform.py` puts a `-live-` before every deopt-capable op;
+        // pyre emits `-live-` only trailing-after-calls, so a FOR_ITER body
+        // guard has no marker of its own: `derive_pc_live_indices_from_sparse`
+        // rounds its PC back to the header marker, whose resume coordinate is
+        // not the body's.  Give each FOR_ITER-body pc-carrying op its own
+        // leading marker so its PC resolves to itself.  While-loop body PCs
+        // are excluded — their existing header-folded marker is correct and
+        // giving them individual markers changes their resume layout, breaking
+        // nbody/nested_loop/spectral_norm.
         {
+            // Build the set of FOR_ITER body PCs: py_pc in
+            // [for_iter_pc + 1, exhaust_target) for each ForIter instruction.
+            let mut foriter_body_pcs: std::collections::HashSet<usize> =
+                std::collections::HashSet::new();
+            {
+                let mut scan_state = pyre_interpreter::OpArgState::default();
+                for scan_pc in 0..num_instrs {
+                    let (scan_instr, scan_arg) =
+                        scan_state.get(code.instructions[scan_pc]);
+                    if let Instruction::ForIter { delta } = scan_instr {
+                        let exhaust_target = pyre_interpreter::jump_target_forward(
+                            &code.instructions,
+                            scan_pc + 1,
+                            delta.get(scan_arg).as_usize(),
+                        );
+                        // Include the FOR_ITER pc itself (for the
+                        // continues guard) and all body PCs up to
+                        // the exhaustion target.
+                        foriter_body_pcs.insert(scan_pc);
+                        for body_pc in (scan_pc + 1)..exhaust_target {
+                            foriter_body_pcs.insert(body_pc);
+                        }
+                    }
+                }
+            }
             let mut marker_before: Vec<bool> = vec![false; spliced.insns.len()];
             for &(py_pc, pos) in &spliced.pc_first_insn_pos {
                 if py_pc < 0 {
+                    continue;
+                }
+                if !foriter_body_pcs.contains(&(py_pc as usize)) {
                     continue;
                 }
                 let already = pos
