@@ -116,24 +116,28 @@ pub fn set_handler(signum: i32, handler: PyObjectRef) {
     unsafe { pyre_object::w_dict_setitem(d, signum as i64, handler) };
 }
 
-/// GC root walker over the signal-handler table's value slots.
+/// GC root walker over the signal-handler table and its value slots.
 ///
-/// `handlers_dict()` is first reached during interpreter bootstrap,
-/// before the GC heap is wired, so `w_dict_new` takes its immortal
-/// (`malloc_typed`) fallback.  The collector never traces into off-GC
-/// objects, so a handler callable reachable only through this dict — a
-/// `unittest._InterruptHandler` instance, say — is reclaimed by
-/// `gc.collect`, after which `getsignal` / `signal` hand back a dangling
-/// pointer.  Expose the dict's value slots as roots so the handlers
-/// survive (and are relocated when they move), mirroring
-/// `walk_mapdict_roots` for the immortal mapdict side tables.  The table
-/// is int-keyed (`signum`), so the strategy's `walk_gc_refs` visits only
-/// the value slots — dispatched exactly as `dict_object_custom_trace`.
+/// The HANDLERS dict pointer itself is visited as a root so the GC can
+/// relocate it (nursery → oldgen) and update the Cell in place.
+/// Without this, a minor collection would move the dict while the Cell
+/// retains the stale nursery address, and the next `handlers_dict()`
+/// read would dereference freed memory.  The value slots are then
+/// walked so handler callables reachable only through this dict survive
+/// collection.
 pub fn walk_signal_handler_roots(mut visitor: impl FnMut(&mut PyObjectRef)) {
     HANDLERS.with(|cell| {
-        let d = cell.get();
+        let mut d = cell.get();
         if d.is_null() {
             return;
+        }
+        // Visit the dict pointer itself as a root.  If the GC
+        // relocates the dict, `visitor` updates `d` in place;
+        // write the (possibly new) address back to the Cell.
+        let old = d;
+        visitor(&mut d);
+        if !std::ptr::eq(d, old) {
+            cell.set(d);
         }
         unsafe {
             let strategy = pyre_object::dictmultiobject::w_dict_get_strategy(d);
