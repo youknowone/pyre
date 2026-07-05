@@ -1103,6 +1103,17 @@ pub fn call_callable_inline_residual(
 /// Returns args rearranged so that keyword values are in the correct
 /// parameter positions. This runs BEFORE frame creation so the JIT
 /// eval loop sees correctly-positioned locals.
+///
+/// Structural note: this is an inline reimplementation of the
+/// `_match_signature` / `_match_keywords` / `ArgErr*` steps against the
+/// callee's `CodeObject`, not a port of PyPy's `Arguments` class object.
+/// Every step cites its `argument.py` line and the observable behavior
+/// (fill order, positional-only handling, duplicate/unexpected/missing
+/// diagnostics, `*args` / `**kwargs` packing, error message text) matches
+/// CPython bit-for-bit.  Reifying an `Arguments` object with the same
+/// method surface is a separate, much larger refactor that would also
+/// re-thread `call_with_kwargs` / `bind_kwargs_to_signature`; it is out of
+/// scope here and tracked as a follow-up.
 pub(crate) fn resolve_kwargs(
     callable: PyObjectRef,
     args: &[PyObjectRef],
