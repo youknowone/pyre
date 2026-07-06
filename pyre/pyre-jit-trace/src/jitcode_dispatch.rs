@@ -9023,6 +9023,18 @@ pub(crate) fn m73_encode_audit_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_M73_ENCODE_AUDIT").is_some())
 }
 
+/// `PYRE_M73_ENCODE` (default OFF) flips the three ENCODE branch-resume depth
+/// readers from the `python_pc_for_jitcode_pc` inversion + runtime trivia walk
+/// to the jitcode-pc-keyed `depth_trivia_for_jitcode_pc` twin. Behavioral flip
+/// (no byte-identity guarantee), certified by the always-computed
+/// `PYRE_M73_ENCODE_AUDIT` full-`Option` equality + `check.py`. When the twin is
+/// empty (skeleton / portal-bridge / fixture) the reader keeps the raw value so
+/// the pre-populated-twin installs are unaffected.
+pub(crate) fn m73_encode_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_M73_ENCODE").is_some())
+}
+
 pub(crate) fn python_pc_for_jitcode_pc(metadata: &crate::PyJitCodeMetadata, jit_pc: usize) -> u32 {
     // Exact inverse: `first_jit_pc_by_py_pc[py]` is the byte offset of the
     // FIRST instruction opcode `py` emitted (`usize::MAX` = the PC emitted
@@ -9350,16 +9362,18 @@ fn branch_resume_target_stack_depth(frame: &ActiveResumeFrame, target: usize) ->
         // read here (both derive from the same static `liveness_for` depth +
         // trivia-skip, baked at compile time). Precondition certificate for
         // retiring the inversion at this ENCODE site. Off in production.
-        if m73_encode_audit_enabled() {
-            if let Some(twin) = pjc.depth_trivia_for_jitcode_pc(target) {
-                assert_eq!(
-                    Some(twin),
-                    depth,
-                    "depth_trivia_by_jit_pc diverges from branch_resume_target_stack_depth at target={target} py={py}"
-                );
-            }
+        if m73_encode_audit_enabled() && pjc.depth_trivia_populated() {
+            assert_eq!(
+                pjc.depth_trivia_for_jitcode_pc(target),
+                depth,
+                "depth_trivia twin diverges from branch_resume_target_stack_depth at target={target} py={py}"
+            );
         }
-        depth
+        if m73_encode_enabled() && pjc.depth_trivia_populated() {
+            pjc.depth_trivia_for_jitcode_pc(target)
+        } else {
+            depth
+        }
     }
 }
 
@@ -9404,15 +9418,18 @@ fn kept_stack_has_boxed_int_hazard(
         // is `None` (past-last-opcode overshoot) — would make the FLIP non
         // byte-identical, so the audit compares the full `Option`. Off in
         // production.
-        if m73_encode_audit_enabled() {
-            if let Some(twin) = pjc.depth_trivia_for_jitcode_pc(target) {
-                assert_eq!(
-                    Some(twin),
-                    depth_opt,
-                    "depth_trivia_by_jit_pc diverges from kept_stack_has_boxed_int_hazard at target={target} py={py}"
-                );
-            }
+        if m73_encode_audit_enabled() && pjc.depth_trivia_populated() {
+            assert_eq!(
+                pjc.depth_trivia_for_jitcode_pc(target),
+                depth_opt,
+                "depth_trivia twin diverges from kept_stack_has_boxed_int_hazard at target={target} py={py}"
+            );
         }
+        let depth_opt = if m73_encode_enabled() && pjc.depth_trivia_populated() {
+            pjc.depth_trivia_for_jitcode_pc(target)
+        } else {
+            depth_opt
+        };
         let Some(depth) = depth_opt.map(|d| d as usize) else {
             // Unknown resume depth — cannot prove safe.
             return true;
@@ -9679,16 +9696,18 @@ fn branch_resume_target_stack_depth_any_leg(target: usize, jitcode_index: u32) -
     // leg-independent depth probe. Same static-liveness + trivia-skip source as
     // the two full-body-walk readers, so the same twin must reproduce it off the
     // genuine jitcode `target`. Off in production.
-    if m73_encode_audit_enabled() {
-        if let Some(twin) = pjc.depth_trivia_for_jitcode_pc(target) {
-            assert_eq!(
-                Some(twin),
-                depth_opt,
-                "depth_trivia_by_jit_pc diverges from branch_resume_target_stack_depth_any_leg at target={target} py={py}"
-            );
-        }
+    if m73_encode_audit_enabled() && pjc.depth_trivia_populated() {
+        assert_eq!(
+            pjc.depth_trivia_for_jitcode_pc(target),
+            depth_opt,
+            "depth_trivia twin diverges from branch_resume_target_stack_depth_any_leg at target={target} py={py}"
+        );
     }
-    depth_opt
+    if m73_encode_enabled() && pjc.depth_trivia_populated() {
+        pjc.depth_trivia_for_jitcode_pc(target)
+    } else {
+        depth_opt
+    }
 }
 
 /// `generate_guard` (`pyjitpl.py:2599-2603`) keys `after_residual_call`

@@ -154,8 +154,8 @@ pub struct PyJitCodeMetadata {
     /// would mis-resolve an interior not-taken coordinate onto a marker byte that
     /// sits inside a preceding op's region, so the tiers stay separate. Empty for
     /// skeleton / portal-bridge / fixture.
-    pub depth_trivia_marker_by_jit_pc: Vec<(usize, u16)>,
-    pub depth_trivia_pred_by_jit_pc: Vec<(usize, u16)>,
+    pub depth_trivia_marker_by_jit_pc: Vec<(usize, Option<u16>)>,
+    pub depth_trivia_pred_by_jit_pc: Vec<(usize, Option<u16>)>,
     /// Post-regalloc Ref-bank color of the call-result operand-stack slot
     /// (top of stack = `depth_at_py_pc[pc] - 1`) at each Python PC, or
     /// `u16::MAX` where the stack is empty. The inline multiframe capture
@@ -528,9 +528,13 @@ impl PyJitCode {
     /// excluded). Equals
     /// `liveness_for(code).depth_at_py_pc()[skip_python_trivia_forward(python_pc_for_jitcode_pc(jit_pc))]`
     /// by construction for ANY jitcode coordinate — including an interior
-    /// not-taken offset the branch-resume readers query, which a single merged
-    /// predecessor table mis-resolves onto an interior marker. `None` when the
-    /// twin is empty (skeleton / portal-bridge / fixture).
+    /// not-taken offset the branch-resume readers query (which a single merged
+    /// predecessor table mis-resolves onto an interior marker) and a
+    /// trailing-trivia overshoot past the last opcode (where the raw
+    /// `depth_at_py_pc().get(py)` is `None`; the twin bakes the same `None`, not a
+    /// spurious `0`). `None` when the twin is empty (skeleton / portal-bridge /
+    /// fixture) — distinguish that from an in-table `None` via
+    /// [`Self::depth_trivia_populated`].
     pub fn depth_trivia_for_jitcode_pc(&self, jit_pc: usize) -> Option<u16> {
         let marker = &self.metadata.depth_trivia_marker_by_jit_pc;
         let pred = &self.metadata.depth_trivia_pred_by_jit_pc;
@@ -538,10 +542,20 @@ impl PyJitCode {
             return None;
         }
         if let Ok(i) = marker.binary_search_by_key(&jit_pc, |&(off, _)| off) {
-            return Some(marker[i].1);
+            return marker[i].1;
         }
         let search = pred.binary_search_by_key(&jit_pc, |&(off, _)| off);
-        Self::predecessor_index(search).map(|i| pred[i].1)
+        Self::predecessor_index(search).and_then(|i| pred[i].1)
+    }
+
+    /// task#50 #73-core: whether the trivia depth twin carries entries. `false`
+    /// for skeleton / portal-bridge / fixture installs where both tiers are
+    /// empty. The audit uses this to distinguish an in-table `None` (overshoot,
+    /// which must equal the raw reader's `None`) from an empty-twin `None` (where
+    /// the raw inversion still resolves a value and the twin does not apply).
+    pub fn depth_trivia_populated(&self) -> bool {
+        !self.metadata.depth_trivia_marker_by_jit_pc.is_empty()
+            || !self.metadata.depth_trivia_pred_by_jit_pc.is_empty()
     }
 
     /// JitCode byte offset of `py_pc`'s post-`residual_call` `-live-`

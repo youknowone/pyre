@@ -12689,8 +12689,14 @@ impl CodeWriter {
         // offset or exact marker), which is why the phase-1 merged twins pass;
         // the any-leg branch-resume reader queries interior not-taken offsets and
         // exposes the merge.
-        let mut depth_trivia_marker_by_jit_pc: Vec<(usize, u16)> = Vec::new();
-        let mut depth_trivia_pred_by_jit_pc: Vec<(usize, u16)> = Vec::new();
+        // Option-valued: the raw reader indexes `depth_at_py_pc().get(py)`, which
+        // is `None` for a coordinate past the last opcode (trailing-trivia
+        // overshoot: `skip_trivia(py)` can reach `n`, the truncated liveness
+        // length).  Bake the exact `Option` so the twin returns `None` there too
+        // rather than a spurious `0` — a `Some(0)` at the overshoot would flip the
+        // `None`-means-decline hazard reader (S9394) into a compile.
+        let mut depth_trivia_marker_by_jit_pc: Vec<(usize, Option<u16>)> = Vec::new();
+        let mut depth_trivia_pred_by_jit_pc: Vec<(usize, Option<u16>)> = Vec::new();
         if !first_jit_pc_by_py_pc.is_empty() {
             use std::collections::BTreeMap;
             let mut by_off: BTreeMap<usize, usize> = BTreeMap::new();
@@ -12743,8 +12749,7 @@ impl CodeWriter {
             // gives the smallest py resolving at the marker offset).
             for (py, &off) in pc_map_bytes.iter().enumerate() {
                 if marker_seen.remove(&off) {
-                    let depth_trivia =
-                        static_depth.get(skip_trivia(py)).copied().unwrap_or(0);
+                    let depth_trivia = static_depth.get(skip_trivia(py)).copied();
                     depth_trivia_marker_by_jit_pc.push((off, depth_trivia));
                 }
             }
@@ -12752,8 +12757,7 @@ impl CodeWriter {
             // Op-start tier: predecessor scan, markers EXCLUDED.
             for (py, &pos) in first_jit_pc_by_py_pc.iter().enumerate() {
                 if pos != usize::MAX {
-                    let depth_trivia =
-                        static_depth.get(skip_trivia(py)).copied().unwrap_or(0);
+                    let depth_trivia = static_depth.get(skip_trivia(py)).copied();
                     depth_trivia_pred_by_jit_pc.push((pos, depth_trivia));
                 }
             }
