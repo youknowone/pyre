@@ -2088,7 +2088,10 @@ pub(crate) fn register_unsafe_fn_stubs(
 ///   `Void` result.
 /// - `core::f64::<Impl>::is_infinite` / `core::slice::<Impl>::is_empty`
 ///   return `bool` — `Bool` result.
-/// - `std::f64::<Impl>::floor` returns `f64` — `Float` result.
+/// - `std::f64::<Impl>::floor` / `std::f64::<Impl>::powf` return `f64` —
+///   `Float` result.
+/// - `core::f64::<Impl>::to_bits` returns `u64` reinterpreted as `i64` —
+///   `Signed` result.
 ///
 /// Paths whose faithful result is a non-scalar value the stub carrier
 /// cannot express (`alloc::fmt::format` → `String`,
@@ -2115,6 +2118,16 @@ const FOREIGN_STDLIB_EXTERNALS: &[(&[&str], &[&str], LowLevelType)] = &[
         &["std", "f64", "<Impl>", "floor"],
         &["self"],
         LowLevelType::Float,
+    ),
+    (
+        &["std", "f64", "<Impl>", "powf"],
+        &["self", "n"],
+        LowLevelType::Float,
+    ),
+    (
+        &["core", "f64", "<Impl>", "to_bits"],
+        &["self"],
+        LowLevelType::Signed,
     ),
 ];
 
