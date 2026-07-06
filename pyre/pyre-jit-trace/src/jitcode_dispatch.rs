@@ -9029,16 +9029,24 @@ pub(crate) fn m73_encode_audit_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_M73_ENCODE_AUDIT").is_some())
 }
 
-/// `PYRE_M73_ENCODE` (default OFF) flips the three ENCODE branch-resume depth
+/// `PYRE_M73_ENCODE` (default ON) flips the three ENCODE branch-resume depth
 /// readers from the `python_pc_for_jitcode_pc` inversion + runtime trivia walk
 /// to the jitcode-pc-keyed `depth_trivia_for_jitcode_pc` twin. Behavioral flip
 /// (no byte-identity guarantee), certified by the always-computed
-/// `PYRE_M73_ENCODE_AUDIT` full-`Option` equality + `check.py`. When the twin is
-/// empty (skeleton / portal-bridge / fixture) the reader keeps the raw value so
-/// the pre-populated-twin installs are unaffected.
+/// `PYRE_M73_ENCODE_AUDIT` full-`Option` equality + `check.py` — corpus-wide
+/// OFF/ON equality validated on both backends (183/183 dynasm + cranelift);
+/// opt out with `PYRE_M73_ENCODE=0`. When the twin is empty (skeleton /
+/// portal-bridge / fixture) the reader keeps the raw value so the
+/// pre-populated-twin installs are unaffected.
 pub(crate) fn m73_encode_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("PYRE_M73_ENCODE").is_some())
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M73_ENCODE") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => true,
+    })
 }
 
 /// `PYRE_M73_LIVENESS_AUDIT` enables the assertion that querying the register
