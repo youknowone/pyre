@@ -12675,16 +12675,24 @@ impl CodeWriter {
         // `ExtendedArg`/`Resume`/`Nop`/`Cache`/`NotTaken` then record that opcode's
         // static depth.  A predecessor lookup then equals
         // `liveness_for(code).depth_at_py_pc()[skip_python_trivia_forward(inv(jit_pc))]`.
-        let mut depth_trivia_by_jit_pc: Vec<(usize, u16)> = Vec::new();
+        // task#50 #73-core: the trivia twin is split into the SAME two tiers as
+        // `python_pc_for_jitcode_pc` — a marker table matched EXACTLY (the block
+        // -head precedence tier, `block_head_py_by_jit_pc`'s depth analog) and an
+        // op-start table matched by PREDECESSOR (`first_jit_pc_by_py_pc`'s depth
+        // analog).  A single merged predecessor table is WRONG for an interior
+        // query: a marker byte sits inside a preceding op's emitted region, so a
+        // predecessor search for a coordinate past the op-start but before the
+        // next op would land on that interior marker instead of the op-start.
+        // `python_pc_for_jitcode_pc` never returns a marker py for a non-exact
+        // coordinate, so the marker tier must stay OUT of the predecessor scan.
+        // The decode/bridge readers only ever query exact coordinates (guard op
+        // offset or exact marker), which is why the phase-1 merged twins pass;
+        // the any-leg branch-resume reader queries interior not-taken offsets and
+        // exposes the merge.
+        let mut depth_trivia_marker_by_jit_pc: Vec<(usize, u16)> = Vec::new();
+        let mut depth_trivia_pred_by_jit_pc: Vec<(usize, u16)> = Vec::new();
         if !first_jit_pc_by_py_pc.is_empty() {
             use std::collections::BTreeMap;
-            // offset -> resolving py. Seed every op-start offset with its own py
-            // (`first_jit_pc_by_py_pc`, the predecessor-scan tier), then set each
-            // block-head marker offset to the SMALLEST py resolving there (the
-            // marker tier that takes precedence in `python_pc_for_jitcode_pc`).
-            // Op-start and marker offsets are disjoint (each byte belongs to one
-            // instruction, :8998-9001), so the marker writes never clobber a real
-            // op-start; the explicit second pass just makes the precedence exact.
             let mut by_off: BTreeMap<usize, usize> = BTreeMap::new();
             for (py, &pos) in first_jit_pc_by_py_pc.iter().enumerate() {
                 if pos != usize::MAX {
@@ -12728,12 +12736,28 @@ impl CodeWriter {
             for (&off, &py) in by_off.iter() {
                 let pcdep = pcdep_color_slots.get(py).cloned().unwrap_or_default();
                 let depth = depth_at_pc.get(py).copied().unwrap_or(0);
-                let py_trivia = skip_trivia(py);
-                let depth_trivia = static_depth.get(py_trivia).copied().unwrap_or(0);
                 pcdep_by_jit_pc.push((off, pcdep));
                 depth_pred_by_jit_pc.push((off, depth));
-                depth_trivia_by_jit_pc.push((off, depth_trivia));
             }
+            // Marker tier: exact-match, block-head precedence (first-seen dedup
+            // gives the smallest py resolving at the marker offset).
+            for (py, &off) in pc_map_bytes.iter().enumerate() {
+                if marker_seen.remove(&off) {
+                    let depth_trivia =
+                        static_depth.get(skip_trivia(py)).copied().unwrap_or(0);
+                    depth_trivia_marker_by_jit_pc.push((off, depth_trivia));
+                }
+            }
+            depth_trivia_marker_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
+            // Op-start tier: predecessor scan, markers EXCLUDED.
+            for (py, &pos) in first_jit_pc_by_py_pc.iter().enumerate() {
+                if pos != usize::MAX {
+                    let depth_trivia =
+                        static_depth.get(skip_trivia(py)).copied().unwrap_or(0);
+                    depth_trivia_pred_by_jit_pc.push((pos, depth_trivia));
+                }
+            }
+            depth_trivia_pred_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
         }
 
         // call.py:148 `jd.mainjitcode.jitdriver_sd = jd`. RPython mutates
@@ -12766,7 +12790,8 @@ impl CodeWriter {
             depth_by_jit_pc,
             pcdep_by_jit_pc,
             depth_pred_by_jit_pc,
-            depth_trivia_by_jit_pc,
+            depth_trivia_marker_by_jit_pc,
+            depth_trivia_pred_by_jit_pc,
             result_color_at_pc,
             portal_frame_reg,
             portal_ec_reg,

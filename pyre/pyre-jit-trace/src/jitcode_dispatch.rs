@@ -9393,12 +9393,27 @@ fn kept_stack_has_boxed_int_hazard(
         let code = &*pjc.code_ptr;
         let py = python_pc_for_jitcode_pc(&pjc.metadata, target) as usize;
         let py = skip_python_trivia_forward(code, py);
-        let Some(depth) = crate::liveness::liveness_for(pjc.code_ptr)
+        let depth_opt = crate::liveness::liveness_for(pjc.code_ptr)
             .depth_at_py_pc()
             .get(py)
-            .copied()
-            .map(|d| d as usize)
-        else {
+            .copied();
+        // task#50 #73-core: certify the shared `depth_trivia_by_jit_pc` twin
+        // reproduces this depth off the genuine jitcode `target`, at the
+        // trait/any-leg sibling of `branch_resume_target_stack_depth`. A
+        // divergence here — including the twin being `Some` where the raw read
+        // is `None` (past-last-opcode overshoot) — would make the FLIP non
+        // byte-identical, so the audit compares the full `Option`. Off in
+        // production.
+        if m73_encode_audit_enabled() {
+            if let Some(twin) = pjc.depth_trivia_for_jitcode_pc(target) {
+                assert_eq!(
+                    Some(twin),
+                    depth_opt,
+                    "depth_trivia_by_jit_pc diverges from kept_stack_has_boxed_int_hazard at target={target} py={py}"
+                );
+            }
+        }
+        let Some(depth) = depth_opt.map(|d| d as usize) else {
             // Unknown resume depth — cannot prove safe.
             return true;
         };
@@ -9656,10 +9671,24 @@ fn branch_resume_target_stack_depth_any_leg(target: usize, jitcode_index: u32) -
     let code_obj = unsafe { &*pjc.code_ptr };
     let py = python_pc_for_jitcode_pc(&pjc.metadata, target) as usize;
     let py = skip_python_trivia_forward(code_obj, py);
-    crate::liveness::liveness_for(pjc.code_ptr)
+    let depth_opt = crate::liveness::liveness_for(pjc.code_ptr)
         .depth_at_py_pc()
         .get(py)
-        .copied()
+        .copied();
+    // task#50 #73-core: certify the shared `depth_trivia_by_jit_pc` twin at the
+    // leg-independent depth probe. Same static-liveness + trivia-skip source as
+    // the two full-body-walk readers, so the same twin must reproduce it off the
+    // genuine jitcode `target`. Off in production.
+    if m73_encode_audit_enabled() {
+        if let Some(twin) = pjc.depth_trivia_for_jitcode_pc(target) {
+            assert_eq!(
+                Some(twin),
+                depth_opt,
+                "depth_trivia_by_jit_pc diverges from branch_resume_target_stack_depth_any_leg at target={target} py={py}"
+            );
+        }
+    }
+    depth_opt
 }
 
 /// `generate_guard` (`pyjitpl.py:2599-2603`) keys `after_residual_call`

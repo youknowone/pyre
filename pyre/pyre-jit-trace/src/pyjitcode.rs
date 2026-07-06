@@ -144,14 +144,18 @@ pub struct PyJitCodeMetadata {
     /// at the decode seam for every carried coordinate. `PYRE_PCMAP_BRIDGE_AUDIT`
     /// certifies it equals `depth_at_py_pc[python_pc_for_jitcode_pc(jit_pc)]`.
     pub depth_pred_by_jit_pc: Vec<(usize, u16)>,
-    /// task#50 #73-core: trivia-aware predecessor twin of `depth_at_py_pc`.
-    /// Like `depth_pred_by_jit_pc` but with `skip_python_trivia_forward` baked
-    /// in at the resolved py before reading depth, so a predecessor lookup
-    /// equals `depth_at_py_pc[skip_python_trivia_forward(python_pc_for_jitcode_pc(jit_pc))]`
-    /// — the value the ENCODE branch-resume depth reader
-    /// (`branch_resume_target_stack_depth`) computes. Empty for skeleton /
-    /// portal-bridge / fixture.
-    pub depth_trivia_by_jit_pc: Vec<(usize, u16)>,
+    /// task#50 #73-core: trivia-aware STATIC-liveness depth twin, split into the
+    /// SAME two tiers as `python_pc_for_jitcode_pc` — an EXACT-match marker table
+    /// (`depth_trivia_marker_by_jit_pc`, block-head precedence) and a PREDECESSOR
+    /// op-start table (`depth_trivia_pred_by_jit_pc`, markers EXCLUDED). Each
+    /// records `liveness_for(code).depth_at_py_pc()[skip_python_trivia_forward(py)]`
+    /// for its resolving py — the value the ENCODE branch-resume depth readers
+    /// compute AFTER their forward trivia-skip. A single merged predecessor table
+    /// would mis-resolve an interior not-taken coordinate onto a marker byte that
+    /// sits inside a preceding op's region, so the tiers stay separate. Empty for
+    /// skeleton / portal-bridge / fixture.
+    pub depth_trivia_marker_by_jit_pc: Vec<(usize, u16)>,
+    pub depth_trivia_pred_by_jit_pc: Vec<(usize, u16)>,
     /// Post-regalloc Ref-bank color of the call-result operand-stack slot
     /// (top of stack = `depth_at_py_pc[pc] - 1`) at each Python PC, or
     /// `u16::MAX` where the stack is empty. The inline multiframe capture
@@ -517,19 +521,27 @@ impl PyJitCode {
         Self::predecessor_index(search).map(|i| table[i].1)
     }
 
-    /// task#50 #73-core: trivia-aware value-stack depth keyed by a JitCode byte
-    /// offset via the `depth_trivia_by_jit_pc` predecessor twin. Equals
-    /// `depth_at_py_pc[skip_python_trivia_forward(python_pc_for_jitcode_pc(jit_pc))]`
-    /// by construction; `None` when the twin is empty. This is the value the
-    /// ENCODE branch-resume depth reader computes AFTER its forward trivia-skip,
-    /// which the raw [`Self::depth_for_jitcode_pc_pred`] does not reproduce.
+    /// task#50 #73-core: trivia-aware STATIC-liveness depth keyed by a JitCode
+    /// byte offset, resolved with the SAME two tiers as
+    /// `python_pc_for_jitcode_pc`: an EXACT marker match first (block-head
+    /// precedence), else a PREDECESSOR scan of the op-start table (markers
+    /// excluded). Equals
+    /// `liveness_for(code).depth_at_py_pc()[skip_python_trivia_forward(python_pc_for_jitcode_pc(jit_pc))]`
+    /// by construction for ANY jitcode coordinate — including an interior
+    /// not-taken offset the branch-resume readers query, which a single merged
+    /// predecessor table mis-resolves onto an interior marker. `None` when the
+    /// twin is empty (skeleton / portal-bridge / fixture).
     pub fn depth_trivia_for_jitcode_pc(&self, jit_pc: usize) -> Option<u16> {
-        let table = &self.metadata.depth_trivia_by_jit_pc;
-        if table.is_empty() {
+        let marker = &self.metadata.depth_trivia_marker_by_jit_pc;
+        let pred = &self.metadata.depth_trivia_pred_by_jit_pc;
+        if marker.is_empty() && pred.is_empty() {
             return None;
         }
-        let search = table.binary_search_by_key(&jit_pc, |&(off, _)| off);
-        Self::predecessor_index(search).map(|i| table[i].1)
+        if let Ok(i) = marker.binary_search_by_key(&jit_pc, |&(off, _)| off) {
+            return Some(marker[i].1);
+        }
+        let search = pred.binary_search_by_key(&jit_pc, |&(off, _)| off);
+        Self::predecessor_index(search).map(|i| pred[i].1)
     }
 
     /// JitCode byte offset of `py_pc`'s post-`residual_call` `-live-`
@@ -664,7 +676,8 @@ impl PyJitCode {
                 depth_by_jit_pc: Vec::new(),
                 pcdep_by_jit_pc: Vec::new(),
                 depth_pred_by_jit_pc: Vec::new(),
-                depth_trivia_by_jit_pc: Vec::new(),
+                depth_trivia_marker_by_jit_pc: Vec::new(),
+                depth_trivia_pred_by_jit_pc: Vec::new(),
                 depth_at_py_pc: Vec::new(),
                 result_color_at_pc: Vec::new(),
                 // u16::MAX sentinel mirrors `canonical_bridge::install_portal_for`
