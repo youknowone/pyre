@@ -153,6 +153,12 @@ impl<'c> Lowerer<'c> {
                 if let Some(binding) = self.lower_pool_array_get_call(call) {
                     return Some(binding);
                 }
+                // jtransform.py:2030 _handle_int_special — pure int binop
+                // aliases bypass the call-policy machinery and emit a native
+                // IR op (IntAdd, IntSub, etc.) directly.
+                if let Some(binding) = self.lower_native_int_binop_call(call) {
+                    return Some(binding);
+                }
                 self.lower_call_value(call)
             }
             Expr::MethodCall(call) => self.lower_method_call_value(call),
@@ -1454,6 +1460,51 @@ impl<'c> Lowerer<'c> {
             }
             _ => None,
         }
+    }
+
+    /// Recognize a function call registered as a native int binop alias.
+    /// Emits the corresponding IR op (IntAdd, IntSub, etc.) directly,
+    /// bypassing the call-policy machinery.  The concrete path calls the
+    /// original function normally — no observer replay needed (pure op).
+    ///
+    /// jtransform.py:2030 `_handle_int_special()` parity.
+    fn lower_native_int_binop_call(&mut self, call: &ExprCall) -> Option<Binding> {
+        let config = self.config?;
+        let func_segments = canonical_expr_segments(&call.func)?;
+        let opcode_name = config
+            .native_int_binops
+            .iter()
+            .find(|(path, _)| *path == func_segments)
+            .map(|(_, op)| op.clone())?;
+
+        if call.args.len() != 2 {
+            return None;
+        }
+
+        let lhs = self.lower_value_expr(&call.args[0])?;
+        let rhs = self.lower_value_expr(&call.args[1])?;
+        if !matches!(lhs.kind, BindingKind::Int) || !matches!(rhs.kind, BindingKind::Int) {
+            return None;
+        }
+
+        let reg = self.alloc_reg();
+        let lhs_reg = lhs.reg;
+        let rhs_reg = rhs.reg;
+        let opcode = Ident::new(&opcode_name, proc_macro2::Span::call_site());
+        self.emit_op(
+            OpMeta::linear(
+                OpKind::BinopI,
+                Register::ints(&[lhs_reg, rhs_reg]),
+                vec![Register::int(reg)],
+            ),
+            binop_i_emit_tokens(reg, &opcode, lhs_reg, rhs_reg),
+        );
+        Some(Binding {
+            reg,
+            kind: BindingKind::Int,
+            depends_on_stack: lhs.depends_on_stack || rhs.depends_on_stack,
+            struct_type: None,
+        })
     }
 
     fn lower_binary(&mut self, expr: &ExprBinary) -> Option<Binding> {

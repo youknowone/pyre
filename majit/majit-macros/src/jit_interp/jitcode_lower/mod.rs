@@ -196,6 +196,12 @@ pub struct LowererConfig {
     /// result is bound, the lowerer sets `Binding.struct_type` from this map
     /// so subsequent `result.field` accesses resolve through `ref_fields`.
     pub(super) call_returns: HashMap<Vec<String>, syn::Path>,
+    /// Pure function → native IR integer binop aliases.  Key = canonical func
+    /// path segments, value = IR opcode name (e.g. "IntAdd").  When
+    /// `lower_native_int_binop_call` encounters a call whose path matches a
+    /// key, it emits the named IR opcode directly — bypassing the call-policy
+    /// machinery.  jtransform.py:2030 `_handle_int_special()` parity.
+    pub(super) native_int_binops: Vec<(Vec<String>, String)>,
     /// Source: `JitInterpConfig.split_dispatch`.  When set, the dispatch lowerer
     /// routes pure forward-advancing green-pc arms through the per-arm
     /// sub-JitCode path with a pc-returning `inline_call_<types>_i` instead of
@@ -812,6 +818,7 @@ impl LowererConfig {
         pool_arrays: &[crate::jit_interp::PoolArrayEntry],
         ref_fields: &[crate::jit_interp::RefFieldEntry],
         call_returns: &[(Path, Path)],
+        native_int_binops: &[(Path, Ident)],
         split_dispatch: bool,
         switch_dispatch: bool,
     ) -> Self {
@@ -1005,6 +1012,10 @@ impl LowererConfig {
                         canonical_path_segments(&entry.getter),
                     )
                 })
+                .collect(),
+            native_int_binops: native_int_binops
+                .iter()
+                .map(|(path, op)| (canonical_path_segments(path), op.to_string()))
                 .collect(),
             split_dispatch,
             switch_dispatch,

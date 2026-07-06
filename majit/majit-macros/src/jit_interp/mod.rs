@@ -148,6 +148,14 @@ pub struct JitInterpConfig {
     /// `allocator_func(v0, v1)`.  The JIT path already handles struct
     /// literals natively via `lower_struct_value` (New + SetfieldGc).
     pub struct_allocs: Vec<(Path, Path)>,
+    /// Pure function → native IR integer binop aliases.
+    /// `native_int_binops = { val_add => IntAdd, ... }`.  When the JIT-path
+    /// lowerer encounters a call whose path matches a key, it emits the named
+    /// IR opcode (e.g. `IntAdd`) directly instead of routing through the
+    /// call-policy machinery.  The concrete path calls the function normally.
+    /// jtransform.py:2030-2047 `_handle_int_special()` parity — oopspec
+    /// `int.add`/`int.sub`/`int.mul` codewriter-time rewrite.
+    pub native_int_binops: Vec<(Path, Ident)>,
     /// Opt-in: route pure forward-advancing dispatch arms (those whose body
     /// only does work then `pc += N`, with no back-edge / `can_enter_jit!` /
     /// early return) through the per-arm sub-JitCode path with a pc-returning
@@ -522,6 +530,7 @@ impl Parse for JitInterpConfig {
         let mut ref_fields: Vec<RefFieldEntry> = Vec::new();
         let mut call_returns: Vec<(Path, Path)> = Vec::new();
         let mut struct_allocs: Vec<(Path, Path)> = Vec::new();
+        let mut native_int_binops: Vec<(Path, Ident)> = Vec::new();
         let mut split_dispatch = false;
         let mut switch_dispatch = false;
 
@@ -585,6 +594,9 @@ impl Parse for JitInterpConfig {
                 "struct_allocs" => {
                     struct_allocs = parse_call_returns_map(input)?;
                 }
+                "native_int_binops" => {
+                    native_int_binops = parse_native_int_binops_map(input)?;
+                }
                 "split_dispatch" => {
                     split_dispatch = input.parse::<LitBool>()?.value;
                 }
@@ -639,6 +651,7 @@ impl Parse for JitInterpConfig {
             ref_fields,
             call_returns,
             struct_allocs,
+            native_int_binops,
             split_dispatch,
             switch_dispatch,
         })
@@ -703,6 +716,20 @@ fn parse_call_returns_map(input: ParseStream) -> syn::Result<Vec<(Path, Path)>> 
         content.parse::<Token![=>]>()?;
         let return_type: Path = content.parse()?;
         entries.push((func_path, return_type));
+        let _ = content.parse::<Token![,]>();
+    }
+    Ok(entries)
+}
+
+fn parse_native_int_binops_map(input: ParseStream) -> syn::Result<Vec<(Path, Ident)>> {
+    let content;
+    braced!(content in input);
+    let mut entries = Vec::new();
+    while !content.is_empty() {
+        let func_path: Path = content.parse()?;
+        content.parse::<Token![=>]>()?;
+        let opcode: Ident = content.parse()?;
+        entries.push((func_path, opcode));
         let _ = content.parse::<Token![,]>();
     }
     Ok(entries)
