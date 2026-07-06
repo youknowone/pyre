@@ -88,6 +88,15 @@ static SMALL_INTS: LazyLock<Vec<W_IntObject>> = LazyLock::new(|| {
 /// replaces only that body, this constructor stays unchanged.
 #[inline]
 pub fn w_int_new(value: i64) -> PyObjectRef {
+    // `ll_int_box`: a value that fits the immediate range is returned as a
+    // tagged pointer `(value << 1) | 1` with no allocation — the whole point
+    // of the representation. Gated on `CAN_BE_TAGGED` (default false), so the
+    // heap-box path below is the only live one until enablement. Subclass
+    // instances never reach here (they use `w_int_new_unique`), so a tagged
+    // result is always an exact builtin `int`.
+    if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::fits_tagged(value) {
+        return crate::tagged_int::tag_int(value);
+    }
     if WITHPREBUILTINT && value >= PREBUILTINTFROM && value < PREBUILTINTTO {
         let idx = (value - PREBUILTINTFROM) as usize;
         return (&SMALL_INTS[idx] as *const W_IntObject).cast_mut() as PyObjectRef;
@@ -115,7 +124,10 @@ pub fn w_int_new(value: i64) -> PyObjectRef {
 /// Create a W_IntObject bypassing the small-int cache.
 ///
 /// Used for int subclass instances that need unique object identity
-/// (so per-object attributes don't collide).
+/// (so per-object attributes don't collide). This must NEVER return a
+/// tagged immediate: tagged ints are value-identical (`1 is 1`), which is
+/// exactly the identity a subclass instance must not have. It always
+/// allocates a distinct heap box, independent of `CAN_BE_TAGGED`.
 pub fn w_int_new_unique(value: i64) -> PyObjectRef {
     crate::lltype::malloc_typed(W_IntObject {
         ob_header: PyObject {

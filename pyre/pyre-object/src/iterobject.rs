@@ -28,6 +28,12 @@ pub fn w_seq_iter_new(seq: PyObjectRef, length: usize) -> PyObjectRef {
 }
 
 pub unsafe fn is_seq_iter(obj: PyObjectRef) -> bool {
+    // A tagged immediate is an `int`, never a seq-iter; short-circuit before
+    // the `ob_type` deref so the GC value-stack walker (`walk_raw_seq_iter_roots`)
+    // never dereferences one. Gated on `CAN_BE_TAGGED` (default false).
+    if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::is_tagged_int(obj) {
+        return false;
+    }
     !obj.is_null() && unsafe { (*obj).ob_type == &SEQ_ITER_TYPE as *const PyType }
 }
 

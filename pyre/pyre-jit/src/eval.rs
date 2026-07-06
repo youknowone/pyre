@@ -781,7 +781,16 @@ thread_local! {
 /// Build and configure the MiniMarkGC with all type registrations,
 /// vtable mappings, and subclass ranges.
 fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
-    let mut gc = MiniMarkGC::new();
+    // translationoption.py:185 `taggedpointers` — kept in lockstep with the
+    // pyre-object representation switch so the collector-core immediate
+    // guards (`is_tagged_immediate`) go live exactly when small ints start
+    // arriving as `(v<<1)|1` immediates. Both default false; the flip lands
+    // in the enablement slice. majit-gc cannot read `pyre_object`
+    // (dependency points the other way), so the constructor mirrors it here.
+    let mut gc = MiniMarkGC::with_config(majit_gc::collector::GcConfig {
+        taggedpointers: pyre_object::tagged_int::CAN_BE_TAGGED,
+        ..majit_gc::collector::GcConfig::default()
+    });
     // rclass.OBJECT root (rclass.py:160-166). pyre's static
     // `INSTANCE_TYPE` is the `name = "object"` PyType — every
     // other `PyObject`-layout class chains its `parent` field to
@@ -6467,6 +6476,11 @@ fn materialize_virtual_from_rd(
     //   Phase 3: self.setfields(decoder, struct)         ← fields filled AFTER
 
     // Phase 1: allocate.
+    // A virtual is materialized empty (`intval: 0`) and its field is written by
+    // Phase 3 `setfields`; a tagged immediate carries its value in the pointer
+    // and cannot be mutated field-by-field, so this reconstruction path stays
+    // boxed regardless of `CAN_BE_TAGGED`. Fresh int *values* are made via
+    // `w_int_new` (which takes the tag path); this is not that.
     let obj_ptr: usize = match kind {
         // resume.py:617-621: VirtualInfo.allocate(descr) → allocate_with_vtable.
         VirtualKind::Instance { descr, known_class } => {
