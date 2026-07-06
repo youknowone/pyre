@@ -1594,6 +1594,41 @@ pub fn translate_op(
                             FlowspaceOp::new("simple_call", vec![bound_method, source], result),
                         ]);
                     }
+                    // `ll_issubclass(subcls, cls)` / `ll_isinstance(obj, cls)`
+                    // (`pyre-object/src/pyobject.rs`, ports of `rclass.py:1133`
+                    // / `:1143`).  Their bodies read `subclassrange_{min,max}`
+                    // through a pyre-only seqlock (`subclass_range_read` over
+                    // `SUBCLASS_RANGE_SEQ`, an adaptation for the two-pass
+                    // startup renumbering that has no upstream analog); tracing
+                    // into that body stalls at the unmodellable static load.
+                    // Upstream never lets the JIT see the call: the rtyper
+                    // lowers `issubtype`/`isinstance` to `ll_issubclass`/
+                    // `ll_isinstance` and the inliner folds the helper into a
+                    // single `int_between` over the immutable vtable fields
+                    // (`OBJECT_VTABLE` `hints={'immutable': True}`,
+                    // rclass.py:167-174).  Mirror that by rewriting the
+                    // recognised call back into the high-level operation, so
+                    // `ClassRepr.rtype_issubtype` (`rclass.rs:1500`) /
+                    // `InstanceRepr.rtype_isinstance` (`rclass.rs:3682`) emit
+                    // the seqlock-free `int_between` helper the same as a
+                    // Python-level `issubtype`/`isinstance`.
+                    if segments.len() >= 2 && segments[segments.len() - 2] == "pyobject" {
+                        let leaf = segments[segments.len() - 1].as_str();
+                        let opname = match leaf {
+                            "ll_issubclass" => Some("issubtype"),
+                            "ll_isinstance" => Some("isinstance"),
+                            _ => None,
+                        };
+                        if let Some(opname) = opname {
+                            if arg_hls.len() != 2 {
+                                return Err(TyperError::message(format!(
+                                    "`{leaf}` requires exactly two args (value, class), got {}",
+                                    arg_hls.len()
+                                )));
+                            }
+                            return Ok(vec![FlowspaceOp::new(opname, arg_hls, result)]);
+                        }
+                    }
                     // Fail-closed on an UNFUSED `lltype::malloc_typed`.  Only the
                     // numeric boxing structs recognised by `fuse_boxing_alloc`
                     // (`model.rs payload_fields` — `W_FloatObject` / `W_IntObject`
@@ -4190,6 +4225,80 @@ mod tests {
             }
             other => panic!("result must be Variable, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn translate_op_ll_issubclass_call_rewrites_to_issubtype() {
+        // `ll_issubclass(subcls, cls)` (rclass.py:1133) must be recognised
+        // and rewritten to the flowspace `issubtype` op so the rtyper lowers
+        // it to `int_between` over the immutable subclassrange fields, rather
+        // than tracing into the pyre-only seqlock body.
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 4);
+        let subcls_hl = Variable::new();
+        let cls_hl = Variable::new();
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(subcls_hl.clone()));
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(cls_hl.clone()));
+        value_map.insert(vars[3].clone(), Hlvalue::Variable(Variable::new()));
+        let op = SpaceOperation {
+            result: Some(vars[3].clone()),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath {
+                    segments: vec!["pyre_object".into(), "pyobject".into(), "ll_issubclass".into()],
+                },
+                args: vec![vars[1].clone(), vars[2].clone()],
+                result_ty: ValueType::Bool,
+            },
+        };
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("ll_issubclass must lower");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(
+            translated[0].opname, "issubtype",
+            "ll_issubclass must emit the flowspace `issubtype` opname",
+        );
+        assert_eq!(translated[0].args.len(), 2, "issubtype args: [subcls, cls]");
+        match &translated[0].args[0] {
+            Hlvalue::Variable(v) => assert_eq!(v, &subcls_hl, "args[0] must be subcls"),
+            other => panic!("args[0] must be Variable, got {other:?}"),
+        }
+        match &translated[0].args[1] {
+            Hlvalue::Variable(v) => assert_eq!(v, &cls_hl, "args[1] must be cls"),
+            other => panic!("args[1] must be Variable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn translate_op_ll_isinstance_call_rewrites_to_isinstance() {
+        // `ll_isinstance(obj, cls)` (rclass.py:1143) recognised and rewritten
+        // to the flowspace `isinstance` op — same seqlock-free lowering path.
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 4);
+        let obj_hl = Variable::new();
+        let cls_hl = Variable::new();
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(obj_hl.clone()));
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(cls_hl.clone()));
+        value_map.insert(vars[3].clone(), Hlvalue::Variable(Variable::new()));
+        let op = SpaceOperation {
+            result: Some(vars[3].clone()),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath {
+                    segments: vec!["pyre_object".into(), "pyobject".into(), "ll_isinstance".into()],
+                },
+                args: vec![vars[1].clone(), vars[2].clone()],
+                result_ty: ValueType::Bool,
+            },
+        };
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("ll_isinstance must lower");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(
+            translated[0].opname, "isinstance",
+            "ll_isinstance must emit the flowspace `isinstance` opname",
+        );
+        assert_eq!(translated[0].args.len(), 2, "isinstance args: [obj, cls]");
     }
 
     #[test]

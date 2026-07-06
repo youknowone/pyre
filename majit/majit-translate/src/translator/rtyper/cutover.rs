@@ -1579,6 +1579,25 @@ pub(crate) fn populate_call_registry_from_call_graphs(
         if canonical_strip == ["lltype", "malloc_raw"] {
             continue;
         }
+        // The `pyobject::ll_issubclass` / `ll_issubclass_const` / `ll_isinstance`
+        // runtime helpers and their shared `subclass_range_read` seqlock body
+        // are never lifted: `flowspace_adapter::translate_op` rewrites every
+        // `ll_issubclass`/`ll_isinstance` call site into the high-level
+        // `issubtype`/`isinstance` op, which the rtyper lowers to a fresh
+        // `int_between`-over-`subclassrange` helper graph
+        // (`lowlevel_issubclass_helper_graph`, the `rclass.py:1133` body).  The
+        // pyre-object bodies additionally read `SUBCLASS_RANGE_SEQ` through a
+        // startup-only seqlock (an adaptation with no upstream analog) that the
+        // tracer cannot model; with all call sites rewritten these graphs are
+        // dead, so skip registering them rather than record a poison lift-error
+        // (the same shape as the `malloc_typed` skip above).
+        if canonical_strip == ["pyobject", "ll_issubclass"]
+            || canonical_strip == ["pyobject", "ll_issubclass_const"]
+            || canonical_strip == ["pyobject", "ll_isinstance"]
+            || canonical_strip == ["pyobject", "subclass_range_read"]
+        {
+            continue;
+        }
         let entry = if let Some(canonical_key) = by_canonical_path.get(&canonical_strip) {
             if canonical_key != &key {
                 registry.alias(key.clone(), canonical_key);
