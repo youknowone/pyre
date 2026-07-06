@@ -413,7 +413,7 @@ def f(x, y):
                 pcdep_by_jit_pc: Vec::new(),
                 depth_pred_by_jit_pc: Vec::new(),
                 depth_trivia_marker_by_jit_pc: Vec::new(),
-            depth_trivia_pred_by_jit_pc: Vec::new(),
+                depth_trivia_pred_by_jit_pc: Vec::new(),
                 depth_at_py_pc: Vec::new(),
                 result_color_at_pc: Vec::new(),
                 portal_frame_reg: 0,

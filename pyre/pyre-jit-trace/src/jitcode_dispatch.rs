@@ -9035,6 +9035,31 @@ pub(crate) fn m73_encode_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_M73_ENCODE").is_some())
 }
 
+/// `PYRE_M73_LIVENESS_AUDIT` enables the assertion that querying the register
+/// liveness banks off the genuine jitcode `target`
+/// (`frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(idx, py, target)`)
+/// reproduces the banks the ENCODE-side branch-arm readers compute via the
+/// `python_pc_for_jitcode_pc(target)` inversion + `skip_python_trivia_forward`.
+/// Certifies the precondition for re-sourcing the branch-arm Ref-liveness off
+/// the carried coordinate without the py_pc channel. Off in production.
+pub(crate) fn m73_liveness_audit_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_M73_LIVENESS_AUDIT").is_some())
+}
+
+/// `PYRE_M73_LIVENESS` (default OFF) flips the branch-arm Ref-liveness reader
+/// from the `python_pc_for_jitcode_pc` inversion to the jitcode-pc-keyed
+/// `frame_liveness_reg_indices_by_bank_at_with_jitcode_pc` twin, preferring the
+/// carried `target` coordinate. Behavioral flip (no byte-identity guarantee),
+/// certified by the always-available `PYRE_M73_LIVENESS_AUDIT` full-bank
+/// equality + `check.py`. When the carried coordinate is not `-live-`-decodable
+/// the twin falls back to the same `resolve_resume_pc` path as the raw reader,
+/// so unpopulated / portal-bridge installs are unaffected.
+pub(crate) fn m73_liveness_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_M73_LIVENESS").is_some())
+}
+
 pub(crate) fn python_pc_for_jitcode_pc(metadata: &crate::PyJitCodeMetadata, jit_pc: usize) -> u32 {
     // Exact inverse: `first_jit_pc_by_py_pc[py]` is the byte offset of the
     // FIRST instruction opcode `py` emitted (`usize::MAX` = the PC emitted
@@ -9526,6 +9551,26 @@ fn branch_arm_resume_ref_liveness(
             outer_jitcode_index as i32,
             py as i32,
         );
+        if m73_liveness_audit_enabled() {
+            let twin = crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
+                outer_jitcode_index as i32,
+                py as i32,
+                target as i32,
+            );
+            assert_eq!(
+                twin, banks,
+                "liveness twin diverges from branch_arm_resume_ref_liveness at target={target} py={py}"
+            );
+        }
+        let banks = if m73_liveness_enabled() {
+            crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
+                outer_jitcode_index as i32,
+                py as i32,
+                target as i32,
+            )
+        } else {
+            banks
+        };
         let live: std::collections::HashSet<u16> = banks.ref_.iter().map(|&c| c as u16).collect();
         let num_regs_r = jc.payload.jitcode.num_regs_r() as u16;
         Some((live, num_regs_r))
@@ -9947,12 +9992,8 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 // channel.  Off in production → byte-identical.
                 if depth_audit_enabled() {
                     if let Some(twin_depth) = jc.payload.depth_for_jitcode_pc(op_pc as usize) {
-                        let field_depth = jc
-                            .payload
-                            .metadata
-                            .depth_at_py_pc
-                            .get(py as usize)
-                            .copied();
+                        let field_depth =
+                            jc.payload.metadata.depth_at_py_pc.get(py as usize).copied();
                         assert_eq!(
                             Some(twin_depth),
                             field_depth,
@@ -15286,6 +15327,15 @@ fn compare_box_provably_dead(ctx: &WalkContext<'_, '_>, compare_pc: usize, dst_r
     let target_jc = read_label(code, &gin_op, 1);
     // SAFETY: code_ptr captured non-null above, live for the walk.
     let code_obj = unsafe { &*code_ptr };
+    // The `jc_pc` here is a branch ARM's op-start (`gin_op.next_pc` /
+    // `read_label`), NOT the guard's resume marker, so it does not satisfy
+    // the carried-coordinate contract (`can_decode_live_vars` may hold at an
+    // interior arm offset whose liveness window differs from the py opcode's
+    // representative resume window). The `pc_map` normalization to the py
+    // opcode's resume liveness is the intended behavior here, so this reader
+    // keeps the py_pc channel and is excluded from the jitcode-pc liveness
+    // twin — verified: querying the carried offset directly drops live
+    // colors (e.g. `ref_ [0,1,4]` vs `[0,1]`) across the branch-arm corpus.
     let arm_dst_live = |jc_pc: usize| -> bool {
         let py = skip_python_trivia_forward(
             code_obj,
