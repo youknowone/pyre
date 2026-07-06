@@ -5168,17 +5168,41 @@ impl<M: Clone> MetaInterp<M> {
             .map(|rc| (**rc).clone())
             .collect();
         if crate::majit_log_enabled() {
-            eprintln!("--- trace (before opt) ---");
-            eprint!("{}", majit_ir::format_trace(&trace_ops, &constants));
+            eprintln!("--- trace (before opt) --- [{} ops]", trace_ops.len());
+            if trace_ops.len() <= 10000 {
+                eprint!("{}", majit_ir::format_trace(&trace_ops, &constants));
+            } else {
+                eprintln!("  [trace too large for full dump, showing op counts]");
+                let mut counts: std::collections::HashMap<majit_ir::OpCode, usize> =
+                    std::collections::HashMap::new();
+                for op in &trace_ops {
+                    *counts.entry(op.opcode).or_insert(0) += 1;
+                }
+                let mut sorted: Vec<_> = counts.into_iter().collect();
+                sorted.sort_by(|a, b| b.1.cmp(&a.1));
+                for (opcode, count) in sorted.iter().take(15) {
+                    eprintln!("  {:?}: {}", opcode, count);
+                }
+            }
         }
 
         let num_ops_before = trace.ops.len();
         let num_trace_inputargs = trace.inputargs.len();
+        if crate::majit_log_enabled() {
+            eprintln!("[jit-diag] entering optimizer: {} ops, {} inputargs", num_ops_before, num_trace_inputargs);
+        }
 
         // Save trace_ops + constants snapshot for potential unroll-free retry
         // (pyjitpl.py:3016-3021).
         let trace_ops_snapshot = trace_ops.clone();
         let constants_snapshot = constants.clone();
+
+        // PyPy: pyjitpl.py:3016-3017 `can_use_unroll = cpu.supports_guard_gc_type
+        // and 'unroll' in warmstate.enable_opts`. PYRE_NO_UNROLL forces the
+        // simple-loop compilation path (compile.py:251 compile_simple_loop)
+        // without preamble peeling, useful for diagnostics and to isolate
+        // unroller-related regressions.
+        let no_unroll = std::env::var_os("PYRE_NO_UNROLL").is_some();
 
         // Use UnrollOptimizer for preamble peeling when available.
         // compile.py: compile_loop → PreambleCompileData + LoopCompileData.
@@ -5275,13 +5299,23 @@ impl<M: Clone> MetaInterp<M> {
             Vec<majit_ir::OpRc>,
             crate::optimizeopt::unroll::ExportedState,
         )> = None;
-        let optimize_result = unroll_opt.optimize_trace_with_constants_and_inputs_vable_out(
-            &trace_ops,
-            &mut constants,
-            num_trace_inputargs,
-            vable_config.clone(),
-            Some(&mut phase1_out),
-        );
+        let optimize_result = if no_unroll {
+            if crate::majit_log_enabled() {
+                eprintln!(
+                    "[jit] PYRE_NO_UNROLL: skipping unroll optimizer at key={}",
+                    green_key,
+                );
+            }
+            Err(crate::optimize::InvalidLoop("PYRE_NO_UNROLL"))
+        } else {
+            unroll_opt.optimize_trace_with_constants_and_inputs_vable_out(
+                &trace_ops,
+                &mut constants,
+                num_trace_inputargs,
+                vable_config.clone(),
+                Some(&mut phase1_out),
+            )
+        };
         let mut retried_without_unroll = false;
         let (optimized_ops, final_num_inputs) = match optimize_result {
             Ok(result) => result,
@@ -5299,17 +5333,22 @@ impl<M: Clone> MetaInterp<M> {
                             green_key, reason,
                         );
                     }
-                    self.cancel_count += 1;
-                    // pyjitpl.py:3018-3029: RPython increments cancel_count
-                    // and falls through (tracing continues). compile_loop is
-                    // re-invoked on the next reached_loop_header. Do NOT call
-                    // abort_tracing — TRACING flag must stay active.
-                    if !self.cancelled_too_many_times() {
-                        self.exported_state = None;
-                        if std::env::var_os("MAJIT_CLOSEDBG").is_some() {
-                            eprintln!("@@@CANCEL-SITE line={}", line!());
+                    // When PYRE_NO_UNROLL is set, the InvalidLoop is synthetic
+                    // — skip the cancel_count gate and go straight to the
+                    // simple-loop retry path.
+                    if !no_unroll {
+                        self.cancel_count += 1;
+                        // pyjitpl.py:3018-3029: RPython increments cancel_count
+                        // and falls through (tracing continues). compile_loop is
+                        // re-invoked on the next reached_loop_header. Do NOT call
+                        // abort_tracing — TRACING flag must stay active.
+                        if !self.cancelled_too_many_times() {
+                            self.exported_state = None;
+                            if std::env::var_os("MAJIT_CLOSEDBG").is_some() {
+                                eprintln!("@@@CANCEL-SITE line={}", line!());
+                            }
+                            return CompileOutcome::Cancelled;
                         }
-                        return CompileOutcome::Cancelled;
                     }
                     {
                         // The retry MOVES the original snapshot maps into
@@ -5594,18 +5633,40 @@ impl<M: Clone> MetaInterp<M> {
         }
         let mut compiled_ops =
             compile::normalize_closing_jump_args(optimized_ops, &constants, final_num_inputs);
-        if crate::majit_log_enabled() {
+        if crate::majit_log_enabled() || std::env::var_os("MAJIT_DIAG").is_some() {
             eprintln!(
-                "[jit] normalize_closing_jump_args done, {} ops",
-                compiled_ops.len()
+                "[jit] compiled loop: {} ops before opt -> {} ops after opt ({:.1}% reduction)",
+                num_ops_before,
+                compiled_ops.len(),
+                (1.0 - compiled_ops.len() as f64 / num_ops_before as f64) * 100.0
             );
+            if std::env::var_os("MAJIT_DIAG").is_some() {
+                let mut counts: std::collections::HashMap<majit_ir::OpCode, usize> =
+                    std::collections::HashMap::new();
+                for op in &compiled_ops {
+                    *counts.entry(op.opcode).or_insert(0) += 1;
+                }
+                let mut sorted: Vec<_> = counts.into_iter().collect();
+                sorted.sort_by(|a, b| b.1.cmp(&a.1));
+                eprintln!("[jit] after-opt op breakdown:");
+                for (opcode, count) in &sorted {
+                    eprintln!("  {:?}: {}", opcode, count);
+                }
+            }
         }
 
         if crate::debug::have_debug_prints() {
             let _s = crate::debug::scope("jit-log-opt-loop");
-            crate::debug::debug_print("--- trace (after opt) ---");
-            for line in majit_ir::format_trace(&compiled_ops, &constants).lines() {
-                crate::debug::debug_print(line);
+            crate::debug::debug_print(&format!(
+                "--- trace (after opt) --- [{} ops]",
+                compiled_ops.len()
+            ));
+            if compiled_ops.len() <= 10000 {
+                for line in majit_ir::format_trace(&compiled_ops, &constants).lines() {
+                    crate::debug::debug_print(line);
+                }
+            } else {
+                crate::debug::debug_print("[trace too large for full dump]");
             }
             for op in &compiled_ops {
                 if op.opcode == majit_ir::OpCode::GuardNotInvalidated {
