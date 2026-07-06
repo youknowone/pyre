@@ -461,6 +461,31 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::pin_root",
         pyre_object::gc_roots::pin_root as *const (),
     );
+    // `mark_prebuilt_roots_dirty` sets the static `PREBUILT_ROOTS_DIRTY`
+    // bit, `box_str_constant` reads the TLS `STRING_CONSTANT_CACHE`, and
+    // `try_gc_add_root` dispatches the TLS `GC_ADD_ROOT_HOOK` — all through
+    // state the tracer cannot model (the `pin_root` / `try_gc_write_barrier`
+    // twins).  Their `#[dont_look_inside]` calls bind the Rust `fn` directly
+    // by qualified path (`-> ()` / pointer / `-> bool` signatures are
+    // JIT-representable).
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::gc_roots::mark_prebuilt_roots_dirty",
+        "pyre_object::mark_prebuilt_roots_dirty",
+        pyre_object::gc_roots::mark_prebuilt_roots_dirty as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::unicodeobject::box_str_constant",
+        "pyre_object::box_str_constant",
+        pyre_object::unicodeobject::box_str_constant as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::gc_hook::try_gc_add_root",
+        "pyre_object::try_gc_add_root",
+        pyre_object::gc_hook::try_gc_add_root as *const (),
+    );
     push_fnaddr(
         &mut entries,
         "pyre_interpreter::module::_weakref::interp__weakref::dereference",

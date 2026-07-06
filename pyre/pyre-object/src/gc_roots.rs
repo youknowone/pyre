@@ -207,7 +207,11 @@ static PREBUILT_ROOTS_DIRTY: AtomicBool = AtomicBool::new(true);
 /// (incminimark `remember_young_pointer` analog).  Call from every helper
 /// that stores a `PyObjectRef` into a structure reached only by the
 /// `walk_pyframe_roots` band-aid walks.
-#[inline]
+///
+/// Sets the static `PREBUILT_ROOTS_DIRTY` bit the tracer cannot model; the
+/// JIT residualises the call instead of tracing into it (`@dont_look_inside`,
+/// `rlib/jit.py:139`), the `pin_root` twin.
+#[majit_macros::dont_look_inside]
 pub fn mark_prebuilt_roots_dirty() {
     PREBUILT_ROOTS_DIRTY.store(true, Ordering::Relaxed);
 }

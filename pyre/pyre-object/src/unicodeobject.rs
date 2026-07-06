@@ -105,6 +105,11 @@ thread_local! {
 }
 
 /// Box a string constant into a heap Python str object.
+///
+/// Reads the thread-local `STRING_CONSTANT_CACHE` the tracer cannot model;
+/// the JIT residualises the call instead of tracing into it
+/// (`@dont_look_inside`, `rlib/jit.py:139`), the `box_str`/`pin_root` twin.
+#[majit_macros::dont_look_inside]
 pub fn box_str_constant(value: &Wtf8) -> PyObjectRef {
     STRING_CONSTANT_CACHE.with(|cache| {
         if let Some(&cached) = cache.borrow().get(value) {

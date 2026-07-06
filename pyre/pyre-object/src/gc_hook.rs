@@ -345,7 +345,10 @@ pub fn clear_gc_root_hooks() {
 /// # Safety
 /// Caller must keep `slot` valid until [`try_gc_remove_root`] is
 /// called with the same pointer.
-#[inline]
+// `dont_look_inside`: host hook dispatch (`thread_local!` `Cell`
+// indirection) stays opaque to the JIT — the `try_gc_write_barrier`
+// twin; calls residualize via the registered fnaddr (`rlib/jit.py:139`).
+#[majit_macros::dont_look_inside]
 pub unsafe fn try_gc_add_root(slot: *mut *mut u8) -> bool {
     GC_ADD_ROOT_HOOK.with(|cell| match cell.get() {
         Some(f) => {
