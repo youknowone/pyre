@@ -1175,12 +1175,12 @@ fn mmap_construct(
     let flags_arg = if args.len() >= 3 {
         (unsafe { pyre_object::w_int_get_value(args[2]) }) as libc::c_int
     } else {
-        libc::MAP_SHARED
+        host_mmap::MAP_SHARED
     };
     let prot_arg = if args.len() >= 4 {
         (unsafe { pyre_object::w_int_get_value(args[3]) }) as libc::c_int
     } else {
-        libc::PROT_READ | libc::PROT_WRITE
+        host_mmap::PROT_READ | host_mmap::PROT_WRITE
     };
     let access = if args.len() >= 5 {
         unsafe { pyre_object::w_int_get_value(args[4]) }
@@ -1193,9 +1193,13 @@ fn mmap_construct(
         0
     };
     let (flags, prot) = match access {
-        x if x == MMAP_ACCESS_READ => (libc::MAP_SHARED, libc::PROT_READ),
-        x if x == MMAP_ACCESS_WRITE => (libc::MAP_SHARED, libc::PROT_READ | libc::PROT_WRITE),
-        x if x == MMAP_ACCESS_COPY => (libc::MAP_PRIVATE, libc::PROT_READ | libc::PROT_WRITE),
+        x if x == MMAP_ACCESS_READ => (host_mmap::MAP_SHARED, host_mmap::PROT_READ),
+        x if x == MMAP_ACCESS_WRITE => {
+            (host_mmap::MAP_SHARED, host_mmap::PROT_READ | host_mmap::PROT_WRITE)
+        }
+        x if x == MMAP_ACCESS_COPY => {
+            (host_mmap::MAP_PRIVATE, host_mmap::PROT_READ | host_mmap::PROT_WRITE)
+        }
         _ => (flags_arg, prot_arg),
     };
     // fileno == -1 → anonymous mapping.  host_env expresses the mapping as an
@@ -1210,8 +1214,8 @@ fn mmap_construct(
     let mapped = if real_fd == -1 {
         host_mmap::map_anon(length).map_err(|e| mmap_io_err(e, "mmap"))?
     } else {
-        let mode = if prot & libc::PROT_WRITE != 0 {
-            if flags & libc::MAP_PRIVATE != 0 {
+        let mode = if prot & host_mmap::PROT_WRITE != 0 {
+            if flags & host_mmap::MAP_PRIVATE != 0 {
                 host_mmap::AccessMode::Copy
             } else {
                 host_mmap::AccessMode::Write
@@ -1249,28 +1253,29 @@ pub fn register_module(ns: &mut DictStorage) {
         crate::dict_storage_store(ns, "error", w_os_error);
 
         // Constants.  CPython exposes both POSIX MAP_/PROT_/MADV_ and the
-        // Python ACCESS_* aliases.  These Python-visible values still source
-        // from libc; a pending host_env patch re-exports them, after which
-        // this can switch to host_env in a one-line change.
+        // Python ACCESS_* aliases.  The portable subset sources from
+        // host_env's re-exports; the platform-specific extras host_env does
+        // not re-export (MAP_FIXED, the Linux-only MAP_* flags, PROT_NONE)
+        // stay on libc.
         crate::dict_storage_store(
             ns,
             "MAP_SHARED",
-            pyre_object::w_int_new(libc::MAP_SHARED as i64),
+            pyre_object::w_int_new(host_mmap::MAP_SHARED as i64),
         );
         crate::dict_storage_store(
             ns,
             "MAP_PRIVATE",
-            pyre_object::w_int_new(libc::MAP_PRIVATE as i64),
+            pyre_object::w_int_new(host_mmap::MAP_PRIVATE as i64),
         );
         crate::dict_storage_store(
             ns,
             "MAP_ANON",
-            pyre_object::w_int_new(libc::MAP_ANON as i64),
+            pyre_object::w_int_new(host_mmap::MAP_ANON as i64),
         );
         crate::dict_storage_store(
             ns,
             "MAP_ANONYMOUS",
-            pyre_object::w_int_new(libc::MAP_ANON as i64),
+            pyre_object::w_int_new(host_mmap::MAP_ANONYMOUS as i64),
         );
         crate::dict_storage_store(
             ns,
@@ -1313,17 +1318,17 @@ pub fn register_module(ns: &mut DictStorage) {
         crate::dict_storage_store(
             ns,
             "PROT_READ",
-            pyre_object::w_int_new(libc::PROT_READ as i64),
+            pyre_object::w_int_new(host_mmap::PROT_READ as i64),
         );
         crate::dict_storage_store(
             ns,
             "PROT_WRITE",
-            pyre_object::w_int_new(libc::PROT_WRITE as i64),
+            pyre_object::w_int_new(host_mmap::PROT_WRITE as i64),
         );
         crate::dict_storage_store(
             ns,
             "PROT_EXEC",
-            pyre_object::w_int_new(libc::PROT_EXEC as i64),
+            pyre_object::w_int_new(host_mmap::PROT_EXEC as i64),
         );
         crate::dict_storage_store(
             ns,
@@ -1345,27 +1350,27 @@ pub fn register_module(ns: &mut DictStorage) {
         crate::dict_storage_store(
             ns,
             "MADV_NORMAL",
-            pyre_object::w_int_new(libc::MADV_NORMAL as i64),
+            pyre_object::w_int_new(host_mmap::MADV_NORMAL as i64),
         );
         crate::dict_storage_store(
             ns,
             "MADV_RANDOM",
-            pyre_object::w_int_new(libc::MADV_RANDOM as i64),
+            pyre_object::w_int_new(host_mmap::MADV_RANDOM as i64),
         );
         crate::dict_storage_store(
             ns,
             "MADV_SEQUENTIAL",
-            pyre_object::w_int_new(libc::MADV_SEQUENTIAL as i64),
+            pyre_object::w_int_new(host_mmap::MADV_SEQUENTIAL as i64),
         );
         crate::dict_storage_store(
             ns,
             "MADV_WILLNEED",
-            pyre_object::w_int_new(libc::MADV_WILLNEED as i64),
+            pyre_object::w_int_new(host_mmap::MADV_WILLNEED as i64),
         );
         crate::dict_storage_store(
             ns,
             "MADV_DONTNEED",
-            pyre_object::w_int_new(libc::MADV_DONTNEED as i64),
+            pyre_object::w_int_new(host_mmap::MADV_DONTNEED as i64),
         );
 
         // Page-related constants (sys.PAGESIZE in CPython mmap module).
