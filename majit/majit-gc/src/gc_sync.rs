@@ -85,7 +85,9 @@ pub fn store_singleton(gc: Box<dyn GcAllocator>) {
         return;
     }
     // SAFETY: gc_mutex held, no concurrent access.
-    unsafe { *GC_STORE.0.get() = Some(gc); }
+    unsafe {
+        *GC_STORE.0.get() = Some(gc);
+    }
     GC_INITIALIZED.store(true, Ordering::Release);
 }
 
@@ -103,37 +105,90 @@ unsafe fn singleton_mut() -> &'static mut dyn GcAllocator {
 }
 
 // ──────────────────────────────────────────────────────────────
-// GC operation gate — P0: every GC op goes through this
+// Mutator registry — single-thread fast path
+// ──────────────────────────────────────────────────────────────
+
+/// Number of threads that have called `register_thread` and not yet
+/// `unregister_thread`.  When ≤ 1, `gc_op` skips the Mutex entirely.
+static REGISTERED_THREADS: AtomicUsize = AtomicUsize::new(0);
+
+/// Set by the single-thread fast path while inside `singleton_mut()`.
+/// `register_thread` spins on this to prevent the 1→2 transition from
+/// racing with a concurrent fast-path gc_op.
+static IN_FAST_PATH: AtomicBool = AtomicBool::new(false);
+
+/// Register the current thread as a GC mutator.  Must be called before
+/// any `gc_op` on this thread.  Paired with `unregister_thread`.
+pub fn register_thread() {
+    let old = REGISTERED_THREADS.fetch_add(1, Ordering::SeqCst);
+    if old > 0 {
+        // A second thread is arriving.  Spin until any in-progress
+        // fast-path gc_op completes — after this, the first thread
+        // will see REGISTERED_THREADS > 1 and take the Mutex path.
+        while IN_FAST_PATH.load(Ordering::Acquire) {
+            std::hint::spin_loop();
+        }
+    }
+}
+
+/// Unregister the current thread.  After this, gc_op must not be
+/// called from this thread.
+pub fn unregister_thread() {
+    REGISTERED_THREADS.fetch_sub(1, Ordering::SeqCst);
+}
+
+// ──────────────────────────────────────────────────────────────
+// GC operation gate — fast path when single-threaded
 // ──────────────────────────────────────────────────────────────
 
 /// Execute a closure with exclusive `&mut dyn GcAllocator` access.
 ///
-/// In P0, this acquires `gc_mutex` for the duration of `f`. If an STW
-/// is in progress, the calling thread parks until collection finishes.
+/// **Fast path** (single registered thread, no STW): direct access,
+/// no Mutex.  Cost: 2 atomic loads + 2 atomic stores (~4ns x86).
 ///
-/// P1 will make the common alloc path lock-free (TLAB bump) and only
-/// route slow paths (nursery refill, collect, barrier) through the mutex.
+/// **Slow path** (multiple threads or STW): acquires `gc_mutex`.
+/// Single-threaded production always takes the fast path.
+#[inline]
 pub fn gc_op<R>(f: impl FnOnce(&mut dyn GcAllocator) -> R) -> R {
-    // Park if STW is requested — wait until the collector finishes.
+    // Fast path: single thread, no STW.
+    if REGISTERED_THREADS.load(Ordering::Acquire) <= 1
+        && !GC_SYNC.stw_requested.load(Ordering::Acquire)
+    {
+        IN_FAST_PATH.store(true, Ordering::Release);
+        // Double-check: another thread may have registered between
+        // our load and the flag set.
+        if REGISTERED_THREADS.load(Ordering::Acquire) <= 1
+            && !GC_SYNC.stw_requested.load(Ordering::Acquire)
+        {
+            // SAFETY: single thread, no concurrent access possible.
+            let r = f(unsafe { singleton_mut() });
+            IN_FAST_PATH.store(false, Ordering::Release);
+            return r;
+        }
+        IN_FAST_PATH.store(false, Ordering::Release);
+    }
+    gc_op_slow(f)
+}
+
+/// Slow path: Mutex-guarded access with STW parking.
+#[cold]
+fn gc_op_slow<R>(f: impl FnOnce(&mut dyn GcAllocator) -> R) -> R {
     if GC_SYNC.stw_requested.load(Ordering::Acquire) {
         park_until_stw_done();
     }
     let _guard = GC_SYNC.gc_mutex.lock().unwrap();
-    // Re-check after acquiring mutex — STW may have been requested
-    // between our check and the lock acquisition.
     if GC_SYNC.stw_requested.load(Ordering::Acquire) {
         drop(_guard);
         park_until_stw_done();
         let _guard = GC_SYNC.gc_mutex.lock().unwrap();
-        // SAFETY: gc_mutex held.
         return f(unsafe { singleton_mut() });
     }
-    // SAFETY: gc_mutex held.
     f(unsafe { singleton_mut() })
 }
 
-/// Execute a closure with `& dyn GcAllocator` access (read-only query).
-/// Same synchronisation as `gc_op` in P0.
+/// Execute a closure with `&dyn GcAllocator` access (read-only query).
+/// Same fast/slow path as `gc_op`.
+#[inline]
 pub fn gc_query<R>(f: impl FnOnce(&dyn GcAllocator) -> R) -> R {
     gc_op(|gc| f(gc))
 }
@@ -151,13 +206,16 @@ pub fn gc_query<R>(f: impl FnOnce(&dyn GcAllocator) -> R) -> R {
 pub fn request_stw(collect_fn: impl FnOnce(&mut dyn GcAllocator)) {
     GC_SYNC.stw_requested.store(true, Ordering::Release);
 
-    // Acquire gc_mutex — this ensures no thread is mid-gc_op.
+    // Wait for any in-progress fast-path gc_op to finish.
+    while IN_FAST_PATH.load(Ordering::Acquire) {
+        std::hint::spin_loop();
+    }
+
+    // Acquire gc_mutex — ensures no thread is mid-slow-path gc_op.
     let guard = GC_SYNC.gc_mutex.lock().unwrap();
 
-    // In P0, gc_mutex serialises everything, so by the time we hold it,
-    // no other thread is inside gc_op. No need to wait on active_in_gc_op.
-
-    // SAFETY: gc_mutex held, stw_requested prevents new entrants.
+    // SAFETY: gc_mutex held + fast path blocked by stw_requested +
+    // IN_FAST_PATH drained. No concurrent singleton access.
     collect_fn(unsafe { singleton_mut() });
 
     // Resume all parked threads.
@@ -198,11 +256,11 @@ mod tests {
     use std::sync::{Arc, Barrier};
 
     fn ensure_gc() {
-        if is_initialized() {
-            return;
+        if !is_initialized() {
+            let gc = Box::new(MiniMarkGC::new());
+            store_singleton(gc);
         }
-        let gc = Box::new(MiniMarkGC::new());
-        store_singleton(gc);
+        register_thread();
     }
 
     #[test]
@@ -225,6 +283,7 @@ mod tests {
                 let c = counter.clone();
                 let b = barrier.clone();
                 std::thread::spawn(move || {
+                    register_thread();
                     b.wait();
                     for _ in 0..100 {
                         gc_op(|_gc| {
@@ -233,6 +292,7 @@ mod tests {
                             c.store(v + 1, Ordering::Relaxed);
                         });
                     }
+                    unregister_thread();
                 })
             })
             .collect();

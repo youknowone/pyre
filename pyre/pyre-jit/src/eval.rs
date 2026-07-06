@@ -2351,6 +2351,7 @@ pub fn init_gc_subsystem() {
     if GC_TLS_INSTALLED.with(|c| c.get()) {
         return;
     }
+    majit_gc::gc_sync::register_thread();
     install_gc_hooks();
     GC_TLS_INSTALLED.with(|c| c.set(true));
 }
