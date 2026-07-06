@@ -133,6 +133,12 @@ pub fn get_instantiate(tp: &PyType) -> PyObjectRef {
 /// `obj` must be null or a valid `PyObjectRef`.
 #[inline]
 pub unsafe fn is_exact_builtin_instance(obj: PyObjectRef) -> bool {
+    // A tagged immediate is an exact builtin `int` (subclasses stay boxed),
+    // so it is always an exact builtin instance. Gated on `CAN_BE_TAGGED`
+    // (default false), synthesized before the `w_class`/`ob_type` derefs.
+    if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::is_tagged_int(obj) {
+        return true;
+    }
     if obj.is_null() {
         return false;
     }
@@ -157,6 +163,13 @@ pub unsafe fn is_exact_builtin_instance(obj: PyObjectRef) -> bool {
 /// builtin layout type with `get_instantiate(tp)` initialized.
 #[inline]
 pub unsafe fn is_exact_type(obj: PyObjectRef, tp: &PyType) -> bool {
+    // A tagged immediate is always an exact builtin `int` (never a
+    // subclass — those stay boxed via `w_int_new_unique`), so it is the
+    // exact `tp` iff `tp` is the `int` vtable. Gated on `CAN_BE_TAGGED`
+    // (default false), synthesized before the `w_class`/`ob_type` derefs.
+    if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::is_tagged_int(obj) {
+        return std::ptr::eq(tp as *const PyType, &INT_TYPE as *const PyType);
+    }
     if obj.is_null() {
         return false;
     }
@@ -305,6 +318,12 @@ pub fn ll_issubclass_const(subcls: &PyType, minid: i64, maxid: i64) -> bool {
 /// `obj` must be a valid non-null `PyObject`.
 #[inline]
 pub unsafe fn ll_isinstance(obj: PyObjectRef, cls: &PyType) -> bool {
+    // `ll_unboxed_isinstance`: a tagged immediate's RPython class is the
+    // `int` vtable, checked against `cls`'s subclass range without the
+    // `ob_type` deref. Gated on `CAN_BE_TAGGED` (default false).
+    if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::is_tagged_int(obj) {
+        return ll_issubclass(&INT_TYPE, cls);
+    }
     if obj.is_null() {
         return false;
     }
@@ -742,6 +761,14 @@ pub fn all_foreign_pytypes() -> &'static [(&'static PyType, &'static PyType)] {
 /// `obj` must be a valid, non-null pointer to a `PyObject`.
 #[inline]
 pub unsafe fn py_type_check(obj: PyObjectRef, tp: &PyType) -> bool {
+    // A tagged immediate's type is `int`, synthesized before the `ob_type`
+    // deref: it matches iff `tp` is the `int` vtable. Gated on
+    // `CAN_BE_TAGGED` (default false), so the deref below is the only live
+    // path until enablement. This is the shared chokepoint for
+    // `is_bool`/`is_float`/`is_long`/`is_complex`, which inherit the guard.
+    if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::is_tagged_int(obj) {
+        return std::ptr::eq(tp as *const PyType, &INT_TYPE as *const PyType);
+    }
     !obj.is_null() && unsafe { std::ptr::eq((*obj).ob_type, tp as *const PyType) }
 }
 
