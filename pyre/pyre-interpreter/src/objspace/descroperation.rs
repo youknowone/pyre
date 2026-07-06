@@ -1636,6 +1636,22 @@ unsafe fn numeric_base_type(obj: PyObjectRef) -> Option<*const pyre_object::PyTy
     }
 }
 
+/// The builtin numeric base type object of `obj`, returned only when `obj`
+/// is a subclass instance that may override a special method.  An exact
+/// builtin numeric instance ([`is_exact_builtin_instance`]) cannot override
+/// any special method, so it yields `None`, skipping the string-keyed
+/// method-cache lookups in [`dunder_overridden`].  Those lookups (one
+/// UTF-8-keyed cache probe per dunder) are the dominant per-iteration cost
+/// of the interpreter numeric fast path.  This mirrors the exact-builtin
+/// gate already opening `subclass_special_override` / `is_true`.
+unsafe fn numeric_base_type_of_overriding_subclass(obj: PyObjectRef) -> Option<PyObjectRef> {
+    if pyre_object::is_exact_builtin_instance(obj) {
+        return None;
+    }
+    let base = numeric_base_type(obj)?;
+    crate::typedef::gettypefor(base)
+}
+
 /// True when numeric operand `obj` (int/long/float storage) has a Python
 /// class that overrides `dunder` relative to its builtin base — int/long
 /// against `int`, float against `float`.  Mirrors [`dunder_overridden`]
@@ -1644,10 +1660,7 @@ unsafe fn numeric_base_type(obj: PyObjectRef) -> Option<*const pyre_object::PyTy
 /// Rust fast path, which both matches the builtin result and avoids
 /// re-entering the inherited slot (it would recurse back into this op).
 unsafe fn numeric_operand_overrides(obj: PyObjectRef, dunder: &str, rdunder: &str) -> bool {
-    let Some(base) = numeric_base_type(obj) else {
-        return false;
-    };
-    let Some(t) = crate::typedef::gettypefor(base) else {
+    let Some(t) = numeric_base_type_of_overriding_subclass(obj) else {
         return false;
     };
     dunder_overridden(obj, dunder, t) || dunder_overridden(obj, rdunder, t)
@@ -1676,10 +1689,7 @@ unsafe fn needs_numeric_binop_dispatch(
 /// special `dunder` relative to its builtin base.
 #[majit_macros::dont_look_inside]
 unsafe fn needs_numeric_unaryop_dispatch(a: PyObjectRef, dunder: &str) -> bool {
-    let Some(base) = numeric_base_type(a) else {
-        return false;
-    };
-    let Some(t) = crate::typedef::gettypefor(base) else {
+    let Some(t) = numeric_base_type_of_overriding_subclass(a) else {
         return false;
     };
     dunder_overridden(a, dunder, t)
