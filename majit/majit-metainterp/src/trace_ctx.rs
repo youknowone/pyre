@@ -361,6 +361,13 @@ pub struct TraceCtx {
     /// `recover` cannot reconstruct (loop-carried state held in a red bank but
     /// never written back to the shared heap). Empty unless single-pass.
     pub walk_final_reds: Vec<majit_ir::Value>,
+    /// Trace-recording mode: `true` while the JitCode dispatch walk is
+    /// recording a trace (the record-side of the observer/replay handover).
+    /// Set for the lifetime of a `trace_jitcode_observer_*` walk and read by
+    /// the `record_observed_*` gate in `run_one_step`. This is the RPython
+    /// `MetaInterp.history`-carried "am I tracing" state, held on the walk
+    /// context (one executor with `ctx` in scope) rather than a thread-local.
+    pub(crate) observer_mode: bool,
     /// pyjitpl.py:1087 parity: quasi-immutable field read needs a
     /// GUARD_NOT_INVALIDATED with full snapshot at the field read's orgpc.
     /// Stores Some(orgpc) when pending.
@@ -1178,6 +1185,7 @@ impl TraceCtx {
             initial_inputarg_consts: vec![],
             walk_final_pc: None,
             walk_final_reds: Vec::new(),
+            observer_mode: false,
             pending_guard_not_invalidated_pc: None,
             forced_virtualizable: None,
             has_compiled_targets_fn: None,
@@ -1252,6 +1260,7 @@ impl TraceCtx {
             initial_inputarg_consts: vec![],
             walk_final_pc: None,
             walk_final_reds: Vec::new(),
+            observer_mode: false,
             pending_guard_not_invalidated_pc: None,
             forced_virtualizable: None,
             has_compiled_targets_fn: None,

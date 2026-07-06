@@ -21,18 +21,18 @@ use crate::jitcode::{self, JitArgKind, JitCallArg, JitCallTarget, JitCode, JitCo
 use crate::{TraceAction, TraceCtx};
 
 thread_local! {
-    // Tracing observer state is per-metainterp / per-thread in PyPy
-    // (`MetaInterp.history`); a process-global flag would let one thread's
-    // tracing wrap another thread's outer-interpreter helper calls. Keep it
-    // thread-local alongside the replay queue.
-    static OBSERVER_MODE: Cell<bool> = const { Cell::new(false) };
+    // The executed-but-not-yet-replayed residual call queue for a recording
+    // walk. The record side (walk-scoped) pushes; the replay side
+    // (outer-body-scoped) drains via `consume_observed_*_call`. The
+    // trace-recording mode flag itself lives on `TraceCtx::observer_mode`
+    // (the walk has `ctx` in scope), not thread-local.
     static OBSERVED_CALLS: RefCell<VecDeque<ObservedCall>> = const { RefCell::new(VecDeque::new()) };
     // Set when a recording walk ends with executed-but-not-yet-replayed
     // calls on OBSERVED_CALLS. The outer mainloop body that runs right
     // after the walk consumes the queue through `consume_observed_*_call`
     // and the flag clears itself when the queue empties. Split from
-    // OBSERVER_MODE so the record side (walk-scoped) and the replay side
-    // (outer-body-scoped) cannot leak into each other.
+    // the record-side mode flag so the record side (walk-scoped) and the
+    // replay side (outer-body-scoped) cannot leak into each other.
     static OBSERVER_REPLAY: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -69,13 +69,6 @@ enum ObservedCall {
         offset: usize,
         result: i64,
     },
-}
-
-/// Returns whether the current thread is running `JitCodeMachine::run_to_end`
-/// in observer mode (i.e., trace recording).  See `OBSERVER_MODE` doc.
-#[inline(always)]
-pub fn in_observer_mode() -> bool {
-    OBSERVER_MODE.with(|m| m.get())
 }
 
 /// Returns whether the outer interpreter is replaying the call queue left
@@ -454,10 +447,11 @@ pub fn consume_observed_getfield(obj: usize, offset: usize) -> Option<i64> {
     })
 }
 
-/// RAII guard that toggles `OBSERVER_MODE` on for its lifetime.
-struct ObserverGuard {
-    previous: bool,
-}
+/// RAII guard that owns the observed-call replay queue lifecycle for a walk:
+/// it starts the queue empty on `enter` and hands it over to the outer
+/// interpreter on `drop`. The trace-recording mode flag itself lives on the
+/// walk's `TraceCtx` (`observer_mode`), not here.
+struct ObserverGuard;
 
 fn observer_debug() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -501,30 +495,20 @@ pub fn authoritative_executor_enabled() -> bool {
 
 impl ObserverGuard {
     fn enter() -> Self {
-        let previous = OBSERVER_MODE.with(|m| m.replace(true));
         if observer_debug() {
             let n = OBSERVED_CALLS.with(|q| q.borrow().len());
-            eprintln!("[observer] enter (previous={previous}, stale_queue_len={n})");
+            eprintln!("[observer] enter (stale_queue_len={n})");
         }
         // A leftover queue means the previous walk's replay span did not
         // consume exactly what the walker executed; start fresh.
         OBSERVED_CALLS.with(|q| q.borrow_mut().clear());
         OBSERVER_REPLAY.with(|m| m.set(false));
-        Self { previous }
+        Self
     }
 }
 
 impl Drop for ObserverGuard {
     fn drop(&mut self) {
-        OBSERVER_MODE.with(|m| m.set(self.previous));
-        // Hand the executed-call queue over to the outer interpreter: the
-        // mainloop body that runs right after the walk re-runs the walked
-        // span and must REPLAY these calls (consume_observed_*_call)
-        // rather than execute them a second time. This holds for every
-        // walk outcome — on CloseLoop the queue covers one full loop
-        // circuit, on Abort it covers the executed prefix; either way the
-        // outer body consumes the queue in order and falls back to real
-        // execution once it empties.
         // Hand the executed-call queue over to the outer interpreter: the
         // mainloop body that runs right after the walk re-runs the walked
         // span and must REPLAY these calls (consume_observed_*_call)
@@ -545,10 +529,7 @@ impl Drop for ObserverGuard {
         OBSERVER_REPLAY.with(|m| m.set(handover));
         if observer_debug() {
             let n = OBSERVED_CALLS.with(|q| q.borrow().len());
-            eprintln!(
-                "[observer] drop (restore={}, replay_handover={handover}, queue_len={n})",
-                self.previous
-            );
+            eprintln!("[observer] drop (replay_handover={handover}, queue_len={n})");
         }
     }
 }
@@ -3124,7 +3105,7 @@ where
                     bytecode,
                     jitcode::insns::BC_GETFIELD_GC_I_PURE | jitcode::insns::BC_GETFIELD_GC_R_PURE
                 );
-                if !is_pure && in_observer_mode() {
+                if !is_pure && ctx.observer_mode {
                     record_observed_getfield(struct_ptr as usize, offset, loaded);
                 }
                 let kind = if is_ref {
@@ -5121,7 +5102,7 @@ where
                             );
                         }
                     }
-                    if in_observer_mode() {
+                    if ctx.observer_mode {
                         record_observed_void_call(concrete_ptr, &concrete_args);
                     }
                     // `pyjitpl.py:3711-3716 do_not_in_trace_call`:
@@ -5223,7 +5204,7 @@ where
                     // the outer body has no consume_observed_*_call wrapper
                     // for them (replay_kind_for_policy returns None) and
                     // pure re-execution is harmless.
-                    if in_observer_mode() && !effectinfo.check_is_elidable() {
+                    if ctx.observer_mode && !effectinfo.check_is_elidable() {
                         record_observed_void_call(concrete_ptr, &concrete_args);
                     }
                     // pyjitpl.py:2046-2049 — after the residual call,
@@ -5444,7 +5425,7 @@ where
                             );
                         }
                     }
-                    if in_observer_mode() {
+                    if ctx.observer_mode {
                         record_observed_void_call(concrete_ptr, &concrete_args);
                     }
                     // `pyjitpl.py:3711-3716 do_not_in_trace_call`:
@@ -5523,7 +5504,7 @@ where
                             )
                         }
                     };
-                    if in_observer_mode() && !effectinfo.check_is_elidable() {
+                    if ctx.observer_mode && !effectinfo.check_is_elidable() {
                         record_observed_int_call(concrete_ptr, &concrete_args, concrete);
                     }
                     // pyjitpl.py:2046-2049 — vrefs_after_residual_call
@@ -5738,7 +5719,7 @@ where
                             );
                         }
                     }
-                    if in_observer_mode() {
+                    if ctx.observer_mode {
                         record_observed_void_call(concrete_ptr, &concrete_args);
                     }
                     // `pyjitpl.py:3711-3716 do_not_in_trace_call`:
@@ -5814,7 +5795,7 @@ where
                             )
                         }
                     };
-                    if in_observer_mode() && !effectinfo.check_is_elidable() {
+                    if ctx.observer_mode && !effectinfo.check_is_elidable() {
                         record_observed_ref_call(concrete_ptr, &concrete_args, concrete);
                     }
                     // pyjitpl.py:2046-2049 — vrefs_after_residual_call
@@ -5991,7 +5972,7 @@ where
                             );
                         }
                     }
-                    if in_observer_mode() {
+                    if ctx.observer_mode {
                         record_observed_void_call(concrete_ptr, &concrete_args);
                     }
                     // `pyjitpl.py:3711-3716 do_not_in_trace_call`:
@@ -6061,7 +6042,7 @@ where
                             )
                         }
                     };
-                    if in_observer_mode() && !effectinfo.check_is_elidable() {
+                    if ctx.observer_mode && !effectinfo.check_is_elidable() {
                         record_observed_float_call(
                             concrete_ptr,
                             &concrete_args,
@@ -6309,7 +6290,7 @@ where
                         if first_val != 0 {
                             call_void_function(concrete_ptr, &concrete_args);
                             // Always record concrete_ptr (see BC_RESIDUAL_CALL_VOID).
-                            if in_observer_mode() {
+                            if ctx.observer_mode {
                                 record_observed_void_call(concrete_ptr, &concrete_args);
                             }
                         }
@@ -6324,7 +6305,7 @@ where
                         let concrete_result = if first_val == 0 {
                             let result = call_int_function(concrete_ptr, &concrete_args);
                             // Always record concrete_ptr (see BC_RESIDUAL_CALL_VOID).
-                            if in_observer_mode() {
+                            if ctx.observer_mode {
                                 record_observed_int_call(concrete_ptr, &concrete_args, result);
                             }
                             result
@@ -6356,7 +6337,7 @@ where
                             // Ref-shaped result: queue entry uses the Ref
                             // variant so a wrapped Ref policy's
                             // `consume_observed_ref_call` matches.
-                            if in_observer_mode() {
+                            if ctx.observer_mode {
                                 record_observed_ref_call(concrete_ptr, &concrete_args, result);
                             }
                             result
@@ -7210,7 +7191,7 @@ where
 ///
 /// Used by `#[jit_interp]`-generated `__trace_*` wrappers where the outer
 /// Rust mainloop runs the same opcode body alongside the metainterp's
-/// jitcode execution. The observer-mode flag (see [`OBSERVER_MODE`])
+/// jitcode execution. The observer-mode flag (`TraceCtx::observer_mode`)
 /// instructs `run_one_step` to *execute* concrete-side residual function-
 /// pointer calls (BC_CALL_INT / BC_RESIDUAL_CALL_VOID and friends) and
 /// also push each invocation into [`OBSERVED_CALLS`]. The outer mainloop
@@ -7251,7 +7232,11 @@ where
     FLabel: Fn(usize) -> usize,
 {
     let _observer_guard = ObserverGuard::enter();
-    trace_jitcode_with_args(ctx, sym, jitcode, pc, label_at, argboxes)
+    let prev_observer_mode = ctx.observer_mode;
+    ctx.observer_mode = true;
+    let action = trace_jitcode_with_args(ctx, sym, jitcode, pc, label_at, argboxes);
+    ctx.observer_mode = prev_observer_mode;
+    action
 }
 
 /// Observer-mode variant of [`trace_jitcode_with_args_and_runtime`] —
@@ -7272,7 +7257,11 @@ where
     R: JitCodeRuntime,
 {
     let _observer_guard = ObserverGuard::enter();
-    trace_jitcode_with_args_and_runtime(ctx, sym, jitcode, pc, runtime, argboxes)
+    let prev_observer_mode = ctx.observer_mode;
+    ctx.observer_mode = true;
+    let action = trace_jitcode_with_args_and_runtime(ctx, sym, jitcode, pc, runtime, argboxes);
+    ctx.observer_mode = prev_observer_mode;
+    action
 }
 
 /// `b1 is b2` crude fastpath result for comparison opcodes —
