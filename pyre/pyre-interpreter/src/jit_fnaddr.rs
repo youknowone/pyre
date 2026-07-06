@@ -486,6 +486,34 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::try_gc_add_root",
         pyre_object::gc_hook::try_gc_add_root as *const (),
     );
+    // #346: four direct `malloc_typed` (`NewWithVtable`) roots residualised
+    // via `#[dont_look_inside]`; each binds both the qualified module path and
+    // the glob-re-exported root alias. `function_new_impl` lives in this crate
+    // so it binds through `crate::`.
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::bytesobject::w_bytes_from_bytes",
+        "pyre_object::w_bytes_from_bytes",
+        pyre_object::bytesobject::w_bytes_from_bytes as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dictmultiobject::alloc_dict_object",
+        "pyre_object::alloc_dict_object",
+        pyre_object::dictmultiobject::alloc_dict_object as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dictmultiobject::w_module_dict_new_with_storage_proxy",
+        "pyre_object::w_module_dict_new_with_storage_proxy",
+        pyre_object::dictmultiobject::w_module_dict_new_with_storage_proxy as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::function::function_new_impl",
+        "pyre_interpreter::function_new_impl",
+        crate::function::function_new_impl as *const (),
+    );
     push_fnaddr(
         &mut entries,
         "pyre_interpreter::module::_weakref::interp__weakref::dereference",

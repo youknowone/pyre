@@ -35,6 +35,11 @@ impl crate::lltype::GcType for W_BytesObject {
 }
 
 /// Allocate a new bytes object from a byte slice.
+///
+/// Allocates the `W_BytesObject` via `malloc_typed` (`NewWithVtable`) which
+/// the tracer cannot model; the JIT residualises the call instead of tracing
+/// into it (`@dont_look_inside`, `rlib/jit.py:139`).
+#[majit_macros::dont_look_inside]
 pub fn w_bytes_from_bytes(bytes: &[u8]) -> PyObjectRef {
     let len = bytes.len();
     // The `data` Vec lives on the raw heap (manually freed elsewhere),
