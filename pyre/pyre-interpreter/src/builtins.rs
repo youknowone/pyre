@@ -6447,46 +6447,21 @@ fn libm_frexp(v: f64) -> (f64, i32) {
     (f64::from_bits(mantissa_bits), exponent)
 }
 
-/// `pypy/objspace/std/tupleobject.py:358-401 descr_hash` line-by-line
-/// port — xxHash sequence hash (CPython 3.8+ tuple hash):
+/// `tupleobject.py:358-401 descr_hash` — the xxHash sequence hash, delegated
+/// to `rustpython_common::hash::hash_tuple`.  The caller has already computed
+/// each element's hash into `items`, so the fold is infallible here.
 ///
-/// ```python
-/// XXPRIME_1 = 0x9E3779B185EBCA87
-/// XXPRIME_2 = 0xC2B2AE3D27D4EB4F
-/// XXPRIME_5 = 0x27D4EB2F165667C5
-/// xxrotate = lambda x: (x << 31) | (x >> 33)
-///
-/// acc = XXPRIME_5
-/// for w_item in items:
-///     lane = space.hash_w(w_item)
-///     acc += lane * XXPRIME_2
-///     acc = xxrotate(acc)
-///     acc *= XXPRIME_1
-/// acc += len(items) ^ (XXPRIME_5 ^ 3527539)
-/// if acc == -1: acc = 1546275796 + 1
-/// return acc
-/// ```
-const XXPRIME_1: u64 = 11400714785074694791;
-const XXPRIME_2: u64 = 14029467366897019727;
-const XXPRIME_5: u64 = 2870177450012600261;
-
+/// The shared fold reproduces the accumulator loop and length mangle exactly.
+/// It also corrects the `acc == (uint)-1` sentinel: `tupleobject.py:403`
+/// computes `acc += (acc == -1) * (1546275796 + 1)`, so a wrapped `acc` of
+/// `-1` becomes `1546275796` — the value CPython's `tuplehash` also returns.
+/// The prior local port set the result to `1546275796 + 1` instead of adding
+/// to `acc`, an off-by-one in that (2**-64-probability) case; delegation fixes
+/// it.
 #[inline]
 fn _hash_tuple_xx(items: &[i64]) -> i64 {
-    let mut acc: u64 = XXPRIME_5;
-    for &lane in items {
-        acc = acc.wrapping_add((lane as u64).wrapping_mul(XXPRIME_2));
-        // xxrotate: rotate-left 31 bits.
-        acc = acc.rotate_left(31);
-        acc = acc.wrapping_mul(XXPRIME_1);
-    }
-    // Mangle in the length per `tupleobject.py:399`.
-    let n = items.len() as u64;
-    acc = acc.wrapping_add(n ^ (XXPRIME_5 ^ 3527539u64));
-    let mut h = acc as i64;
-    if h == -1 {
-        h = 1546275796 + 1;
-    }
-    h
+    rustpython_common::hash::hash_tuple(items.iter().map(|&h| Ok::<i64, ()>(h)))
+        .expect("element hashes are precomputed, so the fold cannot fail")
 }
 
 /// `pypy/objspace/std/unicodeobject.py:341-345 W_UnicodeObject.hash_w`
@@ -6549,40 +6524,22 @@ pub fn hash_str_bytes(bytes: &[u8]) -> i64 {
     _hash_str(bytes)
 }
 
-/// `pypy/objspace/std/setobject.py:623-642 W_FrozensetObject.descr_hash`
-/// line-by-line port:
+/// `setobject.py:623-642 W_FrozensetObject.descr_hash` — the order-independent
+/// XOR-fold, delegated to `rustpython_common::hash::FrozenSetHash`.  The caller
+/// has already computed each element's hash into `items`.
 ///
-/// ```python
-/// multi = r_uint(1822399083) + r_uint(1822399083) + 1
-/// hash = r_uint(1927868237)
-/// hash *= r_uint(self.length() + 1)
-/// for item in items:
-///     h = space.hash_w(item)
-///     value = (r_uint(h ^ (h << 16) ^ 89869747) * multi)
-///     hash = hash ^ value
-/// hash ^= (hash >> 11) ^ (hash >> 25)
-/// hash = hash * 69069 + 907133923
-/// hash = intmask(hash)
-/// if hash == -1: hash = 590923713
-/// return hash
-/// ```
+/// The shared accumulator is bit-identical: its `shuffle_bits`
+/// `((h ^ 89869747) ^ (h << 16)) * 3644798167` equals the port's
+/// `(h ^ (h << 16) ^ 89869747) * (1822399083 * 2 + 1)` (xor is associative;
+/// `3644798167 == 1822399083 * 2 + 1`), and the seed `(len + 1) * 1927868237`,
+/// the final dispersion, and the `-1 -> 590923713` sentinel all match.
 #[inline]
 fn _hash_frozenset(items: &[i64]) -> i64 {
-    let multi: u64 = 1822399083u64.wrapping_add(1822399083).wrapping_add(1);
-    let mut h: u64 = 1927868237;
-    h = h.wrapping_mul((items.len() as u64).wrapping_add(1));
+    let mut acc = rustpython_common::hash::FrozenSetHash::new(items.len());
     for &item_hash in items {
-        let item_u = item_hash as u64;
-        let v = (item_u ^ item_u.wrapping_shl(16) ^ 89869747u64).wrapping_mul(multi);
-        h ^= v;
+        acc.add(item_hash);
     }
-    h ^= (h >> 11) ^ (h >> 25);
-    h = h.wrapping_mul(69069).wrapping_add(907133923);
-    let mut hi = h as i64;
-    if hi == -1 {
-        hi = 590923713;
-    }
-    hi
+    acc.finish()
 }
 
 /// `pypy/objspace/std/objspace.py StdObjSpace.hash` parity — share one
@@ -9021,6 +8978,33 @@ mod tests {
         assert_eq!(_hash_str(b""), 0);
         assert_eq!(hash_str_bytes(b""), 0);
         assert_ne!(_hash_str(b"a"), 0);
+    }
+
+    /// Tuple and frozenset hashes delegate to `rustpython_common::hash`
+    /// (`hash_tuple` / `FrozenSetHash`).  Both fold only element hashes and are
+    /// seed-independent, so the values are fixed and match CPython 3.14.
+    /// `_hash_tuple_xx` / `_hash_frozenset` take the already-computed element
+    /// hashes; small ints hash to themselves and `hash(-1) == -2`.
+    #[test]
+    fn tuple_and_frozenset_hash_match_cpython() {
+        let h12 = _hash_tuple_xx(&[1, 2]);
+        let h34 = _hash_tuple_xx(&[3, 4]);
+        assert_eq!(_hash_tuple_xx(&[]), 5740354900026072187); // ()
+        assert_eq!(_hash_tuple_xx(&[1]), -6644214454873602895); // (1,)
+        assert_eq!(h12, -3550055125485641917); // (1, 2)
+        assert_eq!(_hash_tuple_xx(&[1, 2, 3]), 529344067295497451);
+        assert_eq!(_hash_tuple_xx(&[-2, 0, 1]), 5003556802939907908); // (-1, 0, 1)
+        assert_eq!(_hash_tuple_xx(&[h12, h34]), -1467267874458550984); // ((1,2), (3,4))
+        assert_eq!(_hash_tuple_xx(&[549755813930, -5]), 6589866070287121549); // (2**100+42, -5)
+
+        // Frozenset fold is order-independent (XOR), so element order is free.
+        let fs1 = _hash_frozenset(&[1]);
+        let fs2 = _hash_frozenset(&[2]);
+        assert_eq!(_hash_frozenset(&[]), 133146708735736); // frozenset()
+        assert_eq!(fs1, -558064481276695278); // frozenset({1})
+        assert_eq!(_hash_frozenset(&[1, 2, 3]), -272375401224217160);
+        assert_eq!(_hash_frozenset(&[-2, 0, 1]), 8868930259606097796); // {-1, 0, 1}
+        assert_eq!(_hash_frozenset(&[fs1, fs2]), 304806268181062474); // {fs{1}, fs{2}}
     }
 
     #[test]
