@@ -349,7 +349,9 @@ fn ensure_jitframe_type_registered(gc: &mut dyn GcAllocator) -> Option<u32> {
 /// Store a GC allocator in the cranelift backend thread-local and
 /// register the `majit_gc::set_active_*` function-pointer hooks,
 /// without requiring a `CraneliftBackend` instance.
-pub fn install_gc_standalone(mut gc: Box<dyn GcAllocator>) {
+/// Install a GC box into TLS and register all `set_active_*` hooks.
+/// Shared by `install_gc_standalone` (production) and `set_gc_allocator` (tests).
+fn install_gc_box(mut gc: Box<dyn GcAllocator>) {
     let jitframe_type_id = ensure_jitframe_type_registered(gc.as_mut());
     gc.freeze_types();
     let supports_guard_gc_type = gc.supports_guard_gc_type();
@@ -381,6 +383,12 @@ pub fn install_gc_standalone(mut gc: Box<dyn GcAllocator>) {
     majit_gc::set_active_gc_owns_object(Some(gc_owns_object_via_active_runtime));
     majit_gc::set_active_gc_id_or_identityhash(Some(id_or_identityhash_via_active_runtime));
     majit_gc::set_active_write_barrier(Some(gc_write_barrier_via_active_runtime));
+}
+
+/// Production path: install a `GcHandle` forwarding to the global singleton.
+pub fn install_gc_standalone(gc_ptr: *mut dyn GcAllocator) {
+    let handle: Box<dyn GcAllocator> = Box::new(majit_gc::GcHandle(gc_ptr));
+    install_gc_box(handle);
 }
 
 /// Follow jf_forward chain to get the final jitframe address.
@@ -7804,7 +7812,7 @@ impl CraneliftBackend {
     }
 
     pub fn set_gc_allocator(&mut self, gc: Box<dyn GcAllocator>) {
-        install_gc_standalone(gc);
+        install_gc_box(gc);
     }
 
     // `set_constants_pool`, `set_next_trace_id`, `set_next_header_pc`

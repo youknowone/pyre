@@ -125,15 +125,17 @@ fn with_dynasm_active_gc<R>(f: impl FnOnce(&dyn majit_gc::GcAllocator) -> R) -> 
 /// requiring a `DynasmBackend` instance.  This allows the GC subsystem
 /// to be installed at boot (via `init_gc_subsystem`) before the JIT
 /// driver is constructed.
-pub fn install_gc_standalone(mut gc: Box<dyn majit_gc::GcAllocator>) {
-    gc.freeze_types();
+/// Install a GC handle into TLS and register all `set_active_*` hooks.
+/// Shared by both `install_gc_standalone` (production: GcHandle to global
+/// singleton) and `set_gc_allocator` (tests: direct Box ownership).
+fn install_gc_box(gc: Box<dyn majit_gc::GcAllocator>) {
     let supports_guard_gc_type = gc.supports_guard_gc_type();
     DYNASM_ACTIVE_GC.with(|cell| {
         let mut guard = cell.borrow_mut();
         *guard = Some(gc);
         let raw = guard
             .as_deref_mut()
-            .map(|gc| gc as *mut dyn majit_gc::GcAllocator);
+            .map(|g| g as *mut dyn majit_gc::GcAllocator);
         DYNASM_ACTIVE_GC_RAW.with(|raw_cell| raw_cell.set(raw));
     });
     majit_gc::set_active_gc_guard_hooks(majit_gc::ActiveGcGuardHooks {
@@ -159,6 +161,14 @@ pub fn install_gc_standalone(mut gc: Box<dyn majit_gc::GcAllocator>) {
     majit_gc::set_active_gc_owns_object(Some(dynasm_gc_owns_object));
     majit_gc::set_active_gc_id_or_identityhash(Some(dynasm_id_or_identityhash));
     majit_gc::set_active_write_barrier(Some(dynasm_gc_write_barrier));
+}
+
+/// Production path: install a `GcHandle` forwarding to the global singleton.
+pub fn install_gc_standalone(gc_ptr: *mut dyn majit_gc::GcAllocator) {
+    let mut handle: Box<dyn majit_gc::GcAllocator> =
+        Box::new(majit_gc::GcHandle(gc_ptr));
+    handle.freeze_types();
+    install_gc_box(handle);
 }
 
 /// Clear both `DYNASM_ACTIVE_GC` and `DYNASM_ACTIVE_GC_RAW`. Callers
@@ -1295,8 +1305,9 @@ impl DynasmBackend {
     /// Dynasm does not have cranelift's runtime-id indirection, so it
     /// mirrors wasm: the live allocator is stored in a thread-local and
     /// exposed through backend-agnostic `majit_gc::ActiveGcGuardHooks`.
-    pub fn set_gc_allocator(&mut self, gc: Box<dyn majit_gc::GcAllocator>) {
-        install_gc_standalone(gc);
+    pub fn set_gc_allocator(&mut self, mut gc: Box<dyn majit_gc::GcAllocator>) {
+        gc.freeze_types();
+        install_gc_box(gc);
     }
 
     /// llmodel.py:64-69 self.vtable_offset configuration.

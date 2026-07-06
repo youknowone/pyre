@@ -771,8 +771,17 @@ type JitDriverPair = (
     std::sync::Arc<majit_metainterp::virtualizable::VirtualizableInfo>,
 );
 
+/// Process-global GC singleton. PyPy has one GC per process (GIL
+/// singleton); pyre mirrors this. The `Mutex` is only held briefly
+/// during `build_gc_global` (write) and `gc_singleton_ptr` (read);
+/// hot-path access goes through the per-thread `GcHandle` in backend TLS.
+static GC_SINGLETON: std::sync::OnceLock<std::sync::Mutex<Box<dyn GcAllocator>>> =
+    std::sync::OnceLock::new();
+
 thread_local! {
-    static GC_SUBSYSTEM_INSTALLED: Cell<bool> = const { Cell::new(false) };
+    /// Per-thread flag: TLS hooks (backend GC pointer, majit_gc
+    /// set_active_* fn-ptrs, pyre_object gc_hook cells) installed.
+    static GC_TLS_INSTALLED: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Build and configure the MiniMarkGC with all type registrations,
@@ -2182,33 +2191,32 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     Box::new(gc)
 }
 
-/// Store the GC allocator into the active backend's thread-local.
+/// Store a `GcHandle` pointing at the global singleton into the active
+/// backend's thread-local.
 #[cfg(target_arch = "wasm32")]
-fn install_gc_into_backend(gc: Box<dyn majit_gc::GcAllocator>) {
-    majit_backend_wasm::install_gc_standalone(gc);
+fn install_gc_into_backend(gc_ptr: *mut dyn majit_gc::GcAllocator) {
+    majit_backend_wasm::install_gc_standalone(gc_ptr);
 }
 #[cfg(all(feature = "cranelift", not(target_arch = "wasm32")))]
-fn install_gc_into_backend(gc: Box<dyn majit_gc::GcAllocator>) {
-    majit_backend_cranelift::install_gc_standalone(gc);
+fn install_gc_into_backend(gc_ptr: *mut dyn majit_gc::GcAllocator) {
+    majit_backend_cranelift::install_gc_standalone(gc_ptr);
 }
 #[cfg(all(
     feature = "dynasm",
     not(feature = "cranelift"),
     not(target_arch = "wasm32")
 ))]
-fn install_gc_into_backend(gc: Box<dyn majit_gc::GcAllocator>) {
-    majit_backend_dynasm::runner::install_gc_standalone(gc);
+fn install_gc_into_backend(gc_ptr: *mut dyn majit_gc::GcAllocator) {
+    majit_backend_dynasm::runner::install_gc_standalone(gc_ptr);
 }
 
-/// Install the GC into the backend thread-local, register root walkers
-/// and pyre-object hook trampolines.
+/// Install TLS hooks: backend GC handle + pyre-object hook trampolines.
 ///
 /// The 4 JIT-only root walkers (`rd_consts`, `partial_trace`,
 /// `active_trace`, `compile_snapshot`) are NOT registered here — they
 /// call `driver_pair()` which would trigger recursive `JIT_DRIVER` init.
-fn install_gc_hooks(gc: Box<dyn majit_gc::GcAllocator>) {
-    // Phase A: backend + pyre-object hooks — safe at boot (no interpreter state).
-    install_gc_into_backend(gc);
+fn install_gc_hooks(gc_ptr: *mut dyn majit_gc::GcAllocator) {
+    install_gc_into_backend(gc_ptr);
     install_pyre_object_hooks();
 }
 
@@ -2306,15 +2314,37 @@ fn install_pyre_object_hooks() {
     pyre_object::gc_hook::register_gc_identity_hash_hook(pyre_object_gc_identity_hash_trampoline);
 }
 
+/// Build the GC once and store it in the process-global singleton.
+/// `OnceLock::get_or_init` ensures exactly one thread runs `build_gc()`
+/// even under cargo test's parallel threads.
+fn build_gc_global() {
+    GC_SINGLETON.get_or_init(|| std::sync::Mutex::new(build_gc()));
+}
+
+/// Raw pointer to the global GC singleton for TLS handle creation.
+/// The Mutex is locked only briefly here; the returned `*mut` is
+/// used by `GcHandle` which forwards through the raw pointer.
+/// All hot-path access goes through the per-thread `GcHandle`.
+fn gc_singleton_ptr() -> *mut dyn GcAllocator {
+    let mutex = GC_SINGLETON.get().expect("GC singleton not initialized");
+    let mut guard = mutex.lock().unwrap();
+    guard.as_mut() as *mut dyn GcAllocator
+}
+
 /// Initialize the GC subsystem independently of the JIT driver.
-/// Idempotent: subsequent calls are no-ops.
+///
+/// Phase 1 (process-global, once): build MiniMarkGC, type registry,
+/// subclass ranges.
+/// Phase 2 (per-thread, idempotent): install TLS hooks so the backend
+/// trampolines and pyre_object hooks reach the global GC.
 pub fn init_gc_subsystem() {
-    if GC_SUBSYSTEM_INSTALLED.with(|c| c.get()) {
+    build_gc_global();
+    if GC_TLS_INSTALLED.with(|c| c.get()) {
         return;
     }
-    let gc = build_gc();
-    install_gc_hooks(gc);
-    GC_SUBSYSTEM_INSTALLED.with(|c| c.set(true));
+    let gc_ptr = gc_singleton_ptr();
+    install_gc_hooks(gc_ptr);
+    GC_TLS_INSTALLED.with(|c| c.set(true));
 }
 
 thread_local! {

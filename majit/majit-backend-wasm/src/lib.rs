@@ -211,8 +211,8 @@ fn with_wasm_active_gc<R>(f: impl FnOnce(&dyn GcAllocator) -> R) -> Option<R> {
 /// Store a GC allocator in the wasm backend thread-local and register
 /// the `majit_gc::set_active_*` function-pointer hooks, without
 /// requiring a `WasmBackend` instance.
-pub fn install_gc_standalone(mut gc: Box<dyn majit_gc::GcAllocator>) {
-    gc.freeze_types();
+/// Install a GC box into TLS and register all `set_active_*` hooks.
+fn install_gc_box(gc: Box<dyn majit_gc::GcAllocator>) {
     let supports_guard_gc_type = gc.supports_guard_gc_type();
     WASM_ACTIVE_GC.with(|cell| {
         let mut guard = cell.borrow_mut();
@@ -236,6 +236,14 @@ pub fn install_gc_standalone(mut gc: Box<dyn majit_gc::GcAllocator>) {
     majit_gc::set_active_write_barrier(Some(wasm_active_gc_write_barrier));
     majit_gc::set_active_collect_oldgen(Some(wasm_collect_oldgen_nonmoving));
     majit_gc::set_active_heap_stats(Some(active_gc_heap_stats));
+}
+
+/// Production path: install a `GcHandle` forwarding to the global singleton.
+pub fn install_gc_standalone(gc_ptr: *mut dyn majit_gc::GcAllocator) {
+    let mut handle: Box<dyn majit_gc::GcAllocator> =
+        Box::new(majit_gc::GcHandle(gc_ptr));
+    handle.freeze_types();
+    install_gc_box(handle);
 }
 
 /// Diagnostic only: `(oldgen_total_bytes, nursery_used_bytes)` of the GC owned
@@ -753,8 +761,9 @@ impl WasmBackend {
     /// `ActiveGcGuardHooks` so the backend-agnostic optimizer /
     /// blackhole executor reach the live allocator without taking a
     /// wasm dependency.
-    pub fn set_gc_allocator(&mut self, gc: Box<dyn majit_gc::GcAllocator>) {
-        install_gc_standalone(gc);
+    pub fn set_gc_allocator(&mut self, mut gc: Box<dyn majit_gc::GcAllocator>) {
+        gc.freeze_types();
+        install_gc_box(gc);
     }
 
     /// llmodel.py:64-69 self.vtable_offset configuration.
