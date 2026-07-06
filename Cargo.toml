@@ -148,6 +148,9 @@ sha1 = "0.10"
 sha2 = "0.10"
 sha3 = "0.10"
 blake2 = "0.10"
+# zlib backend (pyre-native only): zlib-rs is a pure-Rust zlib port whose
+# DEFLATE output is byte-identical to the reference C zlib.
+flate2 = { version = "1.1.9", default-features = false }
 
 # math
 pymath = { version = "0.2.0", features = ["malachite-bigint"] }

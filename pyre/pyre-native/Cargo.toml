@@ -12,3 +12,4 @@ sha1 = { workspace = true }
 sha2 = { workspace = true }
 sha3 = { workspace = true }
 blake2 = { workspace = true }
+flate2 = { workspace = true, features = ["zlib-rs"] }

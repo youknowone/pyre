@@ -5,3 +5,4 @@
 //! lowered into the meta-traceable `.ullbc`.
 
 pub mod hash;
+pub mod zlib;
