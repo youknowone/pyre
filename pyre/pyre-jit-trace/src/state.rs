@@ -1543,64 +1543,93 @@ pub(crate) fn bridge_semantic_maps_at_with_jitcode_pc(
         // `liveness_py_pc = guard_py_pc` keying. The guard PC is where the
         // computed kept operand-stack temps are live; at the merge-target PC
         // they've been consumed and carry no pcdep entry.
-        let real_pc = if jitcode_pc != majit_ir::resumedata::NO_JITCODE_PC && jitcode_pc >= 0 {
+        // Index the py_pc-keyed depth/pcdep tables at a resolved Python PC.
+        let via_py_pc = |rp: usize| {
+            let depth = payload.metadata.depth_at_py_pc.get(rp).copied().unwrap_or(0) as usize;
+            let pcdep = payload
+                .metadata
+                .pcdep_color_slots
+                .get(rp)
+                .cloned()
+                .unwrap_or_default();
+            (depth, pcdep)
+        };
+        let (stack_depth_at_pc, pcdep_entries) = if jitcode_pc
+            != majit_ir::resumedata::NO_JITCODE_PC
+            && jitcode_pc >= 0
+        {
             let jp = jitcode_pc as usize;
             // Validate with `can_decode_live_vars` — symmetric with the
             // liveness decode in `resolve_resume_pc_with_jitcode_pc`.
             // A non-decodable carried coordinate falls back to the
             // merge-target PC so liveness and pcdep key the same point.
             if payload.jitcode.can_decode_live_vars(jp, sd.op_live) {
-                let rp = crate::jitcode_dispatch::python_pc_for_jitcode_pc(&payload.metadata, jp)
-                    as usize;
-                // task#50 phase-1: certify the predecessor-keyed jitcode-pc twins
-                // reproduce the py_pc-indexed pcdep/depth this seam still reads
-                // via the re-inversion. When the carried `jitcode_pc` resolves to
-                // `rp`, the twins keyed on `jp` must equal the tables keyed on
-                // `rp` (both compile-time derivations of the same coordinates).
-                // This is the precondition certificate for consuming the twins
-                // from `jp` directly and retiring the re-inversion. Off in
-                // production → byte-identical.
-                if crate::jitcode_dispatch::bridge_audit_enabled() {
-                    if let Some(twin) = payload.pcdep_for_jitcode_pc(jp) {
-                        let via_py = payload
-                            .metadata
-                            .pcdep_color_slots
-                            .get(rp)
-                            .cloned()
-                            .unwrap_or_default();
-                        assert_eq!(
-                            twin, via_py,
-                            "pcdep_by_jit_pc diverges from pcdep_color_slots at jp={jp} rp={rp}"
-                        );
+                // Decode-identity path: source depth/pcdep directly from the
+                // carried genuine `jitcode_pc` via the predecessor-keyed twins,
+                // bypassing the `python_pc_for_jitcode_pc` re-inversion. Valid
+                // exactly where the twins are populated (a colored jitcode); the
+                // equality with the py_pc tables is what `PYRE_PCMAP_BRIDGE_AUDIT`
+                // certifies. Portal bridges have empty twins → fall through to the
+                // re-inversion, which still keys the populated `depth_at_py_pc`.
+                let via_twin = if crate::jitcode_dispatch::bridge_jitcode_enabled() {
+                    match (
+                        payload.depth_for_jitcode_pc_pred(jp),
+                        payload.pcdep_for_jitcode_pc(jp),
+                    ) {
+                        (Some(depth), Some(pcdep)) => Some((depth as usize, pcdep)),
+                        _ => None,
                     }
-                    if let Some(twin_d) = payload.depth_for_jitcode_pc_pred(jp) {
-                        let via_py_d =
-                            payload.metadata.depth_at_py_pc.get(rp).copied().unwrap_or(0);
-                        assert_eq!(
-                            twin_d, via_py_d,
-                            "depth_pred_by_jit_pc diverges from depth_at_py_pc at jp={jp} rp={rp}"
-                        );
+                } else {
+                    None
+                };
+                match via_twin {
+                    Some(pair) => pair,
+                    None => {
+                        let rp =
+                            crate::jitcode_dispatch::python_pc_for_jitcode_pc(&payload.metadata, jp)
+                                as usize;
+                        // task#50 phase-1: certify the predecessor-keyed jitcode-pc
+                        // twins reproduce the py_pc-indexed pcdep/depth this seam
+                        // reads via the re-inversion. When the carried `jitcode_pc`
+                        // resolves to `rp`, the twins keyed on `jp` must equal the
+                        // tables keyed on `rp` (both compile-time derivations of the
+                        // same coordinates). This is the precondition certificate for
+                        // the decode-identity path above. Off in production.
+                        if crate::jitcode_dispatch::bridge_audit_enabled() {
+                            if let Some(twin) = payload.pcdep_for_jitcode_pc(jp) {
+                                let via_py = payload
+                                    .metadata
+                                    .pcdep_color_slots
+                                    .get(rp)
+                                    .cloned()
+                                    .unwrap_or_default();
+                                assert_eq!(
+                                    twin, via_py,
+                                    "pcdep_by_jit_pc diverges from pcdep_color_slots at jp={jp} rp={rp}"
+                                );
+                            }
+                            if let Some(twin_d) = payload.depth_for_jitcode_pc_pred(jp) {
+                                let via_py_d = payload
+                                    .metadata
+                                    .depth_at_py_pc
+                                    .get(rp)
+                                    .copied()
+                                    .unwrap_or(0);
+                                assert_eq!(
+                                    twin_d, via_py_d,
+                                    "depth_pred_by_jit_pc diverges from depth_at_py_pc at jp={jp} rp={rp}"
+                                );
+                            }
+                        }
+                        via_py_pc(rp)
                     }
                 }
-                rp
             } else {
-                majit_ir::resumedata::decode_resume_pc(pc).0 as usize
+                via_py_pc(majit_ir::resumedata::decode_resume_pc(pc).0 as usize)
             }
         } else {
-            majit_ir::resumedata::decode_resume_pc(pc).0 as usize
+            via_py_pc(majit_ir::resumedata::decode_resume_pc(pc).0 as usize)
         };
-        let stack_depth_at_pc = payload
-            .metadata
-            .depth_at_py_pc
-            .get(real_pc)
-            .copied()
-            .unwrap_or(0) as usize;
-        let pcdep_entries = payload
-            .metadata
-            .pcdep_color_slots
-            .get(real_pc)
-            .cloned()
-            .unwrap_or_default();
         BridgeSemanticMaps {
             is_portal_bridge: payload.is_portal_bridge(),
             // #73: the codewriter colored this jitcode iff `pcdep_color_slots`

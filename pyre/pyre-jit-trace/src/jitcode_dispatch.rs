@@ -8998,6 +8998,20 @@ pub(crate) fn bridge_audit_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_BRIDGE_AUDIT").is_some())
 }
 
+/// `PYRE_M366_BRIDGE_JITCODE` (default OFF) consumes the predecessor-keyed
+/// `pcdep_by_jit_pc` / `depth_pred_by_jit_pc` twins directly from the carried
+/// genuine `jitcode_pc` at `bridge_semantic_maps_at_with_jitcode_pc`, instead of
+/// re-inverting the coordinate to a Python PC via `python_pc_for_jitcode_pc` and
+/// indexing the py_pc-keyed `pcdep_color_slots` / `depth_at_py_pc`. The equality
+/// this relies on is the one `PYRE_PCMAP_BRIDGE_AUDIT` certifies. This is the
+/// decode-side identity step toward retiring the `pc_map` re-inversion — a
+/// behavioral flip validated by that audit certificate plus full corpus, since
+/// no byte-identical fallback exists once the re-inversion is bypassed.
+pub(crate) fn bridge_jitcode_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_M366_BRIDGE_JITCODE").is_some())
+}
+
 pub(crate) fn python_pc_for_jitcode_pc(metadata: &crate::PyJitCodeMetadata, jit_pc: usize) -> u32 {
     // Exact inverse: `first_jit_pc_by_py_pc[py]` is the byte offset of the
     // FIRST instruction opcode `py` emitted (`usize::MAX` = the PC emitted
