@@ -45,6 +45,8 @@ pyre-sandbox = { workspace = true, optional = true }
 libc = { workspace = true }
 siphasher = { workspace = true }
 caseless = { workspace = true }
+base64 = { workspace = true }
+crc32fast = { workspace = true }
 indexmap = { workspace = true }
 paste = { workspace = true }
 unicode-xid = { workspace = true }

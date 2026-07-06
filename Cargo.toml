@@ -151,6 +151,9 @@ blake2 = "0.10"
 # zlib backend (pyre-native only): zlib-rs is a pure-Rust zlib port whose
 # DEFLATE output is byte-identical to the reference C zlib.
 flate2 = { version = "1.1.9", default-features = false }
+# binascii transforms (pure-Rust logic).
+base64 = "0.22"
+crc32fast = "1.4"
 
 # math
 pymath = { version = "0.2.0", features = ["malachite-bigint"] }

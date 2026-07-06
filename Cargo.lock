@@ -2034,7 +2034,9 @@ dependencies = [
 name = "pyre-interpreter"
 version = "0.0.2"
 dependencies = [
+ "base64",
  "caseless",
+ "crc32fast",
  "indexmap",
  "libc",
  "lz4_flex",
