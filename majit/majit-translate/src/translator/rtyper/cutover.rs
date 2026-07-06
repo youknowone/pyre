@@ -2104,6 +2104,8 @@ pub(crate) fn register_unsafe_fn_stubs(
 ///
 /// - `core::mem::swap(&mut T, &mut T)` returns `()` — an in-place swap,
 ///   `Void` result.
+/// - `core::cell::Cell::<T>::set(&self, val)` returns `()` — an
+///   in-place store into the cell, `Void` result.
 /// - `core::f64::<Impl>::is_infinite` / `core::slice::<Impl>::is_empty`
 ///   return `bool` — `Bool` result.
 /// - `std::f64::<Impl>::floor` / `std::f64::<Impl>::powf` return `f64` —
@@ -2122,6 +2124,11 @@ pub(crate) fn register_unsafe_fn_stubs(
 /// "not registered" Skip until their result type can be modeled.
 const FOREIGN_STDLIB_EXTERNALS: &[(&[&str], &[&str], LowLevelType)] = &[
     (&["core", "mem", "swap"], &["x", "y"], LowLevelType::Void),
+    (
+        &["cell", "Cell", "set"],
+        &["self", "val"],
+        LowLevelType::Void,
+    ),
     (
         &["core", "f64", "<Impl>", "is_infinite"],
         &["self"],

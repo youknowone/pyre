@@ -522,6 +522,12 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     );
     push_alias_pair(
         &mut entries,
+        "pyre_object::module::w_module_new_aliasing_dict",
+        "pyre_object::w_module_new_aliasing_dict",
+        pyre_object::module::w_module_new_aliasing_dict as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
         "pyre_interpreter::function::function_new_impl",
         "pyre_interpreter::function_new_impl",
         crate::function::function_new_impl as *const (),

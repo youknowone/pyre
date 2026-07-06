@@ -127,6 +127,15 @@ pub fn w_module_new(name: &str, dict_ptr: *mut u8) -> PyObjectRef {
 /// setitem is skipped — the subclass's own `__init__` is responsible
 /// for seeding `__name__` (matching PyPy `moduledef.py:102-103
 /// Module(space, None, w_builtin)` where `w_name=None`).
+///
+/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py:139`):
+/// the body performs an unported `lltype::malloc_typed` NewWithVtable
+/// (`Module`) that survives `fuse_boxing_alloc` unfused, so the JIT
+/// residualises the whole call to a stable runtime fnaddr instead of
+/// tracing the allocation — the `w_module_dict_new_with_storage_proxy`
+/// twin.  The `-> PyObjectRef` result is a plain GCREF with no
+/// discriminant to erase.
+#[majit_macros::dont_look_inside]
 pub fn w_module_new_aliasing_dict(
     name: &str,
     _dict_ptr: *mut u8,
