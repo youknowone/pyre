@@ -1075,6 +1075,28 @@ pub fn frame_value_count_at(jitcode_index: i32, pc: i32, carried_jitcode_pc: i32
     })
 }
 
+/// Resolve the JitCode byte offset the full-body walk should RESUME at for a
+/// bridge whose guard carried `carried_jitcode_pc`. Mirrors the blackhole's
+/// `resolve_resume_pc_with_jitcode_pc` (`call_jit.rs` `resolve_jitcode`): a
+/// kept-stack branch guard resumes at its OWN mid-opcode jitcode offset (the
+/// `goto_if_not`), not the opcode-entry marker `pc_map[py_pc]` — re-executing
+/// the whole opcode from entry would read abstract-register colors dead at the
+/// guard. Returns `None` when no coordinate resolves (the caller keeps the
+/// `pc_map` entry).
+pub fn resolve_bridge_walk_entry_at(
+    jitcode_index: i32,
+    pc: i32,
+    carried_jitcode_pc: i32,
+) -> Option<usize> {
+    ensure_finish_setup();
+    METAINTERP_SD.with(|r| {
+        let sd = r.borrow();
+        let jc = sd.jitcodes.get(jitcode_index as usize)?;
+        jc.payload
+            .resolve_resume_pc_with_jitcode_pc(pc, carried_jitcode_pc, sd.op_live)
+    })
+}
+
 /// virtualizable.py:86-98 `read_boxes` parity: assemble the
 /// `virtualizable_boxes` layout the tracing-time vable mirror expects
 /// and hand it to `TraceCtx::init_virtualizable_boxes`. Used by both
@@ -2007,6 +2029,19 @@ pub struct PyreSym {
     /// back to NONE, and so the full-body-walk argbox seed can recover the
     /// kept conditional-expression / short-circuit value (#124).
     pub(crate) bridge_stack_oprefs: Option<Vec<OpRef>>,
+    /// Kept-stack branch-guard resume coordinate for the full-body walk: the
+    /// guard's OWN jitcode byte offset (`frame0.jitcode_pc`, the mid-opcode
+    /// `goto_if_not`), resolved the same way the blackhole resolves its
+    /// `setposition` (`resolve_resume_pc_with_jitcode_pc`).  A chained-compare /
+    /// short-circuit guard resumes mid-opcode: the opcode-entry marker
+    /// (`pc_map[py_pc]`) re-executes the whole comparison from the top, reading
+    /// abstract-register colors that were live at entry but dead (recolored /
+    /// consumed) at the guard — colors the guard snapshot never preserved.  The
+    /// walk must resume where the blackhole does (the guard offset), so the
+    /// re-executed suffix only reads colors the resume data actually carries.
+    /// `None` for a non-branch-guard / portal-bridge resume, where the walk
+    /// keeps the `pc_map[py_pc]` opcode-entry offset.
+    pub(crate) bridge_walk_entry_pc: Option<usize>,
     /// The color-indexed Ref register bank as `consume_boxes`
     /// (resume.py:1055) fills `f.registers_r` — one box per abstract
     /// register color the guard's resume numbering named. This is the
@@ -3857,6 +3892,7 @@ impl PyreSym {
             nlocals: 0,
             bridge_local_oprefs: None,
             bridge_stack_oprefs: None,
+            bridge_walk_entry_pc: None,
             bridge_registers_r: None,
             bridge_local_types: None,
             vable_last_instr: OpRef::NONE,
@@ -7725,10 +7761,13 @@ impl JitState for PyreJitState {
                 backend,
                 &mut virtuals_cache,
             );
-            if seed_bridge_locals
-                && !seed_deferred_to_overlay
-                && !matches!(concrete_val, majit_ir::Value::Void)
-            {
+            // The Int bank is color-indexed (no slot overlay to defer to), and
+            // for a kept-stack branch guard the walk resumes at the guard's own
+            // coordinate where `reg_indices.int` colors are authoritative — so
+            // stamp the concrete directly here (the `seed_deferred_to_overlay`
+            // deferral only applies to the Ref slot-mirror). The guard's
+            // GUARD_TRUE/GUARD_FALSE needs this concrete to fold its direction.
+            if seed_bridge_locals && !matches!(concrete_val, majit_ir::Value::Void) {
                 ctx.try_set_opref_concrete(resolved, concrete_val);
             }
             let reg_idx = reg_idx as usize;
@@ -8237,6 +8276,21 @@ impl JitState for PyreJitState {
         // rebuilt registers_r and the full-body-walk argbox seed recover the
         // kept conditional-expression / short-circuit value.
         sym.bridge_stack_oprefs = Some(bridge_stack);
+        // Kept-stack branch guards (`frame0.jitcode_pc != NO_JITCODE_PC`) resume
+        // the full-body walk at the guard's OWN mid-opcode jitcode offset — the
+        // same coordinate the blackhole `setposition`s to — instead of the
+        // opcode-entry marker `pc_map[py_pc]`. Resolve it now (identical to the
+        // blackhole's `resolve_resume_pc_with_jitcode_pc`) and hand it to
+        // `run_perfn_walk` via `sym`. `None` leaves the walk on the pc_map entry.
+        sym.bridge_walk_entry_pc = if frame0.jitcode_pc != majit_ir::resumedata::NO_JITCODE_PC {
+            crate::state::resolve_bridge_walk_entry_at(
+                frame0.jitcode_index,
+                frame0.pc,
+                frame0.jitcode_pc,
+            )
+        } else {
+            None
+        };
         sym.bridge_local_types = Some(bridge_local_types);
         // consume_boxes (resume.py:1055) fills `f.registers_r` by abstract
         // register color; keep that color-indexed decode so a cross-frame

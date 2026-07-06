@@ -315,6 +315,7 @@ fn dispatch_perfn_frame(
     pjc: &std::sync::Arc<crate::PyJitCode>,
     entry: usize,
     argboxes_r: &[majit_ir::OpRef],
+    argboxes_i: &[majit_ir::OpRef],
     authoritative: bool,
 ) -> Option<(usize, PerfnWalkResult)> {
     // Resolve the five terminal descrs off MetaInterpStaticData so the
@@ -414,7 +415,7 @@ fn dispatch_perfn_frame(
         pjc.jitcode.constants_i.as_slice(),
         pjc.jitcode.constants_f.as_slice(),
         argboxes_r,
-        &[],
+        argboxes_i,
         &[],
     );
     Some((code_len, walk_result))
@@ -895,7 +896,7 @@ fn run_perfn_walk(
         eprintln!("[walk-perfn] no per-CodeObject PyJitCode for code={w_code:?}");
         return None;
     };
-    let Some(entry) = pjc.resume_jitcode_pc_for(start_pc) else {
+    let Some(pc_map_entry) = pjc.resume_jitcode_pc_for(start_pc) else {
         // The frozen pc_map of this already-built body does not encode
         // `start_pc` as a resume coordinate, so the same body walked from
         // the same entry recurs identically on every retrace.  Decline the
@@ -911,6 +912,15 @@ fn run_perfn_walk(
         fbw_decline(crate::driver::make_green_key(w_code, start_pc));
         return None;
     };
+    // A kept-stack branch-guard bridge resumes at the guard's OWN mid-opcode
+    // jitcode offset (`setup_bridge_sym` resolved it into
+    // `sym.bridge_walk_entry_pc`, the same coordinate the blackhole
+    // `setposition`s to) — NOT the opcode-entry marker `pc_map[start_pc]`.
+    // Resuming at the entry marker re-executes the whole opcode from the top,
+    // reading abstract-register colors that were live at entry but dead
+    // (recolored / already consumed) at the guard, which the guard's resume
+    // data never preserved. See the field doc on `PyreSym::bridge_walk_entry_pc`.
+    let entry = sym.bridge_walk_entry_pc.unwrap_or(pc_map_entry);
     // The full-body walk drives a PORTAL trace, so the body must carry
     // the portal entry shape (`FrameInputs::Portal`: `[frame, ec]` red
     // inputs + the frame-vable locals prologue).  A body first compiled
@@ -1054,21 +1064,43 @@ fn run_perfn_walk(
         // expression / short-circuit / chained-compare value.  Leaving e.g.
         // the pycode green at the kept temp's color feeds a stale code object
         // into its binary op (`unsupported operand type(s) for +: 'code' and
-        // 'int'`).  Override the kept operand-stack colors
-        // [nlocals..nlocals+stack_only) with the resume-data OpRefs
-        // setup_bridge_sym resolved; in that semantic prefix the abstract-
-        // register color equals the semantic slot.  Locals (read through the
-        // vable) and frame/ec (at their own colors) keep the seeding above.
+        // 'int'`).  Seed the guard's live abstract-register colors from the
+        // resume-data OpRefs setup_bridge_sym resolved.  Locals (read through
+        // the vable) and frame/ec (at their own colors) keep the seeding above.
         //
-        // The `nl + i` slot→color shortcut collides with a red-input color
-        // when `portal_frame_reg == nlocals` (e.g. fib: frame=r1, nlocals=1,
-        // so operand-stack slot 0 → color 1 == frame).  A kept operand-stack
-        // temp never occupies a red-input color, so skip those: seeding a temp
-        // over the frame color overwrites the standard virtualizable identity
-        // and forces every later `vable_*` op onto the nonstandard leg
-        // (NonStandardVableFinishPortalUnsupported abort).
+        // A kept operand-stack temp never occupies a red-input color, so skip
+        // `reserved_red_colors`: seeding a temp over the frame color overwrites
+        // the standard virtualizable identity and forces every later `vable_*`
+        // op onto the nonstandard leg (NonStandardVableFinishPortalUnsupported
+        // abort).
         if is_bridge_trace {
-            if let Some(ref bridge_stack) = sym.bridge_stack_oprefs {
+            if sym.bridge_walk_entry_pc.is_some() {
+                // Kept-stack branch guard resumed at the guard's own jitcode
+                // offset (`entry` above).  The live registers there are the
+                // guard-time abstract-register colors the resume data decoded
+                // into `bridge_registers_r` (color-indexed, `consume_boxes`
+                // parity, resume.py:1055) — the SAME bank the blackhole's
+                // `init_register_files` + resume fill would hold.  Seed each
+                // non-NONE color directly; the `nlocals + depth` slot→color
+                // shortcut below is wrong here because a kept temp's abstract
+                // color is not `nlocals + depth` under free register coloring.
+                if let Some(ref bridge_regs_r) = sym.bridge_registers_r {
+                    for (color, &opref) in bridge_regs_r.iter().enumerate() {
+                        if opref.is_none() {
+                            continue;
+                        }
+                        let color = color as u8;
+                        if reserved_red_colors.contains(&color) {
+                            continue;
+                        }
+                        seed(color, opref);
+                    }
+                }
+            } else if let Some(ref bridge_stack) = sym.bridge_stack_oprefs {
+                // Non-branch-guard / portal-bridge resume at the opcode-entry
+                // marker: in the semantic prefix the abstract-register color
+                // equals the semantic slot, so the `nlocals + depth` slot→color
+                // shortcut over the slot-indexed `bridge_stack_oprefs` holds.
                 let nl = sym.nlocals;
                 for (i, &opref) in bridge_stack.iter().enumerate() {
                     if !opref.is_none() {
@@ -1145,8 +1177,30 @@ fn run_perfn_walk(
         v
     };
 
+    // Int-bank seed for a kept-stack branch-guard bridge: the guard reads its
+    // condition from an Int register (the `b < 9` compare result) that ran
+    // BEFORE the guard, so resuming at the guard offset requires it from the
+    // resume data. `setup_bridge_sym` decoded the Int bank color-indexed into
+    // `sym.registers_i` (concrete already stamped there); pass it positionally
+    // so `dispatch_via_miframe` writes `top_regs_i[color] = value`. Empty for a
+    // non-branch-guard resume (`bridge_walk_entry_pc == None`), where the walk
+    // enters at the opcode boundary with no live mid-opcode Int temps.
+    let argboxes_i: Vec<majit_ir::OpRef> = if sym.bridge_walk_entry_pc.is_some() {
+        // Clamp to the jitcode's Int register count: `sym.registers_i` may carry
+        // trailing scratch/constant colors beyond `num_regs_i`, and
+        // `dispatch_via_miframe` rejects an argbox list longer than the callee
+        // bank (`InlineCallIntArityMismatch`). Only the leading `num_regs_i`
+        // colors are real Int registers the walk reads.
+        let num_regs_i = pjc.jitcode.num_regs_i() as usize;
+        let mut v = sym.registers_i.clone();
+        v.truncate(num_regs_i);
+        v
+    } else {
+        Vec::new()
+    };
+
     let Some((code_len, mut walk_result)) =
-        dispatch_perfn_frame(&mut mi, &pjc, entry, &argboxes_r, authoritative)
+        dispatch_perfn_frame(&mut mi, &pjc, entry, &argboxes_r, &argboxes_i, authoritative)
     else {
         return None;
     };
