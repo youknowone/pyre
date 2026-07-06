@@ -2583,6 +2583,13 @@ pub fn is_w(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
     // identity — the exact-type gate excludes both (a `bool`'s
     // `w_class` is `bool`, a subclass instance's is the subclass), so
     // they fall through to the `ptr::eq` above.
+    //
+    // Tagged immediates need no special case: `is_exact_type` reports a
+    // tagged int as an exact `int` (never a subclass — those stay boxed),
+    // and `range_obj_to_bigint` reads its value through the tag-aware
+    // `w_int_get_value`. Two equal-valued immediates already matched the
+    // `ptr::eq` above (identical bit patterns); an immediate and a boxed
+    // int of the same value fall here and compare equal by value.
     unsafe {
         if pyre_object::pyobject::is_exact_type(w_one, &pyre_object::pyobject::INT_TYPE)
             && pyre_object::pyobject::is_exact_type(w_two, &pyre_object::pyobject::INT_TYPE)
