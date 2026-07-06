@@ -586,14 +586,21 @@ pub trait GcAllocator: Send {
 /// so the ~45 trampoline functions per backend keep their existing
 /// `RefCell<Option<Box<dyn GcAllocator>>>` access pattern unchanged.
 ///
-/// # Safety
+/// # Safety — NOT thread-safe (gh#396)
+///
 /// The pointee must outlive every `GcHandle` (guaranteed: the global
-/// singleton is never dropped). Only one thread calls mutating methods
-/// at a time (pyre is single-threaded, GIL-equivalent).
+/// singleton is never dropped). Multiple threads may hold `GcHandle`s
+/// to the same singleton and call `&mut self` methods (alloc, collect,
+/// write_barrier) concurrently — this is a data race (UB). pyre
+/// currently has no GIL; production code is single-threaded only
+/// because the `_thread` module is a stub. Per-access Mutex is NOT
+/// a fix — with a moving collector, thread A's collection cannot see
+/// thread B's roots; only GIL or safepoints solve this. See gh#396.
 pub struct GcHandle(pub *mut dyn GcAllocator);
 
-// SAFETY: pyre is single-threaded (GIL-equivalent). The raw pointer
-// targets the process-global GC singleton that outlives all threads.
+// The raw pointer targets the process-global GC singleton that outlives
+// all threads. Send is needed so Box<GcHandle> can be stored in TLS.
+// NOT Sync — concurrent &mut access is unsound (gh#396).
 unsafe impl Send for GcHandle {}
 
 impl GcAllocator for GcHandle {

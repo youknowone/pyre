@@ -775,12 +775,34 @@ type JitDriverPair = (
 /// singleton); pyre mirrors this. The `Mutex` is only held briefly
 /// during `build_gc_global` (write) and `gc_singleton_ptr` (read);
 /// hot-path access goes through the per-thread `GcHandle` in backend TLS.
+///
+/// # Safety — NOT thread-safe (see gh#396)
+///
+/// `GcHandle` stores a raw `*mut dyn GcAllocator` into this singleton
+/// and bypasses the Mutex on every subsequent access. If two OS threads
+/// call `&mut self` methods (alloc, collect, write_barrier) concurrently
+/// through their respective `GcHandle`s, that is a data race (UB).
+/// PyPy avoids this because GIL serialises all Python execution; pyre
+/// has no GIL, so this is unsound under true multi-threading. The
+/// downstream TLS hooks (`GC_TLS_INSTALLED`, backend `*_ACTIVE_GC`,
+/// `majit_gc::set_active_*`, `pyre_object::gc_hook::*`) inherit the
+/// same unsoundness: each thread installs its own `GcHandle` to the
+/// shared singleton, and nothing prevents concurrent mutation.
+///
+/// Current production code is single-threaded in practice (the `_thread`
+/// module is a stub), so this does not manifest today. Per-access Mutex
+/// is NOT a fix — with a moving collector, thread A's collection cannot
+/// see thread B's roots; only GIL or safepoints solve this (PyPy's GIL
+/// IS the GC's lock: `thread_gil.c`). Tracked in gh#396 (rgil port).
 static GC_SINGLETON: std::sync::OnceLock<std::sync::Mutex<Box<dyn GcAllocator>>> =
     std::sync::OnceLock::new();
 
 thread_local! {
     /// Per-thread flag: TLS hooks (backend GC pointer, majit_gc
     /// set_active_* fn-ptrs, pyre_object gc_hook cells) installed.
+    ///
+    /// See `GC_SINGLETON` safety note — this flag and the hooks it
+    /// guards are not thread-safe under true multi-threading (gh#396).
     static GC_TLS_INSTALLED: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -1881,6 +1903,27 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     pytype_to_tid.insert(
         &pyre_object::pyobject::COMPLEX_TYPE as *const _ as usize,
         w_complex_tid,
+    );
+    // `W_ObjectObject.storage` block — the mapdict instance attribute-value
+    // array (`mapdict.py:910`, `Ptr(GcArray(OBJECTPTR))`).  Registered as a
+    // varsize leaf: the custom trace on the W_ObjectObject instance walks
+    // each boxed storage slot by consulting the map to skip unboxed slots
+    // (`instance_walk_boxed_storage`), and forwards this block pointer to
+    // keep the (non-moving, stable-allocated) block marked live.  Length at
+    // offset 0 (the `ItemsBlock.capacity` header), 8-byte ref items.
+    // Registered here, immediately after `W_COMPLEX_GC_TYPE_ID = 54`, so it
+    // takes tid 55 before the runtime-numbered `#[pyre_class]` / per-ExcKind
+    // registrations below.
+    let w_mapdict_storage_tid = gc.register_type(TypeInfo::varsize(
+        pyre_object::object_array::ITEMS_BLOCK_ITEMS_OFFSET,
+        std::mem::size_of::<pyre_object::pyobject::PyObjectRef>(),
+        0,
+        false,
+        Vec::new(),
+    ));
+    debug_assert_eq!(
+        w_mapdict_storage_tid,
+        pyre_object::object_array::W_MAPDICT_STORAGE_GC_TYPE_ID,
     );
     // `#[pyre_class]`-emitted typed-payload registrations.  Each
     // entry is one line consuming the macro-generated

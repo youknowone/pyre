@@ -240,8 +240,7 @@ fn install_gc_box(gc: Box<dyn majit_gc::GcAllocator>) {
 
 /// Production path: install a `GcHandle` forwarding to the global singleton.
 pub fn install_gc_standalone(gc_ptr: *mut dyn majit_gc::GcAllocator) {
-    let mut handle: Box<dyn majit_gc::GcAllocator> =
-        Box::new(majit_gc::GcHandle(gc_ptr));
+    let mut handle: Box<dyn majit_gc::GcAllocator> = Box::new(majit_gc::GcHandle(gc_ptr));
     handle.freeze_types();
     install_gc_box(handle);
 }
