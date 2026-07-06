@@ -239,6 +239,29 @@ unsafe fn walk_raw_exception_roots(
     }
 }
 
+/// Mark the GC-reachable children of a Box-immortal `W_SeqIterObject`.
+///
+/// The seq iterator is `malloc_typed`-immortal (its `allocate` uses
+/// `malloc_typed`), so `seed_major_root` ignores it.  Its `seq` field
+/// points to the iterable — often a user-defined instance allocated in
+/// old-gen via `try_gc_alloc_stable`.  Without this walk, that instance
+/// is invisible to the marker and freed while the iterator still holds
+/// a live reference.
+unsafe fn walk_raw_seq_iter_roots(
+    value: PyObjectRef,
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    unsafe {
+        if value.is_null() {
+            return;
+        }
+        if pyre_object::iterobject::is_seq_iter(value) {
+            let iter = &mut *(value as *mut pyre_object::W_SeqIterObject);
+            visitor(&mut *(&mut iter.seq as *mut PyObjectRef as *mut majit_ir::GcRef));
+        }
+    }
+}
+
 /// Mark the GC-reachable children of a `getset_descriptor`
 /// (`GetSetProperty`).  The descriptor itself is Box-immortal
 /// (`pyre_class` `allocate` → `malloc_typed`), so its `W_TYPE_GC_TYPE_ID`
@@ -651,6 +674,7 @@ fn walk_pyframe_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
                     unsafe {
                         let value = (*slot_ptr).0 as PyObjectRef;
                         walk_raw_exception_roots(value, visitor);
+                        walk_raw_seq_iter_roots(value, visitor);
                     }
                 }
             }
