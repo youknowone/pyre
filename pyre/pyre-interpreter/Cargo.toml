@@ -28,6 +28,7 @@ pyre-native = { workspace = true }
 rustpython-wtf8 = { workspace = true }
 rustpython-literal = { workspace = true }
 rustpython-common = { workspace = true }
+rustpython-unicode = { workspace = true }
 majit-gc = { workspace = true }
 majit-ir = { workspace = true }
 majit-macros = { workspace = true }

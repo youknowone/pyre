@@ -70,6 +70,7 @@ rustpython-compiler = { git = "https://github.com/youknowone/RustPython.git", re
 rustpython-compiler-core = { git = "https://github.com/youknowone/RustPython.git", rev = "a6271d25e426ecae4acab70f95271f0ef9badfaa" }
 rustpython-host_env = { git = "https://github.com/youknowone/RustPython.git", rev = "a6271d25e426ecae4acab70f95271f0ef9badfaa" }
 rustpython-wtf8 = { git = "https://github.com/youknowone/RustPython.git", rev = "a6271d25e426ecae4acab70f95271f0ef9badfaa" }
+rustpython-unicode = { git = "https://github.com/youknowone/RustPython.git", rev = "a6271d25e426ecae4acab70f95271f0ef9badfaa" }
 sre-engine = { package = "rustpython-sre_engine", git = "https://github.com/youknowone/RustPython.git", rev = "a6271d25e426ecae4acab70f95271f0ef9badfaa" }
 
 # majit JIT framework
