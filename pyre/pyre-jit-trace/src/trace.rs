@@ -1199,9 +1199,14 @@ fn run_perfn_walk(
         Vec::new()
     };
 
-    let Some((code_len, mut walk_result)) =
-        dispatch_perfn_frame(&mut mi, &pjc, entry, &argboxes_r, &argboxes_i, authoritative)
-    else {
+    let Some((code_len, mut walk_result)) = dispatch_perfn_frame(
+        &mut mi,
+        &pjc,
+        entry,
+        &argboxes_r,
+        &argboxes_i,
+        authoritative,
+    ) else {
         return None;
     };
 

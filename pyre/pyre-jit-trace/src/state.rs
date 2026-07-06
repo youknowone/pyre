@@ -7955,17 +7955,23 @@ impl JitState for PyreJitState {
                 .copied()
                 .collect()
         } else {
-            // Per-CodeObject: invert each live local/stack color to its slot.
+            // Per-CodeObject: fill each live local/stack slot from its color.
             let mut mirror = vec![OpRef::NONE; semantic_prefix_len];
-            let mut color_to_slot: Vec<usize> = vec![usize::MAX; bridge_registers_r.len()];
-            // #348 Part (2): per-PC color→slot inversion. Entries are sorted
-            // by `(color, slot)`, so for a color shared by an aliased
-            // local+stack pair the stack slot (larger slot) overwrites —
-            // matching `semantic_ref_slot_for_reg_color`'s stack-first
-            // tie-break. Out-of-prefix slots are dropped by the
-            // `s >= semantic_prefix_len` guard.  #73: pcdep is the SOLE
-            // color→slot source here; the flat `local_color_map` /
-            // `stack_color_map` fallback is drained.
+            // #348 Part (2): per-PC slot fill. `pcdep_entries` maps each live
+            // slot to its TRUE per-program-point color, so drive the fill by
+            // SLOT (not color): write `mirror[slot] = bridge_registers_r[color]`
+            // for every entry. A color shared by multiple slots — an aliased
+            // `DUP_TOP` / `ROT_THREE` operand-stack pair, or a local aliased
+            // onto the stack — writes its single value into EVERY slot it
+            // covers. A prior color→slot inversion kept only one slot per
+            // color (stack-first tie-break), leaving the sibling aliased slot
+            // `OpRef::NONE`; the vable image is also NULL for pure trace temps
+            // (`kept_stack_branch_depths` `0 < a < b < 9` keeps two copies of
+            // the same compare operand across the guard), so that slot folded
+            // to concrete `GcRef(0)` and the residual declined. Out-of-prefix
+            // slots are dropped by the `s >= semantic_prefix_len` guard.  #73:
+            // pcdep is the SOLE color→slot source here; the flat
+            // `local_color_map` / `stack_color_map` fallback is drained.
             for &(bank, color, slot) in &maps.pcdep_entries {
                 // Only Ref-bank colors map to bridge_registers_r slots.
                 // Int/Float bank entries are structurally recorded but
@@ -7978,8 +7984,8 @@ impl JitState for PyreJitState {
                     continue;
                 }
                 let col = color as usize;
-                if col < color_to_slot.len() {
-                    color_to_slot[col] = s;
+                if col < bridge_registers_r.len() {
+                    mirror[s] = bridge_registers_r[col];
                 }
             }
             // pcdep-totality guard (#73): the drained flat-else previously
@@ -8002,11 +8008,6 @@ impl JitState for PyreJitState {
                          (jitcode_index={}, pc={})",
                         frame0.jitcode_index, frame0.pc
                     );
-                }
-            }
-            for (c, &s) in color_to_slot.iter().enumerate() {
-                if s != usize::MAX && s < mirror.len() {
-                    mirror[s] = bridge_registers_r[c];
                 }
             }
             for s in 0..nlocals {
@@ -8091,7 +8092,22 @@ impl JitState for PyreJitState {
             for (s, opref) in semantic_mirror.iter().enumerate() {
                 if !opref.is_none() {
                     if let Some(&cv) = live_local_values.get(s) {
-                        if !matches!(cv, majit_ir::Value::Void) {
+                        // Skip a NULL (`GcRef(0)`) source: an operand-stack slot
+                        // above the frame's materialized `valuestackdepth` reads
+                        // NULL from `locals_cells_stack_w` because the kept temp
+                        // lives in the guard's register file / resume data, not
+                        // the frame array. When a color aliases two slots
+                        // (`DUP_TOP` / `ROT_THREE`), one slot may carry the real
+                        // value and its sibling the NULL hole; both stamp the
+                        // SAME opref, so a NULL stamp would clobber the real one
+                        // (last write wins) and fold the residual's Ref arg to
+                        // concrete NULL → `MayForceNullRefArgUnsupported`. A real
+                        // frame Ref is never NULL here, so skipping NULL only
+                        // drops the unmaterialized-hole case.
+                        if !matches!(
+                            cv,
+                            majit_ir::Value::Void | majit_ir::Value::Ref(majit_ir::GcRef(0))
+                        ) {
                             ctx.try_set_opref_concrete(*opref, cv);
                         }
                     }
