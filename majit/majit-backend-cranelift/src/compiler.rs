@@ -3,7 +3,7 @@
 /// Translates majit IR traces into native code via Cranelift, then
 /// executes them as ordinary function pointers.
 use indexmap::{IndexMap, IndexSet};
-use majit_ir::VecMapExt;
+use majit_ir::IndexMapExt;
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};

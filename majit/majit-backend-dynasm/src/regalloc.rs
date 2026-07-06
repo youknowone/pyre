@@ -13,7 +13,7 @@
 ///   valid_addressing_size  — regalloc.py:1236
 ///   get_scale              — regalloc.py:1239
 use indexmap::IndexMap;
-use majit_ir::VecMapExt;
+use majit_ir::IndexMapExt;
 
 use crate::arch::*;
 use crate::gcmap::{allocate_gcmap, gcmap_set_bit};

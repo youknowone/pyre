@@ -5,6 +5,7 @@ pub mod descr_registry;
 pub mod effectinfo;
 pub mod field_entry;
 pub mod forwarding;
+pub mod indexmap_ext;
 pub mod intbound;
 pub mod op_descr;
 pub mod op_info;
@@ -17,7 +18,6 @@ pub mod resoperation;
 pub mod resumecode;
 pub mod resumedata;
 pub mod value;
-pub mod vec_map;
 
 // Re-export key types at crate root for convenience.
 pub use descr::{
@@ -36,6 +36,7 @@ pub use effectinfo::{
     CallInfoCollection, EffectInfo, ExtraEffect, OopSpecIndex, PyreHelperKind, UnsupportedFieldExc,
     consider_array, consider_struct, frozenset_or_none,
 };
+pub use indexmap_ext::{ConstMap, IndexMapExt};
 pub use op_type_index::OpTypeIndex;
 pub use resoperation::{
     AbstractValue, ArrayDescrInfo, BoxEnv, FieldDescrInfo, GuardPendingFieldEntry, OPCODE_COUNT,
@@ -46,4 +47,3 @@ pub use value::{
     JitDriverVar, StrEqFn, StrHashFn, Type, Value, VarKind, green_type_to_ir, make_str_slot,
     pypyjit_greenkey_uhash, set_str_resolver, set_unicode_resolver,
 };
-pub use vec_map::{ConstMap, VecMapExt};

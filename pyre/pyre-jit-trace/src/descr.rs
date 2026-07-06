@@ -12,7 +12,8 @@ use std::sync::Weak;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use majit_ir::{
-    ArrayDescr, Descr, DescrRef, FieldDescr, JitCodeDescr, SizeDescr, SwitchDescr, Type, VecMapExt,
+    ArrayDescr, Descr, DescrRef, FieldDescr, IndexMapExt, JitCodeDescr, SizeDescr, SwitchDescr,
+    Type,
 };
 
 // TODO: tag bits in the high nibble of the descr

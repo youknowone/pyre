@@ -82,7 +82,7 @@ use crate::history::TreeLoop;
 use crate::warmstate::{HotResult, WarmEnterState};
 use majit_ir::descr::DescrRef;
 use majit_ir::{
-    Const, FailDescr, GcRef, InputArg, Op, OpCode, OpRc, OpRef, Type, Value, VecMapExt,
+    Const, FailDescr, GcRef, IndexMapExt, InputArg, Op, OpCode, OpRc, OpRef, Type, Value,
 };
 
 use crate::blackhole::ExceptionState;

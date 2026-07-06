@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
 use indexmap::IndexMap;
-use majit_ir::VecMapExt;
+use majit_ir::IndexMapExt;
 use majit_metainterp::jitcode::{JitCallArg, JitCode, JitCodeBuilder};
 use vecset::VecSet;
 

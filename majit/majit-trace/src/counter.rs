@@ -1,4 +1,4 @@
-use majit_ir::VecMapExt;
+use majit_ir::IndexMapExt;
 
 /// counter.py: JitCounter — float-based 5-way associative timetable.
 ///

@@ -40,7 +40,7 @@ fn sort_array_index_entries_untranslated<T>(entries: &mut [(i64, T)]) {
 
 use indexmap::{IndexMap, IndexSet};
 use majit_ir::{
-    DescrRef, OopSpecIndex, Op, OpCode, OpRef, Value, VecMapExt, descr::descr_identity,
+    DescrRef, IndexMapExt, OopSpecIndex, Op, OpCode, OpRef, Value, descr::descr_identity,
 };
 
 use crate::optimizeopt::info::PtrInfoExt;

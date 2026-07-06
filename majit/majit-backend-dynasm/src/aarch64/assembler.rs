@@ -10,7 +10,7 @@
 ///   patch_jump_for_descr — assembler.py:965
 ///   redirect_call_assembler — assembler.py:1138
 use indexmap::IndexMap;
-use majit_ir::VecMapExt;
+use majit_ir::IndexMapExt;
 use std::sync::Arc;
 
 // aarch64/assembler.py parity: aarch64-only backend.

@@ -1,5 +1,5 @@
 use indexmap::IndexMap;
-use majit_ir::VecMapExt;
+use majit_ir::IndexMapExt;
 use std::cell::RefCell;
 use std::sync::Arc;
 /// runner.py: AbstractX86CPU — the Backend trait implementation.

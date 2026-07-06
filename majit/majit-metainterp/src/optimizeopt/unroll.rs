@@ -19,7 +19,7 @@
 /// don't collide with the original ops.
 use indexmap::{IndexMap, IndexSet};
 use majit_ir::operand::Operand;
-use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type, Value, VecMapExt};
+use majit_ir::{DescrRef, GcRef, IndexMapExt, Op, OpCode, OpRef, Type, Value};
 
 use crate::history::TargetToken;
 use crate::optimizeopt::{
