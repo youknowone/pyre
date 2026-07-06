@@ -170,6 +170,12 @@ pub struct PyCode {
     /// - FLATPYCALL | co_argcount: simple user function
     /// - HOPELESS: has *args/**kwargs/kwonly/too many params
     pub fast_natural_arity: u16,
+    /// Cached [`crate::pyframe::npure_cellvars`] — the count of cellvars that
+    /// are not also varnames.  Code-invariant, so computed once here instead
+    /// of re-walking the O(cellvars × varnames) overlap check on every
+    /// `PyFrame::ncells()` / stack-base query (a per-`pop_value` hot path).
+    /// `u32::MAX` sentinel when `code_ptr` is null/unaligned (test stubs).
+    pub npure_cellvars: u32,
     /// `pycode.py:198 self._globals_caches = [None] * len(self.co_names_w)`.
     ///
     /// Per-name slot for `LOAD_GLOBAL_cached` / `STORE_GLOBAL_cached`
@@ -363,6 +369,12 @@ pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: boo
         v.resize(consts_len, std::ptr::null_mut());
         Box::into_raw(Box::new(v))
     };
+    let npure_cellvars = if code_ptr.is_null() || (code_ptr as i64) & align_mask != 0 {
+        u32::MAX
+    } else {
+        let code_ref = unsafe { &*(code_ptr as *const crate::CodeObject) };
+        crate::pyframe::npure_cellvars(code_ref) as u32
+    };
     let obj = Box::new(PyCode {
         ob_header: PyObject {
             ob_type: &CODE_TYPE as *const PyType,
@@ -372,6 +384,7 @@ pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: boo
         w_globals: pyre_object::PY_NULL,
         hidden_applevel,
         fast_natural_arity,
+        npure_cellvars,
         globals_caches,
         mapdict_caches,
         co_consts_w,
@@ -774,6 +787,23 @@ pub unsafe fn w_code_set_hidden_applevel(obj: PyObjectRef, hidden_applevel: bool
 #[inline]
 pub unsafe fn w_code_get_ptr(obj: PyObjectRef) -> *const () {
     unsafe { (*(obj as *const PyCode)).code_ptr }
+}
+
+/// Cached [`crate::pyframe::npure_cellvars`] for the code wrapper `obj`,
+/// or `None` for a null/stub wrapper (sentinel `u32::MAX`) so the caller
+/// falls back to recomputation.
+///
+/// # Safety
+/// `obj` must be null or point to a valid `PyCode`.
+#[inline]
+pub unsafe fn w_code_npure_cellvars(obj: PyObjectRef) -> Option<usize> {
+    if obj.is_null() {
+        return None;
+    }
+    match unsafe { (*(obj as *const PyCode)).npure_cellvars } {
+        u32::MAX => None,
+        n => Some(n as usize),
+    }
 }
 
 /// PyPy: `PyCode.hidden_applevel` (`pycode.py:147`). Reads the field

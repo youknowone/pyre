@@ -1869,7 +1869,17 @@ impl PyFrame {
     #[majit_macros::elidable_cannot_raise]
     #[inline]
     pub fn ncells(&self) -> usize {
-        unsafe { ncells(&*pyframe_get_pycode(self)) }
+        // `npure_cellvars` (the O(cellvars × varnames) overlap count) is
+        // code-invariant and cached on the `PyCode` wrapper; `freevars.len()`
+        // is a direct read.  Falls back to the full walk for stub frames
+        // whose `pycode` wrapper carries the `u32::MAX` sentinel.
+        let code = unsafe { &*pyframe_get_pycode(self) };
+        match unsafe {
+            crate::pycode::w_code_npure_cellvars(self.pycode as pyre_object::PyObjectRef)
+        } {
+            Some(npure) => npure + code.freevars.len(),
+            None => ncells(code),
+        }
     }
 
     /// First index of the operand stack (after locals and cells).
