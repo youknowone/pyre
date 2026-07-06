@@ -822,14 +822,29 @@ impl UnrollOptimizer {
         // Phase 1 raw position maps to the same Phase 2 box the iterator
         // allocated for it.  See the remap block after `p2_cache` is
         // built below.
+        // `trace_inputargs` stays a clone: it is re-read below at the Phase 2
+        // TraceIterator setup (`p2_inputarg_types`) and by the earlier
+        // `debug_assert_eq!` on its length.
         opt_p2.trace_inputargs = self.trace_inputargs.clone();
-        opt_p2.phase1_emit_ops = self.phase1_emit_ops.clone();
-        opt_p2.snapshot_boxes = self.snapshot_boxes.clone();
-        opt_p2.snapshot_frame_sizes = self.snapshot_frame_sizes.clone();
-        opt_p2.snapshot_vable_boxes = self.snapshot_vable_boxes.clone();
-        opt_p2.snapshot_vref_boxes = self.snapshot_vref_boxes.clone();
-        opt_p2.snapshot_frame_pcs = self.snapshot_frame_pcs.clone();
-        opt_p2.call_pure_results = self.call_pure_results.clone();
+        // Move, not clone: Phase 2 is the last reader of these fields in this
+        // function (no `self.`-qualified read past this point on any path —
+        // the imported_state path writes `phase1_emit_ops` above then reads it
+        // here; the non-peeled early-return arm returns before reaching here),
+        // and the caller never reads `unroll_opt.{snapshot_*,phase1_emit_ops,
+        // call_pure_results}` after the optimize call (the InvalidLoop retry
+        // moves the caller's own `snapshot_map` locals, not these fields). A
+        // `Vec` move copies only the (ptr,len,cap) header and leaves the inner
+        // buffers — and the `*mut OpRef` const-ptr root slots collected into
+        // `opt_p2` at the re-root below — at the same addresses. Mirrors the
+        // move-not-clone precedent on the InvalidLoop retry path (pyjitpl.rs
+        // `simple_opt.snapshot_boxes = snapshot_map`).
+        opt_p2.phase1_emit_ops = std::mem::take(&mut self.phase1_emit_ops);
+        opt_p2.snapshot_boxes = std::mem::take(&mut self.snapshot_boxes);
+        opt_p2.snapshot_frame_sizes = std::mem::take(&mut self.snapshot_frame_sizes);
+        opt_p2.snapshot_vable_boxes = std::mem::take(&mut self.snapshot_vable_boxes);
+        opt_p2.snapshot_vref_boxes = std::mem::take(&mut self.snapshot_vref_boxes);
+        opt_p2.snapshot_frame_pcs = std::mem::take(&mut self.snapshot_frame_pcs);
+        opt_p2.call_pure_results = std::mem::take(&mut self.call_pure_results);
         // RPython: same Optimizer instance keeps patchguardop across phases.
         // Phase 1 processes GUARD_FUTURE_CONDITION (from close_loop_args_at)
         // which sets patchguardop. optimizer.py:294 parity — no synthetic
