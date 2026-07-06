@@ -7234,9 +7234,19 @@ where
     let _observer_guard = ObserverGuard::enter();
     let prev_observer_mode = ctx.observer_mode;
     ctx.observer_mode = true;
-    let action = trace_jitcode_with_args(ctx, sym, jitcode, pc, label_at, argboxes);
+    // Restore observer_mode on both normal return and unwind (try/finally
+    // parity): trace-time panics are caught and recovered higher up
+    // (`run_to_end`, `note_jit_panic_or_reraise`), so a plain post-call
+    // statement would leak `observer_mode = true` into the recovered outer
+    // interpreter. Mirrors the previous `ObserverGuard::drop` restore.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        trace_jitcode_with_args(ctx, sym, jitcode, pc, label_at, argboxes)
+    }));
     ctx.observer_mode = prev_observer_mode;
-    action
+    match result {
+        Ok(action) => action,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
 }
 
 /// Observer-mode variant of [`trace_jitcode_with_args_and_runtime`] —
@@ -7259,9 +7269,19 @@ where
     let _observer_guard = ObserverGuard::enter();
     let prev_observer_mode = ctx.observer_mode;
     ctx.observer_mode = true;
-    let action = trace_jitcode_with_args_and_runtime(ctx, sym, jitcode, pc, runtime, argboxes);
+    // Restore observer_mode on both normal return and unwind (try/finally
+    // parity): trace-time panics are caught and recovered higher up
+    // (`run_to_end`, `note_jit_panic_or_reraise`), so a plain post-call
+    // statement would leak `observer_mode = true` into the recovered outer
+    // interpreter. Mirrors the previous `ObserverGuard::drop` restore.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        trace_jitcode_with_args_and_runtime(ctx, sym, jitcode, pc, runtime, argboxes)
+    }));
     ctx.observer_mode = prev_observer_mode;
-    action
+    match result {
+        Ok(action) => action,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
 }
 
 /// `b1 is b2` crude fastpath result for comparison opcodes —
