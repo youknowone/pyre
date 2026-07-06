@@ -492,6 +492,12 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::try_gc_add_root",
         pyre_object::gc_hook::try_gc_add_root as *const (),
     );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::gc_hook::try_gc_remove_root",
+        "pyre_object::try_gc_remove_root",
+        pyre_object::gc_hook::try_gc_remove_root as *const (),
+    );
     // #346: four direct `malloc_typed` (`NewWithVtable`) roots residualised
     // via `#[dont_look_inside]`; each binds both the qualified module path and
     // the glob-re-exported root alias. `function_new_impl` lives in this crate
@@ -538,6 +544,11 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         &mut entries,
         "pyre_interpreter::objspace::std::mapdict::_obj_setdict",
         crate::objspace::std::mapdict::_obj_setdict as *const (),
+    );
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::objspace::std::mapdict::_obj_getdict",
+        crate::objspace::std::mapdict::_obj_getdict as *const (),
     );
     // `gc_interp::enabled` reads (and lazily inits) the `STATE` atomic and
     // `longobject::bigint_gc_type_id` reads the init-assigned `BIGINT_GC_TYPE_ID`

@@ -2905,6 +2905,13 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
 ///     assert flag
 ///     return w_dict
 /// ```
+///
+/// `dont_look_inside` — the `_obj_setdict` read twin: the miss path reads
+/// the address-keyed `INSTANCE_DICT` thread-local side table (and allocates
+/// a fresh dict), state the tracer cannot model; the call residualises via
+/// the registered fnaddr (`@objectmodel.dont_inline` upstream,
+/// mapdict.py:826).
+#[majit_macros::dont_look_inside]
 pub fn _obj_getdict(self_ref: PyObjectRef) -> PyObjectRef {
     // mapdict.py:828-838: read the "dict" SPECIAL slot; on a miss build the
     // MapDictStrategy view and write it back into that slot. `strategy.erase(self)`

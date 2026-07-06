@@ -375,7 +375,10 @@ pub unsafe fn try_gc_add_root(slot: *mut *mut u8) -> bool {
 
 /// Remove a previously-registered root via the installed callback.
 /// Returns `true` when the callback was invoked.
-#[inline]
+// `dont_look_inside`: host hook dispatch (`thread_local!` `Cell`
+// indirection) stays opaque to the JIT — the `try_gc_add_root` twin;
+// calls residualize via the registered fnaddr (`rlib/jit.py:139`).
+#[majit_macros::dont_look_inside]
 pub fn try_gc_remove_root(slot: *mut *mut u8) -> bool {
     GC_REMOVE_ROOT_HOOK.with(|cell| match cell.get() {
         Some(f) => {
