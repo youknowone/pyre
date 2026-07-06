@@ -12661,6 +12661,21 @@ impl CodeWriter {
         // `PYRE_PCMAP_BRIDGE_AUDIT`; empty for skeleton / portal-bridge.
         let mut pcdep_by_jit_pc: Vec<(usize, Vec<(u8, u16, u16)>)> = Vec::new();
         let mut depth_pred_by_jit_pc: Vec<(usize, u16)> = Vec::new();
+        // task#50 #73-core: trivia-aware predecessor twin of the STATIC dense
+        // liveness depth.  The ENCODE-side branch-resume depth reader
+        // (`branch_resume_target_stack_depth`, jitcode_dispatch.rs:9329) does NOT
+        // read `depth_at_py_pc[inv(target)]` directly — it advances the inverted
+        // py through `skip_python_trivia_forward` (a not-taken branch coordinate
+        // can land on a `NOT_TAKEN`/`Cache` trivia op) BEFORE indexing the
+        // `liveness_for(code)` depth.  A plain `depth_pred_by_jit_pc` twin keys the
+        // RAW inverted py against the walk-visited `depth_at_pc`, so it diverges
+        // both when trivia moves the coordinate AND at any PC the trace never
+        // entered.  This second twin bakes the same forward trivia-skip over the
+        // same static liveness at compile time: for each resolved py, advance past
+        // `ExtendedArg`/`Resume`/`Nop`/`Cache`/`NotTaken` then record that opcode's
+        // static depth.  A predecessor lookup then equals
+        // `liveness_for(code).depth_at_py_pc()[skip_python_trivia_forward(inv(jit_pc))]`.
+        let mut depth_trivia_by_jit_pc: Vec<(usize, u16)> = Vec::new();
         if !first_jit_pc_by_py_pc.is_empty() {
             use std::collections::BTreeMap;
             // offset -> resolving py. Seed every op-start offset with its own py
@@ -12683,11 +12698,41 @@ impl CodeWriter {
                     by_off.insert(off, py);
                 }
             }
+            // Compile-time twin of `skip_python_trivia_forward`
+            // (jitcode_dispatch.rs:9126): advance past Python trivia opcodes to
+            // the next executable opcode.  Same opcode set, same start-AT (not
+            // start-after) semantics.
+            let skip_trivia = |mut py: usize| -> usize {
+                loop {
+                    match pyre_interpreter::decode_instruction_at(code, py) {
+                        Some((
+                            Instruction::ExtendedArg
+                            | Instruction::Resume { .. }
+                            | Instruction::Nop
+                            | Instruction::Cache
+                            | Instruction::NotTaken,
+                            _,
+                        )) => py += 1,
+                        _ => return py,
+                    }
+                }
+            };
+            // The ENCODE branch-resume depth reader indexes the STATIC dense
+            // liveness (`liveness_for(code).depth_at_py_pc()`), not the
+            // walk-visited sparse `depth_at_pc` (which stays 0 at any PC the
+            // trace did not enter — e.g. a not-taken branch target the resume
+            // depth reader queries).  The trivia twin must reproduce the same
+            // static analysis, so source its depth from `liveness_for`.
+            let static_depth =
+                pyre_jit_trace::state::liveness_for(code as *const _).depth_at_py_pc();
             for (&off, &py) in by_off.iter() {
                 let pcdep = pcdep_color_slots.get(py).cloned().unwrap_or_default();
                 let depth = depth_at_pc.get(py).copied().unwrap_or(0);
+                let py_trivia = skip_trivia(py);
+                let depth_trivia = static_depth.get(py_trivia).copied().unwrap_or(0);
                 pcdep_by_jit_pc.push((off, pcdep));
                 depth_pred_by_jit_pc.push((off, depth));
+                depth_trivia_by_jit_pc.push((off, depth_trivia));
             }
         }
 
@@ -12721,6 +12766,7 @@ impl CodeWriter {
             depth_by_jit_pc,
             pcdep_by_jit_pc,
             depth_pred_by_jit_pc,
+            depth_trivia_by_jit_pc,
             result_color_at_pc,
             portal_frame_reg,
             portal_ec_reg,

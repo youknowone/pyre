@@ -11672,6 +11672,7 @@ mod tests {
                 depth_by_jit_pc: vec![(0, 2)],
                 pcdep_by_jit_pc: vec![(0, Vec::new())],
                 depth_pred_by_jit_pc: vec![(0, 2)],
+                depth_trivia_by_jit_pc: vec![(0, 2)],
                 depth_at_py_pc: vec![2],
                 result_color_at_pc: Vec::new(),
                 portal_frame_reg: 0,
