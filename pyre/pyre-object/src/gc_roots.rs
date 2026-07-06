@@ -151,7 +151,11 @@ pub fn shadow_stack_len() -> usize {
 /// is out of bounds. Used by tests and ad-hoc host-side debugging to
 /// confirm the slot contents survive across nested brackets — the GC
 /// itself uses [`walk_shadow_stack`] for the collection-time visit.
-#[inline]
+///
+/// Reads the thread-local `SHADOW_STACK` the tracer cannot type; the JIT
+/// residualises the read instead of tracing into it (`@dont_look_inside`,
+/// `rlib/jit.py:139`), the [`shadow_stack_len`] twin.
+#[majit_macros::dont_look_inside]
 pub fn shadow_stack_get(index: usize) -> PyObjectRef {
     SHADOW_STACK.with(|s| s.borrow()[index])
 }

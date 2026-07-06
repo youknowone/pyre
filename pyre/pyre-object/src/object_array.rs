@@ -249,12 +249,11 @@ pub unsafe fn dealloc_instance_items_block(block: *mut ItemsBlock) {
 /// when no GC hook is installed. `cap` may be zero (header-only block).
 unsafe fn alloc_mapdict_storage_block(cap: usize) -> *mut ItemsBlock {
     let payload = ITEMS_BLOCK_ITEMS_OFFSET + cap * std::mem::size_of::<PyObjectRef>();
-    if let Some(raw) = crate::gc_hook::try_gc_alloc_stable(W_MAPDICT_STORAGE_GC_TYPE_ID, payload) {
-        if !raw.is_null() {
-            let block = raw as *mut ItemsBlock;
-            unsafe { (*block).capacity = cap };
-            return block;
-        }
+    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_MAPDICT_STORAGE_GC_TYPE_ID, payload);
+    if !raw.is_null() {
+        let block = raw as *mut ItemsBlock;
+        unsafe { (*block).capacity = cap };
+        return block;
     }
     unsafe { alloc_items_block(cap) }
 }
@@ -603,19 +602,18 @@ pub unsafe fn alloc_typed_items_block(cap: usize, tid: u32) -> *mut TypedItemsBl
     let cap = cap.max(1);
     if itemsblock_gc_enabled() {
         let payload = TYPED_ITEMS_BLOCK_ITEMS_OFFSET + cap * std::mem::size_of::<u64>();
-        if let Some(raw) = crate::gc_hook::try_gc_alloc_stable(tid, payload) {
-            if !raw.is_null() {
-                let block = raw as *mut TypedItemsBlock;
-                unsafe {
-                    (*block).capacity = cap;
-                    std::ptr::write_bytes(
-                        typed_items_block_items_base(block),
-                        0,
-                        cap * std::mem::size_of::<u64>(),
-                    );
-                }
-                return block;
+        let raw = crate::gc_hook::try_gc_alloc_stable_raw(tid, payload);
+        if !raw.is_null() {
+            let block = raw as *mut TypedItemsBlock;
+            unsafe {
+                (*block).capacity = cap;
+                std::ptr::write_bytes(
+                    typed_items_block_items_base(block),
+                    0,
+                    cap * std::mem::size_of::<u64>(),
+                );
             }
+            return block;
         }
     }
     let layout = typed_items_block_layout(cap);

@@ -127,8 +127,7 @@ pub fn w_tuple_new_array_backed(items: Vec<PyObjectRef>) -> PyObjectRef {
         ob_type: &TUPLE_TYPE as *const PyType,
         w_class: get_instantiate(&TUPLE_TYPE),
     };
-    let raw = crate::gc_hook::try_gc_alloc_stable(W_TUPLE_GC_TYPE_ID, W_TUPLE_OBJECT_SIZE)
-        .filter(|p| !p.is_null());
+    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_TUPLE_GC_TYPE_ID, W_TUPLE_OBJECT_SIZE);
 
     // pop_roots: read the relocated item pointers back out of the shadow
     // stack, then build the items block. On the Phase L2 nursery path
@@ -141,7 +140,7 @@ pub fn w_tuple_new_array_backed(items: Vec<PyObjectRef>) -> PyObjectRef {
         .collect();
     let items_block = unsafe { alloc_tuple_items_block_gc(&relocated) };
 
-    if let Some(raw) = raw {
+    if !raw.is_null() {
         unsafe {
             std::ptr::write(
                 raw as *mut W_TupleObject,

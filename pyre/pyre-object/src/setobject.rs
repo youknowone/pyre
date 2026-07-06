@@ -86,27 +86,25 @@ fn alloc_set_with_type(tp: &'static PyType) -> PyObjectRef {
     // through the plain `malloc_typed` (no TRACK_YOUNG_PTRS) would leave
     // young elements unforwarded and collected. Falls back to
     // `malloc_typed` when no GC hook is installed (unit tests).
-    match crate::gc_hook::try_gc_alloc_stable(W_SET_GC_TYPE_ID, W_SET_OBJECT_SIZE)
-        .filter(|p| !p.is_null())
-    {
-        Some(raw) => {
-            unsafe {
-                std::ptr::write(
-                    raw as *mut W_SetObject,
-                    W_SetObject {
-                        ob_header: header,
-                        items,
-                        len: 0,
-                    },
-                );
-            }
-            raw as PyObjectRef
+    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_SET_GC_TYPE_ID, W_SET_OBJECT_SIZE);
+    if !raw.is_null() {
+        unsafe {
+            std::ptr::write(
+                raw as *mut W_SetObject,
+                W_SetObject {
+                    ob_header: header,
+                    items,
+                    len: 0,
+                },
+            );
         }
-        None => crate::lltype::malloc_typed(W_SetObject {
+        raw as PyObjectRef
+    } else {
+        crate::lltype::malloc_typed(W_SetObject {
             ob_header: header,
             items,
             len: 0,
-        }) as PyObjectRef,
+        }) as PyObjectRef
     }
 }
 

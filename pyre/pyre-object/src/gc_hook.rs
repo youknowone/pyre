@@ -78,6 +78,20 @@ pub fn try_gc_alloc_stable(type_id: u32, payload_size: usize) -> Option<*mut u8>
     GC_ALLOC_STABLE_HOOK.with(|cell| cell.get().map(|f| f(type_id, payload_size)))
 }
 
+/// Null-collapsing view of [`try_gc_alloc_stable`] for JIT-traced callers.
+///
+/// Returns `null` both when no hook is installed and when the hook itself
+/// returned `null`; every traced caller already treats those two cases
+/// identically (fall back to `malloc_typed`), so the `Option` discriminant
+/// carries no information the caller reads.  Residualising this primitive
+/// (`@dont_look_inside`, `rlib/jit.py:139`) keeps the thread-local hook
+/// dispatch out of the trace — a `*mut u8` return has no discriminant to
+/// erase, unlike the `Option<*mut u8>` accessor.
+#[majit_macros::dont_look_inside]
+pub fn try_gc_alloc_stable_raw(type_id: u32, payload_size: usize) -> *mut u8 {
+    try_gc_alloc_stable(type_id, payload_size).unwrap_or(core::ptr::null_mut())
+}
+
 thread_local! {
     static GC_ALLOC_COLLECTING_HOOK: Cell<Option<GcAllocHookFn>> = const { Cell::new(None) };
 }

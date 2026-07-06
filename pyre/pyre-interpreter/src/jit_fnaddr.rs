@@ -435,6 +435,12 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     );
     push_alias_pair(
         &mut entries,
+        "pyre_object::gc_roots::shadow_stack_get",
+        "pyre_object::shadow_stack_get",
+        pyre_object::gc_roots::shadow_stack_get as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
         "pyre_object::typeobject::w_type_set_uses_object_setattr",
         "pyre_object::w_type_set_uses_object_setattr",
         crate::opcode_ops::bh_w_type_set_uses_object_setattr as *const (),
@@ -513,6 +519,15 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::function::function_new_impl",
         "pyre_interpreter::function_new_impl",
         crate::function::function_new_impl as *const (),
+    );
+    // #346: null-collapsing stable-alloc primitive residualised via
+    // `#[dont_look_inside]`, keeping the thread-local GC hook dispatch out of
+    // the trace.
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::gc_hook::try_gc_alloc_stable_raw",
+        "pyre_object::try_gc_alloc_stable_raw",
+        pyre_object::gc_hook::try_gc_alloc_stable_raw as *const (),
     );
     push_fnaddr(
         &mut entries,

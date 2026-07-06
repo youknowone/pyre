@@ -59,10 +59,8 @@ pub fn w_generator_new(frame_ptr: *mut u8) -> PyObjectRef {
     // memory. Allocate stable (non-moving old-gen) so the many raw
     // `*GeneratorIterator` / `frame_ptr` readers keep a fixed address, and
     // fall back to the immortal alloc only when the GC is not installed.
-    if let Some(raw) =
-        crate::gc_hook::try_gc_alloc_stable(W_GENERATOR_GC_TYPE_ID, W_GENERATOR_OBJECT_SIZE)
-            .filter(|p| !p.is_null())
-    {
+    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_GENERATOR_GC_TYPE_ID, W_GENERATOR_OBJECT_SIZE);
+    if !raw.is_null() {
         crate::gc_interp::note_alloc();
         unsafe {
             std::ptr::write(raw as *mut GeneratorIterator, value);

@@ -47,14 +47,13 @@ pub fn w_method_new(
         ob_type: &METHOD_TYPE as *const PyType,
         w_class: get_instantiate(&METHOD_TYPE),
     };
-    let raw = crate::gc_hook::try_gc_alloc_stable(W_METHOD_GC_TYPE_ID, W_METHOD_OBJECT_SIZE)
-        .filter(|p| !p.is_null());
+    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_METHOD_GC_TYPE_ID, W_METHOD_OBJECT_SIZE);
     // Re-read the pinned roots after the allocation; a minor collection
     // inside the GC malloc may have relocated them.
     let w_function = crate::gc_roots::shadow_stack_get(save_point);
     let w_self = crate::gc_roots::shadow_stack_get(save_point + 1);
     let w_class = crate::gc_roots::shadow_stack_get(save_point + 2);
-    if let Some(raw) = raw {
+    if !raw.is_null() {
         unsafe {
             std::ptr::write(
                 raw as *mut Method,
@@ -122,11 +121,12 @@ pub fn w_staticmethod_new(func: PyObjectRef) -> PyObjectRef {
         ob_type: &STATICMETHOD_TYPE as *const PyType,
         w_class: get_instantiate(&STATICMETHOD_TYPE),
     };
-    let raw =
-        crate::gc_hook::try_gc_alloc_stable(W_STATICMETHOD_GC_TYPE_ID, W_STATICMETHOD_OBJECT_SIZE)
-            .filter(|p| !p.is_null());
+    let raw = crate::gc_hook::try_gc_alloc_stable_raw(
+        W_STATICMETHOD_GC_TYPE_ID,
+        W_STATICMETHOD_OBJECT_SIZE,
+    );
     let func = crate::gc_roots::shadow_stack_get(save_point);
-    if let Some(raw) = raw {
+    if !raw.is_null() {
         unsafe {
             std::ptr::write(
                 raw as *mut StaticMethod,
@@ -176,11 +176,12 @@ pub fn w_classmethod_new(func: PyObjectRef) -> PyObjectRef {
         ob_type: &CLASSMETHOD_TYPE as *const PyType,
         w_class: get_instantiate(&CLASSMETHOD_TYPE),
     };
-    let raw =
-        crate::gc_hook::try_gc_alloc_stable(W_CLASSMETHOD_GC_TYPE_ID, W_CLASSMETHOD_OBJECT_SIZE)
-            .filter(|p| !p.is_null());
+    let raw = crate::gc_hook::try_gc_alloc_stable_raw(
+        W_CLASSMETHOD_GC_TYPE_ID,
+        W_CLASSMETHOD_OBJECT_SIZE,
+    );
     let func = crate::gc_roots::shadow_stack_get(save_point);
-    if let Some(raw) = raw {
+    if !raw.is_null() {
         unsafe {
             std::ptr::write(
                 raw as *mut ClassMethod,

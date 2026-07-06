@@ -177,9 +177,8 @@ pub fn alloc_bigint_nursery_collecting(value: BigInt) -> *mut BigInt {
 pub fn alloc_bigint_stable(value: BigInt) -> *mut BigInt {
     let tid = bigint_gc_type_id();
     if tid != 0 {
-        if let Some(raw) =
-            crate::gc_hook::try_gc_alloc_stable(tid, BIGINT_PAYLOAD_SIZE).filter(|p| !p.is_null())
-        {
+        let raw = crate::gc_hook::try_gc_alloc_stable_raw(tid, BIGINT_PAYLOAD_SIZE);
+        if !raw.is_null() {
             // Charge the limb-`Vec` bytes against the old-gen external total so a
             // directly-old-gen bignum's footprint enters the major threshold now,
             // not only at the next major's recompute. No minor is forced, so this
@@ -228,13 +227,13 @@ pub fn w_long_from_raw(value: *mut BigInt) -> PyObjectRef {
         // rooted as a GcRef slot rather than a PyObjectRef.
         let mut slot = value as *mut u8;
         let pinned = unsafe { crate::gc_hook::try_gc_add_root(&mut slot as *mut *mut u8) };
-        let raw = crate::gc_hook::try_gc_alloc_stable(W_LONG_GC_TYPE_ID, W_LONG_OBJECT_SIZE)
-            .filter(|p| !p.is_null());
+        let raw =
+            crate::gc_hook::try_gc_alloc_stable_raw(W_LONG_GC_TYPE_ID, W_LONG_OBJECT_SIZE);
         let value = slot as *mut BigInt;
         if pinned {
             crate::gc_hook::try_gc_remove_root(&mut slot as *mut *mut u8);
         }
-        if let Some(raw) = raw {
+        if !raw.is_null() {
             // Advance the dispatch-loop safepoint counter, as w_int_new /
             // w_float_new do for their stable allocs — otherwise a long-dominated
             // interpreter workload never reaches the safepoint threshold and the

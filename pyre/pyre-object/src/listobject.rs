@@ -530,22 +530,18 @@ fn w_list_new_with_strategy(items: Vec<PyObjectRef>, strategy: ListStrategy) -> 
     // `list_object_custom_trace` and remembered by `list_write_barrier` below;
     // `int_items.block` / `float_items.block` are old-gen leaf arrays the same
     // trace marks live.
-    let raw = match crate::gc_hook::try_gc_alloc_stable(W_LIST_GC_TYPE_ID, W_LIST_OBJECT_SIZE)
-        .filter(|p| !p.is_null())
-    {
-        Some(p) => p,
-        None => {
-            let boxed = Box::new(W_ListObject {
-                ob_header: header,
-                length,
-                items: items_block,
-                strategy,
-                int_items,
-                float_items,
-            });
-            return Box::into_raw(boxed) as PyObjectRef;
-        }
-    };
+    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_LIST_GC_TYPE_ID, W_LIST_OBJECT_SIZE);
+    if raw.is_null() {
+        let boxed = Box::new(W_ListObject {
+            ob_header: header,
+            length,
+            items: items_block,
+            strategy,
+            int_items,
+            float_items,
+        });
+        return Box::into_raw(boxed) as PyObjectRef;
+    }
     // Re-read the (possibly relocated) nursery items block after the header alloc.
     if let Some(s) = block_root {
         items_block = crate::gc_roots::shadow_stack_get(s) as *mut ItemsBlock;

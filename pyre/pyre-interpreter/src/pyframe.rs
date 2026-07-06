@@ -305,12 +305,11 @@ impl FrameBox {
     /// `pyframe_object_custom_trace`) is regime-independent; `Drop`
     /// distinguishes them with `try_gc_owns_object`.
     pub fn new(frame: PyFrame) -> Self {
-        if let Some(raw) = pyre_object::gc_hook::try_gc_alloc_stable(
+        let raw = pyre_object::gc_hook::try_gc_alloc_stable_raw(
             PYFRAME_GC_TYPE_ID,
             std::mem::size_of::<PyFrame>(),
-        )
-        .filter(|p| !p.is_null())
-        {
+        );
+        if !raw.is_null() {
             pyre_object::gc_interp::note_alloc();
             let ptr = raw as *mut PyFrame;
             unsafe {

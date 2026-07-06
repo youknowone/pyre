@@ -112,14 +112,17 @@ pub fn w_instance_new(w_type: PyObjectRef) -> PyObjectRef {
 /// subsystem) to cover transient Ref slots, then switch this call back
 /// to `try_gc_alloc` for the movable nursery.
 fn alloc_instance_object(value: W_ObjectObject) -> PyObjectRef {
-    match crate::gc_hook::try_gc_alloc_stable(W_OBJECT_OBJECT_GC_TYPE_ID, W_OBJECT_OBJECT_SIZE)
-        .filter(|p| !p.is_null())
-    {
-        Some(raw) => unsafe {
+    let raw = crate::gc_hook::try_gc_alloc_stable_raw(
+        W_OBJECT_OBJECT_GC_TYPE_ID,
+        W_OBJECT_OBJECT_SIZE,
+    );
+    if !raw.is_null() {
+        unsafe {
             std::ptr::write(raw as *mut W_ObjectObject, value);
             raw as PyObjectRef
-        },
-        None => crate::lltype::malloc(value) as PyObjectRef,
+        }
+    } else {
+        crate::lltype::malloc(value) as PyObjectRef
     }
 }
 

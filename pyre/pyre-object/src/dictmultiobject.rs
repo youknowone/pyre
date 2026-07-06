@@ -870,16 +870,19 @@ pub unsafe fn w_dict_walk_entries_mut(obj: PyObjectRef, mut visitor: impl FnMut(
 #[majit_macros::dont_look_inside]
 pub fn alloc_dict_object(value: W_DictObject, stable: bool) -> PyObjectRef {
     let raw = if stable {
-        crate::gc_hook::try_gc_alloc_stable(W_DICT_GC_TYPE_ID, W_DICT_OBJECT_SIZE)
+        crate::gc_hook::try_gc_alloc_stable_raw(W_DICT_GC_TYPE_ID, W_DICT_OBJECT_SIZE)
     } else {
         crate::gc_hook::try_gc_alloc(W_DICT_GC_TYPE_ID, W_DICT_OBJECT_SIZE)
+            .filter(|p| !p.is_null())
+            .unwrap_or(std::ptr::null_mut())
     };
-    match raw.filter(|p| !p.is_null()) {
-        Some(raw) => unsafe {
+    if !raw.is_null() {
+        unsafe {
             std::ptr::write(raw as *mut W_DictObject, value);
             raw as PyObjectRef
-        },
-        None => crate::lltype::malloc_typed(value) as PyObjectRef,
+        }
+    } else {
+        crate::lltype::malloc_typed(value) as PyObjectRef
     }
 }
 

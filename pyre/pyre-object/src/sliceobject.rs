@@ -39,12 +39,11 @@ pub fn w_slice_new(start: PyObjectRef, stop: PyObjectRef, step: PyObjectRef) -> 
         ob_type: &SLICE_TYPE as *const PyType,
         w_class: get_instantiate(&SLICE_TYPE),
     };
-    let raw = crate::gc_hook::try_gc_alloc_stable(W_SLICE_GC_TYPE_ID, W_SLICE_OBJECT_SIZE)
-        .filter(|p| !p.is_null());
+    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_SLICE_GC_TYPE_ID, W_SLICE_OBJECT_SIZE);
     let start = crate::gc_roots::shadow_stack_get(save_point);
     let stop = crate::gc_roots::shadow_stack_get(save_point + 1);
     let step = crate::gc_roots::shadow_stack_get(save_point + 2);
-    if let Some(raw) = raw {
+    if !raw.is_null() {
         unsafe {
             std::ptr::write(
                 raw as *mut W_SliceObject,

@@ -83,10 +83,9 @@ pub fn w_dict_proxy_new(w_mapping: PyObjectRef) -> PyObjectRef {
         w_class: get_instantiate(&MAPPING_PROXY_TYPE),
     };
     let raw =
-        crate::gc_hook::try_gc_alloc_stable(W_DICT_PROXY_GC_TYPE_ID, W_DICT_PROXY_OBJECT_SIZE)
-            .filter(|p| !p.is_null());
+        crate::gc_hook::try_gc_alloc_stable_raw(W_DICT_PROXY_GC_TYPE_ID, W_DICT_PROXY_OBJECT_SIZE);
     let w_mapping = crate::gc_roots::shadow_stack_get(save_point);
-    if let Some(raw) = raw {
+    if !raw.is_null() {
         unsafe {
             std::ptr::write(
                 raw as *mut W_DictProxyObject,

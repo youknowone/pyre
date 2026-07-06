@@ -41,11 +41,10 @@ pub fn w_super_new(super_type: PyObjectRef, obj: PyObjectRef) -> PyObjectRef {
         ob_type: &SUPER_TYPE as *const PyType,
         w_class: get_instantiate(&SUPER_TYPE),
     };
-    let raw = crate::gc_hook::try_gc_alloc_stable(W_SUPER_GC_TYPE_ID, W_SUPER_OBJECT_SIZE)
-        .filter(|p| !p.is_null());
+    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_SUPER_GC_TYPE_ID, W_SUPER_OBJECT_SIZE);
     let super_type = crate::gc_roots::shadow_stack_get(save_point);
     let obj = crate::gc_roots::shadow_stack_get(save_point + 1);
-    if let Some(raw) = raw {
+    if !raw.is_null() {
         unsafe {
             std::ptr::write(
                 raw as *mut W_Super,
@@ -146,12 +145,12 @@ pub fn w_property_new(fget: PyObjectRef, fset: PyObjectRef, fdel: PyObjectRef) -
         ob_type: &PROPERTY_TYPE as *const PyType,
         w_class: get_instantiate(&PROPERTY_TYPE),
     };
-    let raw = crate::gc_hook::try_gc_alloc_stable(W_PROPERTY_GC_TYPE_ID, W_PROPERTY_OBJECT_SIZE)
-        .filter(|p| !p.is_null());
+    let raw =
+        crate::gc_hook::try_gc_alloc_stable_raw(W_PROPERTY_GC_TYPE_ID, W_PROPERTY_OBJECT_SIZE);
     let fget = crate::gc_roots::shadow_stack_get(save_point);
     let fset = crate::gc_roots::shadow_stack_get(save_point + 1);
     let fdel = crate::gc_roots::shadow_stack_get(save_point + 2);
-    if let Some(raw) = raw {
+    if !raw.is_null() {
         unsafe {
             std::ptr::write(
                 raw as *mut W_Property,

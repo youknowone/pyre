@@ -61,17 +61,15 @@ pub fn w_memoryview_alloc_header(released: bool) -> PyObjectRef {
         view: std::ptr::null(),
         released,
     };
-    match crate::gc_hook::try_gc_alloc_stable(
+    let raw = crate::gc_hook::try_gc_alloc_stable_raw(
         <W_MemoryView as crate::lltype::GcType>::type_id(),
         <W_MemoryView as crate::lltype::GcType>::SIZE,
-    )
-    .filter(|p| !p.is_null())
-    {
-        Some(raw) => {
-            unsafe { std::ptr::write(raw as *mut W_MemoryView, payload) };
-            raw as PyObjectRef
-        }
-        None => crate::lltype::malloc_typed(payload) as PyObjectRef,
+    );
+    if !raw.is_null() {
+        unsafe { std::ptr::write(raw as *mut W_MemoryView, payload) };
+        raw as PyObjectRef
+    } else {
+        crate::lltype::malloc_typed(payload) as PyObjectRef
     }
 }
 

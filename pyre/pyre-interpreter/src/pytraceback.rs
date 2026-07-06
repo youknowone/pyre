@@ -132,10 +132,9 @@ pub fn w_pytraceback_new(
     // pointers), mirroring `FrameBox::new` (`pyframe.rs:307`).  Before
     // the GC hook is wired (bootstrap, tests) `try_gc_alloc_stable`
     // returns `None`; fall back to the leaked `malloc_typed` block.
-    if let Some(raw) =
-        pyre_object::gc_hook::try_gc_alloc_stable(PYTRACEBACK_GC_TYPE_ID, PYTRACEBACK_OBJECT_SIZE)
-            .filter(|p| !p.is_null())
-    {
+    let raw =
+        pyre_object::gc_hook::try_gc_alloc_stable_raw(PYTRACEBACK_GC_TYPE_ID, PYTRACEBACK_OBJECT_SIZE);
+    if !raw.is_null() {
         pyre_object::gc_interp::note_alloc();
         let ptr = raw as *mut PyTraceback;
         unsafe {

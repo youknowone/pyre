@@ -59,10 +59,9 @@ pub fn w_float_new(value: f64) -> PyObjectRef {
         floatval: value,
     };
     if crate::gc_interp::enabled() {
-        if let Some(raw) =
-            crate::gc_hook::try_gc_alloc_stable(W_FLOAT_GC_TYPE_ID, W_FLOAT_OBJECT_SIZE)
-                .filter(|p| !p.is_null())
-        {
+        let raw =
+            crate::gc_hook::try_gc_alloc_stable_raw(W_FLOAT_GC_TYPE_ID, W_FLOAT_OBJECT_SIZE);
+        if !raw.is_null() {
             crate::gc_interp::note_alloc();
             unsafe {
                 std::ptr::write(raw as *mut W_FloatObject, obj);

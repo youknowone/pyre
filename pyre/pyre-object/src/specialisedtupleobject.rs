@@ -108,12 +108,11 @@ pub fn w_specialised_tuple_ii_new(value0: i64, value1: i64) -> PyObjectRef {
         ob_type: &SPECIALISED_TUPLE_II_TYPE as *const PyType,
         w_class: get_instantiate(&TUPLE_TYPE),
     };
-    if let Some(raw) = crate::gc_hook::try_gc_alloc_stable(
+    let raw = crate::gc_hook::try_gc_alloc_stable_raw(
         SPECIALISED_TUPLE_II_GC_TYPE_ID,
         SPECIALISED_TUPLE_II_OBJECT_SIZE,
-    )
-    .filter(|p| !p.is_null())
-    {
+    );
+    if !raw.is_null() {
         unsafe {
             std::ptr::write(
                 raw as *mut W_SpecialisedTupleObject_ii,
@@ -141,12 +140,11 @@ pub fn w_specialised_tuple_ff_new(value0: f64, value1: f64) -> PyObjectRef {
         ob_type: &SPECIALISED_TUPLE_FF_TYPE as *const PyType,
         w_class: get_instantiate(&TUPLE_TYPE),
     };
-    if let Some(raw) = crate::gc_hook::try_gc_alloc_stable(
+    let raw = crate::gc_hook::try_gc_alloc_stable_raw(
         SPECIALISED_TUPLE_FF_GC_TYPE_ID,
         SPECIALISED_TUPLE_FF_OBJECT_SIZE,
-    )
-    .filter(|p| !p.is_null())
-    {
+    );
+    if !raw.is_null() {
         unsafe {
             std::ptr::write(
                 raw as *mut W_SpecialisedTupleObject_ff,
@@ -185,12 +183,11 @@ pub fn w_specialised_tuple_oo_new(value0: PyObjectRef, value1: PyObjectRef) -> P
         ob_type: &SPECIALISED_TUPLE_OO_TYPE as *const PyType,
         w_class: get_instantiate(&TUPLE_TYPE),
     };
-    if let Some(raw) = crate::gc_hook::try_gc_alloc_stable(
+    let raw = crate::gc_hook::try_gc_alloc_stable_raw(
         SPECIALISED_TUPLE_OO_GC_TYPE_ID,
         SPECIALISED_TUPLE_OO_OBJECT_SIZE,
-    )
-    .filter(|p| !p.is_null())
-    {
+    );
+    if !raw.is_null() {
         unsafe {
             std::ptr::write(
                 raw as *mut W_SpecialisedTupleObject_oo,

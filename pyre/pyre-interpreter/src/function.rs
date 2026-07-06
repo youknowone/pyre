@@ -379,10 +379,11 @@ pub(crate) fn function_new_impl(
     let is_builtin =
         !code.is_null() && unsafe { crate::gateway::is_builtin_code(code as PyObjectRef) };
     if !is_builtin {
-        if let Some(raw) =
-            pyre_object::gc_hook::try_gc_alloc_stable(FUNCTION_GC_TYPE_ID, FUNCTION_OBJECT_SIZE)
-                .filter(|p| !p.is_null())
-        {
+        let raw = pyre_object::gc_hook::try_gc_alloc_stable_raw(
+            FUNCTION_GC_TYPE_ID,
+            FUNCTION_OBJECT_SIZE,
+        );
+        if !raw.is_null() {
             unsafe {
                 std::ptr::write(raw as *mut Function, function);
             }
