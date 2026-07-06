@@ -1624,6 +1624,17 @@ unsafe fn bytes_operand_overrides(obj: PyObjectRef, fwd: &str, rev: &str) -> boo
     dunder_overridden(obj, fwd, t) || dunder_overridden(obj, rev, t)
 }
 
+/// True when `obj` is an exact builtin numeric instance
+/// (`int`/`long`/`float`/`complex`/`bool`, not a subclass).  These types
+/// define no in-place special method (`__iadd__` etc.), so
+/// [`try_inplace_special`] can skip the in-place lookup for them.  A
+/// subclass ([`is_exact_builtin_instance`] false) may override the slot, so
+/// it is excluded.
+unsafe fn is_exact_numeric_builtin(obj: PyObjectRef) -> bool {
+    pyre_object::is_exact_builtin_instance(obj)
+        && (is_int(obj) || is_long(obj) || is_float(obj) || is_complex(obj))
+}
+
 /// The builtin numeric base type backing `obj`'s storage — `int` for
 /// int/long, `float` for float, `None` for a non-numeric operand.
 unsafe fn numeric_base_type(obj: PyObjectRef) -> Option<*const pyre_object::PyType> {
@@ -2501,6 +2512,16 @@ pub(crate) fn try_inplace_special(
     rdunder: Option<&str>,
     seq_bug_compat: bool,
 ) -> Result<Option<PyObjectRef>, PyError> {
+    // An exact builtin numeric lhs (int/long/float/complex/bool) defines no
+    // in-place special, so the lookup below is always a miss.  Skip it — the
+    // string-keyed method-cache probe (a UTF-8 dunder-name intern) is the
+    // dominant per-iteration cost of `total += …`.  Only exact numerics are
+    // gated: builtin sequences (list/bytearray) define `__iadd__`/`__imul__`,
+    // and a subclass may override the in-place slot, so both must fall
+    // through to the lookup.
+    if unsafe { is_exact_numeric_builtin(lhs) } {
+        return Ok(None);
+    }
     // descroperation.py:826 — only when the lhs in-place method exists.
     if let Some(method) = unsafe { lookup_type_special(lhs, idunder) } {
         // descroperation.py:831 seq_bug_compat — for `+=` / `*=` where the
