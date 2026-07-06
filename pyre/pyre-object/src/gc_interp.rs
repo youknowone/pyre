@@ -73,18 +73,22 @@ impl Drop for EvalActivationGuard {
     }
 }
 
-/// Whether the current eval-loop activation is the outermost one on this
-/// thread. The non-moving major walks the interpreter's roots through the
-/// registered pyframe walker, which only sees the `CURRENT_FRAME` /
-/// `f_backref` chain. When a NESTED eval loop runs — e.g. a Python callback
-/// invoked from a native module (`_sre.sub` with a callable, `sorted` key,
-/// …) — that native frame holds live `PyObjectRef`s on the Rust stack that
-/// the walker cannot reach, so a collection there would free still-reachable
-/// old-gen objects. Firing only at the outermost activation keeps the root
-/// set complete; deep pure-Python loops simply collect less often.
+/// Whether the safepoint may fire at this eval-loop nesting depth.
+///
+/// Depth 1 = module-level loop, depth 2 = one called function's loop.
+/// Both are safe: a Python CALL opcode completes before re-entering the
+/// eval loop, so no opcode handler holds a Rust-stack `PyObjectRef` across
+/// the boundary; the pyframe root walker sees the full `CURRENT_FRAME` /
+/// `f_backref` chain.
+///
+/// Depth ≥ 3 = a callback re-entry from inside an opcode handler (e.g.
+/// FOR_ITER → `__getitem__`, exception handler, `_sre.sub` callable,
+/// `sorted` key). The outer handler holds live `PyObjectRef`s on the
+/// Rust stack that the walker cannot reach — a collection would free
+/// still-reachable old-gen objects. Block the safepoint there.
 #[inline]
 fn at_outermost_activation() -> bool {
-    EVAL_NESTING.with(|d| d.get() <= 1)
+    EVAL_NESTING.with(|d| d.get() <= 2)
 }
 
 /// Tri-state for the safepoint collection, gated by `PYRE_GC_INTERP_COLLECT`

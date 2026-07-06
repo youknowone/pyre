@@ -3968,9 +3968,13 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
     // FBW FOR_ITER Option-C guard snapshots this around a residual call to
     // detect a body effect that ran through user code.
     pyre_interpreter::call::bump_frame_entry_count();
-    // Count this interpreter activation so the GC safepoint below fires only at
-    // the outermost eval loop (PYRE_GC_INTERP root-completeness). No-op when the
-    // flag is off.
+    // Count this eval-loop activation for the GC safepoint's
+    // at_outermost_activation gate (gh#393). The gate allows collection
+    // at depth ≤ 2 (module + one called function) where the CALL opcode
+    // has completed and no Rust-stack ref is live, but blocks at depth
+    // ≥ 3 (a callback re-entry from FOR_ITER→__getitem__, exception
+    // handler, etc., where the outer opcode handler holds a PyObjectRef
+    // on the Rust stack that walk_pyframe_roots cannot reach).
     let _eval_activation = pyre_object::gc_interp::EvalActivationGuard::enter();
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
     let env = PyreEnv;
@@ -4194,9 +4198,8 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
 /// eval_loop_jit, but always calls jit_merge_point_hook since tracing
 /// is already active from start_bridge_tracing.
 pub(crate) fn eval_loop_jit_bridge(frame: &mut PyFrame) -> LoopResult {
-    // Count this interpreter activation alongside eval_loop / eval_loop_jit so
-    // the safepoint's outermost-activation gate accounts for a bridge loop on
-    // the stack. No-op when the flag is off.
+    // Same as eval_loop_jit: count the activation for the safepoint's
+    // depth gate (gh#393). See the comment in eval_loop_jit.
     let _eval_activation = pyre_object::gc_interp::EvalActivationGuard::enter();
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
     let env = PyreEnv;
