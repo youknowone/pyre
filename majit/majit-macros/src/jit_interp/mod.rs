@@ -2291,17 +2291,37 @@ fn rewrite_body(
                                     // transfer state directly and skip the body
                                     // re-run, so nothing should replay the queue.
                                     majit_metainterp::cancel_observer_replay();
+                                    // Push the walk-mutated scalar state fields
+                                    // (e.g. a walk-advanced `selected`) from the
+                                    // still-live persistent sym into native
+                                    // `state`. The walk advances these on the sym
+                                    // via BC_STORE_STATE_FIELD only; native
+                                    // `state` is frozen at trace-start (S_k), so
+                                    // without this the scalars stay stale — and a
+                                    // `recover` that re-derives caches FROM a
+                                    // scalar (stacksize from selected) would then
+                                    // read the wrong index. Must precede both
+                                    // `recover` (which refines storage-backed
+                                    // caches from the current scalars) and
+                                    // `try_resume_into_compiled_loop` (which reads
+                                    // the native scalars to seed the compiled
+                                    // loop). Mirrors the authoritative branch's
+                                    // ordering. No-op with no scalar state fields
+                                    // or no live sym.
+                                    #driver.writeback_authoritative_state_fields(
+                                        &mut #state,
+                                    );
                                     // Transfer any loop-carried reds the walk
                                     // captured, then re-derive the
                                     // storage-backed cache fields (stacksize,
                                     // selected/storage refs) from the
                                     // walk-advanced shared storage via the
-                                    // `recover` hook. The native `state`'s scalar
-                                    // fields are frozen at trace-start (S_k) — the
-                                    // walk mutates only the shared storage and
-                                    // the JitCode machine — so the cache fields
-                                    // are one iteration stale; `recover` is what
-                                    // brings them to the walk-final state (S_k+1).
+                                    // `recover` hook. `__sp_reds` is empty today
+                                    // (merge-point red-operand slots don't map to
+                                    // native state fields; the scalar write-back
+                                    // above is the authoritative scalar source),
+                                    // so this block is scaffolding for a future
+                                    // JIT whose merge point carries real reds.
                                     if !__sp_reds.is_empty() {
                                         let __sp_meta = majit_metainterp::JitState::build_meta(
                                             &#state, __sp_pc, #env,
