@@ -115,6 +115,16 @@ pub struct PyJitCodeMetadata {
     pub block_head_py_by_jit_pc: Vec<(usize, u32)>,
     /// Value-stack depth at each Python PC, in slots above stack_base.
     pub depth_at_py_pc: Vec<u16>,
+    /// task#50 phase-0: the jitcode-pc-keyed twin of `depth_at_py_pc`. Each
+    /// distinct `-live-` marker byte offset a PC resolves to → the value-stack
+    /// depth of the SMALLEST py_pc resolving there (the block head), sorted
+    /// ascending by offset for binary search. Built from the SAME `pc_map`
+    /// bytes + `depth_at_py_pc` at `finalize_jitcode`, so a lookup equals
+    /// `depth_at_py_pc[python_pc_for_jitcode_pc(jit_pc)]` by construction. A
+    /// scaffolding twin for the eventual jitcode-pc-keyed resume re-key
+    /// (`PYRE_PCMAP_DEPTH_AUDIT` certifies the equality); empty for skeleton /
+    /// portal-bridge / fixture metadata.
+    pub depth_by_jit_pc: Vec<(usize, u16)>,
     /// Post-regalloc Ref-bank color of the call-result operand-stack slot
     /// (top of stack = `depth_at_py_pc[pc] - 1`) at each Python PC, or
     /// `u16::MAX` where the stack is empty. The inline multiframe capture
@@ -420,6 +430,24 @@ impl PyJitCode {
         self.metadata.pc_map.get(py_pc).copied()
     }
 
+    /// task#50 phase-0: value-stack depth keyed directly by a JitCode byte
+    /// offset, via the `depth_by_jit_pc` twin (binary search on block-head
+    /// offset). Equals `depth_at_py_pc[python_pc_for_jitcode_pc(jit_pc)]` by
+    /// construction when `jit_pc` is a block-head marker offset; `None` when
+    /// the twin is empty (skeleton / portal-bridge) or `jit_pc` is not a
+    /// marker offset. Scaffolding for the eventual jitcode-pc resume re-key
+    /// that lets `pc_map` retire.
+    pub fn depth_for_jitcode_pc(&self, jit_pc: usize) -> Option<u16> {
+        let table = &self.metadata.depth_by_jit_pc;
+        if table.is_empty() {
+            return None;
+        }
+        table
+            .binary_search_by_key(&jit_pc, |&(off, _)| off)
+            .ok()
+            .map(|i| table[i].1)
+    }
+
     /// JitCode byte offset of `py_pc`'s post-`residual_call` `-live-`
     /// (the marker preceding the opcode's own `catch_exception`), or
     /// `None` if `py_pc` makes no residual call.  After-residual-call
@@ -549,6 +577,7 @@ impl PyJitCode {
                 after_residual_call_resume_pc: Vec::new(),
                 first_jit_pc_by_py_pc: Vec::new(),
                 block_head_py_by_jit_pc: Vec::new(),
+                depth_by_jit_pc: Vec::new(),
                 depth_at_py_pc: Vec::new(),
                 result_color_at_pc: Vec::new(),
                 // u16::MAX sentinel mirrors `canonical_bridge::install_portal_for`

@@ -8968,6 +8968,20 @@ fn carry_audit_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_CARRY_AUDIT").is_some())
 }
 
+/// `PYRE_PCMAP_DEPTH_AUDIT` enables the assertion that the jitcode-pc-keyed
+/// `depth_by_jit_pc` twin reproduces the py_pc-indexed `depth_at_py_pc` value
+/// at the walker capture seam: for a genuine walker `op_pc` that lands on a
+/// block-head marker, `depth_for_jitcode_pc(op_pc)` equals
+/// `depth_at_py_pc[python_pc_for_jitcode_pc(op_pc)]`.  Both are compile-time
+/// derivations of the same `pc_map` bytes, so the equality holds by
+/// construction; the audit certifies the depth re-key precondition (the twin
+/// can source the value from `op_pc` without the py_pc channel) ahead of the
+/// eventual `pc_map`-deletion flip.  Diagnostic only; off in production.
+fn depth_audit_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_DEPTH_AUDIT").is_some())
+}
+
 pub(crate) fn python_pc_for_jitcode_pc(metadata: &crate::PyJitCodeMetadata, jit_pc: usize) -> u32 {
     // Exact inverse: `first_jit_pc_by_py_pc[py]` is the byte offset of the
     // FIRST instruction opcode `py` emitted (`usize::MAX` = the PC emitted
@@ -9817,6 +9831,29 @@ fn walker_capture_snapshot_for_last_guard_impl(
             let (py_pc, jitcode_index, num_instrs) = unsafe {
                 let jc = &*sym.jitcode;
                 let mut py = python_pc_for_jitcode_pc(&jc.payload.metadata, op_pc);
+                // task#50 phase-0: certify the jitcode-pc-keyed `depth_by_jit_pc`
+                // twin reproduces the py_pc-indexed `depth_at_py_pc` value the
+                // decode still reads.  When the genuine walker `op_pc` lands on a
+                // block-head marker the twin has an entry for, its depth must
+                // equal `depth_at_py_pc[py]` (both derived from the same `pc_map`
+                // bytes at compile time).  This is the precondition certificate
+                // for re-sourcing the resume depth off `op_pc` without the py_pc
+                // channel.  Off in production → byte-identical.
+                if depth_audit_enabled() {
+                    if let Some(twin_depth) = jc.payload.depth_for_jitcode_pc(op_pc as usize) {
+                        let field_depth = jc
+                            .payload
+                            .metadata
+                            .depth_at_py_pc
+                            .get(py as usize)
+                            .copied();
+                        assert_eq!(
+                            Some(twin_depth),
+                            field_depth,
+                            "depth_by_jit_pc diverges from depth_at_py_pc at op_pc={op_pc} py={py}"
+                        );
+                    }
+                }
                 // The inverse-`pc_map` can land on a Python trivia
                 // instruction's jitcode region (e.g. a branch target
                 // whose block lowers `NOT_TAKEN`).  A resume coordinate
