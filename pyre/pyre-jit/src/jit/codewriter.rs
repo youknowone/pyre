@@ -12645,6 +12645,52 @@ impl CodeWriter {
             depth_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
         }
 
+        // task#50 phase-1: predecessor-keyed jitcode-pc twins of
+        // `pcdep_color_slots` and `depth_at_pc`, resolving a JitCode byte
+        // offset the way `python_pc_for_jitcode_pc` does — the block-head marker
+        // match first, else the largest `first_jit_pc_by_py_pc[py]` at-or-before
+        // the offset (predecessor op containment).  Both tiers are baked into
+        // ONE table: seed every op-start offset with its own py's value, then
+        // OVERRIDE each block-head marker offset with the block-head py's value
+        // (marker precedence, `python_pc_for_jitcode_pc` :9009-9024).  A
+        // predecessor binary search (largest offset <= jit_pc) then reproduces
+        // `table[python_pc_for_jitcode_pc(jit_pc)]` for the carried resume
+        // coordinates that reach the decode re-inversion at `state.rs`
+        // (`bridge_semantic_maps_at_with_jitcode_pc`), which are the guard's own
+        // op offset or a block-head marker — never a mid-op byte.  Certified by
+        // `PYRE_PCMAP_BRIDGE_AUDIT`; empty for skeleton / portal-bridge.
+        let mut pcdep_by_jit_pc: Vec<(usize, Vec<(u8, u16, u16)>)> = Vec::new();
+        let mut depth_pred_by_jit_pc: Vec<(usize, u16)> = Vec::new();
+        if !first_jit_pc_by_py_pc.is_empty() {
+            use std::collections::BTreeMap;
+            // offset -> resolving py. Seed every op-start offset with its own py
+            // (`first_jit_pc_by_py_pc`, the predecessor-scan tier), then set each
+            // block-head marker offset to the SMALLEST py resolving there (the
+            // marker tier that takes precedence in `python_pc_for_jitcode_pc`).
+            // Op-start and marker offsets are disjoint (each byte belongs to one
+            // instruction, :8998-9001), so the marker writes never clobber a real
+            // op-start; the explicit second pass just makes the precedence exact.
+            let mut by_off: BTreeMap<usize, usize> = BTreeMap::new();
+            for (py, &pos) in first_jit_pc_by_py_pc.iter().enumerate() {
+                if pos != usize::MAX {
+                    by_off.insert(pos, py);
+                }
+            }
+            let mut marker_seen: std::collections::HashSet<usize> =
+                std::collections::HashSet::new();
+            for (py, &off) in pc_map_bytes.iter().enumerate() {
+                if marker_seen.insert(off) {
+                    by_off.insert(off, py);
+                }
+            }
+            for (&off, &py) in by_off.iter() {
+                let pcdep = pcdep_color_slots.get(py).cloned().unwrap_or_default();
+                let depth = depth_at_pc.get(py).copied().unwrap_or(0);
+                pcdep_by_jit_pc.push((off, pcdep));
+                depth_pred_by_jit_pc.push((off, depth));
+            }
+        }
+
         // call.py:148 `jd.mainjitcode.jitdriver_sd = jd`. RPython mutates
         // the shell returned by `grab_initial_jitcodes`; pyre still
         // builds the populated `JitCode` as the final codewriter step, so
@@ -12673,6 +12719,8 @@ impl CodeWriter {
             block_head_py_by_jit_pc,
             depth_at_py_pc: depth_at_pc,
             depth_by_jit_pc,
+            pcdep_by_jit_pc,
+            depth_pred_by_jit_pc,
             result_color_at_pc,
             portal_frame_reg,
             portal_ec_reg,

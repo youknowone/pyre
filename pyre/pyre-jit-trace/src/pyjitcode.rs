@@ -125,6 +125,25 @@ pub struct PyJitCodeMetadata {
     /// (`PYRE_PCMAP_DEPTH_AUDIT` certifies the equality); empty for skeleton /
     /// portal-bridge / fixture metadata.
     pub depth_by_jit_pc: Vec<(usize, u16)>,
+    /// task#50 phase-1: predecessor-keyed jitcode-pc twin of `pcdep_color_slots`.
+    /// Each entry `(off, colors)` maps a JitCode byte offset to the pcdep
+    /// color→slot list of the py_pc that `python_pc_for_jitcode_pc(off)` returns
+    /// (block-head marker precedence, else the largest `first_jit_pc_by_py_pc`
+    /// at-or-before `off`). A PREDECESSOR binary search (largest offset ≤ jit_pc)
+    /// then reproduces `pcdep_color_slots[python_pc_for_jitcode_pc(jit_pc)]` for
+    /// the carried resume coordinates reaching the decode re-inversion at
+    /// `bridge_semantic_maps_at_with_jitcode_pc`. Sorted ascending by offset;
+    /// empty for skeleton / portal-bridge / fixture. `PYRE_PCMAP_BRIDGE_AUDIT`
+    /// certifies the equality.
+    pub pcdep_by_jit_pc: Vec<(usize, Vec<(u8, u16, u16)>)>,
+    /// task#50 phase-1: predecessor-keyed jitcode-pc twin of `depth_at_py_pc`,
+    /// built alongside `pcdep_by_jit_pc` with the same `python_pc_for_jitcode_pc`
+    /// resolution (marker precedence + first_jit predecessor). Distinct from
+    /// `depth_by_jit_pc`, which is EXACT-match on block-head markers only; this
+    /// one predecessor-covers op offsets too, so it agrees with the depth read
+    /// at the decode seam for every carried coordinate. `PYRE_PCMAP_BRIDGE_AUDIT`
+    /// certifies it equals `depth_at_py_pc[python_pc_for_jitcode_pc(jit_pc)]`.
+    pub depth_pred_by_jit_pc: Vec<(usize, u16)>,
     /// Post-regalloc Ref-bank color of the call-result operand-stack slot
     /// (top of stack = `depth_at_py_pc[pc] - 1`) at each Python PC, or
     /// `u16::MAX` where the stack is empty. The inline multiframe capture
@@ -448,6 +467,48 @@ impl PyJitCode {
             .map(|i| table[i].1)
     }
 
+    /// task#50 phase-1: predecessor index into a jitcode-pc twin — the entry
+    /// with the largest offset at-or-before `jit_pc`, reproducing
+    /// `python_pc_for_jitcode_pc`'s marker-then-first_jit resolution baked into
+    /// the twin at build time. `None` when the table is empty (skeleton /
+    /// portal-bridge) or `jit_pc` precedes the first entry.
+    fn predecessor_index(search: Result<usize, usize>) -> Option<usize> {
+        match search {
+            Ok(i) => Some(i),
+            Err(0) => None,
+            Err(i) => Some(i - 1),
+        }
+    }
+
+    /// task#50 phase-1: pcdep color→slot list keyed directly by a JitCode byte
+    /// offset via the `pcdep_by_jit_pc` predecessor twin. Equals
+    /// `pcdep_color_slots[python_pc_for_jitcode_pc(jit_pc)]` by construction for
+    /// a carried resume coordinate; `None` when the twin is empty (skeleton /
+    /// portal-bridge). Scaffolding for the decode-side pc_map re-inversion
+    /// retirement (`PYRE_PCMAP_BRIDGE_AUDIT` certifies the equality).
+    pub fn pcdep_for_jitcode_pc(&self, jit_pc: usize) -> Option<Vec<(u8, u16, u16)>> {
+        let table = &self.metadata.pcdep_by_jit_pc;
+        if table.is_empty() {
+            return None;
+        }
+        let search = table.binary_search_by_key(&jit_pc, |&(off, _)| off);
+        Self::predecessor_index(search).map(|i| table[i].1.clone())
+    }
+
+    /// task#50 phase-1: value-stack depth keyed by a JitCode byte offset via the
+    /// `depth_pred_by_jit_pc` predecessor twin. Equals
+    /// `depth_at_py_pc[python_pc_for_jitcode_pc(jit_pc)]` by construction for a
+    /// carried resume coordinate; `None` when the twin is empty. Predecessor
+    /// analog of [`Self::depth_for_jitcode_pc`] (which is EXACT-match on markers).
+    pub fn depth_for_jitcode_pc_pred(&self, jit_pc: usize) -> Option<u16> {
+        let table = &self.metadata.depth_pred_by_jit_pc;
+        if table.is_empty() {
+            return None;
+        }
+        let search = table.binary_search_by_key(&jit_pc, |&(off, _)| off);
+        Self::predecessor_index(search).map(|i| table[i].1)
+    }
+
     /// JitCode byte offset of `py_pc`'s post-`residual_call` `-live-`
     /// (the marker preceding the opcode's own `catch_exception`), or
     /// `None` if `py_pc` makes no residual call.  After-residual-call
@@ -578,6 +639,8 @@ impl PyJitCode {
                 first_jit_pc_by_py_pc: Vec::new(),
                 block_head_py_by_jit_pc: Vec::new(),
                 depth_by_jit_pc: Vec::new(),
+                pcdep_by_jit_pc: Vec::new(),
+                depth_pred_by_jit_pc: Vec::new(),
                 depth_at_py_pc: Vec::new(),
                 result_color_at_pc: Vec::new(),
                 // u16::MAX sentinel mirrors `canonical_bridge::install_portal_for`

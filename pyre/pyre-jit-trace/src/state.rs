@@ -1550,7 +1550,39 @@ pub(crate) fn bridge_semantic_maps_at_with_jitcode_pc(
             // A non-decodable carried coordinate falls back to the
             // merge-target PC so liveness and pcdep key the same point.
             if payload.jitcode.can_decode_live_vars(jp, sd.op_live) {
-                crate::jitcode_dispatch::python_pc_for_jitcode_pc(&payload.metadata, jp) as usize
+                let rp = crate::jitcode_dispatch::python_pc_for_jitcode_pc(&payload.metadata, jp)
+                    as usize;
+                // task#50 phase-1: certify the predecessor-keyed jitcode-pc twins
+                // reproduce the py_pc-indexed pcdep/depth this seam still reads
+                // via the re-inversion. When the carried `jitcode_pc` resolves to
+                // `rp`, the twins keyed on `jp` must equal the tables keyed on
+                // `rp` (both compile-time derivations of the same coordinates).
+                // This is the precondition certificate for consuming the twins
+                // from `jp` directly and retiring the re-inversion. Off in
+                // production → byte-identical.
+                if crate::jitcode_dispatch::bridge_audit_enabled() {
+                    if let Some(twin) = payload.pcdep_for_jitcode_pc(jp) {
+                        let via_py = payload
+                            .metadata
+                            .pcdep_color_slots
+                            .get(rp)
+                            .cloned()
+                            .unwrap_or_default();
+                        assert_eq!(
+                            twin, via_py,
+                            "pcdep_by_jit_pc diverges from pcdep_color_slots at jp={jp} rp={rp}"
+                        );
+                    }
+                    if let Some(twin_d) = payload.depth_for_jitcode_pc_pred(jp) {
+                        let via_py_d =
+                            payload.metadata.depth_at_py_pc.get(rp).copied().unwrap_or(0);
+                        assert_eq!(
+                            twin_d, via_py_d,
+                            "depth_pred_by_jit_pc diverges from depth_at_py_pc at jp={jp} rp={rp}"
+                        );
+                    }
+                }
+                rp
             } else {
                 majit_ir::resumedata::decode_resume_pc(pc).0 as usize
             }
@@ -11609,6 +11641,8 @@ mod tests {
                 first_jit_pc_by_py_pc: vec![0],
                 block_head_py_by_jit_pc: vec![(0, 0)],
                 depth_by_jit_pc: vec![(0, 2)],
+                pcdep_by_jit_pc: vec![(0, Vec::new())],
+                depth_pred_by_jit_pc: vec![(0, 2)],
                 depth_at_py_pc: vec![2],
                 result_color_at_pc: Vec::new(),
                 portal_frame_reg: 0,

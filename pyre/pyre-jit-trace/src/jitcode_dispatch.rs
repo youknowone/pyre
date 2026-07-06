@@ -8982,6 +8982,22 @@ fn depth_audit_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_DEPTH_AUDIT").is_some())
 }
 
+/// `PYRE_PCMAP_BRIDGE_AUDIT` enables the assertion that the predecessor-keyed
+/// `pcdep_by_jit_pc` / `depth_pred_by_jit_pc` twins reproduce the py_pc-indexed
+/// `pcdep_color_slots` / `depth_at_py_pc` values at the decode re-inversion seam
+/// (`bridge_semantic_maps_at_with_jitcode_pc`): for a carried genuine
+/// `jitcode_pc`, `pcdep_for_jitcode_pc(jp)` equals
+/// `pcdep_color_slots[python_pc_for_jitcode_pc(jp)]` and likewise for depth.
+/// Both are compile-time derivations of the same `pc_map` / `first_jit`
+/// coordinates, so the equality holds by construction; the audit certifies the
+/// precondition for retiring the decode-side `pc_map` re-inversion (the twins
+/// can source pcdep/depth from the carried `jitcode_pc` without the py_pc
+/// channel). Diagnostic only; off in production.
+pub(crate) fn bridge_audit_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_BRIDGE_AUDIT").is_some())
+}
+
 pub(crate) fn python_pc_for_jitcode_pc(metadata: &crate::PyJitCodeMetadata, jit_pc: usize) -> u32 {
     // Exact inverse: `first_jit_pc_by_py_pc[py]` is the byte offset of the
     // FIRST instruction opcode `py` emitted (`usize::MAX` = the PC emitted
