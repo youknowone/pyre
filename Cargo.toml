@@ -61,13 +61,16 @@ pyre-jit-trace = { version = "0.0.2", path = "pyre/pyre-jit-trace" }
 pyre-wasm = { version = "0.0.2", path = "pyre/pyre-wasm" }
 pyrex = { version = "0.0.2", path = "pyre/pyrex" }
 
-rustpython-common = { git = "https://github.com/RustPython/RustPython.git", rev = "83ce1a7cad790dcf95886f119c1585ee4089a41c" }
-rustpython-literal = { git = "https://github.com/RustPython/RustPython.git", rev = "83ce1a7cad790dcf95886f119c1585ee4089a41c" }
-rustpython-compiler = { git = "https://github.com/RustPython/RustPython.git", rev = "83ce1a7cad790dcf95886f119c1585ee4089a41c" }
-rustpython-compiler-core = { git = "https://github.com/RustPython/RustPython.git", rev = "83ce1a7cad790dcf95886f119c1585ee4089a41c" }
-rustpython-host_env = { git = "https://github.com/RustPython/RustPython.git", rev = "83ce1a7cad790dcf95886f119c1585ee4089a41c" }
-rustpython-wtf8 = { git = "https://github.com/RustPython/RustPython.git", rev = "83ce1a7cad790dcf95886f119c1585ee4089a41c" }
-sre-engine = { package = "rustpython-sre_engine", git = "https://github.com/RustPython/RustPython.git", rev = "83ce1a7cad790dcf95886f119c1585ee4089a41c" }
+# Temporarily pinned to the fork's `unicode` branch head (adds the
+# rustpython-unicode crate; not yet merged upstream). Move back to
+# RustPython/RustPython once the branch lands.
+rustpython-common = { git = "https://github.com/youknowone/RustPython.git", rev = "a6271d25e426ecae4acab70f95271f0ef9badfaa" }
+rustpython-literal = { git = "https://github.com/youknowone/RustPython.git", rev = "a6271d25e426ecae4acab70f95271f0ef9badfaa" }
+rustpython-compiler = { git = "https://github.com/youknowone/RustPython.git", rev = "a6271d25e426ecae4acab70f95271f0ef9badfaa" }
+rustpython-compiler-core = { git = "https://github.com/youknowone/RustPython.git", rev = "a6271d25e426ecae4acab70f95271f0ef9badfaa" }
+rustpython-host_env = { git = "https://github.com/youknowone/RustPython.git", rev = "a6271d25e426ecae4acab70f95271f0ef9badfaa" }
+rustpython-wtf8 = { git = "https://github.com/youknowone/RustPython.git", rev = "a6271d25e426ecae4acab70f95271f0ef9badfaa" }
+sre-engine = { package = "rustpython-sre_engine", git = "https://github.com/youknowone/RustPython.git", rev = "a6271d25e426ecae4acab70f95271f0ef9badfaa" }
 
 # majit JIT framework
 majit = { version = "0.0.2", path = "majit/majit" }
