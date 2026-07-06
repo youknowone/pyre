@@ -163,9 +163,10 @@ fn install_gc_box(gc: Box<dyn majit_gc::GcAllocator>) {
     majit_gc::set_active_write_barrier(Some(dynasm_gc_write_barrier));
 }
 
-/// Production path: install a `GcHandle` forwarding to the global singleton.
-pub fn install_gc_standalone(gc_ptr: *mut dyn majit_gc::GcAllocator) {
-    let mut handle: Box<dyn majit_gc::GcAllocator> = Box::new(majit_gc::GcHandle(gc_ptr));
+/// Production path: install a `GcHandle` (zero-size, routes through
+/// `gc_sync`) into TLS and register all `set_active_*` hooks.
+pub fn install_gc_standalone() {
+    let mut handle: Box<dyn majit_gc::GcAllocator> = Box::new(majit_gc::GcHandle);
     handle.freeze_types();
     install_gc_box(handle);
 }
