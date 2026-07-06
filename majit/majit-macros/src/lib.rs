@@ -341,10 +341,7 @@ fn emit_helper_call_target_fn(
             let ReturnType::Type(_, ty) = &func.sig.output else {
                 return Ok(None);
             };
-            let Some(converted_return) = helper_return_to_i64(
-                call_expr.clone(),
-                ty,
-            ) else {
+            let Some(converted_return) = helper_return_to_i64(call_expr.clone(), ty) else {
                 return Ok(None);
             };
             quote! {
@@ -366,10 +363,7 @@ fn emit_helper_call_target_fn(
                     #call_expr
                 }
             };
-            let Some(concrete_return) = helper_return_to_i64(
-                call_expr.clone(),
-                ty,
-            ) else {
+            let Some(concrete_return) = helper_return_to_i64(call_expr.clone(), ty) else {
                 return Ok(None);
             };
             let concrete_wrapper = quote! {

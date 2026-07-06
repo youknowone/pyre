@@ -227,8 +227,7 @@ pub fn w_long_from_raw(value: *mut BigInt) -> PyObjectRef {
         // rooted as a GcRef slot rather than a PyObjectRef.
         let mut slot = value as *mut u8;
         let pinned = unsafe { crate::gc_hook::try_gc_add_root(&mut slot as *mut *mut u8) };
-        let raw =
-            crate::gc_hook::try_gc_alloc_stable_raw(W_LONG_GC_TYPE_ID, W_LONG_OBJECT_SIZE);
+        let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_LONG_GC_TYPE_ID, W_LONG_OBJECT_SIZE);
         let value = slot as *mut BigInt;
         if pinned {
             crate::gc_hook::try_gc_remove_root(&mut slot as *mut *mut u8);

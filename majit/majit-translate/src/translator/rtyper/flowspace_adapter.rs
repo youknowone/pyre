@@ -4245,7 +4245,11 @@ mod tests {
             result: Some(vars[3].clone()),
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
-                    segments: vec!["pyre_object".into(), "pyobject".into(), "ll_issubclass".into()],
+                    segments: vec![
+                        "pyre_object".into(),
+                        "pyobject".into(),
+                        "ll_issubclass".into(),
+                    ],
                 },
                 args: vec![vars[1].clone(), vars[2].clone()],
                 result_ty: ValueType::Bool,
@@ -4285,7 +4289,11 @@ mod tests {
             result: Some(vars[3].clone()),
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
-                    segments: vec!["pyre_object".into(), "pyobject".into(), "ll_isinstance".into()],
+                    segments: vec![
+                        "pyre_object".into(),
+                        "pyobject".into(),
+                        "ll_isinstance".into(),
+                    ],
                 },
                 args: vec![vars[1].clone(), vars[2].clone()],
                 result_ty: ValueType::Bool,

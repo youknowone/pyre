@@ -676,6 +676,18 @@ impl<'c> Lowerer<'c> {
                             __builder.residual_call_ref_canonical_via_target(__fn_idx, __typed_args, #reg);
                         },
                     );
+                    // jtransform.py:467-470 — a residual ref call can raise, so
+                    // the trailing `-live-` follows it exactly as the shared
+                    // path below emits for the other explicit residual arms.
+                    // This arm returns early (to attach `struct_type`), so it
+                    // cannot fall through to that shared emission and must emit
+                    // the marker itself.
+                    if post_live_after_call {
+                        self.emit_op(
+                            OpMeta::live_marker(),
+                            quote! { let _ = __builder.live_placeholder(); },
+                        );
+                    }
                     // Check `call_returns` config for a declared return
                     // struct type, enabling subsequent `result.field`
                     // access to resolve through `ref_fields`.
