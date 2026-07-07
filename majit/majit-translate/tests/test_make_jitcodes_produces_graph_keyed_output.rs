@@ -112,8 +112,8 @@ fn slow_generated_jitcodes_keep_opcode_dispatch_shape() {
         let dispatch_keys = dispatch_keys(reg);
         assert_eq!(
             dispatch_keys.len(),
-            107,
-            "expected 107 per-opcode dispatch arms in `by_path`; got {}",
+            111,
+            "expected 111 per-opcode dispatch arms in `by_path`; got {}",
             dispatch_keys.len()
         );
         let dispatch_selectors = selectors_from_dispatch_keys(&dispatch_keys);
@@ -127,8 +127,8 @@ fn slow_generated_jitcodes_keep_opcode_dispatch_shape() {
                 .iter()
                 .filter(|selector| selector.contains(" | "))
                 .count(),
-            4,
-            "expected four Or-pattern dispatch arms"
+            3,
+            "expected three Or-pattern dispatch arms"
         );
         assert!(
             dispatch_selectors.contains("Instruction::PopTop"),
@@ -148,7 +148,6 @@ fn slow_generated_jitcodes_keep_opcode_dispatch_shape() {
             "Instruction::EndAsyncFor",
             "Instruction::GetAiter",
             "Instruction::GetAnext",
-            "Instruction::GetAwaitable",
         ];
         assert!(
             dispatch_selectors.iter().any(|selector| {
@@ -157,6 +156,10 @@ fn slow_generated_jitcodes_keep_opcode_dispatch_shape() {
                     .all(|case| selector.split(" | ").any(|part| part == *case))
             }),
             "async-stub Or group present: got {dispatch_selectors:?}"
+        );
+        assert!(
+            dispatch_selectors.contains("Instruction::GetAwaitable"),
+            "GetAwaitable present as its own arm"
         );
     });
 
