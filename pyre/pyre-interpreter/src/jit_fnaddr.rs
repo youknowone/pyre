@@ -547,6 +547,24 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::try_gc_alloc_stable_raw",
         pyre_object::gc_hook::try_gc_alloc_stable_raw as *const (),
     );
+    // The interp-alloc boxing tail's two GC-hook toucher residuals: `note_alloc`
+    // bumps the runtime-mutable `ALLOC_SINCE_GC` atomic, and
+    // `try_gc_charge_oldgen_external` dispatches through a thread-local `Cell`.
+    // Neither is a build-time constant, so both carry `#[dont_look_inside]` and
+    // bind their `()`-returning `fn` directly by qualified path (siblings of
+    // `try_gc_alloc_stable_raw` / `gc_interp::enabled`).
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::gc_interp::note_alloc",
+        "pyre_object::note_alloc",
+        pyre_object::gc_interp::note_alloc as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::gc_hook::try_gc_charge_oldgen_external",
+        "pyre_object::try_gc_charge_oldgen_external",
+        pyre_object::gc_hook::try_gc_charge_oldgen_external as *const (),
+    );
     push_fnaddr(
         &mut entries,
         "pyre_interpreter::module::_weakref::interp__weakref::dereference",

@@ -126,7 +126,12 @@ pub fn enabled() -> bool {
 
 /// Account for one interpreter-routed allocation. Called from `w_int_new` /
 /// `w_float_new` after a successful `try_gc_alloc_stable`.
-#[inline]
+///
+/// Touches the runtime-mutable `ALLOC_SINCE_GC` atomic; the value is not a
+/// build-time constant, so the JIT residualises the call instead of tracing
+/// into it (`@dont_look_inside`, the [`enabled`] sibling). A `()` return has no
+/// discriminant to erase.
+#[majit_macros::dont_look_inside]
 pub fn note_alloc() {
     ALLOC_SINCE_GC.fetch_add(1, Ordering::Relaxed);
 }

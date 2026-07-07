@@ -177,7 +177,11 @@ pub fn clear_gc_charge_oldgen_external_hook() {
 /// minor, so it is safe after allocating an unrooted payload: a directly-old-gen
 /// bignum's limb `Vec` would otherwise stay invisible to the threshold until
 /// the next major's `recompute_oldgen_external_bytes`.
-#[inline]
+// `dont_look_inside`: host hook dispatch (`thread_local!` `Cell` indirection)
+// stays opaque to the JIT — the `try_gc_add_root` / `try_gc_remove_root` /
+// `try_gc_write_barrier` twins; calls residualize via the registered fnaddr
+// (`rlib/jit.py:139`). A `()` return has no discriminant to erase.
+#[majit_macros::dont_look_inside]
 pub fn try_gc_charge_oldgen_external(obj_addr: usize, bytes: usize) {
     GC_CHARGE_OLDGEN_EXTERNAL_HOOK.with(|cell| {
         if let Some(f) = cell.get() {
