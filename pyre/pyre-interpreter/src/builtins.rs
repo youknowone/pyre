@@ -6314,8 +6314,7 @@ fn unhashable_type_error(obj: PyObjectRef) -> crate::PyError {
 /// numeric values land on the same residue.
 const HASH_BITS: u32 = 61;
 const HASH_MODULUS: u64 = (1u64 << HASH_BITS) - 1;
-/// `floatobject.py:29-30` HASH_INF / HASH_NAN sentinels.
-const HASH_INF: i64 = 314159;
+/// `floatobject.py:29-30` HASH_NAN sentinel.
 const HASH_NAN: i64 = 0;
 
 /// Numeric hash of a machine-word integer: reduce `a` modulo the
@@ -6344,107 +6343,15 @@ pub(crate) fn _hash_long(v: &BigInt) -> i64 {
     rustpython_common::hash::hash_bigint(v)
 }
 
-/// `pypy/objspace/std/floatobject.py:790-822 _hash_float` line-by-line
-/// port:
-///
-/// ```python
-/// def _hash_float(v):
-///     if math.isinf(v): return HASH_INF if v > 0 else -HASH_INF
-///     # nan hash handled elsewhere (W_FloatObject.descr_hash routes to HASH_NAN)
-///     m, e = math.frexp(v)
-///     sign = 1
-///     if m < 0: sign = -1; m = -m
-///     x = r_uint(0)
-///     while m:
-///         x = ((x << 28) & HASH_MODULUS) | x >> (HASH_BITS - 28)
-///         m *= 268435456.0          # 2**28
-///         e -= 28
-///         y = r_uint(m)
-///         m -= y
-///         x += y
-///         if x >= HASH_MODULUS: x -= HASH_MODULUS
-///     e = e % HASH_BITS if e >= 0 else HASH_BITS - 1 - ((-1 - e) % HASH_BITS)
-///     x = ((x << e) & HASH_MODULUS) | x >> (HASH_BITS - e)
-///     x = intmask(intmask(x) * sign)
-///     x -= (x == -1)
-///     return x
-/// ```
-///
-/// For finite floats whose value is an integer that fits in `i64`,
-/// this returns the same value as `_hash_int(v as i64)` — that's the
-/// `hash(42) == hash(42.0)` invariant.  NaN is dispatched to
-/// `HASH_NAN` by the caller (PyPy's `W_FloatObject.descr_hash` does
-/// the NaN check before reaching `_hash_float`).
-///
-/// Kept local rather than delegated to
-/// `rustpython_common::hash::hash_float`: that routine's frexp
-/// (`float_ops::decompose_float`) normalises every input as if it had
-/// an implicit leading mantissa bit, so it produces the wrong exponent
-/// for subnormals and diverges there (`hash(5e-324)` is `16777216`, but
-/// it returns `8404992`).  `libm_frexp` below rescales subnormals first.
+/// Numeric hash of a `float`.  `rustpython_common::hash::hash_float`
+/// reduces the mantissa/exponent modulo the Mersenne prime
+/// `HASH_MODULUS = 2**61 - 1` (keeping the sign), so `hash(2.0) == hash(2)`
+/// and the `±inf` sentinels are `±314159`; subnormals decompose exactly.
+/// It returns `None` for NaN, and the sole caller (`hash_value`) reaches
+/// here without a prior NaN check, so map that to `HASH_NAN`.
 #[inline]
 pub(crate) fn _hash_float(v: f64) -> i64 {
-    if v.is_nan() {
-        return HASH_NAN;
-    }
-    if v.is_infinite() {
-        return if v > 0.0 { HASH_INF } else { -HASH_INF };
-    }
-    // For integral values that fit in i64, short-circuit to
-    // `_hash_int(v as i64)` so `hash(2.0) == hash(2)`.  The frexp
-    // walk below produces the same result, but the integer fast path
-    // avoids floating-point noise on already-integer inputs.
-    if v.fract() == 0.0 && (i64::MIN as f64) <= v && v <= (i64::MAX as f64) {
-        return _hash_int(v as i64);
-    }
-    let (mut m, mut e) = libm_frexp(v);
-    let mut sign: i64 = 1;
-    if m < 0.0 {
-        sign = -1;
-        m = -m;
-    }
-    let mut x: u64 = 0;
-    while m != 0.0 {
-        x = ((x.wrapping_shl(28)) & HASH_MODULUS) | (x >> (HASH_BITS - 28));
-        m *= 268435456.0; // 2**28
-        e -= 28;
-        let y = m as u64;
-        m -= y as f64;
-        x = x.wrapping_add(y);
-        if x >= HASH_MODULUS {
-            x -= HASH_MODULUS;
-        }
-    }
-    // `e = e % HASH_BITS if e >= 0 else HASH_BITS - 1 - ((-1 - e) % HASH_BITS)`
-    let e_mod: u32 = if e >= 0 {
-        (e as u32) % HASH_BITS
-    } else {
-        HASH_BITS - 1 - (((-1 - e) as u32) % HASH_BITS)
-    };
-    x = ((x.wrapping_shl(e_mod)) & HASH_MODULUS) | (x >> (HASH_BITS - e_mod));
-    let h = (x as i64).wrapping_mul(sign);
-    h - (h == -1) as i64
-}
-
-/// Rust port of Python's `math.frexp(x) -> (mantissa, exponent)` where
-/// `x == mantissa * 2**exponent` and `0.5 <= |mantissa| < 1` (or both
-/// are 0).  `libm` isn't a workspace dep, so we use `f64::to_bits`
-/// to peek at the IEEE-754 exponent directly.
-#[inline]
-fn libm_frexp(v: f64) -> (f64, i32) {
-    if v == 0.0 || !v.is_finite() {
-        return (v, 0);
-    }
-    let bits = v.to_bits();
-    let raw_exp = ((bits >> 52) & 0x7ff) as i32;
-    if raw_exp == 0 {
-        // Subnormal — normalise by multiplying with 2**54.
-        let (m, e) = libm_frexp(v * (1u64 << 54) as f64);
-        return (m, e - 54);
-    }
-    let exponent = raw_exp - 1022;
-    let mantissa_bits = (bits & !(0x7ffu64 << 52)) | (1022u64 << 52);
-    (f64::from_bits(mantissa_bits), exponent)
+    rustpython_common::hash::hash_float(v).unwrap_or(HASH_NAN)
 }
 
 /// `tupleobject.py:358-401 descr_hash` — the xxHash sequence hash, delegated
@@ -8947,27 +8854,63 @@ mod tests {
         }
     }
 
-    /// Float hashing stays local: `rustpython_common::hash::hash_float`
-    /// mishandles subnormals (its frexp assumes a normalised mantissa),
-    /// so it diverges from the reference `hash(5e-324) == 16777216` that
-    /// `_hash_float` reproduces.  If this ever stops diverging, revisit
-    /// delegating `_hash_float`.
+    /// `_hash_float` delegates to `rustpython_common::hash::hash_float`,
+    /// which reproduces the reference `hash(5e-324) == 16777216` for
+    /// subnormals, the `hash(2.0) == hash(2)` integral invariant, and the
+    /// `±inf`/NaN sentinels.
     #[test]
-    fn float_hash_kept_local_matches_reference_on_subnormals() {
+    fn float_hash_delegates_to_common() {
         use rustpython_common::hash;
-        let smallest_subnormal = f64::from_bits(1);
-        assert_eq!(_hash_float(smallest_subnormal), 16777216);
-        assert_ne!(
-            hash::hash_float(smallest_subnormal),
-            Some(_hash_float(smallest_subnormal)),
-            "common::hash::hash_float no longer diverges on the smallest subnormal"
-        );
-        // Integral and NaN reference points.
+        // Subnormal reference point (the value that motivated the fix).
+        assert_eq!(_hash_float(f64::from_bits(1)), 16777216);
+        // Integral, zero, and sentinel reference points.
         assert_eq!(_hash_float(2.0), 2);
+        assert_eq!(_hash_float(-1.0), -2);
+        assert_eq!(_hash_float(0.0), 0);
+        assert_eq!(_hash_float(-0.0), 0);
+        assert_eq!(_hash_float(f64::INFINITY), 314159);
+        assert_eq!(_hash_float(f64::NEG_INFINITY), -314159);
+        // NaN hashes to HASH_NAN here; common returns None for it.
         assert_eq!(_hash_float(f64::NAN), HASH_NAN);
-        // Non-subnormal finite floats still agree with common.
-        for &f in &[1.5f64, -1.5, 3.14, 1e20, 9.999e15] {
-            assert_eq!(hash::hash_float(f), Some(_hash_float(f)), "hash_float for {f}");
+        assert_eq!(hash::hash_float(f64::NAN), None);
+        // Differential battery of tricky finite floats: `_hash_float` must
+        // equal `Some(hash_float(f))` on every one.
+        let cases = [
+            0.0f64,
+            -0.0,
+            f64::from_bits(1),       // smallest positive subnormal
+            -f64::from_bits(1),
+            5e-324,
+            1e-310,                  // subnormal
+            2.2250738585072014e-308, // smallest normal
+            0.1,
+            -0.1,
+            0.5,
+            1.0,
+            -1.0,
+            1.5,
+            -1.5,
+            2.0,
+            3.14,
+            123.456,
+            9.999e15,
+            1e16,
+            1e20,
+            1e100,
+            1e308,
+            f64::MAX,
+            f64::MIN,
+            -123456789.123456789,
+            9.995,
+            268435456.0, // 2**28
+            1.7976931348623157e308,
+        ];
+        for &f in &cases {
+            assert_eq!(
+                Some(_hash_float(f)),
+                hash::hash_float(f),
+                "hash_float divergence for {f}"
+            );
         }
     }
 
