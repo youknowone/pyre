@@ -1509,11 +1509,10 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     // avoided because we key on the post-strip segment sequence, not
     // on the bare leaf.
     fn canonical_dedup_key(path: &crate::parse::CallPath) -> Vec<String> {
-        const CRATE_PREFIXES: &[&str] = &["crate", "pyre_interpreter", "pyre_object", "pyre_jit"];
         let mut segs: Vec<String> = path.segments.iter().cloned().collect();
         if segs
             .first()
-            .map(|s| CRATE_PREFIXES.contains(&s.as_str()))
+            .map(|s| s == "crate" || crate::local_crates::is_local_crate_root(s))
             .unwrap_or(false)
         {
             segs.remove(0);

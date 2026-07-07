@@ -36,6 +36,7 @@ pub mod layout;
 pub mod model;
 pub mod model_ssa;
 pub mod opcode_dispatch;
+mod local_crates;
 mod parse;
 pub mod pipeline;
 #[cfg(test)]
@@ -150,6 +151,14 @@ fn build_semantic_program_via_active_frontend(
                         .unwrap_or_else(|e| panic!("Step 4.4 cutover: load {p}: {e}"))
                 })
                 .collect();
+            // Seed the local-crate alias roots from the loaded set so
+            // `free_function_alias_paths` and the registry's canonical
+            // dedup treat every extracted crate name as an alias root
+            // (`local_crates.rs`); non-pyre consumers (aheui) resolve
+            // their crate-qualified cross-crate callsites through this.
+            crate::local_crates::register_local_crate_roots(
+                llbcs.iter().map(|l| l.crate_name().to_string()),
+            );
             let mut program =
                 front::mir::build_semantic_program_from_llbcs_with_static_addrs_and_module_paths(
                     &llbcs,
@@ -481,8 +490,9 @@ fn free_function_alias_paths(name: &str, source_module: &str) -> Vec<crate::pars
     let mut crate_segs = vec!["crate"];
     crate_segs.extend(segments.iter().copied());
     paths.push(crate::parse::CallPath::from_segments(crate_segs));
-    for crate_alias in &["pyre_interpreter", "pyre_object", "pyre_jit"] {
-        let mut alias_segs = vec![*crate_alias];
+    let crate_roots = crate::local_crates::local_crate_roots();
+    for crate_alias in &crate_roots {
+        let mut alias_segs = vec![crate_alias.as_str()];
         alias_segs.extend(segments.iter().copied());
         paths.push(crate::parse::CallPath::from_segments(alias_segs));
     }
@@ -516,8 +526,8 @@ fn free_function_alias_paths(name: &str, source_module: &str) -> Vec<crate::pars
         paths.push(crate::parse::CallPath::from_segments(
             crate_module_segs.iter().copied(),
         ));
-        for crate_alias in &["pyre_interpreter", "pyre_object", "pyre_jit"] {
-            let mut alias_segs = vec![*crate_alias];
+        for crate_alias in &crate_roots {
+            let mut alias_segs = vec![crate_alias.as_str()];
             alias_segs.extend(module_qualified_segs.iter().copied());
             paths.push(crate::parse::CallPath::from_segments(
                 alias_segs.iter().copied(),
@@ -1470,16 +1480,15 @@ fn analyze_pipeline_from_module_paths(
         // forms are crate-prefixed aliases for cross-crate callsites.
         //
         // Tie-break among same-length candidates by deprioritising
-        // keys whose first segment is a crate alias
-        // (`pyre_interpreter`, `pyre_object`, `pyre_jit`), then by
+        // keys whose first segment is a local-crate alias root
+        // (`local_crates.rs`), then by
         // lexicographic order.  Without this, two length-2 keys like
         // `["eval", "eval_loop_jit"]` (the module-qualified form) and
         // `["pyre_object", "eval_loop_jit"]` (a crate-alias form
         // emitted by `free_function_alias_paths`) tie on length, and
         // the winner depends on HashMap iteration order — the source
         // of the eval_loop_jit_portal_* flake.
-        let is_crate_alias =
-            |seg: &str| matches!(seg, "pyre_interpreter" | "pyre_object" | "pyre_jit");
+        let is_crate_alias = |seg: &str| crate::local_crates::is_local_crate_root(seg);
         let qualified = call_control
             .function_graphs()
             .keys()
