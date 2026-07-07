@@ -1194,16 +1194,23 @@ impl Optimization for OptPure {
             let key = PureOpKey::from_call_op(op, start_index);
             self.cache.insert(key, op.pos.get());
             self.call_pure_positions.push(ctx.new_operations.len());
+            // pure.py:225,227 route the emitted op through `self.emit`, i.e.
+            // the passes downstream of OptPure (earlyforce, heap). Returning
+            // `Replace` continues the op through those remaining passes, so
+            // OptHeap.emit() still runs — flushing any postponed comparison op
+            // ahead of this call. `Emit` would append the op terminally and
+            // skip OptHeap, stranding a postponed comparison whose result this
+            // call consumes past its own definition (regalloc def-after-use).
             if start_index == 0 {
                 // pure.py:222-225: replace CALL_PURE with CALL.
                 let new_op = self.demote_call_pure(op);
                 if !Self::call_pure_can_raise(op) {
                     self.short_preamble_pure_ops.push(new_op.clone());
                 }
-                return OptimizationResult::Emit(new_op);
+                return OptimizationResult::Replace(new_op);
             } else {
                 // pure.py:226-227: COND_CALL_VALUE is NOT demoted.
-                return OptimizationResult::Emit(op.clone());
+                return OptimizationResult::Replace(op.clone());
             }
         }
 
@@ -2760,9 +2767,11 @@ mod tests {
             ),
         ));
         let result = pass.propagate_forward(&op, &std::rc::Rc::new(op.clone()), &mut ctx);
+        // The demote routes the CALL through the remaining passes (Replace),
+        // mirroring RPython's `self.emit(newop)`, so OptHeap still processes it.
         match result {
-            OptimizationResult::Emit(emitted) => assert_eq!(emitted.opcode, OpCode::CallI),
-            other => panic!("expected emitted demoted call, got {other:?}"),
+            OptimizationResult::Replace(emitted) => assert_eq!(emitted.opcode, OpCode::CallI),
+            other => panic!("expected demoted call routed via Replace, got {other:?}"),
         }
 
         // Deps are the call args (100, 0, 1); the call result (pos 2) is not a
