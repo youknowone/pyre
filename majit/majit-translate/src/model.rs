@@ -2786,6 +2786,22 @@ pub fn fuse_boxing_alloc(graph: &mut FunctionGraph) -> usize {
                 continue;
             }
             let vtable = resolve_vtable_addr(graph, agg);
+            // Leave the cluster unfused when the `ob_header.ob_type` store
+            // carries no resolvable constant type-pointer (`resolve_vtable_addr`
+            // == 0).  A `NewWithVtable` requires a non-zero type pointer — a
+            // zero vtable would stamp a null `ob_type`, and the assembler
+            // fail-closes on it (`assembler.rs` `new_with_vtable`).  Untouched,
+            // the `lltype::malloc_typed` stays a residual call, the same
+            // graceful outcome an incomplete payload store takes above.  This
+            // happens only when the `PyType` singleton addresses are
+            // unavailable (`HostStaticAddrs.pytypes` empty, as in the
+            // pure-translate registry fixture): the `&FLOAT_TYPE` read then
+            // lowers to a residual `FunctionPath` call rather than a
+            // `ConstRefAddr`.  The production driver supplies those addresses,
+            // so the type pointer resolves and the cluster fuses.
+            if vtable == 0 {
+                continue;
+            }
             sites.push(Site {
                 block: bi,
                 op: oi,
@@ -5996,7 +6012,39 @@ mod tests {
         let v = graph
             .push_op_var(entry, OpKind::ConstFloat(0.0f64.to_bits()), true)
             .unwrap();
-        let header = graph.push_op_var(entry, OpKind::ConstInt(0), true).unwrap();
+        // The `ob_header` carries a resolvable `ob_type` type-pointer (the
+        // `&FLOAT_TYPE` constant `w_float_new` stores), so `fuse_boxing_alloc`
+        // captures a non-zero vtable.  A cluster whose `ob_type` store resolves
+        // to no constant is left unfused (residual `malloc_typed`), so the
+        // header must model the real store chain for the fusion to fire.
+        let ty_addr = graph
+            .push_op_var(entry, OpKind::ConstRefAddr(4357049520), true)
+            .unwrap();
+        let header = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("PyObject"),
+                    args: vec![],
+                    result_ty: ValueType::Ref(Some("PyObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            entry,
+            OpKind::FieldWrite {
+                base: header.clone(),
+                field: FieldDescriptor {
+                    name: "ob_type".into(),
+                    owner_root: Some("PyObject".into()),
+                    owner_id: None,
+                },
+                value: LinkArg::Value(ty_addr),
+                ty: ValueType::Ref(None),
+            },
+            false,
+        );
         let agg = graph
             .push_op_var(
                 entry,
@@ -6110,6 +6158,37 @@ mod tests {
         let im = graph
             .push_op_var(entry, OpKind::ConstFloat(0.0f64.to_bits()), true)
             .unwrap();
+        // Resolvable `ob_header.ob_type` type-pointer so `fuse_boxing_alloc`
+        // captures a non-zero vtable; a cluster whose `ob_type` store resolves
+        // to no constant is left unfused (residual `malloc_typed`).
+        let ty_addr = graph
+            .push_op_var(entry, OpKind::ConstRefAddr(4357049520), true)
+            .unwrap();
+        let header = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("PyObject"),
+                    args: vec![],
+                    result_ty: ValueType::Ref(Some("PyObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            entry,
+            OpKind::FieldWrite {
+                base: header.clone(),
+                field: FieldDescriptor {
+                    name: "ob_type".into(),
+                    owner_root: Some("PyObject".into()),
+                    owner_id: None,
+                },
+                value: LinkArg::Value(ty_addr),
+                ty: ValueType::Ref(None),
+            },
+            false,
+        );
         let agg = graph
             .push_op_var(
                 entry,
@@ -6121,6 +6200,20 @@ mod tests {
                 true,
             )
             .unwrap();
+        graph.push_op_var(
+            entry,
+            OpKind::FieldWrite {
+                base: agg.clone(),
+                field: FieldDescriptor {
+                    name: "ob_header".into(),
+                    owner_root: Some("W_ComplexObject".into()),
+                    owner_id: None,
+                },
+                value: LinkArg::Value(header),
+                ty: ValueType::Ref(None),
+            },
+            false,
+        );
         for (name, v) in [("real", re.clone()), ("imag", im.clone())] {
             graph.push_op_var(
                 entry,
