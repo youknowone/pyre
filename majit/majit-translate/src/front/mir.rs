@@ -5711,6 +5711,16 @@ impl<'a> Lowering<'a> {
                 )? {
                     return Ok(());
                 }
+                if self.try_lower_wrapping_binop(
+                    mir_bb,
+                    &reg.kind,
+                    &segments,
+                    &args,
+                    dest_local,
+                    target,
+                )? {
+                    return Ok(());
+                }
                 if self.try_lower_usize_try_from(
                     mir_bb,
                     &reg.kind,
@@ -7952,6 +7962,72 @@ impl<'a> Lowering<'a> {
     /// and keeps the generic `Call` form (none arise today; the live
     /// callers are `neg`'s `int_value` and `functional`'s `step`,
     /// both `i64`).
+    /// Lower `i64::wrapping_{add,sub,mul}` (`core::num::<Impl>::wrapping_*`,
+    /// Opaque in the LLBC like every core fn) to the native
+    /// `BinOp("add"/"sub"/"mul")`.  `Signed` arithmetic is modular
+    /// machine arithmetic — `rint.py rtype_add` emits `int_add` with no
+    /// overflow check, and `int_add` wraps (`rarithmetic.py intmask`
+    /// semantics) — so the wrapping method IS the plain llop.  Restricted
+    /// to word-sized signed receivers; a narrower `wrapping_add` (which
+    /// wraps at its own width) keeps the `Call` form.
+    fn try_lower_wrapping_binop(
+        &mut self,
+        mir_bb: usize,
+        kind: &CallKind,
+        segments: &[String],
+        args: &[Variable],
+        dest_local: usize,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        let [first, .., module, impl_seg, leaf] = segments else {
+            return Ok(false);
+        };
+        if first.as_str() != "core" || module.as_str() != "num" || impl_seg.as_str() != "<Impl>" {
+            return Ok(false);
+        }
+        let op = match leaf.as_str() {
+            "wrapping_add" => "add",
+            "wrapping_sub" => "sub",
+            "wrapping_mul" => "mul",
+            _ => return Ok(false),
+        };
+        let [lhs, rhs] = args else {
+            return Ok(false);
+        };
+        // Same width gate as `try_lower_checked_neg`: the operand is the
+        // receiver — `wrapping_add(self, rhs)` — so read `inputs[0]`.
+        let CallKind::Fun(FunId::Regular { id }) = kind else {
+            return Ok(false);
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return Ok(false);
+        };
+        let Some(src) = fd.signature.inputs.first() else {
+            return Ok(false);
+        };
+        if !matches!(self.tyref_literal_int_atom(src), Some("I64" | "Isize")) {
+            return Ok(false);
+        }
+        let bb_id = self.block_id[mir_bb];
+        let res = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind: OpKind::BinOp {
+                op: op.to_string(),
+                lhs: lhs.clone(),
+                rhs: rhs.clone(),
+                result_ty: ValueType::Int,
+            },
+        });
+        self.local_var[dest_local] = Some(res);
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
+    }
+
     /// Returns `Ok(false)` when the call is not `checked_neg` (or the
     /// destination's `Option` decl cannot be resolved) so the generic
     /// `Call` lowering proceeds.
