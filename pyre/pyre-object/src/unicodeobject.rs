@@ -61,6 +61,14 @@ impl crate::lltype::GcType for W_UnicodeObject {
 /// The inner `Wtf8Buf` is also `Box::into_raw`'d so it can be recovered.
 /// `from_string` takes ownership of the bytes with no copy or
 /// re-validation (every `&str` is already valid WTF-8).
+///
+/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py:139`), the
+/// `box_str_constant` twin: the body runs a `str::chars` count plus an
+/// unfused `malloc_typed` NewWithVtable (`W_UnicodeObject`), so the JIT
+/// residualises the whole `&str -> W_UnicodeObject` construction to a
+/// stable fnaddr instead of tracing it.  The `-> PyObjectRef` result is a
+/// plain GCREF with no discriminant to erase.
+#[majit_macros::dont_look_inside]
 pub fn w_str_new(s: &str) -> PyObjectRef {
     let value = crate::lltype::malloc_raw(Wtf8Buf::from_string(s.to_string()));
     let byte_len = s.len();

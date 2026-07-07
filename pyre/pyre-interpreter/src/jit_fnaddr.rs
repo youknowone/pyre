@@ -488,6 +488,12 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     );
     push_alias_pair(
         &mut entries,
+        "pyre_object::unicodeobject::w_str_new",
+        "pyre_object::w_str_new",
+        pyre_object::unicodeobject::w_str_new as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
         "pyre_object::gc_hook::try_gc_add_root",
         "pyre_object::try_gc_add_root",
         pyre_object::gc_hook::try_gc_add_root as *const (),
