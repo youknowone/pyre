@@ -149,6 +149,13 @@ impl CodeWriter {
         // path (`derive_subject_inputcells` resolves a bound-trait
         // `class_root` through it before the struct-root lookup).
         registry.set_pyre_trait_unique_impls(callcontrol.trait_unique_impls().clone());
+        // Opt-in receiver-driven dispatch families (issue #346): mint
+        // each registered trait's base ClassDef + impl subclasses BEFORE
+        // `seed_struct_root_method_members` below, so the method seeding
+        // attaches the impl methods onto the base-linked subclass and a
+        // `dyn Trait` receiver getattr resolves the impl MethodDesc
+        // family (attrfamily merge).  Empty for pyre production.
+        registry.register_trait_families(callcontrol.trait_family_registrations());
         // PyPy's `Bookkeeper.compute_at_fixpoint` raises through to
         // the caller (`bookkeeper.py:108-127`); pyre's dual-gate
         // mirrors that propagation by routing the populate `TyperError`
@@ -186,6 +193,11 @@ impl CodeWriter {
         // instead of blocking.  AFTER populate (which seeds the unsafe-fn
         // stubs internally) so the entry set is complete.
         registry.seed_struct_root_method_members();
+        // Issue #346: register the just-seeded impl-subclass methods into
+        // their ClassDef attr sources so a family-base / `dyn Trait`
+        // receiver getattr resolves the impl MethodDesc family via the
+        // attrfamily merge.  No-op for pyre production (no families).
+        registry.populate_trait_family_base_attrs(callcontrol.trait_family_registrations());
         // RPython parity: `Translator.buildannotator()` /
         // `Translator.buildrtyper()` (`translator.py:69-83`) construct
         // exactly one annotator and one rtyper per Translator and assert

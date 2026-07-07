@@ -1182,6 +1182,53 @@ fn analyze_pipeline_from_module_paths(
             *struct_leaf_counts.entry(leaf).or_default() += 1;
         }
     }
+    // Opt-in receiver-driven dispatch families (issue #346): a consumer
+    // (e.g. the aheui census) names `>=2`-impl trait qualified paths
+    // whose `dyn Trait` receivers should annotate to a base ClassDef
+    // linking the impl subclasses, so a method getattr on the receiver
+    // resolves the impl MethodDesc family.  Pyre production names none,
+    // so its multi-impl traits keep their classdef-less / fail-loud
+    // disposition unchanged.  Built from `trait_impl_owners` (before it
+    // is consumed below) and forwarded through `CallControl` to
+    // `dual_gate_registry`, which mints each family before the
+    // class-method seeding.
+    let trait_family_registrations: Vec<call::TraitFamilyRegistration> = config
+        .pipeline
+        .register_trait_families
+        .iter()
+        .filter_map(
+            |trait_qualified| match trait_impl_owners.get(trait_qualified) {
+                Some(owners) => {
+                    let impl_roots: Vec<String> = owners
+                        .iter()
+                        .map(|owner| owner.rsplit("::").next().unwrap_or(owner).to_string())
+                        .collect();
+                    Some(call::TraitFamilyRegistration {
+                        base_root: trait_qualified.clone(),
+                        impl_roots,
+                    })
+                }
+                None => {
+                    // Config validation: a named family that matches no
+                    // harvested trait is almost always a spelling mismatch
+                    // (the key is the trait's full `name_path()`).  List the
+                    // available multi-impl trait paths so the consumer can
+                    // correct it.
+                    let candidates: Vec<&String> = trait_impl_owners
+                        .iter()
+                        .filter(|(_, owners)| owners.len() >= 2)
+                        .map(|(path, _)| path)
+                        .collect();
+                    eprintln!(
+                        "register_trait_families: no harvested trait matches {trait_qualified:?}; \
+                     known multi-impl trait paths: {candidates:?}"
+                    );
+                    None
+                }
+            },
+        )
+        .collect();
+    call_control.set_trait_family_registrations(trait_family_registrations);
     let trait_unique_impls: std::collections::HashMap<String, String> = trait_impl_owners
         .into_iter()
         .filter_map(|(trait_qualified, owners)| {

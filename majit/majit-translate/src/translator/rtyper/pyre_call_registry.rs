@@ -271,6 +271,40 @@ impl PyreCallRegistry {
         self.bookkeeper.set_pyre_trait_unique_impls(map);
     }
 
+    /// Mint each opt-in receiver-driven dispatch family's base
+    /// `ClassDef` + impl subclasses (issue #346).  Called from
+    /// `dual_gate_registry` BEFORE
+    /// [`Self::seed_struct_root_method_members`], so that method seeding's
+    /// `intern_class_by_qualname(owner)` hits the subclass host minted
+    /// here (first-mint wins) and attaches the impl methods onto the
+    /// base-linked subclass; the attrfamily merge then surfaces them on
+    /// the base for a `dyn Trait` receiver getattr.  The impl subclasses
+    /// are minted member-less — `seed_struct_root_method_members`
+    /// installs their methods.  A per-family registration error is
+    /// reported and skipped (the block stays census-visible / fail-loud)
+    /// rather than aborting the whole build.
+    pub fn register_trait_families(
+        &self,
+        families: &[crate::codewriter::call::TraitFamilyRegistration],
+    ) {
+        for family in families {
+            let impls: Vec<(String, HashMap<String, ConstValue>)> = family
+                .impl_roots
+                .iter()
+                .map(|root| (root.clone(), HashMap::new()))
+                .collect();
+            if let Err(e) =
+                self.bookkeeper
+                    .register_trait_family(&family.base_root, HashMap::new(), impls)
+            {
+                eprintln!(
+                    "register_trait_families: base {:?} failed: {e:?}",
+                    family.base_root
+                );
+            }
+        }
+    }
+
     /// Thread the enum `discriminant → variant` tables into the shared
     /// bookkeeper so the `__discriminant` getattr can attach
     /// discriminant→variant narrowing `knowntypedata`.  Called once from
@@ -378,6 +412,48 @@ impl PyreCallRegistry {
                 method.clone(),
                 ConstValue::HostObject(entry.host_object.clone()),
             );
+        }
+    }
+
+    /// Populate each registered dispatch family's impl-subclass
+    /// `ClassDef` attr sources from the method members seeded by
+    /// [`Self::seed_struct_root_method_members`] (issue #346).
+    ///
+    /// A raw `class_set` on the subclass host (what the method seeding
+    /// does) puts the method in the host `__dict__` but does NOT register
+    /// it in the subclass `ClassDef`'s `attr_sources` — only
+    /// `check_missing_attribute_update` → `check_attr_here` →
+    /// `find_source_for` reads the host dict and records the source.
+    /// Without that, a `getattr` on the FAMILY BASE
+    /// (`ClassDef::generalize_attr` at `locate_attribute`) finds no
+    /// subclass `attr_sources` to merge up and the block stays blocked
+    /// ("no source").  Run the update for every seeded subclass method so
+    /// a base-instance / `dyn Trait` receiver getattr resolves the impl
+    /// `MethodDesc` family via the attrfamily merge.  Called from
+    /// `dual_gate_registry` AFTER `seed_struct_root_method_members`.
+    pub fn populate_trait_family_base_attrs(
+        &self,
+        families: &[crate::codewriter::call::TraitFamilyRegistration],
+    ) {
+        for family in families {
+            for impl_root in &family.impl_roots {
+                let key = majit_ir::descr::canonical_struct_name(impl_root);
+                let host = self
+                    .bookkeeper
+                    .pyre_struct_root_classes
+                    .borrow()
+                    .get(&key)
+                    .cloned();
+                let Some(host) = host else { continue };
+                let Ok(cd) = self.bookkeeper.getuniqueclassdef(&host) else {
+                    continue;
+                };
+                for method in host.class_dict_keys() {
+                    let _ = crate::annotator::classdesc::ClassDef::check_missing_attribute_update(
+                        &cd, &method,
+                    );
+                }
+            }
         }
     }
 

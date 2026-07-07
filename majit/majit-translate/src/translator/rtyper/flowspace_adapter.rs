@@ -1709,6 +1709,54 @@ pub fn translate_op(
                         crate::translator::rtyper::pyre_call_registry::FunctionPathKey::from_segments(
                             segments.iter().cloned(),
                         );
+                    // Method-routing for a registered dispatch family
+                    // (issue #346).  `front::mir`'s `CallKind::Trait` arm
+                    // lowers `<Trait>::method(receiver, …)` to a
+                    // `FunctionPath [<trait leaf>, method]`.  The
+                    // direct-path binder (`lib.rs`) registers only trait
+                    // default bodies and single-impl devirtualizations; a
+                    // REQUIRED method with `>=2` impls is intentionally
+                    // left unregistered ("keep failing loud until
+                    // receiver-driven resolution lands").  When the trait
+                    // is an opted-in family and the receiver carries the
+                    // family base `ClassDef` (seeded by
+                    // `derive_subject_inputcells`), lower the call as a
+                    // `getattr` + `simple_call` so the attrfamily merge
+                    // resolves the impl `MethodDesc` family — exactly as
+                    // `CallTarget::Method`.  Gated on an exact registry
+                    // miss so default bodies and single-impl devirt (both
+                    // registered) keep their direct FunctionPath.
+                    if segments.len() == 2
+                        && call_registry.lookup(&key).is_none()
+                        && call_registry
+                            .bookkeeper()
+                            .is_registered_trait_family_leaf(&segments[0])
+                    {
+                        let mut iter = arg_hls.into_iter();
+                        let receiver = iter.next().ok_or_else(|| {
+                            TyperError::message(format!(
+                                "translate_op: family method call {segments:?} \
+                                 has no receiver arg (receiver must be args[0])"
+                            ))
+                        })?;
+                        let bound_method = Hlvalue::Variable(Variable::new());
+                        let mut call_args = Vec::with_capacity(iter.size_hint().0 + 1);
+                        call_args.push(bound_method.clone());
+                        call_args.extend(iter);
+                        return Ok(vec![
+                            FlowspaceOp::new(
+                                "getattr",
+                                vec![
+                                    receiver,
+                                    Hlvalue::Constant(Constant::new(ConstValue::byte_str(
+                                        &segments[1],
+                                    ))),
+                                ],
+                                bound_method,
+                            ),
+                            FlowspaceOp::new("simple_call", call_args, result),
+                        ]);
+                    }
                     // Three resolution layers, matching upstream's three
                     // dispatch shapes for a dotted call site:
                     //
@@ -2641,6 +2689,38 @@ pub(crate) fn derive_subject_inputcells(
                     continue;
                 }
                 if let (Some(root), Some(bk)) = (class_root.as_ref(), bookkeeper) {
+                    // A registered receiver-driven dispatch family (issue
+                    // #346): a `dyn Trait` receiver whose bound-trait
+                    // `class_root` names a family opted in through
+                    // `register_trait_families` seeds the family base
+                    // `ClassDef`.  Its impl subclasses carry the methods
+                    // (attrfamily merge), so a method getattr on the
+                    // receiver resolves the impl `MethodDesc` family
+                    // instead of blocking on the classdef-less shell.
+                    // Checked before the unique-impl substitution below —
+                    // a multi-impl family has no unique impl to fold to.
+                    let family_base = bk
+                        .pyre_trait_family_bases
+                        .borrow()
+                        .get(root.as_str())
+                        .cloned();
+                    if let Some(base_host) = family_base {
+                        let cd = bk.getuniqueclassdef(&base_host).map_err(|e| {
+                            TyperError::message(format!(
+                                "derive_subject_inputcells: startblock.inputargs[{idx}] \
+                                 ({var:?}) trait-family base for {root:?} failed \
+                                 ClassDef registration: {e:?}"
+                            ))
+                        })?;
+                        cells.push(crate::annotator::model::SomeValue::Instance(
+                            crate::annotator::model::SomeInstance::new(
+                                Some(cd),
+                                false,
+                                std::collections::BTreeMap::new(),
+                            ),
+                        ));
+                        continue;
+                    }
                     // A generic param (`&T` where `T: Trait`, incl. a
                     // trait default body's `&Self`) carries the bound
                     // trait's qualified path as `class_root`

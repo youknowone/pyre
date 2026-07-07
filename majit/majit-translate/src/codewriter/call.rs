@@ -562,6 +562,20 @@ impl GraphStore {
     }
 }
 
+/// Opt-in receiver-driven method-dispatch family (issue #346).  A
+/// consumer names a `>=2`-impl trait whose `dyn Trait` receivers should
+/// annotate to a base `ClassDef` linking the impl subclasses, so a
+/// method getattr on the receiver resolves the impl `MethodDesc` family
+/// (attrfamily merge) instead of blocking on the classdef-less shell.
+/// `base_root` is the trait's qualified `name_path()` — the same
+/// spelling `tyref_generic_trait_bound_root` stamps as a receiver's
+/// `class_root`; `impl_roots` are its concrete impl owner roots.
+#[derive(Debug, Clone)]
+pub struct TraitFamilyRegistration {
+    pub base_root: String,
+    pub impl_roots: Vec<String>,
+}
+
 /// Call control — decides inline vs residual for each call target.
 ///
 /// RPython: `call.py::CallControl`.
@@ -811,6 +825,13 @@ pub struct CallControl {
     /// while a subject graph annotated standalone only knows the
     /// trait bound.
     trait_unique_impls: HashMap<String, String>,
+
+    /// Opt-in receiver-driven method-dispatch families (see
+    /// [`TraitFamilyRegistration`]).  Empty for pyre production — its
+    /// multi-impl traits keep their classdef-less / fail-loud
+    /// disposition; a consumer (e.g. the aheui census) opts specific
+    /// traits in through [`Self::set_trait_family_registrations`].
+    trait_family_registrations: Vec<TraitFamilyRegistration>,
 
     /// RPython: `symbolic.get_array_token(ARRAY, tsc)[0]` — array base size.
     /// Offset from the array object pointer to the first element.
@@ -1256,6 +1277,7 @@ impl CallControl {
             struct_fields: crate::front::StructFieldRegistry::default(),
             enum_variant_by_discriminant: HashMap::new(),
             trait_unique_impls: HashMap::new(),
+            trait_family_registrations: Vec::new(),
             // RPython: symbolic.get_array_token(GcArray(T))[0] = carray.items.offset
             // = sizeof(Signed) = WORD. Standard GcArray has a length field before items.
             //
@@ -1350,6 +1372,19 @@ impl CallControl {
     /// bookkeeper alongside [`Self::struct_fields`].
     pub fn trait_unique_impls(&self) -> &HashMap<String, String> {
         &self.trait_unique_impls
+    }
+
+    /// Register the opt-in receiver-driven method-dispatch families (see
+    /// [`TraitFamilyRegistration`]).  Consumed by
+    /// `CodeWriter::dual_gate_registry` before the class-method seeding
+    /// so each family's base + impl subclasses are minted first.
+    pub fn set_trait_family_registrations(&mut self, families: Vec<TraitFamilyRegistration>) {
+        self.trait_family_registrations = families;
+    }
+
+    /// The opt-in receiver-driven method-dispatch families.
+    pub fn trait_family_registrations(&self) -> &[TraitFamilyRegistration] {
+        &self.trait_family_registrations
     }
 
     /// RPython: isinstance(TYPE, lltype.Struct) check.

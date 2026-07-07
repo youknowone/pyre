@@ -47,6 +47,15 @@ pub struct PipelineConfig {
     /// (`execute_opcode_step`) for backwards compatibility with the
     /// pyre-specific entry path.
     pub portal: Option<PortalSpec>,
+    /// Opt-in receiver-driven method-dispatch families (issue #346):
+    /// qualified `name_path()`s of `>=2`-impl traits whose `dyn Trait`
+    /// receivers should annotate to a base `ClassDef` linking the impl
+    /// subclasses (so a method getattr resolves the impl `MethodDesc`
+    /// family via the attrfamily merge).  Empty for pyre production — its
+    /// multi-impl traits keep their classdef-less / fail-loud
+    /// disposition; the aheui census opts `LinkedList` in.
+    #[serde(default)]
+    pub register_trait_families: Vec<String>,
 }
 
 /// Result of running the full pipeline on a single function.

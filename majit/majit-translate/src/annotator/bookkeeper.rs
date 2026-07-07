@@ -350,6 +350,16 @@ pub struct Bookkeeper {
     /// RPython's annotator never needs this: it sees the concrete
     /// receiver class at every call site (`classdesc.py:749 lookup`).
     pub pyre_trait_unique_impls: RefCell<HashMap<String, String>>,
+    /// Trait qualified-path (`name_path()`) → base `HostObject` for a
+    /// receiver-driven method-dispatch family registered through
+    /// [`Self::register_trait_family`] (issue #346).
+    /// `derive_subject_inputcells` seeds a `dyn Trait` receiver whose
+    /// `class_root` is a key here with the base `ClassDef`, so
+    /// `getattr(receiver, method)` resolves the impl-subclass
+    /// `MethodDesc` family (attrfamily merge) rather than blocking on
+    /// the classdef-less shell.  Empty unless a consumer opts a trait
+    /// in; pyre production registers none.
+    pub pyre_trait_family_bases: RefCell<HashMap<String, HostObject>>,
     /// TODO: no upstream equivalent.  Struct names first interned by
     /// [`Self::project_pyre_field_type`]'s bare-name arm whose
     /// registry rows have not been projected yet — drained at the end
@@ -538,6 +548,7 @@ impl Bookkeeper {
             pyre_enum_variant_by_discriminant: RefCell::new(None),
             pyre_struct_root_classes: RefCell::new(HashMap::new()),
             pyre_trait_unique_impls: RefCell::new(HashMap::new()),
+            pyre_trait_family_bases: RefCell::new(HashMap::new()),
             pending_struct_row_projection: RefCell::new(Vec::new()),
             projected_struct_rows: RefCell::new(std::collections::HashSet::new()),
         }
@@ -594,6 +605,20 @@ impl Bookkeeper {
             .as_ref()
             .map(|reg| reg.fields.keys().cloned().collect())
             .unwrap_or_default()
+    }
+
+    /// True when `leaf` is the trait-leaf of a registered dispatch family
+    /// ([`Self::pyre_trait_family_bases`], keyed by the trait's full
+    /// `name_path()`).  A method call lowered as `FunctionPath [<leaf>,
+    /// method]` (`front::mir`'s `CallKind::Trait` arm spells the trait by
+    /// leaf) routes through the receiver's getattr when this matches and
+    /// the direct-path registry has no entry (the required-method,
+    /// `>=2`-impl case).  Empty unless a consumer opts a trait in.
+    pub fn is_registered_trait_family_leaf(&self, leaf: &str) -> bool {
+        self.pyre_trait_family_bases
+            .borrow()
+            .keys()
+            .any(|path| path.rsplit("::").next().unwrap_or(path) == leaf)
     }
 
     /// No upstream equivalent — forced by pyre's numbering order, not a
@@ -1851,6 +1876,13 @@ impl Bookkeeper {
         self.pyre_struct_root_classes
             .borrow_mut()
             .insert(base_key, base_host.clone());
+        // Index the base by the raw `base_root` spelling too, so the
+        // receiver seed (`derive_subject_inputcells`) can match a
+        // `dyn Trait` receiver's `class_root` (the trait's `name_path()`)
+        // directly without re-canonicalising.
+        self.pyre_trait_family_bases
+            .borrow_mut()
+            .insert(base_root.to_string(), base_host.clone());
         let base_cd = self.getuniqueclassdef(&base_host)?;
         // Subclasses — interned WITH the base host so `ClassDesc::new` wires
         // `basedef` and `_init_classdef` pushes each into `base.subdefs`.

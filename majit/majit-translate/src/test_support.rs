@@ -48,5 +48,6 @@ pub(crate) fn pyre_pipeline_config() -> crate::PipelineConfig {
             ..Default::default()
         },
         portal: None,
+        register_trait_families: Vec::new(),
     }
 }
