@@ -4784,33 +4784,7 @@ impl<'a> Lowering<'a> {
         let init_id = g.rest.get("init")?.as_u64()?;
         let fd = self.llbc.fn_by_id(init_id)?;
         let u = fd.unstructured()?;
-        let [block] = u.body.as_slice() else {
-            return None;
-        };
-        if !matches!(block.term(), Ok(TermKind::Return)) {
-            return None;
-        }
-        let mut assigned: Option<serde_json::Value> = None;
-        for stmt in &block.statements {
-            match stmt.stmt_kind() {
-                Ok(StmtKind::StorageLive(_)) | Ok(StmtKind::StorageDead(_)) => {}
-                Ok(StmtKind::Assign(place, Rvalue::Use(Operand::Const(value))))
-                    if matches!(place.kind, PlaceKind::Local(0)) && assigned.is_none() =>
-                {
-                    assigned = Some(value);
-                }
-                _ => return None,
-            }
-        }
-        match decode_constant(self.llbc, &assigned?).ok()? {
-            DecodedConst::Int(n) => Some(OpKind::ConstInt(n)),
-            DecodedConst::Bool(b) => Some(OpKind::ConstBool(b)),
-            DecodedConst::Float(bits) => Some(OpKind::ConstFloat(bits)),
-            // Strings / fn pointers keep the existing Call shapes the
-            // operand-constant lowering uses; folding them here would
-            // diverge from the `Rvalue::Use(Const)` treatment.
-            DecodedConst::Str(_) | DecodedConst::FnPath(_) => None,
-        }
+        const_eval_init_body(self.llbc, &u)
     }
 
     /// Fold a `NamedConst` global whose initializer is exactly
@@ -12130,6 +12104,244 @@ enum DecodedConst {
     /// `FunctionPath` so it shares the existing `Call` lowering path
     /// when threaded into an indirect call site.
     FnPath(Vec<String>),
+}
+
+/// Literal value tracked by [`const_eval_init_body`].
+#[derive(Clone, Copy)]
+enum ConstLit {
+    Int(i64),
+    Bool(bool),
+    Float(u64),
+    /// `*Checked` binop result `(value, overflowed)`; read back via
+    /// `Field[Tuple 2, 0|1]` projections.
+    Checked(i64, bool),
+}
+
+/// Evaluate a global's single-value init body over literal locals.
+///
+/// Upstream needs no analog: RPython constants are live host values at
+/// translation time, so a computed constant like `-(1i64 << 62)`
+/// reaches the annotator already folded (flowspace constant folding).
+/// ULLBC instead carries the unevaluated init MIR — in the dev profile
+/// a shift or negation drags an overflow-assert diamond along — so fold
+/// it here: execute literal assigns, follow each `Assert` whose
+/// condition evaluates to its `expected` value (rustc already
+/// const-checked the initializer), and bail to the residual `Call`
+/// lowering on any other shape.
+fn const_eval_init_body(llbc: &Llbc, u: &Unstructured) -> Option<OpKind> {
+    let mut locals: std::collections::HashMap<u64, ConstLit> = std::collections::HashMap::new();
+    let eval_operand =
+        |locals: &std::collections::HashMap<u64, ConstLit>, op: &Operand| -> Option<ConstLit> {
+            match op {
+                Operand::Copy(place) | Operand::Move(place) => match &place.kind {
+                    PlaceKind::Local(n) => locals.get(n).copied(),
+                    // `checked_pair.0` / `.1` — the only projection an
+                    // init body needs (`(1i64 << 62) - 1` reads its
+                    // `SubChecked` result back field-wise).
+                    PlaceKind::Projection(inner, elem) => {
+                        let PlaceKind::Local(n) = inner.kind else {
+                            return None;
+                        };
+                        let ConstLit::Checked(v, o) = locals.get(&n).copied()? else {
+                            return None;
+                        };
+                        match const_tuple_field_index(elem)? {
+                            0 => Some(ConstLit::Int(v)),
+                            1 => Some(ConstLit::Bool(o)),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                },
+                Operand::Const(value) => match decode_constant(llbc, value).ok()? {
+                    DecodedConst::Int(n) => Some(ConstLit::Int(n)),
+                    DecodedConst::Bool(b) => Some(ConstLit::Bool(b)),
+                    DecodedConst::Float(bits) => Some(ConstLit::Float(bits)),
+                    // Strings / fn pointers keep the existing Call
+                    // shapes the operand-constant lowering uses.
+                    DecodedConst::Str(_) | DecodedConst::FnPath(_) => None,
+                },
+            }
+        };
+    let mut bb = 0usize;
+    // A genuine init body is a short assert-diamond chain; the step cap
+    // only guards against cycles.
+    for _ in 0..64 {
+        let block = u.body.get(bb)?;
+        for stmt in &block.statements {
+            match stmt.stmt_kind() {
+                Ok(StmtKind::StorageLive(_)) | Ok(StmtKind::StorageDead(_)) => {}
+                Ok(StmtKind::Assign(place, rvalue)) => {
+                    let PlaceKind::Local(dst) = place.kind else {
+                        return None;
+                    };
+                    let value = match &rvalue {
+                        Rvalue::Use(op) => eval_operand(&locals, op)?,
+                        Rvalue::UnaryOp(kind, op) => {
+                            const_eval_unop(kind, eval_operand(&locals, op)?)?
+                        }
+                        Rvalue::BinaryOp(kind, lhs, rhs) => const_eval_binop(
+                            kind,
+                            eval_operand(&locals, lhs)?,
+                            eval_operand(&locals, rhs)?,
+                        )?,
+                        _ => return None,
+                    };
+                    locals.insert(dst, value);
+                }
+                _ => return None,
+            }
+        }
+        match block.term().ok()? {
+            TermKind::Return => {
+                return match locals.get(&0)? {
+                    ConstLit::Int(n) => Some(OpKind::ConstInt(*n)),
+                    ConstLit::Bool(b) => Some(OpKind::ConstBool(*b)),
+                    ConstLit::Float(bits) => Some(OpKind::ConstFloat(*bits)),
+                    ConstLit::Checked(..) => None,
+                };
+            }
+            TermKind::Goto { target } => bb = target as usize,
+            TermKind::Assert { assert, target, .. } => {
+                let ConstLit::Bool(cond) = eval_operand(&locals, &assert.cond)? else {
+                    return None;
+                };
+                if cond != assert.expected {
+                    return None;
+                }
+                bb = target as usize;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Charon serializes an operator as an atom string (`"Add"`) or a
+/// one-key object whose key is the operator and whose value is the
+/// overflow mode (`{"Shl": "Wrap"}`) or cast payload.
+fn operator_name(kind: &serde_json::Value) -> Option<&str> {
+    if let Some(s) = kind.as_str() {
+        return Some(s);
+    }
+    let obj = kind.as_object()?;
+    if obj.len() == 1 {
+        obj.keys().next().map(String::as_str)
+    } else {
+        None
+    }
+}
+
+/// Decode a `Field` projection on a tuple container —
+/// `{"Field": [{"Tuple": N}, idx]}` — to its element index.
+fn const_tuple_field_index(elem: &ProjectionElem) -> Option<u64> {
+    let ProjectionElem::Tagged(v) = elem else {
+        return None;
+    };
+    let payload = v.as_object()?.get("Field")?.as_array()?;
+    if payload.len() != 2 {
+        return None;
+    }
+    payload[0].as_object()?.get("Tuple")?;
+    payload[1].as_u64()
+}
+
+fn const_eval_unop(kind: &serde_json::Value, v: ConstLit) -> Option<ConstLit> {
+    match (operator_name(kind)?, v) {
+        ("Neg", ConstLit::Int(n)) => n.checked_neg().map(ConstLit::Int),
+        ("Not", ConstLit::Bool(b)) => Some(ConstLit::Bool(!b)),
+        ("Not", ConstLit::Int(n)) => Some(ConstLit::Int(!n)),
+        ("Cast", ConstLit::Int(n)) => {
+            // Scalar int→int cast: truncate / re-extend to the target
+            // width so `expr as uN` folds exactly.
+            let scalar = kind.as_object()?.get("Cast")?.get("Scalar")?.as_array()?;
+            const_cast_int(n, scalar.get(1)?).map(ConstLit::Int)
+        }
+        _ => None,
+    }
+}
+
+fn const_cast_int(n: i64, target: &serde_json::Value) -> Option<i64> {
+    let (signed, width) = if let Some(w) = target.get("Int") {
+        (true, w.as_str()?)
+    } else if let Some(w) = target.get("UInt") {
+        (false, w.as_str()?)
+    } else {
+        return None;
+    };
+    let bits: u32 = match width {
+        "I8" | "U8" => 8,
+        "I16" | "U16" => 16,
+        "I32" | "U32" => 32,
+        "I64" | "U64" | "Isize" | "Usize" => 64,
+        // 128-bit targets exceed the i64 carrier.
+        _ => return None,
+    };
+    Some(if bits == 64 {
+        n
+    } else if signed {
+        let shift = 64 - bits;
+        (n << shift) >> shift
+    } else {
+        n & ((1i64 << bits) - 1)
+    })
+}
+
+fn const_eval_binop(kind: &serde_json::Value, lhs: ConstLit, rhs: ConstLit) -> Option<ConstLit> {
+    let name = operator_name(kind)?;
+    match (lhs, rhs) {
+        (ConstLit::Int(a), ConstLit::Int(b)) => match name {
+            // checked_* also on the Wrap-mode forms: a genuinely
+            // wrapping fold would need the operand width, so bail to
+            // the residual Call instead of folding wrong.
+            "Add" => a.checked_add(b).map(ConstLit::Int),
+            "Sub" => a.checked_sub(b).map(ConstLit::Int),
+            "Mul" => a.checked_mul(b).map(ConstLit::Int),
+            "Div" => a.checked_div(b).map(ConstLit::Int),
+            "Rem" => a.checked_rem(b).map(ConstLit::Int),
+            "Shl" => u32::try_from(b)
+                .ok()
+                .and_then(|s| a.checked_shl(s))
+                .map(ConstLit::Int),
+            "Shr" => u32::try_from(b)
+                .ok()
+                .and_then(|s| a.checked_shr(s))
+                .map(ConstLit::Int),
+            "BitAnd" => Some(ConstLit::Int(a & b)),
+            "BitOr" => Some(ConstLit::Int(a | b)),
+            "BitXor" => Some(ConstLit::Int(a ^ b)),
+            // i64-width overflow flags: exact for I64 operands; a
+            // narrower-width divergence would need an overflow the
+            // initializer cannot contain (rustc const-checked it).
+            "AddChecked" => {
+                let (v, o) = a.overflowing_add(b);
+                Some(ConstLit::Checked(v, o))
+            }
+            "SubChecked" => {
+                let (v, o) = a.overflowing_sub(b);
+                Some(ConstLit::Checked(v, o))
+            }
+            "MulChecked" => {
+                let (v, o) = a.overflowing_mul(b);
+                Some(ConstLit::Checked(v, o))
+            }
+            "Lt" => Some(ConstLit::Bool(a < b)),
+            "Le" => Some(ConstLit::Bool(a <= b)),
+            "Gt" => Some(ConstLit::Bool(a > b)),
+            "Ge" => Some(ConstLit::Bool(a >= b)),
+            "Eq" => Some(ConstLit::Bool(a == b)),
+            "Ne" => Some(ConstLit::Bool(a != b)),
+            _ => None,
+        },
+        (ConstLit::Bool(a), ConstLit::Bool(b)) => match name {
+            "Eq" => Some(ConstLit::Bool(a == b)),
+            "Ne" => Some(ConstLit::Bool(a != b)),
+            "BitAnd" => Some(ConstLit::Bool(a & b)),
+            "BitOr" => Some(ConstLit::Bool(a | b)),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// Decode `Operand::Const`'s value field. Possible shapes:
