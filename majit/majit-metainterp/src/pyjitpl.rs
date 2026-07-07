@@ -5189,7 +5189,10 @@ impl<M: Clone> MetaInterp<M> {
         let num_ops_before = trace.ops.len();
         let num_trace_inputargs = trace.inputargs.len();
         if crate::majit_log_enabled() {
-            eprintln!("[jit-diag] entering optimizer: {} ops, {} inputargs", num_ops_before, num_trace_inputargs);
+            eprintln!(
+                "[jit-diag] entering optimizer: {} ops, {} inputargs",
+                num_ops_before, num_trace_inputargs
+            );
         }
 
         // Save trace_ops + constants snapshot for potential unroll-free retry
