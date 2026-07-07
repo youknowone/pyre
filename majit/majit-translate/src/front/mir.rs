@@ -53,8 +53,9 @@
 //!   - `Discriminant(place)` — synthetic `FieldRead("__discriminant")`.
 //!   - `Aggregate` — synthetic `Call(SyntheticTransparentCtor)`.
 //!   - `ShallowInitBox` — synthetic `Call(SyntheticTransparentCtor)`.
-//!   - `Repeat` / `Len` / `NullaryOp` — synthetic `Call(__array_repeat
-//!     / __len / __nullary_*)`.
+//!   - `Repeat` — synthetic `Call(SyntheticTransparentCtor("Array"))`
+//!     (the same array constructor `Aggregate` emits).
+//!   - `Len` / `NullaryOp` — synthetic `Call(__len / __nullary_*)`.
 //!
 //! ### Terminators
 //!   - `Return` → `returnblock`.
@@ -3602,21 +3603,27 @@ impl<'a> Lowering<'a> {
                 let v = self.resolve_place(mir_bb, place)?;
                 Ok((None, v))
             }
-            // `Repeat(elem, ty, count)` — `[v; N]` literal. Modeled as
-            // a synthetic Call so the IR shape stays uniform; downstream
-            // consumers see a 1-arg array construction call.
-            Rvalue::Repeat(elem, _ty, _count) => {
-                let arg = self.resolve_operand(mir_bb, elem)?;
+            // `Repeat(elem, ty, count)` — `[v; N]` literal. Lowered to the
+            // same transparent `Array` constructor the `Rvalue::Aggregate`
+            // array arm emits, so the result annotates as
+            // `SomeInstance(Array)` → GcRef. This is the `malloc(Array, N)`
+            // shape: one allocation op whose slots are written through the
+            // subsequent dynamic getarrayitem/setarrayitem, not a per-slot
+            // FieldWrite chain — a fixed-array malloc value-fills without
+            // per-element ops upstream, and dropping the fill operand leaves
+            // no dead binding (a `[v; N]` element is a pure `Copy` value).
+            // The suffix is empty for an array node (`tyref_tuple_suffix`
+            // only suffixes tuple `Adt`s), so the bare `Array` owner matches
+            // the `Aggregate` array arm's `result_ty_owner`.
+            Rvalue::Repeat(_elem, _ty, _count) => {
                 let res = self
                     .graph
                     .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
                 Ok((
                     Some(OpKind::Call {
-                        target: CallTarget::FunctionPath {
-                            segments: vec!["__array_repeat".to_string()],
-                        },
-                        args: vec![arg],
-                        result_ty: ValueType::Int,
+                        target: CallTarget::synthetic_transparent_ctor("Array"),
+                        args: Vec::new(),
+                        result_ty: ValueType::Ref(Some("Array".to_string())),
                     }),
                     res,
                 ))
