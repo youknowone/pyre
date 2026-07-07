@@ -28,9 +28,9 @@ use super::lltypesystem::lltype;
 use crate::annotator::argument::ArgumentsForTranslation;
 use crate::annotator::bookkeeper;
 use crate::annotator::model::{
-    AnnotatorError, KnownType, SomeAddress, SomeBool, SomeChar, SomeFloat, SomeInteger,
-    SomeLongFloat, SomeObject, SomeObjectTrait, SomePtr, SomeSingleFloat, SomeUnicodeCodePoint,
-    SomeValue, SomeValueTag, s_bool, s_none,
+    AnnotatorError, KnownType, SomeAddress, SomeBool, SomeBuiltinMethod, SomeChar, SomeFloat,
+    SomeInteger, SomeLongFloat, SomeObject, SomeObjectTrait, SomePtr, SomeSingleFloat,
+    SomeUnicodeCodePoint, SomeValue, SomeValueTag, s_bool, s_none,
 };
 use crate::flowspace::model::{ConstValue, Constant};
 use crate::flowspace::operation::{CanOnlyThrow, HLOperation, OpKind, Specialization, pure};
@@ -251,10 +251,30 @@ impl SomePtr {
         };
         let example = self.ll_ptrtype._example();
         match example._lookup_adtmeth(attr) {
-            Err(lltype::AttributeError) => {
-                let v = example.getattr(attr).map_err(AnnotatorError::new)?;
-                Ok(ll_to_annotation(v))
-            }
+            Err(lltype::AttributeError) => match example.getattr(attr) {
+                Ok(v) => Ok(ll_to_annotation(v)),
+                // A raw-pointer `p.is_null()` whose receiver keeps its
+                // `SomePtr` tag (e.g. the `*mut u8` opaque GCREF from
+                // `try_gc_alloc_stable_raw`, `TO: Opaque(GCREF)`) reaches
+                // this `SomePtr.getattr` rather than the `SomeObject` /
+                // `SomeInstance` `is_null` arms.  `front::mir` already
+                // routed it as `CallTarget::Method { name: "is_null",
+                // receiver_root: "mut_ptr"/"const_ptr" }`, which
+                // `jtransform` lowers to `ptr_iszero` regardless of the
+                // receiver repr; answer the getattr with the same
+                // `ptr_method_is_null` bound method so the result types as
+                // `SomeBool`.  Last-resort after both `_lookup_adtmeth` and
+                // the struct-field `getattr`, so a real `is_null` adt
+                // member or field is never shadowed.
+                Err(_) if attr == "is_null" => Ok(SomeValue::BuiltinMethod(
+                    SomeBuiltinMethod::new(
+                        "ptr_method_is_null",
+                        SomeValue::Ptr(self.clone()),
+                        "is_null",
+                    ),
+                )),
+                Err(e) => Err(AnnotatorError::new(e)),
+            },
             Ok(lltype::LowLevelAdtMember::Method { ll_ptrtype, func }) => {
                 Ok(SomeValue::LLADTMeth(SomeLLADTMeth::new(ll_ptrtype, func)))
             }
