@@ -30,6 +30,10 @@ class CrateSpec:
     - `cargo_args`: extra flags passed after `--`; each arg may contain the
       `{features}` placeholder, substituted with the active cargo feature set
       (e.g. `["--features", "{features}"]` or `["--no-default-features"]`).
+    - `charon_args`: extra flags passed to Charon itself, before the `--`
+      separator (e.g. `["--include", "somecrate::module::_"]` to translate the
+      bodies of items in a foreign dependency instead of keeping them opaque).
+      Same `{features}` placeholder substitution as `cargo_args`.
     - `fingerprint_pathspecs`: explicit git pathspecs (relative to the driver's
       `root`) that fingerprint this crate's sources. `None` derives them from a
       `cargo metadata` dependency walk instead.
@@ -42,6 +46,7 @@ class CrateSpec:
     crate_dir: Path
     output_name: str
     cargo_args: list[str] = field(default_factory=list)
+    charon_args: list[str] = field(default_factory=list)
     fingerprint_pathspecs: list[str] | None = None
     excluded_deps: set[str] = field(default_factory=set)
 
@@ -98,6 +103,10 @@ def platform_info() -> tuple[str, str]:
 
 def crate_flags(spec: CrateSpec, cargo_features: str) -> list[str]:
     return [arg.format(features=cargo_features) for arg in spec.cargo_args]
+
+
+def charon_crate_flags(spec: CrateSpec, cargo_features: str) -> list[str]:
+    return [arg.format(features=cargo_features) for arg in spec.charon_args]
 
 
 def run_capture(args: list[str], *, cwd: Path) -> str:
@@ -308,6 +317,7 @@ def stamp_for(
     charon_stamp: str,
     cargo_features: str,
     flags: list[str],
+    charon_flags: list[str],
 ) -> str:
     return "\n".join(
         [
@@ -316,6 +326,7 @@ def stamp_for(
             f"charon={charon_stamp}",
             f"features={cargo_features}",
             f"flags={' '.join(flags)}",
+            f"charon_flags={' '.join(charon_flags)}",
             f"source={source_fingerprint(eng, [crate], cargo_features)}",
         ]
     )
@@ -359,6 +370,7 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
         spec = eng.spec(crate)
         path = spec.crate_dir
         flags = crate_flags(spec, cargo_features)
+        charon_flags = charon_crate_flags(spec, cargo_features)
         if not path.is_dir():
             raise SystemExit(f"extract-llbc.py: missing crate dir for '{crate}' at {path}")
 
@@ -371,6 +383,7 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
             charon_stamp=charon_stamp,
             cargo_features=cargo_features,
             flags=flags,
+            charon_flags=charon_flags,
         )
 
         if (
@@ -404,6 +417,7 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
             "--ullbc",
             "--dest-file",
             str(dest),
+            *charon_flags,
             "--",
             *flags,
             *host_config,
