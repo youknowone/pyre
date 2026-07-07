@@ -266,13 +266,13 @@ impl SomePtr {
                 // `SomeBool`.  Last-resort after both `_lookup_adtmeth` and
                 // the struct-field `getattr`, so a real `is_null` adt
                 // member or field is never shadowed.
-                Err(_) if attr == "is_null" => Ok(SomeValue::BuiltinMethod(
-                    SomeBuiltinMethod::new(
+                Err(_) if attr == "is_null" => {
+                    Ok(SomeValue::BuiltinMethod(SomeBuiltinMethod::new(
                         "ptr_method_is_null",
                         SomeValue::Ptr(self.clone()),
                         "is_null",
-                    ),
-                )),
+                    )))
+                }
                 Err(e) => Err(AnnotatorError::new(e)),
             },
             Ok(lltype::LowLevelAdtMember::Method { ll_ptrtype, func }) => {

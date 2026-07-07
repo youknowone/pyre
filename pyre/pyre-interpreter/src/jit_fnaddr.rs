@@ -611,6 +611,21 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::objspace::descroperation::jit_bigint_rem",
         crate::objspace::descroperation::jit_bigint_rem as *const (),
     );
+    // `jit_bigint_div_floor` / `jit_bigint_mod_floor` residualize the
+    // `div_mod_floor()` tuple synth (`front::bigint_div_mod_floor`): the foreign
+    // malachite `div_mod_floor` returns a floored `(BigInt, BigInt)` the tracer
+    // models as a `__pos_0`/`__pos_1` tuple sourced from these two
+    // `#[dont_look_inside]` calls, bound by path.
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::jit_bigint_div_floor",
+        crate::objspace::descroperation::jit_bigint_div_floor as *const (),
+    );
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::jit_bigint_mod_floor",
+        crate::objspace::descroperation::jit_bigint_mod_floor as *const (),
+    );
     // `jit_bigint_{and,or,xor,sub,mul}` residualize the foreign BigInt binary
     // operators (`<BigInt as BitAnd>::bitand`, …) the `front::mir` retarget
     // (`front::bigint_binop`) redirects when both operands are the opaque

@@ -65,6 +65,7 @@
 //! treated as opaque ops.
 
 pub(crate) mod bigint_binop;
+pub(crate) mod bigint_div_mod_floor;
 pub(crate) mod bigint_div_rem;
 pub(crate) mod bool_then;
 pub(crate) mod checked_arith;

@@ -116,6 +116,32 @@ pub extern "C" fn jit_bigint_rem(a: i64, b: i64) -> *mut BigInt {
     unsafe { pyre_object::longobject::alloc_bigint_nursery_collecting((&*a).div_rem(&*b).1) }
 }
 
+/// `rbigint.floordiv`'s floored quotient — the `.0` of `num_integer::div_mod_floor`
+/// on two bare `*const BigInt` payloads. The foreign malachite `div_mod_floor`
+/// returns a `(BigInt, BigInt)` tuple the tracer cannot model, so the front
+/// `div_mod_floor` synth (`front::bigint_div_mod_floor`) replaces the call with
+/// the floored quotient (this) + floored modulus ([`jit_bigint_mod_floor`])
+/// sourcing a modeled 2-tuple. Allocates the result via the COLLECTING nursery
+/// (a gcmap-rooted residual, its operand pointers rooted across the alloc),
+/// matching the arithmetic residuals. Returns a freshly heap-allocated
+/// `*mut BigInt` — a `ref`-token return so the CodeWriter models the result as
+/// a traced GcRef.
+#[majit_macros::dont_look_inside]
+pub extern "C" fn jit_bigint_div_floor(a: i64, b: i64) -> *mut BigInt {
+    let (a, b) = (a as *const BigInt, b as *const BigInt);
+    unsafe { pyre_object::longobject::alloc_bigint_nursery_collecting((&*a).div_mod_floor(&*b).0) }
+}
+
+/// `rbigint.mod`'s floored modulus — the `.1` of `num_integer::div_mod_floor`.
+/// See [`jit_bigint_div_floor`]; the two share the `(BigInt, BigInt)` floored
+/// semantics the `front::bigint_div_mod_floor` synth reassembles into a modeled
+/// tuple.
+#[majit_macros::dont_look_inside]
+pub extern "C" fn jit_bigint_mod_floor(a: i64, b: i64) -> *mut BigInt {
+    let (a, b) = (a as *const BigInt, b as *const BigInt);
+    unsafe { pyre_object::longobject::alloc_bigint_nursery_collecting((&*a).div_mod_floor(&*b).1) }
+}
+
 // ── BigInt binary-operator residuals ─────────────────────────────────
 // The foreign malachite operator impls (`<BigInt as BitAnd>::bitand`, …)
 // are Opaque in the LLBC, so a traced-into caller (`bigint_truediv`) emits

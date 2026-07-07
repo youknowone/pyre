@@ -1703,6 +1703,19 @@ pub fn lower_fun_decl_with_static_addrs(
                 &lo.bigint_div_rem_sites,
             );
         }
+        // The `bigint::BigInt::div_mod_floor()` producer rewrite
+        // (`front::bigint_div_mod_floor`) splices the residual `div_mod_floor`
+        // call in place with `jit_bigint_div_floor` / `jit_bigint_mod_floor`
+        // residuals + a synthetic-`Tuple` floored `(quotient, modulus)`
+        // aggregate.  It touches no control flow (no fresh blocks, no detached
+        // edges), so it does not gate the reachability sweep; fail-safe, so a
+        // structural mismatch leaves the residual call (rtyper Skip).
+        if !lo.bigint_div_mod_floor_sites.is_empty() {
+            crate::front::bigint_div_mod_floor::rewire_bigint_div_mod_floor_call_sites(
+                &mut lo.graph,
+                &lo.bigint_div_mod_floor_sites,
+            );
+        }
         if !lo.result_exc_call_results.is_empty()
             || result_exc_callee
             || next_rewritten > 0
@@ -2057,6 +2070,11 @@ struct Lowering<'a> {
     /// post-pass synthesizes (see
     /// [`crate::front::bigint_div_rem::BigIntDivRemSite`]).
     bigint_div_rem_sites: Vec<crate::front::bigint_div_rem::BigIntDivRemSite>,
+    /// `bigint::BigInt::div_mod_floor()` call sites recorded for the modeled
+    /// floored `(quotient, modulus)` tuple producer the
+    /// `front::bigint_div_mod_floor` post-pass synthesizes (see
+    /// [`crate::front::bigint_div_mod_floor::BigIntDivModFloorSite`]).
+    bigint_div_mod_floor_sites: Vec<crate::front::bigint_div_mod_floor::BigIntDivModFloorSite>,
     /// `Option::unwrap_or(opt, default)` call sites recorded for the
     /// discriminant value-select the `front::option_unwrap_or` post-pass
     /// synthesizes after the body lowering completes.  Each carries the
@@ -2239,6 +2257,7 @@ impl<'a> Lowering<'a> {
             option_try_sites: Vec::new(),
             bool_then_sites: Vec::new(),
             bigint_div_rem_sites: Vec::new(),
+            bigint_div_mod_floor_sites: Vec::new(),
             unwrap_or_sites: Vec::new(),
             unwrap_sites: Vec::new(),
             map_or_sites: Vec::new(),
@@ -6186,6 +6205,26 @@ impl<'a> Lowering<'a> {
                 .push(crate::front::bigint_div_rem::BigIntDivRemSite {
                     result_var: result_var.clone(),
                 });
+        }
+        // Capture `bigint::BigInt::div_mod_floor()` sites for the modeled floored
+        // `(quotient, modulus)` tuple producer `front::bigint_div_mod_floor`
+        // synthesizes.  Opaque foreign 2-arg FunctionPath (numerator,
+        // denominator); the `(BigInt, BigInt)` tuple owner is the synthetic
+        // `"Tuple"` constant, so only the result var is recorded.  A distinct
+        // leaf name from `div_rem`, so this arm coexists with it.
+        if let OpKind::Call {
+            target: CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } = &op_kind
+            && args.len() == 2
+            && fmt_path_ends_with(segments, &["bigint", "BigInt", "div_mod_floor"])
+        {
+            self.bigint_div_mod_floor_sites.push(
+                crate::front::bigint_div_mod_floor::BigIntDivModFloorSite {
+                    result_var: result_var.clone(),
+                },
+            );
         }
         // Capture `Option::unwrap_or(opt, default)` /
         // `Result::unwrap_or(res, default)` sites for the discriminant
