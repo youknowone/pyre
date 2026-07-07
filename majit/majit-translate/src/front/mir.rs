@@ -5693,12 +5693,7 @@ impl<'a> Lowering<'a> {
                     return Ok(());
                 }
                 if self.try_lower_wrapping_binop(
-                    mir_bb,
-                    &reg.kind,
-                    &segments,
-                    &args,
-                    dest_local,
-                    target,
+                    mir_bb, &reg.kind, &segments, &args, dest_local, target,
                 )? {
                     return Ok(());
                 }

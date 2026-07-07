@@ -33,10 +33,10 @@ pub mod generated;
 pub mod hints;
 pub mod inline;
 pub mod layout;
+mod local_crates;
 pub mod model;
 pub mod model_ssa;
 pub mod opcode_dispatch;
-mod local_crates;
 mod parse;
 pub mod pipeline;
 #[cfg(test)]
