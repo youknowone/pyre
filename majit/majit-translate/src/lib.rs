@@ -154,7 +154,7 @@ fn build_semantic_program_via_active_frontend(
             // Seed the local-crate alias roots from the loaded set so
             // `free_function_alias_paths` and the registry's canonical
             // dedup treat every extracted crate name as an alias root
-            // (`local_crates.rs`); non-pyre consumers (aheui) resolve
+            // (`local_crates.rs`); non-pyre consumer crates resolve
             // their crate-qualified cross-crate callsites through this.
             crate::local_crates::register_local_crate_roots(
                 llbcs.iter().map(|l| l.crate_name().to_string()),

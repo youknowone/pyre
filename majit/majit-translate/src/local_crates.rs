@@ -5,7 +5,7 @@
 //! identity, so a callable has one identity regardless of the import
 //! spelling. pyre resolves symbolic paths extracted from LLBC, where a
 //! cross-crate callsite spells the callee with its crate name
-//! (`aheui_runtime::io::output_flush`) while the graph registers under
+//! (`myinterp::io::output_flush`) while the graph registers under
 //! module-relative spellings — so every *local* (LLBC-extracted) crate
 //! name must be an alias root on both the registration side
 //! (`free_function_alias_paths`) and the canonical-dedup side
