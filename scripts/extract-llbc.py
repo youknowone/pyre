@@ -13,8 +13,43 @@ import sys
 from pathlib import Path
 
 
-ALL_CRATES = ["corpus", "pyre-object", "pyre-module", "pyre-interpreter", "pyre-jit"]
+ALL_CRATES = [
+    "corpus",
+    "pyre-object",
+    "pyre-module",
+    "pyre-interpreter",
+    "pyre-jit",
+    "aheui-runtime",
+    "aheui-runtime-smallint",
+    "aheuinterpreter",
+]
 DEFAULT_CRATES = ["pyre-object", "pyre-interpreter", "pyre-jit"]
+
+# aheui crates live in their own cargo workspace (`aheui/Cargo.toml`), so the
+# root `cargo metadata` walk in fingerprint_inputs() cannot see them. Like
+# `corpus`, their fingerprint inputs are explicit pathspecs: the crate itself
+# plus its path dependencies inside the aheui workspace.
+AHEUI_CRATE_PATHSPECS: dict[str, list[str]] = {
+    "aheui-runtime": [
+        "aheui/Cargo.lock",
+        "aheui/aheui-runtime/Cargo.toml",
+        "aheui/aheui-runtime/src/",
+        "aheui/ahsembler/Cargo.toml",
+        "aheui/ahsembler/src/",
+    ],
+    "aheuinterpreter": [
+        "aheui/Cargo.lock",
+        "aheui/aheuinterpreter/Cargo.toml",
+        "aheui/aheuinterpreter/src/",
+        "aheui/aheui-runtime/Cargo.toml",
+        "aheui/aheui-runtime/src/",
+        "aheui/ahsembler/Cargo.toml",
+        "aheui/ahsembler/src/",
+    ],
+}
+# `aheui-runtime-smallint` is the same crate extracted with
+# `--no-default-features` (Val = i64 instead of the tagged bigint word).
+AHEUI_CRATE_PATHSPECS["aheui-runtime-smallint"] = AHEUI_CRATE_PATHSPECS["aheui-runtime"]
 
 # Path-dependency packages that do NOT appear at all in a given crate's emitted
 # `.ullbc`, so changes to them cannot change that artefact. Dropping such a
@@ -69,6 +104,10 @@ def platform_info() -> tuple[str, str]:
 def crate_info(root: Path, crate: str, cargo_features: str) -> tuple[Path, list[str]]:
     if crate == "corpus":
         return root / "majit" / "charon-corpus", []
+    if crate == "aheui-runtime-smallint":
+        return root / "aheui" / "aheui-runtime", ["--no-default-features"]
+    if crate in AHEUI_CRATE_PATHSPECS:
+        return root / "aheui" / crate, []
     if crate == "pyre-object":
         return root / "pyre" / "pyre-object", []
     if crate == "pyre-module":
@@ -143,6 +182,8 @@ def fingerprint_inputs(root: Path, crates: list[str], cargo_features: str) -> li
             pathspecs.extend(
                 ["majit/charon-corpus/Cargo.toml", "majit/charon-corpus/src/"]
             )
+        elif crate in AHEUI_CRATE_PATHSPECS:
+            pathspecs.extend(AHEUI_CRATE_PATHSPECS[crate])
         else:
             target_names.append(crate)
 
