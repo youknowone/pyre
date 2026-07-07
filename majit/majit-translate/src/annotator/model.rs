@@ -2981,12 +2981,21 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
                 (Some(ca), Some(cb)) => match ClassDef::commonbase(ca, cb) {
                     Some(base) => Some(base),
                     None => {
+                        // Name the two colliding classdefs so the
+                        // skip-classified panic path is diagnosable
+                        // instead of a blind `<other> ∪ <other>`.  The
+                        // "cannot unify instances with no common base
+                        // class" phrase is preserved verbatim so the
+                        // dual-gate skip classifier still matches.
                         return Err(UnionError {
                             lhs: s1.clone(),
                             rhs: s2.clone(),
-                            msg: "RPython cannot unify instances with no \
-                                  common base class"
-                                .to_string(),
+                            msg: format!(
+                                "RPython cannot unify instances with no \
+                                 common base class: {} ∪ {}",
+                                ca.borrow().name,
+                                cb.borrow().name
+                            ),
                         });
                     }
                 },
@@ -3156,17 +3165,25 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
         // SomeWeakRef ∪ SomeWeakRef — upstream widens the classdef to
         // the common base when both sides carry one.
         (SomeValue::WeakRef(a), SomeValue::WeakRef(b)) => {
-            let merged_classdef = match (&a.classdef, &b.classdef) {
-                (None, _) | (_, None) => Some(None),
-                (Some(ca), Some(cb)) => ClassDef::commonbase(ca, cb).map(Some),
-            };
-            let Some(merged_classdef) = merged_classdef else {
-                return Err(UnionError {
-                    lhs: s1.clone(),
-                    rhs: s2.clone(),
-                    msg: "RPython cannot unify weakrefs with no common base class".into(),
-                });
-            };
+            let merged_classdef: Option<Rc<RefCell<ClassDef>>> =
+                match (&a.classdef, &b.classdef) {
+                    (None, _) | (_, None) => None,
+                    (Some(ca), Some(cb)) => match ClassDef::commonbase(ca, cb) {
+                        Some(base) => Some(base),
+                        None => {
+                            return Err(UnionError {
+                                lhs: s1.clone(),
+                                rhs: s2.clone(),
+                                msg: format!(
+                                    "RPython cannot unify weakrefs with no \
+                                     common base class: {} ∪ {}",
+                                    ca.borrow().name,
+                                    cb.borrow().name
+                                ),
+                            });
+                        }
+                    },
+                };
             Ok(SomeValue::WeakRef(SomeWeakRef::new(merged_classdef)))
         }
 
