@@ -1801,6 +1801,74 @@ impl Bookkeeper {
         self.getuniqueclassdef(&variant_host)
     }
 
+    /// Register a trait family for receiver-driven method dispatch: a base
+    /// `ClassDef` `base_root` with each `(impl_root, members)` interned as a
+    /// subclass, carrying method MEMBERS so `getattr(instance, method)`
+    /// resolves to a `MethodDesc` PBC family — the RPython instance-method
+    /// [`MethodsPBCRepr`](crate::translator::rtyper::rpbc::MethodsPBCRepr)
+    /// dispatch path.
+    ///
+    /// Mirrors [`Self::getuniqueclassdef_for_enum_variant`] (a base plus
+    /// subclasses interned WITH that base as their sole `__bases__`, so
+    /// `ClassDef.basedef`/`subdefs`/`getmro` chain), but seeds method members
+    /// through [`HostObject::new_class_with_members`].  Plain pyre struct
+    /// classdefs are minted member-less by
+    /// [`Self::intern_class_by_qualname`] (`HostObject::new_class`) and carry
+    /// only fields (`project_struct_rows`); a `dyn Trait` receiver therefore
+    /// annotates to a classdef-less shell and every `getattr` on it fails.
+    /// The members seeded here are what `ClassDesc::find_source_for` reads via
+    /// `pyobj.class_get(name)` → `add_source_attribute`, so the trait methods
+    /// become classdict attributes and `s_getattr` yields the PBC family.
+    ///
+    /// `base_members` (trait default-body methods) attach to the base;
+    /// each impl's `members` (its required-method overrides) attach to that
+    /// subclass — mirroring the trait's default-vs-required split, so the MRO
+    /// getattr binds each method to its correct owner.
+    ///
+    /// OPT-IN: only a trait registered through this entry point gets a
+    /// member-carrying host in `pyre_struct_root_classes`.  Every other
+    /// (unregistered) multi-impl trait keeps its current classdef-less /
+    /// fail-loud disposition, so this cannot perturb the annotation of pyre
+    /// production dispatch that was never registered.
+    ///
+    /// Returns the base `ClassDef`.
+    pub fn register_trait_family(
+        self: &Rc<Self>,
+        base_root: &str,
+        base_members: HashMap<String, ConstValue>,
+        impls: Vec<(String, HashMap<String, ConstValue>)>,
+    ) -> Result<Rc<RefCell<ClassDef>>, AnnotatorError> {
+        // Base first — its identity-keyed HostObject must be published in
+        // `pyre_struct_root_classes` before the subclasses intern, so each
+        // subclass's `__bases__` resolves to this exact base host (the same
+        // discipline `getuniqueclassdef_for_enum_variant` relies on).
+        let base_key = majit_ir::descr::canonical_struct_name(base_root);
+        let base_host = crate::flowspace::model::HostObject::new_class_with_members(
+            base_key.clone(),
+            Vec::new(),
+            base_members,
+        );
+        self.pyre_struct_root_classes
+            .borrow_mut()
+            .insert(base_key, base_host.clone());
+        let base_cd = self.getuniqueclassdef(&base_host)?;
+        // Subclasses — interned WITH the base host so `ClassDesc::new` wires
+        // `basedef` and `_init_classdef` pushes each into `base.subdefs`.
+        for (impl_root, members) in impls {
+            let impl_key = majit_ir::descr::canonical_struct_name(&impl_root);
+            let impl_host = crate::flowspace::model::HostObject::new_class_with_members(
+                impl_key.clone(),
+                vec![base_host.clone()],
+                members,
+            );
+            self.pyre_struct_root_classes
+                .borrow_mut()
+                .insert(impl_key, impl_host.clone());
+            self.getuniqueclassdef(&impl_host)?;
+        }
+        Ok(base_cd)
+    }
+
     /// Intern (first-mint-wins) and return the canonical variant-subclass
     /// `HostObject` for `{enum_root}::{variant_name}`, wiring the enum's
     /// discriminant-only base as its sole `__bases__` (`rclass.py:82-88`).
@@ -5846,6 +5914,160 @@ mod tests {
             matches!(varnames.s_value, SomeValue::List(_)),
             "varnames must project to SomeList, got {:?}",
             varnames.s_value
+        );
+    }
+
+    /// Fixture for the methods-on-classdef capability that `dyn Trait`
+    /// receiver-driven dispatch (issue #346, aheui LinkedList) needs.
+    ///
+    /// A ≥2-impl trait family registered through `register_trait_family`
+    /// must (a) link a base ClassDef to its impl subclasses, (b) carry the
+    /// trait methods as members so `getattr(instance, method)` annotates to
+    /// a `MethodDesc` PBC family instead of a classdef-less shell, and
+    /// (c) let the existing `MethodsPBCRepr` port lower that family to a
+    /// vtable/method dispatch.  Plain pyre struct classdefs carry fields
+    /// only, so this method-member path is exercised here for the first time.
+    #[test]
+    fn register_trait_family_getattr_yields_method_pbc_and_rtypes_via_methods_pbc_repr() {
+        use crate::annotator::classdesc::ClassDef;
+        use crate::annotator::model::SomeValue;
+        use crate::translator::rtyper::rpbc::MethodsPBCRepr;
+        use crate::translator::rtyper::rtyper::RPythonTyper;
+        use std::collections::HashMap;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let bk = ann.bookkeeper.clone();
+
+        // A method member is a user function backed by a GraphFunc — the
+        // same shape `HostObject::new_class`'s `__dict__` would carry, and
+        // what `add_source_attribute` turns into a MethodDesc.
+        let member = |name: &str| -> ConstValue {
+            ConstValue::HostObject(HostObject::new_user_function(GraphFunc::new(
+                name.to_string(),
+                Constant::new(ConstValue::Dict(Default::default())),
+            )))
+        };
+
+        // Base trait `T` with a default-body method `shared`; three impls
+        // A/B/C each override `shared`.  This is the ≥2-impl multi-impl
+        // family shape that annotates classdef-less today.
+        let mut base_members = HashMap::new();
+        base_members.insert("shared".to_string(), member("T::shared"));
+        let mut impls = Vec::new();
+        for impl_name in ["A", "B", "C"] {
+            let mut m = HashMap::new();
+            m.insert(
+                "shared".to_string(),
+                member(&format!("{impl_name}::shared")),
+            );
+            impls.push((impl_name.to_string(), m));
+        }
+        let base_cd = bk
+            .register_trait_family("T", base_members, impls)
+            .expect("register_trait_family must succeed");
+
+        // (a) base ↔ subclass links.
+        assert_eq!(
+            base_cd.borrow().subdefs.len(),
+            3,
+            "base classdef must link 3 impl subclasses"
+        );
+
+        // (b) getattr(instance_of_T, "shared") resolves to a MethodDesc PBC
+        // family — NOT `SomeInstance(classdef=None)`, NOT "attribute not
+        // found".  `s_getattr` on the base ClassDef is exactly what
+        // `SomeInstance.getattr` (unaryop.rs:4143) calls for an instance of
+        // that classdef; populate the attr across the tree first (the
+        // fixpoint analog).
+        ClassDef::check_missing_attribute_update(&base_cd, "shared")
+            .expect("attr population must succeed");
+        let s_shared = ClassDef::s_getattr(&base_cd, "shared", &std::collections::BTreeMap::new())
+            .expect("s_getattr(shared) must resolve");
+        let pbc = match &s_shared {
+            SomeValue::PBC(p) => p.clone(),
+            other => panic!("expected a method PBC for `shared`, got {other:?}"),
+        };
+        let n_methods = pbc
+            .descriptions
+            .values()
+            .filter(|d| d.as_method().is_some())
+            .count();
+        assert!(
+            n_methods >= 3,
+            "expected >=3 MethodDescs in the `shared` family (the subclass \
+             overrides), got {n_methods}: {pbc:?}"
+        );
+
+        // (c) the `MethodsPBCRepr` port — possibly never exercised on a
+        // pyre-synthesized method PBC — must accept the family and resolve
+        // its owner + bound-`self` InstanceRepr (the vtable dispatch seed).
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        let repr = MethodsPBCRepr::new(&rtyper, pbc)
+            .expect("MethodsPBCRepr must accept the pyre-synthesized method family");
+        assert_eq!(repr.methodname, "shared");
+        assert!(
+            Rc::ptr_eq(&repr.classdef, &base_cd),
+            "MethodsPBCRepr must fold the family's owner to the base classdef"
+        );
+    }
+
+    /// Diagnostic for the LinkedList wiring: the real dispatch blockers
+    /// (`_get_2_values` / `head` / `dup`) are trait REQUIRED methods —
+    /// declared on the trait, bodied only on the impl subclasses.  This
+    /// probes a base-instance `getattr` of a method that exists ONLY on the
+    /// subclasses (absent from the base member map).
+    ///
+    /// FINDING: it resolves to the full impl family anyway.  RPython's
+    /// attrfamily merge homes a same-named attribute defined across sibling
+    /// subclasses onto their common base, so `s_getattr(base, "req")` returns
+    /// the {A,B,C}::req MethodDesc PBC even though the base declares no `req`.
+    /// => piece-3 registration can seed the impls ONLY; it need NOT synthesize
+    /// a base declaration for required (default-body-less) trait methods.
+    #[test]
+    fn register_trait_family_subclass_only_method_surfaces_on_base() {
+        use crate::annotator::classdesc::ClassDef;
+        use crate::annotator::model::SomeValue;
+        use std::collections::HashMap;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let bk = ann.bookkeeper.clone();
+        let member = |name: &str| -> ConstValue {
+            ConstValue::HostObject(HostObject::new_user_function(GraphFunc::new(
+                name.to_string(),
+                Constant::new(ConstValue::Dict(Default::default())),
+            )))
+        };
+
+        // Base `T` declares NO `req`; each impl bodies `req` — the
+        // required-method-with-no-default-body shape.
+        let mut impls = Vec::new();
+        for impl_name in ["A", "B", "C"] {
+            let mut m = HashMap::new();
+            m.insert("req".to_string(), member(&format!("{impl_name}::req")));
+            impls.push((impl_name.to_string(), m));
+        }
+        let base_cd = bk
+            .register_trait_family("T", HashMap::new(), impls)
+            .expect("register_trait_family must succeed");
+
+        ClassDef::check_missing_attribute_update(&base_cd, "req").expect("attr population");
+        let s_req = ClassDef::s_getattr(&base_cd, "req", &std::collections::BTreeMap::new())
+            .expect("s_getattr(req) must not error");
+        let n_methods = match &s_req {
+            SomeValue::PBC(p) => p
+                .descriptions
+                .values()
+                .filter(|d| d.as_method().is_some())
+                .count(),
+            other => panic!("expected a method PBC for subclass-only `req`, got {other:?}"),
+        };
+        // The attrfamily merge surfaces the subclass-only method on the base:
+        // one MethodDesc per impl, so a base-typed / trait-object receiver
+        // dispatches across all impls without a base declaration.
+        assert_eq!(
+            n_methods, 3,
+            "subclass-only `req` must surface all 3 impl MethodDescs on the \
+             base via attrfamily merge, got {n_methods}: {s_req:?}"
         );
     }
 }
