@@ -107,7 +107,9 @@ fn category_old(args: &[PyObjectRef]) -> PyResult {
 }
 
 fn bidirectional_impl(db: &ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
-    Ok(w_str_new(db.bidirectional(one_char("bidirectional", args)?)))
+    Ok(w_str_new(
+        db.bidirectional(one_char("bidirectional", args)?),
+    ))
 }
 fn bidirectional(args: &[PyObjectRef]) -> PyResult {
     bidirectional_impl(&MODERN, args)
@@ -149,7 +151,9 @@ fn mirrored_old(args: &[PyObjectRef]) -> PyResult {
 }
 
 fn decomposition_impl(db: &ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
-    Ok(w_str_new(&db.decomposition(one_char("decomposition", args)?)))
+    Ok(w_str_new(
+        &db.decomposition(one_char("decomposition", args)?),
+    ))
 }
 fn decomposition(args: &[PyObjectRef]) -> PyResult {
     decomposition_impl(&MODERN, args)

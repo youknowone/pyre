@@ -11,8 +11,8 @@
 //! dropped by GC leaks its (post-finish, buffer-freed) registry entry; the
 //! heavy flate2 buffers are released by the backend at finish/eof.
 
-use pyre_object::*;
 use pyre_native::zlib as backend;
+use pyre_object::*;
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -23,7 +23,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 static COMPRESSORS: Mutex<BTreeMap<u64, backend::Compressor>> = Mutex::new(BTreeMap::new());
 static DECOMPRESSORS: Mutex<BTreeMap<u64, backend::Decompressor>> = Mutex::new(BTreeMap::new());
-static ZDECOMPRESSORS: Mutex<BTreeMap<u64, backend::ZlibDecompressor>> = Mutex::new(BTreeMap::new());
+static ZDECOMPRESSORS: Mutex<BTreeMap<u64, backend::ZlibDecompressor>> =
+    Mutex::new(BTreeMap::new());
 
 fn next_id() -> u64 {
     NEXT_ID.fetch_add(1, Ordering::Relaxed)
@@ -205,7 +206,11 @@ fn init_compress_type(ns: &mut crate::DictStorage) {
     );
 }
 
-fn make_compress(level: i32, wbits: i8, zdict: Option<Vec<u8>>) -> Result<PyObjectRef, crate::PyError> {
+fn make_compress(
+    level: i32,
+    wbits: i8,
+    zdict: Option<Vec<u8>>,
+) -> Result<PyObjectRef, crate::PyError> {
     let c = backend::Compressor::new(level, wbits, zdict.as_deref()).map_err(zlib_error)?;
     let id = next_id();
     COMPRESSORS.lock().unwrap().insert(id, c);
@@ -226,7 +231,11 @@ fn decompress_type() -> PyObjectRef {
     })
 }
 
-fn decompress_getset(ns: &mut crate::DictStorage, name: &'static str, f: crate::gateway::BuiltinCodeFn) {
+fn decompress_getset(
+    ns: &mut crate::DictStorage,
+    name: &'static str,
+    f: crate::gateway::BuiltinCodeFn,
+) {
     crate::dict_storage_store(
         ns,
         name,
@@ -251,7 +260,9 @@ fn init_decompress_type(ns: &mut crate::DictStorage) {
                 Some(o) if !unsafe { is_none(o) } => {
                     let v = crate::baseobjspace::int_w(o)?;
                     if v < 0 {
-                        return Err(crate::PyError::value_error("max_length must be non-negative"));
+                        return Err(crate::PyError::value_error(
+                            "max_length must be non-negative",
+                        ));
                     }
                     (v != 0).then_some(v as usize)
                 }
@@ -277,7 +288,9 @@ fn init_decompress_type(ns: &mut crate::DictStorage) {
                 Some(o) if !unsafe { is_none(o) } => {
                     let v = crate::baseobjspace::int_w(o)?;
                     if v <= 0 {
-                        return Err(crate::PyError::value_error("length must be greater than zero"));
+                        return Err(crate::PyError::value_error(
+                            "length must be greater than zero",
+                        ));
                     }
                     v as usize
                 }
@@ -294,7 +307,10 @@ fn init_decompress_type(ns: &mut crate::DictStorage) {
     decompress_getset(ns, "unused_data", |args| {
         let id = get_id(args.get(1).copied().unwrap_or(PY_NULL));
         let reg = DECOMPRESSORS.lock().unwrap();
-        let data = reg.get(&id).map(|d| d.unused_data().to_vec()).unwrap_or_default();
+        let data = reg
+            .get(&id)
+            .map(|d| d.unused_data().to_vec())
+            .unwrap_or_default();
         Ok(bytesobject::w_bytes_from_bytes(&data))
     });
     decompress_getset(ns, "unconsumed_tail", |args| {
@@ -403,7 +419,10 @@ fn init_zdecompress_type(ns: &mut crate::DictStorage) {
     zdecompress_getset(ns, "unused_data", |args| {
         let id = get_id(args.get(1).copied().unwrap_or(PY_NULL));
         let reg = ZDECOMPRESSORS.lock().unwrap();
-        let data = reg.get(&id).map(|d| d.unused_data().to_vec()).unwrap_or_default();
+        let data = reg
+            .get(&id)
+            .map(|d| d.unused_data().to_vec())
+            .unwrap_or_default();
         Ok(bytesobject::w_bytes_from_bytes(&data))
     });
     zdecompress_getset(ns, "eof", |args| {
@@ -414,7 +433,9 @@ fn init_zdecompress_type(ns: &mut crate::DictStorage) {
     zdecompress_getset(ns, "needs_input", |args| {
         let id = get_id(args.get(1).copied().unwrap_or(PY_NULL));
         let reg = ZDECOMPRESSORS.lock().unwrap();
-        Ok(w_bool_from(reg.get(&id).map(|d| d.needs_input()).unwrap_or(true)))
+        Ok(w_bool_from(
+            reg.get(&id).map(|d| d.needs_input()).unwrap_or(true),
+        ))
     });
 }
 

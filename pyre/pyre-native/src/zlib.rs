@@ -60,7 +60,9 @@ impl InitOptions {
 
     fn compress(self, level: Compression) -> Compress {
         match self {
-            Self::Standard { header, wbits } => Compress::new_with_window_bits(level, header, wbits),
+            Self::Standard { header, wbits } => {
+                Compress::new_with_window_bits(level, header, wbits)
+            }
             Self::Gzip { wbits } => Compress::new_gzip(level, wbits),
         }
     }
@@ -196,9 +198,8 @@ pub fn compress(data: &[u8], level: i32, wbits: i8) -> Result<Vec<u8>, String> {
 #[inline(never)]
 pub fn decompress(data: &[u8], wbits: i8, bufsize: usize) -> Result<Vec<u8>, String> {
     let mut d = InitOptions::new(wbits)?.decompress();
-    let (buf, stream_end) = decompress_all(data, &mut d, None, bufsize, None, |_| {
-        FlushDecompress::Sync
-    })?;
+    let (buf, stream_end) =
+        decompress_all(data, &mut d, None, bufsize, None, |_| FlushDecompress::Sync)?;
     if !stream_end {
         return Err("Error -5 while decompressing data: incomplete or truncated stream".to_owned());
     }
@@ -576,10 +577,7 @@ mod tests {
         assert_eq!(got, b"gzip payload contents");
         assert!(d.eof());
         // decompress after eof raises Eof
-        assert!(matches!(
-            d.decompress(b"", None),
-            Err(DecompressError::Eof)
-        ));
+        assert!(matches!(d.decompress(b"", None), Err(DecompressError::Eof)));
     }
 
     #[test]

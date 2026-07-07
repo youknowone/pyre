@@ -117,12 +117,11 @@ fn arg_sep(
         }
         _ => None,
     };
-    let bytes_per_sep = match crate::builtins::kwarg_get(kwargs, "bytes_per_sep")
-        .or_else(|| pos.get(2).copied())
-    {
-        Some(o) if !unsafe { is_none(o) } => crate::baseobjspace::int_w(o)? as isize,
-        _ => 1,
-    };
+    let bytes_per_sep =
+        match crate::builtins::kwarg_get(kwargs, "bytes_per_sep").or_else(|| pos.get(2).copied()) {
+            Some(o) if !unsafe { is_none(o) } => crate::baseobjspace::int_w(o)? as isize,
+            _ => 1,
+        };
     Ok((sep, bytes_per_sep))
 }
 

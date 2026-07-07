@@ -99,7 +99,11 @@ pub(crate) fn format_wtf8_repr(s: &Wtf8) -> String {
 fn bytearray_repr_string(data: &[u8]) -> String {
     let has_single = data.contains(&b'\'');
     let has_double = data.contains(&b'"');
-    let quote = if has_single && !has_double { b'"' } else { b'\'' };
+    let quote = if has_single && !has_double {
+        b'"'
+    } else {
+        b'\''
+    };
     let mut out = String::with_capacity(data.len() + 14);
     out.push_str("bytearray(b");
     out.push(quote as char);

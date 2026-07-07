@@ -8850,7 +8850,11 @@ mod tests {
             -BigInt::from(u128::MAX),
         ];
         for b in &bigs {
-            assert_eq!(hash::hash_bigint(b), _hash_long(b), "hash_bigint vs _hash_long");
+            assert_eq!(
+                hash::hash_bigint(b),
+                _hash_long(b),
+                "hash_bigint vs _hash_long"
+            );
         }
     }
 
@@ -8878,7 +8882,7 @@ mod tests {
         let cases = [
             0.0f64,
             -0.0,
-            f64::from_bits(1),       // smallest positive subnormal
+            f64::from_bits(1), // smallest positive subnormal
             -f64::from_bits(1),
             5e-324,
             1e-310,                  // subnormal

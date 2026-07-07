@@ -1086,10 +1086,7 @@ fn format_render(
 
 /// Fetch positional argument `idx`, raising the `str.format` IndexError for
 /// an out-of-range replacement index.
-fn index_positional(
-    positional: &[PyObjectRef],
-    idx: usize,
-) -> Result<PyObjectRef, crate::PyError> {
+fn index_positional(positional: &[PyObjectRef], idx: usize) -> Result<PyObjectRef, crate::PyError> {
     positional.get(idx).copied().ok_or_else(|| {
         crate::PyError::index_error(format!(
             "Replacement index {idx} out of range for positional args tuple"
@@ -1101,7 +1098,10 @@ fn index_positional(
 /// `FormatString` reports `UnmatchedBracket` for both a lone trailing `{`
 /// and an opened-but-unclosed field, so the trailing byte disambiguates the
 /// two CPython messages.
-fn format_parse_err(err: rustpython_common::format::FormatParseError, fmt: &Wtf8) -> crate::PyError {
+fn format_parse_err(
+    err: rustpython_common::format::FormatParseError,
+    fmt: &Wtf8,
+) -> crate::PyError {
     use rustpython_common::format::FormatParseError as E;
     let msg = match err {
         E::UnmatchedBracket => {
@@ -1206,74 +1206,6 @@ fn parse_spec(spec: &str) -> ParsedSpec {
         precision,
         ty,
     }
-}
-
-/// Insert the thousands separator `sep` into a run of plain digits every
-/// `interval` positions counted from the right.
-fn group_digits(digits: &str, sep: char, interval: usize) -> String {
-    let chars: Vec<char> = digits.chars().collect();
-    let len = chars.len();
-    let mut out = String::with_capacity(len + len / interval);
-    for (idx, c) in chars.iter().enumerate() {
-        if idx > 0 && (len - idx) % interval == 0 {
-            out.push(sep);
-        }
-        out.push(*c);
-    }
-    out
-}
-
-/// Group only the leading integer run of a numeric body (the digits before
-/// any `.`, exponent, or `%`), leaving the fractional / suffix portion
-/// untouched.  Float groupings always use interval 3.
-fn group_integer_prefix(body: &str, sep: char) -> String {
-    let int_len = body.chars().take_while(|c| c.is_ascii_digit()).count();
-    if int_len <= 3 {
-        return body.to_string();
-    }
-    let (int_part, rest) = body.split_at(int_len);
-    format!("{}{}", group_digits(int_part, sep, 3), rest)
-}
-
-/// Group the leading integer run of `body` while sign-aware zero-padding it
-/// to `field` characters (the width less the sign).  Leading zeros are added
-/// to the integer run *before* grouping so the padding is itself grouped,
-/// matching the `0`-flag / `=`-alignment interaction.  Only the digit run is
-/// touched, so an exponent (`e+30`) or fractional tail is never separated.
-fn group_integer_zero_padded(body: &str, sep: char, field: usize) -> String {
-    let int_len = body.chars().take_while(|c| c.is_ascii_digit()).count();
-    let (int_part, tail) = body.split_at(int_len);
-    let disp = std::cmp::max(field as i32, body.len() as i32);
-    let int_digit_cnt = disp - tail.len() as i32;
-    format!("{}{tail}", separate_integer(int_part, 3, sep, int_digit_cnt))
-}
-
-/// Pad the digit string `int_str` with leading zeros to a display width of
-/// `disp_digit_cnt` and insert `sep` every `inter` digits.  The pad count is
-/// reduced by the separators that will occupy width, and a leading separator
-/// is avoided when the display width is an exact group boundary.
-fn separate_integer(int_str: &str, inter: i32, sep: char, disp_digit_cnt: i32) -> String {
-    let mag_len = int_str.len() as i32;
-    let offset = i32::from(disp_digit_cnt % (inter + 1) == 0);
-    let disp = disp_digit_cnt + offset;
-    let pad_cnt = disp - mag_len;
-    let sep_cnt = disp / (inter + 1);
-    if pad_cnt > 0 && pad_cnt - sep_cnt > 0 {
-        let padded = format!("{}{int_str}", "0".repeat((pad_cnt - sep_cnt) as usize));
-        insert_separator(padded, inter, sep, sep_cnt)
-    } else {
-        insert_separator(int_str.to_string(), inter, sep, (mag_len - 1) / inter)
-    }
-}
-
-/// Insert `sep` into `s` at every `inter`-digit boundary from the right,
-/// `sep_cnt` times.
-fn insert_separator(mut s: String, inter: i32, sep: char, sep_cnt: i32) -> String {
-    let len = s.len() as i32;
-    for i in 1..=sep_cnt {
-        s.insert((len - inter * i) as usize, sep);
-    }
-    s
 }
 
 /// Pad `body` to `width` characters with `fill`, honouring the numeric
@@ -1602,8 +1534,8 @@ fn format_with_spec(val: PyObjectRef, spec: &str) -> Result<Wtf8Buf, crate::PyEr
             // A valid-UTF-8 body goes through the shared string formatter,
             // which pads by code point.
             if let Ok(valid) = full.as_str() {
-                let parsed = FormatSpec::parse(spec)
-                    .map_err(|e| format_spec_err(e, spec, "str", false))?;
+                let parsed =
+                    FormatSpec::parse(spec).map_err(|e| format_spec_err(e, spec, "str", false))?;
                 let s = parsed
                     .format_string(&CharLenStr(valid, valid.chars().count()))
                     .map_err(|e| format_spec_err(e, spec, "str", false))?;
@@ -1832,89 +1764,19 @@ fn validate_float_spec(spec: &str, p: &ParsedSpec) -> Result<(), crate::PyError>
     Ok(())
 }
 
-/// Format a finite `f64` through `spec`.  Fixed-point (`f`/`F`) and
-/// locale-general (`n`) presentations pad and group exactly through the shared
-/// engine, so delegate them.  The exponent and general forms stay local: the
-/// shared grouping splits only on the decimal point (corrupting an exponent
-/// into `1e,+20`) and its empty-type precision picks exponent notation where a
-/// fixed form is required.
+/// Format a finite `f64` through `spec`.  Every presentation type
+/// (`\0`/`e`/`E`/`f`/`F`/`g`/`G`/`n`/`%`) pads, groups, and rounds through the
+/// shared engine.  `validate_float_spec` still supplies the type and
+/// grouping-with-`n` messages before delegating.
 fn format_finite_float(v: f64, spec: &str) -> Result<Wtf8Buf, crate::PyError> {
     let p = parse_spec(spec);
     validate_float_spec(spec, &p)?;
-    if matches!(p.ty, 'f' | 'F' | 'n') {
-        let parsed = rustpython_common::format::FormatSpec::parse(spec)
-            .map_err(|e| format_spec_err(e, spec, "float", false))?;
-        let s = parsed
-            .format_float(v)
-            .map_err(|e| format_spec_err(e, spec, "float", false))?;
-        return Ok(Wtf8Buf::from_string(s));
-    }
-    Ok(Wtf8Buf::from_string(format_float(v, &p)))
-}
-
-/// Format a finite float through the presentation-type `p.ty`, applying
-/// sign, alt-form trailing dot, integer-run grouping, and width padding.
-fn format_float(v: f64, p: &ParsedSpec) -> String {
-    let prec = p.precision.unwrap_or(6);
-    // Format on `v.abs()` so the sign is reattached exactly once below;
-    // Rust's `{:e}`/`{:E}` would otherwise emit it too.
-    let abs = v.abs();
-    let body = match p.ty {
-        // Rust's `{:e}` emits a sign-less, minimal exponent ("e2"); C-style
-        // formatting wants an explicit, two-digit exponent ("e+02").
-        'e' => crate::baseobjspace::normalise_exponent(&format!("{abs:.prec$e}"), false),
-        'E' => crate::baseobjspace::normalise_exponent(&format!("{abs:.prec$E}"), true),
-        'f' | 'F' => format!("{abs:.prec$}"),
-        // Percent type: scale by 100, format fixed, suffix `%`.
-        '%' => format!("{:.*}%", prec, abs * 100.0),
-        // `g`/`G` format general with trailing zeros trimmed unless alt-form
-        // keeps them; `n` matches `g` with locale grouping (none in C).
-        'g' | 'G' | 'n' => crate::baseobjspace::format_g_like(abs, prec, p.ty == 'G', p.alt_form),
-        '\0' => {
-            // No presentation type formats like `repr()`; an explicit precision
-            // switches to a `g`-like form with a lower scientific cutoff, while
-            // bare alt-form only guarantees the trailing dot (added below).
-            match p.precision {
-                Some(_) => crate::baseobjspace::format_no_type_prec(abs, prec, p.alt_form),
-                None => crate::display::format_float_repr(abs),
-            }
-        }
-        _ => format!("{abs}"),
-    };
-    let sign_char = if v.is_sign_negative() && !v.is_nan() {
-        "-"
-    } else {
-        match p.sign {
-            Some('+') => "+",
-            Some(' ') => " ",
-            _ => "",
-        }
-    };
-    // Alt-form `#` keeps the decimal point even when no fractional digits
-    // remain; it sits before the exponent (`e`) or percent (`%`) suffix.
-    let body = if p.alt_form
-        && !body.contains('.')
-        && matches!(p.ty, 'e' | 'E' | 'f' | 'F' | 'g' | 'G' | '%' | '\0')
-    {
-        match body.find(['e', 'E', '%']) {
-            Some(pos) => format!("{}.{}", &body[..pos], &body[pos..]),
-            None => format!("{body}."),
-        }
-    } else {
-        body
-    };
-    let align = p.align.unwrap_or('>');
-    let body = match p.grouping {
-        // Sign-aware zero padding groups the pad zeros together with the
-        // digits, so the width must be threaded into the grouping step.
-        Some(sep) if align == '=' && p.fill == '0' => {
-            group_integer_zero_padded(&body, sep, p.width.saturating_sub(sign_char.len()))
-        }
-        Some(sep) => group_integer_prefix(&body, sep),
-        None => body,
-    };
-    let body = format!("{sign_char}{body}");
-    pad_to_width(body, p.fill, align, p.width)
+    let parsed = rustpython_common::format::FormatSpec::parse(spec)
+        .map_err(|e| format_spec_err(e, spec, "float", false))?;
+    let s = parsed
+        .format_float(v)
+        .map_err(|e| format_spec_err(e, spec, "float", false))?;
+    Ok(Wtf8Buf::from_string(s))
 }
 
 /// Pad a WTF-8 string body to `width` code points with `fill`,

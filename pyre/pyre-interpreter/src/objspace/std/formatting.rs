@@ -26,8 +26,8 @@ use rustpython_wtf8::{CodePoint, Wtf8Buf};
 /// error only when the operand is not itself a mapping.
 pub(crate) unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> PyResult {
     let fmt_str = w_str_get_wtf8(fmt);
-    let format =
-        CFormatWtf8::parse_from_wtf8(fmt_str).map_err(|err| PyError::value_error(err.to_string()))?;
+    let format = CFormatWtf8::parse_from_wtf8(fmt_str)
+        .map_err(|err| PyError::value_error(err.to_string()))?;
 
     // `unicodeobject.c PyUnicode_Format` — the operand is usable as a
     // mapping (for `%(key)s` lookups) when it exposes `__getitem__` and is
@@ -41,7 +41,9 @@ pub(crate) unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> 
     };
     let positional: Vec<PyObjectRef> = if args_is_tuple {
         let n = w_tuple_len(args);
-        (0..n).filter_map(|i| w_tuple_getitem(args, i as i64)).collect()
+        (0..n)
+            .filter_map(|i| w_tuple_getitem(args, i as i64))
+            .collect()
     } else {
         vec![args]
     };
@@ -53,7 +55,10 @@ pub(crate) unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> 
     for (idx, part) in format {
         match part {
             CFormatPart::Literal(literal) => result.push_wtf8(&literal),
-            CFormatPart::Spec(CFormatSpecKeyed { mapping_key, mut spec }) => {
+            CFormatPart::Spec(CFormatSpecKeyed {
+                mapping_key,
+                mut spec,
+            }) => {
                 saw_specifier = true;
                 let value = if let Some(key) = mapping_key {
                     let Some(dict) = dict else {
@@ -65,10 +70,16 @@ pub(crate) unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> 
                     let _ = pos.next();
                     w_value
                 } else {
-                    update_quantity_from_tuple(&mut pos, &mut spec.min_field_width, &mut spec.flags)?;
+                    update_quantity_from_tuple(
+                        &mut pos,
+                        &mut spec.min_field_width,
+                        &mut spec.flags,
+                    )?;
                     update_precision_from_tuple(&mut pos, &mut spec.precision)?;
                     let Some(v) = pos.next() else {
-                        return Err(PyError::type_error("not enough arguments for format string"));
+                        return Err(PyError::type_error(
+                            "not enough arguments for format string",
+                        ));
                     };
                     v
                 };
@@ -172,7 +183,9 @@ unsafe fn number_arg_decimal(spec: &CFormatSpec, obj: PyObjectRef) -> Result<Big
         return Ok(arg_to_bigint(pyint));
     }
     if has_dunder(obj, "__index__") {
-        return Ok(crate::builtins::obj_to_bigint(crate::baseobjspace::space_index(obj)?));
+        return Ok(crate::builtins::obj_to_bigint(
+            crate::baseobjspace::space_index(obj)?,
+        ));
     }
     if let Some(method) = crate::baseobjspace::lookup(obj, "__int__") {
         let r = crate::builtins::call_and_check(method, &[obj])?;
@@ -190,7 +203,9 @@ unsafe fn number_arg_integer(spec: &CFormatSpec, obj: PyObjectRef) -> Result<Big
         return Ok(arg_to_bigint(obj));
     }
     if has_dunder(obj, "__index__") {
-        return Ok(crate::builtins::obj_to_bigint(crate::baseobjspace::space_index(obj)?));
+        return Ok(crate::builtins::obj_to_bigint(
+            crate::baseobjspace::space_index(obj)?,
+        ));
     }
     Err(number_type_error(spec, obj, "an integer is required"))
 }
@@ -230,7 +245,12 @@ unsafe fn char_arg(obj: PyObjectRef) -> Result<CodePoint, PyError> {
             crate::baseobjspace::object_functionstr_type_name(obj),
         )));
     };
-    let overflow = || PyError::new(PyErrorKind::OverflowError, "%c arg not in range(0x110000)".to_string());
+    let overflow = || {
+        PyError::new(
+            PyErrorKind::OverflowError,
+            "%c arg not in range(0x110000)".to_string(),
+        )
+    };
     let n = u32::try_from(&value).map_err(|_| overflow())?;
     CodePoint::from_u32(n).ok_or_else(overflow)
 }
@@ -283,187 +303,12 @@ unsafe fn update_precision_from_tuple(
 /// The `*` argument must be an int; consume it, matching `nextinputvalue`.
 unsafe fn star_int(arg: Option<PyObjectRef>) -> Result<i64, PyError> {
     let Some(arg) = arg else {
-        return Err(PyError::type_error("not enough arguments for format string"));
+        return Err(PyError::type_error(
+            "not enough arguments for format string",
+        ));
     };
     if !is_int_like(arg) {
         return Err(PyError::type_error("* wants int"));
     }
     Ok(int_value(arg))
-}
-
-/// `formatting.py fmt_g / fmt_G` parity helper — emits the `%g` body
-/// for an *absolute* float value.  CPython's `%g` rules:
-///   * precision ≤ 0 is treated as 1 (PyPy: `prec = max(prec, 1)`)
-///   * choose scientific when `exp < -4` or `exp >= prec`
-///     (`pypy/objspace/std/formatting.py:120 format_e_g_complex`)
-///   * scientific body uses (`prec - 1`) decimals
-///   * fixed body uses `(prec - 1 - exp)` decimals
-///   * trailing zeros (and the trailing '.') are stripped unless
-///     `#` (alt-form) was set; with alt-form the trailing zeros AND
-///     the dangling '.' survive so the output advertises the full
-///     requested precision.
-pub(crate) fn format_g_like(abs: f64, prec: usize, upper: bool, alt_form: bool) -> String {
-    if abs == 0.0 {
-        return if alt_form {
-            // `formatting.py:120-128` — alt-form `%#g` keeps `prec`
-            // significant digits even for 0.0, so `"%#.4g" % 0`
-            // renders as `"0.000"` (one digit before the dot, then
-            // `prec - 1` zeros after).
-            let after = prec.saturating_sub(1);
-            if after == 0 {
-                "0".to_string()
-            } else {
-                format!("0.{}", "0".repeat(after))
-            }
-        } else {
-            "0".to_string()
-        };
-    }
-    if !abs.is_finite() {
-        return if upper {
-            format!("{abs}").to_uppercase()
-        } else {
-            format!("{abs}")
-        };
-    }
-    let prec = prec.max(1);
-    let exp = abs.log10().floor() as i32;
-    let use_sci = exp < -4 || exp >= prec as i32;
-    let raw = if use_sci {
-        let rust_exp = format!("{:.*e}", prec - 1, abs);
-        normalise_exponent(&rust_exp, upper)
-    } else {
-        let dec = (prec as i32 - 1 - exp).max(0) as usize;
-        format!("{abs:.dec$}")
-    };
-    if alt_form {
-        // Alt-form preserves trailing zeros and the dangling '.';
-        // ensure a '.' is present even when the natural body has
-        // none (e.g. `"%#g" % 1` → `"1.00000"`).
-        if use_sci {
-            return raw;
-        }
-        return if raw.contains('.') {
-            raw
-        } else {
-            // `prec - 1 - exp` was 0, so the body has no decimals;
-            // re-render with the alt-form '.' suffix + trailing
-            // zeros to advertise the full precision.
-            let after = (prec as i32 - 1 - exp).max(0) as usize;
-            if after == 0 {
-                format!("{raw}.")
-            } else {
-                format!("{raw}.{}", "0".repeat(after))
-            }
-        };
-    }
-    // Strip trailing zeros from the mantissa (and a dangling '.').
-    if use_sci {
-        if let Some(epos) = raw.find(|c: char| c == 'e' || c == 'E') {
-            let (mantissa, exp_part) = raw.split_at(epos);
-            let trimmed = trim_trailing_zeros(mantissa);
-            format!("{trimmed}{exp_part}")
-        } else {
-            raw
-        }
-    } else if raw.contains('.') {
-        trim_trailing_zeros(&raw)
-    } else {
-        raw
-    }
-}
-
-/// Format an absolute float for the empty presentation type with an explicit
-/// precision (or alt-form).  Like `%g` with `prec` significant digits, but the
-/// scientific cutoff is one lower (`exp >= prec - 1`) and a fixed result always
-/// shows a fractional part — a bare integer keeps a trailing `.0`, and alt-form
-/// retains the requested trailing zeros.
-pub(crate) fn format_no_type_prec(abs: f64, prec: usize, alt_form: bool) -> String {
-    if !abs.is_finite() {
-        return format!("{abs}");
-    }
-    let prec = prec.max(1);
-    // 0.0 has no `log10`; its decimal point sits one past the leading digit.
-    let exp = if abs == 0.0 {
-        0
-    } else {
-        abs.log10().floor() as i32
-    };
-    if exp < -4 || exp >= prec as i32 - 1 {
-        let raw = normalise_exponent(&format!("{:.*e}", prec - 1, abs), false);
-        let Some(epos) = raw.find('e') else {
-            return raw;
-        };
-        let (mantissa, exp_part) = raw.split_at(epos);
-        let mantissa = if alt_form {
-            mantissa.to_string()
-        } else {
-            trim_trailing_zeros(mantissa)
-        };
-        // Alt-form advertises the point even when the mantissa is a bare digit.
-        let mantissa = if alt_form && !mantissa.contains('.') {
-            format!("{mantissa}.")
-        } else {
-            mantissa
-        };
-        return format!("{mantissa}{exp_part}");
-    }
-    let dec = (prec as i32 - 1 - exp).max(0) as usize;
-    let raw = format!("{abs:.dec$}");
-    if alt_form {
-        return if raw.contains('.') { raw } else { format!("{raw}.") };
-    }
-    let body = if raw.contains('.') {
-        trim_trailing_zeros(&raw)
-    } else {
-        raw
-    };
-    if body.contains('.') {
-        body
-    } else {
-        format!("{body}.0")
-    }
-}
-
-/// Convert Rust's `{:e}` / `{:E}` exponent encoding (no sign, minimal
-/// width — `1.5e3` / `1.5e-3`) to PyPy / CPython `%e`-style
-/// (`1.5e+03` / `1.5e-03` — explicit sign, exponent zero-padded to at
-/// least two digits).  Mirrors `pypy/objspace/std/formatting.py
-/// fmt_e` which delegates to `rfloat.formatd` with the C printf-style
-/// padding rules.
-pub(crate) fn normalise_exponent(raw: &str, upper: bool) -> String {
-    let marker = if upper { 'E' } else { 'e' };
-    let lower_marker = marker.to_ascii_lowercase();
-    let upper_marker = marker.to_ascii_uppercase();
-    let pos = match raw.find([lower_marker, upper_marker].as_ref()) {
-        Some(p) => p,
-        None => return raw.to_string(),
-    };
-    let (mantissa, exp_part) = raw.split_at(pos);
-    let exp_str = &exp_part[1..]; // skip the marker
-    let (sign_char, digits) = if let Some(rest) = exp_str.strip_prefix('-') {
-        ('-', rest)
-    } else if let Some(rest) = exp_str.strip_prefix('+') {
-        ('+', rest)
-    } else {
-        ('+', exp_str)
-    };
-    let padded = if digits.len() < 2 {
-        format!("0{digits}")
-    } else {
-        digits.to_string()
-    };
-    format!("{mantissa}{marker}{sign_char}{padded}")
-}
-
-fn trim_trailing_zeros(body: &str) -> String {
-    if !body.contains('.') {
-        return body.to_string();
-    }
-    let trimmed = body.trim_end_matches('0').trim_end_matches('.');
-    if trimmed.is_empty() {
-        "0".to_string()
-    } else {
-        trimmed.to_string()
-    }
 }
