@@ -7256,7 +7256,24 @@ pub(crate) fn fbw_loop_callee_ca_enabled() -> bool {
 /// avoids that.  Default ON — corpus-wide OFF/ON byte-equality validated on
 /// both backends (171/171 dynasm + cranelift); opt out with
 /// `PYRE_M366_NONBRANCH_PC=0`.
+///
+/// The OFF/ON byte-equality was validated on dynasm + cranelift only; those
+/// backends decode a guard exit through the bridge / re-trace path, which
+/// reads the same carried-coordinate liveness twin
+/// (`frame_liveness_reg_indices_by_bank_at_with_jitcode_pc`) the encoder
+/// (`collect_outer_active_boxes`) uses, so encoder and decoder stay symmetric.
+/// wasm re-enters `blackhole_from_resumedata` on every guard exit (no bridge
+/// chaining, #62) and enumerates the raw `-live-` record at the resolved
+/// offset instead of that twin; the two disagree for the carried coordinate,
+/// so the resumed frame materialises the wrong slot value (e.g. a `float /`
+/// dividend reconstructs as a typeless object → `unsupported operand type(s)
+/// for /: '' and ...`). wasm gains nothing from the direct-pc carry — the hot
+/// loop still runs interpreter-bound there — so disable on wasm; keep it on
+/// natively.
 pub(crate) fn m366_nonbranch_pc_enabled() -> bool {
+    if cfg!(target_arch = "wasm32") {
+        return false;
+    }
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M366_NONBRANCH_PC") {
         Some(v) => {
