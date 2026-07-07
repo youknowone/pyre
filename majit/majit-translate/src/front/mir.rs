@@ -4356,6 +4356,7 @@ impl<'a> Lowering<'a> {
                     .or_else(|| self.static_int_value_op(&segments))
                     .or_else(|| self.const_eval_global(id))
                     .or_else(|| self.fold_size_const_global(id))
+                    .or_else(|| self.fold_named_const_int_array_global(id))
                     .or_else(|| primitive_float_const(&segments))
                     .unwrap_or_else(|| OpKind::Call {
                         target: CallTarget::FunctionPath { segments },
@@ -4724,6 +4725,96 @@ impl<'a> Lowering<'a> {
             }),
             _ => None,
         }
+    }
+
+    /// Fold a `NamedConst` global whose initializer builds a fixed-size
+    /// array of integer literals (`OP_STACKDEL: [i32; N] = [c0, c1, …]`)
+    /// into the synthetic prebuilt-constant-array define-op the adapter
+    /// re-folds to `Constant(list)`
+    /// (`flowspace_adapter.rs::is_const_int_array_define`).  A
+    /// module-level constant array is a prebuilt `Constant(ll_array)`
+    /// whose `arr[i]` runtime-index read is a foldable `getarrayitem`
+    /// (the `ArrayRead` the `Index` projection arm emits); baking the
+    /// literals here lets that read resolve against a constant base
+    /// instead of a residual accessor `Call` no registry can bind.
+    ///
+    /// Accepts only the exact `_0 = [c0, c1, …]; return` shape: a single
+    /// `Array` aggregate assigned to `_0` whose operands are all integer
+    /// literals, over linear `Goto`s to a `Return`.  Anything richer
+    /// (computed elements, non-integer items, a `Repeat` fill, a second
+    /// `_0` write) returns `None` and keeps the residual accessor path;
+    /// so does a foreign const whose init body Charon left opaque (no
+    /// readable body to bake).
+    fn fold_named_const_int_array_global(&self, def_id: u64) -> Option<OpKind> {
+        let gd = self.llbc.global_by_id(def_id)?;
+        if gd
+            .rest
+            .get("global_kind")
+            .and_then(serde_json::Value::as_str)
+            != Some("NamedConst")
+        {
+            return None;
+        }
+        let init_id = gd.rest.get("init")?.as_u64()?;
+        let body = self.llbc.fn_by_id(init_id)?.unstructured()?;
+        let mut items: Option<Vec<i64>> = None;
+        for block in &body.body {
+            for stmt in &block.statements {
+                match stmt.stmt_kind() {
+                    Ok(StmtKind::StorageLive(_))
+                    | Ok(StmtKind::StorageDead(_))
+                    | Ok(StmtKind::PlaceMention(_)) => {}
+                    Ok(StmtKind::Assign(place, Rvalue::Aggregate(kind, operands)))
+                        if matches!(place.kind, PlaceKind::Local(0)) =>
+                    {
+                        // Only a fixed-size `Array` aggregate of integer
+                        // literals; a `Repeat` fill or an Adt aggregate is
+                        // out of scope, as is a second `_0`-defining assign.
+                        if aggregate_ctor_name(&kind) != "Array" || items.is_some() {
+                            return None;
+                        }
+                        let mut vals = Vec::with_capacity(operands.len());
+                        for op in &operands {
+                            let Operand::Const(value) = op else {
+                                return None;
+                            };
+                            let DecodedConst::Int(n) =
+                                decode_constant(self.llbc, value).ok()?
+                            else {
+                                return None;
+                            };
+                            vals.push(n);
+                        }
+                        items = Some(vals);
+                    }
+                    // Any other statement (a write to a temporary or a
+                    // richer `_0` definition) means the array is computed,
+                    // not a literal aggregate.
+                    _ => return None,
+                }
+            }
+            match block.term() {
+                Ok(TermKind::Return) | Ok(TermKind::Goto { .. }) => {}
+                _ => return None,
+            }
+        }
+        let items = items?;
+        // The annotator infers the list's element type from the baked
+        // literals, so an empty array carries no element type; leave it
+        // to the residual path.
+        if items.is_empty() {
+            return None;
+        }
+        let mut segments = Vec::with_capacity(items.len() + 1);
+        segments.push("__const_int_array".to_string());
+        for n in items {
+            segments.push(n.to_string());
+        }
+        Some(OpKind::Call {
+            target: CallTarget::FunctionPath { segments },
+            args: Vec::new(),
+            result_ty: ValueType::Ref(None),
+        })
     }
 
     fn static_addr_op(&self, segments: &[String]) -> Option<OpKind> {
