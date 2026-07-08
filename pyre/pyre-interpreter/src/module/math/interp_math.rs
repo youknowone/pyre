@@ -65,9 +65,8 @@ type PyResult = Result<PyObjectRef, crate::PyError>;
 fn map_err(r: pymath::Result<f64>) -> PyResult {
     match r {
         Ok(v) => Ok(floatobject::w_float_new(v)),
-        Err(e) => Err(crate::PyError::value_error(format!(
-            "math domain error: {e:?}"
-        ))),
+        Err(pymath::Error::EDOM) => Err(crate::PyError::value_error("math domain error")),
+        Err(pymath::Error::ERANGE) => Err(crate::PyError::overflow_error("math range error")),
     }
 }
 
