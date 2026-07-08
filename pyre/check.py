@@ -600,7 +600,12 @@ class Check:
                 # producer instead.
                 print(red("LLBC artefacts are missing under build/llbc/."))
                 print("Run the extractor first, then re-run this script:")
-                print("    scripts/extract-llbc.py pyre-object pyre-interpreter")
+                # No crate arguments: extract the full DEFAULT_CRATES set
+                # (pyre-object, pyre-interpreter, pyre-jit). Naming only the
+                # mandatory pair would omit pyre-jit.ullbc, leaving check.py to
+                # validate the degraded 2-crate frontend without the
+                # eval_loop_jit portal.
+                print("    scripts/extract-llbc.py")
             else:
                 self._print_cargo_diagnostics(cargo_path)
             sys.exit(1)
