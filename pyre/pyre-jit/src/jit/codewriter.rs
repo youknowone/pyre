@@ -12626,6 +12626,29 @@ impl CodeWriter {
             block_head_py_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
         }
 
+        // task#50 sparse carry-forward sidecar: capture ONLY the py_pcs whose
+        // dense marker the on-demand `derive_resume_marker` derivation cannot
+        // reproduce from `first_jit_pc_by_py_pc` + `block_head_py_by_jit_pc`.
+        // The derivation covers a py's own first op AND the trivia / next-op
+        // forward-carry; the genuinely non-invertible residual — uncond-jump
+        // forward-carry to a jump TARGET, can-raise / branch re-keys keyed off
+        // the stream position (`derive_pc_live_indices_from_sparse`) — diverges
+        // and is stored here.  Sorted by py_pc for binary search; sparse (the
+        // trivia-forward-carry majority derives, so only the jump-target /
+        // re-key residual remains).
+        let carryfwd_resume_pc: Vec<(u32, usize)> = pc_map_bytes
+            .iter()
+            .enumerate()
+            .filter(|&(py, &dense)| {
+                pyre_jit_trace::pyjitcode::derive_resume_marker(
+                    &first_jit_pc_by_py_pc,
+                    &block_head_py_by_jit_pc,
+                    py,
+                ) != Some(dense)
+            })
+            .map(|(py, &dense)| (py as u32, dense))
+            .collect();
+
         // task#50 phase-0: the jitcode-pc-keyed twin of `depth_at_pc`. Same
         // first-seen-offset dedup as `block_head_py_by_jit_pc` (a marker offset
         // belongs to the smallest py_pc resolving there), pairing each block-head
@@ -12786,10 +12809,10 @@ impl CodeWriter {
         let frame_stack_base = code.varnames.len() + pyre_interpreter::pyframe::ncells(code);
 
         let metadata = PyJitCodeMetadata {
-            pc_map: pc_map_bytes,
             after_residual_call_resume_pc,
             first_jit_pc_by_py_pc,
             block_head_py_by_jit_pc,
+            carryfwd_resume_pc,
             depth_at_py_pc: depth_at_pc,
             depth_by_jit_pc,
             pcdep_by_jit_pc,
@@ -14451,7 +14474,7 @@ mod tests {
         );
         let pyjit = writer.callcontrol().find_jitcode(raw_code).unwrap();
         assert!(
-            !pyjit.metadata.pc_map.is_empty(),
+            pyjit.metadata.is_drained,
             "drain must populate bytecode metadata on the existing entry"
         );
         assert_eq!(pyjit.code_ptr, raw_code);

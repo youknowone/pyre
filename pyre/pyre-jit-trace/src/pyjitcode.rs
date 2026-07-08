@@ -10,10 +10,10 @@
 //!     plus pyre-only `exec.*` pools). It is not the canonical
 //!     codewriter `majit_translate::jitcode::JitCode`.
 //!   * `PyJitCode` (this struct) wraps that JitCode together with
-//!     pyre-only translation metadata — `pc_map` (Python PC → byte
-//!     offset), the runtime `w_code` wrapper, and register layout — that
-//!     RPython does not need because RPython's bytecode PCs are already
-//!     JitCode PCs.
+//!     pyre-only translation metadata — the per-Python-PC resume tables
+//!     (Python PC → byte offset), the runtime `w_code` wrapper, and
+//!     register layout — that RPython does not need because RPython's
+//!     bytecode PCs are already JitCode PCs.
 //!
 //! The struct lives in `pyre-jit-trace` (the lower crate) so that
 //! both the codewriter (`pyre-jit::jit::codewriter`) and the
@@ -37,26 +37,17 @@
 //! | PerCodeObject    | non-empty      | true                  | [`PyJitCode::is_populated`]      |
 //!
 //! `is_drained` tracks the setup-time drain (`codewriter.rs` `finalize_jitcode`
-//! populates the per-PC maps); it replaces the older `pc_map.is_empty()` test
-//! so the mode classification is independent of the translation table.
+//! populates the per-PC maps); it is the sole mode-classification flag, so the
+//! mode is independent of the translation tables.
 //!
-//! `code` and `pc_map` are independent because the portal-bridged
-//! install ([`crate::canonical_bridge::install_portal_for`]) reuses
-//! the canonical portal `JitCode.code` byte stream but skips the
+//! `code` and the per-Python-PC resume tables are independent because the
+//! portal-bridged install ([`crate::canonical_bridge::install_portal_for`])
+//! reuses the canonical portal `JitCode.code` byte stream but skips the
 //! per-Python-PC mapping (the portal dispatches via its own arms on
-//! `pycode.instructions[pc]`). Drained CodeWriter installs do both:
-//! fill real instructions into `code` and stamp `pc_map` to
-//! `code.instructions.len()`. Skeletons have neither because they are
-//! placeholder slots inserted by `CallControl::get_jitcode` before the
-//! assembler drain runs.
-//!
-//! The fourth combination (`code` empty, `pc_map` non-empty) is not
-//! produced by any production path; the predicates classify it as
-//! neither Skeleton nor PortalBridge nor PerCodeObject. Test fixtures
-//! that fabricate this combination (e.g. by calling [`PyJitCode::skeleton`]
-//! and then pushing into `metadata.pc_map`) flow as PerCodeObject for
-//! [`PyJitCode::is_populated`] purposes (the historical predicate
-//! looks at `pc_map` only).
+//! `pycode.instructions[pc]`). Drained CodeWriter installs do both: fill real
+//! instructions into `code` and populate the per-Python-PC tables. Skeletons
+//! have neither because they are placeholder slots inserted by
+//! `CallControl::get_jitcode` before the assembler drain runs.
 //!
 //! Convergence path: RPython's single `JitCode` class has neither flag
 //! to consult — `assembler.assemble` populates `code` in place and
@@ -77,11 +68,6 @@ use std::ops::{Deref, DerefMut};
 /// translation maps live here instead of polluting either upstream's
 /// canonical `JitCode` or pyre's eventual single-store replacement.
 pub struct PyJitCodeMetadata {
-    /// py_pc → jitcode byte offset. Named for RPython's `frame.pc →
-    /// jitcode position` flow; the runtime side reads this to map
-    /// the Python frame's `next_instr` to the JitCode entry point
-    /// for blackhole resume / inline call tracing.
-    pub pc_map: Vec<usize>,
     /// py_pc → jitcode byte offset of the post-`residual_call` `-live-`
     /// marker (the one immediately preceding the opcode's own
     /// `catch_exception`), `None` for PCs that do not make a residual
@@ -113,6 +99,19 @@ pub struct PyJitCodeMetadata {
     /// skeleton / portal-bridge / fixture metadata, where the legacy scan
     /// remains the fallback.
     pub block_head_py_by_jit_pc: Vec<(usize, u32)>,
+    /// task#50 sparse carry-forward sidecar: the `-live-` marker byte offset
+    /// for each py_pc whose dense marker the on-demand [`derive_resume_marker`]
+    /// derivation cannot reproduce from `first_jit_pc_by_py_pc` +
+    /// `block_head_py_by_jit_pc`. The derivation covers a py's own first op AND
+    /// the trivia / next-op forward-carry; the genuinely non-invertible residual
+    /// — uncond-jump forward-carry to a jump TARGET, can-raise / branch re-keys
+    /// keyed off the stream position — diverges and is stored here. Built by
+    /// comparing the derivation against the dense map at compile time and
+    /// keeping exactly the divergences, so `resume_jitcode_pc_for` reproduces
+    /// the dense value without the dense Vec. Sorted ascending by py_pc for
+    /// binary search; sparse (most graphs need zero entries, the majority a
+    /// handful); empty for skeleton / portal-bridge / fixture metadata.
+    pub carryfwd_resume_pc: Vec<(u32, usize)>,
     /// Value-stack depth at each Python PC, in slots above stack_base.
     pub depth_at_py_pc: Vec<u16>,
     /// task#50 phase-0: the jitcode-pc-keyed twin of `depth_at_py_pc`. Each
@@ -346,17 +345,51 @@ pub fn portal_red_pre_regalloc_slots(nlocals: usize, max_stackdepth: usize) -> (
     (portal_frame_reg, portal_ec_reg)
 }
 
-/// `PYRE_PCMAP_DERIVE_AUDIT` enables the assertion that the dense `pc_map`
-/// value at a py_pc is derivable on-demand from the two surviving tables
-/// (`first_jit_pc_by_py_pc` + `block_head_py_by_jit_pc`): the largest
-/// `-live-` marker offset at-or-before `first_jit_pc_by_py_pc[py]` equals
-/// `pc_map[py]` by construction (no marker lies strictly between py's block
-/// head and py's first emitted op inside that block). Certifies that
-/// `pc_map` is a redundant cache of the two-table derivation ahead of its
-/// eventual deletion. Diagnostic only; off in production.
-fn pcmap_derive_audit_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_DERIVE_AUDIT").is_some())
+/// task#50 deletion-precondition: derive `pc_map[py_pc]` — the `-live-` resume
+/// marker byte offset — on-demand from the two surviving per-Python-PC tables,
+/// WITHOUT the retired dense `pc_map` Vec.
+///
+/// Two tiers reproduce the carry-forward rules that
+/// `derive_pc_live_indices_from_sparse` (codewriter) baked into the dense map:
+///
+/// * A py_pc that emitted its own first op (`first_jit != usize::MAX`) resolves
+///   to the largest block-head marker at-or-before that first offset — no
+///   marker lies strictly between a block head and the first op emitted inside
+///   the block, so this equals the dense value.
+/// * A py_pc that emitted no op of its own (`usize::MAX`: trivia / folded /
+///   unconditional jump) inherits the resume marker the codewriter carried
+///   forward to the NEXT real PC in the block (the trivia / next-op
+///   forward-carry): scan ascending to the first py that emitted an op and
+///   resolve THAT. This reproduces the common trivia-forward-carry; the
+///   genuinely non-invertible residual (uncond-jump forward-carry to a
+///   backward/forward jump TARGET, can-raise / branch re-keys keyed off the
+///   stream position) diverges here and is captured in the sparse
+///   `carryfwd_resume_pc` sidecar instead.
+///
+/// `None` when the tables are empty (portal-bridge / skeleton / fixture) or
+/// no at-or-after py emitted a real op.
+pub fn derive_resume_marker(
+    first_jit_pc_by_py_pc: &[usize],
+    block_head_py_by_jit_pc: &[(usize, u32)],
+    py_pc: usize,
+) -> Option<usize> {
+    if block_head_py_by_jit_pc.is_empty() {
+        return None;
+    }
+    // Real-op offset for `py_pc`, else the first at-or-after py that emitted an
+    // op (trivia / next-op forward-carry).
+    let first_val = first_jit_pc_by_py_pc
+        .get(py_pc..)?
+        .iter()
+        .copied()
+        .find(|&v| v != usize::MAX)?;
+    let search = block_head_py_by_jit_pc.binary_search_by_key(&first_val, |&(off, _)| off);
+    let idx = match search {
+        Ok(i) => i,
+        Err(0) => return None,
+        Err(i) => i - 1,
+    };
+    Some(block_head_py_by_jit_pc[idx].0)
 }
 
 impl PyJitCode {
@@ -471,63 +504,31 @@ impl PyJitCode {
     /// target: once resume data stores `jitcode_pc` directly the
     /// translation step (and the `pc_map` it depends on) can retire.
     pub fn resume_jitcode_pc_for(&self, py_pc: usize) -> Option<usize> {
-        let dense = self.metadata.pc_map.get(py_pc).copied();
-        if pcmap_derive_audit_enabled() {
-            let first = self.metadata.first_jit_pc_by_py_pc.get(py_pc).copied();
-            let table_nonempty = !self.metadata.block_head_py_by_jit_pc.is_empty();
-            // The derivation applies only when the inverse table carries
-            // markers (populated compiled install, not portal-bridge /
-            // skeleton / fixture) AND py_pc is in range AND emitted a first op
-            // of its own (`first != usize::MAX`, else pc_map carry-forward has
-            // no first-op anchor to derive from).
-            match first {
-                Some(first_val) if table_nonempty && first_val != usize::MAX => {
-                    let derived = self.resume_jitcode_pc_for_derived(py_pc);
-                    assert_eq!(
-                        derived, dense,
-                        "pc_map derive-audit divergence: py_pc={py_pc} \
-                         first_jit={first_val} derived={derived:?} dense={dense:?}"
-                    );
-                }
-                Some(usize::MAX) if table_nonempty && dense.is_some() => {
-                    // Carry-forward-on-forward-path finding: resume was queried
-                    // on a trivia/folded py (no first op) yet dense returns a
-                    // marker. The two-table derivation cannot reproduce this;
-                    // count occurrences to learn whether it is a real forward
-                    // path concern or dead.
-                    eprintln!(
-                        "PCMAP_DERIVE_CARRYFWD py_pc={py_pc} first_jit=MAX dense={dense:?}"
-                    );
-                }
-                _ => {}
-            }
+        // The sparse sidecar takes precedence: it captures exactly the PCs
+        // whose dense marker the on-demand derivation cannot reproduce
+        // (uncond-jump forward-carry to a jump target, can-raise / branch
+        // re-keys). Everything else derives from the two surviving tables.
+        if let Some(off) = self.carryfwd_resume_pc_for(py_pc) {
+            return Some(off);
         }
-        dense
+        derive_resume_marker(
+            &self.metadata.first_jit_pc_by_py_pc,
+            &self.metadata.block_head_py_by_jit_pc,
+            py_pc,
+        )
     }
 
-    /// task#50 deletion-precondition: derive `pc_map[py_pc]` on-demand from the
-    /// two surviving tables WITHOUT reading the dense `pc_map` Vec. Returns the
-    /// largest `-live-` marker offset at-or-before py_pc's first emitted op
-    /// (`first_jit_pc_by_py_pc[py_pc]`), which equals py_pc's block-head marker
-    /// = `pc_map[py_pc]` by construction (no marker lies strictly between a
-    /// block head and the first op emitted inside that block). `None` when the
-    /// derivation does not apply: py_pc out of range, py_pc emitted no op of its
-    /// own (`usize::MAX`, where `pc_map` carries the previous marker forward and
-    /// has no first-op anchor), or the inverse table is empty (portal-bridge /
-    /// skeleton / fixture install). The audit in `resume_jitcode_pc_for`
-    /// certifies this equals the dense value wherever it applies.
-    fn resume_jitcode_pc_for_derived(&self, py_pc: usize) -> Option<usize> {
-        let first = self.metadata.first_jit_pc_by_py_pc.get(py_pc).copied();
-        let first_val = match first {
-            Some(v) if v != usize::MAX => v,
-            _ => return None,
-        };
-        let table = &self.metadata.block_head_py_by_jit_pc;
-        if table.is_empty() {
-            return None;
-        }
-        let search = table.binary_search_by_key(&first_val, |&(off, _)| off);
-        Self::predecessor_index(search).map(|i| table[i].0)
+    /// task#50: the sparse carry-forward sidecar lookup — the `-live-` marker
+    /// offset for a py_pc whose dense marker [`derive_resume_marker`] cannot
+    /// reproduce from the two surviving tables (uncond-jump forward-carry to a
+    /// jump target, can-raise / branch re-keys). `None` when py_pc has no
+    /// sidecar entry (its marker is derivable, or it falls outside the range).
+    fn carryfwd_resume_pc_for(&self, py_pc: usize) -> Option<usize> {
+        let table = &self.metadata.carryfwd_resume_pc;
+        table
+            .binary_search_by_key(&(py_pc as u32), |&(py, _)| py)
+            .ok()
+            .map(|i| table[i].1)
     }
 
     /// task#50 phase-0: value-stack depth keyed directly by a JitCode byte
@@ -752,10 +753,10 @@ impl PyJitCode {
         Self::from_parts(
             std::sync::Arc::new(RuntimeJitCode::default()),
             PyJitCodeMetadata {
-                pc_map: Vec::new(),
                 after_residual_call_resume_pc: Vec::new(),
                 first_jit_pc_by_py_pc: Vec::new(),
                 block_head_py_by_jit_pc: Vec::new(),
+                carryfwd_resume_pc: Vec::new(),
                 depth_by_jit_pc: Vec::new(),
                 pcdep_by_jit_pc: Vec::new(),
                 depth_pred_by_jit_pc: Vec::new(),

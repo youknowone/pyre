@@ -102,8 +102,8 @@ use crate::pyjitcode::{PyJitCode, PyJitCodeMetadata};
 ///
 /// ## Caller invariant (G.3a → G.3b → G.3c gate)
 ///
-/// A portal-bridged `PyJitCode` MUST NOT reach readers that index
-/// `metadata.pc_map[pc]`. The category audit is documented at
+/// A portal-bridged `PyJitCode` MUST NOT reach readers that resolve a
+/// per-Python-PC resume coordinate. The category audit is documented at
 /// `PyJitCode::is_portal_bridge`; readers in Categories A and C are
 /// portal-mode-aware via that discriminator.
 ///
@@ -202,10 +202,10 @@ pub fn install_portal_for(code_ptr: *const pyre_interpreter::CodeObject) -> Arc<
     Arc::new(PyJitCode::from_parts(
         runtime,
         PyJitCodeMetadata {
-            pc_map: Vec::new(),
             after_residual_call_resume_pc: Vec::new(),
             first_jit_pc_by_py_pc: Vec::new(),
             block_head_py_by_jit_pc: Vec::new(),
+            carryfwd_resume_pc: Vec::new(),
             depth_by_jit_pc: Vec::new(),
             pcdep_by_jit_pc: Vec::new(),
             depth_pred_by_jit_pc: Vec::new(),
@@ -260,8 +260,8 @@ mod tests {
     fn install_portal_for_metadata_is_empty_marker() {
         let pyjit = install_portal_for(std::ptr::null());
         assert!(
-            pyjit.metadata.pc_map.is_empty(),
-            "portal-bridged pc_map must be empty (G.3a marker invariant)"
+            !pyjit.metadata.is_drained,
+            "portal-bridged install must skip the setup-time drain (G.3a marker invariant)"
         );
         // Null code_ptr ⇒ no user CodeObject to analyse ⇒
         // `depth_at_py_pc` falls back to `Vec::new()`.  Production
@@ -346,11 +346,11 @@ def f(x, y):
         assert!(
             pyjit.is_portal_bridge(),
             "populating depth_at_py_pc must NOT flip the portal-bridge \
-             discriminator — pc_map stays empty"
+             discriminator — the install stays undrained"
         );
         assert!(
-            pyjit.metadata.pc_map.is_empty(),
-            "portal-bridge pc_map must remain empty (G.3a marker invariant)"
+            !pyjit.metadata.is_drained,
+            "portal-bridge install must remain undrained (G.3a marker invariant)"
         );
         // stack_base = nlocals + ncells for a non-null code_ptr; for
         // this fixture (no closures / cell vars), ncells = 0.
@@ -405,10 +405,10 @@ def f(x, y):
         let drained = PyJitCode::from_parts(
             std::sync::Arc::new(drained_runtime),
             PyJitCodeMetadata {
-                pc_map: vec![0],
                 after_residual_call_resume_pc: vec![None],
                 first_jit_pc_by_py_pc: vec![0],
                 block_head_py_by_jit_pc: vec![(0, 0)],
+                carryfwd_resume_pc: Vec::new(),
                 depth_by_jit_pc: Vec::new(),
                 pcdep_by_jit_pc: Vec::new(),
                 depth_pred_by_jit_pc: Vec::new(),

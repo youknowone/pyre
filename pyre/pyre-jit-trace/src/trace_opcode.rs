@@ -1989,7 +1989,7 @@ impl MIFrame {
             panic!(
                 "get_list_of_active_boxes: no pc_map entry for live_pc={} (pc_map.len={})",
                 live_pc,
-                jc.payload.metadata.pc_map.len()
+                jc.payload.metadata.first_jit_pc_by_py_pc.len()
             )
         });
         let op_live = crate::state::op_live();
@@ -9995,7 +9995,8 @@ mod tests {
         };
         let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
         pyjit.jitcode = Arc::new(runtime_jc);
-        pyjit.metadata.pc_map.push(0);
+        pyjit.metadata.first_jit_pc_by_py_pc = vec![0];
+        pyjit.metadata.block_head_py_by_jit_pc = vec![(0, 0)];
         pyjit.metadata.is_drained = true;
         let inner_jc = crate::state::JitCode {
             index: 0,
@@ -10072,7 +10073,8 @@ mod tests {
         };
         let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
         pyjit.jitcode = Arc::new(runtime_jc);
-        pyjit.metadata.pc_map.push(0);
+        pyjit.metadata.first_jit_pc_by_py_pc = vec![0];
+        pyjit.metadata.block_head_py_by_jit_pc = vec![(0, 0)];
         pyjit.metadata.is_drained = true;
         pyjit.metadata.depth_at_py_pc.push(1);
         // Per-PC (color, slot) entries the codewriter publishes at pc 0:

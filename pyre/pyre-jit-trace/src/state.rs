@@ -1069,7 +1069,7 @@ pub fn frame_value_count_at(jitcode_index: i32, pc: i32, carried_jitcode_pc: i32
              all known triggers — further hits are bugs.",
             jitcode_index,
             pc,
-            payload.metadata.pc_map.len(),
+            payload.metadata.first_jit_pc_by_py_pc.len(),
             sd.liveness_info.len(),
         );
     })
@@ -1240,7 +1240,7 @@ pub fn frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
         let payload = &jc.payload;
         // G.4.4 portal-bridge fallback (symmetric with frame_value_count_at:803
         // and trace_opcode.rs:642 get_list_of_active_boxes encoder):
-        // portal-bridge installs leave `metadata.pc_map` empty and emit a
+        // portal-bridge installs skip the setup-time drain and emit a
         // positional Ref-typed box list of length
         // `stack_base + depth_at_py_pc[pc]` covering locals + cells + the
         // live operand stack tail. Color map is identity (no regalloc for
@@ -9430,7 +9430,6 @@ mod tests {
         crate::assembler::publish_state(&insns, all_liveness, all_liveness.len(), num_liveness_ops);
         let mut pyjit = crate::PyJitCode::skeleton(raw_code);
         pyjit.jitcode = std::sync::Arc::new(builder.finish());
-        pyjit.metadata.pc_map.resize(code.instructions.len(), 0);
         pyjit.metadata.is_drained = true;
         METAINTERP_SD.with(|r| {
             r.borrow_mut()
@@ -9497,7 +9496,6 @@ mod tests {
         };
         let mut pyjit = crate::PyJitCode::skeleton(raw_code);
         pyjit.jitcode = std::sync::Arc::new(runtime_jc);
-        pyjit.metadata.pc_map.push(0);
         pyjit.metadata.is_drained = true;
         let inner_jc = JitCode {
             index: 0,
@@ -11731,10 +11729,10 @@ mod tests {
         let pyjit = std::sync::Arc::new(crate::PyJitCode::from_parts(
             runtime_jitcode,
             crate::PyJitCodeMetadata {
-                pc_map: vec![0],
                 after_residual_call_resume_pc: vec![None],
                 first_jit_pc_by_py_pc: vec![0],
                 block_head_py_by_jit_pc: vec![(0, 0)],
+                carryfwd_resume_pc: Vec::new(),
                 depth_by_jit_pc: vec![(0, 2)],
                 pcdep_by_jit_pc: vec![(0, Vec::new())],
                 depth_pred_by_jit_pc: vec![(0, 2)],
@@ -12560,7 +12558,6 @@ mod indirectcalltargets_tests {
             ..Default::default()
         });
         pyjit.jitcode = Arc::new(runtime_jc);
-        pyjit.metadata.pc_map.push(0);
         pyjit.metadata.is_drained = true;
         Arc::new(pyjit)
     }

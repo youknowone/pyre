@@ -8697,15 +8697,46 @@ fn vstack_containing_py_pc(metadata: &crate::PyJitCodeMetadata, jit_pc: usize) -
             return py;
         }
     }
+    // Nearest-`-live-`-marker fallback (portal-bridge / fixture / a coordinate
+    // preceding the first op — verified to fire only at `jit_pc == 0`): the
+    // largest `py` whose resume marker offset is `<= jit_pc`, ties → larger
+    // `py`.  Reconstructs each `py`'s marker via the two surviving tables (the
+    // block-head predecessor derivation, else the sparse carry-forward
+    // sidecar) instead of the retired dense `pc_map` — identical for drained
+    // installs, where `derived.or(sidecar)` equals the dense value at every
+    // `py` by construction.
     let mut best_py = 0u32;
     let mut best_jc = 0usize;
-    for (py, &jc) in metadata.pc_map.iter().enumerate() {
-        if jc <= jit_pc && jc >= best_jc {
-            best_jc = jc;
-            best_py = py as u32;
+    for py in 0..first_jit.len() {
+        if let Some(jc) = pc_map_marker_for(metadata, py) {
+            if jc <= jit_pc && jc >= best_jc {
+                best_jc = jc;
+                best_py = py as u32;
+            }
         }
     }
     best_py
+}
+
+/// Reconstruct `pc_map[py]` — the `-live-` resume marker byte offset for
+/// Python PC `py` — from the two surviving tables plus the sparse carry-forward
+/// sidecar, WITHOUT the retired dense `pc_map` Vec.  Same resolution as
+/// [`crate::PyJitCode::resume_jitcode_pc_for`]: the sidecar takes precedence
+/// (it holds the non-derivable divergences), everything else derives via
+/// [`crate::pyjitcode::derive_resume_marker`].  `None` when `py` is out of
+/// range or the tables are empty (skeleton / portal-bridge).
+fn pc_map_marker_for(metadata: &crate::PyJitCodeMetadata, py: usize) -> Option<usize> {
+    if let Ok(i) = metadata
+        .carryfwd_resume_pc
+        .binary_search_by_key(&(py as u32), |&(p, _)| p)
+    {
+        return Some(metadata.carryfwd_resume_pc[i].1);
+    }
+    crate::pyjitcode::derive_resume_marker(
+        &metadata.first_jit_pc_by_py_pc,
+        &metadata.block_head_py_by_jit_pc,
+        py,
+    )
 }
 
 /// Map an `abort_permanent` marker's jitcode pc back to the Python opcode
@@ -8928,24 +8959,6 @@ fn vstack_enter_exception_handler(
     let _ = reseed_vstack_from_shadow(ctx, handler_depth);
 }
 
-/// Map a JitCode byte offset back to the Python PC of the opcode whose
-/// JitCode region contains it: the largest `py_pc` with
-/// `pc_map[py_pc] <= jit_pc` (ties → larger `py_pc`).  `pc_map[py_pc]` is
-/// the start JitCode offset of Python opcode `py_pc`; unmapped gaps read
-/// `0` and are naturally skipped for `jit_pc > 0` because real opcode
-/// starts have a positive offset.  This is the inverse of `pc_map` /
-/// `resume_jitcode_pc_for`, used by the full-body walk to stamp a guard's
-/// snapshot with the Python opcode the blackhole resumes (and re-executes)
-/// at — matching the trait path's `orgpc` snapshot coordinate.
-/// `PYRE_PCMAP_BLOCKHEAD_AUDIT` enables the corpus-diff assertion that the
-/// precomputed `block_head_py_by_jit_pc` table reproduces the legacy
-/// `pc_map.iter().position()` block-head scan.  Diagnostic only; off in
-/// production.
-fn block_head_audit_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_BLOCKHEAD_AUDIT").is_some())
-}
-
 /// `PYRE_PCMAP_CARRY_AUDIT` enables the assertion that the ONLY carried
 /// `guard_jitcode_pc` word not derivable from `pc_map` is the kept-stack
 /// branch guard's own `op.pc` (the walker `MIFrame.pc`, stashed in
@@ -9047,52 +9060,26 @@ pub(crate) fn python_pc_for_jitcode_pc(metadata: &crate::PyJitCodeMetadata, jit_
     //
     // The `block_head_py_by_jit_pc` table is the precomputed inverse of this
     // block-head case (marker byte offset → smallest resuming py_pc), built
-    // from the same `pc_map` bytes at compile time, so a lookup is equal to
-    // the `pc_map.iter().position()` scan by construction.  Drained installs
-    // carry it; skeleton / portal-bridge / fixture installs leave it empty
-    // and keep the legacy scan below.
+    // from the same block-head marker bytes at compile time.  Drained installs
+    // carry it; skeleton / portal-bridge / fixture installs leave it empty.
     if !metadata.block_head_py_by_jit_pc.is_empty() {
         if let Ok(i) = metadata
             .block_head_py_by_jit_pc
             .binary_search_by_key(&jit_pc, |&(off, _)| off)
         {
-            let py = metadata.block_head_py_by_jit_pc[i].1;
-            if block_head_audit_enabled() {
-                let scanned = metadata.pc_map.iter().position(|&m| m == jit_pc);
-                assert_eq!(
-                    scanned,
-                    Some(py as usize),
-                    "block_head_py_by_jit_pc diverges from pc_map.position at jit_pc={jit_pc}"
-                );
-            }
-            return py;
+            return metadata.block_head_py_by_jit_pc[i].1;
         }
-    } else if let Some(py) = metadata.pc_map.iter().position(|&m| m == jit_pc) {
-        return py as u32;
     }
     let first_jit = &metadata.first_jit_pc_by_py_pc;
-    if !first_jit.is_empty() {
-        let mut best: Option<(usize, u32)> = None;
-        for (py, &pos) in first_jit.iter().enumerate() {
-            if pos != usize::MAX && pos <= jit_pc && best.is_none_or(|(b, _)| pos >= b) {
-                best = Some((pos, py as u32));
-            }
-        }
-        if let Some((_, py)) = best {
-            return py;
+    let mut best: Option<(usize, u32)> = None;
+    for (py, &pos) in first_jit.iter().enumerate() {
+        if pos != usize::MAX && pos <= jit_pc && best.is_none_or(|(b, _)| pos >= b) {
+            best = Some((pos, py as u32));
         }
     }
-    // Fallback (portal-bridge / fixture installs without the table): the
-    // legacy nearest-`pc_map`-entry heuristic.
-    let mut best_py = 0u32;
-    let mut best_jc = 0usize;
-    for (py, &jc) in metadata.pc_map.iter().enumerate() {
-        if jc <= jit_pc && jc >= best_jc {
-            best_jc = jc;
-            best_py = py as u32;
-        }
-    }
-    best_py
+    // Both live tiers missed (skeleton / portal-bridge / fixture, or a
+    // coordinate preceding the first op): resume at the first opcode.
+    best.map_or(0, |(_, py)| py)
 }
 
 /// #57 Option C (Finding #2): derive the FOR_ITER body pc — the continue-arm
@@ -10018,7 +10005,11 @@ fn walker_capture_snapshot_for_last_guard_impl(
                         }
                     }
                 }
-                (py, jc.index as u32, jc.payload.metadata.pc_map.len())
+                (
+                    py,
+                    jc.index as u32,
+                    jc.payload.metadata.first_jit_pc_by_py_pc.len(),
+                )
             };
             // #67/#124: synthetic loop-close guard pc overshoots past the last
             // Python opcode → resume at the trace's entry py (loop header).
