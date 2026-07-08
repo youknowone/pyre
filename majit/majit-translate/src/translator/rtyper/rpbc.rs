@@ -4621,8 +4621,11 @@ pub fn pair_function_repr_base_rtype_is_(
 pub struct MultipleFrozenPBCRepr {
     /// RPython `self.rtyper = rtyper` (rpbc.py:732).
     pub rtyper: Weak<RPythonTyper>,
-    /// RPython `self.access_set = access_set` (rpbc.py:733).
-    pub access_set: Rc<RefCell<crate::annotator::description::FrozenAttrFamily>>,
+    /// RPython `self.access_set = access_set` (rpbc.py:733). `None` is the
+    /// no-attrs arm (`getFrozenPBCRepr`'s `access is None` case): a
+    /// zero-field `Struct('pbc')` with no per-attr membership check
+    /// (rpbc.py:758, 770).
+    pub access_set: Option<Rc<RefCell<crate::annotator::description::FrozenAttrFamily>>>,
     /// RPython `self.pbc_type = ForwardReference()` (rpbc.py:734).
     /// Stored as a clone alongside [`Self::lltype`] so callers can
     /// observe the resolved struct after `_setup_repr` runs `become`
@@ -4648,7 +4651,7 @@ impl MultipleFrozenPBCRepr {
     /// (rpbc.py:731-736).
     pub fn new(
         rtyper: &Rc<RPythonTyper>,
-        access_set: Rc<RefCell<crate::annotator::description::FrozenAttrFamily>>,
+        access_set: Option<Rc<RefCell<crate::annotator::description::FrozenAttrFamily>>>,
     ) -> Self {
         let pbc_type = crate::translator::rtyper::lltypesystem::lltype::ForwardReference::new();
         let pbc_type_clone = pbc_type.clone();
@@ -4692,9 +4695,16 @@ impl MultipleFrozenPBCRepr {
         let rtyper = self.rtyper.upgrade().ok_or_else(|| {
             TyperError::message("MultipleFrozenPBCRepr._setup_repr_fields: rtyper weak ref dropped")
         })?;
+        // upstream `if self.access_set is not None:` (rpbc.py:758) — the
+        // no-attrs arm leaves `fields`/`fieldmap` empty, giving a
+        // zero-field `Struct('pbc')`.
+        let Some(access_set) = &self.access_set else {
+            self.fieldmap.borrow_mut().clear();
+            return Ok(Vec::new());
+        };
         // upstream `attrlist = self.access_set.attrs.keys(); attrlist.sort()`.
         let attrs_snapshot: Vec<(String, crate::annotator::model::SomeValue)> = {
-            let caf = self.access_set.borrow();
+            let caf = access_set.borrow();
             let mut attrs: Vec<(String, crate::annotator::model::SomeValue)> = caf
                 .attrs
                 .iter()
@@ -4882,11 +4892,8 @@ impl Repr for MultipleFrozenPBCRepr {
         desc: &crate::annotator::description::DescEntry,
     ) -> Result<Constant, TyperError> {
         // upstream `if (self.access_set is not None and
-        // frozendesc not in self.access_set.descs)` — pyre's
-        // `access_set` is always Some on this concrete repr (the
-        // `None` arm in upstream describes the abstract base class
-        // before the per-attr family is known), so the membership
-        // check is unconditional here.
+        // frozendesc not in self.access_set.descs)` — the membership
+        // check is skipped in the `None` (no-attrs) arm.
         //
         // PRE-EXISTING-DEVIATION: pyre keys
         // `FrozenAttrFamily.descs` on `FrozenDesc.base.identity`
@@ -4900,11 +4907,13 @@ impl Repr for MultipleFrozenPBCRepr {
                 "MultipleFrozenPBCRepr.convert_desc: non-Frozen desc {desc:?}"
             )));
         };
-        let identity_key = fd_rc.borrow().base.identity;
-        if !self.access_set.borrow().descs.contains_key(&identity_key) {
-            return Err(TyperError::message(format!(
-                "MultipleFrozenPBCRepr.convert_desc: {desc:?} not found in PBC access set"
-            )));
+        if let Some(access_set) = &self.access_set {
+            let identity_key = fd_rc.borrow().base.identity;
+            if !access_set.borrow().descs.contains_key(&identity_key) {
+                return Err(TyperError::message(format!(
+                    "MultipleFrozenPBCRepr.convert_desc: {desc:?} not found in PBC access set"
+                )));
+            }
         }
         let desc_key = desc.desc_key();
 
@@ -6260,18 +6269,16 @@ impl Repr for ClassesPBCRepr {
 /// * multi-desc with a common `Some(access)` set →
 ///   [`MultipleFrozenPBCRepr`] keyed in
 ///   `rtyper.pbc_reprs[PbcReprKey::Access(access_key)]`, registered
-///   via `rtyper.add_pendingsetup`.
-///
-/// The `None`-access edge case (every desc has no attrfamily) still
-/// surfaces `MissingRTypeOperation`: upstream constructs
-/// `MultipleFrozenPBCRepr(rtyper, access_set=None)` to materialise a
-/// zero-field struct PBC; pyre defers the body because no current
-/// consumer reaches it.
+///   via `rtyper.add_pendingsetup`,
+/// * multi-desc whose common access set is `None` (every desc has no
+///   attrfamily) → [`MultipleFrozenPBCRepr`] with `access_set = None`,
+///   a zero-field `Struct('pbc')` keyed in
+///   `rtyper.pbc_reprs[PbcReprKey::AccessNone]` (rpbc.py:626-632 + 758).
 ///
 /// Called from both `somepbc_rtyper_makerepr` DescKind::Frozen and the
 /// Function-kind uncallable branch — `FunctionDesc.queryattrfamily` is
 /// the base `None` stub, so multi-FunctionDesc always appears "common
-/// access set = None" and routes to the still-pending `MultipleFrozenPBCRepr`
+/// access set = None" and routes to the `None`-access `MultipleFrozenPBCRepr`
 /// arm.
 #[allow(non_snake_case)]
 pub fn getFrozenPBCRepr(
@@ -6340,49 +6347,47 @@ pub fn getFrozenPBCRepr(
     //     return result
     // ```
     //
-    // All descs share `first` (verified above) — the access family is
-    // either `Some(usize)` or `None`. None means every desc has no
-    // attrfamily; upstream still routes to `MultipleFrozenPBCRepr` with
-    // `access_set=None`, but the Rust port requires a live family Rc to
-    // construct the repr. Resolve the family from the first frozen
-    // desc's `queryattrfamily()` so the repr can read its `attrs`.
-    let Some(access_key) = first else {
-        return Err(TyperError::missing_rtype_operation(
-            "getFrozenPBCRepr: MultipleFrozenPBCRepr with access_set=None \
-             (rpbc.py:626-632 + 758) is upstream's no-attrs path — pyre \
-             defers it because no current consumer needs a zero-field \
-             struct PBC",
-        ));
-    };
+    // All descs share `first` (verified above): the access family is
+    // either `Some(usize)` or `None`. `None` means every desc has no
+    // attrfamily (uncallable multi-desc function/frozen PBCs) —
+    // `MultipleFrozenPBCRepr(rtyper, None)` lowers to a zero-field
+    // `Struct('pbc')` (`_setup_repr_fields` returns `[]`, rpbc.py:758),
+    // cached under the `pbc_reprs[None]` singleton slot.
     use crate::translator::rtyper::rtyper::PbcReprKey;
-    if let Some(cached) = rtyper
-        .pbc_reprs
-        .borrow()
-        .get(&PbcReprKey::Access(access_key))
-    {
+    let repr_key = match first {
+        Some(access_key) => PbcReprKey::Access(access_key),
+        None => PbcReprKey::AccessNone,
+    };
+    if let Some(cached) = rtyper.pbc_reprs.borrow().get(&repr_key) {
         return Ok(cached.clone());
     }
-    // Fetch the live FrozenAttrFamily — every desc shared the same key
-    // so any of them yields the same family.
-    let access_family = s_pbc
-        .descriptions
-        .values()
-        .find_map(|d| match d {
-            DescEntry::Frozen(fd) => fd.borrow().queryattrfamily(),
-            _ => None,
-        })
-        .ok_or_else(|| {
-            TyperError::message(
-                "getFrozenPBCRepr: invariant — first desc's queryattrfamily \
-                 returned Some(key) but no descs surface a family",
-            )
-        })?;
+    // Fetch the live FrozenAttrFamily shared by all descs (verified via
+    // `first`). `None` when the shared access set is absent — the
+    // zero-field `access_set=None` arm.
+    let access_family = match first {
+        Some(_) => Some(
+            s_pbc
+                .descriptions
+                .values()
+                .find_map(|d| match d {
+                    DescEntry::Frozen(fd) => fd.borrow().queryattrfamily(),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    TyperError::message(
+                        "getFrozenPBCRepr: invariant — first desc's queryattrfamily \
+                         returned Some(key) but no descs surface a family",
+                    )
+                })?,
+        ),
+        None => None,
+    };
     let fresh: std::sync::Arc<dyn Repr> =
         std::sync::Arc::new(MultipleFrozenPBCRepr::new(rtyper, access_family));
     rtyper
         .pbc_reprs
         .borrow_mut()
-        .insert(PbcReprKey::Access(access_key), fresh.clone());
+        .insert(repr_key, fresh.clone());
     rtyper.add_pendingsetup(fresh.clone());
     Ok(fresh)
 }
@@ -7043,12 +7048,11 @@ pub fn somepbc_rtyper_makerepr(
                     // through `getFrozenPBCRepr`. The factory dispatches
                     // to `SingleFrozenPBCRepr` (single-desc + !can_be_None),
                     // `MultipleUnrelatedFrozenPBCRepr` (cached at
-                    // `pbc_reprs[Unrelated]`), or `MultipleFrozenPBCRepr`
-                    // (cached at `pbc_reprs[Access(_)]`). The remaining
-                    // `MissingRTypeOperation` path is the `None`-access
-                    // edge case (every desc has no attrfamily — upstream's
-                    // zero-field struct PBC), deferred until a consumer
-                    // reaches it.
+                    // `pbc_reprs[Unrelated]`), `MultipleFrozenPBCRepr`
+                    // (cached at `pbc_reprs[Access(_)]`), or — when every
+                    // desc has no attrfamily — the `None`-access
+                    // `MultipleFrozenPBCRepr` zero-field struct PBC
+                    // (cached at `pbc_reprs[AccessNone]`).
                     getFrozenPBCRepr(rtyper, s_pbc)
                 }
             }
@@ -7129,33 +7133,29 @@ mod pbc_repr_tests {
     }
 
     #[test]
-    fn somepbc_rtyper_makerepr_single_function_desc_with_can_be_none_surfaces_pending() {
-        // Uncallable (no callfamily wired) → getFrozenPBCRepr branch.
+    fn somepbc_rtyper_makerepr_single_function_desc_with_can_be_none_returns_multiple_frozen() {
+        // Uncallable (no callfamily wired), `can_be_None=true` drops out of
+        // the SingleFrozenPBCRepr fast-path → getFrozenPBCRepr multi-desc
+        // branch → the `access is None` no-attrs arm builds a zero-field
+        // MultipleFrozenPBCRepr (rpbc.py:626-632 + 758).
         let (ann, rtyper) = make_rtyper();
         let f = function_entry(&ann.bookkeeper, "f");
         let s_pbc = SomePBC::new(vec![f], true);
-        let err = somepbc_rtyper_makerepr(&s_pbc, &rtyper).unwrap_err();
-        assert!(
-            err.to_string().contains("getFrozenPBCRepr"),
-            "unexpected: {}",
-            err
-        );
+        let r = somepbc_rtyper_makerepr(&s_pbc, &rtyper).unwrap();
+        assert_eq!(r.class_name(), "MultipleFrozenPBCRepr");
     }
 
     #[test]
     fn somepbc_rtyper_makerepr_multi_function_descs_without_callfamily_uses_getfrozenpbcrepr() {
         // Multi-FunctionDesc PBC without an attached callfamily → upstream
-        // rpbc.py:49 routes to getFrozenPBCRepr.
+        // rpbc.py:49 routes to getFrozenPBCRepr, whose no-attrs
+        // (`access is None`) arm yields a zero-field MultipleFrozenPBCRepr.
         let (ann, rtyper) = make_rtyper();
         let f = function_entry(&ann.bookkeeper, "f");
         let g = function_entry(&ann.bookkeeper, "g");
         let s_pbc = SomePBC::new(vec![f, g], false);
-        let err = somepbc_rtyper_makerepr(&s_pbc, &rtyper).unwrap_err();
-        assert!(
-            err.to_string().contains("getFrozenPBCRepr"),
-            "unexpected: {}",
-            err
-        );
+        let r = somepbc_rtyper_makerepr(&s_pbc, &rtyper).unwrap();
+        assert_eq!(r.class_name(), "MultipleFrozenPBCRepr");
     }
 
     #[test]
@@ -7981,17 +7981,23 @@ mod pbc_repr_tests {
     }
 
     #[test]
-    fn getFrozenPBCRepr_multi_desc_common_access_set_surfaces_pending() {
+    fn getFrozenPBCRepr_multi_desc_common_none_access_set_returns_multiple_frozen() {
         // Two FrozenDescs without any `getattrfamily` touch share the
-        // same `queryattrfamily() == None` result, so upstream routes
-        // them to MultipleFrozenPBCRepr (still pending).
+        // same `queryattrfamily() == None` result, so upstream routes them
+        // to the `access is None` arm — a zero-field MultipleFrozenPBCRepr
+        // (rpbc.py:626-632 + 758). The None arm is a singleton cached at
+        // `pbc_reprs[None]`.
         let (ann, rtyper) = make_rtyper();
         let f = frozen_entry(&ann.bookkeeper, "frozen0");
         let g = frozen_entry(&ann.bookkeeper, "frozen1");
         let s_pbc = SomePBC::new(vec![f, g], false);
-        let err = getFrozenPBCRepr(&rtyper, &s_pbc).unwrap_err();
-        assert!(err.is_missing_rtype_operation());
-        assert!(err.to_string().contains("MultipleFrozenPBCRepr"));
+        let r1 = getFrozenPBCRepr(&rtyper, &s_pbc).unwrap();
+        assert_eq!(r1.class_name(), "MultipleFrozenPBCRepr");
+        let r2 = getFrozenPBCRepr(&rtyper, &s_pbc).unwrap();
+        assert!(
+            std::sync::Arc::ptr_eq(&r1, &r2),
+            "the None-access MultipleFrozenPBCRepr must be a cached singleton"
+        );
     }
 
     #[test]
@@ -8777,17 +8783,16 @@ mod pbc_repr_tests {
     }
 
     #[test]
-    fn somepbc_rtyper_makerepr_single_frozen_desc_with_can_be_none_surfaces_pending() {
+    fn somepbc_rtyper_makerepr_single_frozen_desc_with_can_be_none_returns_multiple_frozen() {
         // Single FrozenDesc with `can_be_None=true` falls out of the
-        // SingleFrozenPBCRepr fast-path, hits getFrozenPBCRepr's
-        // multi-desc branch, and — with only one access-set (None) —
-        // routes to the still-pending MultipleFrozenPBCRepr arm.
+        // SingleFrozenPBCRepr fast-path, hits getFrozenPBCRepr's multi-desc
+        // branch, and — with only one access-set (None) — routes to the
+        // zero-field MultipleFrozenPBCRepr no-attrs arm.
         let (ann, rtyper) = make_rtyper();
         let f = frozen_entry(&ann.bookkeeper, "frozen0");
         let s_pbc = SomePBC::new(vec![f], true);
-        let err = somepbc_rtyper_makerepr(&s_pbc, &rtyper).unwrap_err();
-        assert!(err.is_missing_rtype_operation());
-        assert!(err.to_string().contains("MultipleFrozenPBCRepr"));
+        let r = somepbc_rtyper_makerepr(&s_pbc, &rtyper).unwrap();
+        assert_eq!(r.class_name(), "MultipleFrozenPBCRepr");
     }
 
     #[test]

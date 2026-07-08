@@ -334,10 +334,13 @@ pub(crate) enum PbcReprKey {
     /// `rtyper.pbc_reprs['unrelated']` (rpbc.py:621).
     Unrelated,
     /// `rtyper.pbc_reprs[access_set]` (rpbc.py:627) — keyed by the
-    /// `FrozenAttrFamily` pointer identity. Reserved for
-    /// MultipleFrozenPBCRepr caching when that repr lands; currently
-    /// unused.
+    /// `FrozenAttrFamily` pointer identity, for a `MultipleFrozenPBCRepr`
+    /// with a concrete access set.
     Access(usize),
+    /// `rtyper.pbc_reprs[None]` (rpbc.py:627) — the singleton
+    /// `MultipleFrozenPBCRepr` for the no-attrs arm (`access is None`),
+    /// a zero-field `Struct('pbc')`.
+    AccessNone,
 }
 
 /// RPython `class RTyperBackend(object): pass` (`rtyper.py:30-31`).
