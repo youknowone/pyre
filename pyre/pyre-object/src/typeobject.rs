@@ -706,9 +706,51 @@ pub unsafe fn w_type_get_mro(obj: PyObjectRef) -> *mut Vec<PyObjectRef> {
 pub unsafe fn w_type_issubtype(w_type: PyObjectRef, cls: PyObjectRef) -> bool {
     let mro_ptr = w_type_get_mro(w_type);
     if mro_ptr.is_null() {
+        // typeobject.py:1646 _issubtype_slow_and_wrong — a partially
+        // initialised type (custom metaclass mro()) has no mro yet; walk
+        // find_best_base up the base chain (single inheritance, deliberately
+        // wrong for multiple inheritance).
+        let mut w_cls = w_type;
+        while !w_cls.is_null() {
+            if std::ptr::eq(w_cls, cls) {
+                return true;
+            }
+            w_cls = find_best_base(w_cls);
+        }
         return false;
     }
     (*mro_ptr).iter().any(|&t| std::ptr::eq(t, cls))
+}
+
+/// typeobject.py:1335-1354 find_best_base — the type base whose instance
+/// layout a subtype extends (most-derived layout among the type bases).
+/// Non-raising variant for the null-mro subtype fallback.
+unsafe fn find_best_base(w_type: PyObjectRef) -> PyObjectRef {
+    let bases = w_type_get_bases(w_type);
+    if bases.is_null() {
+        return PY_NULL;
+    }
+    let mut w_bestbase = PY_NULL;
+    let mut best_layout: *const Layout = std::ptr::null();
+    for w_cand in crate::tupleobject::w_tuple_items_copy_as_vec(bases) {
+        if !is_type(w_cand) {
+            continue;
+        }
+        let cand_layout = w_type_get_layout_ptr(w_cand);
+        if w_bestbase.is_null() {
+            w_bestbase = w_cand;
+            best_layout = cand_layout;
+            continue;
+        }
+        if cand_layout != best_layout
+            && !cand_layout.is_null()
+            && (*cand_layout).issublayout(best_layout)
+        {
+            w_bestbase = w_cand;
+            best_layout = cand_layout;
+        }
+    }
+    w_bestbase
 }
 
 /// Set the cached MRO.
