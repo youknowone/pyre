@@ -4936,7 +4936,7 @@ fn unicode_to_decimal(s: &str) -> std::borrow::Cow<'_, str> {
                 out.push(' ');
                 continue;
             }
-            if let Some(v) = crate::unicodedb::decimal_value(c) {
+            if let Some(v) = rustpython_unicode::Ucd::new(true).decimal(CodePoint::from(c)) {
                 out.push((b'0' + v as u8) as char);
                 continue;
             }

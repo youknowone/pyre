@@ -45,12 +45,10 @@ rustpython-host_env = { workspace = true, optional = true }
 pyre-sandbox = { workspace = true, optional = true }
 libc = { workspace = true }
 siphasher = { workspace = true }
-caseless = { workspace = true }
 base64 = { workspace = true }
 crc32fast = { workspace = true }
 indexmap = { workspace = true }
 paste = { workspace = true }
-unicode-xid = { workspace = true }
 # Decompresses the embedded stdlib VFS blob at runtime (wasm_vfs). Decode-only,
 # no_std-compatible safe path; the encode side is unused here.
 lz4_flex = { version = "0.13", default-features = false, features = [

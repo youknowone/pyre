@@ -12,6 +12,14 @@
 use malachite_bigint::BigInt;
 use num_traits::ToPrimitive;
 use pyre_object::*;
+// `classify`/`case`/`identifier` back the `str` predicate and `casefold`
+// methods with the runtime-independent Unicode tables shared with the
+// `unicodedata` module.  Those tables track Unicode 17.0.0, one release ahead
+// of Python 3.14's 16.0.0, so predicates read a property on the ~500 code
+// points release 17 newly assigns (unassigned under 16.0.0) — the same
+// data-version skew already noted in `module/unicodedata`, kept consistent
+// across `str` and `unicodedata` here.
+use rustpython_unicode::{case, classify, identifier};
 use rustpython_wtf8::{CodePoint, Wtf8, Wtf8Buf};
 
 // ── Arity checks for builtin methods ─────────────────────────────────
@@ -540,51 +548,13 @@ pub fn str_method_rsplit(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 /// applies the full Unicode `CaseFolding.txt` mapping (status C +
 /// status F: ß → ss, ﬁ → fi, İ → i + combining dot,
 /// Lithuanian Į → i̇ǫ, the Greek sigma, etc.).  Pyre routes through
-/// the `caseless` crate's `default_case_fold_str` which is itself
-/// generated from `CaseFolding.txt` status-C+F entries, so the
-/// surface matches `unicode_casefold` for every Unicode code point.
+/// `case::casefold_wtf8`, which applies the same
+/// `CaseFolding.txt` status-C+F mapping to each scalar code point and
+/// passes lone surrogates through unchanged.
 pub fn str_method_casefold(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_receiver(args, "casefold")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
-    // Fast path: no lone surrogate, fold the whole &str at once.
-    if let Ok(valid) = s.as_str() {
-        return Ok(w_str_new(&caseless::default_case_fold_str(valid)));
-    }
-    // Surrogate path: fold each scalar code point, pass surrogates through.
-    let out = wtf8_map_chars(s, |c, out| {
-        let mut buf = [0u8; 4];
-        out.push_str(&caseless::default_case_fold_str(c.encode_utf8(&mut buf)));
-    });
-    Ok(w_str_from_wtf8(out))
-}
-
-#[allow(dead_code)]
-fn casefold_basic(s: &str) -> String {
-    // Multi-char expansion casefolds the Unicode `Final_Sigma` /
-    // `Lt`/`Lu` cases pyre's interpreter test corpus actually
-    // touches.  Any code point outside this whitelist falls back
-    // to Rust's `char::to_lowercase` which matches CPython for the
-    // overwhelming majority of letters.
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        match ch {
-            'ß' => out.push_str("ss"),
-            'ﬀ' => out.push_str("ff"),
-            'ﬁ' => out.push_str("fi"),
-            'ﬂ' => out.push_str("fl"),
-            'ﬃ' => out.push_str("ffi"),
-            'ﬄ' => out.push_str("ffl"),
-            'ﬅ' => out.push_str("st"),
-            'ﬆ' => out.push_str("st"),
-            'İ' => out.push_str("i\u{0307}"),
-            _ => {
-                for lower in ch.to_lowercase() {
-                    out.push(lower);
-                }
-            }
-        }
-    }
-    out
+    Ok(w_str_from_wtf8(case::casefold_wtf8(s)))
 }
 
 /// `pypy/objspace/std/unicodeobject.py:429-430 W_UnicodeObject
@@ -2552,7 +2522,7 @@ pub fn str_method_isdigit(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     // backing is never all-digit (and the empty string is false too).
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let result = match s.as_str() {
-        Ok(v) => !v.is_empty() && v.chars().all(crate::unicodedb::isdigit),
+        Ok(v) => !v.is_empty() && v.chars().all(classify::is_digit),
         Err(_) => false,
     };
     Ok(w_bool_from(result))
@@ -2562,7 +2532,7 @@ pub fn str_method_isdecimal(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     require_receiver(args, "isdecimal")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let result = match s.as_str() {
-        Ok(v) => !v.is_empty() && v.chars().all(crate::unicodedb::isdecimal),
+        Ok(v) => !v.is_empty() && v.chars().all(classify::is_decimal),
         Err(_) => false,
     };
     Ok(w_bool_from(result))
@@ -2572,7 +2542,7 @@ pub fn str_method_isnumeric(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     require_receiver(args, "isnumeric")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let result = match s.as_str() {
-        Ok(v) => !v.is_empty() && v.chars().all(crate::unicodedb::isnumeric),
+        Ok(v) => !v.is_empty() && v.chars().all(classify::is_numeric),
         Err(_) => false,
     };
     Ok(w_bool_from(result))
@@ -2614,7 +2584,7 @@ pub fn str_method_isalpha(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     require_receiver(args, "isalpha")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let result = match s.as_str() {
-        Ok(v) => !v.is_empty() && v.chars().all(|c| c.is_alphabetic()),
+        Ok(v) => !v.is_empty() && v.chars().all(classify::is_alpha),
         Err(_) => false,
     };
     Ok(w_bool_from(result))
@@ -2637,10 +2607,9 @@ pub fn str_method_isidentifier(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
 /// (or underscore) followed by `XID_Continue` code points.
 /// PyPy: unicodeobject.py `_isidentifier` via `unicodedb.isxidstart`/`isxidcontinue`.
 fn is_identifier(s: &str) -> bool {
-    use unicode_xid::UnicodeXID;
     let mut chars = s.chars();
-    let valid_start = chars.next().is_some_and(|c| c == '_' || c.is_xid_start());
-    valid_start && chars.all(|c| c.is_xid_continue())
+    let valid_start = chars.next().is_some_and(identifier::is_start);
+    valid_start && chars.all(identifier::is_continue)
 }
 
 /// `pypy/objspace/std/unicodeobject.py W_UnicodeObject.descr_zfill`.
@@ -2985,26 +2954,14 @@ pub fn str_method_rjust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 ///     return space.w_True
 /// ```
 ///
-/// Empty string returns True per CPython.  Non-printable categories
-/// per Unicode standard: Cc/Cf/Cs/Co/Cn/Zl/Zp + Zs other than
-/// U+0020.  Rust stdlib's `char::is_control()` only covers Cc; full
-/// parity requires a Unicode category table.  Convergence path:
-/// import `unicode_general_category` (e.g. via the `unicode-general-category`
-/// crate) and check `!matches!(cat, Cc|Cf|Cs|Co|Cn|Zl|Zp)` + `Zs == ' '`.
-/// For now: approximate via `!c.is_control() && c != ' ' || c == ' '`
-/// which catches the common ASCII-only cases.
+/// Empty string returns True per CPython.  Delegates the per-character
+/// category check to `classify::is_printable`.
 pub fn str_method_isprintable(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_receiver(args, "isprintable")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     // Empty returns True (vacuous); a lone surrogate is not printable.
     let result = match s.as_str() {
-        Ok(v) => v.chars().all(|c| {
-            // Cc (control) — Rust stdlib catches this.
-            // Zl / Zp — single chars U+2028 / U+2029 are non-printable.
-            // Zs other than space — narrow no-break U+202F, etc., are
-            // non-printable, but plain space ' ' is.
-            !c.is_control() && c != '\u{2028}' && c != '\u{2029}'
-        }),
+        Ok(v) => v.chars().all(classify::is_printable),
         Err(_) => false,
     };
     Ok(w_bool_from(result))
@@ -3015,7 +2972,7 @@ pub fn str_method_isspace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     require_receiver(args, "isspace")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let result = match s.as_str() {
-        Ok(v) => !v.is_empty() && v.chars().all(|c| c.is_whitespace()),
+        Ok(v) => !v.is_empty() && v.chars().all(classify::is_space),
         Err(_) => false,
     };
     Ok(w_bool_from(result))
@@ -3066,7 +3023,7 @@ pub fn str_method_isalnum(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     require_receiver(args, "isalnum")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let result = match s.as_str() {
-        Ok(v) => !v.is_empty() && v.chars().all(|c| c.is_alphanumeric()),
+        Ok(v) => !v.is_empty() && v.chars().all(classify::is_alnum),
         Err(_) => false,
     };
     Ok(w_bool_from(result))

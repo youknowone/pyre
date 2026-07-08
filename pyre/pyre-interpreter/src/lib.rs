@@ -79,7 +79,6 @@ pub mod sliceobject;
 pub mod stack_check;
 pub mod type_methods;
 pub mod typedef;
-pub mod unicodedb;
 pub mod warn;
 
 // ── Execution and import modules ──
