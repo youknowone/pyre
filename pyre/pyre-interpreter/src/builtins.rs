@@ -191,6 +191,9 @@ unsafe fn memoryview_buffer_params(obj: PyObjectRef) -> Option<(String, i64, boo
 /// reports the original exporter as `.obj`); a non-buffer raises TypeError.
 pub(crate) fn w_memoryview_new(w_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     use pyre_object::memoryview::*;
+    if let Some(target) = crate::module::__pypy__::interp_buffer::forwarded_exporter(w_obj) {
+        return w_memoryview_new(target?);
+    }
     unsafe {
         if is_w_memoryview(w_obj) {
             memoryview_check_released(w_obj)?;

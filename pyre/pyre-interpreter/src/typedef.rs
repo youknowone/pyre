@@ -10289,6 +10289,9 @@ fn bytes_method_rstrip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 pub(crate) fn buffer_as_bytes_like(
     obj: PyObjectRef,
 ) -> Result<Option<PyObjectRef>, crate::PyError> {
+    if let Some(target) = crate::module::__pypy__::interp_buffer::forwarded_exporter(obj) {
+        return buffer_as_bytes_like(target?);
+    }
     if unsafe { pyre_object::interp_array::is_array(obj) } {
         return Ok(Some(pyre_object::bytesobject::w_bytes_from_bytes(unsafe {
             pyre_object::interp_array::w_array_bytes(obj)
