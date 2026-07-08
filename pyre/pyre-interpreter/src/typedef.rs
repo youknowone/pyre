@@ -8489,43 +8489,10 @@ fn init_int_type(ns: &mut DictStorage) {
         ),
     );
 }
-/// Format one component of a complex repr: shortest float repr without
-/// the trailing `.0` that `float.__repr__` appends.
-fn complex_part_repr(val: f64) -> String {
-    if val.is_nan() {
-        return "nan".to_string();
-    }
-    if val.is_infinite() {
-        return if val < 0.0 {
-            "-inf".to_string()
-        } else {
-            "inf".to_string()
-        };
-    }
-    let s = crate::display::format_float_repr(val);
-    s.strip_suffix(".0").map(str::to_string).unwrap_or(s)
-}
-
-/// `complexobject.c complex_repr` — `Xj` for a pure-`+0` real part, else
-/// `(re±imj)`.
+/// Complex `repr` (`Xj` for a pure-`+0` real part, else `(re±imj)`),
+/// delegated to `rustpython_literal::complex::to_string`.
 pub(crate) fn complex_repr_string(re: f64, im: f64) -> String {
-    if re == 0.0 && re.is_sign_positive() {
-        format!("{}j", complex_part_repr(im))
-    } else {
-        // The sign follows the imaginary part's sign bit, so a negative
-        // zero prints as `-0j`; a NaN imaginary part prints with `+`.
-        let sign = if im.is_sign_negative() && !im.is_nan() {
-            "-"
-        } else {
-            "+"
-        };
-        format!(
-            "({}{}{}j)",
-            complex_part_repr(re),
-            sign,
-            complex_part_repr(im.abs())
-        )
-    }
+    rustpython_literal::complex::to_string(re, im)
 }
 
 fn init_complex_type(ns: &mut DictStorage) {

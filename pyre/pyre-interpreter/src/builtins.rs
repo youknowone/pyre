@@ -8784,59 +8784,10 @@ fn builtin_bin(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(w_str_new(&s))
 }
 
-/// Parse a complex literal string into `(real, imag)`.
-///
-/// `complexobject.c complex_from_string_inner`: optional surrounding
-/// parens, then `[real][+/-]imag[j]` with no internal whitespace.
+/// Parse a complex literal string into `(real, imag)`, delegated to
+/// `rustpython_literal::complex::parse_str`.
 fn parse_complex_str(raw: &str) -> Option<(f64, f64)> {
-    let mut s = raw.trim();
-    if s.starts_with('(') && s.ends_with(')') {
-        s = s[1..s.len() - 1].trim();
-    }
-    if s.is_empty() || s.contains(char::is_whitespace) {
-        return None;
-    }
-    let parse_part = |p: &str, is_imag: bool| -> Option<f64> {
-        // A bare/sign-only imaginary coefficient means ±1.
-        if is_imag {
-            match p {
-                "" | "+" => return Some(1.0),
-                "-" => return Some(-1.0),
-                _ => {}
-            }
-        }
-        p.parse::<f64>().ok()
-    };
-    let bytes = s.as_bytes();
-    // Boundary between real and imaginary parts: the last '+'/'-' that is
-    // not the leading sign and not part of an exponent (`e+`/`e-`).
-    let mut split = None;
-    for i in 1..bytes.len() {
-        let c = bytes[i];
-        if (c == b'+' || c == b'-') && bytes[i - 1] != b'e' && bytes[i - 1] != b'E' {
-            split = Some(i);
-        }
-    }
-    let ends_j = matches!(bytes.last(), Some(b'j') | Some(b'J'));
-    match split {
-        Some(i) => {
-            if !ends_j {
-                return None;
-            }
-            let real = parse_part(&s[..i], false)?;
-            let imag = parse_part(&s[i..s.len() - 1], true)?;
-            Some((real, imag))
-        }
-        None => {
-            if ends_j {
-                let imag = parse_part(&s[..s.len() - 1], true)?;
-                Some((0.0, imag))
-            } else {
-                let real = parse_part(s, false)?;
-                Some((real, 0.0))
-            }
-        }
-    }
+    rustpython_literal::complex::parse_str(raw)
 }
 
 /// Coerce a value to `(real, imag)` for `complex()` construction.
