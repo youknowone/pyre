@@ -8,6 +8,14 @@
 //! lookups, no negative cache).
 
 use pyre_object::*;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+// `abc_invalidation_counter` (`_abcmodule.c`): bumped by every successful
+// `_abc_register` and by `_reset_caches`, and read by `get_cache_token`.
+// The positive/negative object caches themselves remain omitted as an
+// optimisation — only this token is tracked, so a bump makes any cached
+// token stale.
+static INVALIDATION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 // `_py_abc.ABCMeta.__new__` (`_py_abc.py:48`) gives every ABC its OWN
 // `_abc_registry`. Create it here as a per-class list so the registry is not
@@ -23,9 +31,9 @@ fn abc_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(w_none())
 }
 
-// `app_abc.py:_abc_register` — `cls._abc_registry.add(subclass)`.
-// Pyre stores the registry as a list attribute (no WeakSet); duplicates
-// are skipped to keep the list bounded.
+// `_abc_register` (`_abcmodule.c:_abc__abc_register_impl`) —
+// `cls._abc_registry.add(subclass)`.  Pyre stores the registry as a list
+// attribute (no WeakSet).
 fn register(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() < 2 {
         return Err(crate::PyError::type_error(
@@ -34,6 +42,30 @@ fn register(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     }
     let cls = args[0];
     let subclass = args[1];
+    // `subclass` must be a class (`PyType_Check`).  Pyre's stdlib stubs
+    // register callable non-type shells to ABCs — `_contextvars.Context` is a
+    // builtin function here, yet `contextvars` runs `Mapping.register(Context)`
+    // at import.  `__subclasscheck__` already tolerates such members by
+    // skipping non-type registry entries (see `subclass_of`), so the
+    // `PyObject_IsSubclass` guards below (which reject non-type args) only run
+    // for real types; a callable stub falls straight through to the append,
+    // and only a genuine non-class value (`register(42)`) is rejected.
+    if unsafe { is_type(subclass) } {
+        // Already a subclass (`PyObject_IsSubclass(subclass, cls) > 0`) —
+        // nothing to register.  This also dedups: a previously registered
+        // `subclass` resolves through `__subclasscheck__`'s registry walk.
+        if crate::baseobjspace::issubclass(subclass, cls)? {
+            return Ok(subclass);
+        }
+        // Registering `subclass` would also make `cls` its subclass.
+        if crate::baseobjspace::issubclass(cls, subclass)? {
+            return Err(crate::PyError::runtime_error(
+                "Refusing to create an inheritance cycle",
+            ));
+        }
+    } else if !crate::baseobjspace::callable_w(subclass) {
+        return Err(crate::PyError::type_error("Can only register classes"));
+    }
     let registry = match crate::baseobjspace::getattr_str(cls, "_abc_registry") {
         Ok(r) if !unsafe { is_none(r) } => r,
         _ => {
@@ -43,16 +75,10 @@ fn register(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         }
     };
     unsafe {
-        let n = w_list_len(registry);
-        for i in 0..n {
-            if let Some(item) = w_list_getitem(registry, i as i64) {
-                if std::ptr::eq(item, subclass) {
-                    return Ok(subclass);
-                }
-            }
-        }
         w_list_append(registry, subclass);
     }
+    // Invalidate any outstanding cache token.
+    INVALIDATION_COUNTER.fetch_add(1, Ordering::Relaxed);
     Ok(subclass)
 }
 
@@ -152,13 +178,15 @@ fn subclasscheck(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 crate::py_module! {
     "_abc",
     functions: {
-        "get_cache_token"     / 0 = |_| Ok(w_int_new(0)),
+        "get_cache_token"     / 0 = |_| Ok(w_int_new(INVALIDATION_COUNTER.load(Ordering::Relaxed) as i64)),
         "_abc_init"           / 1 = abc_init,
         "_abc_register"       / 2 = register,
         "_abc_instancecheck"  / 2 = instancecheck,
         "_abc_subclasscheck"  / 2 = subclasscheck,
         "_get_dump"           / 1 = |_| Ok(w_tuple_new(vec![])),
         "_reset_registry"     / 1 = |_| Ok(w_none()),
-        "_reset_caches"       / 1 = |_| Ok(w_none()),
+        // Pyre keeps no object caches to clear; bumping the token invalidates
+        // any outstanding `get_cache_token` value.
+        "_reset_caches"       / 1 = |_| { INVALIDATION_COUNTER.fetch_add(1, Ordering::Relaxed); Ok(w_none()) },
     },
 }
