@@ -7701,6 +7701,22 @@ impl CraneliftBackend {
         // x86_64 register pressure (rbp already taken by preserve_frame_pointers),
         // spills to a stack slot and is reloaded on every frame access.
         flag_builder.set("enable_pinned_reg", "true").unwrap();
+        // Windows enforces the stack guard page strictly: a prologue that moves
+        // %rsp past the 4KB guard in one `sub` (a deep trace body's
+        // fixed_frame_storage can reach hundreds of KB) faults 0xC0000005 on the
+        // first write below the skipped page. Linux/macOS auto-grow the stack
+        // instead. Emit inline stack probes (the __chkstk analog: a probe loop
+        // touching each page) so the guard page is hit during the prologue.
+        // `inline` emits the loop directly; `outline` would need a probestack
+        // libcall symbol registered in the JITModule. Scoped to Windows via the
+        // runtime `cfg!` macro (not a `#[cfg]` attribute) so these `set` calls
+        // still compile on every platform and only take effect on Windows,
+        // keeping non-Windows codegen unchanged (probestack is a pure prologue
+        // insertion — no body instruction-selection change).
+        if cfg!(windows) {
+            flag_builder.set("enable_probestack", "true").unwrap();
+            flag_builder.set("probestack_strategy", "inline").unwrap();
+        }
 
         let isa_builder = cranelift_native::builder().expect("host ISA not supported");
         let isa = isa_builder
