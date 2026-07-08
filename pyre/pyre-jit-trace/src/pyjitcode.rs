@@ -114,16 +114,6 @@ pub struct PyJitCodeMetadata {
     pub carryfwd_resume_pc: Vec<(u32, usize)>,
     /// Value-stack depth at each Python PC, in slots above stack_base.
     pub depth_at_py_pc: Vec<u16>,
-    /// task#50 phase-0: the jitcode-pc-keyed twin of `depth_at_py_pc`. Each
-    /// distinct `-live-` marker byte offset a PC resolves to → the value-stack
-    /// depth of the SMALLEST py_pc resolving there (the block head), sorted
-    /// ascending by offset for binary search. Built from the SAME `pc_map`
-    /// bytes + `depth_at_py_pc` at `finalize_jitcode`, so a lookup equals
-    /// `depth_at_py_pc[python_pc_for_jitcode_pc(jit_pc)]` by construction. A
-    /// scaffolding twin for the eventual jitcode-pc-keyed resume re-key
-    /// (`PYRE_PCMAP_DEPTH_AUDIT` certifies the equality); empty for skeleton /
-    /// portal-bridge / fixture metadata.
-    pub depth_by_jit_pc: Vec<(usize, u16)>,
     /// task#50 phase-1: predecessor-keyed jitcode-pc twin of `pcdep_color_slots`.
     /// Each entry `(off, colors)` maps a JitCode byte offset to the pcdep
     /// color→slot list of the py_pc that `python_pc_for_jitcode_pc(off)` returns
@@ -137,9 +127,8 @@ pub struct PyJitCodeMetadata {
     pub pcdep_by_jit_pc: Vec<(usize, Vec<(u8, u16, u16)>)>,
     /// task#50 phase-1: predecessor-keyed jitcode-pc twin of `depth_at_py_pc`,
     /// built alongside `pcdep_by_jit_pc` with the same `python_pc_for_jitcode_pc`
-    /// resolution (marker precedence + first_jit predecessor). Distinct from
-    /// `depth_by_jit_pc`, which is EXACT-match on block-head markers only; this
-    /// one predecessor-covers op offsets too, so it agrees with the depth read
+    /// resolution (marker precedence + first_jit predecessor). Predecessor-covers
+    /// op offsets, so it agrees with the depth read
     /// at the decode seam for every carried coordinate. `PYRE_PCMAP_BRIDGE_AUDIT`
     /// certifies it equals `depth_at_py_pc[python_pc_for_jitcode_pc(jit_pc)]`.
     pub depth_pred_by_jit_pc: Vec<(usize, u16)>,
@@ -531,24 +520,6 @@ impl PyJitCode {
             .map(|i| table[i].1)
     }
 
-    /// task#50 phase-0: value-stack depth keyed directly by a JitCode byte
-    /// offset, via the `depth_by_jit_pc` twin (binary search on block-head
-    /// offset). Equals `depth_at_py_pc[python_pc_for_jitcode_pc(jit_pc)]` by
-    /// construction when `jit_pc` is a block-head marker offset; `None` when
-    /// the twin is empty (skeleton / portal-bridge) or `jit_pc` is not a
-    /// marker offset. Scaffolding for the eventual jitcode-pc resume re-key
-    /// that lets `pc_map` retire.
-    pub fn depth_for_jitcode_pc(&self, jit_pc: usize) -> Option<u16> {
-        let table = &self.metadata.depth_by_jit_pc;
-        if table.is_empty() {
-            return None;
-        }
-        table
-            .binary_search_by_key(&jit_pc, |&(off, _)| off)
-            .ok()
-            .map(|i| table[i].1)
-    }
-
     /// task#50 phase-1: predecessor index into a jitcode-pc twin — the entry
     /// with the largest offset at-or-before `jit_pc`, reproducing
     /// `python_pc_for_jitcode_pc`'s marker-then-first_jit resolution baked into
@@ -581,7 +552,7 @@ impl PyJitCode {
     /// `depth_pred_by_jit_pc` predecessor twin. Equals
     /// `depth_at_py_pc[python_pc_for_jitcode_pc(jit_pc)]` by construction for a
     /// carried resume coordinate; `None` when the twin is empty. Predecessor
-    /// analog of [`Self::depth_for_jitcode_pc`] (which is EXACT-match on markers).
+    /// index (largest offset ≤ jit_pc).
     pub fn depth_for_jitcode_pc_pred(&self, jit_pc: usize) -> Option<u16> {
         let table = &self.metadata.depth_pred_by_jit_pc;
         if table.is_empty() {
@@ -757,7 +728,6 @@ impl PyJitCode {
                 first_jit_pc_by_py_pc: Vec::new(),
                 block_head_py_by_jit_pc: Vec::new(),
                 carryfwd_resume_pc: Vec::new(),
-                depth_by_jit_pc: Vec::new(),
                 pcdep_by_jit_pc: Vec::new(),
                 depth_pred_by_jit_pc: Vec::new(),
                 depth_trivia_marker_by_jit_pc: Vec::new(),

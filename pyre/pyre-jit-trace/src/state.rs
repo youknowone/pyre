@@ -11733,7 +11733,6 @@ mod tests {
                 first_jit_pc_by_py_pc: vec![0],
                 block_head_py_by_jit_pc: vec![(0, 0)],
                 carryfwd_resume_pc: Vec::new(),
-                depth_by_jit_pc: vec![(0, 2)],
                 pcdep_by_jit_pc: vec![(0, Vec::new())],
                 depth_pred_by_jit_pc: vec![(0, 2)],
                 depth_trivia_marker_by_jit_pc: vec![(0, Some(2))],

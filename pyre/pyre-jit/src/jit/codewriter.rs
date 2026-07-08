@@ -12649,25 +12649,6 @@ impl CodeWriter {
             .map(|(py, &dense)| (py as u32, dense))
             .collect();
 
-        // task#50 phase-0: the jitcode-pc-keyed twin of `depth_at_pc`. Same
-        // first-seen-offset dedup as `block_head_py_by_jit_pc` (a marker offset
-        // belongs to the smallest py_pc resolving there), pairing each block-head
-        // offset with that py_pc's value-stack depth. A lookup equals
-        // `depth_at_pc[python_pc_for_jitcode_pc(jit_pc)]` by construction, so it
-        // scaffolds the eventual jitcode-pc resume re-key without switching any
-        // consumer (`PYRE_PCMAP_DEPTH_AUDIT` certifies the equality).
-        let mut depth_by_jit_pc: Vec<(usize, u16)> = Vec::new();
-        {
-            let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
-            for (py, &off) in pc_map_bytes.iter().enumerate() {
-                if seen.insert(off) {
-                    let depth = depth_at_pc.get(py).copied().unwrap_or(0);
-                    depth_by_jit_pc.push((off, depth));
-                }
-            }
-            depth_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
-        }
-
         // task#50 phase-1: predecessor-keyed jitcode-pc twins of
         // `pcdep_color_slots` and `depth_at_pc`, resolving a JitCode byte
         // offset the way `python_pc_for_jitcode_pc` does — the block-head marker
@@ -12814,7 +12795,6 @@ impl CodeWriter {
             block_head_py_by_jit_pc,
             carryfwd_resume_pc,
             depth_at_py_pc: depth_at_pc,
-            depth_by_jit_pc,
             pcdep_by_jit_pc,
             depth_pred_by_jit_pc,
             depth_trivia_marker_by_jit_pc,
