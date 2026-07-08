@@ -3078,7 +3078,7 @@ impl GcAllocator for MiniMarkGC {
     /// outside the nursery, and pinned nursery objects never move
     /// (minimark.py keeps pinned objects in place across a minor cycle).
     fn can_move(&self, gcref: GcRef) -> bool {
-        if gcref.is_null() {
+        if gcref.is_null() || self.is_tagged_immediate(gcref.0) {
             return false;
         }
         self.is_in_nursery(gcref.0) && !self.pinned_objects.contains(&gcref.0)
