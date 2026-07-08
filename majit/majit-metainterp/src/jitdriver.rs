@@ -1791,6 +1791,10 @@ impl<S: JitState> JitDriver<S> {
                 // bumped at backend-compile time). Call the live-teardown half
                 // only, not the accounting half.
                 self.meta.abort_trace_live(false);
+                // No aborted_tracing follows on success, so drop the
+                // pending_abort_* payload abort_trace_live staged (else it
+                // attaches this key to a later, unrelated abort's hook).
+                self.meta.clear_pending_abort();
                 self.sym = None;
                 self.meta.clear_trace_session();
                 self.compile_trace_success = true;
@@ -1917,6 +1921,7 @@ impl<S: JitState> JitDriver<S> {
                                     // aborted_tracing accounting (see the
                                     // CompileTrace arm above).
                                     self.meta.abort_trace_live(false);
+                                    self.meta.clear_pending_abort();
                                     return;
                                 }
                                 // pyjitpl.py:2993-3007: after retrace_needed(),
@@ -2074,6 +2079,7 @@ impl<S: JitState> JitDriver<S> {
                                 // aborted_tracing accounting (see the
                                 // CompileTrace arm above).
                                 self.meta.abort_trace_live(false);
+                                self.meta.clear_pending_abort();
                                 return;
                             }
                             // pyjitpl.py:2993-3007: after retrace_needed(),
@@ -2458,6 +2464,7 @@ impl<S: JitState> JitDriver<S> {
                 // accounting must not fire (it would double-count a single
                 // successful compile as two aborts).
                 self.meta.abort_trace_live(false);
+                self.meta.clear_pending_abort();
                 self.sym = None;
                 self.meta.clear_trace_session();
                 return Some(DetailedDriverRunOutcome::Jump {

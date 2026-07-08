@@ -6972,6 +6972,20 @@ impl<M: Clone> MetaInterp<M> {
         self.clear_trace_session();
     }
 
+    /// Drop the `pending_abort_*` payload staged by `abort_trace_live`.
+    ///
+    /// `abort_trace_live` always stages `(green_key, permanent)` for the
+    /// `aborted_tracing` call that normally follows on the `SwitchToBlackhole`
+    /// unwind. A *successful* compile teardown runs `abort_trace_live` for its
+    /// live cleanup but fires no `aborted_tracing` (raise_if_successful raises
+    /// `ContinueRunningNormally`, pyjitpl.py:3095-3123), so the staged key must
+    /// be dropped here — leaving it would attach this successfully-compiled
+    /// key to a later, unrelated abort's `on_trace_abort` hook.
+    pub fn clear_pending_abort(&mut self) {
+        self.pending_abort_green_key = None;
+        self.pending_abort_permanent = false;
+    }
+
     /// Finish the current trace with a terminal `FINISH`, then optimize and compile it.
     ///
     /// `exit_with_exception` selects the FINISH descr per `pyjitpl.py`:
@@ -12565,8 +12579,7 @@ impl<M: Clone> MetaInterp<M> {
                     // fires, so letting stale greenkey linger would
                     // attach this successfully-compiled bridge's key
                     // to a later, unrelated abort.
-                    self.pending_abort_green_key = None;
-                    self.pending_abort_permanent = false;
+                    self.clear_pending_abort();
                     Ok(())
                 }
                 // pyjitpl.py:3220/:3245 `compile.giveup()` per
