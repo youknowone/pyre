@@ -2570,6 +2570,20 @@ pub(crate) fn has_real_kwargs(kwargs: Option<PyObjectRef>) -> bool {
         .any(|(key, _)| key != "__pyre_kw__")
 }
 
+/// Number of real keyword arguments in the kwargs dict from
+/// [`split_builtin_kwargs`] — every entry other than the `__pyre_kw__`
+/// marker.  The clinic-style "takes at most N arguments (M given)" builtins
+/// (`sum`, `round`, `pow`) count positionals plus this against their limit.
+pub(crate) fn real_kwarg_count(kwargs: Option<PyObjectRef>) -> usize {
+    let Some(dict) = kwargs else {
+        return 0;
+    };
+    unsafe { pyre_object::w_dict_str_entries(dict) }
+        .iter()
+        .filter(|(key, _)| key != "__pyre_kw__")
+        .count()
+}
+
 /// Look up a single keyword argument from the kwargs dict produced by
 /// `split_builtin_kwargs`. Returns `None` when no kwargs dict is present
 /// or the requested key is absent.
@@ -8659,13 +8673,23 @@ fn builtin_all(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// does (`sum([0.1, 0.2, 0.3])` is `0.6000000000000001`, not `0.6`).  A
 /// `str`/`bytes`/`bytearray` `start` is rejected up front.
 fn builtin_sum(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.is_empty() {
+    // `sum(iterable, /, start=0)`: iterable is positional-only, start is
+    // positional-or-keyword; at most two arguments total.
+    let (pos, kwargs) = split_builtin_kwargs(args);
+    let total = pos.len() + real_kwarg_count(kwargs);
+    if total > 2 {
+        return Err(crate::PyError::type_error(format!(
+            "sum() takes at most 2 arguments ({total} given)"
+        )));
+    }
+    if pos.is_empty() {
         return Err(crate::PyError::type_error(
-            "sum() takes at least one argument",
+            "sum() takes at least 1 positional argument (0 given)",
         ));
     }
-    let iterable = args[0];
-    let start = args.get(1).copied().unwrap_or_else(|| w_int_new(0));
+    kwarg_reject_unknown(kwargs, &["start"], "sum")?;
+    let iterable = pos[0];
+    let start = bind_pos_or_kw(pos, kwargs, 1, "start", "sum", 2)?.unwrap_or_else(|| w_int_new(0));
     if unsafe { pyre_object::is_str(start) } {
         return Err(crate::PyError::type_error(
             "sum() can't sum strings [use ''.join(seq) instead]",
@@ -8738,13 +8762,20 @@ fn float_round_ndigits(v: f64, ndigits: i64) -> f64 {
 }
 
 pub(crate) fn builtin_round(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.is_empty() {
-        return Err(crate::PyError::type_error(
-            "round() missing required argument: 'number' (pos 1)",
-        ));
+    // `round(number, ndigits=None)`: both positional-or-keyword; at most two.
+    let (pos, kwargs) = split_builtin_kwargs(args);
+    let total = pos.len() + real_kwarg_count(kwargs);
+    if total > 2 {
+        return Err(crate::PyError::type_error(format!(
+            "round() takes at most 2 arguments ({total} given)"
+        )));
     }
-    let obj = args[0];
-    let ndigits = args.get(1);
+    kwarg_reject_unknown(kwargs, &["number", "ndigits"], "round")?;
+    let obj = bind_pos_or_kw(pos, kwargs, 0, "number", "round", 1)?.ok_or_else(|| {
+        crate::PyError::type_error("round() missing required argument 'number' (pos 1)")
+    })?;
+    let ndigits_arg = bind_pos_or_kw(pos, kwargs, 1, "ndigits", "round", 2)?;
+    let ndigits = ndigits_arg.as_ref();
     unsafe {
         if is_float(obj) {
             let v = floatobject::w_float_get_value(obj);
@@ -8831,6 +8862,12 @@ pub(crate) fn builtin_round(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 
 /// `divmod(a, b)` — pypy/interpreter/baseobjspace.py:2159 divmod row.
 fn builtin_divmod(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let (args, kwargs) = split_builtin_kwargs(args);
+    if has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(
+            "divmod() takes no keyword arguments",
+        ));
+    }
     if args.len() != 2 {
         return Err(crate::PyError::type_error(format!(
             "divmod() takes exactly two arguments ({} given)",
@@ -8842,27 +8879,36 @@ fn builtin_divmod(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 /// `pow(base, exp[, mod])` — pypy/interpreter/baseobjspace.py:2160 pow row.
 fn builtin_pow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.len() < 2 {
+    // `pow(base, exp, mod=None)`: all positional-or-keyword; at most three.
+    let (pos, kwargs) = split_builtin_kwargs(args);
+    let total = pos.len() + real_kwarg_count(kwargs);
+    if total > 3 {
         return Err(crate::PyError::type_error(format!(
-            "pow() takes at least two arguments ({} given)",
-            args.len()
+            "pow() takes at most 3 arguments ({total} given)"
         )));
     }
-    if args.len() > 3 {
-        return Err(crate::PyError::type_error(format!(
-            "pow() takes at most 3 arguments ({} given)",
-            args.len()
-        )));
-    }
-    if args.len() >= 3 && !unsafe { is_none(args[2]) } {
-        crate::baseobjspace::pow3(args[0], args[1], args[2])
-    } else {
-        crate::baseobjspace::pow(args[0], args[1])
+    kwarg_reject_unknown(kwargs, &["base", "exp", "mod"], "pow")?;
+    let base = bind_pos_or_kw(pos, kwargs, 0, "base", "pow", 1)?.ok_or_else(|| {
+        crate::PyError::type_error("pow() missing required argument 'base' (pos 1)")
+    })?;
+    let exp = bind_pos_or_kw(pos, kwargs, 1, "exp", "pow", 2)?.ok_or_else(|| {
+        crate::PyError::type_error("pow() missing required argument 'exp' (pos 2)")
+    })?;
+    let modulus = bind_pos_or_kw(pos, kwargs, 2, "mod", "pow", 3)?;
+    match modulus {
+        Some(m) if !unsafe { pyre_object::is_none(m) } => crate::baseobjspace::pow3(base, exp, m),
+        _ => crate::baseobjspace::pow(base, exp),
     }
 }
 
 /// `hex(x)` — PyPy: operation.py hex
 fn builtin_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let (args, kwargs) = split_builtin_kwargs(args);
+    if has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(
+            "hex() takes no keyword arguments",
+        ));
+    }
     if args.len() != 1 {
         return Err(crate::PyError::type_error(format!(
             "hex() takes exactly one argument ({} given)",
@@ -8880,6 +8926,12 @@ fn builtin_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 /// `oct(x)` — PyPy: operation.py oct
 fn builtin_oct(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let (args, kwargs) = split_builtin_kwargs(args);
+    if has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(
+            "oct() takes no keyword arguments",
+        ));
+    }
     if args.len() != 1 {
         return Err(crate::PyError::type_error(format!(
             "oct() takes exactly one argument ({} given)",
@@ -8897,6 +8949,12 @@ fn builtin_oct(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 /// `bin(x)` — PyPy: operation.py bin
 fn builtin_bin(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let (args, kwargs) = split_builtin_kwargs(args);
+    if has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(
+            "bin() takes no keyword arguments",
+        ));
+    }
     if args.len() != 1 {
         return Err(crate::PyError::type_error(format!(
             "bin() takes exactly one argument ({} given)",
