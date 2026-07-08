@@ -14848,6 +14848,16 @@ fn try_walker_specialize_newtuple(
     // `W_LongObject` arm `is_plain_int1` also accepts, which would need the
     // long unbox the trait `trace_plain_int_payload` does (out of scope
     // here).  Any other shape falls through to the residual (correct).
+    if pyre_object::tagged_int::CAN_BE_TAGGED
+        && (pyre_object::tagged_int::is_tagged_int(c0)
+            || pyre_object::tagged_int::is_tagged_int(c1))
+    {
+        // A tagged-immediate element has no real header to read for the exact
+        // `&INT_TYPE` ob_type check below, and the spec_ii emit (w_class guard +
+        // typed unbox) is not tag-aware. Fall through to the opaque residual,
+        // which is correct for any element shape.
+        return Ok(None);
+    }
     let int_ty = &pyre_object::pyobject::INT_TYPE as *const pyre_object::pyobject::PyType;
     let both_plain_int = unsafe {
         pyre_object::is_plain_int1(c0)
@@ -16208,9 +16218,13 @@ unsafe fn orthodox_list_append_recognize(
     }
     // Int-storage specialization: plain-int value stored unboxed (a
     // fits-int `W_LongObject` is declined, see note above).
+    // A tagged-immediate value would need a tag-aware unboxed store and no
+    // `w_class` pin; decline to the generic residual append instead.
     let int_ok = pyre_object::w_list_uses_int_storage(inner_self)
         && pyre_object::is_plain_int1(value)
-        && !pyre_object::pyobject::is_long(value);
+        && !pyre_object::pyobject::is_long(value)
+        && !(pyre_object::tagged_int::CAN_BE_TAGGED
+            && pyre_object::tagged_int::is_tagged_int(value));
     // Object-storage extension: any non-null `Ref` value stored into the
     // object items block — no unboxing, so the value carries no type
     // precondition.
