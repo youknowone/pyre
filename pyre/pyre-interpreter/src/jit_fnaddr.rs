@@ -586,6 +586,45 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::objspace::std::mapdict::_obj_getdict",
         crate::objspace::std::mapdict::_obj_getdict as *const (),
     );
+    // #346: the C3 linearization core `compute_mro` carries `#[dont_look_inside]`
+    // — MRO computation is opaque, MRO iteration stays traced. The self-recursive
+    // C3 walk bottoms out in the `vec![w_type]` foreign alloc intrinsic, so it
+    // residualizes; its public wrapper `compute_default_mro` residualizes with
+    // it. Both are Vec-returning residuals with no build-time constant, so bind
+    // their `fn` directly by qualified path.
+    let compute_mro: unsafe fn(pyre_object::PyObjectRef) -> Vec<pyre_object::PyObjectRef> =
+        crate::baseobjspace::compute_mro;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::compute_mro",
+        "pyre_interpreter::compute_mro",
+        compute_mro as *const (),
+    );
+    let compute_default_mro: unsafe fn(pyre_object::PyObjectRef) -> Vec<pyre_object::PyObjectRef> =
+        crate::baseobjspace::compute_default_mro;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::compute_default_mro",
+        "pyre_interpreter::compute_default_mro",
+        compute_default_mro as *const (),
+    );
+    // #346: `lookup_in_type_where_uncached` is the scalar-`Option` residual
+    // boundary over the cold uncached MRO walk. With `compute_mro` opaque,
+    // `lookup_where`'s `mro` phi-merges the cached slice against the opaque
+    // `Vec` borrow (`<other> ∪ _ptr`), a union the annotator cannot model, so
+    // this projection carries `#[dont_look_inside]`. No build-time constant, so
+    // bind its `fn` directly by qualified path.
+    let lookup_in_type_where_uncached: unsafe fn(
+        pyre_object::PyObjectRef,
+        &str,
+    ) -> Option<pyre_object::PyObjectRef> =
+        crate::baseobjspace::lookup_in_type_where_uncached;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::lookup_in_type_where_uncached",
+        "pyre_interpreter::lookup_in_type_where_uncached",
+        lookup_in_type_where_uncached as *const (),
+    );
     // `gc_interp::enabled` reads (and lazily inits) the `STATE` atomic and
     // `longobject::bigint_gc_type_id` reads the init-assigned `BIGINT_GC_TYPE_ID`
     // atomic — neither is a build-time constant, so both carry

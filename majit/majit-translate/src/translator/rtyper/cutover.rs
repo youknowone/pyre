@@ -1279,13 +1279,15 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
         // skips to the legacy walker until per-instantiation classdef
         // specialization lands.
         || msg.contains("cannot unify instances with no common base class")
-        // `model.rs:3061` subset-gap marker — the union pair has no
-        // ported `pair(s1, s2).union()` handler.  Upstream degenerates
-        // such pairs to `SomeObject` (`annmodel` pair(SomeObject,
-        // SomeObject).union, binaryop.py:64-72) instead of erroring,
-        // so any hit here is by construction an unported handler, not
-        // a divergence.  Skip to the legacy walker until the pair is
-        // ported.
+        // The union fallback marker — no arm handles this pair.  Upstream
+        // RAISES for the pairs that reach here: `pair(SomeObject, SomeObject)
+        // .union()` raises (binaryop.py:90-93), `pair(SomePtr, SomeObject)`
+        // raises (llannotation.py:118-120).  So a hit is a pyre PRODUCER
+        // divergence — a boxed `*mut PyObject` lifted as `SomePtr` where
+        // RPython carries `SomeInstance`, making a `SomeInstance ∪ SomePtr`
+        // phi RPython never constructs — not a missing union handler.  Skip
+        // to the legacy walker until the pointer values lift as instances
+        // (typed-Ref ClassDef projection).
         || msg.contains("no upstream pair(s1, s2).union() handler in current subset")
         // `InstanceRepr.getfield` walking the `rbase` chain before the
         // repr's deferred `setup()` ran (upstream drains pending

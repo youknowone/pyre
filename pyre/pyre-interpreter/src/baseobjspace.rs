@@ -5892,9 +5892,24 @@ pub(crate) unsafe fn lookup_where(
 
 /// `lookup_in_type` / `lookup_in_type_where` descriptor-only projection of
 /// [`lookup_where`], for the callers that do not need the defining class.
-/// The raw walk underneath the method cache; also the JIT path (no
-/// thread-local state) so the trace can lower it directly.
-unsafe fn lookup_in_type_where_uncached(w_type: PyObjectRef, name: &str) -> Option<PyObjectRef> {
+/// The raw walk underneath the method cache.
+///
+/// `dont_look_inside` — the scalar-`Option` residual boundary over the cold
+/// uncached MRO walk. [`compute_mro`] is opaque, so [`lookup_where`]'s `mro`
+/// binding phi-merges the cached `&*mro` slice against the freshly computed
+/// opaque `Vec` borrow, a union the annotator cannot model (`<other> ∪ _ptr`).
+/// Residualizing at this `-> Option<PyObjectRef>` projection keeps the phi-merge
+/// out of the traced numeric/unary and lookup-family callers while
+/// [`lookup_where`] itself stays traced (`_lookup_where` typeobject.py:480
+/// `@unroll_safe`). Marker `_jit_look_inside_ = False` (rlib/jit.py:139).
+///
+/// Mirror: the scalar-`Option` residuals in `objspace/std/mapdict.rs`
+/// (`instance_get_dict_slot` -> `Option<PyObjectRef>`).
+#[majit_macros::dont_look_inside]
+pub(crate) unsafe fn lookup_in_type_where_uncached(
+    w_type: PyObjectRef,
+    name: &str,
+) -> Option<PyObjectRef> {
     lookup_where(w_type, name).map(|(_src, value)| value)
 }
 
@@ -6486,6 +6501,24 @@ pub unsafe fn compute_default_mro(w_type: PyObjectRef) -> Vec<PyObjectRef> {
     compute_mro(w_type)
 }
 
+/// C3 linearization core (typeobject.py:1687 `compute_C3_mro`).
+///
+/// `dont_look_inside` — MRO computation is opaque, MRO iteration stays traced.
+/// C3 runs behind `@dont_look_inside` `__init__` (typeobject.py:199); the hot
+/// walk iterates the prebuilt `mro_w` (`_lookup_where` typeobject.py:480
+/// `@unroll_safe`, cache hit `_pure_lookup_where_with_method_cache`
+/// typeobject.py:516-517 `@elidable`, mirrored at
+/// [`_pure_lookup_where_with_method_cache`]). The first statement
+/// `vec![w_type]` lowers to the foreign, non-scalar
+/// `box_assume_init_into_vec_unsafe` alloc intrinsic, which has no annotator
+/// graph, so the entire self-recursive C3 walk residualizes here instead of
+/// blocking every numeric/unary and lookup-family graph that funnels through
+/// the cold uncached [`lookup_where`] branch. Marker `_jit_look_inside_ =
+/// False` (rlib/jit.py:139).
+///
+/// Mirror: the Vec-returning residuals in `objspace/std/mapdict.rs`
+/// (`instance_node_dict_keys` -> `Vec<PyObjectRef>`).
+#[majit_macros::dont_look_inside]
 pub(crate) unsafe fn compute_mro(w_type: PyObjectRef) -> Vec<PyObjectRef> {
     let mut result = vec![w_type];
     let bases = w_type_get_bases(w_type);
