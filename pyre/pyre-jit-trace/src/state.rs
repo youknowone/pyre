@@ -2930,6 +2930,15 @@ pub(crate) fn trace_unbox_int_with_resume<F: crate::walker_frame_ops::WalkerFram
 pub(crate) fn int_or_bool_unbox_type_descr(
     concrete: pyre_object::PyObjectRef,
 ) -> (i64, majit_ir::DescrRef) {
+    if pyre_object::tagged_int::CAN_BE_TAGGED
+        && !concrete.is_null()
+        && pyre_object::tagged_int::is_tagged_int(concrete)
+    {
+        return (
+            &pyre_object::pyobject::INT_TYPE as *const _ as i64,
+            crate::descr::int_intval_descr(),
+        );
+    }
     if !concrete.is_null() && unsafe { pyre_object::is_bool(concrete) } {
         (
             &pyre_object::pyobject::BOOL_TYPE as *const _ as i64,
@@ -2949,6 +2958,25 @@ pub(crate) fn trace_unbox_int_with_resume_descr<F: crate::walker_frame_ops::Walk
     type_addr: i64,
     intval_descr: majit_ir::DescrRef,
 ) -> OpRef {
+    if pyre_object::tagged_int::CAN_BE_TAGGED {
+        if let Some(majit_ir::Value::Ref(r)) = frame.ctx().concrete_of_opref(obj) {
+            if r != majit_ir::GcRef(usize::MAX) {
+                let o = r.as_usize() as pyre_object::PyObjectRef;
+                if !o.is_null() {
+                    if pyre_object::tagged_int::is_tagged_int(o) {
+                        let lowbit = crate::helpers::emit_tag_lowbit_test(frame.ctx_mut(), obj, true);
+                        frame.generate_guard(OpCode::GuardTrue, &[lowbit]);
+                        return crate::helpers::emit_untag_int(
+                            frame.ctx_mut(), obj, pyre_object::tagged_int::untag_int(o),
+                        );
+                    } else {
+                        let lowbit = crate::helpers::emit_tag_lowbit_test(frame.ctx_mut(), obj, false);
+                        frame.generate_guard(OpCode::GuardFalse, &[lowbit]);
+                    }
+                }
+            }
+        }
+    }
     // pyjitpl.py GUARD_CLASS(box, cls): guard takes object box directly,
     // backend loads typeptr at offset 0.
     if !frame.ctx().heap_cache().is_class_known(obj) {

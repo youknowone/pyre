@@ -13716,6 +13716,21 @@ fn walker_unbox_int_typed(
     type_addr: i64,
     intval_descr: majit_ir::DescrRef,
 ) -> Result<OpRef, DispatchError> {
+    if pyre_object::tagged_int::CAN_BE_TAGGED {
+        if let Some(o) = walker_concrete_ref_object(ctx, obj) {
+            if pyre_object::tagged_int::is_tagged_int(o) {
+                let lowbit = crate::helpers::emit_tag_lowbit_test(ctx.trace_ctx, obj, true);
+                walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[lowbit])?;
+                return Ok(crate::helpers::emit_untag_int(
+                    ctx.trace_ctx, obj, pyre_object::tagged_int::untag_int(o),
+                ));
+            } else {
+                let lowbit = crate::helpers::emit_tag_lowbit_test(ctx.trace_ctx, obj, false);
+                walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[lowbit])?;
+                // fall through: boxed leg now deopts (not faults) on a tagged arrival.
+            }
+        }
+    }
     if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
         let type_const = ctx.trace_ctx.const_int(type_addr);
         ctx.trace_ctx

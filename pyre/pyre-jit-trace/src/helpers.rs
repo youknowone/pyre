@@ -844,6 +844,26 @@ pub trait TraceHelperAccess {
     }
 }
 
+/// `ll_unboxed_getclass` low-bit test (rtagged.py:155): IntAnd(CastPtrToInt(obj),1).
+/// Caller emits the GuardTrue (tagged leg) / GuardFalse (boxed leg) via its
+/// path-native guard mechanism. `observed_tagged` stamps the folded bit.
+pub(crate) fn emit_tag_lowbit_test(ctx: &mut TraceCtx, obj: OpRef, observed_tagged: bool) -> OpRef {
+    let as_int = ctx.record_op(OpCode::CastPtrToInt, &[obj]);
+    let one = ctx.const_int(1);
+    let lowbit = ctx.record_op(OpCode::IntAnd, &[as_int, one]);
+    ctx.set_opref_concrete(lowbit, majit_ir::Value::Int(observed_tagged as i64));
+    lowbit
+}
+
+/// `ll_unboxed_to_int` (rtagged.py:147): arithmetic IntRshift(CastPtrToInt(obj),1).
+pub(crate) fn emit_untag_int(ctx: &mut TraceCtx, obj: OpRef, value: i64) -> OpRef {
+    let as_int = ctx.record_op(OpCode::CastPtrToInt, &[obj]);
+    let one = ctx.const_int(1);
+    let raw = ctx.record_op(OpCode::IntRshift, &[as_int, one]);
+    ctx.set_opref_concrete(raw, majit_ir::Value::Int(value));
+    raw
+}
+
 /// Emit inline W_Int creation (NewWithVtable + SetfieldGc).
 ///
 /// jtransform.py:908-911 rewrite_op_setfield: setfield on typeptr is dropped
