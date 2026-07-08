@@ -9,12 +9,11 @@
 //! steady-state execution. The call-area offsets and panic-message recovery
 //! are shared with `main.rs`.
 
-use std::collections::HashMap;
 use std::path::Path;
 
 use wasmi::{
     AsContext, AsContextMut, Caller, Config, Engine, Extern, F32, F64, Func, Linker, Memory,
-    Module, Ref, Store, Table, Val, ValType,
+    Module, Nullable, Ref, Store, Table, Val, ValType,
 };
 
 use crate::{CALL_ARGS_OFS, CALL_FUNC_OFS, CALL_RESULT_OFS};
@@ -26,8 +25,14 @@ use crate::{CALL_ARGS_OFS, CALL_FUNC_OFS, CALL_RESULT_OFS};
 struct Host {
     memory: Option<Memory>,
     table: Option<Table>,
-    traces: HashMap<u32, Func>,
-    next_id: u32,
+    /// First `__indirect_function_table` slot that is a JIT trace. Slots
+    /// `[0, trace_base)` are the main module's own functions; `jit_compile`
+    /// only appends (`table.grow`), so the slot index IS the trace id and the
+    /// shared table is the single source of trace liveness (a freed trace's
+    /// slot is reset to `Ref::Func(Null)`). This mirrors the wasmtime path so
+    /// a trace's in-module `call_indirect` and the host `jit_execute` resolve
+    /// through the same table.
+    trace_base: u64,
     stdlib_root: Option<String>,
     engine: Option<Engine>,
 }
@@ -38,11 +43,11 @@ fn estr(e: impl std::fmt::Display) -> String {
 
 /// Reported when wasmi's translator declines a main-module function. Not a pyre
 /// bug; the program is runnable under wasmtime.
-const WASMI_TRANSLATOR_DECLINE: &str = "wasmi could not translate this module (cmp+branch fusion assertion in wasmi 1.x); \
+const WASMI_TRANSLATOR_DECLINE: &str = "wasmi could not translate this module (internal translator assertion); \
      run this program with `--engine wasmtime`";
 
 /// True for panics raised by wasmi's own bytecode translator (e.g. the
-/// `cmp+branch fusion must succeed` assertion in wasmi 1.x). Such a panic is a
+/// `cmp+branch fusion must succeed` assertion). Such a panic is a
 /// wasmi limitation translating a module function, not a pyre bug; `run`
 /// catch_unwinds it into the clean WASMI_TRANSLATOR_DECLINE error.
 fn is_wasmi_translator_panic(msg: &str) -> bool {
@@ -89,7 +94,6 @@ pub fn run(module_path: &Path, source: &str) -> Result<i32, String> {
     let module = Module::new(&engine, &bytes[..]).map_err(|e| format!("compile module: {e}"))?;
 
     let mut store = Store::new(&engine, Host::default());
-    store.data_mut().next_id = 1;
     store.data_mut().stdlib_root = std::env::var("PYRE_STDLIB").ok();
     store.data_mut().engine = Some(engine.clone());
 
@@ -110,6 +114,9 @@ pub fn run(module_path: &Path, source: &str) -> Result<i32, String> {
     )?;
     store.data_mut().memory = Some(memory);
     store.data_mut().table = Some(table);
+    // Slots below the main module's current table size are its own functions;
+    // every trace appended by `jit_compile` lands at or above this base.
+    store.data_mut().trace_base = table.size(&store);
 
     let alloc = instance
         .get_typed_func::<u32, u32>(&store, "pyre_alloc")
@@ -131,7 +138,7 @@ pub fn run(module_path: &Path, source: &str) -> Result<i32, String> {
         p
     };
 
-    // wasmi 1.x translates each module function lazily on first use, and its
+    // wasmi translates each module function lazily on first use, and its
     // translator can hit an internal assertion (`cmp+branch fusion must
     // succeed`) on some rustc-emitted functions. That is a wasmi limitation,
     // not a pyre bug, and unlike a JIT trace a main-module function cannot be
@@ -210,7 +217,15 @@ fn build_linker(engine: &Engine) -> Result<Linker<Host>, String> {
             "pyre_jit",
             "jit_free_wasm",
             |mut caller: Caller<'_, Host>, func_id: u32| {
-                caller.data_mut().traces.remove(&func_id);
+                // Only a trace slot may be cleared; nulling a main-module slot
+                // (`id < trace_base`) would corrupt the shared dispatch table.
+                // The slot stays (wasm tables cannot shrink); only the trace
+                // function reference is released.
+                if (func_id as u64) >= caller.data().trace_base {
+                    if let Some(table) = caller.data().table {
+                        let _ = table.set(&mut caller, func_id as u64, Ref::Func(Nullable::Null));
+                    }
+                }
             },
         )
         .map_err(estr)?;
@@ -388,14 +403,20 @@ fn jit_compile(
         },
     );
 
-    // Supply imports by name; a trace that imports only `env.memory` simply
-    // leaves the defined `env.jit_call` unused.
+    // Supply imports by name; a trace that imports only a subset (e.g. just
+    // `env.memory`) leaves the other defines unused. `__indirect_function_table`
+    // is the main module's shared table so the trace's `call_indirect` and the
+    // host `jit_execute` dispatch through the same slots.
+    let table = caller.data().table.ok_or("main table not initialized")?;
     let mut linker = Linker::new(&engine);
     linker
         .define("env", "memory", Extern::Memory(memory))
         .map_err(estr)?;
     linker
         .define("env", "jit_call", Extern::Func(jit_call))
+        .map_err(estr)?;
+    linker
+        .define("env", "__indirect_function_table", Extern::Table(table))
         .map_err(estr)?;
     let instance = linker
         .instantiate_and_start(&mut *caller, &module)
@@ -404,20 +425,40 @@ fn jit_compile(
         .get_func(&*caller, "trace")
         .ok_or("trace module is missing its `trace` export")?;
 
-    let host = caller.data_mut();
-    let id = host.next_id;
-    host.next_id += 1;
-    host.traces.insert(id, trace);
-    Ok(id)
+    // Append the trace to the shared table; `grow` returns the previous size,
+    // i.e. the index of the newly appended entry, which becomes its id.
+    let slot = table
+        .grow(&mut *caller, 1, Ref::Func(Nullable::Val(trace)))
+        .map_err(|e| format!("register trace into shared table: {e}"))? as u32;
+    Ok(slot)
 }
 
 /// Run a previously compiled trace, returning its guard-exit index.
 fn jit_execute(caller: &mut Caller<'_, Host>, func_id: u32, frame_ptr: u32) -> Result<u32, String> {
-    let trace = *caller
-        .data()
-        .traces
-        .get(&func_id)
-        .ok_or_else(|| format!("jit_execute_wasm: unknown func id {func_id}"))?;
+    if (func_id as u64) < caller.data().trace_base {
+        return Err(format!(
+            "jit_execute_wasm: id {func_id} is not a trace slot"
+        ));
+    }
+    let table = caller.data().table.ok_or("main table not initialized")?;
+    // The id IS the table slot; dispatch through the shared table by index —
+    // the same lookup an in-module `call_indirect` would perform. A freed trace
+    // (slot reset to `Ref::Func(Null)`) or out-of-range id misses here.
+    let trace = match table.get(&*caller, func_id as u64) {
+        Some(Ref::Func(nf)) => match nf.val() {
+            Some(f) => *f,
+            None => {
+                return Err(format!(
+                    "jit_execute_wasm: id {func_id} is a freed trace slot"
+                ));
+            }
+        },
+        _ => {
+            return Err(format!(
+                "jit_execute_wasm: id {func_id} is not a live trace"
+            ));
+        }
+    };
 
     // A wasmi translator panic during the trace's first call (lazy translation)
     // unwinds up through `run_python.call`'s catch_unwind in `run`, which turns
@@ -450,7 +491,7 @@ fn jit_call_trampoline(caller: &mut Caller<'_, Host>, frame_ptr: u32) -> Result<
     }
 
     let func = match table.get(&*caller, func_ptr as u64) {
-        Some(Val::FuncRef(fr)) => match func_of(&fr) {
+        Some(Ref::Func(fr)) => match func_of(&fr) {
             Some(f) => f,
             None => {
                 write_i64(&memory, &mut *caller, frame + CALL_RESULT_OFS, 0)?;
@@ -511,7 +552,7 @@ fn jit_call_trampoline(caller: &mut Caller<'_, Host>, frame_ptr: u32) -> Result<
 }
 
 /// Resolve a funcref to its `Func`, copying the lightweight handle out.
-fn func_of(fr: &Ref<Func>) -> Option<Func> {
+fn func_of(fr: &Nullable<Func>) -> Option<Func> {
     fr.val().copied()
 }
 
