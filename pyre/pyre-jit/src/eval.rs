@@ -3711,7 +3711,18 @@ fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
     );
     match unsupported_jit_shape(code) {
         UnsupportedJitShape::None => {}
-        UnsupportedJitShape::CurrentFrameOnly => return frame.execute_frame(None, None),
+        UnsupportedJitShape::CurrentFrameOnly => {
+            // A FOR_ITER frame the #57 gate cannot trace (a non-journalable
+            // mutator body, or a `finally`-duplicated loop): run it in the plain
+            // interpreter.  The tracer never sees it, so record the frame-shape
+            // decline in the census (deduped per code object) — otherwise a hot
+            // loop declined here reads as a silent no-token gap, indistinguishable
+            // from a loop the JIT never noticed.
+            pyre_jit_trace::jitcode_dispatch::census_record_frame_shape_decline(
+                code as *const _ as usize,
+            );
+            return frame.execute_frame(None, None);
+        }
     }
     frame.fix_array_ptrs();
     // Set CURRENT_FRAME so zero-arg super() can find __class__ in the caller.

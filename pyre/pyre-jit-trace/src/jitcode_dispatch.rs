@@ -1281,6 +1281,31 @@ pub(crate) fn census_record(name: &'static str) {
     census_dump();
 }
 
+thread_local! {
+    /// Code objects already counted by
+    /// [`census_record_frame_shape_decline`], so a `CurrentFrameOnly` code
+    /// entered many times (a hot helper) records exactly one census entry
+    /// instead of one per call.  Keyed by the stable `CodeObject` pointer.
+    static FRAME_SHAPE_DECLINE_SEEN: std::cell::RefCell<std::collections::BTreeSet<usize>> =
+        const { std::cell::RefCell::new(std::collections::BTreeSet::new()) };
+}
+
+/// Record — once per distinct code object — the frame-shape decline of a frame
+/// that `unsupported_jit_shape` keeps out of the tracer entirely (a
+/// `CurrentFrameOnly` FOR_ITER frame: either a body with a non-journalable
+/// mutator — the #57 gate — or a `finally`-duplicated loop).  The tracer never
+/// runs for such a frame, so its decline would otherwise leave no census entry
+/// and read as a silent no-token gap; recording it here lets the
+/// `PYRE_FBW_DEBUG_ABORT` corpus attribute the pre-trace frame-shape decline
+/// alongside the traced declines.  `code_ptr` is the `CodeObject` pointer, used
+/// only to dedup repeated entries of the same declined frame.
+pub fn census_record_frame_shape_decline(code_ptr: usize) {
+    let first = FRAME_SHAPE_DECLINE_SEEN.with(|s| s.borrow_mut().insert(code_ptr));
+    if first {
+        census_record("FrameShape::CurrentFrameOnly");
+    }
+}
+
 /// Print the accumulated decline census as `[fbw-census] <name>: <count>`
 /// lines, sorted by name.  No-op unless [`fbw_debug_abort_enabled`].
 /// Safe to call repeatedly (a diagnostic dump, not a reset).
