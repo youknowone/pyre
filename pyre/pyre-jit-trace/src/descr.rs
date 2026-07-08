@@ -1873,7 +1873,13 @@ static W_OBJECT_OBJECT_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::n
             (
                 "W_ObjectObject.map",
                 core::mem::offset_of!(pyre_object::W_ObjectObject, map),
-                8,
+                // `map` is a `*const MapNode` erased to an opaque Int word, so
+                // its width is one machine word — 4 bytes on wasm32, 8 on
+                // 64-bit. Hardcoding 8 would read/write past the field on
+                // wasm32, folding the adjacent `storage` pointer into the high
+                // half of a `guard_value(map)` load (and clobbering it on a
+                // `setfield_gc(map)` store).
+                core::mem::size_of::<usize>(),
                 Type::Int,
                 false,
                 false,
