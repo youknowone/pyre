@@ -55,6 +55,7 @@ crate::py_module! {
         "register_error"   / 2 = |_| Ok(w_none()),
         "_unregister_error" / 1 = |_| Ok(w_bool_from(false)),
         "register"       / 1 = |_| Ok(w_none()),
+        "unregister"     / 1 = |_| Ok(w_none()),
         "lookup"         / 1 = |_| Ok(w_none()),
         "_forget_codec"  / 1 = |args| Ok(args.first().copied().unwrap_or(w_none())),
         "charmap_build"  / 1 = |_| Ok(w_dict_new()),
