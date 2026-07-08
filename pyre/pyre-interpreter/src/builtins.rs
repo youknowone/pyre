@@ -5761,9 +5761,10 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     let source = bind_pos_or_kw(pos, kwargs, 0, "source", "compile", 1)?.ok_or_else(|| {
         crate::PyError::type_error("compile() missing required argument 'source' (pos 1)")
     })?;
-    let filename_obj = bind_pos_or_kw(pos, kwargs, 1, "filename", "compile", 2)?.ok_or_else(|| {
-        crate::PyError::type_error("compile() missing required argument 'filename' (pos 2)")
-    })?;
+    let filename_obj =
+        bind_pos_or_kw(pos, kwargs, 1, "filename", "compile", 2)?.ok_or_else(|| {
+            crate::PyError::type_error("compile() missing required argument 'filename' (pos 2)")
+        })?;
     let mode_obj = bind_pos_or_kw(pos, kwargs, 2, "mode", "compile", 3)?.ok_or_else(|| {
         crate::PyError::type_error("compile() missing required argument 'mode' (pos 3)")
     })?;
@@ -5833,8 +5834,10 @@ fn builtin_exec(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         ));
     }
     let source = pos[0];
-    let globals_arg = bind_pos_or_kw(pos, kwargs, 1, "globals", "exec", 2)?.unwrap_or(pyre_object::PY_NULL);
-    let locals_arg = bind_pos_or_kw(pos, kwargs, 2, "locals", "exec", 3)?.unwrap_or(pyre_object::PY_NULL);
+    let globals_arg =
+        bind_pos_or_kw(pos, kwargs, 1, "globals", "exec", 2)?.unwrap_or(pyre_object::PY_NULL);
+    let locals_arg =
+        bind_pos_or_kw(pos, kwargs, 2, "locals", "exec", 3)?.unwrap_or(pyre_object::PY_NULL);
     if let Some(closure) = kwarg_get(kwargs, "closure") {
         if !unsafe { pyre_object::is_none(closure) } {
             return Err(crate::PyError::type_error(
@@ -5858,8 +5861,10 @@ fn builtin_eval(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         ));
     }
     let source = pos[0];
-    let globals_arg = bind_pos_or_kw(pos, kwargs, 1, "globals", "eval", 2)?.unwrap_or(pyre_object::PY_NULL);
-    let locals_arg = bind_pos_or_kw(pos, kwargs, 2, "locals", "eval", 3)?.unwrap_or(pyre_object::PY_NULL);
+    let globals_arg =
+        bind_pos_or_kw(pos, kwargs, 1, "globals", "eval", 2)?.unwrap_or(pyre_object::PY_NULL);
+    let locals_arg =
+        bind_pos_or_kw(pos, kwargs, 2, "locals", "eval", 3)?.unwrap_or(pyre_object::PY_NULL);
     exec_or_eval(source, globals_arg, locals_arg, true)
 }
 
