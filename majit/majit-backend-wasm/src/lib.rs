@@ -1380,6 +1380,20 @@ impl majit_backend::Backend for WasmBackend {
             return Err(BackendError::Unsupported(reason));
         }
 
+        // Decline bridges that re-enter the interpreter through a may-force
+        // residual call. Such a bridge reconstructs the interpreter value stack
+        // from its inputargs before the CallMayForce; on wasm a float-const
+        // dividend materialises as NULL through that inputarg path, so the
+        // re-entered interpreter runs `truediv(NULL, int)` and raises a spurious
+        // `unsupported operand type(s) for /`. Native never compiles this
+        // side-trace — it blackholes the deopt instead. Declining here routes
+        // the deopt back through the blackhole interpreter, matching native.
+        if ops.iter().any(|op| op.opcode.is_call_may_force()) {
+            return Err(BackendError::Unsupported(
+                "wasm backend: bridge with CallMayForce interpreter re-entry".into(),
+            ));
+        }
+
         // The source guard this bridge attaches to. `fail_index` is its index in
         // the source loop's `fail_descrs` / cell array; `trace_id` identifies the
         // owning trace.
