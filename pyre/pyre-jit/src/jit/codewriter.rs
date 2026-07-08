@@ -4726,9 +4726,8 @@ fn build_slot_disjoint_interference(
     canonical_slot: &[Option<u16>],
 ) -> Vec<(super::flow::VariableId, super::flow::VariableId)> {
     use super::flow::VariableId;
-    let slot_of = |id: VariableId| -> Option<u16> {
-        canonical_slot.get(id.0 as usize).copied().flatten()
-    };
+    let slot_of =
+        |id: VariableId| -> Option<u16> { canonical_slot.get(id.0 as usize).copied().flatten() };
     fn find(parent: &mut HashMap<VariableId, VariableId>, x: VariableId) -> VariableId {
         let mut root = x;
         while let Some(&p) = parent.get(&root) {
@@ -6101,6 +6100,16 @@ impl CodeWriter {
         // precise liveness generation. Stack registers stack_base..stack_base+depth
         // are live at each PC.
         let mut depth_at_pc: Vec<u16> = vec![0; num_instrs];
+        // Per-PC top-of-stack graph Variable at the resume-depth (pre-dispatch)
+        // FrameState, captured at the same program point `depth_at_pc[py_pc]` is
+        // set. `result_color_at_pc` reads the call-result operand slot's colour
+        // from this Variable's canonical splice colour directly, so the capture
+        // never inverts the walker slot map: the call result is not resume-live
+        // (no `pcdep` entry), but the top-of-stack Variable at a call's
+        // fallthrough pc IS the call op's result. `None` where top-of-stack is a
+        // constant / sentinel rather than a Variable.
+        let mut top_of_stack_var_at_pc: Vec<Option<super::flow::VariableId>> =
+            vec![None; num_instrs];
         // Stage 1a (#348, ADDITIVE / gated by `PYRE_PCDEP_VALIDATE`):
         // per-PC snapshot of `slot -> SSA Variable.id` taken from the
         // post-opcode FrameState. The splice regalloc derives the
@@ -7420,6 +7429,14 @@ impl CodeWriter {
                     // `-live-` positions for `pc_map` population are
                     // derived from the spliced SSARepr at finalize time.
                     depth_at_pc[py_pc] = current_depth;
+                    // Record the top-of-stack Variable at this pre-dispatch
+                    // depth so `result_color_at_pc` can source the call-result
+                    // slot colour graph-directly (last write wins on re-walk,
+                    // matching `depth_at_pc`).
+                    top_of_stack_var_at_pc[py_pc] = match current_state.stack.last() {
+                        Some(super::flow::FlowValue::Variable(v)) => Some(v.id),
+                        _ => None,
+                    };
 
                     // #355 B2: snapshot `slot -> Variable.id` from the
                     // PRE-dispatch (resume-depth) FrameState, the state a guard
@@ -12557,27 +12574,28 @@ impl CodeWriter {
         // multiframe capture (`compute_inline_caller_frame`) finds the
         // not-yet-produced result register. The call-result slot is not a
         // live Variable at the return PC, so it carries no `pcdep_color_slots`
-        // entry; source its color directly from the operand-stack slot's
-        // post-regalloc canonical Ref color. With the input-arg pinning
-        // removed (`enforce_input_args` no longer rotates stack slots), the
-        // chordal coloring may coalesce disjointly-live stack slots into the
-        // same color, so read the per-slot color rather than assume
-        // `color == slot`. `u16::MAX` where the stack is empty or `depth - 1`
-        // is past the static peak (`code.max_stackdepth` = CPython
-        // `co_stacksize`), which the runtime decoder treats as "no result
-        // slot".
+        // entry; source its color directly from the graph Variable occupying
+        // top-of-stack at that pc's resume-depth state, whose canonical Ref
+        // color the splice coloring holds. The top-of-stack Variable at a
+        // call's fallthrough pc IS the call op's result. This reads the
+        // per-Variable splice color, not a slot inversion, so a stack slot
+        // reused by differently-colored Variables across pcs resolves to each
+        // pc's own result color. `u16::MAX` where the stack is empty, `depth -
+        // 1` is past the static peak (`code.max_stackdepth` = CPython
+        // `co_stacksize`), or top-of-stack is a constant/sentinel — all of
+        // which the runtime decoder treats as "no result slot".
+        let ref_coloring = &splice_regallocs[Kind::Ref.index()].coloring;
         let result_color_at_pc: Vec<u16> = depth_at_pc
             .iter()
-            .map(|&d| {
+            .enumerate()
+            .map(|(pc, &d)| {
                 let d = d as usize;
                 if d == 0 || d - 1 >= max_stackdepth {
-                    u16::MAX
-                } else {
-                    super::regalloc::rename_lookup(
-                        &alloc_result.rename,
-                        Kind::Ref,
-                        slot_pre_color(stack_base + (d - 1) as u16),
-                    )
+                    return u16::MAX;
+                }
+                match top_of_stack_var_at_pc[pc] {
+                    Some(vid) => ref_coloring.get(&vid).copied().unwrap_or(u16::MAX),
+                    None => u16::MAX,
                 }
             })
             .collect();
