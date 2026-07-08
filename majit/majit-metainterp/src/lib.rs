@@ -124,9 +124,8 @@ pub use pyjitpl::{
     JitCodeSym, JitHooks, JitStats, MIFrame, MIFrameStack, MetaInterp, MetaInterpGlobalData,
     MetaInterpStaticData, RawCompileResult, StandaloneFrameStack, authoritative_executor_enabled,
     build_state_field_snapshot, call_int_function, call_ref_function, call_void_function, counters,
-    single_pass_enabled, struct_field_write_effect_info, trace_jitcode, trace_jitcode_observer,
-    trace_jitcode_observer_with_args, trace_jitcode_observer_with_args_and_runtime,
-    trace_jitcode_with_args, trace_jitcode_with_args_and_runtime,
+    single_pass_enabled, struct_field_write_effect_info, trace_jitcode, trace_jitcode_with_args,
+    trace_jitcode_with_args_and_runtime,
 };
 pub use quasiimmut::QuasiImmut;
 pub use trace_ctx::BridgeInlineCarrier;

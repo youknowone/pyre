@@ -168,7 +168,7 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
             // Dispatch JitCode reads `program` and `pc` as caller-provided
             // IR arguments (matching the (Ref, Int) prefix of `reds` declared
             // by `__declare_jit_schema_*` and consumed by
-            // `trace_jitcode_observer_with_args`).
+            // `trace_jitcode_with_args`).
             let mut __jitcode_args: ::std::vec::Vec<(
                 majit_metainterp::JitArgKind,
                 majit_ir::OpRef,
@@ -189,7 +189,7 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
                 __pc_bits,
             ));
             #push_virtualizable_argbox
-            let __result = majit_metainterp::trace_jitcode_observer_with_args_and_runtime(
+            let __result = majit_metainterp::trace_jitcode_with_args_and_runtime(
                 __ctx,
                 __sym,
                 &__jitcode,

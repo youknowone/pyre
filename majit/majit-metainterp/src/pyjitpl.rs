@@ -5,9 +5,8 @@ pub use dispatch::build_state_field_snapshot;
 pub use dispatch::{
     ClosureRuntime, ClosureRuntimeWithResolver, JitCodeMachine, JitCodeRuntime, JitCodeSym,
     StandaloneFrameStack, authoritative_executor_enabled, single_pass_enabled,
-    struct_field_write_effect_info, trace_jitcode, trace_jitcode_observer,
-    trace_jitcode_observer_with_args, trace_jitcode_observer_with_args_and_runtime,
-    trace_jitcode_with_args, trace_jitcode_with_args_and_runtime,
+    struct_field_write_effect_info, trace_jitcode, trace_jitcode_with_args,
+    trace_jitcode_with_args_and_runtime,
 };
 pub use dispatch::{build_vable_snapshot_boxes, build_vref_snapshot_boxes};
 pub use dispatch::{call_int_function, call_ref_function, call_void_function};

@@ -1798,7 +1798,7 @@ where
         //
         // Prefer `self.outer_program_pc` when supplied — entries that
         // go through `MIFrame::setup_call` between `MIFrame::setup` and
-        // `run_to_end` (e.g. `trace_jitcode` / `trace_jitcode_observer`
+        // `run_to_end` (e.g. the `trace_jitcode` / `trace_jitcode_with_args`
         // wrappers) capture the outer pc BEFORE the `setup_call` reset
         // (`frame.rs:946 self.pc = 0`).  Without that, the portal-op
         // bookkeeping and diagnostics would anchor on the freshly-zeroed
@@ -6642,61 +6642,6 @@ where
     machine.run_to_end(ctx, sym, runtime)
 }
 
-/// Entry the `#[jit_interp]`-generated `__trace_*` wrappers call to run the
-/// JitCode dispatch walk. The walk is the sole executor: `run_one_step`
-/// executes concrete-side residual function-pointer calls (BC_CALL_INT /
-/// BC_RESIDUAL_CALL_VOID and friends) for real and records the matching trace
-/// IR call op for compiled-trace runtime. A thin alias for [`trace_jitcode`]
-/// kept so the generated wrappers' call site is unchanged.
-pub fn trace_jitcode_observer<S, FLabel>(
-    ctx: &mut TraceCtx,
-    sym: &mut S,
-    jitcode: &JitCode,
-    pc: usize,
-    label_at: FLabel,
-) -> TraceAction
-where
-    S: JitCodeSym,
-    FLabel: Fn(usize) -> usize,
-{
-    trace_jitcode_observer_with_args(ctx, sym, jitcode, pc, label_at, &[])
-}
-
-/// Walk-entry alias for [`trace_jitcode_with_args`].
-pub fn trace_jitcode_observer_with_args<S, FLabel>(
-    ctx: &mut TraceCtx,
-    sym: &mut S,
-    jitcode: &JitCode,
-    pc: usize,
-    label_at: FLabel,
-    argboxes: &[(JitArgKind, OpRef, i64)],
-) -> TraceAction
-where
-    S: JitCodeSym,
-    FLabel: Fn(usize) -> usize,
-{
-    trace_jitcode_with_args(ctx, sym, jitcode, pc, label_at, argboxes)
-}
-
-/// Walk-entry alias for [`trace_jitcode_with_args_and_runtime`] — the
-/// production wire-up entry the macro-generated `__trace_*` wrapper calls so
-/// the dispatcher's `BC_CALL_ASSEMBLER_*` path can resolve targets through the
-/// real warmstate-backed `Arc<JitCellToken>` rather than the synth-Arc
-/// fallback.
-pub fn trace_jitcode_observer_with_args_and_runtime<S, R>(
-    ctx: &mut TraceCtx,
-    sym: &mut S,
-    jitcode: &JitCode,
-    pc: usize,
-    runtime: &R,
-    argboxes: &[(JitArgKind, OpRef, i64)],
-) -> TraceAction
-where
-    S: JitCodeSym,
-    R: JitCodeRuntime,
-{
-    trace_jitcode_with_args_and_runtime(ctx, sym, jitcode, pc, runtime, argboxes)
-}
 
 /// `b1 is b2` crude fastpath result for comparison opcodes —
 /// `pyjitpl.py:56-63` `FASTPATHS_SAME_BOXES`. Returns the constant
