@@ -9171,6 +9171,25 @@ pub(crate) fn m73_perop_audit_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_M73_PEROP_AUDIT").is_some())
 }
 
+/// `PYRE_M73_BRANCH_AUDIT` (#73 S3 phase-0, default OFF): census that, for a
+/// depth-0 branch guard (`GuardTrue`/`GuardFalse`), measures whether carrying
+/// the walk's genuine JitCode resume coordinate `op_pc` (== the branch
+/// `other_target` produced by `resolve_branch_target_through_trampoline`)
+/// directly would be byte-behavior-safe versus today's py_pc round-trip marker
+/// (`resume_jitcode_pc_for(py_pc)`). Emits one `M73_BRANCH` line per depth-0
+/// branch capture: `eq=1` when `op_pc` coincides with the marker (carry is a
+/// byte-identical re-source), `eq=0 ...` with per-consumer agreement at
+/// `op_pc` vs `marker` (liveness banks + bridge maps + const refill), a direct
+/// `python_pc_for_jitcode_pc(op_pc)`-vs-`py_pc` probe (the marker path applies
+/// `skip_python_trivia_forward`, this inverse does not — it is the real signal
+/// because a non-decodable `op_pc` self-masks the consumers back to the py_pc
+/// baseline), and the `can_decode_live_vars(op_pc)` flag; or `eq=nomarker`
+/// when `py_pc` carries no resume entry. Off in production.
+pub(crate) fn m73_branch_audit_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_M73_BRANCH_AUDIT").is_some())
+}
+
 /// `PYRE_M73_PEROP_CARRY` (#73 S2, default ON): source a specialization
 /// guard's (`GuardValue`/`GuardClass`) resume coordinate from the walk
 /// cursor's per-op `-live-` BEFORE anchor (`ctx.live_before_jit_pc`,
@@ -10592,6 +10611,115 @@ fn walker_capture_snapshot_for_last_guard_impl(
                                     "M73_PEROP_SPEC eq=0 py_pc={} lb={} bh={} banks_eq={} \
                                      bmaps_eq={} const_eq={}",
                                     py_pc, lb, bh, banks_eq, bmaps_eq, const_eq
+                                );
+                            }
+                        }
+                    }
+                }
+                // #73 S3 phase-0 census: for a depth-0 branch guard
+                // (`GuardTrue`/`GuardFalse`) measure whether carrying the walk's
+                // genuine JitCode resume coordinate `op_pc` (== `other_target`)
+                // directly is byte-behavior-safe versus today's py_pc round-trip
+                // marker (`resume_jitcode_pc_for(py_pc)`). This arm is enclosed
+                // by `!inline_subwalk && !full_body_sym.is_null()`, and depth-0
+                // is guaranteed because kept-stack (depth>0) branch guards set
+                // `BRANCH_GUARD_JITCODE_PC` and take the raw-`op.pc` arm above
+                // instead. Unlike the specialization census it compares against
+                // `marker` (the ACTUAL carried word), not `NO_JITCODE_PC`, and
+                // adds a DIRECT `python_pc_for_jitcode_pc(op_pc)`-vs-`py_pc`
+                // probe to defeat the `can_decode_live_vars` self-masking that
+                // would otherwise report false agreement for a non-decodable
+                // `op_pc`. Read-only: nothing here mutates the carried word.
+                //
+                // Phase-0 corpus result (1506 captures): `op_pc == marker` in
+                // ~31% (a vacuous re-source — `marker` is still derived), and in
+                // the ~69% divergent majority `op_pc` is NON-decodable
+                // (`can_decode_live_vars == false`) so a decoder consuming it
+                // ignores it and falls back to the py_pc path
+                // (`resolve_resume_pc_with_jitcode_pc`, pyjitcode.rs), which
+                // diverges from the `marker` path in the bridge maps / const
+                // refill. The walk's raw `other_target` is therefore NOT a
+                // byte-identical substitute for `marker`: the
+                // `resume_jitcode_pc_for(py_pc)` normalization to the decodable
+                // block-head `-live-` marker is load-bearing, not a removable
+                // round-trip. Retiring it for the branch family needs a
+                // jitcode-keyed resume-marker twin (author the block-head marker
+                // in jitcode space), not a raw-target carry.
+                if m73_branch_audit_enabled() {
+                    let is_branch = matches!(
+                        ctx.trace_ctx.last_guard_opcode(),
+                        Some(OpCode::GuardTrue | OpCode::GuardFalse)
+                    );
+                    if is_branch {
+                        match marker {
+                            None => {
+                                eprintln!(
+                                    "M73_BRANCH eq=nomarker py_pc={} op_pc={}",
+                                    py_pc, op_pc
+                                );
+                            }
+                            Some(m) if op_pc == m => {
+                                eprintln!("M73_BRANCH eq=1 py_pc={} op_pc={}", py_pc, op_pc);
+                            }
+                            Some(m) => {
+                                // op_pc != marker: probe the two divergence
+                                // sources and every consumer.
+                                let ji = jitcode_index as i32;
+                                let pp = py_pc as i32;
+                                // (1) direct skip_trivia-asymmetry / decodability
+                                //     probe on op_pc. `python_pc_for_jitcode_pc`
+                                //     has NO skip_trivia; `py_pc` DID get it.
+                                //     Also record `can_decode_live_vars(op_pc)` — a
+                                //     non-decodable op_pc makes the consumers below
+                                //     silently fall back to the pp baseline
+                                //     (self-masking), so `inv_*` is the real signal.
+                                let (inv_pp, decodable) = unsafe {
+                                    let jc = &*sym.jitcode;
+                                    let inv =
+                                        python_pc_for_jitcode_pc(&jc.payload.metadata, op_pc);
+                                    let dec = jc
+                                        .payload
+                                        .jitcode
+                                        .can_decode_live_vars(op_pc, crate::state::op_live());
+                                    (inv, dec)
+                                };
+                                let inv_eq = inv_pp == py_pc;
+                                // (2) per-consumer agreement at op_pc vs marker
+                                //     (baseline = m, NOT NO_JITCODE_PC).
+                                let banks_o =
+                                    crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
+                                        ji, pp, op_pc as i32,
+                                    );
+                                let banks_m =
+                                    crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
+                                        ji, pp, m as i32,
+                                    );
+                                let banks_eq = banks_o.int == banks_m.int
+                                    && banks_o.ref_ == banks_m.ref_
+                                    && banks_o.float == banks_m.float;
+                                let bm_o = crate::state::bridge_semantic_maps_at_with_jitcode_pc(
+                                    ji, pp, op_pc as i32,
+                                );
+                                let bm_m = crate::state::bridge_semantic_maps_at_with_jitcode_pc(
+                                    ji, pp, m as i32,
+                                );
+                                let bmaps_eq = bm_o.stack_depth_at_pc == bm_m.stack_depth_at_pc
+                                    && bm_o.pcdep_entries == bm_m.pcdep_entries;
+                                let const_eq =
+                                    crate::state::const_ref_slots_at_pc_at(ji, pp, op_pc as i32)
+                                        == crate::state::const_ref_slots_at_pc_at(ji, pp, m as i32);
+                                eprintln!(
+                                    "M73_BRANCH eq=0 py_pc={} op_pc={} marker={} inv_pp={} \
+                                     inv_eq={} decodable={} banks_eq={} bmaps_eq={} const_eq={}",
+                                    py_pc,
+                                    op_pc,
+                                    m,
+                                    inv_pp,
+                                    inv_eq,
+                                    decodable,
+                                    banks_eq,
+                                    bmaps_eq,
+                                    const_eq
                                 );
                             }
                         }
