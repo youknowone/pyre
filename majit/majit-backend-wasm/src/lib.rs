@@ -1413,7 +1413,7 @@ impl majit_backend::Backend for WasmBackend {
             source_loop_finish_fi,
             source_compiled_ptr,
             source_ca_active,
-            source_has_bridges,
+            _source_has_bridges,
         ) = {
             let source_loop = original_token
                 .compiled
@@ -1513,15 +1513,6 @@ impl majit_backend::Backend for WasmBackend {
         // guard then fails codegen's CALL_ASSEMBLER handling — a deterministic
         // decline.
         let allow_ca = allow_ca && source_is_direct;
-        // The CA arm and further bridge chaining do not compose yet: a chained
-        // bridge deopting inside the CA recursion trips a resume seam that
-        // reads a clobbered class (wrong output on suite
-        // `recursion_memo_branch` / `generator_tree_recursion`; each mechanism
-        // alone is correct). Until that seam is fixed, a recursion gets ONE of
-        // the two: the CA lift only for a loop with no chained bridges yet,
-        // and no further chaining once the CA cell is live — the declined
-        // guard falls back to host round-trips, which handle it correctly.
-        let allow_ca = allow_ca && !source_has_bridges;
         if !allow_ca && source_ca_active {
             diag_bump(14); // declined: source recursion is CA-active
             return Err(BackendError::Unsupported(
@@ -1988,10 +1979,10 @@ impl majit_backend::Backend for WasmBackend {
                     force_token_slots: Vec::new(),
                     recovery_layout: None,
                     frame_stack: None,
-                    rd_numb: None,
-                    rd_consts: None,
-                    rd_virtuals: None,
-                    rd_pendingfields: None,
+                    rd_numb: meta.and_then(|fd| fd.rd_numb().map(|s| s.to_vec())),
+                    rd_consts: meta.and_then(|fd| fd.rd_consts().map(|s| s.to_vec())),
+                    rd_virtuals: meta.and_then(|fd| fd.rd_virtuals().map(|s| s.to_vec())),
+                    rd_pendingfields: meta.and_then(|fd| fd.rd_pendingfields().map(|s| s.to_vec())),
                 }
             })
             .collect();
@@ -2071,10 +2062,10 @@ impl majit_backend::Backend for WasmBackend {
                     force_token_slots: Vec::new(),
                     recovery_layout: None,
                     frame_stack: None,
-                    rd_numb: None,
-                    rd_consts: None,
-                    rd_virtuals: None,
-                    rd_pendingfields: None,
+                    rd_numb: meta.and_then(|fd| fd.rd_numb().map(|s| s.to_vec())),
+                    rd_consts: meta.and_then(|fd| fd.rd_consts().map(|s| s.to_vec())),
+                    rd_virtuals: meta.and_then(|fd| fd.rd_virtuals().map(|s| s.to_vec())),
+                    rd_pendingfields: meta.and_then(|fd| fd.rd_pendingfields().map(|s| s.to_vec())),
                 }
             })
             .collect();
