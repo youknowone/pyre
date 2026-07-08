@@ -6,11 +6,10 @@
 
 use pyre_object::*;
 
-/// Extract f64 from an int, float, or long object.
-/// PyPy: `_get_double(space, w_x)` — falls back to `__float__` for
-/// Fraction/Decimal/custom number types. Infallible callers should
-/// use `get_double_or_default` which retains the legacy 0.0 fallback
-/// for backward compatibility.
+/// Infallible f64 extraction with a `0.0` fallback for a non-convertible
+/// argument. Retained for `cmath`, whose flat gateway does not thread the
+/// error path; the `math` module uses [`try_get_double`] directly so a
+/// non-number raises `TypeError`.
 pub fn get_double(obj: PyObjectRef) -> f64 {
     try_get_double(obj).unwrap_or(0.0)
 }
@@ -42,31 +41,39 @@ pub fn try_get_double(obj: PyObjectRef) -> Result<f64, crate::PyError> {
             return Ok(if w_bool_get_value(obj) { 1.0 } else { 0.0 });
         }
     }
-    // A raising `__float__`/`__index__` (descriptor `__get__` or the call
-    // itself) propagates instead of being reported as "must be real number".
-    match crate::baseobjspace::getattr_str(obj, "__float__") {
-        Ok(method) => {
+    // `__float__` is a type-only special-method lookup (`space.lookup`); an
+    // instance attribute named `__float__` is not consulted. A raising
+    // `__float__` (descriptor `__get__` or the call itself) propagates
+    // instead of being reported as "must be real number".
+    match unsafe { crate::baseobjspace::lookup_special(obj, "__float__") } {
+        Ok(Some(method)) => {
             let result = crate::builtins::call_and_check(method, &[])?;
             unsafe {
                 if is_float(result) {
-                    return Ok(floatobject::w_float_get_value(result));
-                }
-                if is_int(result) {
-                    return Ok(w_int_get_value(result) as f64);
-                }
-                if is_long(result) {
-                    let v = jit_bigint_to_f64_or_nan(w_long_get_value(result));
-                    if !v.is_finite() {
-                        return Err(crate::PyError::overflow_error(
-                            "int too large to convert to float",
+                    // A strict `float` subclass is accepted but deprecated;
+                    // an exact `float` is used as-is.
+                    if !is_exact_type(result, &FLOAT_TYPE) {
+                        let value_type = crate::type_methods::arg_type_name(obj);
+                        let result_type = crate::type_methods::arg_type_name(result);
+                        crate::warn::warn_deprecation(&format!(
+                            "{value_type}.__float__ returned non-float (type {result_type}).  \
+                             The ability to return an instance of a strict subclass of \
+                             float is deprecated, and may be removed in a future version \
+                             of Python."
                         ));
                     }
-                    return Ok(v);
+                    return Ok(floatobject::w_float_get_value(result));
                 }
             }
+            // descroperation.py:891 — a non-float result (including int/long)
+            // is rejected rather than coerced.
+            let result_type = unsafe { (*(*result).ob_type).name };
+            return Err(crate::PyError::type_error(format!(
+                "__float__ returned non-float (type '{result_type}')",
+            )));
         }
-        Err(err) if err.kind != crate::PyErrorKind::AttributeError => return Err(err),
-        Err(_) => {}
+        Ok(None) => {}
+        Err(err) => return Err(err),
     }
     match crate::baseobjspace::getattr_str(obj, "__index__") {
         Ok(method) => {
@@ -484,9 +491,9 @@ pub fn degrees(args: &[PyObjectRef]) -> PyResult {
             "degrees() takes exactly 1 argument",
         ));
     }
-    Ok(floatobject::w_float_new(pymath::math::degrees(get_double(
-        args[0],
-    ))))
+    Ok(floatobject::w_float_new(pymath::math::degrees(
+        try_get_double(args[0])?,
+    )))
 }
 
 pub fn radians(args: &[PyObjectRef]) -> PyResult {
@@ -495,9 +502,9 @@ pub fn radians(args: &[PyObjectRef]) -> PyResult {
             "radians() takes exactly 1 argument",
         ));
     }
-    Ok(floatobject::w_float_new(pymath::math::radians(get_double(
-        args[0],
-    ))))
+    Ok(floatobject::w_float_new(pymath::math::radians(
+        try_get_double(args[0])?,
+    )))
 }
 
 pub fn isinf(args: &[PyObjectRef]) -> PyResult {
@@ -506,7 +513,7 @@ pub fn isinf(args: &[PyObjectRef]) -> PyResult {
             "isinf() takes exactly 1 argument",
         ));
     }
-    Ok(w_bool_from(pymath::math::isinf(get_double(args[0]))))
+    Ok(w_bool_from(pymath::math::isinf(try_get_double(args[0])?)))
 }
 
 pub fn isnan(args: &[PyObjectRef]) -> PyResult {
@@ -515,7 +522,7 @@ pub fn isnan(args: &[PyObjectRef]) -> PyResult {
             "isnan() takes exactly 1 argument",
         ));
     }
-    Ok(w_bool_from(pymath::math::isnan(get_double(args[0]))))
+    Ok(w_bool_from(pymath::math::isnan(try_get_double(args[0])?)))
 }
 
 pub fn isfinite(args: &[PyObjectRef]) -> PyResult {
@@ -524,34 +531,32 @@ pub fn isfinite(args: &[PyObjectRef]) -> PyResult {
             "isfinite() takes exactly 1 argument",
         ));
     }
-    Ok(w_bool_from(pymath::math::isfinite(get_double(args[0]))))
+    Ok(w_bool_from(pymath::math::isfinite(try_get_double(args[0])?)))
 }
 
 pub fn isclose(args: &[PyObjectRef]) -> PyResult {
-    let is_kwargs = !args.is_empty()
-        && unsafe {
-            let last = *args.last().unwrap();
-            pyre_object::is_dict(last)
-                && pyre_object::w_dict_lookup(last, pyre_object::w_str_new("__pyre_kw__")).is_some()
-        };
-    let (pos, kwargs) = if is_kwargs {
-        (&args[..args.len() - 1], Some(*args.last().unwrap()))
-    } else {
-        (&args[..], None)
-    };
+    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
     if pos.len() != 2 {
         return Err(crate::PyError::type_error(
             "isclose() takes exactly 2 positional arguments",
         ));
     }
-    let read = |name: &str| -> Option<f64> {
-        kwargs
-            .and_then(|kw| unsafe { pyre_object::w_dict_lookup(kw, pyre_object::w_str_new(name)) })
-            .map(get_double)
+    // `rel_tol` and `abs_tol` are the only (keyword-only) parameters.
+    crate::builtins::kwarg_reject_unknown(kwargs, &["rel_tol", "abs_tol"], "isclose")?;
+    let read = |name: &str| -> Result<Option<f64>, crate::PyError> {
+        match crate::builtins::kwarg_get(kwargs, name) {
+            Some(v) => Ok(Some(try_get_double(v)?)),
+            None => Ok(None),
+        }
     };
-    let rel_tol = read("rel_tol");
-    let abs_tol = read("abs_tol");
-    match pymath::math::isclose(get_double(pos[0]), get_double(pos[1]), rel_tol, abs_tol) {
+    let rel_tol = read("rel_tol")?;
+    let abs_tol = read("abs_tol")?;
+    match pymath::math::isclose(
+        try_get_double(pos[0])?,
+        try_get_double(pos[1])?,
+        rel_tol,
+        abs_tol,
+    ) {
         Ok(v) => Ok(w_bool_from(v)),
         Err(e) => Err(map_int_err(e)),
     }
@@ -629,10 +634,12 @@ fn get_bigint(obj: PyObjectRef) -> Result<malachite_bigint::BigInt, crate::PyErr
             ));
         }
     }
-    // __index__ dunder — PyPy: descroperation.py space.index.
-    if let Ok(method) = crate::baseobjspace::getattr_str(obj, "__index__") {
-        let result = crate::call_function(method, &[]);
-        if !result.is_null() {
+    // __index__ dunder — descroperation.py `_index`: type-only special-method
+    // lookup, then propagate a raising `__index__` instead of masking it with
+    // the generic "object cannot be interpreted as an integer".
+    match unsafe { crate::baseobjspace::lookup_special(obj, "__index__") } {
+        Ok(Some(method)) => {
+            let result = crate::builtins::call_and_check(method, &[])?;
             unsafe {
                 if pyre_object::is_int(result) {
                     return Ok(BigInt::from(pyre_object::w_int_get_value(result)));
@@ -641,7 +648,14 @@ fn get_bigint(obj: PyObjectRef) -> Result<malachite_bigint::BigInt, crate::PyErr
                     return Ok(pyre_object::w_long_get_value(result).clone());
                 }
             }
+            // descroperation.py:612 — __index__ returned non-int (type %T)
+            let result_type = unsafe { (*(*result).ob_type).name };
+            return Err(crate::PyError::type_error(format!(
+                "__index__ returned non-int (type '{result_type}')",
+            )));
         }
+        Ok(None) => {}
+        Err(err) => return Err(err),
     }
     Err(crate::PyError::type_error(
         "object cannot be interpreted as an integer",
@@ -933,7 +947,7 @@ pub fn frexp(args: &[PyObjectRef]) -> PyResult {
             "frexp() takes exactly 1 argument",
         ));
     }
-    let (m, e) = pymath::math::frexp(get_double(args[0]));
+    let (m, e) = pymath::math::frexp(try_get_double(args[0])?);
     Ok(w_tuple_new(vec![
         floatobject::w_float_new(m),
         w_int_new(e as i64),
@@ -950,7 +964,7 @@ pub fn ldexp(args: &[PyObjectRef]) -> PyResult {
     // PyPy: pypy/module/math/interp_math.py::ldexp — second argument
     // must be an integer (via `__index__`), not a float.
     let exp_big = get_bigint(args[1])?;
-    let x = get_double(args[0]);
+    let x = try_get_double(args[0])?;
     // Short-circuit special cases so an overflowing exponent doesn't
     // mask inf/nan propagation.
     if x.is_nan() {
@@ -981,7 +995,7 @@ pub fn modf(args: &[PyObjectRef]) -> PyResult {
             "modf() takes exactly 1 argument",
         ));
     }
-    let (frac, integer) = pymath::math::modf(get_double(args[0]));
+    let (frac, integer) = pymath::math::modf(try_get_double(args[0])?);
     Ok(w_tuple_new(vec![
         floatobject::w_float_new(frac),
         floatobject::w_float_new(integer),
@@ -1021,8 +1035,8 @@ pub fn nextafter(args: &[PyObjectRef]) -> PyResult {
         None => None,
     };
     Ok(floatobject::w_float_new(pymath::math::nextafter(
-        get_double(pos[0]),
-        get_double(pos[1]),
+        try_get_double(pos[0])?,
+        try_get_double(pos[1])?,
         steps,
     )))
 }
@@ -1034,8 +1048,8 @@ pub fn fma(args: &[PyObjectRef]) -> PyResult {
         ));
     }
     map_err(pymath::math::fma(
-        get_double(args[0]),
-        get_double(args[1]),
-        get_double(args[2]),
+        try_get_double(args[0])?,
+        try_get_double(args[1])?,
+        try_get_double(args[2])?,
     ))
 }
