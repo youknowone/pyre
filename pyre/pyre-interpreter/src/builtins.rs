@@ -5073,6 +5073,27 @@ fn strip_numeric_underscores(s: &str) -> Option<String> {
     Some(out)
 }
 
+/// `float.__float__(self)` — floatobject.py descr___float__: an exact float
+/// is returned as-is; a strict subclass is down-converted to a fresh base
+/// `float`.  Kept separate from the `float()` constructor so `float()` can look
+/// `__float__` up on a subclass (honoring an override) without recursing.
+pub(crate) fn builtin_float_dunder(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let obj = args[0];
+    unsafe {
+        if is_exact_type(obj, &FLOAT_TYPE) {
+            return Ok(obj);
+        }
+        if is_float(obj) {
+            return Ok(floatobject::w_float_new(w_float_get_value(obj)));
+        }
+    }
+    // interp2app(W_FloatObject.descr_float) requires a float `self`.
+    Err(crate::PyError::type_error(format!(
+        "descriptor '__float__' requires a 'float' object but received a '{}'",
+        crate::type_methods::arg_type_name(obj)
+    )))
+}
+
 /// `float(obj)` → convert to float
 pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.is_empty() {
@@ -5090,14 +5111,14 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     let obj = args[value_idx];
     unsafe {
         if is_float(obj) {
-            // `float(f) is f` only for an exact `float`; a subclass instance
-            // is copied to a fresh base `float`.
+            // `float(f) is f` for an exact `float`. A subclass falls through
+            // to the `__float__` lookup below so an overridden `__float__` is
+            // honored; a subclass that does not override it resolves to
+            // `float.__float__`, which returns a fresh base `float`.
             if is_exact_type(obj, &FLOAT_TYPE) {
                 return Ok(obj);
             }
-            return Ok(floatobject::w_float_new(w_float_get_value(obj)));
-        }
-        if is_int(obj) {
+        } else if is_int(obj) {
             return Ok(floatobject::w_float_new(w_int_get_value(obj) as f64));
         }
         if is_bool(obj) {

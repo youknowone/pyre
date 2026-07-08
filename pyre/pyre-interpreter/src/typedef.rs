@@ -9008,7 +9008,7 @@ fn init_float_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "__float__",
-        make_builtin_function_with_arity("__float__", crate::builtins::builtin_float, 1),
+        make_builtin_function_with_arity("__float__", crate::builtins::builtin_float_dunder, 1),
     );
     dict_storage_store(
         ns,
