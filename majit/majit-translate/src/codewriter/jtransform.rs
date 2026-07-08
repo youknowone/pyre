@@ -2960,9 +2960,9 @@ impl<'a> Transformer<'a> {
             // Unhandled spellings return `None` and fall through to the
             // residual-call path (RPython raises `NotSupported`).
             if base.starts_with("stroruni.") {
-                if let Some(result) = self._handle_stroruni_call(
-                    base, op, target, args, result_ty, graph_name, graph,
-                ) {
+                if let Some(result) =
+                    self._handle_stroruni_call(base, op, target, args, result_ty, graph_name, graph)
+                {
                     return prepend_const_prefix(&mut const_prefix_ops, result);
                 }
             }
