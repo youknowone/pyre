@@ -2088,7 +2088,6 @@ fn rewrite_body(
                     return;
                 }
             }
-
         }
 
         fn visit_block_mut(&mut self, block: &mut syn::Block) {

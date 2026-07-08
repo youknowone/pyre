@@ -15,7 +15,6 @@ use crate::jitcode::insns::MAX_HOST_CALL_ARITY;
 use crate::jitcode::{self, JitArgKind, JitCallArg, JitCallTarget, JitCode, JitCodeRuntimeExt};
 use crate::{TraceAction, TraceCtx};
 
-
 /// Single-pass tracing: when set, on CloseLoop the walk's final state is
 /// transferred into native state at the merge-point hook and the native loop
 /// resumes into the compiled loop, skipping the walked span's re-run.
@@ -6641,7 +6640,6 @@ where
     machine.set_outer_program_pc(outer_pc);
     machine.run_to_end(ctx, sym, runtime)
 }
-
 
 /// `b1 is b2` crude fastpath result for comparison opcodes —
 /// `pyjitpl.py:56-63` `FASTPATHS_SAME_BOXES`. Returns the constant
