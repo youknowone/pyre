@@ -359,6 +359,7 @@ fn install_gc_box(mut gc: Box<dyn GcAllocator>) {
     set_cranelift_jitframe_type_id(jitframe_type_id);
     majit_gc::set_active_gc_guard_hooks(majit_gc::ActiveGcGuardHooks {
         check_is_object: Some(check_is_object_via_active_runtime),
+        is_tagged_immediate: Some(is_tagged_immediate_via_active_runtime),
         get_actual_typeid: Some(get_actual_typeid_via_active_runtime),
         subclass_range: Some(subclass_range_via_active_runtime),
         typeid_subclass_range: Some(typeid_subclass_range_via_active_runtime),
@@ -1428,6 +1429,13 @@ fn cranelift_gc_active() -> bool {
 /// reach the live GC allocator without taking a cranelift dependency.
 fn check_is_object_via_active_runtime(gcref: GcRef) -> bool {
     with_cranelift_gc(|gc| gc.check_is_object(gcref)).unwrap_or(false)
+}
+
+/// `majit_gc::IsTaggedImmediateFn` installed by `set_gc_allocator`.
+/// Dispatches gc/base.py:380-383 `is_valid_gc_object`'s tagged-immediate
+/// test through the thread-local `CRANELIFT_ACTIVE_GC`.
+fn is_tagged_immediate_via_active_runtime(addr: usize) -> bool {
+    with_cranelift_gc(|gc| gc.is_tagged_immediate(addr)).unwrap_or(false)
 }
 
 /// `majit_gc::GetActualTypeidFn` installed by `set_gc_allocator`.

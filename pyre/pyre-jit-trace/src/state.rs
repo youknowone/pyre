@@ -2964,13 +2964,17 @@ pub(crate) fn trace_unbox_int_with_resume_descr<F: crate::walker_frame_ops::Walk
                 let o = r.as_usize() as pyre_object::PyObjectRef;
                 if !o.is_null() {
                     if pyre_object::tagged_int::is_tagged_int(o) {
-                        let lowbit = crate::helpers::emit_tag_lowbit_test(frame.ctx_mut(), obj, true);
+                        let lowbit =
+                            crate::helpers::emit_tag_lowbit_test(frame.ctx_mut(), obj, true);
                         frame.generate_guard(OpCode::GuardTrue, &[lowbit]);
                         return crate::helpers::emit_untag_int(
-                            frame.ctx_mut(), obj, pyre_object::tagged_int::untag_int(o),
+                            frame.ctx_mut(),
+                            obj,
+                            pyre_object::tagged_int::untag_int(o),
                         );
                     } else {
-                        let lowbit = crate::helpers::emit_tag_lowbit_test(frame.ctx_mut(), obj, false);
+                        let lowbit =
+                            crate::helpers::emit_tag_lowbit_test(frame.ctx_mut(), obj, false);
                         frame.generate_guard(OpCode::GuardFalse, &[lowbit]);
                     }
                 }

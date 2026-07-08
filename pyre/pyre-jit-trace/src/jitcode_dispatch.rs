@@ -13722,7 +13722,9 @@ fn walker_unbox_int_typed(
                 let lowbit = crate::helpers::emit_tag_lowbit_test(ctx.trace_ctx, obj, true);
                 walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[lowbit])?;
                 return Ok(crate::helpers::emit_untag_int(
-                    ctx.trace_ctx, obj, pyre_object::tagged_int::untag_int(o),
+                    ctx.trace_ctx,
+                    obj,
+                    pyre_object::tagged_int::untag_int(o),
                 ));
             } else {
                 let lowbit = crate::helpers::emit_tag_lowbit_test(ctx.trace_ctx, obj, false);

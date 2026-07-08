@@ -140,6 +140,7 @@ fn install_gc_box(gc: Box<dyn majit_gc::GcAllocator>) {
     });
     majit_gc::set_active_gc_guard_hooks(majit_gc::ActiveGcGuardHooks {
         check_is_object: Some(dynasm_check_is_object),
+        is_tagged_immediate: Some(dynasm_is_tagged_immediate),
         get_actual_typeid: Some(dynasm_get_actual_typeid),
         subclass_range: Some(dynasm_subclass_range),
         typeid_subclass_range: Some(dynasm_typeid_subclass_range),
@@ -206,6 +207,10 @@ pub(crate) struct GuardGcTypeInfo {
 
 fn dynasm_check_is_object(gcref: GcRef) -> bool {
     with_dynasm_active_gc(|gc| gc.check_is_object(gcref)).unwrap_or(false)
+}
+
+fn dynasm_is_tagged_immediate(addr: usize) -> bool {
+    with_dynasm_active_gc(|gc| gc.is_tagged_immediate(addr)).unwrap_or(false)
 }
 
 fn dynasm_get_actual_typeid(gcref: GcRef) -> Option<u32> {

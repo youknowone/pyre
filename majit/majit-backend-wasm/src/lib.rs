@@ -222,6 +222,7 @@ fn install_gc_box(gc: Box<dyn majit_gc::GcAllocator>) {
     });
     majit_gc::set_active_gc_guard_hooks(majit_gc::ActiveGcGuardHooks {
         check_is_object: Some(wasm_check_is_object),
+        is_tagged_immediate: Some(wasm_is_tagged_immediate),
         get_actual_typeid: Some(wasm_get_actual_typeid),
         subclass_range: Some(wasm_subclass_range),
         typeid_subclass_range: Some(wasm_typeid_subclass_range),
@@ -324,6 +325,10 @@ fn wasm_collect_oldgen_nonmoving() {
 /// through the wasm-thread-local GC allocator.
 fn wasm_check_is_object(gcref: GcRef) -> bool {
     with_wasm_active_gc(|gc| gc.check_is_object(gcref)).unwrap_or(false)
+}
+
+fn wasm_is_tagged_immediate(addr: usize) -> bool {
+    with_wasm_active_gc(|gc| gc.is_tagged_immediate(addr)).unwrap_or(false)
 }
 
 fn wasm_get_actual_typeid(gcref: GcRef) -> Option<u32> {

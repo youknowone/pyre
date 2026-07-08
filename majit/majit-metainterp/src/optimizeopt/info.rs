@@ -401,6 +401,20 @@ impl PtrInfoExt for PtrInfo {
                 if gcref.is_null() {
                     return None;
                 }
+                // A tagged immediate (odd-valued constant address) is an
+                // unboxed `int`, not a heap object; reading a typeptr at
+                // offset 0 would fault. Return `None` ("class unknown")
+                // so the optimizer declines to fold the guard while the
+                // runtime tag/GuardClass check still runs. This crate
+                // cannot name the pyre `int` classptr, and no `Cpu`
+                // accessor yields it without an offset-0 deref, so `None`
+                // is the conservative, deref-free verdict. Gated on the
+                // active GC's taggedpointers config (mirror of
+                // CAN_BE_TAGGED, default false), so it is inert until the
+                // enablement flip.
+                if majit_gc::is_tagged_immediate(gcref.as_usize()) {
+                    return None;
+                }
                 // info.py:765-767: gate the `check_is_object` call on
                 // `supports_guard_gc_type`. When the backend doesn't
                 // support guard_gc_type, RPython simply skips the

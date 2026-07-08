@@ -3064,6 +3064,14 @@ impl GcAllocator for MiniMarkGC {
         (byte & is_object_flag) != 0
     }
 
+    /// gc/base.py:380-383 `is_valid_gc_object` tagged-immediate test.
+    /// Delegates to the inherent guard the collector uses internally,
+    /// exposing it through the trait so backend-agnostic callers can ask
+    /// whether an odd-valued constant address is an unboxed immediate.
+    fn is_tagged_immediate(&self, addr: usize) -> bool {
+        MiniMarkGC::is_tagged_immediate(self, addr)
+    }
+
     /// `rgc.can_move` (rpython/rlib/rgc.py:229). MiniMark mapping: an
     /// object can still move iff it is a young (nursery) object that is
     /// not pinned. Old-generation objects, prebuilt/foreign addresses

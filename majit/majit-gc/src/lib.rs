@@ -476,6 +476,13 @@ pub trait GcAllocator: Send {
         false
     }
 
+    /// gc/base.py:380-383 `is_valid_gc_object` tagged-immediate test:
+    /// `config.taggedpointers && (addr & 1 == 1)`. Backends with no
+    /// tagged-immediate support (the default) return `false`.
+    fn is_tagged_immediate(&self, _addr: usize) -> bool {
+        false
+    }
+
     /// `rpython/rlib/rgc.py:229` `can_move(p)` — whether the GC object
     /// `gcref` sits at an address that may still move. "With non-moving
     /// GCs, it is always False; with moving GCs it can be True for some
@@ -751,6 +758,9 @@ impl GcAllocator for GcHandle {
     fn check_is_object(&self, gcref: GcRef) -> bool {
         gc_sync::gc_query(|gc| gc.check_is_object(gcref))
     }
+    fn is_tagged_immediate(&self, addr: usize) -> bool {
+        gc_sync::gc_query(|gc| gc.is_tagged_immediate(addr))
+    }
     fn can_move(&self, gcref: GcRef) -> bool {
         gc_sync::gc_query(|gc| gc.can_move(gcref))
     }
@@ -871,6 +881,14 @@ use std::cell::Cell;
 /// unregistered.
 pub type CheckIsObjectFn = fn(GcRef) -> bool;
 
+/// Thread-local callback that answers the collector's tagged-immediate
+/// test (gc/base.py:380-383 `is_valid_gc_object`) for the currently
+/// active backend's GC: `config.taggedpointers && (addr & 1 == 1)`.
+/// Lets a backend-agnostic caller decide that an odd-valued constant
+/// address is an unboxed immediate rather than a heap object, without
+/// reading an object header at offset 0.
+pub type IsTaggedImmediateFn = fn(usize) -> bool;
+
 /// Thread-local callback that answers `gc_ll_descr.get_actual_typeid`
 /// (gc.py:624-629) for the currently active backend. Returns the
 /// `rffi.cast(HDRPTR, gcptr).tid` half-word for managed objects and
@@ -913,6 +931,7 @@ pub type CanMoveFn = fn(GcRef) -> bool;
 
 thread_local! {
     static ACTIVE_CHECK_IS_OBJECT: Cell<Option<CheckIsObjectFn>> = const { Cell::new(None) };
+    static ACTIVE_IS_TAGGED_IMMEDIATE: Cell<Option<IsTaggedImmediateFn>> = const { Cell::new(None) };
     static ACTIVE_GET_ACTUAL_TYPEID: Cell<Option<GetActualTypeidFn>> = const { Cell::new(None) };
     static ACTIVE_SUBCLASS_RANGE: Cell<Option<SubclassRangeFn>> = const { Cell::new(None) };
     static ACTIVE_TYPEID_SUBCLASS_RANGE: Cell<Option<TypeidSubclassRangeFn>> = const { Cell::new(None) };
@@ -929,6 +948,7 @@ thread_local! {
 #[derive(Clone, Copy, Default)]
 pub struct ActiveGcGuardHooks {
     pub check_is_object: Option<CheckIsObjectFn>,
+    pub is_tagged_immediate: Option<IsTaggedImmediateFn>,
     pub get_actual_typeid: Option<GetActualTypeidFn>,
     pub subclass_range: Option<SubclassRangeFn>,
     pub typeid_subclass_range: Option<TypeidSubclassRangeFn>,
@@ -946,6 +966,7 @@ pub struct ActiveGcGuardHooks {
 /// bundles them here so a backend install is a single call.
 pub fn set_active_gc_guard_hooks(hooks: ActiveGcGuardHooks) {
     ACTIVE_CHECK_IS_OBJECT.with(|c| c.set(hooks.check_is_object));
+    ACTIVE_IS_TAGGED_IMMEDIATE.with(|c| c.set(hooks.is_tagged_immediate));
     ACTIVE_GET_ACTUAL_TYPEID.with(|c| c.set(hooks.get_actual_typeid));
     ACTIVE_SUBCLASS_RANGE.with(|c| c.set(hooks.subclass_range));
     ACTIVE_TYPEID_SUBCLASS_RANGE.with(|c| c.set(hooks.typeid_subclass_range));
@@ -978,6 +999,18 @@ pub fn check_is_object(gcref: GcRef) -> bool {
     }
     ACTIVE_CHECK_IS_OBJECT.with(|c| match c.get() {
         Some(f) => f(gcref),
+        None => false,
+    })
+}
+
+/// gc/base.py:380-383 `is_valid_gc_object` tagged-immediate test shim.
+/// Delegates to the active backend's installed callback, which reads its
+/// GC's `config.taggedpointers`. Returns `false` for null and when no
+/// backend is installed — same absent-backend semantics as
+/// `check_is_object`, so flag-off / no-GC paths are unaffected.
+pub fn is_tagged_immediate(addr: usize) -> bool {
+    ACTIVE_IS_TAGGED_IMMEDIATE.with(|c| match c.get() {
+        Some(f) => f(addr),
         None => false,
     })
 }
