@@ -1185,7 +1185,19 @@ fn collect_cfg_coalesce_pairs(
 /// disjoint-live stay free to share a color — the chordal coloring aliases
 /// them when no interference edge forces them apart, so this only forbids
 /// the union-find MERGE, not color reuse.  Only WITHIN-slot pairs survive.
-/// Splice-only (production passes the unfiltered pairs and is byte-identical).
+///
+/// LOAD-BEARING (not inert): production wires the filtered result
+/// (`splice_pairs`) as the sole source of `ssarepr.insns`.  Passing the
+/// unfiltered CFG pairs instead is NOT byte-identical — it regresses the
+/// kept-stack / short-circuit benches (`short_circuit_value_kept_stack`,
+/// `short_circuit_value_local_kept`, `short_circuit_boxed_int_cross_fn`,
+/// `kept_stack_branch_depths`).  It is still needed because
+/// `filter_coalesce_pairs_by_interference` honours only SSA-liveness
+/// interference, which is disjoint between `LOAD_FAST` re-reads; this filter
+/// covers the remaining CPython-slot-co-live-but-SSA-disjoint merges.
+/// Retiring it faithfully means feeding those co-live edges into that filter's
+/// `has_edge` oracle (its `extra_interference` argument) so the guard rejects
+/// them directly, rather than post-filtering by walker slot here.
 fn filter_cross_slot_coalesce_pairs(
     pairs: &[(super::flow::VariableId, super::flow::VariableId)],
     walker_slot_for_variable: &[Option<u16>],
@@ -12143,10 +12155,16 @@ impl CodeWriter {
         // short-circuit `(i and C)` PHI ↔ loop-var merge that collapses the
         // kept operand-stack slot's color onto the loop var (#124 float).
         let cfg_variable_pairs = collect_cfg_coalesce_pairs(&graph);
+        // `&[]`: honour SSA-liveness interference only. The CPython-slot
+        // co-live merges this filter misses (SSA-disjoint `LOAD_FAST` re-reads)
+        // are still caught downstream by `filter_cross_slot_coalesce_pairs`;
+        // feeding the `build_colive_interference` edges into this argument is
+        // the retirement path for that walker-slot filter.
         let cfg_variable_pairs = super::regalloc::filter_coalesce_pairs_by_interference(
             &graph,
             Kind::Ref,
             &cfg_variable_pairs,
+            &[],
         );
         let mut graph_regallocs = super::regalloc::perform_register_allocation_all_kinds_with_pairs(
             &graph,

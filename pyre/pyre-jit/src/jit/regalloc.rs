@@ -624,13 +624,34 @@ pub fn perform_register_allocation_with_pairs_and_interference(
 /// non-interfering pins (walker scratch ↔ inputarg) survive, so the
 /// canonical coloring still matches the walker's emit, while the
 /// interfering `(i, PHI)` pair is rejected.
+///
+/// `extra_interference` seeds additional edges into the dependency graph
+/// (via `add_interference_pin_ids`) before the coalesce replay, so a pair
+/// whose endpoints are co-live under a liveness `make_dependencies` does not
+/// see — the CPython-slot co-live locals whose SSA ranges are disjoint —
+/// is also rejected.  Callers pass `&[]` to honour SSA-liveness alone.
 pub fn filter_coalesce_pairs_by_interference(
     graph: &FlowGraph,
     kind: Kind,
     pairs: &[(super::flow::VariableId, super::flow::VariableId)],
+    extra_interference: &[(super::flow::VariableId, super::flow::VariableId)],
 ) -> Vec<(super::flow::VariableId, super::flow::VariableId)> {
     let mut allocator = RegAllocator::new(graph, kind);
     allocator.make_dependencies();
+    // Inject caller-supplied interference edges into the dependency graph
+    // before replaying `_try_coalesce`, so the `has_edge` guard (regalloc.py:105)
+    // rejects a coalesce whose endpoints are simultaneously live under a
+    // liveness the SSA `make_dependencies` graph does not model: two locals
+    // whose SSA live ranges are disjoint between `LOAD_FAST` re-reads yet
+    // co-live at a guard (the CPython-slot co-live separations
+    // `build_colive_interference` records).  An empty slice is a no-op — the
+    // filter then honours SSA-liveness interference only, which is why the
+    // walker-slot `filter_cross_slot_coalesce_pairs` (codewriter.rs) still
+    // runs on top; feeding those co-live edges here is the retirement path
+    // for that walker-slot filter.
+    for &(a_id, b_id) in extra_interference {
+        allocator.add_interference_pin_ids(a_id, b_id);
+    }
     let mut kept = Vec::with_capacity(pairs.len());
     for &(v_id, w_id) in pairs {
         if v_id == w_id {
@@ -1567,6 +1588,49 @@ mod tests {
         assert_eq!(
             pinned_v0, pinned_v1,
             "pin must unify v0 and v1 even across an interference edge"
+        );
+    }
+
+    #[test]
+    fn filter_coalesce_pairs_by_interference_extra_edge_rejects_ssa_disjoint_pair() {
+        // v0 (inputarg) is copied into v1 and dies at the copy, so v0 and v1
+        // have DISJOINT SSA live ranges: `make_dependencies` records no edge
+        // between them and the coalesce pair (v0, v1) is accepted.  A
+        // caller-supplied `extra_interference` edge models a CPython-slot
+        // co-live separation the SSA graph cannot see (two locals co-live at a
+        // guard across `LOAD_FAST` re-reads); the `has_edge` guard must then
+        // reject the pair.
+        let build = || {
+            let v0 = flow_var(0, Kind::Ref);
+            let v1 = flow_var(1, Kind::Ref);
+            let start = Block::shared(vec![v0.into()]);
+            let graph = FunctionGraph::new("xslot_colive", start.clone(), None);
+            push_op(
+                &start,
+                SpaceOperation::new("ref_copy", vec![v0.into()], Some(v1.into()), 0),
+            );
+            start.closeblock(vec![
+                Link::new(vec![v1.into()], Some(graph.returnblock.clone()), None).into_ref(),
+            ]);
+            (graph, v0.id, v1.id)
+        };
+
+        // SSA-liveness only: the disjoint pair is accepted.
+        let (g_ssa, a, b) = build();
+        let kept_ssa = filter_coalesce_pairs_by_interference(&g_ssa, Kind::Ref, &[(a, b)], &[]);
+        assert_eq!(
+            kept_ssa,
+            vec![(a, b)],
+            "SSA-disjoint pair must be accepted when no extra interference is supplied"
+        );
+
+        // With an injected co-live edge, the has_edge guard rejects it.
+        let (g_colive, a, b) = build();
+        let kept_colive =
+            filter_coalesce_pairs_by_interference(&g_colive, Kind::Ref, &[(a, b)], &[(a, b)]);
+        assert!(
+            kept_colive.is_empty(),
+            "an injected co-live interference edge must reject the otherwise-accepted pair"
         );
     }
 
