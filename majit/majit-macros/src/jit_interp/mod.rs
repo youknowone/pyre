@@ -1998,21 +1998,25 @@ fn rewrite_body(
                                 if let Some((__sp_pc, __sp_reds)) = __mp_out
                                 {
                                     // Push the walk-mutated scalar state fields
-                                    // (e.g. a walk-advanced `selected`) from the
-                                    // still-live persistent sym into native
-                                    // `state`. The walk advances these on the sym
-                                    // via BC_STORE_STATE_FIELD only; native
-                                    // `state` is frozen at trace-start (S_k), so
-                                    // without this the scalars stay stale — and a
-                                    // `recover` that re-derives caches FROM a
-                                    // scalar (stacksize from selected) would then
-                                    // read the wrong index. Must precede both
+                                    // (e.g. a walk-advanced `selected`) into
+                                    // native `state`. The walk advances these on
+                                    // the sym via BC_STORE_STATE_FIELD only;
+                                    // native `state` is frozen at trace-start
+                                    // (S_k), so without this the scalars stay
+                                    // stale — and a `recover` that re-derives
+                                    // caches FROM a scalar (stacksize from
+                                    // selected) would then read the wrong index.
+                                    // The values were captured off the still-live
+                                    // sym inside the CloseLoop arm (the arm clears
+                                    // the sym before returning, so they cannot be
+                                    // re-read here) and stashed on the MetaInterp;
+                                    // this consumes the stash. Must precede both
                                     // `recover` (which refines storage-backed
                                     // caches from the current scalars) and
                                     // `try_resume_into_compiled_loop` (which reads
                                     // the native scalars to seed the compiled
                                     // loop). No-op with no scalar state fields
-                                    // or no live sym.
+                                    // or when no CloseLoop stashed values.
                                     #driver.writeback_scalar_state_fields(
                                         &mut #state,
                                     );

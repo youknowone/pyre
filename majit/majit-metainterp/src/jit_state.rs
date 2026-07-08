@@ -361,15 +361,30 @@ pub trait JitState: Sized {
 
     fn recover_after_compiled_run(&mut self) {}
 
+    /// Whole-circuit single-pass: read the walk's scalar state-field concrete
+    /// values off the still-live persistent sym, in scalar state-field index
+    /// order (idx `0..num_scalars`). Called from the CloseLoop arm of
+    /// `merge_point` while the sym is `Some`, before the arm clears it; the
+    /// captured values are stashed on the `MetaInterp` and applied to native
+    /// `state` after the walk closes (`writeback_scalar_state_fields_from_values`
+    /// via the `jit_merge_point!` hook). Empty when the state has no scalar
+    /// fields. Default empty; the `#[jit_interp]` macro overrides it for
+    /// state-field consumers.
+    fn collect_scalar_state_field_values(_sym: &Self::Sym) -> Vec<i64> {
+        Vec::new()
+    }
+
     /// Whole-circuit single-pass: write the walk's scalar state-field concrete
-    /// values from the persistent sym back into native state. A scalar the walk
+    /// values (captured at close time by `collect_scalar_state_field_values`)
+    /// into native state. `values[idx]` is the scalar at state-field index
+    /// `idx`, written in the same order the sym read them. A scalar the walk
     /// mutates but `recover` cannot re-derive from shared storage (e.g. aheui's
     /// `selected` storage index, set by SEL from a program operand) would
-    /// otherwise stay frozen at its trace-start value. Called before
+    /// otherwise stay frozen at its trace-start value. Applied before
     /// `recover_after_compiled_run` so recover then refines the storage-derived
     /// caches (stacksize / list refs) from the now-current scalars. Default
     /// no-op; the `#[jit_interp]` macro overrides it for state-field consumers.
-    fn writeback_scalar_state_fields_from_sym(&mut self, _sym: &Self::Sym) {}
+    fn writeback_scalar_state_fields_from_values(&mut self, _values: &[i64]) {}
 
     /// blackhole.py:1679 `_exit_frame_with_exception` → warmspot.py:998-1005.
     ///

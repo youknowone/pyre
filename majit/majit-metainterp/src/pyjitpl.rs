@@ -1066,6 +1066,17 @@ pub struct MetaInterp<M: Clone> {
     /// after the trace closes. `take`n by the `__merge` wrapper. `None` when
     /// the walk did not populate the reds.
     pub(crate) single_pass_outcome: Option<(usize, Vec<Value>)>,
+    /// Single-pass tracing: the walk-final scalar state-field values captured
+    /// off the still-live sym at the CloseLoop point (scalar state-field index
+    /// order, idx `0..num_scalars`), BEFORE the CloseLoop arm clears the sym.
+    /// `merge_point`'s closure sees only `&mut MetaInterp` and `&mut sym`, and
+    /// the arm sets `self.sym = None` before returning, so native `state`
+    /// (available only in the `jit_merge_point!` macro expansion) cannot read
+    /// the sym after the close. Stash the values here while the sym is still
+    /// live; the macro hook `take`s them and applies them to native `state`
+    /// via `writeback_scalar_state_fields_from_values`. `None` outside
+    /// single-pass or when the state has no scalar fields.
+    pub(crate) single_pass_scalar_values: Option<Vec<i64>>,
     /// Single-pass tracing: the green key the CloseLoop arm compiled the
     /// (cross-loop-cut) inner loop under, captured after a `Compiled`
     /// outcome so the merge-point hook can DIRECTLY enter that freshly
@@ -2260,6 +2271,7 @@ impl<M: Clone> MetaInterp<M> {
             loop_header_pcs: indexmap::IndexMap::new(),
             tracing: None,
             single_pass_outcome: None,
+            single_pass_scalar_values: None,
             single_pass_compiled_key: None,
             next_trace_id: 1,
             hooks: JitHooks::default(),

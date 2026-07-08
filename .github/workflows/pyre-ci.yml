@@ -286,7 +286,7 @@ jobs:
           -p majit-metainterp -p majit-backend-cranelift \
           -p pyre-jit -p pyre-jit-trace -p pyrex -p pyre-interpreter -p majit \
           -p tlr -p tl -p tla -p tiny2 -p tiny3 -p tinyframe \
-          -p braininterp -p dualtape -p tlc -p calc -p i64env
+          -p braininterp -p dualtape -p tlc -p calc -p i64env -p spcount
         exit "$status"
 
   cargo-test-macos:

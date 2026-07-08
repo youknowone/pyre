@@ -1382,18 +1382,21 @@ impl<S: JitState> JitDriver<S> {
         self.meta.single_pass_outcome.take()
     }
 
-    /// Push the walk's scalar state fields from the still-live persistent sym
-    /// back into native `state`. The walk advances a scalar (notably a SEL's
-    /// new `selected`) on the sym only; native `state` stays at its trace-start
-    /// value until this write-back. No-op when no sym is live. Called from the
-    /// whole-circuit single-pass `jit_merge_point!` branch, before
-    /// `recover_after_compiled_run` so recover refines the storage-derived
-    /// caches (e.g. stacksize from the now-current selected) from the
-    /// written-back scalars.
+    /// Push the walk's scalar state fields into native `state`. The walk
+    /// advances a scalar (notably a SEL's new `selected`) on the sym only;
+    /// native `state` stays at its trace-start value until this write-back.
+    /// The values were captured off the still-live sym inside the CloseLoop
+    /// arm (`single_pass_scalar_values`, scalar index order) — the arm clears
+    /// the sym before returning, so they cannot be re-read here. Consumes
+    /// (`take`s) the stash. No-op when no CloseLoop stashed values (the hot
+    /// path) or the state has no scalar fields. Called from the whole-circuit
+    /// single-pass `jit_merge_point!` branch, before `recover_after_compiled_run`
+    /// so recover refines the storage-derived caches (e.g. stacksize from the
+    /// now-current selected) from the written-back scalars.
     #[inline]
-    pub fn writeback_scalar_state_fields(&self, state: &mut S) {
-        if let Some(sym) = self.sym.as_ref() {
-            state.writeback_scalar_state_fields_from_sym(sym);
+    pub fn writeback_scalar_state_fields(&mut self, state: &mut S) {
+        if let Some(values) = self.meta.single_pass_scalar_values.take() {
+            state.writeback_scalar_state_fields_from_values(&values);
         }
     }
 
@@ -1801,9 +1804,10 @@ impl<S: JitState> JitDriver<S> {
                 // (an interpreter program pc, NOT the JitCode op cursor). The
                 // reds vector published here is INTENTIONALLY empty. The
                 // merge-point hook transfers walk-final loop state without it:
-                // scalar state fields (e.g. selected) are written back from
-                // the live sym by `writeback_scalar_state_fields`, then
-                // `recover` re-derives the storage-backed cache fields
+                // scalar state fields (e.g. selected) are captured here from
+                // the still-live sym (`single_pass_scalar_values`) and written
+                // into native `state` by the macro hook after the walk closes,
+                // then `recover` re-derives the storage-backed cache fields
                 // (stacksize, storage refs) from the walk-advanced shared
                 // storage. `dispatch` does populate `ctx.walk_final_reds` from
                 // the merge point's red-operand slots, but that register-bank
@@ -1817,6 +1821,17 @@ impl<S: JitState> JitDriver<S> {
                 let pc = self.meta.trace_ctx().and_then(|ctx| ctx.walk_final_pc);
                 if let Some(p) = pc {
                     self.meta.single_pass_outcome = Some((p, Vec::new()));
+                }
+                // Capture the walk-final scalar state-field values off the
+                // still-live sym in scalar index order (idx `0..num_scalars`),
+                // BEFORE `self.sym = None` at the end of this arm drops them.
+                // native `state` is not in scope here (only in the
+                // `jit_merge_point!` macro expansion), so stash the values on
+                // the MetaInterp for the macro hook to apply after the close.
+                // Empty when the state has no scalar fields.
+                if let Some(sym) = self.sym.as_ref() {
+                    let scalars = S::collect_scalar_state_field_values(sym);
+                    self.meta.single_pass_scalar_values = Some(scalars);
                 }
                 // pyjitpl.py:2979-3036 reached_loop_header parity.
                 // Path 1: bridge — only if has_compiled_targets (line 2982).
@@ -5230,6 +5245,145 @@ mod tests {
         assert_eq!(stats.loops_compiled, 1);
         assert_eq!(stats.loops_aborted, 0);
         assert_eq!(stats.bridges_compiled, 0);
+    }
+
+    /// State whose walk advances a scalar state field the recover hook cannot
+    /// re-derive (an aheui `selected`-style storage index). The Sym carries the
+    /// scalar; `collect_scalar_state_field_values` reads it (at close time,
+    /// while the sym is live) and `writeback_scalar_state_fields_from_values`
+    /// pushes the captured value into native `state`.
+    #[derive(Default)]
+    struct ScalarWalkState {
+        // Native scalar; frozen at trace-start until the close-time write-back.
+        selected: i64,
+        // Set by the write-back so the test can observe the applied value.
+        writeback_applied: Option<Vec<i64>>,
+    }
+
+    #[derive(Default)]
+    struct ScalarWalkSym {
+        // The walk mutates this in the merge-point closure (a
+        // BC_STORE_STATE_FIELD analog); native `state.selected` stays frozen.
+        selected: i64,
+    }
+
+    impl JitState for ScalarWalkState {
+        type Meta = ();
+        type Sym = ScalarWalkSym;
+        type Env = ();
+
+        fn build_meta(&self, _header_pc: usize, _env: &Self::Env) -> Self::Meta {}
+
+        fn extract_live(&self, _meta: &Self::Meta) -> Vec<i64> {
+            // One inputarg so the trace records a valid input.
+            vec![self.selected]
+        }
+
+        fn create_sym(_meta: &Self::Meta, _header_pc: usize) -> Self::Sym {
+            ScalarWalkSym::default()
+        }
+
+        fn initialize_sym(&self, sym: &mut Self::Sym, _meta: &Self::Meta) {
+            // Seed the sym's scalar mirror from the trace-start native value.
+            sym.selected = self.selected;
+        }
+
+        fn is_compatible(&self, _meta: &Self::Meta) -> bool {
+            true
+        }
+
+        fn restore(&mut self, _meta: &Self::Meta, _values: &[i64]) {}
+
+        fn collect_jump_args(_sym: &Self::Sym) -> Vec<OpRef> {
+            Vec::new()
+        }
+
+        // The bug: this must observe the walk-final scalar captured while the
+        // sym was still live, NOT the trace-start value and NOT a no-op.
+        fn collect_scalar_state_field_values(sym: &Self::Sym) -> Vec<i64> {
+            vec![sym.selected]
+        }
+
+        fn writeback_scalar_state_fields_from_values(&mut self, values: &[i64]) {
+            self.selected = values[0];
+            self.writeback_applied = Some(values.to_vec());
+        }
+
+        // Force the abort branch of the CloseLoop arm — no backend compile is
+        // needed to exercise the capture-before-clear / apply-after-clear
+        // ordering, which is where the bug lived.
+        fn validate_close(_sym: &Self::Sym, _meta: &Self::Meta) -> bool {
+            false
+        }
+    }
+
+    /// Regression: the whole-circuit single-pass CloseLoop arm captures the
+    /// walk-final scalar state fields off the still-live sym (into
+    /// `single_pass_scalar_values`) BEFORE it clears `self.sym`, and
+    /// `writeback_scalar_state_fields` applies that stash to native `state`
+    /// afterward. Previously the write-back read `self.sym` directly, but the
+    /// CloseLoop arm had already set `self.sym = None`, so the write-back was
+    /// always a silent no-op — a program whose walk advanced a scalar (e.g. an
+    /// aheui SEL changing `selected`) would seed native state from the stale
+    /// trace-start value.
+    #[test]
+    fn single_pass_close_writes_back_walk_final_scalar() {
+        let mut driver = JitDriver::<ScalarWalkState>::new(1);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+
+        // Trace-start native state: selected == 3.
+        let mut state = ScalarWalkState {
+            selected: 3,
+            writeback_applied: None,
+        };
+        let target_pc = 7usize;
+        let key = target_pc as u64;
+
+        // Start a real trace: this seeds `driver.sym` via create_sym +
+        // initialize_sym (sym.selected == 3) and installs the trace session.
+        driver.force_start_tracing(key, target_pc, &mut state, &());
+        assert!(
+            driver.is_tracing(),
+            "force_start_tracing must start a trace"
+        );
+
+        // Drive the merge point to a CloseLoop. The closure stands in for the
+        // walk: it advances the scalar on the sym (selected 3 -> 9) and stamps
+        // the walk-final pc so the single-pass outcome is published, then
+        // closes the loop.
+        driver.merge_point(|meta, sym| {
+            sym.selected = 9;
+            if let Some(ctx) = meta.trace_ctx() {
+                ctx.walk_final_pc = Some(target_pc);
+            }
+            TraceAction::CloseLoop
+        });
+
+        // merge_point cleared the sym as part of CloseLoop handling.
+        assert!(
+            driver.sym.is_none(),
+            "CloseLoop handling must clear the sym before returning",
+        );
+
+        // Mimic the `jit_merge_point!(...; state)` macro hook: the walk-final
+        // outcome is published, then the write-back applies the captured
+        // walk-final scalar into native state.
+        let outcome = driver.take_single_pass_outcome();
+        assert!(
+            outcome.is_some(),
+            "CloseLoop must publish the single-pass outcome",
+        );
+        driver.writeback_scalar_state_fields(&mut state);
+
+        assert_eq!(
+            state.selected, 9,
+            "native state must receive the walk-final scalar (9), not stay frozen at the trace-start value (3)",
+        );
+        assert_eq!(
+            state.writeback_applied,
+            Some(vec![9]),
+            "write-back must run with the walk-final captured values, not be a no-op",
+        );
     }
 
     #[test]

@@ -3863,6 +3863,30 @@ where
                         self.seen_loop_header_for_jdindex,
                     );
                     self.seen_loop_header_for_jdindex = -1;
+                    // pyjitpl.py:2991-2993 reached_loop_header: generate a dummy
+                    // GUARD_FUTURE_CONDITION just before the implicit JUMP so
+                    // unroll's `jump_to_existing_trace` has a `patchguardop`
+                    // whose `rd_resume_position` it copies onto every extra
+                    // virtual-state guard (unroll.py:333-337, resume.py:397).
+                    // The source-level tracer emits this in `close_loop_args_at`
+                    // (trace_opcode.rs:3397); the state-field dispatch model
+                    // reaches the loop header here instead.  Emitted
+                    // unconditionally at the top of the reached_loop_header
+                    // equivalent, BEFORE the header-match/close/append branching,
+                    // so it fires for EVERY outcome — including the inner-loop
+                    // first-visit append-and-continue path (pyjitpl.py:3058-3060)
+                    // — matching upstream's top-of-function `generate_guard`
+                    // emission.  `record_state_guard` captures the matching resume
+                    // snapshot at `mp_opcode_pc`, mirroring `generate_guard`'s
+                    // `capture_resumedata` (pyjitpl.py:2591-2602).
+                    self.record_state_guard(
+                        ctx,
+                        sym,
+                        OpCode::GuardFutureCondition,
+                        &[],
+                        mp_opcode_pc,
+                        false,
+                    );
                     // pyjitpl.py:2974-3060 reached_loop_header: close the loop
                     // ONLY when the current merge point's green key matches the
                     // trace-start (loop-header) key — `same_greenkey`
@@ -3950,26 +3974,8 @@ where
                             ctx.walk_final_pc = mp_green_pc.map(|p| p as usize);
                             ctx.walk_final_reds = std::mem::take(&mut walk_reds);
                         }
-                        // pyjitpl.py:2967-2969 reached_loop_header: emit a dummy
-                        // GUARD_FUTURE_CONDITION just before the implicit JUMP so
-                        // unroll's `jump_to_existing_trace` has a `patchguardop`
-                        // whose `rd_resume_position` it copies onto every extra
-                        // virtual-state guard (unroll.py:333-337, resume.py:397).
-                        // The source-level tracer emits this in
-                        // `close_loop_args_at` (trace_opcode.rs:3397); the
-                        // state-field dispatch model closes here instead, so the
-                        // GFC must be recorded here.  `record_state_guard`
-                        // captures the matching resume snapshot at
-                        // `mp_opcode_pc`, mirroring `generate_guard`'s
-                        // `capture_resumedata` (pyjitpl.py:2591-2602).
-                        self.record_state_guard(
-                            ctx,
-                            sym,
-                            OpCode::GuardFutureCondition,
-                            &[],
-                            mp_opcode_pc,
-                            false,
-                        );
+                        // GUARD_FUTURE_CONDITION already emitted unconditionally at
+                        // the reached_loop_header entry above (pyjitpl.py:2993).
                         return TraceAction::CloseLoop;
                     }
                     // No same_greenkey match — fall through and keep tracing
@@ -4031,14 +4037,9 @@ where
                                     ctx.walk_final_pc = Some(pc as usize);
                                     ctx.walk_final_reds = std::mem::take(&mut walk_reds);
                                 }
-                                self.record_state_guard(
-                                    ctx,
-                                    sym,
-                                    OpCode::GuardFutureCondition,
-                                    &[],
-                                    mp_opcode_pc,
-                                    false,
-                                );
+                                // GUARD_FUTURE_CONDITION already emitted
+                                // unconditionally at the reached_loop_header entry
+                                // above (pyjitpl.py:2993).
                                 return TraceAction::CloseLoop;
                             }
                             // first visit → append and keep tracing

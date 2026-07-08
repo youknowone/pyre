@@ -868,12 +868,26 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             }
         })
         .collect();
-    // D2 per-opcode single-executor: write each scalar state field back into
-    // native state from the walk's persistent sym (`state_field_value`), the
-    // inverse of `initialize_sym_scalar_parts`. recover runs afterwards and
-    // overwrites the storage-derived caches, so only scalars recover cannot
-    // re-derive (e.g. aheui `selected`) meaningfully carry through.
-    let writeback_scalar_parts: Vec<TokenStream> = scalars
+    // D2 per-opcode single-executor: read each scalar state field's concrete
+    // value off the walk's persistent sym in scalar index order (mirrors
+    // `state_field_value` / the `<field>_value` slots). Captured at the
+    // CloseLoop point (while the sym is still live) into
+    // `MetaInterp::single_pass_scalar_values`.
+    let collect_scalar_values_parts: Vec<TokenStream> = scalars
+        .iter()
+        .map(|(_, f)| {
+            let value_name = quote::format_ident!("{}_value", f.name);
+            quote! { values.push(sym.#value_name); }
+        })
+        .collect();
+    // D2 per-opcode single-executor: write each captured scalar state-field
+    // value back into native state, the inverse of
+    // `initialize_sym_scalar_parts`. `values[idx]` is the scalar at
+    // state-field index `idx` (the order `collect_scalar_values_parts`
+    // produced). recover runs afterwards and overwrites the storage-derived
+    // caches, so only scalars recover cannot re-derive (e.g. aheui `selected`)
+    // meaningfully carry through.
+    let writeback_from_values_parts: Vec<TokenStream> = scalars
         .iter()
         .enumerate()
         .map(|(idx, (_, f))| {
@@ -881,11 +895,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             let rust_ty = scalar_rust_type(&f.kind);
             let idx_lit = idx;
             quote! {
-                if let Some(__v) =
-                    majit_metainterp::JitCodeSym::state_field_value(sym, #idx_lit)
-                {
-                    self.#fname = __v as #rust_ty;
-                }
+                self.#fname = values[#idx_lit] as #rust_ty;
             }
         })
         .collect();
@@ -2056,8 +2066,14 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 #recover_body
             }
 
-            fn writeback_scalar_state_fields_from_sym(&mut self, sym: &Self::Sym) {
-                #(#writeback_scalar_parts)*
+            fn collect_scalar_state_field_values(sym: &Self::Sym) -> Vec<i64> {
+                let mut values = Vec::new();
+                #(#collect_scalar_values_parts)*
+                values
+            }
+
+            fn writeback_scalar_state_fields_from_values(&mut self, values: &[i64]) {
+                #(#writeback_from_values_parts)*
             }
 
             fn state_field_layout(&self) -> majit_metainterp::blackhole::StateFieldLayout {

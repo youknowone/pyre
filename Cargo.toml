@@ -33,6 +33,7 @@ members = [
     "majit/examples/tlc",
     "majit/examples/calc",
     "majit/examples/i64env",
+    "majit/examples/spcount",
     # pyre
     "pyre/pyre-object",
     "pyre/pyre-macros",
