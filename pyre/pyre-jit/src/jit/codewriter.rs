@@ -6698,8 +6698,48 @@ impl CodeWriter {
                     && (canraise_pending
                         || (branch_target_pcs.contains(&py_pc)
                             && current_block.block().borrow().exits.is_empty()));
+                // A sequential fall-through into a PC that already carries a
+                // live joinpoint block OTHER than `current_block` is a merge,
+                // not a plain continuation: the arriving edge must be unioned
+                // and recorded.  `mergeblock` (arm 1) appends that terminating
+                // fall-through edge via `append_exit`; the joinpoint-arrival
+                // arm below does NOT — it assumes the branch that registered
+                // the joinpoint already appended its own edge, which holds for
+                // a `goto`/branch arrival but not for a sequential fall-in.
+                // The fast-path guard `current_state.next_offset == py_pc`
+                // (set to `py_pc + 1` after each op dispatch, so it equals the
+                // NEXT PC) suppresses arm 1 for the normal single-successor
+                // step, but that same guard misfires when the next PC is a
+                // merge point reached by fall-through: arm 1 is skipped and the
+                // arm below switches to the sibling without ever closing
+                // `current_block`, leaving it `exits==0` — an orphan that
+                // `flatten`'s empty-exits path routes to `make_return`.  Route
+                // the fall-through through `mergeblock` so `current_block` gets
+                // its `goto` exit.  Mirrors the per-block walker
+                // (`flowcontext.py:407-475`), where a block's terminating link
+                // into a merge point always unions via `mergeblock`, never a
+                // bare block switch.  The `framestate().next_offset != py_pc`
+                // guard excludes the block's own entry PC (no self-loop), and
+                // `b != current_block` excludes a self-registered candidate.
+                let joinpoint_merge_pending = needs_fallthrough
+                    && current_block
+                        .framestate()
+                        .map_or(true, |fs| fs.next_offset != py_pc)
+                    // Only a block that fell through WITHOUT a terminator (no
+                    // exits yet) needs the merge edge.  A block already closed
+                    // by a conditional branch (POP_JUMP_IF_*) carries its
+                    // Bool/Signed exit pair; appending a plain `(None, None)`
+                    // fall-through exit on top would produce the mixed
+                    // `[Bool, Bool, (None, None)]` shape that trips
+                    // `flatten.py:275-296 insert_switch_exits`.
+                    && current_block.block().borrow().exits.is_empty()
+                    && joinpoints.get(&py_pc).map_or(false, |blocks| {
+                        blocks.iter().any(|b| !b.dead() && b != &current_block)
+                    });
                 let new_block = if needs_fallthrough
-                    && (current_state.next_offset != py_pc || force_branch_boundary)
+                    && (current_state.next_offset != py_pc
+                        || force_branch_boundary
+                        || joinpoint_merge_pending)
                 {
                     let merged = mergeblock(
                         code,
@@ -14952,6 +14992,68 @@ mod tests {
         assert!(
             mainjitcode.is_skeleton(),
             "call.py:147 binds the shell before codewriter.py:80 fills it"
+        );
+    }
+
+    #[test]
+    fn walker_fallthrough_into_joinpoint_pc_appends_edge_no_orphan() {
+        // gh#389 with-narrow regression: a hot loop whose body has two
+        // `with` blocks — one routing an exception through `__exit__`/
+        // WITH_EXCEPT_START — produces a normal-flow join PC (the `else:`
+        // continuation) that the PC-sequential walker reaches BOTH by a
+        // forward `goto` (JUMP_FORWARD → mergeblock, which appends the
+        // edge) AND by sequential fall-through from the preceding
+        // handler-adjacent block.  The fall-through arrival lands one PC
+        // past the join's start (`next_offset == py_pc` after the join
+        // PC's own op dispatches), so the boundary-force in
+        // `emit_mark_label_pc!` was skipped and the joinpoint-arrival arm
+        // switched to the sibling block WITHOUT appending the terminating
+        // edge — leaving the join block with `exits==0, operations==0`
+        // and a full-framestate `inputargs`.  `flatten`'s empty-exits
+        // path then routes that block to `make_return`, tripping the
+        // "1 or 2 args" invariant.  The fix routes the fall-through
+        // through `mergeblock` so the join block gets its `goto` exit.
+        let source = "\
+def run(iters):
+    caught = 0
+    swallowed = 0
+    k = 0
+    while k < iters:
+        with CM(\"normal\"):
+            k = k
+        try:
+            with CM(\"swallow\"):
+                raise ValueError(\"x\")
+        except ValueError:
+            caught += 1
+        else:
+            swallowed += 1
+        k += 1
+    return caught, swallowed
+";
+        let code = first_nested_function_code(source);
+        let w_code = pyre_interpreter::box_code_constant(&code);
+        let code_ptr = unsafe {
+            pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject
+        };
+        let writer = CodeWriter::new();
+        writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
+            portal_graph: code_ptr,
+            mainjitcode: None,
+        });
+
+        // Drives the full codewriter walker (graph build → flatten).
+        // Before the fix this panics inside `make_return` with
+        // "expects 1 or 2 args, got 6".
+        writer.make_jitcodes();
+
+        assert!(
+            writer
+                .callcontrol()
+                .find_compiled_jitcode_arc(code_ptr)
+                .is_some(),
+            "walker must produce a jitcode for the with/exception loop \
+             without tripping the make_return empty-exits invariant"
         );
     }
 
