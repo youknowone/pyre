@@ -4,9 +4,9 @@
 # (a non-journaled STORE_SUBSCR-class heap effect committed inside a user
 # frame).  A FOR_ITER trace that consumes the iterator, aborts on the deep
 # kept-stack guard, and then DELIVERS the in-flight item would re-run the body
-# and DOUBLE the mutation.  The `log` length must equal the iteration count
-# exactly (2 mutations per iteration): a doubled delivery over-counts, a
-# dropped iteration under-counts.
+# and DOUBLE the mutation.  The `log` length must equal 3x the iteration count
+# exactly (g, h, and one conditional g/h append per iteration): a doubled
+# delivery over-counts, a dropped iteration under-counts.
 log = []
 
 
