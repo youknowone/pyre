@@ -2603,14 +2603,16 @@ fn compute_bridge_root_parent_frame(
         None,
         // Paused ROOT (outermost caller) frame: the sentinel is
         // correct-by-construction, not a lossy deferral.  `resume_py_pc` is a
-        // CALL-return fallthrough opcode boundary where `pc_map` is lossless
+        // CALL-return fallthrough opcode boundary where the py_pc→jitcode
+        // translation is lossless
         // (no kept operand-stack temp), so the frame resumes through the plain
-        // `py_pc → pc_map` path — matching the emit-side sentinel the paused
+        // `py_pc → resume_jitcode_pc_for` path — matching the emit-side sentinel
+        // the paused
         // caller word carries elsewhere.  It must NOT be "upgraded" to a direct
         // pc without a real per-frame `MIFrame.pc` for the whole caller chain
         // (the `#124`/task#50 register↔value-stack rework); the only
-        // pc_map-independent carried coordinate today is the kept-stack branch
-        // guard's own `op.pc`.
+        // translation-independent carried coordinate today is the kept-stack
+        // branch guard's own `op.pc`.
         majit_ir::resumedata::NO_JITCODE_PC,
         None,
     );
@@ -6475,7 +6477,7 @@ fn collect_outer_active_boxes(
     // JitCode coordinate so the encoder's color set matches the decoder's
     // (`setup_bridge_sym` / `rebuild_inline_callee`), which read the same
     // carried word.  With the flag off `carried_jitcode_pc` is ignored and
-    // this is the plain `pc_map`-keyed query.
+    // this is the plain py_pc→jitcode-translation query.
     let banks = crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
         outer_jitcode_index as i32,
         entry_py_pc as i32,
@@ -6849,8 +6851,9 @@ thread_local! {
     /// callee's non-standard heap frame — must resume at the *caller's*
     /// CALL boundary (`ctx.entry_py_pc` / `ctx.outer_active_boxes`), not
     /// at the callee `op_pc` mapped through the outer (`FULL_BODY_SNAPSHOT_SYM`)
-    /// jitcode's `pc_map`.  The callee `op_pc` is meaningless in the outer
-    /// pc_map, and pyre's blackhole can only re-enter the caller's Python
+    /// jitcode's py_pc→jitcode translation.  The callee `op_pc` is meaningless
+    /// in that outer
+    /// translation, and pyre's blackhole can only re-enter the caller's Python
     /// opcode; resuming at the CALL boundary re-executes the whole call,
     /// which is sound for the side-effect-free leaves this path inlines.
     static INLINE_SUBWALK_CAPTURE_BOUNDARY: std::cell::Cell<bool> =
@@ -6903,7 +6906,8 @@ thread_local! {
     /// that aborted the walk fired inside an inline sub-walk
     /// ([`INLINE_SUBWALK_CAPTURE_BOUNDARY`]).  When set, the abort's jitcode
     /// `op.pc` is a CALLEE coordinate with no meaning in the outer
-    /// (`FULL_BODY_SNAPSHOT_SYM`) `pc_map`, so the abort-point flush must
+    /// (`FULL_BODY_SNAPSHOT_SYM`) py_pc→jitcode translation, so the
+    /// abort-point flush must
     /// decline and fall back to the legacy replay.  Captured at the marker
     /// (before the sub-walk's RAII guard restores the boundary flag) so the
     /// top-level walk driver reads the abort-time value, not the unwound one.
@@ -7247,18 +7251,20 @@ pub(crate) fn fbw_loop_callee_ca_enabled() -> bool {
 /// resume pc for the non-branch specialization guards (`GuardValue` /
 /// `GuardClass`) instead of the `NO_JITCODE_PC` sentinel, so their resume
 /// decode consults the carried word rather than the stored Python pc →
-/// `pc_map` translation.
+/// jitcode translation.
 ///
 /// The carried word is `resume_jitcode_pc_for(py_pc)` — the SAME `-live-`
-/// marker offset the `pc_map` fallback returns — not the guard op's raw
+/// marker offset that translation returns — not the guard op's raw
 /// `op_pc`.  These guards resume by re-executing their own opcode at
 /// `orgpc` with a deterministic operand stack (no kept temp), so the
-/// marker `pc_map[py_pc]` names is a valid startpoint (`can_decode_live_vars`
+/// marker `resume_jitcode_pc_for(py_pc)` names is a valid startpoint
+/// (`can_decode_live_vars`
 /// holds) AND identical to what the decoder would translate to — the encoder
 /// (`collect_outer_active_boxes` reg banks) and decoder (`setposition` /
 /// liveness) resolve the same offset, keeping the box layout symmetric.
-/// Carrying the raw `op_pc` (which may sit mid-opcode, `op_pc != pc_map[
-/// py_pc]`) is what broke the earlier attempt; anchoring to the marker
+/// Carrying the raw `op_pc` (which may sit mid-opcode,
+/// `op_pc != resume_jitcode_pc_for(py_pc)`) is what broke the earlier attempt;
+/// anchoring to the marker
 /// avoids that.  Default ON — corpus-wide OFF/ON byte-equality validated on
 /// both backends (171/171 dynasm + cranelift); opt out with
 /// `PYRE_M366_NONBRANCH_PC=0`.
@@ -8682,7 +8688,8 @@ fn reseed_vstack_from_shadow(ctx: &mut WalkContext<'_, '_>, new_depth: usize) ->
 /// `-live-` marker names — the marker case returns an EARLIER py_pc and
 /// makes the mirror's boundary detection oscillate.  Uses only the
 /// `first_jit_pc_by_py_pc` containment table (largest `py` with
-/// `first_jit[py] <= jit_pc`); falls back to the nearest-`pc_map` heuristic
+/// `first_jit[py] <= jit_pc`); falls back to the nearest-`-live-`-marker
+/// heuristic (reconstructed via [`pc_map_marker_for`])
 /// when that table is empty (portal-bridge / fixture installs).
 fn vstack_containing_py_pc(metadata: &crate::PyJitCodeMetadata, jit_pc: usize) -> u32 {
     let first_jit = &metadata.first_jit_pc_by_py_pc;
@@ -8779,7 +8786,8 @@ fn step_vstack_mirror(ctx: &mut WalkContext<'_, '_>, jit_pc: usize) {
     }
     // Inside an inline sub-walk the `jit_pc` is a CALLEE coordinate that
     // does not exist in the outer (`FULL_BODY_SNAPSHOT_SYM`) jitcode's
-    // pc_map, so `python_pc_for_jitcode_pc` would return garbage and a
+    // py_pc→jitcode tables, so `python_pc_for_jitcode_pc` would return garbage
+    // and a
     // callee `write_ref_reg` would clobber `vstack_last_ref`.  Decline the
     // whole mirror for any walk that inlines a Python call — the benches
     // this targets (short-circuit `or`/`and` chains) are call-free, and
@@ -8960,13 +8968,16 @@ fn vstack_enter_exception_handler(
 }
 
 /// `PYRE_PCMAP_CARRY_AUDIT` enables the assertion that the ONLY carried
-/// `guard_jitcode_pc` word not derivable from `pc_map` is the kept-stack
+/// `guard_jitcode_pc` word not derivable from the py_pc→jitcode resume
+/// translation is the kept-stack
 /// branch guard's own `op.pc` (the walker `MIFrame.pc`, stashed in
 /// `BRANCH_GUARD_JITCODE_PC`).  Every other carried word equals
 /// `resume_jitcode_pc_for(py_pc)` / `after_residual_call_resume_pc_for(..)`
-/// — a `pc_map` read relocated from decode to encode, not an independent
-/// coordinate.  This certifies the `pc_map`-deletion precondition: the map
-/// stays load-bearing until the kept-stack coordinate is re-sourced off the
+/// — a resume-translation read relocated from decode to encode, not an
+/// independent
+/// coordinate.  This certified the precondition for deleting the dense
+/// translation map: it stayed load-bearing until the kept-stack coordinate is
+/// re-sourced off the
 /// walker `op.pc` for every frame (the `#124`/task#50 register↔value-stack
 /// rework).  Diagnostic only; off in production.
 fn carry_audit_enabled() -> bool {
@@ -8980,9 +8991,10 @@ fn carry_audit_enabled() -> bool {
 /// (`bridge_semantic_maps_at_with_jitcode_pc`): for a carried genuine
 /// `jitcode_pc`, `pcdep_for_jitcode_pc(jp)` equals
 /// `pcdep_color_slots[python_pc_for_jitcode_pc(jp)]` and likewise for depth.
-/// Both are compile-time derivations of the same `pc_map` / `first_jit`
+/// Both are compile-time derivations of the same resume-marker / `first_jit`
 /// coordinates, so the equality holds by construction; the audit certifies the
-/// precondition for retiring the decode-side `pc_map` re-inversion (the twins
+/// precondition for retiring the decode-side jitcode-pc→py-pc re-inversion
+/// (the twins
 /// can source pcdep/depth from the carried `jitcode_pc` without the py_pc
 /// channel). Diagnostic only; off in production.
 pub(crate) fn bridge_audit_enabled() -> bool {
@@ -9030,7 +9042,8 @@ pub(crate) fn python_pc_for_jitcode_pc(metadata: &crate::PyJitCodeMetadata, jit_
     // Exact inverse: `first_jit_pc_by_py_pc[py]` is the byte offset of the
     // FIRST instruction opcode `py` emitted (`usize::MAX` = the PC emitted
     // no jitcode of its own), so the containing opcode is the largest `py`
-    // whose first offset is at-or-before `jit_pc`.  `pc_map` cannot serve
+    // whose first offset is at-or-before `jit_pc`.  The resume-marker
+    // resolution cannot serve
     // here: it resolves each PC to its nearest `-live-` marker at-or-before
     // (sparse markers, carry-forward repeats), so whole PC runs share one
     // value and the inverse is ambiguous.
@@ -9038,7 +9051,7 @@ pub(crate) fn python_pc_for_jitcode_pc(metadata: &crate::PyJitCodeMetadata, jit_
     // head (branch target / catch target, reached via
     // `resolve_branch_target_through_trampoline`): it belongs to the
     // FIRST Python opcode that resumes at that marker — the start of the
-    // carry-forward run in `pc_map` — not to the preceding opcode whose
+    // marker's carry-forward run — not to the preceding opcode whose
     // emitted region the marker byte happens to fall inside.  Real op
     // positions never collide with marker positions (each byte belongs
     // to exactly one instruction), so this test only fires for block
@@ -9142,8 +9155,8 @@ fn skip_python_trivia_forward(code: &pyre_interpreter::CodeObject, mut py_pc: us
 /// `PyFrame`, not from jitcode registers — so the register renaming is
 /// irrelevant to it; the correct resume coordinate is the trampoline's
 /// ultimate destination, which IS a py-boundary block (starts with a
-/// `live/` marker and has an exact `pc_map` entry).  Without this
-/// resolution the inverse-`pc_map` maps the trampoline offset (no
+/// `live/` marker and has an exact resume-marker entry).  Without this
+/// resolution the jitcode-pc→py-pc inversion maps the trampoline offset (no
 /// boundary) to the wrong Python opcode (the nearest preceding entry,
 /// e.g. `RETURN_VALUE`), so the guard resumes past its real target.
 ///
@@ -9154,7 +9167,7 @@ fn skip_python_trivia_forward(code: &pyre_interpreter::CodeObject, mut py_pc: us
 /// link, the second to the destination opcode).  So "starts with `live/`"
 /// does NOT terminate the scan; instead the scan skips through `live` /
 /// `ref_copy`, follows `goto`, and returns the LAST `live` position seen
-/// before the first real op — that marker has the exact `pc_map` entry
+/// before the first real op — that marker has the exact resume-marker entry
 /// for the destination Python opcode.  Returning the outer block-head
 /// instead resolves through the first-emission table to whatever opcode
 /// the codewriter placed before the trampoline in jitcode order — an
@@ -9238,7 +9251,7 @@ fn decode_branch_trampoline_ref_moves(code: &[u8], tramp_start: usize) -> Option
 /// The frame whose JitCode byte offsets the branch-resume gate readers
 /// ([`branch_resume_target_stack_depth`] and the kept-slot hazard checks)
 /// resolve through.  Holds the frame's `PyJitCode` payload — its `metadata`
-/// (`pc_map` for the jitcode-pc → Python-pc inversion) and `code_ptr` (the
+/// (the tables for the jitcode-pc → Python-pc inversion) and `code_ptr` (the
 /// liveness key).
 ///
 /// Two constructors mark the frame model: the gate must read the frame whose
@@ -9291,8 +9304,9 @@ impl ActiveResumeFrame {
 /// `target` is a jitcode pc — the `goto_if_not` `other_target` (the
 /// not-taken arm a guard failure deopts into).  Maps it back to the
 /// Python opcode boundary the blackhole resumes at (same coordinate
-/// resolution as `walker_capture_snapshot_for_last_guard_impl`: inverse
-/// `pc_map` + forward trivia skip) and reads the forward stack-depth
+/// resolution as `walker_capture_snapshot_for_last_guard_impl`: the
+/// jitcode-pc→py-pc inversion + forward trivia skip) and reads the forward
+/// stack-depth
 /// analysis.  A depth `> 0` means the resume target carries a live
 /// operand-stack temp — the short-circuit / conditional-expression /
 /// chained-comparison shape the single-frame snapshot cannot rebuild on
@@ -9788,7 +9802,7 @@ fn walker_capture_inline_nonstandard_vable_guard(
     // The non-standard identity guard resumes at the caller's CALL
     // boundary (`entry_py_pc`), re-executing the whole call on deopt —
     // there is no kept-stack JitCode coordinate to preserve, so the
-    // frame resumes through the Python pc → pc_map path.
+    // frame resumes through the Python pc → jitcode resume-translation path.
     ctx.trace_ctx
         .capture_snapshot_for_last_guard_op_with_vable_vref(
             &ctx.outer_active_boxes,
@@ -9871,7 +9885,8 @@ fn walker_capture_snapshot_for_last_guard_impl(
     // static entry-time coordinate the per-opcode arm path uses.
     let full_body_sym = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
     // Inline sub-walk: the guard's `op_pc` is a *callee* coordinate that
-    // does not exist in the outer (`full_body_sym`) jitcode's `pc_map`.
+    // does not exist in the outer (`full_body_sym`) jitcode's py_pc→jitcode
+    // tables.
     // Skip the full-body mapping and fall through to the caller-boundary
     // capture below, which resumes at the CALL site (re-execute the
     // call on deopt — see `INLINE_SUBWALK_CAPTURE_BOUNDARY`).
@@ -9922,7 +9937,7 @@ fn walker_capture_snapshot_for_last_guard_impl(
             let (py_pc, jitcode_index, num_instrs) = unsafe {
                 let jc = &*sym.jitcode;
                 let mut py = python_pc_for_jitcode_pc(&jc.payload.metadata, op_pc);
-                // The inverse-`pc_map` can land on a Python trivia
+                // The jitcode-pc→py-pc inversion can land on a Python trivia
                 // instruction's jitcode region (e.g. a branch target
                 // whose block lowers `NOT_TAKEN`).  A resume coordinate
                 // must be a real opcode: the trait path resumes branches
@@ -10146,23 +10161,27 @@ fn walker_capture_snapshot_for_last_guard_impl(
             // as the resume coordinate ONLY for branch guards — they stash
             // their own pc in `BRANCH_GUARD_JITCODE_PC`, the
             // kept-stack-across-branch precision `setposition(jitcode,
-            // miframe.pc)` preserves and the lossy `py_pc → pc_map` collapses.
+            // miframe.pc)` preserves and the lossy `py_pc → jitcode`
+            // resume-translation collapses.
             //
             // Every other guard (guard_value / guard_class / guard_no_exception,
             // the `after_residual_call` family) resumes at a `py_pc` whose
             // operand stack is in a deterministic state with no kept temp, so
-            // its `pc_map` translation is already exact; it keeps the sentinel
-            // and decodes via `py_pc → pc_map`, identical to the flag-off
+            // its resume-translation is already exact; it keeps the sentinel
+            // and decodes via `py_pc → jitcode`, identical to the flag-off
             // baseline.  Carrying `op_pc` for those broke encoder ↔ decoder
             // symmetry: `collect_outer_active_boxes` resolves the reg banks at
             // the carried coordinate but `live_locals` / `stack_color_map` at
-            // `entry_py_pc`, and for a non-branch guard `op_pc != pc_map[py_pc]`
+            // `entry_py_pc`, and for a non-branch guard
+            // `op_pc != resume_jitcode_pc_for(py_pc)`
             // — the two windows diverge and the decoded box layout mismatches.
             let guard_jitcode_pc: i32 = if guard_jc_pc_raw != usize::MAX {
                 // The kept-stack branch guard's own `op.pc` (walker
-                // `MIFrame.pc`) — the ONE carried word not sourced from
-                // `pc_map`.  Certify that: it must differ from the `pc_map`
-                // round-trip of its resume `py_pc`, or `pc_map` would already
+                // `MIFrame.pc`) — the ONE carried word not sourced from the
+                // resume-translation.  Certify that: it must differ from the
+                // resume-translation
+                // round-trip of its resume `py_pc`, or that translation would
+                // already
                 // suffice and the carry would be a pure relocation.
                 if carry_audit_enabled() {
                     let jc = unsafe { &*sym.jitcode };
@@ -10196,16 +10215,19 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 // depth-0 branch guards (`GuardTrue`/`GuardFalse`, kept-stack
                 // depth>0 branches take the first arm carrying `op.pc`).  For
                 // every guard here the decoder's baseline already resolves
-                // `pc_map[py_pc]` — the same `py_pc` and the same forward
+                // `resume_jitcode_pc_for(py_pc)` — the same `py_pc` and the same
+                // forward
                 // lookup — so carrying `resume_jitcode_pc_for(py_pc)` is
                 // identical to that fallback by construction, keeping the
                 // encoder reg-bank window and decoder liveness symmetric.  It is
                 // a valid startpoint (`can_decode_live_vars` holds: the baseline
-                // decodes `pc_map[py_pc]` without `_missing_liveness` today).
+                // decodes `resume_jitcode_pc_for(py_pc)` without
+                // `_missing_liveness` today).
                 // The `after_residual_call` family is excluded — it routes
                 // through the separate `after_residual_call_resume_pc` map + the
-                // bit-14 marker, so `pc_map[py_pc]` would name a different
-                // offset.  Fall back to the sentinel if `py_pc` has no `pc_map`
+                // bit-14 marker, so `resume_jitcode_pc_for(py_pc)` would name a
+                // different
+                // offset.  Fall back to the sentinel if `py_pc` has no resume
                 // entry (portal-bridge / out-of-range).
                 let marker = unsafe {
                     let jc = &*sym.jitcode;
@@ -10223,7 +10245,7 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 // These resume AFTER the residual call at the marker the
                 // decoder already resolves for this guard, so carrying it
                 // directly makes decode consult the carried word instead of
-                // the bit-14-marked / plain `py_pc → pc_map` translation.
+                // the bit-14-marked / plain `py_pc → jitcode` resume-translation.
                 //
                 // Which marker the decoder resolves depends on the sub-case
                 // captured in `marker_call_py_pc` (set above at the CALL pc):
@@ -10233,7 +10255,8 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 //     that same post-call catch `-live-` offset.
                 //   * `None` — plain sequential residual call resuming at the
                 //     next opcode's start marker: decode routes the plain word
-                //     through `pc_map`, so carry `resume_jitcode_pc_for(py_pc)`.
+                //     through the resume-translation, so carry
+                //     `resume_jitcode_pc_for(py_pc)`.
                 //     `py_pc == liveness_py_pc` here: the residual-call path
                 //     never stashes `BRANCH_GUARD_JITCODE_PC` (only kept-stack
                 //     branch guards do), so `guard_jc_pc_raw == usize::MAX` and
@@ -10270,7 +10293,7 @@ fn walker_capture_snapshot_for_last_guard_impl(
             // — the kept operand stack is naturally live at the guard pc and is
             // recovered from the walk-level box mirror in
             // `collect_outer_active_boxes`.  A non-branch guard carries no guard
-            // pc, so it keeps the merge `py_pc` and its exact `pc_map` translation.
+            // pc, so it keeps the merge `py_pc` and its exact resume-translation.
             let liveness_py_pc = guard_py_pc.unwrap_or(py_pc);
             // The snapshot resume pc folds in the bit-14 marker for a try-block
             // residual call so the decode routes through
@@ -10314,7 +10337,8 @@ fn walker_capture_snapshot_for_last_guard_impl(
 
     // Per-opcode arm path: `op_pc` (arm-local PC) is not a blackhole
     // resume point, so the snapshot uses the static outer coordinate and
-    // resumes via the Python pc → pc_map path (no JitCode coordinate).
+    // resumes via the Python pc → jitcode resume-translation path (no JitCode
+    // coordinate).
     let _ = op_pc;
     let (vable_boxes, vref_boxes) = ctx.trace_ctx.build_snapshot_vable_vref_boxes();
     ctx.trace_ctx
@@ -10334,7 +10358,8 @@ fn walker_capture_snapshot_for_last_guard_impl(
 /// (`ctx.registers_*`) are still in scope.  `call_jit_pc` is the CALL op's
 /// jitcode pc in the caller.  Returns `None` (→ caller declines the inline)
 /// when the caller frame is not snapshot-able for this first slice: missing
-/// liveness/pc_map, a CALL inside a try-block (catch marker resume pc is not
+/// liveness / resume tables, a CALL inside a try-block (catch marker resume pc
+/// is not
 /// representable in the multi-frame capture's bit-14-free py_pc slot), or no
 /// result on the operand stack at the return point.
 ///
@@ -10351,7 +10376,7 @@ fn compute_inline_caller_frame(
     // (`FBW_INLINE_CODE_STACK.last()` is Some), the immediate caller of THIS
     // call is that intermediate callee (a sym-less sub-jitcode), not the
     // top-level `FULL_BODY_SNAPSHOT_SYM`.  Compute its paused frame from that
-    // jitcode (index / liveness / pc_map via its `PyJitCode`), reading the
+    // jitcode (index / liveness / resume tables via its `PyJitCode`), reading the
     // boxes from the caller's live register banks (`ctx.registers_*`, which ARE
     // the intermediate callee's banks here) via the sym-less
     // `collect_callee_active_boxes`.  The stack is empty for a top-level
@@ -10488,7 +10513,8 @@ fn compute_nested_inline_caller_frame(
         ctx.registers_r[result_color] = null_ref;
     }
     // A paused caller frame resumes at the CALL return point via the
-    // Python-pc → pc_map path; no kept-stack jitcode coordinate is carried for
+    // Python-pc → jitcode resume-translation path; no kept-stack jitcode
+    // coordinate is carried for
     // it (mirrors the caller-frame handling at the depth-2 callee site), so it
     // queries liveness through the `fallthrough_py_pc` window with the sentinel.
     let boxes = collect_callee_active_boxes(
@@ -10615,7 +10641,8 @@ fn walker_capture_multi_frame_inline_snapshot(
     // `BRANCH_GUARD_JITCODE_PC`; otherwise the guard's own offset is
     // `callee_op_pc`.  `after_residual_call` guards resume BEFORE the call and
     // keep the sentinel.  The paused caller frames resume at the CALL return
-    // point via the Python pc → pc_map path, so they keep the sentinel too (no
+    // point via the Python pc → jitcode resume-translation path, so they keep
+    // the sentinel too (no
     // kept-stack coordinate is carried for them in M2).  Computed BEFORE the box
     // collection so it queries liveness at the SAME coordinate the decoder
     // resumes at.
@@ -11560,7 +11587,8 @@ fn collect_callee_active_boxes(
 ) -> Result<Vec<OpRef>, DispatchError> {
     // The resume decoder consumes this frame's section per the liveness at the
     // carried `jitcode_pc` (`setposition` → `get_current_position_info`), not
-    // the lossy `pc_map(callee_py_pc)` window.  Query the SAME carried
+    // the lossy `resume_jitcode_pc_for(callee_py_pc)` window.  Query the SAME
+    // carried
     // coordinate so the encoder's box bank set agrees with the decoder's
     // section sizes (mirror of `collect_outer_active_boxes`:5060 and
     // `state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc`:1399).  A
@@ -12587,7 +12615,8 @@ fn try_walker_inline_user_call(
         // `vable_getfield_*` records internally — resume at this CALL
         // boundary (`sub_wc.entry_py_pc` / `outer_active_boxes`, inherited
         // from the caller), not at a callee `op_pc` that has no meaning in
-        // the outer jitcode's pc_map.  See `INLINE_SUBWALK_CAPTURE_BOUNDARY`.
+        // the outer jitcode's py_pc→jitcode tables.  See
+        // `INLINE_SUBWALK_CAPTURE_BOUNDARY`.
         let _inline_boundary = InlineSubwalkCaptureGuard::enter();
         // Track this callee on the FBW inline stack for the lifetime of the
         // sub-walk so a nested self-call sees the correct recursion depth.
@@ -15280,7 +15309,8 @@ fn compare_box_provably_dead(ctx: &WalkContext<'_, '_>, compare_pc: usize, dst_r
     // `read_label`), NOT the guard's resume marker, so it does not satisfy
     // the carried-coordinate contract (`can_decode_live_vars` may hold at an
     // interior arm offset whose liveness window differs from the py opcode's
-    // representative resume window). The `pc_map` normalization to the py
+    // representative resume window). The resume-translation normalization to
+    // the py
     // opcode's resume liveness is the intended behavior here, so this reader
     // keeps the py_pc channel and is excluded from the jitcode-pc liveness
     // twin — verified: querying the carried offset directly drops live
@@ -19032,7 +19062,7 @@ fn handle(
                 // #171 sub-walk single-frame collapse: inside an inlined-callee
                 // sub-walk that resumes at the caller's CALL boundary,
                 // `other_target` is a *callee* coordinate absent from the outer
-                // jitcode's `pc_map`, so `branch_resume_target_stack_depth`
+                // jitcode's py_pc→jitcode tables, so `branch_resume_target_stack_depth`
                 // (which maps through `FULL_BODY_SNAPSHOT_SYM`) would read a
                 // meaningless outer depth at the coincidental offset.  The
                 // collapse guard does not resume at a callee coordinate at all:
@@ -19053,7 +19083,7 @@ fn handle(
                 // `ActiveResumeFrame`.  `current()` selects the innermost inlined
                 // callee when a sub-walk is active (else the portal frame), so a
                 // callee branch guard's `other_target` is inverted through the
-                // callee's own pc_map rather than the outer frame's — the frame
+                // callee's own tables rather than the outer frame's — the frame
                 // whose box collection (`collect_callee_active_boxes`) already
                 // keys off the same `FBW_INLINE_CODE_STACK` top.  The #68
                 // multiframe path reaches this `else`; the single-frame collapse
@@ -19294,7 +19324,8 @@ fn handle(
                 // resume coordinate `other_target` names a merge point whose
                 // live colors the walk has not written at the guard point).
                 // A depth-0 branch resumes losslessly at `other_target` via
-                // the baseline `py_pc → pc_map` path; routing it through the
+                // the baseline `py_pc → jitcode` resume-translation path;
+                // routing it through the
                 // guard-pc carrier would resume one opcode early (re-running
                 // `goto_if_not`) and desync the decoded box layout.
                 if kept_stack {
@@ -19562,7 +19593,8 @@ fn handle(
             //
             // Capture the inline-sub-walk state here: an `op.pc` reached
             // inside an inlined callee is a callee coordinate the outer
-            // walk's `pc_map` cannot resolve, so the abort-point flush must
+            // walk's py_pc→jitcode tables cannot resolve, so the abort-point
+            // flush must
             // decline (the sub-walk's RAII guard restores the boundary flag
             // on unwind, so the value must be latched at the marker).
             FBW_ABORT_IN_SUBWALK.with(|c| c.set(INLINE_SUBWALK_CAPTURE_BOUNDARY.with(|b| b.get())));
