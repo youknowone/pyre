@@ -9557,66 +9557,17 @@ impl CodeWriter {
                             // its `(color -> slot)` entry for the M3 body-guard
                             // resume.  TOS is the iterator (`current_depth - 1`).
                             //
-                            // WITHHOLD the reload when the loop body holds a
-                            // CALL result across an in-body conditional branch
-                            // (a `CALL` opcode and a `POP_JUMP_IF_*` both inside
-                            // `[py_pc+1, exhaust_target)`).  That shape produces
-                            // a depth > 1 operand stack of call results kept
-                            // across a short-circuit / conditional guard whose
-                            // COMPILED interior-guard resume cannot yet
-                            // reconstruct the deep slots (the walk-level operand
-                            // mirror reports them present, but the blackhole
-                            // rebuilds them NULL — the #416/#420 deep-kept
-                            // interior-snapshot gap).  Enabling the reload lets
-                            // the walk enter and CONSUME the shared iterator, run
-                            // the body's residual calls concretely, then abort at
-                            // the deep guard — an irreversible half-executed
-                            // iteration that cannot be delivered (re-running the
-                            // body doubles a committed effect) nor cleanly
-                            // dropped (it loses the iteration).  Without the
-                            // reload the `ForIterNext` residual has no bound
-                            // iterator argument, so the walk aborts at the
-                            // FOR_ITER header BEFORE the consume
-                            // (`ResidualCallArgUnbound`) and the location
-                            // interprets permanently — bit-exact, the pre-reload
-                            // behaviour.  condexpr (branch, no call) and
-                            // nested_call (call, no in-body branch) do not match,
-                            // so both keep the reload.  Lifted when the deep-kept
-                            // interior-guard snapshot lands.
-                            let foriter_deep_kept_call_hazard = {
-                                let exhaust_target = jump_target_forward(
-                                    code,
-                                    num_instrs,
-                                    py_pc + 1,
-                                    delta.get(op_arg).as_usize(),
-                                );
-                                let mut scan_state = pyre_interpreter::OpArgState::default();
-                                let mut has_call = false;
-                                let mut has_branch = false;
-                                for scan_pc in 0..num_instrs {
-                                    let (scan_instr, _) =
-                                        scan_state.get(code.instructions[scan_pc]);
-                                    if scan_pc <= py_pc || scan_pc >= exhaust_target {
-                                        continue;
-                                    }
-                                    match scan_instr {
-                                        Instruction::Call { .. }
-                                        | Instruction::CallKw { .. }
-                                        | Instruction::CallFunctionEx
-                                        | Instruction::CallIntrinsic1 { .. }
-                                        | Instruction::CallIntrinsic2 { .. } => has_call = true,
-                                        Instruction::PopJumpIfTrue { .. }
-                                        | Instruction::PopJumpIfFalse { .. }
-                                        | Instruction::PopJumpIfNone { .. }
-                                        | Instruction::PopJumpIfNotNone { .. } => has_branch = true,
-                                        _ => {}
-                                    }
-                                }
-                                has_call && has_branch
-                            };
+                            // The per-iteration reload is unconditional for
+                            // portals.  Deep operand-stack kept temps that an
+                            // in-body branch-guard resume needs (a CALL result
+                            // held across a short-circuit / conditional guard)
+                            // are recovered via the register/liveness channel in
+                            // `walker_capture_snapshot_for_last_guard_impl`
+                            // (jitcode_dispatch.rs), porting
+                            // `get_list_of_active_boxes` (pyjitpl.py:177-234).
                             let iter_slot_depth = current_depth.saturating_sub(1);
                             let iter_value: super::flow::FlowValue =
-                                if is_portal && !foriter_deep_kept_call_hazard {
+                                if is_portal {
                                     let iter_abs_slot =
                                         (stack_base_absolute + iter_slot_depth as usize) as i64;
                                     let v_iter_idx: super::flow::FlowValue =
@@ -9635,11 +9586,8 @@ impl CodeWriter {
                                     pin!(Some(v_iter), stack_base + iter_slot_depth);
                                     v_iter.into()
                                 } else {
-                                    // Non-portal callee (no vable read; keep the
-                                    // loop-carried operand SSA Variable at TOS) OR
-                                    // the deep-kept-call hazard shape (withhold the
-                                    // reload so the walk aborts at the header before
-                                    // the irreversible consume).
+                                    // Non-portal callee: no vable read; keep the
+                                    // loop-carried operand SSA Variable at TOS.
                                     current_state
                                         .stack
                                         .last()

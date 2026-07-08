@@ -1788,6 +1788,28 @@ pub(crate) fn semantic_slot_for_reg_color(
     stack_match.or(local_match)
 }
 
+/// Inverse of [`semantic_slot_for_reg_color`] for the Ref bank: given a
+/// semantic `locals_cells_stack_w` slot, return the Ref-bank color that owns
+/// it at this PC per the `(bank, color, slot)` map. Used by the deep-kept
+/// operand-stack recovery in `walker_capture_snapshot_for_last_guard_impl` to
+/// name the guard-PC register (`registers_r[color]`) holding a kept operand-
+/// stack slot the walk mirror lost. Returns the smallest matching color;
+/// `None` when no live Ref color owns the slot at this PC.
+pub(crate) fn semantic_slot_color_for_ref_slot(
+    pcdep_entries: &[(u8, u16, u16)],
+    slot: usize,
+) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    for &(b, color, s) in pcdep_entries {
+        if b != 1 || s as usize != slot {
+            continue;
+        }
+        let c = color as usize;
+        best = Some(best.map_or(c, |cur: usize| cur.min(c)));
+    }
+    best
+}
+
 // Sentinel null JitCode for uninitialized PyreSym.
 //
 // Cannot be `static` because `Arc::new` is not const; use a thread_local
