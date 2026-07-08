@@ -2533,17 +2533,6 @@ fn decode_utf32_impl(
 /// Map each scalar code point of `s` through `f`, appending to a
 /// `Wtf8Buf`; a lone surrogate passes through unchanged.  Used by the
 /// case-mapping methods, which leave surrogates untouched.
-fn wtf8_map_chars(s: &Wtf8, f: impl Fn(char, &mut Wtf8Buf)) -> Wtf8Buf {
-    let mut out = Wtf8Buf::with_capacity(s.len());
-    for cp in s.code_points() {
-        match cp.to_char() {
-            Some(c) => f(c, &mut out),
-            None => out.push(cp),
-        }
-    }
-    out
-}
-
 /// Apply a whole-string case transform (`str::to_lowercase` / `to_uppercase`)
 /// to each maximal valid-UTF-8 run of `s`, passing lone surrogates through
 /// unchanged.  Operating on the run rather than each scalar preserves the
@@ -2612,7 +2601,7 @@ pub fn str_method_istitle(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         // any other non-cased code point (the `None` arm / `else`).
         match cp.to_char() {
             Some(c) => {
-                if c.is_uppercase() {
+                if c.is_uppercase() || case::is_titlecase(c) {
                     if prev_cased {
                         return Ok(w_bool_from(false));
                     }
@@ -2841,77 +2830,21 @@ pub fn str_method_rindex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 pub fn str_method_title(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_no_args(args, "title")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
-    let mut result = Wtf8Buf::with_capacity(s.len());
-    let mut prev_is_sep = true;
-    for cp in s.code_points() {
-        match cp.to_char() {
-            Some(c) => {
-                if prev_is_sep {
-                    for u in c.to_uppercase() {
-                        result.push_char(u);
-                    }
-                } else {
-                    for l in c.to_lowercase() {
-                        result.push_char(l);
-                    }
-                }
-                prev_is_sep = !c.is_alphanumeric();
-            }
-            // A lone surrogate is not alphanumeric — it starts a new word.
-            None => {
-                result.push(cp);
-                prev_is_sep = true;
-            }
-        }
-    }
-    Ok(w_str_from_wtf8(result))
+    Ok(w_str_from_wtf8(case::title_wtf8(s)))
 }
 
 /// PyPy: unicodeobject.py descr_capitalize
 pub fn str_method_capitalize(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_no_args(args, "capitalize")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
-    let mut result = Wtf8Buf::with_capacity(s.len());
-    let mut cps = s.code_points();
-    if let Some(first) = cps.next() {
-        match first.to_char() {
-            Some(c) => {
-                for u in c.to_uppercase() {
-                    result.push_char(u);
-                }
-            }
-            None => result.push(first),
-        }
-        for cp in cps {
-            match cp.to_char() {
-                Some(c) => {
-                    for l in c.to_lowercase() {
-                        result.push_char(l);
-                    }
-                }
-                None => result.push(cp),
-            }
-        }
-    }
-    Ok(w_str_from_wtf8(result))
+    Ok(w_str_from_wtf8(case::capitalize_wtf8(s)))
 }
 
 /// PyPy: unicodeobject.py descr_swapcase
 pub fn str_method_swapcase(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_no_args(args, "swapcase")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
-    let out = wtf8_map_chars(s, |c, out| {
-        if c.is_uppercase() {
-            for l in c.to_lowercase() {
-                out.push_char(l);
-            }
-        } else {
-            for u in c.to_uppercase() {
-                out.push_char(u);
-            }
-        }
-    });
-    Ok(w_str_from_wtf8(out))
+    Ok(w_str_from_wtf8(case::swapcase_wtf8(s)))
 }
 
 /// PyPy: unicodeobject.py descr_center
