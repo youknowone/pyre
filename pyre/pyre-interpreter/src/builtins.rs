@@ -5590,17 +5590,27 @@ fn builtin_super(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// `iter(obj)` / `iter(callable, sentinel)` — PyPy:
 /// `module/__builtin__/operation.py` iter
 fn builtin_iter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    match args.len() {
+    // `iter` is a keyword-rejecting builtin; a `sentinel` is only ever
+    // positional (`iter(callable, sentinel)`).  Strip the kwargs marker so a
+    // keyword call raises instead of consuming the marker dict as an argument.
+    let (positional, kwargs) = split_builtin_kwargs(args);
+    if has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(
+            "iter() takes no keyword arguments",
+        ));
+    }
+    match positional.len() {
         0 => Err(crate::PyError::type_error(
             "iter() requires at least one argument",
         )),
-        1 => crate::baseobjspace::iter(args[0]),
+        1 => crate::baseobjspace::iter(positional[0]),
         2 => {
-            if !crate::baseobjspace::callable_w(args[0]) {
+            if !crate::baseobjspace::callable_w(positional[0]) {
                 return Err(crate::PyError::type_error("iter(v, w): v must be callable"));
             }
             Ok(pyre_object::operation::w_callable_iterator_new(
-                args[0], args[1],
+                positional[0],
+                positional[1],
             ))
         }
         n => Err(crate::PyError::type_error(format!(
@@ -9001,11 +9011,15 @@ fn builtin_import_stub(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
             .unwrap_or(pyre_object::PY_NULL)
     };
     let name_obj = arg(0, "name");
-    let name = if !name_obj.is_null() && unsafe { pyre_object::is_str(name_obj) } {
-        unsafe { pyre_object::w_str_get_value(name_obj) }
-    } else {
-        ""
-    };
+    if name_obj.is_null() {
+        return Err(crate::PyError::type_error(
+            "__import__() missing required argument 'name' (pos 1)",
+        ));
+    }
+    if !unsafe { pyre_object::is_str(name_obj) } {
+        return Err(crate::PyError::type_error("module name must be a string"));
+    }
+    let name = unsafe { pyre_object::w_str_get_value(name_obj) };
     let globals = arg(1, "globals");
     let fromlist = arg(3, "fromlist");
     let level_obj = arg(4, "level");
