@@ -9489,40 +9489,123 @@ impl CodeWriter {
                         // interpreter on side-exit; the trace only records the
                         // continuing iteration (the loop closes at the back-edge).
                         Instruction::ForIter { delta } => {
-                            // Source `next()`'s iterator argument from the
-                            // loop-carried operand Variable at TOS
-                            // (`current_state.stack.last()`, the merge-rebound
-                            // loop-input the runtime vstack mirror holds as an
-                            // InputArgRef), mirroring RPython `space.next(
-                            // peekvalue())`.  Feeding a real operand Variable
-                            // gives the loop-carried iterator a genuine SSA
-                            // reader, so the graph allocator assigns it a
-                            // DISTINCT live color and `compute_liveness` marks it
-                            // live at the FOR_ITER `-live-` marker; both cascades
-                            // let `build_pcdep_color_slots` keep the
-                            // `(iter_color -> nlocals+0)` operand entry at this
-                            // guard pc.  Without a reader (the prior portal-only
-                            // `getarrayitem_vable_r` reload was defined-and-
-                            // consumed inside the opcode) the loop-carried
-                            // iterator color is dropped from both `pcdep` and the
-                            // `-live-` R-bank, so a guard-pc resume (M3) cannot
-                            // reconstruct the kept iterator operand slot and
-                            // re-executes FOR_ITER on a non-iterator.  GET_ITER's
-                            // `setarrayitem_vable_r` still populates the vable
-                            // image (blackhole/interp read), so dropping the
-                            // reload is safe; DCE removes it.  TOS is the iterator
-                            // (`current_depth - 1`).
-                            let iter_slot_depth = current_depth.saturating_sub(1);
-                            let iter_value: super::flow::FlowValue = current_state
-                                .stack
-                                .last()
-                                .cloned()
-                                .unwrap_or_else(|| fresh_ref_value(&mut graph).into());
-                            if is_portal {
-                                if let super::flow::FlowValue::Variable(v) = &iter_value {
-                                    pin!(Some(*v), stack_base + iter_slot_depth);
+                            // Reload `next()`'s iterator argument from its
+                            // value-stack slot every iteration, porting RPython
+                            // `w_iterator = self.peekvalue()`
+                            // (pyopcode.py:1303-1304).  `peekvalue` reads
+                            // `locals_cells_stack_w[index]`, which
+                            // `jtransform.py:760-767 do_fixed_list_getitem`
+                            // lowers to `getarrayitem_vable_r` inside the loop
+                            // body.  GET_ITER's `pushvalue` populated the slot
+                            // via `setarrayitem_vable_r` (see above), so the
+                            // reload always finds the live iterator.
+                            //
+                            // The reload is required, not optional: pyre's
+                            // `jit_merge_point` reds are `[frame, ec]` only
+                            // (interp_jit.py:67), so the operand stack is NOT
+                            // loop-carried in registers — it lives in the
+                            // virtualizable image.  An iterator defined once in
+                            // the loop preamble cannot survive as an SSA
+                            // register across the compiled resident loop; a full-
+                            // body walk that resumes past the loop-header merge
+                            // point would then read an unbound register on the
+                            // `ForIterNext` residual (ResidualCallArgUnbound).
+                            // Re-materializing it from the vable each iteration
+                            // gives it a genuine in-loop reader, so
+                            // `compute_liveness` marks it live at the FOR_ITER
+                            // `-live-` marker and `build_pcdep_color_slots` keeps
+                            // its `(color -> slot)` entry for the M3 body-guard
+                            // resume.  TOS is the iterator (`current_depth - 1`).
+                            //
+                            // WITHHOLD the reload when the loop body holds a
+                            // CALL result across an in-body conditional branch
+                            // (a `CALL` opcode and a `POP_JUMP_IF_*` both inside
+                            // `[py_pc+1, exhaust_target)`).  That shape produces
+                            // a depth > 1 operand stack of call results kept
+                            // across a short-circuit / conditional guard whose
+                            // COMPILED interior-guard resume cannot yet
+                            // reconstruct the deep slots (the walk-level operand
+                            // mirror reports them present, but the blackhole
+                            // rebuilds them NULL — the #416/#420 deep-kept
+                            // interior-snapshot gap).  Enabling the reload lets
+                            // the walk enter and CONSUME the shared iterator, run
+                            // the body's residual calls concretely, then abort at
+                            // the deep guard — an irreversible half-executed
+                            // iteration that cannot be delivered (re-running the
+                            // body doubles a committed effect) nor cleanly
+                            // dropped (it loses the iteration).  Without the
+                            // reload the `ForIterNext` residual has no bound
+                            // iterator argument, so the walk aborts at the
+                            // FOR_ITER header BEFORE the consume
+                            // (`ResidualCallArgUnbound`) and the location
+                            // interprets permanently — bit-exact, the pre-reload
+                            // behaviour.  condexpr (branch, no call) and
+                            // nested_call (call, no in-body branch) do not match,
+                            // so both keep the reload.  Lifted when the deep-kept
+                            // interior-guard snapshot lands.
+                            let foriter_deep_kept_call_hazard = {
+                                let exhaust_target = jump_target_forward(
+                                    code,
+                                    num_instrs,
+                                    py_pc + 1,
+                                    delta.get(op_arg).as_usize(),
+                                );
+                                let mut scan_state = pyre_interpreter::OpArgState::default();
+                                let mut has_call = false;
+                                let mut has_branch = false;
+                                for scan_pc in 0..num_instrs {
+                                    let (scan_instr, _) =
+                                        scan_state.get(code.instructions[scan_pc]);
+                                    if scan_pc <= py_pc || scan_pc >= exhaust_target {
+                                        continue;
+                                    }
+                                    match scan_instr {
+                                        Instruction::Call { .. }
+                                        | Instruction::CallKw { .. }
+                                        | Instruction::CallFunctionEx
+                                        | Instruction::CallIntrinsic1 { .. }
+                                        | Instruction::CallIntrinsic2 { .. } => has_call = true,
+                                        Instruction::PopJumpIfTrue { .. }
+                                        | Instruction::PopJumpIfFalse { .. }
+                                        | Instruction::PopJumpIfNone { .. }
+                                        | Instruction::PopJumpIfNotNone { .. } => has_branch = true,
+                                        _ => {}
+                                    }
                                 }
-                            }
+                                has_call && has_branch
+                            };
+                            let iter_slot_depth = current_depth.saturating_sub(1);
+                            let iter_value: super::flow::FlowValue =
+                                if is_portal && !foriter_deep_kept_call_hazard {
+                                    let iter_abs_slot =
+                                        (stack_base_absolute + iter_slot_depth as usize) as i64;
+                                    let v_iter_idx: super::flow::FlowValue =
+                                        super::flow::Constant::signed(iter_abs_slot).into();
+                                    let v_iter = emit_graph_op_with_result(
+                                        &mut graph,
+                                        &current_block.block(),
+                                        "getarrayitem_vable_r",
+                                        vable_getarrayitem_ref_graph_args(
+                                            frame_var.into(),
+                                            v_iter_idx.into(),
+                                        ),
+                                        Kind::Ref,
+                                        py_pc as i64,
+                                    );
+                                    pin!(Some(v_iter), stack_base + iter_slot_depth);
+                                    v_iter.into()
+                                } else {
+                                    // Non-portal callee (no vable read; keep the
+                                    // loop-carried operand SSA Variable at TOS) OR
+                                    // the deep-kept-call hazard shape (withhold the
+                                    // reload so the walk aborts at the header before
+                                    // the irreversible consume).
+                                    current_state
+                                        .stack
+                                        .last()
+                                        .cloned()
+                                        .unwrap_or_else(|| fresh_ref_value(&mut graph).into())
+                                };
                             let next_var = residual_call!(
                                 for_iter_next_fn_idx,
                                 CallFlavor::MayForce,
