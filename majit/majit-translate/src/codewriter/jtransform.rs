@@ -3102,9 +3102,16 @@ impl<'a> Transformer<'a> {
                 let opname = match stroruni_first_arg_kind(args.first()?) {
                     StrOrUniKind::Str => "copystrcontent",
                     StrOrUniKind::Unicode => "copyunicodecontent",
-                    // BYTEARRAY → NotSupported; any other shape → assert 0.
-                    // Both fall through to the residual-call path.
-                    StrOrUniKind::ByteArray | StrOrUniKind::Other => return None,
+                    // BYTEARRAY → NotSupported (jtransform.py:2074): fall
+                    // through to the residual-call path.
+                    StrOrUniKind::ByteArray => return None,
+                    // jtransform.py:2076 — `else: assert 0, "args[0].concretetype
+                    // must be STR or UNICODE"`. A `stroruni.copy_contents`
+                    // oopspec guarantees a string pointer, so any other shape
+                    // is a should-never-happen invariant violation.
+                    StrOrUniKind::Other => {
+                        panic!("args[0].concretetype must be STR or UNICODE")
+                    }
                 };
                 Some(RewriteResult::Replace(vec![SpaceOperation {
                     result: op.result.clone(),
@@ -3129,8 +3136,15 @@ impl<'a> Transformer<'a> {
     ///
     /// Lowers to a `residual_call` whose calldescr carries the `ShrinkArray`
     /// oopspecindex and the `CanRaise` effect, so `handle_residual_call`
-    /// appends the trailing `-live-`.  Other `rgc.*` spellings return `None`
-    /// and fall through to the residual-call path.
+    /// appends the trailing `-live-`.
+    ///
+    /// jtransform.py:2197 `raise NotImplementedError(oopspec_name)` for any
+    /// other `rgc.*` spelling. Pyre instead returns `None` so the call falls
+    /// through to the residual-call path — the same "unported oopspec →
+    /// residual" convention the `list.*` / `stroruni.*` sibling handlers use,
+    /// which keeps rgc oopspecs pyre has not lowered yet (e.g.
+    /// `rgc.ll_arraycopy`) as ordinary residual calls rather than aborting
+    /// codewriting.
     fn _handle_rgc_call(
         &mut self,
         oopspec_name: &str,
