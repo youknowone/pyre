@@ -62,15 +62,16 @@ pyre-wasm = { version = "0.0.2", path = "pyre/pyre-wasm" }
 pyrex = { version = "0.0.2", path = "pyre/pyrex" }
 
 # Pinned to upstream main, which now carries the rustpython-unicode crate,
-# the host_env mmap re-exports, and the float hash/format fixes (#8232).
-rustpython-common = { git = "https://github.com/RustPython/RustPython.git", rev = "984cb5089ebb04ce22c37c467c0fc001af2a2f36" }
-rustpython-literal = { git = "https://github.com/RustPython/RustPython.git", rev = "984cb5089ebb04ce22c37c467c0fc001af2a2f36" }
-rustpython-compiler = { git = "https://github.com/RustPython/RustPython.git", rev = "984cb5089ebb04ce22c37c467c0fc001af2a2f36" }
-rustpython-compiler-core = { git = "https://github.com/RustPython/RustPython.git", rev = "984cb5089ebb04ce22c37c467c0fc001af2a2f36" }
-rustpython-host_env = { git = "https://github.com/RustPython/RustPython.git", rev = "984cb5089ebb04ce22c37c467c0fc001af2a2f36" }
-rustpython-wtf8 = { git = "https://github.com/RustPython/RustPython.git", rev = "984cb5089ebb04ce22c37c467c0fc001af2a2f36" }
-rustpython-unicode = { git = "https://github.com/RustPython/RustPython.git", rev = "984cb5089ebb04ce22c37c467c0fc001af2a2f36" }
-sre-engine = { package = "rustpython-sre_engine", git = "https://github.com/RustPython/RustPython.git", rev = "984cb5089ebb04ce22c37c467c0fc001af2a2f36" }
+# the host_env mmap re-exports, and the round-half-even float_ops::from_hex
+# hex-float parser (#8234).
+rustpython-common = { git = "https://github.com/RustPython/RustPython.git", rev = "a5eecb5ebfd48dc62fc05913d16a556d6b0ccd3a" }
+rustpython-literal = { git = "https://github.com/RustPython/RustPython.git", rev = "a5eecb5ebfd48dc62fc05913d16a556d6b0ccd3a" }
+rustpython-compiler = { git = "https://github.com/RustPython/RustPython.git", rev = "a5eecb5ebfd48dc62fc05913d16a556d6b0ccd3a" }
+rustpython-compiler-core = { git = "https://github.com/RustPython/RustPython.git", rev = "a5eecb5ebfd48dc62fc05913d16a556d6b0ccd3a" }
+rustpython-host_env = { git = "https://github.com/RustPython/RustPython.git", rev = "a5eecb5ebfd48dc62fc05913d16a556d6b0ccd3a" }
+rustpython-wtf8 = { git = "https://github.com/RustPython/RustPython.git", rev = "a5eecb5ebfd48dc62fc05913d16a556d6b0ccd3a" }
+rustpython-unicode = { git = "https://github.com/RustPython/RustPython.git", rev = "a5eecb5ebfd48dc62fc05913d16a556d6b0ccd3a" }
+sre-engine = { package = "rustpython-sre_engine", git = "https://github.com/RustPython/RustPython.git", rev = "a5eecb5ebfd48dc62fc05913d16a556d6b0ccd3a" }
 
 # majit JIT framework
 majit = { version = "0.0.2", path = "majit/majit" }

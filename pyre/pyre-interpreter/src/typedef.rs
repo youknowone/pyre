@@ -8739,60 +8739,27 @@ fn init_float_type(ns: &mut DictStorage) {
                 .ok_or_else(|| {
                     crate::PyError::type_error("fromhex() requires a string argument")
                 })?;
-            let s = s_arg.trim();
-            let lower = s.to_ascii_lowercase();
-            match lower.as_str() {
-                "inf" | "infinity" | "+inf" | "+infinity" => {
-                    return Ok(pyre_object::w_float_new(f64::INFINITY));
+            // Delegate parsing to the shared hex-float reader, which rounds
+            // round-half-even over the full exponent range (subnormals down to
+            // 0x1p-1074), accepts the inf/nan spellings, handles surrounding
+            // ASCII whitespace itself, and flags overflow distinctly.
+            match rustpython_common::float_ops::from_hex(&s_arg) {
+                Ok(v) => Ok(pyre_object::w_float_new(v)),
+                Err(e) => {
+                    use rustpython_common::float_ops::HexFloatError;
+                    Err(match e {
+                        HexFloatError::Overflow => crate::PyError::overflow_error(
+                            "hexadecimal value too large to represent as a float",
+                        ),
+                        HexFloatError::TooLong => {
+                            crate::PyError::value_error("hexadecimal string too long to convert")
+                        }
+                        HexFloatError::Invalid => {
+                            crate::PyError::value_error("invalid hexadecimal floating-point string")
+                        }
+                    })
                 }
-                "-inf" | "-infinity" => {
-                    return Ok(pyre_object::w_float_new(f64::NEG_INFINITY));
-                }
-                "nan" | "+nan" | "-nan" => {
-                    return Ok(pyre_object::w_float_new(f64::NAN));
-                }
-                _ => {}
             }
-            let (sign_s, rest) = if let Some(r) = s.strip_prefix('-') {
-                (-1.0f64, r)
-            } else if let Some(r) = s.strip_prefix('+') {
-                (1.0f64, r)
-            } else {
-                (1.0f64, s)
-            };
-            let rest = rest
-                .strip_prefix("0x")
-                .or_else(|| rest.strip_prefix("0X"))
-                .unwrap_or(rest);
-            let (body, exp_str) = if let Some(i) = rest.find(|c| c == 'p' || c == 'P') {
-                (&rest[..i], &rest[i + 1..])
-            } else {
-                (rest, "0")
-            };
-            let (int_part, frac_part) = if let Some(i) = body.find('.') {
-                (&body[..i], &body[i + 1..])
-            } else {
-                (body, "")
-            };
-            let int_val = if int_part.is_empty() {
-                0u64
-            } else {
-                u64::from_str_radix(int_part, 16).map_err(|_| {
-                    crate::PyError::value_error("invalid hexadecimal floating-point literal")
-                })?
-            };
-            let mut frac_val = 0f64;
-            for (i, ch) in frac_part.chars().enumerate() {
-                let d = ch.to_digit(16).ok_or_else(|| {
-                    crate::PyError::value_error("invalid hexadecimal floating-point literal")
-                })? as f64;
-                frac_val += d / 16f64.powi(i as i32 + 1);
-            }
-            let exp: i32 = exp_str.parse().map_err(|_| {
-                crate::PyError::value_error("invalid hexadecimal floating-point literal")
-            })?;
-            let mantissa = int_val as f64 + frac_val;
-            Ok(pyre_object::w_float_new(sign_s * mantissa * 2f64.powi(exp)))
         }),
     );
     dict_storage_store(
