@@ -1229,6 +1229,15 @@ impl Repr for OrderedDictRepr {
     /// (`rordereddict.py:285-301`).
     fn rtype_method(&self, method_name: &str, hop: &HighLevelOp) -> RTypeResult {
         match method_name {
+            // `is_null` is the lltype `_ptr` nullity probe on the dict
+            // pointer — lower it as `ptr_iszero` (opimpl.py:134-136
+            // `op_ptr_iszero`), the same lowering `InstanceRepr` uses for
+            // the `ptr_method_is_null` bound method the annotator seats on
+            // pointer-carrying receivers.
+            "is_null" => {
+                let vlist = hop.inputargs(vec![ConvertedTo::Repr(self)])?;
+                Ok(hop.genop("ptr_iszero", vlist, GenopResult::LLType(LowLevelType::Bool)))
+            }
             "get" => {
                 let args = if hop.nb_args() == 3 {
                     hop.inputargs(vec![

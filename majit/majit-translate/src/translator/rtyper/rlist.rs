@@ -30,8 +30,8 @@ use crate::translator::rtyper::lltypesystem::lltype::{
 use crate::translator::rtyper::lltypesystem::rstr::sub_helper_funcptr_constant;
 use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState};
 use crate::translator::rtyper::rtyper::{
-    ConvertedTo, HighLevelOp, LowLevelFunction, RPythonTyper, constant_with_lltype, exception_args,
-    helper_pygraph_from_graph, variable_with_lltype, void_field_const,
+    ConvertedTo, GenopResult, HighLevelOp, LowLevelFunction, RPythonTyper, constant_with_lltype,
+    exception_args, helper_pygraph_from_graph, variable_with_lltype, void_field_const,
 };
 
 /// RPython `class FixedSizeListRepr(AbstractFixedSizeListRepr,
@@ -272,6 +272,14 @@ impl Repr for FixedSizeListRepr {
     /// [`build_ll_reverse_helper_graph`]. `reverse` returns `None` (void).
     fn rtype_method(&self, method_name: &str, hop: &HighLevelOp) -> RTypeResult {
         match method_name {
+            // `is_null` is the lltype `_ptr` nullity probe on the list
+            // backing pointer — lower it as `ptr_iszero` (opimpl.py:134-136
+            // `op_ptr_iszero`), matching the `ptr_method_is_null` bound
+            // method the annotator seats on pointer-carrying receivers.
+            "is_null" => {
+                let vlist = hop.inputargs(vec![ConvertedTo::Repr(self)])?;
+                Ok(hop.genop("ptr_iszero", vlist, GenopResult::LLType(LowLevelType::Bool)))
+            }
             "reverse" => {
                 let vlist = hop.inputargs(vec![ConvertedTo::Repr(self)])?;
                 hop.exception_cannot_occur()?;
@@ -860,6 +868,14 @@ impl Repr for ListRepr {
     /// / bare `getarrayitem` on a `Ptr(GcArray)`.
     fn rtype_method(&self, method_name: &str, hop: &HighLevelOp) -> RTypeResult {
         match method_name {
+            // `is_null` is the lltype `_ptr` nullity probe on the list
+            // header pointer — lower it as `ptr_iszero` (opimpl.py:134-136
+            // `op_ptr_iszero`), matching the `ptr_method_is_null` bound
+            // method the annotator seats on pointer-carrying receivers.
+            "is_null" => {
+                let vlist = hop.inputargs(vec![ConvertedTo::Repr(self)])?;
+                Ok(hop.genop("ptr_iszero", vlist, GenopResult::LLType(LowLevelType::Bool)))
+            }
             "reverse" => {
                 let vlist = hop.inputargs(vec![ConvertedTo::Repr(self)])?;
                 hop.exception_cannot_occur()?;

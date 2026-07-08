@@ -2659,6 +2659,11 @@ pub(crate) fn find_method(s_self: &SomeValue, name: &str) -> Option<SomeBuiltinM
             "remove" => "list_method_remove",
             "pop" => "list_method_pop",
             "index" => "list_method_index",
+            // Raw-pointer `p.is_null()` on a `SomeList` receiver (the list
+            // backing carries a `Ptr` concretetype); the getattr annotator
+            // answers the same probe with `ptr_method_is_null`, so mirror it
+            // here for the rtyper's method-existence check.
+            "is_null" => "ptr_method_is_null",
             _ => return None,
         },
         SomeValue::Dict(_) => match name {
@@ -2683,6 +2688,13 @@ pub(crate) fn find_method(s_self: &SomeValue, name: &str) -> Option<SomeBuiltinM
             "delitem_with_hash" => "dict_method_delitem_with_hash",
             "delitem_if_value_is" => "dict_method_delitem_if_value_is",
             "move_to_end" => "dict_method_move_to_end",
+            // A raw-pointer `p.is_null()` whose receiver Charon erases to
+            // a `SomeDict` (the dict-typed field carries a `Ptr(dicttable)`
+            // concretetype).  The getattr annotator answers the same probe
+            // with `ptr_method_is_null`; mirror it here so the rtyper's
+            // `rtype_getattr` method-existence check finds it and forwards
+            // the receiver to `OrderedDictRepr::rtype_method("is_null")`.
+            "is_null" => "ptr_method_is_null",
             _ => return None,
         },
         SomeValue::String(_) => match name {
