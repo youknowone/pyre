@@ -1415,8 +1415,13 @@ fn build_function(
                 guard_idx += 1;
             }
             // Guards that always pass in wasm MVP (no force-token /
-            // invalidation tracking yet).
-            OpCode::GuardNotInvalidated | OpCode::GuardNotForced | OpCode::GuardNotForced2 => {
+            // invalidation tracking yet). GuardEvalBreaker is inert here too:
+            // wasm32-unknown-unknown has no OS signals, so the ticker never
+            // goes negative.
+            OpCode::GuardNotInvalidated
+            | OpCode::GuardNotForced
+            | OpCode::GuardNotForced2
+            | OpCode::GuardEvalBreaker => {
                 guard_idx += 1;
             }
             OpCode::GuardNoException => {

@@ -3154,6 +3154,15 @@ impl MIFrame {
         ctx: &mut TraceCtx,
         target_pc: Option<usize>,
     ) -> Vec<OpRef> {
+        // `JUMP_BACKWARD` eval-breaker poll (`CHECK_EVAL_BREAKER`): emit
+        // a `GuardEvalBreaker` in the loop body before the closing JUMP so the
+        // compiled loop polls the async-action ticker at the back-edge and
+        // deopts when a signal / async action is pending, instead of running
+        // uninterruptibly until natural loop exit. Nullary guard: no data
+        // operands, so its resume snapshot is the ordinary loop-body liveness
+        // (like GuardNotInvalidated). Captured before the flush/materialize
+        // below so the snapshot reflects the pre-close loop-body state.
+        self.generate_guard(ctx, OpCode::GuardEvalBreaker, &[]);
         // pyjitpl.py:2954-2965 reached_loop_header: virtualizable_boxes
         // (read from locals_cells_stack_w[*] by virtualizable.py:86-98
         // read_boxes) are carried into the JUMP unchanged, including

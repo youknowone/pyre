@@ -9808,6 +9808,54 @@ impl CraneliftBackend {
                     }
                 }
 
+                OpCode::GuardEvalBreaker => {
+                    // Back-edge eval-breaker poll: load the async-action ticker
+                    // cell (baked address) and side-exit when it is negative (a
+                    // pending signal / async action). `0` = no ticker published
+                    // (signal handling not installed) → inert guard.
+                    let info = &guard_infos[guard_idx];
+                    guard_idx += 1;
+
+                    let ticker_addr = majit_ir::eval_breaker::ticker_addr();
+                    if ticker_addr != 0 {
+                        let addr_val = builder.ins().iconst(cl_types::I64, ticker_addr as i64);
+                        let ticker =
+                            builder
+                                .ins()
+                                .load(cl_types::I64, MemFlags::trusted(), addr_val, 0);
+                        let zero = builder.ins().iconst(cl_types::I64, 0);
+                        let is_pending = builder.ins().icmp(IntCC::SignedLessThan, ticker, zero);
+
+                        let exit_block = builder.create_block();
+                        builder.set_cold_block(exit_block);
+                        let cont_block = builder.create_block();
+                        if preamble_phase {
+                            builder.set_cold_block(cont_block);
+                        }
+                        builder
+                            .ins()
+                            .brif(is_pending, exit_block, &[], cont_block, &[]);
+
+                        builder.switch_to_block(exit_block);
+                        builder.seal_block(exit_block);
+                        let cur_jf = builder.ins().get_pinned_reg(ptr_type);
+                        emit_guard_exit(
+                            &mut builder,
+                            &constants,
+                            cur_jf,
+                            info,
+                            &ref_root_slots,
+                            &stale_ref_vars,
+                            ref_root_base_ofs,
+                            ptr_type,
+                            call_conv,
+                        );
+
+                        builder.switch_to_block(cont_block);
+                        builder.seal_block(cont_block);
+                    }
+                }
+
                 OpCode::GuardFutureCondition => {
                     // Future condition: the guard condition is computed lazily.
                     // For now, behave like GuardTrue on args[0].
