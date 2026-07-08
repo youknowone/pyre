@@ -787,11 +787,12 @@ impl SomeStringBuilder {
 
     /// `method_append_multiple_char(self, s_char, s_times)`
     /// (rstring.py:903-906) → `s_None`.
-    pub fn method_append_multiple_char(&self, s_char: &SomeValue, s_times: &SomeValue) -> SomeValue {
-        debug_assert!(matches!(
-            s_char,
-            SomeValue::String(_) | SomeValue::Char(_)
-        ));
+    pub fn method_append_multiple_char(
+        &self,
+        s_char: &SomeValue,
+        s_times: &SomeValue,
+    ) -> SomeValue {
+        debug_assert!(matches!(s_char, SomeValue::String(_) | SomeValue::Char(_)));
         debug_assert!(matches!(s_times, SomeValue::Integer(_)));
         s_none()
     }
@@ -869,7 +870,11 @@ impl SomeUnicodeBuilder {
 
     /// `method_append_multiple_char(self, s_char, s_times)`
     /// (rstring.py:943-946) → `s_None`.
-    pub fn method_append_multiple_char(&self, s_char: &SomeValue, s_times: &SomeValue) -> SomeValue {
+    pub fn method_append_multiple_char(
+        &self,
+        s_char: &SomeValue,
+        s_times: &SomeValue,
+    ) -> SomeValue {
         debug_assert!(matches!(s_char, SomeValue::UnicodeCodePoint(_)));
         debug_assert!(matches!(s_times, SomeValue::Integer(_)));
         s_none()
@@ -5308,10 +5313,7 @@ mod tests {
             b.method_append(&SomeValue::String(SomeString::new(false, false))),
             SomeValue::None_(_)
         ));
-        assert!(matches!(
-            b.method_getlength(),
-            SomeValue::Integer(_)
-        ));
+        assert!(matches!(b.method_getlength(), SomeValue::Integer(_)));
     }
 
     /// rstring.py:953-957 — `SomeUnicodeBuilder.build` annotates to
@@ -5329,7 +5331,9 @@ mod tests {
             other => panic!("build must be SomeUnicodeString(can_be_None=False), got {other:?}"),
         }
         assert!(matches!(
-            b.method_append(&SomeValue::UnicodeString(SomeUnicodeString::new(false, false))),
+            b.method_append(&SomeValue::UnicodeString(SomeUnicodeString::new(
+                false, false
+            ))),
             SomeValue::None_(_)
         ));
     }

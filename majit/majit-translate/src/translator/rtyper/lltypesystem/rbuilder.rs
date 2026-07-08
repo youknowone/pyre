@@ -24,7 +24,7 @@ use crate::translator::rtyper::lltypesystem::lltype::{
 use crate::translator::rtyper::lltypesystem::rstr::{STRPTR, UNICODEPTR};
 use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState};
 use crate::translator::rtyper::rtyper::{
-    ConvertedTo, HighLevelOp, constant_with_lltype, helper_pygraph_from_graph,
+    ConvertedTo, HighLevelOp, constant_with_lltype, functionptr_const, helper_pygraph_from_graph,
     variable_with_lltype, void_field_const,
 };
 
@@ -5184,6 +5184,18 @@ impl StringBuilderRepr {
     pub fn basetp(&self) -> &'static LowLevelType {
         &crate::translator::rtyper::lltypesystem::rstr::STR
     }
+
+    /// RPython `AbstractStringBuilderRepr.rtyper_new(self, hop)`
+    /// (`rtyper/rbuilder.py:8-13`), inherited by `StringBuilderRepr`.
+    pub fn rtyper_new(&self, hop: &HighLevelOp) -> RTypeResult {
+        rtype_builder_new(
+            hop,
+            STRINGBUILDERPTR.clone(),
+            STRINGBUILDER.clone(),
+            STRPTR.clone(),
+            "mallocstr",
+        )
+    }
 }
 
 /// RPython `BaseStringBuilderRepr.rtype_method_getlength(self, hop)`
@@ -5245,6 +5257,81 @@ fn rtype_builder_bool(
     hop.gendirectcall(&helper, vlist)
 }
 
+/// RPython `AbstractStringBuilderRepr.rtyper_new(self, hop)`
+/// (`rtyper/rbuilder.py:8-13`):
+///
+/// ```python
+/// def rtyper_new(self, hop):
+///     if len(hop.args_v) == 0:
+///         v_arg = hop.inputconst(lltype.Signed, INIT_SIZE)
+///     else:
+///         v_arg = hop.inputarg(lltype.Signed, 0)
+///     hop.exception_cannot_occur()
+///     return hop.gendirectcall(self.ll_new, v_arg)
+/// ```
+///
+/// Shared body for the StringBuilderRepr / UnicodeBuilderRepr constructor
+/// lowering. `self.ll_new` resolves to the concrete `ll_new` helper graph
+/// whose whole callee closure is materialised here: `ll_min` (via the
+/// hardcoded `lowlevel_helper_function` builder) and `mallocstr` /
+/// `mallocunicode` (via `build_ll_mallocstr_helper_graph`), both baked in
+/// as `direct_call` callee constants by [`functionptr_const`]. The
+/// helper-graph cache keys stay distinct across STR / UNICODE because the
+/// `ll_new` result lltype and the malloc helper name differ.
+fn rtype_builder_new(
+    hop: &HighLevelOp,
+    builder_ptr_lltype: LowLevelType,
+    builder_struct: LowLevelType,
+    buf_lltype: LowLevelType,
+    malloc_name: &'static str,
+) -> RTypeResult {
+    use crate::translator::rtyper::lltypesystem::rstr::build_ll_mallocstr_helper_graph;
+    use crate::translator::rtyper::rbuilder::INIT_SIZE;
+    let v_arg = if hop.nb_args() == 0 {
+        Hlvalue::Constant(HighLevelOp::inputconst(
+            ConvertedTo::LowLevelType(&LowLevelType::Signed),
+            &ConstValue::Int(INIT_SIZE),
+        )?)
+    } else {
+        hop.inputarg(ConvertedTo::LowLevelType(&LowLevelType::Signed), 0)?
+    };
+    hop.exception_cannot_occur()?;
+
+    let ptr_for_builder = builder_ptr_lltype.clone();
+    let helper = hop.rtyper.lowlevel_helper_function_with_builder(
+        "ll_new".to_string(),
+        vec![LowLevelType::Signed],
+        builder_ptr_lltype,
+        move |rtyper, _args, _result| {
+            let min = rtyper.lowlevel_helper_function(
+                "ll_min",
+                vec![LowLevelType::Unsigned, LowLevelType::Unsigned],
+                LowLevelType::Unsigned,
+            )?;
+            let min_fn = functionptr_const(rtyper, &min)?;
+
+            let malloc_buf = buf_lltype.clone();
+            let malloc = rtyper.lowlevel_helper_function_with_builder(
+                malloc_name.to_string(),
+                vec![LowLevelType::Signed],
+                buf_lltype.clone(),
+                move |_r, _a, _res| build_ll_mallocstr_helper_graph(malloc_name, malloc_buf),
+            )?;
+            let mallocfn = functionptr_const(rtyper, &malloc)?;
+
+            build_ll_new_helper_graph(
+                "ll_new",
+                ptr_for_builder.clone(),
+                builder_struct.clone(),
+                buf_lltype.clone(),
+                min_fn,
+                mallocfn,
+            )
+        },
+    )?;
+    hop.gendirectcall(&helper, vec![v_arg])
+}
+
 impl Default for StringBuilderRepr {
     fn default() -> Self {
         Self::new()
@@ -5296,6 +5383,18 @@ impl UnicodeBuilderRepr {
     /// RPython `UnicodeBuilderRepr.basetp = UNICODE`.
     pub fn basetp(&self) -> &'static LowLevelType {
         &crate::translator::rtyper::lltypesystem::rstr::UNICODE
+    }
+
+    /// RPython `AbstractStringBuilderRepr.rtyper_new(self, hop)`
+    /// (`rtyper/rbuilder.py:8-13`), inherited by `UnicodeBuilderRepr`.
+    pub fn rtyper_new(&self, hop: &HighLevelOp) -> RTypeResult {
+        rtype_builder_new(
+            hop,
+            UNICODEBUILDERPTR.clone(),
+            UNICODEBUILDER.clone(),
+            UNICODEPTR.clone(),
+            "mallocunicode",
+        )
     }
 }
 
@@ -6544,6 +6643,72 @@ mod tests {
             .unwrap_or_else(|err| panic!("rtype_bool: {err:?}"));
         assert!(matches!(result, Some(Hlvalue::Variable(_))));
         assert_single_direct_call_to(&llops, "ll_bool");
+    }
+
+    /// Builds a nullary `HighLevelOp` (constructor call with no arguments)
+    /// whose result carries `builder_ptr_lltype`. `rtyper_new` reads
+    /// `hop.nb_args() == 0` and materialises the `INIT_SIZE` const arg.
+    fn build_builder_nullary_hop(
+        rtyper: std::rc::Rc<crate::translator::rtyper::rtyper::RPythonTyper>,
+        llops: std::rc::Rc<std::cell::RefCell<crate::translator::rtyper::rtyper::LowLevelOpList>>,
+        builder_ptr_lltype: LowLevelType,
+    ) -> crate::translator::rtyper::rtyper::HighLevelOp {
+        use crate::flowspace::model::{Hlvalue, SpaceOperation, Variable};
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(builder_ptr_lltype));
+        crate::translator::rtyper::rtyper::HighLevelOp::new(
+            rtyper,
+            SpaceOperation::new(
+                "simple_call".to_string(),
+                Vec::new(),
+                Hlvalue::Variable(v_result),
+            ),
+            Vec::new(),
+            llops,
+        )
+    }
+
+    /// rtyper/rbuilder.py:8-13 — `rtyper_new` on a zero-argument
+    /// constructor lowers to a single `direct_call` against the `ll_new`
+    /// helper graph (the `INIT_SIZE` default feeds the const arg).
+    #[test]
+    fn stringbuilder_rtyper_new_zero_args_emits_direct_call() {
+        use crate::flowspace::model::Hlvalue;
+        let (_ann, rtyper) = setup_rtyper();
+        let llops = std::rc::Rc::new(std::cell::RefCell::new(
+            crate::translator::rtyper::rtyper::LowLevelOpList::new(rtyper.clone(), None),
+        ));
+        let hop = build_builder_nullary_hop(
+            rtyper.clone(),
+            llops.clone(),
+            super::STRINGBUILDERPTR.clone(),
+        );
+        let result = super::stringbuilder_repr()
+            .rtyper_new(&hop)
+            .unwrap_or_else(|err| panic!("rtyper_new: {err:?}"));
+        assert!(matches!(result, Some(Hlvalue::Variable(_))));
+        assert_single_direct_call_to(&llops, "ll_new");
+    }
+
+    /// The `UnicodeBuilderRepr` constructor lowers to its own `ll_new`
+    /// (distinct helper-graph cache key via the UNICODE result lltype).
+    #[test]
+    fn unicodebuilder_rtyper_new_zero_args_emits_direct_call() {
+        use crate::flowspace::model::Hlvalue;
+        let (_ann, rtyper) = setup_rtyper();
+        let llops = std::rc::Rc::new(std::cell::RefCell::new(
+            crate::translator::rtyper::rtyper::LowLevelOpList::new(rtyper.clone(), None),
+        ));
+        let hop = build_builder_nullary_hop(
+            rtyper.clone(),
+            llops.clone(),
+            super::UNICODEBUILDERPTR.clone(),
+        );
+        let result = super::unicodebuilder_repr()
+            .rtyper_new(&hop)
+            .unwrap_or_else(|err| panic!("rtyper_new: {err:?}"));
+        assert!(matches!(result, Some(Hlvalue::Variable(_))));
+        assert_single_direct_call_to(&llops, "ll_new");
     }
 
     /// rbuilder.py:42-45 mirror for UnicodeBuilderRepr — same shape,

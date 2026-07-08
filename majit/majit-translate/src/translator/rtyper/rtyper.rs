@@ -7051,11 +7051,18 @@ mod tests {
     fn functionptr_const_names_helper_graph_with_matching_signature() {
         let (_ann, rtyper) = make_live_rtyper();
         let llfn = rtyper
-            .lowlevel_helper_function("ll_check_chr", vec![LowLevelType::Signed], LowLevelType::Void)
+            .lowlevel_helper_function(
+                "ll_check_chr",
+                vec![LowLevelType::Signed],
+                LowLevelType::Void,
+            )
             .unwrap();
         let c_func = super::functionptr_const(&rtyper, &llfn).expect("functionptr const");
         let Some(LowLevelType::Ptr(ptr)) = &c_func.concretetype else {
-            panic!("functionptr const must be Ptr(Func), got {:?}", c_func.concretetype);
+            panic!(
+                "functionptr const must be Ptr(Func), got {:?}",
+                c_func.concretetype
+            );
         };
         let PtrTarget::Func(func_type) = &ptr.TO else {
             panic!("functionptr const Ptr.TO must be Func, got {:?}", ptr.TO);
