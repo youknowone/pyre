@@ -2770,13 +2770,19 @@ pub(crate) fn drive_bridge_carrier_subwalk(
             concrete_registers_i: &mut concrete_i,
             descr_refs: &perfn_descr_refs,
             raw_descrs: RawDescrPool::PerFn(perfn_descrs),
-            // 2b-i diagnostic discards the trace, so the sub-walk must NOT
-            // execute may-force residual calls concretely (default).  The inline
-            // / recursive-CALL_ASSEMBLER machinery is gated on
-            // `is_authoritative_executor`, so the 2b-ii experiment
-            // (`PYRE_P2_AUTHORITATIVE`) flips this to drive the nested
-            // self-recursive fold.
-            is_authoritative_executor: std::env::var_os("PYRE_P2_AUTHORITATIVE").is_some(),
+            // The carrier sub-walk IS the bridge-resume metainterp: after a
+            // guard failure `handle_guard_failure` rebuilds the frame state and
+            // drives it forward through the SAME `self.interpret()` the initial
+            // trace uses (`pyjitpl.py:2937 _handle_guard_failure` →
+            // `prepare_resume_from_failure` → `interpret`, cf.
+            // `_compile_and_run_once:2899`).  There is no second-class executor
+            // mode: the resume walk concrete-executes every residual call
+            // (`do_residual_call` → `execute_varargs`, `pyjitpl.py:1995`) exactly
+            // like the initial trace, which is what lets a nested self-recursive
+            // call fold to a live `CALL_ASSEMBLER`.  The residual it reaches was
+            // never run pre-deopt (the deopt cut the trace there), so this is its
+            // first and only concrete execution.
+            is_authoritative_executor: true,
             is_full_body_walk: true,
             store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
@@ -11812,7 +11818,6 @@ fn try_walker_call_assembler_self_recursive(
     }
     let sym = unsafe { &*sym_ptr };
     let caller_frame = sym.frame;
-    let sym_execution_context = sym.execution_context;
     // `is_self_recursive = callee code == portal code`
     // (`trace_opcode.rs:5959-5960`: `callee_raw == caller_raw`).  During
     // recording `we_are_jitted()` is false, so `function_get_code` (the
@@ -11879,18 +11884,22 @@ fn try_walker_call_assembler_self_recursive(
     // callee frame.  Mirror of `trace_guarded_int_payload(args[0])`.
     let raw_arg = walker_unbox_int(ctx, op.pc, r_args[2], int_type_addr)?;
 
-    // Execution-context red (`ensure_execution_context`,
-    // `trace_opcode.rs:1078-1090`): the seeded `sym.execution_context`,
-    // else recovered off the portal frame via `GETFIELD_GC_R`.
-    let ec = if !sym_execution_context.is_none() {
-        sym_execution_context
-    } else {
-        ctx.trace_ctx.record_op_with_descr(
-            OpCode::GetfieldGcR,
-            &[caller_frame],
-            crate::descr::pyframe_execution_context_descr(),
-        )
-    };
+    // Execution-context red: recover it fresh off the materialized caller
+    // portal frame via `GETFIELD_GC_R(frame, execution_context_descr)` rather
+    // than trusting the seeded `sym.execution_context` OpRef.  The seeded OpRef
+    // is a bridge-decode color-bank value (`setup_bridge_sym`) that is
+    // concrete-correct at forward-compile but rebinds to the callee's own
+    // `pycode` when this compiled self-recursive trace re-enters as a NESTED
+    // bridge, building the callee frame with `ec == pycode` and faulting later
+    // in `frame_builtin`.  The outer portal frame's `execution_context` field
+    // is always the true ec (single ExecutionContext, boot-pinned), so reading
+    // it off `caller_frame` is the nested-resume-safe source — the same
+    // recovery `ensure_execution_context` (`trace_opcode.rs`) performs.
+    let ec = ctx.trace_ctx.record_op_with_descr(
+        OpCode::GetfieldGcR,
+        &[caller_frame],
+        crate::descr::pyframe_execution_context_descr(),
+    );
 
     // Build the callee PyFrame inline (Branch A): a single positional
     // local, no cells, constant code / globals.
@@ -12557,22 +12566,22 @@ fn try_walker_inline_user_call(
         }
 
         // ec red: the shared ExecutionContext (perform_call threads the
-        // caller's ec down).  Seeded `sym.execution_context`, else recovered
-        // off the caller portal frame (mirror REC_CA jitcode_dispatch.rs:7873).
+        // caller's ec down).  Recover it off the materialized caller portal
+        // frame via `GETFIELD_GC_R` rather than the seeded
+        // `sym.execution_context` OpRef — the seeded OpRef rebinds to the
+        // callee's own `pycode` when this compiled trace re-enters as a nested
+        // bridge (see `try_walker_call_assembler_self_recursive`).  The outer
+        // portal frame's `execution_context` field is the single true ec.
         let sym_ptr = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
         if sym_ptr.is_null() {
             return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });
         }
         let sym = unsafe { &*sym_ptr };
-        let callee_ec = if !sym.execution_context.is_none() {
-            sym.execution_context
-        } else {
-            ctx.trace_ctx.record_op_with_descr(
-                OpCode::GetfieldGcR,
-                &[sym.frame],
-                crate::descr::pyframe_execution_context_descr(),
-            )
-        };
+        let callee_ec = ctx.trace_ctx.record_op_with_descr(
+            OpCode::GetfieldGcR,
+            &[sym.frame],
+            crate::descr::pyframe_execution_context_descr(),
+        );
 
         let pycode_const = ctx.trace_ctx.const_ref(w_code as i64);
         let w_globals_obj_const = ctx.trace_ctx.const_ref(inline_consts.w_globals as i64);
