@@ -1291,18 +1291,21 @@ thread_local! {
 }
 
 /// Record — once per distinct code object — the frame-shape decline of a frame
-/// that `unsupported_jit_shape` keeps out of the tracer entirely (a
-/// `CurrentFrameOnly` FOR_ITER frame: either a body with a non-journalable
-/// mutator — the #57 gate — or a `finally`-duplicated loop).  The tracer never
-/// runs for such a frame, so its decline would otherwise leave no census entry
-/// and read as a silent no-token gap; recording it here lets the
-/// `PYRE_FBW_DEBUG_ABORT` corpus attribute the pre-trace frame-shape decline
-/// alongside the traced declines.  `code_ptr` is the `CodeObject` pointer, used
-/// only to dedup repeated entries of the same declined frame.
-pub fn census_record_frame_shape_decline(code_ptr: usize) {
+/// that `unsupported_jit_shape` keeps out of the tracer entirely.  Two shapes
+/// reach here: a `CurrentFrameOnly` FOR_ITER frame (a body with a
+/// non-journalable mutator — the #57 gate — or a `finally`-duplicated loop),
+/// and a `StructuralRegion` frame (a `with` block whose `WITH_EXCEPT_START`
+/// exception-link lowering the codewriter still residualizes, which also keeps
+/// its nested callees interpreted).  The tracer never runs for such a frame, so
+/// its decline would otherwise leave no census entry and read as a silent
+/// no-token gap; recording it here lets the `PYRE_FBW_DEBUG_ABORT` corpus
+/// attribute the pre-trace frame-shape decline alongside the traced declines.
+/// `code_ptr` is the `CodeObject` pointer, used only to dedup repeated entries
+/// of the same declined frame; `kind` names the shape for the census line.
+pub fn census_record_frame_shape_decline(code_ptr: usize, kind: &'static str) {
     let first = FRAME_SHAPE_DECLINE_SEEN.with(|s| s.borrow_mut().insert(code_ptr));
     if first {
-        census_record("FrameShape::CurrentFrameOnly");
+        census_record(kind);
     }
 }
 

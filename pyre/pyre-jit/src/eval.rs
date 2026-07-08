@@ -3484,10 +3484,36 @@ pub fn init_jit_hooks() {
     );
 }
 
+thread_local! {
+    static JIT_SUPPRESSED_BY_UNSUPPORTED_FRAME: Cell<usize> = const { Cell::new(0) };
+}
+
+struct JitSuppressionGuard;
+
+impl JitSuppressionGuard {
+    fn new() -> Self {
+        JIT_SUPPRESSED_BY_UNSUPPORTED_FRAME.with(|depth| depth.set(depth.get() + 1));
+        Self
+    }
+}
+
+impl Drop for JitSuppressionGuard {
+    fn drop(&mut self) {
+        JIT_SUPPRESSED_BY_UNSUPPORTED_FRAME.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
+// dont_look_inside: reads JIT_SUPPRESSED_BY_UNSUPPORTED_FRAME TLS.
+#[majit_macros::dont_look_inside]
+fn jit_suppressed_by_unsupported_frame() -> bool {
+    JIT_SUPPRESSED_BY_UNSUPPORTED_FRAME.with(|depth| depth.get() != 0)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UnsupportedJitShape {
     None,
     CurrentFrameOnly,
+    StructuralRegion,
 }
 
 /// True for opcodes that may appear in a `FOR_ITER` loop body without ever
@@ -3651,24 +3677,39 @@ fn for_iter_frame_is_finally_duplicated(code: &pyre_interpreter::CodeObject) -> 
 }
 
 fn unsupported_jit_shape(code: &pyre_interpreter::CodeObject) -> UnsupportedJitShape {
-    // `FOR_ITER`: a FOR_ITER frame may enter the JIT only when every loop body
-    // contains exclusively allow-listed opcodes (`for_iter_bodies_all_jit_safe`).
-    // The exclusion exists because a FBW walk that aborts mid-loop while an
-    // inlined sub-walk has performed a direct `list.append`/`STORE_SUBSCR` cannot
-    // deliver or rewind that effect, so the iteration is silently dropped (#57).
-    // Bodies with no explicit mutation/call and no nested `FOR_ITER` cannot reach
-    // that path — verified against the battery and adversarial mutation probes.
+    // Structural adaptation: RPython/PyPy traces these bytecodes with
+    // fully translated support. Pyre's codewriter still lowers
+    // `WITH_EXCEPT_START` through a pyre-local `abort_permanent`
+    // path. A frame containing this unsupported shape must run in the
+    // interpreter. While that frame is active, nested helper calls are
+    // also kept out of the JIT by `JitSuppressionGuard`; this mirrors
+    // the structural unsupported region instead of keying on a
+    // benchmark filename.
     //
-    // `WITH_EXCEPT_START` needs no frame-shape pre-filter: a hot loop containing
-    // a `with` block gets a token, starts tracing, and declines cleanly through
-    // the `abort_permanent` census when the walk reaches the still-residualized
-    // exception-link lowering. RPython has no such pre-filter either
-    // (warmstate.py `maybe_compile_and_run` always ticks the counter).
+    // The gate cannot be dropped yet: removing it lets a `with` frame trace,
+    // which miscompiles (a raw SIGSEGV in the exception-link path plus
+    // guard-failure storms — test_strftime/test_shlex/test_textwrap, #389).
+    // The eventual fix is a real `WITH_EXCEPT_START` lowering; until then the
+    // decline is recorded in the census (see the `StructuralRegion` arm) so it
+    // is not a silent no-token gap.
+    //
+    // `FOR_ITER` is narrower: a FOR_ITER frame may enter the JIT only when
+    // every loop body contains exclusively allow-listed opcodes
+    // (`for_iter_bodies_all_jit_safe`). The exclusion exists because a FBW walk
+    // that aborts mid-loop while an inlined sub-walk has performed a direct
+    // `list.append`/`STORE_SUBSCR` cannot deliver or rewind that effect, so the
+    // iteration is silently dropped (#57). Bodies with no explicit
+    // mutation/call and no nested `FOR_ITER` cannot reach that path — verified
+    // against the battery and adversarial mutation probes.
     let mut arg_state = pyre_interpreter::OpArgState::default();
     let mut has_for_iter = false;
     for unit in code.instructions.iter().copied() {
-        if let pyre_interpreter::Instruction::ForIter { .. } = arg_state.get(unit).0 {
-            has_for_iter = true;
+        match arg_state.get(unit).0 {
+            pyre_interpreter::Instruction::WithExceptStart => {
+                return UnsupportedJitShape::StructuralRegion;
+            }
+            pyre_interpreter::Instruction::ForIter { .. } => has_for_iter = true,
+            _ => {}
         }
     }
     if has_for_iter {
@@ -3691,6 +3732,9 @@ fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
     // PYRE_JIT=0 disables JIT entirely, falling back to plain interpreter.
     static PYRE_JIT_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *PYRE_JIT_DISABLED.get_or_init(|| std::env::var("PYRE_JIT").as_deref() == Ok("0")) {
+        return frame.execute_frame(None, None);
+    }
+    if jit_suppressed_by_unsupported_frame() {
         return frame.execute_frame(None, None);
     }
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
@@ -3720,7 +3764,23 @@ fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
             // from a loop the JIT never noticed.
             pyre_jit_trace::jitcode_dispatch::census_record_frame_shape_decline(
                 code as *const _ as usize,
+                "FrameShape::CurrentFrameOnly",
             );
+            return frame.execute_frame(None, None);
+        }
+        UnsupportedJitShape::StructuralRegion => {
+            // A `with` frame whose `WITH_EXCEPT_START` exception-link lowering
+            // the codewriter still residualizes: tracing it (or its callees)
+            // miscompiles — a raw SIGSEGV in the exception path and guard-failure
+            // storms (#389 gate-regression evidence).  Keep the frame AND its
+            // nested helper frames interpreted via `JitSuppressionGuard`, and
+            // record the census entry so the decline is visible, not a silent
+            // no-token gap.
+            pyre_jit_trace::jitcode_dispatch::census_record_frame_shape_decline(
+                code as *const _ as usize,
+                "FrameShape::StructuralRegion",
+            );
+            let _guard = JitSuppressionGuard::new();
             return frame.execute_frame(None, None);
         }
     }
@@ -3927,6 +3987,17 @@ pub(crate) fn portal_runner_result(frame: &mut PyFrame) -> PyResult {
     // bhimpl_recursive_call_* paths.
     frame.fix_array_ptrs();
     let _frame_guard = pyre_interpreter::eval::install_current_frame(frame);
+    // Mirror `eval_with_jit_inner`'s structural-region suppression so a
+    // recursive portal entry whose code contains `WITH_EXCEPT_START`
+    // keeps nested helper Python frames out of the JIT too. The current
+    // frame is already kept out of trace by `try_function_entry_jit` and
+    // `jit_merge_point_hook`'s `unsupported_jit_shape` check; the guard
+    // extends that to callees.
+    let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
+    let _suppression = match unsupported_jit_shape(code) {
+        UnsupportedJitShape::StructuralRegion => Some(JitSuppressionGuard::new()),
+        UnsupportedJitShape::None | UnsupportedJitShape::CurrentFrameOnly => None,
+    };
     portal_runner_dispatch(frame)
 }
 
@@ -4361,7 +4432,9 @@ fn jit_merge_point_hook(
     info: &majit_metainterp::virtualizable::VirtualizableInfo,
     env: &PyreEnv,
 ) -> Option<LoopResult> {
-    if unsupported_jit_shape(code) != UnsupportedJitShape::None {
+    if jit_suppressed_by_unsupported_frame()
+        || unsupported_jit_shape(code) != UnsupportedJitShape::None
+    {
         return None;
     }
     let concrete_frame = frame as *mut PyFrame as usize;
@@ -4502,7 +4575,9 @@ fn maybe_compile_and_run(
         return None;
     }
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
-    if unsupported_jit_shape(code) != UnsupportedJitShape::None {
+    if jit_suppressed_by_unsupported_frame()
+        || unsupported_jit_shape(code) != UnsupportedJitShape::None
+    {
         return None;
     }
     // warmstate.py:473-477: JC_TRACING → skip entirely (no counter tick)
@@ -5280,7 +5355,9 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         return None;
     }
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
-    if unsupported_jit_shape(code) != UnsupportedJitShape::None {
+    if jit_suppressed_by_unsupported_frame()
+        || unsupported_jit_shape(code) != UnsupportedJitShape::None
+    {
         return None;
     }
     if std::env::var_os("MAJIT_DUMP_BYTECODE").is_some() {
@@ -8219,6 +8296,27 @@ mod tests {
         assert_eq!(
             unsupported_jit_shape(&code),
             UnsupportedJitShape::CurrentFrameOnly
+        );
+    }
+
+    #[test]
+    fn with_block_frame_is_structural_region() {
+        // A `with` block compiles to `WITH_EXCEPT_START` for its exception link.
+        // The codewriter still residualizes that lowering, so tracing the frame
+        // (or its nested callees) miscompiles — a raw SIGSEGV in the exception
+        // path plus guard-failure storms (test_strftime/test_shlex/test_textwrap,
+        // #389). The frame must classify as `StructuralRegion` so it and its
+        // callees stay interpreted; dropping this gate regressed the CPython
+        // suite (commit 4daa5c517e, reverted).
+        use pyre_interpreter::compile_exec;
+        let module = compile_exec(
+            "def wf(cm):\n    total = 0\n    for _ in range(3):\n        with cm:\n            total += 1\n    return total\n",
+        )
+        .expect("test code should compile");
+        let code = function_code_from_module(&module, "wf");
+        assert_eq!(
+            unsupported_jit_shape(&code),
+            UnsupportedJitShape::StructuralRegion
         );
     }
 
