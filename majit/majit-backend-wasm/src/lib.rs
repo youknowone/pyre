@@ -1380,17 +1380,28 @@ impl majit_backend::Backend for WasmBackend {
             return Err(BackendError::Unsupported(reason));
         }
 
-        // Decline bridges that re-enter the interpreter through a may-force
-        // residual call. Such a bridge reconstructs the interpreter value stack
-        // from its inputargs before the CallMayForce; on wasm a float-const
-        // dividend materialises as NULL through that inputarg path, so the
-        // re-entered interpreter runs `truediv(NULL, int)` and raises a spurious
-        // `unsupported operand type(s) for /`. Native never compiles this
-        // side-trace — it blackholes the deopt instead. Declining here routes
-        // the deopt back through the blackhole interpreter, matching native.
-        if ops.iter().any(|op| op.opcode.is_call_may_force()) {
+        // Decline exception-resume bridges (`GuardException`): the guarded call
+        // raised, so the bridge resumes into the exception handler by re-entering
+        // the interpreter at the raising bytecode. That re-entry reads the
+        // pre-call operand stack, whose constant entries (e.g. a float dividend)
+        // live only in the guard's `rd_consts` resume data, not in a spilled
+        // frame slot. The compiled bridge reconstructs its state from inputargs
+        // (spilled slots) alone and cannot see `rd_consts`, so such a constant
+        // materialises as NULL and the re-entered interpreter runs e.g.
+        // `truediv(NULL, int)`, raising a spurious `unsupported operand type(s)
+        // for /`. Declining routes the deopt through the blackhole interpreter,
+        // which rematerialises constants from `rd_consts` (the native path).
+        // Non-raising (`GuardNoException`) loop-closing bridges keep their
+        // compiled fast path — the CallMayForce bridges wasm relies on for speed
+        // are unaffected, so this does not regress them.
+        if ops
+            .iter()
+            .any(|op| op.opcode == majit_ir::OpCode::GuardException)
+        {
             return Err(BackendError::Unsupported(
-                "wasm backend: bridge with CallMayForce interpreter re-entry".into(),
+                "wasm backend: exception-resume bridge (GuardException) re-enters \
+                 the interpreter with unreconstructable rd_consts stack entries"
+                    .into(),
             ));
         }
 
