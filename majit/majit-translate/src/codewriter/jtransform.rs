@@ -2960,7 +2960,9 @@ impl<'a> Transformer<'a> {
             // Unhandled spellings return `None` and fall through to the
             // residual-call path (RPython raises `NotSupported`).
             if base.starts_with("stroruni.") {
-                if let Some(result) = self._handle_stroruni_call(base, op, args) {
+                if let Some(result) = self._handle_stroruni_call(
+                    base, op, target, args, result_ty, graph_name, graph,
+                ) {
                     return prepend_const_prefix(&mut const_prefix_ops, result);
                 }
             }
@@ -3066,63 +3068,118 @@ impl<'a> Transformer<'a> {
         prepend_const_prefix(&mut const_prefix_ops, result)
     }
 
-    /// Port of `jtransform.py:2049 _handle_stroruni_call`, `copy_contents`
-    /// arm only (jtransform.py:2079-2086):
+    /// Port of `jtransform.py:2049 _handle_stroruni_call`.
     ///
-    /// ```python
-    /// if oopspec_name == 'stroruni.copy_contents':
-    ///     if SoU.TO == rstr.STR:      new_op = 'copystrcontent'
-    ///     elif SoU.TO == rstr.UNICODE: new_op = 'copyunicodecontent'
-    ///     else: assert 0
-    ///     return SpaceOperation(new_op, args, op.result)
-    /// ```
+    /// `SoU = args[0].concretetype` classifies the operand as `Ptr(STR)` /
+    /// `Ptr(UNICODE)` / `Ptr(BYTEARRAY)` (jtransform.py:2058-2077); pyre reads
+    /// it from the flowspace `Variable::concretetype()` via
+    /// [`stroruni_first_arg_kind`]. `Ptr(BYTEARRAY)` is `raise NotSupported`
+    /// (jtransform.py:2074) — pyre returns `None`, falling through to the
+    /// residual-call path — and any other shape is `else: assert 0`
+    /// (jtransform.py:2077).
     ///
-    /// `SoU = args[0].concretetype` selects the STR vs UNICODE spelling;
-    /// pyre reads it from the flowspace `Variable::concretetype()` via
-    /// [`stroruni_first_arg_kind`]. Only `Ptr(STR)` maps to `copystrcontent`
-    /// and only `Ptr(UNICODE)` maps to `copyunicodecontent`; `Ptr(BYTEARRAY)`
-    /// (upstream `raise NotSupported`, `jtransform.py:2074`) and any other
-    /// operand shape (`else: assert 0`) return `None`, falling through to the
-    /// residual-call path — pyre's `NotSupported` analogue. The resulting op
-    /// is emitted as [`OpKind::LoweredBlackholeOp`], the same representation
-    /// the Spine-B string transducer produces, so flatten / assembly already
-    /// lower it to the matching jitcode bytecode.
-    ///
-    /// The `concat` / `slice` / `equal` / `cmp` / `copy_string_to_raw` arms
-    /// are not ported yet; those spellings return `None` and fall through to
-    /// the residual-call path.
+    /// - `copy_contents` (jtransform.py:2079-2086) lowers to a
+    ///   `copystrcontent` / `copyunicodecontent` [`OpKind::LoweredBlackholeOp`],
+    ///   the same representation the Spine-B string transducer produces, so
+    ///   flatten / assembly already lower it to the matching jitcode bytecode.
+    /// - `concat` / `slice` / `cmp` / `copy_string_to_raw`
+    ///   (jtransform.py:2059-2072, 2124-2128) map to the `OS_STR_*` / `OS_UNI_*`
+    ///   oopspecindex and lower to a residual call. `concat` / `slice` can
+    ///   raise `MemoryError` (`EF_ELIDABLE_OR_MEMORYERROR`), `cmp` /
+    ///   `copy_string_to_raw` cannot (`EF_ELIDABLE_CANNOT_RAISE`).
+    /// - `equal` (jtransform.py:2087-2122) additionally registers the
+    ///   `OS_STREQ_*` / `OS_UNIEQ_*` slice-comparison helper variants via
+    ///   `_register_extra_helper`, which pyre has not ported; that spelling
+    ///   returns `None` and falls through to the residual-call path until the
+    ///   helper-registration machinery lands.
     fn _handle_stroruni_call(
-        &self,
+        &mut self,
         oopspec_name: &str,
         op: &SpaceOperation,
+        target: &CallTarget,
         args: &[crate::flowspace::model::Variable],
+        result_ty: &ValueType,
+        graph_name: &str,
+        graph: &mut FunctionGraph,
     ) -> Option<RewriteResult> {
-        match oopspec_name {
-            "stroruni.copy_contents" => {
-                let opname = match stroruni_first_arg_kind(args.first()?) {
-                    StrOrUniKind::Str => "copystrcontent",
-                    StrOrUniKind::Unicode => "copyunicodecontent",
-                    // BYTEARRAY → NotSupported (jtransform.py:2074): fall
-                    // through to the residual-call path.
-                    StrOrUniKind::ByteArray => return None,
-                    // jtransform.py:2076 — `else: assert 0, "args[0].concretetype
-                    // must be STR or UNICODE"`. A `stroruni.copy_contents`
-                    // oopspec guarantees a string pointer, so any other shape
-                    // is a should-never-happen invariant violation.
-                    StrOrUniKind::Other => {
-                        panic!("args[0].concretetype must be STR or UNICODE")
-                    }
-                };
-                Some(RewriteResult::Replace(vec![SpaceOperation {
-                    result: op.result.clone(),
-                    kind: OpKind::LoweredBlackholeOp {
-                        opname: opname.to_string(),
-                        args: args.to_vec(),
-                    },
-                }]))
-            }
-            _ => None,
+        // SoU = args[0].concretetype (jtransform.py:2050): the STR vs UNICODE
+        // spelling selects the OS_STR_* vs OS_UNI_* oopspecindex family below.
+        let kind = stroruni_first_arg_kind(args.first()?);
+
+        // jtransform.py:2079-2086 — copy_contents lowers to a blackhole op.
+        if oopspec_name == "stroruni.copy_contents" {
+            let opname = match kind {
+                StrOrUniKind::Str => "copystrcontent",
+                StrOrUniKind::Unicode => "copyunicodecontent",
+                // BYTEARRAY → NotSupported (jtransform.py:2074): fall through
+                // to the residual-call path.
+                StrOrUniKind::ByteArray => return None,
+                // jtransform.py:2077 `else: assert 0, "args[0].concretetype
+                // must be STR or UNICODE"`. A `stroruni.copy_contents` oopspec
+                // guarantees a string pointer, so any other shape is a
+                // should-never-happen invariant violation.
+                StrOrUniKind::Other => {
+                    panic!("args[0].concretetype must be STR or UNICODE")
+                }
+            };
+            return Some(RewriteResult::Replace(vec![SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::LoweredBlackholeOp {
+                    opname: opname.to_string(),
+                    args: args.to_vec(),
+                },
+            }]));
         }
+
+        // jtransform.py:2087-2122 — stroruni.equal registers the OS_STREQ_* /
+        // OS_UNIEQ_* slice-comparison helpers through _register_extra_helper,
+        // which pyre has not ported; fall through to the residual-call path.
+        if oopspec_name == "stroruni.equal" {
+            return None;
+        }
+
+        // jtransform.py:2059-2072 — the OS_STR_* / OS_UNI_* index selected by
+        // the STR vs UNICODE operand. BYTEARRAY → NotSupported (None); any
+        // other shape → assert 0 (jtransform.py:2074-2077).
+        let oopspecindex = match (oopspec_name, kind) {
+            ("stroruni.concat", StrOrUniKind::Str) => OopSpecIndex::StrConcat,
+            ("stroruni.concat", StrOrUniKind::Unicode) => OopSpecIndex::UniConcat,
+            ("stroruni.slice", StrOrUniKind::Str) => OopSpecIndex::StrSlice,
+            ("stroruni.slice", StrOrUniKind::Unicode) => OopSpecIndex::UniSlice,
+            ("stroruni.cmp", StrOrUniKind::Str) => OopSpecIndex::StrCmp,
+            ("stroruni.cmp", StrOrUniKind::Unicode) => OopSpecIndex::UniCmp,
+            ("stroruni.copy_string_to_raw", StrOrUniKind::Str) => OopSpecIndex::StrCopyToRaw,
+            ("stroruni.copy_string_to_raw", StrOrUniKind::Unicode) => OopSpecIndex::UniCopyToRaw,
+            // BYTEARRAY → raise NotSupported (jtransform.py:2074).
+            (_, StrOrUniKind::ByteArray) => return None,
+            // else: assert 0 (jtransform.py:2077).
+            (_, StrOrUniKind::Other) => {
+                panic!("args[0].concretetype must be STR or UNICODE")
+            }
+            // An unported / unknown stroruni.* spelling: fall through to the
+            // residual-call path.
+            _ => return None,
+        };
+
+        // jtransform.py:2051-2057, 2124-2128 — concat/slice can raise
+        // MemoryError; cmp/copy_string_to_raw cannot.
+        let extra = match oopspec_name {
+            "stroruni.concat" | "stroruni.slice" => {
+                majit_ir::descr::ExtraEffect::ElidableOrMemoryError
+            }
+            _ => majit_ir::descr::ExtraEffect::ElidableCannotRaise,
+        };
+        Some(self._handle_oopspec_call(
+            graph,
+            op,
+            target,
+            args,
+            result_ty,
+            graph_name,
+            oopspecindex,
+            Some(extra),
+            None,
+        ))
     }
 
     /// Port of `jtransform.py:2193 _handle_rgc_call`, `ll_shrink_array` arm:
@@ -8260,6 +8317,18 @@ mod tests {
         ]
     }
 
+    /// The `copy_contents` arm returns before touching the residual-call
+    /// machinery, so its tests only need placeholder `graph` / `target` /
+    /// `result_ty` values to satisfy the shared `_handle_stroruni_call`
+    /// signature.
+    fn stroruni_call_dummy_extras() -> (FunctionGraph, CallTarget, ValueType) {
+        (
+            FunctionGraph::new("stroruni"),
+            CallTarget::function_path(["copy_contents"]),
+            ValueType::Ref(None),
+        )
+    }
+
     /// jtransform.py:2079-2086 — `stroruni.copy_contents` with a `Ptr(STR)`
     /// first argument lowers to a single `copystrcontent` blackhole op
     /// carrying the five call args and a void result.
@@ -8267,14 +8336,23 @@ mod tests {
     fn stroruni_copy_contents_str_lowers_to_copystrcontent() {
         use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
         let config = GraphTransformConfig::default();
-        let transformer = Transformer::new(&config);
+        let mut transformer = Transformer::new(&config);
         let args = stroruni_copy_contents_args(STRPTR.clone());
         let op = SpaceOperation {
             result: None,
             kind: OpKind::Live,
         };
+        let (mut graph, target, result_ty) = stroruni_call_dummy_extras();
         let result = transformer
-            ._handle_stroruni_call("stroruni.copy_contents", &op, &args)
+            ._handle_stroruni_call(
+                "stroruni.copy_contents",
+                &op,
+                &target,
+                &args,
+                &result_ty,
+                "stroruni",
+                &mut graph,
+            )
             .expect("copy_contents must be handled");
         let RewriteResult::Replace(ops) = result else {
             panic!("expected Replace");
@@ -8298,14 +8376,23 @@ mod tests {
     fn stroruni_copy_contents_unicode_lowers_to_copyunicodecontent() {
         use crate::translator::rtyper::lltypesystem::rstr::UNICODEPTR;
         let config = GraphTransformConfig::default();
-        let transformer = Transformer::new(&config);
+        let mut transformer = Transformer::new(&config);
         let args = stroruni_copy_contents_args(UNICODEPTR.clone());
         let op = SpaceOperation {
             result: None,
             kind: OpKind::Live,
         };
+        let (mut graph, target, result_ty) = stroruni_call_dummy_extras();
         let result = transformer
-            ._handle_stroruni_call("stroruni.copy_contents", &op, &args)
+            ._handle_stroruni_call(
+                "stroruni.copy_contents",
+                &op,
+                &target,
+                &args,
+                &result_ty,
+                "stroruni",
+                &mut graph,
+            )
             .expect("copy_contents must be handled");
         let RewriteResult::Replace(ops) = result else {
             panic!("expected Replace");
@@ -8323,35 +8410,117 @@ mod tests {
     fn stroruni_copy_contents_bytearray_falls_through() {
         use crate::translator::rtyper::lltypesystem::rbytearray::BYTEARRAYPTR;
         let config = GraphTransformConfig::default();
-        let transformer = Transformer::new(&config);
+        let mut transformer = Transformer::new(&config);
         let args = stroruni_copy_contents_args(BYTEARRAYPTR.clone());
         let op = SpaceOperation {
             result: None,
             kind: OpKind::Live,
         };
+        let (mut graph, target, result_ty) = stroruni_call_dummy_extras();
         assert!(
             transformer
-                ._handle_stroruni_call("stroruni.copy_contents", &op, &args)
+                ._handle_stroruni_call(
+                    "stroruni.copy_contents",
+                    &op,
+                    &target,
+                    &args,
+                    &result_ty,
+                    "stroruni",
+                    &mut graph,
+                )
                 .is_none()
         );
     }
 
-    /// The not-yet-ported `stroruni.*` spellings (concat / slice / equal /
-    /// cmp / copy_string_to_raw) return `None` so `handle_builtin_call`
-    /// falls through to the residual-call path.
+    /// jtransform.py:2059-2072, 2124-2128 — `stroruni.concat` on a `Ptr(STR)`
+    /// operand lowers to a residual call carrying the `StrConcat` oopspecindex
+    /// (`OS_STR_CONCAT`).
     #[test]
-    fn stroruni_unported_spellings_fall_through() {
+    fn stroruni_concat_lowers_to_str_concat_residual_call() {
+        use crate::call::CallControl;
+        use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
+
+        let mut cc = CallControl::new();
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+
+        let mut graph = FunctionGraph::new("concat");
+        let args = stroruni_copy_contents_args(STRPTR.clone());
+        let result_ty = ValueType::Ref(None);
+        let target = CallTarget::function_path(["ll_strconcat"]);
+        let result_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "result".into(),
+                    ty: result_ty.clone(),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let op = SpaceOperation {
+            result: Some(result_var),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: args.clone(),
+                result_ty: result_ty.clone(),
+            },
+        };
+        let rewritten = transformer
+            ._handle_stroruni_call(
+                "stroruni.concat",
+                &op,
+                &target,
+                &args,
+                &result_ty,
+                "concat",
+                &mut graph,
+            )
+            .expect("stroruni.concat must be handled");
+        let RewriteResult::Replace(ops) = rewritten else {
+            panic!("expected Replace");
+        };
+        assert!(
+            ops.iter()
+                .any(|o| matches!(o.kind, OpKind::CallResidual { .. })),
+            "expected a CallResidual, got {ops:?}"
+        );
+        assert!(
+            transformer
+                .notes
+                .iter()
+                .any(|n| n.detail.contains("StrConcat")),
+            "expected an oopspec StrConcat note, got {:?}",
+            transformer.notes
+        );
+    }
+
+    /// jtransform.py:2087-2122 — `stroruni.equal` needs the unported
+    /// `_register_extra_helper` machinery, so it returns `None` and falls
+    /// through to the residual-call path.
+    #[test]
+    fn stroruni_equal_falls_through() {
         use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
         let config = GraphTransformConfig::default();
-        let transformer = Transformer::new(&config);
+        let mut transformer = Transformer::new(&config);
         let args = stroruni_copy_contents_args(STRPTR.clone());
         let op = SpaceOperation {
             result: None,
             kind: OpKind::Live,
         };
+        let (mut graph, target, result_ty) = stroruni_call_dummy_extras();
         assert!(
             transformer
-                ._handle_stroruni_call("stroruni.concat", &op, &args)
+                ._handle_stroruni_call(
+                    "stroruni.equal",
+                    &op,
+                    &target,
+                    &args,
+                    &result_ty,
+                    "stroruni",
+                    &mut graph,
+                )
                 .is_none()
         );
     }
