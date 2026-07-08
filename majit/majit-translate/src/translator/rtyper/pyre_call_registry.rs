@@ -147,6 +147,16 @@ impl PyreFunctionEntry {
     pub fn record_lift_error(&self, message: String) {
         self.function_desc.borrow().record_pyre_lift_error(message);
     }
+
+    /// Read-side twin of [`record_lift_error`]: the recorded pyre-side
+    /// lift failure message, or `None` when the entry's body lifted
+    /// cleanly.  `translate_op` consults this to fail-closed on a callee
+    /// whose graph could not be built (unbuildable callee → caller Skips
+    /// to the legacy walker), instead of binding a `host_object` that
+    /// would partial-codewrite with a pre-real residual kind.
+    pub fn pyre_lift_error(&self) -> Option<String> {
+        self.function_desc.borrow().pyre_lift_error_message()
+    }
 }
 
 /// Per-subject result of the two-phase rtyper drive (`PYRE_TWO_PHASE_RTYPE`).

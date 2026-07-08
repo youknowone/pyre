@@ -1809,6 +1809,29 @@ pub fn translate_op(
                     // 3c. Unknown prefix — `TyperError` (caller must
                     //     register the path or import the prefix).
                     let callable_host = if let Some(entry) = call_registry.lookup(&key) {
+                        // Fail-closed: an entry whose pyre-side body failed to
+                        // lift (recorded by
+                        // `populate_call_registry_from_call_graphs` Pass 2 via
+                        // `record_lift_error`) is NOT a resolved callable.
+                        // Binding its `host_object` would let a graph
+                        // referencing an unbuildable foreign callee false-Match
+                        // through the dual gate and partial-codewrite with the
+                        // callee's pre-real residual kind. Treat it as
+                        // unresolved so the referencing graph deterministically
+                        // Skips to the legacy walker (unbuildable callee →
+                        // caller Skips).
+                        if let Some(lift_err) = entry.pyre_lift_error() {
+                            return Err(TyperError::message(format!(
+                                "translate_op: OpKind::Call::FunctionPath \
+                                 {{ segments: {:?} }} resolves to a \
+                                 PyreCallRegistry entry whose pyre-side lift \
+                                 failed ({lift_err}); the referencing graph \
+                                 falls back to the legacy walker. \
+                                 Result slot = {}",
+                                segments,
+                                fmt_op_result(op),
+                            )));
+                        }
                         entry.host_object.clone()
                     } else if segments.len() == 1
                         && let Some(builtin) = HOST_ENV.lookup_builtin(&segments[0])
@@ -1875,6 +1898,22 @@ pub fn translate_op(
                         // same-leaf matches converge on a single `host_object`
                         // identity, otherwise `None` falls through to the hard
                         // error below.
+                        //
+                        // Same fail-closed rule as the exact-lookup branch: a
+                        // lift-errored entry is unresolved, so the referencing
+                        // graph Skips to the legacy walker.
+                        if let Some(lift_err) = entry.pyre_lift_error() {
+                            return Err(TyperError::message(format!(
+                                "translate_op: OpKind::Call::FunctionPath \
+                                 {{ segments: {:?} }} leaf-matches a \
+                                 PyreCallRegistry entry whose pyre-side lift \
+                                 failed ({lift_err}); the referencing graph \
+                                 falls back to the legacy walker. \
+                                 Result slot = {}",
+                                segments,
+                                fmt_op_result(op),
+                            )));
+                        }
                         entry.host_object.clone()
                     } else {
                         return Err(TyperError::message(format!(
