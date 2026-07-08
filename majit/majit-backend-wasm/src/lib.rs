@@ -1200,6 +1200,23 @@ impl majit_backend::Backend for WasmBackend {
         #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
         let func_handle = 0u32; // Placeholder — no wasm host available
 
+        // `jit_compile_wasm` returns 0 when the host runtime rejects the emitted
+        // module (e.g. a function body exceeding the parser's size limit — a
+        // trace within the metainterp `trace_limit` can still overflow it once
+        // the optimizer peels/unrolls the loop). Storing a token whose handle is
+        // this dead sentinel would let `execute_token` dispatch table slot 0 (not
+        // a trace), leaving `frame[0]` unwritten and resolving a wrong exit descr.
+        // Decline the compile so the metainterp keeps the interpreter fallback —
+        // a backend capability limit, reported like any other unsupported shape.
+        #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+        if func_handle == 0 {
+            return Err(BackendError::Unsupported(
+                "wasm host rejected the compiled trace module (oversized function body \
+                 or invalid module)"
+                    .to_string(),
+            ));
+        }
+
         // A peeled loop carries real work before its (last) LABEL — the
         // unrolled first iteration. codegen emits the `loop` at that LABEL, so
         // the preamble runs once on entry and is NOT part of the iterating body.
@@ -1863,6 +1880,18 @@ impl majit_backend::Backend for WasmBackend {
         let bridge_slot = glue::compile_module(&wasm_bytes);
         #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
         let bridge_slot = 0u32;
+        // A 0 handle means the host rejected the bridge module (see the
+        // `compile_loop` decline). Flipping the source guard's cell to dispatch
+        // into slot 0 would tail-call a non-trace; decline instead so the guard
+        // keeps its host round-trip (correct, unaccelerated).
+        #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+        if bridge_slot == 0 {
+            return Err(BackendError::Unsupported(
+                "wasm host rejected the compiled bridge module (oversized function body \
+                 or invalid module)"
+                    .to_string(),
+            ));
+        }
         diag_bump(5); // bridge compiled — chained in-module
 
         {
