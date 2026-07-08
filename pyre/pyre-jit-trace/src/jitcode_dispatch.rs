@@ -9171,17 +9171,26 @@ pub(crate) fn m73_perop_audit_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_M73_PEROP_AUDIT").is_some())
 }
 
-/// `PYRE_M73_PEROP_CARRY` (#73 S2, default OFF): source a specialization
+/// `PYRE_M73_PEROP_CARRY` (#73 S2, default ON): source a specialization
 /// guard's (`GuardValue`/`GuardClass`) resume coordinate from the walk
 /// cursor's per-op `-live-` BEFORE anchor (`ctx.live_before_jit_pc`,
 /// `pyjitpl.py:198`) instead of the py_pc-keyed `resume_jitcode_pc_for(py_pc)`
 /// block-head marker — the genuine JitCode cursor the migration authors resume
-/// data from. Byte-identical where the anchor coincides with the marker
-/// (99%+ of the corpus per the `PYRE_M73_PEROP_AUDIT` census); the divergent
-/// minority is gated by check.py output equality. Off in production.
+/// data from. Byte-behavior-identical: the per-op anchor coincides with the
+/// marker for 99%+ of specialization captures (`PYRE_M73_PEROP_AUDIT` census),
+/// and the divergent minority resumes correctly (per-op == `self.pc -
+/// SIZE_LIVE_OP`). Validated OFF==ON on check.py (155x2), cpython_tests
+/// (39x2), and extra_tests (219x2), both backends. Opt out with
+/// `PYRE_M73_PEROP_CARRY=0`.
 pub(crate) fn m73_perop_carry_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("PYRE_M73_PEROP_CARRY").is_some())
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M73_PEROP_CARRY") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => true,
+    })
 }
 
 pub(crate) fn python_pc_for_jitcode_pc(metadata: &crate::PyJitCodeMetadata, jit_pc: usize) -> u32 {
