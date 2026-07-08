@@ -7238,6 +7238,35 @@ pub(crate) fn fbw_inline_multiframe_enabled() -> bool {
     })
 }
 
+/// `PYRE_FBW_STRICT_MULTIFRAME` (gh#420): give a STRICT straight-line inlined
+/// callee the same multi-frame guard snapshot the branch-bearing multiframe
+/// path uses, so an in-callee guard resumes at the callee's OWN coordinate
+/// (with the caller paused at the CALL return point) instead of collapsing to
+/// the caller boundary.  The single-frame collapse re-executes the whole call
+/// on deopt, which re-materializes it at a stale `valuestackdepth` (a resume
+/// `LOAD_FAST` push overflows the frame, an `rd_numb` decode overruns) and
+/// re-applies a committed heap side effect — visible on the wasm resume path,
+/// where a guard-failure deopt is not absorbed by a compiled bridge.
+///
+/// The caller (paused) frame is pushed whenever it is snapshot-able
+/// ([`compute_inline_caller_frame`] returns `Some`; `None` keeps the collapse).
+/// When the CALLEE frame is then not snapshot-able either — a kept operand-stack
+/// temp the callee sub-walk does not mirror (a `LOAD_METHOD` receiver, a
+/// residual-call result live across the guard) —
+/// [`walker_capture_multi_frame_inline_snapshot`] returns `Unsupported`, and the
+/// inline declines to an ordinary residual call rather than falling back to the
+/// corrupt collapse.  Default-on; `=0`/`false` opts out.
+pub(crate) fn fbw_strict_multiframe_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_STRICT_MULTIFRAME") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => true,
+    })
+}
+
 /// `PYRE_FBW_LOOP_CALLEE_CA` (gap-10, general loop-bearing-callee →
 /// CALL_ASSEMBLER): when a multi-frame inlined callee sub-walk reaches the
 /// callee's own `jit_merge_point` and a compiled loop token already exists
@@ -9964,6 +9993,13 @@ fn walker_capture_snapshot_for_last_guard_impl(
         let n_callees = FBW_INLINE_CODE_STACK.with(|s| s.borrow().len());
         if n_parents > 0 && n_parents == n_callees {
             let parent_frames = FBW_INLINE_PARENT_FRAMES.with(|s| s.borrow().clone());
+            // A STRICT straight-line callee (gh#420) whose own frame is not
+            // MF-snapshot-able (a kept operand-stack temp the sub-walk does not
+            // mirror) propagates the `Unsupported` error the same as the branch
+            // path: the enclosing inline declines to a residual call rather than
+            // resuming through the single-frame collapse, whose caller-boundary
+            // re-execute both mis-sizes the resumed frame (a decode/`LOAD_FAST`
+            // out-of-bounds) and re-applies the callee's committed side effect.
             return walker_capture_multi_frame_inline_snapshot(
                 ctx,
                 op_pc,
@@ -12756,6 +12792,16 @@ fn try_walker_inline_user_call(
             Some(pf) => Some(pf),
             None => return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc }),
         }
+    } else if strict_inlinable && fbw_strict_multiframe_enabled() {
+        // gh#420: a strict straight-line callee's in-callee guard collapses to
+        // the caller boundary and re-executes the whole call on deopt, doubling
+        // a committed heap side effect and resuming at a stale valuestackdepth.
+        // Give it the same paused-caller frame the branch multiframe path uses
+        // so the guard resumes at the callee's own coordinate.  Best effort:
+        // when the caller frame is not snapshot-able keep the single-frame
+        // collapse (do NOT decline the inline — that shape is otherwise served
+        // correctly today), so this never removes a working inline.
+        compute_inline_caller_frame(ctx, op.pc)
     } else {
         None
     };
