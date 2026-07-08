@@ -16,31 +16,19 @@
 //! pin is: build_flow never panics on a realistic `def f(x): return x
 //! + 1` input and the resulting graph passes checkgraph.
 
-use majit_translate::flowspace::bytecode::{ConstantData, HostCode};
+mod common;
+
+use common::compile_first_code;
+use majit_translate::flowspace::bytecode::HostCode;
 use majit_translate::flowspace::model::{ConstValue, Constant, GraphFunc, checkgraph};
 use majit_translate::flowspace::objspace::build_flow;
-use rustpython_compiler::{Mode, compile as rp_compile};
-use rustpython_compiler_core::bytecode::CodeObject;
-
-fn compile_first_function(src: &str) -> CodeObject {
-    let module = rp_compile(src, Mode::Exec, "<pyre>".into(), Default::default())
-        .expect("compile should succeed");
-    module
-        .constants
-        .iter()
-        .find_map(|c| match c {
-            ConstantData::Code { code } => Some((**code).clone()),
-            _ => None,
-        })
-        .expect("source should contain at least one function body")
-}
 
 fn empty_globals() -> Constant {
     Constant::new(ConstValue::Dict(Default::default()))
 }
 
 fn graph_func_from_source(src: &str) -> GraphFunc {
-    let code = compile_first_function(src);
+    let code = compile_first_code(src);
     let host = HostCode::from_code(&code);
     GraphFunc::from_host_code(host, empty_globals(), Vec::new())
 }
@@ -86,7 +74,7 @@ fn build_flow_rejects_missing_co_newlocals() {
     // Construct a GraphFunc whose HostCode has co_flags = 0. This
     // mirrors the upstream `_assert_rpythonic` branch that rejects
     // exec-level code objects (no CO_NEWLOCALS).
-    let code = compile_first_function("def f():\n    return 1\n");
+    let code = compile_first_code("def f():\n    return 1\n");
     let mut host = HostCode::from_code(&code);
     host.co_flags = 0; // strip CO_NEWLOCALS
     let func = GraphFunc::from_host_code(host, empty_globals(), Vec::new());
@@ -102,7 +90,7 @@ fn build_flow_rejects_closure_bearing_func() {
     // `func.__closure__`. Mirror that: a non-empty co_cellvars on the
     // HostCode signals an inner function / generator / lambda —
     // closure-bearing in upstream's sense.
-    let code = compile_first_function("def f():\n    return 1\n");
+    let code = compile_first_code("def f():\n    return 1\n");
     let mut host = HostCode::from_code(&code);
     host.co_cellvars.push("x".to_string());
     let func = GraphFunc::from_host_code(host, empty_globals(), Vec::new());

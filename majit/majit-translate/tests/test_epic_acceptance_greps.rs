@@ -18,6 +18,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use walkdir::WalkDir;
 
 /// Walk production source tree. Returns (relative_path, source) pairs.
@@ -52,13 +53,21 @@ fn strip_line_comments(line: &str) -> &str {
     }
 }
 
+/// Read the production source tree exactly once and share it across
+/// every invariant test. The tree is ~180 files; without the memo each
+/// of the three grep tests below would re-`read_to_string` the whole
+/// `src/` subtree.
+fn all_src_files() -> &'static Vec<(PathBuf, String)> {
+    static FILES: OnceLock<Vec<(PathBuf, String)>> = OnceLock::new();
+    FILES.get_or_init(|| production_rs_files(&src_root()))
+}
+
 fn scan_forbidden(
     label: &str,
-    root: &Path,
     is_forbidden: impl Fn(&str) -> bool,
 ) -> Vec<(PathBuf, usize, String)> {
     let mut hits = Vec::new();
-    for (rel, src) in production_rs_files(root) {
+    for (rel, src) in all_src_files() {
         for (lineno, line) in src.lines().enumerate() {
             let stripped = strip_line_comments(line);
             if is_forbidden(stripped) {
@@ -90,7 +99,7 @@ fn src_root() -> PathBuf {
 /// identity surrogate), matching upstream.
 #[test]
 fn no_variant_keyed_jitcode_map() {
-    let hits = scan_forbidden("no_variant_keyed_jitcode_map", &src_root(), |line| {
+    let hits = scan_forbidden("no_variant_keyed_jitcode_map", |line| {
         line.contains("HashMap<Instruction")
     });
     assert!(
@@ -112,7 +121,7 @@ fn no_variant_keyed_jitcode_map() {
 /// opname family, no new `OpKind` variant.
 #[test]
 fn no_new_opname_family_for_exceptions() {
-    let hits = scan_forbidden("no_new_opname_family_for_exceptions", &src_root(), |line| {
+    let hits = scan_forbidden("no_new_opname_family_for_exceptions", |line| {
         line.contains("_may_raise") || line.contains("OpKind::Try") || line.contains("TryOp")
     });
     assert!(
@@ -134,7 +143,7 @@ fn no_new_opname_family_for_exceptions() {
 /// the graph-keyed one.
 #[test]
 fn no_legacy_compile_pyre_interpreter() {
-    let hits = scan_forbidden("no_legacy_compile_pyre_interpreter", &src_root(), |line| {
+    let hits = scan_forbidden("no_legacy_compile_pyre_interpreter", |line| {
         line.contains("fn compile_pyre_interpreter")
     });
     assert!(

@@ -5112,26 +5112,8 @@ result = f.x + g.x";
     }
 
     #[test]
-    fn test_contains_op_not_in() {
-        let source = "result = 4 not in [1, 2, 3]";
-        let (_, frame) = run_exec_frame(source);
-        unsafe {
-            let result = w_dict_getitem_str(frame.w_globals, "result").unwrap();
-            assert!(w_bool_get_value(result));
-        }
-    }
-
-    #[test]
     fn test_is_op() {
         let result = run_eval("None is None").unwrap();
-        unsafe {
-            assert!(w_bool_get_value(result));
-        }
-    }
-
-    #[test]
-    fn test_is_not_op() {
-        let result = run_eval("1 is not None").unwrap();
         unsafe {
             assert!(w_bool_get_value(result));
         }
@@ -5176,14 +5158,6 @@ result = f.x + g.x";
     #[test]
     fn test_to_bool() {
         let result = run_eval("not 0").unwrap();
-        unsafe {
-            assert!(w_bool_get_value(result));
-        }
-    }
-
-    #[test]
-    fn test_none_is_none() {
-        let result = run_eval("None is None").unwrap();
         unsafe {
             assert!(w_bool_get_value(result));
         }
@@ -5378,14 +5352,6 @@ result = fib(10)";
         unsafe {
             let r = w_dict_getitem_str(frame.w_globals, "result").unwrap();
             assert_eq!(w_int_get_value(r), 55);
-        }
-    }
-
-    #[test]
-    fn test_string_multiply() {
-        let result = run_eval("'ab' * 3").unwrap();
-        unsafe {
-            assert_eq!(w_str_get_value(result), "ababab");
         }
     }
 

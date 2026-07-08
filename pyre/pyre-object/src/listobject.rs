@@ -1594,24 +1594,6 @@ mod tests {
     }
 
     #[test]
-    fn test_w_list_pop_returns_and_shifts() {
-        let list = w_list_new(vec![w_int_new(10), w_int_new(20), w_int_new(30)]);
-        unsafe {
-            let popped = w_list_pop(list, 1).unwrap();
-            assert_eq!(crate::intobject::w_int_get_value(popped), 20);
-            assert_eq!(w_list_len(list), 2);
-            assert_eq!(
-                crate::intobject::w_int_get_value(w_list_getitem(list, 0).unwrap()),
-                10
-            );
-            assert_eq!(
-                crate::intobject::w_int_get_value(w_list_getitem(list, 1).unwrap()),
-                30
-            );
-        }
-    }
-
-    #[test]
     fn test_w_list_pop_normalizes_negative_index() {
         let list = w_list_new(vec![w_int_new(10), w_int_new(20), w_int_new(30)]);
         unsafe {

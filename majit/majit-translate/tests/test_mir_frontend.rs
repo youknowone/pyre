@@ -5,17 +5,43 @@
 
 use majit_charon_reader::Llbc;
 use majit_translate::front::mir::{LowerError, build_semantic_program_from_llbc, lower_function};
+use std::sync::OnceLock;
 
 const CORPUS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../charon-corpus/corpus.ullbc",);
 
-fn load_corpus() -> Llbc {
-    Llbc::load(CORPUS).expect("load corpus.ullbc")
+/// Load `corpus.ullbc` once and share it across every test. `Llbc` is
+/// read-only after `load`, so a single parse behind a `OnceLock` is
+/// sufficient: `get_or_init` runs the load exactly once even under the
+/// concurrent test threads, and the lowering entry points only borrow it.
+fn load_corpus() -> &'static Llbc {
+    static LLBC: OnceLock<Llbc> = OnceLock::new();
+    LLBC.get_or_init(|| Llbc::load(CORPUS).expect("load corpus.ullbc"))
+}
+
+/// BFS the set of blocks reachable from the graph's startblock. The
+/// `bool_then` / `option_question_mark` rewrites can leave the pre-split
+/// framestate merge block unreachable, so the reachable-only assertions
+/// filter against this set.
+fn reachable_blocks(
+    graph: &majit_translate::model::FunctionGraph,
+) -> std::collections::HashSet<majit_translate::model::BlockId> {
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = vec![graph.startblock];
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        for l in &graph.block(id).exits {
+            stack.push(l.target);
+        }
+    }
+    seen
 }
 
 #[test]
 fn lowers_straight_line_add() {
     let llbc = load_corpus();
-    let graph = lower_function(&llbc, "straight_line_add").expect("lowering");
+    let graph = lower_function(llbc, "straight_line_add").expect("lowering");
     // FunctionGraph.name keeps the full Charon-qualified path
     // because it identifies the LLBC source — only the
     // SemanticFunction.name has the crate-prefix stripping applied
@@ -63,7 +89,7 @@ fn lowers_branch_loop_sum_with_calls_and_discriminant() {
     // terminators, and `Rvalue::Discriminant` on the iterator's
     // `Option<&i64>` step result.
     let llbc = load_corpus();
-    let graph = lower_function(&llbc, "branch_loop_sum").expect("lowering");
+    let graph = lower_function(llbc, "branch_loop_sum").expect("lowering");
     assert_eq!(graph.name, "charon_corpus::branch_loop_sum");
 
     use majit_translate::model::{CallTarget, OpKind};
@@ -108,7 +134,7 @@ fn lowers_branch_loop_sum_with_calls_and_discriminant() {
 #[test]
 fn lowers_strategy_len_with_discriminant_switch() {
     let llbc = load_corpus();
-    let graph = lower_function(&llbc, "strategy_len").expect("lowering");
+    let graph = lower_function(llbc, "strategy_len").expect("lowering");
     assert_eq!(graph.name, "charon_corpus::strategy_len");
     // bb0 Discriminant + Switch, bb1/bb2/bb3 arm bodies + Return,
     // bb4 Abort → 5 MIR bbs + returnblock + exceptblock = 7.
@@ -122,7 +148,7 @@ fn lowers_desugar_mix_with_aggregate_and_question_mark() {
     // construction (`Rvalue::Aggregate` for `PyResult::Ok`), iterator
     // calls, and `break`.
     let llbc = load_corpus();
-    let graph = lower_function(&llbc, "desugar_mix").expect("lowering");
+    let graph = lower_function(llbc, "desugar_mix").expect("lowering");
     assert_eq!(graph.name, "charon_corpus::desugar_mix");
 
     use majit_translate::model::{CallTarget, OpKind};
@@ -164,7 +190,7 @@ fn lowers_tuple_roundtrip_with_symmetric_positional_field_reads() {
     use majit_translate::model::{CallTarget, OpKind};
 
     let llbc = load_corpus();
-    let graph = lower_function(&llbc, "tuple_roundtrip").expect("lowering");
+    let graph = lower_function(llbc, "tuple_roundtrip").expect("lowering");
     assert_eq!(graph.name, "charon_corpus::tuple_roundtrip");
 
     let mut field_reads: Vec<(String, Option<String>)> = Vec::new();
@@ -230,7 +256,7 @@ fn lowers_tuple_roundtrip_with_symmetric_positional_field_reads() {
 #[test]
 fn unknown_function_name_errors() {
     let llbc = load_corpus();
-    let err = lower_function(&llbc, "no_such_function_anywhere").unwrap_err();
+    let err = lower_function(llbc, "no_such_function_anywhere").unwrap_err();
     assert!(matches!(err, LowerError::FunctionNotFound(_)));
 }
 
@@ -240,7 +266,7 @@ fn semantic_program_builder_lowers_every_corpus_function() {
     // and surface every local function as a SemanticFunction with a
     // populated FunctionGraph.
     let llbc = load_corpus();
-    let program = build_semantic_program_from_llbc(&llbc).expect("builder");
+    let program = build_semantic_program_from_llbc(llbc).expect("builder");
     assert!(
         program.functions.len() >= 4,
         "expected at least the 4 corpus shapes, got {}",
@@ -285,7 +311,7 @@ fn enum_variant_by_discriminant_round_trips_against_variant_paths() {
     // `Strategy::<name>` variant path in known_struct_names, and the
     // leaf key must mirror the qualified key.
     let llbc = load_corpus();
-    let program = build_semantic_program_from_llbc(&llbc).expect("builder");
+    let program = build_semantic_program_from_llbc(llbc).expect("builder");
 
     let by_leaf = program
         .enum_variant_by_discriminant
@@ -343,7 +369,7 @@ fn front_graph_carries_no_synthesized_exception_edges() {
         let Some(body): Option<Unstructured> = fd.unstructured() else {
             continue;
         };
-        let graph = lower_fun_decl(&llbc, fd)
+        let graph = lower_fun_decl(llbc, fd)
             .unwrap_or_else(|e| panic!("{} failed to lower: {e}", fd.item_meta.name_path()));
 
         // Invariant A.  The iterator `next`-diamond rewrite
@@ -427,7 +453,7 @@ fn front_graph_carries_no_synthesized_exception_edges() {
 fn branch_loop_sum_lifts_next_to_iter_next_op() {
     use majit_translate::model::{CallTarget, ExitSwitch, OpKind};
     let llbc = load_corpus();
-    let graph = lower_function(&llbc, "branch_loop_sum").expect("lowering");
+    let graph = lower_function(llbc, "branch_loop_sum").expect("lowering");
 
     let mut iter_next_blocks = Vec::new();
     let mut residual_next = 0usize;
@@ -499,23 +525,11 @@ fn branch_loop_sum_lifts_next_to_iter_next_op() {
 fn bool_then_closure_lifts_to_short_circuit_diamond() {
     use majit_translate::model::{CallTarget, ExitSwitch, OpKind};
     let llbc = load_corpus();
-    let graph = lower_function(&llbc, "bool_then_closure").expect("lowering");
+    let graph = lower_function(llbc, "bool_then_closure").expect("lowering");
 
     // Only reachable blocks matter — the rewrite can leave the pre-split
     // framestate merge block unreachable (dropped by later consumers).
-    let reachable: std::collections::HashSet<_> = {
-        let mut seen = std::collections::HashSet::new();
-        let mut stack = vec![graph.startblock];
-        while let Some(id) = stack.pop() {
-            if !seen.insert(id) {
-                continue;
-            }
-            for l in &graph.block(id).exits {
-                stack.push(l.target);
-            }
-        }
-        seen
-    };
+    let reachable = reachable_blocks(&graph);
 
     let mut residual_then = 0usize;
     let mut call_once = 0usize;
@@ -580,21 +594,9 @@ fn bool_then_closure_lifts_to_short_circuit_diamond() {
 fn option_question_mark_lifts_to_direct_option_switch() {
     use majit_translate::model::{CallTarget, ExitCase, ExitSwitch, OpKind};
     let llbc = load_corpus();
-    let graph = lower_function(&llbc, "option_question_mark").expect("lowering");
+    let graph = lower_function(llbc, "option_question_mark").expect("lowering");
 
-    let reachable: std::collections::HashSet<_> = {
-        let mut seen = std::collections::HashSet::new();
-        let mut stack = vec![graph.startblock];
-        while let Some(id) = stack.pop() {
-            if !seen.insert(id) {
-                continue;
-            }
-            for l in &graph.block(id).exits {
-                stack.push(l.target);
-            }
-        }
-        seen
-    };
+    let reachable = reachable_blocks(&graph);
 
     let mut residual_branch = 0usize;
     let mut direct_option_switch = 0usize;

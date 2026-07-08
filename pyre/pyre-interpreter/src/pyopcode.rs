@@ -3536,7 +3536,7 @@ mod tests {
     use crate::{OpArgState, compile_exec};
 
     #[test]
-    fn decode_instruction_at_matches_forward_decode_across_extended_arg_prefix() {
+    fn decode_instruction_across_extended_arg_prefix() {
         let source = (0..400)
             .map(|i| format!("v{i} = {i}"))
             .collect::<Vec<_>>()
@@ -3559,6 +3559,7 @@ mod tests {
             })
             .expect("expected an instruction with an ExtendedArg prefix");
 
+        // decode_instruction_at matches a forward OpArgState decode at target_pc.
         let mut forward = OpArgState::default();
         let mut expected = None;
         for (pc, unit) in code.instructions.iter().copied().enumerate() {
@@ -3576,31 +3577,9 @@ mod tests {
             expected
                 .map(|(instruction, arg)| (std::mem::discriminant(&instruction), u32::from(arg)))
         );
-    }
 
-    #[test]
-    fn decode_instruction_for_dispatch_absorbs_extended_arg_prefix() {
-        let source = (0..400)
-            .map(|i| format!("v{i} = {i}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let code = compile_exec(&source).expect("compile failed");
-
-        let target_pc = code
-            .instructions
-            .iter()
-            .enumerate()
-            .find_map(|(pc, unit)| {
-                if pc > 0
-                    && matches!(code.instructions[pc - 1].op, Instruction::ExtendedArg)
-                    && !matches!(unit.op, Instruction::ExtendedArg)
-                {
-                    Some(pc)
-                } else {
-                    None
-                }
-            })
-            .expect("expected an instruction with an ExtendedArg prefix");
+        // decode_instruction_for_dispatch, starting on the ExtendedArg prefix,
+        // absorbs the prefix and lands on the same target instruction.
         let prefix_pc = target_pc - 1;
 
         let (decoded_pc, decoded_instr, decoded_arg) =

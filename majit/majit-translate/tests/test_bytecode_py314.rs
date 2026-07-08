@@ -17,22 +17,10 @@
 //! they require `FlowContext`. A separate `tests/test_objspace.rs`
 //! will be added alongside the flowcontext port.
 
-use majit_translate::flowspace::bytecode::{ConstantData, HostCode, Instruction};
-use rustpython_compiler::{Mode, compile as rp_compile};
-use rustpython_compiler_core::bytecode::CodeObject;
+mod common;
 
-fn compile_function_body(src: &str) -> CodeObject {
-    let module = rp_compile(src, Mode::Exec, "<pyre>".into(), Default::default())
-        .expect("compile should succeed");
-    module
-        .constants
-        .iter()
-        .find_map(|c| match c {
-            ConstantData::Code { code } => Some((**code).clone()),
-            _ => None,
-        })
-        .expect("source should contain at least one function body")
-}
+use common::compile_first_code;
+use majit_translate::flowspace::bytecode::{HostCode, Instruction};
 
 /// Walk the entire bytecode via `HostCode::read` and return every
 /// decoded instruction. Panics if the walker ever stalls or errors —
@@ -61,7 +49,7 @@ fn contains_variant<F: Fn(&Instruction) -> bool>(ops: &[Instruction], pred: F) -
 
 #[test]
 fn walks_trivial_return() {
-    let host = HostCode::from_code(&compile_function_body("def f():\n    return 1\n"));
+    let host = HostCode::from_code(&compile_first_code("def f():\n    return 1\n"));
     let ops = collect_instructions(&host);
     assert!(contains_variant(&ops, |op| matches!(
         op,
@@ -71,7 +59,7 @@ fn walks_trivial_return() {
 
 #[test]
 fn walks_load_fast_and_binary_op() {
-    let host = HostCode::from_code(&compile_function_body("def f(x, y):\n    return x + y\n"));
+    let host = HostCode::from_code(&compile_first_code("def f(x, y):\n    return x + y\n"));
     let ops = collect_instructions(&host);
     // Either LoadFast (x, y loaded separately) or LoadFastLoadFast (3.14
     // super-instruction). Accept either.
@@ -90,7 +78,7 @@ fn walks_load_fast_and_binary_op() {
 
 #[test]
 fn walks_branches() {
-    let host = HostCode::from_code(&compile_function_body(
+    let host = HostCode::from_code(&compile_first_code(
         "def f(x):\n    if x:\n        return 1\n    return 0\n",
     ));
     let ops = collect_instructions(&host);
@@ -105,7 +93,7 @@ fn walks_branches() {
 
 #[test]
 fn walks_backward_jump_for_while_loop() {
-    let host = HostCode::from_code(&compile_function_body(
+    let host = HostCode::from_code(&compile_first_code(
         "def f(x):\n    while x:\n        x = x - 1\n    return x\n",
     ));
     let ops = collect_instructions(&host);
@@ -117,7 +105,7 @@ fn walks_backward_jump_for_while_loop() {
 
 #[test]
 fn walks_for_iter() {
-    let host = HostCode::from_code(&compile_function_body(
+    let host = HostCode::from_code(&compile_first_code(
         "def f(xs):\n    for x in xs:\n        pass\n",
     ));
     let ops = collect_instructions(&host);
@@ -133,7 +121,7 @@ fn walks_for_iter() {
 
 #[test]
 fn walks_store_and_load_global() {
-    let host = HostCode::from_code(&compile_function_body(
+    let host = HostCode::from_code(&compile_first_code(
         "def f():\n    global g\n    g = 1\n    return g\n",
     ));
     let ops = collect_instructions(&host);
@@ -152,7 +140,7 @@ fn walks_build_tuple_list_and_unpack() {
     // Destructure a parameter (not a literal tuple) so that the
     // compiler cannot constant-fold the RHS into direct stores and
     // must emit UnpackSequence.
-    let host = HostCode::from_code(&compile_function_body(
+    let host = HostCode::from_code(&compile_first_code(
         "def f(t):\n    a, b = t\n    return [a, b]\n",
     ));
     let ops = collect_instructions(&host);
@@ -168,7 +156,7 @@ fn walks_build_tuple_list_and_unpack() {
 
 #[test]
 fn walks_compare_and_contains() {
-    let host = HostCode::from_code(&compile_function_body(
+    let host = HostCode::from_code(&compile_first_code(
         "def f(a, b):\n    return (a < b) and (a in b)\n",
     ));
     let ops = collect_instructions(&host);
@@ -184,7 +172,7 @@ fn walks_compare_and_contains() {
 
 #[test]
 fn walks_call_and_kw_call() {
-    let host = HostCode::from_code(&compile_function_body(
+    let host = HostCode::from_code(&compile_first_code(
         "def f(x):\n    return print(x, end='\\n')\n",
     ));
     let ops = collect_instructions(&host);
@@ -196,7 +184,7 @@ fn walks_call_and_kw_call() {
 
 #[test]
 fn walks_raise_and_try_except() {
-    let host = HostCode::from_code(&compile_function_body(
+    let host = HostCode::from_code(&compile_first_code(
         "def f():\n    try:\n        raise ValueError('x')\n    except ValueError:\n        return 0\n",
     ));
     let ops = collect_instructions(&host);
@@ -212,9 +200,7 @@ fn walks_raise_and_try_except() {
 
 #[test]
 fn walks_yield_and_resume_for_generators() {
-    let host = HostCode::from_code(&compile_function_body(
-        "def g():\n    yield 1\n    yield 2\n",
-    ));
+    let host = HostCode::from_code(&compile_first_code("def g():\n    yield 1\n    yield 2\n"));
     let ops = collect_instructions(&host);
     assert!(host.is_generator());
     assert!(contains_variant(&ops, |op| matches!(
@@ -229,7 +215,7 @@ fn walks_yield_and_resume_for_generators() {
 
 #[test]
 fn walks_build_dict_and_subscript() {
-    let host = HostCode::from_code(&compile_function_body(
+    let host = HostCode::from_code(&compile_first_code(
         "def f():\n    d = {'a': 1}\n    return d['a']\n",
     ));
     let ops = collect_instructions(&host);
@@ -245,7 +231,7 @@ fn walks_build_dict_and_subscript() {
 
 #[test]
 fn walks_return_generator_for_generator_entry() {
-    let host = HostCode::from_code(&compile_function_body("def g():\n    yield 1\n"));
+    let host = HostCode::from_code(&compile_first_code("def g():\n    yield 1\n"));
     let ops = collect_instructions(&host);
     assert!(contains_variant(&ops, |op| matches!(
         op,
@@ -265,7 +251,7 @@ fn extended_arg_prefix_folds_into_oparg() {
         src.push_str(&format!("    v{i} = {i}\n"));
     }
     src.push_str("    return v259\n");
-    let host = HostCode::from_code(&compile_function_body(&src));
+    let host = HostCode::from_code(&compile_first_code(&src));
     let ops = collect_instructions(&host);
     // The decoded op stream must never itself contain ExtendedArg —
     // `HostCode::read` folds the prefix into the successor's oparg.

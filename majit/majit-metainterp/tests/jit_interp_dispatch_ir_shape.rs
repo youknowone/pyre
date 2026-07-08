@@ -61,14 +61,22 @@ fn dispatch_minimal(program: &Bytecode, threshold: u32) -> i64 {
     state.a
 }
 
-#[test]
-fn dispatch_jitcode_emits_portal_markers() {
+/// Shared fixture for the `dispatch_minimal` cluster: rebuilds the
+/// canonical-liveness Assembler and returns the lowered dispatch JitCode.
+/// Each test keeps its own assertions; only the identical build lines are
+/// factored out here.
+fn build_dispatch_minimal() -> JitCode {
     let mut asm = Assembler::new();
     asm.set_canonical_liveness_triple(vec![0], vec![], vec![]);
     __prebuild_jitcode_liveness_dispatch_minimal(&mut asm);
     let _ = asm.ensure_canonical_liveness_offset();
-    let dispatch_jc = __dispatch_jitcode_dispatch_minimal(&mut asm, 0i64)
-        .expect("dispatch lower must succeed for fixture");
+    __dispatch_jitcode_dispatch_minimal(&mut asm, 0i64)
+        .expect("dispatch lower must succeed for fixture")
+}
+
+#[test]
+fn dispatch_jitcode_emits_portal_markers() {
+    let dispatch_jc = build_dispatch_minimal();
     let code = &dispatch_jc.code;
     assert!(!code.is_empty(), "dispatch JitCode body must not be empty");
     let mut i = 0;
@@ -89,12 +97,7 @@ fn dispatch_jitcode_emits_portal_markers() {
 
 #[test]
 fn dispatch_jitcode_contains_inline_call_per_arm() {
-    let mut asm = Assembler::new();
-    asm.set_canonical_liveness_triple(vec![0], vec![], vec![]);
-    __prebuild_jitcode_liveness_dispatch_minimal(&mut asm);
-    let _ = asm.ensure_canonical_liveness_offset();
-    let dispatch_jc = __dispatch_jitcode_dispatch_minimal(&mut asm, 0i64)
-        .expect("dispatch lower must succeed for fixture");
+    let dispatch_jc = build_dispatch_minimal();
     let code = &dispatch_jc.code;
     let inline_call_count = code.iter().filter(|&&b| b == BC_INLINE_CALL).count();
     assert_eq!(
@@ -106,12 +109,7 @@ fn dispatch_jitcode_contains_inline_call_per_arm() {
 
 #[test]
 fn dispatch_arm_subjitcode_lowers_state_field_write() {
-    let mut asm = Assembler::new();
-    asm.set_canonical_liveness_triple(vec![0], vec![], vec![]);
-    __prebuild_jitcode_liveness_dispatch_minimal(&mut asm);
-    let _ = asm.ensure_canonical_liveness_offset();
-    let dispatch_jc = __dispatch_jitcode_dispatch_minimal(&mut asm, 0i64)
-        .expect("dispatch lower must succeed for fixture");
+    let dispatch_jc = build_dispatch_minimal();
     let sub_jitcodes = dispatch_jc
         .exec
         .descrs
@@ -283,12 +281,7 @@ mod switch_dispatch {
 
 #[test]
 fn dispatch_jitcode_contains_loop_back_goto() {
-    let mut asm = Assembler::new();
-    asm.set_canonical_liveness_triple(vec![0], vec![], vec![]);
-    __prebuild_jitcode_liveness_dispatch_minimal(&mut asm);
-    let _ = asm.ensure_canonical_liveness_offset();
-    let dispatch_jc = __dispatch_jitcode_dispatch_minimal(&mut asm, 0i64)
-        .expect("dispatch lower must succeed for fixture");
+    let dispatch_jc = build_dispatch_minimal();
     let code = &dispatch_jc.code;
     let goto_count = code.iter().filter(|&&b| b == BC_GOTO).count();
     assert!(
@@ -306,13 +299,7 @@ fn dispatch_jitcode_contains_loop_back_goto() {
 /// pyopcode.py:171 `opcode = ord(co_code[next_instr])` + `next_instr += 1`.
 #[test]
 fn dispatch_jitcode_lowers_opcode_fetch() {
-    let mut asm = Assembler::new();
-    let canonical: Vec<u8> = (0..1u8).collect();
-    asm.set_canonical_liveness_triple(canonical, vec![], vec![]);
-    __prebuild_jitcode_liveness_dispatch_minimal(&mut asm);
-    let _ = asm.ensure_canonical_liveness_offset();
-    let dispatch_jc = __dispatch_jitcode_dispatch_minimal(&mut asm, 0i64)
-        .expect("dispatch lower must succeed for fixture");
+    let dispatch_jc = build_dispatch_minimal();
     let code = &dispatch_jc.code;
     let mp_idx = code
         .iter()
@@ -341,13 +328,7 @@ fn dispatch_jitcode_lowers_opcode_fetch() {
 /// into goto_if_not_int_eq/iiL (BC_GOTO_IF_NOT_INT_EQ).
 #[test]
 fn dispatch_jitcode_emits_chain_of_int_eq_dispatch() {
-    let mut asm = Assembler::new();
-    let canonical: Vec<u8> = (0..1u8).collect();
-    asm.set_canonical_liveness_triple(canonical, vec![], vec![]);
-    __prebuild_jitcode_liveness_dispatch_minimal(&mut asm);
-    let _ = asm.ensure_canonical_liveness_offset();
-    let dispatch_jc = __dispatch_jitcode_dispatch_minimal(&mut asm, 0i64)
-        .expect("dispatch lower must succeed for fixture");
+    let dispatch_jc = build_dispatch_minimal();
     let code = &dispatch_jc.code;
     let chain_count = code.iter().filter(|&&b| b == BC_GOTO_IF_NOT_INT_EQ).count();
     assert!(
@@ -366,13 +347,7 @@ fn dispatch_jitcode_emits_chain_of_int_eq_dispatch() {
 /// exits; the dispatch JitCode signals this via an int_return insn.
 #[test]
 fn dispatch_jitcode_emits_typed_return_for_default_arm() {
-    let mut asm = Assembler::new();
-    let canonical: Vec<u8> = (0..1u8).collect();
-    asm.set_canonical_liveness_triple(canonical, vec![], vec![]);
-    __prebuild_jitcode_liveness_dispatch_minimal(&mut asm);
-    let _ = asm.ensure_canonical_liveness_offset();
-    let dispatch_jc = __dispatch_jitcode_dispatch_minimal(&mut asm, 0i64)
-        .expect("dispatch lower must succeed for fixture");
+    let dispatch_jc = build_dispatch_minimal();
     let code = &dispatch_jc.code;
     assert!(
         code.iter().any(|&b| b == BC_INT_RETURN),
@@ -510,13 +485,7 @@ fn register_dispatch_jitcode_stores_singleton() {
     // before `ensure_descriptor_registered` in `codegen_state.rs:719`).
     __declare_jit_schema_dispatch_minimal(&mut driver);
 
-    let mut asm = Assembler::new();
-    let canonical: Vec<u8> = (0..1u8).collect();
-    asm.set_canonical_liveness_triple(canonical, vec![], vec![]);
-    __prebuild_jitcode_liveness_dispatch_minimal(&mut asm);
-    let _ = asm.ensure_canonical_liveness_offset();
-    let dispatch_jc = __dispatch_jitcode_dispatch_minimal(&mut asm, 0i64)
-        .expect("dispatch lower must succeed for fixture");
+    let dispatch_jc = build_dispatch_minimal();
 
     driver.register_dispatch_jitcode(dispatch_jc);
 
@@ -651,15 +620,23 @@ mod oparg_minimal {
         state.acc
     }
 
-    #[test]
-    fn dispatch_oparg_minimal_builds_jitcode() {
+    /// Shared fixture for the `dispatch_oparg_minimal` cluster: rebuilds the
+    /// canonical-liveness Assembler and returns the lowered dispatch JitCode.
+    /// Each test keeps its own assertions; only the identical build lines are
+    /// factored out here.
+    fn build_oparg_minimal() -> majit_metainterp::JitCode {
         let mut asm = Assembler::new();
         let canonical: Vec<u8> = (0..1u8).collect();
         asm.set_canonical_liveness_triple(canonical, vec![], vec![]);
         __prebuild_jitcode_liveness_dispatch_oparg_minimal(&mut asm);
         let _ = asm.ensure_canonical_liveness_offset();
-        let dispatch_jc = __dispatch_jitcode_dispatch_oparg_minimal(&mut asm, 0i64)
-            .expect("dispatch lower must succeed for fixture");
+        __dispatch_jitcode_dispatch_oparg_minimal(&mut asm, 0i64)
+            .expect("dispatch lower must succeed for fixture")
+    }
+
+    #[test]
+    fn dispatch_oparg_minimal_builds_jitcode() {
+        let dispatch_jc = build_oparg_minimal();
         assert!(
             !dispatch_jc.code.is_empty(),
             "A.2.1: dispatch JitCode body must be non-empty for the oparg+last_instr fixture"
@@ -682,13 +659,7 @@ mod oparg_minimal {
             BC_GETARRAYITEM_GC_I, BC_INT_ADD, BC_JIT_MERGE_POINT, BC_JIT_MERGE_POINT_C,
         };
 
-        let mut asm = Assembler::new();
-        let canonical: Vec<u8> = (0..1u8).collect();
-        asm.set_canonical_liveness_triple(canonical, vec![], vec![]);
-        __prebuild_jitcode_liveness_dispatch_oparg_minimal(&mut asm);
-        let _ = asm.ensure_canonical_liveness_offset();
-        let dispatch_jc = __dispatch_jitcode_dispatch_oparg_minimal(&mut asm, 0i64)
-            .expect("dispatch lower must succeed for fixture");
+        let dispatch_jc = build_oparg_minimal();
         let code = &dispatch_jc.code;
         let mp_idx = code
             .iter()
@@ -767,13 +738,7 @@ mod oparg_minimal {
             BC_GETARRAYITEM_GC_I, BC_JIT_MERGE_POINT, BC_JIT_MERGE_POINT_C, BC_STORE_STATE_FIELD,
         };
 
-        let mut asm = Assembler::new();
-        let canonical: Vec<u8> = (0..1u8).collect();
-        asm.set_canonical_liveness_triple(canonical, vec![], vec![]);
-        __prebuild_jitcode_liveness_dispatch_oparg_minimal(&mut asm);
-        let _ = asm.ensure_canonical_liveness_offset();
-        let dispatch_jc = __dispatch_jitcode_dispatch_oparg_minimal(&mut asm, 0i64)
-            .expect("dispatch lower must succeed for fixture");
+        let dispatch_jc = build_oparg_minimal();
         let code = &dispatch_jc.code;
         let mp_idx = code
             .iter()
@@ -838,13 +803,7 @@ mod oparg_minimal {
             BC_STORE_STATE_FIELD,
         };
 
-        let mut asm = Assembler::new();
-        let canonical: Vec<u8> = (0..1u8).collect();
-        asm.set_canonical_liveness_triple(canonical, vec![], vec![]);
-        __prebuild_jitcode_liveness_dispatch_oparg_minimal(&mut asm);
-        let _ = asm.ensure_canonical_liveness_offset();
-        let dispatch_jc = __dispatch_jitcode_dispatch_oparg_minimal(&mut asm, 0i64)
-            .expect("dispatch lower must succeed for fixture");
+        let dispatch_jc = build_oparg_minimal();
         let code = &dispatch_jc.code;
         let mp_idx = code
             .iter()
@@ -913,13 +872,7 @@ mod oparg_minimal {
     fn dispatch_oparg_minimal_pins_real_reds_layout() {
         use majit_metainterp::jitcode::insns::{BC_JIT_MERGE_POINT, BC_JIT_MERGE_POINT_C};
 
-        let mut asm = Assembler::new();
-        let canonical: Vec<u8> = (0..1u8).collect();
-        asm.set_canonical_liveness_triple(canonical, vec![], vec![]);
-        __prebuild_jitcode_liveness_dispatch_oparg_minimal(&mut asm);
-        let _ = asm.ensure_canonical_liveness_offset();
-        let dispatch_jc = __dispatch_jitcode_dispatch_oparg_minimal(&mut asm, 0i64)
-            .expect("dispatch lower must succeed for fixture");
+        let dispatch_jc = build_oparg_minimal();
         let code = &dispatch_jc.code;
 
         let mp_pos = code
@@ -1024,13 +977,7 @@ mod oparg_minimal {
         use majit_metainterp::BC_GOTO;
         use majit_metainterp::jitcode::insns::BC_LOOP_HEADER;
 
-        let mut asm = Assembler::new();
-        let canonical: Vec<u8> = (0..1u8).collect();
-        asm.set_canonical_liveness_triple(canonical, vec![], vec![]);
-        __prebuild_jitcode_liveness_dispatch_oparg_minimal(&mut asm);
-        let _ = asm.ensure_canonical_liveness_offset();
-        let dispatch_jc = __dispatch_jitcode_dispatch_oparg_minimal(&mut asm, 0i64)
-            .expect("dispatch lower must succeed for fixture");
+        let dispatch_jc = build_oparg_minimal();
         let dispatch_code = &dispatch_jc.code;
 
         // Step 3 (negative parity at dispatch level): the dispatch JitCode
@@ -1143,13 +1090,7 @@ mod oparg_minimal {
             BC_REF_GUARD_VALUE,
         };
 
-        let mut asm = Assembler::new();
-        let canonical: Vec<u8> = (0..1u8).collect();
-        asm.set_canonical_liveness_triple(canonical, vec![], vec![]);
-        __prebuild_jitcode_liveness_dispatch_oparg_minimal(&mut asm);
-        let _ = asm.ensure_canonical_liveness_offset();
-        let dispatch_jc = __dispatch_jitcode_dispatch_oparg_minimal(&mut asm, 0i64)
-            .expect("dispatch lower must succeed for fixture");
+        let dispatch_jc = build_oparg_minimal();
         let code = &dispatch_jc.code;
 
         let mp_pos = code

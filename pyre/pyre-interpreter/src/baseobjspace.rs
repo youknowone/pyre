@@ -10826,14 +10826,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_setattr_getattr() {
+    fn test_setattr_getattr_and_overwrite() {
         // PyPy raises AttributeError when setattr targets a non-hasdict
         // type. Use a hasdict instance: a W_ObjectObject of a fresh
         // user class created via type().
         let obj = make_user_instance();
+
+        // set → read: happy path
         setattr_str(obj, "name", w_int_new(100)).unwrap();
         let result = getattr_str(obj, "name").unwrap();
         unsafe { assert_eq!(w_int_get_value(result), 100) };
+
+        // overwrite → read: second setattr wins
+        setattr_str(obj, "x", w_int_new(1)).unwrap();
+        setattr_str(obj, "x", w_int_new(2)).unwrap();
+        let result = getattr_str(obj, "x").unwrap();
+        unsafe { assert_eq!(w_int_get_value(result), 2) };
     }
 
     #[test]
@@ -10841,15 +10849,6 @@ mod tests {
         let obj = w_int_new(1);
         let err = getattr_str(obj, "missing").unwrap_err();
         assert!(matches!(err.kind, PyErrorKind::AttributeError));
-    }
-
-    #[test]
-    fn test_setattr_overwrite() {
-        let obj = make_user_instance();
-        setattr_str(obj, "x", w_int_new(1)).unwrap();
-        setattr_str(obj, "x", w_int_new(2)).unwrap();
-        let result = getattr_str(obj, "x").unwrap();
-        unsafe { assert_eq!(w_int_get_value(result), 2) };
     }
 
     /// Helper for the setattr/getattr tests: build an instance of a fresh
