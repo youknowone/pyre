@@ -346,6 +346,19 @@ pub fn portal_red_pre_regalloc_slots(nlocals: usize, max_stackdepth: usize) -> (
     (portal_frame_reg, portal_ec_reg)
 }
 
+/// `PYRE_PCMAP_DERIVE_AUDIT` enables the assertion that the dense `pc_map`
+/// value at a py_pc is derivable on-demand from the two surviving tables
+/// (`first_jit_pc_by_py_pc` + `block_head_py_by_jit_pc`): the largest
+/// `-live-` marker offset at-or-before `first_jit_pc_by_py_pc[py]` equals
+/// `pc_map[py]` by construction (no marker lies strictly between py's block
+/// head and py's first emitted op inside that block). Certifies that
+/// `pc_map` is a redundant cache of the two-table derivation ahead of its
+/// eventual deletion. Diagnostic only; off in production.
+fn pcmap_derive_audit_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_DERIVE_AUDIT").is_some())
+}
+
 impl PyJitCode {
     pub fn new(payload: PyJitCodePayload) -> Self {
         Self {
@@ -458,7 +471,63 @@ impl PyJitCode {
     /// target: once resume data stores `jitcode_pc` directly the
     /// translation step (and the `pc_map` it depends on) can retire.
     pub fn resume_jitcode_pc_for(&self, py_pc: usize) -> Option<usize> {
-        self.metadata.pc_map.get(py_pc).copied()
+        let dense = self.metadata.pc_map.get(py_pc).copied();
+        if pcmap_derive_audit_enabled() {
+            let first = self.metadata.first_jit_pc_by_py_pc.get(py_pc).copied();
+            let table_nonempty = !self.metadata.block_head_py_by_jit_pc.is_empty();
+            // The derivation applies only when the inverse table carries
+            // markers (populated compiled install, not portal-bridge /
+            // skeleton / fixture) AND py_pc is in range AND emitted a first op
+            // of its own (`first != usize::MAX`, else pc_map carry-forward has
+            // no first-op anchor to derive from).
+            match first {
+                Some(first_val) if table_nonempty && first_val != usize::MAX => {
+                    let derived = self.resume_jitcode_pc_for_derived(py_pc);
+                    assert_eq!(
+                        derived, dense,
+                        "pc_map derive-audit divergence: py_pc={py_pc} \
+                         first_jit={first_val} derived={derived:?} dense={dense:?}"
+                    );
+                }
+                Some(usize::MAX) if table_nonempty && dense.is_some() => {
+                    // Carry-forward-on-forward-path finding: resume was queried
+                    // on a trivia/folded py (no first op) yet dense returns a
+                    // marker. The two-table derivation cannot reproduce this;
+                    // count occurrences to learn whether it is a real forward
+                    // path concern or dead.
+                    eprintln!(
+                        "PCMAP_DERIVE_CARRYFWD py_pc={py_pc} first_jit=MAX dense={dense:?}"
+                    );
+                }
+                _ => {}
+            }
+        }
+        dense
+    }
+
+    /// task#50 deletion-precondition: derive `pc_map[py_pc]` on-demand from the
+    /// two surviving tables WITHOUT reading the dense `pc_map` Vec. Returns the
+    /// largest `-live-` marker offset at-or-before py_pc's first emitted op
+    /// (`first_jit_pc_by_py_pc[py_pc]`), which equals py_pc's block-head marker
+    /// = `pc_map[py_pc]` by construction (no marker lies strictly between a
+    /// block head and the first op emitted inside that block). `None` when the
+    /// derivation does not apply: py_pc out of range, py_pc emitted no op of its
+    /// own (`usize::MAX`, where `pc_map` carries the previous marker forward and
+    /// has no first-op anchor), or the inverse table is empty (portal-bridge /
+    /// skeleton / fixture install). The audit in `resume_jitcode_pc_for`
+    /// certifies this equals the dense value wherever it applies.
+    fn resume_jitcode_pc_for_derived(&self, py_pc: usize) -> Option<usize> {
+        let first = self.metadata.first_jit_pc_by_py_pc.get(py_pc).copied();
+        let first_val = match first {
+            Some(v) if v != usize::MAX => v,
+            _ => return None,
+        };
+        let table = &self.metadata.block_head_py_by_jit_pc;
+        if table.is_empty() {
+            return None;
+        }
+        let search = table.binary_search_by_key(&first_val, |&(off, _)| off);
+        Self::predecessor_index(search).map(|i| table[i].0)
     }
 
     /// task#50 phase-0: value-stack depth keyed directly by a JitCode byte
