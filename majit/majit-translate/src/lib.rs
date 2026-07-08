@@ -1203,10 +1203,32 @@ fn analyze_pipeline_from_module_paths(
                         .iter()
                         .map(|owner| owner.rsplit("::").next().unwrap_or(owner).to_string())
                         .collect();
-                    Some(call::TraitFamilyRegistration {
-                        base_root: trait_qualified.clone(),
-                        impl_roots,
-                    })
+                    // The family interning + method seeding key impl
+                    // subclasses by leaf (`canonical_struct_name`), so two
+                    // impls whose qualified owners share a leaf across
+                    // modules would collapse to one classdef and silently
+                    // drop a member. Skip such a family — leaving the
+                    // trait's classdef-less / fail-loud disposition — rather
+                    // than mis-seed it; a same-leaf consumer needs
+                    // qualified-root interning end-to-end (the leaf-keyed
+                    // struct registry and receiver match are pre-existing).
+                    // Mirrors the `struct_leaf_counts` bail on the
+                    // single-impl path below.
+                    let mut seen = std::collections::HashSet::new();
+                    let dup_leaf = impl_roots.iter().find(|leaf| !seen.insert(leaf.as_str()));
+                    if let Some(dup) = dup_leaf {
+                        eprintln!(
+                            "register_trait_families: {trait_qualified:?} has impls sharing \
+                             leaf {dup:?} across modules ({owners:?}); skipping — leaf-keyed \
+                             seeding cannot disambiguate them"
+                        );
+                        None
+                    } else {
+                        Some(call::TraitFamilyRegistration {
+                            base_root: trait_qualified.clone(),
+                            impl_roots,
+                        })
+                    }
                 }
                 None => {
                     // Config validation: a named family that matches no
