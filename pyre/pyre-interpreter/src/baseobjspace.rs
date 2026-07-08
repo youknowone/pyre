@@ -2349,39 +2349,59 @@ unsafe fn setitem_bytearray(obj: PyObjectRef, index: PyObjectRef, value: PyObjec
     if is_slice(index) {
         return setitem_bytearray_slice(obj, index, value);
     }
-    // `descr_setitem`: getindex_w(index) → _fixindex(idx) → coerce value.  The
-    // index gate and byte coercion are inlined (not routed through the shared
-    // `bytearray_index`/`byte_w`) and the coercion is kept inside the in-bounds
-    // block: a shared-function result fails to bind a concrete Int repr in the
-    // rtyper (concretetype None), which the codewriter then mis-colors Ref
-    // against its Int provenance.  `__index__` index support and coercing before
-    // the bounds check (so `ba[oob] = bad` reports the value error ahead of
-    // IndexError) are deferred on that same kind-provenance gap.
-    if !is_int(index) {
-        return Err(PyError::type_error("bytearray indices must be integers"));
+    // `descr_setitem`: getindex_w(index) → byte_w(value) → _fixindex(idx) store.
+    // Both coercions are inlined rather than routed through the shared
+    // `bytearray_index`/`byte_w`, whose `Result<int>` payload fails to bind a
+    // concrete Int repr in the rtyper (concretetype None) so the codewriter
+    // mis-colors it Ref against its Int provenance; the inline `space_index`
+    // pattern keeps the Int repr concrete.  The value is coerced before the
+    // bounds check so `ba[oob] = bad` reports the value error ahead of the
+    // IndexError, and `len` is read after value coercion.
+    let idx = if is_int(index) {
+        w_int_get_value(index)
+    } else if pyre_object::pyobject::is_int_or_long(index) || lookup(index, "__index__").is_some() {
+        let indexed = space_index(index)?;
+        if is_int(indexed) {
+            w_int_get_value(indexed)
+        } else {
+            match i64::try_from(w_long_get_value(indexed)) {
+                Ok(i) => i,
+                // `getindex_w` overflow reports the source type, not the coerced int.
+                Err(_) => {
+                    return Err(PyError::new(
+                        PyErrorKind::IndexError,
+                        format!(
+                            "cannot fit '{}' into an index-sized integer",
+                            object_functionstr_type_name(index)
+                        ),
+                    ));
+                }
+            }
+        }
+    } else {
+        return Err(index_type_error("bytearray", index));
+    };
+    let v = if is_int(value) {
+        w_int_get_value(value)
+    } else {
+        let indexed = space_index(value)?;
+        if is_int(indexed) {
+            w_int_get_value(indexed)
+        } else {
+            match i64::try_from(w_long_get_value(indexed)) {
+                Ok(v) => v,
+                Err(_) => {
+                    return Err(PyError::value_error("byte must be in range(0, 256)"));
+                }
+            }
+        }
+    };
+    if !(0..=255).contains(&v) {
+        return Err(PyError::value_error("byte must be in range(0, 256)"));
     }
-    let idx = w_int_get_value(index);
     let len = pyre_object::bytearrayobject::w_bytearray_len(obj) as i64;
     let actual = if idx < 0 { len + idx } else { idx };
     if actual >= 0 && actual < len {
-        let v = if is_int(value) {
-            w_int_get_value(value)
-        } else {
-            let indexed = space_index(value)?;
-            if is_int(indexed) {
-                w_int_get_value(indexed)
-            } else {
-                match i64::try_from(w_long_get_value(indexed)) {
-                    Ok(v) => v,
-                    Err(_) => {
-                        return Err(PyError::value_error("byte must be in range(0, 256)"));
-                    }
-                }
-            }
-        };
-        if !(0..=255).contains(&v) {
-            return Err(PyError::value_error("byte must be in range(0, 256)"));
-        }
         pyre_object::bytearrayobject::w_bytearray_setitem(obj, actual as usize, v as u8);
         return Ok(w_none());
     }
