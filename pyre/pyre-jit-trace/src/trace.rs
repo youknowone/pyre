@@ -121,14 +121,17 @@ fn start_pc_is_loop_header(code: &pyre_interpreter::CodeObject, start_pc: usize)
     false
 }
 
-/// Heuristic static test: does `code` call a global whose name is its own
-/// (`co_name`)?  That is the self-recursion shape in bytecode — `LOAD_GLOBAL
-/// <own-name>` feeding a `CALL`.  The name-index low bit is the `push_null`
-/// flag (`pyopcode.rs` load-global decode), so the real `co_names` index is
-/// `namei >> 1`.  A shadowed same-name global is a false positive, but the only
-/// cost is declining a walker trace that would abort anyway.
+/// Heuristic static test: does `code` load its own name (`co_name`) feeding a
+/// `CALL`?  That is the self-recursion shape in bytecode.  A module-level
+/// function loads itself with `LOAD_GLOBAL <own-name>` (the name-index low bit
+/// is the `push_null` flag, so the real `co_names` index is `namei >> 1`); a
+/// nested/closure function loads itself with `LOAD_DEREF`/`LOAD_FROM_DICT_OR_DEREF`
+/// of the cell/free var whose name is its own.  A shadowed same-name binding is
+/// a false positive, but the only cost is declining a walker trace that would
+/// abort anyway.
 fn code_is_self_recursive(code: &pyre_interpreter::CodeObject) -> bool {
     use pyre_interpreter::Instruction as I;
+    let own_name: &str = code.obj_name.as_ref();
     let mut arg_state = pyre_interpreter::OpArgState::default();
     let mut self_name_loaded = false;
     let mut has_call = false;
@@ -137,8 +140,14 @@ fn code_is_self_recursive(code: &pyre_interpreter::CodeObject) -> bool {
         match instr {
             I::LoadGlobal { namei } => {
                 let idx = (namei.get(op_arg) as usize) >> 1;
-                let own_name: &str = code.obj_name.as_ref();
                 if code.names.get(idx).map(|n| -> &str { n.as_ref() }) == Some(own_name) {
+                    self_name_loaded = true;
+                }
+            }
+            I::LoadDeref { i } | I::LoadFromDictOrDeref { i } => {
+                let idx = i.get(op_arg).as_usize();
+                let (name, _is_free) = pyre_interpreter::deref_name_and_kind(code, idx);
+                if name == own_name {
                     self_name_loaded = true;
                 }
             }
@@ -2057,16 +2066,21 @@ mod tests {
     }
 
     fn named_function_code(source: &str, name: &str) -> pyre_interpreter::CodeObject {
-        let module = compile_exec(source).expect("test code should compile");
-        module
-            .constants
-            .iter()
-            .find_map(|constant| match constant {
-                pyre_interpreter::ConstantData::Code { code } if code.obj_name.as_str() == name => {
-                    Some((**code).clone())
+        fn find_in(code: &pyre_interpreter::CodeObject, name: &str) -> Option<pyre_interpreter::CodeObject> {
+            for constant in code.constants.iter() {
+                if let pyre_interpreter::ConstantData::Code { code: inner } = constant {
+                    if inner.obj_name.as_str() == name {
+                        return Some((**inner).clone());
+                    }
+                    if let Some(found) = find_in(inner, name) {
+                        return Some(found);
+                    }
                 }
-                _ => None,
-            })
+            }
+            None
+        }
+        let module = compile_exec(source).expect("test code should compile");
+        find_in(&module, name)
             .unwrap_or_else(|| panic!("test source should contain function {name}"))
     }
 
@@ -2090,6 +2104,26 @@ mod tests {
             "fill",
         );
         assert!(!super::code_is_self_recursive(&code));
+    }
+
+    #[test]
+    fn code_is_self_recursive_detects_closure_self_call() {
+        // A nested function loads its own name via LOAD_DEREF (closure cell),
+        // not LOAD_GLOBAL — the scanner must still recognize the self-call.
+        let code = named_function_code(
+            "def outer():\n    def rec(xs, n):\n        xs.append(n)\n        if n > 0:\n            return rec(xs, n - 1) + 1\n        return 1\n    return rec\n",
+            "rec",
+        );
+        assert!(
+            super::code_is_self_recursive(&code),
+            "closure self-recursion (LOAD_DEREF) must be detected"
+        );
+        assert_eq!(code.arg_count, 2);
+        // 2-arg closure self-recursion traced from entry must decline.
+        assert!(
+            decline_predicate(&code, 0),
+            "2-arg closure self-recursion must be declined"
+        );
     }
 
     /// Mirror of the `static_walker_should_decline` predicate on a raw
