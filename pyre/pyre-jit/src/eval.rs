@@ -3214,11 +3214,8 @@ pub fn set_param(
 
     // interp_jit.py:151-156 — positional string → jit.set_user_param(None, text)
     if pos_args.len() == 1 {
-        let w_text = pos_args[0];
-        if !unsafe { pyre_object::is_str(w_text) } {
-            return Ok(w_none());
-        }
-        let text = unsafe { pyre_object::w_str_get_value(w_text) };
+        // `space.text_w` rejects a non-str positional with TypeError.
+        let text = pyre_interpreter::baseobjspace::text_w(pos_args[0])?;
         // rlib/jit.py:842-862 set_user_param.
         let ws = driver.meta_interp_mut().warm_state_mut();
         if apply_jit_param_string(ws, &text).is_err() {
@@ -3244,22 +3241,21 @@ pub fn set_param(
             if key == "__pyre_kw__" {
                 continue;
             }
-            // interp_jit.py:158-159
+            // interp_jit.py:158-159 — `space.text_w` rejects a non-str value.
             if key == "enable_opts" {
-                if unsafe { pyre_object::is_str(v) } {
-                    ws.set_param_enable_opts(unsafe { pyre_object::w_str_get_value(v) });
-                }
+                ws.set_param_enable_opts(pyre_interpreter::baseobjspace::text_w(v)?);
                 continue;
             }
-            // interp_jit.py:160-167 — validate parameter name
+            // interp_jit.py:160-167 — `intval = space.int_w(w_value)` is computed
+            // (rejecting a non-int value with TypeError) before the parameter
+            // name is validated.
+            let intval = pyre_interpreter::baseobjspace::int_w(v)?;
             if !is_known_jit_param(key) {
                 return Err(pyre_interpreter::PyError::type_error(format!(
                     "no JIT parameter '{key}'"
                 )));
             }
-            if unsafe { pyre_object::is_int(v) } {
-                ws.set_param(key, unsafe { pyre_object::w_int_get_value(v) });
-            }
+            ws.set_param(key, intval);
         }
     }
 
