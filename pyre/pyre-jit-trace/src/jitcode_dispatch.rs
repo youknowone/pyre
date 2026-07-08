@@ -9004,18 +9004,29 @@ pub(crate) fn bridge_audit_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_BRIDGE_AUDIT").is_some())
 }
 
-/// `PYRE_M366_BRIDGE_JITCODE` (default OFF) consumes the predecessor-keyed
+/// `PYRE_M366_BRIDGE_JITCODE` (default ON) consumes the predecessor-keyed
 /// `pcdep_by_jit_pc` / `depth_pred_by_jit_pc` twins directly from the carried
 /// genuine `jitcode_pc` at `bridge_semantic_maps_at_with_jitcode_pc`, instead of
 /// re-inverting the coordinate to a Python PC via `python_pc_for_jitcode_pc` and
 /// indexing the py_pc-keyed `pcdep_color_slots` / `depth_at_py_pc`. The equality
-/// this relies on is the one `PYRE_PCMAP_BRIDGE_AUDIT` certifies. This is the
-/// decode-side identity step toward retiring the `pc_map` re-inversion — a
-/// behavioral flip validated by that audit certificate plus full corpus, since
-/// no byte-identical fallback exists once the re-inversion is bypassed.
+/// this relies on is the one `PYRE_PCMAP_BRIDGE_AUDIT` certifies (with the gate
+/// OFF, so `via_twin` is `None` and the audit arm reaches every decodable carried
+/// coordinate). This is the decode-side identity step retiring the `pc_map`
+/// re-inversion at seam #1. The twin path is taken only when the carried
+/// coordinate is `can_decode_live_vars`-anchored AND both predecessor twins are
+/// populated; every other case (portal/skeleton bridges, non-decodable interior
+/// coordinates) falls through to the byte-identical legacy re-inversion — so the
+/// flip changes only the populated-twin frames the audit certifies. Opt out with
+/// `PYRE_M366_BRIDGE_JITCODE=0`.
 pub(crate) fn bridge_jitcode_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("PYRE_M366_BRIDGE_JITCODE").is_some())
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M366_BRIDGE_JITCODE") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => true,
+    })
 }
 
 /// `PYRE_M73_ENCODE_AUDIT` enables the assertion that the trivia-aware
