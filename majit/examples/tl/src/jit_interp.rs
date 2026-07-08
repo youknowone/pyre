@@ -15,8 +15,13 @@ pub static SPIKE_COMPILES: core::sync::atomic::AtomicU32 = core::sync::atomic::A
 ///
 /// Operates on the live portion of the stack `stack[0..stackpos]`.
 /// The JIT does not trace into this function; it emits a residual CALL.
+#[cfg(test)]
+pub static ROLL_CALLS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 #[majit_macros::dont_look_inside]
 extern "C" fn storage_roll(stack_ptr: usize, stackpos: i64, r: i64) {
+    #[cfg(test)]
+    ROLL_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let stack = unsafe { std::slice::from_raw_parts_mut(stack_ptr as *mut i64, stackpos as usize) };
     let len = stack.len();
     if r < -1 {
@@ -366,6 +371,67 @@ mod tests {
             let got = jit.run(&bc, a);
             assert_eq!(got, expected, "mismatch for a={a}");
         }
+    }
+
+    /// Hot loop that runs a residual `storage_roll` (ROLL, @dont_look_inside)
+    /// twice per iteration. An accumulator stays on the stack throughout so
+    /// RETURN always has a value; the two ROLLs cancel (rotate + rotate back)
+    /// so the final acc equals the interpreter's. Counting actual
+    /// `storage_roll` invocations detects walk-vs-native double-execution of
+    /// the residual during tracing.
+    ///
+    /// Stack discipline (acc kept at bottom, counter counts down from N):
+    ///   PUSH 0             [0]              acc
+    ///   PUSHARG            [0, N]           counter
+    /// loop @ off 3:
+    ///   PICK 0             [acc, c, c]      dup counter
+    ///   BR_COND 2          [acc, c]         if c!=0 -> body(off 9), pops dup
+    ///   POP                [acc]            c==0: drop counter
+    ///   RETURN                              return acc
+    /// body @ off 9:                         [acc, c]
+    ///   ROLL 2             [c, acc]         residual (rotate 2)
+    ///   ROLL 254(=-2)      [acc, c]         residual (rotate back)
+    ///   PUSH 1 SUB         [acc, c-1]       decrement counter
+    ///   PUSH 1 BR_COND -N  jump to loop
+    fn roll_loop_bytecode() -> Vec<u8> {
+        vec![
+            PUSH, 0,       // 0: [0]
+            PUSHARG, // 2: [0, N]
+            // loop @ off 3:
+            PICK, 0, // 3: [acc, c, c]
+            BR_COND, 2,      // 5: if c!=0 -> body off 9 (pops dup); else fall through
+            POP,    // 7: [acc]
+            RETURN, // 8: return acc
+            // body @ off 9:
+            ROLL, 2, // 9: [c, acc] residual
+            ROLL, 254, // 11: r=-2 -> [acc, c] residual
+            PUSH, 1, SUB, // 13: [acc, c-1]
+            PUSH, 1, // 16: [acc, c-1, 1]
+            BR_COND, 239, // 18: offset byte @19, target=19+(-17)+1=3 -> loop header
+        ]
+    }
+
+    #[test]
+    fn jit_residual_not_double_executed() {
+        let bc = roll_loop_bytecode();
+        let n: i64 = 20;
+        // First confirm the program is well-formed and the JIT result matches
+        // the interpreter (the two ROLLs cancel, so acc == 0).
+        let expected = interp::interpret(&bc, n);
+        ROLL_CALLS.store(0, core::sync::atomic::Ordering::Relaxed);
+        let mut jit = JitTlInterp::new();
+        let got = jit.run(&bc, n);
+        let jit_rolls = ROLL_CALLS.load(core::sync::atomic::Ordering::Relaxed);
+        assert_eq!(got, expected, "JIT result diverged from interp");
+
+        // Two ROLLs per iteration; N iterations before the counter hits 0.
+        let expected_rolls = (n as u32) * 2;
+        assert_eq!(
+            jit_rolls, expected_rolls,
+            "residual storage_roll executed {jit_rolls}× but the program has \
+             exactly {expected_rolls} ROLLs — a walk-vs-native double-execution \
+             would inflate this count"
+        );
     }
 
     #[test]
