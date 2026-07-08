@@ -5105,6 +5105,31 @@ impl MIFrame {
 
     #[allow(dead_code)]
     fn guard_int_object_value(&mut self, ctx: &mut TraceCtx, int_obj: OpRef, expected: i64) {
+        if pyre_object::tagged_int::CAN_BE_TAGGED {
+            if let Some(Value::Ref(r)) = ctx.concrete_of_opref(int_obj) {
+                if r != GcRef(usize::MAX) {
+                    let o = r.as_usize() as PyObjectRef;
+                    if !o.is_null() {
+                        if pyre_object::tagged_int::is_tagged_int(o) {
+                            let lowbit =
+                                crate::helpers::emit_tag_lowbit_test(ctx, int_obj, true);
+                            self.generate_guard(ctx, OpCode::GuardTrue, &[lowbit]);
+                            let untagged = crate::helpers::emit_untag_int(
+                                ctx,
+                                int_obj,
+                                pyre_object::tagged_int::untag_int(o),
+                            );
+                            self.implement_guard_value(ctx, untagged, expected);
+                            return;
+                        } else {
+                            let lowbit =
+                                crate::helpers::emit_tag_lowbit_test(ctx, int_obj, false);
+                            self.generate_guard(ctx, OpCode::GuardFalse, &[lowbit]);
+                        }
+                    }
+                }
+            }
+        }
         self.guard_class(ctx, int_obj, &INT_TYPE as *const PyType);
         let actual_value = opimpl_getfield_gc_i(ctx, int_obj, int_intval_descr());
         self.implement_guard_value(ctx, actual_value, expected);
@@ -5171,6 +5196,29 @@ impl MIFrame {
     ) -> OpRef {
         if self.value_type(int_obj) == Type::Int {
             return int_obj;
+        }
+        if pyre_object::tagged_int::CAN_BE_TAGGED {
+            if let Some(Value::Ref(r)) = ctx.concrete_of_opref(int_obj) {
+                if r != GcRef(usize::MAX) {
+                    let o = r.as_usize() as PyObjectRef;
+                    if !o.is_null() {
+                        if pyre_object::tagged_int::is_tagged_int(o) {
+                            let lowbit =
+                                crate::helpers::emit_tag_lowbit_test(ctx, int_obj, true);
+                            self.generate_guard(ctx, OpCode::GuardTrue, &[lowbit]);
+                            return crate::helpers::emit_untag_int(
+                                ctx,
+                                int_obj,
+                                pyre_object::tagged_int::untag_int(o),
+                            );
+                        } else {
+                            let lowbit =
+                                crate::helpers::emit_tag_lowbit_test(ctx, int_obj, false);
+                            self.generate_guard(ctx, OpCode::GuardFalse, &[lowbit]);
+                        }
+                    }
+                }
+            }
         }
         self.guard_class(ctx, int_obj, &INT_TYPE as *const PyType);
         opimpl_getfield_gc_i(ctx, int_obj, int_intval_descr())

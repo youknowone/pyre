@@ -145,6 +145,31 @@ pub trait WalkerFrameOps {
     /// as `INT_TYPE`, read its `intval` field, then `implement_guard_value`
     /// the unboxed payload against `expected`.
     fn guard_int_object_value(&mut self, int_obj: OpRef, expected: i64) {
+        if pyre_object::tagged_int::CAN_BE_TAGGED {
+            if let Some(majit_ir::Value::Ref(r)) = self.ctx().concrete_of_opref(int_obj) {
+                if r != majit_ir::GcRef(usize::MAX) {
+                    let o = r.as_usize() as pyre_object::PyObjectRef;
+                    if !o.is_null() {
+                        if pyre_object::tagged_int::is_tagged_int(o) {
+                            let lowbit =
+                                crate::helpers::emit_tag_lowbit_test(self.ctx_mut(), int_obj, true);
+                            self.generate_guard(OpCode::GuardTrue, &[lowbit]);
+                            let untagged = crate::helpers::emit_untag_int(
+                                self.ctx_mut(),
+                                int_obj,
+                                pyre_object::tagged_int::untag_int(o),
+                            );
+                            self.implement_guard_value(untagged, expected);
+                            return;
+                        } else {
+                            let lowbit =
+                                crate::helpers::emit_tag_lowbit_test(self.ctx_mut(), int_obj, false);
+                            self.generate_guard(OpCode::GuardFalse, &[lowbit]);
+                        }
+                    }
+                }
+            }
+        }
         self.guard_class(int_obj, &pyre_object::pyobject::INT_TYPE as *const PyType);
         let actual_value = crate::state::opimpl_getfield_gc_i(
             self.ctx_mut(),
