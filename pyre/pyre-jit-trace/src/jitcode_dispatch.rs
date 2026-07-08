@@ -7019,19 +7019,21 @@ impl Drop for CarrierResumeGuard {
 const FBW_MAX_INLINE_RECURSION: usize = 7;
 
 /// Maximum inline depth the multiframe guard-snapshot path
-/// (`walker_capture_multi_frame_inline_snapshot`) SOUNDLY supports.  Only a
-/// single paused caller frame (depth-1, one parent) resumes correctly: on
-/// guard-failure blackhole resume the one caller frame's virtualizable is
-/// rematerialized and its `portal_frame_reg` decodes to a live vable.  A
-/// depth-≥2 snapshot has a MIDDLE inlined-callee frame whose `NewWithVtable`
-/// virtual `PyFrame` (`emit_new_pyframe_inline_with_params`) is NOT
-/// rematerialized by the resume decoder — its `portal_frame_reg` decodes to a
-/// raw `TAGVIRTUAL` value and `handler_setarrayitem_vable_r` dereferences it
-/// (`EXC_BAD_ACCESS`).  Bounded to 1 so `try_multiframe` (`inline_depth <
-/// FBW_MAX_MULTIFRAME_DEPTH`) only fires at the top inline level; deeper
-/// recursion folds to the `CALL_ASSEMBLER` tail.  Restoring deeper unroll
-/// needs middle-frame virtual rematerialization in the optimizer
-/// `store_final_boxes_in_guard` / resume decoder (the walker-arch rework).
+/// (`walker_capture_multi_frame_inline_snapshot`) unrolls before folding to
+/// the `CALL_ASSEMBLER` tail.  Bounded to 1: a depth-≥2 unroll of a tree
+/// recursion (e.g. `fib`, whose `n < 2` base-case guard fails per call) does
+/// not stay in compiled code — the unrolled trace guard-fails and deopts to
+/// the blackhole on essentially every recursive call (measured: two orders of
+/// magnitude more blackhole resumes than the folded path, ~20-30× slower).
+/// This mirrors `max_unroll_recursion` bounding the same runaway: past the
+/// bound the recursive call folds straight to `CALL_ASSEMBLER`
+/// (`_opimpl_recursive_call` → `do_recursive_call`, `pyjitpl.py:1404-1416`)
+/// rather than continuing to unroll the call tree.  `try_multiframe`
+/// (`inline_depth < FBW_MAX_MULTIFRAME_DEPTH`) therefore only fires at the top
+/// inline level.  (The depth-≥2 blackhole-resume crash that previously blocked
+/// this path was a GC-rooting gap in the nested `run()` chain, fixed by rooting
+/// the whole pending `nextblackholeinterp` chain across `run()`; raising the
+/// bound is now a performance, not a soundness, question.)
 const FBW_MAX_MULTIFRAME_DEPTH: usize = 1;
 
 /// Recursion depth of `w_code` on the FBW inline stack.

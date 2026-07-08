@@ -1224,8 +1224,30 @@ impl BlackholeInterpreter {
     /// Returns `Some(args)` for `ContinueRunningNormally` (RPython: raise
     /// jitexc.ContinueRunningNormally propagates through run→_run_forever).
     pub fn run(&mut self) -> Option<MergePointArgs> {
+        // Root this frame's register bank AND every pending caller frame
+        // reachable through `nextblackholeinterp`.  RPython keeps the whole
+        // blackhole interpreter chain transitively GC-traced from the head for
+        // the lifetime of `_run_forever`: each interp is a GC object and its
+        // `registers_r` array plus the `nextblackholeinterp` link are traced
+        // fields.  pyre's `push_bh_regs` roots one frame's `Vec` copy at a
+        // time, so a caller frame that is not yet running is invisible to the
+        // collector.  A minor collection triggered inside this frame's
+        // `run_inner` (nursery allocation) would then fail to forward a young
+        // object held only by a pending caller's register — most importantly
+        // that caller's own materialized `PyFrame` self-pointer — and
+        // `nursery.reset()` zeroes the reclaimed slot.  When control unwinds to
+        // that caller it reads a stale/zeroed frame (its `locals_cells_stack_w`
+        // slot NULL) and a vable opcode dereferences it.  Rooting the full
+        // pending chain here mirrors the RPython invariant.
         let bh_depth = unsafe {
-            majit_gc::shadow_stack::push_bh_regs(&mut self.registers_r, &mut self.tmpreg_r)
+            let depth =
+                majit_gc::shadow_stack::push_bh_regs(&mut self.registers_r, &mut self.tmpreg_r);
+            let mut caller = self.nextblackholeinterp.as_deref_mut();
+            while let Some(frame) = caller {
+                majit_gc::shadow_stack::push_bh_regs(&mut frame.registers_r, &mut frame.tmpreg_r);
+                caller = frame.nextblackholeinterp.as_deref_mut();
+            }
+            depth
         };
         let result = self.run_inner();
         majit_gc::shadow_stack::pop_bh_regs_to(bh_depth);
