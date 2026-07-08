@@ -9691,7 +9691,7 @@ impl OpcodeStepExecutor for MIFrame {
         // raise of the same object must take the residual path, whose
         // runtime `attach_raise_cause` keeps an existing `__context__`
         // and avoids the self-cycle.
-        let trace_built = self.sym_mut().trace_built_exc.remove(&exc_val.opref);
+        let trace_built = self.sym_mut().trace_built_exc.swap_remove(&exc_val.opref);
         let exc = if exc.is_null() {
             trace_built.unwrap_or(exc)
         } else {

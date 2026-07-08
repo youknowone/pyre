@@ -788,7 +788,7 @@ impl RewriteState {
     /// original.  Preserves the original's position mapping so downstream
     /// uses of the original's `OpRef` resolve to the lowered op's result.
     fn emit_maybe_forwarded(&mut self, original: &Op) -> Operand {
-        if let Some(lowered) = self.forwarded_ops.remove(&self.current_i) {
+        if let Some(lowered) = self.forwarded_ops.swap_remove(&self.current_i) {
             let result = if original.result_type() == Type::Void {
                 self.emit(lowered)
             } else {
@@ -1784,7 +1784,7 @@ impl GcRewriterImpl {
         let offset = fd.offset() as i64;
         let base = st.resolve(op.arg(0));
         if let Some(entries) = st._delayed_zero_setfields.get_mut(&base.to_opref()) {
-            entries.remove(&offset);
+            entries.swap_remove(&offset);
         }
     }
 
@@ -2860,7 +2860,7 @@ impl GcRewriter for GcRewriterImpl {
         for (i, orig_op) in ops.iter().enumerate() {
             // rewrite.py:366-367 — if `remove_tested_failarg` rewrote this
             // op on a previous iteration, use the stashed replacement.
-            let owned = st.changed_ops.remove(&i);
+            let owned = st.changed_ops.swap_remove(&i);
             let op: &Op = owned.as_ref().unwrap_or(orig_op);
             st.current_i = i;
 

@@ -2592,7 +2592,7 @@ pub(crate) fn box_value_for_python_helper(
             // `__context__` or other state); drop it so a later
             // RAISE_VARARGS takes the residual path, whose runtime
             // `attach_raise_cause` chaining is conditional.
-            state.sym_mut().trace_built_exc.remove(&value);
+            state.sym_mut().trace_built_exc.swap_remove(&value);
             value
         }
     }
@@ -7793,8 +7793,7 @@ impl JitState for PyreJitState {
         // out) once validated, mirroring the LoadGlobal-fold / multiframe
         // gap-10 flips; the opt-out keeps the prior symbolic-bridge
         // behavior available for A/B.
-        let mut seed_bridge_locals =
-            std::env::var("PYRE_FBW_BRIDGE_LOCAL_SEED").as_deref() != Ok("0");
+        let seed_bridge_locals = std::env::var("PYRE_FBW_BRIDGE_LOCAL_SEED").as_deref() != Ok("0");
         // For kept-stack branch guards the body-internal marker's
         // liveness colors do not 1:1-correspond to semantic slots — a
         // color that lives a temp at the body marker may name a different

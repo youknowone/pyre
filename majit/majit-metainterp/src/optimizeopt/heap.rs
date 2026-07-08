@@ -920,8 +920,8 @@ impl OptHeap {
         if box_.is_constant() {
             return;
         }
-        self.unescaped.remove(box_);
-        if let Some(deps) = self.heapc_deps.remove(box_) {
+        self.unescaped.swap_remove(box_);
+        if let Some(deps) = self.heapc_deps.swap_remove(box_) {
             for dep in deps {
                 self.escape_box(&dep);
             }
@@ -1951,7 +1951,7 @@ impl OptHeap {
                 // heap.py:547-552 del self.cached_dict_reads[fielddescr]
                 if !descr.is_always_pure() {
                     let did = descr_identity(&descr);
-                    self.cached_dict_reads.remove(&did);
+                    self.cached_dict_reads.swap_remove(&did);
                 }
             }
         }
@@ -2028,7 +2028,7 @@ impl OptHeap {
             })
             .collect();
         for dict_id in array_ids_to_clear {
-            self.cached_dict_reads.remove(&dict_id);
+            self.cached_dict_reads.swap_remove(&dict_id);
         }
     }
 

@@ -1412,7 +1412,7 @@ impl WarmEnterState {
     ///
     /// Returns the number of loops invalidated.
     pub fn invalidate_quasiimmut(&mut self, qmut_key: u64) -> usize {
-        let deps = match self.quasiimmut_deps.remove(&qmut_key) {
+        let deps = match self.quasiimmut_deps.swap_remove(&qmut_key) {
             Some(deps) => deps,
             None => return 0,
         };
@@ -1727,7 +1727,7 @@ impl WarmEnterState {
         let mut removed = 0;
         let keys: Vec<u64> = self.cells.keys().copied().collect();
         for hash in keys {
-            if let Some(head) = self.cells.remove(&hash) {
+            if let Some(head) = self.cells.swap_remove(&hash) {
                 let (kept, n) = Self::clean_chain(head);
                 removed += n;
                 if let Some(k) = kept {
@@ -1786,7 +1786,7 @@ impl WarmEnterState {
     /// ```
     pub fn install_new_cell(&mut self, hash: u64, newcell: Option<BaseJitCell>) {
         let mut keep = newcell;
-        let mut cell_opt = self.cells.remove(&hash);
+        let mut cell_opt = self.cells.swap_remove(&hash);
         // Walk the existing chain, unlink each node.
         while let Some(mut cell) = cell_opt {
             let next = cell.next.take().map(|b| *b);

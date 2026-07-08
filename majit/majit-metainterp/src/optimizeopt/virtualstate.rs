@@ -2588,7 +2588,7 @@ fn export_single_value(
 
     let info = export_single_value_inner(box_.to_opref(), ctx, cache);
     let rc = VirtualStateInfoNode::new_rc(info);
-    cache.in_progress.remove(&key);
+    cache.in_progress.swap_remove(&key);
     cache.finished.insert(key, Rc::clone(&rc));
     rc
 }

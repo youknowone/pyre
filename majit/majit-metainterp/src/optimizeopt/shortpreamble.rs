@@ -893,7 +893,7 @@ impl ShortBoxes {
         let candidate = self.potential_ops.get(&okey)?.clone();
         self.boxes_in_production.insert(okey.clone());
         let produced = candidate.add_op_to_short(self, ctx);
-        self.boxes_in_production.remove(&okey);
+        self.boxes_in_production.swap_remove(&okey);
         let produced = produced?;
         self.produced_short_boxes.insert(okey, produced.clone());
         Some(produced)
@@ -2308,7 +2308,7 @@ impl ShortPreambleBuilder {
                 let _ = self.use_box_recursive(arg, visiting);
             }
         }
-        visiting.remove(result);
+        visiting.swap_remove(result);
         Some(self.state.append_to_short(result.to_opref(), &produced))
     }
 
@@ -2831,7 +2831,7 @@ impl ExtendedShortPreambleBuilder {
                 let _ = self.use_box_recursive(arg, visiting);
             }
         }
-        visiting.remove(&result);
+        visiting.swap_remove(&result);
         // Append to self.short directly
         let preamble_op = (*produced.preamble_op).clone();
         self.short_results.insert(canonical_result);
@@ -3190,7 +3190,7 @@ pub(crate) fn extract_short_preamble(peeled_ops: &[Op]) -> ShortPreamble {
                     });
                     included_overflow_producer = true;
                 } else {
-                    included_positions.remove(&ovf_op.pos.get());
+                    included_positions.swap_remove(&ovf_op.pos.get());
                 }
             }
         }

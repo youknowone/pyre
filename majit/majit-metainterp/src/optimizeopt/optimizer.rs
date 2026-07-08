@@ -4622,7 +4622,7 @@ impl Optimizer {
             if self.can_replace_guards {
                 if let Some(replacement) = ctx
                     .resolve_to_operand(op.pos.get())
-                    .and_then(|op_key| self.replaces_guard.remove(&op_key))
+                    .and_then(|op_key| self.replaces_guard.swap_remove(&op_key))
                 {
                     let target_pos = replacement.pos.get().raw() as usize;
                     if target_pos < ctx.new_operations.len() {

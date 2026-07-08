@@ -156,7 +156,7 @@ pub fn register_libc_jitframe(addr: usize) {
 /// jitframe memory is about to be freed.
 pub fn unregister_libc_jitframe(addr: usize) {
     LIBC_JF_REGISTRY.with(|r| {
-        r.borrow_mut().remove(&addr);
+        r.borrow_mut().swap_remove(&addr);
     });
 }
 

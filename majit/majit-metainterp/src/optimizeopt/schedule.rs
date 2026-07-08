@@ -247,7 +247,7 @@ impl VecScheduleState {
     /// vector.py:58-60 `op.set_forwarded(None)` for one op: drops the
     /// stored vecinfo, the per-op body of `VectorLoop::teardown_vectorization`.
     pub(crate) fn clear_op_forwarded_vecinfo(&mut self, opref: OpRef) {
-        self.vecinfo_cache.remove(&opref);
+        self.vecinfo_cache.swap_remove(&opref);
     }
 
     /// `resoperation.py:181-186 VectorizationInfo.__init__` INT_SIGNEXT

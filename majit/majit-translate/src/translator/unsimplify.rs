@@ -528,7 +528,7 @@ mod tests {
         let arg = var("arg");
         let result = var("result");
         let start = Block::shared(vec![hv(&arg)]);
-        let mut graph = FunctionGraph::with_return_var("entry", start.clone(), hv(&result));
+        let graph = FunctionGraph::with_return_var("entry", start.clone(), hv(&result));
         start.closeblock(vec![
             Link::new(vec![hv(&arg)], Some(graph.returnblock.clone()), None).into_ref(),
         ]);

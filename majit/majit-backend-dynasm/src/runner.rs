@@ -2622,7 +2622,7 @@ impl Backend for DynasmBackend {
     /// lifetime.  Drop the entry so the Arc chain unwinds.
     fn free_loop(&mut self, token: &JitCellToken) {
         CALL_ASSEMBLER_TARGETS.with(|cell| {
-            cell.borrow_mut().remove(&token.number);
+            cell.borrow_mut().swap_remove(&token.number);
         });
     }
 

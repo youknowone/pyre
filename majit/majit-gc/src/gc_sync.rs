@@ -23,7 +23,7 @@
 
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
+use std::sync::{Condvar, Mutex};
 
 use crate::GcAllocator;
 
@@ -50,8 +50,10 @@ pub struct GcSync {
     /// Note: in P0, a thread inside gc_op holds gc_mutex, so at most 1
     /// thread is inside at a time. This counter exists for P1 (TLAB)
     /// where alloc won't hold the mutex.
+    #[allow(dead_code)] // reserved for P1 (TLAB): unread until alloc stops holding gc_mutex
     active_in_gc_op: AtomicUsize,
     /// Signalled when the last active thread exits gc_op during STW.
+    #[allow(dead_code)] // reserved for P1 (TLAB): pairs with active_in_gc_op
     all_parked: Condvar,
     /// Signalled when STW ends (collector finished, mutators can resume).
     stw_done: Condvar,
@@ -99,7 +101,8 @@ pub fn is_initialized() -> bool {
 /// Access the GC singleton mutably under gc_mutex protection.
 /// SAFETY: caller must hold gc_mutex.
 unsafe fn singleton_mut() -> &'static mut dyn GcAllocator {
-    (*GC_STORE.0.get())
+    // SAFETY: caller holds gc_mutex, so there is no concurrent access.
+    unsafe { &mut *GC_STORE.0.get() }
         .as_deref_mut()
         .expect("GC singleton not initialized — call store_singleton() first")
 }

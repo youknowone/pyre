@@ -5064,7 +5064,7 @@ impl<M: Clone> MetaInterp<M> {
                 );
             }
             self.warm_state.abort_tracing(green_key, true);
-            if (std::env::var_os("MAJIT_CLOSEDBG").is_some()) {
+            if std::env::var_os("MAJIT_CLOSEDBG").is_some() {
                 eprintln!("@@@CANCEL-SITE line={}", line!());
             }
             return CompileOutcome::Cancelled;
@@ -5191,7 +5191,7 @@ impl<M: Clone> MetaInterp<M> {
             .compiled_loops
             .get(&green_key)
             .map(|compiled| compiled.front_target_tokens.clone())
-            .or_else(|| self.pending_preamble_tokens.remove(&green_key))
+            .or_else(|| self.pending_preamble_tokens.swap_remove(&green_key))
             .unwrap_or_default();
         let mut unroll_opt = crate::optimizeopt::unroll::UnrollOptimizer::new();
         unroll_opt.compile_snapshot_root_slots =
@@ -5306,7 +5306,7 @@ impl<M: Clone> MetaInterp<M> {
                     // abort_tracing — TRACING flag must stay active.
                     if !self.cancelled_too_many_times() {
                         self.exported_state = None;
-                        if (std::env::var_os("MAJIT_CLOSEDBG").is_some()) {
+                        if std::env::var_os("MAJIT_CLOSEDBG").is_some() {
                             eprintln!("@@@CANCEL-SITE line={}", line!());
                         }
                         return CompileOutcome::Cancelled;
@@ -5503,7 +5503,7 @@ impl<M: Clone> MetaInterp<M> {
                         );
                     }
                     self.cancel_count += 1;
-                    if (std::env::var_os("MAJIT_CLOSEDBG").is_some()) {
+                    if std::env::var_os("MAJIT_CLOSEDBG").is_some() {
                         eprintln!("@@@CANCEL-SITE line={}", line!());
                     }
                     return CompileOutcome::Cancelled;
@@ -5546,7 +5546,7 @@ impl<M: Clone> MetaInterp<M> {
                     );
                 }
                 self.cancel_count += 1;
-                if (std::env::var_os("MAJIT_CLOSEDBG").is_some()) {
+                if std::env::var_os("MAJIT_CLOSEDBG").is_some() {
                     eprintln!("@@@CANCEL-SITE line={}", line!());
                 }
                 return CompileOutcome::Cancelled;
@@ -5796,7 +5796,7 @@ impl<M: Clone> MetaInterp<M> {
                 }
                 self.warm_state.abort_tracing(green_key, !is_invalid_loop);
                 self.cancel_count += 1;
-                if (std::env::var_os("MAJIT_CLOSEDBG").is_some()) {
+                if std::env::var_os("MAJIT_CLOSEDBG").is_some() {
                     eprintln!("@@@CANCEL-SITE line={}", line!());
                 }
                 return CompileOutcome::Cancelled;
@@ -5883,7 +5883,7 @@ impl<M: Clone> MetaInterp<M> {
                 // RPython parity: keep previous compiled tokens alive so
                 // external target_token JUMPs can redirect to them.
                 let mut previous_tokens: Vec<std::sync::Weak<JitCellToken>> = Vec::new();
-                if let Some(old_entry) = self.compiled_loops.remove(&green_key) {
+                if let Some(old_entry) = self.compiled_loops.swap_remove(&green_key) {
                     // Cranelift workaround (no RPython counterpart): copy
                     // bridges from old token to new, since Cranelift cannot
                     // patch machine code in-place. No-op for dynasm.
@@ -5965,7 +5965,7 @@ impl<M: Clone> MetaInterp<M> {
                 self.cancel_count += 1;
                 // pyjitpl.py:3025: self.exported_state = None
                 self.exported_state = None;
-                if (std::env::var_os("MAJIT_CLOSEDBG").is_some()) {
+                if std::env::var_os("MAJIT_CLOSEDBG").is_some() {
                     eprintln!("@@@CANCEL-SITE line={}", line!());
                 }
                 return CompileOutcome::Cancelled;
@@ -6149,7 +6149,7 @@ impl<M: Clone> MetaInterp<M> {
                         green_key, bridge_origin
                     );
                 }
-                if (std::env::var_os("MAJIT_CLOSEDBG").is_some()) {
+                if std::env::var_os("MAJIT_CLOSEDBG").is_some() {
                     eprintln!("@@@CANCEL-SITE line={}", line!());
                 }
                 return CompileOutcome::Cancelled;
@@ -6259,7 +6259,7 @@ impl<M: Clone> MetaInterp<M> {
                 // (populated by `start_retrace_from_guard`).  No
                 // `(trace_id, fail_index)` reverse lookup.
                 if !self.compiled_loops.contains_key(&origin_key) {
-                    if (std::env::var_os("MAJIT_CLOSEDBG").is_some()) {
+                    if std::env::var_os("MAJIT_CLOSEDBG").is_some() {
                         eprintln!("@@@CANCEL-SITE line={}", line!());
                     }
                     return CompileOutcome::Cancelled;
@@ -6299,7 +6299,7 @@ impl<M: Clone> MetaInterp<M> {
                 // compile a fresh entry bridge and attach it to the
                 // original interpreter green key.
                 let Some((original_green_key, entry_meta)) = entry_bridge else {
-                    if (std::env::var_os("MAJIT_CLOSEDBG").is_some()) {
+                    if std::env::var_os("MAJIT_CLOSEDBG").is_some() {
                         eprintln!("@@@CANCEL-SITE line={}", line!());
                     }
                     return CompileOutcome::Cancelled;
@@ -6507,7 +6507,7 @@ impl<M: Clone> MetaInterp<M> {
             .compiled_loops
             .get(&green_key)
             .map(|compiled| compiled.front_target_tokens.clone())
-            .or_else(|| self.pending_preamble_tokens.remove(&green_key))
+            .or_else(|| self.pending_preamble_tokens.swap_remove(&green_key))
             .unwrap_or_default();
         let mut unroll_opt = crate::optimizeopt::unroll::UnrollOptimizer::new();
         unroll_opt.compile_snapshot_root_slots =
@@ -6785,7 +6785,7 @@ impl<M: Clone> MetaInterp<M> {
                 );
 
                 let mut previous_tokens: Vec<std::sync::Weak<JitCellToken>> = Vec::new();
-                if let Some(old_entry) = self.compiled_loops.remove(&green_key) {
+                if let Some(old_entry) = self.compiled_loops.swap_remove(&green_key) {
                     // Cranelift workaround (no RPython counterpart): copy
                     // bridges from old token to new, since Cranelift cannot
                     // patch machine code in-place. No-op for dynasm.
@@ -7296,7 +7296,7 @@ impl<M: Clone> MetaInterp<M> {
                         .map(|tok| tok.get_retraced_count())
                         .unwrap_or(0);
                     let _had_old = self.compiled_loops.contains_key(&green_key);
-                    if let Some(old_entry) = self.compiled_loops.remove(&green_key) {
+                    if let Some(old_entry) = self.compiled_loops.swap_remove(&green_key) {
                         // Box Identity Phase E.2b parity: preserve old entry's
                         // high-water so previously stored bridges' OpRefs stay
                         // disjoint from any future bridge.
@@ -7642,7 +7642,7 @@ impl<M: Clone> MetaInterp<M> {
                     },
                 );
                 let mut previous_tokens: Vec<std::sync::Weak<JitCellToken>> = Vec::new();
-                if let Some(old_entry) = self.compiled_loops.remove(&green_key) {
+                if let Some(old_entry) = self.compiled_loops.swap_remove(&green_key) {
                     // Box Identity Phase E.2b parity: see finish_and_compile.
                     next_global_opref = next_global_opref.max(old_entry.next_global_opref);
                     previous_tokens = self.retire_compiled_entry(green_key, old_entry, &mut traces);
@@ -8320,8 +8320,8 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     pub fn remove_compiled_loop(&mut self, green_key: u64) {
-        self.compiled_loops.remove(&green_key);
-        self.pending_preamble_tokens.remove(&green_key);
+        self.compiled_loops.swap_remove(&green_key);
+        self.pending_preamble_tokens.swap_remove(&green_key);
     }
 
     /// rpython/rlib/rstack.py:75-90 `stack_almost_full` — delegates to
@@ -8415,7 +8415,7 @@ impl<M: Clone> MetaInterp<M> {
                 // including every previous-token predecessor on the
                 // entry (the merged `traces` map and the
                 // previous_tokens Vec drop together).
-                self.compiled_loops.remove(&gk);
+                self.compiled_loops.swap_remove(&gk);
                 if crate::debug::have_debug_prints() {
                     crate::debug::log_one(
                         "jit-mem-collect",
@@ -9712,7 +9712,7 @@ impl<M: Clone> MetaInterp<M> {
                     .map(|tok| tok.get_retraced_count())
                     .unwrap_or(0);
                 let mut previous_tokens: Vec<std::sync::Weak<JitCellToken>> = Vec::new();
-                if let Some(old_entry) = self.compiled_loops.remove(&original_green_key) {
+                if let Some(old_entry) = self.compiled_loops.swap_remove(&original_green_key) {
                     // Box Identity Phase E.2b parity: see finish_and_compile.
                     next_global_opref = next_global_opref.max(old_entry.next_global_opref);
                     if let Some(old_tok) = old_entry.live_token() {
@@ -19190,7 +19190,7 @@ mod tests {
                 .get_mut(&trace_id)
                 .expect("compiled trace")
                 .exit_layouts
-                .remove(&fail_index);
+                .swap_remove(&fail_index);
             fresh_arc
         };
 
@@ -19418,7 +19418,7 @@ mod tests {
                 .get_mut(&trace_id)
                 .expect("compiled trace")
                 .exit_layouts
-                .remove(&fail_index);
+                .swap_remove(&fail_index);
             fresh_arc
         };
 
@@ -19509,7 +19509,7 @@ mod tests {
                 .get_mut(&trace_id)
                 .expect("compiled trace")
                 .exit_layouts
-                .remove(&fail_index);
+                .swap_remove(&fail_index);
             fresh_arc
         };
 
@@ -19617,7 +19617,7 @@ mod tests {
                 .get_mut(&trace_id)
                 .expect("compiled trace")
                 .exit_layouts
-                .remove(&fail_index);
+                .swap_remove(&fail_index);
             fresh_arc
         };
 

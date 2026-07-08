@@ -2054,7 +2054,7 @@ fn ca_dispatch_remove(token_number: u64) {
     // `try_with`: `CraneliftBackend::drop` calls `unregister_call_assembler_target`
     // which reaches here during thread TLS teardown. Silently no-op if TLS
     // has already been torn down.
-    let _ = CA_DISPATCH_TABLE.try_with(|c| c.borrow_mut().remove(&token_number));
+    let _ = CA_DISPATCH_TABLE.try_with(|c| c.borrow_mut().swap_remove(&token_number));
 }
 
 thread_local! {
@@ -2109,7 +2109,7 @@ fn invalidate_ca_thread_cache(token_number: u64) {
             c.set((0, 0));
         }
     });
-    let _ = CA_TARGET_CACHE.try_with(|c| c.borrow_mut().remove(&token_number));
+    let _ = CA_TARGET_CACHE.try_with(|c| c.borrow_mut().swap_remove(&token_number));
 }
 
 /// Register a force callback for call_assembler guard failures.
@@ -2339,7 +2339,7 @@ fn remove_call_assembler_expectations_locked(
     caller_id: CallAssemblerCallerId,
 ) {
     expectations.retain(|_, callers| {
-        callers.remove(&caller_id);
+        callers.swap_remove(&caller_id);
         !callers.is_empty()
     });
 }
@@ -2570,7 +2570,7 @@ fn unregister_call_assembler_target(token_number: u64) {
     // `try_*_drop`: called from `CraneliftBackend::drop` during thread
     // shutdown — use TLS teardown-safe variant.
     let mut removed = None;
-    try_call_assembler_registry_drop(|m| removed = m.remove(&token_number));
+    try_call_assembler_registry_drop(|m| removed = m.swap_remove(&token_number));
     if let Some(target) = removed {
         unregister_call_assembler_bridge_tree(&target.fail_descrs);
     }
@@ -2676,7 +2676,7 @@ fn store_call_assembler_deadframe(frame: DeadFrame) -> u64 {
 }
 
 fn take_call_assembler_deadframe(handle: u64) -> Option<DeadFrame> {
-    CALL_ASSEMBLER_DEADFRAMES.with(|map| map.borrow_mut().remove(&handle))
+    CALL_ASSEMBLER_DEADFRAMES.with(|map| map.borrow_mut().swap_remove(&handle))
 }
 
 /// Read typed values from a deadframe, dispatching on per-slot type.
@@ -5396,7 +5396,7 @@ fn mark_ref_roots_synced(synced_ref_vars: &mut IndexSet<u32>, ref_root_slots: &[
 
 fn mark_ref_roots_fresh(stale_ref_vars: &mut IndexSet<u32>, ref_root_slots: &[(u32, usize)]) {
     for &(var_idx, _) in ref_root_slots {
-        stale_ref_vars.remove(&var_idx);
+        stale_ref_vars.swap_remove(&var_idx);
     }
 }
 
@@ -5410,7 +5410,7 @@ fn mark_ref_roots_after_selective_reload(
             .iter()
             .any(|(idx, _)| *idx == var_idx)
         {
-            stale_ref_vars.remove(&var_idx);
+            stale_ref_vars.swap_remove(&var_idx);
         } else {
             stale_ref_vars.insert(var_idx);
         }
@@ -15863,7 +15863,8 @@ impl majit_backend::Backend for CraneliftBackend {
 
     fn free_loop(&mut self, token: &JitCellToken) {
         unregister_call_assembler_target(token.number);
-        self.registered_call_assembler_tokens.remove(&token.number);
+        self.registered_call_assembler_tokens
+            .swap_remove(&token.number);
         // `llmodel.py:252-268 free_loop_and_bridges` parity.  Strong
         // refs to baked `FailDescrCell` Arcs live on
         // `clt.asmmemmgr_gcreftracers` (`model.py:294`); dropping the

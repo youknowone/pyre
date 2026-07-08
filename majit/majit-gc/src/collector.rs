@@ -2576,7 +2576,7 @@ impl MiniMarkGC {
                 (*header_of(obj.0)).clear_flag(flags::PINNED);
             }
         }
-        self.pinned_objects.remove(&obj.0);
+        self.pinned_objects.swap_remove(&obj.0);
     }
 
     /// Check if an object is currently pinned.

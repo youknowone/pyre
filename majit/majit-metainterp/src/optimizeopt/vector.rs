@@ -1821,7 +1821,7 @@ impl VectorizingOptimizer {
             let mut modify_later: Vec<usize> = Vec::new();
             let mut valid = true;
             // vector.py:542-543
-            zero_deps.remove(&guard_idx);
+            zero_deps.swap_remove(&guard_idx);
             // vector.py:544-545: for prev_dep in guard_node.depends(): prev_node = prev_dep.to
             // Snapshot the (predecessor, failarg) pairs before mutating the graph.
             let prev_deps: Vec<(usize, bool)> = graph.nodes[guard_idx]
@@ -1840,7 +1840,7 @@ impl VectorizingOptimizer {
                         if !path.is_always_pure(&graph.nodes, false, false) {
                             valid = false;
                         } else if let Some(last) = path.last() {
-                            zero_deps.remove(&last);
+                            zero_deps.swap_remove(&last);
                         }
                     }
                     // vector.py:560-561
