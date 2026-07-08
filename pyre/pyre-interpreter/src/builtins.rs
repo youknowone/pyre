@@ -5872,8 +5872,19 @@ fn exec_or_eval(
     // Resolve a runnable code object: accept a precompiled W_Code or
     // compile a str on the fly.
     let code_obj_ref = unsafe {
-        if pyre_object::is_str(source) {
-            let s = pyre_object::w_str_get_value(source).to_string();
+        // `compiling.py:103 source_as_str` — accepts a str or a bytes-like
+        // source (decoded), or an already-compiled code object.
+        let source_str = if pyre_object::is_str(source) {
+            Some(pyre_object::w_str_get_value(source).to_string())
+        } else if pyre_object::bytesobject::is_bytes_like(source) {
+            Some(
+                String::from_utf8_lossy(pyre_object::bytesobject::bytes_like_data(source))
+                    .into_owned(),
+            )
+        } else {
+            None
+        };
+        if let Some(s) = source_str {
             let mode = if is_eval {
                 crate::compile::Mode::Eval
             } else {
@@ -5886,9 +5897,10 @@ fn exec_or_eval(
         } else if !source.is_null() && crate::is_code(source) {
             source
         } else {
-            return Err(crate::PyError::type_error(
-                "exec() / eval() expects str or code",
-            ));
+            return Err(crate::PyError::type_error(format!(
+                "{}() arg 1 must be a string, bytes or code object",
+                if is_eval { "eval" } else { "exec" }
+            )));
         }
     };
     let raw_code = unsafe {
@@ -7120,18 +7132,41 @@ pub(crate) fn builtin_zip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 // source list directly when `start == 0 + isinstance(it, list)`.
 pub(crate) fn builtin_enumerate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let (positional, kwargs) = split_builtin_kwargs(args);
-    if positional.is_empty() {
-        return Err(crate::PyError::type_error(
-            "enumerate() requires at least one argument",
-        ));
-    }
     if positional.len() > 2 {
         return Err(crate::PyError::type_error(format!(
             "enumerate() takes at most 2 arguments ({} given)",
             positional.len()
         )));
     }
-    kwarg_reject_unknown(kwargs, &["start"], "enumerate")?;
+    // `iterable` and `start` are the only accepted keywords; an unknown one is
+    // reported with the vectorcall-style "invalid keyword argument" message.
+    if let Some(dict) = kwargs {
+        for (key, _) in unsafe { pyre_object::w_dict_str_entries_wtf8(dict) }.iter() {
+            let k = key.as_str().unwrap_or("");
+            if k == "__pyre_kw__" || k == "iterable" || k == "start" {
+                continue;
+            }
+            return Err(crate::PyError::type_error(format!(
+                "'{key}' is an invalid keyword argument for enumerate()"
+            )));
+        }
+    }
+    // `iterable` is positional-or-keyword; once filled positionally a stray
+    // `iterable=` keyword is rejected as invalid rather than "multiple values".
+    let source = if !positional.is_empty() {
+        if kwarg_get(kwargs, "iterable").is_some() {
+            return Err(crate::PyError::type_error(
+                "'iterable' is an invalid keyword argument for enumerate()",
+            ));
+        }
+        positional[0]
+    } else if let Some(iterable) = kwarg_get(kwargs, "iterable") {
+        iterable
+    } else {
+        return Err(crate::PyError::type_error(
+            "enumerate() missing required argument 'iterable'",
+        ));
+    };
     let start_obj = if positional.len() > 1 {
         Some(positional[1])
     } else {
@@ -7146,7 +7181,6 @@ pub(crate) fn builtin_enumerate(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
         Some(o) if !unsafe { pyre_object::is_none(o) } => space_index_w(o)?,
         _ => 0,
     };
-    let source = positional[0];
     // `functional.py:268-271` — `if start == 0 and type(w_iterable) is
     // W_ListObject: w_iter = w_iterable` (skip space.iter for the
     // common list-source case so __next__ can `getitem(index)`
@@ -8930,6 +8964,50 @@ fn builtin_pow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     }
 }
 
+/// Coerce `obj` to a `BigInt` through the index protocol (`_operator.index`),
+/// so `hex`/`oct`/`bin` accept any `__index__` object and arbitrarily large
+/// integers.
+fn index_to_bigint(obj: PyObjectRef) -> Result<BigInt, crate::PyError> {
+    unsafe {
+        if is_int(obj) || is_long(obj) {
+            return Ok(obj_to_bigint(obj));
+        }
+        if pyre_object::is_bool(obj) {
+            return Ok(BigInt::from(pyre_object::w_bool_get_value(obj) as i64));
+        }
+        if let Some(tp) = crate::typedef::r#type(obj) {
+            if let Some(index_fn) = crate::baseobjspace::lookup_in_type(tp, "__index__") {
+                let result = crate::call::call_function_impl_result(index_fn, &[obj])?;
+                if is_int(result) || is_long(result) {
+                    return Ok(obj_to_bigint(result));
+                }
+                if pyre_object::is_bool(result) {
+                    return Ok(BigInt::from(pyre_object::w_bool_get_value(result) as i64));
+                }
+            }
+        }
+    }
+    let tp_name = unsafe {
+        match crate::typedef::r#type(obj) {
+            Some(tp) => pyre_object::w_type_get_name(tp).to_string(),
+            None => "object".to_string(),
+        }
+    };
+    Err(crate::PyError::type_error(format!(
+        "'{tp_name}' object cannot be interpreted as an integer"
+    )))
+}
+
+/// Format a `BigInt` in `radix` with the given `0x`/`0o`/`0b` prefix, keeping
+/// the sign ahead of the prefix (`-0xff`).
+fn format_int_radix(value: &BigInt, radix: u32, prefix: &str) -> String {
+    let digits = value.to_str_radix(radix);
+    match digits.strip_prefix('-') {
+        Some(magnitude) => format!("-{prefix}{magnitude}"),
+        None => format!("{prefix}{digits}"),
+    }
+}
+
 /// `hex(x)` — PyPy: operation.py hex
 fn builtin_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let (args, kwargs) = split_builtin_kwargs(args);
@@ -8944,12 +9022,7 @@ fn builtin_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             args.len()
         )));
     }
-    let v = unsafe { w_int_get_value(args[0]) };
-    let s = if v < 0 {
-        format!("-0x{:x}", -v)
-    } else {
-        format!("0x{v:x}")
-    };
+    let s = format_int_radix(&index_to_bigint(args[0])?, 16, "0x");
     Ok(w_str_new(&s))
 }
 
@@ -8967,12 +9040,7 @@ fn builtin_oct(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             args.len()
         )));
     }
-    let v = unsafe { w_int_get_value(args[0]) };
-    let s = if v < 0 {
-        format!("-0o{:o}", -v)
-    } else {
-        format!("0o{v:o}")
-    };
+    let s = format_int_radix(&index_to_bigint(args[0])?, 8, "0o");
     Ok(w_str_new(&s))
 }
 
@@ -8990,12 +9058,7 @@ fn builtin_bin(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             args.len()
         )));
     }
-    let v = unsafe { w_int_get_value(args[0]) };
-    let s = if v < 0 {
-        format!("-0b{:b}", -v)
-    } else {
-        format!("0b{v:b}")
-    };
+    let s = format_int_radix(&index_to_bigint(args[0])?, 2, "0b");
     Ok(w_str_new(&s))
 }
 

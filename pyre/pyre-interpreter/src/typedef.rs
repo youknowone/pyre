@@ -1894,7 +1894,13 @@ fn set_alloc_for_class(
 /// ignores everything past `w_settype`. The actual argument count check
 /// lives on `descr_init`, which type.__call__ runs after `__new__`.
 fn set_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    let (params, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    if crate::builtins::has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(
+            "set() takes no keyword arguments",
+        ));
+    }
+    let cls = params.first().copied().unwrap_or(pyre_object::PY_NULL);
     let set_type = crate::typedef::gettypeobject(&pyre_object::setobject::SET_TYPE);
     set_alloc_for_class(cls, set_type, false)
 }
