@@ -4,13 +4,11 @@
 
 use crate::DictStorage;
 
+/// `lib_pypy/syslog.py:35-44` — process-global tracking of whether
+/// `openlog()` has been called so the first `syslog()` can auto-open with
+/// the default libc ident (NULL → program name).
 #[cfg(all(unix, feature = "host_env"))]
-thread_local! {
-    /// `lib_pypy/syslog.py:35-44` — track whether `openlog()` has been
-    /// called so the first `syslog()` can auto-open with the default
-    /// libc ident (NULL → program name).
-    static SYSLOG_OPENED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
+static SYSLOG_OPENED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// syslog module — PyPy: lib_pypy/syslog.py.
 ///
@@ -50,7 +48,7 @@ pub fn register_module(ns: &mut DictStorage) {
                     .map(|&a| unsafe { pyre_object::w_int_get_value(a) } as i32)
                     .unwrap_or(libc::LOG_USER);
                 rustpython_host_env::syslog::openlog(ident, logoption, facility);
-                SYSLOG_OPENED.with(|f| f.set(true));
+                SYSLOG_OPENED.store(true, std::sync::atomic::Ordering::Relaxed);
                 Ok(pyre_object::w_none())
             }
             #[cfg(not(all(unix, feature = "host_env")))]
@@ -94,9 +92,9 @@ pub fn register_module(ns: &mut DictStorage) {
                     // a NULL ident (libc falls back to argv[0]) so the
                     // first syslog() call delivers correctly even when the
                     // caller skipped openlog().
-                    if !SYSLOG_OPENED.with(|f| f.get()) {
+                    if !SYSLOG_OPENED.load(std::sync::atomic::Ordering::Relaxed) {
                         rustpython_host_env::syslog::openlog(None, 0, libc::LOG_USER);
-                        SYSLOG_OPENED.with(|f| f.set(true));
+                        SYSLOG_OPENED.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                     rustpython_host_env::syslog::syslog(priority, &cmsg);
                 }

@@ -37,11 +37,9 @@ const QUOTE_IN_QUOTED_FIELD: u8 = 6;
 const EAT_CRNL: u8 = 7;
 const AFTER_ESCAPED_CRNL: u8 = 8;
 
-thread_local! {
-    // `interp_reader.py FieldLimit.limit` — module-global max parsed field
-    // size; a plain `i64` so it needs no GC root.
-    static FIELD_LIMIT: std::cell::Cell<i64> = const { std::cell::Cell::new(128 * 1024) };
-}
+// `interp_reader.py FieldLimit.limit` — process-global max parsed field
+// size; a plain `i64` so it needs no GC root.
+static FIELD_LIMIT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(128 * 1024);
 
 /// Resolved dialect in the parser/serializer's internal form: code points
 /// for the single-character options (with `None` standing in for the
@@ -504,68 +502,65 @@ mod dialect_class {
     }
 
     pub fn type_object() -> PyObjectRef {
-        thread_local! {
-            static CELL: std::cell::OnceCell<PyObjectRef> = const { std::cell::OnceCell::new() };
-        }
-        CELL.with(|c| {
-            *c.get_or_init(|| {
-                let tp = crate::typedef::make_builtin_type("_csv.Dialect", |ns| {
+        // Process-global immortal type object (see `make_builtin_type`).
+        static CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *CELL.get_or_init(|| {
+            let tp = crate::typedef::make_builtin_type("_csv.Dialect", |ns| {
+                crate::dict_storage_store(
+                    ns,
+                    "__new__",
+                    crate::typedef::make_new_descr(dialect_new),
+                );
+                // `dialect_new` does all the work; a no-op `__init__`
+                // keeps the template argument from reaching
+                // `object.__init__`.
+                crate::dict_storage_store(
+                    ns,
+                    "__init__",
+                    crate::make_builtin_function("__init__", |_| Ok(pyre_object::w_none())),
+                );
+                // `W_Dialect.reduce_ex_w` — dialects are not picklable
+                // (and so not copyable).
+                crate::dict_storage_store(
+                    ns,
+                    "__reduce_ex__",
+                    crate::make_builtin_function("__reduce_ex__", |_| {
+                        Err(PyError::type_error("can't pickle _csv.Dialect objects"))
+                    }),
+                );
+                crate::dict_storage_store(
+                    ns,
+                    "__reduce__",
+                    crate::make_builtin_function("__reduce__", |_| {
+                        Err(PyError::type_error("can't pickle _csv.Dialect objects"))
+                    }),
+                );
+                for (name, getter) in [
+                    (
+                        "delimiter",
+                        get_delimiter as fn(&[PyObjectRef]) -> Result<PyObjectRef, PyError>,
+                    ),
+                    ("doublequote", get_doublequote),
+                    ("escapechar", get_escapechar),
+                    ("lineterminator", get_lineterminator),
+                    ("quotechar", get_quotechar),
+                    ("quoting", get_quoting),
+                    ("skipinitialspace", get_skipinitialspace),
+                    ("strict", get_strict),
+                ] {
                     crate::dict_storage_store(
                         ns,
-                        "__new__",
-                        crate::typedef::make_new_descr(dialect_new),
-                    );
-                    // `dialect_new` does all the work; a no-op `__init__`
-                    // keeps the template argument from reaching
-                    // `object.__init__`.
-                    crate::dict_storage_store(
-                        ns,
-                        "__init__",
-                        crate::make_builtin_function("__init__", |_| Ok(pyre_object::w_none())),
-                    );
-                    // `W_Dialect.reduce_ex_w` — dialects are not picklable
-                    // (and so not copyable).
-                    crate::dict_storage_store(
-                        ns,
-                        "__reduce_ex__",
-                        crate::make_builtin_function("__reduce_ex__", |_| {
-                            Err(PyError::type_error("can't pickle _csv.Dialect objects"))
-                        }),
-                    );
-                    crate::dict_storage_store(
-                        ns,
-                        "__reduce__",
-                        crate::make_builtin_function("__reduce__", |_| {
-                            Err(PyError::type_error("can't pickle _csv.Dialect objects"))
-                        }),
-                    );
-                    for (name, getter) in [
-                        (
-                            "delimiter",
-                            get_delimiter as fn(&[PyObjectRef]) -> Result<PyObjectRef, PyError>,
-                        ),
-                        ("doublequote", get_doublequote),
-                        ("escapechar", get_escapechar),
-                        ("lineterminator", get_lineterminator),
-                        ("quotechar", get_quotechar),
-                        ("quoting", get_quoting),
-                        ("skipinitialspace", get_skipinitialspace),
-                        ("strict", get_strict),
-                    ] {
-                        crate::dict_storage_store(
-                            ns,
+                        name,
+                        crate::typedef::make_getset_descriptor_named(
+                            crate::make_builtin_function(name, getter),
                             name,
-                            crate::typedef::make_getset_descriptor_named(
-                                crate::make_builtin_function(name, getter),
-                                name,
-                            ),
-                        );
-                    }
-                });
-                unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
-                tp
-            })
-        })
+                        ),
+                    );
+                }
+            });
+            unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+            tp as usize
+        }) as PyObjectRef
     }
 }
 
@@ -644,7 +639,7 @@ fn reader_next_impl(self_obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
 fn reader_next_inner(self_obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
     let dialect_obj = crate::baseobjspace::getattr_str(self_obj, "dialect")?;
     let cfg = derive_config(dialect_obj)?;
-    let limit = FIELD_LIMIT.with(|cell| cell.get());
+    let limit = FIELD_LIMIT.load(std::sync::atomic::Ordering::Relaxed);
     let mut line_num = {
         let v = crate::baseobjspace::getattr_str(self_obj, "line_num")?;
         if unsafe { pyre_object::is_int(v) } {
@@ -1102,12 +1097,15 @@ fn field_size_limit_fn(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
             args.len()
         )));
     }
-    let old = FIELD_LIMIT.with(|c| c.get());
+    let old = FIELD_LIMIT.load(std::sync::atomic::Ordering::Relaxed);
     if let Some(&v) = args.first() {
         if !unsafe { pyre_object::is_int(v) } {
             return Err(PyError::type_error("limit must be an integer"));
         }
-        FIELD_LIMIT.with(|c| c.set(unsafe { pyre_object::w_int_get_value(v) }));
+        FIELD_LIMIT.store(
+            unsafe { pyre_object::w_int_get_value(v) },
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
     Ok(pyre_object::w_int_new(old))
 }

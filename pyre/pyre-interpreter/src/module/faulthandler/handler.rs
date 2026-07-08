@@ -16,9 +16,8 @@ use crate::DictStorage;
 // ──────────────────────────────────────────────────────────────────────
 
 #[cfg(all(unix, feature = "host_env"))]
-thread_local! {
-    static FAULTHANDLER_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
+static FAULTHANDLER_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(all(unix, feature = "host_env"))]
 extern "C" fn faulthandler_signal_handler(signum: libc::c_int) {
@@ -72,7 +71,7 @@ pub fn register_module(ns: &mut DictStorage) {
                     libc::SA_NODEFER | libc::SA_ONSTACK,
                 );
                 if ok {
-                    FAULTHANDLER_ENABLED.with(|c| c.set(true));
+                    FAULTHANDLER_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
                     return Ok(pyre_object::w_none());
                 }
                 return Err(crate::PyError::runtime_error(
@@ -98,7 +97,7 @@ pub fn register_module(ns: &mut DictStorage) {
                 #[cfg(all(unix, feature = "host_env"))]
                 {
                     rustpython_host_env::faulthandler::disable_fatal_handlers();
-                    FAULTHANDLER_ENABLED.with(|c| c.set(false));
+                    FAULTHANDLER_ENABLED.store(false, std::sync::atomic::Ordering::Relaxed);
                 }
                 Ok(pyre_object::w_none())
             },
@@ -114,7 +113,7 @@ pub fn register_module(ns: &mut DictStorage) {
                 #[cfg(all(unix, feature = "host_env"))]
                 {
                     return Ok(pyre_object::w_bool_from(
-                        FAULTHANDLER_ENABLED.with(|c| c.get()),
+                        FAULTHANDLER_ENABLED.load(std::sync::atomic::Ordering::Relaxed),
                     ));
                 }
                 #[cfg(not(all(unix, feature = "host_env")))]

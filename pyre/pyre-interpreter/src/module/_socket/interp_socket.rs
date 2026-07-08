@@ -1562,20 +1562,32 @@ fn unpack_hostent(he: *mut HostentRaw) -> Result<pyre_object::PyObjectRef, crate
 // default for socket() construction.  None == blocking; Some(secs)
 // == timeout in seconds.
 
-thread_local! {
-    static DEFAULT_SOCKET_TIMEOUT: std::cell::Cell<Option<f64>> =
-        const { std::cell::Cell::new(None) };
-}
+// Process-global default socket timeout, encoded as f64 bits.  A valid
+// timeout is always a finite non-negative float, so the qNaN sentinel
+// below can never collide with a real value and stands in for `None`.
+const SOCKET_TIMEOUT_NONE: u64 = 0x7ff8_0000_0000_0001;
+static DEFAULT_SOCKET_TIMEOUT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(SOCKET_TIMEOUT_NONE);
 
 fn get_default_socket_timeout() -> pyre_object::PyObjectRef {
-    match DEFAULT_SOCKET_TIMEOUT.with(|c| c.get()) {
-        None => pyre_object::w_none(),
-        Some(s) => pyre_object::floatobject::w_float_new(s),
+    let bits = DEFAULT_SOCKET_TIMEOUT.load(std::sync::atomic::Ordering::Relaxed);
+    if bits == SOCKET_TIMEOUT_NONE {
+        pyre_object::w_none()
+    } else {
+        pyre_object::floatobject::w_float_new(f64::from_bits(bits))
     }
 }
 
 fn set_default_socket_timeout(v: Option<f64>) {
-    DEFAULT_SOCKET_TIMEOUT.with(|c| c.set(v));
+    let bits = match v {
+        None => SOCKET_TIMEOUT_NONE,
+        Some(s) => {
+            let b = s.to_bits();
+            debug_assert_ne!(b, SOCKET_TIMEOUT_NONE);
+            b
+        }
+    };
+    DEFAULT_SOCKET_TIMEOUT.store(bits, std::sync::atomic::Ordering::Relaxed);
 }
 
 // ── getaddrinfo / getnameinfo wiring ──
@@ -1836,20 +1848,14 @@ fn init_socket_getaddrinfo(ns: &mut DictStorage) {
 // `_timeout` (float or None).  Methods read/write via baseobjspace.
 
 #[cfg(unix)]
-thread_local! {
-    static SOCKET_TYPE_OBJ: std::cell::OnceCell<pyre_object::PyObjectRef> =
-        const { std::cell::OnceCell::new() };
-}
-
-#[cfg(unix)]
 fn socket_type() -> pyre_object::PyObjectRef {
-    SOCKET_TYPE_OBJ.with(|c| {
-        *c.get_or_init(|| {
-            let tp = crate::typedef::make_builtin_type("socket", init_socket_type);
-            unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
-            tp
-        })
-    })
+    // Process-global immortal type object (see `make_builtin_type`).
+    static SOCKET_TYPE_OBJ: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *SOCKET_TYPE_OBJ.get_or_init(|| {
+        let tp = crate::typedef::make_builtin_type("socket", init_socket_type);
+        unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+        tp as usize
+    }) as pyre_object::PyObjectRef
 }
 
 #[cfg(unix)]
