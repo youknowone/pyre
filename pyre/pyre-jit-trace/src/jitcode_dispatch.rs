@@ -7334,19 +7334,6 @@ pub(crate) fn fbw_builtin_fold_enabled() -> bool {
 /// switch); verified byte-exact on synth dynasm + cranelift and GC-soak clean
 /// under `PYPY_GC_NURSERY=131072` on instance-heavy benches.
 fn fbw_loadattr_fold_enabled() -> bool {
-    // The fold's guarded inline read (guard_class + guard_value(map) +
-    // getfield(storage) + getarrayitem) is correct on the native backends,
-    // but its guards' resume snapshot does not round-trip through the wasm
-    // blackhole-resume decoder: wasm re-enters `blackhole_from_resumedata` on
-    // every guard exit (no bridge chaining, #62), and a folded read that flows
-    // into a later deopt either indexes an empty const pool (`decode_ref`
-    // panic) or materialises the wrong slot value (a closure `cell` read as a
-    // plain attribute).  wasm also gains nothing from the fold — the hot loop
-    // still runs interpreter-bound there (#62), so the residual it replaces is
-    // not on wasm's critical path.  Disable on wasm; keep it on natively.
-    if cfg!(target_arch = "wasm32") {
-        return false;
-    }
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_LOADATTR_FOLD") {
         Some(v) => {
@@ -13818,6 +13805,27 @@ fn walker_emit_guard_with_snapshot(
     walker_capture_snapshot_for_last_guard(ctx, op_pc)
 }
 
+/// Fold-specific guard snapshot: records the guard and delegates to the
+/// standard `walker_capture_snapshot_for_last_guard` which handles both the
+/// FBW path (fresh `collect_outer_active_boxes` from `FULL_BODY_SNAPSHOT_SYM`)
+/// and the per-opcode arm path (`ctx.outer_active_boxes`).
+///
+/// Previous attempt used `ctx.outer_active_boxes` directly, which is correct
+/// for the per-opcode arm entry but empty (`Vec::new()`) in the main FBW
+/// walk (`dispatch_via_miframe`).  The FBW path in
+/// `walker_capture_snapshot_for_last_guard_impl` re-derives `py_pc` from
+/// `op_pc` and computes a fresh active-box set per guard, matching the
+/// decoder's liveness query.
+fn walker_emit_fold_guard_with_snapshot(
+    ctx: &mut WalkContext<'_, '_>,
+    op_pc: usize,
+    opcode: OpCode,
+    args: &[OpRef],
+) -> Result<(), DispatchError> {
+    ctx.trace_ctx.record_guard(opcode, args, 0);
+    walker_capture_snapshot_for_last_guard(ctx, op_pc)
+}
+
 /// Record `int_eq(raw, const k)` and stamp its already-known concrete
 /// truth.  Used to build the div/mod precondition guards walker-native.
 fn walker_int_eq_const(
@@ -14675,7 +14683,7 @@ fn try_walker_specialize_load_attr(
     let instance_type_addr = &pyre_object::pyobject::INSTANCE_TYPE as *const _ as i64;
     if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
         let type_const = ctx.trace_ctx.const_int(instance_type_addr);
-        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardClass, &[obj, type_const])?;
+        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardClass, &[obj, type_const])?;
         ctx.trace_ctx
             .heap_cache_mut()
             .class_now_known(obj, instance_type_addr);
@@ -14690,7 +14698,7 @@ fn try_walker_specialize_load_attr(
         crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, obj, crate::descr::object_map_descr());
     if ctx.trace_ctx.box_value(map_op) != Some(majit_ir::Value::Int(map as i64)) {
         let map_const = ctx.trace_ctx.const_int(map as i64);
-        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[map_op, map_const])?;
+        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[map_op, map_const])?;
     }
 
     // getfield_gc_r(obj, storage) + getarrayitem_gc_r(block, C_storageindex):

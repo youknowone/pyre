@@ -6659,6 +6659,13 @@ impl<'a> ResumeDataDirectReader<'a> {
         let mut offset = info + 3;
 
         let bh_debug = std::env::var_os("MAJIT_BH_DEBUG").is_some();
+        if bh_debug {
+            eprintln!(
+                "[bh-section] info={info} length_i={length_i} length_r={length_r} length_f={length_f} \
+                 items_read={} items_resume_section={}",
+                self.resumecodereader.items_read, self.items_resume_section,
+            );
+        }
         // resume.py:1028-1030 `_callback_i` / jitcode.py:153-157.
         if length_i != 0 {
             let mut it = LivenessIterator::new(offset, length_i, all_liveness);
