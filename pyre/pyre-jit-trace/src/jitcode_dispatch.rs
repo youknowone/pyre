@@ -12831,18 +12831,41 @@ fn try_walker_inline_user_call(
             ctx.outer_active_boxes.clone()
         } else {
             let sym = unsafe { &*sym_ptr };
-            collect_outer_active_boxes(
-                sym,
-                ctx.trace_ctx,
-                ctx.registers_i,
-                ctx.registers_r,
-                ctx.registers_f,
-                ctx.outer_jitcode_index,
-                ctx.entry_py_pc,
-                None,
-                majit_ir::resumedata::NO_JITCODE_PC,
-                None,
-            )
+            if sym.jitcode.is_null() {
+                ctx.outer_active_boxes.clone()
+            } else {
+                // Liveness coordinate is the CALL op's own (jitcode index,
+                // py_pc) — NOT the `ctx` sentinels.  `dispatch_via_miframe`
+                // initializes `ctx.outer_jitcode_index` to 0 and
+                // `ctx.entry_py_pc` to the walk-entry py_pc, so for a CALL in a
+                // non-root jitcode, or a CALL not at the walk-entry pc, those
+                // select the wrong liveness window and the callee guard snapshot
+                // encodes the wrong frame boxes.  Derive the coordinate from the
+                // snapshot sym's jitcode at the CALL op's pc, matching
+                // `orthodox_list_append_commit`.
+                let (call_site_py_pc, call_site_jc_index) = unsafe {
+                    let jc = &*sym.jitcode;
+                    let jc_index = jc.index as u32;
+                    let mut py = python_pc_for_jitcode_pc(&jc.payload.metadata, op.pc);
+                    if !jc.payload.code_ptr.is_null() {
+                        let codeobj = &*jc.payload.code_ptr;
+                        py = skip_python_trivia_forward(codeobj, py as usize) as u32;
+                    }
+                    (py, jc_index)
+                };
+                collect_outer_active_boxes(
+                    sym,
+                    ctx.trace_ctx,
+                    ctx.registers_i,
+                    ctx.registers_r,
+                    ctx.registers_f,
+                    call_site_jc_index,
+                    call_site_py_pc,
+                    None,
+                    majit_ir::resumedata::NO_JITCODE_PC,
+                    None,
+                )
+            }
         }
     } else {
         ctx.outer_active_boxes.clone()
