@@ -12752,10 +12752,14 @@ impl CodeWriter {
             assembler.finish_with_positions_from(&mut *asm, ssarepr, &combined_indices, num_regs)
         };
         let pc_map_bytes = combined_bytes[..pc_map.len()].to_vec();
-        let mut after_residual_call_resume_pc: Vec<Option<usize>> = vec![None; pc_map.len()];
-        for (k, (py_pc, _)) in after_call_some.iter().enumerate() {
-            after_residual_call_resume_pc[*py_pc] = Some(combined_bytes[pc_map.len() + k]);
-        }
+        // Sparse `(py_pc, offset)` sidecar built in ascending py_pc order
+        // (`after_call_some` is `enumerate`-ordered) so the accessor's binary
+        // search is valid without an extra sort.
+        let after_residual_call_resume_pc: Vec<(u32, usize)> = after_call_some
+            .iter()
+            .enumerate()
+            .map(|(k, (py_pc, _))| (*py_pc as u32, combined_bytes[pc_map.len() + k]))
+            .collect();
         // `usize::MAX` = the PC emitted no jitcode of its own (trivia /
         // folded); see `PyJitCodeMetadata::first_jit_pc_by_py_pc`.
         let mut first_jit_pc_by_py_pc: Vec<usize> = vec![usize::MAX; pc_map.len()];

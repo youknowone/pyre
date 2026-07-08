@@ -11822,7 +11822,7 @@ mod tests {
         let pyjit = std::sync::Arc::new(crate::PyJitCode::from_parts(
             runtime_jitcode,
             crate::PyJitCodeMetadata {
-                after_residual_call_resume_pc: vec![None],
+                after_residual_call_resume_pc: Vec::new(),
                 first_jit_pc_by_py_pc: vec![0],
                 block_head_py_by_jit_pc: vec![(0, 0)],
                 carryfwd_resume_pc: Vec::new(),
