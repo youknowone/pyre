@@ -869,11 +869,17 @@ pub fn register_module(ns: &mut DictStorage) {
         "is_finalizing",
         make_builtin_function_with_arity("is_finalizing", |_| Ok(w_bool_from(false)), 0),
     );
-    // sys.displayhook / excepthook
+    // sys.displayhook / excepthook. `__displayhook__` keeps the original so
+    // code (e.g. doctest) can save and restore the hook.
     dict_storage_store(
         ns,
         "displayhook",
-        make_builtin_function_with_arity("displayhook", |_| Ok(w_none()), 1),
+        make_builtin_function_with_arity("displayhook", crate::builtins::sys_displayhook, 1),
+    );
+    dict_storage_store(
+        ns,
+        "__displayhook__",
+        make_builtin_function_with_arity("displayhook", crate::builtins::sys_displayhook, 1),
     );
     dict_storage_store(
         ns,

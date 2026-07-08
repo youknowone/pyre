@@ -2328,6 +2328,49 @@ fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(w_none())
 }
 
+/// Bind `builtins._` best-effort; a missing `builtins` module (early
+/// bootstrap) is ignored.
+fn set_builtins_underscore(value: PyObjectRef) {
+    if let Some(b) = crate::importing::get_sys_module("builtins") {
+        let _ = crate::baseobjspace::setattr_str(b, "_", value);
+    }
+}
+
+/// `sys.displayhook(value)` — print `repr(value)` followed by a newline to
+/// the live `sys.stdout` and bind `builtins._` to the value. A `None` value
+/// prints nothing and leaves `_` unchanged (`sys_displayhook` in sysmodule.c).
+pub(crate) fn sys_displayhook(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let value = args.first().copied().unwrap_or_else(w_none);
+    if unsafe { pyre_object::is_none(value) } {
+        return Ok(w_none());
+    }
+    // `_` is cleared before rendering so a failing repr does not leave a
+    // stale binding, then set to the value once the write succeeds.
+    set_builtins_underscore(w_none());
+    let repr = pyre_object::w_str_from_wtf8(unsafe { crate::display::py_repr_wtf8(value)? });
+    let newline = w_str_new("\n");
+    match resolve_default_print_target()? {
+        DefaultPrintTarget::Native => {
+            let s = unsafe { print_render(repr)? };
+            crate::print_output(&s);
+            crate::print_output("\n");
+        }
+        DefaultPrintTarget::Rebound(fp) => {
+            for part in [repr, newline] {
+                let r = crate::baseobjspace::call_method(fp, "write", &[part]);
+                if r.is_null() {
+                    return Err(crate::call::take_call_error().unwrap_or_else(|| {
+                        crate::PyError::runtime_error("displayhook: file.write() failed")
+                    }));
+                }
+            }
+        }
+        DefaultPrintTarget::Silent => return Ok(w_none()),
+    }
+    set_builtins_underscore(value);
+    Ok(w_none())
+}
+
 /// `space.index` re-wraps a result whose type is not exactly `int` (a
 /// bool, or a strict int subclass) as a plain int (descroperation.py:622
 /// `index`).  A range stores its bounds wrapped, so normalize each here —
