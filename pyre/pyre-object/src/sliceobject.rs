@@ -67,6 +67,11 @@ pub fn w_slice_new(start: PyObjectRef, stop: PyObjectRef, step: PyObjectRef) -> 
 }
 
 pub unsafe fn is_slice(obj: PyObjectRef) -> bool {
+    // A tagged immediate is an `int`, never a slice; short-circuit before
+    // the `ob_type` deref. Gated on `CAN_BE_TAGGED` (default false).
+    if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::is_tagged_int(obj) {
+        return false;
+    }
     unsafe { !obj.is_null() && (*obj).ob_type == &SLICE_TYPE as *const PyType }
 }
 

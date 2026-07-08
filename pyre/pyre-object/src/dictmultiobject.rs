@@ -255,6 +255,12 @@ fn strategy_is(
 
 #[inline]
 pub unsafe fn key_compares_by_identity(key: PyObjectRef) -> bool {
+    // A tagged immediate is an `int`, which compares by value, never by
+    // identity; short-circuit before the `w_class` deref. Gated on
+    // `CAN_BE_TAGGED` (default false).
+    if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::is_tagged_int(key) {
+        return false;
+    }
     let w_type = (*key).w_class as PyObjectRef;
     !w_type.is_null()
         && matches!(

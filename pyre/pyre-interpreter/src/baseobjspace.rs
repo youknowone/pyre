@@ -5326,7 +5326,15 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
     }
 
     // MRO lookup on the object's Python class (w_class) for method resolution.
-    let w_class = unsafe { (*obj).w_class };
+    // A tagged immediate has no `w_class` slot to deref; its class is the
+    // `int` type object (via the tag-safe `typedef::r#type`). Gated on
+    // `CAN_BE_TAGGED` (default false).
+    let w_class =
+        if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj) {
+            crate::typedef::r#type(obj).unwrap_or(std::ptr::null_mut())
+        } else {
+            unsafe { (*obj).w_class }
+        };
     if !w_class.is_null() && unsafe { is_type(w_class) } {
         if let Some(method) = unsafe { lookup_in_type_where(w_class, name) } {
             if unsafe {
@@ -5345,10 +5353,11 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
     }
 
     unsafe {
-        let tp_name = if obj.is_null() {
-            "NULL"
-        } else {
-            (*(*obj).ob_type).name
+        // Name the object's type via the tag-safe `typedef::r#type`
+        // (a tagged immediate has no `ob_type` slot to deref).
+        let tp_name = match crate::typedef::r#type(obj) {
+            Some(tp) => pyre_object::w_type_get_name(tp).to_string(),
+            None => "NULL".to_string(),
         };
         Err(PyError::attribute_error_with_context(
             format!("'{tp_name}' object has no attribute '{name}'"),

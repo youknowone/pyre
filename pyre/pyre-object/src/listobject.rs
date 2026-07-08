@@ -286,6 +286,12 @@ pub unsafe fn is_plain_int1(item: PyObjectRef) -> bool {
     if item.is_null() {
         return false;
     }
+    // A tagged immediate is always an exact `int` (never a subclass and
+    // never a bool), so it is a plain int without the `w_class` deref
+    // below. Gated on `CAN_BE_TAGGED` (default false).
+    if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::is_tagged_int(item) {
+        return true;
+    }
     if is_int(item) && !is_bool(item) {
         // type(w_obj) is W_IntObject — reject int subclasses.
         // Subclass instances share ob_type == &INT_TYPE but have w_class

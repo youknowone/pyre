@@ -181,6 +181,13 @@ pub fn r#type(obj: PyObjectRef) -> Option<PyObjectRef> {
     if obj.is_null() {
         return None;
     }
+    // A tagged immediate is an exact builtin `int`; its type object is
+    // `gettypefor(&INT_TYPE)`, synthesized before the `w_class`/`ob_type`
+    // derefs below (which would fault on the immediate). Gated on
+    // `CAN_BE_TAGGED` (default false), so the derefs stay the only live path.
+    if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj) {
+        return gettypefor(&pyre_object::INT_TYPE);
+    }
     unsafe {
         // Exception instances share a single W_BaseException layout
         // but carry an `ExcKind` tag that names the real Python class.
@@ -6102,7 +6109,7 @@ fn init_type_type(ns: &mut DictStorage) {
                 return Err(crate::PyError::type_error(format!(
                     "can only assign string to {}.__name__, not '{}'",
                     unsafe { pyre_object::w_type_get_name(w_type) },
-                    unsafe { (*(*w_value).ob_type).name }
+                    type_name_of(w_value)
                 )));
             }
             // typeobject.py:1054 text_w — read through the surrogate-aware

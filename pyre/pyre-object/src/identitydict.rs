@@ -101,6 +101,12 @@ impl IdentityDictStrategy {
     /// trampoline (pyre-interpreter installs the MRO walker).
     #[inline]
     unsafe fn is_correct_type(w_key: PyObjectRef) -> bool {
+        // A tagged immediate is an `int` (value-compared), never a
+        // compares-by-identity key; short-circuit before the `w_class`
+        // deref. Gated on `CAN_BE_TAGGED` (default false).
+        if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::is_tagged_int(w_key) {
+            return false;
+        }
         let w_type = (*w_key).w_class as PyObjectRef;
         if w_type.is_null() {
             return false;

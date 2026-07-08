@@ -200,6 +200,12 @@ pub unsafe fn unwrap_cell(w_value: PyObjectRef) -> PyObjectRef {
     if w_value.is_null() {
         return w_value;
     }
+    // A tagged immediate is a plain value, never a `MutableCell`; return it
+    // unchanged before the `ob_type` deref (which would fault on the
+    // immediate). Gated on `CAN_BE_TAGGED` (default false).
+    if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::is_tagged_int(w_value) {
+        return w_value;
+    }
     let tp = (*w_value).ob_type;
     if std::ptr::eq(tp, &OBJECT_MUTABLE_CELL_TYPE as *const PyType) {
         return (*(w_value as *const ObjectMutableCell)).w_value;
