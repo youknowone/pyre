@@ -5420,6 +5420,27 @@ pub(crate) fn p2_drain_enabled() -> bool {
     std::env::var_os("PYRE_P2_DRAIN").is_some()
 }
 
+/// Decode one suspended inline-callee frame's resume section into a
+/// [`ReconstructRecipe`], or `None` to decline the multi-frame inline rebuild.
+///
+/// `resume.py rebuild_from_resumedata` (`newframe(jitcode)` +
+/// `setup_resume_at_op` + `consume_boxes` per suspended frame) ALWAYS
+/// allocates and refills every inlined frame — its snapshot writer guarantees
+/// the liveness invariants the reader consumes. Pyre's per-function portal
+/// model + super-instruction bytecode cannot guarantee those invariants for
+/// every reconstructed callee, so this returns `None` exactly where a rebuild
+/// would be unsound: a no-snapshot pc, an unresolved jitcode, cell/free vars
+/// (cell contents live outside the resume stream → LOAD_DEREF NameError),
+/// unrecoverable callee globals, an `enumerate_vars` count that disagrees with
+/// the encoded section (`consume_boxes`), or an int/float-bank register with no
+/// boxed-Ref source.
+///
+/// The `None` fallback is semantically equivalent in program result: the caller
+/// declines the multi-frame inline reconstruction and routes to the
+/// conservative single-frame bridge / blackhole resume, which re-enters the
+/// interpreter and resumes correctly — only the inline-frame reconstruction
+/// optimization is forfeited, never correctness. The forward inline capture
+/// declines on the same conditions.
 fn reconstruct_inline_recipe(
     ctx: &mut majit_metainterp::TraceCtx,
     frame: &majit_ir::resumedata::RebuiltFrame,

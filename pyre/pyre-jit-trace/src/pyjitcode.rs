@@ -154,9 +154,12 @@ pub struct PyJitCodeMetadata {
     /// `compute_nested_inline_caller_frame`) nulls the not-yet-produced result
     /// register before serializing the paused caller frame; that slot is not a
     /// live Variable at the return PC, so it carries no `pcdep_color_slots`
-    /// entry. This precomputed table (built in `finalize_jitcode` from the
-    /// compile-time stack coloring) supplies its color. Same length as
-    /// `depth_at_py_pc`; empty for non-compiled skeleton metadata.
+    /// entry — the same not-yet-defined call-result box that `_result_argcode`
+    /// (pyjitpl.py) clears in a non-topmost resumed frame (`registers_r[index]
+    /// = CONST_NULL` for the `'r'` argcode). This precomputed table (built in
+    /// `finalize_jitcode` from the compile-time stack coloring) supplies its
+    /// color. Same length as `depth_at_py_pc`; empty for non-compiled skeleton
+    /// metadata.
     pub result_color_at_pc: Vec<u16>,
     /// Post-regalloc Ref-bank color of the portal jitdriver's first red
     /// argument (`frame`).  RPython parity: `pypy/module/pypyjit/
@@ -204,7 +207,12 @@ pub struct PyJitCodeMetadata {
     /// `(bank, color, slot)`.
     ///
     /// Records each slot's TRUE per-program-point SSA color — the runtime
-    /// analog of RPython's compile-time baked register operands. Stack
+    /// analog of RPython's compile-time baked register operands, precomputed
+    /// per Python PC so a guard resume can invert color→slot without walking
+    /// the jitcode. It is the static form of the per-bank register enumeration
+    /// that `resume.py`'s `_prepare_next_section` → `enumerate_vars` dispatches
+    /// at resume time to seed `registers_i` / `registers_r` / `registers_f`
+    /// from the encoded section. Stack
     /// slots and body locals are freely chordal-colored (only the
     /// startblock inputargs are pinned by `enforce_input_args`,
     /// `flatten.py:88-100` parity), so there is no `color == slot`
