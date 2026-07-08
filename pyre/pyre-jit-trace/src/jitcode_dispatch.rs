@@ -12769,6 +12769,38 @@ fn try_walker_inline_user_call(
     // side-effecting prologue must decline the CA inline (see the arm).
     let prologue_journal_before = fbw_store_journal_len();
     let prologue_effect_before = fbw_has_unjournaled_effect();
+    // Compute fresh outer_active_boxes for the inline sub-walk when the
+    // parent FBW walk carries an empty set (`dispatch_via_miframe`
+    // initializes `outer_active_boxes: Vec::new()`; it is computed
+    // dynamically per guard by the FBW path).  A callee guard falls
+    // through to the per-opcode arm path which reads `ctx.outer_active_boxes`,
+    // so an empty inherited set produces a resume snapshot with zero frame
+    // boxes while the decoder expects the full liveness-derived set — the
+    // same defect class as the LOAD_ATTR fold empty-boxes bug.  Mirror
+    // `try_walker_list_append_inline`: read the caller's live register
+    // banks from `FULL_BODY_SNAPSHOT_SYM` at the CALL-site py_pc.
+    let inline_outer_active_boxes = if ctx.is_full_body_walk && ctx.outer_active_boxes.is_empty() {
+        let sym_ptr = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
+        if sym_ptr.is_null() {
+            ctx.outer_active_boxes.clone()
+        } else {
+            let sym = unsafe { &*sym_ptr };
+            collect_outer_active_boxes(
+                sym,
+                ctx.trace_ctx,
+                ctx.registers_i,
+                ctx.registers_r,
+                ctx.registers_f,
+                ctx.outer_jitcode_index,
+                ctx.entry_py_pc,
+                None,
+                majit_ir::resumedata::NO_JITCODE_PC,
+                None,
+            )
+        }
+    } else {
+        ctx.outer_active_boxes.clone()
+    };
     let callee_outcome = {
         let mut sub_wc = WalkContext {
             registers_r: &mut callee_regs_r,
@@ -12799,7 +12831,7 @@ fn try_walker_inline_user_call(
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: ctx.entry_py_pc,
             outer_jitcode_index: ctx.outer_jitcode_index,
-            outer_active_boxes: ctx.outer_active_boxes.clone(),
+            outer_active_boxes: inline_outer_active_boxes,
         };
         // Guards emitted inside the callee body — both the walker's own
         // and the `_nonstandard_virtualizable` PTR_EQ promote that
