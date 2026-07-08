@@ -9819,10 +9819,8 @@ impl CraneliftBackend {
                     let ticker_addr = majit_ir::eval_breaker::ticker_addr();
                     if ticker_addr != 0 {
                         let addr_val = builder.ins().iconst(cl_types::I64, ticker_addr as i64);
-                        let ticker =
-                            builder
-                                .ins()
-                                .load(cl_types::I64, MemFlags::trusted(), addr_val, 0);
+                        let flags = MemFlags::trusted();
+                        let ticker = builder.ins().load(cl_types::I64, flags, addr_val, 0);
                         let zero = builder.ins().iconst(cl_types::I64, 0);
                         let is_pending = builder.ins().icmp(IntCC::SignedLessThan, ticker, zero);
 

@@ -3413,6 +3413,21 @@ impl<'a> AssemblerARM64<'a> {
             OpCode::GuardNotInvalidated => {
                 self.implement_guard_nojump_with_faillocs(op, op_index, fail_index, faillocs);
             }
+            OpCode::GuardEvalBreaker => {
+                // Back-edge eval-breaker poll: load the async-action ticker
+                // cell and deopt when it is negative (a pending signal /
+                // async action). `0` = no ticker published (signal handling
+                // not installed) → inert guard, no runtime check.
+                let ticker_addr = majit_ir::eval_breaker::ticker_addr();
+                if ticker_addr == 0 {
+                    self.implement_guard_nojump_with_faillocs(op, op_index, fail_index, faillocs);
+                } else {
+                    self.emit_mov_imm64(16, ticker_addr as i64);
+                    dynasm!(self.mc ; .arch aarch64 ; ldr X(16), [x16] ; cmp X(16), xzr);
+                    self.guard_success_cc = Some(CC_GE);
+                    self.implement_guard_with_faillocs(op, op_index, fail_index, faillocs);
+                }
+            }
             OpCode::GuardAlwaysFails => {
                 self.implement_guard_always_fails_with_faillocs(op, op_index, fail_index, faillocs);
             }
