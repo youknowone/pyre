@@ -2728,7 +2728,7 @@ fn float_pow_inner(x: f64, y: f64) -> Result<f64, FloatPowError> {
     // floatobject.py:844-847
     if x == 0.0 && y < 0.0 {
         return Err(FloatPowError::Py(PyError::zero_division(
-            "0.0 cannot be raised to a negative power",
+            "zero to a negative power",
         )));
     }
     // floatobject.py:849-862

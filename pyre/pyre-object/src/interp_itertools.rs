@@ -418,6 +418,70 @@ pub unsafe fn is_cycle(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &CYCLE_TYPE) }
 }
 
+// ── W_Chain — pypy/module/itertools/interp_itertools.py:class W_Chain ──
+//
+// ```python
+// class W_Chain(W_Root):
+//     def __init__(self, space, w_iterables):
+//         self.space = space
+//         self.w_iterables = w_iterables
+//         self.w_it = None
+//
+//     def _advance(self):
+//         self.w_it = self.space.iter(self.space.next(self.w_iterables))
+//
+//     def next_w(self):
+//         if not self.w_it:
+//             self._advance()     # may raise StopIteration
+//         while True:
+//             try:
+//                 return self.space.next(self.w_it)
+//             except OperationError as e:
+//                 if e.match(self.space, self.space.w_StopIteration):
+//                     self.w_it = None
+//                     self._advance()
+//                 else:
+//                     raise
+// ```
+//
+// `w_iterables` is an iterator over the source iterables; `w_it` is the
+// current active sub-iterator (PY_NULL until the first `next_w`, and reset
+// to PY_NULL each time a sub-iterator is exhausted).  Both pointer fields
+// are owned solely by the W_Chain, so the GC must trace them — the type is
+// registered in the JIT GC driver (`pyre-jit/src/eval.rs`) via
+// `register_pyre_class` in AUTO-ID mode.
+#[pyre_class("itertools.chain", static_name = "CHAIN")]
+pub struct W_Chain {
+    pub w_iterables: PyObjectRef,
+    pub w_it: PyObjectRef,
+}
+
+/// `w_iterables` must already be an iterator over the source iterables
+/// (`chain` / `chain.from_iterable` apply `space.iter`).  `w_it` starts
+/// PY_NULL (no active sub-iterator yet).
+pub fn w_chain_new(w_iterables: PyObjectRef) -> PyObjectRef {
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`).
+    let _roots = crate::gc_roots::push_roots();
+    crate::gc_roots::pin_root(w_iterables);
+    W_Chain::allocate(W_Chain {
+        ob: PyObject {
+            ob_type: std::ptr::null(),
+            w_class: std::ptr::null_mut(),
+        },
+        w_iterables,
+        w_it: std::ptr::null_mut(),
+    })
+}
+
+/// Check if an object is a `W_Chain`.
+///
+/// # Safety
+/// `obj` must be a valid, non-null pointer to a `PyObject`.
+#[inline]
+pub unsafe fn is_chain(obj: PyObjectRef) -> bool {
+    unsafe { py_type_check(obj, &CHAIN_TYPE) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -519,6 +583,29 @@ mod tests {
         assert_eq!(
             <W_Cycle as crate::lltype::GcType>::SIZE,
             W_CYCLE_OBJECT_SIZE
+        );
+    }
+
+    // W_Chain is registered in AUTO-ID mode (no `type_id = N`), so the GC
+    // tid is stamped at JIT-driver init rather than asserted against a
+    // constant.  What must hold is that both traced edges — the source
+    // `w_iterables` iterator and the current sub-iterator `w_it` — are
+    // reported to the collector, and that the descriptor reflects the
+    // struct's size.
+    #[test]
+    fn w_chain_gc_descriptor_traces_both_pointer_fields() {
+        assert_eq!(W_CHAIN_GC_PTR_OFFSETS.len(), 2);
+        assert_eq!(
+            W_CHAIN_GC_PTR_OFFSETS[0],
+            std::mem::offset_of!(W_Chain, w_iterables)
+        );
+        assert_eq!(
+            W_CHAIN_GC_PTR_OFFSETS[1],
+            std::mem::offset_of!(W_Chain, w_it)
+        );
+        assert_eq!(
+            <W_Chain as crate::lltype::GcType>::SIZE,
+            W_CHAIN_OBJECT_SIZE
         );
     }
 }

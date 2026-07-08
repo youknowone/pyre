@@ -2132,6 +2132,17 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
         &mut pytype_to_tid,
         <pyre_object::interp_array::W_Array as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
+    // W_Chain (`itertools.chain`) — typed payload via `#[pyre_class]` in
+    // AUTO-ID mode.  Both the `w_iterables` source iterator and the current
+    // sub-iterator `w_it` are owned solely by the W_Chain (no external
+    // root), so the collector must trace both edges.  Tail of the
+    // register_pyre_class chain so no earlier slot shifts.
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_object::interp_itertools::W_Chain
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
     // W_MemoryView (`memoryview`) — typed payload via `#[pyre_class]` in
     // AUTO-ID mode.  Its geometry and backing live in an off-heap
     // `*const BufferView`, so the macro's empty `gc_ptr_offsets` reach

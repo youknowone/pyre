@@ -3353,6 +3353,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
             || pyre_object::interp_itertools::is_filterfalse(obj)
             || pyre_object::interp_itertools::is_pairwise(obj)
             || pyre_object::interp_itertools::is_cycle(obj)
+            || pyre_object::interp_itertools::is_chain(obj)
         {
             let entry: Option<(fn(&[PyObjectRef]) -> PyResult, &str, u16)> = match name {
                 "__next__" => Some((iter_next_method, "__next__", 1)),
@@ -9148,6 +9149,7 @@ pub fn is_iterable(w_obj: PyObjectRef) -> bool {
             || pyre_object::interp_itertools::is_filterfalse(obj)
             || pyre_object::interp_itertools::is_pairwise(obj)
             || pyre_object::interp_itertools::is_cycle(obj)
+            || pyre_object::interp_itertools::is_chain(obj)
         {
             return true;
         }
@@ -9390,6 +9392,7 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
             || pyre_object::interp_itertools::is_filterfalse(obj)
             || pyre_object::interp_itertools::is_pairwise(obj)
             || pyre_object::interp_itertools::is_cycle(obj)
+            || pyre_object::interp_itertools::is_chain(obj)
         {
             return Ok(obj);
         }
@@ -9911,6 +9914,44 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                     );
                 }
                 Err(e) => return Err(e),
+            }
+        }
+        // itertools.chain — interp_itertools.py W_Chain.next_w
+        //
+        //     def _advance(self):
+        //         self.w_it = self.space.iter(self.space.next(self.w_iterables))
+        //
+        //     def next_w(self):
+        //         if not self.w_it:
+        //             self._advance()     # may raise StopIteration
+        //         while True:
+        //             try:
+        //                 return self.space.next(self.w_it)
+        //             except OperationError as e:
+        //                 if e.match(self.space, self.space.w_StopIteration):
+        //                     self.w_it = None
+        //                     self._advance()
+        //                 else:
+        //                     raise
+        if pyre_object::interp_itertools::is_chain(obj) {
+            let it = &mut *(obj as *mut pyre_object::interp_itertools::W_Chain);
+            loop {
+                if it.w_it.is_null() {
+                    // `_advance`: fetch the next source iterable and take its
+                    // iterator.  StopIteration from `w_iterables` means the
+                    // whole chain is exhausted — propagate.
+                    let w_iterable = next(it.w_iterables)?;
+                    it.w_it = iter(w_iterable)?;
+                }
+                match next(it.w_it) {
+                    Ok(w_obj) => return Ok(w_obj),
+                    Err(e) if e.kind == PyErrorKind::StopIteration => {
+                        // Sub-iterator exhausted — advance to the next iterable.
+                        it.w_it = std::ptr::null_mut();
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
             }
         }
         // `pypy/objspace/std/dictmultiobject.py:809-845 _new_next`

@@ -838,6 +838,10 @@ pub fn init_typeobjects() {
             &pyre_object::interp_itertools::CYCLE_TYPE as *const PyType as usize,
             new_typeobject_with_base("itertools.cycle", |_| {}, object_type) as usize,
         );
+        reg.insert(
+            &pyre_object::interp_itertools::CHAIN_TYPE as *const PyType as usize,
+            new_typeobject_with_base("itertools.chain", |_| {}, object_type) as usize,
+        );
         // `pypy/objspace/std/specialisedtupleobject.py` — three SpecialisedTuple
         // variants share the public `tuple` PyType name, so all three
         // foreign statics map to a "tuple" typedef.  `gettypefor` keys
@@ -8130,12 +8134,25 @@ fn init_int_type(ns: &mut DictStorage) {
         make_builtin_function_with_arity(
             "bit_count",
             |args| {
-                let val = if !args.is_empty() && unsafe { pyre_object::is_int(args[0]) } {
-                    unsafe { pyre_object::w_int_get_value(args[0]) }
+                let count = if args.is_empty() {
+                    0
+                } else if unsafe { pyre_object::is_int(args[0]) } {
+                    // Small-int fast path — `@jit.elidable` `_bit_count`.
+                    pyre_object::int_bit_count(unsafe { pyre_object::w_int_get_value(args[0]) })
+                } else if unsafe { pyre_object::pyobject::is_int_or_long(args[0]) } {
+                    // long/bigint: population count of the magnitude, so the
+                    // i64 fast path (which leaves out-of-range values at 0)
+                    // does not undercount.
+                    unsafe {
+                        crate::builtins::obj_to_bigint(args[0])
+                            .iter_u32_digits()
+                            .map(|d| d.count_ones() as i64)
+                            .sum()
+                    }
                 } else {
                     0
                 };
-                Ok(pyre_object::w_int_new(pyre_object::int_bit_count(val)))
+                Ok(pyre_object::w_int_new(count))
             },
             1,
         ),
@@ -8856,7 +8873,10 @@ fn init_float_type(ns: &mut DictStorage) {
                         pyre_object::w_long_new(b)
                     }
                 };
-                Ok(pyre_object::w_tuple_new(vec![to_pyint(numer), to_pyint(denom)]))
+                Ok(pyre_object::w_tuple_new(vec![
+                    to_pyint(numer),
+                    to_pyint(denom),
+                ]))
             },
             1,
         ),

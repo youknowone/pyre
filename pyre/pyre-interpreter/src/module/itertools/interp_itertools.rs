@@ -6,33 +6,26 @@ use crate::DictStorage;
 
 /// itertools stub
 pub fn register_module(ns: &mut DictStorage) {
-    // chain(*iterables) → flat iterator
+    // chain(*iterables) — W_Chain___new__: store `iter(newtuple(args))` as
+    // the source-iterables iterator.  W_Chain.next_w (baseobjspace::next)
+    // lazily draws each sub-iterable's iterator on demand, so infinite
+    // arguments (e.g. `chain([3], repeat(3))`) do not hang at construction.
     let chain_fn = crate::make_builtin_function("chain", |args| {
-        let mut items = Vec::new();
-        for &arg in args {
-            items.extend(crate::builtins::collect_iterable(arg)?);
-        }
-        let n = items.len();
-        let list = pyre_object::w_list_new(items);
-        Ok(pyre_object::w_seq_iter_new(list, n))
+        let tup = pyre_object::w_tuple_new(args.to_vec());
+        let iterables = crate::baseobjspace::iter(tup)?;
+        Ok(pyre_object::interp_itertools::w_chain_new(iterables))
     });
-    // chain.from_iterable(iterable) — flatten a single iterable of iterables.
-    // Attached as an attribute on the `chain` callable (the classmethod is
-    // read straight off the function object, so it is called with just the
-    // outer iterable).
-    let from_iterable_fn =
-        crate::make_builtin_function("from_iterable", |args| {
-            let outer = args.first().copied().ok_or_else(|| {
-                crate::PyError::type_error("from_iterable() missing 1 required positional argument")
-            })?;
-            let mut items = Vec::new();
-            for inner in crate::builtins::collect_iterable(outer)? {
-                items.extend(crate::builtins::collect_iterable(inner)?);
-            }
-            let n = items.len();
-            let list = pyre_object::w_list_new(items);
-            Ok(pyre_object::w_seq_iter_new(list, n))
-        });
+    // chain.from_iterable(iterable) — W_Chain.descr_from_iterable: flatten a
+    // single iterable of iterables.  Attached as an attribute on the `chain`
+    // callable (the classmethod is read straight off the function object, so
+    // it is called with just the outer iterable).
+    let from_iterable_fn = crate::make_builtin_function("from_iterable", |args| {
+        let outer = args.first().copied().ok_or_else(|| {
+            crate::PyError::type_error("from_iterable() missing 1 required positional argument")
+        })?;
+        let iterables = crate::baseobjspace::iter(outer)?;
+        Ok(pyre_object::interp_itertools::w_chain_new(iterables))
+    });
     crate::setattr_str(chain_fn, "from_iterable", from_iterable_fn)
         .expect("attach itertools.chain.from_iterable");
     crate::dict_storage_store(ns, "chain", chain_fn);

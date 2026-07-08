@@ -1392,6 +1392,7 @@ pub fn via_space_next(iter: PyObjectRef) -> bool {
             || pyre_object::interp_itertools::is_filterfalse(iter)
             || pyre_object::interp_itertools::is_pairwise(iter)
             || pyre_object::interp_itertools::is_cycle(iter)
+            || pyre_object::interp_itertools::is_chain(iter)
             || pyre_object::functional::is_enumerate(iter)
             || pyre_object::functional::is_reversed(iter)
             || pyre_object::functional::is_filter(iter)

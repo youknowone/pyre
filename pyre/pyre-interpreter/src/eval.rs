@@ -1866,6 +1866,7 @@ impl IterOpcodeHandler for PyFrame {
                 || pyre_object::interp_itertools::is_filterfalse(iter)
                 || pyre_object::interp_itertools::is_pairwise(iter)
                 || pyre_object::interp_itertools::is_cycle(iter)
+                || pyre_object::interp_itertools::is_chain(iter)
                 || pyre_object::dictmultiobject::is_dict_view_iterator(iter)
                 || pyre_object::functional::is_enumerate(iter)
                 || pyre_object::functional::is_reversed(iter)
