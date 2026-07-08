@@ -698,16 +698,20 @@ unsafe fn as_float(obj: PyObjectRef) -> f64 {
     }
 }
 
-/// Coerce an operand to f64 for a value-producing float operator, reporting
-/// an over-range int as `OverflowError` (`PyFloat_AsDouble`). A genuine
-/// float infinity is preserved; only an `int` whose magnitude exceeds f64
-/// range raises.
-unsafe fn as_float_arith(obj: PyObjectRef) -> Result<f64, PyError> {
-    let v = as_float(obj);
+/// Reject an over-range `int` operand of a value-producing float operator:
+/// `PyFloat_AsDouble` raises `OverflowError` when an `int`'s magnitude
+/// exceeds f64 range. `v` is the already-extracted [`as_float`] value; a
+/// genuine float infinity is preserved, only an over-range `int` raises.
+///
+/// Split from the f64 extraction so the operator bodies pass plain `f64`
+/// values — never a `Result<f64, _>` — into the arithmetic. A `Result`
+/// payload mixing `Float` (`Ok`) and `Ref` (`Err`) has no single register
+/// kind, so the JIT codewriter cannot flatten it (`emit_list_of_kind`).
+unsafe fn reject_float_coercion_overflow(obj: PyObjectRef, v: f64) -> Result<(), PyError> {
     if is_long(obj) && !v.is_finite() {
         return Err(PyError::overflow_error("int too large to convert to float"));
     }
-    Ok(v)
+    Ok(())
 }
 
 /// True if both operands are numeric and at least one is float.
@@ -719,35 +723,56 @@ unsafe fn is_float_pair(a: PyObjectRef, b: PyObjectRef) -> bool {
 }
 
 unsafe fn float_add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    Ok(w_float_new(as_float_arith(a)? + as_float_arith(b)?))
+    let va = as_float(a);
+    reject_float_coercion_overflow(a, va)?;
+    let vb = as_float(b);
+    reject_float_coercion_overflow(b, vb)?;
+    Ok(w_float_new(va + vb))
 }
 
 unsafe fn float_sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    Ok(w_float_new(as_float_arith(a)? - as_float_arith(b)?))
+    let va = as_float(a);
+    reject_float_coercion_overflow(a, va)?;
+    let vb = as_float(b);
+    reject_float_coercion_overflow(b, vb)?;
+    Ok(w_float_new(va - vb))
 }
 
 unsafe fn float_mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    Ok(w_float_new(as_float_arith(a)? * as_float_arith(b)?))
+    let va = as_float(a);
+    reject_float_coercion_overflow(a, va)?;
+    let vb = as_float(b);
+    reject_float_coercion_overflow(b, vb)?;
+    Ok(w_float_new(va * vb))
 }
 
 unsafe fn float_truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let vb = as_float_arith(b)?;
+    let vb = as_float(b);
+    reject_float_coercion_overflow(b, vb)?;
     if vb == 0.0 {
         return Err(PyError::zero_division("float division by zero"));
     }
-    Ok(w_float_new(as_float_arith(a)? / vb))
+    let va = as_float(a);
+    reject_float_coercion_overflow(a, va)?;
+    Ok(w_float_new(va / vb))
 }
 
 /// floatobject.py:508-512: descr_floordiv → _divmod_w()[0].
 unsafe fn float_floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let (floordiv, _mod) = float_divmod_w(as_float_arith(a)?, as_float_arith(b)?)?;
+    let x = as_float(a);
+    reject_float_coercion_overflow(a, x)?;
+    let y = as_float(b);
+    reject_float_coercion_overflow(b, y)?;
+    let (floordiv, _mod) = float_divmod_w(x, y)?;
     Ok(w_float_new(floordiv))
 }
 
 /// floatobject.py:520-540: descr_mod with math_fmod + sign correction.
 unsafe fn float_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let x = as_float_arith(a)?;
-    let y = as_float_arith(b)?;
+    let x = as_float(a);
+    reject_float_coercion_overflow(a, x)?;
+    let y = as_float(b);
+    reject_float_coercion_overflow(b, y)?;
     if y == 0.0 {
         // floatobject.py:526
         return Err(PyError::zero_division("float modulo"));

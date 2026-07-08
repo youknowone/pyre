@@ -531,7 +531,9 @@ pub fn isfinite(args: &[PyObjectRef]) -> PyResult {
             "isfinite() takes exactly 1 argument",
         ));
     }
-    Ok(w_bool_from(pymath::math::isfinite(try_get_double(args[0])?)))
+    Ok(w_bool_from(pymath::math::isfinite(try_get_double(
+        args[0],
+    )?)))
 }
 
 pub fn isclose(args: &[PyObjectRef]) -> PyResult {
