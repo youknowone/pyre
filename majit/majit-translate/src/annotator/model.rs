@@ -761,7 +761,7 @@ impl SomeStringBuilder {
 
     /// `method_append(self, s_str)` (rstring.py:891-894) → `s_None`.
     pub fn method_append(&self, s_str: &SomeValue) -> SomeValue {
-        debug_assert!(
+        assert!(
             matches!(
                 s_str,
                 SomeValue::None_(_) | SomeValue::String(_) | SomeValue::Char(_)
@@ -779,9 +779,9 @@ impl SomeStringBuilder {
         s_start: &SomeValue,
         s_end: &SomeValue,
     ) -> SomeValue {
-        debug_assert!(matches!(s_str, SomeValue::None_(_) | SomeValue::String(_)));
-        debug_assert!(matches!(s_start, SomeValue::Integer(_)));
-        debug_assert!(matches!(s_end, SomeValue::Integer(_)));
+        assert!(matches!(s_str, SomeValue::None_(_) | SomeValue::String(_)));
+        assert!(matches!(s_start, SomeValue::Integer(_)));
+        assert!(matches!(s_end, SomeValue::Integer(_)));
         s_none()
     }
 
@@ -792,16 +792,16 @@ impl SomeStringBuilder {
         s_char: &SomeValue,
         s_times: &SomeValue,
     ) -> SomeValue {
-        debug_assert!(matches!(s_char, SomeValue::String(_) | SomeValue::Char(_)));
-        debug_assert!(matches!(s_times, SomeValue::Integer(_)));
+        assert!(matches!(s_char, SomeValue::String(_) | SomeValue::Char(_)));
+        assert!(matches!(s_times, SomeValue::Integer(_)));
         s_none()
     }
 
     /// `method_append_charpsize(self, s_ptr, s_size)`
     /// (rstring.py:908-911) → `s_None`.
     pub fn method_append_charpsize(&self, s_ptr: &SomeValue, s_size: &SomeValue) -> SomeValue {
-        debug_assert!(matches!(s_ptr, SomeValue::Ptr(_)));
-        debug_assert!(matches!(s_size, SomeValue::Integer(_)));
+        assert!(matches!(s_ptr, SomeValue::Ptr(_)));
+        assert!(matches!(s_size, SomeValue::Integer(_)));
         s_none()
     }
 
@@ -841,7 +841,7 @@ impl SomeUnicodeBuilder {
 
     /// `method_append(self, s_str)` (rstring.py:931-934) → `s_None`.
     pub fn method_append(&self, s_str: &SomeValue) -> SomeValue {
-        debug_assert!(
+        assert!(
             matches!(
                 s_str,
                 SomeValue::None_(_) | SomeValue::UnicodeCodePoint(_) | SomeValue::UnicodeString(_)
@@ -859,12 +859,12 @@ impl SomeUnicodeBuilder {
         s_start: &SomeValue,
         s_end: &SomeValue,
     ) -> SomeValue {
-        debug_assert!(matches!(
+        assert!(matches!(
             s_str,
             SomeValue::None_(_) | SomeValue::UnicodeString(_)
         ));
-        debug_assert!(matches!(s_start, SomeValue::Integer(_)));
-        debug_assert!(matches!(s_end, SomeValue::Integer(_)));
+        assert!(matches!(s_start, SomeValue::Integer(_)));
+        assert!(matches!(s_end, SomeValue::Integer(_)));
         s_none()
     }
 
@@ -875,16 +875,16 @@ impl SomeUnicodeBuilder {
         s_char: &SomeValue,
         s_times: &SomeValue,
     ) -> SomeValue {
-        debug_assert!(matches!(s_char, SomeValue::UnicodeCodePoint(_)));
-        debug_assert!(matches!(s_times, SomeValue::Integer(_)));
+        assert!(matches!(s_char, SomeValue::UnicodeCodePoint(_)));
+        assert!(matches!(s_times, SomeValue::Integer(_)));
         s_none()
     }
 
     /// `method_append_charpsize(self, s_ptr, s_size)`
     /// (rstring.py:948-951) → `s_None`.
     pub fn method_append_charpsize(&self, s_ptr: &SomeValue, s_size: &SomeValue) -> SomeValue {
-        debug_assert!(matches!(s_ptr, SomeValue::Ptr(_)));
-        debug_assert!(matches!(s_size, SomeValue::Integer(_)));
+        assert!(matches!(s_ptr, SomeValue::Ptr(_)));
+        assert!(matches!(s_size, SomeValue::Integer(_)));
         s_none()
     }
 
@@ -2354,6 +2354,9 @@ impl SomeValue {
                 s.subset_of.clone(),
             ))),
             SomeValue::WeakRef(s) => Ok(SomeValue::WeakRef(SomeWeakRef::new(s.classdef.clone()))),
+            // rstring.py:1231/1271 — SomeStringBuilder / SomeUnicodeBuilder
+            // `noneify(self)` returns `self`.
+            SomeValue::StringBuilder(_) | SomeValue::UnicodeBuilder(_) => Ok(self.clone()),
             _ => Err(UnionError {
                 lhs: self.clone(),
                 rhs: s_none(),

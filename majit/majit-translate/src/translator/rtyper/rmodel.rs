@@ -2835,6 +2835,12 @@ pub enum ReprKey {
     /// RPython `SomeInteriorPtr.rtyper_makekey = (self.__class__,
     /// self.ll_ptrtype)` (rptr.py:24). Same by-value lltype key as [`Ptr`].
     InteriorPtr(LowLevelType),
+    /// RPython `SomeStringBuilder.rtyper_makekey = (self.__class__,)`
+    /// (rstring.py:1228). Class-tag singleton.
+    StringBuilder,
+    /// RPython `SomeUnicodeBuilder.rtyper_makekey = (self.__class__,)`
+    /// (rstring.py:1268). Class-tag singleton.
+    UnicodeBuilder,
     /// Pending variant — carries a textual discriminator from
     /// `rtyper_makekey` arm that hasn't been ported yet.
     Pending(String),
@@ -2994,6 +3000,10 @@ pub fn rtyper_makekey(s_obj: &crate::annotator::model::SomeValue) -> ReprKey {
                 s.ll_ptrtype.clone(),
             ),
         ),
+        // rstring.py:1228/1268 — SomeStringBuilder / SomeUnicodeBuilder
+        // rtyper_makekey = (self.__class__,).
+        SomeValue::StringBuilder(_) => ReprKey::StringBuilder,
+        SomeValue::UnicodeBuilder(_) => ReprKey::UnicodeBuilder,
         // Remaining variants defer to their r*.rs ports. Emit a
         // deterministic `Pending` key so the reprs cache still
         // distinguishes entries by variant-shape — identical
