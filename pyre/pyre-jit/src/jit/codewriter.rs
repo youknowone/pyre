@@ -9566,34 +9566,33 @@ impl CodeWriter {
                             // (jitcode_dispatch.rs), porting
                             // `get_list_of_active_boxes` (pyjitpl.py:177-234).
                             let iter_slot_depth = current_depth.saturating_sub(1);
-                            let iter_value: super::flow::FlowValue =
-                                if is_portal {
-                                    let iter_abs_slot =
-                                        (stack_base_absolute + iter_slot_depth as usize) as i64;
-                                    let v_iter_idx: super::flow::FlowValue =
-                                        super::flow::Constant::signed(iter_abs_slot).into();
-                                    let v_iter = emit_graph_op_with_result(
-                                        &mut graph,
-                                        &current_block.block(),
-                                        "getarrayitem_vable_r",
-                                        vable_getarrayitem_ref_graph_args(
-                                            frame_var.into(),
-                                            v_iter_idx.into(),
-                                        ),
-                                        Kind::Ref,
-                                        py_pc as i64,
-                                    );
-                                    pin!(Some(v_iter), stack_base + iter_slot_depth);
-                                    v_iter.into()
-                                } else {
-                                    // Non-portal callee: no vable read; keep the
-                                    // loop-carried operand SSA Variable at TOS.
-                                    current_state
-                                        .stack
-                                        .last()
-                                        .cloned()
-                                        .unwrap_or_else(|| fresh_ref_value(&mut graph).into())
-                                };
+                            let iter_value: super::flow::FlowValue = if is_portal {
+                                let iter_abs_slot =
+                                    (stack_base_absolute + iter_slot_depth as usize) as i64;
+                                let v_iter_idx: super::flow::FlowValue =
+                                    super::flow::Constant::signed(iter_abs_slot).into();
+                                let v_iter = emit_graph_op_with_result(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    "getarrayitem_vable_r",
+                                    vable_getarrayitem_ref_graph_args(
+                                        frame_var.into(),
+                                        v_iter_idx.into(),
+                                    ),
+                                    Kind::Ref,
+                                    py_pc as i64,
+                                );
+                                pin!(Some(v_iter), stack_base + iter_slot_depth);
+                                v_iter.into()
+                            } else {
+                                // Non-portal callee: no vable read; keep the
+                                // loop-carried operand SSA Variable at TOS.
+                                current_state
+                                    .stack
+                                    .last()
+                                    .cloned()
+                                    .unwrap_or_else(|| fresh_ref_value(&mut graph).into())
+                            };
                             let next_var = residual_call!(
                                 for_iter_next_fn_idx,
                                 CallFlavor::MayForce,
