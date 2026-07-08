@@ -640,15 +640,15 @@ pub fn filter_coalesce_pairs_by_interference(
     allocator.make_dependencies();
     // Inject caller-supplied interference edges into the dependency graph
     // before replaying `_try_coalesce`, so the `has_edge` guard (regalloc.py:105)
-    // rejects a coalesce whose endpoints are simultaneously live under a
-    // liveness the SSA `make_dependencies` graph does not model: two locals
-    // whose SSA live ranges are disjoint between `LOAD_FAST` re-reads yet
-    // co-live at a guard (the CPython-slot co-live separations
-    // `build_colive_interference` records).  An empty slice is a no-op — the
-    // filter then honours SSA-liveness interference only, which is why the
-    // walker-slot `filter_cross_slot_coalesce_pairs` (codewriter.rs) still
-    // runs on top; feeding those co-live edges here is the retirement path
-    // for that walker-slot filter.
+    // rejects a coalesce whose endpoints are separated by an interference the
+    // SSA `make_dependencies` graph does not model.  The splice caller
+    // (codewriter.rs) supplies the slot-identity edges
+    // (`build_slot_disjoint_interference`): two Variables at distinct CPython
+    // frame slots whose SSA live ranges are disjoint between `LOAD_FAST`
+    // re-reads.  Injecting them here is what retired the walker-slot
+    // `filter_cross_slot_coalesce_pairs` — slot rejection now happens through
+    // this `has_edge` guard rather than a separate post-filter.  An empty
+    // slice is a no-op: the filter then honours SSA-liveness interference only.
     for &(a_id, b_id) in extra_interference {
         allocator.add_interference_pin_ids(a_id, b_id);
     }

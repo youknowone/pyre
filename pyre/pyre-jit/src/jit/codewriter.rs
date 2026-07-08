@@ -4666,14 +4666,23 @@ fn build_colive_interference(
 fn pcdep_canonical_slot(
     pcdep_slot_var: &[Vec<(u16, u32)>],
     pcdep_slot_var_resume: &[Vec<(u16, u32)>],
-) -> std::collections::HashMap<u32, u16> {
-    let mut slot_of: std::collections::HashMap<u32, u16> = std::collections::HashMap::new();
+) -> Vec<Option<u16>> {
+    // Slot-indexed by `VariableId.0`, matching `walker_slot_for_variable`'s
+    // side-table shape.  `None` = the Variable is absent from every pcdep
+    // snapshot (never live at a resume PC).
+    let mut slot_of: Vec<Option<u16>> = Vec::new();
     let n = pcdep_slot_var.len().max(pcdep_slot_var_resume.len());
     for py_pc in 0..n {
         for tbl in [pcdep_slot_var, pcdep_slot_var_resume] {
             if let Some(snap) = tbl.get(py_pc) {
                 for &(slot, var_id) in snap {
-                    slot_of.entry(var_id).or_insert(slot);
+                    let idx = var_id as usize;
+                    if idx >= slot_of.len() {
+                        slot_of.resize(idx + 1, None);
+                    }
+                    if slot_of[idx].is_none() {
+                        slot_of[idx] = Some(slot);
+                    }
                 }
             }
         }
@@ -4697,16 +4706,72 @@ fn pcdep_canonical_slot(
 /// walker-slot cross-slot coalesce filter.  Same-slot pairs (the walker's
 /// COPY/SWAP value lineage) are untouched, so no extra color separation is
 /// forced beyond the merges that were already dropped.
+///
+/// The slot claim is propagated through a union-find over the pairs, so a
+/// TRANSITIVE cross-slot chain is caught even when the bridging Variable has
+/// no canonical slot of its own.  A pass-through link/inputarg temp that never
+/// appears at a resume PC is absent from the pcdep snapshots, so the pairs
+/// `(slot0_var, temp)` and `(temp, slot1_var)` name no directly-distinct
+/// slots; but merging both aliases slot0 and slot1 onto one color.  The group
+/// carries slot0's claim through the first merge, so the second pair's slot1
+/// conflicts and is rejected.  A slot number is unique across locals and stack
+/// (stack slots are `>= nlocals`), so one claim per group suffices — a group
+/// holds at most one distinct slot, and any second distinct slot rejects.  The
+/// rejecting edge is emitted between the pair's direct endpoints;
+/// `DependencyGraph::coalesce` in `filter_coalesce_pairs_by_interference` moves
+/// the edge onto the surviving rep as earlier pairs merge, so the `has_edge`
+/// replay sees it.
 fn build_slot_disjoint_interference(
     pairs: &[(super::flow::VariableId, super::flow::VariableId)],
-    canonical_slot: &std::collections::HashMap<u32, u16>,
+    canonical_slot: &[Option<u16>],
 ) -> Vec<(super::flow::VariableId, super::flow::VariableId)> {
+    use super::flow::VariableId;
+    let slot_of = |id: VariableId| -> Option<u16> {
+        canonical_slot.get(id.0 as usize).copied().flatten()
+    };
+    fn find(parent: &mut HashMap<VariableId, VariableId>, x: VariableId) -> VariableId {
+        let mut root = x;
+        while let Some(&p) = parent.get(&root) {
+            if p == root {
+                break;
+            }
+            root = p;
+        }
+        let mut cur = x;
+        while let Some(&p) = parent.get(&cur) {
+            if p == root {
+                break;
+            }
+            parent.insert(cur, root);
+            cur = p;
+        }
+        root
+    }
+    let mut parent: HashMap<VariableId, VariableId> = HashMap::new();
+    // Canonical slot claimed by each union-find root (absent = the group
+    // touches no slotted Variable yet).
+    let mut group_slot: HashMap<VariableId, u16> = HashMap::new();
     let mut edges = Vec::new();
     for &(a, b) in pairs {
-        if let (Some(&sa), Some(&sb)) = (canonical_slot.get(&a.0), canonical_slot.get(&b.0)) {
-            if sa != sb {
+        parent.entry(a).or_insert(a);
+        parent.entry(b).or_insert(b);
+        let ra = find(&mut parent, a);
+        let rb = find(&mut parent, b);
+        if ra == rb {
+            continue;
+        }
+        let sa = group_slot.get(&ra).copied().or_else(|| slot_of(a));
+        let sb = group_slot.get(&rb).copied().or_else(|| slot_of(b));
+        if let (Some(x), Some(y)) = (sa, sb) {
+            if x != y {
+                // Merging would alias two distinct slots onto one color.
                 edges.push((a, b));
+                continue;
             }
+        }
+        parent.insert(rb, ra);
+        if let Some(s) = sa.or(sb) {
+            group_slot.insert(ra, s);
         }
     }
     edges
@@ -13561,10 +13626,7 @@ mod tests {
     #[test]
     fn build_slot_disjoint_interference_edges_cross_slot_only() {
         // v0 → slot 0, v1 → slot 3, v2 → slot 3, v3 → (no snapshot).
-        let mut canonical: std::collections::HashMap<u32, u16> = std::collections::HashMap::new();
-        canonical.insert(0, 0);
-        canonical.insert(1, 3);
-        canonical.insert(2, 3);
+        let canonical = vec![Some(0u16), Some(3), Some(3)];
         let pairs = vec![
             (VariableId(0), VariableId(1)), // slot 0 ≠ 3 → edge
             (VariableId(1), VariableId(2)), // slot 3 == 3 → no edge (COPY lineage)
@@ -13572,6 +13634,23 @@ mod tests {
         ];
         let edges = build_slot_disjoint_interference(&pairs, &canonical);
         assert_eq!(edges, vec![(VariableId(0), VariableId(1))]);
+    }
+
+    /// A transitive cross-slot chain through a Variable with no canonical slot
+    /// is still rejected: `(slot0_var, temp)` then `(temp, slot1_var)` where
+    /// `temp` is absent from the pcdep snapshots (never live at a resume PC).
+    /// The union-find carries slot0's claim through the first merge, so the
+    /// second pair's slot1 conflicts and is edged.
+    #[test]
+    fn build_slot_disjoint_interference_rejects_transitive_cross_slot_chain() {
+        // v0 → slot 0, v2 → slot 1, v1 (temp) → no snapshot.
+        let canonical = vec![Some(0u16), None, Some(1)];
+        let pairs = vec![
+            (VariableId(0), VariableId(1)), // slot0_var → temp: merge, group claims slot 0
+            (VariableId(1), VariableId(2)), // temp → slot1_var: group slot 0 ≠ 1 → edge
+        ];
+        let edges = build_slot_disjoint_interference(&pairs, &canonical);
+        assert_eq!(edges, vec![(VariableId(1), VariableId(2))]);
     }
 
     /// The canonical slot is the slot a Variable occupies at the earliest PC
@@ -13582,7 +13661,7 @@ mod tests {
         let post = vec![vec![], vec![(2u16, 5u32)], vec![(0u16, 5u32)]];
         let resume: Vec<Vec<(u16, u32)>> = vec![vec![], vec![], vec![(0u16, 5u32)]];
         let slots = pcdep_canonical_slot(&post, &resume);
-        assert_eq!(slots.get(&5), Some(&2));
+        assert_eq!(slots.get(5).copied().flatten(), Some(2));
     }
 
     fn make_runtime_jitcode_with_fnaddr(fnaddr: usize) -> Arc<majit_metainterp::jitcode::JitCode> {
