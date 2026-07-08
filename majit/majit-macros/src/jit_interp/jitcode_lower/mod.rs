@@ -478,7 +478,8 @@ pub(super) fn call_policy_effect_slot(
         | K::InlineFloat
         | K::InlinePipelineInt
         | K::InlinePipelineRef
-        | K::InlinePipelineFloat => None,
+        | K::InlinePipelineFloat
+        | K::ConcreteOnlyVoid => None,
     }
 }
 
@@ -492,6 +493,9 @@ pub(super) fn call_policy_effect_slot(
 /// conditional-call slot but force / may raise, so they keep the marker.
 pub(super) fn explicit_call_emits_post_live(kind: crate::jit_interp::CallPolicyKind) -> bool {
     if binding_kind_for_inline_policy(kind).is_some() {
+        return false;
+    }
+    if matches!(kind, crate::jit_interp::CallPolicyKind::ConcreteOnlyVoid) {
         return false;
     }
     call_policy_effect_slot(kind)
@@ -513,7 +517,8 @@ pub(super) fn call_policy_result_kind(
         | K::ReleaseGilVoid
         | K::ReleaseGilVoidWrapped
         | K::LoopInvariantVoid
-        | K::LoopInvariantVoidWrapped => Some(CallResultKind::Void),
+        | K::LoopInvariantVoidWrapped
+        | K::ConcreteOnlyVoid => Some(CallResultKind::Void),
 
         K::ResidualInt
         | K::ResidualIntWrapped

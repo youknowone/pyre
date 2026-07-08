@@ -450,6 +450,11 @@ pub(crate) enum CallPolicyKind {
     InlinePipelineInt,
     InlinePipelineRef,
     InlinePipelineFloat,
+    /// Calls the function on the concrete path only; the JIT-path lowerer
+    /// emits no IR ops at all. Use for operations that have no JIT-visible
+    /// side effects (e.g. returning a node to a free-list -- RPython's `del`
+    /// generates zero IR ops).
+    ConcreteOnlyVoid,
 }
 
 pub(crate) fn parse_call_policy_kind(kind: &Ident) -> Option<CallPolicyKind> {
@@ -508,6 +513,7 @@ pub(crate) fn parse_call_policy_kind(kind: &Ident) -> Option<CallPolicyKind> {
         "inline_pipeline_int" => CallPolicyKind::InlinePipelineInt,
         "inline_pipeline_ref" => CallPolicyKind::InlinePipelineRef,
         "inline_pipeline_float" => CallPolicyKind::InlinePipelineFloat,
+        "concrete_only_void" => CallPolicyKind::ConcreteOnlyVoid,
         _ => return None,
     })
 }

@@ -1610,6 +1610,10 @@ impl<'c> Lowerer<'c> {
                         },
                     );
                 }
+                crate::jit_interp::CallPolicyKind::ConcreteOnlyVoid => {
+                    // No IR ops emitted on the JIT path. The concrete
+                    // RefFieldRewriter path calls the function normally.
+                }
                 _ => return None,
             },
             CallPolicySpec::Infer => {
