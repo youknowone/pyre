@@ -1593,16 +1593,12 @@ pub(crate) fn bridge_semantic_maps_at_with_jitcode_pc(
                 // equality with the py_pc tables is what `PYRE_PCMAP_BRIDGE_AUDIT`
                 // certifies. Portal bridges have empty twins → fall through to the
                 // re-inversion, which still keys the populated `depth_at_py_pc`.
-                let via_twin = if crate::jitcode_dispatch::bridge_jitcode_enabled() {
-                    match (
-                        payload.depth_for_jitcode_pc_pred(jp),
-                        payload.pcdep_for_jitcode_pc(jp),
-                    ) {
-                        (Some(depth), Some(pcdep)) => Some((depth as usize, pcdep)),
-                        _ => None,
-                    }
-                } else {
-                    None
+                let via_twin = match (
+                    payload.depth_for_jitcode_pc_pred(jp),
+                    payload.pcdep_for_jitcode_pc(jp),
+                ) {
+                    (Some(depth), Some(pcdep)) => Some((depth as usize, pcdep)),
+                    _ => None,
                 };
                 match via_twin {
                     Some(pair) => pair,
