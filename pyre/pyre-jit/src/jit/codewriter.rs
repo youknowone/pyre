@@ -1155,156 +1155,6 @@ fn collect_cfg_coalesce_pairs(
     pairs
 }
 
-/// Drop coalesce pairs that would TRANSITIVELY merge a
-/// frame-local slot with another DISTINCT frame-local slot, or with any
-/// stack slot, into one regalloc group.
-///
-/// The splice regalloc pre-merges `extra_coalesce_pairs` into the
-/// union-find BEFORE `make_dependencies` runs (no interference graph
-/// exists yet, so no `has_edge` guard applies), so a chain of pairs
-/// through intermediate non-slot Variables (inputargs / stack temps) can
-/// unify `i`/`s`/`j` even when no single pair directly links two slots
-/// (mult/m12: `cfg_cross == 0` yet 3 slots collapse to one rep).  Once the
-/// slots share a union-find rep they can no longer be re-separated — body
-/// locals are kept on distinct colors purely by the natural SSA-liveness
-/// interference of the `mergeable()` block inputargs, so a wrongful merge
-/// here would leave the resume reverse map non-injective.
-///
-/// This simulates the same in-order union-find merge the regalloc applies
-/// and skips any pair whose union would place two different frame slots —
-/// two distinct frame-local slots, two distinct stack slots, or a
-/// frame-local and a stack slot — in one group.  A skipped pair's
-/// endpoints get a `*_copy` at flatten time instead of sharing a register —
-/// correct, since they hold distinct frame slots.  Two distinct stack slots
-/// must not coalesce either: a guard compare's two operands occupy adjacent
-/// stack slots and are simultaneously live, so merging them aliases one
-/// register across both operands and the pre-merge voids the SSA-liveness
-/// edge that would otherwise keep them apart (simultaneously-live stack
-/// slots interfere through normal liveness only as long as the pre-merge
-/// does not collapse them).  Distinct stack slots that are
-/// disjoint-live stay free to share a color — the chordal coloring aliases
-/// them when no interference edge forces them apart, so this only forbids
-/// the union-find MERGE, not color reuse.  Only WITHIN-slot pairs survive.
-///
-/// LOAD-BEARING (not inert): production wires the filtered result
-/// (`splice_pairs`) as the sole source of `ssarepr.insns`.  Passing the
-/// unfiltered CFG pairs instead is NOT byte-identical — it regresses the
-/// kept-stack / short-circuit benches (`short_circuit_value_kept_stack`,
-/// `short_circuit_value_local_kept`, `short_circuit_boxed_int_cross_fn`,
-/// `kept_stack_branch_depths`).  It is still needed because
-/// `filter_coalesce_pairs_by_interference` honours only SSA-liveness
-/// interference, which is disjoint between `LOAD_FAST` re-reads; this filter
-/// covers the remaining CPython-slot-co-live-but-SSA-disjoint merges.
-/// Retiring it faithfully means feeding those co-live edges into that filter's
-/// `has_edge` oracle (its `extra_interference` argument) so the guard rejects
-/// them directly, rather than post-filtering by walker slot here.
-fn filter_cross_slot_coalesce_pairs(
-    pairs: &[(super::flow::VariableId, super::flow::VariableId)],
-    walker_slot_for_variable: &[Option<u16>],
-    nlocals: usize,
-) -> Vec<(super::flow::VariableId, super::flow::VariableId)> {
-    use super::flow::VariableId;
-    fn find(parent: &mut HashMap<VariableId, VariableId>, x: VariableId) -> VariableId {
-        let mut root = x;
-        while let Some(&p) = parent.get(&root) {
-            if p == root {
-                break;
-            }
-            root = p;
-        }
-        let mut cur = x;
-        while let Some(&p) = parent.get(&cur) {
-            if p == root {
-                break;
-            }
-            parent.insert(cur, root);
-            cur = p;
-        }
-        root
-    }
-    let slot_of = |id: VariableId| -> Option<u16> {
-        walker_slot_for_variable
-            .get(id.0 as usize)
-            .copied()
-            .flatten()
-    };
-    let local_of =
-        |id: VariableId| -> Option<u16> { slot_of(id).filter(|s| (*s as usize) < nlocals) };
-    let stack_of =
-        |id: VariableId| -> Option<u16> { slot_of(id).filter(|s| (*s as usize) >= nlocals) };
-    // Claim at most one slot of a given kind for the merged group, treating
-    // a second distinct slot of that kind as a conflict.  Returns the
-    // claimed slot (if any) or signals a conflict.
-    let claim_slot = |candidates: [Option<u16>; 4]| -> Result<Option<u16>, ()> {
-        let mut claimed: Option<u16> = None;
-        for s in candidates.into_iter().flatten() {
-            match claimed {
-                None => claimed = Some(s),
-                Some(c) if c == s => {}
-                Some(_) => return Err(()),
-            }
-        }
-        Ok(claimed)
-    };
-    let mut parent: HashMap<VariableId, VariableId> = HashMap::new();
-    // Frame-local slot claimed by each union-find root (absent = the group
-    // touches no frame-local slot).
-    let mut group_local: HashMap<VariableId, u16> = HashMap::new();
-    // Stack slot claimed by each union-find root (absent = the group touches
-    // no stack slot).
-    let mut group_stack: HashMap<VariableId, u16> = HashMap::new();
-    let mut kept = Vec::with_capacity(pairs.len());
-    for &(a, b) in pairs {
-        parent.entry(a).or_insert(a);
-        parent.entry(b).or_insert(b);
-        let ra = find(&mut parent, a);
-        let rb = find(&mut parent, b);
-        if ra == rb {
-            kept.push((a, b));
-            continue;
-        }
-        // The single frame-local slot the merged group may claim, or a
-        // conflict if the two groups + raw endpoints name 2+ distinct
-        // frame-local slots.
-        let Ok(claimed_local) = claim_slot([
-            group_local.get(&ra).copied(),
-            group_local.get(&rb).copied(),
-            local_of(a),
-            local_of(b),
-        ]) else {
-            continue;
-        };
-        // Likewise the single stack slot the merged group may claim: two
-        // distinct stack slots hold simultaneously-live values (e.g. the
-        // two operands of a guard compare), so merging them would alias one
-        // register across both and the pre-merge would void the SSA-liveness
-        // edge that keeps them apart.  Reject the cross-slot stack merge.
-        let Ok(claimed_stack) = claim_slot([
-            group_stack.get(&ra).copied(),
-            group_stack.get(&rb).copied(),
-            stack_of(a),
-            stack_of(b),
-        ]) else {
-            continue;
-        };
-        // A frame-local slot must not share a register group with any stack
-        // slot (local↔stack collision), so reject a merge that would put a
-        // claimed local and a claimed stack slot together.
-        if claimed_local.is_some() && claimed_stack.is_some() {
-            continue;
-        }
-        parent.insert(rb, ra);
-        if let Some(s) = claimed_local {
-            group_local.insert(ra, s);
-        }
-        if let Some(s) = claimed_stack {
-            group_stack.insert(ra, s);
-        }
-        kept.push((a, b));
-    }
-    kept
-}
-
 /// Port of `rpython/translator/simplify.py` `eliminate_empty_blocks`.
 ///
 /// `simplify_graph` (`translator.py:55-56`) runs this right after
@@ -4804,6 +4654,62 @@ fn build_colive_interference(
         .into_iter()
         .map(|(a, b)| (super::flow::VariableId(a), super::flow::VariableId(b)))
         .collect()
+}
+
+/// Derive each Variable's canonical CPython slot from the pcdep snapshots:
+/// the slot it occupies at the earliest resume PC it appears in (POST before
+/// RESUME within a PC).  The inlined-callee frames record their own slots at
+/// the callee PCs (the callee's operand-stack temp sits at its frame-stack
+/// slot), so this spans all inline frames — unlike the outer-frame-only
+/// co-live snapshot pairs.  Reproduces `walker_slot_for_variable`'s first-pin
+/// slot without the walker map.
+fn pcdep_canonical_slot(
+    pcdep_slot_var: &[Vec<(u16, u32)>],
+    pcdep_slot_var_resume: &[Vec<(u16, u32)>],
+) -> std::collections::HashMap<u32, u16> {
+    let mut slot_of: std::collections::HashMap<u32, u16> = std::collections::HashMap::new();
+    let n = pcdep_slot_var.len().max(pcdep_slot_var_resume.len());
+    for py_pc in 0..n {
+        for tbl in [pcdep_slot_var, pcdep_slot_var_resume] {
+            if let Some(snap) = tbl.get(py_pc) {
+                for &(slot, var_id) in snap {
+                    slot_of.entry(var_id).or_insert(slot);
+                }
+            }
+        }
+    }
+    slot_of
+}
+
+/// Slot-identity interference for the splice coalesce filter: a coalesce
+/// candidate whose two endpoints hold DISTINCT canonical CPython slots must
+/// not merge, even when their SSA / CPython-slot live ranges are disjoint
+/// (never co-live at a single resume PC).  Merging two distinct-slot
+/// Variables onto one color extends that color's liveness across a region
+/// where no box is live in it — the liveness side-table then marks the color
+/// active at a resume PC where `regs_r[color]` is `OpRef::NONE`
+/// (`collect_outer_active_boxes` panics).  This is broader than co-liveness:
+/// the inline-callee operand-stack temp and the outer merge inputarg live at
+/// disjoint PCs yet occupy distinct frame-stack slots, so `build_colive_
+/// interference` (which only edges simultaneously-live pairs) never separates
+/// them.  Feeding these edges into the coalesce `has_edge` oracle rejects the
+/// cross-slot merge directly — the pcdep-sourced replacement for the retired
+/// walker-slot cross-slot coalesce filter.  Same-slot pairs (the walker's
+/// COPY/SWAP value lineage) are untouched, so no extra color separation is
+/// forced beyond the merges that were already dropped.
+fn build_slot_disjoint_interference(
+    pairs: &[(super::flow::VariableId, super::flow::VariableId)],
+    canonical_slot: &std::collections::HashMap<u32, u16>,
+) -> Vec<(super::flow::VariableId, super::flow::VariableId)> {
+    let mut edges = Vec::new();
+    for &(a, b) in pairs {
+        if let (Some(&sa), Some(&sb)) = (canonical_slot.get(&a.0), canonical_slot.get(&b.0)) {
+            if sa != sb {
+                edges.push((a, b));
+            }
+        }
+    }
+    edges
 }
 
 /// #348 Part (2): build the per-PC `(color, semantic_slot)` map shipped in
@@ -12155,11 +12061,11 @@ impl CodeWriter {
         // short-circuit `(i and C)` PHI ↔ loop-var merge that collapses the
         // kept operand-stack slot's color onto the loop var (#124 float).
         let cfg_variable_pairs = collect_cfg_coalesce_pairs(&graph);
-        // `&[]`: honour SSA-liveness interference only. The CPython-slot
-        // co-live merges this filter misses (SSA-disjoint `LOAD_FAST` re-reads)
-        // are still caught downstream by `filter_cross_slot_coalesce_pairs`;
-        // feeding the `build_colive_interference` edges into this argument is
-        // the retirement path for that walker-slot filter.
+        // `&[]`: honour SSA-liveness interference only, seeding the gate-off
+        // `graph_regallocs` coloring. The CPython-slot co-live / cross-slot
+        // merges this SSA-only pass misses are rejected on the SPLICE pairs
+        // below, where the co-live + slot-identity edges feed this same filter's
+        // `has_edge` oracle.
         let cfg_variable_pairs = super::regalloc::filter_coalesce_pairs_by_interference(
             &graph,
             Kind::Ref,
@@ -12239,10 +12145,31 @@ impl CodeWriter {
         // needs one canonical color across its re-read Variables. Only the CFG
         // value-equivalence pairs (the walker's COPY/SWAP lineage) remain, to
         // merge provably-equal Variables.
-        let splice_pairs = filter_cross_slot_coalesce_pairs(
+        //
+        // Reject the coalesce merges that would break the color-indexed per-PC
+        // resume via the interference `has_edge` oracle (the RPython-faithful
+        // `regalloc.py:105` guard), replacing the walker-slot post-filter.  The
+        // filter was purely slot-based, so its pcdep-sourced successor is too:
+        // `build_slot_disjoint_interference` edges any coalesce candidate whose
+        // endpoints hold distinct canonical CPython slots.  This covers the
+        // disjoint-live case (never co-live at a single PC) that dominates
+        // inlined callees — a callee operand-stack temp and the outer merge
+        // inputarg occupy distinct frame-stack slots but live at disjoint PCs,
+        // so merging them extends a color's liveness across a box-less region
+        // and the resume reads `OpRef::NONE`.  Canonical slots come from the
+        // pcdep snapshots (which record each inline frame's slots at that
+        // frame's PCs), so no walker slot map is consulted here.  Co-liveness is
+        // NOT needed to gate coalescing — the co-live separations the coloring
+        // needs are applied to the interference graph below (`splice_
+        // interference`), not to the coalesce filter.
+        let canonical_slot = pcdep_canonical_slot(&pcdep_slot_var, &pcdep_slot_var_resume);
+        let splice_coalesce_oracle =
+            build_slot_disjoint_interference(&cfg_variable_pairs, &canonical_slot);
+        let splice_pairs = super::regalloc::filter_coalesce_pairs_by_interference(
+            &graph,
+            Kind::Ref,
             &cfg_variable_pairs,
-            &walker_slot_for_variable,
-            code.varnames.len(),
+            &splice_coalesce_oracle,
         );
         // Liveness-correct CPython-co-live interference: each resume PC's
         // simultaneously-CPython-live, non-value-equivalent locals/stack
@@ -13627,22 +13554,35 @@ mod tests {
     use pyre_interpreter::compile_exec;
     use std::sync::Arc;
 
-    /// The coalesce filter drops any pair that would merge two distinct
-    /// frame slots — local↔stack AND stack↔stack — but keeps a within-slot
-    /// pair (two Variables pinned to the same stack slot).
+    /// A coalesce candidate whose two endpoints hold distinct canonical
+    /// CPython slots — including the disjoint-live inline-callee case that is
+    /// never co-live at a single resume PC — yields a slot-identity
+    /// interference edge, while a within-slot pair yields none.
     #[test]
-    fn filter_cross_slot_coalesce_pairs_rejects_all_cross_slot_merges() {
-        // V0 → local slot 0; V1,V3 → stack slot 3; V2 → stack slot 4.
-        let walker_slot_for_variable = vec![Some(0u16), Some(3u16), Some(4u16), Some(3u16)];
-        // local↔stack (V0,V1) dropped; cross-slot stack↔stack (V1,V2)
-        // dropped; within-slot stack (V1,V3) kept.
+    fn build_slot_disjoint_interference_edges_cross_slot_only() {
+        // v0 → slot 0, v1 → slot 3, v2 → slot 3, v3 → (no snapshot).
+        let mut canonical: std::collections::HashMap<u32, u16> = std::collections::HashMap::new();
+        canonical.insert(0, 0);
+        canonical.insert(1, 3);
+        canonical.insert(2, 3);
         let pairs = vec![
-            (VariableId(0), VariableId(1)),
-            (VariableId(1), VariableId(2)),
-            (VariableId(1), VariableId(3)),
+            (VariableId(0), VariableId(1)), // slot 0 ≠ 3 → edge
+            (VariableId(1), VariableId(2)), // slot 3 == 3 → no edge (COPY lineage)
+            (VariableId(1), VariableId(3)), // v3 absent → no edge (never live at a resume)
         ];
-        let kept = filter_cross_slot_coalesce_pairs(&pairs, &walker_slot_for_variable, 1);
-        assert_eq!(kept, vec![(VariableId(1), VariableId(3))]);
+        let edges = build_slot_disjoint_interference(&pairs, &canonical);
+        assert_eq!(edges, vec![(VariableId(0), VariableId(1))]);
+    }
+
+    /// The canonical slot is the slot a Variable occupies at the earliest PC
+    /// it appears in across the pcdep snapshots (POST before RESUME).
+    #[test]
+    fn pcdep_canonical_slot_takes_earliest_pc() {
+        // v5 first appears at py_pc 1 slot 2, later at slot 0 → canonical 2.
+        let post = vec![vec![], vec![(2u16, 5u32)], vec![(0u16, 5u32)]];
+        let resume: Vec<Vec<(u16, u32)>> = vec![vec![], vec![], vec![(0u16, 5u32)]];
+        let slots = pcdep_canonical_slot(&post, &resume);
+        assert_eq!(slots.get(&5), Some(&2));
     }
 
     fn make_runtime_jitcode_with_fnaddr(fnaddr: usize) -> Arc<majit_metainterp::jitcode::JitCode> {
