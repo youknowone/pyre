@@ -586,14 +586,21 @@ class Check:
                 print("─── cargo stderr ───")
                 print(proc.stderr.rstrip())
             print("────────────────────")
-            if "no LLBC source resolved" in (proc.stderr or ""):
+            cargo_output = (proc.stderr or "") + (proc.stdout or "")
+            llbc_missing = (
+                # translator runtime panic (majit-translate/src/lib.rs)
+                "no LLBC source resolved" in cargo_output
+                # pyre-jit-trace/build.rs compile-time preflight
+                or "Extract the LLBC" in cargo_output
+            )
+            if llbc_missing:
                 # The JIT front-end has no MIR to lower because build/llbc/
                 # is empty. This is a setup step, not a toolchain fault — the
                 # rustup diagnostics below would be noise, so point at the
                 # producer instead.
                 print(red("LLBC artefacts are missing under build/llbc/."))
                 print("Run the extractor first, then re-run this script:")
-                print("    scripts/extract-llbc.py")
+                print("    scripts/extract-llbc.py pyre-object pyre-interpreter")
             else:
                 self._print_cargo_diagnostics(cargo_path)
             sys.exit(1)
