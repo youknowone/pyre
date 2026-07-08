@@ -3376,6 +3376,12 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
                 "__setstate__" if pyre_object::interp_itertools::is_cycle(obj) => {
                     Some((cycle_setstate_method, "__setstate__", 2))
                 }
+                "__reduce__" if pyre_object::interp_itertools::is_chain(obj) => {
+                    Some((chain_reduce_method, "__reduce__", 1))
+                }
+                "__setstate__" if pyre_object::interp_itertools::is_chain(obj) => {
+                    Some((chain_setstate_method, "__setstate__", 2))
+                }
                 "__reduce__" if pyre_object::interp_itertools::is_takewhile(obj) => {
                     Some((takewhile_reduce_method, "__reduce__", 1))
                 }
@@ -9937,10 +9943,24 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             let it = &mut *(obj as *mut pyre_object::interp_itertools::W_Chain);
             loop {
                 if it.w_it.is_null() {
-                    // `_advance`: fetch the next source iterable and take its
-                    // iterator.  StopIteration from `w_iterables` means the
-                    // whole chain is exhausted — propagate.
-                    let w_iterable = next(it.w_iterables)?;
+                    // `_advance`: `if self.w_iterables is None: raise
+                    // StopIteration` — once the outer iterator is spent it is
+                    // cleared to None and the chain stays exhausted.
+                    if it.w_iterables.is_null() {
+                        return Err(PyError::stop_iteration());
+                    }
+                    // Fetch the next source iterable and take its iterator.
+                    // StopIteration from `w_iterables` means the outer
+                    // iterator is exhausted — `_handle_error` sets
+                    // `w_iterables = None` before re-raising.
+                    let w_iterable = match next(it.w_iterables) {
+                        Ok(w) => w,
+                        Err(e) if e.kind == PyErrorKind::StopIteration => {
+                            it.w_iterables = std::ptr::null_mut();
+                            return Err(e);
+                        }
+                        Err(e) => return Err(e),
+                    };
                     it.w_it = iter(w_iterable)?;
                 }
                 match next(it.w_it) {
@@ -10655,6 +10675,70 @@ fn cycle_setstate_method(args: &[PyObjectRef]) -> PyResult {
     it.saved = w_saved;
     pyre_object::gc_hook::try_gc_write_barrier(w_self as *mut u8);
     it.index = index;
+    Ok(w_none())
+}
+
+/// `chain.__reduce__` — `interp_itertools.py W_Chain.descr_reduce`.  While
+/// the chain still has a live `w_iterables` the state carries `(w_iterables,)`
+/// or `(w_iterables, w_it)` so `__setstate__` can restore both; the args
+/// tuple is empty because `chain()` takes no positional arguments (the
+/// iterables come back through `__setstate__`).  A spent chain
+/// (`w_iterables is None`) reduces to just `(type, ())`.
+fn chain_reduce_method(args: &[PyObjectRef]) -> PyResult {
+    // Read the pointer fields before any allocation (`w_tuple_new` may
+    // collect); `w_type` mirrors `space.type(self)`.
+    let w_type = crate::typedef::r#type(args[0]).unwrap_or(PY_NULL);
+    let w_iterables = unsafe { pyre_object::interp_itertools::w_chain_get_iterables(args[0]) };
+    let w_it = unsafe { pyre_object::interp_itertools::w_chain_get_it(args[0]) };
+    if !w_iterables.is_null() {
+        let inner = if !w_it.is_null() {
+            vec![w_iterables, w_it]
+        } else {
+            vec![w_iterables]
+        };
+        Ok(w_tuple_new(vec![
+            w_type,
+            w_tuple_new(vec![]),
+            w_tuple_new(inner),
+        ]))
+    } else {
+        Ok(w_tuple_new(vec![w_type, w_tuple_new(vec![])]))
+    }
+}
+
+/// `chain.__setstate__` — `interp_itertools.py W_Chain.descr_setstate`:
+/// unpack the pickled state and restore `w_iterables` (and, with two
+/// elements, `w_it`).  Reassigning the pointer fields records an old→young
+/// edge, so the setters run the GC write barrier.
+fn chain_setstate_method(args: &[PyObjectRef]) -> PyResult {
+    // `unpackiterable` iterates the pickled state and may collect; pin the
+    // receiver and the state so they (and, transitively, the unpacked
+    // elements) survive each iteration.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let w_self = args[0];
+    let w_state = args.get(1).copied().unwrap_or(w_none());
+    pyre_object::gc_roots::pin_root(w_self);
+    pyre_object::gc_roots::pin_root(w_state);
+    let state = unpackiterable(w_state, -1)?;
+    let n = state.len();
+    if n < 1 {
+        return Err(PyError::type_error(format!(
+            "function takes at least 1 argument ({n} given)"
+        )));
+    } else if n == 1 {
+        unsafe {
+            pyre_object::interp_itertools::w_chain_set_iterables(w_self, state[0]);
+        }
+    } else if n == 2 {
+        unsafe {
+            pyre_object::interp_itertools::w_chain_set_iterables(w_self, state[0]);
+            pyre_object::interp_itertools::w_chain_set_it(w_self, state[1]);
+        }
+    } else {
+        return Err(PyError::type_error(format!(
+            "function takes at most 2 arguments ({n} given)"
+        )));
+    }
     Ok(w_none())
 }
 

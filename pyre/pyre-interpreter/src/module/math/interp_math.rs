@@ -743,6 +743,9 @@ pub fn comb(args: &[PyObjectRef]) -> PyResult {
     } else {
         &k_big
     };
+    // `comb_bigint` takes the smaller factor as a `u64`; a value past
+    // `u64::MAX` is unreachable for any computable input (the product would
+    // need >2**64 multiplications) and is rejected rather than truncated.
     let ki: u64 = match effective_k.to_u64() {
         Some(k) => k,
         None => {

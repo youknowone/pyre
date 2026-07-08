@@ -482,6 +482,50 @@ pub unsafe fn is_chain(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &CHAIN_TYPE) }
 }
 
+/// Read the `w_iterables` field of a `W_Chain`.
+///
+/// # Safety
+/// `obj` must be a valid, non-null pointer to a `W_Chain`.
+#[inline]
+pub unsafe fn w_chain_get_iterables(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const W_Chain)).w_iterables }
+}
+
+/// Read the `w_it` field of a `W_Chain`.
+///
+/// # Safety
+/// `obj` must be a valid, non-null pointer to a `W_Chain`.
+#[inline]
+pub unsafe fn w_chain_get_it(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const W_Chain)).w_it }
+}
+
+/// Store the `w_iterables` field of a `W_Chain`.  Reassigning a pointer
+/// field can record an old→young edge, so the GC write barrier runs.
+///
+/// # Safety
+/// `obj` must be a valid, non-null pointer to a `W_Chain`.
+#[inline]
+pub unsafe fn w_chain_set_iterables(obj: PyObjectRef, w_value: PyObjectRef) {
+    unsafe {
+        (*(obj as *mut W_Chain)).w_iterables = w_value;
+        crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    }
+}
+
+/// Store the `w_it` field of a `W_Chain`.  Reassigning a pointer field can
+/// record an old→young edge, so the GC write barrier runs.
+///
+/// # Safety
+/// `obj` must be a valid, non-null pointer to a `W_Chain`.
+#[inline]
+pub unsafe fn w_chain_set_it(obj: PyObjectRef, w_value: PyObjectRef) {
+    unsafe {
+        (*(obj as *mut W_Chain)).w_it = w_value;
+        crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
