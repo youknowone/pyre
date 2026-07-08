@@ -698,6 +698,19 @@ pub unsafe fn w_type_get_mro(obj: PyObjectRef) -> *mut Vec<PyObjectRef> {
     (*(obj as *const W_TypeObject)).mro_w
 }
 
+/// True when `cls` occurs in `w_type`'s MRO — the pointer-identity subtype
+/// membership scan `W_TypeObject.issubtype` / `_issubtype` performs
+/// (typeobject.py:603/1640).  The single home for the MRO subtype check;
+/// interpreter-level subtype guards and reflected-binop dispatch delegate
+/// here rather than each re-scanning the MRO.
+pub unsafe fn w_type_issubtype(w_type: PyObjectRef, cls: PyObjectRef) -> bool {
+    let mro_ptr = w_type_get_mro(w_type);
+    if mro_ptr.is_null() {
+        return false;
+    }
+    (*mro_ptr).iter().any(|&t| std::ptr::eq(t, cls))
+}
+
 /// Set the cached MRO.
 ///
 /// Construction installs the MRO here (rather than in `__init__`

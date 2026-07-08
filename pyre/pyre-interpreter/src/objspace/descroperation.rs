@@ -1408,13 +1408,10 @@ unsafe fn try_typedef_binop(a: PyObjectRef, b: PyObjectRef, dunder: &str) -> Opt
     None
 }
 
-/// Check if w_type is a subtype of cls using cached MRO.
+/// Check if w_type is a subtype of cls — delegates to the single MRO
+/// membership scan in `pyre_object::w_type_issubtype`.
 unsafe fn issubtype_cached(w_type: PyObjectRef, cls: PyObjectRef) -> bool {
-    let mro_ptr = w_type_get_mro(w_type);
-    if !mro_ptr.is_null() {
-        return (*mro_ptr).iter().any(|&t| std::ptr::eq(t, cls));
-    }
-    false
+    pyre_object::w_type_issubtype(w_type, cls)
 }
 
 /// Builtin-subclass comparison override dispatch.

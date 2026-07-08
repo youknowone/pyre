@@ -2344,13 +2344,10 @@ fn type_call_init_type(instance: PyObjectRef, w_type: PyObjectRef) -> Option<PyO
     }
 }
 
-/// Pointer-based subtype check for descr_call __init__ guard.
+/// Pointer-based subtype check for descr_call __init__ guard — the MRO
+/// membership scan lives in `pyre_object::w_type_issubtype`.
 fn issubtype_ptr(w_type: PyObjectRef, cls: PyObjectRef) -> bool {
-    let mro_ptr = unsafe { pyre_object::w_type_get_mro(w_type) };
-    if mro_ptr.is_null() {
-        return false;
-    }
-    unsafe { (*mro_ptr).iter().any(|&t| std::ptr::eq(t, cls)) }
+    unsafe { pyre_object::w_type_issubtype(w_type, cls) }
 }
 
 /// Helper: call a user function with arbitrary args from descriptor context.
