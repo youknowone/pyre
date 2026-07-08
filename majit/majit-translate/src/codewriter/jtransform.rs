@@ -3131,12 +3131,24 @@ impl<'a> Transformer<'a> {
             }]));
         }
 
-        // jtransform.py:2087-2122 — stroruni.equal registers the OS_STREQ_* /
-        // OS_UNIEQ_* slice-comparison helpers through _register_extra_helper,
-        // which pyre has not ported; fall through to the residual-call path.
-        if oopspec_name == "stroruni.equal" {
-            return None;
-        }
+        // jtransform.py:2087-2122 — before falling through to the common
+        // residual-call tail, stroruni.equal registers seven OS_STREQ_* /
+        // OS_UNIEQ_* slice-comparison side-helpers (str.eq_slice_checknull /
+        // eq_slice_nonnull / eq_slice_char / eq_nonnull / eq_nonnull_char /
+        // eq_checknull_char / eq_lengthok, each shifted by _OS_offset_uni for
+        // UNICODE) via _register_extra_helper. That registration is blocked:
+        // _register_extra_helper → support::builtin_func_for_spec →
+        // setup_extra_builtin resolves each helper's host fnaddr and panics on
+        // a miss, and pyre deliberately does not host-bind the str.eq_*
+        // helpers — Python strings are W_UnicodeObject (native WTF-8), not the
+        // rstr.STR `{hash, chars}` GcStruct these helpers index (see
+        // jit_fnaddr.rs `jit_trace_fnaddrs` and blackhole.rs next to
+        // `bhimpl_int_and`). The side-registrations are consumed only by the
+        // string-optimization pass; their absence does not affect the main
+        // OS_STR_EQUAL / OS_UNI_EQUAL residual call emitted by the tail below,
+        // which resolves the primary helper through fnaddr_for_target like
+        // concat/slice/cmp. Wire the extra-helper loop once the rstr.STR
+        // runtime layout and str.eq_* host bodies land.
 
         // jtransform.py:2059-2072 — the OS_STR_* / OS_UNI_* index selected by
         // the STR vs UNICODE operand. BYTEARRAY → NotSupported (None); any
@@ -3146,6 +3158,8 @@ impl<'a> Transformer<'a> {
             ("stroruni.concat", StrOrUniKind::Unicode) => OopSpecIndex::UniConcat,
             ("stroruni.slice", StrOrUniKind::Str) => OopSpecIndex::StrSlice,
             ("stroruni.slice", StrOrUniKind::Unicode) => OopSpecIndex::UniSlice,
+            ("stroruni.equal", StrOrUniKind::Str) => OopSpecIndex::StrEqual,
+            ("stroruni.equal", StrOrUniKind::Unicode) => OopSpecIndex::UniEqual,
             ("stroruni.cmp", StrOrUniKind::Str) => OopSpecIndex::StrCmp,
             ("stroruni.cmp", StrOrUniKind::Unicode) => OopSpecIndex::UniCmp,
             ("stroruni.copy_string_to_raw", StrOrUniKind::Str) => OopSpecIndex::StrCopyToRaw,
@@ -8496,32 +8510,68 @@ mod tests {
         );
     }
 
-    /// jtransform.py:2087-2122 — `stroruni.equal` needs the unported
-    /// `_register_extra_helper` machinery, so it returns `None` and falls
-    /// through to the residual-call path.
+    /// jtransform.py:2087-2128 — `stroruni.equal` emits the main OS_STR_EQUAL
+    /// residual call (via the common tail) even though the seven
+    /// OS_STREQ_*/OS_UNIEQ_* extra-helper side-registrations remain blocked on
+    /// the unported str.eq_* host bodies.
     #[test]
-    fn stroruni_equal_falls_through() {
+    fn stroruni_equal_lowers_to_str_equal_residual_call() {
+        use crate::call::CallControl;
         use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
+
+        let mut cc = CallControl::new();
         let config = GraphTransformConfig::default();
-        let mut transformer = Transformer::new(&config);
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+
+        let mut graph = FunctionGraph::new("equal");
         let args = stroruni_copy_contents_args(STRPTR.clone());
+        let result_ty = ValueType::Int;
+        let target = CallTarget::function_path(["ll_streq"]);
+        let result_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "result".into(),
+                    ty: result_ty.clone(),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
         let op = SpaceOperation {
-            result: None,
-            kind: OpKind::Live,
+            result: Some(result_var),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: args.clone(),
+                result_ty: result_ty.clone(),
+            },
         };
-        let (mut graph, target, result_ty) = stroruni_call_dummy_extras();
+        let rewritten = transformer
+            ._handle_stroruni_call(
+                "stroruni.equal",
+                &op,
+                &target,
+                &args,
+                &result_ty,
+                "equal",
+                &mut graph,
+            )
+            .expect("stroruni.equal must emit its OS_STR_EQUAL residual call");
+        let RewriteResult::Replace(ops) = rewritten else {
+            panic!("expected Replace");
+        };
+        assert!(
+            ops.iter()
+                .any(|o| matches!(o.kind, OpKind::CallResidual { .. })),
+            "expected a CallResidual, got {ops:?}"
+        );
         assert!(
             transformer
-                ._handle_stroruni_call(
-                    "stroruni.equal",
-                    &op,
-                    &target,
-                    &args,
-                    &result_ty,
-                    "stroruni",
-                    &mut graph,
-                )
-                .is_none()
+                .notes
+                .iter()
+                .any(|n| n.detail.contains("StrEqual")),
+            "expected an oopspec StrEqual note, got {:?}",
+            transformer.notes
         );
     }
 
