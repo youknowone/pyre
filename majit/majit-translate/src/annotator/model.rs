@@ -3165,25 +3165,24 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
         // SomeWeakRef ∪ SomeWeakRef — upstream widens the classdef to
         // the common base when both sides carry one.
         (SomeValue::WeakRef(a), SomeValue::WeakRef(b)) => {
-            let merged_classdef: Option<Rc<RefCell<ClassDef>>> =
-                match (&a.classdef, &b.classdef) {
-                    (None, _) | (_, None) => None,
-                    (Some(ca), Some(cb)) => match ClassDef::commonbase(ca, cb) {
-                        Some(base) => Some(base),
-                        None => {
-                            return Err(UnionError {
-                                lhs: s1.clone(),
-                                rhs: s2.clone(),
-                                msg: format!(
-                                    "RPython cannot unify weakrefs with no \
+            let merged_classdef: Option<Rc<RefCell<ClassDef>>> = match (&a.classdef, &b.classdef) {
+                (None, _) | (_, None) => None,
+                (Some(ca), Some(cb)) => match ClassDef::commonbase(ca, cb) {
+                    Some(base) => Some(base),
+                    None => {
+                        return Err(UnionError {
+                            lhs: s1.clone(),
+                            rhs: s2.clone(),
+                            msg: format!(
+                                "RPython cannot unify weakrefs with no \
                                      common base class: {} ∪ {}",
-                                    ca.borrow().name,
-                                    cb.borrow().name
-                                ),
-                            });
-                        }
-                    },
-                };
+                                ca.borrow().name,
+                                cb.borrow().name
+                            ),
+                        });
+                    }
+                },
+            };
             Ok(SomeValue::WeakRef(SomeWeakRef::new(merged_classdef)))
         }
 
