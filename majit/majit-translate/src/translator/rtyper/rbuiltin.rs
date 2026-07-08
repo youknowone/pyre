@@ -427,6 +427,12 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
             "raw_memclear",
             rtype_raw_memclear,
         ),
+        // rbuiltin.py:621-626
+        (
+            "rpython.rtyper.lltypesystem.llmemory",
+            "offsetof",
+            rtype_offsetof,
+        ),
         // rbuiltin.py:744-758
         (
             "rpython.rtyper.lltypesystem.llmemory",
@@ -1668,14 +1674,53 @@ pub fn rtype_hlinvoke(_hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> R
 }
 
 /// RPython `@typer_for(llmemory.offsetof) def rtype_offsetof(hop)`
-/// (rbuiltin.py:622-627).
+/// (rbuiltin.py:621-626).
 ///
-/// The upstream implementation reads two Void constants and returns
-/// `llmemory.offsetof(TYPE.value, field.value)`. The Rust low-level offset
-/// model exists, but the exact `HighLevelOp::inputargs(Void, Void)` constant
-/// path still needs a line-by-line port.
-pub fn rtype_offsetof(_hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
-    Err(rbuiltin_deferred("rtype_offsetof"))
+/// ```python
+/// @typer_for(llmemory.offsetof)
+/// def rtype_offsetof(hop):
+///     TYPE, field = hop.inputargs(lltype.Void, lltype.Void)
+///     hop.exception_cannot_occur()
+///     return hop.inputconst(lltype.Signed,
+///                           llmemory.offsetof(TYPE.value, field.value))
+/// ```
+///
+/// `offsetof(TYPE, field)` is `FieldOffset(TYPE, field)` — a `Signed`
+/// symbolic constant whose concrete byte value is resolved only at code
+/// emission (`Signed._contains_value` accepts `AddressOffset`).
+#[allow(non_snake_case)]
+pub fn rtype_offsetof(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    use crate::translator::rtyper::lltypesystem::llmemory;
+
+    let args = hop.inputargs(vec![
+        ConvertedTo::LowLevelType(&LowLevelType::Void),
+        ConvertedTo::LowLevelType(&LowLevelType::Void),
+    ])?;
+    hop.exception_cannot_occur()?;
+    // `TYPE.value` — the struct lltype carried on the first Void constant.
+    let Hlvalue::Constant(Constant {
+        value: ConstValue::LowLevelType(TYPE),
+        ..
+    }) = &args[0]
+    else {
+        return Err(TyperError::message(
+            "rtype_offsetof: first argument is not a constant TYPE",
+        ));
+    };
+    // `field.value` — the field name carried on the second Void constant.
+    let Hlvalue::Constant(Constant {
+        value: ConstValue::ByteStr(field),
+        ..
+    }) = &args[1]
+    else {
+        return Err(TyperError::message(
+            "rtype_offsetof: second argument is not a constant field name",
+        ));
+    };
+    let field = String::from_utf8_lossy(field);
+    let offset = llmemory::offsetof(TYPE, &field).map_err(TyperError::message)?;
+    let c = HighLevelOp::inputconst(&LowLevelType::Signed, &ConstValue::AddressOffset(offset))?;
+    Ok(Some(Hlvalue::Constant(c)))
 }
 
 /// RPython `@typer_for(objectmodel.instantiate) def rtype_instantiate`
@@ -3682,6 +3727,51 @@ mod tests {
     }
 
     #[test]
+    #[allow(non_snake_case)]
+    fn rtype_offsetof_folds_field_to_signed_symbolic_field_offset() {
+        use crate::translator::rtyper::lltypesystem::llmemory::AddressOffset;
+        use crate::translator::rtyper::lltypesystem::lltype::Struct;
+
+        // A STR-like struct so `offsetof(TYPE, "chars")` resolves a field.
+        let str_ty = LowLevelType::Struct(Box::new(Struct::new(
+            "rpy_string",
+            vec![
+                ("hash".to_string(), LowLevelType::Signed),
+                ("chars".to_string(), LowLevelType::Signed),
+            ],
+        )));
+
+        // upstream `TYPE, field = hop.inputargs(lltype.Void, lltype.Void)` —
+        // two Void constants carrying the struct type and the field name.
+        let hop = dummy_hop();
+        *hop.args_v.borrow_mut() = vec![
+            Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::LowLevelType(Box::new(str_ty.clone())),
+                LowLevelType::Void,
+            )),
+            Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::ByteStr(b"chars".to_vec()),
+                LowLevelType::Void,
+            )),
+        ];
+
+        let result = rtype_offsetof(&hop, &HashMap::new()).unwrap().unwrap();
+        let Hlvalue::Constant(c) = result else {
+            panic!("expected a Constant, got {result:?}");
+        };
+        // `hop.inputconst(lltype.Signed, ...)` — the carrier lltype is Signed.
+        assert_eq!(c.concretetype, Some(LowLevelType::Signed));
+        // The value is the symbolic `FieldOffset(rpy_string, 'chars')`.
+        match c.value {
+            ConstValue::AddressOffset(AddressOffset::FieldOffset(f)) => {
+                assert_eq!(f.fldname, "chars");
+                assert_eq!(f.TYPE, str_ty);
+            }
+            other => panic!("expected a FieldOffset, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn rtype_simple_call_pops_first_arg_before_dispatching_typer() {
         use crate::flowspace::model::{Hlvalue, Variable};
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -4499,7 +4589,6 @@ mod tests {
             ),
             ("rtype_WindowsError__init__", rtype_WindowsError__init__),
             ("rtype_hlinvoke", rtype_hlinvoke),
-            ("rtype_offsetof", rtype_offsetof),
             ("rtype_instantiate", rtype_instantiate),
             ("rtype_dict_constructor", rtype_dict_constructor),
         ];
