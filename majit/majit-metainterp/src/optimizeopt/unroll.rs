@@ -777,7 +777,7 @@ impl UnrollOptimizer {
         // ── Phase 2: optimize_peeled_loop (compile.py:291-292) ──
         let body_num_inputs = num_inputs;
 
-        if std::env::var_os("MAJIT_LOG").is_some() {
+        if crate::majit_log_enabled() {
             eprintln!(
                 "[jit] preamble peeling: {} virtual(s), phase1 end_args={} p1_patchguardop={}",
                 exported_state
@@ -866,7 +866,7 @@ impl UnrollOptimizer {
         // RPython parity: Phase 2 imports heap cache via short preamble
         // RPython: Phase 2 heap cache is populated by inline_short_preamble
         // replaying HeapOps through send_extra_operation.
-        if std::env::var_os("MAJIT_LOG").is_some() {
+        if crate::majit_log_enabled() {
             let gc_before = ops.iter().filter(|o| o.opcode.is_guard()).count();
             eprintln!(
                 "[jit] phase 2 input: {} ops, {} guards, body_ni={}",
@@ -1071,7 +1071,7 @@ impl UnrollOptimizer {
             .clone()
             .expect("phase 2 missing import_state label_args");
 
-        if std::env::var_os("MAJIT_LOG").is_some() {
+        if crate::majit_log_enabled() {
             for op in &p2_ops {
                 if op.opcode.is_guard() {
                     let rd_numb_len = op.resolved_rd_numb().map(|s| s.len()).unwrap_or(0);
@@ -1397,7 +1397,7 @@ impl UnrollOptimizer {
         // unroll.py:176-177: disable_retracing_if_max_retrace_guards
         if Self::disable_retracing_if_max_retrace_guards(&p2_ops, self.max_retrace_guards) {
             self.retraced_count = u32::MAX;
-            if std::env::var_os("MAJIT_LOG").is_some() {
+            if crate::majit_log_enabled() {
                 eprintln!(
                     "[jit] too many guards (>{}), disabling retracing",
                     self.max_retrace_guards
@@ -1405,7 +1405,7 @@ impl UnrollOptimizer {
             }
         }
 
-        if std::env::var_os("MAJIT_LOG").is_some() {
+        if crate::majit_log_enabled() {
             eprintln!(
                 "[jit] finalize_short_preamble: target_tokens={}",
                 self.target_tokens.len()
@@ -1421,7 +1421,7 @@ impl UnrollOptimizer {
         // jump_to_existing_trace regardless of body size.
         let p2_guard_count = p2_ops.iter().filter(|o| o.opcode.is_guard()).count();
         let skip_jump_to_existing = false;
-        if std::env::var_os("MAJIT_LOG").is_some() {
+        if crate::majit_log_enabled() {
             eprintln!(
                 "[jit] post-finalize: entering jump_to_existing_trace section (p2_guards={}, skip={})",
                 p2_guard_count, skip_jump_to_existing
@@ -1564,7 +1564,7 @@ impl UnrollOptimizer {
                     )
                     .is_none();
                 if let Some(reason) = jump_ctx.take_invalid_loop() {
-                    if std::env::var_os("MAJIT_LOG_JTET").is_some() {
+                    if crate::log_jtet_enabled() {
                         eprintln!(
                             "[jit][jte] InvalidLoop during force_boxes=false: {}",
                             reason.0
@@ -1578,7 +1578,7 @@ impl UnrollOptimizer {
                     did_jump
                 }
             };
-            if std::env::var_os("MAJIT_LOG").is_some() {
+            if crate::majit_log_enabled() {
                 eprintln!(
                     "[jit] jump_to_existing_trace(force_boxes=false) result: jumped={}, invalid_loop={}",
                     jumped, invalid_loop
@@ -1590,7 +1590,7 @@ impl UnrollOptimizer {
                 // unroll.py:161-174: virtual state not matched, retry
                 if self.retraced_count < self.retrace_limit {
                     self.retraced_count += 1;
-                    if std::env::var_os("MAJIT_LOG").is_some() {
+                    if crate::majit_log_enabled() {
                         eprintln!(
                             "[jit] Retracing ({}/{})",
                             self.retraced_count, self.retrace_limit
@@ -1609,7 +1609,7 @@ impl UnrollOptimizer {
                         )
                         .is_none();
                     jumped = if let Some(reason) = jump_ctx.take_invalid_loop() {
-                        if std::env::var_os("MAJIT_LOG_JTET").is_some() {
+                        if crate::log_jtet_enabled() {
                             eprintln!(
                                 "[jit][jte] InvalidLoop during force_boxes=true retrace: {}",
                                 reason.0
@@ -1633,7 +1633,7 @@ impl UnrollOptimizer {
                         )
                         .is_none();
                     jumped = if let Some(reason) = jump_ctx.take_invalid_loop() {
-                        if std::env::var_os("MAJIT_LOG_JTET").is_some() {
+                        if crate::log_jtet_enabled() {
                             eprintln!(
                                 "[jit][jte] InvalidLoop during force_boxes=true limit: {}",
                                 reason.0
@@ -1677,7 +1677,7 @@ impl UnrollOptimizer {
                     // code from a previous compilation (separate function).
                     // Fall back to jump_to_preamble, matching RPython's
                     // behavior when the target isn't reachable (unroll.py:228).
-                    if std::env::var_os("MAJIT_LOG").is_some() {
+                    if crate::majit_log_enabled() {
                         eprintln!(
                             "[jit] jump_to_existing_trace: external target {:?} != body {:?}, falling back to preamble",
                             redirected_jump_descr_idx, current_body_descr_idx
@@ -1699,7 +1699,7 @@ impl UnrollOptimizer {
         if !sp.is_empty() {
             self.short_preamble = Some(sp.clone());
         }
-        if std::env::var_os("MAJIT_LOG").is_some() {
+        if crate::majit_log_enabled() {
             eprintln!(
                 "[jit] assembly_contract: label_args={:?} used_boxes={:?} jump_args={:?}",
                 label_args, sp.used_boxes, sp.jump_args
@@ -1724,7 +1724,7 @@ impl UnrollOptimizer {
                 .expect("preamble target token must exist before jump_to_preamble")
                 .clone();
             let preamble_arity = exported_renamed_inputargs.len();
-            if std::env::var_os("MAJIT_LOG").is_some() {
+            if crate::majit_log_enabled() {
                 let body_jump_arity = body_terminal_op.as_ref().map(|j| j.num_args()).unwrap_or(0);
                 eprintln!(
                     "[jit] jump_to_preamble: body_jump_args={} preamble_arity={} start_label_args={:?}",
@@ -3260,7 +3260,7 @@ impl OptUnroll {
             ) {
                 Ok(guards) => guards,
                 Err(()) => {
-                    if std::env::var_os("MAJIT_LOG_JTET").is_some() {
+                    if crate::log_jtet_enabled() {
                         eprintln!(
                             "[jit][jte] target_token #{tt_idx} generate_guards failed (force_boxes={force_boxes})",
                         );
@@ -3300,7 +3300,7 @@ impl OptUnroll {
                 });
                 let rd_resume_position = patch.rd_resume_position.get();
                 for mut guard_op in emitted {
-                    if std::env::var_os("MAJIT_LOG_JTET").is_some() {
+                    if crate::log_jtet_enabled() {
                         let arg_values: Vec<_> = guard_op
                             .getarglist()
                             .iter()
@@ -3357,7 +3357,7 @@ impl OptUnroll {
             ) {
                 Ok(result) => result,
                 Err(()) => {
-                    if std::env::var_os("MAJIT_LOG_JTET").is_some() {
+                    if crate::log_jtet_enabled() {
                         eprintln!(
                             "[jit][jte] target_token #{tt_idx} make_inputargs failed (force_boxes={force_boxes})",
                         );
@@ -3701,7 +3701,7 @@ impl OptUnroll {
         loop {
             fixpoint_iter += 1;
             if fixpoint_iter > 20 {
-                if std::env::var_os("MAJIT_LOG").is_some() {
+                if crate::majit_log_enabled() {
                     eprintln!(
                         "[jit][inline_short_preamble] fixpoint loop exceeded 20 iterations, breaking"
                     );
@@ -5085,7 +5085,7 @@ fn assemble_peeled_trace_with_jump_args(
             } else {
                 label_args.len()
             };
-            if std::env::var_os("MAJIT_LOG").is_some() {
+            if crate::majit_log_enabled() {
                 eprintln!(
                     "[jit] assemble_jump: inner_label={:?} original_args={:?} mapped_base_args={:?} label_args={:?} filtered_extra_jump_args={:?}",
                     current_inner_label_index,

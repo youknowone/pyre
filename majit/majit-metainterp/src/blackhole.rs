@@ -961,7 +961,7 @@ impl BlackholeInterpreter {
         let mut values = Vec::with_capacity(length);
         for _ in 0..length {
             let index = self.next_u8() as usize;
-            if std::env::var_os("MAJIT_BH_DEBUG").is_some() {
+            if crate::bh_debug_enabled() {
                 eprintln!(
                     "[bh-getlist] i{index} -> {}",
                     self.registers_i.get(index).copied().unwrap_or(0)
@@ -1006,7 +1006,7 @@ impl BlackholeInterpreter {
     /// reads it as a raw signed byte (`'c'` argcode, assembler.py:312
     /// `USE_C_FORM`).
     pub(crate) fn bhimpl_jit_merge_point(&mut self, opcode: u8) -> Result<(), DispatchError> {
-        let nbody_debug = std::env::var_os("PYRE_NBODY_DEBUG").is_some();
+        let nbody_debug = crate::nbody_debug_enabled();
         let jdindex_byte = self.next_u8();
         let jdindex = if opcode == jitcode::insns::BC_JIT_MERGE_POINT_C {
             (jdindex_byte as i8) as usize
@@ -5256,7 +5256,7 @@ fn handler_goto_if_not_int_eq(
     let b = bh.registers_i[code[position + 1] as usize];
     let target = (code[position + 2] as usize) | ((code[position + 3] as usize) << 8);
     let pc = position + 4;
-    if std::env::var_os("MAJIT_BH_DEBUG").is_some() {
+    if crate::bh_debug_enabled() {
         eprintln!(
             "[bh-brcond] pos={} int_eq i{}={} i{}={} target={} fallthrough={}",
             position - 1,
@@ -5545,7 +5545,7 @@ fn handler_goto_if_not(
     let a = bh.registers_i[code[position] as usize];
     let target = (code[position + 1] as usize) | ((code[position + 2] as usize) << 8);
     let pc = position + 3;
-    if std::env::var_os("MAJIT_BH_DEBUG").is_some() {
+    if crate::bh_debug_enabled() {
         eprintln!(
             "[bh-brcond] pos={} cond_reg=i{} cond={} target={} fallthrough={}",
             position - 1,
@@ -8378,7 +8378,7 @@ fn handler_getarrayitem_vable_r(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let nbody_debug = std::env::var_os("PYRE_NBODY_DEBUG").is_some();
+    let nbody_debug = crate::nbody_debug_enabled();
     let vable = bh.registers_r[code[p] as usize];
     let index = bh.registers_i[code[p + 1] as usize] as usize;
     let vinfo = vable_clear_token_and_get_vinfo(bh, vable);
@@ -8420,7 +8420,7 @@ fn handler_setarrayitem_vable_r(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let nbody_debug = std::env::var_os("PYRE_NBODY_DEBUG").is_some();
+    let nbody_debug = crate::nbody_debug_enabled();
     let vable = bh.registers_r[code[p] as usize];
     let index = bh.registers_i[code[p + 1] as usize] as usize;
     let value = bh.registers_r[code[p + 2] as usize];

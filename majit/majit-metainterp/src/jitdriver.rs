@@ -89,7 +89,7 @@ impl Drop for TraceContinuationSuspendGuard {
 /// Diagnostic env gates read once and cached — these are checked on the hot
 /// back-edge / guard-failure paths that run every loop iteration, so re-reading
 /// the environment per call would add a syscall to each iteration.
-fn spdiag_enabled() -> bool {
+pub(crate) fn spdiag_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::env::var_os("MAJIT_SPDIAG").is_some())
 }
@@ -1415,7 +1415,7 @@ impl<S: JitState> JitDriver<S> {
         state: &mut S,
         env: &S::Env,
     ) -> Option<usize> {
-        let dbg = std::env::var_os("MAJIT_CLOSEDBG").is_some();
+        let dbg = crate::closedbg_enabled();
         let key = match self.meta.single_pass_compiled_key.take() {
             Some(k) => k,
             None => {
@@ -1471,7 +1471,7 @@ impl<S: JitState> JitDriver<S> {
     ) -> crate::CompileOutcome {
         let loop_header_pc = self.meta.trace_ctx().map(|c| c.header_pc);
         let loop_green_key = self.current_trace_green_key();
-        if std::env::var_os("MAJIT_CLOSEDBG").is_some() {
+        if crate::closedbg_enabled() {
             eprintln!(
                 "@@@CLOSE LOOP-COMPILE green_key={} header_pc={} jump_args={}",
                 loop_green_key.map(|k| k as i64).unwrap_or(-1),
@@ -1480,7 +1480,7 @@ impl<S: JitState> JitDriver<S> {
             );
         }
         let outcome = self.meta.compile_loop(jump_args, meta);
-        if std::env::var_os("MAJIT_CLOSEDBG").is_some() {
+        if crate::closedbg_enabled() {
             eprintln!(
                 "@@@CLOSE LOOP-COMPILE outcome={:?}",
                 match &outcome {
@@ -1835,7 +1835,7 @@ impl<S: JitState> JitDriver<S> {
                     // retargeted by `reached_loop_header`.
                     let target_key = self.current_trace_green_key().unwrap_or(bridge_key);
                     let has_targets = self.meta.has_compiled_targets(target_key);
-                    if std::env::var_os("MAJIT_CLOSEDBG").is_some() {
+                    if crate::closedbg_enabled() {
                         let hp = self
                             .meta
                             .trace_ctx()

@@ -1078,7 +1078,7 @@ impl Optimizer {
                 }
                 installed_heads.insert(head_key);
             }
-            if std::env::var_os("MAJIT_LOG").is_some() {
+            if crate::majit_log_enabled() {
                 eprintln!(
                     "[jit] install_imported_virtual head={:?} fields={:?}",
                     entry.head, entry.fields
@@ -1346,7 +1346,7 @@ impl Optimizer {
                     .get(*label_slot)
                     .copied()
                     .unwrap_or_else(|| {
-                        if std::env::var_os("MAJIT_LOG").is_some() {
+                        if crate::majit_log_enabled() {
                             eprintln!(
                                 "[jit] MISS: label_slot={} len={}",
                                 *label_slot,
@@ -2038,7 +2038,7 @@ impl Optimizer {
     /// optimizer.py: log_loop(ops)
     /// Log the optimized trace for debugging/profiling.
     pub fn log_optimized_trace(ctx: &OptContext) {
-        if std::env::var("MAJIT_LOG_OPT").is_ok() {
+        if crate::log_opt_enabled() {
             eprintln!(
                 "[MAJIT] optimized trace: {} ops, {} guards",
                 ctx.new_operations.len(),
@@ -3327,7 +3327,7 @@ impl Optimizer {
                         })
                     })
                     .collect();
-                if std::env::var_os("MAJIT_LOG").is_some() {
+                if crate::majit_log_enabled() {
                     for entry in &ctx.exported_short_boxes {
                         eprintln!(
                             "[jit] exported_short_box: kind={:?} pos={:?} opcode={:?} args={:?} descr_idx={:?} invented={} same_as_source={:?}",
@@ -3815,7 +3815,7 @@ impl Optimizer {
                 }
             }
         }
-        if ops.len() < 120 && std::env::var_os("MAJIT_SMALLIR").is_some() {
+        if ops.len() < 120 && crate::smallir_enabled() {
             eprintln!("@@@SMALLIR LOOP total={}", ops.len());
             for (i, op) in ops.iter().enumerate() {
                 eprintln!("@@@SMALLIR   [{i}] {:?}", op);
@@ -3956,7 +3956,7 @@ impl Optimizer {
             .as_ref()
             .map_or(false, |op| op.opcode == OpCode::Jump);
 
-        if optimized_ops.len() < 120 && std::env::var_os("MAJIT_SMALLIR").is_some() {
+        if optimized_ops.len() < 120 && crate::smallir_enabled() {
             eprintln!(
                 "@@@SMALLIR BRIDGE total={} has_jump={} front_targets={}",
                 optimized_ops.len(),
@@ -4626,7 +4626,7 @@ impl Optimizer {
                 {
                     let target_pos = replacement.pos.get().raw() as usize;
                     if target_pos < ctx.new_operations.len() {
-                        if std::env::var_os("MAJIT_LOG").is_some() {
+                        if crate::majit_log_enabled() {
                             eprintln!(
                                 "[opt] guard replacement op={:?} pos={:?} target_index={} len={}",
                                 op.opcode,
@@ -4750,7 +4750,7 @@ impl Optimizer {
                 }
             }
         }
-        if std::env::var_os("MAJIT_LOG").is_some()
+        if crate::majit_log_enabled()
             && matches!(
                 op.opcode,
                 OpCode::CallMayForceI

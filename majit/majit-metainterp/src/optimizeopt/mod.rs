@@ -70,9 +70,7 @@ pub(crate) fn next_snapshot_pos<T>(store: &[Option<T>]) -> i32 {
     store.len() as i32
 }
 
-pub(crate) fn majit_log_enabled() -> bool {
-    std::env::var_os("MAJIT_LOG").is_some()
-}
+pub(crate) use crate::majit_log_enabled;
 
 /// info.py:865-894 `getrawptrinfo` / `getptrinfo` return shape, with
 /// RPython `_forwarded` object identity preserved.

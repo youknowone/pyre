@@ -1053,7 +1053,7 @@ impl VirtualState {
                     (node.info.info_type(), ctx.opref_type(resolved_for_store))
                 {
                     if expected != actual {
-                        if std::env::var_os("MAJIT_LOG").is_some() {
+                        if crate::majit_log_enabled() {
                             eprintln!(
                                 "[label-type-mismatch] slot={} expected={:?} actual={:?} \
                                  source={:?} resolved={:?}",
@@ -1237,7 +1237,7 @@ impl VirtualState {
                 runtime_box,
                 &mut state,
             ) {
-                if std::env::var_os("MAJIT_LOG_JTET").is_some() {
+                if crate::log_jtet_enabled() {
                     let runtime_value = runtime_box.and_then(|rb| {
                         state
                             .ctx
@@ -1333,7 +1333,7 @@ impl VirtualState {
             Some(prev) if prev != inc_pos => {
                 state.bad.insert(expected as *const _);
                 state.bad.insert(incoming as *const _);
-                if std::env::var_os("MAJIT_LOG_JTET").is_some() {
+                if crate::log_jtet_enabled() {
                     eprintln!(
                         "[jit][jte] renum alias mismatch arg_idx={arg_idx} expected.position={exp_pos} \
                          prior_incoming={prev} current_incoming={inc_pos}"

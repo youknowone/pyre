@@ -166,6 +166,109 @@ pub fn jit_strict_mode() -> bool {
     *STRICT
 }
 
+// ── Cached diagnostic env-var helpers ────────────────────────────────
+//
+// Each env var is read once and cached via OnceLock so hot paths
+// (back-edge, guard-failure, optimizer) never re-acquire the global
+// env lock.
+
+pub fn closedbg_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("MAJIT_CLOSEDBG").is_some())
+}
+
+pub fn bh_debug_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("MAJIT_BH_DEBUG").is_some())
+}
+
+pub fn nbody_debug_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("PYRE_NBODY_DEBUG").is_some())
+}
+
+pub fn mptrace_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("MAJIT_MPTRACE").is_some())
+}
+
+pub fn pcseq_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("MAJIT_PCSEQ").is_some())
+}
+
+pub fn tldbg_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("MAJIT_TLDBG").is_some())
+}
+
+pub fn heapdbg_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("MAJIT_HEAPDBG").is_some())
+}
+
+pub fn diag_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("MAJIT_DIAG").is_some())
+}
+
+pub fn log_jtet_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("MAJIT_LOG_JTET").is_some())
+}
+
+pub fn smallir_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("MAJIT_SMALLIR").is_some())
+}
+
+pub fn log_opt_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("MAJIT_LOG_OPT").is_some())
+}
+
+pub fn bridge_debug_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("MAJIT_BRIDGE_DEBUG").is_some())
+}
+
+pub fn no_unroll_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("PYRE_NO_UNROLL").is_some())
+}
+
+/// `PYRE_ORIGINAL_BOXES`: default true, only disabled by `0` or `false`.
+pub fn original_boxes_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| match std::env::var_os("PYRE_ORIGINAL_BOXES") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => true,
+    })
+}
+
+pub fn stall_window() -> u64 {
+    static VAL: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+        std::env::var("MAJIT_STALL_WINDOW")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1_000_000)
+    });
+    *VAL
+}
+
+pub fn step_limit() -> u64 {
+    static VAL: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+        std::env::var("MAJIT_STEP_LIMIT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8_000_000)
+    });
+    *VAL
+}
+
 /// Result of tracing a single instruction.
 ///
 /// Returned by the interpreter's `trace_instruction()` function

@@ -966,7 +966,7 @@ where
             // inline callee frame.  State-field JIT still needs to
             // materialize `__JitSym` scalars into an MIFrame register bank,
             // but the only orthodox destination is the root/portal frame.
-            if std::env::var_os("MAJIT_BH_DEBUG").is_some() {
+            if crate::bh_debug_enabled() {
                 eprintln!(
                     "[rec-guard] resume_pc={} frames={} root_i0_reg={:?} root_i0_val={:?}",
                     resume_pc,
@@ -1773,14 +1773,8 @@ where
         //     a non-productive spin never does).  Catches the cycle early.
         //   * `step_limit` — absolute cap for any other runaway.
         // `MAJIT_STALL_WINDOW` / `MAJIT_STEP_LIMIT` override for diagnosis.
-        let stall_window: u64 = std::env::var("MAJIT_STALL_WINDOW")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1_000_000);
-        let step_limit: u64 = std::env::var("MAJIT_STEP_LIMIT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(8_000_000);
+        let stall_window: u64 = crate::stall_window();
+        let step_limit: u64 = crate::step_limit();
         let mut step_count: u64 = 0;
         let mut last_num_ops = ctx.num_recorded_ops();
         let mut steps_since_growth: u64 = 0;
@@ -1834,7 +1828,7 @@ where
                 }
             };
             if !matches!(action, TraceAction::Continue) {
-                if std::env::var_os("MAJIT_TLDBG").is_some() {
+                if crate::tldbg_enabled() {
                     eprintln!(
                         "@@@TLDBG run_to_end end action={:?} step_count={} num_recorded_ops={} trace_limit={}",
                         action,
@@ -2547,7 +2541,7 @@ where
                 } else {
                     0
                 };
-                if !is_ref && ctx.is_bridge_trace && std::env::var_os("MAJIT_HEAPDBG").is_some() {
+                if !is_ref && ctx.is_bridge_trace && crate::heapdbg_enabled() {
                     use std::sync::atomic::{AtomicU64, Ordering};
                     static N: AtomicU64 = AtomicU64::new(0);
                     let n = N.fetch_add(1, Ordering::Relaxed);
@@ -3777,7 +3771,7 @@ where
                 // seen_loop_header like MAJIT_MPTRACE). Confirms the walk holds a
                 // concrete per-opcode next-pc = mp_green_pc, the walker-drives-pc
                 // data source for the per-opcode single-executor.
-                if std::env::var_os("MAJIT_PCSEQ").is_some() {
+                if crate::pcseq_enabled() {
                     let sf: Vec<Option<i64>> = (0..3).map(|i| sym.state_field_value(i)).collect();
                     eprintln!(
                         "@@@PCSEQ mp pc={mp_green_pc:?} greens={mp_green_ints:?} refs={mp_green_refs:?} floats={mp_green_floats:?} hdr={:?} sf={sf:?} num_ops={} seen_lh={}",
@@ -3932,7 +3926,7 @@ where
                         true
                     };
                     let header_matches = pc_matches && same_greenkey;
-                    if std::env::var_os("MAJIT_MPTRACE").is_some() {
+                    if crate::mptrace_enabled() {
                         eprintln!(
                             "@@@MPTRACE visit pc={mp_green_pc:?} header_pc={} close_target={close_target_pc} matches={header_matches} num_ops={}",
                             ctx.header_pc,
@@ -3940,7 +3934,7 @@ where
                         );
                     }
                     if header_matches {
-                        if std::env::var_os("MAJIT_SPDIAG").is_some() {
+                        if crate::jitdriver::spdiag_enabled() {
                             eprintln!(
                                 "@@@SPDIAG HEADER-CLOSE close_target_pc={close_target_pc} mp_green_pc={mp_green_pc:?} walk_reds={walk_reds:?}"
                             );
@@ -4004,12 +3998,12 @@ where
                             let inner_key =
                                 crate::green_key_from_code_ptr(ctx.green_key_raw.0, pc as usize);
                             if ctx.has_merge_point_at(inner_key, header_pc) {
-                                if std::env::var_os("MAJIT_SPDIAG").is_some() {
+                                if crate::jitdriver::spdiag_enabled() {
                                     eprintln!(
                                         "@@@SPDIAG INNER-CUT-CLOSE pc={pc} header_pc={header_pc} inner_key={inner_key} walk_reds={walk_reds:?}"
                                     );
                                 }
-                                if std::env::var_os("MAJIT_CLOSEDBG").is_some() {
+                                if crate::closedbg_enabled() {
                                     let mut i = 0;
                                     while let Some(o) = sym.state_field_ref(i) {
                                         eprintln!("@@@RED int[{i}]={o:?}");
@@ -4078,7 +4072,7 @@ where
                             } else {
                                 red_boxes
                             };
-                            if std::env::var_os("MAJIT_MPTRACE").is_some() {
+                            if crate::mptrace_enabled() {
                                 eprintln!(
                                     "@@@MPTRACE add-mp pc={pc} header_pc={header_pc} inner_key={inner_key} num_ops={}",
                                     ctx.num_ops(),

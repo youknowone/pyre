@@ -6658,7 +6658,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         // jitcode.py:152
         let mut offset = info + 3;
 
-        let bh_debug = std::env::var_os("MAJIT_BH_DEBUG").is_some();
+        let bh_debug = crate::bh_debug_enabled();
         if bh_debug {
             eprintln!(
                 "[bh-section] info={info} length_i={length_i} length_r={length_r} length_f={length_f} \
@@ -7176,7 +7176,7 @@ pub fn read_frame_liveness_reg_indices(
 ) -> FrameLivenessRegIndices {
     use majit_translate::liveness::LivenessIterator;
     if !jitcode.can_decode_live_vars(pc, op_live) {
-        if std::env::var_os("MAJIT_BRIDGE_DEBUG").is_some() {
+        if crate::bridge_debug_enabled() {
             eprintln!(
                 "[bridgeB] read_frame_liveness_reg_indices: no liveness startpoint at pc={pc} op_live={op_live} — declining (empty banks)"
             );
@@ -7185,7 +7185,7 @@ pub fn read_frame_liveness_reg_indices(
     }
     let info = jitcode.get_live_vars_info(pc, op_live);
     if info + 2 >= all_liveness.len() {
-        if std::env::var_os("MAJIT_BRIDGE_DEBUG").is_some() {
+        if crate::bridge_debug_enabled() {
             eprintln!(
                 "[bridgeB] read_frame_liveness_reg_indices: liveness info {info} out of range (len={}) at pc={pc} — declining (empty banks)",
                 all_liveness.len()
@@ -7340,7 +7340,7 @@ pub fn blackhole_from_resumedata<'a>(
         // `#124`: pass the carried direct JitCode pc so the resolver can
         // prefer it over the lossy `pc_map` translation.
         let resolved = resolve_jitcode(jitcode_pos, pc, jitcode_pc)?;
-        if std::env::var_os("MAJIT_BH_DEBUG").is_some() {
+        if crate::bh_debug_enabled() {
             eprintln!(
                 "[bh-frame] jitcode_pos={jitcode_pos} encoded_pc={pc} resolved_pc={}",
                 resolved.pc

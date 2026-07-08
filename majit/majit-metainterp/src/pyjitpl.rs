@@ -771,7 +771,7 @@ fn normalize_root_loop_entry_contract(
         return Err((0, jump_arg_count));
     }
     if jump_targets_current_loop && label_arg_count != jump_arg_count {
-        if std::env::var_os("MAJIT_CLOSEDBG").is_some() {
+        if crate::closedbg_enabled() {
             eprintln!(
                 "@@@CONTRACT label({label_arg_count})={:?}",
                 label_op.map(|op| op.getarglist())
@@ -2802,14 +2802,7 @@ impl<M: Clone> MetaInterp<M> {
             .driver_descriptor()
             .map(|driver| driver.num_greens())
             .unwrap_or(0);
-        let use_original_boxes = descriptor_num_greens > 0
-            && match std::env::var_os("PYRE_ORIGINAL_BOXES") {
-                Some(v) => {
-                    let v = v.to_string_lossy();
-                    v != "0" && !v.eq_ignore_ascii_case("false")
-                }
-                None => true,
-            };
+        let use_original_boxes = descriptor_num_greens > 0 && crate::original_boxes_enabled();
         let num_green_args = if use_original_boxes {
             descriptor_num_greens
         } else {
@@ -5064,7 +5057,7 @@ impl<M: Clone> MetaInterp<M> {
                 );
             }
             self.warm_state.abort_tracing(green_key, true);
-            if std::env::var_os("MAJIT_CLOSEDBG").is_some() {
+            if crate::closedbg_enabled() {
                 eprintln!("@@@CANCEL-SITE line={}", line!());
             }
             return CompileOutcome::Cancelled;
@@ -5205,7 +5198,7 @@ impl<M: Clone> MetaInterp<M> {
         // simple-loop compilation path (compile.py:251 compile_simple_loop)
         // without preamble peeling, useful for diagnostics and to isolate
         // unroller-related regressions.
-        let no_unroll = std::env::var_os("PYRE_NO_UNROLL").is_some();
+        let no_unroll = crate::no_unroll_enabled();
 
         // Use UnrollOptimizer for preamble peeling when available.
         // compile.py: compile_loop → PreambleCompileData + LoopCompileData.
@@ -5347,7 +5340,7 @@ impl<M: Clone> MetaInterp<M> {
                         // abort_tracing — TRACING flag must stay active.
                         if !self.cancelled_too_many_times() {
                             self.exported_state = None;
-                            if std::env::var_os("MAJIT_CLOSEDBG").is_some() {
+                            if crate::closedbg_enabled() {
                                 eprintln!("@@@CANCEL-SITE line={}", line!());
                             }
                             return CompileOutcome::Cancelled;
@@ -5545,7 +5538,7 @@ impl<M: Clone> MetaInterp<M> {
                         );
                     }
                     self.cancel_count += 1;
-                    if std::env::var_os("MAJIT_CLOSEDBG").is_some() {
+                    if crate::closedbg_enabled() {
                         eprintln!("@@@CANCEL-SITE line={}", line!());
                     }
                     return CompileOutcome::Cancelled;
@@ -5588,7 +5581,7 @@ impl<M: Clone> MetaInterp<M> {
                     );
                 }
                 self.cancel_count += 1;
-                if std::env::var_os("MAJIT_CLOSEDBG").is_some() {
+                if crate::closedbg_enabled() {
                     eprintln!("@@@CANCEL-SITE line={}", line!());
                 }
                 return CompileOutcome::Cancelled;
@@ -5636,14 +5629,14 @@ impl<M: Clone> MetaInterp<M> {
         }
         let mut compiled_ops =
             compile::normalize_closing_jump_args(optimized_ops, &constants, final_num_inputs);
-        if crate::majit_log_enabled() || std::env::var_os("MAJIT_DIAG").is_some() {
+        if crate::majit_log_enabled() || crate::diag_enabled() {
             eprintln!(
                 "[jit] compiled loop: {} ops before opt -> {} ops after opt ({:.1}% reduction)",
                 num_ops_before,
                 compiled_ops.len(),
                 (1.0 - compiled_ops.len() as f64 / num_ops_before as f64) * 100.0
             );
-            if std::env::var_os("MAJIT_DIAG").is_some() {
+            if crate::diag_enabled() {
                 let mut counts: std::collections::HashMap<majit_ir::OpCode, usize> =
                     std::collections::HashMap::new();
                 for op in &compiled_ops {
@@ -5860,7 +5853,7 @@ impl<M: Clone> MetaInterp<M> {
                 }
                 self.warm_state.abort_tracing(green_key, !is_invalid_loop);
                 self.cancel_count += 1;
-                if std::env::var_os("MAJIT_CLOSEDBG").is_some() {
+                if crate::closedbg_enabled() {
                     eprintln!("@@@CANCEL-SITE line={}", line!());
                 }
                 return CompileOutcome::Cancelled;
@@ -5966,7 +5959,7 @@ impl<M: Clone> MetaInterp<M> {
                         &format!("compiled_loops.insert green_key={green_key}"),
                     );
                 }
-                if std::env::var_os("MAJIT_SPDIAG").is_some() {
+                if crate::jitdriver::spdiag_enabled() {
                     eprintln!("@@@SPDIAG compiled_loops.insert green_key={green_key}");
                 }
                 token.set_retraced_count(final_retraced_count);
@@ -6029,7 +6022,7 @@ impl<M: Clone> MetaInterp<M> {
                 self.cancel_count += 1;
                 // pyjitpl.py:3025: self.exported_state = None
                 self.exported_state = None;
-                if std::env::var_os("MAJIT_CLOSEDBG").is_some() {
+                if crate::closedbg_enabled() {
                     eprintln!("@@@CANCEL-SITE line={}", line!());
                 }
                 return CompileOutcome::Cancelled;
@@ -6213,7 +6206,7 @@ impl<M: Clone> MetaInterp<M> {
                         green_key, bridge_origin
                     );
                 }
-                if std::env::var_os("MAJIT_CLOSEDBG").is_some() {
+                if crate::closedbg_enabled() {
                     eprintln!("@@@CANCEL-SITE line={}", line!());
                 }
                 return CompileOutcome::Cancelled;
@@ -6323,7 +6316,7 @@ impl<M: Clone> MetaInterp<M> {
                 // (populated by `start_retrace_from_guard`).  No
                 // `(trace_id, fail_index)` reverse lookup.
                 if !self.compiled_loops.contains_key(&origin_key) {
-                    if std::env::var_os("MAJIT_CLOSEDBG").is_some() {
+                    if crate::closedbg_enabled() {
                         eprintln!("@@@CANCEL-SITE line={}", line!());
                     }
                     return CompileOutcome::Cancelled;
@@ -6363,7 +6356,7 @@ impl<M: Clone> MetaInterp<M> {
                 // compile a fresh entry bridge and attach it to the
                 // original interpreter green key.
                 let Some((original_green_key, entry_meta)) = entry_bridge else {
-                    if std::env::var_os("MAJIT_CLOSEDBG").is_some() {
+                    if crate::closedbg_enabled() {
                         eprintln!("@@@CANCEL-SITE line={}", line!());
                     }
                     return CompileOutcome::Cancelled;
@@ -6866,7 +6859,7 @@ impl<M: Clone> MetaInterp<M> {
                         &format!("compiled_loops.insert green_key={green_key}"),
                     );
                 }
-                if std::env::var_os("MAJIT_SPDIAG").is_some() {
+                if crate::jitdriver::spdiag_enabled() {
                     eprintln!(
                         "@@@SPDIAG FINISH-compile compiled_loops.insert green_key={green_key}"
                     );
