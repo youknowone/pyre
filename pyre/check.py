@@ -1156,8 +1156,23 @@ def parse_args():
         choices=["wasmtime", "wasmi"],
         default="wasmtime",
         help="wasm runtime for the wasm backend: wasmtime (cranelift JIT, fast "
-        "but recompiles the module each start) or wasmi (interpreter, near-zero "
-        "startup, slower loops)",
+        "but recompiles the module each start) or wasmi (our patched pure-Rust "
+        "interpreter with the majit meta-tracing tier; near-zero startup, tier "
+        "toggled off with WASMI_NO_MAJIT=1)",
+    )
+    parser.add_argument(
+        "--wasm-bench",
+        action="store_true",
+        help="benchmark the wasm backend under each host engine — wasmtime, "
+        "wasmi (majit tier off), and wasmi+majit (our patched interpreter) — and "
+        "print a speedup table; ignores the normal check/backends flow",
+    )
+    parser.add_argument(
+        "--wasm-bench-reps",
+        type=int,
+        default=1,
+        help="repetitions per (bench, engine) in --wasm-bench; the best "
+        "(minimum) user-CPU time is reported (default: 1)",
     )
     parser.add_argument("--timeout-scale", type=float, default=1.0)
     parser.add_argument("--dynasm-timeout-scale", type=float, default=None)
@@ -1224,8 +1239,120 @@ def parse_args():
 
 # ── Main ─────────────────────────────────────────────────────────────
 
+# Loop-heavy scripts benched by --wasm-bench: (label, filename, timeout_s).
+# Curated to workloads that finish on the wasm path within a short budget so the
+# host majit tier has a hot loop to compile; heavier benches (nbody/fannkuch/
+# recursion) are intentionally left to the normal flow.
+WASM_BENCH_SCRIPTS = [
+    ("int_loop",      "int_loop.py",      10),
+    ("float_loop",    "float_loop.py",    10),
+    ("fib_loop",      "fib_loop.py",      10),
+    ("inline_helper", "inline_helper.py", 10),
+    ("nested_loop",   "nested_loop.py",   10),
+    ("spectral_norm", "spectral_norm.py", 15),
+]
+
+# Host-engine configurations compared by --wasm-bench:
+# (label, PYRE_WASM_ENGINE, WASMI_NO_MAJIT). `wasmi+majit` is our patched
+# interpreter with the tier on; `wasmi-stock` is the same build with the tier
+# forced off, isolating the majit contribution.
+WASM_BENCH_CONFIGS = [
+    ("wasmtime",    "wasmtime", None),
+    ("wasmi-stock", "wasmi",    "1"),
+    ("wasmi+majit", "wasmi",    None),
+]
+
+
+def run_wasm_bench(args):
+    """Build the wasm backend once and time each bench under every host engine.
+
+    Every run uses the same wasm module (the wasm32 build of pyre); only the
+    native host interpreting it changes. Output is required to match across
+    engines — a mismatch means the majit tier miscompiled and is flagged.
+    """
+    chk = Check(args)
+    chk.build_backend("wasm")
+    pyre_bin = default_binary("wasm")
+    if not Path(pyre_bin).exists() and Path(pyre_bin + EXE).exists():
+        pyre_bin += EXE
+    if not (Path(pyre_bin).exists() or os.access(pyre_bin, os.X_OK)):
+        print(f"ERROR: wasm runner not built: {pyre_bin}")
+        sys.exit(1)
+
+    reps = max(1, args.wasm_bench_reps)
+    base_env = pyre_env()
+    labels = [c[0] for c in WASM_BENCH_CONFIGS]
+
+    print()
+    print(bold("wasm majit bench — the pyre module under each host engine"))
+    print(dim(f"reps={reps} (best user-CPU seconds); majit tier toggled via WASMI_NO_MAJIT"))
+    print()
+    header = f"{'bench':<14s}" + "".join(f"{l:>14s}" for l in labels) + f"{'majit spd':>11s}  correct"
+    print(header)
+    print("-" * len(header))
+
+    any_wrong = False
+    for name, fname, timeout in WASM_BENCH_SCRIPTS:
+        script = f"{BENCH_DIR}/{fname}"
+        if not Path(script).exists():
+            continue
+        times, outputs = {}, {}
+        for label, engine, no_majit in WASM_BENCH_CONFIGS:
+            env = dict(base_env)
+            env["PYRE_WASM_ENGINE"] = engine
+            if no_majit:
+                env["WASMI_NO_MAJIT"] = no_majit
+            else:
+                env.pop("WASMI_NO_MAJIT", None)
+            best, out, code = None, None, 0
+            for _ in range(reps):
+                o, t, c, _e = run_timed([pyre_bin, script], timeout_s=timeout, env=env)
+                if c != 0:
+                    code = c
+                    break
+                out = o
+                best = t if best is None else min(best, t)
+            times[label] = (best, code)
+            outputs[label] = out
+
+        # Correctness: all engines that succeeded must agree.
+        ref, ok = None, True
+        for label in labels:
+            if times[label][1] == 0 and outputs[label] is not None:
+                if ref is None:
+                    ref = outputs[label]
+                elif outputs[label] != ref:
+                    ok = False
+
+        cells = []
+        for label in labels:
+            best, code = times[label]
+            if code == 124:
+                cells.append("TIMEOUT")
+            elif code != 0:
+                cells.append(f"CRASH({code})")
+            else:
+                cells.append(f"{best:.3f}s")
+        stock, s_code = times["wasmi-stock"]
+        majit, m_code = times["wasmi+majit"]
+        if s_code == 0 and m_code == 0 and stock and majit:
+            spd = f"{stock / majit:.2f}x"
+        else:
+            spd = "-"
+        correct = green("yes") if ok else red("NO")
+        any_wrong = any_wrong or not ok
+        print(f"{name:<14s}" + "".join(f"{c:>14s}" for c in cells) + f"{spd:>11s}  {correct}")
+
+    print()
+    print(dim("majit spd = wasmi-stock / wasmi+majit user-CPU (higher = tier helps more)"))
+    sys.exit(1 if any_wrong else 0)
+
+
 def main():
     args = parse_args()
+    if args.wasm_bench:
+        run_wasm_bench(args)
+        return
     if args.no_fbw_inline_multiframe:
         global FBW_INLINE_MULTIFRAME_OFF
         FBW_INLINE_MULTIFRAME_OFF = True
