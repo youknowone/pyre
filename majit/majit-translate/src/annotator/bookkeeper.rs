@@ -2016,17 +2016,52 @@ impl Bookkeeper {
         // Strip the `<…>` argument span so the lookup resolves under the
         // template key — matching `StructFieldRegistry::lookup_fields`,
         // which the bare-`reg.fields.get` here bypasses.
-        let fields: Option<Vec<(String, String)>> = {
+        let mut fields: Vec<(String, String)> = {
             let guard = self.pyre_struct_fields.borrow();
-            guard.as_ref().and_then(|r| {
+            match guard.as_ref().and_then(|r| {
                 r.fields
                     .get(majit_ir::descr::strip_generic_args(n).as_ref())
                     .cloned()
-            })
+            }) {
+                Some(f) => f,
+                None => return Ok(()),
+            }
         };
-        let Some(fields) = fields else {
-            return Ok(());
-        };
+        // A per-instantiation variant carries concrete payload rows keyed
+        // under its full `<…>`-suffixed spelling
+        // (`Option<*mut PyObject>::Some` → `__pos_0: *mut PyObject`,
+        // registered by `register_ref_enum_instantiation_rows`), while the
+        // stripped template row is the generic `??TypeVar` that projects to
+        // `Impossible`.  Substitute a template field's type with the exact
+        // key's concrete type ONLY for a RAW-POINTER payload: a pointer
+        // resolves to its pointee struct root (`PyObject`) independent of
+        // spelling, so projecting it here needs no constructor to flow the
+        // value and cannot collide with a differently-spelled named-ADT
+        // payload at `generalize_attr`.  A named heap-ADT payload
+        // (`Result<_, DictKeyError>::Err`) keeps the template `Impossible`
+        // and is filled by the constructor's `setattr` under its own
+        // qualname spelling, unchanged.  Without this, a residual-return
+        // `Option<*mut PyObject>` narrowed to `SomeInstance(Some)` re-blocks
+        // its `__pos_0` payload read on an `Impossible` attr.
+        // Gated with the residual-Option narrow (mir.rs
+        // `option_residual_narrow_enabled`): the narrowed
+        // `Option<*mut PyObject>` residual result is the only consumer of the
+        // per-instantiation raw-pointer payload row today, so the two land
+        // and lift as one slice (`PYRE_OPTION_RESIDUAL_NARROW=0` restores the
+        // template-only projection).
+        if crate::front::mir::option_residual_narrow_enabled() {
+            let guard = self.pyre_struct_fields.borrow();
+            if let Some(exact) = guard.as_ref().and_then(|r| r.fields.get(n)) {
+                for (fname, fty) in &mut fields {
+                    if let Some((_, exact_ty)) = exact.iter().find(|(en, _)| en == fname) {
+                        let t = exact_ty.trim();
+                        if t.starts_with("*mut ") || t.starts_with("*const ") {
+                            *fty = exact_ty.clone();
+                        }
+                    }
+                }
+            }
+        }
         // Bare and qualified spellings of one struct intern to the
         // same canonical class — project its rows once.
         let canonical = majit_ir::descr::canonical_struct_name(n);
