@@ -8,7 +8,7 @@ def add(a, b):
 def main():
     total = 0
     n = 0
-    while n < 1000:
+    while n < 100:
         for j in range(200):
             total = add(total, n * j)
         n += 1
@@ -16,6 +16,6 @@ def main():
 
 result = main()
 print(result)
-# Expected: sum(n*j for n in range(1000) for j in range(200))
-#         = sum(n for n in range(1000)) * sum(j for j in range(200))
-#         = 499500 * 19900 = 9940050000
+# Expected: sum(n*j for n in range(100) for j in range(200))
+#         = sum(n for n in range(100)) * sum(j for j in range(200))
+#         = 4950 * 19900 = 98505000

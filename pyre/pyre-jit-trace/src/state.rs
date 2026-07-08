@@ -1957,6 +1957,12 @@ impl ConcreteValue {
 
 #[inline]
 unsafe fn is_trace_plain_int(obj: PyObjectRef) -> bool {
+    // A tagged immediate is always an exact `int` (never a subclass), so it
+    // is a plain int without the `w_class` deref below. Gated on
+    // `CAN_BE_TAGGED` (default false).
+    if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj) {
+        return true;
+    }
     if !unsafe { py_type_check(obj, &INT_TYPE) } {
         return false;
     }
