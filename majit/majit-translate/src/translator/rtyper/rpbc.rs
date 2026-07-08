@@ -4895,6 +4895,13 @@ impl Repr for MultipleFrozenPBCRepr {
         // frozendesc not in self.access_set.descs)` — the membership
         // check is skipped in the `None` (no-attrs) arm.
         //
+        // upstream's `convert_desc` does not require a FrozenDesc: in the
+        // `access_set is None` arm the fieldmap is empty and the desc is
+        // consumed only as a cache key, so an uncallable FunctionDesc
+        // routed here by `getFrozenPBCRepr` is accepted and materialises
+        // an empty zero-field instance. Only the `access_set is Some` arm
+        // reads `attrcache`, so a FrozenDesc is required there.
+        //
         // PRE-EXISTING-DEVIATION: pyre keys
         // `FrozenAttrFamily.descs` on `FrozenDesc.base.identity`
         // (counter-based DescKey) because that is the key
@@ -4902,12 +4909,17 @@ impl Repr for MultipleFrozenPBCRepr {
         // `DescEntry::desc_key()` returns the `Rc::as_ptr`-based
         // identity used elsewhere. Look up by `base.identity` so
         // membership matches what `mergeattrfamilies` populated.
-        let crate::annotator::description::DescEntry::Frozen(fd_rc) = desc else {
-            return Err(TyperError::message(format!(
-                "MultipleFrozenPBCRepr.convert_desc: non-Frozen desc {desc:?}"
-            )));
+        let fd_rc = match desc {
+            crate::annotator::description::DescEntry::Frozen(fd_rc) => Some(fd_rc),
+            _ => None,
         };
         if let Some(access_set) = &self.access_set {
+            let fd_rc = fd_rc.ok_or_else(|| {
+                TyperError::message(format!(
+                    "MultipleFrozenPBCRepr.convert_desc: access_set=Some requires a \
+                     Frozen desc, got {desc:?}"
+                ))
+            })?;
             let identity_key = fd_rc.borrow().base.identity;
             if !access_set.borrow().descs.contains_key(&identity_key) {
                 return Err(TyperError::message(format!(
@@ -4934,7 +4946,10 @@ impl Repr for MultipleFrozenPBCRepr {
 
         // upstream loop over fieldmap, writing each attr's converted
         // value into the cached pointer through brief borrow_mut bursts.
-        let frozendesc = fd_rc.clone();
+        // `fieldmap` is non-empty only in the `access_set is Some` arm,
+        // where the desc is a FrozenDesc (guarded above); `None` when
+        // access_set is None so the loop below never runs.
+        let frozendesc = fd_rc.cloned();
         let fieldmap_snapshot: Vec<(String, String, Arc<dyn Repr>)> = self
             .fieldmap
             .borrow()
@@ -4945,6 +4960,13 @@ impl Repr for MultipleFrozenPBCRepr {
             if matches!(r_value.lowleveltype(), LowLevelType::Void) {
                 continue;
             }
+            // A non-empty fieldmap only occurs on the `access_set is Some`
+            // arm, where `desc` was validated as a FrozenDesc above.
+            let frozendesc = frozendesc.as_ref().ok_or_else(|| {
+                TyperError::message(
+                    "MultipleFrozenPBCRepr.convert_desc: non-empty fieldmap requires a Frozen desc",
+                )
+            })?;
             // upstream `frozendesc.attrcache[attr]`; missing attrs
             // consult `warn_missing_attribute` and emit the same rtyper
             // warning before leaving the field unset.
@@ -7997,6 +8019,31 @@ mod pbc_repr_tests {
         assert!(
             std::sync::Arc::ptr_eq(&r1, &r2),
             "the None-access MultipleFrozenPBCRepr must be a cached singleton"
+        );
+    }
+
+    #[test]
+    fn multiple_frozen_pbc_repr_none_access_convert_desc_accepts_function_desc() {
+        // An uncallable multi-FunctionDesc PBC (each `queryattrfamily() ==
+        // None`) is routed by `getFrozenPBCRepr` to the zero-field
+        // None-access arm. upstream `MultipleFrozenPBCRepr.convert_desc`
+        // (rpbc.py:769) does not require a FrozenDesc, so converting a
+        // FunctionDesc there must succeed: the fieldmap is empty, so nothing
+        // is read off the desc and an empty `pbc` instance is materialised.
+        let (ann, rtyper) = make_rtyper();
+        let f = function_entry(&ann.bookkeeper, "func0");
+        let g = function_entry(&ann.bookkeeper, "func1");
+        let s_pbc = SomePBC::new(vec![f.clone(), g], false);
+        let r = getFrozenPBCRepr(&rtyper, &s_pbc).unwrap();
+        assert_eq!(r.class_name(), "MultipleFrozenPBCRepr");
+        Repr::setup(r.as_ref()).expect("setup");
+        let c = r
+            .convert_desc(&f)
+            .expect("None-access convert_desc must accept a FunctionDesc");
+        assert!(
+            matches!(c.value, ConstValue::LLPtr(_)),
+            "expected a zero-field pbc instance pointer, got {:?}",
+            c.value
         );
     }
 
