@@ -5725,15 +5725,34 @@ fn try_execute_residual_call_via_executor(
     // `null_or_self` (arg index 1) is a checked sentinel — `PY_NULL`
     // means "no receiver" and is never dereferenced (`bh_call_fn_impl`
     // prepends it as arg0 only when non-null), so a concrete-NULL there
-    // is the normal plain-call shape.  Same exemption as
-    // `walker_abort_if_mayforce_null_ref_arg`.
+    // is the normal plain-call shape.  These exemptions MUST match
+    // `walker_abort_if_mayforce_null_ref_arg`'s — otherwise a normal
+    // no-receiver keyword/star call is declined here to `Ok(None)`
+    // (left symbolic), which drops the recording iteration's call
+    // exactly once (`g(i, d=4)` in a hot loop summed to n-1, callee
+    // ran n-1 times).
     let is_call_fn = call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::CallFn;
+    // `bh_call_kw_N(callable, null_or_self, kwnames, args...)` — `null_or_self`
+    // (arg index 1) is the same checked `PY_NULL` sentinel.
+    let is_call_kw = call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::CallKw;
+    // `bh_call_function_ex_fn(callable, self_or_null, starargs, kwargs_or_null)`
+    // — `self_or_null` (arg 1) and `kwargs_or_null` (arg 3) are checked `PY_NULL`
+    // sentinels (never dereferenced when null), so a concrete-NULL there is the
+    // normal `f(*args)` / no-`**` shape.
+    let is_call_function_ex =
+        call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::CallFunctionEx;
     // Same `RaiseVarargs` trailing-`cause` sentinel exemption as
     // `walker_abort_if_mayforce_null_ref_arg` (gated `PYRE_FBW_RAISE`).
     let is_raise_varargs = fbw_raise_enabled()
         && call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::RaiseVarargs;
     for (i, &arg) in args.iter().enumerate() {
         if is_call_fn && i == 1 {
+            continue;
+        }
+        if is_call_kw && i == 1 {
+            continue;
+        }
+        if is_call_function_ex && (i == 1 || i == 3) {
             continue;
         }
         if is_raise_varargs && i + 1 == args.len() {
