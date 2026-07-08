@@ -1936,41 +1936,14 @@ fn rewrite_body(
                     // add a second merge-point dispatch — `driver.merge_point` guards
                     // again internally, but the closure runs only once.
                     let new_tokens: TokenStream = if let Some(state) = &args.state {
-                        // Single-pass opt-in: after the walk, if the CloseLoop
+                        // Single-pass close: after the walk, if the CloseLoop
                         // populated a walk-final (pc, reds) snapshot, transfer
                         // it into native state and resume the native loop at the
                         // close pc, skipping the body re-run. `#merge_fn` returns
-                        // `None` (so this is inert) whenever `PYRE_SINGLE_PASS` is
-                        // off or the walk did not populate reds.
+                        // `None` whenever the walk did not populate reds.
                         quote! {
                             if #driver.is_tracing() {
                                 let __mp_out = #merge_fn(&mut #driver, #env, #pc);
-                                // D2 per-opcode single-executor
-                                // (PYRE_AUTHORITATIVE): the authoritative walker
-                                // executed exactly one opcode and returned its
-                                // boundary pc. Re-derive the native scalar caches
-                                // (stacksize / selected ref) from the
-                                // walk-advanced shared storage, jump the native
-                                // loop to the boundary pc, and skip native's own
-                                // dispatch of the walked opcode. Inert (the
-                                // channel stays `None`) unless authoritative.
-                                if let Some(__next_pc) =
-                                    #driver.take_authoritative_next_pc()
-                                {
-                                    // Propagate the walk's scalar state fields
-                                    // (e.g. SEL's new `selected`) from the live
-                                    // sym into native state BEFORE recover, so
-                                    // recover re-derives the storage-backed
-                                    // caches from the current scalars.
-                                    #driver.writeback_authoritative_state_fields(
-                                        &mut #state,
-                                    );
-                                    majit_metainterp::JitState::recover_after_compiled_run(
-                                        &mut #state,
-                                    );
-                                    #pc = __next_pc;
-                                    continue;
-                                }
                                 if let Some((__sp_pc, __sp_reds)) = __mp_out
                                 {
                                     // Push the walk-mutated scalar state fields
@@ -1987,8 +1960,7 @@ fn rewrite_body(
                                     // caches from the current scalars) and
                                     // `try_resume_into_compiled_loop` (which reads
                                     // the native scalars to seed the compiled
-                                    // loop). Mirrors the authoritative branch's
-                                    // ordering. No-op with no scalar state fields
+                                    // loop). No-op with no scalar state fields
                                     // or no live sym.
                                     #driver.writeback_authoritative_state_fields(
                                         &mut #state,

@@ -1382,23 +1382,14 @@ impl<S: JitState> JitDriver<S> {
         self.meta.single_pass_outcome.take()
     }
 
-    /// D2 per-opcode single-executor: take the boundary pc stashed by the
-    /// `OpcodeComplete` arm of `merge_point`. `Some(next_pc)` means the
-    /// authoritative walker executed one opcode; the native loop assigns it to
-    /// `pc` and skips its own dispatch of that opcode. `None` otherwise.
-    #[inline]
-    pub fn take_authoritative_next_pc(&mut self) -> Option<usize> {
-        self.meta.authoritative_next_pc.take()
-    }
-
     /// Push the walk's scalar state fields from the still-live persistent sym
     /// back into native `state`. The walk advances a scalar (notably a SEL's
     /// new `selected`) on the sym only; native `state` stays at its trace-start
-    /// value until this write-back. No-op when no sym is live. Called from both
-    /// single-executor `jit_merge_point!` branches (per-opcode authoritative and
-    /// whole-circuit single-pass), before `recover_after_compiled_run` so
-    /// recover refines the storage-derived caches (e.g. stacksize from the
-    /// now-current selected) from the written-back scalars.
+    /// value until this write-back. No-op when no sym is live. Called from the
+    /// whole-circuit single-pass `jit_merge_point!` branch, before
+    /// `recover_after_compiled_run` so recover refines the storage-derived
+    /// caches (e.g. stacksize from the now-current selected) from the
+    /// written-back scalars.
     #[inline]
     pub fn writeback_authoritative_state_fields(&self, state: &mut S) {
         if let Some(sym) = self.sym.as_ref() {
@@ -1507,13 +1498,11 @@ impl<S: JitState> JitDriver<S> {
                 if let Some(hp) = loop_header_pc {
                     self.meta.record_loop_header_pc(k, hp);
                 }
-                // Single-pass: stash the just-compiled loop's key so the
-                // merge-point hook can directly enter it with the walk-final
-                // state instead of re-interpreting the walked body
-                // (cross-loop-cut: this is cut_inner_green_key).
-                if crate::single_pass_enabled() {
-                    self.meta.single_pass_compiled_key = Some(k);
-                }
+                // Stash the just-compiled loop's key so the merge-point hook
+                // can directly enter it with the walk-final state instead of
+                // re-interpreting the walked body (cross-loop-cut: this is
+                // cut_inner_green_key).
+                self.meta.single_pass_compiled_key = Some(k);
             }
         }
         outcome
@@ -1802,33 +1791,32 @@ impl<S: JitState> JitDriver<S> {
                 return;
             }
             TraceAction::CloseLoop => {
-                // Single-pass tracing: snapshot the walk-final (pc, reds) off
-                // the active TraceCtx BEFORE `compile_loop` (below) drains it,
-                // stashing onto the MetaInterp so the `__merge` wrapper can
-                // read it after the trace closes. `None` outside single-pass
-                // and whenever the walk did not populate the reds.
-                if crate::single_pass_enabled() {
-                    // Resume pc is the walk-final green pc the dispatch stashed
-                    // (an interpreter program pc, NOT the JitCode op cursor). The
-                    // reds vector published here is INTENTIONALLY empty. The
-                    // merge-point hook transfers walk-final loop state without it:
-                    // scalar state fields (e.g. selected) are written back from
-                    // the live sym by `writeback_authoritative_state_fields`, then
-                    // `recover` re-derives the storage-backed cache fields
-                    // (stacksize, storage refs) from the walk-advanced shared
-                    // storage. `dispatch` does populate `ctx.walk_final_reds` from
-                    // the merge point's red-operand slots, but that register-bank
-                    // snapshot is NOT a valid `restore_values` source for the
-                    // state-field model — those slots are type-grouped operand
-                    // order, not `collect_jump_args` order, and include reds (e.g.
-                    // floats) with no state-field target, so restoring them would
-                    // write the wrong values. A JIT whose merge point carries real
-                    // red operands would instead source reds here, but none that
-                    // close exist today.
-                    let pc = self.meta.trace_ctx().and_then(|ctx| ctx.walk_final_pc);
-                    if let Some(p) = pc {
-                        self.meta.single_pass_outcome = Some((p, Vec::new()));
-                    }
+                // Snapshot the walk-final (pc, reds) off the active TraceCtx
+                // BEFORE `compile_loop` (below) drains it, stashing onto the
+                // MetaInterp so the `__merge` wrapper can read it after the
+                // trace closes. `None` whenever the walk did not populate the
+                // reds.
+                //
+                // Resume pc is the walk-final green pc the dispatch stashed
+                // (an interpreter program pc, NOT the JitCode op cursor). The
+                // reds vector published here is INTENTIONALLY empty. The
+                // merge-point hook transfers walk-final loop state without it:
+                // scalar state fields (e.g. selected) are written back from
+                // the live sym by `writeback_authoritative_state_fields`, then
+                // `recover` re-derives the storage-backed cache fields
+                // (stacksize, storage refs) from the walk-advanced shared
+                // storage. `dispatch` does populate `ctx.walk_final_reds` from
+                // the merge point's red-operand slots, but that register-bank
+                // snapshot is NOT a valid `restore_values` source for the
+                // state-field model — those slots are type-grouped operand
+                // order, not `collect_jump_args` order, and include reds (e.g.
+                // floats) with no state-field target, so restoring them would
+                // write the wrong values. A JIT whose merge point carries real
+                // red operands would instead source reds here, but none that
+                // close exist today.
+                let pc = self.meta.trace_ctx().and_then(|ctx| ctx.walk_final_pc);
+                if let Some(p) = pc {
+                    self.meta.single_pass_outcome = Some((p, Vec::new()));
                 }
                 // pyjitpl.py:2979-3036 reached_loop_header parity.
                 // Path 1: bridge — only if has_compiled_targets (line 2982).
@@ -2304,15 +2292,6 @@ impl<S: JitState> JitDriver<S> {
                 self.meta.abort_trace(true);
                 self.sym = None;
                 self.meta.clear_trace_session();
-            }
-            TraceAction::OpcodeComplete { next_pc } => {
-                // D2 per-opcode single-executor: the walker executed one opcode
-                // and returned its boundary pc. The trace session stays alive
-                // (NOT drained/compiled) — accumulation continues on the next
-                // merge_point call. Stash the boundary pc so the
-                // `jit_merge_point!` macro expansion advances the native loop
-                // there and skips its own dispatch of the walked opcode.
-                self.meta.authoritative_next_pc = Some(next_pc);
             }
         }
     }

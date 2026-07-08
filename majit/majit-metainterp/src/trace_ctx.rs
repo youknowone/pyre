@@ -347,11 +347,11 @@ pub struct TraceCtx {
     /// `MetaInterp::walk_active_trace_refs`. Used by cut_trace_from to
     /// remap escaped original inputargs to their stable Const value.
     pub initial_inputarg_consts: Vec<OpRef>,
-    /// Single-pass tracing (`PYRE_SINGLE_PASS`): the resume-aligned bytecode
-    /// pc the walk closed back to, captured at the CloseLoop decision point
-    /// in the JitCode dispatch. `None` for every trace unless single-pass
-    /// populated it. Surfaced through `MetaInterp::single_pass_outcome` (set
-    /// before `compile_loop` drains the ctx) to the gated merge-point hook.
+    /// Single-pass tracing: the resume-aligned bytecode pc the walk closed
+    /// back to, captured at the CloseLoop decision point in the JitCode
+    /// dispatch. `None` until the walk populates it. Surfaced through
+    /// `MetaInterp::single_pass_outcome` (set before `compile_loop` drains the
+    /// ctx) to the merge-point hook.
     pub walk_final_pc: Option<usize>,
     /// Single-pass tracing: the walk-final concrete RED values captured from
     /// the closing merge point's red operands (their live `int_values` /

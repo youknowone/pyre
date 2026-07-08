@@ -4,8 +4,8 @@ mod frame;
 pub use dispatch::build_state_field_snapshot;
 pub use dispatch::{
     ClosureRuntime, ClosureRuntimeWithResolver, JitCodeMachine, JitCodeRuntime, JitCodeSym,
-    StandaloneFrameStack, authoritative_executor_enabled, single_pass_enabled,
-    struct_field_write_effect_info, trace_jitcode, trace_jitcode_with_args,
+    StandaloneFrameStack, struct_field_write_effect_info, trace_jitcode,
+    trace_jitcode_with_args,
     trace_jitcode_with_args_and_runtime,
 };
 pub use dispatch::{build_vable_snapshot_boxes, build_vref_snapshot_boxes};
@@ -1061,11 +1061,11 @@ pub struct MetaInterp<M: Clone> {
     /// a loop compiles; queried at `start_bridge_tracing`.
     pub(crate) loop_header_pcs: indexmap::IndexMap<u64, usize>,
     pub(crate) tracing: Option<TraceCtx>,
-    /// Single-pass tracing (`PYRE_SINGLE_PASS`): the `(walk_final_pc,
-    /// walk_final_reds)` snapshot copied off the active `TraceCtx` at the
-    /// CloseLoop point BEFORE `compile_loop` drains the ctx, so the
-    /// merge-point hook can read it after the trace closes. `take`n by the
-    /// `__merge` wrapper. `None` outside single-pass.
+    /// Single-pass tracing: the `(walk_final_pc, walk_final_reds)` snapshot
+    /// copied off the active `TraceCtx` at the CloseLoop point BEFORE
+    /// `compile_loop` drains the ctx, so the merge-point hook can read it
+    /// after the trace closes. `take`n by the `__merge` wrapper. `None` when
+    /// the walk did not populate the reds.
     pub(crate) single_pass_outcome: Option<(usize, Vec<Value>)>,
     /// Single-pass tracing: the green key the CloseLoop arm compiled the
     /// (cross-loop-cut) inner loop under, captured after a `Compiled`
@@ -1075,14 +1075,6 @@ pub struct MetaInterp<M: Clone> {
     /// iteration N+1 onward (the walk's draw was the peeled preamble).
     /// `None` outside single-pass or when compilation did not succeed.
     pub(crate) single_pass_compiled_key: Option<u64>,
-    /// D2 per-opcode single-executor (`PYRE_AUTHORITATIVE`): the boundary pc
-    /// carried by a `TraceAction::OpcodeComplete` — the interpreter pc the
-    /// authoritative walker advanced to after executing exactly one opcode.
-    /// Set by `jitdriver::merge_point`'s OpcodeComplete arm, `take`n by the
-    /// `__merge` wrapper's caller so the native loop assigns it to `pc` and
-    /// skips its own dispatch of the walked opcode. `None` outside
-    /// authoritative mode.
-    pub(crate) authoritative_next_pc: Option<usize>,
     pub(crate) next_trace_id: u64,
     /// JIT hooks for profiling and debugging.
     pub(crate) hooks: JitHooks,
@@ -2270,7 +2262,6 @@ impl<M: Clone> MetaInterp<M> {
             tracing: None,
             single_pass_outcome: None,
             single_pass_compiled_key: None,
-            authoritative_next_pc: None,
             next_trace_id: 1,
             hooks: JitHooks::default(),
             pending_token: None,

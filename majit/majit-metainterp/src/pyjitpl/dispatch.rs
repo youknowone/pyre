@@ -15,41 +15,6 @@ use crate::jitcode::insns::MAX_HOST_CALL_ARITY;
 use crate::jitcode::{self, JitArgKind, JitCallArg, JitCallTarget, JitCode, JitCodeRuntimeExt};
 use crate::{TraceAction, TraceCtx};
 
-/// Single-pass tracing: when set, on CloseLoop the walk's final state is
-/// transferred into native state at the merge-point hook and the native loop
-/// resumes into the compiled loop, skipping the walked span's re-run.
-/// Default-off: the native body re-runs the walked span after the walk closes.
-/// Read once.
-pub fn single_pass_enabled() -> bool {
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("PYRE_SINGLE_PASS").is_some())
-}
-
-/// pyjitpl.py:3018-3060 reached_loop_header parity for a NESTED inner loop:
-/// when the JitCode dispatch walk re-reaches a non-header merge point whose
-/// green key it already visited, close the loop there (cross-loop cut) instead
-/// of spinning to the trace limit. Gated for incremental bring-up; single-pass
-/// (`single_pass_enabled`) implies it so the close + reds transfer move
-/// together.
-pub fn inner_close_enabled() -> bool {
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| single_pass_enabled() || std::env::var_os("PYRE_INNER_CLOSE").is_some())
-}
-
-/// Walker-as-tracer (`PYRE_AUTHORITATIVE`): when set, the `run_to_end` walk is
-/// the SOLE authoritative executor for a trace — residual calls execute exactly
-/// once during the walk and the outer mainloop must neither replay them nor
-/// re-run the walked span. Parity target: `pyre-jit-trace`
-/// `WalkContext::is_authoritative_executor` + `production_walker_handles`
-/// (the eval loop skips `execute_opcode_step` for walker-handled opcodes).
-/// Default-off. This is the incremental bring-up gate for the per-opcode seam
-/// rewrite; on its own the native-side walked-span skip must land before it is
-/// correct end-to-end.
-pub fn authoritative_executor_enabled() -> bool {
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("PYRE_AUTHORITATIVE").is_some())
-}
-
 /// Decode a virtualizable shadow Value (RPython Box concrete) back into the
 /// raw int/ref/float bit pattern that pyre stores in register shadows
 /// (`frame.int_values`, `frame.ref_values`, `frame.float_values`).
@@ -812,15 +777,6 @@ pub struct JitCodeMachine<'mi, S, R> {
     /// because the previous arm's `BC_LOOP_HEADER` handler stamped it.
     /// Pyre's typed `i32` mirrors RPython's `int` (sentinel `-1`).
     seen_loop_header_for_jdindex: i32,
-    /// D2 per-opcode single-executor: within one `run_to_end` call under
-    /// `authoritative_executor_enabled()`, the machine enters at the current
-    /// opcode's merge point (the ENTRY MP) and must stop at the NEXT
-    /// non-closing merge point (the BOUNDARY MP) after executing exactly one
-    /// opcode. This flag distinguishes them: `false` until the entry MP is
-    /// passed, then `true`; the boundary MP returns
-    /// `TraceAction::OpcodeComplete`. Reset at the top of every `run_to_end`.
-    /// Inert unless authoritative.
-    authoritative_seen_entry_mp: bool,
     marker: PhantomData<(S, R)>,
 }
 
@@ -1403,7 +1359,6 @@ where
             outer_program_pc: None,
             // pyjitpl.py:2882 / :2916 — sentinel "no loop_header seen yet".
             seen_loop_header_for_jdindex: -1,
-            authoritative_seen_entry_mp: false,
             marker: PhantomData,
         }
     }
@@ -1809,10 +1764,6 @@ where
             .outer_program_pc
             .unwrap_or_else(|| self.frames.current_mut().pc);
         sym.begin_portal_op(portal_pc);
-        // D2 per-opcode single-executor: each `run_to_end` call walks exactly
-        // one opcode under authoritative mode, so the entry-vs-boundary
-        // merge-point flag starts fresh every call.
-        self.authoritative_seen_entry_mp = false;
         // Safety backstop against a runaway trace-recording loop.  A
         // jitcode-level cycle that re-steps without growing the recorded op
         // list never trips `is_too_long` (which counts ops), so the
@@ -1893,11 +1844,7 @@ where
                     );
                 }
                 match action {
-                    // OpcodeComplete = a successful one-opcode boundary (D2), not
-                    // an abort: commit the portal op like a normal close.
-                    TraceAction::CloseLoop | TraceAction::OpcodeComplete { .. } => {
-                        sym.commit_portal_op()
-                    }
+                    TraceAction::CloseLoop => sym.commit_portal_op(),
                     _ => sym.abort_portal_op(),
                 }
                 return action;
@@ -3670,11 +3617,11 @@ where
                 let mut mp_green_refs: Vec<i64> = Vec::new();
                 let mut mp_green_floats: Vec<i64> = Vec::new();
                 // Single-pass tracing: the walk closes back to an interpreter
-                // program pc; capture it (below, gated) so the merge-point hook
-                // can resume the native loop there. Gated so the
-                // observer/replay path pays nothing.
-                let capture_walk_reds = single_pass_enabled();
-                let inner_close = inner_close_enabled();
+                // program pc; capture it (below) so the merge-point hook can
+                // resume the native loop there. The walk is the sole executor,
+                // so the close always transfers walk-final state.
+                let capture_walk_reds = true;
+                let inner_close = true;
                 // pyjitpl.py:3060 reached_loop_header `current_merge_points.append`:
                 // the live arg boxes (greens slots 0..3 + reds slots 3..6, in
                 // operand order) at this merge point. A NESTED inner-loop revisit
@@ -4056,9 +4003,7 @@ where
                             let header_pc = ctx.header_pc;
                             let inner_key =
                                 crate::green_key_from_code_ptr(ctx.green_key_raw.0, pc as usize);
-                            if ctx.has_merge_point_at(inner_key, header_pc)
-                                && std::env::var_os("PYRE_NO_INNER_CLOSE").is_none()
-                            {
+                            if ctx.has_merge_point_at(inner_key, header_pc) {
                                 if std::env::var_os("MAJIT_SPDIAG").is_some() {
                                     eprintln!(
                                         "@@@SPDIAG INNER-CUT-CLOSE pc={pc} header_pc={header_pc} inner_key={inner_key} walk_reds={walk_reds:?}"
@@ -4141,27 +4086,6 @@ where
                             }
                             ctx.add_merge_point(inner_key, original_boxes, header_pc);
                         }
-                    }
-                }
-                // D2 per-opcode single-executor (PYRE_AUTHORITATIVE): reaching
-                // here means every loop-close check above declined (a closing
-                // merge point already returned CloseLoop). A non-closing merge
-                // point is an interpreter-opcode boundary. The FIRST such point
-                // in this run_to_end call is the ENTRY (the opcode about to
-                // execute) — mark it and keep tracing the body. The NEXT is the
-                // BOUNDARY reached after exactly one opcode — return its
-                // interpreter green pc so the native loop advances pc there and
-                // skips re-dispatching the walked opcode. Inert (falls through
-                // to Continue) unless authoritative.
-                if authoritative_executor_enabled() {
-                    if self.authoritative_seen_entry_mp {
-                        if let Some(pc) = mp_green_pc {
-                            return TraceAction::OpcodeComplete {
-                                next_pc: pc as usize,
-                            };
-                        }
-                    } else {
-                        self.authoritative_seen_entry_mp = true;
                     }
                 }
             }
