@@ -9152,16 +9152,36 @@ pub(crate) fn m73_liveness_audit_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_M73_LIVENESS_AUDIT").is_some())
 }
 
-/// `PYRE_M73_ANCHOR_AUDIT` enables the assertion that the walk-maintained
-/// `-live-` BEFORE anchor (`ctx.live_before_jit_pc`, updated from every
-/// decoded `-live-` op) equals the py-keyed resume marker the encoder
-/// resolves via `resume_jitcode_pc_for(py_pc)` at the normal-family guard arm
-/// (`pyjitpl.py:198`, normal guard resume reads at `self.pc - SIZE_LIVE_OP`).
-/// Certifies the precondition for re-sourcing that marker off the walk-level
-/// cursor without the py_pc channel. Diagnostic only; off in production.
-pub(crate) fn m73_anchor_audit_enabled() -> bool {
+/// `PYRE_M73_PEROP_AUDIT` (#73 S2, default OFF): census that, for a
+/// specialization guard (`GuardValue`/`GuardClass`), measures whether the
+/// walk-maintained per-op `-live-` BEFORE anchor (`ctx.live_before_jit_pc`,
+/// `pyjitpl.py:198`) decodes IDENTICALLY to the block-head marker
+/// (`resume_jitcode_pc_for(py_pc)`) across EVERY consumer of the carried
+/// resume word — the liveness banks (resolver-funneled) AND the
+/// coordinate-sensitive `bridge_semantic_maps_at_with_jitcode_pc` (depth +
+/// pcdep) and `const_ref_slots_at_pc_at` (const refill), which invert the
+/// carried offset back to a `py_pc` and index py_pc-keyed tables. Emits one
+/// `M73_PEROP_SPEC` line per specialization capture: `eq=1` when the per-op
+/// anchor coincides with the block-head marker (carry is a byte-identical
+/// re-source), `eq=0 banks_eq=.. bmaps_eq=.. const_eq=..` when it differs
+/// (each consumer certified independently), or `eq=nolb`/`eq=nomarker` edge
+/// cases. Off in production.
+pub(crate) fn m73_perop_audit_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("PYRE_M73_ANCHOR_AUDIT").is_some())
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_M73_PEROP_AUDIT").is_some())
+}
+
+/// `PYRE_M73_PEROP_CARRY` (#73 S2, default OFF): source a specialization
+/// guard's (`GuardValue`/`GuardClass`) resume coordinate from the walk
+/// cursor's per-op `-live-` BEFORE anchor (`ctx.live_before_jit_pc`,
+/// `pyjitpl.py:198`) instead of the py_pc-keyed `resume_jitcode_pc_for(py_pc)`
+/// block-head marker — the genuine JitCode cursor the migration authors resume
+/// data from. Byte-identical where the anchor coincides with the marker
+/// (99%+ of the corpus per the `PYRE_M73_PEROP_AUDIT` census); the divergent
+/// minority is gated by check.py output equality. Off in production.
+pub(crate) fn m73_perop_carry_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_M73_PEROP_CARRY").is_some())
 }
 
 pub(crate) fn python_pc_for_jitcode_pc(metadata: &crate::PyJitCodeMetadata, jit_pc: usize) -> u32 {
@@ -10501,24 +10521,98 @@ fn walker_capture_snapshot_for_last_guard_impl(
                     let jc = &*sym.jitcode;
                     jc.payload.resume_jitcode_pc_for(py_pc as usize)
                 };
-                // #73 (SLICE 1): certificate for the later cursor flip (S3).
-                // The walk-maintained `-live-` BEFORE anchor must equal the
-                // py-keyed resume marker the encoder resolves here
-                // (`pyjitpl.py:198`).  Read-only: `marker` is still consumed
-                // unchanged by the match below.
-                if m73_anchor_audit_enabled() && ctx.live_before_jit_pc != usize::MAX {
-                    debug_assert_eq!(
-                        Some(ctx.live_before_jit_pc),
-                        marker,
-                        "#73 anchor mismatch: live_before={} py_pc={} marker={:?}",
-                        ctx.live_before_jit_pc,
-                        py_pc,
-                        marker
+                // #73 S2 census: for a specialization guard measure whether the
+                // per-op `-live-` BEFORE anchor (`ctx.live_before_jit_pc`,
+                // `pyjitpl.py:198`) decodes IDENTICALLY to the block-head marker
+                // across EVERY consumer of the carried resume word. The banks
+                // reader funnels through the carried-word resolver (safe at any
+                // `-live-` offset), but `bridge_semantic_maps_at_with_jitcode_pc`
+                // (depth + pcdep) and `const_ref_slots_at_pc_at` (const refill)
+                // invert the carried offset to a `py_pc` via the two-tier
+                // `python_pc_for_jitcode_pc` and index py_pc-keyed tables, so a
+                // per-op offset that is not a block head can invert to a DIFFERENT
+                // `py_pc`. The per-op carry is byte-behavior-safe only where all
+                // consumers agree; this census is the precondition certificate.
+                // Read-only: `marker` is consumed unchanged by the match below.
+                if m73_perop_audit_enabled() {
+                    let is_specialization = matches!(
+                        ctx.trace_ctx.last_guard_opcode(),
+                        Some(OpCode::GuardValue | OpCode::GuardClass)
                     );
+                    if is_specialization {
+                        match marker {
+                            None => {
+                                eprintln!("M73_PEROP_SPEC eq=nomarker py_pc={}", py_pc);
+                            }
+                            Some(bh) if ctx.live_before_jit_pc == usize::MAX => {
+                                eprintln!("M73_PEROP_SPEC eq=nolb py_pc={} bh={}", py_pc, bh);
+                            }
+                            Some(bh) if ctx.live_before_jit_pc == bh => {
+                                eprintln!("M73_PEROP_SPEC eq=1 py_pc={} bh={}", py_pc, bh);
+                            }
+                            Some(bh) => {
+                                // per-op `-live-` differs from the block-head marker:
+                                // measure whether EVERY consumer of the carried word
+                                // decodes identically at the two offsets.
+                                let lb = ctx.live_before_jit_pc as i32;
+                                let no = majit_ir::resumedata::NO_JITCODE_PC;
+                                let ji = jitcode_index as i32;
+                                let pp = py_pc as i32;
+                                let banks_p =
+                                    crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
+                                        ji, pp, lb,
+                                    );
+                                let banks_b =
+                                    crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
+                                        ji, pp, no,
+                                    );
+                                let banks_eq = banks_p.int == banks_b.int
+                                    && banks_p.ref_ == banks_b.ref_
+                                    && banks_p.float == banks_b.float;
+                                let bm_p = crate::state::bridge_semantic_maps_at_with_jitcode_pc(
+                                    ji, pp, lb,
+                                );
+                                let bm_b = crate::state::bridge_semantic_maps_at_with_jitcode_pc(
+                                    ji, pp, no,
+                                );
+                                let bmaps_eq = bm_p.stack_depth_at_pc == bm_b.stack_depth_at_pc
+                                    && bm_p.pcdep_entries == bm_b.pcdep_entries;
+                                let const_eq = crate::state::const_ref_slots_at_pc_at(ji, pp, lb)
+                                    == crate::state::const_ref_slots_at_pc_at(ji, pp, no);
+                                eprintln!(
+                                    "M73_PEROP_SPEC eq=0 py_pc={} lb={} bh={} banks_eq={} \
+                                     bmaps_eq={} const_eq={}",
+                                    py_pc, lb, bh, banks_eq, bmaps_eq, const_eq
+                                );
+                            }
+                        }
+                    }
                 }
-                match marker {
-                    Some(jp) => jp as i32,
-                    None => majit_ir::resumedata::NO_JITCODE_PC,
+                // #73 S2 flip (`PYRE_M73_PEROP_CARRY`, default OFF): a
+                // specialization guard (`GuardValue`/`GuardClass`) sources its
+                // resume coordinate from the walk cursor's per-op `-live-`
+                // BEFORE anchor (`ctx.live_before_jit_pc`, `pyjitpl.py:198`)
+                // directly, dropping the py_pc-keyed `resume_jitcode_pc_for`
+                // lookup. Requires a stepped `-live-` and a resolvable
+                // block-head marker (else keep the baseline, byte-identical).
+                // The `PYRE_M73_PEROP_AUDIT` census certifies both offsets
+                // decode identically for every consumer (banks + bridge maps +
+                // const refill) where the anchor coincides, and flags the
+                // divergent minority for the check.py output-equality gate.
+                if m73_perop_carry_enabled()
+                    && marker.is_some()
+                    && ctx.live_before_jit_pc != usize::MAX
+                    && matches!(
+                        ctx.trace_ctx.last_guard_opcode(),
+                        Some(OpCode::GuardValue | OpCode::GuardClass)
+                    )
+                {
+                    ctx.live_before_jit_pc as i32
+                } else {
+                    match marker {
+                        Some(jp) => jp as i32,
+                        None => majit_ir::resumedata::NO_JITCODE_PC,
+                    }
                 }
             } else if m366_nonbranch_pc_enabled() && after_residual_call {
                 // #366: extend the direct-pc carry to the after-residual-call
