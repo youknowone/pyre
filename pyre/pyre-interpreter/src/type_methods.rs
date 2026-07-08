@@ -881,23 +881,13 @@ pub fn str_method_rfind(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 pub fn str_method_upper(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_no_args(args, "upper")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
-    let out = wtf8_map_chars(s, |c, out| {
-        for u in c.to_uppercase() {
-            out.push_char(u);
-        }
-    });
-    Ok(w_str_from_wtf8(out))
+    Ok(w_str_from_wtf8(wtf8_map_str_runs(s, str::to_uppercase)))
 }
 
 pub fn str_method_lower(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_no_args(args, "lower")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
-    let out = wtf8_map_chars(s, |c, out| {
-        for l in c.to_lowercase() {
-            out.push_char(l);
-        }
-    });
-    Ok(w_str_from_wtf8(out))
+    Ok(w_str_from_wtf8(wtf8_map_str_runs(s, str::to_lowercase)))
 }
 
 /// PyPy: unicodeobject.py descr_format
@@ -2550,6 +2540,32 @@ fn wtf8_map_chars(s: &Wtf8, f: impl Fn(char, &mut Wtf8Buf)) -> Wtf8Buf {
             Some(c) => f(c, &mut out),
             None => out.push(cp),
         }
+    }
+    out
+}
+
+/// Apply a whole-string case transform (`str::to_lowercase` / `to_uppercase`)
+/// to each maximal valid-UTF-8 run of `s`, passing lone surrogates through
+/// unchanged.  Operating on the run rather than each scalar preserves the
+/// context rules those transforms encode — notably the Greek Final_Sigma
+/// (`Σ` → `ς` word-finally, `σ` elsewhere).
+fn wtf8_map_str_runs(s: &Wtf8, f: impl Fn(&str) -> String) -> Wtf8Buf {
+    let mut out = Wtf8Buf::with_capacity(s.len());
+    let mut run = String::new();
+    for cp in s.code_points() {
+        match cp.to_char() {
+            Some(c) => run.push(c),
+            None => {
+                if !run.is_empty() {
+                    out.push_str(&f(&run));
+                    run.clear();
+                }
+                out.push(cp);
+            }
+        }
+    }
+    if !run.is_empty() {
+        out.push_str(&f(&run));
     }
     out
 }
