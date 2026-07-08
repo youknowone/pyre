@@ -486,9 +486,9 @@ fn ga_make_starred(args: &[PyObjectRef]) -> crate::PyResult {
 /// same callable identity.
 pub(crate) fn make_starred_fn() -> PyObjectRef {
     static MAKE_STARRED_FN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *MAKE_STARRED_FN.get_or_init(|| {
-        make_builtin_function("_make_starred", ga_make_starred) as usize
-    }) as PyObjectRef
+    *MAKE_STARRED_FN
+        .get_or_init(|| make_builtin_function("_make_starred", ga_make_starred) as usize)
+        as PyObjectRef
 }
 
 /// `GenericAlias.__reduce__` (`_pypy_generic_alias.py:96`).

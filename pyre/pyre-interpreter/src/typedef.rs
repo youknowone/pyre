@@ -5307,10 +5307,7 @@ fn getset_descriptor_type() -> pyre_object::PyObjectRef {
         // pass can race the first GetSetProperty alloc.
         // Setting it eagerly here keeps `w_class` non-null for
         // every descriptor regardless of allocation order.
-        pyre_object::pyobject::set_instantiate(
-            &pyre_object::typedef::GETSET_DESCRIPTOR_TYPE,
-            tp,
-        );
+        pyre_object::pyobject::set_instantiate(&pyre_object::typedef::GETSET_DESCRIPTOR_TYPE, tp);
         tp as usize
     }) as pyre_object::PyObjectRef
 }
