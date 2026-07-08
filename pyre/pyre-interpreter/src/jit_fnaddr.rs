@@ -617,8 +617,7 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     let lookup_in_type_where_uncached: unsafe fn(
         pyre_object::PyObjectRef,
         &str,
-    ) -> Option<pyre_object::PyObjectRef> =
-        crate::baseobjspace::lookup_in_type_where_uncached;
+    ) -> Option<pyre_object::PyObjectRef> = crate::baseobjspace::lookup_in_type_where_uncached;
     push_alias_pair(
         &mut entries,
         "pyre_interpreter::baseobjspace::lookup_in_type_where_uncached",
