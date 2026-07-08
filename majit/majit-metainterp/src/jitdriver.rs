@@ -1783,7 +1783,14 @@ impl<S: JitState> JitDriver<S> {
         match action {
             TraceAction::Continue => {}
             TraceAction::CompileTrace => {
-                self.meta.abort_trace(false);
+                // Successful compile-into-existing-target: raise_if_successful()
+                // raises ContinueRunningNormally (pyjitpl.py:3095-3123), which
+                // bypasses the `except SwitchToBlackhole` handler, so only the
+                // live history teardown runs — `aborted_tracing` accounting is
+                // NOT reached on success (the loop/bridge counter was already
+                // bumped at backend-compile time). Call the live-teardown half
+                // only, not the accounting half.
+                self.meta.abort_trace_live(false);
                 self.sym = None;
                 self.meta.clear_trace_session();
                 self.compile_trace_success = true;
@@ -1906,7 +1913,10 @@ impl<S: JitState> JitDriver<S> {
                                         continue_running_normally_values,
                                         None,
                                     );
-                                    self.meta.abort_trace(false);
+                                    // Success edge: live teardown only, no
+                                    // aborted_tracing accounting (see the
+                                    // CompileTrace arm above).
+                                    self.meta.abort_trace_live(false);
                                     return;
                                 }
                                 // pyjitpl.py:2993-3007: after retrace_needed(),
@@ -2060,7 +2070,10 @@ impl<S: JitState> JitDriver<S> {
                                     continue_running_normally_values,
                                     loop_header_pc,
                                 );
-                                self.meta.abort_trace(false);
+                                // Success edge: live teardown only, no
+                                // aborted_tracing accounting (see the
+                                // CompileTrace arm above).
+                                self.meta.abort_trace_live(false);
                                 return;
                             }
                             // pyjitpl.py:2993-3007: after retrace_needed(),
@@ -2440,7 +2453,11 @@ impl<S: JitState> JitDriver<S> {
                 let (continue_running_normally_values, continue_running_normally_pc) = self
                     .take_continue_running_normally_payload()
                     .map_or((None, None), |(values, pc)| (Some(values), pc));
-                self.meta.abort_trace(false);
+                // Re-observing a success the CompileTrace arm already tore down
+                // (compile_trace_success flag). Live teardown only — the
+                // accounting must not fire (it would double-count a single
+                // successful compile as two aborts).
+                self.meta.abort_trace_live(false);
                 self.sym = None;
                 self.meta.clear_trace_session();
                 return Some(DetailedDriverRunOutcome::Jump {
