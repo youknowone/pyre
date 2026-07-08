@@ -2041,6 +2041,17 @@ impl Bookkeeper {
             seen.insert(cur.rsplit("::").next().unwrap_or(&cur).to_string());
             chain.push(cur.clone());
             let next = self.pyre_struct_fields.borrow().as_ref().and_then(|reg| {
+                // A constructor mints its class under the dot-joined,
+                // crate-included qualname (`pyre_object.intobject.
+                // W_IntObject`, flowspace_adapter `SyntheticTransparentCtor`
+                // arm), but `struct_fields` is keyed by the `::` `name_path`
+                // (`pyre_object::intobject::W_IntObject`) and the bare leaf.
+                // Reduce `.`→`::` for the registry lookups ONLY, so the
+                // header chain resolves the base for a dot-joined ctor
+                // qualname too — the classdef cache key (`key` above) keeps
+                // the raw spelling, so this seeds the base without collapsing
+                // the ctor class onto the `::`-spelled field-read class.
+                let lookup = cur.replace('.', "::");
                 // An enum-variant key `{enum_base}::{variant}` subclasses its
                 // enum base — the discriminant-only sum-type root
                 // (`rclass.py:82-88`).  Checked before the header convention
@@ -2050,13 +2061,13 @@ impl Bookkeeper {
                 // `struct_fields` key including the variant keys, would mint
                 // the variant base-less, and first-mint-wins would freeze
                 // that, dropping the subclass link the narrowing relies on.
-                if let Some((parent, _variant)) = cur.rsplit_once("::") {
+                if let Some((parent, _variant)) = lookup.rsplit_once("::") {
                     let parent_leaf = parent.rsplit("::").next().unwrap_or(parent);
                     if reg.is_enum_base(parent) && !seen.contains(parent_leaf) {
                         return Some(parent.to_string());
                     }
                 }
-                let (first_name, first_ty) = reg.fields.get(&cur)?.first()?;
+                let (first_name, first_ty) = reg.fields.get(&lookup)?.first()?;
                 // Only header-conventional first fields mark subclassing
                 // (`ob_header: PyObject` / `base: FrameBlock`).  A
                 // by-value first field of another registered type is
