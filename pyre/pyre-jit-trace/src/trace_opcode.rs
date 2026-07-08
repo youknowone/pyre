@@ -5111,8 +5111,7 @@ impl MIFrame {
                     let o = r.as_usize() as PyObjectRef;
                     if !o.is_null() {
                         if pyre_object::tagged_int::is_tagged_int(o) {
-                            let lowbit =
-                                crate::helpers::emit_tag_lowbit_test(ctx, int_obj, true);
+                            let lowbit = crate::helpers::emit_tag_lowbit_test(ctx, int_obj, true);
                             self.generate_guard(ctx, OpCode::GuardTrue, &[lowbit]);
                             let untagged = crate::helpers::emit_untag_int(
                                 ctx,
@@ -5122,8 +5121,7 @@ impl MIFrame {
                             self.implement_guard_value(ctx, untagged, expected);
                             return;
                         } else {
-                            let lowbit =
-                                crate::helpers::emit_tag_lowbit_test(ctx, int_obj, false);
+                            let lowbit = crate::helpers::emit_tag_lowbit_test(ctx, int_obj, false);
                             self.generate_guard(ctx, OpCode::GuardFalse, &[lowbit]);
                         }
                     }
@@ -5203,8 +5201,7 @@ impl MIFrame {
                     let o = r.as_usize() as PyObjectRef;
                     if !o.is_null() {
                         if pyre_object::tagged_int::is_tagged_int(o) {
-                            let lowbit =
-                                crate::helpers::emit_tag_lowbit_test(ctx, int_obj, true);
+                            let lowbit = crate::helpers::emit_tag_lowbit_test(ctx, int_obj, true);
                             self.generate_guard(ctx, OpCode::GuardTrue, &[lowbit]);
                             return crate::helpers::emit_untag_int(
                                 ctx,
@@ -5212,8 +5209,7 @@ impl MIFrame {
                                 pyre_object::tagged_int::untag_int(o),
                             );
                         } else {
-                            let lowbit =
-                                crate::helpers::emit_tag_lowbit_test(ctx, int_obj, false);
+                            let lowbit = crate::helpers::emit_tag_lowbit_test(ctx, int_obj, false);
                             self.generate_guard(ctx, OpCode::GuardFalse, &[lowbit]);
                         }
                     }

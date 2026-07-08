@@ -162,8 +162,11 @@ pub trait WalkerFrameOps {
                             self.implement_guard_value(untagged, expected);
                             return;
                         } else {
-                            let lowbit =
-                                crate::helpers::emit_tag_lowbit_test(self.ctx_mut(), int_obj, false);
+                            let lowbit = crate::helpers::emit_tag_lowbit_test(
+                                self.ctx_mut(),
+                                int_obj,
+                                false,
+                            );
                             self.generate_guard(OpCode::GuardFalse, &[lowbit]);
                         }
                     }

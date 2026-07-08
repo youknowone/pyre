@@ -351,6 +351,12 @@ impl Cpu for DefaultCpu {
         if gcref.is_null() {
             return 0;
         }
+        if majit_gc::is_tagged_immediate(gcref.as_usize()) {
+            // A tagged immediate has no object header to read at offset 0; report
+            // "no class" (0) so the optimizer keeps the runtime type guard instead
+            // of dereferencing. Inert when taggedpointers is disabled.
+            return 0;
+        }
         // SAFETY: caller has guaranteed `gcref` is a valid OBJECTPTR
         // payload pointer; the lltype OBJECTPTR layout has the typeptr
         // at offset 0 (model.py:200 `box.getref_base().typeptr`).
@@ -414,6 +420,12 @@ pub fn cpu_from_cls_of_box_fn(f: fn(i64) -> i64) -> Arc<dyn Cpu> {
             (self.0)(raw)
         }
         fn cls_of_gcref(&self, gcref: GcRef) -> i64 {
+            if majit_gc::is_tagged_immediate(gcref.as_usize()) {
+                // A tagged immediate has no object header to read at offset 0; report
+                // "no class" (0) so the optimizer keeps the runtime type guard instead
+                // of dereferencing. Inert when taggedpointers is disabled.
+                return 0;
+            }
             (self.0)(gcref.0 as i64)
         }
         fn bh_getfield_gc_i(&self, struct_ptr: usize, fd: &dyn FieldDescr) -> i64 {
