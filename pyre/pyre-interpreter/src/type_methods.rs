@@ -88,6 +88,21 @@ pub(crate) fn arity_at_least_positional(
     Ok(())
 }
 
+/// Validate that a str search method's substring (`args[1]`) is a `str`,
+/// else raise `TypeError("{method}() argument 1 must be str, not {type}")`.
+/// The search path reads `args[1]` as a `W_UnicodeObject`; a non-str would
+/// be dereferenced as one. `args[1]` is guaranteed present by the caller's
+/// preceding `arity_at_least(_, _, 1)`.
+pub(crate) fn require_str_sub(args: &[PyObjectRef], method: &str) -> Result<(), crate::PyError> {
+    if !unsafe { pyre_object::is_str(args[1]) } {
+        return Err(crate::PyError::type_error(format!(
+            "{method}() argument 1 must be str, not {}",
+            arg_type_name(args[1])
+        )));
+    }
+    Ok(())
+}
+
 /// TypeError for a method accepting at most `max` positional arguments after
 /// the receiver, called with more — the METH_VARARGS "X expected at most N
 /// arguments, got M" form (`list.index`, `dict.pop`).
@@ -870,11 +885,13 @@ fn wtf8_idx_window(
 
 pub fn str_method_find(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "find", 1)?;
+    require_str_sub(args, "find")?;
     Ok(w_int_new(str_unwrap_and_search(args, true)?.unwrap_or(-1)))
 }
 
 pub fn str_method_rfind(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "rfind", 1)?;
+    require_str_sub(args, "rfind")?;
     Ok(w_int_new(str_unwrap_and_search(args, false)?.unwrap_or(-1)))
 }
 
@@ -2792,6 +2809,7 @@ fn str_unwrap_and_search(
 /// PyPy: unicodeobject.py descr_count
 pub fn str_method_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "count", 1)?;
+    require_str_sub(args, "count")?;
     // Operands read as WTF-8 so lone surrogates do not panic; the optional
     // start / end arguments bound the count window over the code points.
     let s = unsafe { pyre_object::w_str_get_wtf8(args[0]) };
@@ -2809,6 +2827,7 @@ pub fn str_method_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 /// "substring not found" (ValueError).
 pub fn str_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "index", 1)?;
+    require_str_sub(args, "index")?;
     match str_unwrap_and_search(args, true)? {
         Some(i) => Ok(w_int_new(i)),
         None => Err(crate::PyError::value_error("substring not found")),
@@ -2820,6 +2839,7 @@ pub fn str_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 /// unicodeobject.py:572 descr_rindex
 pub fn str_method_rindex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "rindex", 1)?;
+    require_str_sub(args, "rindex")?;
     match str_unwrap_and_search(args, false)? {
         Some(i) => Ok(w_int_new(i)),
         None => Err(crate::PyError::value_error("substring not found")),
