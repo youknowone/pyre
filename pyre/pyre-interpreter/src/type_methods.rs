@@ -117,6 +117,24 @@ pub(crate) fn require_receiver(args: &[PyObjectRef], name: &str) -> Result<(), c
     Ok(())
 }
 
+/// Receiver-only arity for `str` methods that take no arguments (`isspace`,
+/// `lower`, …).  Rejects a missing receiver and any extra positional argument,
+/// matching `str.{name}() takes no arguments (N given)`.
+pub(crate) fn require_no_args(args: &[PyObjectRef], name: &str) -> Result<(), crate::PyError> {
+    if args.is_empty() {
+        return Err(crate::PyError::type_error(format!(
+            "descriptor '{name}' of 'str' object needs an argument"
+        )));
+    }
+    if args.len() > 1 {
+        return Err(crate::PyError::type_error(format!(
+            "str.{name}() takes no arguments ({} given)",
+            args.len() - 1
+        )));
+    }
+    Ok(())
+}
+
 // ── List methods ─────────────────────────────────────────────────────
 // All take self (list) as first arg.
 
@@ -572,7 +590,7 @@ pub fn str_method_rsplit(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 /// `CaseFolding.txt` status-C+F mapping to each scalar code point and
 /// passes lone surrogates through unchanged.
 pub fn str_method_casefold(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    require_receiver(args, "casefold")?;
+    require_no_args(args, "casefold")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     Ok(w_str_from_wtf8(case::casefold_wtf8(s)))
 }
@@ -861,7 +879,7 @@ pub fn str_method_rfind(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 }
 
 pub fn str_method_upper(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    require_receiver(args, "upper")?;
+    require_no_args(args, "upper")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let out = wtf8_map_chars(s, |c, out| {
         for u in c.to_uppercase() {
@@ -872,7 +890,7 @@ pub fn str_method_upper(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 }
 
 pub fn str_method_lower(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    require_receiver(args, "lower")?;
+    require_no_args(args, "lower")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let out = wtf8_map_chars(s, |c, out| {
         for l in c.to_lowercase() {
@@ -2537,7 +2555,7 @@ fn wtf8_map_chars(s: &Wtf8, f: impl Fn(char, &mut Wtf8Buf)) -> Wtf8Buf {
 }
 
 pub fn str_method_isdigit(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    require_receiver(args, "isdigit")?;
+    require_no_args(args, "isdigit")?;
     // A lone surrogate satisfies no character class, so a non-UTF-8
     // backing is never all-digit (and the empty string is false too).
     let s = unsafe { w_str_get_wtf8(args[0]) };
@@ -2549,7 +2567,7 @@ pub fn str_method_isdigit(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 }
 
 pub fn str_method_isdecimal(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    require_receiver(args, "isdecimal")?;
+    require_no_args(args, "isdecimal")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let result = match s.as_str() {
         Ok(v) => !v.is_empty() && v.chars().all(classify::is_decimal),
@@ -2559,7 +2577,7 @@ pub fn str_method_isdecimal(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 }
 
 pub fn str_method_isnumeric(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    require_receiver(args, "isnumeric")?;
+    require_no_args(args, "isnumeric")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let result = match s.as_str() {
         Ok(v) => !v.is_empty() && v.chars().all(classify::is_numeric),
@@ -2569,7 +2587,7 @@ pub fn str_method_isnumeric(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 }
 
 pub fn str_method_istitle(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    require_receiver(args, "istitle")?;
+    require_no_args(args, "istitle")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let mut cased = false;
     let mut prev_cased = false;
@@ -2601,7 +2619,7 @@ pub fn str_method_istitle(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 }
 
 pub fn str_method_isalpha(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    require_receiver(args, "isalpha")?;
+    require_no_args(args, "isalpha")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let result = match s.as_str() {
         Ok(v) => !v.is_empty() && v.chars().all(classify::is_alpha),
@@ -2612,7 +2630,7 @@ pub fn str_method_isalpha(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 
 /// PyPy: unicodeobject.py descr_isidentifier
 pub fn str_method_isidentifier(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    require_receiver(args, "isidentifier")?;
+    require_no_args(args, "isidentifier")?;
     // An identifier cannot contain a lone surrogate, so a non-UTF-8
     // backing is never an identifier.
     let s = unsafe { w_str_get_wtf8(args[0]) };
@@ -2805,7 +2823,7 @@ pub fn str_method_rindex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 
 /// PyPy: unicodeobject.py descr_title
 pub fn str_method_title(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    require_receiver(args, "title")?;
+    require_no_args(args, "title")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let mut result = Wtf8Buf::with_capacity(s.len());
     let mut prev_is_sep = true;
@@ -2835,7 +2853,7 @@ pub fn str_method_title(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 
 /// PyPy: unicodeobject.py descr_capitalize
 pub fn str_method_capitalize(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    require_receiver(args, "capitalize")?;
+    require_no_args(args, "capitalize")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let mut result = Wtf8Buf::with_capacity(s.len());
     let mut cps = s.code_points();
@@ -2864,7 +2882,7 @@ pub fn str_method_capitalize(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 
 /// PyPy: unicodeobject.py descr_swapcase
 pub fn str_method_swapcase(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    require_receiver(args, "swapcase")?;
+    require_no_args(args, "swapcase")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let out = wtf8_map_chars(s, |c, out| {
         if c.is_uppercase() {
@@ -2977,7 +2995,7 @@ pub fn str_method_rjust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 /// Empty string returns True per CPython.  Delegates the per-character
 /// category check to `classify::is_printable`.
 pub fn str_method_isprintable(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    require_receiver(args, "isprintable")?;
+    require_no_args(args, "isprintable")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     // Empty returns True (vacuous); a lone surrogate is not printable.
     let result = match s.as_str() {
@@ -2989,7 +3007,7 @@ pub fn str_method_isprintable(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
 
 /// PyPy: unicodeobject.py descr_isspace
 pub fn str_method_isspace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    require_receiver(args, "isspace")?;
+    require_no_args(args, "isspace")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let result = match s.as_str() {
         Ok(v) => !v.is_empty() && v.chars().all(classify::is_space),
@@ -3026,21 +3044,21 @@ fn wtf8_cased_all(s: &Wtf8, want_upper: bool) -> bool {
 
 /// PyPy: unicodeobject.py descr_isupper
 pub fn str_method_isupper(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    require_receiver(args, "isupper")?;
+    require_no_args(args, "isupper")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     Ok(w_bool_from(wtf8_cased_all(s, true)))
 }
 
 /// PyPy: unicodeobject.py descr_islower
 pub fn str_method_islower(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    require_receiver(args, "islower")?;
+    require_no_args(args, "islower")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     Ok(w_bool_from(wtf8_cased_all(s, false)))
 }
 
 /// PyPy: unicodeobject.py descr_isalnum
 pub fn str_method_isalnum(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    require_receiver(args, "isalnum")?;
+    require_no_args(args, "isalnum")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let result = match s.as_str() {
         Ok(v) => !v.is_empty() && v.chars().all(classify::is_alnum),
@@ -3051,7 +3069,7 @@ pub fn str_method_isalnum(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 
 /// PyPy: unicodeobject.py descr_isascii
 pub fn str_method_isascii(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    require_receiver(args, "isascii")?;
+    require_no_args(args, "isascii")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let result = match s.as_str() {
         Ok(v) => v.is_ascii(),
