@@ -648,6 +648,17 @@ pub struct WalkContext<'frame, 'static_a: 'frame> {
     /// boundary; read by [`reconcile_vstack_at_boundary`] for the
     /// RESULT-TO-TOS class.
     pub vstack_last_ref: OpRef,
+    /// #73 (SLICE 1, INERT): the jitcode offset of the `-live-` byte that
+    /// precedes the CURRENT opcode's guard resume point — the `-live-`
+    /// BEFORE (`pyjitpl.py:198`, normal guard resume reads at
+    /// `self.pc - SIZE_LIVE_OP`).  Maintained purely from `DecodedOp` by the
+    /// walk; `usize::MAX` until the first `-live-` is seen.  Side-data only.
+    pub live_before_jit_pc: usize,
+    /// #73 (SLICE 1, INERT): the jitcode offset of the `-live-` byte that
+    /// trails a residual-call opcode — the `-live-` AFTER (`pyjitpl.py:195`,
+    /// residual-call guard resume reads at `self.pc`).  Maintained purely
+    /// from `DecodedOp` by the walk; `usize::MAX` until set.  Side-data only.
+    pub live_after_jit_pc: usize,
 }
 
 /// Outcome of dispatching one opcode. The walker uses this to decide
@@ -1342,6 +1353,14 @@ pub fn step(
     ctx: &mut WalkContext<'_, '_>,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let op: DecodedOp = decode_op_at(code, pc).ok_or(DispatchError::UndecodableOpcode { pc })?;
+    // #73 (SLICE 1, INERT): maintain the `-live-` BEFORE anchor.  Every
+    // `-live-` byte the walk decodes becomes the resume point preceding the
+    // NEXT guard (`pyjitpl.py:198`, normal guard resume reads at
+    // `self.pc - SIZE_LIVE_OP`).  `op.pc` is the genuine jitcode offset of
+    // the `-live-` byte.  Side-data only — read under a debug audit gate.
+    if op.opname == "live" {
+        ctx.live_before_jit_pc = op.pc;
+    }
     // #73 (SLICE 1, INERT): maintain the walk-level operand-stack box
     // mirror.  Detects a Python-opcode boundary at this jitcode pc and
     // reconciles the previous opcode's stack effect into `ctx.vstack_boxes`
@@ -2520,6 +2539,8 @@ pub fn dispatch_via_miframe(
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         // #73 (SLICE 1, INERT): seed the walk-level operand-stack box mirror
         // at entry.  The mirror is only enabled when the outer sym owns the
@@ -2821,6 +2842,8 @@ pub(crate) fn drive_bridge_carrier_subwalk(
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
             trace_ctx: ctx,
             done_with_this_frame_descr_ref: done_ref,
             done_with_this_frame_descr_int: done_int,
@@ -3073,6 +3096,8 @@ pub(crate) fn drive_outer_frame_continuation(
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
             trace_ctx: ctx,
             done_with_this_frame_descr_ref: done_ref,
             done_with_this_frame_descr_int: done_int,
@@ -3300,6 +3325,8 @@ pub fn dispatch_via_miframe_at_opcode_entry<'a>(
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let outcome = walk(entry_jitcode.code.as_slice(), 0, &mut wc);
         let final_last_exc = wc.last_exc_value;
@@ -9125,6 +9152,18 @@ pub(crate) fn m73_liveness_audit_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_M73_LIVENESS_AUDIT").is_some())
 }
 
+/// `PYRE_M73_ANCHOR_AUDIT` enables the assertion that the walk-maintained
+/// `-live-` BEFORE anchor (`ctx.live_before_jit_pc`, updated from every
+/// decoded `-live-` op) equals the py-keyed resume marker the encoder
+/// resolves via `resume_jitcode_pc_for(py_pc)` at the normal-family guard arm
+/// (`pyjitpl.py:198`, normal guard resume reads at `self.pc - SIZE_LIVE_OP`).
+/// Certifies the precondition for re-sourcing that marker off the walk-level
+/// cursor without the py_pc channel. Diagnostic only; off in production.
+pub(crate) fn m73_anchor_audit_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_M73_ANCHOR_AUDIT").is_some())
+}
+
 pub(crate) fn python_pc_for_jitcode_pc(metadata: &crate::PyJitCodeMetadata, jit_pc: usize) -> u32 {
     // Exact inverse: `first_jit_pc_by_py_pc[py]` is the byte offset of the
     // FIRST instruction opcode `py` emitted (`usize::MAX` = the PC emitted
@@ -10462,6 +10501,21 @@ fn walker_capture_snapshot_for_last_guard_impl(
                     let jc = &*sym.jitcode;
                     jc.payload.resume_jitcode_pc_for(py_pc as usize)
                 };
+                // #73 (SLICE 1): certificate for the later cursor flip (S3).
+                // The walk-maintained `-live-` BEFORE anchor must equal the
+                // py-keyed resume marker the encoder resolves here
+                // (`pyjitpl.py:198`).  Read-only: `marker` is still consumed
+                // unchanged by the match below.
+                if m73_anchor_audit_enabled() && ctx.live_before_jit_pc != usize::MAX {
+                    debug_assert_eq!(
+                        Some(ctx.live_before_jit_pc),
+                        marker,
+                        "#73 anchor mismatch: live_before={} py_pc={} marker={:?}",
+                        ctx.live_before_jit_pc,
+                        py_pc,
+                        marker
+                    );
+                }
                 match marker {
                     Some(jp) => jp as i32,
                     None => majit_ir::resumedata::NO_JITCODE_PC,
@@ -12990,6 +13044,8 @@ fn try_walker_inline_user_call(
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
             trace_ctx: ctx.trace_ctx,
             done_with_this_frame_descr_ref: ctx.done_with_this_frame_descr_ref.clone(),
             done_with_this_frame_descr_int: ctx.done_with_this_frame_descr_int.clone(),
@@ -13691,6 +13747,13 @@ fn dispatch_residual_call_iRd_kind(
         // `PyError::runtime_error("ABORT_ESCAPE: ...")` before walker IR
         // diff would run.
         if emit_guard_not_forced {
+            // #73 (SLICE 1, INERT): maintain the `-live-` AFTER anchor.  A
+            // residual-call guard reads its resume point at `self.pc` (the
+            // `-live-` trailing the call, `pyjitpl.py:195`).  `op.next_pc` is
+            // the first byte after the residual_call opcode, which the
+            // `[funcptr, Call, -live-]` layout (jitcode.rs:565) makes the
+            // trailing `-live-` byte.  Side-data only.
+            ctx.live_after_jit_pc = op.next_pc;
             ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
             walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
         }
@@ -18898,6 +18961,8 @@ fn run_sub_jitcode_walk(
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         walk(sub_body.code, 0, &mut sub_wc)?
     };
@@ -21346,6 +21411,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
 
         // Synthesize a 2-byte op fixture: `<opcode_byte> <reg_idx>`.
@@ -21409,6 +21476,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         // `getfield_vable_i/rd>i`: operand 0 (the box) sits at code[pc+1].
         let code = [0u8, 0x00, 0x00, 0x00, 0x00];
@@ -21462,6 +21531,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         // `setfield_vable_i/rid`: operand 0 (the box) sits at code[pc+1].
         let code = [0u8, 0x00, 0x00, 0x00, 0x00];
@@ -21533,6 +21604,8 @@ mod tests {
                 vstack_cur_pypc: 0,
                 vstack_valid: false,
                 vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
             };
             let op = DecodedOp {
                 key,
@@ -21715,6 +21788,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
 
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("switch hit must dispatch");
@@ -21769,6 +21844,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
 
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("switch miss must dispatch");
@@ -21822,6 +21899,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
 
         let err = step(&code, 0, &mut wc).expect_err("non-constant switch value must not guess");
@@ -21884,6 +21963,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
 
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("truthy branch must dispatch");
@@ -21938,6 +22019,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
 
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("falsy branch must dispatch");
@@ -21991,6 +22074,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
 
         let err = step(&code, 0, &mut wc).expect_err("non-constant branch value must not guess");
@@ -22253,6 +22338,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         fbw_finish_payload_reset();
         let (outcome, end_pc) =
@@ -22419,6 +22506,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, next_pc) =
             step(&caller_code, 0, &mut wc).expect("inline_call_r_i must dispatch");
@@ -22533,6 +22622,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, next_pc) =
             step(&caller_code, 0, &mut wc).expect("inline_call_ir_r must dispatch");
@@ -22641,6 +22732,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, next_pc) =
             step(&caller_code, 0, &mut wc).expect("inline_call_irf_r must dispatch");
@@ -22738,6 +22831,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let err =
             step(&caller_code, 0, &mut wc).expect_err("I-list overflow must surface typed error");
@@ -22832,6 +22927,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, _) = walk(&caller_code, 0, &mut wc).expect("caller must walk to terminator");
         assert_eq!(
@@ -22907,6 +23004,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let err = step(&caller_code, 0, &mut wc)
             .expect_err("FailDescr at inline_call's d-slot must hit ExpectedJitCodeDescr");
@@ -22961,6 +23060,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let err = step(&caller_code, 0, &mut wc)
             .expect_err("missing sub-jitcode must hit SubJitCodeNotFound");
@@ -23011,6 +23112,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("live/ must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -23070,6 +23173,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         fbw_finish_payload_reset();
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("ref_return/r must dispatch");
@@ -23127,6 +23232,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let err = step(&code, 0, &mut wc).expect_err("must surface RegisterOutOfRange");
         assert_eq!(
@@ -23187,6 +23294,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let ops_before = wc.trace_ctx.num_ops();
         fbw_finish_payload_reset();
@@ -23263,6 +23372,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let ops_before = wc.trace_ctx.num_ops();
         let (outcome, _) = step(&code, 0, &mut wc).expect("int_return/i must dispatch");
@@ -23327,6 +23438,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let ops_before = wc.trace_ctx.num_ops();
         fbw_finish_payload_reset();
@@ -23392,6 +23505,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let ops_before = wc.trace_ctx.num_ops();
         let (outcome, _) = step(&code, 0, &mut wc).expect("void_return/ must dispatch");
@@ -23445,6 +23560,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let err = step(&code, 0, &mut wc).expect_err("raise/r must read its operand");
         assert_eq!(
@@ -23501,6 +23618,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("goto/L must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -23557,6 +23676,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("goto/L must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -23661,6 +23782,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let err =
             step(&code, 0, &mut wc).expect_err("catch_exception/L with active exc must error");
@@ -23713,6 +23836,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("catch_exception/L must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -23778,6 +23903,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, next_pc) = walk(&code, 0, &mut wc).expect("raise/r must dispatch");
         assert_eq!(outcome, DispatchOutcome::Terminate);
@@ -23875,6 +24002,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         // `raise/r` emits the GuardClass during dispatch, then surfaces
         // `SubRaise`; `walk()`'s top-level SubRaise arm records the FINISH.
@@ -23956,6 +24085,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         // With `PYRE_FBW_RAISE` on (default), `reraise/` surfaces
         // `SubRaise` and `walk()`'s top-level SubRaise arm records the
@@ -24032,6 +24163,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let err = step(&code, 0, &mut wc).expect_err("reraise/ without last_exc_value must error");
         assert_eq!(err, DispatchError::ReraiseWithoutLastExcValue { pc: 0 });
@@ -24083,6 +24216,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let _ = step(&code, 0, &mut wc).expect("raise/r must dispatch");
         assert_eq!(
@@ -24198,6 +24333,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         fbw_finish_payload_reset();
         let (outcome, end_pc) =
@@ -24317,6 +24454,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let ops_before = wc.trace_ctx.num_ops();
         let (outcome, _) = walk(&caller_code, 0, &mut wc).expect("caller must walk to terminator");
@@ -24383,6 +24522,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("int_copy/i>i must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -24446,6 +24587,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let _ = step(&code, 0, &mut wc).expect("int_copy/i>i must dispatch");
         assert_eq!(
@@ -24500,6 +24643,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let err = step(&code, 0, &mut wc).expect_err("int_copy dst OOR must surface a typed error");
         assert_eq!(
@@ -24553,6 +24698,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let err = step(&code, 0, &mut wc).expect_err("int_copy/i>i must read its src operand");
         assert_eq!(
@@ -24626,6 +24773,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("ref_copy/r>r must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -24687,6 +24836,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let _ = step(&code, 0, &mut wc).expect("ref_copy/r>r must dispatch");
         assert_eq!(
@@ -24739,6 +24890,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let err = step(&code, 0, &mut wc).expect_err("ref_copy dst OOR must surface a typed error");
         assert_eq!(
@@ -24790,6 +24943,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let err = step(&code, 0, &mut wc).expect_err("ref_copy/r>r must read its src operand");
         assert_eq!(
@@ -24852,6 +25007,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc)
             .unwrap_or_else(|e| panic!("`{opname}` must dispatch — got {:?}", e));
@@ -25040,6 +25197,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, next_pc) =
             int_between_record(&code, &op, &mut wc).expect("int_between_record must dispatch");
@@ -25174,6 +25333,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc)
             .unwrap_or_else(|e| panic!("`{opname}` must dispatch — got {:?}", e));
@@ -25260,6 +25421,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("float_neg/f>f must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -25324,6 +25487,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc)
             .unwrap_or_else(|e| panic!("`{opname}` must dispatch — got {:?}", e));
@@ -25413,6 +25578,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc)
             .unwrap_or_else(|e| panic!("`{opname}` must dispatch — got {:?}", e));
@@ -25482,6 +25649,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let err = step(&code, 0, &mut wc).expect_err("float_add must read its src operand");
         assert_eq!(
@@ -25534,6 +25703,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let err = step(&code, 0, &mut wc).expect_err("int_add must read its src operand");
         assert_eq!(
@@ -25588,6 +25759,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let err = step(&code, 0, &mut wc).expect_err("int_add dst OOR must surface a typed error");
         assert_eq!(
@@ -25650,6 +25823,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let err =
             step(&code, 0, &mut wc).expect_err("unsupported opname must hit UnsupportedOpname");
@@ -25704,6 +25879,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("ptr_nonzero must record PtrNe");
         assert!(matches!(outcome, DispatchOutcome::Continue));
@@ -25785,6 +25962,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("abort/>r must dispatch");
         assert!(matches!(outcome, DispatchOutcome::Continue));
@@ -25848,6 +26027,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, next_pc) =
             step(&code, 0, &mut wc).expect("ref_guard_value must record GuardValue");
@@ -25927,6 +26108,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("ref_guard_value Const arm");
         assert!(matches!(outcome, DispatchOutcome::Continue));
@@ -26019,6 +26202,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, next_pc) =
             step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
@@ -26183,6 +26368,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
         drop(wc);
@@ -26264,6 +26451,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let _ = try_execute_residual_call_via_executor(
             &mut wc,
@@ -26318,6 +26507,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let _ = try_execute_residual_call_via_executor(
             &mut wc,
@@ -26387,6 +26578,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let _ = try_execute_residual_call_via_executor(
             &mut wc,
@@ -26480,6 +26673,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let result = try_execute_residual_call_via_executor(
             &mut wc,
@@ -26577,6 +26772,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let result = try_execute_residual_call_via_executor(
             &mut wc,
@@ -26649,6 +26846,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let err = step(&code, 0, &mut wc).expect_err("OS_NOT_IN_TRACE must surface a typed error");
         assert_eq!(
@@ -26709,6 +26908,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let err =
             step(&code, 0, &mut wc).expect_err("OS_JIT_FORCE_VIRTUAL must surface a typed error");
@@ -26764,6 +26965,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
         drop(wc);
@@ -26828,6 +27031,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
         drop(wc);
@@ -26894,6 +27099,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
         // The dst slot must hold the OpRef of the recorded CallR. Each
@@ -26980,6 +27187,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
         drop(wc);
@@ -27055,6 +27264,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_ir_r/iIRd>r must dispatch");
         drop(wc);
@@ -27129,6 +27340,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let err = step(&code, 0, &mut wc).expect_err("dst OOR must surface a typed error");
         assert_eq!(
@@ -27185,6 +27398,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let err = step(&code, 0, &mut wc)
             .expect_err("descr index 5 with pool size 2 must surface DescrIndexOutOfRange");
@@ -27279,6 +27494,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, next_pc) =
             step(&code, 0, &mut wc).expect("residual_call_r_i/iRd>i must dispatch");
@@ -27370,6 +27587,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_r_i/iRd>i must dispatch");
         drop(wc);
@@ -27471,6 +27690,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, next_pc) =
             step(&code, 0, &mut wc).expect("residual_call_ir_r/iIRd>r must dispatch");
@@ -27602,6 +27823,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_ir_r/iIRd>r must dispatch");
         drop(wc);
@@ -27669,6 +27892,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let err = step(&code, 0, &mut wc)
             .expect_err("FailDescr (not CallDescr) must surface ResidualCallDescrNotCallDescr");
@@ -27724,6 +27949,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let err = step(&code, 0, &mut wc)
             .expect_err("R-list member out of range must surface RegisterOutOfRange");
@@ -27803,6 +28030,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, end_pc) =
             walk(&jc.code, 0, &mut wc).expect("ReturnValue arm must walk to a terminator");
@@ -27927,6 +28156,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, end_pc) =
             walk(&jc.code, 0, &mut wc).expect("PopTop arm must walk to a terminator");
@@ -28027,6 +28258,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let err = step(&caller_code, 0, &mut wc).expect_err("arity overflow must surface error");
         assert_eq!(
@@ -28126,6 +28359,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, _) =
             walk(&caller_code, 0, &mut wc).expect("inline_call_r_v with void callee must succeed");
@@ -28204,6 +28439,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let err = walk(&caller_code, 0, &mut wc)
             .expect_err("inline_call_r_v with non-void callee must reject");
@@ -28285,6 +28522,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, _) =
             walk(&caller_code, 0, &mut wc).expect("inline_call_ir_v with void callee must succeed");
@@ -28364,6 +28603,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let err = walk(&caller_code, 0, &mut wc)
             .expect_err("inline_call_ir_v with non-void callee must reject");
@@ -28448,6 +28689,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, _) = walk(&caller_code, 0, &mut wc)
             .expect("inline_call_irf_v with void callee must succeed");
@@ -28530,6 +28773,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let err = walk(&caller_code, 0, &mut wc)
             .expect_err("inline_call_irf_v with non-void callee must reject");
@@ -28601,6 +28846,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("getfield_gc_i must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -28693,6 +28940,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let _ = step(&code, 0, &mut wc).expect("getfield_gc_i must dispatch");
         let dst_post = wc.registers_i[5];
@@ -28763,6 +29012,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let _ = step(&code, 0, &mut wc).expect("getfield_gc_r must dispatch");
         let dst_post = wc.registers_r[6];
@@ -28821,6 +29072,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let err = step(&code, 0, &mut wc).expect_err("getfield_gc must validate r-reg");
         assert_eq!(
@@ -28891,6 +29144,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("getfield_vable_i must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -28981,6 +29236,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("setfield_vable_i must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -29061,6 +29318,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let _ = step(&code, 0, &mut wc).expect("setfield_gc_i must dispatch");
         drop(wc);
@@ -29119,6 +29378,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let _ = step(&code, 0, &mut wc).expect("setfield_gc_i must dispatch");
         drop(wc);
@@ -29203,6 +29464,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let _ = step(&code, 0, &mut wc).expect("setfield_gc_r must dispatch");
         drop(wc);
@@ -29270,6 +29533,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("getarrayitem_gc_r must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -29351,6 +29616,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let _ = step(&code, 0, &mut wc).expect("getarrayitem_gc_r must dispatch");
         let dst_post = wc.registers_r[5];
@@ -29417,6 +29684,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("setarrayitem_gc_r must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -29725,6 +29994,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         assert_eq!(
             walk(&code, 0, &mut wc),
@@ -29801,6 +30072,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
 
         // Arrival without a preceding `loop_header` stamp and with no
@@ -29887,6 +30160,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         assert_eq!(wc.trace_ctx.seen_loop_header_for_jdindex, -1);
         let (outcome, next) = step(&code, 0, &mut wc).expect("loop_header must dispatch");
@@ -29948,6 +30223,8 @@ mod tests {
             vstack_cur_pypc: 0,
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
         };
         assert_eq!(
             step(&code, 0, &mut wc),
