@@ -1391,7 +1391,7 @@ impl<S: JitState> JitDriver<S> {
     /// caches (e.g. stacksize from the now-current selected) from the
     /// written-back scalars.
     #[inline]
-    pub fn writeback_authoritative_state_fields(&self, state: &mut S) {
+    pub fn writeback_scalar_state_fields(&self, state: &mut S) {
         if let Some(sym) = self.sym.as_ref() {
             state.writeback_scalar_state_fields_from_sym(sym);
         }
@@ -1802,7 +1802,7 @@ impl<S: JitState> JitDriver<S> {
                 // reds vector published here is INTENTIONALLY empty. The
                 // merge-point hook transfers walk-final loop state without it:
                 // scalar state fields (e.g. selected) are written back from
-                // the live sym by `writeback_authoritative_state_fields`, then
+                // the live sym by `writeback_scalar_state_fields`, then
                 // `recover` re-derives the storage-backed cache fields
                 // (stacksize, storage refs) from the walk-advanced shared
                 // storage. `dispatch` does populate `ctx.walk_final_reds` from

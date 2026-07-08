@@ -1962,7 +1962,7 @@ fn rewrite_body(
                                     // the native scalars to seed the compiled
                                     // loop). No-op with no scalar state fields
                                     // or no live sym.
-                                    #driver.writeback_authoritative_state_fields(
+                                    #driver.writeback_scalar_state_fields(
                                         &mut #state,
                                     );
                                     // Transfer any loop-carried reds the walk
