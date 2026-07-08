@@ -76,6 +76,12 @@ pub(crate) struct ClosureSelectSite {
     /// [`ValueType`]: `U` for `map`, `Option<U>` for `and_then`, `T` for
     /// `unwrap_or_else`.
     pub call_result_ty: ValueType,
+    /// The `<X>` suffix for the closure `Args` tuple `(payload,)` — the same
+    /// `Tuple<X>` leaf the extracted `call_once` reads its `.0` under, derived
+    /// from the receiver `Option<X>`'s payload node so the synthesized write
+    /// and the `resolve_place` read key under one classdef.  "" (bare `Tuple`)
+    /// for a unit payload.
+    pub args_tuple_suffix: String,
 }
 
 /// Rewrite every recorded closure-select call site into the discriminant
@@ -231,6 +237,7 @@ fn rewire_one_closure_select_site(
                 Some((payload, site.payload_ty.clone())),
                 &site.call_once_owner,
                 site.call_result_ty.clone(),
+                &site.args_tuple_suffix,
             );
             match site.kind {
                 // `map` wraps the closure result back into `Some(U)`.
@@ -274,6 +281,7 @@ fn rewire_one_closure_select_site(
                 None,
                 &site.call_once_owner,
                 site.call_result_ty.clone(),
+                &site.args_tuple_suffix,
             )
         }
     };
@@ -323,14 +331,24 @@ fn emit_call_once(
     arg: Option<(Variable, ValueType)>,
     call_once_owner: &str,
     result_ty: ValueType,
+    args_tuple_suffix: &str,
 ) -> Variable {
+    // The `(payload,)` Args tuple keys under the per-shape `Tuple<X>` leaf the
+    // extracted `call_once` reads `.0` from at `resolve_place`; a niladic
+    // closure's `()` tuple has no `.0` and stays bare `Tuple` (empty types →
+    // "" on both sides), so the suffix applies only when an argument is written.
+    let tuple_owner = if arg.is_some() {
+        format!("Tuple{args_tuple_suffix}")
+    } else {
+        "Tuple".to_string()
+    };
     let args_tuple = graph.alloc_value_var();
     graph.block_mut(block).operations.push(SpaceOperation {
         result: Some(args_tuple.clone()),
         kind: OpKind::Call {
-            target: CallTarget::synthetic_transparent_ctor("Tuple"),
+            target: CallTarget::synthetic_transparent_ctor(&tuple_owner),
             args: Vec::new(),
-            result_ty: ValueType::Ref(Some("Tuple".to_string())),
+            result_ty: ValueType::Ref(Some(tuple_owner.clone())),
         },
     });
     if let Some((value, _value_ty)) = arg {
@@ -340,7 +358,7 @@ fn emit_call_once(
                 base: args_tuple.clone(),
                 field: FieldDescriptor {
                     name: "__pos_0".to_string(),
-                    owner_root: Some("Tuple".to_string()),
+                    owner_root: Some(tuple_owner.clone()),
                     owner_id: None,
                 },
                 value: LinkArg::Value(value),
@@ -373,6 +391,7 @@ mod tests {
             call_once_owner: "test::closure".into(),
             payload_ty: ValueType::Int,
             call_result_ty: ValueType::Int,
+            args_tuple_suffix: String::new(),
         }
     }
 

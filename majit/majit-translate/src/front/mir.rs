@@ -7791,7 +7791,14 @@ impl<'a> Lowering<'a> {
         // Destination `Option`: enum root + `Some` variant owners + payload.
         let def_id = self.tyref_adt_def_id(dest_ty)?;
         let td = self.llbc.type_by_id(def_id)?;
-        let option_owner = td.item_meta.name_path();
+        // Suffix the enum root with the destination `Option<X>`'s `<X>` so a
+        // `bool::then` construction mints the same per-instantiation root a
+        // static `Some(..)` mints; `some_owner` then derives `Option<X>::Some`.
+        let option_owner = format!(
+            "{}{}",
+            td.item_meta.name_path(),
+            tyref_enum_instantiation_suffix(dest_ty, self.llbc)
+        );
         let some_owner = Self::tagged_pair_payload_owner(td, &option_owner, 1)?;
         let payload_ty = self.tyref_option_payload_value_type(dest_ty)?;
         // Closure env ADT → its `name_path` is the `call_once` inherent
@@ -7957,7 +7964,14 @@ impl<'a> Lowering<'a> {
         }
         let def_id = self.tyref_adt_def_id(recv_ty)?;
         let td = self.llbc.type_by_id(def_id)?;
-        let option_owner = td.item_meta.name_path();
+        // Suffix the enum root with the receiver `Option<X>`'s `<X>` so the
+        // per-instantiation root a static `Some(..)` mints is reused here;
+        // `some_owner` then derives `Option<X>::Some`.
+        let option_owner = format!(
+            "{}{}",
+            td.item_meta.name_path(),
+            tyref_enum_instantiation_suffix(recv_ty, self.llbc)
+        );
         let some_owner = Self::tagged_pair_payload_owner(td, &option_owner, 1)?;
         let payload_ty = self.tyref_option_payload_value_type(recv_ty)?;
         // Closure env ADT → its `name_path` is the `call_once` inherent method
@@ -7967,6 +7981,10 @@ impl<'a> Lowering<'a> {
         let env_td = self.llbc.type_by_id(env_def_id)?;
         let call_once_owner = env_td.item_meta.name_path();
         let result_ty = tyref_to_value_type(dest_ty, self.llbc);
+        // The single-element closure-`Args` tuple `(payload,)` the extracted
+        // `call_once` reads its `.0` from, keyed to the same `Tuple<X>` leaf
+        // the read side derives at `resolve_place`.
+        let args_tuple_suffix = option_payload_tuple_suffix(recv_ty, self.llbc);
         Some(crate::front::option_map_or::MapOrSite {
             result_var: result_var.clone(),
             option_owner,
@@ -7974,6 +7992,7 @@ impl<'a> Lowering<'a> {
             call_once_owner,
             payload_ty,
             result_ty,
+            args_tuple_suffix,
         })
     }
 
@@ -8001,12 +8020,23 @@ impl<'a> Lowering<'a> {
         }
         let def_id = self.tyref_adt_def_id(recv_ty)?;
         let td = self.llbc.type_by_id(def_id)?;
-        let option_owner = td.item_meta.name_path();
+        // Suffix the enum root with the receiver `Option<X>`'s `<X>` so the
+        // per-instantiation root a static `Some(..)` mints is reused here;
+        // `some_owner` then derives `Option<X>::Some`.
+        let option_owner = format!(
+            "{}{}",
+            td.item_meta.name_path(),
+            tyref_enum_instantiation_suffix(recv_ty, self.llbc)
+        );
         let some_owner = Self::tagged_pair_payload_owner(td, &option_owner, 1)?;
         let payload_ty = self.tyref_option_payload_value_type(recv_ty)?;
         let env_def_id = self.tyref_ref_adt_def_id(env_ty?)?;
         let env_td = self.llbc.type_by_id(env_def_id)?;
         let call_once_owner = env_td.item_meta.name_path();
+        // The single-element closure-`Args` tuple `(payload,)` the extracted
+        // `call_once` reads its `.0` from, keyed to the same `Tuple<X>` leaf
+        // the read side derives at `resolve_place`.
+        let args_tuple_suffix = option_payload_tuple_suffix(recv_ty, self.llbc);
         // The type the closure's `call_once` returns: `map`'s dest is
         // `Option<U>` and its closure returns `U` (the dest payload);
         // `and_then`'s dest is `Option<U>` returned directly; `unwrap_or_else`'s
@@ -8025,6 +8055,7 @@ impl<'a> Lowering<'a> {
             call_once_owner,
             payload_ty,
             call_result_ty,
+            args_tuple_suffix,
         })
     }
 
@@ -8193,7 +8224,16 @@ impl<'a> Lowering<'a> {
         // Same owner-path / ctor-leaf split `resolve_aggregate_adt`
         // performs, so the ctor target and FieldWrite owner carry the
         // spellings the rest of the aggregate machinery expects.
-        let owner = td.item_meta.name_path();
+        // Route the runtime-discriminant tagged-pair ctor to the SAME
+        // per-instantiation enum root a static `Some(..)`/`Ok(..)` mints,
+        // by suffixing the bare template name with the `<X>` the
+        // destination `Option<X>`/`Result<X, E>` local carries.
+        // Fail-closed: no splitting generic yields "" → bare owner.
+        let owner = format!(
+            "{}{}",
+            td.item_meta.name_path(),
+            tyref_enum_instantiation_suffix(dest_ty, self.llbc)
+        );
         let arg = arg.clone();
         let bb_id = self.block_id[mir_bb];
 
@@ -8295,7 +8335,16 @@ impl<'a> Lowering<'a> {
         let Some(td) = self.llbc.type_by_id(def_id) else {
             return Ok(false);
         };
-        let owner = td.item_meta.name_path();
+        // Route the runtime-discriminant tagged-pair ctor to the SAME
+        // per-instantiation enum root a static `Some(..)`/`Ok(..)` mints,
+        // by suffixing the bare template name with the `<X>` the
+        // destination `Option<X>`/`Result<X, E>` local carries.
+        // Fail-closed: no splitting generic yields "" → bare owner.
+        let owner = format!(
+            "{}{}",
+            td.item_meta.name_path(),
+            tyref_enum_instantiation_suffix(dest_ty, self.llbc)
+        );
         let arg = arg.clone();
         if self.multi_assigned_locals.contains(&dest_local) {
             // A re-bindable local may later carry a runtime `Result`,
@@ -11869,6 +11918,81 @@ fn tyref_tuple_suffix(ty: &TyRef, llbc: &Llbc) -> String {
         .and_then(serde_json::Value::as_object)
         .map(|adt| tuple_shape_suffix(adt, llbc))
         .unwrap_or_default()
+}
+
+/// The `<X>` enum-instantiation suffix for a destination `Option<X>` /
+/// `Result<X, E>` local `ty`.  A runtime-discriminant decomposition
+/// (`checked_neg`, `usize::try_from`) constructs the enum ROOT — no static
+/// variant annotates the destination — so it cannot route through
+/// `resolve_aggregate_adt`'s enum arm; without a suffix it mints the bare
+/// template (`core.option.Option`), whose `__pos_0` then unions every
+/// caller's payload (`int ∪ FrameDebugData ∪ …`) onto one classdef.
+/// Suffixing the root with the `<X>` the `place.ty` carries mints one root
+/// per instantiation instead, so each `__pos_0` sees a single concrete
+/// payload — the spelling a static `Some(..)`/`Ok(..)` construction already
+/// mints.  Extracts `ty`'s `{"Adt": …}` node (as [`tyref_tuple_suffix`]
+/// does) and defers to [`adt_head_instantiation_suffix`], already RC2-gated
+/// (an `f32`/`f64`/`()`/`""` argument yields `None`).  Fail-closed: a
+/// missing `Adt` node, a non-enum type, or a deferred argument yields `""` —
+/// the bare owner, unchanged.
+fn tyref_enum_instantiation_suffix(ty: &TyRef, llbc: &Llbc) -> String {
+    let value = match ty {
+        TyRef::Inline { value: (_, v) } => v,
+        TyRef::Other(v) => v,
+        TyRef::Dedup { id } => match llbc.dedup_body(*id) {
+            Some(v) => v,
+            None => return String::new(),
+        },
+    };
+    value
+        .as_object()
+        .and_then(|m| m.get("Adt"))
+        .and_then(serde_json::Value::as_object)
+        .and_then(|adt| adt_head_instantiation_suffix(adt, llbc))
+        .unwrap_or_default()
+}
+
+/// The `<X>` suffix for the single-element closure-`Args` tuple `(payload,)` a
+/// unary `map_or`/`and_then`/`map` closure receives, where `payload` is the
+/// receiver `Option<X>`'s Some payload.  The extracted `call_once` body reads
+/// this tuple's `.0` via a real Charon `Tuple<X>` container (owner derived at
+/// [`Lowering::resolve_place`] mir.rs:4269 through [`tyref_tuple_suffix`]); the
+/// synthesized WRITE must derive the identical leaf so the `__pos_0` write and
+/// read key under one classdef.  Both terminate in `render_adt_type_args` →
+/// `charon_type_value_to_ast_string` (which strips `&T → T`) on the SAME
+/// payload node, so the strings are equal by construction.  Sourced from
+/// `recv_ty` (`Option<X>`, un-erased) — NOT `site.payload_ty`, which is
+/// `Ref(None)` erased.  Fail-closed: a non-Option recv, a missing payload node,
+/// or a deferred arg yields "" (bare `Tuple`, unchanged).
+fn option_payload_tuple_suffix(recv_ty: &TyRef, llbc: &Llbc) -> String {
+    // 1. pull recv_ty.Adt.generics.types[0] exactly as
+    //    tyref_option_payload_value_type does (mir.rs:7743).
+    let body = match recv_ty {
+        TyRef::Inline { value: (_, v) } => v,
+        TyRef::Other(v) => v,
+        TyRef::Dedup { id } => match llbc.dedup_body(*id) {
+            Some(v) => v,
+            None => return String::new(),
+        },
+    };
+    let Some(node) = body
+        .get("Adt")
+        .and_then(|a| a.get("generics"))
+        .and_then(|g| g.get("types"))
+        .and_then(|t| t.get(0))
+    else {
+        return String::new();
+    };
+    // 2. synthesize wrapper {"Adt":{"id":"Tuple","generics":{"types":[node]}}}.
+    let wrapper = serde_json::json!({
+        "Adt": {
+            "id": "Tuple",
+            "generics": { "types": [node.clone()] }
+        }
+    });
+    // 3. return tyref_tuple_suffix of the wrapper — the same renderer the read
+    //    side routes through, so the `&`-stripped leaf matches by construction.
+    tyref_tuple_suffix(&TyRef::Other(wrapper), llbc)
 }
 
 /// A type-argument drives a per-instantiation variant-class split unless

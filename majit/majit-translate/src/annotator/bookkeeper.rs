@@ -2167,6 +2167,25 @@ impl Bookkeeper {
                         return Some(parent.to_string());
                     }
                 }
+                // A generic enum instantiation (`Option<X>`, `Result<T,E>`) and
+                // a collapsed non-suffixed spelling of the same enum
+                // (`core.option.Option`, from a ctor whose ADT head lost its
+                // type argument) both denote ONE class — RPython has no
+                // generics, so every spelling of an enum is the same class.
+                // Subclass each under the bare enum leaf (`Option` / `Result`)
+                // so two sibling instantiations, and a collapsed value, share a
+                // base and `commonbase` to it at a phi merge instead of failing
+                // `mergeinputargs` with "no common base class".  The bare leaf
+                // is the discriminant-only root (its only row is
+                // `__discriminant`), so it carries no payload attr the
+                // per-instantiation `__pos_N` writes could conflict on.
+                if reg.is_enum_base(&lookup) {
+                    let stripped = majit_ir::descr::strip_generic_args(&lookup);
+                    let bare_leaf = stripped.rsplit("::").next().unwrap_or(&stripped);
+                    if bare_leaf != lookup.as_str() && !seen.contains(bare_leaf) {
+                        return Some(bare_leaf.to_string());
+                    }
+                }
                 let (first_name, first_ty) = reg.fields.get(&lookup)?.first()?;
                 // Only header-conventional first fields mark subclassing
                 // (`ob_header: PyObject` / `base: FrameBlock`).  A
