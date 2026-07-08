@@ -2263,7 +2263,8 @@ impl JitCodeBuilder {
         for &(kind, src) in greens {
             match kind {
                 JitArgKind::Ref => self.touch_ref_reg(src),
-                JitArgKind::Int | JitArgKind::Float => self.touch_reg(src),
+                JitArgKind::Int => self.touch_reg(src),
+                JitArgKind::Float => self.touch_float_reg(src),
             }
         }
         for &(kind, caller_src, _callee_dst) in args {
@@ -2287,6 +2288,127 @@ impl JitCodeBuilder {
             self.push_u16(callee_dst);
         }
         self.record_resulttype('i');
+    }
+
+    /// Ref-result sibling of [`Self::recursive_call_int`]
+    /// (`opimpl_recursive_call_r`).  Same payload shape; the result lands in
+    /// the ref register `result_dst`.
+    pub fn recursive_call_ref(
+        &mut self,
+        jd_index: u16,
+        result_dst: u16,
+        greens: &[(JitArgKind, u16)],
+        args: &[(JitArgKind, u16, u16)],
+    ) {
+        self.touch_ref_reg(result_dst);
+        for &(kind, src) in greens {
+            match kind {
+                JitArgKind::Ref => self.touch_ref_reg(src),
+                JitArgKind::Int => self.touch_reg(src),
+                JitArgKind::Float => self.touch_float_reg(src),
+            }
+        }
+        for &(kind, caller_src, _callee_dst) in args {
+            self.touch_call_arg(JitCallArg {
+                kind,
+                reg: caller_src,
+            });
+        }
+        self.start_instr(jitcode::insns::BC_RECURSIVE_CALL_REF);
+        self.push_u16(jd_index);
+        self.push_u16(result_dst);
+        self.push_u16(greens.len() as u16);
+        for &(kind, src) in greens {
+            self.push_u8(kind.encode());
+            self.push_u16(src);
+        }
+        self.push_u16(args.len() as u16);
+        for &(kind, caller_src, callee_dst) in args {
+            self.push_u8(kind.encode());
+            self.push_u16(caller_src);
+            self.push_u16(callee_dst);
+        }
+        self.record_resulttype('r');
+    }
+
+    /// Float-result sibling of [`Self::recursive_call_int`]
+    /// (`opimpl_recursive_call_f`).  Same payload shape; the result lands in
+    /// the float register `result_dst`.
+    pub fn recursive_call_float(
+        &mut self,
+        jd_index: u16,
+        result_dst: u16,
+        greens: &[(JitArgKind, u16)],
+        args: &[(JitArgKind, u16, u16)],
+    ) {
+        self.touch_float_reg(result_dst);
+        for &(kind, src) in greens {
+            match kind {
+                JitArgKind::Ref => self.touch_ref_reg(src),
+                JitArgKind::Int => self.touch_reg(src),
+                JitArgKind::Float => self.touch_float_reg(src),
+            }
+        }
+        for &(kind, caller_src, _callee_dst) in args {
+            self.touch_call_arg(JitCallArg {
+                kind,
+                reg: caller_src,
+            });
+        }
+        self.start_instr(jitcode::insns::BC_RECURSIVE_CALL_FLOAT);
+        self.push_u16(jd_index);
+        self.push_u16(result_dst);
+        self.push_u16(greens.len() as u16);
+        for &(kind, src) in greens {
+            self.push_u8(kind.encode());
+            self.push_u16(src);
+        }
+        self.push_u16(args.len() as u16);
+        for &(kind, caller_src, callee_dst) in args {
+            self.push_u8(kind.encode());
+            self.push_u16(caller_src);
+            self.push_u16(callee_dst);
+        }
+        self.record_resulttype('f');
+    }
+
+    /// Void-result sibling of [`Self::recursive_call_int`]
+    /// (`opimpl_recursive_call_v`).  Carries no result register — the
+    /// `result_dst` slot is emitted as the `u16::MAX` "no result" sentinel the
+    /// dispatcher decodes to `None`.
+    pub fn recursive_call_void(
+        &mut self,
+        jd_index: u16,
+        greens: &[(JitArgKind, u16)],
+        args: &[(JitArgKind, u16, u16)],
+    ) {
+        for &(kind, src) in greens {
+            match kind {
+                JitArgKind::Ref => self.touch_ref_reg(src),
+                JitArgKind::Int => self.touch_reg(src),
+                JitArgKind::Float => self.touch_float_reg(src),
+            }
+        }
+        for &(kind, caller_src, _callee_dst) in args {
+            self.touch_call_arg(JitCallArg {
+                kind,
+                reg: caller_src,
+            });
+        }
+        self.start_instr(jitcode::insns::BC_RECURSIVE_CALL_VOID);
+        self.push_u16(jd_index);
+        self.push_u16(u16::MAX);
+        self.push_u16(greens.len() as u16);
+        for &(kind, src) in greens {
+            self.push_u8(kind.encode());
+            self.push_u16(src);
+        }
+        self.push_u16(args.len() as u16);
+        for &(kind, caller_src, callee_dst) in args {
+            self.push_u8(kind.encode());
+            self.push_u16(caller_src);
+            self.push_u16(callee_dst);
+        }
     }
 
     /// Constant-operand form of `ref_return`. `flatten.py:130-146

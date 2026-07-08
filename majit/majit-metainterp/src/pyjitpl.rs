@@ -3932,6 +3932,9 @@ impl<M: Clone> MetaInterp<M> {
             &dyn Fn(usize, &[i64]) -> Option<(Arc<JitCellToken>, u64)>,
             &dyn Fn(usize, &[i64], usize, usize) -> InlineDecision,
             &dyn Fn(&JitCellToken, &[Value]) -> Option<i64>,
+            &dyn Fn(&JitCellToken, &[Value]) -> Option<i64>,
+            &dyn Fn(&JitCellToken, &[Value]) -> Option<i64>,
+            &dyn Fn(&JitCellToken, &[Value]) -> Option<()>,
         ) -> R,
     ) -> Option<R> {
         let tracing = self.tracing.as_mut()?;
@@ -4011,12 +4014,41 @@ impl<M: Clone> MetaInterp<M> {
                 None
             }
         };
+        // Ref / float siblings decode the single FINISH output in its raw
+        // packing (`execute_token_raw` stores a ref as its `GcRef` bits and a
+        // float as `f64::to_bits()`, both into `outputs`), so the int decode
+        // shape carries through unchanged.
+        let recursive_exec_ref = |token: &JitCellToken, reds: &[Value]| -> Option<i64> {
+            let result = backend.execute_token_raw(token, reds);
+            if result.is_finish {
+                result.outputs.first().copied()
+            } else {
+                None
+            }
+        };
+        let recursive_exec_float = |token: &JitCellToken, reds: &[Value]| -> Option<i64> {
+            let result = backend.execute_token_raw(token, reds);
+            if result.is_finish {
+                result.outputs.first().copied()
+            } else {
+                None
+            }
+        };
+        // Void runs the callee for its side effects; a finished loop yields
+        // `Some(())`, an unfinished one `None`.
+        let recursive_exec_void = |token: &JitCellToken, reds: &[Value]| -> Option<()> {
+            let result = backend.execute_token_raw(token, reds);
+            result.is_finish.then_some(())
+        };
         Some(f(
             tracing,
             &resolver,
             &recursive_target,
             &recursive_decision,
             &recursive_exec,
+            &recursive_exec_ref,
+            &recursive_exec_float,
+            &recursive_exec_void,
         ))
     }
 

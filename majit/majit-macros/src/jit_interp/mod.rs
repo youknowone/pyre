@@ -1295,7 +1295,14 @@ fn generate_merge_wrapper(config: &JitInterpConfig, func: &ItemFn) -> TokenStrea
                 // production warmstate / backend.
                 let __result = __meta
                     .with_trace_ctx_and_token_resolver(
-                        |__ctx, __resolve, __rec_target, __rec_decision, __rec_exec| {
+                        |__ctx,
+                         __resolve,
+                         __rec_target,
+                         __rec_decision,
+                         __rec_exec,
+                         __rec_exec_ref,
+                         __rec_exec_float,
+                         __rec_exec_void| {
                             let __runtime =
                                 majit_metainterp::ClosureRuntimeWithResolver::new(
                                     |pc: usize| pc,
@@ -1303,6 +1310,9 @@ fn generate_merge_wrapper(config: &JitInterpConfig, func: &ItemFn) -> TokenStrea
                                     __rec_target,
                                     __rec_decision,
                                     __rec_exec,
+                                    __rec_exec_ref,
+                                    __rec_exec_float,
+                                    __rec_exec_void,
                                 );
                             #trace_fn_name(
                                 __ctx,

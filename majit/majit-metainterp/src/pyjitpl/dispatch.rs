@@ -616,6 +616,52 @@ pub trait JitCodeRuntime {
     ) -> Option<i64> {
         None
     }
+
+    /// Ref-result sibling of [`Self::execute_recursive_assembler_int`]
+    /// (`call_assembler_ref` / `do_residual_call` tp == 'r').  Drives the
+    /// callee loop's JITFRAME-ABI entry and decodes the single ref FINISH
+    /// output as its raw `GcRef` bits (the same `as_usize() as i64` packing
+    /// the `BC_CALL_ASSEMBLER_REF` arm stores through `set_ref_reg`).
+    /// Returns `None` when the loop did not finish with a ref result or when
+    /// the runtime has no backend (the default), in which case the caller
+    /// aborts.
+    fn execute_recursive_assembler_ref(
+        &self,
+        _token: &majit_backend::JitCellToken,
+        _reds: &[Value],
+    ) -> Option<i64> {
+        None
+    }
+
+    /// Float-result sibling of [`Self::execute_recursive_assembler_int`]
+    /// (`call_assembler_float` / `do_residual_call` tp == 'f').  Drives the
+    /// callee loop's JITFRAME-ABI entry and decodes the single float FINISH
+    /// output as its `f64::to_bits()` packing (the same `longlong.ZEROF`
+    /// packing the `BC_CALL_ASSEMBLER_FLOAT` arm stores through
+    /// `set_float_reg`).  Returns `None` when the loop did not finish with a
+    /// float result or when the runtime has no backend (the default), in
+    /// which case the caller aborts.
+    fn execute_recursive_assembler_float(
+        &self,
+        _token: &majit_backend::JitCellToken,
+        _reds: &[Value],
+    ) -> Option<i64> {
+        None
+    }
+
+    /// Void-result sibling of [`Self::execute_recursive_assembler_int`]
+    /// (`call_assembler_void` / `do_residual_call` tp == 'v').  Drives the
+    /// callee loop's JITFRAME-ABI entry for its side effects; there is no
+    /// result to decode.  Returns `Some(())` when the loop finished and
+    /// `None` when it did not finish or the runtime has no backend (the
+    /// default), in which case the caller aborts.
+    fn execute_recursive_assembler_void(
+        &self,
+        _token: &majit_backend::JitCellToken,
+        _reds: &[Value],
+    ) -> Option<()> {
+        None
+    }
 }
 
 /// [FR] WIP gate for the state-field recursive-portal Inline re-entry rework.
@@ -656,23 +702,39 @@ where
 /// through the production warmstate / backend.  All closures are built by
 /// `MetaInterp::with_trace_ctx_and_token_resolver`, which split-borrows the
 /// MetaInterp fields they read.
-pub struct ClosureRuntimeWithResolver<FLabel, FResolve, FTarget, FDecision, FExec> {
+pub struct ClosureRuntimeWithResolver<
+    FLabel,
+    FResolve,
+    FTarget,
+    FDecision,
+    FExec,
+    FExecR,
+    FExecF,
+    FExecV,
+> {
     label_at: FLabel,
     resolve_token: FResolve,
     recursive_target: FTarget,
     recursive_decision: FDecision,
     recursive_exec: FExec,
+    recursive_exec_ref: FExecR,
+    recursive_exec_float: FExecF,
+    recursive_exec_void: FExecV,
 }
 
-impl<FLabel, FResolve, FTarget, FDecision, FExec>
-    ClosureRuntimeWithResolver<FLabel, FResolve, FTarget, FDecision, FExec>
+impl<FLabel, FResolve, FTarget, FDecision, FExec, FExecR, FExecF, FExecV>
+    ClosureRuntimeWithResolver<FLabel, FResolve, FTarget, FDecision, FExec, FExecR, FExecF, FExecV>
 {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         label_at: FLabel,
         resolve_token: FResolve,
         recursive_target: FTarget,
         recursive_decision: FDecision,
         recursive_exec: FExec,
+        recursive_exec_ref: FExecR,
+        recursive_exec_float: FExecF,
+        recursive_exec_void: FExecV,
     ) -> Self {
         Self {
             label_at,
@@ -680,18 +742,33 @@ impl<FLabel, FResolve, FTarget, FDecision, FExec>
             recursive_target,
             recursive_decision,
             recursive_exec,
+            recursive_exec_ref,
+            recursive_exec_float,
+            recursive_exec_void,
         }
     }
 }
 
-impl<FLabel, FResolve, FTarget, FDecision, FExec> JitCodeRuntime
-    for ClosureRuntimeWithResolver<FLabel, FResolve, FTarget, FDecision, FExec>
+impl<FLabel, FResolve, FTarget, FDecision, FExec, FExecR, FExecF, FExecV> JitCodeRuntime
+    for ClosureRuntimeWithResolver<
+        FLabel,
+        FResolve,
+        FTarget,
+        FDecision,
+        FExec,
+        FExecR,
+        FExecF,
+        FExecV,
+    >
 where
     FLabel: Fn(usize) -> usize,
     FResolve: Fn(u64) -> Option<std::sync::Arc<majit_backend::JitCellToken>>,
     FTarget: Fn(usize, &[i64]) -> Option<(std::sync::Arc<majit_backend::JitCellToken>, u64)>,
     FDecision: Fn(usize, &[i64], usize, usize) -> crate::pyjitpl::InlineDecision,
     FExec: Fn(&majit_backend::JitCellToken, &[Value]) -> Option<i64>,
+    FExecR: Fn(&majit_backend::JitCellToken, &[Value]) -> Option<i64>,
+    FExecF: Fn(&majit_backend::JitCellToken, &[Value]) -> Option<i64>,
+    FExecV: Fn(&majit_backend::JitCellToken, &[Value]) -> Option<()>,
 {
     fn label_at(&self, pc: usize) -> usize {
         (self.label_at)(pc)
@@ -728,6 +805,30 @@ where
         reds: &[Value],
     ) -> Option<i64> {
         (self.recursive_exec)(token, reds)
+    }
+
+    fn execute_recursive_assembler_ref(
+        &self,
+        token: &majit_backend::JitCellToken,
+        reds: &[Value],
+    ) -> Option<i64> {
+        (self.recursive_exec_ref)(token, reds)
+    }
+
+    fn execute_recursive_assembler_float(
+        &self,
+        token: &majit_backend::JitCellToken,
+        reds: &[Value],
+    ) -> Option<i64> {
+        (self.recursive_exec_float)(token, reds)
+    }
+
+    fn execute_recursive_assembler_void(
+        &self,
+        token: &majit_backend::JitCellToken,
+        reds: &[Value],
+    ) -> Option<()> {
+        (self.recursive_exec_void)(token, reds)
     }
 }
 
@@ -1952,15 +2053,18 @@ where
 
         // Read each green from the register bank its `JitArgKind` names: a
         // ref green (e.g. tl's `program`) from the ref bank, an int green
-        // (e.g. `pc`) from the int bank.  The values are collected in green
-        // declaration order so they hash against `green_args_spec`.
-        // `green_pc` is the first green (the int portal entry pc), or 0 when
-        // the call carries no greens.
+        // (e.g. `pc`) from the int bank, a float green from the float bank
+        // (its raw i64 bits feed the green-key hash — `prepare_list_of_boxes`
+        // decodes `argcode == 'f'` from `registers_f`).  The values are
+        // collected in green declaration order so they hash against
+        // `green_args_spec`.  `green_pc` is the first green (the int portal
+        // entry pc), or 0 when the call carries no greens.
         let green_values: Vec<i64> = green_srcs
             .iter()
             .map(|&(kind, src)| match kind {
                 JitArgKind::Ref => self.read_ref_reg(src).1,
-                JitArgKind::Int | JitArgKind::Float => self.read_int_reg(src).1,
+                JitArgKind::Int => self.read_int_reg(src).1,
+                JitArgKind::Float => self.read_float_reg(src).1,
             })
             .collect();
         let green_pc = green_values.first().copied().unwrap_or(0) as usize;
@@ -2004,6 +2108,15 @@ where
             let mut portal_frame = MIFrame::setup(portal, green_pc, None, Some(ctx));
             portal_frame.code_cursor = green_pc;
             ctx.push_inline_frame((jd_index, green_pc), u32::MAX);
+            // pyjitpl.py:2465 newframe -> enter_portal_frame(jd_no, unique_id)
+            // for an inlined portal (greenkey present). `unique_id` has no
+            // warmstate source here; use `green_pc` as a stable per-entry id.
+            // Pairs with the deferred LEAVE_PORTAL_FRAME recorded by the
+            // recursive-portal merge-point cut (opimpl_jit_merge_point
+            // else-branch).
+            let jd_box = ctx.const_int(jd_index as i64);
+            let uid_box = ctx.const_int(green_pc as i64);
+            ctx.record_op(OpCode::EnterPortalFrame, &[jd_box, uid_box]);
             portal_frame.inline_frame = true;
             for (kind, caller_src, callee_dst) in arg_triples {
                 match kind {
@@ -2057,8 +2170,12 @@ where
     /// Because the callee runs as its own compiled loop with its caller's
     /// state forced to the heap, there is no shared-shadow aliasing and no
     /// caller-frame resume coupling — the callee's guards resume in its own
-    /// blackhole.  Wires the `Int` result kind only; `Ref` / `Float` /
-    /// `Void` recursive assembler calls are a follow-on slice.
+    /// blackhole.  Wires all four result kinds (`Int` / `Ref` / `Float` /
+    /// `Void`): each drives its kind-specific concrete executor
+    /// (`execute_recursive_assembler_{int,ref,float,void}`), records the
+    /// matching `CallAssembler{I,R,F,N}` descr via
+    /// `call_assembler_{int,ref,float,void}_arc_typed`, and writes the result
+    /// into the correct register bank (`Void` has no result).
     #[allow(clippy::too_many_arguments)]
     fn exec_recursive_call_assembler(
         &mut self,
@@ -2074,11 +2191,16 @@ where
         // fresh state supersedes it); kept for the opcode's decode shape.
         _arg_triples: &[(JitArgKind, usize, usize)],
     ) -> TraceAction {
-        // S1 supports only the `Int` result kind through CALL_ASSEMBLER.
-        let result_dst = match (result_kind, result_dst) {
-            (Some(JitArgKind::Int), Some(dst)) => dst,
+        // Validate the (result_kind, result_dst) pairing: the three typed
+        // kinds carry a destination register, `Void` carries none.  Any
+        // other shape is a malformed opcode — abort.
+        match (result_kind, result_dst) {
+            (Some(JitArgKind::Int), Some(_))
+            | (Some(JitArgKind::Ref), Some(_))
+            | (Some(JitArgKind::Float), Some(_))
+            | (None, None) => {}
             _ => return TraceAction::Abort,
-        };
+        }
 
         // The greens carry the portal green key (pyjitpl.py:3593-3599
         // `get_assembler_token(greenargs)`), already read from the correct
@@ -2186,14 +2308,70 @@ where
         // pyjitpl.py:2017 — vrefs walk + vinfo stamp before the call.
         ctx.vrefs_before_residual_call();
         let active_vable = self.prepare_standard_virtualizable_before_residual_call(ctx);
-        let concrete = match runtime.execute_recursive_assembler_int(&token_arc, &red_values) {
-            Some(value) => value,
-            None => return TraceAction::Abort,
-        };
-        // pyjitpl.py:2046-2049 vrefs_after_residual_call.
-        ctx.vrefs_after_residual_call();
-        let traced = ctx.call_assembler_int_arc_typed(token_arc, &args, &arg_types);
-        self.set_int_reg(result_dst, Some(traced), Some(concrete));
+        // Concrete leg + `CallAssembler{I,R,F,N}` record + result writeback,
+        // one arm per result kind.  The concrete executor decodes the FINISH
+        // output in the kind's raw packing (int as-is, ref as its `GcRef`
+        // bits, float as `f64::to_bits()`); the recorded descr is emitted by
+        // the matching `call_assembler_*_arc_typed`, and the traced result op
+        // is written into the result kind's register bank.  `Void` runs the
+        // callee for its side effects with no result to decode or write.
+        //
+        // `vrefs_after_residual_call` fires between the concrete run and the
+        // CALL_ASSEMBLER record in every arm (pyjitpl.py:2046-2049).
+        match result_kind {
+            Some(JitArgKind::Int) => {
+                let concrete =
+                    match runtime.execute_recursive_assembler_int(&token_arc, &red_values) {
+                        Some(value) => value,
+                        None => return TraceAction::Abort,
+                    };
+                ctx.vrefs_after_residual_call();
+                let traced = ctx.call_assembler_int_arc_typed(token_arc, &args, &arg_types);
+                self.set_int_reg(
+                    result_dst.expect("int result kind requires a destination"),
+                    Some(traced),
+                    Some(concrete),
+                );
+            }
+            Some(JitArgKind::Ref) => {
+                let concrete =
+                    match runtime.execute_recursive_assembler_ref(&token_arc, &red_values) {
+                        Some(value) => value,
+                        None => return TraceAction::Abort,
+                    };
+                ctx.vrefs_after_residual_call();
+                let traced = ctx.call_assembler_ref_arc_typed(token_arc, &args, &arg_types);
+                self.set_ref_reg(
+                    result_dst.expect("ref result kind requires a destination"),
+                    Some(traced),
+                    Some(concrete),
+                );
+            }
+            Some(JitArgKind::Float) => {
+                let concrete =
+                    match runtime.execute_recursive_assembler_float(&token_arc, &red_values) {
+                        Some(value) => value,
+                        None => return TraceAction::Abort,
+                    };
+                ctx.vrefs_after_residual_call();
+                let traced = ctx.call_assembler_float_arc_typed(token_arc, &args, &arg_types);
+                self.set_float_reg(
+                    result_dst.expect("float result kind requires a destination"),
+                    Some(traced),
+                    Some(concrete),
+                );
+            }
+            None => {
+                if runtime
+                    .execute_recursive_assembler_void(&token_arc, &red_values)
+                    .is_none()
+                {
+                    return TraceAction::Abort;
+                }
+                ctx.vrefs_after_residual_call();
+                ctx.call_assembler_void_arc_typed(token_arc, &args, &arg_types);
+            }
+        }
         // Free each fresh allocation after the call: the compiled loop's
         // residual `CallN`.  Recorded after CALL_ASSEMBLER so the callee has
         // the state for the duration of its run; the trace-time owner box is
@@ -3753,17 +3931,23 @@ where
                         }
                     }
                 }
-                // [FR] pyjitpl.py:1551 `if self.metainterp.portal_call_depth:
-                // return` — a jit_merge_point reached INSIDE an inline
-                // recursive-portal callee is NOT the traced loop's header, so
-                // it is a pure no-op: skip both the auto loop-header stamp and
-                // the close protocol below.  Without this, the callee's merge
-                // point (it shares the caller's dispatch jitcode, entered at
-                // offset 0) resets `seen_loop_header_for_jdindex` to -1, and the
-                // real outer header then falls through instead of closing.  The
-                // payload cursor was already advanced above, so the callee
-                // continues to its next opcode.  Gated to the FR experiment.
-                if portal_inline_experiment_enabled() && ctx.inline_depth() > 0 {
+                // pyjitpl.py:1547-1552 — a jit_merge_point reached INSIDE an
+                // inline recursive-portal callee, while no loop_header has been
+                // seen yet (`seen_loop_header_for_jdindex < 0`), is a pure
+                // no-op: the `if not jitdriver_sd.no_loop_header: if
+                // self.metainterp.portal_call_depth: return` early-out skips the
+                // auto loop-header stamp so the callee's merge point (it shares
+                // the caller's dispatch jitcode, entered at offset 0) does not
+                // corrupt the outer header.  The payload cursor was already
+                // advanced above, so the callee continues to its next opcode.
+                // A seen>=0 (or `no_loop_header` auto-stamped) depth>0 merge
+                // point falls through into the close protocol at the else-branch
+                // cut below (pyjitpl.py:1579-1602).
+                let no_loop_header = ctx.metainterp_sd().jitdrivers_sd[jdindex].no_loop_header;
+                if ctx.inline_depth() > 0
+                    && self.seen_loop_header_for_jdindex < 0
+                    && !no_loop_header
+                {
                     return TraceAction::Continue;
                 }
                 // MAJIT_PCSEQ (W4/D2 diagnostic): log the interpreter green pc
@@ -3805,7 +3989,7 @@ where
                 //     `MetaInterp.has_compiled_targets(green_key)` keyed
                 //     on the trace's green key.
                 if self.seen_loop_header_for_jdindex < 0 && ctx.num_ops() > 0 {
-                    let no_loop_header = ctx.metainterp_sd().jitdrivers_sd[jdindex].no_loop_header;
+                    // `no_loop_header` hoisted above (EDIT A) and reused here.
                     let should_auto_stamp = if no_loop_header {
                         // pyjitpl.py:1554 path through (skip the
                         // `if not jitdriver_sd.no_loop_header:` guard).
@@ -3863,6 +4047,84 @@ where
                         self.seen_loop_header_for_jdindex,
                     );
                     self.seen_loop_header_for_jdindex = -1;
+                    if ctx.inline_depth() > 0 {
+                        // pyjitpl.py:1579-1602 else-branch: a recursive-portal
+                        // merge point reached at portal_call_depth > 0 is NOT
+                        // the traced loop's own header. Instead of a close it
+                        // returns from the inlined callee frame
+                        // (`finishframe(leave_portal_frame=False)`), then
+                        // `do_recursive_call(assembler_call=True)` on the caller
+                        // frame so the recursion follows a CALL_ASSEMBLER into
+                        // the callee's own compiled loop, then
+                        // `leave_portal_frame`, then `raise ChangeFrame` to
+                        // resume the caller.
+                        //
+                        // (1) capture old_frame (the inlined portal callee, top
+                        //     of stack) before the pop (pyjitpl.py:1592) so its
+                        //     return-destination slot and jitdriver index are
+                        //     read from the callee, not the caller.
+                        let old_frame = self.frames.current_mut();
+                        let jd_no = old_frame.jitcode.jitdriver_sd().unwrap_or(jdindex);
+                        let (result_kind, result_dst) = if let Some(d) = old_frame.return_i {
+                            (Some(JitArgKind::Int), Some(d))
+                        } else if let Some(d) = old_frame.return_r {
+                            (Some(JitArgKind::Ref), Some(d))
+                        } else if let Some(d) = old_frame.return_f {
+                            (Some(JitArgKind::Float), Some(d))
+                        } else {
+                            (None, None)
+                        };
+                        // (2) finishframe(leave_portal_frame=False) analog
+                        //     (pyjitpl.py:1593-1596): pop the inline callee
+                        //     frame, mirror the ctx inline depth, and restore the
+                        //     caller sym scalar / vable state the push saved —
+                        //     but DO NOT wire the return (do_recursive_call's job)
+                        //     and DO NOT record LEAVE_PORTAL_FRAME yet
+                        //     (leave_portal_frame=False).
+                        let popped = self.frames.pop().expect("recursive-cut: framestack < 2");
+                        if popped.inline_frame {
+                            ctx.pop_inline_frame();
+                        }
+                        if let Some(snapshot) = popped.portal_scalar_state.clone() {
+                            sym.restore_inline_scalar_state(snapshot);
+                        }
+                        if popped.portal_vable_saved {
+                            ctx.restore_saved_virtualizable();
+                        }
+                        // (3) do_recursive_call(assembler_call=True) on the caller
+                        //     (now current): reuse the existing 8-step
+                        //     CALL_ASSEMBLER recorder. `set_int_reg(result_dst)`
+                        //     inside binds the result on the CALLER frame
+                        //     (make_result_of_lastop parity, pyjitpl.py:1584-1590).
+                        let green_values: Vec<i64> = mp_green_ints
+                            .iter()
+                            .chain(mp_green_refs.iter())
+                            .chain(mp_green_floats.iter())
+                            .copied()
+                            .collect();
+                        match self.exec_recursive_call_assembler(
+                            ctx,
+                            sym,
+                            _runtime,
+                            result_kind,
+                            jdindex,
+                            result_dst,
+                            &green_values,
+                            &[],
+                        ) {
+                            TraceAction::Continue => {}
+                            // Abort propagates (missing fresh-reds / target).
+                            other => return other,
+                        }
+                        // (4) deferred LEAVE_PORTAL_FRAME (pyjitpl.py:1600-1601),
+                        //     recorded AFTER the CALL_ASSEMBLER so the trace order
+                        //     is CALL_ASSEMBLER … then LEAVE.
+                        let jd_box = ctx.const_int(jd_no as i64);
+                        ctx.record_op(OpCode::LeavePortalFrame, &[jd_box]);
+                        // (5) raise ChangeFrame (pyjitpl.py:1602): resume the
+                        //     caller frame in the walker dispatch loop.
+                        return TraceAction::Continue;
+                    }
                     // pyjitpl.py:2991-2993 reached_loop_header: generate a dummy
                     // GUARD_FUTURE_CONDITION just before the implicit JUMP so
                     // unroll's `jump_to_existing_trace` has a `patchguardop`
@@ -7462,6 +7724,49 @@ mod tests {
             RECURSIVE_CALLEE_ARG.with(|c| c.set(arg));
             Some(arg + 100)
         }
+
+        fn execute_recursive_assembler_ref(
+            &self,
+            _token: &majit_backend::JitCellToken,
+            reds: &[Value],
+        ) -> Option<i64> {
+            let arg = match reds.first() {
+                Some(Value::Int(v)) => *v,
+                _ => return None,
+            };
+            RECURSIVE_CALLEE_ARG.with(|c| c.set(arg));
+            // A ref result is a raw `GcRef`-bits payload; return a distinct,
+            // recognizable non-zero value.
+            Some(arg + 200)
+        }
+
+        fn execute_recursive_assembler_float(
+            &self,
+            _token: &majit_backend::JitCellToken,
+            reds: &[Value],
+        ) -> Option<i64> {
+            let arg = match reds.first() {
+                Some(Value::Int(v)) => *v,
+                _ => return None,
+            };
+            RECURSIVE_CALLEE_ARG.with(|c| c.set(arg));
+            // A float result carries `f64::to_bits()`; return a recognizable
+            // float value packed the way `execute_token_raw` would.
+            Some(f64::to_bits(arg as f64 + 0.5) as i64)
+        }
+
+        fn execute_recursive_assembler_void(
+            &self,
+            _token: &majit_backend::JitCellToken,
+            reds: &[Value],
+        ) -> Option<()> {
+            let arg = match reds.first() {
+                Some(Value::Int(v)) => *v,
+                _ => return None,
+            };
+            RECURSIVE_CALLEE_ARG.with(|c| c.set(arg));
+            Some(())
+        }
     }
 
     /// Test `JitCodeSym` for the recursive CALL_ASSEMBLER fresh-frame path: a
@@ -7605,6 +7910,377 @@ mod tests {
             finish_args[0],
             call_op.pos.get(),
             "the recursive CALL_ASSEMBLER result must be wired into the caller's return register",
+        );
+    }
+
+    /// #19 Step 3 (Ref) — a `BC_RECURSIVE_CALL_REF` whose runtime decides
+    /// `CallAssembler` records a `CallAssemblerR` (+ GUARD_NOT_FORCED) carrying
+    /// the fresh reds, and the ref result flows into the caller's ref return
+    /// register.  The concrete leg still runs with the FRESH `stackpos = 0`.
+    #[test]
+    fn recursive_call_assembler_ref_records_and_returns_result() {
+        RECURSIVE_CALLEE_ARG.with(|c| c.set(-1));
+
+        let mut caller_builder = JitCodeBuilder::new();
+        caller_builder.recursive_call_ref(0, 0, &[], &[]);
+        caller_builder.ref_return(0);
+        let caller = caller_builder.finish();
+
+        let runtime = RecursiveAssemblerRuntime {
+            token: std::sync::Arc::new(majit_backend::JitCellToken::new(7)),
+        };
+        let mut ctx = TraceCtx::for_test(0);
+        let mut sym = RecursiveFreshSym;
+        let action =
+            trace_jitcode_with_args_and_runtime(&mut ctx, &mut sym, &caller, 0, &runtime, &[]);
+
+        let finish_args = match action {
+            TraceAction::Finish {
+                finish_args,
+                finish_arg_types,
+                exit_with_exception: false,
+            } => {
+                assert_eq!(finish_arg_types, vec![majit_ir::Type::Ref]);
+                finish_args
+            }
+            other => {
+                panic!("expected Finish[Ref] from recursive CALL_ASSEMBLER, got {other:?}")
+            }
+        };
+        assert_eq!(finish_args.len(), 1);
+        // The callee's concrete entry ran with the FRESH reds (zeroed stackpos).
+        assert_eq!(RECURSIVE_CALLEE_ARG.with(|c| c.get()), 0);
+
+        let recorder = ctx.into_recorder();
+        let ops = recorder.ops();
+        let call_ops: Vec<_> = ops
+            .iter()
+            .filter(|o| o.opcode == OpCode::CallAssemblerR)
+            .collect();
+        assert_eq!(
+            call_ops.len(),
+            1,
+            "recursive CALL_ASSEMBLER[Ref] must record exactly one CallAssemblerR op",
+        );
+        let call = ops
+            .iter()
+            .position(|o| o.opcode == OpCode::CallAssemblerR)
+            .unwrap();
+        let gnf = ops
+            .iter()
+            .position(|o| o.opcode == OpCode::GuardNotForced)
+            .expect("CALL_ASSEMBLER[Ref] must record a GUARD_NOT_FORCED");
+        assert!(call < gnf, "CALL_ASSEMBLER must precede GUARD_NOT_FORCED");
+        assert_eq!(
+            finish_args[0],
+            call_ops[0].pos.get(),
+            "the recursive CALL_ASSEMBLER[Ref] result must be wired into the caller's ref return register",
+        );
+    }
+
+    /// #19 Step 3 (Float) — a `BC_RECURSIVE_CALL_FLOAT` records a
+    /// `CallAssemblerF` (+ GUARD_NOT_FORCED) and wires the float result into
+    /// the caller's float return register.
+    #[test]
+    fn recursive_call_assembler_float_records_and_returns_result() {
+        RECURSIVE_CALLEE_ARG.with(|c| c.set(-1));
+
+        let mut caller_builder = JitCodeBuilder::new();
+        caller_builder.recursive_call_float(0, 0, &[], &[]);
+        caller_builder.float_return(0);
+        let caller = caller_builder.finish();
+
+        let runtime = RecursiveAssemblerRuntime {
+            token: std::sync::Arc::new(majit_backend::JitCellToken::new(7)),
+        };
+        let mut ctx = TraceCtx::for_test(0);
+        let mut sym = RecursiveFreshSym;
+        let action =
+            trace_jitcode_with_args_and_runtime(&mut ctx, &mut sym, &caller, 0, &runtime, &[]);
+
+        let finish_args = match action {
+            TraceAction::Finish {
+                finish_args,
+                finish_arg_types,
+                exit_with_exception: false,
+            } => {
+                assert_eq!(finish_arg_types, vec![majit_ir::Type::Float]);
+                finish_args
+            }
+            other => {
+                panic!("expected Finish[Float] from recursive CALL_ASSEMBLER, got {other:?}")
+            }
+        };
+        assert_eq!(finish_args.len(), 1);
+        assert_eq!(RECURSIVE_CALLEE_ARG.with(|c| c.get()), 0);
+
+        let recorder = ctx.into_recorder();
+        let ops = recorder.ops();
+        let call_ops: Vec<_> = ops
+            .iter()
+            .filter(|o| o.opcode == OpCode::CallAssemblerF)
+            .collect();
+        assert_eq!(
+            call_ops.len(),
+            1,
+            "recursive CALL_ASSEMBLER[Float] must record exactly one CallAssemblerF op",
+        );
+        let call = ops
+            .iter()
+            .position(|o| o.opcode == OpCode::CallAssemblerF)
+            .unwrap();
+        let gnf = ops
+            .iter()
+            .position(|o| o.opcode == OpCode::GuardNotForced)
+            .expect("CALL_ASSEMBLER[Float] must record a GUARD_NOT_FORCED");
+        assert!(call < gnf, "CALL_ASSEMBLER must precede GUARD_NOT_FORCED");
+        assert_eq!(
+            finish_args[0],
+            call_ops[0].pos.get(),
+            "the recursive CALL_ASSEMBLER[Float] result must be wired into the caller's float return register",
+        );
+    }
+
+    /// #19 Step 3 (Void) — a `BC_RECURSIVE_CALL_VOID` records a
+    /// `CallAssemblerN` (+ GUARD_NOT_FORCED) with no result destination; the
+    /// callee runs its concrete leg for side effects only (the fresh
+    /// `stackpos = 0` reaches the executor) and the caller finishes void.
+    #[test]
+    fn recursive_call_assembler_void_records_and_runs_side_effect() {
+        RECURSIVE_CALLEE_ARG.with(|c| c.set(-1));
+
+        let mut caller_builder = JitCodeBuilder::new();
+        caller_builder.recursive_call_void(0, &[], &[]);
+        caller_builder.void_return();
+        let caller = caller_builder.finish();
+
+        let runtime = RecursiveAssemblerRuntime {
+            token: std::sync::Arc::new(majit_backend::JitCellToken::new(7)),
+        };
+        let mut ctx = TraceCtx::for_test(0);
+        let mut sym = RecursiveFreshSym;
+        let action =
+            trace_jitcode_with_args_and_runtime(&mut ctx, &mut sym, &caller, 0, &runtime, &[]);
+
+        match action {
+            TraceAction::Finish {
+                finish_args,
+                finish_arg_types,
+                exit_with_exception: false,
+            } => {
+                assert!(finish_args.is_empty(), "void return has no finish args");
+                assert!(
+                    finish_arg_types.is_empty(),
+                    "void return has no finish arg types"
+                );
+            }
+            other => {
+                panic!("expected Finish[Void] from recursive CALL_ASSEMBLER, got {other:?}")
+            }
+        };
+        // The callee's concrete void leg ran with the FRESH reds (zeroed
+        // stackpos), proving the side effect fired.
+        assert_eq!(RECURSIVE_CALLEE_ARG.with(|c| c.get()), 0);
+
+        let recorder = ctx.into_recorder();
+        let ops = recorder.ops();
+        let call_ops: Vec<_> = ops
+            .iter()
+            .filter(|o| o.opcode == OpCode::CallAssemblerN)
+            .collect();
+        assert_eq!(
+            call_ops.len(),
+            1,
+            "recursive CALL_ASSEMBLER[Void] must record exactly one CallAssemblerN op",
+        );
+        let call = ops
+            .iter()
+            .position(|o| o.opcode == OpCode::CallAssemblerN)
+            .unwrap();
+        let gnf = ops
+            .iter()
+            .position(|o| o.opcode == OpCode::GuardNotForced)
+            .expect("CALL_ASSEMBLER[Void] must record a GUARD_NOT_FORCED");
+        assert!(call < gnf, "CALL_ASSEMBLER must precede GUARD_NOT_FORCED");
+    }
+
+    /// #19 Step 1 — a `jit_merge_point` reached INSIDE an inlined recursive
+    /// portal callee (portal_call_depth > 0) must NOT be traced through the
+    /// callee's return; it takes the `opimpl_jit_merge_point` else-branch
+    /// (pyjitpl.py:1579-1602): finishframe(leave_portal_frame=False) pops the
+    /// inline callee, do_recursive_call(assembler_call=True) records a
+    /// CALL_ASSEMBLER into the callee's own compiled loop on the caller frame,
+    /// then a deferred leave_portal_frame, then ChangeFrame resumes the caller.
+    ///
+    /// The fixture merges the two existing recursive-portal fixtures: it BOTH
+    /// inlines the portal (so `inline_depth() > 0` and the callee reaches a
+    /// merge point at depth > 0) AND resolves a CALL_ASSEMBLER target so the
+    /// cut can record the recursion.  The recorded op stream must be
+    /// `[ENTER_PORTAL_FRAME … CALL_ASSEMBLER, GUARD_NOT_FORCED,
+    /// LEAVE_PORTAL_FRAME]` in that order (LEAVE deferred past the call), and
+    /// the callee body after the merge point (its `int_return`) must NOT be
+    /// traced inline — the recursion is a single CALL_ASSEMBLER, not an
+    /// inlined tail.
+    struct RecursivePortalMergePointRuntime {
+        portal: std::sync::Arc<JitCode>,
+        token: std::sync::Arc<majit_backend::JitCellToken>,
+    }
+
+    impl JitCodeRuntime for RecursivePortalMergePointRuntime {
+        fn label_at(&self, _pc: usize) -> usize {
+            0
+        }
+
+        fn recursive_inline_decision(
+            &self,
+            _jd_index: usize,
+            _green_values: &[i64],
+            _inline_depth: usize,
+            _recursive_depth: usize,
+        ) -> crate::pyjitpl::InlineDecision {
+            // Inline the portal so `exec_recursive_call` takes the
+            // `portal_jitcode` branch and pushes the inline frame.
+            crate::pyjitpl::InlineDecision::Inline
+        }
+
+        fn portal_jitcode(&self, _jd_index: usize) -> Option<std::sync::Arc<JitCode>> {
+            Some(self.portal.clone())
+        }
+
+        fn recursive_call_assembler_target(
+            &self,
+            _jd_index: usize,
+            _green_values: &[i64],
+        ) -> Option<(std::sync::Arc<majit_backend::JitCellToken>, u64)> {
+            Some((self.token.clone(), 0))
+        }
+
+        fn execute_recursive_assembler_int(
+            &self,
+            _token: &majit_backend::JitCellToken,
+            reds: &[Value],
+        ) -> Option<i64> {
+            // Concrete leg: the fresh reds start with the zeroed scalar, so
+            // arg + 100 == 100 is distinguishable from any caller value.
+            let arg = match reds.first() {
+                Some(Value::Int(v)) => *v,
+                _ => return None,
+            };
+            Some(arg + 100)
+        }
+    }
+
+    #[test]
+    fn recursive_portal_merge_point_cuts_to_call_assembler() {
+        // Portal body: a merge point THEN a return.  The merge point is
+        // reached at portal_call_depth > 0 (inlined), triggering the
+        // else-branch cut; the trailing `int_return` must NOT be traced (the
+        // callee frame is popped by the cut before it can run).
+        let mut portal_builder = JitCodeBuilder::new();
+        portal_builder.jit_merge_point(0, &[], &[], &[], &[], &[], &[]);
+        portal_builder.int_return(0);
+        let portal = std::sync::Arc::new(portal_builder.finish());
+
+        // Caller: recurse into the portal (decision = Inline), result into
+        // reg 0, then return reg 0.
+        let mut caller_builder = JitCodeBuilder::new();
+        caller_builder.recursive_call_int(0, 0, &[], &[]);
+        caller_builder.int_return(0);
+        let caller = caller_builder.finish();
+
+        // Register a jitdriver with `no_loop_header = true` so the callee's
+        // merge point auto-stamps `seen_loop_header_for_jdindex` (>= 0),
+        // bypassing the EDIT-A seen<0 skip and flowing into the depth>0 cut.
+        let mut staticdata = crate::MetaInterpStaticData::new();
+        let mut jd = crate::jitdriver::JitDriverStaticData::new(vec![], vec![("frame", Type::Int)]);
+        jd.index = Some(0);
+        jd.result_type = Type::Int;
+        jd.no_loop_header = true;
+        staticdata.jitdrivers_sd.push(jd);
+
+        let recorder = crate::recorder::Trace::new();
+        let mut ctx = TraceCtx::new(recorder, 0, std::sync::Arc::new(staticdata));
+        let mut sym = RecursiveFreshSym;
+        let runtime = RecursivePortalMergePointRuntime {
+            portal: portal.clone(),
+            token: std::sync::Arc::new(majit_backend::JitCellToken::new(7)),
+        };
+
+        let action =
+            trace_jitcode_with_args_and_runtime(&mut ctx, &mut sym, &caller, 0, &runtime, &[]);
+
+        let finish_args = match action {
+            TraceAction::Finish {
+                finish_args,
+                finish_arg_types,
+                exit_with_exception: false,
+            } => {
+                assert_eq!(finish_arg_types, vec![majit_ir::Type::Int]);
+                finish_args
+            }
+            other => {
+                panic!("expected Finish[Int] from recursive-portal merge-point cut, got {other:?}")
+            }
+        };
+
+        let recorder = ctx.into_recorder();
+        let ops = recorder.ops();
+
+        let enter = ops
+            .iter()
+            .position(|o| o.opcode == OpCode::EnterPortalFrame);
+        let call = ops.iter().position(|o| o.opcode == OpCode::CallAssemblerI);
+        let gnf = ops.iter().position(|o| o.opcode == OpCode::GuardNotForced);
+        let leave = ops
+            .iter()
+            .position(|o| o.opcode == OpCode::LeavePortalFrame);
+
+        let enter = enter.expect("must record ENTER_PORTAL_FRAME at the inline-portal push");
+        let call = call.expect("cut must record a CALL_ASSEMBLER for the recursion");
+        let gnf = gnf.expect("CALL_ASSEMBLER must record a GUARD_NOT_FORCED");
+        let leave = leave.expect("cut must record the deferred LEAVE_PORTAL_FRAME");
+
+        // Each of the paired ops is unique.
+        assert_eq!(
+            ops.iter()
+                .filter(|o| o.opcode == OpCode::EnterPortalFrame)
+                .count(),
+            1,
+            "exactly one ENTER_PORTAL_FRAME",
+        );
+        assert_eq!(
+            ops.iter()
+                .filter(|o| o.opcode == OpCode::CallAssemblerI)
+                .count(),
+            1,
+            "the recursion is a single CALL_ASSEMBLER — the callee was NOT traced inline",
+        );
+        assert_eq!(
+            ops.iter()
+                .filter(|o| o.opcode == OpCode::LeavePortalFrame)
+                .count(),
+            1,
+            "exactly one LEAVE_PORTAL_FRAME",
+        );
+
+        // Recorded order: [ENTER_PORTAL_FRAME … CALL_ASSEMBLER,
+        // GUARD_NOT_FORCED, LEAVE_PORTAL_FRAME] — the LEAVE is deferred past
+        // the CALL_ASSEMBLER (leave_portal_frame=False on the pop,
+        // re-emitted after the call).
+        assert!(
+            enter < call && call < gnf && gnf < leave,
+            "op order must be ENTER < CALL_ASSEMBLER < GUARD_NOT_FORCED < LEAVE, got \
+             enter={enter} call={call} gnf={gnf} leave={leave}",
+        );
+
+        // The portal tail after the merge point (`int_return`) produced no
+        // inline return-derived ops: the sole finish value is the recursion's
+        // CALL_ASSEMBLER result wired into the caller's return register.
+        assert_eq!(finish_args.len(), 1);
+        assert_eq!(
+            finish_args[0],
+            ops[call].pos.get(),
+            "the finish value must be the recursive CALL_ASSEMBLER result",
         );
     }
 
