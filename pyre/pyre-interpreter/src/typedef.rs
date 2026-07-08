@@ -1959,12 +1959,20 @@ fn frozenset_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     )?;
     let iterable = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
 
-    if !iterable.is_null() && std::ptr::eq(cls, frozenset_type) {
-        if let Some(iterable_type) = crate::typedef::r#type(iterable) {
-            if std::ptr::eq(iterable_type, frozenset_type) {
-                return Ok(iterable);
-            }
+    // setobject.py:616-618 — reuse the argument only when the target type is
+    // exactly `frozenset` and the argument's implementation class is exactly
+    // `W_FrozensetObject` (`type(w_iterable) is W_FrozensetObject`); a subclass
+    // instance retags `w_class` and is rebuilt.
+    if !iterable.is_null()
+        && std::ptr::eq(cls, frozenset_type)
+        && unsafe {
+            pyre_object::pyobject::is_exact_type(
+                iterable,
+                &pyre_object::setobject::FROZENSET_TYPE,
+            )
         }
+    {
+        return Ok(iterable);
     }
 
     let obj = set_alloc_for_class(cls, frozenset_type, true)?;
