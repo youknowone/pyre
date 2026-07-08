@@ -1015,6 +1015,16 @@ pub fn is_tagged_immediate(addr: usize) -> bool {
     })
 }
 
+/// Whether the active backend's GC has `config.taggedpointers` enabled
+/// (translationoption.py:185). The installed `is_tagged_immediate` callback
+/// answers `config.taggedpointers && (addr & 1 == 1)`, so probing it with an
+/// odd sentinel address isolates the config flag without a live pointer.
+/// Returns `false` when no backend is installed — same absent-backend
+/// semantics as [`is_tagged_immediate`], so flag-off paths are unaffected.
+pub fn taggedpointers_enabled() -> bool {
+    is_tagged_immediate(1)
+}
+
 /// gc.py:624-629 `gc_ll_descr.get_actual_typeid(gcptr)` shim.
 /// Delegates to the active backend's installed callback; returns
 /// `None` when no backend is installed, which mirrors

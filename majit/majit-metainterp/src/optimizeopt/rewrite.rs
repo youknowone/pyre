@@ -312,6 +312,58 @@ impl OptRewrite {
         OptimizationResult::PassOn
     }
 
+    /// Fold the tagged-int box/unbox round-trip
+    /// `IntRshift(IntOr(IntAddOvf(x, x), 1), 1) => x`.
+    ///
+    /// 5b's box path emits `IntAddOvf(raw, raw)` (== 2*x, guarded by its
+    /// `GuardNoOverflow` so the low bit is 0), then `IntOr(.., 1)` (set the
+    /// tag bit, == 2*x + 1), and the next iteration re-unboxes with an
+    /// arithmetic `IntRshift(.., 1)` (== x, since `(2x+1) >> 1 == x` for all
+    /// non-overflowing i64 x, including negatives). The upstream
+    /// `GuardNoOverflow` on the `IntAddOvf` makes `2*x` exact on the compiled
+    /// fast path, so the whole chain reduces to `x`. The `IntAddOvf`/`IntOr`/
+    /// `CastIntToPtr` box ops stay (the tagged store still needs the boxed
+    /// value); only this redundant unbox is eliminated, and DCE reclaims the
+    /// store leg if it later dies.
+    ///
+    /// Only the exact chain folds: the `IntOr` and `IntRshift` second args
+    /// must both be the constant `1`, and the `IntAddOvf`'s two args must be
+    /// the same box.
+    fn optimize_int_rshift_tag_unbox(
+        &self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> Option<OptimizationResult> {
+        // IntRshift(A, 1): shift amount must be the constant 1.
+        if ctx.get_constant_int_box(&op.arg(1).get_box_replacement(false)) != Some(1) {
+            return None;
+        }
+        // A resolves to IntOr(B, 1): second arg must be the constant 1.
+        let a = ctx.resolve_operand_operand(&op.arg(0));
+        let or_op = ctx.get_producing_op(&a)?;
+        if or_op.opcode != OpCode::IntOr {
+            return None;
+        }
+        if ctx.get_constant_int_box(&or_op.arg(1).get_box_replacement(false)) != Some(1) {
+            return None;
+        }
+        // B resolves to IntAddOvf(x, x): both args the same box.
+        let b = ctx.resolve_operand_operand(&or_op.arg(0));
+        let add_op = ctx.get_producing_op(&b)?;
+        if add_op.opcode != OpCode::IntAddOvf {
+            return None;
+        }
+        let x = ctx.resolve_operand_operand(&add_op.arg(0));
+        if !x.same_box(&ctx.resolve_operand_operand(&add_op.arg(1))) {
+            return None;
+        }
+        // The IntRshift result is x.
+        let b_old = Operand::from_bound_op(op_rc);
+        ctx.make_equal_to(&b_old, &x);
+        Some(OptimizationResult::Remove)
+    }
+
     // ── Unary operations ──
 
     /// Constant fold INT_IS_ZERO.
@@ -1703,6 +1755,19 @@ impl Optimization for OptRewrite {
             // their strength-reduction rules stay here with the opcode.
             OpCode::IntFloorDiv => self.optimize_int_floor_div(op, op_rc, ctx),
             OpCode::IntMod => self.optimize_int_mod(op, op_rc, ctx),
+
+            // Tagged-int box/unbox round-trip fold. The autogen IntRshift
+            // rules live in OptIntBounds (autogenintrules.rs); this pyre-only
+            // tag fold is gated on the active GC's taggedpointers config and
+            // is unreachable with it off (nothing emits the matched chain).
+            OpCode::IntRshift => {
+                if majit_gc::taggedpointers_enabled() {
+                    if let Some(result) = self.optimize_int_rshift_tag_unbox(op, op_rc, ctx) {
+                        return result;
+                    }
+                }
+                OptimizationResult::PassOn
+            }
 
             OpCode::IntIsZero => self.optimize_int_is_zero(op, ctx),
             OpCode::IntIsTrue => self.optimize_int_is_true(op, op_rc, ctx),
