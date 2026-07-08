@@ -153,8 +153,11 @@ pub struct JitInterpConfig {
     /// lowerer encounters a call whose path matches a key, it emits the named
     /// IR opcode (e.g. `IntAdd`) directly instead of routing through the
     /// call-policy machinery.  The concrete path calls the function normally.
-    /// jtransform.py:2030-2047 `_handle_int_special()` parity — oopspec
-    /// `int.add`/`int.sub`/`int.mul` codewriter-time rewrite.
+    /// In RPython, `int + int` is lowered to `int_add` at rtype time
+    /// (rint.py:314 `_rtype_template`), so the JIT codewriter never sees a
+    /// call.  In pyre's LLBC tracer, the equivalent Rust function call
+    /// (e.g. `val_add`) is still visible, so this config rewrites it to a
+    /// native IR binop at codewriter time.
     pub native_int_binops: Vec<(Path, Ident)>,
     /// Opt-in: route pure forward-advancing dispatch arms (those whose body
     /// only does work then `pc += N`, with no back-edge / `can_enter_jit!` /

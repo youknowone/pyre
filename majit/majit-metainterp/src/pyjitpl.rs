@@ -5220,8 +5220,8 @@ impl<M: Clone> MetaInterp<M> {
                 eprint!("{}", majit_ir::format_trace(&trace_ops, &constants));
             } else {
                 eprintln!("  [trace too large for full dump, showing op counts]");
-                let mut counts: std::collections::HashMap<majit_ir::OpCode, usize> =
-                    std::collections::HashMap::new();
+                let mut counts: indexmap::IndexMap<majit_ir::OpCode, usize> =
+                    indexmap::IndexMap::new();
                 for op in &trace_ops {
                     *counts.entry(op.opcode).or_insert(0) += 1;
                 }
@@ -5419,7 +5419,13 @@ impl<M: Clone> MetaInterp<M> {
                             &mut snapshot_vref_map,
                         ]);
                         let mut retry_constants = constants_snapshot;
-                        let mut simple_opt = Optimizer::default_pipeline();
+                        let mut simple_opt = if let Some(config) = vable_config.clone() {
+                            Optimizer::default_pipeline_with_virtualizable(config)
+                        } else {
+                            Optimizer::default_pipeline()
+                        };
+                        simple_opt.all_descrs =
+                            std::mem::take(&mut unroll_opt.all_descrs);
                         // history.py:220/261/307: `Const.type` /
                         // `InputArg.type` are intrinsic on the box;
                         // no raw-u32 type side-table propagation is
@@ -5469,6 +5475,10 @@ impl<M: Clone> MetaInterp<M> {
                                 retried_without_unroll = true;
                                 constants = retry_constants;
                                 let ni = simple_opt.final_num_inputs();
+                                // Return descrs to unroll_opt so take_back_all_descrs
+                                // at the end of compile_loop picks them up.
+                                unroll_opt.all_descrs =
+                                    std::mem::take(&mut simple_opt.all_descrs);
                                 (retry_ops, ni)
                             }
                             Ok(Err(_invalid_loop)) => {
@@ -5691,8 +5701,8 @@ impl<M: Clone> MetaInterp<M> {
                 (1.0 - compiled_ops.len() as f64 / num_ops_before as f64) * 100.0
             );
             if crate::diag_enabled() {
-                let mut counts: std::collections::HashMap<majit_ir::OpCode, usize> =
-                    std::collections::HashMap::new();
+                let mut counts: indexmap::IndexMap<majit_ir::OpCode, usize> =
+                    indexmap::IndexMap::new();
                 for op in &compiled_ops {
                     *counts.entry(op.opcode).or_insert(0) += 1;
                 }

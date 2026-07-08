@@ -3,7 +3,7 @@
 //! Runs the production analyze pipeline (`analyze_multiple_pipeline_with_modules`)
 //! over the Charon-extracted aheui LLBC set (`build/llbc/aheui-runtime.ullbc`
 //! + `build/llbc/aheuinterpreter.ullbc`, produced by
-//! `scripts/extract-llbc.py aheui-runtime aheuinterpreter`) with the portal
+//! `aheui/scripts/extract-llbc.sh`) with the portal
 //! bound to `aheuinterpreter::interp::mainloop`, and surfaces the two-phase
 //! prepass census dispositions for the mainloop closure (`val_*`,
 //! `Storage`, …).
@@ -13,7 +13,7 @@
 //!
 //! ```sh
 //! PYRE_RTYPER_VERBOSE=1 cargo test --release -p majit-translate \
-//!     --test test_aheui_census -- --ignored --nocapture
+//!     --test test_aheui_census -- --nocapture
 //! ```
 
 use majit_translate::{AnalyzeConfig, HostStaticAddrs, PipelineConfig, PortalSpec};
@@ -59,7 +59,7 @@ fn aheui_census_m0_val_helpers() {
     if !ensure_aheui_llbc_env(&["aheui-runtime.ullbc", "aheuinterpreter.ullbc"]) {
         eprintln!(
             "skipping: build/llbc/{{aheui-runtime,aheuinterpreter}}.ullbc missing — \
-             run `scripts/extract-llbc.py aheui-runtime aheuinterpreter`"
+             run `aheui/scripts/extract-llbc.sh`"
         );
         return;
     }
@@ -77,7 +77,7 @@ fn aheui_census_m0_val_helpers_smallint() {
     if !ensure_aheui_llbc_env(&["aheui-runtime-smallint.ullbc"]) {
         eprintln!(
             "skipping: build/llbc/aheui-runtime-smallint.ullbc missing — \
-             run `scripts/extract-llbc.py aheui-runtime-smallint`"
+             run `aheui/scripts/extract-llbc.sh`"
         );
         return;
     }
@@ -92,6 +92,14 @@ fn val_add_portal() -> PortalSpec {
         virtualizables: Vec::new(),
         red_types: Vec::new(),
     }
+}
+
+/// Extract the panic message from a `catch_unwind` error payload.
+fn panic_message(err: &Box<dyn std::any::Any + Send>) -> &str {
+    err.downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| err.downcast_ref::<&str>().copied())
+        .unwrap_or("<non-string panic>")
 }
 
 fn run_census_with_portal(portal: PortalSpec) {
@@ -127,13 +135,8 @@ fn run_census_with_portal(portal: PortalSpec) {
             eprintln!("insn vocabulary: {insns:?}");
         }
         Err(err) => {
-            let msg = err
-                .downcast_ref::<String>()
-                .map(String::as_str)
-                .or_else(|| err.downcast_ref::<&str>().copied())
-                .unwrap_or("<non-string panic>");
             eprintln!("=== aheui census: pipeline panicked after census ===");
-            eprintln!("panic: {msg}");
+            eprintln!("panic: {}", panic_message(&err));
         }
     }
 }
@@ -147,7 +150,7 @@ fn aheui_census_m0() {
     if !ensure_aheui_llbc_env(&["aheui-runtime.ullbc", "aheuinterpreter.ullbc"]) {
         eprintln!(
             "skipping: build/llbc/{{aheui-runtime,aheuinterpreter}}.ullbc missing — \
-             run `scripts/extract-llbc.py aheui-runtime aheuinterpreter`"
+             run `aheui/scripts/extract-llbc.sh`"
         );
         return;
     }
@@ -199,13 +202,8 @@ fn aheui_census_m0() {
             eprintln!("jitcode leaves: {names:?}");
         }
         Err(err) => {
-            let msg = err
-                .downcast_ref::<String>()
-                .map(String::as_str)
-                .or_else(|| err.downcast_ref::<&str>().copied())
-                .unwrap_or("<non-string panic>");
             eprintln!("=== aheui census M0: pipeline panicked after census ===");
-            eprintln!("panic: {msg}");
+            eprintln!("panic: {}", panic_message(&err));
         }
     }
 }
