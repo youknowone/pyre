@@ -14030,6 +14030,34 @@ fn walker_emit_float_pow_inline(
     Ok(Some(z))
 }
 
+/// Box a raw i64 int result. Under `CAN_BE_TAGGED`, when the recorded
+/// concrete `value` fits the tagged range, emit an immediate
+/// `(value<<1)|1` (rtagged.py ll_int_to_unboxed) guarded by
+/// `IntAddOvf(raw,raw)` + `GuardNoOverflow` — the doubling overflow IS the
+/// fits check, and a runtime value that does not fit deopts instead of
+/// producing a wrong box. Otherwise (or flag off) fall back to the heap
+/// `wrapint` box. The caller stamps the Ref concrete.
+fn walker_box_int(
+    ctx: &mut WalkContext<'_, '_>,
+    op_pc: usize,
+    raw: OpRef,
+    value: i64,
+) -> Result<OpRef, DispatchError> {
+    if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::fits_tagged(value) {
+        let doubled = ctx.trace_ctx.record_op(OpCode::IntAddOvf, &[raw, raw]);
+        ctx.trace_ctx
+            .set_opref_concrete(doubled, majit_ir::Value::Int(value << 1));
+        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoOverflow, &[])?;
+        let one = ctx.trace_ctx.const_int(1);
+        let tagged = ctx.trace_ctx.record_op(OpCode::IntOr, &[doubled, one]);
+        ctx.trace_ctx
+            .set_opref_concrete(tagged, majit_ir::Value::Int((value << 1) | 1));
+        let ptr = ctx.trace_ctx.record_op(OpCode::CastIntToPtr, &[tagged]);
+        return Ok(ptr);
+    }
+    Ok(crate::state::wrapint(ctx.trace_ctx, raw))
+}
+
 /// #57: walker-native speculative int specialization for the `BINARY_OP`
 /// helper residual_call (oopspec `BinaryOp`).  Re-derives
 /// `generated_binary_int_value`'s structure (`guard_class` +
@@ -14243,7 +14271,7 @@ fn try_walker_specialize_binary_op_int(
     let boxed = if result_is_bool {
         crate::helpers::emit_trace_bool_value_from_truth(ctx.trace_ctx, raw_result, false)
     } else {
-        crate::state::wrapint(ctx.trace_ctx, raw_result)
+        walker_box_int(ctx, op_pc, raw_result, concrete_value)?
     };
     ctx.trace_ctx.set_opref_concrete(
         boxed,
