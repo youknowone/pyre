@@ -263,6 +263,14 @@ pub fn w_long_from_raw(value: *mut BigInt) -> PyObjectRef {
 /// payload is GC-managed at a stable address (held on the Rust stack by host
 /// callers without rooting), and the wrapper traces it via the registered
 /// `LONG_VALUE_OFFSET` gc-pointer.
+///
+/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py:139`): the body
+/// delegates through `alloc_bigint_stable -> *mut BigInt`, so tracing into it
+/// leaks the raw `BigInt` pointee into the return model and unifies against the
+/// `w_int_new` fast path as `PyObject ∪ BigInt`. Residualising the whole box
+/// tail models it by signature — a plain `PyObjectRef` GCREF with no
+/// discriminant to erase — the `w_str_new`/`box_bigint_constant` twin.
+#[majit_macros::dont_look_inside]
 pub fn w_long_new(value: BigInt) -> PyObjectRef {
     w_long_from_raw(alloc_bigint_stable(value))
 }
