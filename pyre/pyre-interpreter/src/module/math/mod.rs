@@ -16,7 +16,7 @@ crate::py_module! {
         "inf" => pyre_object::floatobject::w_float_new(pymath::math::INF),
         "nan" => pyre_object::floatobject::w_float_new(pymath::math::NAN),
     },
-    functions: {
+    module_functions: {
         // Trigonometric
         "sin"   / 1 = m::sin,
         "cos"   / 1 = m::cos,

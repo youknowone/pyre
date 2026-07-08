@@ -28,15 +28,25 @@ pub fn try_get_double(obj: PyObjectRef) -> Result<f64, crate::PyError> {
             return Ok(floatobject::w_float_get_value(obj));
         }
         if is_long(obj) {
-            return Ok(jit_bigint_to_f64_or_nan(w_long_get_value(obj)));
+            // A Python int is always finite, so a non-finite conversion means
+            // the magnitude exceeds f64 range — PyFloat_AsDouble raises here.
+            let v = jit_bigint_to_f64_or_nan(w_long_get_value(obj));
+            if !v.is_finite() {
+                return Err(crate::PyError::overflow_error(
+                    "int too large to convert to float",
+                ));
+            }
+            return Ok(v);
         }
         if is_bool(obj) {
             return Ok(if w_bool_get_value(obj) { 1.0 } else { 0.0 });
         }
     }
-    if let Ok(method) = crate::baseobjspace::getattr_str(obj, "__float__") {
-        let result = crate::call_function(method, &[obj]);
-        if !result.is_null() {
+    // A raising `__float__`/`__index__` (descriptor `__get__` or the call
+    // itself) propagates instead of being reported as "must be real number".
+    match crate::baseobjspace::getattr_str(obj, "__float__") {
+        Ok(method) => {
+            let result = crate::builtins::call_and_check(method, &[])?;
             unsafe {
                 if is_float(result) {
                     return Ok(floatobject::w_float_get_value(result));
@@ -44,18 +54,40 @@ pub fn try_get_double(obj: PyObjectRef) -> Result<f64, crate::PyError> {
                 if is_int(result) {
                     return Ok(w_int_get_value(result) as f64);
                 }
+                if is_long(result) {
+                    let v = jit_bigint_to_f64_or_nan(w_long_get_value(result));
+                    if !v.is_finite() {
+                        return Err(crate::PyError::overflow_error(
+                            "int too large to convert to float",
+                        ));
+                    }
+                    return Ok(v);
+                }
             }
         }
+        Err(err) if err.kind != crate::PyErrorKind::AttributeError => return Err(err),
+        Err(_) => {}
     }
-    if let Ok(method) = crate::baseobjspace::getattr_str(obj, "__index__") {
-        let result = crate::call_function(method, &[obj]);
-        if !result.is_null() {
+    match crate::baseobjspace::getattr_str(obj, "__index__") {
+        Ok(method) => {
+            let result = crate::builtins::call_and_check(method, &[])?;
             unsafe {
                 if is_int(result) {
                     return Ok(w_int_get_value(result) as f64);
                 }
+                if is_long(result) {
+                    let v = jit_bigint_to_f64_or_nan(w_long_get_value(result));
+                    if !v.is_finite() {
+                        return Err(crate::PyError::overflow_error(
+                            "int too large to convert to float",
+                        ));
+                    }
+                    return Ok(v);
+                }
             }
         }
+        Err(err) if err.kind != crate::PyErrorKind::AttributeError => return Err(err),
+        Err(_) => {}
     }
     Err(crate::PyError::type_error("must be real number"))
 }
@@ -67,6 +99,29 @@ fn map_err(r: pymath::Result<f64>) -> PyResult {
         Ok(v) => Ok(floatobject::w_float_new(v)),
         Err(pymath::Error::EDOM) => Err(crate::PyError::value_error("math domain error")),
         Err(pymath::Error::ERANGE) => Err(crate::PyError::overflow_error("math range error")),
+    }
+}
+
+fn map_int_err(e: pymath::Error) -> crate::PyError {
+    match e {
+        pymath::Error::EDOM => crate::PyError::value_error("math domain error"),
+        pymath::Error::ERANGE => crate::PyError::overflow_error("math range error"),
+    }
+}
+
+/// `float.__repr__` of a finite value, used to embed the offending operand
+/// in a domain-error message.
+fn float_repr(val: f64) -> String {
+    if val.is_nan() {
+        "nan".to_owned()
+    } else if val.is_infinite() {
+        if val.is_sign_positive() {
+            "inf".to_owned()
+        } else {
+            "-inf".to_owned()
+        }
+    } else {
+        crate::display::format_float_repr(val)
     }
 }
 
@@ -82,6 +137,32 @@ macro_rules! pm1 {
                 )));
             }
             map_err(pymath::math::$name(try_get_double(args[0])?))
+        }
+    };
+}
+
+/// Like `pm1!`, but an `EDOM` result becomes a value-carrying message
+/// ("<prefix>, got <repr>") instead of the generic "math domain error".
+macro_rules! pm1_edom {
+    ($name:ident, $prefix:literal) => {
+        pub fn $name(args: &[PyObjectRef]) -> PyResult {
+            if args.len() != 1 {
+                return Err(crate::PyError::type_error(concat!(
+                    stringify!($name),
+                    "() takes exactly one argument"
+                )));
+            }
+            let val = try_get_double(args[0])?;
+            match pymath::math::$name(val) {
+                Ok(v) => Ok(floatobject::w_float_new(v)),
+                Err(pymath::Error::EDOM) => Err(crate::PyError::value_error(format!(
+                    concat!($prefix, ", got {}"),
+                    float_repr(val)
+                ))),
+                Err(pymath::Error::ERANGE) => {
+                    Err(crate::PyError::overflow_error("math range error"))
+                }
+            }
         }
     };
 }
@@ -103,21 +184,21 @@ macro_rules! pm1_plain {
 }
 
 // Trigonometric
-pm1!(sin);
-pm1!(cos);
-pm1!(tan);
-pm1!(asin);
-pm1!(acos);
+pm1_edom!(sin, "expected a finite input");
+pm1_edom!(cos, "expected a finite input");
+pm1_edom!(tan, "expected a finite input");
+pm1_edom!(asin, "expected a number in range from -1 up to 1");
+pm1_edom!(acos, "expected a number in range from -1 up to 1");
 pm1!(atan);
 pm1!(sinh);
 pm1!(cosh);
 pm1!(tanh);
 pm1!(asinh);
 pm1!(acosh);
-pm1!(atanh);
+pm1_edom!(atanh, "expected a number between -1 and 1");
 
 // Exponential / logarithmic
-pm1!(sqrt);
+pm1_edom!(sqrt, "expected a nonnegative input");
 pm1!(cbrt);
 pm1!(exp);
 pm1!(exp2);
@@ -127,7 +208,7 @@ pm1!(log1p);
 // Gamma / error
 pm1!(erf);
 pm1!(erfc);
-pm1!(gamma);
+pm1_edom!(gamma, "expected a noninteger or positive integer");
 pm1!(lgamma);
 
 // Misc
@@ -169,22 +250,27 @@ pub fn atan2(args: &[PyObjectRef]) -> PyResult {
 }
 
 pub fn hypot(args: &[PyObjectRef]) -> PyResult {
-    let coords: Vec<f64> = args.iter().map(|&a| get_double(a)).collect();
+    let coords: Vec<f64> = args
+        .iter()
+        .map(|&a| try_get_double(a))
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(floatobject::w_float_new(pymath::math::hypot(&coords)))
 }
 
 pub fn dist(args: &[PyObjectRef]) -> PyResult {
-    if args.len() < 2 {
-        return Err(crate::PyError::type_error("dist requires 2 arguments"));
+    if args.len() != 2 {
+        return Err(crate::PyError::type_error(
+            "dist() takes exactly 2 arguments",
+        ));
     }
     let p: Vec<f64> = crate::builtins::collect_iterable(args[0])?
         .iter()
-        .map(|&a| get_double(a))
-        .collect();
+        .map(|&a| try_get_double(a))
+        .collect::<Result<Vec<_>, _>>()?;
     let q: Vec<f64> = crate::builtins::collect_iterable(args[1])?
         .iter()
-        .map(|&a| get_double(a))
-        .collect();
+        .map(|&a| try_get_double(a))
+        .collect::<Result<Vec<_>, _>>()?;
     if p.len() != q.len() {
         return Err(crate::PyError::value_error(
             "both points must have the same number of dimensions",
@@ -195,24 +281,29 @@ pub fn dist(args: &[PyObjectRef]) -> PyResult {
 
 // ── Integer-returning functions ──────────────────────────────────────
 
-/// Invoke `__ceil__`/`__floor__`/`__trunc__` or fall back to converting
-/// the argument to a float via `__float__`. Raises TypeError when the
-/// argument has no numeric interpretation — PyPy: mathmodule.c
-/// math_1_impl's `double_from_object` routine.
-fn math_unary_int(args: &[PyObjectRef], dunder: &str, fname: &str) -> PyResult {
+/// Invoke `__ceil__`/`__floor__`/`__trunc__` looked up on the argument's
+/// type (special-method semantics, so an instance attribute is ignored).
+///
+/// `math.ceil`/`math.floor` fall back to `__float__` coercion when the
+/// dunder is absent, so `ceil(FloatLike(...))` works; `math.trunc` has no
+/// such fallback and requires `__trunc__`.
+fn math_unary_int(
+    args: &[PyObjectRef],
+    dunder: &str,
+    fname: &str,
+    fallback_float: bool,
+) -> PyResult {
     if args.len() != 1 {
         return Err(crate::PyError::type_error(format!(
             "{fname}() takes exactly 1 argument",
         )));
     }
-    // Prefer the dunder so subclasses of float with `__ceil__` use their
-    // override even when the parent float path would also succeed. If the
-    // descriptor itself raises (e.g. BadDescr.__get__ → ValueError),
+    // If the descriptor itself raises (e.g. BadDescr.__get__ → ValueError),
     // propagate that error rather than silently falling back to float.
-    match crate::baseobjspace::getattr_str(args[0], dunder) {
-        Ok(method) => {
+    match unsafe { crate::baseobjspace::lookup_special(args[0], dunder) } {
+        Ok(Some(method)) => {
             crate::call::clear_call_error();
-            let result = crate::call_function(method, &[args[0]]);
+            let result = crate::call_function(method, &[]);
             if !result.is_null() {
                 return Ok(result);
             }
@@ -220,13 +311,16 @@ fn math_unary_int(args: &[PyObjectRef], dunder: &str, fname: &str) -> PyResult {
                 return Err(err);
             }
         }
-        Err(err) if err.kind != crate::PyErrorKind::AttributeError => {
-            return Err(err);
-        }
-        _ => {}
+        Ok(None) => {}
+        Err(err) => return Err(err),
     }
-    // Fall back to `__float__` coercion — mathmodule.c uses PyNumber_Float
-    // in math_1_impl for this role. `try_get_double` raises TypeError
+    if !fallback_float {
+        return Err(crate::PyError::type_error(format!(
+            "type {} doesn't define {fname}() method",
+            crate::baseobjspace::object_functionstr_type_name(args[0])
+        )));
+    }
+    // Fall back to `__float__` coercion — `try_get_double` raises TypeError
     // when the operand has no numeric interpretation.
     let v = try_get_double(args[0])
         .map_err(|_| crate::PyError::type_error(format!("type has no {fname}() method")))?;
@@ -238,15 +332,15 @@ fn math_unary_int(args: &[PyObjectRef], dunder: &str, fname: &str) -> PyResult {
 }
 
 pub fn floor(args: &[PyObjectRef]) -> PyResult {
-    math_unary_int(args, "__floor__", "floor")
+    math_unary_int(args, "__floor__", "floor", true)
 }
 
 pub fn ceil(args: &[PyObjectRef]) -> PyResult {
-    math_unary_int(args, "__ceil__", "ceil")
+    math_unary_int(args, "__ceil__", "ceil", true)
 }
 
 pub fn trunc(args: &[PyObjectRef]) -> PyResult {
-    math_unary_int(args, "__trunc__", "trunc")
+    math_unary_int(args, "__trunc__", "trunc", false)
 }
 
 // ── Special signatures ──────────────────────────────────────────────
@@ -295,29 +389,41 @@ fn bigint_log(n: &malachite_bigint::BigInt, base: f64) -> Result<f64, crate::PyE
     Ok(result)
 }
 
-/// PyPy: pypy/module/math/interp_math.py::_log_any —
-/// special-case long arguments to avoid overflow in `get_double`.
+/// Special-case integer arguments to avoid overflow, and give the domain
+/// error the value-carrying message except for an int argument, whose error
+/// carries no value.
 fn log_any(w_x: PyObjectRef, base: f64) -> PyResult {
+    use num_traits::Signed;
     unsafe {
-        if pyre_object::is_long(w_x) {
-            let num = pyre_object::w_long_get_value(w_x);
-            let r = bigint_log(num, base)?;
-            if base != 0.0 && base != 10.0 && base != 2.0 {
-                if base <= 0.0 || base.is_nan() {
-                    return Err(crate::PyError::value_error("math domain error"));
-                }
+        if pyre_object::is_bool(w_x) || pyre_object::is_int(w_x) || pyre_object::is_long(w_x) {
+            let num_owned;
+            let num: &malachite_bigint::BigInt = if pyre_object::is_long(w_x) {
+                pyre_object::w_long_get_value(w_x)
+            } else if pyre_object::is_bool(w_x) {
+                num_owned =
+                    malachite_bigint::BigInt::from(pyre_object::w_bool_get_value(w_x) as i64);
+                &num_owned
+            } else {
+                num_owned = malachite_bigint::BigInt::from(pyre_object::w_int_get_value(w_x));
+                &num_owned
+            };
+            if !num.is_positive() {
+                return Err(crate::PyError::value_error("expected a positive input"));
             }
-            return Ok(floatobject::w_float_new(r));
+            return Ok(floatobject::w_float_new(bigint_log(num, base)?));
         }
     }
-    let x = get_double(w_x);
+    let x = try_get_double(w_x)?;
     // NaN propagates through log.
     if x.is_nan() {
         return Ok(floatobject::w_float_new(f64::NAN));
     }
-    // CPython: domain error for x <= 0 (but x == +inf is fine).
+    // Domain error for x <= 0 (but x == +inf is fine).
     if x <= 0.0 {
-        return Err(crate::PyError::value_error("math domain error"));
+        return Err(crate::PyError::value_error(format!(
+            "expected a positive input, got {}",
+            float_repr(x)
+        )));
     }
     if base == 10.0 {
         Ok(floatobject::w_float_new(x.log10()))
@@ -326,9 +432,6 @@ fn log_any(w_x: PyObjectRef, base: f64) -> PyResult {
     } else if base == 0.0 {
         Ok(floatobject::w_float_new(x.ln()))
     } else {
-        if base <= 0.0 || base.is_nan() {
-            return Err(crate::PyError::value_error("math domain error"));
-        }
         Ok(floatobject::w_float_new(x.ln() / base.ln()))
     }
 }
@@ -338,7 +441,19 @@ pub fn log(args: &[PyObjectRef]) -> PyResult {
         return Err(crate::PyError::type_error("log() takes 1 or 2 arguments"));
     }
     let base = if args.len() >= 2 {
-        get_double(args[1])
+        // The base is validated before the argument, so log(x, base) with a
+        // non-positive base reports the base rather than the argument.
+        let b = try_get_double(args[1])?;
+        if b <= 0.0 {
+            return Err(crate::PyError::value_error(format!(
+                "expected a positive input, got {}",
+                float_repr(b)
+            )));
+        }
+        if b == 1.0 {
+            return Err(crate::PyError::value_error("math domain error"));
+        }
+        b
     } else {
         0.0
     };
@@ -413,14 +528,32 @@ pub fn isfinite(args: &[PyObjectRef]) -> PyResult {
 }
 
 pub fn isclose(args: &[PyObjectRef]) -> PyResult {
-    if args.len() < 2 {
-        return Err(crate::PyError::type_error("isclose requires 2 arguments"));
+    let is_kwargs = !args.is_empty()
+        && unsafe {
+            let last = *args.last().unwrap();
+            pyre_object::is_dict(last)
+                && pyre_object::w_dict_lookup(last, pyre_object::w_str_new("__pyre_kw__")).is_some()
+        };
+    let (pos, kwargs) = if is_kwargs {
+        (&args[..args.len() - 1], Some(*args.last().unwrap()))
+    } else {
+        (&args[..], None)
+    };
+    if pos.len() != 2 {
+        return Err(crate::PyError::type_error(
+            "isclose() takes exactly 2 positional arguments",
+        ));
     }
-    let rel_tol = args.get(2).map(|&a| get_double(a));
-    let abs_tol = args.get(3).map(|&a| get_double(a));
-    match pymath::math::isclose(get_double(args[0]), get_double(args[1]), rel_tol, abs_tol) {
+    let read = |name: &str| -> Option<f64> {
+        kwargs
+            .and_then(|kw| unsafe { pyre_object::w_dict_lookup(kw, pyre_object::w_str_new(name)) })
+            .map(get_double)
+    };
+    let rel_tol = read("rel_tol");
+    let abs_tol = read("abs_tol");
+    match pymath::math::isclose(get_double(pos[0]), get_double(pos[1]), rel_tol, abs_tol) {
         Ok(v) => Ok(w_bool_from(v)),
-        Err(e) => Err(crate::PyError::value_error(format!("{e:?}"))),
+        Err(e) => Err(map_int_err(e)),
     }
 }
 
@@ -441,6 +574,12 @@ pub fn factorial(args: &[PyObjectRef]) -> PyResult {
         }
     }
     let n_big = get_bigint(args[0])?;
+    use num_traits::Signed;
+    if n_big.is_negative() {
+        return Err(crate::PyError::value_error(
+            "factorial() not defined for negative values",
+        ));
+    }
     let n = if jit_bigint_to_i64_fits(&n_big) != 0 {
         jit_bigint_to_i64_value(&n_big)
     } else {
@@ -448,11 +587,6 @@ pub fn factorial(args: &[PyObjectRef]) -> PyResult {
             "factorial() argument should not exceed i64::MAX",
         ));
     };
-    if n < 0 {
-        return Err(crate::PyError::value_error(
-            "factorial() not defined for negative values",
-        ));
-    }
     // Straightforward BigInt multiplication; overflow impossible with
     // arbitrary precision. Faster algorithms (binary split) exist in
     // pypy/module/math/app_math.py but structural correctness is what
@@ -497,7 +631,7 @@ fn get_bigint(obj: PyObjectRef) -> Result<malachite_bigint::BigInt, crate::PyErr
     }
     // __index__ dunder — PyPy: descroperation.py space.index.
     if let Ok(method) = crate::baseobjspace::getattr_str(obj, "__index__") {
-        let result = crate::call_function(method, &[obj]);
+        let result = crate::call_function(method, &[]);
         if !result.is_null() {
             unsafe {
                 if pyre_object::is_int(result) {
@@ -544,73 +678,135 @@ pub fn lcm(args: &[PyObjectRef]) -> PyResult {
     }
 }
 
-pub fn comb(args: &[PyObjectRef]) -> PyResult {
+/// `w_int_new` when the value fits an i64, else `w_long_new`.
+fn bigint_to_pyint(b: malachite_bigint::BigInt) -> PyObjectRef {
     use num_traits::ToPrimitive;
-
-    if args.len() < 2 {
-        return Err(crate::PyError::type_error("comb() takes 2 arguments"));
-    }
-    let n_big = get_bigint(args[0])?;
-    let k_big = get_bigint(args[1])?;
-    let n = if jit_bigint_to_i64_fits(&n_big) != 0 {
-        jit_bigint_to_i64_value(&n_big)
-    } else {
-        return Err(crate::PyError::overflow_error(
-            "comb() argument should not exceed i64::MAX",
-        ));
-    };
-    let k = if jit_bigint_to_i64_fits(&k_big) != 0 {
-        jit_bigint_to_i64_value(&k_big)
-    } else {
-        return Err(crate::PyError::overflow_error(
-            "comb() argument should not exceed i64::MAX",
-        ));
-    };
-    match pymath::math::integer::comb(n, k) {
-        Ok(v) => match v.to_i64() {
-            Some(i) => Ok(w_int_new(i)),
-            None => Ok(w_long_new(malachite_bigint::BigInt::from(v))),
-        },
-        Err(e) => Err(crate::PyError::value_error(format!("{e:?}"))),
+    match b.to_i64() {
+        Some(i) => w_int_new(i),
+        None => w_long_new(b),
     }
 }
 
+fn biguint_to_pyint(b: malachite_bigint::BigUint) -> PyObjectRef {
+    bigint_to_pyint(malachite_bigint::BigInt::from(b))
+}
+
+pub fn comb(args: &[PyObjectRef]) -> PyResult {
+    use num_traits::{Signed, ToPrimitive};
+
+    if args.len() != 2 {
+        return Err(crate::PyError::type_error(
+            "comb() takes exactly two arguments",
+        ));
+    }
+    let n_big = get_bigint(args[0])?;
+    let k_big = get_bigint(args[1])?;
+
+    if n_big.is_negative() {
+        return Err(crate::PyError::value_error(
+            "n must be a non-negative integer",
+        ));
+    }
+    if k_big.is_negative() {
+        return Err(crate::PyError::value_error(
+            "k must be a non-negative integer",
+        ));
+    }
+
+    // Fast path: n fits in i64.
+    if let Some(ni) = n_big.to_i64() {
+        // k out of range [0, n] means the result is 0.
+        let ki = match k_big.to_i64() {
+            Some(k) if (0..=ni).contains(&k) => k,
+            _ => return Ok(w_int_new(0)),
+        };
+        // Symmetry C(n, k) == C(n, n-k): compute with the smaller index.
+        let ki = ki.min(ni - ki);
+        if ki > 1 {
+            let v = pymath::math::integer::comb(ni, ki).map_err(map_int_err)?;
+            return Ok(biguint_to_pyint(v));
+        }
+        if ki == 0 {
+            return Ok(w_int_new(1));
+        }
+        return Ok(bigint_to_pyint(n_big)); // ki == 1
+    }
+
+    // BigInt path: n does not fit i64. Reduce by symmetry, then the smaller
+    // index must fit u64 for the divide-and-conquer product.
+    let n_minus_k = &n_big - &k_big;
+    if n_minus_k.is_negative() {
+        return Ok(w_int_new(0));
+    }
+    let effective_k = if n_minus_k < k_big {
+        &n_minus_k
+    } else {
+        &k_big
+    };
+    let ki: u64 = match effective_k.to_u64() {
+        Some(k) => k,
+        None => {
+            return Err(crate::PyError::overflow_error(format!(
+                "min(n - k, k) must not exceed {}",
+                u64::MAX
+            )));
+        }
+    };
+    Ok(biguint_to_pyint(pymath::math::comb_bigint(&n_big, ki)))
+}
+
 pub fn perm(args: &[PyObjectRef]) -> PyResult {
-    use num_traits::ToPrimitive;
+    use num_traits::{Signed, ToPrimitive};
 
     if args.is_empty() {
         return Err(crate::PyError::type_error(
             "perm() takes at least 1 argument",
         ));
     }
-    let n_big = get_bigint(args[0])?;
-    let n = if jit_bigint_to_i64_fits(&n_big) != 0 {
-        jit_bigint_to_i64_value(&n_big)
-    } else {
-        return Err(crate::PyError::overflow_error(
-            "perm() argument should not exceed i64::MAX",
+    if args.len() > 2 {
+        return Err(crate::PyError::type_error(
+            "perm() takes at most 2 arguments",
         ));
-    };
-    // perm(n, None) means "unlimited" — treat as perm(n).
-    let k = if args.len() >= 2 && !unsafe { pyre_object::is_none(args[1]) } {
-        let k_big = get_bigint(args[1])?;
-        if jit_bigint_to_i64_fits(&k_big) != 0 {
-            Some(jit_bigint_to_i64_value(&k_big))
-        } else {
-            return Err(crate::PyError::overflow_error(
-                "perm() argument should not exceed i64::MAX",
-            ));
-        }
+    }
+    let n_big = get_bigint(args[0])?;
+    if n_big.is_negative() {
+        return Err(crate::PyError::value_error(
+            "n must be a non-negative integer",
+        ));
+    }
+    // perm(n, None) means k = n (factorial).
+    let k_big = if args.len() >= 2 && !unsafe { pyre_object::is_none(args[1]) } {
+        Some(get_bigint(args[1])?)
     } else {
         None
     };
-    match pymath::math::integer::perm(n, k) {
-        Ok(v) => match v.to_i64() {
-            Some(i) => Ok(w_int_new(i)),
-            None => Ok(w_long_new(malachite_bigint::BigInt::from(v))),
-        },
-        Err(e) => Err(crate::PyError::value_error(format!("{e:?}"))),
+    if let Some(ref k_val) = k_big {
+        if k_val.is_negative() {
+            return Err(crate::PyError::value_error(
+                "k must be a non-negative integer",
+            ));
+        }
+        if k_val > &n_big {
+            return Ok(w_int_new(0));
+        }
     }
+    // k (falling-factorial length) must fit u64 for the product.
+    let ki: u64 = match &k_big {
+        None => n_big.to_u64().ok_or_else(|| {
+            crate::PyError::overflow_error(format!("n must not exceed {}", u64::MAX))
+        })?,
+        Some(k_val) => k_val.to_u64().ok_or_else(|| {
+            crate::PyError::overflow_error(format!("k must not exceed {}", u64::MAX))
+        })?,
+    };
+    // Fast path: n fits in i64 and k > 1 uses the i64 kernel.
+    if let Some(ni) = n_big.to_i64() {
+        if ni >= 0 && ki > 1 {
+            let v = pymath::math::integer::perm(ni, Some(ki as i64)).map_err(map_int_err)?;
+            return Ok(biguint_to_pyint(v));
+        }
+    }
+    Ok(biguint_to_pyint(pymath::math::perm_bigint(&n_big, ki)))
 }
 
 pub fn isqrt(args: &[PyObjectRef]) -> PyResult {
@@ -628,17 +824,17 @@ pub fn isqrt(args: &[PyObjectRef]) -> PyResult {
                 None => Ok(w_long_new(v)),
             }
         }
-        Err(e) => Err(crate::PyError::value_error(format!("{e:?}"))),
+        Err(e) => Err(map_int_err(e)),
     }
 }
 
 pub fn fsum(args: &[PyObjectRef]) -> PyResult {
     let items = crate::builtins::collect_iterable(args[0])?;
-    let floats: Vec<f64> = items.iter().map(|&a| get_double(a)).collect();
-    match pymath::math::fsum(floats) {
-        Ok(v) => Ok(floatobject::w_float_new(v)),
-        Err(e) => Err(crate::PyError::value_error(format!("{e:?}"))),
-    }
+    let floats: Vec<f64> = items
+        .iter()
+        .map(|&a| try_get_double(a))
+        .collect::<Result<Vec<_>, _>>()?;
+    map_err(pymath::math::fsum(floats))
 }
 
 pub fn prod(args: &[PyObjectRef]) -> PyResult {
@@ -705,7 +901,7 @@ pub fn prod(args: &[PyObjectRef]) -> PyResult {
 /// mathmodule.c `math_sumprod_impl` semantics using the generic
 /// `space.mul` + `space.add` loop.
 pub fn sumprod(args: &[PyObjectRef]) -> PyResult {
-    if args.len() < 2 {
+    if args.len() != 2 {
         return Err(crate::PyError::type_error(
             "sumprod() takes exactly 2 arguments",
         ));
@@ -717,21 +913,10 @@ pub fn sumprod(args: &[PyObjectRef]) -> PyResult {
             "Inputs are not the same length",
         ));
     }
-    let mut acc: PyObjectRef = floatobject::w_float_new(0.0);
-    let mut all_int = true;
-    for (a, b) in p.iter().zip(q.iter()) {
-        unsafe {
-            if !(pyre_object::is_int(*a) || pyre_object::is_long(*a))
-                || !(pyre_object::is_int(*b) || pyre_object::is_long(*b))
-            {
-                all_int = false;
-                break;
-            }
-        }
-    }
-    if all_int {
-        acc = w_int_new(0);
-    }
+    // The accumulator starts as int 0 so type coercion follows the pure
+    // Python `total = 0; total += p_i * q_i` recipe: int stays int, and a
+    // Decimal/Fraction/float product widens the running total on first add.
+    let mut acc: PyObjectRef = w_int_new(0);
     for (a, b) in p.iter().zip(q.iter()) {
         let prod = crate::baseobjspace::mul(*a, *b)?;
         acc = crate::baseobjspace::add(acc, prod)?;
@@ -801,15 +986,41 @@ pub fn modf(args: &[PyObjectRef]) -> PyResult {
 }
 
 pub fn nextafter(args: &[PyObjectRef]) -> PyResult {
-    if args.len() < 2 {
+    let is_kwargs = !args.is_empty()
+        && unsafe {
+            let last = *args.last().unwrap();
+            pyre_object::is_dict(last)
+                && pyre_object::w_dict_lookup(last, pyre_object::w_str_new("__pyre_kw__")).is_some()
+        };
+    let (pos, kwargs) = if is_kwargs {
+        (&args[..args.len() - 1], Some(*args.last().unwrap()))
+    } else {
+        (&args[..], None)
+    };
+    if pos.len() != 2 {
         return Err(crate::PyError::type_error(
-            "nextafter() takes at least 2 arguments",
+            "nextafter() takes exactly 2 positional arguments",
         ));
     }
+    let steps = match kwargs
+        .and_then(|kw| unsafe { pyre_object::w_dict_lookup(kw, pyre_object::w_str_new("steps")) })
+    {
+        Some(s) => {
+            use num_traits::ToPrimitive;
+            let b = get_bigint(s)?;
+            if b.sign() == malachite_bigint::Sign::Minus {
+                return Err(crate::PyError::value_error(
+                    "steps must be a non-negative integer",
+                ));
+            }
+            Some(b.to_u64().unwrap_or(u64::MAX))
+        }
+        None => None,
+    };
     Ok(floatobject::w_float_new(pymath::math::nextafter(
-        get_double(args[0]),
-        get_double(args[1]),
-        None,
+        get_double(pos[0]),
+        get_double(pos[1]),
+        steps,
     )))
 }
 

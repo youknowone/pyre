@@ -5059,9 +5059,15 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             }));
         }
         if pyre_object::is_long(obj) {
-            return Ok(floatobject::w_float_new(
-                pyre_object::jit_bigint_to_f64_or_nan(pyre_object::w_long_get_value(obj)),
-            ));
+            // A Python int is finite, so a non-finite conversion means the
+            // magnitude exceeds f64 range.
+            let v = pyre_object::jit_bigint_to_f64_or_nan(pyre_object::w_long_get_value(obj));
+            if !v.is_finite() {
+                return Err(crate::PyError::overflow_error(
+                    "int too large to convert to float",
+                ));
+            }
+            return Ok(floatobject::w_float_new(v));
         }
         if is_str(obj) {
             let raw = w_str_get_value(obj);

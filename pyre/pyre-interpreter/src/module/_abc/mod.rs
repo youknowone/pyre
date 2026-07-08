@@ -9,6 +9,20 @@
 
 use pyre_object::*;
 
+// `_py_abc.ABCMeta.__new__` (`_py_abc.py:48`) gives every ABC its OWN
+// `_abc_registry`. Create it here as a per-class list so the registry is not
+// inherited: without an own entry `register`/`subclass_of` would resolve
+// `_abc_registry` up the MRO and share one base class's list across every
+// descendant ABC (e.g. Complex/Real/Rational/Integral all collapsing to a
+// single registry).
+fn abc_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if let Some(&cls) = args.first() {
+        let fresh = w_list_new(vec![]);
+        crate::baseobjspace::setattr_str(cls, "_abc_registry", fresh)?;
+    }
+    Ok(w_none())
+}
+
 // `app_abc.py:_abc_register` — `cls._abc_registry.add(subclass)`.
 // Pyre stores the registry as a list attribute (no WeakSet); duplicates
 // are skipped to keep the list bounded.
@@ -139,7 +153,7 @@ crate::py_module! {
     "_abc",
     functions: {
         "get_cache_token"     / 0 = |_| Ok(w_int_new(0)),
-        "_abc_init"           / 1 = |_| Ok(w_none()),
+        "_abc_init"           / 1 = abc_init,
         "_abc_register"       / 2 = register,
         "_abc_instancecheck"  / 2 = instancecheck,
         "_abc_subclasscheck"  / 2 = subclasscheck,

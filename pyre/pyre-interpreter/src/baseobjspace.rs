@@ -5667,6 +5667,29 @@ pub unsafe fn lookup(obj: PyObjectRef, name: &str) -> Option<PyObjectRef> {
     lookup_in_type(w_type, name)
 }
 
+/// `_PyObject_LookupSpecial(obj, name)` — resolve a special method on the
+/// **type** only, ignoring the instance dict, then bind it through the
+/// descriptor `__get__` protocol.
+///
+/// Returns `Ok(None)` when the type MRO does not define `name`, `Ok(Some(m))`
+/// with the bound method otherwise, and propagates a descriptor `__get__`
+/// error (e.g. a `__get__` that raises `ValueError`).
+pub unsafe fn lookup_special(
+    obj: PyObjectRef,
+    name: &str,
+) -> Result<Option<PyObjectRef>, crate::PyError> {
+    let Some(descr) = lookup(obj, name) else {
+        return Ok(None);
+    };
+    let Some(w_type) = crate::typedef::r#type(obj) else {
+        return Ok(Some(descr));
+    };
+    match get(descr, obj, w_type)? {
+        Some(bound) => Ok(Some(bound)),
+        None => Ok(Some(descr)),
+    }
+}
+
 /// Look up a name on a type by walking the C3 MRO.
 ///
 /// PyPy equivalent: `space.lookup_in_type(w_type, name)`.
