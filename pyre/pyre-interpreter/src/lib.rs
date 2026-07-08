@@ -385,54 +385,54 @@ macro_rules! py_class {
         $(,)?
     ) => {
         pub fn type_object() -> ::pyre_object::PyObjectRef {
-            thread_local! {
-                static CELL: ::std::cell::OnceCell<::pyre_object::PyObjectRef>
-                    = const { ::std::cell::OnceCell::new() };
-            }
-            CELL.with(|c| {
-                *c.get_or_init(|| {
-                    let tp = $crate::typedef::make_builtin_type($name, |ns| {
-                        // `make_builtin_function` (varargs, no arity check) is
-                        // used here rather than `_with_arity` because methods
-                        // with `Option<T>` parameters need to accept calls with
-                        // fewer args (PyPy `def f(self, s=None)`).  The
-                        // `#[pyre_function]` wrapper uses bounds-checked
-                        // `args.len()` for Option arms so missing-arg → None,
-                        // while required args still index `args[N]` directly.
-                        $($(
-                            {
-                                #[$crate::pyre_function]
-                                fn $mname ( $($margs)* ) $(-> $mret)? $mbody
-                                $crate::dict_storage_store(
-                                    ns,
-                                    stringify!($mname),
-                                    $crate::make_builtin_function(stringify!($mname), $mname),
-                                );
-                            }
-                        )*)?
-                        // `properties:` — each fn registered as a
-                        // `GetSetProperty` descriptor so `obj.name`
-                        // returns the value directly (PyPy
-                        // `GetSetProperty(W_X.fget_name)`).
-                        $($(
-                            {
-                                #[$crate::pyre_function]
-                                fn $pname ( $($pargs)* ) $(-> $pret)? $pbody
-                                $crate::dict_storage_store(
-                                    ns,
+            // Process-global: the type object is immortal
+            // (`make_builtin_type` → `malloc_typed`, never GC-registered),
+            // so storing the pointer as `usize` and casting back is
+            // rooting-neutral and thread-invariant.
+            static CELL: ::std::sync::OnceLock<usize>
+                = ::std::sync::OnceLock::new();
+            *CELL.get_or_init(|| {
+                let tp = $crate::typedef::make_builtin_type($name, |ns| {
+                    // `make_builtin_function` (varargs, no arity check) is
+                    // used here rather than `_with_arity` because methods
+                    // with `Option<T>` parameters need to accept calls with
+                    // fewer args (PyPy `def f(self, s=None)`).  The
+                    // `#[pyre_function]` wrapper uses bounds-checked
+                    // `args.len()` for Option arms so missing-arg → None,
+                    // while required args still index `args[N]` directly.
+                    $($(
+                        {
+                            #[$crate::pyre_function]
+                            fn $mname ( $($margs)* ) $(-> $mret)? $mbody
+                            $crate::dict_storage_store(
+                                ns,
+                                stringify!($mname),
+                                $crate::make_builtin_function(stringify!($mname), $mname),
+                            );
+                        }
+                    )*)?
+                    // `properties:` — each fn registered as a
+                    // `GetSetProperty` descriptor so `obj.name`
+                    // returns the value directly (PyPy
+                    // `GetSetProperty(W_X.fget_name)`).
+                    $($(
+                        {
+                            #[$crate::pyre_function]
+                            fn $pname ( $($pargs)* ) $(-> $pret)? $pbody
+                            $crate::dict_storage_store(
+                                ns,
+                                stringify!($pname),
+                                $crate::typedef::make_getset_descriptor_named(
+                                    $crate::make_builtin_function(stringify!($pname), $pname),
                                     stringify!($pname),
-                                    $crate::typedef::make_getset_descriptor_named(
-                                        $crate::make_builtin_function(stringify!($pname), $pname),
-                                        stringify!($pname),
-                                    ),
-                                );
-                            }
-                        )*)?
-                    });
-                    unsafe { ::pyre_object::typeobject::w_type_set_hasdict(tp, true) };
-                    tp
-                })
-            })
+                                ),
+                            );
+                        }
+                    )*)?
+                });
+                unsafe { ::pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+                tp as usize
+            }) as ::pyre_object::PyObjectRef
         }
     };
 }
@@ -481,56 +481,56 @@ macro_rules! py_class_typed {
         $(,)?
     ) => {
         pub fn type_object() -> ::pyre_object::PyObjectRef {
-            thread_local! {
-                static CELL: ::std::cell::OnceCell<::pyre_object::PyObjectRef>
-                    = const { ::std::cell::OnceCell::new() };
-            }
-            CELL.with(|c| {
-                *c.get_or_init(|| {
-                    let tp = $crate::typedef::make_builtin_type_with_layout(
-                        $name,
-                        |ns| {
-                            $($(
-                                {
-                                    #[$crate::pyre_function]
-                                    fn $mname ( $($margs)* ) $(-> $mret)? $mbody
-                                    $crate::dict_storage_store(
-                                        ns,
-                                        stringify!($mname),
-                                        $crate::make_builtin_function(stringify!($mname), $mname),
-                                    );
-                                }
-                            )*)?
-                            $($(
-                                {
-                                    #[$crate::pyre_function]
-                                    fn $pname ( $($pargs)* ) $(-> $pret)? $pbody
-                                    $crate::dict_storage_store(
-                                        ns,
+            // Process-global: the type object is immortal
+            // (`make_builtin_type_with_layout` → `malloc_typed`, never
+            // GC-registered), so storing the pointer as `usize` and
+            // casting back is rooting-neutral and thread-invariant.
+            static CELL: ::std::sync::OnceLock<usize>
+                = ::std::sync::OnceLock::new();
+            *CELL.get_or_init(|| {
+                let tp = $crate::typedef::make_builtin_type_with_layout(
+                    $name,
+                    |ns| {
+                        $($(
+                            {
+                                #[$crate::pyre_function]
+                                fn $mname ( $($margs)* ) $(-> $mret)? $mbody
+                                $crate::dict_storage_store(
+                                    ns,
+                                    stringify!($mname),
+                                    $crate::make_builtin_function(stringify!($mname), $mname),
+                                );
+                            }
+                        )*)?
+                        $($(
+                            {
+                                #[$crate::pyre_function]
+                                fn $pname ( $($pargs)* ) $(-> $pret)? $pbody
+                                $crate::dict_storage_store(
+                                    ns,
+                                    stringify!($pname),
+                                    $crate::typedef::make_getset_descriptor_named(
+                                        $crate::make_builtin_function(stringify!($pname), $pname),
                                         stringify!($pname),
-                                        $crate::typedef::make_getset_descriptor_named(
-                                            $crate::make_builtin_function(stringify!($pname), $pname),
-                                            stringify!($pname),
-                                        ),
-                                    );
-                                }
-                            )*)?
-                        },
-                        $crate::typedef::w_object(),
-                        <$struct as $crate::PyreClassPyTypeOf>::PYTYPE,
-                    );
-                    // Eagerly bind the W_TypeObject to the static
-                    // `PyType` so `<$struct>::allocate(...)` can stamp
-                    // `ob_header.w_class` at construction without racing
-                    // the post-init typedef pass (matches
-                    // `getset_descriptor_type()`'s eager `set_instantiate`).
-                    ::pyre_object::pyobject::set_instantiate(
-                        unsafe { &*<$struct as $crate::PyreClassPyTypeOf>::PYTYPE },
-                        tp,
-                    );
-                    tp
-                })
-            })
+                                    ),
+                                );
+                            }
+                        )*)?
+                    },
+                    $crate::typedef::w_object(),
+                    <$struct as $crate::PyreClassPyTypeOf>::PYTYPE,
+                );
+                // Eagerly bind the W_TypeObject to the static
+                // `PyType` so `<$struct>::allocate(...)` can stamp
+                // `ob_header.w_class` at construction without racing
+                // the post-init typedef pass (matches
+                // `getset_descriptor_type()`'s eager `set_instantiate`).
+                ::pyre_object::pyobject::set_instantiate(
+                    unsafe { &*<$struct as $crate::PyreClassPyTypeOf>::PYTYPE },
+                    tp,
+                );
+                tp as usize
+            }) as ::pyre_object::PyObjectRef
         }
     };
 }

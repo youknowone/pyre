@@ -7252,16 +7252,13 @@ fn builtin_any(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// as instance attributes, matching the PyPy FileIO/TextIOWrapper
 /// duck-typing surface without a dedicated W_FileObject.
 pub fn file_wrapper_type() -> PyObjectRef {
-    thread_local! {
-        static FILE_WRAPPER_TYPE: std::cell::OnceCell<PyObjectRef> = const { std::cell::OnceCell::new() };
-    }
-    FILE_WRAPPER_TYPE.with(|c| {
-        *c.get_or_init(|| {
-            let tp = crate::typedef::make_builtin_type("_io.TextIOWrapper", init_file_wrapper_type);
-            unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
-            tp
-        })
-    })
+    // Process-global immortal type object (see `make_builtin_type`).
+    static FILE_WRAPPER_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *FILE_WRAPPER_TYPE.get_or_init(|| {
+        let tp = crate::typedef::make_builtin_type("_io.TextIOWrapper", init_file_wrapper_type);
+        unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+        tp as usize
+    }) as PyObjectRef
 }
 
 /// PyPy: pypy/module/_io/interp_iobase.py W_IOBase.
@@ -8365,17 +8362,13 @@ fn textio_method_close(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 
 /// Shared `_io.TextIOWrapper` type for text-mode file objects.
 pub fn text_io_wrapper_type() -> PyObjectRef {
-    thread_local! {
-        static TYPE: std::cell::OnceCell<PyObjectRef> = const { std::cell::OnceCell::new() };
-    }
-    TYPE.with(|c| {
-        *c.get_or_init(|| {
-            let tp =
-                crate::typedef::make_builtin_type("_io.TextIOWrapper", init_text_io_wrapper_type);
-            unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
-            tp
-        })
-    })
+    // Process-global immortal type object (see `make_builtin_type`).
+    static TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *TYPE.get_or_init(|| {
+        let tp = crate::typedef::make_builtin_type("_io.TextIOWrapper", init_text_io_wrapper_type);
+        unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+        tp as usize
+    }) as PyObjectRef
 }
 
 fn init_text_io_wrapper_type(ns: &mut DictStorage) {

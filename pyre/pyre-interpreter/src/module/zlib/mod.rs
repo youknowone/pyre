@@ -146,20 +146,14 @@ fn adler32_compute(buf: &[u8], start: u32) -> u32 {
 
 // ── Compress (compressobj) ──────────────────────────────────────────────
 
-thread_local! {
-    static COMPRESS_TYPE: std::cell::OnceCell<PyObjectRef> = const { std::cell::OnceCell::new() };
-    static DECOMPRESS_TYPE: std::cell::OnceCell<PyObjectRef> = const { std::cell::OnceCell::new() };
-    static ZDECOMPRESS_TYPE: std::cell::OnceCell<PyObjectRef> = const { std::cell::OnceCell::new() };
-}
-
 fn compress_type() -> PyObjectRef {
-    COMPRESS_TYPE.with(|c| {
-        *c.get_or_init(|| {
-            let tp = crate::typedef::make_builtin_type("Compress", init_compress_type);
-            unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
-            tp
-        })
-    })
+    // Process-global immortal type object (see `make_builtin_type`).
+    static COMPRESS_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *COMPRESS_TYPE.get_or_init(|| {
+        let tp = crate::typedef::make_builtin_type("Compress", init_compress_type);
+        unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+        tp as usize
+    }) as PyObjectRef
 }
 
 fn init_compress_type(ns: &mut crate::DictStorage) {
@@ -222,13 +216,13 @@ fn make_compress(
 // ── Decompress (decompressobj) ──────────────────────────────────────────
 
 fn decompress_type() -> PyObjectRef {
-    DECOMPRESS_TYPE.with(|c| {
-        *c.get_or_init(|| {
-            let tp = crate::typedef::make_builtin_type("Decompress", init_decompress_type);
-            unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
-            tp
-        })
-    })
+    // Process-global immortal type object (see `make_builtin_type`).
+    static DECOMPRESS_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *DECOMPRESS_TYPE.get_or_init(|| {
+        let tp = crate::typedef::make_builtin_type("Decompress", init_decompress_type);
+        unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+        tp as usize
+    }) as PyObjectRef
 }
 
 fn decompress_getset(
@@ -341,13 +335,13 @@ fn make_decompress(wbits: i8, zdict: Option<Vec<u8>>) -> Result<PyObjectRef, cra
 // ── _ZlibDecompressor (buffered; used by gzip reading) ──────────────────
 
 fn zdecompress_type() -> PyObjectRef {
-    ZDECOMPRESS_TYPE.with(|c| {
-        *c.get_or_init(|| {
-            let tp = crate::typedef::make_builtin_type("_ZlibDecompressor", init_zdecompress_type);
-            unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
-            tp
-        })
-    })
+    // Process-global immortal type object (see `make_builtin_type`).
+    static ZDECOMPRESS_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *ZDECOMPRESS_TYPE.get_or_init(|| {
+        let tp = crate::typedef::make_builtin_type("_ZlibDecompressor", init_zdecompress_type);
+        unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+        tp as usize
+    }) as PyObjectRef
 }
 
 fn zdecompress_getset(
