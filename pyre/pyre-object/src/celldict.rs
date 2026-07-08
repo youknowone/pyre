@@ -239,6 +239,14 @@ pub unsafe fn walk_module_value_slot(
     if w_value.is_null() {
         return;
     }
+    // A tagged immediate is a plain value, never a `MutableCell`; forward the
+    // slot as-is before the `ob_type` deref (which would fault on the
+    // immediate). The collector's `is_valid_gc_object` no-ops on the odd
+    // address. Gated on `CAN_BE_TAGGED` (default false).
+    if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::is_tagged_int(w_value) {
+        visitor(slot);
+        return;
+    }
     let tp = (*w_value).ob_type;
     if std::ptr::eq(tp, &OBJECT_MUTABLE_CELL_TYPE as *const PyType) {
         let cell = &mut *(w_value as *mut ObjectMutableCell);
