@@ -3411,6 +3411,14 @@ pub struct LoweringContext {
     /// `bh_make_cell_fn` allocates a fresh cell (`Plain` — runs no user code,
     /// never raises).
     pub make_cell_fn_idx: u16,
+    /// `make_function_fn` descrs-pool index.  MAKE_FUNCTION records the
+    /// `make_function_value(globals, code)` HLOp lowered to
+    /// `residual_call_r_r(ConstInt(fn_idx), ListR([globals, code]), Descr) →
+    /// reg` via [`lower_make_function_hlop_to_insn`] (the two-Ref shape); the
+    /// result is the function the codewriter pushes onto the stack.
+    /// `jit_make_function_from_globals` allocates a function (`Plain` — runs no
+    /// user code, never raises).
+    pub make_function_fn_idx: u16,
     /// `unary_negative_fn` descrs-pool index.  UNARY_NEGATIVE records the
     /// flowspace `neg(value)` op (operation.py:466) lowered to
     /// `residual_call_r_r(ConstInt(fn_idx), ListR([value]), Descr) → reg` via
@@ -5093,6 +5101,9 @@ where
     if let Some(insn) = lower_make_cell_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
+    if let Some(insn) = lower_make_function_hlop_to_insn(op, ctx, get_register, lower_constant) {
+        return Some(insn);
+    }
     if let Some(insn) = lower_unary_negative_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
@@ -5519,6 +5530,44 @@ where
     Some(build_residual_call_r_r_insn_from_operands(
         ctx.make_cell_fn_idx,
         vec![current],
+        CallFlavor::Plain,
+        majit_ir::PyreHelperKind::None,
+        dst_reg,
+    ))
+}
+
+/// Lower the MAKE_FUNCTION pyre HLOp `make_function_value(globals, code)` →
+/// `result: Ref` to `residual_call_r_r(ConstInt(make_function_fn_idx),
+/// ListR([globals, code]), Descr) → reg`, the two-Ref shape.  `globals` is the
+/// code's `w_globals` object baked as a `Signed(ptr) + Kind::Ref` constant;
+/// `code` is the popped code object.  The result is the function the
+/// codewriter pushes back onto the stack.  `jit_make_function_from_globals`
+/// allocates a function but runs no user code and never raises → `Plain`.
+///
+/// Returns `None` for a non-`make_function_value` opname or unexpected arity so
+/// the caller can fall through to other lowering arms.
+pub fn lower_make_function_hlop_to_insn<F, LC>(
+    op: &super::flow::SpaceOperation,
+    ctx: &LoweringContext,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
+{
+    if op.opname != "make_function_value" || op.args.len() != 2 {
+        return None;
+    }
+    let globals = operand_for_value_arg(&op.args[0], get_register, lower_constant)?;
+    let code = operand_for_value_arg(&op.args[1], get_register, lower_constant)?;
+    let dst_reg = match &op.result {
+        Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
+        _ => return None,
+    };
+    Some(build_residual_call_r_r_insn_from_operands(
+        ctx.make_function_fn_idx,
+        vec![globals, code],
         CallFlavor::Plain,
         majit_ir::PyreHelperKind::None,
         dst_reg,
@@ -10782,6 +10831,7 @@ mod tests {
             list_extend_fn_idx: 113,
             store_deref_value_fn_idx: 114,
             make_cell_fn_idx: 115,
+            make_function_fn_idx: 131,
             store_slice_fn_idx: 116,
             unary_positive_fn_idx: 118,
             load_common_constant_fn_idx: 119,
@@ -11772,6 +11822,79 @@ mod tests {
                             matches!(&list.content[..], [Operand::Register(r)] if r.index == 101),
                             "ListR = [current], got {:?}",
                             list.content
+                        );
+                    }
+                    other => panic!("expected ListR, got {other:?}"),
+                }
+                assert_eq!(
+                    result,
+                    Some(Register {
+                        kind: Kind::Ref,
+                        index: 102
+                    }),
+                );
+            }
+            _ => panic!("expected Insn::Op, got {insn:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_make_function_hlop_emits_make_function_fn_residual() {
+        // `make_function_value(globals, code)` →
+        // `residual_call_r_r(ConstInt(make_function_fn_idx), ListR([globals,
+        // code]), Descr) → reg` (Plain — allocates a function, runs no user
+        // code, never raises).  `globals` is a `Signed(ptr) + Kind::Ref`
+        // constant; `code` is the popped code-object Variable.
+        let code_var = Variable::new(VariableId(8), Kind::Ref);
+        let result_var = Variable::new(VariableId(9), Kind::Ref);
+        let (ctx, globals_const, _) = load_attr_lowering_fixture();
+        let op = super::super::flow::SpaceOperation::new(
+            "make_function_value",
+            vec![globals_const.into(), code_var.into()],
+            Some(result_var.into()),
+            0,
+        );
+        let mut get_register = |var: Variable| match var.id {
+            VariableId(8) => Register {
+                kind: Kind::Ref,
+                index: 101,
+            },
+            VariableId(9) => Register {
+                kind: Kind::Ref,
+                index: 102,
+            },
+            _ => panic!("unexpected var id {:?}", var.id),
+        };
+        let mut lower_constant = super::flatten_constant_operand_for_test;
+        let insn = super::lower_make_function_hlop_to_insn(
+            &op,
+            &ctx,
+            &mut get_register,
+            &mut lower_constant,
+        )
+        .expect("2-arg make_function_value lowering must succeed");
+        match insn {
+            Insn::Op {
+                opname,
+                args,
+                result,
+            } => {
+                assert_eq!(opname, "residual_call_r_r");
+                assert!(
+                    matches!(args[0], Operand::ConstInt(131)),
+                    "make_function_fn pool index, got {:?}",
+                    args[0]
+                );
+                match &args[1] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Ref);
+                        assert_eq!(list.content.len(), 2, "ListR = [globals, code]");
+                        // ListR[1] must be the code register; ListR[0] is the
+                        // globals constant.
+                        assert!(
+                            matches!(&list.content[1], Operand::Register(r) if r.index == 101),
+                            "ListR[1] must be code register, got {:?}",
+                            list.content[1]
                         );
                     }
                     other => panic!("expected ListR, got {other:?}"),
