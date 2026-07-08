@@ -155,6 +155,18 @@ pub(crate) fn buffer_view(obj: PyObjectRef) -> Result<(Vec<u8>, bool), PyError> 
     )))
 }
 
+/// Whether the wrapped exporter's buffer is C-contiguous, matching the
+/// `_pickle` save path's `iscontiguous(buf)` guard. `bytes`/`bytearray`/`array`
+/// are one-dimensional and always contiguous; a `memoryview` reports through
+/// its `c_contiguous` flag.
+pub(crate) fn is_contiguous(obj: PyObjectRef) -> Result<bool, PyError> {
+    if is_memoryview(obj) {
+        let w = crate::baseobjspace::getattr_str(obj, "c_contiguous")?;
+        return crate::baseobjspace::is_true(w);
+    }
+    Ok(true)
+}
+
 /// The `memoryview` builtin type via the live execution context.
 fn memoryview_type() -> Option<PyObjectRef> {
     let frame = crate::eval::CURRENT_FRAME.with(|f| f.get());

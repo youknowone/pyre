@@ -1594,6 +1594,11 @@ fn save_picklebuffer(
             "PickleBuffer can not be pickled after release",
         ));
     }
+    if !crate::module::__pypy__::interp_buffer::is_contiguous(wrapped)? {
+        return Err(pickling_error(
+            "PickleBuffer can not be pickled when pointing to a non-contiguous buffer",
+        ));
+    }
     let (data, readonly) = crate::module::__pypy__::interp_buffer::buffer_view(wrapped)?;
     let mut in_band = true;
     if !unsafe { pyre_object::is_none(ctx.buffer_callback) } {
