@@ -663,27 +663,32 @@ fn c_tm_to_msvc_tm(tm: &c_tm) -> MsvcTm {
 /// process-wide cached subclass-of-tuple type.  The 9-field positional
 /// core; on Unix (`HAS_TM_ZONE`) `tm_zone` / `tm_gmtoff` are named-only
 /// extras so `n_fields == _STRUCT_TM_ITEMS == 11`.
+thread_local! {
+    static STRUCT_TIME_TYPE: std::cell::OnceCell<PyObjectRef> =
+        const { std::cell::OnceCell::new() };
+}
+
 pub(crate) fn struct_time_type() -> PyObjectRef {
     const SEQ: &[&str] = &[
         "tm_year", "tm_mon", "tm_mday", "tm_hour", "tm_min", "tm_sec", "tm_wday", "tm_yday",
         "tm_isdst",
     ];
-    // Process-global immortal type object (see `make_struct_seq`).
-    static STRUCT_TIME_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *STRUCT_TIME_TYPE.get_or_init(|| {
-        #[cfg(unix)]
-        {
-            crate::_structseq::make_struct_seq_with_extra(
-                "time.struct_time",
-                SEQ,
-                &["tm_zone", "tm_gmtoff"],
-            ) as usize
-        }
-        #[cfg(not(unix))]
-        {
-            crate::_structseq::make_struct_seq("time.struct_time", SEQ) as usize
-        }
-    }) as PyObjectRef
+    STRUCT_TIME_TYPE.with(|c| {
+        *c.get_or_init(|| {
+            #[cfg(unix)]
+            {
+                crate::_structseq::make_struct_seq_with_extra(
+                    "time.struct_time",
+                    SEQ,
+                    &["tm_zone", "tm_gmtoff"],
+                )
+            }
+            #[cfg(not(unix))]
+            {
+                crate::_structseq::make_struct_seq("time.struct_time", SEQ)
+            }
+        })
+    })
 }
 
 /// Build a `time.struct_time` from our portable `c_tm`.

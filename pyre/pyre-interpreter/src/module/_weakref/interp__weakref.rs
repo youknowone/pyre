@@ -19,6 +19,13 @@ use pyre_object::*;
 
 use std::sync::OnceLock;
 
+thread_local! {
+    static WEAKREF_LIFELINE_TYPE: OnceLock<PyObjectRef> = const { OnceLock::new() };
+    static WEAKREF_TYPE: OnceLock<PyObjectRef> = const { OnceLock::new() };
+    static PROXY_TYPE: OnceLock<PyObjectRef> = const { OnceLock::new() };
+    static CALLABLE_PROXY_TYPE: OnceLock<PyObjectRef> = const { OnceLock::new() };
+}
+
 // ── Instance attribute names ──────────────────────────────────────────
 //
 // PyPy stores fields directly on the W_Root subclass. pyre stores them
@@ -90,13 +97,13 @@ impl Drop for InstanceRoot {
 // ── Type registration ─────────────────────────────────────────────────
 
 fn weakref_lifeline_type() -> PyObjectRef {
-    // Process-global immortal type object (see `make_builtin_type`).
-    static WEAKREF_LIFELINE_TYPE: OnceLock<usize> = OnceLock::new();
-    *WEAKREF_LIFELINE_TYPE.get_or_init(|| {
-        let tp = crate::typedef::make_builtin_type("WeakrefLifeline", |_| {});
-        unsafe { pyre_object::w_type_set_hasdict(tp, true) };
-        tp as usize
-    }) as PyObjectRef
+    WEAKREF_LIFELINE_TYPE.with(|cell| {
+        *cell.get_or_init(|| {
+            let tp = crate::typedef::make_builtin_type("WeakrefLifeline", |_| {});
+            unsafe { pyre_object::w_type_set_hasdict(tp, true) };
+            tp
+        })
+    })
 }
 
 /// pypy/module/_weakref/interp__weakref.py:270-280 W_Weakref.typedef
@@ -153,13 +160,13 @@ fn init_weakref_type(ns: &mut DictStorage) {
 }
 
 pub fn weakref_type() -> PyObjectRef {
-    // Process-global immortal type object (see `make_builtin_type`).
-    static WEAKREF_TYPE: OnceLock<usize> = OnceLock::new();
-    *WEAKREF_TYPE.get_or_init(|| {
-        let tp = crate::typedef::make_builtin_type("weakref", init_weakref_type);
-        unsafe { pyre_object::w_type_set_hasdict(tp, true) };
-        tp as usize
-    }) as PyObjectRef
+    WEAKREF_TYPE.with(|cell| {
+        *cell.get_or_init(|| {
+            let tp = crate::typedef::make_builtin_type("weakref", init_weakref_type);
+            unsafe { pyre_object::w_type_set_hasdict(tp, true) };
+            tp
+        })
+    })
 }
 
 /// pypy/module/_weakref/interp__weakref.py:405-410 W_Proxy.typedef
@@ -192,21 +199,21 @@ fn init_proxy_type(ns: &mut DictStorage) {
     register_proxy_typedef_dict(ns, /*include_comparisons=*/ true);
 }
 
-/// `dont_look_inside`: the `PROXY_TYPE` `OnceLock` read has no
-/// extractable graph; the call stays a residual returning the lazily
+/// `dont_look_inside`: the `PROXY_TYPE` thread-local `OnceLock` read has
+/// no extractable graph; the call stays a residual returning the lazily
 /// built type object (same shape as [`crate::typedef::w_type`]).
 #[majit_macros::dont_look_inside]
 pub fn proxy_type() -> PyObjectRef {
-    // Process-global immortal type object (see `make_builtin_type`).
-    static PROXY_TYPE: OnceLock<usize> = OnceLock::new();
-    *PROXY_TYPE.get_or_init(|| {
-        let tp = crate::typedef::make_builtin_type("weakproxy", init_proxy_type);
-        unsafe {
-            pyre_object::w_type_set_hasdict(tp, true);
-            pyre_object::w_type_set_acceptable_as_base_class(tp, false);
-        }
-        tp as usize
-    }) as PyObjectRef
+    PROXY_TYPE.with(|cell| {
+        *cell.get_or_init(|| {
+            let tp = crate::typedef::make_builtin_type("weakproxy", init_proxy_type);
+            unsafe {
+                pyre_object::w_type_set_hasdict(tp, true);
+                pyre_object::w_type_set_acceptable_as_base_class(tp, false);
+            }
+            tp
+        })
+    })
 }
 
 /// pypy/module/_weakref/interp__weakref.py:412-418 W_CallableProxy.typedef
@@ -250,16 +257,17 @@ fn init_callable_proxy_type(ns: &mut DictStorage) {
 /// `dont_look_inside` for the same reason as [`proxy_type`].
 #[majit_macros::dont_look_inside]
 pub fn callable_proxy_type() -> PyObjectRef {
-    // Process-global immortal type object (see `make_builtin_type`).
-    static CALLABLE_PROXY_TYPE: OnceLock<usize> = OnceLock::new();
-    *CALLABLE_PROXY_TYPE.get_or_init(|| {
-        let tp = crate::typedef::make_builtin_type("weakcallableproxy", init_callable_proxy_type);
-        unsafe {
-            pyre_object::w_type_set_hasdict(tp, true);
-            pyre_object::w_type_set_acceptable_as_base_class(tp, false);
-        }
-        tp as usize
-    }) as PyObjectRef
+    CALLABLE_PROXY_TYPE.with(|cell| {
+        *cell.get_or_init(|| {
+            let tp =
+                crate::typedef::make_builtin_type("weakcallableproxy", init_callable_proxy_type);
+            unsafe {
+                pyre_object::w_type_set_hasdict(tp, true);
+                pyre_object::w_type_set_acceptable_as_base_class(tp, false);
+            }
+            tp
+        })
+    })
 }
 
 // ── WeakrefLifeline ───────────────────────────────────────────────────

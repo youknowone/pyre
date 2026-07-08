@@ -12,13 +12,17 @@ use pyre_object::*;
 /// can be stored as instance attributes.  Plain `object` instances reject
 /// `setattr`, leaving the shell without its methods.
 fn context_var_type() -> PyObjectRef {
-    // Process-global immortal type object (see `make_builtin_type`).
-    static CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *CELL.get_or_init(|| {
-        let tp = crate::typedef::make_builtin_type("ContextVar", |_| {});
-        unsafe { typeobject::w_type_set_hasdict(tp, true) };
-        tp as usize
-    }) as PyObjectRef
+    thread_local! {
+        static CELL: std::cell::OnceCell<PyObjectRef> =
+            const { std::cell::OnceCell::new() };
+    }
+    CELL.with(|c| {
+        *c.get_or_init(|| {
+            let tp = crate::typedef::make_builtin_type("ContextVar", |_| {});
+            unsafe { typeobject::w_type_set_hasdict(tp, true) };
+            tp
+        })
+    })
 }
 
 fn context_var(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
