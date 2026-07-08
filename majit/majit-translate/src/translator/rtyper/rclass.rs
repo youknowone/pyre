@@ -3682,6 +3682,49 @@ impl Repr for InstanceRepr {
     fn rtype_isinstance(&self, hop: &HighLevelOp) -> RTypeResult {
         use crate::translator::rtyper::rtyper::{ConvertedTo, make_ll_isinstance};
 
+        // pyre models type objects as `PyType` GcStruct instances that
+        // carry `subclassrange_{min,max}` directly (the OBJECT_VTABLE
+        // layout is unified into the runtime `PyType`). When the class arg
+        // is such a PyType instance the upstream `class_repr` path cannot
+        // apply — there is no InstanceRepr->RootClassRepr conversion
+        // (`castable` rejects the GcStruct->Struct gc-status change).
+        // Detect the PyType-shaped class arg structurally and lower to a
+        // getfield+int_between helper that reads the ranges off the PyType
+        // ptr, mirroring `ll_isinstance` (rclass.py:1143-1147) on the pyre
+        // `PyObject`/`PyType` structs. The class arg (`&EXCEPTION_TYPE`) is
+        // an opaque host-address `_ptr` whose ranges are re-stamped at
+        // runtime under a seqlock, so it is read at runtime rather than
+        // const-folded through `make_ll_isinstance`.
+        let r_cls = hop.args_r.borrow().get(1).cloned().flatten();
+        if let Some(r_cls) = &r_cls {
+            let cls_is_pytype = (r_cls.as_ref() as &dyn std::any::Any)
+                .downcast_ref::<InstanceRepr>()
+                .is_some_and(|inst| {
+                    let f = inst.allinstancefields();
+                    f.contains_key("subclassrange_min") && f.contains_key("subclassrange_max")
+                });
+            if cls_is_pytype && self.allinstancefields().contains_key("ob_type") {
+                let rtyper = self.rtyper.upgrade().ok_or_else(|| {
+                    TyperError::message("InstanceRepr.rtype_isinstance: rtyper weak ref expired")
+                })?;
+                // Keep `obj` in its own PyObject repr (not `common_repr`):
+                // `ob_type` lives on `PyObject`, and coercing to `OBJECTPTR`
+                // would retarget the getfield owner to `object`. Pass `cls`
+                // in its own repr so both coercions are identity — no
+                // `convert_const` on the `&EXCEPTION_TYPE` Constant.
+                let v = hop.inputargs(vec![
+                    ConvertedTo::Repr(self as &dyn Repr),
+                    ConvertedTo::Repr(r_cls.as_ref()),
+                ])?;
+                let helper = rtyper.lowlevel_helper_function(
+                    "ll_isinstance_pytype",
+                    vec![self.lowleveltype().clone(), r_cls.lowleveltype().clone()],
+                    LowLevelType::Bool,
+                )?;
+                return hop.gendirectcall(&helper, vec![v[0].clone(), v[1].clone()]);
+            }
+        }
+
         // upstream: `class_repr = get_type_repr(hop.rtyper)`.
         let rtyper = self.rtyper.upgrade().ok_or_else(|| {
             TyperError::message("InstanceRepr.rtype_isinstance: rtyper weak ref expired")
@@ -3751,6 +3794,48 @@ impl Repr for InstanceRepr {
             LowLevelType::Bool,
         )?;
         hop.gendirectcall(&helper, vec![v_obj, v_cls])
+    }
+
+    /// pyre-specific `issubtype` lowering for a `PyType` InstanceRepr.
+    ///
+    /// Upstream `issubtype` only reaches `AbstractClassRepr`
+    /// (rclass.py:403-414) because `type(x)` yields a class-repr
+    /// (`CLASSTYPE`) value. pyre's type objects are `PyType` GcStruct
+    /// *instances* carrying `subclassrange_{min,max}` directly, and
+    /// `flowspace_adapter` rewrites `ll_issubclass(subcls, cls)` to an
+    /// `issubtype` op whose operands are `PyType` InstanceReprs. Lower it
+    /// like `ClassRepr.rtype_issubtype`'s variable case — a
+    /// getfield+int_between helper (rclass.py:1133-1137 `ll_issubclass`) —
+    /// but reading the ranges off the PyType ptrs (no object_vtable, no
+    /// InstanceRepr->RootClassRepr cast, which `castable` rejects on the
+    /// gc-status change). Gate structurally on the two range fields so
+    /// only PyType-shaped InstanceReprs take this path; every other
+    /// InstanceRepr keeps the rmodel `missing_rtype_operation` default.
+    fn rtype_issubtype(&self, hop: &crate::translator::rtyper::rtyper::HighLevelOp) -> RTypeResult {
+        use crate::translator::rtyper::rtyper::ConvertedTo;
+        let is_pytype = {
+            let f = self.allinstancefields();
+            f.contains_key("subclassrange_min") && f.contains_key("subclassrange_max")
+        };
+        if !is_pytype {
+            return Err(self.missing_rtype_operation("issubtype"));
+        }
+        let rtyper = self.rtyper.upgrade().ok_or_else(|| {
+            TyperError::message("InstanceRepr.rtype_issubtype: rtyper weak ref expired")
+        })?;
+        // Both operands are the same PyType InstanceRepr; coerce each to
+        // `self` (identity) so no conversion is emitted. subcls = arg0,
+        // cls = arg1, matching `ll_issubclass(subcls, cls)`.
+        let v = hop.inputargs(vec![
+            ConvertedTo::Repr(self as &dyn Repr),
+            ConvertedTo::Repr(self as &dyn Repr),
+        ])?;
+        let helper = rtyper.lowlevel_helper_function(
+            "ll_issubclass_pytype",
+            vec![self.lowleveltype().clone(), self.lowleveltype().clone()],
+            LowLevelType::Bool,
+        )?;
+        hop.gendirectcall(&helper, vec![v[0].clone(), v[1].clone()])
     }
 
     /// RPython `InstanceRepr.convert_const(self, value)` (rclass.py:772-792):

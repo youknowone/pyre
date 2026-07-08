@@ -3044,6 +3044,10 @@ fn lowlevel_helper_graph(
         "ll_both_none" => lowlevel_both_none_helper_graph(name, args, result),
         "ll_issubclass" => lowlevel_issubclass_helper_graph(name, args, result),
         "ll_isinstance" => lowlevel_isinstance_helper_graph(rtyper, name, args, result),
+        "ll_issubclass_pytype" => lowlevel_issubclass_pytype_helper_graph(name, args, result),
+        "ll_isinstance_pytype" => {
+            lowlevel_isinstance_pytype_helper_graph(rtyper, name, args, result)
+        }
         "ll_type" => lowlevel_type_helper_graph(name, args, result),
         _ => Ok(synthetic_lowlevel_helper_graph(name, args, result)),
     }
@@ -3161,6 +3165,101 @@ fn lowlevel_issubclass_helper_graph(
     let argnames = vec!["arg0".to_string(), "arg1".to_string()];
     let subcls = variable_with_lltype("arg0", CLASSTYPE.clone());
     let cls = variable_with_lltype("arg1", CLASSTYPE.clone());
+    let cls_min = variable_with_lltype("cls_min", LowLevelType::Signed);
+    let subcls_min = variable_with_lltype("subcls_min", LowLevelType::Signed);
+    let cls_max = variable_with_lltype("cls_max", LowLevelType::Signed);
+    let is_subclass = variable_with_lltype("result", LowLevelType::Bool);
+    let return_var = variable_with_lltype("result", LowLevelType::Bool);
+
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(subcls.clone()),
+        Hlvalue::Variable(cls.clone()),
+    ]);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "getfield",
+        vec![
+            Hlvalue::Variable(cls.clone()),
+            void_field_const("subclassrange_min"),
+        ],
+        Hlvalue::Variable(cls_min.clone()),
+    ));
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "getfield",
+        vec![
+            Hlvalue::Variable(subcls.clone()),
+            void_field_const("subclassrange_min"),
+        ],
+        Hlvalue::Variable(subcls_min.clone()),
+    ));
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "getfield",
+        vec![
+            Hlvalue::Variable(cls),
+            void_field_const("subclassrange_max"),
+        ],
+        Hlvalue::Variable(cls_max.clone()),
+    ));
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "int_between",
+        vec![
+            Hlvalue::Variable(cls_min),
+            Hlvalue::Variable(subcls_min),
+            Hlvalue::Variable(cls_max),
+        ],
+        Hlvalue::Variable(is_subclass.clone()),
+    ));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(is_subclass)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(graph, argnames, func))
+}
+
+/// `ll_issubclass_pytype(subcls, cls)` — pyre variant of
+/// [`lowlevel_issubclass_helper_graph`] operating directly on
+/// `Ptr(GcStruct pyobject::PyType)` instead of `CLASSTYPE`.
+///
+/// pyre unifies the OBJECT_VTABLE layout into the runtime `PyType`
+/// GcStruct, so `subclassrange_{min,max}` are the PyType's own fields
+/// and the subclass check reads them straight off the PyType ptrs, the
+/// same `int_between` shape as `ll_issubclass` (rclass.py:1133-1137).
+/// The class operand is never a materialised object_vtable `_ptr`
+/// (a `&PyType` static lowers to an opaque host-address `_ptr`), so both
+/// operands' ranges are read at runtime — no const-fold. Validation is
+/// tolerant (matching-Ptr operands) rather than pinned to `CLASSTYPE`.
+fn lowlevel_issubclass_pytype_helper_graph(
+    name: &str,
+    args: &[LowLevelType],
+    result: &LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    if !(args.len() == 2 && matches!(args[0], LowLevelType::Ptr(_)) && args[0] == args[1])
+        || result != &LowLevelType::Bool
+    {
+        return Err(TyperError::message(format!(
+            "{name} expects (PyTypePtr, PyTypePtr) -> Bool with matching ptrs, \
+             got ({args:?}) -> {result:?}"
+        )));
+    }
+    let pytype_lltype = args[0].clone();
+
+    let argnames = vec!["arg0".to_string(), "arg1".to_string()];
+    let subcls = variable_with_lltype("arg0", pytype_lltype.clone());
+    let cls = variable_with_lltype("arg1", pytype_lltype.clone());
     let cls_min = variable_with_lltype("cls_min", LowLevelType::Signed);
     let subcls_min = variable_with_lltype("subcls_min", LowLevelType::Signed);
     let cls_max = variable_with_lltype("cls_max", LowLevelType::Signed);
@@ -3380,6 +3479,128 @@ fn lowlevel_isinstance_helper_graph(
     let callee = rtyper.lowlevel_helper_function(
         "ll_issubclass",
         vec![CLASSTYPE.clone(), CLASSTYPE.clone()],
+        LowLevelType::Bool,
+    )?;
+    callblock
+        .borrow_mut()
+        .operations
+        .push(direct_call_operation(
+            rtyper,
+            &callee,
+            vec![Hlvalue::Variable(obj_cls), Hlvalue::Variable(cls1)],
+            call_result.clone(),
+        )?);
+    callblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(call_result)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(graph, argnames, func))
+}
+
+/// `ll_isinstance_pytype(obj, cls)` — pyre variant of
+/// [`lowlevel_isinstance_helper_graph`]. `obj` is a
+/// `Ptr(GcStruct pyobject::PyObject)` whose `ob_type` field holds the
+/// runtime `PyType` (the OBJECT `typeptr` role, rclass.py:1143-1147).
+/// Reads `obj.ob_type` and tail-calls `ll_issubclass_pytype`; the
+/// null-check is unconditional, matching pyre-object `ll_isinstance`'s
+/// `if obj.is_null() return false` (covering both can_be_none variants).
+fn lowlevel_isinstance_pytype_helper_graph(
+    rtyper: &RPythonTyper,
+    name: &str,
+    args: &[LowLevelType],
+    result: &LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    if !(args.len() == 2
+        && matches!(args[0], LowLevelType::Ptr(_))
+        && matches!(args[1], LowLevelType::Ptr(_)))
+        || result != &LowLevelType::Bool
+    {
+        return Err(TyperError::message(format!(
+            "{name} expects (PyObjectPtr, PyTypePtr) -> Bool, got ({args:?}) -> {result:?}"
+        )));
+    }
+    let obj_lltype = args[0].clone();
+    let cls_lltype = args[1].clone();
+
+    let argnames = vec!["arg0".to_string(), "arg1".to_string()];
+    let obj0 = variable_with_lltype("arg0", obj_lltype.clone());
+    let cls0 = variable_with_lltype("arg1", cls_lltype.clone());
+    let is_nonnull = variable_with_lltype("is_nonnull", LowLevelType::Bool);
+    let obj1 = variable_with_lltype("obj", obj_lltype.clone());
+    let cls1 = variable_with_lltype("cls", cls_lltype.clone());
+    let obj_cls = variable_with_lltype("obj_cls", cls_lltype.clone());
+    let call_result = variable_with_lltype("result", LowLevelType::Bool);
+    let return_var = variable_with_lltype("result", LowLevelType::Bool);
+
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(obj0.clone()),
+        Hlvalue::Variable(cls0.clone()),
+    ]);
+    let callblock = Block::shared(vec![
+        Hlvalue::Variable(obj1.clone()),
+        Hlvalue::Variable(cls1.clone()),
+    ]);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    // upstream `if not obj:` — `ptr_nonzero(obj)`: true link reads the
+    // typeptr, false link returns False.
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "ptr_nonzero",
+        vec![Hlvalue::Variable(obj0.clone())],
+        Hlvalue::Variable(is_nonnull.clone()),
+    ));
+    startblock.borrow_mut().exitswitch = Some(Hlvalue::Variable(is_nonnull));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(obj0.clone()),
+                Hlvalue::Variable(cls0.clone()),
+            ],
+            Some(callblock.clone()),
+            Some(constant_with_lltype(
+                ConstValue::Bool(true),
+                LowLevelType::Bool,
+            )),
+        )
+        .into_ref(),
+        Link::new(
+            vec![constant_with_lltype(
+                ConstValue::Bool(false),
+                LowLevelType::Bool,
+            )],
+            Some(graph.returnblock.clone()),
+            Some(constant_with_lltype(
+                ConstValue::Bool(false),
+                LowLevelType::Bool,
+            )),
+        )
+        .into_ref(),
+    ]);
+
+    // upstream `obj_cls = obj.typeptr` — pyre reads the `ob_type` field.
+    callblock.borrow_mut().operations.push(SpaceOperation::new(
+        "getfield",
+        vec![Hlvalue::Variable(obj1), void_field_const("ob_type")],
+        Hlvalue::Variable(obj_cls.clone()),
+    ));
+    // upstream `return ll_issubclass(obj_cls, cls)`.
+    let callee = rtyper.lowlevel_helper_function(
+        "ll_issubclass_pytype",
+        vec![cls_lltype.clone(), cls_lltype.clone()],
         LowLevelType::Bool,
     )?;
     callblock
@@ -8117,5 +8338,104 @@ mod tests {
             err.to_string().contains("expects (T, T) -> T"),
             "mixed arg lltypes must be rejected: {err}"
         );
+    }
+
+    /// `ll_issubclass_pytype` reads `subclassrange_{min,max}` off the two
+    /// PyType ptrs and folds to `int_between` — the same shape as
+    /// `ll_issubclass` but on the pyre `PyType` GcStruct. The field names
+    /// must be RAW (not `inst_`-mangled): the codewriter's Charon
+    /// struct-layout offset registry is keyed by the bare field name.
+    #[test]
+    fn issubclass_pytype_helper_graph_reads_raw_subclassrange_fields() {
+        use crate::flowspace::model::{Hlvalue, SpaceOperation};
+        // A `Ptr(...)` stands in for the PyType ptr; the builder pins only
+        // the emitted op shape + field names, not the pointee struct.
+        let ptr = OBJECTPTR.clone();
+        let pygraph = lowlevel_issubclass_pytype_helper_graph(
+            "ll_issubclass_pytype",
+            &[ptr.clone(), ptr.clone()],
+            &LowLevelType::Bool,
+        )
+        .expect("ll_issubclass_pytype must build");
+        let graph = pygraph.graph.borrow();
+        let start = graph.startblock.borrow();
+        assert_eq!(start.operations.len(), 4, "op count");
+        assert_eq!(start.operations[0].opname, "getfield");
+        assert_eq!(start.operations[1].opname, "getfield");
+        assert_eq!(start.operations[2].opname, "getfield");
+        assert_eq!(start.operations[3].opname, "int_between");
+        let field = |op: &SpaceOperation| -> String {
+            match &op.args[1] {
+                Hlvalue::Constant(c) => match &c.value {
+                    ConstValue::ByteStr(b) => String::from_utf8_lossy(b).into_owned(),
+                    other => panic!("field-name const not ByteStr: {other:?}"),
+                },
+                other => panic!("getfield arg1 not a Constant: {other:?}"),
+            }
+        };
+        assert_eq!(field(&start.operations[0]), "subclassrange_min");
+        assert_eq!(field(&start.operations[1]), "subclassrange_min");
+        assert_eq!(field(&start.operations[2]), "subclassrange_max");
+    }
+
+    #[test]
+    fn issubclass_pytype_helper_graph_rejects_mismatched_ptrs() {
+        let err = lowlevel_issubclass_pytype_helper_graph(
+            "ll_issubclass_pytype",
+            &[OBJECTPTR.clone(), CLASSTYPE.clone()],
+            &LowLevelType::Bool,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("matching ptrs"),
+            "mismatched ptr operands must be rejected: {err}"
+        );
+    }
+
+    /// `ll_isinstance_pytype` guards on `ptr_nonzero(obj)`, reads
+    /// `obj.ob_type` (RAW name), and tail-calls `ll_issubclass_pytype`,
+    /// mirroring pyre-object `ll_isinstance` on the `PyObject`/`PyType`
+    /// structs.
+    #[test]
+    fn isinstance_pytype_helper_graph_reads_ob_type_and_calls_issubclass() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::flowspace::model::Hlvalue;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let pygraph = lowlevel_isinstance_pytype_helper_graph(
+            &rtyper,
+            "ll_isinstance_pytype",
+            &[OBJECTPTR.clone(), OBJECTPTR.clone()],
+            &LowLevelType::Bool,
+        )
+        .expect("ll_isinstance_pytype must build");
+        let graph = pygraph.graph.borrow();
+        let start = graph.startblock.borrow();
+        // upstream `if not obj:` — the null-check gate.
+        assert_eq!(start.operations.len(), 1);
+        assert_eq!(start.operations[0].opname, "ptr_nonzero");
+        assert!(start.exitswitch.is_some(), "null-check exitswitch present");
+        // The true link's callblock reads `ob_type` then direct_calls
+        // ll_issubclass_pytype.
+        let callblock = start.exits[0]
+            .borrow()
+            .target
+            .clone()
+            .expect("true link has a callblock target");
+        let cb = callblock.borrow();
+        assert_eq!(cb.operations.len(), 2);
+        assert_eq!(cb.operations[0].opname, "getfield");
+        let field = match &cb.operations[0].args[1] {
+            Hlvalue::Constant(c) => match &c.value {
+                ConstValue::ByteStr(b) => String::from_utf8_lossy(b).into_owned(),
+                other => panic!("field-name const not ByteStr: {other:?}"),
+            },
+            other => panic!("getfield arg1 not a Constant: {other:?}"),
+        };
+        assert_eq!(field, "ob_type");
+        assert_eq!(cb.operations[1].opname, "direct_call");
     }
 }
