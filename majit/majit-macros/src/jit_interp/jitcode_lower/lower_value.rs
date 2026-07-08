@@ -941,6 +941,7 @@ impl<'c> Lowerer<'c> {
                             vec![Register::new(result_kind, reg)],
                         ),
                         quote! {
+                            use majit_metainterp::jitcode::JitCodeRuntimeExt as _;
                             let __sub_jitcode = __majit_pipeline_jitcode(#pipeline_name);
                             let (__sub_return_kind, _) = __sub_jitcode
                                 .trailing_return_info()
