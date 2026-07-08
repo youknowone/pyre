@@ -1985,8 +1985,20 @@ impl Repr for PtrRepr {
     fn rtype_getattr(&self, hop: &HighLevelOp) -> RTypeResult {
         let attr = hop_arg_const_string(hop, 1)?;
         let r_result = hop_r_result(hop)?;
+        // rptr.py:44-46: `if isinstance(hop.s_result, SomeLLADTMeth):
+        // return hop.inputarg(hop.r_result, arg=0)`.
         if matches!(&*hop.s_result.borrow(), Some(SomeValue::LLADTMeth(_))) {
             return hop.inputarg(&r_result, 0).map(Some);
+        }
+        // `is_null` on a bare pointer reaches here as a `SomeBuiltinMethod`
+        // (`unaryop.rs ptr_method_is_null`) rather than a `SomeLLADTMeth`.
+        // The bound method is represented as its receiver
+        // (`BuiltinMethodRepr.lowleveltype == self_repr.lowleveltype`), so
+        // forward the pointer value in self's repr and let
+        // `BuiltinMethodRepr.rtype_simple_call` dispatch back through
+        // `rtype_method`.
+        if matches!(&*hop.s_result.borrow(), Some(SomeValue::BuiltinMethod(_))) {
+            return hop.inputarg(self, 0).map(Some);
         }
         if self.ptrtype()._example()._lookup_adtmeth(&attr).is_ok() {
             let value = hop
@@ -2029,6 +2041,20 @@ impl Repr for PtrRepr {
             vlist,
             GenopResult::LLType(r_result.lowleveltype().clone()),
         ))
+    }
+
+    /// `BuiltinMethodRepr.rtype_simple_call` dispatch target for the ptr
+    /// bound method seated by the `SomeBuiltinMethod` pass-through in
+    /// `rtype_getattr`. `is_null` is the lltype `_ptr` nullity probe —
+    /// lower it as `ptr_iszero` (opimpl.py:134-136 `op_ptr_iszero`).
+    fn rtype_method(&self, method_name: &str, hop: &HighLevelOp) -> RTypeResult {
+        if method_name == "is_null" {
+            let vlist = hop.inputargs(vec![ConvertedTo::Repr(self)])?;
+            return Ok(hop.genop("ptr_iszero", vlist, GenopResult::LLType(LowLevelType::Bool)));
+        }
+        Err(TyperError::message(format!(
+            "missing PtrRepr.rtype_method_{method_name}"
+        )))
     }
 
     fn rtype_setattr(&self, hop: &HighLevelOp) -> RTypeResult {
