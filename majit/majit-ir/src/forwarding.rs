@@ -30,7 +30,7 @@ use crate::value::{Const, InputArg};
 /// is a value-typed `Copy` payload with no `_forwarded` slot of its
 /// own, unlike `ResOp`/`InputArg`. Keeping it as a separate variant
 /// retires a dedicated const-as-chain-target carrier.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum Forwarded {
     None,
 
@@ -85,6 +85,23 @@ pub enum Forwarded {
     // validation before landing. `Op.vecinfo` (resoperation.rs) is the SEPARATE
     // permanent `resoperation.py` VecOp datatype/bytesize/signed/count
     // store and stays.
+}
+
+impl std::fmt::Debug for Forwarded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Compact by design: `Info(OpInfo)` carries the abstract-value graph
+        // (nested ops / virtual fields whose own `forwarded` slots reference
+        // back through non-`Weak` `Info` edges), so a derived Debug recurses
+        // without bound and overflows the stack when a `forwarded`-bearing
+        // `Op` / `InputArg` is printed. Render the variant shape only.
+        match self {
+            Forwarded::None => f.write_str("None"),
+            Forwarded::Op(_) => f.write_str("Op(Weak)"),
+            Forwarded::InputArg(_) => f.write_str("InputArg(Weak)"),
+            Forwarded::Const(c) => write!(f, "Const({c:?})"),
+            Forwarded::Info(_) => f.write_str("Info(..)"),
+        }
+    }
 }
 
 /// `resoperation.py AbstractResOpOrInputArg` — the shared `_forwarded`

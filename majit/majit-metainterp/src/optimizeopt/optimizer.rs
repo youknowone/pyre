@@ -3329,15 +3329,22 @@ impl Optimizer {
                     .collect();
                 if crate::majit_log_enabled() {
                     for entry in &ctx.exported_short_boxes {
+                        // Print args / same_as_source as OpRefs, not via the
+                        // Operands' derived Debug: a bound InputArg/Op carries a
+                        // `forwarded` slot whose Debug walks the whole abstract-value
+                        // graph (fields, descrs, nested ops), dumping tens of MB per
+                        // box and stalling the run.
+                        let arg_oprefs: Vec<OpRef> =
+                            entry.op.getarglist().iter().map(|a| a.to_opref()).collect();
                         eprintln!(
                             "[jit] exported_short_box: kind={:?} pos={:?} opcode={:?} args={:?} descr_idx={:?} invented={} same_as_source={:?}",
                             entry.kind,
                             entry.op.pos.get(),
                             entry.op.opcode,
-                            entry.op.getarglist(),
+                            arg_oprefs,
                             entry.op.getdescr().map(|d| d.index()),
                             entry.invented_name,
-                            entry.same_as_source,
+                            entry.same_as_source.as_ref().map(|o| o.to_opref()),
                         );
                     }
                 }
