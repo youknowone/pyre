@@ -5545,6 +5545,12 @@ fn builtin_super(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             "super() takes no keyword arguments",
         ));
     }
+    if args.len() > 2 {
+        return Err(crate::PyError::type_error(format!(
+            "super() expected at most 2 arguments, got {}",
+            args.len()
+        )));
+    }
     if args.len() >= 2 {
         let cls = args[0];
         let obj = args[1];
@@ -5680,6 +5686,12 @@ fn builtin_next(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         return Err(crate::PyError::type_error(
             "next() requires at least one argument",
         ));
+    }
+    if args.len() > 2 {
+        return Err(crate::PyError::type_error(format!(
+            "next expected at most 2 arguments, got {}",
+            args.len()
+        )));
     }
     match crate::baseobjspace::next(args[0]) {
         Ok(v) => Ok(v),
@@ -6377,6 +6389,12 @@ pub(crate) fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             let keys = collect_iterable(keys_iter)?;
             builtin_sorted(&[w_list_new(keys)])
         });
+    }
+    if args.len() > 1 {
+        return Err(crate::PyError::type_error(format!(
+            "dir expected at most 1 argument, got {}",
+            args.len()
+        )));
     }
     let obj = args[0];
     // app_inspect.py:57-62 — dir() is driven by the object's `__dir__`:
@@ -7147,10 +7165,17 @@ pub(crate) fn builtin_enumerate(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
 
 /// `reversed()` — PyPy: functional.py W_ReversedIterator
 pub(crate) fn builtin_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.is_empty() {
+    let (args, kwargs) = split_builtin_kwargs(args);
+    if has_real_kwargs(kwargs) {
         return Err(crate::PyError::type_error(
-            "reversed() requires one argument",
+            "reversed() takes no keyword arguments",
         ));
+    }
+    if args.len() != 1 {
+        return Err(crate::PyError::type_error(format!(
+            "reversed expected 1 argument, got {}",
+            args.len()
+        )));
     }
     let obj = args[0];
     unsafe {
@@ -8781,12 +8806,14 @@ pub(crate) fn builtin_round(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             let v = floatobject::w_float_get_value(obj);
             return match ndigits {
                 // `floatobject.py:966-967 _round_float`: nan/inf round to
-                // themselves when an explicit ndigits is supplied.
-                Some(nd) if is_int(*nd) => {
+                // themselves when an explicit ndigits is supplied.  `ndigits`
+                // is taken through `space.getindex_w`, so any `__index__`
+                // object works and a non-index one raises.
+                Some(nd) if !pyre_object::is_none(*nd) => {
+                    let n = space_index_w(*nd)?;
                     if !v.is_finite() {
                         Ok(floatobject::w_float_new(v))
                     } else {
-                        let n = w_int_get_value(*nd);
                         Ok(floatobject::w_float_new(float_round_ndigits(v, n)))
                     }
                 }
@@ -8804,7 +8831,7 @@ pub(crate) fn builtin_round(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             // ndigits >= 0 leave an int unchanged; ndigits < 0 rounds to
             // the nearest multiple of 10**(-ndigits), ties to even.
             let nd = match ndigits {
-                Some(nd) if is_int(*nd) => w_int_get_value(*nd),
+                Some(nd) if !pyre_object::is_none(*nd) => space_index_w(*nd)?,
                 _ => return Ok(obj),
             };
             if nd >= 0 {
@@ -8839,13 +8866,15 @@ pub(crate) fn builtin_round(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             };
         }
     }
-    // operation.py:97 — lookup __round__ on user objects
+    // operation.py:97 — lookup __round__ on user objects.  An omitted or
+    // explicit-None `ndigits` calls `__round__()` with no second argument.
     if let Some(tp) = crate::typedef::r#type(obj) {
         if let Some(method) = unsafe { crate::baseobjspace::lookup_in_type(tp, "__round__") } {
-            let result = if let Some(nd) = ndigits {
-                crate::call::call_function_impl_result(method, &[obj, *nd])?
-            } else {
-                crate::call::call_function_impl_result(method, &[obj])?
+            let result = match ndigits {
+                Some(nd) if !unsafe { pyre_object::is_none(*nd) } => {
+                    crate::call::call_function_impl_result(method, &[obj, *nd])?
+                }
+                _ => crate::call::call_function_impl_result(method, &[obj])?,
             };
             return Ok(result);
         }
@@ -9138,6 +9167,12 @@ fn builtin_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             args.len()
         )));
     }
+    if args.len() > 2 {
+        return Err(crate::PyError::type_error(format!(
+            "format expected at most 2 arguments, got {}",
+            args.len()
+        )));
+    }
     let value = args[0];
     // `builtin_format_impl`: the `format_spec` must be a `str` — validated
     // here, before dispatch, so `format(value, 34)` reports `format()
@@ -9181,10 +9216,12 @@ fn builtin_import_stub(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     let globals = arg(1, "globals");
     let fromlist = arg(3, "fromlist");
     let level_obj = arg(4, "level");
-    let level = if !level_obj.is_null() && unsafe { pyre_object::is_int(level_obj) } {
-        unsafe { pyre_object::w_int_get_value(level_obj) }
-    } else {
+    // `@unwrap_spec(level=int)` — an omitted level defaults to 0; a supplied
+    // non-integer raises through the index protocol rather than defaulting.
+    let level = if level_obj.is_null() {
         0
+    } else {
+        space_index_w(level_obj)?
     };
     let exec_ctx = crate::eval::CURRENT_FRAME.with(|current| {
         let frame = current.get();

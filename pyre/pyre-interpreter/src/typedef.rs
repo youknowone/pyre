@@ -4914,7 +4914,12 @@ fn slice_method_indices(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 
 /// sliceobject.py `W_SliceObject.descr__new__` — `slice([start,] stop[, step])`.
 fn slice_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let params = &args[1..];
+    let (params, kwargs) = crate::builtins::split_builtin_kwargs(&args[1..]);
+    if crate::builtins::has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(
+            "slice() takes no keyword arguments",
+        ));
+    }
     let none = pyre_object::w_none();
     let (start, stop, step) = match params {
         [stop] => (none, *stop, none),
