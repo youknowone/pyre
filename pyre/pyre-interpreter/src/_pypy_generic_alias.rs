@@ -473,30 +473,22 @@ fn ga_make_starred(args: &[PyObjectRef]) -> crate::PyResult {
     make_starred(ga)
 }
 
-thread_local! {
-    /// The single `_make_starred` callable (`_pypy_generic_alias.py:118`),
-    /// kept reachable by the GenericAlias type namespace it is also stored in
-    /// (`init_generic_alias_type`) and never reallocated, so an unpacked
-    /// alias's `__reduce__` returns the same object every time — PyPy returns
-    /// the module-level function.  pyre houses it on the type as the stand-in
-    /// for PyPy's `_pypy_generic_alias._make_starred` module global; the
-    /// stable-address (old-gen) allocation makes the cached pointer safe to
-    /// hold across collections.
-    static MAKE_STARRED_FN: std::cell::Cell<PyObjectRef> =
-        const { std::cell::Cell::new(pyre_object::PY_NULL) };
-}
-
 /// The shared `_make_starred` callable, lazily built then cached.
+///
+/// The single `_make_starred` callable (`_pypy_generic_alias.py:118`),
+/// kept reachable by the GenericAlias type namespace it is also stored in
+/// (`init_generic_alias_type`) and never reallocated, so an unpacked
+/// alias's `__reduce__` returns the same object every time — PyPy returns
+/// the module-level function.  pyre houses it on the type as the stand-in
+/// for PyPy's `_pypy_generic_alias._make_starred` module global; the
+/// stable-address (old-gen) allocation makes the cached pointer safe to
+/// hold across collections.  Process-global so every thread observes the
+/// same callable identity.
 pub(crate) fn make_starred_fn() -> PyObjectRef {
-    MAKE_STARRED_FN.with(|c| {
-        let cached = c.get();
-        if !cached.is_null() {
-            return cached;
-        }
-        let f = make_builtin_function("_make_starred", ga_make_starred);
-        c.set(f);
-        f
-    })
+    static MAKE_STARRED_FN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAKE_STARRED_FN.get_or_init(|| {
+        make_builtin_function("_make_starred", ga_make_starred) as usize
+    }) as PyObjectRef
 }
 
 /// `GenericAlias.__reduce__` (`_pypy_generic_alias.py:96`).
