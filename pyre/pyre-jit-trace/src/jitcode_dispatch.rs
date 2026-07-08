@@ -9084,29 +9084,16 @@ pub(crate) fn m73_encode_audit_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_M73_ENCODE_AUDIT").is_some())
 }
 
-/// `PYRE_M73_LIVENESS_AUDIT` enables the assertion that querying the register
-/// liveness banks off the genuine jitcode `target`
-/// (`frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(idx, py, target)`)
-/// reproduces the banks the ENCODE-side branch-arm readers compute via the
-/// `python_pc_for_jitcode_pc(target)` inversion + `skip_python_trivia_forward`.
-/// Certifies the precondition for re-sourcing the branch-arm Ref-liveness off
-/// the carried coordinate without the py_pc channel. Off in production.
+/// `PYRE_M73_LIVENESS_AUDIT` enables the assertion that the production
+/// branch-arm Ref-liveness banks — now sourced off the genuine jitcode
+/// `target` via `frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(idx,
+/// py, target)` — still equal the banks the retired
+/// `python_pc_for_jitcode_pc(target)` inversion + `skip_python_trivia_forward`
+/// reader computes. Regression guard for the landed re-sourcing off the
+/// carried coordinate; off in production.
 pub(crate) fn m73_liveness_audit_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_M73_LIVENESS_AUDIT").is_some())
-}
-
-/// `PYRE_M73_LIVENESS` (default OFF) flips the branch-arm Ref-liveness reader
-/// from the `python_pc_for_jitcode_pc` inversion to the jitcode-pc-keyed
-/// `frame_liveness_reg_indices_by_bank_at_with_jitcode_pc` twin, preferring the
-/// carried `target` coordinate. Behavioral flip (no byte-identity guarantee),
-/// certified by the always-available `PYRE_M73_LIVENESS_AUDIT` full-bank
-/// equality + `check.py`. When the carried coordinate is not `-live-`-decodable
-/// the twin falls back to the same `resolve_resume_pc` path as the raw reader,
-/// so unpopulated / portal-bridge installs are unaffected.
-pub(crate) fn m73_liveness_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("PYRE_M73_LIVENESS").is_some())
 }
 
 pub(crate) fn python_pc_for_jitcode_pc(metadata: &crate::PyJitCodeMetadata, jit_pc: usize) -> u32 {
@@ -9572,30 +9559,26 @@ fn branch_arm_resume_ref_liveness(
         let code = &*jc.payload.code_ptr;
         let py = python_pc_for_jitcode_pc(&jc.payload.metadata, target) as usize;
         let py = skip_python_trivia_forward(code, py);
-        let banks = crate::state::frame_liveness_reg_indices_by_bank_at(
+        // Source the branch-arm Ref-liveness banks off the genuine carried
+        // jitcode `target` via the jitcode-pc-keyed twin, bypassing the
+        // `python_pc_for_jitcode_pc` inversion + `pc_map` re-key. The twin
+        // falls back to the same `resolve_resume_pc` path (keyed on `py`) for
+        // unpopulated / portal-bridge installs, so those are unaffected.
+        let banks = crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
             outer_jitcode_index as i32,
             py as i32,
+            target as i32,
         );
         if m73_liveness_audit_enabled() {
-            let twin = crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
+            let via_inversion = crate::state::frame_liveness_reg_indices_by_bank_at(
                 outer_jitcode_index as i32,
                 py as i32,
-                target as i32,
             );
             assert_eq!(
-                twin, banks,
+                banks, via_inversion,
                 "liveness twin diverges from branch_arm_resume_ref_liveness at target={target} py={py}"
             );
         }
-        let banks = if m73_liveness_enabled() {
-            crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
-                outer_jitcode_index as i32,
-                py as i32,
-                target as i32,
-            )
-        } else {
-            banks
-        };
         let live: std::collections::HashSet<u16> = banks.ref_.iter().map(|&c| c as u16).collect();
         let num_regs_r = jc.payload.jitcode.num_regs_r() as u16;
         Some((live, num_regs_r))
