@@ -253,6 +253,8 @@ fn real_main() {
                 ..Default::default()
             },
             portal: None,
+            // pyre production registers no trait-dispatch families (#346).
+            register_trait_families: Vec::new(),
         },
     };
     // warmspot.py:516 `vinfos[VTYPEPTR] = VirtualizableInfo(self, VTYPEPTR)` —
