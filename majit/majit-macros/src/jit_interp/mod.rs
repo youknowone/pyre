@@ -13,7 +13,7 @@ mod green_type_tag;
 pub(crate) mod jitcode_lower;
 
 use proc_macro2::TokenStream;
-use quote::{format_ident, quote};
+use quote::quote;
 use syn::{
     Expr, Ident, ItemFn, LitBool, Path, Token, braced, bracketed,
     ext::IdentExt,
@@ -1403,17 +1403,9 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
                     }
                 }
             }
-            // Read: `state.<ref>.<member>` reads a mutable heap field. In the
-            // observer-replay tracing model the recording walk advances this
-            // field over the whole loop circuit before the concrete body
-            // re-runs, so a raw re-read would see a stale value. Replay the
-            // walk-position value when one is queued (keyed by the live object
-            // pointer + field offset), else read the field live:
-            //   match consume_observed_getfield(obj as usize, offset_of!(T, m)) {
-            //       Some(v) => observer_i64_to_value(v),
-            //       None    => unsafe { (*(obj as *const T)).m },
-            //   }
-            // The JIT side records the matching value in BC_GETFIELD_GC_I.
+            // Read: `state.<ref>.<member>` reads a mutable heap field live from
+            // the object pointer. The walk is the sole executor, so the field
+            // holds the current value; the JIT side records BC_GETFIELD_GC_I.
             if let Expr::Field(field) = expr {
                 if let Some(struct_path) = self.ref_struct_of_base(&field.base) {
                     let base = (*field.base).clone();
@@ -1428,15 +1420,8 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
                         *expr = syn::parse_quote! {
                             {
                                 let __majit_getfield_obj = #base;
-                                match majit_metainterp::consume_observed_getfield(
-                                    __majit_getfield_obj as usize,
-                                    ::core::mem::offset_of!(#struct_path, #member),
-                                ) {
-                                    ::core::option::Option::Some(__majit_getfield_v) =>
-                                        __majit_getfield_v as usize,
-                                    ::core::option::Option::None => unsafe {
-                                        (*(__majit_getfield_obj as *const #struct_path)).#member as usize
-                                    },
+                                unsafe {
+                                    (*(__majit_getfield_obj as *const #struct_path)).#member as usize
                                 }
                             }
                         };
@@ -1444,16 +1429,8 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
                         *expr = syn::parse_quote! {
                             {
                                 let __majit_getfield_obj = #base;
-                                match majit_metainterp::consume_observed_getfield(
-                                    __majit_getfield_obj as usize,
-                                    ::core::mem::offset_of!(#struct_path, #member),
-                                ) {
-                                    ::core::option::Option::Some(__majit_getfield_v) => unsafe {
-                                        majit_metainterp::observer_i64_to_value(__majit_getfield_v)
-                                    },
-                                    ::core::option::Option::None => unsafe {
-                                        (*(__majit_getfield_obj as *const #struct_path)).#member
-                                    },
+                                unsafe {
+                                    (*(__majit_getfield_obj as *const #struct_path)).#member
                                 }
                             }
                         };
@@ -1474,15 +1451,8 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
                         *expr = syn::parse_quote! {
                             {
                                 let __majit_getfield_obj = #base;
-                                match majit_metainterp::consume_observed_getfield(
-                                    __majit_getfield_obj as usize,
-                                    ::core::mem::offset_of!(#struct_path, #member),
-                                ) {
-                                    ::core::option::Option::Some(__majit_getfield_v) =>
-                                        __majit_getfield_v as usize,
-                                    ::core::option::Option::None => unsafe {
-                                        (*(__majit_getfield_obj as *const #struct_path)).#member as usize
-                                    },
+                                unsafe {
+                                    (*(__majit_getfield_obj as *const #struct_path)).#member as usize
                                 }
                             }
                         };
@@ -1491,16 +1461,8 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
                         *expr = syn::parse_quote! {
                             {
                                 let __majit_getfield_obj = #base;
-                                match majit_metainterp::consume_observed_getfield(
-                                    __majit_getfield_obj as usize,
-                                    ::core::mem::offset_of!(#struct_path, #member),
-                                ) {
-                                    ::core::option::Option::Some(__majit_getfield_v) => unsafe {
-                                        majit_metainterp::observer_i64_to_value(__majit_getfield_v)
-                                    },
-                                    ::core::option::Option::None => unsafe {
-                                        (*(__majit_getfield_obj as *const #struct_path)).#member
-                                    },
+                                unsafe {
+                                    (*(__majit_getfield_obj as *const #struct_path)).#member
                                 }
                             }
                         };
@@ -1671,8 +1633,6 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
         &merge_fn_name,
         &config.greens,
         &config.green_type_tags,
-        &config.calls,
-        &config.io_shims,
         config.recursive_entry.as_ref(),
     );
 
@@ -1690,8 +1650,6 @@ fn rewrite_body(
     merge_fn_name: &Ident,
     default_greens: &[Expr],
     default_green_type_tags: &[Option<green_type_tag::GreenTypeTag>],
-    call_policies: &[CallEntry],
-    io_shims: &[(Path, Ident)],
     recursive_entry: Option<&Path>,
 ) -> TokenStream {
     use syn::visit_mut::VisitMut;
@@ -1931,271 +1889,10 @@ fn rewrite_body(
         }
     }
 
-    #[derive(Clone)]
-    enum ObserverReplayKind {
-        Void,
-        Int,
-        Ref,
-        Float,
-    }
-
-    #[derive(Clone)]
-    struct ObserverReplay {
-        kind: ObserverReplayKind,
-        observed_func: TokenStream,
-        observed_arg_indices: Vec<usize>,
-        unwrap_observed_refs: bool,
-    }
-
-    fn path_segments(path: &Path) -> Vec<String> {
-        path.segments
-            .iter()
-            .map(|segment| segment.ident.to_string())
-            .collect()
-    }
-
-    fn call_expr_segments(expr: &Expr) -> Option<Vec<String>> {
-        match expr {
-            Expr::Path(expr_path) => Some(path_segments(&expr_path.path)),
-            _ => None,
-        }
-    }
-
-    fn unwrap_observer_ref_expr(expr: &Expr) -> &Expr {
-        match expr {
-            Expr::Reference(reference) => unwrap_observer_ref_expr(&reference.expr),
-            Expr::Paren(paren) => unwrap_observer_ref_expr(&paren.expr),
-            _ => expr,
-        }
-    }
-
-    fn replay_kind_for_policy(kind: CallPolicyKind) -> Option<ObserverReplayKind> {
-        // Mirror the metainterp's recording sites in
-        // `pyjitpl/dispatch.rs::run_one_step`.  Plain (non-wrapped)
-        // policies use the helper symbol directly; wrapped policies
-        // route through `helper_policy_path` to recover the
-        // `__concrete_target` wrapper symbol the metainterp records,
-        // wired by `observer_replay_for_call` below.
-        //
-        // Elidable: not recorded by dispatch (CALL_PURE_* is exempt),
-        // pure re-execution is harmless. Inline: pushes a metainterp
-        // frame, never reaches call_*_function.
-        match kind {
-            CallPolicyKind::ResidualVoid
-            | CallPolicyKind::ResidualVoidCannotRaise
-            | CallPolicyKind::MayForceVoid
-            | CallPolicyKind::ReleaseGilVoid
-            | CallPolicyKind::LoopInvariantVoid
-            | CallPolicyKind::ResidualVoidWrapped
-            | CallPolicyKind::ResidualVoidCannotRaiseWrapped
-            | CallPolicyKind::MayForceVoidWrapped
-            | CallPolicyKind::ReleaseGilVoidWrapped
-            | CallPolicyKind::LoopInvariantVoidWrapped => Some(ObserverReplayKind::Void),
-            CallPolicyKind::ResidualInt
-            | CallPolicyKind::ResidualIntCannotRaise
-            | CallPolicyKind::MayForceInt
-            | CallPolicyKind::ReleaseGilInt
-            | CallPolicyKind::LoopInvariantInt
-            | CallPolicyKind::ResidualIntWrapped
-            | CallPolicyKind::ResidualIntCannotRaiseWrapped
-            | CallPolicyKind::MayForceIntWrapped
-            | CallPolicyKind::ReleaseGilIntWrapped
-            | CallPolicyKind::LoopInvariantIntWrapped => Some(ObserverReplayKind::Int),
-            CallPolicyKind::ResidualRef
-            | CallPolicyKind::ResidualRefWrapped
-            | CallPolicyKind::ResidualRefCannotRaiseWrapped
-            | CallPolicyKind::MayForceRefWrapped
-            | CallPolicyKind::LoopInvariantRefWrapped => Some(ObserverReplayKind::Ref),
-            CallPolicyKind::ResidualFloatWrapped
-            | CallPolicyKind::ResidualFloatCannotRaiseWrapped
-            | CallPolicyKind::MayForceFloatWrapped
-            | CallPolicyKind::ReleaseGilFloatWrapped
-            | CallPolicyKind::LoopInvariantFloatWrapped => Some(ObserverReplayKind::Float),
-            _ => None,
-        }
-    }
-
-    /// Wrapped policy variants install a generated wrapper at codewriter
-    /// time (`__concrete_target` from `(__policy, _, __trace_target,
-    /// __concrete_target)` tuple).  The metainterp records the wrapper
-    /// pointer on OBSERVED_CALLS, so the outer-side consume must use the
-    /// same wrapper symbol — recovered at runtime by calling the helper's
-    /// `__majit_call_policy_<name>()` accessor.  Plain policies pass
-    /// through `#func as *const ()` directly.
-    fn is_wrapped_policy(kind: CallPolicyKind) -> bool {
-        matches!(
-            kind,
-            CallPolicyKind::ResidualVoidWrapped
-                | CallPolicyKind::ResidualVoidCannotRaiseWrapped
-                | CallPolicyKind::MayForceVoidWrapped
-                | CallPolicyKind::ReleaseGilVoidWrapped
-                | CallPolicyKind::LoopInvariantVoidWrapped
-                | CallPolicyKind::ResidualIntWrapped
-                | CallPolicyKind::ResidualIntCannotRaiseWrapped
-                | CallPolicyKind::MayForceIntWrapped
-                | CallPolicyKind::ReleaseGilIntWrapped
-                | CallPolicyKind::LoopInvariantIntWrapped
-                | CallPolicyKind::ResidualRefWrapped
-                | CallPolicyKind::ResidualRefCannotRaiseWrapped
-                | CallPolicyKind::MayForceRefWrapped
-                | CallPolicyKind::LoopInvariantRefWrapped
-                | CallPolicyKind::ResidualFloatWrapped
-                | CallPolicyKind::ResidualFloatCannotRaiseWrapped
-                | CallPolicyKind::MayForceFloatWrapped
-                | CallPolicyKind::ReleaseGilFloatWrapped
-                | CallPolicyKind::LoopInvariantFloatWrapped
-        )
-    }
-
-    fn observer_replay_for_call(
-        func: &Expr,
-        call_policies: &[(Vec<String>, Option<CallPolicyKind>)],
-        io_shims: &[(Vec<String>, Ident)],
-    ) -> Option<ObserverReplay> {
-        let segments = call_expr_segments(func)?;
-        for (io_path, shim) in io_shims {
-            if *io_path == segments {
-                let observed_func = quote! { #shim as *const () };
-                return Some(ObserverReplay {
-                    kind: ObserverReplayKind::Void,
-                    observed_func,
-                    observed_arg_indices: vec![0],
-                    unwrap_observed_refs: true,
-                });
-            }
-        }
-        for (path, policy) in call_policies {
-            if *path == segments {
-                let policy_kind = *policy.as_ref()?;
-                let kind = replay_kind_for_policy(policy_kind)?;
-                let observed_func = if is_wrapped_policy(policy_kind) {
-                    // Wrapped policy: outer-side replay key must match the
-                    // wrapper symbol (`__concrete_target`) the metainterp
-                    // recorded — recover it via the helper's policy
-                    // accessor at runtime.
-                    let policy_path = jitcode_lower::helper_policy_path(func)?;
-                    quote! {
-                        {
-                            let (_, _, __majit_observer_trace, __majit_observer_concrete, _prebuild, _save_err) = #policy_path();
-                            if __majit_observer_trace.is_null()
-                                && __majit_observer_concrete.is_null()
-                            {
-                                panic!("wrapped helper policy requires generated call-target wrappers");
-                            }
-                            let __majit_observer_trace = if __majit_observer_trace.is_null() {
-                                __majit_observer_concrete
-                            } else {
-                                __majit_observer_trace
-                            };
-                            let __majit_observer_concrete = if __majit_observer_concrete.is_null() {
-                                __majit_observer_trace
-                            } else {
-                                __majit_observer_concrete
-                            };
-                            __majit_observer_concrete
-                        }
-                    }
-                } else {
-                    quote! { #func as *const () }
-                };
-                return Some(ObserverReplay {
-                    kind,
-                    observed_func,
-                    observed_arg_indices: Vec::new(),
-                    unwrap_observed_refs: false,
-                });
-            }
-        }
-        None
-    }
-
-    fn observer_replay_expr(call: &syn::ExprCall, replay: ObserverReplay) -> Expr {
-        let func = &call.func;
-        let arg_exprs: Vec<Expr> = call.args.iter().cloned().collect();
-        let arg_names: Vec<Ident> = (0..arg_exprs.len())
-            .map(|idx| format_ident!("__majit_observer_arg{idx}"))
-            .collect();
-        let arg_binds = arg_names.iter().zip(arg_exprs.iter()).map(|(name, arg)| {
-            quote! {
-                let #name = #arg;
-            }
-        });
-        let observed_indices: Vec<usize> = if replay.observed_arg_indices.is_empty() {
-            (0..arg_names.len()).collect()
-        } else {
-            replay.observed_arg_indices.clone()
-        };
-        let observed_args = observed_indices.iter().map(|idx| {
-            if replay.unwrap_observed_refs {
-                let expr = unwrap_observer_ref_expr(&arg_exprs[*idx]);
-                quote! { majit_metainterp::observer_arg_to_i64(&(#expr)) }
-            } else {
-                let name = &arg_names[*idx];
-                quote! { majit_metainterp::observer_arg_to_i64(&#name) }
-            }
-        });
-        let observed_func = replay.observed_func;
-
-        let tokens = match replay.kind {
-            ObserverReplayKind::Void => quote! {{
-                #(#arg_binds)*
-                let __majit_observer_args = [#(#observed_args),*];
-                if !majit_metainterp::consume_observed_void_call(
-                    #observed_func,
-                    &__majit_observer_args,
-                ) {
-                    #func(#(#arg_names),*);
-                }
-            }},
-            ObserverReplayKind::Int => quote! {{
-                #(#arg_binds)*
-                let __majit_observer_args = [#(#observed_args),*];
-                match majit_metainterp::consume_observed_int_call(
-                    #observed_func,
-                    &__majit_observer_args,
-                ) {
-                    Some(__majit_observer_result) => unsafe {
-                        majit_metainterp::observer_i64_to_value(__majit_observer_result)
-                    },
-                    None => #func(#(#arg_names),*),
-                }
-            }},
-            ObserverReplayKind::Ref => quote! {{
-                #(#arg_binds)*
-                let __majit_observer_args = [#(#observed_args),*];
-                match majit_metainterp::consume_observed_ref_call(
-                    #observed_func,
-                    &__majit_observer_args,
-                ) {
-                    Some(__majit_observer_result) => unsafe {
-                        majit_metainterp::observer_i64_to_value(__majit_observer_result)
-                    },
-                    None => #func(#(#arg_names),*),
-                }
-            }},
-            ObserverReplayKind::Float => quote! {{
-                #(#arg_binds)*
-                let __majit_observer_args = [#(#observed_args),*];
-                match majit_metainterp::consume_observed_float_call(
-                    #observed_func,
-                    &__majit_observer_args,
-                ) {
-                    Some(__majit_observer_result) => unsafe {
-                        majit_metainterp::observer_i64_to_value(__majit_observer_result)
-                    },
-                    None => #func(#(#arg_names),*),
-                }
-            }},
-        };
-        syn::parse2(tokens).expect("failed to parse observer replay expression")
-    }
-
     struct MarkerRewriter {
         merge_fn_name: Ident,
         default_greens: Vec<Expr>,
         default_green_type_tags: Vec<Option<green_type_tag::GreenTypeTag>>,
-        call_policies: Vec<(Vec<String>, Option<CallPolicyKind>)>,
-        io_shims: Vec<(Vec<String>, Ident)>,
         recursive_entry: Option<Path>,
     }
 
@@ -2242,10 +1939,9 @@ fn rewrite_body(
                         // Single-pass opt-in: after the walk, if the CloseLoop
                         // populated a walk-final (pc, reds) snapshot, transfer
                         // it into native state and resume the native loop at the
-                        // close pc — skipping the body re-run (NO observer
-                        // replay). `#merge_fn` returns `None` (so this is inert)
-                        // whenever `PYRE_SINGLE_PASS` is off or the walk did not
-                        // populate reds, leaving the observer/replay path intact.
+                        // close pc, skipping the body re-run. `#merge_fn` returns
+                        // `None` (so this is inert) whenever `PYRE_SINGLE_PASS` is
+                        // off or the walk did not populate reds.
                         quote! {
                             if #driver.is_tracing() {
                                 let __mp_out = #merge_fn(&mut #driver, #env, #pc);
@@ -2261,15 +1957,6 @@ fn rewrite_body(
                                 if let Some(__next_pc) =
                                     #driver.take_authoritative_next_pc()
                                 {
-                                    // Cancel the observer-replay handover the
-                                    // walk's `ObserverGuard::drop` queued: the
-                                    // authoritative walker executed the opcode
-                                    // and native skips its dispatch, so nothing
-                                    // re-runs the body — leaving the replay queue
-                                    // set would make the next opcode consume this
-                                    // opcode's stale calls (same cleanup the
-                                    // single-pass branch below performs).
-                                    majit_metainterp::cancel_observer_replay();
                                     // Propagate the walk's scalar state fields
                                     // (e.g. SEL's new `selected`) from the live
                                     // sym into native state BEFORE recover, so
@@ -2286,11 +1973,6 @@ fn rewrite_body(
                                 }
                                 if let Some((__sp_pc, __sp_reds)) = __mp_out
                                 {
-                                    // Cancel the observer-replay handover the
-                                    // walk's `ObserverGuard::drop` set: we
-                                    // transfer state directly and skip the body
-                                    // re-run, so nothing should replay the queue.
-                                    majit_metainterp::cancel_observer_replay();
                                     // Push the walk-mutated scalar state fields
                                     // (e.g. a walk-advanced `selected`) from the
                                     // still-live persistent sym into native
@@ -2407,13 +2089,6 @@ fn rewrite_body(
                 }
             }
 
-            if let Expr::Call(call) = expr {
-                if let Some(replay) =
-                    observer_replay_for_call(&call.func, &self.call_policies, &self.io_shims)
-                {
-                    *expr = observer_replay_expr(call, replay);
-                }
-            }
         }
 
         fn visit_block_mut(&mut self, block: &mut syn::Block) {
@@ -2553,14 +2228,6 @@ fn rewrite_body(
         merge_fn_name: merge_fn_name.clone(),
         default_greens: default_greens.to_vec(),
         default_green_type_tags: default_green_type_tags.to_vec(),
-        call_policies: call_policies
-            .iter()
-            .map(|entry| (path_segments(&entry.path), entry.policy))
-            .collect(),
-        io_shims: io_shims
-            .iter()
-            .map(|(path, shim)| (path_segments(path), shim.clone()))
-            .collect(),
         recursive_entry: recursive_entry.cloned(),
     };
     rewriter.visit_block_mut(&mut cloned_block);
