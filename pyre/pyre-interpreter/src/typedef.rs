@@ -1895,13 +1895,22 @@ fn set_alloc_for_class(
 /// lives on `descr_init`, which type.__call__ runs after `__new__`.
 fn set_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let (params, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    if crate::builtins::has_real_kwargs(kwargs) {
-        return Err(crate::PyError::type_error(
-            "set() takes no keyword arguments",
-        ));
-    }
     let cls = params.first().copied().unwrap_or(pyre_object::PY_NULL);
     let set_type = crate::typedef::gettypeobject(&pyre_object::setobject::SET_TYPE);
+    // `set.__new__` ignores its extra arguments and leaves positional-count
+    // validation to `__init__`; only a plain `set(...)` whose `__init__` is not
+    // overridden rejects keywords here (`_PyArg_NoKeywords`).  A subclass that
+    // defines an `__init__` taking keywords must still receive them, so the
+    // keyword check is skipped whenever the subtype overrides `__init__`
+    // (passing 0 for `positional_extra` keeps the surplus-positional report in
+    // `__init__`).
+    builtinclass_new_args_check(
+        "set",
+        set_type,
+        cls,
+        0,
+        crate::builtins::has_real_kwargs(kwargs),
+    )?;
     set_alloc_for_class(cls, set_type, false)
 }
 
@@ -1972,10 +1981,7 @@ fn frozenset_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     if !iterable.is_null()
         && std::ptr::eq(cls, frozenset_type)
         && unsafe {
-            pyre_object::pyobject::is_exact_type(
-                iterable,
-                &pyre_object::setobject::FROZENSET_TYPE,
-            )
+            pyre_object::pyobject::is_exact_type(iterable, &pyre_object::setobject::FROZENSET_TYPE)
         }
     {
         return Ok(iterable);
