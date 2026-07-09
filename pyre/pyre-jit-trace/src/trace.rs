@@ -1977,12 +1977,17 @@ fn dump_perfn_jitcode_for_trace(w_code: *const (), start_pc: usize) {
         pjc.metadata.portal_ec_reg,
         pjc.metadata.built_as_portal,
     );
+    let cap = std::env::var("PYRE_DUMP_PERFN_JITCODE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v > 1)
+        .unwrap_or(80);
     let mut count = 0usize;
     let mut last_next = 0usize;
     let mut histogram: std::collections::BTreeMap<String, usize> =
         std::collections::BTreeMap::new();
     for op in crate::jitcode_runtime::decoded_ops(code) {
-        if count < 80 {
+        if count < cap {
             eprintln!(
                 "[perfn-jitcode]   pc={:>4} next={:>4} {}/{} bytes={:?}",
                 op.pc,

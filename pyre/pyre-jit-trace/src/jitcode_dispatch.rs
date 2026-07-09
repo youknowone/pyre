@@ -9564,10 +9564,15 @@ fn kept_stack_has_boxed_int_hazard(
 /// from `jitcode.constants_r` by `init_register_files_from_runtime_jitcode`).
 /// Same `FULL_BODY_SNAPSHOT_SYM` contract as
 /// [`branch_resume_target_stack_depth`].
-fn branch_arm_resume_ref_liveness(
-    target: usize,
-    outer_jitcode_index: u32,
-) -> Option<(std::collections::HashSet<u16>, u16)> {
+fn branch_arm_resume_ref_liveness(target: usize) -> Option<(std::collections::HashSet<u16>, u16)> {
+    // Conservative under an inline sub-walk: `target` indexes the innermost
+    // callee's jitcode while `FULL_BODY_SNAPSHOT_SYM` (read below) is the
+    // outer portal frame, so the outer-keyed liveness banks would be read at
+    // a foreign coordinate.  `None` → the caller treats the arm as
+    // unrestorable and declines, which is the current sub-walk behavior.
+    if INLINE_SUBWALK_CAPTURE_BOUNDARY.with(|c| c.get()) {
+        return None;
+    }
     let full_body_sym = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
     if full_body_sym.is_null() {
         return None;
@@ -9584,21 +9589,31 @@ fn branch_arm_resume_ref_liveness(
         let code = &*jc.payload.code_ptr;
         let py = python_pc_for_jitcode_pc(&jc.payload.metadata, target) as usize;
         let py = skip_python_trivia_forward(code, py);
+        // Key the liveness store off the sym's own stamped `jitcode.index`
+        // — the same per-function index the snapshot encoder
+        // (`collect_outer_active_boxes`) and the resume decoder
+        // (`setup_bridge_sym`, via the snapshot frame's `jitcode_index`)
+        // resolve — NOT the walk context's `outer_jitcode_index`, which is
+        // 0 for the second and later distinct functions in a program.  A
+        // wrong index resolves `target` against the FIRST function's
+        // jitcode, where it is out of range, and the silent empty default
+        // reports every arm read unrestorable (a spurious permanent
+        // decline for every kept-stack branch outside the first function).
+        //
         // Source the branch-arm Ref-liveness banks off the genuine carried
         // jitcode `target` via the jitcode-pc-keyed twin, bypassing the
         // `python_pc_for_jitcode_pc` inversion + `pc_map` re-key. The twin
         // falls back to the same `resolve_resume_pc` path (keyed on `py`) for
         // unpopulated / portal-bridge installs, so those are unaffected.
+        let jitcode_index = jc.index;
         let banks = crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
-            outer_jitcode_index as i32,
+            jitcode_index,
             py as i32,
             target as i32,
         );
         if m73_liveness_audit_enabled() {
-            let via_inversion = crate::state::frame_liveness_reg_indices_by_bank_at(
-                outer_jitcode_index as i32,
-                py as i32,
-            );
+            let via_inversion =
+                crate::state::frame_liveness_reg_indices_by_bank_at(jitcode_index, py as i32);
             assert_eq!(
                 banks, via_inversion,
                 "liveness twin diverges from branch_arm_resume_ref_liveness at target={target} py={py}"
@@ -19703,8 +19718,7 @@ fn handle(
                 // the decline and silently miscompile.  `kept_stack` reads the
                 // correct per-function depth and closes that gap.
                 if (kept_stack || kept_stack_any_leg) && !mirror_covers_kept {
-                    let liveness =
-                        branch_arm_resume_ref_liveness(other_target, ctx.outer_jitcode_index);
+                    let liveness = branch_arm_resume_ref_liveness(other_target);
                     // Hazard (1): the not-taken arm reads a regular Ref register
                     // the blackhole resumes as NULL (the conditional-expression
                     // boxed-int NULL-deref crash).
@@ -19770,6 +19784,34 @@ fn handle(
                     // that kept Ref always also trips Hazard (1)/(2)/(3) — so the
                     // exc-region case needs no decline of its own.
                     if reads_null_ref || uses_edge_recovery || kept_boxed_int {
+                        // Attribute the kept-stack decline to the hazard that
+                        // fired and the mirror state behind it, so a corpus run
+                        // (`PYRE_FBW_DEBUG_ABORT`) can separate the distinct
+                        // decline causes without re-instrumenting: an inline
+                        // sub-walk (`subwalk`/`!vstack_valid`), a genuinely
+                        // unrestorable regular Ref (`reads_null_ref` with a
+                        // valid mirror), or an undermodeled-mirror boxed-int /
+                        // edge-recovery slot.
+                        if fbw_debug_abort_enabled() {
+                            eprintln!(
+                                "[decline-why] PERMANENT pc={} other_target={} vstack_valid={} \
+                                 subwalk={} mirror_covers_kept={} depth_gt_1={} kept_stack={} \
+                                 kept_stack_any_leg={} reads_null_ref={} uses_edge_recovery={} \
+                                 kept_boxed_int={} kept_recovered_nonempty={}",
+                                op.pc,
+                                other_target,
+                                ctx.vstack_valid,
+                                INLINE_SUBWALK_CAPTURE_BOUNDARY.with(|c| c.get()),
+                                mirror_covers_kept,
+                                depth_gt_1,
+                                kept_stack,
+                                kept_stack_any_leg,
+                                reads_null_ref,
+                                uses_edge_recovery,
+                                kept_boxed_int,
+                                kept_recovered.as_deref().is_some_and(|m| !m.is_empty()),
+                            );
+                        }
                         return Err(DispatchError::BranchGuardUnrestorableKeptStackPermanent {
                             pc: op.pc,
                         });
@@ -19784,6 +19826,19 @@ fn handle(
                 // Unmodeled opcode) leaves the kept slots without a reliable
                 // per-slot source, so decline → interpreter (correct).
                 if depth_gt_1 && !ctx.vstack_valid {
+                    if fbw_debug_abort_enabled() {
+                        eprintln!(
+                            "[decline-why] UNSUPPORTED pc={} other_target={} vstack_valid={} \
+                             subwalk={} depth_gt_1={} kept_stack={} kept_stack_any_leg={}",
+                            op.pc,
+                            other_target,
+                            ctx.vstack_valid,
+                            INLINE_SUBWALK_CAPTURE_BOUNDARY.with(|c| c.get()),
+                            depth_gt_1,
+                            kept_stack,
+                            kept_stack_any_leg,
+                        );
+                    }
                     return Err(DispatchError::BranchGuardKeptStackUnsupported { pc: op.pc });
                 }
                 ctx.trace_ctx.record_guard(opcode, &[valuebox], 0);
