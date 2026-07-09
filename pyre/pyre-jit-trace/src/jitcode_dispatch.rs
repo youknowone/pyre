@@ -4246,6 +4246,42 @@ fn getarrayitem_vable_via_metainterp(
     ctx: &mut WalkContext<'_, '_>,
     dst_bank: char,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
+    // Strict fresh-frame fold: when this op reads the current inline level's
+    // own (unseeded) portal frame, resolve it register-to-register through the
+    // per-slot OpRef shadow and emit NO GC op — the `fresh_virtualizable` case
+    // (jtransform.py:990-993 `is_virtualizable_getset` returns `False`).  The
+    // param-store seed dominates every read of a branchless leaf's own frame,
+    // so the slot is present; a genuinely-unbound read falls through to the
+    // `VableBoxNotSeeded` abort below (never the 16 GiB metainterp path).
+    let fold_frame_reg = fbw_strict_fold_frame_reg();
+    if fold_frame_reg != u16::MAX && code[op.pc + 1] as u16 == fold_frame_reg {
+        let index = read_int_reg(code, op, 1, ctx)?;
+        if let Some(majit_ir::Value::Int(slot)) = ctx.trace_ctx.concrete_of_opref(index) {
+            if let Some(result) = fbw_callee_local_get_opref(slot) {
+                let dst = code[op.pc + 7] as usize;
+                let concrete = concrete_from_recorded_opref(ctx, result);
+                match dst_bank {
+                    'i' => write_int_reg(ctx, op.pc, dst, result, concrete)?,
+                    'r' => write_ref_reg(ctx, op.pc, dst, result, concrete)?,
+                    'f' => {
+                        let len = ctx.registers_f.len();
+                        let slot_ref =
+                            ctx.registers_f
+                                .get_mut(dst)
+                                .ok_or(DispatchError::RegisterOutOfRange {
+                                    pc: op.pc,
+                                    reg: dst,
+                                    len,
+                                    bank: "f",
+                                })?;
+                        *slot_ref = result;
+                    }
+                    _ => unreachable!("dst_bank must be 'i', 'r' or 'f'"),
+                }
+                return Ok((DispatchOutcome::Continue, op.next_pc));
+            }
+        }
+    }
     let vable = read_ref_reg(code, op, 0, ctx)?;
     // An unseeded walker Ref register holds `OpRef::None` (`raw() ==
     // u32::MAX`); feeding it into the metainterp vable path would resize
@@ -4350,6 +4386,31 @@ fn setarrayitem_vable_via_metainterp(
     ctx: &mut WalkContext<'_, '_>,
     value_bank: char,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
+    // Strict fresh-frame fold (twin of `getarrayitem_vable_via_metainterp`): a
+    // write to the current inline level's own (unseeded) portal frame updates
+    // the per-slot OpRef + concrete shadow and emits NO SETARRAYITEM_GC.  Both
+    // local stores (`index < nlocals`) and operand-stack pushes (`index >=
+    // nlocals`) on the fresh frame are pure mirror writes here — the value
+    // lives in an SSA register; the vable array is folded away.
+    let fold_frame_reg = fbw_strict_fold_frame_reg();
+    if fold_frame_reg != u16::MAX && code[op.pc + 1] as u16 == fold_frame_reg {
+        let index = read_int_reg(code, op, 1, ctx)?;
+        if let Some(majit_ir::Value::Int(slot)) = ctx.trace_ctx.concrete_of_opref(index) {
+            let value = match value_bank {
+                'i' => read_int_reg(code, op, 2, ctx)?,
+                'r' => read_ref_reg(code, op, 2, ctx)?,
+                'f' => read_float_reg(code, op, 2, ctx)?,
+                _ => unreachable!("value_bank must be 'i', 'r' or 'f'"),
+            };
+            let concrete = ctx
+                .trace_ctx
+                .concrete_of_opref(value)
+                .unwrap_or(majit_ir::Value::Void);
+            fbw_callee_local_set_opref(slot, value);
+            fbw_callee_local_set_concrete(slot, concrete);
+            return Ok((DispatchOutcome::Continue, op.next_pc));
+        }
+    }
     let vable = read_ref_reg(code, op, 0, ctx)?;
     // See `getarrayitem_vable_via_metainterp`: an unseeded `OpRef::None`
     // vable would resize the heapcache flag vector to 16 GiB; bail instead.
@@ -7112,6 +7173,78 @@ thread_local! {
     static FBW_CALLEE_LOCALS_CONCRETE:
         std::cell::RefCell<Vec<std::collections::HashMap<i64, majit_ir::Value>>> =
         const { std::cell::RefCell::new(Vec::new()) };
+
+    /// FBW strict fresh-frame OpRef shadow: a twin of
+    /// `FBW_CALLEE_LOCALS_CONCRETE` carrying the SSA `OpRef` each `localsplus`
+    /// slot currently holds, innermost frame last.  Used only on the strict
+    /// straight-line inline path (a branchless leaf) when the callee body
+    /// carries the portal frame-vable prologue: the callee's own
+    /// `getarrayitem_vable_r` / `setarrayitem_vable_r` on its own (unseeded)
+    /// frame fold register-to-register through this map, emitting NO GC op.
+    /// This is the `fresh_virtualizable` case: a freshly-built callee frame's
+    /// local accesses lower direct, not vable — `is_virtualizable_getset`
+    /// returns `False` when `'fresh_virtualizable' in flags`
+    /// (rpython/jit/codewriter/jtransform.py:990-993,
+    /// pypy/interpreter/pycode.py:275 `fresh_frame = jit.hint(frame,
+    /// access_directly=True, fresh_virtualizable=True)`).
+    static FBW_CALLEE_LOCALS_OPREF:
+        std::cell::RefCell<Vec<std::collections::HashMap<i64, OpRef>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+
+    /// The callee portal frame register a strict fresh-frame fold resolves
+    /// own-frame vable ops against, innermost frame last.  `u16::MAX` = this
+    /// inline level is NOT a strict fold (plain strict leaf with no vable
+    /// prologue, or the multiframe path that seeds a real virtual frame), so
+    /// the fold short-circuits stay inert and the ordinary metainterp vable
+    /// path runs.
+    static FBW_STRICT_FOLD_FRAME_REG: std::cell::RefCell<Vec<u16>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Whether the always-portal frame-input flip is active (`PYRE_ALWAYS_PORTAL`).
+/// When set, every drained per-code jitcode is built with the portal
+/// `[frame, ec]` input shape + frame-vable locals prologue, and the strict
+/// inline path activates the fresh-frame fold to keep a branchless leaf
+/// register-to-register.  Process-constant: the codewriter reads the same env
+/// at build time so a jitcode's shape and its walk-time fold agree.
+fn fbw_always_portal_enabled() -> bool {
+    std::env::var_os("PYRE_ALWAYS_PORTAL").is_some()
+}
+
+/// Activate the strict fresh-frame fold for the innermost inline level,
+/// binding it to the callee's portal frame register.
+fn fbw_strict_fold_activate(frame_reg: u16) {
+    FBW_STRICT_FOLD_FRAME_REG.with(|s| {
+        if let Some(top) = s.borrow_mut().last_mut() {
+            *top = frame_reg;
+        }
+    });
+}
+
+/// The innermost inline level's strict-fold frame register (`u16::MAX` when
+/// inactive / no inline level).
+fn fbw_strict_fold_frame_reg() -> u16 {
+    FBW_STRICT_FOLD_FRAME_REG.with(|s| s.borrow().last().copied().unwrap_or(u16::MAX))
+}
+
+/// Record a callee local slot's live `OpRef` in the innermost fresh-frame
+/// shadow (no-op when the stack is empty).  A `NONE` value clears the slot.
+fn fbw_callee_local_set_opref(slot: i64, value: OpRef) {
+    FBW_CALLEE_LOCALS_OPREF.with(|s| {
+        if let Some(top) = s.borrow_mut().last_mut() {
+            if value.is_none() {
+                top.remove(&slot);
+            } else {
+                top.insert(slot, value);
+            }
+        }
+    });
+}
+
+/// Read a callee local slot's live `OpRef` from the innermost fresh-frame
+/// shadow.
+fn fbw_callee_local_get_opref(slot: i64) -> Option<OpRef> {
+    FBW_CALLEE_LOCALS_OPREF.with(|s| s.borrow().last().and_then(|top| top.get(&slot).copied()))
 }
 
 /// Record a callee local slot's concrete in the innermost inline shadow
@@ -7142,6 +7275,10 @@ impl InlineRecursionGuard {
     fn enter(w_code: usize) -> Self {
         FBW_INLINE_CODE_STACK.with(|s| s.borrow_mut().push(w_code));
         FBW_CALLEE_LOCALS_CONCRETE.with(|s| s.borrow_mut().push(std::collections::HashMap::new()));
+        FBW_CALLEE_LOCALS_OPREF.with(|s| s.borrow_mut().push(std::collections::HashMap::new()));
+        // Push inactive by default: only the strict straight-line path
+        // activates the fold via `fbw_strict_fold_activate`.
+        FBW_STRICT_FOLD_FRAME_REG.with(|s| s.borrow_mut().push(u16::MAX));
         InlineRecursionGuard
     }
 }
@@ -7152,6 +7289,12 @@ impl Drop for InlineRecursionGuard {
             s.borrow_mut().pop();
         });
         FBW_CALLEE_LOCALS_CONCRETE.with(|s| {
+            s.borrow_mut().pop();
+        });
+        FBW_CALLEE_LOCALS_OPREF.with(|s| {
+            s.borrow_mut().pop();
+        });
+        FBW_STRICT_FOLD_FRAME_REG.with(|s| {
             s.borrow_mut().pop();
         });
     }
@@ -12200,6 +12343,7 @@ fn callee_fast_path_inlinable(
     body_code: &[u8],
     callee_descr_refs: &[DescrRef],
     ctx: &WalkContext<'_, '_>,
+    callee_frame_reg: u16,
 ) -> bool {
     let mut pc = 0usize;
     while pc < body_code.len() {
@@ -12213,8 +12357,21 @@ fn callee_fast_path_inlinable(
             }
             return false;
         }
+        // A vable op is inlinable on the strict straight-line path when it is
+        // either a static const-field read (`pycode` / `w_globals`, resolved
+        // frame-free) OR a read/write off the callee's OWN portal frame
+        // register — the latter is the `fresh_virtualizable` case, folded
+        // register-to-register through the per-slot OpRef shadow by the two
+        // `*_vable_via_metainterp` short-circuits (no GC op emitted).  Under
+        // the always-portal flip, LOAD_FAST / STORE_FAST lower to
+        // `getarrayitem_vable_r` / `setarrayitem_vable_r(frame, slot)`, so a
+        // branchless leaf's locals prologue must not decline the fast path.
+        // `callee_frame_reg == u16::MAX` (flag OFF) makes
+        // `inline_resolvable_seeded_frame_op` return false, so this is inert
+        // in the default build.
         if d.opname.contains("vable")
             && !inline_resolvable_static_vable_read(body_code, &d, callee_descr_refs, ctx)
+            && !inline_resolvable_seeded_frame_op(body_code, &d, callee_frame_reg)
         {
             if std::env::var_os("PYRE_FBW_STRICT_DIAG").is_some() {
                 eprintln!(
@@ -13102,7 +13259,23 @@ fn try_walker_inline_user_call(
     // The trait leg inlines such callees via `push_inline_frame` +
     // `recursive-call-assembler`, so route the enclosing key there
     // (`FBW_DECLINED_KEYS`) instead of recording the slow residual.
-    let strict_inlinable = callee_fast_path_inlinable(body.code, callee_descr_refs, ctx);
+    // Resolve the callee's own portal frame register up-front so both the
+    // strict predicate (own-frame vable acceptance) and the multiframe gate
+    // share one `ensure_jitcode_index` + `portal_red_regs_at` lookup.  Under
+    // the always-portal flip the strict straight-line leaf's LOAD_FAST /
+    // STORE_FAST carry the frame-vable locals prologue, folded register-to-
+    // register against this frame reg (see the `*_vable_via_metainterp`
+    // short-circuits).  `u16::MAX` when the flip is OFF keeps the strict
+    // predicate byte-identical (`inline_resolvable_seeded_frame_op` declines).
+    let callee_portal_frame_reg = if fbw_always_portal_enabled() {
+        crate::state::ensure_jitcode_index(callee_code_key as *const ())
+            .map(|jc| crate::state::portal_red_regs_at(jc).0)
+            .unwrap_or(u16::MAX)
+    } else {
+        u16::MAX
+    };
+    let strict_inlinable =
+        callee_fast_path_inlinable(body.code, callee_descr_refs, ctx, callee_portal_frame_reg);
 
     // #62: a self-recursive single-int callee (`fib`'s shape) routes to the
     // direct `CALL_ASSEMBLER` arm (`try_walker_call_assembler_self_recursive`,
@@ -13596,6 +13769,27 @@ fn try_walker_inline_user_call(
         // Track this callee on the FBW inline stack for the lifetime of the
         // sub-walk so a nested self-call sees the correct recursion depth.
         let _recursion_frame = InlineRecursionGuard::enter(callee_code_key);
+        // Strict fresh-frame fold: a branchless leaf inlined without a virtual
+        // frame (not `try_multiframe`) whose body carries the always-portal
+        // frame-vable locals prologue resolves its own `getarrayitem_vable_r` /
+        // `setarrayitem_vable_r` register-to-register through the per-slot
+        // shadow.  Seed each param into slot `i` (`local_to_vable_slot` is
+        // identity) and activate the fold so the callee's first LOAD_FAST of a
+        // param folds to the arg OpRef instead of reading its unseeded frame
+        // box.  Inert when `callee_portal_frame_reg == u16::MAX` (flip OFF /
+        // frame reg unresolved) or `try_multiframe` (real virtual frame seeded).
+        if !try_multiframe && callee_portal_frame_reg != u16::MAX {
+            fbw_strict_fold_activate(callee_portal_frame_reg);
+            for i in 0..nparams {
+                let slot = i as i64;
+                fbw_callee_local_set_opref(slot, r_args[2 + i]);
+                let concrete = sub_wc
+                    .trace_ctx
+                    .concrete_of_opref(r_args[2 + i])
+                    .unwrap_or(majit_ir::Value::Void);
+                fbw_callee_local_set_concrete(slot, concrete);
+            }
+        }
         // Path-1: resolve scalar static-field reads off this callee's own
         // unseeded portal frame to its compile-time constants for the
         // lifetime of the sub-walk.
