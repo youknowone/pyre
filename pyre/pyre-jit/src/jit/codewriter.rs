@@ -6718,12 +6718,30 @@ impl CodeWriter {
                 // insert_switch_exits` ("switch link requires
                 // Signed/Bool llexitcase").  Force a block boundary
                 // here so the next PC's ops emit into a fresh egg.
-                let canraise_pending = matches!(
-                    current_block.block().borrow().exitswitch,
-                    Some(super::flow::ExitSwitch::Value(super::flow::FlowValue::Constant(
-                        ref c,
-                    ))) if matches!(c.value, super::flow::ConstantValue::Atom(super::flow::Atom::LastException))
-                );
+                // An explicit `raise X` covered by a try attaches its
+                // exception edge through `attach_catch_exception_edge`, which
+                // sets `exitswitch=LastException` — the same shape a canraise
+                // OP produces.  `canraise_pending` must NOT treat that as a
+                // half-closed canraise block: an explicit raise is an
+                // unconditional terminator with no normal continuation.
+                // Leaving it true drives `force_branch_boundary` at the next
+                // merge PC, so `mergeblock` appends a spurious normal exit onto
+                // the raise-terminated block (making it multi-exit); then
+                // `insert_exits` lowers the raise edge as a plain catch and
+                // drops the `raise` op, so the handler never runs.
+                let has_explicit_raise = current_block
+                    .block()
+                    .borrow()
+                    .exits
+                    .iter()
+                    .any(|e| e.borrow().explicit_raise_value.is_some());
+                let canraise_pending = !has_explicit_raise
+                    && matches!(
+                        current_block.block().borrow().exitswitch,
+                        Some(super::flow::ExitSwitch::Value(super::flow::FlowValue::Constant(
+                            ref c,
+                        ))) if matches!(c.value, super::flow::ConstantValue::Atom(super::flow::Atom::LastException))
+                    );
                 let force_branch_boundary = needs_fallthrough
                     && current_block
                         .framestate()
@@ -7545,16 +7563,36 @@ impl CodeWriter {
                     let block_closed_by_terminator = {
                         let block_rc = current_block.block();
                         let block = block_rc.borrow();
+                        // An explicit `raise X` covered by a try attaches its
+                        // exception edge through `attach_catch_exception_edge`,
+                        // which sets `exitswitch=LastException` — the same
+                        // canraise shape a real raising OP produces.  The
+                        // LastException exclusion below keeps a canraise OP's
+                        // block open so the walker keeps dispatching the op's
+                        // normal-flow result and the ops after it.  An explicit
+                        // raise has no normal continuation: it is an
+                        // unconditional terminator, so the block must close.
+                        // Left open, the walker serialises the following
+                        // fall-through / loop-back ops (and a `mergeblock`
+                        // appends a spurious normal exit) into the raise's
+                        // block; `insert_exits` then lowers the raise edge as a
+                        // plain catch and drops the `raise` op, so the handler
+                        // is never entered.
+                        let has_explicit_raise = block
+                            .exits
+                            .iter()
+                            .any(|e| e.borrow().explicit_raise_value.is_some());
                         !block.exits.is_empty()
-                            && !matches!(
-                                block.exitswitch,
-                                Some(super::flow::ExitSwitch::Value(super::flow::FlowValue::Constant(
-                                    ref c,
-                                ))) if matches!(
-                                    c.value,
-                                    super::flow::ConstantValue::Atom(super::flow::Atom::LastException)
-                                )
-                            )
+                            && (has_explicit_raise
+                                || !matches!(
+                                    block.exitswitch,
+                                    Some(super::flow::ExitSwitch::Value(super::flow::FlowValue::Constant(
+                                        ref c,
+                                    ))) if matches!(
+                                        c.value,
+                                        super::flow::ConstantValue::Atom(super::flow::Atom::LastException)
+                                    )
+                                ))
                     };
                     if block_closed_by_terminator {
                         current_state.next_offset = py_pc + 1;
