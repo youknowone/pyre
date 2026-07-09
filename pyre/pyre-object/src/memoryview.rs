@@ -198,3 +198,51 @@ pub unsafe fn w_memoryview_stride0(obj: PyObjectRef) -> i64 {
         }
     }
 }
+
+/// Read a shape / strides tuple into native `i64` extents.
+///
+/// # Safety
+/// `t` must point to a valid tuple of ints.
+unsafe fn read_tuple_ints(t: PyObjectRef) -> Vec<i64> {
+    unsafe {
+        let n = crate::tupleobject::w_tuple_len(t);
+        (0..n)
+            .map(|i| {
+                crate::tupleobject::w_tuple_getitem(t, i as i64)
+                    .map(|w| crate::intobject::w_int_get_value(w))
+                    .unwrap_or(0)
+            })
+            .collect()
+    }
+}
+
+/// The view's format string content (`memoryview.format`) read without
+/// allocating a fresh string object — the native counterpart of
+/// [`w_memoryview_format`] for callers that only need the bytes.
+///
+/// # Safety
+/// `obj` must point to a valid `W_MemoryView`.
+#[inline]
+pub unsafe fn w_memoryview_format_str(obj: PyObjectRef) -> &'static str {
+    unsafe { crate::w_str_get_value(w_memoryview_view(obj).w_format()) }
+}
+
+/// The view's shape as native `i64` extents (the native counterpart of
+/// [`w_memoryview_shape`]).
+///
+/// # Safety
+/// `obj` must point to a valid `W_MemoryView`.
+#[inline]
+pub unsafe fn w_memoryview_native_shape(obj: PyObjectRef) -> Vec<i64> {
+    unsafe { read_tuple_ints(w_memoryview_view(obj).w_shape()) }
+}
+
+/// The view's strides as native `i64` byte steps (the native counterpart of
+/// [`w_memoryview_strides`]).
+///
+/// # Safety
+/// `obj` must point to a valid `W_MemoryView`.
+#[inline]
+pub unsafe fn w_memoryview_native_strides(obj: PyObjectRef) -> Vec<i64> {
+    unsafe { read_tuple_ints(w_memoryview_view(obj).w_strides()) }
+}

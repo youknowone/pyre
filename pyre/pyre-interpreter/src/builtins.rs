@@ -79,16 +79,20 @@ unsafe fn memoryview_dim_value(tuple: PyObjectRef, i: i64) -> i64 {
 
 /// Allocate a `W_MemoryView` over a freshly built off-heap `BufferView`.
 /// Selects the backing `Buffer` variant (needs `isinstance_w`, hence here and
-/// not in pyre-object) and pins every ref across the allocation — building the
-/// box and allocating the object can trigger a collection before the new
-/// memoryview roots them.
+/// not in pyre-object) and builds the geometry's Python objects (`format` /
+/// `shape` / `strides`) *inside* the rooted region, pinning every ref across
+/// the allocations — building the boxes and allocating the header can trigger a
+/// collection before the new memoryview roots them.  Geometry arrives as native
+/// values so no caller has to hold an unrooted `format` / `shape` / `strides`
+/// object across the call; `fmt` must borrow non-GC storage (e.g. a Rust
+/// `String`) since it is read after the pin.
 #[allow(clippy::too_many_arguments)]
 unsafe fn w_memoryview_alloc(
     w_obj: PyObjectRef,
     w_backing: PyObjectRef,
-    w_format: PyObjectRef,
-    w_shape: PyObjectRef,
-    w_strides: PyObjectRef,
+    fmt: &str,
+    shape: &[i64],
+    strides: &[i64],
     itemsize: i64,
     ndim: i64,
     offset: i64,
@@ -101,13 +105,20 @@ unsafe fn w_memoryview_alloc(
         let sp = pyre_object::gc_roots::shadow_stack_len();
         pyre_object::gc_roots::pin_root(w_obj);
         pyre_object::gc_roots::pin_root(w_backing);
-        pyre_object::gc_roots::pin_root(w_format);
-        pyre_object::gc_roots::pin_root(w_shape);
-        pyre_object::gc_roots::pin_root(w_strides);
-        // Allocate the managed header first; old-gen allocation may trigger a
-        // moving collection, so read the relocated refs back from the shadow
-        // stack before building the off-heap view (mirrors `W_TupleObject`
-        // filling its items block from the `pop_roots`-relocated slots).
+        // Build each geometry object and pin it as produced: a later allocation
+        // may relocate an earlier one, so the pinned shadow slot (re-read below)
+        // is the source of truth, not the stale local.
+        pyre_object::gc_roots::pin_root(w_str_new(fmt));
+        pyre_object::gc_roots::pin_root(pyre_object::w_tuple_new(
+            shape.iter().map(|&x| w_int_new(x)).collect(),
+        ));
+        pyre_object::gc_roots::pin_root(pyre_object::w_tuple_new(
+            strides.iter().map(|&x| w_int_new(x)).collect(),
+        ));
+        // Allocate the managed header last of the ref-bearing allocations; a
+        // moving collection here relocates the pinned refs, so read every one
+        // back from the shadow stack before building the off-heap view (mirrors
+        // `W_TupleObject` filling its items block from the relocated slots).
         let mv = pyre_object::memoryview::w_memoryview_alloc_header(released);
         let r_obj = pyre_object::gc_roots::shadow_stack_get(sp);
         let r_backing = pyre_object::gc_roots::shadow_stack_get(sp + 1);
@@ -198,12 +209,15 @@ pub(crate) fn w_memoryview_new(w_obj: PyObjectRef) -> Result<PyObjectRef, crate:
         if is_w_memoryview(w_obj) {
             memoryview_check_released(w_obj)?;
             let backing = w_memoryview_backing(w_obj);
+            let fmt = w_memoryview_format_str(w_obj).to_owned();
+            let shape = w_memoryview_native_shape(w_obj);
+            let strides = w_memoryview_native_strides(w_obj);
             return Ok(w_memoryview_alloc(
                 w_memoryview_obj(w_obj),
                 backing,
-                w_memoryview_format(w_obj),
-                w_memoryview_shape(w_obj),
-                w_memoryview_strides(w_obj),
+                &fmt,
+                &shape,
+                &strides,
                 w_memoryview_itemsize(w_obj),
                 w_memoryview_ndim(w_obj),
                 w_memoryview_offset(w_obj),
@@ -228,14 +242,12 @@ pub(crate) fn w_memoryview_new(w_obj: PyObjectRef) -> Result<PyObjectRef, crate:
         } else {
             0
         };
-        let shape = pyre_object::w_tuple_new(vec![w_int_new(count)]);
-        let strides = pyre_object::w_tuple_new(vec![w_int_new(itemsize)]);
         Ok(w_memoryview_alloc(
             w_obj,
             w_obj,
-            w_str_new(&fmt),
-            shape,
-            strides,
+            &fmt,
+            &[count],
+            &[itemsize],
             itemsize,
             1,
             0,
@@ -478,14 +490,13 @@ unsafe fn memoryview_slice_view(
             strides_v.push(memoryview_dim_value(parent_strides, d));
         }
         let new_length = shape_v.iter().product::<i64>() * itemsize;
-        let shape = pyre_object::w_tuple_new(shape_v.iter().map(|&x| w_int_new(x)).collect());
-        let strides = pyre_object::w_tuple_new(strides_v.iter().map(|&x| w_int_new(x)).collect());
+        let fmt = w_memoryview_format_str(mv).to_owned();
         Ok(w_memoryview_alloc(
             w_memoryview_obj(mv),
             w_memoryview_backing(mv),
-            w_memoryview_format(mv),
-            shape,
-            strides,
+            &fmt,
+            &shape_v,
+            &strides_v,
             itemsize,
             ndim.max(1),
             new_offset,
@@ -1116,17 +1127,14 @@ fn memoryview_cast(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         let backing = w_memoryview_backing(mv);
         let obj = w_memoryview_obj(mv);
         let readonly = w_memoryview_readonly(mv);
-        let w_fmt = w_str_new(&fmt);
         if !has_shape {
             let count = total / new_itemsize;
-            let shape = pyre_object::w_tuple_new(vec![w_int_new(count)]);
-            let strides = pyre_object::w_tuple_new(vec![w_int_new(new_itemsize)]);
             return Ok(w_memoryview_alloc(
                 obj,
                 backing,
-                w_fmt,
-                shape,
-                strides,
+                &fmt,
+                &[count],
+                &[new_itemsize],
                 new_itemsize,
                 1,
                 offset,
@@ -1158,14 +1166,12 @@ fn memoryview_cast(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
             ));
         }
         let strides_v = memoryview_strides_from_shape(&dims, new_itemsize);
-        let shape = pyre_object::w_tuple_new(dims.iter().map(|&d| w_int_new(d)).collect());
-        let strides = pyre_object::w_tuple_new(strides_v.iter().map(|&s| w_int_new(s)).collect());
         Ok(w_memoryview_alloc(
             obj,
             backing,
-            w_fmt,
-            shape,
-            strides,
+            &fmt,
+            &dims,
+            &strides_v,
             new_itemsize,
             ndim,
             offset,
@@ -1182,12 +1188,15 @@ fn memoryview_toreadonly(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     unsafe {
         use pyre_object::memoryview::*;
         memoryview_check_released(mv)?;
+        let fmt = w_memoryview_format_str(mv).to_owned();
+        let shape = w_memoryview_native_shape(mv);
+        let strides = w_memoryview_native_strides(mv);
         Ok(w_memoryview_alloc(
             w_memoryview_obj(mv),
             w_memoryview_backing(mv),
-            w_memoryview_format(mv),
-            w_memoryview_shape(mv),
-            w_memoryview_strides(mv),
+            &fmt,
+            &shape,
+            &strides,
             w_memoryview_itemsize(mv),
             w_memoryview_ndim(mv),
             w_memoryview_offset(mv),
