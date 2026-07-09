@@ -7,7 +7,7 @@ use crate::{
     make_module_builtin_function_with_arity,
 };
 use pyre_object::*;
-use rustpython_wtf8::{CodePoint, Wtf8Buf};
+use rustpython_wtf8::{CodePoint, Wtf8, Wtf8Buf};
 
 /// `buffer_w` — select the byte-storage `Buffer` variant for a memoryview
 /// backing by concrete kind, so a bytes / bytearray / array *subclass* backing
@@ -4724,6 +4724,27 @@ pub fn get_build_class_func() -> PyObjectRef {
 pub(crate) fn builtin_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let (pos, kwargs) = split_builtin_kwargs(args);
     kwarg_reject_unknown(kwargs, &["object", "encoding", "errors"], "str")?;
+    let kw_count = kwargs
+        .map(|dict| unsafe {
+            pyre_object::w_dict_str_entries_wtf8(dict)
+                .iter()
+                .filter(|(key, _)| key.as_str() != Ok("__pyre_kw__"))
+                .count()
+        })
+        .unwrap_or(0);
+    let arg_count = pos.len() + kw_count;
+    if pos.len() > 3 {
+        return Err(crate::PyError::type_error(format!(
+            "str expected at most 3 arguments, got {}",
+            pos.len()
+        )));
+    }
+    if arg_count > 3 {
+        return Err(crate::PyError::type_error(format!(
+            "str() takes at most 3 arguments ({} given)",
+            arg_count
+        )));
+    }
     // `str(object='', encoding='utf-8', errors='strict')` — every parameter
     // is positional-or-keyword (unicodeobject.py:descr_new).  An absent
     // `object` yields the empty string; an encoding/errors of None counts as
@@ -4780,9 +4801,7 @@ pub(crate) fn builtin_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             // WTF-8-preserving so a `__str__` override returning a lone
             // surrogate yields that str rather than panicking.
             if let Some(r) = crate::display::builtin_subclass_dunder_obj(obj, tp, "__str__")? {
-                return Ok(pyre_object::w_str_from_wtf8(
-                    pyre_object::w_str_get_wtf8(r).to_owned(),
-                ));
+                return Ok(r);
             }
             // `str(s) is s` only for an exact `str`; a subclass with no
             // `__str__` override is copied to a fresh base `str`.
@@ -4794,8 +4813,45 @@ pub(crate) fn builtin_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             ));
         }
     }
+    unsafe {
+        let obj = crate::baseobjspace::unwrap_cell(obj);
+        if !obj.is_null() && std::ptr::eq((*obj).ob_type, &INSTANCE_TYPE as *const PyType) {
+            if let Some(r) = crate::display::try_call_dunder_obj_above_object(obj, "__str__")? {
+                return Ok(r);
+            }
+            if let Some(r) = crate::display::try_call_dunder_obj(obj, "__repr__")? {
+                return Ok(r);
+            }
+        }
+    }
     let w = unsafe { crate::py_str_wtf8(obj)? };
     Ok(pyre_object::w_str_from_wtf8(w))
+}
+
+unsafe fn py_repr_obj(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    unsafe {
+        if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj) {
+            return Ok(w_str_new(&format!(
+                "{}",
+                pyre_object::tagged_int::untag_int(obj)
+            )));
+        }
+        let obj = crate::baseobjspace::unwrap_cell(obj);
+        if !obj.is_null() {
+            let tp = (*obj).ob_type;
+            if let Some(r) = crate::display::builtin_subclass_dunder_obj(obj, tp, "__repr__")? {
+                return Ok(r);
+            }
+            if std::ptr::eq(tp, &INSTANCE_TYPE as *const PyType) {
+                if let Some(r) = crate::display::try_call_dunder_obj(obj, "__repr__")? {
+                    return Ok(r);
+                }
+            }
+        }
+        Ok(pyre_object::w_str_from_wtf8(crate::display::py_repr_wtf8(
+            obj,
+        )?))
+    }
 }
 
 /// `repr(obj)` → string representation
@@ -4808,21 +4864,19 @@ fn builtin_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     }
     // WTF-8-preserving so a `__repr__` override returning a lone surrogate
     // yields that str rather than panicking in the `String` path.
-    let w = unsafe { crate::py_repr_wtf8(args[0])? };
-    Ok(pyre_object::w_str_from_wtf8(w))
+    unsafe { py_repr_obj(args[0]) }
 }
 
 /// `unicodeobject.c:unicode_repr` post-pass — take the repr of `obj`
 /// and escape every non-ASCII code point as `\xXX` / `\uXXXX` /
 /// `\UXXXXXXXX`.  Shared by the `ascii()` builtin and the `!a`
 /// `str.format` conversion.
-pub(crate) fn py_ascii(obj: PyObjectRef) -> Result<String, crate::PyError> {
-    let s = unsafe { crate::py_repr(obj)? };
+fn ascii_escape_wtf8(s: &Wtf8) -> String {
     let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        let cp = ch as u32;
+    for ch in s.code_points() {
+        let cp = ch.to_u32();
         if cp < 0x80 {
-            out.push(ch);
+            out.push(char::from_u32(cp).unwrap());
         } else if cp <= 0xFF {
             out.push_str(&format!("\\x{cp:02x}"));
         } else if cp <= 0xFFFF {
@@ -4831,7 +4885,29 @@ pub(crate) fn py_ascii(obj: PyObjectRef) -> Result<String, crate::PyError> {
             out.push_str(&format!("\\U{cp:08x}"));
         }
     }
-    Ok(out)
+    out
+}
+
+pub(crate) fn py_ascii(obj: PyObjectRef) -> Result<String, crate::PyError> {
+    let s = unsafe { crate::display::py_repr_wtf8(obj)? };
+    Ok(ascii_escape_wtf8(&s))
+}
+
+fn py_ascii_obj(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    let r = unsafe { py_repr_obj(obj)? };
+    let r_wtf8 = unsafe { pyre_object::w_str_get_wtf8(r) };
+    let out = ascii_escape_wtf8(r_wtf8);
+    let changed = r_wtf8.as_str().map(|s| s != out).unwrap_or(true);
+    if unsafe { is_exact_type(r, &STR_TYPE) } || changed {
+        return Ok(w_str_new(&out));
+    }
+    let Some(tp) = (unsafe { crate::typedef::r#type(r) }) else {
+        return Ok(w_str_new(&out));
+    };
+    let Some(new_fn) = (unsafe { crate::baseobjspace::lookup_in_type(tp, "__new__") }) else {
+        return Ok(w_str_new(&out));
+    };
+    crate::builtins::call_and_check(new_fn, &[tp, w_str_new(&out)])
 }
 
 /// `bltinmodule.c:builtin_ascii` — like `repr`, but escape every
@@ -4843,7 +4919,7 @@ fn builtin_ascii(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             args.len()
         )));
     }
-    Ok(w_str_new(&py_ascii(args[0])?))
+    py_ascii_obj(args[0])
 }
 
 /// `int(obj)` → convert to int

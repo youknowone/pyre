@@ -17,6 +17,18 @@ use crate::{
 /// Uses the unified `call_function` instead of a dedicated callback.
 fn try_call_dunder(obj: PyObjectRef, name: &str) -> Result<Option<String>, crate::PyError> {
     unsafe {
+        Ok(try_call_dunder_obj(obj, name)?
+            .map(|result| pyre_object::w_str_get_value(result).to_string()))
+    }
+}
+
+/// Try to call a dunder method (__repr__, __str__, etc.) on an instance,
+/// returning the raw result object when it is a `str`.
+pub(crate) unsafe fn try_call_dunder_obj(
+    obj: PyObjectRef,
+    name: &str,
+) -> Result<Option<PyObjectRef>, crate::PyError> {
+    unsafe {
         if !pyre_object::is_instance(obj) {
             return Ok(None);
         }
@@ -30,7 +42,32 @@ fn try_call_dunder(obj: PyObjectRef, name: &str) -> Result<Option<String>, crate
         // TypeError (`object.c slot_tp_repr` / `slot_tp_str`).
         let result = crate::builtins::call_and_check(method, &[obj])?;
         if pyre_object::is_str(result) {
-            return Ok(Some(pyre_object::w_str_get_value(result).to_string()));
+            return Ok(Some(result));
+        }
+        Err(dunder_returned_non_string(name, result))
+    }
+}
+
+pub(crate) unsafe fn try_call_dunder_obj_above_object(
+    obj: PyObjectRef,
+    name: &str,
+) -> Result<Option<PyObjectRef>, crate::PyError> {
+    unsafe {
+        if !pyre_object::is_instance(obj) {
+            return Ok(None);
+        }
+        let Some(w_type) = crate::typedef::r#type(obj) else {
+            return Ok(None);
+        };
+        let Some((src, method)) = crate::baseobjspace::lookup_where(w_type, name) else {
+            return Ok(None);
+        };
+        if method.is_null() || std::ptr::eq(src, crate::typedef::w_object()) {
+            return Ok(None);
+        }
+        let result = crate::builtins::call_and_check(method, &[obj])?;
+        if pyre_object::is_str(result) {
+            return Ok(Some(result));
         }
         Err(dunder_returned_non_string(name, result))
     }
@@ -44,20 +81,8 @@ unsafe fn try_call_dunder_wtf8(
     name: &str,
 ) -> Result<Option<Wtf8Buf>, crate::PyError> {
     unsafe {
-        if !pyre_object::is_instance(obj) {
-            return Ok(None);
-        }
-        let Some(method) = crate::baseobjspace::lookup(obj, name) else {
-            return Ok(None);
-        };
-        if method.is_null() {
-            return Ok(None);
-        }
-        let result = crate::builtins::call_and_check(method, &[obj])?;
-        if pyre_object::is_str(result) {
-            return Ok(Some(pyre_object::w_str_get_wtf8(result).to_wtf8_buf()));
-        }
-        Err(dunder_returned_non_string(name, result))
+        Ok(try_call_dunder_obj(obj, name)?
+            .map(|result| pyre_object::w_str_get_wtf8(result).to_wtf8_buf()))
     }
 }
 
