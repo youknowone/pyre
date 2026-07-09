@@ -363,12 +363,25 @@ pub fn str_method_join(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     // element must be a str; otherwise TypeError("sequence item N:
     // expected str instance, <T> found"). Silently dropping non-str
     // items lost the error and produced an empty join.
+    //
+    // A single-element join returns that element (unicode_result_unchanged):
+    // an exact str unchanged, a str subclass copied to a base str.
+    if items.len() == 1 {
+        let item = items[0];
+        if unsafe { !is_str(item) } {
+            return Err(crate::PyError::type_error(format!(
+                "sequence item 0: expected str instance, {} found",
+                arg_type_name(item)
+            )));
+        }
+        return Ok(str_result_unchanged(item));
+    }
     let mut out = rustpython_wtf8::Wtf8Buf::new();
     for (i, item) in items.iter().enumerate() {
         if unsafe { !is_str(*item) } {
             return Err(crate::PyError::type_error(format!(
                 "sequence item {i}: expected str instance, {} found",
-                unsafe { (*(*(*item)).ob_type).name }
+                arg_type_name(*item)
             )));
         }
         if i > 0 {
@@ -725,25 +738,35 @@ pub fn str_method_rstrip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 pub fn str_method_startswith(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "startswith", 1)?;
     let s = unsafe { pyre_object::w_str_get_wtf8(args[0]) };
-    let slice = str_slice_args(s, args);
+    let Some(slice) = str_slice_args(s, args) else {
+        return validate_prefix_arg(args[1], "startswith").map(|()| w_bool_from(false));
+    };
     str_prefix_match(slice, args[1], "startswith", true).map(w_bool_from)
 }
 
 pub fn str_method_endswith(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "endswith", 1)?;
     let s = unsafe { pyre_object::w_str_get_wtf8(args[0]) };
-    let slice = str_slice_args(s, args);
+    let Some(slice) = str_slice_args(s, args) else {
+        return validate_prefix_arg(args[1], "endswith").map(|()| w_bool_from(false));
+    };
     str_prefix_match(slice, args[1], "endswith", false).map(w_bool_from)
 }
 
-fn str_slice_args<'a>(s: &'a Wtf8, args: &[pyre_object::PyObjectRef]) -> &'a Wtf8 {
+/// Apply `startswith`/`endswith`'s optional `start`/`end` bounds to `s`,
+/// returning the code-point window as WTF-8. `None` signals an empty,
+/// out-of-range window (`start` past the end, or `start > end`), for which
+/// the tail match is always `False` — even for an empty needle. A positive
+/// `start` is not upper-clamped so `''.endswith('', 1, 0)` stays `start >
+/// end` rather than collapsing to a valid empty slice.
+fn str_slice_args<'a>(s: &'a Wtf8, args: &[pyre_object::PyObjectRef]) -> Option<&'a Wtf8> {
     let char_len = s.code_points().count() as i64;
     let start = if args.len() >= 3 {
         let v = unsafe { pyre_object::w_int_get_value(args[2]) };
         if v < 0 {
             (char_len + v).max(0) as usize
         } else {
-            (v as usize).min(char_len as usize)
+            v as usize
         }
     } else {
         0
@@ -758,9 +781,8 @@ fn str_slice_args<'a>(s: &'a Wtf8, args: &[pyre_object::PyObjectRef]) -> &'a Wtf
     } else {
         char_len as usize
     };
-    let empty = unsafe { Wtf8::from_bytes_unchecked(&[]) };
     if start > end {
-        return empty;
+        return None;
     }
     let bytes = s.as_bytes();
     let byte_start = s
@@ -771,7 +793,7 @@ fn str_slice_args<'a>(s: &'a Wtf8, args: &[pyre_object::PyObjectRef]) -> &'a Wtf
         .code_point_indices()
         .nth(end)
         .map_or(bytes.len(), |(i, _)| i);
-    unsafe { Wtf8::from_bytes_unchecked(&bytes[byte_start..byte_end]) }
+    Some(unsafe { Wtf8::from_bytes_unchecked(&bytes[byte_start..byte_end]) })
 }
 
 fn str_prefix_match(
@@ -803,7 +825,7 @@ fn str_prefix_match(
             if !unsafe { pyre_object::is_str(item) } {
                 return Err(crate::PyError::type_error(format!(
                     "tuple for {method} must only contain str, not {}",
-                    unsafe { (*(*item).ob_type).name }
+                    arg_type_name(item)
                 )));
             }
             let p = unsafe { pyre_object::w_str_get_wtf8(item) };
@@ -815,38 +837,76 @@ fn str_prefix_match(
     }
     Err(crate::PyError::type_error(format!(
         "{method} first arg must be str or a tuple of str, not {}",
-        unsafe { (*(*needle).ob_type).name }
+        arg_type_name(needle)
+    )))
+}
+
+/// Type-check a `startswith`/`endswith` argument (a str, or a tuple whose
+/// items are all str) without running the match. Used on the out-of-range
+/// window path, where the result is `False` but a bad argument type still
+/// raises the same `TypeError` as the in-range path.
+fn validate_prefix_arg(needle: PyObjectRef, method: &str) -> Result<(), crate::PyError> {
+    if unsafe { pyre_object::is_str(needle) } {
+        return Ok(());
+    }
+    if unsafe { pyre_object::is_tuple(needle) } {
+        let n = unsafe { pyre_object::w_tuple_len(needle) };
+        for i in 0..n as i64 {
+            let item =
+                unsafe { pyre_object::w_tuple_getitem(needle, i) }.expect("index is in range");
+            if !unsafe { pyre_object::is_str(item) } {
+                return Err(crate::PyError::type_error(format!(
+                    "tuple for {method} must only contain str, not {}",
+                    arg_type_name(item)
+                )));
+            }
+        }
+        return Ok(());
+    }
+    Err(crate::PyError::type_error(format!(
+        "{method} first arg must be str or a tuple of str, not {}",
+        arg_type_name(needle)
     )))
 }
 
 pub fn str_method_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    arity_at_least_positional(args, "replace", 2)?;
+    // `old` / `new` are positional-only; `count` is positional-or-keyword.
+    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    if pos.len() < 3 {
+        return Err(crate::PyError::type_error(format!(
+            "replace() takes at least 2 positional arguments ({} given)",
+            pos.len().saturating_sub(1)
+        )));
+    }
+    crate::builtins::kwarg_reject_unknown(kwargs, &["count"], "replace")?;
+    crate::builtins::kwarg_reject_duplicate(kwargs, "replace", "count", pos.get(3).is_some())?;
     // pypy/objspace/std/unicodeobject.py:1132-1148 descr_replace —
     // both `old` and `new` must be str / W_UnicodeObject; otherwise
     // TypeError("replace() argument N must be str, not ...").
-    if !unsafe { pyre_object::is_str(args[1]) } {
+    if !unsafe { pyre_object::is_str(pos[1]) } {
         return Err(crate::PyError::type_error(format!(
             "replace() argument 1 must be str, not {}",
-            unsafe { (*(*args[1]).ob_type).name }
+            arg_type_name(pos[1])
         )));
     }
-    if !unsafe { pyre_object::is_str(args[2]) } {
+    if !unsafe { pyre_object::is_str(pos[2]) } {
         return Err(crate::PyError::type_error(format!(
             "replace() argument 2 must be str, not {}",
-            unsafe { (*(*args[2]).ob_type).name }
+            arg_type_name(pos[2])
         )));
     }
-    let s = unsafe { pyre_object::w_str_get_wtf8(args[0]) };
-    let old = unsafe { pyre_object::w_str_get_wtf8(args[1]) };
-    let new = unsafe { pyre_object::w_str_get_wtf8(args[2]) };
-    // `unicodeobject.py descr_replace` — optional count argument; a
-    // negative count means "no limit" (matches CPython); 0 leaves the
-    // string untouched.
-    let maxcount = match args.get(3) {
-        Some(&w_count) if unsafe { pyre_object::is_int(w_count) } => unsafe {
-            pyre_object::w_int_get_value(w_count)
-        },
-        _ => -1,
+    let s = unsafe { pyre_object::w_str_get_wtf8(pos[0]) };
+    let old = unsafe { pyre_object::w_str_get_wtf8(pos[1]) };
+    let new = unsafe { pyre_object::w_str_get_wtf8(pos[2]) };
+    // Optional `count`: a negative count means "no limit"; 0 leaves the
+    // string untouched. Resolved through `__index__`.
+    let maxcount = match pos
+        .get(3)
+        .copied()
+        .or_else(|| crate::builtins::kwarg_get(kwargs, "count"))
+    {
+        Some(w_count) => crate::builtins::space_index_w(w_count)?,
+        None => -1,
     };
     Ok(w_str_from_wtf8(wtf8_replace(s, old, new, maxcount)))
 }
@@ -2682,7 +2742,7 @@ pub fn str_method_zfill(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     let width = unsafe { w_int_get_value(args[1]) }.max(0) as usize;
     let len = s.code_points().count();
     if len >= width {
-        return Ok(args[0]);
+        return Ok(str_result_unchanged(args[0]));
     }
     let need = width - len;
     let mut cps = s.code_points();
@@ -2899,6 +2959,18 @@ fn push_cp_repeated(out: &mut Wtf8Buf, cp: CodePoint, n: usize) {
     }
 }
 
+/// `unicode_result_unchanged`: a str method whose result equals the
+/// receiver returns the receiver itself only when it is an exact `str`; a
+/// `str` subclass is copied to a fresh base `str`, since str methods never
+/// return a subclass instance.
+fn str_result_unchanged(obj: PyObjectRef) -> PyObjectRef {
+    if unsafe { is_exact_type(obj, &STR_TYPE) } {
+        obj
+    } else {
+        w_str_from_wtf8(unsafe { w_str_get_wtf8(obj) }.to_owned())
+    }
+}
+
 pub fn str_method_center(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "center", 1)?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
@@ -2906,7 +2978,7 @@ pub fn str_method_center(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     let fillchar = pad_fillchar(args, "center")?;
     let s_len = s.code_points().count();
     if s_len >= width {
-        return Ok(args[0]);
+        return Ok(str_result_unchanged(args[0]));
     }
     // unicodeobject.py:1098 d = (width - len) ; lpad = d//2 + (d & width & 1)
     let d = width - s_len;
@@ -2927,7 +2999,7 @@ pub fn str_method_ljust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     let fillchar = pad_fillchar(args, "ljust")?;
     let s_len = s.code_points().count();
     if s_len >= width {
-        return Ok(args[0]);
+        return Ok(str_result_unchanged(args[0]));
     }
     let mut out = Wtf8Buf::with_capacity(s.len() + (width - s_len) * 4);
     out.push_wtf8(s);
@@ -2943,7 +3015,7 @@ pub fn str_method_rjust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     let fillchar = pad_fillchar(args, "rjust")?;
     let s_len = s.code_points().count();
     if s_len >= width {
-        return Ok(args[0]);
+        return Ok(str_result_unchanged(args[0]));
     }
     let mut out = Wtf8Buf::with_capacity(s.len() + (width - s_len) * 4);
     push_cp_repeated(&mut out, fillchar, width - s_len);
@@ -3207,17 +3279,54 @@ pub fn str_method_removesuffix(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
 
 /// PyPy: unicodeobject.py descr_expandtabs
 pub fn str_method_expandtabs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    require_receiver(args, "expandtabs")?;
-    let s = unsafe { w_str_get_wtf8(args[0]) };
-    let tabsize = if args.len() > 1 {
-        unsafe { w_int_get_value(args[1]) }
-    } else {
-        8
+    // `tabsize` is positional-or-keyword (default 8).
+    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    if pos.len() > 2 {
+        return Err(crate::PyError::type_error(format!(
+            "expandtabs() takes at most 1 argument ({} given)",
+            pos.len().saturating_sub(1)
+        )));
+    }
+    crate::builtins::kwarg_reject_unknown(kwargs, &["tabsize"], "expandtabs")?;
+    crate::builtins::kwarg_reject_duplicate(kwargs, "expandtabs", "tabsize", pos.get(1).is_some())?;
+    let s = unsafe { w_str_get_wtf8(pos[0]) };
+    let tabsize = match pos
+        .get(1)
+        .copied()
+        .or_else(|| crate::builtins::kwarg_get(kwargs, "tabsize"))
+    {
+        Some(t) => crate::builtins::space_index_w(t)?,
+        None => 8,
     };
     // Tabs advance to the next multiple of `tabsize` measured from the
     // start of the current line (the column resets on `\n` / `\r`); a
-    // non-positive `tabsize` drops tabs entirely.
-    let mut result = Wtf8Buf::with_capacity(s.len());
+    // non-positive `tabsize` drops tabs entirely. The expanded length is
+    // tracked with checked arithmetic so a pathological `tabsize` raises
+    // OverflowError instead of attempting an unbounded allocation.
+    let overflow = || crate::PyError::overflow_error("result is too long");
+    let mut total: i64 = 0;
+    let mut col: i64 = 0;
+    for cp in s.code_points() {
+        match cp.to_char() {
+            Some('\t') => {
+                if tabsize > 0 {
+                    let incr = tabsize - (col % tabsize);
+                    col = col.checked_add(incr).ok_or_else(overflow)?;
+                    total = total.checked_add(incr).ok_or_else(overflow)?;
+                }
+            }
+            Some('\n') | Some('\r') => {
+                total = total.checked_add(1).ok_or_else(overflow)?;
+                col = 0;
+            }
+            _ => {
+                total = total.checked_add(1).ok_or_else(overflow)?;
+                col += 1;
+            }
+        }
+    }
+    let cap = usize::try_from(total).map_err(|_| overflow())?;
+    let mut result = Wtf8Buf::with_capacity(cap);
     let mut col: i64 = 0;
     for cp in s.code_points() {
         match cp.to_char() {
