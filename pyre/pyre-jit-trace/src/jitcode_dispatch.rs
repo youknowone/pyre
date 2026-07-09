@@ -7257,35 +7257,6 @@ pub(crate) fn fbw_inline_multiframe_enabled() -> bool {
     })
 }
 
-/// `PYRE_FBW_STRICT_MULTIFRAME` (gh#420): give a STRICT straight-line inlined
-/// callee the same multi-frame guard snapshot the branch-bearing multiframe
-/// path uses, so an in-callee guard resumes at the callee's OWN coordinate
-/// (with the caller paused at the CALL return point) instead of collapsing to
-/// the caller boundary.  The single-frame collapse re-executes the whole call
-/// on deopt, which re-materializes it at a stale `valuestackdepth` (a resume
-/// `LOAD_FAST` push overflows the frame, an `rd_numb` decode overruns) and
-/// re-applies a committed heap side effect — visible on the wasm resume path,
-/// where a guard-failure deopt is not absorbed by a compiled bridge.
-///
-/// The caller (paused) frame is pushed whenever it is snapshot-able
-/// ([`compute_inline_caller_frame`] returns `Some`; `None` keeps the collapse).
-/// When the CALLEE frame is then not snapshot-able either — a kept operand-stack
-/// temp the callee sub-walk does not mirror (a `LOAD_METHOD` receiver, a
-/// residual-call result live across the guard) —
-/// [`walker_capture_multi_frame_inline_snapshot`] returns `Unsupported`, and the
-/// inline declines to an ordinary residual call rather than falling back to the
-/// corrupt collapse.  Default-on; `=0`/`false` opts out.
-pub(crate) fn fbw_strict_multiframe_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_STRICT_MULTIFRAME") {
-        Some(v) => {
-            let v = v.to_string_lossy();
-            v != "0" && !v.eq_ignore_ascii_case("false")
-        }
-        None => true,
-    })
-}
-
 /// `PYRE_FBW_LOOP_CALLEE_CA` (gap-10, general loop-bearing-callee →
 /// CALL_ASSEMBLER): when a multi-frame inlined callee sub-walk reaches the
 /// callee's own `jit_merge_point` and a compiled loop token already exists
@@ -11667,52 +11638,6 @@ fn callee_fast_path_inlinable(
     true
 }
 
-/// True when a STRICT straight-line callee commits a heap side effect that its
-/// single-frame collapse would re-apply on a deopt / abort re-execute — the
-/// gh#420 unsoundness.  The collapse resumes at the caller CALL boundary and
-/// re-runs the WHOLE call, so a committed store or construction is doubled
-/// (`inline_callee_constructs_object`'s `P(n)` construct;
-/// `inlined_mutation_before_abort`'s `c.n = c.n + 1` store, whose recorded
-/// value persists past the trace abort).  Such a callee routes through the
-/// multi-frame decline (a paused caller frame) so the enclosing inline declines
-/// to a residual instead of collapsing.
-///
-/// A PURE value-returning leaf — only typed helper residual calls (an int/float
-/// binop `residual_call_ir_r`, an idempotent field read) plus ref moves and a
-/// return, e.g. `inline_helper`'s `a + b` / `a * b` — re-executes identically
-/// on deopt, so its collapse is sound and it must NOT be pushed through the
-/// always-declining MF snapshot (a strict callee seeds no frame red, so that
-/// snapshot can only decline, aborting a working inline).
-///
-/// Conservative: a general ref-first-arg residual call (`residual_call_r_*`, an
-/// arbitrary Python call / constructor that may raise or mutate), a VOID
-/// residual call (`..._v`, a statement run for its effect — a store / append),
-/// or an explicit vable/gc field, array, or interior-field write all count as a
-/// side effect (`setinteriorfield_gc_*` — an array-of-struct / dict-storage
-/// write — is caught by the `setinteriorfield` substring; note the plain
-/// `setfield` substring does not span it).
-fn strict_callee_collapse_unsound(body_code: &[u8]) -> bool {
-    let mut pc = 0usize;
-    while pc < body_code.len() {
-        let Some(d) = crate::jitcode_runtime::decode_op_at(body_code, pc) else {
-            // Undecodable tail: be conservative — take the decline, not the
-            // collapse.
-            return true;
-        };
-        let op = d.opname;
-        if op.starts_with("residual_call_r")
-            || (op.starts_with("residual_call") && op.ends_with("_v"))
-            || op.contains("setfield")
-            || op.contains("setarrayitem")
-            || op.contains("setinteriorfield")
-        {
-            return true;
-        }
-        pc = d.next_pc;
-    }
-    false
-}
-
 /// True iff `d` is a scalar `getfield_vable_r` whose field is a Ref-typed
 /// compile-time constant (`pycode` / `w_globals`) — the only vable op
 /// [`try_resolve_inline_callee_static_field`] can satisfy without a seeded
@@ -12738,112 +12663,158 @@ fn try_walker_inline_user_call(
     // callee portal-shaped, so the same seeding applies.  The frame box stays
     // virtual on the hot path (the optimizer folds the NewWithVtable away) and
     // is materialized only on guard failure; `collect_callee_active_boxes` is
-    // then unchanged (it finds real boxes).  Gated on `try_multiframe` so the
-    // strict straight-line inline path is byte-identical.
+    // then unchanged (it finds real boxes).
+    //
+    // Seeded for BOTH the forward-branch multiframe callee (`try_multiframe`)
+    // AND a STRICT straight-line callee at the top inline level (`strict_seed`).
+    // With the reds seeded, an in-callee guard resumes at the callee's OWN
+    // coordinate through `walker_capture_multi_frame_inline_snapshot` instead of
+    // collapsing to the caller boundary and re-executing the whole call — which
+    // re-materializes it at a stale `valuestackdepth` (a resume `LOAD_FAST` push
+    // overflows the frame, an `rd_numb` decode overruns) and re-applies a
+    // committed heap side effect (visible on the wasm resume path, where a
+    // guard-failure deopt is not absorbed by a compiled bridge).  A
+    // `try_multiframe` callee HARD-declines the inline when a precondition below
+    // fails; a strict callee instead leaves the reds `OpRef::NONE` and falls
+    // back to the single-frame collapse (no paused caller frame is pushed), so
+    // an un-seedable strict shape never loses its inline.  Every bail below
+    // precedes any IR recording, so a strict fall-through records no dead op.
     //
     // gap-10 (`PYRE_FBW_LOOP_CALLEE_CA`): the seeded virtual callee frame /
     // shared ec / local count are hoisted so the sub-walk return site can
     // emit a `CALL_ASSEMBLER` into the callee loop token when the sub-walk
     // surfaces `SubLoopCalleeCallAssembler` (the callee reached its own loop
-    // header). Left `NONE`/0 on the strict straight-line path (no virtual
-    // frame), where that outcome can never arise.
+    // header).  A strict straight-line callee has no loop, so that outcome
+    // never arises for it and the hoisted values are simply unused.
     let mut ca_callee_frame = OpRef::NONE;
     let mut ca_callee_ec = OpRef::NONE;
     let mut ca_nlocals = 0usize;
-    if try_multiframe {
-        // Branch-A frame shape only (mirror REC_CA): no cells.
-        let raw = unsafe {
-            pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
-                as *const pyre_interpreter::CodeObject
-        };
-        if raw.is_null() {
-            return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });
-        }
-        let callee_code = unsafe { &*raw };
-        if pyre_interpreter::ncells(callee_code) != 0 {
-            return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });
-        }
-        // POP_JUMP_IF_NONE / POP_JUMP_IF_NOT_NONE lower to an `is`/`is_not`
-        // identity residual call whose operands must be Ref (the codewriter
-        // PopJumpIfNone arm), then a branch guard.  When the multiframe inline
-        // int-specializes the tested local, the mid-body guard resume cannot
-        // source that operand's Ref form from the callee register banks
-        // (`collect_callee_active_boxes` would read a stale/mismatched box), so
-        // the encoded liveness stream disagrees with the decoder
-        // (`resume.rs decode_ref: unexpected tag`) and the caller frame is
-        // corrupted.  Decline to the ordinary residual call (trait leg) until
-        // the multi-frame resume reboxes int-specialized identity operands.
-        // POP_JUMP_IF_TRUE/FALSE stay inlinable: their `bool` truth folds in the
-        // int bank, so no Ref rebox is needed.
-        if (0..callee_code.instructions.len()).any(|pc| {
-            matches!(
-                pyre_interpreter::decode_instruction_at(callee_code, pc),
-                Some((
-                    pyre_interpreter::bytecode::Instruction::PopJumpIfNone { .. }
-                        | pyre_interpreter::bytecode::Instruction::PopJumpIfNotNone { .. },
-                    _
-                ))
-            )
-        }) {
-            return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });
-        }
-        let nlocals = callee_code.varnames.len();
-        let frame_array_size = nlocals + callee_code.max_stackdepth as usize;
+    // A strict straight-line callee at the top inline level is seeded the same
+    // way, so its in-callee guards route through the multi-frame snapshot.  A
+    // deeper strict callee (`inline_depth >= FBW_MAX_MULTIFRAME_DEPTH`) keeps the
+    // single-frame collapse — a 3-frame snapshot the resume path is sound for
+    // only one paused caller frame (task #126 multiframe depth).
+    let strict_seed = strict_inlinable && inline_depth < FBW_MAX_MULTIFRAME_DEPTH;
+    // True once the callee frame reds are actually seeded (all preconditions
+    // below met).  For a strict callee this gates routing its guards through the
+    // multi-frame snapshot vs. falling back to collapse.
+    let mut callee_frame_seeded = false;
+    if try_multiframe || strict_seed {
+        'seed: {
+            // Branch-A frame shape only (mirror REC_CA): no cells.
+            let raw = unsafe {
+                pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
+                    as *const pyre_interpreter::CodeObject
+            };
+            if raw.is_null() {
+                if try_multiframe {
+                    return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });
+                }
+                break 'seed;
+            }
+            let callee_code = unsafe { &*raw };
+            if pyre_interpreter::ncells(callee_code) != 0 {
+                if try_multiframe {
+                    return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });
+                }
+                break 'seed;
+            }
+            // POP_JUMP_IF_NONE / POP_JUMP_IF_NOT_NONE lower to an `is`/`is_not`
+            // identity residual call whose operands must be Ref (the codewriter
+            // PopJumpIfNone arm), then a branch guard.  When the multiframe inline
+            // int-specializes the tested local, the mid-body guard resume cannot
+            // source that operand's Ref form from the callee register banks
+            // (`collect_callee_active_boxes` would read a stale/mismatched box), so
+            // the encoded liveness stream disagrees with the decoder
+            // (`resume.rs decode_ref: unexpected tag`) and the caller frame is
+            // corrupted.  Decline to the ordinary residual call (trait leg) until
+            // the multi-frame resume reboxes int-specialized identity operands.
+            // POP_JUMP_IF_TRUE/FALSE stay inlinable: their `bool` truth folds in the
+            // int bank, so no Ref rebox is needed.  A strict straight-line callee
+            // has no branch at all, so this scan never fires for it.
+            if (0..callee_code.instructions.len()).any(|pc| {
+                matches!(
+                    pyre_interpreter::decode_instruction_at(callee_code, pc),
+                    Some((
+                        pyre_interpreter::bytecode::Instruction::PopJumpIfNone { .. }
+                            | pyre_interpreter::bytecode::Instruction::PopJumpIfNotNone { .. },
+                        _
+                    ))
+                )
+            }) {
+                if try_multiframe {
+                    return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });
+                }
+                break 'seed;
+            }
+            let nlocals = callee_code.varnames.len();
+            let frame_array_size = nlocals + callee_code.max_stackdepth as usize;
 
-        let Some(callee_jitcode_index) =
-            crate::state::ensure_jitcode_index(callee_code_key as *const ())
-        else {
-            return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });
-        };
-        let (frame_reg, ec_reg) = crate::state::portal_red_regs_at(callee_jitcode_index as i32);
-        if frame_reg == u16::MAX
-            || ec_reg == u16::MAX
-            || frame_reg as usize >= callee_regs_r.len()
-            || ec_reg as usize >= callee_regs_r.len()
-        {
-            return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });
+            let Some(callee_jitcode_index) =
+                crate::state::ensure_jitcode_index(callee_code_key as *const ())
+            else {
+                if try_multiframe {
+                    return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });
+                }
+                break 'seed;
+            };
+            let (frame_reg, ec_reg) = crate::state::portal_red_regs_at(callee_jitcode_index as i32);
+            if frame_reg == u16::MAX
+                || ec_reg == u16::MAX
+                || frame_reg as usize >= callee_regs_r.len()
+                || ec_reg as usize >= callee_regs_r.len()
+            {
+                if try_multiframe {
+                    return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });
+                }
+                break 'seed;
+            }
+
+            // ec red: the shared ExecutionContext (perform_call threads the
+            // caller's ec down).  Recover it off the materialized caller portal
+            // frame via `GETFIELD_GC_R` rather than the seeded
+            // `sym.execution_context` OpRef — the seeded OpRef rebinds to the
+            // callee's own `pycode` when this compiled trace re-enters as a nested
+            // bridge (see `try_walker_call_assembler_self_recursive`).  The outer
+            // portal frame's `execution_context` field is the single true ec.
+            let sym_ptr = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
+            if sym_ptr.is_null() {
+                if try_multiframe {
+                    return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });
+                }
+                break 'seed;
+            }
+            let sym = unsafe { &*sym_ptr };
+            let callee_ec = ctx.trace_ctx.record_op_with_descr(
+                OpCode::GetfieldGcR,
+                &[sym.frame],
+                crate::descr::pyframe_execution_context_descr(),
+            );
+
+            let pycode_const = ctx.trace_ctx.const_ref(w_code as i64);
+            let w_globals_obj_const = ctx.trace_ctx.const_ref(inline_consts.w_globals as i64);
+            let param_boxes: Vec<OpRef> = (0..nparams).map(|i| r_args[2 + i]).collect();
+            let callee_frame = crate::helpers::emit_new_pyframe_inline_with_params(
+                ctx.trace_ctx,
+                &param_boxes,
+                frame_array_size,
+                nlocals,
+                pycode_const,
+                w_globals_obj_const,
+                callee_ec,
+            );
+
+            callee_regs_r[frame_reg as usize] = callee_frame;
+            callee_concrete_r[frame_reg as usize] = ConcreteValue::Null;
+            callee_regs_r[ec_reg as usize] = callee_ec;
+            callee_concrete_r[ec_reg as usize] = ConcreteValue::Null;
+
+            // gap-10: retain for a possible `SubLoopCalleeCallAssembler` emit.
+            ca_callee_frame = callee_frame;
+            ca_callee_ec = callee_ec;
+            ca_nlocals = nlocals;
+            callee_frame_seeded = true;
         }
-
-        // ec red: the shared ExecutionContext (perform_call threads the
-        // caller's ec down).  Recover it off the materialized caller portal
-        // frame via `GETFIELD_GC_R` rather than the seeded
-        // `sym.execution_context` OpRef — the seeded OpRef rebinds to the
-        // callee's own `pycode` when this compiled trace re-enters as a nested
-        // bridge (see `try_walker_call_assembler_self_recursive`).  The outer
-        // portal frame's `execution_context` field is the single true ec.
-        let sym_ptr = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
-        if sym_ptr.is_null() {
-            return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });
-        }
-        let sym = unsafe { &*sym_ptr };
-        let callee_ec = ctx.trace_ctx.record_op_with_descr(
-            OpCode::GetfieldGcR,
-            &[sym.frame],
-            crate::descr::pyframe_execution_context_descr(),
-        );
-
-        let pycode_const = ctx.trace_ctx.const_ref(w_code as i64);
-        let w_globals_obj_const = ctx.trace_ctx.const_ref(inline_consts.w_globals as i64);
-        let param_boxes: Vec<OpRef> = (0..nparams).map(|i| r_args[2 + i]).collect();
-        let callee_frame = crate::helpers::emit_new_pyframe_inline_with_params(
-            ctx.trace_ctx,
-            &param_boxes,
-            frame_array_size,
-            nlocals,
-            pycode_const,
-            w_globals_obj_const,
-            callee_ec,
-        );
-
-        callee_regs_r[frame_reg as usize] = callee_frame;
-        callee_concrete_r[frame_reg as usize] = ConcreteValue::Null;
-        callee_regs_r[ec_reg as usize] = callee_ec;
-        callee_concrete_r[ec_reg as usize] = ConcreteValue::Null;
-
-        // gap-10: retain for a possible `SubLoopCalleeCallAssembler` emit.
-        ca_callee_frame = callee_frame;
-        ca_callee_ec = callee_ec;
-        ca_nlocals = nlocals;
     }
 
     // #68: a forward-branch callee inlined under the multi-frame path needs a
@@ -12857,36 +12828,35 @@ fn try_walker_inline_user_call(
             Some(pf) => Some(pf),
             None => return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc }),
         }
-    } else if strict_inlinable
-        && fbw_strict_multiframe_enabled()
-        && inline_depth < FBW_MAX_MULTIFRAME_DEPTH
-        && strict_callee_collapse_unsound(body.code)
-    {
-        // gh#420: a strict straight-line callee's in-callee guard collapses to
-        // the caller boundary and re-executes the whole call on deopt, doubling
-        // a committed heap side effect and resuming at a stale valuestackdepth.
-        // Give it the same paused-caller frame the branch multiframe path uses
-        // so the guard resumes at the callee's own coordinate.  Best effort:
-        // when the caller frame is not snapshot-able keep the single-frame
-        // collapse (do NOT decline the inline — that shape is otherwise served
+    } else if callee_frame_seeded {
+        // A strict straight-line callee seeded at the top inline level (the
+        // `try_multiframe` arm above already handled the branch path).  Push the
+        // paused caller frame so its in-callee guards resume through the
+        // multi-frame snapshot (`walker_capture_multi_frame_inline_snapshot`) at
+        // the callee's OWN coordinate, with the caller paused at the CALL return
+        // point (`get_list_of_active_boxes(in_a_call=true)` parity,
+        // `trace_opcode.rs:1779`).  With the callee frame red now seeded,
+        // `collect_callee_active_boxes` sources the callee's live boxes and the
+        // snapshot succeeds, producing the full RPython `Snapshot.frames` chain
+        // (`opencoder.py:767 create_top_snapshot`, resumed by
+        // `resume.py rebuild_from_resumedata`).  This replaces the single-frame
+        // collapse, whose caller-boundary re-execute both mis-sizes the resumed
+        // frame (a decode / `LOAD_FAST` overrun) and re-applies the callee's
+        // committed side effect on deopt.
+        //
+        // Best effort: `compute_inline_caller_frame` returns `None` for a caller
+        // shape it cannot build yet (a CALL inside a try-block, or no result on
+        // the operand stack at the return point).  Fall back to the single-frame
+        // collapse there (do NOT decline the inline — that shape is served
         // correctly today), so this never removes a working inline.
-        //
-        // Gated on the callee committing a heap side effect
-        // ([`strict_callee_collapse_unsound`]): only then is the collapse
-        // re-execute unsound and the paused-caller frame (→ MF snapshot decline
-        // → residual) warranted.  A PURE value-returning leaf (`inline_helper`'s
-        // `a + b` / `a * b`) has an idempotent collapse, so it is left on that
-        // collapse — a strict callee seeds no frame red, so pushing it through
-        // the always-declining MF snapshot would abort a working inline.
-        //
-        // Bounded by `inline_depth < FBW_MAX_MULTIFRAME_DEPTH` (mirror of
-        // `try_multiframe`): pushing a paused caller frame while already one
-        // inline level deep yields two `InlineParentFrame`s (n_parents ==
-        // n_callees == 2), a 3-frame snapshot the resume path is sound for only
-        // one paused caller frame.  A nested side-effecting strict callee then
-        // falls back to the single-frame collapse (its pre-strict-MF behavior).
         compute_inline_caller_frame(ctx, op.pc)
     } else {
+        // Single-frame collapse (resume at the CALL boundary, re-execute the
+        // whole call on deopt): a nested strict callee
+        // (`inline_depth >= FBW_MAX_MULTIFRAME_DEPTH`, task #126), an un-seedable
+        // strict callee, or a callee neither seed served.  Sound for a pure
+        // value-returning leaf (idempotent re-execute) and for a nested
+        // straight-line callee (its pre-multiframe behavior).
         None
     };
 
