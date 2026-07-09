@@ -5723,11 +5723,13 @@ fn builtin_callable(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     Ok(w_bool_from(is_callable))
 }
 
-/// `compile(source, filename, mode, ...)` — PyPy: pyopcode.py builtin_compile
+/// `compile(source, filename, mode, ...)` — compiling.py `compile`.
 ///
-/// Compiles a Python string to a code object. Only `source`, `filename` and
-/// `mode` are honoured; flags / dont_inherit / optimize are accepted but
-/// ignored, matching the minimal stub PyPy uses for shim modules.
+/// Compiles a Python string to a code object.  `flags` carries the
+/// `__future__` compiler-feature bits (and the `PyCF_*` compilation
+/// bits), `dont_inherit` controls whether the caller's `__future__`
+/// flags are inherited, and `optimize` selects the -1/0/1/2 optimisation
+/// level (assert / `__debug__` / docstring stripping).
 /// Map a compiler failure string to a Python `SyntaxError`, matching
 /// CPython where `compile`/`exec`/`eval`/`ast.parse` raise `SyntaxError`
 /// (not `ValueError`) for malformed source.  The `compile error: ` prefix
@@ -5738,12 +5740,26 @@ fn compile_err_to_syntax_error(e: String) -> crate::PyError {
     crate::PyError::syntax_error(msg)
 }
 
+/// `pypy/interpreter/astcompiler/consts.py` compilation flag bits.
+const PYCF_ONLY_AST: i64 = 0x0400;
+const PYCF_DONT_IMPLY_DEDENT: i64 = 0x0200;
+const PYCF_SOURCE_IS_UTF8: i64 = 0x0100;
+const PYCF_IGNORE_COOKIE: i64 = 0x0800;
+const PYCF_TYPE_COMMENTS: i64 = 0x4000_0000;
+const PYCF_ALLOW_TOP_LEVEL_AWAIT: i64 = 0x2000;
+const PYCF_ALLOW_INCOMPLETE_INPUT: i64 = 0x4000;
+const PYCF_ACCEPT_NULL_BYTES: i64 = 0x1000_0000;
+/// `future.py` `allowed_flags` — the union of the `__future__`
+/// `compiler_flag` bits (`CO_FUTURE_DIVISION` … `CO_FUTURE_ANNOTATIONS`),
+/// i.e. the flags `getcodeflags` masks out of a caller's `co_flags`.
+const COMPILER_FLAGS: i64 = 0x01FE_0000;
+
 fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // `compile(source, filename, mode, flags=0, dont_inherit=False,
-    // optimize=-1, *, _feature_version=-1)`: the three required parameters are
-    // positional-or-keyword.  pyre honours only source/filename/mode; the
-    // remaining optional parameters are accepted (so a keyword call does not
-    // error) but not yet applied.
+    // optimize=-1, *, _feature_version=-1)`: the three required parameters and
+    // flags/dont_inherit/optimize are positional-or-keyword; _feature_version
+    // is keyword-only and accepted but unused (pyre has no AST surface, so the
+    // PyCF_ONLY_AST feature-version gate never fires).
     let (pos, kwargs) = split_builtin_kwargs(args);
     kwarg_reject_unknown(
         kwargs,
@@ -5768,6 +5784,13 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     let mode_obj = bind_pos_or_kw(pos, kwargs, 2, "mode", "compile", 3)?.ok_or_else(|| {
         crate::PyError::type_error("compile() missing required argument 'mode' (pos 3)")
     })?;
+    let filename = unsafe {
+        if pyre_object::is_str(filename_obj) {
+            pyre_object::w_str_get_value(filename_obj).to_string()
+        } else {
+            "<string>".to_string()
+        }
+    };
     let source_str = unsafe {
         if pyre_object::is_str(source) {
             // The source is decoded to UTF-8 for the tokenizer; a lone
@@ -5776,18 +5799,17 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
             let bytes = crate::type_methods::encode_object(source, "utf-8", "strict")?;
             String::from_utf8(bytes).expect("strict utf-8 encode yields valid utf-8")
         } else if pyre_object::bytesobject::is_bytes_like(source) {
-            String::from_utf8_lossy(pyre_object::bytesobject::bytes_like_data(source)).into_owned()
+            // A bytes-like source honours the PEP 263 coding cookie and raises
+            // SyntaxError on undecodable bytes rather than lossily replacing.
+            crate::compile::decode_source_bytes(
+                pyre_object::bytesobject::bytes_like_data(source),
+                &filename,
+                false,
+            )?
         } else {
             return Err(crate::PyError::type_error(
                 "compile() arg 1 must be a string or bytes",
             ));
-        }
-    };
-    let filename = unsafe {
-        if pyre_object::is_str(filename_obj) {
-            pyre_object::w_str_get_value(filename_obj).to_string()
-        } else {
-            "<string>".to_string()
         }
     };
     let mode = unsafe {
@@ -5797,6 +5819,51 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
             "exec".to_string()
         }
     };
+    // flags / dont_inherit / optimize are positional-or-keyword ints
+    // (unwrap_spec flags=int, dont_inherit=int, optimize=int).
+    let mut flags = match bind_pos_or_kw(pos, kwargs, 3, "flags", "compile", 4)? {
+        Some(v) => crate::baseobjspace::gateway_int_w(v)?,
+        None => 0,
+    };
+    let dont_inherit = match bind_pos_or_kw(pos, kwargs, 4, "dont_inherit", "compile", 5)? {
+        Some(v) => crate::baseobjspace::gateway_int_w(v)?,
+        None => 0,
+    };
+    let mut optimize = match bind_pos_or_kw(pos, kwargs, 5, "optimize", "compile", 6)? {
+        Some(v) => crate::baseobjspace::gateway_int_w(v)?,
+        None => -1,
+    };
+
+    // Any bit outside the recognised compilation-flag set is rejected.
+    let recognized = COMPILER_FLAGS
+        | PYCF_ONLY_AST
+        | PYCF_DONT_IMPLY_DEDENT
+        | PYCF_SOURCE_IS_UTF8
+        | PYCF_ACCEPT_NULL_BYTES
+        | PYCF_TYPE_COMMENTS
+        | PYCF_ALLOW_TOP_LEVEL_AWAIT
+        | PYCF_ALLOW_INCOMPLETE_INPUT
+        | PYCF_IGNORE_COOKIE;
+    if flags & !recognized != 0 {
+        return Err(crate::PyError::value_error("compile(): unrecognised flags"));
+    }
+
+    // dont_inherit=0 folds in the caller's __future__ flags
+    // (getcodeflags: `co_flags & compiler_flags`).
+    if dont_inherit == 0 {
+        let caller_frame = crate::eval::CURRENT_FRAME.with(|current| current.get());
+        if !caller_frame.is_null() {
+            let ec = unsafe { (*caller_frame).execution_context };
+            if !ec.is_null() {
+                let top = unsafe { (*ec).gettopframe_nohidden() };
+                if !top.is_null() {
+                    let caller_flags = unsafe { (*top).getcode().flags.bits() } as i64;
+                    flags |= caller_flags & COMPILER_FLAGS;
+                }
+            }
+        }
+    }
+
     let mode = match mode.as_str() {
         "exec" => crate::compile::Mode::Exec,
         "eval" => crate::compile::Mode::Eval,
@@ -5808,7 +5875,27 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
             ));
         }
     };
-    let code = crate::compile::compile_source_with_filename(&source_str, mode, &filename)
+
+    if !(-1..=2).contains(&optimize) {
+        return Err(crate::PyError::value_error(
+            "compile(): invalid optimize value",
+        ));
+    }
+    if optimize == -1 {
+        // sys.flags.optimize default.
+        optimize = 0;
+    }
+
+    // Assemble CompileOpts: the __future__ feature bits, the two PyCF_*
+    // bits the codegen honours, and the optimisation level.
+    let opts = crate::compile::CompileOpts {
+        optimize: optimize as u8,
+        allow_top_level_await: flags & PYCF_ALLOW_TOP_LEVEL_AWAIT != 0,
+        dont_imply_dedent: flags & PYCF_DONT_IMPLY_DEDENT != 0,
+        future_features: crate::CodeFlags::from_bits_truncate((flags & COMPILER_FLAGS) as u32),
+        ..Default::default()
+    };
+    let code = crate::compile::compile_source_with_opts(&source_str, mode, &filename, opts)
         .map_err(compile_err_to_syntax_error)?;
     let code_ptr = Box::into_raw(Box::new(code)) as *const ();
     Ok(crate::w_code_new(code_ptr))
@@ -5823,9 +5910,10 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 /// namespace contents back so that callers see the new bindings.
 fn builtin_exec(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // `exec(source, /, globals=None, locals=None, *, closure=None)`: source is
-    // positional-only; globals/locals are positional-or-keyword.  `closure` is
-    // accepted (keyword-only) but pyre's exec plumbing carries no closure, so a
-    // None closure is a no-op and a non-None one is unsupported.
+    // positional-only; globals/locals are positional-or-keyword; `closure` is
+    // keyword-only.  `closure` supplies the cell objects that bind a code
+    // object's free variables (bltinmodule.c builtin_exec_impl); a None
+    // closure normalises to "absent" (PY_NULL).
     let (pos, kwargs) = split_builtin_kwargs(args);
     kwarg_reject_unknown(kwargs, &["globals", "locals", "closure"], "exec")?;
     if pos.is_empty() {
@@ -5838,14 +5926,12 @@ fn builtin_exec(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         bind_pos_or_kw(pos, kwargs, 1, "globals", "exec", 2)?.unwrap_or(pyre_object::PY_NULL);
     let locals_arg =
         bind_pos_or_kw(pos, kwargs, 2, "locals", "exec", 3)?.unwrap_or(pyre_object::PY_NULL);
-    if let Some(closure) = kwarg_get(kwargs, "closure") {
-        if !unsafe { pyre_object::is_none(closure) } {
-            return Err(crate::PyError::type_error(
-                "exec() closure argument is not supported",
-            ));
-        }
-    }
-    exec_or_eval(source, globals_arg, locals_arg, false)
+    // `if closure is None: closure = NULL` — treat None as unset.
+    let closure = match kwarg_get(kwargs, "closure") {
+        Some(c) if !unsafe { pyre_object::is_none(c) } => c,
+        _ => pyre_object::PY_NULL,
+    };
+    exec_or_eval(source, globals_arg, locals_arg, false, closure)
 }
 
 /// `eval(source_or_code, globals=None, locals=None)` — same plumbing as
@@ -5865,7 +5951,8 @@ fn builtin_eval(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         bind_pos_or_kw(pos, kwargs, 1, "globals", "eval", 2)?.unwrap_or(pyre_object::PY_NULL);
     let locals_arg =
         bind_pos_or_kw(pos, kwargs, 2, "locals", "eval", 3)?.unwrap_or(pyre_object::PY_NULL);
-    exec_or_eval(source, globals_arg, locals_arg, true)
+    // eval() has no closure parameter — pass "absent".
+    exec_or_eval(source, globals_arg, locals_arg, true, pyre_object::PY_NULL)
 }
 
 fn exec_or_eval(
@@ -5873,19 +5960,25 @@ fn exec_or_eval(
     globals_arg: PyObjectRef,
     locals_arg: PyObjectRef,
     is_eval: bool,
+    closure: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
     // Resolve a runnable code object: accept a precompiled W_Code or
-    // compile a str on the fly.
-    let code_obj_ref = unsafe {
+    // compile a str on the fly.  `source_is_code` records whether the
+    // original argument was already a code object (vs a compiled str /
+    // bytes) — the closure validation below branches on it.
+    let (code_obj_ref, source_is_code) = unsafe {
         // `compiling.py:103 source_as_str` — accepts a str or a bytes-like
         // source (decoded), or an already-compiled code object.
         let source_str = if pyre_object::is_str(source) {
             Some(pyre_object::w_str_get_value(source).to_string())
         } else if pyre_object::bytesobject::is_bytes_like(source) {
-            Some(
-                String::from_utf8_lossy(pyre_object::bytesobject::bytes_like_data(source))
-                    .into_owned(),
-            )
+            // A bytes-like source honours the PEP 263 coding cookie and raises
+            // SyntaxError on undecodable bytes rather than lossily replacing.
+            Some(crate::compile::decode_source_bytes(
+                pyre_object::bytesobject::bytes_like_data(source),
+                "<string>",
+                false,
+            )?)
         } else {
             None
         };
@@ -5898,9 +5991,9 @@ fn exec_or_eval(
             let code =
                 crate::compile::compile_source(&s, mode).map_err(compile_err_to_syntax_error)?;
             let code_ptr = Box::into_raw(Box::new(code)) as *const ();
-            crate::w_code_new(code_ptr)
+            (crate::w_code_new(code_ptr), false)
         } else if !source.is_null() && crate::is_code(source) {
-            source
+            (source, true)
         } else {
             return Err(crate::PyError::type_error(format!(
                 "{}() arg 1 must be a string, bytes or code object",
@@ -5911,27 +6004,6 @@ fn exec_or_eval(
     let raw_code = unsafe {
         crate::w_code_get_ptr(code_obj_ref as pyre_object::PyObjectRef) as *const crate::CodeObject
     };
-
-    // pyopcode.py:738-759 exec_ — refuse a code object that needs a
-    // closure with the exec-side TypeError.  PyPy exposes a keyword-only
-    // `w_closure` parameter and builds an `outer_func` from it after
-    // validating the tuple of cells.  Pyre's exec() builtin currently
-    // accepts only source/globals/locals, so no closure cells can be
-    // supplied yet.
-    //
-    // eval() takes no closure parameter even on CPython; the eval-side
-    // error message comes from initialize_frame_scopes (pyframe.py:242-246
-    // "directly executed code object may not contain free variables") via
-    // createframe → ?, which is what compiling.py:99 eval_function reaches
-    // through code.exec_code.
-    if !is_eval {
-        let needed_freevars = unsafe { (&*raw_code).freevars.len() };
-        if needed_freevars > 0 {
-            return Err(crate::PyError::type_error(format!(
-                "code object requires a closure of exactly length {needed_freevars}"
-            )));
-        }
-    }
 
     // pypy/interpreter/eval.py:28-33 Code.exec_code keeps w_globals and
     // w_locals as separate dict references — STORE_GLOBAL writes to
@@ -6102,6 +6174,56 @@ fn exec_or_eval(
         )));
     }
 
+    // bltinmodule.c builtin_exec_impl — validate the closure against the
+    // resolved code object (after the globals/locals type checks), then build
+    // an `outer_func` carrying the cells so `initialize_frame_scopes` binds
+    // them as the code's free variables (the same path a nested function call
+    // takes via `function.__closure__`).  `closure` is already normalised so
+    // PY_NULL means "absent".
+    //
+    // eval() takes no closure parameter; the eval-side error for a code
+    // object that carries free variables comes from initialize_frame_scopes
+    // (pyframe.py:242-246 "directly executed code object may not contain free
+    // variables") when createframe runs below with no outer_func.
+    // `inject_closure` records that a validated closure must be bound into the
+    // frame; the `outer_func` carrier is built just before createframe so it
+    // needs no GC rooting across the namespace-setup allocations below.
+    let mut inject_closure = false;
+    if !is_eval {
+        if source_is_code {
+            let num_free = unsafe { (&*raw_code).freevars.len() };
+            if num_free == 0 {
+                // A code object without free variables accepts no closure.
+                if !closure.is_null() {
+                    return Err(crate::PyError::type_error(
+                        "cannot use a closure with this code object",
+                    ));
+                }
+            } else {
+                // The closure must be an exact tuple of `num_free` cells.
+                let closure_ok = !closure.is_null()
+                    && unsafe { pyre_object::is_tuple(closure) }
+                    && unsafe { pyre_object::w_tuple_len(closure) } == num_free
+                    && (0..num_free).all(|i| unsafe {
+                        pyre_object::w_tuple_getitem(closure, i as i64)
+                            .is_some_and(|cell| pyre_object::is_cell(cell))
+                    });
+                if !closure_ok {
+                    return Err(crate::PyError::type_error(format!(
+                        "code object requires a closure of exactly length {num_free}"
+                    )));
+                }
+                inject_closure = true;
+            }
+        } else if !closure.is_null() {
+            // A str/bytes source is compiled fresh (no free variables), so a
+            // closure is meaningless here.
+            return Err(crate::PyError::type_error(
+                "closure can only be used when source is a code object",
+            ));
+        }
+    }
+
     let caller_frame = crate::eval::CURRENT_FRAME.with(|current| current.get());
     let exec_ctx = if caller_frame.is_null() {
         std::ptr::null::<crate::PyExecutionContext>()
@@ -6182,13 +6304,36 @@ fn exec_or_eval(
             locals_object_arg = locals_arg;
         }
     }
+    // function.py Function.__init__ — build the closure carrier for
+    // `exec(code, ..., closure=...)`.  A `Function` whose `__closure__` is the
+    // validated cell tuple; createframe reads it back through
+    // `function_get_closure` and injects each cell into the frame's freevar
+    // slots (the same path a nested function call takes).  Its globals are
+    // never read (initialize_frame_scopes only consults the closure), so a
+    // PY_NULL globals carrier suffices.  Built here — after the namespace
+    // setup allocations — and pinned so the intervening createframe allocation
+    // cannot reclaim it before its cells are copied into the frame.
+    let _closure_root = pyre_object::gc_roots::push_roots();
+    let outer_func = if inject_closure {
+        let name = unsafe { (&*raw_code).obj_name.clone() };
+        let f = crate::function::function_new_with_closure(
+            code_obj_ref as *const (),
+            name,
+            pyre_object::PY_NULL,
+            closure,
+        );
+        pyre_object::gc_roots::pin_root(f);
+        Some(f)
+    } else {
+        None
+    };
     // eval.py:31-33 Code.exec_code → space.createframe(...) + frame.run().
-    // For eval() with a code object that carries freevars, createframe
-    // surfaces pyframe.py:242-246's TypeError "directly executed code
-    // object may not contain free variables" directly — exec()'s
+    // For eval() with a code object that carries freevars, `outer_func` is
+    // None so createframe surfaces pyframe.py:242-246's TypeError "directly
+    // executed code object may not contain free variables" — exec()'s
     // closure-mismatch TypeError was already raised above.
     let mut frame =
-        match crate::createframe_obj(code_obj_ref as *const (), w_globals, exec_ctx, None) {
+        match crate::createframe_obj(code_obj_ref as *const (), w_globals, exec_ctx, outer_func) {
             Ok(frame) => frame,
             Err(err) => {
                 let _ = raw_code;

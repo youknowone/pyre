@@ -1683,8 +1683,16 @@ fn subclass_to_tag(
 /// fresh list, so a subclass instance is the same object with `w_class`
 /// retagged.
 fn list_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-    let value = crate::builtins::builtin_list_ctor(&args[1..])?;
+    let (params, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let cls = params.first().copied().unwrap_or(pyre_object::PY_NULL);
+    builtinclass_new_args_check(
+        "list",
+        gettypeobject(&pyre_object::LIST_TYPE),
+        cls,
+        params.len().saturating_sub(2),
+        crate::builtins::has_real_kwargs(kwargs),
+    )?;
+    let value = crate::builtins::builtin_list_ctor(params.get(1..).unwrap_or(&[]))?;
     if let Some(sub) = subclass_to_tag(cls, &pyre_object::LIST_TYPE)? {
         unsafe {
             (*value).w_class = sub;
@@ -1698,8 +1706,16 @@ fn list_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// argument tuple unchanged, so the subclass path rebuilds a fresh tuple
 /// before retagging to avoid aliasing the input.
 fn tuple_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-    let value = crate::builtins::builtin_tuple(&args[1..])?;
+    let (params, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let cls = params.first().copied().unwrap_or(pyre_object::PY_NULL);
+    builtinclass_new_args_check(
+        "tuple",
+        gettypeobject(&pyre_object::TUPLE_TYPE),
+        cls,
+        params.len().saturating_sub(2),
+        crate::builtins::has_real_kwargs(kwargs),
+    )?;
+    let value = crate::builtins::builtin_tuple(params.get(1..).unwrap_or(&[]))?;
     if let Some(sub) = subclass_to_tag(cls, &pyre_object::TUPLE_TYPE)? {
         let n = unsafe { pyre_object::w_tuple_len(value) };
         let items: Vec<PyObjectRef> = (0..n)
@@ -1947,7 +1963,7 @@ fn builtinclass_new_args_check(
     if init_matches {
         if positional_extra > 0 {
             return Err(crate::PyError::type_error(format!(
-                "{name}() expected at most 1 argument, got {}",
+                "{name} expected at most 1 argument, got {}",
                 positional_extra + 1,
             )));
         }
@@ -12046,7 +12062,18 @@ pub(crate) fn bytes_method_decode(args: &[PyObjectRef]) -> Result<PyObjectRef, c
         },
         _ => "strict".to_string(),
     };
-    let err_mode = errors.as_str();
+    let s = decode_bytes_to_wtf8(data, &encoding, errors.as_str())?;
+    Ok(pyre_object::w_str_from_wtf8(s))
+}
+
+/// Decode `data` under `encoding`/`errors` into a WTF-8 string, dispatching on
+/// the codec name the same way `bytes.decode` does.
+pub(crate) fn decode_bytes_to_wtf8(
+    data: &[u8],
+    encoding: &str,
+    errors: &str,
+) -> Result<Wtf8Buf, crate::PyError> {
+    let err_mode = errors;
     let enc_lower = encoding.to_ascii_lowercase().replace('_', "-");
     let s = match enc_lower.as_str() {
         "utf-8" | "utf8" | "u8" => decode_utf8_with_errors(data, err_mode)?,
@@ -12121,7 +12148,7 @@ pub(crate) fn bytes_method_decode(args: &[PyObjectRef]) -> Result<PyObjectRef, c
             }
         }
     };
-    Ok(pyre_object::w_str_from_wtf8(s))
+    Ok(s)
 }
 
 /// PyPy: bytesobject.py descr_repr — returns a quoted literal like `b'hello'`.
