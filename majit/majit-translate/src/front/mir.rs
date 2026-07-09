@@ -812,7 +812,18 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         } else {
             format!("{module_path}::{name}")
         };
-        let return_type = if dont_look_inside.contains(&fn_path) {
+        // A trait default body is registered as the `<default methods of
+        // Trait>` family sentinel and picked as the Indirect-dispatch
+        // witness (`getcalldescr`'s indirect arm reads its `return_type` as
+        // `FUNC.RESULT`).  Left `None` it maps to `Void` and mismatches the
+        // caller's `Ref`/`Int` `result_ty`; stamp the same token an opaque
+        // callee gets so the witness reports its real return kind.  Gated on
+        // `PYRE_DYN_INDIRECT` so the direct `[Trait, method]` registration
+        // (`lib.rs`) keeps its `None`→`Void` default when the routing is off
+        // — off-path byte-identity holds.
+        let stamp_return_token = dont_look_inside.contains(&fn_path)
+            || (dyn_indirect_enabled() && trait_root.is_some() && self_ty_root.is_none());
+        let return_type = if stamp_return_token {
             dont_look_inside_return_token(&fd.signature.output, llbc)
         } else {
             None
