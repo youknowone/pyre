@@ -1032,7 +1032,8 @@ fn format_render(
     depth: u32,
 ) -> Result<Wtf8Buf, crate::PyError> {
     use rustpython_common::format::{
-        FieldName, FieldNamePart, FieldType, FormatPart, FormatString, FromTemplate,
+        FieldName, FieldNamePart, FieldType, FormatParseError, FormatPart, FormatString,
+        FromTemplate,
     };
     let lookup_kwarg = |name: &str| -> Result<Option<PyObjectRef>, crate::PyError> {
         if let Some(m) = mapping {
@@ -1072,9 +1073,16 @@ fn format_render(
         // threading the auto-/manual-numbering state (`None` = uncommitted,
         // `Some(true)` = automatic `{}`, `Some(false)` = manual `{0}`).
         //
-        // Classify only the head (up to the first `.`/`[`) here, so a
-        // missing/out-of-range base raises IndexError/KeyError before a
+        // A missing `]` terminates the field, so it precedes base-argument
+        // resolution; every other chain error (empty attribute, empty/`!`
+        // item, stray char after `]`) is a resolution error that follows the
+        // base lookup. Classify only the head (up to the first `.`/`[`) here,
+        // so a missing/out-of-range base raises IndexError/KeyError before a
         // malformed attribute or item chain raises ValueError.
+        let full = FieldName::parse(field_name);
+        if matches!(full, Err(FormatParseError::MissingRightBracket)) {
+            return Err(format_parse_err(FormatParseError::MissingRightBracket, fmt));
+        }
         let mut head = Wtf8Buf::new();
         for ch in field_name.code_points() {
             if ch == '.' || ch == '[' {
@@ -1125,10 +1133,9 @@ fn format_render(
             }
         };
 
-        // Parse the full field name for the attribute/item chain; chain parse
-        // errors now surface after the base argument has been resolved.
-        let FieldName { parts, .. } =
-            FieldName::parse(field_name).map_err(|e| format_parse_err(e, fmt))?;
+        // Surface any remaining chain parse error now that the base argument
+        // has been resolved, then walk the attribute/item chain.
+        let FieldName { parts, .. } = full.map_err(|e| format_parse_err(e, fmt))?;
 
         // `_resolve_lookups` — walk the `.attr` / `[element]` chain; a
         // bracketed all-digit element is an integer index, anything else a
@@ -1142,6 +1149,18 @@ fn format_render(
                     crate::baseobjspace::getitem(val, pyre_object::w_int_new(*idx as i64))?
                 }
                 FieldNamePart::StringIndex(key) => {
+                    // An all-digit bracket element that reached here overflowed
+                    // the integer index — a value that fits is already
+                    // classified as `Index` — so reject it like the head does.
+                    if key
+                        .as_str()
+                        .ok()
+                        .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+                    {
+                        return Err(crate::PyError::value_error(
+                            "Too many decimal digits in format string",
+                        ));
+                    }
                     crate::baseobjspace::getitem(val, pyre_object::w_str_from_wtf8(key.clone()))?
                 }
             };
