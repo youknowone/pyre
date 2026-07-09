@@ -4235,7 +4235,27 @@ impl OptUnroll {
             // a snapshot. Matches PyPy `_forwarded` reference passing.
             return Some(OpInfo::Ptr(handle));
         }
-        // TODO: read from `exported_int_bounds`
+        // unroll.py:443-454 `_expand_info` calls `self.optimizer.getinfo(arg)`
+        // for EVERY exported value with no jump-arg restriction, so an int-typed
+        // value's bound is read straight off its `_forwarded` slot
+        // (`getintbound`). Read the live bound from the still-alive Phase-1
+        // optimizer context; this recovers the `[0, mask]` bound of a masked
+        // short-preamble / loop-invariant pure result that is not a jump arg and
+        // therefore never entered the `exported_int_bounds` side table. Mirror
+        // `export_arg_int_bounds` (intbounds.rs): skip Const/non-Int values and
+        // unbounded bounds.
+        if let Some(box_op) = resolved_box.as_ref() {
+            if !resolved.is_constant()
+                && matches!(ctx.opref_type(resolved), Some(majit_ir::Type::Int))
+            {
+                if let Some(bound) = ctx.peek_intbound_box(box_op) {
+                    if !bound.is_unbounded() {
+                        return Some(OpInfo::int_bound(bound));
+                    }
+                }
+            }
+        }
+        // Fallback: read from `exported_int_bounds`
         // side table.  RPython's `IntBound` flows through
         // `OptInfo.IntBound` on the Box itself
         // (`optimizeopt/info.py:580 IntBoundInfo`), so successive peeling
@@ -6572,6 +6592,59 @@ mod tests {
             ctx2.getintbound_handle(&__mb).borrow().clone()
         };
         assert_eq!((imported_bound.lower, imported_bound.upper), (10, 20));
+    }
+
+    #[test]
+    fn test_exported_state_reads_live_bound_for_non_jumparg() {
+        // unroll.py:443-454 `_expand_info` calls `self.optimizer.getinfo(arg)`
+        // for EVERY exported value with no jump-arg restriction. A masked pure
+        // result (`IntAnd(x, mask)`) that is a short-preamble / loop-invariant
+        // value is not a jump arg, so its `[0, mask]` IntBound never enters the
+        // `exported_int_bounds` side table (populated only from
+        // `jump.getarglist()`). The live bound must still be exported by reading
+        // it directly from the Phase-1 optimizer context.
+        let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
+        use crate::optimizeopt::intutils::IntBound;
+        const MASK: i64 = 0xFFFF_FFFF;
+
+        let mut ctx = crate::optimizeopt::OptContext::with_num_inputs(4, 0);
+        // Bind the export-input position at its source (a forced end-arg is a
+        // bound box in production).
+        ctx.materialize_operand_at(OpRef::int_op(21));
+        let box21 = ctx
+            .get_box_replacement_operand_opt(OpRef::int_op(21))
+            .expect("int_op(21) bound to a box");
+        // The bound lives on the box's `_forwarded` slot (as it does after
+        // `IntAnd` narrows it), but it is NOT registered in the side table —
+        // exactly the state of a non-jump-arg short-box result.
+        ctx.setintbound(&box21, &IntBound::bounded(0, MASK));
+
+        // `None` side table → current code has no way to recover the bound and
+        // drops it; the live-bound read must surface it.
+        let exported = export_state(
+            &[OpRef::int_op(21)],
+            &[],
+            &mut optimizer,
+            &mut ctx,
+            None,
+        );
+
+        assert_eq!(
+            match exported
+                .exported_infos
+                .iter()
+                .find(|(k, _)| k.to_opref() == OpRef::int_op(21))
+                .map(|(_, v)| v)
+            {
+                Some(crate::optimizeopt::info::OpInfo::IntBound(b)) => {
+                    let b = b.borrow();
+                    Some((b.lower, b.upper))
+                }
+                _ => None,
+            },
+            Some((0, MASK)),
+            "live [0, MASK] bound on a non-jump-arg short-box result must be exported"
+        );
     }
 
     #[test]
