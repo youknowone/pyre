@@ -4780,13 +4780,13 @@ pub(crate) fn builtin_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         if unsafe { is_str(obj) } {
             return Err(crate::PyError::type_error("decoding str is not supported"));
         }
-        if !unsafe { pyre_object::bytesobject::is_bytes_like(obj) } {
+        let Some(src) = crate::typedef::buffer_as_bytes_like(obj)? else {
             let tn = unsafe { (*(*obj).ob_type).name };
             return Err(crate::PyError::type_error(format!(
                 "decoding to str: need a bytes-like object, {tn} found"
             )));
-        }
-        let mut decode_args = vec![obj, w_encoding.unwrap_or_else(w_none)];
+        };
+        let mut decode_args = vec![src, w_encoding.unwrap_or_else(w_none)];
         if let Some(e) = w_errors {
             decode_args.push(e);
         }
