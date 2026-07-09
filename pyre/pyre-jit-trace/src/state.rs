@@ -1608,6 +1608,16 @@ pub(crate) fn bridge_semantic_maps_at_with_jitcode_pc(
                 match via_twin {
                     Some(pair) => pair,
                     None => {
+                        // Slice A census: soft, non-aborting count of the
+                        // py_pc re-inversion fallback (empty-twin portal bridge
+                        // or Err(0) colored coord). Emits ONLY when this arm
+                        // runs, so zero output == dead.
+                        if crate::jitcode_dispatch::bridge_audit_enabled() {
+                            eprintln!(
+                                "M73_FALLBACK site=bridge jp={jp} is_portal_bridge={}",
+                                payload.is_portal_bridge()
+                            );
+                        }
                         let rp =
                             crate::jitcode_dispatch::python_pc_for_jitcode_pc(&payload.metadata, jp)
                                 as usize;
@@ -1704,6 +1714,15 @@ pub(crate) fn const_ref_slots_at_pc_at(
                 // check.py certifies on the hot bridge path).
                 if let Some(slots) = jc.payload.const_ref_slots_for_jitcode_pc(jp) {
                     return slots;
+                }
+                // Slice A census: soft, non-aborting count of the py_pc
+                // re-inversion fallback (empty const-slot twin). Known COLD.
+                // Zero output == dead.
+                if crate::jitcode_dispatch::bridge_audit_enabled() {
+                    eprintln!(
+                        "M73_FALLBACK site=const jp={jp} is_portal_bridge={}",
+                        jc.payload.is_portal_bridge()
+                    );
                 }
                 crate::jitcode_dispatch::python_pc_for_jitcode_pc(&jc.payload.metadata, jp) as usize
             } else {

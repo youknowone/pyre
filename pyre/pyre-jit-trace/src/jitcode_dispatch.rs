@@ -9656,6 +9656,16 @@ fn branch_resume_target_stack_depth(frame: &ActiveResumeFrame, target: usize) ->
         if pjc.depth_trivia_populated() {
             pjc.depth_trivia_for_jitcode_pc(target)
         } else {
+            // Slice A census: soft, non-aborting count of the py_pc-inversion
+            // fallback (empty depth-trivia twin). Emits ONLY when this arm runs,
+            // so zero output over the corpus == this fallback is dead.
+            if m73_encode_audit_enabled() {
+                eprintln!(
+                    "M73_FALLBACK site=brtsd target={target} is_portal_bridge={} code_null={}",
+                    pjc.is_portal_bridge(),
+                    pjc.code_ptr.is_null()
+                );
+            }
             depth
         }
     }
@@ -9712,6 +9722,15 @@ fn kept_stack_has_boxed_int_hazard(
         let depth_opt = if pjc.depth_trivia_populated() {
             pjc.depth_trivia_for_jitcode_pc(target)
         } else {
+            // Slice A census: soft, non-aborting count of the py_pc-inversion
+            // fallback (empty depth-trivia twin). Zero output == dead.
+            if m73_encode_audit_enabled() {
+                eprintln!(
+                    "M73_FALLBACK site=kshbih target={target} is_portal_bridge={} code_null={}",
+                    pjc.is_portal_bridge(),
+                    pjc.code_ptr.is_null()
+                );
+            }
             depth_opt
         };
         let Some(depth) = depth_opt.map(|d| d as usize) else {
@@ -10006,6 +10025,17 @@ fn branch_resume_target_stack_depth_any_leg(target: usize, jitcode_index: u32) -
     if pjc.depth_trivia_populated() {
         pjc.depth_trivia_for_jitcode_pc(target)
     } else {
+        // Slice A census: soft, non-aborting count of the py_pc-inversion
+        // fallback (empty depth-trivia twin). Highest-risk site — keys on the
+        // caller's `ctx.outer_jitcode_index` (recorded as outer_idx). Zero
+        // output == dead.
+        if m73_encode_audit_enabled() {
+            eprintln!(
+                "M73_FALLBACK site=brtsd_anyleg target={target} outer_idx={jitcode_index} is_portal_bridge={} code_null={}",
+                pjc.is_portal_bridge(),
+                pjc.code_ptr.is_null()
+            );
+        }
         depth_opt
     }
 }
