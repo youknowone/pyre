@@ -1186,70 +1186,114 @@ fn analyze_pipeline_from_module_paths(
     // (e.g. the aheui census) names `>=2`-impl trait qualified paths
     // whose `dyn Trait` receivers should annotate to a base ClassDef
     // linking the impl subclasses, so a method getattr on the receiver
-    // resolves the impl MethodDesc family.  Pyre production names none,
-    // so its multi-impl traits keep their classdef-less / fail-loud
-    // disposition unchanged.  Built from `trait_impl_owners` (before it
-    // is consumed below) and forwarded through `CallControl` to
-    // `dual_gate_registry`, which mints each family before the
+    // resolves the impl MethodDesc family.  Built from `trait_impl_owners`
+    // (before it is consumed below) and forwarded through `CallControl`
+    // to `dual_gate_registry`, which mints each family before the
     // class-method seeding.
-    let trait_family_registrations: Vec<call::TraitFamilyRegistration> = config
+    //
+    // Per-family builder shared by the config and the gated auto-population
+    // paths.  Skips a family whose impl owners collapse to one leaf under
+    // the leaf-keyed (`canonical_struct_name`) family interning + method
+    // seeding — that would silently drop a member; leaving the trait's
+    // classdef-less / fail-loud disposition is the fail-safe.  Mirrors the
+    // `struct_leaf_counts` bail on the single-impl path below.
+    let make_registration = |trait_qualified: &str,
+                             owners: &std::collections::BTreeSet<String>|
+     -> Option<call::TraitFamilyRegistration> {
+        let impl_roots: Vec<String> = owners
+            .iter()
+            .map(|owner| owner.rsplit("::").next().unwrap_or(owner).to_string())
+            .collect();
+        // Within-family leaf collision: two impls of THIS trait whose
+        // qualified owners share a leaf across modules.
+        let mut seen = std::collections::HashSet::new();
+        if let Some(dup) = impl_roots.iter().find(|leaf| !seen.insert(leaf.as_str())) {
+            eprintln!(
+                "register_trait_families: {trait_qualified:?} has impls sharing \
+                 leaf {dup:?} across modules ({owners:?}); skipping — leaf-keyed \
+                 seeding cannot disambiguate them"
+            );
+            return None;
+        }
+        Some(call::TraitFamilyRegistration {
+            base_root: trait_qualified.to_string(),
+            impl_roots,
+        })
+    };
+    // Config-named families first (empty in pyre production).  Preserves
+    // the prior spelling-mismatch diagnostic on the `None` arm.
+    let mut trait_family_registrations: Vec<call::TraitFamilyRegistration> = config
         .pipeline
         .register_trait_families
         .iter()
-        .filter_map(
-            |trait_qualified| match trait_impl_owners.get(trait_qualified) {
-                Some(owners) => {
-                    let impl_roots: Vec<String> = owners
-                        .iter()
-                        .map(|owner| owner.rsplit("::").next().unwrap_or(owner).to_string())
-                        .collect();
-                    // The family interning + method seeding key impl
-                    // subclasses by leaf (`canonical_struct_name`), so two
-                    // impls whose qualified owners share a leaf across
-                    // modules would collapse to one classdef and silently
-                    // drop a member. Skip such a family — leaving the
-                    // trait's classdef-less / fail-loud disposition — rather
-                    // than mis-seed it; a same-leaf consumer needs
-                    // qualified-root interning end-to-end (the leaf-keyed
-                    // struct registry and receiver match are pre-existing).
-                    // Mirrors the `struct_leaf_counts` bail on the
-                    // single-impl path below.
-                    let mut seen = std::collections::HashSet::new();
-                    let dup_leaf = impl_roots.iter().find(|leaf| !seen.insert(leaf.as_str()));
-                    if let Some(dup) = dup_leaf {
-                        eprintln!(
-                            "register_trait_families: {trait_qualified:?} has impls sharing \
-                             leaf {dup:?} across modules ({owners:?}); skipping — leaf-keyed \
-                             seeding cannot disambiguate them"
-                        );
-                        None
-                    } else {
-                        Some(call::TraitFamilyRegistration {
-                            base_root: trait_qualified.clone(),
-                            impl_roots,
-                        })
-                    }
-                }
-                None => {
-                    // Config validation: a named family that matches no
-                    // harvested trait is almost always a spelling mismatch
-                    // (the key is the trait's full `name_path()`).  List the
-                    // available multi-impl trait paths so the consumer can
-                    // correct it.
-                    let candidates: Vec<&String> = trait_impl_owners
-                        .iter()
-                        .filter(|(_, owners)| owners.len() >= 2)
-                        .map(|(path, _)| path)
-                        .collect();
-                    eprintln!(
-                        "register_trait_families: no harvested trait matches {trait_qualified:?}; \
-                     known multi-impl trait paths: {candidates:?}"
-                    );
-                    None
-                }
-            },
-        )
+        .filter_map(|trait_qualified| match trait_impl_owners.get(trait_qualified) {
+            Some(owners) => make_registration(trait_qualified, owners),
+            None => {
+                // Config validation: a named family that matches no
+                // harvested trait is almost always a spelling mismatch
+                // (the key is the trait's full `name_path()`).  List the
+                // available multi-impl trait paths so the consumer can
+                // correct it.
+                let candidates: Vec<&String> = trait_impl_owners
+                    .iter()
+                    .filter(|(_, owners)| owners.len() >= 2)
+                    .map(|(path, _)| path)
+                    .collect();
+                eprintln!(
+                    "register_trait_families: no harvested trait matches {trait_qualified:?}; \
+                 known multi-impl trait paths: {candidates:?}"
+                );
+                None
+            }
+        })
         .collect();
+    // Gated auto-population (issue #346, S2.3): with `PYRE_DYN_INDIRECT`
+    // on, register EVERY `>=2`-impl trait so its inline `dyn Trait`
+    // receiver (lowered to `CallTarget::Indirect`) narrows to the family
+    // base ClassDef.  Union with the config list (dedup by base_root),
+    // never replacing it, to stay forward-safe with the aheui census.
+    // MUST stay behind the gate: minting base/impl subclass classdefs
+    // perturbs `pyre_struct_root_names` → `ensure_session` inheritance-id
+    // numbering even off-path, so gate-OFF keeps the config-only (empty in
+    // prod) set byte-identical.  Applies the same within-family `dup_leaf`
+    // guard as the config path plus the cross-registry `struct_leaf_counts`
+    // bail: an impl leaf that also names a DIFFERENT registered struct
+    // would mis-seed the family, so skip it (fail-safe classdef-less).
+    if front::mir::dyn_indirect_enabled() {
+        let already: std::collections::HashSet<&str> = trait_family_registrations
+            .iter()
+            .map(|r| r.base_root.as_str())
+            .collect();
+        let mut auto: Vec<call::TraitFamilyRegistration> = trait_impl_owners
+            .iter()
+            .filter(|(trait_qualified, owners)| {
+                owners.len() >= 2 && !already.contains(trait_qualified.as_str())
+            })
+            .filter_map(|(trait_qualified, owners)| {
+                let reg = make_registration(trait_qualified, owners)?;
+                // Cross-registry leaf collision: an impl leaf shared by
+                // another qualified struct in the field registry would
+                // collapse the subclass onto that struct's classdef.
+                if let Some(dup) = reg
+                    .impl_roots
+                    .iter()
+                    .find(|leaf| struct_leaf_counts.get(leaf.as_str()).copied().unwrap_or(0) > 1)
+                {
+                    eprintln!(
+                        "register_trait_families: auto {trait_qualified:?} impl leaf {dup:?} \
+                         collides with another registered struct; skipping — leaf-keyed \
+                         seeding cannot disambiguate them"
+                    );
+                    return None;
+                }
+                Some(reg)
+            })
+            .collect();
+        // Deterministic mint order (BTreeMap iteration on `trait_impl_owners`
+        // is already sorted, but sort defensively since a HashMap seeded it).
+        auto.sort_by(|a, b| a.base_root.cmp(&b.base_root));
+        trait_family_registrations.extend(auto);
+    }
     call_control.set_trait_family_registrations(trait_family_registrations);
     let trait_unique_impls: std::collections::HashMap<String, String> = trait_impl_owners
         .into_iter()

@@ -2143,19 +2143,39 @@ pub fn translate_op(
                 // Instead lower to the same `getattr(receiver,
                 // method_name)` + `simple_call(bound_method, args[1..])`
                 // shape as `CallTarget::Method`.  The receiver `args[0]` is
-                // seeded as the trait-family base `ClassDef`
-                // (`derive_subject_inputcells`, this file ~:2741 via
-                // `pyre_trait_family_bases`, the #346 receiver-driven
-                // dispatch machinery), whose impl subclasses carry the
-                // methods through attrfamily merge — so the method getattr
-                // resolves the impl `MethodDesc` family and the trailing
-                // `simple_call` rtypes through the ordinary bound-method
-                // path (`rpbc.py:199 FunctionRepr.call`).  `trait_root` is
-                // not needed at this stage: the family the getattr resolves
-                // is keyed on the receiver's classdef, which the seeding
-                // already pinned to the same trait family
-                // `(trait_root, method_name)` names.
-                CallTarget::Indirect { method_name, .. } => {
+                // a `dyn Trait` call-result / deref TEMP annotated
+                // `SomeInstance(classdef=None)` — `dyn Trait` has no
+                // `class_root`, and `derive_subject_inputcells` (this file
+                // ~:2784, the #346 receiver seeder) only touches startblock
+                // inputargs, not temps — so the method getattr would block
+                // on the classdef-less shell.  Narrow the receiver first to
+                // the trait-family base `ClassDef` via the
+                // `__pyre_cast_instance` mechanism (same as slice A /
+                // `mir.rs:3725`, lowered at ~:1467 in this file): emit
+                // `simple_call(__pyre_cast_instance, receiver,
+                // Constant(byte_str(base_root)))` producing a narrowed
+                // receiver, then `getattr(narrowed, method_name)`.  The
+                // family base's impl subclasses carry the methods through
+                // attrfamily merge, so the getattr resolves the impl
+                // `MethodDesc` family and the trailing `simple_call` rtypes
+                // through the ordinary bound-method path
+                // (`rpbc.py:199 FunctionRepr.call`); dispatch stays virtual.
+                //
+                // The cast root must resolve through `pyre_struct_root_classes`
+                // to the base classdef `register_trait_family` minted under
+                // `canonical_struct_name(base_root)`.  `trait_root` here is
+                // the bare trait leaf (`dyn_indirect_target`), but the family
+                // base is keyed by the trait's full `name_path()`, so map the
+                // leaf back through `registered_trait_family_base_root`.  When
+                // no base is registered (unregistered / foreign trait, or an
+                // ambiguous same-leaf collision) the lookup returns `None`
+                // and the plain getattr is emitted — the receiver stays
+                // classdef-less and fails loud exactly as before, no cast to
+                // a non-existent root.
+                CallTarget::Indirect {
+                    method_name,
+                    trait_root,
+                } => {
                     let mut iter = arg_hls.into_iter();
                     let receiver = iter.next().ok_or_else(|| {
                         TyperError::message(
@@ -2163,21 +2183,50 @@ pub fn translate_op(
                                 .to_string(),
                         )
                     })?;
+                    let base_root = call_registry
+                        .bookkeeper()
+                        .registered_trait_family_base_root(&trait_root);
+                    let mut ops = Vec::with_capacity(3);
+                    // Narrow the receiver to the family base classdef when the
+                    // trait is a registered dispatch family.
+                    let getattr_receiver = if let Some(base_root) = base_root {
+                        let callable_host =
+                            HOST_ENV.lookup_builtin("__pyre_cast_instance").ok_or_else(|| {
+                                TyperError::message(
+                                    "__pyre_cast_instance missing from HOST_ENV bootstrap"
+                                        .to_string(),
+                                )
+                            })?;
+                        let narrowed = Hlvalue::Variable(Variable::new());
+                        ops.push(FlowspaceOp::new(
+                            "simple_call",
+                            vec![
+                                Hlvalue::Constant(Constant::new(ConstValue::HostObject(
+                                    callable_host,
+                                ))),
+                                receiver,
+                                Hlvalue::Constant(Constant::new(ConstValue::byte_str(&base_root))),
+                            ],
+                            narrowed.clone(),
+                        ));
+                        narrowed
+                    } else {
+                        receiver
+                    };
                     let bound_method = Hlvalue::Variable(Variable::new());
                     let mut call_args = Vec::with_capacity(iter.size_hint().0 + 1);
                     call_args.push(bound_method.clone());
                     call_args.extend(iter);
-                    Ok(vec![
-                        FlowspaceOp::new(
-                            "getattr",
-                            vec![
-                                receiver,
-                                Hlvalue::Constant(Constant::new(ConstValue::byte_str(method_name))),
-                            ],
-                            bound_method,
-                        ),
-                        FlowspaceOp::new("simple_call", call_args, result),
-                    ])
+                    ops.push(FlowspaceOp::new(
+                        "getattr",
+                        vec![
+                            getattr_receiver,
+                            Hlvalue::Constant(Constant::new(ConstValue::byte_str(method_name))),
+                        ],
+                        bound_method,
+                    ));
+                    ops.push(FlowspaceOp::new("simple_call", call_args, result));
+                    Ok(ops)
                 }
                 CallTarget::UnsupportedExpr => Err(TyperError::message(format!(
                     "translate_op: Call with CallTarget::UnsupportedExpr at \

@@ -621,6 +621,28 @@ impl Bookkeeper {
             .any(|path| path.rsplit("::").next().unwrap_or(path) == leaf)
     }
 
+    /// Resolve a bare trait `leaf` to the unique registered dispatch-family
+    /// base spelling ([`Self::pyre_trait_family_bases`] key = the trait's
+    /// full `name_path()`).  The inline-Field `CallTarget::Indirect` carries
+    /// the trait by leaf (`dyn_indirect_target` strips the vtable path to its
+    /// leaf, matching `register_trait_method`), but the receiver-narrowing
+    /// cast (`__pyre_cast_instance`) and the family base mint both key on the
+    /// qualified spelling — so the leaf must map back to it.  Returns `None`
+    /// when the leaf matches no family or matches more than one qualified
+    /// path (ambiguous — the caller then keeps the classdef-less receiver
+    /// rather than casting to an arbitrary base).
+    pub fn registered_trait_family_base_root(&self, leaf: &str) -> Option<String> {
+        let bases = self.pyre_trait_family_bases.borrow();
+        let mut matches = bases
+            .keys()
+            .filter(|path| path.rsplit("::").next().unwrap_or(path) == leaf);
+        let first = matches.next()?.clone();
+        match matches.next() {
+            Some(_) => None,
+            None => Some(first),
+        }
+    }
+
     /// No upstream equivalent — forced by pyre's numbering order, not a
     /// casual workaround.  Upstream runs `assign_inheritance_ids` ONCE
     /// inside `RPythonTyper.specialize`, AFTER `annotator.complete()`

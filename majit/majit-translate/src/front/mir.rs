@@ -12025,7 +12025,7 @@ fn tuple_per_shape_enabled() -> bool {
 /// `__dyn_call` residual (see the `(CallClass::Dynamic, ..)` arm).
 /// Default-OFF — `PYRE_DYN_INDIRECT=1` opts in; every other value (unset
 /// included) keeps the inert `__dyn_call` emit.
-fn dyn_indirect_enabled() -> bool {
+pub(crate) fn dyn_indirect_enabled() -> bool {
     matches!(
         std::env::var("PYRE_DYN_INDIRECT").as_deref(),
         Ok("1") | Ok("true")
