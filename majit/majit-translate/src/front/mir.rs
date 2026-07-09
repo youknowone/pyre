@@ -4633,6 +4633,57 @@ impl<'a> Lowering<'a> {
         }
     }
 
+    /// Decode an inline-Field `dyn Trait` call operand into the
+    /// `(trait_root, method_name)` pair the `CallTarget::Indirect`
+    /// vtable-dispatch pipeline keys on.
+    ///
+    /// The inline dispatch reads the method fn-ptr straight out of the
+    /// receiver's vtable — the operand's terminal projection is
+    /// `Field[Adt(vtable_id), slot]` off `(*recv).vtable`, where the
+    /// vtable type is the `<Trait>::{vtable}` struct and the slot field
+    /// is named `method_<name>`.  Returns `None` for any other operand
+    /// shape (the one-hop `Option<fn-ptr>` deref and `call_once` closure
+    /// shims are bare locals / non-`Field[Adt]` projections), which keeps
+    /// those on the synthetic `__dyn_call` path.
+    fn dyn_indirect_target(&self, dyn_operand: &Operand) -> Option<(String, String)> {
+        let place = match dyn_operand {
+            Operand::Copy(p) | Operand::Move(p) => p,
+            Operand::Const(_) => return None,
+        };
+        let PlaceKind::Projection(_, elem) = &place.kind else {
+            return None;
+        };
+        let ProjectionElem::Tagged(v) = elem else {
+            return None;
+        };
+        let field_payload = v.as_object()?.get("Field")?;
+        // The terminal container must be an `Adt` (the vtable struct);
+        // decode its type id the same two ways `resolve_adt_field` does
+        // (bare u64 or `{id:{Adt}}` head), never hardcoding a value.
+        let arr = field_payload.as_array()?;
+        let container = arr.first()?.as_object()?;
+        let adt = container.get("Adt")?.as_array()?;
+        let head = adt.first()?;
+        let vtable_id = match head.as_u64() {
+            Some(id) => id,
+            None => head.get("id")?.get("Adt")?.as_u64()?,
+        };
+        // `resolve_adt_field` names the slot `method_<name>`; strip the
+        // prefix for the trait method leaf.
+        let (_owner, field_name, _ty, _id) = self.resolve_adt_field(field_payload)?;
+        let method_name = field_name.strip_prefix("method_")?.to_string();
+        // The vtable type is spelled `<path>::<Trait>::{vtable}`; the
+        // trait_root the family lookup keys on is the bare trait leaf
+        // (matching `register_trait_method`, which registers under
+        // `SemanticFunction.trait_root` = the trait's leaf name).
+        let vtable_path = self.llbc.type_by_id(vtable_id)?.item_meta.name_path();
+        let trait_path = vtable_path
+            .strip_suffix("::{vtable}")
+            .unwrap_or(vtable_path.as_str());
+        let trait_root = trait_path.rsplit("::").next()?.to_string();
+        Some((trait_root, method_name))
+    }
+
     /// Resolve a global `def_id` to its fully-qualified path segments
     /// via the reader's `global_decls` table.
     fn global_segments(&self, mir_bb: usize, def_id: u64) -> Result<Vec<String>, LowerError> {
@@ -6079,23 +6130,45 @@ impl<'a> Lowering<'a> {
                 }
             }
             (CallClass::Dynamic, CallFunc::Dynamic(dyn_operand)) => {
-                // `dyn Trait` virtual call. The fat-pointer receiver
-                // is carried in `dyn_operand`; thread it into `args[0]`
-                // and emit a synthetic `__dyn_call` path so the
-                // codewriter sees a uniform `Call` shape.  A faithful
-                // lowering would emit `VtableMethodPtr` + `IndirectCall`;
-                // that needs the trait_root/method_name pair Charon does
-                // not yet surface.
-                let recv = self.resolve_operand(mir_bb, dyn_operand)?;
-                let mut full_args = Vec::with_capacity(args.len() + 1);
-                full_args.push(recv);
-                full_args.extend(args);
-                OpKind::Call {
-                    target: CallTarget::FunctionPath {
-                        segments: vec!["__dyn_call".to_string()],
-                    },
-                    args: full_args,
-                    result_ty,
+                // `dyn Trait` virtual call.  The inline-dispatch form reads
+                // the method fn-ptr straight out of the receiver's vtable
+                // (`(*recv).vtable.method_<name>`), so the operand's
+                // terminal projection is `Field[Adt(vtable_id), slot]`.
+                // Route those through the faithful `CallTarget::Indirect`
+                // vtable pipeline (`rpbc::lower_indirect_calls` →
+                // `VtableMethodPtr` + `IndirectCall`, carrying the full
+                // impl family) instead of the synthetic `__dyn_call`.  The
+                // call args already carry the receiver in `args[0]` (the
+                // operand projection's base local), which is exactly the
+                // receiver slot `IndirectCall` expects, so the arg list
+                // passes through unchanged.
+                //
+                // Any other operand shape — the one-hop `Option<fn-ptr>`
+                // deref and `call_once` closure shims — is a stored
+                // fn-ptr / `FnOnce`, not a vtable slot; it keeps the
+                // synthetic `__dyn_call` path (the fat-pointer receiver
+                // threaded into `args[0]`).
+                let indirect = dyn_indirect_enabled()
+                    .then(|| self.dyn_indirect_target(&dyn_operand))
+                    .flatten();
+                if let Some((trait_root, method_name)) = indirect {
+                    OpKind::Call {
+                        target: CallTarget::indirect(trait_root, method_name),
+                        args,
+                        result_ty,
+                    }
+                } else {
+                    let recv = self.resolve_operand(mir_bb, dyn_operand)?;
+                    let mut full_args = Vec::with_capacity(args.len() + 1);
+                    full_args.push(recv);
+                    full_args.extend(args);
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath {
+                            segments: vec!["__dyn_call".to_string()],
+                        },
+                        args: full_args,
+                        result_ty,
+                    }
                 }
             }
             (CallClass::Ptr, _) => {
@@ -11933,6 +12006,18 @@ fn tuple_per_shape_enabled() -> bool {
     !matches!(
         std::env::var("PYRE_TUPLE_PER_SHAPE_CLASSDEF").as_deref(),
         Ok("0") | Ok("false")
+    )
+}
+
+/// Route inline-Field `dyn Trait` virtual calls through the faithful
+/// `CallTarget::Indirect` vtable pipeline instead of the synthetic
+/// `__dyn_call` residual (see the `(CallClass::Dynamic, ..)` arm).
+/// Default-OFF — `PYRE_DYN_INDIRECT=1` opts in; every other value (unset
+/// included) keeps the inert `__dyn_call` emit.
+fn dyn_indirect_enabled() -> bool {
+    matches!(
+        std::env::var("PYRE_DYN_INDIRECT").as_deref(),
+        Ok("1") | Ok("true")
     )
 }
 
