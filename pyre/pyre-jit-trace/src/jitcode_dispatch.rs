@@ -12057,9 +12057,20 @@ fn try_walker_call_assembler_self_recursive(
     let nlocals = callee_code.varnames.len();
     let max_stack = callee_code.max_stackdepth as usize;
 
-    // Unbox the boxed int argument -> raw payload, re-boxed inside the new
-    // callee frame.  Mirror of `trace_guarded_int_payload(args[0])`.
+    // Unbox the boxed int argument -> raw payload, then re-box it into the
+    // callee's `locals[0]` through `walker_box_int` so the local carries the
+    // same representation the callee was traced against.  Under
+    // `CAN_BE_TAGGED` a small `int` becomes a tagged immediate (`ll_int_box`);
+    // a heap-only re-box (`emit_box_int_inline`) would force a `W_IntObject`
+    // and the callee's speculative low-bit guard on the local would deopt on
+    // every recursion.  Under `!CAN_BE_TAGGED` `walker_box_int` falls back to
+    // `wrapint` (= `emit_box_int_inline`), so the emitted ops are unchanged.
+    // Mirror of `trace_guarded_int_payload(args[0])`.
     let raw_arg = walker_unbox_int(ctx, op.pc, r_args[2], int_type_addr)?;
+    let arg_box = match ctx.trace_ctx.box_value(raw_arg) {
+        Some(majit_ir::Value::Int(v)) => walker_box_int(ctx, op.pc, raw_arg, v)?,
+        _ => crate::state::wrapint(ctx.trace_ctx, raw_arg),
+    };
 
     // Execution-context red: recover it fresh off the materialized caller
     // portal frame via `GETFIELD_GC_R(frame, execution_context_descr)` rather
@@ -12084,7 +12095,7 @@ fn try_walker_call_assembler_self_recursive(
     let w_globals_obj_const = ctx.trace_ctx.const_ref(callee_globals_obj as i64);
     let callee_frame = crate::helpers::emit_new_pyframe_inline_self_recursive(
         ctx.trace_ctx,
-        raw_arg,
+        arg_box,
         nlocals + max_stack,
         nlocals,
         pycode_const,

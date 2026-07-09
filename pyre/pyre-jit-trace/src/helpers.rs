@@ -1249,7 +1249,7 @@ pub fn emit_new_pyframe_inline_with_params(
 
 pub fn emit_new_pyframe_inline_self_recursive(
     ctx: &mut TraceCtx,
-    raw_int_arg: OpRef,
+    arg_box: OpRef,
     array_size: usize,
     valuestackdepth: usize,
     pycode: OpRef,
@@ -1257,15 +1257,21 @@ pub fn emit_new_pyframe_inline_self_recursive(
     ec: OpRef,
 ) -> OpRef {
     use crate::descr::{
-        int_intval_descr, pyframe_code_descr, pyframe_execution_context_descr,
-        pyframe_locals_cells_stack_descr, pyframe_next_instr_descr, pyframe_size_descr,
-        pyframe_stack_depth_descr, pyframe_w_globals_obj_descr, w_int_size_descr,
+        pyframe_code_descr, pyframe_execution_context_descr, pyframe_locals_cells_stack_descr,
+        pyframe_next_instr_descr, pyframe_size_descr, pyframe_stack_depth_descr,
+        pyframe_w_globals_obj_descr,
     };
     use crate::state::pyobject_gcarray_descr;
 
-    // Step 1 — box the raw int into a fresh W_IntObject. Mirrors the
-    // `w_int_new(raw_int_arg)` call inside the opaque helper.
-    let boxed = emit_box_int_inline(ctx, raw_int_arg, w_int_size_descr(), int_intval_descr());
+    // Step 1 — `locals[0]` receives the caller's already-boxed positional
+    // argument box.  The caller supplies the shape-correct box so the callee
+    // reads back the same representation it was traced against: under
+    // `CAN_BE_TAGGED` a small `int` stays a tagged immediate (`ll_int_box`),
+    // otherwise a heap `W_IntObject` (`w_int_new` fallback).  Re-boxing a raw
+    // payload heap-side here would force a heap box even when the value fits
+    // the tagged range, and the callee's speculative low-bit guard on the
+    // local would then deopt on every recursion.
+    let boxed = arg_box;
 
     // Step 2 — allocate the locals_cells_stack_w array. `NewArrayClear`
     // zeros every slot so any future LOAD_FAST on an unbound local
