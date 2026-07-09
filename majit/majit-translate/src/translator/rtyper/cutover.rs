@@ -2736,6 +2736,15 @@ fn classify_unported_reason(reason: &str) -> &'static str {
     // ── annotator-stage catch-alls ──
     else if reason.contains("UnionError") {
         "UNION-ERROR (generic-ADT phi / pair)"
+    } else if reason.contains("setbinding: new value does not contain old") {
+        // A binding moved backwards in the lattice: a variable's
+        // `SomeInteger.knowntypedata` (or instance) annotation refined from
+        // a generic to a per-instantiation classdef between fixpoint passes
+        // (`Option` -> `Option<Result<*mut PyObject,PyError>>`), so
+        // `contains` (union == self) is false. Same per-instantiation
+        // classdef monotonicity as the mergeinputargs `UnionError` bucket —
+        // fixed by the same generic-ADT union work, so it shares the label.
+        "UNION-ERROR (generic-ADT phi / pair)"
     } else if reason.contains("Blocked block -- operation cannot succeed") {
         "BLOCKED-BLOCK (annotation dead-end downstream)"
     } else if reason.contains("compute_at_fixpoint failed")
@@ -3325,6 +3334,25 @@ mod tests {
         assert!(
             is_known_unported(msg),
             "noneify-on-ptr merge must skip/fallback on the typed-null-pointer-lowering gap"
+        );
+    }
+
+    #[test]
+    fn setbinding_backwards_binding_classifies_as_union_adt() {
+        // `unary_invert`/`unary_negative`/`descroperation::{invert,neg}` fail
+        // when a `SomeInteger.knowntypedata` inner annotation refines from a
+        // generic `Option` to a per-instantiation `Option<Result<..>>`
+        // classdef between passes — the same generic-ADT union gap that the
+        // mergeinputargs `UnionError` failures carry, one lattice step later.
+        let msg = "setbinding: new value does not contain old (Integer(SomeInteger { \
+                   knowntypedata: Some({Int(1): {v: Instance(Option<Result<*mut \
+                   PyObject,PyError>>::Some)}}) }) ⊄ Integer(SomeInteger { \
+                   knowntypedata: Some({Int(1): {v: Instance(Option::Some)}}) }))";
+        assert_eq!(
+            classify_unported_reason(msg),
+            "UNION-ERROR (generic-ADT phi / pair)",
+            "backwards setbinding on per-instantiation classdef knowntypedata \
+             shares the generic-ADT union disposition, not UNCLASSIFIED"
         );
     }
 
