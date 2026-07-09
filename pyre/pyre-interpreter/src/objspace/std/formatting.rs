@@ -182,16 +182,16 @@ unsafe fn number_arg_decimal(spec: &CFormatSpec, obj: PyObjectRef) -> Result<Big
         )?;
         return Ok(arg_to_bigint(pyint));
     }
-    if has_dunder(obj, "__index__") {
-        return Ok(crate::builtins::obj_to_bigint(
-            crate::baseobjspace::space_index(obj)?,
-        ));
-    }
     if let Some(method) = crate::baseobjspace::lookup(obj, "__int__") {
         let r = crate::builtins::call_and_check(method, &[obj])?;
         if is_int_like(r) || is_long(r) {
             return Ok(arg_to_bigint(r));
         }
+    }
+    if has_dunder(obj, "__index__") {
+        return Ok(crate::builtins::obj_to_bigint(
+            crate::baseobjspace::space_index(obj)?,
+        ));
     }
     Err(number_type_error(spec, obj, "a real number is required"))
 }
@@ -240,9 +240,12 @@ unsafe fn char_arg(obj: PyObjectRef) -> Result<CodePoint, PyError> {
     } else if has_dunder(obj, "__index__") {
         crate::builtins::obj_to_bigint(crate::baseobjspace::space_index(obj)?)
     } else {
+        let tn = match crate::typedef::r#type(obj) {
+            Some(w_type) => crate::baseobjspace::type_repr_qualified_name(w_type),
+            None => crate::baseobjspace::object_functionstr_type_name(obj),
+        };
         return Err(PyError::type_error(format!(
-            "%c requires an int or a unicode character, not {}",
-            crate::baseobjspace::object_functionstr_type_name(obj),
+            "%c requires an int or a unicode character, not {tn}"
         )));
     };
     let overflow = || {
@@ -273,7 +276,7 @@ unsafe fn update_quantity_from_tuple(
     if !matches!(quantity, Some(CFormatQuantity::FromValuesTuple)) {
         return Ok(());
     }
-    let v = star_int(pos.next())?;
+    let v = star_int(pos.next(), StarField::Width)?;
     if v < 0 {
         flags.insert(CConversionFlags::LEFT_ADJUST);
     }
@@ -293,22 +296,37 @@ unsafe fn update_precision_from_tuple(
     ) {
         return Ok(());
     }
-    let v = star_int(pos.next())?;
+    let v = star_int(pos.next(), StarField::Precision)?;
     *precision = Some(CFormatPrecision::Quantity(CFormatQuantity::Amount(
         v.max(0) as usize,
     )));
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum StarField {
+    Width,
+    Precision,
+}
+
 /// The `*` argument must be an int; consume it, matching `nextinputvalue`.
-unsafe fn star_int(arg: Option<PyObjectRef>) -> Result<i64, PyError> {
+unsafe fn star_int(arg: Option<PyObjectRef>, field: StarField) -> Result<i64, PyError> {
     let Some(arg) = arg else {
         return Err(PyError::type_error(
             "not enough arguments for format string",
         ));
     };
-    if !is_int_like(arg) {
+    if !pyre_object::pyobject::is_int_or_long(arg) {
         return Err(PyError::type_error("* wants int"));
     }
-    Ok(int_value(arg))
+    let big = crate::builtins::obj_to_bigint(arg);
+    use num_traits::ToPrimitive;
+    match field {
+        StarField::Width => big.to_i64().ok_or_else(|| {
+            PyError::overflow_error("Python int too large to convert to C ssize_t")
+        }),
+        StarField::Precision => big.to_i32().map(|v| v as i64).ok_or_else(|| {
+            PyError::overflow_error("Python int too large to convert to C int")
+        }),
+    }
 }
