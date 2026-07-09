@@ -2597,6 +2597,11 @@ pub unsafe fn w_dict_getitem_str_proxy_first(obj: PyObjectRef, key: &str) -> Opt
 /// Dispatches through the polymorphic strategy slot so module dicts
 /// fan out via `ModuleDictStrategy::setitem_str` and regular dicts
 /// via `ObjectDictStrategy::setitem_str`.
+///
+/// Residualise the setitem_str leaf (`@dont_look_inside`,
+/// `rlib/jit.py:139`): the strategy dispatch it wraps mutates
+/// runtime-mutable dict storage the tracer cannot model.
+#[majit_macros::dont_look_inside]
 pub unsafe fn w_dict_setitem_str(obj: PyObjectRef, key: &str, value: PyObjectRef) {
     w_dict_get_strategy(obj).setitem_str(obj, key, value)
 }
@@ -3120,6 +3125,11 @@ pub unsafe fn w_module_dict_clear_inner(obj: PyObjectRef) {
 /// `pypy/objspace/std/dictmultiobject.py:107-109 W_DictMultiObject.length`
 /// — `return self.get_strategy().length(self)`.  Dispatches through
 /// the polymorphic strategy slot.
+///
+/// Residualise the length leaf (`@dont_look_inside`,
+/// `rlib/jit.py:139`): the strategy dispatch it wraps reads
+/// runtime-mutable dict storage the tracer cannot model.
+#[majit_macros::dont_look_inside]
 pub unsafe fn w_dict_len(obj: PyObjectRef) -> usize {
     w_dict_get_strategy(obj).length(obj)
 }

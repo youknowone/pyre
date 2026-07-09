@@ -528,6 +528,18 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     );
     push_alias_pair(
         &mut entries,
+        "pyre_object::dictmultiobject::w_dict_len",
+        "pyre_object::w_dict_len",
+        pyre_object::dictmultiobject::w_dict_len as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dictmultiobject::w_dict_setitem_str",
+        "pyre_object::w_dict_setitem_str",
+        pyre_object::dictmultiobject::w_dict_setitem_str as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
         "pyre_object::dictmultiobject::w_module_dict_new_with_storage_proxy",
         "pyre_object::w_module_dict_new_with_storage_proxy",
         pyre_object::dictmultiobject::w_module_dict_new_with_storage_proxy as *const (),
