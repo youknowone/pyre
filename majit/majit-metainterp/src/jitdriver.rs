@@ -3800,16 +3800,17 @@ impl<S: JitState> JitDriver<S> {
             let src = exit_layout.source_op_index;
             let (result, flavor) = match src {
                 None => ("nosrc", "-"),
-                Some(idx) => match self.meta.exit_guard_opcode(
-                    exit_layout.rd_loop_token,
-                    trace_id,
-                    idx,
-                ) {
-                    Some(majit_ir::OpCode::GuardTrue) => ("branch", "T"),
-                    Some(majit_ir::OpCode::GuardFalse) => ("branch", "F"),
-                    Some(_other) => ("nonbranch", "-"),
-                    None => ("nosrc", "-"),
-                },
+                Some(idx) => {
+                    match self
+                        .meta
+                        .exit_guard_opcode(exit_layout.rd_loop_token, trace_id, idx)
+                    {
+                        Some(majit_ir::OpCode::GuardTrue) => ("branch", "T"),
+                        Some(majit_ir::OpCode::GuardFalse) => ("branch", "F"),
+                        Some(_other) => ("nonbranch", "-"),
+                        None => ("nosrc", "-"),
+                    }
+                }
             };
             eprintln!(
                 "M73_FLAVOR result={result} flavor={flavor} src={src:?} trace_id={trace_id} fail_index={fail_index}"

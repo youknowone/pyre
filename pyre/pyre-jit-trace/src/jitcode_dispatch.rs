@@ -9463,26 +9463,32 @@ fn decode_side_other_target(
         return Err("notgoto");
     }
     let target = read_label(code, &goto, 1);
-    let raw = if flavor_guard_true { target } else { goto.next_pc };
+    let raw = if flavor_guard_true {
+        target
+    } else {
+        goto.next_pc
+    };
     Ok(resolve_branch_target_through_trampoline(code, raw))
 }
 
-/// #73 S3.5 decode: if `carried` is a tagged branch `orgpc` (negative-space
+/// #73 S4 decode: if `carried` is a tagged branch `orgpc` (negative-space
 /// encoding, [`majit_ir::resumedata::encode_branch_orgpc`]), expand it to the
-/// block-head resume marker exactly as the baseline would have carried it —
-/// `decode_side_other_target` picks the not-taken arm from `orgpc` + flavor,
-/// then the SAME inversion + forward trivia-skip + `resume_jitcode_pc_for` the
-/// real capture used (10166-10191). Non-tagged words (offsets `>= 0`,
-/// `NO_JITCODE_PC`) pass through unchanged, so this is a no-op whenever the flip
-/// is off (`decode_branch_orgpc` returns `None`).
+/// genuine not-taken-arm jitcode offset (`derived` / other_target) DIRECTLY:
+/// `decode_side_other_target` picks the not-taken arm from `orgpc` + flavor and
+/// that jitcode offset IS the returned value. The former py_pc round-trip
+/// (`python_pc_for_jitcode_pc` -> `skip_python_trivia_forward` ->
+/// `resume_jitcode_pc_for`, with its `num_instrs` overshoot clamp) is deleted:
+/// it is byte-identical because the encode self-cert
+/// (`walker_capture_snapshot_for_last_guard_impl`) tags a word ONLY when this
+/// same `expand_branch_carried` yields `derived == marker`, so returning
+/// `derived` reproduces exactly the marker the round-trip would have. Non-tagged
+/// words (offsets `>= 0`, `NO_JITCODE_PC`) pass through unchanged, so this is a
+/// no-op whenever the flip is off (`decode_branch_orgpc` returns `None`).
 ///
-/// Returns `NO_JITCODE_PC` if the arm cannot be decoded, so the decoder falls
-/// back to the stored `py_pc` path. In particular an OVERSHOOT (`py_pc >=
-/// num_instrs`) is treated as a decode FAILURE rather than guessing the real
-/// capture's `entry_py_pc` clamp target (a per-walk value not available here):
-/// the encode self-cert re-runs this exact function and declines to carry any
-/// tagged word whose reconstruction overshoots, so a genuinely-carried tagged
-/// word never reaches the overshoot leg.
+/// Returns `NO_JITCODE_PC` only if the arm cannot be decoded, so the decoder
+/// falls back to the stored `py_pc` path; the encode self-cert declines to carry
+/// any tagged word whose reconstruction fails, so a genuinely-carried tagged
+/// word never reaches that leg.
 pub(crate) fn expand_branch_carried(payload: &crate::PyJitCode, carried: i32) -> i32 {
     match majit_ir::resumedata::decode_branch_orgpc(carried) {
         None => carried,
@@ -9490,23 +9496,7 @@ pub(crate) fn expand_branch_carried(payload: &crate::PyJitCode, carried: i32) ->
             let code = payload.jitcode.code.as_slice();
             match decode_side_other_target(code, orgpc, flavor) {
                 Err(_) => majit_ir::resumedata::NO_JITCODE_PC,
-                Ok(derived) => {
-                    let mut py = python_pc_for_jitcode_pc(&payload.metadata, derived);
-                    if !payload.code_ptr.is_null() {
-                        let co = unsafe { &*payload.code_ptr };
-                        py = skip_python_trivia_forward(co, py as usize) as u32;
-                    }
-                    let num_instrs = payload.metadata.first_jit_pc_by_py_pc.len();
-                    if py as usize >= num_instrs {
-                        // Overshoot: the real capture clamps to `ctx.entry_py_pc`
-                        // (a per-walk value absent at decode). Decode-failure →
-                        // py_pc fallback; encode self-cert never tags such a word.
-                        return majit_ir::resumedata::NO_JITCODE_PC;
-                    }
-                    payload
-                        .resume_jitcode_pc_for(py as usize)
-                        .map_or(majit_ir::resumedata::NO_JITCODE_PC, |m| m as i32)
-                }
+                Ok(derived) => derived as i32,
             }
         }
     }
@@ -10794,10 +10784,7 @@ fn walker_capture_snapshot_for_last_guard_impl(
                     if is_branch {
                         match marker {
                             None => {
-                                eprintln!(
-                                    "M73_BRANCH eq=nomarker py_pc={} op_pc={}",
-                                    py_pc, op_pc
-                                );
+                                eprintln!("M73_BRANCH eq=nomarker py_pc={} op_pc={}", py_pc, op_pc);
                             }
                             Some(m) if op_pc == m => {
                                 eprintln!("M73_BRANCH eq=1 py_pc={} op_pc={}", py_pc, op_pc);
@@ -10816,8 +10803,7 @@ fn walker_capture_snapshot_for_last_guard_impl(
                                 //     (self-masking), so `inv_*` is the real signal.
                                 let (inv_pp, decodable) = unsafe {
                                     let jc = &*sym.jitcode;
-                                    let inv =
-                                        python_pc_for_jitcode_pc(&jc.payload.metadata, op_pc);
+                                    let inv = python_pc_for_jitcode_pc(&jc.payload.metadata, op_pc);
                                     let dec = jc
                                         .payload
                                         .jitcode
@@ -10839,7 +10825,9 @@ fn walker_capture_snapshot_for_last_guard_impl(
                                     && banks_o.ref_ == banks_m.ref_
                                     && banks_o.float == banks_m.float;
                                 let bm_o = crate::state::bridge_semantic_maps_at_with_jitcode_pc(
-                                    ji, pp, op_pc as i32,
+                                    ji,
+                                    pp,
+                                    op_pc as i32,
                                 );
                                 let bm_m = crate::state::bridge_semantic_maps_at_with_jitcode_pc(
                                     ji, pp, m as i32,
@@ -10939,7 +10927,8 @@ fn walker_capture_snapshot_for_last_guard_impl(
                                                 py = skip_python_trivia_forward(
                                                     code_obj,
                                                     py as usize,
-                                                ) as u32;
+                                                )
+                                                    as u32;
                                             }
                                             let num_instrs = meta.first_jit_pc_by_py_pc.len();
                                             if py as usize >= num_instrs {
@@ -10949,9 +10938,8 @@ fn walker_capture_snapshot_for_last_guard_impl(
                                             }
                                         };
                                         let invpp_eq = py_pc_cand == py_pc;
-                                        let flip_marker = jc
-                                            .payload
-                                            .resume_jitcode_pc_for(py_pc_cand as usize);
+                                        let flip_marker =
+                                            jc.payload.resume_jitcode_pc_for(py_pc_cand as usize);
                                         let marker_eq = flip_marker == Some(m);
                                         // Whether the flip's carried word (`orgpc`)
                                         // genuinely differs from today's (`m`): a
@@ -11040,8 +11028,7 @@ fn walker_capture_snapshot_for_last_guard_impl(
                             );
                             let jc = unsafe { &*sym.jitcode };
                             let code = jc.payload.jitcode.code.as_slice();
-                            if let Ok(derived) =
-                                decode_side_other_target(code, orgpc, flavor_true)
+                            if let Ok(derived) = decode_side_other_target(code, orgpc, flavor_true)
                             {
                                 let derived_eq_marker = derived as i32 == m as i32;
                                 // Whether the walk cursor could key at `derived`
@@ -11067,7 +11054,9 @@ fn walker_capture_snapshot_for_last_guard_impl(
                                     && banks_d.float == banks_m.float;
                                 // (b) bridge semantic maps (depth + pcdep).
                                 let bm_d = crate::state::bridge_semantic_maps_at_with_jitcode_pc(
-                                    ji, pp, derived as i32,
+                                    ji,
+                                    pp,
+                                    derived as i32,
                                 );
                                 let bm_m = crate::state::bridge_semantic_maps_at_with_jitcode_pc(
                                     ji, pp, m as i32,
@@ -20268,7 +20257,11 @@ fn handle(
                                 reason, orgpc, other_target, switchcase
                             ),
                             Ok(derived) => {
-                                let r = if derived == other_target { "match" } else { "mismatch" };
+                                let r = if derived == other_target {
+                                    "match"
+                                } else {
+                                    "mismatch"
+                                };
                                 eprintln!(
                                     "M73_ARM result={} orgpc={} other_target={} derived={} switchcase={}",
                                     r, orgpc, other_target, derived, switchcase
@@ -22293,8 +22286,8 @@ mod tests {
                 vstack_cur_pypc: 0,
                 vstack_valid: false,
                 vstack_last_ref: OpRef::NONE,
-            live_before_jit_pc: usize::MAX,
-            live_after_jit_pc: usize::MAX,
+                live_before_jit_pc: usize::MAX,
+                live_after_jit_pc: usize::MAX,
             };
             let op = DecodedOp {
                 key,

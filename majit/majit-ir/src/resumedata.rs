@@ -638,15 +638,22 @@ mod after_residual_call_pc_tests {
 
 #[cfg(test)]
 mod branch_orgpc_tag_tests {
-    use super::{
-        BRANCH_ORGPC_MAX, NO_JITCODE_PC, decode_branch_orgpc, encode_branch_orgpc,
-    };
+    use super::{BRANCH_ORGPC_MAX, NO_JITCODE_PC, decode_branch_orgpc, encode_branch_orgpc};
 
     #[test]
     fn roundtrips_across_orgpc_and_flavor() {
         // #73 S3.5: every (orgpc, flavor) in range tags into the negative space
         // and decodes back exactly, including the two endpoints.
-        for orgpc in [0usize, 1, 2, 7, 100, 8191, BRANCH_ORGPC_MAX - 1, BRANCH_ORGPC_MAX] {
+        for orgpc in [
+            0usize,
+            1,
+            2,
+            7,
+            100,
+            8191,
+            BRANCH_ORGPC_MAX - 1,
+            BRANCH_ORGPC_MAX,
+        ] {
             for flavor in [false, true] {
                 let word = encode_branch_orgpc(orgpc, flavor);
                 assert!(word <= -2, "tagged word {word} must land in negative space");
