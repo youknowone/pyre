@@ -7475,7 +7475,30 @@ impl CodeWriter {
                     //   op2 = -live- (for do_recursive_call / guard resume)
                     // The per-PC emit_live_placeholder!() after this block
                     // serves as op2; op3 is emitted inside the block below.
-                    if loop_header_pcs.contains(&py_pc) {
+                    // An explicit `raise X` covered by a try closes its block
+                    // with a single exception exit carrying `explicit_raise_value`
+                    // (`emit_raise!` set `needs_fallthrough = false`).  When that
+                    // block's fall-through PC is itself a loop header — the target
+                    // of the handler's back-edge — `emit_mark_label_pc!` cannot
+                    // switch away from the closed block until the joinpoint block
+                    // exists, so `current_block` is still the raise block here.
+                    // Emitting the loop-header `jit_merge_point` into it appends
+                    // the merge op AFTER the raise's operations; `insert_exits`
+                    // then serialises the block ops (including that merge) BEFORE
+                    // the `raise` op, so a blackhole guard-resume into this arm
+                    // reaches the merge and `ContinueRunningNormally`s (loops back)
+                    // before executing the `raise`, dropping the handler.  The
+                    // `jit_merge_point` belongs to the real loop-header block,
+                    // emitted when that PC is walked through its own joinpoint;
+                    // suppress it on a closed explicit-raise block (mirrors the
+                    // `block_closed_by_terminator` op-dispatch gate below).
+                    let closed_by_explicit_raise = current_block
+                        .block()
+                        .borrow()
+                        .exits
+                        .iter()
+                        .any(|e| e.borrow().explicit_raise_value.is_some());
+                    if loop_header_pcs.contains(&py_pc) && !closed_by_explicit_raise {
                         // jtransform.py:1710-1711 op3: -live- before
                         // jit_merge_point, "for inlined short preambles".
                         emit_live_placeholder!();
