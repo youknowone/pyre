@@ -1540,6 +1540,14 @@ where
             if frame.inline_frame {
                 ctx.pop_inline_frame();
             }
+            // pyjitpl.py:2556 finishframe_exception -> popframe(
+            // leave_portal_frame=True): a portal frame whose push recorded
+            // ENTER_PORTAL_FRAME unwinds through here, so record the matching
+            // LEAVE_PORTAL_FRAME just as the normal-return pop does.
+            if frame.portal_entered {
+                let jd_box = ctx.const_int(frame.portal_jd as i64);
+                ctx.record_op(OpCode::LeavePortalFrame, &[jd_box]);
+            }
             // [FR] A recursive-portal INLINE frame installed its callee's
             // fresh standard vable on push; restore the caller's on return.
             if frame.portal_vable_saved {
@@ -2130,6 +2138,14 @@ where
             let uid_box = ctx.const_int(green_pc as i64);
             ctx.record_op(OpCode::EnterPortalFrame, &[jd_box, uid_box]);
             portal_frame.inline_frame = true;
+            // pyjitpl.py:2461-2492 pairing: this push recorded ENTER_PORTAL_FRAME,
+            // so the frame's normal-return / exception-return pop records the
+            // matching LEAVE_PORTAL_FRAME (popframe leave_portal_frame default
+            // True). The merge-point cut path pops this frame itself and re-emits
+            // LEAVE (leave_portal_frame=False), so it never flows through those
+            // auto-LEAVE pops.
+            portal_frame.portal_entered = true;
+            portal_frame.portal_jd = jd_index;
             for (kind, caller_src, callee_dst) in arg_triples {
                 match kind {
                     JitArgKind::Int => {
@@ -2423,6 +2439,15 @@ where
             let finished_frame = self.frames.pop().expect("finished frame stack was empty");
             if finished_frame.inline_frame {
                 ctx.pop_inline_frame();
+            }
+            // pyjitpl.py:2506 finishframe -> popframe(leave_portal_frame=True):
+            // a portal frame whose push recorded ENTER_PORTAL_FRAME returns
+            // normally here, so record the matching LEAVE_PORTAL_FRAME. Ordinary
+            // BC_INLINE_CALL frames (inline_frame=true, portal_entered=false)
+            // recorded no ENTER and record no LEAVE.
+            if finished_frame.portal_entered {
+                let jd_box = ctx.const_int(finished_frame.portal_jd as i64);
+                ctx.record_op(OpCode::LeavePortalFrame, &[jd_box]);
             }
             // [FR] Restore the caller's sym scalar/fixed-array state that this
             // inline recursive-portal frame overwrote, and its nested vable.
@@ -7679,6 +7704,26 @@ mod tests {
         assert_eq!(finish_arg_types, vec![majit_ir::Type::Int]);
         assert_eq!(finish_args.len(), 1);
         assert_eq!(ctx.const_value(finish_args[0]), Some(42));
+
+        // The portal returns normally (int_return, no merge-point cut), so the
+        // ENTER_PORTAL_FRAME recorded at the inline-portal push pairs with a
+        // LEAVE_PORTAL_FRAME recorded by the normal-return pop
+        // (pyjitpl.py:2461-2492 enter/leave pairing on the finishframe path).
+        let recorder = ctx.into_recorder();
+        let ops = recorder.ops();
+        let enter_count = ops
+            .iter()
+            .filter(|o| o.opcode == OpCode::EnterPortalFrame)
+            .count();
+        let leave_count = ops
+            .iter()
+            .filter(|o| o.opcode == OpCode::LeavePortalFrame)
+            .count();
+        assert_eq!(enter_count, 1, "exactly one ENTER_PORTAL_FRAME");
+        assert_eq!(
+            leave_count, enter_count,
+            "normal-return path must balance ENTER_PORTAL_FRAME with LEAVE_PORTAL_FRAME",
+        );
     }
 
     thread_local! {

@@ -92,6 +92,20 @@ pub struct MIFrame {
     /// INLINE frame; restored into the shared sym when the frame returns so the
     /// callee's in-place mutation of the single sym doesn't corrupt the caller.
     pub portal_scalar_state: Option<Vec<(OpRef, i64)>>,
+    /// [FR] True only for a frame whose push recorded `ENTER_PORTAL_FRAME`
+    /// (an inline-pushed portal, dispatch.rs). Its normal-return and
+    /// exception-return pops record the matching `LEAVE_PORTAL_FRAME`, so every
+    /// enter_portal_frame pairs with a leave_portal_frame (pyjitpl.py:2461-2492:
+    /// newframe→enter_portal_frame, popframe→leave_portal_frame default True on
+    /// both the finishframe and finishframe_exception paths). Distinct from
+    /// `inline_frame`, which is also true for ordinary `BC_INLINE_CALL` frames
+    /// that record no ENTER and must record no LEAVE. The merge-point cut is the
+    /// sole `leave_portal_frame=False` site and re-emits LEAVE itself.
+    pub portal_entered: bool,
+    /// [FR] The jd_index carried in this frame's `LEAVE_PORTAL_FRAME` op, set at
+    /// the same push that set `portal_entered`. Unused when `portal_entered` is
+    /// false.
+    pub portal_jd: usize,
     pub return_i: Option<usize>,
     pub return_r: Option<usize>,
     pub return_f: Option<usize>,
@@ -170,6 +184,8 @@ impl MIFrame {
             inline_frame: false,
             portal_vable_saved: false,
             portal_scalar_state: None,
+            portal_entered: false,
+            portal_jd: 0,
             return_i: None,
             return_r: None,
             return_f: None,
