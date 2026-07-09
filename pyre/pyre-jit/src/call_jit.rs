@@ -4486,8 +4486,13 @@ pub extern "C" fn bh_load_name_fn(frame_ptr: i64, w_name: i64, namei: i64) -> i6
     match frame.load_name_checked_value(name, namei as usize) {
         Ok(w_value) => w_value as i64,
         Err(err) => {
-            let exc_obj = err.to_exc_object();
-            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+            // Publish into BOTH the blackhole `BH_LAST_EXC_VALUE` and the
+            // backend `_store_exception` cells: LOAD_NAME lowers into the
+            // full-body-walk compiled trace (a handler-bearing body skips the
+            // cell-fold), where the following `GUARD_NO_EXCEPTION` reads the
+            // backend cells — writing only `BH_LAST_EXC_VALUE` lets the guard
+            // pass on a stale 0 and a raising LOAD_NAME is silently swallowed.
+            publish_residual_call_exception(err.to_exc_object() as i64);
             0
         }
     }
@@ -4517,8 +4522,12 @@ pub extern "C" fn bh_store_name_fn(frame_ptr: i64, w_name: i64, value: i64) -> i
     match frame.store_name_value(name, 0, value as pyre_object::PyObjectRef) {
         Ok(()) => 1,
         Err(err) => {
-            let exc_obj = err.to_exc_object();
-            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+            // Publish into both exception cells: STORE_NAME lowers into the
+            // full-body-walk compiled trace, whose `GUARD_NO_EXCEPTION` reads
+            // the backend `_store_exception` cells; writing only
+            // `BH_LAST_EXC_VALUE` would let a raising `__setitem__` on a
+            // mapping-locals namespace be silently swallowed.
+            publish_residual_call_exception(err.to_exc_object() as i64);
             0
         }
     }
@@ -4547,8 +4556,12 @@ pub extern "C" fn bh_store_global_fn(frame_ptr: i64, w_name: i64, value: i64) ->
     match frame.store_global_value(name, 0, value as pyre_object::PyObjectRef) {
         Ok(()) => 1,
         Err(err) => {
-            let exc_obj = err.to_exc_object();
-            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+            // Publish into both exception cells, matching the STORE_NAME arm.
+            // `store_global_value` is infallible today (this arm is dead), but
+            // STORE_GLOBAL lowers into the compiled trace with a following
+            // `GUARD_NO_EXCEPTION` that reads the backend cells, so should a
+            // fallible path appear the raise must not be swallowed.
+            publish_residual_call_exception(err.to_exc_object() as i64);
             0
         }
     }
