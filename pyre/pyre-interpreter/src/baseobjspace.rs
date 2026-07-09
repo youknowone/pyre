@@ -1358,7 +1358,10 @@ unsafe fn getitem_str(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
             "string index out of range",
         ));
     }
-    Err(index_type_error("string", index))
+    Err(PyError::type_error(format!(
+        "string indices must be integers, not '{}'",
+        crate::type_methods::arg_type_name(index)
+    )))
 }
 
 #[inline(never)]

@@ -737,6 +737,7 @@ pub fn str_method_rstrip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 /// unicodeobject.py:848 descr_startswith(self, prefix, start=0, end=sys.maxsize)
 pub fn str_method_startswith(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "startswith", 1)?;
+    arity_at_most(args, "startswith", 3)?;
     let s = unsafe { pyre_object::w_str_get_wtf8(args[0]) };
     let Some(slice) = str_slice_args(s, args) else {
         return validate_prefix_arg(args[1], "startswith").map(|()| w_bool_from(false));
@@ -746,6 +747,7 @@ pub fn str_method_startswith(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 
 pub fn str_method_endswith(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "endswith", 1)?;
+    arity_at_most(args, "endswith", 3)?;
     let s = unsafe { pyre_object::w_str_get_wtf8(args[0]) };
     let Some(slice) = str_slice_args(s, args) else {
         return validate_prefix_arg(args[1], "endswith").map(|()| w_bool_from(false));
@@ -761,7 +763,8 @@ pub fn str_method_endswith(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 /// end` rather than collapsing to a valid empty slice.
 fn str_slice_args<'a>(s: &'a Wtf8, args: &[pyre_object::PyObjectRef]) -> Option<&'a Wtf8> {
     let char_len = s.code_points().count() as i64;
-    let start = if args.len() >= 3 {
+    // `None` bounds mean "not provided" (start -> 0, end -> len).
+    let start = if args.len() >= 3 && !unsafe { pyre_object::is_none(args[2]) } {
         let v = unsafe { pyre_object::w_int_get_value(args[2]) };
         if v < 0 {
             (char_len + v).max(0) as usize
@@ -771,7 +774,7 @@ fn str_slice_args<'a>(s: &'a Wtf8, args: &[pyre_object::PyObjectRef]) -> Option<
     } else {
         0
     };
-    let end = if args.len() >= 4 {
+    let end = if args.len() >= 4 && !unsafe { pyre_object::is_none(args[3]) } {
         let v = unsafe { pyre_object::w_int_get_value(args[3]) };
         if v < 0 {
             (char_len + v).max(0) as usize
@@ -945,12 +948,14 @@ fn wtf8_idx_window(
 
 pub fn str_method_find(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "find", 1)?;
+    arity_at_most(args, "find", 3)?;
     require_str_sub(args, "find")?;
     Ok(w_int_new(str_unwrap_and_search(args, true)?.unwrap_or(-1)))
 }
 
 pub fn str_method_rfind(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "rfind", 1)?;
+    arity_at_most(args, "rfind", 3)?;
     require_str_sub(args, "rfind")?;
     Ok(w_int_new(str_unwrap_and_search(args, false)?.unwrap_or(-1)))
 }
@@ -2869,6 +2874,7 @@ fn str_unwrap_and_search(
 /// PyPy: unicodeobject.py descr_count
 pub fn str_method_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "count", 1)?;
+    arity_at_most(args, "count", 3)?;
     require_str_sub(args, "count")?;
     // Operands read as WTF-8 so lone surrogates do not panic; the optional
     // start / end arguments bound the count window over the code points.
@@ -2887,6 +2893,7 @@ pub fn str_method_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 /// "substring not found" (ValueError).
 pub fn str_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "index", 1)?;
+    arity_at_most(args, "index", 3)?;
     require_str_sub(args, "index")?;
     match str_unwrap_and_search(args, true)? {
         Some(i) => Ok(w_int_new(i)),
@@ -2899,6 +2906,7 @@ pub fn str_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 /// unicodeobject.py:572 descr_rindex
 pub fn str_method_rindex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "rindex", 1)?;
+    arity_at_most(args, "rindex", 3)?;
     require_str_sub(args, "rindex")?;
     match str_unwrap_and_search(args, false)? {
         Some(i) => Ok(w_int_new(i)),
@@ -3252,11 +3260,17 @@ pub fn str_method_removeprefix(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
             pos.len().saturating_sub(1)
         )));
     }
+    if !unsafe { pyre_object::is_str(pos[1]) } {
+        return Err(crate::PyError::type_error(format!(
+            "removeprefix() argument must be str, not {}",
+            arg_type_name(pos[1])
+        )));
+    }
     let s = unsafe { w_str_get_wtf8(pos[0]) };
     let prefix = unsafe { w_str_get_wtf8(pos[1]) };
     match s.strip_prefix(prefix) {
         Some(rest) => Ok(w_str_from_wtf8(rest.to_wtf8_buf())),
-        None => Ok(pos[0]),
+        None => Ok(str_result_unchanged(pos[0])),
     }
 }
 
@@ -3269,11 +3283,17 @@ pub fn str_method_removesuffix(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
             pos.len().saturating_sub(1)
         )));
     }
+    if !unsafe { pyre_object::is_str(pos[1]) } {
+        return Err(crate::PyError::type_error(format!(
+            "removesuffix() argument must be str, not {}",
+            arg_type_name(pos[1])
+        )));
+    }
     let s = unsafe { w_str_get_wtf8(pos[0]) };
     let suffix = unsafe { w_str_get_wtf8(pos[1]) };
     match s.strip_suffix(suffix) {
         Some(rest) => Ok(w_str_from_wtf8(rest.to_wtf8_buf())),
-        None => Ok(pos[0]),
+        None => Ok(str_result_unchanged(pos[0])),
     }
 }
 
