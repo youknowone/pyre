@@ -9073,6 +9073,22 @@ pub(crate) fn bridge_audit_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_BRIDGE_AUDIT").is_some())
 }
 
+/// `PYRE_M369_RECOVER_AUDIT` (default OFF): decode-side round-trip audit for the
+/// #369 record-side flip (make the rd_numb `pc` word hold the JitCode offset and
+/// drop the separate `jitcode_pc` word). At the `resolve_resume_pc_with_jitcode_pc`
+/// funnel it checks whether the ORIGINAL Python pc is recoverable from the JitCode
+/// offset the flip would store: `python_pc_for_jitcode_pc(flip_offset) ==
+/// decode_resume_pc(raw_pc).0`, bucketed by frame class (branch_guard /
+/// portal_bridge / after_residual_call / sentinel_plain). Zero divergence across
+/// the corpus is the precondition for dropping the py_pc word. Orthogonal to the
+/// task#50 twin-table audits, which are gated by `can_decode_live_vars` and so
+/// never reach the portal-bridge / sentinel / after-residual-call frames.
+/// Diagnostic only; off in production.
+pub(crate) fn m369_recover_audit_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_M369_RECOVER_AUDIT").is_some())
+}
+
 /// `PYRE_M73_ENCODE_AUDIT` enables the assertion that the trivia-aware
 /// `depth_trivia_by_jit_pc` twin reproduces the ENCODE-side branch-resume depth
 /// that `branch_resume_target_stack_depth` computes via
