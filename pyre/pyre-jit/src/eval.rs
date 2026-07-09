@@ -3613,13 +3613,58 @@ fn for_iter_body_op_is_jit_safe(instr: pyre_interpreter::Instruction) -> bool {
     )
 }
 
-/// True iff every `FOR_ITER` loop body in `code` contains only
-/// `for_iter_body_op_is_jit_safe` opcodes. A nested `FOR_ITER` appears as a body
+/// True when the `FOR_ITER` body in `[body_start, exit)` is straight-line with
+/// respect to walk aborts: it contains no call, no nested-loop iterator setup,
+/// and no conditional or forward branch. Such a body has no reachable trigger
+/// for the mid-loop walk abort that hands control to the Option-C
+/// deliver/refuse path, so any eager heap store performed inside it is always
+/// committed exactly once and can never be dropped or doubled (#57).
+/// `JumpBackward` is the loop's own back edge and does not introduce an abort.
+fn for_iter_body_is_abort_free(
+    instructions: &[pyre_interpreter::bytecode::CodeUnit],
+    body_start: usize,
+    exit: usize,
+) -> bool {
+    use pyre_interpreter::Instruction as I;
+    let mut body_state = pyre_interpreter::OpArgState::default();
+    let mut body_pc = body_start;
+    while body_pc < exit && body_pc < instructions.len() {
+        let (body_instr, _) = body_state.get(instructions[body_pc]);
+        if matches!(
+            body_instr,
+            I::Call { .. }
+                | I::CallKw { .. }
+                | I::ForIter { .. }
+                | I::GetIter
+                | I::PopJumpIfFalse { .. }
+                | I::PopJumpIfTrue { .. }
+                | I::PopJumpIfNone { .. }
+                | I::PopJumpIfNotNone { .. }
+                | I::JumpForward { .. }
+        ) {
+            return false;
+        }
+        body_pc += 1;
+    }
+    true
+}
+
+/// True iff every `FOR_ITER` loop body in `code` is admissible. The BASE rule is
+/// `for_iter_body_op_is_jit_safe`. A nested `FOR_ITER` appears as a body
 /// instruction of its enclosing loop and is not allow-listed, so nested loops
-/// are rejected here without recursion. The iterable setup (`range(n)`,
-/// `GET_ITER`) precedes the `FOR_ITER` and is therefore not part of any body
-/// range.
+/// are rejected without recursion. The iterable setup (`range(n)`, `GET_ITER`)
+/// precedes the `FOR_ITER` and is therefore not part of any body range.
+///
+/// A straight-line body — one that `for_iter_body_is_abort_free` accepts — may
+/// ADDITIONALLY carry the direct heap-store opcodes `STORE_SUBSCR`,
+/// `STORE_ATTR`, `STORE_NAME`, `STORE_GLOBAL` and the `LOAD_NAME` that reads
+/// module globals. That widening is sound because an abort-free body never
+/// reaches the Option-C deliver/refuse path, so the store is committed exactly
+/// once (#57). Bodies with a call or a branch stay on the base allow-list, so
+/// the call-bearing path is unchanged. `LOAD_ATTR` is deliberately excluded:
+/// an attribute read can trigger a descriptor call.
 fn for_iter_bodies_all_jit_safe(code: &pyre_interpreter::CodeObject) -> bool {
+    use pyre_interpreter::Instruction as I;
     let instructions = &code.instructions;
     let mut arg_state = pyre_interpreter::OpArgState::default();
     for (pc, unit) in instructions.iter().copied().enumerate() {
@@ -3630,11 +3675,22 @@ fn for_iter_bodies_all_jit_safe(code: &pyre_interpreter::CodeObject) -> bool {
                 pc + 1,
                 delta.get(op_arg).as_usize(),
             );
+            let abort_free = for_iter_body_is_abort_free(instructions, pc + 1, exit);
             let mut body_state = pyre_interpreter::OpArgState::default();
             let mut body_pc = pc + 1;
             while body_pc < exit && body_pc < instructions.len() {
                 let (body_instr, _) = body_state.get(instructions[body_pc]);
-                if !for_iter_body_op_is_jit_safe(body_instr) {
+                let permitted = for_iter_body_op_is_jit_safe(body_instr)
+                    || (abort_free
+                        && matches!(
+                            body_instr,
+                            I::StoreSubscr
+                                | I::StoreAttr { .. }
+                                | I::StoreName { .. }
+                                | I::StoreGlobal { .. }
+                                | I::LoadName { .. }
+                        ));
+                if !permitted {
                     return false;
                 }
                 body_pc += 1;
@@ -8293,12 +8349,28 @@ mod tests {
     }
 
     #[test]
-    fn for_iter_single_level_store_subscr_body_is_not_jit_safe() {
-        // single-level STORE_SUBSCR (`buf[i] = i`) is the s3_setitem mutation op;
-        // not allow-listed, so it is excluded even without a nested FOR_ITER.
+    fn for_iter_straight_line_store_subscr_body_is_jit_safe() {
+        // A straight-line body `buf[i] = i` (no call, no branch, no nested loop)
+        // is abort-free, so the direct STORE_SUBSCR is admitted: the mid-loop
+        // walk abort that could drop or double the store is unreachable (#57).
         use pyre_interpreter::compile_exec;
         let module = compile_exec(
             "def w(src, buf):\n    for i in src:\n        buf[i] = i\n    return len(buf)\n",
+        )
+        .expect("test code should compile");
+        let code = function_code_from_module(&module, "w");
+        assert!(for_iter_bodies_all_jit_safe(&code));
+        assert_eq!(unsupported_jit_shape(&code), UnsupportedJitShape::None);
+    }
+
+    #[test]
+    fn for_iter_store_subscr_with_branch_body_is_not_jit_safe() {
+        // A conditional `if i & 1: buf[i] = i` makes the body non-abort-free, so
+        // the direct STORE_SUBSCR is NOT admitted through the widening; the frame
+        // stays interpreted.
+        use pyre_interpreter::compile_exec;
+        let module = compile_exec(
+            "def w(src, buf):\n    for i in src:\n        if i & 1:\n            buf[i] = i\n    return len(buf)\n",
         )
         .expect("test code should compile");
         let code = function_code_from_module(&module, "w");
@@ -8307,6 +8379,38 @@ mod tests {
             unsupported_jit_shape(&code),
             UnsupportedJitShape::CurrentFrameOnly
         );
+    }
+
+    #[test]
+    fn for_iter_store_subscr_with_call_body_is_not_jit_safe() {
+        // A body that both calls and stores (`buf[i] = abs(i)`) is non-abort-free
+        // because of the call, so the STORE_SUBSCR is NOT admitted: this is the
+        // hazardous shape whose aborted walk could drop/double the store (#57).
+        use pyre_interpreter::compile_exec;
+        let module = compile_exec(
+            "def w(src, buf):\n    for i in src:\n        buf[i] = abs(i)\n    return len(buf)\n",
+        )
+        .expect("test code should compile");
+        let code = function_code_from_module(&module, "w");
+        assert!(!for_iter_bodies_all_jit_safe(&code));
+        assert_eq!(
+            unsupported_jit_shape(&code),
+            UnsupportedJitShape::CurrentFrameOnly
+        );
+    }
+
+    #[test]
+    fn for_iter_straight_line_store_attr_body_is_jit_safe() {
+        // A straight-line body `o.x = i` is abort-free, so the direct STORE_ATTR
+        // is admitted. (LOAD_ATTR reads stay excluded — see the allow-list.)
+        use pyre_interpreter::compile_exec;
+        let module = compile_exec(
+            "def w(src, o):\n    for i in src:\n        o.x = i\n    return o.x\n",
+        )
+        .expect("test code should compile");
+        let code = function_code_from_module(&module, "w");
+        assert!(for_iter_bodies_all_jit_safe(&code));
+        assert_eq!(unsupported_jit_shape(&code), UnsupportedJitShape::None);
     }
 
     #[test]
