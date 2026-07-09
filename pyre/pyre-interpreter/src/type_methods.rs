@@ -3403,9 +3403,7 @@ pub fn str_method_expandtabs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     Ok(w_str_from_wtf8(result))
 }
 
-/// PyPy: unicodeobject.py descr_translate
-///
-/// str.translate(table) — table is a dict mapping ordinals (int) to
+/// str.translate(table) — table is a mapping from ordinals (int) to
 /// ordinals (int), strings (str), or None (delete).
 pub fn str_method_translate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_exact(args, "str.translate", 1)?;
@@ -3415,20 +3413,27 @@ pub fn str_method_translate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     unsafe {
         for cp in s.code_points() {
             let key = w_int_new(cp.to_u32() as i64);
-            if let Some(val) = w_dict_lookup(table, key) {
-                if is_none(val) {
-                    // None → delete character
-                } else if is_int(val) {
-                    if let Some(c) = CodePoint::from_u32(w_int_get_value(val) as u32) {
+            match crate::baseobjspace::finditem(table, key)? {
+                None => result.push(cp),
+                Some(val) if is_none(val) => {}
+                Some(val) if is_int(val) => {
+                    let code = w_int_get_value(val);
+                    if let Some(c) = u32::try_from(code).ok().and_then(CodePoint::from_u32) {
                         result.push(c);
+                    } else {
+                        return Err(crate::PyError::value_error(
+                            "character mapping must be in range(0x110000)",
+                        ));
                     }
-                } else if is_str(val) {
-                    result.push_wtf8(w_str_get_wtf8(val));
-                } else {
-                    result.push(cp);
                 }
-            } else {
-                result.push(cp);
+                Some(val) if is_str(val) => {
+                    result.push_wtf8(w_str_get_wtf8(val));
+                }
+                Some(_) => {
+                    return Err(crate::PyError::type_error(
+                        "character mapping must return integer, None or str",
+                    ));
+                }
             }
         }
     }
