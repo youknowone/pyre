@@ -118,31 +118,28 @@ impl W_ListObject {
     /// (listobject.py:1695 `AbstractUnwrappedStrategy.append` for the
     /// Object case: no unwrap, just append.)
     unsafe fn object_push(&mut self, value: PyObjectRef) {
-        if self.length == self.object_items_capacity() {
-            // Root the incoming value across the (collecting) grow, then read
-            // it back relocated. No-op under the std::alloc fallback.
-            let _roots = crate::gc_roots::push_roots();
-            let save = crate::gc_roots::shadow_stack_len();
-            crate::gc_roots::pin_root(value);
-            self.object_grow(self.length + 1);
-            let value = crate::gc_roots::shadow_stack_get(save);
-            let base = items_block_items_base(self.items);
-            *base.add(self.length) = value;
+        // At capacity, route the grow through the `dont_look_inside`
+        // boundary: it roots `value` across the (collecting) resize and
+        // returns it relocated. The in-place store below stays outside the
+        // boundary so the spare-capacity fold still lowers it. No-op grow
+        // under the std::alloc fallback.
+        let value = if self.length == self.object_items_capacity() {
+            w_list_grow_items_block(self as *mut W_ListObject as PyObjectRef, value)
         } else {
-            let base = items_block_items_base(self.items);
-            *base.add(self.length) = value;
-        }
+            value
+        };
+        let base = items_block_items_base(self.items);
+        *base.add(self.length) = value;
         self.length += 1;
     }
 
     unsafe fn object_insert(&mut self, index: usize, value: PyObjectRef) {
         assert!(index <= self.length);
+        // Same grow-then-store shape as `object_push`: at capacity, route the
+        // grow through the `dont_look_inside` boundary, which roots `value`
+        // across the (collecting) resize and returns it relocated.
         let value = if self.length == self.object_items_capacity() {
-            let _roots = crate::gc_roots::push_roots();
-            let save = crate::gc_roots::shadow_stack_len();
-            crate::gc_roots::pin_root(value);
-            self.object_grow(self.length + 1);
-            crate::gc_roots::shadow_stack_get(save)
+            w_list_grow_items_block(self as *mut W_ListObject as PyObjectRef, value)
         } else {
             value
         };
@@ -272,6 +269,38 @@ impl W_ListObject {
         self.items = std::ptr::null_mut();
         self.length = 0;
     }
+}
+
+/// Grow the Object-strategy backing of `obj` to hold at least one more
+/// element and return `value` relocated to its post-collection address.
+///
+/// Residualized: the grow drives the moving collector through `object_grow`
+/// → `grow_list_items_block_gc`'s `push_roots` / `pin_root` /
+/// `shadow_stack_get` / `alloc_items_block_gc` — shadow-stack and moving-GC
+/// plumbing the tracer cannot model, the same reason `w_list_new`
+/// residualizes. The JIT leaves the call as a residual returning the
+/// relocated value pointer rather than tracing into the resize allocator.
+/// The in-place store (`items[len] = value; length += 1`) stays with the
+/// caller, outside this boundary, so the spare-capacity fold still lowers
+/// it to `setarrayitem` + `set_len`.
+///
+/// `_ll_list_resize_ge`'s realloc case (rlist.py:285): `value` is pinned
+/// across the (collecting) grow and read back from its relocated
+/// shadow-stack slot — `grow_list_items_block_gc` may move it during its
+/// collection, so the returned pointer, not the stale argument, is what the
+/// caller must store.
+///
+/// # Safety
+/// `obj` must point to a valid Object-strategy `W_ListObject`; `value` must
+/// be a live `PyObjectRef`.
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_list_grow_items_block(obj: PyObjectRef, value: PyObjectRef) -> PyObjectRef {
+    let list = &mut *(obj as *mut W_ListObject);
+    let _roots = crate::gc_roots::push_roots();
+    let save = crate::gc_roots::shadow_stack_len();
+    crate::gc_roots::pin_root(value);
+    list.object_grow(list.length + 1);
+    crate::gc_roots::shadow_stack_get(save)
 }
 
 /// listobject.py:2390-2392 is_plain_int1(w_obj)
