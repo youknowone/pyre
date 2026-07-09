@@ -9190,6 +9190,17 @@ pub(crate) fn m73_branch_audit_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_M73_BRANCH_AUDIT").is_some())
 }
 
+/// `PYRE_M73_ARM_AUDIT` (#73 S3.1, approach C, default OFF): certifies that a
+/// branch guard's resume coordinate `other_target` is re-derivable at decode
+/// time from the guard's OWN `-live-` BEFORE anchor `orgpc` plus the recorded
+/// flavor (`GuardTrue`/`GuardFalse`), WITHOUT the runtime condbox — mirroring
+/// PyPy `generate_guard(resumepc=orgpc)` (`pyjitpl.py:520`). Emits one
+/// `M73_ARM` line per non-constant `goto_if_not` capture. Off in production.
+pub(crate) fn m73_arm_audit_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_M73_ARM_AUDIT").is_some())
+}
+
 /// `PYRE_M73_PEROP_CARRY` (#73 S2, default ON): source a specialization
 /// guard's (`GuardValue`/`GuardClass`) resume coordinate from the walk
 /// cursor's per-op `-live-` BEFORE anchor (`ctx.live_before_jit_pc`,
@@ -9369,6 +9380,41 @@ fn resolve_branch_target_through_trampoline(code: &[u8], target: usize) -> usize
         }
     }
     resume
+}
+
+/// #73 S3.1 (approach C): re-derive a branch guard's resume `other_target` from
+/// the guard's OWN `-live-` BEFORE anchor `orgpc` (== ctx.live_before_jit_pc at
+/// the goto_if_not) + the recorded flavor (GuardTrue/GuardFalse), WITHOUT the
+/// runtime condbox — mirroring PyPy generate_guard(resumepc=orgpc) (pyjitpl.py:520),
+/// where orgpc is arm-independent and the arm is re-derived. A BOUNDED single
+/// leading `-live-` skip (NOT a permissive loop), mirroring pyjitpl.py:198's
+/// `assert code[pc]==op_live`: a mispositioned orgpc (e.g. `live; ref_copy;
+/// goto_if_not`, orgpc one op early) FAILS loudly rather than being walked forward.
+///
+/// The only conditional-branch opname reaching the walk dispatch is
+/// `goto_if_not` (`goto_if_not/iL`): pyre keeps COMPARE_OP and the branch as
+/// SEPARATE JitCode ops and never emits the jtransform-fused `n_<cmp>` form on
+/// the trace/walker path, so the goto opname set is the single `"goto_if_not"`.
+/// The `L` label operand sits at index 1 (`iL`: 1B int reg, then 2B label) —
+/// the same index the `goto_if_not/iL` handler reads `target` from — re-read
+/// here from the re-derived `goto` so the arm-select is genuinely reconstructed
+/// from `orgpc` alone rather than reusing the capture-site op.
+fn decode_side_other_target(
+    code: &[u8],
+    orgpc: usize,
+    flavor_guard_true: bool,
+) -> Result<usize, &'static str> {
+    let live = decode_op_at(code, orgpc).ok_or("notlive")?;
+    if live.opname != "live" {
+        return Err("notlive");
+    }
+    let goto = decode_op_at(code, live.next_pc).ok_or("notgoto")?;
+    if goto.opname != "goto_if_not" {
+        return Err("notgoto");
+    }
+    let target = read_label(code, &goto, 1);
+    let raw = if flavor_guard_true { target } else { goto.next_pc };
+    Ok(resolve_branch_target_through_trampoline(code, raw))
 }
 
 /// Decode a not-taken branch trampoline's `ref_copy` parallel-move
@@ -19819,6 +19865,30 @@ fn handle(
                 if switchcase != 0 { target } else { op.next_pc },
             );
             if !valuebox.is_constant() {
+                if m73_arm_audit_enabled() {
+                    let orgpc = ctx.live_before_jit_pc;
+                    let flavor_guard_true = switchcase != 0;
+                    if orgpc == usize::MAX {
+                        eprintln!(
+                            "M73_ARM result=nolb other_target={} switchcase={}",
+                            other_target, switchcase
+                        );
+                    } else {
+                        match decode_side_other_target(code, orgpc, flavor_guard_true) {
+                            Err(reason) => eprintln!(
+                                "M73_ARM result={} orgpc={} other_target={} switchcase={}",
+                                reason, orgpc, other_target, switchcase
+                            ),
+                            Ok(derived) => {
+                                let r = if derived == other_target { "match" } else { "mismatch" };
+                                eprintln!(
+                                    "M73_ARM result={} orgpc={} other_target={} derived={} switchcase={}",
+                                    r, orgpc, other_target, derived, switchcase
+                                );
+                            }
+                        }
+                    }
+                }
                 // #124/#281: a branch guard whose resume target still holds a
                 // live operand-stack temp (short-circuit `and`/`or`, the
                 // conditional expression, chained comparison) keeps that temp
