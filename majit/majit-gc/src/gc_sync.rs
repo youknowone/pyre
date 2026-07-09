@@ -21,7 +21,7 @@
 //! thread requests STW, all other mutators park at their next poll point
 //! (which is every GC operation in P0), collection runs, then all resume.
 
-use std::cell::UnsafeCell;
+use std::cell::{Cell, UnsafeCell};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 
@@ -153,6 +153,78 @@ unsafe fn singleton_mut() -> &'static mut dyn GcAllocator {
 }
 
 // ──────────────────────────────────────────────────────────────
+// Reentrancy guard — collection-time read-only queries
+// ──────────────────────────────────────────────────────────────
+
+thread_local! {
+    /// `> 0` while this thread holds an exclusive `&mut` to the singleton
+    /// (inside a `gc_op` / `request_stw` closure). A collection fires *inside*
+    /// one of those closures, and its extra-root walkers re-enter the GC with
+    /// read-only ownership queries (`gc_owns_object` → `is_managed_heap_object`).
+    /// `gc_query_reentrant` consults this so such a query reaches the singleton
+    /// via a shared read instead of a second `gc_mutex` lock (deadlock) or a
+    /// second `&mut` (aliasing).
+    static GC_OP_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+/// RAII marker: raises `GC_OP_DEPTH` for the exact span of a closure that holds
+/// the exclusive `&mut dyn GcAllocator`. Wraps every `singleton_mut()` call.
+struct OpGuard;
+impl OpGuard {
+    #[inline]
+    fn enter() -> Self {
+        GC_OP_DEPTH.with(|d| d.set(d.get() + 1));
+        OpGuard
+    }
+}
+impl Drop for OpGuard {
+    #[inline]
+    fn drop(&mut self) {
+        GC_OP_DEPTH.with(|d| d.set(d.get() - 1));
+    }
+}
+
+/// Whether this thread is already inside a `gc_op` / `request_stw` closure
+/// (i.e. a collection is running on this thread and holds the `&mut`).
+#[inline]
+pub fn in_gc_op() -> bool {
+    GC_OP_DEPTH.with(|d| d.get() != 0)
+}
+
+/// Shared reference to the singleton, re-derived from the static `UnsafeCell`.
+///
+/// SAFETY: only sound when [`in_gc_op`] holds on this thread — the collector
+/// already owns the exclusive `&mut`, all other mutators are parked (STW) or
+/// spinning (single-thread fast path), and the returned `&dyn` is used only for
+/// a read-only query whose lifetime ends before control returns to the
+/// collector. Re-derives from `GC_STORE.0.get()` each call (a pre-`&mut`-cached
+/// raw pointer would be invalidated by `singleton_mut`'s reborrow).
+#[inline]
+unsafe fn singleton_ref_reentrant() -> &'static dyn GcAllocator {
+    unsafe { &*GC_STORE.0.get() }
+        .as_deref()
+        .expect("GC singleton not initialized — call store_singleton() first")
+}
+
+/// Read-only query that is safe both at top level and reentrantly from inside a
+/// collection (an extra-root walker's `gc_owns_object` / ownership query).
+///
+/// Top level (`!in_gc_op()`): takes the fully-synchronised [`gc_query`] path.
+/// Reentrant (`in_gc_op()`): reads the singleton directly, without re-locking
+/// `gc_mutex` (which would deadlock — the lock is non-recursive and, under STW,
+/// held by this very collector) or forming a second `&mut`.
+#[inline]
+pub fn gc_query_reentrant<R>(f: impl FnOnce(&dyn GcAllocator) -> R) -> R {
+    if in_gc_op() {
+        // SAFETY: in_gc_op() ⇒ this thread holds the &mut and is the sole
+        // running mutator (parked/spinning invariant); read-only, bounded to `f`.
+        f(unsafe { singleton_ref_reentrant() })
+    } else {
+        gc_query(f)
+    }
+}
+
+// ──────────────────────────────────────────────────────────────
 // Mutator registry — single-thread fast path
 // ──────────────────────────────────────────────────────────────
 
@@ -205,6 +277,10 @@ pub fn gc_op<R>(f: impl FnOnce(&mut dyn GcAllocator) -> R) -> R {
         return f(unsafe { singleton_mut() });
     }
 
+    debug_assert!(
+        !in_gc_op(),
+        "reentrant &mut gc_op — a collection-time query must use gc_query_reentrant"
+    );
     // Fast path: single thread, no STW.
     if REGISTERED_THREADS.load(Ordering::Acquire) <= 1
         && !GC_SYNC.stw_requested.load(Ordering::Acquire)
@@ -216,7 +292,10 @@ pub fn gc_op<R>(f: impl FnOnce(&mut dyn GcAllocator) -> R) -> R {
             && !GC_SYNC.stw_requested.load(Ordering::Acquire)
         {
             // SAFETY: single thread, no concurrent access possible.
-            let r = f(unsafe { singleton_mut() });
+            let r = {
+                let _op = OpGuard::enter();
+                f(unsafe { singleton_mut() })
+            };
             IN_FAST_PATH.store(false, Ordering::Release);
             return r;
         }
@@ -237,9 +316,11 @@ fn gc_op_slow<R>(f: impl FnOnce(&mut dyn GcAllocator) -> R) -> R {
         park_until_stw_done();
         let _guard = GC_SYNC.gc_mutex.lock().unwrap();
         let _held = GateHeldGuard::enter();
+        let _op = OpGuard::enter();
         return f(unsafe { singleton_mut() });
     }
     let _held = GateHeldGuard::enter();
+    let _op = OpGuard::enter();
     f(unsafe { singleton_mut() })
 }
 
@@ -275,6 +356,7 @@ pub fn request_stw(collect_fn: impl FnOnce(&mut dyn GcAllocator)) {
     // IN_FAST_PATH drained. No concurrent singleton access.
     {
         let _held = GateHeldGuard::enter();
+        let _op = OpGuard::enter();
         collect_fn(unsafe { singleton_mut() });
     }
 

@@ -614,11 +614,12 @@ pub trait GcAllocator: Send {
 
 /// Forwarding handle to the process-global GC singleton via `gc_sync`.
 ///
-/// Every method routes through `gc_sync::gc_op` (mutex-guarded) or
-/// `gc_sync::gc_query`. No raw pointer — synchronisation is structural.
-/// Per-thread backend TLS stores `Box<GcHandle>` as `Box<dyn GcAllocator>`,
-/// so the ~45 trampoline functions per backend keep their existing
-/// `RefCell<Option<Box<dyn GcAllocator>>>` access pattern unchanged.
+/// `&mut self` methods route through `gc_sync::gc_op` (mutex-guarded);
+/// `&self` read-only queries route through `gc_sync::gc_query_reentrant` so
+/// they stay correct when a collection-time extra-root walker re-enters the GC
+/// (ownership / type queries) while this thread already holds the `&mut` — a
+/// plain `gc_query` would re-lock the non-recursive `gc_mutex` (deadlock) or, on
+/// the fast path, form a second `&mut`. No raw pointer at this layer.
 ///
 /// # Thread safety
 ///
@@ -715,7 +716,7 @@ impl GcAllocator for GcHandle {
         gc_sync::gc_op(|gc| gc.id_or_identityhash(obj_addr))
     }
     fn get_write_barrier_descr(&self) -> Option<WriteBarrierDescr> {
-        gc_sync::gc_query(|gc| gc.get_write_barrier_descr())
+        gc_sync::gc_query_reentrant(|gc| gc.get_write_barrier_descr())
     }
     unsafe fn add_root(&mut self, root: *mut GcRef) {
         gc_sync::gc_op(|gc| unsafe { gc.add_root(root) })
@@ -724,31 +725,31 @@ impl GcAllocator for GcHandle {
         gc_sync::gc_op(|gc| gc.remove_root(root))
     }
     fn is_managed_heap_object(&self, addr: usize) -> bool {
-        gc_sync::gc_query(|gc| gc.is_managed_heap_object(addr))
+        gc_sync::gc_query_reentrant(|gc| gc.is_managed_heap_object(addr))
     }
     fn nursery_free(&self) -> *mut u8 {
-        gc_sync::gc_query(|gc| gc.nursery_free())
+        gc_sync::gc_query_reentrant(|gc| gc.nursery_free())
     }
     fn nursery_free_addr(&self) -> usize {
-        gc_sync::gc_query(|gc| gc.nursery_free_addr())
+        gc_sync::gc_query_reentrant(|gc| gc.nursery_free_addr())
     }
     fn nursery_top(&self) -> *const u8 {
-        gc_sync::gc_query(|gc| gc.nursery_top())
+        gc_sync::gc_query_reentrant(|gc| gc.nursery_top())
     }
     fn nursery_top_addr(&self) -> usize {
-        gc_sync::gc_query(|gc| gc.nursery_top_addr())
+        gc_sync::gc_query_reentrant(|gc| gc.nursery_top_addr())
     }
     fn max_nursery_object_size(&self) -> usize {
-        gc_sync::gc_query(|gc| gc.max_nursery_object_size())
+        gc_sync::gc_query_reentrant(|gc| gc.max_nursery_object_size())
     }
     fn card_page_shift(&self) -> u32 {
-        gc_sync::gc_query(|gc| gc.card_page_shift())
+        gc_sync::gc_query_reentrant(|gc| gc.card_page_shift())
     }
     fn jit_remember_young_pointer(&mut self, obj: GcRef) {
         gc_sync::gc_op(|gc| gc.jit_remember_young_pointer(obj))
     }
     fn can_optimize_cond_call(&self) -> bool {
-        gc_sync::gc_query(|gc| gc.can_optimize_cond_call())
+        gc_sync::gc_query_reentrant(|gc| gc.can_optimize_cond_call())
     }
     fn gc_step(&mut self) -> bool {
         gc_sync::gc_op(|gc| gc.gc_step())
@@ -763,28 +764,28 @@ impl GcAllocator for GcHandle {
         gc_sync::gc_op(|gc| gc.unpin(obj))
     }
     fn is_pinned(&self, obj: GcRef) -> bool {
-        gc_sync::gc_query(|gc| gc.is_pinned(obj))
+        gc_sync::gc_query_reentrant(|gc| gc.is_pinned(obj))
     }
     fn register_type(&mut self, info: trace::TypeInfo) -> u32 {
         gc_sync::gc_op(|gc| gc.register_type(info))
     }
     fn type_count(&self) -> usize {
-        gc_sync::gc_query(|gc| gc.type_count())
+        gc_sync::gc_query_reentrant(|gc| gc.type_count())
     }
     fn heap_byte_stats(&self) -> (usize, usize) {
-        gc_sync::gc_query(|gc| gc.heap_byte_stats())
+        gc_sync::gc_query_reentrant(|gc| gc.heap_byte_stats())
     }
     fn collection_counts(&self) -> (usize, usize) {
-        gc_sync::gc_query(|gc| gc.collection_counts())
+        gc_sync::gc_query_reentrant(|gc| gc.collection_counts())
     }
     fn type_alloc_is_plain(&self, type_id: u32) -> bool {
-        gc_sync::gc_query(|gc| gc.type_alloc_is_plain(type_id))
+        gc_sync::gc_query_reentrant(|gc| gc.type_alloc_is_plain(type_id))
     }
     fn type_size(&self, type_id: u32) -> Option<usize> {
-        gc_sync::gc_query(|gc| gc.type_size(type_id))
+        gc_sync::gc_query_reentrant(|gc| gc.type_size(type_id))
     }
     fn get_typeid_from_classptr_if_gcremovetypeptr(&self, classptr: usize) -> Option<u32> {
-        gc_sync::gc_query(|gc| gc.get_typeid_from_classptr_if_gcremovetypeptr(classptr))
+        gc_sync::gc_query_reentrant(|gc| gc.get_typeid_from_classptr_if_gcremovetypeptr(classptr))
     }
     fn register_vtable_for_type(&mut self, vtable: usize, type_id: u32) {
         gc_sync::gc_op(|gc| gc.register_vtable_for_type(vtable, type_id))
@@ -793,37 +794,37 @@ impl GcAllocator for GcHandle {
         gc_sync::gc_op(|gc| gc.freeze_types())
     }
     fn supports_guard_gc_type(&self) -> bool {
-        gc_sync::gc_query(|gc| gc.supports_guard_gc_type())
+        gc_sync::gc_query_reentrant(|gc| gc.supports_guard_gc_type())
     }
     fn check_is_object(&self, gcref: GcRef) -> bool {
-        gc_sync::gc_query(|gc| gc.check_is_object(gcref))
+        gc_sync::gc_query_reentrant(|gc| gc.check_is_object(gcref))
     }
     fn is_tagged_immediate(&self, addr: usize) -> bool {
-        gc_sync::gc_query(|gc| gc.is_tagged_immediate(addr))
+        gc_sync::gc_query_reentrant(|gc| gc.is_tagged_immediate(addr))
     }
     fn can_move(&self, gcref: GcRef) -> bool {
-        gc_sync::gc_query(|gc| gc.can_move(gcref))
+        gc_sync::gc_query_reentrant(|gc| gc.can_move(gcref))
     }
     fn get_translated_info_for_typeinfo(&self) -> (usize, u8, usize) {
-        gc_sync::gc_query(|gc| gc.get_translated_info_for_typeinfo())
+        gc_sync::gc_query_reentrant(|gc| gc.get_translated_info_for_typeinfo())
     }
     fn get_translated_info_for_guard_is_object(&self) -> (usize, u8) {
-        gc_sync::gc_query(|gc| gc.get_translated_info_for_guard_is_object())
+        gc_sync::gc_query_reentrant(|gc| gc.get_translated_info_for_guard_is_object())
     }
     fn subclassrange_min_offset(&self) -> usize {
-        gc_sync::gc_query(|gc| gc.subclassrange_min_offset())
+        gc_sync::gc_query_reentrant(|gc| gc.subclassrange_min_offset())
     }
     fn subclass_range(&self, classptr: usize) -> Option<(i64, i64)> {
-        gc_sync::gc_query(|gc| gc.subclass_range(classptr))
+        gc_sync::gc_query_reentrant(|gc| gc.subclass_range(classptr))
     }
     fn typeid_subclass_range(&self, typeid: u32) -> Option<(i64, i64)> {
-        gc_sync::gc_query(|gc| gc.typeid_subclass_range(typeid))
+        gc_sync::gc_query_reentrant(|gc| gc.typeid_subclass_range(typeid))
     }
     fn get_actual_typeid(&self, gcref: GcRef) -> Option<u32> {
-        gc_sync::gc_query(|gc| gc.get_actual_typeid(gcref))
+        gc_sync::gc_query_reentrant(|gc| gc.get_actual_typeid(gcref))
     }
     fn typeid_is_object(&self, typeid: u32) -> Option<bool> {
-        gc_sync::gc_query(|gc| gc.typeid_is_object(typeid))
+        gc_sync::gc_query_reentrant(|gc| gc.typeid_is_object(typeid))
     }
 }
 
