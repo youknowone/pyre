@@ -1733,16 +1733,36 @@ fn run_perfn_walk(
                 }
             } else if let Some(ref bridge_stack) = sym.bridge_stack_oprefs {
                 // Non-branch-guard / portal-bridge resume at the opcode-entry
-                // marker: in the semantic prefix the abstract-register color
-                // equals the semantic slot, so the `nlocals + depth` slot→color
-                // shortcut over the slot-indexed `bridge_stack_oprefs` holds.
+                // marker: the walk re-executes the opcode from the top, reading
+                // its operand-stack inputs POSITIONALLY — `registers_r[nlocals +
+                // stack_idx]` (trace_opcode.rs:628 `stack_slot_reg_idx`) — so
+                // the slot-indexed `bridge_stack` tail seeds color `nlocals + i`.
+                //
+                // The reserved-red skip is per-PC-wrong here.  `portal_frame_reg`
+                // / `portal_ec_reg` are a SINGLE global pair naming where the
+                // reds live at PORTAL ENTRY, not at an arbitrary interior resume
+                // PC; under free register coloring the reds sit at the
+                // operand-stack base `[nlocals, nlocals + 1]`, exactly the colors
+                // a shallow live operand stack occupies.  A live (non-NONE)
+                // `bridge_stack[i]` is the authoritative per-PC witness that slot
+                // `nlocals + i` holds a real operand-stack value at THIS PC — and
+                // a single color cannot simultaneously hold that value and the
+                // red, so the red is provably not live at color `nlocals + i`
+                // here (its identity is recovered through the frame field, e.g.
+                // `ensure_execution_context` / the standard-vable box, not this
+                // register).  Seeding the temp is therefore correct and the skip
+                // is what dropped it: on `re/_parser.py:append` (nlocals=2) the
+                // live callable at slot 2 = color 2 = `portal_frame_reg` was
+                // skipped, so `residual_call` read the stale entry frame/ec seed
+                // as its callable → SIGSEGV in dispatch_callable /
+                // `exception_is_valid_obj_as_class_w` (#389 with-gate probe).
+                //
+                // A NONE `bridge_stack[i]` (dead/empty slot) leaves the color's
+                // red seed intact — the red genuinely still owns the color there.
                 let nl = sym.nlocals;
                 for (i, &opref) in bridge_stack.iter().enumerate() {
                     if !opref.is_none() {
                         let color = (nl + i) as u8;
-                        if reserved_red_colors.contains(&color) {
-                            continue;
-                        }
                         seed(color, opref);
                     }
                 }
