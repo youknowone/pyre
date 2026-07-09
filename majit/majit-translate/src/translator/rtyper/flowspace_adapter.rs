@@ -2129,13 +2129,56 @@ pub fn translate_op(
                         FlowspaceOp::new("simple_call", call_args, result),
                     ])
                 }
-                CallTarget::Indirect { .. } => Err(TyperError::message(format!(
-                    "translate_op: Call with CallTarget::Indirect at result={} \
-                     must be lowered to VtableMethodPtr + IndirectCall by \
-                     rclass.rs before reaching the flowspace adapter; \
-                     reaching here means the rclass rewrite didn't run",
-                    fmt_op_result(op),
-                ))),
+                // A `dyn Trait` virtual call. `front::mir` routes the
+                // inline-Field vtable-slot dispatch here (gated behind
+                // `PYRE_DYN_INDIRECT`) with the receiver already in
+                // `args[0]`.  The production codewriter lowers it through
+                // `rpbc::lower_indirect_calls` (`VtableMethodPtr` +
+                // `IndirectCall`), but pyre has no IR vtable struct, so the
+                // funcptr projection cannot carry a `Ptr(Func)` lltype that
+                // `PtrRepr::rtype_simple_call` (rmodel.rs:2202) needs —
+                // synthesising a `SomePtr(Func)` symbolically is not
+                // available in the two-phase annotate/rtype prepass.
+                //
+                // Instead lower to the same `getattr(receiver,
+                // method_name)` + `simple_call(bound_method, args[1..])`
+                // shape as `CallTarget::Method`.  The receiver `args[0]` is
+                // seeded as the trait-family base `ClassDef`
+                // (`derive_subject_inputcells`, this file ~:2741 via
+                // `pyre_trait_family_bases`, the #346 receiver-driven
+                // dispatch machinery), whose impl subclasses carry the
+                // methods through attrfamily merge — so the method getattr
+                // resolves the impl `MethodDesc` family and the trailing
+                // `simple_call` rtypes through the ordinary bound-method
+                // path (`rpbc.py:199 FunctionRepr.call`).  `trait_root` is
+                // not needed at this stage: the family the getattr resolves
+                // is keyed on the receiver's classdef, which the seeding
+                // already pinned to the same trait family
+                // `(trait_root, method_name)` names.
+                CallTarget::Indirect { method_name, .. } => {
+                    let mut iter = arg_hls.into_iter();
+                    let receiver = iter.next().ok_or_else(|| {
+                        TyperError::message(
+                            "Call::Indirect has empty args: dyn-Trait receiver must be args[0]"
+                                .to_string(),
+                        )
+                    })?;
+                    let bound_method = Hlvalue::Variable(Variable::new());
+                    let mut call_args = Vec::with_capacity(iter.size_hint().0 + 1);
+                    call_args.push(bound_method.clone());
+                    call_args.extend(iter);
+                    Ok(vec![
+                        FlowspaceOp::new(
+                            "getattr",
+                            vec![
+                                receiver,
+                                Hlvalue::Constant(Constant::new(ConstValue::byte_str(method_name))),
+                            ],
+                            bound_method,
+                        ),
+                        FlowspaceOp::new("simple_call", call_args, result),
+                    ])
+                }
                 CallTarget::UnsupportedExpr => Err(TyperError::message(format!(
                     "translate_op: Call with CallTarget::UnsupportedExpr at \
                      result={} — frontend coverage gap; the `front::mir` \
@@ -4538,34 +4581,59 @@ mod tests {
     }
 
     #[test]
-    fn translate_op_call_indirect_surfaces_rclass_invariant() {
-        // Call::Indirect must be lowered to VtableMethodPtr +
-        // IndirectCall by `rclass.rs` before reaching the flowspace
-        // adapter. Reaching here means the rclass rewrite didn't run;
-        // surface the structural invariant break.
+    fn translate_op_call_indirect_chains_getattr_simple_call() {
+        // Call::Indirect (`dyn Trait` virtual call) lowers to the same
+        // `[getattr(receiver, method_name) -> meth, simple_call(meth,
+        // args[1..])]` chain as `CallTarget::Method`.  The receiver
+        // `args[0]` is seeded (by `derive_subject_inputcells`) as the
+        // trait-family base ClassDef, so the method getattr resolves the
+        // impl `MethodDesc` family in the two-phase prepass instead of
+        // failing loud.
         let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
         let mut graph = LegacyGraph::new("translate_op_fixture");
         let vars = mint_vars(&mut graph, 11); // vars[0..11]
-        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
-        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new())); // receiver
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new())); // arg
+        value_map.insert(vars[3].clone(), Hlvalue::Variable(Variable::new())); // result
         let op = SpaceOperation {
-            result: Some(vars[2].clone()),
+            result: Some(vars[3].clone()),
             kind: OpKind::Call {
                 target: crate::model::CallTarget::Indirect {
                     trait_root: "MyTrait".into(),
                     method_name: "do_it".into(),
                 },
-                args: vec![vars[1].clone()],
+                args: vec![vars[1].clone(), vars[2].clone()],
                 result_ty: ValueType::Int,
             },
         };
-        let err = translate_op(&op, &value_map, &empty_call_registry())
-            .expect_err("Call::Indirect must surface rclass invariant break");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("Indirect") && msg.contains("rclass"),
-            "fail-loud must cite Indirect + rclass.rs, got: {msg}"
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("Call::Indirect must lower to getattr + simple_call");
+        assert_eq!(translated.len(), 2);
+        assert_eq!(translated[0].opname, "getattr");
+        assert_eq!(translated[1].opname, "simple_call");
+        // getattr's name arg is the method name as a byte string.
+        let Hlvalue::Constant(ref name_const) = translated[0].args[1] else {
+            panic!("getattr method-name arg must be a Constant");
+        };
+        assert!(matches!(
+            name_const.value,
+            ConstValue::ByteStr(ref bytes) if bytes == b"do_it"
+        ));
+        // Bound-method Variable identity threads from getattr.result into
+        // simple_call.args[0].
+        let Hlvalue::Variable(ref m1) = translated[0].result else {
+            panic!("getattr result must be Variable");
+        };
+        let Hlvalue::Variable(ref m2) = translated[1].args[0] else {
+            panic!("simple_call's first arg must be Variable (bound method)");
+        };
+        assert_eq!(
+            m1.id(),
+            m2.id(),
+            "bound method Variable identity must thread"
         );
+        // simple_call args = [bound_method, args[1..]]
+        assert_eq!(translated[1].args.len(), 2);
     }
 
     #[test]
@@ -5182,11 +5250,11 @@ mod tests {
 
     #[test]
     fn function_graph_to_flowspace_unported_opkind_surfaces_failloud() {
-        // A graph carrying a still-fail-loud OpKind (Call::Indirect —
-        // requires rclass.rs lowering to VtableMethodPtr + IndirectCall
-        // before reaching the adapter) must surface that op's
-        // translate_op error from inside Pass 2, not silently emit a
-        // partial graph.
+        // A graph carrying a still-fail-loud OpKind
+        // (Call::UnsupportedExpr — a frontend coverage gap that
+        // `front::mir` must classify before the rtyper sees it) must
+        // surface that op's translate_op error from inside Pass 2, not
+        // silently emit a partial graph.
         let mut graph = LegacyGraph::new("unported_op");
         let vars = mint_vars(&mut graph, 4); // vars[0..4]
         let inputargs = block_inputargs(&vars, &[1]);
@@ -5197,10 +5265,7 @@ mod tests {
             operations: vec![SpaceOperation {
                 result: Some(vars[2].clone()),
                 kind: OpKind::Call {
-                    target: crate::model::CallTarget::Indirect {
-                        trait_root: "MyTrait".into(),
-                        method_name: "do_it".into(),
-                    },
+                    target: crate::model::CallTarget::UnsupportedExpr,
                     args: vec![arg_var],
                     result_ty: ValueType::Int,
                 },
@@ -5228,7 +5293,7 @@ mod tests {
             .expect_err("unported OpKind must surface as TyperError");
         let msg = format!("{err}");
         assert!(
-            msg.contains("Indirect") && msg.contains("rclass"),
+            msg.contains("UnsupportedExpr") && msg.contains("front::mir"),
             "unported-op error must propagate translate_op's fail-loud message, got: {msg}"
         );
     }
