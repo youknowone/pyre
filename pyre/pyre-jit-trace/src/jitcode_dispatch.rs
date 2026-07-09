@@ -12836,6 +12836,7 @@ fn try_walker_inline_user_call(
         }
     } else if strict_inlinable
         && fbw_strict_multiframe_enabled()
+        && inline_depth < FBW_MAX_MULTIFRAME_DEPTH
         && strict_callee_collapse_unsound(body.code)
     {
         // gh#420: a strict straight-line callee's in-callee guard collapses to
@@ -12854,6 +12855,13 @@ fn try_walker_inline_user_call(
         // `a + b` / `a * b`) has an idempotent collapse, so it is left on that
         // collapse — a strict callee seeds no frame red, so pushing it through
         // the always-declining MF snapshot would abort a working inline.
+        //
+        // Bounded by `inline_depth < FBW_MAX_MULTIFRAME_DEPTH` (mirror of
+        // `try_multiframe`): pushing a paused caller frame while already one
+        // inline level deep yields two `InlineParentFrame`s (n_parents ==
+        // n_callees == 2), a 3-frame snapshot the resume path is sound for only
+        // one paused caller frame.  A nested side-effecting strict callee then
+        // falls back to the single-frame collapse (its pre-strict-MF behavior).
         compute_inline_caller_frame(ctx, op.pc)
     } else {
         None
@@ -12878,51 +12886,76 @@ fn try_walker_inline_user_call(
     // same defect class as the LOAD_ATTR fold empty-boxes bug.  Mirror
     // `try_walker_list_append_inline`: read the caller's live register
     // banks from `FULL_BODY_SNAPSHOT_SYM` at the CALL-site py_pc.
-    let inline_outer_active_boxes = if ctx.is_full_body_walk && ctx.outer_active_boxes.is_empty() {
-        let sym_ptr = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
-        if sym_ptr.is_null() {
-            ctx.outer_active_boxes.clone()
-        } else {
-            let sym = unsafe { &*sym_ptr };
-            if sym.jitcode.is_null() {
-                ctx.outer_active_boxes.clone()
-            } else {
-                // Liveness coordinate is the CALL op's own (jitcode index,
-                // py_pc) — NOT the `ctx` sentinels.  `dispatch_via_miframe`
-                // initializes `ctx.outer_jitcode_index` to 0 and
-                // `ctx.entry_py_pc` to the walk-entry py_pc, so for a CALL in a
-                // non-root jitcode, or a CALL not at the walk-entry pc, those
-                // select the wrong liveness window and the callee guard snapshot
-                // encodes the wrong frame boxes.  Derive the coordinate from the
-                // snapshot sym's jitcode at the CALL op's pc, matching
-                // `orthodox_list_append_commit`.
-                let (call_site_py_pc, call_site_jc_index) = unsafe {
-                    let jc = &*sym.jitcode;
-                    let jc_index = jc.index as u32;
-                    let mut py = python_pc_for_jitcode_pc(&jc.payload.metadata, op.pc);
-                    if !jc.payload.code_ptr.is_null() {
-                        let codeobj = &*jc.payload.code_ptr;
-                        py = skip_python_trivia_forward(codeobj, py as usize) as u32;
-                    }
-                    (py, jc_index)
-                };
-                collect_outer_active_boxes(
-                    sym,
-                    ctx.trace_ctx,
-                    ctx.registers_i,
-                    ctx.registers_r,
-                    ctx.registers_f,
-                    call_site_jc_index,
-                    call_site_py_pc,
-                    None,
-                    majit_ir::resumedata::NO_JITCODE_PC,
-                    None,
+    //
+    // The snapshot header coordinate (`sub_wc.entry_py_pc` /
+    // `sub_wc.outer_jitcode_index`, stamped below) MUST be the SAME coordinate
+    // these boxes are collected at.  A callee guard that collapses to the
+    // caller boundary stamps that coordinate as its resume `SnapshotFrame`
+    // header, and the decoder (`setup_bridge_sym`) reads the liveness window at
+    // that header to size and place the stored boxes
+    // (`reg_indices.total_len() == frame.values.len()`).  Collecting boxes at
+    // the CALL site but stamping the walk-entry header desyncs the two windows
+    // (count-mismatch assert / wrong slot layout), so carry the box coordinate
+    // to the header alongside the boxes.
+    let (inline_outer_active_boxes, inline_outer_py_pc, inline_outer_jc_index) =
+        if ctx.is_full_body_walk && ctx.outer_active_boxes.is_empty() {
+            let sym_ptr = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
+            if sym_ptr.is_null() {
+                (
+                    ctx.outer_active_boxes.clone(),
+                    ctx.entry_py_pc,
+                    ctx.outer_jitcode_index,
                 )
+            } else {
+                let sym = unsafe { &*sym_ptr };
+                if sym.jitcode.is_null() {
+                    (
+                        ctx.outer_active_boxes.clone(),
+                        ctx.entry_py_pc,
+                        ctx.outer_jitcode_index,
+                    )
+                } else {
+                    // Liveness coordinate is the CALL op's own (jitcode index,
+                    // py_pc) — NOT the `ctx` sentinels.  `dispatch_via_miframe`
+                    // initializes `ctx.outer_jitcode_index` to 0 and
+                    // `ctx.entry_py_pc` to the walk-entry py_pc, so for a CALL in
+                    // a non-root jitcode, or a CALL not at the walk-entry pc,
+                    // those select the wrong liveness window and the callee guard
+                    // snapshot encodes the wrong frame boxes.  Derive the
+                    // coordinate from the snapshot sym's jitcode at the CALL op's
+                    // pc, matching `orthodox_list_append_commit`.
+                    let (call_site_py_pc, call_site_jc_index) = unsafe {
+                        let jc = &*sym.jitcode;
+                        let jc_index = jc.index as u32;
+                        let mut py = python_pc_for_jitcode_pc(&jc.payload.metadata, op.pc);
+                        if !jc.payload.code_ptr.is_null() {
+                            let codeobj = &*jc.payload.code_ptr;
+                            py = skip_python_trivia_forward(codeobj, py as usize) as u32;
+                        }
+                        (py, jc_index)
+                    };
+                    let boxes = collect_outer_active_boxes(
+                        sym,
+                        ctx.trace_ctx,
+                        ctx.registers_i,
+                        ctx.registers_r,
+                        ctx.registers_f,
+                        call_site_jc_index,
+                        call_site_py_pc,
+                        None,
+                        majit_ir::resumedata::NO_JITCODE_PC,
+                        None,
+                    );
+                    (boxes, call_site_py_pc, call_site_jc_index)
+                }
             }
-        }
-    } else {
-        ctx.outer_active_boxes.clone()
-    };
+        } else {
+            (
+                ctx.outer_active_boxes.clone(),
+                ctx.entry_py_pc,
+                ctx.outer_jitcode_index,
+            )
+        };
     let callee_outcome = {
         let mut sub_wc = WalkContext {
             registers_r: &mut callee_regs_r,
@@ -12951,16 +12984,16 @@ fn try_walker_inline_user_call(
             sub_jitcode_lookup: callee_lookup,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: ctx.entry_py_pc,
-            outer_jitcode_index: ctx.outer_jitcode_index,
+            entry_py_pc: inline_outer_py_pc,
+            outer_jitcode_index: inline_outer_jc_index,
             outer_active_boxes: inline_outer_active_boxes,
         };
         // Guards emitted inside the callee body — both the walker's own
         // and the `_nonstandard_virtualizable` PTR_EQ promote that
         // `vable_getfield_*` records internally — resume at this CALL
-        // boundary (`sub_wc.entry_py_pc` / `outer_active_boxes`, inherited
-        // from the caller), not at a callee `op_pc` that has no meaning in
-        // the outer jitcode's py_pc→jitcode tables.  See
+        // boundary (`sub_wc.entry_py_pc` / `outer_active_boxes`, both stamped
+        // at the CALL-site coordinate above), not at a callee `op_pc` that has
+        // no meaning in the outer jitcode's py_pc→jitcode tables.  See
         // `INLINE_SUBWALK_CAPTURE_BOUNDARY`.
         let _inline_boundary = InlineSubwalkCaptureGuard::enter();
         // Track this callee on the FBW inline stack for the lifetime of the
