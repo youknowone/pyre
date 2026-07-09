@@ -3977,8 +3977,7 @@ impl ResumeDataLoopMemo {
             if crate::m369_resume_pc_audit_enabled()
                 && frame.jitcode_pc != majit_ir::resumedata::NO_JITCODE_PC
             {
-                let (py_pc, after_residual_call) =
-                    majit_ir::resumedata::decode_resume_pc(frame.pc);
+                let (py_pc, after_residual_call) = majit_ir::resumedata::decode_resume_pc(frame.pc);
                 eprintln!(
                     "[m369-audit] residual jitcode_pc frame: jitcode_index={} \
                      pc_raw={} pc={} after_residual_call={} jitcode_pc={} \

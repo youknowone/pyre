@@ -4795,6 +4795,19 @@ pub(crate) fn m369_route_audit_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_M369_ROUTE_AUDIT").is_some())
 }
 
+thread_local! {
+    /// `PYRE_M369_ROUTE_AUDIT` scratch: the innermost resume frame's
+    /// recoverability, captured while `build_resumed_frames` still has the raw
+    /// rd_numb header (`jitcode_index`, carried `jitcode_pc`) in scope, read by
+    /// the `bridge_decode` census line in `decode_and_restore_guard_failure`.
+    /// `(carried, portal)`: `carried` = a JitCode offset is stored (`jitcode_pc`
+    /// != NO_JITCODE_PC) so the #369 flip could re-derive py_pc by re-execution
+    /// (Option-B feasible); `portal` = a portal-bridge frame (empty block_head
+    /// map) whose py_pc is not offset-resolvable — a HARD blocker if !carried.
+    static M369_INNERMOST_RECOVERY: std::cell::Cell<Option<(bool, bool)>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// compile.py:710-716 resume_in_blackhole parity.
 ///
 /// RPython: resume_in_blackhole → blackhole_from_resumedata →
@@ -6955,11 +6968,20 @@ pub(crate) fn decode_and_restore_guard_failure(
             // blackhole instead (path-A).  `divergent_vs_ni` is true when the
             // stored py_pc differs from the vable-restored `next_instr` -> the
             // py_pc word is the only source, i.e. NOT droppable in favour of ni.
+            // `innermost_carried` (a JitCode offset is stored) => a #369 flip can
+            // re-derive py_pc by re-execution (Option-B feasible); `portal` with
+            // no carried offset is a HARD blocker (py_pc not offset-resolvable).
+            let (innermost_carried, innermost_portal) = M369_INNERMOST_RECOVERY
+                .with(|c| c.get())
+                .unwrap_or((false, false));
             eprintln!(
-                "[m369-route] source=bridge_decode frames={} single={} divergent_vs_ni={} resume_pc={} ni={}",
+                "[m369-route] source=bridge_decode frames={} single={} divergent_vs_ni={} \
+                 innermost_carried={} innermost_portal={} resume_pc={} ni={}",
                 resumed_frames.len(),
                 resumed_frames.len() == 1,
                 resume_pc != ni,
+                innermost_carried,
+                innermost_portal,
                 resume_pc,
                 ni
             );
@@ -7490,8 +7512,24 @@ fn build_resumed_frames(
         }
     }
 
+    let nframes = frames.len();
+    if m369_route_audit_enabled() {
+        M369_INNERMOST_RECOVERY.with(|c| c.set(None));
+    }
     let mut result = Vec::with_capacity(frames.len());
     for (idx, (frame, values)) in frames.iter().zip(all_values.into_iter()).enumerate() {
+        // The innermost frame's stored py_pc is the one that reaches the live
+        // frame `last_instr` on the single-frame bridge-trace path (path-B); its
+        // carried jitcode_pc / portal-bridge status decides whether a #369 flip
+        // could re-derive that py_pc from the offset. Capture it here while the
+        // raw rd_numb header is in scope.
+        if m369_route_audit_enabled() && idx + 1 == nframes {
+            let carried = frame.jitcode_pc != majit_ir::resumedata::NO_JITCODE_PC;
+            let portal = pyre_jit_trace::state::pyjitcode_for_jitcode_index(frame.jitcode_index)
+                .map(|p| p.metadata.block_head_py_by_jit_pc.is_empty())
+                .unwrap_or(false);
+            M369_INNERMOST_RECOVERY.with(|c| c.set(Some((carried, portal))));
+        }
         // resume.py:1338 read_jitcode_pos_pc parity:
         // py_pc comes from rd_numb frame header (frame.pc = orgpc).
         // pc=0 is valid (function start). pc=-1 = no-snapshot sentinel.

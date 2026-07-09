@@ -709,7 +709,9 @@ impl PyJitCode {
         };
         match resolved {
             None => {
-                eprintln!("[m369-recover] bucket={bucket} match=unresolved raw_pc={raw_pc} py_pc={py_pc}");
+                eprintln!(
+                    "[m369-recover] bucket={bucket} match=unresolved raw_pc={raw_pc} py_pc={py_pc}"
+                );
             }
             Some(flip_offset) => {
                 let recovered =
