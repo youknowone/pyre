@@ -1616,6 +1616,20 @@ fn format_with_spec(val: PyObjectRef, spec: &str) -> Result<Wtf8Buf, crate::PyEr
             // but not a sign or `=` alignment, which are also disallowed for
             // strings.
             reject_string_sign_align(spec)?;
+            // A `0` fill flag at the start of the width pads text with the
+            // default-left alignment; the shared formatter treats it as a
+            // numeric alignment, so handle it here.
+            let sc: Vec<char> = spec.chars().collect();
+            let zero_fill = if sc.len() >= 2 && matches!(sc[1], '<' | '>' | '=' | '^') {
+                sc.get(2) == Some(&'0')
+            } else if sc.first().is_some_and(|c| matches!(c, '<' | '>' | '=' | '^')) {
+                sc.get(1) == Some(&'0')
+            } else {
+                sc.first() == Some(&'0')
+            };
+            if zero_fill {
+                return format_surrogate_str(full, spec);
+            }
             // A valid-UTF-8 body goes through the shared string formatter,
             // which pads by code point.
             if let Ok(valid) = full.as_str() {
@@ -1693,6 +1707,10 @@ fn format_surrogate_str(body: &Wtf8, spec: &str) -> Result<Wtf8Buf, crate::PyErr
     } else if n >= 1 && matches!(chars[0], '<' | '>' | '=' | '^') {
         align = chars[0];
         i = 1;
+    }
+    if i < n && chars[i] == '0' {
+        fill = '0';
+        i += 1;
     }
     let mut width = 0usize;
     while i < n && chars[i].is_ascii_digit() {
