@@ -616,6 +616,23 @@ unsafe fn memoryview_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut
             f(w_strides as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
             trace_buffer_exporter(backing, f);
         }
+        // Simple / Raw derive their shape / strides (and Simple its format),
+        // so only the `.obj` exporter, the backing, and — for Raw — the
+        // explicit format object are ref slots to forward.
+        pyre_object::bufferview::BufferView::Simple { backing, w_obj, .. } => {
+            f(w_obj as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+            trace_buffer_exporter(backing, f);
+        }
+        pyre_object::bufferview::BufferView::Raw {
+            backing,
+            w_obj,
+            w_fmt,
+            ..
+        } => {
+            f(w_obj as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+            f(w_fmt as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+            trace_buffer_exporter(backing, f);
+        }
     }
 }
 

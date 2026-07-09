@@ -106,6 +106,27 @@ pub enum BufferView {
         length: i64,
         readonly: bool,
     },
+    /// `SimpleView` (`pypy/interpreter/buffer.py:270`) — a plain contiguous
+    /// 1-D byte view (`bytes` / `bytearray`).  Format `'B'`, itemsize 1,
+    /// ndim 1, offset 0, shape `[length]`, strides `[1]` are all derived;
+    /// `readonly` comes from the backing, so nothing but the exporter refs is
+    /// stored.
+    Simple {
+        backing: Buffer,
+        w_obj: PyObjectRef,
+        length: i64,
+    },
+    /// `RawBufferView` (`buffer.py:231`) — a typed contiguous 1-D view
+    /// (`array.array`).  Format / itemsize are explicit; ndim 1, offset 0,
+    /// shape `[length / itemsize]` (`[0]` when empty), strides `[itemsize]`
+    /// derive; `readonly` comes from the backing.
+    Raw {
+        backing: Buffer,
+        w_obj: PyObjectRef,
+        w_fmt: PyObjectRef,
+        itemsize: i64,
+        length: i64,
+    },
 }
 
 impl BufferView {
@@ -113,65 +134,132 @@ impl BufferView {
     #[inline]
     pub fn backing(&self) -> &Buffer {
         match self {
-            BufferView::Strided { backing, .. } => backing,
+            BufferView::Strided { backing, .. }
+            | BufferView::Simple { backing, .. }
+            | BufferView::Raw { backing, .. } => backing,
         }
     }
     /// The exporter reported by `memoryview.obj`.
     #[inline]
     pub fn w_obj(&self) -> PyObjectRef {
         match self {
-            BufferView::Strided { w_obj, .. } => *w_obj,
+            BufferView::Strided { w_obj, .. }
+            | BufferView::Simple { w_obj, .. }
+            | BufferView::Raw { w_obj, .. } => *w_obj,
         }
     }
-    /// Format string object (`memoryview.format`).
+    /// The element format string (`getformat`), read natively — the callers
+    /// that need a Python `str` wrap a fresh one at the `descr` boundary.  A
+    /// `Simple` view derives `'B'`; a `Raw` view reads its explicit format.
+    ///
+    /// # Safety
+    /// The view's stored format object must be a live `str`.
     #[inline]
-    pub fn w_format(&self) -> PyObjectRef {
-        match self {
-            BufferView::Strided { w_format, .. } => *w_format,
+    pub unsafe fn format_str(&self) -> &'static str {
+        unsafe {
+            match self {
+                BufferView::Strided { w_format, .. } => crate::w_str_get_value(*w_format),
+                BufferView::Simple { .. } => "B",
+                BufferView::Raw { w_fmt, .. } => crate::w_str_get_value(*w_fmt),
+            }
         }
     }
-    /// Shape tuple (`memoryview.shape`).
+    /// The per-dimension element counts (`getshape`) as native extents.  A
+    /// `Simple` view is `[length]`; a `Raw` view is `[length / itemsize]`
+    /// (`[0]` when empty, `buffer.py:254`).
+    ///
+    /// # Safety
+    /// The view's stored shape object must be a live tuple of ints.
     #[inline]
-    pub fn w_shape(&self) -> PyObjectRef {
-        match self {
-            BufferView::Strided { w_shape, .. } => *w_shape,
+    pub unsafe fn native_shape(&self) -> Vec<i64> {
+        unsafe {
+            match self {
+                BufferView::Strided { w_shape, .. } => read_dims(*w_shape),
+                BufferView::Simple { length, .. } => vec![*length],
+                BufferView::Raw {
+                    itemsize, length, ..
+                } => {
+                    if *length == 0 {
+                        vec![0]
+                    } else {
+                        vec![*length / *itemsize]
+                    }
+                }
+            }
         }
     }
-    /// Strides tuple (`memoryview.strides`).
+    /// The per-dimension byte steps (`getstrides`) as native extents.  A
+    /// `Simple` view is `[1]`; a `Raw` view is `[itemsize]`.
+    ///
+    /// # Safety
+    /// The view's stored strides object must be a live tuple of ints.
     #[inline]
-    pub fn w_strides(&self) -> PyObjectRef {
-        match self {
-            BufferView::Strided { w_strides, .. } => *w_strides,
+    pub unsafe fn native_strides(&self) -> Vec<i64> {
+        unsafe {
+            match self {
+                BufferView::Strided { w_strides, .. } => read_dims(*w_strides),
+                BufferView::Simple { .. } => vec![1],
+                BufferView::Raw { itemsize, .. } => vec![*itemsize],
+            }
+        }
+    }
+    /// `strides[0]` — the signed byte step between consecutive elements of a
+    /// 1-D view, falling back to `itemsize` when the strides are empty.
+    ///
+    /// # Safety
+    /// The view's stored strides object must be a live tuple of ints.
+    #[inline]
+    pub unsafe fn stride0(&self) -> i64 {
+        unsafe {
+            match self {
+                BufferView::Strided {
+                    w_strides,
+                    itemsize,
+                    ..
+                } => crate::tupleobject::w_tuple_getitem(*w_strides, 0)
+                    .map(|s| crate::intobject::w_int_get_value(s))
+                    .unwrap_or(*itemsize),
+                BufferView::Simple { .. } => 1,
+                BufferView::Raw { itemsize, .. } => *itemsize,
+            }
         }
     }
     #[inline]
     pub fn itemsize(&self) -> i64 {
         match self {
-            BufferView::Strided { itemsize, .. } => *itemsize,
+            BufferView::Strided { itemsize, .. } | BufferView::Raw { itemsize, .. } => *itemsize,
+            BufferView::Simple { .. } => 1,
         }
     }
     #[inline]
     pub fn ndim(&self) -> i64 {
         match self {
             BufferView::Strided { ndim, .. } => *ndim,
+            BufferView::Simple { .. } | BufferView::Raw { .. } => 1,
         }
     }
     #[inline]
     pub fn offset(&self) -> i64 {
         match self {
             BufferView::Strided { offset, .. } => *offset,
+            BufferView::Simple { .. } | BufferView::Raw { .. } => 0,
         }
     }
     #[inline]
     pub fn length(&self) -> i64 {
         match self {
-            BufferView::Strided { length, .. } => *length,
+            BufferView::Strided { length, .. }
+            | BufferView::Simple { length, .. }
+            | BufferView::Raw { length, .. } => *length,
         }
     }
     #[inline]
     pub fn readonly(&self) -> bool {
         match self {
             BufferView::Strided { readonly, .. } => *readonly,
+            BufferView::Simple { backing, .. } | BufferView::Raw { backing, .. } => {
+                backing.readonly()
+            }
         }
     }
 
@@ -186,32 +274,25 @@ impl BufferView {
     /// tagged kind.
     pub unsafe fn gather(&self) -> Vec<u8> {
         unsafe {
-            let BufferView::Strided {
-                backing,
-                w_shape,
-                w_strides,
-                itemsize,
-                ndim,
-                offset,
-                length,
-                ..
-            } = self;
-            let full = backing.as_bytes();
-            let isz = (*itemsize).max(0) as usize;
-            if *ndim == 0 {
+            let itemsize = self.itemsize();
+            let ndim = self.ndim();
+            let offset = self.offset();
+            let full = self.backing().as_bytes();
+            let isz = itemsize.max(0) as usize;
+            if ndim == 0 {
                 let mut out = Vec::with_capacity(isz);
-                copy_base(full, *offset, isz, &mut out);
+                copy_base(full, offset, isz, &mut out);
                 return out;
             }
-            let shape = read_dims(*w_shape);
-            let strides = read_dims(*w_strides);
-            let count = if *itemsize > 0 {
-                *length / *itemsize
+            let shape = self.native_shape();
+            let strides = self.native_strides();
+            let count = if itemsize > 0 {
+                self.length() / itemsize
             } else {
                 0
             };
             let mut out = Vec::with_capacity(count.max(0) as usize * isz);
-            copy_rec(full, &shape, &strides, *ndim, 0, *offset, isz, &mut out);
+            copy_rec(full, &shape, &strides, ndim, 0, offset, isz, &mut out);
             out
         }
     }

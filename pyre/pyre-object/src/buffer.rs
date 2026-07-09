@@ -73,6 +73,18 @@ impl Buffer {
         }
     }
 
+    /// Whether the exporter's storage is read-only (`Buffer.readonly`,
+    /// `rpython/rlib/buffer.py:53`).  `bytes` is immutable; `bytearray` /
+    /// `array` are writable; a `Sub` inherits its parent's mutability.
+    #[inline]
+    pub fn readonly(&self) -> bool {
+        match self {
+            Buffer::String { .. } => true,
+            Buffer::Byte { .. } | Buffer::Array { .. } => false,
+            Buffer::Sub { parent, .. } => parent.readonly(),
+        }
+    }
+
     /// The root exporter object whose storage this buffer reads/writes; a
     /// `Sub` reports its parent's exporter (`SubBuffer` has no `.obj` of its
     /// own).
