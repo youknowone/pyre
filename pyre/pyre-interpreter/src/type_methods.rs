@@ -1073,6 +1073,11 @@ fn format_render(
         // `Some(true)` = automatic `{}`, `Some(false)` = manual `{0}`).
         let FieldName { field_type, parts } =
             FieldName::parse(field_name).map_err(|e| format_parse_err(e, fmt))?;
+        if mapping.is_some() && matches!(field_type, FieldType::Auto | FieldType::Index(_)) {
+            return Err(crate::PyError::value_error(
+                "Format string contains positional fields",
+            ));
+        }
         let mut val = match field_type {
             FieldType::Auto => {
                 if let Some(false) = *numbering {
