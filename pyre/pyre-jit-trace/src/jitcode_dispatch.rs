@@ -9213,6 +9213,21 @@ pub(crate) fn m73_flip_audit_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_M73_FLIP_AUDIT").is_some())
 }
 
+/// `PYRE_M73_DERIVED_AUDIT` (#73 S4, default OFF): the py_pc-deletion
+/// precondition census. For each depth-0 branch-guard capture, compares the
+/// resume consumers (liveness banks, bridge semantic maps, const ref slots,
+/// AND the loop-header walk-entry merge-point/register seed) keyed at the raw
+/// `derived` (not-taken-arm jitcode offset) vs the block-head `marker` the
+/// decode currently reconstructs. Certifies `consumers(derived) ==
+/// consumers(marker)` on the `derived != marker` subset — the precondition for
+/// returning `derived` directly and deleting the py_pc round-trip from
+/// `expand_branch_carried`. Read-only; OFF is byte-identical, ON adds only
+/// `M73_DERIVED` stderr lines.
+pub(crate) fn m73_derived_audit_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_M73_DERIVED_AUDIT").is_some())
+}
+
 /// `PYRE_M73_PEROP_CARRY` (#73 S2, default ON): source a specialization
 /// guard's (`GuardValue`/`GuardClass`) resume coordinate from the walk
 /// cursor's per-op `-live-` BEFORE anchor (`ctx.live_before_jit_pc`,
@@ -10992,6 +11007,115 @@ fn walker_capture_snapshot_for_last_guard_impl(
                                         );
                                     }
                                 }
+                            }
+                        }
+                    }
+                }
+                // #73 S4 (SUB-A) derived-vs-marker precondition census
+                // (`PYRE_M73_DERIVED_AUDIT`, default OFF): a STANDALONE sibling
+                // of the FLIP_AUDIT block above (fires independently of it).
+                // For each depth-0 branch guard it re-derives its own `orgpc`
+                // (`ctx.live_before_jit_pc`) and the not-taken-arm landing
+                // `derived = decode_side_other_target(orgpc, flavor)`, then
+                // compares EVERY resume consumer keyed at the raw `derived`
+                // jitcode offset vs today's block-head `marker`: liveness banks
+                // (a), bridge semantic maps (b), const ref slots (c), and the
+                // loop-header walk-entry merge-point governance + (gr, rr) seed
+                // (d) — the leg banks/bmaps equality does NOT cover. Certifies
+                // `consumers(derived) == consumers(marker)`, the precondition
+                // for returning `derived` directly and deleting the py_pc
+                // round-trip in `expand_branch_carried`. Read-only; no asserts;
+                // the carried word is left untouched (OFF is byte-identical).
+                if m73_derived_audit_enabled() {
+                    let is_branch = matches!(
+                        ctx.trace_ctx.last_guard_opcode(),
+                        Some(OpCode::GuardTrue | OpCode::GuardFalse)
+                    );
+                    let orgpc = ctx.live_before_jit_pc;
+                    if is_branch && orgpc != usize::MAX {
+                        if let Some(m) = marker {
+                            let flavor_true = matches!(
+                                ctx.trace_ctx.last_guard_opcode(),
+                                Some(OpCode::GuardTrue)
+                            );
+                            let jc = unsafe { &*sym.jitcode };
+                            let code = jc.payload.jitcode.code.as_slice();
+                            if let Ok(derived) =
+                                decode_side_other_target(code, orgpc, flavor_true)
+                            {
+                                let derived_eq_marker = derived as i32 == m as i32;
+                                // Whether the walk cursor could key at `derived`
+                                // — the same `can_decode_live_vars` test the
+                                // consumers gate their jitcode-pc read on.
+                                let decodable = jc
+                                    .payload
+                                    .jitcode
+                                    .can_decode_live_vars(derived, crate::state::op_live());
+                                let ji = jitcode_index as i32;
+                                let pp = py_pc as i32;
+                                // (a) liveness reg-index banks.
+                                let banks_d =
+                                    crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
+                                        ji, pp, derived as i32,
+                                    );
+                                let banks_m =
+                                    crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
+                                        ji, pp, m as i32,
+                                    );
+                                let banks_eq = banks_d.int == banks_m.int
+                                    && banks_d.ref_ == banks_m.ref_
+                                    && banks_d.float == banks_m.float;
+                                // (b) bridge semantic maps (depth + pcdep).
+                                let bm_d = crate::state::bridge_semantic_maps_at_with_jitcode_pc(
+                                    ji, pp, derived as i32,
+                                );
+                                let bm_m = crate::state::bridge_semantic_maps_at_with_jitcode_pc(
+                                    ji, pp, m as i32,
+                                );
+                                let bmaps_eq = bm_d.stack_depth_at_pc == bm_m.stack_depth_at_pc
+                                    && bm_d.pcdep_entries == bm_m.pcdep_entries;
+                                // (c) const ref slot refill (cold in the default
+                                // corpus — both sides empty flags `const_cold`).
+                                let const_d =
+                                    crate::state::const_ref_slots_at_pc_at(ji, pp, derived as i32);
+                                let const_m =
+                                    crate::state::const_ref_slots_at_pc_at(ji, pp, m as i32);
+                                let const_eq = const_d == const_m;
+                                let const_cold = const_d.is_empty() && const_m.is_empty();
+                                // (d) loop-header walk-entry merge-point seed
+                                // (`sym.bridge_walk_entry_pc` -> entry ->
+                                // `loop_header_merge_point_regs`, trace.rs:1123 +
+                                // walk-replay start 1319). Compare BOTH the
+                                // governing merge-point selection (mirrors the
+                                // `<= entry` max / `>= entry` min pick at
+                                // trace.rs:379) AND the (gr, rr) register vectors
+                                // the real seed reads.
+                                let governing_mp = |coord: usize| -> Option<usize> {
+                                    crate::jitcode_runtime::decoded_ops(code)
+                                        .filter(|op| op.opname == "jit_merge_point")
+                                        .map(|op| op.pc)
+                                        .filter(|&p| p <= coord)
+                                        .max()
+                                        .or_else(|| {
+                                            crate::jitcode_runtime::decoded_ops(code)
+                                                .filter(|op| op.opname == "jit_merge_point")
+                                                .map(|op| op.pc)
+                                                .filter(|&p| p >= coord)
+                                                .min()
+                                        })
+                                };
+                                let regs_d =
+                                    crate::trace::loop_header_merge_point_regs(code, derived);
+                                let regs_m = crate::trace::loop_header_merge_point_regs(code, m);
+                                let mp_eq =
+                                    governing_mp(derived) == governing_mp(m) && regs_d == regs_m;
+                                eprintln!(
+                                    "M73_DERIVED derived={derived} marker={m} \
+                                     derived_eq_marker={derived_eq_marker} \
+                                     decodable={decodable} banks_eq={banks_eq} \
+                                     bmaps_eq={bmaps_eq} const_eq={const_eq} \
+                                     const_cold={const_cold} mp_eq={mp_eq}"
+                                );
                             }
                         }
                     }

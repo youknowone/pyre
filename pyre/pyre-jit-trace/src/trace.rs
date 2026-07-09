@@ -368,7 +368,7 @@ pub fn trace_bytecode(
 /// count-prefixed register lists `gi, gr, gf, ri, rr, rf`.  Returns `None`
 /// when no preceding merge point exists (straight-line resume) or the
 /// operand stream is truncated.
-fn loop_header_merge_point_regs(code: &[u8], entry: usize) -> Option<(Vec<u8>, Vec<u8>)> {
+pub(crate) fn loop_header_merge_point_regs(code: &[u8], entry: usize) -> Option<(Vec<u8>, Vec<u8>)> {
     // The merge point governing `entry`.  A body-guard resume enters PAST the
     // merge point, so the merge point precedes `entry` and the last `op.pc <=
     // entry` is the governing one.  A HEADER-entry resume keys to the header
