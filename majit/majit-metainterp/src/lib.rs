@@ -237,6 +237,19 @@ pub fn no_unroll_enabled() -> bool {
     *FLAG.get_or_init(|| std::env::var_os("PYRE_NO_UNROLL").is_some())
 }
 
+/// `PYRE_M369_RESUME_PC_AUDIT`: instrument the resume-data encoder to report
+/// every per-frame `jitcode_pc` word that carries a non-sentinel value. Those
+/// are the kept-stack branch-guard frames where the Python `pc` word alone
+/// cannot describe the resume coordinate, so the extra `jitcode_pc` word is
+/// still load-bearing. Default off (a pure `eprintln!` behind the flag; the
+/// emitted `rd_numb` bytes are unchanged). When a corpus run reports zero
+/// residuals, the word is redundant and the frame chain can collapse to the
+/// 2-word `(jitcode_index, pc)` shape (resume.py:249-253).
+pub fn m369_resume_pc_audit_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("PYRE_M369_RESUME_PC_AUDIT").is_some())
+}
+
 /// `PYRE_ORIGINAL_BOXES`: default true, only disabled by `0` or `false`.
 pub fn original_boxes_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
