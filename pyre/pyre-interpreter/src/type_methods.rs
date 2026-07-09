@@ -51,8 +51,9 @@ pub(crate) fn arity_exact(
     Ok(())
 }
 
-/// TypeError for a method requiring at least `min` positional arguments
-/// after the receiver, called with fewer.
+/// TypeError for a method accepting at least `min` positional arguments
+/// after the receiver, called with fewer — the PyArg_UnpackTuple
+/// "X expected at least N arguments, got M" form (`str.index`, `dict.get`).
 pub(crate) fn arity_at_least(
     args: &[PyObjectRef],
     name: &str,
@@ -60,7 +61,26 @@ pub(crate) fn arity_at_least(
 ) -> Result<(), crate::PyError> {
     if args.len() < min + 1 {
         return Err(crate::PyError::type_error(format!(
-            "{name}() takes at least {min} argument{} ({} given)",
+            "{name} expected at least {min} argument{}, got {}",
+            if min == 1 { "" } else { "s" },
+            args.len().saturating_sub(1),
+        )));
+    }
+    Ok(())
+}
+
+/// TypeError for a method requiring at least `min` positional arguments
+/// after the receiver, called with fewer — the METH_FASTCALL
+/// "X() takes at least N positional arguments (M given)" form
+/// (`str.replace`, `bytes.translate`).
+pub(crate) fn arity_at_least_positional(
+    args: &[PyObjectRef],
+    name: &str,
+    min: usize,
+) -> Result<(), crate::PyError> {
+    if args.len() < min + 1 {
+        return Err(crate::PyError::type_error(format!(
+            "{name}() takes at least {min} positional argument{} ({} given)",
             if min == 1 { "" } else { "s" },
             args.len().saturating_sub(1),
         )));
@@ -574,7 +594,7 @@ pub fn str_method_casefold(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 /// custom `Mapping` subclasses, and any object that only implements
 /// `__getitem__`.
 pub fn str_method_format_map(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    arity_at_least(args, "format_map", 1)?;
+    arity_exact(args, "str.format_map", 1)?;
     let fmt = args[0];
     let mapping = args[1];
     str_method_format_core(fmt, &[], None, Some(mapping))
@@ -767,7 +787,7 @@ fn str_prefix_match(
 }
 
 pub fn str_method_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    arity_at_least(args, "replace", 2)?;
+    arity_at_least_positional(args, "replace", 2)?;
     // pypy/objspace/std/unicodeobject.py:1132-1148 descr_replace —
     // both `old` and `new` must be str / W_UnicodeObject; otherwise
     // TypeError("replace() argument N must be str, not ...").
@@ -2617,7 +2637,7 @@ fn is_identifier(s: &str) -> bool {
 /// a sign character (`+`/`-`), the sign stays at the front and zeros
 /// fill between it and the digits (`'-42'.zfill(5) == '-0042'`).
 pub fn str_method_zfill(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    arity_at_least(args, "zfill", 1)?;
+    arity_exact(args, "str.zfill", 1)?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let width = unsafe { w_int_get_value(args[1]) }.max(0) as usize;
     let len = s.code_points().count();
@@ -3095,7 +3115,7 @@ fn wtf8_replace(input: &Wtf8, sub: &Wtf8, by: &Wtf8, maxcount: i64) -> Wtf8Buf {
 
 /// PyPy: unicodeobject.py descr_partition
 pub fn str_method_partition(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    arity_at_least(args, "partition", 1)?;
+    arity_exact(args, "str.partition", 1)?;
     let s = unsafe { pyre_object::w_str_get_wtf8(args[0]) }.as_bytes();
     let sep = unsafe { pyre_object::w_str_get_wtf8(args[1]) }.as_bytes();
     match wtf8_find_bounded(s, sep, 0, s.len()) {
@@ -3110,7 +3130,7 @@ pub fn str_method_partition(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 
 /// PyPy: unicodeobject.py descr_rpartition
 pub fn str_method_rpartition(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    arity_at_least(args, "rpartition", 1)?;
+    arity_exact(args, "str.rpartition", 1)?;
     let s = unsafe { pyre_object::w_str_get_wtf8(args[0]) }.as_bytes();
     let sep = unsafe { pyre_object::w_str_get_wtf8(args[1]) }.as_bytes();
     match wtf8_rfind_bounded(s, sep, 0, s.len()) {
@@ -3241,7 +3261,7 @@ pub fn str_method_expandtabs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 /// str.translate(table) — table is a dict mapping ordinals (int) to
 /// ordinals (int), strings (str), or None (delete).
 pub fn str_method_translate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    arity_at_least(args, "translate", 1)?;
+    arity_exact(args, "str.translate", 1)?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let table = args[1];
     let mut result = Wtf8Buf::with_capacity(s.len());

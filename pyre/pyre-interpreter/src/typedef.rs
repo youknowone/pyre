@@ -10907,7 +10907,7 @@ fn bytes_method_center(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 /// `bytesobject.py:descr_zfill` — left-pad with `b'0'` to `width`,
 /// keeping a leading `+`/`-` sign ahead of the zeros.
 fn bytes_method_zfill(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    crate::type_methods::arity_at_least(args, "zfill", 1)?;
+    crate::type_methods::arity_exact(args, "bytes.zfill", 1)?;
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     let width = crate::builtins::space_index_w(args[1])?;
     let len = data.len() as i64;
@@ -11037,12 +11037,12 @@ fn bytes_method_removesuffix(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 /// the optional `delete` set.  `delete` may be positional or the
 /// `delete=` keyword.
 fn bytes_method_translate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    crate::type_methods::arity_at_least(args, "translate", 1)?;
+    crate::type_methods::arity_at_least_positional(args, "translate", 1)?;
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     let (positional, kwargs) = crate::builtins::split_builtin_kwargs(&args[1..]);
     let Some(&table_obj) = positional.first() else {
         return Err(crate::PyError::type_error(
-            "translate() takes at least 1 argument (0 given)",
+            "translate() takes at least 1 positional argument (0 given)",
         ));
     };
     let table: Option<&[u8]> = unsafe {
