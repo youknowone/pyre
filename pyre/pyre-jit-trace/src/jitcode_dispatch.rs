@@ -11668,7 +11668,10 @@ fn callee_fast_path_inlinable(
 /// Conservative: a general ref-first-arg residual call (`residual_call_r_*`, an
 /// arbitrary Python call / constructor that may raise or mutate), a VOID
 /// residual call (`..._v`, a statement run for its effect — a store / append),
-/// or an explicit vable/gc field or array write all count as a side effect.
+/// or an explicit vable/gc field, array, or interior-field write all count as a
+/// side effect (`setinteriorfield_gc_*` — an array-of-struct / dict-storage
+/// write — is caught by the `setinteriorfield` substring; note the plain
+/// `setfield` substring does not span it).
 fn strict_callee_collapse_unsound(body_code: &[u8]) -> bool {
     let mut pc = 0usize;
     while pc < body_code.len() {
@@ -11682,6 +11685,7 @@ fn strict_callee_collapse_unsound(body_code: &[u8]) -> bool {
             || (op.starts_with("residual_call") && op.ends_with("_v"))
             || op.contains("setfield")
             || op.contains("setarrayitem")
+            || op.contains("setinteriorfield")
         {
             return true;
         }
