@@ -14069,7 +14069,13 @@ pub enum InlineDecision {
     Inline,
     /// Emit a CALL_ASSEMBLER: callee has compiled code.
     CallAssembler,
-    /// Emit a residual (opaque) call.
+    /// Callee not compiled and no on-demand token machinery.  pyjitpl.py:1417
+    /// (`inlining` true) would build the token via `compile_tmp_callback`
+    /// (warmstate.py:714-722) and still emit CALL_ASSEMBLER; lacking that here,
+    /// this variant means "no token yet" and the dispatcher aborts/retries
+    /// until the callee compiles.  It is not pyjitpl.py's `inlining`-false
+    /// residual call.  See `should_inline_core` for the same
+    /// `compile_tmp_callback` gap.
     ResidualCall,
 }
 
@@ -14092,9 +14098,18 @@ pub(crate) fn decide_recursive_inline(
     recursive_depth: usize,
     max_unroll: usize,
 ) -> (InlineDecision, bool) {
-    // pyjitpl.py:1417 — a non-inlined recursive call routes to
-    // CALL_ASSEMBLER when the callee has (or is converging on) compiled
-    // code, else to a residual call.
+    // pyjitpl.py:1417 — with `warmrunnerstate.inlining` true (pyjitpl.py:1381,
+    // always the case here) a non-inlined recursive call always takes
+    // `assembler_call = True`.  When the callee is (or is converging on)
+    // compiled it routes to CALL_ASSEMBLER against the resolvable token; when
+    // it is not compiled, pyjitpl.py:1417 still takes `assembler_call = True`
+    // and `get_assembler_token` synthesises the token on demand via
+    // `compile_tmp_callback` (warmstate.py:714-722).  There is no
+    // `compile_tmp_callback` here, so the not-compiled case is labelled
+    // `ResidualCall` — a stand-in meaning "no token yet, cannot emit
+    // CALL_ASSEMBLER" — which the dispatcher turns into abort/retry.  It is
+    // NOT pyjitpl.py's `inlining`-false residual (`assembler_call = False`)
+    // path.
     let non_inline = if callee_compiled {
         InlineDecision::CallAssembler
     } else {

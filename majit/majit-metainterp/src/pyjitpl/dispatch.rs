@@ -2097,9 +2097,21 @@ where
             );
         }
         if decision != crate::pyjitpl::InlineDecision::Inline {
-            // `ResidualCall` is not wired in this epic; abort so the trace
-            // is retried rather than recording an unhandled call
-            // (pyjitpl.py falls to `do_residual_call`; pyre retries).
+            // `ResidualCall` here labels pyjitpl.py:1376's callee-not-compiled
+            // case.  Under `warmrunnerstate.inlining` (pyjitpl.py:1381, always
+            // true here — warmstate.rs:471) that case takes
+            // `assembler_call = True` (pyjitpl.py:1417) →
+            // `direct_assembler_call` → `get_assembler_token`, which
+            // synthesises the callee token on demand via `compile_tmp_callback`
+            // (warmstate.py:714-722); it is NOT a residual call.  There is no
+            // `compile_tmp_callback` here (pyjitpl.rs `should_inline_core`),
+            // so the on-demand token cannot be built at this point: abort and
+            // retry until the callee compiles on its own, after which a later
+            // attempt takes the wired `CallAssembler` leg
+            // (`exec_recursive_call_assembler`).  pyjitpl.py's true residual
+            // path (`assembler_call = False`, do_residual_call) is reachable
+            // only when `inlining` is false, which is never the case here, so
+            // it is intentionally unmodelled.
             return TraceAction::Abort;
         }
         // pc-aligned portal runtimes (dispatch.rs test fixtures) wire
