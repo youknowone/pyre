@@ -2565,6 +2565,17 @@ pub fn dispatch_via_miframe(
     // so `fbw_mode.snapshot_sym` is non-null on every default-JIT
     // run.  `PYRE_FULL_BODY_WALK=0` is the only opt-out
     // (the transitional trait leg), which leaves the pointer null.
+    // Recover the portal EC red off `sym.frame` before the first opcode is
+    // dispatched (thus before any guard is recorded), caching it into
+    // `sym.execution_context`.  A bridge-from-guard sym whose ec color collides
+    // with a real frame slot is left `OpRef::NONE` by `setup_bridge_sym`, which
+    // defers recovery to `ensure_execution_context`.  The walker's
+    // snapshot-capture path runs `collect_outer_active_boxes` AFTER the guard,
+    // so recovering there would record the getfield after the guard that
+    // references it (use-before-def).  Seed here — the trait's pre-guard
+    // cache-once analog — so every guard snapshot reads a real EC OpRef.
+    seed_execution_context_for_walk(sym, trace_ctx);
+
     // RPython parity: `metainterp.last_exc_value` (pyjitpl.py:1695)
     // is the standing exception OpRef. Walker's `WalkContext::last_exc_value`
     // mirrors this as `Option<OpRef>` — `None` means "no active
@@ -6906,7 +6917,7 @@ fn opref_is_null_const_ptr(op: OpRef) -> bool {
 
 fn collect_outer_active_boxes(
     sym: &crate::state::PyreSym,
-    trace_ctx: &TraceCtx,
+    trace_ctx: &mut TraceCtx,
     regs_i: &[OpRef],
     regs_r: &[OpRef],
     regs_f: &[OpRef],
@@ -7137,7 +7148,40 @@ fn collect_outer_active_boxes(
         let value = if is_portal_red_scratch {
             if color as u16 == portal_frame_reg {
                 sym.frame
+            } else if !sym.execution_context.is_none() {
+                // EC red already seeded on this snapshot path.
+                sym.execution_context
+            } else if !sym.frame.is_none() {
+                // Adapter / inline-caller snapshot path leaves
+                // `sym.execution_context` unseeded (`OpRef::NONE`).  This is the
+                // pre-guard inline-parent-frame collection (the paused caller's
+                // active boxes are built BEFORE the callee sub-walk records its
+                // guards), so recording the recovery getfield here is
+                // well-ordered.  Recover the EC from the frame the same way the
+                // trait encoder's `ensure_execution_context` does
+                // (trace_opcode.rs:1248): record `getfield
+                // frame.execution_context` and route that OpRef through as the
+                // portal EC red, so the resume snapshot never pushes NONE for
+                // `interp_jit.py:67 reds = ['frame', 'ec']`.  A NONE EC escapes
+                // as a null execution-context pointer and SIGSEGVs (rc=139) or
+                // trips the Ref-bank NONE guard (rc=101).
+                //
+                // The post-guard snapshot-capture path
+                // (`walker_capture_snapshot_for_last_guard`) reaches this fn with
+                // the outer full-body `sym`, whose EC is eagerly recovered at
+                // walk entry (`seed_execution_context_for_walk`) — so on that
+                // path `sym.execution_context` is already real above and this
+                // branch (which would record AFTER the guard, a use-before-def)
+                // is not taken.
+                trace_ctx.record_op_with_descr(
+                    OpCode::GetfieldGcR,
+                    &[sym.frame],
+                    crate::descr::pyframe_execution_context_descr(),
+                )
             } else {
+                // Neither EC nor frame is recoverable: keep the raw NONE so the
+                // downstream Ref-bank NONE guard surfaces the unrecoverable case
+                // instead of silently masking it.
                 sym.execution_context
             }
         } else if owns_vable {
@@ -16014,6 +16058,43 @@ fn walker_ensure_execution_context(ctx: &mut WalkContext<'_, '_>) -> Option<OpRe
         crate::descr::pyframe_execution_context_descr(),
     );
     Some(ec)
+}
+
+/// Eagerly recover the portal EC red before the full-body walk records its
+/// first guard, caching it into `sym.execution_context`.
+///
+/// The portal `[frame, ec]` reds (`interp_jit.py:67 reds = ['frame', 'ec']`)
+/// are force-alived in every `-live-` op's R-bank, so every guard's resume
+/// snapshot lists the EC color.  Loop / function-entry syms seed
+/// `sym.execution_context = InputArgRef(1)` at `create_sym`, but a
+/// bridge-from-guard sym whose ec color collides with a real frame slot is
+/// left `OpRef::NONE` by `setup_bridge_sym` (state.rs:8300-8326), which defers
+/// the recovery to `ensure_execution_context`.
+///
+/// The trait leg performs that recovery inside `get_list_of_active_boxes`,
+/// which runs BEFORE the guard is recorded, so its getfield is well-ordered.
+/// The walker's snapshot-capture path
+/// (`walker_capture_snapshot_for_last_guard` → `collect_outer_active_boxes`)
+/// runs AFTER the guard, so recording the recovery there would place the
+/// getfield after the guard that references it (a use-before-def; the resume
+/// position would also stamp onto the getfield rather than the guard, leaving
+/// the guard with `resume_pos = -1`).  Recover here instead — at walk entry,
+/// before any opcode is dispatched and thus before any guard — mirroring the
+/// trait's cache-once semantics.  When the EC is already seeded, or the frame
+/// itself is unset, this is a no-op.
+pub(crate) fn seed_execution_context_for_walk(
+    sym: &mut crate::state::PyreSym,
+    trace_ctx: &mut TraceCtx,
+) {
+    if !sym.execution_context.is_none() || sym.frame.is_none() {
+        return;
+    }
+    let ec = trace_ctx.record_op_with_descr(
+        OpCode::GetfieldGcR,
+        &[sym.frame],
+        crate::descr::pyframe_execution_context_descr(),
+    );
+    sym.execution_context = ec;
 }
 
 /// #124: walker-native truth specialization for the `truth_fn` residual
