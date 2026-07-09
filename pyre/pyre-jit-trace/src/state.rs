@@ -3016,7 +3016,7 @@ pub(crate) fn trace_unbox_int_with_resume_descr<F: crate::walker_frame_ops::Walk
 ) -> OpRef {
     if pyre_object::tagged_int::CAN_BE_TAGGED {
         if let Some(majit_ir::Value::Ref(r)) = frame.ctx().concrete_of_opref(obj) {
-            if r != majit_ir::GcRef(usize::MAX) {
+            if r != majit_ir::GcRef::NO_CONCRETE {
                 let o = r.as_usize() as pyre_object::PyObjectRef;
                 if !o.is_null() {
                     if pyre_object::tagged_int::is_tagged_int(o) {

@@ -48,6 +48,16 @@ pub struct GcRef(pub usize);
 impl GcRef {
     pub const NULL: GcRef = GcRef(0);
 
+    /// Tracer sentinel for "no concrete runtime value is known for this
+    /// OpRef" (distinct from `NULL`, which is a genuine null reference).
+    ///
+    /// The value must never alias a real `PyObjectRef`: a tagged small int is
+    /// always odd (`(v << 1) | 1`) and a heap object is 8-aligned, so an even,
+    /// non-8-aligned, non-null address is unrepresentable as either. `usize::MAX`
+    /// itself is unsound once ints are tagged — it equals `tag_int(-1)` — so the
+    /// sentinel clears the low bit to stay off every tagged value.
+    pub const NO_CONCRETE: GcRef = GcRef(usize::MAX - 1);
+
     pub fn is_null(self) -> bool {
         self.0 == 0
     }

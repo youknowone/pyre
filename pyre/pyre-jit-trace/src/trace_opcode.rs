@@ -5123,7 +5123,7 @@ impl MIFrame {
     fn guard_int_object_value(&mut self, ctx: &mut TraceCtx, int_obj: OpRef, expected: i64) {
         if pyre_object::tagged_int::CAN_BE_TAGGED {
             if let Some(Value::Ref(r)) = ctx.concrete_of_opref(int_obj) {
-                if r != GcRef(usize::MAX) {
+                if r != GcRef::NO_CONCRETE {
                     let o = r.as_usize() as PyObjectRef;
                     if !o.is_null() {
                         if pyre_object::tagged_int::is_tagged_int(o) {
@@ -5213,7 +5213,7 @@ impl MIFrame {
         }
         if pyre_object::tagged_int::CAN_BE_TAGGED {
             if let Some(Value::Ref(r)) = ctx.concrete_of_opref(int_obj) {
-                if r != GcRef(usize::MAX) {
+                if r != GcRef::NO_CONCRETE {
                     let o = r.as_usize() as PyObjectRef;
                     if !o.is_null() {
                         if pyre_object::tagged_int::is_tagged_int(o) {

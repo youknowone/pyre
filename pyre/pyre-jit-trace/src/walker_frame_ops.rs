@@ -147,7 +147,7 @@ pub trait WalkerFrameOps {
     fn guard_int_object_value(&mut self, int_obj: OpRef, expected: i64) {
         if pyre_object::tagged_int::CAN_BE_TAGGED {
             if let Some(majit_ir::Value::Ref(r)) = self.ctx().concrete_of_opref(int_obj) {
-                if r != majit_ir::GcRef(usize::MAX) {
+                if r != majit_ir::GcRef::NO_CONCRETE {
                     let o = r.as_usize() as pyre_object::PyObjectRef;
                     if !o.is_null() {
                         if pyre_object::tagged_int::is_tagged_int(o) {

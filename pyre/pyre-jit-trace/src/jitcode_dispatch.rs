@@ -1904,7 +1904,7 @@ fn concrete_from_recorded_opref(ctx: &WalkContext<'_, '_>, opref: OpRef) -> Conc
     match ctx.trace_ctx.concrete_of_opref(opref) {
         Some(Value::Int(v)) => ConcreteValue::Int(v),
         Some(Value::Float(v)) => ConcreteValue::Float(v),
-        Some(Value::Ref(r)) if r != majit_ir::GcRef(usize::MAX) => {
+        Some(Value::Ref(r)) if r != majit_ir::GcRef::NO_CONCRETE => {
             ConcreteValue::Ref(r.as_usize() as pyre_object::PyObjectRef)
         }
         _ => ConcreteValue::Null,
@@ -3518,7 +3518,7 @@ fn walker_fill_materialized_array(
         return;
     }
     let block = match ctx.trace_ctx.box_value(array) {
-        Some(majit_ir::Value::Ref(r)) if r != majit_ir::GcRef(usize::MAX) && r.as_usize() != 0 => {
+        Some(majit_ir::Value::Ref(r)) if r != majit_ir::GcRef::NO_CONCRETE && r.as_usize() != 0 => {
             r.as_usize() as *mut pyre_object::object_array::ItemsBlock
         }
         // No stamped concrete → not materialized (gate off / non-ref / non-const).
@@ -3532,23 +3532,23 @@ fn walker_fill_materialized_array(
         Some(majit_ir::Value::Int(i)) if i >= 0 => i as usize,
         _ => {
             ctx.trace_ctx
-                .try_set_opref_concrete(array, majit_ir::Value::Ref(majit_ir::GcRef(usize::MAX)));
+                .try_set_opref_concrete(array, majit_ir::Value::Ref(majit_ir::GcRef::NO_CONCRETE));
             return;
         }
     };
     let cap = unsafe { pyre_object::object_array::items_block_capacity(block) };
     if idx >= cap {
         ctx.trace_ctx
-            .try_set_opref_concrete(array, majit_ir::Value::Ref(majit_ir::GcRef(usize::MAX)));
+            .try_set_opref_concrete(array, majit_ir::Value::Ref(majit_ir::GcRef::NO_CONCRETE));
         return;
     }
     let elem = match ctx.trace_ctx.box_value(value) {
-        Some(majit_ir::Value::Ref(r)) if r != majit_ir::GcRef(usize::MAX) => {
+        Some(majit_ir::Value::Ref(r)) if r != majit_ir::GcRef::NO_CONCRETE => {
             r.as_usize() as pyre_object::PyObjectRef
         }
         _ => {
             ctx.trace_ctx
-                .try_set_opref_concrete(array, majit_ir::Value::Ref(majit_ir::GcRef(usize::MAX)));
+                .try_set_opref_concrete(array, majit_ir::Value::Ref(majit_ir::GcRef::NO_CONCRETE));
             return;
         }
     };
@@ -5236,7 +5236,7 @@ fn try_fold_pure_call_via_executor(
                 // "no concrete known" — never reach this path because
                 // `box_value` returns `None` for un-stamped OpRefs, but
                 // belt-and-suspenders against future plumbing.
-                if r == majit_ir::GcRef(usize::MAX) {
+                if r == majit_ir::GcRef::NO_CONCRETE {
                     return;
                 }
                 r.as_usize() as i64
@@ -5690,7 +5690,7 @@ fn try_execute_residual_call_via_executor(
         let v = match ctx.trace_ctx.box_value(arg) {
             Some(majit_ir::Value::Int(n)) => n,
             Some(majit_ir::Value::Ref(r)) => {
-                if r == majit_ir::GcRef(usize::MAX) {
+                if r == majit_ir::GcRef::NO_CONCRETE {
                     if is_void {
                         return Err(DispatchError::ResidualCallArgUnbound {
                             pc: op_pc,
@@ -13836,7 +13836,7 @@ fn walker_execute_may_force_boxed(
         let v = match ctx.trace_ctx.box_value(arg) {
             Some(majit_ir::Value::Int(n)) => n,
             Some(majit_ir::Value::Ref(r)) => {
-                if r == majit_ir::GcRef(usize::MAX) {
+                if r == majit_ir::GcRef::NO_CONCRETE {
                     return None;
                 }
                 r.as_usize() as i64
@@ -13866,7 +13866,7 @@ fn walker_concrete_ref_object(
     opref: OpRef,
 ) -> Option<pyre_object::PyObjectRef> {
     match ctx.trace_ctx.concrete_of_opref(opref) {
-        Some(majit_ir::Value::Ref(r)) if r != majit_ir::GcRef(usize::MAX) => {
+        Some(majit_ir::Value::Ref(r)) if r != majit_ir::GcRef::NO_CONCRETE => {
             let obj = r.as_usize() as pyre_object::PyObjectRef;
             if obj.is_null() { None } else { Some(obj) }
         }
@@ -14661,6 +14661,21 @@ fn walker_guard_class(
     type_addr: i64,
 ) -> Result<(), DispatchError> {
     if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
+        // `GuardClass` reads `ob_type` off `obj` (rpython/jit/backend/x86/
+        // assembler.py:1885 `_cmp_guard_class` derefs the pointer with no tag
+        // test), so the frontend must not hand it a tagged immediate. `obj`
+        // here is a concrete heap box at record time (callers gate on
+        // `is_long`), but the trace is reused for operands that arrive tagged
+        // on a later entry. Emit the low-bit `GuardFalse` first — mirroring
+        // `walker_unbox_int_typed`'s boxed leg — so a tagged arrival deopts
+        // instead of faulting on the class deref.
+        if pyre_object::tagged_int::CAN_BE_TAGGED
+            && walker_concrete_ref_object(ctx, obj)
+                .is_some_and(|o| !pyre_object::tagged_int::is_tagged_int(o))
+        {
+            let lowbit = crate::helpers::emit_tag_lowbit_test(ctx.trace_ctx, obj, false);
+            walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[lowbit])?;
+        }
         let type_const = ctx.trace_ctx.const_int(type_addr);
         ctx.trace_ctx
             .record_guard(OpCode::GuardClass, &[obj, type_const], 0);

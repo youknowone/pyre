@@ -3187,9 +3187,9 @@ impl TraceCtx {
         // `virtualizable_values` is a dense `Vec<Value>`, so an unknown
         // concrete still needs a placeholder slot.  This is the lone
         // remaining materialization of the "no concrete" marker; the
-        // role-2 shadow store keeps a `Value::Ref(GcRef(usize::MAX))`
+        // role-2 shadow store keeps a `Value::Ref(GcRef::NO_CONCRETE)`
         // until that store is itself moved to `Vec<Option<Value>>`.
-        let stored = concrete.unwrap_or(Value::Ref(majit_ir::GcRef(usize::MAX)));
+        let stored = concrete.unwrap_or(Value::Ref(majit_ir::GcRef::NO_CONCRETE));
         self.set_virtualizable_entry_at(index, value, stored);
         // Keep the heapcache consistent: if a prior nonstandard getfield
         // cached a value for this field (e.g., before a replace_box made
