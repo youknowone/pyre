@@ -5755,15 +5755,37 @@ impl CodeWriter {
         let portal_jd_index = self
             .callcontrol()
             .jitdriver_sd_from_portal_graph(code as *const CodeObject);
-        let is_portal = portal_jd_index.is_some();
-        // Every per-code jitcode threads the universal `self` red frame;
-        // the portal additionally threads `ec` (`jitdriver_sd.reds =
-        // [frame, ec]`).  Non-portal callees carry frame only.
-        let frame_inputs = if is_portal {
+        // #25 step1-2: de-conflate the fused `is_portal` bool into its two
+        // independent RPython concepts.  TRUE-PORTAL is the `jit_merge_point`
+        // marker + jitdriver stamp (`portal_jd is not None`, jtransform.py:65).
+        // FRAME INPUT SHAPE is the `[frame, ec]` red inputs + the frame-vable
+        // locals prologue (`reds = ['frame', 'ec']`, interp_jit.py:67).  A
+        // function first compiled as a plain callee (`FrameInputs::Frame`, no
+        // vable prologue) can never later be walked as a portal; the
+        // always-portal flip makes every body walkable by giving it the Portal
+        // input shape, while the marker stays gated on TRUE-PORTAL.
+        let is_true_portal = portal_jd_index.is_some();
+        // Every per-code jitcode threads the universal `self` red frame; the
+        // portal additionally threads `ec`.  DEFAULT ON: every drained per-code
+        // jitcode carries the Portal shape (its whole body is walkable; the
+        // leaf frame-vable prologue folds via `fresh_virtualizable`).  Set
+        // `PYRE_ALWAYS_PORTAL=0` to roll back to non-portal callees at
+        // `FrameInputs::Frame` (byte-identical to the fused bool) for bisection.
+        let always_portal =
+            std::env::var_os("PYRE_ALWAYS_PORTAL").as_deref() != Some(std::ffi::OsStr::new("0"));
+        let frame_inputs = if is_true_portal || always_portal {
             FrameInputs::Portal
         } else {
             FrameInputs::Frame
         };
+        // The frame-vable locals/stack prologue is emitted iff the frame is
+        // virtualizable-shaped (Portal).  This is `matches!(Portal)`, NOT
+        // `has_frame()`: a `Frame` callee carries the frame inputarg but no
+        // vable ops (it reads params from caller-seeded registers), so gating
+        // on `has_frame()` would inject the prologue into flag-OFF callees.
+        // When OFF, `frame_is_portal == is_true_portal`, so every dual-write
+        // site behaves exactly as the old fused `is_portal`.
+        let frame_is_portal = matches!(frame_inputs, FrameInputs::Portal);
 
         // Populate `cpu.lowering_ctx` with the four retired-family fn
         // indices so the canonical `flatten.rs::flatten_graph(graph,
@@ -6089,7 +6111,7 @@ impl CodeWriter {
         // scratch's liverange.
         macro_rules! emit_vsd {
             ($depth:expr, $py_pc:expr) => {
-                if is_portal {
+                if frame_is_portal {
                     let depth_value = (stack_base_absolute + $depth as usize) as i64;
                     // Graph-side shadow: produce a fresh Int Variable
                     // from a constant-source `int_copy` op and consume it
@@ -6347,7 +6369,7 @@ impl CodeWriter {
                 // underflow.  Store `py_pc - 1` (the `set_last_instr_from_next_instr`
                 // convention: `next_instr = last_instr + 1`) so the
                 // interpreter resumes at this unsupported opcode and runs it.
-                if is_portal {
+                if frame_is_portal {
                     let v_li: super::flow::FlowValue =
                         super::flow::Constant::signed(($py_pc) as i64 - 1).into();
                     record_graph_op(
@@ -7002,7 +7024,7 @@ impl CodeWriter {
                 // identity for downstream dual-writes can thread the
                 // same Variable; non-portal callees skip the graph emit
                 // and return `None`.
-                if is_portal {
+                if frame_is_portal {
                     let result = emit_graph_op_with_result(
                         &mut graph,
                         &current_block.block(),
@@ -7035,7 +7057,7 @@ impl CodeWriter {
                 let _ = $src;
                 let src_value: super::flow::FlowValue = $src_value;
                 let pushvalue_ref_py_pc: i64 = ($py_pc) as i64;
-                if is_portal {
+                if frame_is_portal {
                     let depth_value = (stack_base_absolute + $depth as usize) as i64;
                     // `pyframe.py:389 pushvalue` lowers to
                     // `setarrayitem_vable_r(locals_cells_stack_w,
@@ -7091,7 +7113,7 @@ impl CodeWriter {
                     "emit_pushvalue_ref_const: only PY_NULL is supported today; \
                      graph shadow uses Constant::none() per assembler.py:109",
                 );
-                if is_portal {
+                if frame_is_portal {
                     let depth_value = (stack_base_absolute + $depth as usize) as i64;
                     let v_idx: super::flow::FlowValue =
                         super::flow::Constant::signed(depth_value).into();
@@ -7145,7 +7167,7 @@ impl CodeWriter {
                 let popvalue_ref_py_pc: i64 = ($py_pc) as i64;
                 $depth = $depth.saturating_sub(1);
                 let popped_reg = stack_base + $depth;
-                if is_portal {
+                if frame_is_portal {
                     let depth_value = (stack_base_absolute + $depth as usize) as i64;
                     let v_idx: super::flow::FlowValue =
                         super::flow::Constant::signed(depth_value).into();
@@ -7177,7 +7199,7 @@ impl CodeWriter {
             ($depth:ident, $reg:expr, $py_pc:expr) => {{
                 let reg = $reg;
                 let load_fast_py_pc: i64 = ($py_pc) as i64;
-                if is_portal {
+                if frame_is_portal {
                     let local_slot = local_to_vable_slot(reg as usize) as i64;
                     let stack_slot = (stack_base_absolute + $depth as usize) as i64;
                     // Graph-side dual-write of BOTH halves of the
@@ -7430,7 +7452,7 @@ impl CodeWriter {
                         // jtransform.py:1710-1711 op3: -live- before
                         // jit_merge_point, "for inlined short preambles".
                         emit_live_placeholder!();
-                        if is_portal {
+                        if is_true_portal {
                             let jdindex = portal_jd_index
                                 .expect("portal jit_merge_point requires a registered jitdriver");
                             let scratch_pycode_reg =
@@ -7441,7 +7463,7 @@ impl CodeWriter {
                                 VABLE_CODE_FIELD_IDX
                             )
                             .expect(
-                                "portal jit_merge_point requires is_portal=true; \
+                                "portal jit_merge_point requires is_true_portal=true; \
                              emit_vable_getfield_ref! must return a per-SpaceOp \
                              Variable for the `pycode` green arg",
                             );
@@ -7615,7 +7637,7 @@ impl CodeWriter {
                             let reg = var_num.get(op_arg).as_usize() as u16;
                             emit_popvalue_ref!(current_depth, py_pc);
                             let stored = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            if is_portal {
+                            if frame_is_portal {
                                 // Graph dual-write of jtransform.py:1898
                                 // `do_fixed_list_setitem` — STORE_FAST →
                                 // `setarrayitem_vable_r(locals_cells_stack_w,
@@ -7661,7 +7683,7 @@ impl CodeWriter {
                             // takes only a literal Int as input, so no
                             // frame_var or other portal-only Variable is
                             // threaded — the graph op is well-formed for
-                            // every CodeWriter regardless of is_portal.
+                            // every CodeWriter regardless of frame shape.
                             let boxed = residual_call!(
                                 box_int_fn_idx,
                                 CallFlavor::Plain,
@@ -7716,7 +7738,7 @@ impl CodeWriter {
                             let load_reg = u32::from(pair.idx_2()) as u16;
                             emit_popvalue_ref!(current_depth, py_pc);
                             let stored = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            if is_portal {
+                            if frame_is_portal {
                                 // STORE_FAST half graph dual-write
                                 // (jtransform.py:1898 `do_fixed_list_setitem`).
                                 let store_slot = local_to_vable_slot(store_reg as usize) as i64;
@@ -7738,7 +7760,7 @@ impl CodeWriter {
                             // The local binding is carried by the graph `FrameState`
                             // (`store_local_value` below), which the canonical splice
                             // lowers to the register movements via `insert_renamings`.
-                            if is_portal {
+                            if frame_is_portal {
                                 let load_slot = local_to_vable_slot(load_reg as usize) as i64;
                                 let stack_slot =
                                     (stack_base_absolute + current_depth as usize) as i64;
@@ -8143,7 +8165,7 @@ impl CodeWriter {
                             // `[callable, null_or_self]` order (eval.rs:3141,
                             // shared_opcode.rs opcode_call).
                             let loaded_dst_reg = stack_base + current_depth;
-                            if is_portal {
+                            if is_true_portal {
                                 let _ = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
                             }
                             // #336: in the PORTAL jitcode, load the global at
@@ -8192,7 +8214,7 @@ impl CodeWriter {
                             // are created at module load and promoted to the
                             // non-moving oldgen before any jitcode build, so
                             // const-folding them stays GC-safe.
-                            let result_value: super::flow::FlowValue = if is_portal {
+                            let result_value: super::flow::FlowValue = if is_true_portal {
                                 let ns_var = emit_graph_op_with_result(
                                     &mut graph,
                                     &current_block.block(),
@@ -8377,7 +8399,7 @@ impl CodeWriter {
                             // leaves the register unbound for any execution that
                             // is not rd_numb-seeded (walker full-body walk,
                             // blackhole entry upstream of the push).
-                            let null_or_self_needs_read = is_portal
+                            let null_or_self_needs_read = frame_is_portal
                                 && !matches!(
                                     current_state.stack.last(),
                                     Some(super::flow::FlowValue::Variable(_))
@@ -9394,7 +9416,7 @@ impl CodeWriter {
                             for reg in [reg_a, reg_b] {
                                 emit_popvalue_ref!(current_depth, py_pc);
                                 let stored = pop_ref_or_fresh(&mut current_state, &mut graph);
-                                if is_portal {
+                                if frame_is_portal {
                                     // Graph-side dual-write — same shape as
                                     // the StoreFast handler.  The SSARepr is
                                     // produced by the canonical splice from
@@ -9559,7 +9581,7 @@ impl CodeWriter {
                             // (jitcode_dispatch.rs), porting
                             // `get_list_of_active_boxes` (pyjitpl.py:177-234).
                             let iter_slot_depth = current_depth.saturating_sub(1);
-                            let iter_value: super::flow::FlowValue = if is_portal {
+                            let iter_value: super::flow::FlowValue = if frame_is_portal {
                                 let iter_abs_slot =
                                     (stack_base_absolute + iter_slot_depth as usize) as i64;
                                 let v_iter_idx: super::flow::FlowValue =
@@ -9851,7 +9873,7 @@ impl CodeWriter {
                                 let tos_idx = stack_len - 1;
                                 let other_idx = stack_len - depth;
                                 current_state.stack.swap(tos_idx, other_idx);
-                                if is_portal && tos_idx != other_idx {
+                                if frame_is_portal && tos_idx != other_idx {
                                     let tos_value = current_state.stack[tos_idx].clone();
                                     let other_value = current_state.stack[other_idx].clone();
                                     let tos_slot: super::flow::FlowValue =
@@ -9903,7 +9925,7 @@ impl CodeWriter {
                         Instruction::LoadFastAndClear { var_num } => {
                             let reg = var_num.get(op_arg).as_usize() as u16;
                             emit_load_fast_ref!(current_depth, reg, py_pc);
-                            if is_portal {
+                            if frame_is_portal {
                                 // Clear the LOCAL slot to NULL:
                                 // `setarrayitem_vable_r(locals_cells_stack_w,
                                 // local_slot, ConstRef(0))`, the same
@@ -11270,7 +11292,7 @@ impl CodeWriter {
                                 Kind::Ref,
                                 py_pc as i64,
                             );
-                            if is_portal {
+                            if frame_is_portal {
                                 let local_slot = local_to_vable_slot(idx as usize) as i64;
                                 let v_idx: super::flow::FlowValue =
                                     super::flow::Constant::signed(local_slot).into();
@@ -11313,7 +11335,7 @@ impl CodeWriter {
                                 Kind::Ref,
                                 py_pc as i64,
                             );
-                            if is_portal {
+                            if frame_is_portal {
                                 let local_slot = local_to_vable_slot(idx as usize) as i64;
                                 let v_idx: super::flow::FlowValue =
                                     super::flow::Constant::signed(local_slot).into();
@@ -11598,7 +11620,7 @@ impl CodeWriter {
                     .get(site.lasti_py_pc)
                     .copied()
                     .unwrap_or(site.stack_depth);
-                if is_portal {
+                if frame_is_portal {
                     let mut unwind_depth = raising_depth;
                     while unwind_depth > site.stack_depth {
                         unwind_depth -= 1;
@@ -11642,7 +11664,7 @@ impl CodeWriter {
                     // (`flowcontext.py:135-139` recorder pattern,
                     // `jtransform.py:1898 do_fixed_list_setitem` for the
                     // array write).
-                    if is_portal {
+                    if frame_is_portal {
                         let boxed_lasti = residual_call!(
                             box_int_fn_idx,
                             CallFlavor::Plain,
@@ -11691,7 +11713,7 @@ impl CodeWriter {
                 // from the copy list.  `exc_value` is colored by the graph
                 // regalloc and its handler-entry slot is reconstructed from the
                 // per-PC pcdep resume map, so no walker slot pin is needed.
-                if is_portal {
+                if frame_is_portal {
                     let depth_value = (stack_base_absolute + depth as usize) as i64;
                     // pyframe.py:378-387 `pushvalue` semantics — graph
                     // dual-write of the stack mirror.
@@ -12412,7 +12434,7 @@ impl CodeWriter {
             depth_at_pc,
             portal_frame_reg,
             portal_ec_reg,
-            is_portal,
+            frame_is_portal,
             has_abort,
             num_regs,
             result_color_at_pc,
@@ -12452,7 +12474,7 @@ impl CodeWriter {
         depth_at_pc: Vec<u16>,
         portal_frame_reg: u16,
         portal_ec_reg: u16,
-        is_portal: bool,
+        frame_is_portal: bool,
         has_abort: bool,
         num_regs: super::assembler::NumRegs,
         result_color_at_pc: Vec<u16>,
@@ -12537,7 +12559,7 @@ impl CodeWriter {
             for (py, &off) in pc_map_bytes.iter().enumerate() {
                 if seen.insert(off) {
                     let rewound = block_head_python_pc(&first_jit_pc_by_py_pc, py);
-                    let block_py = if !is_portal && branch_targets.contains(&rewound) {
+                    let block_py = if !frame_is_portal && branch_targets.contains(&rewound) {
                         rewound
                     } else {
                         py
@@ -12751,7 +12773,12 @@ impl CodeWriter {
             result_color_at_pc,
             portal_frame_reg,
             portal_ec_reg,
-            built_as_portal: is_portal,
+            // Records the INPUT SHAPE (Portal `[frame, ec]` + frame-vable
+            // prologue), NOT true-portal-ness: every drained per-code jitcode
+            // is Portal-shaped under the always-portal flip, so a later portal
+            // walk of any body is admitted (`run_perfn_walk` no longer declines
+            // on `!built_as_portal`).  Only shapeless skeletons carry `false`.
+            built_as_portal: frame_is_portal,
             stack_base: frame_stack_base,
             max_stackdepth: code.max_stackdepth as usize,
             pcdep_color_slots,
@@ -13011,22 +13038,24 @@ pub fn register_portal_jitdriver(code: &pyre_interpreter::CodeObject) {
 /// # Non-portal callee status (TODO, partial fix in flight)
 ///
 /// Drained graphs whose `code` is NOT registered as a portal go through the
-/// same `transform_graph_to_jitcode` body. `is_portal=false` already gates
-/// the graph-side dual-writes (vable getfield/setfield → `frame_var` would
-/// be an undefined inputarg), and per-helper walker emit sites are being
-/// migrated to feed compile-time-known operands directly per
+/// same `transform_graph_to_jitcode` body.  With the frame-input shape
+/// de-conflated from true-portal-ness, the graph-side frame-vable dual-writes
+/// gate on `frame_is_portal` (the Portal input shape, default ON so every body
+/// is walkable), while the `jit_merge_point` marker and the LOAD_GLOBAL /
+/// LOAD_CONST namespace split gate on `is_true_portal`.  Per-helper walker
+/// emit sites feed compile-time-known operands directly per
 /// `pyframe.py:509-510 getcode(): hint(self.pycode, promote=True)`.
 ///
 /// Per-helper migration status:
 ///   * `bh_load_const_fn(w_code_ptr, consti)` — **migrated**.  Walker emit
-///     in the `Instruction::LoadConst` arm splits on `is_portal`: portal
+///     in the `Instruction::LoadConst` arm splits on `is_true_portal`: portal
 ///     keeps the `getfield_vable_r(portal_frame_reg, code_field)` +
 ///     register-operand call shape; non-portal skips the vable getfield
 ///     and emits `build_load_const_fn_residual_call_ir_r_insn_with_const_pycode`
 ///     with the callee's own `w_code` pointer as `Operand::ConstRef`.
 ///   * `bh_load_global_fn(namespace_ptr, w_code_ptr, frame_ptr, namei)` —
 ///     **pycode operand migrated**.  Walker emit in the
-///     `Instruction::LoadGlobal` arm splits on `is_portal`: portal keeps
+///     `Instruction::LoadGlobal` arm splits on `is_true_portal`: portal keeps
 ///     the `getfield_vable_r(portal_frame_reg, code_field)` + register
 ///     operand; non-portal skips that vable getfield and emits
 ///     `build_load_global_fn_residual_call_ir_r_insn_with_const_pycode`

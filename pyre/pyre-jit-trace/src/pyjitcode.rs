@@ -190,16 +190,16 @@ pub struct PyJitCodeMetadata {
     /// argument (`ec`, `pypy/module/pypyjit/interp_jit.py:67`).
     /// Snapshot serializer maps this color to `sym.execution_context`.
     pub portal_ec_reg: u16,
-    /// Whether the body was compiled with the PORTAL entry shape
-    /// (`FrameInputs::Portal`: `[frame, ec]` red inputs + frame-vable
-    /// locals prologue) — `jitdriver_sd_from_portal_graph(code)` was
-    /// `Some` at compile time.  A body first compiled as a plain CALLEE
-    /// (`FrameInputs::Frame`, discovered through another function's
-    /// call) reads its params from caller-seeded registers and stays
-    /// frozen once installed trace-side (resume data captured against
-    /// it must stay consistent), so a later portal trace of the same
-    /// code must NOT walk it: `run_perfn_walk` declines on
-    /// `!built_as_portal` and the trait tracer compiles the function.
+    /// Whether the body carries the PORTAL entry INPUT SHAPE
+    /// (`FrameInputs::Portal`: `[frame, ec]` red inputs + frame-vable locals
+    /// prologue) — the default for every drained per-code jitcode under the
+    /// always-portal flip, so a later portal walk of ANY body is admitted.
+    /// This records the input shape, NOT true-portal-ness (the
+    /// `jit_merge_point` marker stays gated separately on
+    /// `jitdriver_sd_from_portal_graph`).  `false` only for shapeless
+    /// skeletons (`PyJitCodeMetadata::skeleton`), which `run_perfn_walk`
+    /// declines to walk.  When the flip is OFF a plain callee
+    /// (`FrameInputs::Frame`) is also shapeless here and declines the same way.
     pub built_as_portal: bool,
     /// Absolute start index of the operand stack in PyFrame.locals_cells_stack_w.
     pub stack_base: usize,

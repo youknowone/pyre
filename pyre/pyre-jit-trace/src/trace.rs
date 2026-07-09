@@ -1222,26 +1222,22 @@ fn run_perfn_walk(
     // (recolored / already consumed) at the guard, which the guard's resume
     // data never preserved. See the field doc on `PyreSym::bridge_walk_entry_pc`.
     let entry = sym.bridge_walk_entry_pc.unwrap_or(pc_map_entry);
-    // The full-body walk drives a PORTAL trace, so the body must carry
-    // the portal entry shape (`FrameInputs::Portal`: `[frame, ec]` red
-    // inputs + the frame-vable locals prologue).  A body first compiled
-    // as a plain CALLEE (`FrameInputs::Frame` — `get_jitcode` builds the
-    // shape from `jitdriver_sd_from_portal_graph` at compile time, and a
-    // function discovered through another function's call compiles
-    // before it becomes a portal) reads its params from caller-seeded
-    // registers; the portal red seeding below would land `ec_box` in a
-    // PARAMETER color and the walk would record the ExecutionContext
-    // const as the function's argument — garbage baked into the trace
-    // (previously masked only when the unseeded color happened to stay
-    // `OpRef::NONE` and aborted as `ResidualCallArgUnbound`).  The
-    // installed body is frozen once trace-side resume data references
-    // it, so it cannot be swapped for a portal rebuild here; decline
-    // permanently like the other structural `FBW_DECLINED_KEYS` classes
-    // and let the trait tracer compile this function.
+    // The full-body walk drives a PORTAL trace, so the body must carry the
+    // portal entry INPUT SHAPE (`FrameInputs::Portal`: `[frame, ec]` red inputs
+    // + the frame-vable locals prologue).  Under the always-portal flip every
+    // drained per-code jitcode is Portal-shaped (`built_as_portal` records the
+    // input shape, independent of true-portal-ness), so this decline narrows to
+    // the only remaining shapeless case: a skeleton jitcode with no portal
+    // input shape (pyjitcode.rs `skeleton`).  When the flip is OFF, a body
+    // first compiled as a plain callee (`FrameInputs::Frame`) is still
+    // shapeless here — its portal red seeding would land `ec_box` in a
+    // PARAMETER color and record the ExecutionContext const as the function's
+    // argument — so decline permanently like the other structural
+    // `FBW_DECLINED_KEYS` classes and let the trait tracer compile it.
     if !pjc.metadata.built_as_portal {
         if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
             eprintln!(
-                "[fbw-abort] start_pc={start_pc} jitcode body compiled as plain callee \
+                "[fbw-abort] start_pc={start_pc} jitcode has no portal input shape \
                  (built_as_portal=false); declining walk"
             );
         }

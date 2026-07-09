@@ -4123,6 +4123,15 @@ fn setfield_vable_via_metainterp(
     ctx: &mut WalkContext<'_, '_>,
     value_bank: char,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
+    // Strict fresh-frame fold: a scalar setfield to the current inline level's
+    // own (unseeded) portal frame is a virtual-field write — `valuestackdepth`
+    // / `last_instr` sync on a branchless leaf that resumes at the caller
+    // boundary — so it folds to a no-op, emitting no SETFIELD_GC.  The
+    // `fresh_virtualizable` OptVirtualize elision (jtransform.py:990-993).
+    let fold_frame_reg = fbw_strict_fold_frame_reg();
+    if fold_frame_reg != u16::MAX && code[op.pc + 1] as u16 == fold_frame_reg {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
     let obj = read_ref_reg(code, op, 0, ctx)?;
     // Same unseeded-register guard as `getfield_vable_via_metainterp`:
     // a `None` box would resize the heapcache flag vector to 16 GiB.
@@ -4265,15 +4274,14 @@ fn getarrayitem_vable_via_metainterp(
                     'r' => write_ref_reg(ctx, op.pc, dst, result, concrete)?,
                     'f' => {
                         let len = ctx.registers_f.len();
-                        let slot_ref =
-                            ctx.registers_f
-                                .get_mut(dst)
-                                .ok_or(DispatchError::RegisterOutOfRange {
-                                    pc: op.pc,
-                                    reg: dst,
-                                    len,
-                                    bank: "f",
-                                })?;
+                        let slot_ref = ctx.registers_f.get_mut(dst).ok_or(
+                            DispatchError::RegisterOutOfRange {
+                                pc: op.pc,
+                                reg: dst,
+                                len,
+                                bank: "f",
+                            },
+                        )?;
                         *slot_ref = result;
                     }
                     _ => unreachable!("dst_bank must be 'i', 'r' or 'f'"),
@@ -7201,14 +7209,16 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Whether the always-portal frame-input flip is active (`PYRE_ALWAYS_PORTAL`).
-/// When set, every drained per-code jitcode is built with the portal
-/// `[frame, ec]` input shape + frame-vable locals prologue, and the strict
-/// inline path activates the fresh-frame fold to keep a branchless leaf
-/// register-to-register.  Process-constant: the codewriter reads the same env
-/// at build time so a jitcode's shape and its walk-time fold agree.
+/// Whether the always-portal frame-input flip is active.  DEFAULT ON: every
+/// drained per-code jitcode is built with the portal `[frame, ec]` input shape
+/// + frame-vable locals prologue, and the strict inline path activates the
+/// fresh-frame fold to keep a branchless leaf register-to-register.  Set
+/// `PYRE_ALWAYS_PORTAL=0` to roll back to the old fused shape (non-portal
+/// callees carry frame only, no vable prologue) for bisection.  Process-
+/// constant: the codewriter reads the same env at build time so a jitcode's
+/// shape and its walk-time fold agree.
 fn fbw_always_portal_enabled() -> bool {
-    std::env::var_os("PYRE_ALWAYS_PORTAL").is_some()
+    std::env::var_os("PYRE_ALWAYS_PORTAL").as_deref() != Some(std::ffi::OsStr::new("0"))
 }
 
 /// Activate the strict fresh-frame fold for the innermost inline level,
