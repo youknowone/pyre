@@ -77,6 +77,7 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
     let mut param_names = Vec::<String>::new();
     let mut param_required = Vec::<bool>::new();
     let mut has_varargs = false;
+    let user_name_str = user_name.to_string();
     for (idx, arg) in user_sig.inputs.iter().enumerate() {
         let pat_type = match arg {
             FnArg::Typed(pt) => pt,
@@ -94,7 +95,7 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
         // Optional iff it has a `#[default(...)]` or is `Option<T>`.
         param_required
             .push(arg_default(pat_type)?.is_none() && option_inner(&pat_type.ty).is_none());
-        let (unwrap, ident) = unwrap_arg(idx, pat_type)?;
+        let (unwrap, ident) = unwrap_arg(idx, pat_type, Some((&user_name_str, idx + 1)))?;
         unwrap_stmts.push(unwrap);
         call_args.push(quote! { #ident });
     }
@@ -236,7 +237,11 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
 /// `args.len() <= idx`.  Mirrors PyPy `@unwrap_spec(w_x=WrappedDefault(v))`
 /// — when the caller omits a positional, the wrapper synthesises a value
 /// in the user's typed coordinate space, not in `PyObjectRef` space.
-fn unwrap_arg(idx: usize, pt: &PatType) -> syn::Result<(proc_macro2::TokenStream, syn::Ident)> {
+fn unwrap_arg(
+    idx: usize,
+    pt: &PatType,
+    missing_ctx: Option<(&str, usize)>,
+) -> syn::Result<(proc_macro2::TokenStream, syn::Ident)> {
     let ident = match &*pt.pat {
         Pat::Ident(pi) => pi.ident.clone(),
         _ => format_ident!("__pyre_arg{}", idx),
@@ -270,18 +275,32 @@ fn unwrap_arg(idx: usize, pt: &PatType) -> syn::Result<(proc_macro2::TokenStream
             if #idx < args.len() && !args[#idx].is_null() { #unwrap } else { #default }
         },
         None if is_whole_slice || is_optional => unwrap,
-        None => quote! {
-            {
-                if #idx >= args.len() || args[#idx].is_null() {
-                    return ::std::result::Result::Err(
-                        crate::PyError::type_error(
-                            format!("missing required argument: '{}'", #argname)
-                        )
-                    );
+        None => {
+            // getargs.c `missing required argument` for a required slot left
+            // unfilled.  The signature-bearing `#[pyre_function]` path reports
+            // the function name and 1-based position (`{name}() missing
+            // required argument '{arg}' (pos {n})`); other callers keep the
+            // bare form.
+            let missing_err = match missing_ctx {
+                Some((fname, pos)) => quote! {
+                    format!(
+                        "{}() missing required argument '{}' (pos {})",
+                        #fname, #argname, #pos
+                    )
+                },
+                None => quote! { format!("missing required argument: '{}'", #argname) },
+            };
+            quote! {
+                {
+                    if #idx >= args.len() || args[#idx].is_null() {
+                        return ::std::result::Result::Err(
+                            crate::PyError::type_error(#missing_err)
+                        );
+                    }
+                    #unwrap
                 }
-                #unwrap
             }
-        },
+        }
     };
     // Typed-receiver aliases erase to the binding type declared in
     // `typed_alias` (PyObjectRef for passthrough, String for PyPath).
@@ -1628,7 +1647,7 @@ fn expand_pyre_methods(
             param_names.push(param_name(offset, pt));
             // Optional iff it has a `#[default(...)]` or is `Option<T>`.
             param_required.push(arg_default(pt)?.is_none() && option_inner(&pt.ty).is_none());
-            let (stmt, ident) = unwrap_arg(arg_idx, pt)?;
+            let (stmt, ident) = unwrap_arg(arg_idx, pt, None)?;
             unwrap_stmts.push(stmt);
             call_args.push(quote! { #ident });
         }
