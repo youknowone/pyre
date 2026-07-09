@@ -21,6 +21,7 @@ use std::path::Path;
 use crate::{CodeObject, Mode, compile_source_with_filename};
 use crate::{DictStorage, PyExecutionContext, dict_storage_store};
 use pyre_object::*;
+use rustpython_wtf8::Wtf8Buf;
 
 /// Module-local re-export of the host-OS surface.  Routes through
 /// `rustpython_host_env` when the `host_env` feature is enabled; when
@@ -560,7 +561,6 @@ pub fn install_builtin_modules() {
     // pure-Python fallback take over: `_datetime` -> `_pydatetime`,
     // `_decimal` -> `_pydecimal`, `_asyncio` -> pure-Python asyncio.
     for name in &[
-        "_string",
         "_warnings",
         "_heapq",
         "_tokenize",
@@ -576,8 +576,110 @@ pub fn install_builtin_modules() {
     register_builtin_module("array", crate::module::array::init_array_module);
     register_builtin_module("_csv", crate::module::_csv::init);
     register_builtin_module("_scproxy", init_scproxy);
+    register_builtin_module("_string", init_string_module);
     register_builtin_module("_tracemalloc", init_tracemalloc);
     register_builtin_module("_sysconfig", init_sysconfig_stub);
+}
+
+fn require_string_module_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let Some(&arg) = args.first() else {
+        return Err(crate::PyError::type_error("expected str, got object"));
+    };
+    if !unsafe { pyre_object::is_str(arg) } {
+        return Err(crate::PyError::type_error(format!(
+            "expected str, got {}",
+            crate::type_methods::arg_type_name(arg)
+        )));
+    }
+    Ok(arg)
+}
+
+fn init_string_module(ns: &mut DictStorage) {
+    crate::dict_storage_store(
+        ns,
+        "formatter_parser",
+        crate::make_builtin_function("formatter_parser", |args| {
+            use rustpython_common::format::{FormatPart, FormatString, FromTemplate};
+
+            let arg = require_string_module_str(args)?;
+            let body = unsafe { pyre_object::w_str_get_wtf8(arg) };
+            let parsed = FormatString::from_str(body)
+                .map_err(|_| crate::PyError::value_error("bad format string"))?;
+
+            let mut tuples = Vec::new();
+            let mut pending: Option<Wtf8Buf> = None;
+            for part in parsed.format_parts {
+                match part {
+                    FormatPart::Literal(text) => pending = Some(text),
+                    FormatPart::Field {
+                        field_name,
+                        conversion_spec,
+                        format_spec,
+                    } => {
+                        let literal = pending.take().unwrap_or_default();
+                        let conversion = match conversion_spec {
+                            Some(c) => pyre_object::w_str_new(&c.to_char_lossy().to_string()),
+                            None => pyre_object::w_none(),
+                        };
+                        tuples.push(pyre_object::w_tuple_new(vec![
+                            pyre_object::w_str_from_wtf8(literal),
+                            pyre_object::w_str_from_wtf8(field_name),
+                            pyre_object::w_str_from_wtf8(format_spec),
+                            conversion,
+                        ]));
+                    }
+                }
+            }
+            if let Some(text) = pending {
+                tuples.push(pyre_object::w_tuple_new(vec![
+                    pyre_object::w_str_from_wtf8(text),
+                    pyre_object::w_none(),
+                    pyre_object::w_none(),
+                    pyre_object::w_none(),
+                ]));
+            }
+            Ok(pyre_object::w_list_new(tuples))
+        }),
+    );
+    crate::dict_storage_store(
+        ns,
+        "formatter_field_name_split",
+        crate::make_builtin_function("formatter_field_name_split", |args| {
+            use rustpython_common::format::{FieldName, FieldNamePart, FieldType};
+
+            let arg = require_string_module_str(args)?;
+            let body = unsafe { pyre_object::w_str_get_wtf8(arg) };
+            let FieldName { field_type, parts } = FieldName::parse(body)
+                .map_err(|_| crate::PyError::value_error("bad field name"))?;
+
+            let first = match field_type {
+                FieldType::Auto => pyre_object::w_str_new(""),
+                FieldType::Index(n) => pyre_object::w_int_new(n as i64),
+                FieldType::Keyword(s) => pyre_object::w_str_from_wtf8(s),
+            };
+            let rest = parts
+                .into_iter()
+                .map(|part| match part {
+                    FieldNamePart::Attribute(s) => pyre_object::w_tuple_new(vec![
+                        pyre_object::w_bool_from(true),
+                        pyre_object::w_str_from_wtf8(s),
+                    ]),
+                    FieldNamePart::Index(n) => pyre_object::w_tuple_new(vec![
+                        pyre_object::w_bool_from(false),
+                        pyre_object::w_int_new(n as i64),
+                    ]),
+                    FieldNamePart::StringIndex(s) => pyre_object::w_tuple_new(vec![
+                        pyre_object::w_bool_from(false),
+                        pyre_object::w_str_from_wtf8(s),
+                    ]),
+                })
+                .collect();
+            Ok(pyre_object::w_tuple_new(vec![
+                first,
+                pyre_object::w_list_new(rest),
+            ]))
+        }),
+    );
 }
 
 /// `_sysconfig` stub — exposes `config_vars()` returning an empty dict. On
