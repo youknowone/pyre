@@ -15,6 +15,7 @@ pub mod collector;
 pub mod gc_sync;
 pub mod gcreftracer;
 pub mod header;
+pub mod hook_cell;
 pub mod nursery;
 pub mod oldgen;
 pub mod rewrite;
@@ -901,7 +902,7 @@ impl Default for GcMap {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Thread-local active GC allocator hook
+// Process-global active GC allocator hooks
 // ─────────────────────────────────────────────────────────────────────
 //
 // The metainterp / optimizer layer needs a backend-agnostic way to query
@@ -912,15 +913,13 @@ impl Default for GcMap {
 // a callback here that the metainterp can invoke without taking a
 // backend dependency.
 
-use std::cell::Cell;
-
-/// Thread-local callback that answers `cpu.check_is_object(gcptr)` for
+/// Process-global callback that answers `cpu.check_is_object(gcptr)` for
 /// the currently active backend. Set by the backend when it installs a
-/// GC runtime for the executing thread; cleared when the runtime is
+/// GC runtime; cleared when the runtime is
 /// unregistered.
 pub type CheckIsObjectFn = fn(GcRef) -> bool;
 
-/// Thread-local callback that answers the collector's tagged-immediate
+/// Process-global callback that answers the collector's tagged-immediate
 /// test (gc/base.py:380-383 `is_valid_gc_object`) for the currently
 /// active backend's GC: `config.taggedpointers && (addr & 1 == 1)`.
 /// Lets a backend-agnostic caller decide that an odd-valued constant
@@ -928,7 +927,7 @@ pub type CheckIsObjectFn = fn(GcRef) -> bool;
 /// reading an object header at offset 0.
 pub type IsTaggedImmediateFn = fn(usize) -> bool;
 
-/// Thread-local callback that answers `gc_ll_descr.get_actual_typeid`
+/// Process-global callback that answers `gc_ll_descr.get_actual_typeid`
 /// (gc.py:624-629) for the currently active backend. Returns the
 /// `rffi.cast(HDRPTR, gcptr).tid` half-word for managed objects and
 /// `vtable_to_type_id` for the foreign-object seam pyre uses. Paired
@@ -937,13 +936,13 @@ pub type IsTaggedImmediateFn = fn(usize) -> bool;
 /// runtime layout assumptions.
 pub type GetActualTypeidFn = fn(GcRef) -> Option<u32>;
 
-/// Thread-local callback that answers the codegen-time bounds lookup
+/// Process-global callback that answers the codegen-time bounds lookup
 /// `rffi.cast(rclass.CLASSTYPE, vtable_ptr).subclassrange_{min,max}`
 /// from x86/assembler.py:1971-1974. Used by the executor's
 /// `GuardSubclass` arm to evaluate bridges interpretively.
 pub type SubclassRangeFn = fn(classptr: usize) -> Option<(i64, i64)>;
 
-/// Thread-local callback that answers the `value.typeptr
+/// Process-global callback that answers the `value.typeptr
 /// .subclassrange_min/max` lookup from llgraph/runner.py:1271-1281
 /// directly by typeid. The backend installs this alongside
 /// `subclass_range` so the executor can recover the object side of
@@ -953,7 +952,7 @@ pub type SubclassRangeFn = fn(classptr: usize) -> Option<(i64, i64)>;
 /// `CLASSTYPE` entry (gctypelayout.py:359-374).
 pub type TypeidSubclassRangeFn = fn(typeid: u32) -> Option<(i64, i64)>;
 
-/// Thread-local callback that answers `rclass.OBJECT`-layout queries
+/// Process-global callback that answers `rclass.OBJECT`-layout queries
 /// by typeid — "does this typeid carry `T_IS_RPYTHON_INSTANCE` in its
 /// TYPE_INFO entry" (gctypelayout.py:642). The executor's
 /// `GuardIsObject` arm calls this after resolving the object's typeid
@@ -962,26 +961,25 @@ pub type TypeidSubclassRangeFn = fn(typeid: u32) -> Option<(i64, i64)>;
 pub type TypeidIsObjectFn = fn(typeid: u32) -> Option<bool>;
 pub type ExtraRootWalkerFn = fn(&mut dyn FnMut(&mut GcRef));
 
-/// Thread-local callback that answers `rgc.can_move(gcref)`
+/// Process-global callback that answers `rgc.can_move(gcref)`
 /// (rpython/rlib/rgc.py:229) for the currently active backend's GC. The
 /// const-baking site (`x86/regalloc.py:58-61 convert_to_imm`) consults
 /// this before baking a `ConstPtr` immediate.
 pub type CanMoveFn = fn(GcRef) -> bool;
 
-thread_local! {
-    static ACTIVE_CHECK_IS_OBJECT: Cell<Option<CheckIsObjectFn>> = const { Cell::new(None) };
-    static ACTIVE_IS_TAGGED_IMMEDIATE: Cell<Option<IsTaggedImmediateFn>> = const { Cell::new(None) };
-    static ACTIVE_GET_ACTUAL_TYPEID: Cell<Option<GetActualTypeidFn>> = const { Cell::new(None) };
-    static ACTIVE_SUBCLASS_RANGE: Cell<Option<SubclassRangeFn>> = const { Cell::new(None) };
-    static ACTIVE_TYPEID_SUBCLASS_RANGE: Cell<Option<TypeidSubclassRangeFn>> = const { Cell::new(None) };
-    static ACTIVE_TYPEID_IS_OBJECT: Cell<Option<TypeidIsObjectFn>> = const { Cell::new(None) };
-    static ACTIVE_CAN_MOVE: Cell<Option<CanMoveFn>> = const { Cell::new(None) };
-    static ACTIVE_SUPPORTS_GUARD_GC_TYPE: Cell<bool> = const { Cell::new(false) };
-    static ACTIVE_EXTRA_ROOT_WALKER: Cell<Option<ExtraRootWalkerFn>> = const { Cell::new(None) };
-}
+global_hook!(static ACTIVE_CHECK_IS_OBJECT: CheckIsObjectFn);
+global_hook!(static ACTIVE_IS_TAGGED_IMMEDIATE: IsTaggedImmediateFn);
+global_hook!(static ACTIVE_GET_ACTUAL_TYPEID: GetActualTypeidFn);
+global_hook!(static ACTIVE_SUBCLASS_RANGE: SubclassRangeFn);
+global_hook!(static ACTIVE_TYPEID_SUBCLASS_RANGE: TypeidSubclassRangeFn);
+global_hook!(static ACTIVE_TYPEID_IS_OBJECT: TypeidIsObjectFn);
+global_hook!(static ACTIVE_CAN_MOVE: CanMoveFn);
+static ACTIVE_SUPPORTS_GUARD_GC_TYPE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+global_hook!(static ACTIVE_EXTRA_ROOT_WALKER: ExtraRootWalkerFn);
 
 /// Bundle of callbacks the metainterp / executor can reach through
-/// thread-locals. Mirrors the fan-out of methods RPython's optimizer
+/// process-global cells. Mirrors the fan-out of methods RPython's optimizer
 /// and blackhole reach via `self.cpu` / `self.cpu.gc_ll_descr`; majit
 /// installs them together so a backend swap is a single call.
 #[derive(Clone, Copy, Default)]
@@ -996,7 +994,7 @@ pub struct ActiveGcGuardHooks {
     pub supports_guard_gc_type: bool,
 }
 
-/// Install the active backend's GC-guard callbacks on this thread.
+/// Install the active backend's GC-guard callbacks.
 /// Called by backends when they enter a JIT region. Pass a default
 /// `ActiveGcGuardHooks` with every field set to `None` / `false` to
 /// clear. Mirrors how RPython's `cpu` field lets the optimizer and
@@ -1004,42 +1002,82 @@ pub struct ActiveGcGuardHooks {
 /// .get_actual_typeid`, and the codegen-time bounds lookup; majit
 /// bundles them here so a backend install is a single call.
 pub fn set_active_gc_guard_hooks(hooks: ActiveGcGuardHooks) {
-    ACTIVE_CHECK_IS_OBJECT.with(|c| c.set(hooks.check_is_object));
-    ACTIVE_IS_TAGGED_IMMEDIATE.with(|c| c.set(hooks.is_tagged_immediate));
-    ACTIVE_GET_ACTUAL_TYPEID.with(|c| c.set(hooks.get_actual_typeid));
-    ACTIVE_SUBCLASS_RANGE.with(|c| c.set(hooks.subclass_range));
-    ACTIVE_TYPEID_SUBCLASS_RANGE.with(|c| c.set(hooks.typeid_subclass_range));
-    ACTIVE_TYPEID_IS_OBJECT.with(|c| c.set(hooks.typeid_is_object));
-    ACTIVE_CAN_MOVE.with(|c| c.set(hooks.can_move));
-    ACTIVE_SUPPORTS_GUARD_GC_TYPE.with(|c| c.set(hooks.supports_guard_gc_type));
+    ACTIVE_CHECK_IS_OBJECT.set(hooks.check_is_object);
+    ACTIVE_IS_TAGGED_IMMEDIATE.set(hooks.is_tagged_immediate);
+    ACTIVE_GET_ACTUAL_TYPEID.set(hooks.get_actual_typeid);
+    ACTIVE_SUBCLASS_RANGE.set(hooks.subclass_range);
+    ACTIVE_TYPEID_SUBCLASS_RANGE.set(hooks.typeid_subclass_range);
+    ACTIVE_TYPEID_IS_OBJECT.set(hooks.typeid_is_object);
+    ACTIVE_CAN_MOVE.set(hooks.can_move);
+    ACTIVE_SUPPORTS_GUARD_GC_TYPE.store(
+        hooks.supports_guard_gc_type,
+        std::sync::atomic::Ordering::Release,
+    );
 }
 
-/// Install a thread-local callback that exposes non-shadow-stack roots
+/// Snapshot of the current guard-hook cells (test-only helper).
+#[allow(dead_code)]
+fn current_gc_guard_hooks() -> ActiveGcGuardHooks {
+    ActiveGcGuardHooks {
+        check_is_object: ACTIVE_CHECK_IS_OBJECT.get(),
+        is_tagged_immediate: ACTIVE_IS_TAGGED_IMMEDIATE.get(),
+        get_actual_typeid: ACTIVE_GET_ACTUAL_TYPEID.get(),
+        subclass_range: ACTIVE_SUBCLASS_RANGE.get(),
+        typeid_subclass_range: ACTIVE_TYPEID_SUBCLASS_RANGE.get(),
+        typeid_is_object: ACTIVE_TYPEID_IS_OBJECT.get(),
+        can_move: ACTIVE_CAN_MOVE.get(),
+        supports_guard_gc_type: supports_guard_gc_type(),
+    }
+}
+
+static GUARD_HOOKS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Test-only: install `hooks` while holding a process-global lock, restoring
+/// the previous guard-hook values when the returned guard drops. Serializes
+/// hook-overriding tests so the now-global cells do not race. `pub` because
+/// the sole caller lives in the `majit-metainterp` crate's tests.
+pub struct GuardHooksTestGuard {
+    prev: ActiveGcGuardHooks,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+impl Drop for GuardHooksTestGuard {
+    fn drop(&mut self) {
+        set_active_gc_guard_hooks(self.prev);
+    }
+}
+pub fn override_gc_guard_hooks_for_test(hooks: ActiveGcGuardHooks) -> GuardHooksTestGuard {
+    let lock = GUARD_HOOKS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let prev = current_gc_guard_hooks();
+    set_active_gc_guard_hooks(hooks);
+    GuardHooksTestGuard { prev, _lock: lock }
+}
+
+/// Install a process-global callback that exposes non-shadow-stack roots
 /// owned by the embedding runtime.
 pub fn set_active_extra_root_walker(walker: Option<ExtraRootWalkerFn>) {
-    ACTIVE_EXTRA_ROOT_WALKER.with(|c| c.set(walker));
+    ACTIVE_EXTRA_ROOT_WALKER.set(walker);
 }
 
 /// Walk the active runtime's extra GC roots.
 pub fn walk_active_extra_roots(visitor: &mut dyn FnMut(&mut GcRef)) {
-    ACTIVE_EXTRA_ROOT_WALKER.with(|c| {
-        if let Some(f) = c.get() {
-            f(visitor);
-        }
-    });
+    if let Some(f) = ACTIVE_EXTRA_ROOT_WALKER.get() {
+        f(visitor);
+    }
 }
 
 /// llmodel.py:541-546 `cpu.check_is_object(gcptr)` shim. Returns whether
 /// `gcref` is a `T_IS_RPYTHON_INSTANCE` (has `typeptr` at offset 0). When
-/// no backend has installed a callback on this thread, returns `false`.
+/// no backend has installed a callback, returns `false`.
 pub fn check_is_object(gcref: GcRef) -> bool {
     if gcref.is_null() {
         return false;
     }
-    ACTIVE_CHECK_IS_OBJECT.with(|c| match c.get() {
+    match ACTIVE_CHECK_IS_OBJECT.get() {
         Some(f) => f(gcref),
         None => false,
-    })
+    }
 }
 
 /// gc/base.py:380-383 `is_valid_gc_object` tagged-immediate test shim.
@@ -1048,10 +1086,10 @@ pub fn check_is_object(gcref: GcRef) -> bool {
 /// backend is installed — same absent-backend semantics as
 /// `check_is_object`, so flag-off / no-GC paths are unaffected.
 pub fn is_tagged_immediate(addr: usize) -> bool {
-    ACTIVE_IS_TAGGED_IMMEDIATE.with(|c| match c.get() {
+    match ACTIVE_IS_TAGGED_IMMEDIATE.get() {
         Some(f) => f(addr),
         None => false,
-    })
+    }
 }
 
 /// Whether the active backend's GC has `config.taggedpointers` enabled
@@ -1073,10 +1111,10 @@ pub fn get_actual_typeid(gcref: GcRef) -> Option<u32> {
     if gcref.is_null() {
         return None;
     }
-    ACTIVE_GET_ACTUAL_TYPEID.with(|c| match c.get() {
+    match ACTIVE_GET_ACTUAL_TYPEID.get() {
         Some(f) => f(gcref),
         None => None,
-    })
+    }
 }
 
 /// `rgc.can_move(gcref)` shim (rpython/rlib/rgc.py:229). Delegates to the
@@ -1088,10 +1126,10 @@ pub fn can_move(gcref: GcRef) -> bool {
     if gcref.is_null() {
         return false;
     }
-    ACTIVE_CAN_MOVE.with(|c| match c.get() {
+    match ACTIVE_CAN_MOVE.get() {
         Some(f) => f(gcref),
         None => false,
-    })
+    }
 }
 
 /// x86/assembler.py:1971-1974 codegen-time bounds lookup shim used by
@@ -1099,7 +1137,7 @@ pub fn can_move(gcref: GcRef) -> bool {
 /// `(subclassrange_min, subclassrange_max)` for the class whose vtable
 /// pointer is given, or `None` when no backend is installed.
 pub fn subclass_range(classptr: usize) -> Option<(i64, i64)> {
-    ACTIVE_SUBCLASS_RANGE.with(|c| c.get().and_then(|f| f(classptr)))
+    ACTIVE_SUBCLASS_RANGE.get().and_then(|f| f(classptr))
 }
 
 /// Companion to `subclass_range` keyed by typeid instead of classptr.
@@ -1109,7 +1147,7 @@ pub fn subclass_range(classptr: usize) -> Option<(i64, i64)> {
 /// classptr is known only to the GC). Returns `None` when no backend
 /// is installed.
 pub fn typeid_subclass_range(typeid: u32) -> Option<(i64, i64)> {
-    ACTIVE_TYPEID_SUBCLASS_RANGE.with(|c| c.get().and_then(|f| f(typeid)))
+    ACTIVE_TYPEID_SUBCLASS_RANGE.get().and_then(|f| f(typeid))
 }
 
 /// Companion to `check_is_object` keyed by typeid. Called by the
@@ -1117,13 +1155,13 @@ pub fn typeid_subclass_range(typeid: u32) -> Option<(i64, i64)> {
 /// typeid via `get_actual_typeid`. Returns `None` when no backend is
 /// installed.
 pub fn typeid_is_object(typeid: u32) -> Option<bool> {
-    ACTIVE_TYPEID_IS_OBJECT.with(|c| c.get().and_then(|f| f(typeid)))
+    ACTIVE_TYPEID_IS_OBJECT.get().and_then(|f| f(typeid))
 }
 
 /// llmodel.py:63 `supports_guard_gc_type` shim. Mirrors the active
 /// backend's capability flag. `false` when no backend has been installed.
 pub fn supports_guard_gc_type() -> bool {
-    ACTIVE_SUPPORTS_GUARD_GC_TYPE.with(|c| c.get())
+    ACTIVE_SUPPORTS_GUARD_GC_TYPE.load(std::sync::atomic::Ordering::Acquire)
 }
 
 // ── Host-side nursery allocation hook ───────────────────────────────
@@ -1135,34 +1173,31 @@ pub fn supports_guard_gc_type() -> bool {
 // dependency. Mirrors how RPython host code reaches `gc.malloc(TYPE)`
 // through the global GC instance.
 
-/// Thread-local callback that performs a nursery allocation for the
+/// Process-global callback that performs a nursery allocation for the
 /// currently active backend. The callback returns `GcRef(0)` (i.e.
 /// null) on allocation failure so callers can fall back to a
 /// non-GC allocator.
 pub type AllocNurseryTypedFn = fn(type_id: u32, payload_size: usize) -> GcRef;
 
-thread_local! {
-    static ACTIVE_ALLOC_NURSERY_TYPED: Cell<Option<AllocNurseryTypedFn>> =
-        const { Cell::new(None) };
-}
+global_hook!(static ACTIVE_ALLOC_NURSERY_TYPED: AllocNurseryTypedFn);
 
 /// Install the active backend's nursery allocator callback. Pass
 /// `None` to clear.
 pub fn set_active_alloc_nursery_typed(hook: Option<AllocNurseryTypedFn>) {
-    ACTIVE_ALLOC_NURSERY_TYPED.with(|c| c.set(hook));
+    ACTIVE_ALLOC_NURSERY_TYPED.set(hook);
 }
 
 /// Allocate through the active backend's GC. Returns `GcRef(0)` when
-/// no backend is installed on this thread (callers treat this as a
+/// no backend has installed a hook (callers treat this as a
 /// null pointer and fall back to their non-GC path).
 pub fn alloc_nursery_typed(type_id: u32, payload_size: usize) -> GcRef {
-    ACTIVE_ALLOC_NURSERY_TYPED.with(|c| match c.get() {
+    match ACTIVE_ALLOC_NURSERY_TYPED.get() {
         Some(f) => f(type_id, payload_size),
         None => GcRef(0),
-    })
+    }
 }
 
-/// Thread-local callback that performs a stable-address old-gen
+/// Process-global callback that performs a stable-address old-gen
 /// allocation for the currently active backend. Used by host-side
 /// allocators whose callers hold the returned pointer on the Rust
 /// stack without registering it as a GC root. MiniMark's
@@ -1171,28 +1206,24 @@ pub fn alloc_nursery_typed(type_id: u32, payload_size: usize) -> GcRef {
 /// `GcRef(0)` on allocation failure.
 pub type AllocOldgenTypedFn = fn(type_id: u32, payload_size: usize) -> GcRef;
 
-thread_local! {
-    static ACTIVE_ALLOC_OLDGEN_TYPED: Cell<Option<AllocOldgenTypedFn>> =
-        const { Cell::new(None) };
-}
+global_hook!(static ACTIVE_ALLOC_OLDGEN_TYPED: AllocOldgenTypedFn);
 
 /// Install the active backend's old-gen allocator callback. Pass
 /// `None` to clear.
 pub fn set_active_alloc_oldgen_typed(hook: Option<AllocOldgenTypedFn>) {
-    ACTIVE_ALLOC_OLDGEN_TYPED.with(|c| c.set(hook));
+    ACTIVE_ALLOC_OLDGEN_TYPED.set(hook);
 }
 
 /// Allocate a stable-address (old-gen) object through the active
-/// backend's GC. Returns `GcRef(0)` when no backend is installed on
-/// this thread.
+/// backend's GC. Returns `GcRef(0)` when no backend has installed a hook.
 pub fn alloc_oldgen_typed(type_id: u32, payload_size: usize) -> GcRef {
-    ACTIVE_ALLOC_OLDGEN_TYPED.with(|c| match c.get() {
+    match ACTIVE_ALLOC_OLDGEN_TYPED.get() {
         Some(f) => f(type_id, payload_size),
         None => GcRef(0),
-    })
+    }
 }
 
-/// Thread-local callback for a *collecting* nursery allocation — unlike
+/// Process-global callback for a *collecting* nursery allocation — unlike
 /// [`alloc_nursery_typed`] (which the backends install as the no-collect
 /// variant), this one runs a minor collection when the nursery is full instead
 /// of spilling to old-gen. Only safe for callers that hold no unrooted GC
@@ -1201,159 +1232,136 @@ pub fn alloc_oldgen_typed(type_id: u32, payload_size: usize) -> GcRef {
 /// gcmap-carrying residual CallR). Returns `GcRef(0)` when no backend installed.
 pub type AllocNurseryCollectingTypedFn = fn(type_id: u32, payload_size: usize) -> GcRef;
 
-thread_local! {
-    static ACTIVE_ALLOC_NURSERY_COLLECTING_TYPED: Cell<Option<AllocNurseryCollectingTypedFn>> =
-        const { Cell::new(None) };
-}
+global_hook!(static ACTIVE_ALLOC_NURSERY_COLLECTING_TYPED: AllocNurseryCollectingTypedFn);
 
 /// Install the active backend's collecting-nursery allocator callback. Pass
 /// `None` to clear. Backends that do not install one leave callers to fall back
 /// to the no-collect path.
 pub fn set_active_alloc_nursery_collecting_typed(hook: Option<AllocNurseryCollectingTypedFn>) {
-    ACTIVE_ALLOC_NURSERY_COLLECTING_TYPED.with(|c| c.set(hook));
+    ACTIVE_ALLOC_NURSERY_COLLECTING_TYPED.set(hook);
 }
 
 /// Allocate through the active backend's collecting nursery allocator. Returns
-/// `GcRef(0)` when no backend (or no collecting hook) is installed on this
-/// thread (callers treat this as null and fall back to the no-collect path).
+/// `GcRef(0)` when no backend (or no collecting hook) is installed (callers
+/// treat this as null and fall back to the no-collect path).
 pub fn alloc_nursery_collecting_typed(type_id: u32, payload_size: usize) -> GcRef {
-    ACTIVE_ALLOC_NURSERY_COLLECTING_TYPED.with(|c| match c.get() {
+    match ACTIVE_ALLOC_NURSERY_COLLECTING_TYPED.get() {
         Some(f) => f(type_id, payload_size),
         None => GcRef(0),
-    })
+    }
 }
 
-/// Thread-local callback that charges off-heap memory pressure on the active
+/// Process-global callback that charges off-heap memory pressure on the active
 /// backend's GC (`GcAllocator::charge_memory_pressure`). Used by host-side
 /// allocators of GC objects whose payload includes external, GC-invisible memory
 /// (the bignum limb `Vec`). Returns silently when no backend is installed.
 pub type ChargeMemoryPressureFn = fn(bytes: usize);
 
-thread_local! {
-    static ACTIVE_CHARGE_MEMORY_PRESSURE: Cell<Option<ChargeMemoryPressureFn>> =
-        const { Cell::new(None) };
-}
+global_hook!(static ACTIVE_CHARGE_MEMORY_PRESSURE: ChargeMemoryPressureFn);
 
 /// Install the active backend's memory-pressure callback. Pass `None` to clear.
 pub fn set_active_charge_memory_pressure(hook: Option<ChargeMemoryPressureFn>) {
-    ACTIVE_CHARGE_MEMORY_PRESSURE.with(|c| c.set(hook));
+    ACTIVE_CHARGE_MEMORY_PRESSURE.set(hook);
 }
 
 /// Charge `bytes` of off-heap memory pressure on the active backend's GC. No-op
-/// when no backend is installed on this thread.
+/// when no backend has installed a hook.
 pub fn charge_memory_pressure(bytes: usize) {
-    ACTIVE_CHARGE_MEMORY_PRESSURE.with(|c| {
-        if let Some(f) = c.get() {
-            f(bytes);
-        }
-    })
+    if let Some(f) = ACTIVE_CHARGE_MEMORY_PRESSURE.get() {
+        f(bytes);
+    }
 }
 
-/// Thread-local callback that charges an object's off-heap payload against the
+/// Process-global callback that charges an object's off-heap payload against the
 /// active backend's major threshold (`GcAllocator::charge_oldgen_external`) when
 /// the object is old-gen, without forcing a minor. Used after initializing GC
 /// objects whose payload includes external, GC-invisible memory (the bignum limb
 /// `Vec`). Returns silently when no backend is installed.
 pub type ChargeOldgenExternalFn = fn(obj_addr: usize, bytes: usize);
 
-thread_local! {
-    static ACTIVE_CHARGE_OLDGEN_EXTERNAL: Cell<Option<ChargeOldgenExternalFn>> =
-        const { Cell::new(None) };
-}
+global_hook!(static ACTIVE_CHARGE_OLDGEN_EXTERNAL: ChargeOldgenExternalFn);
 
 /// Install the active backend's old-gen external-byte callback. Pass `None` to clear.
 pub fn set_active_charge_oldgen_external(hook: Option<ChargeOldgenExternalFn>) {
-    ACTIVE_CHARGE_OLDGEN_EXTERNAL.with(|c| c.set(hook));
+    ACTIVE_CHARGE_OLDGEN_EXTERNAL.set(hook);
 }
 
 /// Charge `bytes` of `obj_addr`'s off-heap payload on the active backend's GC
-/// when the object is old-gen. No-op when no backend is installed on this thread.
+/// when the object is old-gen. No-op when no backend has installed a hook.
 pub fn charge_oldgen_external(obj_addr: usize, bytes: usize) {
-    ACTIVE_CHARGE_OLDGEN_EXTERNAL.with(|c| {
-        if let Some(f) = c.get() {
-            f(obj_addr, bytes);
-        }
-    })
+    if let Some(f) = ACTIVE_CHARGE_OLDGEN_EXTERNAL.get() {
+        f(obj_addr, bytes);
+    }
 }
 
-/// Thread-local callback that runs a full mark-sweep collection cycle
+/// Process-global callback that runs a full mark-sweep collection cycle
 /// on the active backend's GC (`GcAllocator::collect_full`). Used by
 /// `pypy/module/gc/interp_gc.py:7-26 collect` ports — i.e. user-level
 /// `gc.collect()` reaches the live GC through this trampoline. Returns
-/// silently when no backend is installed on this thread (callers treat
+/// silently when no backend has installed a hook (callers treat
 /// it as a no-op).
 pub type CollectFullFn = fn();
 
-thread_local! {
-    static ACTIVE_COLLECT_FULL: Cell<Option<CollectFullFn>> = const { Cell::new(None) };
-}
+global_hook!(static ACTIVE_COLLECT_FULL: CollectFullFn);
 
 /// Install the active backend's full-collection trampoline. Pass
 /// `None` to clear.
 pub fn set_active_collect_full(hook: Option<CollectFullFn>) {
-    ACTIVE_COLLECT_FULL.with(|c| c.set(hook));
+    ACTIVE_COLLECT_FULL.set(hook);
 }
 
 /// Trigger a full mark-sweep collection on the active backend's GC.
-/// No-op when no backend is installed on this thread.
+/// No-op when no backend has installed a hook.
 pub fn collect_full() {
-    ACTIVE_COLLECT_FULL.with(|c| {
-        if let Some(f) = c.get() {
-            f();
-        }
-    });
+    if let Some(f) = ACTIVE_COLLECT_FULL.get() {
+        f();
+    }
 }
 
-/// Thread-local callback running a non-moving old-gen-only major collection
+/// Process-global callback running a non-moving old-gen-only major collection
 /// (`GcAllocator::collect_oldgen_nonmoving`). The interpreter GC safepoint
 /// reaches it to reclaim stable-allocated interp int/float without moving the
 /// nursery — so it can fire under an active JIT (nursery non-empty), unlike
 /// the moving `collect_full`. No-op when no backend is installed.
 pub type CollectOldgenFn = fn();
 
-thread_local! {
-    static ACTIVE_COLLECT_OLDGEN: Cell<Option<CollectOldgenFn>> = const { Cell::new(None) };
-}
+global_hook!(static ACTIVE_COLLECT_OLDGEN: CollectOldgenFn);
 
 /// Install the active backend's non-moving-major trampoline. Pass `None` to
 /// clear.
 pub fn set_active_collect_oldgen(hook: Option<CollectOldgenFn>) {
-    ACTIVE_COLLECT_OLDGEN.with(|c| c.set(hook));
+    ACTIVE_COLLECT_OLDGEN.set(hook);
 }
 
 /// Trigger a non-moving old-gen-only major collection on the active backend's
-/// GC. No-op when no backend is installed on this thread.
+/// GC. No-op when no backend has installed a hook.
 pub fn collect_oldgen_nonmoving() {
-    ACTIVE_COLLECT_OLDGEN.with(|c| {
-        if let Some(f) = c.get() {
-            f();
-        }
-    });
+    if let Some(f) = ACTIVE_COLLECT_OLDGEN.get() {
+        f();
+    }
 }
 
-/// Thread-local callback reporting the active GC's `heap_byte_stats`
+/// Process-global callback reporting the active GC's `heap_byte_stats`
 /// (`(oldgen_total, nursery_used)`). Lets the interpreter safepoint
 /// (`pyre_object::gc_interp`) gate a collection on an empty nursery,
 /// where the embedded minor cycle moves nothing and is therefore safe
 /// even without a shadowstack pass over Rust-stack temporaries.
 pub type HeapStatsFn = fn() -> (usize, usize);
 
-thread_local! {
-    static ACTIVE_HEAP_STATS: Cell<Option<HeapStatsFn>> = const { Cell::new(None) };
-}
+global_hook!(static ACTIVE_HEAP_STATS: HeapStatsFn);
 
 /// Install the active backend's `heap_byte_stats` trampoline.
 pub fn set_active_heap_stats(hook: Option<HeapStatsFn>) {
-    ACTIVE_HEAP_STATS.with(|c| c.set(hook));
+    ACTIVE_HEAP_STATS.set(hook);
 }
 
 /// Report `(oldgen_total, nursery_used)` from the active backend's GC.
-/// `(0, 0)` when no backend is installed on this thread.
+/// `(0, 0)` when no backend has installed a hook.
 pub fn active_heap_stats() -> (usize, usize) {
-    ACTIVE_HEAP_STATS.with(|c| match c.get() {
+    match ACTIVE_HEAP_STATS.get() {
         Some(f) => f(),
         None => (0, 0),
-    })
+    }
 }
 
 /// Whether the JIT-frame shadow stack is empty — i.e. no compiled trace
@@ -1367,7 +1375,7 @@ pub fn jitframe_shadow_stack_empty() -> bool {
     shadow_stack::jf_top_ptr().is_null()
 }
 
-/// Thread-local callback that reports whether a raw address is owned
+/// Process-global callback that reports whether a raw address is owned
 /// by the active backend's GC heap. Used by host-side allocators
 /// (`pyre-object`'s `dealloc_items_block`) to discriminate
 /// `try_gc_alloc_stable`-allocated blocks from `std::alloc`-backed
@@ -1377,44 +1385,40 @@ pub fn jitframe_shadow_stack_empty() -> bool {
 /// `std::alloc`-allocated ones.
 pub type GcOwnsObjectFn = fn(addr: usize) -> bool;
 
-thread_local! {
-    static ACTIVE_GC_OWNS_OBJECT: Cell<Option<GcOwnsObjectFn>> = const { Cell::new(None) };
-}
+global_hook!(static ACTIVE_GC_OWNS_OBJECT: GcOwnsObjectFn);
 
 /// Install the active backend's `is_managed_heap_object` trampoline.
 pub fn set_active_gc_owns_object(hook: Option<GcOwnsObjectFn>) {
-    ACTIVE_GC_OWNS_OBJECT.with(|c| c.set(hook));
+    ACTIVE_GC_OWNS_OBJECT.set(hook);
 }
 
-/// minimark.py:1900-1915 `id_or_identityhash` TLS hook.
+/// minimark.py:1900-1915 `id_or_identityhash` hook.
 pub type GcIdOrIdentityHashFn = fn(addr: usize) -> usize;
 
-thread_local! {
-    static ACTIVE_GC_ID_OR_IDENTITYHASH: Cell<Option<GcIdOrIdentityHashFn>> = const { Cell::new(None) };
-}
+global_hook!(static ACTIVE_GC_ID_OR_IDENTITYHASH: GcIdOrIdentityHashFn);
 
 pub fn set_active_gc_id_or_identityhash(hook: Option<GcIdOrIdentityHashFn>) {
-    ACTIVE_GC_ID_OR_IDENTITYHASH.with(|c| c.set(hook));
+    ACTIVE_GC_ID_OR_IDENTITYHASH.set(hook);
 }
 
 /// Return a GC-move-stable address for identity hashing.
 /// Falls back to `addr` when no backend is installed.
 pub fn gc_id_or_identityhash(addr: usize) -> usize {
-    ACTIVE_GC_ID_OR_IDENTITYHASH.with(|c| match c.get() {
+    match ACTIVE_GC_ID_OR_IDENTITYHASH.get() {
         Some(f) => f(addr),
         None => addr,
-    })
+    }
 }
 
 /// Whether `addr` lies inside the active backend's managed GC heap.
-/// Returns `false` when no backend is installed on this thread —
+/// Returns `false` when no backend has installed a hook —
 /// callers treat that as "no GC owns this pointer" and fall through
 /// to their non-GC dealloc path.
 pub fn gc_owns_object(addr: usize) -> bool {
-    ACTIVE_GC_OWNS_OBJECT.with(|c| match c.get() {
+    match ACTIVE_GC_OWNS_OBJECT.get() {
         Some(f) => f(addr),
         None => false,
-    })
+    }
 }
 
 /// Return the current address for a managed object without treating it as a
@@ -1432,7 +1436,7 @@ pub fn gc_current_object_address(addr: usize) -> usize {
     }
 }
 
-/// Thread-local callbacks for registering/removing a Rust-stack slot
+/// Process-global callbacks for registering/removing a Rust-stack slot
 /// as a GC root with the currently active backend. Used by host-side
 /// allocators whose callers need to keep a
 /// just-allocated nursery pointer alive across a subsequent
@@ -1445,40 +1449,34 @@ pub fn gc_current_object_address(addr: usize) -> usize {
 pub type AddRootFn = unsafe fn(slot: *mut GcRef);
 pub type RemoveRootFn = fn(slot: *mut GcRef);
 
-thread_local! {
-    static ACTIVE_ADD_ROOT: Cell<Option<AddRootFn>> = const { Cell::new(None) };
-    static ACTIVE_REMOVE_ROOT: Cell<Option<RemoveRootFn>> = const { Cell::new(None) };
-}
+global_hook!(static ACTIVE_ADD_ROOT: AddRootFn);
+global_hook!(static ACTIVE_REMOVE_ROOT: RemoveRootFn);
 
 /// Install the active backend's root-register callbacks. Pass `None`
 /// to clear.
 pub fn set_active_root_hooks(add: Option<AddRootFn>, remove: Option<RemoveRootFn>) {
-    ACTIVE_ADD_ROOT.with(|c| c.set(add));
-    ACTIVE_REMOVE_ROOT.with(|c| c.set(remove));
+    ACTIVE_ADD_ROOT.set(add);
+    ACTIVE_REMOVE_ROOT.set(remove);
 }
 
 /// Register a stack slot as a GC root with the active backend. No-op
-/// when no backend is installed on this thread.
+/// when no backend has installed a hook.
 ///
 /// # Safety
 /// The caller must ensure the slot remains valid until
 /// [`gc_remove_root`] is called with the same pointer.
 pub unsafe fn gc_add_root(slot: *mut GcRef) {
-    ACTIVE_ADD_ROOT.with(|c| {
-        if let Some(f) = c.get() {
-            unsafe { f(slot) }
-        }
-    });
+    if let Some(f) = ACTIVE_ADD_ROOT.get() {
+        unsafe { f(slot) }
+    }
 }
 
 /// Remove a previously-registered root slot from the active backend.
-/// No-op when no backend is installed on this thread.
+/// No-op when no backend has installed a hook.
 pub fn gc_remove_root(slot: *mut GcRef) {
-    ACTIVE_REMOVE_ROOT.with(|c| {
-        if let Some(f) = c.get() {
-            f(slot)
-        }
-    });
+    if let Some(f) = ACTIVE_REMOVE_ROOT.get() {
+        f(slot)
+    }
 }
 
 /// rgc.py `FinalizerQueue.register_finalizer` - routed to the active backend GC.
@@ -1486,34 +1484,32 @@ pub type RegisterFinalizerFn = fn(fq_index: usize, obj: GcRef, trigger: Finalize
 /// rgc.py `FinalizerQueue.next_dead` - routed to the active backend GC.
 pub type FinalizerNextDeadFn = fn(fq_index: usize) -> Option<GcRef>;
 
-thread_local! {
-    static ACTIVE_REGISTER_FINALIZER: Cell<Option<RegisterFinalizerFn>> = const { Cell::new(None) };
-    static ACTIVE_FINALIZER_NEXT_DEAD: Cell<Option<FinalizerNextDeadFn>> = const { Cell::new(None) };
-}
+global_hook!(static ACTIVE_REGISTER_FINALIZER: RegisterFinalizerFn);
+global_hook!(static ACTIVE_FINALIZER_NEXT_DEAD: FinalizerNextDeadFn);
 
 /// Install the active backend's finalizer trampolines. Pass `None` to clear.
 pub fn set_active_finalizer_hooks(
     register: Option<RegisterFinalizerFn>,
     next_dead: Option<FinalizerNextDeadFn>,
 ) {
-    ACTIVE_REGISTER_FINALIZER.with(|c| c.set(register));
-    ACTIVE_FINALIZER_NEXT_DEAD.with(|c| c.set(next_dead));
+    ACTIVE_REGISTER_FINALIZER.set(register);
+    ACTIVE_FINALIZER_NEXT_DEAD.set(next_dead);
 }
 
 /// Register an object with an RPython-style finalizer queue on the active GC.
 pub fn gc_register_finalizer(fq_index: usize, obj: GcRef, trigger: FinalizerTriggerFn) {
-    ACTIVE_REGISTER_FINALIZER.with(|c| match c.get() {
+    match ACTIVE_REGISTER_FINALIZER.get() {
         Some(f) => f(fq_index, obj, trigger),
         None => gc_sync::gc_op(|gc| gc.register_finalizer(fq_index, obj, trigger)),
-    });
+    }
 }
 
 /// Pop one object from the active GC's RPython-style finalizer death queue.
 pub fn gc_fq_next_dead(fq_index: usize) -> Option<GcRef> {
-    ACTIVE_FINALIZER_NEXT_DEAD.with(|c| match c.get() {
+    match ACTIVE_FINALIZER_NEXT_DEAD.get() {
         Some(f) => f(fq_index),
         None => gc_sync::gc_op(|gc| gc.finalizer_next_dead(fq_index)),
-    })
+    }
 }
 
 /// rgc.enable / rgc.disable — toggle automatic major-collection progress
@@ -1522,30 +1518,25 @@ pub fn gc_set_enabled(enabled: bool) {
     gc_sync::gc_op(|gc| if enabled { gc.enable() } else { gc.disable() })
 }
 
-/// Thread-local callback that performs a host-side write barrier through
+/// Process-global callback that performs a host-side write barrier through
 /// the currently active backend GC.
 pub type WriteBarrierFn = fn(obj: GcRef);
 
-thread_local! {
-    static ACTIVE_WRITE_BARRIER: Cell<Option<WriteBarrierFn>> = const { Cell::new(None) };
-}
+global_hook!(static ACTIVE_WRITE_BARRIER: WriteBarrierFn);
 
 /// Install the active backend's write-barrier callback. Pass `None` to clear.
 pub fn set_active_write_barrier(hook: Option<WriteBarrierFn>) {
-    ACTIVE_WRITE_BARRIER.with(|c| c.set(hook));
+    ACTIVE_WRITE_BARRIER.set(hook);
 }
 
 /// Perform a write barrier through the active backend.
 ///
 /// Calling convention: callers must invoke this before storing a GC reference
 /// into `obj`, matching [`GcAllocator::write_barrier`]. The active callback is
-/// thread-local and installed with [`set_active_write_barrier`] as a
-/// [`WriteBarrierFn`]; this is a no-op when no barrier is installed on the
-/// current thread.
+/// a process-global cell installed with [`set_active_write_barrier`] as a
+/// [`WriteBarrierFn`]; this is a no-op when no barrier is installed.
 pub fn gc_write_barrier(obj: GcRef) {
-    ACTIVE_WRITE_BARRIER.with(|c| {
-        if let Some(f) = c.get() {
-            f(obj)
-        }
-    });
+    if let Some(f) = ACTIVE_WRITE_BARRIER.get() {
+        f(obj)
+    }
 }

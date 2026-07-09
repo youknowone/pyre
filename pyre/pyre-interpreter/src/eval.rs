@@ -751,8 +751,8 @@ fn walk_pyframe_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
 /// Install the PyFrame GC root walker with the majit-gc collector.
 ///
 /// Called once at process startup from the JIT driver / pyrex main.
-/// Stored in a per-thread slot; calling again with the same fn pointer
-/// is idempotent.
+/// Stored in a process-global fn-pointer cell (#396); calling again with
+/// the same fn pointer is idempotent.
 pub fn register_pyframe_root_walker() {
     majit_gc::set_active_extra_root_walker(Some(walk_pyframe_roots));
 }

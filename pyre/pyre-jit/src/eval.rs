@@ -134,15 +134,6 @@ fn pyre_object_gc_finalizer_next_dead_trampoline(fq_index: usize) -> pyre_object
         .unwrap_or(pyre_object::PY_NULL)
 }
 
-/// Heap-stats trampoline for the interpreter GC safepoint
-/// (`pyre_object::gc_interp`). Bridges pyre-object's heap-stats hook to
-/// `majit_gc::active_heap_stats`, so the safepoint can gate its
-/// collection on an empty nursery (where the embedded minor cycle moves
-/// nothing and is safe without a shadowstack pass).
-fn pyre_object_gc_heap_stats_trampoline() -> (usize, usize) {
-    majit_gc::active_heap_stats()
-}
-
 /// Jitframe-empty trampoline for the interpreter GC safepoint. Bridges
 /// pyre-object's hook to `majit_gc::jitframe_shadow_stack_empty`, so the
 /// safepoint can skip collecting while a compiled trace is suspended.
@@ -863,9 +854,12 @@ type JitDriverPair = (
 );
 
 thread_local! {
-    /// Per-thread flag: TLS hooks (backend GC handle, majit_gc
-    /// set_active_* fn-ptrs, pyre_object gc_hook cells) installed.
-    /// Each thread must install its own hooks because they are TLS cells.
+    /// Per-thread flag: this thread has registered with the gc_sync
+    /// mutator registry and installed the backend GC handle into the
+    /// backend's per-thread TLS box. The majit_gc set_active_* fn-ptrs and
+    /// pyre_object gc_hook cells are now process-global (#396), so they are
+    /// installed once (not gated by this flag); only the per-thread backend
+    /// box and mutator registration remain per-thread here.
     static GC_TLS_INSTALLED: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -2339,16 +2333,6 @@ fn install_gc_into_backend() {
     majit_backend_dynasm::runner::install_gc_standalone();
 }
 
-/// Install TLS hooks: backend GC handle + pyre-object hook trampolines.
-///
-/// The 4 JIT-only root walkers (`rd_consts`, `partial_trace`,
-/// `active_trace`, `compile_snapshot`) are NOT registered here — they
-/// call `driver_pair()` which would trigger recursive `JIT_DRIVER` init.
-fn install_gc_hooks() {
-    install_gc_into_backend();
-    install_pyre_object_hooks();
-}
-
 /// Phase B: root walkers that reference interpreter state (immortal dicts,
 /// mapdict side table, etc.).  Called on first eval entry, after the
 /// interpreter is initialized.
@@ -2434,7 +2418,6 @@ fn install_pyre_object_hooks() {
         pyre_object_gc_register_finalizer_trampoline,
         pyre_object_gc_finalizer_next_dead_trampoline,
     );
-    pyre_object::gc_hook::register_gc_heap_stats_hook(pyre_object_gc_heap_stats_trampoline);
     pyre_object::gc_hook::register_gc_jitframe_empty_hook(pyre_object_gc_jitframe_empty_trampoline);
     pyre_object::register_gc_root_hooks(
         pyre_object_gc_add_root_trampoline,
@@ -2474,17 +2457,29 @@ pub fn reset_gc_fresh_for_test() {
 ///
 /// Phase 1 (process-global, once): build MiniMarkGC, type registry,
 /// subclass ranges, store in gc_sync singleton.
-/// Phase 2 (per-thread, idempotent): install TLS hooks so the backend
-/// trampolines and pyre_object hooks reach the global GC via gc_sync.
+/// Phase 2a (per-thread): register this thread with the gc_sync mutator
+/// registry and install the backend GC handle. `install_gc_into_backend`
+/// also registers the `majit_gc::set_active_*` fn-pointer cells (add_root,
+/// write_barrier, guard hooks, …). The backend still keeps a per-thread TLS
+/// box (removed by #396 R4), so this part stays per-thread.
+/// Phase 2b (process-global, once): install the pyre-object hook
+/// trampolines. These are process-global fn-pointer cells (#396), so a
+/// single install is visible to every thread. They route pyre-object
+/// through the `set_active_*` cells from phase 2a, so phase 2a runs first —
+/// a thread never publishes the pyre-object hooks before its own backend
+/// `set_active_*` install.
 pub fn init_gc_subsystem() {
     build_gc_global();
-    if GC_TLS_INSTALLED.with(|c| c.get()) {
-        return;
+    if !GC_TLS_INSTALLED.with(|c| c.get()) {
+        majit_gc::gc_sync::register_thread();
+        install_gc_into_backend();
+        GC_TLS_INSTALLED.with(|c| c.set(true));
     }
-    majit_gc::gc_sync::register_thread();
-    install_gc_hooks();
-    GC_TLS_INSTALLED.with(|c| c.set(true));
+    PYRE_OBJECT_HOOKS_INSTALLED.call_once(install_pyre_object_hooks);
 }
+
+/// Guards the one-time install of the process-global pyre-object GC hooks.
+static PYRE_OBJECT_HOOKS_INSTALLED: std::sync::Once = std::sync::Once::new();
 
 thread_local! {
     static GC_ROOT_WALKERS_INSTALLED: Cell<bool> = const { Cell::new(false) };

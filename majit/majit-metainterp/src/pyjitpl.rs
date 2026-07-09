@@ -18565,15 +18565,7 @@ mod tests {
 
     #[test]
     fn default_issubclass_uses_active_gc_subclass_ranges() {
-        struct ResetGcHooks;
-        impl Drop for ResetGcHooks {
-            fn drop(&mut self) {
-                majit_gc::set_active_gc_guard_hooks(majit_gc::ActiveGcGuardHooks::default());
-            }
-        }
-
-        let _reset = ResetGcHooks;
-        majit_gc::set_active_gc_guard_hooks(majit_gc::ActiveGcGuardHooks {
+        let _guard = majit_gc::override_gc_guard_hooks_for_test(majit_gc::ActiveGcGuardHooks {
             subclass_range: Some(test_subclass_range),
             ..Default::default()
         });
