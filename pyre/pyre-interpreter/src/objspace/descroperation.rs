@@ -1053,6 +1053,9 @@ pub(crate) unsafe fn str_repeat(s: PyObjectRef, n: PyObjectRef) -> PyResult {
     // `w_str_get_value`.
     let bytes = w_str_get_wtf8(s).as_bytes();
     let count = repeat_count(n, "new string is too long")?;
+    if count == 1 {
+        return Ok(crate::type_methods::str_result_unchanged(s));
+    }
     let total = bytes
         .len()
         .checked_mul(count)

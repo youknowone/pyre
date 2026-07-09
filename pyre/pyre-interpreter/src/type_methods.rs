@@ -2971,7 +2971,7 @@ fn push_cp_repeated(out: &mut Wtf8Buf, cp: CodePoint, n: usize) {
 /// receiver returns the receiver itself only when it is an exact `str`; a
 /// `str` subclass is copied to a fresh base `str`, since str methods never
 /// return a subclass instance.
-fn str_result_unchanged(obj: PyObjectRef) -> PyObjectRef {
+pub(crate) fn str_result_unchanged(obj: PyObjectRef) -> PyObjectRef {
     if unsafe { is_exact_type(obj, &STR_TYPE) } {
         obj
     } else {
@@ -3183,8 +3183,17 @@ fn wtf8_replace(input: &Wtf8, sub: &Wtf8, by: &Wtf8, maxcount: i64) -> Wtf8Buf {
 /// PyPy: unicodeobject.py descr_partition
 pub fn str_method_partition(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_exact(args, "str.partition", 1)?;
+    if !unsafe { pyre_object::is_str(args[1]) } {
+        return Err(crate::PyError::type_error(format!(
+            "must be str, not {}",
+            arg_type_name(args[1])
+        )));
+    }
     let s = unsafe { pyre_object::w_str_get_wtf8(args[0]) }.as_bytes();
     let sep = unsafe { pyre_object::w_str_get_wtf8(args[1]) }.as_bytes();
+    if sep.is_empty() {
+        return Err(crate::PyError::value_error("empty separator"));
+    }
     match wtf8_find_bounded(s, sep, 0, s.len()) {
         Some(i) => Ok(w_tuple_new(vec![
             wtf8_slice_str(&s[..i]),
@@ -3198,8 +3207,17 @@ pub fn str_method_partition(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 /// PyPy: unicodeobject.py descr_rpartition
 pub fn str_method_rpartition(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_exact(args, "str.rpartition", 1)?;
+    if !unsafe { pyre_object::is_str(args[1]) } {
+        return Err(crate::PyError::type_error(format!(
+            "must be str, not {}",
+            arg_type_name(args[1])
+        )));
+    }
     let s = unsafe { pyre_object::w_str_get_wtf8(args[0]) }.as_bytes();
     let sep = unsafe { pyre_object::w_str_get_wtf8(args[1]) }.as_bytes();
+    if sep.is_empty() {
+        return Err(crate::PyError::value_error("empty separator"));
+    }
     match wtf8_rfind_bounded(s, sep, 0, s.len()) {
         Some(i) => Ok(w_tuple_new(vec![
             wtf8_slice_str(&s[..i]),
@@ -3218,6 +3236,19 @@ pub fn str_method_rpartition(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 pub fn str_method_splitlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_receiver(args, "splitlines")?;
     let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    if pos.len() > 2 {
+        return Err(crate::PyError::type_error(format!(
+            "splitlines() takes at most 1 argument ({} given)",
+            pos.len().saturating_sub(1)
+        )));
+    }
+    crate::builtins::kwarg_reject_unknown(kwargs, &["keepends"], "splitlines")?;
+    crate::builtins::kwarg_reject_duplicate(
+        kwargs,
+        "splitlines",
+        "keepends",
+        pos.get(1).is_some(),
+    )?;
     // `\n` / `\r` are single bytes that cannot occur inside a multi-byte
     // WTF-8 sequence, so the line boundaries are found by walking bytes;
     // each emitted slice cuts on a code-point boundary.

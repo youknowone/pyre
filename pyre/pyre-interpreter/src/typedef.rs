@@ -2747,7 +2747,10 @@ fn init_str_type(ns: &mut DictStorage) {
                 if unsafe { pyre_object::pyobject::is_int_or_long(args[1]) } {
                     unsafe { crate::objspace::descroperation::str_repeat(args[0], args[1]) }
                 } else {
-                    Ok(pyre_object::w_not_implemented())
+                    let count = crate::builtins::space_index_w(args[1])?;
+                    unsafe {
+                        crate::objspace::descroperation::str_repeat(args[0], w_int_new(count))
+                    }
                 }
             },
             2,
