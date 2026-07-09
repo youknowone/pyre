@@ -2066,7 +2066,10 @@ mod tests {
     }
 
     fn named_function_code(source: &str, name: &str) -> pyre_interpreter::CodeObject {
-        fn find_in(code: &pyre_interpreter::CodeObject, name: &str) -> Option<pyre_interpreter::CodeObject> {
+        fn find_in(
+            code: &pyre_interpreter::CodeObject,
+            name: &str,
+        ) -> Option<pyre_interpreter::CodeObject> {
             for constant in code.constants.iter() {
                 if let pyre_interpreter::ConstantData::Code { code: inner } = constant {
                     if inner.obj_name.as_str() == name {

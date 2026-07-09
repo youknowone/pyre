@@ -61,6 +61,48 @@ pub extern "C" fn jit_make_function_from_globals(globals: i64, code_obj: i64) ->
     make_function_from_code_obj_with_globals_obj(code_obj as PyObjectRef, w_globals) as i64
 }
 
+/// SET_FUNCTION_ATTRIBUTE residual: stamp one attribute on `func` per the
+/// compile-time `flag` discriminant, then return `func` so the caller pushes
+/// the same function back onto the stack (net stack effect -1).  `flag` is the
+/// `MakeFunctionFlag` bit-position discriminant (`oparg.rs`
+/// `MakeFunctionFlag`): `Defaults = 0`, `KwOnlyDefaults = 1`,
+/// `Annotations = 2`, `Closure = 3`, `Annotate = 4`, `TypeParams = 5`.  The
+/// match must stay in sync with `eval.rs`
+/// `set_function_attribute_with_flag` and the codewriter's
+/// `SetFunctionAttribute` arm.  Sets a typed field on the function; runs no
+/// user code and never raises → `Plain`.
+#[majit_macros::dont_look_inside]
+pub extern "C" fn jit_set_function_attribute(func: i64, attr: i64, flag: i64) -> i64 {
+    let func = func as PyObjectRef;
+    let attr = attr as PyObjectRef;
+    match flag {
+        0 => unsafe { crate::function_set_defaults(func, attr) },
+        1 => unsafe { crate::function_set_kwdefaults(func, attr) },
+        2 => {
+            // `function.py:553-559 fset_func_annotations` — the eager
+            // annotations dict is stamped on the typed `Function.w_ann`
+            // slot via `function_write_barrier`, so `f.__annotations__ is
+            // f.__annotations__` holds through the getattr arm.
+            unsafe { crate::function::function_set_annotations(func, attr) };
+        }
+        3 => unsafe { crate::function_set_closure(func, attr) },
+        4 => {
+            // PEP 649: `attr` is the `__annotate__` callable the runtime
+            // `__annotations__` getter evaluates lazily; stored on the
+            // typed `w_annotate` slot.
+            unsafe { (*(func as *mut crate::function::Function)).w_annotate = attr };
+            // The direct field store bypasses `function_write_barrier`;
+            // record it for the prebuilt-root minor-collection skip, exactly
+            // as the interpreter does.
+            pyre_object::gc_roots::mark_prebuilt_roots_dirty();
+        }
+        // `TypeParams = 5` carries a PEP 695 type-parameter tuple; pyre has
+        // no PEP 695 surface, so the operand is accepted silently.
+        _ => {}
+    }
+    func as i64
+}
+
 #[majit_macros::dont_look_inside]
 pub extern "C" fn jit_load_name_from_namespace(
     frame_ptr: i64,

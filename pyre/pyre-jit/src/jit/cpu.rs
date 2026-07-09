@@ -233,6 +233,10 @@ pub struct Cpu {
     /// wrap a code object into a function using the given globals object;
     /// allocates but runs no user code and never raises.
     pub make_function_fn: extern "C" fn(i64, i64) -> i64,
+    /// `jit_set_function_attribute(func, attr, flag)` — SET_FUNCTION_ATTRIBUTE
+    /// residual: stamp one attribute (`flag` discriminant) on `func`, returning
+    /// `func`; sets a typed field but runs no user code and never raises.
+    pub set_function_attribute_fn: extern "C" fn(i64, i64, i64) -> i64,
     /// `bh_get_iter_fn(obj)` — GET_ITER `iter(obj)` residual
     /// (a user `__iter__` may run Python → fallible).
     pub get_iter_fn: extern "C" fn(i64) -> i64,
@@ -457,6 +461,7 @@ impl Cpu {
             store_deref_value_fn: crate::call_jit::bh_store_deref_value_fn,
             make_cell_fn: crate::call_jit::bh_make_cell_fn,
             make_function_fn: pyre_interpreter::runtime_ops::jit_make_function_from_globals,
+            set_function_attribute_fn: pyre_interpreter::runtime_ops::jit_set_function_attribute,
             get_iter_fn: crate::call_jit::bh_get_iter_fn,
             for_iter_next_fn: pyre_interpreter::runtime_ops::jit_next,
             unary_negative_fn: crate::call_jit::bh_unary_negative_fn,
