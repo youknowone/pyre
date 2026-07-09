@@ -3655,14 +3655,28 @@ fn for_iter_body_is_abort_free(
 /// are rejected without recursion. The iterable setup (`range(n)`, `GET_ITER`)
 /// precedes the `FOR_ITER` and is therefore not part of any body range.
 ///
+/// This whole gate is a conservative adaptation, not an upstream mechanism. The
+/// FBW single-pass walker recovers from a mid-body walk abort by REFUSING to
+/// re-deliver the in-flight `FOR_ITER` item (Option-C deliver/refuse), which
+/// drops the rest of that iteration. The register-machine metainterp instead
+/// resumes exactly: it reads the precise `(jitcode, pc)` from the guard's resume
+/// data, `setposition`s a blackhole interpreter there and runs the body to its
+/// end (`blackhole_from_resumedata`, resume.py:1312), so it never drops or
+/// doubles. Until that exact-resume path is ported (#215 P2 / #73 / task#50), a
+/// body is admitted only where the refuse-drop deviation cannot be observed.
+///
 /// A straight-line body — one that `for_iter_body_is_abort_free` accepts — may
 /// ADDITIONALLY carry the direct heap-store opcodes `STORE_SUBSCR`,
 /// `STORE_ATTR`, `STORE_NAME`, `STORE_GLOBAL` and the `LOAD_NAME` that reads
-/// module globals. That widening is sound because an abort-free body never
-/// reaches the Option-C deliver/refuse path, so the store is committed exactly
-/// once (#57). Bodies with a call or a branch stay on the base allow-list, so
-/// the call-bearing path is unchanged. `LOAD_ATTR` is deliberately excluded:
-/// an attribute read can trigger a descriptor call.
+/// module globals. That widening is sound precisely because an abort-free body
+/// cannot reach the deliver/refuse path at all: with no call, branch or nested
+/// loop there is no abort after the store, so the store commits exactly once and
+/// its result coincides with the exact-resume result (#57). Bodies with a call
+/// or a branch stay on the base allow-list. `LOAD_ATTR` is deliberately
+/// excluded: it admits a method load whose call declines-to-abort while an item
+/// is in flight, and if an earlier body effect has already committed, the
+/// refuse-drop skips the rest of that iteration — a partial-iteration wrong
+/// answer, not a clean drop.
 fn for_iter_bodies_all_jit_safe(code: &pyre_interpreter::CodeObject) -> bool {
     use pyre_interpreter::Instruction as I;
     let instructions = &code.instructions;
@@ -8404,10 +8418,9 @@ mod tests {
         // A straight-line body `o.x = i` is abort-free, so the direct STORE_ATTR
         // is admitted. (LOAD_ATTR reads stay excluded — see the allow-list.)
         use pyre_interpreter::compile_exec;
-        let module = compile_exec(
-            "def w(src, o):\n    for i in src:\n        o.x = i\n    return o.x\n",
-        )
-        .expect("test code should compile");
+        let module =
+            compile_exec("def w(src, o):\n    for i in src:\n        o.x = i\n    return o.x\n")
+                .expect("test code should compile");
         let code = function_code_from_module(&module, "w");
         assert!(for_iter_bodies_all_jit_safe(&code));
         assert_eq!(unsupported_jit_shape(&code), UnsupportedJitShape::None);
