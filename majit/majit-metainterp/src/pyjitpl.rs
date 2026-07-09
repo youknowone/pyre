@@ -5424,8 +5424,7 @@ impl<M: Clone> MetaInterp<M> {
                         } else {
                             Optimizer::default_pipeline()
                         };
-                        simple_opt.all_descrs =
-                            std::mem::take(&mut unroll_opt.all_descrs);
+                        simple_opt.all_descrs = std::mem::take(&mut unroll_opt.all_descrs);
                         // history.py:220/261/307: `Const.type` /
                         // `InputArg.type` are intrinsic on the box;
                         // no raw-u32 type side-table propagation is
@@ -5477,8 +5476,7 @@ impl<M: Clone> MetaInterp<M> {
                                 let ni = simple_opt.final_num_inputs();
                                 // Return descrs to unroll_opt so take_back_all_descrs
                                 // at the end of compile_loop picks them up.
-                                unroll_opt.all_descrs =
-                                    std::mem::take(&mut simple_opt.all_descrs);
+                                unroll_opt.all_descrs = std::mem::take(&mut simple_opt.all_descrs);
                                 (retry_ops, ni)
                             }
                             Ok(Err(_invalid_loop)) => {

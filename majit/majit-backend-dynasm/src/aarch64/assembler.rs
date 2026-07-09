@@ -5992,10 +5992,18 @@ impl<'a> AssemblerARM64<'a> {
 
     /// aarch64/assembler.py:682 malloc_cond parity.
     /// Inline nursery bump allocation for NEW.
+    fn new_alloc_fn_addr() -> i64 {
+        if crate::runner::new_via_gc_enabled() {
+            crate::runner::dynasm_new_alloc as *const () as i64
+        } else {
+            libc::malloc as *const () as i64
+        }
+    }
+
     fn genop_new(&mut self, op: &Op) {
         let obj_size = op.with_size_descr(|sd| sd.size()).unwrap_or(16) as i64;
         self.emit_mov_imm64(0, obj_size);
-        self.emit_mov_imm64(2, libc::malloc as *const () as i64);
+        self.emit_mov_imm64(2, Self::new_alloc_fn_addr());
         dynasm!(self.mc ; .arch aarch64 ; blr x2);
         self.inline_memzero(obj_size);
         if !op.pos.get().is_none() {
@@ -6007,7 +6015,7 @@ impl<'a> AssemblerARM64<'a> {
         let obj_size = op.with_size_descr(|sd| sd.size()).unwrap_or(16) as i64;
         let vtable = op.with_size_descr(|sd| sd.vtable()).unwrap_or(0) as i64;
         self.emit_mov_imm64(0, obj_size);
-        self.emit_mov_imm64(2, libc::malloc as *const () as i64);
+        self.emit_mov_imm64(2, Self::new_alloc_fn_addr());
         dynasm!(self.mc ; .arch aarch64 ; blr x2);
         self.inline_memzero(obj_size);
         if vtable != 0 {

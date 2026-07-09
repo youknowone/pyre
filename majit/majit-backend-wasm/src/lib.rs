@@ -770,6 +770,11 @@ impl WasmBackend {
         install_gc_box(gc);
     }
 
+    /// No-op: present for API parity with the dynasm backend so
+    /// backend-agnostic consumers can call it uniformly. The wasm `New`
+    /// allocation path is out of scope for the GC-routed-New opt-in.
+    pub fn set_new_via_gc(&mut self, _enabled: bool) {}
+
     /// llmodel.py:64-69 self.vtable_offset configuration.
     pub fn set_vtable_offset(&mut self, offset: Option<usize>) {
         self.vtable_offset = offset;

@@ -268,6 +268,27 @@ fn dynasm_typeid_is_object(typeid: u32) -> Option<bool> {
     with_dynasm_active_gc(|gc| gc.typeid_is_object(typeid)).flatten()
 }
 
+/// Whether compiled `New` ops route through the active GC allocator
+/// instead of `libc::malloc`. Set via `DynasmBackend::set_new_via_gc`;
+/// off by default (pyre keeps the `malloc` stub, byte-identical codegen).
+static NEW_VIA_GC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// True when `set_new_via_gc(true)` has been called on the active backend.
+pub(crate) fn new_via_gc_enabled() -> bool {
+    NEW_VIA_GC.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Compiled-code `New` allocation trampoline. Called from the machine code
+/// emitted by `genop_new` / `genop_new_with_vtable` when `new_via_gc_enabled`.
+/// Routes through the active GC's nursery allocator (mirroring cranelift's
+/// `gc_alloc_nursery_shim`); falls back to `malloc` when no GC is installed.
+pub(crate) extern "C" fn dynasm_new_alloc(size: usize) -> *mut u8 {
+    DYNASM_ACTIVE_GC.with(|cell| match cell.borrow_mut().as_deref_mut() {
+        Some(gc) => gc.alloc_nursery(size).0 as *mut u8,
+        None => unsafe { libc::malloc(size) as *mut u8 },
+    })
+}
+
 /// Host-side nursery allocation trampoline. Published via
 /// `majit_gc::set_active_alloc_nursery_typed` from `set_gc_allocator`
 /// so backend-agnostic callers (e.g. pyre-object `w_int_new`) can
@@ -1313,6 +1334,19 @@ impl DynasmBackend {
     pub fn set_gc_allocator(&mut self, mut gc: Box<dyn majit_gc::GcAllocator>) {
         gc.freeze_types();
         install_gc_box(gc);
+    }
+
+    /// Opt in to routing `New` / `NewWithVtable` allocation through the
+    /// active GC allocator (`dynasm_new_alloc`) instead of `libc::malloc`.
+    ///
+    /// Off by default so pyre's dynasm codegen is byte-identical: the
+    /// cranelift backend already routes `New` through the active GC when
+    /// one is installed (`cranelift_gc_active`), but dynasm has always used
+    /// a `malloc` stub. A consumer whose `New` objects belong to the GC's
+    /// own pool (e.g. aheui's nursery-backed linked-list nodes) sets this so
+    /// compiled allocations share the same pool as the interpreter path.
+    pub fn set_new_via_gc(&mut self, enabled: bool) {
+        NEW_VIA_GC.store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// llmodel.py:64-69 self.vtable_offset configuration.

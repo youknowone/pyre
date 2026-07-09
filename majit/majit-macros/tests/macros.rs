@@ -910,5 +910,4 @@ mod jit_struct {
         let parent = value_fd.get_parent_descr().expect("parent_descr wired");
         assert!(std::sync::Arc::ptr_eq(&parent, &node_size));
     }
-
 }

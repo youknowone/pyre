@@ -7871,12 +7871,21 @@ impl<'a> Assembler386<'a> {
 
     /// NEW: allocate a fixed-size object. Requires GC runtime.
     /// Emits a trap (UD2/BRK) until GC nursery allocation is wired.
+    /// Address of the `New` allocation helper: the active-GC trampoline
+    /// (`dynasm_new_alloc`) when `set_new_via_gc(true)`, else `libc::malloc`.
+    fn new_alloc_fn_addr() -> i64 {
+        if crate::runner::new_via_gc_enabled() {
+            crate::runner::dynasm_new_alloc as *const () as i64
+        } else {
+            libc::malloc as *const () as i64
+        }
+    }
+
     fn genop_new(&mut self, op: &Op) {
-        // Simple allocation: call libc malloc(obj_size).
-        // RPython uses GC nursery bump allocation; we use malloc as stub.
+        // Simple allocation: call the New alloc helper(obj_size).
         let obj_size = op.with_size_descr(|sd| sd.size()).unwrap_or(16) as i64;
-        let malloc_ptr = libc::malloc as *const () as i64;
-        // Call malloc(obj_size)
+        let malloc_ptr = Self::new_alloc_fn_addr();
+        // Call alloc_fn(obj_size)
         self.emit_abi_int_arg_from_imm(0, obj_size);
         dynasm!(self.mc ; .arch x64 ; mov rax, QWORD malloc_ptr);
         self.emit_abi_call_rax();
@@ -7901,7 +7910,7 @@ impl<'a> Assembler386<'a> {
         // Same as New, but also write vtable at offset 0.
         let obj_size = op.with_size_descr(|sd| sd.size()).unwrap_or(16) as i64;
         let vtable = op.with_size_descr(|sd| sd.vtable()).unwrap_or(0) as i64;
-        let malloc_ptr = libc::malloc as *const () as i64;
+        let malloc_ptr = Self::new_alloc_fn_addr();
         self.emit_abi_int_arg_from_imm(0, obj_size);
         dynasm!(self.mc ; .arch x64 ; mov rax, QWORD malloc_ptr);
         self.emit_abi_call_rax();
