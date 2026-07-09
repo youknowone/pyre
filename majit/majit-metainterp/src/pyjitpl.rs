@@ -2958,8 +2958,8 @@ impl<M: Clone> MetaInterp<M> {
         // scalar slots instead of actual vable elements.  Force the
         // heap-read path (vable_ptr != null) which always mints fresh
         // inputargs from the live heap values.
-        let has_expanded_tail = info.identity_ref_bank_index.is_none()
-            && live_values.len() >= num_reds + total_vable;
+        let has_expanded_tail =
+            info.identity_ref_bank_index.is_none() && live_values.len() >= num_reds + total_vable;
         // pyjitpl.py:3302: virtualizable_boxes = vinfo.read_boxes(...)
         // pyjitpl.py appends these boxes to `original_boxes` before
         // create_empty_history() snapshots the trace inputargs. When the
