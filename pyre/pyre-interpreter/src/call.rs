@@ -234,6 +234,12 @@ pub fn set_last_exec_ctx(ctx: *const crate::PyExecutionContext) {
 /// that need to temporarily pin a different context (blackhole's
 /// `bh_call_fn_impl` cold path, for example) pair this with
 /// `set_last_exec_ctx` to restore the prior value on return.
+///
+/// `dont_look_inside`: the `LAST_EXEC_CTX` thread-local `.with` read has no
+/// extractable graph (front::mir const-folds the `ThreadLocal` global to
+/// None), so the call stays a residual read via the registered fnaddr
+/// (`@dont_look_inside`, `rlib/jit.py:139`), the `take_call_error` twin.
+#[majit_macros::dont_look_inside]
 pub fn take_last_exec_ctx() -> *const crate::PyExecutionContext {
     LAST_EXEC_CTX.with(|c| c.get())
 }
@@ -2441,9 +2447,9 @@ fn call_user_function_with_args(func: PyObjectRef, args: &[PyObjectRef]) -> PyOb
     let func_code = unsafe {
         crate::w_code_get_ptr(w_code as pyre_object::PyObjectRef) as *const crate::CodeObject
     };
-    let exec_ctx = BUILD_CLASS_EXEC_CTX.with(|c| c.get());
+    let exec_ctx = build_class_exec_ctx();
     let exec_ctx = if exec_ctx.is_null() {
-        LAST_EXEC_CTX.with(|c| c.get())
+        take_last_exec_ctx()
     } else {
         exec_ctx
     };
@@ -2525,9 +2531,9 @@ fn call_user_function_resolved_frameless(func: PyObjectRef, args: &[PyObjectRef]
     let func_code = unsafe {
         crate::w_code_get_ptr(w_code as pyre_object::PyObjectRef) as *const crate::CodeObject
     };
-    let exec_ctx = BUILD_CLASS_EXEC_CTX.with(|c| c.get());
+    let exec_ctx = build_class_exec_ctx();
     let exec_ctx = if exec_ctx.is_null() {
-        LAST_EXEC_CTX.with(|c| c.get())
+        take_last_exec_ctx()
     } else {
         exec_ctx
     };
@@ -2589,7 +2595,7 @@ fn call_metaclass_with_kwargs(
             Vec::new()
         };
         let frame = {
-            let stored = BUILD_CLASS_EXEC_CTX.with(|c| c.get());
+            let stored = build_class_exec_ctx();
             if stored.is_null() {
                 std::ptr::null_mut()
             } else {
@@ -2957,7 +2963,7 @@ fn build_class_inner(
                     _ => Vec::new(),
                 };
                 let prepare_frame = {
-                    let stored = BUILD_CLASS_EXEC_CTX.with(|c| c.get());
+                    let stored = build_class_exec_ctx();
                     if stored.is_null() {
                         std::ptr::null_mut()
                     } else {
@@ -3058,7 +3064,7 @@ fn build_class_inner(
     // class body stores into it after execution. This lets EnumDict etc.
     // track member definitions via __setitem__.
 
-    let stored = BUILD_CLASS_EXEC_CTX.with(|c| c.get());
+    let stored = build_class_exec_ctx();
     let exec_ctx = if stored.is_null() {
         std::ptr::null::<crate::PyExecutionContext>()
     } else {
@@ -3555,9 +3561,9 @@ pub(crate) fn call_init_subclass_on_bases(
         .map(|(k, v)| (unsafe { pyre_object::w_str_get_wtf8(*k) }.to_owned(), *v))
         .collect();
     let frame = {
-        let stored = BUILD_CLASS_EXEC_CTX.with(|c| c.get());
+        let stored = build_class_exec_ctx();
         let stored = if stored.is_null() {
-            LAST_EXEC_CTX.with(|c| c.get())
+            take_last_exec_ctx()
         } else {
             stored
         };
@@ -3597,6 +3603,17 @@ thread_local! {
 /// Set the execution context for __build_class__ to use.
 pub fn set_build_class_exec_ctx(ctx: *const crate::PyExecutionContext) {
     BUILD_CLASS_EXEC_CTX.with(|c| c.set(ctx));
+}
+
+/// Read the __build_class__ execution context.
+///
+/// `dont_look_inside`: the `BUILD_CLASS_EXEC_CTX` thread-local `.with` read
+/// has no extractable graph (front::mir const-folds the `ThreadLocal` global
+/// to None), so the call stays a residual read via the registered fnaddr
+/// (`@dont_look_inside`, `rlib/jit.py:139`), the `take_last_exec_ctx` twin.
+#[majit_macros::dont_look_inside]
+pub fn build_class_exec_ctx() -> *const crate::PyExecutionContext {
+    BUILD_CLASS_EXEC_CTX.with(|c| c.get())
 }
 
 // ── Type calling (instance creation) ─────────────────────────────────
