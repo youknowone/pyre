@@ -4073,6 +4073,17 @@ impl<'a> Assembler386<'a> {
                 let label = self.mc.new_dynamic_label();
                 let descr_arc = op.getdescr();
                 let label_descr = descr_arc.as_ref().and_then(|d| d.as_loop_target_descr());
+                if label_descr.is_some() {
+                    // Align the loop back-edge target to 16 bytes. The buffer is
+                    // page-aligned, so aligning the offset aligns the address. A
+                    // head landing in the last few bytes of a 64-byte fetch line
+                    // costs a per-iteration front-end fetch bubble on the taken
+                    // back-edge; the pad (executed only on the first fall-through
+                    // entry) removes that sensitivity to frame-layout offset.
+                    while self.mc.offset().0 % 16 != 0 {
+                        dynasm!(self.mc ; .arch x64 ; nop);
+                    }
+                }
                 if majit_ir::debug::have_debug_prints() {
                     majit_ir::debug::log_one(
                         "jit-backend",
