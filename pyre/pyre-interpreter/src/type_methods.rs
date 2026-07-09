@@ -1730,10 +1730,11 @@ fn format_with_spec(val: PyObjectRef, spec: &str) -> Result<Wtf8Buf, crate::PyEr
     }
 }
 
-/// Reject a sign flag or `=` alignment in a string format spec — both are
-/// disallowed for `str` values but accepted by the shared formatter.  Only
-/// the *explicit* alignment is inspected: a leading `0` flag (which the
-/// shared parser normalises to `=`) is a zero fill and stays legal for text.
+/// Reject a sign flag, `=` alignment, or `#` alternate form in a string
+/// format spec — all disallowed for `str` values but accepted by the shared
+/// formatter.  Only the *explicit* alignment is inspected: a leading `0` flag
+/// (which the shared parser normalises to `=`) is a zero fill and stays legal
+/// for text, and a `#` used as a fill character precedes the alignment.
 fn reject_string_sign_align(spec: &str) -> Result<(), crate::PyError> {
     let chars: Vec<char> = spec.chars().collect();
     let n = chars.len();
@@ -1757,6 +1758,11 @@ fn reject_string_sign_align(spec: &str) -> Result<(), crate::PyError> {
         } else {
             "Sign not allowed in string format specifier"
         }));
+    }
+    if i < n && chars[i] == '#' {
+        return Err(crate::PyError::value_error(
+            "Alternate form (#) not allowed in string format specifier",
+        ));
     }
     Ok(())
 }
