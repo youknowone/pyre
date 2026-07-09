@@ -2657,12 +2657,15 @@ fn init_str_type(ns: &mut DictStorage) {
         make_builtin_function_with_arity(
             "__contains__",
             |args| {
-                if args.len() < 2 {
-                    return Ok(pyre_object::w_bool_from(false));
+                if args.len() != 2 {
+                    return Err(crate::PyError::type_error(format!(
+                        "expected 1 argument, got {}",
+                        args.len().saturating_sub(1)
+                    )));
                 }
-                Ok(pyre_object::w_bool_from(
-                    crate::baseobjspace::contains_slot(args[0], args[1]).unwrap_or(false),
-                ))
+                Ok(pyre_object::w_bool_from(crate::baseobjspace::contains_slot(
+                    args[0], args[1],
+                )?))
             },
             2,
         ),

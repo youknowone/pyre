@@ -1276,7 +1276,7 @@ unsafe fn getitem_list(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
             if let Some(v) = w_list_getitem(obj, i) {
                 items.push(v);
             }
-            i += step;
+            i = i.saturating_add(step);
         }
         return Ok(w_list_new(items));
     }
@@ -1305,7 +1305,7 @@ unsafe fn getitem_tuple(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
             if let Some(v) = w_tuple_getitem(obj, i) {
                 items.push(v);
             }
-            i += step;
+            i = i.saturating_add(step);
         }
         return Ok(w_tuple_new(items));
     }
@@ -1341,7 +1341,7 @@ unsafe fn getitem_str(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
             if i >= 0 && (i as usize) < cps.len() {
                 result.push(cps[i as usize]);
             }
-            i += step;
+            i = i.saturating_add(step);
         }
         return Ok(w_str_from_wtf8(result));
     }
@@ -1389,14 +1389,14 @@ unsafe fn getitem_bytes_like(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
                 result.push(pyre_object::bytesobject::bytes_like_getitem(
                     obj, i as usize,
                 ));
-                i += step;
+                i = i.saturating_add(step);
             }
         } else {
             while i > stop {
                 result.push(pyre_object::bytesobject::bytes_like_getitem(
                     obj, i as usize,
                 ));
-                i += step;
+                i = i.saturating_add(step);
             }
         }
         return Ok(if is_bytes {
@@ -2140,7 +2140,7 @@ unsafe fn getitem_range_iter(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         let mut i = start;
         while (step > 0 && i < stop) || (step < 0 && i > stop) {
             items.push(w_int_new(r.current + i * r.step));
-            i += step;
+            i = i.saturating_add(step);
         }
         return Ok(w_list_new(items));
     }
@@ -2294,7 +2294,7 @@ unsafe fn setitem_list_slice(obj: PyObjectRef, index: PyObjectRef, value: PyObje
         if i >= 0 && i < len {
             indices.push(i);
         }
-        i += step;
+        i = i.saturating_add(step);
     }
     let other_len = pyre_object::w_list_len(w_other);
     if other_len != indices.len() {
@@ -2530,7 +2530,7 @@ unsafe fn setitem_bytearray_slice(
         if i >= 0 && i < len {
             indices.push(i as usize);
         }
-        i += step;
+        i = i.saturating_add(step);
     }
     if sequence2.len() != indices.len() {
         return Err(PyError::new(
@@ -11441,7 +11441,15 @@ pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Resul
             }
             return Ok(false);
         }
-        if is_str(haystack) && is_str(needle) {
+        if is_str(haystack) {
+            // `x in s` requires a str left operand; any other type is a
+            // TypeError rather than an elementwise scan.
+            if !is_str(needle) {
+                return Err(PyError::type_error(format!(
+                    "'in <string>' requires string as left operand, not {}",
+                    crate::type_methods::arg_type_name(needle)
+                )));
+            }
             // Substring test over the WTF-8 bytes: the encoding is
             // self-synchronizing, so a byte-level match coincides with a
             // codepoint-level match and lone surrogates compare correctly.
@@ -11712,12 +11720,12 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
                 if step > 0 {
                     while i < stop {
                         indices.push(i);
-                        i += step;
+                        i = i.saturating_add(step);
                     }
                 } else {
                     while i > stop {
                         indices.push(i);
-                        i += step;
+                        i = i.saturating_add(step);
                     }
                 }
                 indices.sort_unstable_by(|a, b| b.cmp(a));
@@ -11760,12 +11768,12 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
                 if step > 0 {
                     while i < stop {
                         indices.push(i);
-                        i += step;
+                        i = i.saturating_add(step);
                     }
                 } else {
                     while i > stop {
                         indices.push(i);
-                        i += step;
+                        i = i.saturating_add(step);
                     }
                 }
                 indices.sort_unstable_by(|a, b| b.cmp(a));
