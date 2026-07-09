@@ -1550,9 +1550,9 @@ pub fn builtin_value_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     if spec.is_empty() {
         // `str(self)` — a str self passes through as WTF-8.
         if unsafe { pyre_object::is_str(args[0]) } {
-            return Ok(pyre_object::w_str_from_wtf8(
-                unsafe { pyre_object::w_str_get_wtf8(args[0]) }.to_wtf8_buf(),
-            ));
+            return Ok(pyre_object::w_str_from_wtf8(unsafe {
+                crate::display::py_str_wtf8(args[0])?
+            }));
         }
         return Ok(pyre_object::w_str_new(&unsafe { crate::py_str(args[0])? }));
     }
