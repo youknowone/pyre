@@ -2401,7 +2401,7 @@ mod tests {
     fn parse_state_fields_accepts_opaque_pass_through() {
         let tokens: proc_macro2::TokenStream = parse_quote! {
             {
-                storage: opaque(aheui_runtime::storage::Storage),
+                storage: opaque(test_fixtures::storage::Storage),
                 selected: int,
                 tape: [int; virt],
             }

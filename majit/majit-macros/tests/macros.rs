@@ -912,50 +912,50 @@ mod jit_struct {
     }
 
     // ─────────────────────────────────────────────────────────────────────
-    // rpaheui shape parity: `LinkedList`/`Stack`/`Queue` / `Port` structures
-    // from `rpaheui/aheui/storage/linkedlist.py` recoded as `#[jit_struct]`.
+    // linked-list shape parity: `LinkedList`/`Stack`/`Queue` / `Port`
+    // structures recoded as `#[jit_struct]`.
     // These tests document the end-state of the generic-storage migration:
     // once the tracer consumes descrs through GcCache lookup, the existing
     // `linked_list_*` trait methods on `JitCodeSym` become redundant.
     // ─────────────────────────────────────────────────────────────────────
 
-    /// rpaheui/aheui/storage/linkedlist.py:4-11 (`class Node`).
+    /// Singly-linked list node (`class Node`).
     #[jit_struct]
-    struct AheuiNode {
+    struct LinkedNode {
         value: i64,
-        next: Option<Box<AheuiNode>>,
+        next: Option<Box<LinkedNode>>,
     }
 
-    /// rpaheui/aheui/storage/linkedlist.py:67-91 (`class Stack(LinkedList)`).
+    /// Stack backed by a singly-linked list (`class Stack(LinkedList)`).
     #[jit_struct]
-    struct AheuiStack {
-        head: Option<Box<AheuiNode>>,
+    struct LinkedStack {
+        head: Option<Box<LinkedNode>>,
         size: usize,
     }
 
-    /// rpaheui/aheui/storage/linkedlist.py:94-122 (`class Queue(LinkedList)`).
+    /// Queue backed by a singly-linked list (`class Queue(LinkedList)`).
     #[jit_struct]
-    struct AheuiQueue {
-        head: Option<Box<AheuiNode>>,
-        tail: Option<Box<AheuiNode>>,
+    struct LinkedQueue {
+        head: Option<Box<LinkedNode>>,
+        tail: Option<Box<LinkedNode>>,
         size: usize,
     }
 
-    /// rpaheui/aheui/storage/linkedlist.py:125-148 (`class Port(LinkedList)`).
+    /// Port backed by a singly-linked list (`class Port(LinkedList)`).
     #[jit_struct]
-    struct AheuiPort {
-        head: Option<Box<AheuiNode>>,
+    struct LinkedPort {
+        head: Option<Box<LinkedNode>>,
         size: usize,
         last_push: i64,
     }
 
     #[test]
-    fn aheui_shapes_register_descrs() {
+    fn linked_list_shapes_register_descrs() {
         let mut gc = GcCache::new();
-        let node = AheuiNode::__majit_register_descrs(&mut gc);
-        let stack = AheuiStack::__majit_register_descrs(&mut gc);
-        let queue = AheuiQueue::__majit_register_descrs(&mut gc);
-        let port = AheuiPort::__majit_register_descrs(&mut gc);
+        let node = LinkedNode::__majit_register_descrs(&mut gc);
+        let stack = LinkedStack::__majit_register_descrs(&mut gc);
+        let queue = LinkedQueue::__majit_register_descrs(&mut gc);
+        let port = LinkedPort::__majit_register_descrs(&mut gc);
 
         // Each shape gets a distinct SizeDescr.
         for (a, b) in [
@@ -969,23 +969,23 @@ mod jit_struct {
             assert!(!std::sync::Arc::ptr_eq(a, b));
         }
 
-        assert_eq!(AheuiNode::__MAJIT_FIELD_NAMES, &["value", "next"]);
-        assert_eq!(AheuiStack::__MAJIT_FIELD_NAMES, &["head", "size"]);
-        assert_eq!(AheuiQueue::__MAJIT_FIELD_NAMES, &["head", "tail", "size"]);
+        assert_eq!(LinkedNode::__MAJIT_FIELD_NAMES, &["value", "next"]);
+        assert_eq!(LinkedStack::__MAJIT_FIELD_NAMES, &["head", "size"]);
+        assert_eq!(LinkedQueue::__MAJIT_FIELD_NAMES, &["head", "tail", "size"]);
         assert_eq!(
-            AheuiPort::__MAJIT_FIELD_NAMES,
+            LinkedPort::__MAJIT_FIELD_NAMES,
             &["head", "size", "last_push"]
         );
     }
 
     #[test]
-    fn aheui_node_field_types_match_rpaheui() {
+    fn linked_node_field_types_match() {
         let mut gc = GcCache::new();
-        let _ = AheuiNode::__majit_register_descrs(&mut gc);
-        let key = LLType::struct_key(AheuiNode::__majit_type_id());
+        let _ = LinkedNode::__majit_register_descrs(&mut gc);
+        let key = LLType::struct_key(LinkedNode::__majit_type_id());
         let fields = gc._cache_field.get(&key).unwrap();
 
-        // `value: i64` → Int (rpaheui bigint lowered to i64 for the integer trace).
+        // `value: i64` → Int (bigint lowered to i64 for the integer trace).
         let value_fd = fields.get("value").unwrap().as_field_descr().unwrap();
         assert_eq!(value_fd.field_type(), Type::Int);
 
@@ -995,10 +995,10 @@ mod jit_struct {
     }
 
     #[test]
-    fn aheui_queue_tail_descr_distinct_from_head() {
+    fn queue_tail_descr_distinct_from_head() {
         let mut gc = GcCache::new();
-        let _ = AheuiQueue::__majit_register_descrs(&mut gc);
-        let key = LLType::struct_key(AheuiQueue::__majit_type_id());
+        let _ = LinkedQueue::__majit_register_descrs(&mut gc);
+        let key = LLType::struct_key(LinkedQueue::__majit_type_id());
         let fields = gc._cache_field.get(&key).unwrap();
         let head = fields.get("head").unwrap();
         let tail = fields.get("tail").unwrap();
