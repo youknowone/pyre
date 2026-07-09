@@ -706,12 +706,23 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
     // `_jit_look_inside_` source as `merge_hints_from_llbcs`) so the
     // per-fn push can stamp the matching `return_type` token, keyed by
     // the identical `{module_path}::{name}` path the merge uses.
-    let dont_look_inside: std::collections::HashSet<String> =
-        crate::front::llbc_hints::harvest_hints_from_llbcs(std::slice::from_ref(llbc))
-            .into_iter()
-            .filter(|(_, hints)| hints.iter().any(|h| h == "dont_look_inside"))
-            .map(|(path, _)| path)
-            .collect();
+    let harvested = crate::front::llbc_hints::harvest_hints_from_llbcs(std::slice::from_ref(llbc));
+    let dont_look_inside: std::collections::HashSet<String> = harvested
+        .iter()
+        .filter(|(_, hints)| hints.iter().any(|h| h == "dont_look_inside"))
+        .map(|(path, _)| path.clone())
+        .collect();
+    // `#[majit_macros::elidable]` callees (`llbc_hints.rs:31` maps the
+    // `_elidable_function_` marker → `"elidable"`): the codewriter's
+    // elidable effect already lowers the callsite to CALL_PURE and never
+    // looks inside the body.  Harvest the elidable set from the same
+    // vector so `stamp_return_token` can stamp the matching FUNC.RESULT
+    // token, gated on `PYRE_ELIDABLE_RESIDUALIZE`.
+    let elidable_residual: std::collections::HashSet<String> = harvested
+        .iter()
+        .filter(|(_, hints)| hints.iter().any(|h| h == "elidable"))
+        .map(|(path, _)| path.clone())
+        .collect();
     let mut functions = Vec::new();
     let mut skipped: Vec<(String, String)> = Vec::new();
     for fd in llbc.iter_local_fns() {
@@ -822,6 +833,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         // (`lib.rs`) keeps its `None`→`Void` default when the routing is off
         // — off-path byte-identity holds.
         let stamp_return_token = dont_look_inside.contains(&fn_path)
+            || (elidable_residualize_enabled() && elidable_residual.contains(&fn_path))
             || (dyn_indirect_enabled() && trait_root.is_some() && self_ty_root.is_none());
         let return_type = if stamp_return_token {
             dont_look_inside_return_token(&fd.signature.output, llbc)
@@ -12028,6 +12040,20 @@ fn tuple_per_shape_enabled() -> bool {
 pub(crate) fn dyn_indirect_enabled() -> bool {
     matches!(
         std::env::var("PYRE_DYN_INDIRECT").as_deref(),
+        Ok("1") | Ok("true")
+    )
+}
+
+/// Residualize a `#[majit_macros::elidable]` graph — stamp its return-kind
+/// FUNC.RESULT token and prefill a signature-only stub instead of lifting
+/// the body — mirroring `@elidable` + `look_inside_graph=False` (the
+/// callsite already lowers to CALL_PURE via the codewriter's elidable
+/// effect; the body is never looked inside).  Default-OFF —
+/// `PYRE_ELIDABLE_RESIDUALIZE=1` opts in; every other value (unset
+/// included) keeps the elidable body lifted as today.
+pub(crate) fn elidable_residualize_enabled() -> bool {
+    matches!(
+        std::env::var("PYRE_ELIDABLE_RESIDUALIZE").as_deref(),
         Ok("1") | Ok("true")
     )
 }

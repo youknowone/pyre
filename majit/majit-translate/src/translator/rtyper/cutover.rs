@@ -1713,7 +1713,10 @@ pub(crate) fn populate_call_registry_from_call_graphs(
         // `default_someshell_for_lltype` → `lltype_to_annotation` path
         // already covers `Ptr(_)`.  An unrecognized token (none
         // currently emitted) falls through to the normal lift.
-        if graph.hints.iter().any(|h| h == "dont_look_inside") {
+        let residualize = graph.hints.iter().any(|h| h == "dont_look_inside")
+            || (crate::front::mir::elidable_residualize_enabled()
+                && graph.hints.iter().any(|h| h == "elidable"));
+        if residualize {
             let return_lltype = match graph.return_type.as_deref() {
                 None | Some("()") => Some(LowLevelType::Void),
                 Some("bool") => Some(LowLevelType::Bool),
