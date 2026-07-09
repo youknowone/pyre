@@ -2147,10 +2147,11 @@ pub fn encode_object(
         "raw-unicode-escape" => Ok(encode_raw_unicode_escape(s)),
         _ => match encode_utf16_32(s, &enc_lower, w_object, errors) {
             Some(out) => out,
-            None => Err(crate::PyError::new(
-                crate::PyErrorKind::LookupError,
-                format!("unknown encoding: {encoding}"),
-            )),
+            None => {
+                let encoded =
+                    crate::module::_codecs::encode_text_codec(w_object, encoding, errors)?;
+                Ok(unsafe { pyre_object::bytesobject::bytes_like_data(encoded) }.to_vec())
+            }
         },
     }
 }
@@ -2868,54 +2869,581 @@ pub fn str_method_zfill(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     Ok(w_str_from_wtf8(out))
 }
 
-/// Number of non-overlapping occurrences of `needle` in `haystack`,
-/// scanning over the WTF-8 bytes. The encoding is self-synchronizing,
-/// so a byte-window match starts on a code-point boundary and the count
-/// equals the code-point-level count. An empty needle matches at every
-/// code-point boundary (len+1 positions), as in `str.count`.
-fn wtf8_count(haystack: &Wtf8, needle: &Wtf8) -> usize {
-    let h = haystack.as_bytes();
-    let n = needle.as_bytes();
-    if n.is_empty() {
-        return haystack.code_points().count() + 1;
-    }
-    let mut count = 0;
-    let mut i = 0;
-    while i + n.len() <= h.len() {
-        if &h[i..i + n.len()] == n {
-            count += 1;
-            i += n.len();
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SearchMode {
+    Count,
+    Find,
+    RFind,
+}
+
+const TWOWAY_MAX_SHIFT: usize = 255;
+const TWOWAY_TABLE_SIZE: usize = 64;
+const TWOWAY_TABLE_MASK: usize = TWOWAY_TABLE_SIZE - 1;
+
+#[inline]
+fn rstring_bloom_add(mask: u64, c: u8) -> u64 {
+    // RPython `rstring.py:bloom_add`, with LONG_BIT = 64 on this target.
+    mask | (1u64 << (c & 63))
+}
+
+#[inline]
+fn rstring_bloom(mask: u64, c: u8) -> bool {
+    // RPython `rstring.py:bloom`.
+    (mask & (1u64 << (c & 63))) != 0
+}
+
+fn rstring_lex_search(needle: &[u8], len_needle: usize, invert_alphabet: bool) -> (usize, usize) {
+    // RPython `rstring.py:_lex_search`.
+    let mut max_suffix = 0usize;
+    let mut candidate = 1usize;
+    let mut k = 0usize;
+    let mut period = 1usize;
+    while candidate + k < len_needle {
+        let a = needle[candidate + k];
+        let b = needle[max_suffix + k];
+        if if invert_alphabet { b < a } else { a < b } {
+            candidate += k + 1;
+            k = 0;
+            period = candidate - max_suffix;
+        } else if a == b {
+            if k + 1 != period {
+                k += 1;
+            } else {
+                candidate += period;
+                k = 0;
+            }
         } else {
-            i += 1;
+            max_suffix = candidate;
+            candidate += 1;
+            k = 0;
+            period = 1;
         }
     }
-    count
+    (max_suffix, period)
+}
+
+fn rstring_factorize(needle: &[u8], len_needle: usize) -> (usize, usize) {
+    // RPython `rstring.py:_factorize`.
+    let (cut1, period1) = rstring_lex_search(needle, len_needle, false);
+    let (cut2, period2) = rstring_lex_search(needle, len_needle, true);
+    if cut1 > cut2 {
+        (cut1, period1)
+    } else {
+        (cut2, period2)
+    }
+}
+
+fn rstring_twoway_preprocess(
+    needle: &[u8],
+    len_needle: usize,
+) -> (usize, usize, usize, bool, [u8; TWOWAY_TABLE_SIZE]) {
+    // RPython `rstring.py:_twoway_preprocess`.
+    let (cut, mut period) = rstring_factorize(needle, len_needle);
+    let mut is_periodic = true;
+    let mut i = 0usize;
+    while i < cut {
+        if needle[i] != needle[period + i] {
+            is_periodic = false;
+            break;
+        }
+        i += 1;
+    }
+    let gap = if is_periodic {
+        0
+    } else {
+        period = cut.max(len_needle - cut) + 1;
+        let mut gap = len_needle;
+        let last = (needle[len_needle - 1] as usize) & TWOWAY_TABLE_MASK;
+        let mut i = len_needle - 1;
+        while i > 0 {
+            i -= 1;
+            if ((needle[i] as usize) & TWOWAY_TABLE_MASK) == last {
+                gap = len_needle - 1 - i;
+                break;
+            }
+        }
+        gap
+    };
+    let not_found_shift = len_needle.min(TWOWAY_MAX_SHIFT) as u8;
+    let mut table = [not_found_shift; TWOWAY_TABLE_SIZE];
+    let mut i = len_needle - not_found_shift as usize;
+    while i < len_needle {
+        table[(needle[i] as usize) & TWOWAY_TABLE_MASK] = (len_needle - 1 - i) as u8;
+        i += 1;
+    }
+    (cut, period, gap, is_periodic, table)
+}
+
+fn rstring_two_way(
+    value: &[u8],
+    base: usize,
+    n: usize,
+    needle: &[u8],
+    m: usize,
+    cut: usize,
+    mut period: usize,
+    gap: usize,
+    is_periodic: bool,
+    table: &[u8; TWOWAY_TABLE_SIZE],
+) -> isize {
+    // RPython `rstring.py:_two_way`.
+    let haystack_end = base + n;
+    let mut window_last = base + m - 1;
+    if is_periodic {
+        let mut memory = 0usize;
+        let mut skip_horspool = false;
+        while window_last < haystack_end {
+            if !skip_horspool {
+                loop {
+                    let shift = table[(value[window_last] as usize) & TWOWAY_TABLE_MASK] as usize;
+                    window_last += shift;
+                    if shift == 0 {
+                        break;
+                    }
+                    if window_last >= haystack_end {
+                        return -1;
+                    }
+                }
+            }
+            skip_horspool = false;
+            let window = window_last + 1 - m;
+            let mut i = cut.max(memory);
+            let mut mismatch = false;
+            while i < m {
+                if needle[i] != value[window + i] {
+                    window_last += i - cut + 1;
+                    memory = 0;
+                    mismatch = true;
+                    break;
+                }
+                i += 1;
+            }
+            if mismatch {
+                continue;
+            }
+            i = memory;
+            while i < cut {
+                if needle[i] != value[window + i] {
+                    window_last += period;
+                    memory = m - period;
+                    if window_last >= haystack_end {
+                        return -1;
+                    }
+                    let shift = table[(value[window_last] as usize) & TWOWAY_TABLE_MASK] as usize;
+                    if shift != 0 {
+                        let mem_jump = cut.max(memory) - cut + 1;
+                        memory = 0;
+                        window_last += shift.max(mem_jump);
+                    } else {
+                        skip_horspool = true;
+                    }
+                    mismatch = true;
+                    break;
+                }
+                i += 1;
+            }
+            if mismatch {
+                continue;
+            }
+            return (window - base) as isize;
+        }
+        -1
+    } else {
+        if period < gap {
+            period = gap;
+        }
+        let gap_jump_end = (cut + gap).min(m);
+        while window_last < haystack_end {
+            loop {
+                let shift = table[(value[window_last] as usize) & TWOWAY_TABLE_MASK] as usize;
+                window_last += shift;
+                if shift == 0 {
+                    break;
+                }
+                if window_last >= haystack_end {
+                    return -1;
+                }
+            }
+            let window = window_last + 1 - m;
+            let mut mismatch = false;
+            let mut i = cut;
+            while i < gap_jump_end {
+                if needle[i] != value[window + i] {
+                    window_last += gap;
+                    mismatch = true;
+                    break;
+                }
+                i += 1;
+            }
+            if mismatch {
+                continue;
+            }
+            i = gap_jump_end;
+            while i < m {
+                if needle[i] != value[window + i] {
+                    window_last += i - cut + 1;
+                    mismatch = true;
+                    break;
+                }
+                i += 1;
+            }
+            if mismatch {
+                continue;
+            }
+            i = 0;
+            while i < cut {
+                if needle[i] != value[window + i] {
+                    window_last += period;
+                    mismatch = true;
+                    break;
+                }
+                i += 1;
+            }
+            if mismatch {
+                continue;
+            }
+            return (window - base) as isize;
+        }
+        -1
+    }
+}
+
+fn rstring_two_way_count(
+    value: &[u8],
+    base: usize,
+    n: usize,
+    needle: &[u8],
+    m: usize,
+    cut: usize,
+    period: usize,
+    gap: usize,
+    is_periodic: bool,
+    table: &[u8; TWOWAY_TABLE_SIZE],
+) -> usize {
+    // RPython `rstring.py:_two_way_count`.
+    let mut index = 0usize;
+    let mut count = 0usize;
+    loop {
+        let result = rstring_two_way(
+            value,
+            base + index,
+            n - index,
+            needle,
+            m,
+            cut,
+            period,
+            gap,
+            is_periodic,
+            table,
+        );
+        if result == -1 {
+            return count;
+        }
+        count += 1;
+        index += result as usize + m;
+    }
+}
+
+fn rstring_default_find(
+    value: &[u8],
+    base: usize,
+    n: usize,
+    needle: &[u8],
+    m: usize,
+    mode: SearchMode,
+) -> isize {
+    // RPython `rstring.py:_default_find`.
+    let w = n - m;
+    let mlast = m - 1;
+    let mut count = 0usize;
+    let mut gap = mlast;
+    let last = needle[mlast];
+    let mut mask = 0u64;
+    let mut j = 0usize;
+    while j < mlast {
+        mask = rstring_bloom_add(mask, needle[j]);
+        if needle[j] == last {
+            gap = mlast - j - 1;
+        }
+        j += 1;
+    }
+    mask = rstring_bloom_add(mask, last);
+    let mut i = 0usize;
+    while i <= w {
+        if value[base + mlast + i] == last {
+            j = 0;
+            while j < mlast {
+                if value[base + i + j] != needle[j] {
+                    break;
+                }
+                j += 1;
+            }
+            if j == mlast {
+                if mode != SearchMode::Count {
+                    return i as isize;
+                }
+                count += 1;
+                i += mlast;
+            } else {
+                let la = base + mlast + i + 1;
+                let c = if la < value.len() { value[la] } else { 0 };
+                if !rstring_bloom(mask, c) {
+                    i += m;
+                } else {
+                    i += gap;
+                }
+            }
+        } else {
+            let la = base + mlast + i + 1;
+            let c = if la < value.len() { value[la] } else { 0 };
+            if !rstring_bloom(mask, c) {
+                i += m;
+            }
+        }
+        i += 1;
+    }
+    if mode != SearchMode::Count {
+        -1
+    } else {
+        count as isize
+    }
+}
+
+fn rstring_adaptive_find(
+    value: &[u8],
+    base: usize,
+    n: usize,
+    needle: &[u8],
+    m: usize,
+    mode: SearchMode,
+) -> isize {
+    // RPython `rstring.py:_adaptive_find`.
+    let w = n - m;
+    let mlast = m - 1;
+    let mut count = 0usize;
+    let mut gap = mlast;
+    let mut hits = 0usize;
+    let last = needle[mlast];
+    let mut mask = 0u64;
+    let mut j = 0usize;
+    while j < mlast {
+        mask = rstring_bloom_add(mask, needle[j]);
+        if needle[j] == last {
+            gap = mlast - j - 1;
+        }
+        j += 1;
+    }
+    mask = rstring_bloom_add(mask, last);
+    let mut i = 0usize;
+    while i <= w {
+        if value[base + mlast + i] == last {
+            j = 0;
+            while j < mlast {
+                if value[base + i + j] != needle[j] {
+                    break;
+                }
+                j += 1;
+            }
+            if j == mlast {
+                if mode != SearchMode::Count {
+                    return i as isize;
+                }
+                count += 1;
+                i += mlast;
+            } else {
+                hits += j + 1;
+                if hits > m / 4 && w - i > 2000 {
+                    let (cut, period, gap, is_periodic, table) =
+                        rstring_twoway_preprocess(needle, m);
+                    if mode != SearchMode::Count {
+                        let res = rstring_two_way(
+                            value,
+                            base + i,
+                            n - i,
+                            needle,
+                            m,
+                            cut,
+                            period,
+                            gap,
+                            is_periodic,
+                            &table,
+                        );
+                        return if res == -1 { -1 } else { res + i as isize };
+                    }
+                    let res = rstring_two_way_count(
+                        value,
+                        base + i,
+                        n - i,
+                        needle,
+                        m,
+                        cut,
+                        period,
+                        gap,
+                        is_periodic,
+                        &table,
+                    );
+                    return (res + count) as isize;
+                }
+                let la = base + mlast + i + 1;
+                let c = if la < value.len() { value[la] } else { 0 };
+                if !rstring_bloom(mask, c) {
+                    i += m;
+                } else {
+                    i += gap;
+                }
+            }
+        } else {
+            let la = base + mlast + i + 1;
+            let c = if la < value.len() { value[la] } else { 0 };
+            if !rstring_bloom(mask, c) {
+                i += m;
+            }
+        }
+        i += 1;
+    }
+    if mode != SearchMode::Count {
+        -1
+    } else {
+        count as isize
+    }
+}
+
+fn rstring_search_normal(
+    value: &[u8],
+    other: &[u8],
+    mut start: usize,
+    mut end: usize,
+    mode: SearchMode,
+) -> isize {
+    // RPython `rstring.py:_search_normal`, specialized to byte-backed
+    // PyPy unicode `_utf8` / pyre WTF-8 storage.
+    end = end.min(value.len());
+    start = start.min(end);
+    let n = end - start;
+    let m = other.len();
+    if m == 0 {
+        return match mode {
+            SearchMode::Count => (end - start + 1) as isize,
+            SearchMode::RFind => end as isize,
+            SearchMode::Find => start as isize,
+        };
+    }
+    let Some(w) = n.checked_sub(m) else {
+        return if mode == SearchMode::Count { 0 } else { -1 };
+    };
+    if mode != SearchMode::RFind {
+        let res = if n < 2500 || (m < 100 && n < 30000) || m < 6 {
+            rstring_default_find(value, start, n, other, m, mode)
+        } else if (m >> 2) * 3 < (n >> 2) {
+            let (cut, period, gap, is_periodic, table) = rstring_twoway_preprocess(other, m);
+            if mode == SearchMode::Count {
+                return rstring_two_way_count(
+                    value,
+                    start,
+                    n,
+                    other,
+                    m,
+                    cut,
+                    period,
+                    gap,
+                    is_periodic,
+                    &table,
+                ) as isize;
+            }
+            rstring_two_way(
+                value,
+                start,
+                n,
+                other,
+                m,
+                cut,
+                period,
+                gap,
+                is_periodic,
+                &table,
+            )
+        } else {
+            rstring_adaptive_find(value, start, n, other, m, mode)
+        };
+        if mode == SearchMode::Count {
+            res
+        } else if res == -1 {
+            -1
+        } else {
+            start as isize + res
+        }
+    } else {
+        // RPython `rstring.py:_search_normal` reverse-find branch.
+        let mlast = m - 1;
+        let mut skip = mlast;
+        let mut mask = rstring_bloom_add(0, other[0]);
+        let mut i = mlast;
+        while i > 0 {
+            mask = rstring_bloom_add(mask, other[i]);
+            if other[i] == other[0] {
+                skip = i - 1;
+            }
+            i -= 1;
+        }
+        let mut i = start + w + 1;
+        while i > start {
+            i -= 1;
+            if value[i] == other[0] {
+                let mut matched = true;
+                let mut j = mlast;
+                while j > 0 {
+                    if value[i + j] != other[j] {
+                        matched = false;
+                        break;
+                    }
+                    j -= 1;
+                }
+                if matched {
+                    return i as isize;
+                }
+                if i > 0 && !rstring_bloom(mask, value[i - 1]) {
+                    i = i.saturating_sub(m);
+                } else {
+                    i = i.saturating_sub(skip);
+                }
+            } else if i > 0 && !rstring_bloom(mask, value[i - 1]) {
+                i = i.saturating_sub(m);
+            }
+        }
+        -1
+    }
+}
+
+/// Number of non-overlapping occurrences of `needle` in `haystack`,
+/// scanning over the WTF-8 bytes. PyPy's `unicodeobject.py:1116` delegates
+/// to `_utf8.count`; the RPython translation path for non-host strings is
+/// `rstring.py:_search_normal(..., SEARCH_COUNT)`.
+fn wtf8_count(haystack: &Wtf8, needle: &Wtf8) -> usize {
+    if needle.is_empty() {
+        return haystack.code_points().count() + 1;
+    }
+    rstring_search_normal(
+        haystack.as_bytes(),
+        needle.as_bytes(),
+        0,
+        haystack.len(),
+        SearchMode::Count,
+    ) as usize
 }
 
 /// First byte offset of `needle` fully within `haystack[lo..hi]`, over
-/// WTF-8 bytes. An empty needle matches at `lo`.
+/// WTF-8 bytes. PyPy `unicodeobject.py:_unwrap_and_search` searches the
+/// `_utf8` storage after converting codepoint bounds to byte bounds.
 fn wtf8_find_bounded(haystack: &[u8], needle: &[u8], lo: usize, hi: usize) -> Option<usize> {
-    if needle.is_empty() {
-        return Some(lo);
-    }
-    if needle.len() > hi {
-        return None;
-    }
-    (lo..=hi - needle.len()).find(|&i| &haystack[i..i + needle.len()] == needle)
+    let res = rstring_search_normal(haystack, needle, lo, hi, SearchMode::Find);
+    if res == -1 { None } else { Some(res as usize) }
 }
 
 /// Last byte offset of `needle` fully within `haystack[lo..hi]`, over
-/// WTF-8 bytes. An empty needle matches at `hi`.
+/// WTF-8 bytes. Mirrors `rstring.py:_search_normal(..., SEARCH_RFIND)`.
 fn wtf8_rfind_bounded(haystack: &[u8], needle: &[u8], lo: usize, hi: usize) -> Option<usize> {
-    if needle.is_empty() {
-        return Some(hi);
-    }
-    if needle.len() > hi {
-        return None;
-    }
-    (lo..=hi - needle.len())
-        .rev()
-        .find(|&i| &haystack[i..i + needle.len()] == needle)
+    let res = rstring_search_normal(haystack, needle, lo, hi, SearchMode::RFind);
+    if res == -1 { None } else { Some(res as usize) }
 }
 
 /// PyPy `_unwrap_and_search` (unicodeobject.py:1288-1317) — the shared

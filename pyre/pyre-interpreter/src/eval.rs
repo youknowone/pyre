@@ -718,6 +718,10 @@ fn walk_pyframe_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
                 // reaches — code objects are Box-immortal — so forward those
                 // the same way.
                 crate::pycode::walk_mapdict_method_cache_gc(&mut forward);
+                // _codecs.CodecState is a space-cache object in PyPy; pyre
+                // keeps the same list/dict state in module-local storage, so
+                // its Python objects must be forwarded explicitly.
+                crate::module::_codecs::walk_codec_state_gc(&mut forward);
             }
             // The minor walk above promoted every young value reachable
             // from the prebuilt family; re-arm the write-tracking bit

@@ -322,11 +322,12 @@ unsafe fn star_int(arg: Option<PyObjectRef>, field: StarField) -> Result<i64, Py
     let big = crate::builtins::obj_to_bigint(arg);
     use num_traits::ToPrimitive;
     match field {
-        StarField::Width => big.to_i64().ok_or_else(|| {
-            PyError::overflow_error("Python int too large to convert to C ssize_t")
-        }),
-        StarField::Precision => big.to_i32().map(|v| v as i64).ok_or_else(|| {
-            PyError::overflow_error("Python int too large to convert to C int")
-        }),
+        StarField::Width => big
+            .to_i64()
+            .ok_or_else(|| PyError::overflow_error("Python int too large to convert to C ssize_t")),
+        StarField::Precision => big
+            .to_i32()
+            .map(|v| v as i64)
+            .ok_or_else(|| PyError::overflow_error("Python int too large to convert to C int")),
     }
 }

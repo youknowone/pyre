@@ -2667,9 +2667,9 @@ fn init_str_type(ns: &mut DictStorage) {
                         args.len().saturating_sub(1)
                     )));
                 }
-                Ok(pyre_object::w_bool_from(crate::baseobjspace::contains_slot(
-                    args[0], args[1],
-                )?))
+                Ok(pyre_object::w_bool_from(
+                    crate::baseobjspace::contains_slot(args[0], args[1])?,
+                ))
             },
             2,
         ),
@@ -12158,10 +12158,9 @@ pub(crate) fn decode_bytes_to_wtf8(
             if let Some(result) = crate::type_methods::decode_utf16_32(data, &enc_lower, err_mode) {
                 result?
             } else {
-                return Err(crate::PyError::new(
-                    crate::PyErrorKind::LookupError,
-                    format!("unknown encoding: {encoding}"),
-                ));
+                let w_data = pyre_object::bytesobject::w_bytes_from_bytes(data);
+                let w_text = crate::module::_codecs::decode_text_codec(w_data, encoding, err_mode)?;
+                unsafe { pyre_object::w_str_get_wtf8(w_text) }.to_wtf8_buf()
             }
         }
     };
