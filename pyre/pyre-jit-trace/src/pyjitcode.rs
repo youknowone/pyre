@@ -234,6 +234,18 @@ pub struct PyJitCodeMetadata {
     /// leaves empty after the `pcdep_color_slots` color→slot inversion.
     /// Indexed by `py_pc`; empty for jitcodes with no inlined-callee resume.
     pub const_ref_slots_at_pc: Vec<Vec<(u16, i64)>>,
+    /// gh#73 S3.2: predecessor-keyed jitcode-pc twin of `const_ref_slots_at_pc`.
+    /// Each entry `(off, slots)` maps a JitCode byte offset to the const
+    /// operand-stack slot list of the py_pc that `python_pc_for_jitcode_pc(off)`
+    /// returns (block-head marker precedence, else the largest
+    /// `first_jit_pc_by_py_pc` at-or-before `off`). A PREDECESSOR binary search
+    /// (largest offset ≤ jit_pc) reproduces
+    /// `const_ref_slots_at_pc[python_pc_for_jitcode_pc(jit_pc)]` for a carried
+    /// resume coordinate. Built in the same `by_off` loop as `pcdep_by_jit_pc`;
+    /// empty for skeleton / portal-bridge / fixture. Read on the decode-identity
+    /// path of `const_ref_slots_at_pc_at`, mirroring the `pcdep_by_jit_pc` /
+    /// `depth_pred_by_jit_pc` twins' production use.
+    pub const_ref_slots_by_jit_pc: Vec<(usize, Vec<(u16, i64)>)>,
     /// True once `assembler.assemble`'s setup-time drain has run and stamped
     /// the per-Python-PC maps (`codewriter.rs` `finalize_jitcode`). The
     /// install-mode discriminators ([`PyJitCode::is_populated`] /
@@ -581,6 +593,21 @@ impl PyJitCode {
         Self::predecessor_index(search).map(|i| table[i].1)
     }
 
+    /// gh#73 S3.2: const operand-stack slots keyed by a JitCode byte offset via
+    /// the `const_ref_slots_by_jit_pc` predecessor twin. Equals
+    /// `const_ref_slots_at_pc[python_pc_for_jitcode_pc(jit_pc)]` by construction
+    /// for a carried resume coordinate; `None` when the twin is empty (skeleton /
+    /// portal-bridge / fixture). Consumed on the decode-identity path of
+    /// `const_ref_slots_at_pc_at`.
+    pub fn const_ref_slots_for_jitcode_pc(&self, jit_pc: usize) -> Option<Vec<(u16, i64)>> {
+        let table = &self.metadata.const_ref_slots_by_jit_pc;
+        if table.is_empty() {
+            return None;
+        }
+        let search = table.binary_search_by_key(&jit_pc, |&(off, _)| off);
+        Self::predecessor_index(search).map(|i| table[i].1.clone())
+    }
+
     /// task#50 #73-core: trivia-aware STATIC-liveness depth keyed by a JitCode
     /// byte offset, resolved with the SAME two tiers as
     /// `python_pc_for_jitcode_pc`: an EXACT marker match first (block-head
@@ -811,6 +838,7 @@ impl PyJitCode {
                 max_stackdepth: 0,
                 pcdep_color_slots: Vec::new(),
                 const_ref_slots_at_pc: Vec::new(),
+                const_ref_slots_by_jit_pc: Vec::new(),
                 is_drained: false,
             },
             code_ptr,

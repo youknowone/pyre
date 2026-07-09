@@ -1682,6 +1682,20 @@ pub(crate) fn const_ref_slots_at_pc_at(
         let real_pc = if jitcode_pc != majit_ir::resumedata::NO_JITCODE_PC && jitcode_pc >= 0 {
             let jp = jitcode_pc as usize;
             if jc.payload.jitcode.can_decode_live_vars(jp, sd.op_live) {
+                // gh#73 S3.2: source the const slots directly from the carried
+                // genuine `jitcode_pc` via the predecessor-keyed twin, bypassing
+                // the `python_pc_for_jitcode_pc` re-inversion — the same
+                // decode-identity shape the pcdep/depth twins use at
+                // `bridge_semantic_maps_at_with_jitcode_pc`. A colored jitcode
+                // returns `Some` (an empty slot list is a legitimate hit); an
+                // empty twin (skeleton / portal-bridge) returns `None` and falls
+                // through to the re-inversion, which still keys the populated
+                // `const_ref_slots_at_pc`. Equal by construction (built in the
+                // same `by_off` loop, same predecessor keying, as the twins
+                // check.py certifies on the hot bridge path).
+                if let Some(slots) = jc.payload.const_ref_slots_for_jitcode_pc(jp) {
+                    return slots;
+                }
                 crate::jitcode_dispatch::python_pc_for_jitcode_pc(&jc.payload.metadata, jp) as usize
             } else {
                 majit_ir::resumedata::decode_resume_pc(pc).0 as usize
@@ -11874,6 +11888,7 @@ mod tests {
                 max_stackdepth: 0,
                 pcdep_color_slots: Vec::new(),
                 const_ref_slots_at_pc: Vec::new(),
+                const_ref_slots_by_jit_pc: Vec::new(),
                 is_drained: true,
             },
             std::ptr::null(),

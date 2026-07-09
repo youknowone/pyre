@@ -221,6 +221,7 @@ pub fn install_portal_for(code_ptr: *const pyre_interpreter::CodeObject) -> Arc<
             max_stackdepth,
             pcdep_color_slots: Vec::new(),
             const_ref_slots_at_pc: Vec::new(),
+            const_ref_slots_by_jit_pc: Vec::new(),
             // Portal-bridge installs skip the setup-time drain (empty pc_map),
             // so `is_portal_bridge()` reports true.
             is_drained: false,
@@ -421,6 +422,7 @@ def f(x, y):
                 max_stackdepth: 0,
                 pcdep_color_slots: Vec::new(),
                 const_ref_slots_at_pc: Vec::new(),
+                const_ref_slots_by_jit_pc: Vec::new(),
                 // Simulated drain: setup-time drain ran, so is_drained is set.
                 is_drained: true,
             },
