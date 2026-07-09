@@ -8603,6 +8603,15 @@ fn init_complex_type(ns: &mut DictStorage) {
     );
     dict_storage_store(
         ns,
+        "__format__",
+        make_builtin_function_with_arity(
+            "__format__",
+            crate::type_methods::builtin_value_format,
+            2,
+        ),
+    );
+    dict_storage_store(
+        ns,
         "__hash__",
         make_builtin_function_with_arity(
             "__hash__",

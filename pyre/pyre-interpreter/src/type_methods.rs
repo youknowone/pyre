@@ -1610,6 +1610,41 @@ fn format_with_spec(val: PyObjectRef, spec: &str) -> Result<Wtf8Buf, crate::PyEr
             }
             return format_finite_float(v, spec);
         }
+        if let Some((re, im)) = crate::objspace::descroperation::complex_val(val) {
+            let p = parse_spec(spec);
+            if p.fill == '0' {
+                return Err(crate::PyError::value_error(
+                    "Zero padding is not allowed in complex format specifier",
+                ));
+            }
+            if p.align == Some('=') {
+                return Err(crate::PyError::value_error(
+                    "'=' alignment flag is not allowed in complex format specifier",
+                ));
+            }
+            let align = p.align.unwrap_or('>');
+            // No presentation type and no precision: pad str(self), which
+            // already carries the parentheses / bare-imaginary form.
+            if p.ty == '\0' && p.precision.is_none() {
+                let body = Wtf8Buf::from_string(crate::py_str(val)?);
+                return Ok(pad_wtf8(&body, p.fill, align, p.width));
+            }
+            // A presentation type or precision formats the real and imaginary
+            // parts as floats and joins them; the imaginary part always
+            // carries an explicit sign and the whole ends in `j`.
+            let prec = p
+                .precision
+                .map(|precision| format!(".{precision}"))
+                .unwrap_or_default();
+            let ty = if p.ty == '\0' { 'f' } else { p.ty };
+            let re_spec = format!("{prec}{ty}");
+            let im_spec = format!("+{prec}{ty}");
+            let mut body = format_finite_float(re, &re_spec)?;
+            let im_str = format_finite_float(im, &im_spec)?;
+            body.push_wtf8(&im_str);
+            body.push_char('j');
+            return Ok(pad_wtf8(&body, p.fill, align, p.width));
+        }
         if pyre_object::is_str(val) {
             let full = pyre_object::w_str_get_wtf8(val);
             // The shared string formatter rejects grouping and numeric types
@@ -1622,7 +1657,10 @@ fn format_with_spec(val: PyObjectRef, spec: &str) -> Result<Wtf8Buf, crate::PyEr
             let sc: Vec<char> = spec.chars().collect();
             let zero_fill = if sc.len() >= 2 && matches!(sc[1], '<' | '>' | '=' | '^') {
                 sc.get(2) == Some(&'0')
-            } else if sc.first().is_some_and(|c| matches!(c, '<' | '>' | '=' | '^')) {
+            } else if sc
+                .first()
+                .is_some_and(|c| matches!(c, '<' | '>' | '=' | '^'))
+            {
                 sc.get(1) == Some(&'0')
             } else {
                 sc.first() == Some(&'0')
