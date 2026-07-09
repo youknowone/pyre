@@ -1289,6 +1289,18 @@ unsafe fn store_attr_slowpath(
     w_value: PyObjectRef,
     entry: Option<MapdictCacheEntry>,
 ) -> Result<(), PyError> {
+    // `object.__class__` is a getset data descriptor in PyPy, so `_classify_attr`
+    // (classify_attr) marks it INVALID and the store falls through to
+    // `space.setattr` (mapdict.py:1653) — the assignment re-roots the instance
+    // type via `descr_set___class__`, not the instance dict.  pyre models
+    // `__class__` through `object_setattr`'s special-case rather than a getset,
+    // so it never surfaces as a data descriptor for classify_attr to reject;
+    // exclude it from the store cache here so `obj.__class__ = NewCls` reaches
+    // that special-case instead of being mis-stored as an ordinary instance-dict
+    // attribute (which leaves the real type unchanged).
+    if name == "__class__" {
+        return crate::baseobjspace::setattr_str(w_obj, name, w_value).map(|_| ());
+    }
     // mapdict.py:1591 `if map is not None:`.
     if !map.is_null() {
         // mapdict.py:1592 `w_type = map.terminator.w_cls`.
