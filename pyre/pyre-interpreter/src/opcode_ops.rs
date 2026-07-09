@@ -658,13 +658,18 @@ pub extern "C" fn bh_execute_store_subscr(executor_ptr: i64) -> i64 {
 /// already depends on pyre-interpreter for the normal recording-time
 /// helpers (`jit_setitem`, `jit_getitem`, ...).
 ///
-/// `BH_LAST_EXC_VALUE`); the 1/0 polarity parallels
-/// `bh_execute_store_subscr` above and matches the executor's
-/// raise-vs-success ABI for void residual_calls.  The trait-side void
-/// `jit_setitem` instead publishes the raise into the backend
-/// pos_exception cells (the recorded GuardNoException re-raises through
-/// the blackhole resume) — `bh_store_subscr_fn` is the residual-call
-/// leg, which signals the raise to the dispatcher via the 0 return.
+/// `setitem` may enter a user `__setitem__` (MayForce), so a raise is
+/// published into BOTH the backend `_store_exception` cells (via
+/// `jit_publish_exception`, so a compiled trace's trailing
+/// `GuardNoException` side-exits) AND `BH_LAST_EXC_VALUE` (so the
+/// blackhole / full-body walk sees a non-null standing exception). This
+/// dual-publish mirrors `bh_store_attr_fn`
+/// (`call_jit::publish_residual_call_exception`) and `jit_next`; writing
+/// only `BH_LAST_EXC_VALUE` would leave `GuardNoException` reading a
+/// stale 0 and silently swallow the raise. The 1/0 return signals
+/// raise-vs-success to the walker's residual executor. The walker drains
+/// the backend cells after an Err (`jitcode_dispatch.rs` execute-raised
+/// arm), so the extra publish does not leak into tracing.
 #[allow(improper_ctypes_definitions)]
 pub extern "C" fn bh_store_subscr_fn(obj: i64, key: i64, value: i64) -> i64 {
     let obj = obj as pyre_object::PyObjectRef;
@@ -673,6 +678,7 @@ pub extern "C" fn bh_store_subscr_fn(obj: i64, key: i64, value: i64) -> i64 {
     if let Err(err) = crate::baseobjspace::setitem(obj, key, value) {
         let exc_obj = err.to_exc_object();
         majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+        crate::runtime_ops::jit_publish_exception(exc_obj);
         return 0;
     }
     1
