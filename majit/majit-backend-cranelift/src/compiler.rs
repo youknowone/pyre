@@ -357,6 +357,14 @@ fn install_gc_box(mut gc: Box<dyn GcAllocator>) {
     let supports_guard_gc_type = gc.supports_guard_gc_type();
     set_cranelift_active_gc(Some(gc));
     set_cranelift_jitframe_type_id(jitframe_type_id);
+    register_active_hooks(supports_guard_gc_type);
+}
+
+/// Register all backend-agnostic `majit_gc::set_active_*` hooks to the
+/// cranelift trampolines. Shared by `install_gc_box` (test: also stores a
+/// box) and `install_gc_standalone` (production: hooks only, no box — the
+/// trampolines then route to the `gc_sync` singleton).
+fn register_active_hooks(supports_guard_gc_type: bool) {
     majit_gc::set_active_gc_guard_hooks(majit_gc::ActiveGcGuardHooks {
         check_is_object: Some(check_is_object_via_active_runtime),
         is_tagged_immediate: Some(is_tagged_immediate_via_active_runtime),
@@ -390,10 +398,19 @@ fn install_gc_box(mut gc: Box<dyn GcAllocator>) {
     );
 }
 
-/// Production path: install a `GcHandle` forwarding to the global singleton.
+/// Production path: register the `set_active_*` hooks WITHOUT storing a
+/// box. `CRANELIFT_ACTIVE_GC` stays `None`, so every trampoline routes to
+/// the process-global `gc_sync` singleton (the per-thread GC box is the
+/// free-threading gap R4 removes).
 pub fn install_gc_standalone() {
-    let handle: Box<dyn GcAllocator> = Box::new(majit_gc::GcHandle);
-    install_gc_box(handle);
+    let jitframe_type_id = majit_gc::gc_sync::gc_op(|gc| {
+        let id = ensure_jitframe_type_registered(gc);
+        gc.freeze_types();
+        id
+    });
+    let supports_guard_gc_type = majit_gc::gc_sync::gc_query(|gc| gc.supports_guard_gc_type());
+    set_cranelift_jitframe_type_id(jitframe_type_id);
+    register_active_hooks(supports_guard_gc_type);
 }
 
 /// Follow jf_forward chain to get the final jitframe address.
@@ -1392,21 +1409,24 @@ thread_local! {
 }
 
 fn with_cranelift_gc<R>(f: impl FnOnce(&mut dyn GcAllocator) -> R) -> Option<R> {
-    CRANELIFT_ACTIVE_GC.with(|cell| {
-        let mut guard = cell.borrow_mut();
-        match guard.as_deref_mut() {
-            Some(gc) => Some(f(gc)),
-            None => None,
-        }
-    })
+    if CRANELIFT_ACTIVE_GC.with(|cell| cell.borrow().is_some()) {
+        return CRANELIFT_ACTIVE_GC.with(|cell| {
+            let mut guard = cell.borrow_mut();
+            let raw: *mut dyn GcAllocator = guard.as_deref_mut()?;
+            // SAFETY: `guard` holds the borrow for the whole `f` call and
+            // these are non-reentrant top-level trampolines, so the
+            // reborrow is exclusive and outlives `f`.
+            Some(f(unsafe { &mut *raw }))
+        });
+    }
+    if majit_gc::gc_sync::is_initialized() {
+        return Some(majit_gc::gc_sync::gc_op(f));
+    }
+    None
 }
 
 fn with_cranelift_gc_required<R>(f: impl FnOnce(&mut dyn GcAllocator) -> R) -> R {
-    CRANELIFT_ACTIVE_GC.with(|cell| {
-        let mut guard = cell.borrow_mut();
-        let gc = guard.as_deref_mut().expect("missing active GC runtime");
-        f(gc)
-    })
+    with_cranelift_gc(f).expect("missing active GC runtime")
 }
 
 fn set_cranelift_active_gc(gc: Option<Box<dyn GcAllocator>>) {
@@ -1437,7 +1457,7 @@ fn set_cranelift_jitframe_type_id(type_id: Option<u32>) {
 }
 
 fn cranelift_gc_active() -> bool {
-    CRANELIFT_ACTIVE_GC.with(|cell| cell.borrow().is_some())
+    CRANELIFT_ACTIVE_GC.with(|cell| cell.borrow().is_some()) || majit_gc::gc_sync::is_initialized()
 }
 
 /// `majit_gc::CheckIsObjectFn` installed by `set_gc_allocator`. Dispatches
@@ -1602,43 +1622,41 @@ fn gc_write_barrier_via_active_runtime(obj: GcRef) {
 /// `try_gc_alloc_stable`-allocated blocks from `std::alloc`-backed
 /// fallback blocks during the L1/L2 stepping-stone window.
 fn id_or_identityhash_via_active_runtime(addr: usize) -> usize {
-    CRANELIFT_ACTIVE_GC.with(|cell| {
+    let via_box = CRANELIFT_ACTIVE_GC.with(|cell| {
         let mut guard = match cell.try_borrow_mut() {
             Ok(guard) => guard,
-            Err(_) => return addr,
+            Err(_) => return Some(addr),
         };
-        match guard.as_deref_mut() {
-            Some(gc) => gc.id_or_identityhash(addr),
-            None => addr,
-        }
-    })
+        guard.as_deref_mut().map(|gc| gc.id_or_identityhash(addr))
+    });
+    if let Some(r) = via_box {
+        return r;
+    }
+    if majit_gc::gc_sync::is_initialized() {
+        return majit_gc::gc_sync::gc_op(|gc| gc.id_or_identityhash(addr));
+    }
+    addr
 }
 
 fn gc_owns_object_via_active_runtime(addr: usize) -> bool {
-    CRANELIFT_ACTIVE_GC.with(|cell| {
-        let mut guard = match cell.try_borrow_mut() {
-            Ok(guard) => guard,
-            Err(_) => {
-                // Structural adaptation: RPython's GC descriptor can be
-                // queried reentrantly while a collection is walking extra
-                // roots. Pyre stores the active cranelift GC in a Rust
-                // `RefCell`; allocation slowpaths hold the mutable borrow
-                // while those root walkers may call
-                // `gc_current_object_address`. Use the raw pointer only
-                // for this immutable ownership query, matching the
-                // read-only nature of RPython's descriptor call, instead
-                // of panicking across the extern slowpath.
-                return CRANELIFT_ACTIVE_GC_RAW.with(|raw| match raw.get() {
-                    Some(ptr) => unsafe { (&*ptr).is_managed_heap_object(addr) },
-                    None => false,
-                });
-            }
-        };
-        guard
-            .as_deref_mut()
-            .map(|gc| gc.is_managed_heap_object(addr))
-            .unwrap_or(false)
-    })
+    // Structural adaptation: RPython's GC descriptor can be queried
+    // reentrantly while a collection is walking extra roots. Pyre stores
+    // the active cranelift GC in a Rust `RefCell`; allocation slowpaths
+    // hold the mutable borrow while those root walkers may call
+    // `gc_current_object_address`. Use the raw pointer / reentrant
+    // `gc_sync` read only for this immutable ownership query, matching the
+    // read-only nature of RPython's descriptor call, instead of panicking
+    // across the extern slowpath.
+    match CRANELIFT_ACTIVE_GC
+        .with(|cell| cell.try_borrow().map(|g| g.as_deref().map(|gc| gc.is_managed_heap_object(addr))))
+    {
+        Ok(Some(r)) => r,
+        Ok(None) => majit_gc::gc_sync::gc_query_reentrant(|g| g.is_managed_heap_object(addr)),
+        Err(_) => CRANELIFT_ACTIVE_GC_RAW.with(|raw| match raw.get() {
+            Some(ptr) => unsafe { (&*ptr).is_managed_heap_object(addr) },
+            None => majit_gc::gc_sync::gc_query_reentrant(|g| g.is_managed_heap_object(addr)),
+        }),
+    }
 }
 
 /// Returns true when the active GC was present and roots were
