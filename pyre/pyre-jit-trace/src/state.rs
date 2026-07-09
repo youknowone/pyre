@@ -3073,6 +3073,20 @@ pub(crate) fn trace_unbox_int_with_resume_descr<F: crate::walker_frame_ops::Walk
 ///    `W_LongObject.toint()` (`longobject.py:138`) → `rbigint.toint()`
 ///    (`rbigint.py:465`, elidable). OverflowError is statically
 ///    unreachable post-fits-int GUARD_TRUE.
+///
+/// Unlike the int arms (`trace_unbox_int_with_resume_descr`,
+/// `trace_guarded_int_payload`), step 1's `GUARD_CLASS` carries no
+/// `is_tagged_int` pre-check before its `ob_type` deref, and needs none: a
+/// tagged immediate can never select this arm. Both call sites gate it on
+/// `is_long(concrete)` — `trace_plain_int_payload` (`trace_opcode.rs` `if
+/// is_long(concrete_item)`) and `unbox_int_or_long_for_int_strategy` (fed by
+/// `unbox_long = is_long(concrete_value)` in `detect_list_setitem_strategy`).
+/// `is_long` routes through `py_type_check`, which short-circuits a tagged
+/// immediate to `ptr::eq(tp, &INT_TYPE)` — false for `LONG_TYPE` — before any
+/// `ob_type` deref. A `W_LongObject` is a distinct 8-aligned heap struct and is
+/// never tagged, so `is_long` is definitionally false for an odd pointer. The
+/// `GUARD_CLASS` deref therefore only ever sees an aligned heap pointer. Both
+/// call sites also early-return `value_type == Int` operands before this arm.
 pub(crate) fn trace_unbox_long_with_resume<F: crate::walker_frame_ops::WalkerFrameOps>(
     frame: &mut F,
     obj: OpRef,
