@@ -1785,6 +1785,32 @@ impl TraceCtx {
         self.virtualizable_boxes.clone()
     }
 
+    /// The walk-final concrete values of the virtualizable's array elements, in
+    /// the flat `[arr0_elem0.., arr1_elem0.., ..]` layout — the array portion of
+    /// `virtualizable_values`, excluding the `num_static_extra_boxes` leading
+    /// static-field slots and the trailing identity slot
+    /// (`virtualizable_boxes[-1]`). `None` when no standard virtualizable is
+    /// active or its concrete shadow was disabled. Used by the single-pass close
+    /// to transfer walk-mutated loop-carried array state into native `state`
+    /// before re-entering the compiled loop (pyjitpl.py:2982-2989
+    /// `live_arg_boxes += virtualizable_boxes`).
+    pub fn collect_virtualizable_element_values(&self) -> Option<Vec<i64>> {
+        let values = self.virtualizable_values.as_ref()?;
+        let static_count = self
+            .virtualizable_info
+            .as_ref()
+            .map_or(0, |info| info.num_static_extra_boxes);
+        let end = values.len().saturating_sub(1); // drop the trailing identity slot
+        let start = static_count.min(end);
+        Some(
+            values[start..end]
+                .iter()
+                .copied()
+                .map(value_to_raw_bits)
+                .collect(),
+        )
+    }
+
     // (synchronize_virtualizable helper follows)
 
     /// Mirror of `MetaInterp::vable_ptr` used by `synchronize_virtualizable`.

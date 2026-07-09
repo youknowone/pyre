@@ -1400,6 +1400,24 @@ impl<S: JitState> JitDriver<S> {
         }
     }
 
+    /// Push the walk's loop-carried virtualizable-array element values into
+    /// native `state`, the array analog of `writeback_scalar_state_fields`. The
+    /// walk mutates the array on the trace-ctx shadow; native `state`'s array is
+    /// stale at the close because `synchronize_virtualizable` skips the RustVec
+    /// write-back during tracing. Without this, the compiled-loop seed
+    /// (`extract_live_values` reads native `state`) reflects the trace-start
+    /// array, so the loop re-executes the peeled iteration — double-firing any
+    /// side-effecting residual. Consumes (`take`s) the stash. No-op when the
+    /// state has no virtualizable array. Called from the whole-circuit
+    /// single-pass `jit_merge_point!` branch, after `writeback_scalar_state_fields`
+    /// and before `recover_after_compiled_run` / `try_resume_into_compiled_loop`.
+    #[inline]
+    pub fn writeback_virt_array_state_fields(&mut self, state: &mut S) {
+        if let Some(values) = self.meta.single_pass_virt_array_values.take() {
+            state.writeback_virt_array_state_fields_from_values(&values);
+        }
+    }
+
     /// Single-pass cross-loop-cut resume: directly enter the loop the
     /// CloseLoop arm just compiled (its key stashed in
     /// `single_pass_compiled_key`) with the walk-final native state, instead
@@ -1843,6 +1861,20 @@ impl<S: JitState> JitDriver<S> {
                 if let Some(sym) = self.sym.as_ref() {
                     let scalars = S::collect_scalar_state_field_values(sym);
                     self.meta.single_pass_scalar_values = Some(scalars);
+                }
+                // Capture the walk-final loop-carried virt-array element values
+                // off the still-live trace ctx (the walk mutated the ctx shadow,
+                // not native `state`), before `compile_loop` drains the ctx. The
+                // macro hook writes them into native `state` so the compiled loop
+                // resumes at S_{k+1} instead of re-executing the peeled iteration
+                // (pyjitpl.py:2982-2989 live_arg_boxes += virtualizable_boxes).
+                // `None` when the state has no virtualizable array.
+                let virt_elems = self
+                    .meta
+                    .trace_ctx()
+                    .and_then(|ctx| ctx.collect_virtualizable_element_values());
+                if let Some(elems) = virt_elems {
+                    self.meta.single_pass_virt_array_values = Some(elems);
                 }
                 // pyjitpl.py:2979-3036 reached_loop_header parity.
                 // Path 1: bridge — only if has_compiled_targets (line 2982).

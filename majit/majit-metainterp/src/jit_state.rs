@@ -386,6 +386,19 @@ pub trait JitState: Sized {
     /// no-op; the `#[jit_interp]` macro overrides it for state-field consumers.
     fn writeback_scalar_state_fields_from_values(&mut self, _values: &[i64]) {}
 
+    /// Whole-circuit single-pass: write the walk's loop-carried virtualizable
+    /// array element values (captured at close time by the trace ctx's
+    /// `collect_virtualizable_element_values`) into native state, the array
+    /// analog of `writeback_scalar_state_fields_from_values`. `values` is the
+    /// flat `[arr0_elem0.., arr1_elem0.., ..]` layout in state-field declaration
+    /// order (the same order `extract_live` / `collect_jump_args_with_boxes`
+    /// use). The walk mutates the array on the trace-ctx shadow only, so without
+    /// this native state's array stays frozen at trace-start and the compiled
+    /// loop re-executes the peeled iteration. Applied before
+    /// `recover_after_compiled_run`. Default no-op; the `#[jit_interp]` macro
+    /// overrides it only for consumers declaring a `[.. ; virt]` array.
+    fn writeback_virt_array_state_fields_from_values(&mut self, _values: &[i64]) {}
+
     /// blackhole.py:1679 `_exit_frame_with_exception` → warmspot.py:998-1005.
     ///
     /// The resumed blackhole frame chain raised an exception (`exc`, a GC ref

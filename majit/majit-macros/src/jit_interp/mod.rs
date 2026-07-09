@@ -2030,6 +2030,21 @@ fn rewrite_body(
                                     #driver.writeback_scalar_state_fields(
                                         &mut #state,
                                     );
+                                    // Push the walk-final loop-carried virt-array
+                                    // element values into native `state` too. The
+                                    // walk mutates the array on the trace-ctx
+                                    // shadow only; native `state`'s array is
+                                    // frozen at trace-start (synchronize_
+                                    // virtualizable skips the RustVec write-back
+                                    // during tracing). Without this the compiled-
+                                    // loop seed (extract_live reads native state)
+                                    // reflects the trace-start array and the loop
+                                    // re-executes the peeled iteration, double-
+                                    // firing any side-effecting residual. No-op
+                                    // when the state has no virtualizable array.
+                                    #driver.writeback_virt_array_state_fields(
+                                        &mut #state,
+                                    );
                                     // Transfer any loop-carried reds the walk
                                     // captured, then re-derive the
                                     // storage-backed cache fields (stacksize,

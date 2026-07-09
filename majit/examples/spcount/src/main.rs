@@ -59,24 +59,27 @@ const TOUCH: u8 = 30; // residual: side-effecting, result-neutral stack touch
 #[cfg(test)]
 static TOUCH_CALLS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
+/// Number of loops the driver compiled/closed, observed by the tests. The
+/// residual-count canary only exercises the single-pass close if a trace
+/// actually compiled; this counter lets the test assert that it did, so a run
+/// that never starts tracing (or aborts before the `; state` close) fails
+/// loudly instead of passing vacuously. Mirrors tl's `SPIKE_COMPILES`.
+static SPCOUNT_COMPILES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 /// Side-effecting residual, `@dont_look_inside` — the JIT does not trace into
 /// it; it emits a residual CALL. `#[dont_look_inside]` is non-elidable and may
-/// raise, so the optimizer keeps the call. It reads and rewrites the live
-/// top-of-stack through the raw stack pointer: a genuine heap side effect that
-/// forces the virtualizable stack, yet leaves every value unchanged. The
-/// computed result is therefore independent of how many times `touch` runs, so
-/// the call count alone is the double-execution detector. Modelled on tl's
-/// `storage_roll`.
+/// raise, so the optimizer keeps the call. It is result-neutral (its only
+/// observable effect is the counted call), so the computed sum is independent
+/// of how many times `touch` runs and the call count alone is the
+/// double-execution detector. The argument is the scalar `stackpos` — a
+/// jit-lowerable value, so the TOUCH arm compiles into the trace (a virt-array
+/// base-pointer argument would degrade to a `BC_ABORT` stub and never compile).
+/// Modelled on tl's `storage_roll`.
 #[majit_macros::dont_look_inside]
-extern "C" fn touch(stack_ptr: usize, stackpos: i64) {
+extern "C" fn touch(stackpos: i64) {
     #[cfg(test)]
     TOUCH_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    if stackpos > 0 {
-        let stack =
-            unsafe { std::slice::from_raw_parts_mut(stack_ptr as *mut i64, stackpos as usize) };
-        let top = stack[(stackpos - 1) as usize];
-        stack[(stackpos - 1) as usize] = top;
-    }
+    let _ = stackpos;
 }
 
 // ── State ──
@@ -103,6 +106,11 @@ struct StackState {
 pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
     let mut driver: majit_metainterp::JitDriver<StackState> =
         majit_metainterp::JitDriver::new(threshold);
+    // Count compiled loops so the residual-count test can assert the
+    // single-pass close actually ran. Mirrors tl's SPIKE_COMPILES hook.
+    driver.set_on_compile_loop(|_gk, _b, _a| {
+        SPCOUNT_COMPILES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    });
     let mut pc: usize = 0;
     let stacksize: i32 = 0;
     let mut state = StackState {
@@ -165,7 +173,7 @@ pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
             }
             // Residual @dont_look_inside touch of the live stack.
             TOUCH => {
-                touch(state.stack.as_mut_ptr() as usize, state.stackpos);
+                touch(state.stackpos);
             }
             BR_COND => {
                 let offset = program[pc] as i8 as i64;
@@ -364,6 +372,20 @@ mod tests {
     /// times. Under single-pass tracing (the walk is the sole executor) the
     /// residual must run exactly the interpreter's count — a walk-vs-native
     /// double-execution during the trace-then-close would inflate it.
+    ///
+    /// The `SPCOUNT_COMPILES >= 1` canary below asserts the single-pass close
+    /// actually ran, so the residual count is not measured on a merely-
+    /// interpreted loop. This is the load-bearing guard: before the virt-array
+    /// write-back fix, the compiled loop resumed from the trace-start virt array
+    /// (the walk-final loop counter was never transferred into native `state`)
+    /// and re-executed the peeled iteration, firing `touch` N+1 times. The
+    /// write-back (`writeback_virt_array_state_fields`) makes native `state`
+    /// hold the walk-final (post-peel) counter before re-entry, so the compiled
+    /// loop advances instead of re-running the traced iteration — exactly N
+    /// firings. A residual whose argument is a virt-array base pointer instead
+    /// degrades to a `BC_ABORT` stub (no `#[jit_interp]` lowering) and never
+    /// compiles; using the scalar `stackpos` keeps the loop compilable so this
+    /// canary exercises the real single-pass close.
     #[test]
     fn jit_residual_not_double_executed() {
         let program = touch_loop_program();
@@ -371,8 +393,20 @@ mod tests {
 
         let expected = interp(&program, n);
         TOUCH_CALLS.store(0, Ordering::Relaxed);
+        SPCOUNT_COMPILES.store(0, Ordering::Relaxed);
         let got = mainloop(&program, n, 3);
         let jit_touches = TOUCH_CALLS.load(Ordering::Relaxed);
+
+        // The residual-count canary is only meaningful if a trace actually
+        // compiled and closed via the `; state` single-pass path. Without this
+        // guard the loop could merely interpret (no tracing, or an abort before
+        // the close), run `touch` exactly n× anyway, and leave the count green
+        // vacuously. A `>= 1` lower bound is robust under parallel tests: only
+        // this test resets the counter, and other tests can only raise it.
+        assert!(
+            SPCOUNT_COMPILES.load(Ordering::Relaxed) >= 1,
+            "single-pass trace never compiled — canary would pass vacuously"
+        );
 
         assert_eq!(got, expected, "JIT result diverged from interp");
         // One TOUCH per iteration; N iterations before the counter hits 0.

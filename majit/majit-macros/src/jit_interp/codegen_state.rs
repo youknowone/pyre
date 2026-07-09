@@ -922,6 +922,31 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             }
         })
         .collect();
+    // Single-pass close: write the walk-final virt-array element values
+    // (captured off the trace-ctx shadow) into native state, one array at a
+    // time in declaration order. Mirrors `restore_array_parts`'s per-element
+    // copy, but the source is the element-only flat vector
+    // (`collect_virtualizable_element_values`), so there are no ptr/len slots to
+    // skip. The user's Vec is fixed-capacity (see the reallocation note on
+    // `initialize_sym_virt_array_parts`), so the length matches the walk-final
+    // element count.
+    let writeback_virt_array_parts: Vec<TokenStream> = virt_arrays
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            quote! {
+                let __len = self.#fname.len();
+                debug_assert!(
+                    values.len() >= __offset + __len,
+                    "writeback_virt_array: fewer element values than array length",
+                );
+                for i in 0..__len {
+                    self.#fname[i] = values[__offset + i];
+                }
+                __offset += __len;
+            }
+        })
+        .collect();
     let initialize_sym_scalar_parts: Vec<TokenStream> = scalars
         .iter()
         .map(|(_, f)| {
@@ -1227,6 +1252,19 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 // 0-based ref index.
                 self.restore(meta, int_values);
                 #(#restore_ref_scalar_parts)*
+            }
+        }
+    } else {
+        quote! {}
+    };
+    // Emit the virt-array write-back override only for consumers that declare a
+    // `[.. ; virt]` array; 0-array interps (aheui, tlr, tinyframe, i64env) keep
+    // the trait default no-op, leaving their generated impl byte-identical.
+    let writeback_virt_array_override: TokenStream = if num_virt_arrays > 0 {
+        quote! {
+            fn writeback_virt_array_state_fields_from_values(&mut self, values: &[i64]) {
+                let mut __offset: usize = 0;
+                #(#writeback_virt_array_parts)*
             }
         }
     } else {
@@ -2075,6 +2113,8 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             fn writeback_scalar_state_fields_from_values(&mut self, values: &[i64]) {
                 #(#writeback_from_values_parts)*
             }
+
+            #writeback_virt_array_override
 
             fn state_field_layout(&self) -> majit_metainterp::blackhole::StateFieldLayout {
                 // Flat slot layout for blackhole resume: scalar count is

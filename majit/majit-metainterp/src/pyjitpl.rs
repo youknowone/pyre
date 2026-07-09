@@ -1077,6 +1077,20 @@ pub struct MetaInterp<M: Clone> {
     /// via `writeback_scalar_state_fields_from_values`. `None` outside
     /// single-pass or when the state has no scalar fields.
     pub(crate) single_pass_scalar_values: Option<Vec<i64>>,
+    /// Single-pass tracing: the walk-final concrete values of the loop-carried
+    /// virtualizable ARRAY elements, captured off the active `TraceCtx`
+    /// (`collect_virtualizable_element_values`) at the CloseLoop point. The walk
+    /// mutates the array on the trace-ctx shadow only; native `state`'s array is
+    /// frozen at trace-start because `synchronize_virtualizable` skips the
+    /// write-back for `RustVec` storage during tracing (the native match body,
+    /// the usual writer, never runs under the single-pass walk). The macro hook
+    /// `take`s these and applies them to native `state` via
+    /// `writeback_virt_array_state_fields_from_values` before re-entering the
+    /// compiled loop, so it resumes at the post-peeled iteration (S_{k+1})
+    /// instead of re-executing the traced iteration — the analog of PyPy's
+    /// `live_arg_boxes += virtualizable_boxes` (pyjitpl.py:2982-2989). `None`
+    /// outside single-pass or when the state has no virtualizable array.
+    pub(crate) single_pass_virt_array_values: Option<Vec<i64>>,
     /// Single-pass tracing: the green key the CloseLoop arm compiled the
     /// (cross-loop-cut) inner loop under, captured after a `Compiled`
     /// outcome so the merge-point hook can DIRECTLY enter that freshly
@@ -2272,6 +2286,7 @@ impl<M: Clone> MetaInterp<M> {
             tracing: None,
             single_pass_outcome: None,
             single_pass_scalar_values: None,
+            single_pass_virt_array_values: None,
             single_pass_compiled_key: None,
             next_trace_id: 1,
             hooks: JitHooks::default(),
