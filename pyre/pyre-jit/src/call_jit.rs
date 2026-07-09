@@ -4021,8 +4021,15 @@ pub extern "C" fn bh_load_attr_fn(obj: i64, w_code_ptr: i64, name_idx: i64) -> i
     match pyre_interpreter::baseobjspace::getattr_str(obj as pyre_object::PyObjectRef, name) {
         Ok(attr) => attr as i64,
         Err(err) => {
+            // Publish the raise into BOTH the blackhole `BH_LAST_EXC_VALUE` and
+            // the backend `_store_exception` cells (`publish_residual_call_exception`).
+            // The LOAD_ATTR residual runs under the blackhole interpreter AND
+            // inside a compiled trace; writing only `BH_LAST_EXC_VALUE` leaves a
+            // compiled trace's `GUARD_NO_EXCEPTION` reading a stale 0, so the
+            // guard wrongly passes and the NULL result flows to the consumer (a
+            // raising property getter in a compiled loop is silently swallowed).
             let exc_obj = err.to_exc_object();
-            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+            publish_residual_call_exception(exc_obj as i64);
             0
         }
     }
