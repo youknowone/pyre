@@ -1788,6 +1788,27 @@ pub(crate) fn semantic_slot_for_reg_color(
     stack_match.or(local_match)
 }
 
+/// Bank-generic inverse of [`semantic_slot_for_reg_color`]: given a semantic
+/// `locals_cells_stack_w` slot and a bank tag (`pyjitcode.rs:198-204`:
+/// 0=Int, 1=Ref, 2=Float), return the color of that bank owning the slot at
+/// this PC per the `(bank, color, slot)` map. Returns the smallest matching
+/// color; `None` when no live color of that bank owns the slot at this PC.
+fn semantic_slot_color_for_slot(
+    pcdep_entries: &[(u8, u16, u16)],
+    slot: usize,
+    bank: u8,
+) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    for &(b, color, s) in pcdep_entries {
+        if b != bank || s as usize != slot {
+            continue;
+        }
+        let c = color as usize;
+        best = Some(best.map_or(c, |cur: usize| cur.min(c)));
+    }
+    best
+}
+
 /// Inverse of [`semantic_slot_for_reg_color`] for the Ref bank: given a
 /// semantic `locals_cells_stack_w` slot, return the Ref-bank color that owns
 /// it at this PC per the `(bank, color, slot)` map. Used by the deep-kept
@@ -1799,15 +1820,28 @@ pub(crate) fn semantic_slot_color_for_ref_slot(
     pcdep_entries: &[(u8, u16, u16)],
     slot: usize,
 ) -> Option<usize> {
-    let mut best: Option<usize> = None;
-    for &(b, color, s) in pcdep_entries {
-        if b != 1 || s as usize != slot {
-            continue;
-        }
-        let c = color as usize;
-        best = Some(best.map_or(c, |cur: usize| cur.min(c)));
-    }
-    best
+    semantic_slot_color_for_slot(pcdep_entries, slot, 1)
+}
+
+/// Int-bank inverse of [`semantic_slot_for_reg_color`]: given a semantic
+/// `locals_cells_stack_w` slot, return the Int-bank color (`registers_i`) that
+/// owns it at this PC per the `(bank, color, slot)` map. The Int-bank sibling
+/// of [`semantic_slot_color_for_ref_slot`], feeding the deep-kept UNBOXED-INT
+/// operand-stack recovery in `walker_capture_snapshot_for_last_guard_impl`: a
+/// bank-0 (Int) stack slot names the guard-PC `registers_i[color]` holding the
+/// raw int, which the capture then boxes into a `W_IntObject`.
+/// `get_list_of_active_boxes` (`pyjitpl.py:206-210`) captures the i-bank via a
+/// separate `if length_i:` section
+/// (`add_box_to_storage(self.registers_i[index])`). Returns the smallest
+/// matching color; `None` when no live Int color owns the slot — which is
+/// every current-frontend stack slot, since pyre banks `locals_cells_stack_w`
+/// uniformly as Ref (bank-1). See the caller for why the Ref-bank Int-typed
+/// hole is NOT recovered by boxing at capture time.
+pub(crate) fn semantic_slot_color_for_int_slot(
+    pcdep_entries: &[(u8, u16, u16)],
+    slot: usize,
+) -> Option<usize> {
+    semantic_slot_color_for_slot(pcdep_entries, slot, 0)
 }
 
 // Sentinel null JitCode for uninitialized PyreSym.
