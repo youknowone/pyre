@@ -1071,8 +1071,19 @@ fn format_render(
         // `_get_argument` — resolve the base argument named by the field,
         // threading the auto-/manual-numbering state (`None` = uncommitted,
         // `Some(true)` = automatic `{}`, `Some(false)` = manual `{0}`).
-        let FieldName { field_type, parts } =
-            FieldName::parse(field_name).map_err(|e| format_parse_err(e, fmt))?;
+        //
+        // Classify only the head (up to the first `.`/`[`) here, so a
+        // missing/out-of-range base raises IndexError/KeyError before a
+        // malformed attribute or item chain raises ValueError.
+        let mut head = Wtf8Buf::new();
+        for ch in field_name.code_points() {
+            if ch == '.' || ch == '[' {
+                break;
+            }
+            head.push(ch);
+        }
+        let FieldName { field_type, .. } =
+            FieldName::parse(&head).map_err(|e| format_parse_err(e, fmt))?;
         if mapping.is_some() && matches!(field_type, FieldType::Auto | FieldType::Index(_)) {
             return Err(crate::PyError::value_error(
                 "Format string contains positional fields",
@@ -1113,6 +1124,11 @@ fn format_render(
                 }
             }
         };
+
+        // Parse the full field name for the attribute/item chain; chain parse
+        // errors now surface after the base argument has been resolved.
+        let FieldName { parts, .. } =
+            FieldName::parse(field_name).map_err(|e| format_parse_err(e, fmt))?;
 
         // `_resolve_lookups` — walk the `.attr` / `[element]` chain; a
         // bracketed all-digit element is an integer index, anything else a
