@@ -2751,6 +2751,12 @@ impl RenameOperand {
 fn flatten_constant_operand(constant: &super::flow::Constant) -> Operand {
     match (&constant.value, constant.kind) {
         (ConstantValue::None, Some(Kind::Ref)) => Operand::ConstRef(0),
+        // Absent-`last_exception` TYPE-slot sentinel (`etype`/`>i` is
+        // Kind::Int).  Merged against a real `last_exception` pair, the
+        // absent side's type slot is `Constant(None, Int)`; it lowers to
+        // a null int the same way the value slot's `(None, Ref)` lowers
+        // to `ConstRef(0)`.
+        (ConstantValue::None, Some(Kind::Int)) => Operand::ConstInt(0),
         (ConstantValue::Bool(value), Some(Kind::Int)) => Operand::ConstInt(i64::from(*value)),
         (ConstantValue::Signed(value), Some(Kind::Int)) => Operand::ConstInt(*value),
         // RPython rtyper post-pass: a `Constant(ll_ptr, concretetype=

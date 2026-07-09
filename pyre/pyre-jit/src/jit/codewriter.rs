@@ -319,8 +319,9 @@ impl FrameState {
             data.push(Some(w_type.clone()));
             data.push(Some(w_value.clone()));
         } else {
-            data.push(Some(super::flow::Constant::none().into()));
-            data.push(Some(super::flow::Constant::none().into()));
+            let (none_type, none_value) = last_exception_none_pair();
+            data.push(Some(none_type.into()));
+            data.push(Some(none_value.into()));
         }
         if let Some((frame, ec)) = &self.portal_extras {
             data.push(Some(frame.clone()));
@@ -506,30 +507,20 @@ impl FrameState {
                 union_flow_value(left_type, right_type, fresh_variable)?,
                 union_flow_value(left_value, right_value, fresh_variable)?,
             )),
-            (Some((left_type, left_value)), None) => Some((
-                union_flow_value(
-                    left_type,
-                    &super::flow::Constant::none().into(),
-                    fresh_variable,
-                )?,
-                union_flow_value(
-                    left_value,
-                    &super::flow::Constant::none().into(),
-                    fresh_variable,
-                )?,
-            )),
-            (None, Some((right_type, right_value))) => Some((
-                union_flow_value(
-                    &super::flow::Constant::none().into(),
-                    right_type,
-                    fresh_variable,
-                )?,
-                union_flow_value(
-                    &super::flow::Constant::none().into(),
-                    right_value,
-                    fresh_variable,
-                )?,
-            )),
+            (Some((left_type, left_value)), None) => {
+                let (none_type, none_value) = last_exception_none_pair();
+                Some((
+                    union_flow_value(left_type, &none_type.into(), fresh_variable)?,
+                    union_flow_value(left_value, &none_value.into(), fresh_variable)?,
+                ))
+            }
+            (None, Some((right_type, right_value))) => {
+                let (none_type, none_value) = last_exception_none_pair();
+                Some((
+                    union_flow_value(&none_type.into(), right_type, fresh_variable)?,
+                    union_flow_value(&none_value.into(), right_value, fresh_variable)?,
+                ))
+            }
         };
         // Portal extras carry graph-level identity; if the two sides
         // are both seeded they must reference the same `(frame, ec)`
@@ -643,6 +634,24 @@ where
 
 fn union_kind(left: Option<Kind>, right: Option<Kind>) -> Option<Kind> {
     if left == right { left } else { None }
+}
+
+/// The absent-`last_exception` sentinel pair, kind-matched per slot to
+/// the exception link types: `etype`/`>i` is `Kind::Int`, `evalue`/`>r`
+/// is `Kind::Ref` (`assembler.py:220`; exceptblock inputargs in flow.rs).
+/// A raising predecessor carries a typed `(Int, Ref)` pair, so an absent
+/// predecessor must pad each slot with the SAME kind, otherwise
+/// `union_flow_value`'s `union_kind(Int, Ref)` collapses to an untyped
+/// merged Variable that later defaults to `Ref` and mints a `ref_copy`
+/// over the real Int type source.  `framestate.py:66-71 _exc_args` pads
+/// both slots with one `Constant(None)` because flowspace Variables are
+/// untyped; the rtyper assigns the exception slots a uniform type
+/// afterwards, and pyre carries that uniform per-slot typing here.
+fn last_exception_none_pair() -> (super::flow::Constant, super::flow::Constant) {
+    (
+        super::flow::Constant::new(super::flow::ConstantValue::None, Some(Kind::Int)),
+        super::flow::Constant::new(super::flow::ConstantValue::None, Some(Kind::Ref)),
+    )
 }
 
 fn entry_frame_state(code: &CodeObject, frame_inputs: FrameInputs) -> FrameState {
