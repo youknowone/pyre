@@ -11648,6 +11648,48 @@ fn callee_fast_path_inlinable(
     true
 }
 
+/// True when a STRICT straight-line callee commits a heap side effect that its
+/// single-frame collapse would re-apply on a deopt / abort re-execute — the
+/// gh#420 unsoundness.  The collapse resumes at the caller CALL boundary and
+/// re-runs the WHOLE call, so a committed store or construction is doubled
+/// (`inline_callee_constructs_object`'s `P(n)` construct;
+/// `inlined_mutation_before_abort`'s `c.n = c.n + 1` store, whose recorded
+/// value persists past the trace abort).  Such a callee routes through the
+/// multi-frame decline (a paused caller frame) so the enclosing inline declines
+/// to a residual instead of collapsing.
+///
+/// A PURE value-returning leaf — only typed helper residual calls (an int/float
+/// binop `residual_call_ir_r`, an idempotent field read) plus ref moves and a
+/// return, e.g. `inline_helper`'s `a + b` / `a * b` — re-executes identically
+/// on deopt, so its collapse is sound and it must NOT be pushed through the
+/// always-declining MF snapshot (a strict callee seeds no frame red, so that
+/// snapshot can only decline, aborting a working inline).
+///
+/// Conservative: a general ref-first-arg residual call (`residual_call_r_*`, an
+/// arbitrary Python call / constructor that may raise or mutate), a VOID
+/// residual call (`..._v`, a statement run for its effect — a store / append),
+/// or an explicit vable/gc field or array write all count as a side effect.
+fn strict_callee_collapse_unsound(body_code: &[u8]) -> bool {
+    let mut pc = 0usize;
+    while pc < body_code.len() {
+        let Some(d) = crate::jitcode_runtime::decode_op_at(body_code, pc) else {
+            // Undecodable tail: be conservative — take the decline, not the
+            // collapse.
+            return true;
+        };
+        let op = d.opname;
+        if op.starts_with("residual_call_r")
+            || (op.starts_with("residual_call") && op.ends_with("_v"))
+            || op.contains("setfield")
+            || op.contains("setarrayitem")
+        {
+            return true;
+        }
+        pc = d.next_pc;
+    }
+    false
+}
+
 /// True iff `d` is a scalar `getfield_vable_r` whose field is a Ref-typed
 /// compile-time constant (`pycode` / `w_globals`) — the only vable op
 /// [`try_resolve_inline_callee_static_field`] can satisfy without a seeded
@@ -12792,7 +12834,10 @@ fn try_walker_inline_user_call(
             Some(pf) => Some(pf),
             None => return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc }),
         }
-    } else if strict_inlinable && fbw_strict_multiframe_enabled() {
+    } else if strict_inlinable
+        && fbw_strict_multiframe_enabled()
+        && strict_callee_collapse_unsound(body.code)
+    {
         // gh#420: a strict straight-line callee's in-callee guard collapses to
         // the caller boundary and re-executes the whole call on deopt, doubling
         // a committed heap side effect and resuming at a stale valuestackdepth.
@@ -12801,6 +12846,14 @@ fn try_walker_inline_user_call(
         // when the caller frame is not snapshot-able keep the single-frame
         // collapse (do NOT decline the inline — that shape is otherwise served
         // correctly today), so this never removes a working inline.
+        //
+        // Gated on the callee committing a heap side effect
+        // ([`strict_callee_collapse_unsound`]): only then is the collapse
+        // re-execute unsound and the paused-caller frame (→ MF snapshot decline
+        // → residual) warranted.  A PURE value-returning leaf (`inline_helper`'s
+        // `a + b` / `a * b`) has an idempotent collapse, so it is left on that
+        // collapse — a strict callee seeds no frame red, so pushing it through
+        // the always-declining MF snapshot would abort a working inline.
         compute_inline_caller_frame(ctx, op.pc)
     } else {
         None
