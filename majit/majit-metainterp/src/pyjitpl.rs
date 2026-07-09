@@ -1842,6 +1842,21 @@ impl<M: Clone> MetaInterp<M> {
             .map(|trace| (trace_id, trace))
     }
 
+    /// gh#73 S3.3: the OpCode of the guard op that produced this exit, resolved
+    /// from the `source_op_index` the fail descriptor / exit layout carries.
+    /// Pure read of the retained compiled trace ops; None if the loop/trace is
+    /// gone or the index is out of range.
+    pub fn exit_guard_opcode(
+        &self,
+        rd_loop_token: u64,
+        trace_id: u64,
+        source_op_index: usize,
+    ) -> Option<majit_ir::OpCode> {
+        let compiled = self.compiled_loops.get(&rd_loop_token)?;
+        let (_, trace) = Self::trace_for_exit(compiled, trace_id)?;
+        trace.ops.get(source_op_index).map(|op| op.opcode)
+    }
+
     /// O(1) owner lookup via `descr.rd_loop_token` (compile.py:186 stamp,
     /// stored as the owning loop's green_key).  Every guard produced by
     /// the regular compile_loop / compile_bridge paths goes through the

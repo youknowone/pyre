@@ -154,6 +154,15 @@ pub fn majit_log_enabled() -> bool {
     *ENABLED
 }
 
+/// gh#73 S3.3: whether `PYRE_M73_FLAVOR_AUDIT` is set, cached at first access.
+/// Gates the read-only decode-side branch-guard flavor integrity audit at the
+/// native guard-fail seam. Off by default: byte-identical when unset.
+pub fn m73_flavor_audit_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("PYRE_M73_FLAVOR_AUDIT").is_some());
+    *ENABLED
+}
+
 /// Strict JIT mode: a non-`InvalidLoop` panic during compilation is a bug and
 /// must fail loudly rather than silently degrade to the interpreter and mask
 /// the bug behind correct output. Enabled in debug builds (`cargo test`) and
