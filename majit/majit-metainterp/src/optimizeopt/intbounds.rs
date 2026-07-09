@@ -2719,6 +2719,51 @@ mod tests {
         );
     }
 
+    /// wasm i32 address-mask sequence: masking an unbounded value with a
+    /// non-negative constant bounds the result to [0, mask], so the
+    /// subsequent IntGe(x, 0) / IntLe(x, mask) precheck guards must fold.
+    #[test]
+    fn test_int_and_mask_prechecks_fold() {
+        const MASK: i64 = 0xFFFF_FFFF; // 4294967295
+        // v9 (int_op 0) is an unbounded input; the mask and the comparison
+        // endpoints are literal Const operands, exactly as in the wasm trace.
+        let initial_bounds = vec![(OpRef::int_op(0), IntBound::unbounded())];
+        let ops = vec![
+            // v74 = IntAnd(v9, 0xFFFFFFFF)
+            make_op(
+                OpCode::IntAnd,
+                &[OpRef::int_op(0), OpRef::const_int(MASK)],
+                2,
+            ),
+            // v340 = IntGe(v74, 0); GuardTrue(v340)
+            make_op(OpCode::IntGe, &[OpRef::int_op(2), OpRef::const_int(0)], 3),
+            make_op(OpCode::GuardTrue, &[OpRef::int_op(3)], 5),
+            // v341 = IntLe(v74, 0xFFFFFFFF); GuardTrue(v341)
+            make_op(
+                OpCode::IntLe,
+                &[OpRef::int_op(2), OpRef::const_int(MASK)],
+                6,
+            ),
+            make_op(OpCode::GuardTrue, &[OpRef::int_op(6)], 8),
+        ];
+        let (result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        // The AND result must carry the [0, MASK] bound.
+        let b = {
+            let __mb = ctx.materialize_operand_at(OpRef::int_op(2));
+            ctx.getintbound_handle(&__mb).borrow().clone()
+        };
+        assert_eq!(b.lower, 0, "AND result lower should be 0");
+        assert_eq!(b.upper, MASK, "AND result upper should be MASK");
+        // Both precheck comparisons and their guards must be gone.
+        assert!(
+            result.iter().all(|op| op.opcode != OpCode::IntGe
+                && op.opcode != OpCode::IntLe
+                && op.opcode != OpCode::GuardTrue),
+            "precheck guards should fold away, got {:?}",
+            result.iter().map(|o| o.opcode).collect::<Vec<_>>()
+        );
+    }
+
     /// autogenintrules.py rule or_known_result: int_or(a, b) where the OR
     /// of bounds is a single constant => fold to that constant.
     #[test]
