@@ -8393,9 +8393,7 @@ impl CodeWriter {
                                         super::flow::FlowValue::Variable(v)
                                     }
                                     _ => match null_or_self_read {
-                                        Some(v) => {
-                                            super::flow::FlowValue::Variable(v)
-                                        }
+                                        Some(v) => super::flow::FlowValue::Variable(v),
                                         None => {
                                             // Non-portal plain-call PY_NULL
                                             // self-slot.  Pass the constant null
@@ -9262,7 +9260,6 @@ impl CodeWriter {
                                 Kind::Ref,
                                 py_pc as i64,
                             );
-                            pin!(Some(result_value), stack_base + current_depth);
                             current_state.stack.push(result_value.into());
                             emit_pushvalue_ref!(
                                 current_depth,
@@ -10535,7 +10532,6 @@ impl CodeWriter {
                                 Kind::Ref,
                                 py_pc as i64,
                             );
-                            pin!(Some(result_value), stack_base + current_depth);
                             push_and_bump!(result_value.into(), py_pc);
                         }
 
