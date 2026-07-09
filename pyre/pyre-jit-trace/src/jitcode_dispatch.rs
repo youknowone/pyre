@@ -9235,7 +9235,7 @@ pub(crate) fn m73_perop_carry_enabled() -> bool {
     })
 }
 
-/// `PYRE_M73_BRANCH_CARRY` (#73 S3.5, default OFF): the terminal branch-guard
+/// `PYRE_M73_BRANCH_CARRY` (#73 S3.5, default ON): the terminal branch-guard
 /// flip. A depth-0 `GuardTrue`/`GuardFalse` sources its resume word from the
 /// walk's arm-independent `-live-` BEFORE anchor (`ctx.live_before_jit_pc`,
 /// `orgpc`) TAGGED into the negative space of the `jitcode_pc` word (plus a
@@ -9243,12 +9243,19 @@ pub(crate) fn m73_perop_carry_enabled() -> bool {
 /// marker. Byte-identical by construction: encode carries the tagged word only
 /// when its decode-side expansion ([`expand_branch_carried`]) reproduces the
 /// baseline `marker` (self-cert), and decode expands it back to that same
-/// `marker` before any consumer reads it. Off → encode never emits a tagged
-/// word, so the decode expand is a no-op. Certified by `PYRE_M73_FLIP_AUDIT`
-/// (S3.4) and check.py.
+/// `marker` before any consumer reads it. Disabled (`PYRE_M73_BRANCH_CARRY=0`)
+/// → encode never emits a tagged word, so the decode expand is a no-op and the
+/// carried word is the block-head `marker` as before. Certified by
+/// `PYRE_M73_FLIP_AUDIT` (S3.4) and check.py (159×2, on and off).
 pub(crate) fn m73_branch_carry_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("PYRE_M73_BRANCH_CARRY").is_some())
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M73_BRANCH_CARRY") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => true,
+    })
 }
 
 pub(crate) fn python_pc_for_jitcode_pc(metadata: &crate::PyJitCodeMetadata, jit_pc: usize) -> u32 {
@@ -11000,7 +11007,8 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 // decode identically for every consumer (banks + bridge maps +
                 // const refill) where the anchor coincides, and flags the
                 // divergent minority for the check.py output-equality gate.
-                // #73 S3.5 flip (`PYRE_M73_BRANCH_CARRY`, default OFF): a depth-0
+                // #73 S3.5 flip (`PYRE_M73_BRANCH_CARRY`, default ON, opt-out
+                // `=0`/`false`): a depth-0
                 // branch guard (`GuardTrue`/`GuardFalse`) carries the walk's
                 // arm-independent `-live-` BEFORE anchor (`ctx.live_before_jit_pc`,
                 // `orgpc`) TAGGED into the negative space of the word plus the
