@@ -9201,6 +9201,18 @@ pub(crate) fn m73_arm_audit_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_M73_ARM_AUDIT").is_some())
 }
 
+/// `PYRE_M73_FLIP_AUDIT` (#73 S3.4, approach C, default OFF): the flip-gate
+/// certificate. At the branch-guard capture seam it simulates the decode-side
+/// reconstruction of Approach C — author `orgpc` (`ctx.live_before_jit_pc`) and
+/// expand it via `decode_side_other_target` → `skip_python_trivia_forward`
+/// (num_instrs clamp) → `resume_jitcode_pc_for` — and soft-logs whether that
+/// reproduces today's carried coordinate (`marker`) and every consumer's read.
+/// Off in production → byte-identical. Read-only; no asserts.
+pub(crate) fn m73_flip_audit_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_M73_FLIP_AUDIT").is_some())
+}
+
 /// `PYRE_M73_PEROP_CARRY` (#73 S2, default ON): source a specialization
 /// guard's (`GuardValue`/`GuardClass`) resume coordinate from the walk
 /// cursor's per-op `-live-` BEFORE anchor (`ctx.live_before_jit_pc`,
@@ -10767,6 +10779,151 @@ fn walker_capture_snapshot_for_last_guard_impl(
                                     bmaps_eq,
                                     const_eq
                                 );
+                            }
+                        }
+                    }
+                }
+                // #73 S3.4 flip-gate certificate (`PYRE_M73_FLIP_AUDIT`, default
+                // OFF): ahead of the terminal S3.5 flip, simulate the whole
+                // Approach C decode-side reconstruction for a depth-0 branch
+                // guard and soft-log whether it reproduces today's carried
+                // coordinate. Author `orgpc` (the guard's OWN `-live-` BEFORE
+                // anchor, `ctx.live_before_jit_pc`), expand it through the
+                // decode-side arm resolver (`decode_side_other_target`), then run
+                // the SAME py_pc derivation the real capture uses at 10124-10187
+                // (`python_pc_for_jitcode_pc` → `skip_python_trivia_forward` →
+                // num_instrs overshoot clamp; `after_residual_call` is false in
+                // this arm, so the fallthrough / bit-14 leg is intentionally not
+                // replicated) and the marker round-trip (`resume_jitcode_pc_for`).
+                // Reports whether the derived coordinate, its py_pc, its marker,
+                // and every consumer read (liveness banks + bridge maps + const
+                // refill) match the baseline, plus whether the flip's carried word
+                // (`orgpc`) genuinely differs from today's (`marker`). Read-only;
+                // no asserts; the carried `marker` is left untouched.
+                if m73_flip_audit_enabled() {
+                    let is_branch = matches!(
+                        ctx.trace_ctx.last_guard_opcode(),
+                        Some(OpCode::GuardTrue | OpCode::GuardFalse)
+                    );
+                    if is_branch {
+                        let orgpc = ctx.live_before_jit_pc;
+                        match marker {
+                            None => {
+                                eprintln!("M73_FLIP result=nomarker py_pc={py_pc} op_pc={op_pc}");
+                            }
+                            // nolb residual: no `-live-` anchor stepped for this
+                            // guard, so Approach C has no `orgpc` to author from —
+                            // it stays on the marker channel. A non-zero
+                            // nolb-branch bucket is a residual the terminal flip
+                            // (S3.5) keeps on the py_pc round-trip.
+                            Some(_) if orgpc == usize::MAX => {
+                                eprintln!("M73_FLIP result=nolb py_pc={py_pc} op_pc={op_pc}");
+                            }
+                            Some(m) => {
+                                let flavor_guard_true = matches!(
+                                    ctx.trace_ctx.last_guard_opcode(),
+                                    Some(OpCode::GuardTrue)
+                                );
+                                // Range check on the ORIGINAL usize, before any
+                                // narrowing cast into the carried label space.
+                                let range_ok = orgpc <= i16::MAX as usize;
+                                let jc = unsafe { &*sym.jitcode };
+                                let bytes = jc.payload.jitcode.code.as_slice();
+                                match decode_side_other_target(bytes, orgpc, flavor_guard_true) {
+                                    Err(reason) => {
+                                        eprintln!(
+                                            "M73_FLIP result=undecodable reason={reason} \
+                                             orgpc={orgpc} py_pc={py_pc} op_pc={op_pc} \
+                                             range_ok={range_ok}"
+                                        );
+                                    }
+                                    Ok(derived) => {
+                                        // Re-confirms the S3.1 arm claim: the
+                                        // decode-derived coordinate equals the
+                                        // walk's not-taken landing.
+                                        let coord_eq = derived == op_pc;
+                                        // Re-derive py_pc from `derived`, mirroring
+                                        // the real capture derivation exactly:
+                                        // inversion → forward trivia skip →
+                                        // num_instrs overshoot clamp. This arm has
+                                        // `after_residual_call == false`, so the
+                                        // fallthrough / bit-14 leg is not replicated.
+                                        let py_pc_cand = unsafe {
+                                            let meta = &jc.payload.metadata;
+                                            let mut py = python_pc_for_jitcode_pc(meta, derived);
+                                            if !jc.payload.code_ptr.is_null() {
+                                                let code_obj = &*jc.payload.code_ptr;
+                                                py = skip_python_trivia_forward(
+                                                    code_obj,
+                                                    py as usize,
+                                                ) as u32;
+                                            }
+                                            let num_instrs = meta.first_jit_pc_by_py_pc.len();
+                                            if py as usize >= num_instrs {
+                                                ctx.entry_py_pc
+                                            } else {
+                                                py
+                                            }
+                                        };
+                                        let invpp_eq = py_pc_cand == py_pc;
+                                        let flip_marker = jc
+                                            .payload
+                                            .resume_jitcode_pc_for(py_pc_cand as usize);
+                                        let marker_eq = flip_marker == Some(m);
+                                        // Whether the flip's carried word (`orgpc`)
+                                        // genuinely differs from today's (`m`): a
+                                        // vacuous self-source would carry the same
+                                        // value.
+                                        let flip_changes_word = orgpc != m;
+                                        // Per-consumer read at the candidate
+                                        // (py_pc_cand, flip_marker) vs the baseline
+                                        // (py_pc, m).
+                                        let ji = jitcode_index as i32;
+                                        let pp_b = py_pc as i32;
+                                        let pp_c = py_pc_cand as i32;
+                                        let jm_b = m as i32;
+                                        let jm_c = flip_marker
+                                            .map(|x| x as i32)
+                                            .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC);
+                                        let banks_b =
+                                            crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
+                                                ji, pp_b, jm_b,
+                                            );
+                                        let banks_c =
+                                            crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
+                                                ji, pp_c, jm_c,
+                                            );
+                                        let banks_eq = banks_b.int == banks_c.int
+                                            && banks_b.ref_ == banks_c.ref_
+                                            && banks_b.float == banks_c.float;
+                                        let bm_b =
+                                            crate::state::bridge_semantic_maps_at_with_jitcode_pc(
+                                                ji, pp_b, jm_b,
+                                            );
+                                        let bm_c =
+                                            crate::state::bridge_semantic_maps_at_with_jitcode_pc(
+                                                ji, pp_c, jm_c,
+                                            );
+                                        let bmaps_eq = bm_b.stack_depth_at_pc
+                                            == bm_c.stack_depth_at_pc
+                                            && bm_b.pcdep_entries == bm_c.pcdep_entries;
+                                        let const_eq =
+                                            crate::state::const_ref_slots_at_pc_at(ji, pp_b, jm_b)
+                                                == crate::state::const_ref_slots_at_pc_at(
+                                                    ji, pp_c, jm_c,
+                                                );
+                                        eprintln!(
+                                            "M73_FLIP result=recon orgpc={orgpc} op_pc={op_pc} \
+                                             derived={derived} coord_eq={coord_eq} py_pc={py_pc} \
+                                             py_pc_cand={py_pc_cand} invpp_eq={invpp_eq} \
+                                             marker={m} flip_marker={flip_marker:?} \
+                                             marker_eq={marker_eq} \
+                                             flip_changes_word={flip_changes_word} \
+                                             range_ok={range_ok} banks_eq={banks_eq} \
+                                             bmaps_eq={bmaps_eq} const_eq={const_eq}"
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
