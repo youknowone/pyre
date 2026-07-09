@@ -1647,9 +1647,10 @@ fn gc_owns_object_via_active_runtime(addr: usize) -> bool {
     // `gc_sync` read only for this immutable ownership query, matching the
     // read-only nature of RPython's descriptor call, instead of panicking
     // across the extern slowpath.
-    match CRANELIFT_ACTIVE_GC
-        .with(|cell| cell.try_borrow().map(|g| g.as_deref().map(|gc| gc.is_managed_heap_object(addr))))
-    {
+    match CRANELIFT_ACTIVE_GC.with(|cell| {
+        cell.try_borrow()
+            .map(|g| g.as_deref().map(|gc| gc.is_managed_heap_object(addr)))
+    }) {
         Ok(Some(r)) => r,
         Ok(None) => majit_gc::gc_sync::gc_query_reentrant(|g| g.is_managed_heap_object(addr)),
         Err(_) => CRANELIFT_ACTIVE_GC_RAW.with(|raw| match raw.get() {

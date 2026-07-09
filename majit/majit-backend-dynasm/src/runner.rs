@@ -584,9 +584,10 @@ fn dynasm_gc_owns_object(addr: usize) -> bool {
     //   - `Err`: the test box's mutable borrow is held by an in-progress
     //     alloc → reach it through the raw mirror (read-only), or fall
     //     back to `gc_sync` if there is no box at all.
-    match DYNASM_ACTIVE_GC
-        .with(|c| c.try_borrow().map(|g| g.as_deref().map(|gc| gc.is_managed_heap_object(addr))))
-    {
+    match DYNASM_ACTIVE_GC.with(|c| {
+        c.try_borrow()
+            .map(|g| g.as_deref().map(|gc| gc.is_managed_heap_object(addr)))
+    }) {
         Ok(Some(r)) => r,
         Ok(None) => majit_gc::gc_sync::gc_query_reentrant(|g| g.is_managed_heap_object(addr)),
         Err(_) => DYNASM_ACTIVE_GC_RAW.with(|raw| match raw.get() {

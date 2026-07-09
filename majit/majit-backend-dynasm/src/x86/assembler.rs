@@ -7648,11 +7648,10 @@ impl<'a> Assembler386<'a> {
     /// barrier when card marking exists; otherwise it falls back to the generic
     /// write barrier.
     fn emit_setarrayitem_gc_write_barrier(&mut self, arglocs: &[Loc]) {
-        let use_array_barrier = crate::runner::with_dynasm_active_gc(|gc| {
-            gc.get_write_barrier_descr()
-        })
-        .flatten()
-        .is_some_and(|wb| wb.jit_wb_cards_set != 0);
+        let use_array_barrier =
+            crate::runner::with_dynasm_active_gc(|gc| gc.get_write_barrier_descr())
+                .flatten()
+                .is_some_and(|wb| wb.jit_wb_cards_set != 0);
         self.emit_write_barrier_fastpath_kind(arglocs, use_array_barrier);
     }
 

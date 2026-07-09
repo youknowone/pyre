@@ -208,25 +208,55 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+/// Read-only GC query for the guard hooks and codegen helpers.
+///
+/// - **Test box present** (`WASM_ACTIVE_GC` is `Some`): a test owns the
+///   GC directly — apply `f` to the boxed allocator.
+/// - **No box, `gc_sync` initialized** (production): route to the
+///   process-global singleton via `gc_query_reentrant`. Some of these
+///   callers can fire during a collection's guard evaluation / extra-root
+///   walk, so the reentrant read-only path (no second `gc_mutex`, no
+///   second `&mut`) is required.
+/// - **No box, `gc_sync` uninitialized** (no GC at all — unit tests):
+///   returns `None` so callers keep their existing `.unwrap_or(default)`
+///   / `.flatten()` behaviour.
 fn with_wasm_active_gc<R>(f: impl FnOnce(&dyn GcAllocator) -> R) -> Option<R> {
-    WASM_ACTIVE_GC.with(|cell| {
-        let guard = cell.borrow();
-        guard.as_deref().map(f)
-    })
+    if WASM_ACTIVE_GC.with(|cell| cell.borrow().is_some()) {
+        return WASM_ACTIVE_GC.with(|cell| cell.borrow().as_deref().map(f));
+    }
+    if majit_gc::gc_sync::is_initialized() {
+        return Some(majit_gc::gc_sync::gc_query_reentrant(f));
+    }
+    None
 }
 
-/// Store a GC allocator in the wasm backend thread-local and register
-/// the `majit_gc::set_active_*` function-pointer hooks, without
-/// requiring a `WasmBackend` instance.
-/// Install a GC box into TLS and register all `set_active_*` hooks.
-fn install_gc_box(gc: Box<dyn majit_gc::GcAllocator>) {
-    let supports_guard_gc_type = gc.supports_guard_gc_type();
-    WASM_ACTIVE_GC.with(|cell| {
-        let mut guard = cell.borrow_mut();
-        *guard = Some(gc);
-        let raw = guard.as_deref_mut().map(|gc| gc as *mut dyn GcAllocator);
-        WASM_ACTIVE_GC_RAW.with(|raw_cell| raw_cell.set(raw));
-    });
+/// `&mut` counterpart of `with_wasm_active_gc` for GC mutations
+/// (allocation, write barriers, collection). Test box → box; production
+/// (no box, `gc_sync` initialized) → `gc_sync::gc_op`; no GC at all →
+/// `None` so callers keep their non-GC fallback. Top-level mutator/
+/// blackhole trampolines, never inside a collection, so `gc_op` is correct.
+fn with_wasm_active_gc_mut<R>(f: impl FnOnce(&mut dyn GcAllocator) -> R) -> Option<R> {
+    if WASM_ACTIVE_GC.with(|cell| cell.borrow().is_some()) {
+        return WASM_ACTIVE_GC.with(|cell| {
+            let mut guard = cell.borrow_mut();
+            let raw: *mut dyn GcAllocator = guard.as_deref_mut()?;
+            // SAFETY: `guard` holds the borrow for the whole `f` call and
+            // these are non-reentrant top-level trampolines, so the
+            // reborrow is exclusive and outlives `f`.
+            Some(f(unsafe { &mut *raw }))
+        });
+    }
+    if majit_gc::gc_sync::is_initialized() {
+        return Some(majit_gc::gc_sync::gc_op(f));
+    }
+    None
+}
+
+/// Register all backend-agnostic `majit_gc::set_active_*` hooks to the
+/// wasm trampolines. Shared by `install_gc_box` (test path: also stores a
+/// box in TLS) and `install_gc_standalone` (production: hooks only, no box
+/// — the trampolines then route to the `gc_sync` singleton).
+fn register_active_hooks(supports_guard_gc_type: bool) {
     majit_gc::set_active_gc_guard_hooks(majit_gc::ActiveGcGuardHooks {
         check_is_object: Some(wasm_check_is_object),
         is_tagged_immediate: Some(wasm_is_tagged_immediate),
@@ -250,11 +280,33 @@ fn install_gc_box(gc: Box<dyn majit_gc::GcAllocator>) {
     );
 }
 
-/// Production path: install a `GcHandle` forwarding to the global singleton.
+/// Store a GC allocator in the wasm backend thread-local and register
+/// the `majit_gc::set_active_*` function-pointer hooks, without
+/// requiring a `WasmBackend` instance.
+/// Install a GC box into TLS and register all `set_active_*` hooks. Test
+/// path only — `set_gc_allocator` hands ownership of a real allocator to
+/// the backend thread. Production uses [`install_gc_standalone`], which
+/// registers the same hooks WITHOUT a box so the trampolines fall through
+/// to `gc_sync`.
+fn install_gc_box(gc: Box<dyn majit_gc::GcAllocator>) {
+    let supports_guard_gc_type = gc.supports_guard_gc_type();
+    WASM_ACTIVE_GC.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        *guard = Some(gc);
+        let raw = guard.as_deref_mut().map(|gc| gc as *mut dyn GcAllocator);
+        WASM_ACTIVE_GC_RAW.with(|raw_cell| raw_cell.set(raw));
+    });
+    register_active_hooks(supports_guard_gc_type);
+}
+
+/// Production path: register all `set_active_*` hooks WITHOUT storing a
+/// box. `WASM_ACTIVE_GC` stays `None`, so every trampoline routes to the
+/// process-global `gc_sync` singleton (the per-thread GC box is the
+/// free-threading gap R4 removes).
 pub fn install_gc_standalone() {
-    let mut handle: Box<dyn majit_gc::GcAllocator> = Box::new(majit_gc::GcHandle);
-    handle.freeze_types();
-    install_gc_box(handle);
+    majit_gc::gc_sync::gc_op(|gc| gc.freeze_types());
+    let supports_guard_gc_type = majit_gc::gc_sync::gc_query(|gc| gc.supports_guard_gc_type());
+    register_active_hooks(supports_guard_gc_type);
 }
 
 /// Diagnostic only: `(oldgen_total_bytes, nursery_used_bytes)` of the GC owned
@@ -319,16 +371,12 @@ fn nursery_alloc_params(ops: &[Op]) -> Option<codegen::NurseryAllocParams> {
 
 /// `majit_gc::CollectOldgenFn` installed by `set_gc_allocator`. Drives the
 /// interpreter-safepoint non-moving old-gen major (`gc_interp::safepoint`,
-/// default-on on wasm) through the wasm-thread-local GC. Needs mutable access,
-/// so it borrows `WASM_ACTIVE_GC` directly rather than via `with_wasm_active_gc`.
-/// Mirrors dynasm's `dynasm_collect_oldgen_nonmoving` and cranelift's
-/// `collect_oldgen_nonmoving_via_active_runtime`.
+/// default-on on wasm) through the active GC. Needs mutable access, so it
+/// routes via `with_wasm_active_gc_mut` (test box → box; production → the
+/// `gc_sync` singleton). Mirrors dynasm's `dynasm_collect_oldgen_nonmoving`
+/// and cranelift's `collect_oldgen_nonmoving_via_active_runtime`.
 fn wasm_collect_oldgen_nonmoving() {
-    WASM_ACTIVE_GC.with(|cell| {
-        if let Some(gc) = cell.borrow_mut().as_deref_mut() {
-            gc.collect_oldgen_nonmoving();
-        }
-    });
+    with_wasm_active_gc_mut(|gc| gc.collect_oldgen_nonmoving());
 }
 
 fn wasm_register_finalizer(fq_index: usize, obj: GcRef, trigger: majit_gc::FinalizerTriggerFn) {
@@ -381,25 +429,14 @@ fn wasm_alloc_nursery_typed(type_id: u32, size: usize) -> GcRef {
     // See cranelift/dynasm counterparts: host-side allocation must not
     // trigger collection because the caller holds a raw pointer that
     // is not a registered GC root.
-    WASM_ACTIVE_GC.with(|cell| {
-        let mut guard = cell.borrow_mut();
-        match guard.as_deref_mut() {
-            Some(gc) => gc.alloc_nursery_no_collect_typed(type_id, size),
-            None => GcRef(0),
-        }
-    })
+    with_wasm_active_gc_mut(|gc| gc.alloc_nursery_no_collect_typed(type_id, size))
+        .unwrap_or(GcRef(0))
 }
 
 /// Host-side old-gen allocation trampoline. Stable
 /// across minor/major collections — see dynasm counterpart.
 fn wasm_alloc_oldgen_typed(type_id: u32, size: usize) -> GcRef {
-    WASM_ACTIVE_GC.with(|cell| {
-        let mut guard = cell.borrow_mut();
-        match guard.as_deref_mut() {
-            Some(gc) => gc.alloc_oldgen_typed(type_id, size),
-            None => GcRef(0),
-        }
-    })
+    with_wasm_active_gc_mut(|gc| gc.alloc_oldgen_typed(type_id, size)).unwrap_or(GcRef(0))
 }
 
 /// JIT-trace allocation trampoline target for `New` / `NewWithVtable`.
@@ -419,10 +456,8 @@ fn wasm_alloc_oldgen_typed(type_id: u32, size: usize) -> GcRef {
 /// allocation. So it uses the *collecting* `alloc_nursery_typed`, which
 /// triggers a minor collection on nursery-full instead of leaking to old-gen.
 pub extern "C" fn wasm_jit_alloc(type_id: i64, size: i64) -> i64 {
-    WASM_ACTIVE_GC.with(|cell| match cell.borrow_mut().as_deref_mut() {
-        Some(gc) => gc.alloc_nursery_typed(type_id as u32, size as usize).0 as i64,
-        None => 0,
-    })
+    with_wasm_active_gc_mut(|gc| gc.alloc_nursery_typed(type_id as u32, size as usize).0 as i64)
+        .unwrap_or(0)
 }
 
 /// JIT-trace variable-size allocation trampoline target for `NewArray` /
@@ -438,25 +473,23 @@ pub extern "C" fn wasm_jit_alloc_array(
     let Ok(length) = usize::try_from(length) else {
         return 0;
     };
-    WASM_ACTIVE_GC.with(|cell| match cell.borrow_mut().as_deref_mut() {
-        Some(gc) => {
-            let obj = gc.alloc_varsize_typed(
-                type_id as u32,
-                base_size as usize,
-                item_size as usize,
-                length,
-            );
-            if obj.is_null() {
-                0
-            } else {
-                unsafe {
-                    *((obj.0 as *mut u8).add(len_offset as usize) as *mut usize) = length;
-                }
-                obj.0 as i64
+    with_wasm_active_gc_mut(|gc| {
+        let obj = gc.alloc_varsize_typed(
+            type_id as u32,
+            base_size as usize,
+            item_size as usize,
+            length,
+        );
+        if obj.is_null() {
+            0
+        } else {
+            unsafe {
+                *((obj.0 as *mut u8).add(len_offset as usize) as *mut usize) = length;
             }
+            obj.0 as i64
         }
-        None => 0,
     })
+    .unwrap_or(0)
 }
 
 /// JIT-trace write-barrier trampoline target for ref-storing `SetfieldGc` /
@@ -467,11 +500,7 @@ pub extern "C" fn wasm_jit_alloc_array(
 /// skips the native GC rewrite pass, so the trace emits this barrier directly
 /// instead of `COND_CALL_GC_WB`. Returns 0 — the store codegen ignores it.
 pub extern "C" fn wasm_jit_write_barrier(obj: i64) -> i64 {
-    WASM_ACTIVE_GC.with(|cell| {
-        if let Some(gc) = cell.borrow_mut().as_deref_mut() {
-            gc.write_barrier(GcRef(obj as usize));
-        }
-    });
+    with_wasm_active_gc_mut(|gc| gc.write_barrier(GcRef(obj as usize)));
     0
 }
 
@@ -585,22 +614,12 @@ fn build_callee_gcmap(
 /// Caller must keep `slot` valid until [`wasm_gc_remove_root`] is
 /// called with the same pointer.
 unsafe fn wasm_gc_add_root(slot: *mut GcRef) {
-    WASM_ACTIVE_GC.with(|cell| {
-        let mut guard = cell.borrow_mut();
-        if let Some(gc) = guard.as_deref_mut() {
-            unsafe { gc.add_root(slot) };
-        }
-    });
+    with_wasm_active_gc_mut(|gc| unsafe { gc.add_root(slot) });
 }
 
 /// Companion to [`wasm_gc_add_root`].
 fn wasm_gc_remove_root(slot: *mut GcRef) {
-    WASM_ACTIVE_GC.with(|cell| {
-        let mut guard = cell.borrow_mut();
-        if let Some(gc) = guard.as_deref_mut() {
-            gc.remove_root(slot);
-        }
-    });
+    with_wasm_active_gc_mut(|gc| gc.remove_root(slot));
 }
 
 /// Host-side write-barrier trampoline for the interpreter (mapdict / list /
@@ -608,35 +627,32 @@ fn wasm_gc_remove_root(slot: *mut GcRef) {
 /// `dynasm_gc_write_barrier`; without it every interpreter ref-store is a
 /// silent no-op, so a collecting nursery loses old→young pointers.
 fn wasm_active_gc_write_barrier(obj: GcRef) {
-    WASM_ACTIVE_GC.with(|cell| {
-        let mut guard = cell.borrow_mut();
-        if let Some(gc) = guard.as_deref_mut() {
-            gc.write_barrier(obj);
-        }
-    });
+    with_wasm_active_gc_mut(|gc| gc.write_barrier(obj));
 }
 
 /// Host-side `is_managed_heap_object` trampoline.
+///
+/// This read-only ownership query can fire reentrantly from an extra-root
+/// walker mid-collection (the interpreter-safepoint major holds the
+/// `WASM_ACTIVE_GC` mutable borrow while asking whether a slot is
+/// GC-managed), so:
+///   - `Ok(Some)`: a test box is present and free-borrowable → use it.
+///   - `Ok(None)`: no box (production) → route to `gc_sync` reentrantly.
+///   - `Err`: the test box's mutable borrow is held by an in-progress
+///     mutation → reach it through the raw mirror (read-only), or fall
+///     back to `gc_sync` if there is no box at all.
 fn wasm_gc_owns_object(addr: usize) -> bool {
-    WASM_ACTIVE_GC.with(|cell| {
-        let guard = match cell.try_borrow() {
-            Ok(guard) => guard,
-            Err(_) => {
-                // The interpreter-safepoint major holds the mutable borrow
-                // while its extra-root walker asks whether a slot is
-                // GC-managed. Answer the read-only ownership query through the
-                // raw mirror rather than panicking on the second borrow.
-                return WASM_ACTIVE_GC_RAW.with(|raw| match raw.get() {
-                    Some(ptr) => unsafe { (*ptr).is_managed_heap_object(addr) },
-                    None => false,
-                });
-            }
-        };
-        match guard.as_deref() {
-            Some(gc) => gc.is_managed_heap_object(addr),
-            None => false,
-        }
-    })
+    match WASM_ACTIVE_GC.with(|cell| {
+        cell.try_borrow()
+            .map(|g| g.as_deref().map(|gc| gc.is_managed_heap_object(addr)))
+    }) {
+        Ok(Some(r)) => r,
+        Ok(None) => majit_gc::gc_sync::gc_query_reentrant(|g| g.is_managed_heap_object(addr)),
+        Err(_) => WASM_ACTIVE_GC_RAW.with(|raw| match raw.get() {
+            Some(ptr) => unsafe { (*ptr).is_managed_heap_object(addr) },
+            None => majit_gc::gc_sync::gc_query_reentrant(|g| g.is_managed_heap_object(addr)),
+        }),
+    }
 }
 
 pub struct WasmBackend {
@@ -820,7 +836,7 @@ impl WasmBackend {
         if self.vtable_offset.is_some() {
             return table;
         }
-        if WASM_ACTIVE_GC.with(|cell| cell.borrow().is_none()) {
+        if with_wasm_active_gc(|_| ()).is_none() {
             return table;
         }
         for op in ops {
@@ -1066,10 +1082,8 @@ impl majit_backend::Backend for WasmBackend {
         // TODO: get_type_id() returns the u64 path_hash cache key; the GC tid
         // is its low 32 bits until gc_cache routing resolves the real tid.
         let type_id = sizedescr.get_type_id() as u32;
-        WASM_ACTIVE_GC.with(|cell| match cell.borrow_mut().as_deref_mut() {
-            Some(gc) => gc.alloc_nursery_no_collect_typed(type_id, size).0 as i64,
-            None => 0,
-        })
+        with_wasm_active_gc_mut(|gc| gc.alloc_nursery_no_collect_typed(type_id, size).0 as i64)
+            .unwrap_or(0)
     }
 
     /// llmodel.py:778-782 bh_new_with_vtable(sizedescr): allocate, then write
@@ -1078,10 +1092,9 @@ impl majit_backend::Backend for WasmBackend {
         let size = sizedescr.as_size();
         let vtable = sizedescr.get_vtable();
         let type_id = sizedescr.get_type_id() as u32;
-        let ptr = WASM_ACTIVE_GC.with(|cell| match cell.borrow_mut().as_deref_mut() {
-            Some(gc) => gc.alloc_nursery_no_collect_typed(type_id, size).0 as i64,
-            None => 0,
-        });
+        let ptr =
+            with_wasm_active_gc_mut(|gc| gc.alloc_nursery_no_collect_typed(type_id, size).0 as i64)
+                .unwrap_or(0);
         if ptr != 0 && vtable != 0 {
             if let Some(vt_off) = self.vtable_offset {
                 unsafe {
@@ -1100,20 +1113,18 @@ impl majit_backend::Backend for WasmBackend {
             .array_len_offset()
             .expect("bh_new_array requires ArrayDescr.lendescr");
         let type_id = arraydescr.get_type_id() as u32;
-        WASM_ACTIVE_GC.with(|cell| match cell.borrow_mut().as_deref_mut() {
-            Some(gc) => {
-                let obj = gc.alloc_varsize_typed(type_id, base_size, itemsize, length);
-                if obj.is_null() {
-                    0
-                } else {
-                    unsafe {
-                        *((obj.0 as *mut u8).add(len_offset) as *mut usize) = length;
-                    }
-                    obj.0 as i64
+        with_wasm_active_gc_mut(|gc| {
+            let obj = gc.alloc_varsize_typed(type_id, base_size, itemsize, length);
+            if obj.is_null() {
+                0
+            } else {
+                unsafe {
+                    *((obj.0 as *mut u8).add(len_offset) as *mut usize) = length;
                 }
+                obj.0 as i64
             }
-            None => 0,
         })
+        .unwrap_or(0)
     }
 
     /// llmodel.py:790 bh_new_array_clear = bh_new_array (allocator zeroes).

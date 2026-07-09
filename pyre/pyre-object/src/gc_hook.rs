@@ -117,7 +117,9 @@ pub fn clear_gc_alloc_collecting_hook() {
 /// no-collect [`try_gc_alloc`]).
 #[inline]
 pub fn try_gc_alloc_collecting(type_id: u32, payload_size: usize) -> Option<*mut u8> {
-    GC_ALLOC_COLLECTING_HOOK.get().map(|f| f(type_id, payload_size))
+    GC_ALLOC_COLLECTING_HOOK
+        .get()
+        .map(|f| f(type_id, payload_size))
 }
 
 /// Signature of the host-side memory-pressure callback: charge `bytes` of
