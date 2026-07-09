@@ -19,11 +19,8 @@ wasmtime = { workspace = true }
 wasmprinter = "0.248"
 # Pure-Rust wasm interpreter, the alternative `--engine wasmi` execution path.
 # Unlike wasmtime it does not compile the module on load (near-zero fixed
-# startup cost), at the price of slower steady-state execution. Points at our
-# in-tree patched wasmi (nested workspace) with the `majit-jit` meta-tracing
-# tier so the runner can execute the pyre module under the accelerated
-# interpreter; the tier is on by default and toggled off with `WASMI_NO_MAJIT=1`.
-wasmi = { path = "../../wasmi/crates/wasmi", features = ["majit-jit"] }
+# startup cost), at the price of slower steady-state execution.
+wasmi = "1.1"
 # Content hash binding the `.cwasm` cache to the exact `.wasm` bytes it was
 # compiled from, so a stale or pre-placed cache is never deserialized.
 sha2 = "0.10"
