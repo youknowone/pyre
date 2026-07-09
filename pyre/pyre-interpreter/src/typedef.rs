@@ -740,9 +740,13 @@ pub fn init_typeobjects() {
             &pyre_object::memoryview::MEMORYVIEW_TYPE as *const PyType as usize,
             memoryview_type as usize,
         );
+        let seq_iterator_type = new_typeobject_with_base("iterator", |_| {}, object_type);
+        // `Py_TPFLAGS_DISALLOW_INSTANTIATION` — an iterator is produced only by
+        // `iter(obj)`, never by `iterator()`, so `tp_new` is NULL.
+        unsafe { pyre_object::w_type_set_disallow_instantiation(seq_iterator_type) };
         reg.insert(
             &pyre_object::iterobject::SEQ_ITER_TYPE as *const PyType as usize,
-            new_typeobject_with_base("iterator", |_| {}, object_type) as usize,
+            seq_iterator_type as usize,
         );
         reg.insert(
             &pyre_object::functional::LONG_RANGE_ITER_TYPE as *const PyType as usize,
