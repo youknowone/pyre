@@ -9629,46 +9629,19 @@ fn branch_resume_target_stack_depth(frame: &ActiveResumeFrame, target: usize) ->
     if pjc.code_ptr.is_null() {
         return None;
     }
-    // SAFETY: `code_ptr` / `metadata` are immutable payload layout fields;
-    // the frame holds an `Arc<PyJitCode>` keeping them alive for this read.
-    unsafe {
-        let code = &*pjc.code_ptr;
-        let py = python_pc_for_jitcode_pc(&pjc.metadata, target) as usize;
-        let py = skip_python_trivia_forward(code, py);
-        let depth = crate::liveness::liveness_for(pjc.code_ptr)
-            .depth_at_py_pc()
-            .get(py)
-            .copied();
-        // task#50 #73-core: certify the trivia-aware `depth_trivia_by_jit_pc`
-        // twin reproduces this depth off the genuine jitcode `target`, without
-        // the `python_pc_for_jitcode_pc` inversion + runtime `skip_python_trivia_forward`
-        // walk. When the twin has an entry for `target`, it must equal the depth
-        // read here (both derive from the same static `liveness_for` depth +
-        // trivia-skip, baked at compile time). Precondition certificate for
-        // retiring the inversion at this ENCODE site. Off in production.
-        if m73_encode_audit_enabled() && pjc.depth_trivia_populated() {
-            assert_eq!(
-                pjc.depth_trivia_for_jitcode_pc(target),
-                depth,
-                "depth_trivia twin diverges from branch_resume_target_stack_depth at target={target} py={py}"
-            );
-        }
-        if pjc.depth_trivia_populated() {
-            pjc.depth_trivia_for_jitcode_pc(target)
-        } else {
-            // Slice A census: soft, non-aborting count of the py_pc-inversion
-            // fallback (empty depth-trivia twin). Emits ONLY when this arm runs,
-            // so zero output over the corpus == this fallback is dead.
-            if m73_encode_audit_enabled() {
-                eprintln!(
-                    "M73_FALLBACK site=brtsd target={target} is_portal_bridge={} code_null={}",
-                    pjc.is_portal_bridge(),
-                    pjc.code_ptr.is_null()
-                );
-            }
-            depth
-        }
-    }
+    // #73 family(ii) Slice B: source the not-taken-arm depth off the genuine
+    // jitcode `target` through the compile-time `depth_trivia` twin, retiring
+    // the `python_pc_for_jitcode_pc` inversion + runtime
+    // `skip_python_trivia_forward` + static-liveness read. The twin is built for
+    // every drained real-code jitcode (codewriter.rs), and the Slice A census
+    // (`PYRE_M73_ENCODE_AUDIT`) proved the empty-twin fallback is never reached
+    // here (0 fallback trips / 162 programs; this reader 1181 hits, all
+    // populated). The `debug_assert` re-certifies the invariant in test builds.
+    debug_assert!(
+        pjc.depth_trivia_populated(),
+        "branch_resume_target_stack_depth on an unpopulated depth-trivia twin at target={target}"
+    );
+    pjc.depth_trivia_for_jitcode_pc(target)
 }
 
 /// Flat-free (#267) boxed-int kept-slot hazard: a kept operand-stack slot
@@ -10004,40 +9977,15 @@ fn branch_resume_target_stack_depth_any_leg(target: usize, jitcode_index: u32) -
     if pjc.code_ptr.is_null() {
         return None;
     }
-    let code_obj = unsafe { &*pjc.code_ptr };
-    let py = python_pc_for_jitcode_pc(&pjc.metadata, target) as usize;
-    let py = skip_python_trivia_forward(code_obj, py);
-    let depth_opt = crate::liveness::liveness_for(pjc.code_ptr)
-        .depth_at_py_pc()
-        .get(py)
-        .copied();
-    // task#50 #73-core: certify the shared `depth_trivia_by_jit_pc` twin at the
-    // leg-independent depth probe. Same static-liveness + trivia-skip source as
-    // the two full-body-walk readers, so the same twin must reproduce it off the
-    // genuine jitcode `target`. Off in production.
-    if m73_encode_audit_enabled() && pjc.depth_trivia_populated() {
-        assert_eq!(
-            pjc.depth_trivia_for_jitcode_pc(target),
-            depth_opt,
-            "depth_trivia twin diverges from branch_resume_target_stack_depth_any_leg at target={target} py={py}"
-        );
-    }
-    if pjc.depth_trivia_populated() {
-        pjc.depth_trivia_for_jitcode_pc(target)
-    } else {
-        // Slice A census: soft, non-aborting count of the py_pc-inversion
-        // fallback (empty depth-trivia twin). Highest-risk site — keys on the
-        // caller's `ctx.outer_jitcode_index` (recorded as outer_idx). Zero
-        // output == dead.
-        if m73_encode_audit_enabled() {
-            eprintln!(
-                "M73_FALLBACK site=brtsd_anyleg target={target} outer_idx={jitcode_index} is_portal_bridge={} code_null={}",
-                pjc.is_portal_bridge(),
-                pjc.code_ptr.is_null()
-            );
-        }
-        depth_opt
-    }
+    // #73 family(ii) Slice B: twin-sourced leg-independent depth, py_pc inversion
+    // retired (see `branch_resume_target_stack_depth`). Slice A census: this
+    // reader 1178 hits, all populated, 0 fallback trips — including at the
+    // `outer_jitcode_index==0` coincidence that reads `jitcodes[0]`.
+    debug_assert!(
+        pjc.depth_trivia_populated(),
+        "branch_resume_target_stack_depth_any_leg on an unpopulated depth-trivia twin at target={target} idx={jitcode_index}"
+    );
+    pjc.depth_trivia_for_jitcode_pc(target)
 }
 
 /// `generate_guard` (`pyjitpl.py:2599-2603`) keys `after_residual_call`
