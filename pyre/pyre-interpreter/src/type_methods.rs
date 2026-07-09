@@ -121,6 +121,54 @@ pub(crate) fn arity_at_most(
     Ok(())
 }
 
+/// TypeError for a method requiring exactly `n` positional arguments after
+/// the receiver, called with a different count — the PyArg_UnpackTuple
+/// min==max form "X expected N arguments, got M" (`list.insert`,
+/// `list.__setitem__`).  Unlike `arity_exact`, the message carries neither a
+/// trailing "()" nor the "exactly" wording; "argument" is singular when
+/// `n == 1`.
+pub(crate) fn arity_exact_unpack(
+    args: &[PyObjectRef],
+    name: &str,
+    n: usize,
+) -> Result<(), crate::PyError> {
+    if args.len() != n + 1 {
+        return Err(crate::PyError::type_error(format!(
+            "{name} expected {n} argument{}, got {}",
+            if n == 1 { "" } else { "s" },
+            args.len().saturating_sub(1),
+        )));
+    }
+    Ok(())
+}
+
+/// TypeError for a slot wrapper requiring exactly `n` positional arguments
+/// after the receiver — the `check_num_args` (typeobject.c) form
+/// "expected N argument(s), got M", with no method name.  "argument" is
+/// singular when `n == 1`.
+pub(crate) fn arity_slot(args: &[PyObjectRef], n: usize) -> Result<(), crate::PyError> {
+    if args.len() != n + 1 {
+        return Err(crate::PyError::type_error(format!(
+            "expected {n} argument{}, got {}",
+            if n == 1 { "" } else { "s" },
+            args.len().saturating_sub(1),
+        )));
+    }
+    Ok(())
+}
+
+/// TypeError for a METH_NOARGS method called with positional arguments —
+/// the "X() takes no arguments (M given)" form (`list.__reversed__`).
+pub(crate) fn arity_no_args(args: &[PyObjectRef], name: &str) -> Result<(), crate::PyError> {
+    if args.len() != 1 {
+        return Err(crate::PyError::type_error(format!(
+            "{name}() takes no arguments ({} given)",
+            args.len().saturating_sub(1),
+        )));
+    }
+    Ok(())
+}
+
 /// TypeError for an unbound method descriptor invoked with no receiver
 /// (`list.append()` with zero arguments) — `args` is empty.
 pub(crate) fn require_receiver(args: &[PyObjectRef], name: &str) -> Result<(), crate::PyError> {
@@ -154,13 +202,13 @@ pub(crate) fn require_no_args(args: &[PyObjectRef], name: &str) -> Result<(), cr
 // All take self (list) as first arg.
 
 pub fn list_method_append(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    arity_exact(args, "append", 1)?;
+    arity_exact(args, "list.append", 1)?;
     unsafe { w_list_append(args[0], args[1]) };
     Ok(w_none())
 }
 
 pub fn list_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    arity_exact(args, "extend", 1)?;
+    arity_exact(args, "list.extend", 1)?;
     let list = args[0];
     let other = args[1];
     unsafe {
@@ -191,7 +239,7 @@ pub fn list_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 
 /// PyPy: listobject.py descr_insert — list.insert(index, item)
 pub fn list_method_insert(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    arity_exact(args, "insert", 2)?;
+    arity_exact_unpack(args, "insert", 2)?;
     let index = unsafe { w_int_get_value(args[1]) };
     unsafe { pyre_object::listobject::w_list_insert(args[0], index, args[2]) };
     Ok(w_none())
@@ -202,6 +250,9 @@ pub fn list_method_insert(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 /// otherwise out-of-range raises "pop index out of range".
 pub fn list_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_receiver(args, "pop")?;
+    // `descr_pop` checks arity before touching the list, so `pop(1, 2)` on an
+    // empty list reports the surplus argument rather than "pop from empty list".
+    arity_at_most(args, "pop", 1)?;
     let index = if args.len() > 1 {
         unsafe { w_int_get_value(args[1]) }
     } else {
