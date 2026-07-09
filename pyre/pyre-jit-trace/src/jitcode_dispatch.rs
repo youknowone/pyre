@@ -16762,11 +16762,15 @@ fn try_walker_specialize_subscr(
         );
     }
 
-    // Gate: list[int], non-negative index in bounds, int- or float-storage.
-    // A bool index (`is_int` accepts `W_BoolObject`) is fine: bool shares
-    // int's `intval`, so it unboxes through its own &BOOL_TYPE guard below.
+    // Gate: EXACT list[int], non-negative index in bounds, int- or
+    // float-storage.  A bool index (`is_int` accepts `W_BoolObject`) is fine:
+    // bool shares int's `intval`, so it unboxes through its own &BOOL_TYPE
+    // guard below.  A list SUBCLASS instance shares `ob_type == &LIST_TYPE`
+    // but retags `w_class` and may override `__getitem__`; `is_exact_list`
+    // excludes it so it falls to the generic residual (which honours the
+    // override) instead of this direct-storage load.
     let (sid, index, concrete_len) = unsafe {
-        if !pyre_object::pyobject::is_list(list_obj) || !pyre_object::is_int(key_obj) {
+        if !pyre_object::is_exact_list(list_obj) || !pyre_object::is_int(key_obj) {
             return Ok(None);
         }
         let index = pyre_object::w_int_get_value(key_obj);
@@ -16807,6 +16811,18 @@ fn try_walker_specialize_subscr(
     ctx.trace_ctx
         .heap_cache_mut()
         .class_now_known(list_op, list_type_addr);
+
+    // A list SUBCLASS instance shares `ob_type == &LIST_TYPE` (so it passes
+    // the GuardClass above) but retags `w_class` and may override
+    // `__getitem__`; guard the exact canonical `w_class` so such an instance
+    // side-exits to the generic residual (which honours the override) rather
+    // than taking this direct-storage load.
+    walker_guard_exact_w_class(
+        ctx,
+        op_pc,
+        list_op,
+        pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::LIST_TYPE),
+    )?;
 
     // guard_value(strategy == sid): getfield strategy + GuardValue + replace_box.
     let strategy = crate::state::opimpl_getfield_gc_i(
@@ -18111,7 +18127,11 @@ fn try_walker_specialize_store_subscr(
         // route through the generic path — PyPy's IntegerListStrategy rejects a
         // W_BoolObject (`is_correct_type` is exact-type), switching the list to
         // object storage, so the int-storage fast path would drop the bool type.
-        if !pyre_object::pyobject::is_list(list_obj) || !pyre_object::is_int(key_obj) {
+        // EXACT list only: a list SUBCLASS instance shares `ob_type ==
+        // &LIST_TYPE` but retags `w_class` and may override `__setitem__`;
+        // `is_exact_list` excludes it so it falls to the generic residual
+        // (which honours the override) instead of this direct-storage store.
+        if !pyre_object::is_exact_list(list_obj) || !pyre_object::is_int(key_obj) {
             return Ok(None);
         }
         let index = pyre_object::w_int_get_value(key_obj);
@@ -18149,6 +18169,18 @@ fn try_walker_specialize_store_subscr(
     ctx.trace_ctx
         .heap_cache_mut()
         .class_now_known(list_op, list_type_addr);
+
+    // A list SUBCLASS instance shares `ob_type == &LIST_TYPE` (so it passes
+    // the GuardClass above) but retags `w_class` and may override
+    // `__setitem__`; guard the exact canonical `w_class` so such an instance
+    // side-exits to the generic residual (which honours the override) rather
+    // than taking this direct-storage store.
+    walker_guard_exact_w_class(
+        ctx,
+        op_pc,
+        list_op,
+        pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::LIST_TYPE),
+    )?;
 
     // guard_value(strategy == sid): getfield strategy + GuardValue + replace_box.
     let strategy = crate::state::opimpl_getfield_gc_i(
