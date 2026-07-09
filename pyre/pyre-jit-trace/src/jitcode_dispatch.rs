@@ -9235,6 +9235,22 @@ pub(crate) fn m73_perop_carry_enabled() -> bool {
     })
 }
 
+/// `PYRE_M73_BRANCH_CARRY` (#73 S3.5, default OFF): the terminal branch-guard
+/// flip. A depth-0 `GuardTrue`/`GuardFalse` sources its resume word from the
+/// walk's arm-independent `-live-` BEFORE anchor (`ctx.live_before_jit_pc`,
+/// `orgpc`) TAGGED into the negative space of the `jitcode_pc` word (plus a
+/// 1-bit flavor), instead of the py_pc-keyed `resume_jitcode_pc_for` block-head
+/// marker. Byte-identical by construction: encode carries the tagged word only
+/// when its decode-side expansion ([`expand_branch_carried`]) reproduces the
+/// baseline `marker` (self-cert), and decode expands it back to that same
+/// `marker` before any consumer reads it. Off → encode never emits a tagged
+/// word, so the decode expand is a no-op. Certified by `PYRE_M73_FLIP_AUDIT`
+/// (S3.4) and check.py.
+pub(crate) fn m73_branch_carry_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_M73_BRANCH_CARRY").is_some())
+}
+
 pub(crate) fn python_pc_for_jitcode_pc(metadata: &crate::PyJitCodeMetadata, jit_pc: usize) -> u32 {
     // Exact inverse: `first_jit_pc_by_py_pc[py]` is the byte offset of the
     // FIRST instruction opcode `py` emitted (`usize::MAX` = the PC emitted
@@ -9427,6 +9443,51 @@ fn decode_side_other_target(
     let target = read_label(code, &goto, 1);
     let raw = if flavor_guard_true { target } else { goto.next_pc };
     Ok(resolve_branch_target_through_trampoline(code, raw))
+}
+
+/// #73 S3.5 decode: if `carried` is a tagged branch `orgpc` (negative-space
+/// encoding, [`majit_ir::resumedata::encode_branch_orgpc`]), expand it to the
+/// block-head resume marker exactly as the baseline would have carried it —
+/// `decode_side_other_target` picks the not-taken arm from `orgpc` + flavor,
+/// then the SAME inversion + forward trivia-skip + `resume_jitcode_pc_for` the
+/// real capture used (10166-10191). Non-tagged words (offsets `>= 0`,
+/// `NO_JITCODE_PC`) pass through unchanged, so this is a no-op whenever the flip
+/// is off (`decode_branch_orgpc` returns `None`).
+///
+/// Returns `NO_JITCODE_PC` if the arm cannot be decoded, so the decoder falls
+/// back to the stored `py_pc` path. In particular an OVERSHOOT (`py_pc >=
+/// num_instrs`) is treated as a decode FAILURE rather than guessing the real
+/// capture's `entry_py_pc` clamp target (a per-walk value not available here):
+/// the encode self-cert re-runs this exact function and declines to carry any
+/// tagged word whose reconstruction overshoots, so a genuinely-carried tagged
+/// word never reaches the overshoot leg.
+pub(crate) fn expand_branch_carried(payload: &crate::PyJitCode, carried: i32) -> i32 {
+    match majit_ir::resumedata::decode_branch_orgpc(carried) {
+        None => carried,
+        Some((orgpc, flavor)) => {
+            let code = payload.jitcode.code.as_slice();
+            match decode_side_other_target(code, orgpc, flavor) {
+                Err(_) => majit_ir::resumedata::NO_JITCODE_PC,
+                Ok(derived) => {
+                    let mut py = python_pc_for_jitcode_pc(&payload.metadata, derived);
+                    if !payload.code_ptr.is_null() {
+                        let co = unsafe { &*payload.code_ptr };
+                        py = skip_python_trivia_forward(co, py as usize) as u32;
+                    }
+                    let num_instrs = payload.metadata.first_jit_pc_by_py_pc.len();
+                    if py as usize >= num_instrs {
+                        // Overshoot: the real capture clamps to `ctx.entry_py_pc`
+                        // (a per-walk value absent at decode). Decode-failure →
+                        // py_pc fallback; encode self-cert never tags such a word.
+                        return majit_ir::resumedata::NO_JITCODE_PC;
+                    }
+                    payload
+                        .resume_jitcode_pc_for(py as usize)
+                        .map_or(majit_ir::resumedata::NO_JITCODE_PC, |m| m as i32)
+                }
+            }
+        }
+    }
 }
 
 /// Decode a not-taken branch trampoline's `ref_copy` parallel-move
@@ -10939,7 +11000,45 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 // decode identically for every consumer (banks + bridge maps +
                 // const refill) where the anchor coincides, and flags the
                 // divergent minority for the check.py output-equality gate.
-                if m73_perop_carry_enabled()
+                // #73 S3.5 flip (`PYRE_M73_BRANCH_CARRY`, default OFF): a depth-0
+                // branch guard (`GuardTrue`/`GuardFalse`) carries the walk's
+                // arm-independent `-live-` BEFORE anchor (`ctx.live_before_jit_pc`,
+                // `orgpc`) TAGGED into the negative space of the word plus the
+                // guard flavor, instead of the py_pc-keyed block-head `marker`.
+                // Carried ONLY when the tagged word's decode-side expansion
+                // (`expand_branch_carried`, the same fn every consumer runs)
+                // reproduces today's `marker` (self-cert) — so decode expands it
+                // back to exactly `marker` and the encode is byte-identical by
+                // construction. Requires a stepped `-live-` anchor in i16-tag
+                // range (`BRANCH_ORGPC_MAX`) and a resolvable `marker`; otherwise
+                // fall through to the perop / marker paths unchanged.
+                let flavor_true =
+                    matches!(ctx.trace_ctx.last_guard_opcode(), Some(OpCode::GuardTrue));
+                let is_branch = matches!(
+                    ctx.trace_ctx.last_guard_opcode(),
+                    Some(OpCode::GuardTrue | OpCode::GuardFalse)
+                );
+                if m73_branch_carry_enabled()
+                    && is_branch
+                    && ctx.live_before_jit_pc != usize::MAX
+                    && ctx.live_before_jit_pc <= majit_ir::resumedata::BRANCH_ORGPC_MAX
+                    && marker.is_some()
+                    && {
+                        // Self-certify byte-identity: the tagged word must expand
+                        // back to today's carried `marker`.
+                        let tagged = majit_ir::resumedata::encode_branch_orgpc(
+                            ctx.live_before_jit_pc,
+                            flavor_true,
+                        );
+                        let jc = unsafe { &*sym.jitcode };
+                        expand_branch_carried(&jc.payload, tagged)
+                            == marker
+                                .map(|m| m as i32)
+                                .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC)
+                    }
+                {
+                    majit_ir::resumedata::encode_branch_orgpc(ctx.live_before_jit_pc, flavor_true)
+                } else if m73_perop_carry_enabled()
                     && marker.is_some()
                     && ctx.live_before_jit_pc != usize::MAX
                     && matches!(

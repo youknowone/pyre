@@ -709,6 +709,11 @@ impl PyJitCode {
         carried: i32,
         op_live: u8,
     ) -> Option<usize> {
+        // #73 S3.5: a depth-0 branch guard may carry its `orgpc` tagged into the
+        // word's negative space; expand it to the block-head marker the baseline
+        // would have carried before any offset use. No-op for offsets /
+        // NO_JITCODE_PC (the flip-off case), so byte-identical when off.
+        let carried = crate::jitcode_dispatch::expand_branch_carried(self, carried);
         let used_carried = carried != majit_ir::resumedata::NO_JITCODE_PC
             && carried >= 0
             && self.jitcode.can_decode_live_vars(carried as usize, op_live);

@@ -1536,6 +1536,11 @@ pub(crate) fn bridge_semantic_maps_at_with_jitcode_pc(
             };
         };
         let payload = &jc.payload;
+        // #73 S3.5: expand a tagged branch `orgpc` word to the block-head marker
+        // BEFORE the `>= 0` / offset uses below — a tagged NEGATIVE word cast to
+        // usize would otherwise be a huge OOB index. No-op for offsets /
+        // NO_JITCODE_PC (flip-off), so byte-identical when off.
+        let jitcode_pc = crate::jitcode_dispatch::expand_branch_carried(payload, jitcode_pc);
         // The rd_numb pc word may carry an after-residual-call marker;
         // recover the plain Python PC for the py_pc-keyed liveness/depth
         // tables (same decode as
@@ -1679,6 +1684,10 @@ pub(crate) fn const_ref_slots_at_pc_at(
         let Some(jc) = sd.jitcodes.get(jitcode_index as usize) else {
             return Vec::new();
         };
+        // #73 S3.5: expand a tagged branch `orgpc` word to the block-head marker
+        // before the `>= 0` / offset uses below. No-op for offsets /
+        // NO_JITCODE_PC (flip-off), so byte-identical when off.
+        let jitcode_pc = crate::jitcode_dispatch::expand_branch_carried(&jc.payload, jitcode_pc);
         let real_pc = if jitcode_pc != majit_ir::resumedata::NO_JITCODE_PC && jitcode_pc >= 0 {
             let jp = jitcode_pc as usize;
             if jc.payload.jitcode.can_decode_live_vars(jp, sd.op_live) {

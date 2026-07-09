@@ -93,6 +93,31 @@ pub const AFTER_RESIDUAL_CALL_PC_FLAG: i32 = 1 << 14;
 /// word stays populated for interpreter re-entry / `last_instr`.
 pub const NO_JITCODE_PC: i32 = -1;
 
+/// #73: a depth-0 branch guard's resume word may carry the walk's
+/// arm-independent `-live-` BEFORE anchor (`orgpc`) plus the GuardTrue/False
+/// flavor, tagged into the free negative space of the `jitcode_pc` word
+/// (offsets are >=0, NO_JITCODE_PC is -1). Decode expands it to the block-head
+/// resume marker. `orgpc` must be <= BRANCH_ORGPC_MAX to stay in i16 range.
+pub const BRANCH_ORGPC_MAX: usize = 16382;
+
+/// Tag `orgpc` (+ 1 flavor bit) into the free negative space `[-32767, -2]` of
+/// the `jitcode_pc` word. `orgpc` must be `<= BRANCH_ORGPC_MAX`.
+pub const fn encode_branch_orgpc(orgpc: usize, flavor_guard_true: bool) -> i32 {
+    // orgpc in [0, BRANCH_ORGPC_MAX], 1 flavor bit -> [-32767, -2]
+    -2 - (((orgpc as i32) << 1) | (flavor_guard_true as i32))
+}
+
+/// Inverse of [`encode_branch_orgpc`]. Returns `Some((orgpc, flavor))` for a
+/// tagged word (`<= -2`), `None` for offsets (`>= 0`) and NO_JITCODE_PC (`-1`).
+pub const fn decode_branch_orgpc(word: i32) -> Option<(usize, bool)> {
+    if word <= -2 {
+        let v = (-2 - word) as usize;
+        Some((v >> 1, (v & 1) == 1))
+    } else {
+        None
+    }
+}
+
 /// Fold the after-residual-call marker into a snapshot frame pc word.
 /// `pc` must be a non-negative Python PC `< AFTER_RESIDUAL_CALL_PC_FLAG`.
 /// The bound is enforced in release builds, not only under `debug_assert`,
@@ -608,5 +633,48 @@ mod after_residual_call_pc_tests {
         // a raw pc with bit 14 set is indistinguishable from a marked pc at
         // decode, so an unmarked stored pc >= the flag would be mis-read.
         assert_eq!(decode_resume_pc(AFTER_RESIDUAL_CALL_PC_FLAG), (0, true));
+    }
+}
+
+#[cfg(test)]
+mod branch_orgpc_tag_tests {
+    use super::{
+        BRANCH_ORGPC_MAX, NO_JITCODE_PC, decode_branch_orgpc, encode_branch_orgpc,
+    };
+
+    #[test]
+    fn roundtrips_across_orgpc_and_flavor() {
+        // #73 S3.5: every (orgpc, flavor) in range tags into the negative space
+        // and decodes back exactly, including the two endpoints.
+        for orgpc in [0usize, 1, 2, 7, 100, 8191, BRANCH_ORGPC_MAX - 1, BRANCH_ORGPC_MAX] {
+            for flavor in [false, true] {
+                let word = encode_branch_orgpc(orgpc, flavor);
+                assert!(word <= -2, "tagged word {word} must land in negative space");
+                assert_eq!(decode_branch_orgpc(word), Some((orgpc, flavor)));
+            }
+        }
+    }
+
+    #[test]
+    fn tagged_words_stay_in_i16_range() {
+        // The word is serialized by `append_int`, which asserts i16 range.
+        for orgpc in [0usize, BRANCH_ORGPC_MAX] {
+            for flavor in [false, true] {
+                let word = encode_branch_orgpc(orgpc, flavor);
+                assert!(
+                    word >= i16::MIN as i32 && word <= i16::MAX as i32,
+                    "tagged word {word} out of i16 range"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn non_tagged_words_decode_none() {
+        // Offsets (>=0) and NO_JITCODE_PC (-1) are NOT tagged: decode returns
+        // None so the expand at decode is a pure no-op for them.
+        for word in [0, 5, 32767, NO_JITCODE_PC] {
+            assert_eq!(decode_branch_orgpc(word), None);
+        }
     }
 }
