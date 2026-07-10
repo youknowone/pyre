@@ -538,6 +538,9 @@ pub struct ReconstructRecipe {
     pub code_ptr: *const (),
     pub jitcode_index: i32,
     pub pc: usize,
+    /// Guard-carried JitCode offset from the decoded resume frame;
+    /// `majit_ir::resumedata::NO_JITCODE_PC` when the frame carried none.
+    pub jitcode_pc: i32,
     pub nlocals: usize,
     pub valuestackdepth: usize,
     pub registers_i: Vec<OpRef>,
@@ -559,6 +562,9 @@ pub struct BridgeInlineCarrier {
     /// pc; the root must instead resume at its own `frames[0].pc`, so this is
     /// threaded separately rather than derived from the trace start pc.
     pub root_pc: usize,
+    /// Guard-carried JitCode offset from `resume_data.frames[0]`;
+    /// `majit_ir::resumedata::NO_JITCODE_PC` when the frame carried none.
+    pub root_jitcode_pc: i32,
     /// `resume_data.frames[1..]`, OUTERMOST-FIRST. The portal (`frames[0]`)
     /// is NOT here — it is the caller-visible root `sym`.
     pub recipes: Vec<ReconstructRecipe>,

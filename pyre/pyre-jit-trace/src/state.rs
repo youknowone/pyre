@@ -5643,6 +5643,7 @@ fn reconstruct_inline_recipe(
             code_ptr: raw_code as *const (),
             jitcode_index: frame.jitcode_index,
             pc: frame.pc as usize,
+            jitcode_pc: frame.jitcode_pc,
             nlocals,
             valuestackdepth,
             registers_i: Vec::new(),
@@ -5826,6 +5827,7 @@ fn reconstruct_inline_recipe(
         code_ptr: raw_code as *const (),
         jitcode_index: frame.jitcode_index,
         pc: frame.pc as usize,
+        jitcode_pc: frame.jitcode_pc,
         nlocals,
         valuestackdepth,
         registers_i,
@@ -8652,6 +8654,7 @@ impl JitState for PyreJitState {
             } else {
                 0
             };
+            let root_jitcode_pc = resume_data.frames[0].jitcode_pc;
             let mut recipes: Vec<ReconstructRecipe> =
                 Vec::with_capacity(resume_data.frames.len() - 1);
             let mut ok = root_pc_valid;
@@ -8688,7 +8691,11 @@ impl JitState for PyreJitState {
                 // instead, degrading to the blackhole re-interpret.
                 recipes.clear();
             }
-            ctx.set_bridge_inline_carrier(BridgeInlineCarrier { root_pc, recipes });
+            ctx.set_bridge_inline_carrier(BridgeInlineCarrier {
+                root_pc,
+                root_jitcode_pc,
+                recipes,
+            });
         }
     }
 
