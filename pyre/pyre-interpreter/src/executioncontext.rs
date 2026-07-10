@@ -2357,7 +2357,12 @@ impl UserDelAction {
             let w_obj = self.finalizer_queue.next_dead();
             match w_obj {
                 None => break,
-                Some(w) => self._call_finalizer(w),
+                Some(w) => {
+                    // The deque entry was the object's only root; pin it across the __del__ call.
+                    let _roots = pyre_object::gc_roots::push_roots();
+                    pyre_object::gc_roots::pin_root(w);
+                    self._call_finalizer(w);
+                }
             }
         }
     }

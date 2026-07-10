@@ -1535,12 +1535,25 @@ fn str_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         args[0]
     };
     let value = crate::builtins::builtin_str(&args[1..])?;
-    if cls.is_null() || !unsafe { pyre_object::is_type(cls) } {
+    if cls.is_null() {
         return Ok(value);
     }
     let str_typeobj = gettypefor(&pyre_object::STR_TYPE);
     if str_typeobj.map_or(false, |t| std::ptr::eq(cls, t)) {
         return Ok(value);
+    }
+    if !unsafe { pyre_object::is_type(cls) } {
+        return Err(crate::PyError::type_error(
+            "str.__new__(X): X is not a subtype of str",
+        ));
+    }
+    if let Some(w_str) = str_typeobj {
+        if !unsafe { crate::baseobjspace::issubtype_w(cls, w_str) } {
+            let cls_name = unsafe { pyre_object::w_type_get_name(cls) };
+            return Err(crate::PyError::type_error(format!(
+                "str.__new__({cls_name}): {cls_name} is not a subtype of str"
+            )));
+        }
     }
     let contents = unsafe { pyre_object::w_str_get_wtf8(value) }.to_wtf8_buf();
     Ok(pyre_object::w_str_subclass_from_wtf8(contents, cls))

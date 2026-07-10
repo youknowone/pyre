@@ -105,35 +105,43 @@ struct CodecException {
     w_end: PyObjectRef,
     start: usize,
     end: usize,
-    kind: pyre_object::interp_exceptions::ExcKind,
+    kind: Option<pyre_object::interp_exceptions::ExcKind>,
 }
 
 fn check_exception(w_exc: PyObjectRef) -> Result<CodecException, crate::PyError> {
-    let w_start = crate::baseobjspace::getattr_str(w_exc, "start")
-        .map_err(|_| crate::PyError::type_error("wrong exception"))?;
-    let w_end = crate::baseobjspace::getattr_str(w_exc, "end")
-        .map_err(|_| crate::PyError::type_error("wrong exception"))?;
-    let w_obj = crate::baseobjspace::getattr_str(w_exc, "object")
-        .map_err(|_| crate::PyError::type_error("wrong exception"))?;
-    let start = crate::baseobjspace::int_w(w_start)
-        .map_err(|_| crate::PyError::type_error("wrong exception"))?;
-    let end = crate::baseobjspace::int_w(w_end)
-        .map_err(|_| crate::PyError::type_error("wrong exception"))?;
-    if start < 0
-        || end < start
+    let map_attr_error = |err: crate::PyError| {
+        if err.kind == crate::PyErrorKind::AttributeError {
+            crate::PyError::type_error("wrong exception")
+        } else {
+            err
+        }
+    };
+    let w_start = crate::baseobjspace::getattr_str(w_exc, "start").map_err(map_attr_error)?;
+    let w_end = crate::baseobjspace::getattr_str(w_exc, "end").map_err(map_attr_error)?;
+    let w_obj = crate::baseobjspace::getattr_str(w_exc, "object").map_err(map_attr_error)?;
+    let start_i64 = crate::baseobjspace::int_w(w_start)?;
+    let end_i64 = crate::baseobjspace::int_w(w_end)?;
+    if end_i64 - start_i64 < 0
         || !(unsafe { crate::baseobjspace::isinstance_str_w(w_obj) }
             || unsafe { crate::baseobjspace::isinstance_bytes_w(w_obj) })
-        || !unsafe { pyre_object::is_exception(w_exc) }
     {
         return Err(crate::PyError::type_error("wrong exception"));
     }
+    let kind = if unsafe { pyre_object::is_exception(w_exc) } {
+        Some(unsafe { pyre_object::interp_exceptions::w_exception_get_kind(w_exc) })
+    } else {
+        None
+    };
+    // Bounds are clamped like the C accessors so Rust slicing stays in range.
+    let start = start_i64.max(0) as usize;
+    let end = end_i64.max(start_i64.max(0)) as usize;
     Ok(CodecException {
         w_exc,
         w_obj,
         w_end,
-        start: start as usize,
-        end: end as usize,
-        kind: unsafe { pyre_object::interp_exceptions::w_exception_get_kind(w_exc) },
+        start,
+        end,
+        kind,
     })
 }
 
@@ -150,7 +158,13 @@ fn codec_result(replacement: PyObjectRef, position: PyObjectRef) -> PyObjectRef 
 
 fn strict_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let exc = codec_error_arg(args)?;
-    Err(unsafe { crate::PyError::from_exc_object(exc.w_exc) })
+    if unsafe { pyre_object::is_exception(exc.w_exc) } {
+        Err(unsafe { crate::PyError::from_exc_object(exc.w_exc) })
+    } else {
+        Err(crate::PyError::type_error(
+            "codec must pass exception instance",
+        ))
+    }
 }
 
 fn ignore_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -186,9 +200,13 @@ fn replace_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let exc = codec_error_arg(args)?;
     let size = exc.end - exc.start;
     let replacement = match exc.kind {
-        pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError => "?".repeat(size),
-        pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError => "\u{fffd}".to_string(),
-        pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError => "\u{fffd}".repeat(size),
+        Some(pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError) => "?".repeat(size),
+        Some(pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError) => {
+            "\u{fffd}".to_string()
+        }
+        Some(pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError) => {
+            "\u{fffd}".repeat(size)
+        }
         _ => {
             return Err(crate::PyError::type_error(
                 "don't know how to handle exception in error callback",
@@ -200,7 +218,7 @@ fn replace_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 fn xmlcharrefreplace_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let exc = codec_error_arg(args)?;
-    if exc.kind != pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError {
+    if exc.kind != Some(pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError) {
         return Err(crate::PyError::type_error(
             "don't know how to handle exception in error callback",
         ));
@@ -215,17 +233,21 @@ fn xmlcharrefreplace_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 fn backslashreplace_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let exc = codec_error_arg(args)?;
     let replacement = match exc.kind {
-        pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError
-        | pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError => error_codepoints(&exc)?
-            .into_iter()
-            .map(raw_unicode_escape)
-            .collect::<String>(),
-        pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError => {
+        Some(pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError)
+        | Some(pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError) => {
+            error_codepoints(&exc)?
+                .into_iter()
+                .map(raw_unicode_escape)
+                .collect::<String>()
+        }
+        Some(pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError) => {
             if !unsafe { pyre_object::is_bytes(exc.w_obj) } {
                 return Err(crate::PyError::type_error("wrong exception"));
             }
             let data = unsafe { w_bytes_data(exc.w_obj) };
-            data[exc.start..exc.end]
+            let end = exc.end.min(data.len());
+            let start = exc.start.min(end);
+            data[start..end]
                 .iter()
                 .map(|&byte| raw_unicode_escape(byte as u32))
                 .collect::<String>()
@@ -241,7 +263,7 @@ fn backslashreplace_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 
 fn namereplace_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let exc = codec_error_arg(args)?;
-    if exc.kind != pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError {
+    if exc.kind != Some(pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError) {
         return Err(crate::PyError::type_error(
             "don't know how to handle exception in error callback",
         ));
@@ -301,9 +323,9 @@ fn exception_encoding(exc: &CodecException) -> Result<(usize, StandardEncoding),
 
 fn surrogatepass_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let exc = codec_error_arg(args)?;
-    let (byte_len, encoding) = exception_encoding(&exc)?;
     match exc.kind {
-        pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError => {
+        Some(pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError) => {
+            let (_byte_len, encoding) = exception_encoding(&exc)?;
             let mut replacement = Vec::new();
             for code in error_codepoints(&exc)? {
                 if !(0xD800..=0xDFFF).contains(&code) {
@@ -327,7 +349,8 @@ fn surrogatepass_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
             }
             Ok(codec_result(w_bytes_from_bytes(&replacement), exc.w_end))
         }
-        pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError => {
+        Some(pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError) => {
+            let (byte_len, encoding) = exception_encoding(&exc)?;
             if !unsafe { pyre_object::is_bytes(exc.w_obj) } {
                 return Err(crate::PyError::type_error("wrong exception"));
             }
@@ -371,7 +394,7 @@ fn surrogatepass_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 fn surrogateescape_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let exc = codec_error_arg(args)?;
     match exc.kind {
-        pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError => {
+        Some(pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError) => {
             let mut replacement = Vec::new();
             for code in error_codepoints(&exc)? {
                 if !(0xDC80..=0xDCFF).contains(&code) {
@@ -381,14 +404,15 @@ fn surrogateescape_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             }
             Ok(codec_result(w_bytes_from_bytes(&replacement), exc.w_end))
         }
-        pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError => {
+        Some(pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError) => {
             if !unsafe { pyre_object::is_bytes(exc.w_obj) } {
                 return Err(crate::PyError::type_error("wrong exception"));
             }
             let data = unsafe { w_bytes_data(exc.w_obj) };
             let mut replacement = Wtf8Buf::new();
             let mut consumed = 0usize;
-            while consumed < 4 && exc.start + consumed < exc.end {
+            while consumed < 4 && exc.start + consumed < exc.end && exc.start + consumed < data.len()
+            {
                 let byte = data[exc.start + consumed];
                 if byte < 128 {
                     break;

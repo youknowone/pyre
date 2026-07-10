@@ -78,7 +78,9 @@ Options:
 -I     : isolate Python from the user's environment
 -O     : optimize (no-op, reserved for compatibility)
 -q     : don't print version on interactive startup
+-s     : don't add user site directory to sys.path
 -S     : don't imply 'import site' on initialization
+-P     : don't prepend a potentially unsafe path to sys.path
 -V     : print the Python version number and exit (also --version)
 -X opt : set implementation-specific option
 file   : program read from script file
@@ -144,7 +146,9 @@ fn parse_args(binary_name: &str) -> Result<(RunMode, LaunchFlags, Vec<String>), 
             }
             Short('O') => {} // no-op
             Short('q') => flags.quiet = true,
+            Short('s') => flags.no_user_site = true,
             Short('S') => flags.no_site = true,
+            Short('P') => flags.safe_path = true,
             Short('V') | Long("version") => {
                 println!("{binary_name} 0.0.1");
                 std::process::exit(0);

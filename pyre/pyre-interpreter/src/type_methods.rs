@@ -2449,11 +2449,7 @@ pub fn decode_raw_unicode_escape(data: &[u8], errors: &str) -> Result<Wtf8Buf, c
                 i = available_end;
                 continue;
             }
-            let error_end = if available_end < digits_start + want {
-                hex_end
-            } else {
-                available_end
-            };
+            let error_end = if numeric.is_some() { available_end } else { hex_end };
             let reason = if numeric.is_some() {
                 "illegal Unicode character"
             } else if want == 4 {
@@ -2482,9 +2478,14 @@ pub fn decode_raw_unicode_escape(data: &[u8], errors: &str) -> Result<Wtf8Buf, c
             i = error_end;
             continue;
         }
-        // Not a valid escape — emit the backslash literally as Latin-1.
+        // Not a valid escape — emit both bytes literally as Latin-1.
         out.push_char(b as char);
-        i += 1;
+        if let Some(next) = kind {
+            out.push_char(next as char);
+            i += 2;
+        } else {
+            i += 1;
+        }
     }
     Ok(out)
 }
