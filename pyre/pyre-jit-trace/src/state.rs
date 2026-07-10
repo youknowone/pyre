@@ -3449,7 +3449,8 @@ pub(crate) fn trace_float_block_getitem_value(
         return cached;
     }
     let result = ctx.record_op_with_descr(OpCode::GetarrayitemGcF, &[block, index], descr.clone());
-    if let Some(live_value) = array_load_for_cache(ctx, block, index, &descr, majit_ir::Type::Float) {
+    if let Some(live_value) = array_load_for_cache(ctx, block, index, &descr, majit_ir::Type::Float)
+    {
         ctx.set_opref_concrete(result, live_value);
     }
     ctx.heapcache_getarrayitem_now_known(block, index, descr_idx, result);

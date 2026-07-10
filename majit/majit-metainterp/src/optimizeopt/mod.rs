@@ -6928,9 +6928,9 @@ impl OptContext {
     /// read on an existing producer is sufficient.  Until then this lookup
     /// is the read-only counterpart of `resoperation.py:719/727/739
     /// InputArg{Int,Ref,Float}.type` — it must not materialize a fresh
-    /// Box, because the materialization path keys the new Box's type
-    /// off the OpRef variant tag (mod.rs:3791) and a Phase 2 context
-    /// referencing a Phase 1 low slot can mismatch that tag against
+    /// operand, because the materialization path (`materialize_operand_at`)
+    /// keys the new operand's type off the OpRef variant tag and a Phase 2
+    /// context referencing a Phase 1 low slot can mismatch that tag against
     /// the canonical `inputarg_types[idx]`.
     pub fn inputarg_type(&self, opref: OpRef) -> Option<majit_ir::Type> {
         if opref.is_none() || opref.is_constant() {
