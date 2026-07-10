@@ -1074,7 +1074,39 @@ fn run_perfn_walk(
         eprintln!("[walk-perfn] no per-CodeObject PyJitCode for code={w_code:?}");
         return None;
     };
-    let Some(pc_map_entry) = pjc.resume_jitcode_pc_for(start_pc) else {
+    // The green stays in Python-bytecode coordinates for merge-point matching;
+    // the codewrite-time loop-header sidecar carries its trace-entry JitCode
+    // coordinate for the plain-portal loop-header leg. A bridge starts at its
+    // guard resume py_pc, and a recursive portal may start at function entry;
+    // both are outside that sidecar by construction, so they keep the runtime
+    // derivation (and the bridge-walk override below when present).
+    let is_plain_portal = !ctx.is_bridge_trace;
+    let is_loop_header =
+        !pjc.code_ptr.is_null() && start_pc_is_loop_header(unsafe { &*pjc.code_ptr }, start_pc);
+    let uses_entry_sidecar = is_plain_portal && is_loop_header;
+    let sidecar_entry = pjc.merge_entry_for(start_pc);
+    if uses_entry_sidecar && crate::jitcode_dispatch::m73_entry_audit_enabled() {
+        let derived = pjc.resume_jitcode_pc_for(start_pc);
+        if sidecar_entry != derived {
+            crate::jitcode_dispatch::census_record("M73EntryAudit::Mismatch");
+            eprintln!(
+                "[m73-entry-audit] start_pc={start_pc} sidecar={sidecar_entry:?} derived={derived:?}"
+            );
+        }
+    }
+    let pc_map_entry = if uses_entry_sidecar && crate::jitcode_dispatch::m73_entry_carry_enabled() {
+        sidecar_entry
+    } else {
+        // Bridge resume: `start_pc` is the guard's py_pc, not a loop-header
+        // green — outside the sidecar by construction. The carried coordinate
+        // for this leg is `sym.bridge_walk_entry_pc` (used below when present);
+        // retiring this residual derivation needs the carried `frame0.jitcode_pc`
+        // generalized to every bridge resume, a separate #73 front.
+        // A recursive function-entry portal is likewise not a loop header and
+        // keeps this derivation until that separate entry shape is carried.
+        pjc.resume_jitcode_pc_for(start_pc)
+    };
+    let Some(pc_map_entry) = pc_map_entry else {
         // The frozen pc_map of this already-built body does not encode
         // `start_pc` as a resume coordinate, so the same body walked from
         // the same entry recurs identically on every retrace.  Decline the

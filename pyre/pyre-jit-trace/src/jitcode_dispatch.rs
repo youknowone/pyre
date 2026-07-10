@@ -9296,6 +9296,27 @@ pub(crate) fn m73_branch_carry_enabled() -> bool {
     })
 }
 
+/// `PYRE_M73_ENTRY_AUDIT` (#73 entry-carry E1, default OFF): compare the
+/// codewrite-time green → trace-entry sidecar with runtime resume-marker
+/// derivation at each plain-portal loop-header walk entry.
+pub(crate) fn m73_entry_audit_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_M73_ENTRY_AUDIT").is_some())
+}
+
+/// `PYRE_M73_ENTRY_CARRY` (#73 entry-carry E1, default ON): source a plain
+/// portal loop-header walk's entry coordinate from the codewrite-time sidecar.
+pub(crate) fn m73_entry_carry_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M73_ENTRY_CARRY") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => true,
+    })
+}
+
 pub(crate) fn python_pc_for_jitcode_pc(metadata: &crate::PyJitCodeMetadata, jit_pc: usize) -> u32 {
     // Exact inverse: `first_jit_pc_by_py_pc[py]` is the byte offset of the
     // FIRST instruction opcode `py` emitted (`usize::MAX` = the PC emitted

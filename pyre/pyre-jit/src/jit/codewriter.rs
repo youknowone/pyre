@@ -12571,6 +12571,31 @@ impl CodeWriter {
             .map(|(py, &dense)| (py as u32, dense))
             .collect();
 
+        // Per-loop-header green → walk-entry sidecar. Resolve each entry
+        // with the runtime translator's exact precedence while the codewriter
+        // still owns the marker tables: sparse carry-forward override first,
+        // otherwise the derivable resume marker. This is deliberately only
+        // the set of trace-entry greens, not a general coordinate inverse.
+        let mut loop_header_pcs: Vec<usize> = find_loop_header_pcs(code).iter().copied().collect();
+        loop_header_pcs.sort_unstable();
+        let merge_entry_by_green: Vec<(u32, u32)> = loop_header_pcs
+            .into_iter()
+            .filter_map(|py_pc| {
+                let off = carryfwd_resume_pc
+                    .binary_search_by_key(&(py_pc as u32), |&(py, _)| py)
+                    .ok()
+                    .map(|i| carryfwd_resume_pc[i].1)
+                    .or_else(|| {
+                        pyre_jit_trace::pyjitcode::derive_resume_marker(
+                            &first_jit_pc_by_py_pc,
+                            &block_head_py_by_jit_pc,
+                            py_pc,
+                        )
+                    });
+                off.map(|off| (py_pc as u32, off as u32))
+            })
+            .collect();
+
         // task#50 phase-1: predecessor-keyed jitcode-pc twins of
         // `pcdep_color_slots` and `depth_at_pc`, resolving a JitCode byte
         // offset the way `python_pc_for_jitcode_pc` does — the block-head marker
@@ -12714,6 +12739,7 @@ impl CodeWriter {
             first_jit_pc_by_py_pc,
             block_head_py_by_jit_pc,
             carryfwd_resume_pc,
+            merge_entry_by_green,
             depth_at_py_pc: depth_at_pc,
             pcdep_by_jit_pc,
             depth_pred_by_jit_pc,
