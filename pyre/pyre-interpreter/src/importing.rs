@@ -18,7 +18,7 @@ use std::path::PathBuf;
 #[cfg(feature = "host_env")]
 use std::path::Path;
 
-use crate::{CodeObject, Mode, compile_source_with_filename};
+use crate::{CodeObject, Mode, PyFrame, compile_source_with_filename};
 use crate::{DictStorage, PyExecutionContext, dict_storage_store};
 use pyre_object::*;
 
@@ -1757,11 +1757,44 @@ fn absolute_import(
     })
 }
 
+// ── IMPORT_NAME ──────────────────────────────────────────────────────
+
+/// PyPy equivalent: pyopcode.py `IMPORT_NAME`.
+pub fn import_name(
+    frame: &mut PyFrame,
+    name: &str,
+    w_fromlist: PyObjectRef,
+    w_flag: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    let w_builtin = frame.w_builtin;
+    let w_import = if !w_builtin.is_null() && unsafe { is_module(w_builtin) } {
+        let w_dict = unsafe { pyre_object::w_module_get_w_dict(w_builtin) };
+        if w_dict.is_null() {
+            None
+        } else {
+            crate::baseobjspace::finditem_str(w_dict, "__import__")?
+        }
+    } else {
+        None
+    }
+    .ok_or_else(|| crate::PyError::new(crate::PyErrorKind::ImportError, "__import__ not found"))?;
+
+    let w_locals = match frame.getdebug() {
+        Some(d) if !d.w_locals.is_null() => d.w_locals,
+        _ => pyre_object::w_none(),
+    };
+    let w_globals = frame.get_w_globals();
+    let w_modulename = pyre_object::w_str_new(name);
+
+    crate::call::call_callable(
+        frame,
+        w_import,
+        &[w_modulename, w_globals, w_locals, w_fromlist, w_flag],
+    )
+}
+
 // ── importhook ───────────────────────────────────────────────────────
 // PyPy equivalent: importing.py `importhook()`
-//
-// Main entry point called by the IMPORT_NAME opcode.
-// Stack: [level, fromlist] → [module]
 
 pub fn importhook(
     name: &str,

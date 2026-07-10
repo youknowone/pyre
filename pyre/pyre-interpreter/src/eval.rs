@@ -2705,21 +2705,9 @@ impl OpcodeStepExecutor for PyFrame {
 
     fn import_name(&mut self, name: &str) -> Result<(), PyError> {
         let w_fromlist = self.pop();
-        let w_level = self.pop();
-        let level = if unsafe { pyre_object::is_int(w_level) } {
-            unsafe { pyre_object::w_int_get_value(w_level) }
-        } else {
-            0
-        };
-
-        let module = crate::importing::importhook(
-            name,
-            self.get_w_globals(), // for relative imports: __name__/__package__
-            w_fromlist,
-            level,
-            self.execution_context,
-        )?;
-        self.push(module);
+        let w_flag = self.pop();
+        let w_obj = crate::importing::import_name(self, name, w_fromlist, w_flag)?;
+        self.push(w_obj);
         Ok(())
     }
 

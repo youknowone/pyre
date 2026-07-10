@@ -4101,10 +4101,9 @@ pub extern "C" fn bh_delete_attr_fn(obj: i64, w_code_ptr: i64, name_idx: i64) ->
 
 /// IMPORT_NAME residual (`import_name` HLOp → `residual_call_ir_r`).
 /// Resolves the module name from the jitcode's own code object via
-/// `name_idx` (same `co_names` invariant as `bh_load_attr_fn`), reads the
-/// importing frame's `__name__`/`__package__` (for relative imports) from the
-/// threaded `frame_ptr`, and runs `importhook` with the TLS-pinned execution
-/// context the eval loop stamps on entry.  Importing a module may run its
+/// `name_idx` (same `co_names` invariant as `bh_load_attr_fn`), fetches
+/// `__import__` from the threaded frame's builtins, and calls it with the
+/// frame's globals and locals. Importing a module may run its
 /// top-level Python (`MayForce`); on error the exception is published
 /// through `BH_LAST_EXC_VALUE` for the trailing `GuardNoException` and the
 /// call returns 0.  `fromlist` and `level` are the two popped operands
@@ -4130,33 +4129,16 @@ pub extern "C" fn bh_import_name_fn(
         return 0;
     }
     let name = code.names[idx].as_ref();
-    // `import_name` reads the importing frame's globals for relative-import
-    // package resolution (`__name__` / `__package__`).  Read them from the
-    // live red frame passed as an explicit Ref argument — mirroring
-    // `bh_load_global_fn` — rather than `getexecutioncontext().gettopframe()`,
-    // which collapses to the wrong frame for an inlined non-portal callee.
-    // `w_globals` must be the wrapped dict object `resolve_package_name` does
-    // `finditem_str` against (not the raw DictStorage), so resolve it through
-    // `get_w_globals`.
     let frame = frame_ptr as *mut PyFrame;
-    let w_globals = if frame.is_null() {
-        pyre_object::PY_NULL
-    } else {
-        unsafe { (*frame).get_w_globals() }
-    };
-    let ec = pyre_interpreter::call::getexecutioncontext();
-    let w_level = level as pyre_object::PyObjectRef;
-    let level = if unsafe { pyre_object::is_int(w_level) } {
-        unsafe { pyre_object::w_int_get_value(w_level) }
-    } else {
-        0
-    };
-    match pyre_interpreter::importing::importhook(
+    debug_assert!(!frame.is_null(), "IMPORT_NAME requires a live frame");
+    if frame.is_null() {
+        return 0;
+    }
+    match pyre_interpreter::importing::import_name(
+        unsafe { &mut *frame },
         name,
-        w_globals,
         fromlist as pyre_object::PyObjectRef,
-        level,
-        ec,
+        level as pyre_object::PyObjectRef,
     ) {
         Ok(module) => module as i64,
         Err(err) => {
