@@ -1317,21 +1317,34 @@ fn memoryview_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::typedef::bytes_method_hex(&fwd)
 }
 
-/// `memoryview.__hash__` — `descr_hash`: a writable view is unhashable;
-/// a read-only view hashes its raw bytes (so `hash(mv) == hash(bytes)`).
+/// `descr_hash` (memoryobject.py:476) — a writable view is unhashable; a
+/// read-only view hashes its raw bytes (so `hash(mv) == hash(bytes)`),
+/// cached in `self._hash` with the `-1` sentinel (`_hash_str` never returns
+/// `-1`) — the release / readonly checks run only on the first call, and a
+/// view hashed before `release()` keeps hashing afterwards.
+unsafe fn memoryview_hash_value(mv: PyObjectRef) -> Result<i64, crate::PyError> {
+    unsafe {
+        let mut hash = pyre_object::memoryview::w_memoryview_hash(mv);
+        if hash == -1 {
+            memoryview_check_released(mv)?;
+            if !pyre_object::memoryview::w_memoryview_readonly(mv) {
+                return Err(crate::PyError::value_error(
+                    "cannot hash writable memoryview object",
+                ));
+            }
+            // `compute_hash(self.view.as_str())` — the same content digest the
+            // bytes path uses, so `hash(memoryview(b)) == hash(b)`.
+            hash = hash_str_bytes(&memoryview_gather_bytes(mv));
+            pyre_object::memoryview::w_memoryview_set_hash(mv, hash);
+        }
+        Ok(hash)
+    }
+}
+
+/// `memoryview.__hash__` — see [`memoryview_hash_value`].
 fn memoryview_hash(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mv = args.first().copied().unwrap_or(w_none());
-    unsafe {
-        memoryview_check_released(mv)?;
-        if !pyre_object::memoryview::w_memoryview_readonly(mv) {
-            return Err(crate::PyError::value_error(
-                "cannot hash writable memoryview object",
-            ));
-        }
-        // `compute_hash(self.view.as_str())` — the same content digest the
-        // bytes path uses, so `hash(memoryview(b)) == hash(b)`.
-        Ok(w_int_new(hash_str_bytes(&memoryview_gather_bytes(mv))))
-    }
+    unsafe { Ok(w_int_new(memoryview_hash_value(mv)?)) }
 }
 
 /// `memoryview.__delitem__` — memoryview does not support item deletion.
@@ -6801,15 +6814,9 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
             )));
         }
         if pyre_object::memoryview::is_w_memoryview(obj) {
-            // `descr_hash` — released views and writable views are
-            // unhashable; a read-only view hashes its raw bytes.
-            memoryview_check_released(obj)?;
-            if !pyre_object::memoryview::w_memoryview_readonly(obj) {
-                return Err(crate::PyError::value_error(
-                    "cannot hash writable memoryview object",
-                ));
-            }
-            return Ok(_hash_str(&memoryview_gather_bytes(obj)));
+            // `descr_hash` — released and writable views are unhashable; a
+            // read-only view hashes its raw bytes, cached in `_hash`.
+            return memoryview_hash_value(obj);
         }
         if is_tuple(obj) {
             let n = w_tuple_len(obj);

@@ -28,6 +28,9 @@ pub struct W_MemoryView {
     /// geometry and backing live here, off the GC heap, reached by the custom
     /// trace.
     pub view: *const BufferView,
+    /// `self._hash` — the cached content hash, `-1` until computed
+    /// (`memoryobject.py:92`).
+    pub w_hash: i64,
     /// Flips on `release()` / context-manager exit.
     pub released: bool,
 }
@@ -59,6 +62,7 @@ pub fn w_memoryview_alloc_header(released: bool) -> PyObjectRef {
             w_class: crate::pyobject::get_instantiate(&MEMORYVIEW_TYPE),
         },
         view: std::ptr::null(),
+        w_hash: -1,
         released,
     };
     let raw = crate::gc_hook::try_gc_alloc_stable_raw(
@@ -152,6 +156,27 @@ mv_view_scalar!(w_memoryview_readonly, readonly, bool);
 #[inline]
 pub unsafe fn w_memoryview_released(obj: PyObjectRef) -> bool {
     unsafe { (*(obj as *const W_MemoryView)).released }
+}
+
+/// The cached content hash (`self._hash`), `-1` until computed.
+///
+/// # Safety
+/// `obj` must point to a valid `W_MemoryView`.
+#[inline]
+pub unsafe fn w_memoryview_hash(obj: PyObjectRef) -> i64 {
+    unsafe { (*(obj as *const W_MemoryView)).w_hash }
+}
+
+/// Store the computed content hash.  A plain scalar store — no write
+/// barrier (a barrier guards `PyObjectRef` stores only).
+///
+/// # Safety
+/// `obj` must point to a valid `W_MemoryView`.
+#[inline]
+pub unsafe fn w_memoryview_set_hash(obj: PyObjectRef, hash: i64) {
+    unsafe {
+        (*(obj as *mut W_MemoryView)).w_hash = hash;
+    }
 }
 
 /// Release the view: drop the off-heap `BufferView` box (reclaiming any

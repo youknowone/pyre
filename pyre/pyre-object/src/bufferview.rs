@@ -271,9 +271,7 @@ impl BufferView {
         unsafe {
             match self {
                 BufferView::Simple { .. } => 1,
-                BufferView::Raw { itemsize, .. } | BufferView::View1D { itemsize, .. } => {
-                    *itemsize
-                }
+                BufferView::Raw { itemsize, .. } | BufferView::View1D { itemsize, .. } => *itemsize,
                 BufferView::Slice { parent, step, .. } => parent.stride0() * *step,
                 BufferView::ViewND {
                     parent, w_strides, ..
@@ -383,9 +381,7 @@ impl BufferView {
             length: slicelength,
         };
         match self {
-            BufferView::Simple {
-                backing, w_obj, ..
-            } if step == 1 => BufferView::Simple {
+            BufferView::Simple { backing, w_obj, .. } if step == 1 => BufferView::Simple {
                 backing: Buffer::sub(backing.clone(), start as usize, slicelength),
                 w_obj: *w_obj,
                 length: slicelength,
