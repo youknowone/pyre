@@ -3870,8 +3870,8 @@ pub(crate) fn flush_walk_end_state_to_frame_with_item(
 }
 
 /// gh#467 forward-flush AT an inlined-callee CALL boundary.  When an
-/// `abort_permanent` marker fires inside an inline sub-walk whose callee
-/// committed no heap effect, the outer frame is flushed as of the CALL that
+/// supported abort fires inside an inline sub-walk whose callee executed no
+/// concrete effect, the outer frame is flushed as of the CALL that
 /// entered the callee: the locals/cells region from the vable shadow (exactly
 /// like [`flush_walk_end_state_to_frame`]), the operand-stack region rebuilt
 /// from the concrete `call_stack` (`[callable, null_or_self, args...]` the

@@ -6222,7 +6222,7 @@ fn try_execute_residual_call_via_executor(
             || heap_write_odometer_before
                 .is_some_and(|before| pyre_interpreter::call::frame_entry_count() != before))
     {
-        fbw_bump_concrete_heap_write();
+        fbw_bump_executed_effect();
     }
     // #73/#267: a user-defined iterator's FOR_ITER runs its item producer
     // (`__next__`/`__getitem__`) as an inline sub-walk whose operand-stack
@@ -7874,25 +7874,22 @@ thread_local! {
     /// the recorded effect.
     static FBW_UNJOURNALED_EFFECT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 
-    /// gh#467 concrete-heap-write odometer: bumped whenever the walk applies a
-    /// heap mutation the store/append/cell journals do NOT cover — a Void /
-    /// mutator-tagged residual executed concretely by
-    /// [`try_execute_residual_call_via_executor`], a residual whose concrete
-    /// run entered a user Python frame (a value-returning dunder that may
-    /// mutate), or an unexecutable residual flagged via
-    /// [`fbw_mark_unjournaled_effect`].  Unlike [`FBW_UNJOURNALED_EFFECT`] (a
-    /// monotone bool) this is a COUNT, so a callee sub-walk's OWN concrete
-    /// effect is detectable even when a prior (pre-CALL) effect already tripped
-    /// the bool.  Read only by the inline abort-forward-flush gate
-    /// (`try_walker_inline_user_call` / gh#467): snapshot at the CALL, compare
-    /// after the sub-walk aborts — a nonzero delta means the callee committed
-    /// an irreversible effect, so re-executing the CALL would double it.
-    static FBW_CONCRETE_HEAP_WRITE_COUNT: std::cell::Cell<usize> =
+    /// gh#467 executed-effect odometer: bumped only when the walk concretely
+    /// applies an effect — a store/append/cell journal push, a Void / mutator-
+    /// tagged residual executed by [`try_execute_residual_call_via_executor`],
+    /// or a residual whose concrete run entered a user Python frame (a value-
+    /// returning dunder that may mutate).  A declined residual recorded only
+    /// symbolically sets [`FBW_UNJOURNALED_EFFECT`] but does NOT move this
+    /// counter: no effect executed.  The inline abort-forward-flush gate
+    /// (`try_walker_inline_user_call` / gh#467) snapshots both signals at the
+    /// CALL.  A nonzero count delta means the callee attempt cannot be
+    /// discarded and re-executed without risking a double.
+    static FBW_EXECUTED_EFFECT_COUNT: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
 
     /// gh#467 inline-abort forward-flush carrier: latched by
-    /// [`try_walker_inline_user_call`] when an `abort_permanent` marker fires
-    /// inside a TOP-level inline sub-walk whose callee committed no heap effect.
+    /// [`try_walker_inline_user_call`] when a supported abort fires inside a
+    /// TOP-level inline sub-walk whose callee executed no concrete effect.
     /// Holds `(outer CALL python pc, [callable, null_or_self, args...])` — the
     /// exact operand stack the interpreter's CALL opcode expects — so the walk
     /// driver can flush the outer frame AT that CALL and resume the interpreter
@@ -7960,9 +7957,9 @@ pub(crate) fn fbw_store_journal_reset() {
     FBW_APPEND_JOURNAL.with(|j| j.borrow_mut().clear());
     FBW_CELL_STORE_JOURNAL.with(|j| j.borrow_mut().clear());
     FBW_UNJOURNALED_EFFECT.with(|c| c.set(false));
-    // gh#467: reset the concrete-heap-write odometer and any stale
+    // gh#467: reset the executed-effect odometer and any stale
     // forward-flush carrier a prior aborted walk latched.
-    FBW_CONCRETE_HEAP_WRITE_COUNT.with(|c| c.set(0));
+    FBW_EXECUTED_EFFECT_COUNT.with(|c| c.set(0));
     FBW_ABORT_CALL_RESUME.with(|c| *c.borrow_mut() = None);
     // #57 Option C: drop any in-flight FOR_ITER items a prior aborted walk
     // left undelivered (its live frame already consumed the delivery), so a
@@ -7993,7 +7990,7 @@ pub(crate) fn fbw_store_journal_push(
     // gh#467: a journaled store still mutated the heap this iteration; the
     // forward-flush gate counts it so a callee sub-walk that appends/setitems
     // cannot be committed-then-re-executed (a double).
-    fbw_bump_concrete_heap_write();
+    fbw_bump_executed_effect();
 }
 
 /// Record the live length a walked eager list append grew past, for the
@@ -8005,7 +8002,7 @@ pub(crate) fn fbw_store_journal_push(
 pub(crate) fn fbw_append_journal_push(list: pyre_object::PyObjectRef, length_before: usize) {
     FBW_APPEND_JOURNAL.with(|j| j.borrow_mut().push((list, length_before)));
     // gh#467: see `fbw_store_journal_push`.
-    fbw_bump_concrete_heap_write();
+    fbw_bump_executed_effect();
 }
 
 /// Record the `intvalue` a walked eager `IntMutableCell` store displaces,
@@ -8021,7 +8018,7 @@ pub(crate) fn fbw_cell_store_journal_push(cell: pyre_object::PyObjectRef, intval
     }
     FBW_CELL_STORE_JOURNAL.with(|j| j.borrow_mut().push((cell, intvalue_before)));
     // gh#467: see `fbw_store_journal_push`.
-    fbw_bump_concrete_heap_write();
+    fbw_bump_executed_effect();
 }
 
 /// Commit-path epilogue: the walk's eager stores and appends stand; drop
@@ -8343,20 +8340,16 @@ pub(crate) fn fbw_store_journal_len() -> usize {
 /// the legacy replay applies (see [`FBW_UNJOURNALED_EFFECT`]).
 pub(crate) fn fbw_mark_unjournaled_effect() {
     FBW_UNJOURNALED_EFFECT.with(|c| c.set(true));
-    // gh#467: an unexecutable residual is also a non-journaled effect the
-    // forward-flush gate must count, so a callee that hits one is detected even
-    // when the monotone bool was already set by a pre-CALL effect.
-    fbw_bump_concrete_heap_write();
 }
 
-/// gh#467 concrete-heap-write odometer read (see [`FBW_CONCRETE_HEAP_WRITE_COUNT`]).
-pub(crate) fn fbw_concrete_heap_write_count() -> usize {
-    FBW_CONCRETE_HEAP_WRITE_COUNT.with(|c| c.get())
+/// gh#467 executed-effect odometer read (see [`FBW_EXECUTED_EFFECT_COUNT`]).
+pub(crate) fn fbw_executed_effect_count() -> usize {
+    FBW_EXECUTED_EFFECT_COUNT.with(|c| c.get())
 }
 
-/// gh#467 bump the concrete-heap-write odometer (see [`FBW_CONCRETE_HEAP_WRITE_COUNT`]).
-pub(crate) fn fbw_bump_concrete_heap_write() {
-    FBW_CONCRETE_HEAP_WRITE_COUNT.with(|c| c.set(c.get() + 1));
+/// gh#467 bump the executed-effect odometer (see [`FBW_EXECUTED_EFFECT_COUNT`]).
+pub(crate) fn fbw_bump_executed_effect() {
+    FBW_EXECUTED_EFFECT_COUNT.with(|c| c.set(c.get() + 1));
 }
 
 /// gh#467 latch the inline-abort forward-flush carrier (see [`FBW_ABORT_CALL_RESUME`]).
@@ -13697,19 +13690,16 @@ fn try_walker_inline_user_call(
     // `do_residual_call` runs the call exactly once (`pyjitpl.py:2019`), so a
     // side-effecting prologue must decline the CA inline (see the arm).
     let prologue_journal_before = fbw_store_journal_len();
-    let prologue_effect_before = fbw_has_unjournaled_effect();
-    // gh#467 forward-flush gate snapshot: the concrete-heap-write odometer AT
-    // the CALL (after this iteration's pre-CALL effects, before the callee
-    // sub-walk).  If the sub-walk aborts on an `abort_permanent` marker WITHOUT
-    // moving this odometer, the callee committed nothing irreversible, so the
-    // walk driver may flush the outer frame at this CALL and re-execute the call
-    // forward instead of replaying the loop from entry (which double-applies the
-    // non-journaled pre-CALL store).  Latched only at the TOP inline level: the
-    // flushed frame is the top-level `cf_addr`, whose operand stack is THIS
-    // call's `[callable, null_or_self, args...]`.  Mirrors the convergence of
-    // `run_blackhole_interp_to_cancel_tracing` (`pyjitpl.py:2949`), minus the
-    // inner-frame rebuild (#126/#215).
-    let concrete_writes_before = fbw_concrete_heap_write_count();
+    let unjournaled_before_subwalk = fbw_has_unjournaled_effect();
+    // gh#467 forward-flush gate snapshots AT the CALL, after this iteration's
+    // pre-CALL effects and before the callee sub-walk.  A sub-walk that aborts
+    // without moving the executed-effect odometer applied nothing concrete;
+    // an unjournaled mark raised inside that discarded attempt describes only
+    // a declined residual and may be discarded with it.  A mark already set at
+    // entry belongs outside the callee and blocks the flush.  Latched only at
+    // the TOP inline level: the flushed frame is the top-level `cf_addr`, whose
+    // operand stack is THIS call's `[callable, null_or_self, args...]`.
+    let executed_effects_before = fbw_executed_effect_count();
     let is_top_inline = !INLINE_SUBWALK_CAPTURE_BOUNDARY.with(|c| c.get());
     // The outer CALL's python pc in the TOP-level frame's code, derived from the
     // FBW snapshot sym at this residual_call's jitcode pc (`op.pc`) — the same
@@ -13906,25 +13896,29 @@ fn try_walker_inline_user_call(
             if std::env::var("PYRE_FBW_INLINE_DIAG").is_ok() {
                 eprintln!("[inline-abort] callee sub-walk err: {e:?}");
             }
-            // gh#467: an `abort_permanent` marker fired inside this top-level
-            // inline sub-walk.  If the callee committed NO irreversible heap
-            // effect (the concrete-heap-write odometer is unmoved since the
-            // CALL), latch the outer CALL boundary so the walk driver flushes
-            // the outer frame there and re-executes the call FORWARD — running
-            // the callee from scratch in the interpreter — instead of rolling
-            // back and replaying the loop from entry, which double-applies the
-            // non-journaled pre-CALL store (the gh#467 defect).  The operand
+            // gh#467: a supported abort fired inside this top-level inline
+            // sub-walk.  If the callee executed NO concrete effect and no
+            // unjournaled effect existed before the attempt, latch the outer
+            // CALL boundary so the walk driver flushes the outer frame there
+            // and re-executes the call FORWARD — running the callee from scratch
+            // in the interpreter — instead of rolling back and replaying the
+            // loop from entry, which double-applies the non-journaled pre-CALL
+            // store.  Discarding a zero-executed-effect callee attempt and
+            // re-running its CALL is observationally identical to upstream
+            // never having inlined it: tracing aborts and `switch_to_blackhole`
+            // re-runs the call (`pyjitpl.py:2949`; gh#467).  The operand
             // stack the CALL opcode expects (`[callable, null_or_self,
             // args...]`) is re-read from the (now GC-forwarded) outer registers,
             // not the pre-sub-walk `arg_concretes`, so it is current after the
-            // sub-walk's allocations.  A callee that DID commit an effect
-            // (odometer moved) keeps the legacy replay — the honest residual
-            // (the inner-frame rebuild is #126/#215).  This is the intermediate
-            // convergence of `run_blackhole_interp_to_cancel_tracing`
-            // (`pyjitpl.py:2949`), minus the inner-frame reconstruction.
-            if matches!(e, DispatchError::AbortPermanentMarkerReached { .. })
-                && is_top_inline
-                && fbw_concrete_heap_write_count() == concrete_writes_before
+            // sub-walk's allocations.  Any doubt keeps the legacy replay — the
+            // honest residual (the inner-frame rebuild is #126/#215).
+            if matches!(
+                e,
+                DispatchError::AbortPermanentMarkerReached { .. }
+                    | DispatchError::LoopBearingCalleeInlineUnsupported { .. }
+            ) && is_top_inline
+                && !unjournaled_before_subwalk
+                && fbw_executed_effect_count() == executed_effects_before
             {
                 if let Some(call_pc) = abort_flush_call_py_pc {
                     let fresh = read_ref_var_list_concrete(code, op, 1, ctx);
@@ -13994,7 +13988,7 @@ fn try_walker_inline_user_call(
             // those side effects twice at trace time.  A side-effect-free
             // prologue (the common loop-setup-only case) still inlines.
             if fbw_store_journal_len() > prologue_journal_before
-                || (!prologue_effect_before && fbw_has_unjournaled_effect())
+                || (!unjournaled_before_subwalk && fbw_has_unjournaled_effect())
             {
                 return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });
             }

@@ -1597,8 +1597,9 @@ fn run_perfn_walk(
             }
         }
 
-        // `abort_permanent` marker abort (DELETE_FAST and the other
-        // emit_abort_permanent opcodes): the marker's contract is "resume
+        // Inline-callee forward abort, or an `abort_permanent` marker abort
+        // (DELETE_FAST and the other emit_abort_permanent opcodes).  The
+        // marker's contract is "resume
         // the interpreter AT this unsupported opcode and run it" — codewriter
         // stores `last_instr = py_pc - 1` for the blackhole.  On the
         // full-body walk that recorded write is discarded with the aborted
@@ -1607,24 +1608,36 @@ fn run_perfn_walk(
         // them from entry → double-execution (e.g. a `del`-bearing method
         // whose prior STORE_ATTR ran once during the walk, then again on
         // replay).  Flush the abort-point frame (locals + last_instr) so the
-        // portal resumes at the unsupported opcode instead of replaying —
-        // same mechanism and same no-unjournaled-effect predicate as the
-        // CloseLoop end-flush above.  `PYRE_FBW_ABORT_FLUSH=0` opts out.
+        // portal resumes at the unsupported opcode instead of replaying.
+        // The marker-only fallback uses the same no-unjournaled-effect
+        // predicate as the CloseLoop end-flush above.  A latched inline-callee
+        // forward abort has already distinguished an outside mark from a mark
+        // inside its discarded attempt.  `PYRE_FBW_ABORT_FLUSH=0` opts out.
         if std::env::var_os("PYRE_FBW_ABORT_FLUSH").as_deref() != Some(std::ffi::OsStr::new("0")) {
-            if let Err(crate::jitcode_dispatch::DispatchError::AbortPermanentMarkerReached { pc }) =
-                &walk_result
-            {
-                let abort_jit_pc = *pc;
-                // gh#467: the marker fired inside a TOP-level inline sub-walk
-                // whose callee committed no heap effect
+            let call_forward_abort = match &walk_result {
+                Err(crate::jitcode_dispatch::DispatchError::AbortPermanentMarkerReached { pc }) => {
+                    Some((*pc, true))
+                }
+                Err(
+                    crate::jitcode_dispatch::DispatchError::LoopBearingCalleeInlineUnsupported {
+                        pc,
+                    },
+                ) => Some((*pc, false)),
+                _ => None,
+            };
+            if let Some((abort_jit_pc, is_marker_abort)) = call_forward_abort {
+                // gh#467: a supported abort fired inside a TOP-level inline
+                // sub-walk whose callee executed no concrete effect
                 // (`try_walker_inline_user_call` latched the carrier only under
-                // that gate).  Flush the OUTER frame at the CALL that entered the
-                // callee and resume the interpreter forward — re-executing the
-                // whole call from scratch — instead of the legacy replay from
-                // loop entry, which double-applies the non-journaled pre-CALL
-                // store.  The abort's `abort_jit_pc` is a CALLEE coordinate with
-                // no meaning in the outer py_pc tables, so the outer CALL py_pc
-                // and operand stack come from the latch, not `abort_jit_pc`.
+                // that gate).  The nested-unjournaled-decline class means the
+                // residual did not execute; its callee attempt can be discarded
+                // with any inside-only unjournaled mark.  Flush the OUTER frame
+                // at the CALL that entered the callee and resume the interpreter
+                // forward — re-executing the whole call from scratch — instead
+                // of the legacy replay from loop entry, which double-applies the
+                // non-journaled pre-CALL store.  The abort's `abort_jit_pc` is a
+                // CALLEE coordinate with no meaning in the outer py_pc tables,
+                // so the outer CALL py_pc and operand stack come from the latch.
                 // Convergence of `run_blackhole_interp_to_cancel_tracing`
                 // (`pyjitpl.py:2949`), minus the inner-frame rebuild (#126/#215).
                 if let Some((call_py_pc, call_stack)) =
@@ -1652,32 +1665,44 @@ fn run_perfn_walk(
                              lastblock) — legacy replay kept"
                         );
                     }
-                } else if crate::jitcode_dispatch::fbw_has_unjournaled_effect()
-                    || crate::jitcode_dispatch::fbw_abort_in_subwalk()
-                {
-                    if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                        eprintln!(
-                            "[fbw-abort-flush] declined at abort_jit_pc={abort_jit_pc} \
-                             (unjournaled effect or inline sub-walk) — legacy replay kept"
-                        );
-                    }
-                } else if let Some(resume_py_pc) =
-                    crate::jitcode_dispatch::fbw_abort_resume_py_pc(sym, abort_jit_pc)
-                {
-                    if crate::state::flush_walk_end_state_to_frame(ctx, cf_addr, resume_py_pc) {
+                } else if is_marker_abort {
+                    if crate::jitcode_dispatch::fbw_has_unjournaled_effect()
+                        || crate::jitcode_dispatch::fbw_abort_in_subwalk()
+                    {
                         if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                             eprintln!(
-                                "[fbw-abort-flush] COMMIT abort_jit_pc={abort_jit_pc} \
-                                 resume_py_pc={resume_py_pc}"
+                                "[fbw-abort-flush] declined at abort_jit_pc={abort_jit_pc} \
+                                 (unjournaled effect or inline sub-walk) — legacy replay kept"
                             );
                         }
-                        WALK_END_FLUSH_COMMITTED.with(|c| c.set(true));
-                    } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                        eprintln!(
-                            "[fbw-abort-flush] declined at resume_py_pc={resume_py_pc} \
-                             (shadow slot without concrete / depth / lastblock) — legacy replay kept"
-                        );
+                    } else if let Some(resume_py_pc) =
+                        crate::jitcode_dispatch::fbw_abort_resume_py_pc(sym, abort_jit_pc)
+                    {
+                        if crate::state::flush_walk_end_state_to_frame(ctx, cf_addr, resume_py_pc) {
+                            if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                                eprintln!(
+                                    "[fbw-abort-flush] COMMIT abort_jit_pc={abort_jit_pc} \
+                                     resume_py_pc={resume_py_pc}"
+                                );
+                            }
+                            WALK_END_FLUSH_COMMITTED.with(|c| c.set(true));
+                        } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                            eprintln!(
+                                "[fbw-abort-flush] declined at resume_py_pc={resume_py_pc} \
+                                 (shadow slot without concrete / depth / lastblock) — legacy replay kept"
+                            );
+                        }
                     }
+                } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                    // A nested-unjournaled decline without a latch failed at
+                    // least one all-or-nothing gate (nested inline, executed
+                    // effect, outside unjournaled mark, or CALL reconstruction).
+                    // It has no exact outer resume pc, so preserve the legacy
+                    // replay without consulting the marker-only inverse map.
+                    eprintln!(
+                        "[fbw-abort-flush] gh#467 CALL-forward declined at \
+                         abort_jit_pc={abort_jit_pc} (no carrier) — legacy replay kept"
+                    );
                 }
             }
         }
