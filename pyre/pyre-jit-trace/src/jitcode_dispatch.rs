@@ -8465,7 +8465,7 @@ enum VstackOpClass {
     /// new TOS with `vstack_last_ref`.  Covers value producers whose
     /// result is the topmost stack slot: LOAD_FAST / LOAD_CONST /
     /// LOAD_GLOBAL(result) / LOAD_NAME / LOAD_ATTR / BINARY_OP /
-    /// BINARY_SUBSCR / COMPARE_OP / unary ops / TO_BOOL / CALL /
+    /// BINARY_SUBSCR / COMPARE_OP / unary ops / CALL /
     /// IS_OP / CONTAINS_OP / single-result BUILD_*.
     ResultToTos,
     /// The opcode only pops (and/or stores to a local/global/attr/subscr,
@@ -8699,8 +8699,10 @@ fn classify_vstack_opcode(
         // effect there.
         Instruction::ForIter { .. } => VstackOpClass::ResultToTos,
 
-        // Everything else (TO_BOOL if present as a distinct variant, …) is
-        // not modeled — decline and fall back to the legacy read.
+        // Everything else is not modeled — decline and fall back to the
+        // legacy read.  TO_BOOL emits no JitCode (codewriter.rs:8598
+        // `Instruction::ToBool => {}`) so it never reaches this classifier;
+        // the py-pc boundary mapping skips it.
         _ => VstackOpClass::Unmodeled,
     }
 }
