@@ -18,6 +18,8 @@
 
 use std::cell::Cell;
 
+use crate::PyObjectRef;
+
 /// Signature of the host-side GC allocation callback.
 ///
 /// `type_id` is the backend-registered GC type id (same id used by
@@ -249,6 +251,64 @@ pub fn try_gc_collect_oldgen() {
     GC_COLLECT_OLDGEN_HOOK.with(|cell| {
         if let Some(f) = cell.get() {
             f();
+        }
+    });
+}
+
+/// RPython `gc_fq_register` / `gc_fq_next_dead` hooks.  The trigger is the
+/// translated FinalizerQueue handler and only schedules interpreter work.
+pub type GcFinalizerTriggerFn = fn();
+pub type GcRegisterFinalizerHookFn = fn(usize, PyObjectRef, GcFinalizerTriggerFn);
+pub type GcFinalizerNextDeadHookFn = fn(usize) -> PyObjectRef;
+
+thread_local! {
+    static GC_REGISTER_FINALIZER_HOOK: Cell<Option<GcRegisterFinalizerHookFn>> =
+        const { Cell::new(None) };
+    static GC_FINALIZER_NEXT_DEAD_HOOK: Cell<Option<GcFinalizerNextDeadHookFn>> =
+        const { Cell::new(None) };
+}
+
+pub fn register_gc_finalizer_hooks(
+    register: GcRegisterFinalizerHookFn,
+    next_dead: GcFinalizerNextDeadHookFn,
+) {
+    GC_REGISTER_FINALIZER_HOOK.with(|cell| cell.set(Some(register)));
+    GC_FINALIZER_NEXT_DEAD_HOOK.with(|cell| cell.set(Some(next_dead)));
+}
+
+pub fn try_gc_register_finalizer(fq_index: usize, obj: PyObjectRef, trigger: GcFinalizerTriggerFn) {
+    GC_REGISTER_FINALIZER_HOOK.with(|cell| {
+        if let Some(register) = cell.get() {
+            register(fq_index, obj, trigger);
+        }
+    });
+}
+
+pub fn try_gc_finalizer_next_dead(fq_index: usize) -> PyObjectRef {
+    GC_FINALIZER_NEXT_DEAD_HOOK.with(|cell| {
+        cell.get()
+            .map(|next_dead| next_dead(fq_index))
+            .unwrap_or(crate::PY_NULL)
+    })
+}
+
+/// `ObjSpace.allocate_instance`-level hook.  pyre-object owns allocation but
+/// pyre-interpreter owns MRO lookup and can therefore decide `hasuserdel`.
+pub type MaybeRegisterFinalizerHookFn = fn(PyObjectRef);
+
+thread_local! {
+    static MAYBE_REGISTER_FINALIZER_HOOK: Cell<Option<MaybeRegisterFinalizerHookFn>> =
+        const { Cell::new(None) };
+}
+
+pub fn register_maybe_finalizer_hook(hook: MaybeRegisterFinalizerHookFn) {
+    MAYBE_REGISTER_FINALIZER_HOOK.with(|cell| cell.set(Some(hook)));
+}
+
+pub fn maybe_register_finalizer(obj: PyObjectRef) {
+    MAYBE_REGISTER_FINALIZER_HOOK.with(|cell| {
+        if let Some(hook) = cell.get() {
+            hook(obj);
         }
     });
 }

@@ -24,6 +24,10 @@ use rustpython_wtf8::{CodePoint, Wtf8};
 
 use crate::{PyError, PyErrorKind};
 
+pub(crate) fn character_name(ch: char) -> Option<String> {
+    ucd_core::character_name(ch)
+}
+
 type PyResult = Result<PyObjectRef, PyError>;
 
 /// Latest bundled database view — the module-level functions.

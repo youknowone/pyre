@@ -116,6 +116,20 @@ fn pyre_object_gc_collect_oldgen_trampoline() {
     majit_gc::collect_oldgen_nonmoving();
 }
 
+fn pyre_object_gc_register_finalizer_trampoline(
+    fq_index: usize,
+    obj: pyre_object::PyObjectRef,
+    trigger: pyre_object::gc_hook::GcFinalizerTriggerFn,
+) {
+    majit_gc::gc_register_finalizer(fq_index, majit_ir::GcRef(obj as usize), trigger);
+}
+
+fn pyre_object_gc_finalizer_next_dead_trampoline(fq_index: usize) -> pyre_object::PyObjectRef {
+    majit_gc::gc_fq_next_dead(fq_index)
+        .map(|obj| obj.0 as pyre_object::PyObjectRef)
+        .unwrap_or(pyre_object::PY_NULL)
+}
+
 /// Heap-stats trampoline for the interpreter GC safepoint
 /// (`pyre_object::gc_interp`). Bridges pyre-object's heap-stats hook to
 /// `majit_gc::active_heap_stats`, so the safepoint can gate its
@@ -1507,14 +1521,17 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
         w_type_tid,
     );
     pytype_to_tid.insert(&pyre_object::TYPE_TYPE as *const _ as usize, w_type_tid);
-    // W_UnicodeObject carries a `*mut String` (raw heap) plus a
-    // `usize` length. No direct `PyObjectRef` field. Pre-registered
-    // so the foreign-pytype loop's `sizeof(PyObject)` approximation
-    // does not under-count the payload.
-    let w_str_tid = gc.register_type(TypeInfo::object_subclass(
-        std::mem::size_of::<pyre_object::unicodeobject::W_UnicodeObject>(),
-        object_tid,
-    ));
+    // W_UnicodeObject carries an off-heap WTF-8 buffer. Managed subclass
+    // instances additionally need the header's `w_class` traced, matching
+    // W_ObjectObject's instance-class edge; exact strings remain immortal.
+    let w_str_tid = gc.register_type(
+        TypeInfo::object_subclass_with_gc_ptrs(
+            std::mem::size_of::<pyre_object::unicodeobject::W_UnicodeObject>(),
+            object_tid,
+            vec![pyre_object::pyobject::W_CLASS_OFFSET],
+        )
+        .with_destructor_fn(pyre_object::unicodeobject::unicode_object_destructor),
+    );
     debug_assert_eq!(w_str_tid, W_UNICODE_GC_TYPE_ID);
     majit_gc::GcAllocator::register_vtable_for_type(
         &mut gc,
@@ -2408,6 +2425,10 @@ fn install_pyre_object_hooks() {
     );
     pyre_object::register_gc_collect_hook(pyre_object_gc_collect_trampoline);
     pyre_object::gc_hook::register_gc_collect_oldgen_hook(pyre_object_gc_collect_oldgen_trampoline);
+    pyre_object::gc_hook::register_gc_finalizer_hooks(
+        pyre_object_gc_register_finalizer_trampoline,
+        pyre_object_gc_finalizer_next_dead_trampoline,
+    );
     pyre_object::gc_hook::register_gc_heap_stats_hook(pyre_object_gc_heap_stats_trampoline);
     pyre_object::gc_hook::register_gc_jitframe_empty_hook(pyre_object_gc_jitframe_empty_trampoline);
     pyre_object::register_gc_root_hooks(

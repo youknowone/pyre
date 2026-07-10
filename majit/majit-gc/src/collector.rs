@@ -8,13 +8,14 @@
 /// Modeled after incminimark's minor/major collection.
 use indexmap::{IndexMap, IndexSet};
 use majit_ir::GcRef;
+use std::collections::VecDeque;
 
-use crate::GcAllocator;
 use crate::flags;
 use crate::header::{GcHeader, header_of};
 use crate::nursery::{DEFAULT_NURSERY_SIZE, Nursery};
 use crate::oldgen::OldGen;
 use crate::trace::{ClassTypeLayout, TypeEntry, TypeInfo, TypeInfoLayout, TypeRegistry};
+use crate::{FinalizerTriggerFn, GcAllocator};
 
 /// Configuration for the MiniMarkGC.
 pub struct GcConfig {
@@ -339,6 +340,11 @@ impl IncrementalMarkState {
     }
 }
 
+struct FinalizerHandler {
+    deque: VecDeque<usize>,
+    trigger: FinalizerTriggerFn,
+}
+
 /// The MiniMark generational GC.
 #[allow(non_snake_case)] // _T_IS_RPYTHON_INSTANCE_BYTE keeps the RPython spelling
 pub struct MiniMarkGC {
@@ -390,6 +396,16 @@ pub struct MiniMarkGC {
     /// (incminimark.py:2510-2511, :2897-2912) before the major sweep:
     /// a VISITED object survives, a dying one's destructor runs.
     old_objects_with_destructors: Vec<usize>,
+    /// incminimark.py:388-390.  Registrations first enter the probably-young
+    /// deque as `(object, finalizer-handler-index)` pairs and are promoted by
+    /// the next minor collection.
+    probably_young_objects_with_finalizers: VecDeque<(usize, usize)>,
+    /// incminimark.py:392-393.  Old objects still waiting to become
+    /// unreachable, paired with their translated FinalizerQueue handler.
+    old_objects_with_finalizers: VecDeque<(usize, usize)>,
+    /// gc/base.py finalizer handlers: one death deque and trigger per queue.
+    finalizer_handlers: Vec<FinalizerHandler>,
+    finalizer_lock: bool,
     /// True while [`do_collect_oldgen_nonmoving`](MiniMarkGC::do_collect_oldgen_nonmoving)
     /// is running. A non-moving major skips the leading minor, so unlike
     /// `do_collect_full` it marks through a *populated* nursery: `mark_object`
@@ -561,6 +577,10 @@ impl MiniMarkGC {
             old_objects_with_weakrefs: Vec::new(),
             young_objects_with_destructors: Vec::new(),
             old_objects_with_destructors: Vec::new(),
+            probably_young_objects_with_finalizers: VecDeque::new(),
+            old_objects_with_finalizers: VecDeque::new(),
+            finalizer_handlers: Vec::new(),
+            finalizer_lock: false,
             oldgen_nonmoving_active: false,
             oldgen_nonmoving_nursery_marks: Vec::new(),
             config,
@@ -1071,6 +1091,12 @@ impl MiniMarkGC {
             }
         }
 
+        // incminimark.py:1838-1841: registered young finalizers all survive
+        // this minor and move to the old-registration deque.
+        if !self.probably_young_objects_with_finalizers.is_empty() {
+            self.deal_with_young_objects_with_finalizers();
+        }
+
         // incminimark.py:1843-1862: while True loop —
         // collect_cardrefs_to_nursery, then collect_oldrefs_to_nursery.
         // collect_oldrefs_to_nursery may cause new card-marked objects to
@@ -1240,6 +1266,34 @@ impl MiniMarkGC {
             if self.oldgen.contains(pointing_to) {
                 self.old_objects_with_weakrefs.push(new_obj);
             }
+        }
+    }
+
+    /// incminimark.py:2914-2926 `deal_with_young_objects_with_finalizers`.
+    fn deal_with_young_objects_with_finalizers(&mut self) {
+        while let Some((obj_addr, fq_index)) =
+            self.probably_young_objects_with_finalizers.pop_front()
+        {
+            let current = if self.is_nursery_object_start(obj_addr) {
+                let hdr = unsafe { header_of(obj_addr) };
+                if unsafe { (*hdr).has_flag(flags::IGNORE_FINALIZER) } {
+                    continue;
+                }
+                let mut root = GcRef(obj_addr);
+                self.drag_out_root(&mut root);
+                root.0
+            } else {
+                if !self.is_managed_heap_object(obj_addr) {
+                    continue;
+                }
+                let hdr = unsafe { header_of(obj_addr) };
+                if unsafe { (*hdr).has_flag(flags::IGNORE_FINALIZER) } {
+                    continue;
+                }
+                obj_addr
+            };
+            self.old_objects_with_finalizers
+                .push_back((current, fq_index));
         }
     }
 
@@ -1708,6 +1762,17 @@ impl MiniMarkGC {
         crate::shadow_stack::walk_extra_roots(|gcref| {
             self.seed_major_root(*gcref);
         });
+
+        // gc/base.py `enum_pending_finalizers`: objects already moved to a
+        // death queue remain GC roots until app-level code pops them.
+        let pending: Vec<usize> = self
+            .finalizer_handlers
+            .iter()
+            .flat_map(|handler| handler.deque.iter().copied())
+            .collect();
+        for addr in pending {
+            self.seed_major_root(GcRef(addr));
+        }
     }
 
     /// Drive incremental major-collection progress after a minor collection.
@@ -1904,7 +1969,9 @@ impl MiniMarkGC {
         // VISITED bit on every old-gen object is still meaningful at
         // this point; sweep below tears down `VISITED` per object as
         // it walks oldgen.
-        if !self.old_objects_with_weakrefs.is_empty() {
+        if !self.old_objects_with_finalizers.is_empty() {
+            self.deal_with_objects_with_finalizers();
+        } else if !self.old_objects_with_weakrefs.is_empty() {
             self.invalidate_old_weakrefs();
         }
         // A non-moving major (do_collect_oldgen_nonmoving) runs with a live
@@ -1949,6 +2016,7 @@ impl MiniMarkGC {
         );
         self.bytes_made_old_since_cycle = 0;
         self.threshold_bytes_made_old = 0;
+        self.execute_finalizer_triggers();
     }
 
     /// incminimark.py:3105-3126 `invalidate_old_weakrefs(self)`.
@@ -1991,15 +2059,144 @@ impl MiniMarkGC {
                 new_with_weakref.push(obj_addr);
                 continue;
             }
-            // The target's header reports VISITED → the weakref survives.
+            // incminimark.py:3120-3121: queued finalizers carry VISITED so
+            // they survive this cycle, but FINALIZATION_ORDERING still makes
+            // their weakrefs observe death before `__del__` runs.
             let target_hdr = (pointing_to - GcHeader::SIZE) as *const GcHeader;
-            if unsafe { (*target_hdr).has_flag(flags::VISITED) } {
+            if unsafe {
+                (*target_hdr).has_flag(flags::VISITED)
+                    && !(*target_hdr).has_flag(flags::FINALIZATION_ORDERING)
+            } {
                 new_with_weakref.push(obj_addr);
             } else {
                 unsafe { (*weakptr_slot).0 = 0 };
             }
         }
         self.old_objects_with_weakrefs = new_with_weakref;
+    }
+
+    fn finalization_state(&self, obj_addr: usize) -> u8 {
+        let hdr = unsafe { header_of(obj_addr) };
+        let visited = unsafe { (*hdr).has_flag(flags::VISITED) };
+        let ordering = unsafe { (*hdr).has_flag(flags::FINALIZATION_ORDERING) };
+        match (visited, ordering) {
+            (false, false) => 0,
+            (false, true) => 1,
+            (true, true) => 2,
+            (true, false) => 3,
+        }
+    }
+
+    /// Return the GC-managed outgoing references of one object.  This is the
+    /// collector `trace()` callback shape used by incminimark's finalization
+    /// ordering walk, kept separate from normal VISITED marking.
+    fn finalizer_children(&self, obj_addr: usize) -> Vec<usize> {
+        let type_id = unsafe { (*header_of(obj_addr)).type_id() };
+        let info = self.types.get(type_id);
+        let mut children = Vec::new();
+        if let Some(trace_fn) = info.custom_trace {
+            unsafe {
+                trace_fn(obj_addr, &mut |slot_ptr: *mut GcRef| {
+                    let child = *slot_ptr;
+                    if !child.is_null() && self.is_managed_heap_object(child.0) {
+                        children.push(child.0);
+                    }
+                });
+            }
+            return children;
+        }
+        for &offset in &info.gc_ptr_offsets {
+            let child = unsafe { *((obj_addr + offset) as *const GcRef) };
+            if !child.is_null() && self.is_managed_heap_object(child.0) {
+                children.push(child.0);
+            }
+        }
+        if info.items_have_gc_ptrs && info.item_size > 0 {
+            let length = unsafe { *((obj_addr + info.length_offset) as *const usize) };
+            let items_start = obj_addr + info.size;
+            for i in 0..length {
+                let child = unsafe { *((items_start + i * info.item_size) as *const GcRef) };
+                if !child.is_null() && self.is_managed_heap_object(child.0) {
+                    children.push(child.0);
+                }
+            }
+        }
+        children
+    }
+
+    fn recursively_clear_finalization_ordering(&mut self, obj_addr: usize) {
+        let mut pending = vec![obj_addr];
+        while let Some(addr) = pending.pop() {
+            if self.finalization_state(addr) == 2 {
+                unsafe { (*header_of(addr)).clear_flag(flags::FINALIZATION_ORDERING) };
+                pending.extend(self.finalizer_children(addr));
+            }
+        }
+    }
+
+    /// incminimark.py:2928-2983 `deal_with_objects_with_finalizers`.
+    fn deal_with_objects_with_finalizers(&mut self) {
+        let mut new_with_finalizer = VecDeque::new();
+        let mut marked = VecDeque::new();
+
+        while let Some((obj_addr, fq_index)) = self.old_objects_with_finalizers.pop_front() {
+            let hdr = unsafe { header_of(obj_addr) };
+            if unsafe { (*hdr).has_flag(flags::IGNORE_FINALIZER) } {
+                continue;
+            }
+            if unsafe { (*hdr).has_flag(flags::VISITED) } {
+                new_with_finalizer.push_back((obj_addr, fq_index));
+                continue;
+            }
+
+            marked.push_back((obj_addr, fq_index));
+            let mut pending = vec![obj_addr];
+            while let Some(addr) = pending.pop() {
+                match self.finalization_state(addr) {
+                    0 => {
+                        unsafe { (*header_of(addr)).set_flag(flags::FINALIZATION_ORDERING) };
+                        pending.extend(self.finalizer_children(addr));
+                    }
+                    2 => self.recursively_clear_finalization_ordering(addr),
+                    _ => {}
+                }
+            }
+
+            // `_recursively_bump_finalization_state_from_1_to_2`: enqueue the
+            // root in normal marking and visit its complete object graph.
+            self.seed_major_root(GcRef(obj_addr));
+            while let Some(addr) = self.incr_state.gray_stack.pop() {
+                self.mark_object(addr);
+            }
+        }
+
+        // PyPy clears weakrefs while queued objects are in state 2.
+        if !self.old_objects_with_weakrefs.is_empty() {
+            self.invalidate_old_weakrefs();
+        }
+
+        while let Some((obj_addr, fq_index)) = marked.pop_front() {
+            if self.finalization_state(obj_addr) == 2 {
+                self.finalizer_handlers[fq_index].deque.push_back(obj_addr);
+                self.recursively_clear_finalization_ordering(obj_addr);
+            } else {
+                new_with_finalizer.push_back((obj_addr, fq_index));
+            }
+        }
+        self.old_objects_with_finalizers = new_with_finalizer;
+    }
+
+    fn execute_finalizer_triggers(&mut self) {
+        if self.finalizer_lock {
+            return;
+        }
+        self.finalizer_lock = true;
+        for handler in &self.finalizer_handlers {
+            if !handler.deque.is_empty() {
+                (handler.trigger)();
+            }
+        }
+        self.finalizer_lock = false;
     }
 
     /// incminimark.py:2897-2912 `deal_with_old_objects_with_destructors`.
@@ -2907,6 +3104,37 @@ impl GcAllocator for MiniMarkGC {
 
     fn collect_oldgen_nonmoving(&mut self) {
         self.do_collect_oldgen_nonmoving();
+    }
+
+    fn register_finalizer(&mut self, fq_index: usize, obj: GcRef, trigger: FinalizerTriggerFn) {
+        if obj.is_null() || !self.is_managed_heap_object(obj.0) {
+            return;
+        }
+        assert!(fq_index <= self.finalizer_handlers.len());
+        if fq_index == self.finalizer_handlers.len() {
+            self.finalizer_handlers.push(FinalizerHandler {
+                deque: VecDeque::new(),
+                trigger,
+            });
+        }
+        if self.oldgen.contains(obj.0) {
+            // Pyre's host allocations can be born directly in old-gen and an
+            // explicit non-moving major intentionally skips the leading minor.
+            // This is the post-`_trace_drag_out1` destination of PyPy's
+            // probably-young deque, reached immediately for an already-old obj.
+            self.old_objects_with_finalizers
+                .push_back((obj.0, fq_index));
+        } else {
+            self.probably_young_objects_with_finalizers
+                .push_back((obj.0, fq_index));
+        }
+    }
+
+    fn finalizer_next_dead(&mut self, fq_index: usize) -> Option<GcRef> {
+        self.finalizer_handlers
+            .get_mut(fq_index)
+            .and_then(|handler| handler.deque.pop_front())
+            .map(GcRef)
     }
 
     fn id_or_identityhash(&mut self, obj_addr: usize) -> usize {
@@ -6049,5 +6277,40 @@ mod tests {
 
         assert!(gc.old_objects_with_weakrefs.is_empty());
         gc.roots.clear();
+    }
+
+    #[test]
+    fn finalizer_queue_keeps_dead_object_until_it_is_popped() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static TRIGGERS: AtomicUsize = AtomicUsize::new(0);
+        fn trigger() {
+            TRIGGERS.fetch_add(1, Ordering::Relaxed);
+        }
+
+        TRIGGERS.store(0, Ordering::Relaxed);
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::simple(16));
+        let obj = gc.alloc_in_oldgen(tid, GcHeader::SIZE + 16);
+        let mut root = obj;
+        unsafe { gc.roots.add(&mut root) };
+        GcAllocator::register_finalizer(&mut gc, 0, obj, trigger);
+
+        // A live registered object stays on the registration deque.
+        gc.do_collect_oldgen_nonmoving();
+        assert!(GcAllocator::finalizer_next_dead(&mut gc, 0).is_none());
+        assert!(gc.oldgen.contains(obj.0));
+
+        // Once unreachable it moves to the death queue and is kept alive for
+        // app-level `__del__` execution.
+        gc.roots.remove(&mut root);
+        gc.do_collect_oldgen_nonmoving();
+        assert_eq!(TRIGGERS.load(Ordering::Relaxed), 1);
+        assert!(gc.oldgen.contains(obj.0));
+        assert_eq!(GcAllocator::finalizer_next_dead(&mut gc, 0), Some(obj));
+
+        // Popping removes the queue root; the following major reclaims it.
+        gc.do_collect_oldgen_nonmoving();
+        assert!(!gc.oldgen.contains(obj.0));
     }
 }

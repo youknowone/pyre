@@ -1542,13 +1542,8 @@ fn str_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if str_typeobj.map_or(false, |t| std::ptr::eq(cls, t)) {
         return Ok(value);
     }
-    let s_owned = unsafe { pyre_object::w_str_get_value(value) }.to_string();
-    let obj = pyre_object::w_str_new(&s_owned);
-    // Tag with subclass type so type(obj) returns cls.
-    unsafe {
-        (*(obj as *mut pyre_object::PyObject)).w_class = cls;
-    }
-    Ok(obj)
+    let contents = unsafe { pyre_object::w_str_get_wtf8(value) }.to_wtf8_buf();
+    Ok(pyre_object::w_str_subclass_from_wtf8(contents, cls))
 }
 
 /// dict.__new__(cls, *args) — if cls is a dict subclass, create an instance
@@ -2400,6 +2395,73 @@ fn list_descr_mul(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 fn init_str_type(ns: &mut DictStorage) {
     dict_storage_store(ns, "__new__", make_new_descr(str_descr_new));
+    // unicodeobject.py:330-338 descr_repr / descr_str.  descr_str returns an
+    // exact base str for a subtype, which is required by enum.StrEnum's
+    // inherited `str.__str__`.
+    dict_storage_store(
+        ns,
+        "__repr__",
+        make_builtin_function_with_arity(
+            "__repr__",
+            |args| {
+                Ok(pyre_object::w_str_new(&crate::display::format_wtf8_repr(
+                    unsafe { pyre_object::w_str_get_wtf8(args[0]) },
+                )))
+            },
+            1,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "__str__",
+        make_builtin_function_with_arity(
+            "__str__",
+            |args| {
+                let obj = args[0];
+                if unsafe { pyre_object::pyobject::is_exact_type(obj, &pyre_object::STR_TYPE) } {
+                    Ok(obj)
+                } else {
+                    Ok(pyre_object::w_str_from_wtf8(
+                        unsafe { pyre_object::w_str_get_wtf8(obj) }.to_wtf8_buf(),
+                    ))
+                }
+            },
+            1,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "__sizeof__",
+        make_builtin_function_with_arity(
+            "__sizeof__",
+            |args| {
+                let s = unsafe { pyre_object::w_str_get_wtf8(args[0]) };
+                let mut maxchar = 0u32;
+                let mut length = 0usize;
+                for cp in s.code_points() {
+                    maxchar = maxchar.max(cp.to_u32());
+                    length += 1;
+                }
+                // CPython's compact PEP 393 layout, exposed for compatibility
+                // with test_str.test_raiseMemError.  PyPy documents
+                // `__sizeof__` on str but sys.getsizeof itself remains a
+                // default-returning operation for other objects.
+                let word = std::mem::size_of::<usize>();
+                let struct_size = if maxchar < 0x80 { 5 * word } else { 7 * word };
+                let char_size = if maxchar < 0x100 {
+                    1
+                } else if maxchar < 0x10000 {
+                    2
+                } else {
+                    4
+                };
+                Ok(pyre_object::w_int_new(
+                    (struct_size + char_size * (length + 1)) as i64,
+                ))
+            },
+            1,
+        ),
+    );
     dict_storage_store(
         ns,
         "__format__",
@@ -8243,6 +8305,24 @@ type DunderFn = fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>;
 
 fn init_int_type(ns: &mut DictStorage) {
     dict_storage_store(ns, "__new__", make_new_descr(int_descr_new));
+    // intobject.py descr_repr / descr_str.  IntEnum binds its __str__ to this
+    // descriptor, so it must exist in int's TypeDef rather than falling back
+    // to object.__str__.
+    let int_to_text = |args: &[PyObjectRef]| {
+        Ok(pyre_object::w_str_new(
+            &unsafe { crate::builtins::obj_to_bigint(args[0]) }.to_string(),
+        ))
+    };
+    dict_storage_store(
+        ns,
+        "__repr__",
+        make_builtin_function_with_arity("__repr__", int_to_text, 1),
+    );
+    dict_storage_store(
+        ns,
+        "__str__",
+        make_builtin_function_with_arity("__str__", int_to_text, 1),
+    );
     dict_storage_store(
         ns,
         "bit_length",
@@ -12252,6 +12332,30 @@ pub(crate) fn decode_bytes_to_wtf8(
 ) -> Result<Wtf8Buf, crate::PyError> {
     let err_mode = errors;
     let enc_lower = encoding.to_ascii_lowercase().replace('_', "-");
+    if crate::importing::dev_mode_flag()
+        && matches!(
+            enc_lower.as_str(),
+            "utf-8"
+                | "utf8"
+                | "u8"
+                | "ascii"
+                | "us-ascii"
+                | "646"
+                | "latin-1"
+                | "latin1"
+                | "iso-8859-1"
+                | "8859"
+                | "raw-unicode-escape"
+                | "utf-16"
+                | "utf-16-le"
+                | "utf-16-be"
+                | "utf-32"
+                | "utf-32-le"
+                | "utf-32-be"
+        )
+    {
+        crate::module::_codecs::validate_error_handler(errors)?;
+    }
     let s = match enc_lower.as_str() {
         "utf-8" | "utf8" | "u8" => decode_utf8_with_errors(data, err_mode)?,
         "ascii" | "us-ascii" | "646" => {
@@ -12313,7 +12417,7 @@ pub(crate) fn decode_bytes_to_wtf8(
         "latin-1" | "latin1" | "iso-8859-1" | "8859" => {
             Wtf8Buf::from_string(data.iter().map(|&b| b as char).collect::<String>())
         }
-        "raw-unicode-escape" => crate::type_methods::decode_raw_unicode_escape(data)?,
+        "raw-unicode-escape" => crate::type_methods::decode_raw_unicode_escape(data, err_mode)?,
         _ => {
             if let Some(result) = crate::type_methods::decode_utf16_32(data, &enc_lower, err_mode) {
                 result?

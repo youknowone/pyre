@@ -359,23 +359,47 @@ pub fn register_module(ns: &mut DictStorage) {
             dict_storage_store(fns, "interactive", w_int_new(0));
             dict_storage_store(fns, "optimize", w_int_new(0));
             dict_storage_store(fns, "dont_write_bytecode", w_int_new(0));
-            dict_storage_store(fns, "no_user_site", w_int_new(0));
+            dict_storage_store(
+                fns,
+                "no_user_site",
+                w_int_new(i64::from(crate::importing::no_user_site_flag())),
+            );
             // `-S` (skip `import site`) is recorded by the launcher.
             dict_storage_store(
                 fns,
                 "no_site",
                 w_int_new(i64::from(crate::importing::no_site_flag())),
             );
-            dict_storage_store(fns, "ignore_environment", w_int_new(0));
+            dict_storage_store(
+                fns,
+                "ignore_environment",
+                w_int_new(i64::from(crate::importing::ignore_environment_flag())),
+            );
             dict_storage_store(fns, "verbose", w_int_new(0));
             dict_storage_store(fns, "bytes_warning", w_int_new(0));
             dict_storage_store(fns, "quiet", w_int_new(0));
             dict_storage_store(fns, "hash_randomization", w_int_new(0));
-            dict_storage_store(fns, "isolated", w_int_new(0));
-            dict_storage_store(fns, "dev_mode", w_bool_from(false));
-            dict_storage_store(fns, "utf8_mode", w_int_new(1));
+            dict_storage_store(
+                fns,
+                "isolated",
+                w_int_new(i64::from(crate::importing::isolated_flag())),
+            );
+            dict_storage_store(
+                fns,
+                "dev_mode",
+                w_bool_from(crate::importing::dev_mode_flag()),
+            );
+            dict_storage_store(
+                fns,
+                "utf8_mode",
+                w_int_new(crate::importing::utf8_mode_flag()),
+            );
             dict_storage_store(fns, "warn_default_encoding", w_int_new(0));
-            dict_storage_store(fns, "safe_path", w_bool_from(false));
+            dict_storage_store(
+                fns,
+                "safe_path",
+                w_bool_from(crate::importing::safe_path_flag()),
+            );
             dict_storage_store(fns, "int_max_str_digits", w_int_new(4300));
             dict_storage_store(fns, "context_aware_warnings", w_bool_from(false));
             dict_storage_store(fns, "thread_inherit_context", w_int_new(0));
@@ -794,19 +818,25 @@ pub fn register_module(ns: &mut DictStorage) {
         "copyright",
         w_str_new("Copyright (c) 2001-2024 Python Software Foundation.\nAll Rights Reserved."),
     );
-    // sys.getsizeof(obj[, default]) — pyre has no per-object size accounting
-    // (vm.py getsizeof): return the caller-supplied `default`, and raise
-    // TypeError when it is omitted.
+    // sys.getsizeof(obj[, default]) — PyPy vm.py returns the supplied default
+    // for untracked objects.  str additionally exposes its PEP 393-compatible
+    // `__sizeof__`, needed by the shared CPython test_str overflow check.
     dict_storage_store(
         ns,
         "getsizeof",
         make_builtin_function_with_arity(
             "getsizeof",
-            |args| match args.get(1).copied() {
-                Some(w_default) => Ok(w_default),
-                None => Err(crate::PyError::type_error(
-                    "getsizeof(object, default) -> int: object size is not tracked; supply a default",
-                )),
+            |args| {
+                if unsafe { pyre_object::is_str(args[0]) } {
+                    let method = crate::baseobjspace::getattr_str(args[0], "__sizeof__")?;
+                    return crate::call::call_function_impl_result(method, &[]);
+                }
+                match args.get(1).copied() {
+                    Some(w_default) => Ok(w_default),
+                    None => Err(crate::PyError::type_error(
+                        "getsizeof(object, default) -> int: object size is not tracked; supply a default",
+                    )),
+                }
             },
             1,
         ),

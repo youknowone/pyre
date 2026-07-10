@@ -8,6 +8,7 @@
 use std::cell::Cell;
 
 use pyre_object::*;
+use rustpython_wtf8::{CodePoint, Wtf8Buf};
 
 struct CodecState {
     codec_search_path: PyObjectRef,
@@ -18,12 +19,14 @@ struct CodecState {
 
 impl CodecState {
     fn new() -> Self {
-        Self {
+        let mut state = Self {
             codec_search_path: w_list_new(Vec::new()),
             codec_search_cache: w_dict_new(),
             codec_error_registry: w_dict_new(),
             codec_need_encodings: true,
-        }
+        };
+        register_builtin_error_handlers(&mut state);
+        state
     }
 }
 
@@ -96,15 +99,406 @@ fn is_callable(obj: PyObjectRef) -> bool {
     false
 }
 
-// `lookup_error(name)` returns a pass-through handler that never fires
-// because the pure-Python stdlib paths pyre exercises do not encounter
-// encoding errors yet.
-fn lookup_error(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Ok(crate::make_builtin_function_with_arity(
-        "error_handler",
-        |args| Ok(args.first().copied().unwrap_or(w_none())),
-        1,
+struct CodecException {
+    w_exc: PyObjectRef,
+    w_obj: PyObjectRef,
+    w_end: PyObjectRef,
+    start: usize,
+    end: usize,
+    kind: pyre_object::interp_exceptions::ExcKind,
+}
+
+fn check_exception(w_exc: PyObjectRef) -> Result<CodecException, crate::PyError> {
+    let w_start = crate::baseobjspace::getattr_str(w_exc, "start")
+        .map_err(|_| crate::PyError::type_error("wrong exception"))?;
+    let w_end = crate::baseobjspace::getattr_str(w_exc, "end")
+        .map_err(|_| crate::PyError::type_error("wrong exception"))?;
+    let w_obj = crate::baseobjspace::getattr_str(w_exc, "object")
+        .map_err(|_| crate::PyError::type_error("wrong exception"))?;
+    let start = crate::baseobjspace::int_w(w_start)
+        .map_err(|_| crate::PyError::type_error("wrong exception"))?;
+    let end = crate::baseobjspace::int_w(w_end)
+        .map_err(|_| crate::PyError::type_error("wrong exception"))?;
+    if start < 0
+        || end < start
+        || !(unsafe { crate::baseobjspace::isinstance_str_w(w_obj) }
+            || unsafe { crate::baseobjspace::isinstance_bytes_w(w_obj) })
+        || !unsafe { pyre_object::is_exception(w_exc) }
+    {
+        return Err(crate::PyError::type_error("wrong exception"));
+    }
+    Ok(CodecException {
+        w_exc,
+        w_obj,
+        w_end,
+        start: start as usize,
+        end: end as usize,
+        kind: unsafe { pyre_object::interp_exceptions::w_exception_get_kind(w_exc) },
+    })
+}
+
+fn codec_error_arg(args: &[PyObjectRef]) -> Result<CodecException, crate::PyError> {
+    args.first()
+        .copied()
+        .ok_or_else(|| crate::PyError::type_error("error handler requires an exception"))
+        .and_then(check_exception)
+}
+
+fn codec_result(replacement: PyObjectRef, position: PyObjectRef) -> PyObjectRef {
+    w_tuple_new(vec![replacement, position])
+}
+
+fn strict_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let exc = codec_error_arg(args)?;
+    Err(unsafe { crate::PyError::from_exc_object(exc.w_exc) })
+}
+
+fn ignore_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let exc = codec_error_arg(args)?;
+    Ok(codec_result(w_str_new(""), exc.w_end))
+}
+
+fn error_codepoints(exc: &CodecException) -> Result<Vec<u32>, crate::PyError> {
+    if !unsafe { crate::baseobjspace::isinstance_str_w(exc.w_obj) } {
+        return Err(crate::PyError::type_error(
+            "don't know how to handle exception in error callback",
+        ));
+    }
+    Ok(unsafe { w_str_get_wtf8(exc.w_obj) }
+        .code_points()
+        .skip(exc.start)
+        .take(exc.end.saturating_sub(exc.start))
+        .map(|cp| cp.to_u32())
+        .collect())
+}
+
+fn raw_unicode_escape(code: u32) -> String {
+    if code >= 0x10000 {
+        format!("\\U{code:08x}")
+    } else if code >= 0x100 {
+        format!("\\u{code:04x}")
+    } else {
+        format!("\\x{code:02x}")
+    }
+}
+
+fn replace_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let exc = codec_error_arg(args)?;
+    let size = exc.end - exc.start;
+    let replacement = match exc.kind {
+        pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError => "?".repeat(size),
+        pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError => "\u{fffd}".to_string(),
+        pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError => "\u{fffd}".repeat(size),
+        _ => {
+            return Err(crate::PyError::type_error(
+                "don't know how to handle exception in error callback",
+            ));
+        }
+    };
+    Ok(codec_result(w_str_new(&replacement), exc.w_end))
+}
+
+fn xmlcharrefreplace_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let exc = codec_error_arg(args)?;
+    if exc.kind != pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError {
+        return Err(crate::PyError::type_error(
+            "don't know how to handle exception in error callback",
+        ));
+    }
+    let replacement: String = error_codepoints(&exc)?
+        .into_iter()
+        .map(|code| format!("&#{code};"))
+        .collect();
+    Ok(codec_result(w_str_new(&replacement), exc.w_end))
+}
+
+fn backslashreplace_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let exc = codec_error_arg(args)?;
+    let replacement = match exc.kind {
+        pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError
+        | pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError => error_codepoints(&exc)?
+            .into_iter()
+            .map(raw_unicode_escape)
+            .collect::<String>(),
+        pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError => {
+            if !unsafe { pyre_object::is_bytes(exc.w_obj) } {
+                return Err(crate::PyError::type_error("wrong exception"));
+            }
+            let data = unsafe { w_bytes_data(exc.w_obj) };
+            data[exc.start..exc.end]
+                .iter()
+                .map(|&byte| raw_unicode_escape(byte as u32))
+                .collect::<String>()
+        }
+        _ => {
+            return Err(crate::PyError::type_error(
+                "don't know how to handle exception in error callback",
+            ));
+        }
+    };
+    Ok(codec_result(w_str_new(&replacement), exc.w_end))
+}
+
+fn namereplace_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let exc = codec_error_arg(args)?;
+    if exc.kind != pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError {
+        return Err(crate::PyError::type_error(
+            "don't know how to handle exception in error callback",
+        ));
+    }
+    let mut replacement = String::new();
+    for code in error_codepoints(&exc)? {
+        if let Some(name) =
+            char::from_u32(code).and_then(crate::module::unicodedata::character_name)
+        {
+            replacement.push_str("\\N{");
+            replacement.push_str(&name);
+            replacement.push('}');
+        } else {
+            replacement.push_str(&raw_unicode_escape(code));
+        }
+    }
+    Ok(codec_result(w_str_new(&replacement), exc.w_end))
+}
+
+#[derive(Clone, Copy)]
+enum StandardEncoding {
+    Utf8,
+    Utf16Le,
+    Utf16Be,
+    Utf32Le,
+    Utf32Be,
+}
+
+fn standard_encoding(name: &str) -> Option<(usize, StandardEncoding)> {
+    let compact: String = name
+        .chars()
+        .filter(|c| !matches!(c, '-' | '_' | ' '))
+        .flat_map(char::to_lowercase)
+        .collect();
+    match compact.as_str() {
+        "utf8" | "cputf8" => Some((3, StandardEncoding::Utf8)),
+        "utf16le" => Some((2, StandardEncoding::Utf16Le)),
+        "utf16be" => Some((2, StandardEncoding::Utf16Be)),
+        "utf16" if cfg!(target_endian = "little") => Some((2, StandardEncoding::Utf16Le)),
+        "utf16" => Some((2, StandardEncoding::Utf16Be)),
+        "utf32le" => Some((4, StandardEncoding::Utf32Le)),
+        "utf32be" => Some((4, StandardEncoding::Utf32Be)),
+        "utf32" if cfg!(target_endian = "little") => Some((4, StandardEncoding::Utf32Le)),
+        "utf32" => Some((4, StandardEncoding::Utf32Be)),
+        _ => None,
+    }
+}
+
+fn exception_encoding(exc: &CodecException) -> Result<(usize, StandardEncoding), crate::PyError> {
+    let w_encoding = crate::baseobjspace::getattr_str(exc.w_exc, "encoding")?;
+    if !unsafe { is_str(w_encoding) } {
+        return Err(unsafe { crate::PyError::from_exc_object(exc.w_exc) });
+    }
+    standard_encoding(unsafe { w_str_get_value(w_encoding) })
+        .ok_or_else(|| unsafe { crate::PyError::from_exc_object(exc.w_exc) })
+}
+
+fn surrogatepass_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let exc = codec_error_arg(args)?;
+    let (byte_len, encoding) = exception_encoding(&exc)?;
+    match exc.kind {
+        pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError => {
+            let mut replacement = Vec::new();
+            for code in error_codepoints(&exc)? {
+                if !(0xD800..=0xDFFF).contains(&code) {
+                    return Err(unsafe { crate::PyError::from_exc_object(exc.w_exc) });
+                }
+                match encoding {
+                    StandardEncoding::Utf8 => replacement.extend_from_slice(&[
+                        0xe0 | (code >> 12) as u8,
+                        0x80 | ((code >> 6) & 0x3f) as u8,
+                        0x80 | (code & 0x3f) as u8,
+                    ]),
+                    StandardEncoding::Utf16Le => {
+                        replacement.extend_from_slice(&(code as u16).to_le_bytes())
+                    }
+                    StandardEncoding::Utf16Be => {
+                        replacement.extend_from_slice(&(code as u16).to_be_bytes())
+                    }
+                    StandardEncoding::Utf32Le => replacement.extend_from_slice(&code.to_le_bytes()),
+                    StandardEncoding::Utf32Be => replacement.extend_from_slice(&code.to_be_bytes()),
+                }
+            }
+            Ok(codec_result(w_bytes_from_bytes(&replacement), exc.w_end))
+        }
+        pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError => {
+            if !unsafe { pyre_object::is_bytes(exc.w_obj) } {
+                return Err(crate::PyError::type_error("wrong exception"));
+            }
+            let data = unsafe { w_bytes_data(exc.w_obj) };
+            if exc.start + byte_len > data.len() {
+                return Err(unsafe { crate::PyError::from_exc_object(exc.w_exc) });
+            }
+            let bytes = &data[exc.start..exc.start + byte_len];
+            let code = match encoding {
+                StandardEncoding::Utf8 => {
+                    if bytes[0] & 0xf0 != 0xe0 || bytes[1] & 0xc0 != 0x80 || bytes[2] & 0xc0 != 0x80
+                    {
+                        0
+                    } else {
+                        (((bytes[0] & 0x0f) as u32) << 12)
+                            | (((bytes[1] & 0x3f) as u32) << 6)
+                            | (bytes[2] & 0x3f) as u32
+                    }
+                }
+                StandardEncoding::Utf16Le => u16::from_le_bytes(bytes.try_into().unwrap()) as u32,
+                StandardEncoding::Utf16Be => u16::from_be_bytes(bytes.try_into().unwrap()) as u32,
+                StandardEncoding::Utf32Le => u32::from_le_bytes(bytes.try_into().unwrap()),
+                StandardEncoding::Utf32Be => u32::from_be_bytes(bytes.try_into().unwrap()),
+            };
+            if !(0xD800..=0xDFFF).contains(&code) {
+                return Err(unsafe { crate::PyError::from_exc_object(exc.w_exc) });
+            }
+            let mut replacement = Wtf8Buf::new();
+            replacement.push(CodePoint::from_u32(code).unwrap());
+            Ok(codec_result(
+                w_str_from_wtf8(replacement),
+                w_int_new((exc.start + byte_len) as i64),
+            ))
+        }
+        _ => Err(crate::PyError::type_error(
+            "don't know how to handle exception in error callback",
+        )),
+    }
+}
+
+fn surrogateescape_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let exc = codec_error_arg(args)?;
+    match exc.kind {
+        pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError => {
+            let mut replacement = Vec::new();
+            for code in error_codepoints(&exc)? {
+                if !(0xDC80..=0xDCFF).contains(&code) {
+                    return Err(unsafe { crate::PyError::from_exc_object(exc.w_exc) });
+                }
+                replacement.push((code - 0xDC00) as u8);
+            }
+            Ok(codec_result(w_bytes_from_bytes(&replacement), exc.w_end))
+        }
+        pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError => {
+            if !unsafe { pyre_object::is_bytes(exc.w_obj) } {
+                return Err(crate::PyError::type_error("wrong exception"));
+            }
+            let data = unsafe { w_bytes_data(exc.w_obj) };
+            let mut replacement = Wtf8Buf::new();
+            let mut consumed = 0usize;
+            while consumed < 4 && exc.start + consumed < exc.end {
+                let byte = data[exc.start + consumed];
+                if byte < 128 {
+                    break;
+                }
+                replacement.push(CodePoint::from_u32(0xDC00 + byte as u32).unwrap());
+                consumed += 1;
+            }
+            if consumed == 0 {
+                return Err(unsafe { crate::PyError::from_exc_object(exc.w_exc) });
+            }
+            Ok(codec_result(
+                w_str_from_wtf8(replacement),
+                w_int_new((exc.start + consumed) as i64),
+            ))
+        }
+        _ => Err(crate::PyError::type_error(
+            "don't know how to handle exception in error callback",
+        )),
+    }
+}
+
+fn register_builtin_error_handlers(state: &mut CodecState) {
+    let handlers: [(
+        &str,
+        fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
+    ); 8] = [
+        ("strict", strict_errors),
+        ("ignore", ignore_errors),
+        ("replace", replace_errors),
+        ("xmlcharrefreplace", xmlcharrefreplace_errors),
+        ("backslashreplace", backslashreplace_errors),
+        ("surrogateescape", surrogateescape_errors),
+        ("surrogatepass", surrogatepass_errors),
+        ("namereplace", namereplace_errors),
+    ];
+    for (name, handler) in handlers {
+        let w_handler = crate::make_builtin_function_with_arity(name, handler, 1);
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str(
+                state.codec_error_registry,
+                name,
+                w_handler,
+            );
+        }
+    }
+}
+
+/// `interp_codecs.py:602-610 lookup_error`.  The direct codec loops implement
+/// the eight built-ins themselves; custom handlers live in the same registry
+/// dict PyPy uses and are returned verbatim.
+pub(crate) fn validate_error_handler(errors: &str) -> Result<(), crate::PyError> {
+    let found = with_codec_state(|state| unsafe {
+        pyre_object::dictmultiobject::w_dict_getitem_str(state.codec_error_registry, errors)
+    });
+    if found.is_some() {
+        Ok(())
+    } else {
+        Err(crate::PyError::new(
+            crate::PyErrorKind::LookupError,
+            format!("unknown error handler name {errors}"),
+        ))
+    }
+}
+
+fn lookup_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let Some(w_errors) = args.first().copied() else {
+        return Err(crate::PyError::type_error(
+            "lookup_error() missing argument",
+        ));
+    };
+    if !unsafe { is_str(w_errors) } {
+        return Err(crate::PyError::type_error(
+            "lookup_error() argument must be str",
+        ));
+    }
+    let errors = unsafe { w_str_get_value(w_errors) };
+    if let Some(w_handler) = with_codec_state(|state| unsafe {
+        pyre_object::dictmultiobject::w_dict_getitem_str(state.codec_error_registry, errors)
+    }) {
+        return Ok(w_handler);
+    }
+    Err(crate::PyError::new(
+        crate::PyErrorKind::LookupError,
+        format!("unknown error handler name {errors}"),
     ))
+}
+
+fn register_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let (Some(w_errors), Some(w_handler)) = (args.first().copied(), args.get(1).copied()) else {
+        return Err(crate::PyError::type_error(
+            "register_error() requires name and handler",
+        ));
+    };
+    if !unsafe { is_str(w_errors) } {
+        return Err(crate::PyError::type_error(
+            "register_error() argument 1 must be str",
+        ));
+    }
+    if !is_callable(w_handler) {
+        return Err(crate::PyError::type_error("argument must be callable"));
+    }
+    let errors = unsafe { w_str_get_value(w_errors) };
+    with_codec_state(|state| unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str(
+            state.codec_error_registry,
+            errors,
+            w_handler,
+        );
+    });
+    Ok(w_none())
 }
 
 fn register_codec(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -265,6 +659,9 @@ pub(crate) fn encode_text_codec(
     errors: &str,
 ) -> Result<PyObjectRef, crate::PyError> {
     let w_codec_info = lookup_text_codec("encode", encoding)?;
+    if crate::importing::dev_mode_flag() {
+        validate_error_handler(errors)?;
+    }
     let w_encfunc = unsafe { pyre_object::w_tuple_getitem(w_codec_info, 0).unwrap_or_else(w_none) };
     let w_retval = call_codec(w_encfunc, w_obj, "encoding", Some(errors))?;
     if !unsafe { pyre_object::bytesobject::is_bytes_like(w_retval) } {
@@ -282,6 +679,9 @@ pub(crate) fn decode_text_codec(
     errors: &str,
 ) -> Result<PyObjectRef, crate::PyError> {
     let w_codec_info = lookup_text_codec("decode", encoding)?;
+    if crate::importing::dev_mode_flag() {
+        validate_error_handler(errors)?;
+    }
     let w_decfunc = unsafe { pyre_object::w_tuple_getitem(w_codec_info, 1).unwrap_or_else(w_none) };
     let w_retval = call_codec(w_decfunc, w_obj, "decoding", Some(errors))?;
     if !unsafe { pyre_object::is_str(w_retval) } {
@@ -1245,7 +1645,7 @@ crate::py_module! {
     },
     functions: {
         "lookup_error"     / 1 = lookup_error,
-        "register_error"   / 2 = |_| Ok(w_none()),
+        "register_error"   / 2 = register_error,
         "_unregister_error" / 1 = |_| Ok(w_bool_from(false)),
         "register"       / 1 = register_codec,
         "unregister"     / 1 = unregister,

@@ -58,6 +58,10 @@ pub mod flags {
     pub const DUMMY: u64 = 1 << 12;
 }
 
+/// Low-level trigger stored in an RPython finalizer handler.  It must only
+/// schedule app-level work; finalizers themselves run after collection.
+pub type FinalizerTriggerFn = fn();
+
 /// True when the `gc_stress` test feature is compiled in: every allocation
 /// may then run a full collection inside `alloc_with_type`, so JIT fast
 /// paths that bypass it (inline nursery bump) must stay disabled or the
@@ -259,6 +263,16 @@ pub trait GcAllocator: Send {
     /// objects without moving the nursery). The default no-ops so a backend
     /// with no incremental old-gen lacks no method; `MiniMarkGC` overrides it.
     fn collect_oldgen_nonmoving(&mut self) {}
+
+    /// rgc.py `FinalizerQueue.register_finalizer` /
+    /// framework.py `gc_fq_register`: register `obj` with one translated
+    /// finalizer handler.  Backends without finalizer queues ignore it.
+    fn register_finalizer(&mut self, _fq_index: usize, _obj: GcRef, _trigger: FinalizerTriggerFn) {}
+
+    /// rgc.py `FinalizerQueue.next_dead` / framework.py `gc_fq_next_dead`.
+    fn finalizer_next_dead(&mut self, _fq_index: usize) -> Option<GcRef> {
+        None
+    }
 
     /// minimark.py:1900-1915 `id_or_identityhash(gcobj)`.
     /// Return a stable address for the object that does not change
@@ -670,6 +684,12 @@ impl GcAllocator for GcHandle {
     }
     fn collect_oldgen_nonmoving(&mut self) {
         gc_sync::gc_op(|gc| gc.collect_oldgen_nonmoving())
+    }
+    fn register_finalizer(&mut self, fq_index: usize, obj: GcRef, trigger: FinalizerTriggerFn) {
+        gc_sync::gc_op(|gc| gc.register_finalizer(fq_index, obj, trigger))
+    }
+    fn finalizer_next_dead(&mut self, fq_index: usize) -> Option<GcRef> {
+        gc_sync::gc_op(|gc| gc.finalizer_next_dead(fq_index))
     }
     fn id_or_identityhash(&mut self, obj_addr: usize) -> usize {
         gc_sync::gc_op(|gc| gc.id_or_identityhash(obj_addr))
@@ -1440,6 +1460,16 @@ pub fn gc_remove_root(slot: *mut GcRef) {
             f(slot)
         }
     });
+}
+
+/// Register an object with an RPython-style finalizer queue on the process GC.
+pub fn gc_register_finalizer(fq_index: usize, obj: GcRef, trigger: FinalizerTriggerFn) {
+    gc_sync::gc_op(|gc| gc.register_finalizer(fq_index, obj, trigger));
+}
+
+/// Pop one object from an RPython-style finalizer death queue.
+pub fn gc_fq_next_dead(fq_index: usize) -> Option<GcRef> {
+    gc_sync::gc_op(|gc| gc.finalizer_next_dead(fq_index))
 }
 
 /// Thread-local callback that performs a host-side write barrier through

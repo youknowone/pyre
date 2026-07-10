@@ -1,10 +1,7 @@
 //! gc module — PyPy: `pypy/module/gc/`.
 //!
-//! Partial port of `interp_gc.py`.  `collect` is currently a no-op because
-//! collection at arbitrary interpreter depth needs shadowstack coverage for
-//! Rust-stack-only `PyObjectRef`s; `enable` / `disable` / `isenabled` accept
-//! calls but pyre has no generational threshold knob; `get_referrers` /
-//! `get_referents` return empty lists; the DEBUG_* constants are stubbed.
+//! Partial port of `interp_gc.py`. Explicit collection uses pyre's non-moving
+//! old-gen major, then drains the RPython finalizer queue synchronously.
 
 use pyre_object::*;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,6 +11,40 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// `gc.isenabled()` should reflect the most recent `enable`/`disable`
 /// call so callers that toggle and re-read the state stay consistent.
 static GC_ENABLED: AtomicBool = AtomicBool::new(true);
+
+fn user_del_action() -> Option<&'static mut crate::executioncontext::UserDelAction> {
+    let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
+    if ec.is_null() {
+        return None;
+    }
+    let action = unsafe { (*ec).user_del_action };
+    if action.is_null() {
+        None
+    } else {
+        Some(unsafe { &mut *action })
+    }
+}
+
+fn enable_finalizers(action: &mut crate::executioncontext::UserDelAction) {
+    if action.finalizers_lock_count == 0 {
+        return;
+    }
+    action.finalizers_lock_count -= 1;
+    if action.finalizers_lock_count == 0 {
+        if let Some(mut pending) = action.pending_with_disabled_del.take() {
+            for obj in pending.drain(..) {
+                action._call_finalizer(obj);
+            }
+        }
+    }
+}
+
+fn disable_finalizers(action: &mut crate::executioncontext::UserDelAction) {
+    action.finalizers_lock_count += 1;
+    if action.pending_with_disabled_del.is_none() {
+        action.pending_with_disabled_del = Some(Vec::new());
+    }
+}
 
 crate::py_module! {
     "gc",
@@ -31,18 +62,39 @@ crate::py_module! {
         // upstream.  MethodCache / MapAttrCache clears (`:14-17`) skipped
         // because pyre has no equivalent caches.
         "collect"       / 1 = |_| {
-            // A real collection here needs a shadowstack pass over interpreter
-            // Rust-stack `PyObjectRef`s; see the full-collect trampoline doc in
-            // `pyre-jit/src/eval.rs`. Even the non-moving old-gen major is
-            // unsound at arbitrary interpreter depth because marking cannot see
-            // Rust-stack-only references. Until that shadowstack pass exists,
-            // `collect` is a no-op and collections happen only at the JIT's own
-            // safepoints / the gated interpreter safepoint
-            // (`pyre-object/src/gc_interp.rs`).
+            pyre_object::gc_hook::try_gc_collect_oldgen();
+            if let Some(action) = user_del_action() {
+                let temp_reenable = !action.enabled_at_app_level;
+                if temp_reenable {
+                    enable_finalizers(action);
+                }
+                action._run_finalizers();
+                if temp_reenable {
+                    disable_finalizers(action);
+                }
+            }
             Ok(w_int_new(0))
         },
-        "disable"       / 0 = |_| { GC_ENABLED.store(false, Ordering::Relaxed); Ok(w_none()) },
-        "enable"        / 0 = |_| { GC_ENABLED.store(true, Ordering::Relaxed); Ok(w_none()) },
+        "disable"       / 0 = |_| {
+            GC_ENABLED.store(false, Ordering::Relaxed);
+            if let Some(action) = user_del_action() {
+                if action.enabled_at_app_level {
+                    action.enabled_at_app_level = false;
+                    disable_finalizers(action);
+                }
+            }
+            Ok(w_none())
+        },
+        "enable"        / 0 = |_| {
+            GC_ENABLED.store(true, Ordering::Relaxed);
+            if let Some(action) = user_del_action() {
+                if !action.enabled_at_app_level {
+                    action.enabled_at_app_level = true;
+                    enable_finalizers(action);
+                }
+            }
+            Ok(w_none())
+        },
         "isenabled"     / 0 = |_| Ok(w_bool_from(GC_ENABLED.load(Ordering::Relaxed))),
         "get_objects"   / 1 = |_| Ok(w_list_new(vec![])),
         "get_referrers" / * = |_| Ok(w_list_new(vec![])),

@@ -79,7 +79,7 @@ pub fn w_instance_new(w_type: PyObjectRef) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
     crate::gc_roots::pin_root(w_type);
 
-    alloc_instance_object(W_ObjectObject {
+    let obj = alloc_instance_object(W_ObjectObject {
         ob_header: PyObject {
             ob_type: &INSTANCE_TYPE as *const PyType,
             w_class: w_type,
@@ -90,7 +90,11 @@ pub fn w_instance_new(w_type: PyObjectRef) -> PyObjectRef {
         // map is the not-yet-initialized empty state.
         map: std::ptr::null(),
         storage: std::ptr::null_mut(),
-    })
+    });
+    // objspace.py `allocate_instance`: types with `hasuserdel` register the
+    // fresh instance on `space.finalizer_queue` immediately after allocation.
+    crate::gc_hook::maybe_register_finalizer(obj);
+    obj
 }
 
 /// Allocate a `W_ObjectObject` through the GC. The header is stamped

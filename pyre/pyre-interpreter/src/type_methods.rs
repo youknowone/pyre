@@ -1096,8 +1096,7 @@ fn format_render(
     depth: u32,
 ) -> Result<Wtf8Buf, crate::PyError> {
     use rustpython_common::format::{
-        FieldName, FieldNamePart, FieldType, FormatParseError, FormatPart, FormatString,
-        FromTemplate,
+        FieldName, FieldNamePart, FieldType, FormatParseError, FromTemplate,
     };
     let lookup_kwarg = |name: &str| -> Result<Option<PyObjectRef>, crate::PyError> {
         if let Some(m) = mapping {
@@ -1118,15 +1117,15 @@ fn format_render(
     if depth == 0 {
         return Err(crate::PyError::value_error("Max string recursion exceeded"));
     }
-    let parsed = FormatString::from_str(fmt).map_err(|e| format_parse_err(e, fmt))?;
+    let parsed = parse_format_parts(fmt)?;
     let mut result = Wtf8Buf::new();
-    for part in &parsed.format_parts {
+    for part in &parsed {
         let (field_name, conversion_spec, format_spec) = match part {
-            FormatPart::Literal(literal) => {
+            PyPyFormatPart::Literal(literal) => {
                 result.push_wtf8(literal);
                 continue;
             }
-            FormatPart::Field {
+            PyPyFormatPart::Field {
                 field_name,
                 conversion_spec,
                 format_spec,
@@ -1266,6 +1265,146 @@ fn format_render(
         result.push_wtf8(&formatted);
     }
     Ok(result)
+}
+
+enum PyPyFormatPart {
+    Literal(Wtf8Buf),
+    Field {
+        field_name: Wtf8Buf,
+        conversion_spec: Option<CodePoint>,
+        format_spec: Wtf8Buf,
+    },
+}
+
+fn codepoint_slice(codepoints: &[CodePoint], start: usize, end: usize) -> Wtf8Buf {
+    let mut out = Wtf8Buf::new();
+    for &cp in &codepoints[start..end] {
+        out.push(cp);
+    }
+    out
+}
+
+/// `newformat.py:TemplateFormatter._do_build_string/_parse_field`.
+/// Braces inside the first-part item lookup (`{[{]}`) are ordinary key text;
+/// braces after `:`/`!` are recursive format markup.
+fn parse_format_parts(fmt: &Wtf8) -> Result<Vec<PyPyFormatPart>, crate::PyError> {
+    let s: Vec<CodePoint> = fmt.code_points().collect();
+    let end = s.len();
+    let mut parts = Vec::new();
+    let mut literal = Wtf8Buf::new();
+    let mut i = 0usize;
+    while i < end {
+        let c = s[i];
+        if c != '{' && c != '}' {
+            literal.push(c);
+            i += 1;
+            continue;
+        }
+        if c == '}' {
+            if i + 1 == end || s[i + 1] != '}' {
+                return Err(crate::PyError::value_error(
+                    "Single '}' encountered in format string",
+                ));
+            }
+            literal.push(c);
+            i += 2;
+            continue;
+        }
+        if i + 1 == end {
+            return Err(crate::PyError::value_error(
+                "Single '{' encountered in format string",
+            ));
+        }
+        if s[i + 1] == '{' {
+            literal.push(c);
+            i += 2;
+            continue;
+        }
+        if !literal.is_empty() {
+            parts.push(PyPyFormatPart::Literal(std::mem::take(&mut literal)));
+        }
+
+        i += 1;
+        let field_start = i;
+        let mut nested = 1usize;
+        let mut in_second_part = false;
+        while i < end {
+            let c = s[i];
+            if c == '{' {
+                nested += 1;
+            } else if c == '}' {
+                nested -= 1;
+                if nested == 0 {
+                    break;
+                }
+            } else if c == '[' && !in_second_part {
+                i += 1;
+                while i < end && s[i] != ']' {
+                    i += 1;
+                }
+                continue;
+            } else if c == ':' || c == '!' {
+                in_second_part = true;
+            }
+            i += 1;
+        }
+        if nested != 0 {
+            return Err(crate::PyError::value_error(
+                "expected '}' before end of string",
+            ));
+        }
+        let field_end = i;
+
+        let mut cursor = field_start;
+        let mut field_name_end = field_end;
+        let mut conversion_spec = None;
+        let mut spec_start = field_end;
+        while cursor < field_end {
+            let c = s[cursor];
+            if c == ':' || c == '!' {
+                field_name_end = cursor;
+                if c == '!' {
+                    cursor += 1;
+                    if cursor == field_end {
+                        return Err(crate::PyError::value_error(
+                            "end of string while looking for conversion specifier",
+                        ));
+                    }
+                    conversion_spec = Some(s[cursor]);
+                    cursor += 1;
+                    if cursor < field_end {
+                        if s[cursor] != ':' {
+                            return Err(crate::PyError::value_error(
+                                "expected ':' after conversion specifier",
+                            ));
+                        }
+                        cursor += 1;
+                    }
+                } else {
+                    cursor += 1;
+                }
+                spec_start = cursor;
+                break;
+            } else if c == '[' {
+                while cursor + 1 < field_end && s[cursor + 1] != ']' {
+                    cursor += 1;
+                }
+            } else if c == '{' {
+                return Err(crate::PyError::value_error("unexpected '{' in field name"));
+            }
+            cursor += 1;
+        }
+        parts.push(PyPyFormatPart::Field {
+            field_name: codepoint_slice(&s, field_start, field_name_end),
+            conversion_spec,
+            format_spec: codepoint_slice(&s, spec_start, field_end),
+        });
+        i += 1;
+    }
+    if !literal.is_empty() {
+        parts.push(PyPyFormatPart::Literal(literal));
+    }
+    Ok(parts)
 }
 
 /// Fetch positional argument `idx`, raising the `str.format` IndexError for
@@ -2187,6 +2326,30 @@ pub fn encode_object(
     errors: &str,
 ) -> Result<Vec<u8>, crate::PyError> {
     let enc_lower = encoding.to_ascii_lowercase().replace('_', "-");
+    if crate::importing::dev_mode_flag()
+        && matches!(
+            enc_lower.as_str(),
+            "utf-8"
+                | "utf8"
+                | "u8"
+                | "ascii"
+                | "us-ascii"
+                | "646"
+                | "latin-1"
+                | "latin1"
+                | "iso-8859-1"
+                | "8859"
+                | "raw-unicode-escape"
+                | "utf-16"
+                | "utf-16-le"
+                | "utf-16-be"
+                | "utf-32"
+                | "utf-32-le"
+                | "utf-32-be"
+        )
+    {
+        crate::module::_codecs::validate_error_handler(errors)?;
+    }
     if matches!(enc_lower.as_str(), "utf-8" | "utf8" | "u8") {
         return encode_utf8_with_errors(w_object, errors);
     }
@@ -2244,7 +2407,7 @@ pub fn encode_raw_unicode_escape(s: &Wtf8) -> Vec<u8> {
 /// [`encode_raw_unicode_escape`].  A backslash starts a `\uXXXX` /
 /// `\UXXXXXXXX` escape; any other byte (including a lone backslash or a
 /// malformed escape) is taken as a Latin-1 code point.
-pub fn decode_raw_unicode_escape(data: &[u8]) -> Result<Wtf8Buf, crate::PyError> {
+pub fn decode_raw_unicode_escape(data: &[u8], errors: &str) -> Result<Wtf8Buf, crate::PyError> {
     let mut out = Wtf8Buf::new();
     let mut i = 0usize;
     while i < data.len() {
@@ -2265,17 +2428,59 @@ pub fn decode_raw_unicode_escape(data: &[u8]) -> Result<Wtf8Buf, crate::PyError>
             Some(b'U') => 8usize,
             _ => 0,
         };
-        if want != 0 && i + 2 + want <= data.len() {
-            let hex = &data[i + 2..i + 2 + want];
-            if let Ok(hs) = std::str::from_utf8(hex) {
-                if let Ok(v) = u32::from_str_radix(hs, 16) {
-                    if let Some(c) = CodePoint::from_u32(v) {
-                        out.push(c);
-                        i += 2 + want;
-                        continue;
+        if want != 0 {
+            let escape_start = i;
+            let digits_start = i + 2;
+            let available_end = (digits_start + want).min(data.len());
+            let mut hex_end = digits_start;
+            while hex_end < available_end && data[hex_end].is_ascii_hexdigit() {
+                hex_end += 1;
+            }
+            let numeric = if available_end == digits_start + want && hex_end == available_end {
+                std::str::from_utf8(&data[digits_start..available_end])
+                    .ok()
+                    .and_then(|s| u32::from_str_radix(s, 16).ok())
+            } else {
+                None
+            };
+            let parsed = numeric.and_then(CodePoint::from_u32);
+            if let Some(c) = parsed {
+                out.push(c);
+                i = available_end;
+                continue;
+            }
+            let error_end = if available_end < digits_start + want {
+                hex_end
+            } else {
+                available_end
+            };
+            let reason = if numeric.is_some() {
+                "illegal Unicode character"
+            } else if want == 4 {
+                "truncated \\uXXXX escape"
+            } else {
+                "truncated \\UXXXXXXXX escape"
+            };
+            match errors {
+                "ignore" => {}
+                "replace" => out.push_char('\u{FFFD}'),
+                "backslashreplace" => {
+                    for &byte in &data[escape_start..error_end] {
+                        out.push_str(&format!("\\x{byte:02x}"));
                     }
                 }
+                _ => {
+                    return Err(crate::typedef::unicode_decode_error(
+                        "rawunicodeescape",
+                        data,
+                        escape_start,
+                        error_end,
+                        reason,
+                    ));
+                }
             }
+            i = error_end;
+            continue;
         }
         // Not a valid escape — emit the backslash literally as Latin-1.
         out.push_char(b as char);

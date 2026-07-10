@@ -36,6 +36,35 @@ enum RunMode {
     },
 }
 
+#[derive(Clone, Copy)]
+struct LaunchFlags {
+    inspect: bool,
+    quiet: bool,
+    no_site: bool,
+    no_user_site: bool,
+    ignore_environment: bool,
+    isolated: bool,
+    dev_mode: bool,
+    utf8_mode: i64,
+    safe_path: bool,
+}
+
+impl Default for LaunchFlags {
+    fn default() -> Self {
+        Self {
+            inspect: false,
+            quiet: false,
+            no_site: false,
+            no_user_site: false,
+            ignore_environment: false,
+            isolated: false,
+            dev_mode: false,
+            utf8_mode: 1,
+            safe_path: false,
+        }
+    }
+}
+
 fn usage(binary_name: &str) -> String {
     format!(
         "\
@@ -45,10 +74,13 @@ Options:
 -m mod : run library module as a script (terminates option list)
 -h     : print this help message and exit (also --help)
 -i     : inspect interactively after running script
+-E     : ignore PYTHON* environment variables
+-I     : isolate Python from the user's environment
 -O     : optimize (no-op, reserved for compatibility)
 -q     : don't print version on interactive startup
 -S     : don't imply 'import site' on initialization
 -V     : print the Python version number and exit (also --version)
+-X opt : set implementation-specific option
 file   : program read from script file
 -      : program read from stdin (default; interactive mode if a tty)
 arg ...: arguments passed to program in sys.argv[1:]
@@ -71,34 +103,48 @@ fn drain_args(parser: &mut lexopt::Parser) -> Result<Vec<String>, lexopt::Error>
     Ok(rest)
 }
 
-fn parse_args(
-    binary_name: &str,
-) -> Result<(RunMode, bool, bool, bool, Vec<String>), lexopt::Error> {
+fn parse_args(binary_name: &str) -> Result<(RunMode, LaunchFlags, Vec<String>), lexopt::Error> {
     let mut parser = lexopt::Parser::from_env();
-    let mut inspect = false;
-    let mut quiet = false;
-    let mut no_site = false;
+    let mut flags = LaunchFlags::default();
 
     while let Some(arg) = parser.next()? {
         match arg {
             Short('c') => {
                 let cmd = parser.value()?.string()?;
                 let rest = drain_args(&mut parser)?;
-                return Ok((RunMode::Command(cmd), inspect, quiet, no_site, rest));
+                return Ok((RunMode::Command(cmd), flags, rest));
             }
             Short('m') => {
                 let module = parser.value()?.string()?;
                 let rest = drain_args(&mut parser)?;
-                return Ok((RunMode::Module(module), inspect, quiet, no_site, rest));
+                return Ok((RunMode::Module(module), flags, rest));
             }
             Short('h') | Long("help") => {
                 print!("{}", usage(binary_name));
                 std::process::exit(0);
             }
-            Short('i') => inspect = true,
+            Short('i') => flags.inspect = true,
+            // app_main.py `cmdline_options['E']` / `X_option`.
+            Short('E') => flags.ignore_environment = true,
+            // app_main.py `isolated_option`: -I implies -E, -s and -P.
+            Short('I') => {
+                flags.isolated = true;
+                flags.ignore_environment = true;
+                flags.no_user_site = true;
+                flags.safe_path = true;
+            }
+            Short('X') => {
+                let option = parser.value()?.string()?;
+                match option.as_str() {
+                    "dev" => flags.dev_mode = true,
+                    "utf8" | "utf8=1" => flags.utf8_mode = 1,
+                    "utf8=0" => flags.utf8_mode = 0,
+                    _ => {}
+                }
+            }
             Short('O') => {} // no-op
-            Short('q') => quiet = true,
-            Short('S') => no_site = true,
+            Short('q') => flags.quiet = true,
+            Short('S') => flags.no_site = true,
             Short('V') | Long("version") => {
                 println!("{binary_name} 0.0.1");
                 std::process::exit(0);
@@ -107,18 +153,18 @@ fn parse_args(
                 let script = script.string()?;
                 if script == "interact" {
                     let mode = parse_interact(&mut parser)?;
-                    return Ok((mode, inspect, quiet, no_site, vec![]));
+                    return Ok((mode, flags, vec![]));
                 }
                 if script == "-" {
-                    return Ok((RunMode::Repl, inspect, quiet, no_site, vec![]));
+                    return Ok((RunMode::Repl, flags, vec![]));
                 }
                 let rest = drain_args(&mut parser)?;
-                return Ok((RunMode::Script(script), inspect, quiet, no_site, rest));
+                return Ok((RunMode::Script(script), flags, rest));
             }
             _ => return Err(arg.unexpected()),
         }
     }
-    Ok((RunMode::Repl, inspect, quiet, no_site, vec![]))
+    Ok((RunMode::Repl, flags, vec![]))
 }
 
 /// Parse a `--heapsize` value (`pypy_interact.py:88-102`): a byte count with an
@@ -294,13 +340,24 @@ fn real_main(binary_name: &str) {
             default_hook(info);
         }
     }));
-    let (mode, inspect, quiet, no_site, args) = match parse_args(binary_name) {
+    let (mode, flags, args) = match parse_args(binary_name) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("{binary_name}: {e}");
             std::process::exit(2);
         }
     };
+    let LaunchFlags {
+        inspect,
+        quiet,
+        no_site,
+        no_user_site,
+        ignore_environment,
+        isolated,
+        dev_mode,
+        utf8_mode,
+        safe_path,
+    } = flags;
 
     // The `interact` controller does not run the embedded interpreter; it only
     // spawns and relays for an untrusted child, so it skips the interpreter
@@ -334,6 +391,14 @@ fn real_main(binary_name: &str) {
     // Record `-S` before the first `import sys` so `sys.flags.no_site`
     // reflects whether site initialization was skipped.
     importing::set_no_site(no_site);
+    importing::set_runtime_flags(
+        no_user_site,
+        ignore_environment,
+        isolated,
+        dev_mode,
+        utf8_mode,
+        safe_path,
+    );
 
     // OS-level hardening (default-on in any Linux `sandbox` build): lock the
     // sandboxed child to a host-neutral syscall allowlist so any un-mediated
@@ -542,6 +607,7 @@ fn setup_exec_context() -> Rc<PyExecutionContext> {
     set_last_exec_ctx(Rc::as_ptr(&execution_context));
     unsafe {
         let ec_ptr = Rc::as_ptr(&execution_context) as *mut PyExecutionContext;
+        (*ec_ptr).install_user_del_action();
         pyre_interpreter::module::signal::interp_signal::install_signal_handling(&mut *ec_ptr);
     }
     execution_context

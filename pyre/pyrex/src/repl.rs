@@ -54,6 +54,8 @@ pub fn run_repl(quiet: bool, no_site: bool) {
     // process, and register the periodic signal-check action.
     unsafe {
         let ec_ptr = Rc::as_ptr(&execution_context) as *mut PyExecutionContext;
+        pyre_interpreter::call::set_last_exec_ctx(ec_ptr);
+        (*ec_ptr).install_user_del_action();
         pyre_interpreter::module::signal::interp_signal::install_signal_handling(&mut *ec_ptr);
     }
 

@@ -103,6 +103,46 @@ pub fn w_str_from_wtf8(value: Wtf8Buf) -> PyObjectRef {
     }) as PyObjectRef
 }
 
+/// Allocate a `str` subclass instance through the stable GC allocator.
+/// PyPy's `W_UnicodeObject` subclass is an ordinary GC object; exact strings
+/// remain on pyre's existing immortal/interned path, while subclass identity
+/// and app-level finalization require collector ownership.
+pub fn w_str_subclass_from_wtf8(value: Wtf8Buf, w_class: PyObjectRef) -> PyObjectRef {
+    let byte_len = value.len();
+    let char_len = value.code_points().count();
+    let value = crate::lltype::malloc_raw(value);
+    let unicode = W_UnicodeObject {
+        ob_header: PyObject {
+            ob_type: &STR_TYPE as *const PyType,
+            w_class,
+        },
+        value,
+        byte_len,
+        len: char_len,
+    };
+    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_UNICODE_GC_TYPE_ID, W_UNICODE_OBJECT_SIZE);
+    let obj = if raw.is_null() {
+        crate::lltype::malloc_typed(unicode) as PyObjectRef
+    } else {
+        unsafe {
+            std::ptr::write(raw as *mut W_UnicodeObject, unicode);
+            raw as PyObjectRef
+        }
+    };
+    crate::gc_hook::maybe_register_finalizer(obj);
+    obj
+}
+
+/// Lightweight GC destructor for the off-heap WTF-8 buffer owned by a
+/// managed `W_UnicodeObject`.
+pub unsafe fn unicode_object_destructor(obj_addr: usize) {
+    let obj = unsafe { &mut *(obj_addr as *mut W_UnicodeObject) };
+    if !obj.value.is_null() {
+        unsafe { drop(Box::from_raw(obj.value)) };
+        obj.value = std::ptr::null_mut();
+    }
+}
+
 thread_local! {
     /// String constant interning cache — single-threaded, no lock needed.
     /// RPython has no equivalent lock; string interning is handled by the

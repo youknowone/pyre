@@ -538,7 +538,9 @@ pub const TICK_COUNTER_STEP: usize = 100;
 pub struct WRootFinalizerQueue;
 
 impl WRootFinalizerQueue {
-    pub fn finalizer_trigger(&mut self) {}
+    pub fn finalizer_trigger(&mut self) {
+        finalizer_queue_trigger();
+    }
 
     /// `pypy/interpreter/executioncontext.py:640` —
     /// `self.space.finalizer_queue.next_dead()`.
@@ -546,14 +548,32 @@ impl WRootFinalizerQueue {
     /// Returns the next `w_obj` whose finalizer should run, or `None`
     /// when the death queue is empty.
     ///
-    /// TODO: the real death queue requires GC
-    /// integration to land a
-    /// `WRootFinalizerQueue` instance backed by `rgc.FinalizerQueue`.
-    /// Until then this is a constant-`None` stub so callers
-    /// (`UserDelAction::_run_finalizers`) can mirror PyPy's loop shape
-    /// line-by-line.
     pub fn next_dead(&mut self) -> Option<PyObjectRef> {
-        None
+        let obj = pyre_object::gc_hook::try_gc_finalizer_next_dead(0);
+        (!obj.is_null()).then_some(obj)
+    }
+}
+
+fn finalizer_queue_trigger() {
+    let ec = crate::call::getexecutioncontext() as *mut ExecutionContext;
+    if ec.is_null() {
+        return;
+    }
+    unsafe {
+        let action = (*ec).user_del_action;
+        if !action.is_null() {
+            (*action).fire();
+        }
+    }
+}
+
+/// objspace.py `allocate_instance` finalizer registration callback.
+pub fn maybe_register_user_finalizer(obj: PyObjectRef) {
+    let Some(w_type) = crate::typedef::r#type(obj) else {
+        return;
+    };
+    if unsafe { crate::baseobjspace::lookup_in_type(w_type, "__del__") }.is_some() {
+        pyre_object::gc_hook::try_gc_register_finalizer(0, obj, finalizer_queue_trigger);
     }
 }
 
@@ -578,6 +598,9 @@ pub struct ExecutionContext {
     pub thread_disappeared: bool,
     pub w_async_exception_type: PyObjectRef,
     pub actionflag: ActionFlag,
+    /// `space.user_del_action`, allocated after the ExecutionContext reaches
+    /// its stable process-lifetime address.
+    pub user_del_action: *mut UserDelAction,
     /// `pypy/objspace/std/dictmultiobject.py:60-69
     /// allocate_and_init_instance(module=True)` parity — the builtins
     /// module's `w_dict` is a `W_ModuleDictObject` backed by
@@ -663,6 +686,7 @@ impl ExecutionContext {
             thread_disappeared: false,
             w_async_exception_type: pyre_object::PY_NULL,
             actionflag: ActionFlag::new(),
+            user_del_action: std::ptr::null_mut(),
             builtins_module,
             builtin_dict_cache: std::cell::Cell::new(pyre_object::PY_NULL),
             check_signal_action: None,
@@ -673,6 +697,14 @@ impl ExecutionContext {
     pub fn __init__(&mut self, space: PyObjectRef) {
         self.space = space;
         self.compiler = pyre_object::w_none();
+    }
+
+    pub fn install_user_del_action(&mut self) {
+        if self.user_del_action.is_null() {
+            let action = UserDelAction::new(self.space, &mut self.actionflag);
+            self.user_del_action = Box::into_raw(action);
+        }
+        pyre_object::gc_hook::register_maybe_finalizer_hook(maybe_register_user_finalizer);
     }
 
     #[inline]
@@ -950,7 +982,9 @@ impl ExecutionContext {
     }
 
     pub fn _run_finalizers_now(&mut self) {
-        let _ = self;
+        if !self.user_del_action.is_null() {
+            unsafe { (*self.user_del_action)._run_finalizers() };
+        }
     }
 
     /// pypy/interpreter/executioncontext.py:185-200 `run_trace_func`.
@@ -2338,8 +2372,22 @@ impl UserDelAction {
         }
     }
 
-    pub fn _call_finalizer(&mut self, _w_obj: PyObjectRef) {
-        let _ = _w_obj;
+    pub fn _call_finalizer(&mut self, w_obj: PyObjectRef) {
+        let Some(w_type) = crate::typedef::r#type(w_obj) else {
+            return;
+        };
+        let Some(w_del) = (unsafe { crate::baseobjspace::lookup_in_type(w_type, "__del__") })
+        else {
+            return;
+        };
+        if self.gc_disabled(w_obj) {
+            return;
+        }
+        if let Err(error) =
+            unsafe { crate::baseobjspace::get_and_call_function(w_del, w_obj, w_type, &[]) }
+        {
+            report_error(self.base.space, &error, "", w_del);
+        }
     }
 }
 
@@ -2365,8 +2413,15 @@ impl AsyncActionOps for UserDelAction {
     }
 }
 
-pub fn report_error(_space: PyObjectRef, _e: PyObjectRef, _where_desc: &str, _w_obj: PyObjectRef) {
-    let _ = (_space, _e, _where_desc, _w_obj);
+pub fn report_error(
+    _space: PyObjectRef,
+    error: &crate::PyError,
+    where_desc: &str,
+    _w_obj: PyObjectRef,
+) {
+    crate::host_seam::emit_stderr(
+        format!("Exception ignored in {where_desc}__del__: {error}\n").as_bytes(),
+    );
 }
 
 pub fn make_finalizer_queue<WRoot>(w_root: WRoot, _space: PyObjectRef) -> WRootFinalizerQueue {

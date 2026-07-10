@@ -5021,8 +5021,7 @@ pub fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         // intobject.py:1047 — unicode is normalized through
         // `unicode_to_decimal_w` so non-ASCII decimal digits parse.
         if unsafe { is_str(obj) } {
-            let s = unsafe { w_str_get_value(obj) };
-            return parse_int_from_str(&unicode_to_decimal(s), 10);
+            return parse_int_from_str(&unicode_to_decimal_w(obj)?, 10);
         }
         // intobject.py:1056-1070 — bytes / bytearray, then any object
         // exposing a readable buffer (`space.charbuf_w`).
@@ -5042,7 +5041,7 @@ pub fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     unsafe {
         // intobject.py:1079 — unicode normalized through `unicode_to_decimal_w`.
         if is_str(obj) {
-            return parse_int_from_str(&unicode_to_decimal(w_str_get_value(obj)), base);
+            return parse_int_from_str(&unicode_to_decimal_w(obj)?, base);
         }
         // With an explicit base only str / bytes / bytearray are accepted.
         if pyre_object::bytesobject::is_bytes_like(obj) {
@@ -5145,25 +5144,54 @@ pub(crate) fn getindex_w(w_obj: PyObjectRef) -> Result<i64, crate::PyError> {
 /// becomes its ASCII digit and non-ASCII whitespace becomes a space, so
 /// `int("４２")` and `float("١٫٥")`-style inputs parse.  An all-ASCII string
 /// is returned untouched.
-fn unicode_to_decimal(s: &str) -> std::borrow::Cow<'_, str> {
-    if s.is_ascii() {
-        return std::borrow::Cow::Borrowed(s);
+fn unicode_to_decimal_w(
+    w_unistr: PyObjectRef,
+) -> Result<std::borrow::Cow<'static, str>, crate::PyError> {
+    let utf8 = unsafe { w_str_get_wtf8(w_unistr) };
+    if let Ok(s) = utf8.as_str()
+        && s.is_ascii()
+    {
+        return Ok(std::borrow::Cow::Borrowed(s));
     }
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        if c as u32 > 127 {
-            if c.is_whitespace() {
+
+    // unicodeobject.py `_unicode_to_decimal_w`: iterate the internal UTF-8
+    // representation by code point, translate Unicode decimal digits and
+    // whitespace, then encode each result as strict UTF-8.  WTF-8 exposes the
+    // same surrogate-bearing representation as RPython's rutf8 iterator.
+    let ucd = rustpython_unicode::Ucd::new(true);
+    let mut out = String::with_capacity(utf8.len());
+    for (pos, cp) in utf8.code_points().enumerate() {
+        let mut c = cp;
+        if c.to_u32() > 127 {
+            let Some(ch) = c.to_char() else {
+                return Err(crate::typedef::unicode_encode_error(
+                    "utf-8",
+                    w_unistr,
+                    pos,
+                    pos + 1,
+                    "surrogates not allowed",
+                ));
+            };
+            if ch.is_whitespace() {
                 out.push(' ');
                 continue;
             }
-            if let Some(v) = rustpython_unicode::Ucd::new(true).decimal(CodePoint::from(c)) {
-                out.push((b'0' + v as u8) as char);
-                continue;
+            if let Some(v) = ucd.decimal(c) {
+                c = CodePoint::from((b'0' + v as u8) as char);
             }
         }
-        out.push(c);
+        let Some(ch) = c.to_char() else {
+            return Err(crate::typedef::unicode_encode_error(
+                "utf-8",
+                w_unistr,
+                pos,
+                pos + 1,
+                "surrogates not allowed",
+            ));
+        };
+        out.push(ch);
     }
-    std::borrow::Cow::Owned(out)
+    Ok(std::borrow::Cow::Owned(out))
 }
 
 /// Parse an integer from a string with the given base.
@@ -5311,11 +5339,13 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             return Ok(floatobject::w_float_new(v));
         }
         if is_str(obj) {
-            let raw = w_str_get_value(obj);
             // floatobject.py:242 — unicode is normalized through
             // `unicode_to_decimal_w` before `_string_to_float`, so non-ASCII
             // decimal digits parse.
-            let s = unicode_to_decimal(raw);
+            let s = unicode_to_decimal_w(obj)?;
+            // The strict conversion above rejected any surrogate, so the
+            // original object now has a valid UTF-8 view for the error text.
+            let raw = w_str_get_value(obj);
             // `float_from_string` strips PEP 515 underscore separators
             // (between digits only) before parsing; the numeric conversion
             // uses the Python-literal float grammar.
@@ -9422,8 +9452,11 @@ pub(crate) fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
                     "complex() can't take second arg if first is a string",
                 ));
             }
-            let s = unsafe { w_str_get_value(a) };
-            let (r, i) = parse_complex_str(s).ok_or_else(|| {
+            // complexobject.py:342 applies `unicode_to_decimal_w` before
+            // underscore removal and parsing, including strict surrogate
+            // rejection.
+            let s = unicode_to_decimal_w(a)?;
+            let (r, i) = parse_complex_str(&s).ok_or_else(|| {
                 crate::PyError::new(
                     crate::PyErrorKind::ValueError,
                     format!("complex() arg is a malformed string"),

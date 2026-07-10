@@ -1161,6 +1161,12 @@ thread_local! {
     static SYS_ARGV_PENDING: std::cell::Cell<pyre_object::PyObjectRef> =
         const { std::cell::Cell::new(pyre_object::PY_NULL) };
     static SYS_NO_SITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static SYS_NO_USER_SITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static SYS_IGNORE_ENVIRONMENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static SYS_ISOLATED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static SYS_DEV_MODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static SYS_UTF8_MODE: std::cell::Cell<i64> = const { std::cell::Cell::new(1) };
+    static SYS_SAFE_PATH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Record whether the launcher was given `-S` (no `site` import), so the
@@ -1173,6 +1179,49 @@ pub fn set_no_site(no_site: bool) {
 /// Read the `-S` flag for `sys.flags.no_site`.
 pub fn no_site_flag() -> bool {
     SYS_NO_SITE.with(|p| p.get())
+}
+
+/// Record the command-line flags consumed by `app_main.py` before `sys` is
+/// initialized.  The codec paths also read `dev_mode` directly, matching
+/// `space.sys.get_flag('dev_mode')` in `unicodeobject.py`.
+pub fn set_runtime_flags(
+    no_user_site: bool,
+    ignore_environment: bool,
+    isolated: bool,
+    dev_mode: bool,
+    utf8_mode: i64,
+    safe_path: bool,
+) {
+    SYS_NO_USER_SITE.with(|p| p.set(no_user_site));
+    SYS_IGNORE_ENVIRONMENT.with(|p| p.set(ignore_environment));
+    SYS_ISOLATED.with(|p| p.set(isolated));
+    SYS_DEV_MODE.with(|p| p.set(dev_mode));
+    SYS_UTF8_MODE.with(|p| p.set(utf8_mode));
+    SYS_SAFE_PATH.with(|p| p.set(safe_path));
+}
+
+pub fn no_user_site_flag() -> bool {
+    SYS_NO_USER_SITE.with(|p| p.get())
+}
+
+pub fn ignore_environment_flag() -> bool {
+    SYS_IGNORE_ENVIRONMENT.with(|p| p.get())
+}
+
+pub fn isolated_flag() -> bool {
+    SYS_ISOLATED.with(|p| p.get())
+}
+
+pub fn dev_mode_flag() -> bool {
+    SYS_DEV_MODE.with(|p| p.get())
+}
+
+pub fn utf8_mode_flag() -> i64 {
+    SYS_UTF8_MODE.with(|p| p.get())
+}
+
+pub fn safe_path_flag() -> bool {
+    SYS_SAFE_PATH.with(|p| p.get())
 }
 
 /// Called from sys module init to pick up any pending argv.
