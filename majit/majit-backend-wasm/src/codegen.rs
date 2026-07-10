@@ -1129,13 +1129,16 @@ fn build_function(
     // flag-off module keeps exactly one i32 local (byte-identical).
     let ca_cfp_local = num_vars + UMULHI_SCRATCH + 2;
     let ca_fi_local = num_vars + UMULHI_SCRATCH + 3;
-    // One more i32 scratch when the inline nursery-bump fast path is armed:
-    // it holds the loaded `nursery_free` across the bump/commit sequence.
+    // Extra i32 scratches when the inline nursery-bump fast path is armed:
+    // one holds the loaded `nursery_free` across the bump/commit sequence;
+    // runtime varsize array allocation also needs one for the computed
+    // total/new-free word.
     let base_i32_locals: u32 = if ca.emit_ca { 3 } else { 1 };
     let alloc_scratch_local = num_vars + UMULHI_SCRATCH + 1 + base_i32_locals;
+    let alloc_size_local = alloc_scratch_local + 1;
     let mut func = Function::new(vec![
         (num_vars + UMULHI_SCRATCH, ValType::I64),
-        (base_i32_locals + nursery.is_some() as u32, ValType::I32),
+        (base_i32_locals + if nursery.is_some() { 2 } else { 0 }, ValType::I32),
     ]);
     let mut sink = func.instructions();
 
@@ -2777,28 +2780,56 @@ fn build_function(
                     .map_or(0i64, |ld| ld.offset() as i64);
                 let type_id = ad.map_or(0i64, |ad| ad.type_id() as i64);
 
-                // Inline nursery bump for a CONSTANT-length array of a plain
-                // type under the large-object threshold (same fast path as the
-                // `New` arm — the total is a compile-time constant, and the
-                // nursery is bulk-zeroed on reset so `NewArrayClear`'s cleared
-                // items come for free, exactly like the helper). Writes the
-                // header word and the length field inline. A runtime-length
-                // array keeps the helper call.
-                let inline_nursery_total = const_operand_value(constants, op.arg(0).to_opref())
-                    .and_then(|len| {
+                // Inline nursery bump for arrays of a plain type under the
+                // large-object threshold (same fast path as the `New` arm).
+                // Constant lengths keep the existing compile-time total; a
+                // runtime length uses malloc_cond_varsize's precheck against a
+                // compile-time maxlength before computing the bump size.
+                // The nursery is bulk-zeroed on reset so `NewArrayClear`'s
+                // cleared items come for free, exactly like the helper.
+                let length_const = const_operand_value(constants, op.arg(0).to_opref());
+                let inline_nursery_total = length_const.and_then(|len| {
+                    use majit_gc::header::GcHeader;
+                    let len = usize::try_from(len).ok()?;
+                    let payload = (base_size as usize)
+                        .checked_add((item_size as usize).checked_mul(len)?)?;
+                    let total =
+                        ((GcHeader::SIZE + payload).max(GcHeader::MIN_NURSERY_OBJ_SIZE) + 7) & !7;
+                    let na = nursery.filter(|na| {
+                        total <= na.large_threshold
+                            && u32::try_from(type_id).is_ok_and(|t| na.plain_tids.contains(&t))
+                    })?;
+                    Some((total, len, na))
+                });
+                let inline_nursery_varsize = if length_const.is_none() {
+                    (|| {
                         use majit_gc::header::GcHeader;
-                        let len = usize::try_from(len).ok()?;
-                        let payload = (base_size as usize)
-                            .checked_add((item_size as usize).checked_mul(len)?)?;
-                        let total =
-                            ((GcHeader::SIZE + payload).max(GcHeader::MIN_NURSERY_OBJ_SIZE) + 7)
-                                & !7;
+                        let base_size_usize = usize::try_from(base_size).ok()?;
+                        let item_size_usize = usize::try_from(item_size).ok()?;
+                        let base_total = GcHeader::SIZE.checked_add(base_size_usize)?;
                         let na = nursery.filter(|na| {
-                            total <= na.large_threshold
-                                && u32::try_from(type_id).is_ok_and(|t| na.plain_tids.contains(&t))
+                            u32::try_from(type_id).is_ok_and(|t| na.plain_tids.contains(&t))
                         })?;
-                        Some((total, len, na))
-                    });
+                        // malloc_cond_varsize checks the length before doing
+                        // the scaled size calculation.  Use the largest length
+                        // whose rounded total still fits under the nursery
+                        // large-object threshold, capped to wasm32's usize
+                        // length field.
+                        let threshold = na.large_threshold.min(u32::MAX as usize) & !7;
+                        if threshold < GcHeader::MIN_NURSERY_OBJ_SIZE || base_total > threshold {
+                            return None;
+                        }
+                        let max_len = if item_size_usize == 0 {
+                            u32::MAX as usize
+                        } else {
+                            ((threshold - base_total) / item_size_usize).min(u32::MAX as usize)
+                        };
+                        let max_len = i64::try_from(max_len).ok()?;
+                        Some((max_len, base_total as i64, item_size_usize as i64, na))
+                    })()
+                } else {
+                    None
+                };
                 if let (Some(base), Some((total_size, length, na))) =
                     (residual_type_base, inline_nursery_total)
                 {
@@ -2876,6 +2907,125 @@ fn build_function(
                     } else {
                         sink.drop();
                     }
+                } else if let (Some(base), Some((max_len, base_total, item_size, na))) =
+                    (residual_type_base, inline_nursery_varsize)
+                {
+                    // malloc_cond_varsize: negative lengths compare greater in
+                    // the unsigned precheck and go to the collecting slow path.
+                    emit_resolve(&mut sink, constants, op.arg(0).to_opref());
+                    sink.i64_const(max_len);
+                    sink.i64_gt_u();
+                    sink.if_(BlockType::Result(ValType::I64));
+                    sink.i64_const(type_id);
+                    sink.i64_const(base_size);
+                    sink.i64_const(item_size);
+                    emit_resolve(&mut sink, constants, op.arg(0).to_opref());
+                    sink.i64_const(len_offset);
+                    sink.i32_const(alloc_array_fn_ptr as i32);
+                    sink.call_indirect(0, base + 5);
+                    emit_reload_refs_from_homes(
+                        &mut sink,
+                        ref_homes,
+                        &liveness,
+                        op_idx,
+                        (!OpRef::raw_is_constant(vi)).then_some(vi),
+                    );
+                    sink.else_();
+                    // total = round_up_8(max(header + base + item * length,
+                    // MIN_NURSERY_OBJ_SIZE)).
+                    emit_resolve(&mut sink, constants, op.arg(0).to_opref());
+                    sink.i64_const(item_size);
+                    sink.i64_mul();
+                    sink.i64_const(base_total);
+                    sink.i64_add();
+                    sink.i32_wrap_i64();
+                    sink.local_set(alloc_size_local);
+                    sink.local_get(alloc_size_local);
+                    sink.i32_const(majit_gc::header::GcHeader::MIN_NURSERY_OBJ_SIZE as i32);
+                    sink.i32_lt_u();
+                    sink.if_(BlockType::Result(ValType::I32));
+                    sink.i32_const(majit_gc::header::GcHeader::MIN_NURSERY_OBJ_SIZE as i32);
+                    sink.else_();
+                    sink.local_get(alloc_size_local);
+                    sink.end();
+                    sink.i32_const(7);
+                    sink.i32_add();
+                    sink.i32_const(-8);
+                    sink.i32_and();
+                    sink.local_set(alloc_size_local);
+
+                    // free = *nursery_free; new_free = free + total
+                    sink.i32_const(na.free_addr as i32);
+                    sink.i32_load(MemArg {
+                        offset: 0,
+                        align: 2,
+                        memory_index: 0,
+                    });
+                    sink.local_tee(alloc_scratch_local);
+                    sink.local_get(alloc_size_local);
+                    sink.i32_add();
+                    sink.local_tee(alloc_size_local);
+                    sink.i32_const(na.top_addr as i32);
+                    sink.i32_load(MemArg {
+                        offset: 0,
+                        align: 2,
+                        memory_index: 0,
+                    });
+                    sink.i32_gt_u();
+                    sink.if_(BlockType::Result(ValType::I64));
+                    sink.i64_const(type_id);
+                    sink.i64_const(base_size);
+                    sink.i64_const(item_size);
+                    emit_resolve(&mut sink, constants, op.arg(0).to_opref());
+                    sink.i64_const(len_offset);
+                    sink.i32_const(alloc_array_fn_ptr as i32);
+                    sink.call_indirect(0, base + 5);
+                    emit_reload_refs_from_homes(
+                        &mut sink,
+                        ref_homes,
+                        &liveness,
+                        op_idx,
+                        (!OpRef::raw_is_constant(vi)).then_some(vi),
+                    );
+                    sink.else_();
+                    // Commit: *nursery_free = new_free.
+                    sink.i32_const(na.free_addr as i32);
+                    sink.local_get(alloc_size_local);
+                    sink.i32_store(MemArg {
+                        offset: 0,
+                        align: 2,
+                        memory_index: 0,
+                    });
+                    // Header word: `GcHeader::new(tid)` — flags 0.
+                    sink.local_get(alloc_scratch_local);
+                    sink.i64_const(type_id);
+                    sink.i64_store(MemArg {
+                        offset: 0,
+                        align: 3,
+                        memory_index: 0,
+                    });
+                    // Length field (usize, 4 bytes on wasm32) at
+                    // `payload + len_offset`.
+                    sink.local_get(alloc_scratch_local);
+                    emit_resolve(&mut sink, constants, op.arg(0).to_opref());
+                    sink.i32_wrap_i64();
+                    sink.i32_store(MemArg {
+                        offset: majit_gc::header::GcHeader::SIZE as u64 + len_offset as u64,
+                        align: 2,
+                        memory_index: 0,
+                    });
+                    // Result payload pointer = free + header size.
+                    sink.local_get(alloc_scratch_local);
+                    sink.i32_const(majit_gc::header::GcHeader::SIZE as i32);
+                    sink.i32_add();
+                    sink.i64_extend_i32_u();
+                    sink.end();
+                    sink.end();
+                    if !OpRef::raw_is_constant(vi) {
+                        sink.local_set(1 + vi);
+                    } else {
+                        sink.drop();
+                    }
                 } else if let Some(base) = residual_type_base {
                     // Direct in-module allocation, like the `New` arm:
                     // `wasm_jit_alloc_array(type_id, base_size, item_size,
@@ -2934,8 +3084,10 @@ fn build_function(
                     }
                 }
                 // `wasm_jit_alloc_array` collects; reload other live Refs. The
-                // inline-bump path already emitted this inside its slow arm.
-                if residual_type_base.is_none() || inline_nursery_total.is_none() {
+                // inline-bump paths already emitted this inside their slow arms.
+                if residual_type_base.is_none()
+                    || (inline_nursery_total.is_none() && inline_nursery_varsize.is_none())
+                {
                     let skip = (!OpRef::raw_is_constant(vi)).then_some(vi);
                     emit_reload_refs_from_homes(&mut sink, ref_homes, &liveness, op_idx, skip);
                 }
