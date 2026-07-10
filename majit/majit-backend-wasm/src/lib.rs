@@ -450,6 +450,13 @@ pub extern "C" fn wasm_jit_write_barrier(obj: i64) -> i64 {
 }
 
 thread_local! {
+    /// Per-gcmap cache of the contiguous marked-item runs to re-zero on CA
+    /// frame reuse: `(gcmap_ptr, &[(first_item, item_count)])`. One gcmap is
+    /// built per CA bridge and leaked for the program's life, so a linear
+    /// scan over a handful of entries resolves in one pointer compare and
+    /// the derived runs can be leaked alongside it.
+    static CA_GCMAP_ZERO_RUNS: std::cell::RefCell<Vec<(usize, &'static [(usize, usize)])>> =
+        const { std::cell::RefCell::new(Vec::new()) };
     /// Live CA callee frames in recursion order (mirrors the CA entries on
     /// the jf shadow stack): `(frame_addr, alloc_capacity_bytes)`. Popped
     /// into [`CA_FRAME_POOL`] by `wasm_jit_ca_pop_frame`.
@@ -462,6 +469,69 @@ thread_local! {
     /// jitframes and are never freed (bounded by peak recursion depth).
     static CA_FRAME_POOL: std::cell::RefCell<Vec<(usize, usize)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Contiguous runs of gcmap-marked jf_frame items for a CA callee gcmap, as
+/// `(first_item, item_count)` pairs — the slots [`wasm_jit_ca_alloc_frame`]
+/// must re-zero when reusing a pooled frame. Derived once per gcmap (built by
+/// [`build_callee_gcmap`], leaked per bridge) and cached: the marked items are
+/// the CA input slots and the Ref-home region, i.e. two dense runs, so frame
+/// reuse re-zeroes them with a couple of bulk `memory.fill`s instead of either
+/// a whole-frame memset or a per-bit scatter loop (both measurably slower).
+fn ca_gcmap_zero_runs(gcmap_ptr: usize) -> &'static [(usize, usize)] {
+    // Single-entry fast cache: one CA bridge (hence one gcmap) dominates any
+    // recursion, and the guest is single-threaded (same invariant as the
+    // arena globals in pyre-jit's call_jit). Falls back to the thread-local
+    // table on mismatch.
+    static mut CA_ZERO_RUNS_FAST: (usize, *const (usize, usize), usize) =
+        (0, std::ptr::null(), 0);
+    unsafe {
+        let (p, ptr, len) = CA_ZERO_RUNS_FAST;
+        if p == gcmap_ptr {
+            return std::slice::from_raw_parts(ptr, len);
+        }
+    }
+    CA_GCMAP_ZERO_RUNS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(&(_, runs)) = cache.iter().find(|&&(p, _)| p == gcmap_ptr) {
+            unsafe {
+                CA_ZERO_RUNS_FAST = (gcmap_ptr, runs.as_ptr(), runs.len());
+            }
+            return runs;
+        }
+        // Marked items sit one per 8-byte slot at Signed (4-byte on wasm32)
+        // item granularity, i.e. stride 2 — never bit-contiguous. Merging
+        // across small gaps turns each dense region (inputs, homes) into one
+        // run; zeroing the unmarked gap items is sound (a strict subset of
+        // the whole-frame zero this replaces).
+        const MERGE_SLACK: usize = 16;
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        unsafe {
+            let gcmap = gcmap_ptr as *const usize;
+            let num_words = *gcmap;
+            let bits_per_word = usize::BITS as usize;
+            for w in 0..num_words {
+                let mut word = *gcmap.add(1 + w);
+                while word != 0 {
+                    let bit = word.trailing_zeros() as usize;
+                    word &= word - 1;
+                    let item = w * bits_per_word + bit;
+                    match runs.last_mut() {
+                        Some((first, count)) if item <= *first + *count + MERGE_SLACK => {
+                            *count = item - *first + 1;
+                        }
+                        _ => runs.push((item, 1)),
+                    }
+                }
+            }
+        }
+        let leaked: &'static [(usize, usize)] = Box::leak(runs.into_boxed_slice());
+        cache.push((gcmap_ptr, leaked));
+        unsafe {
+            CA_ZERO_RUNS_FAST = (gcmap_ptr, leaked.as_ptr(), leaked.len());
+        }
+        leaked
+    })
 }
 
 /// Self-recursive CALL_ASSEMBLER (`PYRE_WASM_CA`) callee-frame allocation
@@ -500,9 +570,31 @@ pub extern "C" fn wasm_jit_ca_alloc_frame(frame_bytes: i64, gcmap_ptr: i64) -> i
     });
     let (addr, cap) = match reused {
         Some((addr, cap)) => {
-            // `JitFrame::init` expects zero-filled memory, and the gcmap-marked
-            // slots must not expose the previous run's stale Refs to a tracer.
-            unsafe { std::ptr::write_bytes(addr as *mut u8, 0, alloc_size) };
+            // Re-zero only what a reused frame must present as zeroed:
+            //   * the JitFrame header — `JitFrame::init` writes only
+            //     jf_frame_info + the jf_frame length and relies on the other
+            //     header fields (jf_descr, jf_guard_exc, jf_forward, ...)
+            //     being zero (jitframe.py:48-52 "other fields are zero from
+            //     malloc"), and
+            //   * the gcmap-marked items — stale Refs from a previous run
+            //     must not reach the jf-root tracer, and the trace's
+            //     store-on-def home discipline assumes null-initialized homes.
+            // Every unmarked jf_frame slot is trace data the compiled code
+            // writes before any read (inputs by the CA arm, outputs/spills by
+            // the trace itself), so its stale bytes are unobservable. The
+            // marked items form contiguous runs (the input slots and the
+            // Ref-home region), pre-derived per gcmap by
+            // [`ca_gcmap_zero_runs`], so this is a couple of small
+            // `memory.fill`s instead of the whole `alloc_size` (which was
+            // ~35% of a recursive CALL_ASSEMBLER call).
+            use majit_backend::jitframe::{FIRST_ITEM_OFFSET, JITFRAME_FIXED_SIZE, SIGN_SIZE};
+            unsafe {
+                std::ptr::write_bytes(addr as *mut u8, 0, JITFRAME_FIXED_SIZE);
+                let items = (addr + FIRST_ITEM_OFFSET) as *mut u8;
+                for &(first, count) in ca_gcmap_zero_runs(gcmap_ptr as usize) {
+                    std::ptr::write_bytes(items.add(first * SIGN_SIZE), 0, count * SIGN_SIZE);
+                }
+            }
             (addr, cap)
         }
         None => {
