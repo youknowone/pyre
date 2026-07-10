@@ -1247,17 +1247,21 @@ fn memoryview_release(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     let mv = args.first().copied().unwrap_or(w_none());
     unsafe {
         if !pyre_object::memoryview::w_memoryview_released(mv) {
-            // `_release_underlying`: an owning view drops the one buffer export
-            // it holds on its backing.  Read the backing before `set_released`
+            // `_release_underlying`: read the backing before `set_released`
             // drops the view box.  A slice / copy (`owns_export == false`)
-            // shares the export and must not decrement it.
+            // shares the export and must not release it.
             if pyre_object::memoryview::w_memoryview_owns_export(mv) {
                 let backing = pyre_object::memoryview::w_memoryview_backing(mv);
-                if backing_is_bytearray(backing) {
-                    pyre_object::bytearrayobject::w_bytearray_exports_decref(backing);
+                // Clear the view before invoking the exporter hook so a
+                // re-entrant release is a no-op.
+                pyre_object::memoryview::w_memoryview_set_released(mv);
+                if let Some(release_fn) = crate::baseobjspace::lookup(backing, "__release_buffer__")
+                {
+                    crate::call::call_function_impl_result(release_fn, &[backing, mv])?;
                 }
+            } else {
+                pyre_object::memoryview::w_memoryview_set_released(mv);
             }
-            pyre_object::memoryview::w_memoryview_set_released(mv);
         }
     }
     Ok(w_none())

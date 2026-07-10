@@ -12528,9 +12528,21 @@ fn bytearray_method_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(data))
 }
 
+/// `bytearrayobject.py descr_releasebuffer` — the Python 3.12
+/// `__release_buffer__` protocol entry for a released bytearray export.
+fn bytearray_method_release_buffer(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    unsafe { pyre_object::bytearrayobject::w_bytearray_exports_decref(args[0]) };
+    Ok(pyre_object::w_none())
+}
+
 /// PyPy: bytearrayobject.py W_BytearrayObject.typedef
 fn init_bytearray_type(ns: &mut DictStorage) {
     dict_storage_store(ns, "__new__", make_new_descr(bytearray_descr_new));
+    dict_storage_store(
+        ns,
+        "__release_buffer__",
+        make_builtin_function_with_arity("__release_buffer__", bytearray_method_release_buffer, 2),
+    );
     // `bytearrayobject.py W_BytearrayObject.descr_decode` shares the
     // bytes decode machinery — `bytes_method_decode` already pulls the
     // payload via `bytes_like_data`, which handles both kinds.
