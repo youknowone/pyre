@@ -2014,6 +2014,15 @@ fn loop_inlines_abort_permanent_callee(w_code: *const (), cf_addr: usize) -> boo
         if callee_w_code.is_null() || !visited.insert(callee_w_code) {
             return false;
         }
+        // A FUNCTION_TYPE object can wrap a BuiltinCode, not a CodeObject:
+        // `make_builtin_function*` (gateway.rs:701) puts such a function into
+        // module globals (e.g. `from sys import getsizeof`).  Feeding its
+        // BuiltinCode to `sub_jitcode_body_for_code` / `w_code_get_ptr` casts it
+        // as a PyCode and derefs garbage, so reject it before the scan — a
+        // builtin carries no traceable body and never inlines.
+        if pyre_interpreter::is_builtin_code(callee_w_code as pyre_object::PyObjectRef) {
+            return false;
+        }
         if let Some(body) = crate::state::sub_jitcode_body_for_code(callee_w_code) {
             for op in crate::jitcode_runtime::decoded_ops(body.code) {
                 if op.opname == "abort_permanent" {
