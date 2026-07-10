@@ -31,7 +31,7 @@
 //! `|_| ()`, relying on the no-op `impl UnionFindInfo for ()` to
 //! preserve the upstream absorb-skip semantics.
 
-use std::collections::HashMap;
+use indexmap::IndexMap;
 use std::hash::Hash;
 
 /// RPython `info1.absorb(info2)` (unionfind.py:76) — called by
@@ -54,11 +54,15 @@ where
     K: Eq + Hash + Clone,
 {
     /// RPython `self.link_to_parent` (unionfind.py:8).
-    link_to_parent: HashMap<K, K>,
+    /// `IndexMap`, not `HashMap`: `keys()`/`infos()` iterate these to
+    /// drive commonbase folding and access-set numbering downstream, and
+    /// upstream stores Python dicts (insertion order).  A `HashMap` would
+    /// make that order — and the resulting classification — run-varying.
+    link_to_parent: IndexMap<K, K>,
     /// RPython `self.weight` (unionfind.py:9).
-    weight: HashMap<K, usize>,
+    weight: IndexMap<K, usize>,
     /// RPython `self.root_info` (unionfind.py:11).
-    root_info: HashMap<K, V>,
+    root_info: IndexMap<K, V>,
     /// RPython `self.info_factory` (unionfind.py:10). See module doc
     /// for why the Rust port makes this mandatory.
     info_factory: Box<dyn Fn(&K) -> V>,
@@ -76,9 +80,9 @@ where
         F: Fn(&K) -> V + 'static,
     {
         UnionFind {
-            link_to_parent: HashMap::new(),
-            weight: HashMap::new(),
-            root_info: HashMap::new(),
+            link_to_parent: IndexMap::new(),
+            weight: IndexMap::new(),
+            root_info: IndexMap::new(),
             info_factory: Box::new(info_factory),
         }
     }
@@ -185,13 +189,15 @@ where
         // take both infos out, absorb, and re-insert the merged one
         // onto the chosen new root below. `()` infos no-op via the
         // trait impl, matching the upstream None branch.
-        let mut info1 = self.root_info.remove(&rep1).expect("rep1 info");
-        let info2 = self.root_info.remove(&rep2).expect("rep2 info");
+        // `shift_remove`, not `swap_remove` (IndexMap's `remove`): keep the
+        // insertion order of surviving entries stable for the `infos()` walk.
+        let mut info1 = self.root_info.shift_remove(&rep1).expect("rep1 info");
+        let info2 = self.root_info.shift_remove(&rep2).expect("rep2 info");
         info1.absorb(info2);
 
         // upstream: weighted union, smaller tree under larger.
-        let w1 = self.weight.remove(&rep1).expect("rep1 weight");
-        let w2 = self.weight.remove(&rep2).expect("rep2 weight");
+        let w1 = self.weight.shift_remove(&rep1).expect("rep1 weight");
+        let w2 = self.weight.shift_remove(&rep2).expect("rep2 weight");
         let w = w1 + w2;
 
         let (new_rep1, new_rep2) = if w1 < w2 { (rep2, rep1) } else { (rep1, rep2) };

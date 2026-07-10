@@ -53,6 +53,7 @@
 //! `__NOT_RPYTHON__`, and `_annspecialcase_`.
 
 use std::cell::RefCell;
+use indexmap::{IndexMap, IndexSet};
 use std::collections::{HashMap, HashSet};
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
@@ -525,8 +526,9 @@ pub struct Attribute {
     ///
     /// Upstream stores positions as tuples of `(FunctionGraph, Block,
     /// op_index)`; the Rust port uses the ported [`PositionKey`]
-    /// identity.
-    pub(crate) read_locations: HashSet<PositionKey>,
+    /// identity.  `IndexSet`: these positions drive `reflowfromposition`
+    /// order during the fixpoint; upstream is a Python dict/set.
+    pub(crate) read_locations: IndexSet<PositionKey>,
 }
 
 impl Attribute {
@@ -542,7 +544,7 @@ impl Attribute {
             s_value: SomeValue::Impossible,
             readonly: true,
             attr_allowed: true,
-            read_locations: HashSet::new(),
+            read_locations: IndexSet::new(),
         }
     }
 
@@ -2206,7 +2208,8 @@ pub struct ClassDef {
     /// RPython `self.attr_sources = {}` — `{name: list-of-sources}`.
     attr_sources: HashMap<String, Vec<AttrSource>>,
     /// RPython `self.read_locations_of__class__ = {}`.
-    pub(crate) read_locations_of_class: HashMap<PositionKey, bool>,
+    /// `IndexMap`: iterated to drive `reflowfromposition`; upstream dict.
+    pub(crate) read_locations_of_class: IndexMap<PositionKey, bool>,
     /// RPython `self.repr = None`. Populated by `rclass.getclassrepr()`
     /// with the cached `ClassRepr` for this classdef.
     pub repr: Option<Arc<ClassRepr>>,
@@ -2303,7 +2306,7 @@ impl ClassDef {
             shortname,
             subdefs: Vec::new(),
             attr_sources: HashMap::new(),
-            read_locations_of_class: HashMap::new(),
+            read_locations_of_class: IndexMap::new(),
             repr: None,
             extra_access_sets: HashMap::new(),
             instances_seen: HashSet::new(),

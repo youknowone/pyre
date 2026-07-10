@@ -24,6 +24,7 @@
 //! `Rc::as_ptr` per variant.
 
 use std::cell::RefCell;
+use indexmap::IndexMap;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -160,9 +161,12 @@ impl From<String> for GraphCacheKey {
 #[derive(Debug)]
 pub struct CallFamily {
     /// RPython `self.descs = {desc: True}` (description.py:21).
-    pub(crate) descs: HashMap<DescKey, ()>,
+    /// `IndexMap`: `update`/`absorb` fold these in iteration order and
+    /// upstream is a Python dict (insertion order); a `HashMap` would
+    /// seed the phi-merge union in a run-varying order.
+    pub(crate) descs: IndexMap<DescKey, ()>,
     /// RPython `self.calltables = {}` (description.py:22).
-    pub(crate) calltables: HashMap<CallShape, Vec<CallTableRow>>,
+    pub(crate) calltables: IndexMap<CallShape, Vec<CallTableRow>>,
     /// RPython `self.total_calltable_size = 0` (description.py:23).
     pub(crate) total_calltable_size: usize,
     /// RPython `CallFamily.normalized = False` class-level default
@@ -176,11 +180,11 @@ pub struct CallFamily {
 impl CallFamily {
     /// RPython `CallFamily.__init__(desc)` (description.py:20-23).
     pub(crate) fn new(desc: DescKey) -> Self {
-        let mut descs = HashMap::new();
+        let mut descs = IndexMap::new();
         descs.insert(desc, ());
         CallFamily {
             descs,
-            calltables: HashMap::new(),
+            calltables: IndexMap::new(),
             total_calltable_size: 0,
             normalized: false,
             modified: true,
@@ -271,22 +275,23 @@ impl UnionFindInfo for Rc<RefCell<CallFamily>> {
 #[derive(Debug)]
 pub struct FrozenAttrFamily {
     /// RPython `self.descs = {desc: True}` (description.py:79).
-    pub(crate) descs: HashMap<DescKey, ()>,
+    /// `IndexMap`: iteration order feeds `update`/`absorb`; upstream dict.
+    pub(crate) descs: IndexMap<DescKey, ()>,
     /// RPython `self.read_locations = {}` (description.py:80).
-    pub(crate) read_locations: HashMap<super::bookkeeper::PositionKey, ()>,
+    pub(crate) read_locations: IndexMap<super::bookkeeper::PositionKey, ()>,
     /// RPython `self.attrs = {}` (description.py:81).
-    pub(crate) attrs: HashMap<String, SomeValue>,
+    pub(crate) attrs: IndexMap<String, SomeValue>,
 }
 
 impl FrozenAttrFamily {
     /// RPython `FrozenAttrFamily.__init__(desc)` (description.py:78-81).
     pub(crate) fn new(desc: DescKey) -> Self {
-        let mut descs = HashMap::new();
+        let mut descs = IndexMap::new();
         descs.insert(desc, ());
         FrozenAttrFamily {
             descs,
-            read_locations: HashMap::new(),
-            attrs: HashMap::new(),
+            read_locations: IndexMap::new(),
+            attrs: IndexMap::new(),
         }
     }
 
@@ -337,9 +342,11 @@ impl UnionFindInfo for Rc<RefCell<FrozenAttrFamily>> {
 #[derive(Debug)]
 pub struct ClassAttrFamily {
     /// RPython `self.descs = {desc: True}` (description.py:114).
-    pub(crate) descs: HashMap<DescKey, ()>,
+    /// `IndexMap`: iteration order feeds `update`/`absorb` s_value union;
+    /// upstream dict.
+    pub(crate) descs: IndexMap<DescKey, ()>,
     /// RPython `self.read_locations = {}` (description.py:115).
-    pub(crate) read_locations: HashMap<super::bookkeeper::PositionKey, ()>,
+    pub(crate) read_locations: IndexMap<super::bookkeeper::PositionKey, ()>,
     /// RPython `self.s_value = s_ImpossibleValue` (description.py:116).
     pub(crate) s_value: SomeValue,
     /// Upstream sets this dynamically in
@@ -357,11 +364,11 @@ pub struct ClassAttrFamily {
 impl ClassAttrFamily {
     /// RPython `ClassAttrFamily.__init__(desc)` (description.py:113-116).
     pub(crate) fn new(desc: DescKey) -> Self {
-        let mut descs = HashMap::new();
+        let mut descs = IndexMap::new();
         descs.insert(desc, ());
         ClassAttrFamily {
             descs,
-            read_locations: HashMap::new(),
+            read_locations: IndexMap::new(),
             s_value: s_impossible_value(),
             commonbase: None,
         }

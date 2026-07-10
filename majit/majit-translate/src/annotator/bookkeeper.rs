@@ -26,6 +26,7 @@
 //!   consumers.
 
 use std::cell::RefCell;
+use indexmap::{IndexMap, IndexSet};
 use std::collections::{HashMap, HashSet};
 use std::rc::{Rc, Weak};
 
@@ -205,7 +206,12 @@ pub struct Bookkeeper {
     /// MethodDesc / MethodOfFrozenDesc per bookkeeper.py:353-409. The
     /// Rust port keys directly on [`HostObject`] (which already has
     /// `Arc::ptr_eq` identity) via [`DescEntry`].
-    pub(crate) descs: RefCell<HashMap<HostObject, DescEntry>>,
+    /// `IndexMap`, not `HashMap`: `normalize_class_pbcs` iterates
+    /// `descs.values()` to resolve DescKeys back to `ClassDesc`s and folds
+    /// them into a `commonbase`, feeding classdef numbering.  The key is a
+    /// pointer identity, so only insertion order (IndexMap) is
+    /// reproducible — a `HashMap` would number classdefs run-varyingly.
+    pub(crate) descs: RefCell<IndexMap<HostObject, DescEntry>>,
     /// RPython `self.classdefs = []` (bookkeeper.py:68). Populated by
     /// `ClassDesc._init_classdef` (classdesc.py:672-697). ClassDef
     /// identity is Rc pointer equality — matches upstream's Python
@@ -222,13 +228,20 @@ pub struct Bookkeeper {
     /// RPython `self.classpbc_attr_families = {}` (bookkeeper.py:62) —
     /// lazy `attrname -> UnionFind(ClassAttrFamily)` map materialised by
     /// `get_classpbc_attr_families(attrname)` (bookkeeper.py:447-456).
+    /// `IndexMap`: `normalize_class_pbcs` iterates this map to build the
+    /// commonbase/access-set numbering; upstream is a Python dict.
     pub(crate) classpbc_attr_families:
-        RefCell<HashMap<String, UnionFind<DescKey, Rc<RefCell<ClassAttrFamily>>>>>,
+        RefCell<IndexMap<String, UnionFind<DescKey, Rc<RefCell<ClassAttrFamily>>>>>,
     /// RPython `self.pbc_maximal_call_families = UnionFind(CallFamily)`
     /// (bookkeeper.py:64).
     pub(crate) pbc_maximal_call_families: RefCell<UnionFind<DescKey, Rc<RefCell<CallFamily>>>>,
     /// RPython `self.emulated_pbc_calls = {}` (bookkeeper.py:66).
-    pub(crate) emulated_pbc_calls: RefCell<HashMap<EmulatedPbcCallKey, (SomePBC, Vec<SomeValue>)>>,
+    /// `IndexMap`, not `HashMap`: `compute_at_fixpoint` iterates
+    /// `.values()` to drive `consider_call_site`, and upstream walks
+    /// `emulated_pbc_calls.itervalues()` in dict insertion order.  A
+    /// `HashMap` would consider the emulated calls in a run-varying order,
+    /// perturbing union-seed order and which callee fails first.
+    pub(crate) emulated_pbc_calls: RefCell<IndexMap<EmulatedPbcCallKey, (SomePBC, Vec<SomeValue>)>>,
     /// RPython `bookkeeper._jit_annotation_cache = {}`
     /// (rlib/jit.py:903-914), populated lazily by
     /// `ExtEnterLeaveMarker.compute_result_annotation`.
@@ -527,17 +540,17 @@ impl Bookkeeper {
             position_key: RefCell::new(None),
             listdefs: RefCell::new(HashMap::new()),
             dictdefs: RefCell::new(HashMap::new()),
-            descs: RefCell::new(HashMap::new()),
+            descs: RefCell::new(IndexMap::new()),
             classdefs: RefCell::new(Vec::new()),
             methoddescs: RefCell::new(HashMap::new()),
             frozenpbc_attr_families: RefCell::new(UnionFind::new(|desc: &DescKey| {
                 Rc::new(RefCell::new(FrozenAttrFamily::new(*desc)))
             })),
-            classpbc_attr_families: RefCell::new(HashMap::new()),
+            classpbc_attr_families: RefCell::new(IndexMap::new()),
             pbc_maximal_call_families: RefCell::new(UnionFind::new(|desc: &DescKey| {
                 Rc::new(RefCell::new(CallFamily::new(*desc)))
             })),
-            emulated_pbc_calls: RefCell::new(HashMap::new()),
+            emulated_pbc_calls: RefCell::new(IndexMap::new()),
             _jit_annotation_cache: RefCell::new(HashMap::new()),
             immutable_cache: RefCell::new(HashMap::new()),
             pending_specializations: RefCell::new(Vec::new()),
@@ -600,11 +613,22 @@ impl Bookkeeper {
     /// registry is set (unit-test fixtures), degrading the pass to a
     /// no-op over whatever classdefs already exist.
     pub fn pyre_struct_root_names(&self) -> Vec<String> {
-        self.pyre_struct_fields
+        let mut roots: Vec<String> = self
+            .pyre_struct_fields
             .borrow()
             .as_ref()
             .map(|reg| reg.fields.keys().cloned().collect())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // `reg.fields` is a `HashMap`, so its `keys()` order varies
+        // run-to-run.  This Vec drives `getuniqueclassdef_for_struct_root`
+        // in `ensure_session`, whose first-touch order assigns the global
+        // `NEXT_CLASSDEF_ID` counter (`get_unique_cdef_id`), and those ids
+        // are the sort witness for the inheritance-id markers.  An unsorted
+        // order therefore makes classdef numbering — and the downstream
+        // annotate/rtype classification — nondeterministic.  Sort for a
+        // stable mint order, matching `pre_register_enum_variant_classes`.
+        roots.sort();
+        roots
     }
 
     /// True when `leaf` is the trait-leaf of a registered dispatch family
@@ -1055,7 +1079,7 @@ impl Bookkeeper {
         &self,
         classdesc: &Rc<RefCell<ClassDesc>>,
         attrname: &str,
-    ) -> Result<HashSet<PositionKey>, AnnotatorError> {
+    ) -> Result<IndexSet<PositionKey>, AnnotatorError> {
         // upstream: `attrdef = clsdesc.classdef.find_attribute(attrname)`
         let classdef = classdesc
             .borrow()
@@ -2994,9 +3018,12 @@ impl Bookkeeper {
             //            for other_key in prev:
             //                if other_key in emulated_pbc_calls:
             //                    del emulated_pbc_calls[other_key]`.
-            emulated_map.remove(&unique_key);
+            // `shift_remove`, not `remove`/`swap_remove`: preserve the
+            // insertion order of the surviving entries so the fixpoint
+            // `values()` walk stays deterministic.
+            emulated_map.shift_remove(&unique_key);
             for key in replace {
-                emulated_map.remove(key);
+                emulated_map.shift_remove(key);
             }
             // upstream: `emulated_pbc_calls[unique_key] = pbc, args_s`.
             emulated_map.insert(unique_key, (pbc.clone(), args_s.to_vec()));
