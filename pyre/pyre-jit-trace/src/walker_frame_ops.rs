@@ -206,11 +206,8 @@ pub trait WalkerFrameOps {
         if expected_typeobj.is_null() || self.ctx().heap_cache().is_unescaped(obj) {
             return;
         }
-        let actual = crate::state::opimpl_getfield_gc_r(
-            self.ctx_mut(),
-            obj,
-            crate::descr::w_class_descr(),
-        );
+        let actual =
+            crate::state::opimpl_getfield_gc_r(self.ctx_mut(), obj, crate::descr::w_class_descr());
         let expected = self.ctx_mut().const_ref(expected_typeobj as i64);
         let eq = self.ctx_mut().record_op(OpCode::PtrEq, &[actual, expected]);
         self.generate_guard(OpCode::GuardTrue, &[eq]);
