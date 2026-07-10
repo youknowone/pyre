@@ -6621,13 +6621,7 @@ mod tests {
 
         // `None` side table → current code has no way to recover the bound and
         // drops it; the live-bound read must surface it.
-        let exported = export_state(
-            &[OpRef::int_op(21)],
-            &[],
-            &mut optimizer,
-            &mut ctx,
-            None,
-        );
+        let exported = export_state(&[OpRef::int_op(21)], &[], &mut optimizer, &mut ctx, None);
 
         assert_eq!(
             match exported
