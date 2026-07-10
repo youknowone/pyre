@@ -3540,11 +3540,15 @@ impl OptContext {
         //   * non-input non-Const with forwarded info → also append the
         //     arg op to `self.short` (handled by the builder's `use_box`
         //     dependency walk at shortpreamble.rs:1660-1688), emit
-        //     guards, AND clear the slot to prevent double-emission.
+        //     guards, AND clear the replay op's marker to prevent double-emission.
         //
-        // pyre's `take_preamble_forwarded_opinfo` is the take-clear
-        // primitive matching `arg.set_forwarded(None)`. We use it for the
-        // non-input branch only; input args use the read-only snapshot.
+        // RPython's non-input `arg` is the replay ResOperation object, while
+        // its live body Box keeps separate optimizer info. In pyre's flat-OpRef
+        // model the IntBound/PtrInfo lives in the canonical operand forwarding
+        // slot, so clearing that slot here would drop live body facts before
+        // loop-close virtualstate.py:491-492 can see them. The builder consumes
+        // the replay op's own marker (`Op.forwarded`) at shortpreamble.rs:2116
+        // to mirror `arg.set_forwarded(None)` without clearing optimizer info.
         enum ForwardedInfo {
             // shortpreamble.py:376-379 EmptyInfo / empty_info sentinel.
             // Its presence is meaningful for short-preamble dedup, but it
@@ -3600,8 +3604,8 @@ impl OptContext {
             is_input: bool,
         }
         let mut arg_entries: Vec<ArgEntry> = Vec::new();
-        for arg in preamble_op.getarglist().iter() {
-            let arg = arg.to_opref();
+        for arg_operand in preamble_op.getarglist().iter() {
+            let arg = arg_operand.to_opref();
             // Branch 1: shortpreamble.py:384 `isinstance(arg, Const): continue`.
             if arg.is_constant() || arg.is_none() {
                 continue;
@@ -3615,12 +3619,20 @@ impl OptContext {
                 arg,
                 OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_)
             );
-            if let Some(info) = snapshot_forwarded(self, arg) {
-                arg_entries.push(ArgEntry {
-                    arg,
-                    info,
-                    is_input,
-                });
+            let has_replay_marker = arg_operand.bound_op().is_some_and(|op| {
+                !matches!(
+                    &*op.forwarded.borrow(),
+                    majit_ir::forwarding::Forwarded::None
+                )
+            });
+            if is_input || has_replay_marker {
+                if let Some(info) = snapshot_forwarded(self, arg) {
+                    arg_entries.push(ArgEntry {
+                        arg,
+                        info,
+                        is_input,
+                    });
+                }
             }
             // shortpreamble.py:391 `elif arg.get_forwarded() is None: pass`
             // is the no-info branch; falling out of `snapshot_forwarded`
@@ -3630,16 +3642,7 @@ impl OptContext {
             snapshot_forwarded(self, preamble_op.pos.get())
                 .map(|info| (preamble_op.pos.get(), info));
 
-        // Phase 2 (mutable): clear non-input arg slots — PyPy
-        // `arg.set_forwarded(None)` (shortpreamble.py:397). Branch 2 (input
-        // args) keeps its info; branch 3 (non-input) clears.
-        for entry in &arg_entries {
-            if !entry.is_input {
-                let _ = self.take_preamble_forwarded_opinfo(entry.arg);
-            }
-        }
-
-        // Phase 3: generate guards — `make_guards` takes `&mut self`
+        // Phase 2: generate guards — `make_guards` takes `&mut self`
         // directly. Constants seed via reserve_const_ref + seed_constant
         // (mirroring `ConstInt` / `ConstPtr` inline construction); producer
         // OpRefs come from `alloc_op_position_typed`.

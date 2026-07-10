@@ -6642,6 +6642,116 @@ mod tests {
     }
 
     #[test]
+    fn test_short_box_dependency_preserves_mask_bound_for_loop_close() {
+        // RPython keeps the replay op's `_forwarded` info separate from the
+        // body Box's optimizer info. A preamble-computed masked pure value can
+        // therefore be used by another short-box replay op without losing the
+        // live `[0, MASK]` IntBound needed by virtualstate.py:491-492 to avoid
+        // loop-close re-establishment guards.
+        use crate::optimizeopt::intutils::IntBound;
+        use crate::optimizeopt::shortpreamble::{
+            PreambleOpKind, ProducedShortOp, ShortPreambleBuilder,
+        };
+        use crate::optimizeopt::virtualstate::{VirtualState, VirtualStateInfo};
+        const MASK: i64 = 0xFFFF_FFFF;
+
+        let masked = OpRef::int_op(58);
+        let dependent = OpRef::int_op(59);
+        let mut ctx =
+            crate::optimizeopt::OptContext::with_inputarg_types(128, &vec![Type::Int; 128]);
+
+        let mask_op = {
+            let mut op = Op::new(
+                OpCode::IntAnd,
+                &[
+                    rooted_inputarg_operand(Type::Int, 8),
+                    Operand::from_opref(OpRef::const_int(MASK)),
+                ],
+            );
+            op.pos.set(masked);
+            std::rc::Rc::new(op)
+        };
+        let dep_op = {
+            let mut op = Op::new(
+                OpCode::IntAdd,
+                &[
+                    Operand::from_bound_op(&mask_op),
+                    Operand::from_opref(OpRef::const_int(2160)),
+                ],
+            );
+            op.pos.set(dependent);
+            std::rc::Rc::new(op)
+        };
+        let mask_box = ctx.materialize_operand_at(masked);
+        let dep_box = ctx.materialize_operand_at(dependent);
+        ctx.setintbound(&mask_box, &IntBound::bounded(0, MASK));
+        ctx.imported_short_preamble_builder = Some(ShortPreambleBuilder::new(
+            &[masked, dependent],
+            &[
+                (
+                    mask_box.clone(),
+                    ProducedShortOp {
+                        kind: PreambleOpKind::Pure,
+                        res: mask_box.clone(),
+                        preamble_op: mask_op.clone(),
+                        invented_name: false,
+                        same_as_source: None,
+                        label_arg_idx: Some(0),
+                    },
+                ),
+                (
+                    dep_box.clone(),
+                    ProducedShortOp {
+                        kind: PreambleOpKind::Pure,
+                        res: dep_box.clone(),
+                        preamble_op: dep_op.clone(),
+                        invented_name: false,
+                        same_as_source: None,
+                        label_arg_idx: Some(1),
+                    },
+                ),
+            ],
+            &[OpRef::input_arg_int(8)],
+        ));
+
+        let mask_pop = crate::optimizeopt::info::PreambleOp {
+            op: mask_box.clone(),
+            invented_name: false,
+            preamble_op: mask_op.clone(),
+            same_as_source: None,
+        };
+        let dep_pop = crate::optimizeopt::info::PreambleOp {
+            op: dep_box,
+            invented_name: false,
+            preamble_op: dep_op,
+            same_as_source: None,
+        };
+        assert_eq!(ctx.force_op_from_preamble_op(&mask_pop), masked);
+        assert_eq!(ctx.force_op_from_preamble_op(&dep_pop), dependent);
+
+        let target_vs = VirtualState::new(vec![VirtualStateInfo::IntBounded(IntBound::bounded(
+            0, MASK,
+        ))]);
+        let incoming_vs = crate::optimizeopt::virtualstate::export_state(&[masked], &ctx);
+        let runtime_box = ctx.make_constant_int(0);
+        let guard_reqs = target_vs
+            .generate_guards(&incoming_vs, &[masked], &[runtime_box], &mut ctx, false)
+            .expect("masked short-box state should match target loop state");
+        let mut emitted = Vec::new();
+        for req in &guard_reqs {
+            emitted.extend(req.to_ops(&[masked], &mut ctx));
+        }
+
+        assert!(
+            emitted
+                .iter()
+                .all(|op| !matches!(op.opcode, OpCode::IntGe | OpCode::IntLe | OpCode::GuardTrue)),
+            "loop close must not emit IntBound re-establishment guards for masked short-box arg: {:?}",
+            emitted.iter().map(|op| op.opcode).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn test_export_state_uses_forced_end_args_snapshot() {
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
         let mut ctx = crate::optimizeopt::OptContext::with_inputarg_types(4, &[Type::Ref]);
