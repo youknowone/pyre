@@ -7183,6 +7183,24 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
         "getarrayitem_gc_f_pure/rid>f".to_string(),
         majit_translate::insns::BC_GETARRAYITEM_GC_F_PURE,
     );
+    // `raw_store_i/iiid` — emitted by the wasmi majit kernel's i64 memory
+    // store arms (`majit_raw_store_i64` → `raw_store_i`, the analogue of
+    // RPython `raw_storage_setitem`).  A store's bounds-guard failure (OOB
+    // access) deopts and resumes forward through the dispatch jitcode, so
+    // the blackhole must decode this op; without the map entry
+    // `wire_handler("raw_store_i/iiid", ...)` silently no-ops and the byte
+    // stays unwired, desyncing the blackhole decoder.
+    insns.insert(
+        "raw_store_i/iiid".to_string(),
+        majit_translate::insns::BC_RAW_STORE_I,
+    );
+    // `raw_load_i/iid>i` — the read-side companion the wasmi kernel emits for
+    // the store's out-of-bounds memory-preserving no-op readback.  Same
+    // resume-forward requirement as `raw_store_i` above.
+    insns.insert(
+        "raw_load_i/iid>i".to_string(),
+        majit_translate::insns::BC_RAW_LOAD_I,
+    );
     insns.insert(
         "setarrayitem_gc_i/riid".to_string(),
         majit_translate::insns::BC_SETARRAYITEM_GC_I,

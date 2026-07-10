@@ -159,12 +159,60 @@ impl<'c> Lowerer<'c> {
                 if let Some(binding) = self.lower_native_int_binop_call(call) {
                     return Some(binding);
                 }
+                // Raw native-memory load intrinsic `majit_raw_load_i64(base, ea)`
+                // → raw_load_i (jtransform.py:1165-1171 rewrite_op_raw_load).
+                if let Some(binding) = self.lower_raw_load_call(call) {
+                    return Some(binding);
+                }
                 self.lower_call_value(call)
             }
             Expr::MethodCall(call) => self.lower_method_call_value(call),
             Expr::Struct(s) => self.lower_struct_value(s),
             _ => None,
         }
+    }
+
+    /// Lower a raw native-memory load intrinsic
+    /// `majit_raw_load_i64(base, ea)` to a `raw_load_i` op (the read-side
+    /// analogue of `lower_raw_store_stmt`).  RPython parity:
+    /// `jtransform.py:1165-1171 rewrite_op_raw_load` lowers a
+    /// `rffi.raw_storage_getitem` to `raw_load_i(base, offset,
+    /// arraydescrof(CArray(T)))`.  Both operands are int-kind (raw address,
+    /// byte offset); the op writes an int result.
+    fn lower_raw_load_call(&mut self, call: &syn::ExprCall) -> Option<Binding> {
+        let segments = canonical_expr_segments(&call.func)?;
+        if segments.last().map(String::as_str) != Some("majit_raw_load_i64") {
+            return None;
+        }
+        if call.args.len() != 2 {
+            return None;
+        }
+        let base = self.lower_value_expr(&call.args[0])?;
+        let ea = self.lower_value_expr(&call.args[1])?;
+        let (base_reg, ea_reg) = (base.reg, ea.reg);
+        let dst = self.alloc_reg();
+        self.emit_op(
+            OpMeta::linear(
+                OpKind::RawLoad,
+                vec![Register::int(base_reg), Register::int(ea_reg)],
+                vec![Register::int(dst)],
+            ),
+            quote! {
+                let __raw_descr = __builder.add_raw_int_array_descr(8);
+                __builder.raw_load_i(
+                    #dst as u16,
+                    #base_reg as u16,
+                    #ea_reg as u16,
+                    __raw_descr,
+                );
+            },
+        );
+        Some(Binding {
+            reg: dst,
+            kind: BindingKind::Int,
+            depends_on_stack: base.depends_on_stack || ea.depends_on_stack,
+            struct_type: None,
+        })
     }
 
     /// Lower a struct literal `Path { f0: v0, f1: v1, .. }` to a JIT
@@ -1753,6 +1801,42 @@ mod tests {
         assert!(emitted.contains("setfield_gc_r"));
         assert!(emitted.contains("offset_of"));
         assert!(emitted.contains("size_of"));
+    }
+
+    #[test]
+    fn raw_store_intrinsic_lowers_to_raw_store_i() {
+        // `majit_raw_store_i64(base, ea, val)` lowers to a single RawStore
+        // op reading the three int operands (base, ea, val) and emitting a
+        // `raw_store_i` with an 8-byte raw-int array descr.
+        let mut lowerer = Lowerer::new(None);
+        lowerer
+            .bindings
+            .insert("base".to_string(), binding(3, BindingKind::Int));
+        lowerer
+            .bindings
+            .insert("ea".to_string(), binding(4, BindingKind::Int));
+        lowerer
+            .bindings
+            .insert("val".to_string(), binding(5, BindingKind::Int));
+        let stmt: syn::Stmt =
+            syn::parse_str("majit_raw_store_i64(base, ea, val);").expect("parse raw store");
+
+        lowerer.lower_stmt(&stmt).expect("raw store lowers");
+
+        let kinds: Vec<_> = lowerer.op_metadata.iter().map(|m| m.kind).collect();
+        assert_eq!(kinds, vec![OpKind::RawStore]);
+        assert_eq!(
+            lowerer.op_metadata[0].reads,
+            vec![Register::int(3), Register::int(4), Register::int(5)]
+        );
+        assert!(lowerer.op_metadata[0].writes.is_empty());
+        let emitted = lowerer
+            .statements
+            .iter()
+            .map(ToString::to_string)
+            .collect::<String>();
+        assert!(emitted.contains("raw_store_i"));
+        assert!(emitted.contains("add_raw_int_array_descr"));
     }
 
     #[test]

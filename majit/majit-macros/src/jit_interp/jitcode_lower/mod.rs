@@ -1234,6 +1234,14 @@ pub(super) enum OpKind {
     /// `setfield_gc_{i,r,f}` — store a field through a struct ref.
     /// `reads` carries `[struct_reg, value_reg]`; no writes.
     SetfieldGc,
+    /// `raw_store_i` — store an int into raw native memory at a byte
+    /// offset. `reads` carries `[base_reg, ea_reg, value_reg]` (all int);
+    /// no writes. jtransform.py:1156-1163 `rewrite_op_raw_store`.
+    RawStore,
+    /// `raw_load_i` — load an int from raw native memory at a byte offset.
+    /// `reads` carries `[base_reg, ea_reg]` (int); `writes` carries the
+    /// result reg. jtransform.py:1165-1171 `rewrite_op_raw_load`.
+    RawLoad,
     /// `load_state_*` / `store_state_*` family.
     StateField,
     /// `int_guard_value` / `float_guard_value` / `ref_guard_value`.

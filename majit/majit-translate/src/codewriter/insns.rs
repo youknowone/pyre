@@ -491,6 +491,13 @@ pub const BC_SETFIELD_GC_I_C: u8 = 222;
 // form.
 pub const BC_SETARRAYITEM_GC_I_C: u8 = 227;
 
+// `raw_store_i/iiid` — `blackhole.py:1504-1506 bhimpl_raw_store_i`
+// (`@arguments("cpu", "i", "i", "i", "d")`): raw address + byte offset +
+// int value + `arraydescrof(rffi.CArray(T))` (`jtransform.py:1156-1163
+// rewrite_op_raw_store`).  Sibling of the read-side `BC_RAW_LOAD_I` (20);
+// takes the next free byte.
+pub const BC_RAW_STORE_I: u8 = 228;
+
 // pyre-only `abort/>r` — Ref-result variant of `abort/` (BC_ABORT = 13)
 // emitted by `Assembler::encode_op`'s default branch when an `OpKind::
 // Abort { result_kind: Ref }` reaches the assembler.  Lives in
@@ -1053,6 +1060,12 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     // returns="i"|"f")`): addr + offset + arraydescr.
     m.insert("raw_load_i/iid>i", BC_RAW_LOAD_I);
     m.insert("raw_load_f/iid>f", BC_RAW_LOAD_F);
+
+    // Raw memory store — `blackhole.py:1504-1509`
+    // `bhimpl_raw_store_{i,f}` (`@arguments("cpu", "i", "i", "i"|"f",
+    // "d")`): raw address + byte offset + value + arraydescr.  The
+    // handler is wired in `blackhole.rs` (`handler_raw_store_i`).
+    m.insert("raw_store_i/iiid", BC_RAW_STORE_I);
 
     // GC indexed load — `blackhole.py:1519-1525`
     // `bhimpl_gc_load_indexed_{i,f}` (`@arguments("cpu", "r", "i", "i",

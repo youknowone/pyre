@@ -1409,6 +1409,72 @@ impl JitCodeBuilder {
         self.add_gc_int_array_descr(1, false)
     }
 
+    /// Add a descriptor for a `raw_store_i` / `raw_load_i` against raw
+    /// (non-GC-managed) native memory whose items are `item_size` bytes
+    /// wide.  Mirrors `jtransform.py:1160 rewrite_op_raw_store`'s
+    /// `self.cpu.arraydescrof(rffi.CArray(T))`: a flat C array with no
+    /// length header and no GC type tag.  `base_size = 0` and
+    /// `len_offset = None` because a raw address points directly at the
+    /// target byte (the effective address is passed as a byte offset, not
+    /// a scaled index); `is_gc_managed = false` so `make_guards` never
+    /// emits `GUARD_GC_TYPE` against a raw pointer that has no GC header.
+    /// Deduped structurally by `add_bh_descr`.
+    pub fn add_raw_int_array_descr(&mut self, item_size: usize) -> u16 {
+        self.add_bh_descr(CanonicalBhDescr::Array {
+            base_size: 0,
+            itemsize: item_size,
+            len_offset: None,
+            type_id: 0,
+            item_type: majit_ir::value::Type::Int,
+            is_array_of_pointers: false,
+            is_array_of_structs: false,
+            is_item_signed: false,
+            ei_index: u32::MAX,
+            array_type_id: None,
+            interior_fields: Vec::new(),
+            is_gc_managed: false,
+        })
+    }
+
+    /// Emit `raw_load_i/iid>i` (`blackhole.py:1512-1518 bhimpl_raw_load_i`):
+    /// read an int from raw memory at `registers_i[base_reg] +
+    /// registers_i[ea_reg]` (byte offset) into `dst`.  `jtransform.py:1165-1171
+    /// rewrite_op_raw_load` lowers a `raw_storage_getitem` to this op with an
+    /// `arraydescrof(rffi.CArray(T))` descr (`add_raw_int_array_descr`).
+    ///
+    /// Encoding: `[BC_RAW_LOAD_I][base_reg u8][ea_reg u8][descr_idx lo u8]
+    ///             [descr_idx hi u8][dst u8]`.
+    pub fn raw_load_i(&mut self, dst: u16, base_reg: u16, ea_reg: u16, descr_idx: u16) {
+        self.touch_reg(base_reg);
+        self.touch_reg(ea_reg);
+        self.touch_reg(dst);
+        self.write_insn("raw_load_i/iid>i");
+        self.push_reg_u8(base_reg, "raw_load_i base");
+        self.push_reg_u8(ea_reg, "raw_load_i ea");
+        self.push_u16(descr_idx);
+        self.push_reg_u8(dst, "raw_load_i dst");
+    }
+
+    /// Emit `raw_store_i/iiid` (`blackhole.py:1504-1506 bhimpl_raw_store_i`):
+    /// store the int in `value_reg` into raw memory at
+    /// `registers_i[base_reg] + registers_i[ea_reg]` (byte offset).
+    /// `jtransform.py:1156-1163 rewrite_op_raw_store` lowers a Python-level
+    /// `raw_storage_setitem` to this op with an `arraydescrof(rffi.CArray(T))`
+    /// descr (`add_raw_int_array_descr`, `item_size` bytes).
+    ///
+    /// Encoding: `[BC_RAW_STORE_I][base_reg u8][ea_reg u8][value_reg u8]
+    ///             [descr_idx lo u8][descr_idx hi u8]`.
+    pub fn raw_store_i(&mut self, base_reg: u16, ea_reg: u16, value_reg: u16, descr_idx: u16) {
+        self.touch_reg(base_reg);
+        self.touch_reg(ea_reg);
+        self.touch_reg(value_reg);
+        self.write_insn("raw_store_i/iiid");
+        self.push_reg_u8(base_reg, "raw_store_i base");
+        self.push_reg_u8(ea_reg, "raw_store_i ea");
+        self.push_reg_u8(value_reg, "raw_store_i value");
+        self.push_u16(descr_idx);
+    }
+
     /// Add a GC-array descriptor for an integer-element `env` array whose
     /// items are `item_size` bytes wide (`is_item_signed` selects sign- vs
     /// zero-extension on sub-word loads).  Generalizes

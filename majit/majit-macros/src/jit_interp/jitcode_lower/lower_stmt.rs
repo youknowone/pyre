@@ -905,6 +905,13 @@ impl<'c> Lowerer<'c> {
         if let Some(()) = self.lower_ref_binding_setfield(expr) {
             return Some(());
         }
+        // Raw native-memory store: `majit_raw_store_i64(base, ea, val);` →
+        // raw_store_i (jtransform.py:1156-1163 rewrite_op_raw_store).  Runs
+        // before the residual-call path so the store lowers to an inline
+        // side-effecting IR op instead of an opaque helper call.
+        if let Some(()) = self.lower_raw_store_stmt(expr) {
+            return Some(());
+        }
         if let Some(()) = self.lower_state_array_write(expr) {
             return Some(());
         }
@@ -1704,6 +1711,55 @@ impl<'c> Lowerer<'c> {
                 quote! { let _ = __builder.live_placeholder(); },
             );
         }
+        Some(())
+    }
+
+    /// Lower a raw native-memory store intrinsic
+    /// `majit_raw_store_i64(base, ea, val)` to a `raw_store_i` op.
+    ///
+    /// RPython parity: an `rffi.raw_storage_setitem(base, offset, value)`
+    /// in the interpreter source is rewritten by
+    /// `jtransform.py:1156-1163 rewrite_op_raw_store` to
+    /// `raw_store_i(base, offset, value, arraydescrof(CArray(T)))`.  Here
+    /// the macro recognizes the kernel's `unsafe` intrinsic by name and
+    /// emits the same op with an 8-byte raw-int array descr
+    /// (`add_raw_int_array_descr`).  The three operands are all int-kind
+    /// (raw address, byte offset, stored value); the op has no result.
+    fn lower_raw_store_stmt(&mut self, expr: &Expr) -> Option<()> {
+        let Expr::Call(call) = expr else {
+            return None;
+        };
+        let segments = canonical_expr_segments(&call.func)?;
+        if segments.last().map(String::as_str) != Some("majit_raw_store_i64") {
+            return None;
+        }
+        if call.args.len() != 3 {
+            return None;
+        }
+        let base = self.lower_value_expr(&call.args[0])?;
+        let ea = self.lower_value_expr(&call.args[1])?;
+        let val = self.lower_value_expr(&call.args[2])?;
+        let (base_reg, ea_reg, val_reg) = (base.reg, ea.reg, val.reg);
+        self.emit_op(
+            OpMeta::linear(
+                OpKind::RawStore,
+                vec![
+                    Register::int(base_reg),
+                    Register::int(ea_reg),
+                    Register::int(val_reg),
+                ],
+                vec![],
+            ),
+            quote! {
+                let __raw_descr = __builder.add_raw_int_array_descr(8);
+                __builder.raw_store_i(
+                    #base_reg as u16,
+                    #ea_reg as u16,
+                    #val_reg as u16,
+                    __raw_descr,
+                );
+            },
+        );
         Some(())
     }
 

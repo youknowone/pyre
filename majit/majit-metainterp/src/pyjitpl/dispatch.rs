@@ -2725,6 +2725,125 @@ where
                     unsafe { *((struct_ptr as *mut u8).add(offset) as *mut i64) = concrete };
                 }
             }
+            jitcode::insns::BC_RAW_STORE_I => {
+                // blackhole.py:1504-1506 bhimpl_raw_store_i: store an int
+                // into raw native memory at `base + ea` (byte offset).
+                // jtransform.py:1156-1163 rewrite_op_raw_store lowers a
+                // `raw_storage_setitem` to this op with an
+                // `arraydescrof(rffi.CArray(T))` descr. Record RawStore and
+                // perform the concrete store through the live raw address
+                // while tracing (metainterp executes as it records — the
+                // store side effect is the actual write for this iteration,
+                // mirroring BC_GETARRAYITEM_GC_I's concrete read).
+                //
+                // Encoding (`assembler.rs raw_store_i`):
+                //   [BC_RAW_STORE_I][base_reg u8][ea_reg u8][value_reg u8]
+                //   [descr_idx u16]
+                let (base_reg, ea_reg, value_reg, descr_idx) = {
+                    let frame = self.frames.current_mut();
+                    let base_reg = frame.next_u8() as usize;
+                    let ea_reg = frame.next_u8() as usize;
+                    let value_reg = frame.next_u8() as usize;
+                    let descr_idx = frame.next_u16() as usize;
+                    (base_reg, ea_reg, value_reg, descr_idx)
+                };
+                let Some(descr) = self.dispatch_array_descr_ref(ctx, descr_idx) else {
+                    return TraceAction::Abort;
+                };
+                let Some((_base_size, itemsize, _is_signed)) =
+                    self.dispatch_array_geometry(descr_idx)
+                else {
+                    return TraceAction::Abort;
+                };
+                let (base_opref, base_addr) = self.read_int_reg(base_reg);
+                let (ea_opref, ea_value) = self.read_int_reg(ea_reg);
+                let (value_opref, value) = self.read_int_reg(value_reg);
+                // pyjitpl.py:2693-2694 `_record_helper` invalidates the
+                // heapcache before recording a side-effecting op so a later
+                // `raw_load` at the same `(base, ea)` re-reads instead of
+                // folding a stale cached value.
+                ctx.heapcache_invalidate_caches_varargs(
+                    OpCode::RawStore,
+                    None,
+                    &[base_opref, ea_opref, value_opref],
+                );
+                ctx.record_op_with_descr(
+                    OpCode::RawStore,
+                    &[base_opref, ea_opref, value_opref],
+                    descr,
+                );
+                // Concrete eval: descriptor-sized store at `base + ea`
+                // (`ea` is already a byte offset — `emit_dynamic_offset_addr`
+                // in the backend adds it to `base` unscaled).
+                //
+                // SAFETY: `base_addr + ea_value` was bounds-checked by the
+                // guard that the JitCode's bounds-check `if` lowered to (this
+                // op is only reached on the in-bounds path); the address is
+                // within the outer interpreter's linear-memory allocation.
+                let item_addr = (base_addr as usize).wrapping_add(ea_value as usize);
+                unsafe {
+                    match itemsize {
+                        1 => *(item_addr as *mut u8) = value as u8,
+                        2 => *(item_addr as *mut u16) = value as u16,
+                        4 => *(item_addr as *mut u32) = value as u32,
+                        8 => *(item_addr as *mut i64) = value,
+                        other => {
+                            panic!("BC_RAW_STORE_I: unsupported itemsize {}", other)
+                        }
+                    }
+                }
+            }
+            jitcode::insns::BC_RAW_LOAD_I => {
+                // blackhole.py:1512-1518 bhimpl_raw_load_i: read an int from
+                // raw native memory at `base + ea` (byte offset). jtransform.py:
+                // 1165-1171 rewrite_op_raw_load lowers a `raw_storage_getitem`
+                // to this op with an `arraydescrof(rffi.CArray(T))` descr.
+                // Record RawLoadI and perform the concrete read while tracing.
+                //
+                // Encoding (`assembler.rs raw_load_i`):
+                //   [BC_RAW_LOAD_I][base_reg u8][ea_reg u8][descr_idx u16][dst u8]
+                let (base_reg, ea_reg, descr_idx, dst) = {
+                    let frame = self.frames.current_mut();
+                    let base_reg = frame.next_u8() as usize;
+                    let ea_reg = frame.next_u8() as usize;
+                    let descr_idx = frame.next_u16() as usize;
+                    let dst = frame.next_u8() as usize;
+                    (base_reg, ea_reg, descr_idx, dst)
+                };
+                let Some(descr) = self.dispatch_array_descr_ref(ctx, descr_idx) else {
+                    return TraceAction::Abort;
+                };
+                let Some((_base_size, itemsize, is_signed)) =
+                    self.dispatch_array_geometry(descr_idx)
+                else {
+                    return TraceAction::Abort;
+                };
+                let (base_opref, base_addr) = self.read_int_reg(base_reg);
+                let (ea_opref, ea_value) = self.read_int_reg(ea_reg);
+                let opref =
+                    ctx.record_op_with_descr(OpCode::RawLoadI, &[base_opref, ea_opref], descr);
+                // Concrete eval: descriptor-sized read at `base + ea`.
+                //
+                // SAFETY: the kernel clamps `ea` to an in-bounds byte offset
+                // (0 when the access would trap), so `base_addr + ea_value`
+                // is within the linear-memory allocation.
+                let item_addr = (base_addr as usize).wrapping_add(ea_value as usize);
+                let concrete = unsafe {
+                    match (itemsize, is_signed) {
+                        (1, true) => *(item_addr as *const i8) as i64,
+                        (1, false) => *(item_addr as *const u8) as i64,
+                        (2, true) => *(item_addr as *const i16) as i64,
+                        (2, false) => *(item_addr as *const u16) as i64,
+                        (4, true) => *(item_addr as *const i32) as i64,
+                        (4, false) => *(item_addr as *const u32) as i64,
+                        (8, _) => *(item_addr as *const i64),
+                        other => {
+                            panic!("BC_RAW_LOAD_I: unsupported (itemsize, signed) = {:?}", other)
+                        }
+                    }
+                };
+                self.set_int_reg(dst, Some(opref), Some(concrete));
+            }
             jitcode::insns::BC_GETFIELD_GC_I
             | jitcode::insns::BC_GETFIELD_GC_R
             | jitcode::insns::BC_GETFIELD_GC_I_PURE
