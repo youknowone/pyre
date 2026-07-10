@@ -10,6 +10,8 @@ PyPy proved that a meta-tracing JIT can make Python fast. pyre takes that proven
 
 The key insight: pyre's JIT framework [MaJIT](../majit/) handles tracing, optimization, and native code generation. This means the pyre interpreter itself can stay close to a straightforward Rust program that executes Python bytecodes, while MaJIT provides the tracing JIT machinery around it. In the same way that PyPy is "just a Python interpreter" that RPython makes fast, pyre is "just a Rust interpreter" that MaJIT makes fast.
 
+The deeper goal is to **reproduce RPython in Rust**. RPython's real value was never one specific interpreter but the framework that turns an ordinary interpreter into a fast VM — and MaJIT is that reproduction. PyPy is the most complete language ever built on RPython, so porting PyPy is how we prove and complete MaJIT's reproduction of RPython. pyre is the vehicle; a faithful RPython-in-Rust is the destination.
+
 ## Status
 
 pyre is under active development. Loop tracing and function inlining work, and the JIT now fires on integer-, float-, and exception-heavy loops alike. Most benchmarks run within ~1.5–3x of PyPy and several times faster than CPython; recursive-call-heavy code (fib_recursive) is the main remaining gap. Many Python features are not yet implemented.
