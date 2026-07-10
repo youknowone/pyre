@@ -1633,8 +1633,8 @@ fn run_perfn_walk(
     // CALL_ASSEMBLER callback, which cannot consume a concrete result), so a
     // committed journal never strands into a blackhole re-run; the three
     // decisions (this predicate, the journal commit below, and the caller's
-    // consume-vs-rewind) stay in agreement.  `PYRE_FBW_BRIDGE_TERMINATE_NOREPLAY=0`
-    // (folded into the armed flag) restores the legacy rewind-and-replay.
+    // consume-vs-rewind) stay in agreement.  A multiframe resume is never
+    // armed, so it stays on the legacy rewind-and-replay path.
     let terminate_no_replay = crate::jitcode_dispatch::fbw_no_replay_exit_enabled()
         && (!is_bridge_trace || crate::jitcode_dispatch::fbw_bridge_noreplay_armed())
         && matches!(

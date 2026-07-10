@@ -2437,17 +2437,13 @@ pub fn trace_and_compile_from_bridge(
     let live_frame_addr = frame as *const PyFrame as usize;
     let mut adopted_walk_end_state = false;
     // Arm the bridge `Terminate` no-replay shortcut for this walk only when
-    // the gate is on, the caller can consume a concrete result, and the
-    // resume is single-frame.  The walk epilogue (`run_perfn_walk` in
-    // trace.rs) reads this flag: only when armed does a bridge `Terminate`
-    // walk keep its finish-concrete stash + commit the store journal, so the
-    // three decisions (epilogue predicate, journal commit, the
-    // consume-vs-rewind below) stay in agreement and a committed journal
-    // never strands into a blackhole re-run.
-    let bridge_noreplay_armed =
-        pyre_jit_trace::jitcode_dispatch::fbw_bridge_terminate_noreplay_enabled()
-            && allow_finish_direct_return
-            && !is_multiframe_resume;
+    // the caller can consume a concrete result and the resume is single-frame.
+    // The walk epilogue (`run_perfn_walk` in trace.rs) reads this flag: only
+    // when armed does a bridge `Terminate` walk keep its finish-concrete stash
+    // + commit the store journal, so the three decisions (epilogue predicate,
+    // journal commit, the consume-vs-rewind below) stay in agreement and a
+    // committed journal never strands into a blackhole re-run.
+    let bridge_noreplay_armed = allow_finish_direct_return && !is_multiframe_resume;
     pyre_jit_trace::jitcode_dispatch::fbw_bridge_noreplay_arm(bridge_noreplay_armed);
     let outcome = {
         let (driver, _) = crate::eval::driver_pair();

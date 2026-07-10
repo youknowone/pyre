@@ -7562,21 +7562,6 @@ pub(crate) fn fbw_no_replay_exit_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("PYRE_FBW_NO_REPLAY_EXIT").as_deref() != Ok("0"))
 }
 
-/// Whether a guard-failure BRIDGE walk that reached `Terminate` with a
-/// captured finish-concrete carries that result forward
-/// (`DoneWithThisFrame`) instead of rewinding to the guard pc and
-/// re-interpreting the region.  Without it the walk executes every residual
-/// once and then the `ContinueRunningNormally` re-entry re-executes the
-/// region a second time, double-applying any callee-internal side effect
-/// (e.g. `self.pos += 1` inside a residual `bump()`, #177).  Default ON;
-/// `PYRE_FBW_BRIDGE_TERMINATE_NOREPLAY=0` opts back into the legacy
-/// rewind-and-replay for bisection.
-pub fn fbw_bridge_terminate_noreplay_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED
-        .get_or_init(|| std::env::var("PYRE_FBW_BRIDGE_TERMINATE_NOREPLAY").as_deref() != Ok("0"))
-}
-
 /// Arm/disarm the bridge `Terminate` no-replay shortcut for the next walk
 /// (see [`FBW_BRIDGE_NOREPLAY_ARMED`]).  The bridge tracer sets it before
 /// the walk and clears it after.
