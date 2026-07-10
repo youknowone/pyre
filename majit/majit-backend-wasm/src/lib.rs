@@ -491,8 +491,10 @@ static CA_GCMAP_ZERO_RUNS: GuestCell<Vec<(usize, &'static [(usize, usize)])>> =
 /// static once and steady-state recursion performs no allocator calls at
 /// all. Entries stay registered as libc jitframes and are never freed
 /// (bounded by peak recursion depth).
-static CA_FRAMES: GuestCell<CaFrames> =
-    GuestCell::new(CaFrames { entries: Vec::new(), live: 0 });
+static CA_FRAMES: GuestCell<CaFrames> = GuestCell::new(CaFrames {
+    entries: Vec::new(),
+    live: 0,
+});
 
 /// Backing store for [`CA_FRAMES`]: `entries[..live]` live, `entries[live..]`
 /// pooled (top at `entries[live]`).

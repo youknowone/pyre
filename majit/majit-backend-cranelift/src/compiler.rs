@@ -1128,6 +1128,40 @@ impl Drop for OprefVarMapGuard {
     }
 }
 
+thread_local! {
+    /// Loop-invariant deopt-only LABEL args demoted out of the SSA loop phi are
+    /// frame-resident: their value lives only in a dense jitframe slot, never in
+    /// a loop-body SSA Variable.  When a guard reconstructs the Python frame,
+    /// `resolve_failarg_opref` reads the value from that slot instead of
+    /// `use_var`-ing a Variable that was never defined in the loop body.  Maps
+    /// `OpRef.raw()` → byte offset from the frame pointer
+    /// (`JF_FRAME_ITEM0_OFS + carried_slot*8`).  Populated once per compile
+    /// alongside `compute_loop_phi_keep_last`.
+    static DEMOTED_FAILARG_SLOTS: std::cell::RefCell<Option<indexmap::IndexMap<u32, i32>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// RAII guard restoring `DEMOTED_FAILARG_SLOTS` on Drop (mirrors
+/// `OprefVarMapGuard` so nested bridge compiles don't leak the mapping).
+struct DemotedFailargSlotsGuard {
+    saved: Option<indexmap::IndexMap<u32, i32>>,
+}
+
+impl Drop for DemotedFailargSlotsGuard {
+    fn drop(&mut self) {
+        let saved = self.saved.take();
+        DEMOTED_FAILARG_SLOTS.with(|cell| {
+            *cell.borrow_mut() = saved;
+        });
+    }
+}
+
+/// Frame-pointer byte offset of a demoted (frame-resident) failarg's jitframe
+/// slot, or `None` for a normal SSA-resident value.
+fn demoted_failarg_offset(raw: u32) -> Option<i32> {
+    DEMOTED_FAILARG_SLOTS.with(|cell| cell.borrow().as_ref().and_then(|m| m.get(&raw).copied()))
+}
+
 fn var(idx: u32) -> Variable {
     OPREF_VAR_MAP.with(|cell| {
         if let Some(map) = cell.borrow().as_ref() {
@@ -4792,6 +4826,129 @@ fn lookup_type_at(
     type_index.opref_type_at(opref, op_index)
 }
 
+/// Classify the loop-block LABEL's args into carried SSA phis vs frame-resident
+/// slots.  Returns a per-position mask (`true` = keep as a Cranelift block
+/// param) for the last LABEL, which is the loop back-edge target (`loop_block`).
+/// An empty Vec means no position is demoted.
+///
+/// A position is demoted — kept in its dense jitframe slot
+/// (`JF_FRAME_ITEM0_OFS + i*8`), reloaded once at the LABEL header and left
+/// untouched by the loop body — when it is all of:
+///   * loop-invariant — every JUMP that targets the loop block re-passes the
+///     LABEL's own arg OpRef at that position, unchanged;
+///   * deopt-only     — never read by an in-loop computation op (guard failargs
+///     live in `getfailargs`, not `getarglist`, so a value needed only to
+///     reconstruct the Python frame is not a "read");
+///   * not redefined  — no op after the LABEL writes that OpRef.
+///
+/// Such a value never needs to occupy a register across the loop; threading it
+/// as an SSA block param only wastes registers and forces the register
+/// allocator to spill the hot induction variables.  The x86 backend's
+/// `consider_label` force-spills exactly this class into frame slots, which is
+/// why its loop body is byte-identical regardless of dead-local count.
+fn compute_loop_phi_keep_last(ops: &[Op], label_indices: &[usize]) -> Vec<bool> {
+    let Some(&last) = label_indices.last() else {
+        return Vec::new();
+    };
+    // Only the peeled loop body reached by fall-through is safe: the preamble
+    // initializes the frame slots on first entry.  A LABEL preceded by a
+    // terminator is reached only via re-entry/back-edge and has no fall-through
+    // init site, so leave its args as phis.
+    if last == 0 || matches!(ops[last - 1].opcode, OpCode::Jump | OpCode::Finish) {
+        return Vec::new();
+    }
+    let label_op = &ops[last];
+    let arity = label_op.num_args();
+    if arity == 0 {
+        return Vec::new();
+    }
+    let label_descr = label_op.getdescr().map(|d| d.index());
+
+    // JUMPs branching to the loop block: descr-matched (same arity) or the
+    // implicit descr-less self-loop (which always targets `loop_block` = last).
+    let back_jumps: Vec<usize> = ops
+        .iter()
+        .enumerate()
+        .filter(|(_, j)| {
+            if j.opcode != OpCode::Jump || j.num_args() != arity {
+                return false;
+            }
+            match (j.getdescr().map(|d| d.index()), label_descr) {
+                (Some(jd), Some(ld)) => jd == ld,
+                (None, _) => true,
+                _ => false,
+            }
+        })
+        .map(|(idx, _)| idx)
+        .collect();
+    if back_jumps.is_empty() {
+        return Vec::new();
+    }
+
+    // Values written after the LABEL (redefined in the loop) and values read by
+    // any computation op.  LABEL/JUMP arglists are the carry itself, not a
+    // compute use; failargs live in getfailargs and so are excluded here.
+    let mut redefined: IndexSet<u32> = IndexSet::new();
+    let mut body_read: IndexSet<u32> = IndexSet::new();
+    for (idx, op) in ops.iter().enumerate() {
+        if idx > last && op.result_type() != Type::Void {
+            let p = op.pos.get();
+            if !p.is_none() && p.inline_const_bits().is_none() {
+                redefined.insert(p.raw());
+            }
+        }
+        if !matches!(op.opcode, OpCode::Label | OpCode::Jump) {
+            for a in op.getarglist().iter() {
+                if !a.is_none() && !a.is_constant() {
+                    let o = a.to_opref();
+                    if o.inline_const_bits().is_none() {
+                        body_read.insert(o.raw());
+                    }
+                }
+            }
+        }
+    }
+
+    let label_args = label_op.getarglist();
+    let mut keep = vec![true; arity];
+    let mut any = false;
+    for i in 0..arity {
+        let Some(arg) = label_args.get(i) else {
+            continue;
+        };
+        if arg.is_none() || arg.is_constant() {
+            continue;
+        }
+        let o = arg.to_opref();
+        if o.inline_const_bits().is_some() {
+            continue;
+        }
+        let raw = o.raw();
+        if redefined.contains(&raw) || body_read.contains(&raw) {
+            continue;
+        }
+        // Loop-invariant: every back-edge JUMP re-passes this exact OpRef here.
+        let invariant = back_jumps.iter().all(|&j| {
+            ops[j]
+                .getarglist()
+                .get(i)
+                .map(|a| {
+                    !a.is_none()
+                        && !a.is_constant()
+                        && a.to_opref().inline_const_bits().is_none()
+                        && a.to_opref().raw() == raw
+                })
+                .unwrap_or(false)
+        });
+        if !invariant {
+            continue;
+        }
+        keep[i] = false;
+        any = true;
+    }
+    if any { keep } else { Vec::new() }
+}
+
 fn build_ref_root_slots(
     inputargs: &[InputArg],
     ops: &[Op],
@@ -5026,6 +5183,15 @@ fn resolve_failarg_opref(
     // (regalloc-assigned slots), never to constants.
     if let Some(c) = opref.inline_const_bits() {
         return builder.ins().iconst(cl_types::I64, c);
+    }
+    // A loop-invariant deopt-only arg demoted out of the loop phi has no SSA
+    // Variable in the loop body; its value lives only in its dense jitframe
+    // slot (seeded once in the preamble, unchanged by the loop). Reload it from
+    // there rather than `use_var`-ing an undefined Variable.
+    if let Some(offset) = demoted_failarg_offset(opref.raw()) {
+        return builder
+            .ins()
+            .load(cl_types::I64, MemFlags::trusted(), jf_ptr, offset);
     }
     if let Some((_, root_slot)) = ref_root_slots
         .iter()
@@ -5330,6 +5496,14 @@ fn spill_ref_roots(
         if !defined_ref_vars.contains(&var_idx) || stale_ref_vars.contains(&var_idx) {
             continue;
         }
+        // A demoted (frame-resident) loop-invariant ref has no loop-body SSA
+        // definition; `use_var` here would make Cranelift reconstruct the very
+        // loop phi the demotion removed. Its value already lives in its ref-root
+        // slot — seeded in the preamble and kept current in place because the
+        // slot is a live root in this call's gcmap — so the spill is redundant.
+        if demoted_failarg_offset(var_idx).is_some() {
+            continue;
+        }
         let offset = ref_root_base_ofs + (slot as i32) * 8;
         let val = builder.use_var(var(var_idx));
         builder.ins().store(MemFlags::new(), val, jf_ptr, offset);
@@ -5352,6 +5526,11 @@ fn spill_unsynced_ref_roots(
         if !defined_ref_vars.contains(&var_idx) || synced_ref_vars.contains(&var_idx) {
             continue;
         }
+        // Demoted refs are frame-resident with no loop-body SSA definition
+        // (their slot is already a live gcmap root); never `use_var` them.
+        if demoted_failarg_offset(var_idx).is_some() {
+            continue;
+        }
         let offset = ref_root_base_ofs + (slot as i32) * 8;
         let val = builder.use_var(var(var_idx));
         builder.ins().store(MemFlags::new(), val, jf_ptr, offset);
@@ -5370,6 +5549,13 @@ fn reload_ref_roots(
 ) {
     for &(var_idx, slot) in ref_root_slots {
         if !defined_ref_vars.contains(&var_idx) {
+            continue;
+        }
+        // Demoted refs are read on demand from their ref-root slot by guard
+        // exits (`resolve_failarg_opref`); the loop body never `use_var`s them,
+        // so there is no SSA definition to reload — and defining one would be
+        // dead. The GC already updated the slot in place across the call.
+        if demoted_failarg_offset(var_idx).is_some() {
             continue;
         }
         let offset = ref_root_base_ofs + (slot as i32) * 8;
@@ -8547,6 +8733,107 @@ impl CraneliftBackend {
             .filter_map(|&li| ops[li].getdescr().map(|d| (d.index(), ops[li].num_args())))
             .collect();
 
+        // Loop-invariant deopt-only LABEL args are demoted from SSA loop phis to
+        // frame-resident slots (see `compute_loop_phi_keep_last`).  `keep[i] ==
+        // false` means position `i` of the loop-block LABEL gets no Cranelift
+        // block param: it is reloaded from `JF_FRAME_ITEM0_OFS + i*8` at the
+        // LABEL header and dropped from every predecessor JUMP's arg list.
+        let mut loop_phi_keep = compute_loop_phi_keep_last(ops, &label_indices);
+        let loop_phi_last_label: usize = label_indices.last().copied().unwrap_or(usize::MAX);
+        // Restrict demotion to non-inputarg GC ref-roots.  Two exclusions:
+        //
+        //  * INPUTARG — `compute_loop_phi_keep_last` deems an arg invariant from
+        //    the loop's own back-edge, but an inputarg carried by an enclosing
+        //    loop can be mutated across a re-entry the inner back-edge never sees
+        //    (its once-seeded slot goes stale), and inputargs carry special
+        //    entry-block / ref-root establishment that frame-residency desyncs.
+        //
+        //  * NON-REF — a demoted ref's home is its ref-root slot, which sits in
+        //    the region disjoint from `[0, max_output_slots)`.  A non-ref would
+        //    instead live at the dense carried slot `ITEM0 + i*8`, which is inside
+        //    the deadframe scratch that guard failargs and before-call spills
+        //    (CallMayForce / CallReleaseGil / GuardNotForced2) overwrite densely
+        //    by failarg index — a non-terminal spill would clobber the demoted
+        //    slot for the rest of the loop, corrupting a later guard's rebuilt
+        //    frame.  Refs are immune, so demote only refs.
+        if !loop_phi_keep.is_empty() {
+            let input_idxs: indexmap::IndexSet<u32> = inputargs.iter().map(|ia| ia.index).collect();
+            let label_args = ops[loop_phi_last_label].getarglist();
+            for (i, keep) in loop_phi_keep.iter_mut().enumerate() {
+                if *keep {
+                    continue;
+                }
+                let raw = match label_args.get(i) {
+                    Some(arg) if !arg.is_none() && !arg.is_constant() => arg.to_opref().raw(),
+                    _ => {
+                        *keep = true;
+                        continue;
+                    }
+                };
+                let is_ref = ref_root_slots.iter().any(|(idx, _)| *idx == raw);
+                if input_idxs.contains(&raw) || !is_ref {
+                    *keep = true;
+                }
+            }
+            if loop_phi_keep.iter().all(|k| *k) {
+                loop_phi_keep.clear();
+            }
+        }
+        let loop_phi_active = !loop_phi_keep.is_empty();
+        // Demoted args that are GC ref-roots: read from their ref-root slot (the
+        // collector forwards it in place), not the raw carried slot.  A demoted
+        // ref is loop-invariant, so its slot is seeded once and never dirtied;
+        // it stays a live GC root through `defined_ref_vars` + `longevity`
+        // (never removed).  The one place its SSA var would otherwise be
+        // undefined is a loader re-entry that bypasses the preamble producer —
+        // the loader re-defines it from the ref-root slot (below), keeping the
+        // loop-header phi well-defined on every path.
+        let demoted_ref_positions: Vec<(usize, u32, i32)> = if loop_phi_active {
+            let label_args = ops[loop_phi_last_label].getarglist();
+            loop_phi_keep
+                .iter()
+                .enumerate()
+                .filter(|(_, keep)| !**keep)
+                .filter_map(|(i, _)| {
+                    let arg = label_args.get(i)?;
+                    if arg.is_none() || arg.is_constant() {
+                        return None;
+                    }
+                    let raw = arg.to_opref().raw();
+                    ref_root_slots
+                        .iter()
+                        .find(|(idx, _)| *idx == raw)
+                        .map(|(_, slot)| (i, raw, ref_root_base_ofs + (*slot as i32) * 8))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        // Publish the demoted args' ref-root slot offsets so `resolve_failarg_opref`
+        // reloads them from memory during guard-exit frame reconstruction.  Every
+        // demoted arg is a GC ref-root (the filter above rejects the rest), so it
+        // reads from its ref-root slot — the collector forwards that in place,
+        // whereas the raw carried slot would be a stale pre-move pointer.  The
+        // RAII guard restores the previous map when this compile returns.
+        let demoted_failarg_map: indexmap::IndexMap<u32, i32> = demoted_ref_positions
+            .iter()
+            .map(|&(_, raw, ofs)| (raw, ofs))
+            .collect();
+        // Keep the demoted-slot hook DISARMED during preamble/outer-region
+        // emission.  A demoted arg's frame slot is only seeded at the last
+        // LABEL's fall-through entry (below); guards emitted earlier (e.g. in an
+        // enclosing loop's region of a nested trace) can still carry that arg as
+        // a failarg while it is a live SSA block param of an earlier LABEL, and
+        // must resolve it that way — reading the not-yet-seeded slot would hand
+        // deopt a garbage pointer.  The map is armed only once emission reaches
+        // the last LABEL's body, where the seed dominates every body guard.  The
+        // RAII guard restores the previous map when this compile returns.
+        let _demoted_slots_guard = {
+            let saved = DEMOTED_FAILARG_SLOTS.with(|cell| cell.borrow_mut().take());
+            DemotedFailargSlotsGuard { saved }
+        };
+
         if std::env::var_os("MAJIT_DUMP_CLIF").is_some() {
             for &li in &label_indices {
                 eprintln!(
@@ -8826,7 +9113,11 @@ impl CraneliftBackend {
             // (var_types), so the LABEL-block `def_var(param)` never mismatches.
             // Float vars are F64, keeping a loop-carried float in an FP register
             // across the back-edge; the matching JUMP coerces incoming values.
-            for arg in ops[label_idx].getarglist().iter() {
+            let demote_here = loop_phi_active && label_idx == loop_phi_last_label;
+            for (i, arg) in ops[label_idx].getarglist().iter().enumerate() {
+                if demote_here && !loop_phi_keep[i] {
+                    continue; // frame-resident loop-invariant arg — no phi
+                }
                 let ty = var_types
                     .get(&arg.to_opref().raw())
                     .copied()
@@ -8930,7 +9221,33 @@ impl CraneliftBackend {
                 builder.seal_block(loader);
                 let arity = ops[label_idx].num_args();
                 let cur_jf = builder.ins().get_pinned_reg(ptr_type);
+                // Demoted args have no block param; their value stays in the
+                // carried slot, read on demand by guard exits, so the loader
+                // neither loads nor passes them.  A demoted GC ref is the one
+                // exception: this re-entry path skips the preamble producer that
+                // defines its SSA var and seeds its ref-root slot.  Every re-entry
+                // (a closing JUMP, or an exception-resume bridge landing at a
+                // handler PC) populates the dense carried slot `ITEM0 + i*8` with
+                // the live forwarded pointer, exactly as for kept ref params — so
+                // load it there, re-define the SSA var (keeping the loop-header
+                // phi defined on the loader edge), and re-sync the ref-root slot
+                // the body's guard exits read from.  Reading the ref-root slot
+                // directly would be stale: a bridge does not repopulate it.
+                let demote_here = loop_phi_active && label_idx == loop_phi_last_label;
+                if demote_here {
+                    for &(i, raw, root_ofs) in &demoted_ref_positions {
+                        let v = builder.ins().load(
+                            cl_types::I64,
+                            MemFlags::trusted(),
+                            cur_jf,
+                            JF_FRAME_ITEM0_OFS + (i as i32) * 8,
+                        );
+                        builder.def_var(var(raw), v);
+                        builder.ins().store(MemFlags::new(), v, cur_jf, root_ofs);
+                    }
+                }
                 let vals: Vec<CValue> = (0..arity)
+                    .filter(|&i| !(demote_here && !loop_phi_keep[i]))
                     .map(|i| {
                         let offset = JF_FRAME_ITEM0_OFS + (i as i32) * 8;
                         builder
@@ -9013,18 +9330,56 @@ impl CraneliftBackend {
                         .and_then(|prev_idx| ops.get(prev_idx))
                         .map(|prev| prev.opcode == OpCode::Jump || prev.opcode == OpCode::Finish)
                         .unwrap_or(false);
+                    let demote_here = loop_phi_active && op_idx == loop_phi_last_label;
                     if !prev_terminated {
+                        if demote_here {
+                            // Arm the demoted-slot failarg hook now that emission
+                            // has reached the last LABEL's body: from here on the
+                            // seed below dominates every guard, so guards may read
+                            // the frame slot instead of a (nonexistent) SSA var.
+                            DEMOTED_FAILARG_SLOTS.with(|cell| {
+                                *cell.borrow_mut() = Some(demoted_failarg_map.clone())
+                            });
+                            // Seed each demoted (loop-invariant, deopt-only) arg's
+                            // ref-root slot once, on the preamble fall-through, so
+                            // guard-exit reloads and any re-entry loader see a
+                            // live value.  The slot is loop-invariant, so this is
+                            // the only write in the trace; the collector forwards
+                            // it in place thereafter.  Marking it synced keeps a
+                            // later before-call spill from redundantly re-storing
+                            // it (the GC already keeps the slot current).
+                            let cur_jf = builder.ins().get_pinned_reg(ptr_type);
+                            let label_args = ops[op_idx].getarglist();
+                            for &(i, raw, ofs) in &demoted_ref_positions {
+                                let opref = label_args[i].to_opref();
+                                let v = resolve_opref(&mut builder, &constants, opref);
+                                let v = coerce_ty(&mut builder, v, cl_types::I64);
+                                builder.ins().store(MemFlags::new(), v, cur_jf, ofs);
+                                synced_ref_vars.insert(raw);
+                            }
+                        }
                         let vals: Vec<CValue> = ops[op_idx]
                             .getarglist()
                             .iter()
-                            .map(|r| resolve_opref(&mut builder, &constants, r.to_opref()))
+                            .enumerate()
+                            .filter(|(i, _)| !(demote_here && !loop_phi_keep[*i]))
+                            .map(|(_, r)| resolve_opref(&mut builder, &constants, r.to_opref()))
                             .collect();
                         let args = block_args_to(&mut builder, *label_block, &vals);
                         builder.ins().jump(*label_block, &args);
                     }
                     builder.switch_to_block(*label_block);
+                    let mut param_idx = 0usize;
                     for (i, arg_ref) in ops[op_idx].getarglist().iter().enumerate() {
-                        let param = builder.block_params(*label_block)[i];
+                        if demote_here && !loop_phi_keep[i] {
+                            // Frame-resident: no block param, no header
+                            // materialization, no per-iteration work.  The
+                            // preamble seeded the slot; only cold guard-exit
+                            // paths reload it (`resolve_failarg_opref`).
+                            continue;
+                        }
+                        let param = builder.block_params(*label_block)[param_idx];
+                        param_idx += 1;
                         // Inline-Const (history.py:227/268/314) and legacy
                         // idx-Const args carry value, not a body-namespace
                         // slot — skip def_var/sync.
@@ -12543,11 +12898,6 @@ impl CraneliftBackend {
 
                 // ── Control flow ──
                 OpCode::Jump => {
-                    let vals: Vec<CValue> = op
-                        .getarglist()
-                        .iter()
-                        .map(|r| resolve_opref(&mut builder, &constants, r.to_opref()))
-                        .collect();
                     // Resolve target: try descr-based lookup first, then
                     // fall back to loop_block (Jump without descr targets
                     // the loop header, matching RPython's self-loop).
@@ -12579,6 +12929,20 @@ impl CraneliftBackend {
                         None
                     };
                     if let Some(target_block) = target_block {
+                        // Demoted (frame-resident) loop-invariant args are not
+                        // block params on the loop block, so the back-edge does
+                        // not pass them; their slot is unchanged across the
+                        // iteration and reloaded at the LABEL header.
+                        let demote_target = loop_phi_active && target_block == loop_block;
+                        let vals: Vec<CValue> = op
+                            .getarglist()
+                            .iter()
+                            .enumerate()
+                            .filter(|(i, _)| {
+                                !(demote_target && !loop_phi_keep.get(*i).copied().unwrap_or(true))
+                            })
+                            .map(|(_, r)| resolve_opref(&mut builder, &constants, r.to_opref()))
+                            .collect();
                         let args = block_args_to(&mut builder, target_block, &vals);
                         builder.ins().jump(target_block, &args);
                     } else {
@@ -17034,6 +17398,22 @@ mod tests {
 
         let frame = backend.execute_token(&token, &[Value::Int(0)]);
         assert_eq!(backend.get_int_value(&frame, 0), 999_999);
+    }
+
+    #[test]
+    fn loop_phi_demotes_deopt_only_carried_reference() {
+        let carried = OpRef::ref_op(1);
+        let guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw());
+        guard.setfailargs(smallvec::smallvec![rb(carried)]);
+        let ops = vec![
+            mk_op(OpCode::SameAsR, &[OpRef::input_arg_ref(0)], carried.raw()),
+            mk_op(OpCode::Label, &[carried], OpRef::NONE.raw()),
+            guard,
+            mk_op(OpCode::Jump, &[carried], OpRef::NONE.raw()),
+        ];
+
+        let ops: Vec<Op> = ops.iter().map(|op| (**op).clone()).collect();
+        assert_eq!(compute_loop_phi_keep_last(&ops, &[1]), vec![false]);
     }
 
     #[test]
