@@ -1070,6 +1070,45 @@ pub(crate) unsafe fn str_repeat(s: PyObjectRef, n: PyObjectRef) -> PyResult {
     Ok(w_str_from_wtf8(buf))
 }
 
+pub(crate) unsafe fn bytes_concat(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    let Some(b_src) = crate::typedef::buffer_as_bytes_like(b)? else {
+        return Err(PyError::type_error(format!(
+            "can't concat {} to {}",
+            crate::baseobjspace::object_functionstr_type_name(b),
+            crate::baseobjspace::object_functionstr_type_name(a)
+        )));
+    };
+    let a_data = pyre_object::bytesobject::bytes_like_data(a);
+    let b_data = pyre_object::bytesobject::bytes_like_data(b_src);
+    let mut result = a_data.to_vec();
+    result.extend_from_slice(b_data);
+    Ok(if pyre_object::bytesobject::is_bytes(a) {
+        pyre_object::bytesobject::w_bytes_from_bytes(&result)
+    } else {
+        pyre_object::bytearrayobject::w_bytearray_from_bytes(&result)
+    })
+}
+
+pub(crate) unsafe fn bytes_repeat(s: PyObjectRef, n: PyObjectRef) -> PyResult {
+    let data = pyre_object::bytesobject::bytes_like_data(s);
+    let count = repeat_count(n, "repeated bytes are too long")?;
+    let cap = data
+        .len()
+        .checked_mul(count)
+        .ok_or_else(|| PyError::new(PyErrorKind::OverflowError, "repeated bytes are too long"))?;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.try_reserve_exact(cap)
+        .map_err(|_| PyError::new(PyErrorKind::MemoryError, ""))?;
+    for _ in 0..count {
+        buf.extend_from_slice(data);
+    }
+    Ok(if pyre_object::bytesobject::is_bytes(s) {
+        pyre_object::bytesobject::w_bytes_from_bytes(&buf)
+    } else {
+        pyre_object::bytearrayobject::w_bytearray_from_bytes(&buf)
+    })
+}
+
 pub(crate) unsafe fn list_concat(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let len_a = w_list_len(a);
     let len_b = w_list_len(b);
@@ -1784,16 +1823,12 @@ pub fn add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
                         return Ok(result);
                     }
                 }
-                let a_data = pyre_object::bytesobject::bytes_like_data(a);
-                let b_data = pyre_object::bytesobject::bytes_like_data(b_src);
-                let mut result = a_data.to_vec();
-                result.extend_from_slice(b_data);
-                return Ok(if pyre_object::bytesobject::is_bytes(a) {
-                    pyre_object::bytesobject::w_bytes_from_bytes(&result)
-                } else {
-                    pyre_object::bytearrayobject::w_bytearray_from_bytes(&result)
-                });
+                return bytes_concat(a, b_src);
             }
+            if let Some(result) = try_dispatch_binary_special(a, b, "__add__", "__radd__")? {
+                return Ok(result);
+            }
+            return bytes_concat(a, b);
         }
         // Forward `__add__` + reflected `__radd__` per
         // `descroperation.py:_make_binop_impl` — try_dispatch_binary_special
@@ -1937,22 +1972,7 @@ pub fn mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         }
         // bytesobject.py descr_mul / bytearrayobject.py descr_mul
         if pyre_object::bytesobject::is_bytes_like(a) && is_int_or_long(b) {
-            let data = pyre_object::bytesobject::bytes_like_data(a);
-            let n = repeat_count(b, "repeated bytes are too long")?;
-            let cap = data.len().checked_mul(n).ok_or_else(|| {
-                PyError::new(PyErrorKind::OverflowError, "repeated bytes are too long")
-            })?;
-            let mut buf: Vec<u8> = Vec::new();
-            buf.try_reserve_exact(cap)
-                .map_err(|_| PyError::new(PyErrorKind::MemoryError, ""))?;
-            for _ in 0..n {
-                buf.extend_from_slice(data);
-            }
-            return Ok(if pyre_object::bytesobject::is_bytes(a) {
-                pyre_object::bytesobject::w_bytes_from_bytes(&buf)
-            } else {
-                pyre_object::bytearrayobject::w_bytearray_from_bytes(&buf)
-            });
+            return bytes_repeat(a, b);
         }
         if is_int_or_long(a) && pyre_object::bytesobject::is_bytes_like(b) {
             return mul(b, a);
@@ -2039,9 +2059,11 @@ pub fn mod_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         if is_float_pair(a, b) {
             return float_mod(a, b);
         }
-        // str % args — reflected-subclass priority: a str subclass on the
+        let is_str_lhs = is_str(a);
+        let is_bytes_lhs = pyre_object::bytesobject::is_bytes_like(a);
+        // str/bytes % args — reflected-subclass priority: a subclass on the
         // right overriding __rmod__ is tried before the built-in formatter.
-        if is_str(a) {
+        if is_str_lhs || is_bytes_lhs {
             if let Some((method, w_type)) =
                 crate::baseobjspace::subclass_special_override(b, "__rmod__")
             {
@@ -2057,7 +2079,11 @@ pub fn mod_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
                     }
                 }
             }
-            return crate::objspace::std::formatting::str_format_percent(a, b);
+            return if is_str_lhs {
+                crate::objspace::std::formatting::str_format_percent(a, b)
+            } else {
+                crate::objspace::std::formatting::bytes_format_percent(a, b)
+            };
         }
         if let Some(result) = try_dispatch_binary_special(a, b, "__mod__", "__rmod__")? {
             return Ok(result);

@@ -2,9 +2,11 @@
 #![allow(non_camel_case_types, non_snake_case)]
 
 use malachite_bigint::BigInt;
+use num_traits::ToPrimitive;
 use rustpython_common::cformat::{
-    CConversionFlags, CFormatConversion, CFormatPart, CFormatPrecision, CFormatQuantity,
-    CFormatSpec, CFormatSpecKeyed, CFormatType, CFormatWtf8, CNumberType,
+    CCharacterType, CConversionFlags, CFormatBytes, CFormatConversion, CFormatPart,
+    CFormatPrecision, CFormatQuantity, CFormatSpec, CFormatSpecKeyed, CFormatType, CFormatWtf8,
+    CNumberType,
 };
 
 use crate::objspace::descroperation::{int_value, is_int_like};
@@ -104,6 +106,193 @@ pub(crate) unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> 
     }
 
     Ok(w_str_from_wtf8(result))
+}
+
+pub(crate) unsafe fn bytes_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> PyResult {
+    let fmt_bytes = pyre_object::bytesobject::bytes_like_data(fmt);
+    let format = CFormatBytes::parse_from_bytes(fmt_bytes)
+        .map_err(|err| PyError::value_error(err.to_string()))?;
+    let (num_specifiers, mapping_required) = format
+        .check_specifiers()
+        .ok_or_else(|| PyError::type_error("format requires a mapping"))?;
+    let is_mapping = bytes_format_is_mapping(args);
+    let mut result = Vec::new();
+
+    if num_specifiers == 0 {
+        if !is_mapping && !bytes_format_empty_tuple(args) {
+            return Err(PyError::type_error(
+                "not all arguments converted during bytes formatting",
+            ));
+        }
+        for (_, part) in format {
+            match part {
+                CFormatPart::Literal(literal) => result.extend(literal),
+                CFormatPart::Spec(_) => unreachable!(),
+            }
+        }
+        return Ok(bytes_format_result(fmt, &result));
+    }
+
+    if mapping_required {
+        if !is_mapping {
+            return Err(PyError::type_error("format requires a mapping"));
+        }
+        for (_, part) in format {
+            match part {
+                CFormatPart::Literal(literal) => result.extend(literal),
+                CFormatPart::Spec(CFormatSpecKeyed { mapping_key, spec }) => {
+                    let key = mapping_key.expect("mapping spec carries a key");
+                    let value =
+                        crate::baseobjspace::getitem(args, pyre_object::w_bytes_from_bytes(&key))?;
+                    result.extend(spec_format_bytes(&spec, value)?);
+                }
+            }
+        }
+        return Ok(bytes_format_result(fmt, &result));
+    }
+
+    let positional: Vec<PyObjectRef> = if pyre_object::is_tuple(args) {
+        let n = pyre_object::w_tuple_len(args);
+        (0..n)
+            .filter_map(|i| pyre_object::w_tuple_getitem(args, i as i64))
+            .collect()
+    } else {
+        vec![args]
+    };
+    let mut pos = positional.into_iter().peekable();
+
+    for (_, part) in format {
+        match part {
+            CFormatPart::Literal(literal) => result.extend(literal),
+            CFormatPart::Spec(CFormatSpecKeyed { mut spec, .. }) => {
+                update_quantity_from_tuple(&mut pos, &mut spec.min_field_width, &mut spec.flags)?;
+                update_precision_from_tuple(&mut pos, &mut spec.precision)?;
+                let Some(value) = pos.next() else {
+                    return Err(PyError::type_error(
+                        "not enough arguments for format string",
+                    ));
+                };
+                result.extend(spec_format_bytes(&spec, value)?);
+            }
+        }
+    }
+
+    if pos.peek().is_some() {
+        Err(PyError::type_error(
+            "not all arguments converted during bytes formatting",
+        ))
+    } else {
+        Ok(bytes_format_result(fmt, &result))
+    }
+}
+
+unsafe fn bytes_format_result(fmt: PyObjectRef, data: &[u8]) -> PyObjectRef {
+    if pyre_object::bytearrayobject::is_bytearray(fmt) {
+        pyre_object::bytearrayobject::w_bytearray_from_bytes(data)
+    } else {
+        pyre_object::bytesobject::w_bytes_from_bytes(data)
+    }
+}
+
+unsafe fn bytes_format_empty_tuple(obj: PyObjectRef) -> bool {
+    pyre_object::is_tuple(obj) && pyre_object::w_tuple_len(obj) == 0
+}
+
+unsafe fn bytes_format_is_mapping(obj: PyObjectRef) -> bool {
+    !pyre_object::is_tuple(obj)
+        && !pyre_object::is_str(obj)
+        && !pyre_object::bytesobject::is_bytes_like(obj)
+        && has_dunder(obj, "__getitem__")
+}
+
+unsafe fn spec_format_bytes(spec: &CFormatSpec, obj: PyObjectRef) -> Result<Vec<u8>, PyError> {
+    match &spec.format_type {
+        CFormatType::String(conversion) => match conversion {
+            CFormatConversion::Repr | CFormatConversion::Ascii => {
+                Ok(spec.format_bytes(crate::builtins::py_ascii(obj)?.as_bytes()))
+            }
+            CFormatConversion::Str | CFormatConversion::Bytes => {
+                if let Some(src) = crate::typedef::buffer_as_bytes_like(obj)? {
+                    return Ok(spec.format_bytes(pyre_object::bytesobject::bytes_like_data(src)));
+                }
+                let Some(method) = crate::baseobjspace::lookup(obj, "__bytes__") else {
+                    return Err(PyError::type_error(format!(
+                        "%b requires a bytes-like object, or an object that implements __bytes__, not '{}'",
+                        crate::baseobjspace::object_functionstr_type_name(obj)
+                    )));
+                };
+                let bytes = crate::builtins::call_and_check(method, &[obj])?;
+                if !pyre_object::is_bytes(bytes) {
+                    return Err(PyError::type_error(format!(
+                        "__bytes__ returned non-bytes (type {})",
+                        crate::baseobjspace::object_functionstr_type_name(bytes)
+                    )));
+                }
+                Ok(spec.format_bytes(pyre_object::bytesobject::bytes_like_data(bytes)))
+            }
+        },
+        CFormatType::Number(number_type) => {
+            let value = match number_type {
+                CNumberType::DecimalD | CNumberType::DecimalI | CNumberType::DecimalU => {
+                    number_arg_decimal(spec, obj)?
+                }
+                _ => number_arg_integer(spec, obj)?,
+            };
+            Ok(spec.format_number(&value).into_bytes())
+        }
+        CFormatType::Float(_) => {
+            let value = crate::baseobjspace::float_w(obj).map_err(|e| {
+                if e.kind == PyErrorKind::TypeError {
+                    PyError::type_error(format!(
+                        "float argument required, not {}",
+                        crate::baseobjspace::object_functionstr_type_name(obj)
+                    ))
+                } else {
+                    e
+                }
+            })?;
+            Ok(spec.format_float(value).into_bytes())
+        }
+        CFormatType::Character(CCharacterType::Character) => {
+            Ok(spec.format_char(bytes_char_arg(obj)?))
+        }
+    }
+}
+
+unsafe fn bytes_char_arg(obj: PyObjectRef) -> Result<u8, PyError> {
+    if pyre_object::bytesobject::is_bytes(obj) || pyre_object::bytearrayobject::is_bytearray(obj) {
+        let data = pyre_object::bytesobject::bytes_like_data(obj);
+        if data.len() == 1 {
+            return Ok(data[0]);
+        }
+        let kind = if pyre_object::bytesobject::is_bytes(obj) {
+            "bytes"
+        } else {
+            "bytearray"
+        };
+        return Err(PyError::type_error(format!(
+            "%c requires an integer in range(256) or a single byte, not a {kind} object of length {}",
+            data.len()
+        )));
+    }
+    let value = if pyre_object::pyobject::is_int_or_long(obj) {
+        arg_to_bigint(obj)
+    } else if has_dunder(obj, "__index__") {
+        crate::builtins::obj_to_bigint(crate::baseobjspace::space_index(obj)?)
+    } else {
+        return Err(PyError::type_error(format!(
+            "%c requires an integer in range(256) or a single byte, not {}",
+            crate::baseobjspace::object_functionstr_type_name(obj)
+        )));
+    };
+    let overflow = || PyError::new(PyErrorKind::OverflowError, "%c arg not in range(256)");
+    let Some(n) = value.to_i64() else {
+        return Err(overflow());
+    };
+    if !(0..=255).contains(&n) {
+        return Err(overflow());
+    }
+    Ok(n as u8)
 }
 
 /// True when `obj`'s type carries `__getitem__` (`PyMapping_Check`), so a

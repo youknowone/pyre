@@ -10046,6 +10046,108 @@ fn init_bytes_type(ns: &mut DictStorage) {
         "fromhex",
         pyre_object::function::w_classmethod_new(make_builtin_function("fromhex", bytes_fromhex)),
     );
+    dict_storage_store(
+        ns,
+        "__add__",
+        make_builtin_function_with_arity(
+            "__add__",
+            |args| {
+                crate::type_methods::arity_slot(args, 1)?;
+                unsafe { crate::objspace::descroperation::bytes_concat(args[0], args[1]) }
+            },
+            2,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "__mul__",
+        make_builtin_function_with_arity("__mul__", |args| bytes_descr_repeat(args), 2),
+    );
+    dict_storage_store(
+        ns,
+        "__rmul__",
+        make_builtin_function_with_arity("__rmul__", |args| bytes_descr_repeat(args), 2),
+    );
+    dict_storage_store(
+        ns,
+        "__contains__",
+        make_builtin_function_with_arity(
+            "__contains__",
+            |args| {
+                crate::type_methods::arity_slot(args, 1)?;
+                Ok(pyre_object::w_bool_from(
+                    crate::baseobjspace::contains_slot(args[0], args[1])?,
+                ))
+            },
+            2,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "__getitem__",
+        make_builtin_function_with_arity(
+            "__getitem__",
+            |args| {
+                crate::type_methods::arity_slot(args, 1)?;
+                crate::baseobjspace::getitem_slot(args[0], args[1])
+            },
+            2,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "__iter__",
+        make_builtin_function_with_arity(
+            "__iter__",
+            |args| {
+                crate::type_methods::arity_slot(args, 0)?;
+                crate::baseobjspace::iter(args[0])
+            },
+            1,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "__len__",
+        make_builtin_function_with_arity(
+            "__len__",
+            |args| {
+                crate::type_methods::arity_slot(args, 0)?;
+                crate::baseobjspace::len_slot(args[0])
+            },
+            1,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "__mod__",
+        make_builtin_function_with_arity(
+            "__mod__",
+            |args| {
+                crate::type_methods::arity_slot(args, 1)?;
+                unsafe { crate::objspace::std::formatting::bytes_format_percent(args[0], args[1]) }
+            },
+            2,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "__rmod__",
+        make_builtin_function_with_arity(
+            "__rmod__",
+            |args| {
+                crate::type_methods::arity_slot(args, 1)?;
+                if unsafe { pyre_object::bytesobject::is_bytes(args[1]) } {
+                    unsafe {
+                        crate::objspace::std::formatting::bytes_format_percent(args[1], args[0])
+                    }
+                } else {
+                    Ok(pyre_object::w_not_implemented())
+                }
+            },
+            2,
+        ),
+    );
     for (name, func) in [
         ("__eq__", bytes_dunder_eq as DunderFn),
         ("__ne__", bytes_dunder_ne),
@@ -10073,6 +10175,14 @@ fn init_bytes_type(ns: &mut DictStorage) {
         ),
     );
     // bytes methods are mostly shared with bytearray — add as needed.
+}
+
+fn bytes_descr_repeat(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::arity_slot(args, 1)?;
+    let Some(count) = list_repeat_index(args[1])? else {
+        return Ok(pyre_object::w_not_implemented());
+    };
+    unsafe { crate::objspace::descroperation::bytes_repeat(args[0], count) }
 }
 
 /// `stringmethods.py:_op_val(space, w_sub, allow_char=True)` — the
