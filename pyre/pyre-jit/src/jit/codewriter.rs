@@ -1070,6 +1070,21 @@ fn derive_after_call_indices_from_sparse(
     out
 }
 
+/// Recover a candidate Python block entry for an exact JitCode `-live-`
+/// marker. `pc_map` names the first Python PC that resolves to the marker, but
+/// a block can start with a run of opcodes that emit no JitCode of their own
+/// (trivia, constant-folded loads, fused local loads). In that case the first
+/// resolving PC is the later emitting opcode, while the marker belongs to the
+/// start of the preceding no-emission run. The metadata builder accepts this
+/// candidate only for control-flow entries in plain-callee JitCodes; portal and
+/// non-entry marker ownership stays unchanged.
+fn block_head_python_pc(first_jit_pc_by_py_pc: &[usize], mut py: usize) -> usize {
+    while py > 0 && first_jit_pc_by_py_pc[py - 1] == usize::MAX {
+        py -= 1;
+    }
+    py
+}
+
 fn fresh_variable_for_state(
     graph: &mut super::flow::FunctionGraph,
     kind: Option<Kind>,
@@ -12506,16 +12521,28 @@ impl CodeWriter {
             first_jit_pc_by_py_pc[*py_pc] = combined_bytes[first_insn_base + k];
         }
 
-        // Block-head inverse: for each distinct marker byte offset, record the
-        // FIRST (smallest) py_pc that resolves to it.  Ascending `py` iteration
-        // with first-write-wins reproduces `pc_map.iter().position(|&m| m == off)`
-        // exactly, indexed for binary search.
+        // Block-head inverse: for each distinct marker byte offset, start from
+        // the FIRST py_pc that resolves to it. For a control-flow entry in a
+        // plain-callee JitCode, rewind over the contiguous no-JitCode prefix
+        // immediately before that PC. Such a block can begin with CACHE /
+        // NOT_TAKEN plus constant-folded or fused loads; those PCs do not occur
+        // in `first_jit_pc_by_py_pc`, so the first dense `pc_map` hit otherwise
+        // names a later mid-arm opcode. Portal JitCodes emit live frame/global
+        // reads at these entries and already invert correctly; non-entry markers
+        // keep their dense-map owner as well.
         let mut block_head_py_by_jit_pc: Vec<(usize, u32)> = Vec::new();
         {
+            let branch_targets = find_branch_target_pcs(code);
             let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
             for (py, &off) in pc_map_bytes.iter().enumerate() {
                 if seen.insert(off) {
-                    block_head_py_by_jit_pc.push((off, py as u32));
+                    let rewound = block_head_python_pc(&first_jit_pc_by_py_pc, py);
+                    let block_py = if !is_portal && branch_targets.contains(&rewound) {
+                        rewound
+                    } else {
+                        py
+                    };
+                    block_head_py_by_jit_pc.push((off, block_py as u32));
                 }
             }
             block_head_py_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
@@ -12605,12 +12632,8 @@ impl CodeWriter {
                     by_off.insert(pos, py);
                 }
             }
-            let mut marker_seen: std::collections::HashSet<usize> =
-                std::collections::HashSet::new();
-            for (py, &off) in pc_map_bytes.iter().enumerate() {
-                if marker_seen.insert(off) {
-                    by_off.insert(off, py);
-                }
+            for &(off, py) in &block_head_py_by_jit_pc {
+                by_off.insert(off, py as usize);
             }
             // Compile-time twin of `skip_python_trivia_forward`
             // (jitcode_dispatch.rs:9126): advance past Python trivia opcodes to
@@ -12647,13 +12670,12 @@ impl CodeWriter {
                 depth_pred_by_jit_pc.push((off, depth));
                 const_ref_slots_by_jit_pc.push((off, const_slots));
             }
-            // Marker tier: exact-match, block-head precedence (first-seen dedup
-            // gives the smallest py resolving at the marker offset).
-            for (py, &off) in pc_map_bytes.iter().enumerate() {
-                if marker_seen.remove(&off) {
-                    let depth_trivia = static_depth.get(skip_trivia(py)).copied();
-                    depth_trivia_marker_by_jit_pc.push((off, depth_trivia));
-                }
+            // Marker tier: exact-match, block-head precedence. Source the
+            // corrected block-entry PC from the inversion table so the direct
+            // depth twin and `python_pc_for_jitcode_pc` cannot diverge.
+            for &(off, py) in &block_head_py_by_jit_pc {
+                let depth_trivia = static_depth.get(skip_trivia(py as usize)).copied();
+                depth_trivia_marker_by_jit_pc.push((off, depth_trivia));
             }
             depth_trivia_marker_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
             // Op-start tier: predecessor scan, markers EXCLUDED.
@@ -13280,6 +13302,15 @@ mod tests {
     use pyre_interpreter::bytecode::{CodeObject, ConstantData};
     use pyre_interpreter::compile_exec;
     use std::sync::Arc;
+
+    #[test]
+    fn block_head_python_pc_rewinds_unemitted_prefix() {
+        let first = vec![3, 11, usize::MAX, usize::MAX, usize::MAX, 27];
+
+        assert_eq!(block_head_python_pc(&first, 5), 2);
+        assert_eq!(block_head_python_pc(&first, 1), 1);
+        assert_eq!(block_head_python_pc(&first, 0), 0);
+    }
 
     /// A coalesce candidate whose two endpoints hold distinct canonical
     /// CPython slots — including the disjoint-live inline-callee case that is

@@ -9331,9 +9331,12 @@ pub(crate) fn python_pc_for_jitcode_pc(metadata: &crate::PyJitCodeMetadata, jit_
     // heads.
     //
     // The `block_head_py_by_jit_pc` table is the precomputed inverse of this
-    // block-head case (marker byte offset → smallest resuming py_pc), built
-    // from the same block-head marker bytes at compile time.  Drained installs
-    // carry it; skeleton / portal-bridge / fixture installs leave it empty.
+    // block-head case (marker byte offset → Python block entry), built from
+    // the same block-head marker bytes at compile time. A no-JitCode prefix is
+    // included in the entry coordinate, so a CACHE / NOT_TAKEN run followed by
+    // constant-folded loads cannot move the inverse into the middle of an arm.
+    // Drained installs carry it; skeleton / portal-bridge / fixture installs
+    // leave it empty.
     if !metadata.block_head_py_by_jit_pc.is_empty() {
         if let Ok(i) = metadata
             .block_head_py_by_jit_pc

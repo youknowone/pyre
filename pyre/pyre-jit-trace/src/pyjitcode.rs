@@ -94,15 +94,17 @@ pub struct PyJitCodeMetadata {
     /// as `after_residual_call_resume_pc`.
     pub first_jit_pc_by_py_pc: Vec<usize>,
     /// Inverse of the derived marker resolution's block-head case: each distinct
-    /// `-live-` marker byte offset that some PC resolves to → the SMALLEST py_pc
-    /// that resolves there (the start of that marker's carry-forward run).
+    /// `-live-` marker byte offset that some PC resolves to → the Python block
+    /// entry. For plain-callee control-flow entries, the dense map's smallest
+    /// resolving PC is rewound over a contiguous no-JitCode prefix so a block
+    /// beginning with trivia / constant-folded ops does not invert to the first
+    /// later opcode that emits JitCode. Other markers keep their dense owner.
     /// Sorted ascending by jitcode offset for binary search.  Replaces the
-    /// former `pc_map.iter().position(|&m| m == jit_pc)` block-head scan in
+    /// former dense-map block-head scan in
     /// `python_pc_for_jitcode_pc` (a coordinate landing exactly on a marker is
     /// a block head — branch/catch target — and belongs to the first opcode
-    /// resuming there).  Equal to `position()` by construction; empty for
-    /// skeleton / portal-bridge / fixture metadata, where the legacy scan
-    /// remains the fallback.
+    /// resuming there). Empty for skeleton / portal-bridge / fixture metadata,
+    /// where the legacy scan remains the fallback.
     pub block_head_py_by_jit_pc: Vec<(usize, u32)>,
     /// task#50 sparse carry-forward sidecar: the `-live-` marker byte offset
     /// for each py_pc whose dense marker the on-demand [`derive_resume_marker`]
