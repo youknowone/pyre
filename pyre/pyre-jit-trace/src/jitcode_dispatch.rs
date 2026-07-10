@@ -7526,6 +7526,20 @@ thread_local! {
     /// portal degrades to the legacy `ContinueRunningNormally` replay.
     static FBW_FINISH_CONCRETE: std::cell::Cell<Option<ConcreteValue>> =
         const { std::cell::Cell::new(None) };
+
+    /// Armed by the bridge tracer (`call_jit::trace_and_compile_from_bridge`)
+    /// before a single-frame, direct-return-capable guard-failure walk.  When
+    /// set, the `run_perfn_walk` epilogue lets a bridge `Terminate` walk keep
+    /// the no-replay shortcut — commit the store journal and keep the
+    /// finish-concrete stash — so the caller hands the captured result forward
+    /// as `DoneWithThisFrame` instead of rewinding to the guard pc and
+    /// re-interpreting the region (which would double every eagerly executed
+    /// residual side effect, #177).  Only the bridge tracer sets it, and only
+    /// when the resume is single-frame and the caller can consume a concrete
+    /// result (the general guard path, not the CALL_ASSEMBLER callback), so a
+    /// committed journal never strands into a blackhole re-run.  Cleared after
+    /// every bridge walk.
+    static FBW_BRIDGE_NOREPLAY_ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Whether the slice-b Finish-portal compile route is enabled.  Cached so
@@ -7546,6 +7560,34 @@ pub(crate) fn fbw_call_assembler_enabled() -> bool {
 pub(crate) fn fbw_no_replay_exit_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("PYRE_FBW_NO_REPLAY_EXIT").as_deref() != Ok("0"))
+}
+
+/// Whether a guard-failure BRIDGE walk that reached `Terminate` with a
+/// captured finish-concrete carries that result forward
+/// (`DoneWithThisFrame`) instead of rewinding to the guard pc and
+/// re-interpreting the region.  Without it the walk executes every residual
+/// once and then the `ContinueRunningNormally` re-entry re-executes the
+/// region a second time, double-applying any callee-internal side effect
+/// (e.g. `self.pos += 1` inside a residual `bump()`, #177).  Default ON;
+/// `PYRE_FBW_BRIDGE_TERMINATE_NOREPLAY=0` opts back into the legacy
+/// rewind-and-replay for bisection.
+pub fn fbw_bridge_terminate_noreplay_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED
+        .get_or_init(|| std::env::var("PYRE_FBW_BRIDGE_TERMINATE_NOREPLAY").as_deref() != Ok("0"))
+}
+
+/// Arm/disarm the bridge `Terminate` no-replay shortcut for the next walk
+/// (see [`FBW_BRIDGE_NOREPLAY_ARMED`]).  The bridge tracer sets it before
+/// the walk and clears it after.
+pub fn fbw_bridge_noreplay_arm(armed: bool) {
+    FBW_BRIDGE_NOREPLAY_ARMED.with(|c| c.set(armed));
+}
+
+/// Whether the bridge `Terminate` no-replay shortcut is armed for the
+/// current walk (read by the `run_perfn_walk` epilogue predicate).
+pub(crate) fn fbw_bridge_noreplay_armed() -> bool {
+    FBW_BRIDGE_NOREPLAY_ARMED.with(|c| c.get())
 }
 
 /// Whether `PYRE_FBW_DEBUG_ABORT` is set.  When on, `full_body_walk_trace`

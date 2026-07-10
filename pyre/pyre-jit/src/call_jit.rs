@@ -2106,6 +2106,38 @@ fn bridge_source_identity_from_descr(
     Some((green_key, trace_id, fail_index))
 }
 
+/// Outcome of `trace_and_compile_from_bridge`.
+///
+/// `pyjitpl.py:2884 handle_guard_failure` never returns — it raises
+/// `ContinueRunningNormally` (bridge attached, resume in compiled code),
+/// switches to the blackhole, or raises `DoneWithThisFrame` when
+/// `interpret()` runs the resumed frames forward to a `Finish`.  Pyre
+/// reifies those three exits so the caller can act on each.
+pub enum BridgeResolution {
+    /// Bridge attached — caller re-enters compiled code
+    /// (`ContinueRunningNormally`).  The legacy `true` return.
+    CompiledContinue,
+    /// Resume the region in the blackhole interpreter
+    /// (`SwitchToBlackhole`).  The legacy `false` return.
+    ResumeBlackhole,
+    /// The single-frame bridge walk ran the resumed frame forward to a
+    /// `Finish` (`Terminate`) and captured its concrete return value —
+    /// `pyjitpl.py` `interpret()` raising `DoneWithThisFrame` from the
+    /// post-walk state.  The caller returns this value directly instead of
+    /// rewinding the live frame and re-running the region (#177).
+    Finished(pyre_jit_trace::state::ConcreteValue),
+}
+
+/// Map the legacy bool bridge outcome (`true` = continue in compiled code,
+/// `false` = resume in the blackhole) onto [`BridgeResolution`].
+fn bridge_resolution_from_bool(compiled_continue: bool) -> BridgeResolution {
+    if compiled_continue {
+        BridgeResolution::CompiledContinue
+    } else {
+        BridgeResolution::ResumeBlackhole
+    }
+}
+
 /// compile.py:714 (_trace_and_compile_from_bridge):
 /// Called when a guard failure reaches the trace_eagerness threshold.
 /// Traces the alternative path from the guard failure point and compiles
@@ -2121,10 +2153,17 @@ fn bridge_source_identity_from_descr(
 /// (back-edge to loop header) is reached.
 /// compile.py:714 _trace_and_compile_from_bridge parity.
 ///
-/// Returns true if the bridge was successfully compiled and attached.
-/// On failure (trace abort, start failure), returns false so the caller
-/// falls through to resume_in_blackhole (RPython pyjitpl.py:2906-2907
-/// SwitchToBlackhole → run_blackhole_interp_to_cancel_tracing).
+/// Returns [`BridgeResolution`]: `CompiledContinue` when the bridge was
+/// compiled and attached, `ResumeBlackhole` on a trace abort / start
+/// failure so the caller falls through to resume_in_blackhole (RPython
+/// pyjitpl.py:2906-2907 SwitchToBlackhole → run_blackhole_interp_to_cancel_tracing),
+/// or `Finished(cv)` when a single-frame walk ran forward to a `Finish`
+/// (`interpret()` raising `DoneWithThisFrame`).
+///
+/// `allow_finish_direct_return` gates the `Finished` shortcut: only the
+/// general guard path (`eval::handle_fail`) can consume a concrete result,
+/// so the CALL_ASSEMBLER callback passes `false` and always takes the
+/// legacy rewind/blackhole path.
 // dont_look_inside: bridge-compile machinery the tracer must not enter.
 #[cfg_attr(target_arch = "wasm32", allow(unreachable_code))]
 #[majit_macros::dont_look_inside]
@@ -2154,7 +2193,13 @@ pub fn trace_and_compile_from_bridge(
     // tracer can decline a pending-exception resume at a non-exception
     // guard (see the deferral below).
     guard_exc: i64,
-) -> bool {
+    // Whether the caller can consume a `Finished(cv)` direct return (the
+    // general guard path can; the CALL_ASSEMBLER callback, which returns a
+    // bare bool to native code, cannot).  Gates the bridge `Terminate`
+    // no-replay shortcut so a committed store journal never strands into a
+    // blackhole re-run on a path that would ignore the concrete result.
+    allow_finish_direct_return: bool,
+) -> BridgeResolution {
     use crate::eval::build_jit_state;
     use crate::jit::state::PyreEnv;
 
@@ -2164,7 +2209,7 @@ pub fn trace_and_compile_from_bridge(
         // `compile.giveup()` when `loop_token` is None (memmgr-evicted).
         // Pyre signals the same outcome by returning `false`, dropping
         // the caller into `resume_in_blackhole` (pyjitpl.py:711).
-        return false;
+        return BridgeResolution::ResumeBlackhole;
     };
 
     let info = {
@@ -2203,7 +2248,7 @@ pub fn trace_and_compile_from_bridge(
         (0, 0)
     };
     if resume_pc == 0 {
-        return false;
+        return BridgeResolution::ResumeBlackhole;
     }
     let is_multiframe_resume = num_resume_frames > 1;
     frame.set_last_instr_from_next_instr(resume_pc);
@@ -2239,7 +2284,7 @@ pub fn trace_and_compile_from_bridge(
                 green_key, trace_id, fail_index
             );
         }
-        return false;
+        return BridgeResolution::ResumeBlackhole;
     }
     // RPython pyjitpl.py:3101 _prepare_exception_resumption +
     // pyjitpl.py:3132 prepare_resume_from_failure parity:
@@ -2364,7 +2409,7 @@ pub fn trace_and_compile_from_bridge(
         if driver.is_tracing() {
             driver.meta_interp_mut().abort_trace(false);
         }
-        return false;
+        return BridgeResolution::ResumeBlackhole;
     }
 
     // pyjitpl.py:2841 interpret(): after start_retrace_from_guard, RPython
@@ -2391,6 +2436,19 @@ pub fn trace_and_compile_from_bridge(
     let trace_frame = frame.snapshot_for_tracing();
     let live_frame_addr = frame as *const PyFrame as usize;
     let mut adopted_walk_end_state = false;
+    // Arm the bridge `Terminate` no-replay shortcut for this walk only when
+    // the gate is on, the caller can consume a concrete result, and the
+    // resume is single-frame.  The walk epilogue (`run_perfn_walk` in
+    // trace.rs) reads this flag: only when armed does a bridge `Terminate`
+    // walk keep its finish-concrete stash + commit the store journal, so the
+    // three decisions (epilogue predicate, journal commit, the
+    // consume-vs-rewind below) stay in agreement and a committed journal
+    // never strands into a blackhole re-run.
+    let bridge_noreplay_armed =
+        pyre_jit_trace::jitcode_dispatch::fbw_bridge_terminate_noreplay_enabled()
+            && allow_finish_direct_return
+            && !is_multiframe_resume;
+    pyre_jit_trace::jitcode_dispatch::fbw_bridge_noreplay_arm(bridge_noreplay_armed);
     let outcome = {
         let (driver, _) = crate::eval::driver_pair();
         driver.jit_merge_point_keyed(
@@ -2418,6 +2476,41 @@ pub fn trace_and_compile_from_bridge(
             },
         )
     };
+    // Disarm so the flag cannot leak into a later (non-bridge) walk on this
+    // thread; the epilogue has already consumed it.
+    pyre_jit_trace::jitcode_dispatch::fbw_bridge_noreplay_arm(false);
+
+    // #177 bridge `Terminate` no-replay: consume any finish-concrete the walk
+    // kept.  A stash survives the epilogue only when `bridge_noreplay_armed`
+    // held AND the walk reached `Terminate` with a materialized concrete and
+    // no unjournaled effect — the epilogue then committed the store journal,
+    // so the walked region's eager side effects (including callee-internal
+    // `SetfieldGc`s like `self.pos += 1`) stand exactly once.  Rewinding the
+    // live frame to the guard pc and re-running the region — via the
+    // `ContinueRunningNormally` re-entry — would apply them a second time.
+    // Hand the concrete result forward as `DoneWithThisFrame` instead,
+    // mirroring the top-level portal (eval.rs `maybe_compile_and_run`) and
+    // `pyjitpl.py:2841` `interpret()` raising `DoneWithThisFrame` from the
+    // post-walk state.  Always take (not peek) so a kept stash cannot leak
+    // into a later top-level portal `fbw_finish_concrete_take`.
+    if let Some(cv) = pyre_jit_trace::jitcode_dispatch::fbw_finish_concrete_take() {
+        // `bridge_noreplay_armed` folds in `!is_multiframe_resume`, so a kept
+        // stash implies a single real live PyFrame: the `Terminate` is the
+        // live frame's function return, about to be popped by its caller with
+        // `cv`.  No rewind, no blackhole.
+        debug_assert!(
+            !is_multiframe_resume,
+            "bridge Terminate no-replay stash kept for a multiframe resume \
+             (frames={num_resume_frames})"
+        );
+        if majit_metainterp::majit_log_enabled() {
+            eprintln!(
+                "[jit][bridge-trace] finish-noreplay at resume_pc={} key={}",
+                resume_pc, green_key
+            );
+        }
+        return BridgeResolution::Finished(cv);
+    }
     if !adopted_walk_end_state {
         frame.restore_resume_state_from(&resume_state);
     }
@@ -2445,7 +2538,7 @@ pub fn trace_and_compile_from_bridge(
                 resume_pc, green_key, resume_via_blackhole
             );
         }
-        return !resume_via_blackhole;
+        return bridge_resolution_from_bool(!resume_via_blackhole);
     }
 
     // pyjitpl.py:2982-2983 / 3095-3099 parity:
@@ -2470,7 +2563,7 @@ pub fn trace_and_compile_from_bridge(
                 resume_pc, green_key, resume_via_blackhole
             );
         }
-        return !resume_via_blackhole;
+        return bridge_resolution_from_bool(!resume_via_blackhole);
     }
 
     // If the driver is no longer tracing, the bridge was compiled
@@ -2497,7 +2590,7 @@ pub fn trace_and_compile_from_bridge(
                 resume_pc, green_key, compiled, adopted_walk_end_state
             );
         }
-        return compiled || adopted_walk_end_state;
+        return bridge_resolution_from_bool(compiled || adopted_walk_end_state);
     }
 
     // Trace did not converge into a bridge. Abort like RPython's
@@ -2514,7 +2607,7 @@ pub fn trace_and_compile_from_bridge(
     }
     // A committed walk has already executed the region into the live
     // frame; the blackhole replay must not run even on this abort path.
-    adopted_walk_end_state
+    bridge_resolution_from_bool(adopted_walk_end_state)
 }
 
 /// compile.py:701-717 handle_fail for call_assembler guard failures.
@@ -2614,7 +2707,24 @@ fn jit_ca_handle_guard_failure(
         // CALL_ASSEMBLER guard failures grab their callee exception on the
         // blackhole leg, not here; pass 0 so the non-exception-guard
         // deferral keys only off the general guard path's `guard_exc`.
-        trace_and_compile_from_bridge(&descr_arc, frame, raw_values, &exit_layout, 0)
+        // `allow_finish_direct_return = false`: this callback returns a bare
+        // bool to native code and has no channel for a concrete result, so
+        // it always takes the legacy rewind/blackhole path (the bridge
+        // `Terminate` no-replay shortcut stays off here).
+        match trace_and_compile_from_bridge(&descr_arc, frame, raw_values, &exit_layout, 0, false) {
+            BridgeResolution::CompiledContinue => true,
+            BridgeResolution::ResumeBlackhole => false,
+            // Unreachable: the shortcut is disarmed for this caller
+            // (`allow_finish_direct_return = false`), so the walk never keeps
+            // a finish-concrete stash and never returns `Finished`.
+            BridgeResolution::Finished(_) => {
+                debug_assert!(
+                    false,
+                    "CALL_ASSEMBLER bridge returned Finished despite disarm"
+                );
+                false
+            }
+        }
     };
 
     if majit_metainterp::majit_log_enabled() {

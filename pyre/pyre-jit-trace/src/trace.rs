@@ -1561,12 +1561,21 @@ fn run_perfn_walk(
     // to `ContinueRunningNormally`.  This shares its predicate with the
     // store-journal commit below so the two decisions never disagree.
     //
-    // Bridge walks are excluded: only the loop-free function portal consumes
-    // the finish stash without replaying.  A bridge `Terminate` walk's caller
-    // resumes the region through the blackhole, so keeping the stores here
-    // would double-apply them (once eagerly, once in the blackhole replay).
+    // A guard-failure BRIDGE `Terminate` walk takes the same shortcut when
+    // the bridge tracer armed it (`fbw_bridge_noreplay_armed`): the caller
+    // hands the captured concrete result forward as `DoneWithThisFrame`
+    // rather than rewinding the live frame to the guard pc and re-running the
+    // region through the `ContinueRunningNormally` re-entry — which would
+    // execute every residual a second time and double-apply any
+    // callee-internal side effect (#177).  The tracer only arms it for a
+    // single-frame resume on the general guard path (never the
+    // CALL_ASSEMBLER callback, which cannot consume a concrete result), so a
+    // committed journal never strands into a blackhole re-run; the three
+    // decisions (this predicate, the journal commit below, and the caller's
+    // consume-vs-rewind) stay in agreement.  `PYRE_FBW_BRIDGE_TERMINATE_NOREPLAY=0`
+    // (folded into the armed flag) restores the legacy rewind-and-replay.
     let terminate_no_replay = crate::jitcode_dispatch::fbw_no_replay_exit_enabled()
-        && !is_bridge_trace
+        && (!is_bridge_trace || crate::jitcode_dispatch::fbw_bridge_noreplay_armed())
         && matches!(
             &walk_result,
             Ok((crate::jitcode_dispatch::DispatchOutcome::Terminate, _))

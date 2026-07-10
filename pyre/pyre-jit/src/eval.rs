@@ -4787,6 +4787,11 @@ enum HandleFailOutcome {
     BridgeCompiled,
     /// Resume in blackhole interpreter.
     ResumeInBlackhole,
+    /// The single-frame bridge walk ran the resumed frame forward to a
+    /// `Finish` and captured its concrete return value (`interpret()`
+    /// raising `DoneWithThisFrame`).  Return it directly instead of
+    /// rewinding + re-running the region (#177).
+    BridgeFinished(pyre_object::PyObjectRef),
 }
 
 /// compile.py:701-717 handle_fail.
@@ -4827,24 +4832,43 @@ fn handle_fail(
             // `done_compiling` so a panic inside
             // `trace_and_compile_from_bridge` cannot latch
             // `ST_BUSY_FLAG`.
-            let compiled = {
+            let resolution = {
                 let _guard = GuardCompilingScope::new(descr_arc);
                 // force_plain_eval prevents concrete calls during bridge
                 // tracing from re-entering compiled code.
                 let _plain = pyre_interpreter::call::force_plain_eval();
+                // `allow_finish_direct_return = true`: the general guard path
+                // can hand a concrete `Finish` result back to its portal.
                 crate::call_jit::trace_and_compile_from_bridge(
                     descr_arc,
                     frame,
                     raw_values,
                     exit_layout,
                     guard_exc,
+                    true,
                 )
             };
-            if compiled {
-                // compile.py:708: bridge compiled → ContinueRunningNormally.
-                // RPython: the bridge is attached to the guard descr;
-                // re-entering compiled code will follow the bridge.
-                return HandleFailOutcome::BridgeCompiled;
+            match resolution {
+                crate::call_jit::BridgeResolution::CompiledContinue => {
+                    // compile.py:708: bridge compiled → ContinueRunningNormally.
+                    // RPython: the bridge is attached to the guard descr;
+                    // re-entering compiled code will follow the bridge.
+                    return HandleFailOutcome::BridgeCompiled;
+                }
+                crate::call_jit::BridgeResolution::Finished(cv) => {
+                    // #177: the walk ran the resumed frame forward to its
+                    // return and captured the concrete result; hand it back
+                    // as `DoneWithThisFrame` (`interpret()` raising it from
+                    // the post-walk state) rather than rewinding + re-running.
+                    // The bridge stays attached for subsequent guard failures.
+                    let v = match cv {
+                        // A void return stashes `Null`, i.e. Python `None`.
+                        pyre_jit_trace::state::ConcreteValue::Null => w_none(),
+                        other => other.to_pyobj(),
+                    };
+                    return HandleFailOutcome::BridgeFinished(v);
+                }
+                crate::call_jit::BridgeResolution::ResumeBlackhole => {}
             }
         }
     }
@@ -5153,6 +5177,8 @@ fn execute_assembler(
                 info,
             ) {
                 HandleFailOutcome::BridgeCompiled => Some(LoopResult::ContinueRunningNormally),
+                // #177: single-frame bridge walk returned a concrete Finish.
+                HandleFailOutcome::BridgeFinished(v) => Some(LoopResult::Done(Ok(v))),
                 HandleFailOutcome::ResumeInBlackhole => {
                     // compile.py:710-716 / pyjitpl.py:2906 SwitchToBlackhole
                     let bh_result =
@@ -5439,6 +5465,10 @@ fn bound_reached(
                 HandleFailOutcome::BridgeCompiled => {
                     return Some(LoopResult::ContinueRunningNormally);
                 }
+                // #177: single-frame bridge walk returned a concrete Finish.
+                HandleFailOutcome::BridgeFinished(v) => {
+                    return Some(LoopResult::Done(Ok(v)));
+                }
                 HandleFailOutcome::ResumeInBlackhole => {
                     let bh_result =
                         resume_in_blackhole_from_exit_layout(raw_values, exit_layout, guard_exc);
@@ -5618,6 +5648,11 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                     // Bridge compiled → ContinueRunningNormally → re-enter
                     // compiled code which will follow the new bridge.
                     // Fall through to eval_loop_jit below.
+                }
+                // #177: single-frame bridge walk returned a concrete Finish.
+                // This site returns `Option<PyResult>` (not `LoopResult`).
+                HandleFailOutcome::BridgeFinished(v) => {
+                    return Some(Ok(v));
                 }
                 HandleFailOutcome::ResumeInBlackhole => {
                     let bh_result =
