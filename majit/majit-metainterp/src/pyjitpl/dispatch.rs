@@ -2838,7 +2838,10 @@ where
                         (4, false) => *(item_addr as *const u32) as i64,
                         (8, _) => *(item_addr as *const i64),
                         other => {
-                            panic!("BC_RAW_LOAD_I: unsupported (itemsize, signed) = {:?}", other)
+                            panic!(
+                                "BC_RAW_LOAD_I: unsupported (itemsize, signed) = {:?}",
+                                other
+                            )
                         }
                     }
                 };
