@@ -355,9 +355,41 @@ pub fn trace_bytecode(
 /// seeded, e.g. a `goto_if_not` over a non-concrete Int produced by an
 /// unfolded `residual_call`).  See
 /// `project_issue73_architecture_walker_as_tracer_2026_05_28`.
+///
+/// Whether the loop whose header merge point is `header_mp_pc` (the loop a
+/// header entry at `entry` is about to trace) is NESTED inside another loop
+/// still active at `entry`.
+///
+/// A backward `goto/L` (target `< pc`) is a loop back-edge spanning
+/// `[target, goto_pc]`.  The loop being traced is nested iff some back-edge
+/// `[t, g]` ENCLOSES it: it starts before the entry (`t < entry`) and closes
+/// AFTER the whole inner loop (`g > header_mp_pc`).  A PRECEDING sibling
+/// loop's back-edge closes before `entry` (`g < header_mp_pc`) so it does not
+/// match; the inner loop's OWN back-edge is excluded because its target lands
+/// at its own header (the first merge point at or after `t` is `header_mp_pc`
+/// itself, not an earlier loop).
+fn header_entry_is_nested(code: &[u8], entry: usize, header_mp_pc: usize) -> bool {
+    let first_mp_at_or_after = |t: usize| {
+        crate::jitcode_runtime::decoded_ops(code)
+            .filter(|op| op.opname == "jit_merge_point")
+            .map(|op| op.pc)
+            .filter(|&pc| pc >= t)
+            .min()
+    };
+    crate::jitcode_runtime::decoded_ops(code)
+        .filter(|op| op.opname == "goto")
+        .any(|op| {
+            let target = crate::jitcode_dispatch::read_label(code, &op, 0);
+            target < op.pc // backward branch = loop back-edge
+                && target < entry
+                && op.pc > header_mp_pc
+                && first_mp_at_or_after(target).is_some_and(|mp| mp < header_mp_pc)
+        })
+}
+
 /// Decode the loop-header `jit_merge_point` that governs the resume
-/// coordinate `entry` (the nearest one with `pc < entry`) and return its
-/// green-ref (`gr`) and red (`rr`) register lists.
+/// coordinate `entry` and return its green-ref (`gr`) and red (`rr`)
+/// register lists.
 ///
 /// These name the jitcode register colors the loop body reads its
 /// loop-invariant pycode (`gr`) and frame/ec (`rr`) from.  A mid-loop walk
@@ -368,29 +400,58 @@ pub fn trace_bytecode(
 /// count-prefixed register lists `gi, gr, gf, ri, rr, rf`.  Returns `None`
 /// when no preceding merge point exists (straight-line resume) or the
 /// operand stream is truncated.
+///
+/// `body_resume` selects which merge point governs `entry`.  RPython binds
+/// each merge point's greenboxes 1:1 from the op it is ABOUT TO execute
+/// (pyjitpl.py:1537 `opimpl_jit_merge_point(greenboxes, ...)`), because the
+/// MIFrame walks every op forward.  pyre resumes PAST that op at a resume
+/// marker, so it must reconstruct the same op's register colors:
+///  - A HEADER entry (`body_resume=false`, a fresh loop trace) sits at the
+///    loop header's leading `-live-` marker, immediately BEFORE the merge
+///    point the walk is about to reach — so the governing op is the FIRST
+///    merge point at or after `entry`.  Picking the largest one BEFORE
+///    `entry` would select a PRECEDING sibling loop's merge point (a
+///    function with two loops), seeding that loop's pycode/frame/ec colors
+///    and leaving this loop's distinct colors `OpRef::NONE` — the
+///    born-between-loops abort.
+///  - A body-guard bridge resume (`body_resume=true`) enters PAST its loop's
+///    merge point, so the governing op is the LAST merge point at or before
+///    `entry`.
+///
+/// EXCEPTION: a header entry into a loop that is NESTED inside another loop
+/// still active at `entry` (a `for` inside a `while`) keeps the pre-fix
+/// behavior — the enclosing loop's (earlier) merge point is selected, which
+/// leaves the inner loop's own green color `OpRef::NONE` so the inner-loop
+/// trace declines at its merge point instead of compiling.  pyre's walker
+/// miscompiles the bridges an inner nested loop closes into (wrong result),
+/// so declining (and running the inner loop interpreted) is the safe shape
+/// until that separate nested-loop limitation is fixed.  Only the top-level
+/// sibling-loop case is newly enabled by the forward selection.
 pub(crate) fn loop_header_merge_point_regs(
     code: &[u8],
     entry: usize,
+    body_resume: bool,
 ) -> Option<(Vec<u8>, Vec<u8>)> {
-    // The merge point governing `entry`.  A body-guard resume enters PAST the
-    // merge point, so the merge point precedes `entry` and the last `op.pc <=
-    // entry` is the governing one.  A HEADER-entry resume keys to the header
-    // PC's own leading `-live-` marker, inserted immediately before the
-    // header's first insn, which sits just BEFORE the `jit_merge_point` op;
-    // there `entry < mp_pc`, so fall back to the first merge point at or after
-    // `entry`.  A straight-line function has no merge point and returns `None`.
-    let mp_pc = crate::jitcode_runtime::decoded_ops(code)
-        .filter(|op| op.opname == "jit_merge_point")
-        .map(|op| op.pc)
-        .filter(|&pc| pc <= entry)
-        .max()
-        .or_else(|| {
-            crate::jitcode_runtime::decoded_ops(code)
-                .filter(|op| op.opname == "jit_merge_point")
-                .map(|op| op.pc)
-                .filter(|&pc| pc >= entry)
-                .min()
-        })?;
+    let merge_point_pcs = || {
+        crate::jitcode_runtime::decoded_ops(code)
+            .filter(|op| op.opname == "jit_merge_point")
+            .map(|op| op.pc)
+    };
+    let mp_pc = if body_resume {
+        merge_point_pcs()
+            .filter(|&pc| pc <= entry)
+            .max()
+            .or_else(|| merge_point_pcs().filter(|&pc| pc >= entry).min())
+    } else {
+        let forward = merge_point_pcs().filter(|&pc| pc >= entry).min();
+        match forward {
+            Some(f) if !header_entry_is_nested(code, entry, f) => Some(f),
+            _ => merge_point_pcs()
+                .filter(|&pc| pc <= entry)
+                .max()
+                .or(forward),
+        }
+    }?;
     let mut cursor = mp_pc + 1 + 1; // opcode byte + jdindex (`c`)
     let mut lists: [Vec<u8>; 6] = Default::default();
     for slot in lists.iter_mut() {
@@ -1123,7 +1184,7 @@ fn run_perfn_walk(
         // standard virtualizable. The #124 operand-stack override below must
         // not overwrite these (a kept temp never lives in a red-input color).
         let mut reserved_red_colors: Vec<u8> = Vec::new();
-        match loop_header_merge_point_regs(pjc.jitcode.code.as_slice(), entry) {
+        match loop_header_merge_point_regs(pjc.jitcode.code.as_slice(), entry, is_bridge_trace) {
             Some((gr, rr)) => {
                 if let Some(&r) = gr.first() {
                     seed(r, pycode_box);

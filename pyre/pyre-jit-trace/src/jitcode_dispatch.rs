@@ -1540,7 +1540,7 @@ fn read_float_reg(
 /// writes the resolved target as `chr(target & 0xFF)` +
 /// `chr((target >> 8) & 0xFF)`, matching `bhimpl_goto`'s
 /// `code[pc] | (code[pc+1] << 8)` decode.
-fn read_label(code: &[u8], op: &DecodedOp, operand_offset: usize) -> usize {
+pub(crate) fn read_label(code: &[u8], op: &DecodedOp, operand_offset: usize) -> usize {
     let lo = code[op.pc + 1 + operand_offset] as usize;
     let hi = code[op.pc + 1 + operand_offset + 1] as usize;
     lo | (hi << 8)
@@ -11124,9 +11124,14 @@ fn walker_capture_snapshot_for_last_guard_impl(
                                                 .min()
                                         })
                                 };
+                                // `governing_mp` above mirrors the `<= coord`
+                                // max-first pick, i.e. the body-resume branch;
+                                // pass `body_resume=true` to keep this audit's
+                                // seed identical to that comparison.
                                 let regs_d =
-                                    crate::trace::loop_header_merge_point_regs(code, derived);
-                                let regs_m = crate::trace::loop_header_merge_point_regs(code, m);
+                                    crate::trace::loop_header_merge_point_regs(code, derived, true);
+                                let regs_m =
+                                    crate::trace::loop_header_merge_point_regs(code, m, true);
                                 let mp_eq =
                                     governing_mp(derived) == governing_mp(m) && regs_d == regs_m;
                                 eprintln!(
