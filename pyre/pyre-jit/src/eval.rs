@@ -590,17 +590,15 @@ fn trace_buffer_exporter(
     }
 }
 
-/// Forward, in place, every `PyObjectRef` the view owns — the `.obj`
-/// exporter, the format / shape / strides objects, and the backing exporter
-/// inside its `Buffer` — exactly as `W_ListObject` walks its off-block
-/// elements.  The box is `std::alloc` stationary, so `view` never moves.
-unsafe fn memoryview_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
-    let mv = obj_addr as *const pyre_object::memoryview::W_MemoryView;
-    let view_ptr = unsafe { (*mv).view } as *mut pyre_object::bufferview::BufferView;
-    if view_ptr.is_null() {
-        return;
-    }
-    let view = unsafe { &mut *view_ptr };
+/// Forward, in place, every `PyObjectRef` a view tree owns — the `.obj`
+/// exporter, any stored format / shape / strides objects, the backing
+/// exporter inside its `Buffer`, and (for a `Slice` wrapper) everything the
+/// boxed parent view owns — exactly as `W_ListObject` walks its off-block
+/// elements.  The boxes are `std::alloc` stationary, so nothing here moves.
+fn trace_bufferview(
+    view: &mut pyre_object::bufferview::BufferView,
+    f: &mut dyn FnMut(*mut majit_ir::GcRef),
+) {
     match view {
         pyre_object::bufferview::BufferView::Strided {
             backing,
@@ -633,7 +631,20 @@ unsafe fn memoryview_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut
             f(w_fmt as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
             trace_buffer_exporter(backing, f);
         }
+        pyre_object::bufferview::BufferView::Slice { parent, w_obj, .. } => {
+            f(w_obj as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+            trace_bufferview(parent, f);
+        }
     }
+}
+
+unsafe fn memoryview_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    let mv = obj_addr as *const pyre_object::memoryview::W_MemoryView;
+    let view_ptr = unsafe { (*mv).view } as *mut pyre_object::bufferview::BufferView;
+    if view_ptr.is_null() {
+        return;
+    }
+    trace_bufferview(unsafe { &mut *view_ptr }, f);
 }
 
 /// Reclaim the off-heap `BufferView` box (and any nested `Buffer::Sub`
@@ -641,9 +652,9 @@ unsafe fn memoryview_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut
 /// `W_MemoryView` header is swept.  The custom trace only keeps the box's
 /// `PyObjectRef`s alive while the header lives; without this the
 /// `std::alloc` box would leak on every memoryview / slice / cast that
-/// dies.  `release()` only flips the `released` flag (it does not null
-/// `view`), so the box is always freed here at header death; the null
-/// guard covers the brief header-allocated-before-`set_view` window.
+/// dies.  `release()` drops the box and nulls `view` eagerly, so the null
+/// guard covers both a released view and the brief
+/// header-allocated-before-`set_view` window.
 unsafe fn memoryview_object_destructor(obj_addr: usize) {
     let mv = obj_addr as *const pyre_object::memoryview::W_MemoryView;
     let view_ptr = unsafe { (*mv).view } as *mut pyre_object::bufferview::BufferView;

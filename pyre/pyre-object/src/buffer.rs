@@ -12,6 +12,12 @@
 use crate::pyobject::PyObjectRef;
 
 /// Flat byte storage behind a buffer-protocol exporter.
+///
+/// `Clone` shares the storage, not the bytes: a variant holds only the
+/// exporter ref (plus window scalars for `Sub`), so a clone is another
+/// window onto the same live storage — how PyPy shares one immutable
+/// `Buffer` object between views.
+#[derive(Clone)]
 pub enum Buffer {
     /// `bytes` — read-only (`StringBuffer`).
     String { w_obj: PyObjectRef },
@@ -126,6 +132,44 @@ impl Buffer {
                         at_most
                     };
                     &full[off..off + length]
+                }
+            }
+        }
+    }
+
+    /// Mutable byte storage of a writable buffer, or `None` when the
+    /// exporter is read-only (`bytes`).  The variant tag already encodes the
+    /// concrete exporter kind (including a subclass, tagged at construction),
+    /// so dispatch needs no isinstance.  A `Sub` yields its window of the
+    /// parent's storage with the same clamp as [`as_bytes`](Buffer::as_bytes).
+    ///
+    /// # Safety
+    /// The variant's `w_obj` must point to a live object of the tagged kind.
+    #[inline]
+    pub unsafe fn as_bytes_mut(&self) -> Option<&'static mut [u8]> {
+        unsafe {
+            match self {
+                Buffer::String { .. } => None,
+                Buffer::Byte { w_obj } => {
+                    Some(crate::bytearrayobject::w_bytearray_data_mut(*w_obj))
+                }
+                Buffer::Array { w_obj } => {
+                    Some(crate::interp_array::w_array_vec_mut(*w_obj).as_mut_slice())
+                }
+                Buffer::Sub {
+                    parent,
+                    offset,
+                    size,
+                } => {
+                    let full = parent.as_bytes_mut()?;
+                    let off = (*offset).min(full.len());
+                    let at_most = full.len() - off;
+                    let length = if *size >= 0 && (*size as usize) <= at_most {
+                        *size as usize
+                    } else {
+                        at_most
+                    };
+                    Some(&mut full[off..off + length])
                 }
             }
         }

@@ -620,14 +620,17 @@ unsafe fn writebuf<'a>(obj: PyObjectRef) -> Result<&'a mut [u8], crate::PyError>
                     "a read-write bytes-like object is required",
                 ));
             }
-            let backing = memoryview::w_memoryview_backing(obj);
-            if bytearrayobject::is_bytearray(backing)
+            let view = memoryview::w_memoryview_view(obj);
+            if bytearrayobject::is_bytearray(view.backing().w_obj())
                 && memoryview::w_memoryview_stride0(obj) == memoryview::w_memoryview_itemsize(obj)
             {
-                let off = memoryview::w_memoryview_offset(obj) as usize;
+                let off = view.offset() as usize;
                 let len = memoryview::w_memoryview_length(obj) as usize;
-                let full = bytearrayobject::w_bytearray_data_mut(backing);
-                return Ok(&mut full[off..off + len]);
+                // The backing storage is already the view's `Buffer::Sub`
+                // window for a zero-copy slice.
+                if let Some(full) = view.backing().as_bytes_mut() {
+                    return Ok(&mut full[off..off + len]);
+                }
             }
         }
         Err(crate::PyError::type_error(

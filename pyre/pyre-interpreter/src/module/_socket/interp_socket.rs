@@ -207,18 +207,15 @@ fn socket_writebuf(obj: pyre_object::PyObjectRef) -> Result<&'static mut [u8], c
                 "a read-write bytes-like object is required, not 'memoryview'",
             ));
         }
-        let backing = unsafe { pyre_object::memoryview::w_memoryview_backing(obj) };
+        let view = unsafe { pyre_object::memoryview::w_memoryview_view(obj) };
         // A writable view's backing is a `bytearray` or an `array.array`; both
         // expose a mutable byte store.  Honour the view window: write only into
-        // `[offset, offset+length)` of the backing, not the whole buffer.
-        let full: &mut [u8] = if unsafe { pyre_object::bytearrayobject::is_bytearray(backing) } {
-            unsafe { pyre_object::bytearrayobject::w_bytearray_data_mut(backing) }
-        } else if unsafe { pyre_object::interp_array::is_array(backing) } {
-            unsafe { pyre_object::interp_array::w_array_vec_mut(backing).as_mut_slice() }
-        } else {
+        // `[offset, offset+length)` of the backing storage (itself already the
+        // `Buffer::Sub` window for a zero-copy slice), not the whole buffer.
+        let Some(full) = (unsafe { view.backing().as_bytes_mut() }) else {
             return Err(crate::PyError::type_error("cannot modify read-only memory"));
         };
-        let off = unsafe { pyre_object::memoryview::w_memoryview_offset(obj) } as usize;
+        let off = unsafe { view.offset() } as usize;
         let len = unsafe { pyre_object::memoryview::w_memoryview_length(obj) } as usize;
         // The backing may have been resized after the view was taken; reject a
         // window that no longer fits rather than panic.

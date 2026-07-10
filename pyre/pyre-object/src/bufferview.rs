@@ -6,11 +6,11 @@
 //!
 //! `memoryview`'s `W_MemoryView` holds one of these off the GC heap; the GC
 //! reaches the refs inside (the backing exporter, the `.obj` exporter, and
-//! the format / shape / strides objects) through `W_MemoryView`'s custom
-//! trace.  The format / shape / strides ride as their Python objects so the
-//! `W_MemoryView` accessors stay pure reads; lowering them to native Rust
-//! `str` / `Vec` (the `SimpleView` / `RawBufferView` subclass split) is a
-//! later slice.
+//! any stored format / shape / strides objects) through `W_MemoryView`'s
+//! custom trace.  The specialised variants (`Simple` / `Raw` / `Slice`)
+//! derive their geometry natively and store only exporter refs plus scalars;
+//! callers that need a Python `str` / `tuple` wrap a fresh one at the `descr`
+//! boundary.
 
 use crate::buffer::Buffer;
 use crate::pyobject::PyObjectRef;
@@ -83,6 +83,11 @@ unsafe fn read_dims(t: PyObjectRef) -> Vec<i64> {
 /// every geometry field explicitly; the specialised variants peel off in
 /// later slices, each routing its own constructor and deriving geometry
 /// GC-safely.
+///
+/// Views are immutable once built (`_immutable_ = True`), so `Clone` shares
+/// semantics: PyPy hands the same view object to a wrapper / copy, pyre
+/// clones it into the new owner's box.
+#[derive(Clone)]
 pub enum BufferView {
     /// General strided / N-dimensional view over the root [`Buffer`], carrying
     /// absolute `offset` / `shape` / `strides` geometry.
@@ -127,6 +132,21 @@ pub enum BufferView {
         itemsize: i64,
         length: i64,
     },
+    /// `BufferSlice` (`buffer.py:321`) — a strided dimension-0 window over a
+    /// parent view, produced by a step≠1 slice (a step==1 slice of a
+    /// `Simple` / `Raw` view re-specialises over a [`Buffer::Sub`] window
+    /// instead).  `start` / `step` are in parent dimension-0 element units
+    /// and `length` is the element count (`shape[0]`); shape / strides /
+    /// format / itemsize derive from the parent with dimension 0 replaced,
+    /// so no geometry objects are stored.  A slice of a slice composes into
+    /// the parent's coordinates, keeping the wrapper depth at 1.
+    Slice {
+        parent: Box<BufferView>,
+        w_obj: PyObjectRef,
+        start: i64,
+        step: i64,
+        length: i64,
+    },
 }
 
 impl BufferView {
@@ -137,6 +157,7 @@ impl BufferView {
             BufferView::Strided { backing, .. }
             | BufferView::Simple { backing, .. }
             | BufferView::Raw { backing, .. } => backing,
+            BufferView::Slice { parent, .. } => parent.backing(),
         }
     }
     /// The exporter reported by `memoryview.obj`.
@@ -145,7 +166,8 @@ impl BufferView {
         match self {
             BufferView::Strided { w_obj, .. }
             | BufferView::Simple { w_obj, .. }
-            | BufferView::Raw { w_obj, .. } => *w_obj,
+            | BufferView::Raw { w_obj, .. }
+            | BufferView::Slice { w_obj, .. } => *w_obj,
         }
     }
     /// The element format string (`getformat`), read natively — the callers
@@ -161,6 +183,7 @@ impl BufferView {
                 BufferView::Strided { w_format, .. } => crate::w_str_get_value(*w_format),
                 BufferView::Simple { .. } => "B",
                 BufferView::Raw { w_fmt, .. } => crate::w_str_get_value(*w_fmt),
+                BufferView::Slice { parent, .. } => parent.format_str(),
             }
         }
     }
@@ -185,6 +208,15 @@ impl BufferView {
                         vec![*length / *itemsize]
                     }
                 }
+                // Dimension 0 takes the slice's element count; later
+                // dimensions ride along (`shape[0] = length`, buffer.py:334).
+                BufferView::Slice { parent, length, .. } => {
+                    let mut shape = parent.native_shape();
+                    if let Some(s0) = shape.first_mut() {
+                        *s0 = *length;
+                    }
+                    shape
+                }
             }
         }
     }
@@ -200,6 +232,15 @@ impl BufferView {
                 BufferView::Strided { w_strides, .. } => read_dims(*w_strides),
                 BufferView::Simple { .. } => vec![1],
                 BufferView::Raw { itemsize, .. } => vec![*itemsize],
+                // Dimension 0 steps by the parent's stride times the slice
+                // step (`strides[0] *= step`, buffer.py:332).
+                BufferView::Slice { parent, step, .. } => {
+                    let mut strides = parent.native_strides();
+                    if let Some(s0) = strides.first_mut() {
+                        *s0 *= *step;
+                    }
+                    strides
+                }
             }
         }
     }
@@ -221,6 +262,7 @@ impl BufferView {
                     .unwrap_or(*itemsize),
                 BufferView::Simple { .. } => 1,
                 BufferView::Raw { itemsize, .. } => *itemsize,
+                BufferView::Slice { parent, step, .. } => parent.stride0() * *step,
             }
         }
     }
@@ -229,6 +271,7 @@ impl BufferView {
         match self {
             BufferView::Strided { itemsize, .. } | BufferView::Raw { itemsize, .. } => *itemsize,
             BufferView::Simple { .. } => 1,
+            BufferView::Slice { parent, .. } => parent.itemsize(),
         }
     }
     #[inline]
@@ -236,21 +279,35 @@ impl BufferView {
         match self {
             BufferView::Strided { ndim, .. } => *ndim,
             BufferView::Simple { .. } | BufferView::Raw { .. } => 1,
+            BufferView::Slice { parent, .. } => parent.ndim(),
         }
     }
+    /// Byte offset of the view's first element within the backing storage.
+    /// A `Slice` starts `start` parent elements past the parent's own offset
+    /// (`getbytes` adds `self.start * self.parent.getstrides()[0]`,
+    /// buffer.py:340).
+    ///
+    /// # Safety
+    /// A `Slice` parent's stored strides object must be live.
     #[inline]
-    pub fn offset(&self) -> i64 {
+    pub unsafe fn offset(&self) -> i64 {
         match self {
             BufferView::Strided { offset, .. } => *offset,
             BufferView::Simple { .. } | BufferView::Raw { .. } => 0,
+            BufferView::Slice { parent, start, .. } => unsafe {
+                parent.offset() + *start * parent.stride0()
+            },
         }
     }
+    /// `getlength` — the view's byte count.  A `Slice` spans `shape[0]`
+    /// elements (`buffer.py:336`).
     #[inline]
     pub fn length(&self) -> i64 {
         match self {
             BufferView::Strided { length, .. }
             | BufferView::Simple { length, .. }
             | BufferView::Raw { length, .. } => *length,
+            BufferView::Slice { parent, length, .. } => *length * parent.itemsize(),
         }
     }
     #[inline]
@@ -260,6 +317,70 @@ impl BufferView {
             BufferView::Simple { backing, .. } | BufferView::Raw { backing, .. } => {
                 backing.readonly()
             }
+            BufferView::Slice { parent, .. } => parent.readonly(),
+        }
+    }
+
+    /// `new_slice(start, step, slicelength)` — a live dimension-0 sub-view
+    /// sharing the parent's storage (`buffer.py:149,261,310,403`).  `start` /
+    /// `slicelength` are in dimension-0 element units.
+    ///
+    /// A step==1 slice of a `Simple` / `Raw` view re-specialises over a
+    /// [`Buffer::Sub`] window of the same storage, so the result stays a
+    /// plain contiguous view; every other case wraps the parent in a
+    /// [`Slice`](BufferView::Slice).  Slicing a `Slice` composes into its
+    /// parent's coordinates — `start` maps through `parent_index`
+    /// (`self.start + self.step * idx`, buffer.py:386) so a re-slice of a
+    /// strided slice lands on the elements the composed stride selects.
+    ///
+    /// # Safety
+    /// The view's stored geometry objects must be live.
+    pub unsafe fn new_slice(&self, start: i64, step: i64, slicelength: i64) -> BufferView {
+        let wrap = |view: &BufferView| BufferView::Slice {
+            parent: Box::new(view.clone()),
+            w_obj: view.w_obj(),
+            start,
+            step,
+            length: slicelength,
+        };
+        match self {
+            BufferView::Simple {
+                backing, w_obj, ..
+            } if step == 1 => BufferView::Simple {
+                backing: Buffer::sub(backing.clone(), start as usize, slicelength),
+                w_obj: *w_obj,
+                length: slicelength,
+            },
+            BufferView::Raw {
+                backing,
+                w_obj,
+                w_fmt,
+                itemsize,
+                ..
+            } if step == 1 => {
+                let n = *itemsize;
+                BufferView::Raw {
+                    backing: Buffer::sub(backing.clone(), (start * n) as usize, slicelength * n),
+                    w_obj: *w_obj,
+                    w_fmt: *w_fmt,
+                    itemsize: n,
+                    length: slicelength * n,
+                }
+            }
+            BufferView::Slice {
+                parent,
+                w_obj,
+                start: pstart,
+                step: pstep,
+                ..
+            } => BufferView::Slice {
+                parent: parent.clone(),
+                w_obj: *w_obj,
+                start: pstart + pstep * start,
+                step: pstep * step,
+                length: slicelength,
+            },
+            other => wrap(other),
         }
     }
 
@@ -295,5 +416,129 @@ impl BufferView {
             copy_rec(full, &shape, &strides, ndim, 0, offset, isz, &mut out);
             out
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Geometry-only tests: `Simple` / `Raw` derive everything from scalars,
+    // so a fake exporter address is never dereferenced.
+    fn fake(addr: usize) -> PyObjectRef {
+        addr as PyObjectRef
+    }
+
+    fn simple(len: i64) -> BufferView {
+        BufferView::Simple {
+            backing: Buffer::String {
+                w_obj: fake(0x1000),
+            },
+            w_obj: fake(0x1000),
+            length: len,
+        }
+    }
+
+    #[test]
+    fn simple_step1_slice_respecializes_over_sub_window() {
+        // SimpleView.new_slice step==1 (buffer.py:312): the result is another
+        // SimpleView over a SubBuffer window, not a BufferSlice wrapper.
+        let s = unsafe { simple(10).new_slice(2, 1, 5) };
+        match &s {
+            BufferView::Simple {
+                backing: Buffer::Sub { offset, size, .. },
+                length,
+                ..
+            } => {
+                assert_eq!((*offset, *size, *length), (2, 5, 5));
+            }
+            _ => panic!("expected Simple over Sub"),
+        }
+        unsafe {
+            assert_eq!(s.native_shape(), vec![5]);
+            assert_eq!(s.native_strides(), vec![1]);
+            assert_eq!(s.offset(), 0);
+        }
+    }
+
+    #[test]
+    fn raw_step1_slice_scales_the_window_by_itemsize() {
+        // RawBufferView.new_slice step==1 (buffer.py:262-265): the SubBuffer
+        // window is `start * itemsize .. + slicelength * itemsize`.
+        let raw = BufferView::Raw {
+            backing: Buffer::Array {
+                w_obj: fake(0x2000),
+            },
+            w_obj: fake(0x2000),
+            w_fmt: fake(0x2004),
+            itemsize: 4,
+            length: 40,
+        };
+        let s = unsafe { raw.new_slice(1, 1, 3) };
+        match &s {
+            BufferView::Raw {
+                backing: Buffer::Sub { offset, size, .. },
+                itemsize,
+                length,
+                ..
+            } => {
+                assert_eq!((*offset, *size, *itemsize, *length), (4, 12, 4, 12));
+            }
+            _ => panic!("expected Raw over Sub"),
+        }
+        unsafe {
+            assert_eq!(s.native_shape(), vec![3]);
+            assert_eq!(s.native_strides(), vec![4]);
+        }
+    }
+
+    #[test]
+    fn strided_step_wraps_in_a_slice_with_derived_geometry() {
+        let s = unsafe { simple(10).new_slice(0, 2, 5) };
+        assert!(matches!(s, BufferView::Slice { .. }));
+        unsafe {
+            assert_eq!(s.native_shape(), vec![5]);
+            assert_eq!(s.native_strides(), vec![2]);
+            assert_eq!(s.offset(), 0);
+        }
+        assert_eq!(s.itemsize(), 1);
+        assert_eq!(s.ndim(), 1);
+        assert_eq!(s.length(), 5);
+    }
+
+    #[test]
+    fn slice_of_slice_composes_through_the_parent_step() {
+        // Re-slicing a strided slice maps `start` through `parent_index`
+        // (buffer.py:386) and multiplies the steps, collapsing to one
+        // wrapper over the original parent.
+        let s2 = unsafe { simple(10).new_slice(0, 2, 5).new_slice(1, 1, 2) };
+        match &s2 {
+            BufferView::Slice {
+                parent,
+                start,
+                step,
+                length,
+                ..
+            } => {
+                assert_eq!((*start, *step, *length), (2, 2, 2));
+                assert!(matches!(**parent, BufferView::Simple { .. }));
+            }
+            _ => panic!("expected collapsed Slice"),
+        }
+        unsafe {
+            assert_eq!(s2.offset(), 2);
+            assert_eq!(s2.native_strides(), vec![2]);
+        }
+    }
+
+    #[test]
+    fn reversed_slice_starts_at_the_high_end() {
+        let s = unsafe { simple(10).new_slice(9, -1, 10) };
+        unsafe {
+            assert_eq!(s.offset(), 9);
+            assert_eq!(s.native_strides(), vec![-1]);
+            assert_eq!(s.native_shape(), vec![10]);
+        }
+        assert!(s.readonly()); // String backing stays readonly through the wrapper
     }
 }
