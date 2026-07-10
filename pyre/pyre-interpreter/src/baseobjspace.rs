@@ -2516,7 +2516,14 @@ unsafe fn setitem_bytearray_slice(
         w_slice_get_step(index),
     )?;
     let len = pyre_object::bytearrayobject::w_bytearray_len(obj) as i64;
-    let (start, stop, step, _) = crate::sliceobject::slice_adjust_indices(rs, rp, st, len);
+    let (start, stop, step, slicelength) =
+        crate::sliceobject::slice_adjust_indices(rs, rp, st, len);
+    // `descr_setitem`: only a length-changing assignment is a resize —
+    // `_check_exports` is skipped for an equal-length write, so `m[0:2] = b'ZZ'`
+    // remains legal while a buffer is exported but `m[0:1] = b'ZZZ'` is not.
+    if sequence2.len() as i64 != slicelength {
+        crate::builtins::bytearray_check_exports(obj)?;
+    }
     let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(obj);
     if step == 1 {
         let cur = vec.len();
@@ -11791,6 +11798,9 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
         // length is read, so a mutation during index evaluation is reflected in
         // the bounds.
         if pyre_object::bytearrayobject::is_bytearray(obj) {
+            // `descr_delitem` refuses any deletion (single or slice — every
+            // delete shrinks the buffer) while an export is outstanding.
+            crate::builtins::bytearray_check_exports(obj)?;
             if is_slice(index) {
                 let (rs, rp, st) = crate::sliceobject::slice_unpack(
                     w_slice_get_start(index),

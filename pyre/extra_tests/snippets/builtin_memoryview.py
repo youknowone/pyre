@@ -73,25 +73,35 @@ test_compare_buffer_exporters()
 
 
 def test_resizable():
-    # PyPy has no export lock: descr_releasebuffer is a no-op and bytearray
-    # mutators never check exports, so resizing a bytearray while a memoryview
-    # over it is alive succeeds (no BufferError).
+    # A live buffer export (memoryview) locks the bytearray against every
+    # size-changing mutation; in-place item writes stay legal.  Releasing the
+    # export lifts the lock.
     b = bytearray(b"123")
-    b.append(4)
+    b.append(4)  # no export yet: legal
     m = memoryview(b)
-    b.append(5)
+    assert_raises(BufferError, lambda: b.append(5))
+    assert_raises(BufferError, lambda: b.extend(b"xy"))
+    assert_raises(BufferError, lambda: b.insert(0, 1))
+    assert_raises(BufferError, lambda: b.pop())
+    assert_raises(BufferError, lambda: b.remove(ord("1")))
+    assert_raises(BufferError, lambda: b.clear())
+    assert_raises(BufferError, lambda: b.__iadd__(b"z"))
+    assert_raises(BufferError, lambda: b.__setitem__(slice(0, 1), b"ZZZ"))
+    assert_raises(BufferError, lambda: b.__delitem__(0))
+    assert_raises(BufferError, lambda: b.__delitem__(slice(0, 1)))
+    # In-place, size-preserving writes remain legal while exported.
+    b[0] = ord("9")
+    b[0:2] = b"88"
+    assert b[:2] == b"88"
     m.release()
+    # Export released: size-changing mutation succeeds again.
+    b.append(5)
+    assert len(b) == 5
+    # A context-managed view re-locks for its lifetime.
+    with memoryview(b):
+        assert_raises(BufferError, lambda: b.append(6))
     b.append(6)
-    m2 = memoryview(b)
-    m4 = memoryview(m2)
-    b.append(5)
-    m3 = memoryview(m2)
-    b.append(5)
-    m2.release()
-    b.append(5)
-    m3.release()
-    m4.release()
-    b.append(7)
+    assert len(b) == 6
 
 
 test_resizable()

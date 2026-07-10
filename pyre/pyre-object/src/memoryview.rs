@@ -33,6 +33,11 @@ pub struct W_MemoryView {
     pub w_hash: i64,
     /// Flips on `release()` / context-manager exit.
     pub released: bool,
+    /// `owns_export` (`memoryobject.py`).  True for a view built directly over
+    /// an exporter (holds one `_exports` count on the backing); false for a
+    /// slice or a copy that shares the original's export.  Only an owning view
+    /// releases the underlying export.
+    pub owns_export: bool,
 }
 
 /// Allocate a [`BufferView`] off the GC heap (a stationary `Box`, like a
@@ -55,7 +60,7 @@ pub fn bufferview_alloc(view: BufferView) -> *const BufferView {
 /// from the shadow stack (post-relocation) and attaches the box with
 /// [`w_memoryview_set_view`].  Falls back to `malloc_typed` when no GC hook
 /// is installed (unit tests).
-pub fn w_memoryview_alloc_header(released: bool) -> PyObjectRef {
+pub fn w_memoryview_alloc_header(released: bool, owns_export: bool) -> PyObjectRef {
     let payload = W_MemoryView {
         ob: PyObject {
             ob_type: &MEMORYVIEW_TYPE as *const PyType,
@@ -64,6 +69,7 @@ pub fn w_memoryview_alloc_header(released: bool) -> PyObjectRef {
         view: std::ptr::null(),
         w_hash: -1,
         released,
+        owns_export,
     };
     let raw = crate::gc_hook::try_gc_alloc_stable_raw(
         <W_MemoryView as crate::lltype::GcType>::type_id(),
@@ -177,6 +183,16 @@ pub unsafe fn w_memoryview_set_hash(obj: PyObjectRef, hash: i64) {
     unsafe {
         (*(obj as *mut W_MemoryView)).w_hash = hash;
     }
+}
+
+/// `owns_export` — whether this view holds an `_exports` count on its backing
+/// (true for a root view over an exporter, false for a slice / copy).
+///
+/// # Safety
+/// `obj` must point to a valid `W_MemoryView`.
+#[inline]
+pub unsafe fn w_memoryview_owns_export(obj: PyObjectRef) -> bool {
+    unsafe { (*(obj as *const W_MemoryView)).owns_export }
 }
 
 /// Release the view: drop the off-heap `BufferView` box (reclaiming any

@@ -8,11 +8,14 @@ pub static BYTEARRAY_TYPE: PyType = crate::pyobject::new_pytype("bytearray");
 
 /// Python bytearray object.
 ///
-/// Layout: `[ob_type | data]`
+/// Layout: `[ob_type | data | exports]`
 #[repr(C)]
 pub struct W_BytearrayObject {
     pub ob_header: PyObject,
     pub data: *mut Vec<u8>,
+    /// `_exports` — count of active buffer exports.  Size-changing mutators
+    /// are refused while this is positive (`_check_exports`).
+    pub exports: i64,
 }
 
 /// GC type id assigned to `W_BytearrayObject` at JitDriver init time.
@@ -37,6 +40,7 @@ pub fn w_bytearray_new(size: usize) -> PyObjectRef {
             w_class: get_instantiate(&BYTEARRAY_TYPE),
         },
         data,
+        exports: 0,
     }) as PyObjectRef
 }
 
@@ -49,6 +53,7 @@ pub fn w_bytearray_from_bytes(bytes: &[u8]) -> PyObjectRef {
             w_class: get_instantiate(&BYTEARRAY_TYPE),
         },
         data,
+        exports: 0,
     }) as PyObjectRef
 }
 
@@ -123,6 +128,27 @@ pub unsafe fn w_bytearray_vec_mut(obj: PyObjectRef) -> &'static mut Vec<u8> {
     unsafe {
         let ba = &*(obj as *const W_BytearrayObject);
         &mut *ba.data
+    }
+}
+
+/// `_exports` — number of live buffer exports over this bytearray.
+pub unsafe fn w_bytearray_exports(obj: PyObjectRef) -> i64 {
+    unsafe { (*(obj as *const W_BytearrayObject)).exports }
+}
+
+/// `buffer_w` — record a new live buffer export.
+pub unsafe fn w_bytearray_exports_incref(obj: PyObjectRef) {
+    unsafe {
+        let ba = &mut *(obj as *mut W_BytearrayObject);
+        ba.exports += 1;
+    }
+}
+
+/// `bf_releasebuffer` — a consumer released its buffer export.
+pub unsafe fn w_bytearray_exports_decref(obj: PyObjectRef) {
+    unsafe {
+        let ba = &mut *(obj as *mut W_BytearrayObject);
+        ba.exports -= 1;
     }
 }
 
