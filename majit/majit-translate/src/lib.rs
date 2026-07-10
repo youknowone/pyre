@@ -1226,26 +1226,28 @@ fn analyze_pipeline_from_module_paths(
         .pipeline
         .register_trait_families
         .iter()
-        .filter_map(|trait_qualified| match trait_impl_owners.get(trait_qualified) {
-            Some(owners) => make_registration(trait_qualified, owners),
-            None => {
-                // Config validation: a named family that matches no
-                // harvested trait is almost always a spelling mismatch
-                // (the key is the trait's full `name_path()`).  List the
-                // available multi-impl trait paths so the consumer can
-                // correct it.
-                let candidates: Vec<&String> = trait_impl_owners
-                    .iter()
-                    .filter(|(_, owners)| owners.len() >= 2)
-                    .map(|(path, _)| path)
-                    .collect();
-                eprintln!(
-                    "register_trait_families: no harvested trait matches {trait_qualified:?}; \
+        .filter_map(
+            |trait_qualified| match trait_impl_owners.get(trait_qualified) {
+                Some(owners) => make_registration(trait_qualified, owners),
+                None => {
+                    // Config validation: a named family that matches no
+                    // harvested trait is almost always a spelling mismatch
+                    // (the key is the trait's full `name_path()`).  List the
+                    // available multi-impl trait paths so the consumer can
+                    // correct it.
+                    let candidates: Vec<&String> = trait_impl_owners
+                        .iter()
+                        .filter(|(_, owners)| owners.len() >= 2)
+                        .map(|(path, _)| path)
+                        .collect();
+                    eprintln!(
+                        "register_trait_families: no harvested trait matches {trait_qualified:?}; \
                  known multi-impl trait paths: {candidates:?}"
-                );
-                None
-            }
-        })
+                    );
+                    None
+                }
+            },
+        )
         .collect();
     // Gated auto-population (issue #346, S2.3): with `PYRE_DYN_INDIRECT`
     // on, register EVERY `>=2`-impl trait so its inline `dyn Trait`
@@ -1264,31 +1266,30 @@ fn analyze_pipeline_from_module_paths(
             .iter()
             .map(|r| r.base_root.as_str())
             .collect();
-        let mut auto: Vec<call::TraitFamilyRegistration> = trait_impl_owners
-            .iter()
-            .filter(|(trait_qualified, owners)| {
-                owners.len() >= 2 && !already.contains(trait_qualified.as_str())
-            })
-            .filter_map(|(trait_qualified, owners)| {
-                let reg = make_registration(trait_qualified, owners)?;
-                // Cross-registry leaf collision: an impl leaf shared by
-                // another qualified struct in the field registry would
-                // collapse the subclass onto that struct's classdef.
-                if let Some(dup) = reg
-                    .impl_roots
-                    .iter()
-                    .find(|leaf| struct_leaf_counts.get(leaf.as_str()).copied().unwrap_or(0) > 1)
-                {
-                    eprintln!(
-                        "register_trait_families: auto {trait_qualified:?} impl leaf {dup:?} \
+        let mut auto: Vec<call::TraitFamilyRegistration> =
+            trait_impl_owners
+                .iter()
+                .filter(|(trait_qualified, owners)| {
+                    owners.len() >= 2 && !already.contains(trait_qualified.as_str())
+                })
+                .filter_map(|(trait_qualified, owners)| {
+                    let reg = make_registration(trait_qualified, owners)?;
+                    // Cross-registry leaf collision: an impl leaf shared by
+                    // another qualified struct in the field registry would
+                    // collapse the subclass onto that struct's classdef.
+                    if let Some(dup) = reg.impl_roots.iter().find(|leaf| {
+                        struct_leaf_counts.get(leaf.as_str()).copied().unwrap_or(0) > 1
+                    }) {
+                        eprintln!(
+                            "register_trait_families: auto {trait_qualified:?} impl leaf {dup:?} \
                          collides with another registered struct; skipping — leaf-keyed \
                          seeding cannot disambiguate them"
-                    );
-                    return None;
-                }
-                Some(reg)
-            })
-            .collect();
+                        );
+                        return None;
+                    }
+                    Some(reg)
+                })
+                .collect();
         // Deterministic mint order (BTreeMap iteration on `trait_impl_owners`
         // is already sorted, but sort defensively since a HashMap seeded it).
         auto.sort_by(|a, b| a.base_root.cmp(&b.base_root));

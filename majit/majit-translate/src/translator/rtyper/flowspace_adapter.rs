@@ -2190,8 +2190,9 @@ pub fn translate_op(
                     // Narrow the receiver to the family base classdef when the
                     // trait is a registered dispatch family.
                     let getattr_receiver = if let Some(base_root) = base_root {
-                        let callable_host =
-                            HOST_ENV.lookup_builtin("__pyre_cast_instance").ok_or_else(|| {
+                        let callable_host = HOST_ENV
+                            .lookup_builtin("__pyre_cast_instance")
+                            .ok_or_else(|| {
                                 TyperError::message(
                                     "__pyre_cast_instance missing from HOST_ENV bootstrap"
                                         .to_string(),
