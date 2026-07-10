@@ -1615,7 +1615,44 @@ fn run_perfn_walk(
                 &walk_result
             {
                 let abort_jit_pc = *pc;
-                if crate::jitcode_dispatch::fbw_has_unjournaled_effect()
+                // gh#467: the marker fired inside a TOP-level inline sub-walk
+                // whose callee committed no heap effect
+                // (`try_walker_inline_user_call` latched the carrier only under
+                // that gate).  Flush the OUTER frame at the CALL that entered the
+                // callee and resume the interpreter forward — re-executing the
+                // whole call from scratch — instead of the legacy replay from
+                // loop entry, which double-applies the non-journaled pre-CALL
+                // store.  The abort's `abort_jit_pc` is a CALLEE coordinate with
+                // no meaning in the outer py_pc tables, so the outer CALL py_pc
+                // and operand stack come from the latch, not `abort_jit_pc`.
+                // Convergence of `run_blackhole_interp_to_cancel_tracing`
+                // (`pyjitpl.py:2949`), minus the inner-frame rebuild (#126/#215).
+                if let Some((call_py_pc, call_stack)) =
+                    crate::jitcode_dispatch::fbw_take_abort_call_resume()
+                {
+                    if crate::state::flush_walk_end_state_at_outer_call(
+                        ctx,
+                        cf_addr,
+                        call_py_pc,
+                        &call_stack,
+                    ) {
+                        if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                            eprintln!(
+                                "[fbw-abort-flush] gh#467 CALL-forward COMMIT \
+                                 abort_jit_pc={abort_jit_pc} call_py_pc={call_py_pc} \
+                                 stack_depth={}",
+                                call_stack.len()
+                            );
+                        }
+                        WALK_END_FLUSH_COMMITTED.with(|c| c.set(true));
+                    } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                        eprintln!(
+                            "[fbw-abort-flush] gh#467 CALL-forward declined at \
+                             call_py_pc={call_py_pc} (depth mismatch / unresolved local / \
+                             lastblock) — legacy replay kept"
+                        );
+                    }
+                } else if crate::jitcode_dispatch::fbw_has_unjournaled_effect()
                     || crate::jitcode_dispatch::fbw_abort_in_subwalk()
                 {
                     if crate::jitcode_dispatch::fbw_debug_abort_enabled() {

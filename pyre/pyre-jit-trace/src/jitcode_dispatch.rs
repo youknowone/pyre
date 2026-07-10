@@ -6134,6 +6134,12 @@ fn try_execute_residual_call_via_executor(
     // builtin FOR_ITER stays modeled.
     let foriter_frame_snapshot = (helper == majit_ir::PyreHelperKind::ForIterNext)
         .then(pyre_interpreter::call::frame_entry_count);
+    // gh#467: sample the user-frame odometer UNCONDITIONALLY (not only under an
+    // in-flight FOR_ITER) so the concrete-heap-write gate can detect a callee
+    // sub-walk mutation committed through a value-returning dunder body — the
+    // same user-frame signal Finding #1 uses, generalized past FOR_ITER.
+    let heap_write_odometer_before =
+        (!provably_side_effect_free).then(pyre_interpreter::call::frame_entry_count);
     let exec_result = {
         let _suspend = majit_metainterp::TraceContinuationSuspendGuard::enter();
         majit_metainterp::executor::execute_residual_call(call_descr, func_ptr, &args)
@@ -6203,6 +6209,20 @@ fn try_execute_residual_call_via_executor(
             );
         }
         fbw_mark_foriter_body_effect_since_consume();
+    }
+    // gh#467: bump the concrete-heap-write odometer for any residual that is not
+    // provably side-effect-free and either writes live heap (a Void / mutator-
+    // tagged store the store/append journals do not cover) or entered a user
+    // Python frame (a value-returning getter/dunder body that may have mutated).
+    // The inline abort-forward-flush gate snapshots this at the CALL and refuses
+    // the forward flush if a callee sub-walk moved it — re-executing the CALL
+    // would double the effect.
+    if !provably_side_effect_free
+        && (writes_live_heap
+            || heap_write_odometer_before
+                .is_some_and(|before| pyre_interpreter::call::frame_entry_count() != before))
+    {
+        fbw_bump_concrete_heap_write();
     }
     // #73/#267: a user-defined iterator's FOR_ITER runs its item producer
     // (`__next__`/`__getitem__`) as an inline sub-walk whose operand-stack
@@ -7854,6 +7874,34 @@ thread_local! {
     /// the recorded effect.
     static FBW_UNJOURNALED_EFFECT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 
+    /// gh#467 concrete-heap-write odometer: bumped whenever the walk applies a
+    /// heap mutation the store/append/cell journals do NOT cover — a Void /
+    /// mutator-tagged residual executed concretely by
+    /// [`try_execute_residual_call_via_executor`], a residual whose concrete
+    /// run entered a user Python frame (a value-returning dunder that may
+    /// mutate), or an unexecutable residual flagged via
+    /// [`fbw_mark_unjournaled_effect`].  Unlike [`FBW_UNJOURNALED_EFFECT`] (a
+    /// monotone bool) this is a COUNT, so a callee sub-walk's OWN concrete
+    /// effect is detectable even when a prior (pre-CALL) effect already tripped
+    /// the bool.  Read only by the inline abort-forward-flush gate
+    /// (`try_walker_inline_user_call` / gh#467): snapshot at the CALL, compare
+    /// after the sub-walk aborts — a nonzero delta means the callee committed
+    /// an irreversible effect, so re-executing the CALL would double it.
+    static FBW_CONCRETE_HEAP_WRITE_COUNT: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+
+    /// gh#467 inline-abort forward-flush carrier: latched by
+    /// [`try_walker_inline_user_call`] when an `abort_permanent` marker fires
+    /// inside a TOP-level inline sub-walk whose callee committed no heap effect.
+    /// Holds `(outer CALL python pc, [callable, null_or_self, args...])` — the
+    /// exact operand stack the interpreter's CALL opcode expects — so the walk
+    /// driver can flush the outer frame AT that CALL and resume the interpreter
+    /// forward (re-executing the callee from scratch) instead of rolling back
+    /// and replaying the loop body from entry.  The `PyObjectRef`s are rooted by
+    /// [`fbw_store_journal_root_walker`] across the abort unwind's allocations.
+    static FBW_ABORT_CALL_RESUME: std::cell::RefCell<Option<(usize, Vec<pyre_object::PyObjectRef>)>> =
+        const { std::cell::RefCell::new(None) };
+
     /// B3 (`PYRE_FBW_RAISE`): the set of OpRefs the walker built inline via
     /// [`try_walker_trace_exception_new`] (the virtualizable `NewWithVtable`
     /// exception).  Mirrors the trait's `sym.trace_built_exc`
@@ -7912,6 +7960,10 @@ pub(crate) fn fbw_store_journal_reset() {
     FBW_APPEND_JOURNAL.with(|j| j.borrow_mut().clear());
     FBW_CELL_STORE_JOURNAL.with(|j| j.borrow_mut().clear());
     FBW_UNJOURNALED_EFFECT.with(|c| c.set(false));
+    // gh#467: reset the concrete-heap-write odometer and any stale
+    // forward-flush carrier a prior aborted walk latched.
+    FBW_CONCRETE_HEAP_WRITE_COUNT.with(|c| c.set(0));
+    FBW_ABORT_CALL_RESUME.with(|c| *c.borrow_mut() = None);
     // #57 Option C: drop any in-flight FOR_ITER items a prior aborted walk
     // left undelivered (its live frame already consumed the delivery), so a
     // stale item cannot be re-delivered by this walk's abort.  This also
@@ -7938,6 +7990,10 @@ pub(crate) fn fbw_store_journal_push(
     displaced: pyre_object::PyObjectRef,
 ) {
     FBW_STORE_JOURNAL.with(|j| j.borrow_mut().push([list, key, displaced]));
+    // gh#467: a journaled store still mutated the heap this iteration; the
+    // forward-flush gate counts it so a callee sub-walk that appends/setitems
+    // cannot be committed-then-re-executed (a double).
+    fbw_bump_concrete_heap_write();
 }
 
 /// Record the live length a walked eager list append grew past, for the
@@ -7948,6 +8004,8 @@ pub(crate) fn fbw_store_journal_push(
 // (`try_walker_orthodox_list_append`).
 pub(crate) fn fbw_append_journal_push(list: pyre_object::PyObjectRef, length_before: usize) {
     FBW_APPEND_JOURNAL.with(|j| j.borrow_mut().push((list, length_before)));
+    // gh#467: see `fbw_store_journal_push`.
+    fbw_bump_concrete_heap_write();
 }
 
 /// Record the `intvalue` a walked eager `IntMutableCell` store displaces,
@@ -7962,6 +8020,8 @@ pub(crate) fn fbw_cell_store_journal_push(cell: pyre_object::PyObjectRef, intval
         );
     }
     FBW_CELL_STORE_JOURNAL.with(|j| j.borrow_mut().push((cell, intvalue_before)));
+    // gh#467: see `fbw_store_journal_push`.
+    fbw_bump_concrete_heap_write();
 }
 
 /// Commit-path epilogue: the walk's eager stores and appends stand; drop
@@ -8283,6 +8343,31 @@ pub(crate) fn fbw_store_journal_len() -> usize {
 /// the legacy replay applies (see [`FBW_UNJOURNALED_EFFECT`]).
 pub(crate) fn fbw_mark_unjournaled_effect() {
     FBW_UNJOURNALED_EFFECT.with(|c| c.set(true));
+    // gh#467: an unexecutable residual is also a non-journaled effect the
+    // forward-flush gate must count, so a callee that hits one is detected even
+    // when the monotone bool was already set by a pre-CALL effect.
+    fbw_bump_concrete_heap_write();
+}
+
+/// gh#467 concrete-heap-write odometer read (see [`FBW_CONCRETE_HEAP_WRITE_COUNT`]).
+pub(crate) fn fbw_concrete_heap_write_count() -> usize {
+    FBW_CONCRETE_HEAP_WRITE_COUNT.with(|c| c.get())
+}
+
+/// gh#467 bump the concrete-heap-write odometer (see [`FBW_CONCRETE_HEAP_WRITE_COUNT`]).
+pub(crate) fn fbw_bump_concrete_heap_write() {
+    FBW_CONCRETE_HEAP_WRITE_COUNT.with(|c| c.set(c.get() + 1));
+}
+
+/// gh#467 latch the inline-abort forward-flush carrier (see [`FBW_ABORT_CALL_RESUME`]).
+pub(crate) fn fbw_set_abort_call_resume(call_pc: usize, stack: Vec<pyre_object::PyObjectRef>) {
+    FBW_ABORT_CALL_RESUME.with(|c| *c.borrow_mut() = Some((call_pc, stack)));
+}
+
+/// gh#467 take the inline-abort forward-flush carrier, clearing it (see
+/// [`FBW_ABORT_CALL_RESUME`]).
+pub(crate) fn fbw_take_abort_call_resume() -> Option<(usize, Vec<pyre_object::PyObjectRef>)> {
+    FBW_ABORT_CALL_RESUME.with(|c| c.borrow_mut().take())
 }
 
 /// An unexecutable residual call (`try_execute_residual_call_via_executor`
@@ -8361,6 +8446,19 @@ pub fn fbw_store_journal_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRe
             // SAFETY: as above — only the `PyObjectRef` slot is a root; the
             // `usize` body pc and the bool flag are plain scalars.
             visitor(unsafe { &mut *(&mut entry.item as *mut pyre_object::PyObjectRef).cast() });
+        }
+    });
+    // gh#467: the latched forward-flush operand stack (callable + args) is
+    // nursery-resident across the abort unwind — the flush boxes Int/Float
+    // locals, which can trigger a minor collection that moves these refs before
+    // they are written into the frame array — so forward every slot as a root.
+    FBW_ABORT_CALL_RESUME.with(|c| {
+        if let Some((_call_pc, stack)) = c.borrow_mut().as_mut() {
+            for slot in stack.iter_mut() {
+                // SAFETY: `PyObjectRef` and `GcRef` share the usize repr; the
+                // borrow keeps the Vec storage alive for the visit.
+                visitor(unsafe { &mut *(slot as *mut pyre_object::PyObjectRef).cast() });
+            }
         }
     });
 }
@@ -13600,6 +13698,46 @@ fn try_walker_inline_user_call(
     // side-effecting prologue must decline the CA inline (see the arm).
     let prologue_journal_before = fbw_store_journal_len();
     let prologue_effect_before = fbw_has_unjournaled_effect();
+    // gh#467 forward-flush gate snapshot: the concrete-heap-write odometer AT
+    // the CALL (after this iteration's pre-CALL effects, before the callee
+    // sub-walk).  If the sub-walk aborts on an `abort_permanent` marker WITHOUT
+    // moving this odometer, the callee committed nothing irreversible, so the
+    // walk driver may flush the outer frame at this CALL and re-execute the call
+    // forward instead of replaying the loop from entry (which double-applies the
+    // non-journaled pre-CALL store).  Latched only at the TOP inline level: the
+    // flushed frame is the top-level `cf_addr`, whose operand stack is THIS
+    // call's `[callable, null_or_self, args...]`.  Mirrors the convergence of
+    // `run_blackhole_interp_to_cancel_tracing` (`pyjitpl.py:2949`), minus the
+    // inner-frame rebuild (#126/#215).
+    let concrete_writes_before = fbw_concrete_heap_write_count();
+    let is_top_inline = !INLINE_SUBWALK_CAPTURE_BOUNDARY.with(|c| c.get());
+    // The outer CALL's python pc in the TOP-level frame's code, derived from the
+    // FBW snapshot sym at this residual_call's jitcode pc (`op.pc`) — the same
+    // coordinate `call_site_py_pc` below computes.  `None` outside the FBW
+    // top-inline path (no forward flush there).
+    let abort_flush_call_py_pc: Option<usize> = if ctx.is_full_body_walk && is_top_inline {
+        let sym_ptr = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
+        if sym_ptr.is_null() {
+            None
+        } else {
+            let sym = unsafe { &*sym_ptr };
+            if sym.jitcode.is_null() {
+                None
+            } else {
+                unsafe {
+                    let jc = &*sym.jitcode;
+                    let mut py = python_pc_for_jitcode_pc(&jc.payload.metadata, op.pc);
+                    if !jc.payload.code_ptr.is_null() {
+                        let codeobj = &*jc.payload.code_ptr;
+                        py = skip_python_trivia_forward(codeobj, py as usize) as u32;
+                    }
+                    Some(py as usize)
+                }
+            }
+        }
+    } else {
+        None
+    };
     // Compute fresh outer_active_boxes for the inline sub-walk when the
     // parent FBW walk carries an empty set (`dispatch_via_miframe`
     // initializes `outer_active_boxes: Vec::new()`; it is computed
@@ -13757,19 +13895,63 @@ fn try_walker_inline_user_call(
         // callee sub-walk so its branch guards capture both frames (no-op when
         // `parent_frame` is None — the strict straight-line inline path).
         let _parent_frame_guard = parent_frame.map(InlineParentFrameGuard::enter);
-        let (outcome, _end_pc) = match walk(body.code, 0, &mut sub_wc) {
-            Ok(v) => v,
-            Err(e) => {
-                if std::env::var("PYRE_FBW_INLINE_DIAG").is_ok() {
-                    eprintln!("[inline-abort] callee sub-walk err: {e:?}");
-                }
-                return Err(e);
+        // Yield the walk Result; `sub_wc` (and the RAII guards) drop at the
+        // block end so the outer `ctx` is borrowable again for the gh#467
+        // forward-flush re-read below.
+        walk(body.code, 0, &mut sub_wc)
+    };
+    let (outcome, _end_pc) = match callee_outcome {
+        Ok(v) => v,
+        Err(e) => {
+            if std::env::var("PYRE_FBW_INLINE_DIAG").is_ok() {
+                eprintln!("[inline-abort] callee sub-walk err: {e:?}");
             }
-        };
-        outcome
+            // gh#467: an `abort_permanent` marker fired inside this top-level
+            // inline sub-walk.  If the callee committed NO irreversible heap
+            // effect (the concrete-heap-write odometer is unmoved since the
+            // CALL), latch the outer CALL boundary so the walk driver flushes
+            // the outer frame there and re-executes the call FORWARD — running
+            // the callee from scratch in the interpreter — instead of rolling
+            // back and replaying the loop from entry, which double-applies the
+            // non-journaled pre-CALL store (the gh#467 defect).  The operand
+            // stack the CALL opcode expects (`[callable, null_or_self,
+            // args...]`) is re-read from the (now GC-forwarded) outer registers,
+            // not the pre-sub-walk `arg_concretes`, so it is current after the
+            // sub-walk's allocations.  A callee that DID commit an effect
+            // (odometer moved) keeps the legacy replay — the honest residual
+            // (the inner-frame rebuild is #126/#215).  This is the intermediate
+            // convergence of `run_blackhole_interp_to_cancel_tracing`
+            // (`pyjitpl.py:2949`), minus the inner-frame reconstruction.
+            if matches!(e, DispatchError::AbortPermanentMarkerReached { .. })
+                && is_top_inline
+                && fbw_concrete_heap_write_count() == concrete_writes_before
+            {
+                if let Some(call_pc) = abort_flush_call_py_pc {
+                    let fresh = read_ref_var_list_concrete(code, op, 1, ctx);
+                    let mut stack = Vec::with_capacity(fresh.len());
+                    let mut all_ref = !fresh.is_empty();
+                    for c in &fresh {
+                        match c {
+                            ConcreteValue::Ref(r) => stack.push(*r),
+                            _ => {
+                                all_ref = false;
+                                break;
+                            }
+                        }
+                    }
+                    // The top-of-stack callable slot must be a real object; a
+                    // non-Ref anywhere means the reconstruction is unreliable, so
+                    // decline (the legacy replay is always sound).
+                    if all_ref && stack.first().is_some_and(|c| !c.is_null()) {
+                        fbw_set_abort_call_resume(call_pc, stack);
+                    }
+                }
+            }
+            return Err(e);
+        }
     };
 
-    match callee_outcome {
+    match outcome {
         DispatchOutcome::SubReturn {
             result: Some(value),
         } => {
