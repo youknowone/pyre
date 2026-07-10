@@ -1263,6 +1263,15 @@ fn memoryview_release(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     Ok(w_none())
 }
 
+/// `memoryview.__release_buffer__` — a no-op (`descr_release_buffer`): a
+/// consumer releasing a buffer it obtained from this memoryview has nothing
+/// to undo, because acquiring a buffer from a memoryview does not increment
+/// the underlying exporter's export count.  It must NOT release the view
+/// itself.
+fn memoryview_release_buffer(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    Ok(w_none())
+}
+
 /// `memoryview.__enter__` — check-released, then return the view itself.
 fn memoryview_enter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mv = args.first().copied().unwrap_or(w_none());
@@ -1553,7 +1562,7 @@ pub(crate) fn init_memoryview_type(ns: &mut DictStorage) {
     // so they register as plain (non-arity-pinned) builtins.
     for (name, f) in [
         ("__exit__", memoryview_exit as MvFn),
-        ("__release_buffer__", memoryview_release),
+        ("__release_buffer__", memoryview_release_buffer),
         ("__delitem__", memoryview_delitem),
         ("hex", memoryview_hex),
         ("cast", memoryview_cast),

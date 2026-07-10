@@ -144,10 +144,18 @@ pub unsafe fn w_bytearray_exports_incref(obj: PyObjectRef) {
     }
 }
 
-/// `bf_releasebuffer` — a consumer released its buffer export.
+/// `bf_releasebuffer` — a consumer released its buffer export.  A release
+/// without a matching acquisition is a fatal accounting bug
+/// (`_exports_underflow`).
 pub unsafe fn w_bytearray_exports_decref(obj: PyObjectRef) {
     unsafe {
         let ba = &mut *(obj as *mut W_BytearrayObject);
+        if ba.exports <= 0 {
+            panic!(
+                "bytearray bf_releasebuffer: _exports underflow: id={obj:?} exports={}",
+                ba.exports
+            );
+        }
         ba.exports -= 1;
     }
 }

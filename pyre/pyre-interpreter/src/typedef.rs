@@ -12624,10 +12624,18 @@ fn init_bytearray_type(ns: &mut DictStorage) {
                 let b = args[1];
                 unsafe {
                     let a_data = pyre_object::bytesobject::bytes_like_data(a);
-                    let b_data = match buffer_as_bytes_like(b)? {
-                        Some(src) => pyre_object::bytesobject::bytes_like_data(src).to_vec(),
-                        None => vec![],
+                    // descr_add: a non-buffer operand raises rather than
+                    // concatenating as empty.
+                    let Some(src) = buffer_as_bytes_like(b)? else {
+                        return Err(crate::PyError::new(
+                            crate::PyErrorKind::TypeError,
+                            format!(
+                                "can't concat {} to bytearray",
+                                crate::type_methods::arg_type_name(b)
+                            ),
+                        ));
                     };
+                    let b_data = pyre_object::bytesobject::bytes_like_data(src).to_vec();
                     let mut result = a_data.to_vec();
                     result.extend_from_slice(&b_data);
                     Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(
@@ -12649,10 +12657,19 @@ fn init_bytearray_type(ns: &mut DictStorage) {
                 let other = args[1];
                 unsafe {
                     crate::builtins::bytearray_check_exports(ba)?;
-                    if let Some(src) = buffer_as_bytes_like(other)? {
-                        let data = pyre_object::bytesobject::bytes_like_data(src).to_vec();
-                        pyre_object::bytearrayobject::w_bytearray_extend(ba, &data);
-                    }
+                    // descr_inplace_add: a non-buffer operand raises rather
+                    // than silently leaving the bytearray unchanged.
+                    let Some(src) = buffer_as_bytes_like(other)? else {
+                        return Err(crate::PyError::new(
+                            crate::PyErrorKind::TypeError,
+                            format!(
+                                "can't concat {} to bytearray",
+                                crate::type_methods::arg_type_name(other)
+                            ),
+                        ));
+                    };
+                    let data = pyre_object::bytesobject::bytes_like_data(src).to_vec();
+                    pyre_object::bytearrayobject::w_bytearray_extend(ba, &data);
                 }
                 Ok(ba)
             },
