@@ -1128,38 +1128,17 @@ impl Drop for OprefVarMapGuard {
     }
 }
 
-thread_local! {
-    /// Loop-invariant deopt-only LABEL args demoted out of the SSA loop phi are
-    /// frame-resident: their value lives only in a dense jitframe slot, never in
-    /// a loop-body SSA Variable.  When a guard reconstructs the Python frame,
-    /// `resolve_failarg_opref` reads the value from that slot instead of
-    /// `use_var`-ing a Variable that was never defined in the loop body.  Maps
-    /// `OpRef.raw()` → byte offset from the frame pointer
-    /// (`JF_FRAME_ITEM0_OFS + carried_slot*8`).  Populated once per compile
-    /// alongside `compute_loop_phi_keep_last`.
-    static DEMOTED_FAILARG_SLOTS: std::cell::RefCell<Option<indexmap::IndexMap<u32, i32>>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-/// RAII guard restoring `DEMOTED_FAILARG_SLOTS` on Drop (mirrors
-/// `OprefVarMapGuard` so nested bridge compiles don't leak the mapping).
-struct DemotedFailargSlotsGuard {
-    saved: Option<indexmap::IndexMap<u32, i32>>,
-}
-
-impl Drop for DemotedFailargSlotsGuard {
-    fn drop(&mut self) {
-        let saved = self.saved.take();
-        DEMOTED_FAILARG_SLOTS.with(|cell| {
-            *cell.borrow_mut() = saved;
-        });
-    }
-}
-
 /// Frame-pointer byte offset of a demoted (frame-resident) failarg's jitframe
 /// slot, or `None` for a normal SSA-resident value.
-fn demoted_failarg_offset(raw: u32) -> Option<i32> {
-    DEMOTED_FAILARG_SLOTS.with(|cell| cell.borrow().as_ref().and_then(|m| m.get(&raw).copied()))
+fn demoted_failarg_offset(demoted_failarg_slots: &IndexMap<u32, i32>, raw: u32) -> Option<i32> {
+    demoted_failarg_slots.get(&raw).copied()
+}
+
+/// Whether `var_idx` is frame-resident instead of an SSA variable in the
+/// current LABEL body.  All root spilling/reloading paths use this one test so
+/// a demoted reference is always read from its forwarded jitframe slot.
+fn is_demoted_failarg(demoted_failarg_slots: &IndexMap<u32, i32>, var_idx: u32) -> bool {
+    demoted_failarg_offset(demoted_failarg_slots, var_idx).is_some()
 }
 
 fn var(idx: u32) -> Variable {
@@ -4826,14 +4805,12 @@ fn lookup_type_at(
     type_index.opref_type_at(opref, op_index)
 }
 
-/// Classify the loop-block LABEL's args into carried SSA phis vs frame-resident
-/// slots.  Returns a per-position mask (`true` = keep as a Cranelift block
-/// param) for the last LABEL, which is the loop back-edge target (`loop_block`).
-/// An empty Vec means no position is demoted.
+/// Classify every loop LABEL's args into carried SSA phis vs frame-resident
+/// slots. Each map value is a per-position mask (`true` = keep as a Cranelift
+/// block param); LABELs with no demotions are absent.
 ///
-/// A position is demoted — kept in its dense jitframe slot
-/// (`JF_FRAME_ITEM0_OFS + i*8`), reloaded once at the LABEL header and left
-/// untouched by the loop body — when it is all of:
+/// A position is demoted — kept in its forwarded ref-root slot, reloaded at
+/// the LABEL header, and left untouched by the loop body — when it is all of:
 ///   * loop-invariant — every JUMP that targets the loop block re-passes the
 ///     LABEL's own arg OpRef at that position, unchanged;
 ///   * deopt-only     — never read by an in-loop computation op (guard failargs
@@ -4843,110 +4820,112 @@ fn lookup_type_at(
 ///
 /// Such a value never needs to occupy a register across the loop; threading it
 /// as an SSA block param only wastes registers and forces the register
-/// allocator to spill the hot induction variables.  The x86 backend's
-/// `consider_label` force-spills exactly this class into frame slots, which is
-/// why its loop body is byte-identical regardless of dead-local count.
-fn compute_loop_phi_keep_last(ops: &[Op], label_indices: &[usize]) -> Vec<bool> {
-    let Some(&last) = label_indices.last() else {
-        return Vec::new();
-    };
-    // Only the peeled loop body reached by fall-through is safe: the preamble
-    // initializes the frame slots on first entry.  A LABEL preceded by a
-    // terminator is reached only via re-entry/back-edge and has no fall-through
-    // init site, so leave its args as phis.
-    if last == 0 || matches!(ops[last - 1].opcode, OpCode::Jump | OpCode::Finish) {
-        return Vec::new();
-    }
-    let label_op = &ops[last];
-    let arity = label_op.num_args();
-    if arity == 0 {
-        return Vec::new();
-    }
-    let label_descr = label_op.getdescr().map(|d| d.index());
-
-    // JUMPs branching to the loop block: descr-matched (same arity) or the
-    // implicit descr-less self-loop (which always targets `loop_block` = last).
-    let back_jumps: Vec<usize> = ops
-        .iter()
-        .enumerate()
-        .filter(|(_, j)| {
-            if j.opcode != OpCode::Jump || j.num_args() != arity {
-                return false;
-            }
-            match (j.getdescr().map(|d| d.index()), label_descr) {
-                (Some(jd), Some(ld)) => jd == ld,
-                (None, _) => true,
-                _ => false,
-            }
-        })
-        .map(|(idx, _)| idx)
-        .collect();
-    if back_jumps.is_empty() {
-        return Vec::new();
-    }
-
-    // Values written after the LABEL (redefined in the loop) and values read by
-    // any computation op.  LABEL/JUMP arglists are the carry itself, not a
-    // compute use; failargs live in getfailargs and so are excluded here.
-    let mut redefined: IndexSet<u32> = IndexSet::new();
-    let mut body_read: IndexSet<u32> = IndexSet::new();
-    for (idx, op) in ops.iter().enumerate() {
-        if idx > last && op.result_type() != Type::Void {
-            let p = op.pos.get();
-            if !p.is_none() && p.inline_const_bits().is_none() {
-                redefined.insert(p.raw());
-            }
+/// allocator to spill the hot induction variables. The x86 backend applies
+/// this test at every LABEL, so do the same here.
+fn compute_loop_phi_keep(ops: &[Op], label_indices: &[usize]) -> IndexMap<usize, Vec<bool>> {
+    let mut last_real_use: IndexMap<u32, usize> = IndexMap::new();
+    for (op_idx, op) in ops.iter().enumerate() {
+        if matches!(op.opcode, OpCode::Label | OpCode::Jump) {
+            continue;
         }
-        if !matches!(op.opcode, OpCode::Label | OpCode::Jump) {
-            for a in op.getarglist().iter() {
-                if !a.is_none() && !a.is_constant() {
-                    let o = a.to_opref();
-                    if o.inline_const_bits().is_none() {
-                        body_read.insert(o.raw());
-                    }
+        for arg in op.getarglist().iter() {
+            if !arg.is_none() && !arg.is_constant() {
+                let opref = arg.to_opref();
+                if opref.inline_const_bits().is_none() {
+                    last_real_use.insert(opref.raw(), op_idx);
                 }
             }
         }
     }
 
-    let label_args = label_op.getarglist();
-    let mut keep = vec![true; arity];
-    let mut any = false;
-    for i in 0..arity {
-        let Some(arg) = label_args.get(i) else {
-            continue;
-        };
-        if arg.is_none() || arg.is_constant() {
+    let mut keep_by_label = IndexMap::new();
+    for &label_idx in label_indices {
+        // A LABEL reached only by a terminator has no fall-through site to seed
+        // its frame slot. LABEL 0 cannot have a non-inputarg producer before it.
+        if label_idx == 0 || matches!(ops[label_idx - 1].opcode, OpCode::Jump | OpCode::Finish) {
             continue;
         }
-        let o = arg.to_opref();
-        if o.inline_const_bits().is_some() {
+        let label_op = &ops[label_idx];
+        let arity = label_op.num_args();
+        if arity == 0 {
             continue;
         }
-        let raw = o.raw();
-        if redefined.contains(&raw) || body_read.contains(&raw) {
+        let label_descr = label_op.getdescr().map(|d| d.index());
+        let back_jumps: Vec<usize> = ops
+            .iter()
+            .enumerate()
+            .filter(|(_, jump)| {
+                if jump.opcode != OpCode::Jump || jump.num_args() != arity {
+                    return false;
+                }
+                match (jump.getdescr().map(|d| d.index()), label_descr) {
+                    (Some(jump_descr), Some(label_descr)) => jump_descr == label_descr,
+                    // A descr-less JUMP targets the backend's implicit loop
+                    // block, which is the final LABEL only.
+                    (None, _) => label_indices.last().copied() == Some(label_idx),
+                    _ => false,
+                }
+            })
+            .map(|(jump_idx, _)| jump_idx)
+            .collect();
+        if back_jumps.is_empty() {
             continue;
         }
-        // Loop-invariant: every back-edge JUMP re-passes this exact OpRef here.
-        let invariant = back_jumps.iter().all(|&j| {
-            ops[j]
-                .getarglist()
-                .get(i)
-                .map(|a| {
-                    !a.is_none()
-                        && !a.is_constant()
-                        && a.to_opref().inline_const_bits().is_none()
-                        && a.to_opref().raw() == raw
-                })
-                .unwrap_or(false)
-        });
-        if !invariant {
-            continue;
+
+        let mut redefined: IndexSet<u32> = IndexSet::new();
+        for op in ops.iter().skip(label_idx + 1) {
+            if op.result_type() != Type::Void {
+                let result = op.pos.get();
+                if !result.is_none() && result.inline_const_bits().is_none() {
+                    redefined.insert(result.raw());
+                }
+            }
         }
-        keep[i] = false;
-        any = true;
+
+        let label_args = label_op.getarglist();
+        let mut keep = vec![true; arity];
+        let mut any = false;
+        for (i, arg) in label_args.iter().enumerate() {
+            if arg.is_none() || arg.is_constant() {
+                continue;
+            }
+            let opref = arg.to_opref();
+            if opref.inline_const_bits().is_some() {
+                continue;
+            }
+            let raw = opref.raw();
+            // `Lifetime.is_last_real_use_before(position)`: uses before this
+            // LABEL are preamble uses, not loop-body uses. Failargs and JUMP
+            // carry args are deliberately not real uses.
+            if redefined.contains(&raw)
+                || last_real_use
+                    .get(&raw)
+                    .is_some_and(|last_use| *last_use > label_idx)
+            {
+                continue;
+            }
+            let invariant = back_jumps.iter().all(|&jump_idx| {
+                ops[jump_idx]
+                    .getarglist()
+                    .get(i)
+                    .map(|jump_arg| {
+                        !jump_arg.is_none()
+                            && !jump_arg.is_constant()
+                            && jump_arg.to_opref().inline_const_bits().is_none()
+                            && jump_arg.to_opref().raw() == raw
+                    })
+                    .unwrap_or(false)
+            });
+            if invariant {
+                keep[i] = false;
+                any = true;
+            }
+        }
+        if any {
+            keep_by_label.insert(label_idx, keep);
+        }
     }
-    if any { keep } else { Vec::new() }
+    keep_by_label
 }
 
 fn build_ref_root_slots(
@@ -5171,6 +5150,7 @@ fn resolve_failarg_opref(
     jf_ptr: CValue,
     ref_root_slots: &[(u32, usize)],
     stale_ref_vars: &IndexSet<u32>,
+    demoted_failarg_slots: &IndexMap<u32, i32>,
     ref_root_base_ofs: i32,
     opref: OpRef,
 ) -> CValue {
@@ -5188,7 +5168,7 @@ fn resolve_failarg_opref(
     // Variable in the loop body; its value lives only in its dense jitframe
     // slot (seeded once in the preamble, unchanged by the loop). Reload it from
     // there rather than `use_var`-ing an undefined Variable.
-    if let Some(offset) = demoted_failarg_offset(opref.raw()) {
+    if let Some(offset) = demoted_failarg_offset(demoted_failarg_slots, opref.raw()) {
         return builder
             .ins()
             .load(cl_types::I64, MemFlags::trusted(), jf_ptr, offset);
@@ -5490,6 +5470,7 @@ fn spill_ref_roots(
     ref_root_slots: &[(u32, usize)],
     defined_ref_vars: &IndexSet<u32>,
     stale_ref_vars: &IndexSet<u32>,
+    demoted_failarg_slots: &IndexMap<u32, i32>,
     ref_root_base_ofs: i32,
 ) {
     for &(var_idx, slot) in ref_root_slots {
@@ -5501,7 +5482,7 @@ fn spill_ref_roots(
         // loop phi the demotion removed. Its value already lives in its ref-root
         // slot — seeded in the preamble and kept current in place because the
         // slot is a live root in this call's gcmap — so the spill is redundant.
-        if demoted_failarg_offset(var_idx).is_some() {
+        if is_demoted_failarg(demoted_failarg_slots, var_idx) {
             continue;
         }
         let offset = ref_root_base_ofs + (slot as i32) * 8;
@@ -5520,6 +5501,7 @@ fn spill_unsynced_ref_roots(
     ref_root_slots: &[(u32, usize)],
     defined_ref_vars: &IndexSet<u32>,
     synced_ref_vars: &IndexSet<u32>,
+    demoted_failarg_slots: &IndexMap<u32, i32>,
     ref_root_base_ofs: i32,
 ) {
     for &(var_idx, slot) in ref_root_slots {
@@ -5528,7 +5510,7 @@ fn spill_unsynced_ref_roots(
         }
         // Demoted refs are frame-resident with no loop-body SSA definition
         // (their slot is already a live gcmap root); never `use_var` them.
-        if demoted_failarg_offset(var_idx).is_some() {
+        if is_demoted_failarg(demoted_failarg_slots, var_idx) {
             continue;
         }
         let offset = ref_root_base_ofs + (slot as i32) * 8;
@@ -5545,6 +5527,7 @@ fn reload_ref_roots(
     jf_ptr: CValue,
     ref_root_slots: &[(u32, usize)],
     defined_ref_vars: &IndexSet<u32>,
+    demoted_failarg_slots: &IndexMap<u32, i32>,
     ref_root_base_ofs: i32,
 ) {
     for &(var_idx, slot) in ref_root_slots {
@@ -5555,7 +5538,7 @@ fn reload_ref_roots(
         // exits (`resolve_failarg_opref`); the loop body never `use_var`s them,
         // so there is no SSA definition to reload — and defining one would be
         // dead. The GC already updated the slot in place across the call.
-        if demoted_failarg_offset(var_idx).is_some() {
+        if is_demoted_failarg(demoted_failarg_slots, var_idx) {
             continue;
         }
         let offset = ref_root_base_ofs + (slot as i32) * 8;
@@ -5926,6 +5909,7 @@ fn emit_collecting_gc_call(
     ref_root_slots: &[(u32, usize)],
     defined_ref_vars: &IndexSet<u32>,
     stale_ref_vars: &IndexSet<u32>,
+    demoted_failarg_slots: &IndexMap<u32, i32>,
     ref_root_base_ofs: i32,
     per_call_gcmap: i64,
     func_ptr: usize,
@@ -5938,6 +5922,7 @@ fn emit_collecting_gc_call(
         ref_root_slots,
         defined_ref_vars,
         stale_ref_vars,
+        demoted_failarg_slots,
         ref_root_base_ofs,
     );
     emit_push_gcmap(builder, jf_ptr, per_call_gcmap);
@@ -5959,6 +5944,7 @@ fn emit_collecting_gc_call(
         new_jf_ptr,
         ref_root_slots,
         defined_ref_vars,
+        demoted_failarg_slots,
         ref_root_base_ofs,
     );
     result
@@ -5976,6 +5962,7 @@ fn emit_indirect_call_from_parts(
     ref_root_slots: &[(u32, usize)],
     defined_ref_vars: &IndexSet<u32>,
     stale_ref_vars: &IndexSet<u32>,
+    demoted_failarg_slots: &IndexMap<u32, i32>,
     ref_root_base_ofs: i32,
     per_call_gcmap: i64,
 ) -> Option<CValue> {
@@ -6019,6 +6006,7 @@ fn emit_indirect_call_from_parts(
             ref_root_slots,
             defined_ref_vars,
             stale_ref_vars,
+            demoted_failarg_slots,
             ref_root_base_ofs,
         );
         emit_push_gcmap(builder, jf_ptr, per_call_gcmap);
@@ -6033,6 +6021,7 @@ fn emit_indirect_call_from_parts(
             new_jf_ptr,
             ref_root_slots,
             defined_ref_vars,
+            demoted_failarg_slots,
             ref_root_base_ofs,
         );
     }
@@ -6428,6 +6417,7 @@ fn emit_guard_exit(
     info: &GuardInfo,
     ref_root_slots: &[(u32, usize)],
     stale_ref_vars: &IndexSet<u32>,
+    demoted_failarg_slots: &IndexMap<u32, i32>,
     ref_root_base_ofs: i32,
     ptr_type: cranelift_codegen::ir::Type,
     call_conv: cranelift_codegen::isa::CallConv,
@@ -6489,6 +6479,7 @@ fn emit_guard_exit(
                 jf_ptr,
                 ref_root_slots,
                 stale_ref_vars,
+                demoted_failarg_slots,
                 ref_root_base_ofs,
                 arg_ref,
             );
@@ -8734,19 +8725,18 @@ impl CraneliftBackend {
             .collect();
 
         // Loop-invariant deopt-only LABEL args are demoted from SSA loop phis to
-        // frame-resident slots (see `compute_loop_phi_keep_last`).  `keep[i] ==
-        // false` means position `i` of the loop-block LABEL gets no Cranelift
-        // block param: it is reloaded from `JF_FRAME_ITEM0_OFS + i*8` at the
-        // LABEL header and dropped from every predecessor JUMP's arg list.
-        let mut loop_phi_keep = compute_loop_phi_keep_last(ops, &label_indices);
-        let loop_phi_last_label: usize = label_indices.last().copied().unwrap_or(usize::MAX);
+        // frame-resident slots (see `compute_loop_phi_keep`). `keep[i] == false`
+        // means position `i` of that LABEL gets no Cranelift block param: it is
+        // read from its forwarded ref-root slot and dropped from every incoming
+        // JUMP's argument list.
+        let mut loop_phi_keep_by_label = compute_loop_phi_keep(ops, &label_indices);
         // Restrict demotion to non-inputarg GC ref-roots.  Two exclusions:
         //
-        //  * INPUTARG — `compute_loop_phi_keep_last` deems an arg invariant from
-        //    the loop's own back-edge, but an inputarg carried by an enclosing
-        //    loop can be mutated across a re-entry the inner back-edge never sees
-        //    (its once-seeded slot goes stale), and inputargs carry special
-        //    entry-block / ref-root establishment that frame-residency desyncs.
+        //  * INPUTARG — input references already have a standard ref-root slot:
+        //    `build_ref_root_slots` creates it, LABEL entry synchronizes it, and
+        //    collecting calls spill/reload it. Keeping their SSA parameter avoids
+        //    a once-seeded carried slot becoming stale when an enclosing loop
+        //    re-enters with a different input value.
         //
         //  * NON-REF — a demoted ref's home is its ref-root slot, which sits in
         //    the region disjoint from `[0, max_output_slots)`.  A non-ref would
@@ -8756,30 +8746,29 @@ impl CraneliftBackend {
         //    by failarg index — a non-terminal spill would clobber the demoted
         //    slot for the rest of the loop, corrupting a later guard's rebuilt
         //    frame.  Refs are immune, so demote only refs.
-        if !loop_phi_keep.is_empty() {
+        if !loop_phi_keep_by_label.is_empty() {
             let input_idxs: indexmap::IndexSet<u32> = inputargs.iter().map(|ia| ia.index).collect();
-            let label_args = ops[loop_phi_last_label].getarglist();
-            for (i, keep) in loop_phi_keep.iter_mut().enumerate() {
-                if *keep {
-                    continue;
-                }
-                let raw = match label_args.get(i) {
-                    Some(arg) if !arg.is_none() && !arg.is_constant() => arg.to_opref().raw(),
-                    _ => {
-                        *keep = true;
+            loop_phi_keep_by_label.retain(|&label_idx, keep| {
+                let label_args = ops[label_idx].getarglist();
+                for (i, keep) in keep.iter_mut().enumerate() {
+                    if *keep {
                         continue;
                     }
-                };
-                let is_ref = ref_root_slots.iter().any(|(idx, _)| *idx == raw);
-                if input_idxs.contains(&raw) || !is_ref {
-                    *keep = true;
+                    let raw = match label_args.get(i) {
+                        Some(arg) if !arg.is_none() && !arg.is_constant() => arg.to_opref().raw(),
+                        _ => {
+                            *keep = true;
+                            continue;
+                        }
+                    };
+                    let is_ref = ref_root_slots.iter().any(|(idx, _)| *idx == raw);
+                    if input_idxs.contains(&raw) || !is_ref {
+                        *keep = true;
+                    }
                 }
-            }
-            if loop_phi_keep.iter().all(|k| *k) {
-                loop_phi_keep.clear();
-            }
+                keep.iter().any(|keep| !keep)
+            });
         }
-        let loop_phi_active = !loop_phi_keep.is_empty();
         // Demoted args that are GC ref-roots: read from their ref-root slot (the
         // collector forwards it in place), not the raw carried slot.  A demoted
         // ref is loop-invariant, so its slot is seeded once and never dirtied;
@@ -8788,51 +8777,34 @@ impl CraneliftBackend {
         // undefined is a loader re-entry that bypasses the preamble producer —
         // the loader re-defines it from the ref-root slot (below), keeping the
         // loop-header phi well-defined on every path.
-        let demoted_ref_positions: Vec<(usize, u32, i32)> = if loop_phi_active {
-            let label_args = ops[loop_phi_last_label].getarglist();
-            loop_phi_keep
+        let demoted_ref_positions_by_label: IndexMap<usize, Vec<(usize, u32, i32)>> =
+            loop_phi_keep_by_label
                 .iter()
-                .enumerate()
-                .filter(|(_, keep)| !**keep)
-                .filter_map(|(i, _)| {
-                    let arg = label_args.get(i)?;
-                    if arg.is_none() || arg.is_constant() {
-                        return None;
-                    }
-                    let raw = arg.to_opref().raw();
-                    ref_root_slots
-                        .iter()
-                        .find(|(idx, _)| *idx == raw)
-                        .map(|(_, slot)| (i, raw, ref_root_base_ofs + (*slot as i32) * 8))
+                .map(|(&label_idx, keep)| {
+                    let label_args = ops[label_idx].getarglist();
+                    let positions =
+                        keep.iter()
+                            .enumerate()
+                            .filter(|(_, keep)| !**keep)
+                            .filter_map(|(i, _)| {
+                                let arg = label_args.get(i)?;
+                                if arg.is_none() || arg.is_constant() {
+                                    return None;
+                                }
+                                let raw = arg.to_opref().raw();
+                                ref_root_slots.iter().find(|(idx, _)| *idx == raw).map(
+                                    |(_, slot)| (i, raw, ref_root_base_ofs + (*slot as i32) * 8),
+                                )
+                            })
+                            .collect();
+                    (label_idx, positions)
                 })
-                .collect()
-        } else {
-            Vec::new()
-        };
-
-        // Publish the demoted args' ref-root slot offsets so `resolve_failarg_opref`
-        // reloads them from memory during guard-exit frame reconstruction.  Every
-        // demoted arg is a GC ref-root (the filter above rejects the rest), so it
-        // reads from its ref-root slot — the collector forwards that in place,
-        // whereas the raw carried slot would be a stale pre-move pointer.  The
-        // RAII guard restores the previous map when this compile returns.
-        let demoted_failarg_map: indexmap::IndexMap<u32, i32> = demoted_ref_positions
-            .iter()
-            .map(|&(_, raw, ofs)| (raw, ofs))
-            .collect();
-        // Keep the demoted-slot hook DISARMED during preamble/outer-region
-        // emission.  A demoted arg's frame slot is only seeded at the last
-        // LABEL's fall-through entry (below); guards emitted earlier (e.g. in an
-        // enclosing loop's region of a nested trace) can still carry that arg as
-        // a failarg while it is a live SSA block param of an earlier LABEL, and
-        // must resolve it that way — reading the not-yet-seeded slot would hand
-        // deopt a garbage pointer.  The map is armed only once emission reaches
-        // the last LABEL's body, where the seed dominates every body guard.  The
-        // RAII guard restores the previous map when this compile returns.
-        let _demoted_slots_guard = {
-            let saved = DEMOTED_FAILARG_SLOTS.with(|cell| cell.borrow_mut().take());
-            DemotedFailargSlotsGuard { saved }
-        };
+                .collect();
+        // This map is intentionally local to `do_compile` and grows only when
+        // code emission reaches a LABEL whose fall-through path has seeded the
+        // root slot. Guard emission receives it explicitly; nested compilation
+        // therefore cannot observe or overwrite another trace's state.
+        let mut demoted_failarg_slots: IndexMap<u32, i32> = IndexMap::new();
 
         if std::env::var_os("MAJIT_DUMP_CLIF").is_some() {
             for &li in &label_indices {
@@ -9113,9 +9085,9 @@ impl CraneliftBackend {
             // (var_types), so the LABEL-block `def_var(param)` never mismatches.
             // Float vars are F64, keeping a loop-carried float in an FP register
             // across the back-edge; the matching JUMP coerces incoming values.
-            let demote_here = loop_phi_active && label_idx == loop_phi_last_label;
+            let loop_phi_keep = loop_phi_keep_by_label.get(&label_idx);
             for (i, arg) in ops[label_idx].getarglist().iter().enumerate() {
-                if demote_here && !loop_phi_keep[i] {
+                if loop_phi_keep.is_some_and(|keep| !keep[i]) {
                     continue; // frame-resident loop-invariant arg — no phi
                 }
                 let ty = var_types
@@ -9233,9 +9205,9 @@ impl CraneliftBackend {
                 // phi defined on the loader edge), and re-sync the ref-root slot
                 // the body's guard exits read from.  Reading the ref-root slot
                 // directly would be stale: a bridge does not repopulate it.
-                let demote_here = loop_phi_active && label_idx == loop_phi_last_label;
-                if demote_here {
-                    for &(i, raw, root_ofs) in &demoted_ref_positions {
+                let loop_phi_keep = loop_phi_keep_by_label.get(&label_idx);
+                if let Some(positions) = demoted_ref_positions_by_label.get(&label_idx) {
+                    for &(i, raw, root_ofs) in positions {
                         let v = builder.ins().load(
                             cl_types::I64,
                             MemFlags::trusted(),
@@ -9247,7 +9219,7 @@ impl CraneliftBackend {
                     }
                 }
                 let vals: Vec<CValue> = (0..arity)
-                    .filter(|&i| !(demote_here && !loop_phi_keep[i]))
+                    .filter(|&i| !loop_phi_keep.is_some_and(|keep| !keep[i]))
                     .map(|i| {
                         let offset = JF_FRAME_ITEM0_OFS + (i as i32) * 8;
                         builder
@@ -9330,52 +9302,56 @@ impl CraneliftBackend {
                         .and_then(|prev_idx| ops.get(prev_idx))
                         .map(|prev| prev.opcode == OpCode::Jump || prev.opcode == OpCode::Finish)
                         .unwrap_or(false);
-                    let demote_here = loop_phi_active && op_idx == loop_phi_last_label;
+                    let loop_phi_keep = loop_phi_keep_by_label.get(&op_idx);
                     if !prev_terminated {
-                        if demote_here {
-                            // Arm the demoted-slot failarg hook now that emission
-                            // has reached the last LABEL's body: from here on the
-                            // seed below dominates every guard, so guards may read
-                            // the frame slot instead of a (nonexistent) SSA var.
-                            DEMOTED_FAILARG_SLOTS.with(|cell| {
-                                *cell.borrow_mut() = Some(demoted_failarg_map.clone())
-                            });
-                            // Seed each demoted (loop-invariant, deopt-only) arg's
-                            // ref-root slot once, on the preamble fall-through, so
-                            // guard-exit reloads and any re-entry loader see a
-                            // live value.  The slot is loop-invariant, so this is
-                            // the only write in the trace; the collector forwards
-                            // it in place thereafter.  Marking it synced keeps a
-                            // later before-call spill from redundantly re-storing
-                            // it (the GC already keeps the slot current).
+                        if let Some(positions) = demoted_ref_positions_by_label.get(&op_idx) {
+                            // Seed each demoted loop-invariant arg's ref-root slot
+                            // on the fall-through path. The collector forwards this
+                            // slot in place; guards below this LABEL reload it
+                            // instead of using an SSA variable.
                             let cur_jf = builder.ins().get_pinned_reg(ptr_type);
                             let label_args = ops[op_idx].getarglist();
-                            for &(i, raw, ofs) in &demoted_ref_positions {
+                            for &(i, raw, ofs) in positions {
                                 let opref = label_args[i].to_opref();
                                 let v = resolve_opref(&mut builder, &constants, opref);
                                 let v = coerce_ty(&mut builder, v, cl_types::I64);
                                 builder.ins().store(MemFlags::new(), v, cur_jf, ofs);
                                 synced_ref_vars.insert(raw);
+                                demoted_failarg_slots.insert(raw, ofs);
                             }
                         }
                         let vals: Vec<CValue> = ops[op_idx]
                             .getarglist()
                             .iter()
                             .enumerate()
-                            .filter(|(i, _)| !(demote_here && !loop_phi_keep[*i]))
+                            .filter(|(i, _)| !loop_phi_keep.is_some_and(|keep| !keep[*i]))
                             .map(|(_, r)| resolve_opref(&mut builder, &constants, r.to_opref()))
                             .collect();
                         let args = block_args_to(&mut builder, *label_block, &vals);
                         builder.ins().jump(*label_block, &args);
                     }
                     builder.switch_to_block(*label_block);
+                    // A later LABEL may receive a raw Box first demoted by an
+                    // earlier LABEL. Re-materialize it from the forwarded root
+                    // slot at this header so the fall-through transfer can pass
+                    // it onward without restoring a loop phi.
+                    if let Some(positions) = demoted_ref_positions_by_label.get(&op_idx) {
+                        let cur_jf = builder.ins().get_pinned_reg(ptr_type);
+                        for &(_, raw, ofs) in positions {
+                            let value =
+                                builder
+                                    .ins()
+                                    .load(cl_types::I64, MemFlags::trusted(), cur_jf, ofs);
+                            builder.def_var(var(raw), value);
+                        }
+                    }
                     let mut param_idx = 0usize;
                     for (i, arg_ref) in ops[op_idx].getarglist().iter().enumerate() {
-                        if demote_here && !loop_phi_keep[i] {
-                            // Frame-resident: no block param, no header
-                            // materialization, no per-iteration work.  The
-                            // preamble seeded the slot; only cold guard-exit
-                            // paths reload it (`resolve_failarg_opref`).
+                        if loop_phi_keep.is_some_and(|keep| !keep[i]) {
+                            // Frame-resident: no block param or per-iteration
+                            // transfer. The header reload only supports a
+                            // fall-through into a later LABEL; guard exits read
+                            // the forwarded root slot directly.
                             continue;
                         }
                         let param = builder.block_params(*label_block)[param_idx];
@@ -9712,6 +9688,7 @@ impl CraneliftBackend {
                         info,
                         &ref_root_slots,
                         &stale_ref_vars,
+                        &demoted_failarg_slots,
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
@@ -9746,6 +9723,7 @@ impl CraneliftBackend {
                         info,
                         &ref_root_slots,
                         &stale_ref_vars,
+                        &demoted_failarg_slots,
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
@@ -9797,6 +9775,7 @@ impl CraneliftBackend {
                         info,
                         &ref_root_slots,
                         &stale_ref_vars,
+                        &demoted_failarg_slots,
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
@@ -9850,6 +9829,7 @@ impl CraneliftBackend {
                         info,
                         &ref_root_slots,
                         &stale_ref_vars,
+                        &demoted_failarg_slots,
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
@@ -9895,6 +9875,7 @@ impl CraneliftBackend {
                         info,
                         &ref_root_slots,
                         &stale_ref_vars,
+                        &demoted_failarg_slots,
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
@@ -9945,6 +9926,7 @@ impl CraneliftBackend {
                         info,
                         &ref_root_slots,
                         &stale_ref_vars,
+                        &demoted_failarg_slots,
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
@@ -10006,6 +9988,7 @@ impl CraneliftBackend {
                         info,
                         &ref_root_slots,
                         &stale_ref_vars,
+                        &demoted_failarg_slots,
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
@@ -10043,6 +10026,7 @@ impl CraneliftBackend {
                         info,
                         &ref_root_slots,
                         &stale_ref_vars,
+                        &demoted_failarg_slots,
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
@@ -10091,6 +10075,7 @@ impl CraneliftBackend {
                         info,
                         &ref_root_slots,
                         &stale_ref_vars,
+                        &demoted_failarg_slots,
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
@@ -10131,6 +10116,7 @@ impl CraneliftBackend {
                             cur_jf,
                             &ref_root_slots,
                             &stale_ref_vars,
+                            &demoted_failarg_slots,
                             ref_root_base_ofs,
                             arg_ref,
                         );
@@ -10182,6 +10168,7 @@ impl CraneliftBackend {
                             info,
                             &ref_root_slots,
                             &stale_ref_vars,
+                            &demoted_failarg_slots,
                             ref_root_base_ofs,
                             ptr_type,
                             call_conv,
@@ -10228,6 +10215,7 @@ impl CraneliftBackend {
                             info,
                             &ref_root_slots,
                             &stale_ref_vars,
+                            &demoted_failarg_slots,
                             ref_root_base_ofs,
                             ptr_type,
                             call_conv,
@@ -10267,6 +10255,7 @@ impl CraneliftBackend {
                         info,
                         &ref_root_slots,
                         &stale_ref_vars,
+                        &demoted_failarg_slots,
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
@@ -10289,6 +10278,7 @@ impl CraneliftBackend {
                         info,
                         &ref_root_slots,
                         &stale_ref_vars,
+                        &demoted_failarg_slots,
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
@@ -10342,6 +10332,7 @@ impl CraneliftBackend {
                         info,
                         &ref_root_slots,
                         &stale_ref_vars,
+                        &demoted_failarg_slots,
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
@@ -10450,6 +10441,7 @@ impl CraneliftBackend {
                         info,
                         &ref_root_slots,
                         &stale_ref_vars,
+                        &demoted_failarg_slots,
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
@@ -10612,6 +10604,7 @@ impl CraneliftBackend {
                         info,
                         &ref_root_slots,
                         &stale_ref_vars,
+                        &demoted_failarg_slots,
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
@@ -10775,6 +10768,7 @@ impl CraneliftBackend {
                         &ref_root_slots,
                         &defined_ref_vars,
                         &stale_ref_vars,
+                        &demoted_failarg_slots,
                         ref_root_base_ofs,
                         per_call_gcmap,
                     );
@@ -11062,6 +11056,7 @@ impl CraneliftBackend {
                             &live_ref_root_slots,
                             &defined_ref_vars,
                             &synced_ref_vars,
+                            &demoted_failarg_slots,
                             ref_root_base_ofs,
                         );
                         emit_push_gcmap(&mut builder, jf_ptr, per_call_gcmap);
@@ -11100,6 +11095,7 @@ impl CraneliftBackend {
                             jf_ptr,
                             &post_call_reload_ref_root_slots,
                             &defined_ref_vars,
+                            &demoted_failarg_slots,
                             ref_root_base_ofs,
                         );
                         mark_ref_roots_after_selective_reload(
@@ -11176,6 +11172,7 @@ impl CraneliftBackend {
                             &live_ref_root_slots,
                             &defined_ref_vars,
                             &synced_ref_vars,
+                            &demoted_failarg_slots,
                             ref_root_base_ofs,
                         );
                         emit_push_gcmap(&mut builder, jf_ptr, per_call_gcmap);
@@ -11228,6 +11225,7 @@ impl CraneliftBackend {
                             jf_ptr,
                             &live_ref_root_slots,
                             &defined_ref_vars,
+                            &demoted_failarg_slots,
                             ref_root_base_ofs,
                         );
                         mark_ref_roots_fresh(&mut stale_ref_vars, &live_ref_root_slots);
@@ -11255,6 +11253,7 @@ impl CraneliftBackend {
                         &live_ref_root_slots,
                         &defined_ref_vars,
                         &synced_ref_vars,
+                        &demoted_failarg_slots,
                         ref_root_base_ofs,
                     );
                     emit_push_gcmap(&mut builder, jf_ptr, per_call_gcmap);
@@ -11282,6 +11281,7 @@ impl CraneliftBackend {
                         jf_ptr,
                         &live_ref_root_slots,
                         &defined_ref_vars,
+                        &demoted_failarg_slots,
                         ref_root_base_ofs,
                     );
                     mark_ref_roots_fresh(&mut stale_ref_vars, &live_ref_root_slots);
@@ -11383,6 +11383,7 @@ impl CraneliftBackend {
                                 cur_jf,
                                 &ref_root_slots,
                                 &stale_ref_vars,
+                                &demoted_failarg_slots,
                                 ref_root_base_ofs,
                                 arg_ref,
                             )
@@ -11419,6 +11420,7 @@ impl CraneliftBackend {
                         &ref_root_slots,
                         &defined_ref_vars,
                         &stale_ref_vars,
+                        &demoted_failarg_slots,
                         ref_root_base_ofs,
                         per_call_gcmap,
                     ) {
@@ -11460,6 +11462,7 @@ impl CraneliftBackend {
                                 cur_jf,
                                 &ref_root_slots,
                                 &stale_ref_vars,
+                                &demoted_failarg_slots,
                                 ref_root_base_ofs,
                                 arg_ref,
                             )
@@ -11489,6 +11492,7 @@ impl CraneliftBackend {
                         &ref_root_slots,
                         &defined_ref_vars,
                         &stale_ref_vars,
+                        &demoted_failarg_slots,
                         ref_root_base_ofs,
                     );
                     emit_push_gcmap(&mut builder, jf_ptr, per_call_gcmap);
@@ -11575,6 +11579,7 @@ impl CraneliftBackend {
                         jf_ptr,
                         &ref_root_slots,
                         &defined_ref_vars,
+                        &demoted_failarg_slots,
                         ref_root_base_ofs,
                     );
 
@@ -11622,6 +11627,7 @@ impl CraneliftBackend {
                                 &ref_root_slots,
                                 &defined_ref_vars,
                                 &stale_ref_vars,
+                                &demoted_failarg_slots,
                                 ref_root_base_ofs,
                                 per_call_gcmap,
                             );
@@ -11680,6 +11686,7 @@ impl CraneliftBackend {
                                 &ref_root_slots,
                                 &defined_ref_vars,
                                 &stale_ref_vars,
+                                &demoted_failarg_slots,
                                 ref_root_base_ofs,
                                 per_call_gcmap,
                             ) {
@@ -11805,6 +11812,7 @@ impl CraneliftBackend {
                             &ref_root_slots,
                             &defined_ref_vars,
                             &stale_ref_vars,
+                            &demoted_failarg_slots,
                             ref_root_base_ofs,
                         );
                         emit_push_gcmap(&mut builder, jf_ptr, per_call_gcmap);
@@ -11827,6 +11835,7 @@ impl CraneliftBackend {
                             jf_ptr_slow,
                             &ref_root_slots,
                             &defined_ref_vars,
+                            &demoted_failarg_slots,
                             ref_root_base_ofs,
                         );
                         // Pass GC-updated values through block params
@@ -11882,6 +11891,7 @@ impl CraneliftBackend {
                         &ref_root_slots,
                         &defined_ref_vars,
                         &stale_ref_vars,
+                        &demoted_failarg_slots,
                         ref_root_base_ofs,
                         per_call_gcmap,
                         gc_alloc_varsize_shim as *const () as usize,
@@ -11964,6 +11974,7 @@ impl CraneliftBackend {
                         &ref_root_slots,
                         &defined_ref_vars,
                         &stale_ref_vars,
+                        &demoted_failarg_slots,
                         ref_root_base_ofs,
                     );
                     emit_push_gcmap(&mut builder, jf_ptr, per_call_gcmap);
@@ -11985,6 +11996,7 @@ impl CraneliftBackend {
                         jf_ptr_slow,
                         &ref_root_slots,
                         &defined_ref_vars,
+                        &demoted_failarg_slots,
                         ref_root_base_ofs,
                     );
                     let mut slow_args: Vec<BlockArg> =
@@ -12929,18 +12941,18 @@ impl CraneliftBackend {
                         None
                     };
                     if let Some(target_block) = target_block {
-                        // Demoted (frame-resident) loop-invariant args are not
-                        // block params on the loop block, so the back-edge does
-                        // not pass them; their slot is unchanged across the
-                        // iteration and reloaded at the LABEL header.
-                        let demote_target = loop_phi_active && target_block == loop_block;
+                        // Demoted frame-resident args are not block params on
+                        // their target LABEL, so their incoming JUMP does not
+                        // pass them; the forwarded root slot stays current.
+                        let target_keep = label_blocks
+                            .iter()
+                            .find(|(_, block)| *block == target_block)
+                            .and_then(|(label_idx, _)| loop_phi_keep_by_label.get(label_idx));
                         let vals: Vec<CValue> = op
                             .getarglist()
                             .iter()
                             .enumerate()
-                            .filter(|(i, _)| {
-                                !(demote_target && !loop_phi_keep.get(*i).copied().unwrap_or(true))
-                            })
+                            .filter(|(i, _)| !target_keep.is_some_and(|keep| !keep[*i]))
                             .map(|(_, r)| resolve_opref(&mut builder, &constants, r.to_opref()))
                             .collect();
                         let args = block_args_to(&mut builder, target_block, &vals);
@@ -12959,6 +12971,7 @@ impl CraneliftBackend {
                             info,
                             &ref_root_slots,
                             &stale_ref_vars,
+                            &demoted_failarg_slots,
                             ref_root_base_ofs,
                             ptr_type,
                             call_conv,
@@ -12977,6 +12990,7 @@ impl CraneliftBackend {
                         info,
                         &ref_root_slots,
                         &stale_ref_vars,
+                        &demoted_failarg_slots,
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
@@ -13142,6 +13156,7 @@ impl CraneliftBackend {
                         info,
                         &ref_root_slots,
                         &stale_ref_vars,
+                        &demoted_failarg_slots,
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
@@ -13174,6 +13189,7 @@ impl CraneliftBackend {
                         info,
                         &ref_root_slots,
                         &stale_ref_vars,
+                        &demoted_failarg_slots,
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
@@ -13696,6 +13712,7 @@ impl CraneliftBackend {
                             &ref_root_slots,
                             &defined_ref_vars,
                             &stale_ref_vars,
+                            &demoted_failarg_slots,
                             ref_root_base_ofs,
                             per_call_gcmap,
                             gc_alloc_typed_nursery_shim as *const () as usize,
@@ -13794,6 +13811,7 @@ impl CraneliftBackend {
                         &ref_root_slots,
                         &defined_ref_vars,
                         &stale_ref_vars,
+                        &demoted_failarg_slots,
                         ref_root_base_ofs,
                         per_call_gcmap,
                         gc_alloc_varsize_shim as *const () as usize,
@@ -13976,6 +13994,7 @@ impl CraneliftBackend {
                         &ref_root_slots,
                         &defined_ref_vars,
                         &stale_ref_vars,
+                        &demoted_failarg_slots,
                         ref_root_base_ofs,
                         per_call_gcmap,
                         gc_alloc_varsize_shim as *const () as usize,
@@ -17413,7 +17432,210 @@ mod tests {
         ];
 
         let ops: Vec<Op> = ops.iter().map(|op| (**op).clone()).collect();
-        assert_eq!(compute_loop_phi_keep_last(&ops, &[1]), vec![false]);
+        assert_eq!(
+            compute_loop_phi_keep(&ops, &[1]).get(&1),
+            Some(&vec![false])
+        );
+    }
+
+    #[test]
+    fn loop_phi_demotes_reference_used_only_before_label() {
+        let carried = OpRef::ref_op(1);
+        let guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(3)], OpRef::NONE.raw());
+        guard.setfailargs(smallvec::smallvec![rb(carried)]);
+        let ops = vec![
+            mk_op(OpCode::SameAsR, &[OpRef::input_arg_ref(0)], carried.raw()),
+            mk_op(OpCode::SameAsR, &[carried], OpRef::ref_op(2).raw()),
+            mk_op(OpCode::Label, &[carried], OpRef::NONE.raw()),
+            guard,
+            mk_op(OpCode::Jump, &[carried], OpRef::NONE.raw()),
+        ];
+
+        let ops: Vec<Op> = ops.iter().map(|op| (**op).clone()).collect();
+        assert_eq!(
+            compute_loop_phi_keep(&ops, &[2]).get(&2),
+            Some(&vec![false])
+        );
+    }
+
+    #[test]
+    fn loop_phi_demotes_earlier_label_target() {
+        let carried = OpRef::ref_op(1);
+        let guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw());
+        guard.setfailargs(smallvec::smallvec![rb(carried)]);
+        let ops = vec![
+            mk_op(OpCode::SameAsR, &[OpRef::input_arg_ref(0)], carried.raw()),
+            mk_op_with_descr(
+                OpCode::Label,
+                &[carried],
+                OpRef::NONE.raw(),
+                make_label_descr(40),
+            ),
+            mk_op_with_descr(
+                OpCode::Label,
+                &[carried],
+                OpRef::NONE.raw(),
+                make_label_descr(41),
+            ),
+            guard,
+            mk_op_with_descr(
+                OpCode::Jump,
+                &[carried],
+                OpRef::NONE.raw(),
+                make_label_descr(40),
+            ),
+        ];
+
+        let ops: Vec<Op> = ops.iter().map(|op| (**op).clone()).collect();
+        assert_eq!(
+            compute_loop_phi_keep(&ops, &[1, 2]).get(&1),
+            Some(&vec![false])
+        );
+    }
+
+    #[test]
+    fn loop_invariant_deopt_ref_with_preamble_use_survives_nursery_collection() {
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 160,
+            large_object_threshold: 1024,
+            ..GcConfig::default()
+        });
+        gc.register_type(TypeInfo::simple(16));
+        let root = gc.alloc_with_type(0, 16);
+        unsafe {
+            *(root.0 as *mut u64) = 0xD30F_0001;
+        }
+
+        let mut backend = CraneliftBackend::with_gc_allocator(Box::new(gc));
+        let carried = OpRef::ref_op(1);
+        let guard = mk_op(
+            OpCode::GuardFalse,
+            &[OpRef::const_int(1)],
+            OpRef::NONE.raw(),
+        );
+        guard.setfailargs(smallvec::smallvec![rb(carried)]);
+        let ops = vec![
+            mk_op(OpCode::SameAsR, &[OpRef::input_arg_ref(0)], carried.raw()),
+            mk_op(OpCode::SameAsR, &[carried], OpRef::ref_op(2).raw()),
+            mk_op(OpCode::Label, &[carried], OpRef::NONE.raw()),
+            mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(256)], 3),
+            guard,
+            mk_op(OpCode::Jump, &[carried], OpRef::NONE.raw()),
+        ];
+        let constants = indexmap::IndexMap::new();
+        backend.set_constants(constants);
+
+        let mut token = JitCellToken::new(1700);
+        backend
+            .compile_loop(&[InputArg::new_ref(0)], &ops, &mut token)
+            .unwrap();
+        let frame = backend.execute_token(&token, &[Value::Ref(root)]);
+        let moved = backend.get_ref_value(&frame, 0);
+        assert_ne!(moved, root);
+        assert_eq!(unsafe { *(moved.0 as *const u64) }, 0xD30F_0001);
+    }
+
+    #[test]
+    fn loop_invariant_deopt_ref_survives_backedge_after_nursery_collection() {
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 160,
+            large_object_threshold: 1024,
+            ..GcConfig::default()
+        });
+        gc.register_type(TypeInfo::simple(16));
+        let root = gc.alloc_with_type(0, 16);
+        unsafe {
+            *(root.0 as *mut u64) = 0xD30F_0003;
+        }
+
+        let mut backend = CraneliftBackend::with_gc_allocator(Box::new(gc));
+        let carried = OpRef::ref_op(2);
+        let next_count = OpRef::int_op(3);
+        let guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(4)], OpRef::NONE.raw());
+        guard.setfailargs(smallvec::smallvec![rb(carried)]);
+        let ops = vec![
+            mk_op(OpCode::SameAsR, &[OpRef::input_arg_ref(0)], carried.raw()),
+            mk_op(
+                OpCode::Label,
+                &[carried, OpRef::input_arg_int(1)],
+                OpRef::NONE.raw(),
+            ),
+            mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(256)], 5),
+            mk_op(
+                OpCode::IntSub,
+                &[OpRef::input_arg_int(1), OpRef::const_int(1)],
+                next_count.raw(),
+            ),
+            mk_op(OpCode::IntGt, &[next_count, OpRef::const_int(0)], 4),
+            guard,
+            mk_op(OpCode::Jump, &[carried, next_count], OpRef::NONE.raw()),
+        ];
+
+        let mut token = JitCellToken::new(1703);
+        backend
+            .compile_loop(
+                &[InputArg::new_ref(0), InputArg::new_int(1)],
+                &ops,
+                &mut token,
+            )
+            .unwrap();
+        let frame = backend.execute_token(&token, &[Value::Ref(root), Value::Int(2)]);
+        let moved = backend.get_ref_value(&frame, 0);
+        assert_ne!(moved, root);
+        assert_eq!(unsafe { *(moved.0 as *const u64) }, 0xD30F_0003);
+    }
+
+    #[test]
+    fn earlier_label_deopt_ref_survives_nursery_collection() {
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 160,
+            large_object_threshold: 1024,
+            ..GcConfig::default()
+        });
+        gc.register_type(TypeInfo::simple(16));
+        let root = gc.alloc_with_type(0, 16);
+        unsafe {
+            *(root.0 as *mut u64) = 0xD30F_0002;
+        }
+
+        let mut backend = CraneliftBackend::with_gc_allocator(Box::new(gc));
+        let carried = OpRef::ref_op(1);
+        let loop_descr = make_label_descr(1701);
+        let guard = mk_op(
+            OpCode::GuardFalse,
+            &[OpRef::const_int(1)],
+            OpRef::NONE.raw(),
+        );
+        guard.setfailargs(smallvec::smallvec![rb(carried)]);
+        let ops = vec![
+            mk_op(OpCode::SameAsR, &[OpRef::input_arg_ref(0)], carried.raw()),
+            mk_op_with_descr(
+                OpCode::Label,
+                &[carried],
+                OpRef::NONE.raw(),
+                loop_descr.clone(),
+            ),
+            mk_op_with_descr(
+                OpCode::Label,
+                &[carried],
+                OpRef::NONE.raw(),
+                make_label_descr(1702),
+            ),
+            mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(256)], 2),
+            guard,
+            mk_op_with_descr(OpCode::Jump, &[carried], OpRef::NONE.raw(), loop_descr),
+        ];
+        let constants = indexmap::IndexMap::new();
+        backend.set_constants(constants);
+
+        let mut token = JitCellToken::new(1701);
+        backend
+            .compile_loop(&[InputArg::new_ref(0)], &ops, &mut token)
+            .unwrap();
+        let frame = backend.execute_token(&token, &[Value::Ref(root)]);
+        let moved = backend.get_ref_value(&frame, 0);
+        assert_ne!(moved, root);
+        assert_eq!(unsafe { *(moved.0 as *const u64) }, 0xD30F_0002);
     }
 
     #[test]
