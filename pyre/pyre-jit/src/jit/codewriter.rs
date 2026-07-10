@@ -12571,14 +12571,17 @@ impl CodeWriter {
             .map(|(py, &dense)| (py as u32, dense))
             .collect();
 
-        // Per-loop-header green → walk-entry sidecar. Resolve each entry
+        // Per-trace-entry green → walk-entry sidecar. Resolve each entry
         // with the runtime translator's exact precedence while the codewriter
         // still owns the marker tables: sparse carry-forward override first,
         // otherwise the derivable resume marker. This is deliberately only
-        // the set of trace-entry greens, not a general coordinate inverse.
-        let mut loop_header_pcs: Vec<usize> = find_loop_header_pcs(code).iter().copied().collect();
-        loop_header_pcs.sort_unstable();
-        let merge_entry_by_green: Vec<(u32, u32)> = loop_header_pcs
+        // the set of trace-entry greens (function entry and loop headers), not
+        // a general coordinate inverse.
+        let mut trace_entry_pcs: Vec<usize> = find_loop_header_pcs(code).iter().copied().collect();
+        trace_entry_pcs.push(0);
+        trace_entry_pcs.sort_unstable();
+        trace_entry_pcs.dedup();
+        let merge_entry_by_green: Vec<(u32, u32)> = trace_entry_pcs
             .into_iter()
             .filter_map(|py_pc| {
                 let off = carryfwd_resume_pc

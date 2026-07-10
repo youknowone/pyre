@@ -119,14 +119,14 @@ pub struct PyJitCodeMetadata {
     /// binary search; sparse (most graphs need zero entries, the majority a
     /// handful); empty for skeleton / portal-bridge / fixture metadata.
     pub carryfwd_resume_pc: Vec<(u32, usize)>,
-    /// Loop-header green py_pc → JitCode byte offset where tracing enters
+    /// Trace-entry green py_pc → JitCode byte offset where tracing enters
     /// for that green. This is the restriction of resume-marker resolution to
-    /// loop headers, built at codewrite time, not a general py_pc → jitcode
-    /// inverse. At portal entry `pyjitpl.py:1567-1573` sets the live frame PC
-    /// to the `jit_merge_point` origin before handling the loop header; pyre's
-    /// whole-function JitCode has one corresponding entry per materialized
-    /// loop header. Sorted ascending by green py_pc for binary search; empty
-    /// for skeleton / portal-bridge / fixture metadata.
+    /// function entry and loop headers, built at codewrite time, not a general
+    /// py_pc → jitcode inverse. At portal entry `pyjitpl.py:1567-1573` sets
+    /// the live frame PC to the `jit_merge_point` origin before handling the
+    /// loop header; pyre's whole-function JitCode has one corresponding entry
+    /// per materialized trace-entry green. Sorted ascending by green py_pc for
+    /// binary search; empty for skeleton / portal-bridge / fixture metadata.
     pub merge_entry_by_green: Vec<(u32, u32)>,
     /// Value-stack depth at each Python PC, in slots above stack_base.
     pub depth_at_py_pc: Vec<u16>,
@@ -549,7 +549,8 @@ impl PyJitCode {
         )
     }
 
-    /// Codewrite-time trace-entry offset for a loop-header green py_pc.
+    /// Codewrite-time trace-entry offset for a function-entry or loop-header
+    /// green py_pc.
     pub fn merge_entry_for(&self, py_pc: usize) -> Option<usize> {
         let table = &self.metadata.merge_entry_by_green;
         table

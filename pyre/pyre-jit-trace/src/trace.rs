@@ -1075,26 +1075,37 @@ fn run_perfn_walk(
         return None;
     };
     // The green stays in Python-bytecode coordinates for merge-point matching;
-    // the codewrite-time loop-header sidecar carries its trace-entry JitCode
-    // coordinate for the plain-portal loop-header leg. A bridge starts at its
-    // guard resume py_pc, and a recursive portal may start at function entry;
-    // both are outside that sidecar by construction, so they keep the runtime
-    // derivation (and the bridge-walk override below when present).
+    // the codewrite-time trace-entry sidecar carries its JitCode coordinate for
+    // plain-portal function entries and loop headers. A bridge starts at its
+    // guard resume py_pc, outside that sidecar by construction.
     let is_plain_portal = !ctx.is_bridge_trace;
     let is_loop_header =
         !pjc.code_ptr.is_null() && start_pc_is_loop_header(unsafe { &*pjc.code_ptr }, start_pc);
-    let uses_entry_sidecar = is_plain_portal && is_loop_header;
+    let is_entry_green = start_pc == 0 || is_loop_header;
+    let uses_entry_sidecar = is_plain_portal && is_entry_green;
     let sidecar_entry = pjc.merge_entry_for(start_pc);
-    if uses_entry_sidecar && crate::jitcode_dispatch::m73_entry_audit_enabled() {
-        let derived = pjc.resume_jitcode_pc_for(start_pc);
-        if sidecar_entry != derived {
-            crate::jitcode_dispatch::census_record("M73EntryAudit::Mismatch");
-            eprintln!(
-                "[m73-entry-audit] start_pc={start_pc} sidecar={sidecar_entry:?} derived={derived:?}"
-            );
+    if crate::jitcode_dispatch::m73_entry_audit_enabled() {
+        if uses_entry_sidecar {
+            let derived = pjc.resume_jitcode_pc_for(start_pc);
+            if sidecar_entry != derived {
+                crate::jitcode_dispatch::census_record("M73EntryAudit::Mismatch");
+                eprintln!(
+                    "[m73-entry-audit] start_pc={start_pc} sidecar={sidecar_entry:?} derived={derived:?}"
+                );
+            }
+        }
+        if ctx.is_bridge_trace && sym.bridge_walk_entry_pc.is_none() {
+            crate::jitcode_dispatch::census_record("M73EntryAudit::BridgeNoCarry");
+            eprintln!("[m73-entry-audit] bridge-no-carry start_pc={start_pc}");
         }
     }
-    let pc_map_entry = if uses_entry_sidecar && crate::jitcode_dispatch::m73_entry_carry_enabled() {
+    let carry = crate::jitcode_dispatch::m73_entry_carry_enabled();
+    let pc_map_entry = if carry && sym.bridge_walk_entry_pc.is_some() {
+        // Guard resume with a carried jitcode coordinate: the walk enters at
+        // the carried offset (override below); the entry-marker derivation is
+        // unused, so a py_pc the tables cannot encode must not decline the walk.
+        sym.bridge_walk_entry_pc
+    } else if carry && uses_entry_sidecar {
         sidecar_entry
     } else {
         // Bridge resume: `start_pc` is the guard's py_pc, not a loop-header
@@ -1102,8 +1113,6 @@ fn run_perfn_walk(
         // for this leg is `sym.bridge_walk_entry_pc` (used below when present);
         // retiring this residual derivation needs the carried `frame0.jitcode_pc`
         // generalized to every bridge resume, a separate #73 front.
-        // A recursive function-entry portal is likewise not a loop header and
-        // keeps this derivation until that separate entry shape is carried.
         pjc.resume_jitcode_pc_for(start_pc)
     };
     let Some(pc_map_entry) = pc_map_entry else {
