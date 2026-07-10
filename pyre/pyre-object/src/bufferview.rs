@@ -76,41 +76,16 @@ unsafe fn read_dims(t: PyObjectRef) -> Vec<i64> {
 /// A view of a [`Buffer`]'s bytes with offset / shape / stride geometry and a
 /// buffer-protocol format.
 ///
-/// PyPy splits this into a class hierarchy — `SimpleView` / `RawBufferView`
-/// (1-D), `BufferSlice` (strided), `BufferView1D` / `BufferViewND` (cast) —
-/// each carrying only the state it needs and deriving the rest.  The single
-/// [`Strided`](BufferView::Strided) variant is the general case that holds
-/// every geometry field explicitly; the specialised variants peel off in
-/// later slices, each routing its own constructor and deriving geometry
-/// GC-safely.
+/// One variant per class of PyPy's view hierarchy — `SimpleView` /
+/// `RawBufferView` (plain 1-D), `BufferSlice` (strided slice),
+/// `BufferView1D` / `BufferViewND` (cast), `ReadonlyWrapper` — each carrying
+/// only the state its class stores and deriving the rest.
 ///
 /// Views are immutable once built (`_immutable_ = True`), so `Clone` shares
 /// semantics: PyPy hands the same view object to a wrapper / copy, pyre
 /// clones it into the new owner's box.
 #[derive(Clone)]
 pub enum BufferView {
-    /// General strided / N-dimensional view over the root [`Buffer`], carrying
-    /// absolute `offset` / `shape` / `strides` geometry.
-    Strided {
-        /// Byte storage actually read / written (the root exporter's buffer).
-        backing: Buffer,
-        /// The exporter reported by `memoryview.obj` — coincides with the
-        /// backing for a plain view, but a chained cast / slice keeps the root
-        /// storage in `backing` while `w_obj` still reports the original
-        /// exporter.
-        w_obj: PyObjectRef,
-        /// Format string object (`memoryview.format`).
-        w_format: PyObjectRef,
-        /// Shape tuple (`memoryview.shape`).
-        w_shape: PyObjectRef,
-        /// Strides tuple (`memoryview.strides`).
-        w_strides: PyObjectRef,
-        itemsize: i64,
-        ndim: i64,
-        offset: i64,
-        length: i64,
-        readonly: bool,
-    },
     /// `SimpleView` (`pypy/interpreter/buffer.py:270`) — a plain contiguous
     /// 1-D byte view (`bytes` / `bytearray`).  Format `'B'`, itemsize 1,
     /// ndim 1, offset 0, shape `[length]`, strides `[1]` are all derived;
@@ -147,6 +122,33 @@ pub enum BufferView {
         step: i64,
         length: i64,
     },
+    /// `BufferView1D` (`memoryobject.py:867`) — a cast to a new 1-D element
+    /// format over the parent's bytes (`_cast_to_1D`).  Format / itemsize are
+    /// explicit; ndim 1, shape `[parent_length / itemsize]`, strides
+    /// `[itemsize]` derive; byte access delegates to the parent
+    /// (`IndirectView`).
+    View1D {
+        parent: Box<BufferView>,
+        w_obj: PyObjectRef,
+        w_fmt: PyObjectRef,
+        itemsize: i64,
+    },
+    /// `BufferViewND` (`memoryobject.py:893`) — a cast to an N-dimensional
+    /// shape over a 1-D parent (`_cast_to_ND`).  `shape` / `strides` ride as
+    /// their tuple objects; format / itemsize come from the parent.
+    ViewND {
+        parent: Box<BufferView>,
+        w_obj: PyObjectRef,
+        ndim: i64,
+        w_shape: PyObjectRef,
+        w_strides: PyObjectRef,
+    },
+    /// `ReadonlyWrapper` (`buffer.py:415`) — `toreadonly`'s wrapper: every
+    /// read delegates to the wrapped view, `readonly` is forced true.
+    Readonly {
+        view: Box<BufferView>,
+        w_obj: PyObjectRef,
+    },
 }
 
 impl BufferView {
@@ -154,20 +156,23 @@ impl BufferView {
     #[inline]
     pub fn backing(&self) -> &Buffer {
         match self {
-            BufferView::Strided { backing, .. }
-            | BufferView::Simple { backing, .. }
-            | BufferView::Raw { backing, .. } => backing,
-            BufferView::Slice { parent, .. } => parent.backing(),
+            BufferView::Simple { backing, .. } | BufferView::Raw { backing, .. } => backing,
+            BufferView::Slice { parent, .. }
+            | BufferView::View1D { parent, .. }
+            | BufferView::ViewND { parent, .. } => parent.backing(),
+            BufferView::Readonly { view, .. } => view.backing(),
         }
     }
     /// The exporter reported by `memoryview.obj`.
     #[inline]
     pub fn w_obj(&self) -> PyObjectRef {
         match self {
-            BufferView::Strided { w_obj, .. }
-            | BufferView::Simple { w_obj, .. }
+            BufferView::Simple { w_obj, .. }
             | BufferView::Raw { w_obj, .. }
-            | BufferView::Slice { w_obj, .. } => *w_obj,
+            | BufferView::Slice { w_obj, .. }
+            | BufferView::View1D { w_obj, .. }
+            | BufferView::ViewND { w_obj, .. }
+            | BufferView::Readonly { w_obj, .. } => *w_obj,
         }
     }
     /// The element format string (`getformat`), read natively — the callers
@@ -180,10 +185,14 @@ impl BufferView {
     pub unsafe fn format_str(&self) -> &'static str {
         unsafe {
             match self {
-                BufferView::Strided { w_format, .. } => crate::w_str_get_value(*w_format),
                 BufferView::Simple { .. } => "B",
-                BufferView::Raw { w_fmt, .. } => crate::w_str_get_value(*w_fmt),
-                BufferView::Slice { parent, .. } => parent.format_str(),
+                BufferView::Raw { w_fmt, .. } | BufferView::View1D { w_fmt, .. } => {
+                    crate::w_str_get_value(*w_fmt)
+                }
+                BufferView::Slice { parent, .. } | BufferView::ViewND { parent, .. } => {
+                    parent.format_str()
+                }
+                BufferView::Readonly { view, .. } => view.format_str(),
             }
         }
     }
@@ -197,7 +206,6 @@ impl BufferView {
     pub unsafe fn native_shape(&self) -> Vec<i64> {
         unsafe {
             match self {
-                BufferView::Strided { w_shape, .. } => read_dims(*w_shape),
                 BufferView::Simple { length, .. } => vec![*length],
                 BufferView::Raw {
                     itemsize, length, ..
@@ -217,6 +225,12 @@ impl BufferView {
                     }
                     shape
                 }
+                // `[getlength() // itemsize]` (memoryobject.py:888).
+                BufferView::View1D {
+                    parent, itemsize, ..
+                } => vec![parent.length() / *itemsize],
+                BufferView::ViewND { w_shape, .. } => read_dims(*w_shape),
+                BufferView::Readonly { view, .. } => view.native_shape(),
             }
         }
     }
@@ -229,9 +243,10 @@ impl BufferView {
     pub unsafe fn native_strides(&self) -> Vec<i64> {
         unsafe {
             match self {
-                BufferView::Strided { w_strides, .. } => read_dims(*w_strides),
                 BufferView::Simple { .. } => vec![1],
-                BufferView::Raw { itemsize, .. } => vec![*itemsize],
+                BufferView::Raw { itemsize, .. } | BufferView::View1D { itemsize, .. } => {
+                    vec![*itemsize]
+                }
                 // Dimension 0 steps by the parent's stride times the slice
                 // step (`strides[0] *= step`, buffer.py:332).
                 BufferView::Slice { parent, step, .. } => {
@@ -241,6 +256,8 @@ impl BufferView {
                     }
                     strides
                 }
+                BufferView::ViewND { w_strides, .. } => read_dims(*w_strides),
+                BufferView::Readonly { view, .. } => view.native_strides(),
             }
         }
     }
@@ -253,33 +270,38 @@ impl BufferView {
     pub unsafe fn stride0(&self) -> i64 {
         unsafe {
             match self {
-                BufferView::Strided {
-                    w_strides,
-                    itemsize,
-                    ..
+                BufferView::Simple { .. } => 1,
+                BufferView::Raw { itemsize, .. } | BufferView::View1D { itemsize, .. } => {
+                    *itemsize
+                }
+                BufferView::Slice { parent, step, .. } => parent.stride0() * *step,
+                BufferView::ViewND {
+                    parent, w_strides, ..
                 } => crate::tupleobject::w_tuple_getitem(*w_strides, 0)
                     .map(|s| crate::intobject::w_int_get_value(s))
-                    .unwrap_or(*itemsize),
-                BufferView::Simple { .. } => 1,
-                BufferView::Raw { itemsize, .. } => *itemsize,
-                BufferView::Slice { parent, step, .. } => parent.stride0() * *step,
+                    .unwrap_or_else(|| parent.itemsize()),
+                BufferView::Readonly { view, .. } => view.stride0(),
             }
         }
     }
     #[inline]
     pub fn itemsize(&self) -> i64 {
         match self {
-            BufferView::Strided { itemsize, .. } | BufferView::Raw { itemsize, .. } => *itemsize,
+            BufferView::Raw { itemsize, .. } | BufferView::View1D { itemsize, .. } => *itemsize,
             BufferView::Simple { .. } => 1,
-            BufferView::Slice { parent, .. } => parent.itemsize(),
+            BufferView::Slice { parent, .. } | BufferView::ViewND { parent, .. } => {
+                parent.itemsize()
+            }
+            BufferView::Readonly { view, .. } => view.itemsize(),
         }
     }
     #[inline]
     pub fn ndim(&self) -> i64 {
         match self {
-            BufferView::Strided { ndim, .. } => *ndim,
-            BufferView::Simple { .. } | BufferView::Raw { .. } => 1,
+            BufferView::Simple { .. } | BufferView::Raw { .. } | BufferView::View1D { .. } => 1,
             BufferView::Slice { parent, .. } => parent.ndim(),
+            BufferView::ViewND { ndim, .. } => *ndim,
+            BufferView::Readonly { view, .. } => view.ndim(),
         }
     }
     /// Byte offset of the view's first element within the backing storage.
@@ -291,33 +313,50 @@ impl BufferView {
     /// A `Slice` parent's stored strides object must be live.
     #[inline]
     pub unsafe fn offset(&self) -> i64 {
-        match self {
-            BufferView::Strided { offset, .. } => *offset,
-            BufferView::Simple { .. } | BufferView::Raw { .. } => 0,
-            BufferView::Slice { parent, start, .. } => unsafe {
-                parent.offset() + *start * parent.stride0()
-            },
+        unsafe {
+            match self {
+                BufferView::Simple { .. } | BufferView::Raw { .. } => 0,
+                BufferView::Slice { parent, start, .. } => {
+                    parent.offset() + *start * parent.stride0()
+                }
+                // IndirectView delegates byte access to the parent unshifted.
+                BufferView::View1D { parent, .. } | BufferView::ViewND { parent, .. } => {
+                    parent.offset()
+                }
+                BufferView::Readonly { view, .. } => view.offset(),
+            }
         }
     }
     /// `getlength` — the view's byte count.  A `Slice` spans `shape[0]`
-    /// elements (`buffer.py:336`).
+    /// elements (`buffer.py:336`); a `ViewND` spans `product(shape)` elements
+    /// (`memoryobject.py:922`).
+    ///
+    /// # Safety
+    /// A `ViewND`'s stored shape object must be a live tuple of ints.
     #[inline]
-    pub fn length(&self) -> i64 {
-        match self {
-            BufferView::Strided { length, .. }
-            | BufferView::Simple { length, .. }
-            | BufferView::Raw { length, .. } => *length,
-            BufferView::Slice { parent, length, .. } => *length * parent.itemsize(),
+    pub unsafe fn length(&self) -> i64 {
+        unsafe {
+            match self {
+                BufferView::Simple { length, .. } | BufferView::Raw { length, .. } => *length,
+                BufferView::Slice { parent, length, .. } => *length * parent.itemsize(),
+                BufferView::View1D { parent, .. } => parent.length(),
+                BufferView::ViewND {
+                    parent, w_shape, ..
+                } => read_dims(*w_shape).iter().product::<i64>() * parent.itemsize(),
+                BufferView::Readonly { view, .. } => view.length(),
+            }
         }
     }
     #[inline]
     pub fn readonly(&self) -> bool {
         match self {
-            BufferView::Strided { readonly, .. } => *readonly,
             BufferView::Simple { backing, .. } | BufferView::Raw { backing, .. } => {
                 backing.readonly()
             }
-            BufferView::Slice { parent, .. } => parent.readonly(),
+            BufferView::Slice { parent, .. }
+            | BufferView::View1D { parent, .. }
+            | BufferView::ViewND { parent, .. } => parent.readonly(),
+            BufferView::Readonly { .. } => true,
         }
     }
 
@@ -379,6 +418,11 @@ impl BufferView {
                 start: pstart + pstep * start,
                 step: pstep * step,
                 length: slicelength,
+            },
+            // A slice of a read-only wrapper stays wrapped (buffer.py:462).
+            BufferView::Readonly { w_obj, .. } => BufferView::Readonly {
+                view: Box::new(wrap(self)),
+                w_obj: *w_obj,
             },
             other => wrap(other),
         }
@@ -503,7 +547,7 @@ mod tests {
         }
         assert_eq!(s.itemsize(), 1);
         assert_eq!(s.ndim(), 1);
-        assert_eq!(s.length(), 5);
+        assert_eq!(unsafe { s.length() }, 5);
     }
 
     #[test]

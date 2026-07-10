@@ -600,20 +600,6 @@ fn trace_bufferview(
     f: &mut dyn FnMut(*mut majit_ir::GcRef),
 ) {
     match view {
-        pyre_object::bufferview::BufferView::Strided {
-            backing,
-            w_obj,
-            w_format,
-            w_shape,
-            w_strides,
-            ..
-        } => {
-            f(w_obj as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-            f(w_format as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-            f(w_shape as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-            f(w_strides as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-            trace_buffer_exporter(backing, f);
-        }
         // Simple / Raw derive their shape / strides (and Simple its format),
         // so only the `.obj` exporter, the backing, and — for Raw — the
         // explicit format object are ref slots to forward.
@@ -634,6 +620,32 @@ fn trace_bufferview(
         pyre_object::bufferview::BufferView::Slice { parent, w_obj, .. } => {
             f(w_obj as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
             trace_bufferview(parent, f);
+        }
+        pyre_object::bufferview::BufferView::View1D {
+            parent,
+            w_obj,
+            w_fmt,
+            ..
+        } => {
+            f(w_obj as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+            f(w_fmt as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+            trace_bufferview(parent, f);
+        }
+        pyre_object::bufferview::BufferView::ViewND {
+            parent,
+            w_obj,
+            w_shape,
+            w_strides,
+            ..
+        } => {
+            f(w_obj as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+            f(w_shape as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+            f(w_strides as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+            trace_bufferview(parent, f);
+        }
+        pyre_object::bufferview::BufferView::Readonly { view, w_obj } => {
+            f(w_obj as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+            trace_bufferview(view, f);
         }
     }
 }
