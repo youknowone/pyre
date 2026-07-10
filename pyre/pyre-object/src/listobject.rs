@@ -446,7 +446,10 @@ pub fn list_strategy_for(items: &[PyObjectRef]) -> ListStrategy {
 }
 
 /// Fire the GC write barrier for an Object-strategy list whose `items`
-/// block just gained a possibly-young element. `list_object_custom_trace`
+/// block just gained a possibly-young element. RPython's GC transform
+/// emits `ll_writebarrier` (rgc.py:1196) automatically after a pointer
+/// store into a structure behind a custom tracer; pyre has no transform
+/// pass, so the barrier runs here by hand. `list_object_custom_trace`
 /// only forwards the off-GC `ItemsBlock` slots when the list is reached by
 /// a collection; an old-gen list that stored a young element is reached on
 /// a minor GC only if it sits in the remembered set, so the barrier must

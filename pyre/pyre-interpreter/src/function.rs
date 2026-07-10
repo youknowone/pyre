@@ -159,6 +159,9 @@ fn function_write_barrier(obj: PyObjectRef) {
     // A Box-immortal function's children are reached only through
     // `walk_raw_function_roots`, which clean minor collections skip;
     // record every field store (gc_roots.rs prebuilt-root tracking).
+    // RPython's GC transform inserts the old-to-young `write_barrier`
+    // (minimark.py:1065) after such post-alloc field stores; pyre has no
+    // transform pass, so callers run it by hand through this helper.
     pyre_object::gc_roots::mark_prebuilt_roots_dirty();
 }
 
