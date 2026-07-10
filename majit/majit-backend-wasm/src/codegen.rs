@@ -380,21 +380,97 @@ fn emit_write_barrier(
     sink.call(jit_call);
 }
 
-/// Reload every live Ref local from its home slot, optionally skipping one
-/// value id (`skip_raw` — the freshly-allocated result, whose home is not yet
-/// written). Emitted after a collecting allocation: the collection forwarded
-/// the home slots (registered as GC roots), so reloading the locals makes
-/// object movement transparent to the trace without precise per-safepoint
-/// liveness. Over-reloading a dead Ref is harmless (it is never read again).
+/// Per-value def / last-use op positions over the trace, used to filter the
+/// post-collection Ref reloads ([`emit_reload_refs_from_homes`]) down to
+/// values that are both already defined and still read — the wasm-shaped
+/// analog of the native regalloc reloading a spilled box on its next use
+/// (llsupport/regalloc.py `longevity`) instead of eagerly rebinding every
+/// home.
+///
+/// Positions: inputs are defined at `-1`; an op result at its op index; a
+/// LABEL's args additionally at the label's index (a loop-carried value
+/// re-enters the body there — a def index past a reload site must not hide
+/// the stale local from the reload on the next iteration). Uses are op args
+/// plus guard fail args; the loop-closing JUMP's args are op args, so
+/// loop-carried values stay live through the backedge.
+struct HomeLiveness {
+    def_pos: Vec<i32>,
+    last_use: Vec<i32>,
+}
+
+impl HomeLiveness {
+    fn collect(inputargs: &[InputArg], ops: &[Op]) -> Self {
+        let mut n = inputargs.iter().map(|ia| ia.index as usize + 1).max().unwrap_or(0);
+        for op in ops {
+            let r = op.pos.get();
+            if r != OpRef::NONE && !r.is_constant() {
+                n = n.max(r.raw() as usize + 1);
+            }
+        }
+        let mut def_pos = vec![i32::MAX; n];
+        let mut last_use = vec![-1i32; n];
+        for ia in inputargs {
+            def_pos[ia.index as usize] = -1;
+        }
+        for (i, op) in ops.iter().enumerate() {
+            let r = op.pos.get();
+            if r != OpRef::NONE && !r.is_constant() && (r.raw() as usize) < n {
+                let d = &mut def_pos[r.raw() as usize];
+                *d = (*d).min(i as i32);
+            }
+            for a in op.getarglist().iter() {
+                let a = a.to_opref();
+                if a == OpRef::NONE || a.is_constant() || (a.raw() as usize) >= n {
+                    continue;
+                }
+                last_use[a.raw() as usize] = i as i32;
+                if op.opcode == OpCode::Label {
+                    let d = &mut def_pos[a.raw() as usize];
+                    *d = (*d).min(i as i32);
+                }
+            }
+            if let Some(fa) = op.getfailargs() {
+                for a in fa.iter() {
+                    let a = a.to_opref();
+                    if a != OpRef::NONE && !a.is_constant() && (a.raw() as usize) < n {
+                        last_use[a.raw() as usize] = i as i32;
+                    }
+                }
+            }
+        }
+        Self { def_pos, last_use }
+    }
+
+    /// Value `raw` is defined before op `at` and read after it — i.e. its
+    /// local holds a value a collection at op `at` could invalidate.
+    fn live_across(&self, raw: u32, at: usize) -> bool {
+        let raw = raw as usize;
+        raw < self.def_pos.len()
+            && self.def_pos[raw] < at as i32
+            && self.last_use[raw] > at as i32
+    }
+}
+
+/// Reload the live Ref locals from their home slots after a collecting call
+/// at op index `at_op`, optionally skipping one value id (`skip_raw` — the
+/// freshly-allocated result, whose home is not yet written). The collection
+/// forwarded the home slots (registered as GC roots), so reloading the
+/// locals makes object movement transparent to the trace. Only values live
+/// across `at_op` ([`HomeLiveness::live_across`]) are reloaded: a value not
+/// yet defined has a null home and its local is written at its def, and a
+/// value never read after `at_op` has no consumer for the reload — the
+/// native regalloc likewise reloads a spilled box only on its next use.
 fn emit_reload_refs_from_homes(
     sink: &mut InstructionSink<'_>,
     ref_homes: &RefHomes,
+    liveness: &HomeLiveness,
+    at_op: usize,
     skip_raw: Option<u32>,
 ) {
     // `iter` yields id order, so the emitted module is reproducible without a
     // sort; each reload is independent (home and local storage are disjoint).
     for (raw, h) in ref_homes.iter() {
-        if Some(raw) == skip_raw {
+        if Some(raw) == skip_raw || !liveness.live_across(raw, at_op) {
             continue;
         }
         sink.local_get(0);
@@ -1080,6 +1156,9 @@ fn build_function(
     // inner loop header).
     let loop_label_idx = ops.iter().rposition(|op| op.opcode == OpCode::Label);
     let has_loop = loop_label_idx.is_some();
+
+    // Def / last-use positions for the post-collection Ref reload filter.
+    let liveness = HomeLiveness::collect(inputargs, ops);
 
     // A Label-less trace with bridge dispatch — a `PYRE_WASM_CA` recursion
     // loop, or (chaining on) a bridge whose own guards chain nested
@@ -2392,7 +2471,7 @@ fn build_function(
                 // and its home is not written until the store-on-def below, so a
                 // reload would clobber it with the home's pre-call (stale) value.
                 let skip = (!OpRef::raw_is_constant(vi)).then_some(vi);
-                emit_reload_refs_from_homes(&mut sink, ref_homes, skip);
+                emit_reload_refs_from_homes(&mut sink, ref_homes, &liveness, op_idx, skip);
             }
 
             // ── CALL operations (via trampoline) ──
@@ -2577,6 +2656,8 @@ fn build_function(
                     emit_reload_refs_from_homes(
                         &mut sink,
                         ref_homes,
+                        &liveness,
+                        op_idx,
                         (!OpRef::raw_is_constant(vi)).then_some(vi),
                     );
                     sink.else_();
@@ -2681,7 +2762,7 @@ fn build_function(
                 // nothing).
                 if residual_type_base.is_none() || inline_nursery.is_none() {
                     let skip = (!OpRef::raw_is_constant(vi)).then_some(vi);
-                    emit_reload_refs_from_homes(&mut sink, ref_homes, skip);
+                    emit_reload_refs_from_homes(&mut sink, ref_homes, &liveness, op_idx, skip);
                 }
             }
             OpCode::NewArray | OpCode::NewArrayClear => {
@@ -2752,6 +2833,8 @@ fn build_function(
                     emit_reload_refs_from_homes(
                         &mut sink,
                         ref_homes,
+                        &liveness,
+                        op_idx,
                         (!OpRef::raw_is_constant(vi)).then_some(vi),
                     );
                     sink.else_();
@@ -2854,7 +2937,7 @@ fn build_function(
                 // inline-bump path already emitted this inside its slow arm.
                 if residual_type_base.is_none() || inline_nursery_total.is_none() {
                     let skip = (!OpRef::raw_is_constant(vi)).then_some(vi);
-                    emit_reload_refs_from_homes(&mut sink, ref_homes, skip);
+                    emit_reload_refs_from_homes(&mut sink, ref_homes, &liveness, op_idx, skip);
                 }
             }
 
