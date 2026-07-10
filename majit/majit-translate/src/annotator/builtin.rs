@@ -363,6 +363,19 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     // `BigInt::from(i64)` — boxes a machine int into the foreign opaque
     // `BigInt` (Python `long`); returns the classdef-less GcRef shell.
     analyzer_for(&mut reg, "BigInt.from", bigint_from);
+    // Foreign Rust container constructors — `Vec::new` /
+    // `Vec::with_capacity` / `indexmap::IndexMap::new` / `Box::new`.
+    // Each returns the classdef-less opaque `SomeInstance` shell (twin
+    // `bigint_from`), retiring the "no analyser registered" wall the
+    // two-phase prepass hits when residualizing bodies that build these
+    // containers (`OpcodeStepExecutor.build_*`, `NamespaceOpcodeHandler.
+    // store_*`, `coerce_to_list_for_args`, `FrameBox::new_boxed`,
+    // `malloc_raw`).  Keyed by the qualnames `HOST_ENV` bootstrap assigns
+    // — note the mixed bare/dotted spellings the census demands.
+    analyzer_for(&mut reg, "Vec.new", foreign_container_ctor);
+    analyzer_for(&mut reg, "vec.Vec.with_capacity", foreign_container_ctor);
+    analyzer_for(&mut reg, "indexmap.IndexMap.new", foreign_container_ctor);
+    analyzer_for(&mut reg, "Box.new", foreign_container_ctor);
     // `rarithmetic.r_uint` is routed via
     // `ExtRegistryEntry::ForType` (rarithmetic.py:572-582 `ForTypeEntry`):
     // bookkeeper's BUILTIN_ANALYZERS miss falls through to
@@ -1398,6 +1411,36 @@ fn string_constructor(
 /// Residualizing those foreign-method calls on an opaque instance is a
 /// separate port.
 fn bigint_from(
+    _bk: &Rc<Bookkeeper>,
+    _args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    Ok(SomeValue::Instance(SomeInstance::new(
+        None,
+        false,
+        std::collections::BTreeMap::new(),
+    )))
+}
+
+/// Analyzer for foreign Rust container constructors that box their
+/// contents behind an opaque handle the JIT never rtypes: `Vec::new`,
+/// `Vec::with_capacity`, `indexmap::IndexMap::new`, and `Box::new`.
+/// Each returns a freshly-built owned container/box whose element
+/// internals stay foreign — the same wall `BigInt::from` draws around
+/// the boxed arbitrary-precision integer.  Model the result as a
+/// classdef-less `SomeInstance` (the foreign-opaque GcRef shell
+/// `annotation_state::ref_fallback_instance` gives an unregistered
+/// host-struct pointee); it projects to `ValueType::Ref(None)`
+/// (`somevalue_to_valuetype`).
+///
+/// Registering these retires the `SomeBuiltin.call(): no analyser
+/// registered for <ctor>` wall the two-phase prepass hits when it
+/// residualizes a body that builds one of these containers.  A
+/// subsequent method/accessor call on the opaque handle (`Vec::index`,
+/// `IndexMap::get`, `Box::into_raw`, …) is a separate leaf resolved on
+/// its own path (`translate_op` / `PyreCallRegistry`, not the analyser
+/// table); this analyser only types the constructor's result.
+fn foreign_container_ctor(
     _bk: &Rc<Bookkeeper>,
     _args_s: &[Option<SomeValue>],
     _kwds: &HashMap<String, Option<SomeValue>>,
