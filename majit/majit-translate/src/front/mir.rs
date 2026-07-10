@@ -1885,6 +1885,23 @@ pub fn lower_fun_decl_with_static_addrs(
 ///   removal to keep untouched graphs byte-identical.
 fn simplify_lowered_graph(graph: &mut FunctionGraph) {
     crate::model::eliminate_empty_blocks(graph);
+    // `eliminate_empty_blocks` (simplify.py:33-78) rewires each incoming
+    // link past an operation-less block and leaves the bypassed block
+    // orphaned, still carrying its exits.  Upstream every later consumer
+    // walks the graph through `iterblocks()` (flowspace/model.py:66), so
+    // the orphan and its stale links are invisible; the model-layer
+    // passes below scan `graph.blocks` directly, so the stale links stay
+    // in view — `prune_dead_phis` then trims a shared reachable target's
+    // dead inputargs without trimming the orphan's link
+    // (transform_dead_op_vars walks reachable blocks only), the
+    // arity-desynced link misaligns `remove_duplicate_inputargs`'s
+    // positional phi columns, and the legacy annotator's link fold
+    // (`follow_link`, annrpython.py binding propagation) unions the
+    // shifted kinds into live phi inputargs — surfacing as an
+    // assembler Int/Ref register-kind mismatch.  Empty the orphans
+    // eagerly so the direct-scan passes see the same surface
+    // `iterblocks()` exposes upstream.
+    crate::model::clear_unreachable_blocks(graph);
     // Lower the boxing-constructor idiom `malloc_typed(W_FloatObject{…})`
     // to a native `NewWithVtable` + payload store before the dead-aggregate
     // sweep, which then reclaims the orphaned construct-on-stack ctor and
