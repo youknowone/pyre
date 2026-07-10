@@ -8602,8 +8602,8 @@ mod pbc_repr_tests {
         let _leaf_cd = ClassDesc::getuniqueclassdef(&leaf_desc).unwrap();
 
         // Wire the ClassAttrFamily for "x" via UnionFind union.
-        let root_key = DescKey::from_rc(&root_desc);
-        let leaf_key = DescKey::from_rc(&leaf_desc);
+        let root_key = root_desc.borrow().identity;
+        let leaf_key = leaf_desc.borrow().identity;
         ann.bookkeeper.with_classpbc_attr_families("x", |uf| {
             uf.find(root_key);
             uf.union(root_key, leaf_key);

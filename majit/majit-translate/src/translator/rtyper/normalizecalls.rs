@@ -301,7 +301,7 @@ pub fn merge_classpbc_getattr_into_classdef(
             let mut out = Vec::new();
             for entry in descs_map.values() {
                 if let DescEntry::Class(rc) = entry {
-                    let key = crate::annotator::description::DescKey::from_rc(rc);
+                    let key = rc.borrow().identity;
                     if desc_keys.contains(&key) {
                         out.push(rc.clone());
                     }
@@ -1738,8 +1738,8 @@ mod tests {
 
         // Build a single ClassAttrFamily containing both descs by
         // unioning them under the "shared" attr name.
-        let root_key = DescKey::from_rc(&root_desc);
-        let leaf_key = DescKey::from_rc(&leaf_desc);
+        let root_key = root_desc.borrow().identity;
+        let leaf_key = leaf_desc.borrow().identity;
         ann.bookkeeper.with_classpbc_attr_families("shared", |uf| {
             uf.find(root_key);
             uf.union(root_key, leaf_key);
@@ -1795,7 +1795,7 @@ mod tests {
             let pyobj = only_desc.borrow().pyobj.clone();
             descs.insert(pyobj, DE::Class(only_desc.clone()));
         }
-        let only_key = DescKey::from_rc(&only_desc);
+        let only_key = only_desc.borrow().identity;
         ann.bookkeeper.with_classpbc_attr_families("alone", |uf| {
             uf.find(only_key);
             Some(())
