@@ -861,6 +861,20 @@ thread_local! {
     /// installed once (not gated by this flag); only the per-thread backend
     /// box and mutator registration remain per-thread here.
     static GC_TLS_INSTALLED: Cell<bool> = const { Cell::new(false) };
+
+    /// Initialized after shadow_stack::register_mutator has captured all four
+    /// root TLS slots. Its destructor therefore removes the registry entry
+    /// before those slots are destroyed, then removes the thread from RUNNING.
+    static GC_MUTATOR_REGISTRATION: GcMutatorRegistration = const { GcMutatorRegistration };
+}
+
+struct GcMutatorRegistration;
+
+impl Drop for GcMutatorRegistration {
+    fn drop(&mut self) {
+        majit_gc::shadow_stack::unregister_mutator();
+        majit_gc::gc_sync::unregister_thread();
+    }
 }
 
 /// Build and configure the MiniMarkGC with all type registrations,
@@ -2471,7 +2485,9 @@ pub fn reset_gc_fresh_for_test() {
 pub fn init_gc_subsystem() {
     build_gc_global();
     if !GC_TLS_INSTALLED.with(|c| c.get()) {
+        majit_gc::shadow_stack::register_mutator();
         majit_gc::gc_sync::register_thread();
+        GC_MUTATOR_REGISTRATION.with(|_| {});
         install_gc_into_backend();
         GC_TLS_INSTALLED.with(|c| c.set(true));
     }
@@ -2915,6 +2931,7 @@ impl __extend__ {
         next_instr: usize,
         _ec: *const PyExecutionContext,
     ) -> PyResult {
+        majit_gc::gc_sync::safepoint_poll();
         frame.set_last_instr_from_next_instr(next_instr);
         // interp_jit.py:79-96 dispatch: the while-True loop runs until
         // Yield or ExitFrame. ContinueRunningNormally means portal

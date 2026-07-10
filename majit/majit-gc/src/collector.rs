@@ -971,6 +971,12 @@ impl MiniMarkGC {
     /// 3. Iteratively process newly discovered references until stable.
     /// 4. Reset nursery.
     pub fn do_collect_nursery(&mut self) {
+        let _stw = if crate::gc_sync::registered_threads() > 1 {
+            Some(crate::gc_sync::quiesce_mutators())
+        } else {
+            None
+        };
+        let walk_all_mutators = crate::gc_sync::mutators_quiesced();
         if std::env::var_os("MAJIT_LOG").is_some() {
             eprintln!(
                 "[gc][minor] start count={} remembered={} cards_set={}",
@@ -999,9 +1005,14 @@ impl MiniMarkGC {
         // Phase 1b: Process shadow stack roots.
         // RPython gc.py: GcRootMap_shadowstack — walk the thread-local
         // shadow stack to find GC refs pushed by compiled JIT code.
-        crate::shadow_stack::walk_roots(|gcref| {
+        let mut visit_shadow_root = |gcref: &mut GcRef| {
             self.drag_out_root(gcref);
-        });
+        };
+        if walk_all_mutators {
+            crate::shadow_stack::walk_all_roots(&mut visit_shadow_root);
+        } else {
+            crate::shadow_stack::walk_roots(&mut visit_shadow_root);
+        }
 
         // Phase 1c: Process jitframe shadow stack roots.
         // RPython root_walker.walk_roots with jitframe entries —
@@ -1012,7 +1023,7 @@ impl MiniMarkGC {
         // after the walk finishes without reborrowing `self` inside the
         // tracer callback.
         let mut libc_jf_slots: Vec<*mut majit_ir::GcRef> = Vec::new();
-        crate::shadow_stack::walk_jf_roots(|gcref| {
+        let mut visit_jf_root = |gcref: &mut GcRef| {
             if self.is_nursery_object_start(gcref.0) {
                 self.drag_out_root(gcref);
             } else if !gcref.is_null() && self.oldgen.contains(gcref.0) {
@@ -1029,7 +1040,12 @@ impl MiniMarkGC {
                     libc_jf_slots.push(slot_ptr);
                 });
             }
-        });
+        };
+        if walk_all_mutators {
+            crate::shadow_stack::walk_all_jf_roots(&mut visit_jf_root);
+        } else {
+            crate::shadow_stack::walk_jf_roots(&mut visit_jf_root);
+        }
         for slot_ptr in libc_jf_slots {
             let field_ref = unsafe { &mut *slot_ptr };
             self.drag_out_root(field_ref);
@@ -1041,18 +1057,28 @@ impl MiniMarkGC {
         // root set. RPython traces these via the RPython object graph
         // (Box arrays); pyre stores raw i64 in Vec<i64> so we walk the
         // explicit thread-local stack of register banks.
-        crate::shadow_stack::walk_bh_regs(|gcref| {
+        let mut visit_bh_root = |gcref: &mut GcRef| {
             self.drag_out_root(gcref);
-        });
+        };
+        if walk_all_mutators {
+            crate::shadow_stack::walk_all_bh_regs(&mut visit_bh_root);
+        } else {
+            crate::shadow_stack::walk_bh_regs(&mut visit_bh_root);
+        }
 
         // blackhole resume construction roots (`resume.py:1312`): the
         // virtuals_cache + each frame's registers_r are filled by lazily
         // materializing virtuals before `run()` re-roots them via
         // `push_bh_regs`; forward any already-materialized nursery refs so a
         // later materialization's collection does not strand them.
-        crate::shadow_stack::walk_resume_ref_roots(|gcref| {
+        let mut visit_resume_root = |gcref: &mut GcRef| {
             self.drag_out_root(gcref);
-        });
+        };
+        if walk_all_mutators {
+            crate::shadow_stack::walk_all_resume_ref_roots(&mut visit_resume_root);
+        } else {
+            crate::shadow_stack::walk_resume_ref_roots(&mut visit_resume_root);
+        }
 
         // Phase 1e: framework.py `root_walker.walk_roots` parity — the
         // embedding runtime plugs a walker that visits
@@ -1726,12 +1752,18 @@ impl MiniMarkGC {
             self.seed_major_root(gcref);
         }
 
-        crate::shadow_stack::walk_roots(|gcref| {
+        let walk_all_mutators = crate::gc_sync::mutators_quiesced();
+        let mut visit_shadow_root = |gcref: &mut GcRef| {
             self.seed_major_root(*gcref);
-        });
+        };
+        if walk_all_mutators {
+            crate::shadow_stack::walk_all_roots(&mut visit_shadow_root);
+        } else {
+            crate::shadow_stack::walk_roots(&mut visit_shadow_root);
+        }
 
         let mut libc_jf_refs: Vec<GcRef> = Vec::new();
-        crate::shadow_stack::walk_jf_roots(|gcref| {
+        let mut visit_jf_root = |gcref: &mut GcRef| {
             if !gcref.is_null() && crate::shadow_stack::is_libc_jitframe(gcref.0) {
                 crate::shadow_stack::trace_libc_jitframe(gcref.0, &mut |slot_ptr| {
                     let field_ref = unsafe { *slot_ptr };
@@ -1742,21 +1774,36 @@ impl MiniMarkGC {
             } else {
                 self.seed_major_root(*gcref);
             }
-        });
+        };
+        if walk_all_mutators {
+            crate::shadow_stack::walk_all_jf_roots(&mut visit_jf_root);
+        } else {
+            crate::shadow_stack::walk_jf_roots(&mut visit_jf_root);
+        }
         for gcref in libc_jf_refs {
             self.seed_major_root(gcref);
         }
 
-        crate::shadow_stack::walk_bh_regs(|gcref| {
+        let mut visit_bh_root = |gcref: &mut GcRef| {
             self.seed_major_root(*gcref);
-        });
+        };
+        if walk_all_mutators {
+            crate::shadow_stack::walk_all_bh_regs(&mut visit_bh_root);
+        } else {
+            crate::shadow_stack::walk_bh_regs(&mut visit_bh_root);
+        }
 
         // blackhole resume construction roots (`resume.py:1312`): see the
         // minor-collection path for why the in-flight virtuals_cache /
         // registers_r slices must be seeded as roots.
-        crate::shadow_stack::walk_resume_ref_roots(|gcref| {
+        let mut visit_resume_root = |gcref: &mut GcRef| {
             self.seed_major_root(*gcref);
-        });
+        };
+        if walk_all_mutators {
+            crate::shadow_stack::walk_all_resume_ref_roots(&mut visit_resume_root);
+        } else {
+            crate::shadow_stack::walk_resume_ref_roots(&mut visit_resume_root);
+        }
 
         crate::walk_active_extra_roots(&mut |gcref| {
             self.seed_major_root(*gcref);
@@ -2289,6 +2336,11 @@ impl MiniMarkGC {
     /// 2. Mark phase: trace all roots and transitively mark reachable objects.
     /// 3. Sweep phase: free all unmarked old-gen objects.
     pub fn do_collect_full(&mut self) {
+        let _stw = if crate::gc_sync::registered_threads() > 1 {
+            Some(crate::gc_sync::quiesce_mutators())
+        } else {
+            None
+        };
         // Minor collection first to empty the nursery.
         // Note: do_collect_nursery may itself start/advance an incremental
         // cycle, but we need a complete mark-sweep here regardless.

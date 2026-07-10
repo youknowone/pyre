@@ -18,6 +18,7 @@
 /// load/store instructions (no function calls), exactly as in
 /// assembler.py:1122-1136.
 use std::cell::{Cell, RefCell};
+use std::sync::{Mutex, OnceLock, RwLock};
 
 use majit_ir::GcRef;
 
@@ -139,30 +140,27 @@ pub fn register_libc_jitframe_tracer(tracer: LibcJitframeTracer) {
 // visitor can safely dispatch to the registered tracer. Without this
 // set the visitor cannot tell a libc-alloc'd jitframe from an
 // unrelated foreign pointer that happens to sit on the shadow stack.
-thread_local! {
-    static LIBC_JF_REGISTRY: RefCell<indexmap::IndexSet<usize>> =
-        RefCell::new(indexmap::IndexSet::new());
+static LIBC_JF_REGISTRY: OnceLock<RwLock<indexmap::IndexSet<usize>>> = OnceLock::new();
+
+fn libc_jf_registry() -> &'static RwLock<indexmap::IndexSet<usize>> {
+    LIBC_JF_REGISTRY.get_or_init(|| RwLock::new(indexmap::IndexSet::new()))
 }
 
 /// Register a libc-allocated jitframe payload address. Must be called
 /// before pushing the jitframe onto the JF shadow stack.
 pub fn register_libc_jitframe(addr: usize) {
-    LIBC_JF_REGISTRY.with(|r| {
-        r.borrow_mut().insert(addr);
-    });
+    libc_jf_registry().write().unwrap().insert(addr);
 }
 
 /// Unregister a libc-allocated jitframe address. Call once the
 /// jitframe memory is about to be freed.
 pub fn unregister_libc_jitframe(addr: usize) {
-    LIBC_JF_REGISTRY.with(|r| {
-        r.borrow_mut().swap_remove(&addr);
-    });
+    libc_jf_registry().write().unwrap().swap_remove(&addr);
 }
 
 /// Check whether an address was registered as a libc-allocated jitframe.
 pub fn is_libc_jitframe(addr: usize) -> bool {
-    LIBC_JF_REGISTRY.with(|r| r.borrow().contains(&addr))
+    libc_jf_registry().read().unwrap().contains(&addr)
 }
 
 /// Invoke the registered tracer if any. Returns true if tracer ran.
@@ -221,6 +219,64 @@ thread_local! {
     /// construction window and popped when it ends.
     static RESUME_REF_ROOTS_STACK: RefCell<Vec<(*mut i64, usize)>> =
         RefCell::new(Vec::with_capacity(16));
+}
+
+/// Root structures owned by one registered mutator thread.
+///
+/// The pointers remain valid until `unregister_mutator` runs on the owning
+/// thread. Foreign access is only permitted while gc_sync has quiesced every
+/// registered mutator, so none of the underlying TLS structures can move or
+/// be mutably accessed by its owner during a walk.
+struct MutatorEntry {
+    thread_id: std::thread::ThreadId,
+    shadow_stack: *const RefCell<ShadowStack>,
+    jf_root_stack: *const RefCell<JitFrameShadowStack>,
+    bh_regs_stack: *const RefCell<Vec<BhRegsEntry>>,
+    resume_ref_roots_stack: *const RefCell<Vec<(*mut i64, usize)>>,
+}
+
+// The raw pointers refer to TLS owned by `thread_id`. The registry only moves
+// pointer values between threads; dereferencing them requires the STW
+// quiescence established by gc_sync.
+unsafe impl Send for MutatorEntry {}
+
+static MUTATOR_REGISTRY: Mutex<Vec<MutatorEntry>> = Mutex::new(Vec::new());
+
+/// Register the current thread's four TLS root structures for STW root walks.
+pub fn register_mutator() {
+    let thread_id = std::thread::current().id();
+    let shadow_stack = SHADOW_STACK.with(|stack| stack as *const _);
+    let jf_root_stack = JF_ROOT_STACK.with(|stack| stack as *const _);
+    let bh_regs_stack = BH_REGS_STACK.with(|stack| stack as *const _);
+    let resume_ref_roots_stack = RESUME_REF_ROOTS_STACK.with(|stack| stack as *const _);
+
+    let mut registry = MUTATOR_REGISTRY.lock().unwrap();
+    assert!(
+        !registry.iter().any(|entry| entry.thread_id == thread_id),
+        "mutator thread registered twice"
+    );
+    registry.push(MutatorEntry {
+        thread_id,
+        shadow_stack,
+        jf_root_stack,
+        bh_regs_stack,
+        resume_ref_roots_stack,
+    });
+}
+
+/// Remove the current thread from the all-thread root registry.
+///
+/// Call this before gc_sync::unregister_thread so RUNNING cannot reach zero
+/// while an entry whose TLS is being destroyed remains visible to the
+/// collector.
+pub fn unregister_mutator() {
+    let thread_id = std::thread::current().id();
+    let mut registry = MUTATOR_REGISTRY.lock().unwrap();
+    let index = registry
+        .iter()
+        .position(|entry| entry.thread_id == thread_id)
+        .expect("unregistering an unregistered mutator thread");
+    registry.swap_remove(index);
 }
 
 /// The shadow stack itself.
@@ -297,6 +353,26 @@ pub fn walk_roots(mut visitor: impl FnMut(&mut GcRef)) {
             }
         }
     });
+}
+
+/// Walk every registered mutator's GcRef shadow stack during STW.
+///
+/// This deliberately bypasses `RefCell::borrow_mut`: a RefCell borrow is a
+/// same-thread runtime check and must not be used as the synchronization
+/// mechanism for foreign TLS. gc_sync's quiescence is what makes the raw
+/// dereferences and in-place forwarding sound.
+pub fn walk_all_roots(mut visitor: impl FnMut(&mut GcRef)) {
+    let registry = MUTATOR_REGISTRY.lock().unwrap();
+    for mutator in registry.iter() {
+        // SAFETY: every registered mutator is quiesced, and registry removal
+        // precedes the owner's RUNNING decrement and TLS destruction.
+        let ss = unsafe { &mut *(*mutator.shadow_stack).as_ptr() };
+        for entry in ss.entries.iter_mut() {
+            if !entry.is_null() {
+                visitor(entry);
+            }
+        }
+    }
 }
 
 /// Current depth of the GcRef shadow stack.
@@ -474,6 +550,29 @@ pub fn walk_jf_roots(mut visitor: impl FnMut(&mut GcRef)) {
     });
 }
 
+/// Walk every registered mutator's jitframe shadow stack during STW.
+pub fn walk_all_jf_roots(mut visitor: impl FnMut(&mut GcRef)) {
+    let registry = MUTATOR_REGISTRY.lock().unwrap();
+    for mutator in registry.iter() {
+        // SAFETY: the owning mutator is quiesced and cannot change the stack
+        // or its backing allocation until the STW guard resumes it.
+        let stack = unsafe { &mut *(*mutator.jf_root_stack).as_ptr() };
+        stack.ensure_init();
+        unsafe {
+            let base = stack.base as *mut usize;
+            let top = stack.top.get() as *mut usize;
+            let mut ptr = base;
+            while ptr < top {
+                let jf_ref = &mut *(ptr.add(1) as *mut GcRef);
+                if !jf_ref.is_null() {
+                    visitor(jf_ref);
+                }
+                ptr = ptr.add(2);
+            }
+        }
+    }
+}
+
 /// Read the jf_ptr of the top shadow stack entry.
 ///
 /// assembler.py:1369-1377 _reload_frame_if_necessary:
@@ -610,6 +709,25 @@ pub fn walk_bh_regs(mut visitor: impl FnMut(&mut GcRef)) {
     });
 }
 
+/// Walk every registered mutator's blackhole register roots during STW.
+pub fn walk_all_bh_regs(mut visitor: impl FnMut(&mut GcRef)) {
+    let registry = MUTATOR_REGISTRY.lock().unwrap();
+    for mutator in registry.iter() {
+        // SAFETY: all owners are quiesced, and each registered slice remains
+        // pinned until its owning blackhole frame pops the entry after resume.
+        let entries = unsafe { &*(*mutator.bh_regs_stack).as_ptr() };
+        for entry in entries.iter() {
+            let slots = unsafe { std::slice::from_raw_parts_mut(entry.regs_ptr, entry.regs_len) };
+            for slot in slots.iter_mut() {
+                let gcref = unsafe { &mut *(slot as *mut i64 as *mut GcRef) };
+                visitor(gcref);
+            }
+            let tmp = unsafe { &mut *(entry.tmpreg_ptr as *mut GcRef) };
+            visitor(tmp);
+        }
+    }
+}
+
 /// Current depth of the blackhole register bank stack.
 pub fn bh_regs_depth() -> usize {
     BH_REGS_STACK.with(|ss| ss.borrow().len())
@@ -657,6 +775,23 @@ pub fn walk_resume_ref_roots(mut visitor: impl FnMut(&mut GcRef)) {
             }
         }
     });
+}
+
+/// Walk every registered mutator's resume-construction roots during STW.
+pub fn walk_all_resume_ref_roots(mut visitor: impl FnMut(&mut GcRef)) {
+    let registry = MUTATOR_REGISTRY.lock().unwrap();
+    for mutator in registry.iter() {
+        // SAFETY: the owner is quiesced and the registered slices stay pinned
+        // for the complete resume-construction window.
+        let entries = unsafe { &*(*mutator.resume_ref_roots_stack).as_ptr() };
+        for &(ptr, len) in entries.iter() {
+            let slots = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
+            for slot in slots.iter_mut() {
+                let gcref = unsafe { &mut *(slot as *mut i64 as *mut GcRef) };
+                visitor(gcref);
+            }
+        }
+    }
 }
 
 // ── Extra root walkers registered by the embedder ───────────────
