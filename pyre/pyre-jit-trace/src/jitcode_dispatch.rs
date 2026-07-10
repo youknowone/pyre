@@ -4072,7 +4072,13 @@ fn getfield_vable_via_metainterp(
             write_int_reg(ctx, op.pc, dst, result, concrete_for_shadow)?;
         }
         'r' => {
+            // Scalar vable fields are frame bookkeeping, never Python
+            // operand-stack values, so they must not become the mirror's TOS
+            // candidate. `get_list_of_active_boxes` (pyjitpl.py:177-234)
+            // never names scalar fields as per-PC stack slots.
+            let vstack_last_ref = ctx.vstack_last_ref;
             write_ref_reg(ctx, op.pc, dst, result, concrete_for_shadow)?;
+            ctx.vstack_last_ref = vstack_last_ref;
         }
         'f' => {
             let len = ctx.registers_f.len();

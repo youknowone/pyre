@@ -2524,7 +2524,16 @@ pub fn trace_and_compile_from_bridge(
     // though the bridge compiled. The walk took the non-flush path, so it
     // committed no side effects; the blackhole re-running the resumed region
     // applies them exactly once.
-    let resume_via_blackhole = !adopted_walk_end_state && is_multiframe_resume;
+    // The non-flush path applies to single-frame guards too: without the
+    // committed walk-end state the live frame's last_instr / operand stack
+    // were never advanced through the guard's resume region (only the
+    // blackhole syncs them), so "continue running normally" resumes at the
+    // enclosing loop header and silently skips the region between the guard
+    // and the header — the deopt iteration's remaining inner-loop work.
+    // Complete this iteration through the blackhole exactly like the
+    // multi-frame case above; the compiled bridge stays attached for
+    // subsequent failures.
+    let resume_via_blackhole = !adopted_walk_end_state;
 
     // merge_point handles Finish/CloseLoop via bridge_info.
     if outcome.is_some() {
