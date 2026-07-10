@@ -805,6 +805,16 @@ pub struct OptContext {
     /// collision that makes the final `new_operations` state ambiguous
     /// about which type-tagged value won a shared raw slot.
     pub(crate) live_synthetics: Vec<majit_ir::resoperation::OpRc>,
+    /// `pos -> index into live_synthetics`, kept in lockstep with the vector so
+    /// the three supersession sites (`install_canonical_producer`, `emit`'s
+    /// reuse path, `bind_input_resops`) resolve a position's live stand-in in
+    /// O(1) instead of an `iter().position()` scan. At most one live entry
+    /// exists per position (the emit invariant asserted throughout this file),
+    /// so the map is unambiguous. Maintained via `live_synthetics_push` /
+    /// `live_synthetics_swap_remove_pos`; without it the scan is O(n^2) over a
+    /// vector that grows to the whole trace length (~44k on aheui's logo loop),
+    /// the same producer-resolution cost `phase1_emit_ops_index` removes.
+    pub(crate) live_synthetics_index: std::collections::HashMap<OpRef, usize>,
     /// Phase 1 emit ops carried into Phase 2's lookup surface.
     ///
     /// In RPython, a Box referenced cross-phase keeps its `.type` attribute
@@ -1682,6 +1692,7 @@ impl OptContext {
             inputarg_refs: Vec::new(),
             resop_refs: indexmap::IndexMap::new(),
             live_synthetics: Vec::new(),
+            live_synthetics_index: std::collections::HashMap::new(),
             phase1_emit_ops: Vec::new(),
             phase1_emit_ops_index: std::collections::HashMap::new(),
             input_ops: Vec::new(),
@@ -1901,6 +1912,31 @@ impl OptContext {
         }
     }
 
+    /// Append `op` to `live_synthetics`, keeping `live_synthetics_index`
+    /// (pos -> vector index) in lockstep. At most one live entry per position
+    /// (emit invariant), so a plain insert replaces any stale mapping.
+    pub(crate) fn live_synthetics_push(&mut self, op: majit_ir::OpRc) {
+        let pos = op.pos.get();
+        let idx = self.live_synthetics.len();
+        self.live_synthetics.push(op);
+        self.live_synthetics_index.insert(pos, idx);
+    }
+
+    /// Remove the live entry at position `pos` (if any) via `swap_remove`,
+    /// keeping `live_synthetics_index` in lockstep. Returns the removed `OpRc`.
+    /// `swap_remove` moves the last element into the freed slot, so that
+    /// element's index mapping is repointed here.
+    pub(crate) fn live_synthetics_swap_remove_pos(&mut self, pos: OpRef) -> Option<majit_ir::OpRc> {
+        let i = self.live_synthetics_index.remove(&pos)?;
+        let removed = self.live_synthetics.swap_remove(i);
+        if i < self.live_synthetics.len() {
+            // The element formerly at the tail now lives at `i`.
+            let moved_pos = self.live_synthetics[i].pos.get();
+            self.live_synthetics_index.insert(moved_pos, i);
+        }
+        Some(removed)
+    }
+
     /// Mint a `SameAsI/F/R` (or `Jump` for `Void`) synthetic
     /// stand-in `OpRc` for `opref` with the correct result type and
     /// stash it in `resop_refs[opref]` so `emit()`'s
@@ -1924,7 +1960,7 @@ impl OptContext {
         let synthetic = std::rc::Rc::new(Op::new(opcode, &[]));
         synthetic.pos.set(opref);
         self.resop_refs.insert(opref, synthetic.clone());
-        self.live_synthetics.push(synthetic.clone());
+        self.live_synthetics_push(synthetic.clone());
         synthetic
     }
 
@@ -1982,8 +2018,7 @@ impl OptContext {
         // (mod.rs::emit invariant), so a single removal is sufficient. The
         // `ptr_eq` guard skips the self-clone — and its `RefCell` double-borrow
         // — when `op` is already the registered stand-in.
-        if let Some(i) = self.live_synthetics.iter().position(|s| s.pos.get() == pos) {
-            let superseded = self.live_synthetics.swap_remove(i);
+        if let Some(superseded) = self.live_synthetics_swap_remove_pos(pos) {
             if !std::rc::Rc::ptr_eq(&superseded, op) {
                 let carried = superseded.forwarded.borrow().clone();
                 *op.forwarded.borrow_mut() = carried;
@@ -2004,7 +2039,7 @@ impl OptContext {
             }
         }
         self.resop_refs.insert(pos, op.clone());
-        self.live_synthetics.push(op.clone());
+        self.live_synthetics_push(op.clone());
     }
 
     /// Read `_forwarded` for `opref` directly off the canonical
@@ -2166,7 +2201,7 @@ impl OptContext {
             // (no second private copy).
             let op_rc = op.clone();
             self.resop_refs.insert(pos, op_rc.clone());
-            self.live_synthetics.push(op_rc);
+            self.live_synthetics_push(op_rc);
         }
     }
 
@@ -2241,6 +2276,7 @@ impl OptContext {
             inputarg_refs: Vec::new(),
             resop_refs: indexmap::IndexMap::new(),
             live_synthetics: Vec::new(),
+            live_synthetics_index: std::collections::HashMap::new(),
             phase1_emit_ops: Vec::new(),
             phase1_emit_ops_index: std::collections::HashMap::new(),
             input_ops: Vec::new(),
@@ -2805,10 +2841,22 @@ impl OptContext {
         // a non-matching stand-in; on any mismatch we fall through to the clone
         // path below, which is always correct.
         if reuse && !op.opcode.is_guard() {
-            if let Some(i) = self.live_synthetics.iter().position(|s| {
-                s.pos.get() == op_pos && s.opcode == op.opcode && s.num_args() == op.num_args()
-            }) {
-                let reused = self.live_synthetics.swap_remove(i);
+            // At most one live entry per position (emit invariant), so the
+            // O(1) index resolves the reuse candidate; the opcode/num_args
+            // predicate then guards against reusing a non-matching stand-in
+            // (fall through to the clone path on mismatch).
+            let reuse_match = self
+                .live_synthetics_index
+                .get(&op_pos)
+                .copied()
+                .is_some_and(|i| {
+                    let s = &self.live_synthetics[i];
+                    s.opcode == op.opcode && s.num_args() == op.num_args()
+                });
+            if reuse_match {
+                let reused = self
+                    .live_synthetics_swap_remove_pos(op_pos)
+                    .expect("index pointed at a live entry");
                 for k in 0..op.num_args() {
                     reused.setarg(k, op.arg(k));
                 }
@@ -2842,12 +2890,7 @@ impl OptContext {
         // unambiguous. This is the sole carry-over path: the synthetic is the
         // `_forwarded` host every `find_producer_op` reaches before this emit
         // supersedes it.
-        if let Some(i) = self
-            .live_synthetics
-            .iter()
-            .position(|s| s.pos.get() == op_pos)
-        {
-            let synth = self.live_synthetics.swap_remove(i);
+        if let Some(synth) = self.live_synthetics_swap_remove_pos(op_pos) {
             *op_rc.forwarded.borrow_mut() = synth.forwarded.borrow().clone();
             // replace_op_with parity (optimizer.py): forward the superseded
             // stand-in to the emitted producer. A consumer dispatched BEFORE
