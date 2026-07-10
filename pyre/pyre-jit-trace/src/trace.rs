@@ -1961,19 +1961,22 @@ fn loop_body_has_abort_permanent(w_code: *const ()) -> bool {
 /// executes anything, avoids the double-apply: the location re-interprets
 /// without JIT (correct, at interpreter speed).
 ///
-/// This is an OVER-DECLINING stopgap, and static: it can decline on a
-/// function merely referenced by the loop (present in `co_names`/locals),
-/// not just one the executed path actually calls.  A hot loop that calls any
-/// helper whose body contains an unported op (`match`, `async`,
-/// chained-compare `SWAP`, …) — even on a rarely taken path — now runs
-/// interpreted in full, not just the aborting call.  The orthodox mechanism
-/// has no up-front scan at all: an unsupported op raises `SwitchToBlackhole`
-/// mid-trace and `run_blackhole_interp_to_cancel_tracing`
-/// (pyjitpl.py:2949) converts the live framestack and continues FORWARD in
-/// the blackhole interpreter, so nothing replays and nothing double-applies.
-/// This decline holds until that forward-resume convergence (#126/#215) lets
-/// an inlined-callee abort resume the outer walk in place instead of rolling
-/// back to loop entry.
+/// This is an OVER-DECLINING stopgap, and static: it mirrors the inline path's
+/// static eligibility gates, but can still decline on a function merely
+/// referenced by the loop (present in `co_names`/locals), not just one the
+/// executed path actually calls.  Call-site-dependent gates such as the
+/// passed-argument count and recursion depth cannot be resolved by this scan,
+/// so a callee that would fail one of those gates can also over-decline.  A hot
+/// loop that calls an otherwise inline-eligible helper whose body contains an
+/// unported op (`match`, `async`, chained-compare `SWAP`, …) — even on a rarely
+/// taken path — now runs interpreted in full, not just the aborting call.  The
+/// orthodox mechanism has no up-front scan at all: an unsupported op raises
+/// `SwitchToBlackhole` mid-trace and
+/// `run_blackhole_interp_to_cancel_tracing` (pyjitpl.py:2949) converts the live
+/// framestack and continues FORWARD in the blackhole interpreter, so nothing
+/// replays and nothing double-applies.  This decline holds until that
+/// forward-resume convergence (#126/#215) lets an inlined-callee abort resume
+/// the outer walk in place instead of rolling back to loop entry.
 ///
 /// The scan resolves candidate callees CONCRETELY from the live frame (the
 /// walk has not run yet, so no store has executed).  Two seed sources:
@@ -1982,9 +1985,11 @@ fn loop_body_has_abort_permanent(w_code: *const ()) -> bool {
 /// - the ROOT frame's fastlocals + closure cells — a helper passed as an
 ///   argument/local (`h([i, i])`) or held in a closure cell resolves here.
 ///
-/// Each plain-function value's per-fn jitcode body is scanned end-to-end for
-/// `abort_permanent` (the marker can sit at any pc, ahead of the callee's own
-/// merge point).  Non-aborting callees are enqueued and their own referenced
+/// Each plain-function value first passes the inline path's static closure,
+/// positional-parameter, jitcode-body, and Ref-register-capacity gates.  Its
+/// per-fn jitcode body is then scanned end-to-end for `abort_permanent` (the
+/// marker can sit at any pc, ahead of the callee's own merge point).
+/// Non-aborting eligible callees are enqueued and their own referenced
 /// functions scanned transitively through THEIR globals, guarded by a
 /// scan-local visited set.  The root `w_code` is pre-marked visited — its own
 /// loop-body marker is already handled by [`loop_body_has_abort_permanent`].
@@ -2036,7 +2041,7 @@ fn loop_inlines_abort_permanent_callee(w_code: *const (), cf_addr: usize) -> boo
             return false;
         }
         let callee_w_code = pyre_interpreter::function_get_code(cand);
-        if callee_w_code.is_null() || !visited.insert(callee_w_code) {
+        if callee_w_code.is_null() {
             return false;
         }
         // A FUNCTION_TYPE object can wrap a BuiltinCode, not a CodeObject:
@@ -2048,11 +2053,23 @@ fn loop_inlines_abort_permanent_callee(w_code: *const (), cf_addr: usize) -> boo
         if pyre_interpreter::is_builtin_code(callee_w_code as pyre_object::PyObjectRef) {
             return false;
         }
-        if let Some(body) = crate::state::sub_jitcode_body_for_code(callee_w_code) {
-            for op in crate::jitcode_runtime::decoded_ops(body.code) {
-                if op.opname == "abort_permanent" {
-                    return true;
-                }
+        let Some((callee_w_code, nparams, has_closure)) =
+            crate::jitcode_dispatch::resolve_inlinable_callee(cand)
+        else {
+            return false;
+        };
+        if has_closure || nparams == 0 {
+            return false;
+        }
+        let Some(body) = crate::state::sub_jitcode_body_for_code(callee_w_code) else {
+            return false;
+        };
+        if nparams > body.num_regs_r || !visited.insert(callee_w_code) {
+            return false;
+        }
+        for op in crate::jitcode_runtime::decoded_ops(body.code) {
+            if op.opname == "abort_permanent" {
+                return true;
             }
         }
         // Transitive: resolve this callee's own referenced functions in its own

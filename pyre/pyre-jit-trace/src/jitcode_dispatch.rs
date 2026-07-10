@@ -12332,7 +12332,7 @@ fn diagnose_inline_recognition(arg_concretes: &[ConcreteValue], op_pc: usize) {
 ///
 /// # Safety
 /// `callable` must be a non-null pointer obtained from a `ConcreteValue::Ref`.
-unsafe fn resolve_inlinable_callee(
+pub(crate) unsafe fn resolve_inlinable_callee(
     callable: pyre_object::PyObjectRef,
 ) -> Option<(*const (), usize, bool)> {
     unsafe {
