@@ -1285,12 +1285,19 @@ fn int_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if int_typeobj.map_or(false, |t| std::ptr::eq(cls, t)) {
         return Ok(value);
     }
-    // cls is a subclass of int. Create a unique W_IntObject (bypassing
-    // the small-int cache so each instance has its own identity).
-    // Set w_class = cls so type()/isinstance() see the subclass while
-    // preserving W_IntObject layout for arithmetic.
-    let int_val = unsafe { pyre_object::w_int_get_value(value) };
-    let obj = pyre_object::w_int_new_unique(int_val);
+    // cls is a subclass of int. Create a unique instance (bypassing the
+    // small-int cache so each has its own identity). Set w_class = cls so
+    // type()/isinstance() see the subclass while preserving the underlying
+    // int/long storage layout for arithmetic. A magnitude that overflows
+    // i64 is a W_LongObject; cloning its BigInt keeps the value intact
+    // (w_int_get_value would truncate it to a garbage machine word).
+    let obj = if unsafe { pyre_object::is_long(value) } {
+        let big = unsafe { pyre_object::w_long_get_value(value) }.clone();
+        pyre_object::w_long_new(big)
+    } else {
+        let int_val = unsafe { pyre_object::w_int_get_value(value) };
+        pyre_object::w_int_new_unique(int_val)
+    };
     unsafe {
         (*obj).w_class = cls;
     }
