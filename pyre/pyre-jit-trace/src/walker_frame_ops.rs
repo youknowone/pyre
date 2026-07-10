@@ -193,6 +193,28 @@ pub trait WalkerFrameOps {
         );
         self.implement_guard_value(strategy, expected);
     }
+
+    /// `baseobjspace` subclass-override guard — a builtin SUBCLASS instance
+    /// shares the payload `ob_type` (so it passes `guard_class`) but retags
+    /// `w_class` and may override the dunder; guard the exact canonical
+    /// `w_class` so such an instance side-exits to the generic residual
+    /// (which honours the override) rather than a direct backing-storage
+    /// access.  Skipped when `obj` is a freshly-allocated unescaped virtual
+    /// (cannot be an external subclass instance) or the expected typeobj is
+    /// null.  Walker-native counterpart: `walker_guard_exact_w_class`.
+    fn guard_exact_w_class(&mut self, obj: OpRef, expected_typeobj: pyre_object::PyObjectRef) {
+        if expected_typeobj.is_null() || self.ctx().heap_cache().is_unescaped(obj) {
+            return;
+        }
+        let actual = crate::state::opimpl_getfield_gc_r(
+            self.ctx_mut(),
+            obj,
+            crate::descr::w_class_descr(),
+        );
+        let expected = self.ctx_mut().const_ref(expected_typeobj as i64);
+        let eq = self.ctx_mut().record_op(OpCode::PtrEq, &[actual, expected]);
+        self.generate_guard(OpCode::GuardTrue, &[eq]);
+    }
 }
 
 // `MIFrame` impl — delegates `generate_guard` to the existing

@@ -686,6 +686,10 @@ pub fn generated_list_setitem_by_strategy<F: pyre_jit_trace::walker_frame_ops::W
         obj,
         &pyre_object::pyobject::LIST_TYPE as *const _ as *const pyre_object::PyType,
     );
+    frame.guard_exact_w_class(
+        obj,
+        pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::LIST_TYPE),
+    );
     frame.guard_list_strategy(obj, strategy_id);
     let len_descr = match strategy_id {
         0 => crate::descr::list_length_descr(),
@@ -1794,6 +1798,12 @@ pub fn generated_dynamic_list_index(
 ///
 /// Combined with guard_class + guard_strategy + opimpl_check_resizable_neg_index
 /// as emitted by jtransform do_resizable_list_getitem.
+///
+/// The runtime exact-`w_class` subclass guard for the LIVE getitem path is
+/// enforced by walker-native `try_walker_specialize_subscr`
+/// (jitcode_dispatch.rs, guard at the `walker_guard_exact_w_class` call);
+/// this typed-trace helper is reached only by the retired executor-trait
+/// path (trace_opcode.rs), so it carries no separate exact-w_class guard.
 ///
 /// strategy_id: 0 = object, 1 = int, 2 = float.
 #[inline]
