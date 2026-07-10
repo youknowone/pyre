@@ -653,12 +653,12 @@ pub extern "C" fn wasm_jit_ca_pop_frame(_frame_base: i64) -> i64 {
 }
 
 /// Build the per-frame `jf_gcmap` for a CA callee frame: mark the CA input slots
-/// (`v64` + `ec`, at `FRAME_SLOT_BASE`) AND the home slots (live SSA Refs), in
-/// the `JitFrame`'s Signed-granular item indexing (see [`build_home_gcmap`] for
-/// the wasm32 layout). Unlike the host-entry frame F0 (homes only), a callee
-/// frame keeps its virtualizable `v64` in an input slot (never homed by the
-/// loop), so the input slots are roots too. Returned buffer is leaked by the
-/// caller (one per bridge) and lives for the program's life.
+/// (`v64` + `ec`, at `FRAME_SLOT_BASE`) AND the surviving home slots (Refs live
+/// across collecting calls), in the `JitFrame`'s Signed-granular item indexing
+/// (see [`build_home_gcmap`] for the wasm32 layout). Unlike the host-entry frame
+/// F0 (homes only), a callee frame keeps its virtualizable `v64` in an input slot
+/// (never homed by the loop), so the input slots are roots too. Returned buffer
+/// is leaked by the caller (one per bridge) and lives for the program's life.
 fn build_callee_gcmap(input_count: usize, home_count: usize) -> Box<[usize]> {
     let sign = std::mem::size_of::<isize>();
     let bits_per_word = std::mem::size_of::<usize>() * 8;
@@ -774,8 +774,8 @@ fn wasm_jitframe_tid() -> u32 {
     WASM_JITFRAME_TID.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Build a `jf_gcmap` bitmap marking the Ref-home region as the frame's traced
-/// GC roots, in the `JitFrame`'s Signed-granular item indexing.
+/// Build a `jf_gcmap` bitmap marking the surviving Ref-home region as the
+/// frame's traced GC roots, in the `JitFrame`'s Signed-granular item indexing.
 ///
 /// On wasm32 `isize` is 4 bytes, so `jf_frame` items are 4-byte Signed slots and
 /// each 8-byte data slot spans two items — the orthodox PyPy 32-bit layout where
@@ -1872,18 +1872,20 @@ impl majit_backend::Backend for WasmBackend {
         // Self-recursive CALL_ASSEMBLER (PYRE_WASM_CA): the CA arm bump-allocates
         // a fresh callee frame per recursive `call_indirect` into the source
         // loop. Size it for the source loop's frame layout (base_slots + the
-        // dispatch-key slot + ref-home region, mirroring `execute_token`);
+        // dispatch-key slot + surviving ref-home region, mirroring
+        // `execute_token`);
         // `build_wasm_module` widens it to also fit THIS bridge, which reuses the
         // same frame when the loop's guard-exit chains back into it.
-        // This bridge materializes the recursive callee frame and homes it (plus
-        // its other live Refs) in the SAME arena frame the source loop runs on,
-        // store-on-def'ing at its OWN home indices. A self-recursive fib bridge
-        // reserves more homes than the source loop, so the arena frame and the GC
-        // walker must cover the WIDER of the two: otherwise the callee `v64`'s
-        // home (index >= `source_num_ref_homes`) lands past the frame's walked
-        // region and a minor collection mid-recursion reclaims it, leaving a later
-        // deopt to read zeroed nursery memory. `count_ref_homes` matches the
-        // `num_ref_homes` `build_wasm_module` returns below.
+        // This bridge materializes the recursive callee frame and homes any
+        // bridge Refs live across collecting calls in the SAME arena frame the
+        // source loop runs on, store-on-def'ing at its OWN dense home indices. A
+        // self-recursive fib bridge may reserve more surviving homes than the
+        // source loop, so the arena frame and the GC walker must cover the WIDER
+        // of the two: otherwise a bridge home (index >= `source_num_ref_homes`)
+        // lands past the frame's walked region and a minor collection
+        // mid-recursion reclaims it, leaving a later deopt to read zeroed nursery
+        // memory. `count_ref_homes` matches the CA-enabled `num_ref_homes`
+        // `build_wasm_module` returns below.
         //
         // The recursion can also chain into NESTED bridges (and sibling loops via
         // loop-closing tail calls) while running ON a CA callee frame — and those
@@ -2286,7 +2288,8 @@ impl majit_backend::Backend for WasmBackend {
         // Allocate frame area large enough for slots + call trampoline area +
         // the Ref-home region. MIN_FRAME_BYTES accommodates the call area at
         // offset 2000+; the Ref-home region (`codegen::HOME_SLOT_BASE`) follows
-        // it, one slot per Ref-typed value (`num_ref_homes`).
+        // it, one slot per Ref value live across a collecting call
+        // (`num_ref_homes`).
         let min_slots = codegen::MIN_FRAME_BYTES / 8;
         let base_slots = min_slots.max(1 + compiled.max_output_slots.max(compiled.num_inputs));
         // +1 for the resume-at-LABEL dispatch-key slot (codegen::DISPATCH_KEY_OFS
@@ -2295,9 +2298,9 @@ impl majit_backend::Backend for WasmBackend {
         // `vec![0i64]` zeroes it, so a fresh host entry reads key 0 (preamble).
         //
         // A self-recursive CALL_ASSEMBLER bridge runs its outermost call in this
-        // frame and may home more Refs than the loop, so size for the LARGER of
-        // the two (`ca_bridge_ref_homes`); the extra slots are zeroed and
-        // GC-rooted below exactly like the loop's own homes.
+        // frame and may home more collection-live Refs than the loop, so size
+        // for the LARGER of the two (`ca_bridge_ref_homes`); the extra slots are
+        // zeroed and GC-rooted below exactly like the loop's own homes.
         // A cross-trace tail call can land in a loop or bridge homing more Refs
         // than this one, so also size at least `FRAME_REF_HOME_FLOOR` — the bound
         // `compile_bridge`'s frame-fit accept checks rely on.
@@ -2345,9 +2348,9 @@ impl majit_backend::Backend for WasmBackend {
                 let jf = jf_ref.0 as *mut JitFrame;
                 unsafe { JitFrame::init(jf, std::ptr::null(), depth) };
 
-                // Conservative per-loop gcmap over the Ref-home region. Held in
-                // this stack frame (jf_gcmap points at it) until the outputs are
-                // read after the trace returns.
+                // Per-loop gcmap over the surviving Ref-home region. Held in this
+                // stack frame (jf_gcmap points at it) until the outputs are read
+                // after the trace returns.
                 let gcmap = build_home_gcmap(eff_ref_homes);
                 unsafe { (*jf).jf_gcmap = gcmap.as_ptr() as *const u8 };
 
@@ -2392,11 +2395,11 @@ impl majit_backend::Backend for WasmBackend {
                 };
             }
 
-            // Legacy host-Vec frame path (default, PYRE_WASM_CA off) — byte-
-            // identical to before: fail_index at frame[0], inputs/outputs at
-            // frame[1 + i], Ref homes manually rooted across the trace. A home
-            // slot only ever holds null (entry init) or a valid GcRef (store-on-
-            // def), so forwarding is safe without precise liveness. The path to
+            // Legacy host-Vec frame path (default, PYRE_WASM_CA off): fail_index
+            // at frame[0], inputs/outputs at frame[1 + i], surviving Ref homes
+            // manually rooted across the trace. A home slot only ever holds null
+            // (entry init) or a valid GcRef (store-on-def), so forwarding is
+            // safe. The path to
             // `wasm_gc_remove_root` is straight-line and the wasm32 build is
             // `panic=abort`, so `glue::execute` cannot unwind and leak roots.
             let mut frame = vec![0i64; frame_size];

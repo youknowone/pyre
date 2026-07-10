@@ -48,13 +48,13 @@ const CALL_ARGS_OFS: u64 = 2024;
 /// Minimum frame allocation size in bytes to accommodate the call area.
 pub const MIN_FRAME_BYTES: usize = 2024 + 16 * 8; // 16 max call args
 
-/// Byte offset of the Ref-home region within the frame. Each Ref-typed value
-/// (input arg or op result) is given a dedicated home slot here: it is
+/// Byte offset of the Ref-home region within the frame. Each Ref value that is
+/// live across a collecting call is given a dedicated home slot here: it is
 /// null-initialized at trace entry and written on every definition
 /// (store-on-def), so a home slot only ever holds null or a valid GcRef.
-/// A (future) collecting allocation registers these slots as GC roots and
-/// forwards them, then the trace reloads the live Ref locals from their homes
-/// — making object movement transparent without precise liveness.
+/// A collecting allocation registers these slots as GC roots and forwards them,
+/// then the trace reloads the live Ref locals from their homes — making object
+/// movement transparent without rooting Refs that never cross a collection.
 ///
 /// Placed past the call area so it never overlaps the fail-index / input /
 /// output slots (which sit below the call area at offset 2000) or the call
@@ -188,10 +188,57 @@ fn array_item_size_sign_from_descr(op: &Op) -> (usize, bool) {
         .unwrap_or((8, true))
 }
 
-/// Maps each Ref-typed value (input arg / op result) to a compact home-slot
-/// index `0..len`, where its current `GcRef` is mirrored into the frame's
-/// GC-root region (`HOME_SLOT_BASE + home * 8`) so a collecting allocation
-/// inside the trace can forward it.
+/// Dense census of every non-constant Ref-typed value (input arg / op result),
+/// independent of whether it needs a home slot. Write-barrier selection still
+/// needs the full Ref type set after homes are shrunk to only values live across
+/// collecting calls.
+struct RefValues {
+    /// `Vec<bool>` is a wasteful container in general, but justified here: the
+    /// set is built and dropped within one `build_wasm_module` call, sized to
+    /// the trace's value count (tens to low hundreds), and only ever
+    /// point-queried. At that size a direct byte index beats a bitset's
+    /// shift/mask, and the workspace pulls in no bitset crate; it matches the
+    /// backend's other id-indexed flag vectors (`label_resume_safety`,
+    /// `failguard`).
+    by_id: Vec<bool>,
+}
+
+impl RefValues {
+    fn mark(by_id: &mut Vec<bool>, id: u32) {
+        let i = id as usize;
+        if i >= by_id.len() {
+            by_id.resize(i + 1, false);
+        }
+        by_id[i] = true;
+    }
+
+    fn collect(inputargs: &[InputArg], ops: &[Op]) -> Self {
+        let mut by_id = Vec::new();
+        for ia in inputargs {
+            if ia.tp == Type::Ref {
+                Self::mark(&mut by_id, ia.index);
+            }
+        }
+        for op in ops {
+            let r = op.pos.get();
+            if r != OpRef::NONE && !r.is_constant() && op.result_type() == Type::Ref {
+                Self::mark(&mut by_id, r.raw());
+            }
+        }
+        Self { by_id }
+    }
+
+    fn contains(&self, v: OpRef) -> bool {
+        v != OpRef::NONE
+            && !v.is_constant()
+            && self.by_id.get(v.raw() as usize).copied().unwrap_or(false)
+    }
+}
+
+/// Maps each homed Ref-typed value (input arg / op result) to a compact
+/// home-slot index `0..len`, where its current `GcRef` is mirrored into the
+/// frame's GC-root region (`HOME_SLOT_BASE + home * 8`) so a collecting
+/// allocation inside the trace can forward it.
 ///
 /// Keyed by value id (`OpRef::raw()` / input `index`), which is the dense
 /// `[0, num_vars)` space the wasm value locals already use (`1 + raw`); a flat
@@ -220,17 +267,23 @@ impl RefHomes {
         }
     }
 
-    fn collect(inputargs: &[InputArg], ops: &[Op]) -> Self {
+    fn collect(inputargs: &[InputArg], ops: &[Op], include_ca_collects: bool) -> Self {
+        let liveness = HomeLiveness::collect(inputargs, ops);
+        let collect_positions = collecting_call_positions(ops, include_ca_collects);
         let mut by_id = Vec::new();
         let mut next = 0u32;
         for ia in inputargs {
-            if ia.tp == Type::Ref {
+            if ia.tp == Type::Ref && liveness.live_across_any(ia.index, &collect_positions) {
                 Self::assign(&mut by_id, &mut next, ia.index);
             }
         }
         for op in ops {
             let r = op.pos.get();
-            if r != OpRef::NONE && !r.is_constant() && op.result_type() == Type::Ref {
+            if r != OpRef::NONE
+                && !r.is_constant()
+                && op.result_type() == Type::Ref
+                && liveness.live_across_any(r.raw(), &collect_positions)
+            {
                 Self::assign(&mut by_id, &mut next, r.raw());
             }
         }
@@ -277,7 +330,9 @@ impl RefHomes {
 /// caller size the callee frame and the GC walker for a (wider) bridge's home
 /// region before codegen runs.
 pub fn count_ref_homes(inputargs: &[InputArg], ops: &[Op]) -> usize {
-    RefHomes::collect(inputargs, ops).len()
+    // This pre-sizing query is used for CA bridges before `CaParams` exists, so
+    // count `CallAssemblerR` as a collecting position to match CA codegen.
+    RefHomes::collect(inputargs, ops, true).len()
 }
 
 /// Argument index of the stored value for a GC ref-storing op. `SetfieldRaw` /
@@ -299,18 +354,17 @@ fn ref_store_value_arg(op: &Op) -> Option<usize> {
 /// `handle_write_barrier_setfield` gate `v.type == 'r' and not ConstPtr`: a
 /// constant reference is an immortal/old object whose store never makes the base
 /// point to young, so it needs no barrier (rewrite.py:930-931).
-fn write_barrier_base(op: &Op, ref_homes: &RefHomes) -> Option<OpRef> {
+fn write_barrier_base(op: &Op, ref_values: &RefValues) -> Option<OpRef> {
     let val = op.arg(ref_store_value_arg(op)?).to_opref();
-    // `home` returns `None` for a constant value, matching the gate's
-    // `not ConstPtr`.
-    ref_homes.home(val).map(|_| op.arg(0).to_opref())
+    // `contains` returns false for constants, matching the gate's `not ConstPtr`.
+    ref_values.contains(val).then(|| op.arg(0).to_opref())
 }
 
 /// Whether any op in the trace needs a write-barrier trampoline call, which
 /// requires the `jit_call` import to be present.
-fn has_ref_store_op(ops: &[Op], ref_homes: &RefHomes) -> bool {
+fn has_ref_store_op(ops: &[Op], ref_values: &RefValues) -> bool {
     ops.iter()
-        .any(|op| write_barrier_base(op, ref_homes).is_some())
+        .any(|op| write_barrier_base(op, ref_values).is_some())
 }
 
 /// Emit a write-barrier check on `base_ref` before a ref-storing field/array
@@ -400,7 +454,11 @@ struct HomeLiveness {
 
 impl HomeLiveness {
     fn collect(inputargs: &[InputArg], ops: &[Op]) -> Self {
-        let mut n = inputargs.iter().map(|ia| ia.index as usize + 1).max().unwrap_or(0);
+        let mut n = inputargs
+            .iter()
+            .map(|ia| ia.index as usize + 1)
+            .max()
+            .unwrap_or(0);
         for op in ops {
             let r = op.pos.get();
             if r != OpRef::NONE && !r.is_constant() {
@@ -445,10 +503,32 @@ impl HomeLiveness {
     /// local holds a value a collection at op `at` could invalidate.
     fn live_across(&self, raw: u32, at: usize) -> bool {
         let raw = raw as usize;
-        raw < self.def_pos.len()
-            && self.def_pos[raw] < at as i32
-            && self.last_use[raw] > at as i32
+        raw < self.def_pos.len() && self.def_pos[raw] < at as i32 && self.last_use[raw] > at as i32
     }
+
+    fn live_across_any(&self, raw: u32, positions: &[usize]) -> bool {
+        positions.iter().any(|&at| self.live_across(raw, at))
+    }
+}
+
+/// Static collecting-call positions whose gcmap-visible homes may be forwarded.
+/// These are exactly the sites that emit post-call reloads from homes:
+/// `New`/`NewWithVtable`, `NewArray`/`NewArrayClear`, and the CA
+/// `CallAssemblerR` arm when enabled. General residual calls deliberately stay
+/// out of this set because their host-side allocations use the no-collect hook
+/// and the codegen emits no reload for them.
+fn collecting_call_positions(ops: &[Op], include_ca_collects: bool) -> Vec<usize> {
+    ops.iter()
+        .enumerate()
+        .filter_map(|(i, op)| {
+            matches!(
+                op.opcode,
+                OpCode::New | OpCode::NewWithVtable | OpCode::NewArray | OpCode::NewArrayClear
+            )
+            .then_some(i)
+            .or_else(|| (include_ca_collects && op.opcode == OpCode::CallAssemblerR).then_some(i))
+        })
+        .collect()
 }
 
 /// Reload the live Ref locals from their home slots after a collecting call
@@ -631,7 +711,7 @@ fn residual_call_void_word_arity(op: &Op) -> Option<usize> {
 /// `extern "C" fn(i64×n) -> i64` table entries), or a ref-storing store
 /// (its `wasm_jit_write_barrier` helper takes 1 arg). All of these share
 /// the residual-call type family, so one max covers them.
-fn direct_helper_i64_arity(op: &Op, ref_homes: &RefHomes) -> Option<usize> {
+fn direct_helper_i64_arity(op: &Op, ref_values: &RefValues) -> Option<usize> {
     if let Some(n) = residual_call_i64_arity(op) {
         return Some(n);
     }
@@ -644,7 +724,7 @@ fn direct_helper_i64_arity(op: &Op, ref_homes: &RefHomes) -> Option<usize> {
         // wasm_jit_alloc_array(type_id, base_size, item_size, length, len_offset)
         OpCode::NewArray | OpCode::NewArrayClear => Some(5),
         // wasm_jit_write_barrier(base)
-        _ => write_barrier_base(op, ref_homes).map(|_| 1),
+        _ => write_barrier_base(op, ref_values).map(|_| 1),
     }
 }
 
@@ -896,7 +976,8 @@ pub fn build_wasm_module(
         )));
     }
 
-    let ref_homes = RefHomes::collect(inputargs, ops);
+    let ref_values = RefValues::collect(inputargs, ops);
+    let ref_homes = RefHomes::collect(inputargs, ops, ca.emit_ca);
     let num_ref_homes = ref_homes.len();
 
     // Self-recursive CALL_ASSEMBLER arm (`PYRE_WASM_CA`): `bridge_finish_fi` is
@@ -927,7 +1008,7 @@ pub fn build_wasm_module(
     // for the callee-frame GC-alloc / shadow-stack-pop trampolines (an emit_ca
     // bridge always materializes its callee frame via NewWithVtable, so this is
     // already true in practice — stated explicitly for robustness).
-    let needs_call = has_call_ops(ops) || has_ref_store_op(ops, &ref_homes) || ca.emit_ca;
+    let needs_call = has_call_ops(ops) || has_ref_store_op(ops, &ref_values) || ca.emit_ca;
     // The shared indirect-function table is imported for `jit_call`'s residual
     // dispatch, the epilogue's bridge `call_indirect`, and the CA arm's
     // self-recursive `call_indirect`.
@@ -942,7 +1023,7 @@ pub fn build_wasm_module(
     let residual_max_arity = if WASM_DIRECT_RESIDUAL_CALL {
         let scanned = ops
             .iter()
-            .filter_map(|op| direct_helper_i64_arity(op, &ref_homes))
+            .filter_map(|op| direct_helper_i64_arity(op, &ref_values))
             .max();
         if ca.emit_ca {
             // The CA arm's frame helpers (`wasm_jit_ca_alloc_frame(frame_bytes,
@@ -1054,6 +1135,7 @@ pub fn build_wasm_module(
         alloc_array_fn_ptr,
         wb_fn_ptr,
         nursery,
+        &ref_values,
         &ref_homes,
         cells_base,
         bridge_dispatch,
@@ -1091,6 +1173,7 @@ fn build_function(
     alloc_array_fn_ptr: i64,
     wb_fn_ptr: i64,
     nursery: Option<&NurseryAllocParams>,
+    ref_values: &RefValues,
     ref_homes: &RefHomes,
     cells_base: u32,
     bridge_dispatch: bool,
@@ -1138,7 +1221,10 @@ fn build_function(
     let alloc_size_local = alloc_scratch_local + 1;
     let mut func = Function::new(vec![
         (num_vars + UMULHI_SCRATCH, ValType::I64),
-        (base_i32_locals + if nursery.is_some() { 2 } else { 0 }, ValType::I32),
+        (
+            base_i32_locals + if nursery.is_some() { 2 } else { 0 },
+            ValType::I32,
+        ),
     ]);
     let mut sink = func.instructions();
 
@@ -1778,7 +1864,7 @@ fn build_function(
                 }
             }
             OpCode::SetfieldGc | OpCode::SetfieldRaw => {
-                if let Some(base) = write_barrier_base(op, ref_homes) {
+                if let Some(base) = write_barrier_base(op, ref_values) {
                     emit_write_barrier(
                         &mut sink,
                         constants,
@@ -1867,7 +1953,7 @@ fn build_function(
                 }
             }
             OpCode::SetarrayitemGc | OpCode::SetarrayitemRaw => {
-                if let Some(base) = write_barrier_base(op, ref_homes) {
+                if let Some(base) = write_barrier_base(op, ref_values) {
                     emit_write_barrier(
                         &mut sink,
                         constants,
@@ -1917,7 +2003,7 @@ fn build_function(
                 }
             }
             OpCode::SetinteriorfieldGc => {
-                if let Some(base) = write_barrier_base(op, ref_homes) {
+                if let Some(base) = write_barrier_base(op, ref_values) {
                     emit_write_barrier(
                         &mut sink,
                         constants,
@@ -2791,8 +2877,8 @@ fn build_function(
                 let inline_nursery_total = length_const.and_then(|len| {
                     use majit_gc::header::GcHeader;
                     let len = usize::try_from(len).ok()?;
-                    let payload = (base_size as usize)
-                        .checked_add((item_size as usize).checked_mul(len)?)?;
+                    let payload =
+                        (base_size as usize).checked_add((item_size as usize).checked_mul(len)?)?;
                     let total =
                         ((GcHeader::SIZE + payload).max(GcHeader::MIN_NURSERY_OBJ_SIZE) + 7) & !7;
                     let na = nursery.filter(|na| {
