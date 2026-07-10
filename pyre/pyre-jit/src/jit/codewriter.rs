@@ -7349,30 +7349,57 @@ impl CodeWriter {
                     //   op2 = -live- (for do_recursive_call / guard resume)
                     // The per-PC emit_live_placeholder!() after this block
                     // serves as op2; op3 is emitted inside the block below.
-                    // An explicit `raise X` covered by a try closes its block
-                    // with a single exception exit carrying `explicit_raise_value`
-                    // (`emit_raise!` set `needs_fallthrough = false`).  When that
-                    // block's fall-through PC is itself a loop header — the target
-                    // of the handler's back-edge — `emit_mark_label_pc!` cannot
-                    // switch away from the closed block until the joinpoint block
-                    // exists, so `current_block` is still the raise block here.
-                    // Emitting the loop-header `jit_merge_point` into it appends
-                    // the merge op AFTER the raise's operations; `insert_exits`
-                    // then serialises the block ops (including that merge) BEFORE
-                    // the `raise` op, so a blackhole guard-resume into this arm
-                    // reaches the merge and `ContinueRunningNormally`s (loops back)
-                    // before executing the `raise`, dropping the handler.  The
-                    // `jit_merge_point` belongs to the real loop-header block,
-                    // emitted when that PC is walked through its own joinpoint;
-                    // suppress it on a closed explicit-raise block (mirrors the
-                    // `block_closed_by_terminator` op-dispatch gate below).
-                    let closed_by_explicit_raise = current_block
-                        .block()
-                        .borrow()
-                        .exits
-                        .iter()
-                        .any(|e| e.borrow().explicit_raise_value.is_some());
-                    if loop_header_pcs.contains(&py_pc) && !closed_by_explicit_raise {
+                    //
+                    // The loop-header `jit_merge_point` belongs to the block that
+                    // legitimately STARTS at this PC — the one entered via its own
+                    // back-edge / pending-block pop (`flatten.py make_bytecode_block`
+                    // enters a block only via its own links).  Pyre's PC-sequential
+                    // walker can also reach a loop-header PC by sequentially
+                    // advancing off the PC-adjacent predecessor block AFTER that
+                    // predecessor was closed by an unconditional terminator
+                    // (`emit_goto!` / `emit_ref_return!` / `emit_raise!` cleared
+                    // `needs_fallthrough` so `emit_mark_label_pc!` could not switch
+                    // away, and no joinpoint is registered at the loop-header PC yet
+                    // because its back-edge lies at a higher, not-yet-walked PC).
+                    // In that case `current_block` is the terminator-closed
+                    // predecessor, NOT the loop-header block:
+                    //   - a JumpBackward block carrying `loop_header` + `goto`
+                    //     target whose PC-adjacent next PC is a DIFFERENT loop's
+                    //     header (the word-drop bug: the merge lands after the
+                    //     `goto`, so `insert_exits` serialises it BEFORE the goto
+                    //     target and a blackhole guard-resume reaches the
+                    //     `jit_merge_point` first, `ContinueRunningNormally`s at the
+                    //     loop-header PC without the predecessor's state reset →
+                    //     truncated / duplicated output);
+                    //   - an explicit `raise X` block whose fall-through PC is a
+                    //     loop header (merge serialised before the `raise`, dropping
+                    //     the handler).
+                    // In every terminator-closed case the merge belongs to the real
+                    // loop-header block, emitted when that PC is walked through its
+                    // own entry.  Suppress it here on any terminator-closed block —
+                    // the same guard the op-dispatch `block_closed_by_terminator`
+                    // gate applies below.  Computed once here and reused at that
+                    // gate.
+                    let block_closed_by_terminator = {
+                        let block_rc = current_block.block();
+                        let block = block_rc.borrow();
+                        let has_explicit_raise = block
+                            .exits
+                            .iter()
+                            .any(|e| e.borrow().explicit_raise_value.is_some());
+                        !block.exits.is_empty()
+                            && (has_explicit_raise
+                                || !matches!(
+                                    block.exitswitch,
+                                    Some(super::flow::ExitSwitch::Value(super::flow::FlowValue::Constant(
+                                        ref c,
+                                    ))) if matches!(
+                                        c.value,
+                                        super::flow::ConstantValue::Atom(super::flow::Atom::LastException)
+                                    )
+                                ))
+                    };
+                    if loop_header_pcs.contains(&py_pc) && !block_closed_by_terminator {
                         // jtransform.py:1710-1711 op3: -live- before
                         // jit_merge_point, "for inlined short preambles".
                         emit_live_placeholder!();
@@ -7457,40 +7484,11 @@ impl CodeWriter {
                     // the block, so subsequent ops still need dispatch for
                     // stack-depth parity (e.g. `Instruction::LoadName` +
                     // `Instruction::StoreName` patterns at module scope).
-                    let block_closed_by_terminator = {
-                        let block_rc = current_block.block();
-                        let block = block_rc.borrow();
-                        // An explicit `raise X` covered by a try attaches its
-                        // exception edge through `attach_catch_exception_edge`,
-                        // which sets `exitswitch=LastException` — the same
-                        // canraise shape a real raising OP produces.  The
-                        // LastException exclusion below keeps a canraise OP's
-                        // block open so the walker keeps dispatching the op's
-                        // normal-flow result and the ops after it.  An explicit
-                        // raise has no normal continuation: it is an
-                        // unconditional terminator, so the block must close.
-                        // Left open, the walker serialises the following
-                        // fall-through / loop-back ops (and a `mergeblock`
-                        // appends a spurious normal exit) into the raise's
-                        // block; `insert_exits` then lowers the raise edge as a
-                        // plain catch and drops the `raise` op, so the handler
-                        // is never entered.
-                        let has_explicit_raise = block
-                            .exits
-                            .iter()
-                            .any(|e| e.borrow().explicit_raise_value.is_some());
-                        !block.exits.is_empty()
-                            && (has_explicit_raise
-                                || !matches!(
-                                    block.exitswitch,
-                                    Some(super::flow::ExitSwitch::Value(super::flow::FlowValue::Constant(
-                                        ref c,
-                                    ))) if matches!(
-                                        c.value,
-                                        super::flow::ConstantValue::Atom(super::flow::Atom::LastException)
-                                    )
-                                ))
-                    };
+                    //
+                    // Reuses `block_closed_by_terminator` computed above the
+                    // loop-header `jit_merge_point` gate: the merge emission
+                    // only appends `operations` (never `exits` / `exitswitch`),
+                    // so the value is unchanged here.
                     if block_closed_by_terminator {
                         current_state.next_offset = py_pc + 1;
                         current_state.blocklist =
