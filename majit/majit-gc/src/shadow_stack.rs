@@ -416,6 +416,24 @@ pub fn pop_jf_to(depth: usize) {
     });
 }
 
+/// Pop the single top jitframe entry, if any.
+///
+/// assembler.py:1130-1136 _call_footer_shadowstack:
+///   SUB [rootstacktop], 2*WORD
+/// Single-access fusion of `jf_depth()` + `pop_jf_to(depth - 1)` for
+/// per-call hot paths (the wasm CA return leg pops one frame per call);
+/// the two-step form pays the thread-local + RefCell round-trip twice.
+pub fn pop_jf_top() {
+    JF_ROOT_STACK.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        stack.ensure_init();
+        let top = stack.top.get();
+        if top > stack.base {
+            stack.top.set(top - 2 * WORD);
+        }
+    });
+}
+
 /// Current depth of the jitframe shadow stack.
 pub fn jf_depth() -> usize {
     JF_ROOT_STACK.with(|stack| {

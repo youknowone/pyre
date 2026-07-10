@@ -449,26 +449,56 @@ pub extern "C" fn wasm_jit_write_barrier(obj: i64) -> i64 {
     0
 }
 
-thread_local! {
-    /// Per-gcmap cache of the contiguous marked-item runs to re-zero on CA
-    /// frame reuse: `(gcmap_ptr, &[(first_item, item_count)])`. One gcmap is
-    /// built per CA bridge and leaked for the program's life, so a linear
-    /// scan over a handful of entries resolves in one pointer compare and
-    /// the derived runs can be leaked alongside it.
-    static CA_GCMAP_ZERO_RUNS: std::cell::RefCell<Vec<(usize, &'static [(usize, usize)])>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-    /// Live CA callee frames in recursion order (mirrors the CA entries on
-    /// the jf shadow stack): `(frame_addr, alloc_capacity_bytes)`. Popped
-    /// into [`CA_FRAME_POOL`] by `wasm_jit_ca_pop_frame`.
-    static CA_ACTIVE_FRAMES: std::cell::RefCell<Vec<(usize, usize)>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-    /// LIFO pool of retired CA callee frames available for reuse. Strict CA
-    /// recursion order means the top entry is almost always the geometry the
-    /// next call wants, so the whole recursion runs on a handful of frames
-    /// instead of allocating one per call. Entries stay registered as libc
-    /// jitframes and are never freed (bounded by peak recursion depth).
-    static CA_FRAME_POOL: std::cell::RefCell<Vec<(usize, usize)>> =
-        const { std::cell::RefCell::new(Vec::new()) };
+/// Plain unsynchronized static cell for CA runtime-helper state. These
+/// helpers only ever execute inside the wasm32 guest, which is
+/// single-threaded (native builds compile them for the codegen unit tests
+/// but never call them — `execute_token` requires a wasm host, see the
+/// `func_handle` placeholder arm in `compile_loop`). There is no
+/// thread-locality to model, so `thread_local!` here was asserting a
+/// per-thread identity the state never had; same invariant as the arena
+/// globals in pyre-jit's `call_jit`.
+///
+/// Safety contract for [`GuestCell::get_mut`]: single-threaded caller and no
+/// re-entrant second reference to the same cell while one is live.
+struct GuestCell<T>(std::cell::UnsafeCell<T>);
+unsafe impl<T> Sync for GuestCell<T> {}
+impl<T> GuestCell<T> {
+    const fn new(value: T) -> Self {
+        Self(std::cell::UnsafeCell::new(value))
+    }
+    /// See the safety contract on [`GuestCell`].
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn get_mut(&self) -> &mut T {
+        unsafe { &mut *self.0.get() }
+    }
+}
+
+/// Per-gcmap cache of the contiguous marked-item runs to re-zero on CA
+/// frame reuse: `(gcmap_ptr, &[(first_item, item_count)])`. One gcmap is
+/// built per CA bridge and leaked for the program's life, so a linear
+/// scan over a handful of entries resolves in one pointer compare and
+/// the derived runs can be leaked alongside it.
+static CA_GCMAP_ZERO_RUNS: GuestCell<Vec<(usize, &'static [(usize, usize)])>> =
+    GuestCell::new(Vec::new());
+
+/// CA callee frames as `(frame_addr, alloc_capacity_bytes)`, live-prefix
+/// + pooled-suffix in one Vec: `entries[..live]` are the live frames in
+/// recursion order (mirroring the CA entries on the jf shadow stack) and
+/// `entries[live..]` is the LIFO reuse pool with its top at
+/// `entries[live]`. Strict CA recursion order means a returning frame is
+/// retired IN PLACE by decrementing `live` and the next call revives it
+/// by incrementing `live` back, so alloc and pop each touch this single
+/// static once and steady-state recursion performs no allocator calls at
+/// all. Entries stay registered as libc jitframes and are never freed
+/// (bounded by peak recursion depth).
+static CA_FRAMES: GuestCell<CaFrames> =
+    GuestCell::new(CaFrames { entries: Vec::new(), live: 0 });
+
+/// Backing store for [`CA_FRAMES`]: `entries[..live]` live, `entries[live..]`
+/// pooled (top at `entries[live]`).
+struct CaFrames {
+    entries: Vec<(usize, usize)>,
+    live: usize,
 }
 
 /// Contiguous runs of gcmap-marked jf_frame items for a CA callee gcmap, as
@@ -479,59 +509,39 @@ thread_local! {
 /// reuse re-zeroes them with a couple of bulk `memory.fill`s instead of either
 /// a whole-frame memset or a per-bit scatter loop (both measurably slower).
 fn ca_gcmap_zero_runs(gcmap_ptr: usize) -> &'static [(usize, usize)] {
-    // Single-entry fast cache: one CA bridge (hence one gcmap) dominates any
-    // recursion, and the guest is single-threaded (same invariant as the
-    // arena globals in pyre-jit's call_jit). Falls back to the thread-local
-    // table on mismatch.
-    static mut CA_ZERO_RUNS_FAST: (usize, *const (usize, usize), usize) =
-        (0, std::ptr::null(), 0);
-    unsafe {
-        let (p, ptr, len) = CA_ZERO_RUNS_FAST;
-        if p == gcmap_ptr {
-            return std::slice::from_raw_parts(ptr, len);
-        }
+    let cache = unsafe { CA_GCMAP_ZERO_RUNS.get_mut() };
+    if let Some(&(_, runs)) = cache.iter().find(|&&(p, _)| p == gcmap_ptr) {
+        return runs;
     }
-    CA_GCMAP_ZERO_RUNS.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        if let Some(&(_, runs)) = cache.iter().find(|&&(p, _)| p == gcmap_ptr) {
-            unsafe {
-                CA_ZERO_RUNS_FAST = (gcmap_ptr, runs.as_ptr(), runs.len());
-            }
-            return runs;
-        }
-        // Marked items sit one per 8-byte slot at Signed (4-byte on wasm32)
-        // item granularity, i.e. stride 2 — never bit-contiguous. Merging
-        // across small gaps turns each dense region (inputs, homes) into one
-        // run; zeroing the unmarked gap items is sound (a strict subset of
-        // the whole-frame zero this replaces).
-        const MERGE_SLACK: usize = 16;
-        let mut runs: Vec<(usize, usize)> = Vec::new();
-        unsafe {
-            let gcmap = gcmap_ptr as *const usize;
-            let num_words = *gcmap;
-            let bits_per_word = usize::BITS as usize;
-            for w in 0..num_words {
-                let mut word = *gcmap.add(1 + w);
-                while word != 0 {
-                    let bit = word.trailing_zeros() as usize;
-                    word &= word - 1;
-                    let item = w * bits_per_word + bit;
-                    match runs.last_mut() {
-                        Some((first, count)) if item <= *first + *count + MERGE_SLACK => {
-                            *count = item - *first + 1;
-                        }
-                        _ => runs.push((item, 1)),
+    // Marked items sit one per 8-byte slot at Signed (4-byte on wasm32)
+    // item granularity, i.e. stride 2 — never bit-contiguous. Merging
+    // across small gaps turns each dense region (inputs, homes) into one
+    // run; zeroing the unmarked gap items is sound (a strict subset of
+    // the whole-frame zero this replaces).
+    const MERGE_SLACK: usize = 16;
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    unsafe {
+        let gcmap = gcmap_ptr as *const usize;
+        let num_words = *gcmap;
+        let bits_per_word = usize::BITS as usize;
+        for w in 0..num_words {
+            let mut word = *gcmap.add(1 + w);
+            while word != 0 {
+                let bit = word.trailing_zeros() as usize;
+                word &= word - 1;
+                let item = w * bits_per_word + bit;
+                match runs.last_mut() {
+                    Some((first, count)) if item <= *first + *count + MERGE_SLACK => {
+                        *count = item - *first + 1;
                     }
+                    _ => runs.push((item, 1)),
                 }
             }
         }
-        let leaked: &'static [(usize, usize)] = Box::leak(runs.into_boxed_slice());
-        cache.push((gcmap_ptr, leaked));
-        unsafe {
-            CA_ZERO_RUNS_FAST = (gcmap_ptr, leaked.as_ptr(), leaked.len());
-        }
-        leaked
-    })
+    }
+    let leaked: &'static [(usize, usize)] = Box::leak(runs.into_boxed_slice());
+    cache.push((gcmap_ptr, leaked));
+    leaked
 }
 
 /// Self-recursive CALL_ASSEMBLER (`PYRE_WASM_CA`) callee-frame allocation
@@ -558,18 +568,35 @@ pub extern "C" fn wasm_jit_ca_alloc_frame(frame_bytes: i64, gcmap_ptr: i64) -> i
     use majit_backend::jitframe::JitFrame;
     let depth = frame_bytes as usize / std::mem::size_of::<isize>();
     let alloc_size = JitFrame::alloc_size(depth);
-    // Reuse the pool top when it is large enough (`>=` also covers a smaller
-    // bridge nesting inside a larger one). A too-small top is left in place —
-    // the fresh frame below re-pools on top of it in LIFO order.
-    let reused = CA_FRAME_POOL.with(|pool| {
-        let mut pool = pool.borrow_mut();
-        match pool.last() {
-            Some(&(_, cap)) if cap >= alloc_size => pool.pop(),
-            _ => None,
+    // Reuse the pool top (`entries[live]`) when it is large enough (`>=` also
+    // covers a smaller bridge nesting inside a larger one) by reviving it in
+    // place — bump `live`. A too-small top is left in place: the fresh frame
+    // is inserted at `live`, becoming the new live top with the old pool top
+    // right below it in LIFO order.
+    // `(frame_addr, needs_rezero)`: a revived pool frame carries the previous
+    // run's bytes; a fresh `alloc_zeroed` frame does not.
+    let got = {
+        let f = unsafe { CA_FRAMES.get_mut() };
+        if let Some(&(addr, _)) = f.entries.get(f.live).filter(|&&(_, cap)| cap >= alloc_size) {
+            f.live += 1;
+            Some((addr, true))
+        } else {
+            let layout = std::alloc::Layout::from_size_align(alloc_size, 16)
+                .expect("CA frame layout overflow");
+            let p = unsafe { std::alloc::alloc_zeroed(layout) };
+            if p.is_null() {
+                None
+            } else {
+                majit_gc::shadow_stack::register_libc_jitframe(p as usize);
+                let live = f.live;
+                f.entries.insert(live, (p as usize, alloc_size));
+                f.live += 1;
+                Some((p as usize, false))
+            }
         }
-    });
-    let (addr, cap) = match reused {
-        Some((addr, cap)) => {
+    };
+    let addr = match got {
+        Some((addr, true)) => {
             // Re-zero only what a reused frame must present as zeroed:
             //   * the JitFrame header — `JitFrame::init` writes only
             //     jf_frame_info + the jf_frame length and relies on the other
@@ -595,43 +622,31 @@ pub extern "C" fn wasm_jit_ca_alloc_frame(frame_bytes: i64, gcmap_ptr: i64) -> i
                     std::ptr::write_bytes(items.add(first * SIGN_SIZE), 0, count * SIGN_SIZE);
                 }
             }
-            (addr, cap)
+            addr
         }
-        None => {
-            let layout = std::alloc::Layout::from_size_align(alloc_size, 16)
-                .expect("CA frame layout overflow");
-            let p = unsafe { std::alloc::alloc_zeroed(layout) };
-            if p.is_null() {
-                return 0;
-            }
-            majit_gc::shadow_stack::register_libc_jitframe(p as usize);
-            (p as usize, alloc_size)
-        }
+        Some((addr, false)) => addr,
+        None => return 0,
     };
     let jf = addr as *mut JitFrame;
     unsafe {
         JitFrame::init(jf, std::ptr::null(), depth);
         (*jf).jf_gcmap = gcmap_ptr as *const u8;
     }
-    CA_ACTIVE_FRAMES.with(|v| v.borrow_mut().push((addr, cap)));
     majit_gc::shadow_stack::push_jf(GcRef(addr));
     addr as i64
 }
 
 /// Companion to [`wasm_jit_ca_alloc_frame`]: pop the top jitframe shadow-stack
-/// entry on CA-arm exit (the callee frame just ran to finish/deopt) and move
-/// the frame into the reuse pool. The CA recursion is strict LIFO — each level
-/// pushes one frame before its `call_indirect` and pops after, and a deopt
-/// resume runs on the host's own shadow stack — so removing the top entry
-/// releases exactly this callee's frame.
+/// entry on CA-arm exit (the callee frame just ran to finish/deopt) and retire
+/// the frame into the reuse pool — in place, by decrementing the [`CA_FRAMES`]
+/// live watermark. The CA recursion is strict LIFO — each level pushes one
+/// frame before its `call_indirect` and pops after, and a deopt resume runs on
+/// the host's own shadow stack — so removing the top entry releases exactly
+/// this callee's frame.
 pub extern "C" fn wasm_jit_ca_pop_frame(_frame_base: i64) -> i64 {
-    let depth = majit_gc::shadow_stack::jf_depth();
-    if depth > 0 {
-        majit_gc::shadow_stack::pop_jf_to(depth - 1);
-    }
-    if let Some(entry) = CA_ACTIVE_FRAMES.with(|v| v.borrow_mut().pop()) {
-        CA_FRAME_POOL.with(|pool| pool.borrow_mut().push(entry));
-    }
+    majit_gc::shadow_stack::pop_jf_top();
+    let f = unsafe { CA_FRAMES.get_mut() };
+    f.live = f.live.saturating_sub(1);
     0
 }
 
