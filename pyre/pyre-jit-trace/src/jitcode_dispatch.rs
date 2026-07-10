@@ -20515,18 +20515,32 @@ fn handle(
                     // Hazard (1): the not-taken arm reads a regular Ref register
                     // the blackhole resumes as NULL (the conditional-expression
                     // boxed-int NULL-deref crash).
-                    let reads_null_ref = match &liveness {
-                        Some((live_ref, num_regs_r)) => branch_arm_reads_unrestorable_ref(
-                            code,
-                            other_target,
-                            live_ref,
-                            *num_regs_r,
-                        ),
-                        // Liveness unavailable (the trait leg, where
-                        // `FULL_BODY_SNAPSHOT_SYM` is null, or an unresolved
-                        // coordinate) — cannot prove restorable, so decline.
-                        None => true,
-                    };
+                    //
+                    // Scoped to the undermodeled invalid-mirror walk
+                    // (`!ctx.vstack_valid`), exactly like Hazards (2)/(3) below.
+                    // A VALID walk mirror sources every on-stack kept slot from
+                    // `ctx.vstack_boxes` and every kept local from the vable
+                    // shadow (`collect_outer_active_boxes`), so on resume the
+                    // not-taken arm's Ref reads are reconstructed per-slot even
+                    // when the guard's snapshot liveness (`live_ref`) does not
+                    // name that register color — the same per-slot recovery that
+                    // makes the short-circuit / conditional-expression kept-stack
+                    // reads (#416/#420) restorable for Hazards (2)/(3).  The
+                    // register-file scan only proves a hazard for the INVALID
+                    // mirror, where those per-slot sources are unavailable.
+                    let reads_null_ref = !ctx.vstack_valid
+                        && match &liveness {
+                            Some((live_ref, num_regs_r)) => branch_arm_reads_unrestorable_ref(
+                                code,
+                                other_target,
+                                live_ref,
+                                *num_regs_r,
+                            ),
+                            // Liveness unavailable (the trait leg, where
+                            // `FULL_BODY_SNAPSHOT_SYM` is null, or an unresolved
+                            // coordinate) — cannot prove restorable, so decline.
+                            None => true,
+                        };
                     // Hazard (2): the not-taken edge carries `ref_copy` renames
                     // (`kept_recovered` non-empty) — the #416/#420 short-circuit
                     // / chained-comparison kept-stack recovery.  Historically the
