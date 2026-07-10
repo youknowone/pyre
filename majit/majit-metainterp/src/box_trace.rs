@@ -31,9 +31,8 @@ fn getfield_gc_i_pureornot(
         // covering const pool, standard-virtualizable shadow, and
         // the frontend object's `value` field (RPython
         // `currfieldbox.getint()` dispatch parity).
-        let cached_value = ctx.box_value(cached).unwrap_or(Value::Void);
-        let expected_int = match cached_value {
-            Value::Int(n) => Some(n),
+        let expected_int = match ctx.box_value(cached) {
+            Some(Value::Int(n)) => Some(n),
             _ => None,
         };
         if let Some(cached_int) = expected_int {
@@ -75,17 +74,16 @@ fn getfield_gc_i_pureornot(
         let struct_ptr = struct_ref.0 as i64;
         if struct_ptr != usize::MAX as i64 && struct_ptr != 0 {
             ctx.field_sanity_load(struct_ptr, &descr, majit_ir::Type::Int)
-                .unwrap_or(Value::Void)
         } else {
-            Value::Void
+            None
         }
     } else {
-        Value::Void
+        None
     };
     // RPython `Box(value)` constructor analog — stamp the recorded
     // OpRef so subsequent `box_value(result)` consumers see the
     // runtime concrete instead of the GcRef(usize::MAX) sentinel.
-    if !matches!(live_value, Value::Void) {
+    if let Some(live_value) = live_value {
         ctx.set_opref_concrete(result, live_value);
     }
     ctx.heapcache_getfield_now_known(obj, field_index, result);
@@ -305,9 +303,8 @@ fn getfield_gc_f_pureornot(
         // covering const pool, standard-virtualizable shadow, and
         // the frontend object's `value` field (RPython
         // `currfieldbox.getfloat_storage()` dispatch parity).
-        let cached_value = ctx.box_value(cached).unwrap_or(majit_ir::Value::Void);
-        let expected_float = match cached_value {
-            Value::Float(f) => Some(f),
+        let expected_float = match ctx.box_value(cached) {
+            Some(Value::Float(f)) => Some(f),
             _ => None,
         };
         if let Some(cached_float) = expected_float {
@@ -349,14 +346,13 @@ fn getfield_gc_f_pureornot(
         let struct_ptr = struct_ref.0 as i64;
         if struct_ptr != usize::MAX as i64 && struct_ptr != 0 {
             ctx.field_sanity_load(struct_ptr, &descr, majit_ir::Type::Float)
-                .unwrap_or(Value::Void)
         } else {
-            Value::Void
+            None
         }
     } else {
-        Value::Void
+        None
     };
-    if !matches!(live_value, Value::Void) {
+    if let Some(live_value) = live_value {
         ctx.set_opref_concrete(result, live_value);
     }
     ctx.heapcache_getfield_now_known(obj, field_index, result);

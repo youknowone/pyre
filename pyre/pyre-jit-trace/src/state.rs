@@ -2777,9 +2777,8 @@ pub(crate) fn opimpl_getfield_gc_i(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
         // pool, standard-virtualizable shadow, and the frontend
         // object's `value` field (RPython `currfieldbox.getint()`
         // dispatch parity).
-        let cached_value = ctx.box_value(cached).unwrap_or(Value::Void);
-        let expected_int = match cached_value {
-            majit_ir::Value::Int(n) => Some(n),
+        let expected_int = match ctx.box_value(cached) {
+            Some(majit_ir::Value::Int(n)) => Some(n),
             _ => None,
         };
         if let Some(cached_int) = expected_int {
@@ -2859,14 +2858,13 @@ pub(crate) fn opimpl_getfield_gc_i(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
         let struct_ptr = struct_ref.0 as i64;
         if struct_ptr != usize::MAX as i64 && struct_ptr != 0 {
             ctx.field_sanity_load(struct_ptr, &descr, majit_ir::Type::Int)
-                .unwrap_or(majit_ir::Value::Void)
         } else {
-            majit_ir::Value::Void
+            None
         }
     } else {
-        majit_ir::Value::Void
+        None
     };
-    if !matches!(live_value, majit_ir::Value::Void) {
+    if let Some(live_value) = live_value {
         ctx.set_opref_concrete(result, live_value);
     }
     ctx.heapcache_getfield_now_known(obj, field_index, result);
@@ -2885,9 +2883,8 @@ pub(crate) fn opimpl_getfield_gc_r(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
         // `currfieldbox.getref_base()` payload through the full chain
         // (const pool, standard-virtualizable shadow, the frontend
         // object's `value` field).
-        let cached_value = ctx.box_value(cached).unwrap_or(Value::Void);
-        let expected_ref = match cached_value {
-            majit_ir::Value::Ref(r) => Some(r),
+        let expected_ref = match ctx.box_value(cached) {
+            Some(majit_ir::Value::Ref(r)) => Some(r),
             _ => None,
         };
         if let Some(cached_ref) = expected_ref {
@@ -2945,14 +2942,13 @@ pub(crate) fn opimpl_getfield_gc_r(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
         let struct_ptr = struct_ref.0 as i64;
         if struct_ptr != usize::MAX as i64 && struct_ptr != 0 {
             ctx.field_sanity_load(struct_ptr, &descr, majit_ir::Type::Ref)
-                .unwrap_or(majit_ir::Value::Void)
         } else {
-            majit_ir::Value::Void
+            None
         }
     } else {
-        majit_ir::Value::Void
+        None
     };
-    if !matches!(live_value, majit_ir::Value::Void) {
+    if let Some(live_value) = live_value {
         ctx.set_opref_concrete(result, live_value);
     }
     ctx.heapcache_getfield_now_known(obj, field_index, result);
@@ -3250,8 +3246,7 @@ pub(crate) fn trace_array_getitem_value(ctx: &mut TraceCtx, array: OpRef, index:
         return cached;
     }
     let result = ctx.record_op_with_descr(OpCode::GetarrayitemGcR, &[array, index], descr.clone());
-    let live_value = array_load_for_cache(ctx, array, index, &descr, majit_ir::Type::Ref);
-    if !matches!(live_value, majit_ir::Value::Void) {
+    if let Some(live_value) = array_load_for_cache(ctx, array, index, &descr, majit_ir::Type::Ref) {
         ctx.set_opref_concrete(result, live_value);
     }
     ctx.heapcache_getarrayitem_now_known(array, index, descr_idx, result);
@@ -3273,19 +3268,18 @@ fn array_load_for_cache(
     index: OpRef,
     descr: &DescrRef,
     kind: majit_ir::Type,
-) -> majit_ir::Value {
+) -> Option<majit_ir::Value> {
     let Some(majit_ir::Value::Ref(array_ref)) = ctx.box_value(array) else {
-        return majit_ir::Value::Void;
+        return None;
     };
     let array_ptr = array_ref.0 as i64;
     if array_ptr == usize::MAX as i64 || array_ptr == 0 {
-        return majit_ir::Value::Void;
+        return None;
     }
     let Some(majit_ir::Value::Int(index_value)) = ctx.box_value(index) else {
-        return majit_ir::Value::Void;
+        return None;
     };
     ctx.array_sanity_load(array_ptr, index_value, descr, kind)
-        .unwrap_or(majit_ir::Value::Void)
 }
 
 /// Read from frame's locals_cells_stack_w — namespace access path.
@@ -3300,8 +3294,7 @@ pub(crate) fn trace_raw_array_getitem_value(
         return cached;
     }
     let result = ctx.record_op_with_descr(OpCode::GetarrayitemGcR, &[array, index], descr.clone());
-    let live_value = array_load_for_cache(ctx, array, index, &descr, majit_ir::Type::Ref);
-    if !matches!(live_value, majit_ir::Value::Void) {
+    if let Some(live_value) = array_load_for_cache(ctx, array, index, &descr, majit_ir::Type::Ref) {
         ctx.set_opref_concrete(result, live_value);
     }
     ctx.heapcache_getarrayitem_now_known(array, index, descr_idx, result);
@@ -3332,8 +3325,7 @@ pub(crate) fn trace_items_block_getitem_value(
         return cached;
     }
     let result = ctx.record_op_with_descr(OpCode::GetarrayitemGcR, &[block, index], descr.clone());
-    let live_value = array_load_for_cache(ctx, block, index, &descr, majit_ir::Type::Ref);
-    if !matches!(live_value, majit_ir::Value::Void) {
+    if let Some(live_value) = array_load_for_cache(ctx, block, index, &descr, majit_ir::Type::Ref) {
         ctx.set_opref_concrete(result, live_value);
     }
     ctx.heapcache_getarrayitem_now_known(block, index, descr_idx, result);
@@ -3365,8 +3357,7 @@ pub(crate) fn trace_items_block_getitem_value_pure(
     let descr = pyobject_gcarray_descr();
     let result =
         ctx.record_op_with_descr(OpCode::GetarrayitemGcPureR, &[block, index], descr.clone());
-    let live_value = array_load_for_cache(ctx, block, index, &descr, majit_ir::Type::Ref);
-    if !matches!(live_value, majit_ir::Value::Void) {
+    if let Some(live_value) = array_load_for_cache(ctx, block, index, &descr, majit_ir::Type::Ref) {
         ctx.set_opref_concrete(result, live_value);
     }
     result
@@ -3422,8 +3413,7 @@ pub(crate) fn trace_int_block_getitem_value(
         return cached;
     }
     let result = ctx.record_op_with_descr(OpCode::GetarrayitemGcI, &[block, index], descr.clone());
-    let live_value = array_load_for_cache(ctx, block, index, &descr, majit_ir::Type::Int);
-    if !matches!(live_value, majit_ir::Value::Void) {
+    if let Some(live_value) = array_load_for_cache(ctx, block, index, &descr, majit_ir::Type::Int) {
         ctx.set_opref_concrete(result, live_value);
     }
     ctx.heapcache_getarrayitem_now_known(block, index, descr_idx, result);
@@ -3459,8 +3449,7 @@ pub(crate) fn trace_float_block_getitem_value(
         return cached;
     }
     let result = ctx.record_op_with_descr(OpCode::GetarrayitemGcF, &[block, index], descr.clone());
-    let live_value = array_load_for_cache(ctx, block, index, &descr, majit_ir::Type::Float);
-    if !matches!(live_value, majit_ir::Value::Void) {
+    if let Some(live_value) = array_load_for_cache(ctx, block, index, &descr, majit_ir::Type::Float) {
         ctx.set_opref_concrete(result, live_value);
     }
     ctx.heapcache_getarrayitem_now_known(block, index, descr_idx, result);

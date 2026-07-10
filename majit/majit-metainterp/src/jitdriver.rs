@@ -4026,7 +4026,7 @@ impl<S: JitState> JitDriver<S> {
         vable_opref: OpRef,
         vable_struct_ptr: i64,
         fielddescr: DescrRef,
-    ) -> (OpRef, Value) {
+    ) -> (OpRef, Option<Value>) {
         self.meta
             .opimpl_getfield_vable_int(pc, vable_opref, vable_struct_ptr, fielddescr)
     }
@@ -4037,7 +4037,7 @@ impl<S: JitState> JitDriver<S> {
         vable_opref: OpRef,
         vable_struct_ptr: i64,
         fielddescr: DescrRef,
-    ) -> (OpRef, Value) {
+    ) -> (OpRef, Option<Value>) {
         self.meta
             .opimpl_getfield_vable_ref(pc, vable_opref, vable_struct_ptr, fielddescr)
     }
@@ -4048,7 +4048,7 @@ impl<S: JitState> JitDriver<S> {
         vable_opref: OpRef,
         vable_struct_ptr: i64,
         fielddescr: DescrRef,
-    ) -> (OpRef, Value) {
+    ) -> (OpRef, Option<Value>) {
         self.meta
             .opimpl_getfield_vable_float(pc, vable_opref, vable_struct_ptr, fielddescr)
     }

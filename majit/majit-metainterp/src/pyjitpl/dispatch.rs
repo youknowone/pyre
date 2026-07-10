@@ -2611,7 +2611,7 @@ where
                 let vable_struct_ptr = self.read_ref_reg(vable_reg).1;
                 let (opref, value) =
                     ctx.vable_getfield_int(opcode_pc, vable_opref, vable_struct_ptr, fielddescr);
-                self.set_int_reg(dest, Some(opref), Some(value_as_int_bits(value)));
+                self.set_int_reg(dest, Some(opref), value.map(value_as_int_bits));
             }
             jitcode::insns::BC_GETFIELD_VABLE_R => {
                 let (opcode_pc, vable_reg, field_idx, dest) = {
@@ -2628,7 +2628,7 @@ where
                 let vable_struct_ptr = self.read_ref_reg(vable_reg).1;
                 let (opref, value) =
                     ctx.vable_getfield_ref(opcode_pc, vable_opref, vable_struct_ptr, fielddescr);
-                self.set_ref_reg(dest, Some(opref), Some(value_as_ref_bits(value)));
+                self.set_ref_reg(dest, Some(opref), value.map(value_as_ref_bits));
             }
             jitcode::insns::BC_GETFIELD_VABLE_F => {
                 let (opcode_pc, vable_reg, field_idx, dest) = {
@@ -2645,7 +2645,7 @@ where
                 let vable_struct_ptr = self.read_ref_reg(vable_reg).1;
                 let (opref, value) =
                     ctx.vable_getfield_float(opcode_pc, vable_opref, vable_struct_ptr, fielddescr);
-                self.set_float_reg(dest, Some(opref), Some(value_as_float_bits(value)));
+                self.set_float_reg(dest, Some(opref), value.map(value_as_float_bits));
             }
             jitcode::insns::BC_NEW | jitcode::insns::BC_NEW_WITH_VTABLE => {
                 // blackhole.py:1301-1310 bhimpl_new / bhimpl_new_with_vtable.
@@ -3004,9 +3004,8 @@ where
                         // `currfieldbox.getint()` dispatch parity).
                         // `None` payload (entry seeded without a live
                         // concrete) skips the check.
-                        let cached_value = ctx.box_value(cached).unwrap_or(majit_ir::Value::Void);
-                        let expected = match cached_value {
-                            majit_ir::Value::Int(n) => Some(n),
+                        let expected = match ctx.box_value(cached) {
+                            Some(majit_ir::Value::Int(n)) => Some(n),
                             _ => None,
                         };
                         // Cache hit propagates the stale `tobox.getint()`

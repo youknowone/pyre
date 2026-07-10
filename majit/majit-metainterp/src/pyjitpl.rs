@@ -4265,7 +4265,7 @@ impl<M: Clone> MetaInterp<M> {
         vable_opref: OpRef,
         vable_struct_ptr: i64,
         fielddescr: DescrRef,
-    ) -> (OpRef, Value) {
+    ) -> (OpRef, Option<Value>) {
         self.tracing
             .as_mut()
             .expect("opimpl_getfield_vable_int requires active tracing")
@@ -4279,7 +4279,7 @@ impl<M: Clone> MetaInterp<M> {
         vable_opref: OpRef,
         vable_struct_ptr: i64,
         fielddescr: DescrRef,
-    ) -> (OpRef, Value) {
+    ) -> (OpRef, Option<Value>) {
         self.tracing
             .as_mut()
             .expect("opimpl_getfield_vable_ref requires active tracing")
@@ -4293,7 +4293,7 @@ impl<M: Clone> MetaInterp<M> {
         vable_opref: OpRef,
         vable_struct_ptr: i64,
         fielddescr: DescrRef,
-    ) -> (OpRef, Value) {
+    ) -> (OpRef, Option<Value>) {
         self.tracing
             .as_mut()
             .expect("opimpl_getfield_vable_float requires active tracing")

@@ -3387,18 +3387,17 @@ fn getarrayitem_gc_via_heapcache(
             if array_ptr != usize::MAX as i64 && array_ptr != 0 {
                 ctx.trace_ctx
                     .array_sanity_load(array_ptr, index_value, &descr, ty)
-                    .unwrap_or(majit_ir::Value::Void)
             } else {
-                majit_ir::Value::Void
+                None
             }
         } else {
-            majit_ir::Value::Void
+            None
         };
         // Stamp the loaded value as Box.value of the recorded result
         // (RPython `Box(value)` constructor analog) so subsequent
         // consumers see the runtime concrete instead of the
         // GcRef(usize::MAX) sentinel.
-        if !matches!(live_value, majit_ir::Value::Void) {
+        if let Some(live_value) = live_value {
             ctx.trace_ctx.set_opref_concrete(resbox, live_value);
         }
         ctx.trace_ctx
@@ -3812,20 +3811,18 @@ fn getfield_gc_via_heapcache(
         {
             let struct_ptr = struct_ref.0 as i64;
             if struct_ptr != usize::MAX as i64 && struct_ptr != 0 {
-                ctx.trace_ctx
-                    .field_sanity_load(struct_ptr, &descr, ty)
-                    .unwrap_or(majit_ir::Value::Void)
+                ctx.trace_ctx.field_sanity_load(struct_ptr, &descr, ty)
             } else {
-                majit_ir::Value::Void
+                None
             }
         } else {
-            majit_ir::Value::Void
+            None
         };
         // Stamp the loaded value as the Box.value of the recorded
         // result so subsequent reads (cache hits + non-Const
         // `concrete_of_opref` consumers) see the real runtime
         // concrete instead of the GcRef(usize::MAX) sentinel.
-        if !matches!(live_value, majit_ir::Value::Void) {
+        if let Some(live_value) = live_value {
             ctx.trace_ctx.set_opref_concrete(resbox, live_value);
         }
         ctx.trace_ctx
@@ -4028,12 +4025,11 @@ fn getfield_vable_via_metainterp(
     // `opref_concrete` so `concrete_of_opref(result)` honors the same
     // contract for downstream consumers (`goto_if_not/iL`,
     // `switch/id`, `int_*` arithmetic).  The non-standard heapcache
-    // path inside `vable_getfield_int` already does the same stamp
-    // (trace_ctx.rs:2384); the standard path returns the cached
-    // `(opref, value)` pair without stamping.  `Value::Void` means no
-    // live concrete is available for this slot — skip to match the
-    // heapcache path's gating.
-    if !matches!(shadow_value, Value::Void) {
+    // path inside `vable_getfield_int` already does the same stamp;
+    // the standard path returns the cached `(opref, value)` pair
+    // without stamping.  `None` means no live concrete is available
+    // for this slot — skip to match the heapcache path's gating.
+    if let Some(shadow_value) = shadow_value {
         ctx.trace_ctx.set_opref_concrete(result, shadow_value);
     }
     let dst = code[op.pc + 4] as usize;
@@ -29316,9 +29312,6 @@ mod tests {
         let descr_pool: Vec<DescrRef> = vec![make_fail_descr(0), descr];
         let frame_done = done_descr_ref_for_tests();
         let cached = tc.const_ref(0xCAFE_F00D);
-        let cached_payload = tc
-            .constants_get_value(cached)
-            .unwrap_or(majit_ir::Value::Void);
         tc.heapcache_getarrayitem_now_known(array, index, 1, cached);
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {

@@ -126,6 +126,17 @@ fn concrete_ptrs_eq(a: Option<&Value>, b: Option<&Value>) -> bool {
     }
 }
 
+/// Reinterpret a `virtualizable_values` shadow slot as an optional concrete.
+/// The shadow stores `Value::Void` in slots whose runtime concrete is not
+/// recorded; surface those as `None` so the vable-field read channel carries
+/// the "unknown" marker explicitly rather than a synthesized `Void`.
+fn concrete_shadow_value(value: Value) -> Option<Value> {
+    match value {
+        Value::Void => None,
+        v => Some(v),
+    }
+}
+
 /// pyjitpl.py:2989 box-with-type pair.
 ///
 /// RPython's `Box` carries type implicitly via Python class identity
@@ -2924,7 +2935,7 @@ impl TraceCtx {
         vable_opref: OpRef,
         vable_struct_ptr: i64,
         fielddescr: DescrRef,
-    ) -> (OpRef, Value) {
+    ) -> (OpRef, Option<Value>) {
         let concrete = self.concrete_of_opref(vable_opref);
         if self.is_nonstandard_virtualizable(pc, vable_opref, &fielddescr, concrete) {
             // self.opimpl_getfield_gc_i(box, fielddescr) →
@@ -2939,9 +2950,9 @@ impl TraceCtx {
                 // const pool, standard-virtualizable shadow, and
                 // the frontend object's `value` field (RPython
                 // `currfieldbox.getXXX()` dispatch parity).
-                let cached_value = self.box_value(cached).unwrap_or(Value::Void);
+                let cached_value = self.box_value(cached);
                 let expected_int = match cached_value {
-                    Value::Int(n) => Some(n),
+                    Some(Value::Int(n)) => Some(n),
                     _ => None,
                 };
                 if let Some(cached_int) = expected_int {
@@ -2980,12 +2991,11 @@ impl TraceCtx {
             } else {
                 None
             };
-            let live_value = live.unwrap_or(Value::Void);
-            if !matches!(live_value, Value::Void) {
+            if let Some(live_value) = live {
                 self.set_opref_concrete(op, live_value);
             }
             self.heapcache_getfield_now_known(vable_opref, field_index, op);
-            return (op, live_value);
+            return (op, live);
         }
         // self.metainterp.check_synchronized_virtualizable() — no-op in pyre.
         // index = self._get_virtualizable_field_index(fielddescr)
@@ -2995,13 +3005,13 @@ impl TraceCtx {
             .as_ref()
             .and_then(|info| info.static_field_by_descr(&fielddescr));
         if let Some(idx) = index {
-            if let Some(entry) = self.virtualizable_entry_at(idx) {
-                return entry;
+            if let Some((op, value)) = self.virtualizable_entry_at(idx) {
+                return (op, concrete_shadow_value(value));
             }
         }
         // Fallback for tests/missing layout
         let op = self.record_op_with_descr(OpCode::GetfieldGcI, &[vable_opref], fielddescr);
-        (op, Value::Void)
+        (op, None)
     }
 
     /// Record a virtualizable field read with an explicit field descriptor.
@@ -3224,7 +3234,7 @@ impl TraceCtx {
         vable_opref: OpRef,
         vable_struct_ptr: i64,
         fielddescr: DescrRef,
-    ) -> (OpRef, Value) {
+    ) -> (OpRef, Option<Value>) {
         let concrete = self.concrete_of_opref(vable_opref);
         if self.is_nonstandard_virtualizable(pc, vable_opref, &fielddescr, concrete) {
             // self.opimpl_getfield_gc_r(box, fielddescr) →
@@ -3238,9 +3248,9 @@ impl TraceCtx {
                 // `currfieldbox.getref_base()` payload through the
                 // full chain (const pool, standard-virtualizable
                 // shadow, the frontend object's `value` field).
-                let cached_value = self.box_value(cached).unwrap_or(Value::Void);
+                let cached_value = self.box_value(cached);
                 let expected_ref = match cached_value {
-                    Value::Ref(r) => Some(r),
+                    Some(Value::Ref(r)) => Some(r),
                     _ => None,
                 };
                 if let Some(cached_ref) = expected_ref {
@@ -3276,24 +3286,23 @@ impl TraceCtx {
             } else {
                 None
             };
-            let live_value = live.unwrap_or(Value::Void);
-            if !matches!(live_value, Value::Void) {
+            if let Some(live_value) = live {
                 self.set_opref_concrete(op, live_value);
             }
             self.heapcache_getfield_now_known(vable_opref, field_index, op);
-            return (op, live_value);
+            return (op, live);
         }
         let index = self
             .virtualizable_info
             .as_ref()
             .and_then(|info| info.static_field_by_descr(&fielddescr));
         if let Some(idx) = index {
-            if let Some(entry) = self.virtualizable_entry_at(idx) {
-                return entry;
+            if let Some((op, value)) = self.virtualizable_entry_at(idx) {
+                return (op, concrete_shadow_value(value));
             }
         }
         let op = self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], fielddescr);
-        (op, Value::Void)
+        (op, None)
     }
 
     /// Record a virtualizable ref field read with an explicit field descriptor.
@@ -3317,7 +3326,7 @@ impl TraceCtx {
         vable_opref: OpRef,
         vable_struct_ptr: i64,
         fielddescr: DescrRef,
-    ) -> (OpRef, Value) {
+    ) -> (OpRef, Option<Value>) {
         let concrete = self.concrete_of_opref(vable_opref);
         if self.is_nonstandard_virtualizable(pc, vable_opref, &fielddescr, concrete) {
             // self.opimpl_getfield_gc_f(box, fielddescr) →
@@ -3333,9 +3342,9 @@ impl TraceCtx {
                 // Value::Eq for Float uses to_bits — bit-identical.
                 // `box_value(cached)` resolves the upstream
                 // `currfieldbox.constbox()` payload.
-                let cached_value = self.box_value(cached).unwrap_or(Value::Void);
+                let cached_value = self.box_value(cached);
                 let expected_float = match cached_value {
-                    Value::Float(f) => Some(f),
+                    Some(Value::Float(f)) => Some(f),
                     _ => None,
                 };
                 if let Some(cached_float) = expected_float {
@@ -3370,24 +3379,23 @@ impl TraceCtx {
             } else {
                 None
             };
-            let live_value = live.unwrap_or(Value::Void);
-            if !matches!(live_value, Value::Void) {
+            if let Some(live_value) = live {
                 self.set_opref_concrete(op, live_value);
             }
             self.heapcache_getfield_now_known(vable_opref, field_index, op);
-            return (op, live_value);
+            return (op, live);
         }
         let index = self
             .virtualizable_info
             .as_ref()
             .and_then(|info| info.static_field_by_descr(&fielddescr));
         if let Some(idx) = index {
-            if let Some(entry) = self.virtualizable_entry_at(idx) {
-                return entry;
+            if let Some((op, value)) = self.virtualizable_entry_at(idx) {
+                return (op, concrete_shadow_value(value));
             }
         }
         let op = self.record_op_with_descr(OpCode::GetfieldGcF, &[vable_opref], fielddescr);
-        (op, Value::Void)
+        (op, None)
     }
 
     /// Standard virtualizable array item read (int).
@@ -3712,9 +3720,8 @@ impl TraceCtx {
                 // `currfieldbox.getref_base()` payload through the
                 // full chain (const pool, standard-virtualizable
                 // shadow, the frontend object's `value` field).
-                let cached_value = self.box_value(cached).unwrap_or(Value::Void);
-                let expected_ref = match cached_value {
-                    Value::Ref(r) => Some(r),
+                let expected_ref = match self.box_value(cached) {
+                    Some(Value::Ref(r)) => Some(r),
                     _ => None,
                 };
                 if let Some(cached_ref) = expected_ref {
@@ -3747,8 +3754,7 @@ impl TraceCtx {
                 } else {
                     None
                 };
-                let live_value = live.unwrap_or(Value::Void);
-                if !matches!(live_value, Value::Void) {
+                if let Some(live_value) = live {
                     self.set_opref_concrete(op, live_value);
                 }
                 self.heapcache_getfield_now_known(vable_opref, f_index, op);

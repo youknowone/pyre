@@ -329,14 +329,13 @@ pub fn generated_binary_float_value(
                     let struct_ptr = struct_ref.0 as i64;
                     if struct_ptr != usize::MAX as i64 && struct_ptr != 0 {
                         ctx.field_sanity_load(struct_ptr, &ff_descr, majit_ir::Type::Float)
-                            .unwrap_or(majit_ir::Value::Void)
                     } else {
-                        majit_ir::Value::Void
+                        None
                     }
                 } else {
-                    majit_ir::Value::Void
+                    None
                 };
-                if !matches!(live_value, majit_ir::Value::Void) {
+                if let Some(live_value) = live_value {
                     ctx.set_opref_concrete(r, live_value);
                 }
                 ctx.heapcache_getfield_now_known(obj, ff_idx, r);
