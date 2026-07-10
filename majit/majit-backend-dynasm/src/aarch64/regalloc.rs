@@ -32,7 +32,7 @@ fn check_imm_box(arg: OpRef) -> bool {
 }
 
 /// aarch64/registers.py:14
-///   `all_regs = registers[:14] + [x19, x20] #, x21, x22]`
+///   `all_regs = registers[:14] + [x19, x20, x21, x22]`
 pub fn all_core_regs() -> Vec<RegLoc> {
     registers::ALL_REGS.to_vec()
 }
@@ -74,12 +74,14 @@ pub fn call_result_fpr() -> RegLoc {
 /// `all_core_regs` list — used by gcmap and jitframe slot tables.
 ///
 /// aarch64 mapping (matches `all_core_regs`):
-///   x0..x13 → 0..13, x19 → 14, x20 → 15.
+///   x0..x13 → 0..13, x19 → 14, x20 → 15, x21 → 16, x22 → 17.
 pub fn core_reg_index(reg: RegLoc) -> Option<usize> {
     match reg.value {
         0..=13 => Some(reg.value as usize),
         19 => Some(14),
         20 => Some(15),
+        21 => Some(16),
+        22 => Some(17),
         _ => None,
     }
 }

@@ -94,9 +94,14 @@ pub const VFPREGISTERS: [RegLoc; 32] = [
 /// registers.py:13 `all_vfp_regs = vfpregisters[:8]`
 pub const ALL_VFP_REGS: [RegLoc; 8] = [D0, D1, D2, D3, D4, D5, D6, D7];
 
-/// registers.py:14 `all_regs = registers[:14] + [x19, x20] #, x21, x22]`
-pub const ALL_REGS: [RegLoc; 16] = [
-    X0, X1, X2, X3, X4, X5, X6, X7, X8, X9, X10, X11, X12, X13, X19, X20,
+/// registers.py:14 `all_regs = registers[:14] + [x19, x20, x21, x22]`
+///
+/// Upstream leaves x21, x22 commented out as the contemplated
+/// extension (`registers[:14] + [x19, x20] #, x21, x22]`); pyre enables
+/// exactly that pair so loop-carried values survive residual calls
+/// without spilling to the jitframe.
+pub const ALL_REGS: [RegLoc; 18] = [
+    X0, X1, X2, X3, X4, X5, X6, X7, X8, X9, X10, X11, X12, X13, X19, X20, X21, X22,
 ];
 
 /// registers.py:16 `lr = x30`
@@ -117,8 +122,9 @@ pub const IP2: RegLoc = X15;
 /// registers.py:24 `ip3 = x14`
 pub const IP3: RegLoc = X14;
 
-/// registers.py:26 `callee_saved_registers = [x19, x20] # , x21, x22]`
-pub const CALLEE_SAVED_REGISTERS: [RegLoc; 2] = [X19, X20];
+/// registers.py:26 `callee_saved_registers = [x19, x20, x21, x22]`
+/// (upstream contemplates x21, x22 as a commented extension; enabled here).
+pub const CALLEE_SAVED_REGISTERS: [RegLoc; 4] = [X19, X20, X21, X22];
 
 /// registers.py:27 `vfp_argument_regs = caller_vfp_resp = all_vfp_regs[:8]`
 pub const VFP_ARGUMENT_REGS: [RegLoc; 8] = ALL_VFP_REGS;
@@ -130,8 +136,8 @@ pub const VFP_IP: RegLoc = D15;
 /// registers.py:34 `argument_regs = [x0, x1, x2, x3, x4, x5, x6, x7]`
 pub const ARGUMENT_REGS: [RegLoc; 8] = [X0, X1, X2, X3, X4, X5, X6, X7];
 
-/// registers.py:35 `callee_resp = [x19, x20] # ,x21, x22]`
-pub const CALLEE_RESP: [RegLoc; 2] = CALLEE_SAVED_REGISTERS;
+/// registers.py:35 `callee_resp = [x19, x20, x21, x22]`
+pub const CALLEE_RESP: [RegLoc; 4] = CALLEE_SAVED_REGISTERS;
 
 /// registers.py:36 `caller_resp = argument_regs + [x8, x9, x10, x11, x12, x13]`
 pub const CALLER_RESP: [RegLoc; 14] = [X0, X1, X2, X3, X4, X5, X6, X7, X8, X9, X10, X11, X12, X13];

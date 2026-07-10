@@ -31,7 +31,7 @@ use crate::regalloc::{RegAlloc, RegAllocOp};
 use crate::regloc::{Loc, RegLoc};
 use crate::runner::GuardGcTypeInfo;
 
-const AARCH64_GEN_REGS: [crate::regloc::RegLoc; 16] = crate::aarch64::registers::ALL_REGS;
+const AARCH64_GEN_REGS: [crate::regloc::RegLoc; 18] = crate::aarch64::registers::ALL_REGS;
 
 const AARCH64_FLOAT_REGS: [crate::regloc::RegLoc; 8] = crate::aarch64::registers::ALL_VFP_REGS;
 
@@ -1232,9 +1232,9 @@ impl<'a> AssemblerARM64<'a> {
     /// x64: System V AMD64 ABI — first arg (jf_ptr) in RDI.
     /// aarch64: AAPCS64 — first arg (jf_ptr) in X0.
     ///
-    /// Save slots: 32 bytes total (fp/lr at [sp,#0], x19/x20 at
-    /// [sp,#16]).  Mirrors aarch64/assembler.py:1117-1122 which
-    /// iterates `r.callee_saved_registers = [x19, x20]`.
+    /// Save slots: 48 bytes total (fp/lr at [sp,#0], x19/x20 at
+    /// [sp,#16], x21/x22 at [sp,#32]).  Mirrors aarch64/assembler.py:1117-1122
+    /// which iterates `r.callee_saved_registers = [x19, x20, x21, x22]`.
     ///
     /// aarch64/assembler.py:1092-1114 `_call_header_with_stack_check`:
     /// inline SP probe right after the frame pointer is captured,
@@ -1262,8 +1262,9 @@ impl<'a> AssemblerARM64<'a> {
     /// ```
     fn _call_header(&mut self, inputargs: &[InputArg]) {
         dynasm!(self.mc ; .arch aarch64
-            ; stp x29, x30, [sp, #-32]!
+            ; stp x29, x30, [sp, #-48]!
             ; stp x19, x20, [sp, #16]   // save callee-saved regs
+            ; stp x21, x22, [sp, #32]   // save callee-saved regs
             ; mov x29, x0
         );
         let propagate_descr = self.propagate_exception_descr_ptr();
@@ -1312,7 +1313,8 @@ impl<'a> AssemblerARM64<'a> {
                     // Overflow fallthrough: return x29 as jf_ptr.
                     ; mov x0, x29
                     ; ldp x19, x20, [sp, #16]
-                    ; ldp x29, x30, [sp], #32
+                    ; ldp x21, x22, [sp, #32]
+                    ; ldp x29, x30, [sp], #48
                     ; ret
                     ; =>continue_label
                 );
@@ -1334,7 +1336,8 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; mov x0, x29
             ; ldp x19, x20, [sp, #16]   // restore callee-saved regs
-            ; ldp x29, x30, [sp], #32
+            ; ldp x21, x22, [sp, #32]   // restore callee-saved regs
+            ; ldp x29, x30, [sp], #48
             ; ret
         );
     }
@@ -5922,7 +5925,7 @@ impl<'a> AssemblerARM64<'a> {
         // live Ref into its canonical jitframe slot. `gcmap` identifies
         // those slots by the same register-index table that
         // `get_gcmap` writes bits from (`core_reg_index`:
-        //   x0..x13 → slots 0..13, x19 → 14, x20 → 15).
+        //   x0..x13 → slots 0..13, x19 → 14, x20 → 15, x21 → 16, x22 → 17).
         //
         // Without this spill the GC walks `jf_frame` slots 0..15 (per
         // gcmap bits), finds garbage, and returns with live Refs in CPU
@@ -5939,7 +5942,7 @@ impl<'a> AssemblerARM64<'a> {
         // the malloc site (see `MALLOC_NURSERY_CLOBBER`).
         dynasm!(self.mc ; .arch aarch64 ; =>slow_path);
         let base_ofs = crate::jitframe::FIRST_ITEM_OFFSET as i32;
-        // Save x2..x13 to slots 2..13 (x0/x1 excluded per ignored_regs).
+        // Save x2..x13, x19..x22 to their slots (x0/x1 excluded per ignored_regs).
         dynasm!(self.mc ; .arch aarch64
             ; stp x2, x3, [x29, base_ofs + 2 * 8]
             ; stp x4, x5, [x29, base_ofs + 4 * 8]
@@ -5948,6 +5951,7 @@ impl<'a> AssemblerARM64<'a> {
             ; stp x10, x11, [x29, base_ofs + 10 * 8]
             ; stp x12, x13, [x29, base_ofs + 12 * 8]
             ; stp x19, x20, [x29, base_ofs + 14 * 8]
+            ; stp x21, x22, [x29, base_ofs + 16 * 8]
         );
         // assembler.py:649-650: store gcmap to jf_gcmap so the collector
         // can trace live Refs pinned to frame slots during the slow-path
@@ -5969,7 +5973,7 @@ impl<'a> AssemblerARM64<'a> {
         // pop_gcmap: clear jf_gcmap after collecting call
         let gcmap_ofs = crate::jitframe::JF_GCMAP_OFS as u32;
         dynasm!(self.mc ; .arch aarch64 ; str xzr, [x29, gcmap_ofs]);
-        // Restore x2..x13, x19, x20 from jitframe slots (GC may have
+        // Restore x2..x13, x19..x22 from jitframe slots (GC may have
         // updated the stored pointers). x0 keeps the allocated payload ptr.
         let base_ofs_r = crate::jitframe::FIRST_ITEM_OFFSET as i32;
         dynasm!(self.mc ; .arch aarch64
@@ -5980,6 +5984,7 @@ impl<'a> AssemblerARM64<'a> {
             ; ldp x10, x11, [x29, base_ofs_r + 10 * 8]
             ; ldp x12, x13, [x29, base_ofs_r + 12 * 8]
             ; ldp x19, x20, [x29, base_ofs_r + 14 * 8]
+            ; ldp x21, x22, [x29, base_ofs_r + 16 * 8]
         );
         // `dynasm_nursery_slowpath` returns x0 = 0 on real host OOM
         // (calloc failure preserved as NULL per runner.rs).  Route
