@@ -1882,6 +1882,179 @@ fn loop_body_has_abort_permanent(w_code: *const ()) -> bool {
     false
 }
 
+/// True when the hot loop body in `w_code` inline-calls — transitively — a
+/// user function whose per-fn jitcode body carries an `abort_permanent`
+/// marker.
+///
+/// [`loop_body_has_abort_permanent`] only scans the top-level per-CodeObject
+/// jitcode, so an `abort_permanent` reached through an inlined callee slips
+/// past it.  That gap causes a walk-time double-apply: a non-journaled
+/// concrete heap store (dict/attr/set item, list `extend`, …) in the loop
+/// body executes concretely, then an inline-eligible user CALL later in the
+/// same body is inline-attempted; the callee sub-walk hits `abort_permanent`
+/// and routes the whole walk to abort; the epilogue rolls back the store
+/// journal and REPLAYS FROM LOOP ENTRY, so the non-journaled store — which
+/// the journal never captured — re-executes and the loop over-counts (e.g.
+/// `300001` instead of `300000`).  Declining the walk up front, before it
+/// executes anything, avoids the double-apply: the location re-interprets
+/// without JIT (correct, at interpreter speed).
+///
+/// This is an OVER-DECLINING stopgap, and static: it can decline on a
+/// function merely referenced by the loop (present in `co_names`/locals),
+/// not just one the executed path actually calls.  A hot loop that calls any
+/// helper whose body contains an unported op (`match`, `async`,
+/// chained-compare `SWAP`, …) — even on a rarely taken path — now runs
+/// interpreted in full, not just the aborting call.  The orthodox mechanism
+/// has no up-front scan at all: an unsupported op raises `SwitchToBlackhole`
+/// mid-trace and `run_blackhole_interp_to_cancel_tracing`
+/// (pyjitpl.py:2949) converts the live framestack and continues FORWARD in
+/// the blackhole interpreter, so nothing replays and nothing double-applies.
+/// This decline holds until that forward-resume convergence (#126/#215) lets
+/// an inlined-callee abort resume the outer walk in place instead of rolling
+/// back to loop entry.
+///
+/// The scan resolves candidate callees CONCRETELY from the live frame (the
+/// walk has not run yet, so no store has executed).  Two seed sources:
+/// - the frame's module globals — every referenced name in the CodeObject's
+///   `co_names` is looked up in `w_globals`;
+/// - the ROOT frame's fastlocals + closure cells — a helper passed as an
+///   argument/local (`h([i, i])`) or held in a closure cell resolves here.
+///
+/// Each plain-function value's per-fn jitcode body is scanned end-to-end for
+/// `abort_permanent` (the marker can sit at any pc, ahead of the callee's own
+/// merge point).  Non-aborting callees are enqueued and their own referenced
+/// functions scanned transitively through THEIR globals, guarded by a
+/// scan-local visited set.  The root `w_code` is pre-marked visited — its own
+/// loop-body marker is already handled by [`loop_body_has_abort_permanent`].
+///
+/// Frame-local seeding is ROOT-frame only; a deeper (not-yet-pushed) callee's
+/// locals are not available up front.  Callees reached via attribute access,
+/// container elements, or another call's return value, and callees local to a
+/// deeper frame, stay unresolvable before the walk — those rely on the
+/// deferred #126/#215 forward-resume convergence rather than this stopgap.
+fn loop_inlines_abort_permanent_callee(w_code: *const (), cf_addr: usize) -> bool {
+    // Gate: only scan when the top-level loop body (ops after the first
+    // `jit_merge_point`) contains a `residual_call*` op.  Every inline-eligible
+    // user call lowers to a residual_call, so a call-free loop cannot
+    // inline-abort — skipping it avoids resolving globals for the common case.
+    let Some(pjc) = crate::state::pyjitcode_for_code(w_code) else {
+        return false;
+    };
+    let mut seen_merge_point = false;
+    let mut has_residual_call = false;
+    for op in crate::jitcode_runtime::decoded_ops(pjc.jitcode.code.as_slice()) {
+        if op.opname == "jit_merge_point" {
+            seen_merge_point = true;
+        } else if seen_merge_point && op.opname.starts_with("residual_call") {
+            has_residual_call = true;
+            break;
+        }
+    }
+    if !has_residual_call || cf_addr == 0 {
+        return false;
+    }
+
+    // Process one concrete candidate value shared by both seed paths (globals
+    // and frame slots): gate it to a plain user function, scan its whole
+    // jitcode body for `abort_permanent`, and otherwise enqueue it for
+    // transitive resolution through its own globals.  Returns `true` iff the
+    // candidate's body carries the marker.
+    //
+    // SAFETY: `cand` is a live concrete `PyObjectRef` read from the frame or a
+    // module dict before the walk mutates anything.
+    unsafe fn consider_candidate(
+        cand: pyre_object::PyObjectRef,
+        function_type_addr: usize,
+        visited: &mut std::collections::HashSet<*const ()>,
+        queue: &mut std::collections::VecDeque<(*const (), pyre_object::PyObjectRef)>,
+    ) -> bool {
+        // Only plain user functions inline (mirrors the inline path's exact
+        // FUNCTION_TYPE gate); builtins carry no CodeObject.
+        if cand.is_null() || (*cand).ob_type as *const () as usize != function_type_addr {
+            return false;
+        }
+        let callee_w_code = pyre_interpreter::function_get_code(cand);
+        if callee_w_code.is_null() || !visited.insert(callee_w_code) {
+            return false;
+        }
+        if let Some(body) = crate::state::sub_jitcode_body_for_code(callee_w_code) {
+            for op in crate::jitcode_runtime::decoded_ops(body.code) {
+                if op.opname == "abort_permanent" {
+                    return true;
+                }
+            }
+        }
+        // Transitive: resolve this callee's own referenced functions in its own
+        // globals.
+        let callee_globals = pyre_interpreter::function_get_globals_obj(cand);
+        if !callee_globals.is_null() {
+            queue.push_back((callee_w_code, callee_globals));
+        }
+        false
+    }
+
+    // SAFETY: `cf_addr` is the live `PyFrame` pointer the portal passed to the
+    // walk; its `w_globals` is the module dict and its locals/cells region is
+    // initialised.  All callee resolution reads live concrete objects before
+    // the walk mutates anything.
+    unsafe {
+        let cf = &*(cf_addr as *const pyre_interpreter::pyframe::PyFrame);
+        let root_globals = cf.w_globals;
+        if root_globals.is_null() {
+            return false;
+        }
+        let function_type_addr = &pyre_interpreter::FUNCTION_TYPE as *const _ as usize;
+        let mut visited: std::collections::HashSet<*const ()> = std::collections::HashSet::new();
+        // The root's own loop-body `abort_permanent` is handled upstream.
+        visited.insert(w_code);
+        // BFS over (code wrapper ptr, globals in which its `co_names` resolve).
+        let mut queue: std::collections::VecDeque<(*const (), pyre_object::PyObjectRef)> =
+            std::collections::VecDeque::new();
+        queue.push_back((w_code, root_globals));
+
+        // Seed from the root frame's fastlocals + closure cells: a helper
+        // passed as an argument/local or held in a cell is not in `co_names`,
+        // so resolve it directly from the frame's initialised locals/cells
+        // region.  Stop at `stack_base()` — operand-stack slots beyond it are
+        // uninitialised.
+        let slots = cf.locals_w().as_slice();
+        let bound = cf.stack_base().min(slots.len());
+        for &slot in &slots[..bound] {
+            if slot.is_null() {
+                continue;
+            }
+            // A closure cell holds the function indirectly; unwrap it.
+            let value = if pyre_object::is_cell(slot) {
+                pyre_object::w_cell_get(slot)
+            } else {
+                slot
+            };
+            if consider_candidate(value, function_type_addr, &mut visited, &mut queue) {
+                return true;
+            }
+        }
+
+        while let Some((code_ptr, globals)) = queue.pop_front() {
+            let raw = pyre_interpreter::w_code_get_ptr(code_ptr as pyre_object::PyObjectRef)
+                as *const CodeObject;
+            if raw.is_null() {
+                continue;
+            }
+            for name in (*raw).names.iter() {
+                let Some(cand) =
+                    pyre_object::dictmultiobject::w_dict_getitem_str(globals, name.as_str())
+                else {
+                    continue;
+                };
+                if consider_candidate(cand, function_type_addr, &mut visited, &mut queue) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Issue #73 production full-body tracer (Phase 5 flip, gated).
 ///
 /// `PYRE_FULL_BODY_WALK=1` drives the per-CodeObject JitCode body via
@@ -1917,6 +2090,17 @@ fn full_body_walk_trace(
         // (`Trait::DeclinedAbort`).  Without this the real declining class is
         // invisible to the census.
         crate::jitcode_dispatch::census_record("FullBodyWalk::LoopBodyAbortPermanent");
+        fbw_decline(crate::driver::make_green_key(w_code, start_pc));
+        return TraceAction::Abort;
+    }
+    // Sibling defense to the above, transitively through inlined callees: a
+    // non-journaled concrete store in the loop body followed by an
+    // inline-eligible CALL whose callee body carries `abort_permanent` would
+    // abort the walk, roll back the store journal, and replay from loop entry
+    // — re-executing the non-journaled store.  Decline up front, before the
+    // walk runs anything.  (See `loop_inlines_abort_permanent_callee`.)
+    if loop_inlines_abort_permanent_callee(w_code, cf_addr) {
+        crate::jitcode_dispatch::census_record("FullBodyWalk::CalleeAbortPermanent");
         fbw_decline(crate::driver::make_green_key(w_code, start_pc));
         return TraceAction::Abort;
     }
