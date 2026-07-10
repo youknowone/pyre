@@ -4422,7 +4422,7 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
             for w_metaclass in w_metaclasses.iter().flatten() {
                 let w_metaclass = *w_metaclass;
                 if is_type(w_metaclass) {
-                    if let Some((src, descr)) = lookup_where(w_metaclass, name) {
+                    if let Some((src, descr)) = lookup_where_pair(w_metaclass, name) {
                         if !std::ptr::eq(src, w_type_type)
                             && !std::ptr::eq(src, w_object)
                             && is_data_descr(descr)
@@ -5932,6 +5932,46 @@ pub(crate) unsafe fn lookup_in_type_where_uncached(
     lookup_where(w_type, name).map(|(_src, value)| value)
 }
 
+/// `lookup_where` *defining-class* projection — the `dont_look_inside`
+/// companion of [`lookup_in_type_where_uncached`] returning the `w_class`
+/// half (`(w_class, w_value).0`) of the same MRO walk, for the callers that
+/// need the class that defines the descriptor (a `src`-guard against `type`
+/// / `object` / a builtin base).
+///
+/// `dont_look_inside` for the same reason as the value projection: the
+/// `mro` binding in [`lookup_where`] phi-merges the cached `&*mro` slice
+/// against the freshly computed opaque [`compute_mro`] `Vec` borrow, a
+/// union the annotator cannot model (`<other> ∪ _ptr`).  [`lookup_where`]'s
+/// 2-tuple return exceeds the single-register residual ABI, so the two
+/// halves are exposed as two single-`Option` residuals over the same
+/// deterministic, side-effect-free lookup; a caller that needs both rebuilds
+/// the pair via [`lookup_where_pair`].  Marker `_jit_look_inside_ = False`
+/// (rlib/jit.py:139).
+#[majit_macros::dont_look_inside]
+pub(crate) unsafe fn lookup_where_class_uncached(
+    w_type: PyObjectRef,
+    name: &str,
+) -> Option<PyObjectRef> {
+    lookup_where(w_type, name).map(|(src, _value)| src)
+}
+
+/// Rebuild the `(w_class, w_value)` pair of [`lookup_where`] from its two
+/// single-register `dont_look_inside` projections
+/// ([`lookup_where_class_uncached`] and [`lookup_in_type_where_uncached`]),
+/// for the callers that need both halves.  The projections run over the same
+/// deterministic MRO walk, so the reconstructed pair is identical to the raw
+/// `lookup_where` result; the value half decides presence (`None` when the
+/// name is absent), so the class half is only fetched on a hit.  Keeping the
+/// raw walk behind the two residuals contains its `<other> ∪ _ptr` phi-merge.
+pub(crate) unsafe fn lookup_where_pair(
+    w_type: PyObjectRef,
+    name: &str,
+) -> Option<(PyObjectRef, PyObjectRef)> {
+    let value = lookup_in_type_where_uncached(w_type, name)?;
+    let class = lookup_where_class_uncached(w_type, name)?;
+    Some((class, value))
+}
+
 /// WTF-8 keyed MRO attribute lookup — surrogate-safe sibling of
 /// `lookup_in_type` / `lookup_in_type_where`.  A lone-surrogate name
 /// can only live in a class namespace's `DictStorage` (never as a
@@ -6133,7 +6173,8 @@ unsafe fn _cached_lookup_where(
     if let Some(tup) = hit {
         return tup;
     }
-    let tup = lookup_where(w_type, name).unwrap_or((std::ptr::null_mut(), std::ptr::null_mut()));
+    let tup =
+        lookup_where_pair(w_type, name).unwrap_or((std::ptr::null_mut(), std::ptr::null_mut()));
     // Prebuilt-family store: the cache slot is reached only by
     // `walk_method_cache_gc`, skipped on clean minor collections.
     pyre_object::gc_roots::mark_prebuilt_roots_dirty();
@@ -6187,7 +6228,7 @@ pub(crate) unsafe fn lookup_where_with_method_cache(
     name: &str,
 ) -> Option<(PyObjectRef, PyObjectRef)> {
     if w_type.is_null() || !is_type(w_type) {
-        return lookup_where(w_type, name);
+        return lookup_where_pair(w_type, name);
     }
     // typeobject.py:505 — `promote(self)`.
     let _ = majit_metainterp::jit::promote(w_type);
@@ -6197,7 +6238,7 @@ pub(crate) unsafe fn lookup_where_with_method_cache(
     let version_tag = w_type_version_tag(w_type);
     if version_tag == 0 {
         // typeobject.py:507-509 — no version tag: uncacheable.
-        return lookup_where(w_type, name);
+        return lookup_where_pair(w_type, name);
     }
     // typeobject.py:510-511 — `w_class, w_value =
     // self._pure_lookup_where_with_method_cache(name, version_tag)`.  The
@@ -9361,7 +9402,7 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         // storage iterator to avoid an infinite recursion.
         if is_list(obj) {
             if !pyre_object::is_exact_list(obj) {
-                if let Some((src, method)) = lookup_where((*obj).w_class, "__iter__") {
+                if let Some((src, method)) = lookup_where_pair((*obj).w_class, "__iter__") {
                     if !std::ptr::eq(src, pyre_object::get_instantiate(&pyre_object::LIST_TYPE)) {
                         // descroperation.py:339-341 — an explicit
                         // `__iter__ = None` override marks the subclass
@@ -9381,7 +9422,7 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         }
         if is_tuple(obj) {
             if !pyre_object::is_exact_tuple(obj) {
-                if let Some((src, method)) = lookup_where((*obj).w_class, "__iter__") {
+                if let Some((src, method)) = lookup_where_pair((*obj).w_class, "__iter__") {
                     if !std::ptr::eq(src, pyre_object::get_instantiate(&pyre_object::TUPLE_TYPE)) {
                         // descroperation.py:339-341 — an explicit
                         // `__iter__ = None` override marks the subclass

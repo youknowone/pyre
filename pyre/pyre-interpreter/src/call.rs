@@ -882,14 +882,18 @@ fn metaclass_call_override(callable: PyObjectRef) -> Option<PyObjectRef> {
     if std::ptr::eq(metaclass, crate::typedef::w_type()) {
         return None;
     }
-    // Resolve __call__ AND where it is defined; the default `type.__call__`
+    // Resolve WHERE `__call__` is defined first; the default `type.__call__`
     // (the implicit instantiation path) is not an override, so a metaclass
-    // that merely inherits it — e.g. ABCMeta — keeps the fast path.
-    let (where_defined, call_descr) =
-        unsafe { crate::baseobjspace::lookup_where(metaclass, "__call__") }?;
+    // that merely inherits it — e.g. ABCMeta — keeps the fast path.  The
+    // defining-class half is the cheap guard, so it runs before the value
+    // half's second residual walk (avoided on the common fast path).
+    let where_defined =
+        unsafe { crate::baseobjspace::lookup_where_class_uncached(metaclass, "__call__") }?;
     if std::ptr::eq(where_defined, crate::typedef::w_type()) {
         return None;
     }
+    let call_descr =
+        unsafe { crate::baseobjspace::lookup_in_type_where_uncached(metaclass, "__call__") }?;
     let bound = unsafe { crate::baseobjspace::get(call_descr, callable, metaclass) }
         .ok()
         .flatten()

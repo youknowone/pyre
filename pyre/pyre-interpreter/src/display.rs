@@ -59,7 +59,7 @@ pub(crate) unsafe fn try_call_dunder_obj_above_object(
         let Some(w_type) = crate::typedef::r#type(obj) else {
             return Ok(None);
         };
-        let Some((src, method)) = crate::baseobjspace::lookup_where(w_type, name) else {
+        let Some((src, method)) = crate::baseobjspace::lookup_where_pair(w_type, name) else {
             return Ok(None);
         };
         if method.is_null() || std::ptr::eq(src, crate::typedef::w_object()) {
@@ -385,7 +385,7 @@ unsafe fn exc_user_dunder_obj(obj: PyObjectRef, name: &str) -> Option<PyObjectRe
         if w_class.is_null() || !pyre_object::is_type(w_class) {
             return None;
         }
-        let (src, method) = crate::baseobjspace::lookup_where(w_class, name)?;
+        let (src, method) = crate::baseobjspace::lookup_where_pair(w_class, name)?;
         if method.is_null() || std::ptr::eq(src, crate::typedef::w_object()) {
             return None;
         }
