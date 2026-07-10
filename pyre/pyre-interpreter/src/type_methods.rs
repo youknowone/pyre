@@ -169,6 +169,19 @@ pub(crate) fn arity_no_args(args: &[PyObjectRef], name: &str) -> Result<(), crat
     Ok(())
 }
 
+/// TypeError for the ternary-power slot (`__pow__` / `__rpow__`), which
+/// accepts one or two positional arguments after the receiver — the
+/// "expected 1 or 2 arguments, got M" form with no method name.
+pub(crate) fn arity_pow(args: &[PyObjectRef]) -> Result<(), crate::PyError> {
+    let extra = args.len().saturating_sub(1);
+    if !(1..=2).contains(&extra) {
+        return Err(crate::PyError::type_error(format!(
+            "expected 1 or 2 arguments, got {extra}"
+        )));
+    }
+    Ok(())
+}
+
 /// TypeError for an unbound method descriptor invoked with no receiver
 /// (`list.append()` with zero arguments) — `args` is empty.
 pub(crate) fn require_receiver(args: &[PyObjectRef], name: &str) -> Result<(), crate::PyError> {
