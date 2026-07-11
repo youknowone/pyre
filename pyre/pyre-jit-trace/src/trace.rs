@@ -600,19 +600,24 @@ fn dispatch_perfn_frame(
 }
 
 /// Select a reconstructed frame's walk-entry JitCode offset: prefer the
-/// guard-carried `jitcode_pc` decoded from the resume frame (resolved to the
-/// walk-entry coordinate the same way the bridge walk entry is), falling back
-/// to the runtime `resume_jitcode_pc_for` derivation supplied by `derived`.
+/// guard-carried `jitcode_pc` decoded from the resume frame only when it belongs
+/// to the same JitCode body that will drive the walk. Pyre permits multiple
+/// JitCode bodies per code object, so the carried offset is invalid in another
+/// body's coordinate space. Upstream `resume.py:1050-1051` uses the same
+/// snapshot-selected jitcode for frame construction and its PC. Fall back to
+/// the runtime `resume_jitcode_pc_for` derivation supplied by `derived`.
 /// Gated by `PYRE_M73_ENTRY_CARRY` (off → derivation only); the audit gate
 /// censuses carried-vs-derived disagreements as `M73EntryAudit::RecipeMismatch`.
 fn select_recipe_entry(
     jitcode_index: i32,
+    body_index: i32,
     py_pc: usize,
     carried_jitcode_pc: i32,
     derived: impl Fn() -> Option<usize>,
     diag_tag: std::fmt::Arguments<'_>,
 ) -> Option<usize> {
-    let carried = (carried_jitcode_pc != majit_ir::resumedata::NO_JITCODE_PC)
+    let carried = (carried_jitcode_pc != majit_ir::resumedata::NO_JITCODE_PC
+        && jitcode_index == body_index)
         .then(|| {
             crate::state::resolve_bridge_walk_entry_at(
                 jitcode_index,
@@ -728,6 +733,7 @@ fn drive_bridge_carrier_walk(
     };
     let entry = select_recipe_entry(
         recipe.jitcode_index,
+        callee_pjc.jitcode.index() as i32,
         recipe.pc,
         recipe.jitcode_pc,
         || callee_pjc.resume_jitcode_pc_for(recipe.pc),
@@ -889,6 +895,7 @@ fn drive_bridge_framestack_walk(
     };
     let entry = select_recipe_entry(
         recipe.jitcode_index,
+        callee_pjc.jitcode.index() as i32,
         recipe.pc,
         recipe.jitcode_pc,
         || callee_pjc.resume_jitcode_pc_for(recipe.pc),
@@ -1017,6 +1024,7 @@ fn drive_outer_continuation_and_map(
 ) -> Option<TraceAction> {
     let root_pjc = crate::state::pyjitcode_for_code(w_code)?;
     let entry = select_recipe_entry(
+        root_pjc.jitcode.index() as i32,
         root_pjc.jitcode.index() as i32,
         root_pc,
         root_jitcode_pc,
