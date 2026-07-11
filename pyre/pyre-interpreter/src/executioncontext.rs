@@ -2388,6 +2388,8 @@ impl UserDelAction {
         if self.gc_disabled(w_obj) {
             return;
         }
+        // pyre's combined helper cannot distinguish get-vs-call errors;
+        // report through the call arm (executioncontext.py:680-690).
         if let Err(error) =
             unsafe { crate::baseobjspace::get_and_call_function(w_del, w_obj, w_type, &[]) }
         {
@@ -2419,14 +2421,13 @@ impl AsyncActionOps for UserDelAction {
 }
 
 pub fn report_error(
-    _space: PyObjectRef,
+    space: PyObjectRef,
     error: &crate::PyError,
     where_desc: &str,
-    _w_obj: PyObjectRef,
+    w_obj: PyObjectRef,
 ) {
-    crate::host_seam::emit_stderr(
-        format!("Exception ignored in {where_desc}__del__: {error}\n").as_bytes(),
-    );
+    let mut error = error.clone();
+    error.write_unraisable(space, where_desc, w_obj);
 }
 
 pub fn make_finalizer_queue<WRoot>(w_root: WRoot, _space: PyObjectRef) -> WRootFinalizerQueue {

@@ -136,6 +136,36 @@ fn sys_setprofile_impl(args: &[PyObjectRef]) -> crate::PyResult {
     Ok(w_none())
 }
 
+fn sys_unraisablehook(args: &[PyObjectRef]) -> crate::PyResult {
+    let Some(&w_hookargs) = args.first() else {
+        return Err(crate::PyError::type_error(
+            "unraisablehook() missing 1 required positional argument",
+        ));
+    };
+    let w_type = crate::baseobjspace::getattr_str(w_hookargs, "exc_type")?;
+    let w_value = crate::baseobjspace::getattr_str(w_hookargs, "exc_value")?;
+    let w_tb = crate::baseobjspace::getattr_str(w_hookargs, "exc_traceback")?;
+    let w_err_msg = crate::baseobjspace::getattr_str(w_hookargs, "err_msg")?;
+    let err_msg = if unsafe { pyre_object::is_none(w_err_msg) } {
+        String::new()
+    } else if unsafe { pyre_object::is_str(w_err_msg) } {
+        unsafe { pyre_object::w_str_get_value(w_err_msg) }.to_string()
+    } else {
+        unsafe { crate::display::py_str(w_err_msg)? }
+    };
+    let w_object = crate::baseobjspace::getattr_str(w_hookargs, "object")?;
+    crate::PyError::write_unraisable_default(
+        w_none(),
+        w_type,
+        w_value,
+        w_tb,
+        &err_msg,
+        w_object,
+        "",
+    );
+    Ok(w_none())
+}
+
 /// pypy/module/sys/vm.py `exc_info_direct` — return the active exception
 /// as a `(type, value, traceback)` tuple.
 ///
@@ -919,16 +949,10 @@ pub fn register_module(ns: &mut DictStorage) {
     // sys.unraisablehook(unraisable) — handles exceptions raised where they
     // cannot propagate (e.g. __del__).  Stored alongside the read-only
     // `__unraisablehook__` original so code can save and restore it.
-    dict_storage_store(
-        ns,
-        "unraisablehook",
-        make_builtin_function_with_arity("unraisablehook", |_| Ok(w_none()), 1),
-    );
-    dict_storage_store(
-        ns,
-        "__unraisablehook__",
-        make_builtin_function_with_arity("unraisablehook", |_| Ok(w_none()), 1),
-    );
+    let unraisablehook_fn =
+        make_builtin_function_with_arity("unraisablehook", sys_unraisablehook, 1);
+    dict_storage_store(ns, "unraisablehook", unraisablehook_fn);
+    dict_storage_store(ns, "__unraisablehook__", unraisablehook_fn);
     // sys.path_hooks / path_importer_cache
     dict_storage_store(ns, "path_hooks", w_list_new(vec![]));
     dict_storage_store(ns, "path_importer_cache", w_dict_new());

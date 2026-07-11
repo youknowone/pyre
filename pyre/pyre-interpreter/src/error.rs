@@ -1,6 +1,7 @@
 use pyre_object::PyObjectRef;
 use pyre_object::interp_exceptions::{ExcKind, exc_kind_name, w_exception_new};
 use std::io::Write;
+use std::sync::OnceLock;
 
 #[derive(Debug, Clone)]
 pub struct OperationError {
@@ -686,6 +687,153 @@ impl PyError {
         exc
     }
 
+    pub fn normalize_exception(&mut self, _space: PyObjectRef) -> Result<PyObjectRef, PyError> {
+        let w_value = self.to_exc_object();
+        if w_value.is_null() || !unsafe { pyre_object::is_exception(w_value) } {
+            return Err(PyError::type_error("exception is not a BaseException"));
+        }
+        self.exc_object = w_value;
+        Ok(w_value)
+    }
+
+    /// pypy/interpreter/error.py:263-317 `write_unraisable`, with the
+    /// `with_traceback=False` first-line shape.
+    pub fn write_unraisable(
+        &mut self,
+        space: PyObjectRef,
+        where_desc: &str,
+        w_object: PyObjectRef,
+    ) {
+        let w_value = self
+            .normalize_exception(space)
+            .unwrap_or_else(|_| self.to_exc_object());
+        let mut w_type = crate::baseobjspace::exception_getclass(w_value);
+        if w_type.is_null() {
+            w_type = pyre_object::w_none();
+        }
+        let mut w_tb = if !w_value.is_null() && unsafe { pyre_object::is_exception(w_value) } {
+            unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(w_value) }
+        } else {
+            pyre_object::PY_NULL
+        };
+        if w_tb.is_null() {
+            w_tb = pyre_object::w_none();
+        }
+        let mut w_object = if w_object.is_null() {
+            pyre_object::w_none()
+        } else {
+            w_object
+        };
+        let mut first_line = if where_desc.is_empty() {
+            String::new()
+        } else {
+            format!("Exception ignored in: {where_desc}")
+        };
+        // vm.py:19-25 also carries `extra_line`; pyre's hook-args
+        // structseq targets the 5-field shape, so only the default printer
+        // receives the Rust-side extra line.
+        let hook_args = crate::_structseq::new_instance(
+            unraisable_hook_args_type(),
+            vec![
+                w_type,
+                w_value,
+                w_tb,
+                if first_line.is_empty() {
+                    pyre_object::w_none()
+                } else {
+                    pyre_object::w_str_new(&first_line)
+                },
+                w_object,
+            ],
+        );
+        if let Some(sys_mod) = crate::importing::get_sys_module("sys") {
+            if let Ok(w_hook) = crate::baseobjspace::getattr_str(sys_mod, "unraisablehook") {
+                if !w_hook.is_null() && !unsafe { pyre_object::is_none(w_hook) } {
+                    match crate::call::call_function_impl_result(w_hook, &[hook_args]) {
+                        Ok(_) => return,
+                        Err(mut hook_err) => {
+                            first_line = "Exception ignored in sys.unraisablehook".to_string();
+                            w_object = w_hook;
+                            let hook_value = hook_err
+                                .normalize_exception(space)
+                                .unwrap_or_else(|_| hook_err.to_exc_object());
+                            w_type = crate::baseobjspace::exception_getclass(hook_value);
+                            if w_type.is_null() {
+                                w_type = pyre_object::w_none();
+                            }
+                            w_tb = if !hook_value.is_null()
+                                && unsafe { pyre_object::is_exception(hook_value) }
+                            {
+                                unsafe {
+                                    pyre_object::interp_exceptions::w_exception_get_traceback(
+                                        hook_value,
+                                    )
+                                }
+                            } else {
+                                pyre_object::PY_NULL
+                            };
+                            if w_tb.is_null() {
+                                w_tb = pyre_object::w_none();
+                            }
+                            Self::write_unraisable_default(
+                                space,
+                                w_type,
+                                hook_value,
+                                w_tb,
+                                &first_line,
+                                w_object,
+                                "",
+                            );
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        Self::write_unraisable_default(space, w_type, w_value, w_tb, &first_line, w_object, "");
+    }
+
+    /// pypy/interpreter/error.py:318-347 `write_unraisable_default`.
+    pub fn write_unraisable_default(
+        space: PyObjectRef,
+        w_type: PyObjectRef,
+        w_value: PyObjectRef,
+        w_tb: PyObjectRef,
+        first_line: &str,
+        w_object: PyObjectRef,
+        extra_line: &str,
+    ) {
+        let _ = (space, w_type);
+        let mut first_line = if first_line.is_empty() {
+            "Exception ignored in:".to_string()
+        } else {
+            first_line.to_string()
+        };
+        if !w_object.is_null() && !unsafe { pyre_object::is_none(w_object) } {
+            let objrepr = unsafe { crate::display::py_repr(w_object) }
+                .unwrap_or_else(|_| "<object repr() failed>".to_string());
+            first_line = format!("{first_line} {objrepr}");
+        }
+        let extra_line = if extra_line.is_empty() {
+            "\n".to_string()
+        } else {
+            format!("{extra_line}:\n")
+        };
+        let mut buf = Vec::new();
+        let _ = write!(&mut buf, "{first_line}");
+        if !extra_line.is_empty() {
+            let _ = write!(&mut buf, "{extra_line}");
+        }
+        if !w_value.is_null() && unsafe { pyre_object::is_exception(w_value) } {
+            if !w_tb.is_null() && !unsafe { pyre_object::is_none(w_tb) } {
+                unsafe { pyre_object::interp_exceptions::w_exception_set_traceback(w_value, w_tb) };
+            }
+            let err = unsafe { PyError::from_exc_object(w_value) };
+            let _ = write_exception(&mut buf, &err, true);
+        }
+        crate::host_seam::emit_stderr(&buf);
+    }
+
     fn to_exc_kind(&self) -> ExcKind {
         match self.kind {
             PyErrorKind::TypeError => ExcKind::TypeError,
@@ -826,6 +974,20 @@ impl PyError {
             format!("{name}: {message}")
         }
     }
+}
+
+fn unraisable_hook_args_type() -> PyObjectRef {
+    thread_local! {
+        static TYPE: OnceLock<PyObjectRef> = const { OnceLock::new() };
+    }
+    TYPE.with(|cell| {
+        *cell.get_or_init(|| {
+            crate::_structseq::make_struct_seq(
+                "sys.UnraisableHookArgs",
+                &["exc_type", "exc_value", "exc_traceback", "err_msg", "object"],
+            )
+        })
+    })
 }
 
 /// Resolve an exception instance's actual Python class name for display.
