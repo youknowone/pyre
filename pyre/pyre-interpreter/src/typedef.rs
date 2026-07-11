@@ -3180,11 +3180,16 @@ fn init_dict_type(ns: &mut DictStorage) {
                     let backing = crate::type_methods::resolve_dict_backing(o);
                     if backing.is_null() { o } else { backing }
                 };
-                crate::baseobjspace::compare(
-                    resolve(args[0]),
-                    resolve(args[1]),
-                    crate::baseobjspace::CompareOp::Eq,
-                )
+                let a = resolve(args[0]);
+                let b = resolve(args[1]);
+                // `dictmultiobject.py descr_eq`: a non-dict operand yields
+                // NotImplemented. Handing it to `compare` would re-dispatch
+                // to this `__eq__` (the operand is not a dict for compare's
+                // fast path) and recurse.
+                if !unsafe { pyre_object::is_dict(b) } {
+                    return Ok(pyre_object::w_not_implemented());
+                }
+                crate::baseobjspace::compare(a, b, crate::baseobjspace::CompareOp::Eq)
             },
             2,
         ),

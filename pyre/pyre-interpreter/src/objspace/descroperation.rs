@@ -3469,20 +3469,20 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
         // path is the one that succeeds for `set == d.keys()`.
         if let Some(a_type) = crate::typedef::r#type(a) {
             if let Some(method) = lookup_in_type_where(a_type, dunder) {
-                if let Ok(result) = crate::call::call_function_impl_result(method, &[a, b]) {
-                    if !is_not_implemented(result) {
-                        return Ok(result);
-                    }
+                // A raised exception (not NotImplemented) propagates; only
+                // NotImplemented falls through to the reflected comparison.
+                let result = crate::call::call_function_impl_result(method, &[a, b])?;
+                if !is_not_implemented(result) {
+                    return Ok(result);
                 }
             }
         }
         if let Some(rdunder) = reverse_dunder(dunder) {
             if let Some(b_type) = crate::typedef::r#type(b) {
                 if let Some(method) = lookup_in_type_where(b_type, rdunder) {
-                    if let Ok(result) = crate::call::call_function_impl_result(method, &[b, a]) {
-                        if !is_not_implemented(result) {
-                            return Ok(result);
-                        }
+                    let result = crate::call::call_function_impl_result(method, &[b, a])?;
+                    if !is_not_implemented(result) {
+                        return Ok(result);
                     }
                 }
             }
