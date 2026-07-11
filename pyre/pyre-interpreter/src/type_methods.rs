@@ -2213,12 +2213,17 @@ fn encode_utf8_with_errors(
     }
     let mut out = Vec::with_capacity(s.len());
     let mut buf = [0u8; 4];
-    for (index, cp) in s.code_points().enumerate() {
+    let cps: Vec<CodePoint> = s.code_points().collect();
+    let mut i = 0usize;
+    while i < cps.len() {
+        let cp = cps[i];
         if let Some(c) = cp.to_char() {
             out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            i += 1;
             continue;
         }
         let code = cp.to_u32();
+        let index = i;
         match err_mode {
             // surrogatepass_errors encode branch (interp_codecs.py:455-458):
             // emit the three-byte sequence for the surrogate code point.
@@ -2257,12 +2262,37 @@ fn encode_utf8_with_errors(
             "backslashreplace" => out.extend_from_slice(format!("\\u{code:04x}").as_bytes()),
             "xmlcharrefreplace" => out.extend_from_slice(format!("&#{code};").as_bytes()),
             _ => {
-                return Err(crate::PyError::new(
-                    crate::PyErrorKind::LookupError,
-                    format!("unknown error handler name '{err_mode}'"),
-                ));
+                let (rep, newpos) = call_registered_encode_error_handler(
+                    err_mode,
+                    "utf-8",
+                    w_object,
+                    cps.len(),
+                    index,
+                    index + 1,
+                    "surrogates not allowed",
+                )?;
+                match rep {
+                    EncodeReplacement::Str(rcps) => {
+                        for rc in rcps {
+                            if rc >= 0x80 {
+                                return Err(crate::typedef::unicode_encode_error(
+                                    "utf-8",
+                                    w_object,
+                                    index,
+                                    index + 1,
+                                    "surrogates not allowed",
+                                ));
+                            }
+                            out.push(rc as u8);
+                        }
+                    }
+                    EncodeReplacement::Bytes(b) => out.extend_from_slice(&b),
+                }
+                i = newpos;
+                continue;
             }
         }
+        i += 1;
     }
     Ok(out)
 }
@@ -2560,10 +2590,30 @@ fn encode_narrow(
                 }
             }
             _ => {
-                return Err(crate::PyError::new(
-                    crate::PyErrorKind::LookupError,
-                    format!("unknown error handler name '{errors}'"),
-                ));
+                let (rep, newpos) = call_registered_encode_error_handler(
+                    errors,
+                    enc_name,
+                    source,
+                    cps.len(),
+                    start,
+                    end,
+                    range_msg,
+                )?;
+                match rep {
+                    EncodeReplacement::Str(rcps) => {
+                        for rc in rcps {
+                            if rc > max_cp {
+                                return Err(crate::typedef::unicode_encode_error(
+                                    enc_name, source, start, end, range_msg,
+                                ));
+                            }
+                            out.push(rc as u8);
+                        }
+                    }
+                    EncodeReplacement::Bytes(b) => out.extend_from_slice(&b),
+                }
+                i = newpos;
+                continue;
             }
         }
         i = end;
@@ -2653,12 +2703,16 @@ fn encode_utf16_32_impl(
     if bom {
         emit_scalar(&mut out, 0xFEFF, is32, big_endian);
     }
-    for (index, cp) in s.code_points().enumerate() {
-        let code = cp.to_u32();
+    let cps: Vec<u32> = s.code_points().map(|c| c.to_u32()).collect();
+    let mut i = 0usize;
+    while i < cps.len() {
+        let code = cps[i];
         if !(0xD800..=0xDFFF).contains(&code) {
             emit_scalar(&mut out, code, is32, big_endian);
+            i += 1;
             continue;
         }
+        let index = i;
         // Lone surrogate — only the utf-8/16/32 surrogatepass branch may
         // emit it, as a raw code unit (interp_codecs.py surrogatepass).
         match errors {
@@ -2696,12 +2750,49 @@ fn encode_utf16_32_impl(
                 ));
             }
             _ => {
-                return Err(crate::PyError::new(
-                    crate::PyErrorKind::LookupError,
-                    format!("unknown error handler name '{errors}'"),
-                ));
+                let (rep, newpos) = call_registered_encode_error_handler(
+                    errors,
+                    codec,
+                    w_object,
+                    cps.len(),
+                    index,
+                    index + 1,
+                    "surrogates not allowed",
+                )?;
+                match rep {
+                    EncodeReplacement::Str(rcps) => {
+                        for rc in rcps {
+                            if rc >= 0x80 {
+                                return Err(crate::typedef::unicode_encode_error(
+                                    codec,
+                                    w_object,
+                                    index,
+                                    index + 1,
+                                    "surrogates not allowed",
+                                ));
+                            }
+                            emit_scalar(&mut out, rc, is32, big_endian);
+                        }
+                    }
+                    EncodeReplacement::Bytes(b) => {
+                        let unit = if is32 { 4 } else { 2 };
+                        if b.len() % unit != 0 {
+                            return Err(crate::typedef::unicode_encode_error(
+                                codec,
+                                w_object,
+                                index,
+                                index + 1,
+                                "surrogates not allowed",
+                            ));
+                        }
+                        out.extend_from_slice(&b);
+                    }
+                }
+                i = newpos;
+                continue;
             }
         }
+        i += 1;
     }
     Ok(out)
 }
@@ -2834,6 +2925,96 @@ pub(crate) fn call_registered_decode_error_handler(
 
     out.push_wtf8(unsafe { pyre_object::w_str_get_wtf8(w_replace) });
     Ok(newpos as usize)
+}
+
+/// Replacement returned by a custom encode error handler: either a str
+/// (its code points, re-encoded by the codec) or raw bytes (copied
+/// verbatim). interp_codecs.py:69-72 rettype 'u' vs 'b'.
+enum EncodeReplacement {
+    Str(Vec<u32>),
+    Bytes(Vec<u8>),
+}
+
+/// interp_codecs.py:33-108 `call_errorhandler` (encode branch): invoke a
+/// custom handler registered through `_codecs.register_error` for an
+/// encode error span. `start`/`end`/`char_len` are CHARACTER (code-point)
+/// indices into the source; the returned position is a character index to
+/// resume at. The caller re-encodes an `EncodeReplacement::Str` through
+/// its own codec (raising the ORIGINAL error if a replacement code point
+/// is not encodable) and copies `EncodeReplacement::Bytes` verbatim.
+fn call_registered_encode_error_handler(
+    err_mode: &str,
+    codec: &str,
+    source: PyObjectRef,
+    char_len: usize,
+    start: usize,
+    end: usize,
+    reason: &str,
+) -> Result<(EncodeReplacement, usize), crate::PyError> {
+    let w_handler = crate::module::_codecs::lookup_registered_error(err_mode).ok_or_else(|| {
+        crate::PyError::new(
+            crate::PyErrorKind::LookupError,
+            format!("unknown error handler name '{err_mode}'"),
+        )
+    })?;
+
+    let w_exc =
+        crate::typedef::unicode_encode_error(codec, source, start, end, reason).to_exc_object();
+    let w_res = crate::baseobjspace::call_function(w_handler, &[w_exc]);
+    if w_res.is_null() {
+        return Err(crate::call::take_call_error()
+            .unwrap_or_else(|| crate::PyError::type_error("error handler failed")));
+    }
+
+    if !unsafe { pyre_object::is_tuple(w_res) } || unsafe { pyre_object::w_tuple_len(w_res) } != 2 {
+        return Err(crate::PyError::type_error(
+            "encoding error handler must return (str/bytes, int) tuple",
+        ));
+    }
+    let w_replace = unsafe { pyre_object::w_tuple_getitem(w_res, 0).unwrap() };
+    let w_newpos = unsafe { pyre_object::w_tuple_getitem(w_res, 1).unwrap() };
+
+    let replacement = if unsafe { pyre_object::is_str(w_replace) } {
+        EncodeReplacement::Str(
+            unsafe { pyre_object::w_str_get_wtf8(w_replace) }
+                .code_points()
+                .map(|c| c.to_u32())
+                .collect(),
+        )
+    } else if unsafe { pyre_object::bytesobject::is_bytes(w_replace) } {
+        EncodeReplacement::Bytes(
+            unsafe { pyre_object::bytesobject::bytes_like_data(w_replace) }.to_vec(),
+        )
+    } else {
+        return Err(crate::PyError::type_error(
+            "encoding error handler must return (str/bytes, int) tuple",
+        ));
+    };
+
+    // newpos folds against the source CHARACTER length and resumes into the
+    // original code-point sequence.
+    let length = char_len as i64;
+    let mut newpos = match crate::baseobjspace::int_w(w_newpos) {
+        Ok(n) => n,
+        Err(e) => {
+            if e.kind == crate::PyErrorKind::OverflowError {
+                -1
+            } else {
+                return Err(e);
+            }
+        }
+    };
+    if newpos < 0 {
+        newpos += length;
+    }
+    if newpos < 0 || newpos > length {
+        return Err(crate::PyError::new(
+            crate::PyErrorKind::IndexError,
+            format!("position {newpos} from error handler out of bounds"),
+        ));
+    }
+
+    Ok((replacement, newpos as usize))
 }
 
 /// Decode error-handler dispatch for utf-16 / utf-32 (interp_codecs.py
