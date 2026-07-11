@@ -443,6 +443,10 @@ pub(crate) enum EmulatedPbcCallKey {
     Sandboxing {
         callable_id: usize,
     },
+    /// RPython `annlowlevel.py:363` key `(llhelper, desc.pyobj)`.
+    LLHelper {
+        callable_id: usize,
+    },
 }
 
 /// RPython `Bookkeeper.pbc_call`'s `emulated` parameter

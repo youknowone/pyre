@@ -25,34 +25,21 @@
 //!
 //! ## Status of this port
 //!
-//! **Skeleton landed; bodies deferred.** Every public function and
-//! method below surfaces as `TyperError::message("annlowlevel.py:N
-//! — <symbol> port pending")` so downstream consumers can call into
-//! the module in upstream shape without silently taking an adapted
-//! code path. Filling the bodies is the orthodox R4 work — the
-//! skeleton exists so each method can be swapped in against its
-//! upstream counterpart without call-site churn.
+//! **Skeleton partially filled.** Public functions and methods whose
+//! dependencies have landed are ported directly against their
+//! upstream counterparts; surfaces that still lack a required Rust
+//! carrier keep returning structured pending errors naming the
+//! missing primitive.
 //!
 //! The items whose callable bodies are still scheduled as follow-ups:
 //!
-//! * `PseudoHighLevelCallable` + `PseudoHighLevelCallableEntry`
-//!   (annlowlevel.py:286-320) — the type surface is present; call
-//!   specialization depends on
-//!   [`crate::translator::rtyper::extregistry::ExtRegistryEntry`] and
-//!   `hop.genop('direct_call', …)` wiring.
-//! * `LLHelperEntry` (annlowlevel.py:349-376) — the `llhelper` /
-//!   `llhelper_args` direct-running helper functions are present, but
-//!   annotation/rtyping specialization still depends on
-//!   `r.get_unique_llfn()` on `FunctionsPBCRepr` (unported).
 //! * The `hlstr` / `llstr` / `hlunicode` / `llunicode` and pointer-cast
 //!   helper surfaces are present below, but their bodies still return
 //!   structured pending errors until the corresponding `rstr`, `llmemory`,
 //!   and cast specialization paths land.
-//! * `placeholder_sigarg` / `typemeth_placeholder_sigarg` /
-//!   `ADTInterface` (annlowlevel.py:573-640) — the type surface is
-//!   present; signature expansion depends on
-//!   `rpython/annotator/signature.py::Sig` wiring and the `adtmeths`
-//!   attribute of low-level types.
+//! * `ADTInterface.__call__` (annlowlevel.py:632-640) — the type
+//!   surface is present; installing `_annenforceargs_` still lacks a
+//!   `ConstValue` carrier for method attributes.
 //! * `cachedtype` metaclass (annlowlevel.py:644-668) — metaclass
 //!   shape has no direct Rust counterpart; callers reach for
 //!   `once_cell::sync::Lazy` / `std::sync::LazyLock` + a manual cache
@@ -92,13 +79,14 @@ use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
 use crate::annotator::annrpython::RPythonAnnotator;
+use crate::annotator::bookkeeper::{self, EmulatedPbcCallKey};
 use crate::annotator::description::{FunctionDesc, GraphCacheKey};
-use crate::annotator::model::{SomeObjectTrait, SomeValue, not_const};
+use crate::annotator::model::{SomeObjectTrait, SomePtr, SomeValue, not_const};
 use crate::annotator::policy::{
     AnnotatorPolicy, PolicyError, PolicyHandle, PolicyOps, Specializer,
     parse_specializer_directive, specializer_from_normalized,
 };
-use crate::annotator::signature::{Sig, SigArgType};
+use crate::annotator::signature::{AnnotationSpec, Sig, SigArgType, SignatureError};
 use crate::flowspace::model::{BlockKey, ConstValue, Constant, GraphKey, GraphRef, HostObject};
 use crate::flowspace::pygraph::PyGraph;
 
@@ -107,23 +95,151 @@ use super::llannotation::{annotation_to_lltype, lltype_to_annotation};
 use super::lltypesystem::lltype::{
     self, _ptr, DelayedPointer, ForwardReference, FuncType, LowLevelType, Ptr, PtrTarget,
 };
-use super::rmodel::RTypeResult;
 use super::rmodel::Repr;
-use super::rtyper::{HighLevelOp, RPythonTyper};
+use super::rmodel::{RTypeResult, inputconst_from_lltype};
+use super::rpbc::FunctionRepr;
+use super::rtyper::{GenopResult, HighLevelOp, RPythonTyper};
 
 use crate::tool::sourcetools::valid_identifier;
 
-fn annlowlevel_deferred(name: &str) -> TyperError {
-    TyperError::missing_rtype_operation(format!("annlowlevel.{name} helper surface deferred"))
+fn already_annotation_sigarg(s_value: SomeValue) -> SigArgType {
+    SigArgType::Spec(AnnotationSpec::Already(s_value))
+}
+
+fn signature_error(msg: impl Into<String>) -> SignatureError {
+    SignatureError::new(msg)
+}
+
+fn lowlevel_type_from_const_for_signature(
+    value: &ConstValue,
+    context: &str,
+) -> Result<LowLevelType, SignatureError> {
+    match value {
+        ConstValue::LowLevelType(t) => Ok((**t).clone()),
+        other => Err(signature_error(format!(
+            "{context}: expected a LowLevelType constant, got {other:?}"
+        ))),
+    }
+}
+
+fn lowlevel_ptr_type_from_const(value: &ConstValue, context: &str) -> Result<Ptr, TyperError> {
+    let ConstValue::LowLevelType(t) = value else {
+        return Err(TyperError::message(format!(
+            "{context}: expected a LowLevelType constant, got {value:?}"
+        )));
+    };
+    let LowLevelType::Ptr(ptr_t) = &**t else {
+        return Err(TyperError::message(format!(
+            "{context}: expected Ptr(FuncType), got {:?}",
+            t
+        )));
+    };
+    Ok((**ptr_t).clone())
+}
+
+fn ptr_to_annotation_sigarg(ptr: Ptr) -> SigArgType {
+    already_annotation_sigarg(lltype_to_annotation(LowLevelType::Ptr(Box::new(ptr))))
+}
+
+fn lowlevel_attr_from_struct(
+    struct_t: &lltype::Struct,
+    attr: &str,
+) -> Result<LowLevelType, String> {
+    if let Some(value) = struct_t._adtmeths.get(attr) {
+        return match value {
+            ConstValue::LowLevelType(t) => Ok((**t).clone()),
+            other => Err(format!(
+                "lltype Struct._adtmeths[{attr:?}] is not a LowLevelType: {other:?}"
+            )),
+        };
+    }
+    if let Some(field_t) = struct_t._flds.get(attr) {
+        return Ok(field_t.clone());
+    }
+    Err(struct_t._nofield(attr))
+}
+
+fn lowlevel_attr_from_type(t: &LowLevelType, attr: &str) -> Result<LowLevelType, String> {
+    match t {
+        LowLevelType::Struct(struct_t) => lowlevel_attr_from_struct(struct_t, attr),
+        LowLevelType::Array(array_t) => match attr {
+            "ITEM" | "OF" => Ok(array_t.OF.clone()),
+            _ => Err(format!("Array has no attribute {attr:?}")),
+        },
+        LowLevelType::FixedSizeArray(array_t) => match attr {
+            "ITEM" | "OF" => Ok(array_t.OF.clone()),
+            _ => Err(format!("FixedSizeArray has no attribute {attr:?}")),
+        },
+        LowLevelType::ForwardReference(forward_ref) => {
+            let resolved = forward_ref
+                .resolved()
+                .ok_or_else(|| format!("ForwardReference has no resolved attribute {attr:?}"))?;
+            lowlevel_attr_from_type(&resolved, attr)
+        }
+        LowLevelType::Ptr(ptr_t) => lowlevel_attr_from_ptrtarget(&ptr_t.TO, attr),
+        other => Err(format!("{other:?} has no low-level attribute {attr:?}")),
+    }
+}
+
+fn lowlevel_attr_from_ptrtarget(t: &PtrTarget, attr: &str) -> Result<LowLevelType, String> {
+    match t {
+        PtrTarget::Struct(struct_t) => lowlevel_attr_from_struct(struct_t, attr),
+        PtrTarget::Array(array_t) => match attr {
+            "ITEM" | "OF" => Ok(array_t.OF.clone()),
+            _ => Err(format!("Array has no attribute {attr:?}")),
+        },
+        PtrTarget::FixedSizeArray(array_t) => match attr {
+            "ITEM" | "OF" => Ok(array_t.OF.clone()),
+            _ => Err(format!("FixedSizeArray has no attribute {attr:?}")),
+        },
+        PtrTarget::ForwardReference(forward_ref) => {
+            let resolved = forward_ref
+                .resolved()
+                .ok_or_else(|| format!("ForwardReference has no resolved attribute {attr:?}"))?;
+            lowlevel_attr_from_type(&resolved, attr)
+        }
+        PtrTarget::Func(func_t) => match attr {
+            "RESULT" => Ok(func_t.result.clone()),
+            _ => Err(format!("FuncType has no low-level attribute {attr:?}")),
+        },
+        other => Err(format!("{other:?} has no low-level attribute {attr:?}")),
+    }
 }
 
 pub fn placeholder_sigarg(s: &str) -> Result<SigArgType, TyperError> {
     match s {
-        "self" => Ok(SigArgType::PassThrough),
-        "SELF" => Err(annlowlevel_deferred("placeholder_sigarg('SELF')")),
-        _ if s.chars().all(|c| c.is_ascii_lowercase()) => Err(annlowlevel_deferred(
-            format!("placeholder_sigarg({s:?})").as_str(),
+        "self" => Ok(SigArgType::DynamicCallable(Rc::new(|inputcells| {
+            let Some(s_self) = inputcells.first() else {
+                return Err(signature_error("placeholder_sigarg('self'): missing self"));
+            };
+            match s_self {
+                SomeValue::Ptr(_) => Ok(already_annotation_sigarg(s_self.clone())),
+                other => Err(signature_error(format!(
+                    "placeholder_sigarg('self') expected SomePtr, got {other:?}"
+                ))),
+            }
+        }))),
+        "SELF" => Err(TyperError::message(
+            "annlowlevel.placeholder_sigarg('SELF') raises NotImplementedError",
         )),
+        _ if s.chars().all(|c| c.is_ascii_lowercase()) => {
+            let attr = s.to_ascii_uppercase();
+            Ok(SigArgType::DynamicCallable(Rc::new(move |inputcells| {
+                let Some(s_self) = inputcells.first() else {
+                    return Err(signature_error(format!(
+                        "placeholder_sigarg({attr:?}): missing self"
+                    )));
+                };
+                let SomeValue::Ptr(s_self) = s_self else {
+                    return Err(signature_error(format!(
+                        "placeholder_sigarg({attr:?}) expected SomePtr, got {s_self:?}"
+                    )));
+                };
+                let t = lowlevel_attr_from_ptrtarget(&s_self.ll_ptrtype.TO, &attr)
+                    .map_err(signature_error)?;
+                Ok(already_annotation_sigarg(lltype_to_annotation(t)))
+            })))
+        }
         _ => Err(TyperError::message(format!(
             "placeholder_sigarg expected lowercase placeholder, got {s:?}"
         ))),
@@ -132,11 +248,60 @@ pub fn placeholder_sigarg(s: &str) -> Result<SigArgType, TyperError> {
 
 pub fn typemeth_placeholder_sigarg(s: &str) -> Result<SigArgType, TyperError> {
     match s {
-        "SELF" => Ok(SigArgType::PassThrough),
-        "self" => Err(annlowlevel_deferred("typemeth_placeholder_sigarg('self')")),
-        _ if s.chars().all(|c| c.is_ascii_lowercase()) => Err(annlowlevel_deferred(
-            format!("typemeth_placeholder_sigarg({s:?})").as_str(),
-        )),
+        "SELF" => Ok(SigArgType::DynamicCallable(Rc::new(|inputcells| {
+            let Some(s_type) = inputcells.first() else {
+                return Err(signature_error(
+                    "typemeth_placeholder_sigarg('SELF'): missing SELF",
+                ));
+            };
+            match s_type {
+                SomeValue::PBC(_) if s_type.is_constant() => {
+                    Ok(already_annotation_sigarg(s_type.clone()))
+                }
+                other => Err(signature_error(format!(
+                    "typemeth_placeholder_sigarg('SELF') expected constant SomePBC, got {other:?}"
+                ))),
+            }
+        }))),
+        "self" => Ok(SigArgType::DynamicCallable(Rc::new(|inputcells| {
+            let Some(s_type) = inputcells.first() else {
+                return Err(signature_error(
+                    "typemeth_placeholder_sigarg('self'): missing SELF",
+                ));
+            };
+            if !matches!(s_type, SomeValue::PBC(_)) || !s_type.is_constant() {
+                return Err(signature_error(format!(
+                    "typemeth_placeholder_sigarg('self') expected constant SomePBC, got {s_type:?}"
+                )));
+            }
+            let ty = lowlevel_type_from_const_for_signature(
+                s_type.const_().expect("is_constant checked"),
+                "typemeth_placeholder_sigarg('self')",
+            )?;
+            let ptr = Ptr::from_container_type(ty).map_err(signature_error)?;
+            Ok(ptr_to_annotation_sigarg(ptr))
+        }))),
+        _ if s.chars().all(|c| c.is_ascii_lowercase()) => {
+            let attr = s.to_ascii_uppercase();
+            Ok(SigArgType::DynamicCallable(Rc::new(move |inputcells| {
+                let Some(s_type) = inputcells.first() else {
+                    return Err(signature_error(format!(
+                        "typemeth_placeholder_sigarg({attr:?}): missing SELF"
+                    )));
+                };
+                if !matches!(s_type, SomeValue::PBC(_)) || !s_type.is_constant() {
+                    return Err(signature_error(format!(
+                        "typemeth_placeholder_sigarg({attr:?}) expected constant SomePBC, got {s_type:?}"
+                    )));
+                }
+                let ty = lowlevel_type_from_const_for_signature(
+                    s_type.const_().expect("is_constant checked"),
+                    &format!("typemeth_placeholder_sigarg({attr:?})"),
+                )?;
+                let item_t = lowlevel_attr_from_type(&ty, &attr).map_err(signature_error)?;
+                Ok(already_annotation_sigarg(lltype_to_annotation(item_t)))
+            })))
+        }
         _ => Err(TyperError::message(format!(
             "typemeth_placeholder_sigarg expected lowercase placeholder, got {s:?}"
         ))),
@@ -705,12 +870,55 @@ impl PseudoHighLevelCallableEntry {
     /// RPython `specialize_call(self, hop)` (annlowlevel.py:308-320).
     pub fn specialize_call(
         &self,
-        _instance: &PseudoHighLevelCallable,
-        _hop: &HighLevelOp,
+        instance: &PseudoHighLevelCallable,
+        hop: &HighLevelOp,
     ) -> RTypeResult {
-        Err(annlowlevel_deferred(
-            "PseudoHighLevelCallableEntry.specialize_call",
-        ))
+        let args_r = instance
+            .args_s
+            .iter()
+            .map(|s| {
+                let s = s.as_ref().ok_or_else(|| {
+                    TyperError::message(
+                        "PseudoHighLevelCallableEntry.specialize_call: missing argument annotation",
+                    )
+                })?;
+                hop.rtyper.getrepr(s)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let r_res = hop.rtyper.getrepr(&instance.s_result)?;
+        let vlist = hop.inputargs(args_r.iter().map(|r| r.into()).collect())?;
+        let p = instance.llfnptr.clone();
+        let func_ptr_type = lltype::typeOf(&p);
+        let c_func = inputconst_from_lltype(
+            &LowLevelType::Ptr(Box::new(func_ptr_type.clone())),
+            &ConstValue::LLPtr(Box::new(p)),
+        )?;
+        let PtrTarget::Func(functype) = &func_ptr_type.TO else {
+            return Err(TyperError::message(
+                "PseudoHighLevelCallableEntry.specialize_call: llfnptr is not Ptr(FuncType)",
+            ));
+        };
+        for (r_arg, argtype) in args_r.iter().zip(functype.args.iter()) {
+            if r_arg.lowleveltype() != argtype {
+                return Err(TyperError::message(format!(
+                    "PseudoHighLevelCallableEntry.specialize_call: argument lowleveltype mismatch: got {:?}, expected {:?}",
+                    r_arg.lowleveltype(),
+                    argtype
+                )));
+            }
+        }
+        if r_res.lowleveltype() != &functype.result {
+            return Err(TyperError::message(format!(
+                "PseudoHighLevelCallableEntry.specialize_call: result lowleveltype mismatch: got {:?}, expected {:?}",
+                r_res.lowleveltype(),
+                functype.result
+            )));
+        }
+        hop.exception_is_here()?;
+        let mut call_args = Vec::with_capacity(vlist.len() + 1);
+        call_args.push(crate::flowspace::model::Hlvalue::Constant(c_func));
+        call_args.extend(vlist);
+        Ok(hop.genop("direct_call", call_args, GenopResult::Repr(r_res)))
     }
 }
 
@@ -760,17 +968,128 @@ impl LLHelperEntry {
     /// (annlowlevel.py:352-368).
     pub fn compute_result_annotation(
         &self,
-        _s_f: &SomeValue,
-        _s_callable: &SomeValue,
+        s_f: &SomeValue,
+        s_callable: &SomeValue,
     ) -> Result<SomeValue, TyperError> {
-        Err(annlowlevel_deferred(
+        if !s_f.is_constant() {
+            return Err(TyperError::message(
+                "LLHelperEntry.compute_result_annotation: s_F must be constant",
+            ));
+        }
+        let SomeValue::PBC(pbc) = s_callable else {
+            return Err(TyperError::message(
+                "LLHelperEntry.compute_result_annotation: s_callable must be SomePBC",
+            ));
+        };
+        let f = lowlevel_ptr_type_from_const(
+            s_f.const_().expect("is_constant checked"),
             "LLHelperEntry.compute_result_annotation",
-        ))
+        )?;
+        let PtrTarget::Func(func) = &f.TO else {
+            return Err(TyperError::message(
+                "LLHelperEntry.compute_result_annotation: F must be Ptr(FuncType)",
+            ));
+        };
+        let args_s = func
+            .args
+            .iter()
+            .cloned()
+            .map(lltype_to_annotation)
+            .collect::<Vec<_>>();
+        let bookkeeper = bookkeeper::getbookkeeper().ok_or_else(|| {
+            TyperError::message(
+                "LLHelperEntry.compute_result_annotation missing annotator::bookkeeper::getbookkeeper",
+            )
+        })?;
+        for desc in pbc.descriptions.values() {
+            let _funcdesc: Rc<RefCell<FunctionDesc>> = desc.as_function().ok_or_else(|| {
+                TyperError::message(
+                    "LLHelperEntry.compute_result_annotation: description is not FunctionDesc",
+                )
+            })?;
+            let pyobj = desc.pyobj().ok_or_else(|| {
+                TyperError::message(
+                    "LLHelperEntry.compute_result_annotation: FunctionDesc.pyobj is missing",
+                )
+            })?;
+            if pbc.is_constant() {
+                let Some(ConstValue::HostObject(const_obj)) = s_callable.const_() else {
+                    return Err(TyperError::message(
+                        "LLHelperEntry.compute_result_annotation: constant SomePBC must carry HostObject",
+                    ));
+                };
+                if const_obj != &pyobj {
+                    return Err(TyperError::message(
+                        "LLHelperEntry.compute_result_annotation: constant SomePBC does not match desc.pyobj",
+                    ));
+                }
+            }
+            let key = EmulatedPbcCallKey::LLHelper {
+                callable_id: pyobj.identity_id(),
+            };
+            let s_res = bookkeeper
+                .emulate_pbc_call(key, s_callable, &args_s, &[], None)
+                .map_err(|e| TyperError::message(format!("{e:?}")))?;
+            if !lltype_to_annotation(func.result.clone()).contains(&s_res) {
+                return Err(TyperError::message(format!(
+                    "LLHelperEntry.compute_result_annotation: result {:?} is not contained in {:?}",
+                    s_res,
+                    lltype_to_annotation(func.result.clone())
+                )));
+            }
+        }
+        Ok(SomeValue::Ptr(SomePtr::new(f)))
     }
 
     /// RPython `specialize_call(self, hop)` (annlowlevel.py:370-376).
-    pub fn specialize_call(&self, _hop: &HighLevelOp) -> RTypeResult {
-        Err(annlowlevel_deferred("LLHelperEntry.specialize_call"))
+    pub fn specialize_call(&self, hop: &HighLevelOp) -> RTypeResult {
+        hop.exception_cannot_occur()?;
+        let callable_is_constant = {
+            let args_s = hop.args_s.borrow();
+            args_s
+                .get(1)
+                .ok_or_else(|| {
+                    TyperError::message("LLHelperEntry.specialize_call: missing callable argument")
+                })?
+                .is_constant()
+        };
+        let r_callable = {
+            let args_r = hop.args_r.borrow();
+            args_r.get(1).and_then(Clone::clone).ok_or_else(|| {
+                TyperError::message("LLHelperEntry.specialize_call: missing callable argument repr")
+            })?
+        };
+        if callable_is_constant {
+            let r_func = (r_callable.as_ref() as &dyn std::any::Any)
+                .downcast_ref::<FunctionRepr>()
+                .ok_or_else(|| {
+                    TyperError::message(
+                        "LLHelperEntry.specialize_call: callable repr is not FunctionRepr",
+                    )
+                })?;
+            return Ok(Some(r_func.get_unique_llfn()?));
+        }
+        let f = {
+            let args_s = hop.args_s.borrow();
+            let s_f = args_s.get(0).ok_or_else(|| {
+                TyperError::message("LLHelperEntry.specialize_call: missing F argument")
+            })?;
+            lowlevel_ptr_type_from_const(
+                s_f.const_().ok_or_else(|| {
+                    TyperError::message("LLHelperEntry.specialize_call: F must be constant")
+                })?,
+                "LLHelperEntry.specialize_call",
+            )?
+        };
+        let expected = LowLevelType::Ptr(Box::new(f));
+        if r_callable.lowleveltype() != &expected {
+            return Err(TyperError::message(format!(
+                "LLHelperEntry.specialize_call: callable lowleveltype mismatch: got {:?}, expected {:?}",
+                r_callable.lowleveltype(),
+                expected
+            )));
+        }
+        Ok(Some(hop.inputarg(&r_callable, 1)?))
     }
 }
 
@@ -846,7 +1165,10 @@ impl ADTInterface {
         &self,
         _adtmeths: HashMap<String, ConstValue>,
     ) -> Result<HashMap<String, ConstValue>, TyperError> {
-        Err(annlowlevel_deferred("ADTInterface.__call__"))
+        Err(TyperError::missing_rtype_operation(
+            "annlowlevel.ADTInterface.__call__ deferred: missing ConstValue::_annenforceargs_ carrier"
+                .to_string(),
+        ))
     }
 }
 
@@ -1713,10 +2035,43 @@ pub struct CastBasePtrToInstanceEntry;
 mod tests {
     use super::*;
     use crate::annotator::annrpython::RPythonAnnotator;
-    use crate::annotator::model::SomeInteger;
-    use crate::flowspace::model::{ConstValue, Constant, GraphFunc};
+    use crate::annotator::model::{SomeInteger, SomeObject, SomePBC};
+    use crate::flowspace::model::{
+        ConstValue, Constant, GraphFunc, Hlvalue, SpaceOperation, Variable,
+    };
+    use crate::translator::rtyper::rmodel::ReprState;
+    use crate::translator::rtyper::rtyper::LowLevelOpList;
     use rustpython_compiler::{Mode, compile as rp_compile};
     use rustpython_compiler_core::bytecode::ConstantData;
+
+    #[derive(Debug)]
+    struct TestRepr {
+        state: ReprState,
+        lowleveltype: LowLevelType,
+    }
+
+    impl TestRepr {
+        fn new(lowleveltype: LowLevelType) -> Self {
+            TestRepr {
+                state: ReprState::new(),
+                lowleveltype,
+            }
+        }
+    }
+
+    impl Repr for TestRepr {
+        fn lowleveltype(&self) -> &LowLevelType {
+            &self.lowleveltype
+        }
+
+        fn state(&self) -> &ReprState {
+            &self.state
+        }
+
+        fn class_name(&self) -> &'static str {
+            "TestRepr"
+        }
+    }
 
     fn make_rtyper() -> (Rc<RPythonAnnotator>, Rc<RPythonTyper>) {
         let annotator = RPythonAnnotator::new(None, None, None, false);
@@ -1744,6 +2099,37 @@ mod tests {
         HostObject::new_user_function(func)
     }
 
+    fn lowlevel_type_const_annotation(t: LowLevelType) -> SomeValue {
+        let mut s = SomeObject::default();
+        s.const_box = Some(Constant::new(ConstValue::LowLevelType(Box::new(t))));
+        SomeValue::Object(s)
+    }
+
+    fn lowlevel_type_pbc_annotation(annotator: &RPythonAnnotator, t: LowLevelType) -> SomeValue {
+        let f = compiled_host_function("def ll_marker():\n    return 1\n");
+        let entry = annotator
+            .bookkeeper
+            .getdesc(&f)
+            .expect("function desc for low-level type PBC");
+        let mut pbc = SomePBC::new([entry], false);
+        pbc.base.const_box = Some(Constant::new(ConstValue::LowLevelType(Box::new(t))));
+        SomeValue::PBC(pbc)
+    }
+
+    fn call_dynamic_sigarg(sigarg: &SigArgType, inputcells: &[SomeValue]) -> SigArgType {
+        let SigArgType::DynamicCallable(f) = sigarg else {
+            panic!("expected DynamicCallable");
+        };
+        f(inputcells).expect("dynamic signature argument should expand")
+    }
+
+    fn already_annotation(sigarg: SigArgType) -> SomeValue {
+        let SigArgType::Spec(AnnotationSpec::Already(s_value)) = sigarg else {
+            panic!("expected AnnotationSpec::Already");
+        };
+        s_value
+    }
+
     #[test]
     fn llhelper_args_builds_low_level_function_pointer() {
         let f = compiled_host_function("def ll_id(x):\n    return x\n");
@@ -1761,6 +2147,203 @@ mod tests {
             func._callable
                 .as_deref()
                 .is_some_and(|name| name.starts_with("ll_id#"))
+        );
+    }
+
+    #[test]
+    fn pseudo_high_level_callable_specialize_call_emits_direct_call() {
+        let (_annotator, rtyper) = make_rtyper();
+        let func_t = FuncType {
+            args: vec![LowLevelType::Signed],
+            result: LowLevelType::Signed,
+        };
+        let fnptr = lltype::functionptr(
+            func_t,
+            "ll_identity",
+            None,
+            Some("ll_identity#test".to_string()),
+        );
+        let instance = PseudoHighLevelCallable::new(
+            fnptr.clone(),
+            vec![Some(SomeValue::Integer(SomeInteger::default()))],
+            SomeValue::Integer(SomeInteger::default()),
+        );
+        let v_arg = Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::Int(3),
+            LowLevelType::Signed,
+        ));
+        let spaceop = SpaceOperation::new(
+            "simple_call".to_string(),
+            vec![v_arg.clone()],
+            Hlvalue::Variable(Variable::new()),
+        );
+        let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), llops.clone());
+        let r_int = rtyper
+            .getrepr(&SomeValue::Integer(SomeInteger::default()))
+            .expect("int repr");
+        hop.args_v.borrow_mut().push(v_arg);
+        hop.args_s
+            .borrow_mut()
+            .push(SomeValue::Integer(SomeInteger::default()));
+        hop.args_r.borrow_mut().push(Some(r_int.clone()));
+        *hop.s_result.borrow_mut() = Some(SomeValue::Integer(SomeInteger::default()));
+        *hop.r_result.borrow_mut() = Some(r_int);
+
+        let result = PseudoHighLevelCallableEntry
+            .specialize_call(&instance, &hop)
+            .expect("specialize_call")
+            .expect("direct_call should produce a result");
+        assert!(matches!(result, Hlvalue::Variable(_)));
+        let ops = llops.borrow();
+        assert_eq!(ops.ops.len(), 1);
+        assert_eq!(ops.ops[0].opname, "direct_call");
+        let Hlvalue::Constant(c_func) = &ops.ops[0].args[0] else {
+            panic!("first direct_call arg should be function constant");
+        };
+        assert_eq!(
+            c_func.concretetype,
+            Some(LowLevelType::Ptr(Box::new(fnptr._TYPE)))
+        );
+        assert!(matches!(c_func.value, ConstValue::LLPtr(_)));
+        assert!(ops._called_exception_is_here_or_cannot_occur);
+    }
+
+    #[test]
+    fn llhelper_compute_result_annotation_emulates_pbc_call_and_returns_someptr() {
+        let (annotator, _rtyper) = make_rtyper();
+        let f = compiled_host_function("def ll_id(x):\n    return x\n");
+        let entry = annotator
+            .bookkeeper
+            .getdesc(&f)
+            .expect("function desc for llhelper");
+        let mut pbc = SomePBC::new([entry], false);
+        pbc.base.const_box = Some(Constant::new(ConstValue::HostObject(f)));
+        let s_callable = SomeValue::PBC(pbc);
+        let f_type = Ptr {
+            TO: PtrTarget::Func(FuncType {
+                args: vec![LowLevelType::Signed],
+                result: LowLevelType::Signed,
+            }),
+        };
+        let s_f = lowlevel_type_const_annotation(LowLevelType::Ptr(Box::new(f_type.clone())));
+        let _guard = annotator.bookkeeper.at_position(None);
+
+        let result = LLHelperEntry
+            .compute_result_annotation(&s_f, &s_callable)
+            .expect("compute_result_annotation");
+        let SomeValue::Ptr(s_ptr) = result else {
+            panic!("llhelper should return SomePtr(F)");
+        };
+        assert_eq!(s_ptr.ll_ptrtype, f_type);
+    }
+
+    #[test]
+    fn llhelper_specialize_call_nonconstant_callable_returns_inputarg() {
+        let (_annotator, rtyper) = make_rtyper();
+        let f_type = Ptr {
+            TO: PtrTarget::Func(FuncType {
+                args: vec![LowLevelType::Signed],
+                result: LowLevelType::Signed,
+            }),
+        };
+        let ptr_lltype = LowLevelType::Ptr(Box::new(f_type.clone()));
+        let s_f = lowlevel_type_const_annotation(ptr_lltype.clone());
+        let s_callable = SomeValue::Ptr(SomePtr::new(f_type));
+        let v_f = Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::LowLevelType(Box::new(ptr_lltype.clone())),
+            LowLevelType::Void,
+        ));
+        let v_callable = Variable::new();
+        v_callable.set_concretetype(Some(ptr_lltype.clone()));
+        let v_callable_h = Hlvalue::Variable(v_callable.clone());
+        let spaceop = SpaceOperation::new(
+            "simple_call".to_string(),
+            vec![v_f.clone(), v_callable_h.clone()],
+            Hlvalue::Variable(Variable::new()),
+        );
+        let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper, spaceop, Vec::new(), llops.clone());
+        let r_callable: Arc<dyn Repr> = Arc::new(TestRepr::new(ptr_lltype));
+        hop.args_v.borrow_mut().extend([v_f, v_callable_h]);
+        hop.args_s.borrow_mut().extend([s_f, s_callable]);
+        hop.args_r
+            .borrow_mut()
+            .extend([None, Some(r_callable.clone())]);
+
+        let result = LLHelperEntry
+            .specialize_call(&hop)
+            .expect("specialize_call")
+            .expect("non-constant callable should return inputarg");
+        let Hlvalue::Variable(result_var) = result else {
+            panic!("inputarg should preserve the callable variable");
+        };
+        assert_eq!(result_var, v_callable);
+        assert!(llops.borrow()._called_exception_is_here_or_cannot_occur);
+    }
+
+    #[test]
+    fn placeholder_sigarg_dynamic_branches_expand_from_pointer_type() {
+        let item = placeholder_sigarg("item").expect("item placeholder");
+        let self_arg = placeholder_sigarg("self").expect("self placeholder");
+        let ptr = Ptr {
+            TO: PtrTarget::Array(lltype::Array::gc(LowLevelType::Signed)),
+        };
+        let s_self = SomeValue::Ptr(SomePtr::new(ptr.clone()));
+
+        let expanded_item = already_annotation(call_dynamic_sigarg(&item, &[s_self.clone()]));
+        assert!(matches!(expanded_item, SomeValue::Integer(_)));
+        let expanded_self = already_annotation(call_dynamic_sigarg(&self_arg, &[s_self]));
+        let SomeValue::Ptr(expanded_self) = expanded_self else {
+            panic!("self placeholder should return SomePtr");
+        };
+        assert_eq!(expanded_self.ll_ptrtype, ptr);
+    }
+
+    #[test]
+    fn typemeth_placeholder_sigarg_dynamic_branches_expand_from_type_constant() {
+        let (annotator, _rtyper) = make_rtyper();
+        let list_type = LowLevelType::Array(Box::new(lltype::Array::gc(LowLevelType::Signed)));
+        let s_type = lowlevel_type_pbc_annotation(&annotator, list_type.clone());
+
+        let expanded_self = already_annotation(call_dynamic_sigarg(
+            &typemeth_placeholder_sigarg("self").expect("self typemeth placeholder"),
+            &[s_type.clone()],
+        ));
+        let SomeValue::Ptr(s_ptr) = expanded_self else {
+            panic!("typemeth self should return Ptr(TYPE)");
+        };
+        assert_eq!(
+            s_ptr.ll_ptrtype,
+            Ptr {
+                TO: PtrTarget::Array(lltype::Array::gc(LowLevelType::Signed))
+            }
+        );
+
+        let expanded_self_type = already_annotation(call_dynamic_sigarg(
+            &typemeth_placeholder_sigarg("SELF").expect("SELF typemeth placeholder"),
+            &[s_type.clone()],
+        ));
+        assert_eq!(expanded_self_type, s_type);
+
+        let expanded_item = already_annotation(call_dynamic_sigarg(
+            &typemeth_placeholder_sigarg("item").expect("item typemeth placeholder"),
+            &[lowlevel_type_pbc_annotation(&annotator, list_type)],
+        ));
+        assert!(matches!(expanded_item, SomeValue::Integer(_)));
+    }
+
+    #[test]
+    fn adtinterface_call_reports_missing_constvalue_annenforceargs_carrier() {
+        let interface = ADTInterface {
+            sigtemplates: HashMap::new(),
+            base: None,
+            sigs: HashMap::new(),
+        };
+        let err = interface.__call__(HashMap::new()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("missing ConstValue::_annenforceargs_ carrier")
         );
     }
 
