@@ -1894,6 +1894,8 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
             "interp_itertools::PAIRWISE_TYPE",
             interp_itertools::PAIRWISE_TYPE
         ),
+        pytype_addr!("interp_itertools::CYCLE_TYPE", interp_itertools::CYCLE_TYPE),
+        pytype_addr!("interp_itertools::CHAIN_TYPE", interp_itertools::CHAIN_TYPE),
         pytype_addr!("interp_sre::SRE_SCANNER_TYPE", interp_sre::SRE_SCANNER_TYPE),
         pytype_addr!(
             "functional::LONG_RANGE_ITER_TYPE",
@@ -1937,6 +1939,10 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
         (
             "pytraceback::PYTRACEBACK_TYPE",
             &crate::pytraceback::PYTRACEBACK_TYPE as *const _ as i64,
+        ),
+        (
+            "interp_buffer::PICKLEBUFFER_TYPE",
+            &crate::module::__pypy__::interp_buffer::PICKLEBUFFER_TYPE as *const _ as i64,
         ),
     ]
 }
