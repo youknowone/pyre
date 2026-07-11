@@ -2629,6 +2629,7 @@ fn full_body_walk_trace(
     // aborted walk's top-level `*_return` arm may have stashed, so a stale
     // value cannot leak into this walk's `Terminate` handling.
     crate::jitcode_dispatch::fbw_finish_payload_reset();
+    crate::jitcode_dispatch::fbw_executed_nonpure_residual_reset();
     // Clear the prior walk's store journal + unjournaled-effect flag so
     // dropped (aborted) entries cannot be applied by this walk's commit.
     crate::jitcode_dispatch::fbw_store_journal_reset();

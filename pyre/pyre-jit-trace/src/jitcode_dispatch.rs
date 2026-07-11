@@ -6369,6 +6369,9 @@ fn try_execute_residual_call_via_executor(
         let _suspend = majit_metainterp::TraceContinuationSuspendGuard::enter();
         majit_metainterp::executor::execute_residual_call(call_descr, func_ptr, &args)
     };
+    if !provably_side_effect_free {
+        fbw_mark_executed_nonpure_residual();
+    }
     ctx.trace_ctx
         .set_virtualizable_heap_ptr(saved_vable_heap_ptr.unwrap_or(std::ptr::null()));
     // pyjitpl.py:3349-3353 `vinfo.tracing_after_residual_call(virtualizable)`
@@ -7716,6 +7719,12 @@ thread_local! {
     /// journal never strands into a guard-state re-run.  Cleared after
     /// every bridge walk.
     static FBW_BRIDGE_NOREPLAY_ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+    /// Set when this walk concretely executed a residual call that is not
+    /// provably side-effect-free. Such a residual may have committed a heap
+    /// effect outside the FBW journals; later exit handling must not replay it.
+    static FBW_EXECUTED_NONPURE_RESIDUAL: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 /// Terminal disposition of a walk kept for the no-replay exit:
@@ -7762,6 +7771,23 @@ pub fn fbw_bridge_noreplay_arm(armed: bool) {
 /// current walk (read by the `run_perfn_walk` epilogue predicate).
 pub(crate) fn fbw_bridge_noreplay_armed() -> bool {
     FBW_BRIDGE_NOREPLAY_ARMED.with(|c| c.get())
+}
+
+/// Record that the current walk concretely executed a residual which could
+/// have committed non-journaled heap state.
+pub(crate) fn fbw_mark_executed_nonpure_residual() {
+    FBW_EXECUTED_NONPURE_RESIDUAL.with(|c| c.set(true));
+}
+
+/// Whether the current walk has concretely executed a non-provably-pure
+/// residual.
+pub(crate) fn fbw_executed_nonpure_residual() -> bool {
+    FBW_EXECUTED_NONPURE_RESIDUAL.with(|c| c.get())
+}
+
+/// Clear the executed-residual latch at a walk boundary.
+pub(crate) fn fbw_executed_nonpure_residual_reset() {
+    FBW_EXECUTED_NONPURE_RESIDUAL.with(|c| c.set(false));
 }
 
 /// Whether `PYRE_FBW_DEBUG_ABORT` is set.  When on, `full_body_walk_trace`
