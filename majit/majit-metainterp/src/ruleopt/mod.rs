@@ -11,6 +11,8 @@
 //! `optimizeopt`.
 
 pub mod codegen;
+pub mod rust_codegen;
+
 pub mod generate;
 pub mod parse;
 pub mod proof;
