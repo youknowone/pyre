@@ -2479,9 +2479,9 @@ pub fn reset_gc_fresh_for_test() {
 pub fn init_gc_subsystem() {
     build_gc_global();
     if !GC_TLS_INSTALLED.with(|c| c.get()) {
+        majit_gc::gc_sync::register_thread();
         majit_gc::shadow_stack::register_mutator();
         register_thread_root_areas();
-        majit_gc::gc_sync::register_thread();
         GC_MUTATOR_REGISTRATION.with(|_| {});
         install_gc_into_backend();
         GC_TLS_INSTALLED.with(|c| c.set(true));
