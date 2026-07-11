@@ -5185,6 +5185,34 @@ fn resolve_failarg_opref(
     resolve_opref(builder, constants, opref)
 }
 
+/// Resolve a local JUMP argument that is still a block parameter at its
+/// target.  `regalloc.py` keeps this distinction at `consider_label` /
+/// `force_spill_var`, then `_pop_all_regs_from_frame` restores every live
+/// reference after a collecting call before the next control-flow transfer.
+///
+/// The per-LABEL classifier can demote this raw OpRef at an earlier LABEL,
+/// while a later LABEL keeps it because that later header is only reached by a
+/// terminator.  In that case the global demoted-slot map suppresses the normal
+/// SSA reload, but the local JUMP must still forward the collector-updated root
+/// value into the kept target parameter.
+fn resolve_local_jump_arg(
+    builder: &mut FunctionBuilder,
+    constants: &indexmap::IndexMap<u32, i64>,
+    jf_ptr: CValue,
+    demoted_failarg_slots: &IndexMap<u32, i32>,
+    opref: OpRef,
+) -> CValue {
+    if !opref.is_none()
+        && !opref.is_constant()
+        && let Some(offset) = demoted_failarg_offset(demoted_failarg_slots, opref.raw())
+    {
+        return builder
+            .ins()
+            .load(cl_types::I64, MemFlags::trusted(), jf_ptr, offset);
+    }
+    resolve_opref(builder, constants, opref)
+}
+
 fn resolve_constant_i64(
     constants: &indexmap::IndexMap<u32, i64>,
     known_values: &IndexSet<u32>,
@@ -12953,7 +12981,15 @@ impl CraneliftBackend {
                             .iter()
                             .enumerate()
                             .filter(|(i, _)| !target_keep.is_some_and(|keep| !keep[*i]))
-                            .map(|(_, r)| resolve_opref(&mut builder, &constants, r.to_opref()))
+                            .map(|(_, r)| {
+                                resolve_local_jump_arg(
+                                    &mut builder,
+                                    &constants,
+                                    jf_ptr,
+                                    &demoted_failarg_slots,
+                                    r.to_opref(),
+                                )
+                            })
                             .collect();
                         let args = block_args_to(&mut builder, target_block, &vals);
                         builder.ins().jump(target_block, &args);
@@ -17636,6 +17672,100 @@ mod tests {
         let moved = backend.get_ref_value(&frame, 0);
         assert_ne!(moved, root);
         assert_eq!(unsafe { *(moved.0 as *const u64) }, 0xD30F_0002);
+    }
+
+    #[test]
+    fn demoted_ref_reloads_before_kept_local_jump_arg() {
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 160,
+            large_object_threshold: 1024,
+            ..GcConfig::default()
+        });
+        gc.register_type(TypeInfo::simple(16));
+        let root = gc.alloc_with_type(0, 16);
+        unsafe {
+            *(root.0 as *mut u64) = 0xD30F_0004;
+        }
+
+        let mut backend = CraneliftBackend::with_gc_allocator(Box::new(gc));
+        let carried = OpRef::ref_op(2);
+        let start_descr = make_label_descr(1704);
+        let body_descr = make_label_descr(1705);
+        let entry_guard = mk_op(
+            OpCode::GuardFalse,
+            &[OpRef::const_int(1)],
+            OpRef::NONE.raw(),
+        );
+        entry_guard.setfailargs(smallvec::smallvec![
+            rb(carried),
+            rb(OpRef::input_arg_int(1)),
+        ]);
+        let exit_guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(3)], OpRef::NONE.raw());
+        exit_guard.setfailargs(smallvec::smallvec![rb(carried)]);
+        let inputargs = vec![InputArg::new_ref(0), InputArg::new_int(1)];
+        let ops = vec![
+            mk_op(OpCode::SameAsR, &[OpRef::input_arg_ref(0)], carried.raw()),
+            entry_guard,
+            mk_op_with_descr(
+                OpCode::Label,
+                &[carried],
+                OpRef::NONE.raw(),
+                start_descr.clone(),
+            ),
+            mk_op_with_descr(OpCode::Jump, &[carried], OpRef::NONE.raw(), start_descr),
+            mk_op_with_descr(
+                OpCode::Label,
+                &[carried, OpRef::input_arg_int(1)],
+                OpRef::NONE.raw(),
+                body_descr.clone(),
+            ),
+            mk_op(
+                OpCode::IntGt,
+                &[OpRef::input_arg_int(1), OpRef::const_int(0)],
+                3,
+            ),
+            exit_guard,
+            mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(256)], 4),
+            mk_op(
+                OpCode::IntSub,
+                &[OpRef::input_arg_int(1), OpRef::const_int(1)],
+                5,
+            ),
+            mk_op_with_descr(
+                OpCode::Jump,
+                &[carried, OpRef::int_op(5)],
+                OpRef::NONE.raw(),
+                body_descr.clone(),
+            ),
+        ];
+
+        let mut token = JitCellToken::new(1704);
+        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+        let failed = backend.execute_token(&token, &[Value::Ref(root), Value::Int(1)]);
+        let guard_descr =
+            get_latest_descr_from_deadframe(&failed).expect("entry guard should fail");
+
+        let bridge_ops = vec![
+            mk_op(
+                OpCode::Label,
+                &[OpRef::input_arg_ref(0), OpRef::input_arg_int(1)],
+                OpRef::NONE.raw(),
+            ),
+            mk_op_with_descr(
+                OpCode::Jump,
+                &[OpRef::input_arg_ref(0), OpRef::input_arg_int(1)],
+                OpRef::NONE.raw(),
+                body_descr,
+            ),
+        ];
+        backend
+            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, &[], None)
+            .unwrap();
+
+        let frame = backend.execute_token(&token, &[Value::Ref(root), Value::Int(1)]);
+        let moved = backend.get_ref_value(&frame, 0);
+        assert_ne!(moved, root);
+        assert_eq!(unsafe { *(moved.0 as *const u64) }, 0xD30F_0004);
     }
 
     #[test]
