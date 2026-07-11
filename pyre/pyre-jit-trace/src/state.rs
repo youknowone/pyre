@@ -3754,7 +3754,7 @@ pub(crate) fn flush_walk_end_state_to_frame(
     frame: usize,
     resume_py_pc: usize,
 ) -> bool {
-    flush_walk_end_state_to_frame_with_item(ctx, frame, resume_py_pc, None)
+    flush_walk_end_state_to_frame_inner(ctx, frame, resume_py_pc, None, &[])
 }
 
 /// `flush_walk_end_state_to_frame` plus an optional in-flight FOR_ITER item
@@ -3769,6 +3769,25 @@ pub(crate) fn flush_walk_end_state_to_frame_with_item(
     frame: usize,
     resume_py_pc: usize,
     push: Option<(PyObjectRef, usize)>,
+) -> bool {
+    flush_walk_end_state_to_frame_inner(ctx, frame, resume_py_pc, push, &[])
+}
+
+pub(crate) fn flush_walk_end_state_to_frame_with_stack_overrides(
+    ctx: &TraceCtx,
+    frame: usize,
+    resume_py_pc: usize,
+    stack_overrides: &[(usize, PyObjectRef)],
+) -> bool {
+    flush_walk_end_state_to_frame_inner(ctx, frame, resume_py_pc, None, stack_overrides)
+}
+
+fn flush_walk_end_state_to_frame_inner(
+    ctx: &TraceCtx,
+    frame: usize,
+    resume_py_pc: usize,
+    push: Option<(PyObjectRef, usize)>,
+    stack_overrides: &[(usize, PyObjectRef)],
 ) -> bool {
     if frame == 0 {
         return false;
@@ -3828,10 +3847,21 @@ pub(crate) fn flush_walk_end_state_to_frame_with_item(
     }
     // Validation pass first: it allocates nothing, so entry presence
     // cannot change under it.  Commit only when every live slot resolves.
+    let stack_override_at = |abs: usize| -> Option<PyObjectRef> {
+        stack_overrides
+            .iter()
+            .find_map(|&(slot, value)| (slot == abs).then_some(value))
+    };
     for abs in 0..live {
         let Some((_opref, value)) = ctx.virtualizable_entry_at(base + abs) else {
             return false;
         };
+        if abs >= nlocals && !stack_overrides.is_empty() {
+            if stack_override_at(abs).is_none() {
+                return false;
+            }
+            continue;
+        }
         // An operand-STACK slot (`abs >= nlocals`) that resolves to a NULL Ref
         // is an UNPOPULATED shadow slot, not a live value: the virtualizable
         // shadow tracks locals/cells faithfully but its stack region is only
@@ -3870,7 +3900,11 @@ pub(crate) fn flush_walk_end_state_to_frame_with_item(
         let Some((_opref, value)) = ctx.virtualizable_entry_at(base + abs) else {
             return false;
         };
-        let boxed = boxed_slot_value_for_type(Type::Ref, &value);
+        let boxed = if abs >= nlocals {
+            stack_override_at(abs).unwrap_or_else(|| boxed_slot_value_for_type(Type::Ref, &value))
+        } else {
+            boxed_slot_value_for_type(Type::Ref, &value)
+        };
         unsafe {
             (*arr_ptr).as_mut_slice()[abs] = boxed;
         }

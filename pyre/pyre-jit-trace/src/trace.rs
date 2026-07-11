@@ -2070,6 +2070,54 @@ fn run_perfn_walk(
                     crate::jitcode_dispatch::fbw_abort_carrier_clear();
                 }
             }
+            if let Err(
+                crate::jitcode_dispatch::DispatchError::LoopBearingCalleeInlineUnsupported { pc },
+            ) = &walk_result
+            {
+                let abort_jit_pc = *pc;
+                if !crate::jitcode_dispatch::fbw_executed_nonpure_residual() {
+                    if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                        eprintln!(
+                            "[fbw-abort-flush] declined at abort_jit_pc={abort_jit_pc} \
+                             (no executed non-pure residual) — legacy replay kept"
+                        );
+                    }
+                } else if crate::jitcode_dispatch::fbw_has_unjournaled_effect() {
+                    if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                        eprintln!(
+                            "[fbw-abort-flush] declined at abort_jit_pc={abort_jit_pc} \
+                             (unjournaled effect) — legacy replay kept"
+                        );
+                    }
+                } else if let Some((resume_py_pc, stack_overrides)) =
+                    crate::jitcode_dispatch::fbw_abort_outer_resume_take()
+                {
+                    if crate::state::flush_walk_end_state_to_frame_with_stack_overrides(
+                        ctx,
+                        cf_addr,
+                        resume_py_pc,
+                        &stack_overrides,
+                    ) {
+                        if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                            eprintln!(
+                                "[fbw-abort-flush] COMMIT abort_jit_pc={abort_jit_pc} \
+                                 resume_py_pc={resume_py_pc} (nested inline decline)"
+                            );
+                        }
+                        WALK_END_FLUSH_COMMITTED.with(|c| c.set(true));
+                    } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                        eprintln!(
+                            "[fbw-abort-flush] declined at resume_py_pc={resume_py_pc} \
+                             (shadow slot without concrete / depth / lastblock) — legacy replay kept"
+                        );
+                    }
+                } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                    eprintln!(
+                        "[fbw-abort-flush] declined at abort_jit_pc={abort_jit_pc} \
+                         (no outer caller resume pc) — legacy replay kept"
+                    );
+                }
+            }
         }
 
         // #32 S2: a kept-stack branch guard whose not-taken arm cannot be
@@ -2630,6 +2678,7 @@ fn full_body_walk_trace(
     // value cannot leak into this walk's `Terminate` handling.
     crate::jitcode_dispatch::fbw_finish_payload_reset();
     crate::jitcode_dispatch::fbw_executed_nonpure_residual_reset();
+    crate::jitcode_dispatch::fbw_abort_outer_resume_py_pc_reset();
     // Clear the prior walk's store journal + unjournaled-effect flag so
     // dropped (aborted) entries cannot be applied by this walk's commit.
     crate::jitcode_dispatch::fbw_store_journal_reset();

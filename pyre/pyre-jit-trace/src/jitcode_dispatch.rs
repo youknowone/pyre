@@ -2871,6 +2871,8 @@ fn compute_bridge_root_parent_frame(
     );
     Some(InlineParentFrame {
         jitcode_index,
+        call_py_pc: None,
+        call_stack_overrides: Vec::new(),
         resume_py_pc,
         // Parent-frame words are never branch-tagged; negative tags belong to
         // a branch guard's own top-frame word.
@@ -6314,9 +6316,9 @@ fn try_execute_residual_call_via_executor(
     // provably side-effect-free.  Ref-result getters/dunders/user `__next__`
     // can mutate live heap through user frames while `writes_live_heap` is
     // false, and rollback would miss that concrete mutation.  The helper no-ops
-    // outside `FBW_INLINE_CODE_STACK`, so top-level depth-1 behavior is unchanged.
+    // on an empty session framestack, so top-level depth-1 behavior is unchanged.
     if !provably_side_effect_free {
-        fbw_abort_nested_unjournaled_residual(op_pc)?;
+        fbw_abort_nested_unjournaled_residual(ctx, op_pc)?;
     }
     let body_effect_candidate =
         !provably_side_effect_free && writes_live_heap && fbw_foriter_inflight_active();
@@ -7420,6 +7422,12 @@ fn fbw_strict_fold_frame_reg(ctx: &WalkContext<'_, '_>) -> u16 {
 struct InlineParentFrame {
     /// The caller's jitcode index (`(*JitCode).index`).
     jitcode_index: u32,
+    /// The caller CALL opcode's Python pc. A nested inline-capture abort
+    /// resumes the top-level frame here so the declined callee executes once.
+    call_py_pc: Option<u32>,
+    /// Concrete operand-stack slots at `call_py_pc`, keyed by absolute
+    /// `locals_cells_stack_w` index. Used only by the abort-point flush.
+    call_stack_overrides: Vec<(usize, pyre_object::PyObjectRef)>,
     /// The caller's resume Python pc: the CALL's return point (fallthrough),
     /// where the next opcode pops the call result.  First slice keeps this a
     /// plain py_pc (`< AFTER_RESIDUAL_CALL_PC_FLAG`); a CALL inside a
@@ -7438,6 +7446,17 @@ struct InlineParentFrame {
 /// RAII guard for one framestack level. Pop on drop so `?` and nested
 /// sub-walks unwind to the caller's level.
 struct InlineFrameGuard<'a>(&'a std::cell::RefCell<WalkSession>);
+
+thread_local! {
+    /// Top-level caller CALL pc and its concrete operand-stack slots stashed
+    /// by [`fbw_abort_nested_unjournaled_residual`] at the nested-inline
+    /// decline, read back by the trace loop after the walk unwinds
+    /// ([`fbw_abort_outer_resume_take`]) to drive the abort-point flush.
+    static FBW_ABORT_OUTER_RESUME_PY_PC: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+    static FBW_ABORT_OUTER_STACK_OVERRIDES: std::cell::RefCell<Vec<(usize, pyre_object::PyObjectRef)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
 
 impl<'a> InlineFrameGuard<'a> {
     fn enter(
@@ -8802,9 +8821,38 @@ fn fbw_abort_nested_unjournaled_residual(
             != Some(std::ffi::OsStr::new("0"))
     });
     if enabled && !ctx.session.borrow().framestack.is_empty() {
+        let (outer_resume_py_pc, stack_overrides) = {
+            let session = ctx.session.borrow();
+            match session.framestack.first().and_then(|f| f.parent.as_ref()) {
+                Some(frame) => (frame.call_py_pc, frame.call_stack_overrides.clone()),
+                None => (None, Vec::new()),
+            }
+        };
+        FBW_ABORT_OUTER_RESUME_PY_PC.with(|c| c.set(outer_resume_py_pc.map(|pc| pc as usize)));
+        FBW_ABORT_OUTER_STACK_OVERRIDES.with(|c| {
+            *c.borrow_mut() = stack_overrides;
+        });
         return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc });
     }
     Ok(())
+}
+
+/// Take the top-level caller CALL pc and stack slots stashed by
+/// [`fbw_abort_nested_unjournaled_residual`].
+pub(crate) fn fbw_abort_outer_resume_take()
+-> Option<(usize, Vec<(usize, pyre_object::PyObjectRef)>)> {
+    let pc = FBW_ABORT_OUTER_RESUME_PY_PC.with(|c| c.replace(None))?;
+    let stack_overrides = FBW_ABORT_OUTER_STACK_OVERRIDES.with(|c| {
+        let mut slots = c.borrow_mut();
+        std::mem::take(&mut *slots)
+    });
+    Some((pc, stack_overrides))
+}
+
+/// Clear the nested inline abort resume latch at a walk boundary.
+pub(crate) fn fbw_abort_outer_resume_py_pc_reset() {
+    FBW_ABORT_OUTER_RESUME_PY_PC.with(|c| c.set(None));
+    FBW_ABORT_OUTER_STACK_OVERRIDES.with(|c| c.borrow_mut().clear());
 }
 
 /// Whether the walk recorded an effect outside the journal's reach.
@@ -12329,6 +12377,113 @@ fn decline_inline_caller_frame_for_catch_marker(
     }
 }
 
+fn concrete_ref_for_color(
+    ctx: &WalkContext<'_, '_>,
+    color: usize,
+) -> Option<pyre_object::PyObjectRef> {
+    if let Some(ConcreteValue::Ref(ptr)) = ctx.concrete_registers_r.get(color) {
+        if !ptr.is_null() {
+            return Some(*ptr);
+        }
+    }
+    let opref = ctx.registers_r.get(color).copied()?;
+    match ctx.trace_ctx.concrete_of_opref(opref) {
+        Some(Value::Ref(r)) if !r.is_null() => Some(r.as_usize() as pyre_object::PyObjectRef),
+        _ => None,
+    }
+}
+
+fn concrete_ref_for_opref(
+    ctx: &WalkContext<'_, '_>,
+    opref: OpRef,
+) -> Option<pyre_object::PyObjectRef> {
+    match ctx.trace_ctx.concrete_of_opref(opref) {
+        Some(Value::Ref(r)) => Some(r.as_usize() as pyre_object::PyObjectRef),
+        _ => None,
+    }
+}
+
+fn collect_call_stack_overrides(
+    caller_sym: &crate::state::PyreSym,
+    ctx: &WalkContext<'_, '_>,
+    call_py_pc: usize,
+) -> Vec<(usize, pyre_object::PyObjectRef)> {
+    if caller_sym.jitcode.is_null() {
+        return Vec::new();
+    }
+    let (nlocals, depth, pcdep_entries) = unsafe {
+        let jc = &*caller_sym.jitcode;
+        if jc.payload.code_ptr.is_null() {
+            return Vec::new();
+        }
+        let depth = crate::liveness::liveness_for(jc.payload.code_ptr)
+            .depth_at_py_pc()
+            .get(call_py_pc)
+            .copied()
+            .unwrap_or(0) as usize;
+        let pcdep = jc
+            .payload
+            .metadata
+            .pcdep_color_slots
+            .get(call_py_pc)
+            .cloned()
+            .unwrap_or_default();
+        (caller_sym.nlocals, depth, pcdep)
+    };
+    let stack_end = nlocals + depth;
+    if depth == 0 {
+        return Vec::new();
+    }
+    let mut overrides = Vec::new();
+    if ctx.vstack_valid && ctx.vstack_depth == depth && ctx.vstack_boxes.len() >= depth {
+        for d in 0..depth {
+            let slot = nlocals + d;
+            if let Some(value) = concrete_ref_for_opref(ctx, ctx.vstack_boxes[d]) {
+                overrides.push((slot, value));
+            }
+        }
+    }
+    let base = ctx
+        .trace_ctx
+        .virtualizable_info()
+        .map(|info| info.num_static_extra_boxes)
+        .unwrap_or(0);
+    for slot in nlocals..stack_end {
+        if overrides.iter().any(|&(present, _)| present == slot) {
+            continue;
+        }
+        if let Some((_opref, Value::Ref(value))) = ctx.trace_ctx.virtualizable_entry_at(base + slot)
+        {
+            if !value.is_null() {
+                overrides.push((slot, value.as_usize() as pyre_object::PyObjectRef));
+            }
+        }
+    }
+    if pcdep_entries.is_empty() {
+        for slot in nlocals..stack_end {
+            if overrides.iter().any(|&(present, _)| present == slot) {
+                continue;
+            }
+            if let Some(value) = concrete_ref_for_color(ctx, slot) {
+                overrides.push((slot, value));
+            }
+        }
+    } else {
+        for &(bank, color, slot) in &pcdep_entries {
+            let slot = slot as usize;
+            if bank == 1 && slot >= nlocals && slot < stack_end {
+                if overrides.iter().any(|&(present, _)| present == slot) {
+                    continue;
+                }
+                if let Some(value) = concrete_ref_for_color(ctx, color as usize) {
+                    overrides.push((slot, value));
+                }
+            }
+        }
+    }
+    overrides
+}
+
 fn compute_inline_caller_frame(
     ctx: &mut WalkContext<'_, '_>,
     call_jit_pc: usize,
@@ -12361,7 +12516,7 @@ fn compute_inline_caller_frame(
     if caller_sym.jitcode.is_null() {
         return Err(InlineCallerFrameDecline::Unavailable);
     }
-    let (jitcode_index, fallthrough_py_pc, resume_marker_jit_pc, code_ptr) = unsafe {
+    let (jitcode_index, call_py_pc, fallthrough_py_pc, resume_marker_jit_pc, code_ptr) = unsafe {
         let jc = &*caller_sym.jitcode;
         if jc.payload.code_ptr.is_null() || !jc.payload.is_populated() {
             return Err(InlineCallerFrameDecline::Unavailable);
@@ -12377,6 +12532,7 @@ fn compute_inline_caller_frame(
         let fallthrough = crate::pyjitpl::semantic_fallthrough_pc(code, call_py) as u32;
         (
             jc.index as u32,
+            call_py as u32,
             fallthrough,
             jc.payload.after_residual_marker_for_jitcode_pc(call_jit_pc),
             jc.payload.code_ptr,
@@ -12393,6 +12549,7 @@ fn compute_inline_caller_frame(
     if depth == 0 {
         return Err(InlineCallerFrameDecline::Unavailable);
     }
+    let call_stack_overrides = collect_call_stack_overrides(caller_sym, ctx, call_py_pc as usize);
     // #73: the result slot's color comes from the codewriter-precomputed
     // `result_color_at_pc` (top-of-stack color at the return pc), not the flat
     // `stack_slot_color_map` — the result is not a live Variable here, so it
@@ -12458,6 +12615,8 @@ fn compute_inline_caller_frame(
     }
     Ok(InlineParentFrame {
         jitcode_index,
+        call_py_pc: Some(call_py_pc),
+        call_stack_overrides,
         resume_py_pc: fallthrough_py_pc,
         resume_marker_jit_pc,
         boxes,
@@ -12568,6 +12727,8 @@ fn compute_nested_inline_caller_frame(
     };
     Ok(InlineParentFrame {
         jitcode_index,
+        call_py_pc: Some(call_py as u32),
+        call_stack_overrides: Vec::new(),
         resume_py_pc: fallthrough_py_pc,
         resume_marker_jit_pc,
         boxes,
