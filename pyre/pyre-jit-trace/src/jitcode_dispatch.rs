@@ -23172,6 +23172,7 @@ fn handle(
             let result = OpRef::ConstInt(value);
             if ctx.is_top_level {
                 if fbw_call_assembler_enabled() {
+                    fbw_finish_concrete_set(ConcreteValue::Int(value));
                     fbw_terminate_with_finish(ctx, result, op.pc)?;
                 } else {
                     ctx.trace_ctx
@@ -23202,6 +23203,9 @@ fn handle(
                     // Slice b: portal-exit FINISH carries Type::Ref;
                     // `fbw_ensure_boxed_for_ca` re-boxes the float via
                     // wrapfloat.
+                    if let Some(majit_ir::Value::Float(v)) = ctx.trace_ctx.box_value(result) {
+                        fbw_finish_concrete_set(ConcreteValue::Float(v));
+                    }
                     fbw_terminate_with_finish(ctx, result, op.pc)?;
                 } else {
                     ctx.trace_ctx
