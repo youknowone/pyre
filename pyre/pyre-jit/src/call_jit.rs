@@ -4238,6 +4238,15 @@ pub extern "C" fn bh_import_name_fn(
     let frame = frame_ptr as *mut PyFrame;
     debug_assert!(!frame.is_null(), "IMPORT_NAME requires a live frame");
     if frame.is_null() {
+        // IMPORT_NAME produces a module or raises; it never yields a null
+        // result.  A null frame cannot honour that, so fail closed by
+        // publishing an exception for the trailing `GuardNoException`
+        // instead of returning a bare 0 the guard would accept.
+        let err = pyre_interpreter::PyError::new(
+            pyre_interpreter::PyErrorKind::SystemError,
+            "IMPORT_NAME residual received a null frame",
+        );
+        publish_residual_call_exception(err.to_exc_object() as i64);
         return 0;
     }
     match pyre_interpreter::importing::import_name(

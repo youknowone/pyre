@@ -1868,7 +1868,7 @@ pub fn import_name(
     w_fromlist: PyObjectRef,
     w_flag: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let w_builtin = frame.w_builtin;
+    let w_builtin = frame.get_builtin();
     let w_import = if !w_builtin.is_null() && unsafe { is_module(w_builtin) } {
         let w_dict = unsafe { pyre_object::w_module_get_w_dict(w_builtin) };
         if w_dict.is_null() {
