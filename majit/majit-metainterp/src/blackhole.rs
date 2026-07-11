@@ -7194,9 +7194,11 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     );
     // `raw_store_i/iiid` — emitted by the wasmi majit kernel's i64 memory
     // store arms (`majit_raw_store_i64` → `raw_store_i`, the analogue of
-    // RPython `raw_storage_setitem`).  A store's bounds-guard failure (OOB
-    // access) deopts and resumes forward through the dispatch jitcode, so
-    // the blackhole must decode this op; without the map entry
+    // RPython `raw_storage_setitem`).  The kernel store is branchless and
+    // never deopts on its own OOB access (it clamps out-of-bounds to an
+    // in-bounds no-op); but a guard failure on another op can resume
+    // forward through dispatch jitcode containing raw_store bytes, so the
+    // blackhole must decode this op; without the map entry
     // `wire_handler("raw_store_i/iiid", ...)` silently no-ops and the byte
     // stays unwired, desyncing the blackhole decoder.
     insns.insert(

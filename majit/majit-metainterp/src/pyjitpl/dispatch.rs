@@ -2774,17 +2774,16 @@ where
                 // (`ea` is already a byte offset — `emit_dynamic_offset_addr`
                 // in the backend adds it to `base` unscaled).
                 //
-                // SAFETY: `base_addr + ea_value` was bounds-checked by the
-                // guard that the JitCode's bounds-check `if` lowered to (this
-                // op is only reached on the in-bounds path); the address is
-                // within the outer interpreter's linear-memory allocation.
+                // SAFETY: the kernel clamps `ea` to an in-bounds byte offset
+                // (0 when the access would trap), so `base_addr + ea_value`
+                // is within the outer interpreter's linear-memory allocation.
                 let item_addr = (base_addr as usize).wrapping_add(ea_value as usize);
                 unsafe {
                     match itemsize {
-                        1 => *(item_addr as *mut u8) = value as u8,
-                        2 => *(item_addr as *mut u16) = value as u16,
-                        4 => *(item_addr as *mut u32) = value as u32,
-                        8 => *(item_addr as *mut i64) = value,
+                        1 => core::ptr::write_unaligned(item_addr as *mut u8, value as u8),
+                        2 => core::ptr::write_unaligned(item_addr as *mut u16, value as u16),
+                        4 => core::ptr::write_unaligned(item_addr as *mut u32, value as u32),
+                        8 => core::ptr::write_unaligned(item_addr as *mut i64, value),
                         other => {
                             panic!("BC_RAW_STORE_I: unsupported itemsize {}", other)
                         }
@@ -2828,13 +2827,13 @@ where
                 let item_addr = (base_addr as usize).wrapping_add(ea_value as usize);
                 let concrete = unsafe {
                     match (itemsize, is_signed) {
-                        (1, true) => *(item_addr as *const i8) as i64,
-                        (1, false) => *(item_addr as *const u8) as i64,
-                        (2, true) => *(item_addr as *const i16) as i64,
-                        (2, false) => *(item_addr as *const u16) as i64,
-                        (4, true) => *(item_addr as *const i32) as i64,
-                        (4, false) => *(item_addr as *const u32) as i64,
-                        (8, _) => *(item_addr as *const i64),
+                        (1, true) => core::ptr::read_unaligned(item_addr as *const i8) as i64,
+                        (1, false) => core::ptr::read_unaligned(item_addr as *const u8) as i64,
+                        (2, true) => core::ptr::read_unaligned(item_addr as *const i16) as i64,
+                        (2, false) => core::ptr::read_unaligned(item_addr as *const u16) as i64,
+                        (4, true) => core::ptr::read_unaligned(item_addr as *const i32) as i64,
+                        (4, false) => core::ptr::read_unaligned(item_addr as *const u32) as i64,
+                        (8, _) => core::ptr::read_unaligned(item_addr as *const i64),
                         other => {
                             panic!(
                                 "BC_RAW_LOAD_I: unsupported (itemsize, signed) = {:?}",
