@@ -1275,6 +1275,25 @@ static DICT_STORAGE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(
     )
 });
 
+static ITEMS_BLOCK_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_object_descr_group_with_def_path(
+        pyre_object::object_array::ITEMS_BLOCK_ITEMS_OFFSET,
+        0,
+        0,
+        &[(
+            "ItemsBlock.capacity",
+            0,
+            8,
+            Type::Int,
+            false,
+            true,
+            false,
+        )],
+        "ItemsBlock",
+        "object_array::ItemsBlock",
+    )
+});
+
 // `pypy/objspace/std/sliceobject.py:13` `W_SliceObject._immutable_fields_ =
 // ['w_start', 'w_stop', 'w_step']` — all three Ref fields are immutable
 // once `__init__` runs.  The `space.newslice(w_start, w_end, w_step)` JIT
@@ -2027,8 +2046,10 @@ pub fn specialised_tuple_oo_w_class_descr() -> DescrRef {
 /// allocated the capacity is fixed; resize allocates a fresh block.
 /// Callers combine `list_items_descr()` / `tuple_wrappeditems_descr()`
 /// → `ItemsBlock*` with this descr to read the block's allocated size.
+/// The group parent lets sub-walk reads pass the optimizer's
+/// `ensure_ptr_info_arg0` parent lookup.
 pub fn items_block_capacity_descr() -> DescrRef {
-    make_immutable_field_descr(0, 8, Type::Int, false)
+    field_descr_from_group(&ITEMS_BLOCK_DESCR_GROUP, 0)
 }
 
 pub fn int_intval_descr() -> DescrRef {
