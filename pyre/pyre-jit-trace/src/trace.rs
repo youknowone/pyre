@@ -2189,10 +2189,28 @@ fn run_perfn_walk(
             outcome_kind,
         );
     }
-    if WALK_END_FLUSH_COMMITTED.with(|c| c.get()) || terminate_no_replay {
+    let committed = WALK_END_FLUSH_COMMITTED.with(|c| c.get()) || terminate_no_replay;
+    let journal = crate::jitcode_dispatch::fbw_store_journal_len();
+    if committed {
         crate::jitcode_dispatch::fbw_store_journal_commit();
     } else {
         crate::jitcode_dispatch::fbw_store_journal_rollback();
+    }
+    if authoritative && std::env::var_os("PYRE_FBW_CENSUS").is_some() {
+        let mut end = match &walk_result {
+            Ok((outcome, _)) => format!("{outcome:?}"),
+            Err(error) => format!("{error:?}"),
+        };
+        if let Some(at) = end.find(|c: char| matches!(c, '(' | '{' | ' ')) {
+            end.truncate(at);
+        }
+        let (unj_val, unj_sym) = crate::jitcode_dispatch::fbw_unjournaled_kinds();
+        let (exec_v, exec_mf, exec_pl) = crate::jitcode_dispatch::fbw_executed_residual_counts();
+        eprintln!(
+            "[fbw-census] end={end} committed={committed} bridge={} unj_val={unj_val} \
+             unj_sym={unj_sym} exec_v={exec_v} exec_mf={exec_mf} exec_pl={exec_pl} journal={journal}",
+            ctx.is_bridge_trace,
+        );
     }
 
     Some((entry, code_len, walk_result))

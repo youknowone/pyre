@@ -609,7 +609,7 @@ pub struct WalkContext<'frame, 'static_a: 'frame> {
     /// ops — an effect declined at walk time still lands exactly once
     /// (see the void gate in
     /// [`try_execute_residual_call_via_executor`] and
-    /// [`FBW_UNJOURNALED_EFFECT`]).  A per-opcode arm walk has no
+    /// [`fbw_has_unjournaled_effect`]).  A per-opcode arm walk has no
     /// replay: the interpreter advances opcode by opcode during
     /// tracing and the compiled loop is entered at the NEXT iteration,
     /// so an effect the walker declines to execute is simply lost —
@@ -5809,14 +5809,14 @@ pub fn bool_box_truth_reset() {
 /// or corrupt the live heap under the discard-the-trace probe.
 ///
 /// **Return value**:
-/// * `Ok(Some(Ok(_)))` — helper executed normally, `recorded` OpRef
+/// * `Ok(ResidualExecOutcome::Executed(Ok(_)))` — helper executed normally, `recorded` OpRef
 ///   stamped with the concrete result.
-/// * `Ok(Some(Err(bh_exc)))` — helper raised; `bh_exc` is the wrapped
+/// * `Ok(ResidualExecOutcome::Executed(Err(bh_exc)))` — helper raised; `bh_exc` is the wrapped
 ///   `PyError` pointer (from `BH_LAST_EXC_VALUE`).  Caller is
 ///   responsible for routing into `WalkContext.last_exc_value` so the
 ///   downstream `GuardNoException` walker handler picks it up; the
 ///   `recorded` OpRef is NOT stamped (no concrete result).
-/// * `Ok(None)` — fold declined (preconditions not met: not the
+/// * `Ok(ResidualExecOutcome::Declined(_))` — fold declined (preconditions not met: not the
 ///   authoritative executor, opcode out of set, funcbox non-const, arity
 ///   exceeds [`MAX_HOST_CALL_ARITY`], any operand lacks a concrete
 ///   `box_value`, or any Ref arg is NULL), or the call's result is void
@@ -5835,6 +5835,18 @@ pub fn bool_box_truth_reset() {
 /// alongside [`try_fold_pure_call_via_executor`].  The may-force /
 /// can-raise path wires the `Err` exception through
 /// `WalkContext.last_exc_value`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ResidualDecline {
+    ValueUnavailable,
+    Symbolic,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ResidualExecOutcome {
+    Executed(Result<i64, i64>),
+    Declined(ResidualDecline),
+}
+
 fn try_execute_residual_call_via_executor(
     ctx: &mut WalkContext<'_, '_>,
     call_opcode: OpCode,
@@ -5842,7 +5854,7 @@ fn try_execute_residual_call_via_executor(
     call_descr: &dyn majit_ir::descr::CallDescr,
     recorded: OpRef,
     op_pc: usize,
-) -> Result<Option<Result<i64, i64>>, DispatchError> {
+) -> Result<ResidualExecOutcome, DispatchError> {
     // Orthodox sub-jitcode walk safety (#171 wall-5d): a residual call whose
     // funcbox is a `symbolic_fnaddr` placeholder — a 64-bit `DefaultHasher`
     // hash of an in-body helper's `CallPath`/`CallTarget`, minted when
@@ -5869,7 +5881,7 @@ fn try_execute_residual_call_via_executor(
     // leave the flag `false` so the call is recorded symbolically
     // without re-running its side effects.
     if !ctx.is_authoritative_executor {
-        return Ok(None);
+        return Ok(ResidualExecOutcome::Declined(ResidualDecline::Symbolic));
     }
     let plain_or_loopinvariant = matches!(
         call_opcode,
@@ -5895,10 +5907,10 @@ fn try_execute_residual_call_via_executor(
             | OpCode::CallMayForceN
     );
     if !plain_or_loopinvariant && !is_may_force {
-        return Ok(None);
+        return Ok(ResidualExecOutcome::Declined(ResidualDecline::Symbolic));
     }
     if allboxes.is_empty() {
-        return Ok(None);
+        return Ok(ResidualExecOutcome::Declined(ResidualDecline::Symbolic));
     }
     // Same funcbox-must-be-const invariant as `try_fold_pure_call_via_executor`:
     // a non-const funcbox carries a stale stamp and dereferencing it as a
@@ -5907,7 +5919,7 @@ fn try_execute_residual_call_via_executor(
     // implicitly requires constness too (residual_call descrs always
     // carry a fixed funcptr at translation time).
     if !allboxes[0].is_constant() {
-        return Ok(None);
+        return Ok(ResidualExecOutcome::Declined(ResidualDecline::Symbolic));
     }
     // The LOAD_CONST helper (oopspec `LoadConst`) has a dedicated fold in the
     // residual_call dispatchers: when the const index AND the code pointer
@@ -5921,12 +5933,12 @@ fn try_execute_residual_call_via_executor(
     // `w_code_get_ptr` and faults.  Leave it symbolic, mirroring the fold's
     // "falls through to the generic record" contract.
     if call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::LoadConst {
-        return Ok(None);
+        return Ok(ResidualExecOutcome::Declined(ResidualDecline::Symbolic));
     }
     let funcptr_val = ctx.trace_ctx.box_value(allboxes[0]);
     let func_ptr = match funcptr_val {
         Some(majit_ir::Value::Int(addr)) => addr,
-        _ => return Ok(None),
+        _ => return Ok(ResidualExecOutcome::Declined(ResidualDecline::Symbolic)),
     };
     // Sub-slice 4 safety gate — reject `symbolic_fnaddr_for_path`
     // placeholder values that escaped runtime patching.  Pyre's
@@ -5944,7 +5956,7 @@ fn try_execute_residual_call_via_executor(
     // non-fnptr value (e.g. an int constant mistakenly routed through
     // the funcbox slot).
     if (func_ptr as u64) >> 47 != 0 {
-        return Ok(None);
+        return Ok(ResidualExecOutcome::Declined(ResidualDecline::Symbolic));
     }
     // A residual whose funcptr is a `PyFrame` operand-stack accessor
     // (`pop`/`push`/`peek`/`peek_at`) reads or mutates the live frame's
@@ -5959,10 +5971,10 @@ fn try_execute_residual_call_via_executor(
     // frame whose operand stack the compiled trace's preceding pushes have
     // populated.
     if pyre_interpreter::is_pyframe_operand_stack_accessor(func_ptr as usize) {
-        return Ok(None);
+        return Ok(ResidualExecOutcome::Declined(ResidualDecline::Symbolic));
     }
     if allboxes.len() - 1 > majit_translate::codewriter::insns::MAX_HOST_CALL_ARITY {
-        return Ok(None);
+        return Ok(ResidualExecOutcome::Declined(ResidualDecline::Symbolic));
     }
     // A void residual (CALL_N family) is a side effect with no result box, so
     // `do_residual_call` executes it EAGERLY during the walk and resumes the
@@ -5994,7 +6006,9 @@ fn try_execute_residual_call_via_executor(
                             arg_index,
                         });
                     }
-                    return Ok(None);
+                    return Ok(ResidualExecOutcome::Declined(
+                        ResidualDecline::ValueUnavailable,
+                    ));
                 }
                 r.as_usize() as i64
             }
@@ -6007,7 +6021,9 @@ fn try_execute_residual_call_via_executor(
                         arg_index,
                     });
                 }
-                return Ok(None);
+                return Ok(ResidualExecOutcome::Declined(
+                    ResidualDecline::ValueUnavailable,
+                ));
             }
         };
         args.push(v);
@@ -6024,7 +6040,7 @@ fn try_execute_residual_call_via_executor(
     // prepends it as arg0 only when non-null), so a concrete-NULL there
     // is the normal plain-call shape.  These exemptions MUST match
     // `walker_abort_if_mayforce_null_ref_arg`'s — otherwise a normal
-    // no-receiver keyword/star call is declined here to `Ok(None)`
+    // no-receiver keyword/star call is declined as symbolic
     // (left symbolic), which drops the recording iteration's call
     // exactly once (`g(i, d=4)` in a hot loop summed to n-1, callee
     // ran n-1 times).
@@ -6056,7 +6072,7 @@ fn try_execute_residual_call_via_executor(
             continue;
         }
         if matches!(call_descr.arg_types().get(i), Some(majit_ir::Type::Ref)) && arg == 0 {
-            return Ok(None);
+            return Ok(ResidualExecOutcome::Declined(ResidualDecline::Symbolic));
         }
     }
     // #57 (Finding #1, in-place container mutation): an in-flight FOR_ITER
@@ -6366,6 +6382,7 @@ fn try_execute_residual_call_via_executor(
     }
     match exec_result {
         Ok(result_i64) => {
+            fbw_count_executed_residual(is_void, is_may_force);
             // `pyjitpl.py:1685-1690 _opimpl_residual_call*` finishes its
             // success arm with `metainterp.clear_exception()` (called
             // implicitly through `do_residual_call`'s no-raise tail).
@@ -6393,9 +6410,7 @@ fn try_execute_residual_call_via_executor(
             // pyjitpl.py:1392 `result_box.value = result` analogue — stamp
             // the recorded OpRef with the executed concrete so downstream
             // `concrete_of_opref` / `box_value` consumers see the folded
-            // value.  Full-body-walk Void results returned `None` above
-            // (recorded symbolically); a per-opcode arm walk reaches this
-            // arm for an executed void helper with nothing to stamp.
+            // value. An executed void helper has nothing to stamp.
             match call_descr.result_type() {
                 majit_ir::Type::Int => {
                     ctx.trace_ctx
@@ -6480,6 +6495,7 @@ fn try_execute_residual_call_via_executor(
             }
         }
         Err(bh_exc) => {
+            fbw_count_executed_residual(is_void, is_may_force);
             // pyjitpl.py:1690-1696 `metainterp.execute_raised(exception,
             // constant=False)` analogue — seed the standing exception
             // state so downstream walker chain (`reraise/`,
@@ -6514,7 +6530,7 @@ fn try_execute_residual_call_via_executor(
             }
         }
     }
-    Ok(Some(exec_result))
+    Ok(ResidualExecOutcome::Executed(exec_result))
 }
 
 /// `pyjitpl.py:3671-3681 MetaInterp.direct_call_release_gil` port.
@@ -7786,20 +7802,22 @@ thread_local! {
     static FBW_FORITER_INFLIGHT: std::cell::RefCell<Vec<InflightForiter>> =
         const { std::cell::RefCell::new(Vec::new()) };
 
-    /// Set when the walk records a side effect that was neither executed
-    /// at walk time nor undo-logged: a void residual call recorded
-    /// symbolically (the `try_execute_residual_call_via_executor` void
-    /// gate).  A flagged walk must not adopt its end state — the flush
-    /// site keeps the legacy replay, which is the only path that applies
-    /// the recorded effect.
-    static FBW_UNJOURNALED_EFFECT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FBW_UNJOURNALED_VALUE_UNAVAILABLE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    static FBW_UNJOURNALED_SYMBOLIC: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+
+    static FBW_EXECUTED_RESIDUAL_VOID: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static FBW_EXECUTED_RESIDUAL_MAYFORCE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static FBW_EXECUTED_RESIDUAL_PLAIN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 
     /// gh#467 executed-effect odometer: bumped only when the walk concretely
     /// applies an effect — a store/append/cell journal push, a Void / mutator-
     /// tagged residual executed by [`try_execute_residual_call_via_executor`],
     /// or a residual whose concrete run entered a user Python frame (a value-
     /// returning dunder that may mutate).  A declined residual recorded only
-    /// symbolically sets [`FBW_UNJOURNALED_EFFECT`] but does NOT move this
+    /// symbolically sets an unjournaled flag ([`FBW_UNJOURNALED_VALUE_UNAVAILABLE`]
+    /// / [`FBW_UNJOURNALED_SYMBOLIC`]) but does NOT move this
     /// counter: no effect executed.  The inline abort-forward-flush gate
     /// (`try_walker_inline_user_call` / gh#467) snapshots both signals at the
     /// CALL.  A nonzero count delta means the callee attempt cannot be
@@ -7909,13 +7927,17 @@ fn fbw_built_exc_take(op: OpRef) -> bool {
     FBW_BUILT_EXC.with(|s| s.borrow_mut().remove(&op))
 }
 
-/// Clear the store journal and the unjournaled-effect flag before a walk
+/// Clear the store journal and residual-call census before a walk
 /// begins (mirrors [`bool_box_truth_reset`]).
 pub(crate) fn fbw_store_journal_reset() {
     FBW_STORE_JOURNAL.with(|j| j.borrow_mut().clear());
     FBW_APPEND_JOURNAL.with(|j| j.borrow_mut().clear());
     FBW_CELL_STORE_JOURNAL.with(|j| j.borrow_mut().clear());
-    FBW_UNJOURNALED_EFFECT.with(|c| c.set(false));
+    FBW_UNJOURNALED_VALUE_UNAVAILABLE.with(|c| c.set(false));
+    FBW_UNJOURNALED_SYMBOLIC.with(|c| c.set(false));
+    FBW_EXECUTED_RESIDUAL_VOID.with(|c| c.set(0));
+    FBW_EXECUTED_RESIDUAL_MAYFORCE.with(|c| c.set(0));
+    FBW_EXECUTED_RESIDUAL_PLAIN.with(|c| c.set(0));
     // gh#467: reset the executed-effect odometer and any stale
     // forward-flush carrier a prior aborted walk latched.
     FBW_EXECUTED_EFFECT_COUNT.with(|c| c.set(0));
@@ -8297,9 +8319,14 @@ pub(crate) fn fbw_store_journal_len() -> usize {
 }
 
 /// Mark the walk as carrying a recorded-but-unexecuted side effect only
-/// the legacy replay applies (see [`FBW_UNJOURNALED_EFFECT`]).
-pub(crate) fn fbw_mark_unjournaled_effect() {
-    FBW_UNJOURNALED_EFFECT.with(|c| c.set(true));
+/// the legacy replay applies.
+pub(crate) fn fbw_mark_unjournaled_effect(cause: ResidualDecline) {
+    match cause {
+        ResidualDecline::ValueUnavailable => {
+            FBW_UNJOURNALED_VALUE_UNAVAILABLE.with(|c| c.set(true));
+        }
+        ResidualDecline::Symbolic => FBW_UNJOURNALED_SYMBOLIC.with(|c| c.set(true)),
+    }
 }
 
 /// gh#467 executed-effect odometer read (see [`FBW_EXECUTED_EFFECT_COUNT`]).
@@ -8436,7 +8463,7 @@ pub(crate) fn fbw_abort_carrier_clear() {
     FBW_ABORT_CALL_RESUME.with(|c| *c.borrow_mut() = None);
 }
 
-/// An unexecutable residual call (`try_execute_residual_call_via_executor`
+/// A declined residual call (`try_execute_residual_call_via_executor`
 /// returned `None`) reached during a multiframe-inlined callee sub-walk
 /// (the framestack is non-empty) cannot fall back to the walk-end
 /// legacy replay.  The replay re-enters the freshly compiled loop from the
@@ -8469,7 +8496,34 @@ fn fbw_abort_nested_unjournaled_residual(
 
 /// Whether the walk recorded an effect outside the journal's reach.
 pub(crate) fn fbw_has_unjournaled_effect() -> bool {
-    FBW_UNJOURNALED_EFFECT.with(|c| c.get())
+    let (value_unavailable, symbolic) = fbw_unjournaled_kinds();
+    value_unavailable || symbolic
+}
+
+pub(crate) fn fbw_unjournaled_kinds() -> (bool, bool) {
+    (
+        FBW_UNJOURNALED_VALUE_UNAVAILABLE.with(|c| c.get()),
+        FBW_UNJOURNALED_SYMBOLIC.with(|c| c.get()),
+    )
+}
+
+fn fbw_count_executed_residual(is_void: bool, is_may_force: bool) {
+    let counter = if is_void {
+        &FBW_EXECUTED_RESIDUAL_VOID
+    } else if is_may_force {
+        &FBW_EXECUTED_RESIDUAL_MAYFORCE
+    } else {
+        &FBW_EXECUTED_RESIDUAL_PLAIN
+    };
+    counter.with(|c| c.set(c.get().wrapping_add(1)));
+}
+
+pub(crate) fn fbw_executed_residual_counts() -> (u32, u32, u32) {
+    (
+        FBW_EXECUTED_RESIDUAL_VOID.with(|c| c.get()),
+        FBW_EXECUTED_RESIDUAL_MAYFORCE.with(|c| c.get()),
+        FBW_EXECUTED_RESIDUAL_PLAIN.with(|c| c.get()),
+    )
 }
 
 /// `framework.py root_walker.walk_roots` parity for the store and append
@@ -12035,13 +12089,16 @@ fn direct_call_release_gil(
         recorded,
         pc,
     )?;
-    // A `None` leaves the call recorded symbolically WITHOUT running it, so
+    // A decline leaves the call recorded symbolically WITHOUT running it, so
     // the walk-end no-replay commit must stay off for this trace.
-    if resid_exec.is_none() {
-        fbw_abort_nested_unjournaled_residual(ctx, pc)?;
-        fbw_mark_unjournaled_effect();
-    }
-    let resid_raised = matches!(resid_exec, Some(Err(_)));
+    let resid_raised = match resid_exec {
+        ResidualExecOutcome::Executed(result) => result.is_err(),
+        ResidualExecOutcome::Declined(cause) => {
+            fbw_abort_nested_unjournaled_residual(ctx, pc)?;
+            fbw_mark_unjournaled_effect(cause);
+            false
+        }
+    };
     debug_assert!(
         !resid_raised || ei.check_can_raise(false),
         "{caller}: release-gil helper raised on a `!can_raise` EI — \
@@ -13089,11 +13146,14 @@ fn try_walker_call_assembler_self_recursive(
     // A decline leaves the CALL_ASSEMBLER recorded symbolically WITHOUT
     // running it — a side effect only the legacy replay applies, so the
     // walk-end no-replay commit must stay off for this trace (see
-    // `FBW_UNJOURNALED_EFFECT`).
-    if exec.is_none() {
-        fbw_mark_unjournaled_effect();
-    }
-    let exec_raised = matches!(exec, Some(Err(_)));
+    // `fbw_has_unjournaled_effect`).
+    let exec_raised = match exec {
+        ResidualExecOutcome::Executed(result) => result.is_err(),
+        ResidualExecOutcome::Declined(cause) => {
+            fbw_mark_unjournaled_effect(cause);
+            false
+        }
+    };
 
     // pyjitpl.py:2072: heapcache invalidation for the escaped frame.
     ctx.trace_ctx
@@ -13253,10 +13313,13 @@ fn emit_walker_loop_callee_call_assembler(
         ca_result,
         op.pc,
     )?;
-    if exec.is_none() {
-        fbw_mark_unjournaled_effect();
-    }
-    let exec_raised = matches!(exec, Some(Err(_)));
+    let exec_raised = match exec {
+        ResidualExecOutcome::Executed(result) => result.is_err(),
+        ResidualExecOutcome::Declined(cause) => {
+            fbw_mark_unjournaled_effect(cause);
+            false
+        }
+    };
 
     ctx.trace_ctx
         .heap_cache_mut()
@@ -14877,16 +14940,19 @@ fn dispatch_residual_call_iRd_kind(
             recorded,
             op.pc,
         )?;
-        // A `None` leaves the call recorded symbolically WITHOUT running
+        // A decline leaves the call recorded symbolically WITHOUT running
         // it — a side effect only the legacy replay applies, so the
         // walk-end no-replay commit must stay off for this trace (see
-        // `FBW_UNJOURNALED_EFFECT`).  Pure/elidable calls never reach
+        // `fbw_has_unjournaled_effect`).  Pure/elidable calls never reach
         // this dispatcher (they fold via the pure-call executor).
-        if resid_exec.is_none() {
-            fbw_abort_nested_unjournaled_residual(ctx, op.pc)?;
-            fbw_mark_unjournaled_effect();
-        }
-        let resid_raised = matches!(resid_exec, Some(Err(_)));
+        let resid_raised = match resid_exec {
+            ResidualExecOutcome::Executed(result) => result.is_err(),
+            ResidualExecOutcome::Declined(cause) => {
+                fbw_abort_nested_unjournaled_residual(ctx, op.pc)?;
+                fbw_mark_unjournaled_effect(cause);
+                false
+            }
+        };
         debug_assert!(
             !resid_raised || can_raise,
             "dispatch_residual_call_iRd_kind: helper raised on a \
@@ -19866,16 +19932,19 @@ fn dispatch_residual_call_iIRd_kind(
             recorded,
             op.pc,
         )?;
-        // A `None` leaves the call recorded symbolically WITHOUT running
+        // A decline leaves the call recorded symbolically WITHOUT running
         // it — a side effect only the legacy replay applies, so the
         // walk-end no-replay commit must stay off for this trace (see
-        // `FBW_UNJOURNALED_EFFECT`).  Pure/elidable calls never reach
+        // `fbw_has_unjournaled_effect`).  Pure/elidable calls never reach
         // this dispatcher (they fold via the pure-call executor).
-        if resid_exec.is_none() {
-            fbw_abort_nested_unjournaled_residual(ctx, op.pc)?;
-            fbw_mark_unjournaled_effect();
-        }
-        let resid_raised = matches!(resid_exec, Some(Err(_)));
+        let resid_raised = match resid_exec {
+            ResidualExecOutcome::Executed(result) => result.is_err(),
+            ResidualExecOutcome::Declined(cause) => {
+                fbw_abort_nested_unjournaled_residual(ctx, op.pc)?;
+                fbw_mark_unjournaled_effect(cause);
+                false
+            }
+        };
         debug_assert!(
             !resid_raised || can_raise,
             "dispatch_residual_call_iIRd_kind: helper raised on a \
@@ -20063,16 +20132,19 @@ fn dispatch_residual_call_iIRFd_kind(
             recorded,
             op.pc,
         )?;
-        // A `None` leaves the call recorded symbolically WITHOUT running
+        // A decline leaves the call recorded symbolically WITHOUT running
         // it — a side effect only the legacy replay applies, so the
         // walk-end no-replay commit must stay off for this trace (see
-        // `FBW_UNJOURNALED_EFFECT`).  Pure/elidable calls never reach
+        // `fbw_has_unjournaled_effect`).  Pure/elidable calls never reach
         // this dispatcher (they fold via the pure-call executor).
-        if resid_exec.is_none() {
-            fbw_abort_nested_unjournaled_residual(ctx, op.pc)?;
-            fbw_mark_unjournaled_effect();
-        }
-        let resid_raised = matches!(resid_exec, Some(Err(_)));
+        let resid_raised = match resid_exec {
+            ResidualExecOutcome::Executed(result) => result.is_err(),
+            ResidualExecOutcome::Declined(cause) => {
+                fbw_abort_nested_unjournaled_residual(ctx, op.pc)?;
+                fbw_mark_unjournaled_effect(cause);
+                false
+            }
+        };
         debug_assert!(
             !resid_raised || can_raise,
             "dispatch_residual_call_iIRFd_kind: helper raised on a \
@@ -28460,7 +28532,7 @@ mod tests {
         );
         drop(wc);
         assert!(
-            matches!(result, Ok(Some(Ok(_)))),
+            matches!(result, Ok(ResidualExecOutcome::Executed(Ok(_)))),
             "non-forcing may-force call with active vable must execute normally",
         );
         assert_eq!(
