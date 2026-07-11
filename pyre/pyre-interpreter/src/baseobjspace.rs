@@ -6705,19 +6705,11 @@ pub unsafe fn isinstance_w(w_obj: PyObjectRef, w_cls: PyObjectRef) -> bool {
     if w_obj_type.is_null() {
         return false;
     }
-    if std::ptr::eq(w_obj_type, w_cls) {
-        return true;
-    }
-    // Walk MRO
-    let mro_ptr = w_type_get_mro(w_obj_type);
-    if !mro_ptr.is_null() {
-        for &t in &*mro_ptr {
-            if std::ptr::eq(t, w_cls) {
-                return true;
-            }
-        }
-    }
-    false
+    // `type(w_inst).issubtype(w_type)` (objspace.py:808 _type_isinstance).
+    // The MRO membership scan is the single home `w_type_issubtype`
+    // (self-identity is mro[0], so the `w_obj_type is w_cls` fast path is
+    // subsumed); the null-mro case walks find_best_base there.
+    w_type_issubtype(w_obj_type, w_cls)
 }
 
 /// pypy/interpreter/baseobjspace.py:419-420 DescrMismatch.

@@ -724,6 +724,13 @@ pub unsafe fn w_type_get_mro(obj: PyObjectRef) -> *mut Vec<PyObjectRef> {
 /// (typeobject.py:603/1640).  The single home for the MRO subtype check;
 /// interpreter-level subtype guards and reflected-binop dispatch delegate
 /// here rather than each re-scanning the MRO.
+///
+/// Under the JIT `issubtype` runs this scan inside `_pure_issubtype`
+/// (`@elidable_promote`, typeobject.py:1657), so the MRO membership walk
+/// is not traced — its result is promoted.  The `dont_look_inside` marker
+/// is the equivalent boundary: the JIT residualises the call instead of
+/// tracing the per-type MRO read the tracer cannot model.
+#[majit_macros::dont_look_inside]
 pub unsafe fn w_type_issubtype(w_type: PyObjectRef, cls: PyObjectRef) -> bool {
     let mro_ptr = w_type_get_mro(w_type);
     if mro_ptr.is_null() {

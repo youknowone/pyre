@@ -445,6 +445,21 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::w_type_set_uses_object_setattr",
         crate::opcode_ops::bh_w_type_set_uses_object_setattr as *const (),
     );
+    // `w_type_issubtype` is the MRO membership scan (`_issubtype`,
+    // typeobject.py:1640), run under the JIT inside `_pure_issubtype`
+    // (`@elidable_promote`, typeobject.py:1657).  Its `#[dont_look_inside]`
+    // residualises the call; bind the `-> bool` Rust `fn` directly by
+    // qualified path (2-pointer args, JIT-representable, no C-ABI bridge).
+    let w_type_issubtype: unsafe fn(
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+    ) -> bool = pyre_object::w_type_issubtype;
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::typeobject::w_type_issubtype",
+        "pyre_object::w_type_issubtype",
+        w_type_issubtype as *const (),
+    );
     // `lookup_exc_class_for_kind` reads the TLS `EXC_CLASS_BY_KIND`
     // registry the tracer cannot model; its residual call rides a C-ABI
     // bridge that reconstructs the `ExcKind` from the integer arg slot.
