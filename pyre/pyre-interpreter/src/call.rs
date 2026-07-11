@@ -3758,6 +3758,7 @@ fn mangle(name: &str, klass: &str) -> String {
 /// typeobject.py:1131-1140 copy_flags_from_bases:
 ///   w_self.hasdict |= w_base.hasdict
 ///   w_self.weakrefable |= w_base.weakrefable
+///   typeobject.py:1406 w_self.hasuserdel |= w_base.hasuserdel
 unsafe fn copy_flags_from_bases(
     w_type: pyre_object::PyObjectRef,
     w_bases: pyre_object::PyObjectRef,
@@ -3775,6 +3776,9 @@ unsafe fn copy_flags_from_bases(
                     }
                     if pyre_object::w_type_get_weakrefable(base) {
                         pyre_object::w_type_set_weakrefable(w_type, true);
+                    }
+                    if pyre_object::w_type_get_hasuserdel(base) {
+                        pyre_object::w_type_set_hasuserdel(w_type, true);
                     }
                 }
             }
@@ -3819,7 +3823,7 @@ pub unsafe fn create_all_slots(
             }
         }
 
-        // typeobject.py:1510: copy_flags_from_bases — inherit hasdict/weakrefable
+        // typeobject.py:1510: copy_flags_from_bases — inherit hasdict/weakrefable/hasuserdel
         copy_flags_from_bases(w_type, w_bases);
 
         // typeobject.py:1146: base_layout = w_bestbase.layout
@@ -3909,6 +3913,9 @@ pub unsafe fn create_all_slots(
         }
         if wantweakref {
             create_weakref_slot(w_type);
+        }
+        if ns.get("__del__").is_some() {
+            pyre_object::w_type_set_hasuserdel(w_type, true);
         }
 
         // typeobject.py:1199-1204: layout computation

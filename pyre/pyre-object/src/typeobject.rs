@@ -115,6 +115,10 @@ pub struct W_TypeObject {
     pub hasdict: bool,
     /// typeobject.py:181 `weakrefable` — True when instances support weakrefs.
     pub weakrefable: bool,
+    /// typeobject.py:210 `hasuserdel` — True when instances have a user
+    /// `__del__` (computed at type creation, typeobject.py:1406/1475, and
+    /// kept fresh by `mutated`).
+    pub hasuserdel: bool,
     /// typeobject.py:169 `flag_map_or_seq` (`'?'`, `'M'`, `'S'`).
     ///
     /// Default `'?'` per typeobject.py:216.  Inherited from base
@@ -288,6 +292,7 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
         layout: std::ptr::null(),
         hasdict: false,
         weakrefable: false,
+        hasuserdel: false,
         flag_map_or_seq: std::sync::atomic::AtomicU8::new(b'?'),
         compares_by_identity_status: std::sync::atomic::AtomicU8::new(COMPARES_BY_IDENTITY_UNKNOWN),
         weak_subclasses: std::ptr::null_mut(),
@@ -376,6 +381,7 @@ pub fn w_type_new_builtin(
         layout: std::ptr::null(),
         hasdict: false,
         weakrefable: false,
+        hasuserdel: false,
         // typeobject.py:216 default; built-in dict/list/tuple
         // override via `w_type_set_flag_map_or_seq` at typedef
         // registration time (see `typedef.rs`).
@@ -656,6 +662,14 @@ pub unsafe fn w_type_get_weakrefable(obj: PyObjectRef) -> bool {
 }
 pub unsafe fn w_type_set_weakrefable(obj: PyObjectRef, v: bool) {
     (*(obj as *mut W_TypeObject)).weakrefable = v;
+}
+
+/// typeobject.py:210 `hasuserdel` getter/setter.
+pub unsafe fn w_type_get_hasuserdel(obj: PyObjectRef) -> bool {
+    (*(obj as *const W_TypeObject)).hasuserdel
+}
+pub unsafe fn w_type_set_hasuserdel(obj: PyObjectRef, v: bool) {
+    (*(obj as *mut W_TypeObject)).hasuserdel = v;
 }
 
 // ── Other accessors ──────────────────────────────────────────────────

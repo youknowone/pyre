@@ -567,12 +567,12 @@ fn finalizer_queue_trigger() {
     }
 }
 
-/// objspace.py `allocate_instance` finalizer registration callback.
+/// objspace.py:486 `allocate_instance` finalizer registration callback.
 pub fn maybe_register_user_finalizer(obj: PyObjectRef) {
     let Some(w_type) = crate::typedef::r#type(obj) else {
         return;
     };
-    if unsafe { crate::baseobjspace::lookup_in_type(w_type, "__del__") }.is_some() {
+    if unsafe { pyre_object::w_type_get_hasuserdel(w_type) } {
         pyre_object::gc_hook::try_gc_register_finalizer(0, obj, finalizer_queue_trigger);
     }
 }

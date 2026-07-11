@@ -5869,6 +5869,14 @@ pub unsafe fn mutated(w_type: PyObjectRef, key: Option<&str>) {
             pyre_object::typeobject::new_version_tag(),
         );
     }
+    // typeobject.py:1475 computes `hasuserdel` only at creation; pyre's
+    // allocation path reads the flag (objspace.py:486), so a post-creation
+    // `__del__` assignment must set it too. Sticky like upstream — a later
+    // deletion leaves it set; registration on a type without `__del__` is
+    // a harmless no-op in _call_finalizer.
+    if key == Some("__del__") {
+        pyre_object::w_type_set_hasuserdel(w_type, true);
+    }
     // typeobject.py:288-291 — walk direct subclasses recursively.
     let subs = pyre_object::typeobject::w_type_get_subclasses(w_type);
     for w_sub in subs {
