@@ -6266,7 +6266,7 @@ fn try_execute_residual_call_via_executor(
     // concretely, succeed, and carry `PyreHelperKind::None` (`store_attr_fn` /
     // `delete_subscr_fn` / `delete_attr_fn` / `list_extend_fn` / `store_name_fn`
     // / `store_global` / `store_slice` …): a missed mutator is a silent double
-    // on a body re-run (correctness-FATAL).  Flag any residual that WRITES live
+    // on a body re-run (correctness-FATAL).  Track residuals that WRITE live
     // heap state outside the journals.
     //
     // The write discriminator is the residual's RESULT TYPE plus the
@@ -6310,7 +6310,12 @@ fn try_execute_residual_call_via_executor(
                 | majit_ir::PyreHelperKind::SetCurrentException
                 | majit_ir::PyreHelperKind::StoreDeref
         );
-    if writes_live_heap && !provably_side_effect_free {
+    // Inside an inline sub-walk, decline before any residual that is not
+    // provably side-effect-free.  Ref-result getters/dunders/user `__next__`
+    // can mutate live heap through user frames while `writes_live_heap` is
+    // false, and rollback would miss that concrete mutation.  The helper no-ops
+    // outside `FBW_INLINE_CODE_STACK`, so top-level depth-1 behavior is unchanged.
+    if !provably_side_effect_free {
         fbw_abort_nested_unjournaled_residual(op_pc)?;
     }
     let body_effect_candidate =
