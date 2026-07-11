@@ -4982,6 +4982,70 @@ fn compute_loop_phi_keep(ops: &[Op], label_indices: &[usize]) -> IndexMap<usize,
                 any = true;
             }
         }
+
+        // A kept back-edge position (and every arg of an in-body JUMP to a
+        // local LABEL) is resolved through SSA `use_var` at the JUMP, and the
+        // loop-body reload skip leaves a demoted var's SSA value stale after an
+        // in-loop collecting call.  Un-demote any position whose OpRef also
+        // flows through such a use.  Iterate: un-demoting a position re-adds
+        // its own OpRef to the kept back-edge args (a duplicated LABEL arg can
+        // then escape).
+        if any {
+            let local_label_descrs: IndexSet<u32> = label_indices
+                .iter()
+                .filter_map(|&li| ops[li].getdescr().map(|d| d.index()))
+                .collect();
+            loop {
+                let mut escapes: IndexSet<u32> = IndexSet::new();
+                for (idx, op) in ops.iter().enumerate() {
+                    if idx <= label_idx || op.opcode != OpCode::Jump {
+                        continue;
+                    }
+                    let is_back_jump = back_jumps.contains(&idx);
+                    let is_local_jump = is_back_jump
+                        || op
+                            .getdescr()
+                            .map(|d| local_label_descrs.contains(&d.index()))
+                            .unwrap_or(false);
+                    if !is_local_jump {
+                        // External JUMP: lowered via the guard-exit path, whose
+                        // failarg resolution is demotion-aware.
+                        continue;
+                    }
+                    for (i, a) in op.getarglist().iter().enumerate() {
+                        if is_back_jump && !keep.get(i).copied().unwrap_or(true) {
+                            // Demoted position: dropped from the back-edge args.
+                            continue;
+                        }
+                        if !a.is_none() && !a.is_constant() {
+                            let o = a.to_opref();
+                            if o.inline_const_bits().is_none() {
+                                escapes.insert(o.raw());
+                            }
+                        }
+                    }
+                }
+                let mut changed = false;
+                for i in 0..arity {
+                    if keep[i] {
+                        continue;
+                    }
+                    let escaped = label_args
+                        .get(i)
+                        .map(|a| escapes.contains(&a.to_opref().raw()))
+                        .unwrap_or(false);
+                    if escaped {
+                        keep[i] = true;
+                        changed = true;
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+            any = keep.iter().any(|k| !*k);
+        }
+
         if any {
             keep_by_label.insert(label_idx, keep);
         }
@@ -5226,8 +5290,8 @@ fn resolve_failarg_opref(
         return builder.ins().iconst(cl_types::I64, c);
     }
     // A loop-invariant deopt-only arg demoted out of the loop phi has no SSA
-    // Variable in the loop body; its value lives only in its dense jitframe
-    // slot (seeded once in the preamble, unchanged by the loop). Reload it from
+    // Variable in the loop body; its value lives in its ref-root slot (seeded
+    // on the preamble fall-through, GC-forwarded in place). Reload it from
     // there rather than `use_var`-ing an undefined Variable.
     if let Some(offset) = demoted_failarg_offset(demoted_failarg_slots, opref.raw()) {
         return builder
@@ -5624,9 +5688,11 @@ fn reload_ref_roots(
             continue;
         }
         // Demoted refs are read on demand from their ref-root slot by guard
-        // exits (`resolve_failarg_opref`); the loop body never `use_var`s them,
-        // so there is no SSA definition to reload — and defining one would be
-        // dead. The GC already updated the slot in place across the call.
+        // exits (`resolve_failarg_opref`); the loop body never `use_var`s them
+        // (`compute_loop_phi_keep` un-demotes any arg that escapes through a
+        // kept back-edge position or an in-body local JUMP), so there is no
+        // SSA definition to reload — and defining one would be dead. The GC
+        // already updated the slot in place across the call.
         if is_demoted_failarg(demoted_failarg_slots, var_idx) {
             continue;
         }
@@ -9295,6 +9361,7 @@ impl CraneliftBackend {
                 // the body's guard exits read from.  Reading the ref-root slot
                 // directly would be stale: a bridge does not repopulate it.
                 let loop_phi_keep = loop_phi_keep_by_label.get(&label_idx);
+                let mut demoted_root_syncs: Vec<(CValue, i32)> = Vec::new();
                 if let Some(positions) = demoted_ref_positions_by_label.get(&label_idx) {
                     for &(i, raw, root_ofs) in positions {
                         let v = builder.ins().load(
@@ -9304,7 +9371,7 @@ impl CraneliftBackend {
                             JF_FRAME_ITEM0_OFS + (i as i32) * 8,
                         );
                         builder.def_var(var(raw), v);
-                        builder.ins().store(MemFlags::new(), v, cur_jf, root_ofs);
+                        demoted_root_syncs.push((v, root_ofs));
                     }
                 }
                 let vals: Vec<CValue> = (0..arity)
@@ -9316,6 +9383,15 @@ impl CraneliftBackend {
                             .load(cl_types::I64, MemFlags::trusted(), cur_jf, offset)
                     })
                     .collect();
+                // Ref-root re-syncs go after every dense carried-slot load:
+                // when `max_output_slots < arity` the ref-root region aliases
+                // the tail of the dense slots, and a store emitted before the
+                // loads would clobber a carried value the loader has yet to
+                // read (same hazard `deferred_entry_root_syncs` defers past
+                // the dispatch above).
+                for &(v, root_ofs) in &demoted_root_syncs {
+                    builder.ins().store(MemFlags::new(), v, cur_jf, root_ofs);
+                }
                 let args = block_args_to(&mut builder, label_block, &vals);
                 builder.ins().jump(label_block, &args);
             }
@@ -17831,6 +17907,36 @@ mod tests {
         let moved = backend.get_ref_value(&frame, 0);
         assert_ne!(moved, root);
         assert_eq!(unsafe { *(moved.0 as *const u64) }, 0xD30F_0004);
+    }
+
+    #[test]
+    fn loop_phi_keeps_ref_escaping_via_kept_backedge_position() {
+        // A deopt-only invariant ref that also flows through a *kept* back-edge
+        // position is `use_var`-resolved at the JUMP, so demoting it would feed
+        // a stale (pre-collection) SSA value into the kept phi. It must stay a
+        // phi. Without the escape refinement the label maps to `[true, false]`;
+        // the refinement un-demotes position 1, leaving no demotion so the
+        // label is absent from the per-label map.
+        let inv = OpRef::ref_op(1);
+        let other = OpRef::ref_op(3);
+        let guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw());
+        guard.setfailargs(smallvec::smallvec![rb(inv)]);
+        let ops = vec![
+            mk_op(OpCode::SameAsR, &[OpRef::input_arg_ref(0)], inv.raw()),
+            mk_op(OpCode::SameAsR, &[OpRef::input_arg_ref(1)], other.raw()),
+            mk_op(OpCode::Label, &[other, inv], OpRef::NONE.raw()),
+            guard,
+            // Back-edge passes `inv` at the kept position 0 as well as its own
+            // demotable position 1.
+            mk_op(OpCode::Jump, &[inv, inv], OpRef::NONE.raw()),
+        ];
+
+        let ops: Vec<Op> = ops.iter().map(|op| (**op).clone()).collect();
+        assert_eq!(
+            compute_loop_phi_keep(&ops, &[2]).get(&2),
+            None,
+            "ref escaping through a kept back-edge position must not be demoted"
+        );
     }
 
     #[test]
