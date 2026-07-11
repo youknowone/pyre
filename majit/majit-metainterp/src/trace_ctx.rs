@@ -3413,15 +3413,15 @@ impl TraceCtx {
         fdescr: &DescrRef,
         item_index: usize,
         adescr: DescrRef,
-    ) -> (OpRef, Value) {
+    ) -> (OpRef, Option<Value>) {
         if let Some(flat_idx) = self.vable_array_flat_index(fdescr, item_index) {
-            if let Some(entry) = self.virtualizable_entry_at(flat_idx) {
-                return entry;
+            if let Some((op, value)) = self.virtualizable_entry_at(flat_idx) {
+                return (op, concrete_shadow_value(value));
             }
         }
         let index = self.const_int(item_index as i64);
         let op = self.record_op_with_descr(OpCode::GetarrayitemGcI, &[array_opref, index], adescr);
-        (op, Value::Void)
+        (op, None)
     }
 
     /// pyjitpl.py:1201-1216 `_get_arrayitem_vable_index(pc, arrayfielddescr, indexbox)`.
@@ -3479,7 +3479,7 @@ impl TraceCtx {
         index_runtime_value: i64,
         fdescr: DescrRef,
         adescr: DescrRef,
-    ) -> (OpRef, Value) {
+    ) -> (OpRef, Option<Value>) {
         let concrete = self.concrete_of_opref(vable_opref);
         if self.is_nonstandard_virtualizable(pc, vable_opref, &fdescr, concrete) {
             // arraybox = self.opimpl_getfield_gc_r(box, fdescr)
@@ -3489,7 +3489,7 @@ impl TraceCtx {
                 self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], record_descr);
             return (
                 self.vable_getarrayitem_int_descr(array_opref, index, adescr),
-                Value::Void,
+                None,
             );
         }
         // index = self._get_arrayitem_vable_index(pc, fdescr, indexbox)
@@ -3497,8 +3497,8 @@ impl TraceCtx {
         if let Some(flat_idx) =
             self.get_arrayitem_vable_index(pc, index, index_runtime_value, &fdescr)
         {
-            if let Some(entry) = self.virtualizable_entry_at(flat_idx) {
-                return entry;
+            if let Some((op, value)) = self.virtualizable_entry_at(flat_idx) {
+                return (op, concrete_shadow_value(value));
             }
         }
         // Fallback: vable layout missing — go through getfield + arrayitem.
@@ -3509,7 +3509,7 @@ impl TraceCtx {
         } else {
             (
                 self.vable_getarrayitem_int_descr(array_opref, index, adescr),
-                Value::Void,
+                None,
             )
         }
     }
@@ -3521,15 +3521,15 @@ impl TraceCtx {
         fdescr: &DescrRef,
         item_index: usize,
         adescr: DescrRef,
-    ) -> (OpRef, Value) {
+    ) -> (OpRef, Option<Value>) {
         if let Some(flat_idx) = self.vable_array_flat_index(fdescr, item_index) {
-            if let Some(entry) = self.virtualizable_entry_at(flat_idx) {
-                return entry;
+            if let Some((op, value)) = self.virtualizable_entry_at(flat_idx) {
+                return (op, concrete_shadow_value(value));
             }
         }
         let index = self.const_int(item_index as i64);
         let op = self.record_op_with_descr(OpCode::GetarrayitemGcR, &[array_opref, index], adescr);
-        (op, Value::Void)
+        (op, None)
     }
 
     /// pyjitpl.py:1218-1234 `_opimpl_getarrayitem_vable` — ref variant.
@@ -3541,7 +3541,7 @@ impl TraceCtx {
         index_runtime_value: i64,
         fdescr: DescrRef,
         adescr: DescrRef,
-    ) -> (OpRef, Value) {
+    ) -> (OpRef, Option<Value>) {
         let concrete = self.concrete_of_opref(vable_opref);
         if self.is_nonstandard_virtualizable(pc, vable_opref, &fdescr, concrete) {
             let fwd = self.nonstandard_vable_element_concrete(
@@ -3556,15 +3556,15 @@ impl TraceCtx {
             let item = self.vable_getarrayitem_ref_descr(array_opref, index, adescr);
             if let Some(v) = fwd {
                 self.set_opref_concrete(item, v);
-                return (item, v);
+                return (item, Some(v));
             }
-            return (item, Value::Void);
+            return (item, None);
         }
         if let Some(flat_idx) =
             self.get_arrayitem_vable_index(pc, index, index_runtime_value, &fdescr)
         {
-            if let Some(entry) = self.virtualizable_entry_at(flat_idx) {
-                return entry;
+            if let Some((op, value)) = self.virtualizable_entry_at(flat_idx) {
+                return (op, concrete_shadow_value(value));
             }
         }
         let array_opref =
@@ -3574,7 +3574,7 @@ impl TraceCtx {
         } else {
             (
                 self.vable_getarrayitem_ref_descr(array_opref, index, adescr),
-                Value::Void,
+                None,
             )
         }
     }
@@ -3586,15 +3586,15 @@ impl TraceCtx {
         fdescr: &DescrRef,
         item_index: usize,
         adescr: DescrRef,
-    ) -> (OpRef, Value) {
+    ) -> (OpRef, Option<Value>) {
         if let Some(flat_idx) = self.vable_array_flat_index(fdescr, item_index) {
-            if let Some(entry) = self.virtualizable_entry_at(flat_idx) {
-                return entry;
+            if let Some((op, value)) = self.virtualizable_entry_at(flat_idx) {
+                return (op, concrete_shadow_value(value));
             }
         }
         let index = self.const_int(item_index as i64);
         let op = self.record_op_with_descr(OpCode::GetarrayitemGcF, &[array_opref, index], adescr);
-        (op, Value::Void)
+        (op, None)
     }
 
     /// pyjitpl.py:1218-1234 `_opimpl_getarrayitem_vable` — float variant.
@@ -3606,7 +3606,7 @@ impl TraceCtx {
         index_runtime_value: i64,
         fdescr: DescrRef,
         adescr: DescrRef,
-    ) -> (OpRef, Value) {
+    ) -> (OpRef, Option<Value>) {
         let concrete = self.concrete_of_opref(vable_opref);
         if self.is_nonstandard_virtualizable(pc, vable_opref, &fdescr, concrete) {
             let record_descr = self.vable_array_record_descr(&fdescr);
@@ -3614,14 +3614,14 @@ impl TraceCtx {
                 self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], record_descr);
             return (
                 self.vable_getarrayitem_float_descr(array_opref, index, adescr),
-                Value::Void,
+                None,
             );
         }
         if let Some(flat_idx) =
             self.get_arrayitem_vable_index(pc, index, index_runtime_value, &fdescr)
         {
-            if let Some(entry) = self.virtualizable_entry_at(flat_idx) {
-                return entry;
+            if let Some((op, value)) = self.virtualizable_entry_at(flat_idx) {
+                return (op, concrete_shadow_value(value));
             }
         }
         let array_opref =
@@ -3631,7 +3631,7 @@ impl TraceCtx {
         } else {
             (
                 self.vable_getarrayitem_float_descr(array_opref, index, adescr),
-                Value::Void,
+                None,
             )
         }
     }

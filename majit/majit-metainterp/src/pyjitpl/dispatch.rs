@@ -3279,7 +3279,7 @@ where
                     fdescr,
                     adescr,
                 );
-                self.set_int_reg(dest, Some(opref), Some(value_as_int_bits(value)));
+                self.set_int_reg(dest, Some(opref), value.map(value_as_int_bits));
             }
             jitcode::insns::BC_GETARRAYITEM_VABLE_R => {
                 let (opcode_pc, vable_reg, array_idx, index_reg, dest) = {
@@ -3302,7 +3302,7 @@ where
                     fdescr,
                     adescr,
                 );
-                self.set_ref_reg(dest, Some(opref), Some(value_as_ref_bits(value)));
+                self.set_ref_reg(dest, Some(opref), value.map(value_as_ref_bits));
             }
             jitcode::insns::BC_GETARRAYITEM_VABLE_F => {
                 let (opcode_pc, vable_reg, array_idx, index_reg, dest) = {
@@ -3325,7 +3325,7 @@ where
                     fdescr,
                     adescr,
                 );
-                self.set_float_reg(dest, Some(opref), Some(value_as_float_bits(value)));
+                self.set_float_reg(dest, Some(opref), value.map(value_as_float_bits));
             }
             jitcode::insns::BC_SETARRAYITEM_VABLE_I => {
                 let (opcode_pc, vable_reg, array_idx, index_reg, src) = {

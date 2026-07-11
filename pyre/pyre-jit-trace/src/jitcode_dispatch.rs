@@ -4340,6 +4340,7 @@ fn getarrayitem_vable_via_metainterp(
         _ => unreachable!("dst_bank must be 'i', 'r' or 'f'"),
     };
     walker_capture_inline_nonstandard_vable_guard(ctx, op.pc, guards_before)?;
+    let shadow_value = shadow_value.unwrap_or(Value::Void);
     // When the read missed every concrete channel (`Void`) but we are inside
     // an inlined callee, fall back to the per-frame concrete-locals shadow —
     // a loop-carried local read after a may-force op in the loop body has no

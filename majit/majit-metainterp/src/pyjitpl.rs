@@ -4369,7 +4369,7 @@ impl<M: Clone> MetaInterp<M> {
         index_runtime_value: i64,
         fdescr: DescrRef,
         adescr: DescrRef,
-    ) -> (OpRef, Value) {
+    ) -> (OpRef, Option<Value>) {
         self.tracing
             .as_mut()
             .expect("opimpl_getarrayitem_vable_int requires active tracing")
@@ -4392,7 +4392,7 @@ impl<M: Clone> MetaInterp<M> {
         index_runtime_value: i64,
         fdescr: DescrRef,
         adescr: DescrRef,
-    ) -> (OpRef, Value) {
+    ) -> (OpRef, Option<Value>) {
         self.tracing
             .as_mut()
             .expect("opimpl_getarrayitem_vable_ref requires active tracing")
@@ -4415,7 +4415,7 @@ impl<M: Clone> MetaInterp<M> {
         index_runtime_value: i64,
         fdescr: DescrRef,
         adescr: DescrRef,
-    ) -> (OpRef, Value) {
+    ) -> (OpRef, Option<Value>) {
         self.tracing
             .as_mut()
             .expect("opimpl_getarrayitem_vable_float requires active tracing")

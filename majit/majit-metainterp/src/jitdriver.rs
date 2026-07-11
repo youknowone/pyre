@@ -4122,7 +4122,7 @@ impl<S: JitState> JitDriver<S> {
         index_runtime_value: i64,
         fdescr: DescrRef,
         adescr: DescrRef,
-    ) -> (OpRef, Value) {
+    ) -> (OpRef, Option<Value>) {
         self.meta.opimpl_getarrayitem_vable_int(
             pc,
             vable_opref,
@@ -4141,7 +4141,7 @@ impl<S: JitState> JitDriver<S> {
         index_runtime_value: i64,
         fdescr: DescrRef,
         adescr: DescrRef,
-    ) -> (OpRef, Value) {
+    ) -> (OpRef, Option<Value>) {
         self.meta.opimpl_getarrayitem_vable_ref(
             pc,
             vable_opref,
@@ -4160,7 +4160,7 @@ impl<S: JitState> JitDriver<S> {
         index_runtime_value: i64,
         fdescr: DescrRef,
         adescr: DescrRef,
-    ) -> (OpRef, Value) {
+    ) -> (OpRef, Option<Value>) {
         self.meta.opimpl_getarrayitem_vable_float(
             pc,
             vable_opref,
