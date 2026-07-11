@@ -51,6 +51,10 @@ thread_local! {
     /// `WALK_END_PROPAGATED_EXCEPTION`. Bridge tracing leaves this false and
     /// conservatively retains its legacy preflight.
     static WALK_END_PROPAGATE_ALLOWED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Set during one trace when a LOAD_GLOBAL / LOAD_NAME resolves through the
+    /// frame's module globals dict.  Such traces still depend on the globals
+    /// namespace length because same-key value rebinds are not guarded yet.
+    static TRACE_READS_MODULE_GLOBAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Take-and-reset the walk-end flush flag for the trace that just
@@ -61,6 +65,22 @@ pub fn take_walk_end_flush_committed() -> bool {
 
 pub fn take_walk_end_propagated_exception() -> Option<pyre_interpreter::PyError> {
     WALK_END_PROPAGATED_EXCEPTION.with(|c| c.borrow_mut().take())
+}
+
+pub(crate) fn set_trace_reads_module_global(value: bool) {
+    TRACE_READS_MODULE_GLOBAL.with(|c| c.set(value));
+}
+
+pub(crate) fn trace_reads_module_global() -> bool {
+    TRACE_READS_MODULE_GLOBAL.with(|c| c.get())
+}
+
+fn finish_trace_namespace_dependency(meta: &mut MetaInterp<PyreMeta>) {
+    let namespace_dependent = trace_reads_module_global();
+    if let Some(trace_meta) = meta.trace_meta_mut() {
+        trace_meta.namespace_dependent = namespace_dependent;
+    }
+    set_trace_reads_module_global(false);
 }
 
 thread_local! {
@@ -437,6 +457,7 @@ pub fn trace_bytecode(
     WALK_END_FLUSH_COMMITTED.with(|c| c.set(false));
     WALK_END_PROPAGATED_EXCEPTION.with(|c| *c.borrow_mut() = None);
     WALK_END_PROPAGATE_ALLOWED.with(|c| c.set(allow_propagate_out));
+    set_trace_reads_module_global(false);
     // Likewise clear any no-replay finish payload a prior trace left
     // unconsumed.  The FBW walk re-clears this in `run_perfn_walk`; the
     // trait leg (`trace_step_result_to_action`) has no such epilogue, so
@@ -517,9 +538,11 @@ pub fn trace_bytecode(
         // sub-walk+inject shape is a separate unsound deviation, kept gated off.
         if crate::state::p2_drain_enabled() {
             let action = drive_bridge_carrier_walk(ctx, sym, w_code, start_pc, cf_addr, carrier);
+            finish_trace_namespace_dependency(meta);
             return (action, concrete_frame);
         }
         let action = drive_bridge_framestack_walk(ctx, sym, w_code, start_pc, cf_addr, carrier);
+        finish_trace_namespace_dependency(meta);
         return (action, concrete_frame);
     }
     // Issue #73 walker-as-tracer foundation probe (slice #1, gated).
@@ -540,6 +563,7 @@ pub fn trace_bytecode(
     // frame at `root_pc` instead of the deepest resumed callee.
     if carrier.is_none() && std::env::var_os("PYRE_WALK_PERFN_JITCODE").is_some() {
         probe_walk_perfn_jitcode(ctx, sym, w_code, start_pc, cf_addr);
+        finish_trace_namespace_dependency(meta);
         return (TraceAction::Abort, concrete_frame);
     }
     // Issue #73 Phase 5 production flip: the per-CodeObject JitCode body is
@@ -566,6 +590,7 @@ pub fn trace_bytecode(
         && !static_decline
     {
         let action = full_body_walk_trace(ctx, sym, w_code, start_pc, cf_addr);
+        finish_trace_namespace_dependency(meta);
         return (action, concrete_frame);
     }
     // A self-recursive `arg_count != 1` callee is declined by
@@ -587,6 +612,7 @@ pub fn trace_bytecode(
     } else {
         "Trait::DeclinedAbort"
     });
+    finish_trace_namespace_dependency(meta);
     (TraceAction::Abort, concrete_frame)
 }
 

@@ -996,6 +996,22 @@ pub(crate) fn swap_stack_slots(
 }
 
 impl MIFrame {
+    fn mark_trace_reads_module_global_if_present(&self, name: &str) {
+        if self.concrete_frame_addr == 0 {
+            crate::trace::set_trace_reads_module_global(true);
+            return;
+        }
+        let frame =
+            unsafe { &*(self.concrete_frame_addr as *const pyre_interpreter::pyframe::PyFrame) };
+        let w_globals = frame.get_w_globals();
+        if w_globals.is_null() {
+            return;
+        }
+        if crate::state::module_dict_cell_slot_direct(w_globals, name).is_some() {
+            crate::trace::set_trace_reads_module_global(true);
+        }
+    }
+
     #[allow(dead_code)]
     fn active_execution_context(&self) -> *const pyre_interpreter::PyExecutionContext {
         let exec_ctx = self.sym().concrete_execution_context;
@@ -7627,7 +7643,9 @@ impl MIFrame {
         if let Instruction::LoadName { namei } = instruction {
             use pyre_interpreter::OpcodeStepExecutor;
             let idx = namei.get(op_arg) as usize;
-            OpcodeStepExecutor::load_name(self, code.names[idx].as_ref(), idx)?;
+            let name = code.names[idx].as_ref();
+            self.mark_trace_reads_module_global_if_present(name);
+            OpcodeStepExecutor::load_name(self, name, idx)?;
             return Ok(Some(pyre_interpreter::StepResult::Continue));
         }
         if let Instruction::StoreName { namei } = instruction {
@@ -7656,12 +7674,9 @@ impl MIFrame {
             let raw = namei.get(op_arg) as usize;
             let name_idx = raw >> 1;
             let push_null = (raw & 1) != 0;
-            OpcodeStepExecutor::load_global(
-                self,
-                code.names[name_idx].as_ref(),
-                name_idx,
-                push_null,
-            )?;
+            let name = code.names[name_idx].as_ref();
+            self.mark_trace_reads_module_global_if_present(name);
+            OpcodeStepExecutor::load_global(self, name, name_idx, push_null)?;
             return Ok(Some(pyre_interpreter::StepResult::Continue));
         }
 

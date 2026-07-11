@@ -9007,6 +9007,7 @@ mod tests {
         let meta = PyreMeta {
             num_locals: 4,
             ns_len: 0,
+            namespace_dependent: false,
             valuestackdepth: 4,
             array_capacity: 4,
             trace_extra_reds: 1,

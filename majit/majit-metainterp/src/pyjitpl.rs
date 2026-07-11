@@ -2572,6 +2572,14 @@ impl<M: Clone> MetaInterp<M> {
         self.active_trace_session.as_ref().map(|s| &s.trace_meta)
     }
 
+    /// Mutable access to the active frontend trace metadata for per-trace
+    /// facts that are only known after the frontend has walked the body.
+    pub fn trace_meta_mut(&mut self) -> Option<&mut M> {
+        self.active_trace_session
+            .as_mut()
+            .map(|s| &mut s.trace_meta)
+    }
+
     /// Drain the frontend trace metadata, leaving the session slot
     /// empty.  Used by the finish-compile helpers that consume `M`
     /// before calling `recorder.finish()` + backend compile.

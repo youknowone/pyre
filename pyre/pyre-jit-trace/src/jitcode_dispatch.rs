@@ -19067,6 +19067,49 @@ fn try_walker_load_global_cell_fold(
     Ok(true)
 }
 
+fn mark_trace_reads_module_global(w_globals: pyre_object::PyObjectRef, name: &str) {
+    if !w_globals.is_null() && crate::state::module_dict_cell_slot_direct(w_globals, name).is_some()
+    {
+        crate::trace::set_trace_reads_module_global(true);
+    }
+}
+
+fn mark_trace_reads_module_global_from_code(
+    w_globals: pyre_object::PyObjectRef,
+    w_code_ptr: usize,
+    name_idx: usize,
+) -> bool {
+    let Some(name) = (unsafe {
+        let raw = pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef)
+            as *const pyre_interpreter::CodeObject;
+        if raw.is_null() {
+            None
+        } else {
+            pyre_interpreter::pyframe::load_name_from_code(&*raw, name_idx).map(|n| n.to_string())
+        }
+    }) else {
+        return false;
+    };
+    mark_trace_reads_module_global(w_globals, &name);
+    true
+}
+
+fn mark_trace_reads_module_global_from_frame_name(frame_ptr: usize, w_name_ptr: usize) -> bool {
+    if frame_ptr == 0 || w_name_ptr == 0 {
+        return false;
+    }
+    let frame = unsafe { &*(frame_ptr as *const pyre_interpreter::pyframe::PyFrame) };
+    let w_globals = frame.get_w_globals();
+    if w_globals.is_null() {
+        return false;
+    }
+    let name = unsafe {
+        pyre_object::unicodeobject::w_str_get_value(w_name_ptr as pyre_object::PyObjectRef)
+    };
+    mark_trace_reads_module_global(w_globals, name);
+    true
+}
+
 /// Shared module-dict cell fast path for the LOAD_GLOBAL / LOAD_NAME folds:
 /// const-fold a module-global name read to a `QuasiimmutField` version guard
 /// + elidable `jit_namespace_cell_lookup`, reading an `ObjectMutableCell`'s
@@ -19518,6 +19561,37 @@ fn dispatch_residual_call_iIRd_kind(
     if ctx.is_authoritative_executor
         && ctx.is_full_body_walk
         && ei.pyre_helper == majit_ir::PyreHelperKind::LoadGlobal
+    {
+        if let (Some(&namei_opref), Some(&ns_opref), Some(&code_opref)) =
+            (i_args.first(), r_args.first(), r_args.get(1))
+        {
+            if let (
+                Some(majit_ir::Value::Int(namei)),
+                Some(majit_ir::Value::Ref(majit_ir::GcRef(ns_ptr))),
+                Some(majit_ir::Value::Ref(majit_ir::GcRef(w_code_ptr))),
+            ) = (
+                ctx.trace_ctx.box_value(namei_opref),
+                ctx.trace_ctx.box_value(ns_opref),
+                ctx.trace_ctx.box_value(code_opref),
+            ) {
+                let name_idx = (namei as usize) >> 1;
+                if !mark_trace_reads_module_global_from_code(
+                    ns_ptr as pyre_object::PyObjectRef,
+                    w_code_ptr,
+                    name_idx,
+                ) {
+                    crate::trace::set_trace_reads_module_global(true);
+                }
+            } else {
+                crate::trace::set_trace_reads_module_global(true);
+            }
+        } else {
+            crate::trace::set_trace_reads_module_global(true);
+        }
+    }
+    if ctx.is_authoritative_executor
+        && ctx.is_full_body_walk
+        && ei.pyre_helper == majit_ir::PyreHelperKind::LoadGlobal
         && std::env::var("PYRE_FBW_LOADGLOBAL_FOLD").as_deref() != Ok("0")
         && (!jitcode_has_exception_handler(code) || fbw_builtin_fold_enabled())
     {
@@ -19560,6 +19634,28 @@ fn dispatch_residual_call_iIRd_kind(
     // CanRaise residual a `catch_exception` could otherwise resume into);
     // `try_walker_load_name_cell_fold` gates module scope at runtime and
     // routes non-module frames back to this residual.
+    if ctx.is_authoritative_executor
+        && ctx.is_full_body_walk
+        && ei.pyre_helper == majit_ir::PyreHelperKind::LoadName
+    {
+        if let (Some(&frame_opref), Some(&name_opref)) = (r_args.first(), r_args.get(1)) {
+            if let (
+                Some(majit_ir::Value::Ref(majit_ir::GcRef(frame_ptr))),
+                Some(majit_ir::Value::Ref(majit_ir::GcRef(w_name_ptr))),
+            ) = (
+                ctx.trace_ctx.box_value(frame_opref),
+                ctx.trace_ctx.box_value(name_opref),
+            ) {
+                if !mark_trace_reads_module_global_from_frame_name(frame_ptr, w_name_ptr) {
+                    crate::trace::set_trace_reads_module_global(true);
+                }
+            } else {
+                crate::trace::set_trace_reads_module_global(true);
+            }
+        } else {
+            crate::trace::set_trace_reads_module_global(true);
+        }
+    }
     if ctx.is_authoritative_executor
         && ctx.is_full_body_walk
         && ei.pyre_helper == majit_ir::PyreHelperKind::LoadName
