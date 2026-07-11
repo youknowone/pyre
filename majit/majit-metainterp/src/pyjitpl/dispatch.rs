@@ -1119,7 +1119,6 @@ where
             // two per live vref).
             let virtualizable_snapshot = ctx.virtualizable_boxes.clone().unwrap_or_default();
             let virtualref_snapshot = ctx.virtualref_boxes.clone();
-            let identity_const = ctx.state_field_identity_const();
             let snapshot = build_state_field_snapshot(
                 self.frames,
                 op_live,
@@ -1127,7 +1126,6 @@ where
                 after_residual_call,
                 &virtualizable_snapshot,
                 &virtualref_snapshot,
-                identity_const,
                 Some((sym.int_identity_slots_base(), sym.int_identity_slots_end())),
             );
             for idx in 0..n {
@@ -7595,7 +7593,6 @@ pub fn build_state_field_snapshot(
     after_residual_call: bool,
     virtualizable_boxes: &[OpRef],
     virtualref_boxes: &[(OpRef, usize)],
-    identity_const: Option<i64>,
     inline_int_identity: Option<(usize, usize)>,
 ) -> crate::recorder::Snapshot {
     let frame_count = frames.frames.len();
@@ -7659,7 +7656,7 @@ pub fn build_state_field_snapshot(
     // requiring `OpRef::ty()` to be `Some` rather than silently dropping
     // misshapen entries (which would shrink the snapshot relative to
     // upstream and desync the resume reader).
-    let vable_boxes_snap = build_vable_snapshot_boxes(virtualizable_boxes, identity_const);
+    let vable_boxes_snap = build_vable_snapshot_boxes(virtualizable_boxes);
     let vref_boxes_snap = build_vref_snapshot_boxes(virtualref_boxes);
     crate::recorder::Snapshot {
         frames: snapshot_frames,
@@ -7678,31 +7675,19 @@ pub fn build_state_field_snapshot(
 /// snapshot relative to upstream.
 pub fn build_vable_snapshot_boxes(
     virtualizable_boxes: &[OpRef],
-    identity_const: Option<i64>,
 ) -> Vec<crate::recorder::SnapshotTagged> {
     let mut vable_boxes_snap: Vec<crate::recorder::SnapshotTagged> = Vec::new();
     if !virtualizable_boxes.is_empty() {
         let last = virtualizable_boxes.last().copied().unwrap();
-        // The identity is encoded identity-FIRST.  For the state-field JIT the
-        // `&state` identity is a loop-invariant constant the backend drops from
-        // live registers, so its deadframe slot decodes null at resume; encode
-        // it as a `Ref` constant (rd_consts TAGCONST) so `consume_vable_info`'s
-        // `next_ref()` returns the real pointer, matching RPython `_encode`'s
-        // `isinstance(box, Const)` arm (opencoder.py:603-640).  `None` keeps the
-        // genuinely-live box (heap-object virtualizables like PyFrame, whose
-        // identity flows through the trace and may be forced/mutated).
-        match identity_const {
-            Some(ptr) => vable_boxes_snap.push(crate::recorder::SnapshotTagged::Const(
-                ptr,
-                majit_ir::Type::Ref,
-            )),
-            None => {
-                let last_ty = last
-                    .ty()
-                    .expect("build_vable_snapshot_boxes: virtualizable identity must be typed");
-                vable_boxes_snap.push(crate::recorder::SnapshotTagged::Box(last, last_ty));
-            }
-        }
+        // `pyjitpl.py:3319`: the virtualizable identity is the live red input
+        // box at `virtualizable_boxes[-1]`.  It must remain a TAGBOX failarg,
+        // never a trace-time Ref constant: resume.py:1566-1578 reads the
+        // current failing jitframe slot, whose GC map keeps a moving-GC pointer
+        // updated in place.
+        let last_ty = last
+            .ty()
+            .expect("build_vable_snapshot_boxes: virtualizable identity must be typed");
+        vable_boxes_snap.push(crate::recorder::SnapshotTagged::Box(last, last_ty));
         for opref in &virtualizable_boxes[..virtualizable_boxes.len() - 1] {
             let ty = opref
                 .ty()
@@ -9745,7 +9730,6 @@ mod tests {
             &[],
             &[],
             None,
-            None,
         );
 
         assert_eq!(snapshot.frames.len(), 1);
@@ -9806,7 +9790,6 @@ mod tests {
             false,
             &[],
             &[],
-            None,
             None,
         );
 
@@ -9872,7 +9855,6 @@ mod tests {
             &[],
             &[],
             None,
-            None,
         );
         assert_eq!(snapshot.frames.len(), 2);
         let root_frame = &snapshot.frames[0];
@@ -9931,7 +9913,6 @@ mod tests {
             &[],
             &[],
             None,
-            None,
         );
 
         let f = &snapshot.frames[0];
@@ -9945,31 +9926,26 @@ mod tests {
     }
 
     #[test]
-    fn build_vable_snapshot_boxes_encodes_identity_const_as_ref_const() {
-        // State-field JIT: the loop-invariant `&state` identity (at `[-1]`) is
-        // folded out of live registers, so it is supplied as a concrete pointer
-        // and encoded identity-FIRST as a `Ref` constant.  `consume_vable_info`
-        // then reads the real pointer via `next_ref()` (resume.py:1404) with no
-        // `LIVE_VABLE_PTR` recovery.  Non-identity entries keep their `Box` tag.
+    fn build_vable_snapshot_boxes_encodes_identity_as_live_ref_box() {
+        // `pyjitpl.py:3319` / `resume.py:192-221`: the identity at `[-1]` is
+        // identity-FIRST and always a live Box, so resume.py:1566-1578 reads
+        // the current failing jitframe's ref failarg slot.
         let other = majit_ir::OpRef::int_op(3);
         let identity = majit_ir::OpRef::ref_op(7);
-        let snap = build_vable_snapshot_boxes(&[other, identity], Some(0xdead_beef));
+        let snap = build_vable_snapshot_boxes(&[other, identity]);
         assert_eq!(
             snap,
             vec![
-                crate::recorder::SnapshotTagged::Const(0xdead_beef, majit_ir::Type::Ref),
+                crate::recorder::SnapshotTagged::Box(identity, majit_ir::Type::Ref),
                 crate::recorder::SnapshotTagged::Box(other, majit_ir::Type::Int),
             ]
         );
     }
 
     #[test]
-    fn build_vable_snapshot_boxes_keeps_live_identity_as_box_when_no_const() {
-        // Heap-object virtualizables (e.g. PyFrame) pass `None`: the
-        // genuinely-live identity box stays a `Box` snapshot entry because its
-        // pointer is present in the deadframe and decodes non-null.
+    fn build_vable_snapshot_boxes_keeps_single_live_identity_as_box() {
         let identity = majit_ir::OpRef::ref_op(7);
-        let snap = build_vable_snapshot_boxes(&[identity], None);
+        let snap = build_vable_snapshot_boxes(&[identity]);
         assert_eq!(
             snap,
             vec![crate::recorder::SnapshotTagged::Box(

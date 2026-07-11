@@ -608,7 +608,6 @@ pub trait JitState: Sized {
         _all_liveness: &[u8],
         _virtualizable_boxes: &[OpRef],
         _virtualref_boxes: &[(OpRef, usize)],
-        _identity_const: Option<i64>,
     ) -> Option<crate::recorder::Snapshot> {
         None
     }
