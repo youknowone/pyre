@@ -335,6 +335,19 @@ pub fn registered_threads() -> usize {
     REGISTERED_THREADS.load(Ordering::Acquire)
 }
 
+/// Whether a stop-the-world pause is required for a collection driven by the
+/// current thread: true iff at least one *other* thread is a registered mutator.
+/// The current thread is excluded because the collector walks its own roots
+/// directly (`walk_my_*`); the danger is an unwaited, unscanned OTHER mutator.
+/// An unregistered collector with one registered mutator elsewhere still needs
+/// STW, which the bare count `> 1` check misses.
+#[inline]
+pub fn stw_required() -> bool {
+    let registered = REGISTERED_THREADS.load(Ordering::Acquire);
+    let self_registered = usize::from(THREAD_REGISTERED.with(|registered| registered.get()));
+    registered.saturating_sub(self_registered) > 0
+}
+
 // ──────────────────────────────────────────────────────────────
 // GC operation gate — fast path when single-threaded
 // ──────────────────────────────────────────────────────────────
@@ -500,7 +513,7 @@ pub fn quiesce_mutators() -> StwGuard {
         };
     }
 
-    if REGISTERED_THREADS.load(Ordering::Acquire) <= 1 {
+    if !stw_required() {
         return StwGuard {
             active: false,
             owner: false,

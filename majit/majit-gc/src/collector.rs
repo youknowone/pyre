@@ -994,7 +994,7 @@ impl MiniMarkGC {
     /// 3. Iteratively process newly discovered references until stable.
     /// 4. Reset nursery.
     pub fn do_collect_nursery(&mut self) {
-        let _stw = if crate::gc_sync::registered_threads() > 1 {
+        let _stw = if crate::gc_sync::stw_required() {
             Some(crate::gc_sync::quiesce_mutators())
         } else {
             None
@@ -2377,7 +2377,7 @@ impl MiniMarkGC {
     /// 2. Mark phase: trace all roots and transitively mark reachable objects.
     /// 3. Sweep phase: free all unmarked old-gen objects.
     pub fn do_collect_full(&mut self) {
-        let _stw = if crate::gc_sync::registered_threads() > 1 {
+        let _stw = if crate::gc_sync::stw_required() {
             Some(crate::gc_sync::quiesce_mutators())
         } else {
             None
