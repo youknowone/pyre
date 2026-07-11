@@ -5300,17 +5300,42 @@ impl<'a> AssemblerARM64<'a> {
             _ => false,
         };
 
-        // aarch64/callbuilder.py:29-41 — build arg plan.
-        // ABI regs x0..x7 for core, d0..d7 for float.
+        // aarch64/callbuilder.py:29-41 — build arg plan.  Core and float
+        // arguments have independent x0..x7 / d0..d7 banks; overflow from
+        // either bank is written to the outgoing stack area in source order.
         let mut non_float_src: Vec<Loc> = Vec::new();
         let mut non_float_dst: Vec<Loc> = Vec::new();
         let mut float_src: Vec<Loc> = Vec::new();
         let mut float_dst: Vec<Loc> = Vec::new();
         let mut immed_args: Vec<(u8, i64, bool)> = Vec::new(); // (abi_idx, value, is_float)
+        let mut stack_args: Vec<Loc> = Vec::new();
+        let mut next_core = 0u8;
+        let mut next_float = 0u8;
 
-        for i in (func_index + 1)..arg_count.min(func_index + 9) {
-            let abi_idx = (i - func_index - 1) as u8;
-            let arg = arglocs[i];
+        for &arg in &arglocs[(func_index + 1)..arg_count] {
+            let is_float = match arg {
+                Loc::Frame(f) => f.ebp_loc.is_float,
+                Loc::Reg(r) => r.is_xmm,
+                Loc::Immed(im) => im.is_float,
+                _ => false,
+            };
+            let abi_idx = if is_float {
+                if next_float == 8 {
+                    stack_args.push(arg);
+                    continue;
+                }
+                let idx = next_float;
+                next_float += 1;
+                idx
+            } else {
+                if next_core == 8 {
+                    stack_args.push(arg);
+                    continue;
+                }
+                let idx = next_core;
+                next_core += 1;
+                idx
+            };
             match arg {
                 Loc::Frame(f) if f.ebp_loc.is_float => {
                     float_src.push(arg);
@@ -5332,6 +5357,38 @@ impl<'a> AssemblerARM64<'a> {
                     immed_args.push((abi_idx, im.value, im.is_float));
                 }
                 _ => {}
+            }
+        }
+
+        // aarch64/callbuilder.py:42-50: reserve a 16-byte-aligned outgoing
+        // stack area and copy every register-bank overflow argument before
+        // remapping the register arguments (whose moves may clobber sources).
+        let stack_bytes = (stack_args.len() * WORD + 15) & !15;
+        if stack_bytes != 0 {
+            dynasm!(self.mc ; .arch aarch64 ; sub sp, sp, stack_bytes as u32);
+            for (slot, arg) in stack_args.into_iter().enumerate() {
+                let offset = (slot * WORD) as u32;
+                match arg {
+                    Loc::Reg(r) if r.is_xmm => {
+                        dynasm!(self.mc ; .arch aarch64 ; str D(r.value), [sp, offset]);
+                    }
+                    Loc::Reg(r) => {
+                        dynasm!(self.mc ; .arch aarch64 ; str X(r.value), [sp, offset]);
+                    }
+                    Loc::Frame(f) if f.ebp_loc.is_float => {
+                        self.emit_ldr_fp_d(15, f.ebp_loc.value);
+                        dynasm!(self.mc ; .arch aarch64 ; str d15, [sp, offset]);
+                    }
+                    Loc::Frame(f) => {
+                        self.emit_ldr_fp(16, f.ebp_loc.value);
+                        dynasm!(self.mc ; .arch aarch64 ; str x16, [sp, offset]);
+                    }
+                    Loc::Immed(im) => {
+                        self.emit_mov_imm64(16, im.value);
+                        dynasm!(self.mc ; .arch aarch64 ; str x16, [sp, offset]);
+                    }
+                    other => panic!("unsupported AArch64 stack call argument {other:?}"),
+                }
             }
         }
 
@@ -5365,6 +5422,9 @@ impl<'a> AssemblerARM64<'a> {
             }
         }
 
+        if stack_bytes != 0 {
+            dynasm!(self.mc ; .arch aarch64 ; add sp, sp, stack_bytes as u32);
+        }
         dynasm!(self.mc ; .arch aarch64 ; ldp x29, x30, [sp], #16);
     }
 
