@@ -8001,12 +8001,8 @@ fn extract_interior_field_info(descr: &majit_ir::DescrRef) -> (usize, usize, u8)
 pub(crate) struct PyreBlackholeAllocator;
 
 /// `resume.py:1509-1518 setfield(struct, fieldnum, descr)` byte-write
-/// helper.  Pyre's three `bh_setfield_gc_{i,r,f}` impls share the same
-/// size-aware byte-write because pyre objects are raw Rust structs;
-/// the type-keyed dispatch in the trait keeps RPython's call-site
-/// shape (`cpu.bh_setfield_gc_i/r/f`). Offset 0 is valid for plain
-/// RPython structs; callers that materialize PyObject headers must avoid
-/// replaying a header-field descr instead of hiding it here.
+/// helper for integer and float fields. Ref fields use a pointer-width
+/// store in `bh_setfield_gc_r`, matching `llmodel.py:723`.
 fn bh_setfield_gc_byte_write(struct_ptr: i64, value: i64, descr_info: &majit_ir::FieldDescrInfo) {
     let field_offset = descr_info.offset;
     if struct_ptr == 0 {
@@ -8215,7 +8211,12 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
     }
 
     fn bh_setfield_gc_r(&self, struct_ptr: i64, value: i64, descr_info: &majit_ir::FieldDescrInfo) {
-        bh_setfield_gc_byte_write(struct_ptr, value, descr_info);
+        if struct_ptr == 0 {
+            return;
+        }
+        unsafe {
+            ((struct_ptr as *mut u8).add(descr_info.offset) as *mut usize).write(value as usize);
+        }
     }
 
     fn bh_setfield_gc_f(&self, struct_ptr: i64, value: i64, descr_info: &majit_ir::FieldDescrInfo) {
