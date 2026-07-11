@@ -129,6 +129,11 @@ thread_local! {
     /// (stack.c:63-64).
     static TL_STACK_END: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 
+    /// stack.c:18 `report_error`, mirrored per thread for free-threaded
+    /// critical-code suppression. The global struct field remains the
+    /// stable backend-visible cache; the slow path reads this source of truth.
+    static TL_REPORT_ERROR: std::cell::Cell<u8> = const { std::cell::Cell::new(1) };
+
     /// Pending Python exception produced by a JIT prologue stack check
     /// in the current OS thread. This follows the same ownership model
     /// as `pypy_threadlocal_s::stack_end`: backend code may enter from
@@ -258,9 +263,9 @@ pub extern "C" fn pyre_stack_set_length_fraction(frac: f64) {
 ///   * `-max_stack_size <= diff < 0` — stack underflowed; revise the
 ///     base upward via the shared "update base to current" epilogue
 ///     (stack.c:52-55), return `0`.
-///   * else — real stack overflow (stack.c:56-58), return
-///     `PYRE_STACKTOOBIG.report_error` (which is cleared during
-///     critical-code sections by [`pyre_stack_criticalcode_start`]).
+///   * else — real stack overflow (stack.c:56-58), return the current
+///     thread's `report_error` mirror (which is cleared during critical-code
+///     sections by [`pyre_stack_criticalcode_start`]).
 ///
 /// The TLS mirror [`TL_STACK_END`] is the source of truth
 /// (stack.c:40 `baseptr = tl1->stack_end;`); the global
@@ -300,7 +305,7 @@ pub extern "C" fn pyre_stack_too_big_slowpath(current: usize) -> u8 {
             // "update base to current" epilogue below.
         } else {
             // stack.c:56-58 real stack overflow.
-            return PYRE_STACKTOOBIG.report_error.load(Ordering::Relaxed);
+            return TL_REPORT_ERROR.with(|c| c.get());
         }
     }
 
@@ -402,19 +407,19 @@ pub fn is_jit_overflow_pending() -> bool {
 }
 
 /// rpython/translator/c/src/stack.h:42 `LL_stack_criticalcode_start`.
-/// Clears the `report_error` flag so the slowpath will not signal a
-/// stack overflow during short critical-code sections.
+/// Clears this thread's `report_error` mirror so its slowpath will not signal
+/// a stack overflow during short critical-code sections.
 #[unsafe(no_mangle)]
 pub extern "C" fn pyre_stack_criticalcode_start() {
-    PYRE_STACKTOOBIG.report_error.store(0, Ordering::Relaxed);
+    TL_REPORT_ERROR.with(|c| c.set(0));
 }
 
 /// rpython/translator/c/src/stack.h:43 `LL_stack_criticalcode_stop`.
-/// Re-enables the `report_error` flag so subsequent real overflows
-/// raise `RecursionError` again.
+/// Re-enables this thread's `report_error` mirror so subsequent real
+/// overflows raise `RecursionError` again.
 #[unsafe(no_mangle)]
 pub extern "C" fn pyre_stack_criticalcode_stop() {
-    PYRE_STACKTOOBIG.report_error.store(1, Ordering::Relaxed);
+    TL_REPORT_ERROR.with(|c| c.set(1));
 }
 
 /// pypy/module/sys/vm.py:63 `setrecursionlimit` parity. Tentatively
@@ -544,6 +549,7 @@ mod tests {
             .stack_length
             .store(MAX_STACK_SIZE, Ordering::Relaxed);
         PYRE_STACKTOOBIG.report_error.store(1, Ordering::Relaxed);
+        TL_REPORT_ERROR.with(|c| c.set(1));
         crate::module::sys::state::reset_recursion_limit_for_tests();
         clear_jit_pending_exception();
     }
@@ -821,6 +827,35 @@ mod tests {
         pyre_stack_criticalcode_stop();
         let overflow = pyre_stack_too_big_slowpath(sp);
         assert_eq!(overflow, 1, "stop must re-enable overflow signalling");
+        reset_all();
+    }
+
+    #[test]
+    fn criticalcode_suppression_is_thread_local() {
+        let _g = lock_tests();
+        reset_all();
+        let entered = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let release = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let worker_entered = entered.clone();
+        let worker_release = release.clone();
+        let worker = std::thread::spawn(move || {
+            pyre_stack_criticalcode_start();
+            worker_entered.wait();
+            worker_release.wait();
+            pyre_stack_criticalcode_stop();
+        });
+        entered.wait();
+
+        let sp = current_sp();
+        plant_stack_end(sp.saturating_add(2 * MAX_STACK_SIZE));
+        assert_eq!(
+            pyre_stack_too_big_slowpath(sp),
+            1,
+            "another thread's criticalcode must not suppress this thread"
+        );
+
+        release.wait();
+        worker.join().unwrap();
         reset_all();
     }
 
