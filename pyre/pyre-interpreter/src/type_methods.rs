@@ -2466,13 +2466,16 @@ pub fn decode_raw_unicode_escape(data: &[u8], errors: &str) -> Result<Wtf8Buf, c
                     }
                 }
                 _ => {
-                    return Err(crate::typedef::unicode_decode_error(
+                    i = call_registered_decode_error_handler(
+                        errors,
                         "rawunicodeescape",
                         data,
                         escape_start,
                         error_end,
                         reason,
-                    ));
+                        &mut out,
+                    )?;
+                    continue;
                 }
             }
             i = error_end;
