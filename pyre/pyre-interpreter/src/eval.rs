@@ -500,7 +500,9 @@ fn walk_pyframe_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
             if !action.is_null() {
                 if let Some(list) = unsafe { (*action).pending_with_disabled_del.as_mut() } {
                     for slot in list.iter_mut() {
-                        visitor(unsafe { &mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef) });
+                        visitor(unsafe {
+                            &mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef)
+                        });
                     }
                 }
             }

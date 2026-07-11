@@ -201,9 +201,7 @@ fn replace_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let size = exc.end - exc.start;
     let replacement = match exc.kind {
         Some(pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError) => "?".repeat(size),
-        Some(pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError) => {
-            "\u{fffd}".to_string()
-        }
+        Some(pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError) => "\u{fffd}".to_string(),
         Some(pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError) => {
             "\u{fffd}".repeat(size)
         }
@@ -411,7 +409,9 @@ fn surrogateescape_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             let data = unsafe { w_bytes_data(exc.w_obj) };
             let mut replacement = Wtf8Buf::new();
             let mut consumed = 0usize;
-            while consumed < 4 && exc.start + consumed < exc.end && exc.start + consumed < data.len()
+            while consumed < 4
+                && exc.start + consumed < exc.end
+                && exc.start + consumed < data.len()
             {
                 let byte = data[exc.start + consumed];
                 if byte < 128 {

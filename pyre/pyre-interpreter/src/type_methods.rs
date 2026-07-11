@@ -2479,7 +2479,11 @@ pub fn decode_raw_unicode_escape(data: &[u8], errors: &str) -> Result<Wtf8Buf, c
                 i = available_end;
                 continue;
             }
-            let error_end = if numeric.is_some() { available_end } else { hex_end };
+            let error_end = if numeric.is_some() {
+                available_end
+            } else {
+                hex_end
+            };
             let reason = if numeric.is_some() {
                 "illegal Unicode character"
             } else if want == 4 {
@@ -2885,9 +2889,7 @@ pub(crate) fn call_registered_decode_error_handler(
             .unwrap_or_else(|| crate::PyError::type_error("error handler failed")));
     }
 
-    if !unsafe { pyre_object::is_tuple(w_res) }
-        || unsafe { pyre_object::w_tuple_len(w_res) } != 2
-    {
+    if !unsafe { pyre_object::is_tuple(w_res) } || unsafe { pyre_object::w_tuple_len(w_res) } != 2 {
         return Err(crate::PyError::type_error(
             "decoding error handler must return (str, int) tuple",
         ));
@@ -3081,9 +3083,7 @@ fn utf16_32_decode_error(
             }
             Ok(start + consumed)
         }
-        _ => call_registered_decode_error_handler(
-            err_mode, codec, data, start, end, reason, out,
-        ),
+        _ => call_registered_decode_error_handler(err_mode, codec, data, start, end, reason, out),
     }
 }
 

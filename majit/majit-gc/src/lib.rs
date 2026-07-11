@@ -1494,13 +1494,7 @@ pub fn gc_fq_next_dead(fq_index: usize) -> Option<GcRef> {
 /// rgc.enable / rgc.disable — toggle automatic major-collection progress
 /// on the process-global GC.
 pub fn gc_set_enabled(enabled: bool) {
-    gc_sync::gc_op(|gc| {
-        if enabled {
-            gc.enable()
-        } else {
-            gc.disable()
-        }
-    })
+    gc_sync::gc_op(|gc| if enabled { gc.enable() } else { gc.disable() })
 }
 
 /// Thread-local callback that performs a host-side write barrier through

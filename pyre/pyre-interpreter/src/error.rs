@@ -984,7 +984,13 @@ fn unraisable_hook_args_type() -> PyObjectRef {
         *cell.get_or_init(|| {
             crate::_structseq::make_struct_seq(
                 "sys.UnraisableHookArgs",
-                &["exc_type", "exc_value", "exc_traceback", "err_msg", "object"],
+                &[
+                    "exc_type",
+                    "exc_value",
+                    "exc_traceback",
+                    "err_msg",
+                    "object",
+                ],
             )
         })
     })
