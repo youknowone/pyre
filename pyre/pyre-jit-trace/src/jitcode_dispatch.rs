@@ -7210,18 +7210,6 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Whether the always-portal frame-input flip is active.  DEFAULT ON: every
-/// drained per-code jitcode is built with the portal `[frame, ec]` input shape
-/// + frame-vable locals prologue, and the strict inline path activates the
-/// fresh-frame fold to keep a branchless leaf register-to-register.  Set
-/// `PYRE_ALWAYS_PORTAL=0` to roll back to the old fused shape (non-portal
-/// callees carry frame only, no vable prologue) for bisection.  Process-
-/// constant: the codewriter reads the same env at build time so a jitcode's
-/// shape and its walk-time fold agree.
-fn fbw_always_portal_enabled() -> bool {
-    std::env::var_os("PYRE_ALWAYS_PORTAL").as_deref() != Some(std::ffi::OsStr::new("0"))
-}
-
 /// Activate the strict fresh-frame fold for the innermost inline level,
 /// binding it to the callee's portal frame register.
 fn fbw_strict_fold_activate(frame_reg: u16) {
@@ -13272,19 +13260,16 @@ fn try_walker_inline_user_call(
     // (`FBW_DECLINED_KEYS`) instead of recording the slow residual.
     // Resolve the callee's own portal frame register up-front so both the
     // strict predicate (own-frame vable acceptance) and the multiframe gate
-    // share one `ensure_jitcode_index` + `portal_red_regs_at` lookup.  Under
-    // the always-portal flip the strict straight-line leaf's LOAD_FAST /
-    // STORE_FAST carry the frame-vable locals prologue, folded register-to-
-    // register against this frame reg (see the `*_vable_via_metainterp`
-    // short-circuits).  `u16::MAX` when the flip is OFF keeps the strict
-    // predicate byte-identical (`inline_resolvable_seeded_frame_op` declines).
-    let callee_portal_frame_reg = if fbw_always_portal_enabled() {
-        crate::state::ensure_jitcode_index(callee_code_key as *const ())
-            .map(|jc| crate::state::portal_red_regs_at(jc).0)
-            .unwrap_or(u16::MAX)
-    } else {
-        u16::MAX
-    };
+    // share one `ensure_jitcode_index` + `portal_red_regs_at` lookup.  A
+    // portal-shaped strict straight-line leaf's LOAD_FAST / STORE_FAST carry
+    // the frame-vable locals prologue, folded register-to-register against
+    // this frame reg (see the `*_vable_via_metainterp` short-circuits).
+    // `u16::MAX` for a non-portal callee keeps the strict predicate
+    // byte-identical (`inline_resolvable_seeded_frame_op` declines).
+    let callee_portal_frame_reg = crate::state::ensure_jitcode_index(callee_code_key as *const ())
+        .filter(|&jc| crate::state::built_as_portal_at(jc))
+        .map(|jc| crate::state::portal_red_regs_at(jc).0)
+        .unwrap_or(u16::MAX);
     let strict_inlinable =
         callee_fast_path_inlinable(body.code, callee_descr_refs, ctx, callee_portal_frame_reg);
 

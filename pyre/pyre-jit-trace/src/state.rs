@@ -1766,6 +1766,17 @@ pub fn portal_red_regs_at(jitcode_index: i32) -> (u16, u16) {
     })
 }
 
+pub fn built_as_portal_at(jitcode_index: i32) -> bool {
+    ensure_finish_setup();
+    METAINTERP_SD.with(|r| {
+        let sd = r.borrow();
+        sd.jitcodes
+            .get(jitcode_index as usize)
+            .map(|jc| jc.payload.metadata.built_as_portal)
+            .unwrap_or(false)
+    })
+}
+
 /// Map a post-regalloc Ref-bank color back to the semantic
 /// `locals_cells_stack_w` slot it denotes at the current PC.
 ///
