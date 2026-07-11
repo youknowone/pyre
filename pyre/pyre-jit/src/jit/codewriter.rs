@@ -6392,16 +6392,16 @@ impl CodeWriter {
                 // compiled trace would continue past unsupported
                 // opcodes instead of falling back to the interpreter).
                 // `abort_permanent` is pyre-specific (no upstream
-                // RPython counterpart); use `offset = -1` matching
-                // `emit_vsd!`'s synthetic-op convention since
-                // `abort_permanent` is an emission-time bail-out
-                // marker, not tied to a single Python bytecode PC.
+                // RPython counterpart), but it must retain the Python
+                // opcode where interpretation resumes. In a non-portal
+                // callee there is no last_instr vable write to anchor that
+                // coordinate for the inverse map.
                 record_graph_op(
                     &current_block.block(),
                     "abort_permanent",
                     Vec::new(),
                     None,
-                    -1,
+                    ($py_pc) as i64,
                 );
                 // pyre-only dead-end: the block has no successor in
                 // the shadow graph. Leaving `needs_fallthrough = false`

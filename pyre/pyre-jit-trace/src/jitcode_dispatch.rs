@@ -9075,8 +9075,9 @@ fn pc_map_marker_for(metadata: &crate::PyJitCodeMetadata, py: usize) -> Option<u
 
 /// Map an `abort_permanent` marker's jitcode pc back to the Python opcode
 /// the interpreter must resume at.  `emit_abort_permanent` (codewriter)
-/// anchors that resume coordinate (`last_instr = py_pc - 1`); the full-body
-/// walk reads it here to flush the abort-point frame instead of replaying
+/// anchors the graph marker at `py_pc` and additionally stores
+/// `last_instr = py_pc - 1` for portal frames; the full-body walk reads the
+/// marker coordinate here to flush the abort-point frame instead of replaying
 /// the walked region.  Returns None when the sym's jitcode / `code_ptr` is
 /// unavailable (no resume coordinate derivable → legacy replay).
 pub(crate) fn fbw_abort_resume_py_pc(
