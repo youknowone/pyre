@@ -358,8 +358,8 @@ majit_gc::global_hook!(static GC_REMOVE_ROOT_HOOK: GcRemoveRootHookFn);
 
 /// Install the root-register / remove callbacks.
 pub fn register_gc_root_hooks(add: GcAddRootHookFn, remove: GcRemoveRootHookFn) {
-    GC_ADD_ROOT_HOOK.set(Some(add));
     GC_REMOVE_ROOT_HOOK.set(Some(remove));
+    GC_ADD_ROOT_HOOK.set(Some(add));
 }
 
 /// Remove the root-register callbacks.
