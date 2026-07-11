@@ -9576,6 +9576,20 @@ pub(crate) fn m73_marker_audit_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_M73_MARKER_AUDIT").is_some())
 }
 
+/// `PYRE_M73_MARKER_CARRY` (#73 S5 phase-1, default OFF): source the
+/// nonbranch-marker keystone from the codewrite-time jitcode-keyed twin when
+/// available, retaining runtime resume-marker derivation as the fallback.
+pub(crate) fn m73_marker_carry_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M73_MARKER_CARRY") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => false,
+    })
+}
+
 /// `PYRE_M73_ENTRY_CARRY` (#73 entry-carry E1, default ON): source a plain
 /// portal loop-header walk's entry coordinate from the codewrite-time sidecar.
 pub(crate) fn m73_entry_carry_enabled() -> bool {
@@ -9681,7 +9695,7 @@ fn fbw_foriter_body_pc_from_op_pc(
 /// points at trivia is advanced.  A resume coordinate must be a real
 /// opcode boundary; the resume reader's own backtrack walks trivia
 /// BACKWARD, which is wrong for a `NOT_TAKEN` branch-target coordinate.
-fn skip_python_trivia_forward(code: &pyre_interpreter::CodeObject, mut py_pc: usize) -> usize {
+pub fn skip_python_trivia_forward(code: &pyre_interpreter::CodeObject, mut py_pc: usize) -> usize {
     use pyre_interpreter::bytecode::Instruction;
     loop {
         match pyre_interpreter::decode_instruction_at(code, py_pc) {
@@ -10996,35 +11010,37 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 // different
                 // offset.  Fall back to the sentinel if `py_pc` has no resume
                 // entry (portal-bridge / out-of-range).
-                let marker = unsafe {
+                let mut marker = unsafe {
                     let jc = &*sym.jitcode;
                     jc.payload.resume_jitcode_pc_for(py_pc as usize)
                 };
                 if m73_marker_audit_enabled() {
-                    let lb = ctx.live_before_jit_pc;
-                    match (marker, lb) {
-                        (Some(m), lb) if lb != usize::MAX => {
-                            let twin =
-                                unsafe { (&*sym.jitcode).payload.resume_marker_for_jitcode_pc(lb) };
+                    match marker {
+                        Some(m) => {
+                            let twin = unsafe {
+                                (&*sym.jitcode).payload.resume_marker_for_jitcode_pc(op_pc)
+                            };
                             match twin {
-                                Some(t) if t == m => {
-                                    eprintln!("M73_MARKER eq=1 py_pc={} lb={} m={}", py_pc, lb, m)
-                                }
+                                Some(t) if t == m => eprintln!(
+                                    "M73_MARKER eq=1 py_pc={} op_pc={} m={}",
+                                    py_pc, op_pc, m
+                                ),
                                 Some(t) => eprintln!(
-                                    "M73_MARKER eq=0 py_pc={} lb={} m={} twin={}",
-                                    py_pc, lb, m, t
+                                    "M73_MARKER eq=0 py_pc={} op_pc={} m={} twin={}",
+                                    py_pc, op_pc, m, t
                                 ),
                                 None => eprintln!(
-                                    "M73_MARKER eq=notwin py_pc={} lb={} m={}",
-                                    py_pc, lb, m
+                                    "M73_MARKER eq=notwin py_pc={} op_pc={} m={}",
+                                    py_pc, op_pc, m
                                 ),
                             }
                         }
-                        (Some(m), _) => {
-                            eprintln!("M73_MARKER eq=nolb py_pc={} m={}", py_pc, m)
-                        }
-                        (None, _) => eprintln!("M73_MARKER eq=nomarker py_pc={}", py_pc),
+                        None => eprintln!("M73_MARKER eq=nomarker py_pc={} op_pc={}", py_pc, op_pc),
                     }
+                }
+                if m73_marker_carry_enabled() {
+                    marker = unsafe { (&*sym.jitcode).payload.resume_marker_for_jitcode_pc(op_pc) }
+                        .or(marker);
                 }
                 // #73 S2 census: for a specialization guard measure whether the
                 // per-op `-live-` BEFORE anchor (`ctx.live_before_jit_pc`,

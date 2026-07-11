@@ -12690,25 +12690,6 @@ impl CodeWriter {
             for &(off, py) in &block_head_py_by_jit_pc {
                 by_off.insert(off, py as usize);
             }
-            // Compile-time twin of `skip_python_trivia_forward`
-            // (jitcode_dispatch.rs:9126): advance past Python trivia opcodes to
-            // the next executable opcode.  Same opcode set, same start-AT (not
-            // start-after) semantics.
-            let skip_trivia = |mut py: usize| -> usize {
-                loop {
-                    match pyre_interpreter::decode_instruction_at(code, py) {
-                        Some((
-                            Instruction::ExtendedArg
-                            | Instruction::Resume { .. }
-                            | Instruction::Nop
-                            | Instruction::Cache
-                            | Instruction::NotTaken,
-                            _,
-                        )) => py += 1,
-                        _ => return py,
-                    }
-                }
-            };
             // The ENCODE branch-resume depth reader indexes the STATIC dense
             // liveness (`liveness_for(code).depth_at_py_pc()`), not the
             // walk-visited sparse `depth_at_pc` (which stays 0 at any PC the
@@ -12729,27 +12710,41 @@ impl CodeWriter {
             // corrected block-entry PC from the inversion table so the direct
             // depth twin and `python_pc_for_jitcode_pc` cannot diverge.
             for &(off, py) in &block_head_py_by_jit_pc {
-                let depth_trivia = static_depth.get(skip_trivia(py as usize)).copied();
+                let skipped_py =
+                    pyre_jit_trace::jitcode_dispatch::skip_python_trivia_forward(code, py as usize);
+                let depth_trivia = static_depth.get(skipped_py).copied();
                 depth_trivia_marker_by_jit_pc.push((off, depth_trivia));
             }
             depth_trivia_marker_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
             // Op-start tier: predecessor scan, markers EXCLUDED.
             for (py, &pos) in first_jit_pc_by_py_pc.iter().enumerate() {
                 if pos != usize::MAX {
-                    let depth_trivia = static_depth.get(skip_trivia(py)).copied();
+                    let skipped_py =
+                        pyre_jit_trace::jitcode_dispatch::skip_python_trivia_forward(code, py);
+                    let depth_trivia = static_depth.get(skipped_py).copied();
                     depth_trivia_pred_by_jit_pc.push((pos, depth_trivia));
                 }
             }
             depth_trivia_pred_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
             // Marker tier: exact-match, block-head precedence.
             for &(off, py) in &block_head_py_by_jit_pc {
-                resume_marker_marker_by_jit_pc.push((off, resolve_marker(py as usize)));
+                let skipped_py =
+                    pyre_jit_trace::jitcode_dispatch::skip_python_trivia_forward(code, py as usize);
+                let marker = first_jit_pc_by_py_pc
+                    .get(skipped_py)
+                    .and_then(|_| resolve_marker(skipped_py));
+                resume_marker_marker_by_jit_pc.push((off, marker));
             }
             resume_marker_marker_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
             // Op-start tier: predecessor scan, markers EXCLUDED.
             for (py, &pos) in first_jit_pc_by_py_pc.iter().enumerate() {
                 if pos != usize::MAX {
-                    resume_marker_pred_by_jit_pc.push((pos, resolve_marker(py)));
+                    let skipped_py =
+                        pyre_jit_trace::jitcode_dispatch::skip_python_trivia_forward(code, py);
+                    let marker = first_jit_pc_by_py_pc
+                        .get(skipped_py)
+                        .and_then(|_| resolve_marker(skipped_py));
+                    resume_marker_pred_by_jit_pc.push((pos, marker));
                 }
             }
             resume_marker_pred_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
