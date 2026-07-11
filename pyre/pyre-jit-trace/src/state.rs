@@ -4002,6 +4002,122 @@ pub(crate) fn flush_walk_end_state_at_outer_call(
     true
 }
 
+/// Allocation-free preflight for the depth-1 post-CALL delivery. Every gate
+/// is checked before the rebuilt callee runs, so a later decline cannot replay
+/// effects the plain interpreter already committed.
+pub(crate) fn can_flush_walk_end_state_after_outer_call(
+    ctx: &TraceCtx,
+    frame: usize,
+    call_py_pc: usize,
+    post_call_py_pc: usize,
+    call_stack_len: usize,
+) -> bool {
+    if frame == 0 {
+        return false;
+    }
+    let Some(nlocals) = concrete_nlocals(frame) else {
+        return false;
+    };
+    let Some(info) = ctx.virtualizable_info() else {
+        return false;
+    };
+    let frame_ptr = frame as *const u8;
+    let w_code =
+        unsafe { *(frame_ptr.add(crate::frame_layout::PYFRAME_PYCODE_OFFSET) as *const *const ()) };
+    if w_code.is_null() {
+        return false;
+    }
+    let raw_code = unsafe {
+        pyre_interpreter::w_code_get_ptr(w_code as PyObjectRef)
+            as *const pyre_interpreter::CodeObject
+    };
+    if raw_code.is_null() {
+        return false;
+    }
+    let depths = crate::liveness::liveness_for(raw_code).depth_at_py_pc();
+    if depths.get(call_py_pc).copied().map(usize::from) != Some(call_stack_len)
+        || depths.get(post_call_py_pc).copied() != Some(1)
+    {
+        return false;
+    }
+    let Some(lastblock_idx) = info
+        .static_fields
+        .iter()
+        .position(|f| f.name == "lastblock")
+    else {
+        return false;
+    };
+    let Some((_opref, Value::Ref(shadow_lastblock))) = ctx.virtualizable_entry_at(lastblock_idx)
+    else {
+        return false;
+    };
+    let frame_lastblock = unsafe { *(frame_ptr.add(PYFRAME_LASTBLOCK_OFFSET) as *const usize) };
+    if shadow_lastblock.0 != frame_lastblock {
+        return false;
+    }
+    let base = info.num_static_extra_boxes;
+    if (0..nlocals).any(|abs| ctx.virtualizable_entry_at(base + abs).is_none()) {
+        return false;
+    }
+    let arr_ptr = unsafe {
+        *(frame_ptr.add(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
+            as *const *mut pyre_object::FixedObjectArray)
+    };
+    !arr_ptr.is_null() && unsafe { &*arr_ptr }.as_slice().len() >= nlocals + 1
+}
+
+/// `_setup_return_value_r` parity for the outer half of a two-frame abort:
+/// install the rebuilt callee's return value and resume after the CALL.
+pub(crate) fn flush_walk_end_state_after_outer_call(
+    ctx: &TraceCtx,
+    frame: usize,
+    call_py_pc: usize,
+    post_call_py_pc: usize,
+    call_stack_len: usize,
+    retval: PyObjectRef,
+) -> bool {
+    if !can_flush_walk_end_state_after_outer_call(
+        ctx,
+        frame,
+        call_py_pc,
+        post_call_py_pc,
+        call_stack_len,
+    ) {
+        return false;
+    }
+    let Some(nlocals) = concrete_nlocals(frame) else {
+        return false;
+    };
+    let Some(info) = ctx.virtualizable_info() else {
+        return false;
+    };
+    let frame_ptr = frame as *mut u8;
+    let arr_ptr = unsafe {
+        *(frame_ptr.add(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
+            as *const *mut pyre_object::FixedObjectArray)
+    };
+    // Land the nursery-resident result before boxing locals can collect.
+    unsafe {
+        (*arr_ptr).as_mut_slice()[nlocals] = retval;
+    }
+    let base = info.num_static_extra_boxes;
+    for abs in 0..nlocals {
+        let Some((_opref, value)) = ctx.virtualizable_entry_at(base + abs) else {
+            return false;
+        };
+        let boxed = boxed_slot_value_for_type(Type::Ref, &value);
+        unsafe {
+            (*arr_ptr).as_mut_slice()[abs] = boxed;
+        }
+    }
+    unsafe {
+        let pf = &mut *(frame as *mut PyFrame);
+        pf.valuestackdepth = nlocals + 1;
+        pf.last_instr = post_call_py_pc as isize - 1;
+    }
+    true
+}
+
 pub(crate) fn looks_like_heap_ref(value: PyObjectRef) -> bool {
     let addr = value as usize;
     let word_align = std::mem::align_of::<usize>() - 1;

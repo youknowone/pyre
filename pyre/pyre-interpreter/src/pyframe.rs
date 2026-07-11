@@ -388,7 +388,7 @@ impl FrameBox {
         // its own stack — so root that slot across the allocation. The frame
         // block is non-moving (old-gen when GC-managed, `std::alloc`
         // otherwise), so only the locals array needs protecting.
-        let _root = LocalsRoot::new(frame_ptr);
+        let _root = FrameLocalsRoot::new(frame_ptr);
         let generator = pyre_object::generator::w_generator_new(frame_ptr as *mut u8);
         unsafe {
             (*frame_ptr).f_generator_nowref = generator;
@@ -437,13 +437,13 @@ impl Drop for FrameBox {
 /// root the eval path holds in `call.rs`: during setup the freshly-installed
 /// locals/cells live only in that array, so an intervening collection would
 /// drop or mis-forward them unless the slot is rooted.
-struct LocalsRoot {
+pub struct FrameLocalsRoot {
     slot: *mut *mut u8,
     registered: bool,
 }
 
-impl LocalsRoot {
-    fn new(frame_ptr: *mut PyFrame) -> Self {
+impl FrameLocalsRoot {
+    pub fn new(frame_ptr: *mut PyFrame) -> Self {
         let slot =
             unsafe { std::ptr::addr_of_mut!((*frame_ptr).locals_cells_stack_w) as *mut *mut u8 };
         let registered = unsafe { pyre_object::gc_hook::try_gc_add_root(slot) };
@@ -451,7 +451,7 @@ impl LocalsRoot {
     }
 }
 
-impl Drop for LocalsRoot {
+impl Drop for FrameLocalsRoot {
     fn drop(&mut self) {
         if self.registered {
             pyre_object::gc_hook::try_gc_remove_root(self.slot);
@@ -3444,7 +3444,7 @@ pub fn createframe_obj(
     // cells) and stores the cells into `locals_cells_stack_w`; root the slot so
     // a collection mid-init can't drop the cells already written there.
     {
-        let _root = LocalsRoot::new(frame.as_mut_ptr());
+        let _root = FrameLocalsRoot::new(frame.as_mut_ptr());
         frame.initialize_frame_scopes(outer_ref, code)?;
     }
 

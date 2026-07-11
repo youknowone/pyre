@@ -7896,7 +7896,7 @@ thread_local! {
     /// forward (re-executing the callee from scratch) instead of rolling back
     /// and replaying the loop body from entry.  The `PyObjectRef`s are rooted by
     /// [`fbw_store_journal_root_walker`] across the abort unwind's allocations.
-    static FBW_ABORT_CALL_RESUME: std::cell::RefCell<Option<(usize, Vec<pyre_object::PyObjectRef>)>> =
+    static FBW_ABORT_CALL_RESUME: std::cell::RefCell<Option<InlineAbortCarrier>> =
         const { std::cell::RefCell::new(None) };
 
     /// B3 (`PYRE_FBW_RAISE`): the set of OpRefs the walker built inline via
@@ -7931,6 +7931,29 @@ thread_local! {
     /// [`FBW_EXC_PREV`]) rather than a `POP_EXCEPT` restore (which pops it).
     /// The two `SetCurrentException` shapes are otherwise identical.
     static FBW_EXC_PENDING_PUSH_SET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum InlineAbortCarrier {
+    Entry {
+        call_py_pc: usize,
+        call_stack: Vec<pyre_object::PyObjectRef>,
+    },
+    MidBody(MidBodyPayload),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct MidBodyPayload {
+    pub call_py_pc: usize,
+    pub post_call_py_pc: usize,
+    pub call_stack_len: usize,
+    pub callee_py_pc: usize,
+    pub w_code: pyre_object::PyObjectRef,
+    pub w_globals: pyre_object::PyObjectRef,
+    pub x_arg: pyre_object::PyObjectRef,
+    pub live_locals: Vec<Option<ConcreteValue>>,
+    pub live_stack: Vec<ConcreteValue>,
+    pub return_value: pyre_object::PyObjectRef,
 }
 
 /// Record that `op` is a walker-built inline exception (B3 construct fold).
@@ -8354,13 +8377,32 @@ pub(crate) fn fbw_bump_executed_effect() {
 
 /// gh#467 latch the inline-abort forward-flush carrier (see [`FBW_ABORT_CALL_RESUME`]).
 pub(crate) fn fbw_set_abort_call_resume(call_pc: usize, stack: Vec<pyre_object::PyObjectRef>) {
-    FBW_ABORT_CALL_RESUME.with(|c| *c.borrow_mut() = Some((call_pc, stack)));
+    FBW_ABORT_CALL_RESUME.with(|c| {
+        *c.borrow_mut() = Some(InlineAbortCarrier::Entry {
+            call_py_pc: call_pc,
+            call_stack: stack,
+        })
+    });
 }
 
-/// gh#467 take the inline-abort forward-flush carrier, clearing it (see
-/// [`FBW_ABORT_CALL_RESUME`]).
-pub(crate) fn fbw_take_abort_call_resume() -> Option<(usize, Vec<pyre_object::PyObjectRef>)> {
-    FBW_ABORT_CALL_RESUME.with(|c| c.borrow_mut().take())
+pub(crate) fn fbw_set_midbody_abort_resume(payload: MidBodyPayload) {
+    FBW_ABORT_CALL_RESUME.with(|c| *c.borrow_mut() = Some(InlineAbortCarrier::MidBody(payload)));
+}
+
+pub(crate) fn fbw_abort_carrier_clone() -> Option<InlineAbortCarrier> {
+    FBW_ABORT_CALL_RESUME.with(|c| c.borrow().clone())
+}
+
+pub(crate) fn fbw_abort_carrier_set_return(value: pyre_object::PyObjectRef) {
+    FBW_ABORT_CALL_RESUME.with(|c| {
+        if let Some(InlineAbortCarrier::MidBody(payload)) = c.borrow_mut().as_mut() {
+            payload.return_value = value;
+        }
+    });
+}
+
+pub(crate) fn fbw_abort_carrier_clear() {
+    FBW_ABORT_CALL_RESUME.with(|c| *c.borrow_mut() = None);
 }
 
 /// An unexecutable residual call (`try_execute_residual_call_via_executor`
@@ -8446,11 +8488,44 @@ pub fn fbw_store_journal_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRe
     // locals, which can trigger a minor collection that moves these refs before
     // they are written into the frame array — so forward every slot as a root.
     FBW_ABORT_CALL_RESUME.with(|c| {
-        if let Some((_call_pc, stack)) = c.borrow_mut().as_mut() {
-            for slot in stack.iter_mut() {
-                // SAFETY: `PyObjectRef` and `GcRef` share the usize repr; the
-                // borrow keeps the Vec storage alive for the visit.
-                visitor(unsafe { &mut *(slot as *mut pyre_object::PyObjectRef).cast() });
+        if let Some(carrier) = c.borrow_mut().as_mut() {
+            match carrier {
+                InlineAbortCarrier::Entry { call_stack, .. } => {
+                    for slot in call_stack {
+                        visitor(unsafe { &mut *(slot as *mut pyre_object::PyObjectRef).cast() });
+                    }
+                }
+                InlineAbortCarrier::MidBody(payload) => {
+                    visitor(unsafe {
+                        &mut *(&mut payload.w_code as *mut pyre_object::PyObjectRef).cast()
+                    });
+                    visitor(unsafe {
+                        &mut *(&mut payload.w_globals as *mut pyre_object::PyObjectRef).cast()
+                    });
+                    visitor(unsafe {
+                        &mut *(&mut payload.x_arg as *mut pyre_object::PyObjectRef).cast()
+                    });
+                    if !payload.return_value.is_null() {
+                        visitor(unsafe {
+                            &mut *(&mut payload.return_value as *mut pyre_object::PyObjectRef)
+                                .cast()
+                        });
+                    }
+                    for slot in payload.live_locals.iter_mut().flatten() {
+                        if let ConcreteValue::Ref(value) = slot {
+                            visitor(unsafe {
+                                &mut *(value as *mut pyre_object::PyObjectRef).cast()
+                            });
+                        }
+                    }
+                    for slot in &mut payload.live_stack {
+                        if let ConcreteValue::Ref(value) = slot {
+                            visitor(unsafe {
+                                &mut *(value as *mut pyre_object::PyObjectRef).cast()
+                            });
+                        }
+                    }
+                }
             }
         }
     });
@@ -13886,10 +13961,111 @@ fn try_walker_inline_user_call(
         // callee sub-walk so its branch guards capture both frames (no-op when
         // `parent_frame` is None — the strict straight-line inline path).
         let _parent_frame_guard = parent_frame.map(InlineParentFrameGuard::enter);
-        // Yield the walk Result; `sub_wc` (and the RAII guards) drop at the
-        // block end so the outer `ctx` is borrowable again for the gh#467
-        // forward-flush re-read below.
-        walk(body.code, 0, &mut sub_wc)
+        // Capture a depth-1 live callee before these guards drop. This is the
+        // two-frame specialization of `run_blackhole_interp_to_cancel_tracing`:
+        // `_copy_data_from_miframe` preserves the callee's own position and
+        // live registers instead of collapsing it onto the caller frame.
+        let result = walk(body.code, 0, &mut sub_wc);
+        if let Err(DispatchError::AbortPermanentMarkerReached { pc: abort_pc }) = &result {
+            if is_top_inline
+                && !unjournaled_before_subwalk
+                && fbw_executed_effect_count() != executed_effects_before
+            {
+                let payload = (|| {
+                    let call_py_pc = abort_flush_call_py_pc?;
+                    let callee_pjc = crate::state::pyjitcode_for_code(w_code)?;
+                    let metadata = &callee_pjc.metadata;
+                    let callee_py_pc = python_pc_for_jitcode_pc(metadata, *abort_pc) as usize;
+                    if metadata.first_jit_pc_by_py_pc.get(callee_py_pc).copied() != Some(*abort_pc)
+                    {
+                        return None;
+                    }
+                    let raw = unsafe {
+                        pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
+                            as *const pyre_interpreter::CodeObject
+                    };
+                    if raw.is_null() {
+                        return None;
+                    }
+                    let callee_code = unsafe { &*raw };
+                    if pyre_interpreter::pyframe::code_flags_make_generator(callee_code.flags)
+                        || !callee_code.cellvars.is_empty()
+                        || !callee_code.freevars.is_empty()
+                        || !unsafe { pyre_interpreter::function_get_closure(callable) }.is_null()
+                    {
+                        return None;
+                    }
+                    let depth = metadata.depth_at_py_pc.get(callee_py_pc).copied()? as usize;
+                    let nlocals = callee_code.varnames.len();
+                    let entries = metadata.pcdep_color_slots.get(callee_py_pc)?;
+                    let mut live_stack = Vec::with_capacity(depth);
+                    for rel in 0..depth {
+                        let color =
+                            crate::state::semantic_slot_color_for_ref_slot(entries, nlocals + rel)?;
+                        let value = *sub_wc.concrete_registers_r.get(color)?;
+                        if !matches!(value, ConcreteValue::Ref(r) if !r.is_null()) {
+                            return None;
+                        }
+                        live_stack.push(value);
+                    }
+                    if live_stack.len() != depth {
+                        return None;
+                    }
+                    let lv = crate::state::liveness_for(raw);
+                    let mut live_locals = vec![None; nlocals];
+                    for (slot, dst) in live_locals.iter_mut().enumerate() {
+                        if !lv.is_local_live(callee_py_pc, slot) {
+                            continue;
+                        }
+                        let value = fbw_callee_local_get_concrete(slot as i64)
+                            .and_then(|value| match value {
+                                Value::Ref(r) => Some(ConcreteValue::Ref(
+                                    r.as_usize() as pyre_object::PyObjectRef
+                                )),
+                                Value::Int(v) => Some(ConcreteValue::Int(v)),
+                                Value::Float(v) => Some(ConcreteValue::Float(v)),
+                                Value::Void => None,
+                            })
+                            .or_else(|| arg_concretes.get(2 + slot).copied())?;
+                        if matches!(value, ConcreteValue::Null | ConcreteValue::Bool(_)) {
+                            return None;
+                        }
+                        *dst = Some(value);
+                    }
+                    let sym_ptr = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
+                    if sym_ptr.is_null() {
+                        return None;
+                    }
+                    let outer_jc = unsafe { &*(*sym_ptr).jitcode };
+                    if outer_jc.payload.code_ptr.is_null() {
+                        return None;
+                    }
+                    let post_call_py_pc = skip_python_trivia_forward(
+                        unsafe { &*outer_jc.payload.code_ptr },
+                        call_py_pc + 1,
+                    );
+                    let Some(ConcreteValue::Ref(x_arg)) = live_stack.first().copied() else {
+                        return None;
+                    };
+                    Some(MidBodyPayload {
+                        call_py_pc,
+                        post_call_py_pc,
+                        call_stack_len: arg_concretes.len(),
+                        callee_py_pc,
+                        w_code: w_code as pyre_object::PyObjectRef,
+                        w_globals: unsafe { pyre_interpreter::function_get_globals_obj(callable) },
+                        x_arg,
+                        live_locals,
+                        live_stack,
+                        return_value: pyre_object::PY_NULL,
+                    })
+                })();
+                if let Some(payload) = payload {
+                    fbw_set_midbody_abort_resume(payload);
+                }
+            }
+        }
+        result
     };
     let (outcome, _end_pc) = match callee_outcome {
         Ok(v) => v,

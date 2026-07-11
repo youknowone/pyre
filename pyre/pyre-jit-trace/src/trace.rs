@@ -12,6 +12,27 @@ use pyre_interpreter::CodeObject;
 
 use crate::state::{PyreMeta, PyreSym};
 
+struct ObjectSlotRoot {
+    slot: *mut *mut u8,
+    registered: bool,
+}
+
+impl ObjectSlotRoot {
+    fn new(value: &mut pyre_object::PyObjectRef) -> Self {
+        let slot = value as *mut pyre_object::PyObjectRef as *mut *mut u8;
+        let registered = unsafe { pyre_object::gc_hook::try_gc_add_root(slot) };
+        Self { slot, registered }
+    }
+}
+
+impl Drop for ObjectSlotRoot {
+    fn drop(&mut self) {
+        if self.registered {
+            pyre_object::gc_hook::try_gc_remove_root(self.slot);
+        }
+    }
+}
+
 thread_local! {
     /// pyjitpl.py:3048-3091 `raise_continue_running_normally` seam: set
     /// when the authoritative full-body walk committed its end-of-walk
@@ -51,6 +72,166 @@ fn fbw_decline(key: u64) {
     FBW_DECLINED_KEYS.with(|s| {
         s.borrow_mut().insert(key);
     });
+}
+
+fn midbody_post_marker_is_effect_free(code: &CodeObject, start_pc: usize) -> bool {
+    (start_pc..code.instructions.len()).all(|pc| {
+        let Some((instruction, _)) = pyre_interpreter::decode_instruction_at(code, pc) else {
+            return false;
+        };
+        matches!(
+            instruction,
+            pyre_interpreter::Instruction::Cache
+                | pyre_interpreter::Instruction::ExtendedArg
+                | pyre_interpreter::Instruction::Resume { .. }
+                | pyre_interpreter::Instruction::Nop
+                | pyre_interpreter::Instruction::NotTaken
+                | pyre_interpreter::Instruction::LoadConst { .. }
+                | pyre_interpreter::Instruction::LoadCommonConstant { .. }
+                | pyre_interpreter::Instruction::LoadSmallInt { .. }
+                | pyre_interpreter::Instruction::LoadFast { .. }
+                | pyre_interpreter::Instruction::LoadFastBorrow { .. }
+                | pyre_interpreter::Instruction::LoadFastCheck { .. }
+                | pyre_interpreter::Instruction::LoadFastBorrowLoadFastBorrow { .. }
+                | pyre_interpreter::Instruction::LoadFastLoadFast { .. }
+                | pyre_interpreter::Instruction::StoreFast { .. }
+                | pyre_interpreter::Instruction::StoreFastLoadFast { .. }
+                | pyre_interpreter::Instruction::StoreFastStoreFast { .. }
+                | pyre_interpreter::Instruction::PopTop
+                | pyre_interpreter::Instruction::Copy { .. }
+                | pyre_interpreter::Instruction::Swap { .. }
+                | pyre_interpreter::Instruction::BinaryOp { .. }
+                | pyre_interpreter::Instruction::CompareOp { .. }
+                | pyre_interpreter::Instruction::IsOp { .. }
+                | pyre_interpreter::Instruction::JumpForward { .. }
+                | pyre_interpreter::Instruction::JumpBackward { .. }
+                | pyre_interpreter::Instruction::JumpBackwardNoInterrupt { .. }
+                | pyre_interpreter::Instruction::PopJumpIfFalse { .. }
+                | pyre_interpreter::Instruction::PopJumpIfTrue { .. }
+                | pyre_interpreter::Instruction::PopJumpIfNone { .. }
+                | pyre_interpreter::Instruction::PopJumpIfNotNone { .. }
+                | pyre_interpreter::Instruction::MatchMapping
+                | pyre_interpreter::Instruction::MatchSequence
+                | pyre_interpreter::Instruction::GetLen
+                | pyre_interpreter::Instruction::UnpackSequence { .. }
+                | pyre_interpreter::Instruction::ReturnValue
+        )
+    })
+}
+
+fn try_commit_midbody_abort(
+    ctx: &TraceCtx,
+    cf_addr: usize,
+    payload: &crate::jitcode_dispatch::MidBodyPayload,
+) -> bool {
+    if !crate::state::can_flush_walk_end_state_after_outer_call(
+        ctx,
+        cf_addr,
+        payload.call_py_pc,
+        payload.post_call_py_pc,
+        payload.call_stack_len,
+    ) {
+        return false;
+    }
+    let raw = unsafe {
+        pyre_interpreter::w_code_get_ptr(payload.w_code) as *const pyre_interpreter::CodeObject
+    };
+    if raw.is_null() {
+        return false;
+    }
+    let code = unsafe { &*raw };
+    // G6 is fail-closed: after the marker, only instructions proven to avoid
+    // heap/global/nonlocal mutation and user calls may reach `execute_frame`.
+    // It may then either return normally or raise without committing an
+    // observable effect, so Err -> legacy replay is exactly status quo and
+    // cannot double-apply an effect. General forward exception delivery stays
+    // deferred to #126/#215 (or a later slice).
+    if !code.exceptiontable.is_empty()
+        || !midbody_post_marker_is_effect_free(code, payload.callee_py_pc)
+    {
+        return false;
+    }
+    if cf_addr == 0 {
+        return false;
+    }
+    let ec = unsafe { (*(cf_addr as *const pyre_interpreter::PyFrame)).execution_context };
+    if ec.is_null() {
+        return false;
+    }
+    let mut w_code = payload.w_code;
+    let mut w_globals = payload.w_globals;
+    let mut x_arg = payload.x_arg;
+    let _w_code_root = ObjectSlotRoot::new(&mut w_code);
+    let _w_globals_root = ObjectSlotRoot::new(&mut w_globals);
+    let _x_arg_root = ObjectSlotRoot::new(&mut x_arg);
+    let frame = match pyre_interpreter::PyFrame::try_new_for_call_with_closure_and_globals_obj(
+        w_code as *const (),
+        &[x_arg],
+        std::ptr::null_mut(),
+        w_globals,
+        ec,
+        pyre_object::PY_NULL,
+    ) {
+        Ok(frame) => frame,
+        Err(_) => return false,
+    };
+    let mut frame = pyre_interpreter::pyframe::FrameBox::new(frame);
+    frame.fix_array_ptrs();
+    let _frame_locals_root = pyre_interpreter::pyframe::FrameLocalsRoot::new(frame.as_mut_ptr());
+
+    let Some(crate::jitcode_dispatch::InlineAbortCarrier::MidBody(current)) =
+        crate::jitcode_dispatch::fbw_abort_carrier_clone()
+    else {
+        return false;
+    };
+    if current.live_locals.len() != code.varnames.len() || current.live_stack.is_empty() {
+        return false;
+    }
+    for slot in &mut frame.locals_w_mut().as_mut_slice()[..code.varnames.len()] {
+        *slot = pyre_object::PY_NULL;
+    }
+    // `_copy_data_from_miframe` restores Ref registers before any scalar
+    // boxing allocation; once installed, the rooted frame array owns them.
+    for (slot, value) in current.live_locals.iter().enumerate() {
+        if let Some(crate::state::ConcreteValue::Ref(value)) = value {
+            frame.locals_w_mut().as_mut_slice()[slot] = *value;
+        }
+    }
+    let stack_base = code.varnames.len();
+    for (rel, value) in current.live_stack.iter().enumerate() {
+        let crate::state::ConcreteValue::Ref(value) = value else {
+            return false;
+        };
+        frame.locals_w_mut().as_mut_slice()[stack_base + rel] = *value;
+    }
+    for (slot, value) in current.live_locals.iter().enumerate() {
+        frame.locals_w_mut().as_mut_slice()[slot] = match value {
+            None => pyre_object::PY_NULL,
+            Some(crate::state::ConcreteValue::Ref(value)) => *value,
+            Some(crate::state::ConcreteValue::Int(value)) => pyre_object::w_int_new(*value),
+            Some(crate::state::ConcreteValue::Float(value)) => {
+                pyre_object::floatobject::w_float_new(*value)
+            }
+            Some(crate::state::ConcreteValue::Null | crate::state::ConcreteValue::Bool(_)) => {
+                return false;
+            }
+        };
+    }
+    frame.valuestackdepth = stack_base + current.live_stack.len();
+    frame.last_instr = current.callee_py_pc as isize - 1;
+    let Ok(mut retval) = frame.execute_frame(None, None) else {
+        return false;
+    };
+    crate::jitcode_dispatch::fbw_abort_carrier_set_return(retval);
+    let _retval_root = ObjectSlotRoot::new(&mut retval);
+    crate::state::flush_walk_end_state_after_outer_call(
+        ctx,
+        cf_addr,
+        current.call_py_pc,
+        current.post_call_py_pc,
+        current.call_stack_len,
+        retval,
+    )
 }
 
 /// True when the full-body walker must NOT trace this callee as its own origin,
@@ -1640,69 +1821,101 @@ fn run_perfn_walk(
                 // so the outer CALL py_pc and operand stack come from the latch.
                 // Convergence of `run_blackhole_interp_to_cancel_tracing`
                 // (`pyjitpl.py:2949`), minus the inner-frame rebuild (#126/#215).
-                if let Some((call_py_pc, call_stack)) =
-                    crate::jitcode_dispatch::fbw_take_abort_call_resume()
-                {
-                    if crate::state::flush_walk_end_state_at_outer_call(
-                        ctx,
-                        cf_addr,
+                let carrier = crate::jitcode_dispatch::fbw_abort_carrier_clone();
+                match carrier.as_ref() {
+                    Some(crate::jitcode_dispatch::InlineAbortCarrier::Entry {
                         call_py_pc,
-                        &call_stack,
-                    ) {
-                        if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                            eprintln!(
-                                "[fbw-abort-flush] gh#467 CALL-forward COMMIT \
-                                 abort_jit_pc={abort_jit_pc} call_py_pc={call_py_pc} \
-                                 stack_depth={}",
-                                call_stack.len()
-                            );
-                        }
-                        WALK_END_FLUSH_COMMITTED.with(|c| c.set(true));
-                    } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                        eprintln!(
-                            "[fbw-abort-flush] gh#467 CALL-forward declined at \
-                             call_py_pc={call_py_pc} (depth mismatch / unresolved local / \
-                             lastblock) — legacy replay kept"
-                        );
-                    }
-                } else if is_marker_abort {
-                    if crate::jitcode_dispatch::fbw_has_unjournaled_effect()
-                        || crate::jitcode_dispatch::fbw_abort_in_subwalk()
-                    {
-                        if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                            eprintln!(
-                                "[fbw-abort-flush] declined at abort_jit_pc={abort_jit_pc} \
-                                 (unjournaled effect or inline sub-walk) — legacy replay kept"
-                            );
-                        }
-                    } else if let Some(resume_py_pc) =
-                        crate::jitcode_dispatch::fbw_abort_resume_py_pc(sym, abort_jit_pc)
-                    {
-                        if crate::state::flush_walk_end_state_to_frame(ctx, cf_addr, resume_py_pc) {
+                        call_stack,
+                    }) => {
+                        if crate::state::flush_walk_end_state_at_outer_call(
+                            ctx,
+                            cf_addr,
+                            *call_py_pc,
+                            call_stack,
+                        ) {
                             if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                                 eprintln!(
-                                    "[fbw-abort-flush] COMMIT abort_jit_pc={abort_jit_pc} \
-                                     resume_py_pc={resume_py_pc}"
+                                    "[fbw-abort-flush] gh#467 CALL-forward COMMIT \
+                                     abort_jit_pc={abort_jit_pc} call_py_pc={call_py_pc} \
+                                     stack_depth={}",
+                                    call_stack.len()
                                 );
                             }
                             WALK_END_FLUSH_COMMITTED.with(|c| c.set(true));
                         } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                             eprintln!(
-                                "[fbw-abort-flush] declined at resume_py_pc={resume_py_pc} \
-                                 (shadow slot without concrete / depth / lastblock) — legacy replay kept"
+                                "[fbw-abort-flush] gh#467 CALL-forward declined at \
+                                 call_py_pc={call_py_pc} (depth mismatch / unresolved local / \
+                                 lastblock) — legacy replay kept"
                             );
                         }
                     }
-                } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                    // A nested-unjournaled decline without a latch failed at
-                    // least one all-or-nothing gate (nested inline, executed
-                    // effect, outside unjournaled mark, or CALL reconstruction).
-                    // It has no exact outer resume pc, so preserve the legacy
-                    // replay without consulting the marker-only inverse map.
-                    eprintln!(
-                        "[fbw-abort-flush] gh#467 CALL-forward declined at \
-                         abort_jit_pc={abort_jit_pc} (no carrier) — legacy replay kept"
-                    );
+                    Some(crate::jitcode_dispatch::InlineAbortCarrier::MidBody(payload))
+                        if is_marker_abort =>
+                    {
+                        if try_commit_midbody_abort(ctx, cf_addr, payload) {
+                            if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                                eprintln!(
+                                    "[fbw-abort-flush] gh#467 callee-rebuild COMMIT \
+                                     abort_jit_pc={abort_jit_pc} callee_py_pc={} \
+                                     call_py_pc={} post_call_py_pc={}",
+                                    payload.callee_py_pc,
+                                    payload.call_py_pc,
+                                    payload.post_call_py_pc,
+                                );
+                            }
+                            WALK_END_FLUSH_COMMITTED.with(|c| c.set(true));
+                        } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                            eprintln!(
+                                "[fbw-abort-flush] gh#467 callee-rebuild declined at \
+                                 callee_py_pc={} — legacy replay kept",
+                                payload.callee_py_pc,
+                            );
+                        }
+                    }
+                    None if is_marker_abort => {
+                        if crate::jitcode_dispatch::fbw_has_unjournaled_effect()
+                            || crate::jitcode_dispatch::fbw_abort_in_subwalk()
+                        {
+                            if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                                eprintln!(
+                                    "[fbw-abort-flush] declined at abort_jit_pc={abort_jit_pc} \
+                                     (unjournaled effect or inline sub-walk) — legacy replay kept"
+                                );
+                            }
+                        } else if let Some(resume_py_pc) =
+                            crate::jitcode_dispatch::fbw_abort_resume_py_pc(sym, abort_jit_pc)
+                        {
+                            if crate::state::flush_walk_end_state_to_frame(
+                                ctx,
+                                cf_addr,
+                                resume_py_pc,
+                            ) {
+                                if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                                    eprintln!(
+                                        "[fbw-abort-flush] COMMIT abort_jit_pc={abort_jit_pc} \
+                                         resume_py_pc={resume_py_pc}"
+                                    );
+                                }
+                                WALK_END_FLUSH_COMMITTED.with(|c| c.set(true));
+                            } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                                eprintln!(
+                                    "[fbw-abort-flush] declined at resume_py_pc={resume_py_pc} \
+                                     (shadow slot without concrete / depth / lastblock) — legacy replay kept"
+                                );
+                            }
+                        }
+                    }
+                    _ if crate::jitcode_dispatch::fbw_debug_abort_enabled() => {
+                        eprintln!(
+                            "[fbw-abort-flush] gh#467 CALL-forward declined at \
+                             abort_jit_pc={abort_jit_pc} (no carrier) — legacy replay kept"
+                        );
+                    }
+                    _ => {}
+                }
+                if carrier.is_some() {
+                    crate::jitcode_dispatch::fbw_abort_carrier_clear();
                 }
             }
         }
