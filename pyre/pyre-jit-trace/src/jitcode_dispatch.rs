@@ -11471,7 +11471,7 @@ fn walker_capture_snapshot_for_last_guard_impl(
 /// Build the paused caller frame for a multi-frame inline snapshot (#68),
 /// computed at the inline CALL site where the caller's live register banks
 /// (`ctx.registers_*`) are still in scope.  `call_jit_pc` is the CALL op's
-/// jitcode pc in the caller.  Returns `None` (→ caller declines the inline)
+/// jitcode pc in the caller.  Returns a named decline reason
 /// when the caller frame is not snapshot-able for this first slice: missing
 /// liveness / resume tables, a CALL inside a try-block (catch marker resume pc
 /// is not
@@ -11483,10 +11483,26 @@ fn walker_capture_snapshot_for_last_guard_impl(
 /// in_a_call=true)` parity (`trace_opcode.rs:1779`).  Reuses
 /// [`collect_outer_active_boxes`] (the caller owns the portal virtualizable)
 /// after temporarily nulling the result slot's register.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InlineCallerFrameDecline {
+    TryBlockCatchMarker,
+    Unavailable,
+}
+
+fn decline_inline_caller_frame_for_catch_marker(
+    after_residual_call_resume_pc: Option<usize>,
+) -> Result<(), InlineCallerFrameDecline> {
+    if after_residual_call_resume_pc.is_some() {
+        Err(InlineCallerFrameDecline::TryBlockCatchMarker)
+    } else {
+        Ok(())
+    }
+}
+
 fn compute_inline_caller_frame(
     ctx: &mut WalkContext<'_, '_>,
     call_jit_pc: usize,
-) -> Option<InlineParentFrame> {
+) -> Result<InlineParentFrame, InlineCallerFrameDecline> {
     // #68 nested multiframe: when an inlined callee is already active
     // (`FBW_INLINE_CODE_STACK.last()` is Some), the immediate caller of THIS
     // call is that intermediate callee (a sym-less sub-jitcode), not the
@@ -11501,30 +11517,26 @@ fn compute_inline_caller_frame(
     }
     let caller_sym_ptr = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
     if caller_sym_ptr.is_null() {
-        return None;
+        return Err(InlineCallerFrameDecline::Unavailable);
     }
     // SAFETY: set for the lifetime of the top-level `dispatch_via_miframe`;
     // read-only access to immutable layout fields.
     let caller_sym = unsafe { &*caller_sym_ptr };
     if caller_sym.jitcode.is_null() {
-        return None;
+        return Err(InlineCallerFrameDecline::Unavailable);
     }
     let (jitcode_index, fallthrough_py_pc, code_ptr) = unsafe {
         let jc = &*caller_sym.jitcode;
         if jc.payload.code_ptr.is_null() || !jc.payload.is_populated() {
-            return None;
+            return Err(InlineCallerFrameDecline::Unavailable);
         }
         let call_py = python_pc_for_jitcode_pc(&jc.payload.metadata, call_jit_pc) as usize;
         // A CALL inside a try-block resumes at its own catch via a bit-14
         // marker pc, which the multi-frame capture's `py_pc < FLAG` assert
         // rejects — decline this slice.
-        if jc
-            .payload
-            .after_residual_call_resume_pc_for(call_py)
-            .is_some()
-        {
-            return None;
-        }
+        decline_inline_caller_frame_for_catch_marker(
+            jc.payload.after_residual_call_resume_pc_for(call_py),
+        )?;
         let code = &*jc.payload.code_ptr;
         let fallthrough = crate::pyjitpl::semantic_fallthrough_pc(code, call_py) as u32;
         (jc.index as u32, fallthrough, jc.payload.code_ptr)
@@ -11538,14 +11550,15 @@ fn compute_inline_caller_frame(
             .unwrap_or(0) as usize
     };
     if depth == 0 {
-        return None;
+        return Err(InlineCallerFrameDecline::Unavailable);
     }
     // #73: the result slot's color comes from the codewriter-precomputed
     // `result_color_at_pc` (top-of-stack color at the return pc), not the flat
     // `stack_slot_color_map` — the result is not a live Variable here, so it
     // carries no pcdep entry.
     let result_color =
-        crate::state::result_color_at_pc_at(jitcode_index as i32, fallthrough_py_pc as usize)?;
+        crate::state::result_color_at_pc_at(jitcode_index as i32, fallthrough_py_pc as usize)
+            .ok_or(InlineCallerFrameDecline::Unavailable)?;
     // Null the not-yet-produced result slot, build the box list, then restore
     // the caller's register (the inlined callee, not the walk, produces the
     // result; the inner frame supplies it on resume).
@@ -11569,7 +11582,7 @@ fn compute_inline_caller_frame(
     if let (Some(saved), true) = (saved, result_color < ctx.registers_r.len()) {
         ctx.registers_r[result_color] = saved;
     }
-    Some(InlineParentFrame {
+    Ok(InlineParentFrame {
         jitcode_index,
         resume_py_pc: fallthrough_py_pc,
         boxes,
@@ -11587,18 +11600,18 @@ fn compute_nested_inline_caller_frame(
     ctx: &mut WalkContext<'_, '_>,
     call_jit_pc: usize,
     caller_code: usize,
-) -> Option<InlineParentFrame> {
-    let jitcode_index = crate::state::ensure_jitcode_index(caller_code as *const ())? as u32;
-    let pjc = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32)?;
+) -> Result<InlineParentFrame, InlineCallerFrameDecline> {
+    let jitcode_index = crate::state::ensure_jitcode_index(caller_code as *const ())
+        .ok_or(InlineCallerFrameDecline::Unavailable)? as u32;
+    let pjc = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32)
+        .ok_or(InlineCallerFrameDecline::Unavailable)?;
     if !pjc.is_populated() || pjc.code_ptr.is_null() {
-        return None;
+        return Err(InlineCallerFrameDecline::Unavailable);
     }
     let call_py = python_pc_for_jitcode_pc(&pjc.metadata, call_jit_pc) as usize;
     // A CALL inside a try-block resumes at its own catch via a bit-14 marker
     // pc, which the multi-frame capture's `py_pc < FLAG` assert rejects.
-    if pjc.after_residual_call_resume_pc_for(call_py).is_some() {
-        return None;
-    }
+    decline_inline_caller_frame_for_catch_marker(pjc.after_residual_call_resume_pc_for(call_py))?;
     let fallthrough_py_pc = unsafe {
         let code = &*pjc.code_ptr;
         crate::pyjitpl::semantic_fallthrough_pc(code, call_py) as u32
@@ -11612,12 +11625,13 @@ fn compute_nested_inline_caller_frame(
             .unwrap_or(0) as usize
     };
     if depth == 0 {
-        return None;
+        return Err(InlineCallerFrameDecline::Unavailable);
     }
     // #73: result slot color from the precomputed `result_color_at_pc`, not
     // the flat `stack_slot_color_map` (see `compute_inline_caller_frame`).
     let result_color =
-        crate::state::result_color_at_pc_at(jitcode_index as i32, fallthrough_py_pc as usize)?;
+        crate::state::result_color_at_pc_at(jitcode_index as i32, fallthrough_py_pc as usize)
+            .ok_or(InlineCallerFrameDecline::Unavailable)?;
     // Null the not-yet-produced result slot, build the box list, then restore
     // the caller's register (the inlined callee, not the walk, produces the
     // result; the inner frame supplies it on resume) — same as the top-level
@@ -11646,9 +11660,9 @@ fn compute_nested_inline_caller_frame(
     }
     let boxes = match boxes {
         Ok(b) => b,
-        Err(_) => return None,
+        Err(_) => return Err(InlineCallerFrameDecline::Unavailable),
     };
-    Some(InlineParentFrame {
+    Ok(InlineParentFrame {
         jitcode_index,
         resume_py_pc: fallthrough_py_pc,
         boxes,
@@ -13282,6 +13296,25 @@ fn emit_loop_callee_ca_vable_scalar(
 /// pure-leaf callee resume to the caller's CALL boundary via the inherited
 /// single-frame snapshot (`entry_py_pc` / `outer_active_boxes`), which is
 /// sound for side-effect-free leaves (re-execute the whole call on deopt).
+fn reconstructed_all_ref_call_stack(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &WalkContext<'_, '_>,
+) -> Option<Vec<pyre_object::PyObjectRef>> {
+    let fresh = read_ref_var_list_concrete(code, op, 1, ctx);
+    let mut stack = Vec::with_capacity(fresh.len());
+    if fresh.is_empty() {
+        return None;
+    }
+    for c in fresh {
+        match c {
+            ConcreteValue::Ref(r) => stack.push(r),
+            _ => return None,
+        }
+    }
+    stack.first().is_some_and(|c| !c.is_null()).then_some(stack)
+}
+
 fn try_walker_inline_user_call(
     ctx: &mut WalkContext<'_, '_>,
     op: &DecodedOp,
@@ -13753,72 +13786,13 @@ fn try_walker_inline_user_call(
         }
     }
 
-    // #68: a forward-branch callee inlined under the multi-frame path needs a
-    // paused caller frame on `FBW_INLINE_PARENT_FRAMES` so its in-callee guards
-    // snapshot both frames.  Compute it here, while the caller's live register
-    // banks (`ctx.registers_*`) are still in scope — at guard-capture time the
-    // walk context is the callee's.  A caller frame that is not snapshot-able
-    // (try-block catch marker / missing liveness) declines to the trait leg.
-    let parent_frame = if try_multiframe {
-        match compute_inline_caller_frame(ctx, op.pc) {
-            Some(pf) => Some(pf),
-            None => return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc }),
-        }
-    } else if callee_frame_seeded {
-        // A strict straight-line callee seeded at the top inline level (the
-        // `try_multiframe` arm above already handled the branch path).  Push the
-        // paused caller frame so its in-callee guards resume through the
-        // multi-frame snapshot (`walker_capture_multi_frame_inline_snapshot`) at
-        // the callee's OWN coordinate, with the caller paused at the CALL return
-        // point (`get_list_of_active_boxes(in_a_call=true)` parity,
-        // `trace_opcode.rs:1779`).  With the callee frame red now seeded,
-        // `collect_callee_active_boxes` sources the callee's live boxes and the
-        // snapshot succeeds, producing the full RPython `Snapshot.frames` chain
-        // (`opencoder.py:767 create_top_snapshot`, resumed by
-        // `resume.py rebuild_from_resumedata`).  This replaces the single-frame
-        // collapse, whose caller-boundary re-execute both mis-sizes the resumed
-        // frame (a decode / `LOAD_FAST` overrun) and re-applies the callee's
-        // committed side effect on deopt.
-        //
-        // Best effort: `compute_inline_caller_frame` returns `None` for a caller
-        // shape it cannot build yet (a CALL inside a try-block, or no result on
-        // the operand stack at the return point).  Fall back to the single-frame
-        // collapse there (do NOT decline the inline — that shape is served
-        // correctly today), so this never removes a working inline.
-        compute_inline_caller_frame(ctx, op.pc)
-    } else {
-        // Single-frame collapse (resume at the CALL boundary, re-execute the
-        // whole call on deopt): a nested strict callee
-        // (`inline_depth >= FBW_MAX_MULTIFRAME_DEPTH`, task #126), an un-seedable
-        // strict callee, or a callee neither seed served.  Sound for a pure
-        // value-returning leaf (idempotent re-execute) and for a nested
-        // straight-line callee (its pre-multiframe behavior).
-        None
-    };
-
-    // CODEX1 parity: snapshot the heap-effect state before the callee
-    // sub-walk.  If the prologue (callee pc 0 → its loop header) mutates the
-    // heap, the `SubLoopCalleeCallAssembler` arm below would re-run the WHOLE
-    // call through the residual executor to stamp `ca_result`, applying the
-    // prologue's side effects a second time at trace time.  RPython's
-    // `do_residual_call` runs the call exactly once (`pyjitpl.py:2019`), so a
-    // side-effecting prologue must decline the CA inline (see the arm).
-    let prologue_journal_before = fbw_store_journal_len();
+    // gh#467 forward-flush inputs are captured AT the CALL, after this
+    // iteration's pre-CALL effects and before any callee sub-walk.  Hoisting
+    // them above the paused-caller-frame gate lets its try-block decline use
+    // the same Entry-carrier predicates as a zero-effect sub-walk abort.
     let unjournaled_before_subwalk = fbw_has_unjournaled_effect();
-    // gh#467 forward-flush gate snapshots AT the CALL, after this iteration's
-    // pre-CALL effects and before the callee sub-walk.  A sub-walk that aborts
-    // without moving the executed-effect odometer applied nothing concrete;
-    // an unjournaled mark raised inside that discarded attempt describes only
-    // a declined residual and may be discarded with it.  A mark already set at
-    // entry belongs outside the callee and blocks the flush.  Latched only at
-    // the TOP inline level: the flushed frame is the top-level `cf_addr`, whose
-    // operand stack is THIS call's `[callable, null_or_self, args...]`.
     let executed_effects_before = fbw_executed_effect_count();
     let is_top_inline = !INLINE_SUBWALK_CAPTURE_BOUNDARY.with(|c| c.get());
-    // The outer CALL's python pc in the TOP-level frame's code, derived from the
-    // FBW snapshot sym at this residual_call's jitcode pc (`op.pc`) — the same
-    // coordinate `call_site_py_pc` below computes.  `None` outside the FBW
-    // top-inline path (no forward flush there).
     let abort_flush_call_py_pc: Option<usize> = if ctx.is_full_body_walk && is_top_inline {
         let sym_ptr = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
         if sym_ptr.is_null() {
@@ -13842,6 +13816,78 @@ fn try_walker_inline_user_call(
     } else {
         None
     };
+
+    // #68: a forward-branch callee inlined under the multi-frame path needs a
+    // paused caller frame on `FBW_INLINE_PARENT_FRAMES` so its in-callee guards
+    // snapshot both frames.  Compute it here, while the caller's live register
+    // banks (`ctx.registers_*`) are still in scope — at guard-capture time the
+    // walk context is the callee's.  A caller frame that is not snapshot-able
+    // (try-block catch marker / missing liveness) declines to the trait leg.
+    let parent_frame = if try_multiframe {
+        match compute_inline_caller_frame(ctx, op.pc) {
+            Ok(pf) => Some(pf),
+            Err(InlineCallerFrameDecline::TryBlockCatchMarker) => {
+                // An un-entered multiframe-inline CALL declined at its
+                // try-block catch marker is re-run whole and forward, exactly
+                // as if it had never been inlined (`pyjitpl.py:2949`).  The
+                // multi-frame guard snapshot itself remains declined.
+                if is_top_inline
+                    && !unjournaled_before_subwalk
+                    && fbw_executed_effect_count() == executed_effects_before
+                {
+                    if let (Some(call_pc), Some(stack)) = (
+                        abort_flush_call_py_pc,
+                        reconstructed_all_ref_call_stack(code, op, ctx),
+                    ) {
+                        fbw_set_abort_call_resume(call_pc, stack);
+                    }
+                }
+                return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });
+            }
+            Err(InlineCallerFrameDecline::Unavailable) => {
+                return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });
+            }
+        }
+    } else if callee_frame_seeded {
+        // A strict straight-line callee seeded at the top inline level (the
+        // `try_multiframe` arm above already handled the branch path).  Push the
+        // paused caller frame so its in-callee guards resume through the
+        // multi-frame snapshot (`walker_capture_multi_frame_inline_snapshot`) at
+        // the callee's OWN coordinate, with the caller paused at the CALL return
+        // point (`get_list_of_active_boxes(in_a_call=true)` parity,
+        // `trace_opcode.rs:1779`).  With the callee frame red now seeded,
+        // `collect_callee_active_boxes` sources the callee's live boxes and the
+        // snapshot succeeds, producing the full RPython `Snapshot.frames` chain
+        // (`opencoder.py:767 create_top_snapshot`, resumed by
+        // `resume.py rebuild_from_resumedata`).  This replaces the single-frame
+        // collapse, whose caller-boundary re-execute both mis-sizes the resumed
+        // frame (a decode / `LOAD_FAST` overrun) and re-applies the callee's
+        // committed side effect on deopt.
+        //
+        // Best effort: `compute_inline_caller_frame` returns `Unavailable` for a caller
+        // shape it cannot build yet (a CALL inside a try-block, or no result on
+        // the operand stack at the return point).  Fall back to the single-frame
+        // collapse there (do NOT decline the inline — that shape is served
+        // correctly today), so this never removes a working inline.
+        compute_inline_caller_frame(ctx, op.pc).ok()
+    } else {
+        // Single-frame collapse (resume at the CALL boundary, re-execute the
+        // whole call on deopt): a nested strict callee
+        // (`inline_depth >= FBW_MAX_MULTIFRAME_DEPTH`, task #126), an un-seedable
+        // strict callee, or a callee neither seed served.  Sound for a pure
+        // value-returning leaf (idempotent re-execute) and for a nested
+        // straight-line callee (its pre-multiframe behavior).
+        None
+    };
+
+    // CODEX1 parity: snapshot the heap-effect state before the callee
+    // sub-walk.  If the prologue (callee pc 0 → its loop header) mutates the
+    // heap, the `SubLoopCalleeCallAssembler` arm below would re-run the WHOLE
+    // call through the residual executor to stamp `ca_result`, applying the
+    // prologue's side effects a second time at trace time.  RPython's
+    // `do_residual_call` runs the call exactly once (`pyjitpl.py:2019`), so a
+    // side-effecting prologue must decline the CA inline (see the arm).
+    let prologue_journal_before = fbw_store_journal_len();
     // Compute fresh outer_active_boxes for the inline sub-walk when the
     // parent FBW walk carries an empty set (`dispatch_via_miframe`
     // initializes `outer_active_boxes: Vec::new()`; it is computed
@@ -14151,22 +14197,7 @@ fn try_walker_inline_user_call(
                 && fbw_executed_effect_count() == executed_effects_before
             {
                 if let Some(call_pc) = abort_flush_call_py_pc {
-                    let fresh = read_ref_var_list_concrete(code, op, 1, ctx);
-                    let mut stack = Vec::with_capacity(fresh.len());
-                    let mut all_ref = !fresh.is_empty();
-                    for c in &fresh {
-                        match c {
-                            ConcreteValue::Ref(r) => stack.push(*r),
-                            _ => {
-                                all_ref = false;
-                                break;
-                            }
-                        }
-                    }
-                    // The top-of-stack callable slot must be a real object; a
-                    // non-Ref anywhere means the reconstruction is unreliable, so
-                    // decline (the legacy replay is always sound).
-                    if all_ref && stack.first().is_some_and(|c| !c.is_null()) {
+                    if let Some(stack) = reconstructed_all_ref_call_stack(code, op, ctx) {
                         fbw_set_abort_call_resume(call_pc, stack);
                     }
                 }
@@ -22490,6 +22521,15 @@ mod tests {
     /// when the staticdata singleton was never attached.
     fn done_descr_ref_for_tests() -> DescrRef {
         make_fail_descr(1)
+    }
+
+    #[test]
+    fn inline_caller_frame_distinguishes_try_block_catch_marker_decline() {
+        assert_eq!(
+            decline_inline_caller_frame_for_catch_marker(Some(42)),
+            Err(InlineCallerFrameDecline::TryBlockCatchMarker),
+        );
+        assert_eq!(decline_inline_caller_frame_for_catch_marker(None), Ok(()));
     }
 
     /// `ensure_residual_call_args_bound` backs the unbound-arg abort path
