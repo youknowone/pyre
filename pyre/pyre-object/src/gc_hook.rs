@@ -9,9 +9,9 @@
 //!
 //! The GC is a process-global singleton (`gc_sync`), so these hooks are
 //! process-global fn-pointer cells ([`majit_gc::hook_cell::FnPtrCell`] via
-//! [`majit_gc::global_hook`]) rather than per-thread: every thread installs
-//! the same pointer, and a collector running on an arbitrary thread must see
-//! it even if that thread never ran the install path.
+//! [`majit_gc::global_hook`]) rather than per-thread: one install publishes
+//! the same pointer to every thread, and a collector running on an arbitrary
+//! thread must see it even if that thread never ran the install path.
 //!
 //! Callers use [`try_gc_alloc`] which returns `None` when no hook is
 //! installed — they fall back to the `Box::into_raw` path in
