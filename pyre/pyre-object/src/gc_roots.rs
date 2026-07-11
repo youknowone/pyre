@@ -183,6 +183,23 @@ pub fn walk_shadow_stack(mut visitor: impl FnMut(&mut PyObjectRef)) {
     });
 }
 
+/// Capture the current thread's pinned-root stack for a foreign STW walk.
+pub fn capture_shadow_stack_area() -> *const () {
+    SHADOW_STACK.with(|s| s as *const _ as *const ())
+}
+
+/// Visit a captured thread's pinned-root stack without consulting caller TLS.
+///
+/// # Safety
+/// `data` must come from [`capture_shadow_stack_area`], and the owning thread
+/// must be quiesced for the duration of the walk.
+pub unsafe fn walk_shadow_stack_area(data: *const (), mut visitor: impl FnMut(&mut PyObjectRef)) {
+    let stack = unsafe { &mut *(*(data as *const RefCell<Vec<PyObjectRef>>)).as_ptr() };
+    for slot in stack.iter_mut() {
+        visitor(slot);
+    }
+}
+
 // ── Prebuilt-root write tracking ────────────────────────────────────
 //
 // incminimark.py:106-114 `GCFLAG_TRACK_YOUNG_PTRS` / 339-344

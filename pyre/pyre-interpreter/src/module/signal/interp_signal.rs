@@ -148,6 +148,32 @@ pub fn walk_signal_handler_roots(mut visitor: impl FnMut(&mut PyObjectRef)) {
     });
 }
 
+pub fn capture_signal_handler_root_area() -> *const () {
+    HANDLERS.with(|handlers| handlers as *const _ as *const ())
+}
+
+/// # Safety
+/// `data` must come from [`capture_signal_handler_root_area`], and the owning
+/// thread must be quiesced.
+pub unsafe fn walk_signal_handler_roots_area(
+    data: *const (),
+    mut visitor: impl FnMut(&mut PyObjectRef),
+) {
+    let handlers = unsafe { &*(data as *const std::cell::Cell<PyObjectRef>) };
+    let mut dict = handlers.get();
+    if dict.is_null() {
+        return;
+    }
+    visitor(&mut dict);
+    handlers.set(dict);
+    unsafe {
+        let strategy = pyre_object::dictmultiobject::w_dict_get_strategy(dict);
+        strategy.walk_gc_refs(dict, &mut |slot: *mut PyObjectRef| {
+            visitor(&mut *slot);
+        });
+    }
+}
+
 /// `@unwrap_spec(signum=int)` — coerce the signal-number argument to an
 /// `i32`.  The gateway `int` converter is `space.gateway_int_w`
 /// (`gateway.py:646-665` → `int_w(allow_conversion=True)`), which runs

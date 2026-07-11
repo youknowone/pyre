@@ -233,6 +233,19 @@ struct MutatorEntry {
     jf_root_stack: *const RefCell<JitFrameShadowStack>,
     bh_regs_stack: *const RefCell<Vec<BhRegsEntry>>,
     resume_ref_roots_stack: *const RefCell<Vec<(*mut i64, usize)>>,
+    extra_areas: Vec<MutatorExtraArea>,
+}
+
+/// Walker for one opaque root area owned by a registered mutator.
+///
+/// The callback runs on the collecting thread. It must derive every
+/// thread-specific address from `data` and must not consult caller TLS.
+pub type MutatorExtraWalkFn = unsafe fn(*const (), &mut dyn FnMut(&mut GcRef));
+
+#[derive(Clone, Copy)]
+struct MutatorExtraArea {
+    walk: MutatorExtraWalkFn,
+    data: *const (),
 }
 
 // The raw pointers refer to TLS owned by `thread_id`. The registry only moves
@@ -261,7 +274,50 @@ pub fn register_mutator() {
         jf_root_stack,
         bh_regs_stack,
         resume_ref_roots_stack,
+        extra_areas: Vec::new(),
     });
+}
+
+/// Append an opaque root area to the current registered mutator.
+///
+/// The owning thread must keep `data` valid until [`unregister_mutator`].
+/// Foreign-thread invocation is restricted to the STW walk.
+pub fn register_mutator_extra_area(walk: MutatorExtraWalkFn, data: *const ()) {
+    let thread_id = std::thread::current().id();
+    let mut registry = MUTATOR_REGISTRY.lock().unwrap();
+    let entry = registry
+        .iter_mut()
+        .find(|entry| entry.thread_id == thread_id)
+        .expect("register_mutator_extra_area called before register_mutator");
+    entry.extra_areas.push(MutatorExtraArea { walk, data });
+}
+
+/// Walk every registered mutator's opaque extra root areas during STW.
+pub fn walk_all_extra_areas(mut visitor: impl FnMut(&mut GcRef)) {
+    let registry = MUTATOR_REGISTRY.lock().unwrap();
+    for mutator in registry.iter() {
+        for area in mutator.extra_areas.iter() {
+            // SAFETY: gc_sync has quiesced every registered owner, and each
+            // area remains valid until its MutatorEntry is removed.
+            unsafe { (area.walk)(area.data, &mut visitor) };
+        }
+    }
+}
+
+/// Walk the current mutator's opaque extra root areas.
+///
+/// This is the single-thread collection path; callers without a registered
+/// mutator have no per-thread areas and are a no-op.
+pub fn walk_my_extra_areas(mut visitor: impl FnMut(&mut GcRef)) {
+    let thread_id = std::thread::current().id();
+    let registry = MUTATOR_REGISTRY.lock().unwrap();
+    let Some(mutator) = registry.iter().find(|entry| entry.thread_id == thread_id) else {
+        return;
+    };
+    for area in mutator.extra_areas.iter() {
+        // SAFETY: this is the owning thread's synchronous collection path.
+        unsafe { (area.walk)(area.data, &mut visitor) };
+    }
 }
 
 /// Remove the current thread from the all-thread root registry.
@@ -1024,6 +1080,22 @@ mod tests {
         assert_eq!(get(0), GcRef(0x1100));
         assert_eq!(get(1), GcRef(0x2100));
         clear();
+    }
+
+    #[test]
+    fn test_mutator_extra_area_walks_current_thread() {
+        unsafe fn walk_cell(data: *const (), visitor: &mut dyn FnMut(&mut GcRef)) {
+            let slot = unsafe { &mut *(data as *mut GcRef) };
+            visitor(slot);
+        }
+
+        let _lock = TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let mut root = GcRef(0x1000);
+        register_mutator();
+        register_mutator_extra_area(walk_cell, &mut root as *mut GcRef as *const ());
+        walk_my_extra_areas(|gcref| gcref.0 += 0x100);
+        unregister_mutator();
+        assert_eq!(root, GcRef(0x1100));
     }
 
     #[test]

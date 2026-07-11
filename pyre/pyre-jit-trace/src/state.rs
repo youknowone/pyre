@@ -822,21 +822,33 @@ pub fn pyjitcode_for_jitcode_index(jitcode_index: i32) -> Option<std::sync::Arc<
 /// the non-moving old-gen, build-time consts are `malloc_typed`-immortal —
 /// so the slots are marked in place without forwarding.
 pub fn walk_jitcode_constants_refs(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
-    METAINTERP_SD.with(|r| {
-        // A collection can fire while another reader holds a shared borrow;
-        // only a concurrent `borrow_mut` (jitcode install/refill, which runs
-        // outside an old-gen sweep) conflicts, and those freshly built consts
-        // are still reachable from the builder, so skipping is safe there.
-        let Ok(sd) = r.try_borrow() else {
-            return;
-        };
-        for jc in sd.jitcodes.iter() {
-            for &slot in jc.payload.jitcode.constants_r.iter() {
-                let mut gcref = majit_ir::GcRef(slot as usize);
-                visitor(&mut gcref);
-            }
+    let data = capture_jitcode_constants_root_area();
+    unsafe { walk_jitcode_constants_refs_area(data, visitor) };
+}
+
+pub fn capture_jitcode_constants_root_area() -> *const () {
+    METAINTERP_SD.with(|state| state as *const _ as *const ())
+}
+
+/// # Safety
+/// `data` must come from [`capture_jitcode_constants_root_area`], and the
+/// owning thread must be quiesced.
+pub unsafe fn walk_jitcode_constants_refs_area(
+    data: *const (),
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    let state = unsafe { &*(data as *const RefCell<MetaInterpStaticData>) };
+    // A collection can fire while the owner holds a shared borrow. Preserve
+    // the existing skip for that re-entrant single-thread case.
+    let Ok(sd) = state.try_borrow() else {
+        return;
+    };
+    for jc in sd.jitcodes.iter() {
+        for &slot in jc.payload.jitcode.constants_r.iter() {
+            let mut gcref = majit_ir::GcRef(slot as usize);
+            visitor(&mut gcref);
         }
-    });
+    }
 }
 
 /// Resolve by PyCode wrapper through the trace-side

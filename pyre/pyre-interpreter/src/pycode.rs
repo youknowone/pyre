@@ -1180,6 +1180,36 @@ pub(crate) unsafe fn walk_mapdict_method_cache_gc(forward: &mut dyn FnMut(&mut P
     });
 }
 
+pub(crate) fn capture_mapdict_method_cache_root_area() -> *const () {
+    MAPDICT_METHOD_CACHE_CODES.with(|codes| codes as *const _ as *const ())
+}
+
+/// # Safety
+/// `data` must come from [`capture_mapdict_method_cache_root_area`], and the
+/// owning thread must be quiesced.
+pub(crate) unsafe fn walk_mapdict_method_cache_root_area(
+    data: *const (),
+    forward: &mut dyn FnMut(&mut PyObjectRef),
+) {
+    let codes = unsafe {
+        &*(*(data as *const std::cell::RefCell<std::collections::HashSet<usize>>)).as_ptr()
+    };
+    for &code in codes.iter() {
+        let code = unsafe { &*(code as *const PyCode) };
+        if code.mapdict_caches.is_null() {
+            continue;
+        }
+        let vec = unsafe { &mut *code.mapdict_caches };
+        for slot in vec.iter_mut() {
+            if let Some(entry) = slot.as_mut() {
+                if !entry.w_method.is_null() {
+                    forward(&mut entry.w_method);
+                }
+            }
+        }
+    }
+}
+
 /// Number of `_mapdict_caches` slots — equals `len(co_names_w)` at construction
 /// time.  Returns 0 for code objects built from null or unaligned `code_ptr`.
 ///

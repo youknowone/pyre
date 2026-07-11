@@ -6230,6 +6230,28 @@ pub(crate) unsafe fn walk_method_cache_gc(forward: &mut dyn FnMut(&mut PyObjectR
     });
 }
 
+pub(crate) fn capture_method_cache_root_area() -> *const () {
+    METHOD_CACHE.with(|cache| cache as *const _ as *const ())
+}
+
+/// # Safety
+/// `data` must come from [`capture_method_cache_root_area`], and the owning
+/// thread must be quiesced.
+pub(crate) unsafe fn walk_method_cache_root_area(
+    data: *const (),
+    forward: &mut dyn FnMut(&mut PyObjectRef),
+) {
+    let cache = unsafe { &mut *(*(data as *const std::cell::RefCell<MethodCache>)).as_ptr() };
+    for (w_class, w_value) in cache.lookup_where.iter_mut() {
+        if !w_class.is_null() {
+            forward(w_class);
+        }
+        if !w_value.is_null() {
+            forward(w_value);
+        }
+    }
+}
+
 /// `typeobject.py:503-514 lookup_where_with_method_cache` — the method
 /// cache front door.  One path for interpreter and JIT (PyPy branches
 /// only on `version_tag is None`, never on `we_are_jitted()`): promote

@@ -43,6 +43,24 @@ impl Code {
 // `get_current_exception` / `set_current_exception`; see those.
 thread_local! {
     pub(crate) static CURRENT_FRAME: Cell<*mut PyFrame> = const { Cell::new(std::ptr::null_mut()) };
+
+    static PYFRAME_ROOT_AREA: PyFrameRootArea = PyFrameRootArea {
+        current_frame: CURRENT_FRAME.with(|frame| frame as *const _),
+        last_exec_ctx: crate::call::capture_last_exec_ctx_cell(),
+        import_roots: crate::importing::capture_import_root_area(),
+        method_cache: crate::baseobjspace::capture_method_cache_root_area(),
+        mapdict_method_cache: crate::pycode::capture_mapdict_method_cache_root_area(),
+        codec_state: crate::module::_codecs::capture_codec_state_root_area(),
+    };
+}
+
+struct PyFrameRootArea {
+    current_frame: *const Cell<*mut PyFrame>,
+    last_exec_ctx: *const (),
+    import_roots: *const (),
+    method_cache: *const (),
+    mapdict_method_cache: *const (),
+    codec_state: *const (),
 }
 use crate::pyframe::PyFrame;
 
@@ -429,7 +447,20 @@ fn gc_prebuilt_remember_enabled() -> bool {
     })
 }
 
-fn walk_pyframe_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+pub fn capture_pyframe_root_area() -> *const () {
+    PYFRAME_ROOT_AREA.with(|area| area as *const _ as *const ())
+}
+
+/// Walk one captured thread's active frame and interpreter root state.
+///
+/// # Safety
+/// `data` must come from [`capture_pyframe_root_area`], and the owning thread
+/// must be quiesced.
+pub unsafe fn walk_pyframe_roots_area(
+    data: *const (),
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    let area = unsafe { &*(data as *const PyFrameRootArea) };
     // incminimark.py:339-355 prebuilt-object scanning parity: a minor
     // collection scans an old/prebuilt object only when the write barrier
     // recorded a store into it since the previous minor collection
@@ -445,7 +476,8 @@ fn walk_pyframe_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     let scan_prebuilt = !is_minor
         || pyre_object::gc_roots::prebuilt_roots_dirty()
         || !gc_prebuilt_remember_enabled();
-    CURRENT_FRAME.with(|cf| {
+    let cf = unsafe { &*area.current_frame };
+    {
         // Forward `CURRENT_FRAME` itself: when the top frame is a
         // nursery-allocated `PyFrame`
         // (`emit_new_pyframe_inline_self_recursive`) the visitor copies
@@ -480,7 +512,10 @@ fn walk_pyframe_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
         // nursery exception.  PyPy reaches the ExecutionContext
         // unconditionally through `space.threadlocals`, independent of
         // any frame.
-        let ambient_ec = crate::call::take_last_exec_ctx() as *mut PyExecutionContext;
+        let ambient_ec = unsafe {
+            (&*(area.last_exec_ctx as *const Cell<*const PyExecutionContext>)).get()
+                as *mut PyExecutionContext
+        };
         let mut visit_ec_slots = |ec: *mut PyExecutionContext| {
             if ec.is_null() {
                 return;
@@ -710,42 +745,27 @@ fn walk_pyframe_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
                     // dangles after a collection.
                     walk_raw_getset_roots(*slot, visitor);
                 };
-                crate::importing::walk_module_dicts_gc(&mut forward);
-                // The `sys.modules` dict is cached in a fast-path cell
-                // (`importing::SYS_MODULES_DICT`) that is independent of the
-                // `sys.__dict__["modules"]` slot the walk above forwards; forward
-                // the cell too so a relocated modules dict is not read back stale
-                // on the next import / `check_sys_modules` lookup.
-                crate::importing::walk_sys_modules_dict_gc(&mut forward);
-                // Box-immortal heap types' namespace dicts hold movable
-                // methods / class attributes / descriptor copies that no
-                // custom trace reaches; root them the same way.
-                walk_type_dicts_gc(&mut forward);
+                crate::importing::walk_import_roots_area(area.import_roots, &mut forward);
                 // The interpreter method cache (`baseobjspace::MethodCache`)
                 // keeps a second pointer to each looked-up method that the
                 // namespace-dict walk above does not reach; forward those so
                 // a cache hit after a moving collection is not stale.
-                crate::baseobjspace::walk_method_cache_gc(&mut forward);
+                crate::baseobjspace::walk_method_cache_root_area(area.method_cache, &mut forward);
                 // The per-pycode `_mapdict_caches` LOAD_METHOD slots hold a
                 // `w_method` pointer (mapdict.py:1418) that no custom trace
                 // reaches — code objects are Box-immortal — so forward those
                 // the same way.
-                crate::pycode::walk_mapdict_method_cache_gc(&mut forward);
+                crate::pycode::walk_mapdict_method_cache_root_area(
+                    area.mapdict_method_cache,
+                    &mut forward,
+                );
                 // _codecs.CodecState is a space-cache object in PyPy; pyre
                 // keeps the same list/dict state in module-local storage, so
                 // its Python objects must be forwarded explicitly.
-                crate::module::_codecs::walk_codec_state_gc(&mut forward);
-            }
-            // The minor walk above promoted every young value reachable
-            // from the prebuilt family; re-arm the write-tracking bit
-            // (incminimark: the minor collection empties
-            // `old_objects_pointing_to_young`).  A major seeding walk does
-            // not promote, so the bit is left untouched there.
-            if is_minor {
-                pyre_object::gc_roots::clear_prebuilt_roots_dirty();
+                crate::module::_codecs::walk_codec_state_root_area(area.codec_state, &mut forward);
             }
         }
-    });
+    }
 }
 
 /// Install the PyFrame GC root walker with the majit-gc collector.
@@ -754,7 +774,29 @@ fn walk_pyframe_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
 /// Stored in a process-global fn-pointer cell (#396); calling again with
 /// the same fn pointer is idempotent.
 pub fn register_pyframe_root_walker() {
-    majit_gc::set_active_extra_root_walker(Some(walk_pyframe_roots));
+    majit_gc::shadow_stack::register_extra_root_walker(walk_global_prebuilt_roots);
+}
+
+fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    let is_minor = majit_gc::shadow_stack::extra_root_walk_kind()
+        == majit_gc::shadow_stack::ExtraRootWalkKind::Minor;
+    let scan_prebuilt = !is_minor
+        || pyre_object::gc_roots::prebuilt_roots_dirty()
+        || !gc_prebuilt_remember_enabled();
+    if !scan_prebuilt {
+        return;
+    }
+    unsafe {
+        let mut forward = |slot: &mut PyObjectRef| {
+            visitor(&mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef));
+            walk_raw_function_roots(*slot, visitor);
+            walk_raw_getset_roots(*slot, visitor);
+        };
+        walk_type_dicts_gc(&mut forward);
+    }
+    if is_minor {
+        pyre_object::gc_roots::clear_prebuilt_roots_dirty();
+    }
 }
 
 /// Forward the GC slots a SUSPENDED generator's frame owns.

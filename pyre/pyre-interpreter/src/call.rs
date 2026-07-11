@@ -244,6 +244,10 @@ pub fn take_last_exec_ctx() -> *const crate::PyExecutionContext {
     LAST_EXEC_CTX.with(|c| c.get())
 }
 
+pub(crate) fn capture_last_exec_ctx_cell() -> *const () {
+    LAST_EXEC_CTX.with(|cell| cell as *const _ as *const ())
+}
+
 /// `pypy/objspace/std/objspace.py space.getexecutioncontext()` analogue.
 ///
 /// PyPy walks thread state and returns the live `ExecutionContext`,

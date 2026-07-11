@@ -406,6 +406,16 @@ impl FrameArena {
 
 thread_local! {
     static FRAME_ARENA: UnsafeCell<FrameArena> = UnsafeCell::new(FrameArena::new());
+
+    static JIT_CALLEE_FRAME_ROOT_AREA: JitCalleeFrameRootArea = JitCalleeFrameRootArea {
+        arena: FRAME_ARENA.with(|cell| cell as *const _),
+        heap_frames: HEAP_CALLEE_FRAMES.with(|cell| cell as *const _),
+    };
+}
+
+struct JitCalleeFrameRootArea {
+    arena: *const UnsafeCell<FrameArena>,
+    heap_frames: *const UnsafeCell<Vec<*mut PyFrame>>,
 }
 
 #[inline]
@@ -442,17 +452,32 @@ unsafe fn visit_callee_frame_roots(frame: *mut PyFrame, visitor: &mut dyn FnMut(
 /// framework.py `root_walker.walk_roots` seam the collector already
 /// uses for the other host-side root sources.
 pub fn walk_jit_callee_frame_roots(visitor: &mut dyn FnMut(&mut GcRef)) {
-    let arena = arena_ref();
+    let data = capture_jit_callee_frame_root_area();
+    unsafe { walk_jit_callee_frame_roots_area(data, visitor) };
+}
+
+pub fn capture_jit_callee_frame_root_area() -> *const () {
+    JIT_CALLEE_FRAME_ROOT_AREA.with(|area| area as *const _ as *const ())
+}
+
+/// # Safety
+/// `data` must come from [`capture_jit_callee_frame_root_area`], and the
+/// owning thread must be quiesced.
+pub unsafe fn walk_jit_callee_frame_roots_area(
+    data: *const (),
+    visitor: &mut dyn FnMut(&mut GcRef),
+) {
+    let area = unsafe { &*(data as *const JitCalleeFrameRootArea) };
+    let arena = unsafe { &mut *(*area.arena).get() };
     for idx in 0..ARENA_CAP {
         if arena.armed[idx] {
             unsafe { visit_callee_frame_roots(arena.buf[idx].frame.as_mut_ptr(), visitor) };
         }
     }
-    HEAP_CALLEE_FRAMES.with(|cell| {
-        for &ptr in unsafe { &*cell.get() }.iter() {
-            unsafe { visit_callee_frame_roots(ptr, visitor) };
-        }
-    });
+    let heap_frames = unsafe { &*(*area.heap_frames).get() };
+    for &ptr in heap_frames.iter() {
+        unsafe { visit_callee_frame_roots(ptr, visitor) };
+    }
 }
 
 // ── JIT call callbacks ───────────────────────────────────────────

@@ -58,6 +58,28 @@ pub(crate) unsafe fn walk_codec_state_gc(visitor: &mut dyn FnMut(&mut PyObjectRe
     });
 }
 
+pub(crate) fn capture_codec_state_root_area() -> *const () {
+    CODEC_STATE.with(|state| state as *const _ as *const ())
+}
+
+/// # Safety
+/// `data` must come from [`capture_codec_state_root_area`], and the owning
+/// thread must be quiesced.
+pub(crate) unsafe fn walk_codec_state_root_area(
+    data: *const (),
+    visitor: &mut dyn FnMut(&mut PyObjectRef),
+) {
+    let state = unsafe { &*(data as *const Cell<*mut CodecState>) };
+    let ptr = state.get();
+    if ptr.is_null() {
+        return;
+    }
+    let state = unsafe { &mut *ptr };
+    visitor(&mut state.codec_search_path);
+    visitor(&mut state.codec_search_cache);
+    visitor(&mut state.codec_error_registry);
+}
+
 // PyPy `interp_codecs.py:166-190 normalize`.
 fn normalize(encoding: &str) -> String {
     let mut chars = String::new();

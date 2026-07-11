@@ -2542,6 +2542,16 @@ thread_local! {
     /// this is the same per-instance lifeline storage.
     pub static WEAKREF_TABLE: RefCell<HashMap<usize, PyObjectRef>> =
         RefCell::new(HashMap::new());
+
+    static MAPDICT_ROOT_AREA: MapdictRootArea = MapdictRootArea {
+        instance_dict: INSTANCE_DICT.with(|table| table as *const _),
+        weakref_table: WEAKREF_TABLE.with(|table| table as *const _),
+    };
+}
+
+struct MapdictRootArea {
+    instance_dict: *const RefCell<HashMap<usize, PyObjectRef>>,
+    weakref_table: *const RefCell<HashMap<usize, PyObjectRef>>,
 }
 
 // ── MapdictDictSupport ────────────────────────────────────────────────
@@ -3040,19 +3050,36 @@ pub unsafe fn instance_walk_boxed_storage(obj: PyObjectRef, f: &mut dyn FnMut(*m
 /// those value slots here so the backend GC can update them when nursery objects
 /// move.
 pub fn walk_mapdict_roots(mut visitor: impl FnMut(&mut PyObjectRef)) {
-    let dict_values = INSTANCE_DICT.with(|table| {
+    let data = capture_mapdict_root_area();
+    unsafe { walk_mapdict_roots_area(data, &mut visitor) };
+}
+
+pub fn capture_mapdict_root_area() -> *const () {
+    MAPDICT_ROOT_AREA.with(|area| area as *const _ as *const ())
+}
+
+/// # Safety
+/// `data` must come from [`capture_mapdict_root_area`], and the owning thread
+/// must be quiesced.
+pub unsafe fn walk_mapdict_roots_area(data: *const (), mut visitor: impl FnMut(&mut PyObjectRef)) {
+    let area = unsafe { &*(data as *const MapdictRootArea) };
+    let instance_dict = unsafe { &*area.instance_dict };
+    let weakref_table = unsafe { &*area.weakref_table };
+    let dict_values = {
+        let table = instance_dict;
         table
             .borrow()
             .iter()
             .map(|(&key, &dict)| (key, dict))
             .collect::<Vec<_>>()
-    });
+    };
     // SAFETY: do not hold the RefCell borrow while invoking callbacks. The
     // visitor and w_dict_walk_entries_mut may re-enter mapdict/dict APIs.
     for (key, mut dict) in dict_values {
         visitor(&mut dict);
         let new_key = current_owner_key(key);
-        INSTANCE_DICT.with(|table| {
+        {
+            let table = instance_dict;
             let mut table = table.borrow_mut();
             if new_key == key {
                 if let Some(slot) = table.get_mut(&key) {
@@ -3061,7 +3088,7 @@ pub fn walk_mapdict_roots(mut visitor: impl FnMut(&mut PyObjectRef)) {
             } else if table.remove(&key).is_some() {
                 table.insert(new_key, dict);
             }
-        });
+        }
         // Trace the dict's own r_dict entries. INSTANCE_DICT now holds only
         // non-instance hasdict wrappers (property/member) — never a
         // MapDictStrategy view, since an instance's `__dict__` wrapper lives in
@@ -3091,17 +3118,19 @@ pub fn walk_mapdict_roots(mut visitor: impl FnMut(&mut PyObjectRef)) {
         // via the instance/wrapper write barriers that enter the remembered set.
         // So no instance is walked here.
     }
-    let weakref_values = WEAKREF_TABLE.with(|table| {
+    let weakref_values = {
+        let table = weakref_table;
         table
             .borrow()
             .iter()
             .map(|(&key, &value)| (key, value))
             .collect::<Vec<_>>()
-    });
+    };
     for (key, mut value) in weakref_values {
         visitor(&mut value);
         let new_key = current_owner_key(key);
-        WEAKREF_TABLE.with(|table| {
+        {
+            let table = weakref_table;
             let mut table = table.borrow_mut();
             if new_key == key {
                 if let Some(slot) = table.get_mut(&key) {
@@ -3110,7 +3139,7 @@ pub fn walk_mapdict_roots(mut visitor: impl FnMut(&mut PyObjectRef)) {
             } else if table.remove(&key).is_some() {
                 table.insert(new_key, value);
             }
-        });
+        }
     }
 }
 

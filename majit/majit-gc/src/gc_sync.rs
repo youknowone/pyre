@@ -17,9 +17,12 @@
 //!
 //! This is NOT a GIL — mutators do not hold a lock during Python execution.
 //! The lock is held only for the duration of each individual GC operation.
-//! The STW protocol is for collection: when nursery is full, the collecting
-//! thread requests STW, all other mutators park at their next poll point
-//! (which is every GC operation in P0), collection runs, then all resume.
+//! Collection begins only when every other registered thread is at an
+//! entry-style safepoint where all of its live GC references are rooted.
+//! A slow `gc_op` leaves RUNNING before blocking on `gc_mutex`, then rejoins
+//! RUNNING before its closure executes. A dispatch poll parks directly. There
+//! is no exit safepoint: a returned reference remains protected until the
+//! caller roots it before its next collection-capable call.
 
 use std::cell::{Cell, UnsafeCell};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -42,13 +45,15 @@ pub struct GcSync {
     /// Mutex serialising all GC operations. Held briefly per alloc/barrier
     /// (P0). Held for full STW duration during collection.
     gc_mutex: Mutex<()>,
-    /// Set to true when a thread wants to collect. Other threads park
-    /// at their next gc_op or runtime dispatch poll.
+    /// Set while a collector is draining other mutators to entry-style
+    /// safepoints. Cleared before the collector releases `gc_mutex`.
     stw_requested: AtomicBool,
-    /// RUNNING mutator count. A registered thread is removed before it waits
-    /// on gc_mutex, so a collector holding gc_mutex can drain this to zero.
+    /// RUNNING registered-mutator count. A slow `gc_op` removes itself before
+    /// waiting on `gc_mutex`, so a mutex-holding collector can drain every
+    /// other mutator while remaining counted itself.
     quiesce: Mutex<QuiesceState>,
-    /// Signalled whenever RUNNING decreases, including the transition to zero.
+    /// Signalled whenever RUNNING decreases toward the collector-inclusive
+    /// drain target (one when the collector is counted, otherwise zero).
     quiesced: Condvar,
     /// Signalled when STW ends and parked mutators may become RUNNING again.
     resumed: Condvar,
@@ -170,13 +175,22 @@ thread_local! {
     static THREAD_REGISTERED: Cell<bool> = const { Cell::new(false) };
 
     /// Registered mutators are normally RUNNING. Outermost slow gc_op regions
-    /// and safepoint parks flip this to false until they resume.
+    /// waiting on gc_mutex and dispatch safepoint parks flip this to false.
     static THREAD_RUNNING: Cell<bool> = const { Cell::new(false) };
+
+    /// True while this thread owns the singleton through the lock-free
+    /// single-thread fast path. The slow-path drain uses this to avoid waiting
+    /// on the current thread's own process-global `IN_FAST_PATH` lock.
+    static THREAD_HOLDS_FAST_PATH: Cell<bool> = const { Cell::new(false) };
 
     /// Reentrancy depth for collector-side quiescence. do_collect_full calls
     /// do_collect_nursery, so only the outer guard owns the STW transition.
     static STW_DEPTH: Cell<u32> = const { Cell::new(0) };
 }
+
+/// Debug-build owner flag for the exclusive singleton borrow invariant.
+#[cfg(debug_assertions)]
+static MUT_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// RAII marker: raises `GC_OP_DEPTH` for the exact span of a closure that holds
 /// the exclusive `&mut dyn GcAllocator`. Wraps every `singleton_mut()` call.
@@ -185,6 +199,10 @@ impl OpGuard {
     #[inline]
     fn enter() -> Self {
         GC_OP_DEPTH.with(|d| d.set(d.get() + 1));
+        #[cfg(debug_assertions)]
+        if GC_OP_DEPTH.with(|d| d.get()) == 1 && MUT_ACTIVE.swap(true, Ordering::SeqCst) {
+            panic!("GC singleton exclusivity invariant violated: concurrent &mut access");
+        }
         OpGuard
     }
 }
@@ -192,6 +210,10 @@ impl Drop for OpGuard {
     #[inline]
     fn drop(&mut self) {
         GC_OP_DEPTH.with(|d| d.set(d.get() - 1));
+        #[cfg(debug_assertions)]
+        if GC_OP_DEPTH.with(|d| d.get()) == 0 {
+            MUT_ACTIVE.store(false, Ordering::SeqCst);
+        }
     }
 }
 
@@ -243,13 +265,14 @@ pub fn gc_query_reentrant<R>(f: impl FnOnce(&dyn GcAllocator) -> R) -> R {
 /// `unregister_thread`.  When ≤ 1, `gc_op` skips the Mutex entirely.
 static REGISTERED_THREADS: AtomicUsize = AtomicUsize::new(0);
 
-/// Set by the single-thread fast path while inside `singleton_mut()`.
-/// `register_thread` spins on this to prevent the 1→2 transition from
-/// racing with a concurrent fast-path gc_op.
+/// Fast-path lock held while the single-thread path accesses `singleton_mut()`.
+/// CAS acquisition serialises all eligible callers, including unregistered
+/// callers, and slow paths drain its owner before accessing the singleton.
 static IN_FAST_PATH: AtomicBool = AtomicBool::new(false);
 
-/// Register the current thread as a GC mutator.  Must be called before
-/// any `gc_op` on this thread.  Paired with `unregister_thread`.
+/// Register the current thread as a GC mutator. Paired with
+/// `unregister_thread`. An unregistered thread may still call `gc_op`; it is
+/// not counted for STW, but serialises through the same operation gate.
 pub fn register_thread() {
     assert!(
         !THREAD_REGISTERED.with(|registered| registered.get()),
@@ -257,9 +280,9 @@ pub fn register_thread() {
     );
     let old = REGISTERED_THREADS.fetch_add(1, Ordering::SeqCst);
     if old > 0 {
-        // A second thread is arriving.  Spin until any in-progress
-        // fast-path gc_op completes — after this, the first thread
-        // will see REGISTERED_THREADS > 1 and take the Mutex path.
+        // A second thread is arriving. Spin until the operation gate is free;
+        // after this, existing callers see REGISTERED_THREADS > 1 and take the
+        // Mutex path. CAS acquisition makes this stricter than the old marker.
         while IN_FAST_PATH.load(Ordering::Acquire) {
             std::hint::spin_loop();
         }
@@ -273,10 +296,19 @@ pub fn register_thread() {
     state.running += 1;
     THREAD_RUNNING.with(|running| running.set(true));
     THREAD_REGISTERED.with(|registered| registered.set(true));
+    drop(state);
+
+    if old > 0 && is_initialized() {
+        // gc.py:525-531 publishes the nursery slots used by generated inline
+        // allocation. A shared free-threaded nursery cannot safely use its
+        // non-atomic bump sequence, so the 1→2 transition pins that path off.
+        // This is sticky: unregistering threads never republishes the top.
+        gc_op(|gc| gc.set_inline_alloc_enabled(false));
+    }
 }
 
-/// Unregister the current thread.  After this, gc_op must not be
-/// called from this thread.
+/// Unregister the current thread. Subsequent `gc_op` calls remain serialised,
+/// but this thread no longer participates in STW quiescence.
 pub fn unregister_thread() {
     assert!(
         THREAD_REGISTERED.with(|registered| registered.get()),
@@ -307,64 +339,10 @@ pub fn registered_threads() -> usize {
 // GC operation gate — fast path when single-threaded
 // ──────────────────────────────────────────────────────────────
 
-/// A registered mutator's outermost slow gc_op is a safe region for its
-/// complete duration, including time blocked on gc_mutex.
-struct SafeRegionGuard {
-    active: bool,
-}
-
-impl SafeRegionGuard {
-    fn enter() -> Self {
-        let registered = THREAD_REGISTERED.with(|registered| registered.get());
-        let needs_safe_region = registered
-            && (REGISTERED_THREADS.load(Ordering::Acquire) > 1
-                || GC_SYNC.stw_requested.load(Ordering::Acquire));
-        if !needs_safe_region || in_gc_op() {
-            return Self { active: false };
-        }
-
-        let mut state = GC_SYNC.quiesce.lock().unwrap();
-        assert!(
-            THREAD_RUNNING.with(|running| running.replace(false)),
-            "GC mutator entered a safe region twice"
-        );
-        state.running = state
-            .running
-            .checked_sub(1)
-            .expect("RUNNING underflow entering gc_op safe region");
-        GC_SYNC.quiesced.notify_all();
-
-        state = GC_SYNC
-            .resumed
-            .wait_while(state, |_| GC_SYNC.stw_requested.load(Ordering::Acquire))
-            .unwrap();
-        drop(state);
-        Self { active: true }
-    }
-}
-
-impl Drop for SafeRegionGuard {
-    fn drop(&mut self) {
-        if !self.active {
-            return;
-        }
-        let mut state = GC_SYNC.quiesce.lock().unwrap();
-        state = GC_SYNC
-            .resumed
-            .wait_while(state, |_| GC_SYNC.stw_requested.load(Ordering::Acquire))
-            .unwrap();
-        state.running += 1;
-        assert!(
-            !THREAD_RUNNING.with(|running| running.replace(true)),
-            "GC mutator left a safe region twice"
-        );
-    }
-}
-
 /// Execute a closure with exclusive `&mut dyn GcAllocator` access.
 ///
-/// **Fast path** (single registered thread, no STW): direct access,
-/// no Mutex.  Cost: 2 atomic loads + 2 atomic stores (~4ns x86).
+/// **Fast path** (single registered thread, no STW): direct access after
+/// acquiring `IN_FAST_PATH`, without taking the Mutex.
 ///
 /// **Slow path** (multiple threads or STW): acquires `gc_mutex`.
 /// Single-threaded production always takes the fast path.
@@ -384,18 +362,29 @@ pub fn gc_op<R>(f: impl FnOnce(&mut dyn GcAllocator) -> R) -> R {
     // Fast path: single thread, no STW.
     if REGISTERED_THREADS.load(Ordering::Acquire) <= 1
         && !GC_SYNC.stw_requested.load(Ordering::Acquire)
+        && IN_FAST_PATH
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
     {
-        IN_FAST_PATH.store(true, Ordering::Release);
-        // Double-check: another thread may have registered between
-        // our load and the flag set.
+        // Recheck after acquiring the fast-path lock: another thread may have
+        // registered or requested STW after the eligibility loads above.
         if REGISTERED_THREADS.load(Ordering::Acquire) <= 1
             && !GC_SYNC.stw_requested.load(Ordering::Acquire)
         {
-            // SAFETY: single thread, no concurrent access possible.
+            // SAFETY: the fast-path lock excludes other fast operations, and
+            // slow operations drain it before accessing the singleton.
+            assert!(
+                !THREAD_HOLDS_FAST_PATH.with(|held| held.replace(true)),
+                "nested single-thread GC fast path"
+            );
             let r = {
                 let _op = OpGuard::enter();
                 f(unsafe { singleton_mut() })
             };
+            assert!(
+                THREAD_HOLDS_FAST_PATH.with(|held| held.replace(false)),
+                "single-thread GC fast path marker cleared twice"
+            );
             IN_FAST_PATH.store(false, Ordering::Release);
             return r;
         }
@@ -407,14 +396,69 @@ pub fn gc_op<R>(f: impl FnOnce(&mut dyn GcAllocator) -> R) -> R {
 /// Slow path: Mutex-guarded access with STW parking.
 #[cold]
 fn gc_op_slow<R>(f: impl FnOnce(&mut dyn GcAllocator) -> R) -> R {
-    // Enter the safe region before acquiring gc_mutex. A thread blocked on
-    // the mutex is therefore already excluded from RUNNING, which lets the
-    // collector hold gc_mutex while waiting for RUNNING == 0.
-    let _safe = SafeRegionGuard::enter();
+    let registered = THREAD_REGISTERED.with(|registered| registered.get());
+    if registered {
+        let mut state = GC_SYNC.quiesce.lock().unwrap();
+        assert!(
+            THREAD_RUNNING.with(|running| running.replace(false)),
+            "GC mutator entered a gc_op safepoint twice"
+        );
+        state.running = state
+            .running
+            .checked_sub(1)
+            .expect("RUNNING underflow entering gc_op safepoint");
+        GC_SYNC.quiesced.notify_all();
+    }
+
+    // Blocking on gc_mutex is the park: this thread is already excluded from
+    // RUNNING, so a collector can hold the mutex while draining other threads.
     let _guard = GC_SYNC.gc_mutex.lock().unwrap();
-    let _held = GateHeldGuard::enter();
-    let _op = OpGuard::enter();
-    f(unsafe { singleton_mut() })
+
+    // Drain a fast operation before borrowing the singleton. A fast holder
+    // never waits on gc_mutex, so this terminates. Together with CAS acquisition
+    // this makes fast and slow singleton accesses mutually exclusive.
+    let self_holds_fast_path = THREAD_HOLDS_FAST_PATH.with(|held| held.get());
+    while IN_FAST_PATH.load(Ordering::Acquire) && !self_holds_fast_path {
+        std::hint::spin_loop();
+    }
+    if !self_holds_fast_path {
+        // Claim the gate after draining so a new fast operation cannot start
+        // between the final observation above and the singleton borrow.
+        while IN_FAST_PATH
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            std::hint::spin_loop();
+        }
+    }
+
+    if registered {
+        let mut state = GC_SYNC.quiesce.lock().unwrap();
+        // An STW requester holds gc_mutex and clears its request before
+        // releasing it, so a thread that acquired gc_mutex cannot need to wait.
+        debug_assert!(
+            !GC_SYNC.stw_requested.load(Ordering::Acquire),
+            "gc_mutex holder observed an active STW request"
+        );
+        state.running += 1;
+        assert!(
+            !THREAD_RUNNING.with(|running| running.replace(true)),
+            "GC mutator re-entered RUNNING twice"
+        );
+    }
+
+    let result = {
+        let _held = GateHeldGuard::enter();
+        let _op = OpGuard::enter();
+        // There is deliberately no exit park. A returned reference is rooted
+        // by the caller before its next entry-style safepoint, matching the
+        // single-thread allocation discipline.
+        f(unsafe { singleton_mut() })
+    };
+    if !self_holds_fast_path {
+        IN_FAST_PATH.store(false, Ordering::Release);
+    }
+    result
 }
 
 /// Execute a closure with `&dyn GcAllocator` access (read-only query).
@@ -435,12 +479,10 @@ pub fn gc_query<R>(f: impl FnOnce(&dyn GcAllocator) -> R) -> R {
 pub struct StwGuard {
     active: bool,
     owner: bool,
-    restore_fast_collector: bool,
 }
 
-/// Quiesce every registered mutator when the process-global GC is shared.
-/// The collecting thread is normally already safe because collection runs
-/// inside an outermost slow gc_op.
+/// Quiesce every other registered mutator when the process-global GC is shared.
+/// A registered collecting thread stays in RUNNING while collection executes.
 pub fn quiesce_mutators() -> StwGuard {
     let nested = STW_DEPTH.with(|depth| {
         let old = depth.get();
@@ -455,7 +497,6 @@ pub fn quiesce_mutators() -> StwGuard {
         return StwGuard {
             active: true,
             owner: false,
-            restore_fast_collector: false,
         };
     }
 
@@ -463,40 +504,18 @@ pub fn quiesce_mutators() -> StwGuard {
         return StwGuard {
             active: false,
             owner: false,
-            restore_fast_collector: false,
         };
     }
 
     let mut state = GC_SYNC.quiesce.lock().unwrap();
     GC_SYNC.stw_requested.store(true, Ordering::Release);
 
-    // The 1→2 registration transition publishes REGISTERED_THREADS before it
-    // waits for the old single-thread fast operation to finish. If that very
-    // operation fills the nursery, make its collecting thread safe and release
-    // the transition waiter; stw_requested prevents any new fast operation.
-    let restore_fast_collector = IN_FAST_PATH.load(Ordering::Acquire)
-        && in_gc_op()
-        && THREAD_REGISTERED.with(|registered| registered.get())
+    let collector_is_running = THREAD_REGISTERED.with(|registered| registered.get())
         && THREAD_RUNNING.with(|running| running.get());
-    if restore_fast_collector {
-        THREAD_RUNNING.with(|running| running.set(false));
-        state.running = state
-            .running
-            .checked_sub(1)
-            .expect("RUNNING underflow quiescing fast-path collector");
-        IN_FAST_PATH.store(false, Ordering::Release);
-        GC_SYNC.quiesced.notify_all();
-    }
-
-    // Any other fast operation began before the multi-thread transition and
-    // will finish without consulting the quiesce mutex.
-    while IN_FAST_PATH.load(Ordering::Acquire) {
-        std::hint::spin_loop();
-    }
-
+    let drain_target = usize::from(collector_is_running);
     state = GC_SYNC
         .quiesced
-        .wait_while(state, |state| state.running != 0)
+        .wait_while(state, |state| state.running != drain_target)
         .unwrap();
     drop(state);
     STW_DEPTH.with(|depth| depth.set(1));
@@ -504,7 +523,6 @@ pub fn quiesce_mutators() -> StwGuard {
     StwGuard {
         active: true,
         owner: true,
-        restore_fast_collector,
     }
 }
 
@@ -530,14 +548,7 @@ impl Drop for StwGuard {
         }
         assert_eq!(remaining, 0, "outer STW guard dropped before nested guard");
 
-        let mut state = GC_SYNC.quiesce.lock().unwrap();
-        if self.restore_fast_collector {
-            state.running += 1;
-            assert!(
-                !THREAD_RUNNING.with(|running| running.replace(true)),
-                "fast-path collector resumed twice"
-            );
-        }
+        let _state = GC_SYNC.quiesce.lock().unwrap();
         GC_SYNC.stw_requested.store(false, Ordering::Release);
         GC_SYNC.stw_generation.fetch_add(1, Ordering::Release);
         GC_SYNC.resumed.notify_all();
@@ -559,8 +570,35 @@ pub fn request_stw(collect_fn: impl FnOnce(&mut dyn GcAllocator)) {
 
 /// Park the current thread until the ongoing STW finishes.
 fn park_until_stw_done() {
-    let safe = SafeRegionGuard::enter();
-    drop(safe);
+    if !THREAD_REGISTERED.with(|registered| registered.get())
+        || !THREAD_RUNNING.with(|running| running.get())
+    {
+        return;
+    }
+
+    let mut state = GC_SYNC.quiesce.lock().unwrap();
+    if !GC_SYNC.stw_requested.load(Ordering::Acquire) {
+        return;
+    }
+    assert!(
+        THREAD_RUNNING.with(|running| running.replace(false)),
+        "GC mutator entered a dispatch safepoint twice"
+    );
+    state.running = state
+        .running
+        .checked_sub(1)
+        .expect("RUNNING underflow entering dispatch safepoint");
+    GC_SYNC.quiesced.notify_all();
+
+    state = GC_SYNC
+        .resumed
+        .wait_while(state, |_| GC_SYNC.stw_requested.load(Ordering::Acquire))
+        .unwrap();
+    state.running += 1;
+    assert!(
+        !THREAD_RUNNING.with(|running| running.replace(true)),
+        "GC mutator left a dispatch safepoint twice"
+    );
 }
 
 /// Poll for a collector request at a runtime dispatch safepoint.
@@ -581,8 +619,15 @@ mod tests {
     use super::*;
     use crate::collector::{GcConfig, MiniMarkGC};
     use crate::trace::TypeInfo;
+    use std::cell::UnsafeCell;
     use std::sync::atomic::AtomicUsize;
     use std::sync::{Arc, Barrier};
+
+    struct GcOpCounter(UnsafeCell<usize>);
+
+    // SAFETY: tests access the cell only inside gc_op, whose singleton gate
+    // must provide the same exclusive serialization as it does for the GC.
+    unsafe impl Sync for GcOpCounter {}
 
     fn ensure_gc() {
         if !is_initialized() {
@@ -618,6 +663,62 @@ mod tests {
         let ok = gc_op(|_outer| gc_query(|gc| !gc.nursery_free().is_null()));
         assert!(ok);
         unregister_thread();
+    }
+
+    #[test]
+    #[ignore = "requires exclusive process — exercises process-global registration state"]
+    fn registered_and_unregistered_gc_ops_are_mutually_exclusive() {
+        ensure_gc();
+        register_test_mutator();
+
+        const OPS_PER_THREAD: usize = 100_000;
+        let counter = Arc::new(GcOpCounter(UnsafeCell::new(0)));
+        let start = Arc::new(Barrier::new(2));
+        let worker = {
+            let counter = counter.clone();
+            let start = start.clone();
+            std::thread::spawn(move || {
+                // An unregistered thread's gc_op is legal and must serialize
+                // through the same fast-path lock as a registered caller.
+                start.wait();
+                for _ in 0..OPS_PER_THREAD {
+                    gc_op(|_| unsafe { *counter.0.get() += 1 });
+                }
+            })
+        };
+
+        start.wait();
+        for _ in 0..OPS_PER_THREAD {
+            gc_op(|_| unsafe { *counter.0.get() += 1 });
+        }
+        worker.join().unwrap();
+
+        assert_eq!(unsafe { *counter.0.get() }, OPS_PER_THREAD * 2);
+        unregister_test_mutator();
+    }
+
+    #[test]
+    #[ignore = "requires exclusive process — mutates the sticky singleton inline-allocation state"]
+    fn second_registered_thread_pins_published_nursery_top() {
+        ensure_gc();
+        register_test_mutator();
+        assert_ne!(
+            gc_query(|gc| unsafe { *(gc.nursery_top_addr() as *const usize) }),
+            0
+        );
+
+        std::thread::spawn(|| {
+            register_test_mutator();
+            unregister_test_mutator();
+        })
+        .join()
+        .unwrap();
+
+        assert_eq!(
+            gc_query(|gc| unsafe { *(gc.nursery_top_addr() as *const usize) }),
+            0
+        );
+        unregister_test_mutator();
     }
 
     #[test]
@@ -695,6 +796,79 @@ mod tests {
 
         worker.join().unwrap();
         unregister_test_mutator();
+    }
+
+    #[test]
+    #[ignore = "requires exclusive process — conflicts with other majit-gc tests' local GCs"]
+    fn entry_only_safepoint_preserves_fresh_gc_op_return() {
+        if !is_initialized() {
+            let mut gc = MiniMarkGC::with_config(GcConfig {
+                nursery_size: 64 * 1024,
+                large_object_threshold: 32 * 1024,
+                ..GcConfig::default()
+            });
+            let type_id = gc.register_type(TypeInfo::simple(16));
+            assert_eq!(type_id, 0);
+            store_singleton(Box::new(gc));
+        }
+
+        const MUTATORS: usize = 4;
+        const ROUNDS: usize = 128;
+        let start = Arc::new(Barrier::new(MUTATORS + 1));
+        let finished = Arc::new(AtomicUsize::new(0));
+
+        let collector = {
+            let start = start.clone();
+            let finished = finished.clone();
+            std::thread::spawn(move || {
+                register_test_mutator();
+                start.wait();
+                while finished.load(Ordering::Acquire) != MUTATORS {
+                    gc_op(|gc| gc.collect_nursery());
+                    std::thread::yield_now();
+                }
+                unregister_test_mutator();
+            })
+        };
+
+        let mutators: Vec<_> = (0..MUTATORS)
+            .map(|thread_index| {
+                let start = start.clone();
+                let finished = finished.clone();
+                std::thread::spawn(move || {
+                    register_test_mutator();
+                    start.wait();
+
+                    for round in 0..ROUNDS {
+                        let expected =
+                            0xA110_C000_0000_0000u64 | ((thread_index as u64) << 32) | round as u64;
+                        let fresh = gc_op(|gc| gc.alloc_nursery_typed(0, 16));
+                        unsafe { *(fresh.0 as *mut u64) = expected };
+
+                        // Widen the allocation-return window. Collection must
+                        // wait for the next entry safepoint, after this fresh
+                        // reference has been installed in the shadow stack.
+                        std::thread::yield_now();
+                        let root_depth = crate::shadow_stack::push(fresh);
+                        gc_op(|gc| {
+                            gc.collect_nursery();
+                            let rooted = crate::shadow_stack::get(root_depth);
+                            assert_eq!(unsafe { *(rooted.0 as *const u64) }, expected);
+                        });
+                        crate::shadow_stack::pop_to(root_depth);
+                    }
+
+                    finished.fetch_add(1, Ordering::Release);
+                    unregister_test_mutator();
+                })
+            })
+            .collect();
+
+        for mutator in mutators {
+            mutator.join().unwrap();
+        }
+        collector.join().unwrap();
+        assert_eq!(registered_threads(), 0);
     }
 
     #[test]

@@ -367,6 +367,16 @@ thread_local! {
     /// Each builtin module is lazily created on first import.
     pub(crate) static BUILTIN_MODULES: RefCell<HashMap<&'static str, fn(&mut DictStorage)>> =
         RefCell::new(HashMap::new());
+
+    static IMPORT_ROOT_AREA: ImportRootArea = ImportRootArea {
+        modules: SYS_MODULES.with(|modules| modules as *const _),
+        modules_dict: SYS_MODULES_DICT.with(|dict| dict as *const _),
+    };
+}
+
+struct ImportRootArea {
+    modules: *const RefCell<HashMap<String, PyObjectRef>>,
+    modules_dict: *const std::cell::Cell<PyObjectRef>,
 }
 
 // ── builtin module registry ──────────────────────────────────────────
@@ -1144,6 +1154,36 @@ pub unsafe fn walk_sys_modules_dict_gc(visitor: &mut dyn FnMut(&mut PyObjectRef)
         visitor(&mut dict);
         d.set(dict);
     });
+}
+
+pub(crate) fn capture_import_root_area() -> *const () {
+    IMPORT_ROOT_AREA.with(|area| area as *const _ as *const ())
+}
+
+/// # Safety
+/// `data` must come from [`capture_import_root_area`], and the owning thread
+/// must be quiesced.
+pub(crate) unsafe fn walk_import_roots_area(
+    data: *const (),
+    visitor: &mut dyn FnMut(&mut PyObjectRef),
+) {
+    let area = unsafe { &*(data as *const ImportRootArea) };
+    let modules = unsafe { &*area.modules };
+    for &module in modules.borrow().values() {
+        if module.is_null() || !unsafe { pyre_object::is_module(module) } {
+            continue;
+        }
+        unsafe {
+            let w_dict = pyre_object::w_module_get_w_dict(module);
+            pyre_object::dictmultiobject::w_module_dict_walk_gc_cells(w_dict, visitor);
+        }
+    }
+    let modules_dict = unsafe { &*area.modules_dict };
+    let mut dict = modules_dict.get();
+    if !dict.is_null() {
+        visitor(&mut dict);
+        modules_dict.set(dict);
+    }
 }
 
 /// Set the Python-visible sys.modules dict reference. Called during sys

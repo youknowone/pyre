@@ -7779,27 +7779,41 @@ pub fn fbw_finish_concrete_take() -> Option<FinishConcrete> {
 /// Registered once via `register_extra_root_walker` at JIT init, mirroring
 /// [`fbw_store_journal_root_walker`].
 pub fn fbw_finish_concrete_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
-    FBW_FINISH_CONCRETE.with(|c| {
-        let Some(finish) = c.get() else {
-            return;
-        };
-        let (value, is_raise) = match finish {
-            FinishConcrete::Return(value) => (value, false),
-            FinishConcrete::Raise(value) => (value, true),
-        };
-        if let ConcreteValue::Ref(ptr) = value {
-            let mut gcref = majit_ir::GcRef(ptr as usize);
-            visitor(&mut gcref);
-            // The visitor may forward (relocate) the ref; write it back so
-            // the stashed value points at the moved object.
-            let value = ConcreteValue::Ref(gcref.0 as pyre_object::PyObjectRef);
-            c.set(Some(if is_raise {
-                FinishConcrete::Raise(value)
-            } else {
-                FinishConcrete::Return(value)
-            }));
-        }
-    });
+    let data = capture_fbw_finish_concrete_root_area();
+    unsafe { fbw_finish_concrete_root_walker_area(data, visitor) };
+}
+
+pub fn capture_fbw_finish_concrete_root_area() -> *const () {
+    FBW_FINISH_CONCRETE.with(|value| value as *const _ as *const ())
+}
+
+/// # Safety
+/// `data` must come from [`capture_fbw_finish_concrete_root_area`], and the
+/// owning thread must be quiesced.
+pub unsafe fn fbw_finish_concrete_root_walker_area(
+    data: *const (),
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    let cell = unsafe { &*(data as *const std::cell::Cell<Option<FinishConcrete>>) };
+    let Some(finish) = cell.get() else {
+        return;
+    };
+    let (value, is_raise) = match finish {
+        FinishConcrete::Return(value) => (value, false),
+        FinishConcrete::Raise(value) => (value, true),
+    };
+    if let ConcreteValue::Ref(ptr) = value {
+        let mut gcref = majit_ir::GcRef(ptr as usize);
+        visitor(&mut gcref);
+        // The visitor may forward (relocate) the ref; write it back so
+        // the stashed value points at the moved object.
+        let value = ConcreteValue::Ref(gcref.0 as pyre_object::PyObjectRef);
+        cell.set(Some(if is_raise {
+            FinishConcrete::Raise(value)
+        } else {
+            FinishConcrete::Return(value)
+        }));
+    }
 }
 
 /// One in-flight FOR_ITER continuation entry (#57 Option C): the item the
@@ -8013,6 +8027,24 @@ pub(crate) struct MidBodyPayload {
     pub live_locals: Vec<Option<ConcreteValue>>,
     pub live_stack: Vec<ConcreteValue>,
     pub return_value: pyre_object::PyObjectRef,
+}
+
+struct FbwStoreJournalRootArea {
+    stores: *const std::cell::RefCell<Vec<[pyre_object::PyObjectRef; 3]>>,
+    appends: *const std::cell::RefCell<Vec<(pyre_object::PyObjectRef, usize)>>,
+    cell_stores: *const std::cell::RefCell<Vec<(pyre_object::PyObjectRef, i64)>>,
+    foriter: *const std::cell::RefCell<Vec<InflightForiter>>,
+    abort_resume: *const std::cell::RefCell<Option<InlineAbortCarrier>>,
+}
+
+thread_local! {
+    static FBW_STORE_JOURNAL_ROOT_AREA: FbwStoreJournalRootArea = FbwStoreJournalRootArea {
+        stores: FBW_STORE_JOURNAL.with(|value| value as *const _),
+        appends: FBW_APPEND_JOURNAL.with(|value| value as *const _),
+        cell_stores: FBW_CELL_STORE_JOURNAL.with(|value| value as *const _),
+        foriter: FBW_FORITER_INFLIGHT.with(|value| value as *const _),
+        abort_resume: FBW_ABORT_CALL_RESUME.with(|value| value as *const _),
+    };
 }
 
 /// Record that `op` is a walker-built inline exception (B3 construct fold).
@@ -8688,91 +8720,90 @@ pub(crate) fn fbw_executed_residual_counts() -> (u32, u32, u32) {
 /// objects), so every ref slot is forwarded as a root.  Registered once via
 /// `majit_gc::shadow_stack::register_extra_root_walker` at JIT init.
 pub fn fbw_store_journal_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
-    FBW_STORE_JOURNAL.with(|j| {
-        for triple in j.borrow_mut().iter_mut() {
-            for slot in triple.iter_mut() {
-                // SAFETY: `PyObjectRef` and `GcRef` share the usize repr
-                // (`GcRef` is `#[repr(transparent)]`); the borrow keeps
-                // the Vec storage alive for the visit.
-                visitor(unsafe { &mut *(slot as *mut pyre_object::PyObjectRef).cast() });
-            }
+    let data = capture_fbw_store_journal_root_area();
+    unsafe { fbw_store_journal_root_walker_area(data, visitor) };
+}
+
+pub fn capture_fbw_store_journal_root_area() -> *const () {
+    FBW_STORE_JOURNAL_ROOT_AREA.with(|area| area as *const _ as *const ())
+}
+
+/// # Safety
+/// `data` must come from [`capture_fbw_store_journal_root_area`], and the
+/// owning thread must be quiesced.
+pub unsafe fn fbw_store_journal_root_walker_area(
+    data: *const (),
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    let area = unsafe { &*(data as *const FbwStoreJournalRootArea) };
+    let stores = unsafe { &mut *(*area.stores).as_ptr() };
+    for triple in stores.iter_mut() {
+        for slot in triple.iter_mut() {
+            visitor(unsafe { &mut *(slot as *mut pyre_object::PyObjectRef).cast() });
         }
-    });
-    FBW_APPEND_JOURNAL.with(|j| {
-        for (list, _len) in j.borrow_mut().iter_mut() {
-            // SAFETY: as above — only the `PyObjectRef` slot is a root; the
-            // `usize` length is a plain scalar.
-            visitor(unsafe { &mut *(list as *mut pyre_object::PyObjectRef).cast() });
-        }
-    });
+    }
+    let appends = unsafe { &mut *(*area.appends).as_ptr() };
+    for (list, _len) in appends.iter_mut() {
+        visitor(unsafe { &mut *(list as *mut pyre_object::PyObjectRef).cast() });
+    }
     // Cell-store journal: the cell is immovable (`malloc_typed`) so no
     // forwarding happens, but a mid-walk rebind can drop the module dict's
     // only reference — rooting it keeps the rollback's `intvalue` restore
     // from writing into a freed block.
-    FBW_CELL_STORE_JOURNAL.with(|j| {
-        for (cell, _intvalue) in j.borrow_mut().iter_mut() {
-            // SAFETY: as above — only the `PyObjectRef` slot is a root; the
-            // `i64` payload is a plain scalar.
-            visitor(unsafe { &mut *(cell as *mut pyre_object::PyObjectRef).cast() });
-        }
-    });
+    let cell_stores = unsafe { &mut *(*area.cell_stores).as_ptr() };
+    for (cell, _intvalue) in cell_stores.iter_mut() {
+        visitor(unsafe { &mut *(cell as *mut pyre_object::PyObjectRef).cast() });
+    }
     // #57 Option C: each captured in-flight FOR_ITER item is nursery-resident
     // across the rest of the walk (subsequent residual calls allocate and a
     // minor collection moves nursery objects), so forward every entry's item
     // as a root.
-    FBW_FORITER_INFLIGHT.with(|c| {
-        for entry in c.borrow_mut().iter_mut() {
-            // SAFETY: as above — only the `PyObjectRef` slot is a root; the
-            // `usize` body pc and the bool flag are plain scalars.
-            visitor(unsafe { &mut *(&mut entry.item as *mut pyre_object::PyObjectRef).cast() });
-        }
-    });
+    let foriter = unsafe { &mut *(*area.foriter).as_ptr() };
+    for entry in foriter.iter_mut() {
+        // SAFETY: as above — only the `PyObjectRef` slot is a root; the
+        // `usize` body pc and the bool flag are plain scalars.
+        visitor(unsafe { &mut *(&mut entry.item as *mut pyre_object::PyObjectRef).cast() });
+    }
     // gh#467: the latched forward-flush operand stack (callable + args) is
     // nursery-resident across the abort unwind — the flush boxes Int/Float
     // locals, which can trigger a minor collection that moves these refs before
     // they are written into the frame array — so forward every slot as a root.
-    FBW_ABORT_CALL_RESUME.with(|c| {
-        if let Some(carrier) = c.borrow_mut().as_mut() {
-            match carrier {
-                InlineAbortCarrier::Entry { call_stack, .. } => {
-                    for slot in call_stack {
-                        visitor(unsafe { &mut *(slot as *mut pyre_object::PyObjectRef).cast() });
+    let abort_resume = unsafe { &mut *(*area.abort_resume).as_ptr() };
+    if let Some(carrier) = abort_resume.as_mut() {
+        match carrier {
+            InlineAbortCarrier::Entry { call_stack, .. } => {
+                for slot in call_stack {
+                    visitor(unsafe { &mut *(slot as *mut pyre_object::PyObjectRef).cast() });
+                }
+            }
+            InlineAbortCarrier::MidBody(payload) => {
+                visitor(unsafe {
+                    &mut *(&mut payload.w_code as *mut pyre_object::PyObjectRef).cast()
+                });
+                visitor(unsafe {
+                    &mut *(&mut payload.w_globals as *mut pyre_object::PyObjectRef).cast()
+                });
+                visitor(unsafe {
+                    &mut *(&mut payload.x_arg as *mut pyre_object::PyObjectRef).cast()
+                });
+                if !payload.return_value.is_null() {
+                    visitor(unsafe {
+                        &mut *(&mut payload.return_value as *mut pyre_object::PyObjectRef).cast()
+                    });
+                }
+                for slot in payload.live_locals.iter_mut().flatten() {
+                    if let ConcreteValue::Ref(value) = slot {
+                        visitor(unsafe { &mut *(value as *mut pyre_object::PyObjectRef).cast() });
                     }
                 }
-                InlineAbortCarrier::MidBody(payload) => {
-                    visitor(unsafe {
-                        &mut *(&mut payload.w_code as *mut pyre_object::PyObjectRef).cast()
-                    });
-                    visitor(unsafe {
-                        &mut *(&mut payload.w_globals as *mut pyre_object::PyObjectRef).cast()
-                    });
-                    visitor(unsafe {
-                        &mut *(&mut payload.x_arg as *mut pyre_object::PyObjectRef).cast()
-                    });
-                    if !payload.return_value.is_null() {
-                        visitor(unsafe {
-                            &mut *(&mut payload.return_value as *mut pyre_object::PyObjectRef)
-                                .cast()
-                        });
-                    }
-                    for slot in payload.live_locals.iter_mut().flatten() {
-                        if let ConcreteValue::Ref(value) = slot {
-                            visitor(unsafe {
-                                &mut *(value as *mut pyre_object::PyObjectRef).cast()
-                            });
-                        }
-                    }
-                    for slot in &mut payload.live_stack {
-                        if let ConcreteValue::Ref(value) = slot {
-                            visitor(unsafe {
-                                &mut *(value as *mut pyre_object::PyObjectRef).cast()
-                            });
-                        }
+                for slot in &mut payload.live_stack {
+                    if let ConcreteValue::Ref(value) = slot {
+                        visitor(unsafe { &mut *(value as *mut pyre_object::PyObjectRef).cast() });
                     }
                 }
             }
         }
-    });
+    }
 }
 
 /// FBW-native port of [`crate::state::ensure_boxed_for_ca`] that operates

@@ -350,6 +350,14 @@ struct FinalizerHandler {
 pub struct MiniMarkGC {
     /// The nursery (young generation).
     nursery: Nursery,
+    /// gc.py:525-531 published nursery-top slot read by generated inline
+    /// allocation paths. Kept separately from the real top so free-threaded
+    /// execution can pin the published limit to zero without changing the
+    /// Rust allocator's nursery bounds. The Box keeps its baked address stable
+    /// even if the containing GC value moves.
+    published_nursery_top: Box<usize>,
+    /// Whether generated code may use the shared nursery bump fast path.
+    inline_alloc_enabled: bool,
     /// The old generation.
     oldgen: OldGen,
     /// Type registry for tracing objects.
@@ -568,8 +576,12 @@ impl MiniMarkGC {
         // nursery_size * major_collection_threshold.
         min_heap_size = min_heap_size.max(nursery_size as f64 * major_collection_threshold);
 
+        let nursery = Nursery::new(config.nursery_size);
+        let published_nursery_top = Box::new(nursery.top_ptr() as usize);
         let mut gc = MiniMarkGC {
-            nursery: Nursery::new(config.nursery_size),
+            nursery,
+            published_nursery_top,
+            inline_alloc_enabled: true,
             oldgen: OldGen::new(),
             types: TypeRegistry::new(),
             roots: RootSet::new(),
@@ -628,6 +640,17 @@ impl MiniMarkGC {
         gc.set_major_threshold_from(0.0, 0.0);
         gc._setup_guard_is_object();
         gc
+    }
+
+    /// Refresh the gc.py:525-531 published nursery-top slot from the real
+    /// allocator bound, unless free-threading has disabled the non-atomic
+    /// shared bump fast path.
+    fn refresh_published_nursery_top(&mut self) {
+        *self.published_nursery_top = if self.inline_alloc_enabled {
+            self.nursery.top_ptr() as usize
+        } else {
+            0
+        };
     }
 
     // ── incminimark.py:1292-1308 card marking geometry ──
@@ -1094,6 +1117,14 @@ impl MiniMarkGC {
         crate::shadow_stack::set_extra_root_walk_kind(
             crate::shadow_stack::ExtraRootWalkKind::Minor,
         );
+        let mut visit_extra_area = |gcref: &mut GcRef| {
+            self.drag_out_root(gcref);
+        };
+        if walk_all_mutators {
+            crate::shadow_stack::walk_all_extra_areas(&mut visit_extra_area);
+        } else {
+            crate::shadow_stack::walk_my_extra_areas(&mut visit_extra_area);
+        }
         crate::walk_active_extra_roots(&mut |gcref| {
             self.drag_out_root(gcref);
         });
@@ -1227,6 +1258,7 @@ impl MiniMarkGC {
         } else {
             self.reset_nursery_with_pinned();
         }
+        self.refresh_published_nursery_top();
 
         // Minor collections must also drive incremental major-collection
         // progress. Like incminimark, take one or more major steps until
@@ -1803,6 +1835,15 @@ impl MiniMarkGC {
             crate::shadow_stack::walk_all_resume_ref_roots(&mut visit_resume_root);
         } else {
             crate::shadow_stack::walk_resume_ref_roots(&mut visit_resume_root);
+        }
+
+        let mut visit_extra_area = |gcref: &mut GcRef| {
+            self.seed_major_root(*gcref);
+        };
+        if walk_all_mutators {
+            crate::shadow_stack::walk_all_extra_areas(&mut visit_extra_area);
+        } else {
+            crate::shadow_stack::walk_my_extra_areas(&mut visit_extra_area);
         }
 
         crate::walk_active_extra_roots(&mut |gcref| {
@@ -3251,7 +3292,12 @@ impl GcAllocator for MiniMarkGC {
     }
 
     fn nursery_top_addr(&self) -> usize {
-        self.nursery.top_addr()
+        std::ptr::addr_of!(*self.published_nursery_top) as usize
+    }
+
+    fn set_inline_alloc_enabled(&mut self, enabled: bool) {
+        self.inline_alloc_enabled = enabled;
+        self.refresh_published_nursery_top();
     }
 
     fn max_nursery_object_size(&self) -> usize {
@@ -3531,6 +3577,49 @@ mod tests {
         let obj = gc.alloc_with_type(0, 16);
         assert!(!obj.is_null());
         assert!(gc.is_in_nursery(obj.0));
+    }
+
+    #[test]
+    fn published_nursery_top_tracks_real_top_across_minor_collection() {
+        let mut gc = test_gc(4096);
+        gc.register_type(TypeInfo::simple(16));
+
+        let published_addr = gc.nursery_top_addr();
+        let real_top = gc.nursery_top() as usize;
+        assert_eq!(unsafe { *(published_addr as *const usize) }, real_top);
+
+        // Prove the collection reset republishes the real limit instead of
+        // merely leaving the construction-time value untouched.
+        unsafe { *(published_addr as *mut usize) = 0 };
+        gc.collect_nursery();
+        assert_eq!(gc.nursery_top_addr(), published_addr);
+        assert_eq!(unsafe { *(published_addr as *const usize) }, real_top);
+
+        let obj = gc.alloc_nursery(16);
+        assert!(!obj.is_null());
+        assert!(gc.is_in_nursery(obj.0));
+    }
+
+    #[test]
+    fn disabled_inline_alloc_keeps_published_top_zero_without_disabling_allocator() {
+        let mut gc = test_gc(4096);
+        gc.register_type(TypeInfo::simple(16));
+        let published_addr = gc.nursery_top_addr();
+
+        gc.set_inline_alloc_enabled(false);
+        assert_eq!(unsafe { *(published_addr as *const usize) }, 0);
+        assert!(!gc.alloc_nursery(16).is_null());
+        assert!(!gc.alloc_with_type(0, 16).is_null());
+
+        gc.collect_nursery();
+        assert_eq!(unsafe { *(published_addr as *const usize) }, 0);
+        assert!(!gc.alloc_nursery(16).is_null());
+
+        gc.set_inline_alloc_enabled(true);
+        assert_eq!(
+            unsafe { *(published_addr as *const usize) },
+            gc.nursery_top() as usize
+        );
     }
 
     #[test]

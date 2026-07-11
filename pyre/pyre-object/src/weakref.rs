@@ -181,6 +181,28 @@ pub fn walk_gc_weakref_box_inner_roots(mut visitor: impl FnMut(&mut PyObjectRef)
     });
 }
 
+pub fn capture_gc_weakref_box_root_area() -> *const () {
+    WEAKREF_BOXES.with(|b| b as *const _ as *const ())
+}
+
+/// # Safety
+/// `data` must be the current value returned by
+/// [`capture_gc_weakref_box_root_area`] for a quiesced owning thread.
+pub unsafe fn walk_gc_weakref_box_inner_roots_area(
+    data: *const (),
+    mut visitor: impl FnMut(&mut PyObjectRef),
+) {
+    let boxes =
+        unsafe { &*(*(data as *const std::cell::RefCell<Vec<*mut GcWeakrefBox>>)).as_ptr() };
+    for &boxed in boxes.iter() {
+        if boxed.is_null() {
+            continue;
+        }
+        let inner_slot = unsafe { std::ptr::addr_of_mut!((*boxed).inner) } as *mut PyObjectRef;
+        visitor(unsafe { &mut *inner_slot });
+    }
+}
+
 /// `isinstance(obj, GcWeakrefBox)` predicate.
 ///
 /// # Safety

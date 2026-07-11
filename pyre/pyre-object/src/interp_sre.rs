@@ -57,6 +57,29 @@ pub fn walk_sre_pattern_roots(mut visitor: impl FnMut(&mut PyObjectRef)) {
     });
 }
 
+pub fn capture_sre_pattern_root_area() -> *const () {
+    SRE_PATTERNS.with(|patterns| patterns as *const _ as *const ())
+}
+
+/// # Safety
+/// `data` must come from [`capture_sre_pattern_root_area`], and its owning
+/// thread must be quiesced.
+pub unsafe fn walk_sre_pattern_roots_area(
+    data: *const (),
+    mut visitor: impl FnMut(&mut PyObjectRef),
+) {
+    let patterns =
+        unsafe { &*(*(data as *const std::cell::RefCell<Vec<*mut W_SRE_Pattern>>)).as_ptr() };
+    for &pattern in patterns.iter() {
+        if pattern.is_null() {
+            continue;
+        }
+        visitor(unsafe { &mut (*pattern).w_pattern });
+        visitor(unsafe { &mut (*pattern).w_groupindex });
+        visitor(unsafe { &mut (*pattern).w_indexgroup });
+    }
+}
+
 /// Allocate a `W_SRE_Pattern` — `SRE_Pattern__new__` field stamping
 /// (interp_sre.py:624-639).
 pub fn w_sre_pattern_new(
