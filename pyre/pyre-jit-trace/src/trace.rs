@@ -42,12 +42,25 @@ thread_local! {
     /// returned `FrameBox` carries adoptable end state for the LIVE
     /// frame (no-replay) or still holds the entry state (legacy replay).
     static WALK_END_FLUSH_COMMITTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// A no-handler exception produced by a committed rebuilt callee.  The
+    /// portal consumes it as `LoopResult::Done(Err(..))`; keeping it separate
+    /// from `ContinueRunningNormally` mirrors `_exit_frame_with_exception`.
+    static WALK_END_PROPAGATED_EXCEPTION: std::cell::RefCell<Option<pyre_interpreter::PyError>> =
+        const { std::cell::RefCell::new(None) };
+    /// True at portal trace sites that can consume
+    /// `WALK_END_PROPAGATED_EXCEPTION`. Bridge tracing leaves this false and
+    /// conservatively retains its legacy preflight.
+    static WALK_END_PROPAGATE_ALLOWED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Take-and-reset the walk-end flush flag for the trace that just
 /// returned from [`trace_bytecode`].
 pub fn take_walk_end_flush_committed() -> bool {
     WALK_END_FLUSH_COMMITTED.with(|c| c.replace(false))
+}
+
+pub fn take_walk_end_propagated_exception() -> Option<pyre_interpreter::PyError> {
+    WALK_END_PROPAGATED_EXCEPTION.with(|c| c.borrow_mut().take())
 }
 
 thread_local! {
@@ -119,6 +132,14 @@ fn midbody_post_marker_is_effect_free(code: &CodeObject, start_pc: usize) -> boo
     })
 }
 
+fn exception_delivery_stack_is_sourceable(
+    handler_depth: u32,
+    array_len: usize,
+    stack_base: usize,
+) -> bool {
+    handler_depth == 0 && array_len >= stack_base + 1
+}
+
 fn try_commit_midbody_abort(
     ctx: &TraceCtx,
     cf_addr: usize,
@@ -140,23 +161,51 @@ fn try_commit_midbody_abort(
         return false;
     }
     let code = unsafe { &*raw };
-    // G6 is fail-closed: after the marker, only instructions proven to avoid
-    // heap/global/nonlocal mutation and user calls may reach `execute_frame`.
-    // It may then either return normally or raise without committing an
-    // observable effect, so Err -> legacy replay is exactly status quo and
-    // cannot double-apply an effect. General forward exception delivery stays
-    // deferred to #126/#215 (or a later slice).
-    if !code.exceptiontable.is_empty()
-        || !midbody_post_marker_is_effect_free(code, payload.callee_py_pc)
+    // Only portal trace sites currently carry `_exit_frame_with_exception`
+    // out of the walk. Bridge sites keep the former effect-free preflight;
+    // this is checked before running the rebuilt callee, so they never strand
+    // an effectful Err into replay.
+    if !WALK_END_PROPAGATE_ALLOWED.with(|c| c.get())
+        && (!code.exceptiontable.is_empty()
+            || !midbody_post_marker_is_effect_free(code, payload.callee_py_pc))
     {
         return false;
     }
     if cf_addr == 0 {
         return false;
     }
-    let ec = unsafe { (*(cf_addr as *const pyre_interpreter::PyFrame)).execution_context };
+    let ec = unsafe { (*(cf_addr as *const pyre_interpreter::PyFrame)).execution_context }
+        as *mut pyre_interpreter::PyExecutionContext;
     if ec.is_null() {
         return false;
+    }
+    let propagate_allowed = WALK_END_PROPAGATE_ALLOWED.with(|c| c.get());
+    let outer = unsafe { &mut *(cf_addr as *mut pyre_interpreter::PyFrame) };
+    let outer_stack_base = outer.nlocals() + outer.ncells();
+    let outer_code = unsafe { &*pyre_interpreter::pyframe_get_pycode(outer) };
+    let outer_handler = pyre_interpreter::pycode::lookup_exceptiontable(
+        &outer_code.exceptiontable,
+        (payload.call_py_pc as u32) * 2,
+    );
+    if propagate_allowed {
+        // E-G2: this specialization reconstructs only the exact empty
+        // operand-stack level used by statement-position calls. A handler
+        // preserving any operand below the call remains on legacy replay.
+        if let Some((_target, depth, _lasti)) = outer_handler {
+            if !exception_delivery_stack_is_sourceable(
+                depth,
+                outer.locals_w().as_slice().len(),
+                outer_stack_base,
+            ) {
+                return false;
+            }
+        }
+        // G7: materialize every outer local before the rebuilt callee can run.
+        // `can_flush_walk_end_state_after_outer_call` already proved all
+        // shadow entries sourceable, so no post-effect decline remains.
+        if !crate::state::write_back_outer_locals(ctx, cf_addr) {
+            return false;
+        }
     }
     let mut w_code = payload.w_code;
     let mut w_globals = payload.w_globals;
@@ -184,7 +233,7 @@ fn try_commit_midbody_abort(
     else {
         return false;
     };
-    if current.live_locals.len() != code.varnames.len() || current.live_stack.is_empty() {
+    if current.live_locals.len() != code.varnames.len() {
         return false;
     }
     for slot in &mut frame.locals_w_mut().as_mut_slice()[..code.varnames.len()] {
@@ -219,19 +268,41 @@ fn try_commit_midbody_abort(
     }
     frame.valuestackdepth = stack_base + current.live_stack.len();
     frame.last_instr = current.callee_py_pc as isize - 1;
-    let Ok(mut retval) = frame.execute_frame(None, None) else {
-        return false;
-    };
-    crate::jitcode_dispatch::fbw_abort_carrier_set_return(retval);
-    let _retval_root = ObjectSlotRoot::new(&mut retval);
-    crate::state::flush_walk_end_state_after_outer_call(
-        ctx,
-        cf_addr,
-        current.call_py_pc,
-        current.post_call_py_pc,
-        current.call_stack_len,
-        retval,
-    )
+    let sys_exc_value_pre = unsafe { (*ec).sys_exc_value };
+    match frame.execute_frame(None, None) {
+        Ok(mut retval) => {
+            crate::jitcode_dispatch::fbw_abort_carrier_set_return(retval);
+            let _retval_root = ObjectSlotRoot::new(&mut retval);
+            crate::state::flush_walk_end_state_after_outer_call(
+                ctx,
+                cf_addr,
+                current.call_py_pc,
+                current.post_call_py_pc,
+                current.call_stack_len,
+                retval,
+            )
+        }
+        Err(mut operr) => {
+            // `_resume_mainloop(current_exc)` returns the exception to the
+            // caller frame. Restore the caller's pre-CALL handled-exception
+            // state first; PUSH_EXC_INFO/POP_EXCEPT will manage it from the
+            // selected handler onward.
+            unsafe { (*ec).sys_exc_value = sys_exc_value_pre };
+            if !propagate_allowed {
+                return false;
+            }
+            let outer = unsafe { &mut *(cf_addr as *mut pyre_interpreter::PyFrame) };
+            outer.last_instr = current.call_py_pc as isize;
+            outer.valuestackdepth = outer_stack_base;
+            let mut next_instr = current.call_py_pc;
+            if pyre_interpreter::eval::handle_exception(outer, &mut operr, &mut next_instr) {
+                outer.last_instr = next_instr as isize - 1;
+            } else {
+                WALK_END_PROPAGATED_EXCEPTION.with(|c| *c.borrow_mut() = Some(operr));
+            }
+            true
+        }
+    }
 }
 
 /// True when the full-body walker must NOT trace this callee as its own origin,
@@ -353,6 +424,7 @@ pub fn trace_bytecode(
     start_pc: usize,
     mut concrete_frame: pyre_interpreter::pyframe::FrameBox,
     live_frame_addr: usize,
+    allow_propagate_out: bool,
 ) -> (TraceAction, pyre_interpreter::pyframe::FrameBox) {
     // `llmodel.py:557` parity — install pyre's `Cpu` impl so the
     // optimizer's `protect_speculative_string` / `bh_strlen` /
@@ -363,6 +435,8 @@ pub fn trace_bytecode(
     // A stale flag from a prior trace on this thread must not leak into
     // this trace's adoption decision.
     WALK_END_FLUSH_COMMITTED.with(|c| c.set(false));
+    WALK_END_PROPAGATED_EXCEPTION.with(|c| *c.borrow_mut() = None);
+    WALK_END_PROPAGATE_ALLOWED.with(|c| c.set(allow_propagate_out));
     // Likewise clear any no-replay finish payload a prior trace left
     // unconsumed.  The FBW walk re-clears this in `run_perfn_walk`; the
     // trait leg (`trace_step_result_to_action`) has no such epilogue, so
@@ -1851,7 +1925,12 @@ fn run_perfn_walk(
                         }
                     }
                     Some(crate::jitcode_dispatch::InlineAbortCarrier::MidBody(payload))
-                        if is_marker_abort =>
+                        if (is_marker_abort
+                            && payload.abort_kind
+                                == crate::jitcode_dispatch::MidBodyAbortKind::Marker)
+                            || (!is_marker_abort
+                                && payload.abort_kind
+                                    == crate::jitcode_dispatch::MidBodyAbortKind::Structural) =>
                     {
                         if try_commit_midbody_abort(ctx, cf_addr, payload) {
                             if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
@@ -2905,5 +2984,12 @@ mod tests {
             !decline_predicate(&code, loop_header),
             "an unrelated hot loop in a recursive function must stay walker-eligible"
         );
+    }
+
+    #[test]
+    fn forward_exception_delivery_requires_exact_empty_handler_stack() {
+        assert!(super::exception_delivery_stack_is_sourceable(0, 8, 7));
+        assert!(!super::exception_delivery_stack_is_sourceable(1, 9, 7));
+        assert!(!super::exception_delivery_stack_is_sourceable(0, 7, 7));
     }
 }

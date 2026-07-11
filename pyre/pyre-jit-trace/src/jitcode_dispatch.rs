@@ -1430,7 +1430,20 @@ pub fn step(
     // unless the full-body walk owns the virtualizable shadow and the
     // mirror is still valid.
     step_vstack_mirror(ctx, pc);
-    handle(&op, code, ctx)
+    let effects_before = fbw_executed_effect_count();
+    let result = handle(&op, code, ctx);
+    if matches!(
+        result,
+        Err(DispatchError::LoopBearingCalleeInlineUnsupported { .. })
+    ) {
+        FBW_STRUCTURAL_ABORT_OPCODE_EFFECTS.with(|c| {
+            c.set(Some((
+                op.pc,
+                fbw_executed_effect_count().saturating_sub(effects_before),
+            )))
+        });
+    }
+    result
 }
 
 /// Walk the code from `start_pc` until a terminating opcode fires.
@@ -7887,6 +7900,15 @@ thread_local! {
     static FBW_EXECUTED_EFFECT_COUNT: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
 
+    /// Effect-count delta of the exact JitCode opcode that most recently
+    /// returned `LoopBearingCalleeInlineUnsupported`.  The structural
+    /// mid-body carrier accepts only a zero delta: pyre re-runs the enclosing
+    /// Python opcode boundary, unlike byte-exact `blackhole_from_resumedata`
+    /// (`pyjitpl.py:2949`), so any already-applied effect in that opcode must
+    /// keep the legacy path.
+    static FBW_STRUCTURAL_ABORT_OPCODE_EFFECTS: std::cell::Cell<Option<(usize, usize)>> =
+        const { std::cell::Cell::new(None) };
+
     /// gh#467 inline-abort forward-flush carrier: latched by
     /// [`try_walker_inline_user_call`] when a supported abort fires inside a
     /// TOP-level inline sub-walk whose callee executed no concrete effect.
@@ -7942,8 +7964,15 @@ pub(crate) enum InlineAbortCarrier {
     MidBody(MidBodyPayload),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MidBodyAbortKind {
+    Marker,
+    Structural,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct MidBodyPayload {
+    pub abort_kind: MidBodyAbortKind,
     pub call_py_pc: usize,
     pub post_call_py_pc: usize,
     pub call_stack_len: usize,
@@ -7983,6 +8012,7 @@ pub(crate) fn fbw_store_journal_reset() {
     // gh#467: reset the executed-effect odometer and any stale
     // forward-flush carrier a prior aborted walk latched.
     FBW_EXECUTED_EFFECT_COUNT.with(|c| c.set(0));
+    FBW_STRUCTURAL_ABORT_OPCODE_EFFECTS.with(|c| c.set(None));
     FBW_ABORT_CALL_RESUME.with(|c| *c.borrow_mut() = None);
     // #57 Option C: drop any in-flight FOR_ITER items a prior aborted walk
     // left undelivered (its live frame already consumed the delivery), so a
@@ -8368,6 +8398,14 @@ pub(crate) fn fbw_mark_unjournaled_effect() {
 /// gh#467 executed-effect odometer read (see [`FBW_EXECUTED_EFFECT_COUNT`]).
 pub(crate) fn fbw_executed_effect_count() -> usize {
     FBW_EXECUTED_EFFECT_COUNT.with(|c| c.get())
+}
+
+fn fbw_structural_abort_opcode_is_effect_free(pc: usize) -> bool {
+    FBW_STRUCTURAL_ABORT_OPCODE_EFFECTS.with(|c| c.get() == Some((pc, 0)))
+}
+
+fn exact_first_jit_anchor(first_jit_pc_by_py_pc: &[usize], py_pc: usize, jit_pc: usize) -> bool {
+    first_jit_pc_by_py_pc.get(py_pc).copied() == Some(jit_pc)
 }
 
 /// gh#467 bump the executed-effect odometer (see [`FBW_EXECUTED_EFFECT_COUNT`]).
@@ -13966,7 +14004,18 @@ fn try_walker_inline_user_call(
         // `_copy_data_from_miframe` preserves the callee's own position and
         // live registers instead of collapsing it onto the caller frame.
         let result = walk(body.code, 0, &mut sub_wc);
-        if let Err(DispatchError::AbortPermanentMarkerReached { pc: abort_pc }) = &result {
+        let midbody_abort = match &result {
+            Err(DispatchError::AbortPermanentMarkerReached { pc }) => {
+                Some((*pc, MidBodyAbortKind::Marker))
+            }
+            Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc })
+                if fbw_structural_abort_opcode_is_effect_free(*pc) =>
+            {
+                Some((*pc, MidBodyAbortKind::Structural))
+            }
+            _ => None,
+        };
+        if let Some((abort_pc, abort_kind)) = midbody_abort {
             if is_top_inline
                 && !unjournaled_before_subwalk
                 && fbw_executed_effect_count() != executed_effects_before
@@ -13975,9 +14024,12 @@ fn try_walker_inline_user_call(
                     let call_py_pc = abort_flush_call_py_pc?;
                     let callee_pjc = crate::state::pyjitcode_for_code(w_code)?;
                     let metadata = &callee_pjc.metadata;
-                    let callee_py_pc = python_pc_for_jitcode_pc(metadata, *abort_pc) as usize;
-                    if metadata.first_jit_pc_by_py_pc.get(callee_py_pc).copied() != Some(*abort_pc)
-                    {
+                    let callee_py_pc = python_pc_for_jitcode_pc(metadata, abort_pc) as usize;
+                    if !exact_first_jit_anchor(
+                        &metadata.first_jit_pc_by_py_pc,
+                        callee_py_pc,
+                        abort_pc,
+                    ) {
                         return None;
                     }
                     let raw = unsafe {
@@ -14044,10 +14096,11 @@ fn try_walker_inline_user_call(
                         unsafe { &*outer_jc.payload.code_ptr },
                         call_py_pc + 1,
                     );
-                    let Some(ConcreteValue::Ref(x_arg)) = live_stack.first().copied() else {
+                    let Some(ConcreteValue::Ref(x_arg)) = arg_concretes.get(2).copied() else {
                         return None;
                     };
                     Some(MidBodyPayload {
+                        abort_kind,
                         call_py_pc,
                         post_call_py_pc,
                         call_stack_len: arg_concretes.len(),
@@ -31479,5 +31532,15 @@ mod tests {
             step(&code, 0, &mut wc),
             Err(DispatchError::JitMergePointGreenKeyUnresolved { pc: 0 })
         );
+    }
+
+    #[test]
+    fn structural_midbody_anchor_requires_exact_first_jit_pc() {
+        let mut first = vec![usize::MAX; 30];
+        first[28] = 101;
+        first[29] = 115;
+        assert!(super::exact_first_jit_anchor(&first, 28, 101));
+        assert!(!super::exact_first_jit_anchor(&first, 28, 102));
+        assert!(!super::exact_first_jit_anchor(&first, 27, 101));
     }
 }

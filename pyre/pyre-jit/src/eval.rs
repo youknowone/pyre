@@ -4647,7 +4647,8 @@ fn jit_merge_point_hook(
     // `green_key` when we are mid-trace and the current merge point's
     // key is not the tracing origin.
     let starting_tracing_key = driver.starting_green_key();
-    if let Some(outcome) = driver.jit_merge_point_keyed(
+    let mut propagated_exception = None;
+    let driver_outcome = driver.jit_merge_point_keyed(
         green_key,
         pc,
         &mut jit_state,
@@ -4664,7 +4665,7 @@ fn jit_merge_point_hook(
             let _ = concrete_frame;
             let live_frame_addr = &*frame as *const PyFrame as usize;
             let (action, executed_frame) =
-                trace_bytecode(meta, sym, code, pc, snapshot, live_frame_addr);
+                trace_bytecode(meta, sym, code, pc, snapshot, live_frame_addr, true);
             // pyjitpl.py:3048-3091 raise_continue_running_normally: tracing
             // IS execution — a walk that committed its end-of-walk state
             // into the snapshot (CloseLoop / CompileTracePending flush)
@@ -4676,9 +4677,14 @@ fn jit_merge_point_hook(
             if pyre_jit_trace::trace::take_walk_end_flush_committed() {
                 frame.restore_resume_state_from(&executed_frame);
             }
+            propagated_exception = pyre_jit_trace::trace::take_walk_end_propagated_exception();
             action
         },
-    ) {
+    );
+    if let Some(err) = propagated_exception {
+        return Some(LoopResult::Done(Err(err)));
+    }
+    if let Some(outcome) = driver_outcome {
         match handle_jit_outcome(outcome, &jit_state, frame, info, green_key) {
             JitAction::Return(result) => return Some(LoopResult::Done(result)),
             JitAction::ContinueRunningNormally => return Some(LoopResult::ContinueRunningNormally),
@@ -5436,6 +5442,7 @@ fn bound_reached(
             // run their own eval_loop_jit) don't trigger jit_merge_point_hook.
             driver.meta_interp_mut().tracing_call_depth = Some(call_depth());
             let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame_root.frame()) };
+            let mut propagated_exception = None;
             let outcome = driver.jit_merge_point_keyed(
                 green_key,
                 loop_header_pc,
@@ -5454,6 +5461,7 @@ fn bound_reached(
                         loop_header_pc,
                         concrete_frame,
                         live_frame_addr,
+                        true,
                     );
                     // raise_continue_running_normally seam — see the
                     // jit_merge_point_hook tracing site for the contract.
@@ -5462,10 +5470,15 @@ fn bound_reached(
                             .frame()
                             .restore_resume_state_from(&executed_frame);
                     }
+                    propagated_exception =
+                        pyre_jit_trace::trace::take_walk_end_propagated_exception();
                     action
                 },
             );
             driver.meta_interp_mut().tracing_call_depth = None;
+            if let Some(err) = propagated_exception {
+                return Some(LoopResult::Done(Err(err)));
+            }
             let compiled_key = driver.last_compiled_key().unwrap_or(green_key);
             if !had_compiled && driver.has_compiled_loop(compiled_key) {
                 register_quasi_immutable_deps(compiled_key);

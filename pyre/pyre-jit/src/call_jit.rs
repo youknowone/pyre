@@ -2454,8 +2454,15 @@ pub fn trace_and_compile_from_bridge(
             &env,
             || {},
             |meta, sym| {
-                let (action, executed) =
-                    trace_bytecode(meta, sym, code, resume_pc, trace_frame, live_frame_addr);
+                let (action, executed) = trace_bytecode(
+                    meta,
+                    sym,
+                    code,
+                    resume_pc,
+                    trace_frame,
+                    live_frame_addr,
+                    false,
+                );
                 // pyjitpl.py:3048-3091 raise_continue_running_normally:
                 // a bridge walk that closed at a merge point and committed
                 // its end-of-walk state into the trace snapshot

@@ -4066,6 +4066,40 @@ pub(crate) fn can_flush_walk_end_state_after_outer_call(
     !arr_ptr.is_null() && unsafe { &*arr_ptr }.as_slice().len() >= nlocals + 1
 }
 
+/// Materialize the outer frame's locals from the virtualizable shadow.
+/// Callers must run their complete preflight before executing a rebuilt
+/// callee; after that point a failure would make replay unsafe.
+pub(crate) fn write_back_outer_locals(ctx: &TraceCtx, frame: usize) -> bool {
+    if frame == 0 {
+        return false;
+    }
+    let Some(nlocals) = concrete_nlocals(frame) else {
+        return false;
+    };
+    let Some(info) = ctx.virtualizable_info() else {
+        return false;
+    };
+    let frame_ptr = frame as *mut u8;
+    let arr_ptr = unsafe {
+        *(frame_ptr.add(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
+            as *const *mut pyre_object::FixedObjectArray)
+    };
+    if arr_ptr.is_null() || unsafe { &*arr_ptr }.as_slice().len() < nlocals {
+        return false;
+    }
+    let base = info.num_static_extra_boxes;
+    for abs in 0..nlocals {
+        let Some((_opref, value)) = ctx.virtualizable_entry_at(base + abs) else {
+            return false;
+        };
+        let boxed = boxed_slot_value_for_type(Type::Ref, &value);
+        unsafe {
+            (*arr_ptr).as_mut_slice()[abs] = boxed;
+        }
+    }
+    true
+}
+
 /// `_setup_return_value_r` parity for the outer half of a two-frame abort:
 /// install the rebuilt callee's return value and resume after the CALL.
 pub(crate) fn flush_walk_end_state_after_outer_call(
@@ -4088,9 +4122,6 @@ pub(crate) fn flush_walk_end_state_after_outer_call(
     let Some(nlocals) = concrete_nlocals(frame) else {
         return false;
     };
-    let Some(info) = ctx.virtualizable_info() else {
-        return false;
-    };
     let frame_ptr = frame as *mut u8;
     let arr_ptr = unsafe {
         *(frame_ptr.add(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
@@ -4100,15 +4131,8 @@ pub(crate) fn flush_walk_end_state_after_outer_call(
     unsafe {
         (*arr_ptr).as_mut_slice()[nlocals] = retval;
     }
-    let base = info.num_static_extra_boxes;
-    for abs in 0..nlocals {
-        let Some((_opref, value)) = ctx.virtualizable_entry_at(base + abs) else {
-            return false;
-        };
-        let boxed = boxed_slot_value_for_type(Type::Ref, &value);
-        unsafe {
-            (*arr_ptr).as_mut_slice()[abs] = boxed;
-        }
+    if !write_back_outer_locals(ctx, frame) {
+        return false;
     }
     unsafe {
         let pf = &mut *(frame as *mut PyFrame);
