@@ -8070,6 +8070,7 @@ impl JitState for PyreJitState {
         fail_values: &[i64],
         fail_types: &[Type],
     ) {
+        let bridge_stamp_enabled = std::env::var_os("PYRE_FBW_BRIDGE_STAMP").is_some();
         if resume_data.frames.is_empty() {
             return;
         }
@@ -8257,6 +8258,8 @@ impl JitState for PyreJitState {
         // direction.  Defer seeding to the post-overlay stage where the
         // mirror is slot-indexed and values are authoritative.
         let seed_deferred_to_overlay = frame0.jitcode_pc != majit_ir::resumedata::NO_JITCODE_PC;
+        let mut bridge_stamp_orphans =
+            (bridge_stamp_enabled && seed_deferred_to_overlay).then(Vec::new);
         let mut value_cursor = 0usize;
         for &reg_idx in &reg_indices.int {
             let value = &frame0.values[value_cursor];
@@ -8305,6 +8308,9 @@ impl JitState for PyreJitState {
                 && !matches!(concrete_val, majit_ir::Value::Void)
             {
                 ctx.try_set_opref_concrete(resolved, concrete_val);
+            }
+            if let Some(orphan_stamps) = bridge_stamp_orphans.as_mut() {
+                orphan_stamps.push((resolved, concrete_val));
             }
             let reg_idx = reg_idx as usize;
             if reg_idx >= bridge_registers_r.len() {
@@ -8621,6 +8627,21 @@ impl JitState for PyreJitState {
                             ctx.try_set_opref_concrete(*opref, cv);
                         }
                     }
+                }
+            }
+        }
+        // Orphaned colors have decoded values but no semantic-mirror slot to
+        // re-stamp; seed them so bridge-walk residuals can resolve arguments.
+        if let Some(orphan_stamps) = bridge_stamp_orphans.as_ref() {
+            for (opref, cv) in orphan_stamps {
+                if opref.is_none() || semantic_mirror.contains(opref) {
+                    continue;
+                }
+                if !matches!(
+                    cv,
+                    majit_ir::Value::Void | majit_ir::Value::Ref(majit_ir::GcRef(0))
+                ) {
+                    ctx.try_set_opref_concrete(*opref, *cv);
                 }
             }
         }
