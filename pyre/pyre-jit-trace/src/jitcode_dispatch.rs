@@ -6310,6 +6310,9 @@ fn try_execute_residual_call_via_executor(
                 | majit_ir::PyreHelperKind::SetCurrentException
                 | majit_ir::PyreHelperKind::StoreDeref
         );
+    if writes_live_heap && !provably_side_effect_free {
+        fbw_abort_nested_unjournaled_residual(op_pc)?;
+    }
     let body_effect_candidate =
         !provably_side_effect_free && writes_live_heap && fbw_foriter_inflight_active();
     // #57 Option C (Finding #1, user-frame signal): the Void/helper-tag write
