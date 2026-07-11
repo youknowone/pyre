@@ -97,6 +97,7 @@ KNOWN_SKIPS = {
     "test.test_largefile": "demands too many resources",
     "test.test_embed": "needs embedded CPython",
     "test.test_xpickle": "spawns per-version pythonX.Y subprocesses (PATH-dependent, can deadlock)",
+    "test.test_c_locale_coercion": "asserts child stderr is empty, but MAJIT_STATS=1 prints a [jit-stats] line to every process's stderr",
 }
 
 # ── classification ───────────────────────────────────────────────────
