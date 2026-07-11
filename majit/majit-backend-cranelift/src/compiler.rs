@@ -1652,10 +1652,22 @@ fn gc_owns_object_via_active_runtime(addr: usize) -> bool {
             .map(|g| g.as_deref().map(|gc| gc.is_managed_heap_object(addr)))
     }) {
         Ok(Some(r)) => r,
-        Ok(None) => majit_gc::gc_sync::gc_query_reentrant(|g| g.is_managed_heap_object(addr)),
+        Ok(None) => {
+            if majit_gc::gc_sync::is_initialized() {
+                majit_gc::gc_sync::gc_query_reentrant(|g| g.is_managed_heap_object(addr))
+            } else {
+                false
+            }
+        }
         Err(_) => CRANELIFT_ACTIVE_GC_RAW.with(|raw| match raw.get() {
             Some(ptr) => unsafe { (&*ptr).is_managed_heap_object(addr) },
-            None => majit_gc::gc_sync::gc_query_reentrant(|g| g.is_managed_heap_object(addr)),
+            None => {
+                if majit_gc::gc_sync::is_initialized() {
+                    majit_gc::gc_sync::gc_query_reentrant(|g| g.is_managed_heap_object(addr))
+                } else {
+                    false
+                }
+            }
         }),
     }
 }
