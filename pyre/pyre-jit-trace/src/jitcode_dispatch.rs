@@ -332,6 +332,63 @@ impl<'a> RawDescrPool<'a> {
     }
 }
 
+/// Per-inline-level callee locals shadow owned by the walking frame
+/// (`MIFrame.registers_i/r/f`, `pyjitpl.py:177-234`).
+///
+/// The maps are keyed by `localsplus` slot rather than register color because
+/// pyre lowers callee `LOAD_FAST`/`STORE_FAST` to
+/// `getarrayitem_vable`/`setarrayitem_vable(frame, slot)`, while the
+/// `WalkContext` register banks are post-regalloc color-indexed. At top level
+/// the slot concrete comes from the seeded `virtualizable_boxes`; a fresh
+/// inlined callee has no seeded frame, so it owns this slot-indexed shadow.
+/// The concrete values survive may-force heapcache clears and only specialize
+/// recording; runtime guards still re-check them.
+pub struct CalleeLocalsShadow {
+    /// SSA value held by each fresh-frame local slot. Own-frame vable accesses
+    /// fold through this map without emitting GC ops: `fresh_virtualizable`
+    /// makes `is_virtualizable_getset` return false
+    /// (`rpython/jit/codewriter/jtransform.py:990-993`; the frame is marked by
+    /// `pypy/interpreter/pycode.py:275`).
+    pub opref: std::collections::HashMap<i64, OpRef>,
+    /// Recording-time concrete held by each local slot, including across
+    /// may-force operations that clear the heapcache.
+    pub concrete: std::collections::HashMap<i64, majit_ir::Value>,
+    /// Portal frame register used to resolve own-frame vable operations.
+    /// `u16::MAX` means that the strict fresh-frame fold is inactive.
+    pub fold_frame_reg: u16,
+}
+
+impl Default for CalleeLocalsShadow {
+    fn default() -> Self {
+        Self {
+            opref: Default::default(),
+            concrete: Default::default(),
+            fold_frame_reg: u16::MAX,
+        }
+    }
+}
+
+impl CalleeLocalsShadow {
+    /// A `NONE` value clears the slot.
+    fn set_opref(&mut self, slot: i64, value: OpRef) {
+        if value.is_none() {
+            self.opref.remove(&slot);
+        } else {
+            self.opref.insert(slot, value);
+        }
+    }
+
+    /// A `Void` value clears the slot so a later read does not resurrect a
+    /// stale concrete.
+    fn set_concrete(&mut self, slot: i64, value: majit_ir::Value) {
+        if matches!(value, majit_ir::Value::Void) {
+            self.concrete.remove(&slot);
+        } else {
+            self.concrete.insert(slot, value);
+        }
+    }
+}
+
 /// `WalkContext` carries two lifetimes:
 /// * `'frame` — the inner-frame lifetime: register banks + trace
 ///   recorder. Sub-walk recursion (`inline_call_r_r/dR>r`) allocates
@@ -341,6 +398,9 @@ impl<'a> RawDescrPool<'a> {
 ///   lookup. These flow unchanged from caller into callee, so they
 ///   keep their original (longer) lifetime.
 pub struct WalkContext<'frame, 'static_a: 'frame> {
+    /// Present only for an inlined-callee sub-walk. Top-level and other walks
+    /// have no callee shadow, preserving the former empty-stack no-op behavior.
+    pub callee_shadow: Option<CalleeLocalsShadow>,
     /// Symbolic Ref-bank register file. Indexing matches RPython
     /// `MIFrame.registers_r` (`pyjitpl.py:177-234`); the byte after a
     /// `r`-coded operand opcode indexes directly into this slice.
@@ -2497,6 +2557,7 @@ pub fn dispatch_via_miframe(
 
     let result = {
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut top_regs_r,
             registers_i: &mut top_regs_i,
             registers_f: &mut top_regs_f,
@@ -2814,6 +2875,7 @@ pub(crate) fn drive_bridge_carrier_subwalk(
 
     let outcome = {
         let mut sub_wc = WalkContext {
+            callee_shadow: Some(Default::default()),
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut regs_f,
@@ -2867,17 +2929,19 @@ pub(crate) fn drive_bridge_carrier_subwalk(
         // a recursive-portal CALL_ASSEMBLER (the bridge is the deopt
         // continuation, not a fresh unroll).
         let _carrier_resume = CarrierResumeGuard::enter();
-        // Seed the reconstructed callee's local slot concretes into the (now
-        // innermost) `FBW_CALLEE_LOCALS_CONCRETE` map.  The resume is mid-body,
+        // Seed the reconstructed callee's local slot concretes into its frame-
+        // owned shadow.  The resume is mid-body,
         // so the locals were stored to the frame vable before the guard fired;
         // the map is empty until seeded.  A concrete local lets a callee
         // `getarrayitem_vable(frame, slot)` read fold to its value, so a nested
         // self-recursive call's int arg is known (`arg_is_int`) and the call
         // folds to `CALL_ASSEMBLER` instead of declining.
         for (slot, &v) in local_concretes.iter().enumerate() {
-            if !matches!(v, majit_ir::Value::Void) {
-                fbw_callee_local_set_concrete(slot as i64, v);
-            }
+            sub_wc
+                .callee_shadow
+                .as_mut()
+                .unwrap()
+                .set_concrete(slot as i64, v);
         }
         walk(callee_code, entry, &mut sub_wc)
     };
@@ -3080,6 +3144,7 @@ pub(crate) fn drive_outer_frame_continuation(
 
     let outcome = {
         let mut outer_wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut regs_f,
@@ -3284,6 +3349,7 @@ pub fn dispatch_via_miframe_at_opcode_entry<'a>(
 
     let result = {
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut regs_f,
@@ -4128,7 +4194,7 @@ fn setfield_vable_via_metainterp(
     // / `last_instr` sync on a branchless leaf that resumes at the caller
     // boundary — so it folds to a no-op, emitting no SETFIELD_GC.  The
     // `fresh_virtualizable` OptVirtualize elision (jtransform.py:990-993).
-    let fold_frame_reg = fbw_strict_fold_frame_reg();
+    let fold_frame_reg = fbw_strict_fold_frame_reg(ctx);
     if fold_frame_reg != u16::MAX && code[op.pc + 1] as u16 == fold_frame_reg {
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
@@ -4262,11 +4328,15 @@ fn getarrayitem_vable_via_metainterp(
     // param-store seed dominates every read of a branchless leaf's own frame,
     // so the slot is present; a genuinely-unbound read falls through to the
     // `VableBoxNotSeeded` abort below (never the 16 GiB metainterp path).
-    let fold_frame_reg = fbw_strict_fold_frame_reg();
+    let fold_frame_reg = fbw_strict_fold_frame_reg(ctx);
     if fold_frame_reg != u16::MAX && code[op.pc + 1] as u16 == fold_frame_reg {
         let index = read_int_reg(code, op, 1, ctx)?;
         if let Some(majit_ir::Value::Int(slot)) = ctx.trace_ctx.concrete_of_opref(index) {
-            if let Some(result) = fbw_callee_local_get_opref(slot) {
+            if let Some(result) = ctx
+                .callee_shadow
+                .as_ref()
+                .and_then(|shadow| shadow.opref.get(&slot).copied())
+            {
                 let dst = code[op.pc + 7] as usize;
                 let concrete = concrete_from_recorded_opref(ctx, result);
                 match dst_bank {
@@ -4346,7 +4416,10 @@ fn getarrayitem_vable_via_metainterp(
     // a loop-carried local read after a may-force op in the loop body has no
     // heapcache entry this pass, yet its recording-time concrete is known.
     let shadow_value = if matches!(shadow_value, Value::Void) {
-        fbw_callee_local_get_concrete(index_value).unwrap_or(Value::Void)
+        ctx.callee_shadow
+            .as_ref()
+            .and_then(|shadow| shadow.concrete.get(&index_value).copied())
+            .unwrap_or(Value::Void)
     } else {
         shadow_value
     };
@@ -4401,7 +4474,7 @@ fn setarrayitem_vable_via_metainterp(
     // local stores (`index < nlocals`) and operand-stack pushes (`index >=
     // nlocals`) on the fresh frame are pure mirror writes here — the value
     // lives in an SSA register; the vable array is folded away.
-    let fold_frame_reg = fbw_strict_fold_frame_reg();
+    let fold_frame_reg = fbw_strict_fold_frame_reg(ctx);
     if fold_frame_reg != u16::MAX && code[op.pc + 1] as u16 == fold_frame_reg {
         let index = read_int_reg(code, op, 1, ctx)?;
         if let Some(majit_ir::Value::Int(slot)) = ctx.trace_ctx.concrete_of_opref(index) {
@@ -4415,8 +4488,10 @@ fn setarrayitem_vable_via_metainterp(
                 .trace_ctx
                 .concrete_of_opref(value)
                 .unwrap_or(majit_ir::Value::Void);
-            fbw_callee_local_set_opref(slot, value);
-            fbw_callee_local_set_concrete(slot, concrete);
+            if let Some(shadow) = ctx.callee_shadow.as_mut() {
+                shadow.set_opref(slot, value);
+                shadow.set_concrete(slot, concrete);
+            }
             return Ok((DispatchOutcome::Continue, op.next_pc));
         }
     }
@@ -4460,7 +4535,9 @@ fn setarrayitem_vable_via_metainterp(
     );
     // Keep the inline concrete-locals shadow current so a later read of this
     // slot (after a may-force op clears the heapcache) recovers the concrete.
-    fbw_callee_local_set_concrete(index_value, concrete);
+    if let Some(shadow) = ctx.callee_shadow.as_mut() {
+        shadow.set_concrete(index_value, concrete);
+    }
     walker_capture_inline_nonstandard_vable_guard(ctx, op.pc, guards_before)?;
     // #73 (SLICE 1, INERT): a Ref stored to the operand-stack region of the
     // vable array is an operand-stack PUSH (portal `pyframe.pushvalue`
@@ -7153,117 +7230,12 @@ fn fbw_inline_recursion_count(w_code: usize) -> usize {
     FBW_INLINE_CODE_STACK.with(|s| s.borrow().iter().filter(|&&c| c == w_code).count())
 }
 
-thread_local! {
-    /// FBW inline callee concrete-locals shadow: for each user function
-    /// currently inlined by the sub-walk, a per-slot (`localsplus` index)
-    /// concrete value, innermost frame last.  Unlike the heapcache (which a
-    /// may-force residual clears), this shadow survives across may-force ops,
-    /// so a callee loop-carried local read AFTER a may-force op in the loop
-    /// body keeps its recording-time concrete.  Mirrors the trait's per-frame
-    /// `concrete_locals` (the real concrete frame the trait advances each
-    /// iteration): the single-pass walker has no prior-iteration value for a
-    /// callee local otherwise, and the loop-bearing-callee inline aborts.
-    ///
-    /// Why a side table rather than the callee's register banks (RPython keeps
-    /// per-callee state on `MIFrame.registers_i/r/f`): pyre's "every function
-    /// is its own virtualizable" model lowers callee `LOAD_FAST`/`STORE_FAST`
-    /// to `getarrayitem_vable`/`setarrayitem_vable(frame, slot)` keyed by the
-    /// `localsplus` SLOT INDEX, while the `WalkContext` register banks are
-    /// keyed by post-regalloc REGISTER COLOR.  Those two index spaces differ,
-    /// so a slot-indexed vable read cannot find its concrete in the
-    /// color-indexed register shadow — the slot→concrete map has no register
-    /// bank to live in.  At top level the slot-indexed concrete comes from the
-    /// seeded `virtualizable_boxes` shadow, but an inlined callee has no seeded
-    /// frame, so the per-callee slot map is the forced equivalent.
-    ///
-    /// Soundness: the stamp only feeds recording-time specialization; the
-    /// recorded trace's guards re-check the runtime value, so a stale shadow
-    /// causes a side-exit, never a wrong result.
-    static FBW_CALLEE_LOCALS_CONCRETE:
-        std::cell::RefCell<Vec<std::collections::HashMap<i64, majit_ir::Value>>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-
-    /// FBW strict fresh-frame OpRef shadow: a twin of
-    /// `FBW_CALLEE_LOCALS_CONCRETE` carrying the SSA `OpRef` each `localsplus`
-    /// slot currently holds, innermost frame last.  Used only on the strict
-    /// straight-line inline path (a branchless leaf) when the callee body
-    /// carries the portal frame-vable prologue: the callee's own
-    /// `getarrayitem_vable_r` / `setarrayitem_vable_r` on its own (unseeded)
-    /// frame fold register-to-register through this map, emitting NO GC op.
-    /// This is the `fresh_virtualizable` case: a freshly-built callee frame's
-    /// local accesses lower direct, not vable — `is_virtualizable_getset`
-    /// returns `False` when `'fresh_virtualizable' in flags`
-    /// (rpython/jit/codewriter/jtransform.py:990-993,
-    /// pypy/interpreter/pycode.py:275 `fresh_frame = jit.hint(frame,
-    /// access_directly=True, fresh_virtualizable=True)`).
-    static FBW_CALLEE_LOCALS_OPREF:
-        std::cell::RefCell<Vec<std::collections::HashMap<i64, OpRef>>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-
-    /// The callee portal frame register a strict fresh-frame fold resolves
-    /// own-frame vable ops against, innermost frame last.  `u16::MAX` = this
-    /// inline level is NOT a strict fold (plain strict leaf with no vable
-    /// prologue, or the multiframe path that seeds a real virtual frame), so
-    /// the fold short-circuits stay inert and the ordinary metainterp vable
-    /// path runs.
-    static FBW_STRICT_FOLD_FRAME_REG: std::cell::RefCell<Vec<u16>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
-
-/// Activate the strict fresh-frame fold for the innermost inline level,
-/// binding it to the callee's portal frame register.
-fn fbw_strict_fold_activate(frame_reg: u16) {
-    FBW_STRICT_FOLD_FRAME_REG.with(|s| {
-        if let Some(top) = s.borrow_mut().last_mut() {
-            *top = frame_reg;
-        }
-    });
-}
-
 /// The innermost inline level's strict-fold frame register (`u16::MAX` when
 /// inactive / no inline level).
-fn fbw_strict_fold_frame_reg() -> u16 {
-    FBW_STRICT_FOLD_FRAME_REG.with(|s| s.borrow().last().copied().unwrap_or(u16::MAX))
-}
-
-/// Record a callee local slot's live `OpRef` in the innermost fresh-frame
-/// shadow (no-op when the stack is empty).  A `NONE` value clears the slot.
-fn fbw_callee_local_set_opref(slot: i64, value: OpRef) {
-    FBW_CALLEE_LOCALS_OPREF.with(|s| {
-        if let Some(top) = s.borrow_mut().last_mut() {
-            if value.is_none() {
-                top.remove(&slot);
-            } else {
-                top.insert(slot, value);
-            }
-        }
-    });
-}
-
-/// Read a callee local slot's live `OpRef` from the innermost fresh-frame
-/// shadow.
-fn fbw_callee_local_get_opref(slot: i64) -> Option<OpRef> {
-    FBW_CALLEE_LOCALS_OPREF.with(|s| s.borrow().last().and_then(|top| top.get(&slot).copied()))
-}
-
-/// Record a callee local slot's concrete in the innermost inline shadow
-/// (no-op at top level / when the stack is empty).  A `Void` value clears
-/// the slot so a later read does not resurrect a stale concrete.
-fn fbw_callee_local_set_concrete(slot: i64, value: majit_ir::Value) {
-    FBW_CALLEE_LOCALS_CONCRETE.with(|s| {
-        if let Some(top) = s.borrow_mut().last_mut() {
-            if matches!(value, majit_ir::Value::Void) {
-                top.remove(&slot);
-            } else {
-                top.insert(slot, value);
-            }
-        }
-    });
-}
-
-/// Read a callee local slot's concrete from the innermost inline shadow.
-fn fbw_callee_local_get_concrete(slot: i64) -> Option<majit_ir::Value> {
-    FBW_CALLEE_LOCALS_CONCRETE.with(|s| s.borrow().last().and_then(|top| top.get(&slot).copied()))
+fn fbw_strict_fold_frame_reg(ctx: &WalkContext<'_, '_>) -> u16 {
+    ctx.callee_shadow
+        .as_ref()
+        .map_or(u16::MAX, |shadow| shadow.fold_frame_reg)
 }
 
 /// RAII guard: push `w_code` onto the FBW inline stack for the lifetime of
@@ -7273,11 +7245,6 @@ struct InlineRecursionGuard;
 impl InlineRecursionGuard {
     fn enter(w_code: usize) -> Self {
         FBW_INLINE_CODE_STACK.with(|s| s.borrow_mut().push(w_code));
-        FBW_CALLEE_LOCALS_CONCRETE.with(|s| s.borrow_mut().push(std::collections::HashMap::new()));
-        FBW_CALLEE_LOCALS_OPREF.with(|s| s.borrow_mut().push(std::collections::HashMap::new()));
-        // Push inactive by default: only the strict straight-line path
-        // activates the fold via `fbw_strict_fold_activate`.
-        FBW_STRICT_FOLD_FRAME_REG.with(|s| s.borrow_mut().push(u16::MAX));
         InlineRecursionGuard
     }
 }
@@ -7285,15 +7252,6 @@ impl InlineRecursionGuard {
 impl Drop for InlineRecursionGuard {
     fn drop(&mut self) {
         FBW_INLINE_CODE_STACK.with(|s| {
-            s.borrow_mut().pop();
-        });
-        FBW_CALLEE_LOCALS_CONCRETE.with(|s| {
-            s.borrow_mut().pop();
-        });
-        FBW_CALLEE_LOCALS_OPREF.with(|s| {
-            s.borrow_mut().pop();
-        });
-        FBW_STRICT_FOLD_FRAME_REG.with(|s| {
             s.borrow_mut().pop();
         });
     }
@@ -13722,6 +13680,7 @@ fn try_walker_inline_user_call(
         };
     let callee_outcome = {
         let mut sub_wc = WalkContext {
+            callee_shadow: Some(Default::default()),
             registers_r: &mut callee_regs_r,
             registers_i: &mut callee_regs_i,
             registers_f: &mut callee_regs_f,
@@ -13775,15 +13734,17 @@ fn try_walker_inline_user_call(
         // box.  Inert when `callee_portal_frame_reg == u16::MAX` (flip OFF /
         // frame reg unresolved) or `try_multiframe` (real virtual frame seeded).
         if !try_multiframe && callee_portal_frame_reg != u16::MAX {
-            fbw_strict_fold_activate(callee_portal_frame_reg);
+            sub_wc.callee_shadow.as_mut().unwrap().fold_frame_reg = callee_portal_frame_reg;
             for i in 0..nparams {
                 let slot = i as i64;
-                fbw_callee_local_set_opref(slot, r_args[2 + i]);
+                let value = r_args[2 + i];
                 let concrete = sub_wc
                     .trace_ctx
                     .concrete_of_opref(r_args[2 + i])
                     .unwrap_or(majit_ir::Value::Void);
-                fbw_callee_local_set_concrete(slot, concrete);
+                let shadow = sub_wc.callee_shadow.as_mut().unwrap();
+                shadow.set_opref(slot, value);
+                shadow.set_concrete(slot, concrete);
             }
         }
         // Path-1: resolve scalar static-field reads off this callee's own
@@ -19679,6 +19640,7 @@ fn run_sub_jitcode_walk(
 
     let (callee_outcome, _callee_end_pc) = {
         let mut sub_wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut callee_regs_r,
             registers_i: &mut callee_regs_i,
             registers_f: &mut callee_regs_f,
@@ -22197,6 +22159,7 @@ mod tests {
         let expected: Vec<ConcreteValue> = concrete.clone();
         let descr = done_descr_ref_for_tests();
         let wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
@@ -22262,6 +22225,7 @@ mod tests {
         let mut regs_r = vec![OpRef::NONE];
         let mut regs_i = vec![OpRef::NONE];
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -22317,6 +22281,7 @@ mod tests {
         let mut regs_r = vec![OpRef::NONE];
         let mut regs_i = vec![OpRef::NONE];
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -22390,6 +22355,7 @@ mod tests {
             let mut regs_r = vec![OpRef::NONE];
             let mut regs_i = vec![OpRef::NONE];
             let mut wc = WalkContext {
+                callee_shadow: None,
                 registers_r: &mut regs_r,
                 registers_i: &mut regs_i,
                 registers_f: &mut [],
@@ -22574,6 +22540,7 @@ mod tests {
         let descr_pool = switch_descr_pool(&[(5, 17), (9, 23)]);
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -22630,6 +22597,7 @@ mod tests {
         let descr_pool = switch_descr_pool(&[(5, 17), (9, 23)]);
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -22685,6 +22653,7 @@ mod tests {
         let descr_pool = switch_descr_pool(&[(5, 17)]);
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -22749,6 +22718,7 @@ mod tests {
         let mut regs_i = vec![value];
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -22805,6 +22775,7 @@ mod tests {
         let mut regs_i = vec![value];
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -22860,6 +22831,7 @@ mod tests {
         let mut regs_i = vec![OpRef::input_arg_int(0)];
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -23124,6 +23096,7 @@ mod tests {
         descr_pool[7] = make_jitcode_descr(7);
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
@@ -23292,6 +23265,7 @@ mod tests {
         let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
         descr_pool[7] = make_jitcode_descr(7);
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -23408,6 +23382,7 @@ mod tests {
         let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
         descr_pool[7] = make_jitcode_descr(7);
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -23518,6 +23493,7 @@ mod tests {
         let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
         descr_pool[7] = make_jitcode_descr(7);
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut regs_f,
@@ -23617,6 +23593,7 @@ mod tests {
         let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
         descr_pool[7] = make_jitcode_descr(7);
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -23713,6 +23690,7 @@ mod tests {
         descr_pool[7] = make_jitcode_descr(7);
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
@@ -23790,6 +23768,7 @@ mod tests {
         let descr = done_descr_ref_for_tests();
         let descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
@@ -23846,6 +23825,7 @@ mod tests {
         let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
         descr_pool[3] = make_jitcode_descr(999_999);
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
@@ -23898,6 +23878,7 @@ mod tests {
         let mut tc = fresh_trace_ctx();
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
@@ -23959,6 +23940,7 @@ mod tests {
         let descr = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs,
             registers_i: &mut [],
             registers_f: &mut [],
@@ -24018,6 +24000,7 @@ mod tests {
         let mut tc = fresh_trace_ctx();
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
@@ -24080,6 +24063,7 @@ mod tests {
         let expected_arg = regs_i[2];
         let descr_int = make_fail_descr(42);
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -24158,6 +24142,7 @@ mod tests {
             .collect();
         let expected = regs_i[1];
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -24224,6 +24209,7 @@ mod tests {
         let code = [ret_byte];
         let mut tc = fresh_trace_ctx();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
@@ -24291,6 +24277,7 @@ mod tests {
         let code = [ret_byte];
         let mut tc = fresh_trace_ctx();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
@@ -24346,6 +24333,7 @@ mod tests {
         let mut tc = fresh_trace_ctx();
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
@@ -24404,6 +24392,7 @@ mod tests {
         let descr = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
@@ -24462,6 +24451,7 @@ mod tests {
         let mut tc = fresh_trace_ctx();
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
@@ -24568,6 +24558,7 @@ mod tests {
         let active_exc = regs[0];
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs,
             registers_i: &mut [],
             registers_f: &mut [],
@@ -24622,6 +24613,7 @@ mod tests {
         let descr = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
@@ -24689,6 +24681,7 @@ mod tests {
         let descr_exc = make_fail_descr(99);
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs,
             registers_i: &mut [],
             registers_f: &mut [],
@@ -24788,6 +24781,7 @@ mod tests {
         let descr_exc = make_fail_descr(99);
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs,
             registers_i: &mut [],
             registers_f: &mut [],
@@ -24871,6 +24865,7 @@ mod tests {
         let descr_exc = make_fail_descr(99);
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
@@ -24949,6 +24944,7 @@ mod tests {
         let mut tc = fresh_trace_ctx();
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
@@ -25002,6 +24998,7 @@ mod tests {
         let exc = regs_r[2];
         let descr_done = done_descr_ref_for_tests();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
@@ -25119,6 +25116,7 @@ mod tests {
         let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
         descr_pool[11] = make_jitcode_descr(11);
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
@@ -25239,6 +25237,7 @@ mod tests {
         let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
         descr_pool[13] = make_jitcode_descr(13);
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
@@ -25308,6 +25307,7 @@ mod tests {
         let descr = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -25373,6 +25373,7 @@ mod tests {
         );
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -25429,6 +25430,7 @@ mod tests {
         let mut regs_i = distinct_const_refs(&mut tc, 4);
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -25484,6 +25486,7 @@ mod tests {
         let mut tc = fresh_trace_ctx();
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut [],
             registers_i: &mut [], // empty — index 7 must surface OOR
             registers_f: &mut [],
@@ -25559,6 +25562,7 @@ mod tests {
         let descr = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
@@ -25622,6 +25626,7 @@ mod tests {
         );
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
@@ -25676,6 +25681,7 @@ mod tests {
         let mut regs_r = distinct_const_refs(&mut tc, 4);
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
@@ -25729,6 +25735,7 @@ mod tests {
         let mut tc = fresh_trace_ctx();
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut [], // empty — index 7 must surface OOR
             registers_i: &mut [],
             registers_f: &mut [],
@@ -25793,6 +25800,7 @@ mod tests {
         let descr = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -25983,6 +25991,7 @@ mod tests {
         let descr = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -26119,6 +26128,7 @@ mod tests {
         let descr = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut regs_f,
@@ -26207,6 +26217,7 @@ mod tests {
         let descr = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut regs_f,
@@ -26273,6 +26284,7 @@ mod tests {
         let descr = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -26364,6 +26376,7 @@ mod tests {
         let descr = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -26435,6 +26448,7 @@ mod tests {
         let mut tc = fresh_trace_ctx();
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
@@ -26489,6 +26503,7 @@ mod tests {
         let mut tc = fresh_trace_ctx();
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
@@ -26545,6 +26560,7 @@ mod tests {
         let mut regs_i = distinct_const_refs(&mut tc, 4);
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -26609,6 +26625,7 @@ mod tests {
         let mut tc = fresh_trace_ctx();
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
@@ -26665,6 +26682,7 @@ mod tests {
         let mut regs_r = [box_opref];
         let mut regs_i = [OpRef::None];
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -26748,6 +26766,7 @@ mod tests {
         let descr = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
@@ -26813,6 +26832,7 @@ mod tests {
             concrete_ptr as *mut pyre_object::pyobject::PyObject,
         )];
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -26894,6 +26914,7 @@ mod tests {
             0xdead_beef as *mut pyre_object::pyobject::PyObject,
         )];
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -26988,6 +27009,7 @@ mod tests {
         let frame_done_descr = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -27154,6 +27176,7 @@ mod tests {
         let frame_done_descr = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -27237,6 +27260,7 @@ mod tests {
         let mut regs_r: Vec<OpRef> = Vec::new();
         let call_descr = descr.as_call_descr().expect("CallI descr");
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -27293,6 +27317,7 @@ mod tests {
         let mut regs_r: Vec<OpRef> = Vec::new();
         let call_descr = descr.as_call_descr().expect("CallI descr");
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -27364,6 +27389,7 @@ mod tests {
         let mut regs_r: Vec<OpRef> = Vec::new();
         let call_descr = descr.as_call_descr().expect("CallI descr");
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -27459,6 +27485,7 @@ mod tests {
         let mut regs_r: Vec<OpRef> = Vec::new();
         let call_descr = descr.as_call_descr().expect("CallI descr");
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -27558,6 +27585,7 @@ mod tests {
         let mut regs_r: Vec<OpRef> = Vec::new();
         let call_descr = descr.as_call_descr().expect("CallI descr");
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -27632,6 +27660,7 @@ mod tests {
         let descr_pool = vec![not_in_trace_descr];
         let frame_done_descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -27694,6 +27723,7 @@ mod tests {
         let descr_pool = vec![force_virtual_descr];
         let frame_done_descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -27751,6 +27781,7 @@ mod tests {
         let frame_done_descr = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -27817,6 +27848,7 @@ mod tests {
         let frame_done_descr = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -27885,6 +27917,7 @@ mod tests {
         )];
         let frame_done_descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -27973,6 +28006,7 @@ mod tests {
         let frame_done_descr = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -28050,6 +28084,7 @@ mod tests {
         let frame_done_descr = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -28126,6 +28161,7 @@ mod tests {
         )];
         let frame_done_descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -28184,6 +28220,7 @@ mod tests {
         let descr_pool = vec![make_fail_descr(1), make_fail_descr(1)];
         let frame_done_descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -28280,6 +28317,7 @@ mod tests {
         let frame_done_descr = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -28373,6 +28411,7 @@ mod tests {
         let frame_done_descr = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -28476,6 +28515,7 @@ mod tests {
         let frame_done_descr = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -28609,6 +28649,7 @@ mod tests {
         let descr_pool = vec![mixed_descr.clone()];
         let frame_done_descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -28678,6 +28719,7 @@ mod tests {
         let descr_pool = vec![make_fail_descr(7)];
         let frame_done_descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -28735,6 +28777,7 @@ mod tests {
         let descr_pool = vec![make_fail_descr(1)];
         let frame_done_descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -28816,6 +28859,7 @@ mod tests {
         let descr_pool = descr_pool_with_jitcode_adapters(pool_len);
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -28942,6 +28986,7 @@ mod tests {
         let frame_done_descr = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -29044,6 +29089,7 @@ mod tests {
         let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
         descr_pool[5] = make_jitcode_descr(5);
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
@@ -29145,6 +29191,7 @@ mod tests {
         let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
         descr_pool[7] = make_jitcode_descr(7);
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
@@ -29225,6 +29272,7 @@ mod tests {
         let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
         descr_pool[7] = make_jitcode_descr(7);
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
@@ -29308,6 +29356,7 @@ mod tests {
         let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
         descr_pool[7] = make_jitcode_descr(7);
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -29389,6 +29438,7 @@ mod tests {
         let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
         descr_pool[7] = make_jitcode_descr(7);
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -29475,6 +29525,7 @@ mod tests {
         let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
         descr_pool[7] = make_jitcode_descr(7);
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut regs_f,
@@ -29559,6 +29610,7 @@ mod tests {
         let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
         descr_pool[7] = make_jitcode_descr(7);
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut regs_f,
@@ -29632,6 +29684,7 @@ mod tests {
         let frame_done = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -29726,6 +29779,7 @@ mod tests {
         let ops_before = tc.num_ops();
 
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -29798,6 +29852,7 @@ mod tests {
         let frame_done = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
@@ -29858,6 +29913,7 @@ mod tests {
         let descr_pool = vec![descr];
         let frame_done = done_descr_ref_for_tests();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
@@ -29930,6 +29986,7 @@ mod tests {
         let frame_done = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -30022,6 +30079,7 @@ mod tests {
         let frame_done = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -30104,6 +30162,7 @@ mod tests {
         tc.heapcache_getfield_now_known(obj, 1, valuebox);
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -30164,6 +30223,7 @@ mod tests {
         let frame_done = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -30250,6 +30310,7 @@ mod tests {
         let frame_done = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
@@ -30319,6 +30380,7 @@ mod tests {
         let frame_done = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -30399,6 +30461,7 @@ mod tests {
         tc.heapcache_getarrayitem_now_known(array, index, 1, cached);
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -30467,6 +30530,7 @@ mod tests {
         let frame_done = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -30777,6 +30841,7 @@ mod tests {
         let mut tc = fresh_trace_ctx();
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
@@ -30855,6 +30920,7 @@ mod tests {
         let mut regs_r = vec![pycode, red0, red1];
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -30943,6 +31009,7 @@ mod tests {
         let mut regs_i = vec![jdindex];
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -31006,6 +31073,7 @@ mod tests {
         let mut regs_r = vec![tc.const_ref(0x1_0000)];
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
+            callee_shadow: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
