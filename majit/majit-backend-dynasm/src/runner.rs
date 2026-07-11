@@ -343,11 +343,18 @@ pub(crate) fn new_via_gc_enabled() -> bool {
 /// Compiled-code `New` allocation trampoline. Called from the machine code
 /// emitted by `genop_new` / `genop_new_with_vtable` when `new_via_gc_enabled`.
 /// Routes through the active GC's nursery allocator (mirroring cranelift's
-/// `gc_alloc_nursery_shim`); falls back to `malloc` when no GC is installed.
+/// `gc_alloc_nursery_shim`), including the process-global singleton; falls back
+/// to `malloc` when no GC is installed.
 pub(crate) extern "C" fn dynasm_new_alloc(size: usize) -> *mut u8 {
     DYNASM_ACTIVE_GC.with(|cell| match cell.borrow_mut().as_deref_mut() {
         Some(gc) => gc.alloc_nursery(size).0 as *mut u8,
-        None => unsafe { libc::malloc(size) as *mut u8 },
+        None => {
+            if majit_gc::gc_sync::is_initialized() {
+                majit_gc::gc_sync::gc_op(|g| g.alloc_nursery(size).0 as *mut u8)
+            } else {
+                unsafe { libc::malloc(size) as *mut u8 }
+            }
+        }
     })
 }
 
