@@ -406,6 +406,8 @@ pub struct MiniMarkGC {
     /// gc/base.py finalizer handlers: one death deque and trigger per queue.
     finalizer_handlers: Vec<FinalizerHandler>,
     finalizer_lock: bool,
+    /// incminimark.py:394 `self.enabled = True`.
+    enabled: bool,
     /// True while [`do_collect_oldgen_nonmoving`](MiniMarkGC::do_collect_oldgen_nonmoving)
     /// is running. A non-moving major skips the leading minor, so unlike
     /// `do_collect_full` it marks through a *populated* nursery: `mark_object`
@@ -581,6 +583,7 @@ impl MiniMarkGC {
             old_objects_with_finalizers: VecDeque::new(),
             finalizer_handlers: Vec::new(),
             finalizer_lock: false,
+            enabled: true,
             oldgen_nonmoving_active: false,
             oldgen_nonmoving_nursery_marks: Vec::new(),
             config,
@@ -1782,6 +1785,12 @@ impl MiniMarkGC {
     /// minors may need multiple consecutive steps so old-gen growth does not
     /// outrun marking.
     fn run_major_progress_after_minor(&mut self) {
+        // incminimark.py:832 — automatic major progress after a minor stops
+        // while disabled; explicit collect() passes force_enabled and stays
+        // ungated (collect_full / collect_oldgen_nonmoving here).
+        if !self.enabled {
+            return;
+        }
         if !self.incr_state.marking_in_progress && !self.threshold_reached(0) {
             return;
         }
@@ -2248,6 +2257,19 @@ impl MiniMarkGC {
         self.incr_state.objects_marked
     }
 
+    /// incminimark.py:530-537 `enable` / `disable` / `isenabled`.
+    pub fn enable(&mut self) {
+        self.enabled = true;
+    }
+
+    pub fn disable(&mut self) {
+        self.enabled = false;
+    }
+
+    pub fn isenabled(&self) -> bool {
+        self.enabled
+    }
+
     /// Set the per-step marking budget in bytes.
     pub fn set_mark_budget(&mut self, budget: usize) {
         self.incr_state.mark_budget_per_step = budget;
@@ -2678,6 +2700,9 @@ impl MiniMarkGC {
     /// If a cycle is already in progress, one bounded marking step is
     /// performed. Returns true if any GC work was done.
     pub fn gc_step(&mut self) -> bool {
+        if !self.enabled {
+            return false;
+        }
         if self.threshold_reached(0) && !self.incr_state.marking_in_progress {
             self.start_incremental_cycle();
             let done = self.incremental_mark_step();
@@ -3104,6 +3129,18 @@ impl GcAllocator for MiniMarkGC {
 
     fn collect_oldgen_nonmoving(&mut self) {
         self.do_collect_oldgen_nonmoving();
+    }
+
+    fn enable(&mut self) {
+        self.enable();
+    }
+
+    fn disable(&mut self) {
+        self.disable();
+    }
+
+    fn isenabled(&self) -> bool {
+        self.isenabled()
     }
 
     fn register_finalizer(&mut self, fq_index: usize, obj: GcRef, trigger: FinalizerTriggerFn) {
@@ -5631,6 +5668,22 @@ mod tests {
         // With an almost-empty old gen, gc_step should do nothing.
         assert!(!gc.gc_step());
         assert!(!gc.is_incremental_marking());
+    }
+
+    #[test]
+    fn test_gc_step_respects_enabled_flag() {
+        let mut gc = test_gc(4096);
+        gc.register_type(TypeInfo::simple(16));
+        gc.alloc_in_oldgen(0, GcHeader::SIZE + 16);
+        gc.next_major_collection_threshold = 0.0;
+        assert!(gc.threshold_reached(0));
+
+        gc.disable();
+        assert!(!gc.gc_step());
+        assert!(!gc.incr_state.marking_in_progress);
+
+        gc.enable();
+        assert!(gc.gc_step());
     }
 
     #[test]

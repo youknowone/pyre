@@ -255,6 +255,34 @@ pub fn try_gc_collect_oldgen() {
     });
 }
 
+/// Signature of the host-side automatic major-progress toggle callback.
+pub type GcSetEnabledHookFn = fn(bool);
+
+thread_local! {
+    static GC_SET_ENABLED_HOOK: Cell<Option<GcSetEnabledHookFn>> = const { Cell::new(None) };
+}
+
+/// Install the automatic major-progress toggle callback for this thread.
+pub fn register_gc_set_enabled_hook(hook: GcSetEnabledHookFn) {
+    GC_SET_ENABLED_HOOK.with(|cell| cell.set(Some(hook)));
+}
+
+/// Remove the automatic major-progress toggle callback on this thread.
+pub fn clear_gc_set_enabled_hook() {
+    GC_SET_ENABLED_HOOK.with(|cell| cell.set(None));
+}
+
+/// Toggle automatic major-collection progress via the installed hook. No-op
+/// when no hook is installed on this thread.
+#[inline]
+pub fn try_gc_set_enabled(enabled: bool) {
+    GC_SET_ENABLED_HOOK.with(|cell| {
+        if let Some(f) = cell.get() {
+            f(enabled);
+        }
+    });
+}
+
 /// RPython `gc_fq_register` / `gc_fq_next_dead` hooks.  The trigger is the
 /// translated FinalizerQueue handler and only schedules interpreter work.
 pub type GcFinalizerTriggerFn = fn();

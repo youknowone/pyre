@@ -116,6 +116,10 @@ fn pyre_object_gc_collect_oldgen_trampoline() {
     majit_gc::collect_oldgen_nonmoving();
 }
 
+fn pyre_object_gc_set_enabled_trampoline(enabled: bool) {
+    majit_gc::gc_set_enabled(enabled);
+}
+
 fn pyre_object_gc_register_finalizer_trampoline(
     fq_index: usize,
     obj: pyre_object::PyObjectRef,
@@ -2425,6 +2429,7 @@ fn install_pyre_object_hooks() {
     );
     pyre_object::register_gc_collect_hook(pyre_object_gc_collect_trampoline);
     pyre_object::gc_hook::register_gc_collect_oldgen_hook(pyre_object_gc_collect_oldgen_trampoline);
+    pyre_object::gc_hook::register_gc_set_enabled_hook(pyre_object_gc_set_enabled_trampoline);
     pyre_object::gc_hook::register_gc_finalizer_hooks(
         pyre_object_gc_register_finalizer_trampoline,
         pyre_object_gc_finalizer_next_dead_trampoline,

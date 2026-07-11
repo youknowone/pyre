@@ -493,6 +493,17 @@ fn walk_pyframe_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
             // copy alone is not authoritative for later EC reads).
             let exc_slot = unsafe { &mut (*ec).sys_exc_value as *mut PyObjectRef };
             visitor(unsafe { &mut *(exc_slot as *mut majit_ir::GcRef) });
+            // pending_with_disabled_del is a GC-visible list upstream
+            // (executioncontext.py:652); pyre's Vec lives in the boxed
+            // UserDelAction, so its element slots are visited here.
+            let action = unsafe { (*ec).user_del_action };
+            if !action.is_null() {
+                if let Some(list) = unsafe { (*action).pending_with_disabled_del.as_mut() } {
+                    for slot in list.iter_mut() {
+                        visitor(unsafe { &mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef) });
+                    }
+                }
+            }
         };
         visit_ec_slots(frame_ec);
         if ambient_ec != frame_ec {

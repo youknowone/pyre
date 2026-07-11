@@ -264,6 +264,16 @@ pub trait GcAllocator: Send {
     /// with no incremental old-gen lacks no method; `MiniMarkGC` overrides it.
     fn collect_oldgen_nonmoving(&mut self) {}
 
+    /// Toggle automatic major-collection progress. Backends without
+    /// incremental major collection ignore it.
+    fn enable(&mut self) {}
+
+    fn disable(&mut self) {}
+
+    fn isenabled(&self) -> bool {
+        true
+    }
+
     /// rgc.py `FinalizerQueue.register_finalizer` /
     /// framework.py `gc_fq_register`: register `obj` with one translated
     /// finalizer handler.  Backends without finalizer queues ignore it.
@@ -684,6 +694,15 @@ impl GcAllocator for GcHandle {
     }
     fn collect_oldgen_nonmoving(&mut self) {
         gc_sync::gc_op(|gc| gc.collect_oldgen_nonmoving())
+    }
+    fn enable(&mut self) {
+        gc_sync::gc_op(|gc| gc.enable())
+    }
+    fn disable(&mut self) {
+        gc_sync::gc_op(|gc| gc.disable())
+    }
+    fn isenabled(&self) -> bool {
+        gc_sync::gc_query(|gc| gc.isenabled())
     }
     fn register_finalizer(&mut self, fq_index: usize, obj: GcRef, trigger: FinalizerTriggerFn) {
         gc_sync::gc_op(|gc| gc.register_finalizer(fq_index, obj, trigger))
@@ -1470,6 +1489,18 @@ pub fn gc_register_finalizer(fq_index: usize, obj: GcRef, trigger: FinalizerTrig
 /// Pop one object from an RPython-style finalizer death queue.
 pub fn gc_fq_next_dead(fq_index: usize) -> Option<GcRef> {
     gc_sync::gc_op(|gc| gc.finalizer_next_dead(fq_index))
+}
+
+/// rgc.enable / rgc.disable — toggle automatic major-collection progress
+/// on the process-global GC.
+pub fn gc_set_enabled(enabled: bool) {
+    gc_sync::gc_op(|gc| {
+        if enabled {
+            gc.enable()
+        } else {
+            gc.disable()
+        }
+    })
 }
 
 /// Thread-local callback that performs a host-side write barrier through

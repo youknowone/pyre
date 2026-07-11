@@ -31,8 +31,15 @@ fn enable_finalizers(action: &mut crate::executioncontext::UserDelAction) {
     }
     action.finalizers_lock_count -= 1;
     if action.finalizers_lock_count == 0 {
-        if let Some(mut pending) = action.pending_with_disabled_del.take() {
-            for obj in pending.drain(..) {
+        if let Some(pending) = action.pending_with_disabled_del.take() {
+            // The list just left its GC-visible UserDelAction slot; keep every
+            // entry rooted while the finalizers run (upstream clears the
+            // GC-visible list as it progresses, interp_gc.py:80-84).
+            let _roots = pyre_object::gc_roots::push_roots();
+            for &obj in pending.iter() {
+                pyre_object::gc_roots::pin_root(obj);
+            }
+            for obj in pending {
                 action._call_finalizer(obj);
             }
         }
@@ -76,6 +83,7 @@ crate::py_module! {
             Ok(w_int_new(0))
         },
         "disable"       / 0 = |_| {
+            pyre_object::gc_hook::try_gc_set_enabled(false);
             GC_ENABLED.store(false, Ordering::Relaxed);
             if let Some(action) = user_del_action() {
                 if action.enabled_at_app_level {
@@ -86,6 +94,7 @@ crate::py_module! {
             Ok(w_none())
         },
         "enable"        / 0 = |_| {
+            pyre_object::gc_hook::try_gc_set_enabled(true);
             GC_ENABLED.store(true, Ordering::Relaxed);
             if let Some(action) = user_del_action() {
                 if !action.enabled_at_app_level {
@@ -95,7 +104,13 @@ crate::py_module! {
             }
             Ok(w_none())
         },
-        "isenabled"     / 0 = |_| Ok(w_bool_from(GC_ENABLED.load(Ordering::Relaxed))),
+        "isenabled"     / 0 = |_| {
+            let enabled = match user_del_action() {
+                Some(action) => action.enabled_at_app_level,
+                None => GC_ENABLED.load(Ordering::Relaxed),
+            };
+            Ok(w_bool_from(enabled))
+        },
         "get_objects"   / 1 = |_| Ok(w_list_new(vec![])),
         "get_referrers" / * = |_| Ok(w_list_new(vec![])),
         "get_referents" / * = |_| Ok(w_list_new(vec![])),
