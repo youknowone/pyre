@@ -2764,6 +2764,75 @@ fn read_code_unit(data: &[u8], pos: usize, unit: usize, big_endian: bool) -> u32
     }
 }
 
+/// interp_codecs.py:33-108 `call_errorhandler` (decode branch): invoke a
+/// custom handler registered through `_codecs.register_error` for a decode
+/// error position.
+pub(crate) fn call_registered_decode_error_handler(
+    err_mode: &str,
+    codec: &str,
+    data: &[u8],
+    start: usize,
+    end: usize,
+    reason: &str,
+    out: &mut Wtf8Buf,
+) -> Result<usize, crate::PyError> {
+    let w_handler = crate::module::_codecs::lookup_registered_error(err_mode).ok_or_else(|| {
+        crate::PyError::new(
+            crate::PyErrorKind::LookupError,
+            format!("unknown error handler name '{err_mode}'"),
+        )
+    })?;
+
+    let w_exc =
+        crate::typedef::unicode_decode_error(codec, data, start, end, reason).to_exc_object();
+    let w_res = crate::baseobjspace::call_function(w_handler, &[w_exc]);
+    if w_res.is_null() {
+        return Err(crate::call::take_call_error()
+            .unwrap_or_else(|| crate::PyError::type_error("error handler failed")));
+    }
+
+    if !unsafe { pyre_object::is_tuple(w_res) }
+        || unsafe { pyre_object::w_tuple_len(w_res) } != 2
+    {
+        return Err(crate::PyError::type_error(
+            "decoding error handler must return (str, int) tuple",
+        ));
+    }
+    let w_replace = unsafe { pyre_object::w_tuple_getitem(w_res, 0).unwrap() };
+    let w_newpos = unsafe { pyre_object::w_tuple_getitem(w_res, 1).unwrap() };
+    if !unsafe { pyre_object::is_str(w_replace) } {
+        return Err(crate::PyError::type_error(
+            "decoding error handler must return (str, int) tuple",
+        ));
+    }
+
+    // Bounds stay against original data; these loops resume into the
+    // original byte slice.
+    let length = data.len() as i64;
+    let mut newpos = match crate::baseobjspace::int_w(w_newpos) {
+        Ok(n) => n,
+        Err(e) => {
+            if e.kind == crate::PyErrorKind::OverflowError {
+                -1
+            } else {
+                return Err(e);
+            }
+        }
+    };
+    if newpos < 0 {
+        newpos += length;
+    }
+    if newpos < 0 || newpos > length {
+        return Err(crate::PyError::new(
+            crate::PyErrorKind::IndexError,
+            format!("position {newpos} from error handler out of bounds"),
+        ));
+    }
+
+    out.push_wtf8(unsafe { pyre_object::w_str_get_wtf8(w_replace) });
+    Ok(newpos as usize)
+}
+
 /// Decode error-handler dispatch for utf-16 / utf-32 (interp_codecs.py
 /// surrogatepass/surrogateescape branches plus the generic handlers).
 /// Appends the replacement to `out` and returns the byte position to
@@ -2828,10 +2897,9 @@ fn utf16_32_decode_error(
             }
             Ok(start + consumed)
         }
-        _ => Err(crate::PyError::new(
-            crate::PyErrorKind::LookupError,
-            format!("unknown error handler name '{err_mode}'"),
-        )),
+        _ => call_registered_decode_error_handler(
+            err_mode, codec, data, start, end, reason, out,
+        ),
     }
 }
 

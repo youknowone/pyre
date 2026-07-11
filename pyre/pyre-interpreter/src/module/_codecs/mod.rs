@@ -477,6 +477,12 @@ pub(crate) fn validate_error_handler(errors: &str) -> Result<(), crate::PyError>
     }
 }
 
+pub(crate) fn lookup_registered_error(errors: &str) -> Option<PyObjectRef> {
+    with_codec_state(|state| unsafe {
+        pyre_object::dictmultiobject::w_dict_getitem_str(state.codec_error_registry, errors)
+    })
+}
+
 fn lookup_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let Some(w_errors) = args.first().copied() else {
         return Err(crate::PyError::type_error(

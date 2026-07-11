@@ -12013,10 +12013,9 @@ fn utf8_error_handler(
             Ok(end)
         }
         "xmlcharrefreplace" | "namereplace" => Err(decode_error_encode_only_handler()),
-        _ => Err(crate::PyError::new(
-            crate::PyErrorKind::LookupError,
-            format!("unknown error handler name '{err_mode}'"),
-        )),
+        _ => crate::type_methods::call_registered_decode_error_handler(
+            err_mode, "utf-8", data, start, end, reason, out,
+        ),
     }
 }
 
