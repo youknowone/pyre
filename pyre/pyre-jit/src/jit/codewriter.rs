@@ -12603,20 +12603,23 @@ impl CodeWriter {
         trace_entry_pcs.push(0);
         trace_entry_pcs.sort_unstable();
         trace_entry_pcs.dedup();
+        let resolve_marker = |py_pc: usize| {
+            carryfwd_resume_pc
+                .binary_search_by_key(&(py_pc as u32), |&(py, _)| py)
+                .ok()
+                .map(|i| carryfwd_resume_pc[i].1)
+                .or_else(|| {
+                    pyre_jit_trace::pyjitcode::derive_resume_marker(
+                        &first_jit_pc_by_py_pc,
+                        &block_head_py_by_jit_pc,
+                        py_pc,
+                    )
+                })
+        };
         let merge_entry_by_green: Vec<(u32, u32)> = trace_entry_pcs
             .into_iter()
             .filter_map(|py_pc| {
-                let off = carryfwd_resume_pc
-                    .binary_search_by_key(&(py_pc as u32), |&(py, _)| py)
-                    .ok()
-                    .map(|i| carryfwd_resume_pc[i].1)
-                    .or_else(|| {
-                        pyre_jit_trace::pyjitcode::derive_resume_marker(
-                            &first_jit_pc_by_py_pc,
-                            &block_head_py_by_jit_pc,
-                            py_pc,
-                        )
-                    });
+                let off = resolve_marker(py_pc);
                 off.map(|off| (py_pc as u32, off as u32))
             })
             .collect();
@@ -12674,6 +12677,8 @@ impl CodeWriter {
         // `None`-means-decline hazard reader (S9394) into a compile.
         let mut depth_trivia_marker_by_jit_pc: Vec<(usize, Option<u16>)> = Vec::new();
         let mut depth_trivia_pred_by_jit_pc: Vec<(usize, Option<u16>)> = Vec::new();
+        let mut resume_marker_marker_by_jit_pc: Vec<(usize, Option<usize>)> = Vec::new();
+        let mut resume_marker_pred_by_jit_pc: Vec<(usize, Option<usize>)> = Vec::new();
         if !first_jit_pc_by_py_pc.is_empty() {
             use std::collections::BTreeMap;
             let mut by_off: BTreeMap<usize, usize> = BTreeMap::new();
@@ -12736,6 +12741,18 @@ impl CodeWriter {
                 }
             }
             depth_trivia_pred_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
+            // Marker tier: exact-match, block-head precedence.
+            for &(off, py) in &block_head_py_by_jit_pc {
+                resume_marker_marker_by_jit_pc.push((off, resolve_marker(py as usize)));
+            }
+            resume_marker_marker_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
+            // Op-start tier: predecessor scan, markers EXCLUDED.
+            for (py, &pos) in first_jit_pc_by_py_pc.iter().enumerate() {
+                if pos != usize::MAX {
+                    resume_marker_pred_by_jit_pc.push((pos, resolve_marker(py)));
+                }
+            }
+            resume_marker_pred_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
         }
 
         // call.py:148 `jd.mainjitcode.jitdriver_sd = jd`. RPython mutates
@@ -12770,6 +12787,8 @@ impl CodeWriter {
             depth_pred_by_jit_pc,
             depth_trivia_marker_by_jit_pc,
             depth_trivia_pred_by_jit_pc,
+            resume_marker_marker_by_jit_pc,
+            resume_marker_pred_by_jit_pc,
             result_color_at_pc,
             portal_frame_reg,
             portal_ec_reg,

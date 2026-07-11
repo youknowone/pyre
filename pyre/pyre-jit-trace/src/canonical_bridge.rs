@@ -211,6 +211,8 @@ pub fn install_portal_for(code_ptr: *const pyre_interpreter::CodeObject) -> Arc<
             depth_pred_by_jit_pc: Vec::new(),
             depth_trivia_marker_by_jit_pc: Vec::new(),
             depth_trivia_pred_by_jit_pc: Vec::new(),
+            resume_marker_marker_by_jit_pc: Vec::new(),
+            resume_marker_pred_by_jit_pc: Vec::new(),
             depth_at_py_pc,
             // Portal bridges have an empty pc_map, so the inline multiframe
             // capture declines before it reads this; keep it empty.
@@ -415,6 +417,8 @@ def f(x, y):
                 depth_pred_by_jit_pc: Vec::new(),
                 depth_trivia_marker_by_jit_pc: Vec::new(),
                 depth_trivia_pred_by_jit_pc: Vec::new(),
+                resume_marker_marker_by_jit_pc: Vec::new(),
+                resume_marker_pred_by_jit_pc: Vec::new(),
                 depth_at_py_pc: Vec::new(),
                 result_color_at_pc: Vec::new(),
                 portal_frame_reg: 0,
