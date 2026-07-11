@@ -499,6 +499,29 @@ pub fn jf_top_ptr() -> GcRef {
     })
 }
 
+/// Read the jf_ptr one entry below the top jitframe shadow-stack entry.
+///
+/// While a CALL_ASSEMBLER callee is pushed, this is its caller's frame. A
+/// collecting allocation performed before the callee push can update this
+/// shadow-stack slot, so compiled wasm reloads its own frame from here before
+/// addressing local-0-relative frame homes.
+pub fn jf_under_top_ptr() -> GcRef {
+    JF_ROOT_STACK.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        stack.ensure_init();
+        unsafe {
+            let top = stack.top.get();
+            if top <= stack.base + 2 * WORD {
+                return GcRef::NULL;
+            }
+            // Each entry is [is_minor, jf_ptr]. The caller's jf_ptr is three
+            // words below top: top[-1] is this callee, top[-3] its caller.
+            let jf_ptr_addr = (top - 3 * WORD) as *const usize;
+            GcRef(*jf_ptr_addr)
+        }
+    })
+}
+
 // ── Blackhole register bank shadow stack ────────────────────────
 //
 // blackhole.py:840 BlackholeInterpreter.registers_r parity:
