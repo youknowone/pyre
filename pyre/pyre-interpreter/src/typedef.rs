@@ -4750,10 +4750,17 @@ fn init_mappingproxy_type(ns: &mut DictStorage) {
         args: &[PyObjectRef],
         op: crate::baseobjspace::CompareOp,
     ) -> Result<PyObjectRef, crate::PyError> {
-        if args.len() < 2 {
-            return Ok(pyre_object::w_bool_from(false));
-        }
-        crate::baseobjspace::compare(args[0], args[1], op)
+        crate::type_methods::arity_slot(args, 1)?;
+        // descr_op → getattr(space, op)(self.w_mapping, w_other): the
+        // comparison runs on the wrapped mapping, not the proxy itself.
+        let self_mapping = unsafe {
+            if pyre_object::is_dict_proxy(args[0]) {
+                pyre_object::w_dict_proxy_get_mapping(args[0])
+            } else {
+                args[0]
+            }
+        };
+        crate::baseobjspace::compare(self_mapping, args[1], op)
     }
     fn proxy_eq(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         cmp_helper(args, crate::baseobjspace::CompareOp::Eq)
@@ -9414,9 +9421,8 @@ fn init_object_type(ns: &mut DictStorage) {
         make_builtin_function_with_arity(
             "__eq__",
             |args| {
-                Ok(pyre_object::w_bool_from(
-                    args.len() >= 2 && std::ptr::eq(args[0], args[1]),
-                ))
+                crate::type_methods::arity_slot(args, 1)?;
+                Ok(pyre_object::w_bool_from(std::ptr::eq(args[0], args[1])))
             },
             2,
         ),
@@ -9431,9 +9437,7 @@ fn init_object_type(ns: &mut DictStorage) {
         make_builtin_function_with_arity(
             "__ne__",
             |args| {
-                if args.len() < 2 {
-                    return Ok(pyre_object::w_bool_from(true));
-                }
+                crate::type_methods::arity_slot(args, 1)?;
                 let eq = crate::baseobjspace::compare(
                     args[0],
                     args[1],
