@@ -23,8 +23,8 @@
 //! [`DescEntry`]). [`DescEntry::desc_key`] derives the key from
 //! `Rc::as_ptr` per variant.
 
-use std::cell::RefCell;
 use indexmap::IndexMap;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};

@@ -25,8 +25,8 @@
 //!   mirrored on the Rust bookkeeper; reachable only from rtyper-phase
 //!   consumers.
 
-use std::cell::RefCell;
 use indexmap::{IndexMap, IndexSet};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::{Rc, Weak};
 

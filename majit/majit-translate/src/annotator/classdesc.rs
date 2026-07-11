@@ -52,8 +52,8 @@
 //! `_mixin_`, `_immutable_fields_`, `__slots__`, `_attrs_`,
 //! `__NOT_RPYTHON__`, and `_annspecialcase_`.
 
-use std::cell::RefCell;
 use indexmap::{IndexMap, IndexSet};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
