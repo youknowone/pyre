@@ -4782,21 +4782,48 @@ pub fn memcpy_fn_addr() -> i64 {
 /// "single instance per CPU" semantic; identity stability matters
 /// when downstream optimizer caches key on `descr_identity`.
 pub fn make_vtable_field_descr() -> DescrRef {
-    use std::sync::{Arc, OnceLock};
-    static VTABLE_FIELD_DESCR: OnceLock<DescrRef> = OnceLock::new();
-    VTABLE_FIELD_DESCR
+    static VTABLE_DESCR_GROUP: OnceLock<SimpleDescrGroup> = OnceLock::new();
+    VTABLE_DESCR_GROUP
         .get_or_init(|| {
-            // rclass.py / objectmodel.py: typeptr lives at object head
-            // with `Signed`-sized vtable pointer; is_immutable=true
-            // because the class identity does not change after malloc.
-            Arc::new(SimpleFieldDescr::new(
-                0x6000_0000,
-                0,                            // offset
-                std::mem::size_of::<usize>(), // field_size = WORD
-                crate::Type::Int,
-                true, // is_immutable — typeptr never reassigned
-            ))
+            let field_descr_cell = std::cell::RefCell::new(None);
+            let size_descr = Arc::new_cyclic(|weak_size: &Weak<SimpleSizeDescr>| {
+                let parent_descr: Weak<dyn Descr> = weak_size.clone();
+                // rclass.py / objectmodel.py: typeptr lives at object head
+                // with `Signed`-sized vtable pointer; is_immutable=true
+                // because the class identity does not change after malloc.
+                let field_descr = Arc::new(SimpleFieldDescr {
+                    index: AtomicU32::new(0x6000_0000),
+                    descr_index: AtomicI32::new(-1),
+                    ei_index: AtomicU32::new(u32::MAX),
+                    name: "object.typeptr".to_string(),
+                    offset: 0,
+                    field_size: std::mem::size_of::<usize>(),
+                    field_type: crate::Type::Int,
+                    is_immutable: true,
+                    is_quasi_immutable: false,
+                    flag: ArrayFlag::Signed,
+                    virtualizable: false,
+                    index_in_parent: 0,
+                    parent_descr: Some(parent_descr),
+                    vinfo: None,
+                });
+                *field_descr_cell.borrow_mut() = Some(field_descr.clone());
+                let all_fielddescrs = vec![field_descr as Arc<dyn FieldDescr>];
+                // descr.py:234-238: OBJECT gets a nullptr vtable, so
+                // its SizeDescr is not an object descriptor.
+                SimpleSizeDescr::new(u32::MAX, std::mem::size_of::<usize>(), 0)
+                    .with_all_fielddescrs(all_fielddescrs)
+            });
+            SimpleDescrGroup {
+                size_descr,
+                field_descrs: vec![
+                    field_descr_cell
+                        .into_inner()
+                        .expect("Arc::new_cyclic must initialize the typeptr field descriptor"),
+                ],
+            }
         })
+        .field_descrs[0]
         .clone()
 }
 
