@@ -12527,6 +12527,44 @@ fn bytearray_byte_arg(obj: PyObjectRef) -> Result<u8, crate::PyError> {
     Ok(value as u8)
 }
 
+/// `pypy/objspace/std/bytearrayobject.py descr_inplace_mul` — repeat the
+/// bytearray in place while preserving its identity.
+fn bytearray_method_imul(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::arity_at_least(args, "__imul__", 1)?;
+    let ba = args[0];
+    // Follow CPython here: a non-index TypeError propagates rather than
+    // returning NotImplemented.
+    let w_index = crate::baseobjspace::space_index(args[1])?;
+    let count = match crate::baseobjspace::int_w(w_index) {
+        Ok(v) => v,
+        Err(e) if e.kind == crate::PyErrorKind::OverflowError => {
+            return Err(crate::PyError::overflow_error(
+                "cannot fit 'int' into an index-sized integer",
+            ));
+        }
+        Err(e) => return Err(e),
+    };
+    unsafe {
+        crate::builtins::bytearray_check_exports(ba)?;
+        let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(ba);
+        if count <= 0 {
+            vec.clear();
+        } else if count != 1 && !vec.is_empty() {
+            vec.len().checked_mul(count as usize).ok_or_else(|| {
+                crate::PyError::new(
+                    crate::PyErrorKind::OverflowError,
+                    "repeated bytes are too long",
+                )
+            })?;
+            let orig = vec.clone();
+            for _ in 1..count {
+                vec.extend_from_slice(&orig);
+            }
+        }
+    }
+    Ok(ba)
+}
+
 /// `bytearrayobject.py:descr_append` — append one byte in place.
 fn bytearray_method_append(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::arity_at_least(args, "append", 1)?;
@@ -12808,6 +12846,11 @@ fn init_bytearray_type(ns: &mut DictStorage) {
             },
             2,
         ),
+    );
+    dict_storage_store(
+        ns,
+        "__imul__",
+        make_builtin_function_with_arity("__imul__", bytearray_method_imul, 2),
     );
     // The transform methods read via `bytes_like_data` and build their
     // result with `new_bytes_like`, which yields a bytearray for a
