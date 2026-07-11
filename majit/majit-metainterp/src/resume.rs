@@ -6863,11 +6863,10 @@ impl<'a> ResumeDataDirectReader<'a> {
         // payload the remaining `vable_size - 1`, read sequentially.
         // resume.py:1404 virtualizable = self.next_ref()
         //
-        // The state-field JIT's `&state` identity is a loop-invariant the
-        // backend drops from live registers; `build_vable_snapshot_boxes`
-        // encodes it into the resume snapshot as a `Ref` constant, so it decodes
-        // to the real pointer here with no thread-local recovery — matching
-        // resume.py:1404, which reads the identity solely from resume data.
+        // `build_vable_snapshot_boxes` always encodes this as a TAGBOX.  Thus
+        // `next_ref()` reads the current failing jitframe's gcmap-marked
+        // failarg slot, matching resume.py:1566-1578 rather than retaining a
+        // trace-time object address.
         let virtualizable = self.next_ref();
         self.virtualizable_ptr = virtualizable;
         // resume.py:1406: assert vinfo.get_total_size(virtualizable) == vable_size - 1

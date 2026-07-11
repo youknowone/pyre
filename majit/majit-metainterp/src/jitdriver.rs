@@ -1713,14 +1713,13 @@ impl<S: JitState> JitDriver<S> {
                 // active trace ctx before borrowing `self.meta.framestack`
                 // mutably below.  Cloning is acceptable because this is
                 // the segmented-loop force path (slow path).
-                let (vable_boxes, vref_boxes, identity_const) = self
+                let (vable_boxes, vref_boxes) = self
                     .meta
                     .trace_ctx()
                     .map(|ctx| {
                         (
                             ctx.virtualizable_boxes.clone().unwrap_or_default(),
                             ctx.virtualref_boxes.clone(),
-                            ctx.state_field_identity_const(),
                         )
                     })
                     .unwrap_or_default();
@@ -1732,7 +1731,6 @@ impl<S: JitState> JitDriver<S> {
                         &all_liveness,
                         &vable_boxes,
                         &vref_boxes,
-                        identity_const,
                     )
                 });
                 let mut current_live = self

@@ -2225,31 +2225,9 @@ impl TraceCtx {
         Vec<crate::recorder::SnapshotTagged>,
     ) {
         let vable_slice: &[OpRef] = self.virtualizable_boxes.as_deref().unwrap_or(&[]);
-        let vable_boxes = crate::pyjitpl::build_vable_snapshot_boxes(
-            vable_slice,
-            self.state_field_identity_const(),
-        );
+        let vable_boxes = crate::pyjitpl::build_vable_snapshot_boxes(vable_slice);
         let vref_boxes = crate::pyjitpl::build_vref_snapshot_boxes(&self.virtualref_boxes);
         (vable_boxes, vref_boxes)
-    }
-
-    /// Concrete `&state` pointer to encode as the resume-snapshot identity for
-    /// the state-field JIT, whose loop-invariant identity is folded out of the
-    /// live registers and otherwise decodes null at resume.  Encoding it as a
-    /// `Ref` constant lets `consume_vable_info` read the real pointer from
-    /// resume data, matching `resume.py:1404`.  Returns `None` for heap-object
-    /// virtualizables (e.g. `PyFrame`), whose identity is a genuinely-live box
-    /// that must stay a `Box` snapshot entry, and when no concrete shadow is
-    /// available (bridge-entry rebuild leaves `virtualizable_values` unset).
-    pub(crate) fn state_field_identity_const(&self) -> Option<i64> {
-        let info = self.virtualizable_info.as_ref()?;
-        if !info.elements_carried_via_shadow() {
-            return None;
-        }
-        match self.standard_virtualizable_concrete()? {
-            Value::Ref(r) if r.0 != 0 => Some(r.0 as i64),
-            _ => None,
-        }
     }
 
     /// Concrete shadow of the standard virtualizable — the raw heap pointer
