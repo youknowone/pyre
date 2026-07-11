@@ -12516,24 +12516,15 @@ fn bytes_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     }
 }
 
-/// `space.byte_w` — extract a single byte (`0 <= v < 256`) from an int
-/// argument; a non-int raises the CPython "object cannot be interpreted
-/// as an integer" TypeError, an out-of-range int the ValueError.
+/// `space.byte_w` — extract a single byte (`0 <= v < 256`) from an index
+/// argument; an invalid index raises TypeError, an out-of-range value ValueError.
 fn bytearray_byte_arg(obj: PyObjectRef) -> Result<u8, crate::PyError> {
-    unsafe {
-        if pyre_object::is_int(obj) {
-            let v = pyre_object::w_int_get_value(obj);
-            if !(0..=255).contains(&v) {
-                return Err(crate::PyError::value_error("byte must be in range(0, 256)"));
-            }
-            Ok(v as u8)
-        } else {
-            Err(crate::PyError::type_error(format!(
-                "'{}' object cannot be interpreted as an integer",
-                (*(*obj).ob_type).name
-            )))
-        }
+    // byte_w: getindex_w then range-check to [0, 256).
+    let value = crate::baseobjspace::getindex_w(obj)?;
+    if !(0..=255).contains(&value) {
+        return Err(crate::PyError::value_error("byte must be in range(0, 256)"));
     }
+    Ok(value as u8)
 }
 
 /// `bytearrayobject.py:descr_append` — append one byte in place.
