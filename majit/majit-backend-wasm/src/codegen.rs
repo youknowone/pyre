@@ -1758,12 +1758,25 @@ fn build_function(
                     sink.local_set(1 + label_args[i].raw());
                 }
                 // The parallel move rebinds loop-carried locals without going
-                // through store-on-def, so any Ref label arg's home slot is now
-                // stale. Refresh it before branching back, so the next
-                // iteration's reload-after-allocation sees the current value
-                // (not the previous iteration's).
-                for la in label_args.iter().take(n) {
-                    if let Some(h) = ref_homes.home(*la) {
+                // through store-on-def, so a Ref label arg that is REBOUND to a
+                // new value has a stale home slot; refresh it before branching
+                // back so the next iteration's reload-after-allocation sees the
+                // current value. Skip identity self-moves (jump arg == label
+                // arg): the value is loop-invariant, so the home written by the
+                // entry/resume loader already holds it and re-storing it every
+                // iteration is redundant.
+                for i in 0..n {
+                    let la = label_args[i];
+                    if let Some(h) = ref_homes.home(la) {
+                        // Skip the refresh for a loop-invariant self-move (the jump arg
+                        // is the label arg itself, so the value flows back unchanged and
+                        // the home written by the entry/resume loader is still current).
+                        // A constant jump arg is never a self-move, and OpRef::raw() must
+                        // not be called on an inline constant, so guard the comparison.
+                        let jarg = jump_args[i].to_opref();
+                        if !jarg.is_constant() && jarg.raw() == la.raw() {
+                            continue;
+                        }
                         sink.local_get(0);
                         sink.local_get(1 + la.raw());
                         sink.i64_store(mem64(frame.home_slot_base + h as u64 * SLOT_SIZE));
