@@ -157,6 +157,39 @@ struct FrameLocalsRoot {
     registered: bool,
 }
 
+/// A forwarding root for the red `frame` argument while native JIT glue is
+/// active.  `PyFrame.dispatch` keeps this identity as a GC reference; Rust
+/// callback parameters are raw addresses and must be reloaded after a moving
+/// collection.
+struct FrameRoot {
+    depth: usize,
+}
+
+impl FrameRoot {
+    #[majit_macros::dont_look_inside]
+    fn new(frame: &mut PyFrame) -> Self {
+        let depth = majit_gc::shadow_stack::push(majit_ir::GcRef(frame as *mut PyFrame as usize));
+        Self { depth }
+    }
+
+    #[majit_macros::dont_look_inside]
+    fn frame(&mut self) -> &mut PyFrame {
+        let frame = majit_gc::shadow_stack::get(self.depth).0 as *mut PyFrame;
+        unsafe { &mut *frame }
+    }
+
+    #[majit_macros::dont_look_inside]
+    fn release(&mut self) {
+        majit_gc::shadow_stack::try_pop_to(self.depth);
+    }
+}
+
+impl Drop for FrameRoot {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 impl FrameLocalsRoot {
     fn new(frame: &mut PyFrame) -> Self {
         let slot = &mut frame.locals_cells_stack_w as *mut _ as *mut *mut u8;
@@ -3852,7 +3885,8 @@ fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
     if jit_suppressed_by_unsupported_frame() {
         return frame.execute_frame(None, None);
     }
-    let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
+    let mut frame_root = FrameRoot::new(frame);
+    let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame_root.frame()) };
     pyre_interpreter::call::register_eval_override(eval_with_jit);
     pyre_interpreter::call::register_set_jit_param_hook(set_jit_param_via_warmstate);
     // The backend-agnostic registrations here — notably the JIT exception
@@ -3881,7 +3915,7 @@ fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
                 code as *const _ as usize,
                 "FrameShape::CurrentFrameOnly",
             );
-            return frame.execute_frame(None, None);
+            return frame_root.frame().execute_frame(None, None);
         }
         UnsupportedJitShape::StructuralRegion => {
             // A `with` frame whose `WITH_EXCEPT_START` exception-link lowering
@@ -3896,12 +3930,12 @@ fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
                 "FrameShape::StructuralRegion",
             );
             let _guard = JitSuppressionGuard::new();
-            return frame.execute_frame(None, None);
+            return frame_root.frame().execute_frame(None, None);
         }
     }
-    frame.fix_array_ptrs();
+    frame_root.frame().fix_array_ptrs();
     // Set CURRENT_FRAME so zero-arg super() can find __class__ in the caller.
-    let _frame_guard = pyre_interpreter::eval::install_current_frame(frame);
+    let _frame_guard = pyre_interpreter::eval::install_current_frame(frame_root.frame());
 
     // RPython blackhole.py parity: during bridge tracing, concrete
     // (force helper) calls must use the plain interpreter to avoid
@@ -3911,7 +3945,7 @@ fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
     {
         let (drv, _) = driver_pair();
         if drv.is_bridge_tracing() {
-            return frame.execute_frame(None, None);
+            return frame_root.frame().execute_frame(None, None);
         }
     }
 
@@ -3925,15 +3959,21 @@ fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
     //
     // portal_ptr = eval_loop_jit at depth 0 (has jit_merge_point +
     // can_enter_jit back-edge), plain interpreter at depth > 0.
-    if let Some(result) = try_function_entry_jit(frame) {
+    if let Some(result) = try_function_entry_jit(frame_root.frame()) {
         if majit_metainterp::majit_log_enabled() {
-            log_named_global_result(frame, "eval_with_jit_inner.try_function_entry_jit");
+            log_named_global_result(
+                frame_root.frame(),
+                "eval_with_jit_inner.try_function_entry_jit",
+            );
         }
         return result;
     }
-    let result = handle_jitexception(frame);
+    let result = handle_jitexception(frame_root.frame());
     if majit_metainterp::majit_log_enabled() {
-        log_named_global_result(frame, "eval_with_jit_inner.handle_jitexception");
+        log_named_global_result(
+            frame_root.frame(),
+            "eval_with_jit_inner.handle_jitexception",
+        );
     }
     result
 }
@@ -4044,8 +4084,9 @@ pub(crate) fn pyre_portal_runner(
 /// re-enters without re-extracting CRN args from the exception).
 #[inline(always)]
 fn handle_jitexception(frame: &mut PyFrame) -> PyResult {
+    let mut frame_root = FrameRoot::new(frame);
     loop {
-        let loop_outcome = eval_loop_jit(frame);
+        let loop_outcome = eval_loop_jit(frame_root.frame());
         // Drain pyre's call-error stash (see `pyre_interpreter::call::set_call_error`).
         // Several PY_NULL-returning helpers (e.g. `call_args_and_c_profile`,
         // `c_call_trace` / `c_return_trace` / `c_exception_trace` callbacks)
@@ -4060,7 +4101,7 @@ fn handle_jitexception(frame: &mut PyFrame) -> PyResult {
                 // The blackhole has already written back the merge point
                 // state to the frame (call_jit.rs:999-1013). Re-enter
                 // eval_loop_jit with that state — do NOT reset to entry.
-                frame.fix_array_ptrs();
+                frame_root.frame().fix_array_ptrs();
                 continue;
             }
         }
@@ -4100,20 +4141,21 @@ pub(crate) fn portal_runner_result(frame: &mut PyFrame) -> PyResult {
     // eval_frame_plain here would skip maybe_enter_jit at every
     // opcode of the recursive portal frame, which breaks parity for
     // bhimpl_recursive_call_* paths.
-    frame.fix_array_ptrs();
-    let _frame_guard = pyre_interpreter::eval::install_current_frame(frame);
+    let mut frame_root = FrameRoot::new(frame);
+    frame_root.frame().fix_array_ptrs();
+    let _frame_guard = pyre_interpreter::eval::install_current_frame(frame_root.frame());
     // Mirror `eval_with_jit_inner`'s structural-region suppression so a
     // recursive portal entry whose code contains `WITH_EXCEPT_START`
     // keeps nested helper Python frames out of the JIT too. The current
     // frame is already kept out of trace by `try_function_entry_jit` and
     // `jit_merge_point_hook`'s `unsupported_jit_shape` check; the guard
     // extends that to callees.
-    let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
+    let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame_root.frame()) };
     let _suppression = match unsupported_jit_shape(code) {
         UnsupportedJitShape::StructuralRegion => Some(JitSuppressionGuard::new()),
         UnsupportedJitShape::None | UnsupportedJitShape::CurrentFrameOnly => None,
     };
-    portal_runner_dispatch(frame)
+    portal_runner_dispatch(frame_root.frame())
 }
 
 fn portal_runner_dispatch(frame: &mut PyFrame) -> PyResult {
@@ -4146,6 +4188,7 @@ fn trace_jit_bytecode(_pc: usize, _instruction_name: &str) {
 /// recursive portal depth. Returns PyObjectRef (NULL on void/exception).
 /// JIT hooks are thin inline checks; all heavy logic is in #[cold] helpers.
 fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
+    let mut frame_root = FrameRoot::new(frame);
     // Bump the monotonic frame eval-loop entry odometer (mirrors the plain
     // `eval_loop` entry): a user Python frame is about to run bytecode.  The
     // FBW FOR_ITER Option-C guard snapshots this around a residual call to
@@ -4159,7 +4202,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
     // handler, etc., where the outer opcode handler holds a PyObjectRef
     // on the Rust stack that walk_pyframe_roots cannot reach).
     let _eval_activation = pyre_object::gc_interp::EvalActivationGuard::enter();
-    let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
+    let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame_root.frame()) };
     let env = PyreEnv;
     let (driver, info) = driver_pair();
     // The codewriter-side portal check
@@ -4210,11 +4253,11 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         // have accumulated to warrant a collection.
         pyre_object::gc_interp::safepoint();
 
-        if frame.next_instr() >= code.instructions.len() {
+        if frame_root.frame().next_instr() >= code.instructions.len() {
             return LoopResult::Done(Ok(w_none()));
         }
 
-        let pc = frame.next_instr();
+        let pc = frame_root.frame().next_instr();
         let (opcode_pc, instruction, op_arg) = match decode_instruction_for_dispatch(code, pc) {
             Ok(decoded) => decoded,
             Err(err) => return LoopResult::Done(Err(err.into())),
@@ -4242,7 +4285,8 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                 merge_point_active = false;
             }
             if merge_point_active {
-                if let Some(loop_result) = jit_merge_point_hook(frame, code, pc, driver, info, &env)
+                if let Some(loop_result) =
+                    jit_merge_point_hook(frame_root.frame(), code, pc, driver, info, &env)
                 {
                     return loop_result;
                 }
@@ -4251,8 +4295,10 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
 
         // ── handle_bytecode (RPython interp_jit.py:90) ──
         trace_jit_bytecode(pc, "");
-        frame.last_instr = pc as isize;
-        frame.set_last_instr_from_next_instr(opcode_pc + 1);
+        frame_root.frame().last_instr = pc as isize;
+        frame_root
+            .frame()
+            .set_last_instr_from_next_instr(opcode_pc + 1);
         // pyopcode.py:170-176 dispatch_bytecode parity: fire
         // `ec.bytecode_trace(self)` each opcode while warming up,
         // with the default `TICK_COUNTER_STEP` decrement.  This is
@@ -4273,13 +4319,13 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         // PyPy's `actionflag.decrement_ticker(decr_by)` invariant);
         // the `action_dispatcher` slow path itself is still a stub
         // pending the actionflag port.
-        let ec_ptr = frame.execution_context as *mut PyExecutionContext;
+        let ec_ptr = frame_root.frame().execution_context as *mut PyExecutionContext;
         if !ec_ptr.is_null() {
             let needs_trace = unsafe { !(*ec_ptr).w_tracefunc.is_null() };
             if needs_trace {
                 if let Err(err) = unsafe {
                     (*ec_ptr).bytecode_trace(
-                        frame as *mut PyFrame,
+                        frame_root.frame() as *mut PyFrame,
                         pyre_interpreter::executioncontext::TICK_COUNTER_STEP,
                     )
                 } {
@@ -4297,9 +4343,11 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                 // (= `last_instr + 1`) at the top, so rebase the target
                 // through `set_last_instr_from_next_instr` for the next
                 // iteration to land on it rather than one past it.
-                if frame.last_instr as usize != opcode_pc {
-                    let jump_target = frame.last_instr as usize;
-                    frame.set_last_instr_from_next_instr(jump_target);
+                if frame_root.frame().last_instr as usize != opcode_pc {
+                    let jump_target = frame_root.frame().last_instr as usize;
+                    frame_root
+                        .frame()
+                        .set_last_instr_from_next_instr(jump_target);
                     continue;
                 }
             } else {
@@ -4319,7 +4367,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                 };
                 if ticker < 0 {
                     if let Err(mut err) =
-                        unsafe { (*ec_ptr).perform_actions(frame as *mut PyFrame) }
+                        unsafe { (*ec_ptr).perform_actions(frame_root.frame() as *mut PyFrame) }
                     {
                         // Deliver the action's exception (e.g. a signal
                         // handler's KeyboardInterrupt) as if raised at the
@@ -4328,13 +4376,15 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                         // exception through the same `goto error` path.
                         // `frame.last_instr` was set to `pc` above, so
                         // `handle_exception` finds the covering handler.
-                        let mut next_instr = frame.next_instr();
+                        let mut next_instr = frame_root.frame().next_instr();
                         if pyre_interpreter::eval::handle_exception(
-                            frame,
+                            frame_root.frame(),
                             &mut err,
                             &mut next_instr,
                         ) {
-                            frame.set_last_instr_from_next_instr(next_instr);
+                            frame_root
+                                .frame()
+                                .set_last_instr_from_next_instr(next_instr);
                             continue;
                         }
                         return LoopResult::Done(Err(err));
@@ -4342,8 +4392,9 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                 }
             }
         }
-        let mut next_instr = frame.next_instr();
-        let step_result = execute_opcode_step(frame, code, instruction, op_arg, next_instr);
+        let mut next_instr = frame_root.frame().next_instr();
+        let step_result =
+            execute_opcode_step(frame_root.frame(), code, instruction, op_arg, next_instr);
         match step_result {
             Ok(StepResult::Continue) => {
                 // pyjitpl.py:2843 blackhole_if_trace_too_long — check after
@@ -4353,10 +4404,15 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
             Ok(StepResult::CloseLoop { loop_header_pc, .. }) if is_portal => {
                 // ── can_enter_jit (RPython interp_jit.py:114) ──
                 // RPython interp_jit.py:114 → warmstate.py:446
-                let green_key = make_green_key(frame.pycode, loop_header_pc);
-                if let Some(loop_result) =
-                    maybe_compile_and_run(frame, green_key, loop_header_pc, driver, info, &env)
-                {
+                let green_key = make_green_key(frame_root.frame().pycode, loop_header_pc);
+                if let Some(loop_result) = maybe_compile_and_run(
+                    frame_root.frame(),
+                    green_key,
+                    loop_header_pc,
+                    driver,
+                    info,
+                    &env,
+                ) {
                     return loop_result;
                 }
             }
@@ -4364,8 +4420,14 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
             Ok(StepResult::Return(result)) => return LoopResult::Done(Ok(result)),
             Ok(StepResult::Yield(result)) => return LoopResult::Done(Ok(result)),
             Err(mut err) => {
-                if pyre_interpreter::eval::handle_exception(frame, &mut err, &mut next_instr) {
-                    frame.set_last_instr_from_next_instr(next_instr);
+                if pyre_interpreter::eval::handle_exception(
+                    frame_root.frame(),
+                    &mut err,
+                    &mut next_instr,
+                ) {
+                    frame_root
+                        .frame()
+                        .set_last_instr_from_next_instr(next_instr);
                     continue;
                 }
                 return LoopResult::Done(Err(err));
@@ -4381,19 +4443,20 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
 /// eval_loop_jit, but always calls jit_merge_point_hook since tracing
 /// is already active from start_bridge_tracing.
 pub(crate) fn eval_loop_jit_bridge(frame: &mut PyFrame) -> LoopResult {
+    let mut frame_root = FrameRoot::new(frame);
     // Same as eval_loop_jit: count the activation for the safepoint's
     // depth gate (gh#393). See the comment in eval_loop_jit.
     let _eval_activation = pyre_object::gc_interp::EvalActivationGuard::enter();
-    let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
+    let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame_root.frame()) };
     let env = PyreEnv;
     let (driver, info) = driver_pair();
 
     loop {
-        if frame.next_instr() >= code.instructions.len() {
+        if frame_root.frame().next_instr() >= code.instructions.len() {
             return LoopResult::Done(Ok(w_none()));
         }
 
-        let pc = frame.next_instr();
+        let pc = frame_root.frame().next_instr();
         let (opcode_pc, instruction, op_arg) = match decode_instruction_for_dispatch(code, pc) {
             Ok(decoded) => decoded,
             Err(err) => return LoopResult::Done(Err(err.into())),
@@ -4401,7 +4464,9 @@ pub(crate) fn eval_loop_jit_bridge(frame: &mut PyFrame) -> LoopResult {
 
         // pyjitpl.py:1892-1914 run_one_step: trace + execute.
         if driver.is_tracing() {
-            if let Some(loop_result) = jit_merge_point_hook(frame, code, pc, driver, info, &env) {
+            if let Some(loop_result) =
+                jit_merge_point_hook(frame_root.frame(), code, pc, driver, info, &env)
+            {
                 return loop_result;
             }
         } else {
@@ -4411,17 +4476,26 @@ pub(crate) fn eval_loop_jit_bridge(frame: &mut PyFrame) -> LoopResult {
 
         // handle_bytecode: execute the bytecode on the concrete frame.
         let next_instr = opcode_pc + 1;
-        frame.set_last_instr_from_next_instr(next_instr);
-        let step_result = execute_opcode_step(frame, code, instruction, op_arg, next_instr);
+        frame_root
+            .frame()
+            .set_last_instr_from_next_instr(next_instr);
+        let step_result =
+            execute_opcode_step(frame_root.frame(), code, instruction, op_arg, next_instr);
         match step_result {
             Ok(StepResult::Continue) => {}
             Ok(StepResult::CloseLoop { .. }) => {}
             Ok(StepResult::Return(result)) => return LoopResult::Done(Ok(result)),
             Ok(StepResult::Yield(result)) => return LoopResult::Done(Ok(result)),
             Err(mut err) => {
-                let mut next_instr = frame.next_instr();
-                if pyre_interpreter::eval::handle_exception(frame, &mut err, &mut next_instr) {
-                    frame.set_last_instr_from_next_instr(next_instr);
+                let mut next_instr = frame_root.frame().next_instr();
+                if pyre_interpreter::eval::handle_exception(
+                    frame_root.frame(),
+                    &mut err,
+                    &mut next_instr,
+                ) {
+                    frame_root
+                        .frame()
+                        .set_last_instr_from_next_instr(next_instr);
                     continue;
                 }
                 return LoopResult::Done(Err(err));
@@ -5040,12 +5114,13 @@ fn execute_assembler(
     info: &majit_metainterp::virtualizable::VirtualizableInfo,
     env: &PyreEnv,
 ) -> Option<LoopResult> {
-    frame.set_last_instr_from_next_instr(entry_pc);
+    let mut frame_root = FrameRoot::new(frame);
+    frame_root.frame().set_last_instr_from_next_instr(entry_pc);
 
     if majit_metainterp::majit_log_enabled() {
-        let locals: Vec<(usize, Option<i64>)> = (0..frame.locals_w().len().min(5))
+        let locals: Vec<(usize, Option<i64>)> = (0..frame_root.frame().locals_w().len().min(5))
             .map(|i| {
-                let value = frame.locals_w()[i];
+                let value = frame_root.frame().locals_w()[i];
                 let decoded = if value.is_null() || !unsafe { pyre_object::pyobject::is_int(value) }
                 {
                     None
@@ -5058,20 +5133,20 @@ fn execute_assembler(
         eprintln!("[jit][execute-assembler][locals] {:?}", locals);
     }
 
-    let mut jit_state = build_jit_state(frame, info);
+    let mut jit_state = build_jit_state(frame_root.frame(), info);
 
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
             "[jit][execute-assembler] key={} pc={} arg0={:?}",
             green_key,
             entry_pc,
-            debug_first_arg_int(frame),
+            debug_first_arg_int(frame_root.frame()),
         );
     }
 
     // warmstate.py:395 func_execute_token(loop_token, *args) → deadframe
     let outcome = {
-        let _frame_locals_root = FrameLocalsRoot::new(frame);
+        let _frame_locals_root = FrameLocalsRoot::new(frame_root.frame());
         driver.run_compiled_detailed_with_bridge_keyed(
             green_key,
             entry_pc,
@@ -5187,7 +5262,7 @@ fn execute_assembler(
             guard_exc,
         } => {
             match handle_fail(
-                frame,
+                frame_root.frame(),
                 green_key,
                 trace_id,
                 fail_index,
@@ -5216,7 +5291,9 @@ fn execute_assembler(
                             // back to the frame so eval_loop_jit restarts at
                             // the merge point, not the guard-failure PC.
                             if let Some(&ni) = green_int.first() {
-                                frame.set_last_instr_from_next_instr(ni as usize);
+                                frame_root
+                                    .frame()
+                                    .set_last_instr_from_next_instr(ni as usize);
                             }
                             Some(LoopResult::ContinueRunningNormally)
                         }
@@ -5279,10 +5356,11 @@ fn bound_reached(
     info: &majit_metainterp::virtualizable::VirtualizableInfo,
     env: &PyreEnv,
 ) -> Option<LoopResult> {
+    let mut frame_root = FrameRoot::new(frame);
     if majit_metainterp::majit_log_enabled() {
-        let locals: Vec<(usize, Option<i64>)> = (0..frame.locals_w().len().min(5))
+        let locals: Vec<(usize, Option<i64>)> = (0..frame_root.frame().locals_w().len().min(5))
             .map(|i| {
-                let value = frame.locals_w()[i];
+                let value = frame_root.frame().locals_w()[i];
                 let decoded = if value.is_null() || !unsafe { pyre_object::pyobject::is_int(value) }
                 {
                     None
@@ -5296,7 +5374,7 @@ fn bound_reached(
             "[jit][bound-reached] key={} pc={} arg0={:?} locals={:?}",
             green_key,
             loop_header_pc,
-            debug_first_arg_int(frame),
+            debug_first_arg_int(frame_root.frame()),
             locals,
         );
     }
@@ -5311,18 +5389,20 @@ fn bound_reached(
         return None;
     }
     // warmstate.py:437-444: MetaInterp.compile_and_run_once
-    frame.set_last_instr_from_next_instr(loop_header_pc);
-    let mut jit_state = build_jit_state(frame, info);
+    frame_root
+        .frame()
+        .set_last_instr_from_next_instr(loop_header_pc);
+    let mut jit_state = build_jit_state(frame_root.frame(), info);
     // warmstate.py:473-477 JC_TRACING
     if driver
         .meta_interp()
-        .is_tracing_key((frame.pycode as usize, loop_header_pc))
+        .is_tracing_key((frame_root.frame().pycode as usize, loop_header_pc))
     {
         return None;
     }
     // warmstate.py:503-511: procedure_token → EnterJitAssembler.
     let outcome = if driver.has_compiled_loop(green_key) {
-        let _frame_locals_root = FrameLocalsRoot::new(frame);
+        let _frame_locals_root = FrameLocalsRoot::new(frame_root.frame());
         Some(driver.run_compiled_detailed_with_bridge_keyed(
             green_key,
             loop_header_pc,
@@ -5355,7 +5435,7 @@ fn bound_reached(
             // Set tracing_call_depth so inner function calls (which
             // run their own eval_loop_jit) don't trigger jit_merge_point_hook.
             driver.meta_interp_mut().tracing_call_depth = Some(call_depth());
-            let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
+            let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame_root.frame()) };
             let outcome = driver.jit_merge_point_keyed(
                 green_key,
                 loop_header_pc,
@@ -5365,8 +5445,8 @@ fn bound_reached(
                 |meta, sym| {
                     use pyre_jit_trace::trace::trace_bytecode;
                     crate::jit::codewriter::register_portal_jitdriver(code);
-                    let concrete_frame = frame.snapshot_for_tracing();
-                    let live_frame_addr = &*frame as *const PyFrame as usize;
+                    let concrete_frame = frame_root.frame().snapshot_for_tracing();
+                    let live_frame_addr = frame_root.frame() as *const PyFrame as usize;
                     let (action, executed_frame) = trace_bytecode(
                         meta,
                         sym,
@@ -5378,7 +5458,9 @@ fn bound_reached(
                     // raise_continue_running_normally seam — see the
                     // jit_merge_point_hook tracing site for the contract.
                     if pyre_jit_trace::trace::take_walk_end_flush_committed() {
-                        frame.restore_resume_state_from(&executed_frame);
+                        frame_root
+                            .frame()
+                            .restore_resume_state_from(&executed_frame);
                     }
                     action
                 },
@@ -5433,7 +5515,7 @@ fn bound_reached(
                 // ContinueRunningNormally re-entry runs the body once for it
                 // (the same continuation as the `jit_merge_point_hook`
                 // tracing site).
-                deliver_inflight_foriter_item(frame);
+                deliver_inflight_foriter_item(frame_root.frame());
                 if let Some(cv) = pyre_jit_trace::jitcode_dispatch::fbw_finish_concrete_take() {
                     let result = match cv {
                         // A void return stashes `Null`, i.e. Python `None`.
@@ -5473,7 +5555,7 @@ fn bound_reached(
         } = outcome
         {
             match handle_fail(
-                frame,
+                frame_root.frame(),
                 green_key,
                 trace_id,
                 fail_index,
@@ -5502,7 +5584,9 @@ fn bound_reached(
                         } => {
                             // warmspot.py:961 parity: write merge-point PC
                             if let Some(&ni) = green_int.first() {
-                                frame.set_last_instr_from_next_instr(ni as usize);
+                                frame_root
+                                    .frame()
+                                    .set_last_instr_from_next_instr(ni as usize);
                             }
                             return Some(LoopResult::ContinueRunningNormally);
                         }
@@ -5516,7 +5600,7 @@ fn bound_reached(
                 }
             }
         } else {
-            match handle_jit_outcome(outcome, &jit_state, frame, info, green_key) {
+            match handle_jit_outcome(outcome, &jit_state, frame_root.frame(), info, green_key) {
                 JitAction::Return(result) => return Some(LoopResult::Done(result)),
                 JitAction::ContinueRunningNormally | JitAction::Continue => {}
             }
@@ -5531,19 +5615,20 @@ fn bound_reached(
 /// Called at every portal entry (function call). Must be fast for the
 /// common case (no compiled code, not tracing, threshold not reached).
 pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
+    let mut frame_root = FrameRoot::new(frame);
     // warmstate.py parity: PYRE_NO_JIT disables ALL JIT paths.
     static NO_JIT_FN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *NO_JIT_FN.get_or_init(|| std::env::var_os("PYRE_NO_JIT").is_some()) {
         return None;
     }
-    let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
+    let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame_root.frame()) };
     if jit_suppressed_by_unsupported_frame()
         || unsupported_jit_shape(code) != UnsupportedJitShape::None
     {
         return None;
     }
     if std::env::var_os("MAJIT_DUMP_BYTECODE").is_some() {
-        if code.obj_name.as_str() == "fannkuch" && frame.next_instr() == 0 {
+        if code.obj_name.as_str() == "fannkuch" && frame_root.frame().next_instr() == 0 {
             use std::sync::OnceLock;
             static DUMPED: OnceLock<()> = OnceLock::new();
             if DUMPED.get().is_none() {
@@ -5565,7 +5650,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
             }
         }
     }
-    let green_key = make_green_key(frame.pycode, frame.next_instr());
+    let green_key = make_green_key(frame_root.frame().pycode, frame_root.frame().next_instr());
     let (driver, info) = driver_pair();
 
     // RPython warmstate.py maybe_compile_and_run fast path:
@@ -5581,10 +5666,10 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     }
 
     // RPython warmstate.py:473-477: per-cell JC_TRACING.
-    if driver
-        .meta_interp()
-        .is_tracing_key((frame.pycode as usize, frame.next_instr()))
-    {
+    if driver.meta_interp().is_tracing_key((
+        frame_root.frame().pycode as usize,
+        frame_root.frame().next_instr(),
+    )) {
         return None;
     }
     if driver.has_compiled_loop(green_key) {
@@ -5594,21 +5679,21 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
                 "[jit][func-entry] run compiled frame=0x{:x} locals=0x{:x} key={} arg0={:?} depth={} raw_finish_known={}",
-                frame as *mut PyFrame as usize,
-                frame.locals_cells_stack_w as usize,
+                frame_root.frame() as *mut PyFrame as usize,
+                frame_root.frame().locals_cells_stack_w as usize,
                 green_key,
-                debug_first_arg_int(frame),
+                debug_first_arg_int(frame_root.frame()),
                 call_depth(),
                 driver.has_raw_int_finish()
             );
         }
         let env = PyreEnv;
-        let mut jit_state = build_jit_state(frame, info);
+        let mut jit_state = build_jit_state(frame_root.frame(), info);
         let outcome = {
-            let _frame_locals_root = FrameLocalsRoot::new(frame);
+            let _frame_locals_root = FrameLocalsRoot::new(frame_root.frame());
             driver.run_compiled_detailed_with_bridge_keyed(
                 green_key,
-                frame.next_instr(),
+                frame_root.frame().next_instr(),
                 &mut jit_state,
                 &env,
                 || {},
@@ -5634,10 +5719,10 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
             };
             eprintln!(
                 "[jit][func-entry] compiled outcome frame=0x{:x} locals=0x{:x} key={} arg0={:?} kind={}",
-                frame as *mut PyFrame as usize,
-                frame.locals_cells_stack_w as usize,
+                frame_root.frame() as *mut PyFrame as usize,
+                frame_root.frame().locals_cells_stack_w as usize,
                 green_key,
-                debug_first_arg_int(frame),
+                debug_first_arg_int(frame_root.frame()),
                 kind
             );
         }
@@ -5655,7 +5740,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         } = outcome
         {
             match handle_fail(
-                frame,
+                frame_root.frame(),
                 green_key,
                 trace_id,
                 fail_index,
@@ -5695,7 +5780,9 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                             // interpreter underflows on the next pop. Mirrors
                             // the execute_assembler CRN arm.
                             if let Some(&ni) = green_int.first() {
-                                frame.set_last_instr_from_next_instr(ni as usize);
+                                frame_root
+                                    .frame()
+                                    .set_last_instr_from_next_instr(ni as usize);
                             }
                             // Fall through to eval_loop_jit
                         }
@@ -5734,7 +5821,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                                     };
                                     eprintln!(
                                         "[jit][handle-outcome] bh-return arg0={:?} intval={:?}",
-                                        debug_first_arg_int(frame),
+                                        debug_first_arg_int(frame_root.frame()),
                                         returned_intval,
                                     );
                                 }
@@ -5745,7 +5832,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                 }
             }
         } else {
-            match handle_jit_outcome(outcome, &jit_state, frame, info, green_key) {
+            match handle_jit_outcome(outcome, &jit_state, frame_root.frame(), info, green_key) {
                 JitAction::Return(result) => return Some(result),
                 JitAction::ContinueRunningNormally | JitAction::Continue => {}
             }
@@ -5753,7 +5840,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
 
         // After compiled code guard-restored fallback, re-establish the
         // frame's array pointer.
-        frame.fix_array_ptrs();
+        frame_root.frame().fix_array_ptrs();
         return None;
     }
 
@@ -5761,7 +5848,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         eprintln!(
             "[jit][func-entry] probe key={} arg0={:?} tracing={}",
             green_key,
-            debug_first_arg_int(frame),
+            debug_first_arg_int(frame_root.frame()),
             driver.is_tracing(),
         );
     }
@@ -5796,17 +5883,22 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         return None;
     }
     let env = PyreEnv;
-    let mut jit_state = build_jit_state(frame, info);
+    let mut jit_state = build_jit_state(frame_root.frame(), info);
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
             "[jit][func-entry] start tracing key={} arg0={:?}",
             green_key,
-            debug_first_arg_int(frame),
+            debug_first_arg_int(frame_root.frame()),
         );
     }
     {
-        let _frame_locals_root = FrameLocalsRoot::new(frame);
-        driver.force_start_tracing(green_key, frame.next_instr(), &mut jit_state, &env);
+        let _frame_locals_root = FrameLocalsRoot::new(frame_root.frame());
+        driver.force_start_tracing(
+            green_key,
+            frame_root.frame().next_instr(),
+            &mut jit_state,
+            &env,
+        );
     }
     None
 }
