@@ -85,6 +85,13 @@ pub fn generate_rust_mixin(ast: &parse::File) -> String {
 }
 
 /// Parse rule source and generate the complete Rust mixin source.
+///
+/// PyPy's `generate.py` calls `proof.prove_source(content)` (a Z3 equivalence
+/// check over every non-`SORRY_Z3` rule) before codegen. The Rust `proof`
+/// module has no solver bound (`Prover::check_rule` reports
+/// `SolverUnavailable`), so — like the Python-emitting [`generate_source`] — this
+/// wrapper generates over the typed AST from `parse` without the proof gate.
+/// Wiring the gate in is a separate parity item (porting the Z3 harness).
 pub fn generate_rust_source(content: &str) -> Result<String, parse::RuleParseError> {
     let ast = parse::parse(content)?;
     Ok(format!(

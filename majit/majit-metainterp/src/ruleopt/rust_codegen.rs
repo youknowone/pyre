@@ -105,6 +105,10 @@ impl RustCodegen {
         opname.to_ascii_uppercase()
     }
 
+    // `LONG_BIT` lowers to the literal `64`, and `MININT`/`MAXINT` to the
+    // `i64` bounds: the JIT is native and pyre targets a 64-bit machine word
+    // exclusively, so these fold to the same values the runtime shift/range ops
+    // use. A 32-bit target would need the word size threaded through here.
     fn rust_constant(value: &str) -> String {
         match value {
             "LONG_BIT" => "64".to_string(),
