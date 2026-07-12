@@ -529,10 +529,10 @@ pub extern "C" fn wasm_jit_ca_alloc_frame(frame_bytes: i64, gcmap_ptr: i64) -> i
     // own execution. Steady recursive frames die young; only frames that live
     // through a collection are promoted instead of inflating the old-gen major
     // collection threshold on every call.
-    let jf_ref = WASM_ACTIVE_GC.with(|cell| match cell.borrow_mut().as_deref_mut() {
-        Some(gc) => gc.alloc_nursery_typed(wasm_jitframe_tid(), JitFrame::alloc_size(depth)),
-        None => GcRef(0),
-    });
+    let jf_ref = with_wasm_active_gc_mut(|gc| {
+        gc.alloc_nursery_typed(wasm_jitframe_tid(), JitFrame::alloc_size(depth))
+    })
+    .unwrap_or(GcRef(0));
     if jf_ref.0 == 0 {
         return 0;
     }
