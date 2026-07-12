@@ -2840,6 +2840,7 @@ fn compute_bridge_root_parent_frame(
     Some(InlineParentFrame {
         jitcode_index,
         resume_py_pc,
+        resume_marker_jit_pc: None,
         boxes,
     })
 }
@@ -7283,6 +7284,10 @@ struct InlineParentFrame {
     /// plain py_pc (`< AFTER_RESIDUAL_CALL_PC_FLAG`); a CALL inside a
     /// try-block (catch marker) declines multi-frame.
     resume_py_pc: u32,
+    /// Codewrite-time jitcode-keyed marker for the CALL fallthrough resume
+    /// point, queried at the CALL site.  Bridge-root frames have no CALL
+    /// offset in hand and carry `None`.
+    resume_marker_jit_pc: Option<usize>,
     /// The caller's `in_a_call` active boxes at `resume_py_pc` — the liveness
     /// at the return point with the not-yet-produced call-result slot nulled
     /// (`get_list_of_active_boxes(in_a_call=true)` parity, trace_opcode.rs:1779).
@@ -11723,7 +11728,7 @@ fn compute_inline_caller_frame(
     if caller_sym.jitcode.is_null() {
         return Err(InlineCallerFrameDecline::Unavailable);
     }
-    let (jitcode_index, fallthrough_py_pc, code_ptr) = unsafe {
+    let (jitcode_index, fallthrough_py_pc, resume_marker_jit_pc, code_ptr) = unsafe {
         let jc = &*caller_sym.jitcode;
         if jc.payload.code_ptr.is_null() || !jc.payload.is_populated() {
             return Err(InlineCallerFrameDecline::Unavailable);
@@ -11737,7 +11742,12 @@ fn compute_inline_caller_frame(
         )?;
         let code = &*jc.payload.code_ptr;
         let fallthrough = crate::pyjitpl::semantic_fallthrough_pc(code, call_py) as u32;
-        (jc.index as u32, fallthrough, jc.payload.code_ptr)
+        (
+            jc.index as u32,
+            fallthrough,
+            jc.payload.after_residual_marker_for_jitcode_pc(call_jit_pc),
+            jc.payload.code_ptr,
+        )
     };
     // The call result is the top operand-stack slot at the return point.
     let depth = unsafe {
@@ -11784,6 +11794,7 @@ fn compute_inline_caller_frame(
     Ok(InlineParentFrame {
         jitcode_index,
         resume_py_pc: fallthrough_py_pc,
+        resume_marker_jit_pc,
         boxes,
     })
 }
@@ -11808,6 +11819,7 @@ fn compute_nested_inline_caller_frame(
         return Err(InlineCallerFrameDecline::Unavailable);
     }
     let call_py = python_pc_for_jitcode_pc(&pjc.metadata, call_jit_pc) as usize;
+    let resume_marker_jit_pc = pjc.after_residual_marker_for_jitcode_pc(call_jit_pc);
     // A CALL inside a try-block resumes at its own catch via a bit-14 marker
     // pc, which the multi-frame capture's `py_pc < FLAG` assert rejects.
     decline_inline_caller_frame_for_catch_marker(pjc.after_residual_call_resume_pc_for(call_py))?;
@@ -11864,6 +11876,7 @@ fn compute_nested_inline_caller_frame(
     Ok(InlineParentFrame {
         jitcode_index,
         resume_py_pc: fallthrough_py_pc,
+        resume_marker_jit_pc,
         boxes,
     })
 }
@@ -12045,12 +12058,66 @@ fn walker_capture_multi_frame_inline_snapshot(
     // top frame last (innermost).
     let mut frames: Vec<(u32, u32, i32, &[OpRef])> = Vec::with_capacity(parent_frames.len() + 1);
     for pf in &parent_frames {
+        if m73_marker_audit_enabled() {
+            match crate::state::pyjitcode_for_jitcode_index(pf.jitcode_index as i32) {
+                Some(pjc) if pjc.is_populated() => {
+                    match pjc.resume_jitcode_pc_for(pf.resume_py_pc as usize) {
+                        Some(legacy) => match pf.resume_marker_jit_pc {
+                            Some(twin) if twin == legacy => eprintln!(
+                                "M73_PFMARKER eq=1 idx={} py_pc={} m={}",
+                                pf.jitcode_index, pf.resume_py_pc, legacy
+                            ),
+                            Some(twin) => eprintln!(
+                                "M73_PFMARKER eq=0 idx={} py_pc={} m={} twin={}",
+                                pf.jitcode_index, pf.resume_py_pc, legacy, twin
+                            ),
+                            None => eprintln!(
+                                "M73_PFMARKER eq=notwin idx={} py_pc={} m={}",
+                                pf.jitcode_index, pf.resume_py_pc, legacy
+                            ),
+                        },
+                        None => eprintln!(
+                            "M73_PFMARKER eq=nomarker idx={} py_pc={}",
+                            pf.jitcode_index, pf.resume_py_pc
+                        ),
+                    }
+                }
+                _ => eprintln!(
+                    "M73_PFMARKER eq=nopjc idx={} py_pc={}",
+                    pf.jitcode_index, pf.resume_py_pc
+                ),
+            }
+        }
         frames.push((
             pf.jitcode_index,
             pf.resume_py_pc,
             majit_ir::resumedata::NO_JITCODE_PC,
             pf.boxes.as_slice(),
         ));
+    }
+    if m73_marker_audit_enabled() {
+        if after_residual_call {
+            // `callee_py_pc` was advanced to semantic fallthrough above; the
+            // audit prints that derived pc together with the raw CALL offset.
+            let legacy = callee_pjc.resume_jitcode_pc_for(callee_py_pc as usize);
+            let twin = callee_pjc.after_residual_marker_for_jitcode_pc(callee_op_pc);
+            eprintln!(
+                "M73_MFAR py_pc={callee_py_pc} op_pc={callee_op_pc} legacy={legacy:?} twin={twin:?}"
+            );
+        } else if callee_jitcode_pc == callee_op_pc as i32 {
+            let decodable = callee_pjc
+                .jitcode
+                .can_decode_live_vars(callee_op_pc, crate::state::op_live());
+            // For the undecodable rows the decoder falls back to the plain
+            // translation of `callee_py_pc`; print it next to the marker twin
+            // so a word swap can be certified as value-equal.
+            let legacy = callee_pjc.resume_jitcode_pc_for(callee_py_pc as usize);
+            let twin = callee_pjc.resume_marker_for_jitcode_pc(callee_op_pc);
+            eprintln!(
+                "M73_MFRAW decodable={decodable} py_pc={callee_py_pc} op_pc={callee_op_pc} \
+                 legacy={legacy:?} twin={twin:?}"
+            );
+        }
     }
     frames.push((
         callee_jitcode_index as u32,
