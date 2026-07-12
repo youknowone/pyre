@@ -9689,6 +9689,41 @@ pub(crate) fn m73_loopclose_carry_enabled() -> bool {
     })
 }
 
+/// `PYRE_M73_ARMDST_CARRY` (#73 S5 phase-5 slice-1, default OFF): key the
+/// `compare_box_provably_dead` branch-arm liveness queries (`arm_dst_live`)
+/// on the resume-marker twin at the arm offset instead of the
+/// `resume_jitcode_pc_for` translation of the inverted py pc. Census
+/// pending (`M73_ARMDST` under `PYRE_M73_MARKER_AUDIT`). Enable with
+/// `PYRE_M73_ARMDST_CARRY=1`.
+pub(crate) fn m73_armdst_carry_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M73_ARMDST_CARRY") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => false,
+    })
+}
+
+/// `PYRE_M73_LCLIVE_CARRY` (#73 S5 phase-5 slice-2, default OFF): resolve
+/// the loop-close guards' liveness coordinate in
+/// `get_list_of_active_boxes` from the merge-point resume-marker twin
+/// (`MIFrame::loop_close_marker_jit_pc`) instead of the
+/// `resume_jitcode_pc_for(live_pc)` translation. Census pending
+/// (`M73_LCLIVE` under `PYRE_M73_MARKER_AUDIT`). Enable with
+/// `PYRE_M73_LCLIVE_CARRY=1`.
+pub(crate) fn m73_lclive_carry_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M73_LCLIVE_CARRY") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => false,
+    })
+}
+
 /// #73 S5 phase-3 slice-5: attribution census for the residual decode-side
 /// resume-translation traffic (`bucket=sentinel_plain` in
 /// `PYRE_M369_RECOVER_AUDIT`). Under the audit gate, print one line per
@@ -17321,11 +17356,12 @@ fn compare_box_provably_dead(ctx: &WalkContext<'_, '_>, compare_pc: usize, dst_r
     }
     // SAFETY: same contract as walker_capture_snapshot_for_last_guard_impl —
     // pointer live for the full-body walk, immutable layout fields only.
-    let (code, metadata, jitcode_index, code_ptr): (
+    let (code, metadata, jitcode_index, code_ptr, payload): (
         &[u8],
         &crate::PyJitCodeMetadata,
         i32,
         *const _,
+        &crate::PyJitCode,
     ) = unsafe {
         let sym = &*full_body_sym;
         if sym.jitcode.is_null() {
@@ -17340,6 +17376,7 @@ fn compare_box_provably_dead(ctx: &WalkContext<'_, '_>, compare_pc: usize, dst_r
             &jc.payload.metadata,
             jc.index as i32,
             jc.payload.code_ptr,
+            &jc.payload,
         )
     };
     let Some(start) = crate::jitcode_runtime::decode_op_at(code, compare_pc) else {
@@ -17434,21 +17471,56 @@ fn compare_box_provably_dead(ctx: &WalkContext<'_, '_>, compare_pc: usize, dst_r
     // SAFETY: code_ptr captured non-null above, live for the walk.
     let code_obj = unsafe { &*code_ptr };
     // The `jc_pc` here is a branch ARM's op-start (`gin_op.next_pc` /
-    // `read_label`), NOT the guard's resume marker, so it does not satisfy
-    // the carried-coordinate contract (`can_decode_live_vars` may hold at an
-    // interior arm offset whose liveness window differs from the py opcode's
-    // representative resume window). The resume-translation normalization to
-    // the py
-    // opcode's resume liveness is the intended behavior here, so this reader
-    // keeps the py_pc channel and is excluded from the jitcode-pc liveness
-    // twin — verified: querying the carried offset directly drops live
-    // colors (e.g. `ref_ [0,1,4]` vs `[0,1]`) across the branch-arm corpus.
+    // `read_label`), NOT the guard's resume marker, so the RAW offset does
+    // not satisfy the carried-coordinate contract (`can_decode_live_vars`
+    // may hold at an interior arm offset whose liveness window differs from
+    // the py opcode's representative resume window — verified: querying the
+    // raw offset directly drops live colors, e.g. `ref_ [0,1,4]` vs `[0,1]`).
+    // The normalization this reader wants — the containing py opcode's
+    // resume `-live-` — IS the resume-marker twin at `jc_pc`
+    // (`resume_marker_for_jitcode_pc`, the invert→trivia-skip→resolve
+    // composition built at codewrite time), so under
+    // `PYRE_M73_ARMDST_CARRY` the liveness is keyed on the twin and the
+    // py_pc translation channel is bypassed.
     let arm_dst_live = |jc_pc: usize| -> bool {
         let py = skip_python_trivia_forward(
             code_obj,
             python_pc_for_jitcode_pc(metadata, jc_pc) as usize,
         );
-        let banks = crate::state::frame_liveness_reg_indices_by_bank_at(jitcode_index, py as i32);
+        let twin = payload.resume_marker_for_jitcode_pc(jc_pc);
+        if m73_marker_audit_enabled() {
+            let via_py =
+                crate::state::frame_liveness_reg_indices_by_bank_at(jitcode_index, py as i32);
+            match twin {
+                Some(t) => {
+                    let via_twin =
+                        crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
+                            jitcode_index,
+                            py as i32,
+                            t as i32,
+                        );
+                    if via_twin == via_py {
+                        eprintln!(
+                            "M73_ARMDST eq=1 idx={jitcode_index} jc_pc={jc_pc} py={py} m={t}"
+                        );
+                    } else {
+                        eprintln!(
+                            "M73_ARMDST eq=0 idx={jitcode_index} jc_pc={jc_pc} py={py} m={t} \
+                             via_py={via_py:?} via_twin={via_twin:?}"
+                        );
+                    }
+                }
+                None => eprintln!("M73_ARMDST eq=notwin idx={jitcode_index} jc_pc={jc_pc} py={py}"),
+            }
+        }
+        let banks = match twin.filter(|_| m73_armdst_carry_enabled()) {
+            Some(t) => crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
+                jitcode_index,
+                py as i32,
+                t as i32,
+            ),
+            None => crate::state::frame_liveness_reg_indices_by_bank_at(jitcode_index, py as i32),
+        };
         banks.ref_.iter().any(|&c| c as u8 == dst_reg)
     };
     if arm_dst_live(fallthrough_jc) || arm_dst_live(target_jc) {

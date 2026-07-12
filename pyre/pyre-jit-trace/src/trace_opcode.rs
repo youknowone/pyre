@@ -1495,8 +1495,32 @@ impl MIFrame {
                     // recorded (pre-call) snapshot position.
                     None
                 };
+                // #73 S5 phase-5 slice-2: during the loop-close window the
+                // plain `live_pc` translation resolves the loop header's
+                // block-head marker — the same value the merge-point twin
+                // (`loop_close_marker_jit_pc`) carries, so the twin substitutes
+                // for the `resume_jitcode_pc_for` translation under
+                // `PYRE_M73_LCLIVE_CARRY`.  Outside the window (twin `None`)
+                // and for marker-routed frames the resolution is unchanged.
+                if crate::jitcode_dispatch::m73_marker_audit_enabled() {
+                    if let (Some(twin), None) = (self.loop_close_marker_jit_pc, marker_call_pc) {
+                        match jc.payload.resume_jitcode_pc_for(live_pc) {
+                            Some(legacy) if legacy == twin => {
+                                eprintln!("M73_LCLIVE eq=1 live_pc={live_pc} m={legacy}")
+                            }
+                            Some(legacy) => eprintln!(
+                                "M73_LCLIVE eq=0 live_pc={live_pc} m={legacy} twin={twin}"
+                            ),
+                            None => eprintln!("M73_LCLIVE eq=nomarker live_pc={live_pc}"),
+                        }
+                    }
+                }
                 match marker_call_pc
                     .and_then(|call_pc| jc.payload.after_residual_call_resume_pc_for(call_pc))
+                    .or_else(|| {
+                        self.loop_close_marker_jit_pc
+                            .filter(|_| crate::jitcode_dispatch::m73_lclive_carry_enabled())
+                    })
                     .or_else(|| jc.payload.resume_jitcode_pc_for(live_pc))
                 {
                     Some(jit_pc) => Some(jit_pc),
