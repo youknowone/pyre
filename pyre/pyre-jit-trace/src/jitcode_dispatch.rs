@@ -7026,6 +7026,39 @@ fn collect_outer_active_boxes(
     };
     let pcdep_opt: Option<&[(u8, u16, u16)]> =
         (!pcdep_entries.is_empty()).then(|| pcdep_entries.as_slice());
+    let stack_livereg_gate = fbw_stack_livereg_enabled();
+    let (guard_pcdep_entries, guard_stack_only) = if stack_livereg_gate {
+        if let Some(gpc) = guard_py_pc {
+            if sym.jitcode.is_null() {
+                (Vec::new(), 0usize)
+            } else {
+                unsafe {
+                    let jc = &*sym.jitcode;
+                    let entries = jc
+                        .payload
+                        .metadata
+                        .pcdep_color_slots
+                        .get(gpc as usize)
+                        .cloned()
+                        .unwrap_or_default();
+                    let depth = if jc.payload.code_ptr.is_null() {
+                        0usize
+                    } else {
+                        crate::liveness::liveness_for(jc.payload.code_ptr)
+                            .depth_at_py_pc()
+                            .get(gpc as usize)
+                            .copied()
+                            .unwrap_or(0) as usize
+                    };
+                    (entries, depth)
+                }
+            }
+        } else {
+            (Vec::new(), 0usize)
+        }
+    } else {
+        (Vec::new(), 0usize)
+    };
     // Int / Float bank diagnostic panic: pyre's banks are sized to the
     // jitcode's `num_regs_X`, which the codewriter co-publishes with the
     // liveness side-table, so every liveness index is in range by
@@ -7197,26 +7230,34 @@ fn collect_outer_active_boxes(
                     let vbox = trace_ctx.virtualizable_box_at(nvs + s_idx);
                     let walk_box = regs_r.get(color).copied();
                     if s_idx >= nlocals {
-                        // Operand-stack slot.  The authoritative source is the
-                        // virtualizable shadow (`setarrayitem_vable_r` keeps it
-                        // current on every push/store).  The walk register file
-                        // (`registers_r[color]`) is NOT authoritative for stack
-                        // slots: stack-slot `write_ref_reg` was retired, so the
+                        // Operand-stack slot.  `pyjitpl.py:222` snapshots
+                        // `self.registers_r[index]`, but pyre's stack
+                        // `write_ref_reg` mirror was retired: outside a
+                        // branch guard's own per-PC color map, the walk
                         // register may hold a stale value from a prior SSA def
-                        // that shared the same color (e.g. a green scratch ref
-                        // like `pycode_var` whose tiny live range lets the
-                        // chordal coloring assign it the same color as an
-                        // iterator).  Read the shadow first; fall back to the
-                        // walk register only when the shadow slot is NULL
-                        // (a mid-opcode transient the portal never wrote).
+                        // that shared the color.  Keep the shadow-first order
+                        // by default.  Under `PYRE_FBW_STACK_LIVEREG`, prefer
+                        // the live register only when the guard PC's
+                        // `pcdep_color_slots` proves this color owns the same
+                        // stack slot at the guard capture point; otherwise the
+                        // virtualizable shadow remains authoritative.
                         let shadow_is_real = vbox.is_some_and(|b| !opref_is_null_const_ptr(b));
-                        if shadow_is_real {
+                        let walk_real =
+                            walk_box.filter(|&v| v != OpRef::NONE && !opref_is_null_const_ptr(v));
+                        let guard_pc_proves_slot = stack_livereg_gate
+                            && guard_py_pc.is_some()
+                            && crate::state::semantic_ref_slot_for_reg_color(
+                                nlocals,
+                                guard_stack_only,
+                                &guard_pcdep_entries,
+                                color,
+                            ) == Some(s_idx);
+                        if guard_pc_proves_slot {
+                            walk_real.or(vbox).unwrap_or_else(fallback)
+                        } else if shadow_is_real {
                             vbox.unwrap_or_else(fallback)
                         } else {
-                            match walk_box {
-                                Some(v) if v != OpRef::NONE && !opref_is_null_const_ptr(v) => v,
-                                _ => vbox.unwrap_or_else(fallback),
-                            }
+                            walk_real.unwrap_or_else(|| vbox.unwrap_or_else(fallback))
                         }
                     } else {
                         // At a branch guard the walk register is the live
@@ -7701,6 +7742,20 @@ pub(crate) fn fbw_inline_nsfold_enabled() -> bool {
 fn fbw_callee_vstack_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_CALLEE_VSTACK") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => false,
+    })
+}
+
+/// `PYRE_FBW_STACK_LIVEREG` (default OFF) — for branch-guard operand-stack
+/// snapshot slots, prefer the live Ref register when the guard PC's per-PC
+/// color map proves that color owns the same stack slot.
+fn fbw_stack_livereg_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_STACK_LIVEREG") {
         Some(v) => {
             let v = v.to_string_lossy();
             v != "0" && !v.eq_ignore_ascii_case("false")
