@@ -2835,6 +2835,7 @@ fn compute_bridge_root_parent_frame(
         // branch guard's own `op.pc`.
         majit_ir::resumedata::NO_JITCODE_PC,
         None,
+        &[],
     );
     Some(InlineParentFrame {
         jitcode_index,
@@ -3416,6 +3417,7 @@ pub fn dispatch_via_miframe_at_opcode_entry<'a>(
         None,
         majit_ir::resumedata::NO_JITCODE_PC,
         None,
+        &[],
     );
 
     // pyjitpl.py:82-90 `setup` per-bank allocation: each bank gets
@@ -6834,6 +6836,7 @@ fn collect_outer_active_boxes(
     guard_py_pc: Option<u32>,
     carried_jitcode_pc: i32,
     vstack: Option<&[OpRef]>,
+    kept_recovered: &[(u16, OpRef)],
 ) -> Vec<OpRef> {
     // `#124` Approach B: resolve the base live-box set through the carried
     // JitCode coordinate so the encoder's color set matches the decoder's
@@ -6979,8 +6982,10 @@ fn collect_outer_active_boxes(
     // #420: exact not-taken edge-move recovery, keyed by resume-merge color.
     // The guard trampoline's `ref_copy(dst <- src)` gave this kept slot's live
     // guard-pc source value directly, exact for any kept-stack depth.
-    let kept_recovered: std::collections::HashMap<u32, OpRef> = BRANCH_GUARD_KEPT_RECOVERED
-        .with(|c| c.borrow().iter().map(|&(dst, v)| (dst as u32, v)).collect());
+    let kept_recovered: std::collections::HashMap<u32, OpRef> = kept_recovered
+        .iter()
+        .map(|&(dst, v)| (dst as u32, v))
+        .collect();
     // #73 mirror-sourced kept operand-stack slots: at a branch guard the
     // not-taken arm preserves the operand-stack bottom, so the live walk-level
     // box mirror (`ctx.vstack_boxes`, indexed by absolute operand-stack depth)
@@ -7183,57 +7188,46 @@ fn sync_intermediate_merge_point_last_instr(ctx: &mut TraceCtx, merge_pc: usize)
     );
 }
 
-/// Walker-side port of `pyjitpl.py:2586-2602 MIFrame.capture_resumedata`
-/// for the `after_residual_call=True` path (`pyjitpl.py:2078-2082
-/// handle_possible_exception`).  Attaches a single-frame snapshot to
-/// the last recorded guard so the optimizer's
-/// `store_final_boxes_in_guard` (`optimizeopt/mod.rs:5033`) finds
-/// `rd_resume_position >= 0` and can derive `op.fail_args` from the
-/// snapshot via `op.store_final_boxes(liveboxes)` instead of panicking.
-thread_local! {
-    /// Set (`true`) only for the duration of the
-    /// `walker_capture_snapshot_for_last_guard` call that records a
-    /// FOR_ITER-next residual's `GUARD_NO_EXCEPTION`.  Tells the snapshot
-    /// helper to fold the bit-14 after-residual-call marker onto the
+/// Call-scoped inputs for one guard-snapshot capture — the explicit-parameter
+/// port of `capture_resumedata`'s keyword arguments (pyjitpl.py:2599-2603),
+/// alongside the already-explicit `after_residual_call`.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct GuardCaptureScope<'a> {
+    /// True for a FOR_ITER-next residual's `GUARD_NO_EXCEPTION`. Tells the
+    /// snapshot helper to fold the bit-14 after-residual-call marker onto the
     /// FOR_ITER CALL pc so a deopt resumes at the call's OWN post-call
-    /// `catch_exception` (emitted by the codewriter when the FOR_ITER sits
-    /// in a try-block) — the blackhole's `handle_exception_in_frame` then
-    /// routes the raise to the enclosing handler instead of escaping the
-    /// frame.  A FOR_ITER-next's fallthrough is the continue-arm body
-    /// (reached only on a non-null item), which carries no catch for the
-    /// call's own raise, so the generic fallthrough resume the other
-    /// residual calls use cannot find one.  Off for every other residual.
-    static FBW_FORITER_NEXT_CATCH_RESUME: std::cell::Cell<bool> =
-        const { std::cell::Cell::new(false) };
+    /// `catch_exception` (emitted by the codewriter when the FOR_ITER sits in a
+    /// try-block) — the blackhole's `handle_exception_in_frame` then routes the
+    /// raise to the enclosing handler instead of escaping the frame. A
+    /// FOR_ITER-next's fallthrough is the continue-arm body (reached only on a
+    /// non-null item), which carries no catch for the call's own raise, so the
+    /// generic fallthrough resume the other residual calls use cannot find one.
+    /// False for every other residual.
+    pub foriter_next_catch_resume: bool,
 
-    /// Set (to the branch guard's own jitcode `op.pc`) only for the
-    /// duration of the `walker_capture_snapshot_for_last_guard` call a
-    /// kept-stack branch guard makes (#124).  The
-    /// snapshot helper is invoked with the *resume* coordinate
-    /// (`other_target`, the not-taken arm), so the guard's own coordinate
-    /// is otherwise unavailable to the encoder.  `collect_outer_active_
-    /// boxes` reads this to recover the kept operand-stack value(s): a
-    /// branch guard's not-taken arm resumes at a merge point whose live
-    /// Ref color was minted by the not-taken edge's register move and is
-    /// therefore unwritten in the walk's register file at the guard
-    /// point; the value lives instead in the guard-pc-only color the
-    /// edge move reads from.  Null outside the gated kept-stack path.
-    static BRANCH_GUARD_JITCODE_PC: std::cell::Cell<usize> =
-        const { std::cell::Cell::new(usize::MAX) };
+    /// The branch guard's own jitcode `op.pc` for a kept-stack branch guard
+    /// (#124). The snapshot helper is invoked with the *resume* coordinate
+    /// (`other_target`, the not-taken arm), so the guard's own coordinate is
+    /// otherwise unavailable to the encoder. `collect_outer_active_boxes`
+    /// reads this to recover the kept operand-stack value(s): a branch guard's
+    /// not-taken arm resumes at a merge point whose live Ref color was minted
+    /// by the not-taken edge's register move and is therefore unwritten in the
+    /// walk's register file at the guard point; the value lives instead in the
+    /// guard-pc-only color the edge move reads from. None outside the gated
+    /// kept-stack path.
+    pub branch_guard_jitcode_pc: Option<usize>,
 
     /// `#420` not-taken edge-move recovery: the decoded `ref_copy`
     /// parallel-move list of a kept-stack branch guard's trampoline, as
-    /// `(resume-merge color, guard-state kept value)` pairs.  The branch
-    /// handler reads each `ref_copy(dst <- src)` of the not-taken edge and
-    /// stores `(dst, registers_r[src])` here; `collect_outer_active_boxes`
-    /// and the `stack_sync` vable overlay read it so every kept operand-
-    /// stack slot resumes with the exact value the edge move would produce,
-    /// instead of the stale merge-color read.  This replaces the positional
-    /// depth-1 heuristic with the exact, depth-independent edge resolution.
-    /// Empty outside the gated kept-stack path (cleared after each capture).
-    static BRANCH_GUARD_KEPT_RECOVERED: std::cell::RefCell<Vec<(u16, OpRef)>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-
+    /// `(resume-merge color, guard-state kept value)` pairs. The branch handler
+    /// reads each `ref_copy(dst <- src)` of the not-taken edge and supplies
+    /// `(dst, registers_r[src])`; `collect_outer_active_boxes` and the
+    /// `stack_sync` vable overlay read it so every kept operand-stack slot
+    /// resumes with the exact value the edge move would produce, instead of the
+    /// stale merge-color read. This replaces the positional depth-1 heuristic
+    /// with the exact, depth-independent edge resolution. Empty outside the
+    /// gated kept-stack path.
+    pub branch_guard_kept_recovered: &'a [(u16, OpRef)],
 }
 
 /// `rlib/jit.py:601` `max_unroll_recursion` default (= warmstate
@@ -10344,6 +10338,14 @@ pub(crate) fn walker_capture_snapshot_for_last_guard(
     ctx: &mut WalkContext<'_, '_>,
     op_pc: usize,
 ) -> Result<(), DispatchError> {
+    walker_capture_snapshot_for_last_guard_scoped(ctx, op_pc, GuardCaptureScope::default())
+}
+
+fn walker_capture_snapshot_for_last_guard_scoped(
+    ctx: &mut WalkContext<'_, '_>,
+    op_pc: usize,
+    scope: GuardCaptureScope<'_>,
+) -> Result<(), DispatchError> {
     let after_residual_call = matches!(
         ctx.trace_ctx.last_guard_opcode(),
         Some(
@@ -10353,7 +10355,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard(
                 | OpCode::GuardAlwaysFails
         )
     );
-    walker_capture_snapshot_for_last_guard_impl(ctx, op_pc, after_residual_call)
+    walker_capture_snapshot_for_last_guard_impl(ctx, op_pc, after_residual_call, scope)
 }
 
 /// Attach a resume snapshot to a `_nonstandard_virtualizable` PTR_EQ
@@ -10441,6 +10443,7 @@ fn walker_capture_snapshot_for_last_guard_impl(
     ctx: &mut WalkContext<'_, '_>,
     op_pc: usize,
     after_residual_call: bool,
+    scope: GuardCaptureScope<'_>,
 ) -> Result<(), DispatchError> {
     // A guard whose resume snapshot cannot be built must abort the trace,
     // not panic.  `build_vable_snapshot_boxes` requires every virtualizable
@@ -10558,6 +10561,7 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 op_pc,
                 after_residual_call,
                 parent_frames,
+                scope,
             );
         }
     }
@@ -10607,8 +10611,9 @@ fn walker_capture_snapshot_for_last_guard_impl(
                     // continue-arm body (reached only on a NON-null item), which
                     // carries no catch for the call's OWN raise.  When the
                     // FOR_ITER-next residual guard is being captured
-                    // (`FBW_FORITER_NEXT_CATCH_RESUME`) and the call's CALL pc has
-                    // a post-call catch, fold the bit-14 marker onto the CALL pc
+                    // (`GuardCaptureScope::foriter_next_catch_resume`) and the
+                    // call's CALL pc has a post-call catch, fold the bit-14
+                    // marker onto the CALL pc
                     // (handled at `resume_py_pc` below) so the blackhole resumes
                     // at the call's OWN catch and routes the raise to the
                     // enclosing handler instead of escaping the frame.
@@ -10616,8 +10621,7 @@ fn walker_capture_snapshot_for_last_guard_impl(
                         let call_py_pc = py;
                         py = crate::pyjitpl::semantic_fallthrough_pc(code, py as usize) as u32;
                         let flag = majit_ir::resumedata::AFTER_RESIDUAL_CALL_PC_FLAG as u32;
-                        let foriter_catch = FBW_FORITER_NEXT_CATCH_RESUME.with(|c| c.get());
-                        if foriter_catch
+                        if scope.foriter_next_catch_resume
                             && call_py_pc < flag
                             && jc
                                 .payload
@@ -10717,21 +10721,13 @@ fn walker_capture_snapshot_for_last_guard_impl(
             // dereferences a null operand.  Overlay the live operands, build
             // the snapshot, then restore the shadow so this transient write
             // never leaks into a later op or merge-point sync.
-            // Guard's Python pc (derived from the branch handler's stashed
+            // Guard's Python pc (derived from the branch handler's scoped
             // jitcode pc) — needed by the kept-stack source recovery in the
             // overlay below and the resume coordinate further down.
-            let guard_jc_pc_raw = BRANCH_GUARD_JITCODE_PC.with(|c| c.get());
-            let guard_py_pc = if guard_jc_pc_raw == usize::MAX {
-                None
-            } else {
-                unsafe {
-                    let jc = &*sym.jitcode;
-                    Some(python_pc_for_jitcode_pc(
-                        &jc.payload.metadata,
-                        guard_jc_pc_raw,
-                    ))
-                }
-            };
+            let guard_py_pc = scope.branch_guard_jitcode_pc.map(|guard_jc_pc| unsafe {
+                let jc = &*sym.jitcode;
+                python_pc_for_jitcode_pc(&jc.payload.metadata, guard_jc_pc)
+            });
             let stack_sync: Vec<(usize, OpRef)> = if sym.owns_virtualizable_shadow() {
                 let depth = unsafe {
                     let jc = &*sym.jitcode;
@@ -10931,15 +10927,15 @@ fn walker_capture_snapshot_for_last_guard_impl(
                     ctx.trace_ctx.set_virtualizable_box_at(idx, old);
                 }
             }
-            // `guard_jc_pc_raw` / `guard_py_pc` derived above (before the
-            // stack overlay, which needs `guard_py_pc` for the #124 kept-stack
-            // source recovery): map the guard's own jitcode pc to its Python
-            // opcode so the encoder reads the guard-pc liveness — the resume
-            // `py_pc` is a not-taken merge point whose live colors the walk
-            // has not written.
+            // `scope.branch_guard_jitcode_pc` / `guard_py_pc` derived above
+            // (before the stack overlay, which needs `guard_py_pc` for the #124
+            // kept-stack source recovery): map the guard's own jitcode pc to its
+            // Python opcode so the encoder reads the guard-pc liveness — the
+            // resume `py_pc` is a not-taken merge point whose live colors the
+            // walk has not written.
             // #124 Approach B (M2): carry the guard's raw JitCode byte offset
-            // as the resume coordinate ONLY for branch guards — they stash
-            // their own pc in `BRANCH_GUARD_JITCODE_PC`, the
+            // as the resume coordinate ONLY for branch guards — they supply
+            // their own pc in `GuardCaptureScope::branch_guard_jitcode_pc`, the
             // kept-stack-across-branch precision `setposition(jitcode,
             // miframe.pc)` preserves and the lossy `py_pc → jitcode`
             // resume-translation collapses.
@@ -10955,11 +10951,11 @@ fn walker_capture_snapshot_for_last_guard_impl(
             // `entry_py_pc`, and for a non-branch guard
             // `op_pc != resume_jitcode_pc_for(py_pc)`
             // — the two windows diverge and the decoded box layout mismatches.
-            let guard_jitcode_pc: i32 = if guard_jc_pc_raw != usize::MAX {
+            let guard_jitcode_pc: i32 = if let Some(guard_jc_pc) = scope.branch_guard_jitcode_pc {
                 // The kept-stack branch guard's own `op.pc` (walker
                 // `MIFrame.pc`) — the ONE carried word not sourced from the
                 // resume-translation.
-                guard_jc_pc_raw as i32
+                guard_jc_pc as i32
             } else if m366_nonbranch_pc_enabled()
                 && !after_residual_call
                 && matches!(
@@ -10974,7 +10970,7 @@ fn walker_capture_snapshot_for_last_guard_impl(
             {
                 // #366: carry the `-live-` marker offset (`resume_jitcode_pc_for(
                 // py_pc)`), NOT the raw guard `op_pc`.  Reached only on the
-                // sentinel path (`guard_jc_pc_raw == usize::MAX`): the
+                // default-scope path (`scope.branch_guard_jitcode_pc.is_none()`): the
                 // specialization guards (`GuardValue`/`GuardClass`) and the
                 // depth-0 branch guards (`GuardTrue`/`GuardFalse`, kept-stack
                 // depth>0 branches take the first arm carrying `op.pc`).  For
@@ -11071,7 +11067,8 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 // marker (`resume_jitcode_pc_for(py_pc)`). This arm is enclosed
                 // by `!inline_subwalk && !full_body_sym.is_null()`, and depth-0
                 // is guaranteed because kept-stack (depth>0) branch guards set
-                // `BRANCH_GUARD_JITCODE_PC` and take the raw-`op.pc` arm above
+                // `GuardCaptureScope::branch_guard_jitcode_pc` and take the
+                // raw-`op.pc` arm above
                 // instead. Unlike the specialization census it compares against
                 // `marker` (the ACTUAL carried word), not `NO_JITCODE_PC`, and
                 // adds a DIRECT `python_pc_for_jitcode_pc(op_pc)`-vs-`py_pc`
@@ -11389,9 +11386,9 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 //     through the resume-translation, so carry
                 //     `resume_jitcode_pc_for(py_pc)`.
                 //     `py_pc == liveness_py_pc` here: the residual-call path
-                //     never stashes `BRANCH_GUARD_JITCODE_PC` (only kept-stack
-                //     branch guards do), so `guard_jc_pc_raw == usize::MAX` and
-                //     `guard_py_pc` is `None`.
+                //     never supplies `GuardCaptureScope::branch_guard_jitcode_pc`
+                //     (only kept-stack branch guards do), so `guard_py_pc` is
+                //     `None`.
                 // Both offsets are the SAME physical post-call `-live-` insn by
                 // codewriter construction (the plain fallthrough re-key and the
                 // catch-predecessor anchor resolve to one marker), so the
@@ -11452,6 +11449,7 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 guard_py_pc,
                 guard_jitcode_pc,
                 ctx.vstack_valid.then_some(ctx.vstack_boxes.as_slice()),
+                scope.branch_guard_kept_recovered,
             );
             ctx.trace_ctx
                 .capture_snapshot_for_last_guard_with_vable_vref(
@@ -11600,6 +11598,7 @@ fn compute_inline_caller_frame(
         None,
         majit_ir::resumedata::NO_JITCODE_PC,
         None,
+        &[],
     );
     if let (Some(saved), true) = (saved, result_color < ctx.registers_r.len()) {
         ctx.registers_r[result_color] = saved;
@@ -11703,6 +11702,7 @@ fn walker_capture_multi_frame_inline_snapshot(
     callee_op_pc: usize,
     after_residual_call: bool,
     parent_frames: Vec<InlineParentFrame>,
+    scope: GuardCaptureScope<'_>,
 ) -> Result<(), DispatchError> {
     if !ctx.trace_ctx.vable_snapshot_buildable() {
         return Err(DispatchError::GuardSnapshotVableUntyped { pc: callee_op_pc });
@@ -11794,8 +11794,8 @@ fn walker_capture_multi_frame_inline_snapshot(
     }
     // #124 Approach B (M2): the callee (top) frame carries the guard's raw
     // JitCode byte offset as the resume coordinate (mirror of the single-frame
-    // path).  A branch guard stashes its own callee pc in
-    // `BRANCH_GUARD_JITCODE_PC`; otherwise the guard's own offset is
+    // path). A branch guard supplies its own callee pc in
+    // `GuardCaptureScope::branch_guard_jitcode_pc`; otherwise the guard's own offset is
     // `callee_op_pc`.  `after_residual_call` guards resume BEFORE the call and
     // keep the sentinel.  The paused caller frames resume at the CALL return
     // point via the Python pc → jitcode resume-translation path, so they keep
@@ -11803,15 +11803,10 @@ fn walker_capture_multi_frame_inline_snapshot(
     // kept-stack coordinate is carried for them in M2).  Computed BEFORE the box
     // collection so it queries liveness at the SAME coordinate the decoder
     // resumes at.
-    let callee_jitcode_pc: i32 = {
-        let g = BRANCH_GUARD_JITCODE_PC.with(|c| c.get());
-        if g != usize::MAX {
-            g as i32
-        } else if after_residual_call {
-            majit_ir::resumedata::NO_JITCODE_PC
-        } else {
-            callee_op_pc as i32
-        }
+    let callee_jitcode_pc: i32 = match scope.branch_guard_jitcode_pc {
+        Some(g) => g as i32,
+        None if after_residual_call => majit_ir::resumedata::NO_JITCODE_PC,
+        None => callee_op_pc as i32,
     };
     let callee_boxes = collect_callee_active_boxes(
         ctx.registers_i,
@@ -13985,6 +13980,7 @@ fn try_walker_inline_user_call(
                         None,
                         majit_ir::resumedata::NO_JITCODE_PC,
                         None,
+                        &[],
                     );
                     (boxes, call_site_py_pc, call_site_jc_index)
                 }
@@ -14963,19 +14959,20 @@ fn dispatch_residual_call_iRd_kind(
             } else {
                 ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
                 // FOR_ITER-next routes its no-exception-guard resume through
-                // the call's OWN post-call catch (`FBW_FORITER_NEXT_CATCH_RESUME`);
+                // the call's OWN post-call catch
+                // (`GuardCaptureScope::foriter_next_catch_resume`);
                 // every other residual keeps the fallthrough resume.  See the
-                // thread-local's doc and the marker handling in
+                // scope field's doc and the marker handling in
                 // `walker_capture_snapshot_for_last_guard_impl`.
                 let is_for_iter_next = ei.pyre_helper == majit_ir::PyreHelperKind::ForIterNext;
-                if is_for_iter_next {
-                    FBW_FORITER_NEXT_CATCH_RESUME.with(|c| c.set(true));
-                }
-                let cap = walker_capture_snapshot_for_last_guard(ctx, op.pc);
-                if is_for_iter_next {
-                    FBW_FORITER_NEXT_CATCH_RESUME.with(|c| c.set(false));
-                }
-                cap?;
+                walker_capture_snapshot_for_last_guard_scoped(
+                    ctx,
+                    op.pc,
+                    GuardCaptureScope {
+                        foriter_next_catch_resume: is_for_iter_next,
+                        ..GuardCaptureScope::default()
+                    },
+                )?;
             }
         }
 
@@ -18041,6 +18038,7 @@ fn orthodox_list_append_commit(
         None,
         majit_ir::resumedata::NO_JITCODE_PC,
         None,
+        &[],
     );
 
     // Swap in the call-site resume context + the callee's GLOBAL descr pool
@@ -20855,7 +20853,7 @@ fn handle(
                 // Scope this to the collapse case ONLY: the #68 multiframe
                 // inline path (`PYRE_FBW_INLINE_MULTIFRAME`,
                 // `n_parents == n_callees`, both > 0) resumes the callee at its
-                // OWN pc through `BRANCH_GUARD_JITCODE_PC`
+                // OWN pc through `GuardCaptureScope::branch_guard_jitcode_pc`
                 // (`walker_capture_multi_frame_inline_snapshot`), so its
                 // kept-stack branches still need the real depth/recovery.
                 //
@@ -20979,8 +20977,9 @@ fn handle(
                 // `ref_copy` patches `src` into the constants window of
                 // `registers_r`, so this one read covers register and const
                 // sources alike.  This resolved set is the single source of truth
-                // the snapshot encoder reads (`BRANCH_GUARD_KEPT_RECOVERED_RESOLVED`
-                // below); `record_guard` records into the trace history only and
+                // the snapshot encoder reads
+                // (`GuardCaptureScope::branch_guard_kept_recovered` below);
+                // `record_guard` records into the trace history only and
                 // does not mutate `registers_r`, so reading it here is identical
                 // to reading it post-guard.
                 let resolved_recovered: Option<Vec<(u16, OpRef)>> =
@@ -21170,19 +21169,25 @@ fn handle(
                 // routing it through the
                 // guard-pc carrier would resume one opcode early (re-running
                 // `goto_if_not`) and desync the decoded box layout.
-                if kept_stack {
-                    BRANCH_GUARD_JITCODE_PC.with(|c| c.set(op.pc));
-                    // Feed the snapshot encoder the SAME resolved set the gate
-                    // checked (resolved above, before `record_guard`): each
-                    // `(dst, live guard value)`, sources already filtered to
-                    // live in-range values.
-                    BRANCH_GUARD_KEPT_RECOVERED
-                        .with(|c| *c.borrow_mut() = resolved_recovered.unwrap_or_default());
-                }
-                let capture = walker_capture_snapshot_for_last_guard(ctx, other_target);
-                BRANCH_GUARD_JITCODE_PC.with(|c| c.set(usize::MAX));
-                BRANCH_GUARD_KEPT_RECOVERED.with(|c| c.borrow_mut().clear());
-                capture?;
+                // Feed the snapshot encoder the SAME resolved set the gate
+                // checked (resolved above, before `record_guard`): each
+                // `(dst, live guard value)`, sources already filtered to live
+                // in-range values. Only a kept-stack guard publishes these
+                // inputs.
+                let kept = if kept_stack {
+                    resolved_recovered.unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                walker_capture_snapshot_for_last_guard_scoped(
+                    ctx,
+                    other_target,
+                    GuardCaptureScope {
+                        branch_guard_jitcode_pc: kept_stack.then_some(op.pc),
+                        branch_guard_kept_recovered: &kept,
+                        ..GuardCaptureScope::default()
+                    },
+                )?;
             }
             let next_pc = if switchcase != 0 { op.next_pc } else { target };
             Ok((DispatchOutcome::Continue, next_pc))
