@@ -12547,8 +12547,12 @@ fn bytearray_method_imul(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     let count = match crate::baseobjspace::int_w(w_index) {
         Ok(v) => v,
         Err(e) if e.kind == crate::PyErrorKind::OverflowError => {
-            return Err(crate::PyError::overflow_error(
-                "cannot fit 'int' into an index-sized integer",
+            return Err(crate::PyError::new(
+                crate::PyErrorKind::OverflowError,
+                format!(
+                    "cannot fit '{}' into an index-sized integer",
+                    crate::baseobjspace::object_functionstr_type_name(args[1])
+                ),
             ));
         }
         Err(e) => return Err(e),
