@@ -2796,6 +2796,15 @@ impl<S: JitState> JitDriver<S> {
                     self.meta_interp().staticdata.op_rvmprof_code,
                 );
                 let all_liveness = self.meta_interp().staticdata.liveness_info.as_slice();
+                // The state-field macro's `&state` is host-stack storage, so
+                // its identity may be folded out of the failing frame. Ask
+                // only an explicit host opt-in for the current call's address;
+                // heap virtualizables retain the live resume TAGBOX path.
+                let vable_identity_override = self.meta.virtualizable_info().and_then(|info| {
+                    state
+                        .blackhole_virtualizable_identity(&compiled_meta, &info.name, info)
+                        .map(|ptr| ptr as i64)
+                });
                 let bh = crate::resume::blackhole_from_resumedata(
                     &mut *bh_builder,
                     &resolve_jitcode,
@@ -2817,6 +2826,7 @@ impl<S: JitState> JitDriver<S> {
                         .virtualizable_info()
                         .map(|a| a.as_ref() as &dyn crate::resume::VirtualizableInfo),
                     None, // ginfo
+                    vable_identity_override,
                     allocator,
                 );
                 if let Some((mut bh, _vable_ptr)) = bh {
@@ -4883,6 +4893,13 @@ impl<S: JitState> JitDriver<S> {
                     self.meta_interp().staticdata.op_rvmprof_code,
                 );
                 let all_liveness = self.meta_interp().staticdata.liveness_info.as_slice();
+                // See `back_edge_internal`: only the macro state-field host
+                // opts in to this per-call host-stack identity source.
+                let vable_identity_override = self.meta.virtualizable_info().and_then(|info| {
+                    state
+                        .blackhole_virtualizable_identity(&meta, &info.name, info)
+                        .map(|ptr| ptr as i64)
+                });
                 let bh = crate::resume::blackhole_from_resumedata(
                     &mut *bh_builder,
                     &resolve_jitcode,
@@ -4904,6 +4921,7 @@ impl<S: JitState> JitDriver<S> {
                         .virtualizable_info()
                         .map(|a| a.as_ref() as &dyn crate::resume::VirtualizableInfo),
                     None, // ginfo
+                    vable_identity_override,
                     allocator,
                 );
                 if let Some((mut bh, _vable_ptr)) = bh {

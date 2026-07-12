@@ -504,6 +504,24 @@ pub trait JitState: Sized {
         None
     }
 
+    /// Per-call virtualizable identity for blackhole resume when the host
+    /// keeps its virtualizable in stack storage rather than in a JIT failarg.
+    ///
+    /// RPython's virtualizable is a red input, so resume data always obtains
+    /// this value from its TAGBOX. The state-field macro JIT instead has a
+    /// host-stack `&state`: its loop-invariant identity can be folded out of
+    /// the backend's failargs. That host opts in here and supplies the current
+    /// call's address at deopt entry. Heap virtualizables deliberately keep
+    /// the default so their TAGBOX remains the source of truth.
+    fn blackhole_virtualizable_identity(
+        &self,
+        _meta: &Self::Meta,
+        _virtualizable: &str,
+        _info: &VirtualizableInfo,
+    ) -> Option<*mut u8> {
+        None
+    }
+
     fn virtualizable_array_lengths(
         &self,
         _meta: &Self::Meta,
