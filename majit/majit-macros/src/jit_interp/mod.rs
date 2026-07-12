@@ -414,6 +414,10 @@ pub(crate) enum CallPolicyKind {
     ElidableIntOrMemerror,
     ElidableIntOrMemerrorWrapped,
     ResidualRef,
+    /// Like `ResidualRef` but stamps the descr EffectInfo with
+    /// `PyreHelperKind::NurseryAlloc` (aheui inline nursery bump). Result is a
+    /// real escaping Ref — no virtualization.
+    NurseryAllocRef,
     ResidualRefWrapped,
     /// `EF_CANNOT_RAISE` for ref-returning residual helpers.
     /// Mirrors `ResidualIntCannotRaiseWrapped`; the unwrapped variant
@@ -493,6 +497,7 @@ pub(crate) fn parse_call_policy_kind(kind: &Ident) -> Option<CallPolicyKind> {
         "elidable_int_or_memerror" => CallPolicyKind::ElidableIntOrMemerror,
         "elidable_int_or_memerror_wrapped" => CallPolicyKind::ElidableIntOrMemerrorWrapped,
         "residual_ref" => CallPolicyKind::ResidualRef,
+        "nursery_alloc_ref" => CallPolicyKind::NurseryAllocRef,
         "residual_ref_wrapped" => CallPolicyKind::ResidualRefWrapped,
         "residual_ref_cannot_raise_wrapped" => CallPolicyKind::ResidualRefCannotRaiseWrapped,
         "may_force_ref_wrapped" => CallPolicyKind::MayForceRefWrapped,

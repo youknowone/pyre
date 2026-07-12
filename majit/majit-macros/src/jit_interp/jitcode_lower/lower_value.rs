@@ -756,6 +756,45 @@ impl<'c> Lowerer<'c> {
                         struct_type,
                     });
                 }
+                crate::jit_interp::CallPolicyKind::NurseryAllocRef => {
+                    let typed_args = typed_call_arg_tokens(&arg_bindings);
+                    let reg = self.alloc_reg();
+                    let __arg_regs: Vec<Register> =
+                        arg_bindings.iter().map(Register::from_binding).collect();
+                    self.emit_op(
+                        OpMeta::linear(OpKind::Call, __arg_regs, vec![Register::ref_(reg)]),
+                        quote! {
+                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                            let __typed_args = #typed_args;
+                            __builder.residual_call_ref_canonical_via_target_with_effect_info(__fn_idx, __typed_args, #reg, majit_metainterp::nursery_alloc_effect_info());
+                        },
+                    );
+                    // jtransform.py:467-470 — a residual ref call can raise, so
+                    // the trailing `-live-` follows it exactly as the shared
+                    // path below emits for the other explicit residual arms.
+                    // This arm returns early (to attach `struct_type`), so it
+                    // cannot fall through to that shared emission and must emit
+                    // the marker itself.
+                    if post_live_after_call {
+                        self.emit_op(
+                            OpMeta::live_marker(),
+                            quote! { let _ = __builder.live_placeholder(); },
+                        );
+                    }
+                    // Check `call_returns` config for a declared return
+                    // struct type, enabling subsequent `result.field`
+                    // access to resolve through `ref_fields`.
+                    let func_segments = canonical_expr_segments(func);
+                    let struct_type = func_segments.and_then(|segs| {
+                        self.config.and_then(|c| c.call_returns.get(&segs).cloned())
+                    });
+                    return Some(Binding {
+                        reg,
+                        kind: BindingKind::Ref,
+                        depends_on_stack: false,
+                        struct_type,
+                    });
+                }
                 crate::jit_interp::CallPolicyKind::ResidualIntWrapped
                 | crate::jit_interp::CallPolicyKind::ResidualIntCannotRaiseWrapped
                 | crate::jit_interp::CallPolicyKind::MayForceIntWrapped

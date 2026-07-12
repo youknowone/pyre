@@ -90,6 +90,7 @@ pub use call_descr::{
     make_call_assembler_descr, make_call_assembler_descr_by_number,
     make_call_assembler_descr_with_vable, make_call_assembler_descr_with_vable_by_number,
     make_call_descr, make_call_descr_from_target_slot, make_call_descr_with_effect,
+    nursery_alloc_effect_info,
 };
 pub use compile::{make_fail_descr, make_fail_descr_typed, make_finish_fail_descr_typed};
 pub use io_buffer::{

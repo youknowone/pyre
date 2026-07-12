@@ -667,6 +667,13 @@ pub enum PyreHelperKind {
     /// `__getattribute__`, data descriptor, unboxed slot, attribute absent from
     /// this instance's map).
     LoadAttr,
+    /// aheui headerless-Node nursery allocation (`jit_alloc_node(value,next)`).
+    /// The dynasm backend recognises this tag on the CallR descr to emit an
+    /// inline nursery bump (RPython malloc_cond shape) instead of a full
+    /// residual `blr`; the node stays a real escaping alloc result (NOT a
+    /// virtualized New), so the following `selected_ref.head = new_node`
+    /// remains a normal committed setfield. has_oopspec stays false.
+    NurseryAlloc,
 }
 
 impl EffectInfo {

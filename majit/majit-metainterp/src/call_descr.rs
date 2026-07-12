@@ -186,6 +186,17 @@ pub fn default_effect_info() -> EffectInfo {
     EffectInfo::const_new(ExtraEffect::CanRaise, OopSpecIndex::None)
 }
 
+/// aheui nursery-alloc residual: identical optimizer treatment to
+/// [`default_effect_info`] (CanRaise, empty write-sets, can_collect=true)
+/// but stamped with [`PyreHelperKind::NurseryAlloc`] so the dynasm CallR
+/// genop emits an inline nursery bump. The tag does not change effect
+/// analysis — the op is forced/fenced exactly like the current residual.
+pub fn nursery_alloc_effect_info() -> EffectInfo {
+    let mut ei = default_effect_info();
+    ei.pyre_helper = PyreHelperKind::NurseryAlloc;
+    ei
+}
+
 /// `EF_CANNOT_RAISE` analyzer-absent fallback — the `call.py:303
 /// else:` row of `call.py:282-303 getcalldescr` selected when
 /// `self._canraise(op) == False`, fed through

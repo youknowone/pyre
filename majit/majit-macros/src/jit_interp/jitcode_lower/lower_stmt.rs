@@ -1429,6 +1429,20 @@ impl<'c> Lowerer<'c> {
                         },
                     );
                 }
+                crate::jit_interp::CallPolicyKind::NurseryAllocRef => {
+                    let typed_args = typed_call_arg_tokens(&arg_bindings);
+                    let throwaway_reg = self.alloc_reg();
+                    let __arg_regs: Vec<Register> =
+                        arg_bindings.iter().map(Register::from_binding).collect();
+                    self.emit_op(
+                        OpMeta::linear(OpKind::Call, __arg_regs, vec![Register::ref_(throwaway_reg)]),
+                        quote! {
+                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                            let __typed_args = #typed_args;
+                            __builder.residual_call_ref_canonical_via_target_with_effect_info(__fn_idx, __typed_args, #throwaway_reg, majit_metainterp::nursery_alloc_effect_info());
+                        },
+                    );
+                }
                 // Wrapped Int / Ref / Float statement-form: result discarded,
                 // but the residual_call must still execute the side effect on
                 // the compiled trace.  RPython jtransform.py:456
