@@ -1521,8 +1521,12 @@ impl MIFrame {
                         self.loop_close_marker_jit_pc
                             .filter(|_| crate::jitcode_dispatch::m73_lclive_carry_enabled())
                     })
-                    .or_else(|| jc.payload.resume_jitcode_pc_for(live_pc))
-                {
+                    .or_else(|| {
+                        if crate::jitcode_dispatch::m73_translate_census_enabled() {
+                            eprintln!("M73_TRANSLATE site=lclive-legacy py_pc={live_pc}");
+                        }
+                        jc.payload.resume_jitcode_pc_for(live_pc)
+                    }) {
                     Some(jit_pc) => Some(jit_pc),
                     None => {
                         // This (parent) frame reports a `live_pc` the jitcode

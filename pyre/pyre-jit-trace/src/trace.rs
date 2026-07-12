@@ -891,6 +891,7 @@ fn dispatch_perfn_frame(
 /// the runtime `resume_jitcode_pc_for` derivation supplied by `derived`.
 /// Gated by `PYRE_M73_ENTRY_CARRY` (off → derivation only); the audit gate
 /// censuses carried-vs-derived disagreements as `M73EntryAudit::RecipeMismatch`.
+/// Under `PYRE_M73_ENTRY_DECLINE`, entry-carry failures decline instead of deriving.
 fn select_recipe_entry(
     jitcode_index: i32,
     body_index: i32,
@@ -925,7 +926,14 @@ fn select_recipe_entry(
         }
     }
     if crate::jitcode_dispatch::m73_entry_carry_enabled() {
-        carried.or_else(derived)
+        if crate::jitcode_dispatch::m73_entry_decline_enabled() {
+            // p5-s3: carried-only. A failed carried resolution aborts/declines
+            // at the caller (each `select_recipe_entry` caller routes `None`
+            // to a graceful abort), instead of re-deriving from py_pc.
+            carried
+        } else {
+            carried.or_else(derived)
+        }
     } else {
         derived()
     }
@@ -1024,7 +1032,12 @@ fn drive_bridge_carrier_walk(
         callee_pjc.jitcode.index() as i32,
         recipe.pc,
         recipe.jitcode_pc,
-        || callee_pjc.resume_jitcode_pc_for(recipe.pc),
+        || {
+            if crate::jitcode_dispatch::m73_translate_census_enabled() {
+                eprintln!("M73_TRANSLATE site=recipe-derived py_pc={}", recipe.pc);
+            }
+            callee_pjc.resume_jitcode_pc_for(recipe.pc)
+        },
         format_args!(
             "jitcode_index={} pc={} jitcode_pc={}",
             recipe.jitcode_index, recipe.pc, recipe.jitcode_pc
@@ -1189,7 +1202,12 @@ fn drive_bridge_framestack_walk(
         callee_pjc.jitcode.index() as i32,
         recipe.pc,
         recipe.jitcode_pc,
-        || callee_pjc.resume_jitcode_pc_for(recipe.pc),
+        || {
+            if crate::jitcode_dispatch::m73_translate_census_enabled() {
+                eprintln!("M73_TRANSLATE site=recipe-derived py_pc={}", recipe.pc);
+            }
+            callee_pjc.resume_jitcode_pc_for(recipe.pc)
+        },
         format_args!(
             "jitcode_index={} pc={} jitcode_pc={}",
             recipe.jitcode_index, recipe.pc, recipe.jitcode_pc
@@ -1323,7 +1341,12 @@ fn drive_outer_continuation_and_map(
         root_pjc.jitcode.index() as i32,
         root_pc,
         root_jitcode_pc,
-        || root_pjc.resume_jitcode_pc_for(root_pc),
+        || {
+            if crate::jitcode_dispatch::m73_translate_census_enabled() {
+                eprintln!("M73_TRANSLATE site=recipe-derived py_pc={root_pc}");
+            }
+            root_pjc.resume_jitcode_pc_for(root_pc)
+        },
         format_args!("root pc={root_pc} jitcode_pc={root_jitcode_pc}"),
     )?;
     // Decode the call-dst register: the op whose `next_pc == entry` is the
@@ -1491,8 +1514,8 @@ fn run_perfn_walk(
         // Bridge resume: `start_pc` is the guard's py_pc, not a loop-header
         // green — outside the sidecar by construction. The carried coordinate
         // for this leg is `sym.bridge_walk_entry_pc` (used below when present);
-        // retiring this residual derivation needs the carried `frame0.jitcode_pc`
-        // generalized to every bridge resume, a separate #73 front.
+        // under `PYRE_M73_ENTRY_DECLINE` the residual derivation is
+        // decline-converted, and only opt-out states reach it.
         if crate::jitcode_dispatch::m73_entry_audit_enabled() {
             crate::jitcode_dispatch::census_record("M73EntryAudit::EntryDerivedTaken");
             eprintln!(
@@ -1500,7 +1523,17 @@ fn run_perfn_walk(
                 ctx.is_bridge_trace, carry
             );
         }
-        pjc.resume_jitcode_pc_for(start_pc)
+        if carry && crate::jitcode_dispatch::m73_entry_decline_enabled() {
+            // p5-s3: under entry-carry this leg is certified unreached
+            // (EntryDerivedTaken = 0 corpus-wide); route it to the existing
+            // `fbw_decline` below instead of the py_pc translation.
+            None
+        } else {
+            if crate::jitcode_dispatch::m73_translate_census_enabled() {
+                eprintln!("M73_TRANSLATE site=entry-derived py_pc={start_pc}");
+            }
+            pjc.resume_jitcode_pc_for(start_pc)
+        }
     };
     let Some(pc_map_entry) = pc_map_entry else {
         // The frozen pc_map of this already-built body does not encode

@@ -9597,6 +9597,14 @@ pub(crate) fn m73_entry_audit_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_M73_ENTRY_AUDIT").is_some())
 }
 
+/// #73 S5 p5-s5: terminal call census for `resume_jitcode_pc_for` — counts
+/// every remaining runtime entry into the translation so the deletion scope
+/// can be certified by a corpus sweep. Pure eprintln; off in production.
+pub(crate) fn m73_translate_census_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_M73_TRANSLATE_CENSUS").is_some())
+}
+
 /// `PYRE_M73_MARKER_AUDIT` (#73 S5 phase-0, default OFF): compare the
 /// codewrite-time jitcode-keyed resume-marker twin with runtime derivation.
 pub(crate) fn m73_marker_audit_enabled() -> bool {
@@ -9777,6 +9785,24 @@ pub(crate) fn m73_armarker_carry_enabled() -> bool {
 pub(crate) fn m73_entry_carry_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M73_ENTRY_CARRY") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => true,
+    })
+}
+
+/// #73 S5 p5-s3: decline-convert the entry/recipe derived legs — under
+/// entry-carry, a walk entry whose carried resolution fails DECLINES the
+/// walk instead of falling back to the `resume_jitcode_pc_for` translation.
+/// Certified by the p4 entry census: `RecipeDerivedTaken` /
+/// `EntryDerivedTaken` / `RecipeMismatch` / `BridgeNoCarry` all 0 across the
+/// 151-program corpus, so the retired fallback leg is unreached and the flip
+/// is byte-identical. Default ON; `PYRE_M73_ENTRY_DECLINE=0` opts out.
+pub(crate) fn m73_entry_decline_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M73_ENTRY_DECLINE") {
         Some(v) => {
             let v = v.to_string_lossy();
             v != "0" && !v.eq_ignore_ascii_case("false")
@@ -11203,6 +11229,9 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 // twin-`None` overshoot rows (0 across the certified corpus),
                 // so the carried path no longer calls `resume_jitcode_pc_for`.
                 let legacy_marker = || unsafe {
+                    if m73_translate_census_enabled() {
+                        eprintln!("M73_TRANSLATE site=arm2-legacy py_pc={py_pc}");
+                    }
                     (&*sym.jitcode)
                         .payload
                         .resume_jitcode_pc_for(py_pc as usize)
@@ -11650,7 +11679,12 @@ fn walker_capture_snapshot_for_last_guard_impl(
                             // #73 S5 phase-5 slice-4: translation evaluated
                             // lazily — under the (default-ON) twin carry it
                             // runs only for twin-`None` overshoot rows.
-                            let legacy = || jc.payload.resume_jitcode_pc_for(py_pc as usize);
+                            let legacy = || {
+                                if m73_translate_census_enabled() {
+                                    eprintln!("M73_TRANSLATE site=arm3-legacy py_pc={py_pc}");
+                                }
+                                jc.payload.resume_jitcode_pc_for(py_pc as usize)
+                            };
                             if m73_marker_audit_enabled() {
                                 let twin = jc.payload.after_residual_marker_for_jitcode_pc(op_pc);
                                 match legacy() {

@@ -553,6 +553,9 @@ impl PyJitCode {
     /// offset now derives from the two surviving exact tables plus the
     /// sparse `carryfwd_resume_pc` sidecar.
     pub fn resume_jitcode_pc_for(&self, py_pc: usize) -> Option<usize> {
+        if crate::jitcode_dispatch::m73_translate_census_enabled() {
+            eprintln!("M73_TRANSLATE site=fn py_pc={py_pc}");
+        }
         // The sparse sidecar takes precedence: it captures exactly the PCs
         // whose dense marker the on-demand derivation cannot reproduce
         // (uncond-jump forward-carry to a jump target, can-raise / branch
@@ -748,6 +751,9 @@ impl PyJitCode {
         if after_residual_call {
             self.after_residual_call_resume_pc_for(py_pc as usize)
         } else {
+            if crate::jitcode_dispatch::m73_translate_census_enabled() {
+                eprintln!("M73_TRANSLATE site=decode py_pc={py_pc}");
+            }
             self.resume_jitcode_pc_for(py_pc as usize)
         }
     }
