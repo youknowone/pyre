@@ -2162,6 +2162,10 @@ pub enum BridgeResolution {
     /// post-walk state.  The caller returns this value directly instead of
     /// rewinding the live frame and re-running the region (#177).
     Finished(pyre_jit_trace::state::ConcreteValue),
+    /// The single-frame bridge walk ended in an uncaught raise; hand its
+    /// concrete exception to the guard's portal as
+    /// `ExitFrameWithExceptionRef` (jitexc.py:44).
+    FinishedException(pyre_jit_trace::state::ConcreteValue),
 }
 
 /// Map the legacy bool bridge outcome (`true` = continue in compiled code,
@@ -2535,23 +2539,36 @@ pub fn trace_and_compile_from_bridge(
     // `pyjitpl.py:2841` `interpret()` raising `DoneWithThisFrame` from the
     // post-walk state.  Always take (not peek) so a kept stash cannot leak
     // into a later top-level portal `fbw_finish_concrete_take`.
-    if let Some(cv) = pyre_jit_trace::jitcode_dispatch::fbw_finish_concrete_take() {
-        // `bridge_noreplay_armed` folds in `!is_multiframe_resume`, so a kept
-        // stash implies a single real live PyFrame: the `Terminate` is the
-        // live frame's function return, about to be popped by its caller with
-        // `cv`.  No rewind, no blackhole.
-        debug_assert!(
-            !is_multiframe_resume,
-            "bridge Terminate no-replay stash kept for a multiframe resume \
-             (frames={num_resume_frames})"
-        );
-        if majit_metainterp::majit_log_enabled() {
-            eprintln!(
-                "[jit][bridge-trace] finish-noreplay at resume_pc={} key={}",
-                resume_pc, green_key
+    match pyre_jit_trace::jitcode_dispatch::fbw_finish_concrete_take() {
+        Some(pyre_jit_trace::jitcode_dispatch::FinishConcrete::Return(cv)) => {
+            // `bridge_noreplay_armed` folds in `!is_multiframe_resume`, so a kept
+            // stash implies a single real live PyFrame: the `Terminate` is the
+            // live frame's function return, about to be popped by its caller with
+            // `cv`.  No rewind, no blackhole.
+            debug_assert!(
+                !is_multiframe_resume,
+                "bridge Terminate no-replay stash kept for a multiframe resume \
+                 (frames={num_resume_frames})"
             );
+            if majit_metainterp::majit_log_enabled() {
+                eprintln!(
+                    "[jit][bridge-trace] finish-noreplay at resume_pc={} key={}",
+                    resume_pc, green_key
+                );
+            }
+            return BridgeResolution::Finished(cv);
         }
-        return BridgeResolution::Finished(cv);
+        Some(pyre_jit_trace::jitcode_dispatch::FinishConcrete::Raise(cv)) => {
+            debug_assert!(
+                !is_multiframe_resume,
+                "bridge Terminate no-replay raise kept for a multiframe resume \
+                 (frames={num_resume_frames})"
+            );
+            // jitexc.py:44: hand the walk's uncaught exception to the
+            // guard's portal as ExitFrameWithExceptionRef.
+            return BridgeResolution::FinishedException(cv);
+        }
+        None => {}
     }
     if !adopted_walk_end_state {
         frame.restore_resume_state_from(&resume_state);
@@ -2767,11 +2784,11 @@ fn jit_ca_handle_guard_failure(
             BridgeResolution::ResumeBlackhole => false,
             // Unreachable: the shortcut is disarmed for this caller
             // (`allow_finish_direct_return = false`), so the walk never keeps
-            // a finish-concrete stash and never returns `Finished`.
-            BridgeResolution::Finished(_) => {
+            // a finish-concrete stash and never returns a terminal variant.
+            BridgeResolution::Finished(_) | BridgeResolution::FinishedException(_) => {
                 debug_assert!(
                     false,
-                    "CALL_ASSEMBLER bridge returned Finished despite disarm"
+                    "CALL_ASSEMBLER bridge returned a terminal no-replay result despite disarm"
                 );
                 false
             }

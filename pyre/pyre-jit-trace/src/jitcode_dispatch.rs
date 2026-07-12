@@ -1625,6 +1625,11 @@ pub fn walk(
                     // last_exc_box)` records the outermost FINISH.
                     ctx.trace_ctx
                         .finish(&[exc], ctx.exit_frame_with_exception_descr_ref.clone());
+                    if let ConcreteValue::Ref(p) = exc_concrete {
+                        if !p.is_null() {
+                            fbw_finish_raise_set(exc_concrete);
+                        }
+                    }
                     return Ok((DispatchOutcome::Terminate, pc));
                 } else {
                     return Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, pc));
@@ -7560,11 +7565,11 @@ thread_local! {
     static FBW_FINISH_PAYLOAD: std::cell::Cell<Option<(OpRef, Type)>> =
         const { std::cell::Cell::new(None) };
 
-    /// The CONCRETE return value a top-level `*_return` arm produced, set
-    /// alongside [`FBW_FINISH_PAYLOAD`] for a loop-free portal exit
-    /// (`DispatchOutcome::Terminate`).  Unlike `FBW_FINISH_PAYLOAD` (the
-    /// symbolic re-boxed `OpRef` the compile consumer records into the
-    /// trace), this holds the value the walk *concretely* computed.
+    /// The terminal disposition a top-level walk produced, set for a
+    /// loop-free portal exit (`DispatchOutcome::Terminate`).  Unlike
+    /// `FBW_FINISH_PAYLOAD` (the symbolic re-boxed `OpRef` the compile
+    /// consumer records into the trace), this holds the value the walk
+    /// *concretely* computed.
     ///
     /// A function trace that fully unrolls to `done_with_this_frame`
     /// executed every residual call concretely (consuming side-effecting
@@ -7580,7 +7585,7 @@ thread_local! {
     /// via [`fbw_finish_concrete_root_walker`].  `None` for ungated /
     /// loop-closing / float (no concrete float shadow bank) walks → the
     /// portal degrades to the legacy `ContinueRunningNormally` replay.
-    static FBW_FINISH_CONCRETE: std::cell::Cell<Option<ConcreteValue>> =
+    static FBW_FINISH_CONCRETE: std::cell::Cell<Option<FinishConcrete>> =
         const { std::cell::Cell::new(None) };
 
     /// Armed by the bridge tracer (`call_jit::trace_and_compile_from_bridge`)
@@ -7596,6 +7601,19 @@ thread_local! {
     /// committed journal never strands into a blackhole re-run.  Cleared after
     /// every bridge walk.
     static FBW_BRIDGE_NOREPLAY_ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Terminal disposition of a walk kept for the no-replay exit:
+/// the top-level frame's concrete return value, or the concrete
+/// exception object of the uncaught raise that ended the walk
+/// (`opimpl_raise` → `finishframe_exception` →
+/// `compile_exit_frame_with_exception`, pyjitpl.py:1688-1698 +
+/// 3238-3242; the caller consumes it as `ExitFrameWithExceptionRef`,
+/// jitexc.py:44).
+#[derive(Clone, Copy)]
+pub enum FinishConcrete {
+    Return(ConcreteValue),
+    Raise(ConcreteValue),
 }
 
 /// Whether the slice-b Finish-portal compile route is enabled.  Cached so
@@ -7659,17 +7677,22 @@ pub(crate) fn fbw_finish_payload_take() -> Option<(OpRef, Type)> {
 /// Stash the concrete return value of a top-level value-returning
 /// `*_return` arm (see [`FBW_FINISH_CONCRETE`]).
 pub(crate) fn fbw_finish_concrete_set(value: ConcreteValue) {
-    FBW_FINISH_CONCRETE.with(|c| c.set(Some(value)));
+    FBW_FINISH_CONCRETE.with(|c| c.set(Some(FinishConcrete::Return(value))));
 }
 
-/// Peek at the stashed concrete return value without consuming it (the
+/// Stash the concrete exception object of a top-level uncaught raise.
+pub(crate) fn fbw_finish_raise_set(value: ConcreteValue) {
+    FBW_FINISH_CONCRETE.with(|c| c.set(Some(FinishConcrete::Raise(value))));
+}
+
+/// Peek at the stashed terminal disposition without consuming it (the
 /// `run_perfn_walk` epilogue uses this to decide whether to commit the
 /// store journal and keep the no-replay shortcut).
-pub(crate) fn fbw_finish_concrete_peek() -> Option<ConcreteValue> {
+pub(crate) fn fbw_finish_concrete_peek() -> Option<FinishConcrete> {
     FBW_FINISH_CONCRETE.with(|c| c.get())
 }
 
-/// Clear the stashed concrete return value.  The `run_perfn_walk`
+/// Clear the stashed terminal disposition.  The `run_perfn_walk`
 /// epilogue calls this when the no-replay shortcut is declined (not a
 /// `Terminate` walk, or an unjournaled effect only the replay applies) so
 /// the portal degrades to `ContinueRunningNormally`.
@@ -7677,13 +7700,12 @@ pub(crate) fn fbw_finish_concrete_reset() {
     FBW_FINISH_CONCRETE.with(|c| c.set(None));
 }
 
-/// Consume the stashed concrete return value (the portal exit in
-/// `eval.rs` takes it to return the walk's result directly).
-pub fn fbw_finish_concrete_take() -> Option<ConcreteValue> {
+/// Consume the stashed terminal disposition at the portal exit.
+pub fn fbw_finish_concrete_take() -> Option<FinishConcrete> {
     FBW_FINISH_CONCRETE.with(|c| c.take())
 }
 
-/// `framework.py root_walker.walk_roots` parity for the concrete return
+/// `framework.py root_walker.walk_roots` parity for the concrete terminal
 /// value: a `Ref` payload holds a nursery-resident object across the
 /// post-walk compile (which allocates and may trigger a minor collection
 /// that moves nursery objects), so the slot is forwarded as a root.
@@ -7691,14 +7713,24 @@ pub fn fbw_finish_concrete_take() -> Option<ConcreteValue> {
 /// [`fbw_store_journal_root_walker`].
 pub fn fbw_finish_concrete_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     FBW_FINISH_CONCRETE.with(|c| {
-        if let Some(ConcreteValue::Ref(ptr)) = c.get() {
+        let Some(finish) = c.get() else {
+            return;
+        };
+        let (value, is_raise) = match finish {
+            FinishConcrete::Return(value) => (value, false),
+            FinishConcrete::Raise(value) => (value, true),
+        };
+        if let ConcreteValue::Ref(ptr) = value {
             let mut gcref = majit_ir::GcRef(ptr as usize);
             visitor(&mut gcref);
             // The visitor may forward (relocate) the ref; write it back so
             // the stashed value points at the moved object.
-            c.set(Some(ConcreteValue::Ref(
-                gcref.0 as pyre_object::PyObjectRef,
-            )));
+            let value = ConcreteValue::Ref(gcref.0 as pyre_object::PyObjectRef);
+            c.set(Some(if is_raise {
+                FinishConcrete::Raise(value)
+            } else {
+                FinishConcrete::Return(value)
+            }));
         }
     });
 }
@@ -22207,6 +22239,11 @@ fn handle(
             if ctx.is_top_level && !fbw_raise_enabled() {
                 ctx.trace_ctx
                     .finish(&[exc], ctx.exit_frame_with_exception_descr_ref.clone());
+                if let ConcreteValue::Ref(p) = concrete_exc {
+                    if !p.is_null() {
+                        fbw_finish_raise_set(concrete_exc);
+                    }
+                }
                 Ok((DispatchOutcome::Terminate, op.next_pc))
             } else {
                 Ok((
@@ -22338,6 +22375,11 @@ fn handle(
             if ctx.is_top_level && !fbw_raise_enabled() {
                 ctx.trace_ctx
                     .finish(&[exc], ctx.exit_frame_with_exception_descr_ref.clone());
+                if let ConcreteValue::Ref(p) = ctx.last_exc_value_concrete {
+                    if !p.is_null() {
+                        fbw_finish_raise_set(ctx.last_exc_value_concrete);
+                    }
+                }
                 Ok((DispatchOutcome::Terminate, op.next_pc))
             } else {
                 Ok((

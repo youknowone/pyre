@@ -14,7 +14,7 @@ use pyre_interpreter::PyExecutionContext;
 use pyre_interpreter::executioncontext::ActionFlagOps;
 use pyre_interpreter::pyframe::PyFrame;
 use pyre_interpreter::{
-    PyResult, StepResult, decode_instruction_for_dispatch, execute_opcode_step,
+    PyError, PyResult, StepResult, decode_instruction_for_dispatch, execute_opcode_step,
 };
 use std::cell::{Cell, UnsafeCell};
 use std::collections::HashMap;
@@ -4728,14 +4728,20 @@ fn jit_merge_point_hook(
             // walk already consumed (a side-effecting residual ran once) and
             // deopt; the compiled trace serves only subsequent invocations.
             // No capture → the legacy ContinueRunningNormally replay.
-            if let Some(cv) = pyre_jit_trace::jitcode_dispatch::fbw_finish_concrete_take() {
-                let result = match cv {
-                    // A void return stashes `Null`, i.e. Python `None`
-                    // (`ConcreteValue::to_pyobj` would map it to PY_NULL).
-                    pyre_jit_trace::state::ConcreteValue::Null => w_none(),
-                    other => other.to_pyobj(),
-                };
-                return Some(LoopResult::Done(Ok(result)));
+            match pyre_jit_trace::jitcode_dispatch::fbw_finish_concrete_take() {
+                Some(pyre_jit_trace::jitcode_dispatch::FinishConcrete::Return(cv)) => {
+                    let result = match cv {
+                        // A void return stashes `Null`, i.e. Python `None`
+                        // (`ConcreteValue::to_pyobj` would map it to PY_NULL).
+                        pyre_jit_trace::state::ConcreteValue::Null => w_none(),
+                        other => other.to_pyobj(),
+                    };
+                    return Some(LoopResult::Done(Ok(result)));
+                }
+                Some(pyre_jit_trace::jitcode_dispatch::FinishConcrete::Raise(cv)) => {
+                    return Some(LoopResult::Done(Err(finish_concrete_raise_error(cv))));
+                }
+                None => {}
             }
             return Some(LoopResult::ContinueRunningNormally);
         }
@@ -4880,11 +4886,21 @@ impl Drop for GuardCompilingScope {
     }
 }
 
-/// compile.py:701-717 handle_fail outcome.
+/// Build the exception result the same way as blackhole.py:1679-1682
+/// `_exit_frame_with_exception`.
+fn finish_concrete_raise_error(value: pyre_jit_trace::state::ConcreteValue) -> PyError {
+    let pyre_jit_trace::state::ConcreteValue::Ref(exc_ref) = value else {
+        unreachable!("FinishConcrete::Raise must hold a concrete Ref")
+    };
+    debug_assert!(!exc_ref.is_null());
+    // blackhole.py:1679-1682 constructs ExitFrameWithExceptionRef directly
+    // from the uncaught exception object and leaves the exception latches as-is.
+    unsafe { PyError::from_exc_object(exc_ref) }
+}
+
 /// compile.py:701-717: handle_fail NEVER returns in RPython — it raises
 /// ContinueRunningNormally or DoneWithThisFrame. In pyre, we return the
 /// equivalent BlackholeResult.
-/// compile.py:701-717 handle_fail outcome.
 enum HandleFailOutcome {
     /// Bridge compiled successfully — continue in compiled code.
     BridgeCompiled,
@@ -4895,6 +4911,9 @@ enum HandleFailOutcome {
     /// raising `DoneWithThisFrame`).  Return it directly instead of
     /// rewinding + re-running the region (#177).
     BridgeFinished(pyre_object::PyObjectRef),
+    /// The bridge walk ended in an uncaught raise; propagate the same
+    /// `PyError` as `ExitFrameWithExceptionRef` (jitexc.py:44).
+    BridgeRaised(PyError),
 }
 
 /// compile.py:701-717 handle_fail.
@@ -4970,6 +4989,9 @@ fn handle_fail(
                         other => other.to_pyobj(),
                     };
                     return HandleFailOutcome::BridgeFinished(v);
+                }
+                crate::call_jit::BridgeResolution::FinishedException(cv) => {
+                    return HandleFailOutcome::BridgeRaised(finish_concrete_raise_error(cv));
                 }
                 crate::call_jit::BridgeResolution::ResumeBlackhole => {}
             }
@@ -5283,6 +5305,7 @@ fn execute_assembler(
                 HandleFailOutcome::BridgeCompiled => Some(LoopResult::ContinueRunningNormally),
                 // #177: single-frame bridge walk returned a concrete Finish.
                 HandleFailOutcome::BridgeFinished(v) => Some(LoopResult::Done(Ok(v))),
+                HandleFailOutcome::BridgeRaised(err) => Some(LoopResult::Done(Err(err))),
                 HandleFailOutcome::ResumeInBlackhole => {
                     // compile.py:710-716 / pyjitpl.py:2906 SwitchToBlackhole
                     let bh_result =
@@ -5529,13 +5552,19 @@ fn bound_reached(
                 // (the same continuation as the `jit_merge_point_hook`
                 // tracing site).
                 deliver_inflight_foriter_item(frame_root.frame());
-                if let Some(cv) = pyre_jit_trace::jitcode_dispatch::fbw_finish_concrete_take() {
-                    let result = match cv {
-                        // A void return stashes `Null`, i.e. Python `None`.
-                        pyre_jit_trace::state::ConcreteValue::Null => w_none(),
-                        other => other.to_pyobj(),
-                    };
-                    return Some(LoopResult::Done(Ok(result)));
+                match pyre_jit_trace::jitcode_dispatch::fbw_finish_concrete_take() {
+                    Some(pyre_jit_trace::jitcode_dispatch::FinishConcrete::Return(cv)) => {
+                        let result = match cv {
+                            // A void return stashes `Null`, i.e. Python `None`.
+                            pyre_jit_trace::state::ConcreteValue::Null => w_none(),
+                            other => other.to_pyobj(),
+                        };
+                        return Some(LoopResult::Done(Ok(result)));
+                    }
+                    Some(pyre_jit_trace::jitcode_dispatch::FinishConcrete::Raise(cv)) => {
+                        return Some(LoopResult::Done(Err(finish_concrete_raise_error(cv))));
+                    }
+                    None => {}
                 }
                 return Some(LoopResult::ContinueRunningNormally);
             }
@@ -5586,6 +5615,9 @@ fn bound_reached(
                 // #177: single-frame bridge walk returned a concrete Finish.
                 HandleFailOutcome::BridgeFinished(v) => {
                     return Some(LoopResult::Done(Ok(v)));
+                }
+                HandleFailOutcome::BridgeRaised(err) => {
+                    return Some(LoopResult::Done(Err(err)));
                 }
                 HandleFailOutcome::ResumeInBlackhole => {
                     let bh_result =
@@ -5774,6 +5806,9 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                 // This site returns `Option<PyResult>` (not `LoopResult`).
                 HandleFailOutcome::BridgeFinished(v) => {
                     return Some(Ok(v));
+                }
+                HandleFailOutcome::BridgeRaised(err) => {
+                    return Some(Err(err));
                 }
                 HandleFailOutcome::ResumeInBlackhole => {
                     let bh_result =
