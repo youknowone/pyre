@@ -3069,7 +3069,6 @@ impl<'a> AssemblerARM64<'a> {
             // before the call, use the existing frame-slot genop_call, then
             // mark the result in the allocated register.
             OpCode::CallI
-            | OpCode::CallR
             | OpCode::CallF
             | OpCode::CallN
             | OpCode::CallPureI
@@ -3088,6 +3087,15 @@ impl<'a> AssemblerARM64<'a> {
             | OpCode::CallReleaseGilF
             | OpCode::CallReleaseGilN => {
                 self.genop_call_with_arglocs(op, arglocs);
+            }
+            OpCode::CallR => {
+                let is_nursery_alloc = op.with_call_descr(|cd| cd.get_extra_info().pyre_helper)
+                    == Some(majit_ir::PyreHelperKind::NurseryAlloc);
+                if is_nursery_alloc {
+                    self.genop_nursery_alloc_inline(op, arglocs);
+                } else {
+                    self.genop_call_with_arglocs(op, arglocs);
+                }
             }
             OpCode::CallAssemblerI
             | OpCode::CallAssemblerR
@@ -5448,6 +5456,69 @@ impl<'a> AssemblerARM64<'a> {
                 self.store_rax_to_result(op.pos.get());
             }
         }
+    }
+
+    /// Inline aheui's headerless `jit_alloc_node(value, next)` nursery bump.
+    ///
+    /// The fast path only advances `nursery_free` and initializes the
+    /// 16-byte Node payload, so it cannot collect and emits no gcmap. The
+    /// slow path is the ordinary residual call wrapper, which may collect
+    /// inside `jit_alloc_node` / `Nursery::alloc` and passes `next` (the old
+    /// head) as the keep-root. This is sound because the op is still a call:
+    /// the optimizer's residual-call emission fences pending head/size
+    /// setfields before this allocation, matching the storage collector's
+    /// root-currentness requirement.
+    fn genop_nursery_alloc_inline(&mut self, op: &Op, arglocs: &[Loc]) {
+        const NURSERY_ALLOC_NODE_SIZE: u32 = 16; // aheui headerless Node = 16B (value@0,next@8)
+
+        let (nf_addr, nt_addr) = crate::runner::dynasm_nursery_addrs();
+        if nf_addr == 0 || nt_addr == 0 {
+            self.genop_call_with_arglocs(op, arglocs);
+            return;
+        }
+
+        let func_index = 3 + usize::from(op.opcode.is_call_release_gil());
+        let (Some(&value_loc), Some(&next_loc)) =
+            (arglocs.get(func_index + 1), arglocs.get(func_index + 2))
+        else {
+            self.genop_call_with_arglocs(op, arglocs);
+            return;
+        };
+
+        let slow_path = self.mc.new_dynamic_label();
+        let done = self.mc.new_dynamic_label();
+
+        // Fast path uses ONLY reserved IP regs (x14/x15/x16/x17); never touches a
+        // regalloc-managed register, so the slow path's original arglocs stay
+        // intact. x16=nf_addr->base, x17=base, x14=newf(temp), x15=nt_addr->top.
+        self.emit_mov_imm64(16, nf_addr as i64); // x16 = &nursery_free
+        dynasm!(self.mc ; .arch aarch64
+            ; ldr x17, [x16]                        // x17 = base = *nursery_free
+            ; add x14, x17, NURSERY_ALLOC_NODE_SIZE // x14 = newf = base + 16
+        );
+        self.emit_mov_imm64(15, nt_addr as i64); // x15 = &nursery_top
+        dynasm!(self.mc ; .arch aarch64
+            ; ldr x15, [x15]                        // x15 = top = *nursery_top
+            ; cmp x14, x15                          // newf vs top
+            ; b.hi =>slow_path                      // newf > top -> exhausted
+            ; str x14, [x16]                        // *nursery_free = newf
+        );
+        // Init node fields; value/next loaded from ORIGINAL arglocs (no pre-clobber).
+        // load_loc_to_reg returns a managed reg untouched, or loads Frame/Immed into
+        // the IP scratch we pass (x15 and x14 are free here: top consumed, newf stored).
+        let vreg = self.load_loc_to_reg(&value_loc, 15);
+        dynasm!(self.mc ; .arch aarch64 ; str X(vreg), [x17]); // value @ base+0
+        let nreg = self.load_loc_to_reg(&next_loc, 14);
+        dynasm!(self.mc ; .arch aarch64 ; str X(nreg), [x17, 8]); // next @ base+8
+        dynasm!(self.mc ; .arch aarch64 ; mov x0, x17); // result = base
+        if !op.pos.get().is_none() {
+            self.store_rax_to_result(op.pos.get());
+        }
+        dynasm!(self.mc ; .arch aarch64 ; b =>done);
+
+        dynasm!(self.mc ; .arch aarch64 ; =>slow_path);
+        self.genop_call_with_arglocs(op, arglocs);
+        dynasm!(self.mc ; .arch aarch64 ; =>done);
     }
 
     /// assembler.py:295-360 call_assembler: invoke a compiled JIT loop.

@@ -4118,7 +4118,6 @@ impl<'a> Assembler386<'a> {
             // before the call, use the existing frame-slot genop_call, then
             // mark the result in the allocated register.
             OpCode::CallI
-            | OpCode::CallR
             | OpCode::CallF
             | OpCode::CallN
             | OpCode::CallPureI
@@ -4137,6 +4136,15 @@ impl<'a> Assembler386<'a> {
             | OpCode::CallReleaseGilF
             | OpCode::CallReleaseGilN => {
                 self.genop_call_with_arglocs(op, arglocs);
+            }
+            OpCode::CallR => {
+                let is_nursery_alloc = op.with_call_descr(|cd| cd.get_extra_info().pyre_helper)
+                    == Some(majit_ir::PyreHelperKind::NurseryAlloc);
+                if is_nursery_alloc {
+                    self.genop_nursery_alloc_inline_x86(op, arglocs);
+                } else {
+                    self.genop_call_with_arglocs(op, arglocs);
+                }
             }
             OpCode::CallAssemblerI
             | OpCode::CallAssemblerR
@@ -7074,6 +7082,101 @@ impl<'a> Assembler386<'a> {
         if !op.pos.get().is_none() {
             self.store_rax_to_result(op.pos.get());
         }
+    }
+
+    /// Inline aheui's headerless `jit_alloc_node(value, next)` nursery bump.
+    ///
+    /// The fast path only advances `nursery_free` and initializes the
+    /// 16-byte Node payload, so it cannot collect and emits no gcmap. The
+    /// slow path is the ordinary residual call wrapper, which may collect
+    /// inside `jit_alloc_node` / `Nursery::alloc` and passes `next` (the old
+    /// head) as the keep-root. This is sound because the op is still a call:
+    /// the optimizer's residual-call emission fences pending head/size
+    /// setfields before this allocation, matching the storage collector's
+    /// root-currentness requirement.
+    fn genop_nursery_alloc_inline_x86(&mut self, op: &Op, arglocs: &[Loc]) {
+        const NURSERY_ALLOC_NODE_SIZE: i32 = 16; // aheui headerless Node = 16B (value@0,next@8)
+
+        let (nf_addr, nt_addr) = crate::runner::dynasm_nursery_addrs();
+        if nf_addr == 0 || nt_addr == 0 {
+            self.genop_call_with_arglocs(op, arglocs);
+            return;
+        }
+
+        let func_index = 3 + usize::from(op.opcode.is_call_release_gil());
+        let (Some(&value_loc), Some(&next_loc)) =
+            (arglocs.get(func_index + 1), arglocs.get(func_index + 2))
+        else {
+            self.genop_call_with_arglocs(op, arglocs);
+            return;
+        };
+
+        let fn_loc = arglocs.get(func_index).copied();
+        let source_regs = [
+            fn_loc.and_then(|loc| loc.as_reg()),
+            value_loc.as_reg(),
+            next_loc.as_reg(),
+        ];
+        let caller_save_scratch = crate::x86::regalloc::SAVE_AROUND_CALL_CORE_REGS;
+        let mut picked = Vec::new();
+        for &reg in caller_save_scratch {
+            if source_regs
+                .iter()
+                .flatten()
+                .any(|source| source.is_core_reg() && source.value == reg.value)
+            {
+                continue;
+            }
+            picked.push(reg);
+            if picked.len() == 4 {
+                break;
+            }
+        }
+        if picked.len() < 4 {
+            self.genop_call_with_arglocs(op, arglocs);
+            return;
+        }
+        let value_reg = picked[0].value;
+        let next_reg = picked[1].value;
+        let base_reg = picked[2].value;
+        let new_free_reg = picked[3].value;
+        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+        let nf = nf_addr as i64;
+        let nt = nt_addr as i64;
+
+        let value_dst = Loc::Reg(crate::regloc::RegLoc::new(value_reg, false));
+        let next_dst = Loc::Reg(crate::regloc::RegLoc::new(next_reg, false));
+        self.regalloc_mov(&value_loc, &value_dst);
+        self.regalloc_mov(&next_loc, &next_dst);
+
+        let slow_path = self.mc.new_dynamic_label();
+        let done = self.mc.new_dynamic_label();
+
+        // CallR regalloc has already spilled/moved caller-save registers via
+        // before_call(). Use only those freed registers plus R11, and load
+        // value/next before staging nursery slot addresses so their original
+        // argloc source registers stay intact for the slow residual call.
+        dynasm!(self.mc ; .arch x64
+            ; mov Rq(scratch), QWORD nf
+            ; mov Rq(base_reg), [Rq(scratch)]                       // base = *nursery_free
+            ; lea Rq(new_free_reg), [Rq(base_reg) + NURSERY_ALLOC_NODE_SIZE]
+            ; mov Rq(scratch), QWORD nt
+            ; cmp Rq(new_free_reg), [Rq(scratch)]
+            ; ja =>slow_path
+            ; mov Rq(scratch), QWORD nf
+            ; mov [Rq(scratch)], Rq(new_free_reg)                   // *nursery_free = base + 16
+            ; mov [Rq(base_reg)], Rq(value_reg)                     // value @ base+0
+            ; mov [Rq(base_reg) + 8], Rq(next_reg)                  // next @ base+8
+            ; mov rax, Rq(base_reg)                                 // result = base
+        );
+        if !op.pos.get().is_none() {
+            self.store_rax_to_result(op.pos.get());
+        }
+        dynasm!(self.mc ; .arch x64 ; jmp =>done);
+
+        dynasm!(self.mc ; .arch x64 ; =>slow_path);
+        self.genop_call_with_arglocs(op, arglocs);
+        dynasm!(self.mc ; .arch x64 ; =>done);
     }
 
     /// assembler.py:295-360 call_assembler: invoke a compiled JIT loop.
