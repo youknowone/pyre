@@ -672,24 +672,6 @@ impl Parse for JitInterpConfig {
     }
 }
 
-impl JitInterpConfig {
-    /// Whether any registered call uses an `InlinePipeline*` policy, which
-    /// requires the host to supply `__majit_pipeline_jitcode` in the dispatch
-    /// jitcode builder's scope.
-    pub fn uses_inline_pipeline(&self) -> bool {
-        self.calls.iter().any(|c| {
-            matches!(
-                c.policy,
-                Some(
-                    CallPolicyKind::InlinePipelineInt
-                        | CallPolicyKind::InlinePipelineRef
-                        | CallPolicyKind::InlinePipelineFloat
-                )
-            )
-        })
-    }
-}
-
 /// Parse `residual_writes = { <ref_scalar>.<field> => [helper, ...], ... }`.
 /// Each map key is a `state` ref-scalar field path (`selected_ref.size`) and
 /// the value is a bracketed list of residual helper function paths that mutate

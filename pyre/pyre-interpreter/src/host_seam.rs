@@ -58,6 +58,7 @@ pub mod sys {
     pub use ::libc::{WEXITSTATUS, WIFEXITED, WIFSIGNALED, WIFSTOPPED, WSTOPSIG, WTERMSIG};
     // Type-only re-exports for names that libc also defines as a function, so
     // the type resolves but the syscall call does not.
+    #[allow(non_camel_case_types)]
     pub type stat = ::libc::stat;
     pub use ::libc::winsize;
     // Constants (added as sandbox-reachable modules need them).
