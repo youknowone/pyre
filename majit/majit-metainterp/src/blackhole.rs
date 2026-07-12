@@ -2424,6 +2424,7 @@ pub fn resume_in_blackhole(
         None, // vrefinfo
         None, // vinfo
         None, // ginfo
+        None, // virtualizable_identity_override
         &null_alloc,
     );
 

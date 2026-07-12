@@ -1669,6 +1669,7 @@ pub fn blackhole_resume_via_rd_numb(
             Some(vrefinfo_dyn),     // resume.py:1314 metainterp_sd.virtualref_info
             Some(vinfo_dyn),        // resume.py:1312 self.jitdriver_sd.virtualizable_info
             None,                   // resume.py:1316 greenfield_info unused in pyre
+            None,                   // heap PyFrame identity remains the live TAGBOX
             &allocator,
         )
     });
@@ -5500,7 +5501,7 @@ pub fn cranelift_resumedata_deopt(
     reader.prepare(rd_virtuals_slice, rd_pendingfields);
     let vinfo_dyn: &dyn resume::VirtualizableInfo = driver_vinfo.as_ref();
     let vrefinfo_dyn: &dyn resume::VRefInfo = driver.meta_interp().virtualref_info();
-    reader.consume_vref_and_vable(Some(vrefinfo_dyn), Some(vinfo_dyn), None);
+    reader.consume_vref_and_vable(Some(vrefinfo_dyn), Some(vinfo_dyn), None, None);
 
     // 7. resume.py:1339 jitcodes[jitcode_pos] lookup — same shape as
     //    blackhole_resume_via_rd_numb's resolve_jitcode (line 1891),

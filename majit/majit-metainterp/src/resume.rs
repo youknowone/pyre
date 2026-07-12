@@ -5263,6 +5263,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &NullAllocator,
         )
         .expect("runtime-only jitcode should still resume");
@@ -5302,7 +5303,7 @@ mod tests {
 
         let mut reader =
             ResumeDataDirectReader::new(&rd_numb, &[], &[], &[], None, None, &NullAllocator);
-        reader.consume_vref_and_vable(None, Some(&TestVirtualizableInfo), None);
+        reader.consume_vref_and_vable(None, Some(&TestVirtualizableInfo), None, None);
     }
 
     #[test]
@@ -6852,7 +6853,12 @@ impl<'a> ResumeDataDirectReader<'a> {
     }
 
     /// resume.py:1399 consume_vable_info
-    pub fn consume_vable_info(&mut self, vinfo: &dyn VirtualizableInfo, vable_size: i32) {
+    pub fn consume_vable_info(
+        &mut self,
+        vinfo: &dyn VirtualizableInfo,
+        vable_size: i32,
+        identity_override: Option<i64>,
+    ) {
         // resume.py:1403
         assert!(vable_size > 0);
         // The vable section is encoded identity-FIRST: the snapshot writer
@@ -6863,11 +6869,15 @@ impl<'a> ResumeDataDirectReader<'a> {
         // payload the remaining `vable_size - 1`, read sequentially.
         // resume.py:1404 virtualizable = self.next_ref()
         //
-        // `build_vable_snapshot_boxes` always encodes this as a TAGBOX.  Thus
-        // `next_ref()` reads the current failing jitframe's gcmap-marked
-        // failarg slot, matching resume.py:1566-1578 rather than retaining a
-        // trace-time object address.
-        let virtualizable = self.next_ref();
+        // Consume the encoded identity even when a host supplies an override:
+        // it occupies one resume-data item and keeps the reader aligned for
+        // the field payload. Heap virtualizables (PyFrame) use this live
+        // TAGBOX exactly as RPython does. The state-field macro JIT opts in
+        // to `identity_override` because its host-stack `&state` is folded out
+        // of backend failargs; at deopt it must use the current call's address,
+        // never a trace-time pointer or an unrelated deadframe slot.
+        let encoded_identity = self.next_ref();
+        let virtualizable = identity_override.unwrap_or(encoded_identity);
         self.virtualizable_ptr = virtualizable;
         // resume.py:1406: assert vinfo.get_total_size(virtualizable) == vable_size - 1
         let expected = vinfo.get_total_size(virtualizable) as i32;
@@ -6892,6 +6902,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         vrefinfo: Option<&dyn VRefInfo>,
         vinfo: Option<&dyn VirtualizableInfo>,
         ginfo: Option<&dyn GreenfieldInfo>,
+        identity_override: Option<i64>,
     ) {
         // resume.py:1425
         let vable_size = self.resumecodereader.next_item();
@@ -6899,7 +6910,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         if self.resume_after_guard_not_forced != 2 {
             // resume.py:1427-1428
             if let Some(vi) = vinfo {
-                self.consume_vable_info(vi, vable_size);
+                self.consume_vable_info(vi, vable_size, identity_override);
             }
             // resume.py:1429-1430
             if ginfo.is_some() {
@@ -7273,6 +7284,7 @@ pub fn blackhole_from_resumedata<'a>(
     vrefinfo: Option<&dyn VRefInfo>,
     vinfo: Option<&dyn VirtualizableInfo>,
     ginfo: Option<&dyn GreenfieldInfo>,
+    virtualizable_identity_override: Option<i64>,
     allocator: &'a dyn BlackholeAllocator,
 ) -> Option<(BlackholeInterpreter, i64)> {
     // resume.py:1315-1327 The initialization is stack-critical code: it
@@ -7327,7 +7339,7 @@ pub fn blackhole_from_resumedata<'a>(
     }
 
     // resume.py:1325
-    resumereader.consume_vref_and_vable(vrefinfo, vinfo, ginfo);
+    resumereader.consume_vref_and_vable(vrefinfo, vinfo, ginfo, virtualizable_identity_override);
     drop(_cc_guard);
 
     // resume.py:1404: virtualizable pointer read by consume_vable_info.
@@ -7431,7 +7443,7 @@ pub fn force_from_resumedata<'a>(
     resumereader.prepare(rd_virtuals, rd_guard_pendingfields);
     resumereader.handling_async_forcing();
     // resume.py:1350
-    resumereader.consume_vref_and_vable(vrefinfo, vinfo, ginfo);
+    resumereader.consume_vref_and_vable(vrefinfo, vinfo, ginfo, None);
     // resume.py:1351: return resumereader.force_all_virtuals()
     let (ptrs, ints) = resumereader.force_all_virtuals();
     (ptrs.to_vec(), ints.to_vec())
