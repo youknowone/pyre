@@ -7449,6 +7449,15 @@ thread_local! {
         const { std::cell::Cell::new(None) };
     static FBW_ABORT_OUTER_STACK_OVERRIDES: std::cell::RefCell<Vec<(usize, pyre_object::PyObjectRef)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// Raw pointer to the walk session whose framestack currently holds
+    /// inline frames, for [`fbw_store_journal_root_walker`]: the session
+    /// lives on the walk driver's Rust stack, which the GC cannot scan, and
+    /// each `InlineParentFrame::call_stack_overrides` slot holds a
+    /// nursery-resident ref across residual-call allocations.  Set by
+    /// [`InlineFrameGuard::enter`] and restored on drop; null outside any
+    /// inline sub-walk.
+    static ACTIVE_WALK_SESSION: std::cell::Cell<*const std::cell::RefCell<WalkSession>> =
+        const { std::cell::Cell::new(std::ptr::null()) };
 }
 
 impl<'a> InlineFrameGuard<'a> {
@@ -7461,13 +7470,18 @@ impl<'a> InlineFrameGuard<'a> {
             .borrow_mut()
             .framestack
             .push(InlineFrame { w_code, parent });
+        ACTIVE_WALK_SESSION.with(|c| c.set(session as *const _));
         InlineFrameGuard(session)
     }
 }
 
 impl Drop for InlineFrameGuard<'_> {
     fn drop(&mut self) {
-        self.0.borrow_mut().framestack.pop();
+        let mut session = self.0.borrow_mut();
+        session.framestack.pop();
+        if session.framestack.is_empty() {
+            ACTIVE_WALK_SESSION.with(|c| c.set(std::ptr::null()));
+        }
     }
 }
 
@@ -7677,6 +7691,21 @@ pub(crate) fn fbw_inline_nsfold_enabled() -> bool {
             v != "0" && !v.eq_ignore_ascii_case("false")
         }
         None => true,
+    })
+}
+
+/// `PYRE_FBW_CALLEE_VSTACK` (default OFF) — maintain a callee-local
+/// operand-stack mirror while walking an inline sub-call.  The callee enters
+/// with an empty operand stack; subsequent boundaries must use the active
+/// callee jitcode metadata rather than the outer full-body tables.
+fn fbw_callee_vstack_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_CALLEE_VSTACK") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => false,
     })
 }
 
@@ -9464,12 +9493,13 @@ fn reconcile_vstack_at_boundary(
     // with the NONE slot left in place; `stack_sync` (USE) defers any NONE
     // mirror slot to the legacy read.
     if ctx.vstack_valid {
+        let skip_shadow_fill = ctx.fbw_mode.inline_subwalk && fbw_callee_vstack_enabled();
         let hole = ctx
             .vstack_boxes
             .get(..new_depth)
             .map(|s| s.iter().any(|&b| b == OpRef::NONE))
             .unwrap_or(true);
-        if hole {
+        if hole && !skip_shadow_fill {
             // Best-effort fill from the shadow; leave un-fillable slots NONE.
             let _ = reseed_vstack_from_shadow(ctx, new_depth);
         }
@@ -9634,47 +9664,70 @@ fn step_vstack_mirror(ctx: &mut WalkContext<'_, '_>, jit_pc: usize) {
     }
     // Inside an inline sub-walk the `jit_pc` is a CALLEE coordinate that
     // does not exist in the outer (`fbw_mode.snapshot_sym`) jitcode's
-    // py_pc→jitcode tables, so `python_pc_for_jitcode_pc` would return garbage
-    // and a
-    // callee `write_ref_reg` would clobber `vstack_last_ref`.  Decline the
-    // whole mirror for any walk that inlines a Python call — the benches
-    // this targets (short-circuit `or`/`and` chains) are call-free, and
-    // declining is a clean fallback to the legacy read.
-    if ctx.fbw_mode.inline_subwalk {
-        ctx.vstack_valid = false;
-        return;
-    }
-    let full_body_sym = ctx.fbw_mode.snapshot_sym;
-    if full_body_sym.is_null() {
-        return;
-    }
-    // SAFETY: the pointer is live for the lifetime of the full-body walk
-    // (set in `dispatch_via_miframe`); read-only access to immutable
-    // layout fields (jitcode / code_ptr / metadata).
-    let sym = unsafe { &*full_body_sym };
-    if sym.jitcode.is_null() {
-        return;
-    }
-    let (new_pypc, code_ptr) = unsafe {
-        let jc = &*sym.jitcode;
-        if jc.payload.code_ptr.is_null() {
+    // py_pc→jitcode tables.  Without the `PYRE_FBW_CALLEE_VSTACK` gate the
+    // mirror declines (a callee `write_ref_reg` would clobber
+    // `vstack_last_ref`); with it, the coordinate is resolved through the
+    // active callee jitcode metadata instead.
+    let (new_pypc, code_ptr, new_depth) = if ctx.fbw_mode.inline_subwalk {
+        if !fbw_callee_vstack_enabled() {
+            ctx.vstack_valid = false;
             return;
         }
-        (
-            vstack_containing_py_pc(&jc.payload.metadata, jit_pc),
-            jc.payload.code_ptr,
-        )
+        let Some(frame) = ActiveResumeFrame::current(ctx.session, ctx.fbw_mode.snapshot_sym)
+        else {
+            ctx.vstack_valid = false;
+            return;
+        };
+        let Some(coord) = frame.vstack_coordinate_for_jitcode_pc(jit_pc) else {
+            ctx.vstack_valid = false;
+            return;
+        };
+        coord
+    } else {
+        let full_body_sym = ctx.fbw_mode.snapshot_sym;
+        if full_body_sym.is_null() {
+            return;
+        }
+        // SAFETY: the pointer is live for the lifetime of the full-body walk
+        // (set in `dispatch_via_miframe`); read-only access to immutable
+        // layout fields (jitcode / code_ptr / metadata).
+        let sym = unsafe { &*full_body_sym };
+        if sym.jitcode.is_null() {
+            return;
+        }
+        unsafe {
+            let jc = &*sym.jitcode;
+            if jc.payload.code_ptr.is_null() {
+                return;
+            }
+            let py_pc = vstack_containing_py_pc(&jc.payload.metadata, jit_pc);
+            let depth = crate::liveness::liveness_for(jc.payload.code_ptr)
+                .depth_at_py_pc()
+                .get(py_pc as usize)
+                .copied()
+                .unwrap_or(0) as usize;
+            (py_pc, jc.payload.code_ptr, depth)
+        }
     };
     if new_pypc == ctx.vstack_cur_pypc {
         return;
     }
     let code = unsafe { &*code_ptr };
-    let new_depth = crate::liveness::liveness_for(code_ptr)
-        .depth_at_py_pc()
-        .get(new_pypc as usize)
-        .copied()
-        .unwrap_or(0) as usize;
     reconcile_vstack_at_boundary(ctx, code, new_pypc, new_depth);
+}
+
+fn seed_callee_vstack_mirror(ctx: &mut WalkContext<'_, '_>, frame: &ActiveResumeFrame) {
+    if !fbw_callee_vstack_enabled() {
+        return;
+    }
+    let Some((first_pypc, _code_ptr, _depth)) = frame.vstack_coordinate_for_jitcode_pc(0) else {
+        return;
+    };
+    ctx.vstack_boxes.clear();
+    ctx.vstack_depth = 0;
+    ctx.vstack_cur_pypc = first_pypc;
+    ctx.vstack_last_ref = OpRef::NONE;
+    ctx.vstack_valid = true;
 }
 
 /// #73 (SLICE 1, INERT): seed the walk-level operand-stack box mirror
@@ -10597,6 +10650,28 @@ impl ActiveResumeFrame {
             }
             None => Self::outer(snapshot_sym),
         }
+    }
+
+    fn vstack_coordinate_for_jitcode_pc(
+        &self,
+        jit_pc: usize,
+    ) -> Option<(u32, *const pyre_interpreter::CodeObject, usize)> {
+        let pjc = &self.0;
+        if pjc.code_ptr.is_null() {
+            return None;
+        }
+        let py_pc = vstack_containing_py_pc(&pjc.metadata, jit_pc);
+        let depth = crate::liveness::liveness_for(pjc.code_ptr)
+            .depth_at_py_pc()
+            .get(py_pc as usize)
+            .copied()
+            .unwrap_or(0) as usize;
+        Some((py_pc, pjc.code_ptr, depth))
+    }
+
+    fn body_matches(&self, sub_body: &SubJitCodeBody) -> bool {
+        let code = self.0.jitcode.code.as_slice();
+        code.len() == sub_body.code.len() && code.as_ptr() == sub_body.code.as_ptr()
     }
 }
 
@@ -15195,6 +15270,11 @@ fn try_walker_inline_user_call(
         // Track this callee for the lifetime of the sub-walk so nested
         // self-calls see the correct recursion depth.
         let _inline_frame = InlineFrameGuard::enter(ctx.session, callee_code_key, parent_frame);
+        if let Some(frame) = ActiveResumeFrame::current(ctx.session, ctx.fbw_mode.snapshot_sym) {
+            if frame.body_matches(&body) {
+                seed_callee_vstack_mirror(&mut sub_wc, &frame);
+            }
+        }
         // Strict fresh-frame fold: a branchless leaf inlined without a virtual
         // frame (not `try_multiframe`) whose body carries the Portal
         // frame-vable locals prologue resolves its own `getarrayitem_vable_r` /
@@ -21646,6 +21726,11 @@ fn run_sub_jitcode_walk(
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
+        if let Some(frame) = ActiveResumeFrame::current(ctx.session, ctx.fbw_mode.snapshot_sym) {
+            if frame.body_matches(sub_body) {
+                seed_callee_vstack_mirror(&mut sub_wc, &frame);
+            }
+        }
         walk(sub_body.code, 0, &mut sub_wc)?
     };
     Ok(callee_outcome)
