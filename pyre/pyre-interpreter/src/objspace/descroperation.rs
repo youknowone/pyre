@@ -1214,7 +1214,7 @@ pub(crate) unsafe fn bytearray_inplace_repeat(
     ba: PyObjectRef,
     n: PyObjectRef,
 ) -> Result<(), PyError> {
-    let count = repeat_count(n, "repeated bytes are too long")?;
+    let count = repeat_count(n)?;
     let len = pyre_object::bytearrayobject::w_bytearray_len(ba);
     if count == 1 {
         return Ok(());
