@@ -1823,24 +1823,24 @@ impl MixLevelHelperAnnotator {
     ///     self.newgraphs.clear()
     /// ```
     ///
-    /// Port blocker: the body forwards into
-    /// `rpython/translator/backendopt/all.py:backend_optimizations`,
-    /// which itself chains the whole backend-opt pipeline (inlining,
-    /// mallocs-removal, constant folding, gc transform, stack check
-    /// insertion, …). None of that subsystem has been ported yet, and
-    /// the existing pyre graph pipeline (`translator/` passes like
-    /// `simplify`, `transform`, `unsimplify`) only covers a subset.
-    /// Until the backendopt.all port lands — which is a
-    /// cross-subsystem effort on its own — this surfaces as a typed
-    /// error so call sites (e.g. `rtyper_finish_helpers`) fail loudly
-    /// instead of silently running un-optimised helper graphs.
+    /// Unreachable in pyre. `backend_optimize` re-optimises the fresh helper
+    /// graphs a GC transformer builds, and its only upstream callers are the
+    /// translation-time GC passes (`rpython/memory/gctransform/`
+    /// {boehm,transform,refcounting,framework}). pyre does not run that
+    /// subsystem: it does not translate itself to C, so it needs no C-level GC
+    /// insertion; it manages memory with the `majit-gc` runtime collector; and
+    /// it inserts JIT GC operations with the backend `GcRewriterAssembler`
+    /// (`majit-gc/rewrite.rs`, the `jit/backend/llsupport/rewrite.py` analog),
+    /// exactly as upstream does for JIT traces rather than through the
+    /// translation-time gctransform. The callee `backend_optimizations` is
+    /// itself ported (`backendopt::all`) with a live caller (`driver`); this
+    /// method stays fail-loud so any future real caller surfaces instead of
+    /// silently running un-optimised helper graphs.
     pub fn backend_optimize(&self) -> Result<(), TyperError> {
-        // Line-by-line skeleton matching the upstream four-line body.
-        // The `backend_optimizations(translator, newgraphs, ...)` call
-        // is the load-bearing step that's blocked on the backendopt
-        // port; we capture the surrounding lines so the structure is
-        // visible at audit time and the convergence is mechanical
-        // once the call is implementable.
+        // Skeleton matching the upstream four-line body, kept so the shape is
+        // visible at audit time. `backend_optimizations` is reachable code
+        // (`backendopt::all`); this wrapper simply has no pyre caller — see the
+        // doc above.
 
         // upstream: translator = self.rtyper.annotator.translator
         let _translator = self
@@ -1854,13 +1854,13 @@ impl MixLevelHelperAnnotator {
         //                                  secondary=True,
         //                                  inline_graph_from_anywhere=True,
         //                                  **flags)
-        // Blocked on `rpython/translator/backendopt/all.py` port; surface
-        // the error before reaching `newgraphs.clear()` so the call
-        // chain fails loudly (rather than silently running un-optimised
-        // helper graphs).
+        // Fail before reaching `newgraphs.clear()`: pyre never runs the
+        // translation-time gctransform passes that call this, so reaching here
+        // means an unexpected caller appeared and should surface loudly.
         Err(TyperError::message(
-            "annlowlevel.py:277 MixLevelHelperAnnotator.backend_optimize port pending \
-             (blocked on rpython/translator/backendopt/all.py port)",
+            "annlowlevel.py:277 MixLevelHelperAnnotator.backend_optimize is unreachable in pyre \
+             (only translation-time gctransform passes call it; pyre uses the majit-gc runtime \
+             collector and the backend GcRewriterAssembler)",
         ))
         // upstream: self.newgraphs.clear() — only runs after a
         // successful backend_optimizations return; the stub never
