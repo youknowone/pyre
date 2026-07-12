@@ -7023,20 +7023,7 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
                 if pyre_object::is_none(method) {
                     return Err(unhashable_type_error(obj));
                 }
-                let r = call_and_check(method, &[obj])?;
-                // descroperation.py:576-579 — normalize -1 to -2
-                let h = if is_bool(r) {
-                    pyre_object::w_bool_get_value(r) as i64
-                } else if is_int(r) {
-                    w_int_get_value(r)
-                } else if is_long(r) {
-                    _hash_long(pyre_object::w_long_get_value(r))
-                } else {
-                    return Err(crate::PyError::type_error(
-                        "__hash__ method should return an integer",
-                    ));
-                };
-                return Ok(if h == -1 { -2 } else { h });
+                return hash_call_normalize(method, obj);
             }
         }
         // A type may declare itself unhashable via `__hash__ = None`
@@ -7049,10 +7036,41 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
                 if pyre_object::is_none(method) {
                     return Err(unhashable_type_error(obj));
                 }
+                // A subclass may override `__hash__` (e.g. `class D(deque)`);
+                // honor the override.  The inherited default `object.__hash__`
+                // (identity) is left to the `hash_value` fallback below, which
+                // computes the correct per-type builtin hash for the base
+                // payload rather than a pointer identity.
+                let default_hash =
+                    crate::baseobjspace::lookup_in_type(crate::typedef::w_object(), "__hash__");
+                if default_hash != Some(method) {
+                    return hash_call_normalize(method, obj);
+                }
             }
         }
     }
     Ok(hash_value(obj))
+}
+
+/// Call a resolved `__hash__` method and normalize its result:
+/// `descroperation.py:576-579` — accept `bool` / `int` / `long`, reject other
+/// return types, and map a `-1` result to `-2`.
+fn hash_call_normalize(method: PyObjectRef, obj: PyObjectRef) -> Result<i64, crate::PyError> {
+    let r = call_and_check(method, &[obj])?;
+    let h = unsafe {
+        if is_bool(r) {
+            pyre_object::w_bool_get_value(r) as i64
+        } else if is_int(r) {
+            w_int_get_value(r)
+        } else if is_long(r) {
+            _hash_long(pyre_object::w_long_get_value(r))
+        } else {
+            return Err(crate::PyError::type_error(
+                "__hash__ method should return an integer",
+            ));
+        }
+    };
+    Ok(if h == -1 { -2 } else { h })
 }
 
 fn unhashable_type_error(obj: PyObjectRef) -> crate::PyError {

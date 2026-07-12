@@ -271,9 +271,8 @@ impl W_Deque {
         #[default(None)] iterable: Option<PyObjectRef>,
         #[default(None)] maxlen: Option<PyObjectRef>,
     ) -> Result<(), crate::PyError> {
-        self.data = w_list_new(vec![]);
-        self.state = 0;
         // gateway_nonnegint_w(w_maxlen): None unbounded; non-int → TypeError; negative → ValueError.
+        // Validated before the clear so a bad maxlen leaves the deque untouched.
         self.maxlen = match maxlen {
             Some(m) if !unsafe { is_none(m) } => {
                 if !unsafe { is_int(m) } {
@@ -288,6 +287,9 @@ impl W_Deque {
             _ => -1,
         };
         let self_obj = self as *mut W_Deque as PyObjectRef;
+        // Reinitialize by clearing: `store` bumps the iteration lock (`modified`)
+        // so an outstanding scan of an existing deque detects the reset.
+        store(self_obj, vec![]);
         if let Some(it) = iterable {
             for item in crate::builtins::collect_iterable(it)? {
                 do_append(self_obj, item);
