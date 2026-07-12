@@ -5167,18 +5167,26 @@ impl<M: Clone> MetaInterp<M> {
         // (compile.py:443).
         let orig_vable_ptr_loop =
             self.orig_vable_ptr_from_trace_ctx(&ctx, driver_descriptor.as_ref());
-        let cross_loop_cut = if cut_inner_green_key.is_some() {
-            ctx.get_merge_point_at(green_key, ctx.header_pc)
-                .filter(|mp| mp.position._pos > 0)
-                .map(|mp| {
-                    (
-                        mp.green_boxes.clone(),
-                        crate::history::TreeLoopCutPosition::new(mp.position._pos),
-                    )
-                })
-        } else {
-            None
-        };
+        // pyjitpl.py:3018-3030: compile_loop(original_boxes, live_arg_boxes,
+        // start) always compiles from the merge point registered by the
+        // first header visit — `start` and `original_boxes` come from
+        // `current_merge_points[j]` regardless of where tracing began. A
+        // portal trace starts at its own header (position 0, no cut). A
+        // guard-origin trace that closes at its own key (a bridge walk
+        // whose target procedure has no jumpable label, e.g. a FINISH-only
+        // CALL_ASSEMBLER callee) registers the header mid-trace, so the
+        // prefix from the guard to the header must be cut off — otherwise
+        // the root entry contract pairs the guard's fail-arg inputargs
+        // with the merge point's full-shape JUMP and aborts on arity.
+        let cross_loop_cut = ctx
+            .get_merge_point_at(green_key, ctx.header_pc)
+            .filter(|mp| mp.position._pos > 0)
+            .map(|mp| {
+                (
+                    mp.green_boxes.clone(),
+                    crate::history::TreeLoopCutPosition::new(mp.position._pos),
+                )
+            });
 
         // compile.py:221: call_pure_results = metainterp.call_pure_results
         let call_pure_results = ctx.take_call_pure_results();
