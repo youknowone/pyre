@@ -13150,21 +13150,31 @@ fn block_reachable(graph: &FunctionGraph, target: BlockId) -> bool {
 /// Grammar (verified against the real LLBC for several handler graphs):
 /// - literal segment: a length byte `L` with `L < 0x80`, then `L` bytes
 ///   of UTF-8 text appended to the current piece;
-/// - placeholder: the single byte `0xC0` — closes the current piece and
-///   begins the next (the Display-vs-Debug choice lives in the parallel
-///   args array, not in this template, so a placeholder carries no kind);
+/// - sequential placeholder: the single byte `0xC0` — closes the current
+///   piece, begins the next, and renders the next argument in order (the
+///   Display-vs-Debug choice lives in the parallel args array, not in this
+///   template, so a placeholder carries no kind);
+/// - explicit / reused placeholder: `0xC8` followed by a little-endian
+///   `u16` argument index — a 3-byte token that renders `args[index]`, so
+///   a `{0}…{0}` template that names one argument twice packs two `0xC8`
+///   tokens pointing at index `0`;
 /// - terminator: a `0x00` byte (only at a segment boundary; `0`/`0xC0`
 ///   bytes inside a literal are consumed by its length prefix).
 ///
-/// Returns `(pieces, placeholder_count)` with `pieces.len() ==
-/// placeholder_count + 1`.  Returns `None` (bail, leaving the graph
-/// untouched) on any high-bit control byte other than `0xC0` — i.e. a
-/// format spec with width/precision/fill or an explicit positional/named
-/// argument — and on non-UTF-8 literal bytes.
-fn decode_packed_format_pieces(bytes: &[u8]) -> Option<(Vec<String>, usize)> {
+/// Returns `(pieces, arg_indices)` where `arg_indices` holds the argument
+/// index each placeholder renders (one per placeholder, so `pieces.len() ==
+/// arg_indices.len() + 1`).  A sequential `0xC0` auto-increments; a reused
+/// `0xC8` index points back at an already-seen argument, so the distinct
+/// argument count is `max(arg_indices) + 1`, which can be less than the
+/// placeholder count.  Returns `None` (bail, leaving the graph untouched)
+/// on any high-bit control byte other than `0xC0`/`0xC8` — a format spec
+/// with width/precision/fill or a named argument — and on non-UTF-8
+/// literal bytes.
+fn decode_packed_format_pieces(bytes: &[u8]) -> Option<(Vec<String>, Vec<usize>)> {
     let mut pieces: Vec<String> = Vec::new();
     let mut current = String::new();
-    let mut placeholders = 0usize;
+    let mut indices: Vec<usize> = Vec::new();
+    let mut auto = 0usize; // next sequential argument index
     let mut i = 0;
     let mut terminated = false;
     while i < bytes.len() {
@@ -13177,10 +13187,18 @@ fn decode_packed_format_pieces(bytes: &[u8]) -> Option<(Vec<String>, usize)> {
             terminated = true;
             break;
         } else if b == 0xC0 {
-            // plain sequential placeholder
+            // sequential placeholder: renders the next argument in order
             pieces.push(std::mem::take(&mut current));
-            placeholders += 1;
+            indices.push(auto);
+            auto += 1;
             i += 1;
+        } else if b == 0xC8 {
+            // explicit / reused placeholder: `0xC8` + little-endian u16 index
+            let lo = *bytes.get(i + 1)? as usize;
+            let hi = *bytes.get(i + 2)? as usize;
+            pieces.push(std::mem::take(&mut current));
+            indices.push(lo | (hi << 8));
+            i += 3;
         } else if b < 0x80 {
             // literal segment of length `b`
             let start = i + 1;
@@ -13189,7 +13207,7 @@ fn decode_packed_format_pieces(bytes: &[u8]) -> Option<(Vec<String>, usize)> {
             current.push_str(std::str::from_utf8(seg).ok()?);
             i = end;
         } else {
-            // any other control byte = format spec / positional arg: bail
+            // any other control byte = format spec / named arg: bail
             return None;
         }
     }
@@ -13200,7 +13218,7 @@ fn decode_packed_format_pieces(bytes: &[u8]) -> Option<(Vec<String>, usize)> {
         return None;
     }
     pieces.push(current);
-    Some((pieces, placeholders))
+    Some((pieces, indices))
 }
 
 /// Read an `Array` aggregate literal: given the Variable holding a
@@ -13285,12 +13303,18 @@ struct FmtArg {
 }
 
 /// The decoded contents of a `format_args!` chain — the literal string
-/// pieces interleaved with the rendered placeholder arguments
-/// (`pieces.len() == args.len() + 1`).
+/// pieces interleaved with the placeholder arguments.  `args` holds one
+/// entry per *distinct* argument (the args-array elements), while
+/// `arg_indices` holds the argument index each *placeholder* renders in
+/// template order (`pieces.len() == arg_indices.len() + 1`).  A `{0}…{0}`
+/// template that reuses one argument has `arg_indices == [0, …, 0]` with a
+/// single `args` entry, so `arg_indices.len()` (placeholders) can exceed
+/// `args.len()` (distinct arguments).
 #[derive(Debug, Clone)]
 struct FmtChain {
     pieces: Vec<String>,
     args: Vec<FmtArg>,
+    arg_indices: Vec<usize>,
 }
 
 /// Match a `FunctionPath`'s trailing segments against `tail`, so a
@@ -13441,18 +13465,29 @@ fn extract_fmt_chain(
     for v in &piece_byte_vars {
         bytes.push(u8::try_from(resolve_const_int(graph, v)?).ok()?);
     }
-    let (pieces, placeholder_count) = decode_packed_format_pieces(&bytes)?;
+    let (pieces, arg_indices) = decode_packed_format_pieces(&bytes)?;
     // Args: an `Array` of `Argument::new_display|new_debug(&v)` ctors, one
-    // per placeholder.
+    // per *distinct* argument.  The args array holds the distinct arguments;
+    // reused placeholders (`0xC8`) point back at an earlier index, so the
+    // distinct count is `max(arg_indices) + 1` — bail unless it matches the
+    // args array, and every placeholder index must be in range.
     let arg_elems = read_array_literal_elements(graph, &args_var)?;
-    if arg_elems.len() != placeholder_count {
+    let distinct = arg_indices.iter().map(|i| i + 1).max().unwrap_or(0);
+    if arg_elems.len() != distinct {
+        return None;
+    }
+    if arg_indices.iter().any(|&i| i >= arg_elems.len()) {
         return None;
     }
     let mut args = Vec::with_capacity(arg_elems.len());
     for elem in &arg_elems {
         args.push(extract_fmt_arg(graph, elem)?);
     }
-    Some(FmtChain { pieces, args })
+    Some(FmtChain {
+        pieces,
+        args,
+        arg_indices,
+    })
 }
 
 /// Emit a `__str_const` constant of `text` into `bb_id` and return its
@@ -13518,8 +13553,11 @@ fn emit_str_add(
 /// rejected before emission.
 fn emit_fmt_concat(graph: &mut FunctionGraph, bb_id: BlockId, chain: &FmtChain) -> Variable {
     let mut acc = emit_str_const(graph, bb_id, &chain.pieces[0]);
-    for (i, arg) in chain.args.iter().enumerate() {
-        acc = emit_str_add(graph, bb_id, &acc, &arg.value);
+    // Walk placeholders in template order via `arg_indices`; a reused
+    // argument re-renders the same recovered value (`str(&str)` is pure, so
+    // referencing the value var twice is sound).
+    for (i, &ai) in chain.arg_indices.iter().enumerate() {
+        acc = emit_str_add(graph, bb_id, &acc, &chain.args[ai].value);
         let next_piece = emit_str_const(graph, bb_id, &chain.pieces[i + 1]);
         acc = emit_str_add(graph, bb_id, &acc, &next_piece);
     }
@@ -13677,8 +13715,13 @@ fn collect_fmt_collapse(graph: &FunctionGraph, bf: BlockId, fi: usize) -> Option
         _ => return None,
     };
     let chain = extract_fmt_chain(graph, &fmt_args)?;
-    if chain.args.len() != 1 {
-        return None; // scope: single-argument chains
+    if chain.args.len() != 1 || chain.arg_indices.len() != 1 {
+        // scope: exactly one argument rendered by exactly one placeholder.
+        // A single argument reused across several placeholders (`{0}…{0}`)
+        // has `arg_indices.len() > 1` and stays residual here (none of the
+        // census walls), rather than mis-driving the single-placeholder
+        // expansion below.
+        return None;
     }
     if chain.args[0].kind != FmtArgKind::Display {
         // `str(value)` renders Display; `{:?}` Debug has no native rstr
@@ -13887,9 +13930,12 @@ struct FmtCollapseMulti {
     /// `Arguments::new` result var id (re-threaded to the folded String,
     /// then deleted).
     arguments_var: u64,
-    /// The rendered-value vars in placeholder order (the args-array
+    /// The rendered-value vars, one per *distinct* argument (the args-array
     /// elements, live as inputargs of `args_block`).
     arg_elem_vars: Vec<Variable>,
+    /// The distinct-argument index each placeholder renders, in template
+    /// order (`0xC8` reuse points several placeholders at one `arg_elem_var`).
+    arg_indices: Vec<usize>,
     pieces: Vec<String>,
     /// `(block, op_index, inner)` per `Argument::new_display` ctor to
     /// rewrite into `str(inner)` in place.
@@ -14315,6 +14361,7 @@ fn collect_fmt_collapse_multi(
         args_block,
         arguments_var,
         arg_elem_vars,
+        arg_indices: chain.arg_indices,
         pieces,
         new_display_ops,
         format_block: bf,
@@ -14411,6 +14458,7 @@ fn collapse_fmt_chains_multi(graph: &mut FunctionGraph) -> usize {
                     kind: FmtArgKind::Display,
                 })
                 .collect(),
+            arg_indices: site.arg_indices.clone(),
         };
         let folded = emit_fmt_concat(graph, site.args_block, &fold_chain);
         // 4. Re-thread the folded String onto the link that forwarded the
@@ -14779,13 +14827,13 @@ mod tests {
     fn decode_packed_format_pieces_matches_real_llbc_templates() {
         use super::decode_packed_format_pieces;
 
-        // The four fixtures below are the verbatim `[u8; N]` pieces buffers
+        // The fixtures below are the verbatim `[u8; N]` pieces buffers
         // charon lowers for these handler graphs (captured from the real
         // pyre-interpreter.ullbc). Each asserts the reconstructed pieces +
-        // placeholder count, i.e. the original format string.
+        // per-placeholder argument indices, i.e. the original format string.
 
         // `format!("stack underflow during {}", context)`
-        let (pieces, n) = decode_packed_format_pieces(&[
+        let (pieces, indices) = decode_packed_format_pieces(&[
             23, 115, 116, 97, 99, 107, 32, 117, 110, 100, 101, 114, 102, 108, 111, 119, 32, 100,
             117, 114, 105, 110, 103, 32, 192, 0,
         ])
@@ -14794,10 +14842,10 @@ mod tests {
             pieces,
             vec!["stack underflow during ".to_string(), String::new()]
         );
-        assert_eq!(n, 1);
+        assert_eq!(indices, vec![0]);
 
         // `format!("{} indices must be integers or slices, not {}", ..)`
-        let (pieces, n) = decode_packed_format_pieces(&[
+        let (pieces, indices) = decode_packed_format_pieces(&[
             192, 41, 32, 105, 110, 100, 105, 99, 101, 115, 32, 109, 117, 115, 116, 32, 98, 101, 32,
             105, 110, 116, 101, 103, 101, 114, 115, 32, 111, 114, 32, 115, 108, 105, 99, 101, 115,
             44, 32, 110, 111, 116, 32, 192, 0,
@@ -14811,10 +14859,10 @@ mod tests {
                 String::new(),
             ]
         );
-        assert_eq!(n, 2);
+        assert_eq!(indices, vec![0, 1]);
 
         // `format!("'{}' object does not support item assignment", ..)`
-        let (pieces, n) = decode_packed_format_pieces(&[
+        let (pieces, indices) = decode_packed_format_pieces(&[
             1, 39, 192, 41, 39, 32, 111, 98, 106, 101, 99, 116, 32, 100, 111, 101, 115, 32, 110,
             111, 116, 32, 115, 117, 112, 112, 111, 114, 116, 32, 105, 116, 101, 109, 32, 97, 115,
             115, 105, 103, 110, 109, 101, 110, 116, 0,
@@ -14827,10 +14875,10 @@ mod tests {
                 "' object does not support item assignment".to_string(),
             ]
         );
-        assert_eq!(n, 1);
+        assert_eq!(indices, vec![0]);
 
         // `format!("__init__() should return None, not '{}'", ..)`
-        let (pieces, n) = decode_packed_format_pieces(&[
+        let (pieces, indices) = decode_packed_format_pieces(&[
             36, 95, 95, 105, 110, 105, 116, 95, 95, 40, 41, 32, 115, 104, 111, 117, 108, 100, 32,
             114, 101, 116, 117, 114, 110, 32, 78, 111, 110, 101, 44, 32, 110, 111, 116, 32, 39,
             192, 1, 39, 0,
@@ -14843,15 +14891,44 @@ mod tests {
                 "'".to_string(),
             ]
         );
-        assert_eq!(n, 1);
+        assert_eq!(indices, vec![0]);
+
+        // `format!("can only concatenate {a} (not \"{b}\") to {a}", ..)` —
+        // the `add`-operand error tail (descroperation.rs), where the first
+        // argument is reused by the trailing placeholder.  The reuse packs a
+        // `0xC8` + little-endian u16 index (`200, 0, 0`) pointing back at
+        // argument 0, so `indices == [0, 1, 0]` with two distinct arguments.
+        let (pieces, indices) = decode_packed_format_pieces(&[
+            21, 99, 97, 110, 32, 111, 110, 108, 121, 32, 99, 111, 110, 99, 97, 116, 101, 110, 97,
+            116, 101, 32, 192, 7, 32, 40, 110, 111, 116, 32, 34, 192, 6, 34, 41, 32, 116, 111, 32,
+            200, 0, 0, 0,
+        ])
+        .unwrap();
+        assert_eq!(
+            pieces,
+            vec![
+                "can only concatenate ".to_string(),
+                " (not \"".to_string(),
+                "\") to ".to_string(),
+                String::new(),
+            ]
+        );
+        assert_eq!(indices, vec![0, 1, 0]);
+
+        // A template naming arguments 1 and 3 explicitly (`0xC8` + u16 index
+        // each): three sequential `0xC0` then two explicit reuses.
+        let (pieces, indices) =
+            decode_packed_format_pieces(&[192, 192, 192, 200, 1, 0, 200, 3, 0, 0]).unwrap();
+        assert_eq!(pieces.len(), 6);
+        assert_eq!(indices, vec![0, 1, 2, 1, 3]);
     }
 
     #[test]
     fn decode_packed_format_pieces_bails_and_handles_edges() {
         use super::decode_packed_format_pieces;
 
-        // A control byte other than 0xC0 (e.g. a format-spec / positional
-        // placeholder) must bail so the recognizer leaves the graph alone.
+        // A control byte other than 0xC0 / 0xC8 (e.g. a width/precision
+        // format-spec) must bail so the recognizer leaves the graph alone.
         assert_eq!(decode_packed_format_pieces(&[0xC1, 0]), None);
         assert_eq!(decode_packed_format_pieces(&[0x80, 0]), None);
 
@@ -14866,16 +14943,21 @@ mod tests {
         assert_eq!(decode_packed_format_pieces(&[2, 104, 105]), None);
         assert_eq!(decode_packed_format_pieces(&[2, 104, 105, 192]), None);
 
-        // Literal-only template (no placeholders) → single piece.
-        let (pieces, n) = decode_packed_format_pieces(&[2, 104, 105, 0]).unwrap();
+        // A `0xC8` reuse token whose 2-byte little-endian index runs past
+        // the buffer end bails rather than reading out of bounds.
+        assert_eq!(decode_packed_format_pieces(&[0xC8, 0]), None);
+        assert_eq!(decode_packed_format_pieces(&[0xC8, 0, 0]), None);
+
+        // Literal-only template (no placeholders) → single piece, no args.
+        let (pieces, indices) = decode_packed_format_pieces(&[2, 104, 105, 0]).unwrap();
         assert_eq!(pieces, vec!["hi".to_string()]);
-        assert_eq!(n, 0);
+        assert_eq!(indices, Vec::<usize>::new());
 
         // Two consecutive literal segments accumulate into one piece
         // (how a >127-byte literal is split); one placeholder follows.
-        let (pieces, n) = decode_packed_format_pieces(&[1, 97, 1, 98, 192, 0]).unwrap();
+        let (pieces, indices) = decode_packed_format_pieces(&[1, 97, 1, 98, 192, 0]).unwrap();
         assert_eq!(pieces, vec!["ab".to_string(), String::new()]);
-        assert_eq!(n, 1);
+        assert_eq!(indices, vec![0]);
     }
 
     #[test]
@@ -14929,9 +15011,9 @@ mod tests {
             .map(|v| resolve_const_int(&graph, v).expect("const int") as u8)
             .collect();
         assert_eq!(decoded, vec![2, 104, 105, 0xC0, 0]);
-        let (pieces, n) = decode_packed_format_pieces(&decoded).unwrap();
+        let (pieces, indices) = decode_packed_format_pieces(&decoded).unwrap();
         assert_eq!(pieces, vec!["hi".to_string(), String::new()]);
-        assert_eq!(n, 1);
+        assert_eq!(indices, vec![0]);
 
         // A non-Array producer (plain ConstInt) is rejected.
         assert_eq!(read_array_literal_elements(&graph, &elements[0]), None);
@@ -15866,6 +15948,7 @@ mod tests {
                     kind: FmtArgKind::Display,
                 },
             ],
+            arg_indices: vec![0, 1],
         };
         let result = emit_fmt_concat(&mut graph, bb, &chain);
 
