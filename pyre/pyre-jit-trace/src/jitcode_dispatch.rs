@@ -9651,10 +9651,12 @@ pub(crate) fn m73_pfmarker_carry_enabled() -> bool {
     })
 }
 
-/// `PYRE_M73_ARMPATH_CARRY` (#73 S5 phase-3 slice-4, default OFF): carry
+/// `PYRE_M73_ARMPATH_CARRY` (#73 S5 phase-3 slice-4, default ON): carry
 /// the outer snapshot coordinate's codewrite-time resume-marker twin in the
-/// per-opcode arm-path snapshot word. Enable with
-/// `PYRE_M73_ARMPATH_CARRY=1`.
+/// per-opcode arm-path snapshot word. Certified by the `M73_ARMPATH` census
+/// (2105 captures across 8 bench+synth programs, 100% eq=1; twin-`None`
+/// rows keep the sentinel) and check.py (162×2, on and off). Disable with
+/// `PYRE_M73_ARMPATH_CARRY=0`.
 pub(crate) fn m73_armpath_carry_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M73_ARMPATH_CARRY") {
@@ -9662,7 +9664,7 @@ pub(crate) fn m73_armpath_carry_enabled() -> bool {
             let v = v.to_string_lossy();
             v != "0" && !v.eq_ignore_ascii_case("false")
         }
-        None => false,
+        None => true,
     })
 }
 
