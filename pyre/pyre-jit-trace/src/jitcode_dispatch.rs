@@ -403,6 +403,17 @@ impl CalleeLocalsShadow {
     }
 }
 
+/// Compile-time-constant frame fields of an inlined callee.
+#[derive(Clone, Copy)]
+pub struct InlineCalleeConsts {
+    /// `frame.w_globals` object (`VABLE_NAMESPACE_FIELD_IDX` = 5): the
+    /// callee function's `__globals__` as a `PyObjectRef`.
+    w_globals: usize,
+    /// `frame.pycode` (`VABLE_CODE_FIELD_IDX` = 1): the callee's `W_Code`
+    /// pointer.
+    w_code: usize,
+}
+
 /// `WalkContext` carries two lifetimes:
 /// * `'frame` — the inner-frame lifetime: register banks + trace
 ///   recorder. Sub-walk recursion (`inline_call_r_r/dR>r`) allocates
@@ -415,6 +426,13 @@ pub struct WalkContext<'frame, 'static_a: 'frame> {
     /// Present only for an inlined-callee sub-walk. Top-level and other walks
     /// have no callee shadow, preserving the former empty-stack no-op behavior.
     pub callee_shadow: Option<CalleeLocalsShadow>,
+    /// Compile-time-constant frame fields of this inlined callee's own
+    /// unseeded portal frame. This is the walk-time equivalent of the
+    /// codewriter's non-portal branch (`codewriter.rs:6720-6732` /
+    /// `:7347-7369`), where `pycode` and `w_globals` are constants rather than
+    /// reads that alias the caller's frame. `None` when this is not an
+    /// inlined-callee sub-walk.
+    pub inline_callee_consts: Option<InlineCalleeConsts>,
     /// Symbolic Ref-bank register file. Indexing matches RPython
     /// `MIFrame.registers_r` (`pyjitpl.py:177-234`); the byte after a
     /// `r`-coded operand opcode indexes directly into this slice.
@@ -2585,6 +2603,7 @@ pub fn dispatch_via_miframe(
     let result = {
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut top_regs_r,
             registers_i: &mut top_regs_i,
             registers_f: &mut top_regs_f,
@@ -2903,6 +2922,7 @@ pub(crate) fn drive_bridge_carrier_subwalk(
     let outcome = {
         let mut sub_wc = WalkContext {
             callee_shadow: Some(Default::default()),
+            inline_callee_consts: Some(consts),
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut regs_f,
@@ -2950,7 +2970,6 @@ pub(crate) fn drive_bridge_carrier_subwalk(
         };
         let _inline_boundary = InlineSubwalkCaptureGuard::enter();
         let _recursion_frame = InlineRecursionGuard::enter(callee_code_key);
-        let _callee_consts = InlineCalleeConstsGuard::enter(consts);
         let _parent_frame_guard = InlineParentFrameGuard::enter(root_frame);
         // Nested self-recursive calls inside the resumed callee fold straight to
         // a recursive-portal CALL_ASSEMBLER (the bridge is the deopt
@@ -3172,6 +3191,7 @@ pub(crate) fn drive_outer_frame_continuation(
     let outcome = {
         let mut outer_wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: Some(consts),
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut regs_f,
@@ -3206,7 +3226,6 @@ pub(crate) fn drive_outer_frame_continuation(
         };
         let _inline_boundary = InlineSubwalkCaptureGuard::enter();
         let _recursion_frame = InlineRecursionGuard::enter(root_code_key);
-        let _callee_consts = InlineCalleeConstsGuard::enter(consts);
         let _parent_frame_guard = InlineParentFrameGuard::enter(root_frame);
         // The outer's own second self-recursive call folds to a live
         // recursive-portal CALL_ASSEMBLER (same as the callee's), not a fresh
@@ -3377,6 +3396,7 @@ pub fn dispatch_via_miframe_at_opcode_entry<'a>(
     let result = {
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut regs_f,
@@ -4011,7 +4031,7 @@ fn try_resolve_inline_callee_static_field(
     if dst_bank != 'r' {
         return Ok(None);
     }
-    let Some(consts) = fbw_current_inline_callee_consts() else {
+    let Some(consts) = ctx.inline_callee_consts else {
         return Ok(None);
     };
     let descr = read_descr(code, op, 1, ctx)?;
@@ -7307,59 +7327,6 @@ impl InlineRecursionGuard {
 impl Drop for InlineRecursionGuard {
     fn drop(&mut self) {
         FBW_INLINE_CODE_STACK.with(|s| {
-            s.borrow_mut().pop();
-        });
-    }
-}
-
-thread_local! {
-    /// FBW inline callee constant stack: for each user function currently
-    /// being inlined by [`try_walker_inline_user_call`]'s sub-walk, its
-    /// compile-time-constant frame fields, innermost last.  When the inlined
-    /// body reads a scalar `getfield_vable_r` off its OWN (unseeded) portal
-    /// frame — the namespace (`w_globals`, field 5) for a `LOAD_GLOBAL`, or
-    /// the promote-to-const `pycode` (field 1) — the read resolves to the
-    /// callee constant here instead of aborting `VableBoxNotSeeded`.  This is
-    /// the walk-time equivalent of the codewriter's non-portal branch
-    /// (`codewriter.rs:6720-6732` / `:7347-7369`): a non-portal callee's
-    /// `pycode`/`w_globals` are compile-time constants, fed as `ConstRef`
-    /// rather than a portal `getfield_vable` that would alias the caller's
-    /// frame and read the wrong field.
-    static FBW_INLINE_CALLEE_CONSTS: std::cell::RefCell<Vec<InlineCalleeConsts>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
-
-/// Compile-time-constant frame fields of an inlined callee (see
-/// [`FBW_INLINE_CALLEE_CONSTS`]).
-#[derive(Clone, Copy)]
-struct InlineCalleeConsts {
-    /// `frame.w_globals` object (`VABLE_NAMESPACE_FIELD_IDX` = 5): the
-    /// callee function's `__globals__` as a `PyObjectRef`.
-    w_globals: usize,
-    /// `frame.pycode` (`VABLE_CODE_FIELD_IDX` = 1): the callee's `W_Code`
-    /// pointer.
-    w_code: usize,
-}
-
-/// The innermost inlined callee's constants, if a sub-walk is active.
-fn fbw_current_inline_callee_consts() -> Option<InlineCalleeConsts> {
-    FBW_INLINE_CALLEE_CONSTS.with(|s| s.borrow().last().copied())
-}
-
-/// RAII guard: push the inlined callee's constants for the lifetime of its
-/// sub-walk, pop on drop so nested inlines unwind to their parent.
-struct InlineCalleeConstsGuard;
-
-impl InlineCalleeConstsGuard {
-    fn enter(consts: InlineCalleeConsts) -> Self {
-        FBW_INLINE_CALLEE_CONSTS.with(|s| s.borrow_mut().push(consts));
-        InlineCalleeConstsGuard
-    }
-}
-
-impl Drop for InlineCalleeConstsGuard {
-    fn drop(&mut self) {
-        FBW_INLINE_CALLEE_CONSTS.with(|s| {
             s.borrow_mut().pop();
         });
     }
@@ -14079,6 +14046,9 @@ fn try_walker_inline_user_call(
     let callee_outcome = {
         let mut sub_wc = WalkContext {
             callee_shadow: Some(Default::default()),
+            // Path-1: resolve scalar static-field reads off this callee's own
+            // unseeded portal frame to its compile-time constants.
+            inline_callee_consts: Some(inline_consts),
             registers_r: &mut callee_regs_r,
             registers_i: &mut callee_regs_i,
             registers_f: &mut callee_regs_f,
@@ -14145,10 +14115,6 @@ fn try_walker_inline_user_call(
                 shadow.set_concrete(callee_portal_frame_reg, slot, concrete);
             }
         }
-        // Path-1: resolve scalar static-field reads off this callee's own
-        // unseeded portal frame to its compile-time constants for the
-        // lifetime of the sub-walk.
-        let _callee_consts = InlineCalleeConstsGuard::enter(inline_consts);
         // #68 multi-frame: push the paused caller frame for the lifetime of the
         // callee sub-walk so its branch guards capture both frames (no-op when
         // `parent_frame` is None — the strict straight-line inline path).
@@ -20222,6 +20188,7 @@ fn run_sub_jitcode_walk(
     let (callee_outcome, _callee_end_pc) = {
         let mut sub_wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut callee_regs_r,
             registers_i: &mut callee_regs_i,
             registers_f: &mut callee_regs_f,
@@ -22764,6 +22731,7 @@ mod tests {
         let descr = done_descr_ref_for_tests();
         let wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
@@ -22830,6 +22798,7 @@ mod tests {
         let mut regs_i = vec![OpRef::NONE];
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -22886,6 +22855,7 @@ mod tests {
         let mut regs_i = vec![OpRef::NONE];
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -22960,6 +22930,7 @@ mod tests {
             let mut regs_i = vec![OpRef::NONE];
             let mut wc = WalkContext {
                 callee_shadow: None,
+                inline_callee_consts: None,
                 registers_r: &mut regs_r,
                 registers_i: &mut regs_i,
                 registers_f: &mut [],
@@ -23145,6 +23116,7 @@ mod tests {
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -23202,6 +23174,7 @@ mod tests {
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -23258,6 +23231,7 @@ mod tests {
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -23323,6 +23297,7 @@ mod tests {
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -23380,6 +23355,7 @@ mod tests {
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -23436,6 +23412,7 @@ mod tests {
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -23701,6 +23678,7 @@ mod tests {
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
@@ -23870,6 +23848,7 @@ mod tests {
         descr_pool[7] = make_jitcode_descr(7);
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -23987,6 +23966,7 @@ mod tests {
         descr_pool[7] = make_jitcode_descr(7);
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -24098,6 +24078,7 @@ mod tests {
         descr_pool[7] = make_jitcode_descr(7);
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut regs_f,
@@ -24198,6 +24179,7 @@ mod tests {
         descr_pool[7] = make_jitcode_descr(7);
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -24295,6 +24277,7 @@ mod tests {
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
@@ -24373,6 +24356,7 @@ mod tests {
         let descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
@@ -24430,6 +24414,7 @@ mod tests {
         descr_pool[3] = make_jitcode_descr(999_999);
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
@@ -24483,6 +24468,7 @@ mod tests {
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
@@ -24545,6 +24531,7 @@ mod tests {
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs,
             registers_i: &mut [],
             registers_f: &mut [],
@@ -24605,6 +24592,7 @@ mod tests {
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
@@ -24668,6 +24656,7 @@ mod tests {
         let descr_int = make_fail_descr(42);
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -24747,6 +24736,7 @@ mod tests {
         let expected = regs_i[1];
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -24814,6 +24804,7 @@ mod tests {
         let mut tc = fresh_trace_ctx();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
@@ -24882,6 +24873,7 @@ mod tests {
         let mut tc = fresh_trace_ctx();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
@@ -24938,6 +24930,7 @@ mod tests {
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
@@ -24997,6 +24990,7 @@ mod tests {
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
@@ -25056,6 +25050,7 @@ mod tests {
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
@@ -25163,6 +25158,7 @@ mod tests {
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs,
             registers_i: &mut [],
             registers_f: &mut [],
@@ -25218,6 +25214,7 @@ mod tests {
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
@@ -25286,6 +25283,7 @@ mod tests {
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs,
             registers_i: &mut [],
             registers_f: &mut [],
@@ -25386,6 +25384,7 @@ mod tests {
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs,
             registers_i: &mut [],
             registers_f: &mut [],
@@ -25470,6 +25469,7 @@ mod tests {
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
@@ -25549,6 +25549,7 @@ mod tests {
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
@@ -25603,6 +25604,7 @@ mod tests {
         let descr_done = done_descr_ref_for_tests();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
@@ -25721,6 +25723,7 @@ mod tests {
         descr_pool[11] = make_jitcode_descr(11);
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
@@ -25842,6 +25845,7 @@ mod tests {
         descr_pool[13] = make_jitcode_descr(13);
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
@@ -25912,6 +25916,7 @@ mod tests {
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -25978,6 +25983,7 @@ mod tests {
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -26035,6 +26041,7 @@ mod tests {
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -26091,6 +26098,7 @@ mod tests {
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut [],
             registers_i: &mut [], // empty — index 7 must surface OOR
             registers_f: &mut [],
@@ -26167,6 +26175,7 @@ mod tests {
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
@@ -26231,6 +26240,7 @@ mod tests {
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
@@ -26286,6 +26296,7 @@ mod tests {
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
@@ -26340,6 +26351,7 @@ mod tests {
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut [], // empty — index 7 must surface OOR
             registers_i: &mut [],
             registers_f: &mut [],
@@ -26405,6 +26417,7 @@ mod tests {
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -26596,6 +26609,7 @@ mod tests {
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -26733,6 +26747,7 @@ mod tests {
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut regs_f,
@@ -26822,6 +26837,7 @@ mod tests {
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut regs_f,
@@ -26889,6 +26905,7 @@ mod tests {
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -26981,6 +26998,7 @@ mod tests {
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -27053,6 +27071,7 @@ mod tests {
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
@@ -27108,6 +27127,7 @@ mod tests {
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
@@ -27165,6 +27185,7 @@ mod tests {
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -27230,6 +27251,7 @@ mod tests {
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
@@ -27287,6 +27309,7 @@ mod tests {
         let mut regs_i = [OpRef::None];
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -27371,6 +27394,7 @@ mod tests {
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
@@ -27437,6 +27461,7 @@ mod tests {
         )];
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -27519,6 +27544,7 @@ mod tests {
         )];
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -27614,6 +27640,7 @@ mod tests {
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -27781,6 +27808,7 @@ mod tests {
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -27865,6 +27893,7 @@ mod tests {
         let call_descr = descr.as_call_descr().expect("CallI descr");
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -27922,6 +27951,7 @@ mod tests {
         let call_descr = descr.as_call_descr().expect("CallI descr");
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -27994,6 +28024,7 @@ mod tests {
         let call_descr = descr.as_call_descr().expect("CallI descr");
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -28090,6 +28121,7 @@ mod tests {
         let call_descr = descr.as_call_descr().expect("CallI descr");
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -28190,6 +28222,7 @@ mod tests {
         let call_descr = descr.as_call_descr().expect("CallI descr");
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -28265,6 +28298,7 @@ mod tests {
         let frame_done_descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -28328,6 +28362,7 @@ mod tests {
         let frame_done_descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -28386,6 +28421,7 @@ mod tests {
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -28453,6 +28489,7 @@ mod tests {
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -28522,6 +28559,7 @@ mod tests {
         let frame_done_descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -28611,6 +28649,7 @@ mod tests {
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -28689,6 +28728,7 @@ mod tests {
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -28766,6 +28806,7 @@ mod tests {
         let frame_done_descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -28825,6 +28866,7 @@ mod tests {
         let frame_done_descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -28922,6 +28964,7 @@ mod tests {
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -29016,6 +29059,7 @@ mod tests {
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -29120,6 +29164,7 @@ mod tests {
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -29254,6 +29299,7 @@ mod tests {
         let frame_done_descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -29324,6 +29370,7 @@ mod tests {
         let frame_done_descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -29382,6 +29429,7 @@ mod tests {
         let frame_done_descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -29464,6 +29512,7 @@ mod tests {
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -29591,6 +29640,7 @@ mod tests {
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -29694,6 +29744,7 @@ mod tests {
         descr_pool[5] = make_jitcode_descr(5);
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
@@ -29796,6 +29847,7 @@ mod tests {
         descr_pool[7] = make_jitcode_descr(7);
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
@@ -29877,6 +29929,7 @@ mod tests {
         descr_pool[7] = make_jitcode_descr(7);
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
@@ -29961,6 +30014,7 @@ mod tests {
         descr_pool[7] = make_jitcode_descr(7);
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -30043,6 +30097,7 @@ mod tests {
         descr_pool[7] = make_jitcode_descr(7);
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -30130,6 +30185,7 @@ mod tests {
         descr_pool[7] = make_jitcode_descr(7);
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut regs_f,
@@ -30215,6 +30271,7 @@ mod tests {
         descr_pool[7] = make_jitcode_descr(7);
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut regs_f,
@@ -30289,6 +30346,7 @@ mod tests {
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -30384,6 +30442,7 @@ mod tests {
 
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -30457,6 +30516,7 @@ mod tests {
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
@@ -30518,6 +30578,7 @@ mod tests {
         let frame_done = done_descr_ref_for_tests();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
@@ -30591,6 +30652,7 @@ mod tests {
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -30684,6 +30746,7 @@ mod tests {
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -30767,6 +30830,7 @@ mod tests {
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -30828,6 +30892,7 @@ mod tests {
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -30915,6 +30980,7 @@ mod tests {
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
@@ -30985,6 +31051,7 @@ mod tests {
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -31066,6 +31133,7 @@ mod tests {
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -31135,6 +31203,7 @@ mod tests {
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -31446,6 +31515,7 @@ mod tests {
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
@@ -31525,6 +31595,7 @@ mod tests {
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -31614,6 +31685,7 @@ mod tests {
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
@@ -31678,6 +31750,7 @@ mod tests {
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
             callee_shadow: None,
+            inline_callee_consts: None,
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
