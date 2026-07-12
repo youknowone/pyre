@@ -9672,10 +9672,12 @@ pub(crate) fn m73_armpath_carry_enabled() -> bool {
     })
 }
 
-/// `PYRE_M73_LOOPCLOSE_CARRY` (#73 S5 phase-3 slice-6, default OFF): carry
+/// `PYRE_M73_LOOPCLOSE_CARRY` (#73 S5 phase-3 slice-6, default ON): carry
 /// the merge-point resume-marker twin into the `GuardEvalBreaker` and
-/// `GuardFutureCondition` loop-close snapshot words. Census pending. Enable
-/// with `PYRE_M73_LOOPCLOSE_CARRY=1`.
+/// `GuardFutureCondition` loop-close snapshot words. Certified by the
+/// `M73_LOOPCLOSE` census (362 captures across pyre/bench + synth, 100%
+/// eq=1) and check.py (162×2, on and off). Disable with
+/// `PYRE_M73_LOOPCLOSE_CARRY=0`.
 pub(crate) fn m73_loopclose_carry_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M73_LOOPCLOSE_CARRY") {
@@ -9683,7 +9685,7 @@ pub(crate) fn m73_loopclose_carry_enabled() -> bool {
             let v = v.to_string_lossy();
             v != "0" && !v.eq_ignore_ascii_case("false")
         }
-        None => false,
+        None => true,
     })
 }
 
