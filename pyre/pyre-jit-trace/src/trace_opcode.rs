@@ -5325,27 +5325,12 @@ impl MIFrame {
     }
 
     /// Box a raw `Type::Int` payload back into a `Ref`, taking the tagged
-    /// immediate path when `CAN_BE_TAGGED` and the concrete value fits
-    /// (`ll_int_box`, mirror of `walker_box_int`).  The `IntAddOvf(raw,raw)`
-    /// doubling is the `fits_tagged` overflow check; a runtime value that does
-    /// not fit deopts on the `GuardNoOverflow` rather than producing a wrong
-    /// box.  Falls back to `wrapint` (heap `W_IntObject`) when the flag is off
-    /// or the value is not a concrete `Int`, so the emission is unchanged in
-    /// the default configuration.
+    /// heap `W_IntObject` via `wrapint` (= `emit_box_int_inline`), a
+    /// `NewWithVtable`+`SetfieldGc` pair the optimizer virtualizes across the
+    /// loop back-edge.  Tagging happens only in the interpreter maker
+    /// (`w_int_new`) and on escape/deopt materialize, so the in-trace box is
+    /// representation-uniform with the flag-off emission.
     pub(crate) fn box_int_payload(&mut self, ctx: &mut TraceCtx, raw: OpRef) -> OpRef {
-        if pyre_object::tagged_int::CAN_BE_TAGGED {
-            if let Some(Value::Int(value)) = ctx.box_value(raw) {
-                if pyre_object::tagged_int::fits_tagged(value) {
-                    let doubled = ctx.record_op(OpCode::IntAddOvf, &[raw, raw]);
-                    ctx.set_opref_concrete(doubled, Value::Int(value << 1));
-                    self.generate_guard(ctx, OpCode::GuardNoOverflow, &[]);
-                    let one = ctx.const_int(1);
-                    let tagged = ctx.record_op(OpCode::IntOr, &[doubled, one]);
-                    ctx.set_opref_concrete(tagged, Value::Int((value << 1) | 1));
-                    return ctx.record_op(OpCode::CastIntToPtr, &[tagged]);
-                }
-            }
-        }
         crate::state::wrapint(ctx, raw)
     }
 

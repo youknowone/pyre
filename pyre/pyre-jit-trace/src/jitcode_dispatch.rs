@@ -8823,16 +8823,9 @@ fn fbw_ensure_boxed_for_ca(
     } else {
         ctx.trace_ctx.get_opref_type(value).unwrap_or(Type::Ref)
     };
+    let _ = op_pc;
     let boxed = match ty {
-        Type::Int => {
-            // The concrete int is stamped on `value` by the `int_return`
-            // callers (or carried by a `ConstInt`), so route the box through
-            // the tagged-immediate path when it fits.
-            match ctx.trace_ctx.box_value(value) {
-                Some(majit_ir::Value::Int(v)) => walker_box_int(ctx, op_pc, value, v)?,
-                _ => crate::state::wrapint(ctx.trace_ctx, value),
-            }
-        }
+        Type::Int => crate::state::wrapint(ctx.trace_ctx, value),
         Type::Float => crate::state::wrapfloat(ctx.trace_ctx, value),
         Type::Ref | Type::Void => value,
     };
@@ -13839,10 +13832,7 @@ fn try_walker_call_assembler_self_recursive(
     // `wrapint` (= `emit_box_int_inline`), so the emitted ops are unchanged.
     // Mirror of `trace_guarded_int_payload(args[0])`.
     let raw_arg = walker_unbox_int(ctx, op.pc, r_args[2], int_type_addr)?;
-    let arg_box = match ctx.trace_ctx.box_value(raw_arg) {
-        Some(majit_ir::Value::Int(v)) => walker_box_int(ctx, op.pc, raw_arg, v)?,
-        _ => crate::state::wrapint(ctx.trace_ctx, raw_arg),
-    };
+    let arg_box = crate::state::wrapint(ctx.trace_ctx, raw_arg);
 
     // Execution-context red: recover it fresh off the materialized caller
     // portal frame via `GETFIELD_GC_R(frame, execution_context_descr)` rather
@@ -16184,6 +16174,50 @@ fn walker_unbox_int(
     )
 }
 
+/// True when `obj` is an InputArg the concrete boundary GUARANTEES was
+/// converted from a tagged immediate to a heap `W_IntObject` — i.e. a
+/// frame LOCALS-region array-item InputArg (`raw() - vable_array_base <
+/// nlocals`) of the active root/loop trace.
+///
+/// The boundary only converts the locals region: `untag_tagged_frame_locals`
+/// (`eval.rs`) loops `0..frame.nlocals()`, and the record seed (`state.rs`
+/// `init_symbolic` array-item pass) converts only `item_idx < nlocals`. The
+/// `locals_cells_stack_w` array laid out behind those InputArgs also holds the
+/// VALUE-STACK tail (`nlocals..live_prefix`), which the boundary does NOT
+/// touch — so a value-stack-slot InputArg can still arrive tagged on a later
+/// entry and MUST keep its defensive tag guard.
+///
+/// Returns `false` for:
+///   * a scalar InputArg (`frame`/`ec`/`last_instr`/... at `raw() <
+///     vable_array_base`) — never a boxed int operand, but classified
+///     conservatively;
+///   * a value-stack-slot array-item InputArg (`slot >= nlocals`);
+///   * a bridge trace's InputArg (no `vable_array_base`), whose boxes come
+///     from the guard-fail resume stream, not the converted portal frame;
+///   * a non-InputArg (op result / const / temp).
+///
+/// Reads the active portal sym via `fbw_mode.snapshot_sym` (the same
+/// source `reseed_vstack_from_shadow` uses for `nlocals`); `false` when the
+/// pointer is null (no materialized portal — the trait leg / tests), which
+/// keeps the guard (correct-but-conservative).
+fn walker_inputarg_is_converted_local(ctx: &WalkContext<'_, '_>, obj: OpRef) -> bool {
+    if !obj.is_input_arg() {
+        return false;
+    }
+    let sym_ptr = ctx.fbw_mode.snapshot_sym;
+    if sym_ptr.is_null() {
+        return false;
+    }
+    // SAFETY: pointer live for the full-body walk; read-only nlocals /
+    // vable_array_base.
+    let (nlocals, base) = unsafe { ((*sym_ptr).nlocals, (*sym_ptr).vable_array_base) };
+    let Some(base) = base else {
+        return false;
+    };
+    let raw = obj.raw();
+    raw >= base && ((raw - base) as usize) < nlocals
+}
+
 /// [`walker_unbox_int`] with an explicit `intval` descr so a `bool` operand
 /// can guard its own `&BOOL_TYPE` and read through `bool_intval_descr`
 /// (`bool` shares `W_IntObject`'s `intval` field).
@@ -16194,7 +16228,13 @@ fn walker_unbox_int_typed(
     type_addr: i64,
     intval_descr: majit_ir::DescrRef,
 ) -> Result<OpRef, DispatchError> {
-    if pyre_object::tagged_int::CAN_BE_TAGGED {
+    // A known-class operand is provably a heap `W_IntObject` — a prior
+    // `GuardClass` derefed its `ob_type`, impossible on a tagged immediate — so
+    // it needs neither the tag test nor a repeated `GuardClass`.  Skipping the
+    // tag block for it is also what keeps a JIT-made heap box (e.g. a `wrapint`
+    // result) from emitting a `CastPtrToInt` lowbit test that would force the
+    // box out of virtuality in the loop.
+    if pyre_object::tagged_int::CAN_BE_TAGGED && !ctx.trace_ctx.heap_cache().is_class_known(obj) {
         if let Some(o) = walker_concrete_ref_object(ctx, obj) {
             if pyre_object::tagged_int::is_tagged_int(o) {
                 let lowbit = crate::helpers::emit_tag_lowbit_test(ctx.trace_ctx, obj, true);
@@ -16204,11 +16244,32 @@ fn walker_unbox_int_typed(
                     obj,
                     pyre_object::tagged_int::untag_int(o),
                 ));
-            } else {
+            } else if !walker_inputarg_is_converted_local(ctx, obj) {
+                // Emit the defensive `GuardFalse(lowbit)` for every heap-concrete
+                // operand EXCEPT a frame LOCALS-region InputArg (handled below):
+                //   * a NON-InputArg (a residual-call result box) can still
+                //     receive a tagged immediate on a future arrival;
+                //   * a value-stack-slot InputArg (`slot >= nlocals`) and a
+                //     bridge InputArg (no vable layout) are NOT covered by the
+                //     concrete boundary, which converts only the LOCALS region
+                //     (`untag_tagged_frame_locals` loops `0..frame.nlocals()`;
+                //     the record seed converts `item_idx < nlocals`), so a later
+                //     entry could deliver a tagged immediate to that slot.
+                // With the guard the boxed leg then deopts (not faults) on a
+                // tagged arrival.
                 let lowbit = crate::helpers::emit_tag_lowbit_test(ctx.trace_ctx, obj, false);
                 walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[lowbit])?;
-                // fall through: boxed leg now deopts (not faults) on a tagged arrival.
             }
+            // A heap-concrete LOCALS-region InputArg is an entry/loop-carried
+            // frame local that the concrete boundary
+            // (`untag_tagged_frame_locals` at compiled-loop entry + the
+            // trace-record seed) already converted to a heap `W_IntObject`, and
+            // re-converts on every subsequent entry, so no tagged immediate ever
+            // reaches it. Emit NO tag test for it: the `CastPtrToInt`+`IntAnd`+
+            // `GuardFalse` does not forward through the loop-close `SetfieldGc`,
+            // so it would survive the unroll and pin a per-iteration rebox in the
+            // steady loop. Skipping it yields the flag-false `GuardClass`+
+            // `GetfieldGcPure` shape (raw carry).
         }
     }
     if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
@@ -16523,19 +16584,24 @@ fn walker_box_int(
     raw: OpRef,
     value: i64,
 ) -> Result<OpRef, DispatchError> {
-    if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::fits_tagged(value) {
-        let doubled = ctx.trace_ctx.record_op(OpCode::IntAddOvf, &[raw, raw]);
-        ctx.trace_ctx
-            .set_opref_concrete(doubled, majit_ir::Value::Int(value << 1));
-        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoOverflow, &[])?;
-        let one = ctx.trace_ctx.const_int(1);
-        let tagged = ctx.trace_ctx.record_op(OpCode::IntOr, &[doubled, one]);
-        ctx.trace_ctx
-            .set_opref_concrete(tagged, majit_ir::Value::Int((value << 1) | 1));
-        let ptr = ctx.trace_ctx.record_op(OpCode::CastIntToPtr, &[tagged]);
-        return Ok(ptr);
-    }
+    let _ = (op_pc, value);
     Ok(crate::state::wrapint(ctx.trace_ctx, raw))
+}
+
+/// Concrete counterpart to [`walker_box_int`]. The op is now a heap
+/// `NewWithVtable`, so the stamped concrete must ALSO be a heap ptr. When the
+/// residual result is tagged (flag-true), materialize a real heap
+/// `W_IntObject` via `w_int_new_unique` for the concrete so
+/// `op(heap) == concrete(heap)`.
+fn box_int_concrete(value: i64, runtime_ptr: i64) -> majit_ir::Value {
+    let ptr = if pyre_object::tagged_int::CAN_BE_TAGGED
+        && pyre_object::tagged_int::is_tagged_int(runtime_ptr as pyre_object::PyObjectRef)
+    {
+        pyre_object::intobject::w_int_new_unique(value) as i64
+    } else {
+        runtime_ptr
+    };
+    majit_ir::Value::Ref(majit_ir::GcRef(ptr as usize))
 }
 
 /// #57: walker-native speculative int specialization for the `BINARY_OP`
@@ -16748,15 +16814,18 @@ fn try_walker_specialize_binary_op_int(
     // A both-bool bitwise result boxes via `space.newbool` (boolobject.py:
     // 74-76) so it keeps the bool type; `boxed_result_i64` is already the
     // authentic W_Bool the forced residual produced.
-    let boxed = if result_is_bool {
-        crate::helpers::emit_trace_bool_value_from_truth(ctx.trace_ctx, raw_result, false)
+    let (boxed, boxed_concrete) = if result_is_bool {
+        (
+            crate::helpers::emit_trace_bool_value_from_truth(ctx.trace_ctx, raw_result, false),
+            majit_ir::Value::Ref(majit_ir::GcRef(boxed_result_i64 as usize)),
+        )
     } else {
-        walker_box_int(ctx, op_pc, raw_result, concrete_value)?
+        (
+            walker_box_int(ctx, op_pc, raw_result, concrete_value)?,
+            box_int_concrete(concrete_value, boxed_result_i64),
+        )
     };
-    ctx.trace_ctx.set_opref_concrete(
-        boxed,
-        majit_ir::Value::Ref(majit_ir::GcRef(boxed_result_i64 as usize)),
-    );
+    ctx.trace_ctx.set_opref_concrete(boxed, boxed_concrete);
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
     Ok(Some(()))
 }
@@ -17141,10 +17210,8 @@ fn try_walker_specialize_unpack(
             let elem =
                 unsafe { pyre_object::w_int_get_value(elem_ptr as pyre_object::PyObjectRef) };
             let boxed = walker_box_int(ctx, op_pc, raw, elem)?;
-            ctx.trace_ctx.set_opref_concrete(
-                boxed,
-                majit_ir::Value::Ref(majit_ir::GcRef(elem_ptr as usize)),
-            );
+            ctx.trace_ctx
+                .set_opref_concrete(boxed, box_int_concrete(elem, elem_ptr as i64));
             write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
             Ok(Some(()))
         }
@@ -18278,14 +18345,22 @@ fn try_walker_specialize_subscr(
     // sanity load is skipped when `items_ptr` is not trace-time concrete) so
     // the `wrapint` / `wrapfloat` box's cached field matches a later unbox.
     let result_obj = boxed_result_i64 as pyre_object::PyObjectRef;
-    let boxed = match sid {
+    let default_concrete = majit_ir::Value::Ref(majit_ir::GcRef(boxed_result_i64 as usize));
+    let (boxed, boxed_concrete) = match sid {
         0 => {
             let items_block = crate::state::opimpl_getfield_gc_r(
                 ctx.trace_ctx,
                 list_op,
                 crate::descr::list_items_descr(),
             );
-            crate::state::trace_items_block_getitem_value(ctx.trace_ctx, items_block, raw_index)
+            (
+                crate::state::trace_items_block_getitem_value(
+                    ctx.trace_ctx,
+                    items_block,
+                    raw_index,
+                ),
+                default_concrete,
+            )
         }
         1 => {
             let block = crate::state::opimpl_getfield_gc_r(
@@ -18297,7 +18372,10 @@ fn try_walker_specialize_subscr(
             let elem = unsafe { pyre_object::w_int_get_value(result_obj) };
             ctx.trace_ctx
                 .set_opref_concrete(raw, majit_ir::Value::Int(elem));
-            walker_box_int(ctx, op_pc, raw, elem)?
+            (
+                walker_box_int(ctx, op_pc, raw, elem)?,
+                box_int_concrete(elem, boxed_result_i64),
+            )
         }
         _ => {
             let block = crate::state::opimpl_getfield_gc_r(
@@ -18310,13 +18388,13 @@ fn try_walker_specialize_subscr(
             let elem = unsafe { pyre_object::w_float_get_value(result_obj) };
             ctx.trace_ctx
                 .set_opref_concrete(raw, majit_ir::Value::Float(elem));
-            crate::state::wrapfloat(ctx.trace_ctx, raw)
+            (
+                crate::state::wrapfloat(ctx.trace_ctx, raw),
+                default_concrete,
+            )
         }
     };
-    ctx.trace_ctx.set_opref_concrete(
-        boxed,
-        majit_ir::Value::Ref(majit_ir::GcRef(boxed_result_i64 as usize)),
-    );
+    ctx.trace_ctx.set_opref_concrete(boxed, boxed_concrete);
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
     Ok(Some(()))
 }
@@ -18586,7 +18664,7 @@ fn try_walker_specialize_builtin_len(
     let boxed = walker_box_int(ctx, op.pc, raw_len, concrete_len as i64)?;
     ctx.trace_ctx.set_opref_concrete(
         boxed,
-        majit_ir::Value::Ref(majit_ir::GcRef(boxed_result as usize)),
+        box_int_concrete(concrete_len as i64, boxed_result as i64),
     );
     write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', boxed)?;
     Ok(Some(()))
@@ -20052,11 +20130,15 @@ fn emit_namespace_cell_fold(
     // reason (`write_cell` mutates `intvalue` in place for an int->int
     // reassign) then re-boxes the raw int; a raw stored value is its own
     // result.
-    let result_opref = if is_obj_cell {
-        crate::state::opimpl_getfield_gc_r(
-            ctx.trace_ctx,
-            cell_opref,
-            crate::descr::object_mutable_cell_value_descr(),
+    let default_concrete = majit_ir::Value::Ref(majit_ir::GcRef(result_obj as usize));
+    let (result_opref, result_concrete) = if is_obj_cell {
+        (
+            crate::state::opimpl_getfield_gc_r(
+                ctx.trace_ctx,
+                cell_opref,
+                crate::descr::object_mutable_cell_value_descr(),
+            ),
+            default_concrete,
         )
     } else if is_int_cell {
         let raw_int = crate::state::opimpl_getfield_gc_i(
@@ -20065,16 +20147,17 @@ fn emit_namespace_cell_fold(
             crate::descr::int_mutable_cell_value_descr(),
         );
         let intval = unsafe { pyre_object::w_int_get_value(result_obj) };
-        walker_box_int(ctx, op_pc, raw_int, intval)?
+        (
+            walker_box_int(ctx, op_pc, raw_int, intval)?,
+            box_int_concrete(intval, result_obj as i64),
+        )
     } else {
-        cell_opref
+        (cell_opref, default_concrete)
     };
     // Seed the dst's concrete with the unwrapped LOAD result so chained
     // walker handlers see the resolved value instead of `Null`.
-    ctx.trace_ctx.set_opref_concrete(
-        result_opref,
-        majit_ir::Value::Ref(majit_ir::GcRef(result_obj as usize)),
-    );
+    ctx.trace_ctx
+        .set_opref_concrete(result_opref, result_concrete);
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result_opref)?;
     // `pyjitpl.py:1685-1690 _opimpl_residual_call*` finishes its no-raise
     // tail with `metainterp.clear_exception()`.  The fold replaces a
@@ -20599,10 +20682,8 @@ fn dispatch_residual_call_iIRd_kind(
                 let intval =
                     unsafe { pyre_object::w_int_get_value(boxed_ptr as pyre_object::PyObjectRef) };
                 let boxed = walker_box_int(ctx, op.pc, raw_arg, intval)?;
-                ctx.trace_ctx.set_opref_concrete(
-                    boxed,
-                    majit_ir::Value::Ref(majit_ir::GcRef(boxed_ptr as usize)),
-                );
+                ctx.trace_ctx
+                    .set_opref_concrete(boxed, box_int_concrete(intval, boxed_ptr));
                 write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, boxed)?;
                 return Ok((DispatchOutcome::Continue, op.next_pc));
             }

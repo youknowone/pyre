@@ -1731,6 +1731,33 @@ fn run_perfn_walk(
                         }
                         let color = color as u8;
                         if reserved_red_colors.contains(&color) {
+                            // `bridge_registers_r` is the authoritative guard-time
+                            // register coloring.  Free register allocation reuses
+                            // the portal EC color for a live operand at PCs where
+                            // the trace has no live EC read (the same collision the
+                            // guard-failure resume handles at
+                            // jitcode_dispatch.rs:6994 via `semantic_idx.is_none()`
+                            // — otherwise `fib(n-1) + fib(n-2)` resumes the left
+                            // operand as the EC and SIGSEGVs).  When the bridge
+                            // names a genuine operand here (an opref other than the
+                            // pre-seeded `ec_box`/`frame_box`), skipping strands the
+                            // stale `ConstPtr(ec)` in the color the resumed body
+                            // reads as its operand.  Seed the real operand.
+                            //
+                            // The FRAME color (`reserved_red_colors[0]`) keeps its
+                            // skip unconditionally: its `frame_box` is the standard
+                            // virtualizable identity and overwriting it forces every
+                            // later `vable_*` op onto the nonstandard leg (#124
+                            // `NonStandardVableFinishPortalUnsupported`).  The EC
+                            // color carries no such identity — the EC stays
+                            // recoverable from the frame — so reseeding it is safe.
+                            let is_frame_color =
+                                reserved_red_colors.first().copied() == Some(color);
+                            let bridge_names_operand =
+                                !is_frame_color && opref != ec_box && opref != frame_box;
+                            if pyre_object::tagged_int::CAN_BE_TAGGED && bridge_names_operand {
+                                seed(color, opref);
+                            }
                             continue;
                         }
                         seed(color, opref);

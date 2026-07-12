@@ -188,6 +188,16 @@ impl OpRef {
         matches!(self, Self::None)
     }
 
+    /// Mirrors RPython `isinstance(value, AbstractInputArg)` — the operand is
+    /// one of the trace's typed input args (a loop/function entry value), not a
+    /// recorded op result, constant, or temp.
+    pub fn is_input_arg(self) -> bool {
+        matches!(
+            self,
+            Self::InputArgInt(_) | Self::InputArgFloat(_) | Self::InputArgRef(_)
+        )
+    }
+
     /// Extract the raw u32 payload. For `None` returns `u32::MAX` to
     /// preserve pre-Phase-3 round-trip semantics.
     ///

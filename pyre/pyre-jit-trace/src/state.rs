@@ -2677,7 +2677,21 @@ pub(crate) fn frame_locals_cells_stack_descr() -> DescrRef {
 // reads through w_globals → dict_storage_proxy.
 
 pub(crate) fn wrapint(ctx: &mut TraceCtx, value: OpRef) -> OpRef {
-    crate::helpers::emit_box_int_inline(ctx, value, w_int_size_descr(), int_intval_descr())
+    let boxed =
+        crate::helpers::emit_box_int_inline(ctx, value, w_int_size_descr(), int_intval_descr());
+    // A JIT-made int box is provably a heap `W_IntObject`; record its class so a
+    // later unbox of a loop-carried box skips the tag block AND the redundant
+    // `GuardClass`, taking the `GetfieldGc` path that folds through this box's
+    // `SetfieldGc` at loop-close. Without this the unbox falls into the
+    // `CastPtrToInt` tag-arith leg (a JIT box is not tag-known), which does NOT
+    // fold through `NewWithVtable`+`SetfieldGc` and leaves a per-iteration
+    // rebox+`GuardTrue(lowbit)` in the steady loop that fails every back-edge.
+    // Gated on `CAN_BE_TAGGED` so flag-false unbox emission is byte-identical.
+    if pyre_object::tagged_int::CAN_BE_TAGGED {
+        let int_type = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+        ctx.heap_cache_mut().class_now_known(boxed, int_type);
+    }
+    boxed
 }
 
 /// pyjitpl.py:3514 find_biggest_function
@@ -4834,7 +4848,29 @@ impl PyreSym {
                 }
                 for (a, items) in array_boxes.iter().enumerate() {
                     let item_ty = info.array_fields[a].item_type;
-                    for bits in items {
+                    for (item_idx, bits) in items.iter().enumerate() {
+                        // Seed a tagged-immediate local as the heap `W_IntObject`
+                        // it stands for, so the recorded body reads it through the
+                        // flag-false `GuardClass`+`GetfieldGcPure` arm rather than
+                        // the tagged `CastPtrToInt`+`IntAnd` arm. The runtime
+                        // (`execute_assembler`) converts the live frame's local
+                        // slots to heap boxes before the compiled loop reads them;
+                        // the tracer works on a `snapshot_for_tracing` copy whose
+                        // slots are still tagged, so the same conversion must run
+                        // here at record time. Only the locals region is converted
+                        // (cells/free vars and stack temps stay untouched).
+                        if pyre_object::tagged_int::CAN_BE_TAGGED
+                            && item_ty == Type::Ref
+                            && item_idx < nlocals
+                        {
+                            let obj = *bits as pyre_object::PyObjectRef;
+                            if !obj.is_null() && pyre_object::tagged_int::is_tagged_int(obj) {
+                                let value = pyre_object::tagged_int::untag_int(obj);
+                                let heap = pyre_object::intobject::w_int_new_unique(value);
+                                values.push(majit_ir::Value::Ref(majit_ir::GcRef(heap as usize)));
+                                continue;
+                            }
+                        }
                         values.push(value_for_slot(item_ty, *bits));
                     }
                 }

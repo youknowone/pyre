@@ -5278,6 +5278,44 @@ pub(crate) fn resume_in_blackhole_from_exit_layout(
     );
 }
 
+/// Replace every tagged-immediate int in a frame's local slots with a real
+/// heap `W_IntObject`, in place, before a compiled loop reads them.
+///
+/// `w_int_new` tags small ints as `(value << 1) | 1` during interpretation, so
+/// a hot-loop-carried local can enter the JIT as a tagged immediate. The trace
+/// body would then record the tag-arithmetic unbox (`CastPtrToInt`+`IntRshift`)
+/// against the entry InputArg; the unroll replicates that into the steady loop,
+/// where the loop-carried value is a heap box (low bit 0) and the
+/// `GuardTrue(lowbit)` fails on every back-edge → deopt storm / hang. Converting
+/// the slot to a heap box here — at the concrete boundary, recording no IR —
+/// makes the compiled loop read heap `W_IntObject`, so the trace is the
+/// flag-false `GuardClass`+`GetfieldGcPure` shape that virtualizes to a raw
+/// carry with zero in-loop tag ops.
+///
+/// Only the locals region (`0..nlocals`) is scanned; cell/free vars and stack
+/// temps are left untouched. GC-safe: `w_int_new_unique` returns a managed heap
+/// box and the store lands in the frame's `locals_cells_stack_w` array, which
+/// is a GC root for the duration of the compiled run (`FrameLocalsRoot`) and is
+/// forwarded via the current-frame chain during any collection the allocation
+/// itself triggers.
+#[inline]
+fn untag_tagged_frame_locals(frame: &mut PyFrame) {
+    if !pyre_object::tagged_int::CAN_BE_TAGGED {
+        return;
+    }
+    let nlocals = frame.nlocals();
+    let locals = frame.locals_w_mut();
+    let n = nlocals.min(locals.len());
+    for i in 0..n {
+        let slot = locals[i];
+        if !slot.is_null() && pyre_object::tagged_int::is_tagged_int(slot) {
+            let value = pyre_object::tagged_int::untag_int(slot);
+            let boxed = pyre_object::intobject::w_int_new_unique(value);
+            locals[i] = boxed;
+        }
+    }
+}
+
 /// RPython warmstate.py:387-423 execute_assembler.
 ///
 /// Run compiled machine code for a given green_key. Handles the
@@ -5295,6 +5333,11 @@ fn execute_assembler(
 ) -> Option<LoopResult> {
     let mut frame_root = FrameRoot::new(frame);
     frame_root.frame().set_last_instr_from_next_instr(entry_pc);
+
+    // Convert tagged-immediate frame locals to heap `W_IntObject` before the
+    // compiled loop reads them, so the trace body operates on the flag-false
+    // heap-int representation (no in-loop tag test). See `untag_tagged_frame_locals`.
+    untag_tagged_frame_locals(frame);
 
     if majit_metainterp::majit_log_enabled() {
         let locals: Vec<(usize, Option<i64>)> = (0..frame_root.frame().locals_w().len().min(5))
@@ -5884,6 +5927,13 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
             );
         }
         let env = PyreEnv;
+        // Same concrete boundary as `execute_assembler`: a function-entry
+        // compiled trace reads its arg locals as heap `W_IntObject`
+        // (`GuardClass`+`GetfieldGcPure`, entry-local tag test omitted), but
+        // this path never runs `execute_assembler`, so convert here too. A
+        // recursive callee (`fib(n-1)`) arrives with a tagged-immediate arg
+        // local; without this the compiled `GuardClass(n)` derefs the tag.
+        untag_tagged_frame_locals(frame_root.frame());
         let mut jit_state = build_jit_state(frame_root.frame(), info);
         let outcome = {
             let _frame_locals_root = FrameLocalsRoot::new(frame_root.frame());
@@ -6965,7 +7015,8 @@ fn materialize_virtual_from_rd(
                     },
                     intval: 0,
                 });
-                Box::into_raw(obj) as usize
+                let raw = Box::into_raw(obj) as usize;
+                raw
             } else if ob_type == float_type_addr {
                 let tp = unsafe { &*(ob_type as *const pyre_object::pyobject::PyType) };
                 let obj = Box::new(pyre_object::floatobject::W_FloatObject {
@@ -7202,8 +7253,6 @@ fn decode_tagged_value(
     }
 }
 
-// dont_look_inside: post-trace deopt layout decode machinery.
-#[majit_macros::dont_look_inside]
 fn decode_exit_layout_values(raw_values: &[i64], layout: &CompiledExitLayout) -> Vec<Value> {
     layout
         .exit_types
@@ -8467,7 +8516,8 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
                     },
                     intval: 0,
                 });
-                Box::into_raw(obj) as i64
+                let raw = Box::into_raw(obj) as i64;
+                raw
             }
             W_FLOAT_GC_TYPE_ID => {
                 let obj = Box::new(pyre_object::floatobject::W_FloatObject {
