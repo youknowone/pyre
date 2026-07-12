@@ -9734,6 +9734,23 @@ pub(crate) fn m73_lclive_carry_enabled() -> bool {
     })
 }
 
+/// #73 S5 p5-s6: key the paused inline-caller frame's liveness query off the
+/// after-residual marker twin already carried in the frame's snapshot word
+/// (`resume_marker_jit_pc`), instead of the sentinel +
+/// `resume_jitcode_pc_for(fallthrough)` translation. Certified by the
+/// M73_INLCALLER census (bank equality) and the p3-s2 M73_PFMARKER identity.
+/// `PYRE_M73_INLCALLER_CARRY=0` opts out.
+pub(crate) fn m73_inlcaller_carry_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M73_INLCALLER_CARRY") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => true,
+    })
+}
+
 /// #73 S5 phase-3 slice-5: attribution census for the residual decode-side
 /// resume-translation traffic (`bucket=sentinel_plain` in
 /// `PYRE_M369_RECOVER_AUDIT`). Under the audit gate, print one line per
@@ -12001,6 +12018,38 @@ fn compute_inline_caller_frame(
     if result_color < ctx.registers_r.len() {
         ctx.registers_r[result_color] = null_ref;
     }
+    if m73_marker_audit_enabled() {
+        if let Some(twin) = resume_marker_jit_pc {
+            let with_twin = crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
+                jitcode_index as i32,
+                fallthrough_py_pc as i32,
+                twin as i32,
+            );
+            let via_py = crate::state::frame_liveness_reg_indices_by_bank_at(
+                jitcode_index as i32,
+                fallthrough_py_pc as i32,
+            );
+            eprintln!(
+                "M73_INLCALLER eq={} idx={} py_pc={} twin={}",
+                (with_twin == via_py) as u8,
+                jitcode_index,
+                fallthrough_py_pc,
+                twin
+            );
+        } else {
+            eprintln!(
+                "M73_INLCALLER eq=notwin idx={} py_pc={}",
+                jitcode_index, fallthrough_py_pc
+            );
+        }
+    }
+    // The after-residual marker names the same `-live-` the fallthrough
+    // translation resolves to (M73_PFMARKER identity), bypassing the py channel.
+    let caller_liveness_word = match resume_marker_jit_pc.filter(|_| m73_inlcaller_carry_enabled())
+    {
+        Some(m) => m as i32,
+        None => majit_ir::resumedata::NO_JITCODE_PC,
+    };
     let boxes = collect_outer_active_boxes(
         caller_sym,
         ctx.trace_ctx,
@@ -12010,7 +12059,7 @@ fn compute_inline_caller_frame(
         jitcode_index,
         fallthrough_py_pc,
         None,
-        majit_ir::resumedata::NO_JITCODE_PC,
+        caller_liveness_word,
         None,
         &[],
     );
@@ -12078,11 +12127,39 @@ fn compute_nested_inline_caller_frame(
     if result_color < ctx.registers_r.len() {
         ctx.registers_r[result_color] = null_ref;
     }
-    // A paused caller frame resumes at the CALL return point via the
-    // Python-pc → jitcode resume-translation path; no kept-stack jitcode
-    // coordinate is carried for
-    // it (mirrors the caller-frame handling at the depth-2 callee site), so it
-    // queries liveness through the `fallthrough_py_pc` window with the sentinel.
+    if m73_marker_audit_enabled() {
+        if let Some(twin) = resume_marker_jit_pc {
+            let with_twin = crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
+                jitcode_index as i32,
+                fallthrough_py_pc as i32,
+                twin as i32,
+            );
+            let via_py = crate::state::frame_liveness_reg_indices_by_bank_at(
+                jitcode_index as i32,
+                fallthrough_py_pc as i32,
+            );
+            eprintln!(
+                "M73_INLCALLER eq={} idx={} py_pc={} twin={}",
+                (with_twin == via_py) as u8,
+                jitcode_index,
+                fallthrough_py_pc,
+                twin
+            );
+        } else {
+            eprintln!(
+                "M73_INLCALLER eq=notwin idx={} py_pc={}",
+                jitcode_index, fallthrough_py_pc
+            );
+        }
+    }
+    // The after-residual marker names the same `-live-` the fallthrough
+    // translation resolves to (M73_PFMARKER identity), bypassing the py channel.
+    // `PYRE_M73_INLCALLER_CARRY=0` falls back to the sentinel + translation.
+    let caller_liveness_word = match resume_marker_jit_pc.filter(|_| m73_inlcaller_carry_enabled())
+    {
+        Some(m) => m as i32,
+        None => majit_ir::resumedata::NO_JITCODE_PC,
+    };
     let boxes = collect_callee_active_boxes(
         ctx.registers_i,
         ctx.registers_r,
@@ -12090,7 +12167,7 @@ fn compute_nested_inline_caller_frame(
         jitcode_index,
         fallthrough_py_pc,
         call_jit_pc,
-        majit_ir::resumedata::NO_JITCODE_PC,
+        caller_liveness_word,
     );
     if let (Some(saved), true) = (saved, result_color < ctx.registers_r.len()) {
         ctx.registers_r[result_color] = saved;
