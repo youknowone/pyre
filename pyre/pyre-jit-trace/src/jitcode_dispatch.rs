@@ -5907,6 +5907,13 @@ fn try_execute_residual_call_via_executor(
     recorded: OpRef,
     op_pc: usize,
 ) -> Result<ResidualExecOutcome, DispatchError> {
+    // `execute_varargs` clears the metainterp exception slot at residual-call
+    // entry, before the helper can either run or leave the call recorded
+    // symbolically. A handled exception from an earlier opcode must not survive
+    // across the back edge and make a later linear `catch_exception/L` look like
+    // it is handling a fresh raise.
+    clear_walk_exception(ctx);
+
     // Orthodox sub-jitcode walk safety (#171 wall-5d): a residual call whose
     // funcbox is a `symbolic_fnaddr` placeholder — a 64-bit `DefaultHasher`
     // hash of an in-body helper's `CallPath`/`CallTarget`, minted when
@@ -6470,20 +6477,6 @@ fn try_execute_residual_call_via_executor(
     match exec_result {
         Ok(result_i64) => {
             fbw_count_executed_residual(is_void, is_may_force);
-            // `pyjitpl.py:1685-1690 _opimpl_residual_call*` finishes its
-            // success arm with `metainterp.clear_exception()` (called
-            // implicitly through `do_residual_call`'s no-raise tail).
-            // Pyre's `ctx.last_exc_value` carries a sticky `OpRef` /
-            // concrete pointer from any prior raising helper in the
-            // same walk; if a later non-raising residual call did not
-            // clear it, downstream consumers (`last_exc_value/>r`,
-            // `reraise/`, `catch_exception/L`) would read the stale
-            // value as if a fresh exception had just landed.  Mirror
-            // `clear_exception()` here so the success arm only
-            // surfaces an active exception when the *current* call
-            // raised.
-            ctx.last_exc_value = None;
-            ctx.last_exc_value_concrete = ConcreteValue::Null;
             // #57 (Finding #1): the in-place int-list extend committed; journal
             // its pre-extend length so an aborting walk's rollback rewinds it and
             // the deliver re-applies it exactly once.  `result_i64 == lhs`
@@ -13054,6 +13047,11 @@ fn walker_record_guard_exception(ctx: &mut WalkContext<'_, '_>, pc: usize) {
     let _ = walker_capture_snapshot_for_last_guard(ctx, pc);
 }
 
+fn clear_walk_exception(ctx: &mut WalkContext<'_, '_>) {
+    ctx.last_exc_value = None;
+    ctx.last_exc_value_concrete = ConcreteValue::Null;
+}
+
 fn direct_call_release_gil(
     ctx: &mut WalkContext<'_, '_>,
     ei: &majit_ir::EffectInfo,
@@ -15531,6 +15529,11 @@ fn dispatch_residual_call_iRd_kind(
     };
 
     let ei = call_descr.get_extra_info();
+    // Residual-call entry mirrors `execute_varargs`: even when the walker
+    // folds the call or leaves it recorded symbolically, stale handled
+    // exceptions from earlier opcodes are not visible to the following
+    // linear `catch_exception/L`.
+    clear_walk_exception(ctx);
 
     // #62 slice (3c): attempt full-body-walk inline of a user-function call
     // (dev-gated PYRE_FBW_INLINE).  Eligible exact-positional closure-free
@@ -20756,6 +20759,7 @@ fn dispatch_residual_call_iIRd_kind(
     let allboxes = build_allboxes(funcptr, &argboxes, &argbox_types, call_descr.arg_types());
 
     let ei = call_descr.get_extra_info();
+    clear_walk_exception(ctx);
     // pyjitpl.py:2003-2005 OS_NOT_IN_TRACE guard — see helper docstring
     // for the convergence rationale.
     if let Some(outcome) = do_not_in_trace_call_result(ei, op.pc)? {
@@ -21338,6 +21342,7 @@ fn dispatch_residual_call_iIRFd_kind(
     ensure_residual_call_args_bound(&allboxes, op.pc)?;
 
     let ei = call_descr.get_extra_info();
+    clear_walk_exception(ctx);
     if let Some(outcome) = do_not_in_trace_call_result(ei, op.pc)? {
         return Ok((outcome, op.next_pc));
     }
