@@ -9594,10 +9594,14 @@ pub(crate) fn m73_marker_carry_enabled() -> bool {
     })
 }
 
-/// `PYRE_M73_ARMARKER_CARRY` (#73 S5 phase-2, default OFF): source the plain
-/// after-residual-call marker from the codewrite-time fallthrough-marker twin,
-/// retaining runtime resume-marker derivation as the fallback for twin-`None`
-/// rows. Enable with `PYRE_M73_ARMARKER_CARRY=1`.
+/// `PYRE_M73_ARMARKER_CARRY` (#73 S5 phase-2, default ON): source the plain
+/// after-residual-call marker from the codewrite-time fallthrough-marker twin
+/// at the guard's own jitcode offset, retaining runtime resume-marker
+/// derivation as the fallback for twin-`None` rows (the fallthrough-past-end
+/// overshoot whose `entry_py_pc` rebind is runtime-only). Certified by the
+/// `M73_ARMARKER` census (100% eq=1, 2178 captures across 89 bench+synth
+/// programs) and check.py (161×2, on and off). Disable with
+/// `PYRE_M73_ARMARKER_CARRY=0`.
 pub(crate) fn m73_armarker_carry_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M73_ARMARKER_CARRY") {
@@ -9605,7 +9609,7 @@ pub(crate) fn m73_armarker_carry_enabled() -> bool {
             let v = v.to_string_lossy();
             v != "0" && !v.eq_ignore_ascii_case("false")
         }
-        None => false,
+        None => true,
     })
 }
 
