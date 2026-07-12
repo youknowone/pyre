@@ -247,6 +247,14 @@ unsafe fn w_memoryview_new_plain(
 ///
 /// # Safety
 /// `mv` must point to a valid `W_MemoryView` with a live backing.
+///
+/// The gather walks the exporter's backing storage through pointer
+/// arithmetic and grows a `Vec<u8>` (`buffer.py:117-127 _copy_base`, an
+/// rstring `StringBuilder` append the tracer does not model element by
+/// element); the sub-slice `&full[b..b+isz]` is a windowed copy, not a
+/// value-model view.  Residualize the whole geometry/copy subtree behind
+/// this single `.gather()` call surface (`@jit.dont_look_inside`).
+#[majit_macros::dont_look_inside]
 pub(crate) unsafe fn memoryview_gather_bytes(mv: PyObjectRef) -> Vec<u8> {
     unsafe { pyre_object::memoryview::w_memoryview_view(mv).gather() }
 }

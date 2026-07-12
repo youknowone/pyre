@@ -450,10 +450,8 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // (`@elidable_promote`, typeobject.py:1657).  Its `#[dont_look_inside]`
     // residualises the call; bind the `-> bool` Rust `fn` directly by
     // qualified path (2-pointer args, JIT-representable, no C-ABI bridge).
-    let w_type_issubtype: unsafe fn(
-        pyre_object::PyObjectRef,
-        pyre_object::PyObjectRef,
-    ) -> bool = pyre_object::w_type_issubtype;
+    let w_type_issubtype: unsafe fn(pyre_object::PyObjectRef, pyre_object::PyObjectRef) -> bool =
+        pyre_object::w_type_issubtype;
     push_alias_pair(
         &mut entries,
         "pyre_object::typeobject::w_type_issubtype",
@@ -634,6 +632,19 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::baseobjspace::compute_default_mro",
         "pyre_interpreter::compute_default_mro",
         compute_default_mro as *const (),
+    );
+    // #346: `memoryview_gather_bytes` is the sole `.gather()` call surface —
+    // the buffer-protocol copy leaf whose geometry walk + `Vec<u8>` growth
+    // + `Range`-indexed sub-slices are opaque host plumbing. Residualized
+    // (`#[dont_look_inside]`), it is a `Vec`-returning residual like
+    // `compute_mro`; bind its `fn` directly by qualified path.
+    let memoryview_gather_bytes: unsafe fn(pyre_object::PyObjectRef) -> Vec<u8> =
+        crate::builtins::memoryview_gather_bytes;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::builtins::memoryview_gather_bytes",
+        "pyre_interpreter::memoryview_gather_bytes",
+        memoryview_gather_bytes as *const (),
     );
     // #346: `lookup_in_type_where_uncached` is the scalar-`Option` residual
     // boundary over the cold uncached MRO walk. With `compute_mro` opaque,
