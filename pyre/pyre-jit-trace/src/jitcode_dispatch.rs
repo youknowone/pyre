@@ -2823,6 +2823,19 @@ fn compute_bridge_root_parent_frame(
             regs_r[result_color] = trace_ctx.const_ref(pyre_object::PY_NULL as i64);
         }
     }
+    let root_word = (root_carried_jitcode_pc != majit_ir::resumedata::NO_JITCODE_PC
+        && root_carried_jitcode_pc >= 0)
+        .then_some(root_carried_jitcode_pc as usize);
+    m73_outercap_census(
+        "bridgeroot",
+        jitcode_index as i32,
+        resume_py_pc as i32,
+        root_word,
+    );
+    let root_liveness_word = match root_word.filter(|_| m73_outercap_carry_enabled()) {
+        Some(w) => w as i32,
+        None => majit_ir::resumedata::NO_JITCODE_PC,
+    };
     let boxes = collect_outer_active_boxes(
         root_sym,
         trace_ctx,
@@ -2832,19 +2845,11 @@ fn compute_bridge_root_parent_frame(
         jitcode_index,
         resume_py_pc,
         None,
-        // Paused ROOT (outermost caller) frame: the sentinel is
-        // correct-by-construction, not a lossy deferral.  `resume_py_pc` is a
-        // CALL-return fallthrough opcode boundary where the py_pc→jitcode
-        // translation is lossless
-        // (no kept operand-stack temp), so the frame resumes through the plain
-        // `py_pc → resume_jitcode_pc_for` path — matching the emit-side sentinel
-        // the paused
-        // caller word carries elsewhere.  It must NOT be "upgraded" to a direct
-        // pc without a real per-frame `MIFrame.pc` for the whole caller chain
-        // (the `#124`/task#50 register↔value-stack rework); the only
-        // translation-independent carried coordinate today is the kept-stack
-        // branch guard's own `op.pc`.
-        majit_ir::resumedata::NO_JITCODE_PC,
+        // Key the query off the same carried root-frame word the snapshot and
+        // decode side read from `frames[0].jitcode_pc`, so both resolve the
+        // identical liveness window. `PYRE_M73_OUTERCAP_CARRY=0` falls back to
+        // the sentinel + `resume_jitcode_pc_for(root_pc)` translation.
+        root_liveness_word,
         None,
         &[],
     );
@@ -2853,9 +2858,7 @@ fn compute_bridge_root_parent_frame(
         resume_py_pc,
         // Parent-frame words are never branch-tagged; negative tags belong to
         // a branch guard's own top-frame word.
-        resume_marker_jit_pc: (root_carried_jitcode_pc != majit_ir::resumedata::NO_JITCODE_PC
-            && root_carried_jitcode_pc >= 0)
-            .then(|| root_carried_jitcode_pc as usize),
+        resume_marker_jit_pc: root_word,
         boxes,
     })
 }
@@ -3199,10 +3202,17 @@ pub(crate) fn drive_outer_frame_continuation(
     // walker banks.  Only live colors are touched; dead slots stay
     // `OpRef::NONE` so a later guard snapshot cannot capture a stale operand.
     {
+        let root_word = (root_jitcode_pc != majit_ir::resumedata::NO_JITCODE_PC
+            && root_jitcode_pc >= 0)
+            .then_some(root_jitcode_pc as usize);
+        // Mirror `compute_bridge_root_parent_frame` so scatter reads the banks in collection order.
         let banks = crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
             outer_jitcode_index as i32,
             root_pc as i32,
-            majit_ir::resumedata::NO_JITCODE_PC,
+            match root_word.filter(|_| m73_outercap_carry_enabled()) {
+                Some(w) => w as i32,
+                None => majit_ir::resumedata::NO_JITCODE_PC,
+            },
         );
         let mut cursor = 0usize;
         for &color in &banks.int {
@@ -9751,6 +9761,46 @@ pub(crate) fn m73_inlcaller_carry_enabled() -> bool {
     })
 }
 
+/// #73 S5 p5-s7: key the remaining outer-frame capture liveness queries
+/// (bridge-root parent frame + its register scatter, inline-call outer capture,
+/// list-append outer capture) off the jitcode-keyed word already in hand
+/// (carried root frame word / call-site marker twin) instead of the sentinel +
+/// resume_jitcode_pc_for translation. Certified by the M73_OUTERCAP census
+/// (bank equality). `PYRE_M73_OUTERCAP_CARRY=0` opts out.
+fn m73_outercap_carry_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M73_OUTERCAP_CARRY") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => true,
+    })
+}
+
+/// #73 S5 p5-s7 census: under the marker audit, compare the liveness banks the
+/// jitcode-keyed word resolves against the py-translation resolution.
+fn m73_outercap_census(site: &str, jitcode_index: i32, py_pc: i32, word: Option<usize>) {
+    if !m73_marker_audit_enabled() {
+        return;
+    }
+    match word {
+        Some(twin) => {
+            let with_twin = crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
+                jitcode_index,
+                py_pc,
+                twin as i32,
+            );
+            let via_py = crate::state::frame_liveness_reg_indices_by_bank_at(jitcode_index, py_pc);
+            eprintln!(
+                "M73_OUTERCAP site={site} eq={} idx={jitcode_index} py_pc={py_pc} twin={twin}",
+                (with_twin == via_py) as u8
+            );
+        }
+        None => eprintln!("M73_OUTERCAP site={site} eq=notwin idx={jitcode_index} py_pc={py_pc}"),
+    }
+}
+
 /// #73 S5 phase-3 slice-5: attribution census for the residual decode-side
 /// resume-translation traffic (`bucket=sentinel_plain` in
 /// `PYRE_M369_RECOVER_AUDIT`). Under the audit gate, print one line per
@@ -14547,6 +14597,17 @@ fn try_walker_inline_user_call(
                     }
                     (py, jc_index, jc.payload.resume_marker_for_jitcode_pc(op.pc))
                 };
+                m73_outercap_census(
+                    "inlinecall",
+                    call_site_jc_index as i32,
+                    call_site_py_pc as i32,
+                    call_site_marker,
+                );
+                let call_site_word = match call_site_marker.filter(|_| m73_outercap_carry_enabled())
+                {
+                    Some(m) => m as i32,
+                    None => majit_ir::resumedata::NO_JITCODE_PC,
+                };
                 let boxes = collect_outer_active_boxes(
                     sym,
                     ctx.trace_ctx,
@@ -14556,7 +14617,7 @@ fn try_walker_inline_user_call(
                     call_site_jc_index,
                     call_site_py_pc,
                     None,
-                    majit_ir::resumedata::NO_JITCODE_PC,
+                    call_site_word,
                     None,
                     &[],
                 );
@@ -18649,6 +18710,16 @@ fn orthodox_list_append_commit(
             Value::Int(vsd_value),
         );
     }
+    m73_outercap_census(
+        "listappend",
+        outer_jitcode_index as i32,
+        call_site_py_pc as i32,
+        call_site_marker,
+    );
+    let call_site_word = match call_site_marker.filter(|_| m73_outercap_carry_enabled()) {
+        Some(m) => m as i32,
+        None => majit_ir::resumedata::NO_JITCODE_PC,
+    };
     let active = collect_outer_active_boxes(
         sym,
         ctx.trace_ctx,
@@ -18658,7 +18729,7 @@ fn orthodox_list_append_commit(
         outer_jitcode_index,
         call_site_py_pc,
         None,
-        majit_ir::resumedata::NO_JITCODE_PC,
+        call_site_word,
         None,
         &[],
     );
