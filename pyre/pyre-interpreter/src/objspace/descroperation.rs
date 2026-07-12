@@ -1206,6 +1206,44 @@ pub(crate) unsafe fn list_inplace_repeat(list: PyObjectRef, n: PyObjectRef) -> R
     Ok(())
 }
 
+/// bytearrayobject.py descr_inplace_mul — repeat the bytearray in place,
+/// preserving object identity.  A resize while the buffer is exported raises
+/// BufferError, mirroring the `__iadd__` export guard; a count of 1 leaves the
+/// length unchanged and needs no resize.
+pub(crate) unsafe fn bytearray_inplace_repeat(
+    ba: PyObjectRef,
+    n: PyObjectRef,
+) -> Result<(), PyError> {
+    let count = repeat_count(n, "repeated bytes are too long")?;
+    let len = pyre_object::bytearrayobject::w_bytearray_len(ba);
+    if count == 1 {
+        return Ok(());
+    }
+    let new_size = len
+        .checked_mul(count)
+        .ok_or_else(|| PyError::new(PyErrorKind::OverflowError, "repeated bytes are too long"))?;
+    // Only an actual length change touches the buffer size; an exported buffer
+    // blocks it.
+    if new_size != len {
+        crate::builtins::bytearray_check_exports(ba)?;
+    }
+    if count == 0 {
+        pyre_object::bytearrayobject::w_bytearray_vec_mut(ba).clear();
+        return Ok(());
+    }
+    if len == 0 {
+        return Ok(());
+    }
+    let snapshot = pyre_object::bytearrayobject::w_bytearray_data(ba).to_vec();
+    let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(ba);
+    vec.try_reserve_exact(new_size - len)
+        .map_err(|_| PyError::new(PyErrorKind::MemoryError, ""))?;
+    for _ in 1..count {
+        vec.extend_from_slice(&snapshot);
+    }
+    Ok(())
+}
+
 // ── Comparison operations ─────────────────────────────────────────────
 
 unsafe fn int_lt(a: PyObjectRef, b: PyObjectRef) -> PyResult {

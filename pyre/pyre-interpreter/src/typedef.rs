@@ -13113,6 +13113,76 @@ fn init_bytearray_type(ns: &mut DictStorage) {
             2,
         ),
     );
+    // `bytes_descr_repeat` builds its result via `bytes_repeat`, which yields a
+    // bytearray for a bytearray receiver, so the repeat dunders are shared.
+    dict_storage_store(
+        ns,
+        "__mul__",
+        make_builtin_function_with_arity("__mul__", |args| bytes_descr_repeat(args), 2),
+    );
+    dict_storage_store(
+        ns,
+        "__rmul__",
+        make_builtin_function_with_arity("__rmul__", |args| bytes_descr_repeat(args), 2),
+    );
+    dict_storage_store(
+        ns,
+        "__imul__",
+        make_builtin_function_with_arity(
+            "__imul__",
+            |args| {
+                // descr_inplace_mul: the count goes through `__index__`; a
+                // non-index operand becomes NotImplemented.
+                crate::type_methods::arity_slot(args, 1)?;
+                let Some(w_count) = list_repeat_index(args[1])? else {
+                    return Ok(pyre_object::w_not_implemented());
+                };
+                unsafe {
+                    crate::objspace::descroperation::bytearray_inplace_repeat(args[0], w_count)?
+                };
+                Ok(args[0])
+            },
+            2,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "__contains__",
+        make_builtin_function_with_arity(
+            "__contains__",
+            |args| {
+                crate::type_methods::arity_slot(args, 1)?;
+                Ok(pyre_object::w_bool_from(
+                    crate::baseobjspace::contains_slot(args[0], args[1])?,
+                ))
+            },
+            2,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "__len__",
+        make_builtin_function_with_arity(
+            "__len__",
+            |args| {
+                crate::type_methods::arity_slot(args, 0)?;
+                crate::baseobjspace::len_slot(args[0])
+            },
+            1,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "__iter__",
+        make_builtin_function_with_arity(
+            "__iter__",
+            |args| {
+                crate::type_methods::arity_slot(args, 0)?;
+                crate::baseobjspace::iter(args[0])
+            },
+            1,
+        ),
+    );
     for (name, func) in [
         ("__eq__", bytearray_dunder_eq as DunderFn),
         ("__ne__", bytearray_dunder_ne),
