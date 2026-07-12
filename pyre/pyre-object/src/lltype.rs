@@ -222,6 +222,38 @@ pub fn malloc_typed<T: GcType>(value: T) -> *mut T {
     majit_gc::header::alloc_with_gc_header(value, type_id)
 }
 
+/// Stable-address variant of [`malloc_typed`]: routes through the
+/// non-moving old-gen allocator (`try_gc_alloc_stable_raw`) so the object
+/// never relocates across a later collection.  A self-mutating typed payload
+/// whose methods re-derive `self` from a raw `PyObjectRef` across an
+/// allocating call needs this: under the movable [`malloc_typed`] a
+/// collection triggered mid-method (e.g. by allocating a fresh backing list)
+/// relocates the object, leaving that raw `self` pointer stale — the same
+/// rationale as `alloc_instance_object`.  Falls back to the movable
+/// [`malloc_typed`] when no stable hook is installed (single-crate tests /
+/// pre-init snapshot tools).
+#[inline]
+pub fn malloc_typed_stable<T: GcType>(value: T) -> *mut T {
+    debug_assert_eq!(
+        std::mem::size_of::<T>(),
+        T::SIZE,
+        "GcType::SIZE drift from std::mem::size_of"
+    );
+    let type_id = match T::type_id() {
+        TypeIdCell::UNASSIGNED => 0,
+        id => id,
+    };
+    let raw = crate::gc_hook::try_gc_alloc_stable_raw(type_id, T::SIZE);
+    if raw.is_null() {
+        malloc_typed(value)
+    } else {
+        unsafe {
+            std::ptr::write(raw as *mut T, value);
+            raw as *mut T
+        }
+    }
+}
+
 /// `lltype.malloc(T, flavor='raw')` parity. Non-GC heap allocation;
 /// caller manages lifetime via `Box::from_raw` later.
 ///

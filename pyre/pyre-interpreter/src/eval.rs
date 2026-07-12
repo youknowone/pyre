@@ -2003,11 +2003,18 @@ impl IterOpcodeHandler for PyFrame {
                 self.locals_w_mut()[tos] = seq_iter;
                 return Ok(());
             }
-            // User-defined __iter__ — PyPy: space.iter → __iter__()
-            // Delegates to baseobjspace::iter which handles type MRO
-            // and __getitem__ fallback (PyPy: space.iter →
-            // PyObject_GetIter → tp_iter or PySeqIter_New).
-            if pyre_object::is_instance(iter) {
+            // User-defined __iter__ — PyPy: space.iter → __iter__().
+            // Instances, plus typed-payload builtins (e.g. deque) whose
+            // type registers `__iter__` on its MRO.  Delegates to
+            // baseobjspace::iter which handles type MRO and __getitem__
+            // fallback (PyPy: space.iter → PyObject_GetIter → tp_iter or
+            // PySeqIter_New).  Already-iterator payloads returned above, so
+            // this only sees non-iterator containers.
+            if pyre_object::is_instance(iter)
+                || crate::typedef::r#type(iter).is_some_and(|t| {
+                    crate::baseobjspace::lookup_in_type_where(t, "__iter__").is_some()
+                })
+            {
                 let result = crate::baseobjspace::iter(iter)?;
                 let tos = self.valuestackdepth - 1;
                 self.locals_w_mut()[tos] = result;

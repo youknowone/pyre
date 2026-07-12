@@ -9655,6 +9655,32 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
                 }
             }
         }
+        // descroperation.py `def iter` — a typed-payload builtin
+        // (e.g. `deque`) whose typedef registers `__iter__` is not an
+        // `INSTANCE_TYPE` layout, so the `is_instance` fast path above skips
+        // it.  Mirror the generic MRO dunder dispatch `getitem_slot` uses:
+        // resolve the user type, dispatch `__iter__`, else fall back to
+        // `__getitem__` sequence iteration for a non-mapping type.  Gated on
+        // `!is_instance` so the instance path above is untouched.
+        if !is_instance(obj) {
+            if let Some(w_type) = crate::typedef::r#type(obj) {
+                if let Some(method) = lookup_in_type_where(w_type, "__iter__") {
+                    if is_none(method) {
+                        return Err(PyError::type_error(format!(
+                            "'{}' object is not iterable",
+                            (*(*obj).ob_type).name
+                        )));
+                    }
+                    let w_iter = crate::call::call_function_impl_result(method, &[obj])?;
+                    return iter_check_is_iterator(w_iter);
+                }
+                let is_mapping =
+                    pyre_object::typeobject::w_type_get_flag_map_or_seq(w_type) == b'M';
+                if !is_mapping && lookup_in_type_where(w_type, "__getitem__").is_some() {
+                    return Ok(pyre_object::w_seq_iter_new(obj, 0));
+                }
+            }
+        }
     }
     Err(PyError::type_error(format!(
         "'{}' object is not iterable",
@@ -11866,6 +11892,16 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
             if let Some(method) =
                 lookup_in_type_where(pyre_object::w_instance_get_type(obj), "__delitem__")
             {
+                crate::builtins::call_and_check(method, &[obj, index])?;
+                return Ok(());
+            }
+        }
+        // descroperation.py delitem — any object whose type registers a
+        // `__delitem__` on its MRO supports deletion; the arms above are fast
+        // paths for the builtin sequence/mapping layouts.  Covers typed-payload
+        // types like `deque` whose typedef binds `__delitem__`.
+        if let Some(w_type) = crate::typedef::r#type(obj) {
+            if let Some(method) = lookup_in_type_where(w_type, "__delitem__") {
                 crate::builtins::call_and_check(method, &[obj, index])?;
                 return Ok(());
             }

@@ -6936,6 +6936,18 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
                 return Ok(if h == -1 { -2 } else { h });
             }
         }
+        // A type may declare itself unhashable via `__hash__ = None`
+        // (a typed-payload `#[pyre_methods(unhashable)]` layout such as
+        // `deque`); the `is_instance` arm above covers user classes, this
+        // covers the builtin/typed-payload layouts before the identity-hash
+        // fallback.
+        if let Some(w_type) = crate::typedef::r#type(obj) {
+            if let Some(method) = crate::baseobjspace::lookup_in_type(w_type, "__hash__") {
+                if pyre_object::is_none(method) {
+                    return Err(unhashable_type_error(obj));
+                }
+            }
+        }
     }
     Ok(hash_value(obj))
 }

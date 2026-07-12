@@ -1186,6 +1186,24 @@ fn expand_pyre_class(
                 };
                 ::pyre_object::lltype::malloc_typed(full) as ::pyre_object::PyObjectRef
             }
+
+            /// Stable-address variant of [`Self::allocate`]: allocates via
+            /// the non-moving `malloc_typed_stable`, so the object never
+            /// relocates.  Required for a self-mutating payload whose methods
+            /// re-derive `self` from a raw `PyObjectRef` across an allocating
+            /// call — a movable object would leave that raw pointer stale.
+            #[allow(dead_code)]
+            pub fn allocate_stable(payload: Self) -> ::pyre_object::PyObjectRef {
+                let _roots = ::pyre_object::gc_roots::push_roots();
+                let full = Self {
+                    ob: ::pyre_object::PyObject {
+                        ob_type: &#pytype_static as *const ::pyre_object::PyType,
+                        w_class: ::pyre_object::pyobject::get_instantiate(&#pytype_static),
+                    },
+                    ..payload
+                };
+                ::pyre_object::lltype::malloc_typed_stable(full) as ::pyre_object::PyObjectRef
+            }
         }
     })
 }
