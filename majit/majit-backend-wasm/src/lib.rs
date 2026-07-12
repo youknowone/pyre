@@ -378,6 +378,44 @@ fn nursery_alloc_params(ops: &[Op]) -> Option<codegen::NurseryAllocParams> {
     })?
 }
 
+/// Assemble the direct CA arm's fixed-size nursery/frame parameters. This is
+/// deliberately separate from ordinary `New*` eligibility: a CA frame needs
+/// both the nursery words and the JitFrame shadow-stack top/limit cells.
+/// Missing active GC (or gc_stress) leaves the pre-existing helper path intact.
+fn ca_inline_params(frame_bytes: u32) -> Option<codegen::CaInlineParams> {
+    if majit_gc::gc_stress_enabled() {
+        return None;
+    }
+    let jitframe_tid = wasm_jitframe_tid();
+    let depth = frame_bytes as usize / std::mem::size_of::<isize>();
+    let total = ((majit_gc::header::GcHeader::SIZE
+        + majit_backend::jitframe::JitFrame::alloc_size(depth))
+    .max(majit_gc::header::GcHeader::MIN_NURSERY_OBJ_SIZE)
+        + 7)
+        & !7;
+    with_wasm_active_gc(|gc| {
+        assert_ne!(
+            jitframe_tid, 0,
+            "wasm CA inline frame path requires the registered JitFrame type id"
+        );
+        if total > gc.max_nursery_object_size() || !gc.type_alloc_is_plain(jitframe_tid) {
+            return None;
+        }
+        let nursery_free_addr = gc.nursery_free_addr();
+        let nursery_top_addr = gc.nursery_top_addr();
+        let jf_top_addr = majit_gc::shadow_stack::get_root_stack_top_addr();
+        let jf_limit_addr = majit_gc::shadow_stack::get_root_stack_limit_addr();
+        (nursery_free_addr != 0 && nursery_top_addr != 0 && jf_top_addr != 0 && jf_limit_addr != 0)
+            .then_some(codegen::CaInlineParams {
+                nursery_free_addr: nursery_free_addr as u32,
+                nursery_top_addr: nursery_top_addr as u32,
+                jf_top_addr: jf_top_addr as u32,
+                jf_limit_addr: jf_limit_addr as u32,
+                jitframe_tid,
+            })
+    })?
+}
+
 /// `majit_gc::CollectOldgenFn` installed by `set_gc_allocator`. Drives the
 /// interpreter-safepoint non-moving old-gen major (`gc_interp::safepoint`,
 /// default-on on wasm) through the active GC. Needs mutable access, so it
@@ -1842,6 +1880,7 @@ impl majit_backend::Backend for WasmBackend {
                 ca_reload_caller_fn_ptr: wasm_jit_ca_reload_caller_frame as *const () as usize
                     as i64,
                 callee_gcmap_ptr,
+                inline: ca_inline_params(source_frame.frame_bytes),
             }
         } else {
             codegen::CaParams {

@@ -60,6 +60,9 @@ struct JitFrameShadowStack {
     /// Current top pointer. Compiled code embeds the address of this cell and
     /// mutates its inner usize directly with inline loads/stores.
     top: Cell<usize>,
+    /// One-past-the-end address of the current backing buffer. Compiled code
+    /// embeds this cell's address, never its value: `grow()` replaces `owner`.
+    limit: Cell<usize>,
     /// Current capacity in entries (each entry is two usize words).
     capacity: usize,
     owner: Option<Box<[usize]>>,
@@ -70,6 +73,7 @@ impl JitFrameShadowStack {
         Self {
             base: 0,
             top: Cell::new(0),
+            limit: Cell::new(0),
             capacity: 0,
             owner: None,
         }
@@ -110,11 +114,16 @@ impl JitFrameShadowStack {
         self.base = new_ptr;
         self.top.set(new_ptr + used_bytes);
         self.capacity = new_capacity;
+        self.limit.set(new_ptr + new_capacity * 2 * WORD);
         self.owner = Some(new_buf);
     }
 
     fn top_addr(&self) -> usize {
         self.top.as_ptr() as usize
+    }
+
+    fn limit_addr(&self) -> usize {
+        self.limit.as_ptr() as usize
     }
 }
 
@@ -181,6 +190,19 @@ pub fn get_root_stack_top_addr() -> usize {
         let mut stack = stack.borrow_mut();
         stack.ensure_init();
         stack.top_addr()
+    })
+}
+
+/// Address of this thread's grow-synchronised root-stack limit cell.
+///
+/// Compiled code loads the value for every inline push. `grow()` updates it
+/// after replacing the backing buffer, while the cell address itself remains
+/// stable for the lifetime of the thread-local shadow-stack object.
+pub fn get_root_stack_limit_addr() -> usize {
+    JF_ROOT_STACK.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        stack.ensure_init();
+        stack.limit_addr()
     })
 }
 
@@ -1196,6 +1218,8 @@ mod tests {
         push_jf(GcRef(0xDEADBEEF));
         let base_before = jf_root_stack_base_for_test();
         let capacity_before = jf_root_stack_capacity_for_test();
+        let limit_addr = get_root_stack_limit_addr();
+        let limit_before = unsafe { *(limit_addr as *const usize) };
         assert_eq!(capacity_before, DEFAULT_SHADOW_STACK_DEPTH);
 
         // Grow to 2x the default. RPython's resize copies the used
@@ -1205,6 +1229,13 @@ mod tests {
 
         let base_after = jf_root_stack_base_for_test();
         let capacity_after = jf_root_stack_capacity_for_test();
+        assert_eq!(get_root_stack_limit_addr(), limit_addr);
+        assert_ne!(unsafe { *(limit_addr as *const usize) }, limit_before);
+        assert_eq!(
+            unsafe { *(limit_addr as *const usize) },
+            base_after + new_cap * 2 * WORD,
+            "the stable limit cell must track the reallocated backing buffer"
+        );
         assert_ne!(
             base_before, base_after,
             "resize must reallocate the backing buffer"

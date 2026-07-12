@@ -148,6 +148,10 @@ fn mem64(offset: u64) -> MemArg {
     }
 }
 
+fn mem32(offset: u64) -> MemArg {
+    memarg(offset, 2)
+}
+
 fn memarg(offset: u64, align: u32) -> MemArg {
     MemArg {
         offset,
@@ -686,6 +690,47 @@ fn emit_reload_frame_if_necessary(
     }
 }
 
+/// CA-arm-only variant of [`emit_reload_frame_if_necessary`]. The direct CA
+/// configuration owns an inline shadow-stack top cell; all other call sites
+/// retain their pre-existing helper reload.
+fn emit_reload_ca_frame_if_necessary(
+    sink: &mut InstructionSink<'_>,
+    residual_type_base: Option<u32>,
+    ca_reload_fn_ptr: i64,
+    ca_inline: Option<CaInlineParams>,
+) {
+    if let Some(inline) = ca_inline {
+        debug_assert!(residual_type_base.is_some());
+        emit_ca_reload_top(sink, inline.jf_top_addr);
+        sink.local_set(0);
+    } else {
+        emit_reload_frame_if_necessary(sink, residual_type_base, ca_reload_fn_ptr);
+    }
+}
+
+/// assembler.py `_reload_frame_if_necessary`: `top[-WORD]` is the top
+/// jitframe pointer. The wasm CA ABI carries its ITEMS base in local 0.
+fn emit_ca_reload_top(sink: &mut InstructionSink<'_>, top_addr: u32) {
+    sink.i32_const(top_addr as i32);
+    sink.i32_load(mem32(0));
+    sink.i32_const(4);
+    sink.i32_sub();
+    sink.i32_load(mem32(0));
+    sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
+    sink.i32_add();
+}
+
+/// While a CA callee is pushed, its caller's `jf_ptr` is `top[-3 * WORD]`.
+fn emit_ca_reload_caller(sink: &mut InstructionSink<'_>, top_addr: u32) {
+    sink.i32_const(top_addr as i32);
+    sink.i32_load(mem32(0));
+    sink.i32_const(12);
+    sink.i32_sub();
+    sink.i32_load(mem32(0));
+    sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
+    sink.i32_add();
+}
+
 /// Reload the Ref operands which the CA arm resolves only after its collecting
 /// callee-frame allocation. Unlike ordinary post-call reloads, these are live
 /// *at* the CALL_ASSEMBLER op, not after it.
@@ -1030,6 +1075,19 @@ pub struct CaParams {
     /// callee frame's CA input + home Ref slots; baked into each frame's
     /// `jf_gcmap` field at alloc time.
     pub callee_gcmap_ptr: i64,
+    /// Active-GC state for the direct CA-only inline allocation/frame path.
+    /// `None` retains the helpers (including under gc_stress).
+    pub inline: Option<CaInlineParams>,
+}
+
+/// Direct CA fast-path values baked at bridge compilation time.
+#[derive(Clone, Copy)]
+pub struct CaInlineParams {
+    pub nursery_free_addr: u32,
+    pub nursery_top_addr: u32,
+    pub jf_top_addr: u32,
+    pub jf_limit_addr: u32,
+    pub jitframe_tid: u32,
 }
 
 /// Inline nursery-bump fast-path parameters for `New`/`NewWithVtable`
@@ -1407,7 +1465,12 @@ fn build_function(
     let mut func = Function::new(vec![
         (num_vars + UMULHI_SCRATCH, ValType::I64),
         (
-            base_i32_locals + if nursery.is_some() { 2 } else { 0 },
+            base_i32_locals
+                + if nursery.is_some() || ca.inline.is_some() {
+                    2
+                } else {
+                    0
+                },
             ValType::I32,
         ),
     ]);
@@ -2632,7 +2695,103 @@ fn build_function(
                 // `ca_cfp_local = frame_base + FIRST_ITEM_OFFSET` is the
                 // bespoke-layout frame pointer — every `mem64(OFS)` below is
                 // relative to it, exactly as the source loop reads its local 0.
-                if let Some(base) = residual_type_base {
+                let ca_depth = ca.callee_frame_bytes as usize / std::mem::size_of::<isize>();
+                let ca_payload_size = majit_backend::jitframe::JitFrame::alloc_size(ca_depth);
+                let ca_total_size =
+                    ((GcHeader::SIZE + ca_payload_size).max(GcHeader::MIN_NURSERY_OBJ_SIZE) + 7)
+                        & !7;
+                if let (Some(base), Some(inline)) = (residual_type_base, ca.inline) {
+                    // rewrite.py's nursery fast path plus assembler.py's inline
+                    // shadow-stack header. The `memory.fill` is deliberate:
+                    // home slots are read as roots before every definition, and
+                    // guard/deopt fail slots may be read by the host. Do not rely
+                    // on nursery reset's pre-existing memset for either class.
+                    sink.i32_const(inline.nursery_free_addr as i32);
+                    sink.i32_load(mem32(0));
+                    sink.local_tee(alloc_scratch_local);
+                    sink.i32_const(ca_total_size as i32);
+                    sink.i32_add();
+                    sink.i32_const(inline.nursery_top_addr as i32);
+                    sink.i32_load(mem32(0));
+                    sink.i32_gt_u();
+                    sink.i32_const(inline.jf_top_addr as i32);
+                    sink.i32_load(mem32(0));
+                    sink.local_tee(alloc_size_local);
+                    sink.i32_const(8);
+                    sink.i32_add();
+                    sink.i32_const(inline.jf_limit_addr as i32);
+                    sink.i32_load(mem32(0));
+                    sink.i32_gt_u();
+                    sink.i32_or();
+                    sink.if_(BlockType::Result(ValType::I64));
+                    // Slow path collects/allocates and performs init + push.
+                    sink.i64_const(ca.callee_frame_bytes as i64);
+                    sink.i64_const(ca.callee_gcmap_ptr);
+                    sink.i32_const(ca.ca_alloc_fn_ptr as i32);
+                    sink.call_indirect(0, base + 2);
+                    sink.else_();
+                    // Commit the nursery bump, then write the exact young
+                    // `GcHeader::new(jitframe_tid)` word (flags are clear).
+                    sink.i32_const(inline.nursery_free_addr as i32);
+                    sink.local_get(alloc_scratch_local);
+                    sink.i32_const(ca_total_size as i32);
+                    sink.i32_add();
+                    sink.i32_store(mem32(0));
+                    sink.local_get(alloc_scratch_local);
+                    sink.i64_const(inline.jitframe_tid as i64);
+                    sink.i64_store(mem64(0));
+                    // Explicitly initialise the complete JitFrame payload and
+                    // item area, then replicate JitFrame::init + jf_gcmap.
+                    sink.local_get(alloc_scratch_local);
+                    sink.i32_const(GcHeader::SIZE as i32);
+                    sink.i32_add();
+                    sink.i32_const(0);
+                    sink.i32_const(ca_payload_size as i32);
+                    sink.memory_fill(0);
+                    for offset in [
+                        majit_backend::jitframe::JF_FRAME_INFO_OFS,
+                        majit_backend::jitframe::JF_DESCR_OFS,
+                        majit_backend::jitframe::JF_FORCE_DESCR_OFS,
+                        majit_backend::jitframe::JF_SAVEDATA_OFS,
+                        majit_backend::jitframe::JF_GUARD_EXC_OFS,
+                        majit_backend::jitframe::JF_FORWARD_OFS,
+                    ] {
+                        sink.local_get(alloc_scratch_local);
+                        sink.i32_const(0);
+                        sink.i32_store(mem32(GcHeader::SIZE as u64 + offset as u64));
+                    }
+                    sink.local_get(alloc_scratch_local);
+                    sink.i32_const(ca.callee_gcmap_ptr as i32);
+                    sink.i32_store(mem32(
+                        GcHeader::SIZE as u64 + majit_backend::jitframe::JF_GCMAP_OFS as u64,
+                    ));
+                    sink.local_get(alloc_scratch_local);
+                    sink.i32_const(ca_depth as i32);
+                    sink.i32_store(mem32(
+                        GcHeader::SIZE as u64 + majit_backend::jitframe::JF_FRAME_OFS as u64,
+                    ));
+                    // Push `[is_minor=1, jf_ptr]`; the limit check above made
+                    // these stores safe, so the helper's overflow assertion is
+                    // retained only on the slow path.
+                    sink.local_get(alloc_size_local);
+                    sink.i32_const(1);
+                    sink.i32_store(mem32(0));
+                    sink.local_get(alloc_size_local);
+                    sink.local_get(alloc_scratch_local);
+                    sink.i32_const(GcHeader::SIZE as i32);
+                    sink.i32_add();
+                    sink.i32_store(mem32(4));
+                    sink.i32_const(inline.jf_top_addr as i32);
+                    sink.local_get(alloc_size_local);
+                    sink.i32_const(8);
+                    sink.i32_add();
+                    sink.i32_store(mem32(0));
+                    sink.local_get(alloc_scratch_local);
+                    sink.i32_const(GcHeader::SIZE as i32);
+                    sink.i32_add();
+                    sink.i64_extend_i32_u();
+                    sink.end();
+                } else if let Some(base) = residual_type_base {
                     sink.i64_const(ca.callee_frame_bytes as i64);
                     sink.i64_const(ca.callee_gcmap_ptr);
                     sink.i32_const(ca.ca_alloc_fn_ptr as i32);
@@ -2667,9 +2826,12 @@ fn build_function(
                 // resolving inputs through local-0-relative homes. The
                 // trampoline path intentionally keeps the A0-era assumption:
                 // its scratch writes themselves dereference stale local 0.
-                if let Some(base) = residual_type_base {
+                if let (Some(_base), Some(inline)) = (residual_type_base, ca.inline) {
+                    emit_ca_reload_caller(&mut sink, inline.jf_top_addr);
+                    sink.local_set(0);
+                } else if let Some(base) = residual_type_base {
                     sink.i32_const(ca.ca_reload_caller_fn_ptr as i32);
-                    sink.call_indirect(0, base + 0);
+                    sink.call_indirect(0, base);
                     sink.i32_wrap_i64();
                     sink.local_set(0);
                 }
@@ -2696,7 +2858,10 @@ fn build_function(
                 // callee frame. Deeper levels have already popped, so the
                 // jitframe shadow-stack top is this level's frame; reload its
                 // ITEMS base before reading F'[0] or F'[1].
-                if let Some(base) = residual_type_base {
+                if let (Some(_base), Some(inline)) = (residual_type_base, ca.inline) {
+                    emit_ca_reload_top(&mut sink, inline.jf_top_addr);
+                    sink.i64_extend_i32_u();
+                } else if let Some(base) = residual_type_base {
                     sink.i32_const(ca.ca_reload_fn_ptr as i32);
                     sink.call_indirect(0, base + 0);
                 } else {
@@ -2753,9 +2918,12 @@ fn build_function(
                 // the trampoline-only configuration retains its A0-era stale-
                 // local-0 limitation because its scratch writes cannot reload it
                 // safely.
-                if let Some(base) = residual_type_base {
+                if let (Some(_base), Some(inline)) = (residual_type_base, ca.inline) {
+                    emit_ca_reload_caller(&mut sink, inline.jf_top_addr);
+                    sink.local_set(0);
+                } else if let Some(base) = residual_type_base {
                     sink.i32_const(ca.ca_reload_caller_fn_ptr as i32);
-                    sink.call_indirect(0, base + 0);
+                    sink.call_indirect(0, base);
                     sink.i32_wrap_i64();
                     sink.local_set(0);
                 }
@@ -2769,7 +2937,14 @@ fn build_function(
                 // LIFO) via `wasm_jit_ca_pop_frame` — same direct-vs-trampoline
                 // split as the alloc above (the pop only shrinks the shadow
                 // stack; it never allocates or collects).
-                if let Some(base) = residual_type_base {
+                if let (Some(_base), Some(inline)) = (residual_type_base, ca.inline) {
+                    sink.i32_const(inline.jf_top_addr as i32);
+                    sink.i32_const(inline.jf_top_addr as i32);
+                    sink.i32_load(mem32(0));
+                    sink.i32_const(8);
+                    sink.i32_sub();
+                    sink.i32_store(mem32(0));
+                } else if let Some(base) = residual_type_base {
                     sink.local_get(ca_cfp_local);
                     sink.i64_extend_i32_u();
                     sink.i32_const(ca.ca_pop_fn_ptr as i32);
@@ -2797,7 +2972,12 @@ fn build_function(
                 // and its home is not written until the store-on-def below, so a
                 // reload would clobber it with the home's pre-call (stale) value.
                 let skip = (!OpRef::raw_is_constant(vi)).then_some(vi);
-                emit_reload_frame_if_necessary(&mut sink, residual_type_base, ca.ca_reload_fn_ptr);
+                emit_reload_ca_frame_if_necessary(
+                    &mut sink,
+                    residual_type_base,
+                    ca.ca_reload_fn_ptr,
+                    ca.inline,
+                );
                 emit_reload_refs_from_homes(&mut sink, ref_homes, &liveness, op_idx, skip, frame);
             }
 
