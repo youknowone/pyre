@@ -16390,6 +16390,10 @@ impl majit_backend::Backend for CraneliftBackend {
         grab_exc_value_from_deadframe(frame).expect("grab_exc_value_from_deadframe failed")
     }
 
+    fn clear_stored_exception(&self) {
+        jit_exc_clear();
+    }
+
     fn invalidate_loop(&self, token: &JitCellToken) {
         token.invalidate();
     }

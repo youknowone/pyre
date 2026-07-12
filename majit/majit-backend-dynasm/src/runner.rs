@@ -2747,6 +2747,10 @@ impl Backend for DynasmBackend {
         frame.data.downcast_ref::<FrameData>().unwrap().exc_value
     }
 
+    fn clear_stored_exception(&self) {
+        crate::jit_exc_clear();
+    }
+
     /// `llmodel.py:252-268 free_loop_and_bridges` parity.  When the CLT
     /// drops, `asmmemmgr_gcreftracers` releases its strong refs to the
     /// baked `FailDescrCell` Arcs; subsequent recovery from a stale

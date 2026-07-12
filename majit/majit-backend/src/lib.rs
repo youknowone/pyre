@@ -1990,6 +1990,15 @@ pub trait Backend: Send {
         GcRef::NULL
     }
 
+    /// `llmodel.py:194-199 _store_exception` counterpart — clear the backend
+    /// `_store_exception` cells (`jit_exc_value` / `jit_exc_type`).  A residual
+    /// `bh_call` that raised publishes into BOTH `BH_LAST_EXC_VALUE` and these
+    /// cells; when the blackhole catches it in-frame (`route_to_catch`) only
+    /// `BH_LAST_EXC_VALUE` is cleared, so the cell keeps the consumed exception
+    /// and a later `GUARD_NO_EXCEPTION` re-delivers it.  Draining on handler
+    /// entry keeps the cell coherent with the caught state.
+    fn clear_stored_exception(&self) {}
+
     /// Read the FailDescr from the last guard failure.
     fn get_latest_descr<'a>(&'a self, frame: &'a DeadFrame) -> &'a dyn FailDescr;
 

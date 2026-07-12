@@ -1155,6 +1155,14 @@ impl BlackholeInterpreter {
         self.exception_last_value = exc_value;
         self.position = target;
         BH_LAST_EXC_VALUE.with(|c| c.set(0));
+        // A residual `bh_call` that raised published the exception into BOTH
+        // `BH_LAST_EXC_VALUE` and the backend `_store_exception` cells
+        // (`publish_residual_call_exception`).  Clearing only the former leaves
+        // the cell holding the now-caught exception; the next compiled re-entry
+        // (a nested call from this handler) would read it at its first
+        // `GUARD_NO_EXCEPTION` and re-deliver the already-handled exception.
+        // Drain the backend cells here so the handler runs with a pristine cell.
+        self.cpu().clear_stored_exception();
         true
     }
 
