@@ -1920,7 +1920,11 @@ impl<'a> GraphFlattener<'a> {
             // then expect the catch) and `derive_after_call_indices_from_sparse`
             // (resume anchor keyed on `insns[catch-1].is_live()`) silently
             // mis-resume if a vable-mirror store serialized between the two.
-            debug_assert!(
+            // Pyre blocks may hold several can-raise ops (the walker does not
+            // block-split like flowspace); only the caught op — the last raising op,
+            // which the hoist above targets — needs this adjacency, so the invariant
+            // enforced here is adjacency, not a per-block can-raise-op count.
+            assert!(
                 !block_can_raise
                     || self
                         .ssarepr
