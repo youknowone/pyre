@@ -797,7 +797,7 @@ impl PyJitCode {
             self.resolve_resume_pc(raw_pc)
         };
         if crate::jitcode_dispatch::m369_recover_audit_enabled() {
-            self.m369_recover_audit(raw_pc, used_carried, resolved);
+            self.m369_recover_audit(raw_pc, carried, used_carried, resolved);
         }
         resolved
     }
@@ -807,7 +807,13 @@ impl PyJitCode {
     /// (`decode_resume_pc(raw_pc).0`) is recovered by
     /// `python_pc_for_jitcode_pc(resolved)`, bucketed by frame class. Off in
     /// production; pure `eprintln!`, no behavioral effect.
-    fn m369_recover_audit(&self, raw_pc: i32, used_carried: bool, resolved: Option<usize>) {
+    fn m369_recover_audit(
+        &self,
+        raw_pc: i32,
+        carried: i32,
+        used_carried: bool,
+        resolved: Option<usize>,
+    ) {
         let (py_pc, after_residual_call) = majit_ir::resumedata::decode_resume_pc(raw_pc);
         if py_pc < 0 {
             return;
@@ -821,10 +827,23 @@ impl PyJitCode {
         } else {
             "sentinel_plain"
         };
+        // Why the carried word was not used (attribution for the fallback
+        // translation buckets): the word is the sentinel, negative, or a
+        // startpoint `can_decode_live_vars` rejects.
+        let reject = if used_carried {
+            "used"
+        } else if carried == majit_ir::resumedata::NO_JITCODE_PC {
+            "sentinel"
+        } else if carried < 0 {
+            "negative"
+        } else {
+            "undecodable"
+        };
         match resolved {
             None => {
                 eprintln!(
-                    "[m369-recover] bucket={bucket} match=unresolved raw_pc={raw_pc} py_pc={py_pc}"
+                    "[m369-recover] bucket={bucket} match=unresolved raw_pc={raw_pc} \
+                     py_pc={py_pc} carried={carried} reject={reject}"
                 );
             }
             Some(flip_offset) => {
@@ -833,7 +852,8 @@ impl PyJitCode {
                 let matched = recovered as i64 == py_pc as i64;
                 eprintln!(
                     "[m369-recover] bucket={bucket} match={matched} raw_pc={raw_pc} \
-                     py_pc={py_pc} flip_offset={flip_offset} recovered={recovered}"
+                     py_pc={py_pc} flip_offset={flip_offset} recovered={recovered} \
+                     carried={carried} reject={reject}"
                 );
             }
         }

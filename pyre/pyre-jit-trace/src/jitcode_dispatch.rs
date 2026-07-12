@@ -9668,6 +9668,17 @@ pub(crate) fn m73_armpath_carry_enabled() -> bool {
     })
 }
 
+/// #73 S5 phase-3 slice-5: attribution census for the residual decode-side
+/// resume-translation traffic (`bucket=sentinel_plain` in
+/// `PYRE_M369_RECOVER_AUDIT`). Under the audit gate, print one line per
+/// snapshot word that is still written as the `NO_JITCODE_PC` sentinel,
+/// tagged with the write site.
+fn m73_sentinel_word_census(site: &str, jitcode_index: u32, py_pc: u32, word: i32) {
+    if word == majit_ir::resumedata::NO_JITCODE_PC && m73_marker_audit_enabled() {
+        eprintln!("M73_SENTINEL site={site} idx={jitcode_index} py_pc={py_pc}");
+    }
+}
+
 /// `PYRE_M73_MFCALLEE_CARRY` (#73 S5 phase-3 slice-3, default ON): carry
 /// the multi-frame callee's codewrite-time resume-marker twin in its top-frame
 /// word. Certified by the `M73_MFRAW`/`M73_MFAR` censuses (legacy==twin
@@ -10561,6 +10572,12 @@ fn walker_capture_inline_nonstandard_vable_guard(
     // boundary (`entry_py_pc`), re-executing the whole call on deopt —
     // there is no kept-stack JitCode coordinate to preserve, so the
     // frame resumes through the Python pc → jitcode resume-translation path.
+    m73_sentinel_word_census(
+        "nsvable",
+        ctx.outer_jitcode_index,
+        ctx.entry_py_pc,
+        majit_ir::resumedata::NO_JITCODE_PC,
+    );
     ctx.trace_ctx
         .capture_snapshot_for_last_guard_op_with_vable_vref(
             &ctx.outer_active_boxes,
@@ -11702,6 +11719,7 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 ctx.vstack_valid.then_some(ctx.vstack_boxes.as_slice()),
                 scope.branch_guard_kept_recovered,
             );
+            m73_sentinel_word_census("main", jitcode_index, resume_py_pc, guard_jitcode_pc);
             ctx.trace_ctx
                 .capture_snapshot_for_last_guard_with_vable_vref(
                     &active,
@@ -11751,18 +11769,20 @@ fn walker_capture_snapshot_for_last_guard_impl(
         }
     }
     let (vable_boxes, vref_boxes) = ctx.trace_ctx.build_snapshot_vable_vref_boxes();
+    let arm_word = if m73_armpath_carry_enabled() {
+        ctx.outer_resume_marker_jit_pc
+            .map(|m| m as i32)
+            .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC)
+    } else {
+        majit_ir::resumedata::NO_JITCODE_PC
+    };
+    m73_sentinel_word_census("arm", ctx.outer_jitcode_index, ctx.entry_py_pc, arm_word);
     ctx.trace_ctx
         .capture_snapshot_for_last_guard_with_vable_vref(
             &ctx.outer_active_boxes,
             ctx.outer_jitcode_index,
             ctx.entry_py_pc,
-            if m73_armpath_carry_enabled() {
-                ctx.outer_resume_marker_jit_pc
-                    .map(|m| m as i32)
-                    .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC)
-            } else {
-                majit_ir::resumedata::NO_JITCODE_PC
-            },
+            arm_word,
             &vable_boxes,
             &vref_boxes,
         );
@@ -12202,16 +12222,18 @@ fn walker_capture_multi_frame_inline_snapshot(
                 ),
             }
         }
+        let pf_word = if m73_pfmarker_carry_enabled() {
+            pf.resume_marker_jit_pc
+                .map(|m| m as i32)
+                .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC)
+        } else {
+            majit_ir::resumedata::NO_JITCODE_PC
+        };
+        m73_sentinel_word_census("mfparent", pf.jitcode_index, pf.resume_py_pc, pf_word);
         frames.push((
             pf.jitcode_index,
             pf.resume_py_pc,
-            if m73_pfmarker_carry_enabled() {
-                pf.resume_marker_jit_pc
-                    .map(|m| m as i32)
-                    .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC)
-            } else {
-                majit_ir::resumedata::NO_JITCODE_PC
-            },
+            pf_word,
             pf.boxes.as_slice(),
         ));
     }
@@ -12239,6 +12261,12 @@ fn walker_capture_multi_frame_inline_snapshot(
             );
         }
     }
+    m73_sentinel_word_census(
+        "mfcallee",
+        callee_jitcode_index as u32,
+        callee_py_pc,
+        callee_jitcode_pc,
+    );
     frames.push((
         callee_jitcode_index as u32,
         callee_py_pc,
