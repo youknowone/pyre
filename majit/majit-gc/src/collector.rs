@@ -2435,6 +2435,11 @@ impl MiniMarkGC {
     /// remembered set is left untouched: a non-moving major does not consume
     /// `old -> young` edges, so the next minor still finds them.
     pub fn do_collect_oldgen_nonmoving(&mut self) {
+        let _stw = if crate::gc_sync::stw_required() {
+            Some(crate::gc_sync::quiesce_mutators())
+        } else {
+            None
+        };
         self.oldgen_nonmoving_active = true;
         self.oldgen_nonmoving_nursery_marks.clear();
 

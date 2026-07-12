@@ -937,4 +937,81 @@ mod tests {
         unregister_test_mutator();
         assert!(minor_collections >= THREADS * ROUNDS);
     }
+
+    #[test]
+    #[ignore = "requires exclusive process — conflicts with other majit-gc tests' local GCs"]
+    fn oldgen_nonmoving_preserves_other_mutators_roots() {
+        if !is_initialized() {
+            let mut gc = MiniMarkGC::with_config(GcConfig {
+                nursery_size: 64 * 1024,
+                large_object_threshold: 32 * 1024,
+                ..GcConfig::default()
+            });
+            let type_id = gc.register_type(TypeInfo::simple(16));
+            assert_eq!(type_id, 0);
+            store_singleton(Box::new(gc));
+        }
+
+        const EXPECTED: u64 = 0xCAFE_D00D_F00D_BAAD;
+        let ready = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+
+        register_test_mutator();
+        let worker = {
+            let ready = ready.clone();
+            let done = done.clone();
+            std::thread::spawn(move || {
+                register_test_mutator();
+                let root_depth = gc_op(|gc| {
+                    let object = gc.alloc_nursery_typed(0, 16);
+                    unsafe { *(object.0 as *mut u64) = EXPECTED };
+                    crate::shadow_stack::push(object)
+                });
+                ready.store(true, Ordering::Release);
+
+                for _ in 0..64 {
+                    gc_op(|_gc| {
+                        let object = crate::shadow_stack::get(root_depth);
+                        assert_eq!(unsafe { *(object.0 as *const u64) }, EXPECTED);
+                    });
+                    std::thread::yield_now();
+                }
+                while !done.load(Ordering::Acquire) {
+                    gc_op(|_gc| {
+                        let object = crate::shadow_stack::get(root_depth);
+                        assert_eq!(unsafe { *(object.0 as *const u64) }, EXPECTED);
+                    });
+                    std::thread::yield_now();
+                }
+                gc_op(|_gc| {
+                    let object = crate::shadow_stack::get(root_depth);
+                    assert_eq!(unsafe { *(object.0 as *const u64) }, EXPECTED);
+                });
+
+                crate::shadow_stack::pop_to(root_depth);
+                unregister_test_mutator();
+            })
+        };
+
+        while !ready.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        for _ in 0..3 {
+            gc_op(|gc| {
+                for _ in 0..40 {
+                    let junk = gc.alloc_nursery_typed(0, 2048);
+                    unsafe { *(junk.0 as *mut u64) = 0xBAD0_BAD0_BAD0_BAD0 };
+                }
+                gc.collect_nursery();
+            });
+        }
+        for _ in 0..3 {
+            gc_op(|gc| gc.collect_oldgen_nonmoving());
+        }
+
+        done.store(true, Ordering::Release);
+        worker.join().unwrap();
+        unregister_test_mutator();
+        assert_eq!(registered_threads(), 0);
+    }
 }
