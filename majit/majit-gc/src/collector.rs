@@ -1634,28 +1634,23 @@ impl MiniMarkGC {
     fn trace_and_update_object(&mut self, obj_addr: usize) {
         let type_id = unsafe { (*header_of(obj_addr)).type_id() };
         self.validate_type_id(type_id, obj_addr, "trace_and_update_object");
-        let type_info = self.types.get(type_id);
+        let custom_trace = self.types.get(type_id).custom_trace;
 
         // custom_trace_hook parity: use custom trace function if registered.
-        if let Some(trace_fn) = type_info.custom_trace {
-            let mut slots: Vec<*mut GcRef> = Vec::new();
+        if let Some(trace_fn) = custom_trace {
             unsafe {
                 trace_fn(obj_addr, &mut |slot_ptr: *mut GcRef| {
-                    slots.push(slot_ptr);
-                });
-            }
-            for slot_ptr in slots {
-                let field_ref = unsafe { *slot_ptr };
-                if self.is_nursery_object_start(field_ref.0) {
-                    let new_ref = self.copy_nursery_object(field_ref.0);
-                    unsafe {
+                    let field_ref = *slot_ptr;
+                    if self.is_nursery_object_start(field_ref.0) {
+                        let new_ref = self.copy_nursery_object(field_ref.0);
                         *slot_ptr = new_ref;
                     }
-                }
+                });
             }
             return;
         }
 
+        let type_info = self.types.get(type_id);
         let gc_ptr_offsets: Vec<usize> = type_info.gc_ptr_offsets.clone();
         let items_have_gc_ptrs = type_info.items_have_gc_ptrs;
         let item_size = type_info.item_size;
