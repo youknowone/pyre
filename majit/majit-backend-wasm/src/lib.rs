@@ -30,7 +30,8 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 /// decline (TEMP, for the resume-at-last-label measurement): 8 = JUMP descr
 /// did not resolve (target_ord None), 9 = target_ord Some but != last label,
 /// 10 = arity mismatch, 11 = loop-closing bridge advances no loop-carried value
-/// (guard side-trace that would livelock the chained loop).
+/// (guard side-trace that would livelock the chained loop), 15 = declined CA
+/// because a trace would use the host call trampoline on a movable CA frame.
 pub static BRIDGE_DIAG: [AtomicU64; 16] = {
     const Z: AtomicU64 = AtomicU64::new(0);
     [Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z]
@@ -1209,6 +1210,9 @@ impl majit_backend::Backend for WasmBackend {
         }
         let ops_owned: Vec<Op> = ops.iter().map(|rc| (**rc).clone()).collect();
         let ops: &[Op] = &ops_owned;
+        // This must use the same direct-vs-trampoline predicates as codegen:
+        // a CA callee runs this source-loop body on a movable nursery frame.
+        let has_trampoline_calls = codegen::has_trampoline_calls(inputargs, ops, false);
 
         // Decline traces the wasm backend cannot compile correctly, so the
         // metainterp falls back to the interpreter (correct, if unaccelerated)
@@ -1427,6 +1431,7 @@ impl majit_backend::Backend for WasmBackend {
             max_output_slots,
             num_ref_homes,
             frame,
+            has_trampoline_calls,
             bridge_cells_base,
             num_guard_cells: guard_exits.len(),
             has_preamble,
@@ -1481,7 +1486,6 @@ impl majit_backend::Backend for WasmBackend {
         // and `previous_tokens` are unused.
         let ops_owned: Vec<Op> = ops.iter().map(|rc| (**rc).clone()).collect();
         let ops: &[Op] = &ops_owned;
-
         diag_bump(0); // compile_bridge entered
 
         // is_loop=false: a bridge's terminal JUMP with no LABEL is a loop-closing
@@ -1492,12 +1496,12 @@ impl majit_backend::Backend for WasmBackend {
         // The CA arm must be able to complete a callee deopt; without the
         // registered `wasm_ca_resume_deopt` slot it could not, so decline the
         // lift (the host round-trip path still handles the CALL_ASSEMBLER).
-        let allow_ca = ca_deopt_helper_slot() != 0
+        let ca_candidate = ca_deopt_helper_slot() != 0
             && bridge_is_self_recursive_int_ca(ops, original_token.number);
-        if let Some(reason) = wasm_unsupported_trace_reason(ops, false, allow_ca) {
-            diag_bump(1); // declined: CALL_ASSEMBLER
-            return Err(BackendError::Unsupported(reason));
-        }
+        // The CA candidate's `CallAssemblerR` is a dedicated direct arm; all
+        // other ops are scanned against their normal emission paths.
+        let bridge_has_trampoline_calls =
+            codegen::has_trampoline_calls(inputargs, ops, ca_candidate);
 
         // Decline exception-resume bridges (`GuardException`): the guarded call
         // raised, so the bridge resumes into the exception handler by re-entering
@@ -1542,6 +1546,7 @@ impl majit_backend::Backend for WasmBackend {
             source_loop_finish_fi,
             source_compiled_ptr,
             source_ca_active,
+            source_has_trampoline_calls,
             _source_has_bridges,
         ) = {
             let source_loop = original_token
@@ -1614,6 +1619,7 @@ impl majit_backend::Backend for WasmBackend {
                 // with a stale pointer.
                 source_loop as *const CompiledWasmLoop as usize as u64,
                 source_loop.ca_active.get(),
+                source_loop.has_trampoline_calls,
                 !source_loop.bridge_descr_ranges.borrow().is_empty(),
             )
         };
@@ -1640,13 +1646,24 @@ impl majit_backend::Backend for WasmBackend {
         // restrict it to direct loop guards. A CA-shaped bridge on a nested
         // guard then fails codegen's CALL_ASSEMBLER handling — a deterministic
         // decline.
-        let allow_ca = allow_ca && source_is_direct;
-        if !allow_ca && source_ca_active {
-            diag_bump(14); // declined: source recursion is CA-active
+        let mut allow_ca = ca_candidate && source_is_direct;
+        let ca_trampoline_decline = if allow_ca && source_has_trampoline_calls {
+            Some("wasm backend: self-recursive CA source loop uses the host call trampoline")
+        } else if allow_ca && bridge_has_trampoline_calls {
+            Some("wasm backend: self-recursive CA bridge uses the host call trampoline")
+        } else {
+            None
+        };
+        if ca_trampoline_decline.is_some() {
+            // Let the ordinary non-CA CALL_ASSEMBLER decline path retain the
+            // interpreter fallback, but make this soundness floor observable.
+            diag_bump(15);
+            allow_ca = false;
+        }
+        if let Some(reason) = wasm_unsupported_trace_reason(ops, false, allow_ca) {
+            diag_bump(1); // declined: CALL_ASSEMBLER
             return Err(BackendError::Unsupported(
-                "wasm backend: source recursion is CA-active; further bridge \
-                 chaining declined"
-                    .into(),
+                ca_trampoline_decline.unwrap_or(reason.as_str()).to_string(),
             ));
         }
 
@@ -1660,7 +1677,19 @@ impl majit_backend::Backend for WasmBackend {
         let bridge_ref_homes = codegen::count_ref_homes(inputargs, ops);
         if bridge_value_slots > source_frame.value_slots
             || bridge_ref_homes > source_frame.home_slots
+            || (source_ca_active && bridge_has_trampoline_calls)
         {
+            if source_ca_active && bridge_has_trampoline_calls {
+                // Guard exits in a CA-active token execute on movable callee
+                // frames. Do not chain a later bridge whose own body would
+                // re-enter the stale-pointer host trampoline.
+                diag_bump(15);
+                return Err(BackendError::Unsupported(
+                    "wasm backend: CA-active source cannot chain a bridge that \
+                     uses the host call trampoline"
+                        .into(),
+                ));
+            }
             diag_bump(4);
             return Err(BackendError::Unsupported(format!(
                 "wasm backend: bridge frame needs values={bridge_value_slots}, homes={bridge_ref_homes}; \

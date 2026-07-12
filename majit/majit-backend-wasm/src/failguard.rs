@@ -219,6 +219,11 @@ pub struct CompiledWasmLoop {
     /// Geometry frozen when this token was first compiled. Every bridge
     /// chained onto it is emitted against this exact layout.
     pub frame: crate::codegen::FrameGeometry,
+    /// True when this loop's generated body uses the host residual-call
+    /// trampoline. A CA callee frame is movable, but that trampoline retains
+    /// the pre-call frame pointer, so `compile_bridge` must not enable the CA
+    /// arm for this source loop.
+    pub has_trampoline_calls: bool,
     /// Base address (shared linear memory) of this loop's per-guard bridge-slot
     /// cell array — one i32 per `fail_index`, `0` = no bridge. The trace's
     /// epilogue reads `cells[fail_index]` and `compile_bridge` writes a bridge's

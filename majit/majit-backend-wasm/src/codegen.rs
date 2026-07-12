@@ -941,6 +941,40 @@ fn has_call_ops(ops: &[Op]) -> bool {
     })
 }
 
+/// Whether this trace emits a host `jit_call` / `jit_call_compact` trampoline
+/// invocation.  CA frames are movable nursery objects, while the host
+/// trampoline writes its result back through the pre-call frame pointer, so
+/// `compile_bridge` uses this exact lowering census to keep such traces off a
+/// live CA frame.
+///
+/// Keep this in lockstep with the individual emission arms below: the uniform
+/// i64 residual family, `New*`, and write barriers are direct under
+/// `WASM_DIRECT_RESIDUAL_CALL`; non-uniform CALLs and string allocation retain
+/// the trampoline.  When the direct family is disabled, all of the existing
+/// call-area users return to the trampoline baseline.
+pub fn has_trampoline_calls(inputargs: &[InputArg], ops: &[Op], emit_ca: bool) -> bool {
+    let ref_values = RefValues::collect(inputargs, ops);
+    if !WASM_DIRECT_RESIDUAL_CALL {
+        return has_call_ops(ops) || has_ref_store_op(ops, &ref_values);
+    }
+
+    ops.iter().any(|op| match op.opcode {
+        // `build_function` handles an enabled CA `CallAssemblerR` before the
+        // generic CALL arm, lowering it directly to the source-loop table
+        // slot. It therefore never uses the host call area.
+        OpCode::CallAssemblerR if emit_ca => false,
+        // These arms have no direct helper lowering.
+        OpCode::Newstr | OpCode::Newunicode => true,
+        // Every residual CALL uses the trampoline unless its exact lowering
+        // predicate supplies an i64 helper ABI.
+        _ if op.opcode.is_call() => direct_helper_i64_arity(op, &ref_values).is_none(),
+        // `New*` and ref-store write barriers are covered by
+        // `direct_helper_i64_arity`, so their direct-family arms do not touch
+        // the frame call area.
+        _ => false,
+    })
+}
+
 fn collect_guards_and_vars(inputargs: &[InputArg], ops: &[Op]) -> (Vec<GuardExit>, u32) {
     let mut guards = Vec::new();
     let mut max_var: u32 = 0;
@@ -1263,6 +1297,9 @@ pub fn build_wasm_module(
     } else {
         None
     };
+    // `ca.emit_ca` forces the direct helper family to include arities 0..=2,
+    // so all CA frame-helper trampoline `else` arms below are baseline-only.
+    debug_assert!(!ca.emit_ca || residual_max_arity.is_some());
 
     let mut module = Module::new();
 
@@ -1443,6 +1480,10 @@ fn build_function(
     // `ca.deopt_helper_slot` for a deopted callee.
     ca_helper_type_idx: u32,
 ) -> Result<Function, BackendError> {
+    // The CA arm requires residual types (the setup above forces arity >= 2
+    // while `WASM_DIRECT_RESIDUAL_CALL` is enabled). Its `jit_call` fallback
+    // branches are retained solely for the direct-family-disabled baseline.
+    debug_assert!(!ca.emit_ca || residual_type_base.is_some());
     // Value locals occupy `1 ..= num_vars`; reserve `UMULHI_SCRATCH` extra i64
     // locals past them (`num_vars+1 ..= num_vars+UMULHI_SCRATCH`) as scratch for
     // the `UintMulHigh` 32-bit-split expansion (`emit_umulhi`). One i32 local

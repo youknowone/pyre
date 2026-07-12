@@ -310,7 +310,7 @@ fn run(module_path: &PathBuf, source: &str) -> Result<i32> {
         }
         // compile_bridge outcome tallies (diagnostic). 0=entered 1=declCALL_ASM
         // 2=declMultiPeel 3=declNotDirect 4=declRefHome 5=BRIDGE_OK
-        // 6=loopClosing 7=srcHasPreamble.
+        // 6=loopClosing 7=srcHasPreamble 15=declCAHostTrampoline.
         if let Ok(diag) = instance.get_typed_func::<u32, u64>(&mut store, "pyre_jit_bridge_diag") {
             let labels = [
                 "entered",
@@ -327,8 +327,8 @@ fn run(module_path: &PathBuf, source: &str) -> Result<i32> {
                 "decl_noadvance",
                 "ca_cell_set",
                 "ca_cells_zero",
-                "decl_ca_chain",
-                "reserved15",
+                "reserved14",
+                "decl_ca_trampoline",
             ];
             let mut parts = Vec::new();
             for (i, lbl) in labels.iter().enumerate() {
