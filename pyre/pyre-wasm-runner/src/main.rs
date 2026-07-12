@@ -96,6 +96,9 @@ struct Host {
     /// guard-exit fail_index) over every host round-trip, so we can see which
     /// guard keeps returning to the host instead of chaining in-module.
     exec_hist: std::collections::BTreeMap<(u32, u32), u64>,
+    /// `PYRE_WASM_GUEST_PROFILE` sampling profiler; taken/restored around each
+    /// epoch tick so `sample` can borrow the store it lives in.
+    guest_profiler: Option<wasmtime::GuestProfiler>,
 }
 
 fn main() {
@@ -209,11 +212,48 @@ fn run(module_path: &PathBuf, source: &str) -> Result<i32> {
     if fuel_limit.is_some() {
         config.consume_fuel(true);
     }
+    // Diagnostic: PYRE_WASM_GUEST_PROFILE=<out.json> writes a sampling profile
+    // of the guest in the Firefox processed format (main-module symbols only;
+    // JIT trace modules appear as omitted frames under `execute_token`). View
+    // at https://profiler.firefox.com/. Samples land on epoch checkpoints
+    // (function entries / loop back-edges), so call-dense small functions are
+    // over-represented and bulk ops (memory.fill) are attributed to the next
+    // checkpoint. Epoch interruption changes main-module codegen, so pair with
+    // PYRE_WASM_NO_CACHE=1 to avoid clobbering the shared .cwasm cache.
+    let guest_profile_out = std::env::var("PYRE_WASM_GUEST_PROFILE").ok();
+    if guest_profile_out.is_some() {
+        config.epoch_interruption(true);
+    }
     let engine = Engine::new(&config)?;
 
     let module = load_main_module(&engine, module_path)?;
 
     let mut store = Store::new(&engine, Host::default());
+    if guest_profile_out.is_some() {
+        const SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_micros(200);
+        let profiler = wasmtime::GuestProfiler::new(
+            &engine,
+            "pyre-wasm",
+            SAMPLE_INTERVAL,
+            vec![("pyre_wasm".to_string(), module.clone())],
+        )?;
+        store.data_mut().guest_profiler = Some(profiler);
+        store.set_epoch_deadline(1);
+        store.epoch_deadline_callback(|mut ctx| {
+            if let Some(mut p) = ctx.data_mut().guest_profiler.take() {
+                p.sample(&ctx, std::time::Duration::ZERO);
+                ctx.data_mut().guest_profiler = Some(p);
+            }
+            Ok(wasmtime::UpdateDeadline::Continue(1))
+        });
+        let ticker_engine = engine.clone();
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(SAMPLE_INTERVAL);
+                ticker_engine.increment_epoch();
+            }
+        });
+    }
     store.data_mut().stdlib_root = std::env::var("PYRE_STDLIB").ok();
     if let Some(n) = fuel_limit {
         store.set_fuel(n)?;
@@ -262,6 +302,14 @@ fn run(module_path: &PathBuf, source: &str) -> Result<i32> {
     // Refill so the readout reflects the real (compile-time) counter values.
     if fuel_limit.is_some() {
         let _ = store.set_fuel(u64::MAX);
+    }
+    if let Some(path) = &guest_profile_out {
+        if let Some(p) = store.data_mut().guest_profiler.take() {
+            let f = std::fs::File::create(path).context("create guest profile output")?;
+            p.finish(std::io::BufWriter::new(f))
+                .context("write guest profile")?;
+            eprintln!("[guest-profile] wrote {path}");
+        }
     }
     if std::env::var_os("PYRE_WASM_JIT_STATS").is_some() {
         let lin_mem = memory.data_size(&store);
