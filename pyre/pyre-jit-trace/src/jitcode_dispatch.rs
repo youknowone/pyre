@@ -9576,9 +9576,13 @@ pub(crate) fn m73_marker_audit_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_M73_MARKER_AUDIT").is_some())
 }
 
-/// `PYRE_M73_MARKER_CARRY` (#73 S5 phase-1, default OFF): source the
-/// nonbranch-marker keystone from the codewrite-time jitcode-keyed twin when
-/// available, retaining runtime resume-marker derivation as the fallback.
+/// `PYRE_M73_MARKER_CARRY` (#73 S5 phase-1, default ON): source the
+/// nonbranch-marker keystone from the codewrite-time jitcode-keyed twin at the
+/// guard's own jitcode offset, retaining runtime resume-marker derivation as
+/// the fallback for twin-`None` rows (the synthetic loop-close overshoot whose
+/// `entry_py_pc` rebind is runtime-only). Certified by `PYRE_M73_MARKER_AUDIT`
+/// (100% eq=1 across the bench corpus) and check.py (161×2, on and off).
+/// Disable with `PYRE_M73_MARKER_CARRY=0`.
 pub(crate) fn m73_marker_carry_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M73_MARKER_CARRY") {
@@ -9586,7 +9590,7 @@ pub(crate) fn m73_marker_carry_enabled() -> bool {
             let v = v.to_string_lossy();
             v != "0" && !v.eq_ignore_ascii_case("false")
         }
-        None => false,
+        None => true,
     })
 }
 
