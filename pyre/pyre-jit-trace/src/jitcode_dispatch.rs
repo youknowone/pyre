@@ -9594,6 +9594,21 @@ pub(crate) fn m73_marker_carry_enabled() -> bool {
     })
 }
 
+/// `PYRE_M73_S1MARKER_CARRY` (#73 S5 phase-3 slice-1, default OFF): source
+/// the remaining nonbranch guard resume words from the codewrite-time
+/// jitcode-keyed resume-marker twin. Twin-`None` rows retain the sentinel.
+/// Enable with any value other than `0`/`false`.
+pub(crate) fn m73_s1marker_carry_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M73_S1MARKER_CARRY") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => false,
+    })
+}
+
 /// `PYRE_M73_ARMARKER_CARRY` (#73 S5 phase-2, default ON): source the plain
 /// after-residual-call marker from the codewrite-time fallthrough-marker twin
 /// at the guard's own jitcode offset, retaining runtime resume-marker
@@ -11512,6 +11527,63 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 match marker {
                     Some(jp) => jp as i32,
                     None => majit_ir::resumedata::NO_JITCODE_PC,
+                }
+            } else if m366_nonbranch_pc_enabled()
+                && (m73_marker_audit_enabled() || m73_s1marker_carry_enabled())
+            {
+                // #73 S5 p3-s1: the remaining nonbranch guards (outside the
+                // arm-2 allow-list, not after-residual) carry the same
+                // block-head marker as arm-2, sourced from the jitcode-keyed
+                // twin at the guard's own `op_pc`.  Nested under the #366
+                // nonbranch opt-out so `PYRE_M366_NONBRANCH_PC=0` keeps the
+                // sentinel for every nonbranch guard.
+                let twin = unsafe { (&*sym.jitcode).payload.resume_marker_for_jitcode_pc(op_pc) };
+                if m73_marker_audit_enabled() {
+                    let legacy = unsafe {
+                        (&*sym.jitcode)
+                            .payload
+                            .resume_jitcode_pc_for(py_pc as usize)
+                    };
+                    match legacy {
+                        Some(m) => match twin {
+                            Some(t) if t == m => eprintln!(
+                                "M73_S1MARKER eq=1 guard={:?} py_pc={} op_pc={} m={}",
+                                ctx.trace_ctx.last_guard_opcode(),
+                                py_pc,
+                                op_pc,
+                                m
+                            ),
+                            Some(t) => eprintln!(
+                                "M73_S1MARKER eq=0 guard={:?} py_pc={} op_pc={} m={} twin={}",
+                                ctx.trace_ctx.last_guard_opcode(),
+                                py_pc,
+                                op_pc,
+                                m,
+                                t
+                            ),
+                            None => eprintln!(
+                                "M73_S1MARKER eq=notwin guard={:?} py_pc={} op_pc={} m={}",
+                                ctx.trace_ctx.last_guard_opcode(),
+                                py_pc,
+                                op_pc,
+                                m
+                            ),
+                        },
+                        None => eprintln!(
+                            "M73_S1MARKER eq=nomarker guard={:?} py_pc={} op_pc={}",
+                            ctx.trace_ctx.last_guard_opcode(),
+                            py_pc,
+                            op_pc
+                        ),
+                    }
+                }
+                if m73_s1marker_carry_enabled() {
+                    match twin {
+                        Some(jp) => jp as i32,
+                        None => majit_ir::resumedata::NO_JITCODE_PC,
+                    }
+                } else {
+                    majit_ir::resumedata::NO_JITCODE_PC
                 }
             } else {
                 majit_ir::resumedata::NO_JITCODE_PC
