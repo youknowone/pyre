@@ -59,6 +59,7 @@ fn build_module(
         0,    // fail_index_base
         0,    // external_jump_slot
         0,    // external_jump_key
+        codegen::FrameGeometry::fixed(),
         codegen::CaParams::default(),
     )
     .expect("wasm codegen should succeed");

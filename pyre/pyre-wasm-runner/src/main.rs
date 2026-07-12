@@ -33,13 +33,11 @@ use wasmtime::{
 // Frame call-area offsets — must match `majit-backend-wasm/src/codegen.rs`.
 // Shared with `wasmi_host`, which mirrors the same call-area protocol.
 pub(crate) const CALL_RESULT_OFS: usize = 2000;
-pub(crate) const CALL_FUNC_OFS: usize = 2008;
 // The arg count also lives at offset 2016, but the trampoline derives arity
 // (and the exact value types) from the resolved function's wasm signature
 // instead, which is authoritative on wasm32. Kept for layout documentation.
 #[allow(dead_code)]
 pub(crate) const CALL_NARGS_OFS: usize = 2016;
-pub(crate) const CALL_ARGS_OFS: usize = 2024;
 
 pub(crate) const DEFAULT_MODULE: &str = "target/wasm32-unknown-unknown/release/pyre_wasm.wasm";
 
@@ -567,7 +565,7 @@ fn build_linker(engine: &Engine) -> Result<Linker<Host>> {
         "pyre_jit",
         "jit_call_host",
         |mut caller: Caller<'_, Host>, frame_ptr: u32| {
-            if let Err(e) = jit_call_trampoline(&mut caller, frame_ptr) {
+            if let Err(e) = jit_call_trampoline(&mut caller, frame_ptr, CALL_RESULT_OFS as u32) {
                 eprintln!("[jit_call_host] {e:?}");
             }
         },
@@ -718,8 +716,19 @@ fn jit_compile(caller: &mut Caller<'_, Host>, bytes_ptr: u32, bytes_len: u32) ->
     let jit_call = Func::wrap(
         &mut *caller,
         |mut inner: Caller<'_, Host>, frame_ptr: i32| {
-            if let Err(e) = jit_call_trampoline(&mut inner, frame_ptr as u32) {
+            if let Err(e) =
+                jit_call_trampoline(&mut inner, frame_ptr as u32, CALL_RESULT_OFS as u32)
+            {
                 eprintln!("[jit_call] {e:?}");
+            }
+        },
+    );
+    let jit_call_compact = Func::wrap(
+        &mut *caller,
+        |mut inner: Caller<'_, Host>, frame_ptr: i32, call_area_ofs: i32| {
+            if let Err(e) = jit_call_trampoline(&mut inner, frame_ptr as u32, call_area_ofs as u32)
+            {
+                eprintln!("[jit_call_compact] {e:?}");
             }
         },
     );
@@ -730,6 +739,7 @@ fn jit_compile(caller: &mut Caller<'_, Host>, bytes_ptr: u32, bytes_len: u32) ->
         match (import.module(), import.name()) {
             ("env", "memory") => externs.push(Extern::Memory(memory)),
             ("env", "jit_call") => externs.push(Extern::Func(jit_call)),
+            ("env", "jit_call_compact") => externs.push(Extern::Func(jit_call_compact)),
             ("env", "__indirect_function_table") => externs.push(Extern::Table(table)),
             (m, n) => {
                 return Err(Error::msg(format!(
@@ -796,25 +806,29 @@ fn jit_execute(caller: &mut Caller<'_, Host>, func_id: u32, frame_ptr: u32) -> R
 }
 
 /// Dispatch a residual call requested by a running trace.
-fn jit_call_trampoline(caller: &mut Caller<'_, Host>, frame_ptr: u32) -> Result<()> {
+fn jit_call_trampoline(
+    caller: &mut Caller<'_, Host>,
+    frame_ptr: u32,
+    call_area_ofs: u32,
+) -> Result<()> {
     caller.data_mut().jit_call_count += 1;
     let memory = caller.data().memory.context("memory")?;
     let table = caller.data().table.context("table")?;
-    let frame = frame_ptr as usize;
+    let call_area = frame_ptr as usize + call_area_ofs as usize;
 
-    let func_ptr = read_u32(&memory, &*caller, frame + CALL_FUNC_OFS);
+    let func_ptr = read_u32(&memory, &*caller, call_area + 8);
 
     // `func_ptr == 0` is the "newstr" sentinel; without a host string
     // allocator (matching the browser glue's null table slot) it yields 0.
     if func_ptr == 0 {
-        write_i64(&memory, &mut *caller, frame + CALL_RESULT_OFS, 0)?;
+        write_i64(&memory, &mut *caller, call_area, 0)?;
         return Ok(());
     }
 
     let func = match table.get(&mut *caller, func_ptr as u64) {
         Some(Ref::Func(Some(f))) => f,
         _ => {
-            write_i64(&memory, &mut *caller, frame + CALL_RESULT_OFS, 0)?;
+            write_i64(&memory, &mut *caller, call_area, 0)?;
             return Ok(());
         }
     };
@@ -823,7 +837,7 @@ fn jit_call_trampoline(caller: &mut Caller<'_, Host>, frame_ptr: u32) -> Result<
     let params: Vec<ValType> = ty.params().collect();
     let mut args: Vec<Val> = Vec::with_capacity(params.len());
     for (i, pty) in params.iter().enumerate() {
-        let raw = read_i64(&memory, &*caller, frame + CALL_ARGS_OFS + i * 8);
+        let raw = read_i64(&memory, &*caller, call_area + 24 + i * 8);
         args.push(match pty {
             ValType::I32 => Val::I32(raw as i32),
             ValType::I64 => Val::I64(raw),
@@ -852,7 +866,7 @@ fn jit_call_trampoline(caller: &mut Caller<'_, Host>, frame_ptr: u32) -> Result<
     // reported as a zero result rather than aborting the whole run.
     if let Err(e) = func.call(&mut *caller, &args, &mut results) {
         eprintln!("[jit_call] residual target trapped: {e:?}");
-        write_i64(&memory, &mut *caller, frame + CALL_RESULT_OFS, 0)?;
+        write_i64(&memory, &mut *caller, call_area, 0)?;
         return Ok(());
     }
 
@@ -863,7 +877,7 @@ fn jit_call_trampoline(caller: &mut Caller<'_, Host>, frame_ptr: u32) -> Result<
         Some(Val::F32(x)) => (*x as u64) as i64,
         _ => 0,
     };
-    write_i64(&memory, &mut *caller, frame + CALL_RESULT_OFS, result)?;
+    write_i64(&memory, &mut *caller, call_area, result)?;
     Ok(())
 }
 

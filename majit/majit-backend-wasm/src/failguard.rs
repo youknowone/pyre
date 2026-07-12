@@ -85,25 +85,11 @@ pub struct LabelTarget {
     /// livelock advance-check applies; earlier labels execute the peeled
     /// segment, which advances the state by itself.
     pub is_last_label: bool,
-    /// Ref-home slot count of the owning loop, for the chain-soundness check:
-    /// a chained trace runs in the frame `execute_token` sized for the loop
-    /// the chain ENTERED through, so a tail-call may only target a loop whose
-    /// Ref-home region fits `max(source loop's homes, FRAME_REF_HOME_FLOOR)`
-    /// — inductively, every loop in a chain then fits the entry frame (which
-    /// is sized to at least the floor). Ref homes are the ONLY variable frame
-    /// requirement: value slots are bounded by `codegen`'s
-    /// `CALL_AREA_FIRST_SLOT` decline, below the constant
-    /// `MIN_FRAME_BYTES / 8` value region every host frame carries.
-    pub num_ref_homes: usize,
+    /// Frozen frame geometry of the target token. A tail-call can only reuse
+    /// a frame when its offsets agree exactly, not merely when its allocation
+    /// is large enough.
+    pub frame: crate::codegen::FrameGeometry,
 }
-
-/// Minimum Ref-home slot count `execute_token` sizes every host frame for
-/// while bridge chaining is enabled (see `LabelTarget::num_ref_homes`).
-/// Chains between traces whose home counts stay at or under this floor need
-/// no source-vs-target comparison at all, which is what lifts most frame-fit
-/// bridge declines. Costs `8` bytes + one GC-root registration per slot per
-/// `execute_token` call.
-pub const FRAME_REF_HOME_FLOOR: usize = 64;
 
 /// Global `frame[0]` fail-index space.
 ///
@@ -230,6 +216,9 @@ pub struct CompiledWasmLoop {
     /// region (`codegen::HOME_SLOT_BASE`). `execute_token` sizes the host
     /// frame to include this region and registers each home slot as a GC root.
     pub num_ref_homes: usize,
+    /// Geometry frozen when this token was first compiled. Every bridge
+    /// chained onto it is emitted against this exact layout.
+    pub frame: crate::codegen::FrameGeometry,
     /// Base address (shared linear memory) of this loop's per-guard bridge-slot
     /// cell array — one i32 per `fail_index`, `0` = no bridge. The trace's
     /// epilogue reads `cells[fail_index]` and `compile_bridge` writes a bridge's
@@ -288,15 +277,6 @@ pub struct CompiledWasmLoop {
     /// module lives as long as the source loop it attaches to, so its cells are
     /// freed when this loop drops. Appended by `compile_bridge`.
     pub _bridge_owned_cells: RefCell<Vec<Box<[u32]>>>,
-    /// Max `num_ref_homes` over the self-recursive `CallAssemblerR` bridges
-    /// (`PYRE_WASM_CA`) chained onto this loop, or 0 when there are none. Such a
-    /// bridge runs in the host entry frame `F0` for the outermost call, so
-    /// `execute_token` must size `F0` (and register its GC roots) for the LARGER
-    /// of the loop's own homes and this — the bridge's home writes would
-    /// otherwise overflow a loop-sized `F0`. Set by `compile_bridge` when it
-    /// accepts a CA bridge; `Cell` because the source token is shared (`&`) and
-    /// the wasm host is single-threaded.
-    pub ca_bridge_ref_homes: Cell<usize>,
     /// Set when `compile_bridge` accepts a self-recursive `CallAssemblerR`
     /// bridge (`PYRE_WASM_CA`) for this loop. While set, `compile_bridge`
     /// declines chaining any FURTHER bridge into this recursion (the guard

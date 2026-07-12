@@ -25,16 +25,16 @@ export function jit_set_table(table) {
 // Call trampoline — invoked by generated wasm when it encounters a CALL op.
 // Reads func_ptr + args from the frame's call area, performs the call via
 // the main module's indirect function table, writes result back.
-function jitCallTrampoline(framePtr) {
+function jitCallTrampoline(framePtr, callAreaOfs = CALL_RESULT_OFS) {
   const view = new DataView(mainMemory.buffer);
-  const funcPtrLo = view.getUint32(framePtr + CALL_FUNC_OFS, true);
-  const numArgs = Number(view.getBigInt64(framePtr + CALL_NARGS_OFS, true));
+  const funcPtrLo = view.getUint32(framePtr + callAreaOfs + 8, true);
+  const numArgs = Number(view.getBigInt64(framePtr + callAreaOfs + 16, true));
 
   // Read args from call area
   const args = [];
   for (let i = 0; i < numArgs; i++) {
     // On wasm32, values are i32 (pointers/ints). Read low 32 bits of each i64 slot.
-    args.push(view.getInt32(framePtr + CALL_ARGS_OFS + i * 8, true));
+    args.push(view.getInt32(framePtr + callAreaOfs + 24 + i * 8, true));
   }
 
   // Call via the main module's function table
@@ -50,8 +50,8 @@ function jitCallTrampoline(framePtr) {
   }
 
   // Write result to call area (as i64: low 32 bits = result, high 32 bits = 0)
-  view.setInt32(framePtr + CALL_RESULT_OFS, result, true);
-  view.setInt32(framePtr + CALL_RESULT_OFS + 4, 0, true);
+  view.setInt32(framePtr + callAreaOfs, result, true);
+  view.setInt32(framePtr + callAreaOfs + 4, 0, true);
 }
 
 export function jit_compile_wasm(bytesPtr, bytesLen) {
@@ -69,7 +69,7 @@ export function jit_compile_wasm(bytesPtr, bytesLen) {
     // chaining; the module imports it only when it has CALL ops. Extra
     // entries in the import object are ignored when not declared.
     const instance = new WebAssembly.Instance(module, {
-      env: { memory: mainMemory, jit_call: jitCallTrampoline, __indirect_function_table: mainTable }
+      env: { memory: mainMemory, jit_call: jitCallTrampoline, jit_call_compact: jitCallTrampoline, __indirect_function_table: mainTable }
     });
     return registerTrace(instance.exports.trace);
   } catch (e) {
