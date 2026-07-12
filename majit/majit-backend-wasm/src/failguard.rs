@@ -219,11 +219,11 @@ pub struct CompiledWasmLoop {
     /// Geometry frozen when this token was first compiled. Every bridge
     /// chained onto it is emitted against this exact layout.
     pub frame: crate::codegen::FrameGeometry,
-    /// True when this loop's generated body uses the host residual-call
-    /// trampoline. A CA callee frame is movable, but that trampoline retains
-    /// the pre-call frame pointer, so `compile_bridge` must not enable the CA
-    /// arm for this source loop.
-    pub has_trampoline_calls: bool,
+    /// True when this loop or any successfully chained bridge uses the host
+    /// residual-call trampoline. A CA callee frame is movable, but that
+    /// trampoline retains the pre-call frame pointer, so `compile_bridge` must
+    /// not enable the CA arm for this source token.
+    pub has_trampoline_calls: Cell<bool>,
     /// Base address (shared linear memory) of this loop's per-guard bridge-slot
     /// cell array — one i32 per `fail_index`, `0` = no bridge. The trace's
     /// epilogue reads `cells[fail_index]` and `compile_bridge` writes a bridge's
@@ -291,6 +291,17 @@ pub struct CompiledWasmLoop {
     pub ca_active: Cell<bool>,
 }
 
+impl CompiledWasmLoop {
+    /// Incorporate the normal (non-CA unless this bridge is the candidate)
+    /// codegen census for a bridge after it has been chained onto this token.
+    /// Every earlier bridge remains reachable from a later CA recursion's
+    /// guard exits, so its host trampoline use also rules out CA.
+    pub fn record_chained_bridge_trampoline_calls(&self, bridge_has_trampoline_calls: bool) {
+        self.has_trampoline_calls
+            .set(self.has_trampoline_calls.get() || bridge_has_trampoline_calls);
+    }
+}
+
 impl Drop for CompiledWasmLoop {
     fn drop(&mut self) {
         // Retract this loop's published label targets so a later bridge
@@ -310,5 +321,49 @@ impl Drop for CompiledWasmLoop {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn token_with_trampoline_census(has_trampoline_calls: bool) -> CompiledWasmLoop {
+        CompiledWasmLoop {
+            trace_id: 0,
+            input_types: Vec::new(),
+            func_handle: 0,
+            fail_descrs: RefCell::new(Vec::new()),
+            num_inputs: 0,
+            max_output_slots: 0,
+            num_ref_homes: 0,
+            frame: crate::codegen::FrameGeometry::fixed(),
+            has_trampoline_calls: Cell::new(has_trampoline_calls),
+            bridge_cells_base: 0,
+            num_guard_cells: 0,
+            has_preamble: false,
+            label_descrs: Vec::new(),
+            guard_fail_arg_advanced: Vec::new(),
+            bridge_descr_ranges: RefCell::new(Vec::new()),
+            chained_trace_meta: RefCell::new(std::collections::HashMap::new()),
+            _bridge_cells_owner: None,
+            _bridge_owned_cells: RefCell::new(Vec::new()),
+            ca_active: Cell::new(false),
+        }
+    }
+
+    #[test]
+    fn chained_bridge_trampoline_census_is_orred_into_token() {
+        let token = token_with_trampoline_census(false);
+        token.record_chained_bridge_trampoline_calls(false);
+        assert!(!token.has_trampoline_calls.get());
+
+        token.record_chained_bridge_trampoline_calls(true);
+        assert!(token.has_trampoline_calls.get());
+
+        // A later clean bridge cannot erase an earlier chained bridge's
+        // trampoline census before a CA bridge is considered.
+        token.record_chained_bridge_trampoline_calls(false);
+        assert!(token.has_trampoline_calls.get());
     }
 }

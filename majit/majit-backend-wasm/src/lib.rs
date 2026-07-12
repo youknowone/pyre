@@ -1431,7 +1431,7 @@ impl majit_backend::Backend for WasmBackend {
             max_output_slots,
             num_ref_homes,
             frame,
-            has_trampoline_calls,
+            has_trampoline_calls: std::cell::Cell::new(has_trampoline_calls),
             bridge_cells_base,
             num_guard_cells: guard_exits.len(),
             has_preamble,
@@ -1547,7 +1547,6 @@ impl majit_backend::Backend for WasmBackend {
             source_compiled_ptr,
             source_ca_active,
             source_has_trampoline_calls,
-            _source_has_bridges,
         ) = {
             let source_loop = original_token
                 .compiled
@@ -1619,8 +1618,7 @@ impl majit_backend::Backend for WasmBackend {
                 // with a stale pointer.
                 source_loop as *const CompiledWasmLoop as usize as u64,
                 source_loop.ca_active.get(),
-                source_loop.has_trampoline_calls,
-                !source_loop.bridge_descr_ranges.borrow().is_empty(),
+                source_loop.has_trampoline_calls.get(),
             )
         };
 
@@ -1648,7 +1646,10 @@ impl majit_backend::Backend for WasmBackend {
         // decline.
         let mut allow_ca = ca_candidate && source_is_direct;
         let ca_trampoline_decline = if allow_ca && source_has_trampoline_calls {
-            Some("wasm backend: self-recursive CA source loop uses the host call trampoline")
+            Some(
+                "wasm backend: self-recursive CA source token or chained bridge \
+                 uses the host call trampoline",
+            )
         } else if allow_ca && bridge_has_trampoline_calls {
             Some("wasm backend: self-recursive CA bridge uses the host call trampoline")
         } else {
@@ -2007,6 +2008,7 @@ impl majit_backend::Backend for WasmBackend {
                     count,
                 ));
             }
+            source_loop.record_chained_bridge_trampoline_calls(bridge_has_trampoline_calls);
             // Publish this bridge's own guard-dispatch metadata so a hot guard
             // INSIDE it can chain a nested sub-bridge (same resolution the
             // loop's own guards get, keyed by this bridge's trace_id).
