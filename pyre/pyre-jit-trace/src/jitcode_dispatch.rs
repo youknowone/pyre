@@ -7596,9 +7596,10 @@ thread_local! {
     /// as `DoneWithThisFrame` instead of rewinding to the guard pc and
     /// re-interpreting the region (which would double every eagerly executed
     /// residual side effect, #177).  Only the bridge tracer sets it, and only
-    /// when the resume is single-frame and the caller can consume a concrete
-    /// result (the general guard path, not the CALL_ASSEMBLER callback), so a
-    /// committed journal never strands into a blackhole re-run.  Cleared after
+    /// when the resume is single-frame; the general guard path consumes the
+    /// kept stash as a terminal `BridgeResolution`, and the CALL_ASSEMBLER
+    /// callback hands it to its back-to-back blackhole hook, so a committed
+    /// journal never strands into a guard-state re-run.  Cleared after
     /// every bridge walk.
     static FBW_BRIDGE_NOREPLAY_ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -7687,16 +7688,20 @@ pub(crate) fn fbw_finish_raise_set(value: ConcreteValue) {
 
 /// Peek at the stashed terminal disposition without consuming it (the
 /// `run_perfn_walk` epilogue uses this to decide whether to commit the
-/// store journal and keep the no-replay shortcut).
-pub(crate) fn fbw_finish_concrete_peek() -> Option<FinishConcrete> {
+/// store journal and keep the no-replay shortcut; the CALL_ASSEMBLER
+/// bridge callback uses it to leave a kept stash in its rooted cell for
+/// the back-to-back blackhole hook).
+pub fn fbw_finish_concrete_peek() -> Option<FinishConcrete> {
     FBW_FINISH_CONCRETE.with(|c| c.get())
 }
 
 /// Clear the stashed terminal disposition.  The `run_perfn_walk`
 /// epilogue calls this when the no-replay shortcut is declined (not a
 /// `Terminate` walk, or an unjournaled effect only the replay applies) so
-/// the portal degrades to `ContinueRunningNormally`.
-pub(crate) fn fbw_finish_concrete_reset() {
+/// the portal degrades to `ContinueRunningNormally`; the CALL_ASSEMBLER
+/// blackhole hook calls it so a kept stash that cannot be consumed does
+/// not leak into a later portal take.
+pub fn fbw_finish_concrete_reset() {
     FBW_FINISH_CONCRETE.with(|c| c.set(None));
 }
 

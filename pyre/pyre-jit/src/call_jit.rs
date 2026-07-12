@@ -65,6 +65,17 @@ thread_local! {
     /// the guard-state resume over already-applied effects.
     static CA_WALK_ADOPTED_FRAME: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    /// Callee PyFrame address whose CALL_ASSEMBLER bridge walk terminated
+    /// with a kept finish-concrete stash (the walked callee ran to its
+    /// return/uncaught raise concretely).  The CA bridge hook returns a
+    /// bare bool and cannot carry the concrete result itself, so it sets
+    /// this handshake and the back-to-back blackhole hook consumes the
+    /// stash to complete the callee — the retrace-reaches-finishframe
+    /// `DoneWithThisFrame`/`ExitFrameWithExceptionRef` the assembler
+    /// caller catches (pyjitpl.py:1688-1698, jitexc.py) — instead of
+    /// re-running the resumed region over already-applied effects.
+    static CA_WALK_FINISHED_FRAME: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
     static SELF_RECURSIVE_DISPATCH_CACHE: UnsafeCell<Option<(u64, Option<u64>)>> =
         const { UnsafeCell::new(None) };
 }
@@ -1328,6 +1339,7 @@ fn jit_blackhole_resume_from_guard(
     guard_exc: i64,
 ) -> Option<i64> {
     let ca_adopted_frame = CA_WALK_ADOPTED_FRAME.with(|c| c.replace(0));
+    let ca_finished_frame = CA_WALK_FINISHED_FRAME.with(|c| c.replace(0));
 
     // rstack.stack_check_slowpath → _StackOverflow parity: drain the
     // pending JIT-prologue overflow exception when the backend probe
@@ -1341,13 +1353,51 @@ fn jit_blackhole_resume_from_guard(
         // Stash for the eval loop to surface — same channel the
         // blackhole/force callbacks already use for cross-FFI errors.
         crate::call_jit::set_pending_ca_exception(exc);
+        pyre_jit_trace::jitcode_dispatch::fbw_finish_concrete_reset();
         return None;
     }
 
     if fail_values_ptr.is_null() || num_fail_values == 0 {
+        pyre_jit_trace::jitcode_dispatch::fbw_finish_concrete_reset();
         return None;
     }
     let fail_values = unsafe { std::slice::from_raw_parts(fail_values_ptr, num_fail_values) };
+
+    // The CA bridge walk ran the callee to its finishframe concretely and
+    // kept the finish-concrete stash (`CA_WALK_FINISHED_FRAME` handshake set
+    // by `trace_and_compile_from_bridge`); the guard-state blackhole below
+    // would re-run the resumed region over the already-applied effects.
+    // Complete the callee with the stashed concrete instead — the
+    // `DoneWithThisFrame` / `ExitFrameWithExceptionRef` the assembler caller
+    // catches when a retrace reaches finishframe (pyjitpl.py:1688-1698,
+    // jitexc.py).
+    if ca_finished_frame != 0 && ca_finished_frame == fail_values[0] as usize {
+        match pyre_jit_trace::jitcode_dispatch::fbw_finish_concrete_take() {
+            Some(pyre_jit_trace::jitcode_dispatch::FinishConcrete::Return(cv)) => {
+                let result = match cv {
+                    // A void return stashes `Null`, i.e. Python `None`.
+                    pyre_jit_trace::state::ConcreteValue::Null => pyre_object::w_none(),
+                    other => other.to_pyobj(),
+                };
+                return Some(result as i64);
+            }
+            Some(pyre_jit_trace::jitcode_dispatch::FinishConcrete::Raise(cv)) => {
+                let pyre_jit_trace::state::ConcreteValue::Ref(exc_ref) = cv else {
+                    unreachable!("FinishConcrete::Raise must hold a concrete Ref")
+                };
+                debug_assert!(!exc_ref.is_null());
+                publish_residual_call_exception(exc_ref as i64);
+                return Some(0);
+            }
+            // The epilogue reset the stash between the hook calls; fall
+            // through to the guard-state blackhole.
+            None => {}
+        }
+    } else {
+        // A kept stash without a matching frame must not leak into a later
+        // top-level portal `fbw_finish_concrete_take`.
+        pyre_jit_trace::jitcode_dispatch::fbw_finish_concrete_reset();
+    }
 
     // raise_continue_running_normally parity (pyjitpl.py:3048-3091 +
     // warmspot.py:970-983): the CA bridge walk committed its end-of-walk
@@ -2476,14 +2526,17 @@ pub fn trace_and_compile_from_bridge(
     let trace_frame = frame.snapshot_for_tracing();
     let live_frame_addr = frame as *const PyFrame as usize;
     let mut adopted_walk_end_state = false;
-    // Arm the bridge `Terminate` no-replay shortcut for this walk only when
-    // the caller can consume a concrete result and the resume is single-frame.
-    // The walk epilogue (`run_perfn_walk` in trace.rs) reads this flag: only
-    // when armed does a bridge `Terminate` walk keep its finish-concrete stash
-    // + commit the store journal, so the three decisions (epilogue predicate,
-    // journal commit, the consume-vs-rewind below) stay in agreement and a
-    // committed journal never strands into a blackhole re-run.
-    let bridge_noreplay_armed = allow_finish_direct_return && !is_multiframe_resume;
+    // Arm the bridge `Terminate` no-replay shortcut for this walk whenever
+    // the resume is single-frame.  The walk epilogue (`run_perfn_walk` in
+    // trace.rs) reads this flag: only when armed does a bridge `Terminate`
+    // walk keep its finish-concrete stash + commit the store journal, so the
+    // three decisions (epilogue predicate, journal commit, the
+    // consume-vs-rewind below) stay in agreement and a committed journal
+    // never strands into a blackhole re-run.  Both callers can consume the
+    // kept stash: the general guard path returns it as a terminal
+    // `BridgeResolution`, and the CALL_ASSEMBLER callback hands it to the
+    // back-to-back blackhole hook via `CA_WALK_FINISHED_FRAME`.
+    let bridge_noreplay_armed = !is_multiframe_resume;
     pyre_jit_trace::jitcode_dispatch::fbw_bridge_noreplay_arm(bridge_noreplay_armed);
     let outcome = {
         let (driver, _) = crate::eval::driver_pair();
@@ -2539,6 +2592,32 @@ pub fn trace_and_compile_from_bridge(
     // `pyjitpl.py:2841` `interpret()` raising `DoneWithThisFrame` from the
     // post-walk state.  Always take (not peek) so a kept stash cannot leak
     // into a later top-level portal `fbw_finish_concrete_take`.
+    //
+    // CALL_ASSEMBLER callback: this caller returns a bare bool and cannot
+    // carry the concrete result itself.  Leave the stash in its GC-rooted
+    // cell, record the callee frame in `CA_WALK_FINISHED_FRAME`, and let the
+    // CA slow path's back-to-back blackhole hook
+    // (`jit_blackhole_resume_from_guard`) take the stash and complete the
+    // callee with it — the finishframe `DoneWithThisFrame` /
+    // `ExitFrameWithExceptionRef` the assembler caller catches
+    // (pyjitpl.py:1688-1698, jitexc.py).
+    if !allow_finish_direct_return {
+        if pyre_jit_trace::jitcode_dispatch::fbw_finish_concrete_peek().is_some() {
+            debug_assert!(
+                !is_multiframe_resume,
+                "bridge Terminate no-replay stash kept for a multiframe resume \
+                 (frames={num_resume_frames})"
+            );
+            CA_WALK_FINISHED_FRAME.with(|c| c.set(live_frame_addr));
+            if majit_metainterp::majit_log_enabled() {
+                eprintln!(
+                    "[jit][bridge-trace] ca-finish-noreplay at resume_pc={} key={}",
+                    resume_pc, green_key
+                );
+            }
+            return BridgeResolution::ResumeBlackhole;
+        }
+    }
     match pyre_jit_trace::jitcode_dispatch::fbw_finish_concrete_take() {
         Some(pyre_jit_trace::jitcode_dispatch::FinishConcrete::Return(cv)) => {
             // `bridge_noreplay_armed` folds in `!is_multiframe_resume`, so a kept
@@ -2776,15 +2855,16 @@ fn jit_ca_handle_guard_failure(
         // blackhole leg, not here; pass 0 so the non-exception-guard
         // deferral keys only off the general guard path's `guard_exc`.
         // `allow_finish_direct_return = false`: this callback returns a bare
-        // bool to native code and has no channel for a concrete result, so
-        // it always takes the legacy rewind/blackhole path (the bridge
-        // `Terminate` no-replay shortcut stays off here).
+        // bool to native code and has no channel for a concrete result; a
+        // walk that terminates with a kept finish-concrete stash hands it to
+        // the back-to-back blackhole hook via `CA_WALK_FINISHED_FRAME`
+        // (returned as `ResumeBlackhole` here).
         match trace_and_compile_from_bridge(&descr_arc, frame, raw_values, &exit_layout, 0, false) {
             BridgeResolution::CompiledContinue => true,
             BridgeResolution::ResumeBlackhole => false,
-            // Unreachable: the shortcut is disarmed for this caller
-            // (`allow_finish_direct_return = false`), so the walk never keeps
-            // a finish-concrete stash and never returns a terminal variant.
+            // Unreachable: for this caller a kept stash takes the
+            // `CA_WALK_FINISHED_FRAME` handshake path, never a terminal
+            // variant.
             BridgeResolution::Finished(_) | BridgeResolution::FinishedException(_) => {
                 debug_assert!(
                     false,
