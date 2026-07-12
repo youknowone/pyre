@@ -1030,15 +1030,17 @@ pub(crate) unsafe fn str_concat(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     Ok(w_str_from_wtf8(result))
 }
 
-/// Extract a non-negative repeat count from an int or long, raising
-/// OverflowError with `msg` for positive bigints that exceed usize.
-unsafe fn repeat_count(n: PyObjectRef, msg: &str) -> Result<usize, PyError> {
+/// Extract a non-negative repeat count from an int or long.
+unsafe fn repeat_count(n: PyObjectRef) -> Result<usize, PyError> {
     if is_long(n) {
         let big = as_bigint(n);
         match big.to_usize() {
             Some(v) => Ok(v),
             None if bigint_lt(big, BigInt::from(0)) => Ok(0),
-            None => Err(PyError::new(PyErrorKind::OverflowError, msg)),
+            None => Err(PyError::new(
+                PyErrorKind::OverflowError,
+                "cannot fit 'int' into an index-sized integer",
+            )),
         }
     } else {
         let nv = w_int_get_value(n);
@@ -1052,14 +1054,20 @@ pub(crate) unsafe fn str_repeat(s: PyObjectRef, n: PyObjectRef) -> PyResult {
     // WTF-8 — so a surrogate-bearing string repeats without going through
     // `w_str_get_value`.
     let bytes = w_str_get_wtf8(s).as_bytes();
-    let count = repeat_count(n, "new string is too long")?;
+    let count = repeat_count(n)?;
     if count == 1 {
         return Ok(crate::type_methods::str_result_unchanged(s));
     }
     let total = bytes
         .len()
         .checked_mul(count)
-        .ok_or_else(|| PyError::new(PyErrorKind::OverflowError, "new string is too long"))?;
+        .ok_or_else(|| PyError::new(PyErrorKind::OverflowError, "repeated string is too long"))?;
+    if total > isize::MAX as usize {
+        return Err(PyError::new(
+            PyErrorKind::OverflowError,
+            "repeated string is too long",
+        ));
+    }
     let mut out: Vec<u8> = Vec::new();
     out.try_reserve_exact(total)
         .map_err(|_| PyError::new(PyErrorKind::MemoryError, ""))?;
@@ -1091,11 +1099,17 @@ pub(crate) unsafe fn bytes_concat(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 
 pub(crate) unsafe fn bytes_repeat(s: PyObjectRef, n: PyObjectRef) -> PyResult {
     let data = pyre_object::bytesobject::bytes_like_data(s);
-    let count = repeat_count(n, "repeated bytes are too long")?;
+    let count = repeat_count(n)?;
     let cap = data
         .len()
         .checked_mul(count)
         .ok_or_else(|| PyError::new(PyErrorKind::OverflowError, "repeated bytes are too long"))?;
+    if cap > isize::MAX as usize {
+        return Err(PyError::new(
+            PyErrorKind::OverflowError,
+            "repeated bytes are too long",
+        ));
+    }
     let mut buf: Vec<u8> = Vec::new();
     buf.try_reserve_exact(cap)
         .map_err(|_| PyError::new(PyErrorKind::MemoryError, ""))?;
@@ -1145,7 +1159,7 @@ pub(crate) unsafe fn tuple_concat(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 
 /// listobject.py:638-641 descr_mul
 pub(crate) unsafe fn list_repeat(list: PyObjectRef, n: PyObjectRef) -> PyResult {
-    let count = repeat_count(n, "list is too large")?;
+    let count = repeat_count(n)?;
     let len = w_list_len(list);
     let cap = len
         .checked_mul(count)
@@ -1169,7 +1183,7 @@ pub(crate) unsafe fn list_repeat(list: PyObjectRef, n: PyObjectRef) -> PyResult 
 /// `list_repeat`, but the extra copies are appended into the existing
 /// storage instead of building a fresh list.
 pub(crate) unsafe fn list_inplace_repeat(list: PyObjectRef, n: PyObjectRef) -> Result<(), PyError> {
-    let count = repeat_count(n, "list is too large")?;
+    let count = repeat_count(n)?;
     if count == 0 {
         w_list_clear(list);
         return Ok(());
@@ -1949,7 +1963,7 @@ pub fn mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         }
         // tupleobject.py descr_mul
         if is_tuple(a) && is_int_or_long(b) {
-            let n = repeat_count(b, "tuple is too large")?;
+            let n = repeat_count(b)?;
             let len = w_tuple_len(a);
             let cap = len
                 .checked_mul(n)

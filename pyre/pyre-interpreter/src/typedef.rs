@@ -2365,7 +2365,21 @@ fn init_list_type(ns: &mut DictStorage) {
 /// non-int" message; any other coercion error propagates.
 fn list_repeat_index(w_obj: PyObjectRef) -> Result<Option<PyObjectRef>, crate::PyError> {
     match crate::baseobjspace::space_index(w_obj) {
-        Ok(w_count) => Ok(Some(w_count)),
+        Ok(w_count) => {
+            // getindex_w(w_obj, OverflowError): an out-of-index-range value
+            // reports the original operand's type, not the __index__ result.
+            match crate::baseobjspace::int_w(w_count) {
+                Ok(_) => Ok(Some(w_count)),
+                Err(e) if e.kind == crate::PyErrorKind::OverflowError => Err(crate::PyError::new(
+                    crate::PyErrorKind::OverflowError,
+                    format!(
+                        "cannot fit '{}' into an index-sized integer",
+                        crate::baseobjspace::object_functionstr_type_name(w_obj)
+                    ),
+                )),
+                Err(e) => Err(e),
+            }
+        }
         Err(e) if e.kind == crate::PyErrorKind::TypeError => Ok(None),
         Err(e) => Err(e),
     }
