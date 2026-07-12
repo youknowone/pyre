@@ -745,6 +745,7 @@ type PerfnWalkResult = Result<
 /// `(code_len, walk_result)`; `None` when the terminal descrs are unwired.
 fn dispatch_perfn_frame(
     mi: &mut crate::state::MIFrame,
+    session: &std::cell::RefCell<crate::jitcode_dispatch::WalkSession>,
     pjc: &std::sync::Arc<crate::PyJitCode>,
     entry: usize,
     argboxes_r: &[majit_ir::OpRef],
@@ -826,6 +827,7 @@ fn dispatch_perfn_frame(
     let code_len = code.len();
     let walk_result = crate::jitcode_dispatch::dispatch_via_miframe(
         mi,
+        session,
         code,
         entry,
         &perfn_descr_refs,
@@ -951,6 +953,7 @@ fn drive_bridge_carrier_walk(
     cf_addr: usize,
     carrier: &majit_metainterp::BridgeInlineCarrier,
 ) -> TraceAction {
+    let session = std::cell::RefCell::new(crate::jitcode_dispatch::WalkSession::default());
     crate::jitcode_dispatch::bool_box_truth_reset();
     crate::jitcode_dispatch::fbw_finish_payload_reset();
     crate::jitcode_dispatch::fbw_store_journal_reset();
@@ -1016,6 +1019,7 @@ fn drive_bridge_carrier_walk(
     // rejects.  Diagnostic: log the outcome, then abort (trace discarded).
     let walk = crate::jitcode_dispatch::drive_bridge_carrier_subwalk(
         ctx,
+        &session,
         sym,
         root_pc,
         &callee_pjc,
@@ -1115,6 +1119,7 @@ fn drive_bridge_framestack_walk(
     cf_addr: usize,
     carrier: &majit_metainterp::BridgeInlineCarrier,
 ) -> TraceAction {
+    let session = std::cell::RefCell::new(crate::jitcode_dispatch::WalkSession::default());
     crate::jitcode_dispatch::bool_box_truth_reset();
     crate::jitcode_dispatch::fbw_finish_payload_reset();
     crate::jitcode_dispatch::fbw_store_journal_reset();
@@ -1184,6 +1189,7 @@ fn drive_bridge_framestack_walk(
     // re-unrolling the call tree.
     let walk = crate::jitcode_dispatch::drive_bridge_carrier_subwalk(
         ctx,
+        &session,
         sym,
         root_pc,
         &callee_pjc,
@@ -1239,6 +1245,7 @@ fn drive_bridge_framestack_walk(
         if carrier.recipes.len() == 1 {
             if let Some(action) = drive_outer_continuation_and_map(
                 ctx,
+                &session,
                 sym,
                 w_code,
                 root_pc,
@@ -1269,6 +1276,7 @@ fn drive_bridge_framestack_walk(
 /// from the residual-call op whose `next_pc` is the outer resume entry.
 fn drive_outer_continuation_and_map(
     ctx: &mut TraceCtx,
+    session: &std::cell::RefCell<crate::jitcode_dispatch::WalkSession>,
     sym: &mut PyreSym,
     w_code: *const (),
     root_pc: usize,
@@ -1324,6 +1332,7 @@ fn drive_outer_continuation_and_map(
 
     let outcome = crate::jitcode_dispatch::drive_outer_frame_continuation(
         ctx,
+        session,
         sym,
         &root_pjc,
         w_code as usize,
@@ -1407,6 +1416,7 @@ fn run_perfn_walk(
     cf_addr: usize,
     authoritative: bool,
 ) -> Option<(usize, usize, PerfnWalkResult)> {
+    let session = std::cell::RefCell::new(crate::jitcode_dispatch::WalkSession::default());
     let Some(pjc) = crate::state::pyjitcode_for_code(w_code) else {
         eprintln!("[walk-perfn] no per-CodeObject PyJitCode for code={w_code:?}");
         return None;
@@ -1753,6 +1763,7 @@ fn run_perfn_walk(
 
     let Some((code_len, mut walk_result)) = dispatch_perfn_frame(
         &mut mi,
+        &session,
         &pjc,
         entry,
         &argboxes_r,
@@ -1954,7 +1965,7 @@ fn run_perfn_walk(
                     }
                     None if is_marker_abort => {
                         if crate::jitcode_dispatch::fbw_has_unjournaled_effect()
-                            || crate::jitcode_dispatch::fbw_abort_in_subwalk()
+                            || session.borrow().abort_in_subwalk
                         {
                             if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                                 eprintln!(
@@ -2021,7 +2032,7 @@ fn run_perfn_walk(
             {
                 let abort_jit_pc = *pc;
                 if crate::jitcode_dispatch::fbw_has_unjournaled_effect()
-                    || crate::jitcode_dispatch::fbw_abort_in_subwalk()
+                    || session.borrow().abort_in_subwalk
                 {
                     if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                         eprintln!(
