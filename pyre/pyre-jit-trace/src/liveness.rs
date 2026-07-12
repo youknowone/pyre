@@ -126,6 +126,7 @@ impl LiveVars {
                         Some(next + delta.get(op_arg).as_usize())
                     }
                     Instruction::ForIter { delta } => Some(next + delta.get(op_arg).as_usize()),
+                    Instruction::Send { delta } => Some(next + delta.get(op_arg).as_usize()),
                     _ => None,
                 };
                 if let Some(tgt) = target {
@@ -561,6 +562,12 @@ fn stack_effects(
         | Instruction::Cache
         | Instruction::NotTaken
         | Instruction::ExtendedArg => (d, d),
+        // SetupAnnotations/setup_annotations touches only the namespace: pop 0, push 0.
+        Instruction::SetupAnnotations => (d, d),
+        // MakeCell/make_cell replaces a localsplus slot: pop 0, push 0.
+        Instruction::MakeCell { .. } => (d, d),
+        // ExitInitCheck is a pyopcode.rs dispatch no-op in pyre: pop 0, push 0.
+        Instruction::ExitInitCheck => (d, d),
         // Push one
         Instruction::LoadConst { .. }
         | Instruction::LoadSmallInt { .. }
@@ -575,6 +582,12 @@ fn stack_effects(
         | Instruction::PushNull
         | Instruction::Copy { .. }
         | Instruction::PushExcInfo => (d + 1, d + 1),
+        // LoadCommonConstant/load_common_constant pops 0 and pushes the resolved constant.
+        Instruction::LoadCommonConstant { .. } => (d + 1, d + 1),
+        // ReturnGenerator/return_generator pops 0 and pushes the following POP_TOP placeholder.
+        Instruction::ReturnGenerator => (d + 1, d + 1),
+        // GetAnext's async-stub shape pops 1 and pushes 2, for net +1.
+        Instruction::GetAnext => (d + 1, d + 1),
         // LOAD_GLOBAL pushes 1 or 2 values depending on the low bit of namei.
         // When namei & 1 == 1, a NULL sentinel is pushed before the result (+2).
         // When namei & 1 == 0, only the result is pushed (+1).
@@ -607,6 +620,8 @@ fn stack_effects(
         | Instruction::PopIter => (d - 1, d - 1),
         // YieldValue: sends TOS to caller, receives new value back. Net 0.
         Instruction::YieldValue { .. } => (d, d),
+        // Send/send_value pops the sent value and pushes either next() or StopIteration.value.
+        Instruction::Send { .. } => (d, d),
         // PopExcept: codewriter pops the saved previous exception object
         // from the value stack and restores TLS from it. Net -1.
         Instruction::PopExcept => (d - 1, d - 1),
@@ -636,6 +651,18 @@ fn stack_effects(
         | Instruction::GetYieldFromIter
         | Instruction::GetAiter
         | Instruction::GetAwaitable { .. } => (d, d),
+        // ConvertValue/convert_value pops the input and pushes the converted value.
+        Instruction::ConvertValue { .. } => (d, d),
+        // FormatSimple/format_simple pops the value and pushes its formatted string.
+        Instruction::FormatSimple => (d, d),
+        // ToBool/to_bool pops the value and pushes its bool result.
+        Instruction::ToBool => (d, d),
+        // LoadFromDictOrGlobals/load_from_dict_or_globals pops the mapping and pushes the result.
+        Instruction::LoadFromDictOrGlobals { .. } => (d, d),
+        // LoadFromDictOrDeref/load_from_dict_or_deref pops the mapping and pushes the result.
+        Instruction::LoadFromDictOrDeref { .. } => (d, d),
+        // MakeFunction/opcode_make_function pops the code object and pushes the function.
+        Instruction::MakeFunction => (d, d),
         // LOAD_ATTR pushes 1 (attr) for the plain form, or 2 (attr,
         // self_or_null) for the method form — mirror of `execute_load_attr`
         // `attr.is_method()` → `load_method` (which pushes `[attr, NULL]`).
@@ -712,6 +739,8 @@ fn stack_effects(
         // through END_FOR until the following POP_ITER pops it, so the
         // branch-target depth still counts the iterator slot.
         Instruction::ForIter { .. } => (d + 1, d),
+        // WithExceptStart/with_except_start preserves five inputs and pushes the exit result.
+        Instruction::WithExceptStart => (d + 1, d + 1),
         // Return
         Instruction::ReturnValue => (d - 1, d - 1),
         // Build collections: pop count, push 1
@@ -735,16 +764,57 @@ fn stack_effects(
             let s = count.get(op_arg) as usize as i32;
             (d - s + 1, d - s + 1)
         }
+        // BuildTemplate/build_template_op pops strings+interpolations and pushes the template.
+        Instruction::BuildTemplate => (d - 1, d - 1),
+        // BuildInterpolation/build_interpolation_op pops value+expression(+spec) and pushes one.
+        Instruction::BuildInterpolation { format } => {
+            if u32::from(format.get(op_arg)) & 1 != 0 {
+                (d - 2, d - 2)
+            } else {
+                (d - 1, d - 1)
+            }
+        }
+        // BuildSlice/build_slice pops two or three components and pushes one slice.
+        Instruction::BuildSlice { argc } => {
+            use pyre_interpreter::bytecode::BuildSliceArgCount;
+            match argc.get(op_arg) {
+                BuildSliceArgCount::Two => (d - 1, d - 1),
+                BuildSliceArgCount::Three => (d - 2, d - 2),
+            }
+        }
         // CALL: pop callable + args, push result
         Instruction::Call { argc } => {
             let n = argc.get(op_arg) as usize as i32;
             (d - n - 1, d - n - 1)
         }
+        // CallFunctionEx/call_function_ex pops four call operands and pushes one result.
+        Instruction::CallFunctionEx => (d - 3, d - 3),
+        // CallKw/call_kw pops argc+3 call operands and pushes one result.
+        Instruction::CallKw { argc } => {
+            let n = argc.get(op_arg) as usize as i32;
+            (d - n - 2, d - n - 2)
+        }
+        // CallIntrinsic1/call_intrinsic_1 replaces one operand with one result.
+        Instruction::CallIntrinsic1 { .. } => (d, d),
+        // CallIntrinsic2/call_intrinsic_2 consumes one net slot for every intrinsic variant.
+        Instruction::CallIntrinsic2 { .. } => (d - 1, d - 1),
         // Unpack
         Instruction::UnpackSequence { count } => {
             let s = count.get(op_arg) as usize as i32;
             (d - 1 + s, d - 1 + s)
         }
+        // UnpackEx/unpack_ex pops one and pushes before+starred+after values.
+        Instruction::UnpackEx { counts } => {
+            let args = counts.get(op_arg);
+            let s = args.before as i32 + 1 + args.after as i32;
+            (d - 1 + s, d - 1 + s)
+        }
+        // FormatWithSpec/format_with_spec pops value+spec and pushes one string.
+        Instruction::FormatWithSpec => (d - 1, d - 1),
+        // EndAsyncFor's async-stub shape pops iterator+exception and pushes nothing.
+        Instruction::EndAsyncFor => (d - 2, d - 2),
+        // CleanupThrow's async-stub shape pops three exception items and pushes one result.
+        Instruction::CleanupThrow => (d - 2, d - 2),
         // MATCH_CLASS: pops subject, type, names (−3) and pushes the attrs
         // tuple or None (+1). Net −2.
         Instruction::MatchClass { .. } => (d - 2, d - 2),
@@ -797,6 +867,7 @@ fn target_pc(
         | Instruction::PopJumpIfNone { delta }
         | Instruction::PopJumpIfNotNone { delta } => Some(next + delta.get(op_arg).as_usize()),
         Instruction::ForIter { delta } => Some(next + delta.get(op_arg).as_usize()),
+        Instruction::Send { delta } => Some(next + delta.get(op_arg).as_usize()),
         _ => None,
     }
 }
