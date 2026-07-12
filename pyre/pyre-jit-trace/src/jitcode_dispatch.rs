@@ -800,12 +800,14 @@ pub struct WalkContext<'frame, 'static_a: 'frame> {
     ///
     /// Maintained ONLY when `sym.owns_virtualizable_shadow()`; on any
     /// unmodeled stack effect the maintenance sets `vstack_valid = false`
-    /// and `stack_sync` falls back to the legacy read (zero regression).
+    /// and `stack_sync` omits every operand slot, which resume
+    /// re-materializes (zero regression).
     ///
-    /// SLICE 1 (#423): infrastructure landed fully INERT — the mirror is
-    /// maintained as side-data but the snapshot read stays LEGACY (no
-    /// authoritative flip is wired); `PYRE_VSTACK_DIAG` only logs
-    /// mirror-vs-legacy disagreement.
+    /// The mirror is the SOLE kept-stack source at a branch guard: the
+    /// flat `stack_slot_color_map` static-color read it once fell back to
+    /// is retired, so a slot the mirror does not cover is omitted rather
+    /// than read from the flat map.  `PYRE_VSTACK_DIAG` logs the per-op
+    /// reconcile trace.
     pub vstack_boxes: Vec<OpRef>,
     /// #73: the absolute operand-stack depth `vstack_boxes` currently
     /// reflects — the depth ON ENTRY to the Python opcode at
@@ -828,13 +830,13 @@ pub struct WalkContext<'frame, 'static_a: 'frame> {
     /// boundary; read by [`reconcile_vstack_at_boundary`] for the
     /// RESULT-TO-TOS class.
     pub vstack_last_ref: OpRef,
-    /// #73 (SLICE 1, INERT): the jitcode offset of the `-live-` byte that
+    /// #73: the jitcode offset of the `-live-` byte that
     /// precedes the CURRENT opcode's guard resume point — the `-live-`
     /// BEFORE (`pyjitpl.py:198`, normal guard resume reads at
     /// `self.pc - SIZE_LIVE_OP`).  Maintained purely from `DecodedOp` by the
     /// walk; `usize::MAX` until the first `-live-` is seen.  Side-data only.
     pub live_before_jit_pc: usize,
-    /// #73 (SLICE 1, INERT): the jitcode offset of the `-live-` byte that
+    /// #73: the jitcode offset of the `-live-` byte that
     /// trails a residual-call opcode — the `-live-` AFTER (`pyjitpl.py:195`,
     /// residual-call guard resume reads at `self.pc`).  Maintained purely
     /// from `DecodedOp` by the walk; `usize::MAX` until set.  Side-data only.
@@ -1542,7 +1544,7 @@ pub fn step(
     ctx: &mut WalkContext<'_, '_>,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let op: DecodedOp = decode_op_at(code, pc).ok_or(DispatchError::UndecodableOpcode { pc })?;
-    // #73 (SLICE 1, INERT): maintain the `-live-` BEFORE anchor.  Every
+    // #73: maintain the `-live-` BEFORE anchor.  Every
     // `-live-` byte the walk decodes becomes the resume point preceding the
     // NEXT guard (`pyjitpl.py:198`, normal guard resume reads at
     // `self.pc - SIZE_LIVE_OP`).  `op.pc` is the genuine jitcode offset of
@@ -1550,7 +1552,7 @@ pub fn step(
     if op.opname == "live" {
         ctx.live_before_jit_pc = op.pc;
     }
-    // #73 (SLICE 1, INERT): maintain the walk-level operand-stack box
+    // #73: maintain the walk-level operand-stack box
     // mirror.  Detects a Python-opcode boundary at this jitcode pc and
     // reconciles the previous opcode's stack effect into `ctx.vstack_boxes`
     // BEFORE this op runs.  Writes ONLY the new `vstack_*` fields — never
@@ -2022,7 +2024,7 @@ fn write_ref_reg(
     if let Some(c_slot) = ctx.concrete_registers_r.get_mut(dst) {
         *c_slot = sanitized;
     }
-    // #73 (SLICE 1, INERT): record the box just written as the candidate
+    // #73: record the box just written as the candidate
     // operand-stack TOS for the current Python opcode.  A value-producing
     // opcode (LOAD_*, BINARY_OP, COPY, …) lands its result on the stack
     // TOS; this is the last Ref it writes, so capturing it here lets
@@ -2767,7 +2769,7 @@ pub fn dispatch_via_miframe(
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
-        // #73 (SLICE 1, INERT): seed the walk-level operand-stack box mirror
+        // #73: seed the walk-level operand-stack box mirror
         // at entry.  The mirror is only enabled when the outer sym owns the
         // virtualizable shadow (the production full-body loop trace) — the
         // synthetic/test entries leave it disabled (`vstack_valid = false`).
@@ -9798,7 +9800,8 @@ enum VstackOpClass {
     MultiResultFromShadow,
     /// Anything that does not fit the shapes above — FOR_ITER or any opcode
     /// this classifier does not recognise.  Latches `vstack_valid = false`
-    /// so the overlay falls back to the legacy behaviour (zero regression).
+    /// so the overlay omits those slots, which resume re-materializes (zero
+    /// regression).
     Unmodeled,
 }
 
@@ -9861,15 +9864,16 @@ fn classify_vstack_opcode(
         | Instruction::ConvertValue { .. }
         | Instruction::BinarySlice
         | Instruction::ImportName { .. }
-        // #73 SLICE 2: LOAD_FAST/STORE_FAST super-instructions.  Their net
+        // #73: LOAD_FAST/STORE_FAST super-instructions.  Their net
         // result still lands on the new TOS as the LAST Ref written (the
         // second load, resp. the load following the store), so `ResultToTos`
         // models the top slot correctly.  A two-push pair
         // (`LoadFast(Borrow)LoadFast(Borrow)`, net +2) additionally leaves the
         // slot BELOW the new TOS a NONE hole; the general hole-fill in
         // `reconcile_vstack_at_boundary` recovers it from the virtualizable
-        // shadow (or defers it to the legacy read when unsourceable) WITHOUT
-        // invalidating the mirror.  Net-0 `StoreFastLoadFast` overwrites the
+        // shadow (or leaves it NONE when unsourceable — the overlay then
+        // omits the slot, which resume re-materializes) WITHOUT invalidating
+        // the mirror.  Net-0 `StoreFastLoadFast` overwrites the
         // consumed TOS with the loaded value (no hole).  Before this slice
         // these fell through to `Unmodeled`, killing the mirror at the first
         // super-instruction in a short-circuit / condexpr loop body.
@@ -9913,10 +9917,11 @@ fn classify_vstack_opcode(
         // result (net +2, for the upcoming method CALL).  Exactly like the
         // two-push `LoadFast*LoadFast*` super-instructions, that leaves the slot
         // below the new TOS a NONE hole which the general hole-fill below
-        // recovers from the virtualizable shadow (or defers to the legacy read
-        // when unsourceable) WITHOUT invalidating the mirror.  The NULL sentinel
+        // recovers from the virtualizable shadow (or leaves NONE when
+        // unsourceable — the overlay then omits the slot, which resume
+        // re-materializes) WITHOUT invalidating the mirror.  The NULL sentinel
         // is consumed by the CALL before any short-circuit branch guard, so it
-        // is never a live kept-stack slot at a resume.  (Pre-#73-SLICE-2 the
+        // is never a live kept-stack slot at a resume.  (Previously the
         // `namei & 1` arm declined to `Unmodeled`; the hole-fill makes that
         // unnecessary, and the decline killed the mirror for the rest of any
         // walk with a method-form global load — the dominant mirror=NONE gap.)
@@ -9977,8 +9982,9 @@ fn classify_vstack_opcode(
         // effect there.
         Instruction::ForIter { .. } => VstackOpClass::ResultToTos,
 
-        // Everything else is not modeled — decline and fall back to the
-        // legacy read.  TO_BOOL emits no JitCode (codewriter.rs:8598
+        // Everything else is not modeled — decline; the overlay then omits
+        // the affected slots, which resume re-materializes.  TO_BOOL emits no
+        // JitCode (codewriter.rs:8598
         // `Instruction::ToBool => {}`) so it never reaches this classifier;
         // the py-pc boundary mapping skips it.
         _ => VstackOpClass::Unmodeled,
@@ -9998,7 +10004,7 @@ fn classify_vstack_opcode(
 ///
 /// On any unmodeled effect (or a structurally impossible depth) the
 /// function latches `ctx.vstack_valid = false` so the `stack_sync`
-/// overlay declines to use `vstack_boxes` (legacy fallback, zero
+/// overlay omits every operand slot, which resume re-materializes (zero
 /// regression).
 fn reconcile_vstack_at_boundary(
     ctx: &mut WalkContext<'_, '_>,
@@ -10128,8 +10134,8 @@ fn reconcile_vstack_at_boundary(
     // all-Ref short-circuit guard region — invalidating the whole mirror
     // there made it die at the loop condition, never reaching the kept-stack
     // guard.  Instead keep the mirror TRACKING (advance position / depth)
-    // with the NONE slot left in place; `stack_sync` (USE) defers any NONE
-    // mirror slot to the legacy read.
+    // with the NONE slot left in place; `stack_sync` (USE) omits any NONE
+    // mirror slot, which resume re-materializes.
     if ctx.vstack_valid {
         let skip_shadow_fill = ctx.fbw_mode.inline_subwalk && fbw_callee_vstack_enabled();
         let hole = ctx
@@ -10173,7 +10179,8 @@ fn reseed_vstack_from_shadow(ctx: &mut WalkContext<'_, '_>, new_depth: usize) ->
     // shadow may carry a stale value in a non-hole slot).  A hole the shadow
     // also cannot source (NONE / NULL const-ptr — a function-local temp the
     // portal never wrote through) fails the whole re-seed so the caller
-    // declines to the legacy read.
+    // leaves the slot NONE; `stack_sync` then omits it (resume
+    // re-materializes).
     if ctx.vstack_boxes.len() < new_depth {
         ctx.vstack_boxes.resize(new_depth, OpRef::NONE);
     }
@@ -10188,8 +10195,8 @@ fn reseed_vstack_from_shadow(ctx: &mut WalkContext<'_, '_>, new_depth: usize) ->
             }
             // Fill what we can; an unsourceable hole (NONE / NULL const-ptr —
             // an Int/Float-bank temp or a function-local the portal never
-            // wrote) stays NONE.  `stack_sync` defers a NONE slot to the
-            // legacy read, so an unfilled slot is never a corrupt box.
+            // wrote) stays NONE.  `stack_sync` omits a NONE slot (resume
+            // re-materializes), so an unfilled slot is never a corrupt box.
             _ => all_present = false,
         }
     }
@@ -10284,7 +10291,7 @@ pub(crate) fn fbw_abort_resume_py_pc(
     Some(python_pc_for_jitcode_pc(&jc.payload.metadata, abort_jit_pc) as usize)
 }
 
-/// #73 (SLICE 1, INERT): step the walk-level operand-stack box mirror at
+/// #73: step the walk-level operand-stack box mirror at
 /// the top of every jitcode `step`.  Detects a Python-opcode boundary by
 /// mapping the current `jit_pc` back to its containing Python opcode; when
 /// that differs from `ctx.vstack_cur_pypc`, reconciles the previous
@@ -10367,7 +10374,7 @@ fn seed_callee_vstack_mirror(ctx: &mut WalkContext<'_, '_>, frame: &ActiveResume
     ctx.vstack_valid = true;
 }
 
-/// #73 (SLICE 1, INERT): seed the walk-level operand-stack box mirror
+/// #73: seed the walk-level operand-stack box mirror
 /// ([`WalkContext::vstack_boxes`]) at full-body-walk entry.  Enables the
 /// mirror (`vstack_valid = true`) only when the outer `sym` owns the
 /// virtualizable shadow AND the entry operand stack can be fully sourced
@@ -10376,7 +10383,8 @@ fn seed_callee_vstack_mirror(ctx: &mut WalkContext<'_, '_>, frame: &ActiveResume
 /// `vstack_boxes[0..depth]` from the virtualizable shadow's operand-stack
 /// slots (`virtualizable_box_at(nvs + nlocals + s)`) — the SAME source
 /// `collect_outer_active_boxes` / `stack_sync` read.  Any unsourceable
-/// slot leaves `vstack_valid = false` (legacy fallback, zero regression).
+/// slot leaves `vstack_valid = false`; the overlay then omits operand
+/// slots, which resume re-materializes (zero regression).
 fn seed_vstack_mirror(ctx: &mut WalkContext<'_, '_>, sym: &crate::state::PyreSym, start_pc: usize) {
     if sym.jitcode.is_null() || !sym.owns_virtualizable_shadow() {
         return;
@@ -16228,7 +16236,7 @@ fn dispatch_residual_call_iRd_kind(
         // `PyError::runtime_error("ABORT_ESCAPE: ...")` before walker IR
         // diff would run.
         if emit_guard_not_forced {
-            // #73 (SLICE 1, INERT): maintain the `-live-` AFTER anchor.  A
+            // #73: maintain the `-live-` AFTER anchor.  A
             // residual-call guard reads its resume point at `self.pc` (the
             // `-live-` trailing the call, `pyjitpl.py:195`).  `op.next_pc` is
             // the first byte after the residual_call opcode, which the
