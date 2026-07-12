@@ -1179,7 +1179,7 @@ fn drive_bridge_framestack_walk(
     }
 
     // Drive the deepest reconstructed callee FORWARD from its resume pc. The
-    // sub-walk holds `CarrierResumeGuard` for its lifetime, so a nested
+    // sub-walk runs with `fbw_mode.carrier_resume` set, so a nested
     // self-recursive call folds to a live `CALL_ASSEMBLER` instead of
     // re-unrolling the call tree.
     let walk = crate::jitcode_dispatch::drive_bridge_carrier_subwalk(
@@ -1217,7 +1217,7 @@ fn drive_bridge_framestack_walk(
     // emitted vable) forward and records into `ctx`: it emits the two live
     // `CALL_ASSEMBLER` for the callee recursion ([p2-ca] EMIT=2) and its
     // in-callee guards encode resume snapshots against the paused root
-    // (`FullBodySnapshotSymGuard`, snapshot_data_len>0), returning a live
+    // (`fbw_mode.snapshot_sym`, snapshot_data_len>0), returning a live
     // `SubReturn` result. The vable is load-bearing: local reads lower to
     // `getarrayitem_vable`, which aborts `VableBoxNotSeeded` on an unseeded base
     // — the orthodox resume rebuilds the frame virtualizable
