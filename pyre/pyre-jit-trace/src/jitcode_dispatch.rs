@@ -9689,12 +9689,13 @@ pub(crate) fn m73_loopclose_carry_enabled() -> bool {
     })
 }
 
-/// `PYRE_M73_ARMDST_CARRY` (#73 S5 phase-5 slice-1, default OFF): key the
+/// `PYRE_M73_ARMDST_CARRY` (#73 S5 phase-5 slice-1, default ON): key the
 /// `compare_box_provably_dead` branch-arm liveness queries (`arm_dst_live`)
 /// on the resume-marker twin at the arm offset instead of the
-/// `resume_jitcode_pc_for` translation of the inverted py pc. Census
-/// pending (`M73_ARMDST` under `PYRE_M73_MARKER_AUDIT`). Enable with
-/// `PYRE_M73_ARMDST_CARRY=1`.
+/// `resume_jitcode_pc_for` translation of the inverted py pc. Certified by
+/// the `M73_ARMDST` census (858 queries across pyre/bench + synth, 100%
+/// bank-equal) and check.py (162×2, on and off). Disable with
+/// `PYRE_M73_ARMDST_CARRY=0`.
 pub(crate) fn m73_armdst_carry_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M73_ARMDST_CARRY") {
@@ -9702,17 +9703,18 @@ pub(crate) fn m73_armdst_carry_enabled() -> bool {
             let v = v.to_string_lossy();
             v != "0" && !v.eq_ignore_ascii_case("false")
         }
-        None => false,
+        None => true,
     })
 }
 
-/// `PYRE_M73_LCLIVE_CARRY` (#73 S5 phase-5 slice-2, default OFF): resolve
+/// `PYRE_M73_LCLIVE_CARRY` (#73 S5 phase-5 slice-2, default ON): resolve
 /// the loop-close guards' liveness coordinate in
 /// `get_list_of_active_boxes` from the merge-point resume-marker twin
 /// (`MIFrame::loop_close_marker_jit_pc`) instead of the
-/// `resume_jitcode_pc_for(live_pc)` translation. Census pending
-/// (`M73_LCLIVE` under `PYRE_M73_MARKER_AUDIT`). Enable with
-/// `PYRE_M73_LCLIVE_CARRY=1`.
+/// `resume_jitcode_pc_for(live_pc)` translation. Certified by the
+/// `M73_LCLIVE` census (362 captures across pyre/bench + synth, 100%
+/// eq=1) and check.py (162×2, on and off). Disable with
+/// `PYRE_M73_LCLIVE_CARRY=0`.
 pub(crate) fn m73_lclive_carry_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M73_LCLIVE_CARRY") {
@@ -9720,7 +9722,7 @@ pub(crate) fn m73_lclive_carry_enabled() -> bool {
             let v = v.to_string_lossy();
             v != "0" && !v.eq_ignore_ascii_case("false")
         }
-        None => false,
+        None => true,
     })
 }
 
@@ -11196,12 +11198,17 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 // different
                 // offset.  Fall back to the sentinel if `py_pc` has no resume
                 // entry (portal-bridge / out-of-range).
-                let mut marker = unsafe {
-                    let jc = &*sym.jitcode;
-                    jc.payload.resume_jitcode_pc_for(py_pc as usize)
+                // #73 S5 phase-5 slice-4: the translation is evaluated lazily —
+                // under the (default-ON) twin carry it runs only for the
+                // twin-`None` overshoot rows (0 across the certified corpus),
+                // so the carried path no longer calls `resume_jitcode_pc_for`.
+                let legacy_marker = || unsafe {
+                    (&*sym.jitcode)
+                        .payload
+                        .resume_jitcode_pc_for(py_pc as usize)
                 };
                 if m73_marker_audit_enabled() {
-                    match marker {
+                    match legacy_marker() {
                         Some(m) => {
                             let twin = unsafe {
                                 (&*sym.jitcode).payload.resume_marker_for_jitcode_pc(op_pc)
@@ -11224,10 +11231,12 @@ fn walker_capture_snapshot_for_last_guard_impl(
                         None => eprintln!("M73_MARKER eq=nomarker py_pc={} op_pc={}", py_pc, op_pc),
                     }
                 }
-                if m73_marker_carry_enabled() {
-                    marker = unsafe { (&*sym.jitcode).payload.resume_marker_for_jitcode_pc(op_pc) }
-                        .or(marker);
-                }
+                let marker = if m73_marker_carry_enabled() {
+                    unsafe { (&*sym.jitcode).payload.resume_marker_for_jitcode_pc(op_pc) }
+                        .or_else(legacy_marker)
+                } else {
+                    legacy_marker()
+                };
                 // #73 S2 census: for a specialization guard measure whether the
                 // per-op `-live-` BEFORE anchor (`ctx.live_before_jit_pc`,
                 // `pyjitpl.py:198`) decodes IDENTICALLY to the block-head marker
@@ -11638,10 +11647,13 @@ fn walker_capture_snapshot_for_last_guard_impl(
                             .payload
                             .after_residual_call_resume_pc_for(call_py_pc as usize),
                         None => {
-                            let legacy = jc.payload.resume_jitcode_pc_for(py_pc as usize);
+                            // #73 S5 phase-5 slice-4: translation evaluated
+                            // lazily — under the (default-ON) twin carry it
+                            // runs only for twin-`None` overshoot rows.
+                            let legacy = || jc.payload.resume_jitcode_pc_for(py_pc as usize);
                             if m73_marker_audit_enabled() {
                                 let twin = jc.payload.after_residual_marker_for_jitcode_pc(op_pc);
-                                match legacy {
+                                match legacy() {
                                     Some(m) => match twin {
                                         Some(t) if t == m => eprintln!(
                                             "M73_ARMARKER eq=1 py_pc={} op_pc={} m={}",
@@ -11665,9 +11677,9 @@ fn walker_capture_snapshot_for_last_guard_impl(
                             if m73_armarker_carry_enabled() {
                                 jc.payload
                                     .after_residual_marker_for_jitcode_pc(op_pc)
-                                    .or(legacy)
+                                    .or_else(legacy)
                             } else {
-                                legacy
+                                legacy()
                             }
                         }
                     }
