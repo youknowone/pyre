@@ -1707,14 +1707,26 @@ impl NamespaceOpcodeHandler for PyFrame {
         // is not the one being executed.  Identity is `pycode.w_globals
         // is self.get_w_globals_storage()` — the wrapped dict OBJECT on both
         // sides (`w_code_get_w_globals` vs the frame's `w_globals`).
-        let pycode_matches_frame: bool = unsafe {
-            let cwo = crate::pycode::w_code_get_w_globals(self.pycode as PyObjectRef);
-            !cwo.is_null() && std::ptr::eq(cwo, w_globals)
+        // `celldict.py:287-291 _LOAD_GLOBAL_cached`: under the JIT the
+        // whole `GlobalCache` chase is bypassed via `_load_global_fallback`
+        // → `_load_global` (`pyopcode.py:958-967 space.finditem_str`), so
+        // only the builtin `finditem_str` fallback below runs.  Positive
+        // form (`load_attr_cached` eval.rs:3586) keeps the annotator off
+        // the bare-`!` hazard; `we_are_jitted()` folds to `ConstBool(true)`
+        // so the cache arm and its `Rc<RefCell<GlobalCache>>` chase are
+        // dead-code-eliminated on the lifted graph.
+        let use_cache = if majit_metainterp::jit::we_are_jitted() {
+            false
+        } else {
+            unsafe {
+                let cwo = crate::pycode::w_code_get_w_globals(self.pycode as PyObjectRef);
+                !cwo.is_null()
+                    && std::ptr::eq(cwo, w_globals)
+                    && !w_globals.is_null()
+                    && pyre_object::dictmultiobject::is_module_dict(w_globals)
+            }
         };
-        if pycode_matches_frame
-            && !w_globals.is_null()
-            && unsafe { pyre_object::dictmultiobject::is_module_dict(w_globals) }
-        {
+        if use_cache {
             let cache_hit: Option<PyObjectRef> = unsafe {
                 load_global_via_cache(
                     w_globals,
@@ -1800,6 +1812,16 @@ pub unsafe fn load_global_via_cache_extern(
 /// `Ok(None)` on full miss, `Err(_)` when `space.finditem_str` raises
 /// during the builtins fallback (`baseobjspace.py:45-49
 /// W_Root.getdictvalue` → `space.finditem_str`).
+///
+/// The `GlobalCache` chase walks an `Rc<RefCell<GlobalCache>>` cache
+/// structure the tracer cannot model (its `deref` reads past the
+/// refcount / borrow-flag header, not a value-model identity).
+/// `celldict.py:287-291 _LOAD_GLOBAL_cached` bypasses the whole cache
+/// under `jit.we_are_jitted()`, resolving the builtin through
+/// `space.finditem_str` instead, so the cache is off-trace plumbing;
+/// residualize it (`@jit.dont_look_inside`) like the sibling
+/// `load_attr_caching`.
+#[majit_macros::dont_look_inside]
 unsafe fn load_global_via_cache(
     w_module_dict: PyObjectRef,
     w_builtin: PyObjectRef,
