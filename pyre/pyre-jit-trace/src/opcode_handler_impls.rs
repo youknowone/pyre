@@ -599,7 +599,7 @@ impl pyre_interpreter::ControlFlowOpcodeHandler for crate::state::MIFrame {
             );
             // pyjitpl.py:2957-2965 build live_arg_boxes ONCE.
             let live_args =
-                crate::state::MIFrame::close_loop_args_at(this, ctx, Some(target));
+                crate::state::MIFrame::close_loop_args_at(this, ctx, Some(target), None);
             let live_green_boxes: Vec<majit_metainterp::GreenBox> = live_args
                 .iter()
                 .map(|opref| {

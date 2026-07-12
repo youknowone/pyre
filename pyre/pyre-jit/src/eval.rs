@@ -9886,7 +9886,7 @@ mod tests {
         });
         let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, target_pc, target_pc);
 
-        let jump_args = state.capture_close_loop_args_at(Some(target_pc));
+        let jump_args = state.capture_close_loop_args_at(Some(target_pc), None);
 
         assert_eq!(
             jump_args.len(),

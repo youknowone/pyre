@@ -896,6 +896,10 @@ pub enum DispatchOutcome {
     CloseLoop {
         jump_args: Vec<OpRef>,
         loop_header_pc: usize,
+        /// Codewrite-time resume-marker twin at the merge point op's jitcode
+        /// offset, carried into the loop-close guards' snapshot words under
+        /// `PYRE_M73_LOOPCLOSE_CARRY`.
+        loop_header_marker_jit_pc: Option<usize>,
     },
     /// `jit_merge_point/cIRFIRF` reached a loop header that already has
     /// compiled targets, and the in-walk `compile_trace` attempt
@@ -9665,6 +9669,21 @@ pub(crate) fn m73_armpath_carry_enabled() -> bool {
             v != "0" && !v.eq_ignore_ascii_case("false")
         }
         None => true,
+    })
+}
+
+/// `PYRE_M73_LOOPCLOSE_CARRY` (#73 S5 phase-3 slice-6, default OFF): carry
+/// the merge-point resume-marker twin into the `GuardEvalBreaker` and
+/// `GuardFutureCondition` loop-close snapshot words. Census pending. Enable
+/// with `PYRE_M73_LOOPCLOSE_CARRY=1`.
+pub(crate) fn m73_loopclose_carry_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M73_LOOPCLOSE_CARRY") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => false,
     })
 }
 
@@ -23072,10 +23091,26 @@ fn handle(
                 // the top-level walk is gated — a sub-walk keeps the prior
                 // close-on-match behaviour.
                 if !ctx.is_top_level || key == ctx.trace_ctx.root_green_key() {
+                    let loop_header_marker_jit_pc = {
+                        let sym_ptr = ctx.fbw_mode.snapshot_sym;
+                        if sym_ptr.is_null() {
+                            None
+                        } else {
+                            let sym = unsafe { &*sym_ptr };
+                            if sym.jitcode.is_null() {
+                                None
+                            } else {
+                                unsafe {
+                                    (&*sym.jitcode).payload.resume_marker_for_jitcode_pc(op.pc)
+                                }
+                            }
+                        }
+                    };
                     Ok((
                         DispatchOutcome::CloseLoop {
                             jump_args: live_args,
                             loop_header_pc: next_instr,
+                            loop_header_marker_jit_pc,
                         },
                         op.next_pc,
                     ))
@@ -32206,6 +32241,7 @@ mod tests {
             pending_result_type: None,
             pending_inline_frame: None,
             residual_call_pc: None,
+            loop_close_marker_jit_pc: None,
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
@@ -32288,6 +32324,7 @@ mod tests {
             pending_result_type: None,
             pending_inline_frame: None,
             residual_call_pc: None,
+            loop_close_marker_jit_pc: None,
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
@@ -32376,6 +32413,7 @@ mod tests {
             pending_result_type: None,
             pending_inline_frame: None,
             residual_call_pc: None,
+            loop_close_marker_jit_pc: None,
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
@@ -32584,6 +32622,7 @@ mod tests {
             DispatchOutcome::CloseLoop {
                 jump_args,
                 loop_header_pc,
+                ..
             } => {
                 assert_eq!(loop_header_pc, 42);
                 assert_eq!(jump_args.len(), 2);

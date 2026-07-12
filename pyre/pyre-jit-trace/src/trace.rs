@@ -1824,6 +1824,7 @@ fn run_perfn_walk(
             crate::jitcode_dispatch::DispatchOutcome::CloseLoop {
                 jump_args,
                 loop_header_pc,
+                loop_header_marker_jit_pc,
             },
             _end_pc,
         )) = &mut walk_result
@@ -1833,7 +1834,8 @@ fn run_perfn_walk(
             // portal-bridge vsd lookup + last_instr anchor; the merge point
             // closes at the loop header, so anchor orgpc there.
             mi.orgpc = loop_header_pc;
-            *jump_args = mi.close_loop_args_at(ctx, Some(loop_header_pc));
+            *jump_args =
+                mi.close_loop_args_at(ctx, Some(loop_header_pc), *loop_header_marker_jit_pc);
         }
         // pyjitpl.py:3048-3091 raise_continue_running_normally parity: a
         // walk that ends at a merge point hands the interpreter (and the
@@ -2584,6 +2586,7 @@ fn full_body_walk_trace(
             crate::jitcode_dispatch::DispatchOutcome::CloseLoop {
                 jump_args,
                 loop_header_pc,
+                ..
             } => {
                 // Mirror trace_bytecode's post-interpret CloseLoop green-key
                 // handling: a loop header other than start_pc retargets the

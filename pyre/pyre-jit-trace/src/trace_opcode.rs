@@ -1090,6 +1090,7 @@ impl MIFrame {
             pending_result_type: None,
             pending_inline_frame: None,
             residual_call_pc: None,
+            loop_close_marker_jit_pc: None,
         }
     }
 
@@ -1189,8 +1190,12 @@ impl MIFrame {
     }
 
     #[doc(hidden)]
-    pub fn capture_close_loop_args_at(&mut self, target_pc: Option<usize>) -> Vec<OpRef> {
-        self.with_ctx(|this, ctx| this.close_loop_args_at(ctx, target_pc))
+    pub fn capture_close_loop_args_at(
+        &mut self,
+        target_pc: Option<usize>,
+        header_marker_jit_pc: Option<usize>,
+    ) -> Vec<OpRef> {
+        self.with_ctx(|this, ctx| this.close_loop_args_at(ctx, target_pc, header_marker_jit_pc))
     }
 
     #[doc(hidden)]
@@ -3126,7 +3131,7 @@ impl MIFrame {
     }
 
     pub(crate) fn close_loop_args(&mut self, ctx: &mut TraceCtx) -> Vec<OpRef> {
-        self.close_loop_args_at(ctx, None)
+        self.close_loop_args_at(ctx, None, None)
     }
 
     /// Pure-read shape predictor for `close_loop_args_at` output.
@@ -3180,7 +3185,9 @@ impl MIFrame {
         &mut self,
         ctx: &mut TraceCtx,
         target_pc: Option<usize>,
+        header_marker_jit_pc: Option<usize>,
     ) -> Vec<OpRef> {
+        self.loop_close_marker_jit_pc = header_marker_jit_pc;
         // `JUMP_BACKWARD` eval-breaker poll (`CHECK_EVAL_BREAKER`): emit
         // a `GuardEvalBreaker` in the loop body before the closing JUMP so the
         // compiled loop polls the async-action ticker at the back-edge and
@@ -3821,6 +3828,7 @@ impl MIFrame {
                 }
             }
         }
+        self.loop_close_marker_jit_pc = None;
         args
     }
 
@@ -4305,10 +4313,42 @@ impl MIFrame {
         let n = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
         let top_snapshot_types = &top_snapshot_types_full[n..];
         let top_jitcode_index = unsafe { (*self.sym().jitcode).index } as u32;
+        if crate::jitcode_dispatch::m73_marker_audit_enabled() {
+            if let Some(twin) = self.loop_close_marker_jit_pc {
+                let py_pc = majit_ir::resumedata::decode_resume_pc(top_pc as i32).0 as usize;
+                match crate::state::pyjitcode_for_jitcode_index(top_jitcode_index as i32) {
+                    Some(pjc) if pjc.is_populated() => match pjc.resume_jitcode_pc_for(py_pc) {
+                        Some(legacy) if legacy == twin => eprintln!(
+                            "M73_LOOPCLOSE eq=1 idx={} py_pc={} m={}",
+                            top_jitcode_index, py_pc, legacy
+                        ),
+                        Some(legacy) => eprintln!(
+                            "M73_LOOPCLOSE eq=0 idx={} py_pc={} m={} twin={}",
+                            top_jitcode_index, py_pc, legacy, twin
+                        ),
+                        None => eprintln!(
+                            "M73_LOOPCLOSE eq=nomarker idx={} py_pc={}",
+                            top_jitcode_index, py_pc
+                        ),
+                    },
+                    _ => eprintln!(
+                        "M73_LOOPCLOSE eq=nopjc idx={} py_pc={}",
+                        top_jitcode_index, py_pc
+                    ),
+                }
+            }
+        }
+        let top_word = if crate::jitcode_dispatch::m73_loopclose_carry_enabled() {
+            self.loop_close_marker_jit_pc
+                .map(|m| m as i32)
+                .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC)
+        } else {
+            majit_ir::resumedata::NO_JITCODE_PC
+        };
         let top_frame = majit_metainterp::recorder::SnapshotFrame {
             jitcode_index: top_jitcode_index,
             pc: top_pc as u32,
-            jitcode_pc: majit_ir::resumedata::NO_JITCODE_PC,
+            jitcode_pc: top_word,
             boxes: Self::fail_args_to_snapshot_boxes_typed(
                 top_active_boxes,
                 top_snapshot_types,
@@ -9982,6 +10022,7 @@ mod tests {
             pending_result_type: None,
             pending_inline_frame: None,
             residual_call_pc: None,
+            loop_close_marker_jit_pc: None,
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
@@ -10134,6 +10175,7 @@ mod tests {
             pending_result_type: None,
             pending_inline_frame: None,
             residual_call_pc: None,
+            loop_close_marker_jit_pc: None,
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
@@ -10217,6 +10259,7 @@ mod tests {
             pending_result_type: None,
             pending_inline_frame: None,
             residual_call_pc: None,
+            loop_close_marker_jit_pc: None,
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: Some(vec![local0, local1, stack0]),
