@@ -2982,14 +2982,11 @@ impl OptUnroll {
                         return rc;
                     }
                 }
-                // S-0.C: `box_pool[*ia_opref].bound_inputarg()` resolves
-                // to the same `InputArgRc` as `inputarg_refs[idx]` after
-                // `ensure_inputarg_bindings` / `materialize_operand_at`'s InputArg
-                // placeholder arm have run (both write the canonical
-                // `InputArgRc` matching the OpRef's type). Drop the
-                // box_pool fallback — fall through to a fresh `InputArg`
-                // allocation, matching the original last-resort behaviour
-                // for the type-mismatch edge case.
+                // `inputarg_refs[idx]` is the canonical `InputArgRc` for this
+                // OpRef once `ensure_inputarg_bindings` / `materialize_operand_at`'s
+                // InputArg placeholder arm have run (both write the canonical
+                // `InputArgRc` matching the OpRef's type). Fall through to a
+                // fresh `InputArg` allocation for the type-mismatch edge case.
                 //
                 // Reaching here means the slot was either absent or
                 // type-mismatched. In production every canonical inputarg

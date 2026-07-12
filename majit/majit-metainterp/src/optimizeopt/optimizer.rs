@@ -551,13 +551,12 @@ pub(crate) fn merge_backend_constants_from_ctx(
     let live_positions = live_runtime_positions(ctx.new_operations.iter().map(|rc| rc.as_ref()));
 
     // Iterate every bound ResOp across the canonical `_forwarded` hosts
-    // (`new_operations` ∪ `phase1_emit_ops` ∪ `resop_refs`) rather than the
-    // `box_pool` side-table. The forwarded-write's bound-precondition
-    // forbids a forwarded write to an unbound box, so every
-    // position carrying `Forwarded::Const` has a bound producer `Op`
-    // reachable through one of these stores. Body-namespace producers are
-    // never `InputArg`, so the original `b.is_inputarg()` skip
-    // (make_constant excludes InputArg positions, mod.rs:3946) is automatic.
+    // (`new_operations` ∪ `phase1_emit_ops` ∪ `resop_refs`). The
+    // forwarded-write's bound-precondition forbids a forwarded write to an
+    // unbound box, so every position carrying `Forwarded::Const` has a bound
+    // producer `Op` reachable through one of these stores. Body-namespace
+    // producers are never `InputArg`, so the `b.is_inputarg()` skip
+    // (make_constant excludes InputArg positions) is automatic.
     // `entry_or_insert_with` dedups positions appearing in more than one
     // store.
     let mut consider = |op: &majit_ir::OpRc| {
@@ -2914,10 +2913,10 @@ impl Optimizer {
         // `Weak<Op>` upgrade succeeds.
         // `live_synthetics` is the incrementally-maintained set of synthetic
         // stand-ins (mint_synthetic_resop / bind_input_resops) whose position
-        // was never superseded by an `emit` — exactly the box-bound-to-synthetic
-        // boxes the old `box_pool.iter_indexed()` walk pushed. The unbound
-        // branch of that walk only ever hit Void boxes (no synthesis), so this
-        // drain reproduces it without reading `box_pool`.
+        // was never superseded by an `emit` — the box-bound-to-synthetic
+        // producers that must travel into `phase1_emit_ops`. Positions that
+        // were never synthesized carry no producer, so nothing else needs
+        // draining here.
         self.phase1_emit_ops
             .extend(ctx.live_synthetics.iter().cloned());
         // Transfer exported virtual state from context to optimizer
@@ -3590,8 +3589,7 @@ impl Optimizer {
             // pre-compact value. Readers off the canonical `Op.pos`
             // (`merge_backend_constants`) need the post-compact position.
             // Non-const synthetics never entered `remap`, so they keep their
-            // position — matching the prior `box_pool` walk's `remap.get`
-            // guard. Replaces that walk's production `Op.pos` write.
+            // position; only const-folded producers are repositioned here.
             for (op, new_pos) in &const_remaps {
                 op.pos.set(op.pos.get().with_raw(*new_pos));
             }
@@ -4595,8 +4593,8 @@ impl Optimizer {
                 None => ctx.materialize_operand_at(forced),
             };
             // The forced value is a chain terminal, so its canonical box's
-            // OpRef identity equals `forced`; OpRef-keyed consumers (backend,
-            // box_pool) see the same key, only the _forwarded info is added.
+            // OpRef identity equals `forced`; OpRef-keyed consumers (the
+            // backend) see the same key, only the _forwarded info is added.
             debug_assert_eq!(
                 resolved.to_opref(),
                 forced,

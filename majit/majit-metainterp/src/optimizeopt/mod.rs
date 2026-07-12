@@ -1791,8 +1791,7 @@ impl OptContext {
         // (`seed_boxes_canonical` fixtures populate `inputarg_refs` directly).
         // Void slots are skipped: `InputArg{Int,Ref,Float}` has no Void
         // encoding (resoperation.py:719/727/739), so a Void sentinel in
-        // `inputargs` is not a real input-arg host (mirrors the retired
-        // box_pool scan's `!b.is_inputarg()` skip).
+        // `inputargs` is not a real input-arg host and carries no binding.
         for op in self.inputargs.clone() {
             match op.ty() {
                 Some(tp) if tp != majit_ir::Type::Void => {
@@ -2135,8 +2134,7 @@ impl OptContext {
     /// `inputarg_refs`) from a list of already-bound operands, mirroring
     /// what the production recorder→optimizer handoff populates. Each box
     /// is distributed by its bound identity: InputArg boxes land in
-    /// `inputarg_refs[index]`, ResOp boxes in `resop_refs[pos]`. This
-    /// replaces the retired `ctx.box_pool = vec![..]` fixture pattern so
+    /// `inputarg_refs[index]`, ResOp boxes in `resop_refs[pos]`, so that
     /// `resolve_to_operand` / `materialize_operand_at` / `find_producer_op` resolve each
     /// OpRef through the same canonical hosts production uses, returning a
     /// fresh operand bound to the seeded `Op` / `InputArg`.
@@ -2640,8 +2638,7 @@ impl OptContext {
     /// Whether the canonical `_forwarded` host for raw position `raw`
     /// (any `resop_refs` entry whose `OpRef` shares this raw, or
     /// `inputarg_refs[raw]` for an InputArg slot) carries `Forwarded::Const`.
-    /// The position-keyed replacement for the retired
-    /// `box_pool.get_at_position(raw)` const probe in `allocate_next_pos_raw`.
+    /// The position-keyed const probe used by `allocate_next_pos_raw`.
     fn position_is_const_forwarded(&self, raw: u32) -> bool {
         use majit_ir::forwarding::Forwarded;
         let idx = raw as usize;

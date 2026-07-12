@@ -5573,12 +5573,12 @@ fn try_fold_pure_call_via_executor(
         // pure shapes — skip the stamp for void.
         majit_ir::Type::Void => return,
     };
-    // Stamp only when the recorded result has a live BoxPool slot.  A deeper
-    // inlined / recursive frame's residual result may be recorded in a
-    // context whose Box is not allocated in the active recorder; stamping it
-    // would violate the `*FrontendOp(pos, value)` invariant.  Skipping leaves
-    // the result symbolic so the downstream branch aborts the trace into the
-    // trait fallback instead of crashing.
+    // Stamp only when the recorded result has a live slot in the active
+    // recorder.  A deeper inlined / recursive frame's residual result may be
+    // recorded in a context whose position is not allocated in the active
+    // recorder; stamping it would violate the `*FrontendOp(pos, value)`
+    // invariant.  Skipping leaves the result symbolic so the downstream branch
+    // aborts the trace into the trait fallback instead of crashing.
     ctx.trace_ctx.try_set_opref_concrete(recorded, result_value);
 }
 
