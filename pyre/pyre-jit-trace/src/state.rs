@@ -8070,7 +8070,7 @@ impl JitState for PyreJitState {
         fail_values: &[i64],
         fail_types: &[Type],
     ) {
-        let bridge_stamp_enabled = std::env::var_os("PYRE_FBW_BRIDGE_STAMP").is_some();
+        let bridge_stamp_enabled = std::env::var("PYRE_FBW_BRIDGE_STAMP").as_deref() != Ok("0");
         if resume_data.frames.is_empty() {
             return;
         }
