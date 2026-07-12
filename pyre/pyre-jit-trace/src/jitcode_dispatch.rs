@@ -708,6 +708,11 @@ pub struct WalkContext<'frame, 'static_a: 'frame> {
     /// Read by [`walker_capture_snapshot_for_last_guard`] to stamp the
     /// snapshot frame's Python PC.
     pub entry_py_pc: u32,
+    /// Codewrite-time resume-marker twin for the outer snapshot coordinate
+    /// (`entry_py_pc`), carried by the arm-path snapshot word under
+    /// `PYRE_M73_ARMPATH_CARRY`. `None` when the creation site has no
+    /// jitcode-native outer coordinate.
+    pub outer_resume_marker_jit_pc: Option<usize>,
     /// JitCode index of the **outer** `PyJitCode.jitcode` — the Python
     /// bytecode jitcode whose Python opcode is currently being
     /// dispatched.  Pyre's blackhole resume only re-enters Python-
@@ -2692,6 +2697,7 @@ pub fn dispatch_via_miframe(
             last_exc_value: initial_last_exc_value,
             last_exc_value_concrete: initial_last_exc_value_concrete,
             entry_py_pc,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             // This entry (test/fixture) hard-codes
@@ -3043,6 +3049,7 @@ pub(crate) fn drive_bridge_carrier_subwalk(
             last_exc_value_concrete: ConcreteValue::Null,
             // The outer Python frame is the root, paused at `root_pc`.
             entry_py_pc: root_pc as u32,
+            outer_resume_marker_jit_pc: root_frame.resume_marker_jit_pc,
             outer_jitcode_index,
             outer_active_boxes,
         };
@@ -3303,6 +3310,7 @@ pub(crate) fn drive_outer_frame_continuation(
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: root_pc as u32,
+            outer_resume_marker_jit_pc: root_frame.resume_marker_jit_pc,
             outer_jitcode_index,
             outer_active_boxes,
         };
@@ -3512,6 +3520,10 @@ pub fn dispatch_via_miframe_at_opcode_entry<'a>(
             last_exc_value: initial_last_exc_value,
             last_exc_value_concrete: initial_last_exc_value_concrete,
             entry_py_pc,
+            // `entry_py_pc` is `miframe.orgpc` — an interpreter-driven Python
+            // pc with no jitcode-native producer at this seam, so the outer
+            // coordinate has no twin here.
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index,
             outer_active_boxes,
             store_subscr_fn_addr: bh_store_subscr_fn_addr_cached(),
@@ -9639,6 +9651,21 @@ pub(crate) fn m73_pfmarker_carry_enabled() -> bool {
     })
 }
 
+/// `PYRE_M73_ARMPATH_CARRY` (#73 S5 phase-3 slice-4, default OFF): carry
+/// the outer snapshot coordinate's codewrite-time resume-marker twin in the
+/// per-opcode arm-path snapshot word. Enable with
+/// `PYRE_M73_ARMPATH_CARRY=1`.
+pub(crate) fn m73_armpath_carry_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M73_ARMPATH_CARRY") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => false,
+    })
+}
+
 /// `PYRE_M73_MFCALLEE_CARRY` (#73 S5 phase-3 slice-3, default ON): carry
 /// the multi-frame callee's codewrite-time resume-marker twin in its top-frame
 /// word. Certified by the `M73_MFRAW`/`M73_MFAR` censuses (legacy==twin
@@ -11691,13 +11718,49 @@ fn walker_capture_snapshot_for_last_guard_impl(
     // resumes via the Python pc → jitcode resume-translation path (no JitCode
     // coordinate).
     let _ = op_pc;
+    if m73_marker_audit_enabled() {
+        match crate::state::pyjitcode_for_jitcode_index(ctx.outer_jitcode_index as i32) {
+            Some(pjc) if pjc.is_populated() => {
+                match pjc.resume_jitcode_pc_for(ctx.entry_py_pc as usize) {
+                    Some(legacy) => match ctx.outer_resume_marker_jit_pc {
+                        Some(twin) if twin == legacy => eprintln!(
+                            "M73_ARMPATH eq=1 idx={} py_pc={} m={}",
+                            ctx.outer_jitcode_index, ctx.entry_py_pc, legacy
+                        ),
+                        Some(twin) => eprintln!(
+                            "M73_ARMPATH eq=0 idx={} py_pc={} m={} twin={}",
+                            ctx.outer_jitcode_index, ctx.entry_py_pc, legacy, twin
+                        ),
+                        None => eprintln!(
+                            "M73_ARMPATH eq=notwin idx={} py_pc={} m={}",
+                            ctx.outer_jitcode_index, ctx.entry_py_pc, legacy
+                        ),
+                    },
+                    None => eprintln!(
+                        "M73_ARMPATH eq=nomarker idx={} py_pc={}",
+                        ctx.outer_jitcode_index, ctx.entry_py_pc
+                    ),
+                }
+            }
+            _ => eprintln!(
+                "M73_ARMPATH eq=nopjc idx={} py_pc={}",
+                ctx.outer_jitcode_index, ctx.entry_py_pc
+            ),
+        }
+    }
     let (vable_boxes, vref_boxes) = ctx.trace_ctx.build_snapshot_vable_vref_boxes();
     ctx.trace_ctx
         .capture_snapshot_for_last_guard_with_vable_vref(
             &ctx.outer_active_boxes,
             ctx.outer_jitcode_index,
             ctx.entry_py_pc,
-            majit_ir::resumedata::NO_JITCODE_PC,
+            if m73_armpath_carry_enabled() {
+                ctx.outer_resume_marker_jit_pc
+                    .map(|m| m as i32)
+                    .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC)
+            } else {
+                majit_ir::resumedata::NO_JITCODE_PC
+            },
             &vable_boxes,
             &vref_boxes,
         );
@@ -14232,66 +14295,77 @@ fn try_walker_inline_user_call(
     // the CALL site but stamping the walk-entry header desyncs the two windows
     // (count-mismatch assert / wrong slot layout), so carry the box coordinate
     // to the header alongside the boxes.
-    let (inline_outer_active_boxes, inline_outer_py_pc, inline_outer_jc_index) =
-        if ctx.is_full_body_walk && ctx.outer_active_boxes.is_empty() {
-            let sym_ptr = ctx.fbw_mode.snapshot_sym;
-            if sym_ptr.is_null() {
-                (
-                    ctx.outer_active_boxes.clone(),
-                    ctx.entry_py_pc,
-                    ctx.outer_jitcode_index,
-                )
-            } else {
-                let sym = unsafe { &*sym_ptr };
-                if sym.jitcode.is_null() {
-                    (
-                        ctx.outer_active_boxes.clone(),
-                        ctx.entry_py_pc,
-                        ctx.outer_jitcode_index,
-                    )
-                } else {
-                    // Liveness coordinate is the CALL op's own (jitcode index,
-                    // py_pc) — NOT the `ctx` sentinels.  `dispatch_via_miframe`
-                    // initializes `ctx.outer_jitcode_index` to 0 and
-                    // `ctx.entry_py_pc` to the walk-entry py_pc, so for a CALL in
-                    // a non-root jitcode, or a CALL not at the walk-entry pc,
-                    // those select the wrong liveness window and the callee guard
-                    // snapshot encodes the wrong frame boxes.  Derive the
-                    // coordinate from the snapshot sym's jitcode at the CALL op's
-                    // pc, matching `orthodox_list_append_commit`.
-                    let (call_site_py_pc, call_site_jc_index) = unsafe {
-                        let jc = &*sym.jitcode;
-                        let jc_index = jc.index as u32;
-                        let mut py = python_pc_for_jitcode_pc(&jc.payload.metadata, op.pc);
-                        if !jc.payload.code_ptr.is_null() {
-                            let codeobj = &*jc.payload.code_ptr;
-                            py = skip_python_trivia_forward(codeobj, py as usize) as u32;
-                        }
-                        (py, jc_index)
-                    };
-                    let boxes = collect_outer_active_boxes(
-                        sym,
-                        ctx.trace_ctx,
-                        ctx.registers_i,
-                        ctx.registers_r,
-                        ctx.registers_f,
-                        call_site_jc_index,
-                        call_site_py_pc,
-                        None,
-                        majit_ir::resumedata::NO_JITCODE_PC,
-                        None,
-                        &[],
-                    );
-                    (boxes, call_site_py_pc, call_site_jc_index)
-                }
-            }
-        } else {
+    let (
+        inline_outer_active_boxes,
+        inline_outer_py_pc,
+        inline_outer_jc_index,
+        inline_outer_resume_marker_jit_pc,
+    ) = if ctx.is_full_body_walk && ctx.outer_active_boxes.is_empty() {
+        let sym_ptr = ctx.fbw_mode.snapshot_sym;
+        if sym_ptr.is_null() {
             (
                 ctx.outer_active_boxes.clone(),
                 ctx.entry_py_pc,
                 ctx.outer_jitcode_index,
+                ctx.outer_resume_marker_jit_pc,
             )
-        };
+        } else {
+            let sym = unsafe { &*sym_ptr };
+            if sym.jitcode.is_null() {
+                (
+                    ctx.outer_active_boxes.clone(),
+                    ctx.entry_py_pc,
+                    ctx.outer_jitcode_index,
+                    ctx.outer_resume_marker_jit_pc,
+                )
+            } else {
+                // Liveness coordinate is the CALL op's own (jitcode index,
+                // py_pc) — NOT the `ctx` sentinels.  `dispatch_via_miframe`
+                // initializes `ctx.outer_jitcode_index` to 0 and
+                // `ctx.entry_py_pc` to the walk-entry py_pc, so for a CALL in
+                // a non-root jitcode, or a CALL not at the walk-entry pc,
+                // those select the wrong liveness window and the callee guard
+                // snapshot encodes the wrong frame boxes.  Derive the
+                // coordinate from the snapshot sym's jitcode at the CALL op's
+                // pc, matching `orthodox_list_append_commit`.
+                let (call_site_py_pc, call_site_jc_index, call_site_marker) = unsafe {
+                    let jc = &*sym.jitcode;
+                    let jc_index = jc.index as u32;
+                    let mut py = python_pc_for_jitcode_pc(&jc.payload.metadata, op.pc);
+                    if !jc.payload.code_ptr.is_null() {
+                        let codeobj = &*jc.payload.code_ptr;
+                        py = skip_python_trivia_forward(codeobj, py as usize) as u32;
+                    }
+                    (py, jc_index, jc.payload.resume_marker_for_jitcode_pc(op.pc))
+                };
+                let boxes = collect_outer_active_boxes(
+                    sym,
+                    ctx.trace_ctx,
+                    ctx.registers_i,
+                    ctx.registers_r,
+                    ctx.registers_f,
+                    call_site_jc_index,
+                    call_site_py_pc,
+                    None,
+                    majit_ir::resumedata::NO_JITCODE_PC,
+                    None,
+                    &[],
+                );
+                (boxes, call_site_py_pc, call_site_jc_index, call_site_marker)
+            }
+        }
+    } else {
+        // No CALL-site coordinate is derived in these fallbacks; the outer
+        // coordinate is inherited from `ctx` verbatim, so the twin is too
+        // (e.g. an inline CALL inside a carrier sub-walk whose outer
+        // coordinate is the paused root).
+        (
+            ctx.outer_active_boxes.clone(),
+            ctx.entry_py_pc,
+            ctx.outer_jitcode_index,
+            ctx.outer_resume_marker_jit_pc,
+        )
+    };
     let callee_outcome = {
         let mut sub_wc = WalkContext {
             callee_shadow: Some(Default::default()),
@@ -14339,6 +14413,7 @@ fn try_walker_inline_user_call(
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: inline_outer_py_pc,
+            outer_resume_marker_jit_pc: inline_outer_resume_marker_jit_pc,
             outer_jitcode_index: inline_outer_jc_index,
             outer_active_boxes: inline_outer_active_boxes,
         };
@@ -18293,12 +18368,13 @@ fn orthodox_list_append_commit(
     // collapse to (mirror the full-body path's last_instr / valuestackdepth
     // publication, keyed to the append op's py_pc — the CALL for the method
     // form, the LIST_APPEND for the opcode form).
-    let (call_site_py_pc, vsd_value, outer_jitcode_index) = unsafe {
+    let (call_site_py_pc, vsd_value, outer_jitcode_index, call_site_marker) = unsafe {
         let jc = &*sym.jitcode;
         let jc_index = jc.index as u32;
+        let marker = jc.payload.resume_marker_for_jitcode_pc(op.pc);
         let mut py = python_pc_for_jitcode_pc(&jc.payload.metadata, op.pc);
         if jc.payload.code_ptr.is_null() {
-            (py, sym.valuestackdepth as i64, jc_index)
+            (py, sym.valuestackdepth as i64, jc_index, marker)
         } else {
             let codeobj = &*jc.payload.code_ptr;
             py = skip_python_trivia_forward(codeobj, py as usize) as u32;
@@ -18307,7 +18383,7 @@ fn orthodox_list_append_commit(
                 Some(d) => (sym.nlocals + d as usize) as i64,
                 None => sym.valuestackdepth as i64,
             };
-            (py, vsd, jc_index)
+            (py, vsd, jc_index, marker)
         }
     };
     if sym.owns_virtualizable_shadow() {
@@ -18348,12 +18424,14 @@ fn orthodox_list_append_commit(
     // parent loop's per-fn pool (which mis-resolves the first residual_call
     // descr → `ResidualCallDescrNotCallDescr`).
     let saved_entry = ctx.entry_py_pc;
+    let saved_marker = ctx.outer_resume_marker_jit_pc;
     let saved_oji = ctx.outer_jitcode_index;
     let saved_active = std::mem::take(&mut ctx.outer_active_boxes);
     let saved_descr_refs = ctx.descr_refs;
     let saved_raw_descrs = ctx.raw_descrs;
     let saved_lookup = ctx.sub_jitcode_lookup;
     ctx.entry_py_pc = call_site_py_pc;
+    ctx.outer_resume_marker_jit_pc = call_site_marker;
     ctx.outer_jitcode_index = outer_jitcode_index;
     ctx.outer_active_boxes = active;
     ctx.descr_refs = crate::jitcode_runtime::all_descr_refs();
@@ -18377,6 +18455,7 @@ fn orthodox_list_append_commit(
     ctx.fbw_mode = saved_fbw_mode;
 
     ctx.entry_py_pc = saved_entry;
+    ctx.outer_resume_marker_jit_pc = saved_marker;
     ctx.outer_jitcode_index = saved_oji;
     ctx.outer_active_boxes = saved_active;
     ctx.descr_refs = saved_descr_refs;
@@ -20566,6 +20645,7 @@ fn run_sub_jitcode_walk(
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: ctx.entry_py_pc,
+            outer_resume_marker_jit_pc: ctx.outer_resume_marker_jit_pc,
             outer_jitcode_index: ctx.outer_jitcode_index,
             outer_active_boxes: ctx.outer_active_boxes.clone(),
             store_subscr_fn_addr: ctx.store_subscr_fn_addr,
@@ -23148,6 +23228,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -23218,6 +23299,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -23278,6 +23360,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -23353,6 +23436,7 @@ mod tests {
                 last_exc_value: None,
                 last_exc_value_concrete: ConcreteValue::Null,
                 entry_py_pc: 0,
+                outer_resume_marker_jit_pc: None,
                 outer_jitcode_index: 0,
                 raw_descrs: RawDescrPool::Global,
                 is_authoritative_executor: false,
@@ -23545,6 +23629,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -23606,6 +23691,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -23666,6 +23752,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -23735,6 +23822,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -23796,6 +23884,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -23856,6 +23945,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -24125,6 +24215,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -24298,6 +24389,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -24419,6 +24511,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -24534,6 +24627,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -24638,6 +24732,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -24739,6 +24834,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -24821,6 +24917,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -24882,6 +24979,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -24939,6 +25037,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -25005,6 +25104,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -25069,6 +25169,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -25136,6 +25237,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -25219,6 +25321,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -25290,6 +25393,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -25362,6 +25466,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -25422,6 +25527,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -25485,6 +25591,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -25548,6 +25655,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -25659,6 +25767,7 @@ mod tests {
             last_exc_value: Some(active_exc),
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -25718,6 +25827,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -25790,6 +25900,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -25894,6 +26005,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -25982,6 +26094,7 @@ mod tests {
             last_exc_value: Some(active_exc),
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -26065,6 +26178,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -26123,6 +26237,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -26245,6 +26360,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -26371,6 +26487,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -26444,6 +26561,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -26514,6 +26632,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -26575,6 +26694,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -26635,6 +26755,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -26715,6 +26836,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -26783,6 +26905,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -26842,6 +26965,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -26900,6 +27024,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -26969,6 +27094,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -27164,6 +27290,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -27305,6 +27432,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -27398,6 +27526,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -27469,6 +27598,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -27565,6 +27695,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -27641,6 +27772,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -27700,6 +27832,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -27761,6 +27894,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -27830,6 +27964,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -27891,6 +28026,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -27979,6 +28115,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -28049,6 +28186,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -28135,6 +28273,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -28234,6 +28373,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -28405,6 +28545,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -28493,6 +28634,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -28554,6 +28696,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -28630,6 +28773,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -28730,6 +28874,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -28834,6 +28979,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -28913,6 +29059,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -28980,6 +29127,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -29042,6 +29190,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -29113,6 +29262,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -29186,6 +29336,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -29279,6 +29430,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -29361,6 +29513,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -29442,6 +29595,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -29505,6 +29659,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -29606,6 +29761,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -29704,6 +29860,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -29812,6 +29969,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -29950,6 +30108,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -30024,6 +30183,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -30086,6 +30246,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -30172,6 +30333,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -30303,6 +30465,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -30410,6 +30573,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -30516,6 +30680,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -30601,6 +30766,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -30689,6 +30855,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -30775,6 +30942,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -30866,6 +31034,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -30955,6 +31124,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -31033,6 +31203,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -31132,6 +31303,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -31209,6 +31381,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -31274,6 +31447,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -31351,6 +31525,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -31448,6 +31623,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -31535,6 +31711,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -31600,6 +31777,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -31691,6 +31869,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -31765,6 +31944,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -31850,6 +32030,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -31923,6 +32104,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -32244,6 +32426,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -32327,6 +32510,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -32420,6 +32604,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
@@ -32488,6 +32673,7 @@ mod tests {
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: 0,
+            outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
             outer_active_boxes: Vec::new(),
             store_subscr_fn_addr: None,
