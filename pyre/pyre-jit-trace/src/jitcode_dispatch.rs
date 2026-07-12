@@ -332,6 +332,17 @@ impl<'a> RawDescrPool<'a> {
     }
 }
 
+/// A callee local slot's recording-time concrete, tagged with the frame
+/// register it was written through. Own-frame reads (`getarrayitem_vable`) and
+/// the mid-body live-value recovery only honor an entry whose `frame_reg`
+/// matches the frame they resolve against, so a value stored to another frame's
+/// same-indexed slot never leaks across a frame identity.
+#[derive(Clone, Copy)]
+pub struct CalleeLocalConcrete {
+    pub frame_reg: u16,
+    pub value: majit_ir::Value,
+}
+
 /// Per-inline-level callee locals shadow owned by the walking frame
 /// (`MIFrame.registers_i/r/f`, `pyjitpl.py:177-234`).
 ///
@@ -351,8 +362,10 @@ pub struct CalleeLocalsShadow {
     /// `pypy/interpreter/pycode.py:275`).
     pub opref: std::collections::HashMap<i64, OpRef>,
     /// Recording-time concrete held by each local slot, including across
-    /// may-force operations that clear the heapcache.
-    pub concrete: std::collections::HashMap<i64, majit_ir::Value>,
+    /// may-force operations that clear the heapcache. Each entry records the
+    /// frame register it was written through so a slot read resolves against
+    /// its own frame only.
+    pub concrete: std::collections::HashMap<i64, CalleeLocalConcrete>,
     /// Portal frame register used to resolve own-frame vable operations.
     /// `u16::MAX` means that the strict fresh-frame fold is inactive.
     pub fold_frame_reg: u16,
@@ -379,12 +392,13 @@ impl CalleeLocalsShadow {
     }
 
     /// A `Void` value clears the slot so a later read does not resurrect a
-    /// stale concrete.
-    fn set_concrete(&mut self, slot: i64, value: majit_ir::Value) {
+    /// stale concrete. `frame_reg` is the frame register the write targeted.
+    fn set_concrete(&mut self, frame_reg: u16, slot: i64, value: majit_ir::Value) {
         if matches!(value, majit_ir::Value::Void) {
             self.concrete.remove(&slot);
         } else {
-            self.concrete.insert(slot, value);
+            self.concrete
+                .insert(slot, CalleeLocalConcrete { frame_reg, value });
         }
     }
 }
@@ -2950,11 +2964,11 @@ pub(crate) fn drive_bridge_carrier_subwalk(
         // self-recursive call's int arg is known (`arg_is_int`) and the call
         // folds to `CALL_ASSEMBLER` instead of declining.
         for (slot, &v) in local_concretes.iter().enumerate() {
-            sub_wc
-                .callee_shadow
-                .as_mut()
-                .unwrap()
-                .set_concrete(slot as i64, v);
+            sub_wc.callee_shadow.as_mut().unwrap().set_concrete(
+                callee_pjc.metadata.portal_frame_reg,
+                slot as i64,
+                v,
+            );
         }
         walk(callee_code, entry, &mut sub_wc)
     };
@@ -4432,6 +4446,8 @@ fn getarrayitem_vable_via_metainterp(
         ctx.callee_shadow
             .as_ref()
             .and_then(|shadow| shadow.concrete.get(&index_value).copied())
+            .filter(|entry| entry.frame_reg == code[op.pc + 1] as u16)
+            .map(|entry| entry.value)
             .unwrap_or(Value::Void)
     } else {
         shadow_value
@@ -4503,7 +4519,7 @@ fn setarrayitem_vable_via_metainterp(
                 .unwrap_or(majit_ir::Value::Void);
             if let Some(shadow) = ctx.callee_shadow.as_mut() {
                 shadow.set_opref(slot, value);
-                shadow.set_concrete(slot, concrete);
+                shadow.set_concrete(fold_frame_reg, slot, concrete);
             }
             return Ok((DispatchOutcome::Continue, op.next_pc));
         }
@@ -4549,7 +4565,7 @@ fn setarrayitem_vable_via_metainterp(
     // Keep the inline concrete-locals shadow current so a later read of this
     // slot (after a may-force op clears the heapcache) recovers the concrete.
     if let Some(shadow) = ctx.callee_shadow.as_mut() {
-        shadow.set_concrete(index_value, concrete);
+        shadow.set_concrete(code[op.pc + 1] as u16, index_value, concrete);
     }
     walker_capture_inline_nonstandard_vable_guard(ctx, op.pc, guards_before)?;
     // #73 (SLICE 1, INERT): a Ref stored to the operand-stack region of the
@@ -8406,6 +8422,92 @@ fn fbw_structural_abort_opcode_is_effect_free(pc: usize) -> bool {
 
 fn exact_first_jit_anchor(first_jit_pc_by_py_pc: &[usize], py_pc: usize, jit_pc: usize) -> bool {
     first_jit_pc_by_py_pc.get(py_pc).copied() == Some(jit_pc)
+}
+
+/// Admit a marker at the semantic head of a portal-shaped Python opcode.
+/// `serialize_op` keeps the first op for a Python pc, so the
+/// `setfield_vable_i(last_instr)` emitted immediately before
+/// `abort_permanent` owns the exact anchor slot. The write is entry
+/// bookkeeping: forward interpretation repeats it before executing the
+/// unsupported opcode. Anything except that same-pc write to this portal
+/// frame declines.
+fn portal_marker_first_jit_anchor(
+    first_jit_pc_by_py_pc: &[usize],
+    built_as_portal: bool,
+    portal_frame_reg: u16,
+    perfn_descrs: &[majit_metainterp::jitcode::RuntimeBhDescr],
+    code: &[u8],
+    py_pc: usize,
+    jit_pc: usize,
+    mut python_pc_for_op: impl FnMut(usize) -> usize,
+) -> bool {
+    if exact_first_jit_anchor(first_jit_pc_by_py_pc, py_pc, jit_pc) {
+        return true;
+    }
+    if !built_as_portal || portal_frame_reg > u8::MAX as u16 {
+        return false;
+    }
+    let Some(mut pc) = first_jit_pc_by_py_pc.get(py_pc).copied() else {
+        return false;
+    };
+    if pc == usize::MAX || pc >= jit_pc {
+        return false;
+    }
+    while pc < jit_pc {
+        let Some(op) = crate::jitcode_runtime::decode_op_at(code, pc) else {
+            return false;
+        };
+        if op.next_pc > jit_pc
+            || python_pc_for_op(op.pc) != py_pc
+            || op.key != "setfield_vable_i/rid"
+            || code.get(op.pc + 1).copied() != Some(portal_frame_reg as u8)
+        {
+            return false;
+        }
+        // `rid`: opcode, frame reg, value reg, little-endian descr index.
+        let Some((&lo, &hi)) = code.get(op.pc + 3).zip(code.get(op.pc + 4)) else {
+            return false;
+        };
+        let descr_index = lo as usize | ((hi as usize) << 8);
+        if !matches!(
+            perfn_descrs.get(descr_index),
+            Some(majit_metainterp::jitcode::RuntimeBhDescr::Descr(
+                majit_translate::jitcode::BhDescr::VableField { index: 0 }
+            ))
+        ) {
+            return false;
+        }
+        pc = op.next_pc;
+    }
+    pc == jit_pc
+}
+
+/// Read one exact Ref slot from a callee sub-walk's fresh-frame virtualizable
+/// shadow. The shadow's `fold_frame_reg` witnesses the strict-fold shape; an
+/// entry whose recorded `frame_reg` matches witnesses the live multi-frame
+/// inline shape. A foreign frame, missing, non-Ref, or null value is ambiguous
+/// and declines.
+fn callee_vable_ref_at(
+    shadow: Option<&CalleeLocalsShadow>,
+    frame_reg: u16,
+    slot: usize,
+) -> Option<ConcreteValue> {
+    if frame_reg == u16::MAX {
+        return None;
+    }
+    let shadow = shadow?;
+    let entry = shadow.concrete.get(&(slot as i64)).copied()?;
+    let strict_fold_witness = shadow.fold_frame_reg == frame_reg;
+    let inline_scope_witness = entry.frame_reg == frame_reg;
+    if !strict_fold_witness && !inline_scope_witness {
+        return None;
+    }
+    match entry.value {
+        Value::Ref(r) if r.as_usize() != 0 => {
+            Some(ConcreteValue::Ref(r.as_usize() as pyre_object::PyObjectRef))
+        }
+        Value::Int(_) | Value::Float(_) | Value::Ref(_) | Value::Void => None,
+    }
 }
 
 /// gh#467 bump the executed-effect odometer (see [`FBW_EXECUTED_EFFECT_COUNT`]).
@@ -14034,7 +14136,7 @@ fn try_walker_inline_user_call(
                     .unwrap_or(majit_ir::Value::Void);
                 let shadow = sub_wc.callee_shadow.as_mut().unwrap();
                 shadow.set_opref(slot, value);
-                shadow.set_concrete(slot, concrete);
+                shadow.set_concrete(callee_portal_frame_reg, slot, concrete);
             }
         }
         // Path-1: resolve scalar static-field reads off this callee's own
@@ -14071,11 +14173,24 @@ fn try_walker_inline_user_call(
                     let callee_pjc = crate::state::pyjitcode_for_code(w_code)?;
                     let metadata = &callee_pjc.metadata;
                     let callee_py_pc = python_pc_for_jitcode_pc(metadata, abort_pc) as usize;
-                    if !exact_first_jit_anchor(
-                        &metadata.first_jit_pc_by_py_pc,
-                        callee_py_pc,
-                        abort_pc,
-                    ) {
+                    let anchor_ok = match abort_kind {
+                        MidBodyAbortKind::Structural => exact_first_jit_anchor(
+                            &metadata.first_jit_pc_by_py_pc,
+                            callee_py_pc,
+                            abort_pc,
+                        ),
+                        MidBodyAbortKind::Marker => portal_marker_first_jit_anchor(
+                            &metadata.first_jit_pc_by_py_pc,
+                            metadata.built_as_portal,
+                            metadata.portal_frame_reg,
+                            callee_perfn_descrs,
+                            body.code,
+                            callee_py_pc,
+                            abort_pc,
+                            |op_pc| python_pc_for_jitcode_pc(metadata, op_pc) as usize,
+                        ),
+                    };
+                    if !anchor_ok {
                         return None;
                     }
                     let raw = unsafe {
@@ -14093,14 +14208,31 @@ fn try_walker_inline_user_call(
                     {
                         return None;
                     }
-                    let depth = metadata.depth_at_py_pc.get(callee_py_pc).copied()? as usize;
+                    let Some(depth) = metadata.depth_at_py_pc.get(callee_py_pc).copied() else {
+                        return None;
+                    };
+                    let depth = depth as usize;
                     let nlocals = callee_code.varnames.len();
-                    let entries = metadata.pcdep_color_slots.get(callee_py_pc)?;
+                    let Some(entries) = metadata.pcdep_color_slots.get(callee_py_pc) else {
+                        return None;
+                    };
                     let mut live_stack = Vec::with_capacity(depth);
                     for rel in 0..depth {
-                        let color =
-                            crate::state::semantic_slot_color_for_ref_slot(entries, nlocals + rel)?;
-                        let value = *sub_wc.concrete_registers_r.get(color)?;
+                        let semantic_slot = nlocals + rel;
+                        let register_value =
+                            crate::state::semantic_slot_color_for_ref_slot(entries, semantic_slot)
+                                .and_then(|color| sub_wc.concrete_registers_r.get(color).copied());
+                        let value = register_value.or_else(|| {
+                            (metadata.built_as_portal && abort_kind == MidBodyAbortKind::Marker)
+                                .then(|| {
+                                    callee_vable_ref_at(
+                                        sub_wc.callee_shadow.as_ref(),
+                                        metadata.portal_frame_reg,
+                                        semantic_slot,
+                                    )
+                                })
+                                .flatten()
+                        })?;
                         if !matches!(value, ConcreteValue::Ref(r) if !r.is_null()) {
                             return None;
                         }
@@ -14115,8 +14247,12 @@ fn try_walker_inline_user_call(
                         if !lv.is_local_live(callee_py_pc, slot) {
                             continue;
                         }
-                        let value = fbw_callee_local_get_concrete(slot as i64)
-                            .and_then(|value| match value {
+                        let value = sub_wc
+                            .callee_shadow
+                            .as_ref()
+                            .and_then(|shadow| shadow.concrete.get(&(slot as i64)).copied())
+                            .filter(|entry| entry.frame_reg == metadata.portal_frame_reg)
+                            .and_then(|entry| match entry.value {
                                 Value::Ref(r) => Some(ConcreteValue::Ref(
                                     r.as_usize() as pyre_object::PyObjectRef
                                 )),
@@ -31582,5 +31718,100 @@ mod tests {
         assert!(super::exact_first_jit_anchor(&first, 28, 101));
         assert!(!super::exact_first_jit_anchor(&first, 28, 102));
         assert!(!super::exact_first_jit_anchor(&first, 27, 101));
+    }
+
+    #[test]
+    fn portal_marker_anchor_accepts_only_same_pc_last_instr_bookkeeping() {
+        use majit_metainterp::jitcode::RuntimeBhDescr;
+        use majit_translate::jitcode::BhDescr;
+
+        let setfield = *insns_opname_to_byte()
+            .get("setfield_vable_i/rid")
+            .expect("setfield_vable_i must exist");
+        let abort = *insns_opname_to_byte()
+            .get("abort_permanent/")
+            .expect("abort_permanent must exist");
+        let int_copy = *insns_opname_to_byte()
+            .get("int_copy/c>i")
+            .expect("int_copy/c>i must exist");
+        let descrs = [RuntimeBhDescr::Descr(BhDescr::VableField { index: 0 })];
+        let mut first = vec![usize::MAX; 30];
+        first[29] = 0;
+        let portal_gap = [setfield, 1, 7, 0, 0, abort];
+
+        assert!(super::portal_marker_first_jit_anchor(
+            &first,
+            true,
+            1,
+            &descrs,
+            &portal_gap,
+            29,
+            5,
+            |_| 29,
+        ));
+        assert!(!super::portal_marker_first_jit_anchor(
+            &first,
+            true,
+            1,
+            &descrs,
+            &portal_gap,
+            29,
+            5,
+            |_| 28,
+        ));
+
+        let computation_gap = [int_copy, 1, 7, abort];
+        assert!(!super::portal_marker_first_jit_anchor(
+            &first,
+            true,
+            1,
+            &descrs,
+            &computation_gap,
+            29,
+            3,
+            |_| 29,
+        ));
+
+        first[29] = 5;
+        assert!(super::portal_marker_first_jit_anchor(
+            &first,
+            false,
+            u16::MAX,
+            &[],
+            &portal_gap,
+            29,
+            5,
+            |_| 29,
+        ));
+    }
+
+    #[test]
+    fn callee_vable_ref_gates_on_frame_register_identity() {
+        use majit_ir::{GcRef, Value};
+
+        let ref_value = Value::Ref(GcRef(0x1000));
+        let mut shadow = super::CalleeLocalsShadow::default();
+        shadow.set_concrete(1, 3, ref_value);
+
+        // An entry recorded through frame reg 1 resolves for that frame only.
+        assert!(matches!(
+            super::callee_vable_ref_at(Some(&shadow), 1, 3),
+            Some(ConcreteValue::Ref(value)) if value as usize == 0x1000
+        ));
+        // A foreign frame register declines (no strict-fold witness either).
+        assert_eq!(super::callee_vable_ref_at(Some(&shadow), 2, 3), None);
+
+        // The strict-fold witness admits the slot even when the recorded writer
+        // frame differs from the queried frame.
+        shadow.fold_frame_reg = 2;
+        assert!(matches!(
+            super::callee_vable_ref_at(Some(&shadow), 2, 3),
+            Some(ConcreteValue::Ref(value)) if value as usize == 0x1000
+        ));
+
+        // A missing slot, the `u16::MAX` sentinel, and an absent shadow decline.
+        assert_eq!(super::callee_vable_ref_at(Some(&shadow), 1, 4), None);
+        assert_eq!(super::callee_vable_ref_at(Some(&shadow), u16::MAX, 3), None);
+        assert_eq!(super::callee_vable_ref_at(None, 1, 3), None);
     }
 }
