@@ -14438,6 +14438,14 @@ fn dispatch_residual_call_iRd_kind(
     ctx: &mut WalkContext<'_, '_>,
     dst_bank: char,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
+    // execute_varargs (pyjitpl.py:1940-1941) opens every residual call
+    // with metainterp.clear_exception(), so a caught exception's
+    // last_exc_value never survives past the next call — the
+    // opimpl_catch_exception assert (pyjitpl.py:504) relies on it.
+    // Clear at the arm entry so declined/folded paths uphold the same
+    // invariant as the concrete-execution success arm.
+    ctx.last_exc_value = None;
+    ctx.last_exc_value_concrete = ConcreteValue::Null;
     let funcptr = read_int_reg(code, op, 0, ctx)?;
     let (r_args, arg_width) = read_ref_var_list(code, op, 1, ctx)?;
     // #62: env-gated recognition probe (no-op unless PYRE_DIAG_INLINE_RECOG
@@ -19474,6 +19482,10 @@ fn dispatch_residual_call_iIRd_kind(
     ctx: &mut WalkContext<'_, '_>,
     dst_bank: char,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
+    // execute_varargs (pyjitpl.py:1940-1941) clear_exception at every
+    // residual-call entry; see dispatch_residual_call_iRd_kind.
+    ctx.last_exc_value = None;
+    ctx.last_exc_value_concrete = ConcreteValue::Null;
     let funcptr = read_int_reg(code, op, 0, ctx)?;
     let (i_args, i_width) = read_int_var_list(code, op, 1, ctx)?;
     let (r_args, r_width) = read_ref_var_list(code, op, 1 + i_width, ctx)?;
@@ -20051,6 +20063,10 @@ fn dispatch_residual_call_iIRFd_kind(
     ctx: &mut WalkContext<'_, '_>,
     dst_bank: char,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
+    // execute_varargs (pyjitpl.py:1940-1941) clear_exception at every
+    // residual-call entry; see dispatch_residual_call_iRd_kind.
+    ctx.last_exc_value = None;
+    ctx.last_exc_value_concrete = ConcreteValue::Null;
     let funcptr = read_int_reg(code, op, 0, ctx)?;
     let (i_args, i_width) = read_int_var_list(code, op, 1, ctx)?;
     let (r_args, r_width) = read_ref_var_list(code, op, 1 + i_width, ctx)?;
