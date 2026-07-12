@@ -2339,15 +2339,24 @@ impl<'a> RegAlloc<'a> {
                 gcmap_set_bit(gcmap, val);
             }
         }
-        for (v, lifetime) in self.longevity.lifetimes_iter() {
-            if self.opref_type(*v) != Some(Type::Ref)
-                || !self.rm.is_still_alive(*v, &self.longevity)
-            {
+        // regalloc.py:36 BindingsIterItems; regalloc.py:178 bindings_iteritems.
+        let mut index = 0;
+        while index < self.fm.current_frame_depth {
+            let Some(v) = self.fm.boxes_in_frame[index] else {
+                index += 1;
                 continue;
-            }
-            if let Some(loc) = lifetime.current_frame_loc {
+            };
+            let loc = self
+                .longevity
+                .get(v)
+                .and_then(|lifetime| lifetime.current_frame_loc)
+                .expect("gcmap frame binding without current_frame_loc");
+            debug_assert_eq!(FrameManager::get_loc_index(&loc), index);
+            let size = FrameManager::frame_size(self.tp(v));
+            if self.opref_type(v) == Some(Type::Ref) && self.rm.is_still_alive(v, &self.longevity) {
                 gcmap_set_bit(gcmap, loc.position + JITFRAME_FIXED_SIZE);
             }
+            index += size;
         }
         gcmap
     }
