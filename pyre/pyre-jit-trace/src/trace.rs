@@ -912,6 +912,10 @@ fn select_recipe_entry(
     if crate::jitcode_dispatch::m73_entry_carry_enabled()
         && crate::jitcode_dispatch::m73_entry_audit_enabled()
     {
+        if carried.is_none() {
+            crate::jitcode_dispatch::census_record("M73EntryAudit::RecipeDerivedTaken");
+            eprintln!("[m73-entry-audit] recipe-derived-taken {diag_tag}");
+        }
         let derived_entry = derived();
         if carried != derived_entry {
             crate::jitcode_dispatch::census_record("M73EntryAudit::RecipeMismatch");
@@ -1489,6 +1493,13 @@ fn run_perfn_walk(
         // for this leg is `sym.bridge_walk_entry_pc` (used below when present);
         // retiring this residual derivation needs the carried `frame0.jitcode_pc`
         // generalized to every bridge resume, a separate #73 front.
+        if crate::jitcode_dispatch::m73_entry_audit_enabled() {
+            crate::jitcode_dispatch::census_record("M73EntryAudit::EntryDerivedTaken");
+            eprintln!(
+                "[m73-entry-audit] entry-derived-taken start_pc={start_pc} is_bridge={} carry={}",
+                ctx.is_bridge_trace, carry
+            );
+        }
         pjc.resume_jitcode_pc_for(start_pc)
     };
     let Some(pc_map_entry) = pc_map_entry else {
