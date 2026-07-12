@@ -6892,21 +6892,30 @@ impl<'a> Lowering<'a> {
     /// Restricted to the integer-index impl (`Index<usize>`, the element
     /// load).  `Vec`'s `Index<Range<…>>` impls share the `index` leaf but
     /// return a sub-`&[T]` slice, not an element — lowering those to a
-    /// scalar `ArrayRead` would mis-index, so the index argument
-    /// (`inputs[1]`) must type as an integer.
+    /// scalar `ArrayRead` would mis-index, so the index type must be an
+    /// integer.  Charon runs `monomorphize:false`, so the `index`
+    /// signature keeps the generic index param `I` (a `TypeVar` typing as
+    /// `Ref`); the concrete index type is the callsite substitution
+    /// `types[1]` of the impl generics `[T, I, A]`.  `Index<usize>` types
+    /// as `Int`; `Index<Range<…>>` resolves to a `Range*` Adt (`Ref`) and
+    /// stays foreign.
     fn is_vec_index_call(&self, reg: &RegularCall) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
         };
-        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+        let owner_leaf_ok = self.llbc.fn_by_id(*id).is_some_and(|fd| {
             impl_method_owner_for_fundecl(self.llbc, fd)
                 .is_some_and(|(owner, leaf)| owner == "vec::Vec" && leaf == "index")
-                && fd
-                    .signature
-                    .inputs
-                    .get(1)
-                    .is_some_and(|t| matches!(tyref_to_value_type(t, self.llbc), ValueType::Int))
-        })
+        });
+        if !owner_leaf_ok {
+            return false;
+        }
+        reg.generics
+            .get("types")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|tys| tys.get(1))
+            .and_then(|t| serde_json::from_value::<TyRef>(t.clone()).ok())
+            .is_some_and(|t| matches!(tyref_to_value_type(&t, self.llbc), ValueType::Int))
     }
 
     /// `<[T]>::swap(s, a, b)` (`core::slice::<Impl>::swap`) — an
