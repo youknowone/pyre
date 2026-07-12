@@ -2780,6 +2780,7 @@ fn compute_bridge_root_parent_frame(
     root_sym: &crate::state::PyreSym,
     trace_ctx: &mut TraceCtx,
     root_pc: usize,
+    root_carried_jitcode_pc: i32,
 ) -> Option<InlineParentFrame> {
     if root_sym.jitcode.is_null() {
         return None;
@@ -2840,7 +2841,11 @@ fn compute_bridge_root_parent_frame(
     Some(InlineParentFrame {
         jitcode_index,
         resume_py_pc,
-        resume_marker_jit_pc: None,
+        // Parent-frame words are never branch-tagged; negative tags belong to
+        // a branch guard's own top-frame word.
+        resume_marker_jit_pc: (root_carried_jitcode_pc != majit_ir::resumedata::NO_JITCODE_PC
+            && root_carried_jitcode_pc >= 0)
+            .then(|| root_carried_jitcode_pc as usize),
         boxes,
     })
 }
@@ -2872,6 +2877,7 @@ pub(crate) fn drive_bridge_carrier_subwalk(
     session: &std::cell::RefCell<WalkSession>,
     root_sym: &crate::state::PyreSym,
     root_pc: usize,
+    root_jitcode_pc: i32,
     callee_pjc: &std::sync::Arc<crate::PyJitCode>,
     callee_code_key: usize,
     callee_w_globals: usize,
@@ -2970,7 +2976,7 @@ pub(crate) fn drive_bridge_carrier_subwalk(
     }
 
     // Paused root portal frame for the multi-frame guard snapshot.
-    let root_frame = compute_bridge_root_parent_frame(root_sym, ctx, root_pc)?;
+    let root_frame = compute_bridge_root_parent_frame(root_sym, ctx, root_pc, root_jitcode_pc)?;
     let outer_jitcode_index = root_frame.jitcode_index;
     let outer_active_boxes = root_frame.boxes.clone();
 
@@ -3086,6 +3092,7 @@ pub(crate) fn drive_outer_frame_continuation(
     root_code_key: usize,
     root_w_globals: usize,
     root_pc: usize,
+    root_jitcode_pc: i32,
     entry: usize,
     frame_box: OpRef,
     frame_reg: usize,
@@ -3161,7 +3168,7 @@ pub(crate) fn drive_outer_frame_continuation(
         regs_f[num_regs_f + i] = ctx.const_float(v);
     }
 
-    let root_frame = compute_bridge_root_parent_frame(root_sym, ctx, root_pc)?;
+    let root_frame = compute_bridge_root_parent_frame(root_sym, ctx, root_pc, root_jitcode_pc)?;
     let outer_jitcode_index = root_frame.jitcode_index;
     let outer_active_boxes = root_frame.boxes.clone();
 
@@ -9616,6 +9623,34 @@ pub(crate) fn m73_s1marker_carry_enabled() -> bool {
     })
 }
 
+/// `PYRE_M73_PFMARKER_CARRY` (#73 S5 phase-3 slice-3, default OFF): carry
+/// each paused parent frame's codewrite-time resume-marker twin in its frame
+/// word. Enable with any value other than `0`/`false`.
+pub(crate) fn m73_pfmarker_carry_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M73_PFMARKER_CARRY") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => false,
+    })
+}
+
+/// `PYRE_M73_MFCALLEE_CARRY` (#73 S5 phase-3 slice-3, default OFF): carry
+/// the multi-frame callee's codewrite-time resume-marker twin in its top-frame
+/// word. Enable with any value other than `0`/`false`.
+pub(crate) fn m73_mfcallee_carry_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M73_MFCALLEE_CARRY") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => false,
+    })
+}
+
 /// `PYRE_M73_ARMARKER_CARRY` (#73 S5 phase-2, default ON): source the plain
 /// after-residual-call marker from the codewrite-time fallthrough-marker twin
 /// at the guard's own jitcode offset, retaining runtime resume-marker
@@ -11983,20 +12018,30 @@ fn walker_capture_multi_frame_inline_snapshot(
             }
         }
     }
-    // #124 Approach B (M2): the callee (top) frame carries the guard's raw
-    // JitCode byte offset as the resume coordinate (mirror of the single-frame
-    // path). A branch guard supplies its own callee pc in
-    // `GuardCaptureScope::branch_guard_jitcode_pc`; otherwise the guard's own offset is
-    // `callee_op_pc`.  `after_residual_call` guards resume BEFORE the call and
-    // keep the sentinel.  The paused caller frames resume at the CALL return
-    // point via the Python pc → jitcode resume-translation path, so they keep
-    // the sentinel too (no
-    // kept-stack coordinate is carried for them in M2).  Computed BEFORE the box
-    // collection so it queries liveness at the SAME coordinate the decoder
-    // resumes at.
+    // #124 Approach B (M2), mirror of the single-frame path: the callee (top)
+    // frame carries a branch guard's supplied pc
+    // (`GuardCaptureScope::branch_guard_jitcode_pc`) unchanged.  With
+    // `PYRE_M73_MFCALLEE_CARRY`, other guards source their word from the callee
+    // payload's resume-marker twin: after-residual guards use the fallthrough
+    // twin and retain the sentinel on a miss, while plain guards retain the raw
+    // `callee_op_pc` on a miss.  Computed BEFORE box collection so encoder
+    // liveness and decoder resume use the same coordinate.
     let callee_jitcode_pc: i32 = match scope.branch_guard_jitcode_pc {
         Some(g) => g as i32,
-        None if after_residual_call => majit_ir::resumedata::NO_JITCODE_PC,
+        None if after_residual_call => {
+            if m73_mfcallee_carry_enabled() {
+                callee_pjc
+                    .after_residual_marker_for_jitcode_pc(callee_op_pc)
+                    .map(|m| m as i32)
+                    .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC)
+            } else {
+                majit_ir::resumedata::NO_JITCODE_PC
+            }
+        }
+        None if m73_mfcallee_carry_enabled() => callee_pjc
+            .resume_marker_for_jitcode_pc(callee_op_pc)
+            .map(|m| m as i32)
+            .unwrap_or(callee_op_pc as i32),
         None => callee_op_pc as i32,
     };
     let callee_boxes = collect_callee_active_boxes(
@@ -12091,7 +12136,13 @@ fn walker_capture_multi_frame_inline_snapshot(
         frames.push((
             pf.jitcode_index,
             pf.resume_py_pc,
-            majit_ir::resumedata::NO_JITCODE_PC,
+            if m73_pfmarker_carry_enabled() {
+                pf.resume_marker_jit_pc
+                    .map(|m| m as i32)
+                    .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC)
+            } else {
+                majit_ir::resumedata::NO_JITCODE_PC
+            },
             pf.boxes.as_slice(),
         ));
     }
