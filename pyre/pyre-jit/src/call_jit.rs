@@ -57,6 +57,14 @@ thread_local! {
     /// FFI boundaries (compiled code → callback → exception).
     static LAST_CA_EXCEPTION: std::cell::RefCell<Option<pyre_interpreter::error::PyError>> =
         const { std::cell::RefCell::new(None) };
+    /// Callee PyFrame address whose CALL_ASSEMBLER bridge walk committed
+    /// and adopted its end-of-walk state (raise_continue_running_normally
+    /// analogue). The CA slow path calls the bridge hook and then the
+    /// blackhole hook back-to-back; the blackhole consumes this to
+    /// complete the callee from the adopted state instead of re-running
+    /// the guard-state resume over already-applied effects.
+    static CA_WALK_ADOPTED_FRAME: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
     static SELF_RECURSIVE_DISPATCH_CACHE: UnsafeCell<Option<(u64, Option<u64>)>> =
         const { UnsafeCell::new(None) };
 }
@@ -1319,6 +1327,8 @@ fn jit_blackhole_resume_from_guard(
     num_raw_deadframe: usize,
     guard_exc: i64,
 ) -> Option<i64> {
+    let ca_adopted_frame = CA_WALK_ADOPTED_FRAME.with(|c| c.replace(0));
+
     // rstack.stack_check_slowpath → _StackOverflow parity: drain the
     // pending JIT-prologue overflow exception when the backend probe
     // tripped. The blackhole resume path is one of the three
@@ -1338,6 +1348,32 @@ fn jit_blackhole_resume_from_guard(
         return None;
     }
     let fail_values = unsafe { std::slice::from_raw_parts(fail_values_ptr, num_fail_values) };
+
+    // raise_continue_running_normally parity (pyjitpl.py:3048-3091 +
+    // warmspot.py:970-983): the CA bridge walk committed its end-of-walk
+    // state into the live callee frame and the frame adopted it. The walk
+    // already executed the resumed region's effects concretely, so the
+    // guard-state blackhole below would re-apply them over the advanced
+    // heap (double-execution / stale-value return). Complete the callee
+    // from its adopted state via the portal runner instead — the same
+    // portal_ptr(*args) completion the ContinueRunningNormally arm of
+    // handle_blackhole_result performs.
+    if ca_adopted_frame != 0 && ca_adopted_frame == fail_values[0] as usize {
+        let frame = unsafe { &mut *(ca_adopted_frame as *mut PyFrame) };
+        return match crate::eval::portal_runner_result(frame) {
+            Ok(result) => Some(result as i64),
+            Err(err) => {
+                let exc_obj = err.exc_object;
+                if exc_obj != pyre_object::PY_NULL {
+                    majit_metainterp::blackhole::BH_LAST_EXC_VALUE
+                        .with(|c| c.set(exc_obj as i64));
+                    store_jit_exception(exc_obj as i64);
+                }
+                Some(0)
+            }
+        };
+    }
+
     let raw_deadframe = if !raw_deadframe_ptr.is_null() && num_raw_deadframe > 0 {
         unsafe { std::slice::from_raw_parts(raw_deadframe_ptr, num_raw_deadframe) }
     } else {
@@ -2475,6 +2511,9 @@ pub fn trace_and_compile_from_bridge(
                 if pyre_jit_trace::trace::take_walk_end_flush_committed() {
                     frame.restore_resume_state_from(&executed);
                     adopted_walk_end_state = true;
+                    if !allow_finish_direct_return {
+                        CA_WALK_ADOPTED_FRAME.with(|c| c.set(live_frame_addr));
+                    }
                 }
                 action
             },
