@@ -419,6 +419,15 @@ fn ca_inline_params(frame_bytes: u32) -> Option<codegen::CaInlineParams> {
     })?
 }
 
+/// Address of the active jitframe shadow-stack top cell for ordinary trace
+/// body reloads. This does not depend on nursery fast-path eligibility: the
+/// reload is valid whenever a GC is active at compilation time.
+fn jf_top_addr() -> Option<u32> {
+    with_wasm_active_gc(|_| majit_gc::shadow_stack::get_root_stack_top_addr())
+        .and_then(|addr| u32::try_from(addr).ok())
+        .filter(|&addr| addr != 0)
+}
+
 /// `majit_gc::CollectOldgenFn` installed by `set_gc_allocator`. Drives the
 /// interpreter-safepoint non-moving old-gen major (`gc_interp::safepoint`,
 /// default-on on wasm) through the active GC. Needs mutable access, so it
@@ -1286,6 +1295,7 @@ impl majit_backend::Backend for WasmBackend {
                     // Loops do not emit the CA arm, but they can run on a
                     // nursery CA frame and must reload local 0 after a collect.
                     ca_reload_fn_ptr: wasm_jit_ca_reload_frame as *const () as usize as i64,
+                    jf_top_addr: jf_top_addr(),
                     ..codegen::CaParams::default()
                 },
             )?;
@@ -1927,10 +1937,12 @@ impl majit_backend::Backend for WasmBackend {
                     as i64,
                 callee_gcmap_ptr,
                 inline: ca_inline_params(source_frame.ca_frame_bytes),
+                jf_top_addr: jf_top_addr(),
             }
         } else {
             codegen::CaParams {
                 ca_reload_fn_ptr: wasm_jit_ca_reload_frame as *const () as usize as i64,
+                jf_top_addr: jf_top_addr(),
                 ..codegen::CaParams::default()
             }
         };

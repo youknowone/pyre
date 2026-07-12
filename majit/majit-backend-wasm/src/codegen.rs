@@ -681,8 +681,15 @@ fn emit_reload_frame_if_necessary(
     sink: &mut InstructionSink<'_>,
     residual_type_base: Option<u32>,
     ca_reload_fn_ptr: i64,
+    jf_top_addr: Option<u32>,
 ) {
-    if let Some(base) = residual_type_base {
+    if let Some(top_addr) = jf_top_addr {
+        // assembler.py:1369-1377: reload the possibly-forwarded top JitFrame
+        // directly from the shadow-stack cell. Unlike the helper-table call,
+        // this does not need the residual direct-call type to be declared.
+        emit_ca_reload_top(sink, top_addr);
+        sink.local_set(0);
+    } else if let Some(base) = residual_type_base {
         sink.i32_const(ca_reload_fn_ptr as i32);
         sink.call_indirect(0, base);
         sink.i32_wrap_i64();
@@ -706,7 +713,7 @@ fn emit_reload_ca_frame_if_necessary(
         emit_ca_reload_top(sink, inline.jf_top_addr);
         sink.local_set(0);
     } else {
-        emit_reload_frame_if_necessary(sink, residual_type_base, ca_reload_fn_ptr);
+        emit_reload_frame_if_necessary(sink, residual_type_base, ca_reload_fn_ptr, None);
     }
 }
 
@@ -1106,6 +1113,11 @@ pub struct CaParams {
     /// called after the recursive call to recover this level's possibly-moved
     /// nursery frame from the jitframe shadow stack.
     pub ca_reload_fn_ptr: i64,
+    /// Address of the active jitframe shadow-stack top cell, baked for every
+    /// trace body so post-collecting-call local-0 reloads can match
+    /// assembler.py without a helper round trip. `None` keeps the existing
+    /// helper/trampoline behavior when compilation has no active GC.
+    pub jf_top_addr: Option<u32>,
     /// `__indirect_function_table` slot of
     /// `lib.rs::wasm_jit_ca_reload_caller_frame`, called while the callee is
     /// still pushed to recover this invocation's possibly-moved local-0 frame.
@@ -3078,6 +3090,7 @@ fn build_function(
                         &mut sink,
                         residual_type_base,
                         ca.ca_reload_fn_ptr,
+                        ca.jf_top_addr,
                     );
                     emit_reload_refs_from_homes(
                         &mut sink,
@@ -3107,6 +3120,7 @@ fn build_function(
                         &mut sink,
                         residual_type_base,
                         ca.ca_reload_fn_ptr,
+                        ca.jf_top_addr,
                     );
                     emit_reload_refs_from_homes(
                         &mut sink, ref_homes, &liveness, op_idx, None, frame,
@@ -3222,6 +3236,7 @@ fn build_function(
                         &mut sink,
                         residual_type_base,
                         ca.ca_reload_fn_ptr,
+                        ca.jf_top_addr,
                     );
                     emit_reload_refs_from_homes(
                         &mut sink,
@@ -3337,6 +3352,7 @@ fn build_function(
                         &mut sink,
                         residual_type_base,
                         ca.ca_reload_fn_ptr,
+                        ca.jf_top_addr,
                     );
                     emit_reload_refs_from_homes(
                         &mut sink, ref_homes, &liveness, op_idx, skip, frame,
@@ -3440,6 +3456,7 @@ fn build_function(
                         &mut sink,
                         residual_type_base,
                         ca.ca_reload_fn_ptr,
+                        ca.jf_top_addr,
                     );
                     emit_reload_refs_from_homes(
                         &mut sink,
@@ -3508,6 +3525,7 @@ fn build_function(
                         &mut sink,
                         residual_type_base,
                         ca.ca_reload_fn_ptr,
+                        ca.jf_top_addr,
                     );
                     emit_reload_refs_from_homes(
                         &mut sink,
@@ -3571,6 +3589,7 @@ fn build_function(
                         &mut sink,
                         residual_type_base,
                         ca.ca_reload_fn_ptr,
+                        ca.jf_top_addr,
                     );
                     emit_reload_refs_from_homes(
                         &mut sink,
@@ -3686,6 +3705,7 @@ fn build_function(
                         &mut sink,
                         residual_type_base,
                         ca.ca_reload_fn_ptr,
+                        ca.jf_top_addr,
                     );
                     emit_reload_refs_from_homes(
                         &mut sink, ref_homes, &liveness, op_idx, skip, frame,
