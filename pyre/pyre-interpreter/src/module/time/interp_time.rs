@@ -1020,39 +1020,20 @@ pub fn asctime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 }
 
 fn _asctime_from_tm(tm: &c_tm) -> Result<PyObjectRef, crate::PyError> {
-    #[cfg(target_arch = "wasm32")]
-    {
-        let _ = tm;
-        Err(crate::PyError::not_implemented(
-            "time.asctime is unavailable on wasm32",
-        ))
-    }
-    #[cfg(unix)]
-    {
-        let libc_tm = c_tm_to_libc_tm(&tm);
-        let mut buf = [0 as libc::c_char; 26];
-        let p = unsafe { libc::asctime_r(&libc_tm, buf.as_mut_ptr()) };
-        if p.is_null() {
-            return Err(crate::PyError::value_error("unconvertible time"));
-        }
-        let lossy = unsafe { std::ffi::CStr::from_ptr(p as *const libc::c_char) }.to_string_lossy();
-        let s = lossy.trim_end_matches('\n');
-        Ok(w_str_new(s))
-    }
-    #[cfg(windows)]
-    {
-        unsafe extern "C" {
-            fn asctime(timeptr: *const MsvcTm) -> *const libc::c_char;
-        }
-        let msvc_tm = c_tm_to_msvc_tm(&tm);
-        let p = unsafe { asctime(&msvc_tm) };
-        if p.is_null() {
-            return Err(crate::PyError::value_error("unconvertible time"));
-        }
-        let lossy = unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy();
-        let s = lossy.trim_end_matches('\n');
-        Ok(w_str_new(s))
-    }
+    const WDAY_NAME: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const MON_NAME: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    Ok(w_str_new(&format!(
+        "{} {}{:>3} {:02}:{:02}:{:02} {}",
+        WDAY_NAME[tm.tm_wday as usize],
+        MON_NAME[tm.tm_mon as usize],
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec,
+        tm.tm_year + 1900
+    )))
 }
 
 /// time.ctime([seconds]) — interp_time.ctime

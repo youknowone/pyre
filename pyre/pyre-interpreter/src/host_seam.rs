@@ -49,11 +49,10 @@ pub mod sys {
         c_char, c_int, c_long, c_uint, c_void, clockid_t, gid_t, mode_t, off_t, pid_t, rusage,
         size_t, time_t, timespec, timeval, tm, uid_t,
     };
-    // Calendar/formatting on a caller-supplied value: `asctime_r` is pure, and
-    // `gmtime_r` reads only glibc's timezone cache — which the seccomp backstop
-    // primes before lockdown (see `pyre_sandbox::seccomp`), so at runtime neither
-    // opens a host file.
-    pub use ::libc::{asctime_r, gmtime_r};
+    // Calendar/formatting on a caller-supplied value: `gmtime_r` reads only glibc's
+    // timezone cache — which the seccomp backstop primes before lockdown
+    // (see `pyre_sandbox::seccomp`), so at runtime it doesn't open a host file.
+    pub use ::libc::gmtime_r;
     // Pure functions: wait-status decoders are bit-twiddling on a caller-supplied
     // integer; they make no syscall and read no host state.
     pub use ::libc::{WEXITSTATUS, WIFEXITED, WIFSIGNALED, WIFSTOPPED, WSTOPSIG, WTERMSIG};
