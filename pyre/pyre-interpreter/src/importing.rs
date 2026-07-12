@@ -371,12 +371,16 @@ thread_local! {
     static IMPORT_ROOT_AREA: ImportRootArea = ImportRootArea {
         modules: SYS_MODULES.with(|modules| modules as *const _),
         modules_dict: SYS_MODULES_DICT.with(|dict| dict as *const _),
+        argv_pending: SYS_ARGV_PENDING.with(|p| p as *const _),
     };
 }
 
 struct ImportRootArea {
     modules: *const RefCell<HashMap<String, PyObjectRef>>,
     modules_dict: *const std::cell::Cell<PyObjectRef>,
+    /// The pending `sys.argv` list is reachable only from this cell between
+    /// `set_sys_argv` and `take_pending_sys_argv`.
+    argv_pending: *const std::cell::Cell<PyObjectRef>,
 }
 
 // ── builtin module registry ──────────────────────────────────────────
@@ -1183,6 +1187,12 @@ pub(crate) unsafe fn walk_import_roots_area(
     if !dict.is_null() {
         visitor(&mut dict);
         modules_dict.set(dict);
+    }
+    let argv_pending = unsafe { &*area.argv_pending };
+    let mut argv = argv_pending.get();
+    if !argv.is_null() {
+        visitor(&mut argv);
+        argv_pending.set(argv);
     }
 }
 
