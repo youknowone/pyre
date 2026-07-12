@@ -1280,15 +1280,7 @@ static ITEMS_BLOCK_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|
         pyre_object::object_array::ITEMS_BLOCK_ITEMS_OFFSET,
         0,
         0,
-        &[(
-            "ItemsBlock.capacity",
-            0,
-            8,
-            Type::Int,
-            false,
-            true,
-            false,
-        )],
+        &[("ItemsBlock.capacity", 0, 8, Type::Int, false, true, false)],
         "ItemsBlock",
         "object_array::ItemsBlock",
     )

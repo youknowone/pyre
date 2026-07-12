@@ -1365,8 +1365,7 @@ fn jit_blackhole_resume_from_guard(
             Err(err) => {
                 let exc_obj = err.exc_object;
                 if exc_obj != pyre_object::PY_NULL {
-                    majit_metainterp::blackhole::BH_LAST_EXC_VALUE
-                        .with(|c| c.set(exc_obj as i64));
+                    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
                     store_jit_exception(exc_obj as i64);
                 }
                 Some(0)
