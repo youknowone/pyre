@@ -12679,6 +12679,8 @@ impl CodeWriter {
         let mut depth_trivia_pred_by_jit_pc: Vec<(usize, Option<u16>)> = Vec::new();
         let mut resume_marker_marker_by_jit_pc: Vec<(usize, Option<usize>)> = Vec::new();
         let mut resume_marker_pred_by_jit_pc: Vec<(usize, Option<usize>)> = Vec::new();
+        let mut after_residual_marker_marker_by_jit_pc: Vec<(usize, Option<usize>)> = Vec::new();
+        let mut after_residual_marker_pred_by_jit_pc: Vec<(usize, Option<usize>)> = Vec::new();
         if !first_jit_pc_by_py_pc.is_empty() {
             use std::collections::BTreeMap;
             let mut by_off: BTreeMap<usize, usize> = BTreeMap::new();
@@ -12748,6 +12750,31 @@ impl CodeWriter {
                 }
             }
             resume_marker_pred_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
+            // Marker tier: exact-match, block-head precedence. Compose the
+            // runtime after-residual path's trivia skip and semantic
+            // fallthrough before resolving the resume marker.
+            for &(off, py) in &block_head_py_by_jit_pc {
+                let sk =
+                    pyre_jit_trace::jitcode_dispatch::skip_python_trivia_forward(code, py as usize);
+                let ft = pyre_jit_trace::pyjitpl::semantic_fallthrough_pc(code, sk);
+                let value = first_jit_pc_by_py_pc
+                    .get(ft)
+                    .and_then(|_| resolve_marker(ft));
+                after_residual_marker_marker_by_jit_pc.push((off, value));
+            }
+            after_residual_marker_marker_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
+            // Op-start tier: predecessor scan, markers EXCLUDED.
+            for (py, &pos) in first_jit_pc_by_py_pc.iter().enumerate() {
+                if pos != usize::MAX {
+                    let sk = pyre_jit_trace::jitcode_dispatch::skip_python_trivia_forward(code, py);
+                    let ft = pyre_jit_trace::pyjitpl::semantic_fallthrough_pc(code, sk);
+                    let value = first_jit_pc_by_py_pc
+                        .get(ft)
+                        .and_then(|_| resolve_marker(ft));
+                    after_residual_marker_pred_by_jit_pc.push((pos, value));
+                }
+            }
+            after_residual_marker_pred_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
         }
 
         // call.py:148 `jd.mainjitcode.jitdriver_sd = jd`. RPython mutates
@@ -12784,6 +12811,8 @@ impl CodeWriter {
             depth_trivia_pred_by_jit_pc,
             resume_marker_marker_by_jit_pc,
             resume_marker_pred_by_jit_pc,
+            after_residual_marker_marker_by_jit_pc,
+            after_residual_marker_pred_by_jit_pc,
             result_color_at_pc,
             portal_frame_reg,
             portal_ec_reg,

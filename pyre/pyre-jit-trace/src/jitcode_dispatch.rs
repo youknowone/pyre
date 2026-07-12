@@ -9594,6 +9594,21 @@ pub(crate) fn m73_marker_carry_enabled() -> bool {
     })
 }
 
+/// `PYRE_M73_ARMARKER_CARRY` (#73 S5 phase-2, default OFF): source the plain
+/// after-residual-call marker from the codewrite-time fallthrough-marker twin,
+/// retaining runtime resume-marker derivation as the fallback for twin-`None`
+/// rows. Enable with `PYRE_M73_ARMARKER_CARRY=1`.
+pub(crate) fn m73_armarker_carry_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M73_ARMARKER_CARRY") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => false,
+    })
+}
+
 /// `PYRE_M73_ENTRY_CARRY` (#73 entry-carry E1, default ON): source a plain
 /// portal loop-header walk's entry coordinate from the codewrite-time sidecar.
 pub(crate) fn m73_entry_carry_enabled() -> bool {
@@ -11455,7 +11470,39 @@ fn walker_capture_snapshot_for_last_guard_impl(
                         Some(call_py_pc) => jc
                             .payload
                             .after_residual_call_resume_pc_for(call_py_pc as usize),
-                        None => jc.payload.resume_jitcode_pc_for(py_pc as usize),
+                        None => {
+                            let legacy = jc.payload.resume_jitcode_pc_for(py_pc as usize);
+                            if m73_marker_audit_enabled() {
+                                let twin = jc.payload.after_residual_marker_for_jitcode_pc(op_pc);
+                                match legacy {
+                                    Some(m) => match twin {
+                                        Some(t) if t == m => eprintln!(
+                                            "M73_ARMARKER eq=1 py_pc={} op_pc={} m={}",
+                                            py_pc, op_pc, m
+                                        ),
+                                        Some(t) => eprintln!(
+                                            "M73_ARMARKER eq=0 py_pc={} op_pc={} m={} twin={}",
+                                            py_pc, op_pc, m, t
+                                        ),
+                                        None => eprintln!(
+                                            "M73_ARMARKER eq=notwin py_pc={} op_pc={} m={}",
+                                            py_pc, op_pc, m
+                                        ),
+                                    },
+                                    None => eprintln!(
+                                        "M73_ARMARKER eq=nomarker py_pc={} op_pc={}",
+                                        py_pc, op_pc
+                                    ),
+                                }
+                            }
+                            if m73_armarker_carry_enabled() {
+                                jc.payload
+                                    .after_residual_marker_for_jitcode_pc(op_pc)
+                                    .or(legacy)
+                            } else {
+                                legacy
+                            }
+                        }
                     }
                 };
                 match marker {

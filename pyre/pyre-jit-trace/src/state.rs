@@ -12229,6 +12229,8 @@ mod tests {
                 depth_trivia_pred_by_jit_pc: vec![(0, Some(2))],
                 resume_marker_marker_by_jit_pc: Vec::new(),
                 resume_marker_pred_by_jit_pc: vec![(0, Some(0))],
+                after_residual_marker_marker_by_jit_pc: Vec::new(),
+                after_residual_marker_pred_by_jit_pc: Vec::new(),
                 depth_at_py_pc: vec![2],
                 result_color_at_pc: Vec::new(),
                 portal_frame_reg: 0,

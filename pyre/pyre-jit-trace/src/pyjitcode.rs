@@ -171,6 +171,13 @@ pub struct PyJitCodeMetadata {
     /// the tiers stay separate. Empty for skeleton / portal-bridge / fixture.
     pub resume_marker_marker_by_jit_pc: Vec<(usize, Option<usize>)>,
     pub resume_marker_pred_by_jit_pc: Vec<(usize, Option<usize>)>,
+    /// task#73 S5 phase-2: after-residual fallthrough-marker twin with the
+    /// same exact-marker / predecessor-op-start split as the resume-marker
+    /// twin. Each value additionally applies the tracer's semantic
+    /// fallthrough rule after skipping Python trivia. Empty for skeleton /
+    /// portal-bridge / fixture.
+    pub after_residual_marker_marker_by_jit_pc: Vec<(usize, Option<usize>)>,
+    pub after_residual_marker_pred_by_jit_pc: Vec<(usize, Option<usize>)>,
     /// Post-regalloc Ref-bank color of the call-result operand-stack slot
     /// (top of stack = `depth_at_py_pc[pc] - 1`) at each Python PC, or
     /// `u16::MAX` where the stack is empty. The inline multiframe capture
@@ -684,6 +691,24 @@ impl PyJitCode {
         Self::predecessor_index(search).and_then(|i| pred[i].1)
     }
 
+    /// task#73 S5 phase-2: codewrite-time after-residual fallthrough marker
+    /// keyed by a JitCode byte offset, resolved with the SAME two tiers as
+    /// `python_pc_for_jitcode_pc`: an EXACT marker match first (block-head
+    /// precedence), else a PREDECESSOR scan of the op-start table (markers
+    /// excluded).
+    pub fn after_residual_marker_for_jitcode_pc(&self, jit_pc: usize) -> Option<usize> {
+        let marker = &self.metadata.after_residual_marker_marker_by_jit_pc;
+        let pred = &self.metadata.after_residual_marker_pred_by_jit_pc;
+        if marker.is_empty() && pred.is_empty() {
+            return None;
+        }
+        if let Ok(i) = marker.binary_search_by_key(&jit_pc, |&(off, _)| off) {
+            return marker[i].1;
+        }
+        let search = pred.binary_search_by_key(&jit_pc, |&(off, _)| off);
+        Self::predecessor_index(search).and_then(|i| pred[i].1)
+    }
+
     /// task#50 #73-core: whether the trivia depth twin carries entries. `false`
     /// for skeleton / portal-bridge / fixture installs where both tiers are
     /// empty. The audit uses this to distinguish an in-table `None` (overshoot,
@@ -879,6 +904,8 @@ impl PyJitCode {
                 depth_trivia_pred_by_jit_pc: Vec::new(),
                 resume_marker_marker_by_jit_pc: Vec::new(),
                 resume_marker_pred_by_jit_pc: Vec::new(),
+                after_residual_marker_marker_by_jit_pc: Vec::new(),
+                after_residual_marker_pred_by_jit_pc: Vec::new(),
                 depth_at_py_pc: Vec::new(),
                 result_color_at_pc: Vec::new(),
                 // u16::MAX sentinel mirrors `canonical_bridge::install_portal_for`
