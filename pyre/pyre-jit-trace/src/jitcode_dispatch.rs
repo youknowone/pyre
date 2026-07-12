@@ -9594,10 +9594,12 @@ pub(crate) fn m73_marker_carry_enabled() -> bool {
     })
 }
 
-/// `PYRE_M73_S1MARKER_CARRY` (#73 S5 phase-3 slice-1, default OFF): source
+/// `PYRE_M73_S1MARKER_CARRY` (#73 S5 phase-3 slice-1, default ON): source
 /// the remaining nonbranch guard resume words from the codewrite-time
 /// jitcode-keyed resume-marker twin. Twin-`None` rows retain the sentinel.
-/// Enable with any value other than `0`/`false`.
+/// Certified by the `M73_S1MARKER` census (100% eq=1, 1575 captures across
+/// 119 bench+synth programs) and check.py (161×2, on and off). Disable with
+/// `PYRE_M73_S1MARKER_CARRY=0`.
 pub(crate) fn m73_s1marker_carry_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M73_S1MARKER_CARRY") {
@@ -9605,7 +9607,7 @@ pub(crate) fn m73_s1marker_carry_enabled() -> bool {
             let v = v.to_string_lossy();
             v != "0" && !v.eq_ignore_ascii_case("false")
         }
-        None => false,
+        None => true,
     })
 }
 
