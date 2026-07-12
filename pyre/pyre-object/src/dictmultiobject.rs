@@ -1443,16 +1443,19 @@ pub unsafe fn w_module_dict_getitem_str(obj: PyObjectRef, key: &str) -> Option<P
 ///
 /// A module dict's authoritative storage is reached only behind raw
 /// pointers — the `dstorage` cell map, the post-`switch_to_object_strategy`
-/// `object_storage`, and the `mstrategy.caches` cell registry — none of
-/// which are inline `gc_ptr_offsets`.  The W_ModuleDictObject is
-/// currently `malloc_typed` (Box-immortal), so its registered
-/// `module_dict_object_custom_trace` never fires; without an explicit
-/// walk, `LOAD_GLOBAL` (`w_module_dict_getitem_str`, which reads the
-/// authoritative `dstorage` cell map ahead of the proxy back-mirror)
-/// would observe relocated values through never-forwarded slots.
-/// `walk_pyframe_roots` calls this for every live frame's globals and
-/// builtins so the real storage stays forwarded across collection.
-/// No-op for non-module dicts.
+/// `object_storage`, the `mstrategy.caches` cell registry, and the
+/// `dict_storage_proxy` str-key back-mirror — none of which are inline
+/// `gc_ptr_offsets`.  The W_ModuleDictObject is currently `malloc_typed`
+/// (Box-immortal), so its registered `module_dict_object_custom_trace`
+/// never fires; without an explicit walk, `LOAD_GLOBAL`
+/// (`w_module_dict_getitem_str`, which reads the authoritative `dstorage`
+/// cell map ahead of the proxy back-mirror) would observe relocated values
+/// through never-forwarded slots.  The proxy independently caches aliased
+/// copies of the value pointers and is read *ahead* of `dstorage` by
+/// `w_module_dict_items_inner`, so it must be forwarded too or a relocation
+/// leaves it handing out a reclaimed slot.  `walk_pyframe_roots` calls this
+/// for every live frame's globals and builtins so the real storage stays
+/// forwarded across collection.  No-op for non-module dicts.
 ///
 /// `visitor` receives each movable value slot; `walk_module_value_slot`
 /// unwraps `MutableCell`s (themselves Box-immortal) to forward the inner
@@ -1489,6 +1492,12 @@ pub unsafe fn w_module_dict_walk_gc_cells(
     if !md.mstrategy.is_null() {
         (*md.mstrategy).walk_cache_cells(visitor);
     }
+    // The `dict_storage_proxy` caches aliased copies of the value pointers
+    // in an off-GC value block and is read ahead of `dstorage` by
+    // `w_module_dict_items_inner`.  Forward those copies too, or a minor
+    // collection that relocates a value leaves the proxy handing out a
+    // dangling pointer to a reclaimed slot.
+    maybe_walk_dict_storage(md.dict_storage_proxy, visitor);
 }
 
 /// `celldict.py:106-126 delitem` (str path).
@@ -2331,6 +2340,7 @@ type NamespaceStoreHook = unsafe fn(*mut u8, &str, PyObjectRef);
 type NamespaceDeleteHook = unsafe fn(*mut u8, &str);
 type NamespaceLookupHook = unsafe fn(*mut u8, &str) -> Option<PyObjectRef>;
 type NamespaceItemsHook = unsafe fn(*mut u8) -> Vec<(String, PyObjectRef)>;
+type NamespaceWalkHook = unsafe fn(*mut u8, &mut dyn FnMut(&mut PyObjectRef));
 
 struct AtomicHookPtr(std::sync::atomic::AtomicPtr<NamespaceStoreHook>);
 
@@ -2404,10 +2414,28 @@ impl AtomicItemsHookPtr {
     }
 }
 
+struct AtomicWalkHookPtr(std::sync::atomic::AtomicPtr<NamespaceWalkHook>);
+
+impl AtomicWalkHookPtr {
+    const fn new() -> Self {
+        Self(std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()))
+    }
+
+    fn store(&self, hook: NamespaceWalkHook) {
+        let raw = crate::lltype::malloc_raw(hook);
+        self.0.store(raw, std::sync::atomic::Ordering::Release);
+    }
+
+    fn load(&self, order: std::sync::atomic::Ordering) -> *const NamespaceWalkHook {
+        self.0.load(order) as *const NamespaceWalkHook
+    }
+}
+
 static DICT_STORAGE_STORE_HOOK: AtomicHookPtr = AtomicHookPtr::new();
 static DICT_STORAGE_DELETE_HOOK: AtomicDeleteHookPtr = AtomicDeleteHookPtr::new();
 static DICT_STORAGE_LOOKUP_HOOK: AtomicLookupHookPtr = AtomicLookupHookPtr::new();
 static DICT_STORAGE_ITEMS_HOOK: AtomicItemsHookPtr = AtomicItemsHookPtr::new();
+static DICT_STORAGE_WALK_HOOK: AtomicWalkHookPtr = AtomicWalkHookPtr::new();
 
 /// Register the interpreter-level hook that writes (name, value) into a
 /// DictStorage. Called once during interpreter startup.
@@ -2439,6 +2467,32 @@ pub fn register_dict_storage_lookup_hook(hook: NamespaceLookupHook) {
 /// entry not yet mirrored into the W_DictObject.
 pub fn register_dict_storage_items_hook(hook: NamespaceItemsHook) {
     DICT_STORAGE_ITEMS_HOOK.store(hook);
+}
+
+/// Register the interpreter-level hook that forwards every movable
+/// `PyObjectRef` value slot held in a DictStorage's off-GC value block.
+/// Called once during interpreter startup so a module dict's
+/// `dict_storage_proxy` — which caches aliased copies of the value
+/// pointers and is read ahead of the authoritative `dstorage` cell map —
+/// keeps those copies forwarded across a minor collection instead of
+/// stranding them at a reclaimed pre-move address.
+pub fn register_dict_storage_walk_hook(hook: NamespaceWalkHook) {
+    DICT_STORAGE_WALK_HOOK.store(hook);
+}
+
+/// Forward the value slots of a `DictStorage` proxy through `visitor`.
+/// No-op when `ns_ptr` is null or the walk hook has not been registered
+/// (the hookless case fires for direct `w_module_new` callers and unit
+/// tests before `register_dict_storage_walk_hook` runs).
+unsafe fn maybe_walk_dict_storage(ns_ptr: *mut u8, visitor: &mut dyn FnMut(&mut PyObjectRef)) {
+    if ns_ptr.is_null() {
+        return;
+    }
+    let ptr = DICT_STORAGE_WALK_HOOK.load(std::sync::atomic::Ordering::Acquire);
+    if ptr.is_null() {
+        return;
+    }
+    (*ptr)(ns_ptr, visitor);
 }
 
 /// Read-side counterpart of `maybe_sync_dict_storage_store`: enumerate

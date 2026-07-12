@@ -2146,6 +2146,20 @@ pub fn install_dict_storage_hooks() {
             let ns = &*(ns_ptr as *const crate::DictStorage);
             ns.entries().map(|(k, v)| (k.to_string(), *v)).collect()
         });
+        pyre_object::dictmultiobject::register_dict_storage_walk_hook(|ns_ptr, forward| unsafe {
+            let ns = &mut *(ns_ptr as *mut crate::DictStorage);
+            let value_slots: Vec<*mut PyObjectRef> = ns
+                .values_mut()
+                .iter_mut()
+                .map(|value| value as *mut PyObjectRef)
+                .collect();
+            for slot in value_slots {
+                forward(&mut *slot);
+            }
+            if let Some(slot) = ns.mirror_target_slot_mut() {
+                forward(slot);
+            }
+        });
     });
 }
 
