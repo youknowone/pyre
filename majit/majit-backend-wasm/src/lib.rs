@@ -54,7 +54,9 @@ fn diag_bump(i: usize) {
 // A source token is compiled before a later guard may become a CA bridge.
 // Freeze modest room for that bridge at first compilation; a later trace that
 // exceeds either bound is declined rather than changing the live frame's
-// offsets. Fib's bridge needs about 20 positional slots and 8 homes.
+// offsets. The fib CA path measured raw maxima of 9 positional slots and 15
+// Ref homes, but that is not a bridge fail-arg census for the full suite; keep
+// both existing floors until such a census establishes smaller safe bounds.
 const FROZEN_CHAIN_VALUE_SLOTS: usize = 32;
 const FROZEN_CHAIN_REF_HOMES: usize = 16;
 
@@ -569,6 +571,8 @@ pub extern "C" fn wasm_jit_write_barrier(obj: i64) -> i64 {
 /// frame's interior as a smaller frame's slots.
 pub extern "C" fn wasm_jit_ca_alloc_frame(frame_bytes: i64, gcmap_ptr: i64) -> i64 {
     use majit_backend::jitframe::JitFrame;
+    assert!(frame_bytes >= 0);
+    assert_eq!(frame_bytes as usize % std::mem::size_of::<isize>(), 0);
     let depth = frame_bytes as usize / std::mem::size_of::<isize>();
     // Slice A1: collecting nursery allocation, matching rewrite.py's
     // `gen_malloc_nursery_varsize_frame`. The caller frame remains rooted at
@@ -647,6 +651,14 @@ fn build_callee_gcmap(
         indices.push((frame.home_slot_base as usize + h * 8) / sign);
     }
     let max_index = indices.iter().copied().max().unwrap_or(0);
+    // `wasm_jit_ca_alloc_frame` sets `jf_frame` from `ca_frame_bytes`, not the
+    // full geometry. Inputs and homes must therefore fit that actual item
+    // allocation; fail/deopt outputs live in the low value slots and are
+    // covered by the same bound.
+    debug_assert!(
+        max_index < frame.ca_frame_bytes as usize / sign,
+        "CA gcmap exceeds the allocated JitFrame item area"
+    );
     let num_words = max_index / bits_per_word + 1;
     let mut buf = vec![0usize; 1 + num_words];
     buf[0] = num_words;
@@ -1242,12 +1254,13 @@ impl majit_backend::Backend for WasmBackend {
         let alloc_array_fn_ptr = wasm_jit_alloc_array as *const () as usize as i64;
         let wb_fn_ptr = wasm_jit_write_barrier as *const () as usize as i64;
         // Freeze this token's generated frame layout at first compilation.
-        // `jitframe.py` sizes native JitFrames as `JITFRAME_FIXED_SIZE +
-        // frame_depth`; wasm CA frames follow the same per-token depth instead
-        // of inheriting the host arena's call-area floor.
+        // Every geometry retains its tail call area for later bridges. CA
+        // callee frames use only the homes prefix (`ca_frame_bytes`) below.
+        let raw_frame_value_slots = codegen::frame_value_slots(inputargs, ops);
+        let raw_num_ref_homes = codegen::count_ref_homes(inputargs, ops);
         let frame = codegen::FrameGeometry::compact(
-            codegen::frame_value_slots(inputargs, ops).max(FROZEN_CHAIN_VALUE_SLOTS),
-            codegen::count_ref_homes(inputargs, ops).max(FROZEN_CHAIN_REF_HOMES),
+            raw_frame_value_slots.max(FROZEN_CHAIN_VALUE_SLOTS),
+            raw_num_ref_homes.max(FROZEN_CHAIN_REF_HOMES),
         );
         // Exit indices come from the global fail-index space so a cross-trace
         // chain's `frame[0]` resolves regardless of which module wrote it
@@ -1900,7 +1913,10 @@ impl majit_backend::Backend for WasmBackend {
                 Box::leak(build_callee_gcmap(&source_input_types, source_frame)).as_ptr() as i64;
             codegen::CaParams {
                 emit_ca: true,
-                callee_frame_bytes: source_frame.frame_bytes,
+                // `compile_bridge`'s trampoline-decline floor above guarantees
+                // no trampoline-lowered op executes on this movable CA callee
+                // frame, so its tail call area is never touched.
+                callee_frame_bytes: source_frame.ca_frame_bytes,
                 loop_finish_fi: source_loop_finish_fi,
                 deopt_helper_slot: ca_deopt_helper_slot(),
                 source_compiled_ptr,
@@ -1910,7 +1926,7 @@ impl majit_backend::Backend for WasmBackend {
                 ca_reload_caller_fn_ptr: wasm_jit_ca_reload_caller_frame as *const () as usize
                     as i64,
                 callee_gcmap_ptr,
-                inline: ca_inline_params(source_frame.frame_bytes),
+                inline: ca_inline_params(source_frame.ca_frame_bytes),
             }
         } else {
             codegen::CaParams {
@@ -2247,24 +2263,10 @@ impl majit_backend::Backend for WasmBackend {
             .downcast_ref::<CompiledWasmLoop>()
             .expect("not CompiledWasmLoop");
 
-        // Allocate frame area large enough for slots + call trampoline area +
-        // the Ref-home region. MIN_FRAME_BYTES accommodates the call area at
-        // offset 2000+; the Ref-home region (`codegen::HOME_SLOT_BASE`) follows
-        // it, one slot per Ref value live across a collecting call
-        // (`num_ref_homes`).
-        let min_slots = codegen::MIN_FRAME_BYTES / 8;
-        let base_slots = min_slots.max(1 + compiled.max_output_slots.max(compiled.num_inputs));
-        // +1 for the resume-at-LABEL dispatch-key slot (codegen::DISPATCH_KEY_OFS
-        // = MIN_FRAME_BYTES, slot `min_slots`), which sits between the call area
-        // and the Ref-home region (now at HOME_SLOT_BASE = MIN_FRAME_BYTES + 8).
-        // `vec![0i64]` zeroes it, so a fresh host entry reads key 0 (preamble).
-        //
-        // The host/arena allocation deliberately retains its historical floor:
-        // any token may run here. Generated code, however, addresses only the
-        // compact offsets frozen on `compiled.frame`; all chained bridges use
-        // that same geometry or are declined at compile time.
-        let _ = base_slots;
-        let frame_size = min_slots.max((compiled.frame.frame_bytes as usize).div_ceil(8));
+        // Host entry allocates the complete frozen geometry, including the tail
+        // call area. Chained bridges share these exact offsets; only CA callee
+        // frames use the smaller homes prefix (`ca_frame_bytes`).
+        let frame_size = (compiled.frame.frame_bytes as usize).div_ceil(8);
         #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
         {
             let _ = (frame_size, args);

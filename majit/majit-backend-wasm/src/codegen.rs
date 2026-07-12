@@ -33,14 +33,8 @@ const SLOT_SIZE: u64 = 8;
 /// (al, ah, bl, bh, mid1).
 const UMULHI_SCRATCH: u32 = 5;
 
-/// Call area layout (fixed offsets from frame_ptr).
+/// Call area layout in the historical fixed frame geometry.
 const CALL_RESULT_OFS: u64 = 2000;
-/// First frame *slot* index occupied by the fixed call area. Frame value slots
-/// (inputs at entry, fail-arg spills at guard exit) occupy `[1, 1 + max(num
-/// inputs, max fail args))`; they must stay below this index, or they clobber
-/// the call area and — past `HOME_SLOT_BASE` — the Ref-home region. A trace that
-/// would exceed it is declined in `build_wasm_module`.
-pub const CALL_AREA_FIRST_SLOT: u64 = CALL_RESULT_OFS / SLOT_SIZE;
 const CALL_FUNC_OFS: u64 = 2008;
 const CALL_NARGS_OFS: u64 = 2016;
 const CALL_ARGS_OFS: u64 = 2024;
@@ -48,14 +42,14 @@ const CALL_ARGS_OFS: u64 = 2024;
 /// Minimum frame allocation size in bytes to accommodate the call area.
 pub const MIN_FRAME_BYTES: usize = 2024 + 16 * 8; // 16 max call args
 
-/// Per-token layout of a wasm execution frame.  Host entry frames retain the
-/// historical [`MIN_FRAME_BYTES`] allocation floor, but generated code and CA
-/// nursery frames use these offsets.  This mirrors `jitframe.py`'s
-/// `JITFRAME_FIXED_SIZE + frame_depth`: a frame carries the slots its token
-/// actually needs, rather than a backend-wide slot floor.
+/// Per-token layout of a wasm execution frame.  Every frozen geometry carries
+/// the host-trampoline call area, so a later chained bridge can use it without
+/// changing its source token's frame offsets.  CA callee frames alone allocate
+/// the prefix ending after the Ref homes; the tail is protected by the
+/// trampoline-decline floor in `compile_bridge`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameGeometry {
-    /// Number of data slots before the call trampoline (including frame[0]).
+    /// Number of value slots before the dispatch key (including frame[0]).
     pub value_slots: usize,
     /// Byte offset of the call trampoline result word.
     pub call_result_ofs: u64,
@@ -68,7 +62,11 @@ pub struct FrameGeometry {
     pub home_slot_base: u64,
     /// Number of Ref-home slots the layout reserves.
     pub home_slots: usize,
-    /// Bytes in the JitFrame item area required by this layout.
+    /// Bytes through the end of Ref homes. CA callee frames allocate exactly
+    /// this many item bytes; the tail call area is intentionally omitted.
+    pub ca_frame_bytes: u32,
+    /// Full bytes in the frame layout, including the tail call area. Host entry
+    /// frames and every chained bridge use this geometry and allocation size.
     pub frame_bytes: u32,
 }
 
@@ -87,22 +85,26 @@ impl FrameGeometry {
             dispatch_key_ofs: DISPATCH_KEY_OFS,
             home_slot_base: HOME_SLOT_BASE,
             home_slots: 0,
+            ca_frame_bytes: HOME_SLOT_BASE as u32,
             frame_bytes: (MIN_FRAME_BYTES + SLOT_SIZE as usize) as u32,
         }
     }
 
-    /// Compact geometry for one token.  `value_slots` includes frame[0], so
-    /// the call area begins immediately after the greatest positional input or
-    /// fail-arg slot used by that token.
+    /// Compact frozen geometry for one token:
+    /// `[value slots | dispatch key | Ref homes | call area]`.
+    /// `value_slots` includes frame[0].  The trailing call area is always
+    /// present, even for direct-only source traces, because later bridges are
+    /// compiled against this immutable geometry.
     pub fn compact(value_slots: usize, home_slots: usize) -> Self {
         let value_slots = value_slots.max(1);
-        let call_result_ofs = (value_slots as u64) * SLOT_SIZE;
+        let dispatch_key_ofs = (value_slots as u64) * SLOT_SIZE;
+        let home_slot_base = dispatch_key_ofs + SLOT_SIZE;
+        let ca_frame_bytes = home_slot_base + home_slots as u64 * SLOT_SIZE;
+        let call_result_ofs = ca_frame_bytes;
         let call_func_ofs = call_result_ofs + SLOT_SIZE;
         let call_nargs_ofs = call_func_ofs + SLOT_SIZE;
         let call_args_ofs = call_nargs_ofs + SLOT_SIZE;
-        let dispatch_key_ofs = call_result_ofs + Self::CALL_AREA_SLOTS as u64 * SLOT_SIZE;
-        let home_slot_base = dispatch_key_ofs + SLOT_SIZE;
-        let frame_bytes = home_slot_base + home_slots as u64 * SLOT_SIZE;
+        let frame_bytes = call_result_ofs + Self::CALL_AREA_SLOTS as u64 * SLOT_SIZE;
         Self {
             value_slots,
             call_result_ofs,
@@ -112,6 +114,7 @@ impl FrameGeometry {
             dispatch_key_ofs,
             home_slot_base,
             home_slots,
+            ca_frame_bytes: ca_frame_bytes as u32,
             frame_bytes: frame_bytes as u32,
         }
     }
@@ -125,18 +128,17 @@ impl FrameGeometry {
 /// then the trace reloads the live Ref locals from their homes — making object
 /// movement transparent without rooting Refs that never cross a collection.
 ///
-/// Placed past the call area so it never overlaps the fail-index / input /
-/// output slots (which sit below the call area at offset 2000) or the call
-/// trampoline area. Inert while `wasm_jit_alloc` is no-collect (epic B): the
+/// In compact geometries this region follows the dispatch key and precedes the
+/// trailing call area. Inert while `wasm_jit_alloc` is no-collect (epic B): the
 /// extra stores write a region nothing reads until the allocator collects.
 pub const HOME_SLOT_BASE: u64 = MIN_FRAME_BYTES as u64 + SLOT_SIZE;
 
-/// Resume-at-LABEL dispatch key (one reserved frame slot, between the call
-/// area and the Ref-home region). 0 = preamble/host entry (the `vec![0i64]`
+/// Historical fixed-geometry resume-at-LABEL dispatch key (one reserved frame
+/// slot, between the call area and the Ref-home region). 0 = preamble/host entry (the `vec![0i64]`
 /// frame is always 0 here on a fresh `execute_token`); non-zero = a
 /// loop-closing bridge re-entering a single-label peeled loop at its LABEL,
-/// skipping the preamble. Distinct from every value/fail-arg slot (< 2000) and
-/// the call trampoline (2000..2152); homes follow it at `HOME_SLOT_BASE`.
+/// skipping the preamble. Compact geometries derive this offset from their
+/// value-slot count and put the call area after the homes.
 pub const DISPATCH_KEY_OFS: u64 = MIN_FRAME_BYTES as u64;
 const _: () = assert!(HOME_SLOT_BASE == DISPATCH_KEY_OFS + SLOT_SIZE);
 
@@ -1067,10 +1069,13 @@ pub struct CaParams {
     /// into the source loop). Only set by `compile_bridge` for a self-recursive
     /// single-int bridge; `compile_loop` never sets it.
     pub emit_ca: bool,
-    /// Bytes to reserve per callee frame (the GC `JitFrame`'s data region, i.e.
-    /// its Signed item area). Sized for the SOURCE loop, widened to also fit THIS
-    /// bridge (which reuses the frame when the loop's guard-exit chains back into
-    /// it). The alloc trampoline derives the JitFrame item count from it.
+    /// Bytes to reserve per CA callee frame (the GC `JitFrame`'s data region,
+    /// i.e. its Signed item area). This is the source geometry's prefix through
+    /// the Ref homes, excluding its tail call area. The trampoline-decline
+    /// floor in `WasmBackend::compile_bridge` (`source_ca_active &&
+    /// bridge_has_trampoline_calls`) guarantees that no trampoline-lowered op
+    /// runs on this movable frame, so the omitted tail is unreachable. The alloc
+    /// trampoline derives the JitFrame item count from this exact byte count.
     pub callee_frame_bytes: u32,
     /// `fail_index` the SOURCE loop's DoneWithThisFrame Finish writes to frame[0]
     /// on the base-case return. The CA arm treats this — or this bridge's own
@@ -1213,11 +1218,10 @@ pub fn build_wasm_module(
     let bridge_dispatch = cells_base != 0;
 
     // Frame value slots (inputs at entry, fail-arg spills at guard exit) occupy
-    // `[1, 1 + max(num inputs, max fail args))`. They sit below the fixed call
-    // area and the Ref-home region, which are at constant offsets; a trace whose
-    // value slots would reach the call area must be declined, or those stores
-    // silently clobber the call trampoline / home roots. (Pre-existing for the
-    // call area; the home region inherits the same bound.)
+    // `[1, 1 + max(num inputs, max fail args))`. They precede the dispatch key,
+    // Ref homes, and the always-present tail call area; a chained bridge must
+    // fit the source token's frozen value-slot count before it can share that
+    // frame.
     let max_fail_args = guards
         .iter()
         .map(|g| g.fail_arg_refs.len())
@@ -1258,17 +1262,11 @@ pub fn build_wasm_module(
     // geometry.  `compile_bridge` rejects a bridge that needs more slots, so
     // no global floor or speculative slack is needed here.
 
-    // A ref-storing store needs the `jit_call` import for its write barrier,
-    // even when the trace has no `New*`/CALL of its own. The CA arm needs it too
-    // for the callee-frame GC-alloc / shadow-stack-pop trampolines (an emit_ca
-    // bridge always materializes its callee frame via NewWithVtable, so this is
-    // already true in practice — stated explicitly for robustness).
-    let needs_call = has_call_ops(ops) || has_ref_store_op(ops, &ref_values) || ca.emit_ca;
-    // The shared indirect-function table is imported for `jit_call`'s residual
-    // dispatch, the epilogue's bridge `call_indirect`, and the CA arm's
-    // self-recursive `call_indirect`.
-    let needs_table = needs_call || bridge_dispatch || ca.emit_ca;
-
+    // This exact lowering census controls the host-trampoline import. Direct
+    // residual helpers, including the CA arm's inline fast path, use
+    // `call_indirect` and need no import, although their frozen frame still
+    // keeps the tail call area for future bridges.
+    let needs_call = has_trampoline_calls(inputargs, ops, ca.emit_ca);
     // In-module residual calls (`WASM_DIRECT_RESIDUAL_CALL`): the largest
     // eligible `(i64×n)->i64` arity in this trace — residual CALLs (word
     // result or word-ABI void) plus the `New*` / write-barrier helper
@@ -1297,6 +1295,9 @@ pub fn build_wasm_module(
     } else {
         None
     };
+    // The shared indirect-function table backs direct residual helpers as well
+    // as host-trampoline dispatch, chained bridges, and CA recursion.
+    let needs_table = needs_call || bridge_dispatch || residual_max_arity.is_some() || ca.emit_ca;
     // `ca.emit_ca` forces the direct helper family to include arities 0..=2,
     // so all CA frame-helper trampoline `else` arms below are baseline-only.
     debug_assert!(!ca.emit_ca || residual_max_arity.is_some());
@@ -4383,5 +4384,21 @@ fn emit_unary_vi(
         emit_resolve(sink, constants, op.arg(0).to_opref());
         suffix(sink);
         sink.local_set(1 + vi);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compact_geometry_keeps_tail_call_area_out_of_ca_prefix() {
+        let frame = FrameGeometry::compact(32, 16);
+        assert_eq!(frame.dispatch_key_ofs, 32 * SLOT_SIZE);
+        assert_eq!(frame.home_slot_base, 33 * SLOT_SIZE);
+        assert_eq!(frame.ca_frame_bytes, 392);
+        assert_eq!(frame.call_result_ofs, frame.ca_frame_bytes as u64);
+        assert_eq!(frame.call_args_ofs, 416);
+        assert_eq!(frame.frame_bytes, 544);
     }
 }
