@@ -66,6 +66,9 @@ pub struct Nursery {
     /// Heap-allocated free/top pointers. The Box ensures stable addresses
     /// that the JIT can hardcode into compiled code.
     ptrs: Box<NurseryPtrs>,
+    /// llarena.py mode-3 parity: poison recycled nursery bytes so tests
+    /// expose allocation paths that incorrectly rely on zero-filled memory.
+    poison_on_reset: bool,
 }
 
 // Safety: The nursery owns its memory exclusively and only one thread accesses it.
@@ -83,7 +86,13 @@ impl Nursery {
         }
         let top = unsafe { start.add(size) };
         let ptrs = Box::new(NurseryPtrs { free: start, top });
-        Nursery { start, size, ptrs }
+        let poison_on_reset = std::env::var_os("MAJIT_GC_NURSERY_POISON").is_some();
+        Nursery {
+            start,
+            size,
+            ptrs,
+            poison_on_reset,
+        }
     }
 
     /// incminimark.py:676-680 malloc_fixedsize parity:
@@ -115,22 +124,15 @@ impl Nursery {
     /// incminimark.py:1946 parity: reset nursery after minor collection.
     ///   self.nursery_free = self.nursery
     ///
-    /// PRE-EXISTING-ADAPTATION: the full-nursery zeroing below has no
-    /// upstream counterpart — incminimark's reset is `arena_reset(prev,
-    /// ..., 0)` (incminimark.py:1938; llarena.py:334 mode 0 = "don't fill
-    /// with zeroes") with `malloc_zero_filled = False` (incminimark.py:211),
-    /// each allocation initializing its own fields ("fully initialized,
-    /// but not zero-filled", incminimark.py:960).  pyre allocation paths
-    /// (Rust constructors and JIT inline New*) currently assume
-    /// zero-filled nursery memory for fields they do not write, i.e. the
-    /// system behaves as `malloc_zero_filled = True`.  Convergence path:
-    /// audit every alloc site for assumed-zero fields (add explicit field
-    /// init / `zero_gc_pointers_inside` equivalents), then drop this
-    /// `write_bytes` — it costs one full-nursery memset per minor
-    /// collection (~4.5% of nbody).
+    /// incminimark.py:211/1938 parity: `malloc_zero_filled = False` and
+    /// `arena_reset(..., 0)` leave recycled bytes untouched; allocation
+    /// sites initialize their own GC-pointer fields.  Poison mode mirrors
+    /// llarena.py mode 3 for detecting violations of that contract.
     pub fn reset(&mut self) {
-        unsafe {
-            ptr::write_bytes(self.start, 0, self.size);
+        if self.poison_on_reset {
+            unsafe {
+                ptr::write_bytes(self.start, 0xAA, self.size);
+            }
         }
         self.ptrs.free = self.start;
     }
@@ -207,6 +209,14 @@ impl Nursery {
     #[inline]
     pub fn contains(&self, addr: usize) -> bool {
         addr >= self.start as usize && addr < (self.start as usize + self.size)
+    }
+
+    /// Whether recycled nursery bytes are filled with the llarena-style
+    /// uninitialized-memory poison.  This is cached at nursery construction so
+    /// traced-slot checks do not consult the environment during collection.
+    #[inline]
+    pub(crate) fn poison_enabled(&self) -> bool {
+        self.poison_on_reset
     }
 }
 

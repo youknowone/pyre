@@ -3308,6 +3308,10 @@ impl<'a> AssemblerARM64<'a> {
             OpCode::CondCallGcWb | OpCode::CondCallGcWbArray => {
                 self.emit_write_barrier_fastpath(op, &arglocs);
             }
+            // aarch64/opassembler.py:755 emit_op_zero_array.  This is a
+            // result-less operation, but it is the initialization contract
+            // for NEW_ARRAY_CLEAR when malloc_zero_filled=false.
+            OpCode::ZeroArray => self.genop_discard_zero_array(op, arglocs),
             // ── Misc ──
             OpCode::ForceToken => {
                 if let Some(Loc::Reg(r)) = result_loc {
@@ -6858,37 +6862,123 @@ impl<'a> AssemblerARM64<'a> {
 
     /// ZERO_ARRAY: zero a range in an array.
     /// arg(0)=base, arg(1)=start, arg(2)=size, arg(3)=scale_start, arg(4)=scale_size.
-    fn genop_discard_zero_array(&mut self, op: &Op) {
-        let (base_size, _) = op
+    fn genop_discard_zero_array(&mut self, op: &Op, arglocs: &[Loc]) {
+        let [base_loc, start_loc, size_loc, ..] = arglocs else {
+            panic!("ZERO_ARRAY expects five regalloc locations, got {arglocs:?}");
+        };
+        if matches!(size_loc, Loc::Immed(i) if i.value == 0) {
+            return;
+        }
+        let (base_size, item_size) = op
             .with_array_descr(|ad| (ad.base_size() as i64, ad.item_size() as i64))
             .unwrap_or((8, 8));
 
         let scale_start = self.resolve_const_or(op.arg(3).to_opref(), 1);
         let scale_size = self.resolve_const_or(op.arg(4).to_opref(), 1);
-        let memset_ptr = libc::memset as *const () as i64;
 
-        // byte_offset = base_size + start * scale_start
-        // byte_length = size * scale_size
-        self.load_arg_to_rax(op.arg(0).to_opref()); // base
-        self.load_arg_to_rcx(op.arg(1).to_opref()); // start
-
-        if scale_start != 1 {
-            self.emit_mov_imm64(2, scale_start);
-            dynasm!(self.mc ; .arch aarch64 ; mul x1, x1, x2);
+        // aarch64/opassembler.py:755-839: first compute the byte destination
+        // in ip0/x16.  ip0/ip1 are never managed by regalloc.
+        self.regalloc_mov(base_loc, &Loc::Reg(crate::aarch64::registers::X16));
+        if let Loc::Immed(start) = start_loc {
+            let byte_offset = base_size + start.value * scale_start;
+            if byte_offset != 0 {
+                if (0..4096).contains(&byte_offset) {
+                    dynasm!(self.mc ; .arch aarch64 ; add x16, x16, byte_offset as u32);
+                } else {
+                    self.emit_mov_imm64(17, byte_offset);
+                    dynasm!(self.mc ; .arch aarch64 ; add x16, x16, x17);
+                }
+            }
+        } else {
+            self.regalloc_mov(start_loc, &Loc::Reg(crate::aarch64::registers::X17));
+            if scale_start != 1 {
+                self.emit_mov_imm64(2, scale_start);
+                dynasm!(self.mc ; .arch aarch64 ; mul x17, x17, x2);
+            }
+            if (0..4096).contains(&base_size) {
+                dynasm!(self.mc ; .arch aarch64
+                    ; add x16, x16, x17
+                    ; add x16, x16, base_size as u32
+                );
+            } else {
+                self.emit_mov_imm64(2, base_size);
+                dynasm!(self.mc ; .arch aarch64
+                    ; add x16, x16, x17
+                    ; add x16, x16, x2
+                );
+            }
         }
-        dynasm!(self.mc ; .arch aarch64
-            ; add x0, x0, base_size as u32
-            ; add x0, x0, x1
-            ; str x0, [sp, #-16]!               // save dest
-        );
-        self.load_arg_to_rax(op.arg(2).to_opref());
+
+        let natural_size = if item_size & 1 != 0 {
+            1
+        } else if item_size & 2 != 0 {
+            2
+        } else if item_size & 4 != 0 {
+            4
+        } else {
+            8
+        };
+        let constant_start = matches!(start_loc, Loc::Immed(_));
+        let limit = if natural_size < 8 && constant_start {
+            8
+        } else {
+            natural_size
+        };
+        let constant_bytes = match size_loc {
+            Loc::Immed(size) => Some(size.value * scale_size),
+            _ => None,
+        };
+
+        if let Some(total_size) = constant_bytes.filter(|size| *size >= 0 && *size <= 14 * limit) {
+            // aarch64/opassembler.py:796-835 — inline STRB/STRH/STRW/STR.
+            // For a constant byte start, group naturally aligned runs into
+            // eight-byte stores exactly as upstream does.
+            let start_byte = match start_loc {
+                Loc::Immed(start) => start.value * scale_start,
+                _ => -1,
+            };
+            let mut next_group = -1;
+            if natural_size < 8 && start_byte >= 0 {
+                next_group = (-start_byte) & 7;
+            }
+            let mut i = 0;
+            let mut dst_i = 0;
+            while i < total_size {
+                let mut size = natural_size;
+                if i == next_group {
+                    next_group += 8;
+                    if next_group <= total_size {
+                        size = 8;
+                        if dst_i % 8 != 0 {
+                            dynasm!(self.mc ; .arch aarch64 ; add x16, x16, dst_i as u32);
+                            dst_i = 0;
+                        }
+                    }
+                }
+                let offset = dst_i as u32;
+                match size {
+                    8 => dynasm!(self.mc ; .arch aarch64 ; str xzr, [x16, offset]),
+                    4 => dynasm!(self.mc ; .arch aarch64 ; str wzr, [x16, offset]),
+                    2 => dynasm!(self.mc ; .arch aarch64 ; strh wzr, [x16, offset]),
+                    _ => dynasm!(self.mc ; .arch aarch64 ; strb wzr, [x16, offset]),
+                }
+                i += size;
+                dst_i += size;
+            }
+            return;
+        }
+
+        // Residual non-collecting call.  Regalloc has already applied its
+        // normal `before_call(SAVE_DEFAULT_REGS)` policy, so no blanket
+        // jitframe save/restore is needed here.
+        let memset_ptr = libc::memset as *const () as i64;
+        self.regalloc_mov(size_loc, &Loc::Reg(crate::aarch64::registers::X2));
         if scale_size != 1 {
             self.emit_mov_imm64(1, scale_size);
-            dynasm!(self.mc ; .arch aarch64 ; mul x0, x0, x1);
+            dynasm!(self.mc ; .arch aarch64 ; mul x2, x2, x1);
         }
         dynasm!(self.mc ; .arch aarch64
-            ; mov x2, x0                         // byte_length
-            ; ldr x0, [sp], #16                  // dest
+            ; mov x0, x16                        // dest
             ; mov x1, 0
             ; stp x29, x30, [sp, #-16]!
         );

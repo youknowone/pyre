@@ -2520,6 +2520,22 @@ impl GcRewriterImpl {
                     &[st.last_malloced_ref.clone(), prev_size_ref],
                 );
                 let r = st.emit_result(incr_op, result_pos);
+                // rewrite.py:914-918 initializes every batched object's
+                // Signed-sized HDR.tid word.  pyre splits that word into a
+                // 32-bit type id and 32-bit flags, so gen_initialize_tid's
+                // narrow store cannot clear poison/stale flags.  The first
+                // object is cleared by CallMallocNursery's backend fast path;
+                // clear the flags half of each interior header here.  This
+                // must stay specific to NurseryPtrIncrement: the first result
+                // can come from an old-gen slow path whose TRACK_YOUNG_PTRS
+                // flag gen_initialize_tid intentionally preserves.
+                let flags_ofs = st.const_int(-(std::mem::size_of::<u32>() as i64));
+                let zero = st.const_int(0);
+                let word32 = st.const_int(std::mem::size_of::<u32>() as i64);
+                st.emit(mk_op(
+                    OpCode::GcStore,
+                    &[r.clone(), flags_ofs, zero, word32],
+                ));
                 st.previous_size = size;
                 st.last_malloced_ref = r.clone();
                 st.remember_wb(&r);
@@ -3797,12 +3813,14 @@ mod tests {
             round_up(24 + header) as i64
         );
 
-        // Both should have tid initialisation.
+        // Both have tid initialisation; the interior allocation also clears
+        // the flags half of its header because NurseryPtrIncrement bypasses
+        // the backend's CallMallocNursery header clear.
         let tid_stores: Vec<_> = result
             .iter()
             .filter(|o| o.opcode == OpCode::GcStore)
             .collect();
-        assert_eq!(tid_stores.len(), 2);
+        assert_eq!(tid_stores.len(), 3);
         assert_eq!(
             tid_stores[0]
                 .arg(2)
@@ -3812,13 +3830,29 @@ mod tests {
             1
         ); // first type_id
         assert_eq!(
-            tid_stores[1]
+            tid_stores[2]
                 .arg(2)
                 .to_opref()
                 .inline_const_bits()
                 .expect("inline ConstInt"),
             2
         ); // second type_id
+        assert_eq!(
+            tid_stores[1]
+                .arg(1)
+                .to_opref()
+                .inline_const_bits()
+                .expect("inline ConstInt"),
+            -(std::mem::size_of::<u32>() as i64)
+        );
+        assert_eq!(
+            tid_stores[1]
+                .arg(2)
+                .to_opref()
+                .inline_const_bits()
+                .expect("inline ConstInt"),
+            0
+        );
     }
 
     // ── Test 7: A collecting operation between two NEWs prevents batching ──

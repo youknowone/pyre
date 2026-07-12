@@ -1329,11 +1329,11 @@ impl DynasmBackend {
                 // even though the aarch64 backend has a native
                 // `genop_load_effective_address` lowering.
                 supports_load_effective_address: supports_load_effective_address(),
-                // nursery.rs:68 `alloc_zeroed` + nursery.rs:105-110
-                // `reset` memset-to-zero on recycle mean the nursery
-                // payload is always zero-filled at allocation time;
-                // `clear_gc_fields` short-circuits per rewrite.py:499-500.
-                malloc_zero_filled: true,
+                // incminimark.py:211 `malloc_zero_filled = False`:
+                // clear_gc_fields / clear_varsize_gc_fields emit only the
+                // per-object GC-pointer initialization required by
+                // rewrite.py:498-535.
+                malloc_zero_filled: false,
                 // gc.py:39 `self.memcpy_fn = memcpy_fn` cast through
                 // `cast_ptr_to_adr` + `cast_adr_to_int` (rewrite.py:1046-1047).
                 memcpy_fn: majit_ir::memcpy_fn_addr(),

@@ -4359,6 +4359,11 @@ impl<'a> Assembler386<'a> {
             OpCode::CondCallGcWb | OpCode::CondCallGcWbArray => {
                 self.emit_write_barrier_fastpath(op, &arglocs);
             }
+            // x86/assembler.py:2694 genop_discard_zero_array.  The GC
+            // rewriter leaves ZERO_ARRAY in the stream and mutates its range
+            // after observing following SETARRAYITEM_GC stores; it must reach
+            // codegen even though it has no result.
+            OpCode::ZeroArray => self.genop_discard_zero_array(op, arglocs),
             // ── Misc ──
             OpCode::ForceToken => {
                 if let Some(Loc::Reg(r)) = result_loc {
@@ -8735,44 +8740,102 @@ impl<'a> Assembler386<'a> {
 
     /// ZERO_ARRAY: zero a range in an array.
     /// arg(0)=base, arg(1)=start, arg(2)=size, arg(3)=scale_start, arg(4)=scale_size.
-    fn genop_discard_zero_array(&mut self, op: &Op) {
+    fn genop_discard_zero_array(&mut self, op: &Op, arglocs: &[Loc]) {
+        let [base_loc, start_loc, size_loc, ..] = arglocs else {
+            panic!("ZERO_ARRAY expects five regalloc locations, got {arglocs:?}");
+        };
+        if matches!(size_loc, Loc::Immed(i) if i.value == 0) {
+            return;
+        }
         let (base_size, _) = op
             .with_array_descr(|ad| (ad.base_size() as i64, ad.item_size() as i64))
             .unwrap_or((8, 8));
 
         let scale_start = self.resolve_const_or(op.arg(3).to_opref(), 1);
         let scale_size = self.resolve_const_or(op.arg(4).to_opref(), 1);
-        let memset_ptr = libc::memset as *const () as i64;
 
-        // byte_offset = base_size + start * scale_start
-        // byte_length = size * scale_size
-        self.load_arg_to_rax(op.arg(0).to_opref()); // base
-        self.load_arg_to_rcx(op.arg(1).to_opref()); // start
-
-        if scale_start != 1 {
-            dynasm!(self.mc ; .arch x64 ; imul rcx, rcx, scale_start as i32);
+        // x86/regalloc.py:1436-1503 + assembler.py:2694-2725.  Materialize
+        // the effective address in r11, PyPy's reserved x86-64 scratch GPR.
+        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+        self.regalloc_mov(base_loc, &Loc::Reg(crate::regloc::X86_64_SCRATCH_REG));
+        match start_loc {
+            Loc::Reg(start) => match scale_start {
+                1 => {
+                    dynasm!(self.mc ; .arch x64 ; lea Rq(scratch), [Rq(scratch) + Rq(start.value) + base_size as i32])
+                }
+                2 => {
+                    dynasm!(self.mc ; .arch x64 ; lea Rq(scratch), [Rq(scratch) + Rq(start.value) * 2 + base_size as i32])
+                }
+                4 => {
+                    dynasm!(self.mc ; .arch x64 ; lea Rq(scratch), [Rq(scratch) + Rq(start.value) * 4 + base_size as i32])
+                }
+                8 => {
+                    dynasm!(self.mc ; .arch x64 ; lea Rq(scratch), [Rq(scratch) + Rq(start.value) * 8 + base_size as i32])
+                }
+                _ => panic!("ZERO_ARRAY invalid start scale {scale_start}"),
+            },
+            Loc::Immed(start) => {
+                let offset = base_size + start.value * scale_start;
+                dynasm!(self.mc ; .arch x64 ; add Rq(scratch), offset as i32);
+            }
+            Loc::Frame(start) => {
+                let offset = start.ebp_loc.value;
+                dynasm!(self.mc ; .arch x64
+                    ; imul rax, [rbp + offset], scale_start as i32
+                    ; add Rq(scratch), rax
+                    ; add Rq(scratch), base_size as i32
+                );
+            }
+            other => panic!("ZERO_ARRAY expected GPR/frame/immediate start, got {other:?}"),
         }
-        dynasm!(self.mc ; .arch x64
-            ; add rax, DWORD base_size as i32
-            ; add rax, rcx
-            ; push rax                           // save dest
-        );
-        self.load_arg_to_rax(op.arg(2).to_opref()); // size
+
+        if let Loc::Immed(bytes) = size_loc {
+            let nbytes = bytes.value * scale_size;
+            if (0..=16 * 8).contains(&nbytes) {
+                let xmm = crate::regloc::X86_64_XMM_SCRATCH_REG.value;
+                let mut cleared = false;
+                let mut offset = 0;
+                while offset < nbytes {
+                    let remaining = nbytes - offset;
+                    let current = if remaining >= 16 {
+                        if !cleared {
+                            dynasm!(self.mc ; .arch x64 ; xorps Rx(xmm), Rx(xmm));
+                            cleared = true;
+                        }
+                        dynasm!(self.mc ; .arch x64 ; movups [Rq(scratch) + offset as i32], Rx(xmm));
+                        16
+                    } else if remaining >= 8 {
+                        dynasm!(self.mc ; .arch x64 ; mov QWORD [Rq(scratch) + offset as i32], 0);
+                        8
+                    } else if remaining >= 4 {
+                        dynasm!(self.mc ; .arch x64 ; mov DWORD [Rq(scratch) + offset as i32], 0);
+                        4
+                    } else if remaining >= 2 {
+                        dynasm!(self.mc ; .arch x64 ; mov WORD [Rq(scratch) + offset as i32], 0);
+                        2
+                    } else {
+                        dynasm!(self.mc ; .arch x64 ; mov BYTE [Rq(scratch) + offset as i32], 0);
+                        1
+                    };
+                    offset += current;
+                }
+                return;
+            }
+        }
+
+        // Large/non-constant residual call.  Regalloc has already run the
+        // backend's ordinary non-collecting `before_call` preservation.
+        let memset_ptr = libc::memset as *const () as i64;
+        self.regalloc_mov(size_loc, &Loc::Reg(crate::regloc::EDX));
         if scale_size != 1 {
-            dynasm!(self.mc ; .arch x64 ; imul rax, rax, scale_size as i32);
+            dynasm!(self.mc ; .arch x64 ; imul rdx, rdx, scale_size as i32);
         }
         // memset(dest, 0, byte_length)
-        dynasm!(self.mc ; .arch x64
-            ; mov rdx, rax                       // byte_length
-            ; pop rax                            // dest
-            ; push rbp
-        );
         self.emit_abi_int_arg_from_reg(2, 2);
         self.emit_abi_int_arg_from_imm(1, 0);
-        self.emit_abi_int_arg_from_reg(0, 0);
+        self.emit_abi_int_arg_from_reg(0, scratch);
         dynasm!(self.mc ; .arch x64 ; mov rax, QWORD memset_ptr);
-        self.emit_abi_call_rax_after_one_push();
-        dynasm!(self.mc ; .arch x64 ; pop rbp);
+        self.emit_abi_call_rax();
     }
 
     // ================================================================

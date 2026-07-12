@@ -703,11 +703,25 @@ fn build_object_descr_group_with_def_path(
             .collect();
         // descr.py:123-126 precompute both lists; `gc_fielddescrs` is
         // `all_fielddescrs(only_gc=True)` per heaptracker.py:94-95.
-        let gc_fielddescrs: Vec<Arc<dyn FieldDescr>> = all_fielddescrs
+        let mut gc_fielddescrs: Vec<Arc<dyn FieldDescr>> = all_fielddescrs
             .iter()
             .filter(|fd| fd.is_pointer_field())
             .cloned()
             .collect();
+        // descr.py:121-126 + heaptracker.py:94-95: gc_fielddescrs walks
+        // the complete GC struct, including inherited fields.  Every
+        // runtime object group built here embeds PyObject, whose `w_class`
+        // is a GC reference even when the leaf field list only names the
+        // concrete payload (for example W_IntObject.intval).  Keep the
+        // leaf-only all_fielddescrs indexing used by OptVirtualize, but add
+        // the inherited header edge to the allocation-clear census unless
+        // a group already declared that offset explicitly.
+        if !gc_fielddescrs
+            .iter()
+            .any(|fd| fd.offset() == pyre_object::pyobject::W_CLASS_OFFSET)
+        {
+            gc_fielddescrs.push(new_w_class_field_descr());
+        }
         // `descr.py:108-118 get_size_descr` cache key — `path_hash`로
         // 만들어진 lltype-object identity.  Prefer the canonical
         // *def-path* qualifier (PyPy's `lltype.Struct` identity has
@@ -1700,7 +1714,12 @@ use pyre_object::functional::{
     RANGE_ITER_CURRENT_OFFSET, RANGE_ITER_REMAINING_OFFSET, RANGE_ITER_STEP_OFFSET,
 };
 use pyre_object::interp_exceptions::{
-    EXC_ARGS_W_OFFSET, EXC_KIND_COUNT, EXC_KIND_OFFSET, EXC_W_CONTEXT_OFFSET, ExcKind,
+    EXC_ARGS_W_OFFSET, EXC_KIND_COUNT, EXC_KIND_OFFSET, EXC_W_ATTR_OBJ_OFFSET, EXC_W_CAUSE_OFFSET,
+    EXC_W_CODE_OFFSET, EXC_W_CONTEXT_OFFSET, EXC_W_DICT_OFFSET, EXC_W_ENCODING_OFFSET,
+    EXC_W_END_OFFSET, EXC_W_ERRNO_OFFSET, EXC_W_FILENAME_OFFSET, EXC_W_FILENAME2_OFFSET,
+    EXC_W_IMPORT_MSG_OFFSET, EXC_W_IMPORT_NAME_FROM_OFFSET, EXC_W_IMPORT_PATH_OFFSET,
+    EXC_W_NAME_OFFSET, EXC_W_OBJECT_OFFSET, EXC_W_REASON_OFFSET, EXC_W_START_OFFSET,
+    EXC_W_STRERROR_OFFSET, EXC_W_TRACEBACK_OFFSET, ExcKind, W_BASE_EXCEPTION_GC_PTR_OFFSETS,
     W_BASE_EXCEPTION_SIZE, exc_kind_to_pytype,
 };
 use pyre_object::intobject::W_IntObject;
@@ -1723,7 +1742,7 @@ use pyre_object::{FLOAT_TYPE, INT_TYPE};
 /// field read on the common PyObject header.
 ///
 /// Mutable because __class__ assignment can change it.
-pub fn w_class_descr() -> DescrRef {
+fn new_w_class_field_descr() -> Arc<dyn FieldDescr> {
     // Named "w_class" so `FieldDescr::is_w_class()` recognises the
     // header field; OptVirtualize must resolve it from the object's
     // class identity rather than indexing it against a virtual's value
@@ -1741,6 +1760,10 @@ pub fn w_class_descr() -> DescrRef {
         parent_descr: None,
         ei_index: AtomicU32::new(u32::MAX),
     })
+}
+
+pub fn w_class_descr() -> DescrRef {
+    new_w_class_field_descr()
 }
 
 /// Alias for backward compatibility — same as w_class_descr().
@@ -2211,6 +2234,174 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
                 false,
             ),
+            // The runtime flattens the subclass-specific exception fields
+            // onto W_BaseException and its TypeInfo traces every one of them.
+            // Keep them in gc_fielddescrs so rewrite.py:498-504 emits the
+            // delayed NULL stores required by malloc_zero_filled=false.  They
+            // follow the four optimizer-visible fields above so the stable
+            // kind/w_class/args_w/w_context indices do not change.
+            (
+                "W_BaseException.w_cause",
+                EXC_W_CAUSE_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "W_BaseException.w_traceback",
+                EXC_W_TRACEBACK_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "W_BaseException.w_object",
+                EXC_W_OBJECT_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "W_BaseException.w_start",
+                EXC_W_START_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "W_BaseException.w_end",
+                EXC_W_END_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "W_BaseException.w_reason",
+                EXC_W_REASON_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "W_BaseException.w_encoding",
+                EXC_W_ENCODING_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "W_BaseException.w_errno",
+                EXC_W_ERRNO_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "W_BaseException.w_strerror",
+                EXC_W_STRERROR_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "W_BaseException.w_filename",
+                EXC_W_FILENAME_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "W_BaseException.w_filename2",
+                EXC_W_FILENAME2_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "W_BaseException.w_code",
+                EXC_W_CODE_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "W_BaseException.w_exc_name",
+                EXC_W_NAME_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "W_BaseException.w_attr_obj",
+                EXC_W_ATTR_OBJ_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "W_BaseException.w_import_path",
+                EXC_W_IMPORT_PATH_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "W_BaseException.w_import_name_from",
+                EXC_W_IMPORT_NAME_FROM_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "W_BaseException.w_import_msg",
+                EXC_W_IMPORT_MSG_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "W_BaseException.w_dict",
+                EXC_W_DICT_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
         ],
         // Empty name: the per-kind vtable means a shared "W_BaseException"
         // name-registry slot would be first-write-wins and lose the other
@@ -2414,6 +2605,33 @@ pub fn pyframe_f_backref_descr() -> DescrRef {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pyobject_size_descrs_include_inherited_w_class_gc_field() {
+        let descr = w_int_size_descr();
+        let size = descr.as_size_descr().expect("W_IntObject SizeDescr");
+        assert!(
+            size.gc_fielddescrs()
+                .iter()
+                .any(|fd| fd.offset() == W_CLASS_OFFSET),
+            "malloc_zero_filled=False requires the inherited PyObject.w_class edge"
+        );
+    }
+
+    #[test]
+    fn exception_size_descr_clears_every_runtime_traced_gc_field() {
+        let (descr, _, _, _) = w_exception_descrs(ExcKind::ValueError);
+        let size = descr.as_size_descr().expect("W_BaseException SizeDescr");
+        let mut actual: Vec<usize> = size.gc_fielddescrs().iter().map(|fd| fd.offset()).collect();
+        actual.sort_unstable();
+        actual.dedup();
+
+        let mut expected = W_BASE_EXCEPTION_GC_PTR_OFFSETS.to_vec();
+        expected.push(W_CLASS_OFFSET);
+        expected.sort_unstable();
+        expected.dedup();
+        assert_eq!(actual, expected);
+    }
 
     #[test]
     fn test_field_descr_indices_are_stable_and_distinct() {

@@ -1595,6 +1595,33 @@ impl MiniMarkGC {
         GcRef(new_obj_addr)
     }
 
+    /// llarena debug-fill parity: a GC-visible slot containing the nursery
+    /// poison is an uninitialized reference, not an unmanaged pointer to skip.
+    /// Check before nursery-range filtering so poison mode fails closed at the
+    /// trace site and identifies the exact holder and slot.
+    #[inline]
+    fn assert_traced_slot_initialized(
+        &self,
+        field_ref: GcRef,
+        slot_addr: usize,
+        holder_addr: usize,
+        site: &str,
+    ) {
+        const NURSERY_POISON_WORD: usize = (usize::MAX / 0xff) * 0xaa;
+        if self.nursery.poison_enabled() && field_ref.0 == NURSERY_POISON_WORD {
+            let holder_type_id = if holder_addr == 0 {
+                None
+            } else {
+                Some(unsafe { (*header_of(holder_addr)).type_id() })
+            };
+            let holder_offset = slot_addr.checked_sub(holder_addr);
+            panic!(
+                "GC BUG: traced slot contains nursery poison at slot_addr={:#x} holder_addr={:#x} holder_type_id={:?} holder_offset={:?} site={}",
+                slot_addr, holder_addr, holder_type_id, holder_offset, site,
+            );
+        }
+    }
+
     /// incminimark.py:2145-2263 `_trace_drag_out` + :2128-2143
     /// `_trace_drag_out1_marking_phase`, for a nursery object reached
     /// through a *root* slot during minor collection.
@@ -1611,6 +1638,7 @@ impl MiniMarkGC {
     /// here (matching `_trace_drag_out1` vs `_trace_drag_out1_marking_phase`).
     #[inline]
     fn drag_out_root(&mut self, gcref: &mut GcRef) {
+        self.assert_traced_slot_initialized(*gcref, gcref as *mut GcRef as usize, 0, "minor_root");
         if !self.is_nursery_object_start(gcref.0) || self.pinned_objects.contains(&gcref.0) {
             return;
         }
@@ -1641,6 +1669,12 @@ impl MiniMarkGC {
             unsafe {
                 trace_fn(obj_addr, &mut |slot_ptr: *mut GcRef| {
                     let field_ref = *slot_ptr;
+                    self.assert_traced_slot_initialized(
+                        field_ref,
+                        slot_ptr as usize,
+                        obj_addr,
+                        "minor_custom_trace",
+                    );
                     if self.is_nursery_object_start(field_ref.0) {
                         let new_ref = self.copy_nursery_object(field_ref.0);
                         *slot_ptr = new_ref;
@@ -1661,6 +1695,12 @@ impl MiniMarkGC {
         for &offset in &gc_ptr_offsets {
             let slot = (obj_addr + offset) as *mut GcRef;
             let field_ref = unsafe { *slot };
+            self.assert_traced_slot_initialized(
+                field_ref,
+                slot as usize,
+                obj_addr,
+                "minor_fixed_field",
+            );
             if self.is_nursery_object_start(field_ref.0) {
                 let new_ref = self.copy_nursery_object(field_ref.0);
                 unsafe {
@@ -1676,6 +1716,12 @@ impl MiniMarkGC {
             for i in 0..length {
                 let slot = (items_start + i * item_size) as *mut GcRef;
                 let field_ref = unsafe { *slot };
+                self.assert_traced_slot_initialized(
+                    field_ref,
+                    slot as usize,
+                    obj_addr,
+                    "minor_varsize_item",
+                );
                 if self.is_nursery_object_start(field_ref.0) {
                     let new_ref = self.copy_nursery_object(field_ref.0);
                     unsafe {
@@ -2704,6 +2750,12 @@ impl MiniMarkGC {
                             for i in interval_start..interval_stop {
                                 let slot = (items_start + i * item_size) as *mut GcRef;
                                 let field_ref = unsafe { *slot };
+                                self.assert_traced_slot_initialized(
+                                    field_ref,
+                                    slot as usize,
+                                    obj,
+                                    "minor_dirty_card_item",
+                                );
                                 if self.is_nursery_object_start(field_ref.0) {
                                     let new_ref = self.copy_nursery_object(field_ref.0);
                                     unsafe {

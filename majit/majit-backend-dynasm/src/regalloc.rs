@@ -3008,7 +3008,10 @@ impl<'a> RegAlloc<'a> {
             {
                 self.consider_setarrayitem_j2(args[0], args[1], args[2], i, output);
             }
-            OpCode::ZeroArray | OpCode::Strsetitem | OpCode::Unicodesetitem if args.len() >= 3 => {
+            OpCode::ZeroArray if args.len() >= 3 => {
+                self.consider_zero_array_j2(args, op, i, output);
+            }
+            OpCode::Strsetitem | OpCode::Unicodesetitem if args.len() >= 3 => {
                 self.consider_discard_3args_j2(args, i, output);
             }
             OpCode::Copystrcontent | OpCode::Copyunicodecontent => {
@@ -3267,9 +3270,7 @@ impl<'a> RegAlloc<'a> {
             OpCode::SetinteriorfieldGc | OpCode::SetinteriorfieldRaw => {
                 self.consider_setinteriorfield(op, i, output);
             }
-            OpCode::ZeroArray => {
-                self.consider_discard_3args(op, i, output);
-            }
+            OpCode::ZeroArray => self.consider_zero_array(op, i, output),
             OpCode::Strsetitem | OpCode::Unicodesetitem => {
                 self.consider_discard_3args(op, i, output);
             }
@@ -5936,6 +5937,108 @@ impl<'a> RegAlloc<'a> {
         for &arg in args {
             let tp = self.tp(arg);
             locs.push(self.make_sure_var_in_reg(arg, tp, args, None, false));
+        }
+        self.perform_discard(i, locs, output);
+    }
+
+    /// Select the inline-store or residual-memset ZERO_ARRAY path using the
+    /// same per-backend limits as upstream.  x86/regalloc.py:1436-1503 does
+    /// this split in regalloc; aarch64/opassembler.py:755-839 does it while
+    /// emitting, but the residual call still needs `before_call` here so only
+    /// live caller-saved registers are preserved.
+    fn zero_array_uses_memset(&self, op: &Op) -> bool {
+        let size = op.arg(2).to_opref();
+        if !size.is_constant() {
+            return true;
+        }
+        let mut size = self.const_value(size);
+        let scale = op.arg(4).to_opref();
+        if !scale.is_constant() {
+            return true;
+        }
+        size *= self.const_value(scale);
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            // x86/regalloc.py:1451 — 16 eight-byte chunks.
+            !(0..=16 * 8).contains(&size)
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            // aarch64/opassembler.py:796-812 — choose the natural STR width
+            // from the array item size.  A constant start permits aligned
+            // runs of eight-byte STRs even for byte/halfword/word arrays.
+            let item_size = op.with_array_descr(|ad| ad.item_size() as i64).unwrap_or(8);
+            let item_size = if item_size & 1 != 0 {
+                1
+            } else if item_size & 2 != 0 {
+                2
+            } else if item_size & 4 != 0 {
+                4
+            } else {
+                8
+            };
+            let start_is_constant = op.arg(1).to_opref().is_constant();
+            let limit = if item_size < 8 && start_is_constant {
+                8
+            } else {
+                item_size
+            };
+            size < 0 || size > 14 * limit
+        }
+    }
+
+    fn preserve_for_zero_array_memset(&mut self) {
+        let type_index = OpTypeIndex::from_parts(
+            self.inputargs,
+            self.operations,
+            &self.inputarg_pos,
+            &self.op_pos,
+        );
+        self.rm.before_call(
+            &[],
+            SAVE_DEFAULT_REGS,
+            &mut self.longevity,
+            &mut self.fm,
+            &mut self.pending_moves,
+            &type_index,
+        );
+        self.xrm.before_call(
+            &[],
+            SAVE_DEFAULT_REGS,
+            &mut self.longevity,
+            &mut self.fm,
+            &mut self.pending_moves,
+            &type_index,
+        );
+    }
+
+    fn consider_zero_array(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
+        let args: Vec<OpRef> = op.getarglist().iter().map(|a| a.to_opref()).collect();
+        let mut locs = Vec::with_capacity(args.len());
+        for &arg in &args {
+            locs.push(self.make_sure_var_in_reg(arg, self.tp(arg), &args, None, false));
+        }
+        if self.zero_array_uses_memset(op) {
+            self.preserve_for_zero_array_memset();
+        }
+        self.perform_discard(i, locs, output);
+    }
+
+    fn consider_zero_array_j2(
+        &mut self,
+        args: &[OpRef],
+        op: &Op,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        let mut locs = Vec::with_capacity(args.len());
+        for &arg in args {
+            locs.push(self.make_sure_var_in_reg(arg, self.tp(arg), args, None, false));
+        }
+        if self.zero_array_uses_memset(op) {
+            self.preserve_for_zero_array_memset();
         }
         self.perform_discard(i, locs, output);
     }

@@ -8149,11 +8149,11 @@ impl CraneliftBackend {
             // at the IR level), so the rewriter takes the single-LEA
             // path (rewrite.py:1083-1088).
             supports_load_effective_address: true,
-            // nursery.rs:68 `alloc_zeroed` + nursery.rs:105-110 `reset`
-            // memset-to-zero on recycle mean the nursery payload is
-            // always zero-filled at allocation time; `clear_gc_fields`
-            // thus short-circuits per rewrite.py:499-500.
-            malloc_zero_filled: true,
+            // incminimark.py:211 `malloc_zero_filled = False`:
+            // clear_gc_fields / clear_varsize_gc_fields emit only the
+            // per-object GC-pointer initialization required by
+            // rewrite.py:498-535.
+            malloc_zero_filled: false,
             // gc.py:39 `self.memcpy_fn = memcpy_fn` cast through
             // `cast_ptr_to_adr` + `cast_adr_to_int` (rewrite.py:1046-1047).
             memcpy_fn: majit_ir::memcpy_fn_addr(),
@@ -12104,6 +12104,16 @@ impl CraneliftBackend {
                     for (i, &(var_idx, _)) in live_refs.iter().enumerate() {
                         builder.def_var(var(var_idx), params[2 + i]);
                     }
+                    // jitframe.py:105-116: the custom tracer reads jf_gcmap
+                    // even though it is a raw Ptr(GCMAP), not one of the five
+                    // GCREF/forward fields explicitly cleared by
+                    // rewrite.py:641-650.  PyPy's unusual varsize-frame
+                    // allocation starts this pointer as NULL; recycled nursery
+                    // bytes do not.  Initialize it before publishing the frame.
+                    let zero_gcmap = builder.ins().iconst(cl_types::I64, 0);
+                    builder
+                        .ins()
+                        .store(MemFlags::trusted(), zero_gcmap, result, JF_GCMAP_OFS);
                     builder.def_var(var(vi), result);
                 }
 
@@ -16460,29 +16470,31 @@ impl majit_backend::Backend for CraneliftBackend {
     fn bh_new_with_vtable(&self, sizedescr: &majit_translate::jitcode::BhDescr) -> i64 {
         let size = sizedescr.as_size();
         let vtable = sizedescr.get_vtable();
-        let ptr = match with_cranelift_gc(|gc| {
-            // TODO: same cache-key/gc-tid conflation
-            // as `bh_new`; truncate `as u32` until gc_cache routing.
-            gc.alloc_nursery_typed(sizedescr.get_type_id() as u32, size)
-                .0 as i64
-        }) {
-            Some(p) => p,
-            None => {
-                let layout = std::alloc::Layout::from_size_align(size, 8)
-                    .unwrap_or(std::alloc::Layout::new::<u8>());
-                unsafe { std::alloc::alloc_zeroed(layout) as i64 }
-            }
+        let type_id = sizedescr.get_type_id() as u32;
+        // resume.py direct-reader materialization retains raw pointers across
+        // the forward blackhole run.  Match Dynasm's bh_new_with_vtable:
+        // typed virtuals are born zero-filled in non-moving oldgen.  The old
+        // Cranelift nursery path exposed recycled poison in omitted fields
+        // (W_LongObject.w_class and PyFrame's fixed fields) and could also
+        // stale the materialized pointer at the next minor collection.
+        let ptr = if type_id != 0 {
+            with_cranelift_gc(|gc| gc.alloc_oldgen_typed(type_id, size).0 as *mut u8)
+                .unwrap_or(std::ptr::null_mut())
+        } else {
+            let layout = std::alloc::Layout::from_size_align(size, 8)
+                .unwrap_or(std::alloc::Layout::new::<u8>());
+            unsafe { std::alloc::alloc_zeroed(layout) }
         };
         // llmodel.py:780-782: if self.vtable_offset is not None:
         //   self.write_int_at_mem(res, self.vtable_offset, WORD, sizedescr.get_vtable())
         if let Some(vt_off) = self.vtable_offset {
-            if vtable != 0 && ptr != 0 {
+            if vtable != 0 && !ptr.is_null() {
                 unsafe {
                     *((ptr as *mut u8).add(vt_off) as *mut usize) = vtable;
                 }
             }
         }
-        ptr
+        ptr as i64
     }
 
     /// llmodel.py:788-790 bh_new_array / bh_new_array_clear.
