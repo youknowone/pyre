@@ -1005,6 +1005,10 @@ impl MIFrame {
             unsafe { &*(self.concrete_frame_addr as *const pyre_interpreter::pyframe::PyFrame) };
         let w_globals = frame.get_w_globals();
         if w_globals.is_null() {
+            // Cannot probe a null globals dict for membership; classify
+            // conservatively as a module-global read, like the
+            // `concrete_frame_addr == 0` path above.
+            crate::trace::set_trace_reads_module_global(true);
             return;
         }
         if crate::state::module_dict_cell_slot_direct(w_globals, name).is_some() {

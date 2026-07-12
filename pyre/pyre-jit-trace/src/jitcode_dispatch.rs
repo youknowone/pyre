@@ -19079,6 +19079,12 @@ fn mark_trace_reads_module_global_from_code(
     w_code_ptr: usize,
     name_idx: usize,
 ) -> bool {
+    // A null globals dict cannot be probed for membership; report unresolved so
+    // the caller takes the conservative fallback, matching
+    // `mark_trace_reads_module_global_from_frame_name`.
+    if w_globals.is_null() {
+        return false;
+    }
     let Some(name) = (unsafe {
         let raw = pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef)
             as *const pyre_interpreter::CodeObject;
@@ -22639,7 +22645,20 @@ fn handle(
                         // a trace rooted at a *loop header* falls back to
                         // the plain bridge shape.
                         None => match driver.compile_trace_entry_data() {
-                            Some((original_green_key, entry_meta)) => {
+                            Some((original_green_key, mut entry_meta)) => {
+                                // `compile_trace_entry_data` clones the active
+                                // trace metadata, whose `namespace_dependent` is
+                                // only finalized by `finish_trace_namespace_dependency`
+                                // after the walk returns. An entry bridge is
+                                // compiled mid-walk, before that finalize, so a
+                                // trace that has already read a module global
+                                // would otherwise install the bridge with a stale
+                                // `namespace_dependent = false` and let it be
+                                // re-entered after later namespace growth. Fold in
+                                // the live per-trace flag so the bridge keeps the
+                                // conservative namespace gate.
+                                entry_meta.namespace_dependent |=
+                                    crate::trace::trace_reads_module_global();
                                 driver.meta_interp_mut().compile_trace_from_interp(
                                     key,
                                     &live_args,

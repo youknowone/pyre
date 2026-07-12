@@ -1,27 +1,17 @@
 # Regression guard: a compiled hot loop must be re-entered on every call of its
 # enclosing function, not only on the call that compiled it.
 #
-# KNOWN-FAILING on the single-pass walker JIT as of this commit. Not wired into
-# check.py's run list precisely because it currently fails; run it directly:
+# Wired into check.py via run_selfcheck on dynasm + cranelift; skipped on wasm,
+# whose guest has no `time` module. Run it directly:
 #
-#     python pyre/bench/loop_reentry_regression.py                 # PASS (CPython)
-#     target/release/pyre-cranelift pyre/bench/loop_reentry_regression.py   # FAIL
+#     python pyre/bench/loop_reentry_regression.py               # PASS (interpreter)
+#     target/release/pyre-cranelift pyre/bench/loop_reentry_regression.py
 #
-# Root cause: the only path that enters a compiled loop is
-# JitDriver::try_resume_into_compiled_loop (majit/majit-metainterp/src/
-# jitdriver.rs), gated on single_pass_compiled_key, which is set once at
-# CloseLoop compile and consumed by .take(). The #[jit_interp] merge-point
-# expansion (majit/majit-macros/src/jit_interp/mod.rs) calls it only inside
-# `if driver.is_tracing()` on the post-compile snapshot, and its own comment
-# notes "the native back-edges never key the walk's merge-point header, so the
-# compiled inner loop is otherwise unreachable". So the loop is entered exactly
-# once (right after it compiles) and a fresh activation of the same function
-# runs it fully interpreted. back_edge_internal / can_enter_jit_keyed already
-# implement compiled-loop entry but are not wired to the native hot back-edge.
-#
-# Symptom the check detects: call 1 runs the loop compiled (~sub-ns/iter), calls
-# 2+ run it interpreted (~1000 ns/iter). The margin is ~1000x, so the 20x gate
-# is not timing-flaky.
+# The regression it guards: is_compatible refused re-entry once the enclosing
+# module bound a new top-level name and its globals dict grew, so call 1 ran the
+# loop compiled (~sub-ns/iter) while calls 2+ ran it interpreted (~1000 ns/iter)
+# with a per-iteration compiled-entry abort. The ~1000x margin makes the 20x gate
+# below not timing-flaky.
 
 import time
 

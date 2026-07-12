@@ -10122,6 +10122,32 @@ mod tests {
     }
 
     #[test]
+    fn is_compatible_ignores_namespace_length_when_not_namespace_dependent() {
+        // A pure-compute / builtin-only trace does not fold a module global, so
+        // its compiled code is independent of the globals dict: a later
+        // top-level bind (namespace growth) must not refuse re-entry.
+        let state = empty_state();
+        let mut meta = empty_meta();
+        meta.num_locals = state.local_count();
+        meta.namespace_dependent = false;
+        meta.ns_len = state.namespace_len() + 5;
+        assert!(<PyreJitState as JitState>::is_compatible(&state, &meta));
+    }
+
+    #[test]
+    fn is_compatible_enforces_namespace_length_when_namespace_dependent() {
+        // A trace that read a module global keeps the conservative length gate,
+        // since same-key value rebinds are not value-guarded: a namespace-length
+        // mismatch must refuse re-entry.
+        let state = empty_state();
+        let mut meta = empty_meta();
+        meta.num_locals = state.local_count();
+        meta.namespace_dependent = true;
+        meta.ns_len = state.namespace_len() + 5;
+        assert!(!<PyreJitState as JitState>::is_compatible(&state, &meta));
+    }
+
+    #[test]
     fn test_pre_opcode_snapshot_gate_skips_peek_only_and_no_guard_opcodes() {
         let iter_code =
             compile_function_body("def f(xs):\n    for x in xs:\n        return len(xs)\n");
