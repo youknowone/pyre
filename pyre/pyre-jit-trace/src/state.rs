@@ -1000,7 +1000,7 @@ pub(crate) fn sub_jitcode_descr_pool_for_code(code: *const ()) -> Option<SubDesc
 /// `LiveVars` analysis over the Python bytecode. This path is used
 /// for inlined callee frames whose majit_jitcode has not been built
 /// at trace time.
-pub fn frame_value_count_at(jitcode_index: i32, pc: i32, carried_jitcode_pc: i32) -> usize {
+pub fn frame_value_count_at(jitcode_index: i32, pc: i32, _carried_jitcode_pc: i32) -> usize {
     ensure_finish_setup();
     METAINTERP_SD.with(|r| {
         let sd = r.borrow();
@@ -1010,12 +1010,18 @@ pub fn frame_value_count_at(jitcode_index: i32, pc: i32, carried_jitcode_pc: i32
             None => return 0,
         };
         let payload = &jc.payload;
-        // The rd_numb pc word may carry the after-residual-call marker;
-        // `resolve_resume_pc_with_jitcode_pc` prefers the carried direct
-        // JitCode pc (`#124`) when it names a valid startpoint and otherwise
-        // routes the marker through the right map.
-        let resolved_jit_pc: Option<usize> =
-            payload.resolve_resume_pc_with_jitcode_pc(pc, carried_jitcode_pc, sd.op_live);
+        // Post-flip the rd_numb `pc` word is already the JitCode byte offset;
+        // count liveness there directly when it names a valid `-live-`
+        // startpoint, else translate the stored word through the resume map.
+        let resolved_jit_pc: Option<usize> = if pc >= 0
+            && payload
+                .jitcode
+                .can_decode_live_vars(pc as usize, sd.op_live)
+        {
+            Some(pc as usize)
+        } else {
+            payload.resolve_resume_pc(pc)
+        };
         if let Some(jit_pc) = resolved_jit_pc {
             let off = payload.jitcode.get_live_vars_info(jit_pc, sd.op_live);
             let all_liveness: &[u8] = &sd.liveness_info;
