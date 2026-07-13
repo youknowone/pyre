@@ -1481,14 +1481,39 @@ pub fn gc_remove_root(slot: *mut GcRef) {
     });
 }
 
-/// Register an object with an RPython-style finalizer queue on the process GC.
-pub fn gc_register_finalizer(fq_index: usize, obj: GcRef, trigger: FinalizerTriggerFn) {
-    gc_sync::gc_op(|gc| gc.register_finalizer(fq_index, obj, trigger));
+/// rgc.py `FinalizerQueue.register_finalizer` - routed to the active backend GC.
+pub type RegisterFinalizerFn = fn(fq_index: usize, obj: GcRef, trigger: FinalizerTriggerFn);
+/// rgc.py `FinalizerQueue.next_dead` - routed to the active backend GC.
+pub type FinalizerNextDeadFn = fn(fq_index: usize) -> Option<GcRef>;
+
+thread_local! {
+    static ACTIVE_REGISTER_FINALIZER: Cell<Option<RegisterFinalizerFn>> = const { Cell::new(None) };
+    static ACTIVE_FINALIZER_NEXT_DEAD: Cell<Option<FinalizerNextDeadFn>> = const { Cell::new(None) };
 }
 
-/// Pop one object from an RPython-style finalizer death queue.
+/// Install the active backend's finalizer trampolines. Pass `None` to clear.
+pub fn set_active_finalizer_hooks(
+    register: Option<RegisterFinalizerFn>,
+    next_dead: Option<FinalizerNextDeadFn>,
+) {
+    ACTIVE_REGISTER_FINALIZER.with(|c| c.set(register));
+    ACTIVE_FINALIZER_NEXT_DEAD.with(|c| c.set(next_dead));
+}
+
+/// Register an object with an RPython-style finalizer queue on the active GC.
+pub fn gc_register_finalizer(fq_index: usize, obj: GcRef, trigger: FinalizerTriggerFn) {
+    ACTIVE_REGISTER_FINALIZER.with(|c| match c.get() {
+        Some(f) => f(fq_index, obj, trigger),
+        None => gc_sync::gc_op(|gc| gc.register_finalizer(fq_index, obj, trigger)),
+    });
+}
+
+/// Pop one object from the active GC's RPython-style finalizer death queue.
 pub fn gc_fq_next_dead(fq_index: usize) -> Option<GcRef> {
-    gc_sync::gc_op(|gc| gc.finalizer_next_dead(fq_index))
+    ACTIVE_FINALIZER_NEXT_DEAD.with(|c| match c.get() {
+        Some(f) => f(fq_index),
+        None => gc_sync::gc_op(|gc| gc.finalizer_next_dead(fq_index)),
+    })
 }
 
 /// rgc.enable / rgc.disable — toggle automatic major-collection progress

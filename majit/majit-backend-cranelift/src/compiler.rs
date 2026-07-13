@@ -384,6 +384,10 @@ fn install_gc_box(mut gc: Box<dyn GcAllocator>) {
     majit_gc::set_active_gc_owns_object(Some(gc_owns_object_via_active_runtime));
     majit_gc::set_active_gc_id_or_identityhash(Some(id_or_identityhash_via_active_runtime));
     majit_gc::set_active_write_barrier(Some(gc_write_barrier_via_active_runtime));
+    majit_gc::set_active_finalizer_hooks(
+        Some(register_finalizer_via_active_runtime),
+        Some(finalizer_next_dead_via_active_runtime),
+    );
 }
 
 /// Production path: install a `GcHandle` forwarding to the global singleton.
@@ -1552,6 +1556,18 @@ fn collect_full_via_active_runtime() {
 /// it runs no minor, so a Rust-stack nursery PyObjectRef cannot dangle.
 fn collect_oldgen_nonmoving_via_active_runtime() {
     with_cranelift_gc(|gc| gc.collect_oldgen_nonmoving());
+}
+
+fn register_finalizer_via_active_runtime(
+    fq_index: usize,
+    obj: GcRef,
+    trigger: majit_gc::FinalizerTriggerFn,
+) {
+    with_cranelift_gc(|gc| gc.register_finalizer(fq_index, obj, trigger));
+}
+
+fn finalizer_next_dead_via_active_runtime(fq_index: usize) -> Option<GcRef> {
+    with_cranelift_gc(|gc| gc.finalizer_next_dead(fq_index)).flatten()
 }
 
 /// Report `(oldgen_total, nursery_used)` for the interpreter GC safepoint.

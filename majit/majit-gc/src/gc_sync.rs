@@ -71,6 +71,29 @@ static GC_SYNC: GcSync = GcSync {
     stw_generation: AtomicUsize::new(0),
 };
 
+thread_local! {
+    /// > 0 while this thread already holds exclusive GC access via a
+    /// slow-path `gc_op_slow` or a `request_stw` collection. Nested
+    /// `gc_op`/`gc_query` on the same thread then run directly on the
+    /// singleton instead of re-locking the non-reentrant `gc_mutex`.
+    static GATE_HELD_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+struct GateHeldGuard;
+
+impl GateHeldGuard {
+    fn enter() -> Self {
+        GATE_HELD_DEPTH.with(|c| c.set(c.get() + 1));
+        GateHeldGuard
+    }
+}
+
+impl Drop for GateHeldGuard {
+    fn drop(&mut self) {
+        GATE_HELD_DEPTH.with(|c| c.set(c.get() - 1));
+    }
+}
+
 // ──────────────────────────────────────────────────────────────
 // Singleton management
 // ──────────────────────────────────────────────────────────────
@@ -88,6 +111,28 @@ pub fn store_singleton(gc: Box<dyn GcAllocator>) {
     }
     // SAFETY: gc_mutex held, no concurrent access.
     unsafe {
+        *GC_STORE.0.get() = Some(gc);
+    }
+    GC_INITIALIZED.store(true, Ordering::Release);
+}
+
+/// Test-support: install a fresh GC singleton, LEAKING the previous one.
+///
+/// The prior GC's objects must NOT be freed; process-global immortal builtins
+/// (a builtin type's `weak_subclasses`, etc.) may still reference them, so
+/// dropping the old `OldGen` would leave those references dangling. Forgetting
+/// the old singleton keeps them valid. Used by the `gc_stress` harness to give
+/// each per-worker test a pristine heap and empty root set, so a prior test's
+/// oldgen residue or stale registered roots cannot corrupt this test's
+/// collections.
+pub fn replace_singleton_leaking_old(gc: Box<dyn GcAllocator>) {
+    let _guard = GC_SYNC.gc_mutex.lock().unwrap();
+    // SAFETY: gc_mutex held; the gc_stress harness runs tests serially, so no
+    // concurrent gc_op is in flight during the swap.
+    unsafe {
+        if let Some(old) = (*GC_STORE.0.get()).take() {
+            std::mem::forget(old);
+        }
         *GC_STORE.0.get() = Some(gc);
     }
     GC_INITIALIZED.store(true, Ordering::Release);
@@ -153,6 +198,13 @@ pub fn unregister_thread() {
 /// Single-threaded production always takes the fast path.
 #[inline]
 pub fn gc_op<R>(f: impl FnOnce(&mut dyn GcAllocator) -> R) -> R {
+    if GATE_HELD_DEPTH.with(|c| c.get()) > 0 {
+        // This thread already holds exclusive GC access during collection.
+        // SAFETY: gc_mutex is held by this thread, so there is no concurrent
+        // access to the singleton.
+        return f(unsafe { singleton_mut() });
+    }
+
     // Fast path: single thread, no STW.
     if REGISTERED_THREADS.load(Ordering::Acquire) <= 1
         && !GC_SYNC.stw_requested.load(Ordering::Acquire)
@@ -184,8 +236,10 @@ fn gc_op_slow<R>(f: impl FnOnce(&mut dyn GcAllocator) -> R) -> R {
         drop(_guard);
         park_until_stw_done();
         let _guard = GC_SYNC.gc_mutex.lock().unwrap();
+        let _held = GateHeldGuard::enter();
         return f(unsafe { singleton_mut() });
     }
+    let _held = GateHeldGuard::enter();
     f(unsafe { singleton_mut() })
 }
 
@@ -219,7 +273,10 @@ pub fn request_stw(collect_fn: impl FnOnce(&mut dyn GcAllocator)) {
 
     // SAFETY: gc_mutex held + fast path blocked by stw_requested +
     // IN_FAST_PATH drained. No concurrent singleton access.
-    collect_fn(unsafe { singleton_mut() });
+    {
+        let _held = GateHeldGuard::enter();
+        collect_fn(unsafe { singleton_mut() });
+    }
 
     // Resume all parked threads.
     GC_SYNC.stw_requested.store(false, Ordering::Release);
@@ -271,6 +328,16 @@ mod tests {
         ensure_gc();
         let result = gc_op(|gc| gc.nursery_free());
         assert!(!result.is_null());
+    }
+
+    #[test]
+    fn nested_gc_query_inside_slow_path_gc_op_does_not_deadlock() {
+        ensure_gc();
+        register_thread();
+        // Outer gc_op holds gc_mutex; the nested gc_query must not re-lock it.
+        let ok = gc_op(|_outer| gc_query(|gc| !gc.nursery_free().is_null()));
+        assert!(ok);
+        unregister_thread();
     }
 
     #[test]

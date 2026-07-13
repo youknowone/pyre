@@ -6,26 +6,23 @@
 //! stack in CI.
 //!
 //! Every `#[test]` runs one end-to-end Python program through the shared
-//! `run_harness`, on its own freshly spawned 256 MiB worker thread. All mutable
-//! JIT / GC / interpreter state is thread-local, so each test gets a clean
-//! per-thread world — that isolation is what keeps the six programs independent
-//! inside this one shared process. The programs are therefore NOT run on the
-//! same thread and are NOT flattened into a single test.
+//! `run_harness`, on its own freshly spawned 256 MiB worker thread. The
+//! per-worker thread keeps stack-heavy interpreter / tracer recursion off the
+//! default test stack. These tests also share process-global GC and builtin
+//! type state, so `run_on_worker` serializes them and `run_harness` installs a
+//! fresh GC heap for each worker.
 //!
 //! The harness mirrors the `pyrex` launcher (`pyrex/src/lib.rs` `real_main` +
-//! `run_source`) exactly: it does NOT build the GC up front. Each program's
-//! module body and functions use `while` loops (no `FOR_ITER`), so eval reaches
-//! a JIT-eligible frame and builds the GC lazily — matching production, where
-//! builtins already exist as immortal objects before the GC comes up.
-//! `gc.collect()` then forces deterministic collections through the collect
-//! hook (`interp_gc.py:7-26 collect`).
+//! `run_source`) startup shape, then swaps in a per-worker fresh GC before the
+//! program allocates. Each program's module body and functions use `while`
+//! loops (no `FOR_ITER`), so eval reaches a JIT-eligible frame. `gc.collect()`
+//! then forces deterministic collections through the collect hook
+//! (`interp_gc.py:7-26 collect`).
 //!
 //! Non-vacuity is asserted AFTER eval: the stable instance allocator hook
-//! (installed by the `JIT_DRIVER` initializer, `driver_pair` -> `set_gc_allocator`)
-//! must be live, proving the GC was actually built during the run and objects
-//! were routed through the real managed heap rather than the leaking
-//! `lltype::malloc` Box fallback (which would make the survival checks
-//! meaningless).
+//! must be live, proving the program's objects routed through the real managed
+//! heap rather than the leaking `lltype::malloc` Box fallback (which would make
+//! the survival checks meaningless).
 
 use std::rc::Rc;
 
@@ -33,19 +30,24 @@ use pyre_interpreter::call::{register_build_class, set_build_class_exec_ctx, set
 use pyre_interpreter::importing;
 use pyre_interpreter::pyframe::PyFrame;
 use pyre_interpreter::{Mode, PyExecutionContext, compile_source_with_filename};
-use pyre_jit::eval::{eval_with_jit, init_jit_hooks};
+use pyre_jit::eval::{eval_with_jit, init_jit_hooks, reset_gc_fresh_for_test};
+
+static GC_STRESS_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Shared harness body for every GC-stress program. Compiles and runs `program`
 /// (using `name` as its `sys.argv[0]` / filename) exactly as the `pyrex`
-/// launcher would, letting the GC build lazily during eval. An uncaught
-/// `assert` in the program surfaces here as `Err`, so a successful return means
-/// every read-back assertion held. `vacuity_label` names the survival checks
-/// for the post-eval non-vacuity error.
+/// launcher would, after installing a fresh per-worker GC heap. An uncaught
+/// `assert` in the program surfaces here as `Err`, so a successful return
+/// means every read-back assertion held. `vacuity_label` names the survival
+/// checks for the post-eval non-vacuity error.
 fn run_harness(program: &str, name: &str, vacuity_label: &str) -> Result<(), String> {
     // Mirror `pyrex::real_main` startup, then `pyrex::run_source`.
     pyre_interpreter::stack_check::set_recursion_limit(5000)
         .map_err(|_| "set_recursion_limit failed".to_string())?;
     init_jit_hooks();
+    // Per-worker fresh GC heap: these tests share the process-global GC
+    // singleton, so hide any prior test's residue before this one allocates.
+    reset_gc_fresh_for_test();
 
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     importing::init_sys_path(&cwd);
@@ -75,21 +77,18 @@ fn run_harness(program: &str, name: &str, vacuity_label: &str) -> Result<(), Str
     importing::set_sys_module("__main__", main_module);
 
     // An uncaught `assert` in the program surfaces here as `Err`, so a
-    // successful return means every read-back assertion held. The GC is
-    // built lazily inside this call (the module frame and its functions are
-    // `FOR_ITER`-free), exactly as in the launcher.
+    // successful return means every read-back assertion held.
     eval_with_jit(&mut frame).map_err(|e| format!("execution error: {}", e.message))?;
 
     // Non-vacuity: the stable instance allocator hook is installed by the
     // `JIT_DRIVER` initializer (`driver_pair` -> `set_gc_allocator`). If it is
-    // live now, the GC was built during eval, so the objects above routed
-    // through it rather than the leaking Box fallback — the survival checks
-    // were meaningful.
+    // live now, allocations routed through the managed heap rather than the
+    // leaking Box fallback, so the survival checks were meaningful.
     let probe = pyre_object::try_gc_alloc_stable(
         pyre_object::W_OBJECT_OBJECT_GC_TYPE_ID,
         pyre_object::W_OBJECT_OBJECT_SIZE,
     )
-    .ok_or_else(|| format!("GC was not built during eval; {vacuity_label} would be vacuous"))?;
+    .ok_or_else(|| format!("stable GC alloc hook was not live; {vacuity_label} would be vacuous"))?;
     if probe.is_null() {
         return Err("stable GC alloc hook returned null for an instance-sized block".to_string());
     }
@@ -103,16 +102,23 @@ fn run_harness(program: &str, name: &str, vacuity_label: &str) -> Result<(), Str
 
 /// Run `run_harness` on its own freshly spawned 256 MiB worker thread and
 /// unwrap the result. Mirrors the launcher's worker stack so deep tracer /
-/// interpreter recursion does not overflow the default test stack. GC / JIT
-/// hooks are thread-local, so each test's whole harness runs on this fresh
-/// thread — that per-thread spawn is what isolates the tests inside one shared
-/// process.
+/// interpreter recursion does not overflow the default test stack. The tests
+/// mutate process-global GC and builtin type state, so each worker run is
+/// serialized even when cargo schedules tests in parallel.
 fn run_on_worker(
     program: &'static str,
     name: &'static str,
     vacuity_label: &'static str,
     fail_msg: &'static str,
 ) {
+    // These tests share the process-global GC singleton and process-global
+    // builtin type state (`object.weak_subclasses`, version tags), which are
+    // not thread-safe, so run them one at a time regardless of cargo's
+    // parallel test scheduling. Poison-tolerant: one worker panicking must not
+    // wedge the rest.
+    let _serial = GC_STRESS_SERIAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let handle = std::thread::Builder::new()
         .stack_size(256 * 1024 * 1024)
         .spawn(move || run_harness(program, name, vacuity_label))

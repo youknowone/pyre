@@ -244,6 +244,10 @@ fn install_gc_box(gc: Box<dyn majit_gc::GcAllocator>) {
     majit_gc::set_active_write_barrier(Some(wasm_active_gc_write_barrier));
     majit_gc::set_active_collect_oldgen(Some(wasm_collect_oldgen_nonmoving));
     majit_gc::set_active_heap_stats(Some(active_gc_heap_stats));
+    majit_gc::set_active_finalizer_hooks(
+        Some(wasm_register_finalizer),
+        Some(wasm_finalizer_next_dead),
+    );
 }
 
 /// Production path: install a `GcHandle` forwarding to the global singleton.
@@ -325,6 +329,25 @@ fn wasm_collect_oldgen_nonmoving() {
             gc.collect_oldgen_nonmoving();
         }
     });
+}
+
+fn wasm_register_finalizer(
+    fq_index: usize,
+    obj: GcRef,
+    trigger: majit_gc::FinalizerTriggerFn,
+) {
+    WASM_ACTIVE_GC.with(|cell| {
+        if let Some(gc) = cell.borrow_mut().as_deref_mut() {
+            gc.register_finalizer(fq_index, obj, trigger);
+        }
+    });
+}
+
+fn wasm_finalizer_next_dead(fq_index: usize) -> Option<GcRef> {
+    WASM_ACTIVE_GC.with(|cell| match cell.borrow_mut().as_deref_mut() {
+        Some(gc) => gc.finalizer_next_dead(fq_index),
+        None => None,
+    })
 }
 
 /// `majit_gc::CheckIsObjectFn` installed by `set_gc_allocator`.

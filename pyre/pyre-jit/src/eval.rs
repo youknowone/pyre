@@ -2459,6 +2459,17 @@ fn build_gc_global() {
     majit_gc::gc_sync::store_singleton(gc);
 }
 
+/// Test-support: give the calling `gc_stress` worker a pristine GC heap by
+/// installing a fresh GC and leaking the shared singleton. The per-test worker
+/// threads share the process-global GC singleton; without this, a
+/// class-defining test leaves oldgen residue or stale roots that a later
+/// test's collection, run on a different worker thread with a different
+/// thread-local root set, can mishandle and corrupt immortal state.
+pub fn reset_gc_fresh_for_test() {
+    let gc = build_gc();
+    majit_gc::gc_sync::replace_singleton_leaking_old(gc);
+}
+
 /// Initialize the GC subsystem independently of the JIT driver.
 ///
 /// Phase 1 (process-global, once): build MiniMarkGC, type registry,

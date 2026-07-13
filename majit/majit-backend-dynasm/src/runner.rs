@@ -162,6 +162,10 @@ fn install_gc_box(gc: Box<dyn majit_gc::GcAllocator>) {
     majit_gc::set_active_gc_owns_object(Some(dynasm_gc_owns_object));
     majit_gc::set_active_gc_id_or_identityhash(Some(dynasm_id_or_identityhash));
     majit_gc::set_active_write_barrier(Some(dynasm_gc_write_barrier));
+    majit_gc::set_active_finalizer_hooks(
+        Some(dynasm_register_finalizer),
+        Some(dynasm_finalizer_next_dead),
+    );
 }
 
 /// Production path: install a `GcHandle` (zero-size, routes through
@@ -392,6 +396,29 @@ fn dynasm_collect_oldgen_nonmoving() {
             gc.collect_oldgen_nonmoving();
         }
     });
+}
+
+fn dynasm_register_finalizer(
+    fq_index: usize,
+    obj: GcRef,
+    trigger: majit_gc::FinalizerTriggerFn,
+) {
+    DYNASM_ACTIVE_GC.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        if let Some(gc) = guard.as_deref_mut() {
+            gc.register_finalizer(fq_index, obj, trigger);
+        }
+    });
+}
+
+fn dynasm_finalizer_next_dead(fq_index: usize) -> Option<GcRef> {
+    DYNASM_ACTIVE_GC.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        match guard.as_deref_mut() {
+            Some(gc) => gc.finalizer_next_dead(fq_index),
+            None => None,
+        }
+    })
 }
 
 /// Report `(oldgen_total, nursery_used)` for the interpreter GC safepoint.
