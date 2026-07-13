@@ -1466,8 +1466,15 @@ global_hook!(static ACTIVE_REMOVE_ROOT: RemoveRootFn);
 /// Install the active backend's root-register callbacks. Pass `None`
 /// to clear.
 pub fn set_active_root_hooks(add: Option<AddRootFn>, remove: Option<RemoveRootFn>) {
-    ACTIVE_ADD_ROOT.set(add);
-    ACTIVE_REMOVE_ROOT.set(remove);
+    if add.is_some() {
+        // Publish remove before add so every newly registered root can be removed.
+        ACTIVE_REMOVE_ROOT.set(remove);
+        ACTIVE_ADD_ROOT.set(add);
+    } else {
+        // Withdraw add before remove so no root can be registered without removal.
+        ACTIVE_ADD_ROOT.set(add);
+        ACTIVE_REMOVE_ROOT.set(remove);
+    }
 }
 
 /// Register a stack slot as a GC root with the active backend. No-op
