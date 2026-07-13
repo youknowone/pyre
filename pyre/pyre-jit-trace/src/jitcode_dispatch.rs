@@ -5899,6 +5899,52 @@ pub(crate) enum ResidualExecOutcome {
     Declined(ResidualDecline),
 }
 
+/// Diagnostic (`PYRE_FBW_DEBUG_ABORT`): dump the Python coordinate and per-arg
+/// provenance behind a ValueUnavailable residual decline — the resume py_pc,
+/// the decoded Python opcode, the declined arg's OpRef and whether it is a
+/// constant, and its `box_value`.  Attributes an unj_val census walk to a
+/// knowable-but-unpopulated value versus a genuinely-symbolic heap object
+/// without re-instrumenting.
+fn probe_resid_decline_ctx(
+    ctx: &WalkContext<'_, '_>,
+    why: &str,
+    op_pc: usize,
+    arg_index: usize,
+    arg: OpRef,
+    allboxes: &[OpRef],
+) {
+    let sym = ctx.fbw_mode.snapshot_sym;
+    let (py_pc, opcode) = if !sym.is_null() {
+        let s = unsafe { &*sym };
+        if !s.jitcode.is_null() {
+            let jc = unsafe { &*s.jitcode };
+            let pc = python_pc_for_jitcode_pc(&jc.payload.metadata, op_pc) as usize;
+            let op = if !jc.payload.code_ptr.is_null() {
+                pyre_interpreter::decode_instruction_at(unsafe { &*jc.payload.code_ptr }, pc)
+                    .map(|(i, _)| format!("{i:?}"))
+            } else {
+                None
+            };
+            (Some(pc), op)
+        } else {
+            (None, None)
+        }
+    } else {
+        (None, None)
+    };
+    let box_v = ctx.trace_ctx.box_value(arg);
+    let arg_id = if arg.is_constant() || arg.is_none() {
+        "const".to_string()
+    } else {
+        format!("r{}", arg.raw())
+    };
+    eprintln!(
+        "[fbw-resid-decline] {why} op_pc={op_pc} py_pc={py_pc:?} py_op={opcode:?} \
+         arg_index={arg_index} arg={arg_id} box_value={box_v:?} nargs={}",
+        allboxes.len() - 1,
+    );
+}
+
 fn try_execute_residual_call_via_executor(
     ctx: &mut WalkContext<'_, '_>,
     call_opcode: OpCode,
@@ -6066,10 +6112,13 @@ fn try_execute_residual_call_via_executor(
                         });
                     }
                     if fbw_debug_abort_enabled() {
-                        eprintln!(
-                            "[fbw-resid-decline] NO_CONCRETE op_pc={op_pc} arg_index={arg_index} \
-                             helper={:?} opcode={call_opcode:?}",
-                            call_descr.get_extra_info().pyre_helper
+                        probe_resid_decline_ctx(
+                            ctx,
+                            "NO_CONCRETE",
+                            op_pc,
+                            arg_index,
+                            arg,
+                            allboxes,
                         );
                     }
                     return Ok(ResidualExecOutcome::Declined(
@@ -6088,11 +6137,7 @@ fn try_execute_residual_call_via_executor(
                     });
                 }
                 if fbw_debug_abort_enabled() {
-                    eprintln!(
-                        "[fbw-resid-decline] box_value=None op_pc={op_pc} arg_index={arg_index} \
-                         helper={:?} opcode={call_opcode:?}",
-                        call_descr.get_extra_info().pyre_helper
-                    );
+                    probe_resid_decline_ctx(ctx, "box_value=None", op_pc, arg_index, arg, allboxes);
                 }
                 return Ok(ResidualExecOutcome::Declined(
                     ResidualDecline::ValueUnavailable,
