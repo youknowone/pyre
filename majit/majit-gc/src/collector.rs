@@ -3543,6 +3543,12 @@ impl GcAllocator for MiniMarkGC {
         if gcref.is_null() {
             return None;
         }
+        // gc/base.py:380 `is_valid_gc_object`: a tagged immediate carries no
+        // header/classptr — reading offset 0 would deref the value bits.
+        // Mirrors `can_move`'s guard.
+        if self.is_tagged_immediate(gcref.0) {
+            return None;
+        }
         if self.is_managed_heap_object(gcref.0) {
             let header_addr = gcref.0.wrapping_sub(crate::header::GcHeader::SIZE);
             let header: crate::header::GcHeader = unsafe { *(header_addr as *const _) };

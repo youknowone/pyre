@@ -2429,6 +2429,13 @@ fn loop_inlines_abort_permanent_callee(w_code: *const (), cf_addr: usize) -> boo
         visited: &mut std::collections::HashSet<*const ()>,
         queue: &mut std::collections::VecDeque<(*const (), pyre_object::PyObjectRef)>,
     ) -> bool {
+        // A tagged immediate int is never a FUNCTION_TYPE callee; skip it
+        // before the `ob_type` deref below (which reads an even-aligned heap
+        // pointer). Reaches here via the globals-dict scan and via a cell
+        // whose contents are a tagged int.
+        if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(cand) {
+            return false;
+        }
         // Only plain user functions inline (mirrors the inline path's exact
         // FUNCTION_TYPE gate); builtins carry no CodeObject.
         if cand.is_null() || (*cand).ob_type as *const () as usize != function_type_addr {
@@ -2503,6 +2510,13 @@ fn loop_inlines_abort_permanent_callee(w_code: *const (), cf_addr: usize) -> boo
         let bound = cf.stack_base().min(slots.len());
         for &slot in &slots[..bound] {
             if slot.is_null() {
+                continue;
+            }
+            // A tagged immediate int is neither a cell nor a FUNCTION_TYPE
+            // callee; skip it before `is_cell(slot)` derefs its `ob_type`.
+            if pyre_object::tagged_int::CAN_BE_TAGGED
+                && pyre_object::tagged_int::is_tagged_int(slot)
+            {
                 continue;
             }
             // A closure cell holds the function indirectly; unwrap it.

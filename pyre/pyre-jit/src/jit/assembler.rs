@@ -787,14 +787,18 @@ fn dispatch_op(
         // into the ref constant window (`assembler.py:80-138 emit_const`).
         "ref_return" => {
             if let Some(Operand::ConstRef(value)) = args.first() {
-                state.builder.ref_return_const(*value);
+                state
+                    .builder
+                    .ref_return_const(untag_const_ref_value(*value));
             } else {
                 let src = expect_result_or_first_reg(args, result, Kind::Ref);
                 state.builder.ref_return(src);
             }
         }
         "raise" => match &args[0] {
-            Operand::ConstRef(value) => state.builder.emit_raise_const(*value),
+            Operand::ConstRef(value) => state
+                .builder
+                .emit_raise_const(untag_const_ref_value(*value)),
             _ => {
                 let src = expect_reg(&args[0], Kind::Ref);
                 state.builder.emit_raise(src);
@@ -838,7 +842,9 @@ fn dispatch_op(
             }
             MoveSource::ConstRef(value) => {
                 let dst = expect_result_or_first_reg(args, result, Kind::Ref);
-                state.builder.load_const_r_value(dst, value);
+                state
+                    .builder
+                    .load_const_r_value(dst, untag_const_ref_value(value));
             }
             other => panic!("ref_copy expects Register or ConstRef, got {:?}", other),
         },
@@ -959,9 +965,11 @@ fn dispatch_op(
                         .vable_setfield_ref_with_base(vable_reg, field_idx, r.index);
                 }
                 Operand::ConstRef(value) => {
-                    state
-                        .builder
-                        .vable_setfield_ref_const_value_with_base(vable_reg, field_idx, *value);
+                    state.builder.vable_setfield_ref_const_value_with_base(
+                        vable_reg,
+                        field_idx,
+                        untag_const_ref_value(*value),
+                    );
                 }
                 other => panic!(
                     "setfield_vable_r expects Register(Ref) or ConstRef, got {:?}",
@@ -1105,7 +1113,10 @@ fn dispatch_op(
                 }
                 (Operand::Register(idx), Operand::ConstRef(value)) if idx.kind == Kind::Int => {
                     state.builder.vable_setarrayitem_ref_const_value_with_base(
-                        vable_reg, array_idx, idx.index, *value,
+                        vable_reg,
+                        array_idx,
+                        idx.index,
+                        untag_const_ref_value(*value),
                     );
                 }
                 (Operand::ConstInt(idx_value), Operand::Register(src)) if src.kind == Kind::Ref => {
@@ -1117,7 +1128,10 @@ fn dispatch_op(
                     state
                         .builder
                         .vable_setarrayitem_ref_const_idx_const_value_with_base(
-                            vable_reg, array_idx, *idx_value, *src_value,
+                            vable_reg,
+                            array_idx,
+                            *idx_value,
+                            untag_const_ref_value(*src_value),
                         );
                 }
                 (idx, src) => panic!(
@@ -1905,6 +1919,29 @@ fn expect_int_reg_or_pool(state: &mut AssemblyState, op: &Operand) -> u16 {
     }
 }
 
+/// Normalize a `ConstRef` value before it enters the jitcode `constants_r`
+/// pool.  A tagged small-int immediate would be baked verbatim as a
+/// `ConstPtr(GcRef(tagged))` that an in-trace `GuardClass` derefs as a heap
+/// `W_IntObject` (fannkuch `sign=-1`), and the pool is GC-root-walked
+/// (`walk_jitcode_constants_refs`) so a tagged slot is also forwarded as a
+/// moving-GC pointer.  Re-realize it as a distinct heap box so the pool holds
+/// only real gcrefs — byte-identical to the flag-false bake (`w_int_new` of a
+/// fresh heap `W_IntObject`).  `w_int_new_unique` allocates regardless of
+/// `CAN_BE_TAGGED` (never re-tags).  Gated so flag-false emission is
+/// byte-identical (a non-tagged real pointer is word-aligned, low bit clear,
+/// so the guard is inert).
+fn untag_const_ref_value(value: i64) -> i64 {
+    if pyre_object::tagged_int::CAN_BE_TAGGED
+        && pyre_object::tagged_int::is_tagged_int(value as pyre_object::PyObjectRef)
+    {
+        pyre_object::intobject::w_int_new_unique(pyre_object::tagged_int::untag_int(
+            value as pyre_object::PyObjectRef,
+        )) as i64
+    } else {
+        value
+    }
+}
+
 fn expect_ref_reg_or_pool(state: &mut AssemblyState, op: &Operand) -> u16 {
     match op {
         Operand::Register(Register {
@@ -1912,7 +1949,7 @@ fn expect_ref_reg_or_pool(state: &mut AssemblyState, op: &Operand) -> u16 {
             index,
         }) => *index,
         Operand::ConstRef(value) => {
-            let idx = state.builder.add_const_r(*value);
+            let idx = state.builder.add_const_r(untag_const_ref_value(*value));
             state.builder.num_regs_r() + idx
         }
         other => panic!(
@@ -2009,7 +2046,7 @@ fn expect_list_regs_or_pool(state: &mut AssemblyState, op: &Operand, expected: K
                         Kind::Ref,
                         "ConstRef found inside non-ref ListOfKind({expected:?})"
                     );
-                    let idx = state.builder.add_const_r(*value);
+                    let idx = state.builder.add_const_r(untag_const_ref_value(*value));
                     state.builder.num_regs_r() + idx
                 }
                 other => panic!(

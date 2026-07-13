@@ -4796,6 +4796,15 @@ pub(crate) fn builtin_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         }
         return crate::typedef::bytes_method_decode(&decode_args);
     }
+    // A tagged `int` immediate stringifies to its decimal value; format it
+    // before `is_str` / `unwrap_cell` / `ob_type` touch it as a pointer.
+    // Mirrors `py_str_wtf8` / `py_repr_obj`. Gated on `CAN_BE_TAGGED`.
+    if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj) {
+        return Ok(w_str_new(&format!(
+            "{}",
+            pyre_object::tagged_int::untag_int(obj)
+        )));
+    }
     unsafe {
         if is_str(obj) {
             // A `str` subclass keeps `ob_type` at STR_TYPE but carries the
