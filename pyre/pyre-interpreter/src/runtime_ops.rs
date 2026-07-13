@@ -1338,7 +1338,7 @@ pub fn ensure_range_iter(iter: PyObjectRef) -> Result<(), PyError> {
     }
     Err(PyError::type_error(format!(
         "'{}' object is not iterable",
-        unsafe { (*(*iter).ob_type).name }
+        unsafe { pyre_object::type_name_of(iter) }
     )))
 }
 
