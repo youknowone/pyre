@@ -24,6 +24,10 @@ struct RawMallocedObject {
 pub struct OldGen {
     ac: ArenaCollection,
     old_rawmalloced_objects: Vec<RawMallocedObject>,
+    /// incminimark.py:2688-2694 `raw_malloc_might_sweep`.  At sweep
+    /// preparation the old rawmalloc stack is swapped into this one, isolating
+    /// it from rawmalloc allocations made by minors between sweep steps.
+    raw_malloc_might_sweep: Vec<RawMallocedObject>,
     /// Exact payload membership for objects routed to individual rawmalloc
     /// (oversized or card-header allocations).  This is the same address-dict
     /// shape upstream uses when it needs exact rawmalloc membership:
@@ -47,6 +51,7 @@ impl OldGen {
                 SMALL_REQUEST_THRESHOLD,
             ),
             old_rawmalloced_objects: Vec::new(),
+            raw_malloc_might_sweep: Vec::new(),
             rawmalloced_payloads: HashSet::new(),
             rawmalloced_total_size: 0,
             poison_on_alloc: std::env::var_os("MAJIT_GC_NURSERY_POISON").is_some(),
@@ -114,40 +119,99 @@ impl OldGen {
 
     #[cfg(test)]
     pub(crate) fn object_count(&self) -> usize {
-        self.ac.object_count() + self.old_rawmalloced_objects.len()
+        self.ac.object_count()
+            + self.old_rawmalloced_objects.len()
+            + self.raw_malloc_might_sweep.len()
     }
 
-    /// Non-incremental major sweep: `ArenaCollection.mass_free` for small
-    /// objects and individual freeing of unvisited rawmalloced objects.
-    pub fn sweep(&mut self) {
-        self.ac.mass_free(|header_ptr| unsafe {
-            let hdr = &mut *(header_ptr as *mut GcHeader);
-            if hdr.has_flag(flags::VISITED) {
-                hdr.clear_flag(flags::VISITED);
-                false
-            } else {
-                true
-            }
-        });
+    /// incminimark.py:2512-2514 and :2688-2694: freeze the arena pages and
+    /// rawmalloc stack belonging to this major cycle.  Allocations made while
+    /// sweeping go to the fresh active page lists and
+    /// `old_rawmalloced_objects`, so this cycle never visits them.
+    pub fn sweep_prepare(&mut self) {
+        self.ac.mass_free_prepare();
+        debug_assert!(
+            self.raw_malloc_might_sweep.is_empty(),
+            "raw_malloc_might_sweep must be empty"
+        );
+        std::mem::swap(
+            &mut self.raw_malloc_might_sweep,
+            &mut self.old_rawmalloced_objects,
+        );
+    }
 
-        let mut surviving = Vec::new();
-        let mut freed_bytes = 0;
-        for object in self.old_rawmalloced_objects.drain(..) {
+    /// incminimark.py:2695-2702 `free_unvisited_rawmalloc_objects_step`.
+    /// Process at most `nobjects` candidates and return the unused part of the
+    /// budget, exactly like the upstream routine.
+    pub fn sweep_rawmalloc_step(&mut self, mut nobjects: usize) -> usize {
+        while !self.raw_malloc_might_sweep.is_empty() && nobjects > 0 {
+            let object = self.raw_malloc_might_sweep.pop().unwrap();
             let hdr = unsafe { &mut *(object.header_addr as *mut GcHeader) };
             if hdr.has_flag(flags::VISITED) {
                 hdr.clear_flag(flags::VISITED);
-                surviving.push(object);
+                self.old_rawmalloced_objects.push(object);
             } else {
-                freed_bytes += object.layout.size();
+                self.rawmalloced_total_size -= object.layout.size();
                 let removed = self
                     .rawmalloced_payloads
                     .remove(&(object.header_addr + GcHeader::SIZE));
                 debug_assert!(removed);
                 unsafe { alloc::dealloc(object.alloc_start as *mut u8, object.layout) };
             }
+            nobjects -= 1;
         }
-        self.rawmalloced_total_size -= freed_bytes;
-        self.old_rawmalloced_objects = surviving;
+        nobjects
+    }
+
+    /// Whether the rawmalloc half of the current incremental sweep remains.
+    pub fn rawmalloc_sweep_pending(&self) -> bool {
+        !self.raw_malloc_might_sweep.is_empty()
+    }
+
+    /// incminimark.py:2549-2555: sweep at most `max_pages` frozen arena pages.
+    pub fn sweep_arenas_step(&mut self, max_pages: usize) -> bool {
+        self.ac.mass_free_incremental(
+            &mut |header_ptr| unsafe {
+                let hdr = &mut *(header_ptr as *mut GcHeader);
+                if hdr.has_flag(flags::VISITED) {
+                    hdr.clear_flag(flags::VISITED);
+                    false
+                } else {
+                    true
+                }
+            },
+            max_pages,
+        )
+    }
+
+    pub fn page_size(&self) -> usize {
+        DEFAULT_PAGE_SIZE
+    }
+
+    pub fn small_request_threshold(&self) -> usize {
+        SMALL_REQUEST_THRESHOLD
+    }
+
+    /// Non-incremental compatibility entry point, expressed as prepare plus
+    /// draining steps just like minimarkpage.py:376-383 `mass_free`.
+    #[allow(dead_code)]
+    pub fn sweep(&mut self) {
+        self.sweep_prepare();
+        while self.rawmalloc_sweep_pending() {
+            self.sweep_rawmalloc_step(usize::MAX);
+        }
+        let complete = self.sweep_arenas_step(usize::MAX);
+        assert!(complete, "non-incremental oldgen sweep returned false");
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rawmalloc_sweep_candidate_count(&self) -> usize {
+        self.raw_malloc_might_sweep.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_rawmalloc_count(&self) -> usize {
+        self.old_rawmalloced_objects.len()
     }
 
     /// Arena membership is intentionally an address-range answer, not a live
@@ -176,6 +240,9 @@ impl Default for OldGen {
 impl Drop for OldGen {
     fn drop(&mut self) {
         for object in self.old_rawmalloced_objects.drain(..) {
+            unsafe { alloc::dealloc(object.alloc_start as *mut u8, object.layout) };
+        }
+        for object in self.raw_malloc_might_sweep.drain(..) {
             unsafe { alloc::dealloc(object.alloc_start as *mut u8, object.layout) };
         }
     }
@@ -231,5 +298,39 @@ mod tests {
         assert!(oldgen.contains(dead_payload));
         oldgen.sweep();
         assert!(!oldgen.contains(dead_payload));
+    }
+
+    #[test]
+    fn rawmalloc_sweep_step_is_bounded_and_isolates_new_allocations() {
+        let mut oldgen = OldGen::new();
+        let size = SMALL_REQUEST_THRESHOLD + WORD;
+        for _ in 0..3 {
+            let ptr = oldgen.alloc(size);
+            unsafe { *ptr.cast::<GcHeader>() = GcHeader::new(0) };
+        }
+
+        oldgen.sweep_prepare();
+        assert_eq!(oldgen.rawmalloc_sweep_candidate_count(), 3);
+        assert_eq!(oldgen.active_rawmalloc_count(), 0);
+
+        // incminimark.py:2688-2694: allocations made after the swap land in
+        // the fresh active stack and are not swept in this cycle.
+        let fresh = oldgen.alloc(size);
+        let fresh_payload = fresh as usize + GcHeader::SIZE;
+        unsafe { *fresh.cast::<GcHeader>() = GcHeader::new(0) };
+        assert_eq!(oldgen.active_rawmalloc_count(), 1);
+
+        let bytes_before = oldgen.total_bytes();
+        assert_eq!(oldgen.sweep_rawmalloc_step(1), 0);
+        assert_eq!(oldgen.rawmalloc_sweep_candidate_count(), 2);
+        assert_eq!(oldgen.total_bytes(), bytes_before - round_up(size));
+
+        while oldgen.rawmalloc_sweep_pending() {
+            oldgen.sweep_rawmalloc_step(1);
+        }
+        assert_eq!(oldgen.active_rawmalloc_count(), 1);
+        assert_eq!(oldgen.total_bytes(), round_up(size));
+        assert!(oldgen.contains(fresh_payload));
+        assert!(oldgen.sweep_arenas_step(1));
     }
 }

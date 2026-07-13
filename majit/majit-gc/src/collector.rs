@@ -2,7 +2,7 @@
 ///
 /// A generational copying collector with:
 /// - Bump-pointer nursery for young objects
-/// - System-allocator old gen with mark-sweep for major collection
+/// - ArenaCollection old gen plus rawmalloc fallback, with incremental major sweep
 /// - Write barrier with remembered set for old-to-young pointers
 ///
 /// Modeled after incminimark's minor/major collection.
@@ -301,7 +301,20 @@ impl Default for RootSet {
 /// Default card page shift: each card covers 2^7 = 128 array elements.
 pub const DEFAULT_CARD_PAGE_SHIFT: u32 = 7;
 
-/// State for incremental major collection.
+/// incminimark.py:2390-2634 major-collection state machine.
+///
+/// incminimark's `STATE_FINALIZING` is intentionally absent.  Pyre exposes
+/// explicit FinalizerQueue death deques and trigger callbacks, but has no
+/// collector-run `execute_finalizers`; incminimark.py:2623-2631 therefore
+/// reduces to setting `Scanning` before firing those triggers in the same step.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GcState {
+    Scanning,
+    Marking,
+    Sweeping,
+}
+
+/// State for incremental major marking.
 ///
 /// Instead of doing a full mark-sweep in one pause, the marking work
 /// is spread across multiple minor collections. Each minor collection
@@ -310,8 +323,6 @@ pub const DEFAULT_CARD_PAGE_SHIFT: u32 = 7;
 struct IncrementalMarkState {
     /// Objects still to be scanned (gray set).
     gray_stack: Vec<usize>,
-    /// Whether an incremental cycle is in progress.
-    marking_in_progress: bool,
     /// Number of objects marked so far in this cycle.
     objects_marked: usize,
     /// Target number of bytes to trace per increment.
@@ -333,7 +344,6 @@ impl IncrementalMarkState {
     fn new(nursery_size: usize) -> Self {
         IncrementalMarkState {
             gray_stack: Vec::new(),
-            marking_in_progress: false,
             objects_marked: 0,
             mark_budget_per_step: (nursery_size.saturating_mul(2)).max(1),
             mark_offsets: Vec::new(),
@@ -438,6 +448,8 @@ pub struct MiniMarkGC {
     pub minor_collections: usize,
     /// Count of major collections performed.
     pub major_collections: usize,
+    /// incminimark.py:2390-2634 `gc_state`.
+    gc_state: GcState,
     /// State for incremental major collection.
     incr_state: IncrementalMarkState,
     /// incminimark.py:304 `self.major_collection_threshold`. After a major
@@ -603,6 +615,7 @@ impl MiniMarkGC {
             config,
             minor_collections: 0,
             major_collections: 0,
+            gc_state: GcState::Scanning,
             incr_state: IncrementalMarkState::new(nursery_size),
             major_collection_threshold,
             growth_rate_max,
@@ -919,7 +932,7 @@ impl MiniMarkGC {
     /// `obj_addr` must point at a live (not-yet-freed) object payload
     /// whose header still names a registered type id — true for a dead
     /// nursery object before `nursery.reset()` and a dying old-gen object
-    /// before `oldgen.sweep()`.
+    /// before the first incremental old-gen sweep step.
     fn run_destructor(&self, obj_addr: usize) {
         let type_id = unsafe { (*header_of(obj_addr)).type_id() };
         if (type_id as usize) >= self.types.len() {
@@ -941,19 +954,17 @@ impl MiniMarkGC {
     /// Flags for an object born directly into the old generation, adding
     /// `flags::VISITED` while a major marking cycle is in progress.
     ///
-    /// pyre's [`OldGen::sweep`] is a flat mark-sweep that frees every object
-    /// lacking `flags::VISITED` — a deliberate simplification of incminimark's
-    /// incremental, position-based arena sweep. Under that flat sweep, an object
-    /// allocated straight into the old generation during marking (a large object
-    /// or a nursery-full fallback) would be white at cycle end and freed while
-    /// still reachable: the one-shot major root scan (`seed_major_roots`) already
-    /// ran, and no minor-collection drag-out re-reaches a non-promoted object.
-    /// Allocating it black preserves the snapshot-at-the-beginning invariant that
-    /// incminimark upholds structurally. Any young pointer later stored into it
-    /// re-enters marking through the write barrier's remembered-set rescan.
+    /// An object allocated straight into the old generation during MARKING (a
+    /// large object or nursery-full fallback) enters the still-active page/raw
+    /// lists that will be frozen at the MARKING->SWEEPING seam. The root scan has
+    /// already happened, so allocate it black; allocations during SWEEPING need
+    /// no VISITED workaround because incminimark.py:2513-2514 and :2688-2694's
+    /// list swaps keep them outside this cycle's candidates. Any young pointer
+    /// later stored into a born-black object re-enters marking through the write
+    /// barrier's remembered-set rescan.
     #[inline]
     fn oldgen_birth_flags(&self, base: u64) -> u64 {
-        if self.incr_state.marking_in_progress {
+        if self.gc_state == GcState::Marking {
             base | flags::VISITED
         } else {
             base
@@ -1159,7 +1170,7 @@ impl MiniMarkGC {
         // remembered by the write barrier may already be black. Requeue
         // those black objects so the major collector rescans their new
         // outgoing references before sweep.
-        if self.incr_state.marking_in_progress {
+        if self.gc_state == GcState::Marking {
             let remembered_now: Vec<usize> = self.remembered_set.iter().copied().collect();
             for obj_addr in remembered_now {
                 let hdr = unsafe { header_of(obj_addr) };
@@ -1249,7 +1260,7 @@ impl MiniMarkGC {
                 self.nursery_objects_shadows.clear();
             } else {
                 let pinned = &self.pinned_objects;
-                let marking = self.incr_state.marking_in_progress;
+                let marking = self.gc_state == GcState::Marking;
                 self.nursery_objects_shadows
                     .retain(|obj_addr, shadow_addr| {
                         let keep = pinned.contains(obj_addr);
@@ -1435,11 +1446,11 @@ impl MiniMarkGC {
             // which does not carry it.)
             (*(shadow_hdr_ptr as *mut GcHeader)).set_flag(flags::TRACK_YOUNG_PTRS);
             // A shadow reserved during marking is an old-gen object subject to
-            // the flat sweep; keep it black so the in-progress cycle does not
+            // this cycle's future sweep; keep it black so marking does not
             // reclaim the reserved identity home before the object is copied in
             // (incminimark.py:1747 record_pinned_object_with_shadow). See
             // `oldgen_birth_flags`.
-            if self.incr_state.marking_in_progress {
+            if self.gc_state == GcState::Marking {
                 (*(shadow_hdr_ptr as *mut GcHeader)).set_flag(flags::VISITED);
             }
             if type_info.item_size > 0 {
@@ -1660,7 +1671,7 @@ impl MiniMarkGC {
         // incminimark.py:2140-2143: append iff (VISITED | PINNED) == 0. pyre's
         // marking convention sets VISITED at push time (see `seed_major_root`
         // / `mark_object`), so set it here rather than at pop.
-        if self.incr_state.marking_in_progress {
+        if self.gc_state == GcState::Marking {
             let hdr = unsafe { header_of(new_ref.0) };
             if unsafe { !(*hdr).has_flag(flags::VISITED) } {
                 unsafe { (*hdr).set_flag(flags::VISITED) };
@@ -1794,11 +1805,12 @@ impl MiniMarkGC {
     ///
     /// Seeds the gray stack with all root-reachable old-gen objects.
     pub fn start_incremental_cycle(&mut self) {
-        self.incr_state.marking_in_progress = true;
+        debug_assert_eq!(self.gc_state, GcState::Scanning);
         self.incr_state.gray_stack.clear();
         self.incr_state.objects_marked = 0;
 
         self.seed_major_roots();
+        self.gc_state = GcState::Marking;
     }
 
     fn seed_major_root(&mut self, gcref: GcRef) {
@@ -1817,6 +1829,21 @@ impl MiniMarkGC {
             if newly_marked {
                 self.incr_state.gray_stack.push(gcref.0);
                 self.note_nonmoving_nursery_mark(gcref.0);
+
+                // incminimark.py:1322-1340 requires marking worklists to
+                // contain no nursery objects after a minor. Pyre JITFRAME
+                // gcmap spills are collector metadata, not SETFIELD_GC
+                // writes: a frame first grayed in STATE_SCANNING can leave
+                // the active shadow stack before the next minor without a
+                // mutator barrier. Arm this newly seeded old root in the
+                // existing old_objects_pointing_to_young shape once, so that
+                // minor forwards any such spill before resetting nursery.
+                if !self.is_in_nursery(gcref.0)
+                    && unsafe { (*hdr).has_flag(flags::TRACK_YOUNG_PTRS) }
+                {
+                    unsafe { (*hdr).clear_flag(flags::TRACK_YOUNG_PTRS) };
+                    self.remembered_set.push(gcref.0);
+                }
             }
         }
     }
@@ -1938,30 +1965,61 @@ impl MiniMarkGC {
         if !self.enabled {
             return;
         }
-        if !self.incr_state.marking_in_progress && !self.threshold_reached(0) {
+        if self.gc_state == GcState::Scanning && !self.threshold_reached(0) {
             return;
         }
 
         loop {
-            self.threshold_bytes_made_old = self
-                .threshold_bytes_made_old
-                .saturating_add(self.config.nursery_size / 2);
+            self.major_collection_step();
 
-            if !self.incr_state.marking_in_progress {
+            // incminimark.py:849-855 target (A1), with FINALIZING collapsed.
+            if self.gc_state == GcState::Scanning {
+                break;
+            }
+
+            // incminimark.py:849-860 target (A2). Keep pyre's existing
+            // consecutive-step credit loop: the enclosing call has already
+            // completed the minor collection that supplied these promotions.
+            if self.bytes_made_old_since_cycle <= self.threshold_bytes_made_old {
+                break;
+            }
+        }
+    }
+
+    /// incminimark.py:2390-2634 `major_collection_step`.
+    fn major_collection_step(&mut self) {
+        self.debug_check_consistency();
+
+        // incminimark.py:2406-2436: each state-machine step grants half a
+        // nursery of promotion credit.
+        self.threshold_bytes_made_old = self
+            .threshold_bytes_made_old
+            .saturating_add(self.config.nursery_size / 2);
+
+        match self.gc_state {
+            GcState::Scanning => {
+                // incminimark.py:2439-2448 STATE_SCANNING.
                 self.bytes_made_old_since_cycle = 0;
                 self.threshold_bytes_made_old = self.config.nursery_size / 2;
                 self.start_incremental_cycle();
             }
-
-            let done = self.incremental_mark_step();
-            if done {
-                self.finish_incremental_cycle();
-                break;
+            GcState::Marking => {
+                // `incremental_mark_step` performs the MARKING->SWEEPING seam
+                // itself when the gray stack is exhausted.
+                self.incremental_mark_step();
             }
+            GcState::Sweeping => self.incremental_sweep_step(),
+        }
+    }
 
-            if self.bytes_made_old_since_cycle <= self.threshold_bytes_made_old {
-                break;
-            }
+    /// incminimark.py:1316-1319 debug invariant.
+    fn debug_check_consistency(&self) {
+        if self.oldgen.rawmalloc_sweep_pending() {
+            debug_assert_eq!(
+                self.gc_state,
+                GcState::Sweeping,
+                "raw_malloc_might_sweep must be empty outside SWEEPING"
+            );
         }
     }
 
@@ -1972,11 +2030,12 @@ impl MiniMarkGC {
     /// one object so very small budgets still make forward progress.
     /// Returns `true` if marking is complete (gray stack exhausted).
     pub fn incremental_mark_step(&mut self) -> bool {
+        debug_assert_eq!(self.gc_state, GcState::Marking);
         let mut budget = self.incr_state.mark_budget_per_step;
         let mut processed_any = false;
         while budget > 0 || !processed_any {
             let Some(obj_addr) = self.incr_state.gray_stack.pop() else {
-                self.incr_state.marking_in_progress = false;
+                self.finish_incremental_marking();
                 return true; // marking complete
             };
             let obj_size = self.object_total_size(obj_addr);
@@ -1990,6 +2049,7 @@ impl MiniMarkGC {
 
     fn object_total_size(&self, obj_addr: usize) -> usize {
         let type_id = unsafe { (*header_of(obj_addr)).type_id() };
+        self.validate_type_id(type_id, obj_addr, "object_total_size");
         let type_info = self.types.get(type_id);
         let payload_size = if type_info.item_size > 0 {
             let length = unsafe { *((obj_addr + type_info.length_offset) as *const usize) };
@@ -2111,8 +2171,8 @@ impl MiniMarkGC {
     /// edge to a still-white object. The per-minor black re-grey in
     /// `do_collect_nursery` only re-scans modifications up to the last minor; a
     /// cycle finished at a safepoint *between* minors (`do_collect_oldgen_nonmoving`
-    /// branch A, `gc_step`) leaves the trailing delta unscanned. Under pyre's flat
-    /// [`OldGen::sweep`], those white-but-reachable children would then be freed.
+    /// branch A, `gc_step`) leaves the trailing delta unscanned. The later
+    /// incremental sweep would otherwise free those white-but-reachable children.
     /// Re-grey every already-marked modified object and trace transitively so the
     /// delta is marked before the retain/sweep below. (pyre's marking convention
     /// sets VISITED at push time, so a black object is simply re-pushed; white
@@ -2129,9 +2189,11 @@ impl MiniMarkGC {
         }
     }
 
-    /// Complete the sweep phase after incremental marking finishes.
-    fn finish_incremental_cycle(&mut self) {
-        self.major_collections += 1;
+    /// incminimark.py:2473-2533: finish MARKING and freeze this cycle's sweep
+    /// candidates.  Every VISITED-dependent consumer runs before either raw or
+    /// arena memory is freed.
+    fn finish_incremental_marking(&mut self) {
+        debug_assert_eq!(self.gc_state, GcState::Marking);
         // Re-scan the trailing snapshot-at-the-beginning delta (old objects
         // modified since the last minor) before the sweep, or a cycle finished
         // between minors frees reachable old->old targets.
@@ -2166,9 +2228,68 @@ impl MiniMarkGC {
         // Reset the live off-heap footprint exactly from the survivors (the
         // dying objects' destructors just ran, freeing their limb Vecs), so the
         // promotion-time running total cannot drift and the next-major threshold
-        // taken from get_total_memory_used below reflects the post-sweep truth.
+        // later taken from get_total_memory_used reflects the post-sweep truth.
         self.recompute_oldgen_external_bytes();
-        self.oldgen.sweep();
+
+        // incminimark.py:2512-2514. ArenaCollection's prepare moves active
+        // pages to old_* lists, and OldGen swaps old_rawmalloced_objects into
+        // raw_malloc_might_sweep. Promotions between sweep steps therefore
+        // allocate into fresh lists and are not candidates in this cycle.
+        self.oldgen.sweep_prepare();
+
+        // incminimark.py:2516-2526 maintains an
+        // `old_objects_pointing_to_pinned` stack. Pyre's explicit pin contract
+        // keeps pinned objects nursery-resident and records their old-gen
+        // identity shadows directly, so it has no equivalent stack to filter.
+        // incminimark.py:2528-2529 rawrefcount integration is likewise absent.
+        self.gc_state = GcState::Sweeping;
+    }
+
+    /// incminimark.py:2535-2621 STATE_SWEEPING.
+    fn incremental_sweep_step(&mut self) {
+        debug_assert_eq!(self.gc_state, GcState::Sweeping);
+        let done = if self.oldgen.rawmalloc_sweep_pending() {
+            // incminimark.py:2537-2547: process a bounded number of rawmalloc
+            // objects first. Even if this drains the stack, the arena half is
+            // deliberately deferred to the next state-machine step.
+            let limit = 3 * self.config.nursery_size / self.oldgen.small_request_threshold();
+            // Upstream production geometry makes this non-zero. Pyre unit
+            // tests use nurseries smaller than one rawmalloc threshold, so one
+            // candidate is the minimum needed for forward progress while
+            // retaining the incminimark.py:2543 upper-bound formula otherwise.
+            self.oldgen.sweep_rawmalloc_step(limit.max(1));
+            false
+        } else {
+            // incminimark.py:2549-2555: visit at most three nursery sizes of
+            // frozen arena pages.
+            let limit = 3 * self.config.nursery_size / self.oldgen.page_size();
+            // As above, tiny test nurseries need one-page forward progress;
+            // normal configurations use the literal incminimark.py:2553 value.
+            self.oldgen.sweep_arenas_step(limit.max(1))
+        };
+
+        if done {
+            self.finish_incremental_cycle();
+        }
+    }
+
+    /// incminimark.py:2560-2631: complete SWEEPING, compute the next threshold
+    /// from post-sweep accounting, then collapse FINALIZING back to SCANNING.
+    fn finish_incremental_cycle(&mut self) {
+        debug_assert_eq!(self.gc_state, GcState::Sweeping);
+        debug_assert!(!self.oldgen.rawmalloc_sweep_pending());
+        self.major_collections += 1;
+        if std::env::var_os("MAJIT_LOG").is_some() {
+            eprintln!(
+                "[gc][major] complete count={} oldgen_bytes={}",
+                self.major_collections,
+                self.get_total_memory_used(),
+            );
+        }
+
+        // incminimark.py:2563-2564 resets VISITED on translated prebuilt root
+        // objects. Pyre creates all GC objects at runtime and has no immortal
+        // prebuilt-root list, so there is no corresponding reset pass.
         // incminimark.py:2566-2577 — set the threshold for the next major
         // collection to `major_collection_threshold` times the surviving
         // size, but no more than `max_delta` above it, floored at
@@ -2188,6 +2309,11 @@ impl MiniMarkGC {
         );
         self.bytes_made_old_since_cycle = 0;
         self.threshold_bytes_made_old = 0;
+
+        // incminimark.py:2617-2631: pyre has explicit death deques but no
+        // collector-run execute_finalizers phase. Make recursive collections
+        // see SCANNING first, then fire the queue-notification triggers now.
+        self.gc_state = GcState::Scanning;
         self.execute_finalizer_triggers();
     }
 
@@ -2200,11 +2326,9 @@ impl MiniMarkGC {
     ///     bit. Live target → keep the weakref in a fresh list.
     ///     Dying target → null the slot and drop the weakref.
     ///
-    /// RPython's extra GCFLAG_FINALIZATION_ORDERING handling
-    /// (incminimark.py:3120-3121 — treats objects queued for finalize
-    /// as "dying for weakref purposes" even though they're still
-    /// reachable) is deferred until the finalizer queue itself lands;
-    /// the rule reduces to a plain VISITED check until then.
+    /// incminimark.py:3120-3121 also treats FINALIZATION_ORDERING targets as
+    /// dying for weakref purposes even though finalizer-queue reachability has
+    /// marked them VISITED; the check below preserves that ordering.
     fn invalidate_old_weakrefs(&mut self) {
         let entries = std::mem::take(&mut self.old_objects_with_weakrefs);
         let mut new_with_weakref = Vec::with_capacity(entries.len());
@@ -2376,7 +2500,7 @@ impl MiniMarkGC {
     /// Walk the old-destructor list: a VISITED (surviving) object is kept
     /// in a fresh list; a dying (not-VISITED) object's destructor runs
     /// before the imminent sweep frees its memory. Must run while VISITED
-    /// bits are still meaningful — i.e. before `oldgen.sweep()` clears
+    /// bits are still meaningful — i.e. before incremental sweep steps clear
     /// them.
     fn deal_with_old_objects_with_destructors(&mut self) {
         let entries = std::mem::take(&mut self.old_objects_with_destructors);
@@ -2412,7 +2536,7 @@ impl MiniMarkGC {
 
     /// Whether an incremental marking cycle is currently in progress.
     pub fn is_incremental_marking(&self) -> bool {
-        self.incr_state.marking_in_progress
+        self.gc_state == GcState::Marking
     }
 
     /// Number of objects marked so far in the current incremental cycle.
@@ -2462,30 +2586,13 @@ impl MiniMarkGC {
         // cycle, but we need a complete mark-sweep here regardless.
         self.do_collect_nursery();
 
-        if self.incr_state.marking_in_progress {
-            // An incremental cycle is in progress. Finish it by draining
-            // the gray stack without budget limits.
-            while !self.incr_state.gray_stack.is_empty() {
-                let obj_addr = self.incr_state.gray_stack.pop().unwrap();
-                self.mark_object(obj_addr);
-                self.incr_state.objects_marked += 1;
-            }
-            self.incr_state.marking_in_progress = false;
-            self.finish_incremental_cycle();
-        } else {
-            // No incremental cycle in progress. Do a full stop-the-world
-            // mark-sweep using the same mark_object infrastructure.
-            self.incr_state.gray_stack.clear();
-
-            self.seed_major_roots();
-
-            // Drain gray stack completely.
-            while let Some(obj_addr) = self.incr_state.gray_stack.pop() {
-                self.mark_object(obj_addr);
-            }
-
-            self.finish_incremental_cycle();
+        if self.gc_state == GcState::Scanning {
+            self.start_incremental_cycle();
         }
+        // incminimark.py:2366-2378 `gc_step_until(STATE_SCANNING)`: bounded
+        // state-machine steps are still looped to completion inside this one
+        // stop-the-world call.
+        self.gc_step_until_scanning();
     }
 
     /// Reclaim dead old-gen objects WITHOUT moving the nursery.
@@ -2505,7 +2612,7 @@ impl MiniMarkGC {
     /// survive into the next minor's promoted copy (`copy_nursery_object`
     /// memcpys the header verbatim). The strictly-last step clears VISITED on
     /// exactly the nursery objects greyed this cycle — after
-    /// `finish_incremental_cycle`, hence after `invalidate_old_weakrefs`,
+    /// sweep completion, hence after `invalidate_old_weakrefs`,
     /// which reads a nursery target's VISITED to decide weakref survival. The
     /// remembered set is left untouched: a non-moving major does not consume
     /// `old -> young` edges, so the next minor still finds them.
@@ -2518,24 +2625,12 @@ impl MiniMarkGC {
         self.oldgen_nonmoving_active = true;
         self.oldgen_nonmoving_nursery_marks.clear();
 
-        if self.incr_state.marking_in_progress {
-            // A cycle started by a prior minor's `run_major_progress_after_minor`
-            // is mid-flight; drain it rather than re-seed (the `do_collect_full`
-            // incremental arm, minus the leading minor).
-            while let Some(obj_addr) = self.incr_state.gray_stack.pop() {
-                self.mark_object(obj_addr);
-                self.incr_state.objects_marked += 1;
-            }
-            self.incr_state.marking_in_progress = false;
-            self.finish_incremental_cycle();
-        } else {
-            self.incr_state.gray_stack.clear();
-            self.seed_major_roots();
-            while let Some(obj_addr) = self.incr_state.gray_stack.pop() {
-                self.mark_object(obj_addr);
-            }
-            self.finish_incremental_cycle();
+        if self.gc_state == GcState::Scanning {
+            self.start_incremental_cycle();
         }
+        // Keep this oldgen-only entry stop-the-world: it may enter while
+        // MARKING or SWEEPING, but always returns after the complete cycle.
+        self.gc_step_until_scanning();
 
         // Strictly-last: clear VISITED on every nursery object greyed this
         // cycle (the oldgen sweep already cleared it on old-gen survivors).
@@ -2549,6 +2644,12 @@ impl MiniMarkGC {
             }
         }
         self.oldgen_nonmoving_active = false;
+    }
+
+    fn gc_step_until_scanning(&mut self) {
+        while self.gc_state != GcState::Scanning {
+            self.major_collection_step();
+        }
     }
 
     /// incminimark.py:1489-1493 write_barrier(addr_struct):
@@ -2591,6 +2692,12 @@ impl MiniMarkGC {
     /// at runtime and never sets GCFLAG_NO_HEAP_PTRS (there are no immortal
     /// prebuilt objects from translation), so no object ever reaches that arm.
     fn remember_young_pointer(&mut self, obj: GcRef) {
+        // incminimark.py does not special-case STATE_SWEEPING in its barrier.
+        // After the seam, every retained entry names a VISITED survivor. A new
+        // barrier entry can only name an object the mutator can reach: an old
+        // candidate already known live, a candidate already swept, or a new
+        // object on the fresh lists. An unreachable white candidate cannot be
+        // mutated and therefore cannot be re-added between sweep steps.
         self.remembered_set.push(obj.0);
         let hdr = unsafe { header_of(obj.0) };
         unsafe { (*hdr).clear_flag(flags::TRACK_YOUNG_PTRS) };
@@ -2815,9 +2922,9 @@ impl MiniMarkGC {
             // on the popped object (the marking convention sets it at *push*
             // time — see `seed_major_root` and the remembered-set rescan above),
             // so keep the object black across the re-push. Clearing it would
-            // leave the still-reachable card object white and let `OldGen::sweep`
-            // reclaim it.
-            if self.incr_state.marking_in_progress {
+            // leave the still-reachable card object white for the incremental
+            // sweep to reclaim.
+            if self.gc_state == GcState::Marking {
                 unsafe { (*hdr).set_flag(flags::VISITED) };
                 self.incr_state.gray_stack.push(obj);
             }
@@ -2875,29 +2982,18 @@ impl MiniMarkGC {
 
     /// Perform one incremental GC step. Called from JIT safepoints.
     ///
-    /// If an incremental marking cycle should start, it is initiated.
-    /// If a cycle is already in progress, one bounded marking step is
+    /// If an incremental major cycle should start, it is initiated. If a cycle
+    /// is already in progress, one bounded MARKING or SWEEPING step is
     /// performed. Returns true if any GC work was done.
     pub fn gc_step(&mut self) -> bool {
         if !self.enabled {
             return false;
         }
-        if self.threshold_reached(0) && !self.incr_state.marking_in_progress {
-            self.start_incremental_cycle();
-            let done = self.incremental_mark_step();
-            if done {
-                self.finish_incremental_cycle();
-            }
-            true
-        } else if self.incr_state.marking_in_progress {
-            let done = self.incremental_mark_step();
-            if done {
-                self.finish_incremental_cycle();
-            }
-            true
-        } else {
-            false
+        if self.gc_state == GcState::Scanning && !self.threshold_reached(0) {
+            return false;
         }
+        self.major_collection_step();
+        true
     }
 
     /// Reset the nursery while preserving pinned objects.
@@ -5045,6 +5141,43 @@ mod tests {
     }
 
     #[test]
+    fn minor_forwards_nursery_references_held_by_gray_objects() {
+        let ptr_size = std::mem::size_of::<GcRef>();
+        let mut gc = test_gc(4096);
+        let holder_tid = gc.register_type(TypeInfo::with_gc_ptrs(ptr_size, vec![0]));
+        let leaf_tid = gc.register_type(TypeInfo::simple(16));
+
+        let holder = gc.alloc_with_type(holder_tid, ptr_size);
+        unsafe { *(holder.0 as *mut GcRef) = GcRef::NULL };
+        let mut root = holder;
+        unsafe { gc.roots.add(&mut root) };
+        gc.do_collect_nursery();
+
+        gc.set_mark_budget(1);
+        gc.start_incremental_cycle();
+        assert_eq!(gc.incr_state.gray_stack, vec![root.0]);
+
+        let young = gc.alloc_with_type(leaf_tid, 16);
+        unsafe {
+            *(young.0 as *mut u64) = 0xC011_EC70;
+            // Model a collector-owned JITFRAME gcmap spill: it does not pass
+            // through the ordinary mutator write barrier.
+            *(root.0 as *mut GcRef) = young;
+        }
+        assert!(gc.remembered_set.contains(&root.0));
+
+        gc.disable();
+        gc.do_collect_nursery();
+        gc.enable();
+
+        let forwarded = unsafe { *(root.0 as *const GcRef) };
+        assert!(!gc.is_in_nursery(forwarded.0));
+        assert_eq!(unsafe { *(forwarded.0 as *const u64) }, 0xC011_EC70);
+        gc.do_collect_full();
+        gc.roots.clear();
+    }
+
+    #[test]
     fn test_minor_collection_can_take_multiple_major_steps_when_promotions_outpace_credit() {
         let ptr_size = std::mem::size_of::<GcRef>();
         let mut gc = test_gc(1024);
@@ -5180,12 +5313,88 @@ mod tests {
         }
 
         // Finish: sweep unreachable objects.
-        gc.finish_incremental_cycle();
+        gc.gc_step_until_scanning();
 
         // Only the reachable object should survive.
         assert_eq!(gc.oldgen.object_count(), 1);
         assert!(!root.is_null());
 
+        gc.roots.clear();
+    }
+
+    #[test]
+    fn incremental_sweep_spans_steps_and_preserves_interleaved_promotion() {
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::simple(16));
+        let total_size = GcHeader::SIZE + 16;
+
+        // More than two arena pages of white old objects ensure that the
+        // one-page budget used by this tiny test nursery cannot finish sweep.
+        for _ in 0..900 {
+            gc.alloc_in_oldgen(tid, total_size);
+        }
+
+        gc.start_incremental_cycle();
+        assert!(gc.incremental_mark_step());
+        assert_eq!(gc.gc_state, GcState::Sweeping);
+        gc.major_collection_step();
+        assert_eq!(gc.gc_state, GcState::Sweeping);
+
+        // Disable automatic major progress only while this minor promotes its
+        // survivor. The promotion allocates on ArenaCollection's fresh active
+        // page lists created by mass_free_prepare, not the frozen old_* lists.
+        let young = gc.alloc_with_type(tid, 16);
+        unsafe { *(young.0 as *mut u64) = 0x51_7E_A5E };
+        let mut root = young;
+        unsafe { gc.roots.add(&mut root) };
+        gc.disable();
+        gc.do_collect_nursery();
+        gc.enable();
+        assert!(!gc.is_in_nursery(root.0));
+
+        gc.gc_step_until_scanning();
+        assert_eq!(gc.gc_state, GcState::Scanning);
+        assert_eq!(gc.major_collections, 1);
+        assert_eq!(gc.oldgen.object_count(), 1);
+        assert_eq!(unsafe { *(root.0 as *const u64) }, 0x51_7E_A5E);
+        gc.roots.clear();
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "raw_malloc_might_sweep must be empty outside SWEEPING")]
+    fn rawmalloc_sweep_candidates_require_sweeping_state() {
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::simple(16));
+        let raw_size = gc.oldgen.small_request_threshold() + std::mem::size_of::<usize>();
+        gc.alloc_in_oldgen(tid, raw_size);
+        gc.oldgen.sweep_prepare();
+        assert!(gc.oldgen.rawmalloc_sweep_pending());
+        assert_eq!(gc.gc_state, GcState::Scanning);
+        gc.debug_check_consistency();
+    }
+
+    #[test]
+    fn stop_the_world_full_collection_drains_marking_and_sweeping() {
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::simple(16));
+        let live = gc.alloc_in_oldgen(tid, GcHeader::SIZE + 16);
+        let mut root = live;
+        unsafe { gc.roots.add(&mut root) };
+
+        let raw_size = gc.oldgen.small_request_threshold() + std::mem::size_of::<usize>();
+        for _ in 0..20 {
+            gc.alloc_in_oldgen(tid, raw_size);
+        }
+        let majors_before = gc.major_collections;
+
+        gc.do_collect_full();
+
+        assert_eq!(gc.gc_state, GcState::Scanning);
+        assert!(!gc.oldgen.rawmalloc_sweep_pending());
+        assert_eq!(gc.major_collections, majors_before + 1);
+        assert_eq!(gc.oldgen.object_count(), 1);
+        assert_eq!(root.0, live.0);
         gc.roots.clear();
     }
 
@@ -5403,7 +5612,7 @@ mod tests {
         }
 
         // Complete the cycle.
-        gc.finish_incremental_cycle();
+        gc.gc_step_until_scanning();
         assert!(gc.major_collections > 0);
 
         // Walk the list from the head and verify all data values.
@@ -5628,6 +5837,17 @@ mod tests {
         gc.set_mark_budget(1);
         gc.start_incremental_cycle();
         assert!(gc.is_incremental_marking());
+
+        // `seed_major_root` arms all newly gray roots for the next minor so
+        // collector-owned JITFRAME spills cannot strand nursery references.
+        // Reset that one-time collector setup here to isolate the ordinary
+        // mutator write-barrier behavior this test covers.
+        gc.remembered_set.clear();
+        unsafe {
+            (*header_of(root_a.0)).set_flag(flags::TRACK_YOUNG_PTRS);
+            (*header_of(root_b.0)).set_flag(flags::TRACK_YOUNG_PTRS);
+            (*header_of(root_c.0)).set_flag(flags::TRACK_YOUNG_PTRS);
+        }
 
         // During marking, perform write barriers on A and B.
         gc.do_write_barrier(root_a);
@@ -5971,7 +6191,7 @@ mod tests {
 
         gc.disable();
         assert!(!gc.gc_step());
-        assert!(!gc.incr_state.marking_in_progress);
+        assert_eq!(gc.gc_state, GcState::Scanning);
 
         gc.enable();
         assert!(gc.gc_step());
@@ -6284,7 +6504,7 @@ mod tests {
         assert!(gc.oldgen.contains(rooted.0));
 
         gc.start_incremental_cycle();
-        gc.finish_incremental_cycle();
+        gc.gc_step_until_scanning();
 
         assert!(gc.oldgen.contains(rooted.0));
         crate::shadow_stack::pop_jf_to(depth);
@@ -6655,6 +6875,9 @@ mod tests {
 
         // Popping removes the queue root; the following major reclaims it.
         gc.do_collect_oldgen_nonmoving();
-        assert!(!gc.oldgen.contains(obj.0));
+        // ArenaCollection::contains is intentionally an arena-range query and
+        // can stay true for a freed block while the current arena is retained.
+        // The allocator's exact live count verifies reclamation here.
+        assert_eq!(gc.oldgen.object_count(), 0);
     }
 }

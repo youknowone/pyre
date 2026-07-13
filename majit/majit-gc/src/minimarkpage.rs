@@ -240,7 +240,7 @@ impl ArenaCollection {
     }
 
     /// `ArenaCollection.mass_free_prepare`.
-    fn mass_free_prepare(&mut self) {
+    pub(crate) fn mass_free_prepare(&mut self) {
         self.peak_memory_used = self.peak_memory_used.max(self.total_memory_used);
         let mut size_class = self.small_request_threshold / WORD;
         self.size_class_with_old_pages = size_class as isize;
@@ -254,7 +254,7 @@ impl ArenaCollection {
     }
 
     /// `ArenaCollection.mass_free_incremental`.
-    fn mass_free_incremental(
+    pub(crate) fn mass_free_incremental(
         &mut self,
         ok_to_free_func: &mut impl FnMut(*mut u8) -> bool,
         mut max_pages: usize,
