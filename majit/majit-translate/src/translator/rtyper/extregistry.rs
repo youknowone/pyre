@@ -184,6 +184,15 @@ pub enum ExtRegistryEntry {
     /// [`Self::WeAreJitted`]); its `compute_annotation` is unreachable in
     /// practice and returns the same opaque shell to stay a faithful port.
     BigIntFrom,
+    /// `longlong2float.float2longlong(f64) -> i64` — RPython
+    /// `Float2LongLongEntry(ExtRegistryEntry)` (`rlib/longlong2float.py:76-86`).
+    /// Reinterprets the f64 bit pattern as a signed longlong via the
+    /// `convert_float_bytes_to_longlong` llop.  Same dual-registration shape as
+    /// [`Self::BigIntFrom`]: the annotation half is served by the
+    /// `longlong2float.float2longlong` `BUILTIN_ANALYZERS` entry
+    /// (`float2longlong_analyzer` → `SomeInteger(r_longlong)`); this entry fires on
+    /// the rtyper's `findbltintyper` → `specialize_call` path.
+    Float2LongLong,
 }
 
 /// Small Send-able annotation payload for static HostObject type
@@ -293,6 +302,7 @@ pub enum ExtRegistryEntryKey {
     /// per-instance identity — the variant tag alone supplies
     /// `self.__class__` and there is no `self.instance`.
     BigIntFrom,
+    Float2LongLong,
 }
 
 impl ExtRegistryEntry {
@@ -329,6 +339,7 @@ impl ExtRegistryEntry {
             },
             ExtRegistryEntry::WeAreJitted => ExtRegistryEntryKey::WeAreJitted,
             ExtRegistryEntry::BigIntFrom => ExtRegistryEntryKey::BigIntFrom,
+            ExtRegistryEntry::Float2LongLong => ExtRegistryEntryKey::Float2LongLong,
         }
     }
 
@@ -457,6 +468,12 @@ impl ExtRegistryEntry {
                     None,
                     false,
                     std::collections::BTreeMap::new(),
+                ),
+            )),
+            ExtRegistryEntry::Float2LongLong => Ok(SomeValue::Integer(
+                crate::annotator::model::SomeInteger::new_with_knowntype(
+                    false,
+                    crate::annotator::model::KnownType::LongLong,
                 ),
             )),
         }
@@ -596,6 +613,11 @@ impl ExtRegistryEntry {
             // is the opaque GcRef; `rtype_bigint_from` emits it.
             ExtRegistryEntry::BigIntFrom => {
                 Ok(super::rbuiltin::rtype_bigint_from as BuiltinTyperFn)
+            }
+            // `rlib/longlong2float.py:83-86` — `Float2LongLongEntry.specialize_call`
+            // emits `genop('convert_float_bytes_to_longlong', [v_float], SignedLongLong)`.
+            ExtRegistryEntry::Float2LongLong => {
+                Ok(super::rbuiltin::rtype_float2longlong as BuiltinTyperFn)
             }
         }
     }
@@ -841,6 +863,9 @@ fn lookup_host_object(host: &HostObject) -> Option<ExtRegistryEntry> {
     // host callable the annotator typed as `SomeBuiltin`.
     if host.qualname() == "BigInt.from" {
         return Some(ExtRegistryEntry::BigIntFrom);
+    }
+    if host.qualname() == "longlong2float.float2longlong" {
+        return Some(ExtRegistryEntry::Float2LongLong);
     }
     if let Some(entry) = host_value_registry().lock().unwrap().get(host).cloned() {
         return Some(entry);

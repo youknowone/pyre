@@ -363,6 +363,7 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     // `BigInt::from(i64)` — boxes a machine int into the foreign opaque
     // `BigInt` (Python `long`); returns the classdef-less GcRef shell.
     analyzer_for(&mut reg, "BigInt.from", bigint_from);
+    analyzer_for(&mut reg, "longlong2float.float2longlong", float2longlong_analyzer);
     // Foreign Rust container constructors — `Vec::new` /
     // `Vec::with_capacity` / `indexmap::IndexMap::new` / `Box::new`.
     // Each returns the classdef-less opaque `SomeInstance` shell (twin
@@ -1233,6 +1234,20 @@ pub fn rarith_longlongmask(
     _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
     // upstream: `SomeInteger(knowntype=rpython.rlib.rarithmetic.r_longlong)`.
+    Ok(SomeValue::Integer(SomeInteger::new_with_knowntype(
+        false,
+        crate::annotator::model::KnownType::LongLong,
+    )))
+}
+
+/// `longlong2float.float2longlong(floatval)` — upstream
+/// `Float2LongLongEntry.compute_result_annotation` returns
+/// `SomeInteger(knowntype=r_int64)` (== `r_longlong`).
+pub fn float2longlong_analyzer(
+    _bk: &Rc<Bookkeeper>,
+    _args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
     Ok(SomeValue::Integer(SomeInteger::new_with_knowntype(
         false,
         crate::annotator::model::KnownType::LongLong,

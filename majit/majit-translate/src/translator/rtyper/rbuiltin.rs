@@ -1533,6 +1533,24 @@ pub fn rtype_bigint_from(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) ->
     Ok(hop.genop("direct_call", vlist, GenopResult::Repr(r_result)))
 }
 
+/// `rlib/longlong2float.py:83-86` — `Float2LongLongEntry.specialize_call`:
+/// `hop.inputargs(lltype.Float)`, `hop.exception_cannot_occur()`,
+/// `return hop.genop("convert_float_bytes_to_longlong", [v_float], SignedLongLong)`.
+pub fn rtype_float2longlong(
+    hop: &HighLevelOp,
+    _kwds_i: &HashMap<String, usize>,
+) -> RTypeResult {
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    let vlist = hop.inputargs(vec![ConvertedTo::LowLevelType(&LowLevelType::Float)])?;
+    hop.exception_cannot_occur()?;
+    Ok(hop.genop(
+        "convert_float_bytes_to_longlong",
+        vlist,
+        GenopResult::LLType(LowLevelType::SignedLongLong),
+    ))
+}
+
 /// `@typer_for(pyre_object.lltype.malloc_raw)` — residual external
 /// lowering of the raw (non-GC) typed allocation intrinsic
 /// `malloc_raw::<T>(value: T) -> *mut T` (`malloc_raw_alloc` annotator

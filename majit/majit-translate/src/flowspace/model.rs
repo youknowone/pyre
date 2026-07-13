@@ -1969,6 +1969,18 @@ impl HostEnv {
         let bigint = HostObject::new_module("BigInt");
         bigint.module_set("from", HostObject::new_builtin_callable("BigInt.from"));
 
+        // `longlong2float.float2longlong(x)` reinterprets an f64 bit pattern as
+        // i64 (`convert_float_bytes_to_longlong` llop).  The front-end mints this
+        // callsite in the `f64::is_sign_negative` lowering; surface a module-shaped
+        // stub so Branch 3b in `flowspace_adapter::translate_op` resolves the
+        // 2-segment path, the annotator types it `SomeInteger(r_longlong)`, and the
+        // rtyper's `Float2LongLong` extregistry entry emits the genop.
+        let longlong2float = HostObject::new_module("longlong2float");
+        longlong2float.module_set(
+            "float2longlong",
+            HostObject::new_builtin_callable("longlong2float.float2longlong"),
+        );
+
         // Rust primitive type conversion impls (`u32::from`,
         // `i64::from`, `i64::try_from`, `usize::try_from`) — callsites
         // emit `[primitive, method]` 2-segment paths.  Each impl
@@ -2230,6 +2242,7 @@ impl HostEnv {
         mods.insert("std.alloc".into(), std_alloc);
         mods.insert("std.slice".into(), std_slice);
         mods.insert("BigInt".into(), bigint);
+        mods.insert("longlong2float".into(), longlong2float);
         mods.insert("majit_metainterp".into(), majit_metainterp);
         mods.insert("majit_metainterp.jit".into(), majit_metainterp_jit);
         mods.insert("u32".into(), primitive_u32);
