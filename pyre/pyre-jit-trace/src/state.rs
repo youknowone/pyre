@@ -5957,7 +5957,7 @@ fn reconstruct_inline_recipe(
             code_ptr: raw_code as *const (),
             jitcode_index: frame.jitcode_index,
             pc: py_pc,
-            jitcode_pc: frame.jitcode_pc,
+            jitcode_pc: frame.pc,
             nlocals,
             valuestackdepth,
             registers_i: Vec::new(),
@@ -6139,7 +6139,7 @@ fn reconstruct_inline_recipe(
         code_ptr: raw_code as *const (),
         jitcode_index: frame.jitcode_index,
         pc: py_pc,
-        jitcode_pc: frame.jitcode_pc,
+        jitcode_pc: frame.pc,
         nlocals,
         valuestackdepth,
         registers_i,
@@ -8988,7 +8988,7 @@ impl JitState for PyreJitState {
             } else {
                 0
             };
-            let root_jitcode_pc = resume_data.frames[0].jitcode_pc;
+            let root_jitcode_pc = resume_data.frames[0].pc;
             let mut recipes: Vec<ReconstructRecipe> =
                 Vec::with_capacity(resume_data.frames.len() - 1);
             let mut ok = root_pc_valid;
