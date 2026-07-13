@@ -8695,22 +8695,28 @@ impl CraneliftBackend {
         builder.switch_to_block(stack_check_continue);
         builder.seal_block(stack_check_continue);
 
-        // aarch64/assembler.py:927 `_check_frame_depth` parity — bridge
-        // prologue.  Bridges may require a wider JITFRAME than the
-        // failing parent guard's frame supplies (the parent was sized
-        // for its own `max_output_slots + num_ref_roots`, the bridge
-        // for potentially more).  PyPy emits this check in every bridge
-        // prologue; on `jf_frame.length < expected_size` it calls
-        // `_frame_realloc_slowpath` (assembler.py:118 / aarch64:434),
-        // which `cranelift_realloc_frame` line-by-line ports.  Main
-        // loops skip the check because `run_compiled_code_inner`
-        // (compiler.rs:6191) allocates the frame at exactly the size
-        // the body needs.  Source-guard presence is the bridge
-        // discriminator (`compile_bridge` is the only do_compile caller
-        // that supplies it; `compile_loop` passes `None`).
-        let mut jf_ptr = if source_guard.is_some() {
-            let expected_size =
-                (precompute_max_output_slots(inputargs, ops) + ref_root_slots.len()) as i64;
+        // `_check_frame_depth` parity — entry prologue.  A trace can be
+        // entered on a JITFRAME another trace allocated: a loop reached
+        // by a closing-jump or a bridge-dispatch tail-call runs on the
+        // caller's frame, and a bridge that reallocated the frame to its
+        // own size may jump back to a wider parent loop.  Either way the
+        // incoming frame can be narrower than this trace needs, so it
+        // must be widened before the body writes guard outputs or ref
+        // roots (`jf_frame.length < expected_size` calls
+        // `_frame_realloc_slowpath`, which `cranelift_realloc_frame`
+        // ports).  `check_frame_before_jump` emits this at every JUMP to
+        // a foreign loop token; mirror it on the destination side for
+        // both loops and bridges.  For a fresh loop entry the frame
+        // already matches `max_output_slots + num_ref_roots`, so the
+        // check is a no-op.  Bridges size against
+        // `precompute_max_output_slots` because their fail-arg inputs may
+        // exceed the loop's output slots.
+        let mut jf_ptr = {
+            let expected_size = if source_guard.is_some() {
+                (precompute_max_output_slots(inputargs, ops) + ref_root_slots.len()) as i64
+            } else {
+                (max_output_slots + ref_root_slots.len()) as i64
+            };
             // jitframe.py:84 — `jf_frame.length` is the count of `Signed`
             // payload slots after the length word.  aarch64/assembler.py:935
             // `LDR_ri(r.ip0.value, r.fp.value, ofs)` parity.
@@ -8766,8 +8772,6 @@ impl CraneliftBackend {
             builder.switch_to_block(frame_ok_block);
             builder.seal_block(frame_ok_block);
             builder.block_params(frame_ok_block)[0]
-        } else {
-            initial_jf_ptr
         };
         // jf_ptr serves as both inputs_ptr (entry) and the exit-frame base.
         // RPython: EBP = jitframe pointer throughout compiled code.
@@ -14318,9 +14322,10 @@ impl CraneliftBackend {
         // companion publish, a source loop with a smaller
         // `max_output_slots + num_ref_roots` than this target could
         // closing-jump in and overrun the frame writing guard outputs
-        // / ref roots past the allocation (assembler.py:927 bridge
-        // `_check_frame_depth` only fires for bridges, not for loop
-        // bodies entered via tail-call).
+        // / ref roots past the allocation.  The target's entry prologue
+        // performs the same `_check_frame_depth`, so this publish lets
+        // the closing-jump reallocate at the source before the tail-call
+        // rather than relying solely on that destination check.
         let target_frame_depth = max_output_slots + ref_root_slots.len();
         let mut label_block_id: u32 = 0;
         for op in ops.iter() {
