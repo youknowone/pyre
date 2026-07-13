@@ -5938,9 +5938,15 @@ fn probe_resid_decline_ctx(
     } else {
         format!("r{}", arg.raw())
     };
+    // The declined arg's semantic register slot and its index-keyed concrete
+    // shadow (`concrete_registers_r`): a `Null` shadow at a found slot with a
+    // `None` box_value is the bridge-resume seed gap (neither store populated).
+    let reg_slot = ctx.registers_r.iter().position(|&r| r == arg);
+    let shadow = reg_slot.and_then(|s| ctx.concrete_registers_r.get(s));
     eprintln!(
         "[fbw-resid-decline] {why} op_pc={op_pc} py_pc={py_pc:?} py_op={opcode:?} \
-         arg_index={arg_index} arg={arg_id} box_value={box_v:?} nargs={}",
+         arg_index={arg_index} arg={arg_id} box_value={box_v:?} reg_slot={reg_slot:?} \
+         reg_shadow={shadow:?} nargs={}",
         allboxes.len() - 1,
     );
 }
