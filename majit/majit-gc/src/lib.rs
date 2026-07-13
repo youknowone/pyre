@@ -9,7 +9,7 @@ pub use gcreftracer::{GcTable, install_gc_table_walker};
 ///
 /// Reference: rpython/memory/gc/incminimark.py, rpython/jit/backend/llsupport/gc.py
 use majit_ir::{Const, ConstMap, GcRef, Op};
-pub use trace::{ClassTypeLayout, TypeEntry, TypeInfo, TypeInfoLayout, custom_trace_is_minor};
+pub use trace::{ClassTypeLayout, TypeEntry, TypeInfo, TypeInfoLayout};
 
 pub mod collector;
 pub mod gc_sync;

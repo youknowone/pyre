@@ -735,9 +735,9 @@ unsafe fn memoryview_object_destructor(obj_addr: usize) {
 ///     are Box-immortal (`is_nursery_object_start` short-circuits).
 ///   - `locals_cells_stack_w` — the array pointer.  A GC-managed nursery
 ///     block forwards through its field slot and its type-9 walker owns the
-///     items.  An old-gen GC block also visits the field slot for major
-///     marking, then a minor trace forwards its items in place because
-///     interpreter slot stores do not write-barrier the array.  A stationary
+///     items. An old-gen GC block also visits the field slot and walks its
+///     items in place: barrier-less interpreter stores require that at minors,
+///     and it is harmless duplicate marking at majors. A stationary
 ///     `std::alloc` block always forwards its items in place.
 ///   - `f_generator_nowref`, `w_yielding_from`, `w_builtin`, `w_globals`
 ///     — the ref-bearing statics.
@@ -755,8 +755,10 @@ unsafe fn pyframe_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut ma
 
     // locals_cells_stack_w: visit the field slot for every GC array so major
     // marking reaches it. A nursery array is subsequently scanned by its own
-    // type-9 walker; an old-gen array needs this frame trace to forward
-    // unbarriered young items during a minor collection.
+    // type-9 walker; an old-gen array also needs this in-place scan because
+    // interpreter stores do not write-barrier its items. At a major, its own
+    // walker reaches them too, so this is harmless duplicate marking.
+    // RPython's phase-agnostic precedent is jitframe.py:104 `jitframe_trace`.
     let array = frame.locals_cells_stack_w;
     if !array.is_null() {
         let walk_items = if pyre_object::gc_hook::try_gc_owns_object(array as *mut u8) {
@@ -764,13 +766,16 @@ unsafe fn pyframe_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut ma
                 &mut frame.locals_cells_stack_w as *mut *mut pyre_object::FixedObjectArray
                     as *mut majit_ir::GcRef,
             );
-            !majit_gc::gc_is_nursery_object(array as usize) && majit_gc::custom_trace_is_minor()
+            !majit_gc::gc_is_nursery_object(array as usize)
         } else {
             true
         };
         // Stationary `std::alloc` blocks (never entered by
-        // `trace_and_update_object`) and old-gen GC blocks on a minor trace
-        // forward the FULL fixed-length array, not just the live prefix.
+        // `trace_and_update_object`) and old-gen GC blocks forward the FULL
+        // fixed-length array, not just the live prefix. The old-gen major
+        // walk is idempotent duplicate marking; the minor walk covers
+        // barrier-less interpreter stores. This matches RPython's
+        // phase-agnostic jitframe.py:104 `jitframe_trace`.
         // This matches `walk_pyframe_roots` (eval.rs:626), which forwards
         // popped-in-transit argument slots past `valuestackdepth`.
         if walk_items {
@@ -794,14 +799,16 @@ unsafe fn pyframe_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut ma
                 &mut frame.debugdata as *mut *mut pyre_interpreter::pyframe::FrameDebugData
                     as *mut majit_ir::GcRef,
             );
-            !majit_gc::gc_is_nursery_object(debugdata as usize) && majit_gc::custom_trace_is_minor()
+            !majit_gc::gc_is_nursery_object(debugdata as usize)
         } else {
             true
         };
         // A nursery payload is scanned by FRAME_DEBUG_DATA_GC_TYPE_ID's
-        // ordinary offset walker. Box payloads, and old-gen payloads during
-        // a minor, need this in-place walk because interpreter stores do not
-        // individually write-barrier w_f_trace and its sibling fields.
+        // ordinary offset walker. Box payloads and old-gen payloads need this
+        // in-place walk because interpreter stores do not individually
+        // write-barrier w_f_trace and its sibling fields. The old-gen major
+        // walk is harmless duplicate marking, matching RPython's
+        // phase-agnostic jitframe.py:104 `jitframe_trace` contract.
         if walk_fields {
             let d = unsafe { &mut *frame.debugdata };
             f(&mut d.w_locals as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);

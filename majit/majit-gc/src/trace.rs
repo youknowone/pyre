@@ -9,35 +9,7 @@
 /// declares the offsets of its GC pointer fields relative to the object
 /// payload start. The collector reads/writes GcRef values at these offsets
 /// directly.
-use std::cell::Cell;
-
 use majit_ir::GcRef;
-
-thread_local! {
-    static CUSTOM_TRACE_IS_MINOR: Cell<bool> = const { Cell::new(false) };
-}
-
-/// Scope a custom trace callback to its collection kind.  A hook has only the
-/// visitor callback in its ABI, so this thread-local keeps phase-sensitive
-/// payload walking out of the major marker's duplicate work.
-pub(crate) struct CustomTracePhaseGuard(bool);
-
-pub(crate) fn custom_trace_phase(is_minor: bool) -> CustomTracePhaseGuard {
-    let previous = CUSTOM_TRACE_IS_MINOR.with(|cell| cell.replace(is_minor));
-    CustomTracePhaseGuard(previous)
-}
-
-impl Drop for CustomTracePhaseGuard {
-    fn drop(&mut self) {
-        CUSTOM_TRACE_IS_MINOR.with(|cell| cell.set(self.0));
-    }
-}
-
-/// Whether the current custom trace callback is running from a minor
-/// collection.  Outside a callback this returns false.
-pub fn custom_trace_is_minor() -> bool {
-    CUSTOM_TRACE_IS_MINOR.with(Cell::get)
-}
 
 /// One `gctypelayout.GCData.TYPE_INFO` entry of the materialized
 /// type-info group (gc.py:592, x86/assembler.py:1924-1943).
