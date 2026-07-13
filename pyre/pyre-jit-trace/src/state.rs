@@ -314,9 +314,8 @@ impl MetaInterpStaticData {
     /// a graph (when a later primary compile re-queues an inlined
     /// callee's graph at the drain
     /// boundary); such a rebuild must take a FRESH index, leaving the
-    /// old entry intact for old resume data. Only not-yet-populated placeholders (skeletons and
-    /// portal-bridge installs, both `pc_map`-empty — no liveness any
-    /// rd_numb could reference) are filled in place, matching RPython's
+    /// old entry intact for old resume data. Only not-yet-populated skeletons
+    /// (with no liveness any rd_numb could reference) are filled in place, matching RPython's
     /// "same JitCode object is filled later" setup-time flow.
     fn slot_accepts_payload(slot: &JitCode, payload: &std::sync::Arc<crate::PyJitCode>) -> bool {
         !slot.payload.is_populated() || std::sync::Arc::ptr_eq(&slot.payload, payload)
@@ -329,37 +328,6 @@ impl MetaInterpStaticData {
         self.jitcodes
             .iter()
             .rposition(|jitcode| unsafe { jitcode.raw_code() as usize } == raw_key)
-    }
-
-    fn portal_bridge_payload_for(raw_key: usize) -> std::sync::Arc<crate::PyJitCode> {
-        let raw_code = raw_key as *const CodeObject;
-        let payload = crate::canonical_bridge::install_portal_for(raw_code);
-        assert!(
-            payload.is_portal_bridge(),
-            "portal bridge install must produce a portal-bridge PyJitCode"
-        );
-        payload
-    }
-
-    /// Pyre adapter for the PyPy portal model: every user CodeObject runs
-    /// through the canonical portal JitCode, but trace/resume readers still
-    /// need per-CodeObject frame-shape metadata (`stack_base`,
-    /// `depth_at_py_pc`). Build a portal-bridge wrapper that shares the
-    /// portal bytecode and carries only that metadata; do not invoke the
-    /// codewriter or create a per-CodeObject drained JitCode.
-    fn portal_bridge_jitcode_for(&mut self, code: *const ()) -> *const JitCode {
-        let raw_key = Self::canonical_code_key_opt(code)
-            .unwrap_or_else(|| panic!("portal bridge requested for invalid PyCode {:p}", code));
-        if let Some(pos) = self.installed_jitcode_pos_for_raw_key(raw_key) {
-            return &*self.jitcodes[pos] as *const JitCode;
-        }
-        let payload = Self::portal_bridge_payload_for(raw_key);
-        let index = self.jitcodes.len() as i32;
-        Self::stamp_payload_index(index, &payload);
-        let jitcode = Box::new(JitCode { index, payload });
-        let ptr = &*jitcode as *const JitCode;
-        self.jitcodes.push(jitcode);
-        ptr
     }
 
     /// codewriter.py:67-68 / call.py:155-172 adapter: install or return the
@@ -638,14 +606,6 @@ fn ensure_finish_setup() {
     });
 }
 
-/// Pyre adapter for portal-bridge experiments. Production trace frames use
-/// `jitcode_for()` below, which follows CallControl.get_jitcode + drain.
-#[allow(dead_code)]
-pub(crate) fn portal_bridge_jitcode_for(code: *const ()) -> *const JitCode {
-    ensure_finish_setup();
-    METAINTERP_SD.with(|r| r.borrow_mut().portal_bridge_jitcode_for(code))
-}
-
 /// pyjitpl.py:74: frame.jitcode — resolve the JitCode for the frame's code
 /// object through the writer-side CallControl.get_jitcode path.
 pub(crate) fn jitcode_for(code: *const ()) -> *const JitCode {
@@ -789,8 +749,7 @@ pub fn raw_code_for_jitcode_index(jitcode_index: i32) -> Option<*const CodeObjec
 /// Resolve `MetaInterpStaticData.jitcodes[jitcode_index]` to the same
 /// PyJitCode payload the trace-side frame used. This keeps blackhole /
 /// resume consumers on the RPython single-store path instead of
-/// re-looking-up through pyre-jit's CodeWriter side cache, which does not
-/// own portal-bridge wrappers.
+/// re-looking-up through pyre-jit's CodeWriter side cache.
 pub fn pyjitcode_for_jitcode_index(jitcode_index: i32) -> Option<std::sync::Arc<crate::PyJitCode>> {
     ensure_finish_setup();
     METAINTERP_SD.with(|r| {
@@ -853,7 +812,7 @@ pub unsafe fn walk_jitcode_constants_refs_area(
 
 /// Resolve by PyCode wrapper through the trace-side
 /// MetaInterpStaticData store. Used by blackhole paths that must see
-/// portal-bridge wrappers as well as CodeWriter-drained entries.
+/// CodeWriter-drained entries.
 pub fn pyjitcode_for_code(code: *const ()) -> Option<std::sync::Arc<crate::PyJitCode>> {
     ensure_finish_setup();
     METAINTERP_SD.with(|r| {
@@ -1020,9 +979,7 @@ pub fn frame_value_count_at(jitcode_index: i32, pc: i32, carried_jitcode_pc: i32
         // The rd_numb pc word may carry the after-residual-call marker;
         // `resolve_resume_pc_with_jitcode_pc` prefers the carried direct
         // JitCode pc (`#124`) when it names a valid startpoint and otherwise
-        // routes the marker through the right map.  `real_pc` is the plain
-        // Python PC for the py_pc-keyed fallbacks.
-        let real_pc = majit_ir::resumedata::decode_resume_pc(pc).0;
+        // routes the marker through the right map.
         let resolved_jit_pc: Option<usize> =
             payload.resolve_resume_pc_with_jitcode_pc(pc, carried_jitcode_pc, sd.op_live);
         if let Some(jit_pc) = resolved_jit_pc {
@@ -1034,40 +991,6 @@ pub fn frame_value_count_at(jitcode_index: i32, pc: i32, carried_jitcode_pc: i32
                 let length_f = all_liveness[off + 2] as usize;
                 return length_i + length_r + length_f;
             }
-        }
-        // G.4.3 portal-bridge decoder count: read the per-PC depth from
-        // the metadata `LiveVars` derivation that
-        // `canonical_bridge::install_portal_for` populates (G.4.2).
-        // The encoder side (`trace_opcode.rs::get_list_of_active_boxes`)
-        // emits exactly `stack_base + depth_at_py_pc[pc]` Ref-typed
-        // boxes for portal-bridge frames; this count must agree so the
-        // rd_numb cursor advances symmetrically through
-        // `_prepare_next_section`.
-        //
-        // RPython parity: upstream `pyjitpl.py:177
-        // get_list_of_active_boxes` and `resume.py:1017-1026
-        // _prepare_next_section` share a single packed-liveness
-        // definition per (jitcode, pc).  Pyre's portal-bridge wrapper
-        // routes both sides through `metadata.depth_at_py_pc` instead
-        // of canonical's `all_liveness` (which encodes the dispatch
-        // loop's registers, not user PyFrame state) so the same
-        // symmetry holds.  All portal-bridge live values are Ref-typed
-        // (PyObjectRef stack), so `length_i = length_f = 0` and the
-        // total count is a single `length_r`.
-        //
-        // (Pre-G.4.3a-fix used `payload.nlocals_from_code()` which
-        // dropped `ncells`, breaking encoder/decoder count agreement
-        // for closure-bearing functions.  `metadata.stack_base` matches
-        // upstream's `pyframe.py:111 valuestackdepth = co_nlocals +
-        // ncellvars + nfreevars`.)
-        if payload.is_portal_bridge() {
-            let depth = payload
-                .metadata
-                .depth_at_py_pc
-                .get(real_pc as usize)
-                .copied()
-                .unwrap_or(0) as usize;
-            return payload.metadata.stack_base + depth;
         }
         // `CallControl.get_jitcode` drain fills pc_map + liveness
         // before any guard capture (pyjitpl.py:199 parity). The
@@ -1250,34 +1173,8 @@ pub fn frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
             return FrameLivenessRegIndices::default();
         };
         let payload = &jc.payload;
-        // G.4.4 portal-bridge fallback (symmetric with frame_value_count_at:803
-        // and trace_opcode.rs:642 get_list_of_active_boxes encoder):
-        // portal-bridge installs skip the setup-time drain and emit a
-        // positional Ref-typed box list of length
-        // `stack_base + depth_at_py_pc[pc]` covering locals + cells + the
-        // live operand stack tail. Color map is identity (no regalloc for
-        // portal-bridge), so `reg_idx == slot index` for each box.
-        // Without this fallback, `setup_bridge_sym`'s `reg_indices.len() ==
-        // frame.values.len()` assert fires on every guard exit out of a
-        // portal-bridge trace.
         // The rd_numb pc word may carry the after-residual-call marker;
-        // `real_pc` is the plain Python PC for the py_pc-keyed fallback,
         // `resolve_resume_pc` routes the marker through the right map.
-        let real_pc = majit_ir::resumedata::decode_resume_pc(pc).0;
-        if payload.is_portal_bridge() {
-            let depth = payload
-                .metadata
-                .depth_at_py_pc
-                .get(real_pc as usize)
-                .copied()
-                .unwrap_or(0) as usize;
-            let total = payload.metadata.stack_base + depth;
-            return FrameLivenessRegIndices {
-                int: Vec::new(),
-                ref_: (0..total as u32).collect(),
-                float: Vec::new(),
-            };
-        }
         let resolved_jit_pc: Option<usize> =
             payload.resolve_resume_pc_with_jitcode_pc(pc, carried_jitcode_pc, sd.op_live);
         let Some(jit_pc) = resolved_jit_pc else {
@@ -1493,19 +1390,16 @@ pub fn depth_based_vsd_for_wcode(w_code: usize, py_pc: usize) -> Option<usize> {
 /// `sym.jitcode`, so the bridge decoder can invert each live Ref color to
 /// its `locals_cells_stack_w` slot via `semantic_ref_slot_for_reg_color`.
 ///
-/// `is_portal_bridge` marks the no-regalloc installs whose colors are
-/// slot-identity; the caller keeps the identity reconstruction for those
-/// rather than driving the (per-CodeObject) maps. `has_color_map` is `false`
+/// `has_color_map` is `false`
 /// for a jitcode the codewriter never colored (empty `pcdep_color_slots`) —
 /// byte-identical over the corpus to the retired flat-map identity test
 /// (`local_color_map.is_empty() && stack_color_map.is_empty()`), which a
 /// zero-local frame owning a freely-colored operand stack correctly failed
 /// (its `stack_color_map` was non-empty → its `pcdep_color_slots` is too).
 pub(crate) struct BridgeSemanticMaps {
-    pub is_portal_bridge: bool,
     /// `true` when the codewriter colored this jitcode (non-empty
     /// `pcdep_color_slots`); drives the per-slot pcdep inversion. `false` for
-    /// portal / skeleton installs whose color bank IS the slot mirror.
+    /// skeletons whose color bank is the slot mirror.
     pub has_color_map: bool,
     pub stack_depth_at_pc: usize,
     /// #348 Part (2): per-PC `(color, slot)` entries at the resume PC.
@@ -1541,7 +1435,6 @@ pub(crate) fn bridge_semantic_maps_at_with_jitcode_pc(
         let sd = r.borrow();
         let Some(jc) = sd.jitcodes.get(jitcode_index as usize) else {
             return BridgeSemanticMaps {
-                is_portal_bridge: false,
                 has_color_map: false,
                 stack_depth_at_pc: 0,
                 pcdep_entries: Vec::new(),
@@ -1608,8 +1501,7 @@ pub(crate) fn bridge_semantic_maps_at_with_jitcode_pc(
                 // bypassing the `python_pc_for_jitcode_pc` re-inversion. Valid
                 // exactly where the twins are populated (a colored jitcode); the
                 // equality with the py_pc tables is what `PYRE_PCMAP_BRIDGE_AUDIT`
-                // certifies. Portal bridges have empty twins → fall through to the
-                // re-inversion, which still keys the populated `depth_at_py_pc`.
+                // certifies. Empty twins fall through to the re-inversion.
                 let via_twin = match (
                     payload.depth_for_jitcode_pc_pred(jp),
                     payload.pcdep_for_jitcode_pc(jp),
@@ -1621,14 +1513,10 @@ pub(crate) fn bridge_semantic_maps_at_with_jitcode_pc(
                     Some(pair) => pair,
                     None => {
                         // Slice A census: soft, non-aborting count of the
-                        // py_pc re-inversion fallback (empty-twin portal bridge
-                        // or Err(0) colored coord). Emits ONLY when this arm
+                        // py_pc re-inversion fallback. Emits ONLY when this arm
                         // runs, so zero output == dead.
                         if crate::jitcode_dispatch::bridge_audit_enabled() {
-                            eprintln!(
-                                "M73_FALLBACK site=bridge jp={jp} is_portal_bridge={}",
-                                payload.is_portal_bridge()
-                            );
+                            eprintln!("M73_FALLBACK site=bridge jp={jp}");
                         }
                         let rp =
                             crate::jitcode_dispatch::python_pc_for_jitcode_pc(&payload.metadata, jp)
@@ -1676,7 +1564,6 @@ pub(crate) fn bridge_semantic_maps_at_with_jitcode_pc(
             via_py_pc(majit_ir::resumedata::decode_resume_pc(pc).0 as usize)
         };
         BridgeSemanticMaps {
-            is_portal_bridge: payload.is_portal_bridge(),
             // #73: the codewriter colored this jitcode iff `pcdep_color_slots`
             // is non-empty — the field-free replacement for the retired flat
             // `local_color_map.is_empty() && stack_color_map.is_empty()` test.
@@ -1719,7 +1606,7 @@ pub(crate) fn const_ref_slots_at_pc_at(
                 // decode-identity shape the pcdep/depth twins use at
                 // `bridge_semantic_maps_at_with_jitcode_pc`. A colored jitcode
                 // returns `Some` (an empty slot list is a legitimate hit); an
-                // empty twin (skeleton / portal-bridge) returns `None` and falls
+                // empty twin (skeleton / fixture) returns `None` and falls
                 // through to the re-inversion, which still keys the populated
                 // `const_ref_slots_at_pc`. Equal by construction (built in the
                 // same `by_off` loop, same predecessor keying, as the twins
@@ -1731,10 +1618,7 @@ pub(crate) fn const_ref_slots_at_pc_at(
                 // re-inversion fallback (empty const-slot twin). Known COLD.
                 // Zero output == dead.
                 if crate::jitcode_dispatch::bridge_audit_enabled() {
-                    eprintln!(
-                        "M73_FALLBACK site=const jp={jp} is_portal_bridge={}",
-                        jc.payload.is_portal_bridge()
-                    );
+                    eprintln!("M73_FALLBACK site=const jp={jp}");
                 }
                 crate::jitcode_dispatch::python_pc_for_jitcode_pc(&jc.payload.metadata, jp) as usize
             } else {
@@ -1754,8 +1638,7 @@ pub(crate) fn const_ref_slots_at_pc_at(
 
 /// Return the post-regalloc Ref-bank colors of the portal red args
 /// (`pypy/module/pypyjit/interp_jit.py:67 reds = ['frame', 'ec']`) for
-/// the registered jitcode at `jitcode_index`. Both `u16::MAX` for
-/// portal-bridge installs that skip per-CodeObject regalloc.
+/// the registered jitcode at `jitcode_index`. Both are `u16::MAX` for skeletons.
 ///
 /// Used by bridge resume to thread the ec OpRef from
 /// `sym.registers_r[portal_ec_reg]` (populated by the liveness-driven
@@ -1831,8 +1714,7 @@ pub(crate) fn semantic_slot_for_reg_color(
     // precede stack within a color). A stack slot counts only while it is
     // below the live stack depth (`stack_only`) at THIS resume — the
     // per-PC entries are gated by the compile-time depth, which can
-    // exceed the runtime `stack_only` (portal-bridge stale vsd,
-    // residual-call fallthrough).
+    // exceed the runtime `stack_only` at a residual-call fallthrough.
     //
     // An empty map yields None (no live color owns this slot at this pc).
     let mut local_match: Option<usize> = None;
@@ -2224,7 +2106,7 @@ pub struct PyreSym {
     /// consumed) at the guard — colors the guard snapshot never preserved.  The
     /// walk must resume where the blackhole does (the guard offset), so the
     /// re-executed suffix only reads colors the resume data actually carries.
-    /// `None` for a non-branch-guard / portal-bridge resume, where the walk
+    /// `None` for a non-branch-guard resume, where the walk
     /// keeps the `pc_map[py_pc]` opcode-entry offset.
     pub(crate) bridge_walk_entry_pc: Option<usize>,
     /// The color-indexed Ref register bank as `consume_boxes`
@@ -3735,9 +3617,7 @@ pub(crate) fn concrete_virtualizable_slot_type(_value: PyObjectRef) -> Type {
 /// shadow's concrete half (`virtualizable_entry_at` — the value half of
 /// the Box pair the authoritative walk maintains), `valuestackdepth` =
 /// the `LiveVars` forward-stack-analysis depth at the merge point (the
-/// same `depth_at_py_pc` derivation the portal-bridge encoder/decoder
-/// pair consumes — the symbolic vsd mirror can go stale, see
-/// `portal_bridge_vable_vsd`), and `last_instr = resume_py_pc - 1` so
+/// cached `depth_at_py_pc` derivation, and `last_instr = resume_py_pc - 1` so
 /// `next_instr()` re-enters at the merge point.  A bridge walk enters at
 /// a guard pc whose stack depth differs from the merge point's, so the
 /// depth must come from the analysis, not from the frame's entry value.
@@ -3798,10 +3678,9 @@ fn flush_walk_end_state_to_frame_inner(
     let Some(info) = ctx.virtualizable_info() else {
         return false;
     };
-    // Stack depth at the merge point from the cached forward analysis
-    // (mirror of `canonical_bridge::install_portal_for`'s derivation:
+    // Stack depth at the merge point from the cached forward analysis:
     // absolute vsd = stack_base + depth, stack_base = nlocals + ncells
-    // = `concrete_nlocals`).
+    // = `concrete_nlocals`.
     let frame_ptr = frame as *const u8;
     let w_code =
         unsafe { *(frame_ptr.add(crate::frame_layout::PYFRAME_PYCODE_OFFSET) as *const *const ()) };
@@ -8530,7 +8409,7 @@ impl JitState for PyreJitState {
                 }
             }
         };
-        let semantic_mirror: Vec<OpRef> = if maps.is_portal_bridge || !maps.has_color_map {
+        let semantic_mirror: Vec<OpRef> = if !maps.has_color_map {
             // No per-CodeObject regalloc: colors are slot-identity, so the
             // color bank IS the slot mirror over the semantic prefix. Keep the
             // in-place identity overlay (stack slots NONE-only, locals vable).
@@ -13214,24 +13093,6 @@ mod indirectcalltargets_tests {
             .compiled_jitcode_lookup(code)
             .expect("populated payload should be installed by make_jitcodes");
         assert!(std::ptr::eq(sd.jitcodes[0].as_ref(), hit));
-    }
-
-    #[test]
-    fn bulk_publish_replaces_existing_portal_bridge_payload_without_moving_entry() {
-        let mut sd = MetaInterpStaticData::new();
-        let (code, raw_code) = make_code("x = 1\n");
-        let bridge_ptr = sd.portal_bridge_jitcode_for(code);
-        let bridge_index = unsafe { (*bridge_ptr).index };
-
-        sd.set_jitcodes_from_make_result(vec![populated_pyjit(raw_code)]);
-
-        let hit = sd
-            .compiled_jitcode_lookup(code)
-            .expect("portal bridge entry should remain installed");
-        assert!(std::ptr::eq(hit, bridge_ptr));
-        assert_eq!(unsafe { (*hit).index }, bridge_index);
-        assert!(!unsafe { &*hit }.payload.is_portal_bridge());
-        assert_eq!(unsafe { (*hit).raw_code() }, raw_code);
     }
 
     #[test]

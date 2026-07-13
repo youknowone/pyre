@@ -1759,7 +1759,7 @@ fn run_perfn_walk(
                     }
                 }
             } else if let Some(ref bridge_stack) = sym.bridge_stack_oprefs {
-                // Non-branch-guard / portal-bridge resume at the opcode-entry
+                // Non-branch-guard resume at the opcode-entry
                 // marker: the walk re-executes the opcode from the top, reading
                 // its operand-stack inputs POSITIONALLY — `registers_r[nlocals +
                 // stack_idx]` (trace_opcode.rs:628 `stack_slot_reg_idx`) — so
@@ -1860,8 +1860,7 @@ fn run_perfn_walk(
         )) = &mut walk_result
         {
             let loop_header_pc = *loop_header_pc;
-            // `close_loop_args_at` reads `self.orgpc` for the
-            // portal-bridge vsd lookup + last_instr anchor; the merge point
+            // `close_loop_args_at` reads `self.orgpc` for the last_instr anchor; the merge point
             // closes at the loop header, so anchor orgpc there.
             mi.orgpc = loop_header_pc;
             *jump_args =

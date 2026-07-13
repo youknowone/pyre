@@ -26,36 +26,26 @@
 //! fills a shell, because `inline_call_*` descriptors hold the callee
 //! `JitCode` object itself in the RPython model.
 //!
-//! ## Discriminator: 3-state mode mapping
+//! ## Discriminator: two-state mode mapping
 //!
-//! A `PyJitCode` is one of three modes, encoded across two flags:
+//! A produced `PyJitCode` is one of two modes:
 //!
-//! | mode             | `jitcode.code` | `metadata.is_drained` | predicate                |
-//! |------------------|----------------|-----------------------|--------------------------|
-//! | Skeleton         | empty          | false                 | [`PyJitCode::is_skeleton`]       |
-//! | PortalBridge     | non-empty      | false                 | [`PyJitCode::is_portal_bridge`]  |
-//! | PerCodeObject    | non-empty      | true                  | [`PyJitCode::is_populated`]      |
+//! | mode          | `jitcode.code` | `metadata.is_drained` | predicate                  |
+//! |---------------|----------------|-----------------------|----------------------------|
+//! | Skeleton      | empty          | false                 | [`PyJitCode::is_skeleton`] |
+//! | PerCodeObject | non-empty      | true                  | [`PyJitCode::is_populated`] |
 //!
 //! `is_drained` tracks the setup-time drain (`codewriter.rs` `finalize_jitcode`
 //! populates the per-PC maps); it is the sole mode-classification flag, so the
 //! mode is independent of the translation tables.
 //!
-//! `code` and the per-Python-PC resume tables are independent because the
-//! portal-bridged install ([`crate::canonical_bridge::install_portal_for`])
-//! reuses the canonical portal `JitCode.code` byte stream but skips the
-//! per-Python-PC mapping (the portal dispatches via its own arms on
-//! `pycode.instructions[pc]`). Drained CodeWriter installs do both: fill real
-//! instructions into `code` and populate the per-Python-PC tables. Skeletons
-//! have neither because they are placeholder slots inserted by
+//! Drained CodeWriter installs fill real instructions into `code` and populate
+//! the per-Python-PC tables. Skeletons have neither because they are placeholder slots inserted by
 //! `CallControl::get_jitcode` before the assembler drain runs.
 //!
 //! Convergence path: RPython's single `JitCode` class has neither flag
 //! to consult — `assembler.assemble` populates `code` in place and
-//! per-PC mapping is implicit in the bytecode stream. pyre will lose
-//! the dual-mode discrimination once the codewriter routes Python
-//! bytecode through the canonical RPython codewriter pipeline (Phase
-//! G.4.4+). Until then, the mode mapping above is the source of truth
-//! for every reader that branches on install style.
+//! per-PC mapping is implicit in the bytecode stream.
 
 use majit_metainterp::jitcode::JitCode as RuntimeJitCode;
 use std::cell::UnsafeCell;
@@ -80,8 +70,7 @@ pub struct PyJitCodeMetadata {
     /// the next opcode's start marker (`blackhole.py:396-410
     /// handle_exception_in_frame`).  Sparse `(py_pc, offset)` pairs sorted
     /// ascending by py_pc for binary search; only residual-call PCs appear
-    /// (most PCs have no entry), empty for skeleton / portal-bridge /
-    /// fixture metadata.
+    /// (most PCs have no entry), empty for skeleton / fixture metadata.
     pub after_residual_call_resume_pc: Vec<(u32, usize)>,
     /// py_pc → jitcode byte offset of the FIRST instruction the opcode
     /// emitted (`usize::MAX` for PCs that emit no jitcode of their own:
@@ -101,7 +90,7 @@ pub struct PyJitCodeMetadata {
     /// former dense-map block-head scan in
     /// `python_pc_for_jitcode_pc` (a coordinate landing exactly on a marker is
     /// a block head — branch/catch target — and belongs to the first opcode
-    /// resuming there). Empty for skeleton / portal-bridge / fixture metadata,
+    /// resuming there). Empty for skeleton / fixture metadata,
     /// where the legacy scan remains the fallback.
     pub block_head_py_by_jit_pc: Vec<(usize, u32)>,
     /// task#50 sparse carry-forward sidecar: the `-live-` marker byte offset
@@ -115,7 +104,7 @@ pub struct PyJitCodeMetadata {
     /// keeping exactly the divergences, so `resume_jitcode_pc_for` reproduces
     /// the dense value without the dense Vec. Sorted ascending by py_pc for
     /// binary search; sparse (most graphs need zero entries, the majority a
-    /// handful); empty for skeleton / portal-bridge / fixture metadata.
+    /// handful); empty for skeleton / fixture metadata.
     pub carryfwd_resume_pc: Vec<(u32, usize)>,
     /// Trace-entry green py_pc → JitCode byte offset where tracing enters
     /// for that green. This is the restriction of resume-marker resolution to
@@ -124,7 +113,7 @@ pub struct PyJitCodeMetadata {
     /// the live frame PC to the `jit_merge_point` origin before handling the
     /// loop header; pyre's whole-function JitCode has one corresponding entry
     /// per materialized trace-entry green. Sorted ascending by green py_pc for
-    /// binary search; empty for skeleton / portal-bridge / fixture metadata.
+    /// binary search; empty for skeleton / fixture metadata.
     pub merge_entry_by_green: Vec<(u32, u32)>,
     /// Value-stack depth at each Python PC, in slots above stack_base.
     pub depth_at_py_pc: Vec<u16>,
@@ -136,7 +125,7 @@ pub struct PyJitCodeMetadata {
     /// then reproduces `pcdep_color_slots[python_pc_for_jitcode_pc(jit_pc)]` for
     /// the carried resume coordinates reaching the decode re-inversion at
     /// `bridge_semantic_maps_at_with_jitcode_pc`. Sorted ascending by offset;
-    /// empty for skeleton / portal-bridge / fixture. `PYRE_PCMAP_BRIDGE_AUDIT`
+    /// empty for skeleton / fixture. `PYRE_PCMAP_BRIDGE_AUDIT`
     /// certifies the equality.
     pub pcdep_by_jit_pc: Vec<(usize, Vec<(u8, u16, u16)>)>,
     /// task#50 phase-1: predecessor-keyed jitcode-pc twin of `depth_at_py_pc`,
@@ -155,7 +144,7 @@ pub struct PyJitCodeMetadata {
     /// compute AFTER their forward trivia-skip. A single merged predecessor table
     /// would mis-resolve an interior not-taken coordinate onto a marker byte that
     /// sits inside a preceding op's region, so the tiers stay separate. Empty for
-    /// skeleton / portal-bridge / fixture.
+    /// skeleton / fixture.
     pub depth_trivia_marker_by_jit_pc: Vec<(usize, Option<u16>)>,
     pub depth_trivia_pred_by_jit_pc: Vec<(usize, Option<u16>)>,
     /// task#73 S5 phase-0: resume-marker twin split into the SAME two tiers as
@@ -166,14 +155,14 @@ pub struct PyJitCodeMetadata {
     /// offset for its resolving py — the value `resume_jitcode_pc_for(py)`
     /// computes. A single merged predecessor table would mis-resolve an interior
     /// coordinate onto a marker byte inside a preceding op's emitted region, so
-    /// the tiers stay separate. Empty for skeleton / portal-bridge / fixture.
+    /// the tiers stay separate. Empty for skeleton / fixture.
     pub resume_marker_marker_by_jit_pc: Vec<(usize, Option<usize>)>,
     pub resume_marker_pred_by_jit_pc: Vec<(usize, Option<usize>)>,
     /// task#73 S5 phase-2: after-residual fallthrough-marker twin with the
     /// same exact-marker / predecessor-op-start split as the resume-marker
     /// twin. Each value additionally applies the tracer's semantic
     /// fallthrough rule after skipping Python trivia. Empty for skeleton /
-    /// portal-bridge / fixture.
+    /// fixture.
     pub after_residual_marker_marker_by_jit_pc: Vec<(usize, Option<usize>)>,
     pub after_residual_marker_pred_by_jit_pc: Vec<(usize, Option<usize>)>,
     /// Post-regalloc Ref-bank color of the call-result operand-stack slot
@@ -199,8 +188,7 @@ pub struct PyJitCodeMetadata {
     /// the snapshot serializer at
     /// `pyre-jit-trace::trace_opcode::get_list_of_active_boxes` uses it
     /// to map the live_r color back to the symbolic `sym.frame` OpRef.
-    /// `u16::MAX` for portal-bridge installs that don't run the
-    /// per-CodeObject regalloc (the snapshot helper sentinel-skips).
+    /// `u16::MAX` for skeletons that have not run per-CodeObject regalloc.
     pub portal_frame_reg: u16,
     /// Post-regalloc Ref-bank color of the portal jitdriver's second red
     /// argument (`ec`, `pypy/module/pypyjit/interp_jit.py:67`).
@@ -245,8 +233,7 @@ pub struct PyJitCodeMetadata {
     /// startblock inputargs are pinned by `enforce_input_args`,
     /// `flatten.py:88-100` parity), so there is no `color == slot`
     /// identity and no flat whole-jitcode slot → color map. Empty when the
-    /// producer did not populate it (portal-bridge identity installs,
-    /// skeletons); readers branch to the slot-identity reconstruction
+    /// producer did not populate it (skeletons / fixtures); readers branch to the slot-identity reconstruction
     /// then. When populated, the `-live-` markers carry the SAME per-PC
     /// colors (built by `filter_liveness_in_place` off this map), so
     /// encode/decode/`-live-` stay in one consistent color space.
@@ -268,19 +255,17 @@ pub struct PyJitCodeMetadata {
     /// (largest offset ≤ jit_pc) reproduces
     /// `const_ref_slots_at_pc[python_pc_for_jitcode_pc(jit_pc)]` for a carried
     /// resume coordinate. Built in the same `by_off` loop as `pcdep_by_jit_pc`;
-    /// empty for skeleton / portal-bridge / fixture. Read on the decode-identity
+    /// empty for skeleton / fixture. Read on the decode-identity
     /// path of `const_ref_slots_at_pc_at`, mirroring the `pcdep_by_jit_pc` /
     /// `depth_pred_by_jit_pc` twins' production use.
     pub const_ref_slots_by_jit_pc: Vec<(usize, Vec<(u16, i64)>)>,
     /// True once `assembler.assemble`'s setup-time drain has run and stamped
     /// the per-Python-PC maps (`codewriter.rs` `finalize_jitcode`). The
-    /// install-mode discriminators ([`PyJitCode::is_populated`] /
-    /// [`PyJitCode::is_portal_bridge`]) read this flag instead of testing
+    /// install-mode discriminator [`PyJitCode::is_populated`] reads this flag instead of testing
     /// the now-deleted dense translation table's population state, so the
     /// mode classification no longer depends on it. Set to `true` exactly
     /// where the drain populates the per-Python-PC maps (drained
-    /// PerCodeObject installs); `false` for skeletons and portal-bridge
-    /// installs, which leave those maps empty.
+    /// PerCodeObject installs); `false` for skeletons, which leave those maps empty.
     pub is_drained: bool,
 }
 
@@ -374,9 +359,8 @@ impl DerefMut for PyJitCode {
 /// up the trace's inputargs.  Pyre's codewriter pipeline lacks the
 /// JitDriver greens/reds → register-slot derivation that
 /// `warmspot.setup_jit` runs, so the slot positions are encoded here
-/// as a shared formula instead — both `pyre-jit/src/jit/codewriter.rs`
-/// `MetainterpCodeWriter::compile` and `canonical_bridge.rs`
-/// `install_portal_for` route through this helper so they cannot drift.
+/// as a shared formula used by `pyre-jit/src/jit/codewriter.rs`
+/// `MetainterpCodeWriter::compile`.
 ///
 #[inline]
 pub fn portal_red_pre_regalloc_slots(nlocals: usize, max_stackdepth: usize) -> (u16, u16) {
@@ -406,7 +390,7 @@ pub fn portal_red_pre_regalloc_slots(nlocals: usize, max_stackdepth: usize) -> (
 ///   stream position) diverges here and is captured in the sparse
 ///   `carryfwd_resume_pc` sidecar instead.
 ///
-/// `None` when the tables are empty (portal-bridge / skeleton / fixture) or
+/// `None` when the tables are empty (skeleton / fixture) or
 /// no at-or-after py emitted a real op.
 pub fn derive_resume_marker(
     first_jit_pc_by_py_pc: &[usize],
@@ -533,10 +517,7 @@ impl PyJitCode {
 
     /// Resolve a Python bytecode PC to the JitCode byte offset where
     /// blackhole resume / inline call tracing should restart execution.
-    /// Returns `None` if `py_pc` falls outside the populated range
-    /// (portal-bridge installs always return `None` because their
-    /// derivation tables — `first_jit_pc_by_py_pc` /
-    /// `block_head_py_by_jit_pc` — are empty by construction).
+    /// Returns `None` if `py_pc` falls outside the populated range.
     ///
     /// This is pyre's analog of `blackhole.py:1712 self.setposition(
     /// miframe.jitcode, miframe.pc)` where upstream stores the JitCode
@@ -594,7 +575,7 @@ impl PyJitCode {
     /// with the largest offset at-or-before `jit_pc`, reproducing
     /// `python_pc_for_jitcode_pc`'s marker-then-first_jit resolution baked into
     /// the twin at build time. `None` when the table is empty (skeleton /
-    /// portal-bridge) or `jit_pc` precedes the first entry.
+    /// fixture) or `jit_pc` precedes the first entry.
     fn predecessor_index(search: Result<usize, usize>) -> Option<usize> {
         match search {
             Ok(i) => Some(i),
@@ -607,7 +588,7 @@ impl PyJitCode {
     /// offset via the `pcdep_by_jit_pc` predecessor twin. Equals
     /// `pcdep_color_slots[python_pc_for_jitcode_pc(jit_pc)]` by construction for
     /// a carried resume coordinate; `None` when the twin is empty (skeleton /
-    /// portal-bridge). Scaffolding for the decode-side pc_map re-inversion
+    /// fixture). Scaffolding for the decode-side pc_map re-inversion
     /// retirement (`PYRE_PCMAP_BRIDGE_AUDIT` certifies the equality).
     pub fn pcdep_for_jitcode_pc(&self, jit_pc: usize) -> Option<Vec<(u8, u16, u16)>> {
         let table = &self.metadata.pcdep_by_jit_pc;
@@ -636,7 +617,7 @@ impl PyJitCode {
     /// the `const_ref_slots_by_jit_pc` predecessor twin. Equals
     /// `const_ref_slots_at_pc[python_pc_for_jitcode_pc(jit_pc)]` by construction
     /// for a carried resume coordinate; `None` when the twin is empty (skeleton /
-    /// portal-bridge / fixture). Consumed on the decode-identity path of
+    /// fixture). Consumed on the decode-identity path of
     /// `const_ref_slots_at_pc_at`.
     pub fn const_ref_slots_for_jitcode_pc(&self, jit_pc: usize) -> Option<Vec<(u16, i64)>> {
         let table = &self.metadata.const_ref_slots_by_jit_pc;
@@ -658,7 +639,7 @@ impl PyJitCode {
     /// predecessor table mis-resolves onto an interior marker) and a
     /// trailing-trivia overshoot past the last opcode (where the raw
     /// `depth_at_py_pc().get(py)` is `None`; the twin bakes the same `None`, not a
-    /// spurious `0`). `None` when the twin is empty (skeleton / portal-bridge /
+    /// spurious `0`). `None` when the twin is empty (skeleton /
     /// fixture) — distinguish that from an in-table `None` via
     /// [`Self::depth_trivia_populated`].
     pub fn depth_trivia_for_jitcode_pc(&self, jit_pc: usize) -> Option<u16> {
@@ -710,7 +691,7 @@ impl PyJitCode {
     }
 
     /// task#50 #73-core: whether the trivia depth twin carries entries. `false`
-    /// for skeleton / portal-bridge / fixture installs where both tiers are
+    /// for skeleton / fixture installs where both tiers are
     /// empty. The audit uses this to distinguish an in-table `None` (overshoot,
     /// which must equal the raw reader's `None`) from an empty-twin `None` (where
     /// the raw inversion still resolves a value and the twin does not apply).
@@ -824,7 +805,7 @@ impl PyJitCode {
         let bucket = if used_carried {
             "branch_guard"
         } else if self.metadata.block_head_py_by_jit_pc.is_empty() {
-            "portal_bridge"
+            "unmapped"
         } else if after_residual_call {
             "after_residual_call"
         } else {
@@ -866,40 +847,11 @@ impl PyJitCode {
     /// nor the per-Python-PC maps populated yet. See the discriminator
     /// table on the module doc.
     ///
-    /// Strictly equivalent to `!is_populated() && !is_portal_bridge()`.
-    /// A skeleton is the only mode with empty `code` (portal-bridge and
-    /// PerCodeObject both fill `code`; the fourth combination code-empty/
-    /// drained is not produced by any path, module doc), so the empty-`code`
-    /// test alone names the third mode in the discriminator table directly.
+    /// A skeleton is the only produced mode with empty `code`; PerCodeObject
+    /// fills `code`, so the empty-`code` test names the placeholder directly.
     /// Callers prefer this name over the negated-pair form.
     pub fn is_skeleton(&self) -> bool {
         self.jitcode.code.is_empty()
-    }
-
-    /// Is this `PyJitCode` a portal-bridged install (G.3a
-    /// `canonical_bridge::install_portal_for`)?
-    ///
-    /// Discriminator:
-    ///   * `jitcode.code` non-empty (rules out `PyJitCode::skeleton`,
-    ///     which clones `Arc::new(RuntimeJitCode::default())` whose
-    ///     `code` is empty).
-    ///   * `!metadata.is_drained` (rules out drained CodeWriter installs,
-    ///     whose setup-time drain sets `is_drained` when it populates the
-    ///     per-Python-PC maps).
-    ///
-    /// Used by readers that have to branch on portal-mode semantics —
-    /// portal entry has no per-Python-PC resume maps because the portal
-    /// jitcode dispatches on `pycode.instructions[pc]` at runtime via
-    /// its own dispatch arms.  See
-    /// `canonical_bridge::install_portal_for` for the full reader
-    /// audit (G.3a).
-    ///
-    /// G.3b landed this discriminator for reader-audit probes. The
-    /// orthodox redirect path now avoids binding portal-bridge payloads as
-    /// `jd.mainjitcode`; production readers still branch on this predicate
-    /// only for explicit bridge-probe installs.
-    pub fn is_portal_bridge(&self) -> bool {
-        !self.jitcode.code.is_empty() && !self.metadata.is_drained
     }
 
     /// Empty `PyJitCode` slot inserted by `CallControl::get_jitcode`
@@ -931,8 +883,7 @@ impl PyJitCode {
                 after_residual_marker_pred_by_jit_pc: Vec::new(),
                 depth_at_py_pc: Vec::new(),
                 result_color_at_pc: Vec::new(),
-                // u16::MAX sentinel mirrors `canonical_bridge::install_portal_for`
-                // (canonical_bridge.rs:165-166). Encoder/decoder readers in
+                // Encoder/decoder readers in
                 // `get_list_of_active_boxes`, `regalloc::external/input_indices`,
                 // and `setup_bridge_sym::portal_red_regs_at` sentinel-skip both
                 // values together. A real `0` here would alias every locals-

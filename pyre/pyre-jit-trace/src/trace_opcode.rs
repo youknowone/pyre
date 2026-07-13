@@ -1279,13 +1279,6 @@ impl MIFrame {
         // borrow we take below — both come from raw pointers stored on
         // self, not nested borrows.
         let ctx: &TraceCtx = unsafe { &*self.ctx };
-        // portal-bridge keeps `s.valuestackdepth` at its initial seed
-        // because residual-call paths bypass `push_typed_value` /
-        // `pop_value` (`portal_bridge_vable_vsd` doc at line 2053-2074).
-        // Consult metadata at `self.orgpc` so the shadow snapshot covers
-        // the actual live extent at the current opcode, not the stale
-        // symbolic counter.
-        let portal_vsd = self.portal_bridge_vable_vsd(self.orgpc).map(|d| d as usize);
         // prefix_len fallback reads
         // `PyFrame.valuestackdepth` rather than the symbolic mirror.
         // `capture_pre_opcode_state` runs at the orgpc anchor where
@@ -1312,7 +1305,7 @@ impl MIFrame {
         // occupancy, and capping at `registers_r.len()` would silently
         // drop live shadow slots once `registers_r` lags behind the
         // operand stack.
-        let prefix_len = portal_vsd.unwrap_or(concrete_vsd);
+        let prefix_len = concrete_vsd;
         let snapshot = if owns_shadow && prefix_len >= nlocals {
             let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
             let mut snapshot = Vec::with_capacity(prefix_len);
@@ -1527,42 +1520,10 @@ impl MIFrame {
         };
         let live_regs_for_banks: Vec<(LiveBank, usize)> = unsafe {
             let jc = &*jitcode_ptr_pre;
-            // Skeleton payload (no `pc_map` yet) → skip the lazy-load
-            // preamble; the main path's skeleton-fallback branch
-            // handles the same case.
-            //
-            // Portal-bridge (G.4.4-encoder.2/3): the portal jitcode
-            // has no per-Python-PC `pc_map` because user opcodes are
-            // dispatched by canonical portal arms at runtime.  The
-            // RPython orthodox encoder (`pyjitpl.py:218-225`) reads
-            // every live register unconditionally.  Pyre's portal-
-            // bridge install seeds `metadata.stack_base` (G.3h) +
-            // `depth_at_py_pc[pc]` (G.4.2) so the live ref slots at
-            // this PC span `0..stack_base + depth` — locals + cells +
-            // operand-stack tail.  The full range is covered; the
-            // lazy-load preamble (lines 555+) routes each through
-            // `load_local_value` whose vable-shadow read (line 1218)
-            // works for any flat slot in `vb[NUM_VABLE_SCALARS..
-            // NUM_VABLE_SCALARS + nlocals + ncells + stackdepth]`.
-            // Portal-bridge has no regalloc so colors == slot indices
-            // (identity); the `is_portal_bridge` guard in the Ref-bank
-            // materialization loop below provides the same bypass.
+            // Skeleton payload (no resume maps yet) skips the lazy-load
+            // preamble; the main path's skeleton branch handles the same case.
             if !jc.payload.is_populated() {
-                if jc.payload.is_portal_bridge() {
-                    let stack_base = jc.payload.metadata.stack_base;
-                    let depth = jc
-                        .payload
-                        .metadata
-                        .depth_at_py_pc
-                        .get(live_pc)
-                        .copied()
-                        .unwrap_or(0) as usize;
-                    (0..stack_base + depth)
-                        .map(|idx| (LiveBank::Ref, idx))
-                        .collect()
-                } else {
-                    Vec::new()
-                }
+                Vec::new()
             } else {
                 // RPython `pyjitpl.py:218-225` reads each liveness bank
                 // from its matching register file. Pyre's unified semantic
@@ -1608,24 +1569,14 @@ impl MIFrame {
                 }
             }
         };
-        // portal-bridge has stale `s.valuestackdepth` (residual-call paths
-        // bypass push/pop — see `portal_bridge_vable_vsd` doc); consult
-        // metadata at `live_pc` so the shadow gate's `live_max` reflects
-        // the actual pyframe stack depth at the resume point. live_pc is
-        // either `orgpc` (the standard get_list_of_active_boxes path) or
-        // `fallthrough_pc` (in_a_call / after_residual_call), per RPython
-        // pyjitpl.py:194-198 — pre_opcode_registers_r is captured at orgpc
-        // and would mis-size live_max for the fallthrough_pc resume.
-        let portal_live_vsd = self.portal_bridge_vable_vsd(live_pc).map(|d| d as usize);
-        let (nlocals, valid_stack_only, jitcode_ptr, is_portal_bridge, pcdep_entries) = {
+        let (nlocals, valid_stack_only, jitcode_ptr, pcdep_entries) = {
             let s = self.sym();
-            let (is_portal_bridge, metadata_stack_depth, pcdep_entries) = if s.jitcode.is_null() {
-                (false, None, Vec::new())
+            let (metadata_stack_depth, pcdep_entries) = if s.jitcode.is_null() {
+                (None, Vec::new())
             } else {
                 unsafe {
                     let jc = &*s.jitcode;
                     (
-                        jc.payload.is_portal_bridge(),
                         jc.payload
                             .metadata
                             .depth_at_py_pc
@@ -1642,20 +1593,12 @@ impl MIFrame {
                     )
                 }
             };
-            let valid_stack_only = if let Some(vsd) = portal_live_vsd {
-                vsd.saturating_sub(s.nlocals)
-            } else if self.pre_opcode_registers_r.is_some() {
+            let valid_stack_only = if self.pre_opcode_registers_r.is_some() {
                 metadata_stack_depth.unwrap_or_else(|| s.valuestackdepth.saturating_sub(s.nlocals))
             } else {
                 s.valuestackdepth.saturating_sub(s.nlocals)
             };
-            (
-                s.nlocals,
-                valid_stack_only,
-                s.jitcode,
-                is_portal_bridge,
-                pcdep_entries,
-            )
+            (s.nlocals, valid_stack_only, s.jitcode, pcdep_entries)
         };
         let pcdep_opt: Option<&[(u8, u16, u16)]> =
             (!pcdep_entries.is_empty()).then(|| pcdep_entries.as_slice());
@@ -1679,16 +1622,12 @@ impl MIFrame {
             // `semantic_ref_slot_for_reg_color`: consult the live stack
             // prefix first, and only fall back through the local color
             // map if no live stack slot owns this color.
-            let Some(semantic_idx) = (if is_portal_bridge {
-                Some(color_idx)
-            } else {
-                crate::state::semantic_ref_slot_for_reg_color(
-                    nlocals,
-                    valid_stack_only,
-                    pcdep_opt.unwrap_or(&[]),
-                    color_idx,
-                )
-            }) else {
+            let Some(semantic_idx) = crate::state::semantic_ref_slot_for_reg_color(
+                nlocals,
+                valid_stack_only,
+                pcdep_opt.unwrap_or(&[]),
+                color_idx,
+            ) else {
                 continue;
             };
             {
@@ -1787,33 +1726,12 @@ impl MIFrame {
             // `stack_values.len()` bound on the
             // `stack_values[idx - nlocals]` read path.
             //
-            // Portal-bridge (G.4.4-encoder.3): the trace's
-            // `valuestackdepth` does not track user-bytecode stack
-            // depth (the canonical portal jitcode owns the trace's
-            // stack tracker, not user opcodes), so the per-CodeObject
-            // bound `nlocals + valid_stack_only` undercounts.  The
-            // metadata-derived `stack_base + depth_at_py_pc[pc]`
-            // (G.3h + G.4.2) is the correct bound for portal-bridge
-            // — symmetric with the encoder count side
-            // (`state::frame_value_count_at` portal-bridge branch).
             let source_len = if let Some(ref pre_r) = self.pre_opcode_registers_r {
                 pre_r.len()
             } else {
                 s.registers_r.len()
             };
-            let valid_len = if is_portal_bridge {
-                let payload = unsafe { &(&*jitcode_ptr).payload };
-                let stack_base = payload.metadata.stack_base;
-                let depth = payload
-                    .metadata
-                    .depth_at_py_pc
-                    .get(live_pc)
-                    .copied()
-                    .unwrap_or(0) as usize;
-                (stack_base + depth).min(source_len)
-            } else {
-                (s.nlocals + valid_stack_only).min(source_len)
-            };
+            let valid_len = (s.nlocals + valid_stack_only).min(source_len);
             let mut registers_i = s.registers_i.clone();
             let mut registers_r_bank = s.registers_r.clone();
             let mut registers_f = s.registers_f.clone();
@@ -1878,25 +1796,21 @@ impl MIFrame {
                             // stack depth, so Ref must be translated through
                             // the per-jitcode stack color map before touching
                             // the bank used by packed liveness.
-                            let color_idx_opt = if is_portal_bridge {
-                                Some(abs_idx)
-                            } else {
-                                // #73: the not-yet-produced call result is not a
-                                // live Variable at the resume PC, so it carries no
-                                // `pcdep_color_slots` entry; its color comes from
-                                // the precomputed `result_color_at_pc` table (the
-                                // `_result_argcode` analog, same source as
-                                // `compute_inline_caller_frame`). `live_pc` is the
-                                // fallthrough pc here (`in_a_call`), where the
-                                // result slot is the top of stack. `u16::MAX` =
-                                // empty stack / skeleton, skip the bank null.
-                                (!jitcode_ptr.is_null())
-                                    .then(|| unsafe { &*jitcode_ptr })
-                                    .and_then(|jc| {
-                                        jc.payload.metadata.result_color_at_pc.get(live_pc).copied()
-                                    })
-                                    .and_then(|c| (c != u16::MAX).then_some(c as usize))
-                            };
+                            // #73: the not-yet-produced call result is not a
+                            // live Variable at the resume PC, so it carries no
+                            // `pcdep_color_slots` entry; its color comes from
+                            // the precomputed `result_color_at_pc` table (the
+                            // `_result_argcode` analog, same source as
+                            // `compute_inline_caller_frame`). `live_pc` is the
+                            // fallthrough pc here (`in_a_call`), where the
+                            // result slot is the top of stack. `u16::MAX` =
+                            // empty stack / skeleton, skip the bank null.
+                            let color_idx_opt = (!jitcode_ptr.is_null())
+                                .then(|| unsafe { &*jitcode_ptr })
+                                .and_then(|jc| {
+                                    jc.payload.metadata.result_color_at_pc.get(live_pc).copied()
+                                })
+                                .and_then(|c| (c != u16::MAX).then_some(c as usize));
                             if let Some(color_idx) = color_idx_opt {
                                 if color_idx >= registers_r_bank.len() {
                                     registers_r_bank.resize(color_idx + 1, OpRef::NONE);
@@ -1934,65 +1848,6 @@ impl MIFrame {
         // sentinel/null jitcodes (PyreSym::new_uninit) that never
         // reach final code emission.
         let jc = unsafe { &*jitcode_ptr };
-        // Discriminate via the explicit 3-state predicates
-        // (`pyjitcode.rs` module doc): PortalBridge runs the G.4.3
-        // positional fallback; Skeleton panics; PerCodeObject (which
-        // has a non-empty `pc_map`) falls through to the canonical
-        // `pyjitpl.py:199-233` decode path below.
-        if jc.payload.is_portal_bridge() {
-            // Portal-bridge encoder (G.4.3 + G.4.4-encoder.2/3):
-            // emit a positional Ref-typed box list of length
-            // `stack_base + depth_at_py_pc[live_pc]`, covering locals
-            // + cells + the live operand stack tail.
-            // `metadata.stack_base = code.varnames.len() + ncells(code)`
-            // (G.3h) is the absolute boundary in
-            // `PyFrame.locals_cells_stack_w` between the "always live"
-            // slots and the depth-dependent operand stack — the same
-            // boundary `set_stack_at` (state.rs:2762) uses on the
-            // decoder writeback side.
-            //
-            // Encoder/decoder symmetry (G.4.3 + G.4.4-encoder.3): both
-            // `state::frame_value_count_at` and
-            // `restore_guard_failure_values` source their counts from
-            // `metadata.stack_base + depth_at_py_pc[pc]` so the
-            // upstream `pyjitpl.py:177` / `resume.py:1017-1026`
-            // packed-liveness invariant is preserved.  The
-            // `live_reg_idxs` derivation above (line 504-516) emits
-            // the same range so the lazy-load preamble (line 584-633)
-            // populates `registers_r` from the vable shadow before
-            // the snapshot — RPython orthodox always-box semantics
-            // (`pyjitpl.py:218-225`).  Slots whose vable shadow is
-            // NONE fall through to the heap-read path inside
-            // `load_local_value` (line 1240-1265), so the encoder
-            // emits a real OpRef for every live slot.
-            //
-            // Earlier the encoder fell back to
-            // `OpRef::NONE` for slots beyond `registers_r.len()`
-            // (relying on `consume_one_section` to overwrite before
-            // BH deref); both divergences from `pyjitpl.py:177-234`
-            // (single-bank read + always-box) are now closed by
-            // routing the full live range through the same lazy-load
-            // mechanism per-CodeObject mode uses.
-            let stack_base = jc.payload.metadata.stack_base;
-            let depth = jc
-                .payload
-                .metadata
-                .depth_at_py_pc
-                .get(live_pc)
-                .copied()
-                .unwrap_or(0) as usize;
-            let target_count = stack_base + depth;
-            let mut boxes = Vec::with_capacity(target_count);
-            for reg in 0..target_count {
-                boxes.push(
-                    registers_r_semantic
-                        .get(reg)
-                        .copied()
-                        .unwrap_or(OpRef::NONE),
-                );
-            }
-            return boxes;
-        }
         if jc.payload.is_skeleton() {
             // `CallControl.get_jitcode` drain fills pc_map before any
             // guard capture (pyjitpl.py:199 parity). Phase X-0 eliminated
@@ -2722,25 +2577,15 @@ impl MIFrame {
             (0, 0, 0)
         };
         let ns_ptr = self.sym().concrete_namespace as i64;
-        // G.4.3a: portal-bridge frames trace eval_loop_jit, so each user
-        // opcode is a residual call to execute_opcode_step whose
-        // valuestackdepth side-effects do NOT advance `sym.valuestackdepth`.
-        // The stale symbolic value would encode `vable_valuestackdepth =
-        // stack_base`, leaving the resumed PyFrame with vsd ≤ stack_base
-        // and crashing the next pop. Recompute from the per-PC user-side
-        // depth metadata derived in `install_portal_for` (G.4.2).
-        //
-        // When the portal-bridge metadata is absent,
-        // read from the concrete `PyFrame.valuestackdepth` rather than the
-        // stale `sym.valuestackdepth`.  `resume_pc == self.orgpc` (the
+        // Read from the concrete `PyFrame.valuestackdepth` rather than the
+        // symbolic mirror. `resume_pc == self.orgpc` (the
         // start PC of the current opcode) so PyFrame holds the correct
         // pre-opcode value (the interpreter step for this opcode has not
         // run yet).  Falls back to the symbolic value only when
         // `concrete_frame_addr == 0` (test-only sym-only MIFrames).
-        let vsd = self.portal_bridge_vable_vsd(resume_pc).unwrap_or_else(|| {
-            self.concrete_valuestackdepth()
-                .unwrap_or_else(|| self.sym().valuestackdepth) as i64
-        });
+        let vsd = self
+            .concrete_valuestackdepth()
+            .unwrap_or_else(|| self.sym().valuestackdepth) as i64;
         // virtualizable.py:86-93 read_boxes: ALL static fields from the heap.
         let last_instr_value = resume_pc as i64 - 1;
         let last_instr_op = ctx.const_int(last_instr_value);
@@ -2794,45 +2639,6 @@ impl MIFrame {
         }
     }
 
-    /// G.4.3a: For portal-bridge frames, derive the absolute
-    /// valuestackdepth from `metadata.stack_base + depth_at_py_pc[pc]`
-    /// (both populated by `install_portal_for` G.3h + G.4.2).  Returns
-    /// `None` for non-portal-bridge or null-jitcode states so the caller
-    /// can fall back to the stale `sym.valuestackdepth` /
-    /// `pre_opcode_semantic_depth` heuristic that the per-CodeObject
-    /// path relies on.
-    ///
-    /// Why this is needed: portal-bridge tracing records each user opcode
-    /// as a residual call to `execute_opcode_step`.  The symbolic
-    /// `sym.valuestackdepth` only advances through `push_typed_value` /
-    /// `pop_value` (`trace_opcode.rs:808/872`), neither of which fires
-    /// for residual-call paths.  As a result the symbolic value stays at
-    /// its initial seed (`= stack_base`) for the lifetime of the trace,
-    /// and the encoded `vable_valuestackdepth` is too low.  Restoring
-    /// that value into PyFrame.valuestackdepth crashes the next pop with
-    /// `assertion failed: self.valuestackdepth > self.stack_base()`
-    /// (`pyframe.rs:862`).  The metadata-driven computation matches the
-    /// runtime PyFrame state for the same `(jitcode, py_pc)` pair, just
-    /// like the per-CodeObject path's stack-effect walk does inside
-    /// `pre_opcode_registers_r`.
-    fn portal_bridge_vable_vsd(&self, pc: usize) -> Option<i64> {
-        let s = self.sym();
-        if s.jitcode.is_null() {
-            return None;
-        }
-        let payload = unsafe { &(*s.jitcode).payload };
-        if !payload.is_portal_bridge() {
-            return None;
-        }
-        let depth = payload
-            .metadata
-            .depth_at_py_pc
-            .get(pc)
-            .copied()
-            .unwrap_or(0) as usize;
-        Some((payload.metadata.stack_base + depth) as i64)
-    }
-
     /// capture_resumedata(resumepc=orgpc) parity: flush vable fields for guards.
     ///
     /// When a pre-opcode snapshot is present, sets vable_last_instr = orgpc - 1
@@ -2847,9 +2653,7 @@ impl MIFrame {
         // RPython capture_resumedata(resumepc=orgpc) parity:
         // Always use orgpc (opcode start PC) as the resume PC.
         let resume_pc = self.orgpc;
-        let vsd = self
-            .portal_bridge_vable_vsd(resume_pc)
-            .unwrap_or_else(|| self.pre_opcode_concrete_depth() as i64);
+        let vsd = self.pre_opcode_concrete_depth() as i64;
         // pyjitpl.py:2586-2602 `capture_resumedata` parity: RPython reads
         // `metainterp.virtualizable_boxes` without mutating it. The two
         // fields that advance per-opcode (`last_instr`, `valuestackdepth`)
@@ -2857,7 +2661,7 @@ impl MIFrame {
         // is itself the dispatch loop: at guard time the active opcode is
         // the one at `orgpc`, so the snapshot must encode the pre-opcode
         // state (`last_instr = orgpc - 1`, `valuestackdepth = pre-opcode
-        // depth via pre_opcode_registers_r / portal_bridge_vable_vsd`).
+        // depth via `pre_opcode_registers_r`).
         // The other four scalars (`pycode`, `debugdata`, `lastblock`,
         // `w_globals`) keep the inputarg OpRefs `init_vable_indices`
         // seeded at trace start because pyre-jit-trace never enters
@@ -3350,17 +3154,11 @@ impl MIFrame {
                         .valuestackdepth
                         .saturating_sub(self.sym().nlocals)
             });
-        // portal-bridge keeps `s.valuestackdepth` at its initial seed
-        // (see `portal_bridge_vable_vsd` doc); consult metadata at the
-        // current pc so `stack_only` reflects the actual JUMP-source
-        // stack depth instead of the stale symbolic counter.
-        let portal_vsd = self.portal_bridge_vable_vsd(self.orgpc).map(|d| d as usize);
         // [frame, ec] portal-reds contract: recover ec before the sym()
         // snapshot below so JUMP args never carry OpRef::NONE in the ec
         // slot on adapter / bridge-from-guard paths.
         let recovered_ec = self.ensure_execution_context(ctx);
-        // When the portal-bridge metadata is absent,
-        // the stack depth fallback reads from `PyFrame.valuestackdepth`
+        // The stack depth reads from `PyFrame.valuestackdepth`
         // (via `concrete_valuestackdepth()`) rather than the symbolic
         // mirror.  `close_loop_args_at` runs at the orgpc anchor where
         // PyFrame still holds the pre-opcode state.
@@ -3384,7 +3182,7 @@ impl MIFrame {
         ) = {
             let s = self.sym();
             let nlocals = s.nlocals;
-            let stack_only = portal_vsd.unwrap_or(concrete_vsd).saturating_sub(s.nlocals);
+            let stack_only = concrete_vsd.saturating_sub(s.nlocals);
             // virtualizable.py:86-98 `read_boxes` + pyjitpl.py:2954-2965
             // `reached_loop_header`: `virtualizable_boxes` length is the
             // target vable array capacity (`nlocals + ncells + co_stacksize`),
@@ -3503,7 +3301,7 @@ impl MIFrame {
         // which reconstructs the dead tail as null. Force the null here: these
         // slots reach only the terminal JUMP args, never an in-trace field
         // base, so no `get_const_info_mut` null-base abort.
-        let live_stack_len = portal_vsd.unwrap_or(concrete_vsd).saturating_sub(nlocals);
+        let live_stack_len = concrete_vsd.saturating_sub(nlocals);
         for (stack_idx, value) in stack.into_iter().enumerate() {
             let target_type = inputarg_types
                 .get(num_scalars + nlocals + stack_idx)
@@ -3739,14 +3537,11 @@ impl MIFrame {
         // `num_scalars` already counts `extra_reds` (per dedup loop above).
         {
             let header_off = num_scalars;
-            // Mirror args' stack range (line 2891): portal-bridge keeps
-            // `s.valuestackdepth` at the initial seed (residual-call
-            // paths bypass `push_typed_value`), so the args layout uses
-            // `portal_vsd` metadata when present.  The runtime-value
-            // walk must use the same range or the locals/stack slot
-            // indices misalign relative to `args[header_off + ..]`.
-            let stack_only = portal_vsd
-                .unwrap_or(self.sym().valuestackdepth)
+            // The runtime-value walk uses the symbolic stack range so the
+            // locals/stack slot indices align with `args[header_off + ..]`.
+            let stack_only = self
+                .sym()
+                .valuestackdepth
                 .saturating_sub(self.sym().nlocals);
             let collect_kind =
                 |opref: OpRef, cv: crate::state::ConcreteValue| -> Option<majit_ir::Value> {
@@ -4623,8 +4418,7 @@ impl MIFrame {
         // the four invariant scalars (`pycode`, `debugdata`,
         // `lastblock`, `w_globals`), and recompute the two
         // per-opcode-advancing scalars (`last_instr`, `valuestackdepth`)
-        // from `self.orgpc` / `pre_opcode_registers_r` /
-        // `portal_bridge_vable_vsd(orgpc)` so the snapshot encodes
+        // from `self.orgpc` / `pre_opcode_registers_r` so the snapshot encodes
         // the pre-opcode state at `resume_pc` (the PROBE-VABLE-DIV
         // diagnostic confirmed slot 0 / slot 2 are the
         // only divergence sources between the shared shadow and
@@ -4644,10 +4438,8 @@ impl MIFrame {
         // self-consistent.
         //
         // The slot-2 inline override re-derives the pre-opcode
-        // valuestackdepth via `portal_bridge_vable_vsd(resume_pc)
-        // .unwrap_or(pre_opcode_semantic_depth / s.valuestackdepth)`
-        // — same source `flush_to_frame_for_guard` uses to set
-        // `s.vable_valuestackdepth`.
+        // valuestackdepth from the same source `flush_to_frame_for_guard`
+        // uses to set `s.vable_valuestackdepth`.
         //
         // Test-fixture fallback: `TraceCtx::for_test_types` callers
         // construct a ctx without registering `VirtualizableInfo` and
@@ -4671,10 +4463,7 @@ impl MIFrame {
         };
         let pre_opcode_vsd: Option<i64> = if vsd_field_index.is_some() {
             let resume_pc = self.orgpc;
-            Some(
-                self.portal_bridge_vable_vsd(resume_pc)
-                    .unwrap_or_else(|| self.pre_opcode_concrete_depth() as i64),
-            )
+            Some(self.pre_opcode_concrete_depth() as i64)
         } else {
             None
         };

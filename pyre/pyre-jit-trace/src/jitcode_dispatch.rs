@@ -9688,7 +9688,7 @@ fn reseed_vstack_from_shadow(ctx: &mut WalkContext<'_, '_>, new_depth: usize) ->
 /// `first_jit_pc_by_py_pc` containment table (largest `py` with
 /// `first_jit[py] <= jit_pc`); falls back to the nearest-`-live-`-marker
 /// heuristic (reconstructed via [`pc_map_marker_for`])
-/// when that table is empty (portal-bridge / fixture installs).
+/// when that table is empty (skeleton / fixture installs).
 fn vstack_containing_py_pc(metadata: &crate::PyJitCodeMetadata, jit_pc: usize) -> u32 {
     let first_jit = &metadata.first_jit_pc_by_py_pc;
     if !first_jit.is_empty() {
@@ -9702,7 +9702,7 @@ fn vstack_containing_py_pc(metadata: &crate::PyJitCodeMetadata, jit_pc: usize) -
             return py;
         }
     }
-    // Nearest-`-live-`-marker fallback (portal-bridge / fixture / a coordinate
+    // Nearest-`-live-`-marker fallback (skeleton / fixture / a coordinate
     // preceding the first op — verified to fire only at `jit_pc == 0`): the
     // largest `py` whose resume marker offset is `<= jit_pc`, ties → larger
     // `py`.  Reconstructs each `py`'s marker via the two surviving tables (the
@@ -9729,7 +9729,7 @@ fn vstack_containing_py_pc(metadata: &crate::PyJitCodeMetadata, jit_pc: usize) -
 /// [`crate::PyJitCode::resume_jitcode_pc_for`]: the sidecar takes precedence
 /// (it holds the non-derivable divergences), everything else derives via
 /// [`crate::pyjitcode::derive_resume_marker`].  `None` when `py` is out of
-/// range or the tables are empty (skeleton / portal-bridge).
+/// range or the tables are empty (skeleton / fixture).
 fn pc_map_marker_for(metadata: &crate::PyJitCodeMetadata, py: usize) -> Option<usize> {
     if let Ok(i) = metadata
         .carryfwd_resume_pc
@@ -10011,10 +10011,10 @@ pub(crate) fn bridge_audit_enabled() -> bool {
 /// funnel it checks whether the ORIGINAL Python pc is recoverable from the JitCode
 /// offset the flip would store: `python_pc_for_jitcode_pc(flip_offset) ==
 /// decode_resume_pc(raw_pc).0`, bucketed by frame class (branch_guard /
-/// portal_bridge / after_residual_call / sentinel_plain). Zero divergence across
+/// unmapped / after_residual_call / sentinel_plain). Zero divergence across
 /// the corpus is the precondition for dropping the py_pc word. Orthogonal to the
 /// task#50 twin-table audits, which are gated by `can_decode_live_vars` and so
-/// never reach the portal-bridge / sentinel / after-residual-call frames.
+/// never reach the unmapped / sentinel / after-residual-call frames.
 /// Diagnostic only; off in production.
 pub(crate) fn m369_recover_audit_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -10470,7 +10470,7 @@ pub(crate) fn python_pc_for_jitcode_pc(metadata: &crate::PyJitCodeMetadata, jit_
     // the same block-head marker bytes at compile time. A no-JitCode prefix is
     // included in the entry coordinate, so a CACHE / NOT_TAKEN run followed by
     // constant-folded loads cannot move the inverse into the middle of an arm.
-    // Drained installs carry it; skeleton / portal-bridge / fixture installs
+    // Drained installs carry it; skeleton / fixture installs
     // leave it empty.
     if !metadata.block_head_py_by_jit_pc.is_empty() {
         if let Ok(i) = metadata
@@ -10487,7 +10487,7 @@ pub(crate) fn python_pc_for_jitcode_pc(metadata: &crate::PyJitCodeMetadata, jit_
             best = Some((pos, py as u32));
         }
     }
-    // Both live tiers missed (skeleton / portal-bridge / fixture, or a
+    // Both live tiers missed (skeleton / fixture, or a
     // coordinate preceding the first op): resume at the first opcode.
     best.map_or(0, |(_, py)| py)
 }
@@ -10904,8 +10904,7 @@ fn kept_stack_has_boxed_int_hazard(
             // fallback (empty depth-trivia twin). Zero output == dead.
             if m73_encode_audit_enabled() {
                 eprintln!(
-                    "M73_FALLBACK site=kshbih target={target} is_portal_bridge={} code_null={}",
-                    pjc.is_portal_bridge(),
+                    "M73_FALLBACK site=kshbih target={target} code_null={}",
                     pjc.code_ptr.is_null()
                 );
             }
@@ -11026,7 +11025,7 @@ fn branch_arm_resume_ref_liveness(
         // jitcode `target` via the jitcode-pc-keyed twin, bypassing the
         // `python_pc_for_jitcode_pc` inversion + `pc_map` re-key. The twin
         // falls back to the same `resolve_resume_pc` path (keyed on `py`) for
-        // unpopulated / portal-bridge installs, so those are unaffected.
+        // unpopulated installs, so those are unaffected.
         let jitcode_index = jc.index;
         let banks = crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
             jitcode_index,
@@ -11880,7 +11879,7 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 // bit-14 marker, so `resume_jitcode_pc_for(py_pc)` would name a
                 // different
                 // offset.  Fall back to the sentinel if `py_pc` has no resume
-                // entry (portal-bridge / out-of-range).
+                // entry (skeleton / out-of-range).
                 // #73 S5 phase-5 slice-4: the translation is evaluated lazily —
                 // under the (default-ON) twin carry it runs only for the
                 // twin-`None` overshoot rows (0 across the certified corpus),
@@ -14961,8 +14960,7 @@ fn try_walker_inline_user_call(
     // `dispatch_inline_call_dr_kind`).  The canonical splice regalloc does
     // not pin local-i inputargs to identity colors, so the register the
     // body reads param i from is its per-PC pcdep color at the callee entry
-    // (`pcdep_color_slots[0]`), not `r{i}`; an empty map (portal-bridge
-    // install) is identity.
+    // (`pcdep_color_slots[0]`), not `r{i}`; an empty fixture map is identity.
     let entry_colors = crate::state::sub_jitcode_entry_param_colors(w_code);
     for i in 0..nparams {
         let reg = match &entry_colors {

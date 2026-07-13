@@ -478,13 +478,8 @@ impl LiveVars {
     /// G.4.2: per-PC stack depth in `u16`, sized to
     /// `code.instructions.len()`.
     ///
-    /// Used by `canonical_bridge::install_portal_for` to populate the
-    /// portal-bridge `PyJitCodeMetadata.depth_at_py_pc` field.  The
-    /// portal-bridge encoder/decoder symmetry (G.4.3 and later) wires
-    /// both sides through this metadata so per-frame tagged-value
-    /// counts agree at every guard PC, restoring the upstream
-    /// `pyjitpl.py:177 get_list_of_active_boxes` /
-    /// `resume.py:1017-1026 _prepare_next_section` invariant.
+    /// Used by the codewriter and resume-coordinate derivations to populate
+    /// `PyJitCodeMetadata.depth_at_py_pc`.
     ///
     /// Unreachable PCs (the forward-pass `usize::MAX` sentinel from
     /// `LiveVars::compute`) collapse to `0` since they cannot fire

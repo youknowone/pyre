@@ -25,7 +25,6 @@ extern crate self as pyre_jit_trace;
 
 pub mod assembler;
 pub mod callbacks;
-pub mod canonical_bridge;
 pub mod descr;
 pub mod driver;
 pub mod frame_layout;
