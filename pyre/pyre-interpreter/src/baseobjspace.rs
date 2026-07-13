@@ -10183,11 +10183,10 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 ));
             }
             let index = dv::w_dict_view_iterator_get_index(obj);
-            let items = pyre_object::dictmultiobject::w_dict_items(dict);
-            if index >= items.len() {
+            let Some((k, mut v)) = pyre_object::dictmultiobject::w_dict_nth_item(dict, index)
+            else {
                 return Err(PyError::stop_iteration());
-            }
-            let (k, mut v) = items[index];
+            };
             dv::w_dict_view_iterator_set_index(obj, index + 1);
             // `:829-841` strategy-transition handling.
             let start_strategy_id = dv::w_dict_view_iterator_get_start_strategy_id(obj);

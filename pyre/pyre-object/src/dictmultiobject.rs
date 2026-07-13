@@ -3235,6 +3235,18 @@ pub unsafe fn w_dict_items(obj: PyObjectRef) -> Vec<(PyObjectRef, PyObjectRef)> 
     w_dict_get_strategy(obj).items(obj)
 }
 
+/// `w_dict_get_strategy(obj).nth_item(obj, index)` — single-entry
+/// dispatch backing the dict view iterator's per-step fetch.
+///
+/// # Safety
+/// `obj` must be a valid `W_DictObject` PyObjectRef.
+pub unsafe fn w_dict_nth_item(
+    obj: PyObjectRef,
+    index: usize,
+) -> Option<(PyObjectRef, PyObjectRef)> {
+    w_dict_get_strategy(obj).nth_item(obj, index)
+}
+
 /// `dictmultiobject.py:585-587 W_DictMultiObject.descr_copy` —
 /// `w_dict.copy()` delegates to `strategy.copy(w_dict)` so typed
 /// strategies preserve their backing shape (`:1152
@@ -3337,6 +3349,24 @@ pub unsafe fn w_dict_items_int_strategy(obj: PyObjectRef) -> Vec<(PyObjectRef, P
         .collect()
 }
 
+/// Internal helper: single-entry accessor for `IntDictStrategy` —
+/// the `index`-th `(newint(key), value)` pair in insertion order,
+/// O(1) via `IndexMap::get_index`.  Backs the dict view iterator's
+/// per-step fetch (`baseobjspace.rs` `next()`), replacing a full
+/// `w_dict_items_int_strategy` re-materialisation per step.
+///
+/// # Safety
+/// Same as [`w_dict_items_int_strategy`].
+pub unsafe fn w_dict_nth_item_int_strategy(
+    obj: PyObjectRef,
+    index: usize,
+) -> Option<(PyObjectRef, PyObjectRef)> {
+    let (k, v) = w_dict_int_storage(obj)
+        .get_index(index)
+        .map(|(&k, &v)| (k, v))?;
+    Some((crate::w_int_new(k), v))
+}
+
 /// Internal helper: `IntDictStrategy::clear` body —
 /// `dictmultiobject.py:1141 self.unerase(w_dict.dstorage).clear()`.
 ///
@@ -3416,6 +3446,21 @@ pub unsafe fn w_dict_items_bytes_strategy(obj: PyObjectRef) -> Vec<(PyObjectRef,
         .collect()
 }
 
+/// Internal helper: single-entry accessor for `BytesDictStrategy`.
+///
+/// # Safety
+/// Same as [`w_dict_items_bytes_strategy`].
+pub unsafe fn w_dict_nth_item_bytes_strategy(
+    obj: PyObjectRef,
+    index: usize,
+) -> Option<(PyObjectRef, PyObjectRef)> {
+    let entries = w_dict_bytes_storage(obj);
+    let (k, v) = entries.get_index(index)?;
+    let key_bytes = k.clone();
+    let value = *v;
+    Some((crate::w_bytes_from_bytes(key_bytes.as_slice()), value))
+}
+
 /// Internal helper: `BytesDictStrategy::clear` body.
 ///
 /// # Safety
@@ -3459,6 +3504,26 @@ pub unsafe fn w_dict_items_object_strategy(obj: PyObjectRef) -> Vec<(PyObjectRef
         }
     }
     out
+}
+
+/// Internal helper: single-entry accessor for `ObjectDictStrategy` /
+/// `UnicodeDictStrategy`.  O(1) `get_index` when no `dict_storage_proxy`
+/// is attached; falls back to the full `w_dict_items_object_strategy`
+/// materialisation for the proxy-merged ordering (proxy dicts are
+/// namespace-sized, not the O(N²) hot path).
+///
+/// # Safety
+/// `obj` must point to a valid `W_DictObject`.
+pub unsafe fn w_dict_nth_item_object_strategy(
+    obj: PyObjectRef,
+    index: usize,
+) -> Option<(PyObjectRef, PyObjectRef)> {
+    let dict = &*(obj as *const W_DictObject);
+    if dict.dict_storage_proxy.is_null() {
+        let entries = &*(dict.dstorage as *const indexmap::IndexMap<ObjectKey, PyObjectRef>);
+        return entries.get_index(index).map(|(k, &v)| (k.obj, v));
+    }
+    w_dict_items_object_strategy(obj).into_iter().nth(index)
 }
 
 /// Internal helper: `ModuleDictStrategy::items` body for pyre's
@@ -3979,6 +4044,28 @@ pub trait DictStrategy {
     /// # Safety
     /// `w_dict` must be a valid PyObjectRef.
     unsafe fn items(&self, w_dict: PyObjectRef) -> Vec<(PyObjectRef, PyObjectRef)>;
+
+    /// Fetch the single `(key, value)` entry at iteration position
+    /// `index` (insertion order), wrapping only that one key — O(1)
+    /// per step for the typed strategies via `IndexMap::get_index`.
+    /// Returns `None` once `index` is past the end.
+    ///
+    /// Stands in for PyPy's `next_*_entry` pulling one entry from the
+    /// strategy cursor (`dictmultiobject.py:904-937`); the dict view
+    /// iterator's integer `index` field replaces the live iterator the
+    /// GC-object layout cannot hold.  The default materialises the full
+    /// list (fine for the tiny empty strategies); typed strategies
+    /// override for O(1).
+    ///
+    /// # Safety
+    /// `w_dict` must be a valid PyObjectRef.
+    unsafe fn nth_item(
+        &self,
+        w_dict: PyObjectRef,
+        index: usize,
+    ) -> Option<(PyObjectRef, PyObjectRef)> {
+        self.items(w_dict).into_iter().nth(index)
+    }
 
     /// `dictmultiobject.py:624-634 DictStrategy.pop` — remove and
     /// return the value for `w_key`.  Returns `Ok(value)` on hit,
@@ -4822,6 +4909,14 @@ impl DictStrategy for ObjectDictStrategy {
         crate::dictmultiobject::w_dict_items_object_strategy(w_dict)
     }
 
+    unsafe fn nth_item(
+        &self,
+        w_dict: PyObjectRef,
+        index: usize,
+    ) -> Option<(PyObjectRef, PyObjectRef)> {
+        crate::dictmultiobject::w_dict_nth_item_object_strategy(w_dict, index)
+    }
+
     /// `dictmultiobject.py:1227-1228 clear` — `self.unerase
     /// (w_dict.dstorage).clear()`.  Direct dstorage truncation +
     /// JIT length-cache reset; `w_dict_clear` (the public wrapper)
@@ -4980,6 +5075,14 @@ impl DictStrategy for BytesDictStrategy {
         crate::dictmultiobject::w_dict_items_bytes_strategy(w_dict)
     }
 
+    unsafe fn nth_item(
+        &self,
+        w_dict: PyObjectRef,
+        index: usize,
+    ) -> Option<(PyObjectRef, PyObjectRef)> {
+        crate::dictmultiobject::w_dict_nth_item_bytes_strategy(w_dict, index)
+    }
+
     unsafe fn clear(&self, w_dict: PyObjectRef) {
         crate::dictmultiobject::w_dict_clear_bytes_strategy(w_dict);
     }
@@ -5134,6 +5237,14 @@ impl DictStrategy for UnicodeDictStrategy {
 
     unsafe fn items(&self, w_dict: PyObjectRef) -> Vec<(PyObjectRef, PyObjectRef)> {
         crate::dictmultiobject::w_dict_items_object_strategy(w_dict)
+    }
+
+    unsafe fn nth_item(
+        &self,
+        w_dict: PyObjectRef,
+        index: usize,
+    ) -> Option<(PyObjectRef, PyObjectRef)> {
+        crate::dictmultiobject::w_dict_nth_item_object_strategy(w_dict, index)
     }
 
     unsafe fn clear(&self, w_dict: PyObjectRef) {
@@ -5328,6 +5439,14 @@ impl DictStrategy for IntDictStrategy {
 
     unsafe fn items(&self, w_dict: PyObjectRef) -> Vec<(PyObjectRef, PyObjectRef)> {
         crate::dictmultiobject::w_dict_items_int_strategy(w_dict)
+    }
+
+    unsafe fn nth_item(
+        &self,
+        w_dict: PyObjectRef,
+        index: usize,
+    ) -> Option<(PyObjectRef, PyObjectRef)> {
+        crate::dictmultiobject::w_dict_nth_item_int_strategy(w_dict, index)
     }
 
     unsafe fn clear(&self, w_dict: PyObjectRef) {
