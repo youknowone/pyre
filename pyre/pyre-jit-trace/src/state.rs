@@ -1252,6 +1252,18 @@ pub fn frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
     })
 }
 
+/// Post-flip decode entry: `pc` is already the JitCode byte offset (the flip
+/// stores the resolved offset in the frame pc word), so resolve the liveness
+/// coordinate from `pc` itself — no carried twin needed. Byte-identical to the
+/// `_with_jitcode_pc` form for every frame whose stored `pc` equals the twin
+/// offset (all corpus frames).
+pub(crate) fn frame_liveness_reg_indices_by_bank_from_pc(
+    jitcode_index: i32,
+    pc: i32,
+) -> FrameLivenessRegIndices {
+    frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(jitcode_index, pc, pc)
+}
+
 pub fn frame_liveness_reg_indices_at(jitcode_index: i32, pc: i32) -> Vec<u32> {
     frame_liveness_reg_indices_by_bank_at(jitcode_index, pc).flattened()
 }
@@ -1608,6 +1620,10 @@ pub(crate) fn bridge_semantic_maps_at_with_jitcode_pc(
     })
 }
 
+pub(crate) fn bridge_semantic_maps_from_pc(jitcode_index: i32, pc: i32) -> BridgeSemanticMaps {
+    bridge_semantic_maps_at_with_jitcode_pc(jitcode_index, pc, pc)
+}
+
 /// Per-PC operand-stack Ref CONSTANTS (`(semantic_slot, raw_ref)`) at the
 /// resume PC of a jitcode. The pcdep color map records live Variables only;
 /// `reconstruct_inline_recipe` uses this to refill the registerless constant
@@ -1662,6 +1678,10 @@ pub(crate) fn const_ref_slots_at_pc_at(
             .cloned()
             .unwrap_or_default()
     })
+}
+
+pub(crate) fn const_ref_slots_from_pc(jitcode_index: i32, pc: i32) -> Vec<(u16, i64)> {
+    const_ref_slots_at_pc_at(jitcode_index, pc, pc)
 }
 
 /// Return the post-regalloc Ref-bank colors of the portal red args
@@ -5805,11 +5825,7 @@ fn reconstruct_inline_recipe(
     }
     let nlocals = code_ref.varnames.len();
 
-    let reg_indices = frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
-        frame.jitcode_index,
-        frame.pc,
-        frame.jitcode_pc,
-    );
+    let reg_indices = frame_liveness_reg_indices_by_bank_from_pc(frame.jitcode_index, frame.pc);
     // resume.py:1054 consume_boxes: the liveness enumeration count must match
     // the encoded frame section exactly.
     if reg_indices.total_len() != frame.values.len() {
@@ -6080,7 +6096,7 @@ fn reconstruct_inline_recipe(
 
     // Refill registerless operand-stack constants the color map omits (an
     // inlined callee has no value-stack resumedata to rematerialize them from).
-    for (slot, raw) in const_ref_slots_at_pc_at(frame.jitcode_index, frame.pc, frame.jitcode_pc) {
+    for (slot, raw) in const_ref_slots_from_pc(frame.jitcode_index, frame.pc) {
         let s = slot as usize;
         if s < valuestackdepth {
             registers_r[s] = ctx.const_ref(raw);
@@ -8196,10 +8212,9 @@ impl JitState for PyreJitState {
         // a single `registers_X` vector by abstract register color —
         // there is no `idx < nlocals` decode.
         let frame0 = &resume_data.frames[0];
-        let reg_indices = crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
+        let reg_indices = crate::state::frame_liveness_reg_indices_by_bank_from_pc(
             frame0.jitcode_index,
             frame0.pc,
-            frame0.jitcode_pc,
         );
         // For a kept-stack branch guard, the vable's
         // `valuestackdepth` may reflect the merge-target depth (consumed
@@ -8356,11 +8371,7 @@ impl JitState for PyreJitState {
         // `[0,nlocals)` prefix to identity colors (now retired). Invert each
         // live color to its slot via `semantic_ref_slot_for_reg_color` so the
         // mirror is correct under freely-colored locals.
-        let maps = crate::state::bridge_semantic_maps_at_with_jitcode_pc(
-            frame0.jitcode_index,
-            frame0.pc,
-            frame0.jitcode_pc,
-        );
+        let maps = crate::state::bridge_semantic_maps_from_pc(frame0.jitcode_index, frame0.pc);
         // For a kept-stack branch guard, the vable's runtime
         // `valuestackdepth` reflects the merge-target depth (post
         // consumption) rather than the guard's deeper live depth. The
