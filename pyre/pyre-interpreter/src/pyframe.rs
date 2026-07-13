@@ -172,6 +172,15 @@ pub const PYFRAME_GC_TYPE_ID: u32 = 37;
 /// allocations route through [`majit_gc::header::alloc_with_gc_header`].
 pub const GC_HEADER_SIZE: usize = majit_gc::header::GcHeader::SIZE;
 
+/// Ownership selected by the caller that decides a frame's lifetime.
+/// `FrameBox::new` call frames use `OldGenGc`; tracer-private snapshots use
+/// `StdAlloc` so their locals remain valid until deterministic `Drop`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FrameLocalsArrayAllocation {
+    OldGenGc,
+    StdAlloc,
+}
+
 /// Allocation size (in bytes, including the GC header) for a
 /// `FixedObjectArray` of the given length.
 #[inline]
@@ -219,6 +228,42 @@ pub unsafe fn alloc_fixed_array_with_header(
     }
 }
 
+/// Allocate a frame locals array in the lifetime regime selected by its owner.
+/// The old-gen form is the type-9 GcArray layout `[GcHeader | len | items]`.
+unsafe fn alloc_frame_locals_array(
+    len: usize,
+    fill: pyre_object::PyObjectRef,
+    allocation: FrameLocalsArrayAllocation,
+) -> *mut FixedObjectArray {
+    if allocation == FrameLocalsArrayAllocation::OldGenGc {
+        let payload = pyre_object::FIXED_ARRAY_ITEMS_OFFSET
+            + len * std::mem::size_of::<pyre_object::PyObjectRef>();
+        let raw = pyre_object::gc_hook::try_gc_alloc_stable_raw(
+            pyre_object::PY_OBJECT_ARRAY_GC_TYPE_ID,
+            payload,
+        );
+        if !raw.is_null() {
+            let arr = raw as *mut FixedObjectArray;
+            unsafe {
+                (*arr).len = len;
+                let items = (*arr).items_mut_ptr();
+                for i in 0..len {
+                    items.add(i).write(fill);
+                }
+            }
+            return arr;
+        }
+    }
+    unsafe { alloc_fixed_array_with_header(len, fill) }
+}
+
+#[inline]
+fn remember_frame_locals_array(array: *mut FixedObjectArray) {
+    if pyre_object::gc_hook::try_gc_owns_object(array as *mut u8) {
+        pyre_object::gc_hook::try_gc_write_barrier(array as *mut u8);
+    }
+}
+
 /// Allocate a `FixedObjectArray` pre-populated from `values`. The
 /// resulting array has `values.len()` slots; allocation layout matches
 /// [`alloc_fixed_array_with_header`].
@@ -249,6 +294,7 @@ pub unsafe fn dealloc_array_with_gc_header(ptr: *mut FixedObjectArray) {
     if ptr.is_null() {
         return;
     }
+    debug_assert!(!pyre_object::gc_hook::try_gc_owns_object(ptr as *mut u8));
     unsafe {
         let len = (*ptr).len;
         let raw = (ptr as *mut u8).sub(GC_HEADER_SIZE);
@@ -310,6 +356,9 @@ impl FrameBox {
             std::mem::size_of::<PyFrame>(),
         );
         if !raw.is_null() {
+            debug_assert!(pyre_object::gc_hook::try_gc_owns_object(
+                frame.locals_cells_stack_w as *mut u8
+            ));
             pyre_object::gc_interp::note_alloc();
             let ptr = raw as *mut PyFrame;
             unsafe {
@@ -322,6 +371,9 @@ impl FrameBox {
             pyre_object::gc_hook::try_gc_write_barrier(raw);
             return FrameBox { ptr };
         }
+        debug_assert!(!pyre_object::gc_hook::try_gc_owns_object(
+            frame.locals_cells_stack_w as *mut u8
+        ));
         FrameBox::new_boxed(frame)
     }
 
@@ -1808,7 +1860,8 @@ impl PyFrame {
         // the whole `trace_bytecode` walk, during which a major GC cycle can
         // complete; no root reaches it, so it must NOT have GC lifetime —
         // `new_boxed` gives it a deterministic scope-end free.
-        let mut frame = FrameBox::new_boxed(self.build_snapshot_frame());
+        let mut frame =
+            FrameBox::new_boxed(self.build_snapshot_frame(FrameLocalsArrayAllocation::StdAlloc));
         // fix_array_ptrs AFTER Box allocation: inline_buf ptr must
         // point to the heap-allocated frame, not a stale stack address.
         frame.fix_array_ptrs();
@@ -1823,12 +1876,20 @@ impl PyFrame {
     /// write during recording would leak to the real heap and double-apply
     /// on the compiled loop's re-run; Gap 10 removed that path (inline-frame
     /// STORE_GLOBAL records as deferred IR, applied exactly once).
-    fn build_snapshot_frame(&self) -> PyFrame {
+    fn build_snapshot_frame(&self, allocation: FrameLocalsArrayAllocation) -> PyFrame {
         PyFrame {
             ob_header: frame_ob_header(),
             execution_context: self.execution_context,
             pycode: self.pycode,
-            locals_cells_stack_w: unsafe { alloc_fixed_array_from_vec(self.locals_w().to_vec()) },
+            locals_cells_stack_w: unsafe {
+                let values = self.locals_w().to_vec();
+                let array = alloc_frame_locals_array(values.len(), PY_NULL, allocation);
+                for (i, value) in values.into_iter().enumerate() {
+                    (*array).items_mut_ptr().add(i).write(value);
+                }
+                remember_frame_locals_array(array);
+                array
+            },
             valuestackdepth: self.valuestackdepth,
             last_instr: self.last_instr,
             escaped: self.escaped,
@@ -1850,7 +1911,8 @@ impl PyFrame {
     /// long as the generator object reaches it (`generator.py` holds the
     /// frame), and the generator's custom trace greys the frame block.
     pub fn snapshot_for_generator(&self) -> FrameBox {
-        let mut frame = FrameBox::new(self.build_snapshot_frame());
+        let mut frame =
+            FrameBox::new(self.build_snapshot_frame(FrameLocalsArrayAllocation::OldGenGc));
         frame.fix_array_ptrs();
         frame
     }
@@ -2953,6 +3015,7 @@ impl PyFrame {
             w_globals,
             execution_context,
             PY_NULL,
+            FrameLocalsArrayAllocation::StdAlloc,
         )
     }
 
@@ -2976,6 +3039,7 @@ impl PyFrame {
             w_globals,
             execution_context,
             closure,
+            FrameLocalsArrayAllocation::StdAlloc,
         )
     }
 
@@ -2990,6 +3054,7 @@ impl PyFrame {
         w_globals: PyObjectRef,
         execution_context: *const PyExecutionContext,
         closure: PyObjectRef,
+        allocation: FrameLocalsArrayAllocation,
     ) -> Result<Self, crate::PyError> {
         let w_builtin = if w_globals.is_null() {
             crate::baseobjspace::frame_builtin(globals, execution_context)
@@ -3003,6 +3068,7 @@ impl PyFrame {
             execution_context,
             closure,
             w_builtin,
+            allocation,
         ))
     }
 
@@ -3024,6 +3090,7 @@ impl PyFrame {
         w_globals: PyObjectRef,
         execution_context: *const PyExecutionContext,
         closure: PyObjectRef,
+        allocation: FrameLocalsArrayAllocation,
     ) -> Self {
         let w_builtin = if w_globals.is_null() {
             crate::baseobjspace::frame_builtin(globals, execution_context)
@@ -3037,6 +3104,7 @@ impl PyFrame {
             execution_context,
             closure,
             w_builtin,
+            allocation,
         )
     }
 
@@ -3050,6 +3118,7 @@ impl PyFrame {
         execution_context: *const PyExecutionContext,
         closure: PyObjectRef,
         w_builtin: PyObjectRef,
+        allocation: FrameLocalsArrayAllocation,
     ) -> Self {
         let code_ref = unsafe {
             &*(crate::w_code_get_ptr(code as pyre_object::PyObjectRef) as *const CodeObject)
@@ -3058,8 +3127,9 @@ impl PyFrame {
         let num_cells = ncells(code_ref);
         let max_stack = code_ref.max_stackdepth as usize;
 
-        let locals_cells_stack_w =
-            unsafe { alloc_fixed_array_with_header(num_locals + num_cells + max_stack, PY_NULL) };
+        let locals_cells_stack_w = unsafe {
+            alloc_frame_locals_array(num_locals + num_cells + max_stack, PY_NULL, allocation)
+        };
 
         {
             // Populate the freshly-allocated array via its mutable slice.
@@ -3090,6 +3160,11 @@ impl PyFrame {
                 }
             }
         }
+
+        // Stable frame-locals arrays are filled before their owning frame is
+        // published. `w_cell_new` uses the non-collecting old-gen allocator;
+        // remember the completed array before the next allocating operation.
+        remember_frame_locals_array(locals_cells_stack_w);
 
         // pyframe.py:103 — stamp `pycode.w_globals`; side effect only (the
         // gated debugdata snapshot retired in favour of `w_globals`).
@@ -3418,7 +3493,9 @@ pub fn createframe_obj(
         ob_header: frame_ob_header(),
         execution_context,
         pycode: code,
-        locals_cells_stack_w: unsafe { alloc_fixed_array_with_header(size, PY_NULL) },
+        locals_cells_stack_w: unsafe {
+            alloc_frame_locals_array(size, PY_NULL, FrameLocalsArrayAllocation::OldGenGc)
+        },
         valuestackdepth: num_locals + num_cells,
         last_instr: -1,
         escaped: false,
@@ -3447,6 +3524,7 @@ pub fn createframe_obj(
         let _root = FrameLocalsRoot::new(frame.as_mut_ptr());
         frame.initialize_frame_scopes(outer_ref, code)?;
     }
+    remember_frame_locals_array(frame.locals_cells_stack_w);
 
     Ok(frame)
 }

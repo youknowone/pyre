@@ -6818,6 +6818,7 @@ impl MIFrame {
             callee_globals_obj,
             caller_exec_ctx,
             closure,
+            pyre_interpreter::pyframe::FrameLocalsArrayAllocation::StdAlloc,
         )?;
         callee_frame.fix_array_ptrs();
 

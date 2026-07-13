@@ -240,6 +240,7 @@ fn try_commit_midbody_abort(
         w_globals,
         ec,
         pyre_object::PY_NULL,
+        pyre_interpreter::pyframe::FrameLocalsArrayAllocation::OldGenGc,
     ) {
         Ok(frame) => frame,
         Err(_) => return false,

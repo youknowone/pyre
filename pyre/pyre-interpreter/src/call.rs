@@ -521,6 +521,7 @@ fn call_user_function_with_eval(
                 w_globals,
                 frame.execution_context,
                 closure,
+                crate::pyframe::FrameLocalsArrayAllocation::OldGenGc,
             )?);
         return gen_frame.into_generator();
     }
@@ -533,6 +534,7 @@ fn call_user_function_with_eval(
             w_globals,
             frame.execution_context,
             closure,
+            crate::pyframe::FrameLocalsArrayAllocation::OldGenGc,
         )?);
     func_frame.fix_array_ptrs();
     let _caller_locals_root = FrameLocalsRoot::new(frame);
@@ -571,6 +573,7 @@ pub fn call_user_function_resolved(
                 w_globals,
                 frame.execution_context,
                 closure,
+                crate::pyframe::FrameLocalsArrayAllocation::OldGenGc,
             )?);
         return gen_frame.into_generator();
     }
@@ -585,6 +588,7 @@ pub fn call_user_function_resolved(
             w_globals,
             frame.execution_context,
             closure,
+            crate::pyframe::FrameLocalsArrayAllocation::OldGenGc,
         )?);
     func_frame.fix_array_ptrs();
     let _caller_locals_root = FrameLocalsRoot::new(frame);
@@ -1060,6 +1064,7 @@ pub fn call_user_function_plain_with_ctx(
                 w_globals,
                 execution_context,
                 closure,
+                crate::pyframe::FrameLocalsArrayAllocation::OldGenGc,
             )?);
         return gen_frame.into_generator();
     }
@@ -1072,6 +1077,7 @@ pub fn call_user_function_plain_with_ctx(
             w_globals,
             execution_context,
             closure,
+            crate::pyframe::FrameLocalsArrayAllocation::OldGenGc,
         )?);
     func_frame.fix_array_ptrs();
     let _callee_locals_root = FrameLocalsRoot::new_mut(&mut func_frame);
@@ -1973,6 +1979,7 @@ pub fn call_with_kwargs(
                     w_globals,
                     frame.execution_context,
                     closure,
+                    crate::pyframe::FrameLocalsArrayAllocation::OldGenGc,
                 )?,
             );
             func_frame.fix_array_ptrs();
@@ -2481,6 +2488,7 @@ fn call_user_function_with_args(func: PyObjectRef, args: &[PyObjectRef]) -> PyOb
                 w_globals,
                 exec_ctx,
                 closure,
+                crate::pyframe::FrameLocalsArrayAllocation::OldGenGc,
             ) {
                 Ok(f) => f,
                 Err(e) => {
@@ -2506,6 +2514,7 @@ fn call_user_function_with_args(func: PyObjectRef, args: &[PyObjectRef]) -> PyOb
             w_globals,
             exec_ctx,
             closure,
+            crate::pyframe::FrameLocalsArrayAllocation::OldGenGc,
         ) {
             Ok(f) => f,
             Err(e) => {
@@ -2549,7 +2558,13 @@ fn call_user_function_resolved_frameless(func: PyObjectRef, args: &[PyObjectRef]
 
     let mut frame =
         crate::pyframe::FrameBox::new(PyFrame::new_for_call_with_closure_and_globals_obj(
-            w_code, args, globals, w_globals, exec_ctx, closure,
+            w_code,
+            args,
+            globals,
+            w_globals,
+            exec_ctx,
+            closure,
+            crate::pyframe::FrameLocalsArrayAllocation::OldGenGc,
         ));
     frame.fix_array_ptrs();
     if crate::pyframe::code_flags_make_generator(code_ref.flags) {
@@ -3124,6 +3139,7 @@ fn build_class_inner(
             w_globals,
             exec_ctx,
             closure,
+            crate::pyframe::FrameLocalsArrayAllocation::OldGenGc,
         )?);
     // The class body executes against a namespace OBJECT (setdictscope)
     // so STORE_NAME / LOAD_NAME route through the object form, not the raw

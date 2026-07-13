@@ -2300,6 +2300,7 @@ fn _flat_pycall(
             w_globals,
             frame.execution_context,
             closure,
+            crate::pyframe::FrameLocalsArrayAllocation::OldGenGc,
         ) {
             Ok(f) => f,
             Err(e) => {
@@ -2371,6 +2372,7 @@ fn _flat_pycall_defaults(
             w_globals,
             frame.execution_context,
             closure,
+            crate::pyframe::FrameLocalsArrayAllocation::OldGenGc,
         ) {
             Ok(f) => f,
             Err(e) => {

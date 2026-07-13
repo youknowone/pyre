@@ -734,11 +734,12 @@ unsafe fn memoryview_object_destructor(obj_addr: usize) {
 ///   - `f_backref` — the parent frame pointer.
 ///   - `pycode` — visited to match the walker; inert while code objects
 ///     are Box-immortal (`is_nursery_object_start` short-circuits).
-///   - `locals_cells_stack_w` — the array pointer.  When the array is a
-///     GC-managed (moving) nursery block its slot is forwarded and the
-///     type-9 varsize walker forwards the items; when it is a stationary
-///     `std::alloc` block each item is forwarded in place — the same
-///     regime split as `list_object_custom_trace` / `tuple_object_custom_trace`.
+///   - `locals_cells_stack_w` — the array pointer.  A GC-managed nursery
+///     block forwards through its field slot and its type-9 walker owns the
+///     items.  An old-gen GC block also visits the field slot for major
+///     marking, then a minor trace forwards its items in place because
+///     interpreter slot stores do not write-barrier the array.  A stationary
+///     `std::alloc` block always forwards its items in place.
 ///   - `f_generator_nowref`, `w_yielding_from`, `w_builtin`, `w_globals`
 ///     — the ref-bearing statics.
 ///   - `debugdata->w_locals`, `debugdata->w_f_trace` — null-guarded.
@@ -753,23 +754,27 @@ unsafe fn pyframe_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut ma
     f(&mut frame.f_backref as *mut *mut PyFrame as *mut majit_ir::GcRef);
     f(&mut frame.pycode as *mut *const () as *mut majit_ir::GcRef);
 
-    // locals_cells_stack_w: forward the array pointer, then its items.
+    // locals_cells_stack_w: visit the field slot for every GC array so major
+    // marking reaches it. A nursery array is subsequently scanned by its own
+    // type-9 walker; an old-gen array needs this frame trace to forward
+    // unbarriered young items during a minor collection.
     let array = frame.locals_cells_stack_w;
     if !array.is_null() {
-        if pyre_object::gc_hook::try_gc_owns_object(array as *mut u8) {
-            // GC-managed (moving) nursery block: hand the collector the
-            // array field slot; the type-9 varsize walker forwards the
-            // items once the array itself is copied.
+        let walk_items = if pyre_object::gc_hook::try_gc_owns_object(array as *mut u8) {
             f(
                 &mut frame.locals_cells_stack_w as *mut *mut pyre_object::FixedObjectArray
                     as *mut majit_ir::GcRef,
             );
+            !majit_gc::gc_is_nursery_object(array as usize) && majit_gc::custom_trace_is_minor()
         } else {
-            // Stationary `std::alloc` block (type_id 0, never entered by
-            // `trace_and_update_object`): forward each item in place. Walk
-            // the FULL fixed-length array, not just the live prefix —
-            // matching `walk_pyframe_roots` (eval.rs:626), which forwards
-            // popped-in-transit argument slots past `valuestackdepth`.
+            true
+        };
+        // Stationary `std::alloc` blocks (never entered by
+        // `trace_and_update_object`) and old-gen GC blocks on a minor trace
+        // forward the FULL fixed-length array, not just the live prefix.
+        // This matches `walk_pyframe_roots` (eval.rs:626), which forwards
+        // popped-in-transit argument slots past `valuestackdepth`.
+        if walk_items {
             let arr = unsafe { &mut *array };
             let base = arr.items_mut_ptr();
             for i in 0..arr.len() {

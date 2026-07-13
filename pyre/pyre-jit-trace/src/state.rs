@@ -12775,6 +12775,7 @@ pub(crate) fn assemble_bridge_inline_pending(
         w_globals,
         execution_context,
         pyre_object::PY_NULL,
+        pyre_interpreter::pyframe::FrameLocalsArrayAllocation::StdAlloc,
     );
     {
         let arr = concrete_frame.locals_w_mut();

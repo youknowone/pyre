@@ -390,6 +390,7 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
         Some(gc_remove_root_via_active_runtime),
     );
     majit_gc::set_active_gc_owns_object(Some(gc_owns_object_via_active_runtime));
+    majit_gc::set_active_gc_is_nursery_object(Some(gc_is_nursery_object_via_active_runtime));
     majit_gc::set_active_gc_id_or_identityhash(Some(id_or_identityhash_via_active_runtime));
     majit_gc::set_active_write_barrier(Some(gc_write_barrier_via_active_runtime));
     majit_gc::set_active_finalizer_hooks(
@@ -1670,6 +1671,19 @@ fn gc_owns_object_via_active_runtime(addr: usize) -> bool {
             }
         }),
     }
+}
+
+fn gc_is_nursery_object_via_active_runtime(addr: usize) -> bool {
+    CRANELIFT_ACTIVE_GC.with(|cell| match cell.try_borrow_mut() {
+        Ok(mut guard) => guard
+            .as_deref_mut()
+            .map(|gc| gc.is_nursery_object(addr))
+            .unwrap_or(false),
+        Err(_) => CRANELIFT_ACTIVE_GC_RAW.with(|raw| match raw.get() {
+            Some(ptr) => unsafe { (&*ptr).is_nursery_object(addr) },
+            None => false,
+        }),
+    })
 }
 
 /// Returns true when the active GC was present and roots were

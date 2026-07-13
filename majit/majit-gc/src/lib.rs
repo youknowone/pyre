@@ -9,7 +9,7 @@ pub use gcreftracer::{GcTable, install_gc_table_walker};
 ///
 /// Reference: rpython/memory/gc/incminimark.py, rpython/jit/backend/llsupport/gc.py
 use majit_ir::{Const, ConstMap, GcRef, Op};
-pub use trace::{ClassTypeLayout, TypeEntry, TypeInfo, TypeInfoLayout};
+pub use trace::{ClassTypeLayout, TypeEntry, TypeInfo, TypeInfoLayout, custom_trace_is_minor};
 
 pub mod collector;
 pub mod gc_sync;
@@ -320,6 +320,14 @@ pub trait GcAllocator: Send {
     /// fall through to `std::alloc::dealloc` for non-managed ones.
     /// Default `false` matches stub allocators (no managed heap).
     fn is_managed_heap_object(&self, _addr: usize) -> bool {
+        false
+    }
+
+    /// Whether `addr` is a live object in the moving nursery.  Custom trace
+    /// hooks use this to distinguish a nursery child whose own type walker
+    /// will scan its items from an old-gen child whose owner must scan an
+    /// off-barrier payload during a minor collection.
+    fn is_nursery_object(&self, _addr: usize) -> bool {
         false
     }
 
@@ -733,6 +741,9 @@ impl GcAllocator for GcHandle {
     }
     fn is_managed_heap_object(&self, addr: usize) -> bool {
         gc_sync::gc_query_reentrant(|gc| gc.is_managed_heap_object(addr))
+    }
+    fn is_nursery_object(&self, addr: usize) -> bool {
+        gc_sync::gc_query_reentrant(|gc| gc.is_nursery_object(addr))
     }
     fn nursery_free(&self) -> *mut u8 {
         gc_sync::gc_query_reentrant(|gc| gc.nursery_free())
@@ -1395,12 +1406,19 @@ pub fn jitframe_shadow_stack_empty() -> bool {
 /// sweeps them) and fall through to `std::alloc::dealloc` for
 /// `std::alloc`-allocated ones.
 pub type GcOwnsObjectFn = fn(addr: usize) -> bool;
+pub type GcIsNurseryObjectFn = fn(addr: usize) -> bool;
 
 global_hook!(static ACTIVE_GC_OWNS_OBJECT: GcOwnsObjectFn);
+global_hook!(static ACTIVE_GC_IS_NURSERY_OBJECT: GcIsNurseryObjectFn);
 
 /// Install the active backend's `is_managed_heap_object` trampoline.
 pub fn set_active_gc_owns_object(hook: Option<GcOwnsObjectFn>) {
     ACTIVE_GC_OWNS_OBJECT.set(hook);
+}
+
+/// Install the active backend's nursery-membership predicate.
+pub fn set_active_gc_is_nursery_object(hook: Option<GcIsNurseryObjectFn>) {
+    ACTIVE_GC_IS_NURSERY_OBJECT.set(hook);
 }
 
 /// minimark.py:1900-1915 `id_or_identityhash` hook.
@@ -1428,6 +1446,17 @@ pub fn gc_id_or_identityhash(addr: usize) -> usize {
 pub fn gc_owns_object(addr: usize) -> bool {
     match ACTIVE_GC_OWNS_OBJECT.get() {
         Some(f) => f(addr),
+        None => false,
+    }
+}
+
+/// Whether `addr` is a live object in the active backend's nursery.
+pub fn gc_is_nursery_object(addr: usize) -> bool {
+    match ACTIVE_GC_IS_NURSERY_OBJECT.get() {
+        Some(f) => f(addr),
+        None if gc_sync::is_initialized() => {
+            gc_sync::gc_query_reentrant(|gc| gc.is_nursery_object(addr))
+        }
         None => false,
     }
 }

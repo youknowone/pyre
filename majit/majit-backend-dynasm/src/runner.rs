@@ -198,6 +198,7 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     majit_gc::set_active_heap_stats(Some(dynasm_heap_stats));
     majit_gc::set_active_root_hooks(Some(dynasm_gc_add_root), Some(dynasm_gc_remove_root));
     majit_gc::set_active_gc_owns_object(Some(dynasm_gc_owns_object));
+    majit_gc::set_active_gc_is_nursery_object(Some(dynasm_gc_is_nursery_object));
     majit_gc::set_active_gc_id_or_identityhash(Some(dynasm_id_or_identityhash));
     majit_gc::set_active_write_barrier(Some(dynasm_gc_write_barrier));
     majit_gc::set_active_finalizer_hooks(
@@ -614,6 +615,19 @@ fn dynasm_gc_owns_object(addr: usize) -> bool {
             }
         }),
     }
+}
+
+fn dynasm_gc_is_nursery_object(addr: usize) -> bool {
+    DYNASM_ACTIVE_GC.with(|cell| match cell.try_borrow() {
+        Ok(guard) => guard
+            .as_deref()
+            .map(|gc| gc.is_nursery_object(addr))
+            .unwrap_or(false),
+        Err(_) => DYNASM_ACTIVE_GC_RAW.with(|raw| match raw.get() {
+            Some(ptr) => unsafe { (&*ptr).is_nursery_object(addr) },
+            None => false,
+        }),
+    })
 }
 
 /// `gc.py:51` malloc-helper OOM signaling.

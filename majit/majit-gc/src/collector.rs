@@ -1639,6 +1639,7 @@ impl MiniMarkGC {
         // custom_trace_hook parity: use custom trace function if registered.
         if let Some(trace_fn) = type_info.custom_trace {
             let mut slots: Vec<*mut GcRef> = Vec::new();
+            let _phase = crate::trace::custom_trace_phase(true);
             unsafe {
                 trace_fn(obj_addr, &mut |slot_ptr: *mut GcRef| {
                     slots.push(slot_ptr);
@@ -1997,6 +1998,7 @@ impl MiniMarkGC {
 
         // custom_trace_hook parity for major GC marking.
         if let Some(trace_fn) = custom_trace {
+            let _phase = crate::trace::custom_trace_phase(false);
             unsafe {
                 trace_fn(obj_addr, &mut |slot_ptr: *mut GcRef| {
                     let field_ref = *slot_ptr;
@@ -3203,6 +3205,10 @@ impl GcAllocator for MiniMarkGC {
 
     fn is_managed_heap_object(&self, addr: usize) -> bool {
         self.is_valid_gc_object(addr) && (self.nursery.contains(addr) || self.oldgen.contains(addr))
+    }
+
+    fn is_nursery_object(&self, addr: usize) -> bool {
+        self.is_nursery_object_start(addr)
     }
 
     fn write_barrier(&mut self, obj: GcRef) {
