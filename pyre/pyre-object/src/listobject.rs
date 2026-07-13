@@ -1433,6 +1433,9 @@ pub unsafe fn w_list_setslice(
     w_other: PyObjectRef,
 ) -> Result<(), &'static str> {
     let list = &mut *(obj as *mut W_ListObject);
+    // A backwards slice (start > stop) is an empty removal, i.e. a pure
+    // insertion at `start` — never a negative-length window.
+    let end = end.max(start);
     if is_list(w_other) {
         let other = &*(w_other as *const W_ListObject);
         // listobject.py:1188 EmptyListStrategy.setslice: adopt donor's
