@@ -631,11 +631,25 @@ pub unsafe fn walk_pyframe_roots_area(
                 // `locals()` dict, or an `exec` mapping), so forwarding the
                 // object pointer keeps the whole namespace reachable.
                 if !(*frame).debugdata.is_null() {
+                    if pyre_object::gc_hook::try_gc_owns_object((*frame).debugdata as *mut u8) {
+                        let debugdata_slot =
+                            &mut (*frame).debugdata as *mut *mut crate::pyframe::FrameDebugData;
+                        visitor(&mut *(debugdata_slot as *mut majit_ir::GcRef));
+                    }
                     let d = &mut *(*frame).debugdata;
                     let w_locals_slot = &mut d.w_locals as *mut PyObjectRef;
                     visitor(&mut *(w_locals_slot as *mut majit_ir::GcRef));
                     let w_f_trace_slot = &mut d.w_f_trace as *mut PyObjectRef;
                     visitor(&mut *(w_f_trace_slot as *mut majit_ir::GcRef));
+                    let hidden_operationerr_slot = &mut d.hidden_operationerr as *mut PyObjectRef;
+                    visitor(&mut *(hidden_operationerr_slot as *mut majit_ir::GcRef));
+                }
+                if !(*frame).lastblock.is_null()
+                    && pyre_object::gc_hook::try_gc_owns_object((*frame).lastblock as *mut u8)
+                {
+                    let lastblock_slot =
+                        &mut (*frame).lastblock as *mut *mut crate::pyframe::FrameBlock;
+                    visitor(&mut *(lastblock_slot as *mut majit_ir::GcRef));
                 }
                 // pyframe.py:49 `self.w_globals` is the dict OBJECT.  Its slot
                 // was forwarded above (before the debugdata walk), so this
@@ -856,11 +870,24 @@ pub fn walk_suspended_generator_frame(
         visitor(&mut *(w_builtin_slot as *mut majit_ir::GcRef));
 
         if !(*frame).debugdata.is_null() {
+            if pyre_object::gc_hook::try_gc_owns_object((*frame).debugdata as *mut u8) {
+                let debugdata_slot =
+                    &mut (*frame).debugdata as *mut *mut crate::pyframe::FrameDebugData;
+                visitor(&mut *(debugdata_slot as *mut majit_ir::GcRef));
+            }
             let d = &mut *(*frame).debugdata;
             let w_locals_slot = &mut d.w_locals as *mut PyObjectRef;
             visitor(&mut *(w_locals_slot as *mut majit_ir::GcRef));
             let w_f_trace_slot = &mut d.w_f_trace as *mut PyObjectRef;
             visitor(&mut *(w_f_trace_slot as *mut majit_ir::GcRef));
+            let hidden_operationerr_slot = &mut d.hidden_operationerr as *mut PyObjectRef;
+            visitor(&mut *(hidden_operationerr_slot as *mut majit_ir::GcRef));
+        }
+        if !(*frame).lastblock.is_null()
+            && pyre_object::gc_hook::try_gc_owns_object((*frame).lastblock as *mut u8)
+        {
+            let lastblock_slot = &mut (*frame).lastblock as *mut *mut crate::pyframe::FrameBlock;
+            visitor(&mut *(lastblock_slot as *mut majit_ir::GcRef));
         }
     }
 }

@@ -635,6 +635,10 @@ pub use pyre_object::unicodeobject::W_UNICODE_GC_TYPE_ID;
 // Registered ahead of any future
 // `NewWithVtable(PyFrame)` in trace IR.
 pub use pyre_interpreter::pyframe::PYFRAME_GC_TYPE_ID;
+// Appended tail registrations for PyFrame-owned auxiliary objects. These live
+// with their Rust layouts in pyre-interpreter and are re-exported here beside
+// PYFRAME_GC_TYPE_ID for the runtime registration census.
+pub use pyre_interpreter::pyframe::{FRAME_BLOCK_GC_TYPE_ID, FRAME_DEBUG_DATA_GC_TYPE_ID};
 
 fn field_descr_from_group(group: &PyreObjectDescrGroup, index: usize) -> DescrRef {
     let field_descr = group
