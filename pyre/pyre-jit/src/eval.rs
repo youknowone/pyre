@@ -326,11 +326,9 @@ unsafe fn pyre_object_compares_by_identity_trampoline(w_type: pyre_object::PyObj
 ///     attributes, getset descriptor copies) via the interpreter helper,
 ///     mirroring `object_object_custom_trace`'s off-GC storage walk.
 ///
-/// Inert while heap types remain `malloc_typed` Box-immortal (the
-/// collector never fires this trace for an immortal object, and the
-/// visitor's `is_in_nursery` / `is_managed_heap_object` guard skips
-/// non-managed children); it replaces the `walk_type_dicts_gc` band-aid
-/// root walk once `w_type_new` is GC-managed.
+/// Heap types are stable old-gen GC objects, so this trace keeps their owned
+/// GC edges live and forwards their slots.  The separate builtin-type walk
+/// covers Box-immortal builtin types, whose custom trace never fires.
 unsafe fn type_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let t = unsafe { &mut *(obj_addr as *mut pyre_object::typeobject::W_TypeObject) };
     f(&mut t.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);

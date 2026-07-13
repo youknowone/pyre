@@ -395,11 +395,10 @@ assert result == 3430, result
 /// class attribute (a movable list), and the per-type `__dict__` getset
 /// descriptor (whose `fget` is a collectable function) all survive repeated
 /// full collections, even when first reached *fresh* after the collections.
-/// Heap type objects (`w_type_new`) are Box-immortal, so the collector never
-/// fires their `W_TYPE_GC_TYPE_ID` custom trace and never reaches the movable
-/// values bound in the type's namespace `DictStorage`. Before the
-/// `HEAP_TYPE_REGISTRY` / `walk_type_dicts_gc` / `walk_raw_getset_roots` root
-/// walk, this program SIGSEGV'd.
+/// Heap type objects (`w_type_new`) are GC-managed, so their
+/// `W_TYPE_GC_TYPE_ID` custom trace reaches the movable values bound in the
+/// type's namespace `DictStorage`. The `BUILTIN_TYPE_NAMESPACE_ROOTS` /
+/// `walk_builtin_type_dicts_gc` walk covers immortal builtin types instead.
 ///
 /// `C`'s namespace dict holds a method (`method`), a class attribute
 /// (`KLASS_ATTR`), and — once `c.__dict__` is first read — the copied
@@ -445,7 +444,7 @@ assert result == 33, result
 /// base's `weak_subclasses` survives repeated full collections so the base's
 /// `mutated()` walk still reaches it. `w_type_add_subclass` stores
 /// `w_weakref_new(subclass)` — a `try_gc_alloc` young WEAKREF GcStruct — in the
-/// base's off-GC `weak_subclasses`. Before this fix `walk_type_dicts_gc`
+/// base's off-GC `weak_subclasses`. Before this fix the type root walk
 /// forwarded `bases` and namespace values but NOT `weak_subclasses`, so the
 /// first collection reclaimed the WEAKREF and `type.__setattr__`'s `mutated()`
 /// walk ran over the freed slot (a UAF that dropped cache invalidation).

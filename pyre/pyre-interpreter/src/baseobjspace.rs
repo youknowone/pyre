@@ -4168,6 +4168,7 @@ pub(crate) unsafe fn object_setattr_surrogate(
             let dict_ptr = w_type_get_dict_ptr(obj) as *mut crate::DictStorage;
             if !dict_ptr.is_null() {
                 crate::dict_storage_store_wtf8(&mut *dict_ptr, name, value);
+                pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
                 mutated(obj, name.as_str().ok());
                 return Ok(w_none());
             }
@@ -6208,8 +6209,9 @@ unsafe fn _cached_lookup_where(
 ///
 /// Every cached value is an MRO type's namespace-dict resident (or a
 /// Box-immortal builtin descriptor), so it is already kept *reachable* by
-/// `walk_type_dicts_gc` — this walk is therefore not load-bearing for
-/// reclamation in the current model, and old-gen residents are not
+/// `walk_builtin_type_dicts_gc` or the heap type's custom trace — this walk is
+/// therefore not load-bearing for reclamation in the current model, and
+/// old-gen residents are not
 /// relocated by a collection, so it forwards no slot in practice today.
 /// It becomes load-bearing once those values become movable (the
 /// movable-object GC phases): `version_tag` is bumped only by `mutated()`,

@@ -319,15 +319,14 @@ unsafe fn walk_raw_getset_roots(value: PyObjectRef, visitor: &mut dyn FnMut(&mut
     }
 }
 
-/// Forward every `PyObjectRef` value bound in a heap type's namespace
+/// Forward every `PyObjectRef` value bound in a type's namespace
 /// `DictStorage` in place — the class attributes, methods, and the
 /// per-type `__dict__`/`__weakref__` getset descriptor copies.  Keys are
 /// Rust `String`s (not GC objects); only the `PyObjectRef` values relocate.
 /// Snapshot the value slots first (same shape as the globals proxy walk)
-/// so `forward` cannot re-borrow the storage.  Shared by `walk_type_dicts_gc`
-/// (the Box-immortal-type band-aid root walk) and the `W_TYPE_GC_TYPE_ID`
-/// custom trace, so a GC-managed heap type reaches its own namespace values
-/// directly once its trace fires.
+/// so `forward` cannot re-borrow the storage.  Shared by
+/// `walk_builtin_type_dicts_gc` for Box-immortal builtin types and the
+/// `W_TYPE_GC_TYPE_ID` custom trace for GC-managed heap types.
 pub unsafe fn type_walk_namespace_values(
     w_type: PyObjectRef,
     forward: &mut dyn FnMut(&mut PyObjectRef),
@@ -367,22 +366,15 @@ pub unsafe fn type_walk_namespace_values(
     }
 }
 
-/// Box-immortal heap types (`w_type_new`) never have their
-/// `W_TYPE_GC_TYPE_ID` custom trace fired, so the movable values bound in
-/// each type's namespace `DictStorage` (methods, class attributes, the
-/// per-type `__dict__`/`__weakref__` getset copies), the `bases` tuple, and
-/// the `weak_subclasses` WEAKREF list are unreachable by the collector.
-/// Walk every registered heap type's namespace values + `bases` +
-/// `weak_subclasses` as pinned roots so a relocated class attribute /
-/// method / descriptor — or a reclaimed subclass weakref — is not read back
-/// stale after a collection; the same shape `walk_module_dicts_gc` uses for
-/// module dicts.  PRE-EXISTING-ADAPTATION: PyPy GC-manages type objects and
-/// traces `dict_w`/`bases`/`weak_subclasses` for free; convergence is to
-/// GC-manage `W_TypeObject` (then its custom trace fires and this walk is
-/// deleted), mirroring the deferred instance Path-B keystone.
-unsafe fn walk_type_dicts_gc(forward: &mut dyn FnMut(&mut PyObjectRef)) {
+/// Box-immortal builtin types never have their `W_TYPE_GC_TYPE_ID` custom
+/// trace fired, but their namespaces, `bases`, and `weak_subclasses` can hold
+/// young GC objects after startup.  Walk every registered builtin type (and
+/// the rare pre-GC heap-type fallback) as pinned roots so those children stay
+/// live and their slots are forwarded.  Heap types are GC-managed and reach
+/// the same fields through their own `W_TYPE_GC_TYPE_ID` custom trace.
+unsafe fn walk_builtin_type_dicts_gc(forward: &mut dyn FnMut(&mut PyObjectRef)) {
     unsafe {
-        for addr in pyre_object::typeobject::snapshot_heap_types() {
+        for addr in pyre_object::typeobject::snapshot_builtin_type_roots() {
             let w_type = addr as PyObjectRef;
             if w_type.is_null() {
                 continue;
@@ -398,8 +390,7 @@ unsafe fn walk_type_dicts_gc(forward: &mut dyn FnMut(&mut PyObjectRef)) {
                 forward(bases_slot);
                 // Namespace `dict_w` values: the class attributes, methods,
                 // and getset descriptor copies — the same walk the
-                // `W_TYPE_GC_TYPE_ID` custom trace performs once a heap type
-                // is GC-managed.
+                // `W_TYPE_GC_TYPE_ID` custom trace performs for a heap type.
                 type_walk_namespace_values(w_type, forward);
                 // `weak_subclasses` holds `w_weakref_new` (`try_gc_alloc`)
                 // young WEAKREF GcStructs whose only strong root is this
@@ -409,8 +400,8 @@ unsafe fn walk_type_dicts_gc(forward: &mut dyn FnMut(&mut PyObjectRef)) {
                 // the first collection reclaims the weakref and the base's
                 // `weak_subclasses[i]` dangles — a UAF on the next
                 // `mutated()` / `w_type_get_subclasses` deref.  The
-                // `W_TYPE_GC_TYPE_ID` custom trace performs the same walk once
-                // a heap type is GC-managed.
+                // `W_TYPE_GC_TYPE_ID` custom trace performs the same walk for
+                // a heap type.
                 let t = &mut *(w_type as *mut pyre_object::typeobject::W_TypeObject);
                 if t.weak_subclasses.is_null() {
                     // No subclasses recorded.
@@ -806,7 +797,7 @@ fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
             walk_raw_function_roots(*slot, visitor);
             walk_raw_getset_roots(*slot, visitor);
         };
-        walk_type_dicts_gc(&mut forward);
+        walk_builtin_type_dicts_gc(&mut forward);
     }
     if is_minor {
         pyre_object::gc_roots::clear_prebuilt_roots_dirty();
