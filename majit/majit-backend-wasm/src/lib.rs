@@ -220,9 +220,18 @@ thread_local! {
 /// - **No box, `gc_sync` uninitialized** (no GC at all — unit tests):
 ///   returns `None` so callers keep their existing `.unwrap_or(default)`
 ///   / `.flatten()` behaviour.
-fn with_wasm_active_gc<R>(f: impl FnOnce(&dyn GcAllocator) -> R) -> Option<R> {
-    if WASM_ACTIVE_GC.with(|cell| cell.borrow().is_some()) {
-        return WASM_ACTIVE_GC.with(|cell| cell.borrow().as_deref().map(f));
+fn with_wasm_active_gc<R>(f: impl Fn(&dyn GcAllocator) -> R) -> Option<R> {
+    match WASM_ACTIVE_GC.with(|cell| cell.try_borrow().map(|g| g.as_deref().map(|gc| f(gc)))) {
+        Ok(Some(r)) => return Some(r),
+        Ok(None) => {}
+        Err(_) => {
+            if let Some(ptr) = WASM_ACTIVE_GC_RAW.with(|raw| raw.get()) {
+                // SAFETY: the raw mirror points at the same live test box whose
+                // mutable borrow is held by the in-progress mutation. This is a
+                // read-only reentrant query, so it does not create a second &mut.
+                return Some(f(unsafe { &*ptr }));
+            }
+        }
     }
     if majit_gc::gc_sync::is_initialized() {
         return Some(majit_gc::gc_sync::gc_query_reentrant(f));
