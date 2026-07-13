@@ -5238,6 +5238,137 @@ thread_local! {
     /// map) whose py_pc is not offset-resolvable — a HARD blocker if !carried.
     static M369_INNERMOST_RECOVERY: std::cell::Cell<Option<(bool, bool)>> =
         const { std::cell::Cell::new(None) };
+    static M369_BACKXLAT_FRAMES: std::cell::RefCell<Vec<M369BackxlatFrame>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[derive(Clone, Copy)]
+struct M369BackxlatFrame {
+    jitcode_index: i32,
+    pc: i32,
+    jitcode_pc: i32,
+}
+
+fn m369_backxlat_result(frame: M369BackxlatFrame) -> (Option<usize>, Option<i32>, bool, bool) {
+    let resolved_offset = pyre_jit_trace::state::resolve_resume_offset_public(
+        frame.jitcode_index,
+        frame.pc,
+        frame.jitcode_pc,
+    );
+    let raw_recovered = resolved_offset.and_then(|offset| {
+        pyre_jit_trace::state::python_pc_for_jitcode_pc_public(frame.jitcode_index, offset as i32)
+    });
+    let (recovered, code_ptr_null) = match raw_recovered.and_then(|raw| {
+        pyre_jit_trace::state::skip_python_trivia_forward_public(frame.jitcode_index, raw)
+    }) {
+        Some((py_pc, trivia_applied)) => (Some(py_pc), !trivia_applied),
+        None => (None, false),
+    };
+    let stored_py_pc = majit_ir::resumedata::decode_resume_pc(frame.pc).0 as i32;
+    (
+        resolved_offset,
+        recovered,
+        code_ptr_null,
+        recovered == Some(stored_py_pc),
+    )
+}
+
+fn m369_invariant_check(
+    frame: M369BackxlatFrame,
+    recovered: Option<i32>,
+    eq: bool,
+    divergent_vs_ni: bool,
+) {
+    if !eq && divergent_vs_ni {
+        eprintln!(
+            "[m369-INVARIANT-VIOLATION] eq=false AND divergent_vs_ni=true \
+             jitcode_index={} stored_py_pc={} carried={} recovered={recovered:?}",
+            frame.jitcode_index, frame.pc, frame.jitcode_pc,
+        );
+    }
+}
+
+fn m369_backxlat_audit(ni: usize) {
+    if !m369_route_audit_enabled() {
+        return;
+    }
+    let frames = M369_BACKXLAT_FRAMES.with(|c| c.borrow().clone());
+    let divergences: Vec<(i32, i32, i32, bool)> = frames
+        .iter()
+        .map(|frame| {
+            (
+                frame.jitcode_index,
+                frame.pc,
+                frame.jitcode_pc,
+                frame.pc >= 0 && frame.pc as usize != ni,
+            )
+        })
+        .collect();
+    pyre_jit_trace::state::m369_set_backxlat_divergences(&divergences);
+
+    if let Some(frame) = frames.first().copied() {
+        let divergent_vs_ni = frame.pc >= 0 && frame.pc as usize != ni;
+        if frame.jitcode_pc == majit_ir::resumedata::NO_JITCODE_PC {
+            eprintln!(
+                "[m369-backxlat] site=rd_numb_pc frame_idx=0 nframes={} \
+                 jitcode_index={} stored_py_pc={} carried=sentinel word_class=sentinel \
+                 divergent_vs_ni={divergent_vs_ni}",
+                frames.len(),
+                frame.jitcode_index,
+                frame.pc,
+            );
+        } else {
+            let word_class = if frame.jitcode_pc >= 0 {
+                "offset"
+            } else {
+                "branch"
+            };
+            let (resolved_offset, recovered, code_ptr_null, eq) = m369_backxlat_result(frame);
+            eprintln!(
+                "[m369-backxlat] site=rd_numb_pc frame_idx=0 nframes={} \
+                 jitcode_index={} stored_py_pc={} carried={} word_class={word_class} \
+                 resolved_offset={resolved_offset:?} recovered={recovered:?} \
+                 code_ptr_null={code_ptr_null} eq={eq} divergent_vs_ni={divergent_vs_ni}",
+                frames.len(),
+                frame.jitcode_index,
+                frame.pc,
+                frame.jitcode_pc,
+            );
+            m369_invariant_check(frame, recovered, eq, divergent_vs_ni);
+        }
+    }
+
+    for (idx, frame) in frames.iter().copied().enumerate() {
+        let divergent_vs_ni = frame.pc >= 0 && frame.pc as usize != ni;
+        if frame.jitcode_pc == majit_ir::resumedata::NO_JITCODE_PC {
+            eprintln!(
+                "[m369-backxlat] frame_idx={idx} nframes={} jitcode_index={} \
+                 stored_py_pc={} carried=sentinel word_class=sentinel \
+                 divergent_vs_ni={divergent_vs_ni}",
+                frames.len(),
+                frame.jitcode_index,
+                frame.pc,
+            );
+        } else {
+            let word_class = if frame.jitcode_pc >= 0 {
+                "offset"
+            } else {
+                "branch"
+            };
+            let (resolved_offset, recovered, code_ptr_null, eq) = m369_backxlat_result(frame);
+            eprintln!(
+                "[m369-backxlat] frame_idx={idx} nframes={} jitcode_index={} \
+                 stored_py_pc={} carried={} word_class={word_class} \
+                 resolved_offset={resolved_offset:?} recovered={recovered:?} \
+                 code_ptr_null={code_ptr_null} eq={eq} divergent_vs_ni={divergent_vs_ni}",
+                frames.len(),
+                frame.jitcode_index,
+                frame.pc,
+                frame.jitcode_pc,
+            );
+            m369_invariant_check(frame, recovered, eq, divergent_vs_ni);
+        }
+    }
 }
 
 /// compile.py:710-716 resume_in_blackhole parity.
@@ -7491,6 +7622,7 @@ pub(crate) fn decode_and_restore_guard_failure(
             }
         }
         if m369_route_audit_enabled() {
+            m369_backxlat_audit(ni);
             // The stored innermost py_pc becomes `resume_pc` -> the live frame
             // `last_instr` at the caller's `set_last_instr_from_next_instr`.
             // A SINGLE-frame guard traces the bridge forward from it (path-B,
@@ -7689,57 +7821,6 @@ fn rebuild_typed_from_rd_numb(
     // (the same PC used by get_list_of_active_boxes during encoding).
     // The outer pyre interpreter resumes at the JIT-entry frame's PC,
     // which after `framestack.reverse()` parity is `frames[0]`.
-    if m369_route_audit_enabled() {
-        if let Some(frame) = frames.first() {
-            if frame.jitcode_pc == majit_ir::resumedata::NO_JITCODE_PC {
-                eprintln!(
-                    "[m369-backxlat] site=rd_numb_pc frame_idx=0 nframes={} \
-                     jitcode_index={} stored_py_pc={} carried=sentinel word_class=sentinel",
-                    frames.len(),
-                    frame.jitcode_index,
-                    frame.pc,
-                );
-            } else {
-                let word_class = if frame.jitcode_pc >= 0 {
-                    "offset"
-                } else {
-                    "branch"
-                };
-                let resolved_offset = pyre_jit_trace::state::resolve_resume_offset_public(
-                    frame.jitcode_index,
-                    frame.pc,
-                    frame.jitcode_pc,
-                );
-                let raw_recovered = resolved_offset.and_then(|offset| {
-                    pyre_jit_trace::state::python_pc_for_jitcode_pc_public(
-                        frame.jitcode_index,
-                        offset as i32,
-                    )
-                });
-                let (recovered, code_ptr_null) = match raw_recovered.and_then(|raw| {
-                    pyre_jit_trace::state::skip_python_trivia_forward_public(
-                        frame.jitcode_index,
-                        raw,
-                    )
-                }) {
-                    Some((py_pc, trivia_applied)) => (Some(py_pc), !trivia_applied),
-                    None => (None, false),
-                };
-                let stored_py_pc = majit_ir::resumedata::decode_resume_pc(frame.pc).0 as i32;
-                eprintln!(
-                    "[m369-backxlat] site=rd_numb_pc frame_idx=0 nframes={} \
-                     jitcode_index={} stored_py_pc={} carried={} word_class={word_class} \
-                     resolved_offset={resolved_offset:?} recovered={recovered:?} \
-                     code_ptr_null={code_ptr_null} eq={}",
-                    frames.len(),
-                    frame.jitcode_index,
-                    frame.pc,
-                    frame.jitcode_pc,
-                    recovered == Some(stored_py_pc),
-                );
-            }
-        }
-    }
     let rd_numb_pc = frames.first().map(|f| f.pc as usize);
     (typed, rd_numb_pc, virtuals_cache)
 }
@@ -8096,56 +8177,19 @@ fn build_resumed_frames(
     let nframes = frames.len();
     if m369_route_audit_enabled() {
         M369_INNERMOST_RECOVERY.with(|c| c.set(None));
+        M369_BACKXLAT_FRAMES.with(|c| {
+            *c.borrow_mut() = frames
+                .iter()
+                .map(|frame| M369BackxlatFrame {
+                    jitcode_index: frame.jitcode_index,
+                    pc: frame.pc,
+                    jitcode_pc: frame.jitcode_pc,
+                })
+                .collect();
+        });
     }
     let mut result = Vec::with_capacity(frames.len());
     for (idx, (frame, values)) in frames.iter().zip(all_values.into_iter()).enumerate() {
-        if m369_route_audit_enabled() {
-            if frame.jitcode_pc == majit_ir::resumedata::NO_JITCODE_PC {
-                eprintln!(
-                    "[m369-backxlat] frame_idx={idx} nframes={} jitcode_index={} \
-                     stored_py_pc={} carried=sentinel word_class=sentinel",
-                    nframes, frame.jitcode_index, frame.pc,
-                );
-            } else {
-                let word_class = if frame.jitcode_pc >= 0 {
-                    "offset"
-                } else {
-                    "branch"
-                };
-                let resolved_offset = pyre_jit_trace::state::resolve_resume_offset_public(
-                    frame.jitcode_index,
-                    frame.pc,
-                    frame.jitcode_pc,
-                );
-                let raw_recovered = resolved_offset.and_then(|offset| {
-                    pyre_jit_trace::state::python_pc_for_jitcode_pc_public(
-                        frame.jitcode_index,
-                        offset as i32,
-                    )
-                });
-                let (recovered, code_ptr_null) = match raw_recovered.and_then(|raw| {
-                    pyre_jit_trace::state::skip_python_trivia_forward_public(
-                        frame.jitcode_index,
-                        raw,
-                    )
-                }) {
-                    Some((py_pc, trivia_applied)) => (Some(py_pc), !trivia_applied),
-                    None => (None, false),
-                };
-                let stored_py_pc = majit_ir::resumedata::decode_resume_pc(frame.pc).0 as i32;
-                eprintln!(
-                    "[m369-backxlat] frame_idx={idx} nframes={} jitcode_index={} \
-                     stored_py_pc={} carried={} word_class={word_class} \
-                     resolved_offset={resolved_offset:?} recovered={recovered:?} \
-                     code_ptr_null={code_ptr_null} eq={}",
-                    nframes,
-                    frame.jitcode_index,
-                    frame.pc,
-                    frame.jitcode_pc,
-                    recovered == Some(stored_py_pc),
-                );
-            }
-        }
         // The innermost frame's stored py_pc is the one that reaches the live
         // frame `last_instr` on the single-frame bridge-trace path (path-B); its
         // carried jitcode_pc / portal-bridge status decides whether a #369 flip

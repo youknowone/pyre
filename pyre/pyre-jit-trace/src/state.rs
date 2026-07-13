@@ -799,6 +799,35 @@ pub fn m369_route_audit_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_M369_ROUTE_AUDIT").is_some())
 }
 
+thread_local! {
+    static M369_BACKXLAT_DIVERGENCES: std::cell::RefCell<Vec<(i32, i32, i32, bool)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+pub fn m369_set_backxlat_divergences(divergences: &[(i32, i32, i32, bool)]) {
+    if m369_route_audit_enabled() {
+        M369_BACKXLAT_DIVERGENCES.with(|c| {
+            let mut stored = c.borrow_mut();
+            stored.clear();
+            stored.extend_from_slice(divergences);
+        });
+    }
+}
+
+fn m369_backxlat_divergent(frame: &majit_ir::resumedata::RebuiltFrame) -> bool {
+    M369_BACKXLAT_DIVERGENCES.with(|c| {
+        c.borrow()
+            .iter()
+            .find(|&&(jitcode_index, pc, jitcode_pc, _)| {
+                jitcode_index == frame.jitcode_index
+                    && pc == frame.pc
+                    && jitcode_pc == frame.jitcode_pc
+            })
+            .map(|&(_, _, _, divergent)| divergent)
+            .unwrap_or(false)
+    })
+}
+
 /// `framework.py` `root_walker.walk_roots` hook for the boxed `Ref`
 /// constants embedded in every live jitcode's `constants_r` pool.
 ///
@@ -6132,10 +6161,11 @@ fn m369_backxlat_recipe_audit(frame: &majit_ir::resumedata::RebuiltFrame) {
     if !m369_route_audit_enabled() {
         return;
     }
+    let divergent_vs_ni = m369_backxlat_divergent(frame);
     if frame.jitcode_pc == majit_ir::resumedata::NO_JITCODE_PC {
         eprintln!(
             "[m369-backxlat] site=recipe jitcode_index={} stored_py_pc={} \
-             carried=sentinel word_class=sentinel",
+             carried=sentinel word_class=sentinel divergent_vs_ni={divergent_vs_ni}",
             frame.jitcode_index, frame.pc,
         );
         return;
@@ -6159,12 +6189,20 @@ fn m369_backxlat_recipe_audit(frame: &majit_ir::resumedata::RebuiltFrame) {
     eprintln!(
         "[m369-backxlat] site=recipe jitcode_index={} stored_py_pc={} carried={} \
          word_class={word_class} resolved_offset={resolved_offset:?} \
-         recovered={recovered:?} code_ptr_null={code_ptr_null} eq={}",
+         recovered={recovered:?} code_ptr_null={code_ptr_null} eq={} \
+         divergent_vs_ni={divergent_vs_ni}",
         frame.jitcode_index,
         frame.pc,
         frame.jitcode_pc,
         recovered == Some(stored_py_pc),
     );
+    if recovered != Some(stored_py_pc) && divergent_vs_ni {
+        eprintln!(
+            "[m369-INVARIANT-VIOLATION] eq=false AND divergent_vs_ni=true \
+             jitcode_index={} stored_py_pc={} carried={} recovered={recovered:?}",
+            frame.jitcode_index, frame.pc, frame.jitcode_pc,
+        );
+    }
 }
 
 fn bridge_decode_box(
