@@ -345,9 +345,10 @@ impl FrameBox {
     /// GC object whose lifetime is its reachability.  When the GC hook is
     /// installed this allocates a non-moving old-gen `PYFRAME_GC_TYPE_ID`
     /// block (the same `try_gc_alloc_stable` path every `W_*` uses, e.g.
-    /// `function.rs:373`); the block is reclaimed by a major mark-sweep
-    /// once no root (`walk_pyframe_roots` over the `CURRENT_FRAME` /
-    /// `f_backref` chain) reaches it, so `Drop` performs no manual free
+    /// `function.rs:373`); the collector reclaims the frame and its
+    /// GC-managed locals, debug data, and block stack once no root
+    /// (`walk_pyframe_roots` over the `CURRENT_FRAME` / `f_backref` chain)
+    /// reaches it, so `Drop` performs no manual free
     /// (`executioncontext.py:91-107 leave` frees nothing either).
     ///
     /// Before the hook is wired (bootstrap, tests) `try_gc_alloc_stable`
@@ -476,11 +477,10 @@ impl Drop for FrameBox {
         // GC-managed (old-gen) frames are reclaimed by a major mark-sweep
         // when no root reaches them (`pyframe.py class PyFrame(W_Root)`;
         // `executioncontext.py:91-107 leave` frees nothing).  Their
-        // `PyFrame::drop` side effects (freeing the locals array / debug
-        // data / block chain) run from the registered `PYFRAME_GC_TYPE_ID`
-        // destructor at sweep, not here.  Only the `std::alloc` fallback
-        // box is freed manually — reconstruct and drop it, which runs
-        // `PyFrame::drop` for that block.
+        // The collector reclaims their GC-managed locals array, debug data,
+        // and block chain with the frame, so no manual cleanup runs here.
+        // Only a `std::alloc` snapshot / bootstrap fallback box is freed
+        // manually — reconstruct and drop it, which runs `PyFrame::drop`.
         if pyre_object::gc_hook::try_gc_owns_object(self.ptr as *mut u8) {
             return;
         }
@@ -655,10 +655,9 @@ unsafe fn clear_block_chain(ptr: &mut *mut FrameBlock) {
 impl Drop for PyFrame {
     fn drop(&mut self) {
         // Reached only for a `std::alloc`-backed frame (the `FrameBox`
-        // fallback box, or a bare stack `PyFrame`): its `locals_cells_stack_w`
-        // is always a `std::alloc` array, so free it here.  GC-managed frames
-        // never run `PyFrame::drop` (their `FrameBox::drop` returns early);
-        // their contents are freed by the `PYFRAME_GC_TYPE_ID` destructor.
+        // fallback box, or a bare stack `PyFrame`): it owns `std::alloc`
+        // resources, so free them here.  GC-managed frames never run
+        // `PyFrame::drop`; the collector reclaims their frame-owned resources.
         unsafe { self.free_owned_contents(true) };
     }
 }
@@ -673,17 +672,17 @@ impl PyFrame {
         }
     }
 
-    /// Free the frame's owned off-GC resources — the `locals_cells_stack_w`
-    /// array, the `FrameDebugData` box, and the `FrameBlock` chain.  Shared
-    /// by `Drop for PyFrame` (the `std::alloc` fallback path) and the
-    /// `PYFRAME_GC_TYPE_ID` destructor (`pyframe_object_destructor`) run when
-    /// a GC-managed frame is swept.
+    /// Free the `std::alloc` resources owned by a snapshot, fallback, or bare
+    /// stack frame: its `locals_cells_stack_w` array, `FrameDebugData` box,
+    /// and `FrameBlock` chain.  This is reached only through `Drop for
+    /// PyFrame`; GC-managed frames and all of their corresponding resources
+    /// are reclaimed by the collector.
     ///
     /// `free_locals_array` gates freeing `locals_cells_stack_w`: it is a
-    /// `std::alloc` block for every `FrameBox`/stack frame (free it), but a
-    /// GC-managed `PY_OBJECT_ARRAY_GC_TYPE_ID` array for a JIT-built inline
-    /// frame (the GC sweeps it — freeing it here would double-free).  The
-    /// caller decides by querying `try_gc_owns_object` on the array.
+    /// `std::alloc` block for this Drop-only regime (free it), but can remain
+    /// false if a future regime-mixup supplies a GC-managed array.  The
+    /// `try_gc_owns_object` checks in this cleanup path are retained as a
+    /// guard against freeing collector-owned storage.
     ///
     /// # Safety
     /// Runs at most once per frame — the pointers are nulled as they are

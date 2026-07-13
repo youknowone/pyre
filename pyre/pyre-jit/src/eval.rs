@@ -822,27 +822,6 @@ unsafe fn pyframe_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut ma
     }
 }
 
-/// Destructor for `PyFrame` (type id [`PYFRAME_GC_TYPE_ID`]).
-///
-/// A GC-managed frame is reclaimed by a major mark-sweep once no root
-/// reaches it (`pyframe.py class PyFrame(W_Root)`; `FrameBox::drop`
-/// performs no manual free for these).  This runs at sweep to release the
-/// frame's owned Box fallback resources — debug data, the block chain, and
-/// the `locals_cells_stack_w` array — mirroring
-/// `PyFrame::drop`, which handles the `std::alloc` fallback frames instead.
-///
-/// The locals array is freed only for a transitional `std::alloc` block. All
-/// GC-managed frame regimes now own a `PY_OBJECT_ARRAY_GC_TYPE_ID` array that
-/// the collector sweeps itself, so freeing one here would double-free.
-/// `try_gc_owns_object` keeps this destructor sound until S4 removes it.
-unsafe fn pyframe_object_destructor(obj_addr: usize) {
-    let frame = unsafe { &mut *(obj_addr as *mut PyFrame) };
-    let array = frame.locals_cells_stack_w;
-    let free_locals_array =
-        !array.is_null() && !pyre_object::gc_hook::try_gc_owns_object(array as *mut u8);
-    unsafe { frame.free_owned_contents(free_locals_array) };
-}
-
 /// RPython jitexc.py:53 ContinueRunningNormally parity.
 pub(crate) enum LoopResult {
     Done(PyResult),
@@ -1640,19 +1619,15 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     // remain `type_id = 0` off-GC blocks reached only as roots via
     // `walk_jit_callee_frame_roots` (S2c).
     //
-    // The destructor releases a swept GC-managed frame's owned off-GC
-    // resources (debug data, block chain, and the `std::alloc` locals
-    // array of a `FrameBox` frame — NOT a JIT inline frame's GC array) —
-    // `FrameBox::drop` no longer frees them under policy A
-    // (`executioncontext.py:91-107 leave` frees nothing; frame lifetime
-    // is GC reachability).
-    let pyframe_tid = gc.register_type(
-        majit_gc::trace::TypeInfo::with_custom_trace(
-            std::mem::size_of::<pyre_interpreter::pyframe::PyFrame>(),
-            pyframe_object_custom_trace,
-        )
-        .with_destructor_fn(pyframe_object_destructor),
-    );
+    // Frame-owned locals arrays, debug data, and block-stack nodes are all
+    // GC-managed.  The collector reclaims them with the frame once it is
+    // unreachable; `FrameBox::drop` only frees the `std::alloc` snapshot /
+    // bootstrap fallback regime.  With no destructor or weakref flag,
+    // `type_alloc_is_plain` admits PYFRAME's normal allocation fast paths.
+    let pyframe_tid = gc.register_type(majit_gc::trace::TypeInfo::with_custom_trace(
+        std::mem::size_of::<pyre_interpreter::pyframe::PyFrame>(),
+        pyframe_object_custom_trace,
+    ));
     debug_assert_eq!(pyframe_tid, PYFRAME_GC_TYPE_ID);
     // `W_DictProxyObject` carries a single GC-traceable
     // `w_mapping: PyObjectRef` slot (the wrapped W_DictObject —
