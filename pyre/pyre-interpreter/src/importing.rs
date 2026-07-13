@@ -1172,8 +1172,10 @@ pub(crate) unsafe fn walk_import_roots_area(
     visitor: &mut dyn FnMut(&mut PyObjectRef),
 ) {
     let area = unsafe { &*(data as *const ImportRootArea) };
-    let modules = unsafe { &*area.modules };
-    for &module in modules.borrow().values() {
+    // SAFETY: the owning thread is quiesced for this foreign root walk, so the
+    // modules map is stable even if it parked with the RefCell borrow flag set.
+    let modules = unsafe { &*(*area.modules).as_ptr() };
+    for &module in modules.values() {
         if module.is_null() || !unsafe { pyre_object::is_module(module) } {
             continue;
         }
