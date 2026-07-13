@@ -14416,6 +14416,29 @@ fn init_bool_type(ns: PyObjectRef) {
 // ── Object TypeDef ───────────────────────────────────────────────────
 // PyPy: pypy/objspace/std/objectobject.py TypeDef("object", ...)
 
+/// True when a class's `__new__` / `__init__` slot still resolves to the
+/// one `object` owns — i.e. the class does not override it.  A
+/// `staticmethod`-wrapped `__new__` is unwrapped to its function first
+/// (`_same_static_method`, objectobject.py:113-116) before the identity
+/// compare, so a slot carrying `object`'s own `__new__` staticmethod
+/// matches.
+fn object_slot_inherited(
+    class_slot: Option<PyObjectRef>,
+    object_slot: Option<PyObjectRef>,
+) -> bool {
+    let unwrap = |s: Option<PyObjectRef>| -> PyObjectRef {
+        match s {
+            Some(f) if unsafe { pyre_object::function::is_staticmethod(f) } => unsafe {
+                pyre_object::function::w_staticmethod_get_func(f)
+            },
+            Some(f) => f,
+            None => PY_NULL,
+        }
+    };
+    let a = unwrap(class_slot);
+    !a.is_null() && crate::baseobjspace::is_w(a, unwrap(object_slot))
+}
+
 /// `object.__new__(cls)` — allocate a bare instance of cls.
 ///
 /// PyPy: objectobject.py descr__new__
@@ -14462,70 +14485,93 @@ fn same_inherited_slot(a: Option<PyObjectRef>, b: Option<PyObjectRef>) -> bool {
 }
 
 fn object_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    // objectobject.py:118 descr__new__ — `w_type` is a mandatory argument.
-    if args.is_empty() {
+    let w_object = w_object();
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let Some(&w_type_arg) = positional.first() else {
         return Err(crate::PyError::type_error(
-            "object.__new__(): not enough arguments",
+            "object.__new__(): not enough arguments".to_string(),
         ));
+    };
+    let cls = w_type_arg;
+    // Bootstrap: before `object` is installed the slot lookups below cannot
+    // run, and no excess-args call reaches here that early.
+    if w_object.is_null() {
+        return Ok(if unsafe { is_type(cls) } {
+            w_instance_new(cls)
+        } else {
+            w_instance_new(PY_NULL)
+        });
     }
-    let cls = args[0];
-    // cls should be a W_TypeObject — create instance of it
-    if unsafe { is_type(cls) } {
-        // objectobject.py descr__new__ — surplus arguments are accepted only
-        // when __new__ or __init__ is overridden; the bare object() takes
-        // none.  A type that overrides __new__ but forwards excess args to
-        // object.__new__ hits the first error.
-        if args.len() > 1 {
-            let obj = w_object();
-            let tp_new = unsafe { crate::baseobjspace::lookup_in_type(cls, "__new__") };
-            let obj_new = unsafe { crate::baseobjspace::lookup_in_type(obj, "__new__") };
-            if !same_inherited_slot(tp_new, obj_new) {
-                return Err(crate::PyError::type_error(
-                    "object.__new__() takes exactly one argument (the type to instantiate)",
-                ));
-            }
-            let tp_init = unsafe { crate::baseobjspace::lookup_in_type(cls, "__init__") };
-            let obj_init = unsafe { crate::baseobjspace::lookup_in_type(obj, "__init__") };
-            if same_inherited_slot(tp_init, obj_init) {
-                let name = unsafe { pyre_object::w_type_get_name(cls) };
-                return Err(crate::PyError::type_error(format!(
-                    "{name}() takes no arguments"
-                )));
-            }
-        }
-        // objectobject.py:131 descr__new__ — abstract classes refuse instantiation.
-        if unsafe { pyre_object::w_type_is_abstract(cls) } {
-            return Err(abstract_instantiation_error(cls));
-        }
-        return Ok(w_instance_new(cls));
+    // `_precheck_for_new` (typeobject.py:1001-1004): a non-type first
+    // argument is a `TypeError`, not a silent bare instance.  `%T` names the
+    // Python type of `cls` (tag-safe via `r#type`), not its raw C layout.
+    if !unsafe { is_type(cls) } {
+        let name = crate::typedef::r#type(cls)
+            .map(|t| unsafe { pyre_object::w_type_get_name(t) })
+            .unwrap_or("object");
+        return Err(crate::PyError::type_error(format!(
+            "object.__new__(X): X is not a type object ({name})"
+        )));
     }
-    // Fallback: create bare instance with no type
-    Ok(w_instance_new(PY_NULL))
+    // objectobject.py descr__new__ — surplus arguments are accepted only
+    // when __new__ or __init__ is overridden; the bare object() takes
+    // none.  A type that overrides __new__ but forwards excess args to
+    // object.__new__ hits the first error.
+    if positional.len() > 1 || crate::builtins::has_real_kwargs(kwargs) {
+        let tp_new = unsafe { crate::baseobjspace::lookup_in_type(cls, "__new__") };
+        let obj_new = unsafe { crate::baseobjspace::lookup_in_type(w_object, "__new__") };
+        if !same_inherited_slot(tp_new, obj_new) {
+            return Err(crate::PyError::type_error(
+                "object.__new__() takes exactly one argument (the type to instantiate)",
+            ));
+        }
+        let tp_init = unsafe { crate::baseobjspace::lookup_in_type(cls, "__init__") };
+        let obj_init = unsafe { crate::baseobjspace::lookup_in_type(w_object, "__init__") };
+        if same_inherited_slot(tp_init, obj_init) {
+            let name = unsafe { pyre_object::w_type_get_name(cls) };
+            return Err(crate::PyError::type_error(format!(
+                "{name}() takes no arguments"
+            )));
+        }
+    }
+    // objectobject.py:131 descr__new__ — abstract classes refuse instantiation,
+    // checked after the excess-args gate and before allocating.
+    if unsafe { pyre_object::w_type_is_abstract(cls) } {
+        return Err(abstract_instantiation_error(cls));
+    }
+    Ok(w_instance_new(cls))
 }
 
 /// `object.__init__(self)` — no-op base __init__.  Surplus arguments are
 /// accepted only when __init__ or __new__ is overridden (objectobject.py
 /// descr__init__); otherwise the bare object initializer takes none.
 fn object_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.len() > 1 {
-        let w_obj = args[0];
-        if let Some(w_type) = crate::typedef::r#type(w_obj) {
-            let obj = w_object();
-            let tp_init = unsafe { crate::baseobjspace::lookup_in_type(w_type, "__init__") };
-            let obj_init = unsafe { crate::baseobjspace::lookup_in_type(obj, "__init__") };
-            if !same_inherited_slot(tp_init, obj_init) {
-                return Err(crate::PyError::type_error(
-                    "object.__init__() takes exactly one argument (the instance to initialize)",
-                ));
-            }
-            let tp_new = unsafe { crate::baseobjspace::lookup_in_type(w_type, "__new__") };
-            let obj_new = unsafe { crate::baseobjspace::lookup_in_type(obj, "__new__") };
-            if same_inherited_slot(tp_new, obj_new) {
-                let name = unsafe { pyre_object::w_type_get_name(w_type) };
-                return Err(crate::PyError::type_error(format!(
-                    "{name}.__init__() takes exactly one argument (the instance to initialize)"
-                )));
-            }
+    let w_object = w_object();
+    if w_object.is_null() {
+        return Ok(w_none());
+    }
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    if !(positional.len() > 1 || crate::builtins::has_real_kwargs(kwargs)) {
+        return Ok(w_none());
+    }
+    let Some(&w_obj) = positional.first() else {
+        return Ok(w_none());
+    };
+    if let Some(w_type) = crate::typedef::r#type(w_obj) {
+        let tp_init = unsafe { crate::baseobjspace::lookup_in_type(w_type, "__init__") };
+        let obj_init = unsafe { crate::baseobjspace::lookup_in_type(w_object, "__init__") };
+        if !same_inherited_slot(tp_init, obj_init) {
+            return Err(crate::PyError::type_error(
+                "object.__init__() takes exactly one argument (the instance to initialize)",
+            ));
+        }
+        let tp_new = unsafe { crate::baseobjspace::lookup_in_type(w_type, "__new__") };
+        let obj_new = unsafe { crate::baseobjspace::lookup_in_type(w_object, "__new__") };
+        if same_inherited_slot(tp_new, obj_new) {
+            let name = unsafe { pyre_object::w_type_get_name(w_type) };
+            return Err(crate::PyError::type_error(format!(
+                "{name}.__init__() takes exactly one argument (the instance to initialize)"
+            )));
         }
     }
     Ok(w_none())
