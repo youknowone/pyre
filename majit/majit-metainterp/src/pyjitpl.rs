@@ -5458,8 +5458,11 @@ impl<M: Clone> MetaInterp<M> {
             )
         };
         let mut retried_without_unroll = false;
-        let (optimized_ops, final_num_inputs) = match optimize_result {
-            Ok(result) => result,
+        let (optimized_ops, final_num_inputs, quasi_immutable_deps) = match optimize_result {
+            Ok(result) => {
+                let deps = std::mem::take(&mut unroll_opt.quasi_immutable_deps);
+                (result.0, result.1, deps)
+            }
             // unroll.py:119-123 `except (InvalidLoop, SpeculativeError)`: a
             // guard proven to always fail, or a speculative heap access proven
             // ill-typed (now a deferred `InvalidLoop` signal rather than a
@@ -5565,10 +5568,11 @@ impl<M: Clone> MetaInterp<M> {
                                 retried_without_unroll = true;
                                 constants = retry_constants;
                                 let ni = simple_opt.final_num_inputs();
+                                let deps = std::mem::take(&mut simple_opt.quasi_immutable_deps);
                                 // Return descrs to unroll_opt so take_back_all_descrs
                                 // at the end of compile_loop picks them up.
                                 unroll_opt.all_descrs = std::mem::take(&mut simple_opt.all_descrs);
-                                (retry_ops, ni)
+                                (retry_ops, ni, deps)
                             }
                             Ok(Err(_invalid_loop)) => {
                                 // The unroll-free retry also abandoned the trace.
@@ -5597,6 +5601,7 @@ impl<M: Clone> MetaInterp<M> {
                 }
             }
         };
+        self.last_quasi_immutable_deps = quasi_immutable_deps;
 
         // compile.py:302-308: vectorization post-pass. Condition is
         // `((warmstate.vec and jitdriver_sd.vec) or warmstate.vec_all) and
@@ -6271,10 +6276,13 @@ impl<M: Clone> MetaInterp<M> {
     /// compile.py: has_compiled_targets — check if a green key has
     /// compiled target tokens that a bridge can jump to.
     pub fn has_compiled_targets(&self, green_key: u64) -> bool {
-        // Consistent with has_compiled_loop: direct key only, no alias.
-        // Both functions must see the same view — otherwise tracing sees
-        // "targets exist" while execution sees "no compiled loop", causing
-        // wasted compile/trace churn in nested loops.
+        // Consistent with has_compiled_loop: direct key only, no alias, and
+        // the warmstate token must still be live. warmstate.py:483-500 removes
+        // invalidated/dead cells before retracing; pyre's compiled_loops
+        // side-table must not make such a dead token look jumpable.
+        if !self.has_compiled_loop(green_key) {
+            return false;
+        }
         self.compiled_loops
             .get(&green_key)
             .map_or(false, |c| !c.front_target_tokens.is_empty())

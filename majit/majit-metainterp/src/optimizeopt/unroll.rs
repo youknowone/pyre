@@ -299,6 +299,9 @@ pub struct UnrollOptimizer {
     /// pyjitpl.py:2289 all_descrs: dense list indexed by descr_index.
     /// Threaded through inner Optimizer instances for inline registration.
     pub all_descrs: Vec<majit_ir::descr::DescrRef>,
+    /// compile.py:204-207 / heap.py:807-808 quasi-immutable deps collected
+    /// by the phase optimizers for post-compile watcher registration.
+    pub quasi_immutable_deps: Vec<(u64, u32)>,
     /// RPython Box type parity: trace inputarg types from recorder.
     /// Each RPython Box carries its type; in majit OpRef is untyped u32.
     /// Propagated to Phase 1 and Phase 2 Optimizer.trace_inputargs
@@ -383,6 +386,7 @@ impl UnrollOptimizer {
             snapshot_vref_boxes: Vec::new(),
             snapshot_frame_pcs: Vec::new(),
             all_descrs: Vec::new(),
+            quasi_immutable_deps: Vec::new(),
             trace_inputargs: Vec::new(),
             phase1_emit_ops: Vec::new(),
             phase1_patchguardop: None,
@@ -722,6 +726,10 @@ impl UnrollOptimizer {
             }
             let p1_ops =
                 opt_p1.run_optimize_from_inputs(&p1_ops_in, &mut consts_p1, num_inputs, false)?;
+            merge_quasi_immutable_deps(
+                &mut self.quasi_immutable_deps,
+                &opt_p1.quasi_immutable_deps,
+            );
             // RPython parity: Phase 1 optimizer may discover new constants
             // via make_constant (e.g., constant-folded heap reads, guard
             // class pointers). These live on the operand's forwarded chain
@@ -1137,6 +1145,10 @@ impl UnrollOptimizer {
                 false,
             )
         })?;
+        merge_quasi_immutable_deps(
+            &mut self.quasi_immutable_deps,
+            &opt_p2.quasi_immutable_deps,
+        );
         self.clear_compile_snapshot_roots();
         // RPython optimizer.py:614-625 freezes op arguments during
         // `_emit_operation`; optimizer.py:598-612 may then install a Const
@@ -2004,6 +2016,14 @@ fn closing_loop_contract_arity<T: AsRef<Op>>(ops: &[T], fallback: usize) -> usiz
 impl Default for UnrollOptimizer {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn merge_quasi_immutable_deps(dst: &mut Vec<(u64, u32)>, src: &[(u64, u32)]) {
+    for dep in src {
+        if !dst.contains(dep) {
+            dst.push(*dep);
+        }
     }
 }
 

@@ -828,7 +828,13 @@ impl pyre_interpreter::NamespaceOpcodeHandler for crate::state::MIFrame {
             //    trace-time cell fold into call_pure_results.
             // 3. CALL_PURE_R(helper, ns, slot) — elidable cell lookup folds
             //    to the constant cell (or raw value) pointer.
-            ctx.record_op(majit_ir::OpCode::QuasiimmutField, &[ns_const, slot_const]);
+            crate::state::record_namespace_quasiimmut_field(
+                ctx,
+                ns_const,
+                slot_const,
+                slot as u32,
+            );
+            crate::state::MIFrame::flush_guard_not_invalidated(_this, ctx);
             let lookup_fn = crate::helpers::jit_namespace_cell_lookup as *const ();
             let lookup_args = [ns_const, slot_const];
             let lookup_arg_types = [majit_ir::Type::Ref, majit_ir::Type::Int];

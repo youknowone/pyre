@@ -3665,6 +3665,27 @@ pub(crate) fn module_dict_cell_value_direct(obj: PyObjectRef, slot: usize) -> Op
     unsafe { pyre_object::dictmultiobject::module_dict_cell_at(obj, slot) }
 }
 
+/// pyjitpl.py:1074-1089 `opimpl_record_quasiimmut_field` for namespace
+/// slot folds: record the dependency marker and arm the pending
+/// GUARD_NOT_INVALIDATED once per heapcache epoch.
+pub(crate) fn record_namespace_quasiimmut_field(
+    ctx: &mut TraceCtx,
+    obj: OpRef,
+    slot: OpRef,
+    slot_index: u32,
+) {
+    if ctx.heap_cache().is_quasi_immut_known(obj, slot_index) {
+        ctx.profiler()
+            .count_ops(OpCode::QuasiimmutField, majit_metainterp::counters::HEAPCACHED_OPS);
+        return;
+    }
+    ctx.heap_cache_mut().quasi_immut_now_known(obj, slot_index);
+    ctx.record_op(OpCode::QuasiimmutField, &[obj, slot]);
+    if ctx.heap_cache_mut().check_and_clear_guard_not_invalidated() {
+        ctx.set_pending_guard_not_invalidated(Some(ctx.last_traced_pc));
+    }
+}
+
 /// virtualizable.py:44 + interp_jit.py:25-31 —
 /// `locals_cells_stack_w[*]` is declared as a W_Root array, so every
 /// item's JIT type is GCREF (Type::Ref). W_IntObject/W_FloatObject are

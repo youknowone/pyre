@@ -537,6 +537,7 @@ impl WarmEnterState {
     }
 
     pub fn counter_tick_checked(&mut self, green_key_hash: u64) -> bool {
+        let mut cleanup_dead_token_cell = false;
         if let Some(cell) = self.cells.get(&green_key_hash) {
             if cell.is_compiled() || cell.is_tracing() {
                 return true;
@@ -544,12 +545,23 @@ impl WarmEnterState {
             if cell.flags & jc_flags::DONT_TRACE_HERE != 0 && cell.has_seen_a_procedure_token() {
                 return false;
             }
+            if cell.has_seen_a_procedure_token() && cell.get_procedure_token().is_none() {
+                cleanup_dead_token_cell = true;
+            }
+        }
+        if cleanup_dead_token_cell {
+            // warmstate.py:483-500 — loop-header counter entry must also
+            // remove invalidated token cells before it starts counting again.
+            self.cleanup_chain(green_key_hash);
+            return false;
         }
         self.counter.tick(green_key_hash, self.increment_threshold)
     }
 
     pub fn maybe_compile(&mut self, green_key_hash: u64) -> HotResult {
+        let mut cleanup_dead_token_cell = false;
         if let Some(cell) = self.cells.get(&green_key_hash) {
+            let has_procedure_token = cell.get_procedure_token().is_some();
             let is_compiled = cell.is_compiled();
             let is_tracing = cell.is_tracing();
             let flags = cell.flags;
@@ -570,6 +582,16 @@ impl WarmEnterState {
             if flags & jc_flags::DONT_TRACE_HERE != 0 {
                 return HotResult::NotHot;
             }
+            if has_seen_a_procedure_token && !has_procedure_token {
+                cleanup_dead_token_cell = true;
+            }
+        }
+
+        if cleanup_dead_token_cell {
+            // warmstate.py:483-500 — an invalidated/dead procedure token is
+            // removed from the chain, resetting the hot counter so it re-arms.
+            self.cleanup_chain(green_key_hash);
+            return HotResult::NotHot;
         }
 
         if !self.counter.tick(green_key_hash, self.increment_threshold) {
@@ -605,7 +627,9 @@ impl WarmEnterState {
     /// typed-greenkey threading work.
     pub fn maybe_compile_with_key(&mut self, key: &GreenKey) -> HotResult {
         let hash = key.get_uhash();
+        let mut cleanup_dead_token_cell = false;
         if let Some(cell) = self.lookup_chain_with_key(key) {
+            let has_procedure_token = cell.get_procedure_token().is_some();
             let is_compiled = cell.is_compiled();
             let is_tracing = cell.is_tracing();
             let flags = cell.flags;
@@ -622,6 +646,16 @@ impl WarmEnterState {
             if flags & jc_flags::DONT_TRACE_HERE != 0 {
                 return HotResult::NotHot;
             }
+            if has_seen_a_procedure_token && !has_procedure_token {
+                cleanup_dead_token_cell = true;
+            }
+        }
+
+        if cleanup_dead_token_cell {
+            // warmstate.py:483-500 — an invalidated/dead procedure token is
+            // removed from the chain, resetting the hot counter so it re-arms.
+            self.cleanup_chain(hash);
+            return HotResult::NotHot;
         }
 
         if !self.counter.tick(hash, self.increment_threshold) {
@@ -1354,6 +1388,7 @@ impl WarmEnterState {
     ///
     /// warmstate.py:256-257: jitcounter.tick(hash, increment_function_threshold).
     pub fn should_trace_function_entry(&mut self, green_key_hash: u64) -> bool {
+        let mut cleanup_dead_token_cell = false;
         if let Some(cell) = self.cells.get(&green_key_hash) {
             if cell.is_compiled() || cell.is_tracing() {
                 return false;
@@ -1366,6 +1401,15 @@ impl WarmEnterState {
                     return true;
                 }
             }
+            if cell.has_seen_a_procedure_token() && cell.get_procedure_token().is_none() {
+                cleanup_dead_token_cell = true;
+            }
+        }
+        if cleanup_dead_token_cell {
+            // warmstate.py:483-500 — function-entry warmup must see an
+            // invalidated token as a removed cell and re-count from cold.
+            self.cleanup_chain(green_key_hash);
+            return false;
         }
         self.counter
             .tick(green_key_hash, self.increment_function_threshold)
@@ -3030,6 +3074,77 @@ mod tests {
 
         // Loop should now be invalidated state
         assert_eq!(ws.get_cell_state(key), BaseJitCellState::Invalidated);
+    }
+
+    #[test]
+    fn test_quasiimmut_invalidated_cell_rearms_hot_counter() {
+        let mut ws = WarmEnterState::new(2);
+        let key = 0xD00D;
+        let qmut = 0xFA11;
+
+        assert!(matches!(ws.maybe_compile(key), HotResult::NotHot));
+        assert!(matches!(ws.maybe_compile(key), HotResult::StartTracing));
+        ws.finish_tracing(key);
+        let token = JitCellToken::new(ws.alloc_token_number());
+        ws.attach_procedure_to_interp(key, token);
+        ws.register_quasiimmut_dependency(qmut, key);
+
+        assert_eq!(ws.invalidate_quasiimmut(qmut), 1);
+        assert_eq!(ws.get_cell_state(key), BaseJitCellState::Invalidated);
+
+        // warmstate.py:483-500: the next entry removes the invalidated
+        // token cell and resets the counter; following entries count fresh.
+        assert!(matches!(ws.maybe_compile(key), HotResult::NotHot));
+        assert!(ws.get_cell(key).is_none());
+        assert!(matches!(ws.maybe_compile(key), HotResult::NotHot));
+        assert!(matches!(ws.maybe_compile(key), HotResult::StartTracing));
+    }
+
+    #[test]
+    fn test_counter_tick_checked_rearms_after_quasiimmut_invalidation() {
+        let mut ws = WarmEnterState::new(2);
+        let key = 0xD00E;
+        let qmut = 0xFA12;
+
+        assert!(!ws.counter_tick_checked(key));
+        assert!(ws.counter_tick_checked(key));
+        ws.force_start_tracing(key);
+        ws.finish_tracing(key);
+        let token = JitCellToken::new(ws.alloc_token_number());
+        ws.attach_procedure_to_interp(key, token);
+        ws.register_quasiimmut_dependency(qmut, key);
+
+        assert_eq!(ws.invalidate_quasiimmut(qmut), 1);
+        assert_eq!(ws.get_cell_state(key), BaseJitCellState::Invalidated);
+
+        assert!(!ws.counter_tick_checked(key));
+        assert!(ws.get_cell(key).is_none());
+        assert!(!ws.counter_tick_checked(key));
+        assert!(ws.counter_tick_checked(key));
+    }
+
+    #[test]
+    fn test_function_entry_rearms_after_quasiimmut_invalidation() {
+        let mut ws = WarmEnterState::new(2);
+        ws.set_function_threshold(2);
+        let key = 0xD00F;
+        let qmut = 0xFA13;
+
+        assert!(!ws.should_trace_function_entry(key));
+        assert!(ws.should_trace_function_entry(key));
+        ws.force_start_tracing(key);
+        ws.finish_tracing(key);
+        let token = JitCellToken::new(ws.alloc_token_number());
+        ws.attach_procedure_to_interp(key, token);
+        ws.register_quasiimmut_dependency(qmut, key);
+
+        assert_eq!(ws.invalidate_quasiimmut(qmut), 1);
+        assert_eq!(ws.get_cell_state(key), BaseJitCellState::Invalidated);
+
+        assert!(!ws.should_trace_function_entry(key));
+        assert!(ws.get_cell(key).is_none());
+        assert!(!ws.should_trace_function_entry(key));
+        assert!(ws.should_trace_function_entry(key));
     }
 
     #[test]

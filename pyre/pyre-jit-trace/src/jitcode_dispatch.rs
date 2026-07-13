@@ -15356,7 +15356,13 @@ fn dispatch_residual_call_iRd_kind(
                 ctx.trace_ctx.box_value(frame_opref),
                 ctx.trace_ctx.box_value(name_opref),
             ) {
-                if try_walker_store_name_cell_fold(ctx, frame_ptr, w_name_ptr, value_opref)? {
+                if try_walker_store_name_cell_fold(
+                    ctx,
+                    op.pc,
+                    frame_ptr,
+                    w_name_ptr,
+                    value_opref,
+                )? {
                     return Ok((DispatchOutcome::Continue, op.next_pc));
                 }
             }
@@ -16373,6 +16379,17 @@ fn walker_emit_fold_guard_with_snapshot(
 ) -> Result<(), DispatchError> {
     ctx.trace_ctx.record_guard(opcode, args, 0);
     walker_capture_snapshot_for_last_guard(ctx, op_pc)
+}
+
+fn walker_flush_guard_not_invalidated(
+    ctx: &mut WalkContext<'_, '_>,
+    op_pc: usize,
+) -> Result<(), DispatchError> {
+    if ctx.trace_ctx.pending_guard_not_invalidated_pc().is_some() {
+        ctx.trace_ctx.set_pending_guard_not_invalidated(None);
+        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardNotInvalidated, &[])?;
+    }
+    Ok(())
 }
 
 /// Record `int_eq(raw, const k)` and stamp its already-known concrete
@@ -19949,10 +19966,13 @@ fn try_walker_load_global_cell_fold(
     // a DIFFERENT present name on the same module dict.
     let abs_ns_const = ctx.trace_ctx.const_ref(w_globals as i64);
     let abs_slot_const = ctx.trace_ctx.const_int(usize::MAX as i64);
-    ctx.trace_ctx.record_op(
-        majit_ir::OpCode::QuasiimmutField,
-        &[abs_ns_const, abs_slot_const],
+    crate::state::record_namespace_quasiimmut_field(
+        ctx.trace_ctx,
+        abs_ns_const,
+        abs_slot_const,
+        u32::MAX,
     );
+    walker_flush_guard_not_invalidated(ctx, op_pc)?;
     // Guard (b): the builtins value for `name` must be unchanged.  The
     // `emit_namespace_cell_fold` below records a `QUASIIMMUT_FIELD` on the
     // builtins dict + the elidable cell lookup, so a rebind/del of the
@@ -20089,8 +20109,13 @@ fn emit_namespace_cell_fold(
 
     let ns_const = ctx.trace_ctx.const_ref(ns as i64);
     let slot_const = ctx.trace_ctx.const_int(slot as i64);
-    ctx.trace_ctx
-        .record_op(majit_ir::OpCode::QuasiimmutField, &[ns_const, slot_const]);
+    crate::state::record_namespace_quasiimmut_field(
+        ctx.trace_ctx,
+        ns_const,
+        slot_const,
+        slot as u32,
+    );
+    walker_flush_guard_not_invalidated(ctx, op_pc)?;
     // Bake the immovable cell as a `ConstPtr` (pypy `ConstPtr(cell)`).  The
     // `QuasiimmutField(ns, slot)` guard above invalidates the loop on a
     // rebind / strategy-version bump (`optimize_QUASIIMMUT_FIELD` watches the
@@ -20208,6 +20233,7 @@ fn try_walker_load_name_cell_fold(
 /// invalidating this loop.
 fn emit_namespace_cell_store_fold(
     ctx: &mut WalkContext<'_, '_>,
+    op_pc: usize,
     ns: pyre_object::PyObjectRef,
     slot: usize,
     stored: pyre_object::PyObjectRef,
@@ -20216,8 +20242,13 @@ fn emit_namespace_cell_store_fold(
 ) -> Result<(), DispatchError> {
     let ns_const = ctx.trace_ctx.const_ref(ns as i64);
     let slot_const = ctx.trace_ctx.const_int(slot as i64);
-    ctx.trace_ctx
-        .record_op(majit_ir::OpCode::QuasiimmutField, &[ns_const, slot_const]);
+    crate::state::record_namespace_quasiimmut_field(
+        ctx.trace_ctx,
+        ns_const,
+        slot_const,
+        slot as u32,
+    );
+    walker_flush_guard_not_invalidated(ctx, op_pc)?;
     // Bake the immovable cell as a `ConstPtr`, identical to the LOAD fold
     // (`emit_namespace_cell_fold`), so this `setfield_gc_i` and the LOAD's
     // `getfield_gc_i` canonicalise onto one trace-heapcache slot via
@@ -20284,6 +20315,7 @@ fn emit_namespace_cell_store_fold(
 /// cell + bumps the version for those, which the setfield fast path must not).
 fn try_walker_store_name_cell_fold(
     ctx: &mut WalkContext<'_, '_>,
+    op_pc: usize,
     frame_ptr: usize,
     w_name_ptr: usize,
     value_opref: OpRef,
@@ -20346,7 +20378,7 @@ fn try_walker_store_name_cell_fold(
     let Some(majit_ir::Value::Int(new_int)) = ctx.trace_ctx.box_value(raw_int) else {
         return Ok(false);
     };
-    emit_namespace_cell_store_fold(ctx, w_globals, slot, stored, raw_int, new_int)?;
+    emit_namespace_cell_store_fold(ctx, op_pc, w_globals, slot, stored, raw_int, new_int)?;
     Ok(true)
 }
 
