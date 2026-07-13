@@ -7285,6 +7285,7 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
             let dict_ptr = w_type_get_dict_ptr(obj) as *mut crate::DictStorage;
             if !dict_ptr.is_null() {
                 crate::dict_storage_store(&mut *dict_ptr, name, value);
+                pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
                 // typeobject.py:430 — `self.mutated(name)` after the
                 // dict_w write so cached `compares_by_identity_status`
                 // (and future per-type caches) reset on this type and
