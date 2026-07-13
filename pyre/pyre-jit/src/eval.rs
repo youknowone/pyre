@@ -3854,10 +3854,10 @@ enum UnsupportedJitShape {
 /// walk-abort silently drops an iteration (#57). This is an ALLOW-LIST:
 /// arithmetic/comparison (implicit dunder dispatch resumes past the call on
 /// abort — verified), local/const reads and frame-slot writes, stack
-/// manipulation, and intra-body control flow. Every other opcode — explicit
-/// `CALL`, heap-mutating stores, nested `FOR_ITER`, list/set/dict builders and
-/// mutators — is treated as unsafe so the frame keeps running in the
-/// interpreter. Unknown/future opcodes default to unsafe.
+/// manipulation, read-only attribute loads, and intra-body control flow. Every
+/// other opcode — heap-mutating stores outside the abort-free widening and
+/// unsupported mutators — is treated as unsafe so the frame keeps running in
+/// the interpreter. Unknown/future opcodes default to unsafe.
 fn for_iter_body_op_is_jit_safe(instr: pyre_interpreter::Instruction) -> bool {
     use pyre_interpreter::Instruction as I;
     matches!(
@@ -3922,6 +3922,8 @@ fn for_iter_body_op_is_jit_safe(instr: pyre_interpreter::Instruction) -> bool {
             | I::PopIter
             | I::DeleteFast { .. }
             | I::LoadDeref { .. }
+            // An aborting method call resumes exactly via forward-exc-delivery / CALL-forward.
+            | I::LoadAttr { .. }
             // function calls and global reads: the Layer 2 dynamic defense
             // (body_effect_candidate + fbw_foriter_inflight_take) handles
             // walk-abort safety, and inline sub-walks are declined when a
@@ -3979,19 +3981,17 @@ fn for_iter_body_is_abort_free(
 
 /// True iff every `FOR_ITER` loop body in `code` is admissible. The BASE rule is
 /// `for_iter_body_op_is_jit_safe`. A nested `FOR_ITER` appears as a body
-/// instruction of its enclosing loop and is not allow-listed, so nested loops
-/// are rejected without recursion. The iterable setup (`range(n)`, `GET_ITER`)
-/// precedes the `FOR_ITER` and is therefore not part of any body range.
+/// instruction of its enclosing loop, and its own body is scanned when the
+/// outer instruction walk reaches it. The iterable setup (`range(n)`,
+/// `GET_ITER`) precedes the `FOR_ITER` and is therefore not part of any body
+/// range.
 ///
-/// This whole gate is a conservative adaptation, not an upstream mechanism. The
-/// FBW single-pass walker recovers from a mid-body walk abort by REFUSING to
-/// re-deliver the in-flight `FOR_ITER` item (Option-C deliver/refuse), which
-/// drops the rest of that iteration. The register-machine metainterp instead
-/// resumes exactly: it reads the precise `(jitcode, pc)` from the guard's resume
-/// data, `setposition`s a blackhole interpreter there and runs the body to its
-/// end (`blackhole_from_resumedata`, resume.py:1312), so it never drops or
-/// doubles. Until that exact-resume path is ported (#215 P2 / #73 / task#50), a
-/// body is admitted only where the refuse-drop deviation cannot be observed.
+/// This whole gate is a conservative adaptation, not an upstream mechanism.
+/// Mid-body walk aborts now resume exactly through `try_commit_midbody_abort`:
+/// forward-exception-delivery handles propagated exceptions and CALL-forward
+/// re-runs the outer call, instead of using the FBW refuse-drop path. This
+/// matches the forward-only resume of `blackhole_from_resumedata`
+/// (resume.py:1312), which never drops or doubles an iteration.
 ///
 /// A straight-line body — one that `for_iter_body_is_abort_free` accepts — may
 /// ADDITIONALLY carry the direct heap-store opcodes `STORE_SUBSCR`,
@@ -4000,11 +4000,10 @@ fn for_iter_body_is_abort_free(
 /// cannot reach the deliver/refuse path at all: with no call, branch or nested
 /// loop there is no abort after the store, so the store commits exactly once and
 /// its result coincides with the exact-resume result (#57). Bodies with a call
-/// or a branch stay on the base allow-list. `LOAD_ATTR` is deliberately
-/// excluded: it admits a method load whose call declines-to-abort while an item
-/// is in flight, and if an earlier body effect has already committed, the
-/// refuse-drop skips the rest of that iteration — a partial-iteration wrong
-/// answer, not a clean drop.
+/// or a branch stay on the base allow-list. `LOAD_ATTR` is admitted because a
+/// mid-body abort from its method call resumes exactly through
+/// `try_commit_midbody_abort` using forward-exception-delivery / CALL-forward,
+/// rather than dropping the remainder of the iteration.
 fn for_iter_bodies_all_jit_safe(code: &pyre_interpreter::CodeObject) -> bool {
     use pyre_interpreter::Instruction as I;
     let instructions = &code.instructions;
@@ -8839,31 +8838,31 @@ mod tests {
     }
 
     #[test]
-    fn for_iter_nested_append_body_is_not_jit_safe() {
-        // nested FOR_ITER with a direct append = the s3_append dropper -> excluded.
+    fn for_iter_nested_append_body_is_jit_safe() {
+        // Both loop bodies are scanned; the inner LOAD_ATTR+CALL is admitted now
+        // that a mid-body method-call abort resumes exactly.
         use pyre_interpreter::compile_exec;
         let module = compile_exec(
             "def g(n, acc):\n    for a in range(n):\n        for b in range(a):\n            acc.append(a)\n    return len(acc)\n",
         )
         .expect("test code should compile");
         let code = function_code_from_module(&module, "g");
-        assert!(!for_iter_bodies_all_jit_safe(&code));
-        assert_eq!(
-            unsupported_jit_shape(&code),
-            UnsupportedJitShape::CurrentFrameOnly
-        );
+        assert!(for_iter_bodies_all_jit_safe(&code));
+        assert_eq!(unsupported_jit_shape(&code), UnsupportedJitShape::None);
     }
 
     #[test]
-    fn for_iter_single_level_explicit_append_body_is_not_jit_safe() {
-        // explicit list.append in a body is conservatively excluded (LOAD_METHOD+CALL).
+    fn for_iter_single_level_explicit_append_body_is_jit_safe() {
+        // LOAD_ATTR followed by CALL is admitted now that a mid-body method-call
+        // abort resumes exactly instead of dropping the remainder of the iteration.
         use pyre_interpreter::compile_exec;
         let module = compile_exec(
             "def k(src, acc):\n    for x in src:\n        acc.append(x)\n    return len(acc)\n",
         )
         .expect("test code should compile");
         let code = function_code_from_module(&module, "k");
-        assert!(!for_iter_bodies_all_jit_safe(&code));
+        assert!(for_iter_bodies_all_jit_safe(&code));
+        assert_eq!(unsupported_jit_shape(&code), UnsupportedJitShape::None);
     }
 
     #[test]
@@ -8936,11 +8935,23 @@ mod tests {
     #[test]
     fn for_iter_straight_line_store_attr_body_is_jit_safe() {
         // A straight-line body `o.x = i` is abort-free, so the direct STORE_ATTR
-        // is admitted. (LOAD_ATTR reads stay excluded — see the allow-list.)
+        // is admitted through the abort-free store widening.
         use pyre_interpreter::compile_exec;
         let module =
             compile_exec("def w(src, o):\n    for i in src:\n        o.x = i\n    return o.x\n")
                 .expect("test code should compile");
+        let code = function_code_from_module(&module, "w");
+        assert!(for_iter_bodies_all_jit_safe(&code));
+        assert_eq!(unsupported_jit_shape(&code), UnsupportedJitShape::None);
+    }
+
+    #[test]
+    fn for_iter_load_attr_method_body_is_jit_safe() {
+        use pyre_interpreter::compile_exec;
+        let module = compile_exec(
+            "def w(objs):\n    s = 0\n    for o in objs:\n        s += o.bump()\n    return s\n",
+        )
+        .expect("test code should compile");
         let code = function_code_from_module(&module, "w");
         assert!(for_iter_bodies_all_jit_safe(&code));
         assert_eq!(unsupported_jit_shape(&code), UnsupportedJitShape::None);
