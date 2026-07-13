@@ -761,11 +761,21 @@ unsafe fn pyframe_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut ma
     // RPython's phase-agnostic precedent is jitframe.py:104 `jitframe_trace`.
     let array = frame.locals_cells_stack_w;
     if !array.is_null() {
-        let walk_items = if pyre_object::gc_hook::try_gc_owns_object(array as *mut u8) {
+        let managed = pyre_object::gc_hook::try_gc_owns_object(array as *mut u8);
+        if managed {
             f(
                 &mut frame.locals_cells_stack_w as *mut *mut pyre_object::FixedObjectArray
                     as *mut majit_ir::GcRef,
             );
+        }
+        // The visitor forwards a promoted nursery array in place, so
+        // `frame.locals_cells_stack_w` now holds the old-gen copy. Re-read it:
+        // the local `array` read above still points at the pre-copy location,
+        // whose header is a forwarding marker (arraylen there is the
+        // forwarding address). `walk_items` and the item walk must use the
+        // live destination.
+        let array = frame.locals_cells_stack_w;
+        let walk_items = if managed {
             !majit_gc::gc_is_nursery_object(array as usize)
         } else {
             true
