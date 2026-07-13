@@ -8820,7 +8820,7 @@ impl CodeWriter {
                             // for the analyzer-equivalent `EF_CANNOT_RAISE
                             // + empty raw frozensets + can_collect=false`
                             // shape (`effectinfo.py:281-283`).
-                            let _prev_var = residual_call!(
+                            let prev_var = residual_call!(
                                 get_current_exception_fn_idx,
                                 CallFlavor::PlainCannotRaiseNoHeap,
                                 majit_ir::PyreHelperKind::GetCurrentException,
@@ -8857,7 +8857,10 @@ impl CodeWriter {
                             // catch-landing `last_exc_value` pin, so
                             // `get_color` agrees with the runtime register.
                             let _prev_slot = stack_base + current_depth;
-                            let prev_value = fresh_ref_value(&mut graph);
+                            let prev_value: super::flow::FlowValue = match prev_var {
+                                Some(v) => v.into(),
+                                None => fresh_ref_value(&mut graph).into(),
+                            };
                             current_state.stack.push(prev_value.clone());
                             emit_pushvalue_ref!(
                                 current_depth,
