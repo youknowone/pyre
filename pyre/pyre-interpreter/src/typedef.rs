@@ -12372,7 +12372,9 @@ pub(crate) fn decode_bytes_to_wtf8(
         "utf-8" | "utf8" | "u8" => decode_utf8_with_errors(data, err_mode)?,
         "ascii" | "us-ascii" | "646" => {
             let mut out = Wtf8Buf::new();
-            for (i, &b) in data.iter().enumerate() {
+            let mut i = 0;
+            while i < data.len() {
+                let b = data[i];
                 if b >= 0x80 {
                     match err_mode {
                         "strict" => {
@@ -12384,15 +12386,20 @@ pub(crate) fn decode_bytes_to_wtf8(
                                 "ordinal not in range(128)",
                             ));
                         }
-                        "ignore" => continue,
+                        "ignore" => {
+                            i += 1;
+                            continue;
+                        }
                         "replace" => {
                             out.push_char('\u{FFFD}');
+                            i += 1;
                             continue;
                         }
                         // surrogateescape escapes the non-ASCII byte as a lone
                         // surrogate 0xdc00+b (interp_codecs.py:536-555).
                         "surrogateescape" => {
                             out.push(CodePoint::from_u32(0xDC00 + b as u32).unwrap());
+                            i += 1;
                             continue;
                         }
                         // surrogatepass only decodes three-byte UTF-8 surrogate
@@ -12409,20 +12416,28 @@ pub(crate) fn decode_bytes_to_wtf8(
                         }
                         "backslashreplace" => {
                             out.push_str(&format!("\\x{:02x}", b));
+                            i += 1;
                             continue;
                         }
                         "xmlcharrefreplace" | "namereplace" => {
                             return Err(decode_error_encode_only_handler());
                         }
                         _ => {
-                            return Err(crate::PyError::new(
-                                crate::PyErrorKind::LookupError,
-                                format!("unknown error handler name '{err_mode}'"),
-                            ));
+                            i = crate::type_methods::call_registered_decode_error_handler(
+                                err_mode,
+                                "ascii",
+                                data,
+                                i,
+                                i + 1,
+                                "ordinal not in range(128)",
+                                &mut out,
+                            )?;
+                            continue;
                         }
                     }
                 }
                 out.push_char(b as char);
+                i += 1;
             }
             out
         }

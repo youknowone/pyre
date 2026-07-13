@@ -88,7 +88,9 @@ fn run_harness(program: &str, name: &str, vacuity_label: &str) -> Result<(), Str
         pyre_object::W_OBJECT_OBJECT_GC_TYPE_ID,
         pyre_object::W_OBJECT_OBJECT_SIZE,
     )
-    .ok_or_else(|| format!("stable GC alloc hook was not live; {vacuity_label} would be vacuous"))?;
+    .ok_or_else(|| {
+        format!("stable GC alloc hook was not live; {vacuity_label} would be vacuous")
+    })?;
     if probe.is_null() {
         return Err("stable GC alloc hook returned null for an instance-sized block".to_string());
     }
@@ -116,9 +118,7 @@ fn run_on_worker(
     // not thread-safe, so run them one at a time regardless of cargo's
     // parallel test scheduling. Poison-tolerant: one worker panicking must not
     // wedge the rest.
-    let _serial = GC_STRESS_SERIAL
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _serial = GC_STRESS_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let handle = std::thread::Builder::new()
         .stack_size(256 * 1024 * 1024)
         .spawn(move || run_harness(program, name, vacuity_label))

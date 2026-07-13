@@ -871,23 +871,25 @@ pub fn init_sys_path(script_dir: &Path) {
     SYS_PATH.with(|p| {
         let mut path = p.borrow_mut();
         path.clear();
-        // Script directory first (PyPy: first entry in sys.path)
-        path.push(script_dir.to_path_buf());
-        // Current working directory as fallback. Under sandbox read it through
-        // the seam so it resolves to the controller's virtual cwd (`/tmp`)
-        // rather than leaking the trusted parent's real working directory.
-        #[cfg(feature = "sandbox")]
-        let cwd = {
-            use std::os::unix::ffi::OsStrExt;
-            crate::host_seam::ops::getcwd()
-                .ok()
-                .map(|b| PathBuf::from(std::ffi::OsStr::from_bytes(&b)))
-        };
-        #[cfg(not(feature = "sandbox"))]
-        let cwd = host_os::current_dir().ok();
-        if let Some(cwd) = cwd {
-            if cwd != script_dir {
-                path.push(cwd);
+        if !safe_path_flag() {
+            // Script directory first.
+            path.push(script_dir.to_path_buf());
+            // Current working directory as fallback. Under sandbox read it through
+            // the seam so it resolves to the controller's virtual cwd (`/tmp`)
+            // rather than leaking the trusted parent's real working directory.
+            #[cfg(feature = "sandbox")]
+            let cwd = {
+                use std::os::unix::ffi::OsStrExt;
+                crate::host_seam::ops::getcwd()
+                    .ok()
+                    .map(|b| PathBuf::from(std::ffi::OsStr::from_bytes(&b)))
+            };
+            #[cfg(not(feature = "sandbox"))]
+            let cwd = host_os::current_dir().ok();
+            if let Some(cwd) = cwd {
+                if cwd != script_dir {
+                    path.push(cwd);
+                }
             }
         }
         // CPython stdlib path is detected lazily on first stdlib import

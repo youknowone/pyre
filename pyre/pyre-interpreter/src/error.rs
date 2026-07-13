@@ -793,6 +793,24 @@ impl PyError {
         Self::write_unraisable_default(space, w_type, w_value, w_tb, &first_line, w_object, "");
     }
 
+    fn write_unraisable_to_sys_stderr(buf: &[u8]) -> bool {
+        let Some(sys_mod) = crate::importing::get_sys_module("sys") else {
+            return false;
+        };
+        let stderr = match crate::baseobjspace::getattr_str(sys_mod, "stderr") {
+            Ok(w) if !w.is_null() && !unsafe { pyre_object::is_none(w) } => w,
+            _ => return false,
+        };
+        let text = String::from_utf8_lossy(buf).into_owned();
+        let w_text = pyre_object::w_str_new(&text);
+        let result = crate::baseobjspace::call_method(stderr, "write", &[w_text]);
+        if result.is_null() {
+            let _ = crate::call::take_call_error();
+            return false;
+        }
+        true
+    }
+
     /// pypy/interpreter/error.py:318-347 `write_unraisable_default`.
     pub fn write_unraisable_default(
         space: PyObjectRef,
@@ -831,7 +849,9 @@ impl PyError {
             let err = unsafe { PyError::from_exc_object(w_value) };
             let _ = write_exception(&mut buf, &err, true);
         }
-        crate::host_seam::emit_stderr(&buf);
+        if !Self::write_unraisable_to_sys_stderr(&buf) {
+            crate::host_seam::emit_stderr(&buf);
+        }
     }
 
     fn to_exc_kind(&self) -> ExcKind {

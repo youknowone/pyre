@@ -398,11 +398,7 @@ fn dynasm_collect_oldgen_nonmoving() {
     });
 }
 
-fn dynasm_register_finalizer(
-    fq_index: usize,
-    obj: GcRef,
-    trigger: majit_gc::FinalizerTriggerFn,
-) {
+fn dynasm_register_finalizer(fq_index: usize, obj: GcRef, trigger: majit_gc::FinalizerTriggerFn) {
     DYNASM_ACTIVE_GC.with(|cell| {
         let mut guard = cell.borrow_mut();
         if let Some(gc) = guard.as_deref_mut() {
