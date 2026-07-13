@@ -485,22 +485,11 @@ fn dynasm_collect_oldgen_nonmoving() {
 }
 
 fn dynasm_register_finalizer(fq_index: usize, obj: GcRef, trigger: majit_gc::FinalizerTriggerFn) {
-    DYNASM_ACTIVE_GC.with(|cell| {
-        let mut guard = cell.borrow_mut();
-        if let Some(gc) = guard.as_deref_mut() {
-            gc.register_finalizer(fq_index, obj, trigger);
-        }
-    });
+    with_dynasm_active_gc_mut(|gc| gc.register_finalizer(fq_index, obj, trigger));
 }
 
 fn dynasm_finalizer_next_dead(fq_index: usize) -> Option<GcRef> {
-    DYNASM_ACTIVE_GC.with(|cell| {
-        let mut guard = cell.borrow_mut();
-        match guard.as_deref_mut() {
-            Some(gc) => gc.finalizer_next_dead(fq_index),
-            None => None,
-        }
-    })
+    with_dynasm_active_gc_mut(|gc| gc.finalizer_next_dead(fq_index)).flatten()
 }
 
 /// Report `(oldgen_total, nursery_used)` for the interpreter GC safepoint.

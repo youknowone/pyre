@@ -389,18 +389,11 @@ fn wasm_collect_oldgen_nonmoving() {
 }
 
 fn wasm_register_finalizer(fq_index: usize, obj: GcRef, trigger: majit_gc::FinalizerTriggerFn) {
-    WASM_ACTIVE_GC.with(|cell| {
-        if let Some(gc) = cell.borrow_mut().as_deref_mut() {
-            gc.register_finalizer(fq_index, obj, trigger);
-        }
-    });
+    with_wasm_active_gc_mut(|gc| gc.register_finalizer(fq_index, obj, trigger));
 }
 
 fn wasm_finalizer_next_dead(fq_index: usize) -> Option<GcRef> {
-    WASM_ACTIVE_GC.with(|cell| match cell.borrow_mut().as_deref_mut() {
-        Some(gc) => gc.finalizer_next_dead(fq_index),
-        None => None,
-    })
+    with_wasm_active_gc_mut(|gc| gc.finalizer_next_dead(fq_index)).flatten()
 }
 
 /// `majit_gc::CheckIsObjectFn` installed by `set_gc_allocator`.
