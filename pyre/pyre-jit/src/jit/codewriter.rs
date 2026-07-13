@@ -1533,6 +1533,26 @@ fn handler_entry_state_from_catch_sites(
     merged
 }
 
+/// True for a handler whose reconstructed entry stack carries both a
+/// `push_lasti` box and an exception slot (`handler_entry_state_from_catch_site`
+/// pushes the lasti box below a `fresh_ref_value` exception slot). That
+/// exception slot has no defining op, so under the inline splice regalloc —
+/// which sources interference only from per-PC resume snapshots — it never
+/// interferes with the lasti box and coalesces onto its register, making the
+/// cleanup RERAISE raise the stale lasti integer. The caller gives the slot a
+/// `last_exc_value` producer so it enters the snapshots and earns a distinct
+/// colour.
+fn handler_entry_has_lasti_exception_slots(
+    catch_sites: &[ExceptionCatchSite],
+    handler_py_pc: usize,
+) -> bool {
+    catch_sites.iter().any(|site| {
+        site.handler_py_pc == handler_py_pc
+            && site.push_lasti
+            && site.landing.framestate().is_some()
+    })
+}
+
 fn initialize_spam_block(
     code: &CodeObject,
     graph: &mut super::flow::FunctionGraph,
@@ -7288,6 +7308,19 @@ impl CodeWriter {
                     // current_block.
                     if block_switch_pending {
                         break;
+                    }
+                    if start_pc == py_pc
+                        && handler_entry_has_lasti_exception_slots(&catch_sites, py_pc)
+                    {
+                        if let Some(exc_value) = current_state.stack.last().cloned() {
+                            record_graph_op(
+                                &current_block.block(),
+                                "last_exc_value",
+                                Vec::new(),
+                                Some(exc_value),
+                                py_pc as i64,
+                            );
+                        }
                     }
                     // The walker emits one block-identity `Label(block)`
                     // at block entry (`flatten.py:116` parity).  Per-PC
