@@ -1119,6 +1119,31 @@ where
             // two per live vref).
             let virtualizable_snapshot = ctx.virtualizable_boxes.clone().unwrap_or_default();
             let virtualref_snapshot = ctx.virtualref_boxes.clone();
+            if crate::callee_rca_enabled() {
+                let vable_payload: Vec<_> = virtualizable_snapshot
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, op)| {
+                        let raw = ctx.box_value(*op).map(|value| match value {
+                            majit_ir::Value::Int(v) => v,
+                            majit_ir::Value::Ref(r) => r.as_usize() as i64,
+                            majit_ir::Value::Float(v) => v.to_bits() as i64,
+                            majit_ir::Value::Void => 0,
+                        });
+                        (idx, *op, raw)
+                    })
+                    .collect();
+                eprintln!(
+                    "[callee-rca][record-guard] opcode={:?} resume_pc={} \
+                     vable_boxes={} vref_boxes={} fail_args={}",
+                    opcode,
+                    resume_pc,
+                    virtualizable_snapshot.len(),
+                    virtualref_snapshot.len(),
+                    fail_args.len(),
+                );
+                eprintln!("[callee-rca][record-guard-vable] {:?}", vable_payload);
+            }
             let snapshot = build_state_field_snapshot(
                 self.frames,
                 op_live,
@@ -7242,7 +7267,23 @@ pub fn call_int_function(func_ptr: *const (), args: &[i64]) -> i64 {
                     *a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9, *a10, *a11, *a12, *a13,
                 )
             }
-            [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14] => {
+            [
+                a0,
+                a1,
+                a2,
+                a3,
+                a4,
+                a5,
+                a6,
+                a7,
+                a8,
+                a9,
+                a10,
+                a11,
+                a12,
+                a13,
+                a14,
+            ] => {
                 let func: extern "C" fn(
                     i64,
                     i64,
@@ -7264,7 +7305,24 @@ pub fn call_int_function(func_ptr: *const (), args: &[i64]) -> i64 {
                     *a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9, *a10, *a11, *a12, *a13, *a14,
                 )
             }
-            [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15] => {
+            [
+                a0,
+                a1,
+                a2,
+                a3,
+                a4,
+                a5,
+                a6,
+                a7,
+                a8,
+                a9,
+                a10,
+                a11,
+                a12,
+                a13,
+                a14,
+                a15,
+            ] => {
                 let func: extern "C" fn(
                     i64,
                     i64,
@@ -7435,7 +7493,23 @@ pub fn call_void_function(func_ptr: *const (), args: &[i64]) {
                     *a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9, *a10, *a11, *a12, *a13,
                 )
             }
-            [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14] => {
+            [
+                a0,
+                a1,
+                a2,
+                a3,
+                a4,
+                a5,
+                a6,
+                a7,
+                a8,
+                a9,
+                a10,
+                a11,
+                a12,
+                a13,
+                a14,
+            ] => {
                 let func: extern "C" fn(
                     i64,
                     i64,
@@ -7457,7 +7531,24 @@ pub fn call_void_function(func_ptr: *const (), args: &[i64]) {
                     *a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9, *a10, *a11, *a12, *a13, *a14,
                 )
             }
-            [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15] => {
+            [
+                a0,
+                a1,
+                a2,
+                a3,
+                a4,
+                a5,
+                a6,
+                a7,
+                a8,
+                a9,
+                a10,
+                a11,
+                a12,
+                a13,
+                a14,
+                a15,
+            ] => {
                 let func: extern "C" fn(
                     i64,
                     i64,

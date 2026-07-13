@@ -48,10 +48,10 @@ use majit_ir::{
     AccumInfo, Const, Descr, DescrRef, FailDescr, GuardPendingFieldEntry, RdVirtualInfo, Type,
 };
 
-use crate::rd_payload::RdPayload;
-use crate::resume_value::ResumeData;
 use crate::CompiledLoopToken;
 use crate::CompiledTraceInfo;
+use crate::rd_payload::RdPayload;
+use crate::resume_value::ResumeData;
 
 // `compile.py:687-696 AbstractResumeGuardDescr` status-bit constants.
 //

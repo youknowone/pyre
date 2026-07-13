@@ -192,6 +192,11 @@ pub fn bh_debug_enabled() -> bool {
     *FLAG.get_or_init(|| std::env::var_os("MAJIT_BH_DEBUG").is_some())
 }
 
+pub fn callee_rca_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("PYRE_CALLEE_RCA").is_some())
+}
+
 pub fn nbody_debug_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::env::var_os("PYRE_NBODY_DEBUG").is_some())
@@ -220,6 +225,22 @@ pub fn heapdbg_enabled() -> bool {
 pub fn diag_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::env::var_os("MAJIT_DIAG").is_some())
+}
+
+thread_local! {
+    static PORTAL_CRN_HOOK: std::cell::Cell<Option<fn(usize, usize) -> bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Install a thread-local hook called when blackhole resume reaches
+/// `ContinueRunningNormally`. The hook receives `(target_pc, green_pc)` and
+/// returns true if the portal host handled the CRN itself.
+pub fn set_portal_crn_hook(hook: Option<fn(usize, usize) -> bool>) {
+    PORTAL_CRN_HOOK.with(|cell| cell.set(hook));
+}
+
+pub(crate) fn handle_portal_crn_hook(target_pc: usize, green_pc: usize) -> bool {
+    PORTAL_CRN_HOOK.with(|cell| cell.get().is_some_and(|hook| hook(target_pc, green_pc)))
 }
 
 pub fn log_jtet_enabled() -> bool {

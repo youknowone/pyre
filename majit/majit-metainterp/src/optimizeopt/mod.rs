@@ -6260,6 +6260,31 @@ impl OptContext {
         // create_top_snapshot writes both arrays into the snapshot.
         snapshot.vref_array = vref_oprefs;
 
+        if crate::callee_rca_enabled() {
+            let env = OptBoxEnv { ctx: self };
+            let vable_debug: Vec<(OpRef, OpRef, bool, Type)> = snapshot
+                .vable_array
+                .iter()
+                .map(|boxref| {
+                    let boxref = boxref.opref();
+                    let resolved = self.get_replacement_opref(boxref);
+                    let is_virtual = self
+                        .get_box_replacement_operand_opt(boxref)
+                        .as_ref()
+                        .map_or(false, |b| self.is_virtual(b));
+                    let tp = majit_ir::BoxEnv::get_type(&env, boxref);
+                    (boxref, resolved, is_virtual, tp)
+                })
+                .collect();
+            eprintln!(
+                "[callee-rca][store-final-vable] op={:?} pos={:?} resume_pos={} vable={:?}",
+                op.opcode,
+                op.pos.get(),
+                op.rd_resume_position.get(),
+                vable_debug,
+            );
+        }
+
         if majit_log_enabled() && op.opcode == OpCode::GuardNotForced2 {
             let env = OptBoxEnv { ctx: self };
             let snapshot_debug: Vec<(OpRef, OpRef, bool, Type)> = snapshot_boxes
@@ -6309,6 +6334,31 @@ impl OptContext {
         let (rd_numb, rd_consts, rd_virtuals, liveboxes, livebox_types) =
             memo.finish(numb_state, &env, &mut pending_setfields, knowledge.as_ref());
 
+        if crate::callee_rca_enabled() {
+            let vable_items = if rd_numb.len() >= 3 {
+                let len = rd_numb[2] as usize;
+                rd_numb
+                    .iter()
+                    .skip(3)
+                    .take(len)
+                    .copied()
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            eprintln!(
+                "[callee-rca][store-final-numbered] op={:?} pos={:?} resume_pos={} \
+                 vable_items={:?} liveboxes={:?} livebox_types={:?} rd_consts={:?}",
+                op.opcode,
+                op.pos.get(),
+                op.rd_resume_position.get(),
+                vable_items,
+                liveboxes,
+                livebox_types,
+                rd_consts,
+            );
+        }
+
         if majit_log_enabled() && op.opcode == OpCode::GuardNotForced2 {
             eprintln!(
                 "[jit][guard-resume] pos={:?} liveboxes={:?} rd_virtuals={} livebox_types={:?}",
@@ -6350,6 +6400,19 @@ impl OptContext {
                     .unwrap_or_else(|| Operand::from_opref(*a))
             })
             .collect();
+        if crate::callee_rca_enabled() {
+            let final_oprefs: Vec<_> = final_operands
+                .iter()
+                .map(|operand| operand.to_opref())
+                .collect();
+            eprintln!(
+                "[callee-rca][store-final-operands] op={:?} pos={:?} resume_pos={} final_oprefs={:?}",
+                op.opcode,
+                op.pos.get(),
+                op.rd_resume_position.get(),
+                final_oprefs,
+            );
+        }
         op.store_final_boxes(final_operands);
         op.set_fail_arg_types(new_types.clone());
         // optimizer.py:722-730 `store_final_boxes_in_guard` parity:

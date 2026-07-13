@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use majit_ir::{OpRef, Type};
 
-use crate::jitcode::{read_u16, read_u8, JitArgKind, JitCode};
+use crate::jitcode::{JitArgKind, JitCode, read_u8, read_u16};
 use crate::opencoder::{Box as OpBox, TraceRecordBuffer};
 use crate::recorder::SnapshotTagged;
 
@@ -604,7 +604,7 @@ impl MIFrame {
         after_residual_call: bool,
     ) -> i64 {
         const SIZE_LIVE_OP: usize = majit_translate::liveness::OFFSET_SIZE + 1;
-        use majit_translate::liveness::{decode_offset, LivenessIterator};
+        use majit_translate::liveness::{LivenessIterator, decode_offset};
 
         // pyjitpl.py:180-193 — in_a_call branch.  The frame that holds
         // the in-flight CALL instruction has a "result" register slot
@@ -802,7 +802,7 @@ impl MIFrame {
         skip_int_identity: Option<(usize, usize)>,
     ) -> Vec<SnapshotTagged> {
         const SIZE_LIVE_OP: usize = majit_translate::liveness::OFFSET_SIZE + 1;
-        use majit_translate::liveness::{decode_offset, LivenessIterator};
+        use majit_translate::liveness::{LivenessIterator, decode_offset};
 
         let (clear_int_idx, clear_ref_idx, clear_float_idx) = if in_a_call {
             let argcode = self._result_argcode;

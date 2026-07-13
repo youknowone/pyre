@@ -77,6 +77,95 @@ fn is_trace_runtime_ref(opref: OpRef, constants: &majit_ir::ConstMap<majit_ir::V
     !opref.is_none() && !is_trace_constant_ref(opref, constants)
 }
 
+fn callee_rca_virtual_state_summary(
+    vs: &crate::optimizeopt::virtualstate::VirtualState,
+) -> Vec<String> {
+    fn walk(
+        prefix: String,
+        node: &crate::optimizeopt::virtualstate::VirtualStateInfoNode,
+        out: &mut Vec<String>,
+        seen: &mut IndexSet<usize>,
+    ) {
+        let key = node as *const _ as usize;
+        let kind = match &node.info {
+            crate::optimizeopt::virtualstate::VirtualStateInfo::Constant(value) => {
+                format!("Constant({value:?})")
+            }
+            crate::optimizeopt::virtualstate::VirtualStateInfo::Virtual { fields, .. } => {
+                format!("Virtual(fields={})", fields.len())
+            }
+            crate::optimizeopt::virtualstate::VirtualStateInfo::VArray { items, .. } => {
+                format!("VArray(items={})", items.len())
+            }
+            crate::optimizeopt::virtualstate::VirtualStateInfo::VStruct { fields, .. } => {
+                format!("VStruct(fields={})", fields.len())
+            }
+            crate::optimizeopt::virtualstate::VirtualStateInfo::VArrayStruct {
+                element_fields,
+                ..
+            } => format!("VArrayStruct(elements={})", element_fields.len()),
+            crate::optimizeopt::virtualstate::VirtualStateInfo::KnownClass { class_ptr } => {
+                format!("KnownClass({class_ptr})")
+            }
+            crate::optimizeopt::virtualstate::VirtualStateInfo::NonNull => "NonNull".to_string(),
+            crate::optimizeopt::virtualstate::VirtualStateInfo::IntBounded(bound) => {
+                format!("IntBounded({bound:?})")
+            }
+            crate::optimizeopt::virtualstate::VirtualStateInfo::Unknown(tp) => {
+                format!("Unknown({tp:?})")
+            }
+        };
+        out.push(format!(
+            "{prefix}: {kind} pos={} notvirt={}",
+            node.position.get(),
+            node.position_in_notvirtuals.get()
+        ));
+        if !seen.insert(key) {
+            return;
+        }
+        match &node.info {
+            crate::optimizeopt::virtualstate::VirtualStateInfo::Virtual { fields, .. }
+            | crate::optimizeopt::virtualstate::VirtualStateInfo::VStruct { fields, .. } => {
+                for (idx, child) in fields {
+                    walk(format!("{prefix}.{idx}"), child, out, seen);
+                }
+            }
+            crate::optimizeopt::virtualstate::VirtualStateInfo::VArray { items, .. } => {
+                for (idx, child) in items.iter().enumerate() {
+                    walk(format!("{prefix}[{idx}]"), child, out, seen);
+                }
+            }
+            crate::optimizeopt::virtualstate::VirtualStateInfo::VArrayStruct {
+                element_fields,
+                ..
+            } => {
+                for (elem_idx, fields) in element_fields.iter().enumerate() {
+                    for (field_idx, child) in fields {
+                        walk(
+                            format!("{prefix}[{elem_idx}].{field_idx}"),
+                            child,
+                            out,
+                            seen,
+                        );
+                    }
+                }
+            }
+            crate::optimizeopt::virtualstate::VirtualStateInfo::Constant(_)
+            | crate::optimizeopt::virtualstate::VirtualStateInfo::KnownClass { .. }
+            | crate::optimizeopt::virtualstate::VirtualStateInfo::NonNull
+            | crate::optimizeopt::virtualstate::VirtualStateInfo::IntBounded(_)
+            | crate::optimizeopt::virtualstate::VirtualStateInfo::Unknown(_) => {}
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut seen = IndexSet::new();
+    for (idx, node) in vs.state.iter().enumerate() {
+        walk(format!("state[{idx}]"), node, &mut out, &mut seen);
+    }
+    out
+}
+
 /// Root any GcRef payload reachable from a single `_forwarded` slot (the
 /// `AbstractInputArg.forwarded` / `AbstractResOp.forwarded` host,
 /// resoperation.py:233-242 / :700). PyPy's Python GC walks `_forwarded`
@@ -183,6 +272,11 @@ pub struct UnrollOptimizer {
     /// (Box.type is intrinsic), but majit's `InputArg.tp` side table is
     /// otherwise disconnected from the optimizer's reduced LABEL.
     pub final_exported_state: Option<ExportedState>,
+    /// Compact TargetToken LABEL source positions in the full Phase-1
+    /// `end_args` vector. This is the small part of `ExportedState.end_args`
+    /// needed by Cranelift's host-side direct LABEL entry after
+    /// `final_exported_state` is reduced to type metadata.
+    pub final_exported_label_source_positions: Option<Vec<usize>>,
     // RPython compile.py:278-284: Phase 1 results for retrace_needed.
     // In RPython, Phase 1 and Phase 2 are separate calls, so Phase 1
     // results are naturally accessible. In pyre, Phase 1 results are
@@ -282,6 +376,7 @@ impl UnrollOptimizer {
             max_retrace_guards: 15,
             imported_state: None,
             final_exported_state: None,
+            final_exported_label_source_positions: None,
             snapshot_boxes: Vec::new(),
             snapshot_frame_sizes: Vec::new(),
             snapshot_vable_boxes: Vec::new(),
@@ -653,6 +748,8 @@ impl UnrollOptimizer {
                     // peeled-loop close passes them to generate_guards as
                     // `state.runtime_boxes` (unroll.py:153/166).
                     state.runtime_boxes = recorded_jump_args.clone();
+                    self.final_exported_label_source_positions =
+                        Some(state.label_source_positions.clone());
                     // end_arg_types is already populated by
                     // `Optimizer::optimize_with_constants_and_inputs_at`
                     // using the optimizer-visible `ctx.opref_type()` (see
@@ -709,6 +806,7 @@ impl UnrollOptimizer {
                     // longer than before.
                     let mut final_exported_state = ExportedState {
                         end_args: Vec::new(),
+                        label_source_positions: state.label_source_positions.clone(),
                         next_iteration_args: Vec::new(),
                         end_arg_types: Vec::new(),
                         virtual_state: state.virtual_state.clone(),
@@ -1922,6 +2020,8 @@ impl Default for UnrollOptimizer {
 pub struct ExportedState {
     /// Label args at the end of the preamble (after forcing).
     pub end_args: Vec<OpRef>,
+    /// Positions in `end_args` that feed the compact non-virtual LABEL args.
+    pub label_source_positions: Vec<usize>,
     /// Args for the next iteration (before forcing). unroll.py:467
     /// `next_iteration_args = end_args` — the SAME canonical box objects
     /// (producer-bound / const [`Operand`]s) used as `exported_infos` keys,
@@ -2084,6 +2184,7 @@ impl ExportedState {
     /// unroll.py: ExportedState.__init__
     pub fn new(
         end_args: Vec<OpRef>,
+        label_source_positions: Vec<usize>,
         next_iteration_args: Vec<Operand>,
         virtual_state: crate::optimizeopt::virtualstate::VirtualState,
         exported_infos: indexmap::IndexMap<Operand, crate::optimizeopt::info::OpInfo>,
@@ -2104,6 +2205,7 @@ impl ExportedState {
             );
         ExportedState {
             end_args,
+            label_source_positions,
             // unroll.py:467 `next_iteration_args = end_args` — carry the literal
             // Phase-1 boxes (the same Rcs used as `exported_infos` keys) so the
             // import-state lookup is a ptr_eq hit. NOT `from_opref` (which would
@@ -2644,6 +2746,7 @@ impl Clone for ExportedState {
     fn clone(&self) -> Self {
         ExportedState {
             end_args: self.end_args.clone(),
+            label_source_positions: self.label_source_positions.clone(),
             next_iteration_args: self.next_iteration_args.clone(),
             end_arg_types: self.end_arg_types.clone(),
             virtual_state: self.virtual_state.clone(),
@@ -2790,6 +2893,29 @@ impl OptUnroll {
         let (label_args, virtuals) = virtual_state
             .make_inputargs_and_virtuals(&end_args, optimizer, ctx, false)
             .expect("export_state make_inputargs_and_virtuals failed");
+        let label_source_positions = end_args
+            .iter()
+            .enumerate()
+            .filter_map(|(index, arg)| (!arg.is_constant()).then_some(index))
+            .collect::<Vec<_>>();
+        if crate::callee_rca_enabled() {
+            eprintln!(
+                "[callee-rca][export-state] original_label_args={:?} end_args={:?} \
+                 label_source_positions={:?} label_args={:?} virtuals={:?} \
+                 renamed_inputargs={:?} num_boxes={} entries={}",
+                original_label_args,
+                end_args,
+                label_source_positions,
+                label_args,
+                virtuals,
+                renamed_inputargs,
+                virtual_state.num_boxes(),
+                virtual_state.num_entries(),
+            );
+            for line in callee_rca_virtual_state_summary(&virtual_state) {
+                eprintln!("[callee-rca][export-vs] {line}");
+            }
+        }
         // unroll.py:464-465: for arg in label_args: _expand_info(arg, infos)
         for &arg in &label_args {
             let arg_box = match ctx.get_box_replacement_operand_opt(arg) {
@@ -2933,6 +3059,7 @@ impl OptUnroll {
         // `ExportedState` would risk drift across mutations.
         let mut state = ExportedState::new(
             label_args.clone(),
+            label_source_positions,
             resolved_next_iteration_args,
             virtual_state,
             infos,
@@ -3995,6 +4122,25 @@ impl OptUnroll {
                 return Vec::new();
             }
         };
+        if crate::callee_rca_enabled() {
+            let next_iteration_args: Vec<_> = exported_state
+                .next_iteration_args
+                .iter()
+                .map(|arg| arg.to_opref())
+                .collect();
+            eprintln!(
+                "[callee-rca][import-state] targetargs={:?} next_iteration_args={:?} \
+                 label_args={:?} num_boxes={} entries={}",
+                targetargs,
+                next_iteration_args,
+                label_args,
+                exported_state.virtual_state.num_boxes(),
+                exported_state.virtual_state.num_entries(),
+            );
+            for line in callee_rca_virtual_state_summary(&exported_state.virtual_state) {
+                eprintln!("[callee-rca][import-vs] {line}");
+            }
+        }
         // The short-preamble replay part of unroll.py:496-502 is performed
         // by import_short_preamble_state after majit's split-out
         // Optimizer::install_imported_virtuals has completed. RPython's
@@ -5252,6 +5398,43 @@ fn assemble_peeled_trace_with_jump_args(
         }
     }
 
+    if crate::callee_rca_enabled() {
+        let labels: Vec<_> = result
+            .iter()
+            .enumerate()
+            .filter(|(_, op)| op.opcode == OpCode::Label)
+            .map(|(idx, op)| {
+                (
+                    idx,
+                    op.pos.get(),
+                    op.getarglist()
+                        .iter()
+                        .map(|a| a.to_opref())
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        let jumps: Vec<_> = result
+            .iter()
+            .enumerate()
+            .filter(|(_, op)| op.opcode == OpCode::Jump)
+            .map(|(idx, op)| {
+                (
+                    idx,
+                    op.pos.get(),
+                    op.getarglist()
+                        .iter()
+                        .map(|a| a.to_opref())
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        eprintln!(
+            "[callee-rca][assembled-loop] labels={:?} jumps={:?}",
+            labels, jumps
+        );
+    }
+
     result
 }
 
@@ -5597,6 +5780,7 @@ mod tests {
     fn test_exported_state_high_water_covers_retrace_namespace() {
         let exported = ExportedState::new(
             vec![OpRef::int_op(52)],
+            vec![0],
             vec![
                 rooted_resop_operand(Type::Int, 109),
                 Operand::from_opref(OpRef::const_int(3)),
@@ -5838,6 +6022,7 @@ mod tests {
 
         let mut state = ExportedState::new(
             vec![old_ref],
+            Vec::new(),
             vec![Operand::from_opref(old_ref)],
             VirtualState::new(vec![VirtualStateInfo::Constant(Value::Ref(old))]),
             exported_infos,
@@ -6998,6 +7183,7 @@ mod tests {
         let phase2_result = OpRef::int_op(3);
         let exported = ExportedState::new(
             vec![source],
+            vec![0],
             vec![source_box.clone()],
             crate::optimizeopt::virtualstate::VirtualState::new(Vec::new()),
             indexmap::IndexMap::new(),

@@ -4,8 +4,8 @@
 /// The Backend trait is the contract between the JIT frontend (tracing + optimization)
 /// and the code generation backend (Cranelift, etc.).
 use std::cell::Cell;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use majit_ir::{Const, Descr, FailDescr, GcRef, InputArg, Op, OpRc, Type, Value};
 
@@ -75,22 +75,22 @@ pub mod resume_value;
 pub mod synthetic_cpu;
 
 pub use finish_descrs::{
-    get_or_attach_done_with_this_frame_descr_multi, DoneWithThisFrameDescrFloat,
-    DoneWithThisFrameDescrInt, DoneWithThisFrameDescrMulti, DoneWithThisFrameDescrRef,
-    DoneWithThisFrameDescrVoid, ExitFrameWithExceptionDescrRef, PropagateExceptionDescr,
+    DoneWithThisFrameDescrFloat, DoneWithThisFrameDescrInt, DoneWithThisFrameDescrMulti,
+    DoneWithThisFrameDescrRef, DoneWithThisFrameDescrVoid, ExitFrameWithExceptionDescrRef,
+    PropagateExceptionDescr, get_or_attach_done_with_this_frame_descr_multi,
 };
 pub use jitframe::JitFrameInfo;
 pub use rd_payload::RdPayload;
 pub use resume_guard_descr::{
-    alloc_fail_index, build_vector_info_chain, flatten_vector_info, make_resume_guard_descr_typed,
-    push_vector_info, reset_fail_index_counter, ResumeGuardDescr, STATUS_BUSY_FLAG, STATUS_SHIFT,
-    STATUS_SHIFT_MASK, STATUS_TYPE_MASK, STATUS_TY_FLOAT, STATUS_TY_INT, STATUS_TY_NONE,
-    STATUS_TY_REF,
+    ResumeGuardDescr, STATUS_BUSY_FLAG, STATUS_SHIFT, STATUS_SHIFT_MASK, STATUS_TY_FLOAT,
+    STATUS_TY_INT, STATUS_TY_NONE, STATUS_TY_REF, STATUS_TYPE_MASK, alloc_fail_index,
+    build_vector_info_chain, flatten_vector_info, make_resume_guard_descr_typed, push_vector_info,
+    reset_fail_index_counter,
 };
 pub use resume_value::{
-    resume_value_layout_summary_from_exit_value_source, FrameInfo, FrameSlotSource,
-    PendingFieldInfo, ResumeData, ResumeValueLayoutSummaryExt, ResumeValueSource,
-    VirtualFieldSource, VirtualInfo,
+    FrameInfo, FrameSlotSource, PendingFieldInfo, ResumeData, ResumeValueLayoutSummaryExt,
+    ResumeValueSource, VirtualFieldSource, VirtualInfo,
+    resume_value_layout_summary_from_exit_value_source,
 };
 
 /// Lightweight execution result that avoids DeadFrame boxing.

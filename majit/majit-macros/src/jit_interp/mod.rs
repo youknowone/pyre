@@ -15,11 +15,10 @@ pub(crate) mod jitcode_lower;
 use proc_macro2::TokenStream;
 use quote::quote;
 use syn::{
-    braced, bracketed,
+    Expr, Ident, ItemFn, LitBool, Path, Token, braced, bracketed,
     ext::IdentExt,
     parse::{Parse, ParseStream},
     punctuated::Punctuated,
-    Expr, Ident, ItemFn, LitBool, Path, Token,
 };
 
 /// Parsed configuration from `#[jit_interp(...)]` attributes.
@@ -2033,13 +2032,11 @@ fn rewrite_body(
                                     // sym inside the CloseLoop arm (the arm clears
                                     // the sym before returning, so they cannot be
                                     // re-read here) and stashed on the MetaInterp;
-                                    // this consumes the stash. Must precede both
-                                    // `recover` (which refines storage-backed
-                                    // caches from the current scalars) and
-                                    // `try_resume_into_compiled_loop` (which reads
-                                    // the native scalars to seed the compiled
-                                    // loop). No-op with no scalar state fields
-                                    // or when no CloseLoop stashed values.
+                                    // this consumes the stash. Must precede
+                                    // `recover`, which refines storage-backed
+                                    // caches from the current scalars. No-op with
+                                    // no scalar state fields or when no CloseLoop
+                                    // stashed values.
                                     #driver.writeback_scalar_state_fields(
                                         &mut #state,
                                     );
@@ -2080,24 +2077,23 @@ fn rewrite_body(
                                     majit_metainterp::JitState::recover_after_compiled_run(
                                         &mut #state,
                                     );
-                                    // Direct-entry: run the loop the walk just
-                                    // compiled with the walk-final state so the
-                                    // compiled steady-state advances PAST the
-                                    // walked span instead of re-interpreting it.
-                                    // The driver enters at the loop LABEL, not
-                                    // key 0's peeled preamble.
-                                    if #driver.can_resume_into_compiled_loop_at_label() {
-                                        if let Some(__resume_pc) = #driver
-                                            .try_resume_into_compiled_loop(
-                                                __sp_pc, &mut #state, #env,
-                                            )
-                                        {
-                                            #pc = __resume_pc;
-                                            continue;
-                                        }
-                                    }
+                                    #driver.log_single_pass_parity_resume(
+                                        __sp_pc,
+                                        &#state,
+                                        #env,
+                                    );
+                                    #driver.arm_single_pass_label_entry_on_next_back_edge(
+                                        &#state,
+                                    );
+                                    // RPython pyjitpl.py:3119-3123 ->
+                                    // 3072-3091 parity: a successful translated
+                                    // CloseLoop raises ContinueRunningNormally,
+                                    // returning to the interpreter. The compiled
+                                    // loop is entered later via can_enter_jit /
+                                    // warmstate, not by immediate direct entry.
                                     #driver.discard_single_pass_resume();
                                     #pc = __sp_pc;
+                                    continue;
                                 }
                             }
                         }

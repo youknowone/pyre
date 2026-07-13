@@ -12,7 +12,7 @@
 //! declares the abstract contract for these accessors; all entries
 //! below match those signatures.
 
-use crate::jitframe::{JitFrame, FIRST_ITEM_OFFSET};
+use crate::jitframe::{FIRST_ITEM_OFFSET, JitFrame};
 
 /// llmodel.py:412-420 — get_latest_descr.
 ///

@@ -361,6 +361,14 @@ pub trait JitState: Sized {
 
     fn recover_after_compiled_run(&mut self) {}
 
+    fn debug_state_fields(&self, _meta: &Self::Meta) -> Option<String> {
+        None
+    }
+
+    fn debug_state_live_labels(&self, _meta: &Self::Meta) -> Option<Vec<String>> {
+        None
+    }
+
     /// Whole-circuit single-pass: read the walk's scalar state-field concrete
     /// values off the still-live persistent sym, in scalar state-field index
     /// order (idx `0..num_scalars`). Called from the CloseLoop arm of
@@ -385,6 +393,17 @@ pub trait JitState: Sized {
     /// caches (stacksize / list refs) from the now-current scalars. Default
     /// no-op; the `#[jit_interp]` macro overrides it for state-field consumers.
     fn writeback_scalar_state_fields_from_values(&mut self, _values: &[i64]) {}
+
+    /// Blackhole CRN path for virtualizable-array states: write only the
+    /// scalar state fields whose fixed identity registers are live in the
+    /// terminal blackhole frame. RPython resume writes through the liveness
+    /// enumeration (`resume.py:_prepare_next_section` callbacks), so an
+    /// unlived register is not a dense state-field image and must not clobber
+    /// native state.
+    fn writeback_live_scalar_state_field(&mut self, _field_idx: usize, _value: i64) {}
+
+    /// Ref-bank sibling of [`writeback_live_scalar_state_field`].
+    fn writeback_live_ref_scalar_state_field(&mut self, _field_idx: usize, _value: i64) {}
 
     /// Whole-circuit single-pass: write the walk's loop-carried virtualizable
     /// array element values (captured at close time by the trace ctx's

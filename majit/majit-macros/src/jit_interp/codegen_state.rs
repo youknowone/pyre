@@ -612,6 +612,111 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             }
         })
         .collect();
+    let debug_scalar_state_parts: Vec<TokenStream> = scalars
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            let label = f.name.to_string();
+            quote! {
+                let _ = ::std::fmt::Write::write_fmt(
+                    &mut out,
+                    format_args!("  {} = {}\n", #label, self.#fname as i64),
+                );
+            }
+        })
+        .collect();
+    let debug_array_state_parts: Vec<TokenStream> = arrays
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            let label = f.name.to_string();
+            quote! {
+                let _ = ::std::fmt::Write::write_fmt(
+                    &mut out,
+                    format_args!("  {} len={}\n", #label, self.#fname.len()),
+                );
+                for (__i, __v) in self.#fname.iter().enumerate() {
+                    let _ = ::std::fmt::Write::write_fmt(
+                        &mut out,
+                        format_args!("    {}[{}] = {}\n", #label, __i, *__v as i64),
+                    );
+                }
+            }
+        })
+        .collect();
+    let debug_virt_array_state_parts: Vec<TokenStream> = virt_arrays
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            let label = f.name.to_string();
+            quote! {
+                let _ = ::std::fmt::Write::write_fmt(
+                    &mut out,
+                    format_args!(
+                        "  {} len={} vable={:#x}\n",
+                        #label,
+                        self.#fname.len(),
+                        self as *const Self as usize,
+                    ),
+                );
+                for (__i, __v) in self.#fname.iter().enumerate() {
+                    let _ = ::std::fmt::Write::write_fmt(
+                        &mut out,
+                        format_args!("    {}[{}] = {}\n", #label, __i, *__v as i64),
+                    );
+                }
+            }
+        })
+        .collect();
+    let debug_ref_scalar_state_parts: Vec<TokenStream> = ref_scalars
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            let label = f.name.to_string();
+            quote! {
+                let _ = ::std::fmt::Write::write_fmt(
+                    &mut out,
+                    format_args!("  {} = {:#x}\n", #label, self.#fname as usize),
+                );
+            }
+        })
+        .collect();
+    let debug_scalar_label_parts: Vec<TokenStream> = scalars
+        .iter()
+        .map(|(_, f)| {
+            let label = f.name.to_string();
+            quote! { labels.push(::std::string::String::from(#label)); }
+        })
+        .collect();
+    let debug_array_label_parts: Vec<TokenStream> = arrays
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            let label = f.name.to_string();
+            quote! {
+                for __i in 0..self.#fname.len() {
+                    labels.push(::std::format!("{}[{}]", #label, __i));
+                }
+            }
+        })
+        .collect();
+    let debug_virt_array_label_parts: Vec<TokenStream> = virt_arrays
+        .iter()
+        .map(|(_, f)| {
+            let label = f.name.to_string();
+            quote! {
+                labels.push(::std::format!("{}.<vable>", #label));
+                labels.push(::std::format!("{}.len", #label));
+            }
+        })
+        .collect();
+    let debug_ref_scalar_label_parts: Vec<TokenStream> = ref_scalars
+        .iter()
+        .map(|(_, f)| {
+            let label = f.name.to_string();
+            quote! { labels.push(::std::string::String::from(#label)); }
+        })
+        .collect();
 
     // ── #184 recursive CALL_ASSEMBLER portal entry (JitCodeSym side) ──
     // A recursive callee runs as its own compiled loop with a fresh frame.
@@ -897,6 +1002,15 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             quote! {
                 self.#fname = values[#idx_lit] as #rust_ty;
             }
+        })
+        .collect();
+    let writeback_live_scalar_arms: Vec<TokenStream> = scalars
+        .iter()
+        .enumerate()
+        .map(|(idx, (_, f))| {
+            let fname = &f.name;
+            let rust_ty = scalar_rust_type(&f.kind);
+            quote! { #idx => { self.#fname = value as #rust_ty; } }
         })
         .collect();
     let restore_array_parts: Vec<TokenStream> = arrays
@@ -1185,6 +1299,14 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         .map(|(ref_idx, (_, f))| {
             let value_name = quote::format_ident!("{}_value", f.name);
             quote! { #ref_idx => { self.#value_name = value; } }
+        })
+        .collect();
+    let writeback_live_ref_scalar_arms: Vec<TokenStream> = ref_scalars
+        .iter()
+        .enumerate()
+        .map(|(ref_idx, (_, f))| {
+            let fname = &f.name;
+            quote! { #ref_idx => { self.#fname = value as usize; } }
         })
         .collect();
 
@@ -2117,6 +2239,24 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 #recover_body
             }
 
+            fn debug_state_fields(&self, _meta: &__JitMeta) -> Option<::std::string::String> {
+                let mut out = ::std::string::String::new();
+                #(#debug_scalar_state_parts)*
+                #(#debug_array_state_parts)*
+                #(#debug_virt_array_state_parts)*
+                #(#debug_ref_scalar_state_parts)*
+                Some(out)
+            }
+
+            fn debug_state_live_labels(&self, _meta: &__JitMeta) -> Option<::std::vec::Vec<::std::string::String>> {
+                let mut labels: ::std::vec::Vec<::std::string::String> = ::std::vec::Vec::new();
+                #(#debug_scalar_label_parts)*
+                #(#debug_array_label_parts)*
+                #(#debug_virt_array_label_parts)*
+                #(#debug_ref_scalar_label_parts)*
+                Some(labels)
+            }
+
             fn collect_scalar_state_field_values(sym: &Self::Sym) -> Vec<i64> {
                 let mut values = Vec::new();
                 #(#collect_scalar_values_parts)*
@@ -2125,6 +2265,20 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
 
             fn writeback_scalar_state_fields_from_values(&mut self, values: &[i64]) {
                 #(#writeback_from_values_parts)*
+            }
+
+            fn writeback_live_scalar_state_field(&mut self, field_idx: usize, value: i64) {
+                match field_idx {
+                    #(#writeback_live_scalar_arms)*
+                    _ => {}
+                }
+            }
+
+            fn writeback_live_ref_scalar_state_field(&mut self, field_idx: usize, value: i64) {
+                match field_idx {
+                    #(#writeback_live_ref_scalar_arms)*
+                    _ => {}
+                }
             }
 
             #writeback_virt_array_override

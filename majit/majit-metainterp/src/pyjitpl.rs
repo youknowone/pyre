@@ -2,14 +2,14 @@ pub(crate) mod dispatch;
 mod frame;
 
 pub use dispatch::build_state_field_snapshot;
+pub use dispatch::{
+    ClosureRuntime, ClosureRuntimeWithResolver, JitCodeMachine, JitCodeRuntime, JitCodeSym,
+    StandaloneFrameStack, struct_field_write_effect_info, trace_jitcode, trace_jitcode_with_args,
+    trace_jitcode_with_args_and_runtime,
+};
 pub use dispatch::{build_vable_snapshot_boxes, build_vref_snapshot_boxes};
 pub use dispatch::{call_int_function, call_ref_function, call_void_function};
 pub use dispatch::{eval_binop_f, eval_binop_i, eval_float_cmp, eval_unary_f, eval_unary_i};
-pub use dispatch::{
-    struct_field_write_effect_info, trace_jitcode, trace_jitcode_with_args,
-    trace_jitcode_with_args_and_runtime, ClosureRuntime, ClosureRuntimeWithResolver,
-    JitCodeMachine, JitCodeRuntime, JitCodeSym, StandaloneFrameStack,
-};
 pub use frame::{MIFrame, MIFrameStack};
 
 use indexmap::IndexMap;
@@ -91,7 +91,7 @@ use crate::io_buffer;
 use crate::jitdriver::JitDriverStaticData;
 #[cfg(test)]
 use crate::optimizeopt::snapshot_get;
-use crate::optimizeopt::{snapshot_insert, SnapshotBoxes, SnapshotFramePcs, SnapshotFrameSizes};
+use crate::optimizeopt::{SnapshotBoxes, SnapshotFramePcs, SnapshotFrameSizes, snapshot_insert};
 use crate::resume::{
     MaterializedVirtual, ReconstructedState, ResolvedPendingFieldWrite, ResumeData, ResumeDataExt,
     ResumeLayoutSummary, ResumeStorage, SnapshotBox,
@@ -804,6 +804,11 @@ pub(crate) struct CompiledEntry<M> {
     /// Front-end loop-version state, mirroring RPython's
     /// jitcell_token.target_tokens ownership across recompilations.
     pub(crate) front_target_tokens: Vec<crate::history::TargetToken>,
+    /// Direct TargetToken LABEL entry source positions in the root/full entry
+    /// vector. For unrolled loops this is the position of every non-constant
+    /// `ExportedState.end_args` entry, matching `VirtualState.make_inputargs`'
+    /// compact non-virtual LABEL order.
+    pub(crate) front_target_source_positions: Option<Vec<usize>>,
     /// Trace id of the root compiled loop.
     pub(crate) root_trace_id: u64,
     /// Metadata for the root loop and any attached bridges, keyed by trace id.
@@ -1091,14 +1096,37 @@ pub struct MetaInterp<M: Clone> {
     /// `live_arg_boxes += virtualizable_boxes` (pyjitpl.py:2982-2989). `None`
     /// outside single-pass or when the state has no virtualizable array.
     pub(crate) single_pass_virt_array_values: Option<Vec<i64>>,
+    /// Single-pass tracing: concrete values for a direct TargetToken LABEL
+    /// entry, in that LABEL's compact argument order.  RPython's backend records
+    /// `TargetToken._x86_arglocs` in `regalloc.py:consider_label` and
+    /// `consider_jump` remaps every JUMP arg into those target locations before
+    /// `assembler.py:closing_jump`; Cranelift's host-side LABEL dispatch must
+    /// receive the same compact per-LABEL vector, not the root-loop inputarg
+    /// vector.
+    pub(crate) single_pass_compact_label_values: Option<(u64, Vec<Value>)>,
+    /// Single-pass tracing: full walk-final `raise_continue_running_normally`
+    /// values in root inputarg order.  Consumed during `compile_loop_body` only
+    /// to resolve `InputArg*` entries in a compact LABEL contract; op-result
+    /// LABEL args still read their concrete value from the recorded Box object.
+    pub(crate) single_pass_full_live_values: Option<Vec<Value>>,
     /// Single-pass tracing: the green key the CloseLoop arm compiled the
     /// (cross-loop-cut) inner loop under, captured after a `Compiled`
-    /// outcome so the merge-point hook can DIRECTLY enter that freshly
-    /// compiled loop with the walk-final state (S_{k+1}) instead of
-    /// re-interpreting the walked body — the compiled steady-state runs
-    /// iteration N+1 onward (the walk's draw was the peeled preamble).
+    /// outcome so the merge-point hook can publish a CRN/lazy back-edge
+    /// handoff for that freshly compiled loop with the walk-final state
+    /// (S_{k+1}). The compiled steady-state runs iteration N+1 onward
+    /// because the walk's draw was the peeled preamble.
     /// `None` outside single-pass or when compilation did not succeed.
     pub(crate) single_pass_compiled_key: Option<u64>,
+    /// Single-pass CRN/lazy handoff: the first matching back-edge after the
+    /// parity resume must enter the loop body LABEL rather than dispatch key 0,
+    /// because pyre's single-pass walker has already executed the peeled
+    /// preamble's side effects. This is consumed once by the matching compiled
+    /// back-edge. RPython grounding: `pyjitpl.py:3072-3085` returns to the
+    /// interpreter after successful compilation, while `compile.py:320-328`
+    /// keeps the peeled preamble before the body LABEL; the later assembler
+    /// entry corresponds to the TargetToken LABEL address, not replaying the
+    /// preamble.
+    pub(crate) single_pass_label_entry_key: Option<u64>,
     pub(crate) next_trace_id: u64,
     /// JIT hooks for profiling and debugging.
     pub(crate) hooks: JitHooks,
@@ -2302,7 +2330,10 @@ impl<M: Clone> MetaInterp<M> {
             single_pass_outcome: None,
             single_pass_scalar_values: None,
             single_pass_virt_array_values: None,
+            single_pass_compact_label_values: None,
+            single_pass_full_live_values: None,
             single_pass_compiled_key: None,
+            single_pass_label_entry_key: None,
             next_trace_id: 1,
             hooks: JitHooks::default(),
             pending_token: None,
@@ -3053,6 +3084,18 @@ impl<M: Clone> MetaInterp<M> {
             &vable_values,
             &array_lengths,
         );
+        if crate::callee_rca_enabled() {
+            eprintln!(
+                "[callee-rca][init-vable] total_vable={} has_expanded_tail={} \
+                 values={} oprefs={} identity_ref_bank_index={:?} array_lengths={:?}",
+                total_vable,
+                has_expanded_tail,
+                vable_values.len(),
+                vable_oprefs.len(),
+                info.identity_ref_bank_index,
+                array_lengths,
+            );
+        }
         // pyjitpl.py:3446 synchronize_virtualizable parity: TraceCtx needs
         // the live heap pointer to mirror shadow writes. Mirror here — the
         // MetaInterp `vable_ptr` was cached before `tracing` existed, so
@@ -5003,6 +5046,8 @@ impl<M: Clone> MetaInterp<M> {
 
     fn compile_loop_body(&mut self, jump_args: &[OpRef], meta: M) -> CompileOutcome {
         let _snapshot_guard = CompileSnapshotRootsGuard::new(&mut self.compile_snapshot_refs);
+        self.single_pass_compact_label_values = None;
+        let single_pass_full_live_values = self.single_pass_full_live_values.take();
         // pyjitpl.py:2995 `assert len(self.virtualref_boxes) == 0,
         // "missing virtual_ref_finish()?"` — every `opimpl_virtual_ref`
         // must have a matching `opimpl_virtual_ref_finish` before the
@@ -5676,23 +5721,25 @@ impl<M: Clone> MetaInterp<M> {
             label_op.pos.set(majit_ir::OpRef::NONE);
             optimized_ops.insert(0, std::rc::Rc::new(label_op));
         }
-        let (inputargs, optimized_ops) =
-            match normalize_root_loop_entry_contract(root_inputargs, optimized_ops) {
-                Ok(normalized) => normalized,
-                Err((expected, actual)) => {
-                    if crate::majit_log_enabled() {
-                        eprintln!(
+        let (inputargs, optimized_ops) = match normalize_root_loop_entry_contract(
+            root_inputargs,
+            optimized_ops,
+        ) {
+            Ok(normalized) => normalized,
+            Err((expected, actual)) => {
+                if crate::majit_log_enabled() {
+                    eprintln!(
                         "[jit] abort compile: root loop entry/jump arity mismatch input={} jump={}",
                         expected, actual,
                     );
-                    }
-                    self.cancel_count += 1;
-                    if crate::closedbg_enabled() {
-                        eprintln!("@@@CANCEL-SITE line={}", line!());
-                    }
-                    return CompileOutcome::Cancelled;
                 }
-            };
+                self.cancel_count += 1;
+                if crate::closedbg_enabled() {
+                    eprintln!("@@@CANCEL-SITE line={}", line!());
+                }
+                return CompileOutcome::Cancelled;
+            }
+        };
 
         // RPython virtualizable parity: standard virtualizable fields and
         // arrays stay in the trace as first-class virtualizable boxes.
@@ -5853,6 +5900,11 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             unroll_opt.target_tokens.clone()
         };
+        let front_target_source_positions = if retried_without_unroll {
+            None
+        } else {
+            unroll_opt.final_exported_label_source_positions.clone()
+        };
         // `compile.py:237` / `compile.py:289`
         // `target_token.original_jitcell_token = jitcell_token`. Backfill the
         // owning JitCellToken.number on every TargetToken now that the token
@@ -5865,6 +5917,28 @@ impl<M: Clone> MetaInterp<M> {
         for target_token in &front_target_tokens {
             target_token.set_original_jitcell_token_number(token_num);
             token.record_target_token(target_token.as_jump_target_descr());
+        }
+        // RPython backend contract: `consider_label` records the compact
+        // TargetToken argument locations, and `consider_jump` feeds each JUMP
+        // arg into the corresponding location.  The Cranelift host direct-entry
+        // path bypasses that in-code closing jump, so stash the same compact
+        // LABEL-ordered concrete values for `execute_token_with_dispatch_key`.
+        self.single_pass_compact_label_values = Self::compact_label_values_for_selected_target(
+            green_key,
+            &front_target_tokens,
+            &compiled_ops,
+            &trace,
+            single_pass_full_live_values.as_deref(),
+        );
+        if crate::callee_rca_enabled() {
+            eprintln!(
+                "[callee-rca][direct-entry-capture] key={green_key} compact_len={:?} \
+                 full_len={:?}",
+                self.single_pass_compact_label_values
+                    .as_ref()
+                    .map(|(_, values)| values.len()),
+                single_pass_full_live_values.as_ref().map(Vec::len),
+            );
         }
 
         // compile.py:504-511 send_loop_to_backend — unconditional virtualizable
@@ -6075,6 +6149,7 @@ impl<M: Clone> MetaInterp<M> {
                         token: Arc::downgrade(&token),
                         meta,
                         front_target_tokens,
+                        front_target_source_positions,
                         root_trace_id: trace_id,
                         traces,
                         previous_tokens,
@@ -6981,6 +7056,7 @@ impl<M: Clone> MetaInterp<M> {
                         } else {
                             unroll_opt.target_tokens.clone()
                         },
+                        front_target_source_positions: None,
                         root_trace_id: trace_id,
                         traces,
                         previous_tokens,
@@ -7508,6 +7584,7 @@ impl<M: Clone> MetaInterp<M> {
                             token: Arc::downgrade(&token),
                             meta,
                             front_target_tokens: ft,
+                            front_target_source_positions: None,
                             root_trace_id: trace_id,
                             traces,
                             previous_tokens,
@@ -7830,6 +7907,7 @@ impl<M: Clone> MetaInterp<M> {
                         token: Arc::downgrade(&token),
                         meta,
                         front_target_tokens: vec![target_token],
+                        front_target_source_positions: None,
                         root_trace_id: trace_id,
                         traces,
                         previous_tokens,
@@ -7908,15 +7986,135 @@ impl<M: Clone> MetaInterp<M> {
     /// peeled preamble host entry.
     pub fn front_target_dispatch_key(&self, green_key: u64) -> Option<u32> {
         let compiled = self.compiled_loops.get(&green_key)?;
-        let target = compiled
-            .front_target_tokens
-            .iter()
-            .find(|target| !target.is_preamble_target)
-            .or_else(|| compiled.front_target_tokens.first())?;
+        let target = Self::selected_front_target_token(compiled)?;
         let target_descr = target.as_jump_target_descr();
         target_descr
             .as_loop_target_descr()
             .map(|target| target.label_block_id() + 1)
+    }
+
+    pub fn pack_front_target_live_values(
+        &self,
+        green_key: u64,
+        full_live_values: &[Value],
+    ) -> Option<Vec<Value>> {
+        let compiled = self.compiled_loops.get(&green_key)?;
+        let source_positions = match compiled.front_target_source_positions.as_ref() {
+            Some(positions) => positions,
+            None => {
+                if crate::callee_rca_enabled() {
+                    eprintln!(
+                        "[callee-rca][direct-entry-pack-detail] key={green_key} \
+                         missing_source_positions"
+                    );
+                }
+                return None;
+            }
+        };
+        let expected = self.front_target_inputarg_types(green_key)?.len();
+        if source_positions.len() != expected {
+            if crate::callee_rca_enabled() {
+                eprintln!(
+                    "[callee-rca][direct-entry-pack-detail] key={green_key} \
+                     source_len={} label_len={expected} sources={:?}",
+                    source_positions.len(),
+                    source_positions,
+                );
+            }
+            return None;
+        }
+        let mut packed = Vec::with_capacity(source_positions.len());
+        for &source in source_positions {
+            let Some(value) = full_live_values.get(source).copied() else {
+                if crate::callee_rca_enabled() {
+                    eprintln!(
+                        "[callee-rca][direct-entry-pack-detail] key={green_key} \
+                         source_oob={source} full_len={} sources={:?}",
+                        full_live_values.len(),
+                        source_positions,
+                    );
+                }
+                return None;
+            };
+            packed.push(value);
+        }
+        Some(packed)
+    }
+
+    fn selected_front_target_token<'a>(
+        compiled: &'a CompiledEntry<M>,
+    ) -> Option<&'a crate::history::TargetToken> {
+        compiled
+            .front_target_tokens
+            .iter()
+            .find(|target| !target.is_preamble_target)
+            .or_else(|| compiled.front_target_tokens.first())
+    }
+
+    fn selected_front_target_token_from_slice<'a>(
+        front_target_tokens: &'a [crate::history::TargetToken],
+    ) -> Option<&'a crate::history::TargetToken> {
+        front_target_tokens
+            .iter()
+            .find(|target| !target.is_preamble_target)
+            .or_else(|| front_target_tokens.first())
+    }
+
+    fn compact_label_values_for_selected_target(
+        green_key: u64,
+        front_target_tokens: &[crate::history::TargetToken],
+        compiled_ops: &[majit_ir::OpRc],
+        trace: &TreeLoop,
+        full_live_values: Option<&[Value]>,
+    ) -> Option<(u64, Vec<Value>)> {
+        let front_target = Self::selected_front_target_token_from_slice(front_target_tokens)?;
+        let target_descr = front_target.as_jump_target_descr();
+        let label = compiled_ops.iter().find(|op| {
+            op.opcode == OpCode::Label
+                && op
+                    .getdescr()
+                    .is_some_and(|descr| descr.index() == target_descr.index())
+        })?;
+        let mut values = Vec::with_capacity(label.num_args());
+        for arg in label.getarglist() {
+            let opref = arg.to_opref();
+            let value = opref
+                .inline_const_to_value()
+                .or_else(|| Self::full_live_value_for_inputarg(opref, full_live_values))
+                .or_else(|| Self::compiled_ops_concrete_at(compiled_ops, opref.raw()))
+                .or_else(|| Self::trace_concrete_at(trace, opref.raw()))?;
+            values.push(value);
+        }
+        Some((green_key, values))
+    }
+
+    fn full_live_value_for_inputarg(
+        opref: OpRef,
+        full_live_values: Option<&[Value]>,
+    ) -> Option<Value> {
+        match opref {
+            OpRef::InputArgInt(index) | OpRef::InputArgFloat(index) | OpRef::InputArgRef(index) => {
+                full_live_values.and_then(|values| values.get(index as usize).copied())
+            }
+            _ => None,
+        }
+    }
+
+    fn trace_concrete_at(trace: &TreeLoop, raw: u32) -> Option<Value> {
+        let pos = raw as usize;
+        let n = trace.inputargs.len();
+        if pos < n {
+            trace.inputargs[pos].get_value()
+        } else {
+            trace.ops.get(pos - n).and_then(|op| op.get_value())
+        }
+    }
+
+    fn compiled_ops_concrete_at(compiled_ops: &[majit_ir::OpRc], raw: u32) -> Option<Value> {
+        compiled_ops
+            .iter()
+            .find(|op| op.pos.get().raw() == raw)
+            .and_then(|op| op.get_value())
     }
 
     /// warmstate.py:437-444 `cell.flags |= JC_TRACING ... try ... finally:
@@ -8740,7 +8938,7 @@ impl<M: Clone> MetaInterp<M> {
     pub fn front_target_inputarg_types(&self, green_key: u64) -> Option<Vec<Type>> {
         let compiled = self.compiled_loops.get(&green_key)?;
         let root_trace = compiled.traces.get(&compiled.root_trace_id)?;
-        if let Some(front_target) = compiled.front_target_tokens.first() {
+        if let Some(front_target) = Self::selected_front_target_token(compiled) {
             let target_descr = front_target.as_jump_target_descr();
             // Rebuild the type index from the stored trace's `inputargs`
             // and `ops`; the typed `OpRef` operands carry their type, so
@@ -9940,6 +10138,7 @@ impl<M: Clone> MetaInterp<M> {
                         token: Arc::downgrade(&token),
                         meta,
                         front_target_tokens,
+                        front_target_source_positions: None,
                         root_trace_id: trace_id,
                         traces,
                         previous_tokens,
@@ -10351,9 +10550,9 @@ impl<M: Clone> MetaInterp<M> {
         // pyre-only and violates bridge pool isolation.
         if retrace_requested {
             crate::mc_diag_bump(10); // compile_bridge retrace_requested return
-                                     // compile.py:1079: metainterp.retrace_needed(new_trace, info)
-                                     // Save partial trace + exported state so the next loop-header's
-                                     // compile_loop → compile_retrace can produce a new specialization.
+            // compile.py:1079: metainterp.retrace_needed(new_trace, info)
+            // Save partial trace + exported state so the next loop-header's
+            // compile_loop → compile_retrace can produce a new specialization.
             if let Some(tok) = self
                 .compiled_loops
                 .get(&green_key)
@@ -10724,11 +10923,11 @@ impl<M: Clone> MetaInterp<M> {
             Some(c) => c,
             None => {
                 crate::mc_diag_bump(7); // start_retrace bailed: source loop evicted
-                                        // Source loop already evicted — bail out of the bridge
-                                        // before opening the M-ownership session.  Pair the
-                                        // `start_tracing` fired above so the profiler stack
-                                        // stays balanced (PyPy's `finally` would run even when
-                                        // `handle_guard_failure` returns early via `giveup`).
+                // Source loop already evicted — bail out of the bridge
+                // before opening the M-ownership session.  Pair the
+                // `start_tracing` fired above so the profiler stack
+                // stays balanced (PyPy's `finally` would run even when
+                // `handle_guard_failure` returns early via `giveup`).
                 self.leave_profiler_tracing();
                 return None;
             }
@@ -15776,8 +15975,8 @@ mod metainterp_static_data_tests {
         // pyjitpl.py:2174-2186 — when bytecode_for_address misses, the
         // method returns Ok(self.do_residual_call_full(...)) instead of
         // raising ChangeFrame.
-        use crate::jitcode::JitArgKind;
         use crate::BackEdgeAction;
+        use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
         let fnaddr = execute_varargs_void_helper as *const () as i64;
@@ -15812,8 +16011,8 @@ mod metainterp_static_data_tests {
         // falling through to do_residual_call_full — but only when the
         // funcbox OpRef is a Const (pyjitpl.py:2178 `isinstance(funcbox,
         // Const)`).
-        use crate::jitcode::JitArgKind;
         use crate::BackEdgeAction;
+        use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
         let fnaddr = execute_varargs_void_helper as *const () as i64 as usize;
@@ -15846,8 +16045,8 @@ mod metainterp_static_data_tests {
         // pyjitpl.py:2178 — non-Const funcbox must NOT be promoted to an
         // inlined call even when its concrete address matches a
         // registered indirect-call target.
-        use crate::jitcode::JitArgKind;
         use crate::BackEdgeAction;
+        use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
         let fnaddr = execute_varargs_void_helper as *const () as i64 as usize;
@@ -15929,8 +16128,8 @@ mod metainterp_static_data_tests {
         // `resultbox.getint()` — the symbolic resultbox must be a real
         // ConstInt(0xc0ffee), not a bare unset OpRef. Mint via
         // `ctx.const_int` so the trace's constant pool resolves the slot.
-        use crate::jitcode::JitArgKind;
         use crate::BackEdgeAction;
+        use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
@@ -16188,8 +16387,8 @@ mod metainterp_static_data_tests {
         // pyjitpl.py self.framestack invariant: trace entry pushes the
         // root frame, runs the jitcode interp, and the stack is empty
         // again on return.
-        use crate::jitcode::JitCodeBuilder;
         use crate::BackEdgeAction;
+        use crate::jitcode::JitCodeBuilder;
         let jitcode = std::sync::Arc::new(JitCodeBuilder::new().finish());
 
         let mut meta = MetaInterp::<()>::new(0);
@@ -16278,8 +16477,8 @@ mod metainterp_static_data_tests {
     fn build_allboxes_simple_case_no_prepend_box() {
         // pyjitpl.py:1960-1993 — without prepend_box, allboxes is just
         // [funcbox, *argboxes].
-        use crate::jitcode::JitArgKind;
         use crate::BackEdgeAction;
+        use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
@@ -16309,8 +16508,8 @@ mod metainterp_static_data_tests {
     fn build_allboxes_with_prepend_box_places_it_first() {
         // pyjitpl.py:1963-1965 — prepend_box (e.g. condbox in
         // do_conditional_call) goes to slot 0.
-        use crate::jitcode::JitArgKind;
         use crate::BackEdgeAction;
+        use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
@@ -16341,8 +16540,8 @@ mod metainterp_static_data_tests {
         // When `argboxes` arrives in bank-sorted layout (all ints
         // first, then refs, then floats), the output must still match
         // declaration order.
-        use crate::jitcode::JitArgKind;
         use crate::BackEdgeAction;
+        use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
@@ -16388,8 +16587,8 @@ mod metainterp_static_data_tests {
         // already arrives in declaration order — pyre's BC encoder
         // produces this layout today, so the loop is exercised on
         // every production call.
-        use crate::jitcode::JitArgKind;
         use crate::BackEdgeAction;
+        use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
@@ -16464,8 +16663,8 @@ mod metainterp_static_data_tests {
         // and return Ok(None) when no exception was raised.  No IR ops
         // are emitted because `executor.execute_varargs` is the
         // non-recording path.
-        use crate::jitcode::JitArgKind;
         use crate::BackEdgeAction;
+        use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
@@ -16516,8 +16715,8 @@ mod metainterp_static_data_tests {
     fn do_not_in_trace_call_returns_abort_escape_on_exception() {
         // pyjitpl.py:3687-3692 — if last_exc_value is set after the
         // call, raise SwitchToBlackhole(ABORT_ESCAPE).
-        use crate::jitcode::JitArgKind;
         use crate::BackEdgeAction;
+        use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
@@ -16783,8 +16982,8 @@ mod metainterp_static_data_tests {
     fn do_residual_call_emits_call_i_for_regular_int_call() {
         // pyjitpl.py:2113-2115 — non-loopinvariant, non-force-virtual,
         // int-returning call → CALL_I via miframe_execute_varargs.
-        use crate::jitcode::JitArgKind;
         use crate::BackEdgeAction;
+        use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
@@ -16915,8 +17114,8 @@ mod metainterp_static_data_tests {
         // A portal-jitcode callee never tail-call-optimizes — the
         // upstream invariant is that portal frames stay on the stack
         // for the metainterp dispatch loop.
-        use crate::jitcode::JitCodeBuilder;
         use crate::BackEdgeAction;
+        use crate::jitcode::JitCodeBuilder;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
@@ -17067,8 +17266,8 @@ mod metainterp_static_data_tests {
     #[test]
     #[should_panic(expected = "is not a Const")]
     fn do_recursive_call_panics_when_greens_contain_non_const() {
-        use crate::jitcode::JitArgKind;
         use crate::BackEdgeAction;
+        use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
@@ -17152,8 +17351,8 @@ mod metainterp_static_data_tests {
     #[test]
     fn do_conditional_call_emits_cond_call_when_not_is_value() {
         // pyjitpl.py:2137-2139 — is_value=False → COND_CALL (void).
-        use crate::jitcode::JitArgKind;
         use crate::BackEdgeAction;
+        use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
@@ -17209,8 +17408,8 @@ mod metainterp_static_data_tests {
         // when all normalized args (`argboxes[1..]`, skipping condbox) are
         // Const. Use a live Ref op for funcbox so this fixture keeps the
         // COND_CALL_VALUE_I op in the trace and exercises the recording path.
-        use crate::jitcode::JitArgKind;
         use crate::BackEdgeAction;
+        use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
         let fnaddr = execute_varargs_int_helper as *const () as i64;
@@ -17273,8 +17472,8 @@ mod metainterp_static_data_tests {
         // CALL_MAY_FORCE_I via direct_call_may_force followed by a
         // GUARD_NOT_FORCED.  The call's concrete result is the
         // executor's return.
-        use crate::jitcode::JitArgKind;
         use crate::BackEdgeAction;
+        use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
@@ -17317,8 +17516,8 @@ mod metainterp_static_data_tests {
     fn miframe_execute_varargs_clears_exception_and_records_call_when_no_exc() {
         // pyjitpl.py:1942-1957 — without an exception, the call records
         // a CallI op and assert_no_exception passes.
-        use crate::jitcode::JitArgKind;
         use crate::BackEdgeAction;
+        use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
@@ -17372,8 +17571,8 @@ mod metainterp_static_data_tests {
         // pyjitpl.py:2641-2652 — record CallI op with the descr and
         // return (OpRef, resvalue) computed from
         // executor.execute_varargs.
-        use crate::jitcode::JitArgKind;
         use crate::BackEdgeAction;
+        use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
@@ -17431,8 +17630,8 @@ mod metainterp_static_data_tests {
     fn execute_and_record_varargs_returns_none_for_void_call() {
         // pyjitpl.py:2662-2663 — `if op.type != 'v': return op` →
         // void calls return None even though the IR op is recorded.
-        use crate::jitcode::JitArgKind;
         use crate::BackEdgeAction;
+        use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
@@ -18082,8 +18281,8 @@ mod metainterp_static_data_tests {
         // pyjitpl.py:2440-2441 / 2467:
         // enter/leave portal ops receive jitcode.jitdriver_sd.index, not
         // a hard-coded portal slot.
-        use crate::jitcode::JitCodeBuilder;
         use crate::BackEdgeAction;
+        use crate::jitcode::JitCodeBuilder;
 
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
@@ -18130,8 +18329,8 @@ mod metainterp_static_data_tests {
         // pyjitpl.py:2443-2445 / 2470-2472 — newframe appends
         // (jd_no, Some(greenkey), trace_position); popframe appends
         // (jd_no, None, trace_position) on the matching exit.
-        use crate::jitcode::JitCodeBuilder;
         use crate::BackEdgeAction;
+        use crate::jitcode::JitCodeBuilder;
 
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
@@ -18181,8 +18380,8 @@ mod metainterp_static_data_tests {
     fn portal_trace_positions_skips_non_recursive_jitdriver() {
         // is_main_jitcode requires jd.is_recursive — non-recursive portals
         // must not append to portal_trace_positions.
-        use crate::jitcode::JitCodeBuilder;
         use crate::BackEdgeAction;
+        use crate::jitcode::JitCodeBuilder;
 
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
@@ -18527,8 +18726,8 @@ mod metainterp_static_data_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resume::{FrameSlotSource, ReconstructedValue, ResolvedPendingFieldWrite};
     use crate::JitArgKind;
+    use crate::resume::{FrameSlotSource, ReconstructedValue, ResolvedPendingFieldWrite};
     #[cfg(feature = "cranelift")]
     use majit_backend::DeadFrame;
     #[cfg(feature = "cranelift")]
@@ -18990,6 +19189,7 @@ mod tests {
                 token: std::sync::Arc::downgrade(&token),
                 meta: (),
                 front_target_tokens: vec![start_token],
+                front_target_source_positions: None,
                 root_trace_id: trace_id,
                 traces,
                 previous_tokens: Vec::new(),
@@ -19166,6 +19366,7 @@ mod tests {
                 token: std::sync::Arc::downgrade(&token),
                 meta: (),
                 front_target_tokens: Vec::new(),
+                front_target_source_positions: None,
                 root_trace_id: trace_id,
                 traces,
                 previous_tokens: Vec::new(),
@@ -19262,6 +19463,7 @@ mod tests {
                 token: std::sync::Arc::downgrade(&token),
                 meta: (),
                 front_target_tokens: Vec::new(),
+                front_target_source_positions: None,
                 root_trace_id: trace_id,
                 traces,
                 previous_tokens: Vec::new(),
@@ -19565,6 +19767,7 @@ mod tests {
                 token: std::sync::Arc::downgrade(&token_arc),
                 meta: (),
                 front_target_tokens: Vec::new(),
+                front_target_source_positions: None,
                 root_trace_id: trace_id,
                 traces,
                 previous_tokens: Vec::new(),
@@ -20381,6 +20584,7 @@ mod tests {
                 token: std::sync::Arc::downgrade(&token),
                 meta: (),
                 front_target_tokens: Vec::new(),
+                front_target_source_positions: None,
                 root_trace_id: 0,
                 traces: indexmap::IndexMap::new(),
                 previous_tokens: Vec::new(),

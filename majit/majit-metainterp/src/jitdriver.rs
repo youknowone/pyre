@@ -62,6 +62,60 @@ impl std::ops::DerefMut for BackEdgeBhBuilder {
     }
 }
 
+fn writeback_live_state_scalars_from_blackhole<S: crate::JitState>(
+    state: &mut S,
+    layout: &crate::blackhole::StateFieldLayout,
+    bh: &crate::blackhole::BlackholeInterpreter,
+    all_liveness: &[u8],
+) {
+    use majit_translate::liveness::LivenessIterator;
+
+    let info = bh.get_current_position_info();
+    if info + 3 > all_liveness.len() {
+        return;
+    }
+    let length_i = all_liveness[info] as u32;
+    let length_r = all_liveness[info + 1] as u32;
+    let length_f = all_liveness[info + 2] as u32;
+    let mut offset = info + 3;
+
+    if length_i != 0 {
+        let mut it = LivenessIterator::new(offset, length_i, all_liveness);
+        for reg_idx in &mut it {
+            let reg_idx = reg_idx as usize;
+            let scalars_end = layout.int_scalar_base + layout.num_scalars;
+            if (layout.int_scalar_base..scalars_end).contains(&reg_idx) {
+                if let Some(value) = bh.registers_i.get(reg_idx).copied() {
+                    state
+                        .writeback_live_scalar_state_field(reg_idx - layout.int_scalar_base, value);
+                }
+            }
+        }
+        offset = it.offset;
+    }
+
+    if length_r != 0 {
+        let mut it = LivenessIterator::new(offset, length_r, all_liveness);
+        for reg_idx in &mut it {
+            let reg_idx = reg_idx as usize;
+            let scalars_end = layout.ref_scalar_base + layout.num_ref_scalars;
+            if (layout.ref_scalar_base..scalars_end).contains(&reg_idx) {
+                if let Some(value) = bh.registers_r.get(reg_idx).copied() {
+                    state.writeback_live_ref_scalar_state_field(
+                        reg_idx - layout.ref_scalar_base,
+                        value,
+                    );
+                }
+            }
+        }
+        offset = it.offset;
+    }
+
+    if length_f != 0 {
+        let _ = LivenessIterator::new(offset, length_f, all_liveness);
+    }
+}
+
 /// Whether re-entrant trace continuation is currently suspended — see
 /// [`TRACE_CONTINUATION_SUSPENDED`].
 pub fn trace_continuation_suspended() -> bool {
@@ -104,6 +158,31 @@ fn guardlog_enabled() -> bool {
 fn failvals_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::env::var_os("MAJIT_FAILVALS").is_some())
+}
+fn portal_rca_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("PYRE_PORTAL_RCA").is_some())
+}
+
+fn format_rca_live_values(labels: Option<&[String]>, values: &[Value]) -> String {
+    let mut out = String::new();
+    for (idx, value) in values.iter().enumerate() {
+        let label = labels
+            .and_then(|labels| labels.get(idx).map(String::as_str))
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("virtualizable_payload[{}]", idx));
+        let raw = match value {
+            Value::Int(v) => *v,
+            Value::Ref(r) => r.as_usize() as i64,
+            Value::Float(v) => v.to_bits() as i64,
+            Value::Void => 0,
+        };
+        let _ = std::fmt::Write::write_fmt(
+            &mut out,
+            format_args!("  live[{idx:02}] {label}: {:?} raw={raw}\n", value),
+        );
+    }
+    out
 }
 
 /// `resume.py:993-1007 _prepare_pendingfields` parity for the bridge /
@@ -164,6 +243,7 @@ fn materialize_pending_fields(exit_layout: &CompiledExitLayout, raw_values: &[i6
     }
 }
 
+use crate::TraceAction;
 use crate::blackhole::ExceptionState;
 use crate::jit_state::JitState;
 use crate::pyjitpl::{
@@ -172,11 +252,10 @@ use crate::pyjitpl::{
 };
 use crate::resume::ResumeLayoutSummary;
 use crate::virtualizable::VirtualizableInfo;
-use crate::TraceAction;
 use majit_gc::GcAllocator;
-use majit_ir::descr::DescrRef;
 use majit_ir::OpRef;
-use majit_ir::{green_type_to_ir, Const, GreenKey, GreenType, JitDriverVar, Type, Value, VarKind};
+use majit_ir::descr::DescrRef;
+use majit_ir::{Const, GreenKey, GreenType, JitDriverVar, Type, Value, VarKind, green_type_to_ir};
 
 /// Bucket the variables of a given kind by IR `Type`, returning
 /// `(num_int, num_ref, num_float)`. `Type::Void` is skipped per
@@ -959,11 +1038,13 @@ impl<S: JitState> JitDriver<S> {
         #[cfg(not(target_arch = "wasm32"))]
         let invalidation_thread = if periodic_invalidation {
             let qmut = epoch_qmut.clone();
-            Some(std::thread::spawn(move || loop {
-                std::thread::sleep(std::time::Duration::from_millis(50));
-                if let Ok(mut qmut) = qmut.lock() {
-                    if qmut.has_watchers() {
-                        qmut.invalidate();
+            Some(std::thread::spawn(move || {
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    if let Ok(mut qmut) = qmut.lock() {
+                        if qmut.has_watchers() {
+                            qmut.invalidate();
+                        }
                     }
                 }
             }))
@@ -1050,11 +1131,11 @@ impl<S: JitState> JitDriver<S> {
     pub fn register_portal_runner(
         &mut self,
         runner: impl Fn(
-                &crate::jitexc::JitException,
-            )
-                -> Result<(crate::blackhole::BhReturnType, i64), crate::jitexc::JitException>
-            + Send
-            + 'static,
+            &crate::jitexc::JitException,
+        )
+            -> Result<(crate::blackhole::BhReturnType, i64), crate::jitexc::JitException>
+        + Send
+        + 'static,
     ) {
         self.portal_runner = Some(Box::new(runner));
     }
@@ -1418,18 +1499,96 @@ impl<S: JitState> JitDriver<S> {
 
     pub fn can_resume_into_compiled_loop_at_label(&self) -> bool {
         let Some(key) = self.meta.single_pass_compiled_key else {
+            if crate::callee_rca_enabled() {
+                eprintln!("[callee-rca][direct-entry-can-resume] key=None -> false");
+            }
             return false;
         };
-        self.meta.has_compiled_loop(key)
-            && self.meta.loop_header_pc_for(key) != Some(0)
-            && self.meta.front_target_dispatch_key(key).is_some()
+        let has_compiled = self.meta.has_compiled_loop(key);
+        let loop_header_pc = self.meta.loop_header_pc_for(key);
+        let dispatch_key = self.meta.front_target_dispatch_key(key);
+        let ok = has_compiled && loop_header_pc != Some(0) && dispatch_key.is_some();
+        if crate::callee_rca_enabled() {
+            eprintln!(
+                "[callee-rca][direct-entry-can-resume] key={key} has_compiled={} \
+                 loop_header_pc={:?} dispatch_key={:?} -> {}",
+                has_compiled, loop_header_pc, dispatch_key, ok,
+            );
+        }
+        ok
     }
 
     pub fn discard_single_pass_resume(&mut self) {
         self.meta.single_pass_compiled_key = None;
         self.meta.single_pass_scalar_values = None;
         self.meta.single_pass_virt_array_values = None;
+        self.meta.single_pass_compact_label_values = None;
+        self.meta.single_pass_full_live_values = None;
         self.continue_running_normally_payload = None;
+    }
+
+    pub fn log_single_pass_parity_resume(&self, resume_pc: usize, state: &S, env: &S::Env) {
+        if !portal_rca_enabled() {
+            return;
+        }
+        let key = self.meta.single_pass_compiled_key;
+        let dispatch_key = key.and_then(|k| self.meta.front_target_dispatch_key(k));
+        let meta = S::build_meta(state, resume_pc, env);
+        eprintln!(
+            "[portal-rca][parity-crn] resume_pc={resume_pc} compiled_key={key:?} \
+             label_dispatch_key={dispatch_key:?}"
+        );
+        if let Some(dump) = state.debug_state_fields(&meta) {
+            eprintln!("[portal-rca][parity-crn-state]\n{dump}");
+        }
+    }
+
+    pub fn arm_single_pass_label_entry_on_next_back_edge(&mut self, state: &S) {
+        if state.state_field_layout().total_live_values() == 0 {
+            if portal_rca_enabled() {
+                eprintln!(
+                    "[portal-rca][parity-crn-arm-label-entry] state_fields=0 -> byte-identical discard"
+                );
+            }
+            return;
+        }
+        self.meta.single_pass_label_entry_key = self.meta.single_pass_compiled_key.filter(|&key| {
+            self.meta.has_compiled_loop(key)
+                && self.meta.loop_header_pc_for(key) != Some(0)
+                && self.meta.front_target_dispatch_key(key).is_some()
+        });
+        if portal_rca_enabled() {
+            eprintln!(
+                "[portal-rca][parity-crn-arm-label-entry] pending_key={:?}",
+                self.meta.single_pass_label_entry_key
+            );
+        }
+    }
+
+    fn take_single_pass_label_entry_dispatch_key_for_back_edge(
+        &mut self,
+        green_key: u64,
+    ) -> Option<u32> {
+        let Some(pending_key) = self.meta.single_pass_label_entry_key.take() else {
+            return None;
+        };
+        if pending_key != green_key {
+            if portal_rca_enabled() {
+                eprintln!(
+                    "[portal-rca][parity-crn-drop-label-entry] pending_key={pending_key} \
+                     back_edge_key={green_key}"
+                );
+            }
+            return None;
+        }
+        let dispatch_key = self.meta.front_target_dispatch_key(green_key);
+        if portal_rca_enabled() {
+            eprintln!(
+                "[portal-rca][parity-crn-consume-label-entry] green_key={green_key} \
+                 dispatch_key={dispatch_key:?}"
+            );
+        }
+        dispatch_key
     }
 
     /// Single-pass cross-loop-cut resume: directly enter the loop the
@@ -1469,9 +1628,64 @@ impl<S: JitState> JitDriver<S> {
             return None;
         }
         let dispatch_key = self.meta.front_target_dispatch_key(key)?;
-        let direct_live_values = self
+        let full_live_values = self
             .take_continue_running_normally_payload()
             .map(|(values, _)| values);
+        let compact_label_values = match self.meta.single_pass_compact_label_values.take() {
+            Some((values_key, values)) if values_key == key => {
+                if crate::callee_rca_enabled() {
+                    eprintln!(
+                        "[callee-rca][direct-entry-pack] key={key} dispatch_key={dispatch_key} \
+                         source=compact-label len={}",
+                        values.len()
+                    );
+                }
+                Some(values)
+            }
+            Some((values_key, values)) => {
+                if crate::callee_rca_enabled() {
+                    eprintln!(
+                        "[callee-rca][direct-entry-pack] key={key} dispatch_key={dispatch_key} \
+                         stale_compact_key={values_key} stale_len={} -> decline",
+                        values.len()
+                    );
+                }
+                None
+            }
+            None => None,
+        };
+        let direct_live_values = match compact_label_values {
+            Some(values) => Some(values),
+            None => match full_live_values {
+                Some(values) => {
+                    if let Some(expected) = self
+                        .meta
+                        .front_target_inputarg_types(key)
+                        .map(|types| types.len())
+                    {
+                        if values.len() != expected {
+                            if crate::callee_rca_enabled() {
+                                eprintln!(
+                                    "[callee-rca][direct-entry-pack] key={key} \
+                                     dispatch_key={dispatch_key} full_len={} \
+                                     label_len={expected} -> pack-in-back-edge",
+                                    values.len()
+                                );
+                            }
+                        }
+                    }
+                    if crate::callee_rca_enabled() {
+                        eprintln!(
+                            "[callee-rca][direct-entry-pack] key={key} dispatch_key={dispatch_key} \
+                             source=full-compatible len={}",
+                            values.len()
+                        );
+                    }
+                    Some(values)
+                }
+                None => None,
+            },
+        };
         let r = self.back_edge_internal(
             key,
             None,
@@ -1548,9 +1762,9 @@ impl<S: JitState> JitDriver<S> {
                     self.meta.record_loop_header_pc(k, hp);
                 }
                 // Stash the just-compiled loop's key so the merge-point hook
-                // can directly enter it with the walk-final state instead of
-                // re-interpreting the walked body (cross-loop-cut: this is
-                // cut_inner_green_key).
+                // can arm the CRN/lazy back-edge label entry with the
+                // walk-final state instead of replaying the walked peeled
+                // preamble (cross-loop-cut: this is cut_inner_green_key).
                 self.meta.single_pass_compiled_key = Some(k);
             }
         }
@@ -2071,6 +2285,8 @@ impl<S: JitState> JitDriver<S> {
                         .meta
                         .trace_ctx()
                         .and_then(|ctx| S::close_loop_live_values(ctx, sym, &meta, &jump_args));
+                    self.meta.single_pass_full_live_values =
+                        continue_running_normally_values.clone();
                     let outcome = self.compile_and_record_loop(&jump_args, meta);
                     match outcome {
                         crate::CompileOutcome::Compiled { .. } => {
@@ -2209,6 +2425,8 @@ impl<S: JitState> JitDriver<S> {
                         .meta
                         .trace_ctx()
                         .and_then(|ctx| S::close_loop_live_values(ctx, sym, &meta, &jump_args));
+                    self.meta.single_pass_full_live_values =
+                        continue_running_normally_values.clone();
                     let outcome = self.compile_and_record_loop(&jump_args, meta);
                     match outcome {
                         crate::CompileOutcome::Compiled { .. } => {
@@ -2580,11 +2798,21 @@ impl<S: JitState> JitDriver<S> {
         _env: &S::Env,
         pre_run: impl FnOnce(),
     ) -> Option<DetailedDriverRunOutcome> {
-        if self.meta.is_tracing() || !state.can_trace() {
+        if self.meta.is_tracing() {
+            return None;
+        }
+        let single_pass_dispatch_key =
+            self.take_single_pass_label_entry_dispatch_key_for_back_edge(green_key);
+        if !state.can_trace() {
             return None;
         }
         if self.meta.has_compiled_loop(green_key) {
-            return Some(self.run_compiled_detailed_keyed(green_key, state, pre_run));
+            return Some(self.run_compiled_detailed_keyed_with_dispatch_key(
+                green_key,
+                state,
+                pre_run,
+                single_pass_dispatch_key,
+            ));
         }
         None
     }
@@ -2618,7 +2846,12 @@ impl<S: JitState> JitDriver<S> {
         direct_live_values: Option<Vec<Value>>,
         pre_run: impl FnOnce(),
     ) -> Option<usize> {
-        if self.meta.is_tracing() || !state.can_trace() {
+        if self.meta.is_tracing() {
+            return None;
+        }
+        let single_pass_dispatch_key =
+            self.take_single_pass_label_entry_dispatch_key_for_back_edge(green_key);
+        if !state.can_trace() {
             return None;
         }
 
@@ -2630,6 +2863,7 @@ impl<S: JitState> JitDriver<S> {
         }
 
         if self.meta.has_compiled_loop(green_key) {
+            let dispatch_key = dispatch_key.or(single_pass_dispatch_key);
             let compiled_meta = self.meta.get_compiled_meta(green_key).unwrap().clone();
             let descriptor = self.driver_descriptor_for(state, &compiled_meta);
             if !state.is_compatible(&compiled_meta) {
@@ -2639,7 +2873,7 @@ impl<S: JitState> JitDriver<S> {
             if !self.sync_before(state, &compiled_meta, descriptor.as_ref()) {
                 return None;
             }
-            let live_values = if let Some(values) = direct_live_values {
+            let mut live_values = if let Some(values) = direct_live_values {
                 values
             } else {
                 let live_values = state.extract_live_values(&compiled_meta);
@@ -2661,8 +2895,83 @@ impl<S: JitState> JitDriver<S> {
                 };
                 live_values
             };
+            if dispatch_key.is_some() {
+                let Some(expected) = self
+                    .meta
+                    .front_target_inputarg_types(green_key)
+                    .map(|types| types.len())
+                else {
+                    return None;
+                };
+                if live_values.len() != expected {
+                    let full_len = live_values.len();
+                    let Some(packed) = self
+                        .meta
+                        .pack_front_target_live_values(green_key, &live_values)
+                    else {
+                        if crate::callee_rca_enabled() {
+                            eprintln!(
+                                "[callee-rca][direct-entry-pack] key={green_key} \
+                                 dispatch_key={:?} full_len={full_len} label_len={expected} \
+                                 source=front-target-source-positions -> decline",
+                                dispatch_key,
+                            );
+                        }
+                        return None;
+                    };
+                    if crate::callee_rca_enabled() {
+                        eprintln!(
+                            "[callee-rca][direct-entry-pack] key={green_key} dispatch_key={:?} \
+                             source=front-target-source-positions full_len={full_len} \
+                             compact_len={}",
+                            dispatch_key,
+                            packed.len()
+                        );
+                    }
+                    live_values = packed;
+                }
+            }
+
+            if crate::callee_rca_enabled() {
+                let layout = state.state_field_layout();
+                let labels = state.debug_state_live_labels(&compiled_meta);
+                let compiled_inputs = self
+                    .meta
+                    .warm_state_ref()
+                    .get_compiled(green_key)
+                    .map(|compiled| compiled.inputarg_types.len())
+                    .unwrap_or(0);
+                eprintln!(
+                    "[callee-rca][entry] green_key={green_key} target_pc={target_pc} \
+                     compiled_inputs={} live_values={} layout={:?}",
+                    compiled_inputs,
+                    live_values.len(),
+                    layout,
+                );
+                if let Some(dump) = state.debug_state_fields(&compiled_meta) {
+                    eprintln!("[callee-rca][entry-state]\n{dump}");
+                }
+                eprintln!(
+                    "[callee-rca][entry-live]\n{}",
+                    format_rca_live_values(labels.as_deref(), &live_values)
+                );
+            }
 
             pre_run();
+
+            let selected_dispatch_key = dispatch_key.unwrap_or(0);
+            if portal_rca_enabled() {
+                let labels = state.debug_state_live_labels(&compiled_meta);
+                eprintln!(
+                    "[portal-rca][compiled-entry] green_key={green_key} target_pc={target_pc} \
+                     dispatch_key={selected_dispatch_key} live_values={}",
+                    live_values.len()
+                );
+                eprintln!(
+                    "[portal-rca][compiled-entry-live]\n{}",
+                    format_rca_live_values(labels.as_deref(), &live_values)
+                );
+            }
 
             let result = if let Some(dispatch_key) = dispatch_key {
                 self.meta.run_compiled_detailed_with_values_at_dispatch_key(
@@ -2677,6 +2986,14 @@ impl<S: JitState> JitDriver<S> {
             let Some(result) = result else {
                 return None;
             };
+            if portal_rca_enabled() {
+                eprintln!(
+                    "[portal-rca][compiled-exit] green_key={green_key} \
+                     dispatch_key={selected_dispatch_key} is_finish={} fail_index={} \
+                     typed_values={:?}",
+                    result.is_finish, result.fail_index, result.typed_values
+                );
+            }
 
             if result.is_finish {
                 let run_meta = result.meta.clone();
@@ -2733,6 +3050,15 @@ impl<S: JitState> JitDriver<S> {
                         .unwrap_or(-1),
                     raw_values
                 );
+            }
+            if crate::callee_rca_enabled() {
+                eprintln!(
+                    "[callee-rca][guard-fail] fail_index={} trace_id={} raw_values={:?} exit_types={:?}",
+                    fail_index, trace_id, raw_values, exit_layout.exit_types,
+                );
+                if let Some(dump) = state.debug_state_fields(&compiled_meta) {
+                    eprintln!("[callee-rca][post-execute-token-state]\n{dump}");
+                }
             }
             let fallback_green_key = if exit_layout.rd_loop_token != 0 {
                 exit_layout.rd_loop_token
@@ -2962,6 +3288,7 @@ impl<S: JitState> JitDriver<S> {
                     if crate::majit_log_enabled() {
                         eprintln!("[bh] back_edge_internal: chain resume → {:?}", outcome);
                     }
+                    let mut portal_crn_handled = false;
                     let resume_pc = match outcome {
                         // Next merge point reached (loop back-edge): flush the
                         // register file into the live state and resume the
@@ -2981,6 +3308,16 @@ impl<S: JitState> JitDriver<S> {
                             // the loop), in which case the green pc differs
                             // from the loop-header `target_pc`.
                             let green_pc = green_int.first().map(|&pc| pc as usize);
+                            if portal_rca_enabled() {
+                                eprintln!(
+                                    "[portal-rca][crn] target_pc={} green_int={:?} \
+                                     selected_green_pc={:?}",
+                                    target_pc, green_int, green_pc,
+                                );
+                            }
+                            if let Some(pc) = green_pc {
+                                portal_crn_handled = crate::handle_portal_crn_hook(target_pc, pc);
+                            }
                             // `restore_banked` consumes both banks densely
                             // (int slot j at index j, ref scalar j at index
                             // j); the register file holds them at
@@ -2991,11 +3328,48 @@ impl<S: JitState> JitDriver<S> {
                             let layout = state.state_field_layout();
                             let int_base = layout.int_scalar_base.min(bh.registers_i.len());
                             let ref_base = layout.ref_scalar_base.min(bh.registers_r.len());
-                            state.restore_banked(
-                                &compiled_meta,
-                                &bh.registers_i[int_base..],
-                                &bh.registers_r[ref_base..],
-                            );
+                            if crate::callee_rca_enabled() {
+                                eprintln!(
+                                    "[callee-rca][crn-pre] green_pc={:?} target_pc={} \
+                                     layout={:?} int_base={} ref_base={}",
+                                    green_pc, target_pc, layout, int_base, ref_base,
+                                );
+                                eprintln!(
+                                    "[callee-rca][crn-pre] bh.registers_i(len={})={:?}",
+                                    bh.registers_i.len(),
+                                    bh.registers_i,
+                                );
+                                eprintln!(
+                                    "[callee-rca][crn-pre] bh.registers_r(len={})={:?}",
+                                    bh.registers_r.len(),
+                                    bh.registers_r,
+                                );
+                                eprintln!(
+                                    "[callee-rca][crn-pre] int_slice={:?}",
+                                    &bh.registers_i[int_base..],
+                                );
+                                eprintln!(
+                                    "[callee-rca][crn-pre] ref_slice={:?}",
+                                    &bh.registers_r[ref_base..],
+                                );
+                                if let Some(dump) = state.debug_state_fields(&compiled_meta) {
+                                    eprintln!("[callee-rca][crn-state-before]\n{dump}");
+                                }
+                            }
+                            if layout.num_virt_arrays == 0 {
+                                state.restore_banked(
+                                    &compiled_meta,
+                                    &bh.registers_i[int_base..],
+                                    &bh.registers_r[ref_base..],
+                                );
+                            } else {
+                                writeback_live_state_scalars_from_blackhole(
+                                    state,
+                                    &layout,
+                                    &bh,
+                                    all_liveness,
+                                );
+                            }
                             // The carried/delta-tracked reds in the deadframe
                             // can lag the authoritative live storage (e.g. a
                             // `stacksize` whose backing stack was popped by the
@@ -3007,7 +3381,26 @@ impl<S: JitState> JitDriver<S> {
                             // the same compiled loop and re-fails the same green
                             // guard with zero forward progress.
                             state.recover_after_compiled_run();
-                            Some(green_pc.unwrap_or(target_pc))
+                            if crate::callee_rca_enabled() {
+                                if let Some(dump) = state.debug_state_fields(&compiled_meta) {
+                                    eprintln!("[callee-rca][crn-state-after]\n{dump}");
+                                }
+                            }
+                            let mut resume_pc = green_pc.unwrap_or(target_pc);
+                            if selected_dispatch_key != 0
+                                && !portal_crn_handled
+                                && green_pc.is_some_and(|pc| pc != target_pc)
+                            {
+                                if portal_rca_enabled() {
+                                    eprintln!(
+                                        "[portal-rca][crn-label-entry-header-resume] \
+                                         target_pc={} green_pc={:?}",
+                                        target_pc, green_pc,
+                                    );
+                                }
+                                resume_pc = target_pc;
+                            }
+                            Some(resume_pc)
                         }
                         // The interpreted frame ran to completion inside the
                         // blackhole: flush, then force the generated mainloop's
@@ -3055,7 +3448,7 @@ impl<S: JitState> JitDriver<S> {
                         // from — nothing to bridge, just exit. The blackhole has
                         // already recovered `state` to the resume point, so the
                         // bridge sees the post-guard-failure values.
-                        if should_bridge && pc != usize::MAX {
+                        if should_bridge && !portal_crn_handled && pc != usize::MAX {
                             let bridge_ok =
                                 self.start_bridge_tracing(&descr_arc, state, env, &raw_values, pc);
                             if crate::majit_log_enabled() {
@@ -3099,6 +3492,8 @@ impl<S: JitState> JitDriver<S> {
         if self.meta.is_tracing() {
             return None;
         }
+        let single_pass_dispatch_key =
+            self.take_single_pass_label_entry_dispatch_key_for_back_edge(green_key);
         if !state.can_trace() {
             if crate::debug::have_debug_prints() {
                 crate::debug::log_one(
@@ -3110,7 +3505,12 @@ impl<S: JitState> JitDriver<S> {
         }
 
         if self.meta.has_compiled_loop(green_key) {
-            return Some(self.run_compiled_detailed_keyed(green_key, state, pre_run));
+            return Some(self.run_compiled_detailed_keyed_with_dispatch_key(
+                green_key,
+                state,
+                pre_run,
+                single_pass_dispatch_key,
+            ));
         }
 
         self.maybe_start_tracing(green_key, structured_green_key, target_pc, state, env);
@@ -3180,6 +3580,7 @@ impl<S: JitState> JitDriver<S> {
         if self.meta.is_tracing() {
             return;
         }
+        self.take_single_pass_label_entry_dispatch_key_for_back_edge(green_key);
         let meta = state.build_meta(target_pc, env);
         let descriptor = self.driver_descriptor_for(state, &meta);
         if !self.sync_before(state, &meta, descriptor.as_ref()) {
@@ -3604,6 +4005,17 @@ impl<S: JitState> JitDriver<S> {
         state: &mut S,
         pre_run: impl FnOnce(),
     ) -> DetailedDriverRunOutcome {
+        let dispatch_key = self.take_single_pass_label_entry_dispatch_key_for_back_edge(green_key);
+        self.run_compiled_detailed_keyed_with_dispatch_key(green_key, state, pre_run, dispatch_key)
+    }
+
+    fn run_compiled_detailed_keyed_with_dispatch_key(
+        &mut self,
+        green_key: u64,
+        state: &mut S,
+        pre_run: impl FnOnce(),
+        dispatch_key: Option<u32>,
+    ) -> DetailedDriverRunOutcome {
         let Some(meta) = self.meta.get_compiled_meta(green_key).cloned() else {
             return DetailedDriverRunOutcome::Abort {
                 restored: false,
@@ -3651,10 +4063,42 @@ impl<S: JitState> JitDriver<S> {
                 via_blackhole: false,
             };
         };
+        let mut live_values = live_values;
+        if dispatch_key.is_some() {
+            let Some(expected) = self
+                .meta
+                .front_target_inputarg_types(green_key)
+                .map(|types| types.len())
+            else {
+                return DetailedDriverRunOutcome::Abort {
+                    restored: false,
+                    via_blackhole: false,
+                };
+            };
+            if live_values.len() != expected {
+                let Some(packed) = self
+                    .meta
+                    .pack_front_target_live_values(green_key, &live_values)
+                else {
+                    return DetailedDriverRunOutcome::Abort {
+                        restored: false,
+                        via_blackhole: false,
+                    };
+                };
+                live_values = packed;
+            }
+        }
         pre_run();
-        let result = self
-            .meta
-            .run_compiled_detailed_with_values(green_key, &live_values);
+        let result = if let Some(dispatch_key) = dispatch_key {
+            self.meta.run_compiled_detailed_with_values_at_dispatch_key(
+                green_key,
+                &live_values,
+                dispatch_key,
+            )
+        } else {
+            self.meta
+                .run_compiled_detailed_with_values(green_key, &live_values)
+        };
         let Some(result) = result else {
             return DetailedDriverRunOutcome::Abort {
                 restored: false,
@@ -4342,11 +4786,11 @@ impl<S: JitState> JitDriver<S> {
         resume_pc: usize,
     ) -> bool {
         majit_metainterp::mc_diag_bump(12); // start_bridge_tracing entered
-                                            // compile.py:725-729 `_trace_and_compile_from_bridge` raises
-                                            // `compile.giveup()` when the descr's owning JitCellToken weakref
-                                            // is dead (memmgr-evicted).  Pyre signals the same outcome by
-                                            // returning false; also returns false if the descr is not a
-                                            // FailDescr at all (e.g. a synthetic terminal-exit Descr).
+        // compile.py:725-729 `_trace_and_compile_from_bridge` raises
+        // `compile.giveup()` when the descr's owning JitCellToken weakref
+        // is dead (memmgr-evicted).  Pyre signals the same outcome by
+        // returning false; also returns false if the descr is not a
+        // FailDescr at all (e.g. a synthetic terminal-exit Descr).
         let Some(descr_fd) = descr_arc.as_fail_descr() else {
             majit_metainterp::mc_diag_bump(13); // sbt early: descr not FailDescr
             return false;
@@ -4688,11 +5132,16 @@ impl<S: JitState> JitDriver<S> {
             &crate::compile::CompiledExitLayout,
         ) -> Option<usize>,
     ) -> Option<usize> {
-        if self.is_tracing() || !state.can_trace() {
+        if self.is_tracing() {
             return None;
         }
 
         let key_hash = crate::green_key_hash_typed(green_values, green_types);
+        let single_pass_dispatch_key =
+            self.take_single_pass_label_entry_dispatch_key_for_back_edge(key_hash);
+        if !state.can_trace() {
+            return None;
+        }
 
         if !self.has_compiled_loop(key_hash) {
             // warmstate.py:446,465: cold fast path — check would_fire without
@@ -4733,6 +5182,16 @@ impl<S: JitState> JitDriver<S> {
             descriptor.as_ref(),
             live_values,
         )?;
+        let mut live_values = live_values;
+        let mut dispatch_key = single_pass_dispatch_key;
+        if dispatch_key.is_some() {
+            let expected = self.meta.front_target_inputarg_types(key_hash)?.len();
+            if live_values.len() != expected {
+                live_values = self
+                    .meta
+                    .pack_front_target_live_values(key_hash, &live_values)?;
+            }
+        }
         pre_run();
 
         // RPython compile.py:205-207: register loop token with
@@ -4744,23 +5203,55 @@ impl<S: JitState> JitDriver<S> {
             }
         }
 
-        let mut live_values = live_values;
         loop {
-            let result = self
-                .meta
-                .run_compiled_raw_detailed_with_values(key_hash, &live_values)?;
-            let is_finish = result.is_finish;
-            let fail_index = result.fail_index;
-            let trace_id = result.trace_id;
-            let result_meta = result.meta.clone();
-            let typed_values = result.typed_values;
-            let raw_values = result.values;
-            let exit_layout = result.exit_layout;
-            let descr_arc = result.descr_arc.clone();
+            let (
+                is_finish,
+                fail_index,
+                trace_id,
+                result_meta,
+                typed_values,
+                raw_values,
+                exit_layout,
+                descr_arc,
+                result_exc,
+            ) = if let Some(dispatch_key) = dispatch_key.take() {
+                let result = self
+                    .meta
+                    .run_compiled_detailed_with_values_at_dispatch_key(
+                        key_hash,
+                        &live_values,
+                        dispatch_key,
+                    )?;
+                (
+                    result.is_finish,
+                    result.fail_index,
+                    result.trace_id,
+                    result.meta.clone(),
+                    result.typed_values,
+                    result.values,
+                    result.exit_layout,
+                    result.descr_arc.clone(),
+                    result.exception.exc_value,
+                )
+            } else {
+                let result = self
+                    .meta
+                    .run_compiled_raw_detailed_with_values(key_hash, &live_values)?;
+                (
+                    result.is_finish,
+                    result.fail_index,
+                    result.trace_id,
+                    result.meta.clone(),
+                    result.typed_values,
+                    result.values,
+                    result.exit_layout,
+                    result.descr_arc.clone(),
+                    result.exception.exc_value,
+                )
+            };
             // blackhole.py:1794 `_prepare_resume_from_failure(deadframe)`:
             // seed the blackhole resume with the exception grabbed at guard
             // failure so an exception guard unwinds into its handler.
-            let result_exc = result.exception.exc_value;
 
             if is_finish || fail_index == u32::MAX {
                 if guardlog_enabled() {
@@ -5221,29 +5712,35 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(driver
-            .jit_merge_point_keyed(
-                key,
-                7,
-                &mut state,
-                &(),
-                || {},
-                |_meta, _sym| { TraceAction::Continue }
-            )
-            .is_none());
+        assert!(
+            driver
+                .jit_merge_point_keyed(
+                    key,
+                    7,
+                    &mut state,
+                    &(),
+                    || {},
+                    |_meta, _sym| { TraceAction::Continue }
+                )
+                .is_none()
+        );
         assert!(
             !driver.is_tracing(),
             "jit_merge_point must not warm up or start tracing by itself"
         );
 
-        assert!(driver
-            .back_edge_or_run_compiled_keyed(key, 7, &mut state, &(), || {})
-            .is_none());
+        assert!(
+            driver
+                .back_edge_or_run_compiled_keyed(key, 7, &mut state, &(), || {})
+                .is_none()
+        );
         assert!(!driver.is_tracing(), "first back-edge should only warm up");
 
-        assert!(driver
-            .back_edge_or_run_compiled_keyed(key, 7, &mut state, &(), || {})
-            .is_none());
+        assert!(
+            driver
+                .back_edge_or_run_compiled_keyed(key, 7, &mut state, &(), || {})
+                .is_none()
+        );
         assert!(
             driver.is_tracing(),
             "back-edge should start tracing once hot"
@@ -5309,6 +5806,45 @@ mod tests {
         assert_eq!(state.restored_values, typed_live_values);
         assert_eq!(state.raw_restore_calls, 0);
         assert_eq!(state.typed_restore_calls, 1);
+    }
+
+    #[test]
+    fn single_pass_label_entry_handoff_expires_on_first_unrelated_back_edge() {
+        let mut driver = JitDriver::<TypedRestoreState>::new(100);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        let loop_a = 11u64;
+        let loop_b = 22u64;
+        let mut state = TypedRestoreState::default();
+
+        // Models pyjitpl.py:3072-3123 raise_continue_running_normally: the
+        // LABEL handoff is only for the next back-edge after the parity resume.
+        // If loop B is that next back-edge, loop A's handoff is stale and must
+        // not survive until a later fresh loop-A entry.
+        driver.meta.single_pass_label_entry_key = Some(loop_a);
+        assert!(
+            driver
+                .back_edge_keyed(loop_b, 22, &mut state, &(), || {})
+                .is_none()
+        );
+        assert_eq!(
+            driver.meta.single_pass_label_entry_key, None,
+            "an unrelated uncompiled back_edge must stale the one-shot loop-A label handoff",
+        );
+
+        // Cover the alternate back-edge entry used by callers that combine
+        // can-enter-JIT and compiled execution. Before the fix this path also
+        // missed uncompiled intervening loops because the old take helper only
+        // ran under has_compiled_loop/compiled execution.
+        driver.meta.single_pass_label_entry_key = Some(loop_a);
+        assert!(
+            driver
+                .back_edge_or_run_compiled_keyed(loop_b, 22, &mut state, &(), || {})
+                .is_none()
+        );
+        assert_eq!(
+            driver.meta.single_pass_label_entry_key, None,
+            "back_edge_or_run_compiled must also clear stale handoffs before the compiled-loop gate",
+        );
     }
 
     #[test]
@@ -5576,8 +6112,8 @@ mod tests {
             fn validate_close(_: &(), _: &()) -> bool {
                 true
             }
-            fn __build_virtualizable_info(
-            ) -> Option<std::sync::Arc<crate::virtualizable::VirtualizableInfo>> {
+            fn __build_virtualizable_info()
+            -> Option<std::sync::Arc<crate::virtualizable::VirtualizableInfo>> {
                 let mut info = crate::virtualizable::VirtualizableInfo::new(24);
                 info.add_field("pc", Type::Int, 8);
                 info.add_array_field(
