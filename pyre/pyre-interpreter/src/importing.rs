@@ -1219,7 +1219,7 @@ thread_local! {
     static SYS_IGNORE_ENVIRONMENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static SYS_ISOLATED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static SYS_DEV_MODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    static SYS_UTF8_MODE: std::cell::Cell<i64> = const { std::cell::Cell::new(1) };
+    static SYS_UTF8_MODE: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
     static SYS_SAFE_PATH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
