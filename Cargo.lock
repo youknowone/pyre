@@ -1530,6 +1530,7 @@ dependencies = [
  "majit-ir",
  "majit-trace",
  "majit-translate",
+ "rustc-hash",
 ]
 
 [[package]]
@@ -1600,6 +1601,7 @@ dependencies = [
  "majit-macros",
  "majit-trace",
  "majit-translate",
+ "rustc-hash",
  "smallvec",
  "vecset",
 ]

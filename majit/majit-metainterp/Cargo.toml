@@ -26,6 +26,7 @@ bit-set = { workspace = true }
 smallvec = { workspace = true }
 vecset = { workspace = true }
 indexmap = { workspace = true }
+rustc-hash = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 # Native backends never build for wasm32; on wasm32 the backend is

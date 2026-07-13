@@ -7,6 +7,7 @@
 //! This is the RPython equivalent of `rpython/jit/metainterp/resume.py`.
 
 use indexmap::{IndexMap, IndexSet};
+use rustc_hash::FxBuildHasher;
 use std::cell::UnsafeCell;
 use std::sync::Arc;
 
@@ -14,6 +15,8 @@ use majit_backend::{
     ExitFrameLayout, ExitPendingFieldLayout, ExitRecoveryLayout, ExitVirtualLayout,
 };
 use majit_ir::{Const, GcRef, OpRef, Type};
+
+pub type LiveboxTypeMap = indexmap::IndexMap<majit_ir::OpRef, majit_ir::Type, FxBuildHasher>;
 
 /// resume.py:656-670: element kind from arraydescr.
 /// 0=ref (is_array_of_pointers), 1=int, 2=float (is_array_of_floats).
@@ -167,7 +170,7 @@ pub struct NumberingState {
     /// raw u32 — pyre's flat-OpRef stand-in for PyPy's `box is box`
     /// identity. See `LiveboxMap` (resume.rs:98) for the matching
     /// typed-key convention.
-    pub livebox_types: indexmap::IndexMap<majit_ir::OpRef, majit_ir::Type>,
+    pub livebox_types: LiveboxTypeMap,
 }
 
 impl NumberingState {
@@ -177,7 +180,7 @@ impl NumberingState {
             liveboxes: LiveboxMap::new(),
             num_boxes: 0,
             num_virtuals: 0,
-            livebox_types: indexmap::IndexMap::new(),
+            livebox_types: indexmap::IndexMap::default(),
         }
     }
     pub fn append_short(&mut self, item: i16) {
@@ -4048,7 +4051,7 @@ impl ResumeDataLoopMemo {
         Vec<majit_ir::Const>,
         Vec<std::rc::Rc<majit_ir::RdVirtualInfo>>,
         Vec<majit_ir::OpRef>,
-        indexmap::IndexMap<majit_ir::OpRef, majit_ir::Type>,
+        LiveboxTypeMap,
     ) {
         let num_env_virtuals = numb_state.num_virtuals;
 

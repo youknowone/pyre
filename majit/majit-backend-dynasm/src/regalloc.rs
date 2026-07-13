@@ -14,6 +14,7 @@
 ///   get_scale              — regalloc.py:1239
 use indexmap::IndexMap;
 use majit_ir::IndexMapExt;
+use rustc_hash::FxBuildHasher;
 
 use crate::arch::*;
 use crate::gcmap::{allocate_gcmap, gcmap_set_bit};
@@ -261,7 +262,7 @@ pub struct LifetimeManager {
     // ~all its backend time in `IndexMap::get_index_of` here). regalloc.py:1054
     // keys longevity by a dict (O(1)); `IndexMap` restores that O(1) lookup
     // while keeping the insertion-ordered iteration `IndexMap` provided.
-    lifetimes: indexmap::IndexMap<OpRef, Lifetime>,
+    lifetimes: indexmap::IndexMap<OpRef, Lifetime, FxBuildHasher>,
     /// regalloc.py:1064 maps register → FixedRegisterPositions
     pub fixed_register_use: IndexMap<RegLoc, FixedRegisterPositions>,
 }
@@ -269,7 +270,7 @@ pub struct LifetimeManager {
 impl LifetimeManager {
     pub fn new() -> Self {
         LifetimeManager {
-            lifetimes: indexmap::IndexMap::new(),
+            lifetimes: indexmap::IndexMap::default(),
             fixed_register_use: IndexMap::new(),
         }
     }

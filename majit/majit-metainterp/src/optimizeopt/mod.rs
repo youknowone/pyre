@@ -40,11 +40,13 @@ use indexmap::{IndexMap, IndexSet};
 use info::{EnsuredPtrInfo, PtrInfo};
 use majit_ir::operand::Operand;
 use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type, Value};
+use rustc_hash::{FxBuildHasher, FxHashMap};
 use std::collections::VecDeque;
 
 pub type SnapshotBoxes = Vec<Option<Vec<SnapshotBox>>>;
 pub type SnapshotFrameSizes = Vec<Option<Vec<usize>>>;
 pub type SnapshotFramePcs = Vec<Option<Vec<(i32, i32, i32)>>>;
+type OpRefFxIndexMap<V> = indexmap::IndexMap<OpRef, V, FxBuildHasher>;
 
 pub(crate) fn snapshot_get<T>(store: &[Option<T>], pos: i32) -> Option<&T> {
     if pos < 0 {
@@ -536,7 +538,7 @@ pub struct OptContext {
     /// so the last push at a position wins, matching the `rfind`
     /// last-occurrence semantics); rebuilt by `rebuild_new_operations_index`
     /// after the rare structural mutations, and cleared with the context.
-    pub(crate) new_operations_index: std::collections::HashMap<OpRef, majit_ir::OpRc>,
+    pub(crate) new_operations_index: FxHashMap<OpRef, majit_ir::OpRc>,
     /// optimizer.py:246 `self._emittedoperations = {}` — the result boxes
     /// of ops emitted by THIS optimizer run, keyed by box identity
     /// (`Rc::ptr_eq`) to mirror the upstream dict keyed by the `op` object.
@@ -793,7 +795,7 @@ pub struct OptContext {
     // earlier container guaranteed but resolves `get` in O(1).  Same O(1)
     // acceleration rationale as `input_ops_index`; no PyPy counterpart
     // (upstream keys producers on `box._forwarded`, not a positional map).
-    pub(crate) resop_refs: indexmap::IndexMap<OpRef, majit_ir::resoperation::OpRc>,
+    pub(crate) resop_refs: OpRefFxIndexMap<majit_ir::resoperation::OpRc>,
     /// Live synthetic stand-ins (mint_synthetic_resop / bind_input_resops
     /// products) that have NOT been superseded by an `emit` at their
     /// position. The end-of-Phase-1 orphan-binding pass drains this into
@@ -814,7 +816,7 @@ pub struct OptContext {
     /// `live_synthetics_swap_remove_pos`; without it the scan is O(n^2) over a
     /// vector that grows to the whole trace length (~44k on aheui's logo loop),
     /// the same producer-resolution cost `phase1_emit_ops_index` removes.
-    pub(crate) live_synthetics_index: std::collections::HashMap<OpRef, usize>,
+    pub(crate) live_synthetics_index: FxHashMap<OpRef, usize>,
     /// Phase 1 emit ops carried into Phase 2's lookup surface.
     ///
     /// In RPython, a Box referenced cross-phase keeps its `.type` attribute
@@ -836,7 +838,7 @@ pub struct OptContext {
     /// box of every Phase 2 guard, the dominant O(n^2) compile cost. Same
     /// derived-index rationale as `input_ops_index` (no PyPy counterpart:
     /// upstream keys producers on `box._forwarded`, not a positional map).
-    pub(crate) phase1_emit_ops_index: std::collections::HashMap<OpRef, majit_ir::OpRc>,
+    pub(crate) phase1_emit_ops_index: FxHashMap<OpRef, majit_ir::OpRc>,
     /// Recorder trace ops that carry the input operands' producer `Op`
     /// (e.g. the `IntLt`/`GetfieldGcPureI` operands of a recorded loop),
     /// shared by `Rc` with the canonical stores but absent from
@@ -867,7 +869,7 @@ pub struct OptContext {
     /// (last occurrence wins), enforced by rebuilding forward (a later
     /// `insert` at the same key overwrites the earlier) and covered by
     /// `input_ops_index_last_occurrence_wins`.
-    pub(crate) input_ops_index: std::collections::HashMap<OpRef, majit_ir::OpRc>,
+    pub(crate) input_ops_index: FxHashMap<OpRef, majit_ir::OpRc>,
     /// optimizer.py:644,679 _last_guard_op — index of the last guard in
     /// new_operations that had full resume data built. Consecutive guards
     /// share resume data via _copy_resume_data_from (ResumeGuardCopiedDescr).
@@ -1641,7 +1643,10 @@ impl OptContext {
     pub fn new(estimated_ops: usize) -> Self {
         OptContext {
             new_operations: Vec::with_capacity(estimated_ops),
-            new_operations_index: std::collections::HashMap::with_capacity(estimated_ops),
+            new_operations_index: FxHashMap::with_capacity_and_hasher(
+                estimated_ops,
+                Default::default(),
+            ),
             emitted_operations: indexmap::IndexSet::new(),
             num_inputs: 0,
             inputarg_base: 0,
@@ -1690,13 +1695,13 @@ impl OptContext {
 
             inputargs: Vec::new(),
             inputarg_refs: Vec::new(),
-            resop_refs: indexmap::IndexMap::new(),
+            resop_refs: indexmap::IndexMap::default(),
             live_synthetics: Vec::new(),
-            live_synthetics_index: std::collections::HashMap::new(),
+            live_synthetics_index: FxHashMap::default(),
             phase1_emit_ops: Vec::new(),
-            phase1_emit_ops_index: std::collections::HashMap::new(),
+            phase1_emit_ops_index: FxHashMap::default(),
             input_ops: Vec::new(),
-            input_ops_index: std::collections::HashMap::new(),
+            input_ops_index: FxHashMap::default(),
             last_guard_idx: None,
             last_seen_snapshot_pos: None,
             cpu: crate::cpu::default_cpu(),
@@ -2223,7 +2228,10 @@ impl OptContext {
     ) -> Self {
         OptContext {
             new_operations: Vec::with_capacity(estimated_ops),
-            new_operations_index: std::collections::HashMap::with_capacity(estimated_ops),
+            new_operations_index: FxHashMap::with_capacity_and_hasher(
+                estimated_ops,
+                Default::default(),
+            ),
             emitted_operations: indexmap::IndexSet::new(),
             num_inputs: num_inputs as u32,
             inputarg_base,
@@ -2272,13 +2280,13 @@ impl OptContext {
 
             inputargs: Vec::new(),
             inputarg_refs: Vec::new(),
-            resop_refs: indexmap::IndexMap::new(),
+            resop_refs: indexmap::IndexMap::default(),
             live_synthetics: Vec::new(),
-            live_synthetics_index: std::collections::HashMap::new(),
+            live_synthetics_index: FxHashMap::default(),
             phase1_emit_ops: Vec::new(),
-            phase1_emit_ops_index: std::collections::HashMap::new(),
+            phase1_emit_ops_index: FxHashMap::default(),
             input_ops: Vec::new(),
-            input_ops_index: std::collections::HashMap::new(),
+            input_ops_index: FxHashMap::default(),
             last_guard_idx: None,
             last_seen_snapshot_pos: None,
             cpu: crate::cpu::default_cpu(),
