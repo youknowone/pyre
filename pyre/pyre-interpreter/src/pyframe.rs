@@ -600,14 +600,21 @@ unsafe fn alloc_frame_block(
     pyre_object::lltype::malloc_raw(block)
 }
 
+#[inline]
+fn remember_frame_block_node(node: *mut FrameBlock) {
+    if pyre_object::gc_hook::try_gc_owns_object(node as *mut u8) {
+        pyre_object::gc_hook::try_gc_write_barrier(node as *mut u8);
+    }
+}
+
 unsafe fn clone_block_chain(
     ptr: *mut FrameBlock,
     allocation: FrameLocalsArrayAllocation,
 ) -> *mut FrameBlock {
     // `previous` is assigned only while a node is constructed and points to
-    // a strictly older node.  Rebuild oldest-to-newest for the GC regime, so
-    // a node allocated in old-gen can never acquire a younger predecessor and
-    // no write barrier is needed for `previous`.
+    // a strictly older node. Rebuild oldest-to-newest, but barrier each store:
+    // a nursery-full allocation fallback can make a node old while its
+    // predecessor is still young.
     let mut source = Vec::new();
     let mut current = ptr;
     while !current.is_null() {
@@ -627,6 +634,7 @@ unsafe fn clone_block_chain(
         block.previous = std::ptr::null_mut();
         let node = unsafe { alloc_frame_block(block, allocation) };
         unsafe { (*node).previous = cloned };
+        remember_frame_block_node(node);
         cloned = node;
     }
     cloned
@@ -1495,12 +1503,11 @@ impl PyFrame {
             } else {
                 pyre_object::lltype::malloc_raw(value)
             };
-            // The allocation starts null-filled, but callers commonly seed
-            // it immediately with w_globals or a freshly allocated mapping.
-            // Remembering the completed object is harmless for Box fallback
-            // and keeps the old-gen debug payload visible to the next minor.
-            remember_frame_debug_data(self.debugdata);
         }
+        // Callers mutate the returned payload directly. Remember the container
+        // immediately before exposing it so old debugdata keeps any young refs
+        // written by the caller visible to the next minor collection.
+        remember_frame_debug_data(self.debugdata);
         unsafe { &mut *self.debugdata }
     }
 
@@ -1513,12 +1520,7 @@ impl PyFrame {
     /// PyPy-compatible `getorcreatedebug()`.
     #[inline]
     pub fn getorcreatedebug(&mut self, init_lineno: isize) -> &mut FrameDebugData {
-        self.getorcreate_debug_data(init_lineno);
-        // Callers mutate the returned payload directly (notably w_f_trace)
-        // without their own barrier. Keep the old-gen payload remembered
-        // before exposing it for that mutation.
-        remember_frame_debug_data(self.debugdata);
-        unsafe { &mut *self.debugdata }
+        self.getorcreate_debug_data(init_lineno)
     }
 
     /// PyPy-compatible alias for `code()`.
@@ -1591,7 +1593,6 @@ impl PyFrame {
         // observable instead of faulting.
         let w_locals = unsafe { pyre_object::w_dict_new() };
         self.getorcreate_debug_data(-1).w_locals = w_locals;
-        remember_frame_debug_data(self.debugdata);
         w_locals
     }
 
@@ -2305,11 +2306,15 @@ impl PyFrame {
         let _root = unsafe { FrameBlockRoot::new(&mut previous) };
         block.previous = std::ptr::null_mut();
         let node = unsafe { alloc_frame_block(block, allocation) };
-        // `previous` is written only here (and in clone/unpickle construction)
-        // and always targets the strictly older node.  Thus an old-gen block
-        // never points to a younger block and needs no write barrier.
+        // Both links need barriers: a nursery-full allocation fallback can
+        // make `node` old while `previous` is young, and this old frame usually
+        // receives a young `node`.
         unsafe { (*node).previous = previous };
+        remember_frame_block_node(node);
         self.lastblock = node;
+        if pyre_object::gc_hook::try_gc_owns_object(self as *mut PyFrame as *mut u8) {
+            pyre_object::gc_hook::try_gc_write_barrier(self as *mut PyFrame as *mut u8);
+        }
     }
 
     /// pyframe.py:190 pop_block
@@ -2635,10 +2640,12 @@ impl PyFrame {
 
         if let Some(debug) = self.getdebug() {
             let had_locals = !debug.w_locals.is_null();
+            // Allocate before remembering debugdata: a minor can happen here.
+            let w_locals = had_locals.then(|| unsafe { pyre_object::w_dict_new() });
             let d = self.getorcreate_debug_data(-1);
             d.w_f_trace = pyre_object::PY_NULL;
-            if had_locals {
-                d.w_locals = unsafe { pyre_object::w_dict_new() };
+            if let Some(w_locals) = w_locals {
+                d.w_locals = w_locals;
             }
         }
 

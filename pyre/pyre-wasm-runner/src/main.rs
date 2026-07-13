@@ -305,10 +305,16 @@ fn run(module_path: &PathBuf, source: &str) -> Result<i32> {
     }
     if let Some(path) = &guest_profile_out {
         if let Some(p) = store.data_mut().guest_profiler.take() {
-            let f = std::fs::File::create(path).context("create guest profile output")?;
-            p.finish(std::io::BufWriter::new(f))
-                .context("write guest profile")?;
-            eprintln!("[guest-profile] wrote {path}");
+            match std::fs::File::create(path).context("create guest profile output") {
+                Ok(f) => match p
+                    .finish(std::io::BufWriter::new(f))
+                    .context("write guest profile")
+                {
+                    Ok(()) => eprintln!("[guest-profile] wrote {path}"),
+                    Err(err) => eprintln!("[guest-profile] failed to write {path}: {err:#}"),
+                },
+                Err(err) => eprintln!("[guest-profile] failed to create {path}: {err:#}"),
+            }
         }
     }
     if std::env::var_os("PYRE_WASM_JIT_STATS").is_some() {
