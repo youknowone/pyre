@@ -6282,6 +6282,16 @@ fn try_execute_residual_call_via_executor(
     // builtin FOR_ITER stays modeled.
     let foriter_frame_snapshot = (helper == majit_ir::PyreHelperKind::ForIterNext)
         .then(pyre_interpreter::call::frame_entry_count);
+    // #493: a NEW consume attempt for a FOR_ITER whose prior item is still in
+    // flight means that item's body ran to completion — mark the entry BEFORE
+    // the call so an attempt that aborts mid-way (a kept-stack guard on the
+    // exhaustion arm) still records the completion; a successful attempt
+    // replaces the entry with a fresh one anyway.
+    if helper == majit_ir::PyreHelperKind::ForIterNext {
+        let body_pc = fbw_foriter_body_pc_from_op_pc(ctx.fbw_mode.snapshot_sym, op_pc)
+            .unwrap_or(ctx.entry_py_pc as usize + 1);
+        fbw_foriter_inflight_mark_attempt(body_pc);
+    }
     // gh#467: sample the user-frame odometer UNCONDITIONALLY (not only under an
     // in-flight FOR_ITER) so the concrete-heap-write gate can detect a callee
     // sub-walk mutation committed through a value-returning dunder body — the
@@ -7758,6 +7768,12 @@ struct InflightForiter {
     item: pyre_object::PyObjectRef,
     body_pc: usize,
     body_effect_since_consume: bool,
+    /// The walk re-reached this FOR_ITER's consume after the item's body ran
+    /// (a NEW `for_iter_next` attempt was dispatched for the same `body_pc`).
+    /// A completed entry must never be re-delivered — its body already ran
+    /// during the walk — but a flush may still adopt the walk end state at
+    /// the header WITHOUT delivery (the interpreter re-attempts the consume).
+    body_completed: bool,
 }
 
 thread_local! {
@@ -8076,6 +8092,7 @@ pub(crate) fn fbw_foriter_inflight_capture(item: pyre_object::PyObjectRef, body_
             item,
             body_pc,
             body_effect_since_consume: false,
+            body_completed: false,
         };
         match stack.iter().position(|e| e.body_pc == body_pc) {
             Some(at) => {
@@ -8093,6 +8110,21 @@ pub(crate) fn fbw_foriter_inflight_capture(item: pyre_object::PyObjectRef, body_
 /// counts as a body effect committed after the consume (Finding #1).
 pub(crate) fn fbw_foriter_inflight_active() -> bool {
     FBW_FORITER_INFLIGHT.with(|c| !c.borrow().is_empty())
+}
+
+/// Mark the in-flight entry for `body_pc` body-completed: a NEW
+/// `for_iter_next` attempt is being dispatched for the same FOR_ITER, so the
+/// prior consumed item's body has run to completion (the walk is back at the
+/// header).  Called from the residual dispatch BEFORE the call executes so an
+/// attempt that aborts mid-way (a kept-stack guard on the exhaustion arm)
+/// still leaves the completion recorded; a successful attempt replaces the
+/// entry with a fresh one anyway ([`fbw_foriter_inflight_capture`]).
+pub(crate) fn fbw_foriter_inflight_mark_attempt(body_pc: usize) {
+    FBW_FORITER_INFLIGHT.with(|c| {
+        if let Some(entry) = c.borrow_mut().iter_mut().find(|e| e.body_pc == body_pc) {
+            entry.body_completed = true;
+        }
+    });
 }
 
 /// Flag that a non-elidable concrete residual committed an irreversible heap
@@ -8131,24 +8163,7 @@ pub fn fbw_foriter_inflight_take_for_resume(
     resume_py_pc: usize,
 ) -> Option<(pyre_object::PyObjectRef, usize)> {
     let body_pc = resume_py_pc + 1;
-    // The opcode at `resume_py_pc` must be a FOR_ITER (decoded from the live
-    // frame's code) — a non-FOR_ITER resume pc that merely happens to satisfy
-    // `body_pc == some entry.body_pc` is Shape B.
-    let frame_ptr = frame as *const u8;
-    let w_code =
-        unsafe { *(frame_ptr.add(crate::frame_layout::PYFRAME_PYCODE_OFFSET) as *const *const ()) };
-    if w_code.is_null() {
-        return None;
-    }
-    let raw_code = unsafe {
-        pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
-            as *const pyre_interpreter::CodeObject
-    };
-    let is_foriter_header = matches!(
-        pyre_interpreter::decode_instruction_at(unsafe { &*raw_code }, resume_py_pc),
-        Some((pyre_interpreter::Instruction::ForIter { .. }, _))
-    );
-    if !is_foriter_header {
+    if !foriter_header_at(frame, resume_py_pc) {
         return None;
     }
     FBW_FORITER_INFLIGHT.with(|c| {
@@ -8156,10 +8171,14 @@ pub fn fbw_foriter_inflight_take_for_resume(
         let at = stack.iter().position(|e| e.body_pc == body_pc)?;
         // R1 never-double guard (cross-checks #33): an irreversible body effect
         // committed since this consume means re-running the body on delivery
-        // would double it — refuse delivery.  Also refuse if either journal is
-        // non-empty or an unjournaled effect stands (same signals as
-        // `fbw_foriter_inflight_take`).
+        // would double it — refuse delivery.  A body-COMPLETED entry (the walk
+        // re-reached the consume, so this item's body already ran) must never
+        // be delivered either — that is the header-flush-without-delivery
+        // shape ([`fbw_foriter_inflight_completed_at_resume`]).  Also refuse if
+        // either journal is non-empty or an unjournaled effect stands (same
+        // signals as `fbw_foriter_inflight_take`).
         if stack[at].body_effect_since_consume
+            || stack[at].body_completed
             || fbw_store_journal_len() != 0
             || FBW_APPEND_JOURNAL.with(|j| j.borrow().len()) != 0
             || fbw_has_unjournaled_effect()
@@ -8167,6 +8186,54 @@ pub fn fbw_foriter_inflight_take_for_resume(
             return None;
         }
         Some((stack[at].item, stack[at].body_pc))
+    })
+}
+
+/// Whether the opcode at `resume_py_pc` in the live frame's code is a
+/// FOR_ITER — a non-FOR_ITER resume pc that merely happens to satisfy
+/// `body_pc == some entry.body_pc` is Shape B.
+fn foriter_header_at(frame: usize, resume_py_pc: usize) -> bool {
+    let frame_ptr = frame as *const u8;
+    let w_code =
+        unsafe { *(frame_ptr.add(crate::frame_layout::PYFRAME_PYCODE_OFFSET) as *const *const ()) };
+    if w_code.is_null() {
+        return false;
+    }
+    let raw_code = unsafe {
+        pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
+            as *const pyre_interpreter::CodeObject
+    };
+    matches!(
+        pyre_interpreter::decode_instruction_at(unsafe { &*raw_code }, resume_py_pc),
+        Some((pyre_interpreter::Instruction::ForIter { .. }, _))
+    )
+}
+
+/// #493 selector for the header-flush-without-delivery shape: `resume_py_pc`
+/// is a FOR_ITER header whose in-flight entry is body-COMPLETED — the abort
+/// fired during the NEXT consume attempt (a kept-stack guard on the FOR_ITER
+/// arms after the `for_iter_next` residual), so the consumed item's body
+/// already ran during the walk.  The walk end state at the header is then the
+/// complete post-body state: the flush adopts it WITHOUT delivering the item
+/// and the interpreter re-attempts the consume against the advanced iterator.
+/// Refuses when an effect committed since the consume (re-attempting the
+/// consume could re-apply the failed attempt's effect) — same signals as the
+/// delivery selector above.
+pub fn fbw_foriter_inflight_completed_at_resume(frame: usize, resume_py_pc: usize) -> bool {
+    let body_pc = resume_py_pc + 1;
+    if !foriter_header_at(frame, resume_py_pc) {
+        return false;
+    }
+    FBW_FORITER_INFLIGHT.with(|c| {
+        let stack = c.borrow();
+        let Some(at) = stack.iter().position(|e| e.body_pc == body_pc) else {
+            return false;
+        };
+        stack[at].body_completed
+            && !stack[at].body_effect_since_consume
+            && fbw_store_journal_len() == 0
+            && FBW_APPEND_JOURNAL.with(|j| j.borrow().len()) == 0
+            && !fbw_has_unjournaled_effect()
     })
 }
 
@@ -21391,6 +21458,10 @@ fn handle(
                             kept_stack_any_leg,
                         );
                     }
+                    // Stamp the abort coordinate at the raise point so the
+                    // walk-end branch-flush gate cannot flush the outer frame
+                    // from a callee-coordinate abort.
+                    ctx.session.borrow_mut().abort_in_subwalk = ctx.fbw_mode.inline_subwalk;
                     return Err(DispatchError::BranchGuardKeptStackUnsupported { pc: op.pc });
                 }
                 ctx.trace_ctx.record_guard(opcode, &[valuebox], 0);
