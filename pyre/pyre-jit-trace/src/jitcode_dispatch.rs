@@ -7170,22 +7170,30 @@ fn collect_outer_active_boxes(
         );
         // Portal-red routing applies only to the force-alived SCRATCH case
         // (`filter_liveness_in_place` keeps `portal_frame_reg`/`portal_ec_reg`
-        // in every `-live-` R-bank even where the color carries no value).
-        // The jitcode register allocator ALSO assigns these colors to real
-        // frame slots at other PCs (e.g. a call-result register live across a
-        // later call), where `pcdep_color_slots` maps the color to a semantic
-        // slot.  Routing such a colliding color to `sym.frame`/
-        // `sym.execution_context` encodes the wrong box: the blackhole then
-        // resumes the slot's register with the EC and feeds it to the slot's
-        // consumer (`fib(n-1) + fib(n-2)` resumed the left operand as the EC
-        // → SIGSEGV).  A color that names a live semantic slot takes the
-        // normal slot-value paths below; the EC stays recoverable from the
-        // frame (`ensure_execution_context` getfield).
+        // in every `-live-` R-bank even where the color names no frame slot).
+        // If the walk's live register bank already carries a real box, snapshot
+        // that box first: it is the direct `get_list_of_active_boxes`
+        // (`pyjitpl.py:222`) source for this live color, and bridge resume uses
+        // the same color-indexed bank to recover the EC red (`state.rs:1748`).
+        // Fall back to the named red field only when the bank is empty.  If both
+        // are empty, the force-alived red is dead at this capture point, so encode
+        // `CONST_NULL` (history.py:361), matching the union-liveness arm below.
+        //
+        // The jitcode register allocator ALSO assigns these colors to real frame
+        // slots at other PCs (e.g. a call-result register live across a later
+        // call), where `pcdep_color_slots` maps the color to a semantic slot.
+        // Routing such a colliding color to `sym.frame`/`sym.execution_context`
+        // encodes the wrong box; a color that names a live semantic slot therefore
+        // takes the normal slot-value paths below.
         let is_portal_red_scratch = semantic_idx.is_none()
             && ((color as u16 == portal_frame_reg && portal_frame_reg != u16::MAX)
                 || (color as u16 == portal_ec_reg && portal_ec_reg != u16::MAX));
         let value = if is_portal_red_scratch {
-            if color as u16 == portal_frame_reg {
+            let live_reg = regs_r
+                .get(color)
+                .copied()
+                .filter(|&v| v != OpRef::NONE && !opref_is_null_const_ptr(v));
+            let red_field = if color as u16 == portal_frame_reg {
                 sym.frame
             } else if !sym.execution_context.is_none() {
                 // EC red already seeded on this snapshot path.
@@ -7222,7 +7230,13 @@ fn collect_outer_active_boxes(
                 // downstream Ref-bank NONE guard surfaces the unrecoverable case
                 // instead of silently masking it.
                 sym.execution_context
-            }
+            };
+            live_reg
+                .or_else(|| {
+                    (red_field != OpRef::NONE && !opref_is_null_const_ptr(red_field))
+                        .then_some(red_field)
+                })
+                .unwrap_or_else(|| OpRef::const_ptr(majit_ir::GcRef(0)))
         } else if owns_vable {
             match semantic_idx {
                 Some(s_idx) if s_idx < nlocals + valid_stack_only => {
