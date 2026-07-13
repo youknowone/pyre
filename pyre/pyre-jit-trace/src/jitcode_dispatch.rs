@@ -17353,6 +17353,9 @@ fn try_walker_specialize_unpack(
 ///   * `guard_class(obj, &INSTANCE_TYPE)` — the receiver is a `W_ObjectObject`
 ///     (so the `map`/`storage` field reads below are valid; `mapdict.py:1495`
 ///     `if map is not None:` also filters non-instances at trace time).
+///   * `guard_value(getfield_gc_i(w_type, version_tag), C_version_tag)` — pins
+///     the class lookup result so a later descriptor or `__getattribute__`
+///     mutation deopts on trace re-entry.
 ///   * `guard_value(getfield_gc_i(obj, map), C_map)` — `jit.promote(self.map)`
 ///     (`mapdict.py:905`); pins the exact instance shape so `find_map_attr`
 ///     const-folds `storageindex` to a green constant.
@@ -17394,7 +17397,7 @@ fn try_walker_specialize_load_attr(
     };
     // `mapdict.py:1495-1533` resolution, returning the fold ingredients (the
     // read is left to the caller so it can be folded to a guarded inline read).
-    let Some((_w_type, _version_tag, map, storageindex)) = (unsafe {
+    let Some((w_type, version_tag, map, storageindex)) = (unsafe {
         pyre_interpreter::objspace::std::mapdict::load_attr_fast_path(concrete_obj, &name)
     }) else {
         return Ok(None);
@@ -17412,6 +17415,27 @@ fn try_walker_specialize_load_attr(
             .heap_cache_mut()
             .class_now_known(obj, instance_type_addr);
     }
+
+    // The instance map pins the storage layout, but class mutation can change
+    // lookup precedence without changing that map. Re-read the receiver type's
+    // live version tag at every trace entry and deopt before the inline storage
+    // read when it changes.
+    let w_type_const = ctx.trace_ctx.const_ref(w_type as i64);
+    let version_op = crate::state::opimpl_getfield_gc_i(
+        ctx.trace_ctx,
+        w_type_const,
+        crate::descr::type_version_tag_descr(),
+    );
+    let version_const = ctx.trace_ctx.const_int(version_tag as i64);
+    walker_emit_fold_guard_with_snapshot(
+        ctx,
+        op_pc,
+        OpCode::GuardValue,
+        &[version_op, version_const],
+    )?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .replace_box(version_op, version_const);
 
     // guard_value(getfield_gc_i(obj, map), C_map): `jit.promote(self.map)`
     // (`mapdict.py:905-906`).  The map nodes are interned + immortal, so the
