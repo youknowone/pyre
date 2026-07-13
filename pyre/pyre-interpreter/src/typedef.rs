@@ -2366,28 +2366,36 @@ fn init_list_type(ns: &mut DictStorage) {
     }
 }
 
-/// Coerce a `list * n` / `list *= n` repeat count through `__index__`
-/// (`space.getindex_w`).  An operand without `__index__` yields `None`, which
-/// the caller maps to NotImplemented so the `*`/`*=` operator can try a
-/// reflected `__rmul__` and otherwise emit the "can't multiply sequence by
-/// non-int" message; any other coercion error propagates.
+/// `space.getindex_w(w_obj, space.w_OverflowError)`: run `w_obj.__index__()`
+/// and return the resulting int/long object, converting an out-of-index-range
+/// value to an `OverflowError` that names the ORIGINAL operand (not the
+/// `__index__` result). A non-`__index__` operand raises the `TypeError` from
+/// `space.index`. Callers that repeat a sequence share this so `str`/`tuple`
+/// honour a custom `__index__` exactly like `list`/`bytes`.
+fn getindex_repeat(w_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    let w_count = crate::baseobjspace::space_index(w_obj)?;
+    match crate::baseobjspace::int_w(w_count) {
+        Ok(_) => Ok(w_count),
+        Err(e) if e.kind == crate::PyErrorKind::OverflowError => Err(crate::PyError::new(
+            crate::PyErrorKind::OverflowError,
+            format!(
+                "cannot fit '{}' into an index-sized integer",
+                crate::baseobjspace::object_functionstr_type_name(w_obj)
+            ),
+        )),
+        Err(e) => Err(e),
+    }
+}
+
+/// Coerce a `list`/`tuple` `* n` / `*= n` repeat count through `getindex_repeat`
+/// (`getindex_w`). An operand without `__index__` yields `None`, which the
+/// caller maps to NotImplemented so the `*`/`*=` operator can try a reflected
+/// `__rmul__` and otherwise emit the "can't multiply sequence by non-int"
+/// message; any other coercion error propagates. This is `descr_mul`'s
+/// `try/except TypeError -> NotImplemented` wrapper (`listobject.py`).
 fn list_repeat_index(w_obj: PyObjectRef) -> Result<Option<PyObjectRef>, crate::PyError> {
-    match crate::baseobjspace::space_index(w_obj) {
-        Ok(w_count) => {
-            // getindex_w(w_obj, OverflowError): an out-of-index-range value
-            // reports the original operand's type, not the __index__ result.
-            match crate::baseobjspace::int_w(w_count) {
-                Ok(_) => Ok(Some(w_count)),
-                Err(e) if e.kind == crate::PyErrorKind::OverflowError => Err(crate::PyError::new(
-                    crate::PyErrorKind::OverflowError,
-                    format!(
-                        "cannot fit '{}' into an index-sized integer",
-                        crate::baseobjspace::object_functionstr_type_name(w_obj)
-                    ),
-                )),
-                Err(e) => Err(e),
-            }
-        }
+    match getindex_repeat(w_obj) {
+        Ok(w_count) => Ok(Some(w_count)),
         Err(e) if e.kind == crate::PyErrorKind::TypeError => Ok(None),
         Err(e) => Err(e),
     }
@@ -2852,14 +2860,15 @@ fn init_str_type(ns: &mut DictStorage) {
             "__mul__",
             |args| {
                 crate::type_methods::arity_slot(args, 1)?;
-                if unsafe { pyre_object::pyobject::is_int_or_long(args[1]) } {
-                    unsafe { crate::objspace::descroperation::str_repeat(args[0], args[1]) }
+                // unicodeobject descr_mul = getindex_w (no NotImplemented
+                // wrapper), so a non-__index__ operand raises and a custom
+                // __index__ (incl. an out-of-range one) is honoured.
+                let w_count = if unsafe { pyre_object::pyobject::is_int_or_long(args[1]) } {
+                    args[1]
                 } else {
-                    let count = crate::builtins::space_index_w(args[1])?;
-                    unsafe {
-                        crate::objspace::descroperation::str_repeat(args[0], w_int_new(count))
-                    }
-                }
+                    getindex_repeat(args[1])?
+                };
+                unsafe { crate::objspace::descroperation::str_repeat(args[0], w_count) }
             },
             2,
         ),
@@ -5031,14 +5040,15 @@ fn init_tuple_type(ns: &mut DictStorage) {
 /// raises the `__index__` TypeError.
 fn tuple_descr_mul(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::arity_slot(args, 1)?;
-    if unsafe { pyre_object::pyobject::is_int_or_long(args[1]) } {
-        crate::objspace::descroperation::mul(args[0], args[1])
-    } else {
-        // NotImplemented lets the `*` operator try a reflected `__rmul__`
-        // and otherwise emit the "can't multiply sequence by non-int"
-        // message, instead of this method's own slot error.
-        Ok(pyre_object::w_not_implemented())
-    }
+    // tupleobject descr_mul routes the count through getindex_w, so a custom
+    // __index__ repeats the tuple (and an out-of-range one overflows).
+    // A non-__index__ operand yields NotImplemented, letting the `*` operator
+    // try a reflected `__rmul__` and otherwise emit "can't multiply sequence by
+    // non-int", instead of this method's own slot error.
+    let Some(w_count) = list_repeat_index(args[1])? else {
+        return Ok(pyre_object::w_not_implemented());
+    };
+    crate::objspace::descroperation::mul(args[0], w_count)
 }
 
 // ── Int/Float/Bool TypeDef (minimal) ─────────────────────────────────
