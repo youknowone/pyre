@@ -159,6 +159,8 @@ pub struct JitInterpConfig {
     /// (e.g. `val_add`) is still visible, so this config rewrites it to a
     /// native IR binop at codewriter time.
     pub native_int_binops: Vec<(Path, Ident)>,
+    /// native_tag_small = { jit_retag_small } — unary fns lowered to (x<<1)|1 native IR.
+    pub native_tag_small: Vec<Path>,
     /// Opt-in: route pure forward-advancing dispatch arms (those whose body
     /// only does work then `pc += N`, with no back-edge / `can_enter_jit!` /
     /// early return) through the per-arm sub-JitCode path with a pc-returning
@@ -545,6 +547,7 @@ impl Parse for JitInterpConfig {
         let mut call_returns: Vec<(Path, Path)> = Vec::new();
         let mut struct_allocs: Vec<(Path, Path)> = Vec::new();
         let mut native_int_binops: Vec<(Path, Ident)> = Vec::new();
+        let mut native_tag_small: Vec<Path> = Vec::new();
         let mut split_dispatch = false;
         let mut switch_dispatch = false;
 
@@ -611,6 +614,9 @@ impl Parse for JitInterpConfig {
                 "native_int_binops" => {
                     native_int_binops = parse_native_int_binops_map(input)?;
                 }
+                "native_tag_small" => {
+                    native_tag_small = parse_native_tag_small_list(input)?;
+                }
                 "split_dispatch" => {
                     split_dispatch = input.parse::<LitBool>()?.value;
                 }
@@ -666,6 +672,7 @@ impl Parse for JitInterpConfig {
             call_returns,
             struct_allocs,
             native_int_binops,
+            native_tag_small,
             split_dispatch,
             switch_dispatch,
         })
@@ -744,6 +751,18 @@ fn parse_native_int_binops_map(input: ParseStream) -> syn::Result<Vec<(Path, Ide
         content.parse::<Token![=>]>()?;
         let opcode: Ident = content.parse()?;
         entries.push((func_path, opcode));
+        let _ = content.parse::<Token![,]>();
+    }
+    Ok(entries)
+}
+
+fn parse_native_tag_small_list(input: ParseStream) -> syn::Result<Vec<Path>> {
+    let content;
+    braced!(content in input);
+    let mut entries = Vec::new();
+    while !content.is_empty() {
+        let func_path: Path = content.parse()?;
+        entries.push(func_path);
         let _ = content.parse::<Token![,]>();
     }
     Ok(entries)

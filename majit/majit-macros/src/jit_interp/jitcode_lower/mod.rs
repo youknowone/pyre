@@ -202,6 +202,9 @@ pub struct LowererConfig {
     /// key, it emits the named IR opcode directly — bypassing the call-policy
     /// machinery.  jtransform.py:2030 `_handle_int_special()` parity.
     pub(super) native_int_binops: Vec<(Vec<String>, String)>,
+    /// Pure unary tag-small helpers.  Key = canonical func path segments.
+    /// `lower_native_tag_small_call` emits `(x << 1) | 1` directly.
+    pub(super) native_tag_small: Vec<Vec<String>>,
     /// Source: `JitInterpConfig.split_dispatch`.  When set, the dispatch lowerer
     /// routes pure forward-advancing green-pc arms through the per-arm
     /// sub-JitCode path with a pc-returning `inline_call_<types>_i` instead of
@@ -826,6 +829,7 @@ impl LowererConfig {
         ref_fields: &[crate::jit_interp::RefFieldEntry],
         call_returns: &[(Path, Path)],
         native_int_binops: &[(Path, Ident)],
+        native_tag_small: &[Path],
         split_dispatch: bool,
         switch_dispatch: bool,
     ) -> Self {
@@ -1023,6 +1027,10 @@ impl LowererConfig {
             native_int_binops: native_int_binops
                 .iter()
                 .map(|(path, op)| (canonical_path_segments(path), op.to_string()))
+                .collect(),
+            native_tag_small: native_tag_small
+                .iter()
+                .map(canonical_path_segments)
                 .collect(),
             split_dispatch,
             switch_dispatch,

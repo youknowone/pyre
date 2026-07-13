@@ -159,6 +159,9 @@ impl<'c> Lowerer<'c> {
                 if let Some(binding) = self.lower_native_int_binop_call(call) {
                     return Some(binding);
                 }
+                if let Some(binding) = self.lower_native_tag_small_call(call) {
+                    return Some(binding);
+                }
                 // Raw native-memory load intrinsic `majit_raw_load_i64(base, ea)`
                 // → raw_load_i (jtransform.py:1165-1171 rewrite_op_raw_load).
                 if let Some(binding) = self.lower_raw_load_call(call) {
@@ -1591,6 +1594,64 @@ impl<'c> Lowerer<'c> {
             reg,
             kind: BindingKind::Int,
             depends_on_stack: lhs.depends_on_stack || rhs.depends_on_stack,
+            struct_type: None,
+        })
+    }
+
+    /// Recognize a unary function call registered in `native_tag_small` and
+    /// emit native `(x << 1) | 1` IR (IntLshift then IntOr) instead of a CallI.
+    /// The concrete/naive path calls the original fn normally.
+    fn lower_native_tag_small_call(&mut self, call: &ExprCall) -> Option<Binding> {
+        let config = self.config?;
+        let func_segments = canonical_expr_segments(&call.func)?;
+        if !config
+            .native_tag_small
+            .iter()
+            .any(|path| *path == func_segments)
+        {
+            return None;
+        }
+        if call.args.len() != 1 {
+            return None;
+        }
+
+        let inner = self.lower_value_expr(&call.args[0])?;
+        if !matches!(inner.kind, BindingKind::Int) {
+            return None;
+        }
+
+        let x_reg = inner.reg;
+        let one_reg = self.alloc_reg();
+        self.emit_op(
+            OpMeta::linear(OpKind::LoadConstI, vec![], vec![Register::int(one_reg)]),
+            quote! { __builder.load_const_i_value(#one_reg, 1i64); },
+        );
+
+        let shl_reg = self.alloc_reg();
+        let lshift = syn::Ident::new("IntLshift", proc_macro2::Span::call_site());
+        self.emit_op(
+            OpMeta::linear(
+                OpKind::BinopI,
+                Register::ints(&[x_reg, one_reg]),
+                vec![Register::int(shl_reg)],
+            ),
+            binop_i_emit_tokens(shl_reg, &lshift, x_reg, one_reg),
+        );
+
+        let res_reg = self.alloc_reg();
+        let or = syn::Ident::new("IntOr", proc_macro2::Span::call_site());
+        self.emit_op(
+            OpMeta::linear(
+                OpKind::BinopI,
+                Register::ints(&[shl_reg, one_reg]),
+                vec![Register::int(res_reg)],
+            ),
+            binop_i_emit_tokens(res_reg, &or, shl_reg, one_reg),
+        );
+        Some(Binding {
+            reg: res_reg,
+            kind: BindingKind::Int,
+            depends_on_stack: inner.depends_on_stack,
             struct_type: None,
         })
     }
