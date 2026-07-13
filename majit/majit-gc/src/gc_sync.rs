@@ -75,29 +75,6 @@ static GC_SYNC: GcSync = GcSync {
     stw_generation: AtomicUsize::new(0),
 };
 
-thread_local! {
-    /// > 0 while this thread already holds exclusive GC access via a
-    /// slow-path `gc_op_slow` or a `request_stw` collection. Nested
-    /// `gc_op`/`gc_query` on the same thread then run directly on the
-    /// singleton instead of re-locking the non-reentrant `gc_mutex`.
-    static GATE_HELD_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-struct GateHeldGuard;
-
-impl GateHeldGuard {
-    fn enter() -> Self {
-        GATE_HELD_DEPTH.with(|c| c.set(c.get() + 1));
-        GateHeldGuard
-    }
-}
-
-impl Drop for GateHeldGuard {
-    fn drop(&mut self) {
-        GATE_HELD_DEPTH.with(|c| c.set(c.get() - 1));
-    }
-}
-
 // ──────────────────────────────────────────────────────────────
 // Singleton management
 // ──────────────────────────────────────────────────────────────
@@ -376,13 +353,6 @@ pub fn stw_required() -> bool {
 /// Single-threaded production always takes the fast path.
 #[inline]
 pub fn gc_op<R>(f: impl FnOnce(&mut dyn GcAllocator) -> R) -> R {
-    if GATE_HELD_DEPTH.with(|c| c.get()) > 0 {
-        // This thread already holds exclusive GC access during collection.
-        // SAFETY: gc_mutex is held by this thread, so there is no concurrent
-        // access to the singleton.
-        return f(unsafe { singleton_mut() });
-    }
-
     let ident = my_ident();
     debug_assert!(
         !in_gc_op(),
@@ -470,7 +440,6 @@ fn gc_op_slow<R>(f: impl FnOnce(&mut dyn GcAllocator) -> R) -> R {
     }
 
     let result = {
-        let _held = GateHeldGuard::enter();
         let _op = OpGuard::enter();
         // There is deliberately no exit park. A returned reference is rooted
         // by the caller before its next entry-style safepoint, matching the
@@ -665,11 +634,12 @@ mod tests {
     }
 
     #[test]
-    fn nested_gc_query_inside_slow_path_gc_op_does_not_deadlock() {
+    fn nested_reentrant_query_inside_gc_op_reads_singleton() {
         ensure_gc();
         register_thread();
-        // Outer gc_op holds gc_mutex; the nested gc_query must not re-lock it.
-        let ok = gc_op(|_outer| gc_query(|gc| !gc.nursery_free().is_null()));
+        // The reentrant query reads the singleton directly instead of
+        // re-entering the operation gate.
+        let ok = gc_op(|_outer| gc_query_reentrant(|gc| !gc.nursery_free().is_null()));
         assert!(ok);
         unregister_thread();
     }
