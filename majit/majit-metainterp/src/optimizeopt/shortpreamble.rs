@@ -457,6 +457,12 @@ pub struct ShortBoxes {
     /// per producer, so the same position yields the same object. Const
     /// results never key this map (they route to `const_short_boxes`).
     potential_ops: IndexMap<majit_ir::operand::Operand, PotentialShortOp>,
+    /// Mirrors `to_opref()` for every key ever inserted into `potential_ops`
+    /// (which is insert-only; same-key overwrites keep the same opref), so
+    /// membership equals the old linear scan `any(k.to_opref() == opref)`.
+    /// Parity anchor: shortpreamble.py:290 `op in self.potential_ops` is
+    /// dict membership.
+    potential_op_oprefs: IndexSet<OpRef>,
     /// shortpreamble.py:250 self.produced_short_boxes = {}
     /// (insertion order preserved by IndexMap for deterministic export.)
     /// Keyed by the result Box (`shortop.res`), compared by object
@@ -583,6 +589,7 @@ impl ShortBoxes {
     pub fn new(num_label_args: usize) -> Self {
         ShortBoxes {
             potential_ops: IndexMap::new(),
+            potential_op_oprefs: IndexSet::new(),
             produced_short_boxes: IndexMap::new(),
             const_short_boxes: Vec::new(),
             known_constants: IndexSet::new(),
@@ -621,10 +628,7 @@ impl ShortBoxes {
     pub fn is_reachable(&self, opref: OpRef) -> bool {
         self.label_args.iter().any(|&a| a == opref)
             || opref.is_constant()
-            || self
-                .potential_ops
-                .iter()
-                .any(|(k, _)| k.to_opref() == opref)
+            || self.potential_op_oprefs.contains(&opref)
     }
 
     pub fn note_known_constant(&mut self, opref: OpRef) {
@@ -636,6 +640,7 @@ impl ShortBoxes {
     }
 
     fn add_op(&mut self, key: majit_ir::operand::Operand, pop: PotentialShortOp) {
+        self.potential_op_oprefs.insert(key.to_opref());
         self.potential_ops.insert(key, pop);
     }
 
@@ -756,6 +761,7 @@ impl ShortBoxes {
         // shortpreamble.py:259 `self.potential_ops[box] = ShortInputArg(...)`
         // — keyed by the label-arg Box itself; `arg_res` is its canonical
         // (producer-bound) operand, shared with `res`.
+        self.potential_op_oprefs.insert(arg_res.to_opref());
         self.potential_ops.insert(
             arg_res.clone(),
             PotentialShortOp::Preamble(PreambleOp {
@@ -828,11 +834,7 @@ impl ShortBoxes {
         if self.known_constants.contains(&opref) {
             return Some(ctx.materialize_operand_at(opref));
         }
-        if self
-            .potential_ops
-            .iter()
-            .any(|(k, _)| k.to_opref() == opref)
-        {
+        if self.potential_op_oprefs.contains(&opref) {
             // shortpreamble.py:291-294 `r = self.add_op_to_short(...);
             // return r.preamble_op`. ShortInputArg: renamed short_inputargs
             // box, see the produced arm above.
