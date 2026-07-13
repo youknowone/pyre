@@ -796,9 +796,6 @@ pub fn skip_python_trivia_forward_public(
 /// Translate a resume-frame pc word to a Python instruction coordinate.
 pub fn backxlat_py_pc(jitcode_index: i32, pc_word: i32) -> i32 {
     let fallback = majit_ir::resumedata::decode_resume_pc(pc_word).0;
-    if !majit_ir::resumedata::m369_pcword_flip_enabled() {
-        return fallback;
-    }
     python_pc_for_jitcode_pc_public(jitcode_index, pc_word)
         .and_then(|raw_py_pc| skip_python_trivia_forward_public(jitcode_index, raw_py_pc))
         .map(|(py_pc, _)| py_pc)

@@ -11314,20 +11314,16 @@ fn walker_capture_inline_nonstandard_vable_guard(
     // frame resumes through the Python pc → jitcode resume-translation path.
     // This sentinel-twin writer is corpus-untested.
     let nsvable_word = majit_ir::resumedata::NO_JITCODE_PC;
-    let nsvable_pc_word = if majit_ir::resumedata::m369_pcword_flip_enabled() {
-        crate::state::pyjitcode_for_jitcode_index(ctx.outer_jitcode_index as i32)
-            .and_then(|payload| {
-                payload.resolve_resume_pc_with_jitcode_pc(
-                    ctx.entry_py_pc as i32,
-                    nsvable_word,
-                    crate::state::op_live(),
-                )
-            })
-            .map(|offset| offset as u32)
-            .unwrap_or(ctx.entry_py_pc)
-    } else {
-        ctx.entry_py_pc
-    };
+    let nsvable_pc_word = crate::state::pyjitcode_for_jitcode_index(ctx.outer_jitcode_index as i32)
+        .and_then(|payload| {
+            payload.resolve_resume_pc_with_jitcode_pc(
+                ctx.entry_py_pc as i32,
+                nsvable_word,
+                crate::state::op_live(),
+            )
+        })
+        .map(|offset| offset as u32)
+        .unwrap_or(ctx.entry_py_pc);
     m73_sentinel_word_census(
         "nsvable",
         ctx.outer_jitcode_index,
@@ -12502,19 +12498,15 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 ctx.vstack_valid.then_some(ctx.vstack_boxes.as_slice()),
                 scope.branch_guard_kept_recovered,
             );
-            let pc_word = if majit_ir::resumedata::m369_pcword_flip_enabled() {
-                let payload = unsafe { &(&*sym.jitcode).payload };
-                payload
-                    .resolve_resume_pc_with_jitcode_pc(
-                        resume_py_pc as i32,
-                        guard_jitcode_pc,
-                        crate::state::op_live(),
-                    )
-                    .map(|offset| offset as u32)
-                    .unwrap_or(resume_py_pc)
-            } else {
-                resume_py_pc
-            };
+            let payload = unsafe { &(&*sym.jitcode).payload };
+            let pc_word = payload
+                .resolve_resume_pc_with_jitcode_pc(
+                    resume_py_pc as i32,
+                    guard_jitcode_pc,
+                    crate::state::op_live(),
+                )
+                .map(|offset| offset as u32)
+                .unwrap_or(resume_py_pc);
             m73_sentinel_word_census("main", jitcode_index, resume_py_pc, guard_jitcode_pc);
             ctx.trace_ctx
                 .capture_snapshot_for_last_guard_with_vable_vref(
@@ -12572,20 +12564,16 @@ fn walker_capture_snapshot_for_last_guard_impl(
     } else {
         majit_ir::resumedata::NO_JITCODE_PC
     };
-    let arm_pc_word = if majit_ir::resumedata::m369_pcword_flip_enabled() {
-        crate::state::pyjitcode_for_jitcode_index(ctx.outer_jitcode_index as i32)
-            .and_then(|payload| {
-                payload.resolve_resume_pc_with_jitcode_pc(
-                    ctx.entry_py_pc as i32,
-                    arm_word,
-                    crate::state::op_live(),
-                )
-            })
-            .map(|offset| offset as u32)
-            .unwrap_or(ctx.entry_py_pc)
-    } else {
-        ctx.entry_py_pc
-    };
+    let arm_pc_word = crate::state::pyjitcode_for_jitcode_index(ctx.outer_jitcode_index as i32)
+        .and_then(|payload| {
+            payload.resolve_resume_pc_with_jitcode_pc(
+                ctx.entry_py_pc as i32,
+                arm_word,
+                crate::state::op_live(),
+            )
+        })
+        .map(|offset| offset as u32)
+        .unwrap_or(ctx.entry_py_pc);
     m73_sentinel_word_census("arm", ctx.outer_jitcode_index, ctx.entry_py_pc, arm_word);
     ctx.trace_ctx
         .capture_snapshot_for_last_guard_with_vable_vref(
@@ -13213,20 +13201,16 @@ fn walker_capture_multi_frame_inline_snapshot(
             majit_ir::resumedata::NO_JITCODE_PC
         };
         m73_sentinel_word_census("mfparent", pf.jitcode_index, pf.resume_py_pc, pf_word);
-        let pf_pc_word = if majit_ir::resumedata::m369_pcword_flip_enabled() {
-            crate::state::pyjitcode_for_jitcode_index(pf.jitcode_index as i32)
-                .and_then(|payload| {
-                    payload.resolve_resume_pc_with_jitcode_pc(
-                        pf.resume_py_pc as i32,
-                        pf_word,
-                        crate::state::op_live(),
-                    )
-                })
-                .map(|offset| offset as u32)
-                .unwrap_or(pf.resume_py_pc)
-        } else {
-            pf.resume_py_pc
-        };
+        let pf_pc_word = crate::state::pyjitcode_for_jitcode_index(pf.jitcode_index as i32)
+            .and_then(|payload| {
+                payload.resolve_resume_pc_with_jitcode_pc(
+                    pf.resume_py_pc as i32,
+                    pf_word,
+                    crate::state::op_live(),
+                )
+            })
+            .map(|offset| offset as u32)
+            .unwrap_or(pf.resume_py_pc);
         frames.push((pf.jitcode_index, pf_pc_word, pf_word, pf.boxes.as_slice()));
     }
     if m73_marker_audit_enabled() {
@@ -13259,20 +13243,16 @@ fn walker_capture_multi_frame_inline_snapshot(
         callee_py_pc,
         callee_jitcode_pc,
     );
-    let callee_pc_word = if majit_ir::resumedata::m369_pcword_flip_enabled() {
-        crate::state::pyjitcode_for_jitcode_index(callee_jitcode_index)
-            .and_then(|payload| {
-                payload.resolve_resume_pc_with_jitcode_pc(
-                    callee_py_pc as i32,
-                    callee_jitcode_pc,
-                    crate::state::op_live(),
-                )
-            })
-            .map(|offset| offset as u32)
-            .unwrap_or(callee_py_pc)
-    } else {
-        callee_py_pc
-    };
+    let callee_pc_word = crate::state::pyjitcode_for_jitcode_index(callee_jitcode_index)
+        .and_then(|payload| {
+            payload.resolve_resume_pc_with_jitcode_pc(
+                callee_py_pc as i32,
+                callee_jitcode_pc,
+                crate::state::op_live(),
+            )
+        })
+        .map(|offset| offset as u32)
+        .unwrap_or(callee_py_pc);
     frames.push((
         callee_jitcode_index as u32,
         callee_pc_word,

@@ -7594,17 +7594,10 @@ pub(crate) fn decode_and_restore_guard_failure(
         // innermost decoded section position.
         let ni = jit_state.next_instr();
         let innermost = resumed_frames.last();
-        let resume_pc = if majit_ir::resumedata::m369_pcword_flip_enabled() {
-            if resumed_frames.len() == 1 {
-                ni
-            } else {
-                innermost.map(|f| f.py_pc).unwrap_or(ni)
-            }
+        let resume_pc = if resumed_frames.len() == 1 {
+            ni
         } else {
-            innermost
-                .map(|f| f.py_pc)
-                .filter(|&section_pc| section_pc != ni)
-                .unwrap_or(ni)
+            innermost.map(|f| f.py_pc).unwrap_or(ni)
         };
         // When the resume pc is overridden to the innermost section's
         // `py_pc` (a multi-frame inlined-callee guard), the positional
