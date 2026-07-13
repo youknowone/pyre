@@ -477,7 +477,11 @@ unsafe fn int_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         return Err(PyError::zero_division("integer modulo by zero"));
     }
     // Python modulo: result has the same sign as the divisor.
-    let r = va % vb;
+    // i64::MIN % -1 overflows → fall back to BigInt (result is 0).
+    let r = match va.checked_rem(vb) {
+        Some(r) => r,
+        None => return Ok(bigint_result(BigInt::from(va).mod_floor(&BigInt::from(vb)))),
+    };
     let r = if r != 0 && (r ^ vb) < 0 { r + vb } else { r };
     Ok(w_int_new(r))
 }
