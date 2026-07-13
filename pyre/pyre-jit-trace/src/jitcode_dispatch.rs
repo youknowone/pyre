@@ -8419,6 +8419,7 @@ struct FbwStoreJournalRootArea {
     appends: *const std::cell::RefCell<Vec<(pyre_object::PyObjectRef, usize)>>,
     abort_overrides: *const std::cell::RefCell<Vec<(usize, pyre_object::PyObjectRef)>>,
     cell_stores: *const std::cell::RefCell<Vec<(pyre_object::PyObjectRef, i64)>>,
+    sys_exc: *const std::cell::RefCell<Vec<pyre_object::PyObjectRef>>,
     foriter: *const std::cell::RefCell<Vec<InflightForiter>>,
     abort_resume: *const std::cell::RefCell<Option<InlineAbortCarrier>>,
     active_session: *const std::cell::Cell<*const std::cell::RefCell<WalkSession>>,
@@ -8430,6 +8431,7 @@ thread_local! {
         appends: FBW_APPEND_JOURNAL.with(|value| value as *const _),
         abort_overrides: FBW_ABORT_OUTER_STACK_OVERRIDES.with(|value| value as *const _),
         cell_stores: FBW_CELL_STORE_JOURNAL.with(|value| value as *const _),
+        sys_exc: FBW_SYS_EXC_JOURNAL.with(|value| value as *const _),
         foriter: FBW_FORITER_INFLIGHT.with(|value| value as *const _),
         abort_resume: FBW_ABORT_CALL_RESUME.with(|value| value as *const _),
         active_session: ACTIVE_WALK_SESSION.with(|value| value as *const _),
@@ -9237,13 +9239,12 @@ pub unsafe fn fbw_store_journal_root_walker_area(
     // nursery-resident and no longer referenced elsewhere once the eager store
     // overwrote the EC slot; forward each so a minor collection during the rest
     // of the walk cannot free/move the value the rollback restores.
-    FBW_SYS_EXC_JOURNAL.with(|j| {
-        for displaced in j.borrow_mut().iter_mut() {
-            // SAFETY: `PyObjectRef` and `GcRef` share the usize repr; the
-            // borrow keeps the Vec storage alive for the visit.
-            visitor(unsafe { &mut *(displaced as *mut pyre_object::PyObjectRef).cast() });
-        }
-    });
+    let sys_exc = unsafe { &mut *(*area.sys_exc).as_ptr() };
+    for displaced in sys_exc.iter_mut() {
+        // SAFETY: `PyObjectRef` and `GcRef` share the usize repr; the
+        // borrowed area keeps the Vec storage alive for the visit.
+        visitor(unsafe { &mut *(displaced as *mut pyre_object::PyObjectRef).cast() });
+    }
     // #57 Option C: each captured in-flight FOR_ITER item is nursery-resident
     // across the rest of the walk (subsequent residual calls allocate and a
     // minor collection moves nursery objects), so forward every entry's item
