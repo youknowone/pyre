@@ -2344,7 +2344,15 @@ impl majit_backend::Backend for WasmBackend {
                     .collect();
 
                 // Done reading the frame; release it from the jf shadow stack
-                // (it becomes collectible) and free the gcmap.
+                // (it becomes collectible) and free the gcmap. Null the frame's
+                // jf_gcmap before dropping the gcmap Box: the old-gen frame can
+                // outlive this call still marked VISITED (grayed while it was a
+                // root at a major-cycle start), reachable through the major
+                // gray stack or the remembered set. A later collection would
+                // then custom-trace it and read the freed gcmap. A null gcmap
+                // makes jitframe_trace forward nothing (jitframe.py:115-116),
+                // which is correct here: the outputs were already read out.
+                unsafe { (*jf).jf_gcmap = std::ptr::null() };
                 majit_gc::shadow_stack::pop_jf_to(saved);
                 drop(gcmap);
 
