@@ -548,6 +548,10 @@ unsafe fn p_recursive_issubclass_w(
 /// looked up via `space.lookup(w_klass_or_tuple, "__instancecheck__")`,
 /// then the abstract `__class__`/`__bases__` walk.
 pub fn isinstance(obj: PyObjectRef, classinfo: PyObjectRef) -> Result<bool, PyError> {
+    // Nested tuple / union classinfo recurses in native Rust with no
+    // Python frame push, so guard the C stack here or a deep classinfo
+    // blows it before any frame-level check fires.
+    crate::stack_check::stack_check()?;
     unsafe {
         // abstractinst.py:104-106 — quick exact-type test.
         if let Some(t) = crate::typedef::r#type(obj) {
@@ -613,6 +617,10 @@ pub fn isinstance(obj: PyObjectRef, classinfo: PyObjectRef) -> Result<bool, PyEr
 /// Tuple/union recursion, `__subclasscheck__` override looked up on
 /// `type(classinfo)`, then the abstract `__bases__` walk.
 pub fn issubclass(derived: PyObjectRef, classinfo: PyObjectRef) -> Result<bool, PyError> {
+    // Nested tuple / union classinfo recurses in native Rust with no
+    // Python frame push, so guard the C stack here or a deep classinfo
+    // blows it before any frame-level check fires.
+    crate::stack_check::stack_check()?;
     unsafe {
         // abstractinst.py:181-187 — tuple recursion.
         if is_tuple(classinfo) {
