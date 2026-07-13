@@ -12,10 +12,10 @@ mod lowerer;
 pub use api::GeneratedJitCodeBody;
 #[allow(unused_imports)]
 pub(crate) use api::{
-    CallerLocalLayout, assign_caller_local_layout, generate_inline_helper_jitcode_with_calls,
+    assign_caller_local_layout, generate_inline_helper_jitcode_with_calls,
     inline_helper_param_counts, inline_helper_param_layout,
     try_generate_jitcode_body_parts_with_caller_bindings,
-    try_generate_jitcode_pc_return_body_with_caller_bindings,
+    try_generate_jitcode_pc_return_body_with_caller_bindings, CallerLocalLayout,
 };
 #[allow(unused_imports)]
 pub use api::{try_generate_jitcode_body, try_generate_jitcode_body_with_config};

@@ -15,10 +15,11 @@ pub(crate) mod jitcode_lower;
 use proc_macro2::TokenStream;
 use quote::quote;
 use syn::{
-    Expr, Ident, ItemFn, LitBool, Path, Token, braced, bracketed,
+    braced, bracketed,
     ext::IdentExt,
     parse::{Parse, ParseStream},
     punctuated::Punctuated,
+    Expr, Ident, ItemFn, LitBool, Path, Token,
 };
 
 /// Parsed configuration from `#[jit_interp(...)]` attributes.
@@ -1291,6 +1292,9 @@ fn generate_merge_wrapper(config: &JitInterpConfig, func: &ItemFn) -> TokenStrea
             __driver.merge_point(|__meta, __sym| {
                 use majit_metainterp::JitCodeSym;
                 if __sym.trace_started && __pc == __sym.loop_header_pc() {
+                    if let Some(__ctx) = __meta.trace_ctx() {
+                        __ctx.walk_final_pc = Some(__pc);
+                    }
                     return majit_metainterp::TraceAction::CloseLoop;
                 }
                 // Slice X-D production wire-up: split-borrow the active
@@ -2079,18 +2083,21 @@ fn rewrite_body(
                                     // Direct-entry: run the loop the walk just
                                     // compiled with the walk-final state so the
                                     // compiled steady-state advances PAST the
-                                    // walked span instead of re-interpreting it
-                                    // (the native back-edges never key the walk's
-                                    // merge-point header, so the compiled inner
-                                    // loop is otherwise unreachable). Falls back to
-                                    // the close pc when nothing compiled / the run
-                                    // could not start.
-                                    #pc = #driver
-                                        .try_resume_into_compiled_loop(
-                                            __sp_pc, &mut #state, #env,
-                                        )
-                                        .unwrap_or(__sp_pc);
-                                    continue;
+                                    // walked span instead of re-interpreting it.
+                                    // The driver enters at the loop LABEL, not
+                                    // key 0's peeled preamble.
+                                    if #driver.can_resume_into_compiled_loop_at_label() {
+                                        if let Some(__resume_pc) = #driver
+                                            .try_resume_into_compiled_loop(
+                                                __sp_pc, &mut #state, #env,
+                                            )
+                                        {
+                                            #pc = __resume_pc;
+                                            continue;
+                                        }
+                                    }
+                                    #driver.discard_single_pass_resume();
+                                    #pc = __sp_pc;
                                 }
                             }
                         }

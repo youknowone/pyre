@@ -15,10 +15,11 @@
 //! `<_ as majit_ir::GreenAsI64>::__green_repr(<expr>)` path unchanged.
 
 use syn::{
-    Expr, Ident, Token, bracketed,
+    bracketed,
     ext::IdentExt,
     parse::{Parse, ParseStream},
     punctuated::Punctuated,
+    Expr, Ident, Token,
 };
 
 /// Per-green type tag.  Maps to `majit_ir::GreenType` at codegen time

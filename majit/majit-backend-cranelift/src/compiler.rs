@@ -8328,6 +8328,19 @@ impl CraneliftBackend {
     /// When a bridge FINISH with loop_reentry fires, switch back to the
     /// main loop.
     fn execute_with_inputs(compiled: &CompiledLoop, inputs: &[i64]) -> DeadFrame {
+        Self::execute_with_inputs_at_dispatch_key(compiled, inputs, 0)
+    }
+
+    /// Execute a compiled token from a specific Cranelift dispatch entry.
+    ///
+    /// Key 0 runs the peeled preamble. Key `label_block_id + 1` enters at
+    /// the corresponding LABEL loader, which reads dense carried args from
+    /// the jitframe slots and skips the preamble.
+    fn execute_with_inputs_at_dispatch_key(
+        compiled: &CompiledLoop,
+        inputs: &[i64],
+        dispatch_key: u32,
+    ) -> DeadFrame {
         slice_x2_probe::arm_reporter();
         // Current trace state (equivalent to LLFrame.lltrace)
         let mut cur_code_ptr = compiled.code_ptr;
@@ -8338,7 +8351,7 @@ impl CraneliftBackend {
         // External-JUMP re-entry LABEL selector (host_reentry_dispatch_key);
         // 0 only for the initial entry — every external-JUMP re-entry,
         // including the first LABEL, selects its loader (label_block_id + 1).
-        let mut cur_dispatch_key: u32 = 0;
+        let mut cur_dispatch_key: u32 = dispatch_key;
         // `compile.py:665 setattr(cpu, name, descr)` — borrow the owning
         // cpu's descr set for the whole dispatch loop.  Holding the read
         // lock is safe: `Backend::set_done_with_this_frame_descr_*` only
@@ -16004,6 +16017,31 @@ impl majit_backend::Backend for CraneliftBackend {
         }
 
         Self::execute_with_inputs(compiled, &inputs)
+    }
+
+    fn execute_token_with_dispatch_key(
+        &self,
+        token: &JitCellToken,
+        args: &[Value],
+        dispatch_key: u32,
+    ) -> DeadFrame {
+        let compiled = token
+            .compiled
+            .as_ref()
+            .expect("token has no compiled code")
+            .downcast_ref::<CompiledLoop>()
+            .expect("compiled data is not CompiledLoop");
+        let mut inputs: Vec<i64> = Vec::with_capacity(compiled.num_inputs);
+        for arg in args {
+            inputs.push(match arg {
+                Value::Int(v) => *v,
+                Value::Float(v) => v.to_bits() as i64,
+                Value::Ref(r) => r.0 as i64,
+                Value::Void => 0,
+            });
+        }
+
+        Self::execute_with_inputs_at_dispatch_key(compiled, &inputs, dispatch_key)
     }
 
     fn execute_token_ints(&self, token: &JitCellToken, args: &[i64]) -> DeadFrame {

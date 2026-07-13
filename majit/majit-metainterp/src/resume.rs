@@ -5526,6 +5526,14 @@ pub struct ResumeDataDirectReader<'a> {
     /// Stored so the caller (blackhole_from_resumedata) can access it
     /// after consume_vref_and_vable completes.
     pub virtualizable_ptr: i64,
+
+    /// Resume-data tag for the virtualizable identity consumed at
+    /// resume.py:1404. RPython later decodes the same tag through
+    /// `_callback_r`/`write_a_ref` into blackhole registers; when majit's
+    /// state-field JIT supplies a host-stack identity override, the same
+    /// override must be used for that register seed too.
+    virtualizable_identity_tagged: Option<i16>,
+    virtualizable_identity_override: Option<i64>,
 }
 
 /// resume.py:1433-1456 CPU allocation interface for virtual materialization.
@@ -6174,6 +6182,8 @@ impl<'a> ResumeDataDirectReader<'a> {
             allocator,
             all_liveness,
             virtualizable_ptr: 0,
+            virtualizable_identity_tagged: None,
+            virtualizable_identity_override: None,
         }
     }
 
@@ -6533,6 +6543,17 @@ impl<'a> ResumeDataDirectReader<'a> {
         self.decode_ref(tagged)
     }
 
+    fn next_ref_for_resume_slot(&mut self) -> i64 {
+        let tagged = self.resumecodereader.next_item() as i16;
+        if self.virtualizable_identity_override.is_some()
+            && self.virtualizable_identity_tagged == Some(tagged)
+        {
+            self.virtualizable_ptr
+        } else {
+            self.decode_ref(tagged)
+        }
+    }
+
     /// resume.py:939 next_float
     pub fn next_float(&mut self) -> i64 {
         let tagged = self.resumecodereader.next_item() as i16;
@@ -6732,7 +6753,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         if length_r != 0 {
             let mut it = LivenessIterator::new(offset, length_r, all_liveness);
             while let Some(reg_idx) = it.next() {
-                let value = self.next_ref();
+                let value = self.next_ref_for_resume_slot();
                 if bh_debug {
                     eprintln!("[bh-seed] r{reg_idx} = {value:#x}");
                 }
@@ -6796,7 +6817,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         if length_r != 0 {
             let mut it = LivenessIterator::new(offset, length_r, all_liveness);
             while let Some(reg_idx) = it.next() {
-                let value = self.next_ref();
+                let value = self.next_ref_for_resume_slot();
                 cb(majit_ir::Type::Ref, reg_idx, value);
             }
             offset = it.offset;
@@ -6902,8 +6923,16 @@ impl<'a> ResumeDataDirectReader<'a> {
         // to `identity_override` because its host-stack `&state` is folded out
         // of backend failargs; at deopt it must use the current call's address,
         // never a trace-time pointer or an unrelated deadframe slot.
-        let encoded_identity = self.next_ref();
+        let tagged_identity = self.resumecodereader.next_item() as i16;
+        let encoded_identity = self.decode_ref(tagged_identity);
         let virtualizable = identity_override.unwrap_or(encoded_identity);
+        if identity_override.is_some() {
+            self.virtualizable_identity_tagged = Some(tagged_identity);
+            self.virtualizable_identity_override = identity_override;
+        } else {
+            self.virtualizable_identity_tagged = None;
+            self.virtualizable_identity_override = None;
+        }
         self.virtualizable_ptr = virtualizable;
         // resume.py:1406: assert vinfo.get_total_size(virtualizable) == vable_size - 1
         let expected = vinfo.get_total_size(virtualizable) as i32;

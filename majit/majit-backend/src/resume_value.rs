@@ -9,8 +9,8 @@
 //! codegen can instantiate it directly.
 
 use majit_ir::resumedata::{
-    PendingFieldLayoutSummary, ResumeValueKind, ResumeValueLayoutSummary, ResumeVirtualKind,
-    ResumeVirtualLayoutSummary, opt_descr_arc_ptr_eq,
+    opt_descr_arc_ptr_eq, PendingFieldLayoutSummary, ResumeValueKind, ResumeValueLayoutSummary,
+    ResumeVirtualKind, ResumeVirtualLayoutSummary,
 };
 use majit_ir::{ArrayDescrInfo, Const, DescrRef, FieldDescrInfo};
 

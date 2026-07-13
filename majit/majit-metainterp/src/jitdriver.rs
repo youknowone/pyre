@@ -164,7 +164,6 @@ fn materialize_pending_fields(exit_layout: &CompiledExitLayout, raw_values: &[i6
     }
 }
 
-use crate::TraceAction;
 use crate::blackhole::ExceptionState;
 use crate::jit_state::JitState;
 use crate::pyjitpl::{
@@ -173,10 +172,11 @@ use crate::pyjitpl::{
 };
 use crate::resume::ResumeLayoutSummary;
 use crate::virtualizable::VirtualizableInfo;
+use crate::TraceAction;
 use majit_gc::GcAllocator;
-use majit_ir::OpRef;
 use majit_ir::descr::DescrRef;
-use majit_ir::{Const, GreenKey, GreenType, JitDriverVar, Type, Value, VarKind, green_type_to_ir};
+use majit_ir::OpRef;
+use majit_ir::{green_type_to_ir, Const, GreenKey, GreenType, JitDriverVar, Type, Value, VarKind};
 
 /// Bucket the variables of a given kind by IR `Type`, returning
 /// `(num_int, num_ref, num_float)`. `Type::Void` is skipped per
@@ -959,13 +959,11 @@ impl<S: JitState> JitDriver<S> {
         #[cfg(not(target_arch = "wasm32"))]
         let invalidation_thread = if periodic_invalidation {
             let qmut = epoch_qmut.clone();
-            Some(std::thread::spawn(move || {
-                loop {
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                    if let Ok(mut qmut) = qmut.lock() {
-                        if qmut.has_watchers() {
-                            qmut.invalidate();
-                        }
+            Some(std::thread::spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                if let Ok(mut qmut) = qmut.lock() {
+                    if qmut.has_watchers() {
+                        qmut.invalidate();
                     }
                 }
             }))
@@ -1052,11 +1050,11 @@ impl<S: JitState> JitDriver<S> {
     pub fn register_portal_runner(
         &mut self,
         runner: impl Fn(
-            &crate::jitexc::JitException,
-        )
-            -> Result<(crate::blackhole::BhReturnType, i64), crate::jitexc::JitException>
-        + Send
-        + 'static,
+                &crate::jitexc::JitException,
+            )
+                -> Result<(crate::blackhole::BhReturnType, i64), crate::jitexc::JitException>
+            + Send
+            + 'static,
     ) {
         self.portal_runner = Some(Box::new(runner));
     }
@@ -1418,18 +1416,32 @@ impl<S: JitState> JitDriver<S> {
         }
     }
 
+    pub fn can_resume_into_compiled_loop_at_label(&self) -> bool {
+        let Some(key) = self.meta.single_pass_compiled_key else {
+            return false;
+        };
+        self.meta.has_compiled_loop(key)
+            && self.meta.loop_header_pc_for(key) != Some(0)
+            && self.meta.front_target_dispatch_key(key).is_some()
+    }
+
+    pub fn discard_single_pass_resume(&mut self) {
+        self.meta.single_pass_compiled_key = None;
+        self.meta.single_pass_scalar_values = None;
+        self.meta.single_pass_virt_array_values = None;
+        self.continue_running_normally_payload = None;
+    }
+
     /// Single-pass cross-loop-cut resume: directly enter the loop the
     /// CloseLoop arm just compiled (its key stashed in
     /// `single_pass_compiled_key`) with the walk-final native state, instead
-    /// of re-interpreting the walked body. The native interpreter's own
-    /// back-edges fire at the inner cycle's branch points, never at the
-    /// walk's merge-point header, so the compiled inner loop is otherwise
-    /// unreachable. Runs the compiled loop with the exact compile-time key
-    /// (no green-key lookup), returning the interpreter pc to resume at
-    /// after it exits (loop JUMP → `resume_pc`; guard failure → the guard's
-    /// recovery pc). `None` when no single-pass loop was compiled or the run
-    /// could not start (caller then falls back to re-interpreting at
-    /// `resume_pc`).
+    /// of re-interpreting the walked body. This is a direct TargetToken
+    /// entry, so it must skip the peeled preamble and enter at the loop LABEL:
+    /// PyPy's `raise_continue_running_normally` does not execute the freshly
+    /// compiled token with the post-walk state, and later assembler entry lands
+    /// at the TargetToken body address. Cranelift models that body address with
+    /// dispatch key `label_block_id + 1`; key 0 is the peeled-preamble path and
+    /// would replay side-effecting preamble stores.
     pub fn try_resume_into_compiled_loop(
         &mut self,
         resume_pc: usize,
@@ -1453,7 +1465,23 @@ impl<S: JitState> JitDriver<S> {
         if !has {
             return None;
         }
-        let r = self.back_edge_internal(key, None, resume_pc, state, env, || {});
+        if self.meta.loop_header_pc_for(key) == Some(0) {
+            return None;
+        }
+        let dispatch_key = self.meta.front_target_dispatch_key(key)?;
+        let direct_live_values = self
+            .take_continue_running_normally_payload()
+            .map(|(values, _)| values);
+        let r = self.back_edge_internal(
+            key,
+            None,
+            resume_pc,
+            state,
+            env,
+            Some(dispatch_key),
+            direct_live_values,
+            || {},
+        );
         if dbg {
             eprintln!("@@@DE back_edge_internal -> {r:?}");
         }
@@ -2414,7 +2442,16 @@ impl<S: JitState> JitDriver<S> {
         env: &S::Env,
         pre_run: impl FnOnce(),
     ) -> Option<usize> {
-        self.back_edge_internal(target_pc as u64, None, target_pc, state, env, pre_run)
+        self.back_edge_internal(
+            target_pc as u64,
+            None,
+            target_pc,
+            state,
+            env,
+            None,
+            None,
+            pre_run,
+        )
     }
 
     pub fn back_edge_keyed(
@@ -2425,7 +2462,7 @@ impl<S: JitState> JitDriver<S> {
         env: &S::Env,
         pre_run: impl FnOnce(),
     ) -> Option<usize> {
-        self.back_edge_internal(green_key, None, target_pc, state, env, pre_run)
+        self.back_edge_internal(green_key, None, target_pc, state, env, None, None, pre_run)
     }
 
     #[cold]
@@ -2439,7 +2476,16 @@ impl<S: JitState> JitDriver<S> {
         pre_run: impl FnOnce(),
     ) -> Option<usize> {
         let key = green_key.hash_u64();
-        self.back_edge_internal(key, Some(green_key), target_pc, state, env, pre_run)
+        self.back_edge_internal(
+            key,
+            Some(green_key),
+            target_pc,
+            state,
+            env,
+            None,
+            None,
+            pre_run,
+        )
     }
 
     pub fn back_edge_or_run_compiled(
@@ -2568,6 +2614,8 @@ impl<S: JitState> JitDriver<S> {
         target_pc: usize,
         state: &mut S,
         env: &S::Env,
+        dispatch_key: Option<u32>,
+        direct_live_values: Option<Vec<Value>>,
         pre_run: impl FnOnce(),
     ) -> Option<usize> {
         if self.meta.is_tracing() || !state.can_trace() {
@@ -2591,30 +2639,42 @@ impl<S: JitState> JitDriver<S> {
             if !self.sync_before(state, &compiled_meta, descriptor.as_ref()) {
                 return None;
             }
-            let live_values = state.extract_live_values(&compiled_meta);
-            if !Self::live_values_match_descriptor(
-                descriptor.as_ref(),
-                &live_values,
-                state.state_field_layout().total_live_values(),
-            ) {
-                return None;
-            }
-            let Some(live_values) = self.extend_compiled_live_values(
-                green_key,
-                state,
-                &compiled_meta,
-                descriptor.as_ref(),
-                live_values,
-            ) else {
-                return None;
+            let live_values = if let Some(values) = direct_live_values {
+                values
+            } else {
+                let live_values = state.extract_live_values(&compiled_meta);
+                if !Self::live_values_match_descriptor(
+                    descriptor.as_ref(),
+                    &live_values,
+                    state.state_field_layout().total_live_values(),
+                ) {
+                    return None;
+                }
+                let Some(live_values) = self.extend_compiled_live_values(
+                    green_key,
+                    state,
+                    &compiled_meta,
+                    descriptor.as_ref(),
+                    live_values,
+                ) else {
+                    return None;
+                };
+                live_values
             };
 
             pre_run();
 
-            let Some(result) = self
-                .meta
-                .run_compiled_detailed_with_values(green_key, &live_values)
-            else {
+            let result = if let Some(dispatch_key) = dispatch_key {
+                self.meta.run_compiled_detailed_with_values_at_dispatch_key(
+                    green_key,
+                    &live_values,
+                    dispatch_key,
+                )
+            } else {
+                self.meta
+                    .run_compiled_detailed_with_values(green_key, &live_values)
+            };
+            let Some(result) = result else {
                 return None;
             };
 
@@ -3592,10 +3652,10 @@ impl<S: JitState> JitDriver<S> {
             };
         };
         pre_run();
-        let Some(result) = self
+        let result = self
             .meta
-            .run_compiled_detailed_with_values(green_key, &live_values)
-        else {
+            .run_compiled_detailed_with_values(green_key, &live_values);
+        let Some(result) = result else {
             return DetailedDriverRunOutcome::Abort {
                 restored: false,
                 via_blackhole: false,
@@ -4282,11 +4342,11 @@ impl<S: JitState> JitDriver<S> {
         resume_pc: usize,
     ) -> bool {
         majit_metainterp::mc_diag_bump(12); // start_bridge_tracing entered
-        // compile.py:725-729 `_trace_and_compile_from_bridge` raises
-        // `compile.giveup()` when the descr's owning JitCellToken weakref
-        // is dead (memmgr-evicted).  Pyre signals the same outcome by
-        // returning false; also returns false if the descr is not a
-        // FailDescr at all (e.g. a synthetic terminal-exit Descr).
+                                            // compile.py:725-729 `_trace_and_compile_from_bridge` raises
+                                            // `compile.giveup()` when the descr's owning JitCellToken weakref
+                                            // is dead (memmgr-evicted).  Pyre signals the same outcome by
+                                            // returning false; also returns false if the descr is not a
+                                            // FailDescr at all (e.g. a synthetic terminal-exit Descr).
         let Some(descr_fd) = descr_arc.as_fail_descr() else {
             majit_metainterp::mc_diag_bump(13); // sbt early: descr not FailDescr
             return false;
@@ -5161,35 +5221,29 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(
-            driver
-                .jit_merge_point_keyed(
-                    key,
-                    7,
-                    &mut state,
-                    &(),
-                    || {},
-                    |_meta, _sym| { TraceAction::Continue }
-                )
-                .is_none()
-        );
+        assert!(driver
+            .jit_merge_point_keyed(
+                key,
+                7,
+                &mut state,
+                &(),
+                || {},
+                |_meta, _sym| { TraceAction::Continue }
+            )
+            .is_none());
         assert!(
             !driver.is_tracing(),
             "jit_merge_point must not warm up or start tracing by itself"
         );
 
-        assert!(
-            driver
-                .back_edge_or_run_compiled_keyed(key, 7, &mut state, &(), || {})
-                .is_none()
-        );
+        assert!(driver
+            .back_edge_or_run_compiled_keyed(key, 7, &mut state, &(), || {})
+            .is_none());
         assert!(!driver.is_tracing(), "first back-edge should only warm up");
 
-        assert!(
-            driver
-                .back_edge_or_run_compiled_keyed(key, 7, &mut state, &(), || {})
-                .is_none()
-        );
+        assert!(driver
+            .back_edge_or_run_compiled_keyed(key, 7, &mut state, &(), || {})
+            .is_none());
         assert!(
             driver.is_tracing(),
             "back-edge should start tracing once hot"
@@ -5522,8 +5576,8 @@ mod tests {
             fn validate_close(_: &(), _: &()) -> bool {
                 true
             }
-            fn __build_virtualizable_info()
-            -> Option<std::sync::Arc<crate::virtualizable::VirtualizableInfo>> {
+            fn __build_virtualizable_info(
+            ) -> Option<std::sync::Arc<crate::virtualizable::VirtualizableInfo>> {
                 let mut info = crate::virtualizable::VirtualizableInfo::new(24);
                 info.add_field("pc", Type::Int, 8);
                 info.add_array_field(

@@ -2,14 +2,14 @@ pub(crate) mod dispatch;
 mod frame;
 
 pub use dispatch::build_state_field_snapshot;
-pub use dispatch::{
-    ClosureRuntime, ClosureRuntimeWithResolver, JitCodeMachine, JitCodeRuntime, JitCodeSym,
-    StandaloneFrameStack, struct_field_write_effect_info, trace_jitcode, trace_jitcode_with_args,
-    trace_jitcode_with_args_and_runtime,
-};
 pub use dispatch::{build_vable_snapshot_boxes, build_vref_snapshot_boxes};
 pub use dispatch::{call_int_function, call_ref_function, call_void_function};
 pub use dispatch::{eval_binop_f, eval_binop_i, eval_float_cmp, eval_unary_f, eval_unary_i};
+pub use dispatch::{
+    struct_field_write_effect_info, trace_jitcode, trace_jitcode_with_args,
+    trace_jitcode_with_args_and_runtime, ClosureRuntime, ClosureRuntimeWithResolver,
+    JitCodeMachine, JitCodeRuntime, JitCodeSym, StandaloneFrameStack,
+};
 pub use frame::{MIFrame, MIFrameStack};
 
 use indexmap::IndexMap;
@@ -91,7 +91,7 @@ use crate::io_buffer;
 use crate::jitdriver::JitDriverStaticData;
 #[cfg(test)]
 use crate::optimizeopt::snapshot_get;
-use crate::optimizeopt::{SnapshotBoxes, SnapshotFramePcs, SnapshotFrameSizes, snapshot_insert};
+use crate::optimizeopt::{snapshot_insert, SnapshotBoxes, SnapshotFramePcs, SnapshotFrameSizes};
 use crate::resume::{
     MaterializedVirtual, ReconstructedState, ResolvedPendingFieldWrite, ResumeData, ResumeDataExt,
     ResumeLayoutSummary, ResumeStorage, SnapshotBox,
@@ -5676,25 +5676,23 @@ impl<M: Clone> MetaInterp<M> {
             label_op.pos.set(majit_ir::OpRef::NONE);
             optimized_ops.insert(0, std::rc::Rc::new(label_op));
         }
-        let (inputargs, optimized_ops) = match normalize_root_loop_entry_contract(
-            root_inputargs,
-            optimized_ops,
-        ) {
-            Ok(normalized) => normalized,
-            Err((expected, actual)) => {
-                if crate::majit_log_enabled() {
-                    eprintln!(
+        let (inputargs, optimized_ops) =
+            match normalize_root_loop_entry_contract(root_inputargs, optimized_ops) {
+                Ok(normalized) => normalized,
+                Err((expected, actual)) => {
+                    if crate::majit_log_enabled() {
+                        eprintln!(
                         "[jit] abort compile: root loop entry/jump arity mismatch input={} jump={}",
                         expected, actual,
                     );
+                    }
+                    self.cancel_count += 1;
+                    if crate::closedbg_enabled() {
+                        eprintln!("@@@CANCEL-SITE line={}", line!());
+                    }
+                    return CompileOutcome::Cancelled;
                 }
-                self.cancel_count += 1;
-                if crate::closedbg_enabled() {
-                    eprintln!("@@@CANCEL-SITE line={}", line!());
-                }
-                return CompileOutcome::Cancelled;
-            }
-        };
+            };
 
         // RPython virtualizable parity: standard virtualizable fields and
         // arrays stay in the trace as first-class virtualizable boxes.
@@ -7902,6 +7900,25 @@ impl<M: Clone> MetaInterp<M> {
         self.last_compiled_key
     }
 
+    /// Cranelift direct body-entry selector for the first compiled loop LABEL.
+    ///
+    /// PyPy x86 stores each TargetToken's machine-code LABEL address in
+    /// `_ll_loop_code`. Cranelift exposes one function entry instead, so the
+    /// LABEL address is represented as `label_block_id + 1`; key 0 remains the
+    /// peeled preamble host entry.
+    pub fn front_target_dispatch_key(&self, green_key: u64) -> Option<u32> {
+        let compiled = self.compiled_loops.get(&green_key)?;
+        let target = compiled
+            .front_target_tokens
+            .iter()
+            .find(|target| !target.is_preamble_target)
+            .or_else(|| compiled.front_target_tokens.first())?;
+        let target_descr = target.as_jump_target_descr();
+        target_descr
+            .as_loop_target_descr()
+            .map(|target| target.label_block_id() + 1)
+    }
+
     /// warmstate.py:437-444 `cell.flags |= JC_TRACING ... try ... finally:
     /// cell.flags &= ~JC_TRACING` parity — the green_key that was entered
     /// into `bound_reached` and on which TRACING must be cleared unconditionally
@@ -8196,11 +8213,27 @@ impl<M: Clone> MetaInterp<M> {
         green_key: u64,
         live_values: &[Value],
     ) -> Option<CompileResult<'_, M>> {
+        self.run_compiled_detailed_with_values_at_dispatch_key(green_key, live_values, 0)
+    }
+
+    /// Typed-input runner for Cranelift's direct LABEL entry.
+    ///
+    /// Dispatch key 0 is the ordinary host entry through the peeled preamble.
+    /// Dispatch key `label_block_id + 1` enters the corresponding loop LABEL
+    /// loader, matching PyPy's per-TargetToken `_ll_loop_code` entry.
+    pub fn run_compiled_detailed_with_values_at_dispatch_key(
+        &mut self,
+        green_key: u64,
+        live_values: &[Value],
+        dispatch_key: u32,
+    ) -> Option<CompileResult<'_, M>> {
         let compiled = self.compiled_loops.get(&green_key)?;
         let token = compiled.live_token()?;
 
         Self::prepare_compiled_run_io();
-        let frame = self.backend.execute_token(&token, live_values);
+        let frame = self
+            .backend
+            .execute_token_with_dispatch_key(&token, live_values, dispatch_key);
         // RPython: bridge compilation happens synchronously inside
         // assembler_call_helper (called from compiled code). No deferred queue.
 
@@ -10318,9 +10351,9 @@ impl<M: Clone> MetaInterp<M> {
         // pyre-only and violates bridge pool isolation.
         if retrace_requested {
             crate::mc_diag_bump(10); // compile_bridge retrace_requested return
-            // compile.py:1079: metainterp.retrace_needed(new_trace, info)
-            // Save partial trace + exported state so the next loop-header's
-            // compile_loop → compile_retrace can produce a new specialization.
+                                     // compile.py:1079: metainterp.retrace_needed(new_trace, info)
+                                     // Save partial trace + exported state so the next loop-header's
+                                     // compile_loop → compile_retrace can produce a new specialization.
             if let Some(tok) = self
                 .compiled_loops
                 .get(&green_key)
@@ -10691,11 +10724,11 @@ impl<M: Clone> MetaInterp<M> {
             Some(c) => c,
             None => {
                 crate::mc_diag_bump(7); // start_retrace bailed: source loop evicted
-                // Source loop already evicted — bail out of the bridge
-                // before opening the M-ownership session.  Pair the
-                // `start_tracing` fired above so the profiler stack
-                // stays balanced (PyPy's `finally` would run even when
-                // `handle_guard_failure` returns early via `giveup`).
+                                        // Source loop already evicted — bail out of the bridge
+                                        // before opening the M-ownership session.  Pair the
+                                        // `start_tracing` fired above so the profiler stack
+                                        // stays balanced (PyPy's `finally` would run even when
+                                        // `handle_guard_failure` returns early via `giveup`).
                 self.leave_profiler_tracing();
                 return None;
             }
@@ -15743,8 +15776,8 @@ mod metainterp_static_data_tests {
         // pyjitpl.py:2174-2186 — when bytecode_for_address misses, the
         // method returns Ok(self.do_residual_call_full(...)) instead of
         // raising ChangeFrame.
-        use crate::BackEdgeAction;
         use crate::jitcode::JitArgKind;
+        use crate::BackEdgeAction;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
         let fnaddr = execute_varargs_void_helper as *const () as i64;
@@ -15779,8 +15812,8 @@ mod metainterp_static_data_tests {
         // falling through to do_residual_call_full — but only when the
         // funcbox OpRef is a Const (pyjitpl.py:2178 `isinstance(funcbox,
         // Const)`).
-        use crate::BackEdgeAction;
         use crate::jitcode::JitArgKind;
+        use crate::BackEdgeAction;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
         let fnaddr = execute_varargs_void_helper as *const () as i64 as usize;
@@ -15813,8 +15846,8 @@ mod metainterp_static_data_tests {
         // pyjitpl.py:2178 — non-Const funcbox must NOT be promoted to an
         // inlined call even when its concrete address matches a
         // registered indirect-call target.
-        use crate::BackEdgeAction;
         use crate::jitcode::JitArgKind;
+        use crate::BackEdgeAction;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
         let fnaddr = execute_varargs_void_helper as *const () as i64 as usize;
@@ -15896,8 +15929,8 @@ mod metainterp_static_data_tests {
         // `resultbox.getint()` — the symbolic resultbox must be a real
         // ConstInt(0xc0ffee), not a bare unset OpRef. Mint via
         // `ctx.const_int` so the trace's constant pool resolves the slot.
-        use crate::BackEdgeAction;
         use crate::jitcode::JitArgKind;
+        use crate::BackEdgeAction;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
@@ -16155,8 +16188,8 @@ mod metainterp_static_data_tests {
         // pyjitpl.py self.framestack invariant: trace entry pushes the
         // root frame, runs the jitcode interp, and the stack is empty
         // again on return.
-        use crate::BackEdgeAction;
         use crate::jitcode::JitCodeBuilder;
+        use crate::BackEdgeAction;
         let jitcode = std::sync::Arc::new(JitCodeBuilder::new().finish());
 
         let mut meta = MetaInterp::<()>::new(0);
@@ -16245,8 +16278,8 @@ mod metainterp_static_data_tests {
     fn build_allboxes_simple_case_no_prepend_box() {
         // pyjitpl.py:1960-1993 — without prepend_box, allboxes is just
         // [funcbox, *argboxes].
-        use crate::BackEdgeAction;
         use crate::jitcode::JitArgKind;
+        use crate::BackEdgeAction;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
@@ -16276,8 +16309,8 @@ mod metainterp_static_data_tests {
     fn build_allboxes_with_prepend_box_places_it_first() {
         // pyjitpl.py:1963-1965 — prepend_box (e.g. condbox in
         // do_conditional_call) goes to slot 0.
-        use crate::BackEdgeAction;
         use crate::jitcode::JitArgKind;
+        use crate::BackEdgeAction;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
@@ -16308,8 +16341,8 @@ mod metainterp_static_data_tests {
         // When `argboxes` arrives in bank-sorted layout (all ints
         // first, then refs, then floats), the output must still match
         // declaration order.
-        use crate::BackEdgeAction;
         use crate::jitcode::JitArgKind;
+        use crate::BackEdgeAction;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
@@ -16355,8 +16388,8 @@ mod metainterp_static_data_tests {
         // already arrives in declaration order — pyre's BC encoder
         // produces this layout today, so the loop is exercised on
         // every production call.
-        use crate::BackEdgeAction;
         use crate::jitcode::JitArgKind;
+        use crate::BackEdgeAction;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
@@ -16431,8 +16464,8 @@ mod metainterp_static_data_tests {
         // and return Ok(None) when no exception was raised.  No IR ops
         // are emitted because `executor.execute_varargs` is the
         // non-recording path.
-        use crate::BackEdgeAction;
         use crate::jitcode::JitArgKind;
+        use crate::BackEdgeAction;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
@@ -16483,8 +16516,8 @@ mod metainterp_static_data_tests {
     fn do_not_in_trace_call_returns_abort_escape_on_exception() {
         // pyjitpl.py:3687-3692 — if last_exc_value is set after the
         // call, raise SwitchToBlackhole(ABORT_ESCAPE).
-        use crate::BackEdgeAction;
         use crate::jitcode::JitArgKind;
+        use crate::BackEdgeAction;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
@@ -16750,8 +16783,8 @@ mod metainterp_static_data_tests {
     fn do_residual_call_emits_call_i_for_regular_int_call() {
         // pyjitpl.py:2113-2115 — non-loopinvariant, non-force-virtual,
         // int-returning call → CALL_I via miframe_execute_varargs.
-        use crate::BackEdgeAction;
         use crate::jitcode::JitArgKind;
+        use crate::BackEdgeAction;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
@@ -16882,8 +16915,8 @@ mod metainterp_static_data_tests {
         // A portal-jitcode callee never tail-call-optimizes — the
         // upstream invariant is that portal frames stay on the stack
         // for the metainterp dispatch loop.
-        use crate::BackEdgeAction;
         use crate::jitcode::JitCodeBuilder;
+        use crate::BackEdgeAction;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
@@ -17034,8 +17067,8 @@ mod metainterp_static_data_tests {
     #[test]
     #[should_panic(expected = "is not a Const")]
     fn do_recursive_call_panics_when_greens_contain_non_const() {
-        use crate::BackEdgeAction;
         use crate::jitcode::JitArgKind;
+        use crate::BackEdgeAction;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
@@ -17119,8 +17152,8 @@ mod metainterp_static_data_tests {
     #[test]
     fn do_conditional_call_emits_cond_call_when_not_is_value() {
         // pyjitpl.py:2137-2139 — is_value=False → COND_CALL (void).
-        use crate::BackEdgeAction;
         use crate::jitcode::JitArgKind;
+        use crate::BackEdgeAction;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
@@ -17176,8 +17209,8 @@ mod metainterp_static_data_tests {
         // when all normalized args (`argboxes[1..]`, skipping condbox) are
         // Const. Use a live Ref op for funcbox so this fixture keeps the
         // COND_CALL_VALUE_I op in the trace and exercises the recording path.
-        use crate::BackEdgeAction;
         use crate::jitcode::JitArgKind;
+        use crate::BackEdgeAction;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
         let fnaddr = execute_varargs_int_helper as *const () as i64;
@@ -17240,8 +17273,8 @@ mod metainterp_static_data_tests {
         // CALL_MAY_FORCE_I via direct_call_may_force followed by a
         // GUARD_NOT_FORCED.  The call's concrete result is the
         // executor's return.
-        use crate::BackEdgeAction;
         use crate::jitcode::JitArgKind;
+        use crate::BackEdgeAction;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
@@ -17284,8 +17317,8 @@ mod metainterp_static_data_tests {
     fn miframe_execute_varargs_clears_exception_and_records_call_when_no_exc() {
         // pyjitpl.py:1942-1957 — without an exception, the call records
         // a CallI op and assert_no_exception passes.
-        use crate::BackEdgeAction;
         use crate::jitcode::JitArgKind;
+        use crate::BackEdgeAction;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
@@ -17339,8 +17372,8 @@ mod metainterp_static_data_tests {
         // pyjitpl.py:2641-2652 — record CallI op with the descr and
         // return (OpRef, resvalue) computed from
         // executor.execute_varargs.
-        use crate::BackEdgeAction;
         use crate::jitcode::JitArgKind;
+        use crate::BackEdgeAction;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
@@ -17398,8 +17431,8 @@ mod metainterp_static_data_tests {
     fn execute_and_record_varargs_returns_none_for_void_call() {
         // pyjitpl.py:2662-2663 — `if op.type != 'v': return op` →
         // void calls return None even though the IR op is recorded.
-        use crate::BackEdgeAction;
         use crate::jitcode::JitArgKind;
+        use crate::BackEdgeAction;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
@@ -18049,8 +18082,8 @@ mod metainterp_static_data_tests {
         // pyjitpl.py:2440-2441 / 2467:
         // enter/leave portal ops receive jitcode.jitdriver_sd.index, not
         // a hard-coded portal slot.
-        use crate::BackEdgeAction;
         use crate::jitcode::JitCodeBuilder;
+        use crate::BackEdgeAction;
 
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
@@ -18097,8 +18130,8 @@ mod metainterp_static_data_tests {
         // pyjitpl.py:2443-2445 / 2470-2472 — newframe appends
         // (jd_no, Some(greenkey), trace_position); popframe appends
         // (jd_no, None, trace_position) on the matching exit.
-        use crate::BackEdgeAction;
         use crate::jitcode::JitCodeBuilder;
+        use crate::BackEdgeAction;
 
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
@@ -18148,8 +18181,8 @@ mod metainterp_static_data_tests {
     fn portal_trace_positions_skips_non_recursive_jitdriver() {
         // is_main_jitcode requires jd.is_recursive — non-recursive portals
         // must not append to portal_trace_positions.
-        use crate::BackEdgeAction;
         use crate::jitcode::JitCodeBuilder;
+        use crate::BackEdgeAction;
 
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
@@ -18494,8 +18527,8 @@ mod metainterp_static_data_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::JitArgKind;
     use crate::resume::{FrameSlotSource, ReconstructedValue, ResolvedPendingFieldWrite};
+    use crate::JitArgKind;
     #[cfg(feature = "cranelift")]
     use majit_backend::DeadFrame;
     #[cfg(feature = "cranelift")]

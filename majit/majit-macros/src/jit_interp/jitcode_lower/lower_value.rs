@@ -169,7 +169,12 @@ impl<'c> Lowerer<'c> {
                 }
                 self.lower_call_value(call)
             }
-            Expr::MethodCall(call) => self.lower_method_call_value(call),
+            Expr::MethodCall(call) => {
+                if let Some(binding) = self.lower_wrapping_int_method_call(call) {
+                    return Some(binding);
+                }
+                self.lower_method_call_value(call)
+            }
             Expr::Struct(s) => self.lower_struct_value(s),
             _ => None,
         }
@@ -1293,6 +1298,51 @@ impl<'c> Lowerer<'c> {
             reg,
             kind: result_kind,
             depends_on_stack,
+            struct_type: None,
+        })
+    }
+
+    /// Lower Rust's explicit wrapping integer methods to the same native int
+    /// binops as RPython's `int_add` / `int_sub` / `int_mul` special cases.
+    ///
+    /// RPython parity: `jtransform.py:2030 _handle_int_special` emits the
+    /// arithmetic op directly instead of residualizing a helper call. Rust
+    /// kernels use method syntax (`x.wrapping_add(y)`) to spell the same
+    /// wraparound semantics, so lower that syntax to `IntAdd` / `IntSub` /
+    /// `IntMul` rather than aborting the trace at the method call.
+    fn lower_wrapping_int_method_call(&mut self, call: &ExprMethodCall) -> Option<Binding> {
+        if call.args.len() != 1 {
+            return None;
+        }
+        let opcode_name = match call.method.to_string().as_str() {
+            "wrapping_add" => "IntAdd",
+            "wrapping_sub" => "IntSub",
+            "wrapping_mul" => "IntMul",
+            _ => return None,
+        };
+
+        let lhs = self.lower_value_expr(&call.receiver)?;
+        let rhs = self.lower_value_expr(&call.args[0])?;
+        if !matches!(lhs.kind, BindingKind::Int) || !matches!(rhs.kind, BindingKind::Int) {
+            return None;
+        }
+
+        let reg = self.alloc_reg();
+        let lhs_reg = lhs.reg;
+        let rhs_reg = rhs.reg;
+        let opcode = Ident::new(opcode_name, proc_macro2::Span::call_site());
+        self.emit_op(
+            OpMeta::linear(
+                OpKind::BinopI,
+                Register::ints(&[lhs_reg, rhs_reg]),
+                vec![Register::int(reg)],
+            ),
+            binop_i_emit_tokens(reg, &opcode, lhs_reg, rhs_reg),
+        );
+        Some(Binding {
+            reg,
+            kind: BindingKind::Int,
+            depends_on_stack: lhs.depends_on_stack || rhs.depends_on_stack,
             struct_type: None,
         })
     }

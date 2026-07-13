@@ -3820,12 +3820,6 @@ impl Optimizer {
                 }
             }
         }
-        if ops.len() < 120 && crate::smallir_enabled() {
-            eprintln!("@@@SMALLIR LOOP total={}", ops.len());
-            for (i, op) in ops.iter().enumerate() {
-                eprintln!("@@@SMALLIR   [{i}] {:?}", op);
-            }
-        }
         self.final_ctx = Some(ctx);
         Ok(ops)
     }

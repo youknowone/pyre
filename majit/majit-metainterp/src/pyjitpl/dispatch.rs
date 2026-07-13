@@ -7242,23 +7242,7 @@ pub fn call_int_function(func_ptr: *const (), args: &[i64]) -> i64 {
                     *a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9, *a10, *a11, *a12, *a13,
                 )
             }
-            [
-                a0,
-                a1,
-                a2,
-                a3,
-                a4,
-                a5,
-                a6,
-                a7,
-                a8,
-                a9,
-                a10,
-                a11,
-                a12,
-                a13,
-                a14,
-            ] => {
+            [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14] => {
                 let func: extern "C" fn(
                     i64,
                     i64,
@@ -7280,24 +7264,7 @@ pub fn call_int_function(func_ptr: *const (), args: &[i64]) -> i64 {
                     *a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9, *a10, *a11, *a12, *a13, *a14,
                 )
             }
-            [
-                a0,
-                a1,
-                a2,
-                a3,
-                a4,
-                a5,
-                a6,
-                a7,
-                a8,
-                a9,
-                a10,
-                a11,
-                a12,
-                a13,
-                a14,
-                a15,
-            ] => {
+            [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15] => {
                 let func: extern "C" fn(
                     i64,
                     i64,
@@ -7468,23 +7435,7 @@ pub fn call_void_function(func_ptr: *const (), args: &[i64]) {
                     *a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9, *a10, *a11, *a12, *a13,
                 )
             }
-            [
-                a0,
-                a1,
-                a2,
-                a3,
-                a4,
-                a5,
-                a6,
-                a7,
-                a8,
-                a9,
-                a10,
-                a11,
-                a12,
-                a13,
-                a14,
-            ] => {
+            [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14] => {
                 let func: extern "C" fn(
                     i64,
                     i64,
@@ -7506,24 +7457,7 @@ pub fn call_void_function(func_ptr: *const (), args: &[i64]) {
                     *a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9, *a10, *a11, *a12, *a13, *a14,
                 )
             }
-            [
-                a0,
-                a1,
-                a2,
-                a3,
-                a4,
-                a5,
-                a6,
-                a7,
-                a8,
-                a9,
-                a10,
-                a11,
-                a12,
-                a13,
-                a14,
-                a15,
-            ] => {
+            [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15] => {
                 let func: extern "C" fn(
                     i64,
                     i64,
