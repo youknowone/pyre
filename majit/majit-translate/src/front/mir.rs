@@ -5761,6 +5761,46 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `f64::is_finite(x)` is `(x - x) == 0.0` — emit the
+                // arithmetic directly instead of an unresolved call.
+                if args.len() == 1 && self.is_f64_is_finite(&reg) {
+                    let zero = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(zero.clone()),
+                        kind: OpKind::ConstFloat(0),
+                    });
+                    let diff = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(diff.clone()),
+                        kind: OpKind::BinOp {
+                            op: "sub".to_string(),
+                            lhs: args[0].clone(),
+                            rhs: args[0].clone(),
+                            result_ty: ValueType::Float,
+                        },
+                    });
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::BinOp {
+                            op: "eq".to_string(),
+                            lhs: diff.clone(),
+                            rhs: zero.clone(),
+                            result_ty: ValueType::Int,
+                        },
+                    });
+                    self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // The concrete container `IntoIterator::into_iter` impls
                 // (`&[T]`/`Vec`/`[T;N]`) construct a container iterator.
                 // Emit the `iter` operation on the container receiver — the
@@ -7459,6 +7499,21 @@ impl<'a> Lowering<'a> {
         self.llbc
             .fn_by_id(*id)
             .is_some_and(|fd| fd.item_meta.name_path() == "core::f64::<Impl>::is_nan")
+    }
+
+    /// `f64::is_finite(self)` — `core` has no graph body (Opaque), so the
+    /// callsite would skip as an unregistered `FunctionPath`.  `is_finite`
+    /// is `(x - x) == 0.0`: finite `x` gives `0.0 == 0.0` = true, while ±inf
+    /// and NaN both make `x - x` NaN so the equality is false.  The float
+    /// `sub` carries no reflexive `sub(x, x) => 0` fold (unlike the integer
+    /// bank), preserving the inf/NaN truth value.
+    fn is_f64_is_finite(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc
+            .fn_by_id(*id)
+            .is_some_and(|fd| fd.item_meta.name_path() == "core::f64::<Impl>::is_finite")
     }
 
     /// `majit_metainterp::jit::promote(x)` = `hint(x, promote=True)`
