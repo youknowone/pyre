@@ -1582,10 +1582,9 @@ fn exec_code_module(
 /// each binding in `names` into the caller's module dict `ns`.
 ///
 /// `filename` is used as the source path for tracebacks / co_filename
-/// only.  The intermediate namespace is intentionally leaked: every
-/// function defined in `source` retains it as its `__globals__`, so the
-/// box must outlive the bound names — which, for module-init artifacts,
-/// is "forever".
+/// only.  Every function defined in `source` retains the intermediate
+/// namespace as its `__globals__`; once copied into the caller's module,
+/// those functions keep the namespace transitively reachable.
 pub fn appleveldef_install(ns: &mut DictStorage, source: &str, filename: &str, names: &[&str]) {
     let code = compile_source_with_filename(source, Mode::Exec, filename)
         .unwrap_or_else(|e| panic!("appleveldef `{filename}`: compile failed — {e}"));
@@ -1593,17 +1592,16 @@ pub fn appleveldef_install(ns: &mut DictStorage, source: &str, filename: &str, n
     if ctx.is_null() {
         panic!("appleveldef `{filename}`: no execution context at module init");
     }
-    let mut app_ns = Box::new(unsafe { (*ctx).fresh_dict_storage() });
-    app_ns.fix_ptr();
-    let app_ns_ptr: *mut DictStorage = Box::leak(app_ns);
+    let w_app_globals = unsafe { (*ctx).fresh_module_globals() };
+    let _root = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(w_app_globals);
     let code_ptr = Box::into_raw(Box::new(code));
     let w_code = crate::w_code_new(code_ptr as *const ());
-    let mut frame = crate::createframe(w_code as *const (), app_ns_ptr, ctx, None)
+    let mut frame = crate::pyframe::createframe_obj(w_code as *const (), w_app_globals, ctx, None)
         .unwrap_or_else(|e| panic!("appleveldef `{filename}`: createframe — {e:?}"));
     if let Err(e) = frame.run_with_jit() {
         panic!("appleveldef `{filename}`: exec — {e:?}");
     }
-    let w_app_globals = frame.get_w_globals();
     for &name in names {
         match unsafe { pyre_object::w_dict_getitem_str(w_app_globals, name) } {
             Some(val) => crate::dict_storage_store(ns, name, val),
