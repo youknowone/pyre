@@ -128,10 +128,23 @@ impl Nursery {
     /// `arena_reset(..., 0)` leave recycled bytes untouched; allocation
     /// sites initialize their own GC-pointer fields.  Poison mode mirrors
     /// llarena.py mode 3 for detecting violations of that contract.
+    ///
+    /// WASM-ONLY ADAPTATION: majit-backend-wasm/src/codegen.rs:2592-2599
+    /// documents that wasm skips the GC rewrite, so its JIT code has no
+    /// `clear_gc_fields` stores and still requires recycled nursery bytes to
+    /// be zero-filled.  Delete this target branch once wasm runs the rewrite
+    /// or its inline allocation paths explicitly initialize GC fields.
     pub fn reset(&mut self) {
-        if self.poison_on_reset {
-            unsafe {
-                ptr::write_bytes(self.start, 0xAA, self.size);
+        #[cfg(target_arch = "wasm32")]
+        unsafe {
+            ptr::write_bytes(self.start, 0, self.size);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if self.poison_on_reset {
+                unsafe {
+                    ptr::write_bytes(self.start, 0xAA, self.size);
+                }
             }
         }
         self.ptrs.free = self.start;
