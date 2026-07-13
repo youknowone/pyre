@@ -6011,6 +6011,13 @@ fn try_execute_residual_call_via_executor(
                             arg_index,
                         });
                     }
+                    if fbw_debug_abort_enabled() {
+                        eprintln!(
+                            "[fbw-resid-decline] NO_CONCRETE op_pc={op_pc} arg_index={arg_index} \
+                             helper={:?} opcode={call_opcode:?}",
+                            call_descr.get_extra_info().pyre_helper
+                        );
+                    }
                     return Ok(ResidualExecOutcome::Declined(
                         ResidualDecline::ValueUnavailable,
                     ));
@@ -6025,6 +6032,13 @@ fn try_execute_residual_call_via_executor(
                         pc: op_pc,
                         arg_index,
                     });
+                }
+                if fbw_debug_abort_enabled() {
+                    eprintln!(
+                        "[fbw-resid-decline] box_value=None op_pc={op_pc} arg_index={arg_index} \
+                         helper={:?} opcode={call_opcode:?}",
+                        call_descr.get_extra_info().pyre_helper
+                    );
                 }
                 return Ok(ResidualExecOutcome::Declined(
                     ResidualDecline::ValueUnavailable,
