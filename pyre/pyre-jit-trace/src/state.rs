@@ -13263,6 +13263,8 @@ pub struct ResumeFrameState {
     pub sym: *mut PyreSym,
     pub concrete_frame_addr: usize,
     pub resume_pc: usize,
+    /// Jitcode-space twin of the pc word this frame will encode (gh#369).
+    pub resume_marker_jit_pc: Option<usize>,
     /// Python pc of the CALL whose residual call this frame is the caller
     /// of (the call still on this frame's stack when the callee was
     /// inlined).  When that call sits in a try-block the jitcode emits a

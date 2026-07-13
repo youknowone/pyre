@@ -10227,6 +10227,20 @@ pub(crate) fn m73_pfmarker_carry_enabled() -> bool {
     })
 }
 
+/// `PYRE_M369_PFRAME_CARRY` (gh#369 phase-1 slice-1, default ON): carry
+/// trace-opcode framestack parent resume-marker twins in their frame words.
+/// Disable with `PYRE_M369_PFRAME_CARRY=0`.
+pub(crate) fn m369_pframe_carry_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M369_PFRAME_CARRY") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => true,
+    })
+}
+
 /// `PYRE_M73_ARMPATH_CARRY` (#73 S5 phase-3 slice-4, default ON): carry
 /// the outer snapshot coordinate's codewrite-time resume-marker twin in the
 /// per-opcode arm-path snapshot word. Certified by the `M73_ARMPATH` census
@@ -10360,7 +10374,7 @@ fn m73_outercap_census(site: &str, jitcode_index: i32, py_pc: i32, word: Option<
 /// `PYRE_M369_RECOVER_AUDIT`). Under the audit gate, print one line per
 /// snapshot word that is still written as the `NO_JITCODE_PC` sentinel,
 /// tagged with the write site.
-fn m73_sentinel_word_census(site: &str, jitcode_index: u32, py_pc: u32, word: i32) {
+pub(crate) fn m73_sentinel_word_census(site: &str, jitcode_index: u32, py_pc: u32, word: i32) {
     if word == majit_ir::resumedata::NO_JITCODE_PC && m73_marker_audit_enabled() {
         eprintln!("M73_SENTINEL site={site} idx={jitcode_index} py_pc={py_pc}");
     }

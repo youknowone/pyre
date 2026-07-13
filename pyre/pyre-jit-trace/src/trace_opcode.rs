@@ -4282,10 +4282,24 @@ impl MIFrame {
                 parent.call_pc,
                 parent.resume_pc,
             );
+            let parent_word = if crate::jitcode_dispatch::m369_pframe_carry_enabled() {
+                parent
+                    .resume_marker_jit_pc
+                    .map(|m| m as i32)
+                    .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC)
+            } else {
+                majit_ir::resumedata::NO_JITCODE_PC
+            };
+            crate::jitcode_dispatch::m73_sentinel_word_census(
+                "tframe-parent",
+                parent_jitcode_index,
+                parent.resume_pc as u32,
+                parent_word,
+            );
             lead.push(majit_metainterp::recorder::SnapshotFrame {
                 jitcode_index: parent_jitcode_index,
                 pc: parent_pc as u32,
-                jitcode_pc: majit_ir::resumedata::NO_JITCODE_PC,
+                jitcode_pc: parent_word,
                 boxes: Self::fail_args_to_snapshot_boxes_typed(&parent_active, parent_types, ctx),
             });
         }
@@ -7011,6 +7025,9 @@ impl MIFrame {
             sym: self.sym,
             concrete_frame_addr: self.concrete_frame_addr,
             resume_pc: return_point_pc,
+            // This interpreter-opcode seam has Python orgpc/fallthrough only;
+            // the parent CALL's jitcode op pc is not exposed here.
+            resume_marker_jit_pc: None,
             // The caller's CALL pc — its post-call `-live-`/`catch_exception`
             // (keyed by this pc in `after_residual_call_resume_pc`) is where
             // the blackhole must resume this frame if a guard deopts inside
