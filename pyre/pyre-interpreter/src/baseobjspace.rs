@@ -10139,6 +10139,17 @@ unsafe fn obj_type_name(obj: PyObjectRef) -> &'static str {
     }
 }
 
+/// Type name for the "not iterable" TypeError. A tagged immediate is an
+/// exact `int`; name it without derefing its (non-pointer) tagged bits as
+/// `ob_type`. Gated on `CAN_BE_TAGGED`; folds to the raw deref at flag-false.
+unsafe fn not_iterable_type_name(obj: PyObjectRef) -> &'static str {
+    if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj) {
+        "int"
+    } else {
+        (*(*obj).ob_type).name
+    }
+}
+
 unsafe fn iter_check_is_iterator(w_iterator: PyObjectRef) -> PyResult {
     let w_type = crate::typedef::r#type(w_iterator).unwrap_or(std::ptr::null_mut());
     let has_next = if !w_type.is_null() && lookup_in_type_where(w_type, "__next__").is_some() {
@@ -10467,7 +10478,7 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
                     if is_none(method) {
                         return Err(PyError::type_error(format!(
                             "'{}' object is not iterable",
-                            (*(*obj).ob_type).name
+                            not_iterable_type_name(obj)
                         )));
                     }
                     let w_iter = crate::call::call_function_impl_result(method, &[obj])?;
@@ -10483,7 +10494,7 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
     }
     Err(PyError::type_error(format!(
         "'{}' object is not iterable",
-        unsafe { (*(*obj).ob_type).name }
+        unsafe { not_iterable_type_name(obj) }
     )))
 }
 
