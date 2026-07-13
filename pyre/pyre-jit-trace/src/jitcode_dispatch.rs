@@ -7848,6 +7848,20 @@ fn fbw_loadattr_fold_enabled() -> bool {
     })
 }
 
+/// `PYRE_FBW_DELETE_FAST` — gate the full-body-walker DELETE_FAST lowering.
+/// Default ON; `0`/`false` opts back into the existing `abort_permanent`
+/// marker fallback for unsupported shapes.
+pub(crate) fn fbw_delete_fast_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_DELETE_FAST") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => true,
+    })
+}
+
 /// `PYRE_FBW_INLINE_NSFOLD` (default ON) — gates resolving an inlined callee's
 /// `getfield_vable_r` namespace(idx5)/pycode(idx1) read from the callee's
 /// compile-time [`InlineCalleeConsts`] on the MULTIFRAME path (seeded virtual

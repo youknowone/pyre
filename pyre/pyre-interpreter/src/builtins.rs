@@ -1856,9 +1856,7 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
         exception,
     );
     crate::dict_storage_store(namespace, "NameError", name_error);
-    // `exceptions.c` — `UnboundLocalError(NameError)`.  pyre raises a plain
-    // NameError for unbound locals, but the builtin name must exist for
-    // `except UnboundLocalError` clauses in copyreg / pickle.
+    // `exceptions.c` — `UnboundLocalError(NameError)`.
     crate::dict_storage_store(
         namespace,
         "UnboundLocalError",

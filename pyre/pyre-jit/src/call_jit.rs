@@ -5427,12 +5427,12 @@ pub extern "C" fn bh_unary_not_fn(value: i64) -> i64 {
 /// LOAD_FAST_CHECK residual (`load_fast_check` HLOp → `residual_call_ir_r`).
 /// The local slot is read from the vable exactly like LOAD_FAST and handed in
 /// as `value` (possibly `PY_NULL` for an unbound local).  Returns `value`
-/// unchanged when bound; on an unbound local raises `NameError`, resolving the
-/// variable name from the resume frame's code object via the `co_varnames`
-/// index baked in by the codewriter.  Reads no heap and runs no user code
-/// (`CallFlavor::Plain`); the exception is published through
-/// `BH_LAST_EXC_VALUE` for the trailing `GuardNoException` and the call
-/// returns 0.
+/// unchanged when bound; on an unbound local raises `UnboundLocalError`,
+/// resolving the variable name from the resume frame's code object via the
+/// `co_varnames` index baked in by the codewriter.  Reads no heap and runs no
+/// user code (`CallFlavor::Plain`); the exception is published through
+/// `BH_LAST_EXC_VALUE` for the trailing `GuardNoException` and the call returns
+/// 0.
 pub extern "C" fn bh_load_fast_check_fn(value: i64, w_code_ptr: i64, name_idx: i64) -> i64 {
     if value as pyre_object::PyObjectRef != pyre_object::PY_NULL {
         return value;
@@ -5452,9 +5452,9 @@ pub extern "C" fn bh_load_fast_check_fn(value: i64, w_code_ptr: i64, name_idx: i
     } else {
         "<cell>"
     };
-    let exc_obj = pyre_interpreter::PyError::new(
-        pyre_interpreter::PyErrorKind::NameError,
+    let exc_obj = pyre_interpreter::PyError::unbound_local_error_with_name(
         format!("local variable '{name}' referenced before assignment"),
+        name,
     )
     .to_exc_object();
     publish_residual_call_exception(exc_obj as i64);

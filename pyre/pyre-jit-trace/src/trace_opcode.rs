@@ -2418,6 +2418,23 @@ impl MIFrame {
         Ok(())
     }
 
+    pub(crate) fn delete_local_value(
+        &mut self,
+        ctx: &mut TraceCtx,
+        idx: usize,
+    ) -> Result<(), PyError> {
+        // eval.rs:delete_fast writes PY_NULL into locals_w[idx].  STORE_FAST
+        // reaches store_local_value through `setarrayitem_vable_r`; use the
+        // same virtualizable/local-slot writer with the unbound sentinel.
+        let null = ctx.const_ref(pyre_object::PY_NULL as i64);
+        self.store_local_value(
+            ctx,
+            idx,
+            null,
+            ConcreteValue::Ref(pyre_object::PY_NULL),
+        )
+    }
+
     pub(crate) fn set_next_instr(&mut self, _ctx: &mut TraceCtx, target: usize) {
         self.sym_mut().pending_next_instr = Some(target);
     }
@@ -7367,6 +7384,19 @@ impl MIFrame {
             } else {
                 "<cell>"
             };
+            let is_unbound = self.with_ctx(|this, ctx| {
+                let value = this.load_local_value(ctx, idx)?;
+                Ok::<_, PyError>(
+                    ctx.box_value(value)
+                        == Some(Value::Ref(GcRef(pyre_object::PY_NULL as usize))),
+                )
+            })?;
+            if is_unbound {
+                return Err(PyError::unbound_local_error_with_name(
+                    format!("local variable '{name}' referenced before assignment"),
+                    name,
+                ));
+            }
             OpcodeStepExecutor::load_fast_checked(self, idx, name)?;
             return Ok(Some(pyre_interpreter::StepResult::Continue));
         }
@@ -7403,6 +7433,21 @@ impl MIFrame {
             } else {
                 "<cell>"
             };
+            for (idx, name) in [(idx1, name1), (idx2, name2)] {
+                let is_unbound = self.with_ctx(|this, ctx| {
+                    let value = this.load_local_value(ctx, idx)?;
+                    Ok::<_, PyError>(
+                        ctx.box_value(value)
+                            == Some(Value::Ref(GcRef(pyre_object::PY_NULL as usize))),
+                    )
+                })?;
+                if is_unbound {
+                    return Err(PyError::unbound_local_error_with_name(
+                        format!("local variable '{name}' referenced before assignment"),
+                        name,
+                    ));
+                }
+            }
             OpcodeStepExecutor::load_fast_pair_checked(self, idx1, name1, idx2, name2)?;
             return Ok(Some(pyre_interpreter::StepResult::Continue));
         }
@@ -7505,6 +7550,18 @@ impl MIFrame {
             use pyre_interpreter::OpcodeStepExecutor;
             OpcodeStepExecutor::store_fast(self, var_num.get(op_arg).as_usize())?;
             return Ok(Some(pyre_interpreter::StepResult::Continue));
+        }
+
+        // DELETE_FAST walker activation via the same local-slot writer as
+        // STORE_FAST, but with PY_NULL as the value.  `PYRE_FBW_DELETE_FAST=0`
+        // falls through to the codewriter's `abort_permanent` fallback.
+        if let Instruction::DeleteFast { var_num } = instruction {
+            if crate::jitcode_dispatch::fbw_delete_fast_enabled() {
+                self.with_ctx(|this, ctx| {
+                    this.delete_local_value(ctx, var_num.get(op_arg).as_usize())
+                })?;
+                return Ok(Some(pyre_interpreter::StepResult::Continue));
+            }
         }
 
         // BINARY_OP walker activation via `OpcodeStepExecutor` delegation.

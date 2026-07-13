@@ -1577,7 +1577,7 @@ impl LocalOpcodeHandler for PyFrame {
     fn load_local_checked_value(&mut self, idx: usize, name: &str) -> Result<Self::Value, PyError> {
         let value = self.locals_w()[idx];
         if value.is_null() {
-            return Err(PyError::name_error_with_name(
+            return Err(PyError::unbound_local_error_with_name(
                 format!("local variable '{name}' referenced before assignment"),
                 name,
             ));

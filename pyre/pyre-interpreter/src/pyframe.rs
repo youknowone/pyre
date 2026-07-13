@@ -1411,9 +1411,6 @@ pub fn hidden_local(code: &CodeObject, idx: usize) -> bool {
 /// in the `[nvarnames, nvarnames + npure_cellvars)` band) reports "local
 /// variable '{name}' referenced before assignment"; a free variable reports
 /// "free variable '{name}' referenced before assignment in enclosing scope".
-/// pyre has no `UnboundLocalError`, so — like `load_local_checked_value` —
-/// both use `NameError`.
-///
 /// `idx` follows the `npure_cellvars` slot layout: `varnames` occupy
 /// `[0, nvarnames)`, pure cellvars (those not also varnames) the next
 /// `npure_cellvars` slots, then freevars.
@@ -1460,7 +1457,11 @@ pub fn deref_unbound_error(code: &CodeObject, idx: usize) -> crate::PyError {
     } else {
         format!("local variable '{name}' referenced before assignment")
     };
-    crate::PyError::name_error_with_name(message, name)
+    if is_free {
+        crate::PyError::name_error_with_name(message, name)
+    } else {
+        crate::PyError::unbound_local_error_with_name(message, name)
+    }
 }
 
 /// Whether calling a code object with these flags produces a suspended

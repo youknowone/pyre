@@ -54,6 +54,15 @@ fn local_to_vable_slot(var_num: usize) -> usize {
     var_num
 }
 
+/// `PYRE_FBW_DELETE_FAST` gates the walker-native DELETE_FAST lowering.
+/// Default ON; `0`/`false` restores the permanent-abort marker.
+#[inline]
+fn fbw_delete_fast_enabled() -> bool {
+    std::env::var("PYRE_FBW_DELETE_FAST")
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(true)
+}
+
 /// Re-export of `pyre_jit_trace::pyjitcode::portal_red_pre_regalloc_slots`
 /// so the codewriter pipeline shares the same formula with the
 /// portal-bridge install path in `canonical_bridge.rs`.  See the
@@ -3697,9 +3706,9 @@ fn register_helper_fn_pointers(
         cpu.unary_not_fn as *const (),
         CallFlavor::MayForce,
     );
-    // `bh_load_fast_check_fn` only null-checks the local and raises NameError;
-    // it reads no heap and runs no user code → `Plain`.  Appended last to
-    // preserve fn_ptr indices.
+    // `bh_load_fast_check_fn` only null-checks the local and raises
+    // UnboundLocalError; it reads no heap and runs no user code → `Plain`.
+    // Appended last to preserve fn_ptr indices.
     let load_fast_check_fn = bind(
         assembler,
         cpu.load_fast_check_fn as *const (),
@@ -10996,14 +11005,14 @@ impl CodeWriter {
                         }
 
                         // LOAD_FAST_CHECK: reads a local that may be unbound,
-                        // pushes it, and raises NameError when the slot is
+                        // pushes it, and raises UnboundLocalError when the slot is
                         // PY_NULL.  The local is read from the vable exactly
                         // like LOAD_FAST (`emit_load_fast_ref!`, inlining-safe
                         // via `frame_var`); the `load_fast_check(value, code,
                         // name_idx)` HLOp → `residual_call_ir_r(
                         // load_fast_check_fn, ListR[value, code],
                         // ListI[name_idx])` returns the value when bound or
-                        // raises the unbound NameError (`bh_load_fast_check_fn`,
+                        // raises the unbound UnboundLocalError (`bh_load_fast_check_fn`,
                         // CallFlavor::Plain — reads no heap, runs no user code).
                         // `name_idx` is the `co_varnames` index the residual
                         // resolves the variable name with.
@@ -11288,20 +11297,38 @@ impl CodeWriter {
                             current_state.store_local_value(idx as usize, result_value.into());
                         }
 
+                        Instruction::DeleteFast { var_num } => {
+                            if fbw_delete_fast_enabled() {
+                                let idx = var_num.get(op_arg).as_usize();
+                                let local_slot = local_to_vable_slot(idx) as i64;
+                                let v_idx: super::flow::FlowValue =
+                                    super::flow::Constant::signed(local_slot).into();
+                                // eval.rs:delete_fast writes PY_NULL into the
+                                // locals slot. Mirror STORE_FAST's
+                                // `setarrayitem_vable_r` local write with the
+                                // unbound sentinel as the value.
+                                record_graph_op(
+                                    &current_block.block(),
+                                    "setarrayitem_vable_r",
+                                    vable_setarrayitem_ref_graph_args(
+                                        frame_var.into(),
+                                        v_idx.into(),
+                                        super::flow::Constant::none().into(),
+                                    ),
+                                    None,
+                                    py_pc as i64,
+                                );
+                                current_state.store_local_value(
+                                    idx,
+                                    super::flow::Constant::none().into(),
+                                );
+                            } else {
+                                emit_abort_permanent!(py_pc);
+                            }
+                        }
+
                         // Instructions that don't touch the operand stack (locals/cells only).
-                        // DELETE_FAST aborts rather than lowering a localsplus-slot
-                        // clear: making it traceable lets `del`-bearing regions compile
-                        // (notably the implicit `del e` an `except E as e:` handler
-                        // emits), which surfaces latent miscompiles there — exception
-                        // `__context__` chaining and raising LOAD_FAST_CHECK side-exits.
-                        // The abort's resume coordinate (`last_instr = py_pc - 1`,
-                        // stored below by `emit_abort_permanent`) is honored by the
-                        // full-body walk's abort-point flush (`run_perfn_walk`), so a
-                        // `del`-bearing hot method resumes AT the del instead of
-                        // replaying the walked region's already-executed residual side
-                        // effects.
-                        Instruction::DeleteFast { .. }
-                        | Instruction::DeleteDeref { .. }
+                        Instruction::DeleteDeref { .. }
                         | Instruction::DeleteGlobal { .. }
                         | Instruction::DeleteName { .. }
                         | Instruction::SetupAnnotations => {

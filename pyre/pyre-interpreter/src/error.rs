@@ -346,6 +346,7 @@ pub enum PyErrorKind {
     ValueError,
     ZeroDivisionError,
     NameError,
+    UnboundLocalError,
     IndexError,
     KeyError,
     AttributeError,
@@ -499,12 +500,18 @@ impl PyError {
         Self::new(PyErrorKind::NotImplementedError, msg)
     }
 
-    /// `_PyEval_FormatExcCheckArg` parity — a NameError (or
-    /// UnboundLocalError, which pyre maps to NameError) carrying the
+    /// `_PyEval_FormatExcCheckArg` parity — a NameError carrying the
     /// undefined `name` so `e.name` reads back once the instance is
     /// materialised (Python 3.10+).
     pub fn name_error_with_name(msg: impl Into<String>, name: &str) -> Self {
         let mut err = Self::new(PyErrorKind::NameError, msg);
+        err.w_name_context = pyre_object::w_str_new(name);
+        err
+    }
+
+    /// UnboundLocalError(NameError) carrying the undefined local name.
+    pub fn unbound_local_error_with_name(msg: impl Into<String>, name: &str) -> Self {
+        let mut err = Self::new(PyErrorKind::UnboundLocalError, msg);
         err.w_name_context = pyre_object::w_str_new(name);
         err
     }
@@ -860,6 +867,7 @@ impl PyError {
             PyErrorKind::ValueError => ExcKind::ValueError,
             PyErrorKind::ZeroDivisionError => ExcKind::ZeroDivisionError,
             PyErrorKind::NameError => ExcKind::NameError,
+            PyErrorKind::UnboundLocalError => ExcKind::UnboundLocalError,
             PyErrorKind::IndexError => ExcKind::IndexError,
             PyErrorKind::KeyError => ExcKind::KeyError,
             PyErrorKind::AttributeError => ExcKind::AttributeError,
@@ -929,6 +937,7 @@ impl PyError {
             ExcKind::ValueError => PyErrorKind::ValueError,
             ExcKind::ZeroDivisionError => PyErrorKind::ZeroDivisionError,
             ExcKind::NameError => PyErrorKind::NameError,
+            ExcKind::UnboundLocalError => PyErrorKind::UnboundLocalError,
             ExcKind::IndexError => PyErrorKind::IndexError,
             ExcKind::KeyError => PyErrorKind::KeyError,
             ExcKind::AttributeError => PyErrorKind::AttributeError,
