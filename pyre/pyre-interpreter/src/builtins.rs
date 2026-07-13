@@ -6206,15 +6206,13 @@ fn exec_or_eval(
         }
     }
 
-    /// Ensure the globals dict OBJECT carries a str-keyed `DictStorage`
-    /// proxy for the bytecode globals fastpath (LOAD_GLOBAL /
-    /// STORE_GLOBAL / DELETE_GLOBAL).
+    /// Ensure the globals dict OBJECT carries the shadow `DictStorage`
+    /// required by the transitional back-mirror bridge.
     ///
     /// `pypy/interpreter/pyopcode.py:771-776` runs the frame on the user
-    /// dict directly; pyre's bytecode handlers still read a `*mut
-    /// DictStorage`, so the dict needs a storage proxy attached.  Module
-    /// dicts and dicts returned by `globals()` already carry one — reused
-    /// as-is, so a second `exec(src, g)` allocates nothing (heap-stable).
+    /// dict directly. Module dicts and dicts returned by `globals()` already
+    /// carry a proxy — reused as-is, so a second `exec(src, g)` allocates
+    /// nothing (heap-stable).
     ///
     /// A fresh dict (`exec(src, {})`) gets one storage allocated,
     /// pre-populated from its str-keyed entries (LOAD_GLOBAL must see
@@ -6226,10 +6224,10 @@ fn exec_or_eval(
     /// PyPy's single `W_DictMultiObject`.
     ///
     /// The storage is owned by the dict for its lifetime — functions
-    /// defined during the run capture the dict OBJECT as `__globals__` and
-    /// recover this storage via `get_w_globals_storage()` — so it is intentionally
-    /// leaked alongside the dict rather than freed.  Retires with the
-    /// `dict_storage_proxy` bridge when the dict becomes the single store.
+    /// defined during the run capture the dict OBJECT as `__globals__`, so it
+    /// is intentionally leaked alongside the dict rather than freed. Retires
+    /// with the `dict_storage_proxy` bridge when the dict becomes the single
+    /// store.
     fn ensure_globals_storage_proxy(w_globals: pyre_object::PyObjectRef) {
         if w_globals.is_null() {
             return;

@@ -3465,12 +3465,8 @@ impl OpcodeStepExecutor for PyFrame {
     // `maybe_sync_dict_storage_delete`.
     fn delete_global(&mut self, name: &str) -> Result<(), PyError> {
         let w_globals = self.get_w_globals();
-        let found: bool = if w_globals.is_null() {
-            let ns = self.get_w_globals_storage();
-            unsafe { crate::dict_storage_delete(&mut *ns, name) }
-        } else {
-            unsafe { pyre_object::w_dict_delitem_str(w_globals, name) }
-        };
+        let found =
+            !w_globals.is_null() && unsafe { pyre_object::w_dict_delitem_str(w_globals, name) };
         if !found {
             return Err(PyError::key_error(format!("'{name}'")));
         }

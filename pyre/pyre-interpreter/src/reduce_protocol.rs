@@ -47,15 +47,15 @@ fn handle(which: usize) -> PyObjectRef {
             let mut app_ns = Box::new(unsafe { (*ctx).fresh_dict_storage() });
             app_ns.fix_ptr();
             let app_ns_ptr: *mut crate::DictStorage = Box::leak(app_ns);
+            let w_app_globals = crate::baseobjspace::dict_storage_to_dict(app_ns_ptr);
             crate::importing::appleveldef_install(
                 unsafe { &mut *app_ns_ptr },
                 include_str!("reduce_protocol_app.py"),
                 "reduce_protocol_app.py",
                 &["reduce_1", "reduce_2", "get_slotvalues"],
             );
-            let ns = unsafe { &*app_ns_ptr };
             let get = |name: &str| {
-                crate::dict_storage_get(ns, name)
+                unsafe { pyre_object::w_dict_getitem_str(w_app_globals, name) }
                     .unwrap_or_else(|| panic!("reduce_protocol: `{name}` not bound"))
             };
             [get("reduce_1"), get("reduce_2"), get("get_slotvalues")]

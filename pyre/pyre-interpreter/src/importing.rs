@@ -1495,6 +1495,7 @@ fn exec_code_module(
     pathname: Option<&str>,
     cpathname: Option<&str>,
 ) -> Result<PyObjectRef, crate::PyError> {
+    let w_globals = crate::baseobjspace::dict_storage_to_dict(namespace);
     // importing.py:272-274 — setdefault('__builtins__', space.builtin).
     // `fresh_dict_storage` already seeds `__builtins__` for module-shape
     // namespaces; the explicit setdefault here mirrors PyPy's defensive
@@ -1503,7 +1504,7 @@ fn exec_code_module(
     // pointer with no surprises.
     {
         let ns = unsafe { &mut *namespace };
-        if crate::dict_storage_get(ns, "__builtins__").is_none() {
+        if unsafe { pyre_object::w_dict_getitem_str(w_globals, "__builtins__") }.is_none() {
             let ctx = unsafe { &*execution_context };
             let w_builtin = ctx.get_builtin();
             if !w_builtin.is_null() {
@@ -1541,10 +1542,10 @@ fn exec_code_module(
         // (_bootstrap_external.py:1732, 1739).  When the importlib
         // app-level layer lands, the `None` arms will collapse onto the
         // mechanical PyPy port.
-        if crate::dict_storage_get(ns, "__loader__").is_none() {
+        if unsafe { pyre_object::w_dict_getitem_str(w_globals, "__loader__") }.is_none() {
             crate::dict_storage_store(ns, "__loader__", pyre_object::w_none());
         }
-        if crate::dict_storage_get(ns, "__spec__").is_none() {
+        if unsafe { pyre_object::w_dict_getitem_str(w_globals, "__spec__") }.is_none() {
             crate::dict_storage_store(ns, "__spec__", pyre_object::w_none());
         }
     }
@@ -1596,9 +1597,9 @@ pub fn appleveldef_install(ns: &mut DictStorage, source: &str, filename: &str, n
     if let Err(e) = frame.run_with_jit() {
         panic!("appleveldef `{filename}`: exec — {e:?}");
     }
-    let app_ns_ref = unsafe { &*app_ns_ptr };
+    let w_app_globals = frame.get_w_globals();
     for &name in names {
-        match crate::dict_storage_get(app_ns_ref, name) {
+        match unsafe { pyre_object::w_dict_getitem_str(w_app_globals, name) } {
             Some(val) => crate::dict_storage_store(ns, name, val),
             None => panic!("appleveldef `{filename}`: name `{name}` not bound by source"),
         }

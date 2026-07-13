@@ -8728,46 +8728,12 @@ pub fn pick_builtin(
     w_globals: *mut crate::DictStorage,
     exec_ctx: *const crate::PyExecutionContext,
 ) -> PyObjectRef {
-    if !w_globals.is_null() {
-        if let Some(w_builtin) = crate::dict_storage_get(unsafe { &*w_globals }, "__builtins__") {
-            if !w_builtin.is_null() {
-                // moduledef.py:100-101 `if w_builtin is space.builtin: return
-                // space.builtin` — Module identity short-circuit.
-                if !exec_ctx.is_null() {
-                    let space_builtin = unsafe { (*exec_ctx).get_builtin() };
-                    if !space_builtin.is_null() && std::ptr::eq(w_builtin, space_builtin) {
-                        return w_builtin;
-                    }
-                }
-                // moduledef.py:104 `isinstance(w_builtin, module.Module)`.
-                if unsafe { pyre_object::is_module(w_builtin) } {
-                    return w_builtin;
-                }
-                // moduledef.py:102-103 `space.isinstance_w(w_builtin, w_dict)`.
-                // PyPy: `return module.Module(space, None, w_builtin)` —
-                // a Module wrapping the caller's dict.  `LOAD_GLOBAL`
-                // falls through to `space.finditem_str(w_module.w_dict,
-                // name)`, dispatching through any dict subclass
-                // `__getitem__` override.
-                let backing = crate::type_methods::resolve_dict_backing(w_builtin);
-                if !backing.is_null() {
-                    return pyre_object::w_module_new_aliasing_dict(
-                        "",
-                        std::ptr::null_mut(),
-                        w_builtin,
-                    );
-                }
-                // Fall through — `__builtins__` is not Module/dict (e.g.
-                // `42`, a list, ...).  PyPy moduledef.py:106-108 builds
-                // the default empty Module here.
-            }
-        }
-    }
-    // moduledef.py:106-108 default — anonymous Module with only
-    // `None=w_None`.  This is reached when (a) `w_globals` is null,
-    // (b) `__builtins__` is absent from globals, or (c) `__builtins__`
-    // is not Module/dict.
-    build_default_pick_builtin_module()
+    let w_globals = if w_globals.is_null() {
+        pyre_object::PY_NULL
+    } else {
+        dict_storage_to_dict(w_globals)
+    };
+    pick_builtin_obj(w_globals, exec_ctx)
 }
 
 /// Object-based `pick_builtin` for call frames whose globals came from

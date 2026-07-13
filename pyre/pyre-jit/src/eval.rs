@@ -4177,11 +4177,11 @@ fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
 
 fn log_named_global_result(frame: &PyFrame, label: &str) {
     unsafe {
-        let ns = frame.get_w_globals_storage();
-        if ns.is_null() {
+        let w_globals = frame.get_w_globals();
+        if w_globals.is_null() {
             return;
         }
-        let Some(&value) = (*ns).get("result") else {
+        let Some(value) = pyre_object::w_dict_getitem_str(w_globals, "result") else {
             return;
         };
         if value.is_null() {
