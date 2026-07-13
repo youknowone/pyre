@@ -674,6 +674,15 @@ pub enum PyreHelperKind {
     /// virtualized New), so the following `selected_ref.head = new_node`
     /// remains a normal committed setfield. has_oopspec stays false.
     NurseryAlloc,
+    /// `bh_load_method_self_fn(obj, attr, code, name_idx)` — the LOAD_METHOD
+    /// binding half (`callmethod.py:25-85`).  The full-body walker recognises
+    /// this tag to fold the pure `compute_load_method_bound` decision once the
+    /// paired [`LoadAttr`] method-cache fold has made `attr` concrete.
+    ///
+    /// Keep this at the enum tail: [`PyreHelperKind`] is `repr(u8)`, and
+    /// inserting a helper in the middle changes existing discriminants consumed
+    /// by serialized/stable helper metadata.
+    LoadMethodSelf,
 }
 
 impl EffectInfo {

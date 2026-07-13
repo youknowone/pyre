@@ -7848,6 +7848,22 @@ fn fbw_loadattr_fold_enabled() -> bool {
     })
 }
 
+/// `PYRE_FBW_LOADMETHOD_FOLD` — gate the full-body-walker method-cache fold.
+/// When on, a monomorphic `obj.method(...)` dispatch folds the LOAD_ATTR
+/// method lookup to a constant descriptor plus guards, and folds the paired
+/// `load_method_self` residual to its constant binding decision.  Default ON;
+/// `0`/`false` opts out as the kill switch.
+fn fbw_loadmethod_fold_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_LOADMETHOD_FOLD") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => true,
+    })
+}
+
 /// `PYRE_FBW_DELETE_FAST` — gate the full-body-walker DELETE_FAST lowering.
 /// Default ON; `0`/`false` opts back into the existing `abort_permanent`
 /// marker fallback for unsupported shapes.
@@ -13499,6 +13515,49 @@ fn inline_resolvable_seeded_frame_op(
     }
 }
 
+fn residual_call_helper_kind_in_body(
+    body_code: &[u8],
+    d: &DecodedOp,
+    callee_descr_refs: &[DescrRef],
+) -> Option<majit_ir::PyreHelperKind> {
+    let descr_offset = match d.key {
+        "residual_call_r_r/iRd>r" | "residual_call_r_i/iRd>i" | "residual_call_r_v/iRd" => {
+            let r_len_pc = d.pc + 2;
+            let r_len = *body_code.get(r_len_pc)? as usize;
+            1 + 1 + r_len
+        }
+        "residual_call_ir_r/iIRd>r" | "residual_call_ir_i/iIRd>i" | "residual_call_ir_v/iIRd" => {
+            let i_len_pc = d.pc + 2;
+            let i_width = 1 + *body_code.get(i_len_pc)? as usize;
+            let r_len_pc = d.pc + 1 + 1 + i_width;
+            let r_width = 1 + *body_code.get(r_len_pc)? as usize;
+            1 + i_width + r_width
+        }
+        _ => return None,
+    };
+    let descr_index = decode_descr_index(body_code, d, descr_offset);
+    callee_descr_refs
+        .get(descr_index)
+        .and_then(|descr| descr.as_call_descr())
+        .map(|cd| cd.get_extra_info().pyre_helper)
+}
+
+fn method_form_callee_body_supported(body_code: &[u8], callee_descr_refs: &[DescrRef]) -> bool {
+    let mut pc = 0usize;
+    while pc < body_code.len() {
+        let Some(d) = crate::jitcode_runtime::decode_op_at(body_code, pc) else {
+            return false;
+        };
+        if residual_call_helper_kind_in_body(body_code, &d, callee_descr_refs)
+            == Some(majit_ir::PyreHelperKind::LoadAttr)
+        {
+            return false;
+        }
+        pc = d.next_pc;
+    }
+    true
+}
+
 /// Active boxes for an inlined callee's OWN frame in a multi-frame snapshot
 /// (#68).  The fast-path inline predicate guarantees the callee does not own a
 /// virtualizable (any vable op declines the inline), so the owns_vable /
@@ -14116,11 +14175,10 @@ fn emit_loop_callee_ca_vable_scalar(
 ///   propagated as a trace abort (sound — aborts to the interpreter rather
 ///   than mixing inlined + residual emission).
 ///
-/// Arg layout: `r_args = [callable@0, null_or_self@1, positional@2..]`
-/// (the `call_fn` family carries no frame argument; the parent frame is
-/// resolved from the execution context inside `bh_call_fn_impl`, which
-/// prepends a non-null `null_or_self` as arg0).  Only the plain-call
-/// shape (concretely-NULL `null_or_self`) is inlined.
+/// Arg layout: `r_args = [callable@0, null_or_self@1, positional@2..]`.
+/// `bh_call_fn_impl` prepends a non-null `null_or_self` as arg0, so the
+/// inlined callee's positional locals are either `positional` for plain calls
+/// or `[null_or_self, positional...]` for method-form calls.
 /// Only exact-positional, closure-free callees are inlined.  Guards inside a
 /// pure-leaf callee resume to the caller's CALL boundary via the inherited
 /// single-frame snapshot (`entry_py_pc` / `outer_active_boxes`), which is
@@ -14148,6 +14206,7 @@ fn try_walker_inline_user_call(
     ctx: &mut WalkContext<'_, '_>,
     op: &DecodedOp,
     code: &[u8],
+    ref_operand_offset: usize,
     funcptr: OpRef,
     r_args: &[OpRef],
     call_descr: &dyn majit_ir::descr::CallDescr,
@@ -14190,9 +14249,16 @@ fn try_walker_inline_user_call(
     if r_args.is_empty() {
         return Ok(None);
     }
-    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
+    let mut arg_concretes = read_ref_var_list_concrete(code, op, ref_operand_offset, ctx);
     if r_args.len() < 2 {
         return Ok(None);
+    }
+    for i in 0..2 {
+        if matches!(arg_concretes.get(i), Some(ConcreteValue::Null)) {
+            if let Some(majit_ir::Value::Ref(r)) = ctx.trace_ctx.box_value(r_args[i]) {
+                arg_concretes[i] = ConcreteValue::Ref(r.as_usize() as pyre_object::PyObjectRef);
+            }
+        }
     }
     let ConcreteValue::Ref(callable) = arg_concretes[0] else {
         return Ok(None);
@@ -14200,24 +14266,25 @@ fn try_walker_inline_user_call(
     if callable.is_null() {
         return Ok(None);
     }
-    // Plain-call shape only: a non-null `null_or_self` is a method
-    // receiver `bh_call_fn_impl` would prepend as arg0; an unknown
-    // concrete cannot be proven plain.  Either way, decline to the
-    // residual call.
     let ConcreteValue::Ref(null_or_self) = arg_concretes[1] else {
         return Ok(None);
     };
-    if !null_or_self.is_null() {
-        return Ok(None);
+    let method_form = !null_or_self.is_null();
+    let mut callee_args = Vec::with_capacity(r_args.len().saturating_sub(1));
+    let mut callee_arg_concretes = Vec::with_capacity(arg_concretes.len().saturating_sub(1));
+    if method_form {
+        callee_args.push(r_args[1]);
+        callee_arg_concretes.push(arg_concretes[1]);
     }
+    callee_args.extend_from_slice(&r_args[2..]);
+    callee_arg_concretes.extend_from_slice(&arg_concretes[2..]);
     let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(callable) })
     else {
         return Ok(None);
     };
-    let nargs_passed = r_args.len() - 2;
     // Only exact-positional, closure-free calls: every callee local [0..nparams]
     // is bound from a passed arg, none from defaults/varargs/cells.
-    if has_closure || nargs_passed != nparams {
+    if has_closure || callee_args.len() != nparams {
         return Ok(None);
     }
     // Bound recursive inlining at `max_unroll_recursion`: a callee already
@@ -14245,6 +14312,9 @@ fn try_walker_inline_user_call(
     else {
         return Ok(None);
     };
+    if method_form && !method_form_callee_body_supported(body.code, callee_descr_refs) {
+        return Ok(None);
+    }
     if std::env::var("PYRE_FBW_INLINE_DIAG").is_ok() {
         let mut pc = 0usize;
         let mut shown = 0;
@@ -14377,6 +14447,14 @@ fn try_walker_inline_user_call(
         // the multiframe fast path can serve declines to the trait leg
         // (`FBW_DECLINED_KEYS`).  Self-recursive calls were already routed to
         // the `CALL_ASSEMBLER` fold or plain residual path above (`Ok(None)`).
+        //
+        // For method-form calls reached through the LOAD_METHOD fold, decline
+        // locally instead.  The fold's first-order win is the guarded method
+        // cache; making an uninlineable method body blacklist the whole outer
+        // loop turns a correct specialization into a compile regression.
+        if method_form {
+            return Ok(None);
+        }
         return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });
     }
 
@@ -14439,8 +14517,8 @@ fn try_walker_inline_user_call(
         if reg >= callee_regs_r.len() {
             return Ok(None);
         }
-        callee_regs_r[reg] = r_args[2 + i];
-        callee_concrete_r[reg] = arg_concretes[2 + i];
+        callee_regs_r[reg] = callee_args[i];
+        callee_concrete_r[reg] = callee_arg_concretes[i];
     }
 
     // #68: seed the callee's `frame` / `ec` reds that the codewriter
@@ -14585,7 +14663,7 @@ fn try_walker_inline_user_call(
 
             let pycode_const = ctx.trace_ctx.const_ref(w_code as i64);
             let w_globals_obj_const = ctx.trace_ctx.const_ref(inline_consts.w_globals as i64);
-            let param_boxes: Vec<OpRef> = (0..nparams).map(|i| r_args[2 + i]).collect();
+            let param_boxes: Vec<OpRef> = (0..nparams).map(|i| callee_args[i]).collect();
             let callee_frame = crate::helpers::emit_new_pyframe_inline_with_params(
                 ctx.trace_ctx,
                 &param_boxes,
@@ -14880,10 +14958,10 @@ fn try_walker_inline_user_call(
             sub_wc.callee_shadow.as_mut().unwrap().fold_frame_reg = callee_portal_frame_reg;
             for i in 0..nparams {
                 let slot = i as i64;
-                let value = r_args[2 + i];
+                let value = callee_args[i];
                 let concrete = sub_wc
                     .trace_ctx
-                    .concrete_of_opref(r_args[2 + i])
+                    .concrete_of_opref(callee_args[i])
                     .unwrap_or(majit_ir::Value::Void);
                 let shadow = sub_wc.callee_shadow.as_mut().unwrap();
                 shadow.set_opref(slot, value);
@@ -15003,7 +15081,7 @@ fn try_walker_inline_user_call(
                                 Value::Float(v) => Some(ConcreteValue::Float(v)),
                                 Value::Void => None,
                             })
-                            .or_else(|| arg_concretes.get(2 + slot).copied())?;
+                            .or_else(|| callee_arg_concretes.get(slot).copied())?;
                         if matches!(value, ConcreteValue::Null | ConcreteValue::Bool(_)) {
                             return None;
                         }
@@ -15021,7 +15099,8 @@ fn try_walker_inline_user_call(
                         unsafe { &*outer_jc.payload.code_ptr },
                         call_py_pc + 1,
                     );
-                    let Some(ConcreteValue::Ref(x_arg)) = arg_concretes.get(2).copied() else {
+                    let Some(ConcreteValue::Ref(x_arg)) = callee_arg_concretes.first().copied()
+                    else {
                         return None;
                     };
                     Some(MidBodyPayload {
@@ -15216,6 +15295,7 @@ fn dispatch_residual_call_iRd_kind(
         ctx,
         op,
         code,
+        1,
         funcptr,
         &r_args,
         call_descr,
@@ -15370,13 +15450,8 @@ fn dispatch_residual_call_iRd_kind(
                 ctx.trace_ctx.box_value(frame_opref),
                 ctx.trace_ctx.box_value(name_opref),
             ) {
-                if try_walker_store_name_cell_fold(
-                    ctx,
-                    op.pc,
-                    frame_ptr,
-                    w_name_ptr,
-                    value_opref,
-                )? {
+                if try_walker_store_name_cell_fold(ctx, op.pc, frame_ptr, w_name_ptr, value_opref)?
+                {
                     return Ok((DispatchOutcome::Continue, op.next_pc));
                 }
             }
@@ -17288,16 +17363,8 @@ fn try_walker_specialize_load_attr(
     };
     // Resolve the attribute name from the jitcode's own PyCode `co_names`
     // (mirrors `bh_load_attr_fn`; the codewriter passes the raw co_names index).
-    let name = unsafe {
-        let code_ptr = pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef);
-        if code_ptr.is_null() {
-            return Ok(None);
-        }
-        let code = &*(code_ptr as *const pyre_interpreter::CodeObject);
-        match pyre_interpreter::pyframe::load_name_from_code(code, name_idx) {
-            Some(n) => n.to_string(),
-            None => return Ok(None),
-        }
+    let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
+        return Ok(None);
     };
     // `mapdict.py:1495-1533` resolution, returning the fold ingredients (the
     // read is left to the caller so it can be folded to a guarded inline read).
@@ -17344,6 +17411,242 @@ fn try_walker_specialize_load_attr(
     let idx_const = ctx.trace_ctx.const_int(storageindex as i64);
     let value = crate::state::trace_items_block_getitem_value(ctx.trace_ctx, block, idx_const);
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, value)?;
+    Ok(Some(()))
+}
+
+fn walker_load_name_from_code(w_code_ptr: usize, name_idx: usize) -> Option<String> {
+    unsafe {
+        let code_ptr = pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef);
+        if code_ptr.is_null() {
+            return None;
+        }
+        let code = &*(code_ptr as *const pyre_interpreter::CodeObject);
+        pyre_interpreter::pyframe::load_name_from_code(code, name_idx).map(ToString::to_string)
+    }
+}
+
+fn walker_record_getfield_gc_i_uncached(
+    ctx: &mut WalkContext<'_, '_>,
+    obj: OpRef,
+    descr: DescrRef,
+) -> OpRef {
+    let opcode = if descr.is_always_pure() {
+        OpCode::GetfieldGcPureI
+    } else {
+        OpCode::GetfieldGcI
+    };
+    ctx.trace_ctx.record_op_with_descr(opcode, &[obj], descr)
+}
+
+fn walker_record_getfield_gc_r_uncached(
+    ctx: &mut WalkContext<'_, '_>,
+    obj: OpRef,
+    descr: DescrRef,
+) -> OpRef {
+    let opcode = if descr.is_always_pure() {
+        OpCode::GetfieldGcPureR
+    } else {
+        OpCode::GetfieldGcR
+    };
+    ctx.trace_ctx.record_op_with_descr(opcode, &[obj], descr)
+}
+
+/// True only when this `LoadAttr` residual is immediately consumed by the
+/// paired `load_method_self(obj, attr, code, name_idx)` residual emitted for
+/// `LOAD_METHOD`.  Plain `LOAD_ATTR` of a function descriptor must keep the
+/// normal bound-method semantics and cannot be rewritten to the raw function.
+fn next_op_is_load_method_self_for_attr(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &WalkContext<'_, '_>,
+    attr_dst_reg: usize,
+) -> bool {
+    let Some(mut next) = crate::jitcode_runtime::decode_op_at(code, op.next_pc) else {
+        return false;
+    };
+    while next.opname == "live"
+        || next.opname.starts_with("setarrayitem_vable")
+        || next.opname.starts_with("setfield_vable")
+    {
+        let Some(after_live) = crate::jitcode_runtime::decode_op_at(code, next.next_pc) else {
+            return false;
+        };
+        next = after_live;
+    }
+    if next.key != "residual_call_ir_r/iIRd>r" {
+        return false;
+    }
+    let i_len_pc = next.pc + 2;
+    let Some(&i_len_byte) = code.get(i_len_pc) else {
+        return false;
+    };
+    let i_width = 1 + i_len_byte as usize;
+    let r_len_pc = next.pc + 1 + 1 + i_width;
+    let Some(&r_len_byte) = code.get(r_len_pc) else {
+        return false;
+    };
+    let r_len = r_len_byte as usize;
+    if r_len < 2 {
+        return false;
+    }
+    let Some(&attr_reg_byte) = code.get(r_len_pc + 1 + 1) else {
+        return false;
+    };
+    if attr_reg_byte as usize != attr_dst_reg {
+        return false;
+    }
+    let r_width = 1 + r_len;
+    let descr_offset = 1 + i_width + r_width;
+    let descr_index = decode_descr_index(code, &next, descr_offset);
+    ctx.descr_refs
+        .get(descr_index)
+        .and_then(|descr| descr.as_call_descr())
+        .is_some_and(|cd| {
+            cd.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::LoadMethodSelf
+        })
+}
+
+/// `callmethod.py:25-85 LOAD_METHOD` method-cache fold for the
+/// codewriter's method-form `LOAD_ATTR` residual.  The safety oracle is the
+/// interpreter's `load_method_fast_path`: it declines custom
+/// `__getattribute__`, uncacheable types, non-function descriptors,
+/// shadowing instance attributes, and non-instance receivers.  On success the
+/// walker emits the guards that keep that decision stable, then writes
+/// `w_descr` as a green constant so the following `CALL` can use the existing
+/// constant-callee inline path.
+#[allow(clippy::too_many_arguments)]
+fn try_walker_specialize_load_method_attr(
+    ctx: &mut WalkContext<'_, '_>,
+    op_pc: usize,
+    obj: OpRef,
+    w_code_ptr: usize,
+    name_idx: usize,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    if !ctx.is_authoritative_executor || !ctx.is_full_body_walk || dst_bank != 'r' {
+        return Ok(None);
+    }
+    let Some(concrete_obj) = walker_concrete_ref_object(ctx, obj) else {
+        return Ok(None);
+    };
+    let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
+        return Ok(None);
+    };
+    if name.contains("__") {
+        return Ok(None);
+    }
+    let Some((w_type, version_tag, w_descr)) =
+        (unsafe { pyre_interpreter::load_method_fast_path(concrete_obj, &name) })
+    else {
+        return Ok(None);
+    };
+    if unsafe { resolve_inlinable_callee(w_descr) }.is_none() {
+        return Ok(None);
+    }
+    let map = unsafe {
+        let inst = &*(concrete_obj as *const pyre_object::W_ObjectObject);
+        inst.map
+    };
+    if map.is_null() {
+        return Ok(None);
+    }
+
+    // guard_class(obj, &INSTANCE_TYPE): receiver is a user instance, so the
+    // `w_class` and map fields read below are valid.
+    let instance_type_addr = &pyre_object::pyobject::INSTANCE_TYPE as *const _ as i64;
+    if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
+        let type_const = ctx.trace_ctx.const_int(instance_type_addr);
+        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardClass, &[obj, type_const])?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .class_now_known(obj, instance_type_addr);
+    }
+
+    // Pin the Python-level receiver class (`w_class`) exactly.  This is the
+    // per-frame method namespace anchor: a subclass with the same instance
+    // payload vtable side-exits instead of reusing the caller's method.
+    let w_class_op = walker_record_getfield_gc_r_uncached(ctx, obj, crate::descr::w_class_descr());
+    let w_type_const = ctx.trace_ctx.const_ref(w_type as i64);
+    walker_emit_fold_guard_with_snapshot(
+        ctx,
+        op_pc,
+        OpCode::GuardValue,
+        &[w_class_op, w_type_const],
+    )?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .replace_box(w_class_op, w_type_const);
+
+    // typeobject.py:506 `promote(self.version_tag())`: class mutation or method
+    // reassignment bumps `_version_tag`, so the old `w_descr` side-exits.
+    let vt_op = walker_record_getfield_gc_i_uncached(
+        ctx,
+        w_type_const,
+        crate::descr::type_version_tag_descr(),
+    );
+    let vt_const = ctx.trace_ctx.const_int(version_tag as i64);
+    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[vt_op, vt_const])?;
+    ctx.trace_ctx.heap_cache_mut().replace_box(vt_op, vt_const);
+
+    // mapdict.py LOAD_ATTR caching: guard the instance map so adding a
+    // shadowing `obj.method` attribute changes shape and side-exits before the
+    // constant descriptor is reused.
+    let map_op = walker_record_getfield_gc_i_uncached(ctx, obj, crate::descr::object_map_descr());
+    let map_const = ctx.trace_ctx.const_int(map as i64);
+    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[map_op, map_const])?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .replace_box(map_op, map_const);
+
+    let method_const = ctx.trace_ctx.const_ref(w_descr as i64);
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, method_const)?;
+    Ok(Some(()))
+}
+
+/// Fold `bh_load_method_self_fn(obj, attr, code, name_idx)` once both the
+/// receiver and the attribute are concrete.  The method-attribute fold above
+/// already guards class, type version, and instance map; this second residual
+/// is only the pure `compute_load_method_bound` binding decision.  A plain
+/// instance-method bind writes the original red receiver box, not a baked
+/// `ConstRef`, matching `callmethod.py:68 f.pushvalue(w_obj)`.
+#[allow(clippy::too_many_arguments)]
+fn try_walker_fold_load_method_self(
+    ctx: &mut WalkContext<'_, '_>,
+    op_pc: usize,
+    obj: OpRef,
+    attr: OpRef,
+    _attr_reg: usize,
+    w_code_ptr: usize,
+    name_idx: usize,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    if !ctx.is_authoritative_executor || !ctx.is_full_body_walk || dst_bank != 'r' {
+        return Ok(None);
+    }
+    let Some(concrete_obj) = walker_concrete_ref_object(ctx, obj) else {
+        return Ok(None);
+    };
+    let Some(concrete_attr) = walker_concrete_ref_object(ctx, attr) else {
+        return Ok(None);
+    };
+    if unsafe { pyre_object::is_method(concrete_attr) } {
+        return Ok(None);
+    };
+    let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
+        return Ok(None);
+    };
+    let bound =
+        pyre_interpreter::eval::compute_load_method_bound(concrete_obj, concrete_attr, &name);
+    let bound_op = if std::ptr::eq(bound, concrete_obj) {
+        obj
+    } else if bound == pyre_object::PY_NULL {
+        ctx.trace_ctx.const_ref(pyre_object::PY_NULL as i64)
+    } else {
+        return Ok(None);
+    };
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, bound_op)?;
     Ok(Some(()))
 }
 
@@ -20451,6 +20754,26 @@ fn dispatch_residual_call_iIRd_kind(
     // `dispatch_residual_call_iRd_kind` for the rationale.
     do_jit_force_virtual_guard(ei, op.pc)?;
 
+    // Method-form `CALL` helpers lower through the mixed int/ref residual
+    // shape (`bh_call_fn_N(callable, null_or_self, args...)` carries the call
+    // arity in the Int list).  Share the same user-function inline gate as the
+    // plain Ref-only residual, but read the concrete Ref shadows from the
+    // shifted R-list offset.
+    if let Some(inlined) = try_walker_inline_user_call(
+        ctx,
+        op,
+        code,
+        1 + i_width,
+        funcptr,
+        &r_args,
+        call_descr,
+        ei.pyre_helper,
+        dst_bank,
+        dst,
+    )? {
+        return Ok(inlined);
+    }
+
     // LoadConst fold: the LOAD_CONST helper (oopspec `LoadConst`, set
     // codewriter-side at flatten.rs
     // `build_residual_call_ir_r_single_ref_plain_insn_from_operands`)
@@ -20676,6 +20999,77 @@ fn dispatch_residual_call_iIRd_kind(
                     ctx,
                     op.pc,
                     obj_opref,
+                    w_code_ptr,
+                    namei as usize,
+                    dst,
+                    dst_bank,
+                )?
+                .is_some()
+                {
+                    return Ok((DispatchOutcome::Continue, op.next_pc));
+                }
+            }
+        }
+    }
+    if ctx.is_authoritative_executor
+        && ctx.is_full_body_walk
+        && ei.pyre_helper == majit_ir::PyreHelperKind::LoadAttr
+        && fbw_loadmethod_fold_enabled()
+        && next_op_is_load_method_self_for_attr(code, op, ctx, dst)
+    {
+        if let (Some(&obj_opref), Some(&code_opref), Some(&namei_opref)) =
+            (r_args.first(), r_args.get(1), i_args.first())
+        {
+            if let (
+                Some(majit_ir::Value::Ref(majit_ir::GcRef(w_code_ptr))),
+                Some(majit_ir::Value::Int(namei)),
+            ) = (
+                ctx.trace_ctx.box_value(code_opref),
+                ctx.trace_ctx.box_value(namei_opref),
+            ) {
+                if try_walker_specialize_load_method_attr(
+                    ctx,
+                    op.pc,
+                    obj_opref,
+                    w_code_ptr,
+                    namei as usize,
+                    dst,
+                    dst_bank,
+                )?
+                .is_some()
+                {
+                    return Ok((DispatchOutcome::Continue, op.next_pc));
+                }
+            }
+        }
+    }
+    if ctx.is_authoritative_executor
+        && ctx.is_full_body_walk
+        && ei.pyre_helper == majit_ir::PyreHelperKind::LoadMethodSelf
+        && fbw_loadmethod_fold_enabled()
+    {
+        if let (Some(&namei_opref), Some(&obj_opref), Some(&attr_opref), Some(&code_opref)) =
+            (i_args.first(), r_args.first(), r_args.get(1), r_args.get(2))
+        {
+            let r_len_pc = op.pc + 1 + 1 + i_width;
+            let attr_reg = code
+                .get(r_len_pc + 1 + 1)
+                .copied()
+                .map(usize::from)
+                .unwrap_or(usize::MAX);
+            if let (
+                Some(majit_ir::Value::Int(namei)),
+                Some(majit_ir::Value::Ref(majit_ir::GcRef(w_code_ptr))),
+            ) = (
+                ctx.trace_ctx.box_value(namei_opref),
+                ctx.trace_ctx.box_value(code_opref),
+            ) {
+                if try_walker_fold_load_method_self(
+                    ctx,
+                    op.pc,
+                    obj_opref,
+                    attr_opref,
+                    attr_reg,
                     w_code_ptr,
                     namei as usize,
                     dst,

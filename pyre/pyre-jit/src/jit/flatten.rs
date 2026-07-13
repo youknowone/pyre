@@ -4008,7 +4008,8 @@ pub fn build_load_method_self_fn_residual_call_ir_r_insn(
     code_operand: Operand,
     dst_reg: u16,
 ) -> Insn {
-    let effect_info = effect_info_for_call_flavor(CallFlavor::PlainCannotRaise);
+    let mut effect_info = effect_info_for_call_flavor(CallFlavor::PlainCannotRaise);
+    effect_info.pyre_helper = majit_ir::PyreHelperKind::LoadMethodSelf;
     let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
         effect_info,
         arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Int],
@@ -6412,7 +6413,8 @@ where
         Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
         _ => return None,
     };
-    let effect_info = effect_info_for_call_flavor(CallFlavor::PlainCannotRaise);
+    let mut effect_info = effect_info_for_call_flavor(CallFlavor::PlainCannotRaise);
+    effect_info.pyre_helper = majit_ir::PyreHelperKind::LoadMethodSelf;
     let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
         effect_info,
         arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Int],
