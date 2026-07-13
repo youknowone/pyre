@@ -3181,6 +3181,21 @@ fn build_function(
                         sink.i64_load(mem64(frame.call_result_ofs));
                         sink.local_set(1 + vi);
                     }
+                    // Mirror the direct path: a trampoline residual call may force and collect.
+                    emit_reload_frame_if_necessary(
+                        &mut sink,
+                        residual_type_base,
+                        ca.ca_reload_fn_ptr,
+                        ca.jf_top_addr,
+                    );
+                    emit_reload_refs_from_homes(
+                        &mut sink,
+                        ref_homes,
+                        &liveness,
+                        op_idx,
+                        (!is_void && !OpRef::raw_is_constant(vi)).then_some(vi),
+                        frame,
+                    );
                 }
             }
 
