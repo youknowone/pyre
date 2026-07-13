@@ -206,11 +206,22 @@ impl OpGuard {
     #[inline]
     fn enter() -> Self {
         let prev = GC_OP_OWNER.swap(my_ident(), Ordering::SeqCst);
-        debug_assert!(
+        assert!(
             prev == 0,
             "GC singleton exclusivity invariant violated: concurrent &mut access"
         );
         OpGuard { prev }
+    }
+}
+
+/// Releases an acquired fast-path gate on both normal return and unwind.
+struct FastPathGate {
+    restore: usize,
+}
+impl Drop for FastPathGate {
+    #[inline]
+    fn drop(&mut self) {
+        IN_FAST_PATH.store(self.restore, Ordering::Release);
     }
 }
 impl Drop for OpGuard {
@@ -384,6 +395,7 @@ pub fn gc_op<R>(f: impl FnOnce(&mut dyn GcAllocator) -> R) -> R {
             .compare_exchange(0, ident, Ordering::Acquire, Ordering::Relaxed)
             .is_ok()
     {
+        let _fast_path_gate = FastPathGate { restore: 0 };
         // Recheck after acquiring the fast-path lock: another thread may have
         // registered or requested STW after the eligibility loads above.
         if REGISTERED_THREADS.load(Ordering::Acquire) <= 1
@@ -395,10 +407,8 @@ pub fn gc_op<R>(f: impl FnOnce(&mut dyn GcAllocator) -> R) -> R {
                 let _op = OpGuard::enter();
                 f(unsafe { singleton_mut() })
             };
-            IN_FAST_PATH.store(0, Ordering::Release);
             return r;
         }
-        IN_FAST_PATH.store(0, Ordering::Release);
     }
     gc_op_slow(f)
 }
@@ -442,6 +452,7 @@ fn gc_op_slow<R>(f: impl FnOnce(&mut dyn GcAllocator) -> R) -> R {
             std::hint::spin_loop();
         }
     }
+    let _fast_path_gate = (!self_holds_fast_path).then_some(FastPathGate { restore: 0 });
 
     if registered {
         let mut state = GC_SYNC.quiesce.lock().unwrap();
@@ -466,9 +477,6 @@ fn gc_op_slow<R>(f: impl FnOnce(&mut dyn GcAllocator) -> R) -> R {
         // single-thread allocation discipline.
         f(unsafe { singleton_mut() })
     };
-    if !self_holds_fast_path {
-        IN_FAST_PATH.store(0, Ordering::Release);
-    }
     result
 }
 
