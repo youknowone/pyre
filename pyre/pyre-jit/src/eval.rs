@@ -5224,8 +5224,7 @@ fn blackhole_result_tag(r: &crate::call_jit::BlackholeResult) -> &'static str {
 /// Pure `eprintln!`, no behavioral effect.  Complements the decode-side
 /// `PYRE_M369_RECOVER_AUDIT` (which measures the offset-derivation funnel).
 pub(crate) fn m369_route_audit_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("PYRE_M369_ROUTE_AUDIT").is_some())
+    pyre_jit_trace::state::m369_route_audit_enabled()
 }
 
 thread_local! {
@@ -7690,6 +7689,57 @@ fn rebuild_typed_from_rd_numb(
     // (the same PC used by get_list_of_active_boxes during encoding).
     // The outer pyre interpreter resumes at the JIT-entry frame's PC,
     // which after `framestack.reverse()` parity is `frames[0]`.
+    if m369_route_audit_enabled() {
+        if let Some(frame) = frames.first() {
+            if frame.jitcode_pc == majit_ir::resumedata::NO_JITCODE_PC {
+                eprintln!(
+                    "[m369-backxlat] site=rd_numb_pc frame_idx=0 nframes={} \
+                     jitcode_index={} stored_py_pc={} carried=sentinel word_class=sentinel",
+                    frames.len(),
+                    frame.jitcode_index,
+                    frame.pc,
+                );
+            } else {
+                let word_class = if frame.jitcode_pc >= 0 {
+                    "offset"
+                } else {
+                    "branch"
+                };
+                let resolved_offset = pyre_jit_trace::state::resolve_resume_offset_public(
+                    frame.jitcode_index,
+                    frame.pc,
+                    frame.jitcode_pc,
+                );
+                let raw_recovered = resolved_offset.and_then(|offset| {
+                    pyre_jit_trace::state::python_pc_for_jitcode_pc_public(
+                        frame.jitcode_index,
+                        offset as i32,
+                    )
+                });
+                let (recovered, code_ptr_null) = match raw_recovered.and_then(|raw| {
+                    pyre_jit_trace::state::skip_python_trivia_forward_public(
+                        frame.jitcode_index,
+                        raw,
+                    )
+                }) {
+                    Some((py_pc, trivia_applied)) => (Some(py_pc), !trivia_applied),
+                    None => (None, false),
+                };
+                let stored_py_pc = majit_ir::resumedata::decode_resume_pc(frame.pc).0 as i32;
+                eprintln!(
+                    "[m369-backxlat] site=rd_numb_pc frame_idx=0 nframes={} \
+                     jitcode_index={} stored_py_pc={} carried={} word_class={word_class} \
+                     resolved_offset={resolved_offset:?} recovered={recovered:?} \
+                     code_ptr_null={code_ptr_null} eq={}",
+                    frames.len(),
+                    frame.jitcode_index,
+                    frame.pc,
+                    frame.jitcode_pc,
+                    recovered == Some(stored_py_pc),
+                );
+            }
+        }
+    }
     let rd_numb_pc = frames.first().map(|f| f.pc as usize);
     (typed, rd_numb_pc, virtuals_cache)
 }
@@ -8049,6 +8099,53 @@ fn build_resumed_frames(
     }
     let mut result = Vec::with_capacity(frames.len());
     for (idx, (frame, values)) in frames.iter().zip(all_values.into_iter()).enumerate() {
+        if m369_route_audit_enabled() {
+            if frame.jitcode_pc == majit_ir::resumedata::NO_JITCODE_PC {
+                eprintln!(
+                    "[m369-backxlat] frame_idx={idx} nframes={} jitcode_index={} \
+                     stored_py_pc={} carried=sentinel word_class=sentinel",
+                    nframes, frame.jitcode_index, frame.pc,
+                );
+            } else {
+                let word_class = if frame.jitcode_pc >= 0 {
+                    "offset"
+                } else {
+                    "branch"
+                };
+                let resolved_offset = pyre_jit_trace::state::resolve_resume_offset_public(
+                    frame.jitcode_index,
+                    frame.pc,
+                    frame.jitcode_pc,
+                );
+                let raw_recovered = resolved_offset.and_then(|offset| {
+                    pyre_jit_trace::state::python_pc_for_jitcode_pc_public(
+                        frame.jitcode_index,
+                        offset as i32,
+                    )
+                });
+                let (recovered, code_ptr_null) = match raw_recovered.and_then(|raw| {
+                    pyre_jit_trace::state::skip_python_trivia_forward_public(
+                        frame.jitcode_index,
+                        raw,
+                    )
+                }) {
+                    Some((py_pc, trivia_applied)) => (Some(py_pc), !trivia_applied),
+                    None => (None, false),
+                };
+                let stored_py_pc = majit_ir::resumedata::decode_resume_pc(frame.pc).0 as i32;
+                eprintln!(
+                    "[m369-backxlat] frame_idx={idx} nframes={} jitcode_index={} \
+                     stored_py_pc={} carried={} word_class={word_class} \
+                     resolved_offset={resolved_offset:?} recovered={recovered:?} \
+                     code_ptr_null={code_ptr_null} eq={}",
+                    nframes,
+                    frame.jitcode_index,
+                    frame.pc,
+                    frame.jitcode_pc,
+                    recovered == Some(stored_py_pc),
+                );
+            }
+        }
         // The innermost frame's stored py_pc is the one that reaches the live
         // frame `last_instr` on the single-frame bridge-trace path (path-B); its
         // carried jitcode_pc / portal-bridge status decides whether a #369 flip

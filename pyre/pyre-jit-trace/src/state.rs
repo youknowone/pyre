@@ -761,6 +761,44 @@ pub fn pyjitcode_for_jitcode_index(jitcode_index: i32) -> Option<std::sync::Arc<
     })
 }
 
+/// Resolve a stored JitCode offset back to its Python instruction coordinate.
+pub fn python_pc_for_jitcode_pc_public(jitcode_index: i32, offset: i32) -> Option<i32> {
+    let payload = pyjitcode_for_jitcode_index(jitcode_index)?;
+    Some(
+        crate::jitcode_dispatch::python_pc_for_jitcode_pc(&payload.metadata, offset as usize)
+            as i32,
+    )
+}
+
+/// Resolve a resume-data word through the runtime resume-coordinate path.
+pub fn resolve_resume_offset_public(jitcode_index: i32, pc: i32, carried: i32) -> Option<usize> {
+    let payload = pyjitcode_for_jitcode_index(jitcode_index)?;
+    let op_live = blackhole_control_opcodes().0 as u8;
+    payload.resolve_resume_pc_with_jitcode_pc(pc, carried, op_live)
+}
+
+/// Advance a Python instruction coordinate past resume trivia when code is available.
+pub fn skip_python_trivia_forward_public(
+    jitcode_index: i32,
+    raw_py_pc: i32,
+) -> Option<(i32, bool)> {
+    let payload = pyjitcode_for_jitcode_index(jitcode_index)?;
+    if payload.code_ptr.is_null() {
+        return Some((raw_py_pc, false));
+    }
+    let code = unsafe { &*payload.code_ptr };
+    Some((
+        crate::jitcode_dispatch::skip_python_trivia_forward(code, raw_py_pc as usize) as i32,
+        true,
+    ))
+}
+
+/// Enable the resume-path routing and back-translation census.
+pub fn m369_route_audit_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_M369_ROUTE_AUDIT").is_some())
+}
+
 /// `framework.py` `root_walker.walk_roots` hook for the boxed `Ref`
 /// constants embedded in every live jitcode's `constants_r` pool.
 ///
@@ -5889,6 +5927,7 @@ fn reconstruct_inline_recipe(
                 return None;
             }
         }
+        m369_backxlat_recipe_audit(frame);
         return Some(ReconstructRecipe {
             code_ptr: raw_code as *const (),
             jitcode_index: frame.jitcode_index,
@@ -6073,6 +6112,7 @@ fn reconstruct_inline_recipe(
         }
     }
 
+    m369_backxlat_recipe_audit(frame);
     Some(ReconstructRecipe {
         code_ptr: raw_code as *const (),
         jitcode_index: frame.jitcode_index,
@@ -6086,6 +6126,45 @@ fn reconstruct_inline_recipe(
         concrete_r,
         nargs: nlocals,
     })
+}
+
+fn m369_backxlat_recipe_audit(frame: &majit_ir::resumedata::RebuiltFrame) {
+    if !m369_route_audit_enabled() {
+        return;
+    }
+    if frame.jitcode_pc == majit_ir::resumedata::NO_JITCODE_PC {
+        eprintln!(
+            "[m369-backxlat] site=recipe jitcode_index={} stored_py_pc={} \
+             carried=sentinel word_class=sentinel",
+            frame.jitcode_index, frame.pc,
+        );
+        return;
+    }
+    let word_class = if frame.jitcode_pc >= 0 {
+        "offset"
+    } else {
+        "branch"
+    };
+    let resolved_offset =
+        resolve_resume_offset_public(frame.jitcode_index, frame.pc, frame.jitcode_pc);
+    let raw_recovered = resolved_offset
+        .and_then(|offset| python_pc_for_jitcode_pc_public(frame.jitcode_index, offset as i32));
+    let (recovered, code_ptr_null) = match raw_recovered
+        .and_then(|raw| skip_python_trivia_forward_public(frame.jitcode_index, raw))
+    {
+        Some((py_pc, trivia_applied)) => (Some(py_pc), !trivia_applied),
+        None => (None, false),
+    };
+    let stored_py_pc = majit_ir::resumedata::decode_resume_pc(frame.pc).0 as i32;
+    eprintln!(
+        "[m369-backxlat] site=recipe jitcode_index={} stored_py_pc={} carried={} \
+         word_class={word_class} resolved_offset={resolved_offset:?} \
+         recovered={recovered:?} code_ptr_null={code_ptr_null} eq={}",
+        frame.jitcode_index,
+        frame.pc,
+        frame.jitcode_pc,
+        recovered == Some(stored_py_pc),
+    );
 }
 
 fn bridge_decode_box(
