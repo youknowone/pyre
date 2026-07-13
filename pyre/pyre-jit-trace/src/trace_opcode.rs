@@ -4112,6 +4112,16 @@ impl MIFrame {
             if call_pc >= flag {
                 return crate::state::abort_unencodable_resume_pc(call_pc);
             }
+            if majit_metainterp::m369_resume_pc_audit_enabled() {
+                let jitcode_index = unsafe { (*self.sym().jitcode).index } as i32;
+                let twin = crate::state::pyjitcode_for_jitcode_index(jitcode_index)
+                    .and_then(|pj| pj.after_residual_call_resume_pc_for(call_pc));
+                eprintln!(
+                    "[m369-arflag] site=top jitcode_index={jitcode_index} py_pc={call_pc} \
+                     twin_some={}",
+                    twin.is_some()
+                );
+            }
             majit_ir::resumedata::encode_after_residual_call_pc(call_pc as i32) as usize
         } else {
             let raw = if after_residual_call {
@@ -4152,6 +4162,12 @@ impl MIFrame {
         if let Some(cp) = marked_call_pc {
             if cp >= flag {
                 return crate::state::abort_unencodable_resume_pc(cp);
+            }
+            if majit_metainterp::m369_resume_pc_audit_enabled() {
+                eprintln!(
+                    "[m369-arflag] site=parent parent_jitcode_index={parent_jitcode_index} \
+                     py_pc={cp}"
+                );
             }
             majit_ir::resumedata::encode_after_residual_call_pc(cp as i32) as usize
         } else {

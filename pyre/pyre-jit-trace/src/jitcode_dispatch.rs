@@ -12461,6 +12461,15 @@ fn walker_capture_snapshot_for_last_guard_impl(
             // with what the decoder reads.
             let resume_py_pc = match marker_call_py_pc {
                 Some(call_py_pc) => {
+                    if majit_metainterp::m369_resume_pc_audit_enabled() {
+                        let twin = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32)
+                            .and_then(|pjc| pjc.after_residual_marker_for_jitcode_pc(op_pc));
+                        eprintln!(
+                            "[m369-arflag] site=mfcallee jitcode_index={jitcode_index} \
+                             py_pc={call_py_pc} twin={twin:?} twin_some={}",
+                            twin.is_some()
+                        );
+                    }
                     majit_ir::resumedata::encode_after_residual_call_pc(call_py_pc as i32) as u32
                 }
                 None => liveness_py_pc,
