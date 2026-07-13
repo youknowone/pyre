@@ -704,7 +704,10 @@ mod tests {
         ensure_gc();
         register_test_mutator();
         assert_ne!(
-            gc_query(|gc| unsafe { *(gc.nursery_top_addr() as *const usize) }),
+            gc_query(
+                |gc| unsafe { &*(gc.nursery_top_addr() as *const AtomicUsize) }
+                    .load(Ordering::Acquire)
+            ),
             0
         );
 
@@ -716,7 +719,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            gc_query(|gc| unsafe { *(gc.nursery_top_addr() as *const usize) }),
+            gc_query(
+                |gc| unsafe { &*(gc.nursery_top_addr() as *const AtomicUsize) }
+                    .load(Ordering::Acquire)
+            ),
             0
         );
         unregister_test_mutator();

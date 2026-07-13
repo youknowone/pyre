@@ -9,6 +9,7 @@
 use indexmap::{IndexMap, IndexSet};
 use majit_ir::GcRef;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::flags;
 use crate::header::{GcHeader, header_of};
@@ -353,9 +354,10 @@ pub struct MiniMarkGC {
     /// gc.py:525-531 published nursery-top slot read by generated inline
     /// allocation paths. Kept separately from the real top so free-threaded
     /// execution can pin the published limit to zero without changing the
-    /// Rust allocator's nursery bounds. The Box keeps its baked address stable
-    /// even if the containing GC value moves.
-    published_nursery_top: Box<usize>,
+    /// Rust allocator's nursery bounds. The atomic publishes limit changes to
+    /// generated code and Rust-side readers. The Box keeps its baked address
+    /// stable even if the containing GC value moves.
+    published_nursery_top: Box<AtomicUsize>,
     /// Whether generated code may use the shared nursery bump fast path.
     inline_alloc_enabled: bool,
     /// The old generation.
@@ -577,7 +579,7 @@ impl MiniMarkGC {
         min_heap_size = min_heap_size.max(nursery_size as f64 * major_collection_threshold);
 
         let nursery = Nursery::new(config.nursery_size);
-        let published_nursery_top = Box::new(nursery.top_ptr() as usize);
+        let published_nursery_top = Box::new(AtomicUsize::new(nursery.top_ptr() as usize));
         let mut gc = MiniMarkGC {
             nursery,
             published_nursery_top,
@@ -646,11 +648,14 @@ impl MiniMarkGC {
     /// allocator bound, unless free-threading has disabled the non-atomic
     /// shared bump fast path.
     fn refresh_published_nursery_top(&mut self) {
-        *self.published_nursery_top = if self.inline_alloc_enabled {
-            self.nursery.top_ptr() as usize
-        } else {
-            0
-        };
+        self.published_nursery_top.store(
+            if self.inline_alloc_enabled {
+                self.nursery.top_ptr() as usize
+            } else {
+                0
+            },
+            Ordering::Release,
+        );
     }
 
     // ── incminimark.py:1292-1308 card marking geometry ──
@@ -3297,7 +3302,7 @@ impl GcAllocator for MiniMarkGC {
     }
 
     fn nursery_top_addr(&self) -> usize {
-        std::ptr::addr_of!(*self.published_nursery_top) as usize
+        self.published_nursery_top.as_ptr() as usize
     }
 
     fn set_inline_alloc_enabled(&mut self, enabled: bool) {
@@ -3591,14 +3596,20 @@ mod tests {
 
         let published_addr = gc.nursery_top_addr();
         let real_top = gc.nursery_top() as usize;
-        assert_eq!(unsafe { *(published_addr as *const usize) }, real_top);
+        assert_eq!(
+            unsafe { &*(published_addr as *const AtomicUsize) }.load(Ordering::Acquire),
+            real_top
+        );
 
         // Prove the collection reset republishes the real limit instead of
         // merely leaving the construction-time value untouched.
-        unsafe { *(published_addr as *mut usize) = 0 };
+        unsafe { &*(published_addr as *const AtomicUsize) }.store(0, Ordering::Release);
         gc.collect_nursery();
         assert_eq!(gc.nursery_top_addr(), published_addr);
-        assert_eq!(unsafe { *(published_addr as *const usize) }, real_top);
+        assert_eq!(
+            unsafe { &*(published_addr as *const AtomicUsize) }.load(Ordering::Acquire),
+            real_top
+        );
 
         let obj = gc.alloc_nursery(16);
         assert!(!obj.is_null());
@@ -3612,17 +3623,23 @@ mod tests {
         let published_addr = gc.nursery_top_addr();
 
         gc.set_inline_alloc_enabled(false);
-        assert_eq!(unsafe { *(published_addr as *const usize) }, 0);
+        assert_eq!(
+            unsafe { &*(published_addr as *const AtomicUsize) }.load(Ordering::Acquire),
+            0
+        );
         assert!(!gc.alloc_nursery(16).is_null());
         assert!(!gc.alloc_with_type(0, 16).is_null());
 
         gc.collect_nursery();
-        assert_eq!(unsafe { *(published_addr as *const usize) }, 0);
+        assert_eq!(
+            unsafe { &*(published_addr as *const AtomicUsize) }.load(Ordering::Acquire),
+            0
+        );
         assert!(!gc.alloc_nursery(16).is_null());
 
         gc.set_inline_alloc_enabled(true);
         assert_eq!(
-            unsafe { *(published_addr as *const usize) },
+            unsafe { &*(published_addr as *const AtomicUsize) }.load(Ordering::Acquire),
             gc.nursery_top() as usize
         );
     }
