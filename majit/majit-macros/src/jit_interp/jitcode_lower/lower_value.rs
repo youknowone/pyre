@@ -122,8 +122,40 @@ impl<'c> Lowerer<'c> {
                 })
             }
             Expr::Path(ExprPath { path, .. }) => {
-                let ident = path.get_ident()?;
-                self.bindings.get(&ident.to_string()).cloned()
+                // A single-segment path naming a known local binding resolves
+                // to that binding.
+                if let Some(ident) = path.get_ident() {
+                    if let Some(binding) = self.bindings.get(&ident.to_string()) {
+                        return Some(binding.clone());
+                    }
+                }
+                // Otherwise a path whose final segment is a SCREAMING_CASE
+                // symbolic constant (`VAL_QUEUE`, `aheui::VAL_PORT`) lowers to
+                // a runtime int const — the same `#path as i64` form match-arm
+                // patterns use (`extract_pat_value_tokens`); the Rust compiler
+                // resolves the const value while building the JitCode, and a
+                // green consumer folds it. A lowercase non-binding path stays
+                // unlowerable (fail-closed).
+                let last = path.segments.last()?;
+                if !last.arguments.is_none()
+                    || !last
+                        .ident
+                        .to_string()
+                        .starts_with(|c: char| c.is_uppercase())
+                {
+                    return None;
+                }
+                let reg = self.alloc_reg();
+                self.emit_op(
+                    OpMeta::linear(OpKind::LoadConstI, vec![], vec![Register::int(reg)]),
+                    quote! { __builder.load_const_i_value(#reg, #path as i64); },
+                );
+                Some(Binding {
+                    reg,
+                    kind: BindingKind::Int,
+                    depends_on_stack: false,
+                    struct_type: None,
+                })
             }
             Expr::Cast(ExprCast { expr, ty, .. }) if is_supported_int_cast(ty) => {
                 let binding = self.lower_value_expr(expr)?;
