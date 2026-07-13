@@ -1264,6 +1264,26 @@ pub(crate) fn frame_liveness_reg_indices_by_bank_from_pc(
     frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(jitcode_index, pc, pc)
 }
 
+/// Whether the resume frame's pc word names a resolved JitCode `-live-` offset
+/// (the flip stores a decodable offset when the guard's resume marker resolves,
+/// else the raw Python pc). Post-flip this reproduces the retired
+/// `frame.jitcode_pc != NO_JITCODE_PC` twin test: the twin is non-sentinel iff a
+/// marker resolved iff `frame.pc` is a decodable offset.
+pub(crate) fn frame_pc_is_resolved_offset_at(jitcode_index: i32, pc: i32) -> bool {
+    ensure_finish_setup();
+    METAINTERP_SD.with(|r| {
+        let sd = r.borrow();
+        let Some(jc) = sd.jitcodes.get(jitcode_index as usize) else {
+            return false;
+        };
+        pc >= 0
+            && jc
+                .payload
+                .jitcode
+                .can_decode_live_vars(pc as usize, sd.op_live)
+    })
+}
+
 pub fn frame_liveness_reg_indices_at(jitcode_index: i32, pc: i32) -> Vec<u32> {
     frame_liveness_reg_indices_by_bank_at(jitcode_index, pc).flattened()
 }
@@ -8270,7 +8290,8 @@ impl JitState for PyreJitState {
         // the OpRef, causing downstream branch folds to take the wrong
         // direction.  Defer seeding to the post-overlay stage where the
         // mirror is slot-indexed and values are authoritative.
-        let seed_deferred_to_overlay = frame0.jitcode_pc != majit_ir::resumedata::NO_JITCODE_PC;
+        let seed_deferred_to_overlay =
+            crate::state::frame_pc_is_resolved_offset_at(frame0.jitcode_index, frame0.pc);
         let mut bridge_stamp_orphans =
             (bridge_stamp_enabled && seed_deferred_to_overlay).then(Vec::new);
         let mut value_cursor = 0usize;
@@ -8385,13 +8406,13 @@ impl JitState for PyreJitState {
             bridge_registers_r.resize(semantic_prefix_len, OpRef::NONE);
         }
         if majit_metainterp::majit_log_enabled()
-            && frame0.jitcode_pc != majit_ir::resumedata::NO_JITCODE_PC
+            && crate::state::frame_pc_is_resolved_offset_at(frame0.jitcode_index, frame0.pc)
         {
             let old_so = bridge_valuestackdepth.saturating_sub(nlocals);
             eprintln!(
                 "[jit][kept-stack-bridge] jitcode_pc={} pc={} pcdep={:?} \
                  depth_at_guard={} vsd={} stack_only={}→{}",
-                frame0.jitcode_pc,
+                frame0.pc,
                 frame0.pc,
                 maps.pcdep_entries,
                 maps.stack_depth_at_pc,
@@ -8832,21 +8853,13 @@ impl JitState for PyreJitState {
         // rebuilt registers_r and the full-body-walk argbox seed recover the
         // kept conditional-expression / short-circuit value.
         sym.bridge_stack_oprefs = Some(bridge_stack);
-        // Kept-stack branch guards (`frame0.jitcode_pc != NO_JITCODE_PC`) resume
-        // the full-body walk at the guard's OWN mid-opcode jitcode offset — the
-        // same coordinate the blackhole `setposition`s to — instead of the
-        // opcode-entry marker `pc_map[py_pc]`. Resolve it now (identical to the
-        // blackhole's `resolve_resume_pc_with_jitcode_pc`) and hand it to
-        // `run_perfn_walk` via `sym`. `None` leaves the walk on the pc_map entry.
-        sym.bridge_walk_entry_pc = if frame0.jitcode_pc != majit_ir::resumedata::NO_JITCODE_PC {
-            crate::state::resolve_bridge_walk_entry_at(
-                frame0.jitcode_index,
-                frame0.pc,
-                frame0.jitcode_pc,
-            )
-        } else {
-            None
-        };
+        // Kept-stack branch guards resume the full-body walk at the guard's OWN
+        // mid-opcode jitcode offset — the same resolved coordinate stored in
+        // the frame pc — instead of the opcode-entry marker `pc_map[py_pc]`.
+        // `None` leaves the walk on the pc_map entry.
+        sym.bridge_walk_entry_pc =
+            crate::state::frame_pc_is_resolved_offset_at(frame0.jitcode_index, frame0.pc)
+                .then_some(frame0.pc as usize);
         sym.bridge_local_types = Some(bridge_local_types);
         // consume_boxes (resume.py:1055) fills `f.registers_r` by abstract
         // register color; keep that color-indexed decode so a cross-frame
