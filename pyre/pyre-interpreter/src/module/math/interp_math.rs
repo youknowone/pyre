@@ -67,7 +67,7 @@ pub fn try_get_double(obj: PyObjectRef) -> Result<f64, crate::PyError> {
             }
             // descroperation.py:891 — a non-float result (including int/long)
             // is rejected rather than coerced.
-            let result_type = unsafe { (*(*result).ob_type).name };
+            let result_type = unsafe { pyre_object::type_name_of(result) };
             return Err(crate::PyError::type_error(format!(
                 "__float__ returned non-float (type '{result_type}')",
             )));

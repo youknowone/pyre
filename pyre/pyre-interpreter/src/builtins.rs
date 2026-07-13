@@ -6414,7 +6414,7 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
                 }
             }
             // descroperation.py:891 — __float__ returned non-float (type '%T')
-            let result_type = unsafe { (*(*result).ob_type).name };
+            let result_type = unsafe { pyre_object::type_name_of(result) };
             return Err(crate::PyError::type_error(format!(
                 "__float__ returned non-float (type '{result_type}')",
             )));

@@ -2841,7 +2841,7 @@ pub(crate) fn setitem_slot(obj: PyObjectRef, index: PyObjectRef, value: PyObject
         }
         Err(PyError::type_error(format!(
             "'{}' object does not support item assignment",
-            (*(*obj).ob_type).name,
+            pyre_object::type_name_of(obj),
         )))
     }
 }
@@ -7834,7 +7834,7 @@ pub(crate) fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> 
         if !is_type(w_newcls) {
             return Err(crate::PyError::type_error(format!(
                 "__class__ must be set to new-style class, not '{}' object",
-                (*(*w_newcls).ob_type).name,
+                pyre_object::type_name_of(w_newcls),
             )));
         }
         // objectobject.py:143-145 — w_newcls must be a heap type.
@@ -8697,6 +8697,8 @@ pub fn object_delattr(obj: PyObjectRef, name: &str) -> PyResult {
     // module/type misses above — so the receiver's own type is named and the
     // obj/name context is attached, rather than the bare `object` base.
     // `w_descr` carries a found-but-non-data descriptor so the miss is read-only.
+    // `raiseattrerror` resolves the type name via the tag-safe `typedef::type`,
+    // so a tagged immediate never reaches a raw `ob_type` deref here.
     Err(raiseattrerror(obj, name, w_descr))
 }
 

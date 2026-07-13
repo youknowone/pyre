@@ -251,7 +251,7 @@ pub fn list_extend_value(list: PyObjectRef, iterable: PyObjectRef) -> Result<(),
         Ok(_) => Ok(()),
         Err(error) if crate::baseobjspace::is_iterable(iterable) => Err(error),
         Err(_) => unsafe {
-            let type_name = (*(*iterable).ob_type).name;
+            let type_name = pyre_object::type_name_of(iterable);
             Err(PyError::type_error(format!(
                 "Value after * must be an iterable, not {type_name}"
             )))
@@ -385,7 +385,7 @@ pub fn dict_update_value(dict: PyObjectRef, source: PyObjectRef) -> Result<(), P
     let keys_method = match crate::baseobjspace::getattr_str(source, "keys") {
         Ok(m) => m,
         Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
-            let type_name = unsafe { (*(*source).ob_type).name };
+            let type_name = unsafe { pyre_object::type_name_of(source) };
             return Err(PyError::type_error(format!(
                 "'{type_name}' object is not a mapping"
             )));
@@ -459,7 +459,7 @@ pub fn dict_merge_value(
         // `if not space.ismapping_w(w_item): raise oefmt(... "%s argument
         // after ** must be a mapping, not %T")`.
         if !crate::baseobjspace::ismapping_w(source) {
-            let type_name = unsafe { (*(*source).ob_type).name };
+            let type_name = unsafe { pyre_object::type_name_of(source) };
             return Err(crate::argument::raise_type_error(
                 w_callable,
                 format!("argument after ** must be a mapping, not {type_name}"),

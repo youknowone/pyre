@@ -2611,7 +2611,7 @@ pub fn str_method_encode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
                 Ok(unsafe { w_str_get_value(o) }.to_string())
             }
             Some(o) => {
-                let tname = unsafe { (*(*o).ob_type).name };
+                let tname = unsafe { pyre_object::type_name_of(o) };
                 Err(crate::PyError::type_error(format!(
                     "expected str, got {tname} object"
                 )))

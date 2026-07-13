@@ -701,7 +701,7 @@ pub(crate) fn encode_text_codec(
     let w_encfunc = unsafe { pyre_object::w_tuple_getitem(w_codec_info, 0).unwrap_or_else(w_none) };
     let w_retval = call_codec(w_encfunc, w_obj, "encoding", Some(errors))?;
     if !unsafe { pyre_object::bytesobject::is_bytes_like(w_retval) } {
-        let tname = unsafe { (*(*w_retval).ob_type).name };
+        let tname = unsafe { pyre_object::type_name_of(w_retval) };
         return Err(crate::PyError::type_error(format!(
             "'{encoding}' encoder returned '{tname}' instead of 'bytes'; use codecs.encode() to encode to arbitrary types"
         )));
@@ -721,7 +721,7 @@ pub(crate) fn decode_text_codec(
     let w_decfunc = unsafe { pyre_object::w_tuple_getitem(w_codec_info, 1).unwrap_or_else(w_none) };
     let w_retval = call_codec(w_decfunc, w_obj, "decoding", Some(errors))?;
     if !unsafe { pyre_object::is_str(w_retval) } {
-        let tname = unsafe { (*(*w_retval).ob_type).name };
+        let tname = unsafe { pyre_object::type_name_of(w_retval) };
         return Err(crate::PyError::type_error(format!(
             "'{encoding}' decoder returned '{tname}' instead of 'str'; use codecs.decode() to decode to arbitrary types"
         )));
