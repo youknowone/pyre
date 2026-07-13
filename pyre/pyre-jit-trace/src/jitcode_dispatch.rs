@@ -5945,6 +5945,51 @@ fn probe_resid_decline_ctx(
     );
 }
 
+/// Whether a residual call is a self-recursive call to the walk's own code —
+/// the `CALL_ASSEMBLER` fold target running as a plain residual because the
+/// fold declined (no compiled token yet, a non-concrete argument during a
+/// bridge resume, etc.).  Mirrors the callee/self resolution in
+/// `try_walker_call_assembler_self_recursive`.  Keeps the recursion itself out
+/// of the foreign-body-residual latch so pure recursion (`fib`) still folds.
+fn residual_callee_is_walk_self_recursive(
+    ctx: &WalkContext<'_, '_>,
+    allboxes: &[OpRef],
+    helper: majit_ir::PyreHelperKind,
+) -> bool {
+    if helper != majit_ir::PyreHelperKind::CallFn {
+        return false;
+    }
+    let sym_ptr = ctx.fbw_mode.snapshot_sym;
+    if sym_ptr.is_null() {
+        return false;
+    }
+    // A `bh_call_fn` residual is `[funcptr, callable, null_or_self, arg0, ...]`;
+    // the Python callable is `allboxes[1]`.
+    let Some(&callable_box) = allboxes.get(1) else {
+        return false;
+    };
+    let Some(majit_ir::Value::Ref(callable_ref)) = ctx.trace_ctx.box_value(callable_box) else {
+        return false;
+    };
+    if callable_ref == majit_ir::GcRef::NO_CONCRETE || callable_ref.as_usize() == 0 {
+        return false;
+    }
+    let callable = callable_ref.as_usize() as pyre_object::PyObjectRef;
+    unsafe {
+        let Some((w_code, _nparams, _has_closure)) = resolve_inlinable_callee(callable) else {
+            return false;
+        };
+        let sym = &*sym_ptr;
+        if sym.jitcode.is_null() {
+            return false;
+        }
+        let caller_code = pyre_interpreter::live_code_wrapper(
+            (*sym.jitcode).raw_code() as *const (),
+        ) as *const ();
+        w_code as usize == caller_code as usize
+    }
+}
+
 fn try_execute_residual_call_via_executor(
     ctx: &mut WalkContext<'_, '_>,
     call_opcode: OpCode,
@@ -6433,6 +6478,11 @@ fn try_execute_residual_call_via_executor(
     };
     if !provably_side_effect_free {
         fbw_mark_executed_nonpure_residual();
+        // Count only a FOREIGN non-pure residual: a self-recursive call is the
+        // fold target running because its fold declined, not a body side effect.
+        if !residual_callee_is_walk_self_recursive(ctx, allboxes, helper) {
+            fbw_mark_executed_body_residual();
+        }
     }
     ctx.trace_ctx
         .set_virtualizable_heap_ptr(saved_vable_heap_ptr.unwrap_or(std::ptr::null()));
@@ -7893,6 +7943,14 @@ thread_local! {
     /// effect outside the FBW journals; later exit handling must not replay it.
     static FBW_EXECUTED_NONPURE_RESIDUAL: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+
+    /// Set when this walk concretely executed a non-provably-pure residual that
+    /// is NOT the self-recursive `CALL_ASSEMBLER` fold target — a foreign body
+    /// write (`events.append(n)`).  A self-recursive fold ahead of which such a
+    /// residual ran declines, since folding would leave the walk uncommittable
+    /// and the interpreter would replay the executed mutation.
+    static FBW_EXECUTED_BODY_RESIDUAL: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 /// Terminal disposition of a walk kept for the no-replay exit:
@@ -7956,6 +8014,21 @@ pub(crate) fn fbw_executed_nonpure_residual() -> bool {
 /// Clear the executed-residual latch at a walk boundary.
 pub(crate) fn fbw_executed_nonpure_residual_reset() {
     FBW_EXECUTED_NONPURE_RESIDUAL.with(|c| c.set(false));
+}
+
+/// Record a foreign (non self-recursive) non-pure residual concrete execution.
+pub(crate) fn fbw_mark_executed_body_residual() {
+    FBW_EXECUTED_BODY_RESIDUAL.with(|c| c.set(true));
+}
+
+/// Whether a foreign non-pure residual has concretely executed this walk.
+pub(crate) fn fbw_executed_body_residual() -> bool {
+    FBW_EXECUTED_BODY_RESIDUAL.with(|c| c.get())
+}
+
+/// Clear the foreign-body-residual latch at a walk boundary.
+pub(crate) fn fbw_executed_body_residual_reset() {
+    FBW_EXECUTED_BODY_RESIDUAL.with(|c| c.set(false));
 }
 
 /// Whether `PYRE_FBW_DEBUG_ABORT` is set.  When on, `full_body_walk_trace`
@@ -13618,6 +13691,15 @@ fn try_walker_call_assembler_self_recursive(
         pyre_interpreter::live_code_wrapper((*sym.jitcode).raw_code() as *const ()) as *const ()
     };
     if w_code as usize != caller_code as usize {
+        return Ok(None);
+    }
+    // A foreign (non self-recursive) non-pure residual already executed
+    // concretely earlier in this walk (e.g. `events.append(n)` ahead of the
+    // self-call).  Folding to CALL_ASSEMBLER terminates the walk symbolically;
+    // a later value-unavailable decline then leaves it uncommittable, so the
+    // interpreter replays the region and double-applies that mutation.  Decline
+    // to the plain residual path, which eagerly executes and commits the call.
+    if fbw_executed_body_residual() {
         return Ok(None);
     }
     // Branch A frame shape only: `ncells == 0`, non-global-storing callee.
