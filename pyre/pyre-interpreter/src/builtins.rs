@@ -5754,7 +5754,7 @@ pub(crate) fn builtin_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     // rejected.  Encoding is validated before errors.
     if let Some(w) = w_encoding {
         if !unsafe { is_str(w) } {
-            let tn = unsafe { (*(*w).ob_type).name };
+            let tn = unsafe { pyre_object::type_name_of(w) };
             return Err(crate::PyError::type_error(format!(
                 "str() argument 'encoding' must be str, not {tn}"
             )));
@@ -5762,7 +5762,7 @@ pub(crate) fn builtin_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     }
     if let Some(w) = w_errors {
         if !unsafe { is_str(w) } {
-            let tn = unsafe { (*(*w).ob_type).name };
+            let tn = unsafe { pyre_object::type_name_of(w) };
             return Err(crate::PyError::type_error(format!(
                 "str() argument 'errors' must be str, not {tn}"
             )));
@@ -5775,7 +5775,7 @@ pub(crate) fn builtin_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             return Err(crate::PyError::type_error("decoding str is not supported"));
         }
         let Some(src) = crate::typedef::buffer_as_bytes_like(obj)? else {
-            let tn = unsafe { (*(*obj).ob_type).name };
+            let tn = unsafe { pyre_object::type_name_of(obj) };
             return Err(crate::PyError::type_error(format!(
                 "decoding to str: need a bytes-like object, {tn} found"
             )));
@@ -6464,7 +6464,7 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 /// unified 3.12+ message).
 fn checkattrname(w_name: PyObjectRef) -> Result<(), crate::PyError> {
     if !unsafe { crate::baseobjspace::isinstance_str_w(w_name) } {
-        let name_type = unsafe { (*(*w_name).ob_type).name };
+        let name_type = unsafe { pyre_object::type_name_of(w_name) };
         return Err(crate::PyError::type_error(format!(
             "attribute name must be string, not '{name_type}'",
         )));

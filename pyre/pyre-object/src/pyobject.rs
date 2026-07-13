@@ -766,6 +766,26 @@ pub fn all_foreign_pytypes() -> &'static [(&'static PyType, &'static PyType)] {
 
 // ── Type checks ───────────────────────────────────────────────────────
 
+/// Type name of any object, tag-safe. A tagged immediate is an exact `int`;
+/// name it without derefing its (non-pointer) tagged bits as `ob_type`.
+/// Gated on `CAN_BE_TAGGED` (folds to the raw `ob_type` deref at flag-false →
+/// byte-identical). The chokepoint for the "must be X, not <name>" error
+/// messages that a tagged int reaches after the tag-safe type probes reject
+/// it. The else arm keeps the RAW `(*(*obj).ob_type).name` (NOT `r#type`,
+/// which returns the `w_class` subclass name).
+///
+/// # Safety
+/// `obj` must be a valid pointer to a `PyObject` unless it is a tagged
+/// immediate.
+#[inline]
+pub unsafe fn type_name_of(obj: PyObjectRef) -> &'static str {
+    if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::is_tagged_int(obj) {
+        "int"
+    } else {
+        unsafe { (*(*obj).ob_type).name }
+    }
+}
+
 /// Check if an object is of a given type (pointer identity comparison).
 ///
 /// # Safety

@@ -1209,7 +1209,7 @@ pub(crate) fn getitem_slot(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         }
         Err(PyError::type_error(format!(
             "'{}' object is not subscriptable",
-            (*(*obj).ob_type).name,
+            pyre_object::type_name_of(obj),
         )))
     }
 }

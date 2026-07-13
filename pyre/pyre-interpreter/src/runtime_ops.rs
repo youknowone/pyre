@@ -1149,7 +1149,7 @@ pub fn sequence_len(seq: PyObjectRef) -> Result<usize, PyError> {
         }
         Err(PyError::type_error(format!(
             "cannot unpack non-sequence {}",
-            (*(*seq).ob_type).name
+            pyre_object::type_name_of(seq)
         )))
     }
 }
@@ -1183,7 +1183,7 @@ pub fn sequence_getitem(seq: PyObjectRef, index: usize) -> Result<PyObjectRef, P
         }
         Err(PyError::type_error(format!(
             "cannot unpack non-sequence {}",
-            (*(*seq).ob_type).name
+            pyre_object::type_name_of(seq)
         )))
     }
 }
@@ -1232,7 +1232,7 @@ pub fn unpack_sequence_exact(seq: PyObjectRef, count: usize) -> Result<Vec<PyObj
     // loop) in a TypeError → "cannot unpack non-iterable %T object" remap.
     let non_iterable = || {
         PyError::type_error(format!("cannot unpack non-iterable {} object", unsafe {
-            (*(*seq).ob_type).name
+            pyre_object::type_name_of(seq)
         }))
     };
     let iter = match crate::baseobjspace::iter(seq) {
@@ -1292,7 +1292,7 @@ pub fn unpack_ex_slots(
                 Err(e) if e.kind == PyErrorKind::TypeError => {
                     return Err(PyError::type_error(format!(
                         "cannot unpack non-iterable {} object",
-                        (*(*value).ob_type).name
+                        pyre_object::type_name_of(value)
                     )));
                 }
                 Err(e) => return Err(e),
