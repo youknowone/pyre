@@ -16,6 +16,7 @@ pub mod gc_sync;
 pub mod gcreftracer;
 pub mod header;
 pub mod hook_cell;
+pub mod minimarkpage;
 pub mod nursery;
 pub mod oldgen;
 pub mod rewrite;

@@ -963,6 +963,19 @@ impl MiniMarkGC {
     /// Allocate directly in old gen (for large objects or post-collection fallback).
     fn alloc_in_oldgen(&mut self, type_id: u32, total_size: usize) -> GcRef {
         let ptr = self.oldgen.alloc(total_size);
+        // `do_malloc_fixedsize_clear` and the resume.py direct reader both
+        // require a zero-filled payload.  In particular, resume
+        // materialization writes only fields present in resumedata; omitted
+        // PyFrame owned-content fields must remain null for its destructor.
+        // Keep this rare born-old contract here: ArenaCollection.malloc and
+        // nursery promotion's alloc-and-copy path stay uninitialized.
+        unsafe {
+            std::ptr::write_bytes(
+                ptr.add(GcHeader::SIZE),
+                0,
+                total_size.saturating_sub(GcHeader::SIZE),
+            );
+        }
         let hdr = unsafe { &mut *(ptr as *mut GcHeader) };
         // Old objects start with TRACK_YOUNG_PTRS set (they need write barrier).
         // An object born into the old generation while a major marking cycle is
@@ -2020,6 +2033,22 @@ impl MiniMarkGC {
         // retains the live children); only the bounded fixed-field offsets are
         // copied into the reused `mark_offsets` buffer.
         let type_id = unsafe { (*header_of(obj_addr)).type_id() };
+        // A non-moving major can trace a live nursery object without first
+        // copying it into its reserved old-gen shadow.  Keep that unoccupied
+        // shadow black, but do not push/trace it: only its header (and varsize
+        // length) is initialized until copy_nursery_object overwrites the full
+        // block.  Upstream normally reaches the shadow through
+        // GCFLAG_HAS_SHADOW during the leading minor; this is the equivalent
+        // for pyre's oldgen-only non-moving major.
+        if self.is_in_nursery(obj_addr)
+            && unsafe { (*header_of(obj_addr)).has_flag(flags::HAS_SHADOW) }
+        {
+            let shadow_obj = *self
+                .nursery_objects_shadows
+                .get(&obj_addr)
+                .expect("GCFLAG_HAS_SHADOW but no shadow found");
+            unsafe { (*header_of(shadow_obj)).set_flag(flags::VISITED) };
+        }
         let custom_trace;
         let (item_size, length_offset, fixed_size, items_have_gc_ptrs);
         let mut offsets = std::mem::take(&mut self.incr_state.mark_offsets);
@@ -4016,6 +4045,37 @@ mod tests {
     }
 
     #[test]
+    fn born_old_typed_payload_is_zero_filled() {
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::simple(24));
+        let obj = gc.alloc_in_oldgen(tid, GcHeader::SIZE + 24);
+        let payload = unsafe { std::slice::from_raw_parts(obj.0 as *const u8, 24) };
+        assert!(payload.iter().all(|&byte| byte == 0));
+    }
+
+    #[test]
+    fn nonmoving_major_keeps_unoccupied_shadow_until_minor_copy() {
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::simple(16));
+        let obj = gc.alloc_with_type(tid, 16);
+        let shadow = gc.allocate_shadow(obj.0);
+        let mut root = obj;
+        unsafe { gc.roots.add(&mut root) };
+
+        // The shadow payload has not been copied yet.  A non-moving major must
+        // retain the reserved block without tracing its uninitialized fields.
+        gc.do_collect_oldgen_nonmoving();
+        assert_eq!(gc.oldgen.object_count(), 1);
+        assert!(gc.oldgen.contains(shadow));
+        assert!(!unsafe { (*header_of(shadow)).has_flag(flags::VISITED) });
+
+        // The following minor occupies exactly that reserved identity home.
+        gc.do_collect_nursery();
+        assert_eq!(root.0, shadow);
+        gc.roots.clear();
+    }
+
+    #[test]
     fn write_barrier_skips_object_without_track_young_ptrs() {
         let mut gc = test_gc(1024);
         gc.register_type(TypeInfo::simple(16));
@@ -4602,9 +4662,20 @@ mod tests {
     #[test]
     fn test_card_marking_clear_after_collection() {
         let mut gc = test_gc(4096);
-        let (obj, _) = alloc_card_array(&mut gc, 512);
+        let (obj, array_length) = alloc_card_array(&mut gc, 512);
         let hdr = unsafe { header_of(obj.0) };
         assert!(unsafe { (*hdr).has_flag(flags::HAS_CARDS) });
+
+        // external_malloc is not zero-filled.  Initialize every item that
+        // dirty-card tracing is allowed to read, as production allocation
+        // rewrites do before publishing the array.
+        let ptr_size = std::mem::size_of::<GcRef>();
+        let items_start = obj.0 + 8;
+        for i in 0..array_length {
+            unsafe {
+                *((items_start + i * ptr_size) as *mut GcRef) = GcRef::NULL;
+            }
+        }
 
         // Mark some cards.
         gc.do_write_barrier_card(obj, 0, DEFAULT_CARD_PAGE_SHIFT);
