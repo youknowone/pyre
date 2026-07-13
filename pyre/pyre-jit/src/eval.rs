@@ -2460,52 +2460,57 @@ fn install_gc_root_walkers() {
 
 fn register_thread_root_areas() {
     let register = majit_gc::shadow_stack::register_mutator_extra_area;
-    register(
-        pyframe_root_walker_area,
-        pyre_interpreter::eval::capture_pyframe_root_area(),
-    );
-    register(
-        pyre_object_root_walker_area,
-        pyre_object::gc_roots::capture_shadow_stack_area(),
-    );
-    register(
-        jitcode_constants_root_walker_area,
-        pyre_jit_trace::state::capture_jitcode_constants_root_area(),
-    );
-    register(
-        fbw_store_journal_root_walker_area,
-        pyre_jit_trace::jitcode_dispatch::capture_fbw_store_journal_root_area(),
-    );
-    register(
-        fbw_finish_concrete_root_walker_area,
-        pyre_jit_trace::jitcode_dispatch::capture_fbw_finish_concrete_root_area(),
-    );
-    register(
-        mapdict_root_walker_area,
-        pyre_interpreter::objspace::std::mapdict::capture_mapdict_root_area(),
-    );
-    #[cfg(not(target_arch = "wasm32"))]
-    register(
-        signal_handler_root_walker_area,
-        pyre_interpreter::module::signal::interp_signal::capture_signal_handler_root_area(),
-    );
-    register(
-        weakref_box_inner_root_walker_area,
-        pyre_object::weakref::capture_gc_weakref_box_root_area(),
-    );
-    register(
-        sre_pattern_root_walker_area,
-        pyre_object::interp_sre::capture_sre_pattern_root_area(),
-    );
-    register(
-        jit_callee_frame_root_walker_area,
-        crate::call_jit::capture_jit_callee_frame_root_area(),
-    );
     let jit_driver = JIT_DRIVER.with(|cell| cell as *const _ as *const ());
-    register(rd_consts_root_walker_area, jit_driver);
-    register(partial_trace_root_walker_area, jit_driver);
-    register(active_trace_root_walker_area, jit_driver);
-    register(compile_snapshot_root_walker_area, jit_driver);
+    // SAFETY: every `data` pointer is this thread's own TLS / `'static` root
+    // area, valid for the thread's registered lifetime, and every walk fn
+    // dereferences addresses derived solely from its supplied `data` pointer.
+    unsafe {
+        register(
+            pyframe_root_walker_area,
+            pyre_interpreter::eval::capture_pyframe_root_area(),
+        );
+        register(
+            pyre_object_root_walker_area,
+            pyre_object::gc_roots::capture_shadow_stack_area(),
+        );
+        register(
+            jitcode_constants_root_walker_area,
+            pyre_jit_trace::state::capture_jitcode_constants_root_area(),
+        );
+        register(
+            fbw_store_journal_root_walker_area,
+            pyre_jit_trace::jitcode_dispatch::capture_fbw_store_journal_root_area(),
+        );
+        register(
+            fbw_finish_concrete_root_walker_area,
+            pyre_jit_trace::jitcode_dispatch::capture_fbw_finish_concrete_root_area(),
+        );
+        register(
+            mapdict_root_walker_area,
+            pyre_interpreter::objspace::std::mapdict::capture_mapdict_root_area(),
+        );
+        #[cfg(not(target_arch = "wasm32"))]
+        register(
+            signal_handler_root_walker_area,
+            pyre_interpreter::module::signal::interp_signal::capture_signal_handler_root_area(),
+        );
+        register(
+            weakref_box_inner_root_walker_area,
+            pyre_object::weakref::capture_gc_weakref_box_root_area(),
+        );
+        register(
+            sre_pattern_root_walker_area,
+            pyre_object::interp_sre::capture_sre_pattern_root_area(),
+        );
+        register(
+            jit_callee_frame_root_walker_area,
+            crate::call_jit::capture_jit_callee_frame_root_area(),
+        );
+        register(rd_consts_root_walker_area, jit_driver);
+        register(partial_trace_root_walker_area, jit_driver);
+        register(active_trace_root_walker_area, jit_driver);
+        register(compile_snapshot_root_walker_area, jit_driver);
+    }
 }
 
 /// pyre-object GC hook trampolines — safe to install at boot because

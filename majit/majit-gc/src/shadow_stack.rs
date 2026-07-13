@@ -278,6 +278,7 @@ unsafe impl Send for MutatorEntry {}
 static MUTATOR_REGISTRY: Mutex<Vec<MutatorEntry>> = Mutex::new(Vec::new());
 
 /// Register the current thread's four TLS root structures for STW root walks.
+/// Unregistration is supplied by the caller's RAII destructor (pyre-jit's `GcMutatorRegistration` thread-local, armed in `init_gc_subsystem`, whose `Drop` calls [`unregister_mutator`]); callers must arm that pairing, while an API-level return guard is a tracked follow-up.
 pub fn register_mutator() {
     let thread_id = std::thread::current().id();
     let shadow_stack = SHADOW_STACK.with(|stack| stack as *const _);
@@ -302,9 +303,13 @@ pub fn register_mutator() {
 
 /// Append an opaque root area to the current registered mutator.
 ///
-/// The owning thread must keep `data` valid until [`unregister_mutator`].
-/// Foreign-thread invocation is restricted to the STW walk.
-pub fn register_mutator_extra_area(walk: MutatorExtraWalkFn, data: *const ()) {
+/// # Safety
+///
+/// The caller must keep `data` valid until [`unregister_mutator`] runs on this
+/// thread. `walk` must derive every address it dereferences from `data`, never
+/// from caller TLS, because a foreign collecting thread invokes `walk` during
+/// STW.
+pub unsafe fn register_mutator_extra_area(walk: MutatorExtraWalkFn, data: *const ()) {
     let thread_id = std::thread::current().id();
     let mut registry = MUTATOR_REGISTRY.lock().unwrap();
     let entry = registry
@@ -316,6 +321,10 @@ pub fn register_mutator_extra_area(walk: MutatorExtraWalkFn, data: *const ()) {
 
 /// Walk every registered mutator's opaque extra root areas during STW.
 pub fn walk_all_extra_areas(mut visitor: impl FnMut(&mut GcRef)) {
+    debug_assert!(
+        crate::gc_sync::mutators_quiesced(),
+        "walk_all_extra_areas walks foreign mutator TLS; caller must own collector-side STW",
+    );
     let registry = MUTATOR_REGISTRY.lock().unwrap();
     for mutator in registry.iter() {
         for area in mutator.extra_areas.iter() {
@@ -440,6 +449,10 @@ pub fn walk_roots(mut visitor: impl FnMut(&mut GcRef)) {
 /// mechanism for foreign TLS. gc_sync's quiescence is what makes the raw
 /// dereferences and in-place forwarding sound.
 pub fn walk_all_roots(mut visitor: impl FnMut(&mut GcRef)) {
+    debug_assert!(
+        crate::gc_sync::mutators_quiesced(),
+        "walk_all_roots walks foreign mutator TLS; caller must own collector-side STW",
+    );
     let registry = MUTATOR_REGISTRY.lock().unwrap();
     for mutator in registry.iter() {
         // SAFETY: every registered mutator is quiesced, and registry removal
@@ -630,6 +643,10 @@ pub fn walk_jf_roots(mut visitor: impl FnMut(&mut GcRef)) {
 
 /// Walk every registered mutator's jitframe shadow stack during STW.
 pub fn walk_all_jf_roots(mut visitor: impl FnMut(&mut GcRef)) {
+    debug_assert!(
+        crate::gc_sync::mutators_quiesced(),
+        "walk_all_jf_roots walks foreign mutator TLS; caller must own collector-side STW",
+    );
     let registry = MUTATOR_REGISTRY.lock().unwrap();
     for mutator in registry.iter() {
         // SAFETY: the owning mutator is quiesced and cannot change the stack
@@ -789,6 +806,10 @@ pub fn walk_bh_regs(mut visitor: impl FnMut(&mut GcRef)) {
 
 /// Walk every registered mutator's blackhole register roots during STW.
 pub fn walk_all_bh_regs(mut visitor: impl FnMut(&mut GcRef)) {
+    debug_assert!(
+        crate::gc_sync::mutators_quiesced(),
+        "walk_all_bh_regs walks foreign mutator TLS; caller must own collector-side STW",
+    );
     let registry = MUTATOR_REGISTRY.lock().unwrap();
     for mutator in registry.iter() {
         // SAFETY: all owners are quiesced, and each registered slice remains
@@ -857,6 +878,10 @@ pub fn walk_resume_ref_roots(mut visitor: impl FnMut(&mut GcRef)) {
 
 /// Walk every registered mutator's resume-construction roots during STW.
 pub fn walk_all_resume_ref_roots(mut visitor: impl FnMut(&mut GcRef)) {
+    debug_assert!(
+        crate::gc_sync::mutators_quiesced(),
+        "walk_all_resume_ref_roots walks foreign mutator TLS; caller must own collector-side STW",
+    );
     let registry = MUTATOR_REGISTRY.lock().unwrap();
     for mutator in registry.iter() {
         // SAFETY: the owner is quiesced and the registered slices stay pinned
@@ -1114,7 +1139,11 @@ mod tests {
         let _lock = TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         let mut root = GcRef(0x1000);
         register_mutator();
-        register_mutator_extra_area(walk_cell, &mut root as *mut GcRef as *const ());
+        // SAFETY: `root` remains valid until unregistration, and `walk_cell`
+        // derives its sole dereference from the supplied `data` pointer.
+        unsafe {
+            register_mutator_extra_area(walk_cell, &mut root as *mut GcRef as *const ());
+        }
         walk_my_extra_areas(|gcref| gcref.0 += 0x100);
         unregister_mutator();
         assert_eq!(root, GcRef(0x1100));
