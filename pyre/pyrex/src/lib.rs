@@ -717,21 +717,19 @@ fn run_module(module: &str, no_site: bool) {
 
     // `_run_module_as_main` reads `sys.modules["__main__"].__dict__` and runs
     // the module's code in it, so a `__main__` module backed by a fresh dict
-    // must exist before runpy is imported. Reuse the canonical W_DictObject
-    // paired with the storage so `__main__.__dict__` and `globals()` share one
-    // identity (module.py:77 Module.getdict()).
-    let mut namespace = Box::new(execution_context.fresh_dict_storage());
-    namespace.fix_ptr();
-    pyre_interpreter::dict_storage_store(
-        &mut namespace,
-        "__name__",
-        pyre_object::w_str_new("__main__"),
-    );
-    let namespace = Box::into_raw(namespace);
-    let canonical = pyre_interpreter::baseobjspace::dict_storage_to_dict(namespace);
+    // must exist before runpy is imported. Use the canonical W_DictObject so
+    // `__main__.__dict__` and `globals()` share one identity (module.py:77
+    // Module.getdict()).
+    let w_globals = execution_context.fresh_module_globals();
+    let _root = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(w_globals);
+    unsafe {
+        pyre_object::w_dict_setitem_str(w_globals, "__name__", pyre_object::w_str_new("__main__"))
+    };
+    let canonical = w_globals;
     let main_module = pyre_object::module::w_module_new_aliasing_dict(
         "__main__",
-        namespace as *mut u8,
+        std::ptr::null_mut(),
         canonical,
     );
     importing::set_sys_module("__main__", main_module);

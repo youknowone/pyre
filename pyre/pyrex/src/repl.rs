@@ -8,7 +8,7 @@ use rustpython_compiler::{
 
 use pyre_interpreter::call::{register_build_class, set_build_class_exec_ctx};
 use pyre_interpreter::importing;
-use pyre_interpreter::{DictStorage, PyDisplay, PyError, PyExecutionContext, dict_storage_store};
+use pyre_interpreter::{PyDisplay, PyError, PyExecutionContext};
 use pyre_jit::eval::eval_with_jit;
 
 use crate::repl_readline::{Readline, ReadlineResult};
@@ -34,7 +34,7 @@ enum ShellExecResult {
 
 struct ReplRuntime {
     ctx_ptr: *const PyExecutionContext,
-    namespace: *mut DictStorage,
+    w_globals: pyre_object::PyObjectRef,
     sys_module: pyre_object::PyObjectRef,
 }
 
@@ -59,23 +59,20 @@ pub fn run_repl(quiet: bool, no_site: bool) {
         pyre_interpreter::module::signal::interp_signal::install_signal_handling(&mut *ec_ptr);
     }
 
-    let mut namespace = Box::new(execution_context.fresh_dict_storage());
-    namespace.fix_ptr();
-    dict_storage_store(
-        &mut namespace,
-        "__name__",
-        pyre_object::w_str_new("__main__"),
-    );
-    let namespace = Box::into_raw(namespace);
+    let w_globals = execution_context.fresh_module_globals();
+    let _root = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(w_globals);
+    unsafe {
+        pyre_object::w_dict_setitem_str(w_globals, "__name__", pyre_object::w_str_new("__main__"))
+    };
 
-    // PyPy `module.py:77 Module.getdict()` parity: reuse the canonical
-    // W_DictObject paired with this storage so REPL STORE_NAME writes,
-    // `globals()`, `f.__globals__`, and `__main__.__dict__` all share
-    // one identity.
-    let canonical = pyre_interpreter::baseobjspace::dict_storage_to_dict(namespace);
+    // PyPy `module.py:77 Module.getdict()` parity: use the canonical
+    // W_DictObject so REPL STORE_NAME writes, `globals()`, `f.__globals__`,
+    // and `__main__.__dict__` all share one identity.
+    let canonical = w_globals;
     let main_module = pyre_object::module::w_module_new_aliasing_dict(
         "__main__",
-        namespace as *mut u8,
+        std::ptr::null_mut(),
         canonical,
     );
     importing::set_sys_module("__main__", main_module);
@@ -103,7 +100,7 @@ pub fn run_repl(quiet: bool, no_site: bool) {
 
     let runtime = ReplRuntime {
         ctx_ptr: Rc::into_raw(Rc::clone(&execution_context)),
-        namespace,
+        w_globals,
         sys_module,
     };
 
@@ -246,9 +243,9 @@ fn shell_exec(
         ShellCompileAction::Execute(code) => {
             let code_ptr = Box::into_raw(Box::new(code));
             let w_code = pyre_interpreter::pycode::w_code_new(code_ptr as *const ());
-            let mut frame = match pyre_interpreter::createframe(
+            let mut frame = match pyre_interpreter::pyframe::createframe_obj(
                 w_code as *const (),
-                runtime.namespace,
+                runtime.w_globals,
                 runtime.ctx_ptr,
                 None,
             ) {
