@@ -7235,12 +7235,15 @@ fn collect_outer_active_boxes(
                         // `write_ref_reg` mirror was retired: outside a
                         // branch guard's own per-PC color map, the walk
                         // register may hold a stale value from a prior SSA def
-                        // that shared the color.  Keep the shadow-first order
-                        // by default.  Under `PYRE_FBW_STACK_LIVEREG`, prefer
-                        // the live register only when the guard PC's
+                        // that shared the color.  Prefer the live register
+                        // (the upstream source) when the guard PC's
                         // `pcdep_color_slots` proves this color owns the same
-                        // stack slot at the guard capture point; otherwise the
-                        // virtualizable shadow remains authoritative.
+                        // stack slot at the guard capture point — there the
+                        // register read means exactly `registers_r[index]`;
+                        // where ownership is unprovable the virtualizable
+                        // shadow remains authoritative
+                        // (`PYRE_FBW_STACK_LIVEREG=0` restores shadow-first
+                        // everywhere).
                         let shadow_is_real = vbox.is_some_and(|b| !opref_is_null_const_ptr(b));
                         let walk_real =
                             walk_box.filter(|&v| v != OpRef::NONE && !opref_is_null_const_ptr(v));
@@ -7750,9 +7753,11 @@ fn fbw_callee_vstack_enabled() -> bool {
     })
 }
 
-/// `PYRE_FBW_STACK_LIVEREG` (default OFF) — for branch-guard operand-stack
-/// snapshot slots, prefer the live Ref register when the guard PC's per-PC
-/// color map proves that color owns the same stack slot.
+/// `PYRE_FBW_STACK_LIVEREG` (default ON) — for branch-guard operand-stack
+/// snapshot slots, prefer the live Ref register (`pyjitpl.py:222`
+/// `get_list_of_active_boxes` reads `self.registers_r[index]`) when the
+/// guard PC's per-PC color map proves that color owns the same stack slot.
+/// `=0` restores the shadow-first pyre-local order everywhere.
 fn fbw_stack_livereg_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_STACK_LIVEREG") {
@@ -7760,7 +7765,7 @@ fn fbw_stack_livereg_enabled() -> bool {
             let v = v.to_string_lossy();
             v != "0" && !v.eq_ignore_ascii_case("false")
         }
-        None => false,
+        None => true,
     })
 }
 
