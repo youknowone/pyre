@@ -4108,12 +4108,8 @@ fn unsupported_jit_shape(code: &pyre_interpreter::CodeObject) -> UnsupportedJitS
     let mut arg_state = pyre_interpreter::OpArgState::default();
     let mut has_for_iter = false;
     for unit in code.instructions.iter().copied() {
-        match arg_state.get(unit).0 {
-            pyre_interpreter::Instruction::WithExceptStart => {
-                return UnsupportedJitShape::StructuralRegion;
-            }
-            pyre_interpreter::Instruction::ForIter { .. } => has_for_iter = true,
-            _ => {}
+        if let pyre_interpreter::Instruction::ForIter { .. } = arg_state.get(unit).0 {
+            has_for_iter = true;
         }
     }
     if has_for_iter {
@@ -8946,24 +8942,17 @@ mod tests {
     }
 
     #[test]
-    fn with_block_frame_is_structural_region() {
-        // A `with` block compiles to `WITH_EXCEPT_START` for its exception link.
-        // The codewriter still residualizes that lowering, so tracing the frame
-        // (or its nested callees) miscompiles — a raw SIGSEGV in the exception
-        // path plus guard-failure storms (test_strftime/test_shlex/test_textwrap,
-        // #389). The frame must classify as `StructuralRegion` so it and its
-        // callees stay interpreted; dropping this gate regressed the CPython
-        // suite (commit 4daa5c517e, reverted).
+    fn with_block_frame_is_admitted() {
+        // A `with` block compiles to `WITH_EXCEPT_START` for its exception link,
+        // lowered as a residual with the exception disposition preserved across
+        // the guard-failure bridge. The frame is admitted for tracing.
         use pyre_interpreter::compile_exec;
         let module = compile_exec(
             "def wf(cm):\n    total = 0\n    for _ in range(3):\n        with cm:\n            total += 1\n    return total\n",
         )
         .expect("test code should compile");
         let code = function_code_from_module(&module, "wf");
-        assert_eq!(
-            unsupported_jit_shape(&code),
-            UnsupportedJitShape::StructuralRegion
-        );
+        assert_eq!(unsupported_jit_shape(&code), UnsupportedJitShape::None);
     }
 
     fn ensure_test_jit_callbacks() {

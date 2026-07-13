@@ -9092,13 +9092,6 @@ impl CodeWriter {
                             // on top. Preserve the net `+1` stack effect in the
                             // shadow graph and fall back to the interpreter for
                             // the actual helper call semantics.
-                            //
-                            // Portable (flowspace records a `direct_call` /
-                            // `indirect_call`) but latent: a `with` block's
-                            // exception table prevents the enclosing loop/callee
-                            // from ever reaching a JIT token, so this abort is
-                            // never reached in practice — no residual yet.
-                            emit_abort_permanent!(py_pc);
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
                             emit_vsd!(current_depth, py_pc);
