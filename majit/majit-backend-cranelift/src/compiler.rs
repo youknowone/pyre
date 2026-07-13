@@ -11758,6 +11758,14 @@ impl CraneliftBackend {
                         None,
                     );
 
+                    // The GIL-released window is the most likely point for a
+                    // moving collection by another mutator, so reload the frame
+                    // from the shadow stack and re-pin it before touching the
+                    // frame again — `_reload_frame_if_necessary` runs after every
+                    // call, and every other collecting-call arm does the same.
+                    jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                    builder.ins().set_pinned_reg(jf_ptr);
+
                     emit_pop_gcmap(&mut builder, jf_ptr, per_call_gcmap);
                     // Reload roots (may have been updated by GC during call)
                     reload_ref_roots(
