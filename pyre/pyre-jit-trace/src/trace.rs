@@ -2254,25 +2254,58 @@ fn probe_walk_perfn_jitcode(
 /// loop-input register seeding, so the walk mis-evaluates the loop guard,
 /// exits the loop on the first pass, and concretely executes the post-loop
 /// tail — double-running its side effects and leaving the frame positioned
-/// past the loop (#125).  The walk's reactive `abort_permanent` decline
+/// past the loop.  The walk's reactive `abort_permanent` decline
 /// never fires because the corrupted guard exits before reaching the
-/// marker.  The scan is scoped to ops at/after the first `jit_merge_point`
-/// (the inner loop header) so a prologue-only marker (e.g. `COPY_FREE_VARS`
-/// ahead of a clean hot loop) does not over-decline.
-fn loop_body_has_abort_permanent(w_code: *const ()) -> bool {
+/// marker.  When the loop is not inside a `try`, the scan is scoped to ops
+/// after the first `jit_merge_point` and before the loop's final back-edge, so
+/// neither a prologue-only marker (e.g. `COPY_FREE_VARS` ahead of a clean hot
+/// loop) nor a post-loop marker over-declines the loop.  A loop covered by an
+/// exception handler keeps the full-tail scan so a post-loop
+/// `abort_permanent` (e.g. the `DELETE_FAST` cleanup for `except X as e`)
+/// still declines it, because compiled-loop delivery of an uncaught raise to
+/// the handler is not yet supported.
+fn loop_body_has_abort_permanent(w_code: *const (), start_pc: usize) -> bool {
     let Some(pjc) = crate::state::pyjitcode_for_code(w_code) else {
         return false;
     };
     let code = pjc.jitcode.code.as_slice();
-    let mut seen_merge_point = false;
-    for op in crate::jitcode_runtime::decoded_ops(code) {
-        if op.opname == "jit_merge_point" {
-            seen_merge_point = true;
-        } else if seen_merge_point && op.opname == "abort_permanent" {
-            return true;
+    let Some(merge_point) = crate::jitcode_runtime::decoded_ops(code)
+        .find(|op| op.opname == "jit_merge_point")
+        .map(|op| op.pc)
+    else {
+        return false;
+    };
+
+    let mut back_edge_end: Option<usize> = None;
+    let mut first_abort_permanent = None;
+    for op in crate::jitcode_runtime::decoded_ops(code).filter(|op| op.pc > merge_point) {
+        if op.opname == "abort_permanent" && first_abort_permanent.is_none() {
+            first_abort_permanent = Some(op.pc);
+        }
+        if op.opname.starts_with("goto") && op.argcodes.ends_with('L') {
+            let target =
+                u16::from_le_bytes([code[op.next_pc - 2], code[op.next_pc - 1]]) as usize;
+            if target <= merge_point {
+                back_edge_end = Some(back_edge_end.map_or(op.pc, |end| end.max(op.pc)));
+            }
         }
     }
-    false
+
+    // `start_pc` is a code-unit index; the exception table lookup takes byte offsets (×2).
+    let loop_in_try = unsafe {
+        pyre_interpreter::pycode::w_code_lookup_exceptiontable(
+            w_code as pyre_object::PyObjectRef,
+            (start_pc as u32) * 2,
+        )
+    }
+    .is_some();
+
+    let scan_end = if loop_in_try || std::env::var_os("PYRE_FBW_LOOPBODY_SCAN_FULL").is_some() {
+        code.len()
+    } else {
+        back_edge_end.unwrap_or(code.len())
+    };
+    first_abort_permanent.is_some_and(|pc| pc < scan_end)
 }
 
 /// True when the hot loop body in `w_code` inline-calls — transitively — a
@@ -2517,7 +2550,7 @@ fn full_body_walk_trace(
     // routing to the trait tracer (which handles the unported op) is the
     // same outcome the reactive in-walk `abort_permanent` decline reaches,
     // minus the frame corruption.
-    if loop_body_has_abort_permanent(w_code) {
+    if loop_body_has_abort_permanent(w_code, start_pc) {
         // Tag the decline so `PYRE_FBW_DEBUG_ABORT` census attributes it to the
         // up-front `abort_permanent` scan, not the trait retry fall-through
         // (`Trait::DeclinedAbort`).  Without this the real declining class is
