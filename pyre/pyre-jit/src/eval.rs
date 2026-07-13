@@ -8946,9 +8946,12 @@ mod tests {
         // A `with` block compiles to `WITH_EXCEPT_START` for its exception link,
         // lowered as a residual with the exception disposition preserved across
         // the guard-failure bridge. The frame is admitted for tracing.
+        // The body is kept free of `FOR_ITER` so the only classification axis
+        // is the `WITH_EXCEPT_START` shape; a `for` loop whose body is not
+        // allow-listed declines independently via `for_iter_bodies_all_jit_safe`.
         use pyre_interpreter::compile_exec;
         let module = compile_exec(
-            "def wf(cm):\n    total = 0\n    for _ in range(3):\n        with cm:\n            total += 1\n    return total\n",
+            "def wf(cm):\n    total = 0\n    with cm:\n        total += 1\n    return total\n",
         )
         .expect("test code should compile");
         let code = function_code_from_module(&module, "wf");

@@ -1621,7 +1621,7 @@ fn run_perfn_walk(
                                 reserved_red_colors.first().copied() == Some(color);
                             let bridge_names_operand =
                                 !is_frame_color && opref != ec_box && opref != frame_box;
-                            if pyre_object::tagged_int::CAN_BE_TAGGED && bridge_names_operand {
+                            if bridge_names_operand {
                                 seed(color, opref);
                             }
                             continue;
