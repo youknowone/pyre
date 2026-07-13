@@ -524,9 +524,17 @@ unsafe fn module_dict_object_custom_trace(
 
 unsafe fn set_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let set = unsafe { &mut *(obj_addr as *mut pyre_object::setobject::W_SetObject) };
-    let items = unsafe { &mut *set.items };
-    for item in items.iter_mut() {
-        f(item as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    let entries = unsafe { &mut *set.items };
+    for (key, _) in entries.iter_mut() {
+        // ObjectKey.hash is identity-stable across GC moves, so writing the
+        // relocated pointer through the key's `obj` slot keeps the bucket
+        // index valid — mirrors `dict_object_custom_trace`.
+        let key_ptr = key as *const pyre_object::dictmultiobject::ObjectKey
+            as *mut pyre_object::dictmultiobject::ObjectKey;
+        f(
+            std::ptr::addr_of_mut!((*key_ptr).obj) as *mut pyre_object::PyObjectRef
+                as *mut majit_ir::GcRef,
+        );
     }
 }
 
@@ -1422,8 +1430,8 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
         w_dict_tid,
     );
     pytype_to_tid.insert(&pyre_object::DICT_TYPE as *const _ as usize, w_dict_tid);
-    // W_SetObject carries `items: *mut Vec<PyObjectRef>`. Register a
-    // custom trace hook so GC forwarding updates indirect element slots.
+    // W_SetObject carries `items: *mut IndexMap<ObjectKey, ()>`. Register a
+    // custom trace hook so GC forwarding updates indirect key object slots.
     // Both `set` and `frozenset` PyTypes share this Rust struct/tid.
     let w_set_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
         std::mem::size_of::<pyre_object::setobject::W_SetObject>(),

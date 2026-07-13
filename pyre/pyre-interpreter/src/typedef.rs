@@ -13634,11 +13634,8 @@ fn set_method_intersection(
     let mut result: Vec<pyre_object::PyObjectRef> = self_items;
     for other in &args[1..] {
         let other_items = crate::builtins::collect_iterable(*other)?;
-        result.retain(|&item| unsafe {
-            other_items
-                .iter()
-                .any(|&o| pyre_object::w_set_contains(pyre_object::w_set_from_items(&[o]), item))
-        });
+        let probe = pyre_object::w_set_from_items(&other_items);
+        result.retain(|&item| unsafe { pyre_object::w_set_contains(probe, item) });
     }
     unsafe {
         if pyre_object::is_frozenset(args[0]) {

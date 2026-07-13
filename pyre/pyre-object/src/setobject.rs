@@ -2,10 +2,10 @@
 //!
 //! PyPy equivalent: pypy/objspace/std/setobject.py
 //!
-//! Stores arbitrary PyObjectRef elements with element equality
-//! reusing dict_keys_equal semantics. PyPy carries multiple set
-//! strategies (EmptySet, IntegerSet, etc.); pyre starts with a single
-//! Vec to keep parity tractable while bringing the type online.
+//! Stores arbitrary PyObjectRef elements in a hashed IndexMap of ObjectKey,
+//! reusing the dict object strategy's hashing and equality semantics. PyPy
+//! carries multiple set strategies (EmptySet, IntegerSet, etc.); pyre starts
+//! with a single strategy while bringing the type online.
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
@@ -16,13 +16,13 @@ pub static FROZENSET_TYPE: PyType = crate::pyobject::new_pytype("frozenset");
 
 /// Python set object.
 ///
-/// Layout: `[ob_type | items | len]`. `items` is heap-owned via
-/// `Box::into_raw` to keep the struct trivially `Copy`-friendly for the
-/// JIT raw-pointer model.
+/// Layout: `[ob_type | items | len]`. `items` is a heap-owned hashed
+/// `IndexMap<ObjectKey, ()>`, mirroring the dict object strategy while
+/// keeping the struct trivially `Copy`-friendly for the JIT raw-pointer model.
 #[repr(C)]
 pub struct W_SetObject {
     pub ob_header: PyObject,
-    pub items: *mut Vec<PyObjectRef>,
+    pub items: *mut indexmap::IndexMap<crate::dictmultiobject::ObjectKey, ()>,
     pub len: usize,
 }
 
@@ -54,13 +54,6 @@ pub unsafe fn is_set_or_frozenset(obj: PyObjectRef) -> bool {
     unsafe { is_set(obj) || is_frozenset(obj) }
 }
 
-/// Element equality. Delegates to dict_keys_equal so that set membership
-/// follows the same rules as dict key equality (int / bool / str / tuple
-/// / frozenset, with pointer identity as a fallback for everything else).
-unsafe fn set_keys_equal(a: PyObjectRef, b: PyObjectRef) -> bool {
-    crate::dictmultiobject::dict_keys_equal(a, b)
-}
-
 /// Fire the GC write barrier for a set whose element storage just gained
 /// a possibly-young element. `set_object_custom_trace` only forwards the
 /// `items` slots when the set is reached by a collection; an old-gen set
@@ -73,7 +66,10 @@ fn set_write_barrier(obj: PyObjectRef) {
 }
 
 fn alloc_set_with_type(tp: &'static PyType) -> PyObjectRef {
-    let items = crate::lltype::malloc_raw(Vec::new());
+    let items = crate::lltype::malloc_raw(indexmap::IndexMap::<
+        crate::dictmultiobject::ObjectKey,
+        (),
+    >::new());
     let header = PyObject {
         ob_type: tp as *const PyType,
         w_class: get_instantiate(tp),
@@ -143,14 +139,11 @@ pub fn w_frozenset_from_items(items: &[PyObjectRef]) -> PyObjectRef {
 pub unsafe fn w_set_add(obj: PyObjectRef, item: PyObjectRef) {
     let s = &mut *(obj as *mut W_SetObject);
     let entries = &mut *s.items;
-    for &existing in entries.iter() {
-        if set_keys_equal(existing, item) {
-            return;
-        }
+    let key = crate::dictmultiobject::object_key_for(item);
+    if entries.insert(key, ()).is_none() {
+        s.len += 1;
+        set_write_barrier(obj);
     }
-    entries.push(item);
-    s.len += 1;
-    set_write_barrier(obj);
 }
 
 /// Membership test.
@@ -160,7 +153,7 @@ pub unsafe fn w_set_add(obj: PyObjectRef, item: PyObjectRef) {
 pub unsafe fn w_set_contains(obj: PyObjectRef, item: PyObjectRef) -> bool {
     let s = &*(obj as *const W_SetObject);
     let entries = &*s.items;
-    entries.iter().any(|&e| set_keys_equal(e, item))
+    entries.contains_key(&crate::dictmultiobject::object_key_for(item))
 }
 
 /// Remove an element if present. Returns true when removed.
@@ -170,8 +163,10 @@ pub unsafe fn w_set_contains(obj: PyObjectRef, item: PyObjectRef) -> bool {
 pub unsafe fn w_set_discard(obj: PyObjectRef, item: PyObjectRef) -> bool {
     let s = &mut *(obj as *mut W_SetObject);
     let entries = &mut *s.items;
-    if let Some(idx) = entries.iter().position(|&e| set_keys_equal(e, item)) {
-        entries.remove(idx);
+    if entries
+        .shift_remove(&crate::dictmultiobject::object_key_for(item))
+        .is_some()
+    {
         s.len -= 1;
         true
     } else {
@@ -193,7 +188,7 @@ pub unsafe fn w_set_len(obj: PyObjectRef) -> usize {
 /// `obj` must point to a valid `W_SetObject`.
 pub unsafe fn w_set_items(obj: PyObjectRef) -> Vec<PyObjectRef> {
     let s = &*(obj as *const W_SetObject);
-    (*s.items).clone()
+    (*s.items).keys().map(|key| key.obj).collect()
 }
 
 #[cfg(test)]
@@ -201,8 +196,22 @@ mod tests {
     use super::*;
     use crate::intobject::w_int_new;
 
+    fn install_test_hash_hook() {
+        unsafe fn hash_int(obj: PyObjectRef) -> i64 {
+            crate::w_int_get_value(obj)
+        }
+
+        unsafe fn hash_str(_ptr: *const u8, _len: usize) -> i64 {
+            0
+        }
+
+        crate::dict_eq_hook::register_hash_w_hook(hash_int);
+        crate::dict_eq_hook::register_hash_str_hook(hash_str);
+    }
+
     #[test]
     fn add_dedupes() {
+        install_test_hash_hook();
         let s = w_set_new();
         unsafe {
             w_set_add(s, w_int_new(1));
@@ -217,6 +226,7 @@ mod tests {
 
     #[test]
     fn discard_removes() {
+        install_test_hash_hook();
         let s = w_set_new();
         unsafe {
             w_set_add(s, w_int_new(1));
