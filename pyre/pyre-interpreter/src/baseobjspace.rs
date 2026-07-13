@@ -3856,38 +3856,39 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
         }
     }
 
-    let result = object_getattr_miss(obj, name, call_getattr);
+    let err = match object_getattr_miss(obj, name, call_getattr) {
+        Ok(value) => return Ok(value),
+        Err(e) => e,
+    };
     // module.py:130-142 `Module.descr_getattribute` — PEP 562: after the
     // normal lookup misses with AttributeError, a module-level `__getattr__`
     // stored in the module's own dict gets the final say, called with just the
     // attribute name.  Only `space.getattr` consults it.
-    if let Err(ref e) = result {
-        if call_getattr && e.kind == PyErrorKind::AttributeError && unsafe { is_module(obj) } {
-            let w_dict = unsafe { pyre_object::w_module_get_w_dict(obj) };
-            if !w_dict.is_null() {
-                if let Some(mod_getattr) = finditem_str(w_dict, "__getattr__")? {
-                    if !mod_getattr.is_null() {
-                        let name_obj = w_str_new(name);
-                        return crate::call::call_function_impl_result(mod_getattr, &[name_obj]);
-                    }
+    if call_getattr && err.kind == PyErrorKind::AttributeError && unsafe { is_module(obj) } {
+        let w_dict = unsafe { pyre_object::w_module_get_w_dict(obj) };
+        if !w_dict.is_null() {
+            if let Some(mod_getattr) = finditem_str(w_dict, "__getattr__")? {
+                if !mod_getattr.is_null() {
+                    let name_obj = w_str_new(name);
+                    return crate::call::call_function_impl_result(mod_getattr, &[name_obj]);
                 }
-                // No module `__getattr__`: phrase the miss with the module's
-                // `__name__` (`module '<name>' has no attribute '<attr>'`, the
-                // `'%U'` form), which requires a str `__name__` and falls back
-                // to the bare form otherwise.  (The `__spec__`-based
-                // circular-import diagnostics are not ported.)
-                let msg = match finditem_str(w_dict, "__name__")? {
-                    Some(w) if !w.is_null() && unsafe { pyre_object::is_str(w) } => {
-                        let nm = unsafe { pyre_object::w_str_get_wtf8(w) };
-                        format!("module '{nm}' has no attribute '{name}'")
-                    }
-                    _ => format!("module has no attribute '{name}'"),
-                };
-                return Err(PyError::new(PyErrorKind::AttributeError, msg));
             }
+            // No module `__getattr__`: phrase the miss with the module's
+            // `__name__` (`module '<name>' has no attribute '<attr>'`, the
+            // `'%U'` form), which requires a str `__name__` and falls back
+            // to the bare form otherwise.  (The `__spec__`-based
+            // circular-import diagnostics are not ported.)
+            let msg = match finditem_str(w_dict, "__name__")? {
+                Some(w) if !w.is_null() && unsafe { pyre_object::is_str(w) } => {
+                    let nm = unsafe { pyre_object::w_str_get_wtf8(w) };
+                    format!("module '{nm}' has no attribute '{name}'")
+                }
+                _ => format!("module has no attribute '{name}'"),
+            };
+            return Err(PyError::new(PyErrorKind::AttributeError, msg));
         }
     }
-    result
+    Err(err)
 }
 
 // ─── `w_name`-taking attribute API ───
