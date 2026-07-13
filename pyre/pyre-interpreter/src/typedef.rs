@@ -2448,7 +2448,17 @@ fn bool_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 let result = crate::call_function(method, &[w_obj]);
                 if !result.is_null() {
                     if !pyre_object::is_bool(result) {
-                        let tp_name = (*(*result).ob_type).name;
+                        // A tagged immediate is always an exact `int`; name it
+                        // without derefing its (non-pointer) tagged bits as
+                        // `ob_type`. Mirrors the tag short-circuit in
+                        // `builtin_str`. Gated on `CAN_BE_TAGGED`.
+                        let tp_name: &str = if pyre_object::tagged_int::CAN_BE_TAGGED
+                            && pyre_object::tagged_int::is_tagged_int(result)
+                        {
+                            "int"
+                        } else {
+                            (*(*result).ob_type).name
+                        };
                         return Err(crate::PyError::type_error(format!(
                             "__bool__ should return bool, returned {}",
                             tp_name,
