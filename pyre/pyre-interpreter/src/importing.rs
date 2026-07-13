@@ -1490,25 +1490,23 @@ fn parse_source_module(pathname: &str, source: &str) -> Result<CodeObject, Strin
 
 fn exec_code_module(
     code: CodeObject,
-    namespace: *mut DictStorage,
+    w_globals: pyre_object::PyObjectRef,
     execution_context: *const PyExecutionContext,
     pathname: Option<&str>,
     cpathname: Option<&str>,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let w_globals = crate::baseobjspace::dict_storage_to_dict(namespace);
     // importing.py:272-274 — setdefault('__builtins__', space.builtin).
-    // `fresh_dict_storage` already seeds `__builtins__` for module-shape
+    // `fresh_module_globals` already seeds `__builtins__` for module-shape
     // namespaces; the explicit setdefault here mirrors PyPy's defensive
-    // call so callers that hand in a pre-built storage (future
+    // call so callers that hand in a pre-built globals object (future
     // `_imp.exec_dynamic`-style entry) still inherit the builtins
     // pointer with no surprises.
-    {
-        let ns = unsafe { &mut *namespace };
-        if unsafe { pyre_object::w_dict_getitem_str(w_globals, "__builtins__") }.is_none() {
-            let ctx = unsafe { &*execution_context };
-            let w_builtin = ctx.get_builtin();
-            if !w_builtin.is_null() {
-                crate::dict_storage_store(ns, "__builtins__", w_builtin);
+    if unsafe { pyre_object::w_dict_getitem_str(w_globals, "__builtins__") }.is_none() {
+        let ctx = unsafe { &*execution_context };
+        let w_builtin = ctx.get_builtin();
+        if !w_builtin.is_null() {
+            unsafe {
+                pyre_object::w_dict_setitem_str(w_globals, "__builtins__", w_builtin);
             }
         }
     }
@@ -1516,10 +1514,11 @@ fn exec_code_module(
     // `Some(pathname)` for source-file imports and `None` for the
     // `write_paths=False` shape (REPL, builtin bootstrap).
     if let Some(p) = pathname {
-        let ns = unsafe { &mut *namespace };
         // importing.py:284 setitem('__file__', w_pathname).
         let w_pathname = pyre_object::w_str_new(p);
-        crate::dict_storage_store(ns, "__file__", w_pathname);
+        unsafe {
+            pyre_object::w_dict_setitem_str(w_globals, "__file__", w_pathname);
+        }
         // importing.py:285 setitem('__cached__', w_cpathname).  PyPy
         // surfaces `space.w_None` when `cpathname is None`, i.e. the
         // import was not satisfied from a `.pyc`.  Pyre has no .pyc
@@ -1528,7 +1527,9 @@ fn exec_code_module(
             Some(c) => pyre_object::w_str_new(c),
             None => pyre_object::w_none(),
         };
-        crate::dict_storage_store(ns, "__cached__", w_cpathname);
+        unsafe {
+            pyre_object::w_dict_setitem_str(w_globals, "__cached__", w_cpathname);
+        }
         // importing.py:286-298 — `_fix_up_module(d, name, pathname,
         // cpathname)`.  PyPy's `_fix_up_module`
         // (`lib-python/3/importlib/_bootstrap_external.py:1728`) sets
@@ -1543,10 +1544,14 @@ fn exec_code_module(
         // app-level layer lands, the `None` arms will collapse onto the
         // mechanical PyPy port.
         if unsafe { pyre_object::w_dict_getitem_str(w_globals, "__loader__") }.is_none() {
-            crate::dict_storage_store(ns, "__loader__", pyre_object::w_none());
+            unsafe {
+                pyre_object::w_dict_setitem_str(w_globals, "__loader__", pyre_object::w_none());
+            }
         }
         if unsafe { pyre_object::w_dict_getitem_str(w_globals, "__spec__") }.is_none() {
-            crate::dict_storage_store(ns, "__spec__", pyre_object::w_none());
+            unsafe {
+                pyre_object::w_dict_setitem_str(w_globals, "__spec__", pyre_object::w_none());
+            }
         }
     }
     let code_ptr = Box::into_raw(Box::new(code));
@@ -1559,7 +1564,8 @@ fn exec_code_module(
     // GENERATOR / COROUTINE / ASYNC_GENERATOR dispatch in
     // pyframe.py:268-273 holds for the import path too, and so an imported
     // module's top-level hot loop reaches the JIT portal.
-    let mut frame = crate::createframe(w_code as *const (), namespace, execution_context, None)?;
+    let mut frame =
+        crate::pyframe::createframe_obj(w_code as *const (), w_globals, execution_context, None)?;
     frame.run_with_jit()
 }
 
@@ -1637,14 +1643,14 @@ fn load_source_module(
     // PyPy equivalent: Module.__init__ creates w_dict = space.newdict()
     // then exec_code_module sets __builtins__ and runs code in w_dict.
     let ctx = unsafe { &*execution_context };
-    let mut namespace = Box::new(ctx.fresh_dict_storage());
-    namespace.fix_ptr();
+    let w_globals = ctx.fresh_module_globals();
+    let _root = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(w_globals);
 
     // PyPy `interpreter/module.py:Module.__init__` seeds `__name__` on
-    // the module's w_dict.  `w_module_new(modulename, ns_ptr)` below
-    // does that via `w_dict_setitem_str("__name__", ...)` which the
-    // storage proxy mirrors back into `namespace`, so an explicit
-    // dict_storage_store here would be redundant.
+    // the module's w_dict.  `w_module_new_aliasing_dict` below does that
+    // via `w_dict_setitem_str("__name__", ...)`, so an explicit store
+    // here would be redundant.
     //
     // `__file__`/`__cached__` setting moved into `exec_code_module`
     // (`importing.py:284-285`) so the per-module attribute seeding
@@ -1663,7 +1669,9 @@ fn load_source_module(
     } else {
         modulename
     };
-    crate::dict_storage_store(&mut namespace, "__package__", pyre_object::w_str_new(pkg));
+    unsafe {
+        pyre_object::w_dict_setitem_str(w_globals, "__package__", pyre_object::w_str_new(pkg));
+    }
 
     // Seed `__path__` BEFORE executing the package body so relative imports
     // inside `__init__.py` (`from .sub import *`) resolve against the package
@@ -1672,32 +1680,21 @@ fn load_source_module(
     // sys.path and pick up a same-leaf module from an unrelated package.
     if let Some(dir) = package_dir {
         let path_str = pyre_object::w_str_new(&dir.to_string_lossy());
-        crate::dict_storage_store(
-            &mut namespace,
-            "__path__",
-            pyre_object::w_list_new(vec![path_str]),
-        );
+        unsafe {
+            pyre_object::w_dict_setitem_str(
+                w_globals,
+                "__path__",
+                pyre_object::w_list_new(vec![path_str]),
+            );
+        }
     }
-
-    let ns_ptr = Box::into_raw(namespace);
 
     // Create the module object BEFORE execution and register in sys.modules.
     // PyPy: load_source_module → set_sys_modules BEFORE exec_code_module.
     // This prevents infinite recursion on circular imports.
-    //
-    // `dict_storage_to_dict(ns_ptr)` now constructs a W_ModuleDictObject
-    // (PyPy `dictmultiobject.py:60-69 allocate_and_init_instance(
-    // module=True)` shape) with `dict_storage_proxy = ns_ptr` and
-    // registers it as `DictStorage.mirror_target`, so `module.w_dict`,
-    // `function.__globals__`, and `globals()` all converge on the same
-    // W_ModuleDictObject identity.  Forward writes via the module dict
-    // fan out to the DictStorage; back-mirror updates the strategy
-    // storage in step — the frame-side `*mut DictStorage` carrier
-    // stays valid until `PyFrame.w_globals` migrates to
-    // `PyObjectRef`.  The simpler builtin module loader path (no
-    // frame globals dependency) already uses `W_ModuleDictObject`.
-    let canonical = crate::baseobjspace::dict_storage_to_dict(ns_ptr);
-    let module = pyre_object::w_module_new_aliasing_dict(modulename, ns_ptr as *mut u8, canonical);
+    let canonical = w_globals;
+    let module =
+        pyre_object::w_module_new_aliasing_dict(modulename, std::ptr::null_mut(), canonical);
     set_sys_module(modulename, module);
 
     // PyPy `importing.py:300` passes `pathname`/`cpathname` to
@@ -1708,7 +1705,13 @@ fn load_source_module(
     // On exec failure drop the pre-registered module from sys.modules
     // (`_bootstrap._load`) so a retried import re-runs the body instead of
     // observing a half-built module.
-    if let Err(e) = exec_code_module(code, ns_ptr, execution_context, Some(&pathname_str), None) {
+    if let Err(e) = exec_code_module(
+        code,
+        w_globals,
+        execution_context,
+        Some(&pathname_str),
+        None,
+    ) {
         remove_sys_module(modulename);
         return Err(e);
     }
@@ -1757,28 +1760,28 @@ fn load_namespace_package(
     // Submodule imports resolve against `__path__` exactly as for a regular
     // package.
     let ctx = unsafe { &*execution_context };
-    let mut namespace = Box::new(ctx.fresh_dict_storage());
-    namespace.fix_ptr();
+    let w_globals = ctx.fresh_module_globals();
+    let _root = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(w_globals);
 
-    crate::dict_storage_store(
-        &mut namespace,
-        "__package__",
-        pyre_object::w_str_new(modulename),
-    );
+    unsafe {
+        pyre_object::w_dict_setitem_str(
+            w_globals,
+            "__package__",
+            pyre_object::w_str_new(modulename),
+        );
+    }
 
     let path_items: Vec<PyObjectRef> = dirs
         .iter()
         .map(|d| pyre_object::w_str_new(&d.to_string_lossy()))
         .collect();
-    crate::dict_storage_store(
-        &mut namespace,
-        "__path__",
-        pyre_object::w_list_new(path_items),
-    );
+    unsafe {
+        pyre_object::w_dict_setitem_str(w_globals, "__path__", pyre_object::w_list_new(path_items));
+    }
 
-    let ns_ptr = Box::into_raw(namespace);
-    let canonical = crate::baseobjspace::dict_storage_to_dict(ns_ptr);
-    let module = pyre_object::w_module_new_aliasing_dict(modulename, ns_ptr as *mut u8, canonical);
+    let module =
+        pyre_object::w_module_new_aliasing_dict(modulename, std::ptr::null_mut(), w_globals);
     set_sys_module(modulename, module);
     Ok(module)
 }
