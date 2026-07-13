@@ -1674,15 +1674,19 @@ fn gc_owns_object_via_active_runtime(addr: usize) -> bool {
 }
 
 fn gc_is_nursery_object_via_active_runtime(addr: usize) -> bool {
-    CRANELIFT_ACTIVE_GC.with(|cell| match cell.try_borrow_mut() {
-        Ok(mut guard) => guard
-            .as_deref_mut()
-            .map(|gc| gc.is_nursery_object(addr))
-            .unwrap_or(false),
-        Err(_) => CRANELIFT_ACTIVE_GC_RAW.with(|raw| match raw.get() {
-            Some(ptr) => unsafe { (&*ptr).is_nursery_object(addr) },
-            None => false,
+    let via_box = CRANELIFT_ACTIVE_GC.with(|cell| match cell.try_borrow() {
+        Ok(guard) => guard.as_deref().map(|gc| gc.is_nursery_object(addr)),
+        Err(_) => CRANELIFT_ACTIVE_GC_RAW.with(|raw| {
+            raw.get()
+                .map(|ptr| unsafe { (&*ptr).is_nursery_object(addr) })
         }),
+    });
+    via_box.unwrap_or_else(|| {
+        if majit_gc::gc_sync::is_initialized() {
+            majit_gc::gc_sync::gc_query_reentrant(|g| g.is_nursery_object(addr))
+        } else {
+            false
+        }
     })
 }
 

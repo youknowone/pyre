@@ -2051,6 +2051,11 @@ impl PyFrame {
     /// long as the generator object reaches it (`generator.py` holds the
     /// frame), and the generator's custom trace greys the frame block.
     pub fn snapshot_for_generator(&self) -> FrameBox {
+        // `build_snapshot_frame` finishes by cloning `lastblock`; no later
+        // field construction allocates. `FrameBox::new` then uses the
+        // non-collecting `alloc_in_oldgen` path and write-barriers the frame
+        // before this returns, so any nursery block chain is reached from the
+        // remembered set on the next minor collection.
         let mut frame =
             FrameBox::new(self.build_snapshot_frame(FrameLocalsArrayAllocation::OldGenGc));
         frame.fix_array_ptrs();

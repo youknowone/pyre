@@ -607,15 +607,19 @@ fn dynasm_gc_owns_object(addr: usize) -> bool {
 }
 
 fn dynasm_gc_is_nursery_object(addr: usize) -> bool {
-    DYNASM_ACTIVE_GC.with(|cell| match cell.try_borrow() {
-        Ok(guard) => guard
-            .as_deref()
-            .map(|gc| gc.is_nursery_object(addr))
-            .unwrap_or(false),
-        Err(_) => DYNASM_ACTIVE_GC_RAW.with(|raw| match raw.get() {
-            Some(ptr) => unsafe { (&*ptr).is_nursery_object(addr) },
-            None => false,
+    let via_box = DYNASM_ACTIVE_GC.with(|cell| match cell.try_borrow() {
+        Ok(guard) => guard.as_deref().map(|gc| gc.is_nursery_object(addr)),
+        Err(_) => DYNASM_ACTIVE_GC_RAW.with(|raw| {
+            raw.get()
+                .map(|ptr| unsafe { (&*ptr).is_nursery_object(addr) })
         }),
+    });
+    via_box.unwrap_or_else(|| {
+        if majit_gc::gc_sync::is_initialized() {
+            majit_gc::gc_sync::gc_query_reentrant(|g| g.is_nursery_object(addr))
+        } else {
+            false
+        }
     })
 }
 
