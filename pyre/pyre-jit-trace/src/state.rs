@@ -793,6 +793,18 @@ pub fn skip_python_trivia_forward_public(
     ))
 }
 
+/// Translate a resume-frame pc word to a Python instruction coordinate.
+pub fn backxlat_py_pc(jitcode_index: i32, pc_word: i32) -> i32 {
+    let fallback = majit_ir::resumedata::decode_resume_pc(pc_word).0;
+    if !majit_ir::resumedata::m369_pcword_flip_enabled() {
+        return fallback;
+    }
+    python_pc_for_jitcode_pc_public(jitcode_index, pc_word)
+        .and_then(|raw_py_pc| skip_python_trivia_forward_public(jitcode_index, raw_py_pc))
+        .map(|(py_pc, _)| py_pc)
+        .unwrap_or(fallback)
+}
+
 /// Enable the resume-path routing and back-translation census.
 pub fn m369_route_audit_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -5817,6 +5829,7 @@ fn reconstruct_inline_recipe(
     if frame.pc < 0 {
         return None;
     }
+    let py_pc = backxlat_py_pc(frame.jitcode_index, frame.pc) as usize;
     let w_code = code_for_jitcode_index(frame.jitcode_index)?;
     if w_code.is_null() {
         return None;
@@ -5917,11 +5930,10 @@ fn reconstruct_inline_recipe(
             | majit_ir::RdVirtualInfo::VArrayInfoNotClear { fieldnums, .. } => fieldnums.clone(),
             _ => return None,
         };
-        let valuestackdepth =
-            match crate::liveness::liveness_for(raw_code).stack_depth_at(frame.pc as usize) {
-                Some(d) => nlocals + d,
-                None => return None,
-            };
+        let valuestackdepth = match crate::liveness::liveness_for(raw_code).stack_depth_at(py_pc) {
+            Some(d) => nlocals + d,
+            None => return None,
+        };
         if valuestackdepth > arr.len() {
             return None;
         }
@@ -5960,7 +5972,7 @@ fn reconstruct_inline_recipe(
         return Some(ReconstructRecipe {
             code_ptr: raw_code as *const (),
             jitcode_index: frame.jitcode_index,
-            pc: frame.pc as usize,
+            pc: py_pc,
             jitcode_pc: frame.jitcode_pc,
             nlocals,
             valuestackdepth,
@@ -5989,8 +6001,7 @@ fn reconstruct_inline_recipe(
     // resume pc there is no per-pc map to faithfully rebuild the frame, so
     // decline to the single-frame bridge (whose vable payload IS semantic-
     // ordered) rather than rebuild the frame with mis-slotted boxes.
-    let stack_only = match crate::liveness::liveness_for(raw_code).stack_depth_at(frame.pc as usize)
-    {
+    let stack_only = match crate::liveness::liveness_for(raw_code).stack_depth_at(py_pc) {
         Some(d) => d,
         None => return None,
     };
@@ -6094,11 +6105,10 @@ fn reconstruct_inline_recipe(
     // `valuestackdepth` scalar (state.rs:6382); an inline frame has no such
     // scalar, so derive it from the bytecode here. An unreachable resume pc
     // aborts the multi-frame path.
-    let valuestackdepth =
-        match crate::liveness::liveness_for(raw_code).stack_depth_at(frame.pc as usize) {
-            Some(d) => nlocals + d,
-            None => return None,
-        };
+    let valuestackdepth = match crate::liveness::liveness_for(raw_code).stack_depth_at(py_pc) {
+        Some(d) => nlocals + d,
+        None => return None,
+    };
 
     // Invert the COLOR-indexed decode into SLOT-indexed `registers_r`/
     // `concrete_r`, mirroring the root frame's `setup_bridge_sym` color→slot
@@ -6145,7 +6155,7 @@ fn reconstruct_inline_recipe(
     Some(ReconstructRecipe {
         code_ptr: raw_code as *const (),
         jitcode_index: frame.jitcode_index,
-        pc: frame.pc as usize,
+        pc: py_pc,
         jitcode_pc: frame.jitcode_pc,
         nlocals,
         valuestackdepth,
@@ -6185,7 +6195,7 @@ fn m369_backxlat_recipe_audit(frame: &majit_ir::resumedata::RebuiltFrame) {
         Some((py_pc, trivia_applied)) => (Some(py_pc), !trivia_applied),
         None => (None, false),
     };
-    let stored_py_pc = majit_ir::resumedata::decode_resume_pc(frame.pc).0 as i32;
+    let stored_py_pc = backxlat_py_pc(frame.jitcode_index, frame.pc);
     eprintln!(
         "[m369-backxlat] site=recipe jitcode_index={} stored_py_pc={} carried={} \
          word_class={word_class} resolved_offset={resolved_offset:?} \

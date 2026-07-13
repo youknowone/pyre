@@ -5264,7 +5264,7 @@ fn m369_backxlat_result(frame: M369BackxlatFrame) -> (Option<usize>, Option<i32>
         Some((py_pc, trivia_applied)) => (Some(py_pc), !trivia_applied),
         None => (None, false),
     };
-    let stored_py_pc = majit_ir::resumedata::decode_resume_pc(frame.pc).0 as i32;
+    let stored_py_pc = pyre_jit_trace::state::backxlat_py_pc(frame.jitcode_index, frame.pc);
     (
         resolved_offset,
         recovered,
@@ -5300,14 +5300,18 @@ fn m369_backxlat_audit(ni: usize) {
                 frame.jitcode_index,
                 frame.pc,
                 frame.jitcode_pc,
-                frame.pc >= 0 && frame.pc as usize != ni,
+                frame.pc >= 0
+                    && pyre_jit_trace::state::backxlat_py_pc(frame.jitcode_index, frame.pc)
+                        as usize
+                        != ni,
             )
         })
         .collect();
     pyre_jit_trace::state::m369_set_backxlat_divergences(&divergences);
 
     if let Some(frame) = frames.first().copied() {
-        let divergent_vs_ni = frame.pc >= 0 && frame.pc as usize != ni;
+        let divergent_vs_ni = frame.pc >= 0
+            && pyre_jit_trace::state::backxlat_py_pc(frame.jitcode_index, frame.pc) as usize != ni;
         if frame.jitcode_pc == majit_ir::resumedata::NO_JITCODE_PC {
             eprintln!(
                 "[m369-backxlat] site=rd_numb_pc frame_idx=0 nframes={} \
@@ -5339,7 +5343,8 @@ fn m369_backxlat_audit(ni: usize) {
     }
 
     for (idx, frame) in frames.iter().copied().enumerate() {
-        let divergent_vs_ni = frame.pc >= 0 && frame.pc as usize != ni;
+        let divergent_vs_ni = frame.pc >= 0
+            && pyre_jit_trace::state::backxlat_py_pc(frame.jitcode_index, frame.pc) as usize != ni;
         if frame.jitcode_pc == majit_ir::resumedata::NO_JITCODE_PC {
             eprintln!(
                 "[m369-backxlat] frame_idx={idx} nframes={} jitcode_index={} \
@@ -7584,13 +7589,23 @@ pub(crate) fn decode_and_restore_guard_failure(
         // `resume_in_blackhole` resumes at) is the correct resume point.
         // Prefer it when the two disagree; for the trait tracer they always
         // match (the frame's `last_instr` tracks the Python pc), so this is
-        // a no-op there.
+        // a no-op there. With flipped pc words, a single-frame resume uses
+        // the restored vable position and a multi-frame resume uses the
+        // innermost decoded section position.
         let ni = jit_state.next_instr();
         let innermost = resumed_frames.last();
-        let resume_pc = innermost
-            .map(|f| f.py_pc)
-            .filter(|&section_pc| section_pc != ni)
-            .unwrap_or(ni);
+        let resume_pc = if majit_ir::resumedata::m369_pcword_flip_enabled() {
+            if resumed_frames.len() == 1 {
+                ni
+            } else {
+                innermost.map(|f| f.py_pc).unwrap_or(ni)
+            }
+        } else {
+            innermost
+                .map(|f| f.py_pc)
+                .filter(|&section_pc| section_pc != ni)
+                .unwrap_or(ni)
+        };
         // When the resume pc is overridden to the innermost section's
         // `py_pc` (a multi-frame inlined-callee guard), the positional
         // `write_from_resume_data_partial` has left the physical frame's
@@ -7817,11 +7832,11 @@ fn rebuild_typed_from_rd_numb(
         );
     }
 
-    // resume.py:1383 parity: liveness PC = frame.pc from rd_numb
-    // (the same PC used by get_list_of_active_boxes during encoding).
-    // The outer pyre interpreter resumes at the JIT-entry frame's PC,
-    // which after `framestack.reverse()` parity is `frames[0]`.
-    let rd_numb_pc = frames.first().map(|f| f.pc as usize);
+    // The outer frame's decoded Python position is retained for resume-state
+    // hygiene. The live resume selection uses the rebuilt frame chain.
+    let rd_numb_pc = frames
+        .first()
+        .map(|f| pyre_jit_trace::state::backxlat_py_pc(f.jitcode_index, f.pc) as usize);
     (typed, rd_numb_pc, virtuals_cache)
 }
 
@@ -8202,15 +8217,10 @@ fn build_resumed_frames(
                 .unwrap_or(false);
             M369_INNERMOST_RECOVERY.with(|c| c.set(Some((carried, portal))));
         }
-        // resume.py:1338 read_jitcode_pos_pc parity:
-        // py_pc comes from rd_numb frame header (frame.pc = orgpc).
         // pc=0 is valid (function start). pc=-1 = no-snapshot sentinel.
-        let py_pc = if frame.pc >= 0 {
-            frame.pc as usize
-        } else {
-            // No-snapshot guard: fall back to vable ni.
-            vable_ni
-        };
+        let decoded_py_pc = (frame.pc >= 0)
+            .then(|| pyre_jit_trace::state::backxlat_py_pc(frame.jitcode_index, frame.pc) as usize);
+        let py_pc = decoded_py_pc.unwrap_or(vable_ni);
         // resume.py:1339 jitcodes[jitcode_pos]:
         // Outermost frame: code from vable resume data.
         // Inner frames: code from jitcode_index registry (inlined calls).
@@ -8283,11 +8293,7 @@ fn build_resumed_frames(
         result.push(crate::call_jit::ResumedFrame {
             code: w_code,
             py_pc,
-            rd_numb_pc: if frame.pc >= 0 {
-                Some(frame.pc as usize)
-            } else {
-                None
-            },
+            rd_numb_pc: decoded_py_pc,
             frame_ptr,
             vsd,
             namespace,
