@@ -8246,18 +8246,22 @@ pub(crate) struct MidBodyPayload {
 struct FbwStoreJournalRootArea {
     stores: *const std::cell::RefCell<Vec<[pyre_object::PyObjectRef; 3]>>,
     appends: *const std::cell::RefCell<Vec<(pyre_object::PyObjectRef, usize)>>,
+    abort_overrides: *const std::cell::RefCell<Vec<(usize, pyre_object::PyObjectRef)>>,
     cell_stores: *const std::cell::RefCell<Vec<(pyre_object::PyObjectRef, i64)>>,
     foriter: *const std::cell::RefCell<Vec<InflightForiter>>,
     abort_resume: *const std::cell::RefCell<Option<InlineAbortCarrier>>,
+    active_session: *const std::cell::Cell<*const std::cell::RefCell<WalkSession>>,
 }
 
 thread_local! {
     static FBW_STORE_JOURNAL_ROOT_AREA: FbwStoreJournalRootArea = FbwStoreJournalRootArea {
         stores: FBW_STORE_JOURNAL.with(|value| value as *const _),
         appends: FBW_APPEND_JOURNAL.with(|value| value as *const _),
+        abort_overrides: FBW_ABORT_OUTER_STACK_OVERRIDES.with(|value| value as *const _),
         cell_stores: FBW_CELL_STORE_JOURNAL.with(|value| value as *const _),
         foriter: FBW_FORITER_INFLIGHT.with(|value| value as *const _),
         abort_resume: FBW_ABORT_CALL_RESUME.with(|value| value as *const _),
+        active_session: ACTIVE_WALK_SESSION.with(|value| value as *const _),
     };
 }
 
@@ -9015,6 +9019,29 @@ pub unsafe fn fbw_store_journal_root_walker_area(
     for (list, _len) in appends.iter_mut() {
         visitor(unsafe { &mut *(list as *mut pyre_object::PyObjectRef).cast() });
     }
+    // Nested-inline abort outer-frame stash: PyObjectRef slots kept across the
+    // rest of the walk; only the ref slot is a root.
+    let abort_overrides = unsafe { &mut *(*area.abort_overrides).as_ptr() };
+    for (_slot, value) in abort_overrides.iter_mut() {
+        visitor(unsafe { &mut *(value as *mut pyre_object::PyObjectRef).cast() });
+    }
+    // Inline parent-frame stack overrides on the active walk session's
+    // framestack. The session lives on the walk driver's Rust stack (which the
+    // GC cannot scan) and each override slot holds a nursery-resident ref.
+    let session_ptr = unsafe { (*area.active_session).get() };
+    if !session_ptr.is_null() {
+        // SAFETY: `ACTIVE_WALK_SESSION` is set by `InlineFrameGuard::enter` and
+        // cleared when the last frame pops, so a non-null pointer refers to a
+        // session that is live for the duration of this quiesced walk.
+        let session = unsafe { &mut *(*session_ptr).as_ptr() };
+        for frame in session.framestack.iter_mut() {
+            if let Some(parent) = frame.parent.as_mut() {
+                for (_slot, value) in parent.call_stack_overrides.iter_mut() {
+                    visitor(unsafe { &mut *(value as *mut pyre_object::PyObjectRef).cast() });
+                }
+            }
+        }
+    }
     // Cell-store journal: the cell is immovable (`malloc_typed`) so no
     // forwarding happens, but a mid-walk rebind can drop the module dict's
     // only reference — rooting it keeps the rollback's `intvalue` restore
@@ -9747,8 +9774,7 @@ fn step_vstack_mirror(ctx: &mut WalkContext<'_, '_>, jit_pc: usize) {
             ctx.vstack_valid = false;
             return;
         }
-        let Some(frame) = ActiveResumeFrame::current(ctx.session, ctx.fbw_mode.snapshot_sym)
-        else {
+        let Some(frame) = ActiveResumeFrame::current(ctx.session, ctx.fbw_mode.snapshot_sym) else {
             ctx.vstack_valid = false;
             return;
         };
