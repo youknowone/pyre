@@ -2089,15 +2089,26 @@ fn run_perfn_walk(
                              (unjournaled effect) — legacy replay kept"
                         );
                     }
-                } else if let Some((resume_py_pc, stack_overrides)) =
+                } else if let Some(resume_py_pc) =
                     crate::jitcode_dispatch::fbw_abort_outer_resume_take()
                 {
-                    if crate::state::flush_walk_end_state_to_frame_with_stack_overrides(
-                        ctx,
-                        cf_addr,
-                        resume_py_pc,
-                        &stack_overrides,
-                    ) {
+                    // Flush while the overrides stay rooted in
+                    // FBW_ABORT_OUTER_STACK_OVERRIDES (the flush boxes Int/Float
+                    // locals — an allocation that can move the nursery-resident
+                    // override refs; the area walker forwards them in place),
+                    // then clear the cell.
+                    let committed = crate::jitcode_dispatch::fbw_abort_outer_stack_overrides_with(
+                        |stack_overrides| {
+                            crate::state::flush_walk_end_state_to_frame_with_stack_overrides(
+                                ctx,
+                                cf_addr,
+                                resume_py_pc,
+                                stack_overrides,
+                            )
+                        },
+                    );
+                    crate::jitcode_dispatch::fbw_abort_outer_stack_overrides_clear();
+                    if committed {
                         if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                             eprintln!(
                                 "[fbw-abort-flush] COMMIT abort_jit_pc={abort_jit_pc} \

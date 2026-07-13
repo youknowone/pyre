@@ -6217,14 +6217,12 @@ fn try_execute_residual_call_via_executor(
     // None ref, so it is not a void call yet still mutates) — eager-everything +
     // commit is the single consistent rule, matching `do_residual_call`.
     //
-    // pyjitpl.py:3329-3330 `vinfo.tracing_before_residual_call(virtualizable)`
-    // heap half: every decline gate has passed, so the helper WILL execute —
-    // set TOKEN_TRACING_RESCALL on the active virtualizable so a force
-    // inside the callee is observable afterwards.  Trait mirror:
-    // `MIFrame::vable_and_vrefs_before_residual_call` (trace_opcode.rs:2602).
-    // Skipped for non-forces opcodes and when no live vable exists (the
-    // jitdriver has no standard virtualizable, or unit-test init disabled
-    // the heap pointer) — nothing the callee could force.
+    // The standard virtualizable box pointer for a MayForce residual — a
+    // force inside the callee could escape the frame.  None for non-forces
+    // opcodes and when no live vable exists (the jitdriver has no standard
+    // virtualizable, or unit-test init disabled the heap pointer) — nothing
+    // the callee could force.  The token is armed further below, past every
+    // decline gate.
     let vable_obj_ptr = if is_may_force {
         ctx.trace_ctx
             .standard_virtualizable_box()
@@ -6234,10 +6232,6 @@ fn try_execute_residual_call_via_executor(
     } else {
         None
     };
-    if let Some(obj_ptr) = vable_obj_ptr {
-        let info = crate::frame_layout::build_pyframe_virtualizable_info();
-        unsafe { info.tracing_before_residual_call(obj_ptr) };
-    }
     // A Python-level callee (e.g. a recursive `fib`) re-enters the
     // interpreter (`eval_loop_jit` → `jit_merge_point`) while this walk still
     // holds the driver in the tracing state.  Suspend re-entrant trace
@@ -6326,6 +6320,20 @@ fn try_execute_residual_call_via_executor(
     // on an empty session framestack, so top-level depth-1 behavior is unchanged.
     if !provably_side_effect_free {
         fbw_abort_nested_unjournaled_residual(ctx, op_pc)?;
+    }
+    // pyjitpl.py:3329-3330 `vinfo.tracing_before_residual_call(virtualizable)`
+    // heap half: every decline gate has now passed, so the helper WILL
+    // execute — set TOKEN_TRACING_RESCALL on the active virtualizable so a
+    // force inside the callee is observable afterwards.  Armed AFTER the
+    // inline-subwalk decline so a declined residual never strands the token:
+    // tracing_before pairs with the tracing_after clear below only for
+    // residuals that proceed, mirroring `do_residual_call` where
+    // `vable_and_vrefs_before_residual_call` (pyjitpl.py:2017) runs only past
+    // the OS_NOT_IN_TRACE / force-virtual short-circuits.  Trait mirror:
+    // `MIFrame::vable_and_vrefs_before_residual_call` (trace_opcode.rs:2602).
+    if let Some(obj_ptr) = vable_obj_ptr {
+        let info = crate::frame_layout::build_pyframe_virtualizable_info();
+        unsafe { info.tracing_before_residual_call(obj_ptr) };
     }
     let body_effect_candidate =
         !provably_side_effect_free && writes_live_heap && fbw_foriter_inflight_active();
@@ -8937,16 +8945,28 @@ fn fbw_abort_nested_unjournaled_residual(
     Ok(())
 }
 
-/// Take the top-level caller CALL pc and stack slots stashed by
-/// [`fbw_abort_nested_unjournaled_residual`].
-pub(crate) fn fbw_abort_outer_resume_take()
--> Option<(usize, Vec<(usize, pyre_object::PyObjectRef)>)> {
-    let pc = FBW_ABORT_OUTER_RESUME_PY_PC.with(|c| c.replace(None))?;
-    let stack_overrides = FBW_ABORT_OUTER_STACK_OVERRIDES.with(|c| {
-        let mut slots = c.borrow_mut();
-        std::mem::take(&mut *slots)
-    });
-    Some((pc, stack_overrides))
+/// Take the outer-caller resume pc stashed by
+/// [`fbw_abort_nested_unjournaled_residual`].  The stack overrides stay in
+/// `FBW_ABORT_OUTER_STACK_OVERRIDES` (rooted by the #447 area walker,
+/// `abort_overrides`) until [`fbw_abort_outer_stack_overrides_clear`]; the
+/// flush reads them in place from the rooted cell so a minor collection while
+/// boxing Int/Float locals forwards the very refs it writes.
+pub(crate) fn fbw_abort_outer_resume_take() -> Option<usize> {
+    FBW_ABORT_OUTER_RESUME_PY_PC.with(|c| c.replace(None))
+}
+
+/// Run `f` with the rooted outer-frame stack overrides borrowed in place.
+/// A GC during `f` forwards the cell's ref slots via the area walker's
+/// `as_ptr` access, so the borrowed slice observes the forwarded values.
+pub(crate) fn fbw_abort_outer_stack_overrides_with<R>(
+    f: impl FnOnce(&[(usize, pyre_object::PyObjectRef)]) -> R,
+) -> R {
+    FBW_ABORT_OUTER_STACK_OVERRIDES.with(|c| f(&c.borrow()))
+}
+
+/// Clear the outer-frame stack overrides after the flush consumed them.
+pub(crate) fn fbw_abort_outer_stack_overrides_clear() {
+    FBW_ABORT_OUTER_STACK_OVERRIDES.with(|c| c.borrow_mut().clear());
 }
 
 /// Clear the nested inline abort resume latch at a walk boundary.
