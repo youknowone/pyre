@@ -1475,31 +1475,14 @@ impl MIFrame {
                 // for the `resume_jitcode_pc_for` translation under
                 // `PYRE_M73_LCLIVE_CARRY`.  Outside the window (twin `None`)
                 // and for marker-routed frames the resolution is unchanged.
-                if crate::jitcode_dispatch::m73_marker_audit_enabled() {
-                    if let (Some(twin), None) = (self.loop_close_marker_jit_pc, marker_call_pc) {
-                        match jc.payload.resume_jitcode_pc_for(live_pc) {
-                            Some(legacy) if legacy == twin => {
-                                eprintln!("M73_LCLIVE eq=1 live_pc={live_pc} m={legacy}")
-                            }
-                            Some(legacy) => eprintln!(
-                                "M73_LCLIVE eq=0 live_pc={live_pc} m={legacy} twin={twin}"
-                            ),
-                            None => eprintln!("M73_LCLIVE eq=nomarker live_pc={live_pc}"),
-                        }
-                    }
-                }
                 match marker_call_pc
                     .and_then(|call_pc| jc.payload.after_residual_call_resume_pc_for(call_pc))
                     .or_else(|| {
                         self.loop_close_marker_jit_pc
                             .filter(|_| crate::jitcode_dispatch::m73_lclive_carry_enabled())
                     })
-                    .or_else(|| {
-                        if crate::jitcode_dispatch::m73_translate_census_enabled() {
-                            eprintln!("M73_TRANSLATE site=lclive-legacy py_pc={live_pc}");
-                        }
-                        jc.payload.resume_jitcode_pc_for(live_pc)
-                    }) {
+                    .or_else(|| jc.payload.resume_jitcode_pc_for(live_pc))
+                {
                     Some(jit_pc) => Some(jit_pc),
                     None => {
                         // This (parent) frame reports a `live_pc` the jitcode
@@ -3907,16 +3890,6 @@ impl MIFrame {
             if call_pc >= flag {
                 return crate::state::abort_unencodable_resume_pc(call_pc);
             }
-            if majit_metainterp::m369_resume_pc_audit_enabled() {
-                let jitcode_index = unsafe { (*self.sym().jitcode).index } as i32;
-                let twin = crate::state::pyjitcode_for_jitcode_index(jitcode_index)
-                    .and_then(|pj| pj.after_residual_call_resume_pc_for(call_pc));
-                eprintln!(
-                    "[m369-arflag] site=top jitcode_index={jitcode_index} py_pc={call_pc} \
-                     twin_some={}",
-                    twin.is_some()
-                );
-            }
             majit_ir::resumedata::encode_after_residual_call_pc(call_pc as i32) as usize
         } else {
             let raw = if after_residual_call {
@@ -3957,12 +3930,6 @@ impl MIFrame {
         if let Some(cp) = marked_call_pc {
             if cp >= flag {
                 return crate::state::abort_unencodable_resume_pc(cp);
-            }
-            if majit_metainterp::m369_resume_pc_audit_enabled() {
-                eprintln!(
-                    "[m369-arflag] site=parent parent_jitcode_index={parent_jitcode_index} \
-                     py_pc={cp}"
-                );
             }
             majit_ir::resumedata::encode_after_residual_call_pc(cp as i32) as usize
         } else {
@@ -4101,12 +4068,6 @@ impl MIFrame {
             } else {
                 majit_ir::resumedata::NO_JITCODE_PC
             };
-            crate::jitcode_dispatch::m73_sentinel_word_census(
-                "tframe-parent",
-                parent_jitcode_index,
-                parent.resume_pc as u32,
-                parent_word,
-            );
             let parent_pc_word =
                 crate::state::pyjitcode_for_jitcode_index(parent_jitcode_index as i32)
                     .and_then(|payload| {
@@ -4157,31 +4118,6 @@ impl MIFrame {
         let n = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
         let top_snapshot_types = &top_snapshot_types_full[n..];
         let top_jitcode_index = unsafe { (*self.sym().jitcode).index } as u32;
-        if crate::jitcode_dispatch::m73_marker_audit_enabled() {
-            if let Some(twin) = self.loop_close_marker_jit_pc {
-                let py_pc = majit_ir::resumedata::decode_resume_pc(top_pc as i32).0 as usize;
-                match crate::state::pyjitcode_for_jitcode_index(top_jitcode_index as i32) {
-                    Some(pjc) if pjc.is_populated() => match pjc.resume_jitcode_pc_for(py_pc) {
-                        Some(legacy) if legacy == twin => eprintln!(
-                            "M73_LOOPCLOSE eq=1 idx={} py_pc={} m={}",
-                            top_jitcode_index, py_pc, legacy
-                        ),
-                        Some(legacy) => eprintln!(
-                            "M73_LOOPCLOSE eq=0 idx={} py_pc={} m={} twin={}",
-                            top_jitcode_index, py_pc, legacy, twin
-                        ),
-                        None => eprintln!(
-                            "M73_LOOPCLOSE eq=nomarker idx={} py_pc={}",
-                            top_jitcode_index, py_pc
-                        ),
-                    },
-                    _ => eprintln!(
-                        "M73_LOOPCLOSE eq=nopjc idx={} py_pc={}",
-                        top_jitcode_index, py_pc
-                    ),
-                }
-            }
-        }
         let top_word = if crate::jitcode_dispatch::m73_loopclose_carry_enabled() {
             self.loop_close_marker_jit_pc
                 .map(|m| m as i32)

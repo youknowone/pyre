@@ -155,15 +155,6 @@ pub fn majit_log_enabled() -> bool {
     *ENABLED
 }
 
-/// gh#73 S3.3: whether `PYRE_M73_FLAVOR_AUDIT` is set, cached at first access.
-/// Gates the read-only decode-side branch-guard flavor integrity audit at the
-/// native guard-fail seam. Off by default: byte-identical when unset.
-pub fn m73_flavor_audit_enabled() -> bool {
-    static ENABLED: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("PYRE_M73_FLAVOR_AUDIT").is_some());
-    *ENABLED
-}
-
 /// Strict JIT mode: a non-`InvalidLoop` panic during compilation is a bug and
 /// must fail loudly rather than silently degrade to the interpreter and mask
 /// the bug behind correct output. Enabled in debug builds (`cargo test`) and
@@ -245,19 +236,6 @@ pub fn bridge_debug_enabled() -> bool {
 pub fn no_unroll_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::env::var_os("PYRE_NO_UNROLL").is_some())
-}
-
-/// `PYRE_M369_RESUME_PC_AUDIT`: instrument the resume-data encoder to report
-/// every per-frame `jitcode_pc` word that carries a non-sentinel value. Those
-/// are the kept-stack branch-guard frames where the Python `pc` word alone
-/// cannot describe the resume coordinate, so the extra `jitcode_pc` word is
-/// still load-bearing. Default off (a pure `eprintln!` behind the flag; the
-/// emitted `rd_numb` bytes are unchanged). When a corpus run reports zero
-/// residuals, the word is redundant and the frame chain can collapse to the
-/// 2-word `(jitcode_index, pc)` shape (resume.py:249-253).
-pub fn m369_resume_pc_audit_enabled() -> bool {
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("PYRE_M369_RESUME_PC_AUDIT").is_some())
 }
 
 /// `PYRE_ORIGINAL_BOXES`: default true, only disabled by `0` or `false`.

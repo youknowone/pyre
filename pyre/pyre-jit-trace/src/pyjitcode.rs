@@ -531,9 +531,6 @@ impl PyJitCode {
     /// offset now derives from the two surviving exact tables plus the
     /// sparse `carryfwd_resume_pc` sidecar.
     pub fn resume_jitcode_pc_for(&self, py_pc: usize) -> Option<usize> {
-        if crate::jitcode_dispatch::m73_translate_census_enabled() {
-            eprintln!("M73_TRANSLATE site=fn py_pc={py_pc}");
-        }
         // The sparse sidecar takes precedence: it captures exactly the PCs
         // whose dense marker the on-demand derivation cannot reproduce
         // (uncond-jump forward-carry to a jump target, can-raise / branch
@@ -729,9 +726,6 @@ impl PyJitCode {
         if after_residual_call {
             self.after_residual_call_resume_pc_for(py_pc as usize)
         } else {
-            if crate::jitcode_dispatch::m73_translate_census_enabled() {
-                eprintln!("M73_TRANSLATE site=decode py_pc={py_pc}");
-            }
             self.resume_jitcode_pc_for(py_pc as usize)
         }
     }
@@ -775,71 +769,10 @@ impl PyJitCode {
         let used_carried = carried != majit_ir::resumedata::NO_JITCODE_PC
             && carried >= 0
             && self.jitcode.can_decode_live_vars(carried as usize, op_live);
-        let resolved = if used_carried {
+        if used_carried {
             Some(carried as usize)
         } else {
             self.resolve_resume_pc(raw_pc)
-        };
-        if crate::jitcode_dispatch::m369_recover_audit_enabled() {
-            self.m369_recover_audit(raw_pc, carried, used_carried, resolved);
-        }
-        resolved
-    }
-
-    /// `PYRE_M369_RECOVER_AUDIT` probe: for the JitCode offset the #369 flip would
-    /// store in the `pc` word (`resolved`), report whether the original Python pc
-    /// (`decode_resume_pc(raw_pc).0`) is recovered by
-    /// `python_pc_for_jitcode_pc(resolved)`, bucketed by frame class. Off in
-    /// production; pure `eprintln!`, no behavioral effect.
-    fn m369_recover_audit(
-        &self,
-        raw_pc: i32,
-        carried: i32,
-        used_carried: bool,
-        resolved: Option<usize>,
-    ) {
-        let (py_pc, after_residual_call) = majit_ir::resumedata::decode_resume_pc(raw_pc);
-        if py_pc < 0 {
-            return;
-        }
-        let bucket = if used_carried {
-            "branch_guard"
-        } else if self.metadata.block_head_py_by_jit_pc.is_empty() {
-            "unmapped"
-        } else if after_residual_call {
-            "after_residual_call"
-        } else {
-            "sentinel_plain"
-        };
-        // Why the carried word was not used (attribution for the fallback
-        // translation buckets): the word is the sentinel, negative, or a
-        // startpoint `can_decode_live_vars` rejects.
-        let reject = if used_carried {
-            "used"
-        } else if carried == majit_ir::resumedata::NO_JITCODE_PC {
-            "sentinel"
-        } else if carried < 0 {
-            "negative"
-        } else {
-            "undecodable"
-        };
-        match resolved {
-            None => {
-                eprintln!(
-                    "[m369-recover] bucket={bucket} match=unresolved raw_pc={raw_pc} \
-                     py_pc={py_pc} carried={carried} reject={reject}"
-                );
-            }
-            Some(flip_offset) => {
-                let recovered =
-                    crate::jitcode_dispatch::python_pc_for_jitcode_pc(&self.metadata, flip_offset);
-                let matched = recovered as i64 == py_pc as i64;
-                eprintln!(
-                    "[m369-recover] bucket={bucket} match={matched} raw_pc={raw_pc} \
-                     py_pc={py_pc} flip_offset={flip_offset} recovered={recovered} \
-                     carried={carried} reject={reject}"
-                );
-            }
         }
     }
 

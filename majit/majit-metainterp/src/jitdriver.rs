@@ -3800,31 +3800,6 @@ impl<S: JitState> JitDriver<S> {
         let should_bridge =
             must_compile && !majit_metainterp::MetaInterp::<S::Meta>::stack_almost_full();
 
-        // gh#73 S3.3: read-only decode-side branch-guard flavor integrity
-        // audit. The GuardTrue/GuardFalse flavor is NOT threaded on the exit
-        // layout; it is recovered from `source_op_index` → the compiled
-        // trace's guard op. Gated OFF by default (byte-identical when unset).
-        if majit_metainterp::m73_flavor_audit_enabled() {
-            let src = exit_layout.source_op_index;
-            let (result, flavor) = match src {
-                None => ("nosrc", "-"),
-                Some(idx) => {
-                    match self
-                        .meta
-                        .exit_guard_opcode(exit_layout.rd_loop_token, trace_id, idx)
-                    {
-                        Some(majit_ir::OpCode::GuardTrue) => ("branch", "T"),
-                        Some(majit_ir::OpCode::GuardFalse) => ("branch", "F"),
-                        Some(_other) => ("nonbranch", "-"),
-                        None => ("nosrc", "-"),
-                    }
-                }
-            };
-            eprintln!(
-                "M73_FLAVOR result={result} flavor={flavor} src={src:?} trace_id={trace_id} fail_index={fail_index}"
-            );
-        }
-
         // Return raw guard failure data. State restoration and bridge/
         // blackhole decision happen in the caller's handle_fail().
         DetailedDriverRunOutcome::GuardFailure {

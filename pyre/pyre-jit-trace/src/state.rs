@@ -770,13 +770,6 @@ pub fn python_pc_for_jitcode_pc_public(jitcode_index: i32, offset: i32) -> Optio
     )
 }
 
-/// Resolve a resume-data word through the runtime resume-coordinate path.
-pub fn resolve_resume_offset_public(jitcode_index: i32, pc: i32, carried: i32) -> Option<usize> {
-    let payload = pyjitcode_for_jitcode_index(jitcode_index)?;
-    let op_live = blackhole_control_opcodes().0 as u8;
-    payload.resolve_resume_pc_with_jitcode_pc(pc, carried, op_live)
-}
-
 /// Advance a Python instruction coordinate past resume trivia when code is available.
 pub fn skip_python_trivia_forward_public(
     jitcode_index: i32,
@@ -800,41 +793,6 @@ pub fn backxlat_py_pc(jitcode_index: i32, pc_word: i32) -> i32 {
         .and_then(|raw_py_pc| skip_python_trivia_forward_public(jitcode_index, raw_py_pc))
         .map(|(py_pc, _)| py_pc)
         .unwrap_or(fallback)
-}
-
-/// Enable the resume-path routing and back-translation census.
-pub fn m369_route_audit_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("PYRE_M369_ROUTE_AUDIT").is_some())
-}
-
-thread_local! {
-    static M369_BACKXLAT_DIVERGENCES: std::cell::RefCell<Vec<(i32, i32, i32, bool)>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
-
-pub fn m369_set_backxlat_divergences(divergences: &[(i32, i32, i32, bool)]) {
-    if m369_route_audit_enabled() {
-        M369_BACKXLAT_DIVERGENCES.with(|c| {
-            let mut stored = c.borrow_mut();
-            stored.clear();
-            stored.extend_from_slice(divergences);
-        });
-    }
-}
-
-fn m369_backxlat_divergent(frame: &majit_ir::resumedata::RebuiltFrame) -> bool {
-    M369_BACKXLAT_DIVERGENCES.with(|c| {
-        c.borrow()
-            .iter()
-            .find(|&&(jitcode_index, pc, jitcode_pc, _)| {
-                jitcode_index == frame.jitcode_index
-                    && pc == frame.pc
-                    && jitcode_pc == frame.jitcode_pc
-            })
-            .map(|&(_, _, _, divergent)| divergent)
-            .unwrap_or(false)
-    })
 }
 
 /// `framework.py` `root_walker.walk_roots` hook for the boxed `Ref`
@@ -1588,12 +1546,6 @@ pub(crate) fn bridge_semantic_maps_at_with_jitcode_pc(
                 match via_twin {
                     Some(pair) => pair,
                     None => {
-                        // Slice A census: soft, non-aborting count of the
-                        // py_pc re-inversion fallback. Emits ONLY when this arm
-                        // runs, so zero output == dead.
-                        if crate::jitcode_dispatch::bridge_audit_enabled() {
-                            eprintln!("M73_FALLBACK site=bridge jp={jp}");
-                        }
                         let rp =
                             crate::jitcode_dispatch::python_pc_for_jitcode_pc(&payload.metadata, jp)
                                 as usize;
@@ -1689,12 +1641,6 @@ pub(crate) fn const_ref_slots_at_pc_at(
                 // check.py certifies on the hot bridge path).
                 if let Some(slots) = jc.payload.const_ref_slots_for_jitcode_pc(jp) {
                     return slots;
-                }
-                // Slice A census: soft, non-aborting count of the py_pc
-                // re-inversion fallback (empty const-slot twin). Known COLD.
-                // Zero output == dead.
-                if crate::jitcode_dispatch::bridge_audit_enabled() {
-                    eprintln!("M73_FALLBACK site=const jp={jp}");
                 }
                 crate::jitcode_dispatch::python_pc_for_jitcode_pc(&jc.payload.metadata, jp) as usize
             } else {
@@ -5965,7 +5911,6 @@ fn reconstruct_inline_recipe(
                 return None;
             }
         }
-        m369_backxlat_recipe_audit(frame);
         return Some(ReconstructRecipe {
             code_ptr: raw_code as *const (),
             jitcode_index: frame.jitcode_index,
@@ -6148,7 +6093,6 @@ fn reconstruct_inline_recipe(
         }
     }
 
-    m369_backxlat_recipe_audit(frame);
     Some(ReconstructRecipe {
         code_ptr: raw_code as *const (),
         jitcode_index: frame.jitcode_index,
@@ -6162,54 +6106,6 @@ fn reconstruct_inline_recipe(
         concrete_r,
         nargs: nlocals,
     })
-}
-
-fn m369_backxlat_recipe_audit(frame: &majit_ir::resumedata::RebuiltFrame) {
-    if !m369_route_audit_enabled() {
-        return;
-    }
-    let divergent_vs_ni = m369_backxlat_divergent(frame);
-    if frame.jitcode_pc == majit_ir::resumedata::NO_JITCODE_PC {
-        eprintln!(
-            "[m369-backxlat] site=recipe jitcode_index={} stored_py_pc={} \
-             carried=sentinel word_class=sentinel divergent_vs_ni={divergent_vs_ni}",
-            frame.jitcode_index, frame.pc,
-        );
-        return;
-    }
-    let word_class = if frame.jitcode_pc >= 0 {
-        "offset"
-    } else {
-        "branch"
-    };
-    let resolved_offset =
-        resolve_resume_offset_public(frame.jitcode_index, frame.pc, frame.jitcode_pc);
-    let raw_recovered = resolved_offset
-        .and_then(|offset| python_pc_for_jitcode_pc_public(frame.jitcode_index, offset as i32));
-    let (recovered, code_ptr_null) = match raw_recovered
-        .and_then(|raw| skip_python_trivia_forward_public(frame.jitcode_index, raw))
-    {
-        Some((py_pc, trivia_applied)) => (Some(py_pc), !trivia_applied),
-        None => (None, false),
-    };
-    let stored_py_pc = backxlat_py_pc(frame.jitcode_index, frame.pc);
-    eprintln!(
-        "[m369-backxlat] site=recipe jitcode_index={} stored_py_pc={} carried={} \
-         word_class={word_class} resolved_offset={resolved_offset:?} \
-         recovered={recovered:?} code_ptr_null={code_ptr_null} eq={} \
-         divergent_vs_ni={divergent_vs_ni}",
-        frame.jitcode_index,
-        frame.pc,
-        frame.jitcode_pc,
-        recovered == Some(stored_py_pc),
-    );
-    if recovered != Some(stored_py_pc) && divergent_vs_ni {
-        eprintln!(
-            "[m369-INVARIANT-VIOLATION] eq=false AND divergent_vs_ni=true \
-             jitcode_index={} stored_py_pc={} carried={} recovered={recovered:?}",
-            frame.jitcode_index, frame.pc, frame.jitcode_pc,
-        );
-    }
 }
 
 fn bridge_decode_box(

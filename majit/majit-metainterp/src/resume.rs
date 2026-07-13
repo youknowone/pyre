@@ -3971,51 +3971,6 @@ impl ResumeDataLoopMemo {
             // Per-frame `jitcode_pc` word (after `pc`); see
             // `majit_ir::resumedata::NO_JITCODE_PC`.
             numb_state.append_int(frame.jitcode_pc as i64);
-            // `PYRE_M369_RESUME_PC_AUDIT`: report frames whose `jitcode_pc` is
-            // non-sentinel — the residual kept-stack cases that still block
-            // collapsing this frame chain to the 2-word `(jitcode_index, pc)`
-            // shape (resume.py:249-253).  `pc_substitutes` reports whether the
-            // (flag-stripped) `pc` word already equals `jitcode_pc`, i.e.
-            // whether `pc` alone would suffice at this frame.
-            if crate::m369_resume_pc_audit_enabled()
-                && frame.jitcode_pc != majit_ir::resumedata::NO_JITCODE_PC
-            {
-                let (py_pc, after_residual_call) = majit_ir::resumedata::decode_resume_pc(frame.pc);
-                eprintln!(
-                    "[m369-audit] residual jitcode_pc frame: jitcode_index={} \
-                     pc_raw={} pc={} after_residual_call={} jitcode_pc={} \
-                     pc_substitutes={}",
-                    frame.jitcode_index,
-                    frame.pc,
-                    py_pc,
-                    after_residual_call,
-                    frame.jitcode_pc,
-                    py_pc == frame.jitcode_pc,
-                );
-            }
-            // Inverse probe under the same audit: frames still encoded with
-            // the sentinel word — the writers the #73 S5 twin carry has not
-            // reached yet (attribution for the decode-side translation
-            // fallback).
-            if crate::m369_resume_pc_audit_enabled()
-                && frame.jitcode_pc == majit_ir::resumedata::NO_JITCODE_PC
-            {
-                let (py_pc, after_residual_call) = majit_ir::resumedata::decode_resume_pc(frame.pc);
-                eprintln!(
-                    "[m369-audit] sentinel jitcode_pc frame: jitcode_index={} \
-                     pc_raw={} pc={} after_residual_call={} nframes={} frame_pos={}",
-                    frame.jitcode_index,
-                    frame.pc,
-                    py_pc,
-                    after_residual_call,
-                    snapshot.framestack.len(),
-                    snapshot
-                        .framestack
-                        .iter()
-                        .position(|f| std::ptr::eq(f, frame))
-                        .unwrap_or(usize::MAX),
-                );
-            }
             self._number_boxes(&frame.boxes, &mut numb_state, env)?;
         }
 

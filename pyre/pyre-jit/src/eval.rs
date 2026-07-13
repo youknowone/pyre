@@ -5214,168 +5214,6 @@ fn blackhole_result_tag(r: &crate::call_jit::BlackholeResult) -> &'static str {
     }
 }
 
-/// `PYRE_M369_ROUTE_AUDIT` (default OFF): resume-path routing census for the
-/// #369 record-side flip.  Emits one `[m369-route]` line per guard-failure
-/// resume so the benign path-A population (blackhole re-execution, which
-/// re-derives `last_instr` from the JitCode offset and never reads the stored
-/// py_pc word) can be split from the load-bearing path-B population
-/// (bridge-trace forward re-entry, which installs the stored py_pc as the live
-/// frame `last_instr` at the `set_last_instr_from_next_instr(resume_pc)` site).
-/// Pure `eprintln!`, no behavioral effect.  Complements the decode-side
-/// `PYRE_M369_RECOVER_AUDIT` (which measures the offset-derivation funnel).
-pub(crate) fn m369_route_audit_enabled() -> bool {
-    pyre_jit_trace::state::m369_route_audit_enabled()
-}
-
-thread_local! {
-    /// `PYRE_M369_ROUTE_AUDIT` scratch: the innermost resume frame's
-    /// recoverability, captured while `build_resumed_frames` still has the raw
-    /// rd_numb header (`jitcode_index`, carried `jitcode_pc`) in scope, read by
-    /// the `bridge_decode` census line in `decode_and_restore_guard_failure`.
-    /// `(carried, portal)`: `carried` = a JitCode offset is stored (`jitcode_pc`
-    /// != NO_JITCODE_PC) so the #369 flip could re-derive py_pc by re-execution
-    /// (Option-B feasible); `portal` = a portal-bridge frame (empty block_head
-    /// map) whose py_pc is not offset-resolvable — a HARD blocker if !carried.
-    static M369_INNERMOST_RECOVERY: std::cell::Cell<Option<(bool, bool)>> =
-        const { std::cell::Cell::new(None) };
-    static M369_BACKXLAT_FRAMES: std::cell::RefCell<Vec<M369BackxlatFrame>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
-
-#[derive(Clone, Copy)]
-struct M369BackxlatFrame {
-    jitcode_index: i32,
-    pc: i32,
-    jitcode_pc: i32,
-}
-
-fn m369_backxlat_result(frame: M369BackxlatFrame) -> (Option<usize>, Option<i32>, bool, bool) {
-    let resolved_offset = pyre_jit_trace::state::resolve_resume_offset_public(
-        frame.jitcode_index,
-        frame.pc,
-        frame.jitcode_pc,
-    );
-    let raw_recovered = resolved_offset.and_then(|offset| {
-        pyre_jit_trace::state::python_pc_for_jitcode_pc_public(frame.jitcode_index, offset as i32)
-    });
-    let (recovered, code_ptr_null) = match raw_recovered.and_then(|raw| {
-        pyre_jit_trace::state::skip_python_trivia_forward_public(frame.jitcode_index, raw)
-    }) {
-        Some((py_pc, trivia_applied)) => (Some(py_pc), !trivia_applied),
-        None => (None, false),
-    };
-    let stored_py_pc = pyre_jit_trace::state::backxlat_py_pc(frame.jitcode_index, frame.pc);
-    (
-        resolved_offset,
-        recovered,
-        code_ptr_null,
-        recovered == Some(stored_py_pc),
-    )
-}
-
-fn m369_invariant_check(
-    frame: M369BackxlatFrame,
-    recovered: Option<i32>,
-    eq: bool,
-    divergent_vs_ni: bool,
-) {
-    if !eq && divergent_vs_ni {
-        eprintln!(
-            "[m369-INVARIANT-VIOLATION] eq=false AND divergent_vs_ni=true \
-             jitcode_index={} stored_py_pc={} carried={} recovered={recovered:?}",
-            frame.jitcode_index, frame.pc, frame.jitcode_pc,
-        );
-    }
-}
-
-fn m369_backxlat_audit(ni: usize) {
-    if !m369_route_audit_enabled() {
-        return;
-    }
-    let frames = M369_BACKXLAT_FRAMES.with(|c| c.borrow().clone());
-    let divergences: Vec<(i32, i32, i32, bool)> = frames
-        .iter()
-        .map(|frame| {
-            (
-                frame.jitcode_index,
-                frame.pc,
-                frame.jitcode_pc,
-                frame.pc >= 0
-                    && pyre_jit_trace::state::backxlat_py_pc(frame.jitcode_index, frame.pc)
-                        as usize
-                        != ni,
-            )
-        })
-        .collect();
-    pyre_jit_trace::state::m369_set_backxlat_divergences(&divergences);
-
-    if let Some(frame) = frames.first().copied() {
-        let divergent_vs_ni = frame.pc >= 0
-            && pyre_jit_trace::state::backxlat_py_pc(frame.jitcode_index, frame.pc) as usize != ni;
-        if frame.jitcode_pc == majit_ir::resumedata::NO_JITCODE_PC {
-            eprintln!(
-                "[m369-backxlat] site=rd_numb_pc frame_idx=0 nframes={} \
-                 jitcode_index={} stored_py_pc={} carried=sentinel word_class=sentinel \
-                 divergent_vs_ni={divergent_vs_ni}",
-                frames.len(),
-                frame.jitcode_index,
-                frame.pc,
-            );
-        } else {
-            let word_class = if frame.jitcode_pc >= 0 {
-                "offset"
-            } else {
-                "branch"
-            };
-            let (resolved_offset, recovered, code_ptr_null, eq) = m369_backxlat_result(frame);
-            eprintln!(
-                "[m369-backxlat] site=rd_numb_pc frame_idx=0 nframes={} \
-                 jitcode_index={} stored_py_pc={} carried={} word_class={word_class} \
-                 resolved_offset={resolved_offset:?} recovered={recovered:?} \
-                 code_ptr_null={code_ptr_null} eq={eq} divergent_vs_ni={divergent_vs_ni}",
-                frames.len(),
-                frame.jitcode_index,
-                frame.pc,
-                frame.jitcode_pc,
-            );
-            m369_invariant_check(frame, recovered, eq, divergent_vs_ni);
-        }
-    }
-
-    for (idx, frame) in frames.iter().copied().enumerate() {
-        let divergent_vs_ni = frame.pc >= 0
-            && pyre_jit_trace::state::backxlat_py_pc(frame.jitcode_index, frame.pc) as usize != ni;
-        if frame.jitcode_pc == majit_ir::resumedata::NO_JITCODE_PC {
-            eprintln!(
-                "[m369-backxlat] frame_idx={idx} nframes={} jitcode_index={} \
-                 stored_py_pc={} carried=sentinel word_class=sentinel \
-                 divergent_vs_ni={divergent_vs_ni}",
-                frames.len(),
-                frame.jitcode_index,
-                frame.pc,
-            );
-        } else {
-            let word_class = if frame.jitcode_pc >= 0 {
-                "offset"
-            } else {
-                "branch"
-            };
-            let (resolved_offset, recovered, code_ptr_null, eq) = m369_backxlat_result(frame);
-            eprintln!(
-                "[m369-backxlat] frame_idx={idx} nframes={} jitcode_index={} \
-                 stored_py_pc={} carried={} word_class={word_class} \
-                 resolved_offset={resolved_offset:?} recovered={recovered:?} \
-                 code_ptr_null={code_ptr_null} eq={eq} divergent_vs_ni={divergent_vs_ni}",
-                frames.len(),
-                frame.jitcode_index,
-                frame.pc,
-                frame.jitcode_pc,
-            );
-            m369_invariant_check(frame, recovered, eq, divergent_vs_ni);
-        }
-    }
-}
-
 /// compile.py:710-716 resume_in_blackhole parity.
 ///
 /// RPython: resume_in_blackhole → blackhole_from_resumedata →
@@ -5388,16 +5226,6 @@ pub(crate) fn resume_in_blackhole_from_exit_layout(
     exit_layout: &CompiledExitLayout,
     guard_exc: i64,
 ) -> crate::call_jit::BlackholeResult {
-    if m369_route_audit_enabled() {
-        // Every entry here is a blackhole resume (path-A): a cold/declined
-        // guard, or a multi-frame bridge falling back via `resume_via_blackhole`.
-        // The JitCode is re-executed forward; the stored py_pc is not read as
-        // `last_instr`, so any stored-py_pc divergence is benign here.
-        eprintln!(
-            "[m369-route] source=blackhole_entry trace={} fail={}",
-            exit_layout.trace_id, exit_layout.fail_index
-        );
-    }
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
             "[dynasm-debug] resume_in_blackhole: raw_values.len={} exit_types.len={} rd_numb={:?}",
@@ -7629,33 +7457,6 @@ pub(crate) fn decode_and_restore_guard_failure(
                 }
             }
         }
-        if m369_route_audit_enabled() {
-            m369_backxlat_audit(ni);
-            // The stored innermost py_pc becomes `resume_pc` -> the live frame
-            // `last_instr` at the caller's `set_last_instr_from_next_instr`.
-            // A SINGLE-frame guard traces the bridge forward from it (path-B,
-            // stored py_pc load-bearing); a MULTI-frame guard routes to the
-            // blackhole instead (path-A).  `divergent_vs_ni` is true when the
-            // stored py_pc differs from the vable-restored `next_instr` -> the
-            // py_pc word is the only source, i.e. NOT droppable in favour of ni.
-            // `innermost_carried` (a JitCode offset is stored) => a #369 flip can
-            // re-derive py_pc by re-execution (Option-B feasible); `portal` with
-            // no carried offset is a HARD blocker (py_pc not offset-resolvable).
-            let (innermost_carried, innermost_portal) = M369_INNERMOST_RECOVERY
-                .with(|c| c.get())
-                .unwrap_or((false, false));
-            eprintln!(
-                "[m369-route] source=bridge_decode frames={} single={} divergent_vs_ni={} \
-                 innermost_carried={} innermost_portal={} resume_pc={} ni={}",
-                resumed_frames.len(),
-                resumed_frames.len() == 1,
-                resume_pc != ni,
-                innermost_carried,
-                innermost_portal,
-                resume_pc,
-                ni
-            );
-        }
         Some((typed, resume_pc, resumed_frames.len()))
     } else {
         None
@@ -8182,34 +7983,8 @@ fn build_resumed_frames(
         }
     }
 
-    let nframes = frames.len();
-    if m369_route_audit_enabled() {
-        M369_INNERMOST_RECOVERY.with(|c| c.set(None));
-        M369_BACKXLAT_FRAMES.with(|c| {
-            *c.borrow_mut() = frames
-                .iter()
-                .map(|frame| M369BackxlatFrame {
-                    jitcode_index: frame.jitcode_index,
-                    pc: frame.pc,
-                    jitcode_pc: frame.jitcode_pc,
-                })
-                .collect();
-        });
-    }
     let mut result = Vec::with_capacity(frames.len());
     for (idx, (frame, values)) in frames.iter().zip(all_values.into_iter()).enumerate() {
-        // The innermost frame's stored py_pc is the one that reaches the live
-        // frame `last_instr` on the single-frame bridge-trace path (path-B); its
-        // carried jitcode_pc / portal-bridge status decides whether a #369 flip
-        // could re-derive that py_pc from the offset. Capture it here while the
-        // raw rd_numb header is in scope.
-        if m369_route_audit_enabled() && idx + 1 == nframes {
-            let carried = frame.jitcode_pc != majit_ir::resumedata::NO_JITCODE_PC;
-            let portal = pyre_jit_trace::state::pyjitcode_for_jitcode_index(frame.jitcode_index)
-                .map(|p| p.metadata.block_head_py_by_jit_pc.is_empty())
-                .unwrap_or(false);
-            M369_INNERMOST_RECOVERY.with(|c| c.set(Some((carried, portal))));
-        }
         // pc=0 is valid (function start). pc=-1 = no-snapshot sentinel.
         let decoded_py_pc = (frame.pc >= 0)
             .then(|| pyre_jit_trace::state::backxlat_py_pc(frame.jitcode_index, frame.pc) as usize);
