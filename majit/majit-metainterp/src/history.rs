@@ -2267,12 +2267,15 @@ impl TraceCtx {
         // produces such a pc.  Every other walker guard resumes at a plain
         // outer-Python-opcode coordinate.  Either way the DECODED pc must leave
         // bit 14 free, or `decode_resume_pc` mis-reads it (resumedata.rs:48-62).
-        assert!(
-            majit_ir::resumedata::decode_resume_pc(pc as i32).0
-                < majit_ir::resumedata::AFTER_RESIDUAL_CALL_PC_FLAG,
-            "resume pc {pc} decodes >= AFTER_RESIDUAL_CALL_PC_FLAG; \
-             function too large for bit-14 resume encoding"
-        );
+        // A flipped pc is a raw JitCode offset outside the bit-14 Python-pc range.
+        if !majit_ir::resumedata::m369_pcword_flip_enabled() {
+            assert!(
+                majit_ir::resumedata::decode_resume_pc(pc as i32).0
+                    < majit_ir::resumedata::AFTER_RESIDUAL_CALL_PC_FLAG,
+                "resume pc {pc} decodes >= AFTER_RESIDUAL_CALL_PC_FLAG; \
+                 function too large for bit-14 resume encoding"
+            );
+        }
         let boxes = self.encode_snapshot_boxes(active_boxes);
         let snapshot_id = self.capture_resumedata(crate::recorder::Snapshot {
             frames: vec![crate::recorder::SnapshotFrame {
@@ -2363,11 +2366,14 @@ impl TraceCtx {
                 // marker, so each raw pc must leave bit 14 free or
                 // `decode_resume_pc` mis-reads it as marked
                 // (resumedata.rs:48-62).
-                assert!(
-                    *py_pc < majit_ir::resumedata::AFTER_RESIDUAL_CALL_PC_FLAG as u32,
-                    "resume pc {py_pc} >= AFTER_RESIDUAL_CALL_PC_FLAG; \
-                     function too large for bit-14 resume encoding"
-                );
+                // A flipped pc is a raw JitCode offset outside the bit-14 Python-pc range.
+                if !majit_ir::resumedata::m369_pcword_flip_enabled() {
+                    assert!(
+                        *py_pc < majit_ir::resumedata::AFTER_RESIDUAL_CALL_PC_FLAG as u32,
+                        "resume pc {py_pc} >= AFTER_RESIDUAL_CALL_PC_FLAG; \
+                         function too large for bit-14 resume encoding"
+                    );
+                }
                 let encoded = self.encode_snapshot_boxes(boxes);
                 crate::recorder::SnapshotFrame {
                     jitcode_index: *jitcode_index,

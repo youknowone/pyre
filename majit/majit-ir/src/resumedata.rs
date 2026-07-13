@@ -75,6 +75,19 @@ pub const TAGVIRTUAL: u8 = 3;
 /// decode at resume time.
 pub const AFTER_RESIDUAL_CALL_PC_FLAG: i32 = 1 << 14;
 
+/// `PYRE_M369_PCWORD_FLIP`: store resolved JitCode offsets in resume-frame
+/// `pc` words. Default off; `0` and `false` disable an explicitly set gate.
+pub fn m369_pcword_flip_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M369_PCWORD_FLIP") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => false,
+    })
+}
+
 /// Sentinel for a snapshot frame's `jitcode_pc` word: "no direct JitCode
 /// resume coordinate — translate the Python `pc` through `pc_map` as
 /// before".

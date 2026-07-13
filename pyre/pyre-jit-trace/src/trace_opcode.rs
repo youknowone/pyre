@@ -4107,9 +4107,23 @@ impl MIFrame {
                 parent.resume_pc as u32,
                 parent_word,
             );
+            let parent_pc_word = if majit_ir::resumedata::m369_pcword_flip_enabled() {
+                crate::state::pyjitcode_for_jitcode_index(parent_jitcode_index as i32)
+                    .and_then(|payload| {
+                        payload.resolve_resume_pc_with_jitcode_pc(
+                            parent_pc as i32,
+                            parent_word,
+                            crate::state::op_live(),
+                        )
+                    })
+                    .map(|offset| offset as u32)
+                    .unwrap_or(parent_pc as u32)
+            } else {
+                parent_pc as u32
+            };
             lead.push(majit_metainterp::recorder::SnapshotFrame {
                 jitcode_index: parent_jitcode_index,
-                pc: parent_pc as u32,
+                pc: parent_pc_word,
                 jitcode_pc: parent_word,
                 boxes: Self::fail_args_to_snapshot_boxes_typed(&parent_active, parent_types, ctx),
             });
@@ -4178,9 +4192,18 @@ impl MIFrame {
         } else {
             majit_ir::resumedata::NO_JITCODE_PC
         };
+        let top_pc_word = if majit_ir::resumedata::m369_pcword_flip_enabled() {
+            let payload = unsafe { &(&*self.sym().jitcode).payload };
+            payload
+                .resolve_resume_pc_with_jitcode_pc(top_pc as i32, top_word, crate::state::op_live())
+                .map(|offset| offset as u32)
+                .unwrap_or(top_pc as u32)
+        } else {
+            top_pc as u32
+        };
         let top_frame = majit_metainterp::recorder::SnapshotFrame {
             jitcode_index: top_jitcode_index,
-            pc: top_pc as u32,
+            pc: top_pc_word,
             jitcode_pc: top_word,
             boxes: Self::fail_args_to_snapshot_boxes_typed(
                 top_active_boxes,
