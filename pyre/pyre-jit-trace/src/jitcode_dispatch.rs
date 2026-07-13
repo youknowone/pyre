@@ -20534,14 +20534,19 @@ fn try_walker_load_global_cell_fold(
     Ok(true)
 }
 
-fn mark_trace_reads_module_global(w_globals: pyre_object::PyObjectRef, name: &str) {
+fn mark_trace_reads_module_global(
+    tc: &mut TraceCtx,
+    w_globals: pyre_object::PyObjectRef,
+    name: &str,
+) {
     if !w_globals.is_null() && crate::state::module_dict_cell_slot_direct(w_globals, name).is_some()
     {
-        crate::trace::set_trace_reads_module_global(true);
+        tc.reads_module_global = true;
     }
 }
 
 fn mark_trace_reads_module_global_from_code(
+    tc: &mut TraceCtx,
     w_globals: pyre_object::PyObjectRef,
     w_code_ptr: usize,
     name_idx: usize,
@@ -20563,11 +20568,15 @@ fn mark_trace_reads_module_global_from_code(
     }) else {
         return false;
     };
-    mark_trace_reads_module_global(w_globals, &name);
+    mark_trace_reads_module_global(tc, w_globals, &name);
     true
 }
 
-fn mark_trace_reads_module_global_from_frame_name(frame_ptr: usize, w_name_ptr: usize) -> bool {
+fn mark_trace_reads_module_global_from_frame_name(
+    tc: &mut TraceCtx,
+    frame_ptr: usize,
+    w_name_ptr: usize,
+) -> bool {
     if frame_ptr == 0 || w_name_ptr == 0 {
         return false;
     }
@@ -20579,7 +20588,7 @@ fn mark_trace_reads_module_global_from_frame_name(frame_ptr: usize, w_name_ptr: 
     let name = unsafe {
         pyre_object::unicodeobject::w_str_get_value(w_name_ptr as pyre_object::PyObjectRef)
     };
-    mark_trace_reads_module_global(w_globals, name);
+    mark_trace_reads_module_global(tc, w_globals, name);
     true
 }
 
@@ -21059,17 +21068,18 @@ fn dispatch_residual_call_iIRd_kind(
             ) {
                 let name_idx = (namei as usize) >> 1;
                 if !mark_trace_reads_module_global_from_code(
+                    ctx.trace_ctx,
                     ns_ptr as pyre_object::PyObjectRef,
                     w_code_ptr,
                     name_idx,
                 ) {
-                    crate::trace::set_trace_reads_module_global(true);
+                    ctx.trace_ctx.reads_module_global = true;
                 }
             } else {
-                crate::trace::set_trace_reads_module_global(true);
+                ctx.trace_ctx.reads_module_global = true;
             }
         } else {
-            crate::trace::set_trace_reads_module_global(true);
+            ctx.trace_ctx.reads_module_global = true;
         }
     }
     if ctx.is_authoritative_executor
@@ -21129,14 +21139,18 @@ fn dispatch_residual_call_iIRd_kind(
                 ctx.trace_ctx.box_value(frame_opref),
                 ctx.trace_ctx.box_value(name_opref),
             ) {
-                if !mark_trace_reads_module_global_from_frame_name(frame_ptr, w_name_ptr) {
-                    crate::trace::set_trace_reads_module_global(true);
+                if !mark_trace_reads_module_global_from_frame_name(
+                    ctx.trace_ctx,
+                    frame_ptr,
+                    w_name_ptr,
+                ) {
+                    ctx.trace_ctx.reads_module_global = true;
                 }
             } else {
-                crate::trace::set_trace_reads_module_global(true);
+                ctx.trace_ctx.reads_module_global = true;
             }
         } else {
-            crate::trace::set_trace_reads_module_global(true);
+            ctx.trace_ctx.reads_module_global = true;
         }
     }
     if ctx.is_authoritative_executor
@@ -24193,8 +24207,7 @@ fn handle(
                                 // re-entered after later namespace growth. Fold in
                                 // the live per-trace flag so the bridge keeps the
                                 // conservative namespace gate.
-                                entry_meta.namespace_dependent |=
-                                    crate::trace::trace_reads_module_global();
+                                entry_meta.namespace_dependent |= ctx.trace_ctx.reads_module_global;
                                 driver.meta_interp_mut().compile_trace_from_interp(
                                     key,
                                     &live_args,

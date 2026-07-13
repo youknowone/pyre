@@ -310,6 +310,13 @@ pub struct TraceCtx {
     /// skip when no compiled targets exist for the current
     /// greenkey) gate on this flag instead of fn presence.
     pub is_bridge_trace: bool,
+    /// Set true during the walk when a LOAD_GLOBAL / LOAD_NAME resolves through
+    /// the frame's module globals dict.  Read by
+    /// `finish_trace_namespace_dependency` at walk end and by the entry-bridge
+    /// fold mid-walk; drives `PyreMeta.namespace_dependent` (the re-entry
+    /// namespace-length gate).  Per-trace: a fresh ctx starts `false`, so no
+    /// manual reset is needed.
+    pub reads_module_global: bool,
     /// For a bridge trace (`is_bridge_trace`), the loop-header bytecode pc of
     /// the parent loop the bridge will JUMP into. The bridge closes when it
     /// reaches this pc (a real compiled-loop header), NOT when it transiently
@@ -1199,6 +1206,7 @@ impl TraceCtx {
             forced_virtualizable: None,
             has_compiled_targets_fn: None,
             is_bridge_trace: false,
+            reads_module_global: false,
             bridge_target_header_pc: None,
             portal_call_depth_fn: None,
             seen_loop_header_for_jdindex: -1,
@@ -1273,6 +1281,7 @@ impl TraceCtx {
             forced_virtualizable: None,
             has_compiled_targets_fn: None,
             is_bridge_trace: false,
+            reads_module_global: false,
             bridge_target_header_pc: None,
             portal_call_depth_fn: None,
             seen_loop_header_for_jdindex: -1,

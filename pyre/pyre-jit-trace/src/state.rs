@@ -7891,7 +7891,14 @@ impl JitState for PyreJitState {
         PyreMeta {
             num_locals,
             ns_len: self.namespace_len(),
-            namespace_dependent: crate::trace::trace_reads_module_global(),
+            // Provisional seed only.  build_meta runs at trace START, before the
+            // walk records any LOAD_GLOBAL/LOAD_NAME, so the true value does not
+            // exist yet.  finish_trace_namespace_dependency overwrites this from
+            // TraceCtx.reads_module_global on every trace_bytecode return path,
+            // and the entry-bridge fold ORs the live flag mid-walk (`false` is
+            // the OR identity).  Both invariants must hold for this seed to stay
+            // safe to drop.
+            namespace_dependent: false,
             valuestackdepth: vsd,
             array_capacity: capacity,
             // virtualizable_gen.rs:24-31 wires `extra_reds = { ec: Ref }` per
