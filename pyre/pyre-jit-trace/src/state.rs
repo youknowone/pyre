@@ -3675,8 +3675,10 @@ pub(crate) fn record_namespace_quasiimmut_field(
     slot_index: u32,
 ) {
     if ctx.heap_cache().is_quasi_immut_known(obj, slot_index) {
-        ctx.profiler()
-            .count_ops(OpCode::QuasiimmutField, majit_metainterp::counters::HEAPCACHED_OPS);
+        ctx.profiler().count_ops(
+            OpCode::QuasiimmutField,
+            majit_metainterp::counters::HEAPCACHED_OPS,
+        );
         return;
     }
     ctx.heap_cache_mut().quasi_immut_now_known(obj, slot_index);

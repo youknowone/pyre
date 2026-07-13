@@ -22,8 +22,7 @@ pub static EXC_ZERO_DIVISION_ERROR_TYPE: PyType = crate::pyobject::new_pytype("Z
 pub static EXC_TYPE_ERROR_TYPE: PyType = crate::pyobject::new_pytype("TypeError");
 pub static EXC_VALUE_ERROR_TYPE: PyType = crate::pyobject::new_pytype("ValueError");
 pub static EXC_NAME_ERROR_TYPE: PyType = crate::pyobject::new_pytype("NameError");
-pub static EXC_UNBOUND_LOCAL_ERROR_TYPE: PyType =
-    crate::pyobject::new_pytype("UnboundLocalError");
+pub static EXC_UNBOUND_LOCAL_ERROR_TYPE: PyType = crate::pyobject::new_pytype("UnboundLocalError");
 pub static EXC_INDEX_ERROR_TYPE: PyType = crate::pyobject::new_pytype("IndexError");
 pub static EXC_KEY_ERROR_TYPE: PyType = crate::pyobject::new_pytype("KeyError");
 pub static EXC_ATTRIBUTE_ERROR_TYPE: PyType = crate::pyobject::new_pytype("AttributeError");

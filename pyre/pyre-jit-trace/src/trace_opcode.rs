@@ -2427,12 +2427,7 @@ impl MIFrame {
         // reaches store_local_value through `setarrayitem_vable_r`; use the
         // same virtualizable/local-slot writer with the unbound sentinel.
         let null = ctx.const_ref(pyre_object::PY_NULL as i64);
-        self.store_local_value(
-            ctx,
-            idx,
-            null,
-            ConcreteValue::Ref(pyre_object::PY_NULL),
-        )
+        self.store_local_value(ctx, idx, null, ConcreteValue::Ref(pyre_object::PY_NULL))
     }
 
     pub(crate) fn set_next_instr(&mut self, _ctx: &mut TraceCtx, target: usize) {
@@ -7387,8 +7382,7 @@ impl MIFrame {
             let is_unbound = self.with_ctx(|this, ctx| {
                 let value = this.load_local_value(ctx, idx)?;
                 Ok::<_, PyError>(
-                    ctx.box_value(value)
-                        == Some(Value::Ref(GcRef(pyre_object::PY_NULL as usize))),
+                    ctx.box_value(value) == Some(Value::Ref(GcRef(pyre_object::PY_NULL as usize))),
                 )
             })?;
             if is_unbound {

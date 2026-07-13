@@ -11318,10 +11318,8 @@ impl CodeWriter {
                                     None,
                                     py_pc as i64,
                                 );
-                                current_state.store_local_value(
-                                    idx,
-                                    super::flow::Constant::none().into(),
-                                );
+                                current_state
+                                    .store_local_value(idx, super::flow::Constant::none().into());
                             } else {
                                 emit_abort_permanent!(py_pc);
                             }

@@ -1145,10 +1145,7 @@ impl UnrollOptimizer {
                 false,
             )
         })?;
-        merge_quasi_immutable_deps(
-            &mut self.quasi_immutable_deps,
-            &opt_p2.quasi_immutable_deps,
-        );
+        merge_quasi_immutable_deps(&mut self.quasi_immutable_deps, &opt_p2.quasi_immutable_deps);
         self.clear_compile_snapshot_roots();
         // RPython optimizer.py:614-625 freezes op arguments during
         // `_emit_operation`; optimizer.py:598-612 may then install a Const
