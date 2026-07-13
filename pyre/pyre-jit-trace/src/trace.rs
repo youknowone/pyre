@@ -1562,16 +1562,11 @@ fn run_perfn_walk(
     let entry = sym.bridge_walk_entry_pc.unwrap_or(pc_map_entry);
     // The full-body walk drives a PORTAL trace, so the body must carry the
     // portal entry INPUT SHAPE (`FrameInputs::Portal`: `[frame, ec]` red inputs
-    // + the frame-vable locals prologue).  Under the always-portal flip every
-    // drained per-code jitcode is Portal-shaped (`built_as_portal` records the
+    // + the frame-vable locals prologue). Every drained per-code jitcode is
+    // Portal-shaped (`built_as_portal` records the
     // input shape, independent of true-portal-ness), so this decline narrows to
     // the only remaining shapeless case: a skeleton jitcode with no portal
-    // input shape (pyjitcode.rs `skeleton`).  When the flip is OFF, a body
-    // first compiled as a plain callee (`FrameInputs::Frame`) is still
-    // shapeless here — its portal red seeding would land `ec_box` in a
-    // PARAMETER color and record the ExecutionContext const as the function's
-    // argument — so decline permanently like the other structural
-    // `FBW_DECLINED_KEYS` classes and let the trait tracer compile it.
+    // input shape (pyjitcode.rs `skeleton`).
     if !pjc.metadata.built_as_portal {
         if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
             eprintln!(

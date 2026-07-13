@@ -13369,12 +13369,12 @@ fn callee_fast_path_inlinable(
         // register — the latter is the `fresh_virtualizable` case, folded
         // register-to-register through the per-slot OpRef shadow by the two
         // `*_vable_via_metainterp` short-circuits (no GC op emitted).  Under
-        // the always-portal flip, LOAD_FAST / STORE_FAST lower to
+        // the unconditional Portal input shape, LOAD_FAST / STORE_FAST lower to
         // `getarrayitem_vable_r` / `setarrayitem_vable_r(frame, slot)`, so a
         // branchless leaf's locals prologue must not decline the fast path.
-        // `callee_frame_reg == u16::MAX` (flag OFF) makes
+        // `callee_frame_reg == u16::MAX` for shapeless skeletons makes
         // `inline_resolvable_seeded_frame_op` return false, so this is inert
-        // in the default build.
+        // outside drained per-code jitcodes.
         if d.opname.contains("vable")
             && !inline_resolvable_static_vable_read(body_code, &d, callee_descr_refs, ctx)
             && !inline_resolvable_seeded_frame_op(body_code, &d, callee_frame_reg)
@@ -14880,7 +14880,7 @@ fn try_walker_inline_user_call(
         // self-calls see the correct recursion depth.
         let _inline_frame = InlineFrameGuard::enter(ctx.session, callee_code_key, parent_frame);
         // Strict fresh-frame fold: a branchless leaf inlined without a virtual
-        // frame (not `try_multiframe`) whose body carries the always-portal
+        // frame (not `try_multiframe`) whose body carries the Portal
         // frame-vable locals prologue resolves its own `getarrayitem_vable_r` /
         // `setarrayitem_vable_r` register-to-register through the per-slot
         // shadow.  Seed each param into slot `i` (`local_to_vable_slot` is

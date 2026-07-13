@@ -94,11 +94,9 @@ pub struct PyJitCodeMetadata {
     /// as `after_residual_call_resume_pc`.
     pub first_jit_pc_by_py_pc: Vec<usize>,
     /// Inverse of the derived marker resolution's block-head case: each distinct
-    /// `-live-` marker byte offset that some PC resolves to → the Python block
-    /// entry. For plain-callee control-flow entries, the dense map's smallest
-    /// resolving PC is rewound over a contiguous no-JitCode prefix so a block
-    /// beginning with trivia / constant-folded ops does not invert to the first
-    /// later opcode that emits JitCode. Other markers keep their dense owner.
+    /// `-live-` marker byte offset that some PC resolves to → the first Python PC
+    /// that resolves to it. Portal JitCodes emit live frame/global reads at
+    /// control-flow entries, so the dense-map owner is the block entry.
     /// Sorted ascending by jitcode offset for binary search.  Replaces the
     /// former dense-map block-head scan in
     /// `python_pc_for_jitcode_pc` (a coordinate landing exactly on a marker is
@@ -210,14 +208,13 @@ pub struct PyJitCodeMetadata {
     pub portal_ec_reg: u16,
     /// Whether the body carries the PORTAL entry INPUT SHAPE
     /// (`FrameInputs::Portal`: `[frame, ec]` red inputs + frame-vable locals
-    /// prologue) — the default for every drained per-code jitcode under the
-    /// always-portal flip, so a later portal walk of ANY body is admitted.
+    /// prologue) — the invariant for every drained per-code jitcode, so a
+    /// later portal walk of any body is admitted.
     /// This records the input shape, NOT true-portal-ness (the
     /// `jit_merge_point` marker stays gated separately on
     /// `jitdriver_sd_from_portal_graph`).  `false` only for shapeless
     /// skeletons (`PyJitCodeMetadata::skeleton`), which `run_perfn_walk`
-    /// declines to walk.  When the flip is OFF a plain callee
-    /// (`FrameInputs::Frame`) is also shapeless here and declines the same way.
+    /// declines to walk.
     pub built_as_portal: bool,
     /// Absolute start index of the operand stack in PyFrame.locals_cells_stack_w.
     pub stack_base: usize,
