@@ -11360,9 +11360,6 @@ fn branch_arm_resume_ref_liveness(
         if jc.payload.code_ptr.is_null() {
             return None;
         }
-        let code = &*jc.payload.code_ptr;
-        let py = python_pc_for_jitcode_pc(&jc.payload.metadata, target) as usize;
-        let py = skip_python_trivia_forward(code, py);
         // Key the liveness store off the sym's own stamped `jitcode.index`
         // — the same per-function index the snapshot encoder
         // (`collect_outer_active_boxes`) and the resume decoder
@@ -11374,17 +11371,12 @@ fn branch_arm_resume_ref_liveness(
         // reports every arm read unrestorable (a spurious permanent
         // decline for every kept-stack branch outside the first function).
         //
-        // Source the branch-arm Ref-liveness banks off the genuine carried
-        // jitcode `target` via the jitcode-pc-keyed twin, bypassing the
-        // `python_pc_for_jitcode_pc` inversion + `pc_map` re-key. The twin
-        // has no Python-pc fallback for unpopulated installs; that shape
-        // declines rather than reading liveness from a guessed coordinate.
+        // Source the branch-arm Ref-liveness banks directly from the carried
+        // jitcode-pc `target` via the jitcode-pc-keyed reader, with no reverse
+        // translation to a Python opcode pc and no trivia skip.
         let jitcode_index = jc.index;
-        let banks = crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
-            jitcode_index,
-            py as i32,
-            target as i32,
-        );
+        let banks =
+            crate::state::frame_liveness_reg_indices_by_bank_from_pc(jitcode_index, target as i32);
         let live: std::collections::HashSet<u16> = banks.ref_.iter().map(|&c| c as u16).collect();
         let num_regs_r = jc.payload.jitcode.num_regs_r() as u16;
         Some((live, num_regs_r))

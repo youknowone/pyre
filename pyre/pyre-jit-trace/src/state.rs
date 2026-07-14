@@ -1060,10 +1060,7 @@ pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
 /// coordinate IS that offset, so no Python pc is consulted here. Returns `None`
 /// when the carried word does not name a decodable startpoint, which declines
 /// the bridge at the caller.
-pub fn resolve_bridge_walk_entry_at(
-    jitcode_index: i32,
-    carried_jitcode_pc: i32,
-) -> Option<usize> {
+pub fn resolve_bridge_walk_entry_at(jitcode_index: i32, carried_jitcode_pc: i32) -> Option<usize> {
     ensure_finish_setup();
     METAINTERP_SD.with(|r| {
         let sd = r.borrow();
