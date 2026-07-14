@@ -1549,12 +1549,10 @@ fn build_function(
 
     // A peeled loop arrives as `[preamble..][LABEL][body..][JUMP]`: the
     // preamble runs once on entry, the LABEL is the loop-back target, and
-    // JUMP branches back to it. Emit the `loop` at the LABEL (not the top)
-    // so the preamble is not re-executed every iteration; wrap everything in
-    // a `block` so guard exits `br` out to the function epilogue. Use the
-    // LAST label (a peeled trace may carry an outer entry label plus the
-    // inner loop header).
-    let loop_label_idx = ops.iter().rposition(|op| op.opcode == OpCode::Label);
+    // JUMP branches back to it. Emit the `loop` at the LABEL selected by the
+    // terminal JUMP's descr (not merely the last LABEL) so multi-label traces
+    // re-execute the complete loop body.
+    let loop_label_idx = find_loop_label_index(ops);
     let has_loop = loop_label_idx.is_some();
 
     // Def / last-use positions for the post-collection Ref reload filter.
@@ -1757,7 +1755,7 @@ fn build_function(
                 // value to a later read. Do all reads first (push every resolved
                 // jump arg onto the operand stack), then all writes (pop into the
                 // targets in reverse, the stack being LIFO).
-                let label_args = find_label_args(ops);
+                let label_args = find_label_args(ops, op);
                 let jump_args = op.getarglist();
                 let n = jump_args.len().min(label_args.len());
                 for jump_arg in jump_args.iter().take(n) {
@@ -3907,10 +3905,17 @@ fn build_function(
 /// its JUMP's descr identifies one of the source loop's OWN labels
 /// (`label_descrs`) with matching arity and a resume-safe live set.
 pub fn is_resumable_peeled(ops: &[Op]) -> bool {
-    let Some(last_label) = ops.iter().rposition(|op| op.opcode == OpCode::Label) else {
+    let Some(loop_label) = find_loop_label_index(ops) else {
         return false;
     };
-    ops[..last_label]
+    // The current entry br_table closes every label-loader block before it
+    // opens the wasm `loop`, so it supports only the shape whose actual JUMP
+    // target is the last LABEL. Other multi-label shapes still compile as a
+    // normal local loop but do not advertise in-module label re-entry.
+    if ops.iter().rposition(|op| op.opcode == OpCode::Label) != Some(loop_label) {
+        return false;
+    }
+    ops[..loop_label]
         .iter()
         .any(|op| op.opcode != OpCode::Label)
 }
@@ -3978,10 +3983,37 @@ pub fn label_resume_safety(ops: &[Op]) -> Vec<bool> {
         .collect()
 }
 
-fn find_label_args(ops: &[Op]) -> Vec<OpRef> {
-    // The JUMP branches back to the loop-header label, which is the LAST
-    // label in a peeled trace (an outer entry label may precede it). The
-    // `loop` is emitted at that same label in `build_function`.
+fn find_jump_target_label_index(ops: &[Op], jump: &Op) -> Option<usize> {
+    let target = jump.getdescr()?;
+    ops.iter().position(|op| {
+        op.opcode == OpCode::Label
+            && op
+                .getdescr()
+                .is_some_and(|descr| std::sync::Arc::ptr_eq(&descr, &target))
+    })
+}
+
+fn find_loop_label_index(ops: &[Op]) -> Option<usize> {
+    ops.iter()
+        .rev()
+        .find(|op| op.opcode == OpCode::Jump)
+        .and_then(|jump| find_jump_target_label_index(ops, jump))
+        .or_else(|| ops.iter().rposition(|op| op.opcode == OpCode::Label))
+}
+
+fn find_label_args(ops: &[Op], jump: &Op) -> Vec<OpRef> {
+    // A multi-label trace's JUMP does not necessarily target its last label.
+    // LABEL and JUMP share the loop-target descr, so resolve the target by Arc
+    // identity just like compile_bridge's external-JUMP path. Falling back to
+    // the last label preserves the historical behavior for legacy IR whose
+    // JUMP carries no descr.
+    if let Some(label_idx) = find_jump_target_label_index(ops, jump) {
+        return ops[label_idx]
+            .getarglist()
+            .iter()
+            .map(|arg| arg.to_opref())
+            .collect();
+    }
     for op in ops.iter().rev() {
         if op.opcode == OpCode::Label {
             return op.getarglist().iter().map(|a| a.to_opref()).collect();

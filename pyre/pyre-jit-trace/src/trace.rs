@@ -2283,8 +2283,7 @@ fn loop_body_has_abort_permanent(w_code: *const (), start_pc: usize) -> bool {
             first_abort_permanent = Some(op.pc);
         }
         if op.opname.starts_with("goto") && op.argcodes.ends_with('L') {
-            let target =
-                u16::from_le_bytes([code[op.next_pc - 2], code[op.next_pc - 1]]) as usize;
+            let target = u16::from_le_bytes([code[op.next_pc - 2], code[op.next_pc - 1]]) as usize;
             if target <= merge_point {
                 back_edge_end = Some(back_edge_end.map_or(op.pc, |end| end.max(op.pc)));
             }
