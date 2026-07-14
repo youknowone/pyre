@@ -368,6 +368,23 @@ unsafe fn type_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
     }
 }
 
+/// Reclaim the two Rust-owned, out-of-line containers of a swept heap type.
+/// `mro_w` is a GC-managed `FixedObjectArray` reclaimed by the collector and
+/// must not be freed here. The managed namespace object is also reclaimed by
+/// the collector, while the shared/uncertain `terminator` ownership remains
+/// deferred by #528.
+unsafe fn type_object_destructor(obj_addr: usize) {
+    let t = obj_addr as *const pyre_object::typeobject::W_TypeObject;
+    let name = unsafe { (*t).name };
+    if !name.is_null() {
+        drop(unsafe { Box::from_raw(name) });
+    }
+    let weak_subclasses = unsafe { (*t).weak_subclasses };
+    if !weak_subclasses.is_null() {
+        drop(unsafe { Box::from_raw(weak_subclasses) });
+    }
+}
+
 /// Custom trace for `GeneratorIterator` (generator.py GeneratorIterator).
 ///
 /// The suspended frame is held behind an opaque `frame_ptr`
@@ -1569,11 +1586,14 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     // `TYPE_TYPE` is in `all_foreign_pytypes()` and the
     // loop's `sizeof(PyObject)` approximation drastically
     // under-counts the W_TypeObject payload.
-    let w_type_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
-        std::mem::size_of::<pyre_object::typeobject::W_TypeObject>(),
-        object_tid,
-        type_object_custom_trace,
-    ));
+    let w_type_tid = gc.register_type(
+        TypeInfo::object_subclass_with_custom_trace(
+            std::mem::size_of::<pyre_object::typeobject::W_TypeObject>(),
+            object_tid,
+            type_object_custom_trace,
+        )
+        .with_destructor_fn(type_object_destructor),
+    );
     debug_assert_eq!(w_type_tid, W_TYPE_GC_TYPE_ID);
     majit_gc::GcAllocator::register_vtable_for_type(
         &mut gc,
