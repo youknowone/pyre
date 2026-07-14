@@ -265,7 +265,7 @@ fn try_commit_midbody_abort(
             frame.locals_w_mut().as_mut_slice()[slot] = *value;
         }
     }
-    let stack_base = code.varnames.len();
+    let stack_base = code.varnames.len() + pyre_interpreter::pyframe::ncells(code);
     for (rel, value) in current.live_stack.iter().enumerate() {
         let crate::state::ConcreteValue::Ref(value) = value else {
             return false;

@@ -1368,9 +1368,9 @@ pub fn seed_compiled_trace_jitcode_test_state(
 /// Empty when the index or PC is out of range, or the jitcode was never
 /// colored (portal/skeleton installs).
 ///
-/// Used by tests + tooling that need to translate a semantic slot
-/// (local `i` for `i < nlocals`, `nlocals + d` for operand-stack depth
-/// `d`) into the post-rename register color the dispatcher would touch
+/// Used by tests + tooling that need to translate a physical frame slot
+/// (local `i` for `i < code.varnames.len()`, `metadata.stack_base + d` for
+/// operand-stack depth `d`) into the post-rename register color the dispatcher would touch
 /// at a given PC — colors are per-program-point, so a flat
 /// slot-arithmetic lookup does not exist.
 pub fn pcdep_color_slots_at(jitcode_index: i32, py_pc: i32) -> Vec<(u8, u16, u16)> {

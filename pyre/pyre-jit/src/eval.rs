@@ -8973,7 +8973,7 @@ mod tests {
         local_slots: &[u32],
         stack_depths: &[usize],
     ) -> (usize, Vec<u32>, Vec<u32>) {
-        let nlocals = code.varnames.len();
+        let stack_base = code.varnames.len() + pyre_interpreter::pyframe::ncells(code);
         (0..code.instructions.len())
             .find_map(|pc| {
                 let colors: Vec<u32> = local_slots
@@ -8982,7 +8982,7 @@ mod tests {
                     .chain(
                         stack_depths
                             .iter()
-                            .map(|&d| pcdep_color_for_slot(jitcode_index, pc, nlocals + d)),
+                            .map(|&d| pcdep_color_for_slot(jitcode_index, pc, stack_base + d)),
                     )
                     .collect::<Option<Vec<u32>>>()?;
                 let live =

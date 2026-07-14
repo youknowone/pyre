@@ -4829,6 +4829,19 @@ fn build_pcdep_color_slots(
     out
 }
 
+/// Translate the compact codewriter slot space (`fast locals | operand stack`)
+/// to the physical `locals_cells_stack_w` layout (`fast locals | deref slots |
+/// operand stack`).
+fn frame_layout_slot(slot: u16, nlocals: usize, stack_base: usize) -> u16 {
+    let slot = slot as usize;
+    let absolute = if slot < nlocals {
+        slot
+    } else {
+        stack_base + (slot - nlocals)
+    };
+    u16::try_from(absolute).expect("locals_cells_stack_w slot must fit in u16")
+}
+
 fn validate_pcdep_color_map(
     pcdep_slot_var: &[Vec<(u16, u32)>],
     colorings: [&std::collections::HashMap<super::flow::VariableId, u16>; 3],
@@ -12478,7 +12491,31 @@ impl CodeWriter {
         // #348 Part (2): ship the marker-consistent per-PC map (the fold-group
         // union) so the runtime inversion covers every color the (possibly
         // folded) `-live-` marker carries.
-        let pcdep_color_slots = marker_pcdep_color_slots;
+        // The graph/register space packs `[fast locals | operand stack]`, but
+        // runtime resume consumers index `locals_cells_stack_w` and therefore
+        // need `[fast locals | pure cells/freevars | operand stack]`. Translate
+        // only at this publication boundary so register allocation stays in
+        // its compact space while every frame slot in metadata is physical.
+        let pcdep_color_slots: Vec<Vec<(u8, u16, u16)>> = marker_pcdep_color_slots
+            .into_iter()
+            .map(|entries| {
+                entries
+                    .into_iter()
+                    .map(|(bank, color, slot)| {
+                        (
+                            bank,
+                            color,
+                            frame_layout_slot(slot, nlocals, stack_base_absolute),
+                        )
+                    })
+                    .collect()
+            })
+            .collect();
+        for entries in &mut const_ref_slots_at_pc {
+            for (slot, _) in entries {
+                *slot = frame_layout_slot(*slot, nlocals, stack_base_absolute);
+            }
+        }
         // Runtime entry/liveness lookups expect the byte offset of the
         // surviving `-live-` marker for each Python PC
         // (`jitcode.get_live_vars_info` first checks `code[pc] ==
@@ -13515,6 +13552,21 @@ mod tests {
         let resume: Vec<Vec<(u16, u32)>> = vec![vec![], vec![], vec![(0u16, 5u32)]];
         let slots = pcdep_canonical_slot(&post, &resume);
         assert_eq!(slots.get(5).copied().flatten(), Some(2));
+    }
+
+    #[test]
+    fn frame_layout_slot_places_operand_stack_after_non_argument_deref_slots() {
+        // A free var or pure cell occupies one physical slot between the three
+        // fast locals and the operand stack.
+        assert_eq!(frame_layout_slot(0, 3, 4), 0);
+        assert_eq!(frame_layout_slot(2, 3, 4), 2);
+        assert_eq!(frame_layout_slot(3, 3, 4), 4);
+        assert_eq!(frame_layout_slot(6, 3, 4), 7);
+
+        // An argument-cell overlaps its fast-local slot, so there is no extra
+        // deref slot and compact and physical stack indices coincide.
+        assert_eq!(frame_layout_slot(3, 3, 3), 3);
+        assert_eq!(frame_layout_slot(6, 3, 3), 6);
     }
 
     fn make_runtime_jitcode_with_fnaddr(fnaddr: usize) -> Arc<majit_metainterp::jitcode::JitCode> {

@@ -10922,7 +10922,7 @@ fn kept_stack_has_boxed_int_hazard(
         if depth == 0 {
             return false;
         }
-        let nlocals = code.varnames.len();
+        let stack_base = pjc.metadata.stack_base;
         let pcdep = pjc.metadata.pcdep_color_slots.get(py);
         let consts = pjc.metadata.const_ref_slots_at_pc.get(py);
         // The concrete shadow unboxes exact ints, so a kept slot that holds a
@@ -10935,7 +10935,7 @@ fn kept_stack_has_boxed_int_hazard(
                 && !(0..256).contains(&pyre_object::w_int_get_value(p))
         };
         for s in 0..depth {
-            let slot = (nlocals + s) as u16;
+            let slot = (stack_base + s) as u16;
             // Live Variable slot: inspect its concrete register value.
             if let Some(color) = pcdep.and_then(|e| {
                 e.iter()
