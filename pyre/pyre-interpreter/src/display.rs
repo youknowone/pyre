@@ -1126,6 +1126,12 @@ unsafe fn exception_descr_str_wtf8(obj: PyObjectRef) -> Result<Option<Wtf8Buf>, 
             return Ok(None);
         }
         let first = pyre_object::w_tuple_getitem(args, 0).unwrap_or(args);
+        // A tagged `int` immediate is never a `str`; skip the `ob_type` deref
+        // (which would read the immediate as a pointer) and fall back to
+        // `py_str`, which formats the tagged value directly.
+        if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(first) {
+            return Ok(None);
+        }
         if first.is_null() || !std::ptr::eq((*first).ob_type, &STR_TYPE as *const PyType) {
             return Ok(None);
         }
