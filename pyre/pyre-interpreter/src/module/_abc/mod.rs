@@ -27,6 +27,40 @@ fn abc_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if let Some(&cls) = args.first() {
         let fresh = w_list_new(vec![]);
         crate::baseobjspace::setattr_str(cls, "_abc_registry", fresh)?;
+        let mut abstract_names = Vec::new();
+        let bases = unsafe { w_type_get_bases(cls) };
+        if !bases.is_null() && unsafe { is_tuple(bases) } {
+            for i in 0..unsafe { w_tuple_len(bases) } {
+                let Some(base) = (unsafe { w_tuple_getitem(bases, i as i64) }) else {
+                    continue;
+                };
+                let Ok(names) = crate::baseobjspace::getattr_str(base, "__abstractmethods__")
+                else {
+                    continue;
+                };
+                if !unsafe { is_set_or_frozenset(names) } {
+                    continue;
+                }
+                for name in unsafe { w_set_items(names) } {
+                    if let Some(value) = unsafe {
+                        crate::baseobjspace::lookup_in_type(cls, pyre_object::w_str_get_value(name))
+                    } && crate::baseobjspace::isabstractmethod_w(value)?
+                    {
+                        abstract_names.push(name);
+                    }
+                }
+            }
+        }
+        let namespace = unsafe { w_type_get_dict_ptr(cls) as *mut crate::DictStorage };
+        if !namespace.is_null() {
+            for (name, &value) in unsafe { (*namespace).entries() } {
+                if crate::baseobjspace::isabstractmethod_w(value)? {
+                    abstract_names.push(w_str_new(name));
+                }
+            }
+        }
+        let methods = w_frozenset_from_items(&abstract_names);
+        crate::baseobjspace::setattr_str(cls, "__abstractmethods__", methods)?;
     }
     Ok(w_none())
 }

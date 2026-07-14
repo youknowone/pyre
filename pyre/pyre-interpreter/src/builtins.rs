@@ -3120,6 +3120,13 @@ pub(crate) fn type_new_wrap_special_methods(ns: &mut crate::DictStorage) {
     }
 }
 
+/// A class that supplies equality but no hash is explicitly unhashable.
+pub(crate) fn type_new_set_hash_if_eq(ns: &mut crate::DictStorage) {
+    if ns.get("__eq__").is_some() && ns.get("__hash__").is_none() {
+        crate::dict_storage_store(ns, "__hash__", pyre_object::w_none());
+    }
+}
+
 fn type_descr_new_with_metaclass(
     args: &[PyObjectRef],
     w_metaclass: PyObjectRef,
@@ -3212,6 +3219,7 @@ fn type_descr_new_with_metaclass(
             }
         }
         let ns_ptr = Box::into_raw(class_ns);
+        unsafe { type_new_set_hash_if_eq(&mut *ns_ptr) };
         unsafe { type_new_wrap_special_methods(&mut *ns_ptr) };
 
         // Default bases to (object,) if empty
@@ -3227,6 +3235,7 @@ fn type_descr_new_with_metaclass(
             } else {
                 bases
             };
+        unsafe { crate::baseobjspace::validate_c3_mro(w_effective_bases)? };
 
         // CPython: calculate_metaclass — delegate to winner if different
         let default_meta = if w_metaclass.is_null() {

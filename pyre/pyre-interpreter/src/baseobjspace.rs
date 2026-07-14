@@ -3324,23 +3324,11 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
                             None
                         };
                         if let Some(attr) = found {
-                            // descriptor.py W_Super.getattribute:
-                            // Invoke descriptor __get__ protocol.
-                            // classmethod.__get__(obj, type) binds the class
-                            // (`w_obj_type`); staticmethod.__get__ unwraps to
-                            // the plain function; a plain function binds `obj`.
-                            // `__new__` is implicitly static — never bind.
-                            if pyre_object::is_classmethod(attr) {
-                                let func = pyre_object::w_classmethod_get_func(attr);
-                                return Ok(pyre_object::w_method_new(func, w_obj_type, w_obj_type));
-                            }
-                            if pyre_object::is_staticmethod(attr) {
-                                return Ok(pyre_object::w_staticmethod_get_func(attr));
-                            }
-                            if name != "__new__" && crate::is_function(attr) {
-                                return Ok(pyre_object::w_method_new(attr, bound_obj, w_obj_type));
-                            }
-                            return Ok(attr);
+                            // W_Super.getattribute binds every descriptor,
+                            // rather than only the three builtin method
+                            // wrapper shapes.  This also covers property,
+                            // getset, member, and user-defined descriptors.
+                            return Ok(get(attr, bound_obj, w_obj_type)?.unwrap_or(attr));
                         }
                     }
                 }
@@ -6603,6 +6591,70 @@ pub unsafe fn compute_default_mro(w_type: PyObjectRef) -> Vec<PyObjectRef> {
     compute_mro(w_type)
 }
 
+/// Reject a base tuple whose C3 merge has no valid next head.
+///
+/// Type construction calls this before allocating the new type or running
+/// descriptor/class-subclass hooks, so an invalid hierarchy cannot escape as
+/// a later and unrelated lookup failure.
+pub unsafe fn validate_c3_mro(bases: PyObjectRef) -> Result<(), crate::PyError> {
+    if bases.is_null() || !is_tuple(bases) {
+        return Ok(());
+    }
+    let n = w_tuple_len(bases);
+    let mut lists: Vec<Vec<PyObjectRef>> = Vec::with_capacity(n + 1);
+    let mut bases_list = Vec::with_capacity(n);
+    for i in 0..n {
+        let Some(base) = w_tuple_getitem(bases, i as i64) else {
+            continue;
+        };
+        if is_type_like_w(base) {
+            let mro = w_type_get_mro(base);
+            lists.push(if mro.is_null() {
+                compute_mro(base)
+            } else {
+                (*mro).to_vec()
+            });
+        }
+        bases_list.push(base);
+    }
+    lists.push(bases_list);
+
+    loop {
+        lists.retain(|list| !list.is_empty());
+        if lists.is_empty() {
+            return Ok(());
+        }
+        let next = lists.iter().find_map(|list| {
+            let candidate = list[0];
+            (!lists.iter().any(|other| {
+                other.len() > 1 && other[1..].iter().any(|&item| std::ptr::eq(item, candidate))
+            }))
+            .then_some(candidate)
+        });
+        let Some(next) = next else {
+            let names = (0..n)
+                .filter_map(|i| w_tuple_getitem(bases, i as i64))
+                .map(|base| {
+                    if is_type_like_w(base) {
+                        w_type_get_name(base).to_string()
+                    } else {
+                        "?".to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(crate::PyError::type_error(format!(
+                "Cannot create a consistent method resolution\norder (MRO) for bases {names}"
+            )));
+        };
+        for list in &mut lists {
+            if !list.is_empty() && std::ptr::eq(list[0], next) {
+                list.remove(0);
+            }
+        }
+    }
+}
+
 /// C3 linearization core (typeobject.py:1687 `compute_C3_mro`).
 ///
 /// `dont_look_inside` — MRO computation is opaque, MRO iteration stays traced.
@@ -7194,6 +7246,9 @@ fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> PyResult {
 pub fn setattr_str(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult {
     let value = unwrap_cell(value);
     let obj = crate::module::_weakref::interp__weakref::force(obj)?;
+    // `super` proxies only `__getattribute__` (descriptor.py W_Super); it has
+    // no `__setattr__`, so `super().name = value` uses the object default and
+    // raises AttributeError rather than resolving a descriptor setter.
     // descroperation.py:247 — space.lookup for __setattr__ through MRO,
     // then get_and_call_function which applies descriptor binding.
     unsafe {

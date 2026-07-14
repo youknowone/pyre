@@ -1697,10 +1697,8 @@ fn subclass_to_tag(
     Ok(Some(cls))
 }
 
-/// `list.__new__(cls, *args)` — `listobject.py:descr__new__` allocates a
-/// `W_ListObject` of `w_listtype`.  `builtin_list_ctor` always returns a
-/// fresh list, so a subclass instance is the same object with `w_class`
-/// retagged.
+/// `list.__new__(cls, *args)` allocates an empty list.  Population belongs to
+/// `list.__init__`, including for subclasses which inherit that initializer.
 fn list_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let (params, kwargs) = crate::builtins::split_builtin_kwargs(args);
     let cls = params.first().copied().unwrap_or(pyre_object::PY_NULL);
@@ -1711,13 +1709,41 @@ fn list_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         params.len().saturating_sub(2),
         crate::builtins::has_real_kwargs(kwargs),
     )?;
-    let value = crate::builtins::builtin_list_ctor(params.get(1..).unwrap_or(&[]))?;
+    let value = pyre_object::w_list_new(Vec::new());
     if let Some(sub) = subclass_to_tag(cls, &pyre_object::LIST_TYPE)? {
         unsafe {
             (*value).w_class = sub;
         }
     }
     Ok(value)
+}
+
+fn list_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let (params, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let list = params.first().copied().unwrap_or(pyre_object::PY_NULL);
+    if list.is_null() || !unsafe { pyre_object::is_list(list) } {
+        return Err(crate::PyError::type_error(
+            "descriptor '__init__' requires a 'list' object",
+        ));
+    }
+    if crate::builtins::has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(
+            "list() takes no keyword arguments",
+        ));
+    }
+    if params.len() > 2 {
+        return Err(crate::PyError::type_error(format!(
+            "list expected at most 1 argument, got {}",
+            params.len() - 1
+        )));
+    }
+    unsafe { pyre_object::w_list_clear(list) };
+    if let Some(&iterable) = params.get(1) {
+        for item in crate::builtins::collect_iterable(iterable)? {
+            unsafe { pyre_object::w_list_append(list, item) };
+        }
+    }
+    Ok(pyre_object::w_none())
 }
 
 /// `tuple.__new__(cls, *args)` — `tupleobject.py:descr__new__` allocates
@@ -2123,6 +2149,11 @@ fn arg_type_name(obj: PyObjectRef) -> String {
 
 fn init_list_type(ns: &mut DictStorage) {
     dict_storage_store(ns, "__new__", make_new_descr(list_descr_new));
+    dict_storage_store(
+        ns,
+        "__init__",
+        make_builtin_function("__init__", list_descr_init),
+    );
     // listobject.py:2486 __class_getitem__ = interp2app(
     //     generic_alias_class_getitem, as_classmethod=True)
     dict_storage_store(

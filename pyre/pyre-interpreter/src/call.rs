@@ -2366,13 +2366,17 @@ pub(crate) fn calculate_metaclass(
 /// `typeobject.c type_call` — a type whose `tp_new` is NULL
 /// (`Py_TPFLAGS_DISALLOW_INSTANTIATION`, e.g. generator) refuses
 /// `Type()` with `cannot create 'X' instances`.
-fn check_type_instantiable(w_type: PyObjectRef) -> Result<(), PyError> {
+pub(crate) fn check_type_instantiable(w_type: PyObjectRef) -> Result<(), PyError> {
     if unsafe { pyre_object::w_type_disallows_instantiation(w_type) } {
         let name = unsafe { pyre_object::w_type_get_name(w_type) };
         return Err(PyError::type_error(format!(
             "cannot create '{name}' instances"
         )));
     }
+    // Abstract-class rejection lives in `object.__new__` (objectobject.py:131
+    // descr__new__ → `w_type_is_abstract`), the single enforcement point, so
+    // the error names the missing methods.  A duplicate check here would fire
+    // first with a less specific message.
     Ok(())
 }
 
@@ -3355,6 +3359,7 @@ fn build_class_inner(
     } else {
         bases
     };
+    unsafe { crate::baseobjspace::validate_c3_mro(w_effective_bases)? };
     // Create class via metaclass or default type()
     // PyPy: typeobject.py — metaclass(name, bases, dict_w) or type.__new__
     let w_type = if let Some(w_metaclass) = w_metaclass {
@@ -3461,6 +3466,7 @@ fn build_class_inner(
             let class_ns = &mut *class_ns_ptr;
             class_ns.remove("__classcell__");
             class_ns.remove("__classdictcell__");
+            crate::builtins::type_new_set_hash_if_eq(class_ns);
             crate::builtins::type_new_wrap_special_methods(class_ns);
         }
         let w = pyre_object::w_type_new(name, w_effective_bases, class_ns_ptr as *mut u8);
