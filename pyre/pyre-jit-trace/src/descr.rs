@@ -2543,32 +2543,14 @@ pub fn pyframe_code_descr() -> DescrRef {
     field_descr_from_group(&PYFRAME_DESCR_GROUP, 3)
 }
 
-pub fn pyframe_dict_storage_descr() -> DescrRef {
-    field_descr_from_group(&PYFRAME_DESCR_GROUP, 4)
-}
-
 /// R3.3b prep: canonical `PyFrame.w_globals` slot
 /// (PYFRAME_W_GLOBALS_OFFSET).  Used by
 /// `emit_new_pyframe_inline_self_recursive` to populate the
 /// W_DictObject sibling so trace-time chases observe a non-null
-/// PyObjectRef.  R3.3 cutover will fold `pyframe_dict_storage_descr`
-/// into this entry after retiring the adjacent raw slot.
+/// PyObjectRef.  `PyFrame.w_globals` is the single globals slot;
+/// the raw dict-storage accessor has been retired.
 pub fn pyframe_w_globals_obj_descr() -> DescrRef {
     field_descr_from_group(&PYFRAME_DESCR_GROUP, 12)
-}
-
-/// R3.3-b: `W_ModuleDictObject.dict_storage_proxy` field — a raw
-/// `*mut DictStorage` pointer set during module init and stable
-/// for the object's lifetime.  Used by `frame_get_namespace` to
-/// chase from `w_globals` (a W_ModuleDictObject) to the
-/// DictStorage that `load/store_namespace_value` reads.
-pub fn module_dict_storage_proxy_descr() -> DescrRef {
-    make_immutable_field_descr(
-        pyre_object::dictmultiobject::W_MODULE_DICT_STORAGE_PROXY_OFFSET,
-        8,
-        Type::Ref,
-        false,
-    )
 }
 
 /// rewrite.py:665-695 handle_call_assembler scalar field read for the
