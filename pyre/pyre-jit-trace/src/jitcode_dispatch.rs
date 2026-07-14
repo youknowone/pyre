@@ -5983,9 +5983,8 @@ fn residual_callee_is_walk_self_recursive(
         if sym.jitcode.is_null() {
             return false;
         }
-        let caller_code = pyre_interpreter::live_code_wrapper(
-            (*sym.jitcode).raw_code() as *const (),
-        ) as *const ();
+        let caller_code = pyre_interpreter::live_code_wrapper((*sym.jitcode).raw_code() as *const ())
+            as *const ();
         w_code as usize == caller_code as usize
     }
 }
