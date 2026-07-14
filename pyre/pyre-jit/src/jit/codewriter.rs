@@ -11018,6 +11018,25 @@ impl CodeWriter {
                         // resolves the variable name with.
                         Instruction::LoadFastCheck { var_num } => {
                             let idx = var_num.get(op_arg).as_usize() as u16;
+                            // A local proven unbound at compile time (a
+                            // `ConstantValue::None` slot, e.g. after a preceding
+                            // DELETE_FAST) makes LOAD_FAST_CHECK unconditionally
+                            // raise UnboundLocalError.  Emitting the
+                            // `load_fast_check` residual + `GuardNoException` +
+                            // push leaves a normal-return `Finish` continuation;
+                            // a later guard-failure bridge resolves into that
+                            // return and silently swallows the raise.  Bail to
+                            // the interpreter so it raises, mirroring the
+                            // constant-folded `if w_value is None` failure arm
+                            // (matches the DeleteFast known-unbound handling).
+                            if matches!(
+                                current_state.local_value_at(idx as usize),
+                                Some(super::flow::FlowValue::Constant(c))
+                                    if c.value == super::flow::ConstantValue::None
+                            ) {
+                                emit_abort_permanent!(py_pc);
+                                continue;
+                            }
                             let code_const: super::flow::FlowValue = super::flow::Constant::new(
                                 super::flow::ConstantValue::Signed(w_code as i64),
                                 Some(Kind::Ref),
