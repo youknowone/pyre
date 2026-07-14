@@ -3957,16 +3957,19 @@ fn for_iter_body_op_is_jit_safe(instr: pyre_interpreter::Instruction) -> bool {
 /// matches the forward-only resume of `blackhole_from_resumedata`
 /// (resume.py:1312), which never drops or doubles an iteration.
 ///
-/// The direct heap-store opcodes `STORE_SUBSCR`, `STORE_ATTR`, `STORE_NAME`,
-/// `STORE_GLOBAL` and the `LOAD_NAME` that reads module globals are admitted in
-/// any body, including one with a call, branch or nested loop. A mid-body abort
-/// after a committed un-journaled store now resumes exactly through
-/// `try_commit_midbody_abort`: forward-exception-delivery or CALL-forward
-/// replaces the FBW refuse-drop that skipped the iteration tail. The store
-/// therefore commits exactly once and the tail is never dropped, matching the
-/// forward-only resume of `blackhole_from_resumedata`. `LOAD_ATTR` is admitted
-/// because a mid-body abort from its method call follows the same exact-resume
-/// path rather than dropping the remainder of the iteration.
+/// The direct heap-mutation opcodes `STORE_SUBSCR`, `STORE_ATTR`, `STORE_NAME`,
+/// `STORE_GLOBAL`, `DELETE_SUBSCR`, `DELETE_ATTR`, and the `LOAD_NAME` that reads
+/// module globals are admitted in any body, including one with a call, branch or
+/// nested loop. A mid-body abort after a committed un-journaled store or delete
+/// now resumes exactly through `try_commit_midbody_abort`:
+/// forward-exception-delivery or CALL-forward replaces the FBW refuse-drop that
+/// skipped the iteration tail. The mutation therefore commits exactly once and
+/// the tail is never dropped, matching the forward-only resume of
+/// `blackhole_from_resumedata`. A delete that raises propagates through
+/// forward-exception-delivery; Fix A's exit-frame traceback recording preserves
+/// its traceback exactly. `LOAD_ATTR` is admitted because a mid-body abort from
+/// its method call follows the same exact-resume path rather than dropping the
+/// remainder of the iteration.
 fn for_iter_bodies_all_jit_safe(code: &pyre_interpreter::CodeObject) -> bool {
     use pyre_interpreter::Instruction as I;
     let instructions = &code.instructions;
@@ -3990,6 +3993,8 @@ fn for_iter_bodies_all_jit_safe(code: &pyre_interpreter::CodeObject) -> bool {
                             | I::StoreAttr { .. }
                             | I::StoreName { .. }
                             | I::StoreGlobal { .. }
+                            | I::DeleteSubscr
+                            | I::DeleteAttr { .. }
                             | I::LoadName { .. }
                     );
                 if !permitted {
@@ -8876,6 +8881,34 @@ mod tests {
         use pyre_interpreter::compile_exec;
         let module = compile_exec(
             "def w(src, d, fn, acc):\n    total = 0\n    for i in src:\n        d[i % 8] = i\n        total += fn(i)\n        acc.append(i)\n    return total\n",
+        )
+        .expect("test code should compile");
+        let code = function_code_from_module(&module, "w");
+        assert!(for_iter_bodies_all_jit_safe(&code));
+        assert_eq!(unsupported_jit_shape(&code), UnsupportedJitShape::None);
+    }
+
+    #[test]
+    fn for_iter_delete_subscr_with_branch_and_call_body_is_jit_safe() {
+        // Exact resume preserves a committed delete and the tail when a call
+        // aborts the walk in a body that also contains a branch.
+        use pyre_interpreter::compile_exec;
+        let module = compile_exec(
+            "def w(src, d, fn, acc):\n    for i in src:\n        if i & 1:\n            del d[i]\n        fn(i)\n        acc.append(i)\n    return len(d)\n",
+        )
+        .expect("test code should compile");
+        let code = function_code_from_module(&module, "w");
+        assert!(for_iter_bodies_all_jit_safe(&code));
+        assert_eq!(unsupported_jit_shape(&code), UnsupportedJitShape::None);
+    }
+
+    #[test]
+    fn for_iter_delete_attr_with_branch_and_call_body_is_jit_safe() {
+        // DELETE_ATTR uses the same exact-resume path in a body containing a
+        // branch, an aborting user call, and an append tail.
+        use pyre_interpreter::compile_exec;
+        let module = compile_exec(
+            "def w(src, o, fn, acc):\n    for i in src:\n        if i & 1:\n            del o.x\n        fn(i)\n        acc.append(i)\n    return len(acc)\n",
         )
         .expect("test code should compile");
         let code = function_code_from_module(&module, "w");
