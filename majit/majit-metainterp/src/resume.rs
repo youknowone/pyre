@@ -7144,6 +7144,69 @@ impl Drop for ResumeRefRootsScope {
     }
 }
 
+fn prepare_resume_heap_with_roots<'a>(
+    resumereader: &mut ResumeDataDirectReader<'a>,
+    rd_virtuals: Option<&'a [VirtualInfo]>,
+    rd_guard_pendingfields: Option<&[majit_ir::GuardPendingFieldEntry]>,
+) -> ResumeRefRootsScope {
+    // resume.py:1324 _prepare = _prepare_virtuals + _prepare_pendingfields.
+    //
+    // Root the lazily-filled `virtuals_cache` for the whole construction
+    // window: decoding a virtual target (`getvirtual_ptr` → allocator)
+    // materializes a fresh boxed object, and a minor collection triggered by a
+    // later materialization relocates the already-built ones. The cache must be
+    // rooted BEFORE the first materialization, including materialization that
+    // happens while applying pending fields.
+    let resume_roots = ResumeRefRootsScope::enter();
+    // resume.py:925 _prepare_virtuals
+    resumereader.prepare_virtuals(rd_virtuals);
+    unsafe {
+        majit_gc::shadow_stack::push_resume_ref_roots(
+            &mut resumereader.virtuals_cache.virtuals_ptr_cache,
+        );
+    }
+    // resume.py:926 _prepare_pendingfields
+    if let Some(guard_pf) = rd_guard_pendingfields {
+        resumereader.prepare_guard_pendingfields(guard_pf);
+    }
+    resume_roots
+}
+
+/// Prepare resume heap side effects without entering a blackhole.
+///
+/// This is the bridge / legacy-deopt counterpart to the heap-prepare block in
+/// `blackhole_from_resumedata`: it sizes `rd_virtuals`, roots the virtual cache,
+/// materializes virtual pending-field targets/values on demand, and applies
+/// `rd_pendingfields`.
+pub fn prepare_resume_heap<'a>(
+    rd_numb: &'a [u8],
+    rd_consts: &'a [majit_ir::Const],
+    all_liveness: &'a [u8],
+    deadframe: &'a [i64],
+    deadframe_types: Option<&'a [majit_ir::Type]>,
+    rd_virtuals: Option<&'a [VirtualInfo]>,
+    rd_guard_pendingfields: Option<&[majit_ir::GuardPendingFieldEntry]>,
+    allocator: &'a dyn BlackholeAllocator,
+) {
+    let Some(guard_pf) = rd_guard_pendingfields else {
+        return;
+    };
+    if guard_pf.is_empty() {
+        return;
+    }
+    let mut resumereader = ResumeDataDirectReader::new(
+        rd_numb,
+        rd_consts,
+        all_liveness,
+        deadframe,
+        deadframe_types,
+        None,
+        allocator,
+    );
+    let _resume_roots =
+        prepare_resume_heap_with_roots(&mut resumereader, rd_virtuals, Some(guard_pf));
+}
+
 pub fn blackhole_from_resumedata<'a>(
     builder: &mut crate::blackhole::BlackholeInterpBuilder,
     resolve_jitcode: &dyn Fn(i32, i32) -> Option<ResolvedJitCode>,
@@ -7180,36 +7243,8 @@ pub fn blackhole_from_resumedata<'a>(
         allocator,
     );
 
-    // resume.py:1324 _prepare = _prepare_virtuals + _prepare_pendingfields.
-    //
-    // Root the lazily-filled `virtuals_cache` (and, in the loop below, each
-    // frame's `registers_r`) for the whole construction window: decoding a
-    // virtual target (`getvirtual_ptr` → allocator) materializes a fresh
-    // boxed object, and a minor collection triggered by a later
-    // materialization relocates the already-built ones.  The raw `Vec`
-    // copies are not otherwise forwarded until `run()`'s `push_bh_regs`, so
-    // a from-space pointer would survive into the blackhole.  RPython traces
-    // these through the GC-managed reader/blackhole objects.
-    //
-    // The cache must be rooted BEFORE the first materialization.
-    // `_prepare_pendingfields` (resume.py:926) already materializes virtual
-    // targets via `decode_ref` → `getvirtual_ptr`, so split `_prepare` and
-    // register the ref cache between sizing it (`_prepare_virtuals`) and the
-    // pending-field application.  The cache buffer is stable after
-    // `_prepare_virtuals` (pre-sized; `set_ptr` only indexes), so the
-    // captured pointer stays valid for the window.
-    let _resume_roots = ResumeRefRootsScope::enter();
-    // resume.py:925 _prepare_virtuals
-    resumereader.prepare_virtuals(rd_virtuals);
-    unsafe {
-        majit_gc::shadow_stack::push_resume_ref_roots(
-            &mut resumereader.virtuals_cache.virtuals_ptr_cache,
-        );
-    }
-    // resume.py:926 _prepare_pendingfields
-    if let Some(guard_pf) = rd_guard_pendingfields {
-        resumereader.prepare_guard_pendingfields(guard_pf);
-    }
+    let _resume_roots =
+        prepare_resume_heap_with_roots(&mut resumereader, rd_virtuals, rd_guard_pendingfields);
 
     // resume.py:1325
     resumereader.consume_vref_and_vable(vrefinfo, vinfo, ginfo, virtualizable_identity_override);

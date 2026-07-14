@@ -185,62 +185,47 @@ fn format_rca_live_values(labels: Option<&[String]>, values: &[Value]) -> String
     out
 }
 
-/// `resume.py:993-1007 _prepare_pendingfields` parity for the bridge /
-/// deopt path — replay deferred SetfieldGc / SetarrayitemGc writes
-/// via descr-method dispatch (`resume.py:1509-1518` setfield,
-/// `resume.py:1531-1541` setarrayitem_int / _ref / _float).
-fn materialize_pending_fields(exit_layout: &CompiledExitLayout, raw_values: &[i64]) {
-    let Some(ref recovery) = exit_layout.recovery_layout else {
+fn convert_rd_virtuals_for_storage(
+    storage: &crate::resume::ResumeStorage,
+    raw_value_count: usize,
+) -> Vec<crate::resume::VirtualInfo> {
+    let rd_consts = storage.rd_consts();
+    let count = raw_value_count as i32;
+    let num_virtuals = storage.rd_virtuals.len();
+    storage
+        .rd_virtuals
+        .iter()
+        .map(|rd| crate::resume::rd_virtual_to_virtual_info(rd, rd_consts, count, num_virtuals))
+        .collect()
+}
+
+/// Bridge / legacy deopt heap preparation. This is intentionally routed
+/// through resume.rs so pending fields decode TAGVIRTUAL values after the
+/// virtual cache has been rooted, matching `blackhole_from_resumedata`.
+fn prepare_exit_resume_heap(
+    exit_layout: &CompiledExitLayout,
+    raw_values: &[i64],
+    all_liveness: &[u8],
+    allocator: &dyn crate::resume::BlackholeAllocator,
+) {
+    let Some(storage) = exit_layout.storage.as_deref() else {
         return;
     };
-    for pf in &recovery.pending_field_layouts {
-        let struct_ptr = match &pf.target {
-            ExitValueSourceLayout::ExitValue(slot) if *slot < raw_values.len() => {
-                raw_values[*slot] as *mut u8
-            }
-            ExitValueSourceLayout::Constant(c, _) => *c as *mut u8,
-            _ => std::ptr::null_mut(),
-        };
-        let value = match &pf.value {
-            ExitValueSourceLayout::ExitValue(slot) if *slot < raw_values.len() => raw_values[*slot],
-            ExitValueSourceLayout::Constant(c, _) => *c,
-            _ => 0,
-        };
-        if struct_ptr.is_null() {
-            continue;
-        }
-        // resume.py:1000 PENDINGFIELDSTRUCT.lldescr is always present in
-        // RPython — fail loud if it's missing, the entry cannot be
-        // replayed without it.
-        let descr = pf
-            .descr
-            .as_ref()
-            .expect("resume.py:1000 PENDINGFIELDSTRUCT.lldescr must be set");
-        let (offset, size) = if pf.is_array_item {
-            let ad = descr
-                .as_array_descr()
-                .expect("setarrayitem pending field must carry an ArrayDescr");
-            let item_index = pf
-                .item_index
-                .expect("setarrayitem pending field must carry an item_index");
-            (ad.base_size() + item_index * ad.item_size(), ad.item_size())
-        } else {
-            let fd = descr
-                .as_field_descr()
-                .expect("setfield pending field must carry a FieldDescr");
-            (fd.offset(), fd.field_size())
-        };
-        unsafe {
-            let p = struct_ptr.add(offset);
-            match size {
-                8 => *(p as *mut i64) = value,
-                4 => *(p as *mut i32) = value as i32,
-                2 => *(p as *mut i16) = value as i16,
-                1 => *(p as *mut u8) = value as u8,
-                _ => {}
-            }
-        }
+    if storage.rd_pendingfields.is_empty() {
+        return;
     }
+    let rd_consts = storage.rd_consts();
+    let rd_virtuals = convert_rd_virtuals_for_storage(storage, raw_values.len());
+    crate::resume::prepare_resume_heap(
+        &storage.rd_numb,
+        rd_consts,
+        all_liveness,
+        raw_values,
+        Some(exit_layout.exit_types.as_slice()),
+        Some(rd_virtuals.as_slice()),
+        Some(&storage.rd_pendingfields),
+        allocator,
+    );
 }
 
 use crate::TraceAction;
@@ -5323,10 +5308,18 @@ impl<S: JitState> JitDriver<S> {
                 // resume.py:924/993 `_prepare(storage)`: apply the guard's pending
                 // heap writes (`rd_pendingfields`) to the live storage BEFORE
                 // reconstructing state, so `on_guard_failure` (the interpreter's
-                // recover) reads the post-write heap. Both PyPy rebuild paths
-                // (`rebuild_from_resumedata`, `blackhole_from_resumedata`) share
-                // `_prepare`; run it before the reconstruction, not after.
-                materialize_pending_fields(&exit_layout, &raw_values);
+                // recover) reads the post-write heap. Route through the resume
+                // reader so TAGVIRTUAL pending values materialize under the same
+                // resume-ref roots as `blackhole_from_resumedata`.
+                {
+                    let fallback_alloc = crate::resume::NullAllocator;
+                    let allocator: &dyn crate::resume::BlackholeAllocator = self
+                        .blackhole_allocator
+                        .as_deref()
+                        .unwrap_or(&fallback_alloc);
+                    let all_liveness = self.meta_interp().staticdata.liveness_info.as_slice();
+                    prepare_exit_resume_heap(&exit_layout, &raw_values, all_liveness, allocator);
+                }
                 // Restore state for bridge tracing start point.
                 let resume_pc = on_guard_failure(state, &result_meta, &raw_values, &exit_layout);
                 let resume_pc = resume_pc.unwrap_or(guard_resume_pc);
@@ -5351,25 +5344,9 @@ impl<S: JitState> JitDriver<S> {
                 let rd_consts_slice: &[Const] = storage.rd_consts();
 
                 // Convert RdVirtualInfo → VirtualInfo for blackhole resume.
-                let rd_virtuals_converted: Option<Vec<crate::resume::VirtualInfo>> = {
-                    let count = raw_values.len() as i32;
-                    let num_virtuals = storage.rd_virtuals.len();
-                    Some(
-                        storage
-                            .rd_virtuals
-                            .iter()
-                            .map(|rd| {
-                                crate::resume::rd_virtual_to_virtual_info(
-                                    rd,
-                                    rd_consts_slice,
-                                    count,
-                                    num_virtuals,
-                                )
-                            })
-                            .collect(),
-                    )
-                };
-                let rd_virtuals_slice = rd_virtuals_converted.as_deref();
+                let rd_virtuals_converted =
+                    convert_rd_virtuals_for_storage(storage, raw_values.len());
+                let rd_virtuals_slice = Some(rd_virtuals_converted.as_slice());
 
                 // resume.py:1338-1340 multi-frame chain reconstruction
                 // (mirrors the loop_jit guard-fail path):
@@ -5483,8 +5460,17 @@ impl<S: JitState> JitDriver<S> {
 
             // Legacy fallback: no rd_numb or jitcode resolution failed.
             // resume.py:993 `_prepare(storage)`: pending heap writes before
-            // reconstruction (mirrors the bridge branch above).
-            materialize_pending_fields(&exit_layout, &raw_values);
+            // reconstruction (mirrors the bridge branch above), with virtual
+            // materialization rooted by the resume reader.
+            {
+                let fallback_alloc = crate::resume::NullAllocator;
+                let allocator: &dyn crate::resume::BlackholeAllocator = self
+                    .blackhole_allocator
+                    .as_deref()
+                    .unwrap_or(&fallback_alloc);
+                let all_liveness = self.meta_interp().staticdata.liveness_info.as_slice();
+                prepare_exit_resume_heap(&exit_layout, &raw_values, all_liveness, allocator);
+            }
             let resume_pc = on_guard_failure(state, &result_meta, &raw_values, &exit_layout);
             let resume_pc = resume_pc.unwrap_or(target_pc);
             self.sync_after(state, &result_meta, descriptor.as_ref());
