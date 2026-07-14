@@ -1617,6 +1617,12 @@ fn run_perfn_walk(
                             // `NonStandardVableFinishPortalUnsupported`).  The EC
                             // color carries no such identity — the EC stays
                             // recoverable from the frame — so reseeding it is safe.
+                            // This applies regardless of tagged-int state: a leaf
+                            // callee whose LOAD_DEREF result is colored onto the EC
+                            // register (`return CELL + 1`) strands `ConstPtr(ec)` in
+                            // the add's LHS when the cell payload's class flips and a
+                            // guard-failure bridge resumes here — the residual add
+                            // then dereferences the stale pointer and SIGSEGVs.
                             let is_frame_color =
                                 reserved_red_colors.first().copied() == Some(color);
                             let bridge_names_operand =
