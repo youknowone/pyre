@@ -4364,6 +4364,17 @@ impl<S: JitState> JitDriver<S> {
         self.meta.invalidate_loop(green_key);
     }
 
+    /// Drop the metainterpreter metadata for a loop that has already been
+    /// invalidated and must be replaced by a newly traced version.
+    ///
+    /// `invalidate_loop` alone preserves the old trace's target tokens for
+    /// quasi-immutable invalidation.  An intentional specialization demotion
+    /// instead needs a fresh root trace, so its stale targets must not make
+    /// `compile_loop` choose the old loop's bridge path.
+    pub fn remove_compiled_loop(&mut self, green_key: u64) {
+        self.meta.remove_compiled_loop(green_key);
+    }
+
     /// Check whether a compiled loop exists for a given green key.
     #[inline]
     pub fn has_compiled_loop(&self, green_key: u64) -> bool {

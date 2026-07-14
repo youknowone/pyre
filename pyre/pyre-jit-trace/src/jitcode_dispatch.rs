@@ -15900,6 +15900,24 @@ fn dispatch_residual_call_iRd_kind(
         }
     }
 
+    // Range FOR_ITER is a C-level iterator advance.  Re-emit its field
+    // updates so the opaque ForIterNext residual cannot invalidate optheap;
+    // other iterator families retain the residual and its Python semantics.
+    // The specialization supplies the same Ref result that the residual would,
+    // including NULL for exhaustion, so the codewriter's trailing
+    // GuardNonnull remains the only loop-exit guard.
+    if ctx.is_authoritative_executor
+        && ctx.is_full_body_walk
+        && ei.pyre_helper == majit_ir::PyreHelperKind::ForIterNext
+    {
+        if let Some(item_op) =
+            try_walker_specialize_for_iter_next(ctx, op.pc, &r_args, dst, dst_bank)?
+        {
+            write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, item_op)?;
+            return Ok((DispatchOutcome::Continue, op.next_pc));
+        }
+    }
+
     // #195 / #73: virtualize an arity-2 plain-int BUILD_TUPLE
     // (`newtuple_from_array`) as a `spec_ii` `new_with_vtable` +
     // `value0` / `value1`, so the backing array build and the partner
@@ -20507,6 +20525,218 @@ fn try_walker_specialize_store_subscr(
         "store_subscr specialization: in-bounds store failed"
     );
     Ok(Some(()))
+}
+
+/// Walker-native `ForIterNext` for `W_IntRangeIterator`.
+///
+/// The generic residual advances the shared iterator before an abort can
+/// occur, and forward-delivery preserves that consumed item.  This inline
+/// path keeps that deliberately irreversible advance: it never journals or
+/// rolls the cursor back.  It instead emits the `W_IntRangeIterator.next`
+/// field-update shape with a branchless continuation mask, leaving the
+/// codewriter's existing trailing `GuardNonnull` to select loop exit.
+///
+/// The Phase 1 result remains a normal `W_IntObject` allocation.  Its mask is
+/// only for the exhaustion result; item virtualization is intentionally not
+/// attempted here.
+fn try_walker_specialize_for_iter_next(
+    ctx: &mut WalkContext<'_, '_>,
+    op_pc: usize,
+    r_args: &[OpRef],
+    _dst: usize,
+    dst_bank: char,
+) -> Result<Option<OpRef>, DispatchError> {
+    if !ctx.is_authoritative_executor
+        || !ctx.is_full_body_walk
+        || dst_bank != 'r'
+        || r_args.len() != 1
+    {
+        return Ok(None);
+    }
+
+    // The snapshot root represents the caller during an inline sub-walk, so
+    // it cannot supply the callee's FOR_ITER green key for demotion.  Leave
+    // that shape on the generic residual until every inlined frame threads
+    // its own snapshot root.
+    if ctx.fbw_mode.inline_subwalk {
+        return Ok(None);
+    }
+
+    // A range class-guard failure at this FOR_ITER green key is a definitive
+    // polymorphism witness.  Once the failure path has demoted it, retain the
+    // generic residual rather than recreating the range guard on retrace.
+    let range_green_key = walker_foriter_green_key(ctx, op_pc);
+    if range_green_key.is_some_and(crate::trace::range_foriter_demoted) {
+        return Ok(None);
+    }
+
+    let iter_op = r_args[0];
+    let Some(iter_obj) = walker_concrete_ref_object(ctx, iter_op) else {
+        return Ok(None);
+    };
+    let (concrete_current, concrete_remaining, concrete_step) = unsafe {
+        if !pyre_object::functional::is_range_iter(iter_obj) {
+            return Ok(None);
+        }
+        pyre_object::functional::w_range_iter_fields(iter_obj)
+    };
+    let concrete_continues = concrete_remaining != 0;
+
+    // A new consume attempt completes the prior in-flight iteration before
+    // this irreversible concrete advance, matching the residual executor.
+    let body_pc = fbw_foriter_body_pc_from_op_pc(ctx.fbw_mode.snapshot_sym, op_pc)
+        .unwrap_or(ctx.entry_py_pc as usize + 1);
+    fbw_foriter_inflight_mark_attempt(body_pc);
+
+    // guard_class W_IntRangeIterator, unless the operand is already known.
+    let range_iter_type_addr = &pyre_object::functional::RANGE_ITER_TYPE as *const _ as i64;
+    if !iter_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(iter_op) {
+        let guard_fail_index = ctx.trace_ctx.num_guards() as u32;
+        let type_const = ctx.trace_ctx.const_int(range_iter_type_addr);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardClass, &[iter_op, type_const], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
+        // `handle_fail` receives only the compiled guard's synthesized
+        // FailDescr. Keep this trace's guard ordinal with the corresponding
+        // FOR_ITER loop key so its failure can demote the specialization.
+        if let Some(green_key) = range_green_key {
+            crate::trace::record_range_foriter_specialization(green_key, guard_fail_index);
+        }
+    }
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .class_now_known(iter_op, range_iter_type_addr);
+
+    // Emit the cursor update without a separate exhaustion guard.  `continues`
+    // is 0/1, so the exhausted path writes the existing cursor values and the
+    // masked item becomes NULL for the pre-existing GuardNonnull.
+    let current = crate::state::opimpl_getfield_gc_i(
+        ctx.trace_ctx,
+        iter_op,
+        crate::descr::range_iter_current_descr(),
+    );
+    let remaining = crate::state::opimpl_getfield_gc_i(
+        ctx.trace_ctx,
+        iter_op,
+        crate::descr::range_iter_remaining_descr(),
+    );
+    let step = crate::state::opimpl_getfield_gc_i(
+        ctx.trace_ctx,
+        iter_op,
+        crate::descr::range_iter_step_descr(),
+    );
+    let zero = ctx.trace_ctx.const_int(0);
+    let continues = ctx.trace_ctx.record_op(OpCode::IntGt, &[remaining, zero]);
+    ctx.trace_ctx
+        .set_opref_concrete(continues, Value::Int(concrete_continues as i64));
+    let delta = ctx.trace_ctx.record_op(OpCode::IntMul, &[step, continues]);
+    ctx.trace_ctx.set_opref_concrete(
+        delta,
+        Value::Int(concrete_step.wrapping_mul(concrete_continues as i64)),
+    );
+    let next_current = ctx.trace_ctx.record_op(OpCode::IntAdd, &[current, delta]);
+    let next_current_concrete =
+        concrete_current.wrapping_add(concrete_step.wrapping_mul(concrete_continues as i64));
+    ctx.trace_ctx
+        .set_opref_concrete(next_current, Value::Int(next_current_concrete));
+    let current_descr = crate::descr::range_iter_current_descr();
+    ctx.trace_ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[iter_op, next_current],
+        current_descr.clone(),
+    );
+    ctx.trace_ctx
+        .heapcache_setfield_cached(iter_op, current_descr.index(), next_current);
+
+    let next_remaining = ctx
+        .trace_ctx
+        .record_op(OpCode::IntSub, &[remaining, continues]);
+    let next_remaining_concrete = concrete_remaining.wrapping_sub(concrete_continues as i64);
+    ctx.trace_ctx
+        .set_opref_concrete(next_remaining, Value::Int(next_remaining_concrete));
+    let remaining_descr = crate::descr::range_iter_remaining_descr();
+    ctx.trace_ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[iter_op, next_remaining],
+        remaining_descr.clone(),
+    );
+    ctx.trace_ctx
+        .heapcache_setfield_cached(iter_op, remaining_descr.index(), next_remaining);
+
+    // Phase 1 keeps the item boxed.  Mask its pointer through an Int word so
+    // exhaustion produces a NULL Ref without an additional guard or side exit.
+    let boxed = crate::state::wrapint(ctx.trace_ctx, current);
+    let boxed_as_int = ctx.trace_ctx.record_op(OpCode::CastPtrToInt, &[boxed]);
+    let mask = ctx.trace_ctx.record_op(OpCode::IntSub, &[zero, continues]);
+    let mask_concrete = 0i64.wrapping_sub(concrete_continues as i64);
+    ctx.trace_ctx
+        .set_opref_concrete(mask, Value::Int(mask_concrete));
+    let masked_as_int = ctx
+        .trace_ctx
+        .record_op(OpCode::IntAnd, &[boxed_as_int, mask]);
+    let masked_item = ctx
+        .trace_ctx
+        .record_op(OpCode::CastIntToPtr, &[masked_as_int]);
+
+    // Tracing executes the real range cursor advance.  The direct helper is
+    // the same `W_IntRangeIterator.next` implementation used by the residual;
+    // do not journal it, because abort recovery forwards this exact item.
+    let concrete_item = unsafe { pyre_object::functional::w_range_iter_next(iter_obj) };
+    debug_assert_eq!(concrete_item.is_some(), concrete_continues);
+    let concrete_item_ptr = concrete_item.unwrap_or(pyre_object::PY_NULL);
+    let concrete_box_ptr = if concrete_continues {
+        concrete_item_ptr as usize
+    } else {
+        0
+    };
+    ctx.trace_ctx
+        .set_opref_concrete(boxed, Value::Ref(majit_ir::GcRef(concrete_box_ptr)));
+    ctx.trace_ctx
+        .set_opref_concrete(boxed_as_int, Value::Int(concrete_box_ptr as i64));
+    let masked_concrete = (concrete_box_ptr as i64) & mask_concrete;
+    ctx.trace_ctx
+        .set_opref_concrete(masked_as_int, Value::Int(masked_concrete));
+    ctx.trace_ctx.set_opref_concrete(
+        masked_item,
+        Value::Ref(majit_ir::GcRef(masked_concrete as usize)),
+    );
+
+    if concrete_continues {
+        fbw_foriter_inflight_capture(concrete_item_ptr, body_pc);
+        // Range iteration stays at the C level, so the operand-stack mirror
+        // remains valid and must receive the item produced by FOR_ITER.
+        ctx.vstack_last_ref = masked_item;
+    }
+
+    Ok(Some(masked_item))
+}
+
+/// Return the driver green key for this top-level FOR_ITER residual.
+///
+/// `op_pc` belongs to the current per-CodeObject JitCode, while the driver
+/// key is `(W_Code, python FOR_ITER pc)`.  The full-body snapshot root owns
+/// the outer JitCode metadata needed for that inversion.  Inlined sub-walks
+/// have a distinct callee JitCode but deliberately share the root snapshot;
+/// decline their range fold rather than associating a callee guard with the
+/// caller's key.
+fn walker_foriter_green_key(ctx: &WalkContext<'_, '_>, op_pc: usize) -> Option<u64> {
+    if ctx.fbw_mode.inline_subwalk || ctx.fbw_mode.snapshot_sym.is_null() {
+        return None;
+    }
+    // SAFETY: snapshot-root mode keeps the outer `PyreSym` live throughout
+    // the full-body walk.  This reads immutable code metadata only.
+    let sym = unsafe { &*ctx.fbw_mode.snapshot_sym };
+    if sym.jitcode.is_null() {
+        return None;
+    }
+    let jitcode = unsafe { &*sym.jitcode };
+    let raw_code = unsafe { jitcode.raw_code() };
+    let w_code = pyre_interpreter::live_code_wrapper(raw_code as *const ()) as *const ();
+    if w_code.is_null() {
+        return None;
+    }
+    let foriter_start_pc = python_pc_for_jitcode_pc(&jitcode.payload.metadata, op_pc) as usize;
+    Some(crate::driver::make_green_key(w_code, foriter_start_pc))
 }
 
 /// #57 SLICE 3c (compare): walker-native speculative float specialization

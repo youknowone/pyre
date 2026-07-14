@@ -5293,9 +5293,9 @@ enum HandleFailOutcome {
 #[majit_macros::dont_look_inside]
 fn handle_fail(
     frame: &mut PyFrame,
-    _green_key: u64,
+    green_key: u64,
     _trace_id: u64,
-    _fail_index: u32,
+    fail_index: u32,
     descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
     should_bridge: bool,
     _owning_key: u64,
@@ -5304,6 +5304,21 @@ fn handle_fail(
     guard_exc: i64,
     _info: &majit_metainterp::virtualizable::VirtualizableInfo,
 ) -> HandleFailOutcome {
+    // The range FOR_ITER `GuardClass(RANGE_ITER)` proves its own site
+    // polymorphic on the first failure.  Demote before `should_bridge` can
+    // spend another retrace-limit cycle trying to close a bridge at the same
+    // failing loop header; blackhole resumes this invocation without the
+    // invalidated compiled loop.
+    if pyre_jit_trace::trace::range_foriter_guard_failed(green_key, fail_index) {
+        let (driver, _) = driver_pair();
+        driver.invalidate_loop(green_key);
+        // This is an intentional replacement, unlike ordinary
+        // GUARD_NOT_INVALIDATED handling: discard the range trace's target
+        // tokens so the next walk compiles the generic FOR_ITER residual.
+        driver.remove_compiled_loop(green_key);
+        return HandleFailOutcome::ResumeInBlackhole;
+    }
+
     // compile.py:702-703: must_compile() AND not stack_almost_full()
     if should_bridge && !stack_almost_full() {
         let is_tracing = {
