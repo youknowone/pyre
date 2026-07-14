@@ -287,9 +287,15 @@ impl W_Deque {
             _ => -1,
         };
         let self_obj = self as *mut W_Deque as PyObjectRef;
-        // Reinitialize by clearing: `store` bumps the iteration lock (`modified`)
-        // so an outstanding scan of an existing deque detects the reset.
-        store(self_obj, vec![]);
+        // Reinitialize by clearing, but only when non-empty (`init`:
+        // `if self.len > 0: self.clear()`). `store` bumps the iteration lock
+        // (`modified`) so an outstanding scan of an existing deque detects the
+        // reset; an already-empty deque leaves `state` untouched, so re-init
+        // while iterating an empty deque yields StopIteration, not a mutation
+        // RuntimeError.
+        if unsafe { w_list_len(data(self_obj)) } > 0 {
+            store(self_obj, vec![]);
+        }
         if let Some(it) = iterable {
             for item in crate::builtins::collect_iterable(it)? {
                 do_append(self_obj, item);
