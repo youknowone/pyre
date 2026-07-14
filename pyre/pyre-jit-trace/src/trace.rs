@@ -324,55 +324,6 @@ fn try_commit_midbody_abort(
     }
 }
 
-/// True when the full-body walker must NOT trace this callee as its own origin,
-/// decided statically before the first walk.
-///
-/// A self-recursive callee with `arg_count != 1` cannot be served by the walker:
-/// the single-int self-recursive `CALL_ASSEMBLER` arm
-/// (`jitcode_dispatch.rs` `try_walker_call_assembler_self_recursive`) is
-/// `nparams == 1` only, so a 2+-param self-recursive callee always bottoms out
-/// at the inline-depth cap and aborts `LoopBearingCalleeInlineUnsupported`.
-/// That abort happens AFTER the walk has concretely executed the body's leading
-/// side effects (e.g. an unjournaled residual `list.append`), which the abort
-/// rollback cannot rewind and the interpreter then replays from entry — a silent
-/// double.  Declining the walker here routes the callee to a clean re-interpret
-/// (the trace-start gate's `else` arm) BEFORE any side effect runs.  These
-/// callees never compile under the walker anyway (verified: 2-param
-/// self-recursion is always `loops_compiled=0`), so the decline costs no
-/// compilation.  `arg_count == 1` is exempt so `fib`'s recursive-portal
-/// `CALL_ASSEMBLER` compile is preserved.
-///
-/// The predicate is a pure function of the code's bytecode and is recomputed on
-/// each call: the scan is a single pass over a short callee body, the gate is
-/// hit only at a compile attempt (not per opcode), and after the first decline
-/// the `fbw_decline` path absorbs the repeat cost — so no cache is warranted.
-/// A thread-local memo would also be wrong under free-threading (this result is
-/// thread-invariant, but a per-thread memo cannot share a hit across threads).
-fn static_walker_should_decline(w_code: *const (), start_pc: usize) -> bool {
-    let raw = unsafe {
-        pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
-            as *const pyre_interpreter::CodeObject
-    };
-    if raw.is_null() {
-        return false;
-    }
-    let code = unsafe { &*raw };
-    // The unsafe double-append happens only when the recursive function is
-    // traced as its OWN callee from function-entry: the walk executes the
-    // pre-recursion body concretely, reaches the self-call, and aborts, so the
-    // interpreter replays the concrete mutation.  A `start_pc` that is a
-    // loop-header (a backward-jump target) is a distinct trace origin — an
-    // independent hot loop inside the same function — whose compile has nothing
-    // to do with the recursive-callee resume; declining it only strands that
-    // loop out of the JIT.  Restrict the decline to non-loop-header origins.
-    if start_pc_is_loop_header(code, start_pc) {
-        return false;
-    }
-    // `arg_count == 1` keeps the single-int self-recursive `CALL_ASSEMBLER` arm
-    // (fib) reachable — never decline it.
-    code.arg_count != 1 && code_is_self_recursive(code)
-}
-
 /// True when `start_pc` is the target of a `JumpBackward` in `code` — i.e. a
 /// loop header, the origin of a loop-header trace rather than a function-entry
 /// trace.
@@ -390,43 +341,6 @@ fn start_pc_is_loop_header(code: &pyre_interpreter::CodeObject, start_pc: usize)
         }
     }
     false
-}
-
-/// Heuristic static test: does `code` load its own name (`co_name`) feeding a
-/// `CALL`?  That is the self-recursion shape in bytecode.  A module-level
-/// function loads itself with `LOAD_GLOBAL <own-name>` (the name-index low bit
-/// is the `push_null` flag, so the real `co_names` index is `namei >> 1`); a
-/// nested/closure function loads itself with `LOAD_DEREF`/`LOAD_FROM_DICT_OR_DEREF`
-/// of the cell/free var whose name is its own.  A shadowed same-name binding is
-/// a false positive, but the only cost is declining a walker trace that would
-/// abort anyway.
-fn code_is_self_recursive(code: &pyre_interpreter::CodeObject) -> bool {
-    use pyre_interpreter::Instruction as I;
-    let own_name: &str = code.obj_name.as_ref();
-    let mut arg_state = pyre_interpreter::OpArgState::default();
-    let mut self_name_loaded = false;
-    let mut has_call = false;
-    for unit in code.instructions.iter().copied() {
-        let (instr, op_arg) = arg_state.get(unit);
-        match instr {
-            I::LoadGlobal { namei } => {
-                let idx = (namei.get(op_arg) as usize) >> 1;
-                if code.names.get(idx).map(|n| -> &str { n.as_ref() }) == Some(own_name) {
-                    self_name_loaded = true;
-                }
-            }
-            I::LoadDeref { i } | I::LoadFromDictOrDeref { i } => {
-                let idx = i.get(op_arg).as_usize();
-                let (name, _is_free) = pyre_interpreter::deref_name_and_kind(code, idx);
-                if name == own_name {
-                    self_name_loaded = true;
-                }
-            }
-            I::Call { .. } | I::CallKw { .. } => has_call = true,
-            _ => {}
-        }
-    }
-    self_name_loaded && has_call
 }
 
 /// Trace an entire loop body starting at `start_pc`.
@@ -583,22 +497,13 @@ pub fn trace_bytecode(
     // blackhole switch); the trait leg is pyre's transitional stand-in
     // until the walker covers those shapes (deleted with the trait in
     // Phase 6).
-    let static_decline = carrier.is_none() && static_walker_should_decline(w_code, start_pc);
     if carrier.is_none()
         && std::env::var_os("PYRE_FULL_BODY_WALK").as_deref() != Some(std::ffi::OsStr::new("0"))
         && !fbw_declined(crate::driver::make_green_key(w_code, start_pc))
-        && !static_decline
     {
         let action = full_body_walk_trace(ctx, sym, w_code, start_pc, cf_addr);
         finish_trace_namespace_dependency(meta);
         return (action, concrete_frame);
-    }
-    // A self-recursive `arg_count != 1` callee is declined by
-    // `static_walker_should_decline` above (BEFORE any concrete side effect),
-    // not by the lazy post-abort `fbw_decline`.  Record it so the decline is
-    // visible in the `PYRE_FBW_DEBUG_ABORT` corpus instead of vanishing.
-    if static_decline {
-        crate::jitcode_dispatch::census_record("Static::SelfRecursiveMultiParam");
     }
     // gap-10: the trait tracer (`PyreMetaInterp` / `owned_concrete_frame`
     // interpret loop) is retired.  Any path the walker did not trace above — an
@@ -2969,106 +2874,9 @@ mod tests {
     }
 
     #[test]
-    fn code_is_self_recursive_detects_self_call() {
-        // A function that calls its own global name feeding a CALL.
-        let code = named_function_code(
-            "def rec_append(xs, n):\n    xs.append(n)\n    if n > 0:\n        return rec_append(xs, n - 1) + 1\n    return 1\n",
-            "rec_append",
-        );
-        assert!(super::code_is_self_recursive(&code));
-        // arg_count == 2 and self-recursive → the walker must decline.
-        assert_eq!(code.arg_count, 2);
-    }
-
-    #[test]
-    fn code_is_self_recursive_rejects_non_recursive_loop() {
-        // A loop-bearing function with a CALL but no self-referential LOAD_GLOBAL.
-        let code = named_function_code(
-            "def fill(dst, n):\n    i = 0\n    while i < n:\n        dst.append(i)\n        i = i + 1\n    return len(dst)\n",
-            "fill",
-        );
-        assert!(!super::code_is_self_recursive(&code));
-    }
-
-    #[test]
-    fn code_is_self_recursive_detects_closure_self_call() {
-        // A nested function loads its own name via LOAD_DEREF (closure cell),
-        // not LOAD_GLOBAL — the scanner must still recognize the self-call.
-        let code = named_function_code(
-            "def outer():\n    def rec(xs, n):\n        xs.append(n)\n        if n > 0:\n            return rec(xs, n - 1) + 1\n        return 1\n    return rec\n",
-            "rec",
-        );
-        assert!(
-            super::code_is_self_recursive(&code),
-            "closure self-recursion (LOAD_DEREF) must be detected"
-        );
-        assert_eq!(code.arg_count, 2);
-        // 2-arg closure self-recursion traced from entry must decline.
-        assert!(
-            decline_predicate(&code, 0),
-            "2-arg closure self-recursion must be declined"
-        );
-    }
-
-    /// Mirror of the `static_walker_should_decline` predicate on a raw
-    /// `CodeObject` (the pointer-resolution wrapper needs a live GC-boxed code
-    /// object, unavailable in a bare unit test — the boxing round-trip SIGSEGVs
-    /// without interpreter init).  The decline logic itself is
-    /// `!start_pc_is_loop_header && arg_count != 1 && code_is_self_recursive`.
-    fn decline_predicate(code: &pyre_interpreter::CodeObject, start_pc: usize) -> bool {
-        !super::start_pc_is_loop_header(code, start_pc)
-            && code.arg_count != 1
-            && super::code_is_self_recursive(code)
-    }
-
-    #[test]
-    fn walker_decline_only_multi_param_self_recursive() {
-        // 1-param self-recursion (fib shape): self-recursive but arg_count == 1,
-        // so the walker must NOT decline it (the CALL_ASSEMBLER arm compiles it).
-        let fib = named_function_code(
-            "def fib(n):\n    if n < 2:\n        return n\n    return fib(n - 1) + fib(n - 2)\n",
-            "fib",
-        );
-        assert!(super::code_is_self_recursive(&fib));
-        assert_eq!(fib.arg_count, 1);
-        assert!(
-            !decline_predicate(&fib, 0),
-            "1-param self-recursion must stay walker-eligible (fib CA arm)"
-        );
-
-        // 2-param self-recursion (rec_append shape) traced from function-entry:
-        // must decline.  rec_append is loop-free, so its entry-trace start_pc
-        // (0) is not a loop header.
-        let rec = named_function_code(
-            "def rec_append(xs, n):\n    xs.append(n)\n    if n > 0:\n        return rec_append(xs, n - 1) + 1\n    return 1\n",
-            "rec_append",
-        );
-        assert!(
-            decline_predicate(&rec, 0),
-            "2-param self-recursion must be declined by the walker"
-        );
-
-        // Non-recursive loop callee: must stay eligible.
-        let fill = named_function_code(
-            "def fill(dst, n):\n    i = 0\n    while i < n:\n        dst.append(i)\n        i = i + 1\n    return len(dst)\n",
-            "fill",
-        );
-        assert!(
-            !decline_predicate(&fill, 0),
-            "non-self-recursive loop callee must stay walker-eligible"
-        );
-    }
-
-    #[test]
-    fn walker_decline_spares_unrelated_loop_in_recursive_fn() {
-        // A 2-param self-recursive function that ALSO has an unrelated hot
-        // `while` loop.  The recursive-callee decline must not strand that
-        // loop: a loop-header trace (start_pc at the JumpBackward target) is a
-        // distinct origin from the function-entry recursive trace.
+    fn start_pc_is_loop_header_detects_while_target() {
         let src = "def f(a, b):\n    if a <= 0:\n        total = 0\n        i = 0\n        while i < b:\n            total = total + i\n            i = i + 1\n        return total\n    return f(a - 1, b)\n";
         let code = named_function_code(src, "f");
-        assert!(super::code_is_self_recursive(&code));
-        assert_eq!(code.arg_count, 2);
 
         // Locate the loop header (the JumpBackward target).
         let mut arg_state = pyre_interpreter::OpArgState::default();
@@ -3092,17 +2900,9 @@ mod tests {
             super::start_pc_is_loop_header(&code, loop_header),
             "the JumpBackward target must be recognized as a loop header"
         );
-
-        // Entry-origin trace (start_pc 0): declined (the recursive callee).
         assert!(
-            decline_predicate(&code, 0),
-            "the recursive callee traced from entry must decline"
-        );
-        // Loop-header-origin trace: must stay eligible so the unrelated hot
-        // loop still gets a JIT token.
-        assert!(
-            !decline_predicate(&code, loop_header),
-            "an unrelated hot loop in a recursive function must stay walker-eligible"
+            !super::start_pc_is_loop_header(&code, 0),
+            "function entry must not be recognized as the loop header"
         );
     }
 

@@ -7550,6 +7550,11 @@ const FBW_MAX_INLINE_RECURSION: usize = 7;
 /// bound is now a performance, not a soundness, question.)
 const FBW_MAX_MULTIFRAME_DEPTH: usize = 1;
 
+/// Upper bound on the parameter count the self-recursive `CALL_ASSEMBLER` fold
+/// accepts. Accumulator/linear recursion is low-arity; the cap keeps a
+/// pathological signature off the fold path.
+const FBW_REC_CA_MAX_PARAMS: usize = 8;
+
 /// Recursion depth of `w_code` on the walk's framestack.
 fn fbw_inline_recursion_count(ctx: &WalkContext<'_, '_>, w_code: usize) -> usize {
     ctx.session
@@ -13615,13 +13620,12 @@ fn try_walker_call_assembler_self_recursive(
     if pyre_helper != majit_ir::PyreHelperKind::CallFn {
         return Ok(None);
     }
-    // Single positional argument (`r_args = [callable, null_or_self,
-    // arg0]`); Ref dst only (`residual_call_r_r`, the boxed PyObject
-    // consumed by a following BINARY_OP).  The only `residual_call_r_i`
-    // helper is the 1-arg `truth_fn`, which can never pass the
-    // `r_args.len() != 3` bail — an Int dst is structurally unreachable
-    // here, so don't accept one.
-    if dst_bank != 'r' || r_args.len() != 3 {
+    // Positional args only (`r_args = [callable, null_or_self, arg0, ..]`);
+    // Ref dst only (`residual_call_r_r`, the boxed PyObject consumed by a
+    // following BINARY_OP).  The only `residual_call_r_i` helper is the
+    // 1-arg `truth_fn`, so an Int dst is structurally unreachable here —
+    // don't accept one.  At least one positional argument is required.
+    if dst_bank != 'r' || r_args.len() < 3 {
         return Ok(None);
     }
     // A self-recursive CALL_ASSEMBLER raising inside a `try` body must
@@ -13649,26 +13653,36 @@ fn try_walker_call_assembler_self_recursive(
     if !null_or_self.is_null() {
         return Ok(None);
     }
-    // The callable must be a plain Python function with exactly one
-    // positional parameter and no closure.  Unlike the inline path this
-    // does NOT require a leaf body: the callee runs as its own compiled
-    // loop reached through `CALL_ASSEMBLER`, not traced through — so a
-    // branchy self-recursive body (`fib`'s `if n < 2`) is eligible here
-    // even though `callee_fast_path_inlinable` declines it for inlining.
+    // The callable must be a plain Python function with N positional
+    // parameters and no closure.  Unlike the inline path this does NOT
+    // require a leaf body: the callee runs as its own compiled loop reached
+    // through `CALL_ASSEMBLER`, not traced through — so a branchy
+    // self-recursive body (`fib`'s `if n < 2`) is eligible here even though
+    // `callee_fast_path_inlinable` declines it for inlining.
     let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(callable) })
     else {
         return Ok(None);
     };
-    if has_closure || nparams != 1 {
+    // Dense positional fill only: the call must pass exactly `nparams`
+    // positional args (`r_args = [callable, null_or_self, arg0..arg{n-1}]`),
+    // so the built frame's `locals[0..nparams]` come straight from the args.
+    // A default/vararg/kwarg mismatch would leave a hole the frame build
+    // cannot fill — decline to the residual.
+    if has_closure || nparams < 1 || nparams != r_args.len() - 2 || nparams > FBW_REC_CA_MAX_PARAMS
+    {
         return Ok(None);
     }
-    // The single positional argument must be a boxed int at trace time
-    // (`concrete_arg0 is_int`, `trace_opcode.rs:6148`).
-    let ConcreteValue::Ref(arg_obj) = arg_concretes[2] else {
-        return Ok(None);
-    };
-    if arg_obj.is_null() || !unsafe { pyre_object::is_int(arg_obj) } {
-        return Ok(None);
+    // Every positional argument must be a boxed int at trace time
+    // (`concrete_arg is_int`): the callee was traced against int locals whose
+    // speculative low-bit guard would deopt on a non-int box.  A non-int
+    // argument declines to the residual call.
+    for i in 0..nparams {
+        let ConcreteValue::Ref(arg_obj) = arg_concretes[2 + i] else {
+            return Ok(None);
+        };
+        if arg_obj.is_null() || !unsafe { pyre_object::is_int(arg_obj) } {
+            return Ok(None);
+        }
     }
     // The outer portal sym (the only materialized frame across sub-walks)
     // via the FBW thread-local — the same read mechanism
@@ -13752,17 +13766,18 @@ fn try_walker_call_assembler_self_recursive(
     let nlocals = callee_code.varnames.len();
     let max_stack = callee_code.max_stackdepth as usize;
 
-    // Unbox the boxed int argument -> raw payload, then re-box it into the
-    // callee's `locals[0]` through `walker_box_int` so the local carries the
-    // same representation the callee was traced against.  Under
-    // `CAN_BE_TAGGED` a small `int` becomes a tagged immediate (`ll_int_box`);
-    // a heap-only re-box (`emit_box_int_inline`) would force a `W_IntObject`
-    // and the callee's speculative low-bit guard on the local would deopt on
-    // every recursion.  Under `!CAN_BE_TAGGED` `walker_box_int` falls back to
-    // `wrapint` (= `emit_box_int_inline`), so the emitted ops are unchanged.
-    // Mirror of `trace_guarded_int_payload(args[0])`.
-    let raw_arg = walker_unbox_int(ctx, op.pc, r_args[2], int_type_addr)?;
-    let arg_box = crate::state::wrapint(ctx.trace_ctx, raw_arg);
+    // Unbox each boxed int argument -> raw payload, then re-box it into the
+    // callee's `locals[i]` through `wrapint` so the local carries the same
+    // representation the callee was traced against.  Under `CAN_BE_TAGGED` a
+    // small `int` becomes a tagged immediate (`ll_int_box`); a heap-only
+    // re-box would force a `W_IntObject` and the callee's speculative low-bit
+    // guard on the local would deopt on every recursion.  Mirror of
+    // `trace_guarded_int_payload(args[i])`.
+    let mut param_boxes: Vec<OpRef> = Vec::with_capacity(nparams);
+    for i in 0..nparams {
+        let raw_arg = walker_unbox_int(ctx, op.pc, r_args[2 + i], int_type_addr)?;
+        param_boxes.push(crate::state::wrapint(ctx.trace_ctx, raw_arg));
+    }
 
     // Execution-context red: recover it fresh off the materialized caller
     // portal frame via `GETFIELD_GC_R(frame, execution_context_descr)` rather
@@ -13785,9 +13800,9 @@ fn try_walker_call_assembler_self_recursive(
     // local, no cells, constant code / globals.
     let pycode_const = ctx.trace_ctx.const_ref(w_code as i64);
     let w_globals_obj_const = ctx.trace_ctx.const_ref(callee_globals_obj as i64);
-    let callee_frame = crate::helpers::emit_new_pyframe_inline_self_recursive(
+    let callee_frame = crate::helpers::emit_new_pyframe_inline_with_params(
         ctx.trace_ctx,
-        arg_box,
+        &param_boxes,
         nlocals + max_stack,
         nlocals,
         pycode_const,
@@ -14256,20 +14271,19 @@ fn try_walker_inline_user_call(
     let strict_inlinable =
         callee_fast_path_inlinable(body.code, callee_descr_refs, ctx, callee_portal_frame_reg);
 
-    // #62: a self-recursive single-int callee (`fib`'s shape) routes to the
-    // direct `CALL_ASSEMBLER` arm (`try_walker_call_assembler_self_recursive`,
-    // reached when this inline attempt returns `Ok(None)`) — NOT the multiframe
-    // inline path.  Detected here, BEFORE the multiframe gate: a forward-branch
-    // self-recursive callee is `try_multiframe`-eligible, but unbounded
-    // self-recursion bottoms out the multiframe inline at the depth cap and
-    // aborts (`LoopBearingCalleeInlineUnsupported`) → trait leg.  The CA arm
-    // instead folds the recursion into a recursive-portal `CALL_ASSEMBLER`.
-    // A strict-inlinable callee is a straight-line leaf (no self-recursion), so
-    // this never preempts the strict path.  Gated on `PYRE_FBW_REC_CA` (the
-    // same flag the CA arm honours): when off, keep the multiframe/trait route.
+    // A self-recursive callee routes to the direct `CALL_ASSEMBLER` arm
+    // (`try_walker_call_assembler_self_recursive`, reached when this inline
+    // attempt returns `Ok(None)`) rather than the multiframe inline path.
+    // Multi-parameter all-int calls fold there; other self-recursive shapes
+    // decline from the fold to the plain residual call instead of aborting.
+    // Detected before the multiframe gate: a forward-branch self-recursive
+    // callee is `try_multiframe`-eligible, but unbounded self-recursion bottoms
+    // out the multiframe inline at the depth cap.  A strict-inlinable callee is
+    // a straight-line leaf (no self-recursion), so this never preempts the
+    // strict path.  Gated on `PYRE_FBW_REC_CA`, matching the fold.
     if !strict_inlinable
         && std::env::var_os("PYRE_FBW_REC_CA").as_deref() != Some(std::ffi::OsStr::new("0"))
-        && nparams == 1
+        && nparams >= 1
     {
         let sym_ptr = ctx.fbw_mode.snapshot_sym;
         let self_recursive = !sym_ptr.is_null()
@@ -14278,18 +14292,14 @@ fn try_walker_inline_user_call(
                     as *const ()
             } as usize
                 == w_code as usize;
-        let arg_is_int = matches!(
-            arg_concretes.get(2),
-            Some(ConcreteValue::Ref(a)) if !a.is_null() && unsafe { pyre_object::is_int(*a) }
-        );
         if ctx.fbw_mode.carrier_resume && std::env::var_os("PYRE_P2_DIAG").is_some() {
             eprintln!(
-                "[p2-diag] nested call pc={} self_recursive={self_recursive} arg_is_int={arg_is_int} strict_inlinable={strict_inlinable} recursion_count={}",
+                "[p2-diag] nested call pc={} self_recursive={self_recursive} strict_inlinable={strict_inlinable} recursion_count={}",
                 op.pc,
                 fbw_inline_recursion_count(ctx, callee_code_key)
             );
         }
-        if self_recursive && arg_is_int {
+        if self_recursive {
             // A bridge-carrier resume is the deopt continuation of an
             // already-compiled recursive portal, so a nested self-recursive
             // call folds straight to the recursive-portal `CALL_ASSEMBLER`
@@ -14298,9 +14308,9 @@ fn try_walker_inline_user_call(
             if ctx.fbw_mode.carrier_resume {
                 return Ok(None);
             }
-            // A self-recursive single-int callee folds to the recursive-portal
-            // `CALL_ASSEMBLER` tail (`try_walker_call_assembler_self_recursive`),
-            // reached by returning `Ok(None)` here.
+            // A self-recursive all-int callee folds to the recursive-portal
+            // `CALL_ASSEMBLER` tail.  Other self-recursive shapes decline from
+            // that fold to the plain residual call.
             return Ok(None);
         }
     }
@@ -14336,8 +14346,8 @@ fn try_walker_inline_user_call(
     if !strict_inlinable && !try_multiframe {
         // A non-self-recursive loop/branch callee that neither the strict nor
         // the multiframe fast path can serve declines to the trait leg
-        // (`FBW_DECLINED_KEYS`).  The self-recursive single-int shape was
-        // already routed to the `CALL_ASSEMBLER` arm above (`Ok(None)`).
+        // (`FBW_DECLINED_KEYS`).  Self-recursive calls were already routed to
+        // the `CALL_ASSEMBLER` fold or plain residual path above (`Ok(None)`).
         return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });
     }
 
