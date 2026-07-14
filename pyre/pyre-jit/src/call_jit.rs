@@ -2066,6 +2066,11 @@ pub fn blackhole_resume_via_rd_numb(
                         );
                     }
                 }
+                // A residual helper can publish a raise to both exception
+                // channels.  Blackhole propagation has consumed its own
+                // channel into `ExitFrameWithExceptionRef`; keep the backend
+                // cell in sync before the outer interpreter receives it.
+                drain_backend_jit_exc();
                 return BlackholeResult::ExitFrameWithExceptionRef(err);
             };
             caller_bh.last_opcode_position = caller_bh.position;
