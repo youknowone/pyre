@@ -243,7 +243,6 @@ fn try_commit_midbody_abort(
     let frame = match pyre_interpreter::PyFrame::try_new_for_call_with_closure_and_globals_obj(
         w_code as *const (),
         &[x_arg],
-        std::ptr::null_mut(),
         w_globals,
         ec,
         pyre_object::PY_NULL,

@@ -7,8 +7,8 @@
 
 use std::rc::Rc;
 
+use crate::PyExecutionContext;
 use crate::{CodeFlags, CodeObject};
-use crate::{DictStorage, PyExecutionContext};
 use pyre_object::FixedObjectArray;
 use pyre_object::*;
 
@@ -139,14 +139,12 @@ pub struct PyFrame {
     /// `pypy/interpreter/pyframe.py:49 self.w_globals = w_globals`
     /// — the canonical W_DictObject paired with this frame's globals.
     ///
-    /// **Population**: eagerly resolved at frame construction by calling
-    /// `dict_storage_to_dict(w_globals)` on the raw storage handed to the
-    /// constructor (or threaded through directly by the obj-taking
-    /// constructors), so every reader after construction observes the same
-    /// W_DictObject across the frame's lifetime.  This is the source of
-    /// truth: `get_w_globals()` and `get_w_globals_storage()` both return it
-    /// directly.  Synthetic test stubs that hand-build PyFrame without a real
-    /// globals leave it `PY_NULL`.
+    /// **Population**: threaded through directly by the object-taking
+    /// constructors; storage-only builders use `PY_NULL`.  Every reader after
+    /// construction observes the same value across the frame's lifetime.  This
+    /// is the source of truth: `get_w_globals()` and
+    /// `get_w_globals_storage()` both return it directly.  Synthetic test stubs
+    /// that hand-build PyFrame without a real globals leave it `PY_NULL`.
     pub w_globals: PyObjectRef,
 }
 
@@ -1602,12 +1600,7 @@ impl PyFrame {
 
     /// PyPy-compatible `__init__` hook.
     #[inline]
-    pub fn __init__(
-        &mut self,
-        code: *const (),
-        w_globals_storage: *mut DictStorage,
-        outer_func: PyObjectRef,
-    ) {
+    pub fn __init__(&mut self, code: *const (), outer_func: PyObjectRef) {
         let _ = outer_func;
         let allocation = self.aux_allocation();
         self.pycode = code;
@@ -1640,14 +1633,10 @@ impl PyFrame {
         // w_globals)`.  pyre keeps the picked builtin and the canonical
         // `w_globals` W_DictObject (the `get_w_globals_storage` resolution of
         // `pyframe.py:128-132`) in the adjacent `w_builtin` / `w_globals`
-        // slots, resolved eagerly here exactly as `new_minimal` does, so a
+        // slots.  This storage-only hook carries no globals object, so a
         // frame built through this hook is left in the same state as one
         // built by `createframe`.
-        let w_globals = if w_globals_storage.is_null() {
-            PY_NULL
-        } else {
-            crate::baseobjspace::dict_storage_to_dict(w_globals_storage)
-        };
+        let w_globals = PY_NULL;
         self.w_builtin = crate::baseobjspace::frame_builtin_obj(w_globals, self.execution_context);
         self.w_globals = w_globals;
         // pyframe.py:103 — stamp `pycode.w_globals` (the first-globals cache
@@ -1816,11 +1805,7 @@ impl PyFrame {
 
     /// Create a minimal frame stub for passing to call dispatch.
     /// Used by MIFrame Box tracking when concrete_frame is unavailable.
-    pub fn new_minimal(
-        code: *const (),
-        w_globals_storage: *mut crate::DictStorage,
-        execution_context: *const PyExecutionContext,
-    ) -> Self {
+    pub fn new_minimal(code: *const (), execution_context: *const PyExecutionContext) -> Self {
         let raw =
             unsafe { crate::w_code_get_ptr(code as pyre_object::PyObjectRef) as *const CodeObject };
         let nlocals = unsafe { (&*raw).varnames.len() };
@@ -1828,15 +1813,8 @@ impl PyFrame {
         let size = nlocals + ncells + 16; // small stack
         // `pyframe.py:98 __init__(self, space, code, w_globals, ...)`
         // stores `w_globals` as the canonical W_DictObject directly.
-        // Pyre carries both the raw storage pointer (`w_globals_storage`) and
-        // the W_DictObject (`w_globals`); eager resolution at
-        // frame construction matches PyPy's `self.w_globals = w_globals`
-        // identity invariant without waiting for the first reader.
-        let w_globals = if w_globals_storage.is_null() {
-            PY_NULL
-        } else {
-            crate::baseobjspace::dict_storage_to_dict(w_globals_storage)
-        };
+        // This storage-only builder carries no globals object.
+        let w_globals = PY_NULL;
         let w_builtin = crate::baseobjspace::frame_builtin_obj(w_globals, execution_context);
         // pyframe.py:103 — stamp `pycode.w_globals`; side effect only (the
         // gated debugdata snapshot retired in favour of `w_globals`).
@@ -1940,7 +1918,6 @@ impl PyFrame {
     pub(crate) fn new_with_namespace(
         code: *const (),
         execution_context: *const PyExecutionContext,
-        w_globals_storage: *mut DictStorage,
     ) -> Self {
         let raw =
             unsafe { crate::w_code_get_ptr(code as pyre_object::PyObjectRef) as *const CodeObject };
@@ -1949,14 +1926,8 @@ impl PyFrame {
         let num_cells = ncells(code_ref);
         let max_stack = code_ref.max_stackdepth as usize;
 
-        // `pyframe.py:98 __init__` — `self.w_globals = w_globals` stores
-        // the W_DictObject directly; eager `dict_storage_to_dict`
-        // mirrors the identity invariant on pyre's split layout.
-        let w_globals = if w_globals_storage.is_null() {
-            PY_NULL
-        } else {
-            crate::baseobjspace::dict_storage_to_dict(w_globals_storage)
-        };
+        // This storage-only builder carries no globals object.
+        let w_globals = PY_NULL;
         let w_builtin = crate::baseobjspace::frame_builtin_obj(w_globals, execution_context);
         // pyframe.py:103 — stamp `pycode.w_globals`; side effect only (the
         // gated debugdata snapshot retired in favour of `w_globals`).
@@ -3140,17 +3111,15 @@ impl PyFrame {
 
     /// Create a new frame for a function call.
     ///
-    /// The `globals` pointer is shared from the function object -- no clone.
     /// The `code` pointer is shared from the function object -- no clone.
     /// `closure` is a tuple of cell objects from the enclosing scope,
     /// or PY_NULL if the function has no free variables.
     pub fn new_for_call(
         code: *const (),
         args: &[PyObjectRef],
-        globals: *mut DictStorage,
         execution_context: *const PyExecutionContext,
     ) -> Self {
-        Self::new_for_call_with_closure(code, args, globals, execution_context, PY_NULL)
+        Self::new_for_call_with_closure(code, args, execution_context, PY_NULL)
     }
 
     /// JIT warm-entry frame builder. The only callers are the `call_jit.rs`
@@ -3161,19 +3130,17 @@ impl PyFrame {
     /// trace sets the virtualizable frame fields directly (pyjitpl frame
     /// setup) instead of re-running `__init__` as a residual call, so there is
     /// no fallible `createframe` residual to mirror and `pick_builtin` cannot
-    /// newly raise here — `globals` carries an `__builtins__` already validated
+    /// newly raise here — `w_globals` carries an `__builtins__` already validated
     /// when the interpreter first built the frame.
     pub fn new_for_call_with_globals_obj(
         code: *const (),
         args: &[PyObjectRef],
-        globals: *mut DictStorage,
         w_globals: PyObjectRef,
         execution_context: *const PyExecutionContext,
     ) -> Self {
         Self::new_for_call_with_closure_and_globals_obj(
             code,
             args,
-            globals,
             w_globals,
             execution_context,
             PY_NULL,
@@ -3185,19 +3152,13 @@ impl PyFrame {
     pub fn new_for_call_with_closure(
         code: *const (),
         args: &[PyObjectRef],
-        globals: *mut DictStorage,
         execution_context: *const PyExecutionContext,
         closure: PyObjectRef,
     ) -> Self {
-        let w_globals = if globals.is_null() {
-            PY_NULL
-        } else {
-            crate::baseobjspace::dict_storage_to_dict(globals)
-        };
+        let w_globals = PY_NULL;
         Self::new_for_call_with_closure_and_globals_obj(
             code,
             args,
-            globals,
             w_globals,
             execution_context,
             closure,
@@ -3212,17 +3173,11 @@ impl PyFrame {
     pub fn try_new_for_call_with_closure_and_globals_obj(
         code: *const (),
         args: &[PyObjectRef],
-        globals: *mut DictStorage,
         w_globals: PyObjectRef,
         execution_context: *const PyExecutionContext,
         closure: PyObjectRef,
         allocation: FrameLocalsArrayAllocation,
     ) -> Result<Self, crate::PyError> {
-        let w_globals = if w_globals.is_null() && !globals.is_null() {
-            crate::baseobjspace::dict_storage_to_dict(globals)
-        } else {
-            w_globals
-        };
         let w_builtin =
             crate::baseobjspace::frame_builtin_obj_checked(w_globals, execution_context)?;
         Ok(Self::finish_for_call_with_globals_obj(
@@ -3237,10 +3192,7 @@ impl PyFrame {
     }
 
     /// PyPy `space.createframe(code, function.w_func_globals, function)`.
-    /// The semantic globals carrier is the dict object.  `globals` is kept
-    /// only as pyre's legacy raw-storage side channel for code paths that
-    /// have not yet migrated off `PyFrame.w_globals`.
-    ///
+    /// The semantic globals carrier is the dict object.
     /// Infallible sibling of `try_new_for_call_with_closure_and_globals_obj`.
     /// All interpreter and tracer entry points use the `try_` variant; this
     /// one survives only for the JIT warm-entry path via
@@ -3250,17 +3202,11 @@ impl PyFrame {
     pub fn new_for_call_with_closure_and_globals_obj(
         code: *const (),
         args: &[PyObjectRef],
-        globals: *mut DictStorage,
         w_globals: PyObjectRef,
         execution_context: *const PyExecutionContext,
         closure: PyObjectRef,
         allocation: FrameLocalsArrayAllocation,
     ) -> Self {
-        let w_globals = if w_globals.is_null() && !globals.is_null() {
-            crate::baseobjspace::dict_storage_to_dict(globals)
-        } else {
-            w_globals
-        };
         let w_builtin = crate::baseobjspace::frame_builtin_obj(w_globals, execution_context);
         Self::finish_for_call_with_globals_obj(
             code,
@@ -3577,24 +3523,16 @@ fn pyobject_from_constant(constant: &crate::bytecode::ConstantData) -> PyObjectR
 /// `init_cells()`.
 ///
 /// # Safety
-/// `code`, `w_globals`, and `execution_context` must be valid pointers
+/// `code` and `execution_context` must be valid pointers
 /// for the duration the returned `Box<PyFrame>` is alive.  `outer_func`,
 /// when `Some`, must be a valid Function `PyObjectRef`.
 pub fn createframe(
     code: *const (),
-    w_globals: *mut DictStorage,
     execution_context: *const PyExecutionContext,
     outer_func: Option<PyObjectRef>,
 ) -> Result<FrameBox, crate::PyError> {
-    // Legacy raw-storage entry: resolve the canonical W_DictObject sibling
-    // and delegate to `createframe_obj`.  `dict_storage_to_dict` and
-    // `w_dict_get_dict_storage_proxy` are mutual inverses under the
-    // `mirror_target` invariant, so the round-trip preserves identity.
-    let w_globals = if w_globals.is_null() {
-        PY_NULL
-    } else {
-        crate::baseobjspace::dict_storage_to_dict(w_globals)
-    };
+    // Storage-only entry: there is no globals object to forward.
+    let w_globals = PY_NULL;
     createframe_obj(code, w_globals, execution_context, outer_func)
 }
 

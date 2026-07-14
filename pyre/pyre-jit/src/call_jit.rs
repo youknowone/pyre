@@ -628,11 +628,7 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
             as *const *const pyre_interpreter::PyExecutionContext);
         (code, w_globals, ec)
     };
-    // Raw storage is recovered from `w_globals` by the frame builder.
-    let namespace = std::ptr::null_mut();
-
-    let mut func_frame =
-        PyFrame::new_for_call_with_globals_obj(code, &[], namespace, w_globals, exec_ctx);
+    let mut func_frame = PyFrame::new_for_call_with_globals_obj(code, &[], w_globals, exec_ctx);
     func_frame.fix_array_ptrs();
 
     // warmspot.py:1021-1028 assembler_call_helper:
@@ -3296,8 +3292,6 @@ fn create_callee_frame_impl_1_boxed(
 ) -> i64 {
     let w_code = unsafe { pyre_interpreter::getcode(callable) };
     let caller = unsafe { &*(caller_frame as *const PyFrame) };
-    // Raw storage is recovered from `w_globals` by the frame builder.
-    let globals = std::ptr::null_mut();
     let w_globals = unsafe { function_get_globals_obj(callable) };
     let one_arg = [boxed_arg];
     let args = fill_positional_defaults_for_jit_call(callable, w_code, &one_arg);
@@ -3323,7 +3317,6 @@ fn create_callee_frame_impl_1_boxed(
                         PyFrame::new_for_call_with_globals_obj(
                             w_code,
                             args,
-                            globals,
                             w_globals,
                             caller.execution_context,
                         ),
@@ -3338,7 +3331,6 @@ fn create_callee_frame_impl_1_boxed(
                     PyFrame::new_for_call_with_globals_obj(
                         w_code,
                         args,
-                        globals,
                         w_globals,
                         caller.execution_context,
                     ),
@@ -3354,7 +3346,6 @@ fn create_callee_frame_impl_1_boxed(
     let frame_ptr = heap_alloc_frame(PyFrame::new_for_call_with_globals_obj(
         w_code,
         args,
-        globals,
         w_globals,
         caller.execution_context,
     ));
@@ -3369,8 +3360,6 @@ fn create_self_recursive_callee_frame_impl_1_boxed(
     let caller = unsafe { &*(caller_frame as *const PyFrame) };
     let func_code = caller.pycode;
     let w_globals = caller.w_globals;
-    // Raw storage is recovered from `w_globals` by the frame builder.
-    let globals = std::ptr::null_mut();
     let execution_context = caller.execution_context;
 
     let arena = arena_ref();
@@ -3393,7 +3382,6 @@ fn create_self_recursive_callee_frame_impl_1_boxed(
                         PyFrame::new_for_call_with_globals_obj(
                             func_code,
                             &[boxed_arg],
-                            globals,
                             w_globals,
                             execution_context,
                         ),
@@ -3408,7 +3396,6 @@ fn create_self_recursive_callee_frame_impl_1_boxed(
                     PyFrame::new_for_call_with_globals_obj(
                         func_code,
                         &[boxed_arg],
-                        globals,
                         w_globals,
                         execution_context,
                     ),
@@ -3431,7 +3418,6 @@ fn create_self_recursive_callee_frame_impl_1_boxed(
     let frame_ptr = heap_alloc_frame(PyFrame::new_for_call_with_globals_obj(
         func_code,
         &[boxed_arg],
-        globals,
         w_globals,
         execution_context,
     ));
@@ -3450,8 +3436,6 @@ fn create_callee_frame_impl(caller_frame: i64, callable: i64, args: &[PyObjectRe
     let callable = callable as PyObjectRef;
     let w_code = unsafe { pyre_interpreter::getcode(callable) };
     let caller = unsafe { &*(caller_frame as *const PyFrame) };
-    // Raw storage is recovered from `w_globals` by the frame builder.
-    let globals = std::ptr::null_mut();
     let w_globals = unsafe { function_get_globals_obj(callable) };
     let args = fill_positional_defaults_for_jit_call(callable, w_code, args);
     let args = args.as_ref();
@@ -3477,7 +3461,6 @@ fn create_callee_frame_impl(caller_frame: i64, callable: i64, args: &[PyObjectRe
                         PyFrame::new_for_call_with_globals_obj(
                             w_code,
                             args,
-                            globals,
                             w_globals,
                             caller.execution_context,
                         ),
@@ -3493,7 +3476,6 @@ fn create_callee_frame_impl(caller_frame: i64, callable: i64, args: &[PyObjectRe
                     PyFrame::new_for_call_with_globals_obj(
                         w_code,
                         args,
-                        globals,
                         w_globals,
                         caller.execution_context,
                     ),
@@ -3510,7 +3492,6 @@ fn create_callee_frame_impl(caller_frame: i64, callable: i64, args: &[PyObjectRe
     let frame_ptr = heap_alloc_frame(PyFrame::new_for_call_with_globals_obj(
         w_code,
         args,
-        globals,
         w_globals,
         caller.execution_context,
     ));
@@ -3564,8 +3545,6 @@ pub extern "C" fn jit_create_self_recursive_callee_frame_1_raw_int(
     let caller = unsafe { &*(caller_frame as *const PyFrame) };
     let func_code = caller.pycode;
     let w_globals = caller.w_globals;
-    // Raw storage is recovered from `w_globals` by the frame builder.
-    let globals = std::ptr::null_mut();
     let execution_context = caller.execution_context;
 
     let boxed = pyre_object::intobject::w_int_new(raw_int_arg);
@@ -3590,7 +3569,6 @@ pub extern "C" fn jit_create_self_recursive_callee_frame_1_raw_int(
                     PyFrame::new_for_call_with_globals_obj(
                         func_code,
                         &[boxed],
-                        globals,
                         w_globals,
                         execution_context,
                     ),
@@ -3619,7 +3597,6 @@ pub extern "C" fn jit_create_self_recursive_callee_frame_1_raw_int(
     let frame_ptr = heap_alloc_frame(PyFrame::new_for_call_with_globals_obj(
         func_code,
         &[boxed],
-        globals,
         w_globals,
         execution_context,
     ));

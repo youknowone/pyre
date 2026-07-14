@@ -6479,8 +6479,6 @@ impl MIFrame {
         let caller_exec_ctx = self.sym().concrete_execution_context;
         let caller_namespace_ptr = self.sym().concrete_namespace;
         let w_code = unsafe { pyre_interpreter::getcode(concrete_callable) };
-        // Raw storage is recovered from `callee_globals_obj` by the frame builder.
-        let globals = std::ptr::null_mut();
         let callee_globals_obj = unsafe { function_get_globals_obj(concrete_callable) };
         let closure = unsafe { pyre_interpreter::function_get_closure(concrete_callable) };
         // pyjitpl.py:1396-1401 element-wise greenkey — `(code_ptr, 0)`
@@ -6497,7 +6495,6 @@ impl MIFrame {
         let mut callee_frame = PyFrame::try_new_for_call_with_closure_and_globals_obj(
             w_code,
             concrete_args,
-            globals,
             callee_globals_obj,
             caller_exec_ctx,
             closure,

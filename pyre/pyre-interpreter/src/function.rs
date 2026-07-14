@@ -2296,7 +2296,6 @@ fn _flat_pycall(
         match crate::pyframe::PyFrame::try_new_for_call_with_closure_and_globals_obj(
             code,
             &[], // locals filled below directly from stack
-            std::ptr::null_mut(),
             w_globals,
             frame.execution_context,
             closure,
@@ -2368,7 +2367,6 @@ fn _flat_pycall_defaults(
         match crate::pyframe::PyFrame::try_new_for_call_with_closure_and_globals_obj(
             code,
             &[], // locals filled below
-            std::ptr::null_mut(),
             w_globals,
             frame.execution_context,
             closure,

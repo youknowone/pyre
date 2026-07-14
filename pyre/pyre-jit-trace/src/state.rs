@@ -12864,13 +12864,10 @@ pub(crate) fn assemble_bridge_inline_pending(
     // `locals_cells_stack_w[0..valuestackdepth]` from the decoded boxes. The
     // callee has no cells/freevars (gated in `reconstruct_inline_recipe`), so
     // `closure = PY_NULL` and the array layout is `[locals | stack]` with
-    // `stack_base() == nlocals`. The builder re-derives the storage proxy from
-    // the (non-null) globals object, so the raw `globals` arg is unused — pass
-    // null rather than reading the off-GC `code.w_globals` proxy.
+    // `stack_base() == nlocals`.
     let mut concrete_frame = PyFrame::new_for_call_with_closure_and_globals_obj(
         w_code,
         &[],
-        std::ptr::null_mut(),
         w_globals,
         execution_context,
         pyre_object::PY_NULL,
