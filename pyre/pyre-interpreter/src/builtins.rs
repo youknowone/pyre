@@ -2586,8 +2586,8 @@ pub fn builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         }
     }
     Err(crate::PyError::type_error(format!(
-        "bad operand type for abs(): '{}'",
-        unsafe { (*(*obj).ob_type).name }
+        "unsupported operand type for unary abs: '{}'",
+        crate::baseobjspace::object_functionstr_type_name(obj)
     )))
 }
 
