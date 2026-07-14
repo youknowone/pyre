@@ -3219,6 +3219,18 @@ fn build_class_inner(
     // the `debugdata.w_locals` walk in `walk_pyframe_roots`.
     frame.run_with_jit()?;
 
+    // A minor collection during the body (a hot class-level loop compiles
+    // and runs through the JIT portal) can promote the namespace young ->
+    // old, relocating it.  The frame's `debugdata.w_locals` slot and the
+    // shadow-stack pin are forwarded, keeping the object alive at its new
+    // address, but this stack-local `body_ns` copy is not — it is left
+    // pointing at the freed nursery slot.  Re-read the forwarded object
+    // from the frame before any downstream use; a stale read would
+    // dereference reclaimed memory (`resolve_dict_backing` / `w_dict_items`
+    // below, then `__set_name__`).
+    let body_ns = frame.get_w_locals();
+    let mapping_namespace = mapping_namespace.map(|_| body_ns);
+
     // The body wrote through `body_ns`; mirror its final contents into
     // class_ns for the downstream type construction (classcell capture,
     // create_all_slots, __set_name__), which read class_ns.
