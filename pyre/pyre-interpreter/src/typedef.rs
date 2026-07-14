@@ -13854,10 +13854,7 @@ fn init_set_type(ns: &mut DictStorage) {
                 }
                 let removed = unsafe { pyre_object::w_set_discard(args[0], args[1]) };
                 if !removed {
-                    return Err(crate::PyError::new(
-                        crate::PyErrorKind::KeyError,
-                        "set.remove(x): x not in set",
-                    ));
+                    return Err(crate::PyError::key_error_with_key(args[1]));
                 }
                 Ok(pyre_object::w_none())
             },

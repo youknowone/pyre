@@ -7266,9 +7266,10 @@ fn builtin_ord(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             return Ok(w_int_new(data[0] as i64));
         }
     }
-    Err(crate::PyError::type_error(
-        "ord() expected string of length 1, but other type found",
-    ))
+    Err(crate::PyError::type_error(format!(
+        "ord() expected string of length 1, but {} found",
+        crate::baseobjspace::object_functionstr_type_name(obj)
+    )))
 }
 
 /// `chr(i)` — PyPy: operation.py chr
