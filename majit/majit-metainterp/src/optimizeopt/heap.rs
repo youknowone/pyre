@@ -1742,7 +1742,13 @@ impl OptHeap {
                 if flush_owners.contains(&owner) {
                     return;
                 }
-                let allocated_here = self.seen_allocation.contains(owner.raw() as usize);
+                // `seen_allocation` is keyed by real SSA-op positions.  A
+                // forwarded lazy-store owner may instead be an inline Const
+                // (`ConstPtr` after a raising/non-raising path merge); like
+                // RPython's Const box it cannot be a trace allocation, and
+                // it has no raw position to query.
+                let allocated_here =
+                    !owner.is_constant() && self.seen_allocation.contains(owner.raw() as usize);
                 let escaped = ctx
                     .get_box_replacement_operand_opt(owner)
                     .as_ref()
