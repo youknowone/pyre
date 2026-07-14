@@ -430,11 +430,6 @@ pub fn install_signal_handling(ec: &mut ExecutionContext) {
     // ticker negative (rsignal.py:31-32 `pypysig_getaddr_occurred`).
     let ticker_addr = ec.actionflag.ticker_addr();
     signalstate::register_ticker(ticker_addr);
-    // Publish the same cell to the JIT backends so a compiled loop's
-    // `GuardEvalBreaker` polls it at the back-edge and deopts when it goes
-    // negative, delivering async actions to JIT-compiled loops
-    // (`CHECK_EVAL_BREAKER`).
-    majit_ir::eval_breaker::set_ticker_addr(ticker_addr as usize);
 
     // app_main.py:926 — `signal.signal(SIGINT, default_int_handler)`.
     #[cfg(unix)]

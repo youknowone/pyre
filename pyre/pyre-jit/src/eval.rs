@@ -2557,6 +2557,7 @@ fn build_gc_global() {
     }
     let gc = build_gc();
     majit_gc::gc_sync::store_singleton(gc);
+    majit_ir::eval_breaker_word::publish_addr();
 }
 
 /// Test-support: give the calling `gc_stress` worker a pristine GC heap by
@@ -4512,6 +4513,12 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         // here. A no-op unless the flag is on and enough interpreter objects
         // have accumulated to warrant a collection.
         pyre_object::gc_interp::safepoint();
+
+        // Stop-the-world safepoint: a compiled loop's back-edge poll deopts
+        // here when a collector has requested STW; park until it completes.
+        // Between opcodes no bytecode handler holds a Rust-stack ref (see the
+        // note above), so this is a walkable safepoint.
+        majit_gc::gc_sync::safepoint_poll();
 
         if frame_root.frame().next_instr() >= code.instructions.len() {
             return LoopResult::Done(Ok(w_none()));

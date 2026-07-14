@@ -490,6 +490,7 @@ pub fn quiesce_mutators() -> StwGuard {
 
     let mut state = GC_SYNC.quiesce.lock().unwrap();
     GC_SYNC.stw_requested.store(true, Ordering::Release);
+    majit_ir::eval_breaker_word::set_stw();
 
     let collector_is_running =
         GC_THREAD.with(|t| t.registered.get()) && GC_THREAD.with(|t| t.running.get());
@@ -530,6 +531,7 @@ impl Drop for StwGuard {
 
         let _state = GC_SYNC.quiesce.lock().unwrap();
         GC_SYNC.stw_requested.store(false, Ordering::Release);
+        majit_ir::eval_breaker_word::clear_stw();
         GC_SYNC.stw_generation.fetch_add(1, Ordering::Release);
         GC_SYNC.resumed.notify_all();
     }
@@ -599,7 +601,8 @@ mod tests {
     use crate::trace::TypeInfo;
     use std::cell::UnsafeCell;
     use std::sync::atomic::AtomicUsize;
-    use std::sync::{Arc, Barrier};
+    use std::sync::{Arc, Barrier, mpsc};
+    use std::time::Duration;
 
     struct GcOpCounter(UnsafeCell<usize>);
 
@@ -624,6 +627,12 @@ mod tests {
         unregister_thread();
     }
 
+    fn load_eval_breaker_word() -> usize {
+        let addr = majit_ir::eval_breaker_word::eval_breaker_word_addr();
+        assert_ne!(addr, 0);
+        unsafe { &*(addr as *const AtomicUsize) }.load(Ordering::Relaxed)
+    }
+
     #[test]
     fn gc_op_basic() {
         ensure_gc();
@@ -631,6 +640,61 @@ mod tests {
         let result = gc_op(|gc| gc.nursery_free());
         assert!(!result.is_null());
         unregister_test_mutator();
+    }
+
+    #[test]
+    fn eval_breaker_word_parks_and_resumes_mutator() {
+        majit_ir::eval_breaker_word::clear_async();
+        majit_ir::eval_breaker_word::clear_stw();
+        majit_ir::eval_breaker_word::publish_addr();
+
+        let observed_poll = Arc::new(AtomicBool::new(false));
+        let worker_observed_poll = observed_poll.clone();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (resumed_tx, resumed_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            register_thread();
+            ready_tx.send(()).unwrap();
+            while load_eval_breaker_word() & majit_ir::eval_breaker_word::EB_STW == 0 {
+                std::hint::spin_loop();
+            }
+            worker_observed_poll.store(true, Ordering::Release);
+            safepoint_poll();
+            assert_eq!(
+                load_eval_breaker_word() & majit_ir::eval_breaker_word::EB_STW,
+                0,
+                "the resumed mutator must observe bit1 cleared"
+            );
+            resumed_tx.send(()).unwrap();
+            unregister_thread();
+        });
+
+        ready_rx.recv().unwrap();
+        let stw = quiesce_mutators();
+        assert!(
+            observed_poll.load(Ordering::Acquire),
+            "the bitmask poll must lead the worker into the park gate"
+        );
+        assert_ne!(
+            load_eval_breaker_word() & majit_ir::eval_breaker_word::EB_STW,
+            0,
+            "bit1 must remain armed throughout the STW episode"
+        );
+        drop(stw);
+        assert_eq!(
+            load_eval_breaker_word() & majit_ir::eval_breaker_word::EB_STW,
+            0,
+            "bit1 must balance to zero before mutators resume"
+        );
+        resumed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the parked mutator must resume cleanly");
+        worker.join().unwrap();
+        assert_eq!(
+            load_eval_breaker_word(),
+            0,
+            "the eval-breaker word must be balanced after the STW episode"
+        );
     }
 
     #[test]

@@ -6,6 +6,9 @@ license.workspace = true
 repository.workspace = true
 description = "Dynasm code generation backend for majit JIT compiler"
 
+[features]
+dynasm = []
+
 [dependencies]
 majit-ir = { workspace = true }
 majit-backend = { workspace = true }

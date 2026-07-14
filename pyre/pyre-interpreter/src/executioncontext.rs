@@ -1966,6 +1966,13 @@ impl ActionFlagOps for ActionFlag {
     /// `p.c_value = value`.
     fn reset_ticker(&mut self, value: isize) {
         self._ticker = value;
+        // A negative reset arms the async-pending bit; any non-negative
+        // reset is the dispatch clear.
+        if value < 0 {
+            majit_ir::eval_breaker_word::set_async();
+        } else {
+            majit_ir::eval_breaker_word::clear_async();
+        }
     }
 
     /// interp_signal.py:42-51 `SignalActionFlag.decrement_ticker`.
@@ -1990,6 +1997,11 @@ impl ActionFlagOps for ActionFlag {
     fn decrement_ticker(&mut self, by: isize) -> isize {
         if self.base.has_bytecode_counter {
             self._ticker -= by;
+            // This path bypasses reset_ticker, so mirror a future periodic
+            // decrement that crosses negative.
+            if self._ticker < 0 {
+                majit_ir::eval_breaker_word::set_async();
+            }
         }
         self._ticker
     }

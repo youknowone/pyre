@@ -10366,30 +10366,27 @@ impl CraneliftBackend {
                 }
 
                 OpCode::GuardEvalBreaker => {
-                    // Back-edge eval-breaker poll: load the async-action ticker
-                    // cell (baked address) and side-exit when it is negative (a
-                    // pending signal / async action). `0` = no ticker published
-                    // (signal handling not installed) → inert guard.
                     let info = &guard_infos[guard_idx];
                     guard_idx += 1;
 
-                    let ticker_addr = majit_ir::eval_breaker::ticker_addr();
-                    if ticker_addr != 0 {
-                        let addr_val = builder.ins().iconst(cl_types::I64, ticker_addr as i64);
-                        let flags = MemFlags::trusted();
-                        let ticker = builder.ins().load(cl_types::I64, flags, addr_val, 0);
+                    let bitmask_addr = majit_ir::eval_breaker_word::eval_breaker_word_addr();
+                    if bitmask_addr != 0 {
+                        let addr = builder.ins().iconst(cl_types::I64, bitmask_addr as i64);
+                        let word = builder
+                            .ins()
+                            .load(cl_types::I64, MemFlags::trusted(), addr, 0);
                         let zero = builder.ins().iconst(cl_types::I64, 0);
-                        let is_pending = builder.ins().icmp(IntCC::SignedLessThan, ticker, zero);
+                        let cond = builder.ins().icmp(IntCC::NotEqual, word, zero);
 
+                        // Both back-edge reasons share this one guard exit and
+                        // its existing resume snapshot.
                         let exit_block = builder.create_block();
                         builder.set_cold_block(exit_block);
                         let cont_block = builder.create_block();
                         if preamble_phase {
                             builder.set_cold_block(cont_block);
                         }
-                        builder
-                            .ins()
-                            .brif(is_pending, exit_block, &[], cont_block, &[]);
+                        builder.ins().brif(cond, exit_block, &[], cont_block, &[]);
 
                         builder.switch_to_block(exit_block);
                         builder.seal_block(exit_block);
@@ -17116,12 +17113,49 @@ mod tests {
     use majit_ir::descr::{Descr, EffectInfo, ExtraEffect, SizeDescr};
     use majit_ir::operand::Operand;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct ClearEvalBreakerAddrOverride;
+
+    impl Drop for ClearEvalBreakerAddrOverride {
+        fn drop(&mut self) {
+            majit_ir::eval_breaker_word::set_addr_override_for_test(0);
+        }
+    }
 
     fn mk_op(opcode: OpCode, args: &[OpRef], pos: u32) -> majit_ir::OpRc {
         let bx: Vec<Operand> = args.iter().map(|a| rb(*a)).collect();
         let o = Op::new(opcode, &bx);
         o.pos.set(OpRef::op_typed(pos, opcode.result_type()));
         std::rc::Rc::new(o)
+    }
+
+    fn compile_eval_breaker_guard_trace(trace_id: u64) -> (CraneliftBackend, JitCellToken) {
+        let mut backend = CraneliftBackend::new();
+        let guard = Op::new(OpCode::GuardEvalBreaker, &[]);
+        guard.pos.set(OpRef::void_op(0));
+        guard.set_fail_arg_types(vec![]);
+        guard.setfailargs(vec![].into());
+        let finish = Op::new(OpCode::Finish, &[]);
+        finish.pos.set(OpRef::void_op(1));
+        finish.set_fail_arg_types(vec![]);
+        finish.setfailargs(vec![].into());
+        let ops = vec![std::rc::Rc::new(guard), std::rc::Rc::new(finish)];
+        let mut token = JitCellToken::new(trace_id);
+        backend
+            .compile_loop(&[], &ops, &mut token)
+            .expect("compile GuardEvalBreaker");
+        (backend, token)
+    }
+
+    fn assert_inert_eval_breaker_guard() {
+        majit_ir::eval_breaker_word::set_addr_override_for_test(0);
+        let (backend, token) = compile_eval_breaker_guard_trace(517);
+        let frame = backend.execute_token(&token, &[]);
+        assert!(
+            backend.get_latest_descr(&frame).is_finish(),
+            "an unpublished bitmask address must leave the guard inert"
+        );
     }
 
     use majit_ir::forwarding::bound_operand_from_opref as rb;
@@ -24702,6 +24736,74 @@ mod tests {
             result.is_ok(),
             "representative trace should compile: {:?}",
             result.err()
+        );
+    }
+
+    #[test]
+    fn guard_eval_breaker_deopts_when_bitmask_set() {
+        assert_inert_eval_breaker_guard();
+
+        let test_word = AtomicUsize::new(0);
+        majit_ir::eval_breaker_word::set_addr_override_for_test(
+            &test_word as *const AtomicUsize as usize,
+        );
+        let _clear_override = ClearEvalBreakerAddrOverride;
+
+        let (backend, token) = compile_eval_breaker_guard_trace(518);
+        let frame = backend.execute_token(&token, &[]);
+        assert!(
+            backend.get_latest_descr(&frame).is_finish(),
+            "a zero eval-breaker word must stay on the guard fast path"
+        );
+
+        test_word.fetch_or(majit_ir::eval_breaker_word::EB_STW, Ordering::Relaxed);
+        assert_ne!(
+            test_word.load(Ordering::Relaxed) & majit_ir::eval_breaker_word::EB_STW,
+            0
+        );
+        let frame = backend.execute_token(&token, &[]);
+        assert!(
+            !backend.get_latest_descr(&frame).is_finish(),
+            "the STW bit must use the existing guard-failure exit"
+        );
+        test_word.fetch_and(!majit_ir::eval_breaker_word::EB_STW, Ordering::Relaxed);
+
+        let (backend_after_clear, token_after_clear) = compile_eval_breaker_guard_trace(519);
+        let frame = backend_after_clear.execute_token(&token_after_clear, &[]);
+        assert!(
+            backend_after_clear.get_latest_descr(&frame).is_finish(),
+            "a freshly compiled trace must pass after the STW bit clears"
+        );
+
+        test_word.fetch_or(majit_ir::eval_breaker_word::EB_ASYNC, Ordering::Relaxed);
+        let frame = backend_after_clear.execute_token(&token_after_clear, &[]);
+        assert!(
+            !backend_after_clear.get_latest_descr(&frame).is_finish(),
+            "the async bit must use the same guard-failure exit"
+        );
+    }
+
+    #[test]
+    fn guard_eval_breaker_cross_trace_inherits_bitmask() {
+        let test_word = AtomicUsize::new(0);
+        majit_ir::eval_breaker_word::set_addr_override_for_test(
+            &test_word as *const AtomicUsize as usize,
+        );
+        let _clear_override = ClearEvalBreakerAddrOverride;
+
+        let (backend_a, token_a) = compile_eval_breaker_guard_trace(520);
+        test_word.fetch_or(majit_ir::eval_breaker_word::EB_ASYNC, Ordering::Relaxed);
+        let (backend_b, token_b) = compile_eval_breaker_guard_trace(521);
+
+        let frame_a = backend_a.execute_token(&token_a, &[]);
+        assert!(
+            !backend_a.get_latest_descr(&frame_a).is_finish(),
+            "the first trace must observe the stable test-local word"
+        );
+        let frame_b = backend_b.execute_token(&token_b, &[]);
+        assert!(
+            !backend_b.get_latest_descr(&frame_b).is_finish(),
+            "a trace compiled after arming must bake the same test-local word address"
         );
     }
 }

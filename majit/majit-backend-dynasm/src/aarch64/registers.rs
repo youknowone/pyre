@@ -31,6 +31,11 @@ pub const X21: RegLoc = RegLoc::new(21, false);
 pub const X22: RegLoc = RegLoc::new(22, false);
 pub const X23: RegLoc = RegLoc::new(23, false);
 pub const X24: RegLoc = RegLoc::new(24, false);
+/// Callee-saved register reserved to hold the process-global eval-breaker-word
+/// address for the whole trace, so the back-edge poll loads the word without
+/// re-materialising the 64-bit address each iteration. Kept OUT of ALL_REGS;
+/// saved/restored by the trace prologue/epilogue.
+pub const BITMASK_ADDR_REG: RegLoc = X24;
 pub const X25: RegLoc = RegLoc::new(25, false);
 pub const X26: RegLoc = RegLoc::new(26, false);
 pub const X27: RegLoc = RegLoc::new(27, false);
@@ -141,3 +146,18 @@ pub const CALLEE_RESP: [RegLoc; 4] = CALLEE_SAVED_REGISTERS;
 
 /// registers.py:36 `caller_resp = argument_regs + [x8, x9, x10, x11, x12, x13]`
 pub const CALLER_RESP: [RegLoc; 14] = [X0, X1, X2, X3, X4, X5, X6, X7, X8, X9, X10, X11, X12, X13];
+
+#[cfg(test)]
+mod tests {
+    use super::{ALL_REGS, BITMASK_ADDR_REG};
+
+    #[test]
+    fn bitmask_addr_reg_is_reserved_x24() {
+        assert_eq!(BITMASK_ADDR_REG.value, 24);
+        assert!(
+            !ALL_REGS
+                .iter()
+                .any(|reg| reg.value == BITMASK_ADDR_REG.value)
+        );
+    }
+}

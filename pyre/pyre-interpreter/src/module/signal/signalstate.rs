@@ -64,6 +64,10 @@ fn rearm_ticker() {
     if !p.is_null() {
         unsafe { std::ptr::write_volatile(p, -1) };
     }
+    // The signal handler also arms the JIT back-edge trigger. This runs even
+    // before a ticker address is registered because compiled loops poll the
+    // process-global word directly.
+    majit_ir::eval_breaker_word::set_async();
 }
 
 // ── pending-signal bitmask (signals.c pypysig_pushback / pypysig_poll) ──
@@ -226,6 +230,60 @@ pub fn pypysig_ignore(signum: i32) -> bool {
 /// unix target pyre builds for.
 #[cfg(unix)]
 pub fn pypysig_reinstall(_signum: i32) {}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::executioncontext::{ActionFlag, ActionFlagOps};
+
+    struct ResetSignalState;
+
+    impl Drop for ResetSignalState {
+        fn drop(&mut self) {
+            register_ticker(std::ptr::null_mut());
+            pypysig_default(libc::SIGINT);
+            while signal_poll() >= 0 {}
+            majit_ir::eval_breaker_word::clear_async();
+        }
+    }
+
+    fn load_eval_breaker_word() -> usize {
+        let addr = majit_ir::eval_breaker_word::eval_breaker_word_addr();
+        assert_ne!(addr, 0);
+        unsafe { &*(addr as *const AtomicUsize) }.load(Ordering::Relaxed)
+    }
+
+    #[test]
+    fn signal_during_warmup_sets_async_bit() {
+        let _reset = ResetSignalState;
+        let mut actionflag = ActionFlag::new();
+        actionflag.reset_ticker(0);
+        register_ticker(actionflag.ticker_addr());
+        majit_ir::eval_breaker_word::publish_addr();
+
+        assert!(pypysig_setflag(libc::SIGINT));
+        assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0);
+        assert!(actionflag.get_ticker() < 0);
+        assert_ne!(
+            load_eval_breaker_word() & majit_ir::eval_breaker_word::EB_ASYNC,
+            0,
+            "the real signal handler must arm bit0"
+        );
+        assert_eq!(signal_poll(), libc::SIGINT);
+
+        actionflag
+            .action_dispatcher(std::ptr::null_mut(), std::ptr::null_mut())
+            .unwrap();
+        assert!(actionflag.get_ticker() >= 0);
+        assert_eq!(
+            load_eval_breaker_word() & majit_ir::eval_breaker_word::EB_ASYNC,
+            0,
+            "dispatch must clear bit0 with the non-negative ticker reset"
+        );
+    }
+}
 
 // ── interpreter-thread signal routing ──
 //
