@@ -3357,6 +3357,13 @@ fn build_class_inner(
     };
     // Create class via metaclass or default type()
     // PyPy: typeobject.py — metaclass(name, bases, dict_w) or type.__new__
+    // Keep the default path's fresh managed namespace rooted until slot
+    // creation, __set_name__, and classcell binding have all completed.
+    let _dict_root = if w_metaclass.is_none() {
+        Some(pyre_object::gc_roots::push_roots())
+    } else {
+        None
+    };
     let w_type = if let Some(w_metaclass) = w_metaclass {
         // Convert class namespace to a dict for metaclass call.
         // If __prepare__ returned a custom dict, replay stores into it
@@ -3463,12 +3470,26 @@ fn build_class_inner(
             class_ns.remove("__classdictcell__");
             crate::builtins::type_new_wrap_special_methods(class_ns);
         }
-        let w = pyre_object::w_type_new(name, w_effective_bases, class_ns_ptr as *mut u8);
-        // typeobject.py:1143-1204 create_all_slots parity.
-        unsafe {
-            let ns = &*class_ns_ptr;
-            create_all_slots(w, ns, w_effective_bases)?;
+        let dict_root = pyre_object::gc_roots::shadow_stack_len();
+        let dict_obj = pyre_object::w_dict_new();
+        pyre_object::gc_roots::pin_root(dict_obj);
+        for (key, &value) in unsafe { (*class_ns_ptr).entries_wtf8() } {
+            if value.is_null() {
+                continue;
+            }
+            let dict_obj = pyre_object::gc_roots::shadow_stack_get(dict_root);
+            match key.as_str() {
+                Ok(s) => unsafe { pyre_object::w_dict_setitem_str_no_proxy(dict_obj, s, value) },
+                Err(_) => unsafe {
+                    pyre_object::w_dict_setitem_wtf8_no_proxy(dict_obj, key, value)
+                },
+            }
         }
+        let dict_obj = pyre_object::gc_roots::shadow_stack_get(dict_root);
+        drop(unsafe { Box::from_raw(class_ns_ptr) });
+        let w = pyre_object::w_type_new(name, w_effective_bases, dict_obj as *mut u8);
+        // typeobject.py:1143-1204 create_all_slots parity.
+        unsafe { create_all_slots(w, w_effective_bases)? };
         // baseobjspace.py:76 — set w_class to 'type' (default metaclass)
         unsafe {
             (*w).w_class = crate::typedef::w_type();
@@ -3486,12 +3507,10 @@ fn build_class_inner(
         // which handles __set_name__ in builtins.rs, so we must NOT call it
         // again there to avoid double invocation.
         if unsafe { pyre_object::is_type(w) } {
-            let ns = unsafe { &*class_ns_ptr };
-            let entries: Vec<(String, PyObjectRef)> =
-                ns.entries().map(|(k, &v)| (k.to_string(), v)).collect();
-            for (attr_name, value) in entries {
-                if !value.is_null() {
-                    let w_name = pyre_object::w_str_new(&attr_name);
+            let dict_obj = pyre_object::gc_roots::shadow_stack_get(dict_root);
+            let entries = unsafe { pyre_object::w_dict_items(dict_obj) };
+            for (w_name, value) in entries {
+                if !value.is_null() && unsafe { pyre_object::is_str(w_name) } {
                     unsafe { crate::baseobjspace::set_name(w, w_name, value) }?;
                 }
             }
@@ -3846,7 +3865,6 @@ unsafe fn copy_flags_from_bases(
 /// `w_type` must be a valid W_TypeObject pointer.
 pub unsafe fn create_all_slots(
     w_type: pyre_object::PyObjectRef,
-    ns: &crate::DictStorage,
     w_bases: pyre_object::PyObjectRef,
 ) -> Result<(), crate::PyError> {
     unsafe {
@@ -3864,7 +3882,7 @@ pub unsafe fn create_all_slots(
         // `abc.Mapping` / `abc.Sequence` match `case {..}` / `case [..]`. The
         // bit lives only in the defining body's namespace, so subclasses pick
         // it up through `inherit_flag_map_or_seq` above rather than re-reading.
-        if let Some(&w_flags) = ns.get("__abc_tpflags__") {
+        if let Some(w_flags) = crate::type_dict_lookup(w_type, "__abc_tpflags__") {
             if pyre_object::is_int(w_flags) {
                 let flags = pyre_object::w_int_get_value(w_flags);
                 if flags & (1 << 6) != 0 {
@@ -3893,7 +3911,7 @@ pub unsafe fn create_all_slots(
         // typeobject.py:1150-1204 create_all_slots
         let mut newslotnames = Vec::new();
         let (mut wantdict, mut wantweakref);
-        if let Some(&w_slots) = ns.get("__slots__") {
+        if let Some(w_slots) = crate::type_dict_lookup(w_type, "__slots__") {
             // typeobject.py:1154-1176: has __slots__
             wantdict = false;
             wantweakref = false;
@@ -3965,7 +3983,7 @@ pub unsafe fn create_all_slots(
         if wantweakref {
             create_weakref_slot(w_type);
         }
-        if ns.get("__del__").is_some() {
+        if crate::type_dict_contains(w_type, "__del__") {
             pyre_object::w_type_set_hasuserdel(w_type, true);
         }
 

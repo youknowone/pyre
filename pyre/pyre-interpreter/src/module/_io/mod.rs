@@ -61,7 +61,7 @@ crate::py_module! {
             let t = pyre_object::w_type_new(
                 name,
                 pyre_object::w_tuple_new(vec![obj_type]),
-                std::ptr::null_mut(),
+                pyre_object::w_dict_new() as *mut u8,
             );
             unsafe { pyre_object::w_type_set_mro(t, vec![t, obj_type]) };
             unsafe { pyre_object::typeobject::w_type_ready(t) };

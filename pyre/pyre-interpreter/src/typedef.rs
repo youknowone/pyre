@@ -6253,16 +6253,16 @@ fn init_type_type(ns: &mut DictStorage) {
                     return Ok(pyre_object::w_dict_proxy_new(pyre_object::w_dict_new()));
                 }
                 // `pypy/objspace/std/typeobject.py:1277 descr_get_dict`
-                // returns `W_DictProxyObject(w_dict)` — read-only **live**
-                // view.  Wrap the type's canonical W_DictObject so
-                // subsequent `cls.x = 1` setattrs flow through the
-                // dict_storage_proxy and become visible on the proxy.
-                // Instance flavor: a type's namespace is a regular
-                // W_DictObject, not a module-strategy dict.
-                let canonical = crate::baseobjspace::dict_storage_to_dict_kind(
-                    ns_ptr as *const DictStorage,
-                    crate::baseobjspace::DictWrapKind::Instance,
-                );
+                // returns a read-only live view over the type's canonical
+                // regular dict object.
+                let canonical = if pyre_object::w_type_is_heaptype(cls) {
+                    ns_ptr as PyObjectRef
+                } else {
+                    crate::baseobjspace::dict_storage_to_dict_kind(
+                        ns_ptr as *const DictStorage,
+                        crate::baseobjspace::DictWrapKind::Instance,
+                    )
+                };
                 Ok(pyre_object::w_dict_proxy_new(canonical))
             }
         },

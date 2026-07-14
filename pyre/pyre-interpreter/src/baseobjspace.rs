@@ -4509,20 +4509,21 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 // returns `W_DictProxyObject(w_dict)` — a read-only
                 // **live** view of the type's namespace.  The proxy's
                 // identity is fresh per call (a new wrapper) but its
-                // `w_mapping` is the type's canonical W_DictObject, so
-                // a subsequent `cls.x = 1; d['x']` resolves through the
-                // dict_storage_proxy and surfaces the live binding.
-                let dict_ptr = w_type_get_dict_ptr(obj) as *const crate::DictStorage;
+                // `w_mapping` is the type's canonical W_DictObject.
+                let dict_ptr = w_type_get_dict_ptr(obj);
                 if dict_ptr.is_null() {
                     return Ok(pyre_object::w_dict_proxy_new(pyre_object::w_dict_new()));
                 }
-                // `pypy/objspace/std/typeobject.py:1277 descr_get_dict`
-                // wraps the type's regular W_DictObject — not a
-                // module-strategy dict — into the proxy.  Pass
-                // `Instance` kind so the type's namespace lives on
-                // the EmptyDictStrategy/typed-strategy ladder rather
-                // than ModuleDictStrategy's GlobalCache machinery.
-                let canonical = dict_storage_to_dict_kind(dict_ptr, DictWrapKind::Instance);
+                let canonical = if w_type_is_heaptype(obj) {
+                    dict_ptr as PyObjectRef
+                } else {
+                    // Static builtin types keep their raw namespace and lazily
+                    // materialize the canonical regular dict mirror.
+                    dict_storage_to_dict_kind(
+                        dict_ptr as *const crate::DictStorage,
+                        DictWrapKind::Instance,
+                    )
+                };
                 return Ok(pyre_object::w_dict_proxy_new(canonical));
             }
             if name == "__bases__" {

@@ -322,9 +322,8 @@ unsafe fn pyre_object_compares_by_identity_trampoline(w_type: pyre_object::PyObj
 ///     collector's `invalidate_young_weakrefs` / `invalidate_old_weakrefs`
 ///     (incminimark.py:3058-3126), so passing the slot to `f` keeps the
 ///     WEAKREF alive without forcing the target alive.
-///   * the off-GC namespace `DictStorage` values (methods, class
-///     attributes, getset descriptor copies) via the interpreter helper,
-///     mirroring `object_object_custom_trace`'s off-GC storage walk.
+///   * the managed namespace object for heap types, or the off-GC
+///     `DictStorage` values for static builtin types.
 ///
 /// Heap types are stable old-gen GC objects, so this trace keeps their owned
 /// GC edges live and forwards their slots.  The separate builtin-type walk
@@ -357,12 +356,16 @@ unsafe fn type_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
             f(slot as *mut *mut pyre_object::weakref::Weakref as *mut majit_ir::GcRef);
         }
     }
-    pyre_interpreter::eval::type_walk_namespace_values(
-        obj_addr as pyre_object::PyObjectRef,
-        &mut |slot: &mut pyre_object::PyObjectRef| {
-            f(slot as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-        },
-    );
+    if unsafe { pyre_object::w_type_is_heaptype(obj_addr as pyre_object::PyObjectRef) } {
+        f(&mut t.dict as *mut *mut u8 as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    } else {
+        pyre_interpreter::eval::type_walk_namespace_values(
+            obj_addr as pyre_object::PyObjectRef,
+            &mut |slot: &mut pyre_object::PyObjectRef| {
+                f(slot as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+            },
+        );
+    }
 }
 
 /// Custom trace for `GeneratorIterator` (generator.py GeneratorIterator).

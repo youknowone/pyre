@@ -275,8 +275,15 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
     let name = crate::lltype::malloc_raw(name.to_string());
     // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`).
     let _roots = crate::gc_roots::push_roots();
+    let save_point = crate::gc_roots::shadow_stack_len();
     crate::gc_roots::pin_root(bases);
-
+    crate::gc_roots::pin_root(dict_ptr as PyObjectRef);
+    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_TYPE_GC_TYPE_ID, W_TYPE_OBJECT_SIZE);
+    // The stable allocation may collect the nursery, so install the forwarded
+    // bases and managed namespace addresses rather than the pre-collection
+    // arguments.
+    let bases = crate::gc_roots::shadow_stack_get(save_point);
+    let dict_ptr = crate::gc_roots::shadow_stack_get(save_point + 1) as *mut u8;
     let value = W_TypeObject {
         ob_header: PyObject {
             ob_type: &TYPE_TYPE as *const PyType,
@@ -314,7 +321,6 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
         flag_disallow_instantiation: std::sync::atomic::AtomicBool::new(false),
         flag_abstract: std::sync::atomic::AtomicBool::new(false),
     };
-    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_TYPE_GC_TYPE_ID, W_TYPE_OBJECT_SIZE);
     let (w_type, gc_managed) = if !raw.is_null() {
         unsafe { std::ptr::write(raw as *mut W_TypeObject, value) };
         (raw as PyObjectRef, true)

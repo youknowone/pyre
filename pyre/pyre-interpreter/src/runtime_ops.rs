@@ -1047,63 +1047,100 @@ pub fn dict_storage_delete_wtf8(namespace: &mut DictStorage, name: &Wtf8) -> boo
     namespace.remove_wtf8(name).is_some()
 }
 
-fn type_dict_storage_ptr(cls: PyObjectRef) -> *mut DictStorage {
-    unsafe { pyre_object::w_type_get_dict_ptr(cls) as *mut DictStorage }
+fn type_dict_ptr(cls: PyObjectRef) -> *mut u8 {
+    unsafe { pyre_object::w_type_get_dict_ptr(cls) }
 }
 
 pub fn type_dict_has_storage(cls: PyObjectRef) -> bool {
-    !type_dict_storage_ptr(cls).is_null()
+    !type_dict_ptr(cls).is_null()
 }
 
 pub fn type_dict_lookup(cls: PyObjectRef, name: &str) -> Option<PyObjectRef> {
-    let namespace = type_dict_storage_ptr(cls);
-    if namespace.is_null() {
+    let dict = type_dict_ptr(cls);
+    if dict.is_null() {
         return None;
     }
-    let value = unsafe { (*namespace).get(name).copied()? };
+    let value = if unsafe { pyre_object::w_type_is_heaptype(cls) } {
+        unsafe { pyre_object::w_dict_getitem_str(dict as PyObjectRef, name)? }
+    } else {
+        unsafe { (*(dict as *mut DictStorage)).get(name).copied()? }
+    };
     if value.is_null() { None } else { Some(value) }
 }
 
 pub fn type_dict_lookup_wtf8(cls: PyObjectRef, name: &Wtf8) -> Option<PyObjectRef> {
-    let namespace = type_dict_storage_ptr(cls);
-    if namespace.is_null() {
+    let dict = type_dict_ptr(cls);
+    if dict.is_null() {
         return None;
     }
-    let value = unsafe { (*namespace).get_wtf8(name).copied()? };
+    let value = if unsafe { pyre_object::w_type_is_heaptype(cls) } {
+        unsafe { pyre_object::w_dict_getitem_wtf8(dict as PyObjectRef, name)? }
+    } else {
+        unsafe { (*(dict as *mut DictStorage)).get_wtf8(name).copied()? }
+    };
     if value.is_null() { None } else { Some(value) }
 }
 
 pub fn type_dict_contains(cls: PyObjectRef, name: &str) -> bool {
-    let namespace = type_dict_storage_ptr(cls);
-    !namespace.is_null() && unsafe { (*namespace).get(name).is_some() }
+    let dict = type_dict_ptr(cls);
+    if dict.is_null() {
+        return false;
+    }
+    if unsafe { pyre_object::w_type_is_heaptype(cls) } {
+        unsafe { pyre_object::w_dict_getitem_str(dict as PyObjectRef, name).is_some() }
+    } else {
+        unsafe { (*(dict as *mut DictStorage)).get(name).is_some() }
+    }
 }
 
 pub fn type_dict_store(cls: PyObjectRef, name: &str, value: PyObjectRef) -> bool {
-    let namespace = type_dict_storage_ptr(cls);
-    if namespace.is_null() {
+    let dict = type_dict_ptr(cls);
+    if dict.is_null() {
         return false;
     }
-    unsafe { dict_storage_store(&mut *namespace, name, value) };
+    if unsafe { pyre_object::w_type_is_heaptype(cls) } {
+        unsafe { pyre_object::w_dict_setitem_str_no_proxy(dict as PyObjectRef, name, value) };
+    } else {
+        unsafe { dict_storage_store(&mut *(dict as *mut DictStorage), name, value) };
+    }
     true
 }
 
 pub fn type_dict_store_wtf8(cls: PyObjectRef, name: &Wtf8, value: PyObjectRef) -> bool {
-    let namespace = type_dict_storage_ptr(cls);
-    if namespace.is_null() {
+    let dict = type_dict_ptr(cls);
+    if dict.is_null() {
         return false;
     }
-    unsafe { dict_storage_store_wtf8(&mut *namespace, name, value) };
+    if unsafe { pyre_object::w_type_is_heaptype(cls) } {
+        unsafe { pyre_object::w_dict_setitem_wtf8_no_proxy(dict as PyObjectRef, name, value) };
+    } else {
+        unsafe { dict_storage_store_wtf8(&mut *(dict as *mut DictStorage), name, value) };
+    }
     true
 }
 
 pub fn type_dict_delete(cls: PyObjectRef, name: &str) -> bool {
-    let namespace = type_dict_storage_ptr(cls);
-    !namespace.is_null() && unsafe { dict_storage_delete(&mut *namespace, name) }
+    let dict = type_dict_ptr(cls);
+    if dict.is_null() {
+        return false;
+    }
+    if unsafe { pyre_object::w_type_is_heaptype(cls) } {
+        unsafe { pyre_object::w_dict_delitem_str_no_proxy(dict as PyObjectRef, name) }
+    } else {
+        unsafe { dict_storage_delete(&mut *(dict as *mut DictStorage), name) }
+    }
 }
 
 pub fn type_dict_delete_wtf8(cls: PyObjectRef, name: &Wtf8) -> bool {
-    let namespace = type_dict_storage_ptr(cls);
-    !namespace.is_null() && unsafe { dict_storage_delete_wtf8(&mut *namespace, name) }
+    let dict = type_dict_ptr(cls);
+    if dict.is_null() {
+        return false;
+    }
+    if unsafe { pyre_object::w_type_is_heaptype(cls) } {
+        unsafe { pyre_object::w_dict_delitem_wtf8_no_proxy(dict as PyObjectRef, name) }
+    } else {
+        unsafe { dict_storage_delete_wtf8(&mut *(dict as *mut DictStorage), name) }
+    }
 }
 
 pub fn sequence_len(seq: PyObjectRef) -> Result<usize, PyError> {

@@ -3260,12 +3260,27 @@ fn type_descr_new_with_metaclass(
         }
         let w_metaclass = w_winner;
 
-        let w_type = pyre_object::w_type_new(name, w_effective_bases, ns_ptr as *mut u8);
-        // typeobject.py:1143-1204 create_all_slots parity.
-        unsafe {
-            let ns = &*ns_ptr;
-            crate::call::create_all_slots(w_type, ns, w_effective_bases)?;
+        let _dict_root = pyre_object::gc_roots::push_roots();
+        let dict_root = pyre_object::gc_roots::shadow_stack_len();
+        let dict_obj = pyre_object::w_dict_new();
+        pyre_object::gc_roots::pin_root(dict_obj);
+        for (key, &value) in unsafe { (*ns_ptr).entries_wtf8() } {
+            if value.is_null() {
+                continue;
+            }
+            let dict_obj = pyre_object::gc_roots::shadow_stack_get(dict_root);
+            match key.as_str() {
+                Ok(s) => unsafe { pyre_object::w_dict_setitem_str_no_proxy(dict_obj, s, value) },
+                Err(_) => unsafe {
+                    pyre_object::w_dict_setitem_wtf8_no_proxy(dict_obj, key, value)
+                },
+            }
         }
+        let dict_obj = pyre_object::gc_roots::shadow_stack_get(dict_root);
+        drop(unsafe { Box::from_raw(ns_ptr) });
+        let w_type = pyre_object::w_type_new(name, w_effective_bases, dict_obj as *mut u8);
+        // typeobject.py:1143-1204 create_all_slots parity.
+        unsafe { crate::call::create_all_slots(w_type, w_effective_bases)? };
         // rclass.py:739-743 — set w_class (typeptr) at allocation time.
         // For type objects, w_class is the metaclass (type(C) → Meta).
         // baseobjspace.py:76 getclass() returns the metatype.
@@ -3292,15 +3307,12 @@ fn type_descr_new_with_metaclass(
         // already removed, not the original backing.  Collect the entries
         // first so the storage borrow is released before the call, which may
         // re-enter the type's dict.
-        let set_name_entries: Vec<(Wtf8Buf, PyObjectRef)> = unsafe {
-            (*ns_ptr)
-                .entries_wtf8()
-                .map(|(k, v)| (k.to_owned(), *v))
-                .collect()
-        };
+        let dict_obj = pyre_object::gc_roots::shadow_stack_get(dict_root);
+        let set_name_entries = unsafe { pyre_object::w_dict_items(dict_obj) };
         for (key, v) in set_name_entries {
-            let k = pyre_object::w_str_from_wtf8(key);
-            unsafe { crate::baseobjspace::set_name(w_type, k, v) }?;
+            if unsafe { pyre_object::is_str(key) } {
+                unsafe { crate::baseobjspace::set_name(w_type, key, v) }?;
+            }
         }
 
         // type_new_init_subclass — fire __init_subclass__ with the
