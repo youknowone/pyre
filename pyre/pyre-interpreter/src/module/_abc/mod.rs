@@ -43,11 +43,11 @@ fn abc_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                     Err(err) => return Err(err),
                 };
                 for name in crate::builtins::collect_iterable(names)? {
-                    // app_abc.py:69 — normal getattr lets descriptors and
-                    // metaclass attributes provide a concrete implementation.
-                    let value = match crate::baseobjspace::getattr_str(cls, unsafe {
-                        pyre_object::w_str_get_value(name)
-                    }) {
+                    // `_py_abc.py:69` — object-level getattr validates that
+                    // every supplied abstract-method name is a string, then
+                    // lets descriptors and metaclass attributes provide an
+                    // implementation.  Only a missing attribute defaults.
+                    let value = match crate::baseobjspace::getattr(cls, name) {
                         Ok(value) => value,
                         Err(err) if err.kind == crate::PyErrorKind::AttributeError => w_none(),
                         Err(err) => return Err(err),

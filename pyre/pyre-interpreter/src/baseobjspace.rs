@@ -4029,6 +4029,15 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
 
 /// `space.getattr(w_obj, w_name)`.
 pub fn getattr(obj: PyObjectRef, w_name: PyObjectRef) -> PyResult {
+    // `getattr` accepts a wrapped attribute name.  Validate it before the
+    // Unicode storage access below: callers such as `_abc._abc_init` can
+    // receive arbitrary objects from a user-provided iterable.
+    if !unsafe { pyre_object::is_str(w_name) } {
+        return Err(PyError::type_error(format!(
+            "attribute name must be string, not '{}'",
+            crate::type_methods::arg_type_name(w_name)
+        )));
+    }
     let name = unsafe { pyre_object::w_str_get_wtf8(w_name) };
     match name.as_str() {
         Ok(s) => getattr_str(obj, s),
