@@ -240,10 +240,32 @@ pub fn list_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
                 }
             }
         } else {
-            // listobject.py:1019 _extend_from_iterable
-            let items = crate::builtins::collect_iterable(other)?;
-            for item in items {
-                w_list_append(list, item);
+            // listobject.py:1019 _extend_from_iterable: append each yielded
+            // value before asking the iterator for the next one.  In
+            // particular, an exception from a later `next()` must not roll
+            // back the prefix already appended to the receiver.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let root_base = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(list);
+            pyre_object::gc_roots::pin_root(other);
+            let iterator =
+                crate::baseobjspace::iter(pyre_object::gc_roots::shadow_stack_get(root_base + 1))?;
+            pyre_object::gc_roots::pin_root(iterator);
+            loop {
+                let item = match crate::baseobjspace::next(pyre_object::gc_roots::shadow_stack_get(
+                    root_base + 2,
+                )) {
+                    Ok(item) => item,
+                    Err(err) if err.kind == crate::PyErrorKind::StopIteration => break,
+                    Err(err) => return Err(err),
+                };
+                let _item_roots = pyre_object::gc_roots::push_roots();
+                let item_slot = pyre_object::gc_roots::shadow_stack_len();
+                pyre_object::gc_roots::pin_root(item);
+                w_list_append(
+                    pyre_object::gc_roots::shadow_stack_get(root_base),
+                    pyre_object::gc_roots::shadow_stack_get(item_slot),
+                );
             }
         }
     }
@@ -321,20 +343,68 @@ pub fn list_method_reverse(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 pub fn list_method_sort(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_receiver(args, "sort")?;
     let list = args[0];
-    // listobject.py `descr_sort` shares `rpython/rlib/listsort.py`'s comparison
-    // machinery (general `space.lt`, `key=`, `reverse=`) with `sorted()`.
-    // The flat builtin ABI hands us `[self, kwargs?]`, exactly the shape
-    // `sorted()` expects, so produce the sorted sequence through the same
-    // path and copy it back into the list in place.
-    let sorted_list = crate::builtins::builtin_sorted(args)?;
+    // Keep the argument decoding shared with `sorted()` before changing the
+    // receiver's visible storage.
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    if positional.len() > 1 {
+        return Err(crate::PyError::type_error(format!(
+            "sorted() takes at most 1 positional argument ({} given)",
+            positional.len()
+        )));
+    }
+    crate::builtins::kwarg_reject_unknown(kwargs, &["key", "reverse"], "sorted")?;
+    let key_fn = crate::builtins::kwarg_get(kwargs, "key")
+        .filter(|key| unsafe { !pyre_object::is_none(*key) });
+    let reverse = crate::builtins::kwarg_get(kwargs, "reverse")
+        .map(|value| crate::baseobjspace::is_true(value))
+        .transpose()?
+        .unwrap_or(false);
+
     unsafe {
-        let n = w_list_len(sorted_list);
-        let items: Vec<PyObjectRef> = (0..n)
-            .filter_map(|i| w_list_getitem(sorted_list, i as i64))
-            .collect();
+        // Hold the detached values in shadow-stack slots, not a bare Rust
+        // Vec, while key and comparison calls can collect.  The receiver is
+        // empty for the whole operation, so user code cannot alter this
+        // sorting slice through the visible list.
+        let saved = pyre_object::w_list_items_copy_as_vec(list);
+        let _roots = pyre_object::gc_roots::push_roots();
+        let item_base = pyre_object::gc_roots::shadow_stack_len();
+        for item in saved {
+            pyre_object::gc_roots::pin_root(item);
+        }
+        let saved_len = pyre_object::gc_roots::shadow_stack_len() - item_base;
         pyre_object::listobject::w_list_clear(list);
-        for item in items {
-            w_list_append(list, item);
+
+        let sorted = crate::builtins::sort_rooted_items(item_base, saved_len, key_fn, reverse);
+        let modified = w_list_len(list) != 0;
+
+        // Discard any visible mutations and always restore the detached
+        // values.  On an error from the key function this restores the input
+        // order; after a successful sort it installs the sorted permutation.
+        pyre_object::listobject::w_list_clear(list);
+        match sorted {
+            Ok(order) => {
+                for index in order {
+                    w_list_append(
+                        list,
+                        pyre_object::gc_roots::shadow_stack_get(item_base + index),
+                    );
+                }
+                if modified {
+                    return Err(crate::PyError::new(
+                        crate::PyErrorKind::ValueError,
+                        "list modified during sort",
+                    ));
+                }
+            }
+            Err(err) => {
+                for index in 0..saved_len {
+                    w_list_append(
+                        list,
+                        pyre_object::gc_roots::shadow_stack_get(item_base + index),
+                    );
+                }
+                return Err(err);
+            }
         }
     }
     Ok(w_none())

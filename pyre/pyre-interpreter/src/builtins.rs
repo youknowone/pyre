@@ -7624,21 +7624,48 @@ pub(crate) fn builtin_sorted(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
         .map(|v| crate::baseobjspace::is_true(v))
         .transpose()?
         .unwrap_or(false);
-    let mut items = collect_iterable(iterable)?;
-    // `pypy/objspace/std/listobject.py W_ListObject.descr_sort` →
-    // build (key, item) pairs, sort by key, optionally reverse.
-    let keyed: Vec<(PyObjectRef, PyObjectRef)> = if let Some(kf) = key_fn {
-        items
-            .iter()
-            .map(|&item| {
-                let k = crate::call_function(kf, &[item]);
-                (k, item)
-            })
-            .collect()
-    } else {
-        items.iter().map(|&item| (item, item)).collect()
-    };
-    let mut keyed = keyed;
+    let items = collect_iterable(iterable)?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let item_base = pyre_object::gc_roots::shadow_stack_len();
+    for item in items {
+        pyre_object::gc_roots::pin_root(item);
+    }
+    let item_len = pyre_object::gc_roots::shadow_stack_len() - item_base;
+    let order = sort_rooted_items(item_base, item_len, key_fn, reverse)?;
+    let result = order
+        .into_iter()
+        .map(|index| pyre_object::gc_roots::shadow_stack_get(item_base + index))
+        .collect();
+    Ok(w_list_new(result))
+}
+
+/// Sort rooted item slots and return the resulting permutation.  All object
+/// references that survive a Python call live in the shadow stack; the sort
+/// itself only moves integer indices.
+pub(crate) fn sort_rooted_items(
+    item_base: usize,
+    item_len: usize,
+    key_fn: Option<PyObjectRef>,
+    reverse: bool,
+) -> Result<Vec<usize>, crate::PyError> {
+    let _key_roots = pyre_object::gc_roots::push_roots();
+    let key_base = pyre_object::gc_roots::shadow_stack_len();
+    let key_fn_slot = key_fn.map(|key| {
+        pyre_object::gc_roots::pin_root(key);
+        key_base
+    });
+    let key_base = key_base + usize::from(key_fn_slot.is_some());
+    if let Some(key_fn_slot) = key_fn_slot {
+        for index in 0..item_len {
+            let key = crate::call::call_function_impl_result(
+                pyre_object::gc_roots::shadow_stack_get(key_fn_slot),
+                &[pyre_object::gc_roots::shadow_stack_get(item_base + index)],
+            )?;
+            pyre_object::gc_roots::pin_root(key);
+        }
+    }
+
+    let mut order: Vec<usize> = (0..item_len).collect();
     // `rpython/rlib/listsort.py listsort.lt` defers to
     // `space.lt(a, b)` and propagates exceptions; if the user's
     // `__lt__` raises, sort halts with that error.  Rust's
@@ -7649,10 +7676,10 @@ pub(crate) fn builtin_sorted(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     // original relative order (a stable descending sort). A single
     // post-sort reverse would instead flip ties.
     if reverse {
-        keyed.reverse();
+        order.reverse();
     }
     let sort_error: std::cell::Cell<Option<crate::PyError>> = std::cell::Cell::new(None);
-    let sort_lt = |ka: PyObjectRef, kb: PyObjectRef| -> bool {
+    let sort_lt = |left: usize, right: usize| -> bool {
         if sort_error
             .take()
             .map(|e| {
@@ -7663,7 +7690,17 @@ pub(crate) fn builtin_sorted(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
         {
             return false;
         }
-        match crate::baseobjspace::compare(ka, kb, crate::baseobjspace::CompareOp::Lt) {
+        let left = pyre_object::gc_roots::shadow_stack_get(if key_fn_slot.is_some() {
+            key_base + left
+        } else {
+            item_base + left
+        });
+        let right = pyre_object::gc_roots::shadow_stack_get(if key_fn_slot.is_some() {
+            key_base + right
+        } else {
+            item_base + right
+        });
+        match crate::baseobjspace::compare(left, right, crate::baseobjspace::CompareOp::Lt) {
             Ok(r) => crate::baseobjspace::is_true(r).unwrap_or_else(|e| {
                 sort_error.set(Some(e));
                 false
@@ -7674,12 +7711,12 @@ pub(crate) fn builtin_sorted(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
             }
         }
     };
-    keyed.sort_by(|(ka, _), (kb, _)| {
-        let ab = sort_lt(*ka, *kb);
+    order.sort_by(|left, right| {
+        let ab = sort_lt(*left, *right);
         if ab {
             return std::cmp::Ordering::Less;
         }
-        let ba = sort_lt(*kb, *ka);
+        let ba = sort_lt(*right, *left);
         if ba {
             return std::cmp::Ordering::Greater;
         }
@@ -7687,15 +7724,25 @@ pub(crate) fn builtin_sorted(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
         // `False` for both directions (legacy unhashable / unorderable
         // pairs that pyre still has) — preserves prior behaviour.
         unsafe {
-            if is_int(*ka) && is_int(*kb) {
-                return w_int_get_value(*ka).cmp(&w_int_get_value(*kb));
+            let left = pyre_object::gc_roots::shadow_stack_get(if key_fn_slot.is_some() {
+                key_base + *left
+            } else {
+                item_base + *left
+            });
+            let right = pyre_object::gc_roots::shadow_stack_get(if key_fn_slot.is_some() {
+                key_base + *right
+            } else {
+                item_base + *right
+            });
+            if is_int(left) && is_int(right) {
+                return w_int_get_value(left).cmp(&w_int_get_value(right));
             }
-            if is_str(*ka) && is_str(*kb) {
-                return w_str_get_value(*ka).cmp(w_str_get_value(*kb));
+            if is_str(left) && is_str(right) {
+                return w_str_get_value(left).cmp(w_str_get_value(right));
             }
-            if is_float(*ka) && is_float(*kb) {
-                return pyre_object::w_float_get_value(*ka)
-                    .partial_cmp(&pyre_object::w_float_get_value(*kb))
+            if is_float(left) && is_float(right) {
+                return pyre_object::w_float_get_value(left)
+                    .partial_cmp(&pyre_object::w_float_get_value(right))
                     .unwrap_or(std::cmp::Ordering::Equal);
             }
             std::cmp::Ordering::Equal
@@ -7706,10 +7753,9 @@ pub(crate) fn builtin_sorted(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     }
     // Second half of the `reverse=True` double-reverse (see above).
     if reverse {
-        keyed.reverse();
+        order.reverse();
     }
-    items = keyed.into_iter().map(|(_, v)| v).collect();
-    Ok(w_list_new(items))
+    Ok(order)
 }
 
 /// `any(iterable)` — PyPy: operation.py any
