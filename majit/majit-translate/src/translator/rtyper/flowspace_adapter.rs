@@ -501,17 +501,10 @@ fn normalize_unary_op_name(pyre_name: &str) -> Result<String, TyperError> {
         // string-build lowering (`str(arg)` ++ `ll_strconcat`) in place of
         // the graph-less `fmt::rt::Argument::new_display` chain.
         "str" => Ok("str".to_string()),
-        // `abs` — RPython `add_operator('abs', 1, .., pure=True)`
-        // (`operation.py`), dispatched through `RPythonTyper::translate_op`'s
-        // `"abs"` arm into the per-repr `rtype_abs` (`FloatRepr::rtype_abs` →
-        // `float_abs`; `IntegerRepr::rtype_abs` → `int_abs`).  `front::mir` emits
-        // `OpKind::UnaryOp { op: "abs", .. }` for the `f64::abs` intrinsic in place
-        // of the graph-less callee.
-        "abs" => Ok("abs".to_string()),
         other => Err(TyperError::missing_rtype_operation(format!(
             "normalize_unary_op_name: pyre UnaryOp `{other}` has no \
              flowspace counterpart (operation.py registers \
-             `pos` / `neg` / `abs` / `invert` / `bool` and the ported `str` \
+             `pos` / `neg` / `invert` / `bool` and the ported `str` \
              as unary ops; \
              `same_as` is rtyper's internal renaming op per \
              rtyper.py:478-481; all 13 typed cast names retired \

@@ -5845,26 +5845,6 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // `f64::abs(x)` is the `float_abs` unary op (`FloatRepr::rtype_abs`) —
-                // emit it directly instead of leaving the graph-less intrinsic call.
-                if args.len() == 1 && self.is_f64_abs(&reg) {
-                    let res = self
-                        .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                        result: Some(res.clone()),
-                        kind: OpKind::UnaryOp {
-                            op: "abs".to_string(),
-                            operand: args[0].clone(),
-                            result_ty: ValueType::Float,
-                        },
-                    });
-                    self.local_var[dest_local] = Some(res);
-                    let target_bb = self.block_id[target];
-                    let link_args = self.edge_args(mir_bb, target)?;
-                    self.graph.set_goto(bb_id, target_bb, link_args);
-                    return Ok(());
-                }
                 // The concrete container `IntoIterator::into_iter` impls
                 // (`&[T]`/`Vec`/`[T;N]`) construct a container iterator.
                 // Emit the `iter` operation on the container receiver — the
@@ -7593,20 +7573,6 @@ impl<'a> Lowering<'a> {
         self.llbc
             .fn_by_id(*id)
             .is_some_and(|fd| fd.item_meta.name_path() == "core::f64::<Impl>::is_sign_negative")
-    }
-
-    /// `f64::abs(self)` — `core` has no graph body (Opaque), so the callsite would
-    /// skip as an unregistered `FunctionPath`.  `abs` is the `float_abs` unary op
-    /// (`FloatRepr::rtype_abs`); the rtyper's `"abs"` dispatch and the annotator's
-    /// float `abs` (→ `SomeFloat`) already handle it, so emitting `UnaryOp("abs")`
-    /// is enough.
-    fn is_f64_abs(&self, reg: &RegularCall) -> bool {
-        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
-            return false;
-        };
-        self.llbc
-            .fn_by_id(*id)
-            .is_some_and(|fd| fd.item_meta.name_path() == "core::f64::<Impl>::abs")
     }
 
     /// `majit_metainterp::jit::promote(x)` = `hint(x, promote=True)`
