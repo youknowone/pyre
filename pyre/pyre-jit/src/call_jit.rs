@@ -1616,7 +1616,7 @@ impl Drop for VableRollbackRoots {
 /// copy holding from-space pointers; `decode_ref` (resume.rs:1575) then reads
 /// a stale pointer for a box-sourced slot and the blackhole dereferences
 /// freed memory.  Resume *constants* are already forwarded by
-/// `rd_consts_root_walker`, but the box-sourced slots here are not.
+/// `rd_consts_root_walker_area`, but the box-sourced slots here are not.
 /// Registering each `Ref` element slot makes the root walker forward it in
 /// place, mirroring `VableRollbackRoots` (#326).
 ///
