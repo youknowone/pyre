@@ -3956,7 +3956,7 @@ impl OptUnroll {
                 }
             }
 
-            // unroll.py:417-423: force all except virtuals.
+            // unroll.py:417-434: force all except virtuals.
             loop {
                 let short_jump_args = current_short_jump_args(short_preamble, ctx);
                 let num_short_jump_args = short_jump_args.len();
@@ -3977,7 +3977,20 @@ impl OptUnroll {
                 for &arg in args_no_virtuals.iter().chain(mapped_jump_args.iter()) {
                     let _ = optimizer.force_box(arg, ctx);
                 }
-                if current_short_jump_args(short_preamble, ctx).len() == num_short_jump_args {
+                // unroll.py:425-434: if short_jump_args did not grow we are
+                // done. If force_box grew it via add_preamble_op, only re-force
+                // when every new entry is a Const or already in `mapping`;
+                // otherwise break and let the outer replay loop register the
+                // producer first, since the top-of-loop _map_args above would
+                // otherwise read an unmapped arg.
+                let grown = current_short_jump_args(short_preamble, ctx);
+                if grown.len() == num_short_jump_args {
+                    break;
+                }
+                let all_new_mapped = grown[num_short_jump_args..]
+                    .iter()
+                    .all(|arg| arg.is_constant() || mapping.contains_key(arg));
+                if !all_new_mapped {
                     break;
                 }
             }
