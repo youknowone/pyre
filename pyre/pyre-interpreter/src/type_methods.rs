@@ -253,7 +253,10 @@ pub fn list_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 /// PyPy: listobject.py descr_insert — list.insert(index, item)
 pub fn list_method_insert(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_exact_unpack(args, "insert", 2)?;
-    let index = unsafe { w_int_get_value(args[1]) };
+    // `@unwrap_spec(index='index')` → getindex_w(index, OverflowError): coerce
+    // through `__index__`; `get_positive_index` then clamps to `[0, len]`
+    // inside `w_list_insert`.
+    let index = unsafe { crate::baseobjspace::getindex_w_index(args[1])? };
     unsafe { pyre_object::listobject::w_list_insert(args[0], index, args[2]) };
     Ok(w_none())
 }
@@ -266,8 +269,10 @@ pub fn list_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     // `descr_pop` checks arity before touching the list, so `pop(1, 2)` on an
     // empty list reports the surplus argument rather than "pop from empty list".
     arity_at_most(args, "pop", 1)?;
+    // `@unwrap_spec(index='index')` → getindex_w(index, OverflowError): coerce
+    // through `__index__`.
     let index = if args.len() > 1 {
-        unsafe { w_int_get_value(args[1]) }
+        unsafe { crate::baseobjspace::getindex_w_index(args[1])? }
     } else {
         -1
     };

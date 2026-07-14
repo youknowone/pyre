@@ -1251,17 +1251,16 @@ pub(crate) fn getitem_slot(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
 
 /// `pypy/interpreter/baseobjspace.py:1574 getindex_w` — the `TypeError`
 /// raised when a sequence subscript is neither an integer nor a slice:
-/// `"<descr> indices must be integers or slices, not <type>"`.
+/// `"<descr> indices must be integers or slices, not '<type>'"` (the `%T`
+/// operand names the key's own class).
 fn index_type_error(descr: &str, index: PyObjectRef) -> PyError {
-    let tp = unsafe {
-        if index.is_null() {
-            "NULL"
-        } else {
-            (*(*index).ob_type).name
-        }
+    let tp = if index.is_null() {
+        "NULL".to_string()
+    } else {
+        object_functionstr_type_name(index)
     };
     PyError::type_error(format!(
-        "{descr} indices must be integers or slices, not {tp}"
+        "{descr} indices must be integers or slices, not '{tp}'"
     ))
 }
 
@@ -1280,10 +1279,36 @@ unsafe fn getitem_list(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         }
         return Ok(w_list_new(items));
     }
-    if !is_int(index) {
+    // `descr_getitem`: getindex_w(index, IndexError, "list") coerces a
+    // non-slice key through `__index__`.  The coercion is inlined rather
+    // than routed through the `Result<i64>` `subscript_index_w` helper,
+    // whose payload fails to bind a concrete Int repr in the rtyper
+    // (concretetype None → the codewriter mis-colors it Ref), so the hot
+    // integer subscript keeps its Int repr concrete.
+    let idx = if is_int(index) {
+        w_int_get_value(index)
+    } else if pyre_object::pyobject::is_int_or_long(index) || lookup(index, "__index__").is_some() {
+        let indexed = space_index(index)?;
+        if is_int(indexed) {
+            w_int_get_value(indexed)
+        } else {
+            match i64::try_from(w_long_get_value(indexed)) {
+                Ok(i) => i,
+                // `getindex_w` overflow reports the source type, not the coerced int.
+                Err(_) => {
+                    return Err(PyError::new(
+                        PyErrorKind::IndexError,
+                        format!(
+                            "cannot fit '{}' into an index-sized integer",
+                            object_functionstr_type_name(index)
+                        ),
+                    ));
+                }
+            }
+        }
+    } else {
         return Err(index_type_error("list", index));
-    }
-    let idx = w_int_get_value(index);
+    };
     match w_list_getitem(obj, idx) {
         Some(val) => Ok(val),
         None => Err(PyError::new(
@@ -2251,16 +2276,37 @@ unsafe fn setitem_list(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef)
     if is_slice(index) {
         return setitem_list_slice(obj, index, value);
     }
-    if !is_int(index) {
+    // `descr_setitem`: getindex_w(index, IndexError, "list") — coercion
+    // inlined for the same rtyper reason as `getitem_list`.
+    let idx = if is_int(index) {
+        w_int_get_value(index)
+    } else if pyre_object::pyobject::is_int_or_long(index) || lookup(index, "__index__").is_some() {
+        let indexed = space_index(index)?;
+        if is_int(indexed) {
+            w_int_get_value(indexed)
+        } else {
+            match i64::try_from(w_long_get_value(indexed)) {
+                Ok(i) => i,
+                Err(_) => {
+                    return Err(PyError::new(
+                        PyErrorKind::IndexError,
+                        format!(
+                            "cannot fit '{}' into an index-sized integer",
+                            object_functionstr_type_name(index)
+                        ),
+                    ));
+                }
+            }
+        }
+    } else {
         return Err(index_type_error("list", index));
-    }
-    let idx = w_int_get_value(index);
+    };
     if w_list_setitem(obj, idx, value) {
         Ok(w_none())
     } else {
         Err(PyError::new(
             PyErrorKind::IndexError,
-            "list assignment index out of range",
+            "list index out of range",
         ))
     }
 }
@@ -2323,13 +2369,15 @@ unsafe fn setitem_list_slice(obj: PyObjectRef, index: PyObjectRef, value: PyObje
     Ok(w_none())
 }
 
-/// Resolve a `bytearray` subscript index (`bytearray_ass_subscript`): honor
-/// `__index__`, raise the "indices must be integers or slices" TypeError for a
-/// non-index, non-slice key, and raise IndexError for a value too large to fit
-/// an index (`PyNumber_AsSsize_t(index, IndexError)`).
-unsafe fn bytearray_index(index: PyObjectRef) -> Result<i64, PyError> {
+/// Resolve a sequence subscript index (`getindex_w(index, IndexError, descr)`):
+/// honor `__index__`, raise the "indices must be integers or slices" TypeError
+/// for a non-index, non-slice key, and raise IndexError for a value too large
+/// to fit an index (`PyNumber_AsSsize_t(index, IndexError)`).  Used on cold
+/// deletion paths; hot read/write paths inline the same coercion so their Int
+/// repr stays concrete in the rtyper.
+unsafe fn subscript_index_w(descr: &str, index: PyObjectRef) -> Result<i64, PyError> {
     if !pyre_object::pyobject::is_int_or_long(index) && lookup(index, "__index__").is_none() {
-        return Err(index_type_error("bytearray", index));
+        return Err(index_type_error(descr, index));
     }
     match int_w(space_index(index)?) {
         Ok(i) => Ok(i),
@@ -2347,6 +2395,27 @@ unsafe fn bytearray_index(index: PyObjectRef) -> Result<i64, PyError> {
     }
 }
 
+/// `getindex_w(index, OverflowError)` with `objdescr=None` — the variant
+/// reached through the `@unwrap_spec(index='index')` of `list.insert` /
+/// `list.pop`.  With no `objdescr`, `space.index`'s own error for a non-index
+/// key surfaces verbatim ("'<type>' object cannot be interpreted as an
+/// integer" / "__index__ returned non-int (type X)"); an index too large for a
+/// machine word raises OverflowError "cannot fit '<type>' into an index-sized
+/// integer" (distinct from the subscript path's IndexError).
+pub(crate) unsafe fn getindex_w_index(index: PyObjectRef) -> Result<i64, PyError> {
+    match int_w(space_index(index)?) {
+        Ok(i) => Ok(i),
+        Err(e) if e.kind == PyErrorKind::OverflowError => Err(PyError::new(
+            PyErrorKind::OverflowError,
+            format!(
+                "cannot fit '{}' into an index-sized integer",
+                object_functionstr_type_name(index)
+            ),
+        )),
+        Err(e) => Err(e),
+    }
+}
+
 #[inline(never)]
 unsafe fn setitem_bytearray(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> PyResult {
     if is_slice(index) {
@@ -2354,7 +2423,7 @@ unsafe fn setitem_bytearray(obj: PyObjectRef, index: PyObjectRef, value: PyObjec
     }
     // `descr_setitem`: getindex_w(index) → byte_w(value) → _fixindex(idx) store.
     // Both coercions are inlined rather than routed through the shared
-    // `bytearray_index`/`byte_w`, whose `Result<int>` payload fails to bind a
+    // `subscript_index_w`/`byte_w`, whose `Result<int>` payload fails to bind a
     // concrete Int repr in the rtyper (concretetype None) so the codewriter
     // mis-colors it Ref against its Int provenance; the inline `space_index`
     // pattern keeps the Int repr concrete.  The value is coerced before the
@@ -11790,16 +11859,6 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
     use pyre_object::*;
     unsafe {
         if is_list(obj) {
-            if is_int(index) {
-                let i = w_int_get_value(index);
-                let len = w_list_len(obj) as i64;
-                let idx = if i < 0 { len + i } else { i };
-                if idx >= 0 && idx < len {
-                    w_list_pop(obj, idx);
-                    return Ok(());
-                }
-                return Err(PyError::type_error("list index out of range"));
-            }
             if is_slice(index) {
                 let len = w_list_len(obj) as i64;
                 let (start, stop, step) = normalize_slice(index, len)?;
@@ -11831,6 +11890,27 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
                 }
                 return Ok(());
             }
+            // `descr_delitem`: getindex_w(idx, IndexError, "list") coerces a
+            // non-slice key through `__index__` before the length is read.  A
+            // key that is neither an index nor a slice raises the "indices must
+            // be integers" TypeError here rather than falling through to the
+            // generic `__delitem__` slot, which is bound to `delitem_slot` and
+            // would recurse.
+            let i = if is_int(index) {
+                w_int_get_value(index)
+            } else {
+                subscript_index_w("list", index)?
+            };
+            let len = w_list_len(obj) as i64;
+            let idx = if i < 0 { len + i } else { i };
+            if idx >= 0 && idx < len {
+                w_list_pop(obj, idx);
+                return Ok(());
+            }
+            return Err(PyError::new(
+                PyErrorKind::IndexError,
+                "list index out of range",
+            ));
         }
         if is_dict(obj) {
             return dict_delitem(obj, index);
@@ -11882,7 +11962,7 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
                 }
                 return Ok(());
             }
-            let i = bytearray_index(index)?;
+            let i = subscript_index_w("bytearray", index)?;
             let len = pyre_object::bytearrayobject::w_bytearray_len(obj) as i64;
             let idx = if i < 0 { len + i } else { i };
             if idx >= 0 && idx < len {
