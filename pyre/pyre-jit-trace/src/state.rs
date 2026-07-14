@@ -5760,16 +5760,15 @@ fn rd_virtual_at(
     rd_virtuals.and_then(|v| v.get(vidx)).map(|rc| &**rc)
 }
 
-/// P2 multi-frame bridge drain (`PYRE_P2_DRAIN`, default OFF): gates the
-/// `trace.rs` carrier drain sub-walk+inject deviation. The carrier itself is
-/// installed for every `frames.len() > 1` resume (safety floor: a carrier routes
-/// a hot multi-frame guard to the `CarrierAbort` blackhole instead of the
-/// degenerate root-at-innermost-pc bridge); this gate only selects the drain
-/// driver over the default framestack path. Until the drain is net-positive the
-/// gate stays off so a carrier resume falls through to the framestack walk /
-/// clean abort.
+/// Multi-frame bridge drain (`PYRE_P2_DRAIN`, default ON; `=0` restores the
+/// framestack-walk bridge): routes a multi-frame carrier resume to the blackhole
+/// safety floor. The drain is now the default because the framestack-walk
+/// cross-frame bridge miscompiles a branchy inlined-callee continuation (a
+/// module-scope two-level inline with a mid-function branch), while the drain is
+/// net-positive on the full suite. The escape hatch keeps the framestack walk
+/// reachable pending the orthodox multi-frame reconstruction fix (#343).
 pub(crate) fn p2_drain_enabled() -> bool {
-    std::env::var_os("PYRE_P2_DRAIN").is_some()
+    std::env::var_os("PYRE_P2_DRAIN").as_deref() != Some(std::ffi::OsStr::new("0"))
 }
 
 /// Decode one suspended inline-callee frame's resume section into a

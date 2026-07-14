@@ -464,13 +464,12 @@ pub fn trace_bytecode(
     // full-body walker (reconstruct the in-flight callee framestack + walk
     // innermost-first) instead of aborting to a no-JIT re-interpret below.
     if let Some(ref carrier) = carrier {
-        // A multi-frame bridge resume is driven by the orthodox framestack
-        // trampoline (`rebuild_from_resumedata` resume.py:1042-1057 + the
-        // continuous interpret loop): reconstruct the resumed callee framestack
-        // and walk it forward. Without it a present carrier falls through to the
-        // degenerate `Trait::CarrierAbort` below, which never compiles the bridge
-        // and re-aborts on every guard failure. The `PYRE_P2_DRAIN`
-        // sub-walk+inject shape is a separate unsound deviation, kept gated off.
+        // The framestack-walk cross-frame bridge is correctness-buggy for a
+        // branchy inlined-callee continuation. Keep it behind
+        // `PYRE_P2_DRAIN=0` pending the orthodox multi-frame reconstruction fix
+        // (#343). The drain sub-walk is the safe default: with the experimental
+        // `PYRE_P2_COMPILE` unset it discards the trace and aborts to the
+        // blackhole safety floor.
         if crate::state::p2_drain_enabled() {
             let action = drive_bridge_carrier_walk(ctx, sym, w_code, start_pc, cf_addr, carrier);
             finish_trace_namespace_dependency(meta);
@@ -839,7 +838,8 @@ fn select_recipe_entry(
 /// (`recipes` is outermost-first, so the last entry is the guard-failing
 /// frame), log the outcome, discard the trace, and abort — validates the
 /// reconstructed-frame walk plumbing before result-threading + the root walk
-/// are wired.  Gated behind `PYRE_P2_DRAIN` (default off → unchanged behavior).
+/// are wired. This abort-to-blackhole drain is the safe default; the experimental
+/// `PYRE_P2_COMPILE` path remains opt-in.
 /// Thread a reconstructed callee's `SubReturn` value into the root portal's
 /// operand-stack result slot so the subsequent root walk (`run_perfn_walk`'s
 /// `bridge_stack_oprefs` seeding) reads it as the call result at `root_pc`.
@@ -987,19 +987,24 @@ fn drive_bridge_carrier_walk(
         }
     }
 
+    let p2_diag = std::env::var_os("PYRE_P2_DIAG").is_some();
     match &walk {
         Some(Ok((outcome, end_pc))) => {
-            eprintln!(
-                "[p2-drain] callee sub-walk OK recipe_py_pc={} entry={entry} end_pc={end_pc} outcome={outcome:?}",
-                crate::state::backxlat_py_pc(recipe.jitcode_index, recipe.jitcode_pc)
-            );
+            if p2_diag {
+                eprintln!(
+                    "[p2-drain] callee sub-walk OK recipe_py_pc={} entry={entry} end_pc={end_pc} outcome={outcome:?}",
+                    crate::state::backxlat_py_pc(recipe.jitcode_index, recipe.jitcode_pc)
+                );
+            }
             crate::jitcode_dispatch::census_record("P2Drain::SubWalkOk");
         }
         Some(Err(e)) => {
-            eprintln!(
-                "[p2-drain] callee sub-walk STOP recipe_py_pc={} entry={entry} err={e:?}",
-                crate::state::backxlat_py_pc(recipe.jitcode_index, recipe.jitcode_pc)
-            );
+            if p2_diag {
+                eprintln!(
+                    "[p2-drain] callee sub-walk STOP recipe_py_pc={} entry={entry} err={e:?}",
+                    crate::state::backxlat_py_pc(recipe.jitcode_index, recipe.jitcode_pc)
+                );
+            }
             crate::jitcode_dispatch::census_record("P2Drain::SubWalkStop");
         }
         None => {
@@ -1014,7 +1019,7 @@ fn drive_bridge_carrier_walk(
     TraceAction::Abort
 }
 
-/// Shape A orthodox multi-frame bridge resume: the default driver for a
+/// Shape A orthodox multi-frame bridge resume: the escape-hatch driver for a
 /// single-recipe (depth-1) carrier.
 ///
 /// A driver-managed framestack trampoline that mirrors RPython's
@@ -1045,8 +1050,8 @@ fn drive_bridge_carrier_walk(
 /// bridge. `recipes.len() != 1` (depth≥2, #343) and any setup/continuation
 /// failure fall through to `SafeAbortReconstruction`, which cuts the whole
 /// reconstruction and re-interprets with the correct result (no SEGV). The
-/// [`drive_bridge_carrier_walk`] sub-walk+inject shape (`PYRE_P2_DRAIN`) is a
-/// separate unsound deviation, kept gated off.
+/// [`drive_bridge_carrier_walk`] abort-to-blackhole drain is the safe default;
+/// this framestack walk remains reachable with `PYRE_P2_DRAIN=0` pending #343.
 fn drive_bridge_framestack_walk(
     ctx: &mut TraceCtx,
     sym: &mut PyreSym,
