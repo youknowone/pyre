@@ -1966,12 +1966,20 @@ impl ActionFlagOps for ActionFlag {
     /// `p.c_value = value`.
     fn reset_ticker(&mut self, value: isize) {
         self._ticker = value;
-        // A negative reset arms the async-pending bit; any non-negative
-        // reset is the dispatch clear.
-        if value < 0 {
-            majit_ir::eval_breaker_word::set_async();
-        } else {
-            majit_ir::eval_breaker_word::clear_async();
+        // Mirror the async-pending bit only for the signal-registered ticker
+        // — the single cell compiled-loop back-edges poll. Per-EC flags that
+        // are not the registered breaker source must not touch the shared
+        // word, or one context's dispatch clear would drop another context's
+        // pending async.
+        if std::ptr::eq(
+            &self._ticker as *const isize,
+            crate::module::signal::signalstate::registered_ticker_ptr() as *const isize,
+        ) {
+            if value < 0 {
+                majit_ir::eval_breaker_word::set_async();
+            } else {
+                majit_ir::eval_breaker_word::clear_async();
+            }
         }
     }
 
@@ -1999,7 +2007,11 @@ impl ActionFlagOps for ActionFlag {
             self._ticker -= by;
             // This path bypasses reset_ticker, so mirror a future periodic
             // decrement that crosses negative.
-            if self._ticker < 0 {
+            if std::ptr::eq(
+                &self._ticker as *const isize,
+                crate::module::signal::signalstate::registered_ticker_ptr() as *const isize,
+            ) && self._ticker < 0
+            {
                 majit_ir::eval_breaker_word::set_async();
             }
         }

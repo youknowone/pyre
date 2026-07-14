@@ -57,6 +57,14 @@ pub fn register_ticker(ptr: *mut isize) {
     TICKER_PTR.store(ptr, Ordering::SeqCst);
 }
 
+/// Address of the registered `ActionFlag` ticker cell, or null before
+/// `register_ticker` runs. Used to gate the eval-breaker async-bit mirror
+/// so only the signal-registered ticker (the one compiled loops poll)
+/// drives the shared word.
+pub fn registered_ticker_ptr() -> *mut isize {
+    TICKER_PTR.load(Ordering::SeqCst)
+}
+
 /// Store -1 into the ticker cell so the next `decrement_ticker` runs
 /// `action_dispatcher`.  Async-signal-safe: a single aligned word store.
 fn rearm_ticker() {
