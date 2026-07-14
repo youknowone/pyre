@@ -21,18 +21,13 @@ static FRAME_VALUE_COUNT_FN: AtomicUsize = AtomicUsize::new(0);
 
 /// Register the global frame_value_count callback.
 ///
-/// Signature: `(jitcode_index, py_pc, jitcode_pc) -> count`.  The
-/// implementation prefers the carried direct `jitcode_pc` (`#124`
-/// Approach B) when it names a valid startpoint, else translates `py_pc`
-/// through `pc_map` to look up `get_live_vars_info`; pyre's portal-bridge
-/// fallback (`PyJitCodeMetadata.depth_at_py_pc`) is py_pc-keyed pending
-/// its own TODO retirement.
-pub fn set_frame_value_count_fn(f: fn(i32, i32, i32) -> usize) {
+/// Signature: `(jitcode_index, pc) -> count`.
+pub fn set_frame_value_count_fn(f: fn(i32, i32) -> usize) {
     FRAME_VALUE_COUNT_FN.store(f as usize, Ordering::Relaxed);
 }
 
 /// Get the registered frame_value_count callback (if any).
-pub fn get_frame_value_count_fn() -> Option<fn(i32, i32, i32) -> usize> {
+pub fn get_frame_value_count_fn() -> Option<fn(i32, i32) -> usize> {
     let p = FRAME_VALUE_COUNT_FN.load(Ordering::Relaxed);
     if p == 0 {
         None
@@ -401,14 +396,8 @@ pub enum RebuiltValue {
 #[derive(Debug, Clone)]
 pub struct RebuiltFrame {
     pub jitcode_index: i32,
-    /// resume.py:250 `pc` — RPython carries the JitCode byte offset
-    /// here; pyre's deviation populates this with the Python bytecode
-    /// PC because pyre traces Python bytecode rather than JitCode.  See
-    /// `[[project-issue73-phase5-design]]`.
+    /// resume.py:250 `pc` — the JitCode byte offset.
     pub pc: i32,
-    /// Direct JitCode resume coordinate, or [`NO_JITCODE_PC`] when the
-    /// frame resumes through the Python `pc` → `pc_map` translation.
-    pub jitcode_pc: i32,
     pub values: Vec<RebuiltValue>,
 }
 
@@ -482,13 +471,11 @@ fn decode_tagged(
 /// (`get_current_position_info`) at the decode site to know how many
 /// values each frame has.
 ///
-/// `frame_value_count`: when `Some(f)`, `f(jitcode_index, pc, jitcode_pc)`
+/// `frame_value_count`: when `Some(f)`, `f(jitcode_index, pc)`
 /// returns the number of tagged values for that frame (RPython parity:
-/// liveness-driven decode). The carried `jitcode_pc` (`#124`) lets the
-/// callback resolve the precise resume coordinate when it names a valid
-/// startpoint. When `None`, all remaining items after `(jitcode_index, pc,
-/// jitcode_pc)` are consumed as a single frame (backward-compat for callers
-/// that only ever see single-frame data).
+/// liveness-driven decode). When `None`, all remaining items after
+/// `(jitcode_index, pc)` are consumed as a single frame (backward-compat for
+/// callers that only ever see single-frame data).
 ///
 /// `fail_arg_types`: parent guard's per-failarg type vector. resume.py:1245
 /// `decode_box(num, kind)` parity — TAGBOX values use this to fill in their
@@ -498,7 +485,7 @@ pub fn rebuild_from_numbering(
     rd_numb: &[u8],
     rd_consts: &[Const],
     fail_arg_types: &[Type],
-    frame_value_count: Option<&dyn Fn(i32, i32, i32) -> usize>,
+    frame_value_count: Option<&dyn Fn(i32, i32) -> usize>,
     num_virtuals: usize,
 ) -> (i32, Vec<RebuiltValue>, Vec<RebuiltValue>, Vec<RebuiltFrame>) {
     let mut reader = resumecode::Reader::new(rd_numb);
@@ -550,17 +537,9 @@ pub fn rebuild_from_numbering(
         } else {
             0
         };
-        // Per-frame `jitcode_pc` word (after `pc`).  See [`NO_JITCODE_PC`].
-        let jitcode_pc = if reader.has_more() && reader.items_read < total_size as usize {
-            reader.next_item()
-        } else {
-            NO_JITCODE_PC
-        };
         let box_count = if let Some(f) = &frame_value_count {
-            // RPython parity: liveness-driven frame boundary.  The carried
-            // `jitcode_pc` (`#124`) lets the callback prefer the precise
-            // resume coordinate over the lossy `pc_map` translation.
-            f(jitcode_index, pc, jitcode_pc)
+            // RPython parity: liveness-driven frame boundary.
+            f(jitcode_index, pc)
         } else {
             // Single-frame fallback: consume all remaining items.
             (total_size as usize).saturating_sub(reader.items_read)
@@ -582,7 +561,6 @@ pub fn rebuild_from_numbering(
         frames.push(RebuiltFrame {
             jitcode_index,
             pc,
-            jitcode_pc,
             values,
         });
     }

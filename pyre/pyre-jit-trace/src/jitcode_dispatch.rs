@@ -11133,7 +11133,6 @@ fn walker_capture_inline_nonstandard_vable_guard(
             &ctx.outer_active_boxes,
             ctx.outer_jitcode_index,
             nsvable_pc_word,
-            nsvable_word,
             &vable_boxes,
             &vref_boxes,
         );
@@ -11898,7 +11897,6 @@ fn walker_capture_snapshot_for_last_guard_impl(
                     &active,
                     jitcode_index,
                     pc_word,
-                    guard_jitcode_pc,
                     &vable_boxes,
                     &vref_boxes,
                 );
@@ -11934,7 +11932,6 @@ fn walker_capture_snapshot_for_last_guard_impl(
             &ctx.outer_active_boxes,
             ctx.outer_jitcode_index,
             arm_pc_word,
-            arm_word,
             &vable_boxes,
             &vref_boxes,
         );
@@ -12465,7 +12462,7 @@ fn walker_capture_multi_frame_inline_snapshot(
 
     // Frame tuples, OUTERMOST-FIRST: the paused caller chain, then the callee
     // top frame last (innermost).
-    let mut frames: Vec<(u32, u32, i32, &[OpRef])> = Vec::with_capacity(parent_frames.len() + 1);
+    let mut frames: Vec<(u32, u32, &[OpRef])> = Vec::with_capacity(parent_frames.len() + 1);
     for pf in &parent_frames {
         let pf_word = if m73_pfmarker_carry_enabled() {
             pf.resume_marker_jit_pc
@@ -12484,7 +12481,7 @@ fn walker_capture_multi_frame_inline_snapshot(
             })
             .map(|offset| offset as u32)
             .unwrap_or(pf.resume_py_pc);
-        frames.push((pf.jitcode_index, pf_pc_word, pf_word, pf.boxes.as_slice()));
+        frames.push((pf.jitcode_index, pf_pc_word, pf.boxes.as_slice()));
     }
     let callee_pc_word = crate::state::pyjitcode_for_jitcode_index(callee_jitcode_index)
         .and_then(|payload| {
@@ -12499,7 +12496,6 @@ fn walker_capture_multi_frame_inline_snapshot(
     frames.push((
         callee_jitcode_index as u32,
         callee_pc_word,
-        callee_jitcode_pc,
         callee_boxes.as_slice(),
     ));
 

@@ -1000,7 +1000,7 @@ pub(crate) fn sub_jitcode_descr_pool_for_code(code: *const ()) -> Option<SubDesc
 /// `LiveVars` analysis over the Python bytecode. This path is used
 /// for inlined callee frames whose majit_jitcode has not been built
 /// at trace time.
-pub fn frame_value_count_at(jitcode_index: i32, pc: i32, _carried_jitcode_pc: i32) -> usize {
+pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
     ensure_finish_setup();
     METAINTERP_SD.with(|r| {
         let sd = r.borrow();
@@ -12376,7 +12376,6 @@ mod tests {
             frames: vec![RebuiltFrame {
                 jitcode_index,
                 pc: 0,
-                jitcode_pc: majit_ir::resumedata::NO_JITCODE_PC,
                 values: vec![
                     RebuiltValue::Box(8, Type::Ref),
                     RebuiltValue::Box(9, Type::Ref),

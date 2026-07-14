@@ -4082,7 +4082,6 @@ impl MIFrame {
             lead.push(majit_metainterp::recorder::SnapshotFrame {
                 jitcode_index: parent_jitcode_index,
                 pc: parent_pc_word,
-                jitcode_pc: parent_word,
                 boxes: Self::fail_args_to_snapshot_boxes_typed(&parent_active, parent_types, ctx),
             });
         }
@@ -4133,7 +4132,6 @@ impl MIFrame {
         let top_frame = majit_metainterp::recorder::SnapshotFrame {
             jitcode_index: top_jitcode_index,
             pc: top_pc_word,
-            jitcode_pc: top_word,
             boxes: Self::fail_args_to_snapshot_boxes_typed(
                 top_active_boxes,
                 top_snapshot_types,

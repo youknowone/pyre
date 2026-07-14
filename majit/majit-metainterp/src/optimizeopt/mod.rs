@@ -45,7 +45,7 @@ use std::collections::VecDeque;
 
 pub type SnapshotBoxes = Vec<Option<Vec<SnapshotBox>>>;
 pub type SnapshotFrameSizes = Vec<Option<Vec<usize>>>;
-pub type SnapshotFramePcs = Vec<Option<Vec<(i32, i32, i32)>>>;
+pub type SnapshotFramePcs = Vec<Option<Vec<(i32, i32)>>>;
 type OpRefFxIndexMap<V> = indexmap::IndexMap<OpRef, V, FxBuildHasher>;
 
 pub(crate) fn snapshot_get<T>(store: &[Option<T>], pos: i32) -> Option<&T> {
@@ -6228,27 +6228,14 @@ impl OptContext {
             for (i, &size) in sizes.iter().enumerate() {
                 let end = (offset + size).min(snapshot_boxes.len());
                 let frame_boxes: Vec<SnapshotBox> = snapshot_boxes[offset..end].to_vec();
-                let (jitcode_index, pc, jitcode_pc) = frame_pcs.get(i).copied().unwrap_or((
-                    0,
-                    0,
-                    majit_ir::resumedata::NO_JITCODE_PC,
-                ));
-                frames.push((jitcode_index, pc, jitcode_pc, frame_boxes));
+                let (jitcode_index, pc) = frame_pcs.get(i).copied().unwrap_or((0, 0));
+                frames.push((jitcode_index, pc, frame_boxes));
                 offset = end;
             }
-            Snapshot::multi_frame_boxes_with_jitcode_pc(frames)
+            Snapshot::multi_frame_boxes(frames)
         } else {
-            let (jitcode_index, pc, jitcode_pc) =
-                frame_pcs
-                    .first()
-                    .copied()
-                    .unwrap_or((0, 0, majit_ir::resumedata::NO_JITCODE_PC));
-            Snapshot::single_frame_boxes_with_jitcode_pc(
-                jitcode_index,
-                pc,
-                jitcode_pc,
-                snapshot_boxes.clone(),
-            )
+            let (jitcode_index, pc) = frame_pcs.first().copied().unwrap_or((0, 0));
+            Snapshot::single_frame_boxes(jitcode_index, pc, snapshot_boxes.clone())
         };
         // pyjitpl.py:2588: vable_array stores virtualizable_boxes.
         // ni/vsd are constants (TAGINT/TAGCONST) so they don't affect

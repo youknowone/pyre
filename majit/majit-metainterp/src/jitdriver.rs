@@ -882,7 +882,7 @@ struct StateFieldFvcData {
 /// derives the per-frame box count from that jitcode's liveness at pc
 /// (jitcode.py:147 `enumerate_vars` → `length_i + length_r + length_f`).
 /// Structural mirror of `pyre-jit-trace::state::frame_value_count_at`.
-fn state_field_frame_value_count(jitcode_index: i32, pc: i32, _carried_jitcode_pc: i32) -> usize {
+fn state_field_frame_value_count(jitcode_index: i32, pc: i32) -> usize {
     STATE_FIELD_FVC.with(|cell| {
         let data = cell.borrow();
         let Some(data) = data.as_ref() else {
@@ -2763,8 +2763,7 @@ impl<S: JitState> JitDriver<S> {
                 // branch, no parent-relative descrs walk, no last-frame state).
                 let jitcode_registry = self.jitcode_registry.clone();
                 let resolve_jitcode = |jitcode_index: i32,
-                                       pc: i32,
-                                       _carried_jitcode_pc: i32|
+                                       pc: i32|
                  -> Option<crate::resume::ResolvedJitCode> {
                     let resolved_jitcode = jitcode_registry.get(jitcode_index as usize)?.clone();
                     Some(crate::resume::ResolvedJitCode::new(
@@ -4465,12 +4464,8 @@ impl<S: JitState> JitDriver<S> {
             // macro mainloop bridge is single-frame, so the root frame's
             // dispatch JitCode is the only coordinate needed.
             //
-            // We pass `frame.pc`, not `frame.jitcode_pc`: the single-frame macro
-            // capture records the dispatch-JitCode position in `pc` and leaves
-            // `jitcode_pc = NO_JITCODE_PC` (sentinel, resume.rs single_frame_boxes),
-            // so `pc` is the valid liveness coordinate here.  A multi-frame
-            // consumer whose inlined callees carry real `jitcode_pc` words would
-            // index liveness per-frame by `jitcode_pc` instead.
+            // The frame's `pc` word stores the dispatch-JitCode position, so it
+            // is the liveness coordinate for this single-frame macro bridge.
             let bridge_reg_indices = self.dispatch_jitcode().and_then(|jc| {
                 bfm.frames.first().map(|frame| {
                     crate::resume::read_frame_liveness_reg_indices(
@@ -4835,8 +4830,7 @@ impl<S: JitState> JitDriver<S> {
                 // branch, no parent-relative descrs walk, no last-frame state).
                 let jitcode_registry = self.jitcode_registry.clone();
                 let resolve_jitcode = |jitcode_index: i32,
-                                       pc: i32,
-                                       _carried_jitcode_pc: i32|
+                                       pc: i32|
                  -> Option<crate::resume::ResolvedJitCode> {
                     let resolved_jitcode = jitcode_registry.get(jitcode_index as usize)?.clone();
                     Some(crate::resume::ResolvedJitCode::new(

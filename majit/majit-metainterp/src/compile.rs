@@ -542,8 +542,8 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
             {
                 use majit_ir::resumedata::{RebuiltValue, rebuild_from_numbering};
                 let fvc = majit_ir::resumedata::get_frame_value_count_fn();
-                let fvc_ref: Option<&dyn Fn(i32, i32, i32) -> usize> =
-                    fvc.as_ref().map(|f| f as &dyn Fn(i32, i32, i32) -> usize);
+                let fvc_ref: Option<&dyn Fn(i32, i32) -> usize> =
+                    fvc.as_ref().map(|f| f as &dyn Fn(i32, i32) -> usize);
                 let num_virtuals = op.resolved_rd_virtuals().map_or(0, |v| v.len());
                 let (_num_failargs, vable_values, _vref_values, frames) = rebuild_from_numbering(
                     &rd_numb_bytes,
@@ -659,8 +659,8 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
                 {
                     use majit_ir::resumedata::{RebuiltValue, rebuild_from_numbering};
                     let fvc = majit_ir::resumedata::get_frame_value_count_fn();
-                    let fvc_ref: Option<&dyn Fn(i32, i32, i32) -> usize> =
-                        fvc.as_ref().map(|f| f as &dyn Fn(i32, i32, i32) -> usize);
+                    let fvc_ref: Option<&dyn Fn(i32, i32) -> usize> =
+                        fvc.as_ref().map(|f| f as &dyn Fn(i32, i32) -> usize);
                     let num_virtuals = op.resolved_rd_virtuals().map_or(0, |v| v.len());
                     let (num_failargs, vable_values, vref_values, frames) = rebuild_from_numbering(
                         &rd_numb_bytes,
@@ -2634,7 +2634,6 @@ mod tests {
             framestack: vec![SnapshotFrame {
                 jitcode_index: 0,
                 pc: 8,
-                jitcode_pc: majit_ir::resumedata::NO_JITCODE_PC,
                 boxes: vec![OpRef::input_arg_int(1).into()],
             }],
         };

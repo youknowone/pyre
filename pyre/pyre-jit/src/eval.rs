@@ -9186,11 +9186,7 @@ mod tests {
             "selected resume pc must decode the raw-int local slot"
         );
         assert_eq!(
-            trace_state::frame_value_count_at(
-                jitcode_index,
-                resume_pc as i32,
-                majit_ir::resumedata::NO_JITCODE_PC,
-            ),
+            trace_state::frame_value_count_at(jitcode_index, resume_pc as i32),
             live_regs.len(),
             "frame-value count must come from the same compiled jitcode liveness block"
         );

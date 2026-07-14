@@ -271,16 +271,8 @@ impl From<majit_ir::OpRef> for SnapshotBox {
 pub struct SnapshotFrame {
     /// Index into the jitcode table (resume.py:250 jitcode_index).
     pub jitcode_index: i32,
-    /// Bytecode program counter (resume.py:250 pc).  In RPython this
-    /// is the JitCode byte offset; pyre stores the Python bytecode PC
-    /// here as a deviation (see `[[project-issue73-phase5-design]]`).
-    /// Resume readers translate via `PyJitCode::resume_jitcode_pc_for`.
+    /// JitCode byte offset (resume.py:250 pc).
     pub pc: i32,
-    /// Direct JitCode resume coordinate, or
-    /// [`majit_ir::resumedata::NO_JITCODE_PC`] when this frame resumes
-    /// through the Python `pc` → `pc_map` translation.  A branch-guard
-    /// kept-stack capture stores the guard's JitCode byte offset here.
-    pub jitcode_pc: i32,
     /// Live boxes for this frame's registers (resume.py:253).
     pub boxes: Vec<SnapshotBox>,
 }
@@ -302,30 +294,12 @@ impl Snapshot {
     }
 
     pub fn single_frame_boxes(jitcode_index: i32, pc: i32, boxes: Vec<SnapshotBox>) -> Self {
-        Self::single_frame_boxes_with_jitcode_pc(
-            jitcode_index,
-            pc,
-            majit_ir::resumedata::NO_JITCODE_PC,
-            boxes,
-        )
-    }
-
-    /// Like [`single_frame_boxes`], but carries the guard's JitCode byte
-    /// offset (`jitcode_pc`) for kept-stack resume.  Callers that have no
-    /// JitCode coordinate pass [`majit_ir::resumedata::NO_JITCODE_PC`].
-    pub fn single_frame_boxes_with_jitcode_pc(
-        jitcode_index: i32,
-        pc: i32,
-        jitcode_pc: i32,
-        boxes: Vec<SnapshotBox>,
-    ) -> Self {
         Snapshot {
             vable_array: Vec::new(),
             vref_array: Vec::new(),
             framestack: vec![SnapshotFrame {
                 jitcode_index,
                 pc,
-                jitcode_pc,
                 boxes,
             }],
         }
@@ -355,37 +329,14 @@ impl Snapshot {
     }
 
     pub fn multi_frame_boxes(frames: Vec<(i32, i32, Vec<SnapshotBox>)>) -> Self {
-        Self::multi_frame_boxes_with_jitcode_pc(
-            frames
-                .into_iter()
-                .map(|(jitcode_index, pc, boxes)| {
-                    (
-                        jitcode_index,
-                        pc,
-                        majit_ir::resumedata::NO_JITCODE_PC,
-                        boxes,
-                    )
-                })
-                .collect(),
-        )
-    }
-
-    /// Like [`multi_frame_boxes`], but each frame tuple carries the
-    /// guard's JitCode byte offset (`jitcode_pc`, 3rd element) for
-    /// kept-stack resume.  Frames with no JitCode coordinate pass
-    /// [`majit_ir::resumedata::NO_JITCODE_PC`].
-    pub fn multi_frame_boxes_with_jitcode_pc(
-        frames: Vec<(i32, i32, i32, Vec<SnapshotBox>)>,
-    ) -> Self {
         Snapshot {
             vable_array: Vec::new(),
             vref_array: Vec::new(),
             framestack: frames
                 .into_iter()
-                .map(|(jitcode_index, pc, jitcode_pc, boxes)| SnapshotFrame {
+                .map(|(jitcode_index, pc, boxes)| SnapshotFrame {
                     jitcode_index,
                     pc,
-                    jitcode_pc,
                     boxes,
                 })
                 .collect(),
@@ -2024,9 +1975,6 @@ impl EncodedResumeData {
         for frame in frames {
             rd_numb.push(frame.jitcode_index as i64);
             rd_numb.push(encode_u64(frame.pc));
-            // Per-frame `jitcode_pc` word; the test/embedder path never
-            // captures a guard coordinate, so it stays the sentinel.
-            rd_numb.push(majit_ir::resumedata::NO_JITCODE_PC as i64);
             // resume.py:253 _number_boxes(snapshot_iter, iter_array(snapshot), numb_state)
             for source in &frame.slot_map {
                 let tagged = memo.encode_tagged_source(source, &mut liveboxes, &mut box_map);
@@ -2113,9 +2061,6 @@ impl EncodedResumeData {
         while cursor < items_resume_len {
             let jitcode_index = self.next_word(&mut cursor) as i32;
             let pc = decode_u64(self.next_word(&mut cursor));
-            // Per-frame `jitcode_pc` word (after `pc`); discarded on this
-            // layout-decode path, which carries only `FrameInfo`.
-            let _jitcode_pc = self.next_word(&mut cursor);
             let slot_count = if frame_idx < self.frame_sizes.len() {
                 self.frame_sizes[frame_idx]
             } else {
@@ -3968,9 +3913,6 @@ impl ResumeDataLoopMemo {
         for frame in &snapshot.framestack {
             numb_state.append_int(frame.jitcode_index as i64);
             numb_state.append_int(frame.pc as i64);
-            // Per-frame `jitcode_pc` word (after `pc`); see
-            // `majit_ir::resumedata::NO_JITCODE_PC`.
-            numb_state.append_int(frame.jitcode_pc as i64);
             self._number_boxes(&frame.boxes, &mut numb_state, env)?;
         }
 
@@ -4309,8 +4251,6 @@ impl ResumeDataLoopMemo {
         for frame in &rd.frames {
             rd_numb.push(frame.jitcode_index as i64);
             rd_numb.push(encode_u64(frame.pc));
-            // Per-frame `jitcode_pc` word; sentinel on the test/embedder path.
-            rd_numb.push(majit_ir::resumedata::NO_JITCODE_PC as i64);
             for source in &frame.slot_map {
                 let tagged = self.encode_tagged_source(source, &mut liveboxes, &mut box_map);
                 rd_numb.push(tagged);
@@ -4738,76 +4678,18 @@ mod tests {
         assert_eq!(items[4], 0);
         // items[5] = pc = 8
         assert_eq!(items[5], 8);
-        // items[6] = jitcode_pc = NO_JITCODE_PC (sentinel)
-        assert_eq!(items[6], majit_ir::resumedata::NO_JITCODE_PC);
-        // items[7] = inline-Const(42) tagged as TAGINT(42) since 42 fits in 13 bits
-        let (val, tagbits) = untag(items[7] as i16);
+        // items[6] = inline-Const(42) tagged as TAGINT(42) since 42 fits in 13 bits
+        let (val, tagbits) = untag(items[6] as i16);
         assert_eq!(tagbits, TAGINT);
         assert_eq!(val, 42);
-        // items[8] = OpRef::int_op(1) tagged as TAGBOX(0) — first live box
-        let (val, tagbits) = untag(items[8] as i16);
+        // items[7] = OpRef::int_op(1) tagged as TAGBOX(0) — first live box
+        let (val, tagbits) = untag(items[7] as i16);
         assert_eq!(tagbits, TAGBOX);
         assert_eq!(val, 0);
-        // items[9] = OpRef::int_op(2) tagged as TAGBOX(1) — second live box
-        let (val, tagbits) = untag(items[9] as i16);
+        // items[8] = OpRef::int_op(2) tagged as TAGBOX(1) — second live box
+        let (val, tagbits) = untag(items[8] as i16);
         assert_eq!(tagbits, TAGBOX);
         assert_eq!(val, 1);
-    }
-
-    #[test]
-    fn test_single_frame_with_jitcode_pc_carries_offset_into_numbering() {
-        // #124 Approach B (M2): the production capture factory writes the
-        // guard's real JitCode byte offset into the per-frame `jitcode_pc`
-        // word of `rd_numb`, where `single_frame` / the legacy
-        // `single_frame_boxes` write `NO_JITCODE_PC` (`test_memo_number_simple`
-        // pins the sentinel at the same slot, `items[6]`).
-        use majit_ir::OpRef;
-        let mut memo = ResumeDataLoopMemo::new();
-        let env = SimpleBoxEnv::new();
-        let snapshot = Snapshot::single_frame_boxes_with_jitcode_pc(
-            0,
-            8,
-            42,
-            vec![OpRef::const_int(42).into(), OpRef::int_op(1).into()],
-        );
-        let numb_state = memo.number(&snapshot, &env, -1).unwrap();
-        let items = crate::resumecode::unpack_numbering(&numb_state.create_numbering());
-        // Empty vable/vref single-frame header:
-        // items[4]=jitcode_index(0) items[5]=pc(8) items[6]=jitcode_pc.
-        assert_eq!(items[4], 0); // jitcode_index
-        assert_eq!(items[5], 8); // pc
-        assert_eq!(items[6], 42); // jitcode_pc carried by the M2 factory
-        assert_ne!(items[6], majit_ir::resumedata::NO_JITCODE_PC);
-    }
-
-    #[test]
-    fn test_multi_frame_with_jitcode_pc_per_frame() {
-        // #124 Approach B (M2): the multi-frame factory carries a distinct
-        // `jitcode_pc` per frame; a frame with no JitCode coordinate keeps
-        // the `NO_JITCODE_PC` sentinel.
-        use majit_ir::OpRef;
-        let mut memo = ResumeDataLoopMemo::new();
-        let env = SimpleBoxEnv::new();
-        let snapshot = Snapshot::multi_frame_boxes_with_jitcode_pc(vec![
-            (
-                0,
-                10,
-                majit_ir::resumedata::NO_JITCODE_PC,
-                vec![OpRef::int_op(1).into()],
-            ),
-            (1, 20, 55, vec![OpRef::int_op(2).into()]),
-        ]);
-        let items = crate::resumecode::unpack_numbering(
-            &memo.number(&snapshot, &env, -1).unwrap().create_numbering(),
-        );
-        // Frame 0: items[4]=jitcode(0) items[5]=pc(10) items[6]=jitcode_pc(sentinel) items[7]=box
-        assert_eq!(items[4], 0);
-        assert_eq!(items[5], 10);
-        assert_eq!(items[6], majit_ir::resumedata::NO_JITCODE_PC);
-        // Frame 1: items[8]=jitcode(1) items[9]=pc(20) items[10]=jitcode_pc(55) items[11]=box
-        assert_eq!(items[8], 1);
-        assert_eq!(items[9], 20);
-        assert_eq!(items[10], 55);
     }
 
     #[test]
@@ -4896,18 +4778,16 @@ mod tests {
         let items = crate::resumecode::unpack_numbering(&numb_state.create_numbering());
         // items[1] = num_failargs: 0 (not patched — RPython patches in finish())
         assert_eq!(items[1], 0);
-        // items[6] = jitcode_pc = NO_JITCODE_PC (sentinel)
-        assert_eq!(items[6], majit_ir::resumedata::NO_JITCODE_PC);
-        // items[7] = OpRef::int_op(1) → TAGBOX(0)
-        let (val, tagbits) = untag(items[7] as i16);
+        // items[6] = OpRef::int_op(1) → TAGBOX(0)
+        let (val, tagbits) = untag(items[6] as i16);
         assert_eq!(tagbits, TAGBOX);
         assert_eq!(val, 0);
-        // items[8] = OpRef::ref_op(2) → TAGVIRTUAL(0)
-        let (val, tagbits) = untag(items[8] as i16);
+        // items[7] = OpRef::ref_op(2) → TAGVIRTUAL(0)
+        let (val, tagbits) = untag(items[7] as i16);
         assert_eq!(tagbits, TAGVIRTUAL);
         assert_eq!(val, 0);
-        // items[9] = OpRef::int_op(3) → TAGBOX(1)
-        let (val, tagbits) = untag(items[9] as i16);
+        // items[8] = OpRef::int_op(3) → TAGBOX(1)
+        let (val, tagbits) = untag(items[8] as i16);
         assert_eq!(tagbits, TAGBOX);
         assert_eq!(val, 1);
     }
@@ -5020,9 +4900,8 @@ mod tests {
         let numb_state = memo.number(&snapshot, &env, -1).unwrap();
         let items = crate::resumecode::unpack_numbering(&numb_state.create_numbering());
 
-        // items[6] = jitcode_pc (sentinel); items[7] = the frame's box.
-        assert_eq!(items[6], majit_ir::resumedata::NO_JITCODE_PC);
-        let (val, tagbits) = untag(items[7] as i16);
+        // items[6] = the frame's box.
+        let (val, tagbits) = untag(items[6] as i16);
         assert_eq!(tagbits, TAGVIRTUAL);
         assert_eq!(val, 0);
         assert_eq!(numb_state.num_boxes, 0);
@@ -5042,13 +4921,11 @@ mod tests {
                 SnapshotFrame {
                     jitcode_index: 0,
                     pc: 10,
-                    jitcode_pc: majit_ir::resumedata::NO_JITCODE_PC,
                     boxes: vec![OpRef::int_op(1).into(), OpRef::const_int(99).into()],
                 },
                 SnapshotFrame {
                     jitcode_index: 1,
                     pc: 20,
-                    jitcode_pc: majit_ir::resumedata::NO_JITCODE_PC,
                     boxes: vec![OpRef::int_op(2).into(), OpRef::int_op(3).into()],
                 },
             ],
@@ -5061,18 +4938,16 @@ mod tests {
         // Multi-frame encoding: no box_count, RPython parity.
         let items = crate::resumecode::unpack_numbering(&rd_numb);
         assert_eq!(items[1], 3); // num_failargs: 3 boxes patched
-        // Frame 0: items[4]=jitcode(0), items[5]=pc(10), items[6]=jitcode_pc, items[7..8]=tagged
+        // Frame 0: items[4]=jitcode(0), items[5]=pc(10), items[6..7]=tagged
         assert_eq!(items[4], 0);
         assert_eq!(items[5], 10);
-        assert_eq!(items[6], majit_ir::resumedata::NO_JITCODE_PC);
-        // Frame 1: items[9]=jitcode(1), items[10]=pc(20), items[11]=jitcode_pc, items[12..13]=tagged
-        assert_eq!(items[9], 1);
-        assert_eq!(items[10], 20);
-        assert_eq!(items[11], majit_ir::resumedata::NO_JITCODE_PC);
+        // Frame 1: items[8]=jitcode(1), items[9]=pc(20), items[10..11]=tagged
+        assert_eq!(items[8], 1);
+        assert_eq!(items[9], 20);
 
         // Roundtrip with liveness-based closure.
         let rd_consts: Vec<majit_ir::Const> = memo.consts().to_vec();
-        let frame_count = |jitcode_index: i32, _pc: i32, _jitcode_pc: i32| -> usize {
+        let frame_count = |jitcode_index: i32, _pc: i32| -> usize {
             match jitcode_index {
                 0 => 2, // Frame 0 has 2 boxes
                 1 => 2, // Frame 1 has 2 boxes
@@ -5161,7 +5036,6 @@ mod tests {
             framestack: vec![SnapshotFrame {
                 jitcode_index: 0,
                 pc: 8,
-                jitcode_pc: 13,
                 boxes: vec![OpRef::int_op(1).into()],
             }],
         };
@@ -5181,12 +5055,11 @@ mod tests {
         assert_eq!(items[5], 0); // vref_array_length
         assert_eq!(items[6], 0); // jitcode_index
         assert_eq!(items[7], 8); // pc
-        assert_eq!(items[8], 13); // jitcode_pc
 
         // The frame slot reuses the payload tag because numbering follows
         // Box identity exactly: upstream dedups only when the same Box object
         // appears twice, and in this test we passed the same OpRef twice.
-        let (val, tagbits) = untag(items[9] as i16);
+        let (val, tagbits) = untag(items[8] as i16);
         assert_eq!(tagbits, TAGBOX);
         assert_eq!(val, 0);
     }
@@ -5204,7 +5077,6 @@ mod tests {
         writer.append_int(0); // vref_array length
         writer.append_int(0); // jitcode_pos
         writer.append_int(0); // pc
-        writer.append_int(majit_ir::resumedata::NO_JITCODE_PC as i64); // jitcode_pc
         writer.patch_current_size(0);
         let rd_numb = writer.create_numbering();
 
@@ -5225,10 +5097,9 @@ mod tests {
             BC_CATCH_EXCEPTION as i32,
             BC_RVMPROF_CODE as i32,
         );
-        let resolve_jitcode =
-            |_jitcode_pos: i32, _pc: i32, _jitcode_pc: i32| -> Option<ResolvedJitCode> {
-                Some(ResolvedJitCode::new(runtime.clone(), 0))
-            };
+        let resolve_jitcode = |_jitcode_pos: i32, _pc: i32| -> Option<ResolvedJitCode> {
+            Some(ResolvedJitCode::new(runtime.clone(), 0))
+        };
 
         let all_liveness: Vec<u8> = vec![0, 0, 0];
         let (bh, virtualizable_ptr) = blackhole_from_resumedata(
@@ -6465,15 +6336,11 @@ impl<'a> ResumeDataDirectReader<'a> {
 
     // ---- AbstractResumeDataReader methods (resume.py:928-1038) ----
 
-    /// resume.py:928 read_jitcode_pos_pc.  Returns
-    /// `(jitcode_pos, pc, jitcode_pc)`; `jitcode_pc` is the direct JitCode
-    /// resume coordinate or `NO_JITCODE_PC` (see
-    /// `majit_ir::resumedata::NO_JITCODE_PC`).
-    pub fn read_jitcode_pos_pc(&mut self) -> (i32, i32, i32) {
+    /// resume.py:928 read_jitcode_pos_pc.  Returns `(jitcode_pos, pc)`.
+    pub fn read_jitcode_pos_pc(&mut self) -> (i32, i32) {
         let jitcode_pos = self.resumecodereader.next_item();
         let pc = self.resumecodereader.next_item();
-        let jitcode_pc = self.resumecodereader.next_item();
-        (jitcode_pos, pc, jitcode_pc)
+        (jitcode_pos, pc)
     }
 
     /// resume.py:933 next_int
@@ -6785,18 +6652,14 @@ impl<'a> ResumeDataDirectReader<'a> {
         resolve_jitcode: &dyn Fn(
             i32,
             i32,
-            i32,
         )
             -> Option<(std::sync::Arc<crate::jitcode::JitCode>, usize, u8)>,
         outputs: &mut Vec<i64>,
     ) -> bool {
         while !self.done_reading() {
-            // resume.py:1338-1340 read_jitcode_pos_pc.  `#124`: forward the
-            // carried direct JitCode pc to the resolver.
-            let (jitcode_pos, pc, jitcode_pc) = self.read_jitcode_pos_pc();
-            let Some((jitcode, resolved_pc, op_live)) =
-                resolve_jitcode(jitcode_pos, pc, jitcode_pc)
-            else {
+            // resume.py:1338-1340 read_jitcode_pos_pc.
+            let (jitcode_pos, pc) = self.read_jitcode_pos_pc();
+            let Some((jitcode, resolved_pc, op_live)) = resolve_jitcode(jitcode_pos, pc) else {
                 return false;
             };
             // `blackhole.rs:1435 get_current_position_info` parity —
@@ -7254,7 +7117,7 @@ impl Drop for ResumeRefRootsScope {
 
 pub fn blackhole_from_resumedata<'a>(
     builder: &mut crate::blackhole::BlackholeInterpBuilder,
-    resolve_jitcode: &dyn Fn(i32, i32, i32) -> Option<ResolvedJitCode>,
+    resolve_jitcode: &dyn Fn(i32, i32) -> Option<ResolvedJitCode>,
     rd_numb: &'a [u8],
     rd_consts: &'a [majit_ir::Const],
     all_liveness: &'a [u8],
@@ -7349,11 +7212,9 @@ pub fn blackhole_from_resumedata<'a>(
         nextbh.nextblackholeinterp = curbh;
 
         // resume.py:1338-1340
-        let (jitcode_pos, pc, jitcode_pc) = resumereader.read_jitcode_pos_pc();
+        let (jitcode_pos, pc) = resumereader.read_jitcode_pos_pc();
         // resume.py:1339-1340: jitcode = jitcodes[jitcode_pos]; curbh.setposition(jitcode, pc).
-        // `#124`: pass the carried direct JitCode pc so the resolver can
-        // prefer it over the lossy `pc_map` translation.
-        let resolved = resolve_jitcode(jitcode_pos, pc, jitcode_pc)?;
+        let resolved = resolve_jitcode(jitcode_pos, pc)?;
         if crate::bh_debug_enabled() {
             eprintln!(
                 "[bh-frame] jitcode_pos={jitcode_pos} encoded_pc={pc} resolved_pc={}",

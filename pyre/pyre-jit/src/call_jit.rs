@@ -1696,10 +1696,7 @@ pub fn blackhole_resume_via_rd_numb(
 
     // resume.py:1339 jitcodes[jitcode_pos]: resolve jitcode_index + pc
     // through the trace-side MetaInterpStaticData.jitcodes store.
-    let resolve_jitcode = |jitcode_index: i32,
-                           pc: i32,
-                           _carried_jitcode_pc: i32|
-     -> Option<resume::ResolvedJitCode> {
+    let resolve_jitcode = |jitcode_index: i32, pc: i32| -> Option<resume::ResolvedJitCode> {
         if pc < 0 {
             return None;
         }
@@ -5706,8 +5703,7 @@ pub fn cranelift_resumedata_deopt(
     }
     let op_live = op_live_i32 as u8;
     let resolve_jitcode = |jitcode_index: i32,
-                           pc: i32,
-                           _carried_jitcode_pc: i32|
+                           pc: i32|
      -> Option<(
         std::sync::Arc<majit_metainterp::jitcode::JitCode>,
         usize,
