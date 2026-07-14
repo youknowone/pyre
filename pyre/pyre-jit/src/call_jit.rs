@@ -2497,6 +2497,20 @@ pub fn trace_and_compile_from_bridge(
     // always-correct blackhole resume handles it.  (Routing the bridge walk
     // to the handler is the orthodox follow-up, gated on the in-try
     // residual-call resume-PC epic; declining is correctness-first.)
+    //
+    // The escaping case — an exception guard whose raising op is NOT caught in
+    // this frame, so the exception unwinds OUT to the caller — has the same
+    // fallthrough-not-catch resume gap: the guard's resume_pc is the
+    // no-exception fallthrough, so the bridge walk records the RETURN of the
+    // NULL raised-call result and the compiled bridge hands a NULL up to the
+    // caller (the "call failed" crash).  The
+    // `emit_exception_bridge_prologue` GUARD_EXCEPTION path that would trace
+    // the propagate-out continuation needs resume-data replay pyre does not yet
+    // have (its synthetic guard carries no rd_resume_position), so decline the
+    // escaping case too and let the blackhole propagate the exception out of
+    // the frame to the caller's handler.  Compiling a real raising bridge
+    // (`Finish(exc, exit_frame_with_exception_descr_ref)`) is the orthodox
+    // follow-up, gated on the same exception-edge bridge epic.
     let caught_in_frame = pending_exc && last_bridge_is_exception_guard && {
         if is_multiframe_resume {
             // `resume_pc` (and thus `frame.last_instr`, set above) addresses the
@@ -2518,7 +2532,7 @@ pub fn trace_and_compile_from_bridge(
             pyre_interpreter::pycode::lookup_exceptiontable(&code.exceptiontable, off).is_some()
         }
     };
-    if pending_exc && (!last_bridge_is_exception_guard || caught_in_frame) {
+    if pending_exc {
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
                 "[jit][bridge-trace] decline (pending exc, caught_in_frame={caught_in_frame}) key={} trace={} fail={} resume_pc={}",
