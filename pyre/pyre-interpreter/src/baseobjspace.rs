@@ -10749,7 +10749,7 @@ fn generator_send_ex(
     gen_obj: PyObjectRef,
     w_arg: PyObjectRef,
     operr: Option<PyError>,
-    throw_args: Option<[PyObjectRef; 3]>,
+    throw_args: Option<([PyObjectRef; 3], usize)>,
 ) -> PyResult {
     use pyre_object::generator::*;
     unsafe {
@@ -10855,7 +10855,7 @@ fn resume_yield_from(
     frame: &mut crate::pyframe::PyFrame,
     w_arg: PyObjectRef,
     operr: Option<PyError>,
-    throw_args: Option<[PyObjectRef; 3]>,
+    throw_args: Option<([PyObjectRef; 3], usize)>,
 ) -> Result<Option<PyObjectRef>, PyError> {
     let w_yf = frame.w_yielding_from;
     debug_assert!(!w_yf.is_null());
@@ -10893,7 +10893,7 @@ fn resume_yield_from(
 fn throw_yield_from(
     w_yf: PyObjectRef,
     err: PyError,
-    throw_args: Option<[PyObjectRef; 3]>,
+    throw_args: Option<([PyObjectRef; 3], usize)>,
 ) -> PyResult {
     unsafe {
         if pyre_object::generator::is_generator(w_yf) {
@@ -10905,10 +10905,10 @@ fn throw_yield_from(
         Err(attr_err) if attr_err.kind == PyErrorKind::AttributeError => return Err(err),
         Err(attr_err) => return Err(attr_err),
     };
-    if let Some([w_type, w_val, w_tb]) = throw_args {
-        // PEP 380 / generator.py delegation forwards the original three
-        // throw arguments, rather than a synthesized exception instance.
-        return crate::call::call_function_impl_result(throw, &[w_type, w_val, w_tb]);
+    if let Some((args, argc)) = throw_args {
+        // PEP 380 delegation forwards exactly the original positional throw
+        // arguments, rather than a synthesized exception instance.
+        return crate::call::call_function_impl_result(throw, &args[..argc]);
     }
     let w_exc = err.to_exc_object();
     let w_type = crate::typedef::r#type(w_exc).unwrap_or(pyre_object::PY_NULL);
@@ -11286,11 +11286,17 @@ fn generator_throw_method(args: &[PyObjectRef]) -> PyResult {
     };
     let w_val = args.get(2).copied().unwrap_or_else(w_none);
     let w_tb = args.get(3).copied().unwrap_or_else(w_none);
+    let argc = (args.len() - 1).clamp(1, 3);
 
     // A non-exception argument or a normalization failure is raised to the
     // caller; the generator is not resumed.
     let err = normalize_throw_args(w_type, w_val)?;
-    generator_send_ex(gen_obj, w_none(), Some(err), Some([w_type, w_val, w_tb]))
+    generator_send_ex(
+        gen_obj,
+        w_none(),
+        Some(err),
+        Some(([w_type, w_val, w_tb], argc)),
+    )
 }
 
 /// PyPy: GeneratorIterator.descr_close()
