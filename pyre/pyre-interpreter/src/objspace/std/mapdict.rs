@@ -2781,6 +2781,11 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
         Box::into_raw(Box::new(w_result)) as *mut u8
     }
 
+    /// Production MapDictStrategy storage is a borrowed GC edge to the
+    /// backing `W_ObjectObject` (`strategy.erase(self)`), not a container
+    /// owned by the dict view.  The instance collector reclaims it.
+    unsafe fn dealloc_storage(&self, _w_dict: PyObjectRef) {}
+
     /// mapdict.py:1157-1166 `getitem`.
     unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> Option<PyObjectRef> {
         if pyre_object::is_str(w_key) {

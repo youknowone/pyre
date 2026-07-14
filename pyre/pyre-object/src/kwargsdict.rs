@@ -112,6 +112,13 @@ impl DictStrategy for KwargsDictStrategy {
         Box::into_raw(v) as *mut u8
     }
 
+    unsafe fn dealloc_storage(&self, w_dict: PyObjectRef) {
+        let dict = &*(w_dict as *const crate::dictmultiobject::W_DictObject);
+        drop(Box::from_raw(
+            dict.dstorage as *mut (Vec<PyObjectRef>, Vec<PyObjectRef>),
+        ));
+    }
+
     /// `kwargsdict.py:134-141 switch_to_object_strategy` — walk
     /// parallel arrays, rebuild `IndexMap<ObjectKey, PyObjectRef>`,
     /// retire the typed parallel-array box.

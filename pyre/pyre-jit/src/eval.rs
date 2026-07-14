@@ -467,6 +467,18 @@ unsafe fn dict_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
     unsafe { strategy.walk_gc_refs(w_dict, &mut adapter) };
 }
 
+/// Reclaim the Rust-owned erased storage container of a swept regular dict.
+/// The strategy reconstructs the exact Box type; contained PyObjectRefs remain
+/// collector-owned.  MapDictStrategy's dstorage is a borrowed GC edge and its
+/// strategy deallocator is deliberately a no-op.
+unsafe fn dict_object_destructor(obj_addr: usize) {
+    let obj = obj_addr as pyre_object::PyObjectRef;
+    let dict = unsafe { &*(obj as *const pyre_object::dictmultiobject::W_DictObject) };
+    if !dict.dstorage.is_null() {
+        unsafe { dict.dstrategy.dealloc_storage(obj) };
+    }
+}
+
 /// Custom trace for `W_ObjectObject` (instance `map`+`storage`,
 /// `mapdict.py:907-910`).  The `storage` list is an off-GC
 /// `Box<Vec<PyObjectRef>>`, so — exactly as `dict_object_custom_trace`
@@ -1450,11 +1462,14 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     // PyObjectRef)>` behind a raw pointer. Register a custom trace
     // hook so the GC updates those indirect key/value slots just as it
     // updates inline object fields.
-    let w_dict_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
-        std::mem::size_of::<pyre_object::dictmultiobject::W_DictObject>(),
-        object_tid,
-        dict_object_custom_trace,
-    ));
+    let w_dict_tid = gc.register_type(
+        TypeInfo::object_subclass_with_custom_trace(
+            std::mem::size_of::<pyre_object::dictmultiobject::W_DictObject>(),
+            object_tid,
+            dict_object_custom_trace,
+        )
+        .with_destructor_fn(dict_object_destructor),
+    );
     debug_assert_eq!(w_dict_tid, W_DICT_GC_TYPE_ID);
     majit_gc::GcAllocator::register_vtable_for_type(
         &mut gc,

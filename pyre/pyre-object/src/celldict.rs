@@ -938,6 +938,11 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
         crate::lltype::malloc_raw(ModuleDictStorage::new()) as *mut u8
     }
 
+    unsafe fn dealloc_storage(&self, w_dict: PyObjectRef) {
+        let dict = &*(w_dict as *const crate::dictmultiobject::W_ModuleDictObject);
+        drop(Box::from_raw(dict.dstorage));
+    }
+
     /// `celldict.py:131-141 getitem` — str fast path, else
     /// `switch_to_object_strategy` then walk unified entries.
     /// Body in `w_module_dict_lookup_inner` to avoid recursing

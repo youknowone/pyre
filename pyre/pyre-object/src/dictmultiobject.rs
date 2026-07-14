@@ -2579,11 +2579,15 @@ pub unsafe fn w_dict_adopt_regular_copy_for_empty_update(dst: PyObjectRef, w_cop
     debug_assert!(!is_module_dict(w_copy));
 
     let dst_dict = &mut *(dst as *mut W_DictObject);
-    let copy_dict = &*(w_copy as *const W_DictObject);
+    let copy_dict = &mut *(w_copy as *mut W_DictObject);
     let old_dstorage = dst_dict.dstorage;
 
     dst_dict.dstrategy = copy_dict.dstrategy;
     dst_dict.dstorage = copy_dict.dstorage;
+    // `w_copy` is a consumed temporary.  Move, rather than alias, its storage:
+    // once W_DictObject has a GC destructor, leaving both dicts pointing at the
+    // same Box would let the temporary free the destination's live backing.
+    copy_dict.dstorage = std::ptr::null_mut();
     dict_write_barrier(dst);
 
     if !old_dstorage.is_null() {
@@ -3961,6 +3965,15 @@ pub trait DictStrategy {
     /// freshly-allocated erased storage for this strategy.  Required.
     fn get_empty_storage(&self) -> *mut u8;
 
+    /// Free the out-of-line `dstorage` container owned by this dict on
+    /// collection. Frees the Rust map/Vec backing ONLY; the `PyObjectRef`
+    /// keys/values are GC-managed and reclaimed by the collector.
+    ///
+    /// # Safety
+    /// `w_dict` must be a valid `W_DictObject` whose strategy is `self`, and
+    /// called at most once (from the GC destructor of a swept dict).
+    unsafe fn dealloc_storage(&self, w_dict: PyObjectRef);
+
     /// `dictmultiobject.py:469-470 getitem` — required.
     ///
     /// # Safety
@@ -4533,6 +4546,10 @@ impl DictStrategy for EmptyKwargsDictStrategy {
         EMPTY_DICT_STRATEGY.get_empty_storage()
     }
 
+    /// `w_dict_new_kwargs` represents `erased(None)` with a null pointer;
+    /// there is no allocation to reclaim while this strategy is active.
+    unsafe fn dealloc_storage(&self, _w_dict: PyObjectRef) {}
+
     /// An empty kwargs dict has the `erased(None)` null `dstorage` from
     /// `w_dict_new_kwargs` and holds no entries — `setitem`/`setitem_str`
     /// switch to a concrete strategy before storing — so there is nothing
@@ -4638,6 +4655,16 @@ impl DictStrategy for EmptyDictStrategy {
         // until `switch_to_correct_strategy` flips the dict to a
         // concrete strategy and the Vec starts receiving entries.
         std::ptr::null_mut()
+    }
+
+    /// Regular empty dicts carry a per-dict Object-shape placeholder allocated
+    /// by `w_dict_new`; it is not the shared/null `erased(None)` sentinel.
+    unsafe fn dealloc_storage(&self, w_dict: PyObjectRef) {
+        let dict = &*(w_dict as *const crate::dictmultiobject::W_DictObject);
+        drop(Box::from_raw(
+            dict.dstorage
+                as *mut indexmap::IndexMap<crate::dictmultiobject::ObjectKey, PyObjectRef>,
+        ));
     }
 
     /// `dictmultiobject.py:732-736 EmptyDictStrategy.switch_to_object_strategy`
@@ -4832,6 +4859,14 @@ impl DictStrategy for ObjectDictStrategy {
         Box::into_raw(v) as *mut u8
     }
 
+    unsafe fn dealloc_storage(&self, w_dict: PyObjectRef) {
+        let dict = &*(w_dict as *const crate::dictmultiobject::W_DictObject);
+        drop(Box::from_raw(
+            dict.dstorage
+                as *mut indexmap::IndexMap<crate::dictmultiobject::ObjectKey, PyObjectRef>,
+        ));
+    }
+
     /// `dictmultiobject.py:1213-1215 getitem` — `self.unerase
     /// (w_dict.dstorage).get(w_key)` plus pyre's `dict_storage_proxy`
     /// storage-first contract for str keys.  Body in
@@ -5011,6 +5046,13 @@ impl DictStrategy for BytesDictStrategy {
         Box::into_raw(v) as *mut u8
     }
 
+    unsafe fn dealloc_storage(&self, w_dict: PyObjectRef) {
+        let dict = &*(w_dict as *const crate::dictmultiobject::W_DictObject);
+        drop(Box::from_raw(
+            dict.dstorage as *mut indexmap::IndexMap<Vec<u8>, PyObjectRef>,
+        ));
+    }
+
     /// `dictmultiobject.py:1095-1103 AbstractTypedStrategy.getitem`.
     unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> Option<PyObjectRef> {
         if crate::is_bytes(w_key) {
@@ -5170,6 +5212,14 @@ impl DictStrategy for UnicodeDictStrategy {
         let v: Box<indexmap::IndexMap<crate::dictmultiobject::ObjectKey, PyObjectRef>> =
             Box::new(indexmap::IndexMap::new());
         Box::into_raw(v) as *mut u8
+    }
+
+    unsafe fn dealloc_storage(&self, w_dict: PyObjectRef) {
+        let dict = &*(w_dict as *const crate::dictmultiobject::W_DictObject);
+        drop(Box::from_raw(
+            dict.dstorage
+                as *mut indexmap::IndexMap<crate::dictmultiobject::ObjectKey, PyObjectRef>,
+        ));
     }
 
     /// `dictmultiobject.py:1095-1103 AbstractTypedStrategy.getitem`.
@@ -5379,6 +5429,13 @@ impl DictStrategy for IntDictStrategy {
     fn get_empty_storage(&self) -> *mut u8 {
         let v: Box<indexmap::IndexMap<i64, PyObjectRef>> = Box::new(indexmap::IndexMap::new());
         Box::into_raw(v) as *mut u8
+    }
+
+    unsafe fn dealloc_storage(&self, w_dict: PyObjectRef) {
+        let dict = &*(w_dict as *const crate::dictmultiobject::W_DictObject);
+        drop(Box::from_raw(
+            dict.dstorage as *mut indexmap::IndexMap<i64, PyObjectRef>,
+        ));
     }
 
     /// `dictmultiobject.py:1095-1103 AbstractTypedStrategy.getitem`.
