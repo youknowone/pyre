@@ -8980,6 +8980,7 @@ impl JitState for PyreJitState {
             );
         }
         if resume_data.frames.len() > 1 {
+            let root_jitcode_index = resume_data.frames[0].jitcode_index;
             let root_pc_valid = resume_data.frames[0].pc >= 0;
             let root_pc = if root_pc_valid {
                 resume_data.frames[0].pc as usize
@@ -9022,7 +9023,11 @@ impl JitState for PyreJitState {
                 // instead, degrading to the blackhole re-interpret.
                 recipes.clear();
             }
-            ctx.set_bridge_inline_carrier(BridgeInlineCarrier { root_pc, recipes });
+            ctx.set_bridge_inline_carrier(BridgeInlineCarrier {
+                root_pc,
+                root_jitcode_index,
+                recipes,
+            });
         }
     }
 

@@ -399,6 +399,11 @@ pub fn trace_bytecode(
     } else {
         start_pc
     };
+    let lasti_pc = if let Some(ref c) = carrier {
+        crate::state::backxlat_py_pc(c.root_jitcode_index, c.root_pc as i32) as usize
+    } else {
+        start_pc
+    };
     // RPython MetaInterp._interpret() parity: the walker (sole tracer)
     // executes as it records over a concrete `PyFrame` snapshot
     // (`snapshot_for_tracing`); the interpreter does not run during tracing.
@@ -412,7 +417,7 @@ pub fn trace_bytecode(
     // record-only, and `flush_walk_end_state_to_frame`
     // (`raise_continue_running_normally` parity) advances the real frame so
     // the interpreter resumes AFTER the walked region, not from its start.
-    concrete_frame.set_last_instr_from_next_instr(start_pc);
+    concrete_frame.set_last_instr_from_next_instr(lasti_pc);
     let w_code = concrete_frame.pycode;
     // Issue #73 walker-as-tracer foundation probe (read-only).
     // `PYRE_DUMP_PERFN_JITCODE=1` dumps the per-CodeObject JitCode body
@@ -420,7 +425,7 @@ pub fn trace_bytecode(
     // `miframe.pc == jitcode_pc` and `pc_map` can retire.  See
     // `project_issue73_architecture_walker_as_tracer_2026_05_28`.
     if std::env::var_os("PYRE_DUMP_PERFN_JITCODE").is_some() {
-        dump_perfn_jitcode_for_trace(w_code, start_pc);
+        dump_perfn_jitcode_for_trace(w_code, lasti_pc);
     }
     let cf_addr = &*concrete_frame as *const pyre_interpreter::pyframe::PyFrame as usize;
     // The snapshot stands in for concrete stepping only; vable-statics
@@ -439,6 +444,12 @@ pub fn trace_bytecode(
     // (trace_opcode.rs:3323-3424) and don't call init_symbolic; this path
     // handles the root frame push.
     sym.init_symbolic(ctx, cf_addr);
+    if let Some(ref carrier) = carrier {
+        debug_assert_eq!(
+            unsafe { (*sym.jitcode).index as i32 },
+            carrier.root_jitcode_index
+        );
+    }
     // Issue #215 item 2: drive the multiframe bridge-carrier resume via the
     // full-body walker (reconstruct the in-flight callee framestack + walk
     // innermost-first) instead of aborting to a no-JIT re-interpret below.
@@ -855,7 +866,8 @@ fn inject_root_call_result(sym: &mut PyreSym, root_pc: usize, result: majit_ir::
         return false;
     }
     let jitcode_index = unsafe { (*sym.jitcode).index as i32 };
-    let Some(result_color) = crate::state::result_color_at_pc_at(jitcode_index, root_pc) else {
+    let root_py_pc = crate::state::backxlat_py_pc(jitcode_index, root_pc as i32) as usize;
+    let Some(result_color) = crate::state::result_color_at_pc_at(jitcode_index, root_py_pc) else {
         return false;
     };
     let nlocals = sym.nlocals;
@@ -975,7 +987,10 @@ fn drive_bridge_carrier_walk(
         if carrier.recipes.len() == 1 && std::env::var_os("PYRE_P2_COMPILE").is_some() {
             if inject_root_call_result(sym, root_pc, result) {
                 crate::jitcode_dispatch::census_record("P2Drain::CompileRoot");
-                return full_body_walk_trace(ctx, sym, w_code, root_pc, cf_addr);
+                let root_py_pc =
+                    crate::state::backxlat_py_pc(carrier.root_jitcode_index, root_pc as i32)
+                        as usize;
+                return full_body_walk_trace(ctx, sym, w_code, root_py_pc, cf_addr);
             }
             crate::jitcode_dispatch::census_record("P2Drain::ResultSlotUnresolved");
         }
@@ -1109,10 +1124,13 @@ fn drive_bridge_framestack_walk(
     let local_concretes = &recipe.concrete_r[..nlocals];
     let pos_after_setup = ctx.get_trace_position();
     if std::env::var_os("PYRE_P2_DIAG").is_some() {
-        let root_entry = crate::state::pyjitcode_for_code(w_code)
-            .and_then(|pjc| pjc.resume_jitcode_pc_for(root_pc));
+        let root_entry = crate::state::pyjitcode_for_code(w_code).and_then(|pjc| {
+            let root_py_pc =
+                crate::state::backxlat_py_pc(pjc.jitcode.index() as i32, root_pc as i32) as usize;
+            pjc.resume_jitcode_pc_for(root_py_pc)
+        });
         eprintln!(
-            "[p2-fs] callee_entry(jit)={entry} callee.pc(py)={} root_pc(py)={root_pc} root_entry(jit)={root_entry:?} pos_pre={pre_pos:?} pos_after_setup={pos_after_setup:?}",
+            "[p2-fs] callee_entry(jit)={entry} callee.pc(py)={} root_pc(jit)={root_pc} root_entry(jit)={root_entry:?} pos_pre={pre_pos:?} pos_after_setup={pos_after_setup:?}",
             crate::state::backxlat_py_pc(recipe.jitcode_index, recipe.jitcode_pc)
         );
     }
@@ -1211,12 +1229,14 @@ fn drive_outer_continuation_and_map(
     pre_pos: majit_metainterp::recorder::TracePosition,
 ) -> Option<TraceAction> {
     let root_pjc = crate::state::pyjitcode_for_code(w_code)?;
+    let root_py_pc =
+        crate::state::backxlat_py_pc(root_pjc.jitcode.index() as i32, root_pc as i32) as usize;
     let entry = select_recipe_entry(
         root_pjc.jitcode.index() as i32,
         root_pjc.jitcode.index() as i32,
-        root_pc,
+        root_py_pc,
         root_pc as i32,
-        || root_pjc.resume_jitcode_pc_for(root_pc),
+        || root_pjc.resume_jitcode_pc_for(root_py_pc),
     )?;
     // Decode the call-dst register: the op whose `next_pc == entry` is the
     // residual call the outer resumes after; its `>r` dst is the last operand
@@ -1288,8 +1308,12 @@ fn drive_outer_continuation_and_map(
         Some(Ok((crate::jitcode_dispatch::DispatchOutcome::Terminate, _end_pc))) => {
             match crate::jitcode_dispatch::fbw_finish_payload_take() {
                 Some((_, majit_ir::Type::Void)) => {
-                    let key = crate::driver::make_green_key(w_code, root_pc);
-                    ctx.set_green_key(key, (w_code as usize, root_pc));
+                    let green_pc = crate::state::backxlat_py_pc(
+                        root_pjc.jitcode.index() as i32,
+                        root_pc as i32,
+                    ) as usize;
+                    let key = crate::driver::make_green_key(w_code, green_pc);
+                    ctx.set_green_key(key, (w_code as usize, green_pc));
                     Some(TraceAction::Finish {
                         finish_args: vec![],
                         finish_arg_types: vec![],
@@ -1297,8 +1321,12 @@ fn drive_outer_continuation_and_map(
                     })
                 }
                 Some((finish_value, finish_type)) => {
-                    let key = crate::driver::make_green_key(w_code, root_pc);
-                    ctx.set_green_key(key, (w_code as usize, root_pc));
+                    let green_pc = crate::state::backxlat_py_pc(
+                        root_pjc.jitcode.index() as i32,
+                        root_pc as i32,
+                    ) as usize;
+                    let key = crate::driver::make_green_key(w_code, green_pc);
+                    ctx.set_green_key(key, (w_code as usize, green_pc));
                     crate::jitcode_dispatch::census_record("P2Framestack::OuterFinish");
                     if std::env::var_os("PYRE_P2_DIAG").is_some() {
                         eprintln!(

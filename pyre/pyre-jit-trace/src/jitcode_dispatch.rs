@@ -2814,7 +2814,7 @@ fn compute_bridge_root_parent_frame(
     // `root_pc` (`resume_data.frames[0].pc`) is already the post-call resume
     // point — the slot the inner frame's result lands in — so it is the
     // fallthrough `resume_py_pc` directly (no `semantic_fallthrough_pc`).
-    let resume_py_pc = root_pc as u32;
+    let resume_py_pc = crate::state::backxlat_py_pc(jitcode_index as i32, root_pc as i32) as u32;
     // Null the not-yet-produced call-result slot before collecting the active
     // boxes (the reconstructed callee supplies it on `SubReturn`), mirroring
     // `compute_inline_caller_frame`.  Operate on a clone so `root_sym` stays a
@@ -2833,7 +2833,10 @@ fn compute_bridge_root_parent_frame(
         .bridge_registers_r
         .clone()
         .unwrap_or_else(|| root_sym.registers_r.clone());
-    if let Some(result_color) = crate::state::result_color_at_pc_at(jitcode_index as i32, root_pc) {
+    let root_py_pc = crate::state::backxlat_py_pc(jitcode_index as i32, root_pc as i32) as usize;
+    if let Some(result_color) =
+        crate::state::result_color_at_pc_at(jitcode_index as i32, root_py_pc)
+    {
         if result_color < regs_r.len() {
             regs_r[result_color] = trace_ctx.const_ref(pyre_object::PY_NULL as i64);
         }
@@ -3065,7 +3068,8 @@ pub(crate) fn drive_bridge_carrier_subwalk(
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             // The outer Python frame is the root, paused at `root_pc`.
-            entry_py_pc: root_pc as u32,
+            entry_py_pc: crate::state::backxlat_py_pc(outer_jitcode_index as i32, root_pc as i32)
+                as u32,
             outer_resume_marker_jit_pc: root_frame.resume_marker_jit_pc,
             outer_jitcode_index,
             outer_active_boxes,
@@ -3217,7 +3221,7 @@ pub(crate) fn drive_outer_frame_continuation(
         // Mirror `compute_bridge_root_parent_frame` so scatter reads the banks in collection order.
         let banks = crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
             outer_jitcode_index as i32,
-            root_pc as i32,
+            crate::state::backxlat_py_pc(outer_jitcode_index as i32, root_pc as i32),
             match root_word.filter(|_| m73_outercap_carry_enabled()) {
                 Some(w) => w as i32,
                 None => majit_ir::resumedata::NO_JITCODE_PC,
@@ -3332,7 +3336,8 @@ pub(crate) fn drive_outer_frame_continuation(
             sub_jitcode_lookup: lookup_ref,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
-            entry_py_pc: root_pc as u32,
+            entry_py_pc: crate::state::backxlat_py_pc(outer_jitcode_index as i32, root_pc as i32)
+                as u32,
             outer_resume_marker_jit_pc: root_frame.resume_marker_jit_pc,
             outer_jitcode_index,
             outer_active_boxes,

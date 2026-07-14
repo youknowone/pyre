@@ -568,6 +568,8 @@ pub struct BridgeInlineCarrier {
     /// pc; the root must instead resume at its own `frames[0].pc`, so this is
     /// threaded separately rather than derived from the trace start pc.
     pub root_pc: usize,
+    /// The JitCode body that owns `root_pc`.
+    pub root_jitcode_index: i32,
     /// `resume_data.frames[1..]`, OUTERMOST-FIRST. The portal (`frames[0]`)
     /// is NOT here — it is the caller-visible root `sym`.
     pub recipes: Vec<ReconstructRecipe>,
