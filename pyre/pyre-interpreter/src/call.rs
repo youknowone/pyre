@@ -3068,37 +3068,66 @@ fn build_class_inner(
     // rare `__prepare__` returning a W_ModuleDictObject still walks
     // correctly.  Both branches share the same shape; collapse them
     // around the dispatching surface.
-    let mut class_ns = Box::new(DictStorage::new());
-    if let Some(w_prepared_dict) = w_namespace {
+    let _class_ns_root = pyre_object::gc_roots::push_roots();
+    let w_namespace_root = w_namespace.map(|w_namespace| {
+        let root = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(w_namespace);
+        root
+    });
+    let class_ns = pyre_object::w_dict_new();
+    let class_ns_root = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(class_ns);
+    if let Some(w_namespace_root) = w_namespace_root {
+        let w_prepared_dict = pyre_object::gc_roots::shadow_stack_get(w_namespace_root);
         if unsafe { pyre_object::is_dict(w_prepared_dict) } {
-            for (key, value) in unsafe { pyre_object::w_dict_items(w_prepared_dict) } {
-                if !value.is_null() && unsafe { pyre_object::is_str(key) } {
-                    crate::dict_storage_store_wtf8(
-                        &mut class_ns,
-                        unsafe { pyre_object::w_str_get_wtf8(key) },
-                        value,
-                    );
+            let keys: Vec<Wtf8Buf> = unsafe {
+                pyre_object::w_dict_str_entries_wtf8(w_prepared_dict)
+                    .into_iter()
+                    .map(|(key, _)| key)
+                    .collect()
+            };
+            for key in keys {
+                let w_prepared_dict = pyre_object::gc_roots::shadow_stack_get(w_namespace_root);
+                let Some(value) =
+                    (unsafe { pyre_object::w_dict_getitem_wtf8(w_prepared_dict, &key) })
+                else {
+                    continue;
+                };
+                if value.is_null() {
+                    continue;
                 }
+                let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
+                unsafe { pyre_object::w_dict_setitem_wtf8_no_proxy(class_ns, &key, value) };
             }
         }
         // dict subclass instance (e.g. EnumDict): backing dict via __dict_data__
+        let w_prepared_dict = pyre_object::gc_roots::shadow_stack_get(w_namespace_root);
         if unsafe { pyre_object::is_instance(w_prepared_dict) } {
             let backing = crate::type_methods::resolve_dict_backing(w_prepared_dict);
             if !backing.is_null() && unsafe { pyre_object::is_dict(backing) } {
-                for (key, value) in unsafe { pyre_object::w_dict_items(backing) } {
-                    if !value.is_null() && unsafe { pyre_object::is_str(key) } {
-                        crate::dict_storage_store_wtf8(
-                            &mut class_ns,
-                            unsafe { pyre_object::w_str_get_wtf8(key) },
-                            value,
-                        );
+                let backing_root = pyre_object::gc_roots::shadow_stack_len();
+                pyre_object::gc_roots::pin_root(backing);
+                let keys: Vec<Wtf8Buf> = unsafe {
+                    pyre_object::w_dict_str_entries_wtf8(backing)
+                        .into_iter()
+                        .map(|(key, _)| key)
+                        .collect()
+                };
+                for key in keys {
+                    let backing = pyre_object::gc_roots::shadow_stack_get(backing_root);
+                    let Some(value) = (unsafe { pyre_object::w_dict_getitem_wtf8(backing, &key) })
+                    else {
+                        continue;
+                    };
+                    if value.is_null() {
+                        continue;
                     }
+                    let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
+                    unsafe { pyre_object::w_dict_setitem_wtf8_no_proxy(class_ns, &key, value) };
                 }
             }
         }
     }
-    class_ns.fix_ptr();
-    let class_ns_ptr = Box::into_raw(class_ns);
 
     // w_namespace: if __prepare__ returned a custom dict, we'll replay
     // class body stores into it after execution. This lets EnumDict etc.
@@ -3144,9 +3173,11 @@ fn build_class_inner(
     // `compiling.py:207-209` runs `frame.setdictscope(w_namespace)`
     // unconditionally; route the frame's name binding through the mapping
     // via setdictscope.  An absent or plain-dict namespace keeps the
-    // DictStorage fast path (plain-dict stores have no observable side
+    // plain-dict fast path (plain-dict stores have no observable side
     // effects, and the metaclass replay below restores its final contents).
-    let mapping_namespace = w_namespace.filter(|&w| unsafe { !pyre_object::is_dict(w) });
+    let mapping_namespace = w_namespace_root
+        .map(pyre_object::gc_roots::shadow_stack_get)
+        .filter(|&w| unsafe { !pyre_object::is_dict(w) });
 
     let mut frame =
         crate::pyframe::FrameBox::new(PyFrame::try_new_for_call_with_closure_and_globals_obj(
@@ -3165,25 +3196,44 @@ fn build_class_inner(
     // run.  class_ns is rebuilt from the object after the body for the
     // downstream type construction.
     let _ns_root = pyre_object::gc_roots::push_roots();
-    let body_ns: PyObjectRef = match mapping_namespace {
-        Some(w_ns) => w_ns,
+    let (body_ns, body_ns_root): (PyObjectRef, Option<usize>) = match mapping_namespace {
+        Some(w_ns) => (w_ns, None),
         None => {
-            let w_ns = unsafe { pyre_object::w_dict_new() };
+            let w_ns = pyre_object::w_dict_new();
+            let w_ns_root = pyre_object::gc_roots::shadow_stack_len();
             pyre_object::gc_roots::pin_root(w_ns);
-            for (key, &value) in unsafe { (*class_ns_ptr).entries_wtf8() } {
+            let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
+            let keys: Vec<Wtf8Buf> = unsafe {
+                pyre_object::w_dict_str_entries_wtf8(class_ns)
+                    .into_iter()
+                    .map(|(key, _)| key)
+                    .collect()
+            };
+            for key in keys {
+                let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
+                let Some(value) = (unsafe { pyre_object::w_dict_getitem_wtf8(class_ns, &key) })
+                else {
+                    continue;
+                };
                 if value.is_null() {
                     continue;
                 }
+                let w_ns = pyre_object::gc_roots::shadow_stack_get(w_ns_root);
                 match key.as_str() {
                     Ok(s) => unsafe {
                         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(w_ns, s, value)
                     },
                     Err(_) => unsafe {
-                        pyre_object::dictmultiobject::w_dict_setitem_wtf8_no_proxy(w_ns, key, value)
+                        pyre_object::dictmultiobject::w_dict_setitem_wtf8_no_proxy(
+                            w_ns, &key, value,
+                        )
                     },
                 }
             }
-            w_ns
+            (
+                pyre_object::gc_roots::shadow_stack_get(w_ns_root),
+                Some(w_ns_root),
+            )
         }
     };
     frame.setdictscope(body_ns)?;
@@ -3210,22 +3260,35 @@ fn build_class_inner(
     // class_ns for the downstream type construction (classcell capture,
     // create_all_slots, __set_name__), which read class_ns.
     {
-        let w_ns = body_ns;
-        let class_ns = unsafe { &mut *class_ns_ptr };
+        let w_ns = body_ns_root
+            .map(pyre_object::gc_roots::shadow_stack_get)
+            .unwrap_or(body_ns);
         // Rebuild from the final contents so names `del`eted from the
         // namespace during body execution don't survive in class_ns.
-        class_ns.clear();
+        let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
+        unsafe { pyre_object::w_dict_clear(class_ns) };
         let backing = crate::type_methods::resolve_dict_backing(w_ns);
         if !backing.is_null() && unsafe { pyre_object::is_dict(backing) } {
             // Dict subclass: read final entries off the backing dict.
-            for (key, value) in unsafe { pyre_object::w_dict_items(backing) } {
-                if !value.is_null() && unsafe { pyre_object::is_str(key) } {
-                    crate::dict_storage_store_wtf8(
-                        class_ns,
-                        unsafe { pyre_object::w_str_get_wtf8(key) },
-                        value,
-                    );
+            let backing_root = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(backing);
+            let keys: Vec<Wtf8Buf> = unsafe {
+                pyre_object::w_dict_str_entries_wtf8(backing)
+                    .into_iter()
+                    .map(|(key, _)| key)
+                    .collect()
+            };
+            for key in keys {
+                let backing = pyre_object::gc_roots::shadow_stack_get(backing_root);
+                let Some(value) = (unsafe { pyre_object::w_dict_getitem_wtf8(backing, &key) })
+                else {
+                    continue;
+                };
+                if value.is_null() {
+                    continue;
                 }
+                let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
+                unsafe { pyre_object::w_dict_setitem_wtf8_no_proxy(class_ns, &key, value) };
             }
         } else if w_metaclass.is_some() {
             // A custom metaclass receives the raw mapping unchanged (passed
@@ -3237,7 +3300,10 @@ fn build_class_inner(
             let w_cellkey = pyre_object::w_str_new("__classcell__");
             match crate::baseobjspace::getitem(w_ns, w_cellkey) {
                 Ok(value) if !value.is_null() => {
-                    crate::dict_storage_store(class_ns, "__classcell__", value);
+                    let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
+                    unsafe {
+                        pyre_object::w_dict_setitem_str_no_proxy(class_ns, "__classcell__", value)
+                    };
                 }
                 Ok(_) => {}
                 Err(e) if e.kind == crate::PyErrorKind::KeyError => {}
@@ -3260,25 +3326,26 @@ fn build_class_inner(
                 }
                 let value = crate::baseobjspace::getitem(w_ns, key)?;
                 if !value.is_null() {
-                    crate::dict_storage_store_wtf8(
-                        class_ns,
-                        unsafe { pyre_object::w_str_get_wtf8(key) },
-                        value,
-                    );
+                    let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
+                    unsafe {
+                        pyre_object::w_dict_setitem_wtf8_no_proxy(
+                            class_ns,
+                            pyre_object::w_str_get_wtf8(key),
+                            value,
+                        )
+                    };
                 }
             }
         }
-        unsafe { (*class_ns_ptr).fix_ptr() };
     }
 
     // compiling.py:211-212 — when __mro_entries__ rewrote the bases, expose
     // the user-declared bases via __orig_bases__ in the class namespace.
     if let Some(w_orig_bases) = w_orig_bases {
+        let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
         unsafe {
-            let class_ns = &mut *class_ns_ptr;
-            crate::dict_storage_store(class_ns, "__orig_bases__", w_orig_bases);
-            class_ns.fix_ptr();
-        }
+            pyre_object::w_dict_setitem_str_no_proxy(class_ns, "__orig_bases__", w_orig_bases)
+        };
         if let Some(w_ns) = mapping_namespace {
             crate::baseobjspace::setitem(
                 w_ns,
@@ -3299,10 +3366,12 @@ fn build_class_inner(
     // (type_new_classcell) consumes them, so they are dropped per
     // construction path below rather than up front.
     let classcell = {
-        let class_ns = unsafe { &mut *class_ns_ptr };
-        let cell = class_ns.get("__classcell__").copied();
-        class_ns.remove("__class__");
-        class_ns.remove("__classdict__");
+        let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
+        let cell = unsafe { pyre_object::w_dict_getitem_str(class_ns, "__classcell__") };
+        let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
+        unsafe { pyre_object::w_dict_delitem_str_no_proxy(class_ns, "__class__") };
+        let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
+        unsafe { pyre_object::w_dict_delitem_str_no_proxy(class_ns, "__classdict__") };
         cell
     };
 
@@ -3312,25 +3381,33 @@ fn build_class_inner(
     // the default when `__doc__` is a declared slot — a class variable would
     // collide with the member descriptor (typing._SpecialForm).
     {
-        let class_ns = unsafe { &mut *class_ns_ptr };
-        if class_ns.get("__doc__").is_none() {
-            let doc_is_slot = match class_ns.get("__slots__").copied() {
-                Some(slots)
-                    if unsafe {
-                        pyre_object::is_str(slots)
-                            || pyre_object::is_tuple(slots)
-                            || pyre_object::is_list(slots)
-                    } =>
-                {
-                    collect_slot_names(slots)
-                        .map(|names| names.iter().any(|n| n == "__doc__"))
-                        .unwrap_or(false)
-                }
-                _ => false,
-            };
+        let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
+        if unsafe { pyre_object::w_dict_getitem_str(class_ns, "__doc__") }.is_none() {
+            let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
+            let doc_is_slot =
+                match unsafe { pyre_object::w_dict_getitem_str(class_ns, "__slots__") } {
+                    Some(slots)
+                        if unsafe {
+                            pyre_object::is_str(slots)
+                                || pyre_object::is_tuple(slots)
+                                || pyre_object::is_list(slots)
+                        } =>
+                    {
+                        collect_slot_names(slots)
+                            .map(|names| names.iter().any(|n| n == "__doc__"))
+                            .unwrap_or(false)
+                    }
+                    _ => false,
+                };
             if !doc_is_slot {
-                crate::dict_storage_store(class_ns, "__doc__", pyre_object::w_none());
-                class_ns.fix_ptr();
+                let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
+                unsafe {
+                    pyre_object::w_dict_setitem_str_no_proxy(
+                        class_ns,
+                        "__doc__",
+                        pyre_object::w_none(),
+                    )
+                };
             }
         }
     }
@@ -3366,10 +3443,13 @@ fn build_class_inner(
         None
     };
     let w_type = if let Some(w_metaclass) = w_metaclass {
+        let _metaclass_ns_root = pyre_object::gc_roots::push_roots();
+        let mut w_namespace_dict_root = None;
         // Convert class namespace to a dict for metaclass call.
         // If __prepare__ returned a custom dict, replay stores into it
         // so that __setitem__ side effects (e.g. EnumDict tracking) fire.
-        let w_namespace_dict = if let Some(w_prepared_dict) = w_namespace {
+        let mut w_namespace_dict = if let Some(w_namespace_root) = w_namespace_root {
+            let w_prepared_dict = pyre_object::gc_roots::shadow_stack_get(w_namespace_root);
             // Replay class body stores into the prepared dict so __setitem__
             // side effects (EnumDict tracking) fire — but only on the legacy
             // path where the body wrote into class_ns.  When the body executed
@@ -3377,16 +3457,28 @@ fn build_class_inner(
             // already holds every store; replaying would re-run __setitem__
             // and, for _EnumDict, reject the duplicate member keys.
             if mapping_namespace.is_none() {
-                let ns = unsafe { &*class_ns_ptr };
-                for (k, &v) in ns.entries_wtf8() {
-                    if !v.is_null() {
-                        let key = pyre_object::w_str_from_wtf8(k.to_owned());
-                        // `w_prepared_dict` is an exact `dict` on this branch
-                        // (`mapping_namespace.is_none()`), so this is a plain
-                        // dict store with a hashable `str` key; propagate any
-                        // (unreachable) hash error rather than dropping it.
-                        crate::baseobjspace::setitem(w_prepared_dict, key, v)?;
+                let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
+                let keys: Vec<Wtf8Buf> = unsafe {
+                    pyre_object::w_dict_str_entries_wtf8(class_ns)
+                        .into_iter()
+                        .map(|(key, _)| key)
+                        .collect()
+                };
+                for key in keys {
+                    let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
+                    let Some(value) = (unsafe { pyre_object::w_dict_getitem_wtf8(class_ns, &key) })
+                    else {
+                        continue;
+                    };
+                    if value.is_null() {
+                        continue;
                     }
+                    let w_prepared_dict = pyre_object::gc_roots::shadow_stack_get(w_namespace_root);
+                    // `w_prepared_dict` is an exact `dict` on this branch
+                    // (`mapping_namespace.is_none()`), so no user code runs.
+                    unsafe {
+                        pyre_object::w_dict_setitem_wtf8_no_proxy(w_prepared_dict, &key, value)
+                    };
                 }
             } else {
                 // The body wrote directly into the mapping, so the prepared
@@ -3407,22 +3499,41 @@ fn build_class_inner(
                     }
                 }
             }
-            w_prepared_dict
+            pyre_object::gc_roots::shadow_stack_get(w_namespace_root)
         } else {
             let d = pyre_object::w_dict_new();
-            let ns = unsafe { &*class_ns_ptr };
-            for (k, &v) in ns.entries() {
-                if !v.is_null() {
-                    unsafe { pyre_object::w_dict_store(d, pyre_object::w_str_new(k), v) };
+            let d_root = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(d);
+            w_namespace_dict_root = Some(d_root);
+            let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
+            let keys: Vec<String> = unsafe {
+                pyre_object::w_dict_str_entries(class_ns)
+                    .into_iter()
+                    .map(|(key, _)| key)
+                    .collect()
+            };
+            for key in keys {
+                let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
+                let Some(value) = (unsafe { pyre_object::w_dict_getitem_str(class_ns, &key) })
+                else {
+                    continue;
+                };
+                if value.is_null() {
+                    continue;
                 }
+                let d = pyre_object::gc_roots::shadow_stack_get(d_root);
+                unsafe { pyre_object::w_dict_setitem_str_no_proxy(d, &key, value) };
             }
-            d
+            pyre_object::gc_roots::shadow_stack_get(d_root)
         };
         // Call metaclass(name, bases, namespace, **kwds)
         // Pass the ORIGINAL bases (not w_effective_bases) — the metaclass
         // expects the user-declared bases. Default (object,) is added by
         // type.__new__ internally if needed.
         let name_obj = pyre_object::w_str_new(name);
+        if let Some(root) = w_namespace_dict_root {
+            w_namespace_dict = pyre_object::gc_roots::shadow_stack_get(root);
+        }
         clear_call_error();
         let result = if let Some(kw) = extra_kwargs {
             // Only use kwargs path if there are actual extra kwargs
@@ -3465,17 +3576,29 @@ fn build_class_inner(
         // consume the explicit class cells here (type_new_classcell leaves
         // them out of the class `__dict__`); the captured `classcell` is
         // bound to the new type below.
-        unsafe {
-            let class_ns = &mut *class_ns_ptr;
-            class_ns.remove("__classcell__");
-            class_ns.remove("__classdictcell__");
-            crate::builtins::type_new_set_hash_if_eq(class_ns);
-            crate::builtins::type_new_wrap_special_methods(class_ns);
-        }
+        let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
+        unsafe { pyre_object::w_dict_delitem_str_no_proxy(class_ns, "__classcell__") };
+        let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
+        unsafe { pyre_object::w_dict_delitem_str_no_proxy(class_ns, "__classdictcell__") };
+        let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
+        crate::builtins::type_new_set_hash_if_eq(class_ns);
+        let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
+        crate::builtins::type_new_wrap_special_methods(class_ns);
         let dict_root = pyre_object::gc_roots::shadow_stack_len();
         let dict_obj = pyre_object::w_dict_new();
         pyre_object::gc_roots::pin_root(dict_obj);
-        for (key, &value) in unsafe { (*class_ns_ptr).entries_wtf8() } {
+        let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
+        let keys: Vec<Wtf8Buf> = unsafe {
+            pyre_object::w_dict_str_entries_wtf8(class_ns)
+                .into_iter()
+                .map(|(key, _)| key)
+                .collect()
+        };
+        for key in keys {
+            let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
+            let Some(value) = (unsafe { pyre_object::w_dict_getitem_wtf8(class_ns, &key) }) else {
+                continue;
+            };
             if value.is_null() {
                 continue;
             }
@@ -3483,12 +3606,11 @@ fn build_class_inner(
             match key.as_str() {
                 Ok(s) => unsafe { pyre_object::w_dict_setitem_str_no_proxy(dict_obj, s, value) },
                 Err(_) => unsafe {
-                    pyre_object::w_dict_setitem_wtf8_no_proxy(dict_obj, key, value)
+                    pyre_object::w_dict_setitem_wtf8_no_proxy(dict_obj, &key, value)
                 },
             }
         }
         let dict_obj = pyre_object::gc_roots::shadow_stack_get(dict_root);
-        drop(unsafe { Box::from_raw(class_ns_ptr) });
         let w = pyre_object::w_type_new(name, w_effective_bases, dict_obj as *mut u8);
         // typeobject.py:1143-1204 create_all_slots parity.
         unsafe { create_all_slots(w, w_effective_bases)? };
