@@ -1017,6 +1017,7 @@ pub struct BhFieldSpec {
     pub is_field_signed: bool,
     pub is_immutable: bool,
     pub is_quasi_immutable: bool,
+    pub force_virtual_at_guard: bool,
     pub index_in_parent: usize,
 }
 
@@ -1048,6 +1049,7 @@ impl BhFieldSpec {
             is_field_signed: fd.is_field_signed(),
             is_immutable: fd.is_immutable(),
             is_quasi_immutable: fd.is_quasi_immutable(),
+            force_virtual_at_guard: fd.force_virtual_at_guard(),
             index_in_parent: fd.index_in_parent(),
         }
     }

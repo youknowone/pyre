@@ -1009,6 +1009,19 @@ impl GcRewriterImpl {
             .as_size_descr()
             .expect("NEW descr must be SizeDescr");
 
+        if descr.headerless() {
+            let size = round_up(descr.size());
+            let result_pos = op.pos.get();
+            st.emitting_an_operation_that_can_collect();
+            let size_ref = st.const_int(size as i64);
+            let malloc_op = mk_op(OpCode::CallMallocNurseryHeaderless, &[size_ref]);
+            let obj_ref = st.emit_result(malloc_op, result_pos);
+            st.record_result_mapping(result_pos, obj_ref.clone());
+            st.last_malloced_ref = obj_ref.clone();
+            st.remember_wb(&obj_ref);
+            return;
+        }
+
         // rewrite.py:474-484 handle_malloc_operation parity:
         // descr.size in RPython already includes the GC header (the
         // OBJECT type is built with `size = sizeof(header) + sizeof(fields)`).

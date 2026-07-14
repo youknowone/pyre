@@ -11900,6 +11900,9 @@ impl CraneliftBackend {
                 }
 
                 // ── GC allocation calls ──
+                OpCode::CallMallocNurseryHeaderless => {
+                    unreachable!("headerless nursery alloc is aheui-dynasm-only");
+                }
                 OpCode::CallMallocNursery => {
                     // x86/assembler.py:2556-2565 malloc_cond parity.
                     // RPython: inline nursery bump alloc for BOTH loops and

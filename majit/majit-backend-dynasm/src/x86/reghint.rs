@@ -121,6 +121,7 @@ impl RegisterHints {
             }
             // reghint.py:123-128 consider_call_malloc_nursery + varsize variants
             OpCode::CallMallocNursery
+            | OpCode::CallMallocNurseryHeaderless
             | OpCode::CallMallocNurseryVarsize
             | OpCode::CallMallocNurseryVarsizeFrame => {
                 self.consider_call_malloc_nursery(longevity, op, position);

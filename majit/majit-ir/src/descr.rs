@@ -1900,6 +1900,12 @@ pub trait Descr: Send + Sync + std::fmt::Debug {
         false
     }
 
+    /// Whether a virtual RHS stored to this field must be materialized at
+    /// guard time instead of being recorded in rd_pendingfields.
+    fn force_virtual_at_guard(&self) -> bool {
+        false
+    }
+
     /// compile.py: isinstance(resumekey, ResumeAtPositionDescr).
     /// Guards created during loop unrolling / short preamble inlining
     /// return true. When bridge compilation starts from such a guard,
@@ -2738,6 +2744,14 @@ pub trait SizeDescr: Descr {
     /// `vtable == 0`.
     fn is_gc_managed(&self) -> bool {
         true
+    }
+
+    /// Whether `NEW` for this descr should be rewritten to a headerless
+    /// nursery allocation.  Separate from `is_gc_managed()`: headerless
+    /// allocation changes the rewriter/backend malloc shape, while
+    /// `is_gc_managed()` gates runtime type-header guards.
+    fn headerless(&self) -> bool {
+        false
     }
 
     /// Vtable address, if is_object().
@@ -3614,6 +3628,7 @@ pub struct SimpleFieldDescr {
     /// FLAG_POINTER, FLAG_FLOAT, FLAG_SIGNED, FLAG_UNSIGNED, FLAG_STRUCT, FLAG_VOID.
     flag: ArrayFlag,
     virtualizable: bool,
+    force_virtual_at_guard: bool,
     /// descr.py:158 FieldDescr.index — slot position within the
     /// parent struct's `all_fielddescrs`.
     pub index_in_parent: usize,
@@ -3647,6 +3662,7 @@ impl Clone for SimpleFieldDescr {
             is_quasi_immutable: self.is_quasi_immutable,
             flag: self.flag,
             virtualizable: self.virtualizable,
+            force_virtual_at_guard: self.force_virtual_at_guard,
             index_in_parent: self.index_in_parent,
             parent_descr: self.parent_descr.clone(),
             vinfo: self.vinfo.clone(),
@@ -3677,6 +3693,7 @@ impl SimpleFieldDescr {
             is_quasi_immutable: false,
             flag,
             virtualizable: false,
+            force_virtual_at_guard: false,
             index_in_parent: 0,
             parent_descr: None,
             vinfo: None,
@@ -3707,6 +3724,7 @@ impl SimpleFieldDescr {
             is_quasi_immutable: false,
             flag,
             virtualizable: false,
+            force_virtual_at_guard: false,
             index_in_parent: 0,
             parent_descr: None,
             vinfo: None,
@@ -3748,6 +3766,11 @@ impl SimpleFieldDescr {
 
     pub fn with_virtualizable(mut self, virtualizable: bool) -> Self {
         self.virtualizable = virtualizable;
+        self
+    }
+
+    pub fn with_force_virtual_at_guard(mut self, force_virtual_at_guard: bool) -> Self {
+        self.force_virtual_at_guard = force_virtual_at_guard;
         self
     }
 
@@ -3805,6 +3828,9 @@ impl Descr for SimpleFieldDescr {
     }
     fn is_virtualizable(&self) -> bool {
         self.virtualizable
+    }
+    fn force_virtual_at_guard(&self) -> bool {
+        self.force_virtual_at_guard
     }
     fn as_field_descr(&self) -> Option<&dyn FieldDescr> {
         Some(self)
@@ -3882,6 +3908,9 @@ pub struct SimpleSizeDescr {
     /// `is_object()` (`vtable != 0`) because a `new_struct` GC struct
     /// also has `vtable == 0`.
     is_gc_managed: bool,
+    /// Explicit allocation-shape bit for `NEW` rewriting.  Defaults false:
+    /// normal JIT-GC structs are headered unless an emitter opts in.
+    headerless: bool,
     /// descr.py:72 `self.all_fielddescrs = all_fielddescrs`.
     all_fielddescrs: Vec<Arc<dyn FieldDescr>>,
     /// descr.py:71 `self.gc_fielddescrs = gc_fielddescrs`.
@@ -3902,6 +3931,7 @@ impl Clone for SimpleSizeDescr {
             is_immutable: self.is_immutable,
             vtable: self.vtable,
             is_gc_managed: self.is_gc_managed,
+            headerless: self.headerless,
             all_fielddescrs: self.all_fielddescrs.clone(),
             gc_fielddescrs: self.gc_fielddescrs.clone(),
         }
@@ -3919,6 +3949,7 @@ impl SimpleSizeDescr {
             is_immutable: false,
             vtable: 0,
             is_gc_managed: true,
+            headerless: false,
             all_fielddescrs: Vec::new(),
             gc_fielddescrs: Vec::new(),
         }
@@ -3934,6 +3965,7 @@ impl SimpleSizeDescr {
             is_immutable: false,
             vtable,
             is_gc_managed: true,
+            headerless: false,
             all_fielddescrs: Vec::new(),
             gc_fielddescrs: Vec::new(),
         }
@@ -3952,6 +3984,11 @@ impl SimpleSizeDescr {
     /// `GuardGcType` must not be emitted for it).
     pub fn set_gc_managed(&mut self, is_gc_managed: bool) {
         self.is_gc_managed = is_gc_managed;
+    }
+
+    /// Override the allocation-shape flag (default `false`).
+    pub fn set_headerless(&mut self, headerless: bool) {
+        self.headerless = headerless;
     }
 
     /// descr.py:123-126 — `get_size_descr` calls
@@ -4020,6 +4057,9 @@ impl SizeDescr for SimpleSizeDescr {
     fn is_gc_managed(&self) -> bool {
         self.is_gc_managed
     }
+    fn headerless(&self) -> bool {
+        self.headerless
+    }
     fn vtable(&self) -> usize {
         self.vtable
     }
@@ -4042,6 +4082,7 @@ pub struct SimpleFieldDescrSpec {
     /// descr.py:151: FieldDescr.flag — get_type_flag(FIELDTYPE).
     pub flag: ArrayFlag,
     pub virtualizable: bool,
+    pub force_virtual_at_guard: bool,
     pub index_in_parent: usize,
 }
 
@@ -4071,6 +4112,28 @@ pub fn make_simple_descr_group_keyed(
     is_gc_managed: bool,
     field_specs: &[SimpleFieldDescrSpec],
 ) -> SimpleDescrGroup {
+    make_simple_descr_group_keyed_with_headerless(
+        index,
+        size,
+        type_id,
+        cache_key,
+        vtable,
+        is_gc_managed,
+        false,
+        field_specs,
+    )
+}
+
+pub fn make_simple_descr_group_keyed_with_headerless(
+    index: u32,
+    size: usize,
+    type_id: u32,
+    cache_key: u64,
+    vtable: usize,
+    is_gc_managed: bool,
+    headerless: bool,
+    field_specs: &[SimpleFieldDescrSpec],
+) -> SimpleDescrGroup {
     let group = make_simple_descr_group_inner(
         index,
         size,
@@ -4078,6 +4141,7 @@ pub fn make_simple_descr_group_keyed(
         cache_key,
         vtable,
         is_gc_managed,
+        headerless,
         field_specs,
     );
     let struct_key = LLType::struct_key(cache_key);
@@ -4124,6 +4188,7 @@ fn make_simple_descr_group_inner(
     cache_key: u64,
     vtable: usize,
     is_gc_managed: bool,
+    headerless: bool,
     field_specs: &[SimpleFieldDescrSpec],
 ) -> SimpleDescrGroup {
     let field_descrs_cell = std::cell::RefCell::new(Vec::<Arc<SimpleFieldDescr>>::new());
@@ -4145,6 +4210,7 @@ fn make_simple_descr_group_inner(
                     is_quasi_immutable: spec.is_quasi_immutable,
                     flag: spec.flag,
                     virtualizable: spec.virtualizable,
+                    force_virtual_at_guard: spec.force_virtual_at_guard,
                     index_in_parent: spec.index_in_parent,
                     parent_descr: Some(parent_descr.clone()),
                     vinfo: None,
@@ -4167,6 +4233,7 @@ fn make_simple_descr_group_inner(
         // landing on a stale slot via `type_id` widening.
         sd.set_cache_key(cache_key);
         sd.set_gc_managed(is_gc_managed);
+        sd.set_headerless(headerless);
         sd.with_all_fielddescrs(all_fielddescrs)
     });
     let field_descrs = field_descrs_cell.into_inner();
@@ -4193,7 +4260,8 @@ pub fn make_simple_descr_group(
     // No-cache legacy mint sites are JIT-allocated structs; default
     // `is_gc_managed = true` (the raw-struct path goes through the keyed
     // factory with an explicit flag).
-    let group = make_simple_descr_group_inner(index, size, type_id, 0, vtable, true, field_specs);
+    let group =
+        make_simple_descr_group_inner(index, size, type_id, 0, vtable, true, false, field_specs);
     // descr.py:236-247 `get_size_descr` cache-miss branch — snapshot
     // order only.
     crate::descr_registry::register_size(group.size_descr.clone() as DescrRef);
@@ -4803,6 +4871,7 @@ pub fn make_vtable_field_descr() -> DescrRef {
                     is_quasi_immutable: false,
                     flag: ArrayFlag::Signed,
                     virtualizable: false,
+                    force_virtual_at_guard: false,
                     index_in_parent: 0,
                     parent_descr: Some(parent_descr),
                     vinfo: None,

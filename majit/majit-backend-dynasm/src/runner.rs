@@ -678,6 +678,22 @@ pub extern "C" fn dynasm_nursery_slowpath(total_size: u64) -> u64 {
     ptr
 }
 
+/// Headerless nursery overflow slow path.
+///
+/// `size` is the exact allocation size.  Returns the allocation base,
+/// matching the headerless fast path.
+pub extern "C" fn dynasm_nursery_slowpath_headerless(size: u64) -> u64 {
+    let ptr = with_dynasm_active_gc_mut(|gc| gc.alloc_nursery(size as usize).0 as u64)
+        .unwrap_or_else(|| unsafe { libc::calloc(1, size as usize) as u64 });
+    if majit_ir::debug::have_debug_prints() {
+        majit_ir::debug::log_one(
+            "jit-backend",
+            &format!("nursery-headerless size={size} base=0x{ptr:x}"),
+        );
+    }
+    ptr
+}
+
 /// malloc_cond_varsize_frame slow path for JITFRAME allocation.
 ///
 /// `frame_size` is `jfi_frame_size`: bytes from the JITFRAME payload base
@@ -2031,6 +2047,10 @@ impl Backend for DynasmBackend {
         let malloc_slowpath_fixed = self
             .arch_cpu_ext
             .ensure_malloc_slowpath_fixed(&self.descr_attachments);
+        #[cfg(target_arch = "x86_64")]
+        let malloc_slowpath_headerless = self
+            .arch_cpu_ext
+            .ensure_malloc_slowpath_headerless(&self.descr_attachments);
         let mut asm = Asm::new(
             trace_id,
             header_pc,
@@ -2043,6 +2063,8 @@ impl Backend for DynasmBackend {
             cpu_handle,
             #[cfg(target_arch = "x86_64")]
             malloc_slowpath_fixed,
+            #[cfg(target_arch = "x86_64")]
+            malloc_slowpath_headerless,
             inputargs,
             &prepared_ops,
         );
@@ -2273,6 +2295,10 @@ impl Backend for DynasmBackend {
         let malloc_slowpath_fixed = self
             .arch_cpu_ext
             .ensure_malloc_slowpath_fixed(&self.descr_attachments);
+        #[cfg(target_arch = "x86_64")]
+        let malloc_slowpath_headerless = self
+            .arch_cpu_ext
+            .ensure_malloc_slowpath_headerless(&self.descr_attachments);
         let mut asm = Asm::new(
             trace_id,
             0,
@@ -2285,6 +2311,8 @@ impl Backend for DynasmBackend {
             cpu_handle,
             #[cfg(target_arch = "x86_64")]
             malloc_slowpath_fixed,
+            #[cfg(target_arch = "x86_64")]
+            malloc_slowpath_headerless,
             inputargs,
             &prepared_ops,
         );
@@ -3591,6 +3619,8 @@ impl Backend for DynasmBackend {
                 .ensure_propagate_exception_path(&self.descr_attachments);
             self.arch_cpu_ext
                 .ensure_malloc_slowpath_fixed(&self.descr_attachments);
+            self.arch_cpu_ext
+                .ensure_malloc_slowpath_headerless(&self.descr_attachments);
         }
     }
 

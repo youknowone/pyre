@@ -35,6 +35,8 @@ pub(crate) struct X86CpuExt {
     /// this struct.
     malloc_slowpath_fixed: Option<usize>,
     _malloc_slowpath_fixed_buffer: Option<ExecutableBuffer>,
+    malloc_slowpath_headerless: Option<usize>,
+    _malloc_slowpath_headerless_buffer: Option<ExecutableBuffer>,
     /// `assembler.py:344 self.propagate_exception_path` parity.
     /// Standalone trampoline that the malloc slowpath (and, in PyPy,
     /// the stack check slowpath) JMPs to on OOM / propagate.
@@ -47,6 +49,8 @@ impl X86CpuExt {
         Self {
             malloc_slowpath_fixed: None,
             _malloc_slowpath_fixed_buffer: None,
+            malloc_slowpath_headerless: None,
+            _malloc_slowpath_headerless_buffer: None,
             propagate_exception_path: None,
             _propagate_exception_path_buffer: None,
         }
@@ -102,6 +106,26 @@ impl X86CpuExt {
         addr
     }
 
+    pub(crate) fn ensure_malloc_slowpath_headerless(
+        &mut self,
+        cpu_handle: &CpuDescrHandle,
+    ) -> usize {
+        if let Some(addr) = self.malloc_slowpath_headerless {
+            return addr;
+        }
+        let propagate_path = self.ensure_propagate_exception_path(cpu_handle);
+        let (buffer, addr) =
+            super::assembler::build_malloc_slowpath_headerless(cpu_handle, propagate_path);
+        debug_assert!(
+            addr != 0,
+            "build_malloc_slowpath_headerless returned NULL entry address — \
+             dynasm finalize is expected to yield a non-zero buffer_ptr"
+        );
+        self._malloc_slowpath_headerless_buffer = Some(buffer);
+        self.malloc_slowpath_headerless = Some(addr);
+        addr
+    }
+
     /// Whether either trampoline that bakes `propagate_exception_descr`
     /// as an immediate has already been materialised.  Used by
     /// `DynasmBackend::set_propagate_exception_descr` to refuse a
@@ -115,6 +139,8 @@ impl X86CpuExt {
     /// upholds the same invariant by panicking instead of dropping
     /// the buffer.
     pub(crate) fn has_propagate_dependent_caches(&self) -> bool {
-        self.malloc_slowpath_fixed.is_some() || self.propagate_exception_path.is_some()
+        self.malloc_slowpath_fixed.is_some()
+            || self.malloc_slowpath_headerless.is_some()
+            || self.propagate_exception_path.is_some()
     }
 }

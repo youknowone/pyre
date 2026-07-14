@@ -2858,7 +2858,9 @@ impl<'a> RegAlloc<'a> {
             OpCode::CondCallValueI | OpCode::CondCallValueR => {
                 self.consider_raw_call_like_j2(dst, args, op, i, output, SAVE_DEFAULT_REGS);
             }
-            OpCode::CallMallocNursery => self.consider_call_malloc_nursery_j2(dst, args, i, output),
+            OpCode::CallMallocNursery | OpCode::CallMallocNurseryHeaderless => {
+                self.consider_call_malloc_nursery_j2(dst, args, i, output)
+            }
             OpCode::CallMallocNurseryVarsizeFrame => {
                 self.consider_call_malloc_nursery_varsize_frame_j2(dst, args, i, output);
             }
@@ -3333,7 +3335,7 @@ impl<'a> RegAlloc<'a> {
                 self.consider_raw_call_like(op, i, output, SAVE_DEFAULT_REGS);
             }
             // aarch64/regalloc.py:958 prepare_op_call_malloc_nursery
-            OpCode::CallMallocNursery => {
+            OpCode::CallMallocNursery | OpCode::CallMallocNurseryHeaderless => {
                 self.consider_call_malloc_nursery(op, i, output);
             }
             OpCode::CallMallocNurseryVarsizeFrame => {

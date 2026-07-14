@@ -419,6 +419,25 @@ pub(crate) fn build_malloc_slowpath_fixed(
     (buffer, ptr)
 }
 
+pub(crate) fn build_malloc_slowpath_headerless(
+    cpu_handle: &crate::guard::CpuDescrHandle,
+    propagate_path: usize,
+) -> (ExecutableBuffer, usize) {
+    let _ = cpu_handle;
+    let mut asm = Assembler::new().expect("malloc_slowpath_headerless: new Assembler");
+
+    dynasm!(asm ; .arch x64 ; sub rdx, rcx);
+
+    let slowpath_fn = crate::runner::dynasm_nursery_slowpath_headerless as *const () as i64;
+    build_malloc_slowpath_body(&mut asm, slowpath_fn, propagate_path);
+
+    let buffer = asm
+        .finalize()
+        .expect("malloc_slowpath_headerless: finalize");
+    let ptr = crate::codebuf::buffer_ptr(&buffer) as usize;
+    (buffer, ptr)
+}
+
 /// Body of the single PyPy `malloc_slowpath` trampoline used by both
 /// `CallMallocNursery` (fixed-size object alloc) and
 /// `CallMallocNurseryVarsizeFrame` (JITFRAME alloc).  Emits the
@@ -860,6 +879,8 @@ pub struct Assembler386<'a> {
     /// passed in at construction time so the emit path bakes it as a
     /// 64-bit immediate without re-touching the backend.
     malloc_slowpath_fixed: usize,
+    /// Headerless fixed-size nursery malloc slowpath trampoline.
+    malloc_slowpath_headerless: usize,
     /// `assembler.py:1545` `genop_load_from_gc_table`: base address of
     /// this loop's per-loop `GcTable` slot array. Baked as a 64-bit
     /// immediate by the `LoadFromGcTable` genop; 0 when the trace
@@ -965,6 +986,7 @@ impl<'a> Assembler386<'a> {
         attached_descrs: crate::guard::AttachedDescrPtrs,
         cpu_handle: crate::guard::CpuDescrHandle,
         malloc_slowpath_fixed: usize,
+        malloc_slowpath_headerless: usize,
         inputargs: &'a [InputArg],
         operations: &'a [Op],
     ) -> Self {
@@ -1010,6 +1032,7 @@ impl<'a> Assembler386<'a> {
             frame_depth_to_patch: Vec::new(),
             jump_target_frame_depth: 0,
             malloc_slowpath_fixed,
+            malloc_slowpath_headerless,
             gc_table_base: 0,
         }
     }
@@ -4259,6 +4282,9 @@ impl<'a> Assembler386<'a> {
             // ── Allocation (rewritten by GC rewriter) ──
             OpCode::CallMallocNursery => {
                 self.genop_call_malloc_nursery(op, result_loc);
+            }
+            OpCode::CallMallocNurseryHeaderless => {
+                self.genop_call_malloc_nursery_headerless(op, result_loc);
             }
             // assembler.py:2567 malloc_cond_varsize_frame parity.
             // The varsize_frame call site shares the entire slowpath
@@ -8064,6 +8090,82 @@ impl<'a> Assembler386<'a> {
             // RAX (now caller-live) instead of the object pointer.
             let Some(Loc::Reg(r)) = result_loc else {
                 panic!("CallMallocNursery result_loc must be a register; got {result_loc:?}");
+            };
+            let rv = r.value;
+            dynasm!(self.mc ; .arch x64 ; mov [rbp + offset], Rq(rv));
+        }
+    }
+
+    /// Headerless fixed-size nursery allocation.  `size` excludes any GC
+    /// header; result is the old nursery base.
+    fn genop_call_malloc_nursery_headerless(&mut self, op: &Op, result_loc: Option<&Loc>) {
+        let size_ref = op.arg(0).to_opref();
+        let size = size_ref.inline_const_bits().unwrap_or_else(|| {
+            self.constants
+                .get(&size_ref.raw())
+                .map(|c| c.as_raw_i64())
+                .unwrap_or(size_ref.raw() as i64)
+        });
+        let (nf_addr, nt_addr) = crate::runner::dynasm_nursery_addrs();
+        let nf = nf_addr as i64;
+        let nt = nt_addr as i64;
+        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+
+        dynasm!(self.mc ; .arch x64
+            ; mov Rq(scratch), QWORD nf
+            ; mov rcx, [Rq(scratch)]
+            ; lea rdx, [rcx + size as i32]
+            ; mov Rq(scratch), QWORD nt
+            ; cmp rdx, [Rq(scratch)]
+        );
+
+        let slow_path = self.mc.new_dynamic_label();
+        let done = self.mc.new_dynamic_label();
+        dynasm!(self.mc ; .arch x64 ; ja =>slow_path);
+
+        let result_reg = match result_loc {
+            Some(Loc::Reg(r)) => r.value,
+            _ => crate::regloc::ECX.value,
+        };
+        dynasm!(self.mc ; .arch x64
+            ; mov Rq(scratch), QWORD nf
+            ; mov [Rq(scratch)], rdx
+        );
+        if result_reg != crate::regloc::ECX.value {
+            dynasm!(self.mc ; .arch x64 ; mov Rq(result_reg), rcx);
+        }
+        dynasm!(self.mc ; .arch x64 ; jmp =>done);
+
+        dynasm!(self.mc ; .arch x64 ; =>slow_path);
+        let gcmap_ofs = crate::jitframe::JF_GCMAP_OFS;
+        if let Some(gcmap) = self.pending_malloc_nursery_gcmap {
+            self.push_gcmap(gcmap as *mut usize);
+        } else {
+            dynasm!(self.mc ; .arch x64 ; mov QWORD [rbp + gcmap_ofs], 0);
+        }
+        let helper_addr = self.malloc_slowpath_headerless as i64;
+        let call_scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+        dynasm!(self.mc ; .arch x64
+            ; mov Rq(call_scratch), QWORD helper_addr
+            ; call Rq(call_scratch)
+        );
+        if let Some(Loc::Reg(r)) = result_loc {
+            if r.value != crate::regloc::ECX.value {
+                let rv = r.value;
+                dynasm!(self.mc ; .arch x64 ; mov Rq(rv), rcx);
+            }
+        }
+        let _ = gcmap_ofs;
+
+        dynasm!(self.mc ; .arch x64 ; =>done);
+        let pos = op.pos.get();
+        if !pos.is_none() {
+            let slot = self.allocate_slot(pos);
+            let offset = Self::slot_offset(slot);
+            let Some(Loc::Reg(r)) = result_loc else {
+                panic!(
+                    "CallMallocNurseryHeaderless result_loc must be a register; got {result_loc:?}"
+                );
             };
             let rv = r.value;
             dynasm!(self.mc ; .arch x64 ; mov [rbp + offset], Rq(rv));

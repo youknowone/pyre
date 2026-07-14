@@ -15,6 +15,8 @@ use crate::jitcode::insns::MAX_HOST_CALL_ARITY;
 use crate::jitcode::{self, JitArgKind, JitCallArg, JitCallTarget, JitCode, JitCodeRuntimeExt};
 use crate::{TraceAction, TraceCtx};
 
+const HEADERLESS_SIZE_OWNER_MARKER: &str = "__majit_headerless_size__";
+
 /// Decode a virtualizable shadow Value (RPython Box concrete) back into the
 /// raw int/ref/float bit pattern that pyre stores in register shadows
 /// (`frame.int_values`, `frame.ref_values`, `frame.float_values`).
@@ -60,6 +62,7 @@ fn field_spec_from_bh(
         is_quasi_immutable: f.is_quasi_immutable,
         flag: f.field_flag,
         virtualizable: false,
+        force_virtual_at_guard: f.force_virtual_at_guard,
         index_in_parent: f.index_in_parent,
     }
 }
@@ -79,6 +82,7 @@ fn size_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> majit_ir::DescrR
         size,
         type_id,
         vtable,
+        owner,
         all_fielddescrs,
         is_gc_managed,
         ..
@@ -86,13 +90,14 @@ fn size_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> majit_ir::DescrR
     {
         if !all_fielddescrs.is_empty() {
             let specs: Vec<_> = all_fielddescrs.iter().map(field_spec_from_bh).collect();
-            let group = majit_ir::descr::make_simple_descr_group_keyed(
+            let group = majit_ir::descr::make_simple_descr_group_keyed_with_headerless(
                 u32::MAX,
                 *size,
                 *type_id as u32,
                 *type_id,
                 *vtable as usize,
                 *is_gc_managed,
+                owner == HEADERLESS_SIZE_OWNER_MARKER,
                 &specs,
             );
             let sd: majit_ir::DescrRef = group.size_descr;
@@ -102,20 +107,18 @@ fn size_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> majit_ir::DescrR
     let size = descr.as_size();
     let vtable = descr.get_vtable();
     let type_id = descr.get_type_id() as u32;
-    let sd: majit_ir::DescrRef = if vtable != 0 {
-        Arc::new(majit_ir::descr::SimpleSizeDescr::with_vtable(
-            u32::MAX,
-            size,
-            type_id,
-            vtable,
-        ))
+    let headerless = if let crate::blackhole::BhDescr::Size { owner, .. } = descr {
+        owner == HEADERLESS_SIZE_OWNER_MARKER
     } else {
-        Arc::new(majit_ir::descr::SimpleSizeDescr::new(
-            u32::MAX,
-            size,
-            type_id,
-        ))
+        false
     };
+    let mut sd = if vtable != 0 {
+        majit_ir::descr::SimpleSizeDescr::with_vtable(u32::MAX, size, type_id, vtable)
+    } else {
+        majit_ir::descr::SimpleSizeDescr::new(u32::MAX, size, type_id)
+    };
+    sd.set_headerless(headerless);
+    let sd: majit_ir::DescrRef = Arc::new(sd);
     sd
 }
 
@@ -152,13 +155,14 @@ fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, majit_i
                     // Weak parent back-reference upgrades — a freshly built
                     // group would drop its size descr here (the op only
                     // carries the field) and dangle the parent.
-                    majit_ir::descr::make_simple_descr_group_keyed(
+                    majit_ir::descr::make_simple_descr_group_keyed_with_headerless(
                         u32::MAX,
                         p.size,
                         p.type_id as u32,
                         p.type_id,
                         p.vtable as usize,
                         p.is_gc_managed,
+                        false,
                         &specs,
                     );
                     let struct_key = majit_ir::descr::LLType::Struct(p.type_id);
@@ -242,6 +246,7 @@ pub fn struct_field_write_effect_info(
                 is_quasi_immutable: false,
                 flag,
                 virtualizable: false,
+                force_virtual_at_guard: false,
                 index_in_parent: idx,
             }
         })
@@ -8612,7 +8617,7 @@ mod tests {
         // SizeDescr (size from the per-jitcode descr pool) and binds the
         // allocation pointer to the destination ref register.
         let mut builder = JitCodeBuilder::new();
-        builder.new_struct(0, 16, 0xCD, &[]);
+        builder.new_struct(0, 16, 0xCD, false, &[]);
         let jitcode = builder.finish();
 
         let mut ctx = TraceCtx::for_test(0);
@@ -8661,7 +8666,13 @@ mod tests {
         // through the live struct ptr, then read them back.  Exercises the
         // emit -> trace-dispatch -> record path for plain getfield/setfield_gc.
         let mut builder = JitCodeBuilder::new();
-        builder.new_struct(0, 16, 0xCD, &[(0, false, "value"), (8, true, "next")]); // ref reg 0 = Node*
+        builder.new_struct(
+            0,
+            16,
+            0xCD,
+            false,
+            &[(0, false, "value", false), (8, true, "next", false)],
+        ); // ref reg 0 = Node*
         builder.load_const_i_value(0, 99); // int reg 0 = 99
         builder.setfield_gc_i(0, 0, 0, 0xCD); // Node.value = 99
         builder.setfield_gc_r(0, 0, 8, 0xCD); // Node.next  = Node (self-ref)
@@ -8727,7 +8738,13 @@ mod tests {
         // plain `/rid` form — byte 222 (BC_SETFIELD_GC_I_C) is distinct from
         // the NEW family so the arm is reached (insns.rs deconfliction).
         let mut builder = JitCodeBuilder::new();
-        builder.new_struct(0, 16, 0xCE, &[(0, false, "value"), (8, true, "next")]);
+        builder.new_struct(
+            0,
+            16,
+            0xCE,
+            false,
+            &[(0, false, "value", false), (8, true, "next", false)],
+        );
         builder.setfield_gc_i_c(0, -7, 0, 0xCE); // Node.value = -7 (inline const)
         let jitcode = builder.finish();
 

@@ -149,6 +149,12 @@ pub struct JitInterpConfig {
     /// `allocator_func(v0, v1)`.  The JIT path already handles struct
     /// literals natively via `lower_struct_value` (New + SetfieldGc).
     pub struct_allocs: Vec<(Path, Path)>,
+    /// Structs whose `New` allocation should use the headerless nursery opcode.
+    /// `headerless_structs = { StructType, ... }`.
+    pub headerless_structs: Vec<Path>,
+    /// Fields whose virtual RHS must be forced to memory at guards.
+    /// `force_at_guard = { StructType::field, ... }`.
+    pub force_at_guard: Vec<ForceAtGuardEntry>,
     /// Pure function → native IR integer binop aliases.
     /// `native_int_binops = { val_add => IntAdd, ... }`.  When the JIT-path
     /// lowerer encounters a call whose path matches a key, it emits the named
@@ -376,6 +382,12 @@ pub struct RefFieldEntry {
     pub pointee_type: Path,
 }
 
+#[derive(Clone)]
+pub struct ForceAtGuardEntry {
+    pub struct_type: Path,
+    pub field: Ident,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CallPolicyKind {
     ResidualVoid,
@@ -552,6 +564,8 @@ impl Parse for JitInterpConfig {
         let mut ref_fields: Vec<RefFieldEntry> = Vec::new();
         let mut call_returns: Vec<(Path, Path)> = Vec::new();
         let mut struct_allocs: Vec<(Path, Path)> = Vec::new();
+        let mut headerless_structs: Vec<Path> = Vec::new();
+        let mut force_at_guard: Vec<ForceAtGuardEntry> = Vec::new();
         let mut native_int_binops: Vec<(Path, Ident)> = Vec::new();
         let mut native_tag_small: Vec<Path> = Vec::new();
         let mut split_dispatch = false;
@@ -617,6 +631,12 @@ impl Parse for JitInterpConfig {
                 "struct_allocs" => {
                     struct_allocs = parse_call_returns_map(input)?;
                 }
+                "headerless_structs" => {
+                    headerless_structs = parse_path_set(input)?;
+                }
+                "force_at_guard" => {
+                    force_at_guard = parse_force_at_guard_set(input)?;
+                }
                 "native_int_binops" => {
                     native_int_binops = parse_native_int_binops_map(input)?;
                 }
@@ -677,6 +697,8 @@ impl Parse for JitInterpConfig {
             ref_fields,
             call_returns,
             struct_allocs,
+            headerless_structs,
+            force_at_guard,
             native_int_binops,
             native_tag_small,
             split_dispatch,
@@ -785,26 +807,52 @@ fn parse_native_tag_small_list(input: ParseStream) -> syn::Result<Vec<Path>> {
     Ok(entries)
 }
 
+fn parse_path_set(input: ParseStream) -> syn::Result<Vec<Path>> {
+    let content;
+    braced!(content in input);
+    let mut entries = Vec::new();
+    while !content.is_empty() {
+        entries.push(content.parse::<Path>()?);
+        let _ = content.parse::<Token![,]>();
+    }
+    Ok(entries)
+}
+
+fn split_struct_field_path(full_path: Path) -> syn::Result<(Path, Ident)> {
+    let mut segments: Vec<_> = full_path.segments.into_iter().collect();
+    if segments.len() < 2 {
+        return Err(syn::Error::new_spanned(
+            &full_path.leading_colon,
+            "entry must be `Struct::field`",
+        ));
+    }
+    let field_seg = segments.pop().unwrap();
+    let field = field_seg.ident;
+    let struct_type = syn::Path {
+        leading_colon: full_path.leading_colon,
+        segments: segments.into_iter().collect(),
+    };
+    Ok((struct_type, field))
+}
+
+fn parse_force_at_guard_set(input: ParseStream) -> syn::Result<Vec<ForceAtGuardEntry>> {
+    let content;
+    braced!(content in input);
+    let mut entries = Vec::new();
+    while !content.is_empty() {
+        let (struct_type, field) = split_struct_field_path(content.parse::<Path>()?)?;
+        entries.push(ForceAtGuardEntry { struct_type, field });
+        let _ = content.parse::<Token![,]>();
+    }
+    Ok(entries)
+}
+
 fn parse_ref_fields_map(input: ParseStream) -> syn::Result<Vec<RefFieldEntry>> {
     let content;
     braced!(content in input);
     let mut entries = Vec::new();
     while !content.is_empty() {
-        let full_path: Path = content.parse()?;
-        // Split the last segment as the field name.
-        let mut segments: Vec<_> = full_path.segments.into_iter().collect();
-        if segments.len() < 2 {
-            return Err(syn::Error::new_spanned(
-                &full_path.leading_colon,
-                "ref_fields entry must be `Struct::field => Pointee`",
-            ));
-        }
-        let field_seg = segments.pop().unwrap();
-        let field = field_seg.ident;
-        let struct_type = syn::Path {
-            leading_colon: full_path.leading_colon,
-            segments: segments.into_iter().collect(),
-        };
+        let (struct_type, field) = split_struct_field_path(content.parse::<Path>()?)?;
         content.parse::<Token![=>]>()?;
         let pointee_type: Path = content.parse()?;
         entries.push(RefFieldEntry {

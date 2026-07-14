@@ -3145,6 +3145,18 @@ impl<'a> AssemblerARM64<'a> {
                     self.store_rax_to_result(op.pos.get());
                 }
             }
+            OpCode::CallMallocNurseryHeaderless => {
+                self.genop_call_malloc_nursery_headerless(op);
+                if let Some(Loc::Reg(r)) = result_loc {
+                    if r.value != 0 {
+                        let rv = r.value;
+                        dynasm!(self.mc ; .arch aarch64 ; mov X(rv), x0);
+                    }
+                }
+                if !op.pos.get().is_none() {
+                    self.store_rax_to_result(op.pos.get());
+                }
+            }
             // aarch64/assembler.py:715 malloc_cond_varsize_frame
             OpCode::CallMallocNurseryVarsizeFrame => {
                 let sizeloc = match arglocs.first() {
@@ -6134,6 +6146,96 @@ impl<'a> AssemblerARM64<'a> {
         // (calloc failure preserved as NULL per runner.rs).  Route
         // through the propagate path before the fast-path join so the
         // null pointer never reaches subsequent typed stores.
+        self.emit_propagate_memory_error_if_null(0);
+
+        dynasm!(self.mc ; .arch aarch64 ; =>done);
+    }
+
+    /// Headerless fixed-size nursery allocation.  `size` excludes any GC
+    /// header; result is the old nursery base.
+    fn genop_call_malloc_nursery_headerless(&mut self, op: &Op) {
+        let size_ref = op.arg(0).to_opref();
+        let size = size_ref.inline_const_bits().unwrap_or_else(|| {
+            self.constants
+                .get(&size_ref.raw())
+                .map(|c| c.as_raw_i64())
+                .unwrap_or(size_ref.raw() as i64)
+        });
+        let (nf_addr, nt_addr) = crate::runner::dynasm_nursery_addrs();
+        if nf_addr == 0 || nt_addr == 0 {
+            self.emit_mov_imm64(0, size);
+            self.emit_mov_imm64(
+                2,
+                crate::runner::dynasm_nursery_slowpath_headerless as *const () as i64,
+            );
+            self.emit_malloc_slowpath_helper_call(2);
+            self.reload_frame_if_necessary();
+            return;
+        }
+
+        self.emit_mov_imm64(2, nf_addr as i64);
+        dynasm!(self.mc ; .arch aarch64 ; ldr x0, [x2]);
+
+        if size < 4096 {
+            let sz = size as u32;
+            dynasm!(self.mc ; .arch aarch64 ; add x1, x0, sz);
+        } else {
+            self.emit_mov_imm64(1, size);
+            dynasm!(self.mc ; .arch aarch64 ; add x1, x0, x1);
+        }
+
+        self.emit_mov_imm64(3, nt_addr as i64);
+        dynasm!(self.mc ; .arch aarch64 ; ldr x3, [x3]);
+        dynasm!(self.mc ; .arch aarch64 ; cmp x1, x3);
+
+        let slow_path = self.mc.new_dynamic_label();
+        let done = self.mc.new_dynamic_label();
+        dynasm!(self.mc ; .arch aarch64 ; b.hi =>slow_path);
+
+        self.emit_mov_imm64(2, nf_addr as i64);
+        dynasm!(self.mc ; .arch aarch64
+            ; str x1, [x2]       // *nursery_free = new_free
+            ; b =>done
+        );
+
+        dynasm!(self.mc ; .arch aarch64 ; =>slow_path);
+        let base_ofs = crate::jitframe::FIRST_ITEM_OFFSET as i32;
+        dynasm!(self.mc ; .arch aarch64
+            ; stp x2, x3, [x29, base_ofs + 2 * 8]
+            ; stp x4, x5, [x29, base_ofs + 4 * 8]
+            ; stp x6, x7, [x29, base_ofs + 6 * 8]
+            ; stp x8, x9, [x29, base_ofs + 8 * 8]
+            ; stp x10, x11, [x29, base_ofs + 10 * 8]
+            ; stp x12, x13, [x29, base_ofs + 12 * 8]
+            ; stp x19, x20, [x29, base_ofs + 14 * 8]
+            ; stp x21, x22, [x29, base_ofs + 16 * 8]
+        );
+        if let Some(gcmap) = self.pending_malloc_nursery_gcmap {
+            self.push_gcmap(gcmap as *mut usize);
+        } else {
+            let gcmap_ofs = crate::jitframe::JF_GCMAP_OFS as u32;
+            dynasm!(self.mc ; .arch aarch64 ; str xzr, [x29, gcmap_ofs]);
+        }
+        self.emit_mov_imm64(0, size);
+        self.emit_mov_imm64(
+            2,
+            crate::runner::dynasm_nursery_slowpath_headerless as *const () as i64,
+        );
+        self.emit_malloc_slowpath_helper_call(2);
+        self.reload_frame_if_necessary();
+        let gcmap_ofs = crate::jitframe::JF_GCMAP_OFS as u32;
+        dynasm!(self.mc ; .arch aarch64 ; str xzr, [x29, gcmap_ofs]);
+        let base_ofs_r = crate::jitframe::FIRST_ITEM_OFFSET as i32;
+        dynasm!(self.mc ; .arch aarch64
+            ; ldp x2, x3, [x29, base_ofs_r + 2 * 8]
+            ; ldp x4, x5, [x29, base_ofs_r + 4 * 8]
+            ; ldp x6, x7, [x29, base_ofs_r + 6 * 8]
+            ; ldp x8, x9, [x29, base_ofs_r + 8 * 8]
+            ; ldp x10, x11, [x29, base_ofs_r + 10 * 8]
+            ; ldp x12, x13, [x29, base_ofs_r + 12 * 8]
+            ; ldp x19, x20, [x29, base_ofs_r + 14 * 8]
+            ; ldp x21, x22, [x29, base_ofs_r + 16 * 8]
+        );
         self.emit_propagate_memory_error_if_null(0);
 
         dynasm!(self.mc ; .arch aarch64 ; =>done);

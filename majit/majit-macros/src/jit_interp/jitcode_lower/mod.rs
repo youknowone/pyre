@@ -196,6 +196,10 @@ pub struct LowererConfig {
     /// result is bound, the lowerer sets `Binding.struct_type` from this map
     /// so subsequent `result.field` accesses resolve through `ref_fields`.
     pub(super) call_returns: HashMap<Vec<String>, syn::Path>,
+    /// Struct types whose `New` allocation should carry the headerless bit.
+    pub(super) headerless_structs: std::collections::HashSet<Vec<String>>,
+    /// Field keys (`StructLast::field`) whose virtual RHS is guard-forced.
+    pub(super) force_at_guard_fields: std::collections::HashSet<String>,
     /// Pure function → native IR integer binop aliases.  Key = canonical func
     /// path segments, value = IR opcode name (e.g. "IntAdd").  When
     /// `lower_native_int_binop_call` encounters a call whose path matches a
@@ -828,6 +832,8 @@ impl LowererConfig {
         pool_arrays: &[crate::jit_interp::PoolArrayEntry],
         ref_fields: &[crate::jit_interp::RefFieldEntry],
         call_returns: &[(Path, Path)],
+        headerless_structs: &[Path],
+        force_at_guard: &[crate::jit_interp::ForceAtGuardEntry],
         native_int_binops: &[(Path, Ident)],
         native_tag_small: &[Path],
         split_dispatch: bool,
@@ -1015,6 +1021,22 @@ impl LowererConfig {
                 .iter()
                 .map(|(func, ret_type)| (canonical_path_segments(func), ret_type.clone()))
                 .collect(),
+            headerless_structs: headerless_structs
+                .iter()
+                .map(canonical_path_segments)
+                .collect(),
+            force_at_guard_fields: force_at_guard
+                .iter()
+                .map(|entry| {
+                    let struct_name = entry
+                        .struct_type
+                        .segments
+                        .last()
+                        .map(|s| s.ident.to_string())
+                        .unwrap_or_default();
+                    format!("{}::{}", struct_name, entry.field)
+                })
+                .collect(),
             pool_arrays: pool_arrays
                 .iter()
                 .map(|entry| {
@@ -1044,6 +1066,25 @@ impl LowererConfig {
             cloned.vable_input_ref_reg = Some(reg);
         }
         cloned
+    }
+
+    pub(super) fn is_headerless_struct(&self, struct_path: &syn::Path) -> bool {
+        self.headerless_structs
+            .contains(&canonical_path_segments(struct_path))
+    }
+
+    pub(super) fn force_virtual_at_guard_field(
+        &self,
+        struct_path: &syn::Path,
+        field_name: &str,
+    ) -> bool {
+        let struct_name = struct_path
+            .segments
+            .last()
+            .map(|s| s.ident.to_string())
+            .unwrap_or_default();
+        self.force_at_guard_fields
+            .contains(&format!("{}::{}", struct_name, field_name))
     }
 }
 

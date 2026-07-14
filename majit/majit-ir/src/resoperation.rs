@@ -2107,6 +2107,7 @@ pub enum OpCode {
     CallPureN,
     CheckMemoryError,
     CallMallocNursery,
+    CallMallocNurseryHeaderless,
     CallMallocNurseryVarsize,
     CallMallocNurseryVarsizeFrame,
     RecordKnownResult,
@@ -3078,6 +3079,7 @@ static OPARITY: [Option<u8>; OPCODE_COUNT] = {
     // Calls: all variadic (None) - default
     set!(CheckMemoryError, 1);
     set!(CallMallocNursery, 1);
+    set!(CallMallocNurseryHeaderless, 1);
     set!(CallMallocNurseryVarsizeFrame, 1);
     // Overflow
     set!(IntAddOvf, 2);
@@ -3433,6 +3435,7 @@ static OPRESTYPE: [Type; OPCODE_COUNT] = {
         CallLoopinvariantR,
         ThreadlocalrefGet,
         CallMallocNursery,
+        CallMallocNurseryHeaderless,
         CallMallocNurseryVarsize,
         CallMallocNurseryVarsizeFrame,
         SaveException
@@ -3683,6 +3686,7 @@ static OPNAME: [&str; OPCODE_COUNT] = {
         CallPureN,
         CheckMemoryError,
         CallMallocNursery,
+        CallMallocNurseryHeaderless,
         CallMallocNurseryVarsize,
         CallMallocNurseryVarsizeFrame,
         RecordKnownResult,
@@ -3872,6 +3876,7 @@ mod tests {
             OpCode::IncrementDebugCounter,
             OpCode::LeavePortalFrame,
             OpCode::CallMallocNursery,
+            OpCode::CallMallocNurseryHeaderless,
             OpCode::CallMallocNurseryVarsizeFrame,
         ];
         for op in &unary_ops {
@@ -4128,6 +4133,7 @@ mod tests {
             OpCode::CondCallValueR,
             OpCode::ThreadlocalrefGet,
             OpCode::CallMallocNursery,
+            OpCode::CallMallocNurseryHeaderless,
             OpCode::CallMallocNurseryVarsize,
             OpCode::CallMallocNurseryVarsizeFrame,
             OpCode::SaveException,
