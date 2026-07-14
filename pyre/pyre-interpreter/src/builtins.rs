@@ -6206,66 +6206,6 @@ fn exec_or_eval(
         }
     }
 
-    /// Ensure the globals dict OBJECT carries the shadow `DictStorage`
-    /// required by the transitional back-mirror bridge.
-    ///
-    /// `pypy/interpreter/pyopcode.py:771-776` runs the frame on the user
-    /// dict directly. Module dicts and dicts returned by `globals()` already
-    /// carry a proxy — reused as-is, so a second `exec(src, g)` allocates
-    /// nothing (heap-stable).
-    ///
-    /// A fresh dict (`exec(src, {})`) gets one storage allocated,
-    /// pre-populated from its str-keyed entries (LOAD_GLOBAL must see
-    /// bindings the dict already held), back-mirrored (`set_mirror_target`,
-    /// so STORE_GLOBAL / DELETE_GLOBAL through the storage propagate into
-    /// the dict's entries), and attached as the proxy (so the dict's own
-    /// `__setitem__` fans str-keyed writes back into the storage via
-    /// `maybe_sync_dict_storage_store`).  The two halves stand in for
-    /// PyPy's single `W_DictMultiObject`.
-    ///
-    /// The storage is owned by the dict for its lifetime — functions
-    /// defined during the run capture the dict OBJECT as `__globals__`, so it
-    /// is intentionally leaked alongside the dict rather than freed. Retires
-    /// with the `dict_storage_proxy` bridge when the dict becomes the single
-    /// store.
-    fn ensure_globals_storage_proxy(w_globals: pyre_object::PyObjectRef) {
-        if w_globals.is_null() {
-            return;
-        }
-        // Dispatch storage on `resolve_dict_backing` (a dict subclass
-        // resolves to itself; a dict-proxy / mapping to its inner dict),
-        // mirroring PyPy's storage-vs-original split.
-        let backing = unsafe { crate::type_methods::resolve_dict_backing(w_globals) };
-        if backing.is_null() {
-            return;
-        }
-        if !unsafe { pyre_object::w_dict_get_dict_storage_proxy(backing) }.is_null() {
-            // module.__dict__ / globals() / a dict reused across exec —
-            // already storage-backed, nothing to allocate.
-            return;
-        }
-        let mut ns = Box::new(crate::DictStorage::new());
-        unsafe {
-            for (key, value) in pyre_object::w_dict_items(backing) {
-                if !value.is_null() && pyre_object::is_str(key) {
-                    let name = pyre_object::w_str_get_value(key).to_string();
-                    crate::dict_storage_store(&mut ns, &name, value);
-                }
-            }
-            ns.set_mirror_target(backing);
-        }
-        // The fresh immortal storage now holds refs copied out of a GC
-        // dict (possibly young); rescan on the next minor collection.
-        pyre_object::gc_roots::mark_prebuilt_roots_dirty();
-        ns.fix_ptr();
-        let storage_ptr: *mut crate::DictStorage = ns.as_mut() as *mut _;
-        unsafe {
-            pyre_object::w_dict_set_dict_storage_proxy(backing, storage_ptr as *mut u8);
-        }
-        // Owned by the dict for its lifetime; leaked rather than freed.
-        let _ = Box::into_raw(ns);
-    }
-
     fn ensure_eval_builtins(
         w_globals: pyre_object::PyObjectRef,
         exec_ctx: *const crate::PyExecutionContext,
@@ -6412,15 +6352,10 @@ fn exec_or_eval(
     } else {
         pyre_object::w_dict_new()
     };
-    // Seed the str-keyed storage proxy that the LOAD_GLOBAL / STORE_GLOBAL
-    // bytecode fastpath reads, mirroring the dict's str entries.  A dict
-    // already backing a frame (module.__dict__ / globals()) keeps its proxy.
-    ensure_globals_storage_proxy(w_globals);
     // pyopcode.py:773-774 `space.call_method(w_globals, 'setdefault', ...)`
     // (exec) and compiling.py:109-110 `space.setitem_str(w_globals, ...)`
     // (eval) dispatch on the ORIGINAL `w_globals` object so a dict-subclass
-    // `setdefault` / `__contains__` / `__setitem__` override fires; the
-    // str-keyed write fans into the storage proxy seeded above.
+    // `setdefault` / `__contains__` / `__setitem__` override fires.
     if is_eval {
         ensure_eval_builtins(w_globals, exec_ctx)?;
     } else {

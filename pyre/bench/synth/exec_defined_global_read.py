@@ -4,9 +4,8 @@ N = 200
 def main():
     # A function defined inside `exec(src, fresh_dict)` captures the fresh
     # dict as its `__globals__`.  Calling it enough to JIT-compile a trace
-    # must keep resolving its module globals (LOAD_GLOBAL `ADDEND`) — the
-    # frame's globals object is the exec dict, and its backing storage must
-    # stay live after `exec` returns.
+    # must keep resolving its module globals (LOAD_GLOBAL `ADDEND`) through
+    # that dict object; no separate backing storage is involved.
     ns = {}
     exec(
         "ADDEND = 3\n"
