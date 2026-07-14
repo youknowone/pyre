@@ -3879,7 +3879,6 @@ mod tests {
     #[test]
     fn classdesc_consider_call_site_merges_call_families() {
         use super::super::argument::simple_args;
-        use super::super::description::DescKey;
         use super::super::model::SomeValue;
         let bk = make_bk();
         // Phase 2 requires a common base — upstream classdesc.py:912

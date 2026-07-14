@@ -8569,7 +8569,6 @@ mod pbc_repr_tests {
     #[test]
     fn classes_pbc_repr_get_access_set_returns_family_and_commonbase_class_repr() {
         use crate::annotator::classdesc::ClassDesc;
-        use crate::annotator::description::DescKey;
         use crate::flowspace::model::HostObject;
         use crate::translator::rtyper::normalizecalls::merge_classpbc_getattr_into_classdef;
 

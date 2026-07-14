@@ -6035,7 +6035,7 @@ mod tests {
 
     #[test]
     fn classrepr_setup_materializes_extra_access_sets() {
-        use crate::annotator::description::{ClassAttrFamily, DescKey};
+        use crate::annotator::description::ClassAttrFamily;
 
         let rtyper = fresh_rtyper();
         let classdef = ClassDef::new_standalone("pkg.C", None);
