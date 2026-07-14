@@ -72,17 +72,6 @@ pub type ProfileFunc = fn(
     w_arg: PyObjectRef,
 ) -> Result<(), crate::PyError>;
 
-/// Byte offset of the GC-owning `values` pointer inside `DictStorage`.
-/// Post-L1 DictStorage holds a `*mut ItemsBlock` directly (no fat
-/// wrapper); the JIT reads this field to obtain the items-block
-/// pointer, then adds `ITEMS_BLOCK_ITEMS_OFFSET` for the items base.
-pub const DICT_STORAGE_VALUES_OFFSET: usize = std::mem::offset_of!(DictStorage, values);
-
-/// Byte offset of the live dict slot count inside `DictStorage`.
-/// Post-L1 reads `DictStorage.length` directly (upstream
-/// `rdict.py` `l.length` equivalent for the values array).
-pub const DICT_STORAGE_VALUES_LEN_OFFSET: usize = std::mem::offset_of!(DictStorage, length);
-
 /// Internal dict backing used for globals, module dicts, and type dicts.
 ///
 /// PyPy correspondence: this is not `cpyext._PyNamespace_New()` or

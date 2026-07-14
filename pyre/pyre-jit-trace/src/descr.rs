@@ -1264,36 +1264,6 @@ static SPECIALISED_TUPLE_OO_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLo
     )
 });
 
-static DICT_STORAGE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
-    build_object_descr_group_with_def_path(
-        std::mem::size_of::<pyre_interpreter::DictStorage>(),
-        0,
-        0,
-        &[
-            (
-                "DictStorage.values.ptr",
-                DICT_STORAGE_VALUES_OFFSET,
-                8,
-                Type::Int,
-                false,
-                false,
-                false,
-            ),
-            (
-                "DictStorage.values.len",
-                DICT_STORAGE_VALUES_LEN_OFFSET,
-                8,
-                Type::Int,
-                false,
-                false,
-                false,
-            ),
-        ],
-        "DictStorage",
-        "executioncontext::DictStorage",
-    )
-});
-
 static ITEMS_BLOCK_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     build_object_descr_group_with_def_path(
         pyre_object::object_array::ITEMS_BLOCK_ITEMS_OFFSET,
@@ -1709,7 +1679,6 @@ pub fn make_array_descr_with_full_id(
 
 // ── Range iterator field descriptors ─────────────────────────────────
 
-use pyre_interpreter::{DICT_STORAGE_VALUES_LEN_OFFSET, DICT_STORAGE_VALUES_OFFSET};
 use pyre_object::floatobject::{FLOAT_FLOATVAL_OFFSET, W_FloatObject};
 use pyre_object::functional::{
     RANGE_ITER_CURRENT_OFFSET, RANGE_ITER_REMAINING_OFFSET, RANGE_ITER_STEP_OFFSET,
@@ -2102,14 +2071,6 @@ pub fn str_len_descr() -> DescrRef {
         Type::Int,
         false,
     )
-}
-
-pub fn dict_storage_values_ptr_descr() -> DescrRef {
-    field_descr_from_group(&DICT_STORAGE_DESCR_GROUP, 0)
-}
-
-pub fn dict_storage_values_len_descr() -> DescrRef {
-    field_descr_from_group(&DICT_STORAGE_DESCR_GROUP, 1)
 }
 
 // ── Object header & allocation descriptors ──────────────────────────
