@@ -7506,12 +7506,18 @@ fn builtin_ord(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             let cp = w_str_get_wtf8(obj).code_points().next().unwrap();
             return Ok(w_int_new(cp.to_u32() as i64));
         }
-        // bytesobject.py:464 — bytes of length 1
+        // bytesobject.py:473 names bytes "bytes"; bytearrayobject.py:213
+        // names bytearray "string".
         if pyre_object::bytesobject::is_bytes_like(obj) {
             let data = pyre_object::bytesobject::bytes_like_data(obj);
             if data.len() != 1 {
+                let noun = if pyre_object::bytesobject::is_bytes(obj) {
+                    "bytes"
+                } else {
+                    "string"
+                };
                 return Err(crate::PyError::type_error(format!(
-                    "ord() expected a character, but string of length {} found",
+                    "ord() expected a character, but {noun} of length {} found",
                     data.len()
                 )));
             }

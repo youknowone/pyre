@@ -2814,10 +2814,12 @@ pub fn pow3(base: PyObjectRef, exp: PyObjectRef, modulus: PyObjectRef) -> PyResu
     if unsafe { is_none(modulus) } {
         return pow(base, exp);
     }
-    // descroperation.py:459 — three-arg power looks up only the forward
+    // descroperation.py:454-459 — three-arg power looks up only the forward
     // `__pow__` on the base (so a subclass override is honoured) and never
-    // the reflected `__rpow__`. The integer modular-power computation lives
-    // in `int.__pow__`, reached through this lookup.
+    // the reflected `__rpow__`. The `is_cpytype()` `pow3_bug_compat_cpyext`
+    // branch has no equivalent: with no cpyext type model every base takes
+    // the `else` branch. The integer modular-power computation lives in
+    // `int.__pow__`, reached through this lookup.
     if let Some(method) = unsafe { lookup_type_special(base, "__pow__") } {
         if let Some(result) = try_call_special(method, &[base, exp, modulus])? {
             return Ok(result);

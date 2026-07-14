@@ -1252,7 +1252,8 @@ pub(crate) fn getitem_slot(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
 /// `pypy/interpreter/baseobjspace.py:1574 getindex_w` — the `TypeError`
 /// raised when a sequence subscript is neither an integer nor a slice:
 /// `"<descr> indices must be integers or slices, not '<type>'"` (the `%T`
-/// operand names the key's own class).
+/// operand names the key's own class).  The reference `pypy3` quotes the
+/// type name here; a later source tree emits it unquoted.
 fn index_type_error(descr: &str, index: PyObjectRef) -> PyError {
     let tp = if index.is_null() {
         "NULL".to_string()
@@ -1262,6 +1263,21 @@ fn index_type_error(descr: &str, index: PyObjectRef) -> PyError {
     PyError::type_error(format!(
         "{descr} indices must be integers or slices, not '{tp}'"
     ))
+}
+
+/// `getindex_w` remaps a `TypeError` raised while coercing a subscript key
+/// through `__index__` — a non-int `__index__` return, or a `TypeError` from
+/// `__index__` itself — to the sequence-specific "indices must be integers or
+/// slices" message (`baseobjspace.py:1574` catches `space.index`'s error when
+/// `objdescr` is set).  Any other error (e.g. a `ValueError` from `__index__`)
+/// propagates unchanged.  Only the subscript paths pass an `objdescr`;
+/// `list.insert` / `list.pop` do not, and surface `space.index`'s error verbatim.
+fn remap_getindex_type_error(err: PyError, descr: &str, index: PyObjectRef) -> PyError {
+    if err.kind == PyErrorKind::TypeError {
+        index_type_error(descr, index)
+    } else {
+        err
+    }
 }
 
 #[inline(never)]
@@ -1296,7 +1312,10 @@ unsafe fn getitem_list(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     let idx = if is_int(index) {
         w_int_get_value(index)
     } else if pyre_object::pyobject::is_int_or_long(index) || lookup(index, "__index__").is_some() {
-        let indexed = space_index(index)?;
+        let indexed = match space_index(index) {
+            Ok(w) => w,
+            Err(e) => return Err(remap_getindex_type_error(e, "list", index)),
+        };
         if is_int(indexed) {
             w_int_get_value(indexed)
         } else {
@@ -1355,7 +1374,10 @@ unsafe fn getitem_tuple(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     let idx = if is_int(index) {
         w_int_get_value(index)
     } else if pyre_object::pyobject::is_int_or_long(index) || lookup(index, "__index__").is_some() {
-        let indexed = space_index(index)?;
+        let indexed = match space_index(index) {
+            Ok(w) => w,
+            Err(e) => return Err(remap_getindex_type_error(e, "tuple", index)),
+        };
         if is_int(indexed) {
             w_int_get_value(indexed)
         } else {
@@ -1420,7 +1442,10 @@ unsafe fn getitem_str(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     let idx = if is_int(index) {
         w_int_get_value(index)
     } else if pyre_object::pyobject::is_int_or_long(index) || lookup(index, "__index__").is_some() {
-        let indexed = space_index(index)?;
+        let indexed = match space_index(index) {
+            Ok(w) => w,
+            Err(e) => return Err(remap_getindex_type_error(e, "string", index)),
+        };
         if is_int(indexed) {
             w_int_get_value(indexed)
         } else {
@@ -1486,7 +1511,13 @@ unsafe fn getitem_bytes_like(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     let idx = if is_int(index) {
         w_int_get_value(index)
     } else if pyre_object::pyobject::is_int_or_long(index) || lookup(index, "__index__").is_some() {
-        let indexed = space_index(index)?;
+        let indexed = match space_index(index) {
+            Ok(w) => w,
+            Err(e) => {
+                let descr = if is_bytes { "byte" } else { "bytearray" };
+                return Err(remap_getindex_type_error(e, descr, index));
+            }
+        };
         if is_int(indexed) {
             w_int_get_value(indexed)
         } else {
@@ -2365,7 +2396,10 @@ unsafe fn setitem_list(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef)
     let idx = if is_int(index) {
         w_int_get_value(index)
     } else if pyre_object::pyobject::is_int_or_long(index) || lookup(index, "__index__").is_some() {
-        let indexed = space_index(index)?;
+        let indexed = match space_index(index) {
+            Ok(w) => w,
+            Err(e) => return Err(remap_getindex_type_error(e, "list", index)),
+        };
         if is_int(indexed) {
             w_int_get_value(indexed)
         } else {
@@ -2463,7 +2497,11 @@ unsafe fn subscript_index_w(descr: &str, index: PyObjectRef) -> Result<i64, PyEr
     if !pyre_object::pyobject::is_int_or_long(index) && lookup(index, "__index__").is_none() {
         return Err(index_type_error(descr, index));
     }
-    match int_w(space_index(index)?) {
+    let indexed = match space_index(index) {
+        Ok(w) => w,
+        Err(e) => return Err(remap_getindex_type_error(e, descr, index)),
+    };
+    match int_w(indexed) {
         Ok(i) => Ok(i),
         // `baseobjspace.py getindex_w` — an index that overflows a machine
         // word reports the *source* object's type, `oefmt("cannot fit '%T'
@@ -2516,7 +2554,10 @@ unsafe fn setitem_bytearray(obj: PyObjectRef, index: PyObjectRef, value: PyObjec
     let idx = if is_int(index) {
         w_int_get_value(index)
     } else if pyre_object::pyobject::is_int_or_long(index) || lookup(index, "__index__").is_some() {
-        let indexed = space_index(index)?;
+        let indexed = match space_index(index) {
+            Ok(w) => w,
+            Err(e) => return Err(remap_getindex_type_error(e, "bytearray", index)),
+        };
         if is_int(indexed) {
             w_int_get_value(indexed)
         } else {
