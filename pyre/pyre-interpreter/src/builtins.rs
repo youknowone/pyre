@@ -5265,15 +5265,16 @@ pub(crate) fn getindex_w(w_obj: PyObjectRef) -> Result<i64, crate::PyError> {
             return Ok(w_int_get_value(w_obj));
         }
         if pyre_object::pyobject::is_long(w_obj) {
-            // baseobjspace.py:1586-1591: try int_w, on overflow clamp
+            // baseobjspace.py:1586-1591: try int_w, on overflow clamp to
+            // -sys.maxint-1 for a negative value, sys.maxint otherwise.
             let big = pyre_object::longobject::w_long_get_value(w_obj);
-            return Ok(
-                if pyre_object::longobject::jit_bigint_to_i64_fits(big) != 0 {
-                    pyre_object::longobject::jit_bigint_to_i64_value(big)
-                } else {
-                    i64::MAX
-                },
-            );
+            return Ok(if pyre_object::longobject::jit_bigint_to_i64_fits(big) != 0 {
+                pyre_object::longobject::jit_bigint_to_i64_value(big)
+            } else if pyre_object::longobject::jit_bigint_sign_i64(big) < 0 {
+                i64::MIN
+            } else {
+                i64::MAX
+            });
         }
         // baseobjspace.py:1568: w_index = self.index(w_obj)
         if let Some(method) = crate::baseobjspace::lookup(w_obj, "__index__") {
@@ -5283,13 +5284,13 @@ pub(crate) fn getindex_w(w_obj: PyObjectRef) -> Result<i64, crate::PyError> {
             }
             if pyre_object::pyobject::is_long(w_index) {
                 let big = pyre_object::longobject::w_long_get_value(w_index);
-                return Ok(
-                    if pyre_object::longobject::jit_bigint_to_i64_fits(big) != 0 {
-                        pyre_object::longobject::jit_bigint_to_i64_value(big)
-                    } else {
-                        i64::MAX
-                    },
-                );
+                return Ok(if pyre_object::longobject::jit_bigint_to_i64_fits(big) != 0 {
+                    pyre_object::longobject::jit_bigint_to_i64_value(big)
+                } else if pyre_object::longobject::jit_bigint_sign_i64(big) < 0 {
+                    i64::MIN
+                } else {
+                    i64::MAX
+                });
             }
         }
     }
@@ -9500,10 +9501,11 @@ pub(crate) fn builtin_round(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             return match ndigits {
                 // `floatobject.py:966-967 _round_float`: nan/inf round to
                 // themselves when an explicit ndigits is supplied.  `ndigits`
-                // is taken through `space.getindex_w`, so any `__index__`
-                // object works and a non-index one raises.
+                // is taken through `space.getindex_w(w, None)`, so any
+                // `__index__` object works, an out-of-word value clamps, and a
+                // non-index one raises.
                 Some(nd) if !pyre_object::is_none(*nd) => {
-                    let n = space_index_w(*nd)?;
+                    let n = crate::baseobjspace::getindex_w(*nd)?;
                     if !v.is_finite() {
                         Ok(floatobject::w_float_new(v))
                     } else {
@@ -9520,11 +9522,12 @@ pub(crate) fn builtin_round(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             };
         }
         if is_int(obj) || is_long(obj) {
-            // `longobject.c:long_round` — single-arg round and any
+            // `intobject.py:144 descr_round` — single-arg round and any
             // ndigits >= 0 leave an int unchanged; ndigits < 0 rounds to
-            // the nearest multiple of 10**(-ndigits), ties to even.
+            // the nearest multiple of 10**(-ndigits), ties to even.  `ndigits`
+            // is coerced through `space.index`, so a non-index one raises.
             let nd = match ndigits {
-                Some(nd) if !pyre_object::is_none(*nd) => space_index_w(*nd)?,
+                Some(nd) if !pyre_object::is_none(*nd) => crate::baseobjspace::getindex_w(*nd)?,
                 _ => return Ok(obj),
             };
             if nd >= 0 {
@@ -9532,6 +9535,13 @@ pub(crate) fn builtin_round(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             }
             use num_integer::Integer;
             let a = obj_to_bigint(obj);
+            // 10**(-ndigits) beyond the magnitude of `a` rounds every digit
+            // away, giving 0; short-circuit so a clamped huge-negative ndigits
+            // neither overflows `-nd` nor builds an astronomical power of ten.
+            let magnitude_digits = a.to_str_radix(10).trim_start_matches('-').len() as u64;
+            if nd.unsigned_abs() > magnitude_digits {
+                return Ok(w_int_new(0));
+            }
             let mut b = BigInt::from(1);
             let ten = BigInt::from(10);
             for _ in 0..(-nd) {
@@ -9623,38 +9633,19 @@ fn builtin_pow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     }
 }
 
-/// Coerce `obj` to a `BigInt` through the index protocol (`_operator.index`),
-/// so `hex`/`oct`/`bin` accept any `__index__` object and arbitrarily large
-/// integers.
+/// Coerce `obj` to a `BigInt` through the index protocol (`space.index`), so
+/// `hex`/`oct`/`bin` accept any `__index__` object and arbitrarily large
+/// integers. A missing `__index__` raises "'X' object cannot be interpreted as
+/// an integer"; an `__index__` returning a non-int raises "__index__ returned
+/// non-int (type X)".
 fn index_to_bigint(obj: PyObjectRef) -> Result<BigInt, crate::PyError> {
+    let w_index = crate::baseobjspace::space_index(obj)?;
     unsafe {
-        if is_int(obj) || is_long(obj) {
-            return Ok(obj_to_bigint(obj));
+        if pyre_object::is_bool(w_index) {
+            return Ok(BigInt::from(pyre_object::w_bool_get_value(w_index) as i64));
         }
-        if pyre_object::is_bool(obj) {
-            return Ok(BigInt::from(pyre_object::w_bool_get_value(obj) as i64));
-        }
-        if let Some(tp) = crate::typedef::r#type(obj) {
-            if let Some(index_fn) = crate::baseobjspace::lookup_in_type(tp, "__index__") {
-                let result = crate::call::call_function_impl_result(index_fn, &[obj])?;
-                if is_int(result) || is_long(result) {
-                    return Ok(obj_to_bigint(result));
-                }
-                if pyre_object::is_bool(result) {
-                    return Ok(BigInt::from(pyre_object::w_bool_get_value(result) as i64));
-                }
-            }
-        }
+        Ok(obj_to_bigint(w_index))
     }
-    let tp_name = unsafe {
-        match crate::typedef::r#type(obj) {
-            Some(tp) => pyre_object::w_type_get_name(tp).to_string(),
-            None => "object".to_string(),
-        }
-    };
-    Err(crate::PyError::type_error(format!(
-        "'{tp_name}' object cannot be interpreted as an integer"
-    )))
 }
 
 /// Format a `BigInt` in `radix` with the given `0x`/`0o`/`0b` prefix, keeping

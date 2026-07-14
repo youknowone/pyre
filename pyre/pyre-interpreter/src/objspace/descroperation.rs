@@ -1924,7 +1924,13 @@ pub fn add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             if let Some(result) = try_dispatch_binary_special(a, b, "__add__", "__radd__")? {
                 return Ok(result);
             }
-            return bytes_concat(a, b);
+            // A non-buffer rhs is rejected with the generic operator TypeError
+            // (bytes `descr_add` returns NotImplemented), not "can't concat".
+            let a_name = crate::baseobjspace::object_functionstr_type_name(a);
+            let b_name = crate::baseobjspace::object_functionstr_type_name(b);
+            return Err(PyError::type_error(format!(
+                "unsupported operand type(s) for +: '{a_name}' and '{b_name}'"
+            )));
         }
         // Forward `__add__` + reflected `__radd__` per
         // `descroperation.py:_make_binop_impl` — try_dispatch_binary_special
@@ -1939,14 +1945,6 @@ pub fn add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         }
         let a_name = crate::baseobjspace::object_functionstr_type_name(a);
         let b_name = crate::baseobjspace::object_functionstr_type_name(b);
-        // Sequence concatenation slot (sq_concat) reports a distinct
-        // message when the left operand is a sequence — `unicode_concatenate`
-        // / `list_concat` / `tuple_concat`.
-        if is_str(a) || is_list(a) || is_tuple(a) {
-            return Err(PyError::type_error(format!(
-                "can only concatenate {a_name} (not \"{b_name}\") to {a_name}"
-            )));
-        }
         Err(PyError::type_error(format!(
             "unsupported operand type(s) for +: '{}' and '{}'",
             a_name, b_name,

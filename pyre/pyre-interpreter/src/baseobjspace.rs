@@ -916,14 +916,14 @@ pub(crate) unsafe fn normalize_slice(
         if step > 0 { 0 } else { length - 1 }
     } else {
         let v = crate::sliceobject::eval_slice_index(start_obj)?;
-        let v = if v < 0 { v + length } else { v };
+        let v = if v < 0 { v.saturating_add(length) } else { v };
         v.max(lower).min(upper)
     };
     let stop = if is_none(stop_obj) {
         if step > 0 { length } else { -1 }
     } else {
         let v = crate::sliceobject::eval_slice_index(stop_obj)?;
-        let v = if v < 0 { v + length } else { v };
+        let v = if v < 0 { v.saturating_add(length) } else { v };
         v.max(lower).min(upper)
     };
     Ok((start, stop, step))

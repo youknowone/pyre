@@ -2520,8 +2520,9 @@ fn init_list_type(ns: PyObjectRef) {
             ),
         )
     };
-    // Arithmetic slots.  `listobject.c:list_concat` rejects a non-list
-    // operand with TypeError (it does not return NotImplemented);
+    // Arithmetic slots.  `listobject.py:627 descr_add` returns NotImplemented
+    // for a non-list operand (so the `+` operator's reflected dispatch runs and
+    // a generic "unsupported operand type(s)" TypeError is raised);
     // `list_repeat` requires an integer count.
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
@@ -2534,10 +2535,7 @@ fn init_list_type(ns: PyObjectRef) {
                     if unsafe { pyre_object::is_list(args[1]) } {
                         unsafe { crate::objspace::descroperation::list_concat(args[0], args[1]) }
                     } else {
-                        Err(crate::PyError::type_error(format!(
-                            "can only concatenate list (not \"{}\") to list",
-                            arg_type_name(args[1])
-                        )))
+                        Ok(pyre_object::w_not_implemented())
                     }
                 },
                 2,
@@ -5643,8 +5641,10 @@ fn init_tuple_type(ns: PyObjectRef) {
             ),
         )
     };
-    // `tupleobject.c:tuple_concat` rejects a non-tuple operand with
-    // TypeError; `*` requires an integer count.
+    // `tupleobject.py:181 descr_add` returns NotImplemented for a non-tuple
+    // operand (so the `+` operator's reflected dispatch runs and a generic
+    // "unsupported operand type(s)" TypeError is raised); `*` requires an
+    // integer count.
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
@@ -5656,10 +5656,7 @@ fn init_tuple_type(ns: PyObjectRef) {
                     if unsafe { pyre_object::is_tuple(args[1]) } {
                         unsafe { crate::objspace::descroperation::tuple_concat(args[0], args[1]) }
                     } else {
-                        Err(crate::PyError::type_error(format!(
-                            "can only concatenate tuple (not \"{}\") to tuple",
-                            arg_type_name(args[1])
-                        )))
+                        Ok(pyre_object::w_not_implemented())
                     }
                 },
                 2,
@@ -11577,7 +11574,16 @@ fn init_bytes_type(ns: PyObjectRef) {
                 "__add__",
                 |args| {
                     crate::type_methods::arity_slot(args, 1)?;
-                    unsafe { crate::objspace::descroperation::bytes_concat(args[0], args[1]) }
+                    // `descr_add` returns NotImplemented for a non-buffer operand
+                    // so the `+` operator raises the generic operator TypeError.
+                    unsafe {
+                        match buffer_as_bytes_like(args[1])? {
+                            Some(_) => {
+                                crate::objspace::descroperation::bytes_concat(args[0], args[1])
+                            }
+                            None => Ok(pyre_object::w_not_implemented()),
+                        }
+                    }
                 },
                 2,
             ),
@@ -14405,16 +14411,10 @@ fn init_bytearray_type(ns: PyObjectRef) {
                     let b = args[1];
                     unsafe {
                         let a_data = pyre_object::bytesobject::bytes_like_data(a);
-                        // descr_add: a non-buffer operand raises rather than
-                        // concatenating as empty.
+                        // `descr_add` returns NotImplemented for a non-buffer
+                        // operand so the `+` operator raises the generic TypeError.
                         let Some(src) = buffer_as_bytes_like(b)? else {
-                            return Err(crate::PyError::new(
-                                crate::PyErrorKind::TypeError,
-                                format!(
-                                    "can't concat {} to bytearray",
-                                    crate::type_methods::arg_type_name(b)
-                                ),
-                            ));
+                            return Ok(pyre_object::w_not_implemented());
                         };
                         let b_data = pyre_object::bytesobject::bytes_like_data(src).to_vec();
                         let mut result = a_data.to_vec();
@@ -14440,13 +14440,14 @@ fn init_bytearray_type(ns: PyObjectRef) {
                     let other = args[1];
                     unsafe {
                         crate::builtins::bytearray_check_exports(ba)?;
-                        // descr_inplace_add: a non-buffer operand raises rather
-                        // than silently leaving the bytearray unchanged.
+                        // `descr_inplace_add` requires a bytes-like operand; a
+                        // non-buffer one raises rather than silently leaving the
+                        // bytearray unchanged.
                         let Some(src) = buffer_as_bytes_like(other)? else {
                             return Err(crate::PyError::new(
                                 crate::PyErrorKind::TypeError,
                                 format!(
-                                    "can't concat {} to bytearray",
+                                    "a bytes-like object is required, not '{}'",
                                     crate::type_methods::arg_type_name(other)
                                 ),
                             ));

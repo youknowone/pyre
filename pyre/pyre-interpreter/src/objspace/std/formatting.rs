@@ -378,9 +378,16 @@ unsafe fn number_arg_decimal(spec: &CFormatSpec, obj: PyObjectRef) -> Result<Big
         }
     }
     if has_dunder(obj, "__index__") {
-        return Ok(crate::builtins::obj_to_bigint(
-            crate::baseobjspace::space_index(obj)?,
-        ));
+        // `format_num_helper`: a TypeError from the numeric decoder (a non-int
+        // `__index__` return included) is reported as the operand-type error,
+        // naming the original argument, not the coerced result.
+        return match crate::baseobjspace::space_index(obj) {
+            Ok(w) => Ok(crate::builtins::obj_to_bigint(w)),
+            Err(e) if e.kind == crate::PyErrorKind::TypeError => {
+                Err(number_type_error(spec, obj, "a real number is required"))
+            }
+            Err(e) => Err(e),
+        };
     }
     Err(number_type_error(spec, obj, "a real number is required"))
 }
@@ -392,9 +399,15 @@ unsafe fn number_arg_integer(spec: &CFormatSpec, obj: PyObjectRef) -> Result<Big
         return Ok(arg_to_bigint(obj));
     }
     if has_dunder(obj, "__index__") {
-        return Ok(crate::builtins::obj_to_bigint(
-            crate::baseobjspace::space_index(obj)?,
-        ));
+        // `format_num_helper` (maybe_index): a TypeError from `space.index`
+        // is reported as the operand-type error naming the original argument.
+        return match crate::baseobjspace::space_index(obj) {
+            Ok(w) => Ok(crate::builtins::obj_to_bigint(w)),
+            Err(e) if e.kind == crate::PyErrorKind::TypeError => {
+                Err(number_type_error(spec, obj, "an integer is required"))
+            }
+            Err(e) => Err(e),
+        };
     }
     Err(number_type_error(spec, obj, "an integer is required"))
 }

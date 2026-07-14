@@ -28,7 +28,9 @@ pub(crate) fn eval_slice_index(w_int: PyObjectRef) -> Result<i64, crate::PyError
 pub fn adapt_lower_bound(size: i64, w_index: PyObjectRef) -> Result<i64, crate::PyError> {
     let mut index = eval_slice_index(w_index)?;
     if index < 0 {
-        index += size;
+        // `eval_slice_index` clamps an out-of-word index to `i64::MIN`, so fold
+        // by `size` without overflowing before flooring at 0.
+        index = index.saturating_add(size);
         if index < 0 {
             index = 0;
         }
