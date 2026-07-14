@@ -2427,6 +2427,10 @@ impl MIFrame {
         // reaches store_local_value through `setarrayitem_vable_r`; use the
         // same virtualizable/local-slot writer with the unbound sentinel.
         let null = ctx.const_ref(pyre_object::PY_NULL as i64);
+        if idx < self.sym().concrete_locals.len() {
+            self.sym_mut().concrete_locals[idx] =
+                crate::state::ConcreteValue::Ref(pyre_object::PY_NULL);
+        }
         self.store_local_value(ctx, idx, null, ConcreteValue::Ref(pyre_object::PY_NULL))
     }
 
@@ -7551,8 +7555,37 @@ impl MIFrame {
         // falls through to the codewriter's `abort_permanent` fallback.
         if let Instruction::DeleteFast { var_num } = instruction {
             if crate::jitcode_dispatch::fbw_delete_fast_enabled() {
+                let idx = var_num.get(op_arg).as_usize();
+                let name = if idx < pyre_interpreter::code_varnames_len(code) {
+                    code.varnames[idx].as_ref()
+                } else {
+                    "<cell>"
+                };
+                let concrete_unbound = self
+                    .sym()
+                    .concrete_locals
+                    .get(idx)
+                    .copied()
+                    .is_some_and(|v| v == crate::state::ConcreteValue::Ref(pyre_object::PY_NULL));
+                let traced_unbound = self.with_ctx(|this, ctx| {
+                    let value = this.load_local_value(ctx, idx)?;
+                    Ok::<_, PyError>(
+                        ctx.box_value(value)
+                            == Some(Value::Ref(GcRef(pyre_object::PY_NULL as usize))),
+                    )
+                })?;
+                if concrete_unbound || traced_unbound {
+                    return Err(PyError::unbound_local_error_with_name(
+                        format!("local variable '{name}' referenced before assignment"),
+                        name,
+                    ));
+                }
                 self.with_ctx(|this, ctx| {
-                    this.delete_local_value(ctx, var_num.get(op_arg).as_usize())
+                    let opref = crate::state::MIFrame::load_local_value(this, ctx, idx)?;
+                    if this.value_type(opref) == majit_ir::Type::Ref {
+                        crate::state::MIFrame::guard_nonnull(this, ctx, opref);
+                    }
+                    this.delete_local_value(ctx, idx)
                 })?;
                 return Ok(Some(pyre_interpreter::StepResult::Continue));
             }

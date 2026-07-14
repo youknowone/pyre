@@ -11300,9 +11300,121 @@ impl CodeWriter {
                         Instruction::DeleteFast { var_num } => {
                             if fbw_delete_fast_enabled() {
                                 let idx = var_num.get(op_arg).as_usize();
+                                if current_state.local_value_at(idx).is_none() {
+                                    emit_abort_permanent!(py_pc);
+                                    continue;
+                                }
+                                let idx_u16 = idx as u16;
                                 let local_slot = local_to_vable_slot(idx) as i64;
                                 let v_idx: super::flow::FlowValue =
                                     super::flow::Constant::signed(local_slot).into();
+                                let code_const: super::flow::FlowValue =
+                                    super::flow::Constant::new(
+                                        super::flow::ConstantValue::Signed(w_code as i64),
+                                        Some(Kind::Ref),
+                                    )
+                                    .into();
+                                let name_idx_const: super::flow::FlowValue =
+                                    super::flow::Constant::signed(idx as i64).into();
+                                emit_load_fast_ref!(current_depth, idx_u16, py_pc);
+                                let _value_reg = emit_popvalue_ref!(current_depth, py_pc);
+                                let value_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                                let checked_value = emit_graph_op_with_result(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    "load_fast_check",
+                                    vec![
+                                        value_value.into(),
+                                        code_const.into(),
+                                        name_idx_const.into(),
+                                    ],
+                                    Kind::Ref,
+                                    py_pc as i64,
+                                );
+                                let checked_flow: super::flow::FlowValue = checked_value.into();
+                                let is_null = emit_graph_op_with_result(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    "ptr_iszero",
+                                    vec![checked_flow.clone().into()],
+                                    Kind::Int,
+                                    py_pc as i64,
+                                );
+                                current_block.block().borrow_mut().exitswitch =
+                                    Some(super::flow::ExitSwitch::Value(is_null.into()));
+                                let abort_state = current_state.clone();
+                                let abort_block = SpamBlockRef::new(
+                                    graph.new_block(Vec::new()),
+                                    Some(abort_state.clone()),
+                                );
+                                abort_block.block().borrow_mut().inputargs =
+                                    abort_state.getvariables();
+                                all_walker_blocks.push(abort_block.clone());
+                                append_exit(
+                                    &current_block.block(),
+                                    output_link(&current_state, &abort_state, abort_block.block()),
+                                );
+                                set_last_bool_exitcase(&current_block.block(), true);
+                                {
+                                    let v_li: super::flow::FlowValue =
+                                        super::flow::Constant::signed(py_pc as i64 - 1).into();
+                                    record_graph_op(
+                                        &abort_block.block(),
+                                        "setfield_vable_i",
+                                        vable_setfield_int_graph_args(
+                                            frame_var.into(),
+                                            v_li.into(),
+                                            VABLE_LAST_INSTR_FIELD_IDX,
+                                        ),
+                                        None,
+                                        py_pc as i64,
+                                    );
+                                    record_graph_op(
+                                        &abort_block.block(),
+                                        "abort_permanent",
+                                        Vec::new(),
+                                        None,
+                                        py_pc as i64,
+                                    );
+                                    append_exit(
+                                        &abort_block.block(),
+                                        super::flow::Link::new(
+                                            vec![super::flow::Constant::none().into()],
+                                            Some(graph.returnblock.clone()),
+                                            None,
+                                        )
+                                        .into_ref(),
+                                    );
+                                }
+                                let continue_state = current_state.clone();
+                                let continue_block = SpamBlockRef::new(
+                                    graph.new_block(Vec::new()),
+                                    Some(continue_state.clone()),
+                                );
+                                continue_block.block().borrow_mut().inputargs =
+                                    continue_state.getvariables();
+                                all_walker_blocks.push(continue_block.clone());
+                                append_exit(
+                                    &current_block.block(),
+                                    output_link(
+                                        &current_state,
+                                        &continue_state,
+                                        continue_block.block(),
+                                    ),
+                                );
+                                set_last_bool_exitcase(&current_block.block(), false);
+                                current_block = continue_block;
+                                record_graph_op(
+                                    &current_block.block(),
+                                    "setarrayitem_vable_r",
+                                    vable_setarrayitem_ref_graph_args(
+                                        frame_var.into(),
+                                        v_idx.clone().into(),
+                                        checked_flow.into(),
+                                    ),
+                                    None,
+                                    py_pc as i64,
+                                );
                                 // eval.rs:delete_fast writes PY_NULL into the
                                 // locals slot. Mirror STORE_FAST's
                                 // `setarrayitem_vable_r` local write with the

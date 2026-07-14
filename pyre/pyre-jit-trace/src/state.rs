@@ -1939,6 +1939,15 @@ pub(crate) fn concrete_value_from_slot(obj: PyObjectRef) -> ConcreteValue {
     ConcreteValue::from_pyobj(obj)
 }
 
+fn concrete_value_from_ir_value(value: majit_ir::Value) -> ConcreteValue {
+    match value {
+        Value::Ref(gc_ref) => concrete_value_from_slot(gc_ref.0 as PyObjectRef),
+        Value::Int(n) => ConcreteValue::Int(n),
+        Value::Float(n) => ConcreteValue::Float(n),
+        Value::Void => ConcreteValue::Null,
+    }
+}
+
 impl ConcreteValue {
     /// Convert from PyObjectRef (unbox if possible).
     /// Null pointers become ConcreteValue::Null ("untracked").
@@ -8842,6 +8851,24 @@ impl JitState for PyreJitState {
             bridge_array_len,
             &vable_array_values,
         );
+        sym.concrete_locals = (0..nlocals)
+            .map(|i| {
+                live_array_values
+                    .get(i)
+                    .copied()
+                    .map(concrete_value_from_ir_value)
+                    .unwrap_or(ConcreteValue::Ref(pyre_object::PY_NULL))
+            })
+            .collect();
+        sym.concrete_stack = (0..stack_only)
+            .map(|i| {
+                live_array_values
+                    .get(nlocals + i)
+                    .copied()
+                    .map(concrete_value_from_ir_value)
+                    .unwrap_or(ConcreteValue::Ref(pyre_object::PY_NULL))
+            })
+            .collect();
         let mut concrete_values = Vec::with_capacity(vable_scalar_values.len() + bridge_array_len);
         concrete_values.extend_from_slice(&vable_scalar_values);
         let taken_concrete = live_array_values.len().min(bridge_array_len);
@@ -12837,13 +12864,14 @@ pub(crate) fn assemble_bridge_inline_pending(
     // locals_cells_stack_w is a W_Root array — every live slot is Ref.
     sym.symbolic_local_types = vec![Type::Ref; nlocals];
     sym.symbolic_stack_types = vec![Type::Ref; valuestackdepth - nlocals];
-    // Box-identity shadow: unbox per the FAST branch (`ConcreteValue::
-    // from_pyobj`), so a boxed int/float local tracks as Int/Float.
+    // Box-identity shadow: unbox per the FAST branch, preserving PY_NULL
+    // frame slots as Ref(PY_NULL) so uninitialized locals stay distinct from
+    // untracked values.
     sym.concrete_locals = (0..nlocals)
-        .map(|k| ConcreteValue::from_pyobj(recipe_slot_to_pyobj(recipe.concrete_r[k])))
+        .map(|k| concrete_value_from_slot(recipe_slot_to_pyobj(recipe.concrete_r[k])))
         .collect();
     sym.concrete_stack = (nlocals..valuestackdepth)
-        .map(|k| ConcreteValue::from_pyobj(recipe_slot_to_pyobj(recipe.concrete_r[k])))
+        .map(|k| concrete_value_from_slot(recipe_slot_to_pyobj(recipe.concrete_r[k])))
         .collect();
     sym.concrete_namespace = w_globals;
     sym.concrete_execution_context = execution_context;
