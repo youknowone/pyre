@@ -1052,16 +1052,16 @@ pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
 }
 
 /// Resolve the JitCode byte offset the full-body walk should RESUME at for a
-/// bridge whose guard carried `carried_jitcode_pc`. Mirrors the blackhole's
-/// `resolve_resume_pc_with_jitcode_pc` (`call_jit.rs` `resolve_jitcode`): a
-/// kept-stack branch guard resumes at its OWN mid-opcode jitcode offset (the
-/// `goto_if_not`), not the opcode-entry marker `pc_map[py_pc]` — re-executing
-/// the whole opcode from entry would read abstract-register colors dead at the
-/// guard. Returns `None` when no coordinate resolves (the caller keeps the
-/// caller declines).
+/// bridge whose guard carried `carried_jitcode_pc`. Agrees with where the
+/// blackhole resumes (`call_jit.rs` `resolve_jitcode`): a kept-stack branch
+/// guard resumes at its OWN mid-opcode jitcode offset (the `goto_if_not`), not
+/// the opcode-entry marker — re-executing the whole opcode from entry would
+/// read abstract-register colors dead at the guard. The carried direct
+/// coordinate IS that offset, so no Python pc is consulted here. Returns `None`
+/// when the carried word does not name a decodable startpoint, which declines
+/// the bridge at the caller.
 pub fn resolve_bridge_walk_entry_at(
     jitcode_index: i32,
-    pc: i32,
     carried_jitcode_pc: i32,
 ) -> Option<usize> {
     ensure_finish_setup();
@@ -1069,7 +1069,7 @@ pub fn resolve_bridge_walk_entry_at(
         let sd = r.borrow();
         let jc = sd.jitcodes.get(jitcode_index as usize)?;
         jc.payload
-            .resolve_resume_pc_with_jitcode_pc(pc, carried_jitcode_pc, sd.op_live)
+            .resolve_bridge_walk_entry_pc(carried_jitcode_pc, sd.op_live)
     })
 }
 

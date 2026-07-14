@@ -820,7 +820,7 @@ fn select_recipe_entry(
     carried_jitcode_pc: i32,
 ) -> Option<usize> {
     (carried_jitcode_pc != majit_ir::resumedata::NO_JITCODE_PC && jitcode_index == body_index)
-        .then(|| crate::state::resolve_bridge_walk_entry_at(jitcode_index, 0, carried_jitcode_pc))
+        .then(|| crate::state::resolve_bridge_walk_entry_at(jitcode_index, carried_jitcode_pc))
         .flatten()
 }
 
