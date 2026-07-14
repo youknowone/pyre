@@ -4398,6 +4398,7 @@ impl<'a> Lowering<'a> {
                     .or_else(|| self.fold_size_const_global(id))
                     .or_else(|| self.fold_named_const_int_array_global(id))
                     .or_else(|| primitive_float_const(&segments))
+                    .or_else(|| code_flags_const(&segments))
                     .unwrap_or_else(|| OpKind::Call {
                         target: CallTarget::FunctionPath { segments },
                         args: vec![],
@@ -12545,6 +12546,51 @@ fn primitive_float_const(segments: &[String]) -> Option<OpKind> {
         _ => return None,
     };
     Some(OpKind::ConstFloat(bits))
+}
+
+/// Supply the value of a `CodeFlags` associated constant. `bitflags!`
+/// generates each flag as an `impl CodeFlags { const NAME: Self }` whose
+/// initializer Charon records as an `Opaque` body (the `<Impl>` segment
+/// anonymizes to `_`), so [`Lowering::const_eval_global`] finds no
+/// in-LLBC init to evaluate and the read stays a `not registered` Call.
+/// The value is a fixed compile-time `u32` bitmask, so emit it by-value
+/// as the same `ConstInt` an inline integer literal lowers to — a
+/// `flags.contains(CodeFlags::VARARGS)` test then folds to the
+/// integer bit-and the `bitflags` `.contains` inlines to. Mirrors
+/// [`primitive_float_const`] for `f64::INFINITY`.
+fn code_flags_const(segments: &[String]) -> Option<OpKind> {
+    let [first, second, .., impl_seg, leaf] = segments else {
+        return None;
+    };
+    if first.as_str() != "rustpython_compiler_core"
+        || second.as_str() != "bytecode"
+        || impl_seg.as_str() != "<Impl>"
+    {
+        return None;
+    }
+    let bits: u32 = match leaf.as_str() {
+        "OPTIMIZED" => 0x0001,
+        "NEWLOCALS" => 0x0002,
+        "VARARGS" => 0x0004,
+        "VARKEYWORDS" => 0x0008,
+        "NESTED" => 0x0010,
+        "GENERATOR" => 0x0020,
+        "COROUTINE" => 0x0080,
+        "ITERABLE_COROUTINE" => 0x0100,
+        "ASYNC_GENERATOR" => 0x0200,
+        "FUTURE_DIVISION" => 0x20000,
+        "FUTURE_ABSOLUTE_IMPORT" => 0x40000,
+        "FUTURE_WITH_STATEMENT" => 0x80000,
+        "FUTURE_PRINT_FUNCTION" => 0x100000,
+        "FUTURE_UNICODE_LITERALS" => 0x200000,
+        "FUTURE_BARRY_AS_BDFL" => 0x400000,
+        "FUTURE_GENERATOR_STOP" => 0x800000,
+        "FUTURE_ANNOTATIONS" => 0x1000000,
+        "HAS_DOCSTRING" => 0x4000000,
+        "METHOD" => 0x8000000,
+        _ => return None,
+    };
+    Some(OpKind::ConstInt(bits as i64))
 }
 
 fn place_kind_label(k: &PlaceKind) -> &'static str {

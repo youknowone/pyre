@@ -1593,14 +1593,14 @@ unsafe fn range_compute_slice(obj: PyObjectRef, slice: PyObjectRef) -> PyResult 
 /// `range.count(value)` — `functional.py W_Range.descr_count`.
 fn range_count_method(args: &[PyObjectRef]) -> PyResult {
     let obj = args[0];
-    let needle = args.get(1).copied().unwrap_or(PY_NULL);
+    let needle = if args.len() > 1 { args[1] } else { PY_NULL };
     Ok(w_int_new(if contains(obj, needle)? { 1 } else { 0 }))
 }
 
 /// `range.index(value)` — `functional.py W_Range.descr_index`.
 fn range_index_method(args: &[PyObjectRef]) -> PyResult {
     let obj = args[0];
-    let needle = args.get(1).copied().unwrap_or(PY_NULL);
+    let needle = if args.len() > 1 { args[1] } else { PY_NULL };
     unsafe {
         // int / bool / long needle → O(1) `(value - start) // step`.
         if is_int(needle) || is_long(needle) {
@@ -10477,7 +10477,8 @@ unsafe fn property_no_accessor(prop: PyObjectRef, obj: PyObjectRef, kind: &str) 
 fn property_set_name_impl(args: &[PyObjectRef]) -> PyResult {
     // descriptor.py:274-276 `set_name(self, w_type, w_name)` — the bound
     // method receives `[property, owner, name]`.
-    if let Some(&w_name) = args.get(2) {
+    if args.len() > 2 {
+        let w_name = args[2];
         unsafe { pyre_object::descriptor::w_property_set_name(args[0], w_name) };
     }
     Ok(pyre_object::w_none())
@@ -10485,17 +10486,20 @@ fn property_set_name_impl(args: &[PyObjectRef]) -> PyResult {
 
 fn property_setter_impl(args: &[PyObjectRef]) -> PyResult {
     // descriptor.py:243-244 `setter` → `_copy(space, w_setter=w_setter)`
-    unsafe { property_copy(args[0], None, args.get(1).copied(), None) }
+    let w_setter = if args.len() > 1 { Some(args[1]) } else { None };
+    unsafe { property_copy(args[0], None, w_setter, None) }
 }
 
 fn property_getter_impl(args: &[PyObjectRef]) -> PyResult {
     // descriptor.py:240-241 `getter` → `_copy(space, w_getter=w_getter)`
-    unsafe { property_copy(args[0], args.get(1).copied(), None, None) }
+    let w_getter = if args.len() > 1 { Some(args[1]) } else { None };
+    unsafe { property_copy(args[0], w_getter, None, None) }
 }
 
 fn property_deleter_impl(args: &[PyObjectRef]) -> PyResult {
     // descriptor.py:246-247 `deleter` → `_copy(space, w_deleter=w_deleter)`
-    unsafe { property_copy(args[0], None, None, args.get(1).copied()) }
+    let w_deleter = if args.len() > 1 { Some(args[1]) } else { None };
+    unsafe { property_copy(args[0], None, None, w_deleter) }
 }
 
 /// `descriptor.py W_Property.get` as the type-dict `__get__` entry — args
@@ -10506,7 +10510,11 @@ fn property_deleter_impl(args: &[PyObjectRef]) -> PyResult {
 pub(crate) fn property_descr_get_impl(args: &[PyObjectRef]) -> PyResult {
     unsafe {
         let prop = args[0];
-        let obj = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        let obj = if args.len() > 1 {
+            args[1]
+        } else {
+            pyre_object::PY_NULL
+        };
         // `if space.is_w(w_obj, space.w_None): return self`
         if obj.is_null() || is_none(obj) {
             return Ok(prop);
@@ -10524,7 +10532,11 @@ pub(crate) fn property_descr_set_impl(args: &[PyObjectRef]) -> PyResult {
     unsafe {
         let prop = args[0];
         let obj = args[1];
-        let value = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
+        let value = if args.len() > 2 {
+            args[2]
+        } else {
+            pyre_object::PY_NULL
+        };
         let fset = w_property_get_fset(prop);
         if fset.is_null() || is_none(fset) {
             return Err(property_no_accessor(prop, obj, "setter"));
@@ -10733,7 +10745,7 @@ fn takewhile_reduce_method(args: &[PyObjectRef]) -> PyResult {
 /// state just as `bool_w` does).
 fn takewhile_setstate_method(args: &[PyObjectRef]) -> PyResult {
     let it = unsafe { &mut *(args[0] as *mut pyre_object::interp_itertools::W_TakeWhile) };
-    it.stopped = int_w(args.get(1).copied().unwrap_or(w_none()))? != 0;
+    it.stopped = int_w(if args.len() > 1 { args[1] } else { w_none() })? != 0;
     Ok(w_none())
 }
 
@@ -10751,7 +10763,7 @@ fn dropwhile_reduce_method(args: &[PyObjectRef]) -> PyResult {
 /// `takewhile_setstate_method` for the `int_w(...)? != 0` equivalence).
 fn dropwhile_setstate_method(args: &[PyObjectRef]) -> PyResult {
     let it = unsafe { &mut *(args[0] as *mut pyre_object::interp_itertools::W_DropWhile) };
-    it.started = int_w(args.get(1).copied().unwrap_or(w_none()))? != 0;
+    it.started = int_w(if args.len() > 1 { args[1] } else { w_none() })? != 0;
     Ok(w_none())
 }
 
@@ -10851,7 +10863,7 @@ fn cycle_setstate_method(args: &[PyObjectRef]) -> PyResult {
     // list reached through the tuple) survive each iteration.
     let _roots = pyre_object::gc_roots::push_roots();
     let w_self = args[0];
-    let w_state = args.get(1).copied().unwrap_or(w_none());
+    let w_state = if args.len() > 1 { args[1] } else { w_none() };
     pyre_object::gc_roots::pin_root(w_self);
     pyre_object::gc_roots::pin_root(w_state);
     let state_w = unpackiterable(w_state, 2)?;
@@ -10903,7 +10915,7 @@ fn chain_setstate_method(args: &[PyObjectRef]) -> PyResult {
     // elements) survive each iteration.
     let _roots = pyre_object::gc_roots::push_roots();
     let w_self = args[0];
-    let w_state = args.get(1).copied().unwrap_or(w_none());
+    let w_state = if args.len() > 1 { args[1] } else { w_none() };
     pyre_object::gc_roots::pin_root(w_self);
     pyre_object::gc_roots::pin_root(w_state);
     let state = unpackiterable(w_state, -1)?;

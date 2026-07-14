@@ -302,7 +302,13 @@ pub fn register_maybe_finalizer_hook(hook: MaybeRegisterFinalizerHookFn) {
     MAYBE_REGISTER_FINALIZER_HOOK.set(Some(hook));
 }
 
-pub fn maybe_register_finalizer(obj: PyObjectRef) {
+// `dont_look_inside`: the host finalizer-registration hook is a
+// process-global fn-pointer cell (`MAYBE_REGISTER_FINALIZER_HOOK`) whose
+// dispatch stays opaque to the JIT; calls residualize via the registered
+// fnaddr. The `try_gc_owns_object` twin.
+#[majit_macros::dont_look_inside]
+#[allow(improper_ctypes_definitions)]
+pub extern "C" fn maybe_register_finalizer(obj: PyObjectRef) {
     if let Some(hook) = MAYBE_REGISTER_FINALIZER_HOOK.get() {
         hook(obj);
     }

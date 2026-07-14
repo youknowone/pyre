@@ -32,7 +32,23 @@ pub(crate) const ATTR_EXCEPTIONS: &[&str] = &[
 /// `name in _ATTR_EXCEPTIONS` — used by `getattr` to decide whether to
 /// delegate to `__origin__`.
 pub(crate) fn is_attr_exception(name: &str) -> bool {
-    ATTR_EXCEPTIONS.contains(&name)
+    // `name in _ATTR_EXCEPTIONS` membership, spelled as direct string
+    // equality so it lowers to a chain of `ll_streq` rather than a
+    // scan over the `&[&str]` const backing (whose body is opaque).
+    matches!(
+        name,
+        "__args__"
+            | "__class__"
+            | "__copy__"
+            | "__deepcopy__"
+            | "__mro_entries__"
+            | "__origin__"
+            | "__parameters__"
+            | "__reduce__"
+            | "__reduce_ex__"
+            | "__typing_unpacked_tuple_args__"
+            | "__unpacked__"
+    )
 }
 
 /// `generic_alias_class_getitem(space, w_cls, w_item)` (util.py:99).
