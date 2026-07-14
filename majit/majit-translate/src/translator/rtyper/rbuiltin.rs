@@ -1536,10 +1536,7 @@ pub fn rtype_bigint_from(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) ->
 /// `rlib/longlong2float.py:83-86` — `Float2LongLongEntry.specialize_call`:
 /// `hop.inputargs(lltype.Float)`, `hop.exception_cannot_occur()`,
 /// `return hop.genop("convert_float_bytes_to_longlong", [v_float], SignedLongLong)`.
-pub fn rtype_float2longlong(
-    hop: &HighLevelOp,
-    _kwds_i: &HashMap<String, usize>,
-) -> RTypeResult {
+pub fn rtype_float2longlong(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
     use crate::translator::rtyper::rtyper::GenopResult;
 
     let vlist = hop.inputargs(vec![ConvertedTo::LowLevelType(&LowLevelType::Float)])?;

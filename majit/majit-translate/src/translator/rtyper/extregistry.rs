@@ -470,6 +470,14 @@ impl ExtRegistryEntry {
                     std::collections::BTreeMap::new(),
                 ),
             )),
+            // The annotation half is served by the
+            // `longlong2float.float2longlong` `BUILTIN_ANALYZERS` entry
+            // (`float2longlong_analyzer`), which `immutablevalue_hostobject`
+            // resolves before the `extregistry.is_registered` fall-through
+            // (bookkeeper.py:309-314). This entry only fires on the rtyper
+            // path; returning the same `SomeInteger(r_int64)` result that
+            // `Float2LongLongEntry.compute_result_annotation` produces keeps
+            // it a faithful port for any path that consults it.
             ExtRegistryEntry::Float2LongLong => Ok(SomeValue::Integer(
                 crate::annotator::model::SomeInteger::new_with_knowntype(
                     false,

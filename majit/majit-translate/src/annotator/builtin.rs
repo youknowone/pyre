@@ -363,7 +363,11 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     // `BigInt::from(i64)` — boxes a machine int into the foreign opaque
     // `BigInt` (Python `long`); returns the classdef-less GcRef shell.
     analyzer_for(&mut reg, "BigInt.from", bigint_from);
-    analyzer_for(&mut reg, "longlong2float.float2longlong", float2longlong_analyzer);
+    analyzer_for(
+        &mut reg,
+        "longlong2float.float2longlong",
+        float2longlong_analyzer,
+    );
     // Foreign Rust container constructors — `Vec::new` /
     // `Vec::with_capacity` / `indexmap::IndexMap::new` / `Box::new`.
     // Each returns the classdef-less opaque `SomeInstance` shell (twin
