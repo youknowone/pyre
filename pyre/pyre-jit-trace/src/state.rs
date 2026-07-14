@@ -1015,9 +1015,9 @@ pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
             None => return 0,
         };
         let payload = &jc.payload;
-        // Post-flip the rd_numb `pc` word is already the JitCode byte offset;
-        // count liveness there directly when it names a valid `-live-`
-        // startpoint, else translate the stored word through the resume map.
+        // Snapshot publication stores only a decodable JitCode `-live-`
+        // coordinate. An unrepresentable coordinate must have declined during
+        // capture, before it could reach this frame-boundary decoder.
         let resolved_jit_pc: Option<usize> = if pc >= 0
             && payload
                 .jitcode
@@ -1025,7 +1025,7 @@ pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
         {
             Some(pc as usize)
         } else {
-            payload.resolve_resume_pc(pc)
+            None
         };
         if let Some(jit_pc) = resolved_jit_pc {
             let off = payload.jitcode.get_live_vars_info(jit_pc, sd.op_live);
@@ -1037,12 +1037,8 @@ pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
                 return length_i + length_r + length_f;
             }
         }
-        // `CallControl.get_jitcode` drain fills pc_map + liveness
-        // before any guard capture (pyjitpl.py:199 parity). The
-        // out-of-range-pc source is eliminated by threading
-        // jitcode_index through `Snapshot::single_frame`, and the
-        // guard/resume tests run on the real compile/register path in
-        // `pyre-jit`. Unconditional panic — any hit is a bug.
+        // A published non-decodable coordinate violates the capture contract.
+        // This remains a fail-loud internal invariant, not a fallback path.
         panic!(
             "frame_value_count_at: fallback hit for jitcode_index={} pc={} \
              (pc_map.len={}, all_liveness.len={}). Phase X-0/X-1 removed \
@@ -1062,7 +1058,7 @@ pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
 /// `goto_if_not`), not the opcode-entry marker `pc_map[py_pc]` — re-executing
 /// the whole opcode from entry would read abstract-register colors dead at the
 /// guard. Returns `None` when no coordinate resolves (the caller keeps the
-/// `pc_map` entry).
+/// caller declines).
 pub fn resolve_bridge_walk_entry_at(
     jitcode_index: i32,
     pc: i32,
@@ -1200,8 +1196,7 @@ pub fn frame_liveness_reg_indices_by_bank_at(
 
 /// `#124` Approach B encoder/decoder liveness query: identical to
 /// [`frame_liveness_reg_indices_by_bank_at`] but resolves the JitCode
-/// coordinate through [`PyJitCode::resolve_resume_pc_with_jitcode_pc`],
-/// preferring the carried `jitcode_pc` over the lossy `pc_map`.  The
+/// coordinate through [`PyJitCode::resolve_resume_pc_with_jitcode_pc`]. The
 /// snapshot encoder (`collect_outer_active_boxes`) and the bridge/inline
 /// decoders (`setup_bridge_sym`, `rebuild_inline_callee`) call this with
 /// the SAME carried word so their register color sets agree.
@@ -1218,8 +1213,8 @@ pub fn frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
             return FrameLivenessRegIndices::default();
         };
         let payload = &jc.payload;
-        // The rd_numb pc word may carry the after-residual-call marker;
-        // `resolve_resume_pc` routes the marker through the right map.
+        // No Python-pc reconstruction is available here: an absent carried
+        // coordinate returns the empty result to its decline-aware caller.
         let resolved_jit_pc: Option<usize> =
             payload.resolve_resume_pc_with_jitcode_pc(pc, carried_jitcode_pc, sd.op_live);
         let Some(jit_pc) = resolved_jit_pc else {

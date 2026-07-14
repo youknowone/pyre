@@ -1270,6 +1270,10 @@ pub enum DispatchError {
     /// of panicking the tracer. Resuming such a guard needs the multi-frame
     /// vable snapshot machinery (task #124).
     GuardSnapshotVableUntyped { pc: usize },
+    /// A guard capture had no decodable carried JitCode coordinate. Publishing
+    /// a Python pc here would make a later side exit resume at a guessed
+    /// block head, so the walker declines before the trace is installed.
+    GuardResumeCoordinateUnavailable { pc: usize },
     /// `last_exception/>i` fired but no concrete standing exception was
     /// available. RPython parity: `pyjitpl.py:1707-1714 opimpl_last_exception`:
     ///
@@ -1426,6 +1430,7 @@ impl DispatchError {
             Self::MayForceNullRefArgUnsupported { .. } => "MayForceNullRefArgUnsupported",
             Self::VableEscapedDuringResidualCall { .. } => "VableEscapedDuringResidualCall",
             Self::GuardSnapshotVableUntyped { .. } => "GuardSnapshotVableUntyped",
+            Self::GuardResumeCoordinateUnavailable { .. } => "GuardResumeCoordinateUnavailable",
             Self::LastExceptionWithoutActiveException { .. } => {
                 "LastExceptionWithoutActiveException"
             }
@@ -2892,7 +2897,7 @@ fn compute_bridge_root_parent_frame(
         // Key the query off the same carried root-frame word the snapshot and
         // decode side read from `frames[0].jitcode_pc`, so both resolve the
         // identical liveness window. `PYRE_M73_OUTERCAP_CARRY=0` falls back to
-        // the sentinel + `resume_jitcode_pc_for(root_pc)` translation.
+        // the sentinel-based decode path.
         root_liveness_word,
         None,
         &[],
@@ -8034,17 +8039,17 @@ pub(crate) fn fbw_loop_callee_ca_enabled() -> bool {
 /// decode consults the carried word rather than the stored Python pc →
 /// jitcode translation.
 ///
-/// The carried word is `resume_jitcode_pc_for(py_pc)` — the SAME `-live-`
-/// marker offset that translation returns — not the guard op's raw
+/// The carried word is the guard's codewrite-time `-live-` marker offset —
+/// not the guard op's raw
 /// `op_pc`.  These guards resume by re-executing their own opcode at
 /// `orgpc` with a deterministic operand stack (no kept temp), so the
-/// marker `resume_jitcode_pc_for(py_pc)` names is a valid startpoint
+/// marker is a valid startpoint
 /// (`can_decode_live_vars`
 /// holds) AND identical to what the decoder would translate to — the encoder
 /// (`collect_outer_active_boxes` reg banks) and decoder (`setposition` /
 /// liveness) resolve the same offset, keeping the box layout symmetric.
 /// Carrying the raw `op_pc` (which may sit mid-opcode,
-/// `op_pc != resume_jitcode_pc_for(py_pc)`) is what broke the earlier attempt;
+/// `op_pc != marker`) is what broke the earlier attempt;
 /// anchoring to the marker
 /// avoids that.  Default ON — corpus-wide OFF/ON byte-equality validated on
 /// both backends (171/171 dynasm + cranelift); opt out with
@@ -10238,8 +10243,8 @@ fn vstack_containing_py_pc(metadata: &crate::PyJitCodeMetadata, jit_pc: usize) -
 /// Reconstruct `pc_map[py]` — the `-live-` resume marker byte offset for
 /// Python PC `py` — from the two surviving tables plus the sparse carry-forward
 /// sidecar, WITHOUT the retired dense `pc_map` Vec.  Same resolution as
-/// [`crate::PyJitCode::resume_jitcode_pc_for`]: the sidecar takes precedence
-/// (it holds the non-derivable divergences), everything else derives via
+/// the historical dense-map rule: the sidecar takes precedence (it holds the
+/// non-derivable divergences), everything else derives via
 /// [`crate::pyjitcode::derive_resume_marker`].  `None` when `py` is out of
 /// range or the tables are empty (skeleton / fixture).
 fn pc_map_marker_for(metadata: &crate::PyJitCodeMetadata, py: usize) -> Option<usize> {
@@ -10529,7 +10534,7 @@ pub(crate) fn result_color_audit_enabled() -> bool {
 /// `PYRE_M73_PEROP_CARRY` (#73 S2, default ON): source a specialization
 /// guard's (`GuardValue`/`GuardClass`) resume coordinate from the walk
 /// cursor's per-op `-live-` BEFORE anchor (`ctx.live_before_jit_pc`,
-/// `pyjitpl.py:198`) instead of the py_pc-keyed `resume_jitcode_pc_for(py_pc)`
+/// `pyjitpl.py:198`) instead of a py_pc-keyed block-head
 /// block-head marker — the genuine JitCode cursor the migration authors resume
 /// data from. Byte-behavior-identical: the per-op anchor coincides with the
 /// marker for 99%+ of specialization captures (`PYRE_M73_PEROP_AUDIT` census),
@@ -10552,7 +10557,7 @@ pub(crate) fn m73_perop_carry_enabled() -> bool {
 /// flip. A depth-0 `GuardTrue`/`GuardFalse` sources its resume word from the
 /// walk's arm-independent `-live-` BEFORE anchor (`ctx.live_before_jit_pc`,
 /// `orgpc`) TAGGED into the negative space of the `jitcode_pc` word (plus a
-/// 1-bit flavor), instead of the py_pc-keyed `resume_jitcode_pc_for` block-head
+/// 1-bit flavor), instead of a py_pc-keyed block-head
 /// marker. Byte-identical by construction: encode carries the tagged word only
 /// when its decode-side expansion ([`expand_branch_carried`]) reproduces the
 /// baseline `marker` (self-cert), and decode expands it back to that same
@@ -10673,7 +10678,7 @@ pub(crate) fn m73_loopclose_carry_enabled() -> bool {
 /// `PYRE_M73_ARMDST_CARRY` (#73 S5 phase-5 slice-1, default ON): key the
 /// `compare_box_provably_dead` branch-arm liveness queries (`arm_dst_live`)
 /// on the resume-marker twin at the arm offset instead of the
-/// `resume_jitcode_pc_for` translation of the inverted py pc. Certified by
+/// historical block-head translation of the inverted py pc. Certified by
 /// the `M73_ARMDST` census (858 queries across pyre/bench + synth, 100%
 /// bank-equal) and check.py (162×2, on and off). Disable with
 /// `PYRE_M73_ARMDST_CARRY=0`.
@@ -10692,7 +10697,7 @@ pub(crate) fn m73_armdst_carry_enabled() -> bool {
 /// the loop-close guards' liveness coordinate in
 /// `get_list_of_active_boxes` from the merge-point resume-marker twin
 /// (`MIFrame::loop_close_marker_jit_pc`) instead of the
-/// `resume_jitcode_pc_for(live_pc)` translation. Certified by the
+/// legacy block-head translation. Certified by the
 /// `M73_LCLIVE` census (362 captures across pyre/bench + synth, 100%
 /// eq=1) and check.py (162×2, on and off). Disable with
 /// `PYRE_M73_LCLIVE_CARRY=0`.
@@ -10710,7 +10715,7 @@ pub(crate) fn m73_lclive_carry_enabled() -> bool {
 /// #73 S5 p5-s6: key the paused inline-caller frame's liveness query off the
 /// after-residual marker twin already carried in the frame's snapshot word
 /// (`resume_marker_jit_pc`), instead of the sentinel +
-/// `resume_jitcode_pc_for(fallthrough)` translation. Certified by the
+/// legacy block-head translation. Certified by the
 /// M73_INLCALLER census (bank equality) and the p3-s2 M73_PFMARKER identity.
 /// `PYRE_M73_INLCALLER_CARRY=0` opts out.
 pub(crate) fn m73_inlcaller_carry_enabled() -> bool {
@@ -10728,7 +10733,7 @@ pub(crate) fn m73_inlcaller_carry_enabled() -> bool {
 /// (bridge-root parent frame + its register scatter, inline-call outer capture,
 /// list-append outer capture) off the jitcode-keyed word already in hand
 /// (carried root frame word / call-site marker twin) instead of the sentinel +
-/// resume_jitcode_pc_for translation. Certified by the M73_OUTERCAP census
+/// historical block-head translation. Certified by the M73_OUTERCAP census
 /// (bank equality). `PYRE_M73_OUTERCAP_CARRY=0` opts out.
 fn m73_outercap_carry_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -10791,7 +10796,7 @@ pub(crate) fn m73_entry_carry_enabled() -> bool {
 
 /// #73 S5 p5-s3: decline-convert the entry/recipe derived legs — under
 /// entry-carry, a walk entry whose carried resolution fails DECLINES the
-/// walk instead of falling back to the `resume_jitcode_pc_for` translation.
+/// walk instead of reconstructing a block-head coordinate.
 /// Certified by the p4 entry census: `RecipeDerivedTaken` /
 /// `EntryDerivedTaken` / `RecipeMismatch` / `BridgeNoCarry` all 0 across the
 /// 151-program corpus, so the retired fallback leg is unreached and the flip
@@ -11017,7 +11022,8 @@ fn decode_side_other_target(
 /// `decode_side_other_target` picks the not-taken arm from `orgpc` + flavor and
 /// that jitcode offset IS the returned value. The former py_pc round-trip
 /// (`python_pc_for_jitcode_pc` -> `skip_python_trivia_forward` ->
-/// `resume_jitcode_pc_for`, with its `num_instrs` overshoot clamp) is deleted:
+/// historical Python-pc translation, with its `num_instrs` overshoot clamp) is
+/// deleted:
 /// it is byte-identical because the encode self-cert
 /// (`walker_capture_snapshot_for_last_guard_impl`) tags a word ONLY when this
 /// same `expand_branch_carried` yields `derived == marker`, so returning
@@ -11026,9 +11032,9 @@ fn decode_side_other_target(
 /// no-op whenever the flip is off (`decode_branch_orgpc` returns `None`).
 ///
 /// Returns `NO_JITCODE_PC` only if the arm cannot be decoded, so the decoder
-/// falls back to the stored `py_pc` path; the encode self-cert declines to carry
-/// any tagged word whose reconstruction fails, so a genuinely-carried tagged
-/// word never reaches that leg.
+/// declines the guard capture; the encode self-cert declines to carry any
+/// tagged word whose reconstruction fails, so a genuinely-carried tagged word
+/// never reaches that leg.
 pub(crate) fn expand_branch_carried(payload: &crate::PyJitCode, carried: i32) -> i32 {
     match majit_ir::resumedata::decode_branch_orgpc(carried) {
         None => carried,
@@ -11363,8 +11369,8 @@ fn branch_arm_resume_ref_liveness(
         // Source the branch-arm Ref-liveness banks off the genuine carried
         // jitcode `target` via the jitcode-pc-keyed twin, bypassing the
         // `python_pc_for_jitcode_pc` inversion + `pc_map` re-key. The twin
-        // falls back to the same `resolve_resume_pc` path (keyed on `py`) for
-        // unpopulated installs, so those are unaffected.
+        // has no Python-pc fallback for unpopulated installs; that shape
+        // declines rather than reading liveness from a guessed coordinate.
         let jitcode_index = jc.index;
         let banks = crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
             jitcode_index,
@@ -12176,7 +12182,7 @@ fn walker_capture_snapshot_for_last_guard_impl(
             // symmetry: `collect_outer_active_boxes` resolves the reg banks at
             // the carried coordinate but `live_locals` / `stack_color_map` at
             // `entry_py_pc`, and for a non-branch guard
-            // `op_pc != resume_jitcode_pc_for(py_pc)`
+            // `op_pc != marker`
             // — the two windows diverge and the decoded box layout mismatches.
             let guard_jitcode_pc: i32 = if let Some(guard_jc_pc) = scope.branch_guard_jitcode_pc {
                 // The kept-stack branch guard's own `op.pc` (walker
@@ -12195,48 +12201,28 @@ fn walker_capture_snapshot_for_last_guard_impl(
                     )
                 )
             {
-                // #366: carry the `-live-` marker offset (`resume_jitcode_pc_for(
-                // py_pc)`), NOT the raw guard `op_pc`.  Reached only on the
+                // #366: carry the `-live-` marker offset, NOT the raw guard
+                // `op_pc`. Reached only on the
                 // default-scope path (`scope.branch_guard_jitcode_pc.is_none()`): the
                 // specialization guards (`GuardValue`/`GuardClass`) and the
                 // depth-0 branch guards (`GuardTrue`/`GuardFalse`, kept-stack
                 // depth>0 branches take the first arm carrying `op.pc`).  For
-                // every guard here the decoder's baseline already resolves
-                // `resume_jitcode_pc_for(py_pc)` — the same `py_pc` and the same
-                // forward
-                // lookup — so carrying `resume_jitcode_pc_for(py_pc)` is
-                // identical to that fallback by construction, keeping the
+                // every guard here the codewrite-time twin resolves the
+                // `-live-` marker, keeping the
                 // encoder reg-bank window and decoder liveness symmetric.  It is
-                // a valid startpoint (`can_decode_live_vars` holds: the baseline
-                // decodes `resume_jitcode_pc_for(py_pc)` without
-                // `_missing_liveness` today).
+                // a valid startpoint (`can_decode_live_vars` holds).
                 // The `after_residual_call` family is excluded — it routes
                 // through the separate `after_residual_call_resume_pc` map + the
-                // bit-14 marker, so `resume_jitcode_pc_for(py_pc)` would name a
-                // different
-                // offset.  Fall back to the sentinel if `py_pc` has no resume
-                // entry (skeleton / out-of-range).
-                // #73 S5 phase-5 slice-4: the translation is evaluated lazily —
-                // under the (default-ON) twin carry it runs only for the
-                // twin-`None` overshoot rows (0 across the certified corpus),
-                // so the carried path no longer calls `resume_jitcode_pc_for`.
-                let legacy_marker = || unsafe {
-                    (&*sym.jitcode)
-                        .payload
-                        .resume_jitcode_pc_for(py_pc as usize)
-                };
-                let marker = if m73_marker_carry_enabled() {
-                    unsafe { (&*sym.jitcode).payload.resume_marker_for_jitcode_pc(op_pc) }
-                        .or_else(legacy_marker)
-                } else {
-                    legacy_marker()
-                };
+                // bit-14 marker, so the ordinary marker would name a different
+                // Every guard-capture point is emitted after a `-live-` marker;
+                // its populated codewrite-time twin is therefore total here.
+                let marker = unsafe { (&*sym.jitcode).payload.resume_marker_for_jitcode_pc(op_pc) };
                 // #73 S2 flip (`PYRE_M73_PEROP_CARRY`, default OFF): a
                 // specialization guard (`GuardValue`/`GuardClass`) sources its
                 // resume coordinate from the walk cursor's per-op `-live-`
                 // BEFORE anchor (`ctx.live_before_jit_pc`, `pyjitpl.py:198`)
-                // directly, dropping the py_pc-keyed `resume_jitcode_pc_for`
-                // lookup. Requires a stepped `-live-` and a resolvable
+                // directly, dropping the py_pc-keyed block-head lookup.
+                // Requires a stepped `-live-` and a resolvable
                 // block-head marker (else keep the baseline, byte-identical).
                 // The `PYRE_M73_PEROP_AUDIT` census certifies both offsets
                 // decode identically for every consumer (banks + bridge maps +
@@ -12315,7 +12301,7 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 //   * `None` — plain sequential residual call resuming at the
                 //     next opcode's start marker: decode routes the plain word
                 //     through the resume-translation, so carry
-                //     `resume_jitcode_pc_for(py_pc)`.
+                //     the ordinary post-call marker.
                 //     `py_pc == liveness_py_pc` here: the residual-call path
                 //     never supplies `GuardCaptureScope::branch_guard_jitcode_pc`
                 //     (only kept-stack branch guards do), so `guard_py_pc` is
@@ -12334,17 +12320,10 @@ fn walker_capture_snapshot_for_last_guard_impl(
                             .payload
                             .after_residual_call_resume_pc_for(call_py_pc as usize),
                         None => {
-                            // #73 S5 phase-5 slice-4: translation evaluated
-                            // lazily — under the (default-ON) twin carry it
-                            // runs only for twin-`None` overshoot rows.
-                            let legacy = || jc.payload.resume_jitcode_pc_for(py_pc as usize);
-                            if m73_armarker_carry_enabled() {
-                                jc.payload
-                                    .after_residual_marker_for_jitcode_pc(op_pc)
-                                    .or_else(legacy)
-                            } else {
-                                legacy()
-                            }
+                            // Every plain post-call guard capture is emitted
+                            // after its fallthrough `-live-` marker, so this
+                            // populated twin is total at the capture point.
+                            jc.payload.after_residual_marker_for_jitcode_pc(op_pc)
                         }
                     }
                 };
@@ -13019,7 +12998,7 @@ fn walker_capture_multi_frame_inline_snapshot(
         } else {
             majit_ir::resumedata::NO_JITCODE_PC
         };
-        let pf_pc_word = crate::state::pyjitcode_for_jitcode_index(pf.jitcode_index as i32)
+        let Some(pf_pc_word) = crate::state::pyjitcode_for_jitcode_index(pf.jitcode_index as i32)
             .and_then(|payload| {
                 payload.resolve_resume_pc_with_jitcode_pc(
                     pf.resume_py_pc as i32,
@@ -13028,10 +13007,12 @@ fn walker_capture_multi_frame_inline_snapshot(
                 )
             })
             .map(|offset| offset as u32)
-            .unwrap_or(pf.resume_py_pc);
+        else {
+            return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: callee_op_pc });
+        };
         frames.push((pf.jitcode_index, pf_pc_word, pf.boxes.as_slice()));
     }
-    let callee_pc_word = crate::state::pyjitcode_for_jitcode_index(callee_jitcode_index)
+    let Some(callee_pc_word) = crate::state::pyjitcode_for_jitcode_index(callee_jitcode_index)
         .and_then(|payload| {
             payload.resolve_resume_pc_with_jitcode_pc(
                 callee_py_pc as i32,
@@ -13040,7 +13021,9 @@ fn walker_capture_multi_frame_inline_snapshot(
             )
         })
         .map(|offset| offset as u32)
-        .unwrap_or(callee_py_pc);
+    else {
+        return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: callee_op_pc });
+    };
     frames.push((
         callee_jitcode_index as u32,
         callee_pc_word,
@@ -13970,7 +13953,7 @@ fn collect_callee_active_boxes(
 ) -> Result<Vec<OpRef>, DispatchError> {
     // The resume decoder consumes this frame's section per the liveness at the
     // carried `jitcode_pc` (`setposition` → `get_current_position_info`), not
-    // the lossy `resume_jitcode_pc_for(callee_py_pc)` window.  Query the SAME
+    // the lossy py_pc-keyed liveness window. Query the SAME
     // carried
     // coordinate so the encoder's box bank set agrees with the decoder's
     // section sizes (mirror of `collect_outer_active_boxes`:5060 and
@@ -18732,23 +18715,22 @@ fn compare_box_provably_dead(ctx: &WalkContext<'_, '_>, compare_pc: usize, dst_r
     // The normalization this reader wants — the containing py opcode's
     // resume `-live-` — IS the resume-marker twin at `jc_pc`
     // (`resume_marker_for_jitcode_pc`, the invert→trivia-skip→resolve
-    // composition built at codewrite time), so under
-    // `PYRE_M73_ARMDST_CARRY` the liveness is keyed on the twin and the
-    // py_pc translation channel is bypassed.
+    // composition built at codewrite time), so liveness is keyed on the twin.
+    // A missing twin conservatively keeps the box: treating its liveness as
+    // empty would incorrectly prove the register dead.
     let arm_dst_live = |jc_pc: usize| -> bool {
         let py = skip_python_trivia_forward(
             code_obj,
             python_pc_for_jitcode_pc(metadata, jc_pc) as usize,
         );
-        let twin = payload.resume_marker_for_jitcode_pc(jc_pc);
-        let banks = match twin.filter(|_| m73_armdst_carry_enabled()) {
-            Some(t) => crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
-                jitcode_index,
-                py as i32,
-                t as i32,
-            ),
-            None => crate::state::frame_liveness_reg_indices_by_bank_at(jitcode_index, py as i32),
+        let Some(twin) = payload.resume_marker_for_jitcode_pc(jc_pc) else {
+            return true;
         };
+        let banks = crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
+            jitcode_index,
+            py as i32,
+            twin as i32,
+        );
         banks.ref_.iter().any(|&c| c as u8 == dst_reg)
     };
     if arm_dst_live(fallthrough_jc) || arm_dst_live(target_jc) {

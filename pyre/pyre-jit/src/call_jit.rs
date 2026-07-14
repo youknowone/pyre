@@ -1727,13 +1727,12 @@ pub fn blackhole_resume_via_rd_numb(
             return None;
         }
         let op_live = pyre_jit_trace::state::blackhole_control_opcodes().0 as u8;
-        // Post-flip the rd_numb `pc` word is already the JitCode byte offset;
-        // resume there directly when it names a valid `-live-` startpoint,
-        // else translate the stored word through the resume map.
+        // A published resume frame carries a decodable JitCode `-live-`
+        // coordinate. An unrepresentable frame declines this blackhole path.
         let resolved_pc = if pyjitcode.jitcode.can_decode_live_vars(pc as usize, op_live) {
             pc as usize
         } else {
-            pyjitcode.resolve_resume_pc(pc)?
+            return None;
         };
         // resume.py:1339 reads from one `jitcodes[]` store.  pyre's
         // `state::code_for_jitcode_index` indices name the runtime
@@ -5914,7 +5913,7 @@ pub fn cranelift_resumedata_deopt(
         let resolved_pc = if pyjitcode.jitcode.can_decode_live_vars(pc as usize, op_live) {
             pc as usize
         } else {
-            pyjitcode.resolve_resume_pc(pc)?
+            return None;
         };
         Some((pyjitcode.jitcode.clone(), resolved_pc, op_live))
     };

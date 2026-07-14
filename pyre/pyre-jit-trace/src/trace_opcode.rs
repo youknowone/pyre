@@ -1468,21 +1468,16 @@ impl MIFrame {
                     // recorded (pre-call) snapshot position.
                     None
                 };
-                // #73 S5 phase-5 slice-2: during the loop-close window the
-                // plain `live_pc` translation resolves the loop header's
-                // block-head marker — the same value the merge-point twin
-                // (`loop_close_marker_jit_pc`) carries, so the twin substitutes
-                // for the `resume_jitcode_pc_for` translation under
-                // `PYRE_M73_LCLIVE_CARRY`.  Outside the window (twin `None`)
-                // and for marker-routed frames the resolution is unchanged.
+                // The post-call marker or loop-close twin is the complete
+                // resume coordinate at this capture seam. A missing twin uses
+                // the existing trace-abort path below rather than guessing a
+                // block-head position from `live_pc`.
                 match marker_call_pc
                     .and_then(|call_pc| jc.payload.after_residual_call_resume_pc_for(call_pc))
                     .or_else(|| {
                         self.loop_close_marker_jit_pc
                             .filter(|_| crate::jitcode_dispatch::m73_lclive_carry_enabled())
-                    })
-                    .or_else(|| jc.payload.resume_jitcode_pc_for(live_pc))
-                {
+                    }) {
                     Some(jit_pc) => Some(jit_pc),
                     None => {
                         // This (parent) frame reports a `live_pc` the jitcode
@@ -4094,7 +4089,13 @@ impl MIFrame {
                         )
                     })
                     .map(|offset| offset as u32)
-                    .unwrap_or(parent_pc as u32);
+                    .unwrap_or_else(|| {
+                        // Do not publish an invented resume coordinate. The
+                        // recording loop observes this request and discards
+                        // the trace before the provisional snapshot can run.
+                        crate::state::request_trace_abort();
+                        parent_pc as u32
+                    });
             lead.push(majit_metainterp::recorder::SnapshotFrame {
                 jitcode_index: parent_jitcode_index,
                 pc: parent_pc_word,
@@ -4144,7 +4145,12 @@ impl MIFrame {
         let top_pc_word = payload
             .resolve_resume_pc_with_jitcode_pc(top_pc as i32, top_word, crate::state::op_live())
             .map(|offset| offset as u32)
-            .unwrap_or(top_pc as u32);
+            .unwrap_or_else(|| {
+                // A missing carried marker declines this trace before the
+                // provisional snapshot can be installed.
+                crate::state::request_trace_abort();
+                top_pc as u32
+            });
         let top_frame = majit_metainterp::recorder::SnapshotFrame {
             jitcode_index: top_jitcode_index,
             pc: top_pc_word,

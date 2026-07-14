@@ -70,13 +70,11 @@ pub const TAGVIRTUAL: u8 = 3;
 /// decode at resume time.
 pub const AFTER_RESIDUAL_CALL_PC_FLAG: i32 = 1 << 14;
 
-/// Sentinel for a snapshot frame's `jitcode_pc` word: "no direct JitCode
-/// resume coordinate — translate the Python `pc` through `pc_map` as
-/// before".
+/// Sentinel for a snapshot frame's `jitcode_pc` word: no direct JitCode
+/// resume coordinate. Such a frame is unrepresentable and must decline before
+/// resume data is published.
 ///
-/// Each per-frame header carries a `jitcode_pc` word after `pc`.  Normally
-/// it is this sentinel and the frame resumes via the Python `pc` →
-/// `pc_map` indirection (`resolve_resume_pc`).  A branch guard whose
+/// Each per-frame header carries a `jitcode_pc` word after `pc`. A branch guard whose
 /// not-taken arm keeps operand-stack temps the JitCode virtualized cannot
 /// be described by the merge-target Python pc: its kept temps are only
 /// live at the *guard* JitCode position, not at the resume Python opcode

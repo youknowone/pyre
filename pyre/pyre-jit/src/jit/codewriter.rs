@@ -1030,7 +1030,7 @@ fn derive_pc_live_indices_from_sparse(
 /// immediately precedes a `catch_exception`, derived from a SPLICED
 /// (canonical) SSARepr.  These after-residual-call resume anchors feed the
 /// runtime's `after_residual_call_resume_pc` table (the bit-14 flagged resume
-/// path, `pyjitcode.rs:408 resolve_resume_pc`) once
+/// path once
 /// `compute_liveness_with_pc_anchors` remaps them (`liveness.rs:78-81`) into
 /// the spliced bytes.  For each `catch_exception`, the bare `-live-` directly
 /// before it is the anchor, keyed to the canraise opcode that owns the call

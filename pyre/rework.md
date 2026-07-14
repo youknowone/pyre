@@ -29,7 +29,7 @@ is a second, correct coordinate — a per-frame `jitcode_pc: i32` word
 (`resume.rs:279`) with a `NO_JITCODE_PC` sentinel — which branch-guard
 resume now prefers (#73/#366, gates already removed). So one snapshot
 carries **two coordinate systems**, one of them lossy, plus a translation
-layer (`resolve_resume_pc*`) that PyPy never needed.
+layer that PyPy never needed.
 
 **Violates.** A6/N2 (parity: no invented representations), and via its
 consequences A1 (traces that resume at the wrong position are semantics the
@@ -50,7 +50,7 @@ has the analog entry points (`eval.rs:6429–6743`, `dispatch_perfn_frame`,
 converge.
 
 **Tracking.** Fully issued: gh#366 (tracer interprets JitCode directly —
-the enabling engine), gh#368 (delete `pc_map` + `resume_jitcode_pc_for`,
+the enabling engine), gh#368 (delete `pc_map` + the legacy Python-pc resume map,
 Artifact 1), gh#369 (retire the carried `jitcode_pc` side-channel,
 Artifact 3), gh#367 (bank-aware pcdep color-slot map, Artifact 2 /
 slot-vs-color); groundwork gh#73 + PR#365 (closed, M3 milestone). Related:
@@ -198,7 +198,7 @@ Increments (each lands green on N4 gates, each with its kill switch):
 2. **Invert the representation** (gh#368 + gh#369): make the JitCode offset
    the primary `SnapshotFrame` field (resume.py shape); delete the
    Python-PC field, the snapshot `pc_map` (pyjitpl.rs:506), and the
-   `resolve_resume_pc*` translation layer (gh#368), then the carried
+   resume translation layer (gh#368), then the carried
    `jitcode_pc` side-channel it obsoletes (gh#369). Python-level PC, where
    genuinely needed (frame f_lasti, tracebacks), is derived the way PyPy
    derives it, not stored as the resume key.
@@ -221,7 +221,7 @@ the pr354 FOR_ITER-in-called-function crash repro, the loop-carried `or`
 deopt underflow repro, rc_d32.py double-append, aheui logo --jit, the wasm
 timeout re-entry cases.
 
-Exit criteria: `pc_map`, `resolve_resume_pc*`, `OpcodeHandler` twin, and
+Exit criteria: `pc_map`, the resume translation layer, `OpcodeHandler` twin, and
 `is_full_body_walk` no longer exist in the tree; full benchmark suite (all
 8) no regressions; crash corpus green; slot-vs-color epic closeable.
 
