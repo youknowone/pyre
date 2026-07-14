@@ -5661,14 +5661,37 @@ pub(crate) fn builtin_list_ctor(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
 
 pub fn collect_iterable(obj: PyObjectRef) -> Result<Vec<PyObjectRef>, crate::PyError> {
     let it = crate::baseobjspace::iter(obj)?;
-    let mut items = Vec::new();
+    // Each `next` runs arbitrary allocating code (a generator body, a JIT
+    // callee that boxes a fresh int) which can trigger a moving minor
+    // collection. A raw `Vec<PyObjectRef>` on the malloc heap is invisible to
+    // the collector, so already-collected nursery elements would be stranded /
+    // not forwarded. Pin the iterator and each yielded element onto the shadow
+    // stack (a real GC root the collector walks and updates on relocation),
+    // then read the forwarded slots back out — the manual equivalent of the
+    // translator's shadowstack save/restore around a collecting call
+    // (framework.py:853-856).
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(it);
+    let mut count = 0usize;
     loop {
-        match crate::baseobjspace::next(it) {
-            Ok(v) => items.push(v),
+        // The iterator may itself have moved during a prior `next`; reload it
+        // from its (post-relocation) shadow-stack slot before each call.
+        let it_now = pyre_object::gc_roots::shadow_stack_get(base);
+        match crate::baseobjspace::next(it_now) {
+            Ok(v) => {
+                pyre_object::gc_roots::pin_root(v);
+                count += 1;
+            }
             Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
             Err(e) => return Err(e),
         }
     }
+    // Read the forwarded element slots back out. The elements sit at
+    // `base + 1 ..= base + count` (the iterator occupies `base`).
+    let items = (0..count)
+        .map(|i| pyre_object::gc_roots::shadow_stack_get(base + 1 + i))
+        .collect();
     Ok(items)
 }
 
