@@ -5956,7 +5956,6 @@ fn reconstruct_inline_recipe(
         return Some(ReconstructRecipe {
             code_ptr: raw_code as *const (),
             jitcode_index: frame.jitcode_index,
-            pc: py_pc,
             jitcode_pc: frame.pc,
             nlocals,
             valuestackdepth,
@@ -6138,7 +6137,6 @@ fn reconstruct_inline_recipe(
     Some(ReconstructRecipe {
         code_ptr: raw_code as *const (),
         jitcode_index: frame.jitcode_index,
-        pc: py_pc,
         jitcode_pc: frame.pc,
         nlocals,
         valuestackdepth,
@@ -8988,7 +8986,6 @@ impl JitState for PyreJitState {
             } else {
                 0
             };
-            let root_jitcode_pc = resume_data.frames[0].pc;
             let mut recipes: Vec<ReconstructRecipe> =
                 Vec::with_capacity(resume_data.frames.len() - 1);
             let mut ok = root_pc_valid;
@@ -9025,11 +9022,7 @@ impl JitState for PyreJitState {
                 // instead, degrading to the blackhole re-interpret.
                 recipes.clear();
             }
-            ctx.set_bridge_inline_carrier(BridgeInlineCarrier {
-                root_pc,
-                root_jitcode_pc,
-                recipes,
-            });
+            ctx.set_bridge_inline_carrier(BridgeInlineCarrier { root_pc, recipes });
         }
     }
 
@@ -12791,8 +12784,11 @@ pub(crate) fn assemble_bridge_inline_pending(
     for k in nlocals..valuestackdepth {
         concrete_frame.push(recipe_slot_to_pyobj(recipe.concrete_r[k]));
     }
-    // last_instr = recipe.pc - 1 so next_instr() resumes AT recipe.pc.
-    concrete_frame.set_last_instr_from_next_instr(recipe.pc);
+    // last_instr is one before the recipe's Python pc so next_instr() resumes there.
+    concrete_frame
+        .set_last_instr_from_next_instr(
+            backxlat_py_pc(recipe.jitcode_index, recipe.jitcode_pc) as usize
+        );
 
     // Symbolic side: mirror the FAST branch field-for-field.
     let mut sym = PyreSym::new_uninit(OpRef::NONE);

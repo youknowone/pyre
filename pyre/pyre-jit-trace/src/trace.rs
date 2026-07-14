@@ -886,7 +886,11 @@ fn drive_bridge_carrier_walk(
 
     let root_ec = sym.concrete_execution_context;
     if std::env::var_os("PYRE_P2_DIAG").is_some() {
-        let pcs: Vec<usize> = carrier.recipes.iter().map(|r| r.pc).collect();
+        let pcs: Vec<usize> = carrier
+            .recipes
+            .iter()
+            .map(|r| crate::state::backxlat_py_pc(r.jitcode_index, r.jitcode_pc) as usize)
+            .collect();
         eprintln!(
             "[p2-shape] root_pc={root_pc} n_recipes={} recipe_pcs={pcs:?}",
             carrier.recipes.len()
@@ -918,9 +922,14 @@ fn drive_bridge_carrier_walk(
     let entry = select_recipe_entry(
         recipe.jitcode_index,
         callee_pjc.jitcode.index() as i32,
-        recipe.pc,
+        crate::state::backxlat_py_pc(recipe.jitcode_index, recipe.jitcode_pc) as usize,
         recipe.jitcode_pc,
-        || callee_pjc.resume_jitcode_pc_for(recipe.pc),
+        || {
+            callee_pjc.resume_jitcode_pc_for(crate::state::backxlat_py_pc(
+                recipe.jitcode_index,
+                recipe.jitcode_pc,
+            ) as usize)
+        },
     );
     let Some(entry) = entry else {
         ctx.cut_trace(pre_pos);
@@ -934,7 +943,6 @@ fn drive_bridge_carrier_walk(
     // is known.
     let nlocals = recipe.nlocals.min(recipe.concrete_r.len());
     let local_concretes = &recipe.concrete_r[..nlocals];
-
     // Increment 2b-i: drive the deepest callee as an inline SUB-WALK rooted on
     // the portal `sym` (is_top_level=false), so its `ref_return` surfaces
     // `SubReturn` instead of the top-level `Finish` pyre's own-portal model
@@ -944,7 +952,6 @@ fn drive_bridge_carrier_walk(
         &session,
         sym,
         root_pc,
-        carrier.root_jitcode_pc,
         &callee_pjc,
         recipe.code_ptr as usize,
         callee_w_globals,
@@ -977,15 +984,15 @@ fn drive_bridge_carrier_walk(
     match &walk {
         Some(Ok((outcome, end_pc))) => {
             eprintln!(
-                "[p2-drain] callee sub-walk OK recipe.pc={} entry={entry} end_pc={end_pc} outcome={outcome:?}",
-                recipe.pc
+                "[p2-drain] callee sub-walk OK recipe_py_pc={} entry={entry} end_pc={end_pc} outcome={outcome:?}",
+                crate::state::backxlat_py_pc(recipe.jitcode_index, recipe.jitcode_pc)
             );
             crate::jitcode_dispatch::census_record("P2Drain::SubWalkOk");
         }
         Some(Err(e)) => {
             eprintln!(
-                "[p2-drain] callee sub-walk STOP recipe.pc={} entry={entry} err={e:?}",
-                recipe.pc
+                "[p2-drain] callee sub-walk STOP recipe_py_pc={} entry={entry} err={e:?}",
+                crate::state::backxlat_py_pc(recipe.jitcode_index, recipe.jitcode_pc)
             );
             crate::jitcode_dispatch::census_record("P2Drain::SubWalkStop");
         }
@@ -1048,7 +1055,11 @@ fn drive_bridge_framestack_walk(
     crate::jitcode_dispatch::fbw_store_journal_reset();
 
     if std::env::var_os("PYRE_P2_DIAG").is_some() {
-        let pcs: Vec<usize> = carrier.recipes.iter().map(|r| r.pc).collect();
+        let pcs: Vec<usize> = carrier
+            .recipes
+            .iter()
+            .map(|r| crate::state::backxlat_py_pc(r.jitcode_index, r.jitcode_pc) as usize)
+            .collect();
         eprintln!(
             "[p2-framestack] root_pc={root_pc} n_recipes={} recipe_pcs={pcs:?}",
             carrier.recipes.len()
@@ -1079,9 +1090,14 @@ fn drive_bridge_framestack_walk(
     let entry = select_recipe_entry(
         recipe.jitcode_index,
         callee_pjc.jitcode.index() as i32,
-        recipe.pc,
+        crate::state::backxlat_py_pc(recipe.jitcode_index, recipe.jitcode_pc) as usize,
         recipe.jitcode_pc,
-        || callee_pjc.resume_jitcode_pc_for(recipe.pc),
+        || {
+            callee_pjc.resume_jitcode_pc_for(crate::state::backxlat_py_pc(
+                recipe.jitcode_index,
+                recipe.jitcode_pc,
+            ) as usize)
+        },
     );
     let Some(entry) = entry else {
         ctx.cut_trace(pre_pos);
@@ -1091,14 +1107,13 @@ fn drive_bridge_framestack_walk(
     let callee_w_globals = crate::state::recover_inline_callee_globals(recipe.code_ptr) as usize;
     let nlocals = recipe.nlocals.min(recipe.concrete_r.len());
     let local_concretes = &recipe.concrete_r[..nlocals];
-
     let pos_after_setup = ctx.get_trace_position();
     if std::env::var_os("PYRE_P2_DIAG").is_some() {
         let root_entry = crate::state::pyjitcode_for_code(w_code)
             .and_then(|pjc| pjc.resume_jitcode_pc_for(root_pc));
         eprintln!(
             "[p2-fs] callee_entry(jit)={entry} callee.pc(py)={} root_pc(py)={root_pc} root_entry(jit)={root_entry:?} pos_pre={pre_pos:?} pos_after_setup={pos_after_setup:?}",
-            recipe.pc
+            crate::state::backxlat_py_pc(recipe.jitcode_index, recipe.jitcode_pc)
         );
     }
 
@@ -1111,7 +1126,6 @@ fn drive_bridge_framestack_walk(
         &session,
         sym,
         root_pc,
-        carrier.root_jitcode_pc,
         &callee_pjc,
         recipe.code_ptr as usize,
         callee_w_globals,
@@ -1164,15 +1178,7 @@ fn drive_bridge_framestack_walk(
         // `SafeAbortReconstruction` below (correct no-JIT re-interpret).
         if carrier.recipes.len() == 1 {
             if let Some(action) = drive_outer_continuation_and_map(
-                ctx,
-                &session,
-                sym,
-                w_code,
-                root_pc,
-                carrier.root_jitcode_pc,
-                cf_addr,
-                result,
-                pre_pos,
+                ctx, &session, sym, w_code, root_pc, cf_addr, result, pre_pos,
             ) {
                 return action;
             }
@@ -1200,7 +1206,6 @@ fn drive_outer_continuation_and_map(
     sym: &mut PyreSym,
     w_code: *const (),
     root_pc: usize,
-    root_jitcode_pc: i32,
     _cf_addr: usize,
     result: majit_ir::OpRef,
     pre_pos: majit_metainterp::recorder::TracePosition,
@@ -1210,7 +1215,7 @@ fn drive_outer_continuation_and_map(
         root_pjc.jitcode.index() as i32,
         root_pjc.jitcode.index() as i32,
         root_pc,
-        root_jitcode_pc,
+        root_pc as i32,
         || root_pjc.resume_jitcode_pc_for(root_pc),
     )?;
     // Decode the call-dst register: the op whose `next_pc == entry` is the
@@ -1257,7 +1262,6 @@ fn drive_outer_continuation_and_map(
         w_code as usize,
         root_w_globals,
         root_pc,
-        root_jitcode_pc,
         entry,
         frame_box,
         frame_reg,

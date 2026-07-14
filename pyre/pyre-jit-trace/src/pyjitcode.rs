@@ -524,8 +524,8 @@ impl PyJitCode {
     /// PC directly in resume data (`miframe.pc`); pyre's resume data
     /// stores the Python bytecode PC and translates here.  This
     /// translation is permanent: pyre interprets Python bytecode while
-    /// upstream interprets JitCode, so an *entry* py_pc (inline-callee
-    /// `recipe.pc`, root-portal / walk-entry `start_pc`) has no genuine
+    /// upstream interprets JitCode, so an *entry* py_pc (an inline-callee's
+    /// translated recipe pc, or root-portal / walk-entry `start_pc`) has no genuine
     /// JitCode coordinate in hand and must be resolved through the
     /// tables.  The dense `pc_map` this once read has been deleted; the
     /// offset now derives from the two surviving exact tables plus the
