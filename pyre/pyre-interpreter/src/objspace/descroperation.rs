@@ -1058,16 +1058,21 @@ pub(crate) unsafe fn str_repeat(s: PyObjectRef, n: PyObjectRef) -> PyResult {
     if count == 1 {
         return Ok(crate::type_methods::str_result_unchanged(s));
     }
-    let total = bytes
-        .len()
-        .checked_mul(count)
-        .ok_or_else(|| PyError::new(PyErrorKind::OverflowError, "repeated string is too long"))?;
-    if total > isize::MAX as usize {
+    // unicode_repeat: overflow is judged on the character count
+    // (length * nchars), not the WTF-8 byte length. A non-ASCII character
+    // is wider in WTF-8 than its Py_UCS storage, so the byte product may
+    // exceed isize::MAX while the character product does not. That case is
+    // a MemoryError from the allocation, not an OverflowError.
+    let char_len = w_str_len(s);
+    if char_len != 0 && count > isize::MAX as usize / char_len {
         return Err(PyError::new(
             PyErrorKind::OverflowError,
             "repeated string is too long",
         ));
     }
+    let Some(total) = bytes.len().checked_mul(count) else {
+        return Err(PyError::new(PyErrorKind::MemoryError, ""));
+    };
     let mut out: Vec<u8> = Vec::new();
     out.try_reserve_exact(total)
         .map_err(|_| PyError::new(PyErrorKind::MemoryError, ""))?;
