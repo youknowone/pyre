@@ -7671,8 +7671,11 @@ fn rebuild_typed_from_rd_numb(
 
     // The outer frame's decoded Python position is retained for resume-state
     // hygiene. The live resume selection uses the rebuilt frame chain.
+    // pc=-1 = no-snapshot sentinel; screen it out (as build_resumed_frames does)
+    // so the negative word never reaches the `as usize` cast.
     let rd_numb_pc = frames
         .first()
+        .filter(|f| f.pc >= 0)
         .map(|f| pyre_jit_trace::state::backxlat_py_pc(f.jitcode_index, f.pc) as usize);
     (typed, rd_numb_pc, virtuals_cache)
 }

@@ -787,13 +787,13 @@ pub fn skip_python_trivia_forward_public(
 }
 
 /// Translate a resume-frame pc word to a Python instruction coordinate.
+///
+/// A negative word (sentinel / branch-orgpc tag) has no Python coordinate; per
+/// the `decode_resume_pc` contract it passes through so the caller's `pc < 0`
+/// screen rejects it (the internal metadata lookups below are bounds-checked and
+/// never index with the word, so no wrap results).
 pub fn backxlat_py_pc(jitcode_index: i32, pc_word: i32) -> i32 {
     let fallback = majit_ir::resumedata::decode_resume_pc(pc_word).0;
-    // A negative word (sentinel / branch-orgpc tag) would wrap to a huge offset
-    // in the `as usize` casts below; return the decoded fallback directly.
-    if pc_word < 0 {
-        return fallback;
-    }
     python_pc_for_jitcode_pc_public(jitcode_index, pc_word)
         .and_then(|raw_py_pc| skip_python_trivia_forward_public(jitcode_index, raw_py_pc))
         .map(|(py_pc, _)| py_pc)
