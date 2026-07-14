@@ -10590,13 +10590,30 @@ fn generator_send_ex(gen_obj: PyObjectRef, w_arg: PyObjectRef, operr: Option<PyE
         w_generator_set_started(gen_obj);
         w_generator_set_running(gen_obj, true);
 
+        // A suspended `yield from` owns the next resume operation.  Keep the
+        // outer frame parked until its delegate either yields again or is
+        // exhausted, so a value or exception never takes the bytecode path
+        // intended for an awaitable resume.
+        let mut pending_operr = operr;
+        let mut delegated_completion = false;
+        if already_started && !frame.w_yielding_from.is_null() {
+            match resume_yield_from(frame, w_arg, pending_operr.take()) {
+                Ok(Some(value)) => {
+                    w_generator_set_running(gen_obj, false);
+                    return Ok(value);
+                }
+                Ok(None) => delegated_completion = true,
+                Err(err) => pending_operr = Some(err),
+            }
+        }
+
         // generator.py:104 — w_result = frame.execute_frame(w_arg, operr)
-        let w_inputvalue = if already_started && operr.is_none() {
+        let w_inputvalue = if already_started && pending_operr.is_none() && !delegated_completion {
             Some(w_arg)
         } else {
             None
         };
-        let result = frame.execute_frame(w_inputvalue, operr);
+        let result = frame.execute_frame(w_inputvalue, pending_operr);
 
         w_generator_set_running(gen_obj, false);
 
@@ -10632,6 +10649,123 @@ fn generator_send_ex(gen_obj: PyObjectRef, w_arg: PyObjectRef, operr: Option<PyE
             }
         }
     }
+}
+
+/// Resume the iterator recorded by a suspended `yield from`.
+///
+/// `Some` is a value yielded by the delegate and is therefore also the
+/// outer generator's result.  `None` means the delegate completed and the
+/// outer frame has been positioned at the completion path.
+fn resume_yield_from(
+    frame: &mut crate::pyframe::PyFrame,
+    w_arg: PyObjectRef,
+    operr: Option<PyError>,
+) -> Result<Option<PyObjectRef>, PyError> {
+    let w_yf = frame.w_yielding_from;
+    debug_assert!(!w_yf.is_null());
+
+    let result = match operr {
+        Some(err) if err.kind == PyErrorKind::GeneratorExit => {
+            close_yield_from(w_yf)?;
+            frame.w_yielding_from = pyre_object::PY_NULL;
+            return Err(err);
+        }
+        Some(err) => throw_yield_from(w_yf, err),
+        None if unsafe { pyre_object::is_none(w_arg) } => next(w_yf),
+        None => {
+            let send = getattr_str(w_yf, "send")?;
+            crate::call::call_function_impl_result(send, &[w_arg])
+        }
+    };
+
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(err) if err.kind == PyErrorKind::StopIteration => {
+            frame.w_yielding_from = pyre_object::PY_NULL;
+            finish_yield_from(frame, err)?;
+            Ok(None)
+        }
+        Err(err) => {
+            frame.w_yielding_from = pyre_object::PY_NULL;
+            Err(err)
+        }
+    }
+}
+
+/// Delegate a thrown exception, preserving the original exception when the
+/// iterator has no `throw` method.
+fn throw_yield_from(w_yf: PyObjectRef, err: PyError) -> PyResult {
+    unsafe {
+        if pyre_object::generator::is_generator(w_yf) {
+            return generator_send_ex(w_yf, w_none(), Some(err));
+        }
+    }
+    let throw = match getattr_str(w_yf, "throw") {
+        Ok(method) => method,
+        Err(attr_err) if attr_err.kind == PyErrorKind::AttributeError => return Err(err),
+        Err(attr_err) => return Err(attr_err),
+    };
+    let w_exc = err.to_exc_object();
+    let w_type = crate::typedef::r#type(w_exc).unwrap_or(pyre_object::PY_NULL);
+    crate::call::call_function_impl_result(throw, &[w_type, w_exc])
+}
+
+/// Run a delegated iterator's close operation.  A generator close is kept
+/// in the same resume path so nested delegation unwinds one frame at a time.
+fn close_yield_from(w_yf: PyObjectRef) -> PyResult {
+    unsafe {
+        if pyre_object::generator::is_generator(w_yf) {
+            let exit = PyError::new(PyErrorKind::GeneratorExit, String::new());
+            return match generator_send_ex(w_yf, w_none(), Some(exit)) {
+                Ok(_) => Err(PyError::runtime_error("generator ignored GeneratorExit")),
+                Err(err)
+                    if err.kind == PyErrorKind::StopIteration
+                        || err.kind == PyErrorKind::GeneratorExit =>
+                {
+                    Ok(w_none())
+                }
+                Err(err) => Err(err),
+            };
+        }
+    }
+    let close = match getattr_str(w_yf, "close") {
+        Ok(method) => method,
+        Err(err) if err.kind == PyErrorKind::AttributeError => return Ok(w_none()),
+        Err(err) => return Err(err),
+    };
+    crate::call::call_function_impl_result(close, &[])
+}
+
+/// Put the stopped delegate's return value through the `SEND` completion
+/// edge.  The iterator remains on the operand stack until `END_SEND` removes
+/// it, exactly as it does when exhaustion happens during bytecode dispatch.
+fn finish_yield_from(frame: &mut crate::pyframe::PyFrame, err: PyError) -> Result<(), PyError> {
+    use crate::bytecode::Instruction;
+
+    let value = if !err.exc_object.is_null() && unsafe { pyre_object::is_exception(err.exc_object) }
+    {
+        getattr_str(err.exc_object, "value").unwrap_or_else(|_| w_none())
+    } else {
+        w_none()
+    };
+    frame.pushvalue(value);
+
+    let code = frame.code();
+    let last_instr = frame.last_instr.max(0) as usize;
+    let mut completion_target = None;
+    for pc in 0..=last_instr {
+        let Some((instruction, op_arg)) = crate::pyopcode::decode_instruction_at(code, pc) else {
+            continue;
+        };
+        if let Instruction::Send { delta } = instruction {
+            let next = pc + instruction.cache_entries() + 1;
+            completion_target = Some(next + delta.get(op_arg).as_usize());
+        }
+    }
+    let target = completion_target
+        .ok_or_else(|| PyError::runtime_error("yield from completion has no SEND instruction"))?;
+    frame.set_last_instr_from_next_instr(target);
+    Ok(())
 }
 
 /// Build a `StopIteration` carrying `value` on `.value` / `args[0]`.

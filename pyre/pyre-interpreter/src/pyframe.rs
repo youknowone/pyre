@@ -2457,23 +2457,14 @@ impl PyFrame {
 
     /// pyframe.py:300 resume_execute_frame (send-path only).
     ///
-    /// pyre does not emit YIELD_FROM/SEND yet, so `w_yielding_from` is
-    /// expected to remain null; asserting makes the gap visible instead of
-    /// silently dropping the delegate. The SApplicationException branch
-    /// (pyframe.py:320) is handled by the caller in `execute_frame`: if
-    /// `operr.is_some()`, resume_execute_frame is skipped and
-    /// `eval_frame_plain_with_operr` routes the error through
-    /// `handle_exception` at `last_instr + 1`, matching PyPy's
-    /// `handle_generator_error`.
+    /// A suspended delegate is resumed by `generator_send_ex` before this
+    /// method runs.  Once that delegate completes, this path receives the
+    /// normal outer-frame input again.
     #[inline]
     pub fn resume_execute_frame(
         &mut self,
         w_arg_or_err: PyObjectRef,
     ) -> Result<usize, crate::PyError> {
-        debug_assert!(
-            self.w_yielding_from.is_null(),
-            "YIELD_FROM delegation not yet ported; see pyframe.py:305-318",
-        );
         if self.last_instr != -1 {
             self.pushvalue(w_arg_or_err);
             Ok(self.last_instr as usize + 1)

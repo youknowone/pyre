@@ -1258,6 +1258,9 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     fn end_send(&mut self) -> Result<(), PyError> {
         Err(crate::PyError::type_error("end_send not implemented").into())
     }
+    fn cleanup_throw(&mut self) -> Result<(), PyError> {
+        Err(crate::PyError::type_error("cleanup throw not implemented").into())
+    }
     /// GET_AWAITABLE — replace TOS with its awaitable iterator (`__await__`).
     /// Overridden by the interpreter; the trace path declines (await suspends
     /// the frame and is never JIT-traced).
@@ -2060,6 +2063,13 @@ pub fn execute_send<E: OpcodeStepExecutor>(
 ) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
     let target = jump_target_forward_from_oparg(code, next_instr, op_arg);
     executor.send_value(target)?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_cleanup_throw<E: OpcodeStepExecutor>(
+    executor: &mut E,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    executor.cleanup_throw()?;
     Ok(StepResult::Continue)
 }
 
@@ -3476,10 +3486,7 @@ where
         Instruction::GetAwaitable { .. } => execute_get_awaitable(executor, instruction, op_arg),
 
         // ── Async stubs ──
-        Instruction::GetAiter
-        | Instruction::GetAnext
-        | Instruction::EndAsyncFor
-        | Instruction::CleanupThrow => {
+        Instruction::GetAiter | Instruction::GetAnext | Instruction::EndAsyncFor => {
             Err(crate::PyError::type_error("async not yet implemented").into())
         }
 
@@ -3489,6 +3496,8 @@ where
         Instruction::Send { .. } => execute_send(executor, code, op_arg, next_instr),
 
         Instruction::EndSend => execute_end_send(executor),
+
+        Instruction::CleanupThrow => execute_cleanup_throw(executor),
 
         // ── Misc stubs ──
         // Pops obj, pushes (callable, self_or_null).

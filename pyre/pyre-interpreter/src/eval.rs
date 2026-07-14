@@ -2513,6 +2513,26 @@ impl OpcodeStepExecutor for PyFrame {
         Ok(())
     }
 
+    fn cleanup_throw(&mut self) -> Result<(), PyError> {
+        let w_exc = self.pop_value()?;
+        let err = unsafe { PyError::from_exc_object(w_exc) };
+        if err.kind != PyErrorKind::StopIteration {
+            return Err(err);
+        }
+
+        self.pop_value()?;
+        self.pop_value()?;
+        let value =
+            if !err.exc_object.is_null() && unsafe { pyre_object::is_exception(err.exc_object) } {
+                crate::baseobjspace::getattr_str(err.exc_object, "value")
+                    .unwrap_or_else(|_| pyre_object::w_none())
+            } else {
+                pyre_object::w_none()
+            };
+        self.push(value);
+        Ok(())
+    }
+
     /// WITH_EXCEPT_START — call __exit__ for the exceptional `with` exit.
     ///
     /// Stack layout the bytecode emits (bottom → top):
@@ -3545,14 +3565,27 @@ impl OpcodeStepExecutor for PyFrame {
     }
 
     fn send_value(&mut self, target: usize) -> Result<(), PyError> {
-        let _value = self.pop(); // sent value
+        let value = self.pop();
         let iter = self.peek();
-        match crate::baseobjspace::next(iter) {
+        let result = if unsafe { pyre_object::is_none(value) } {
+            crate::baseobjspace::next(iter)
+        } else {
+            let send = crate::baseobjspace::getattr_str(iter, "send")?;
+            crate::call::call_function_impl_result(send, &[value])
+        };
+        match result {
             Ok(result) => {
+                self.w_yielding_from = iter;
+                if pyre_object::gc_hook::try_gc_owns_object(self as *mut PyFrame as *mut u8) {
+                    pyre_object::gc_hook::try_gc_write_barrier(self as *mut PyFrame as *mut u8);
+                }
                 self.push(result);
                 Ok(())
             }
             Err(e) if e.kind == crate::PyErrorKind::StopIteration => {
+                if std::ptr::eq(self.w_yielding_from, iter) {
+                    self.w_yielding_from = pyre_object::PY_NULL;
+                }
                 // `pypy/interpreter/pyopcode.py:1158-1166 next_yield_from`:
                 //     try:
                 //         w_stop_value = space.getattr(e.get_w_value(space),
