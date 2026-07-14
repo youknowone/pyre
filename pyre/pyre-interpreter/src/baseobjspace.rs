@@ -1334,10 +1334,31 @@ unsafe fn getitem_tuple(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         }
         return Ok(w_tuple_new(items));
     }
-    if !is_int(index) {
+    // `descr_getitem`: getindex_w(index, IndexError, "tuple") — coercion
+    // inlined for the same rtyper reason as `getitem_list`.
+    let idx = if is_int(index) {
+        w_int_get_value(index)
+    } else if pyre_object::pyobject::is_int_or_long(index) || lookup(index, "__index__").is_some() {
+        let indexed = space_index(index)?;
+        if is_int(indexed) {
+            w_int_get_value(indexed)
+        } else {
+            match i64::try_from(w_long_get_value(indexed)) {
+                Ok(i) => i,
+                Err(_) => {
+                    return Err(PyError::new(
+                        PyErrorKind::IndexError,
+                        format!(
+                            "cannot fit '{}' into an index-sized integer",
+                            object_functionstr_type_name(index)
+                        ),
+                    ));
+                }
+            }
+        }
+    } else {
         return Err(index_type_error("tuple", index));
-    }
-    let idx = w_int_get_value(index);
+    };
     match w_tuple_getitem(obj, idx) {
         Some(val) => Ok(val),
         None => Err(PyError::new(
@@ -1370,43 +1391,46 @@ unsafe fn getitem_str(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         }
         return Ok(w_str_from_wtf8(result));
     }
-    if is_int(index) {
-        let idx = w_int_get_value(index);
-        let actual_idx = if idx < 0 { cps.len() as i64 + idx } else { idx } as usize;
-        if actual_idx < cps.len() {
-            let mut one = Wtf8Buf::new();
-            one.push(cps[actual_idx]);
-            return Ok(w_str_from_wtf8(one));
+    // `descr_getitem`: getindex_w(index, IndexError, "string") — coercion
+    // inlined for the same rtyper reason as `getitem_list`.
+    let idx = if is_int(index) {
+        w_int_get_value(index)
+    } else if pyre_object::pyobject::is_int_or_long(index) || lookup(index, "__index__").is_some() {
+        let indexed = space_index(index)?;
+        if is_int(indexed) {
+            w_int_get_value(indexed)
+        } else {
+            match i64::try_from(w_long_get_value(indexed)) {
+                Ok(i) => i,
+                Err(_) => {
+                    return Err(PyError::new(
+                        PyErrorKind::IndexError,
+                        format!(
+                            "cannot fit '{}' into an index-sized integer",
+                            object_functionstr_type_name(index)
+                        ),
+                    ));
+                }
+            }
         }
-        return Err(PyError::new(
-            PyErrorKind::IndexError,
-            "string index out of range",
-        ));
+    } else {
+        return Err(index_type_error("string", index));
+    };
+    let actual_idx = if idx < 0 { cps.len() as i64 + idx } else { idx } as usize;
+    if actual_idx < cps.len() {
+        let mut one = Wtf8Buf::new();
+        one.push(cps[actual_idx]);
+        return Ok(w_str_from_wtf8(one));
     }
-    Err(PyError::type_error(format!(
-        "string indices must be integers, not '{}'",
-        crate::type_methods::arg_type_name(index)
-    )))
+    Err(PyError::new(
+        PyErrorKind::IndexError,
+        "string index out of range",
+    ))
 }
 
 #[inline(never)]
 unsafe fn getitem_bytes_like(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     let is_bytes = pyre_object::bytesobject::is_bytes(obj);
-    if is_int(index) {
-        let idx = w_int_get_value(index);
-        let len = pyre_object::bytesobject::bytes_like_len(obj) as i64;
-        let actual = if idx < 0 { len + idx } else { idx };
-        if actual >= 0 && actual < len {
-            return Ok(w_int_new(
-                pyre_object::bytesobject::bytes_like_getitem(obj, actual as usize) as i64,
-            ));
-        }
-        let name = if is_bytes { "bytes" } else { "bytearray" };
-        return Err(PyError::new(
-            PyErrorKind::IndexError,
-            format!("{name} index out of range"),
-        ));
-    }
     if is_slice(index) {
         let len = pyre_object::bytesobject::bytes_like_len(obj) as i64;
         let (start, stop, step) = normalize_slice(index, len)?;
@@ -1433,8 +1457,44 @@ unsafe fn getitem_bytes_like(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
             pyre_object::bytearrayobject::w_bytearray_from_bytes(&result)
         });
     }
-    let descr = if is_bytes { "byte" } else { "bytearray" };
-    Err(index_type_error(descr, index))
+    // `descr_getitem`: getindex_w(index, IndexError, "byte") — coercion
+    // inlined for the same rtyper reason as `getitem_list`.
+    let idx = if is_int(index) {
+        w_int_get_value(index)
+    } else if pyre_object::pyobject::is_int_or_long(index) || lookup(index, "__index__").is_some() {
+        let indexed = space_index(index)?;
+        if is_int(indexed) {
+            w_int_get_value(indexed)
+        } else {
+            match i64::try_from(w_long_get_value(indexed)) {
+                Ok(i) => i,
+                Err(_) => {
+                    return Err(PyError::new(
+                        PyErrorKind::IndexError,
+                        format!(
+                            "cannot fit '{}' into an index-sized integer",
+                            object_functionstr_type_name(index)
+                        ),
+                    ));
+                }
+            }
+        }
+    } else {
+        let descr = if is_bytes { "byte" } else { "bytearray" };
+        return Err(index_type_error(descr, index));
+    };
+    let len = pyre_object::bytesobject::bytes_like_len(obj) as i64;
+    let actual = if idx < 0 { len + idx } else { idx };
+    if actual >= 0 && actual < len {
+        return Ok(w_int_new(
+            pyre_object::bytesobject::bytes_like_getitem(obj, actual as usize) as i64,
+        ));
+    }
+    let name = if is_bytes { "byte" } else { "bytearray" };
+    Err(PyError::new(
+        PyErrorKind::IndexError,
+        format!("{name} index out of range"),
+    ))
 }
 
 #[inline(never)]
