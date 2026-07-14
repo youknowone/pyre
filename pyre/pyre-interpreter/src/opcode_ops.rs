@@ -3,8 +3,8 @@ use crate::bytecode::{BinaryOperator, ComparisonOperator};
 use pyre_object::{PyObjectRef, w_bool_from};
 
 use crate::{
-    CompareOp, add, and_, compare, floordiv, getitem, invert, is_true, lshift, mod_, mul, neg, or_,
-    pow, rshift, sub, truediv, xor,
+    CompareOp, add, and_, compare, floordiv, getitem, invert, is_true, lshift, matmul, mod_, mul,
+    neg, or_, pow, rshift, sub, truediv, xor,
 };
 
 /// Maps an in-place `BinaryOperator` to its special-method name
@@ -19,6 +19,7 @@ fn inplace_dunder_name(op: BinaryOperator) -> Option<&'static str> {
         BinaryOperator::InplaceTrueDivide => "__itruediv__",
         BinaryOperator::InplacePower => "__ipow__",
         BinaryOperator::InplaceLshift => "__ilshift__",
+        BinaryOperator::InplaceMatrixMultiply => "__imatmul__",
         BinaryOperator::InplaceRshift => "__irshift__",
         BinaryOperator::InplaceAnd => "__iand__",
         BinaryOperator::InplaceOr => "__ior__",
@@ -64,6 +65,7 @@ pub fn binary_value(
         BinaryOperator::TrueDivide | BinaryOperator::InplaceTrueDivide => truediv(a, b),
         BinaryOperator::Power | BinaryOperator::InplacePower => pow(a, b),
         BinaryOperator::Lshift | BinaryOperator::InplaceLshift => lshift(a, b),
+        BinaryOperator::MatrixMultiply | BinaryOperator::InplaceMatrixMultiply => matmul(a, b),
         BinaryOperator::Rshift | BinaryOperator::InplaceRshift => rshift(a, b),
         BinaryOperator::And | BinaryOperator::InplaceAnd => and_(a, b),
         // mappingproxy `__ior__` (read-only) raises TypeError, handled
@@ -71,9 +73,6 @@ pub fn binary_value(
         BinaryOperator::Or | BinaryOperator::InplaceOr => or_(a, b),
         BinaryOperator::Xor | BinaryOperator::InplaceXor => xor(a, b),
         BinaryOperator::Subscr => getitem(a, b),
-        _ => Err(PyError::type_error(format!(
-            "binary operation {op:?} not yet implemented"
-        ))),
     }
 }
 

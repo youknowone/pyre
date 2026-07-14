@@ -11141,7 +11141,7 @@ fn generator_throw_method(args: &[PyObjectRef]) -> PyResult {
     };
     // w_tb (args[3]) ignored for now — traceback not yet supported
 
-    let err = normalize_throw_args(w_type, w_val);
+    let err = normalize_throw_args(w_type, w_val)?;
     generator_send_ex(gen_obj, w_none(), Some(err))
 }
 
@@ -11183,30 +11183,30 @@ fn generator_close_method(args: &[PyObjectRef]) -> PyResult {
 ///   throw(TypeError)         — type → creates instance
 ///   throw(TypeError("msg"))  — instance → derives type
 ///   throw(TypeError, "msg")  — type + value → creates instance
-fn normalize_throw_args(w_type: PyObjectRef, w_val: PyObjectRef) -> PyError {
+fn normalize_throw_args(w_type: PyObjectRef, w_val: PyObjectRef) -> Result<PyError, PyError> {
     unsafe {
         // If w_type is an exception instance, use it directly
         if !w_type.is_null() && pyre_object::interp_exceptions::is_exception(w_type) {
-            return PyError::from_exc_object(w_type);
+            return Ok(PyError::from_exc_object(w_type));
         }
 
-        // If w_type is a type (class), try to create exception from it
-        if !w_type.is_null() && pyre_object::is_type(w_type) {
-            let type_name = pyre_object::w_type_get_name(w_type);
-            if let Some(kind) = pyre_object::interp_exceptions::exc_kind_from_name(type_name) {
-                let msg = if w_val.is_null() || pyre_object::is_none(w_val) {
-                    String::new()
-                } else if pyre_object::is_str(w_val) {
-                    pyre_object::w_str_get_value(w_val).to_string()
-                } else {
-                    String::new()
-                };
-                return PyError::new(PyError::kind_from_exc(kind), msg);
+        // generator.py throw(): a valid exception class is called to make
+        // the exception instance, including user-defined subclasses.
+        if !w_type.is_null() && exception_is_valid_obj_as_class_w(w_type) {
+            let w_exc = if w_val.is_null() || pyre_object::is_none(w_val) {
+                crate::call::call_function_impl_result(w_type, &[])?
+            } else {
+                crate::call::call_function_impl_result(w_type, &[w_val])?
+            };
+            if pyre_object::interp_exceptions::is_exception(w_exc) {
+                return Ok(PyError::from_exc_object(w_exc));
             }
         }
 
         // Fallback: TypeError
-        PyError::type_error("exceptions must be classes or instances deriving from BaseException")
+        Err(PyError::type_error(
+            "exceptions must be classes or instances deriving from BaseException",
+        ))
     }
 }
 

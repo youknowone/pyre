@@ -1636,6 +1636,7 @@ fn reverse_dunder(dunder: &str) -> Option<&'static str> {
         "__truediv__" => "__rtruediv__",
         "__floordiv__" => "__rfloordiv__",
         "__mod__" => "__rmod__",
+        "__matmul__" => "__rmatmul__",
         "__pow__" => "__rpow__",
         "__lshift__" => "__rlshift__",
         "__rshift__" => "__rrshift__",
@@ -1936,6 +1937,21 @@ pub fn add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         Err(PyError::type_error(format!(
             "unsupported operand type(s) for +: '{}' and '{}'",
             a_name, b_name,
+        )))
+    }
+}
+
+pub fn matmul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    let a = unwrap_cell(a);
+    let b = unwrap_cell(b);
+    unsafe {
+        if let Some(result) = try_dispatch_binary_special(a, b, "__matmul__", "__rmatmul__")? {
+            return Ok(result);
+        }
+        let a_name = (*ll_type(a)).name;
+        let b_name = (*ll_type(b)).name;
+        Err(PyError::type_error(format!(
+            "unsupported operand type(s) for @: '{a_name}' and '{b_name}'"
         )))
     }
 }

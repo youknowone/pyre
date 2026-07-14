@@ -458,7 +458,8 @@ pub fn binary_op_tag(op: BinaryOperator) -> Option<i64> {
         BinaryOperator::InplaceAnd => 22,
         BinaryOperator::InplaceOr => 23,
         BinaryOperator::InplaceXor => 24,
-        _ => return None,
+        BinaryOperator::MatrixMultiply => 25,
+        BinaryOperator::InplaceMatrixMultiply => 26,
     })
 }
 
@@ -492,6 +493,8 @@ pub fn binary_op_from_tag(tag: i64) -> Option<BinaryOperator> {
         22 => BinaryOperator::InplaceAnd,
         23 => BinaryOperator::InplaceOr,
         24 => BinaryOperator::InplaceXor,
+        25 => BinaryOperator::MatrixMultiply,
+        26 => BinaryOperator::InplaceMatrixMultiply,
         _ => return None,
     })
 }

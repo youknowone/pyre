@@ -94,7 +94,7 @@ fn op_compare_digest(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
 // Inline closures below preserve the per-name `assert!` checks.
 use crate::baseobjspace::{
     self, CompareOp, add, and_, contains, delitem, floordiv, getitem, invert, is_true, lshift,
-    mod_, mul, neg, or_, pos, pow, rshift, setitem, sub, truediv, xor,
+    matmul, mod_, mul, neg, or_, pos, pow, rshift, setitem, sub, truediv, xor,
 };
 
 crate::py_module! {
@@ -110,6 +110,7 @@ crate::py_module! {
         "add"      / 2 = |args| op_binary(args, "add", add),
         "sub"      / 2 = |args| op_binary(args, "sub", sub),
         "mul"      / 2 = |args| op_binary(args, "mul", mul),
+        "matmul"   / 2 = |args| op_binary(args, "matmul", matmul),
         "truediv"  / 2 = |args| truediv(args[0], args[1]),
         "floordiv" / 2 = |args| floordiv(args[0], args[1]),
         "mod"      / 2 = |args| mod_(args[0], args[1]),
@@ -123,6 +124,7 @@ crate::py_module! {
         "and_"     / 2 = |args| and_(args[0], args[1]),
         "or_"      / 2 = |args| or_(args[0], args[1]),
         "xor"      / 2 = |args| xor(args[0], args[1]),
+        "imatmul"  / 2 = |args| op_binary(args, "imatmul", |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceMatrixMultiply)),
         "not_"     / 1 = |args| Ok(w_bool_from(!is_true(args[0])?)),
         // interp_operator.py:138
         "truth"    / 1 = |args| Ok(w_bool_from(is_true(args[0])?)),
