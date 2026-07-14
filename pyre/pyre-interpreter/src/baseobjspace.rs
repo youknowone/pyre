@@ -3317,12 +3317,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
                     if is_type(t) {
                         // Look in this class's own dict only (not its MRO),
                         // since we are already iterating the full MRO ourselves.
-                        let ns_ptr = w_type_get_dict_ptr(t) as *mut crate::DictStorage;
-                        let found = if !ns_ptr.is_null() {
-                            (*ns_ptr).get(name).copied()
-                        } else {
-                            None
-                        };
+                        let found = crate::type_dict_lookup(t, name);
                         if let Some(attr) = found {
                             // descriptor.py W_Super.getattribute:
                             // Invoke descriptor __get__ protocol.
@@ -4168,9 +4163,7 @@ pub(crate) unsafe fn object_setattr_surrogate(
                     w_type_get_name(obj)
                 )));
             }
-            let dict_ptr = w_type_get_dict_ptr(obj) as *mut crate::DictStorage;
-            if !dict_ptr.is_null() {
-                crate::dict_storage_store_wtf8(&mut *dict_ptr, name, value);
+            if crate::type_dict_store_wtf8(obj, name, value) {
                 pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
                 mutated(obj, name.as_str().ok());
                 return Ok(w_none());
@@ -4252,8 +4245,7 @@ pub(crate) unsafe fn object_delattr_surrogate(
                     w_type_get_name(obj)
                 )));
             }
-            let dict_ptr = w_type_get_dict_ptr(obj) as *mut crate::DictStorage;
-            if !dict_ptr.is_null() && crate::dict_storage_delete_wtf8(&mut *dict_ptr, name) {
+            if crate::type_dict_delete_wtf8(obj, name) {
                 // A lone surrogate has no `&str` form, so `mutated` falls
                 // back to the conservative whole-cache reset (correct: a
                 // surrogate can never name `__eq__`/`__hash__`).
@@ -5801,22 +5793,13 @@ pub unsafe fn compares_by_identity(w_type: PyObjectRef) -> bool {
         if *cls == object_type {
             break;
         }
-        let ns_ptr = pyre_object::typeobject::w_type_get_dict_ptr(*cls) as *mut crate::DictStorage;
-        if ns_ptr.is_null() {
-            continue;
+        if crate::type_dict_lookup(*cls, "__eq__").is_some() {
+            compares_by_identity = false;
+            break;
         }
-        let ns = &*ns_ptr;
-        if let Some(&v) = ns.get("__eq__") {
-            if !v.is_null() {
-                compares_by_identity = false;
-                break;
-            }
-        }
-        if let Some(&v) = ns.get("__hash__") {
-            if !v.is_null() {
-                compares_by_identity = false;
-                break;
-            }
+        if crate::type_dict_lookup(*cls, "__hash__").is_some() {
+            compares_by_identity = false;
+            break;
         }
     }
     let result = if compares_by_identity {
@@ -5915,14 +5898,8 @@ pub(crate) unsafe fn lookup_where(
         if (*cls).is_null() || !is_type(*cls) {
             continue;
         }
-        let ns_ptr = w_type_get_dict_ptr(*cls) as *mut crate::DictStorage;
-        if !ns_ptr.is_null() {
-            let ns = &*ns_ptr;
-            if let Some(&value) = ns.get(name) {
-                if !value.is_null() {
-                    return Some((*cls, value));
-                }
-            }
+        if let Some(value) = crate::type_dict_lookup(*cls, name) {
+            return Some((*cls, value));
         }
     }
     None
@@ -6015,14 +5992,8 @@ pub(crate) unsafe fn lookup_in_type_wtf8(w_type: PyObjectRef, name: &Wtf8) -> Op
         if (*cls).is_null() || !is_type(*cls) {
             continue;
         }
-        let ns_ptr = w_type_get_dict_ptr(*cls) as *mut crate::DictStorage;
-        if !ns_ptr.is_null() {
-            let ns = &*ns_ptr;
-            if let Some(&value) = ns.get_wtf8(name) {
-                if !value.is_null() {
-                    return Some(value);
-                }
-            }
+        if let Some(value) = crate::type_dict_lookup_wtf8(*cls, name) {
+            return Some(value);
         }
     }
     None
@@ -7277,8 +7248,7 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
                     w_type_get_name(obj)
                 )));
             }
-            let dict_ptr = w_type_get_dict_ptr(obj) as *mut crate::DictStorage;
-            if !dict_ptr.is_null() {
+            if crate::type_dict_has_storage(obj) {
                 // typeobject.py:1258-1261 descr_set___abstractmethods__ —
                 // evaluate truthiness BEFORE mutating the dict so a raising
                 // `__bool__` leaves the type unchanged (CPython
@@ -7288,7 +7258,7 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
                 } else {
                     None
                 };
-                crate::dict_storage_store(&mut *dict_ptr, name, value);
+                crate::type_dict_store(obj, name, value);
                 pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
                 if let Some(a) = abstract_flag {
                     pyre_object::w_type_set_abstract(obj, a);
@@ -7841,9 +7811,8 @@ pub fn object_delattr(obj: PyObjectRef, name: &str) -> PyResult {
                     w_type_get_name(obj)
                 )));
             }
-            let dict_ptr = w_type_get_dict_ptr(obj) as *mut crate::DictStorage;
-            if !dict_ptr.is_null() {
-                if crate::dict_storage_delete(&mut *dict_ptr, name) {
+            if crate::type_dict_has_storage(obj) {
+                if crate::type_dict_delete(obj, name) {
                     // typeobject.py:1263-1267 descr_del___abstractmethods__.
                     if name == "__abstractmethods__" {
                         pyre_object::w_type_set_abstract(obj, false);
@@ -11288,13 +11257,7 @@ mod tests {
             // closure capture is fine — make_builtin_type runs init eagerly.
         });
         // Stash __bases__ on outer's type dict pointing at the inner instance.
-        crate::dict_storage_store(
-            unsafe {
-                &mut *(pyre_object::w_type_get_dict_ptr(outer_type) as *mut crate::DictStorage)
-            },
-            "__bases__",
-            w_tuple_new(vec![inner]),
-        );
+        crate::type_dict_store(outer_type, "__bases__", w_tuple_new(vec![inner]));
         let outer = pyre_object::objectobject::w_instance_new(outer_type);
         let yes = super::issubclass(outer, inner).expect("issubclass should succeed");
         assert!(yes);

@@ -206,15 +206,7 @@ fn structseq_setattr(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let attr = unsafe { pyre_object::w_str_get_value(attr_obj) };
     let cls = unsafe { (*inst).w_class };
     // `attr not in type(self).__dict__` — own-dict membership, not MRO.
-    let in_type_dict = {
-        let dict_ptr = unsafe { pyre_object::typeobject::w_type_get_dict_ptr(cls) }
-            as *const crate::DictStorage;
-        if dict_ptr.is_null() {
-            false
-        } else {
-            crate::dict_storage_get(unsafe { &*dict_ptr }, &attr).is_some()
-        }
-    };
+    let in_type_dict = crate::type_dict_contains(cls, &attr);
     if !in_type_dict {
         let cls_name = unsafe { pyre_object::w_type_get_name(cls) };
         return Err(PyError::attribute_error(format!(

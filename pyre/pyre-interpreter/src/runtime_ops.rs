@@ -1047,6 +1047,65 @@ pub fn dict_storage_delete_wtf8(namespace: &mut DictStorage, name: &Wtf8) -> boo
     namespace.remove_wtf8(name).is_some()
 }
 
+fn type_dict_storage_ptr(cls: PyObjectRef) -> *mut DictStorage {
+    unsafe { pyre_object::w_type_get_dict_ptr(cls) as *mut DictStorage }
+}
+
+pub fn type_dict_has_storage(cls: PyObjectRef) -> bool {
+    !type_dict_storage_ptr(cls).is_null()
+}
+
+pub fn type_dict_lookup(cls: PyObjectRef, name: &str) -> Option<PyObjectRef> {
+    let namespace = type_dict_storage_ptr(cls);
+    if namespace.is_null() {
+        return None;
+    }
+    let value = unsafe { (*namespace).get(name).copied()? };
+    if value.is_null() { None } else { Some(value) }
+}
+
+pub fn type_dict_lookup_wtf8(cls: PyObjectRef, name: &Wtf8) -> Option<PyObjectRef> {
+    let namespace = type_dict_storage_ptr(cls);
+    if namespace.is_null() {
+        return None;
+    }
+    let value = unsafe { (*namespace).get_wtf8(name).copied()? };
+    if value.is_null() { None } else { Some(value) }
+}
+
+pub fn type_dict_contains(cls: PyObjectRef, name: &str) -> bool {
+    let namespace = type_dict_storage_ptr(cls);
+    !namespace.is_null() && unsafe { (*namespace).get(name).is_some() }
+}
+
+pub fn type_dict_store(cls: PyObjectRef, name: &str, value: PyObjectRef) -> bool {
+    let namespace = type_dict_storage_ptr(cls);
+    if namespace.is_null() {
+        return false;
+    }
+    unsafe { dict_storage_store(&mut *namespace, name, value) };
+    true
+}
+
+pub fn type_dict_store_wtf8(cls: PyObjectRef, name: &Wtf8, value: PyObjectRef) -> bool {
+    let namespace = type_dict_storage_ptr(cls);
+    if namespace.is_null() {
+        return false;
+    }
+    unsafe { dict_storage_store_wtf8(&mut *namespace, name, value) };
+    true
+}
+
+pub fn type_dict_delete(cls: PyObjectRef, name: &str) -> bool {
+    let namespace = type_dict_storage_ptr(cls);
+    !namespace.is_null() && unsafe { dict_storage_delete(&mut *namespace, name) }
+}
+
+pub fn type_dict_delete_wtf8(cls: PyObjectRef, name: &Wtf8) -> bool {
+    let namespace = type_dict_storage_ptr(cls);
+    !namespace.is_null() && unsafe { dict_storage_delete_wtf8(&mut *namespace, name) }
+}
+
 pub fn sequence_len(seq: PyObjectRef) -> Result<usize, PyError> {
     unsafe {
         if is_tuple(seq) {

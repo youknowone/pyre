@@ -5779,14 +5779,12 @@ fn patch_getset_descriptor_metadata() {
     if tp.is_null() {
         return;
     }
-    let dict_ptr = unsafe { pyre_object::w_type_get_dict_ptr(tp) } as *mut DictStorage;
-    if dict_ptr.is_null() {
+    if !crate::type_dict_has_storage(tp) {
         return;
     }
-    let ns = unsafe { &mut *dict_ptr };
     // typedef.py:470 __name__
-    dict_storage_store(
-        ns,
+    crate::type_dict_store(
+        tp,
         "__name__",
         make_getset_descriptor(make_builtin_function_with_arity(
             "__name__",
@@ -5822,8 +5820,8 @@ fn patch_getset_descriptor_metadata() {
     //     qualname = "%s.%s" % (type_qualname, self.name)
     //     return space.newtext(qualname)
     // ```
-    dict_storage_store(
-        ns,
+    crate::type_dict_store(
+        tp,
         "__qualname__",
         make_getset_descriptor(make_builtin_function_with_arity(
             "__qualname__",
@@ -5892,8 +5890,8 @@ fn patch_getset_descriptor_metadata() {
     //     raise oefmt(space.w_AttributeError,
     //                 "generic self has no __objclass__")
     // ```
-    dict_storage_store(
-        ns,
+    crate::type_dict_store(
+        tp,
         "__objclass__",
         make_getset_descriptor(make_builtin_function_with_arity(
             "__objclass__",
@@ -5922,8 +5920,8 @@ fn patch_getset_descriptor_metadata() {
         )),
     );
     // typedef.py:473 __doc__ = interp_attrproperty('doc', ...)
-    dict_storage_store(
-        ns,
+    crate::type_dict_store(
+        tp,
         "__doc__",
         make_getset_descriptor(make_builtin_function_with_arity(
             "__doc__",
@@ -6227,10 +6225,7 @@ fn init_type_type(ns: &mut DictStorage) {
             let value = args[2];
             unsafe {
                 if pyre_object::is_type(cls) {
-                    let dict_ptr = pyre_object::w_type_get_dict_ptr(cls) as *mut crate::DictStorage;
-                    if !dict_ptr.is_null() {
-                        crate::dict_storage_store(&mut *dict_ptr, "__module__", value);
-                    }
+                    crate::type_dict_store(cls, "__module__", value);
                 }
             }
             Ok(pyre_object::w_none())
@@ -6947,13 +6942,11 @@ fn patch_builtin_function_descriptors() {
     if bf_type.is_null() {
         return;
     }
-    let dict_ptr = unsafe { pyre_object::w_type_get_dict_ptr(bf_type) } as *mut DictStorage;
-    if dict_ptr.is_null() {
+    if !crate::type_dict_has_storage(bf_type) {
         return;
     }
-    let ns = unsafe { &*dict_ptr };
     for name in ["__self__", "__doc__"] {
-        if let Some(&descr) = ns.get(name) {
+        if let Some(descr) = crate::type_dict_lookup(bf_type, name) {
             if unsafe { pyre_object::typedef::is_getset_property(descr) } {
                 // typedef.py:818 `cls=BuiltinFunction` — patch the
                 // `reqcls` slot in place now that the BuiltinFunction

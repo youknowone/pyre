@@ -3926,7 +3926,6 @@ pub unsafe fn create_all_slots(
             newslotnames.sort();
 
             // typeobject.py:1183-1189: create_slot loop
-            let type_ns = pyre_object::w_type_get_dict_ptr(w_type) as *mut crate::DictStorage;
             let type_name = pyre_object::w_type_get_name(w_type);
             let mut slot_index = base_nslots;
             let mut i = 0;
@@ -3939,15 +3938,15 @@ pub unsafe fn create_all_slots(
                 }
                 // typeobject.py:1211: slot_name = mangle(slot_name, w_self.name)
                 let mangled = mangle(&newslotnames[i], type_name);
-                if !type_ns.is_null() && (*type_ns).get(mangled.as_str()).is_some() {
+                if crate::type_dict_contains(w_type, mangled.as_str()) {
                     // typeobject.py:1219-1220: name conflict → skip this slot
                     newslotnames.remove(i);
                 } else {
                     // typeobject.py:1216-1217: create_slot
                     newslotnames[i] = mangled.clone();
-                    if !type_ns.is_null() {
+                    if crate::type_dict_has_storage(w_type) {
                         let member = pyre_object::w_member_new(slot_index, mangled.clone(), w_type);
-                        (*type_ns).insert(mangled, member);
+                        crate::type_dict_store(w_type, &mangled, member);
                     }
                     slot_index += 1;
                     i += 1;
@@ -4014,9 +4013,8 @@ unsafe fn create_dict_slot(w_type: pyre_object::PyObjectRef) {
         if !pyre_object::w_type_get_hasdict(w_type) {
             let descr =
                 crate::typedef::copy_descriptor_for_type(crate::typedef::dict_descr(), w_type);
-            let type_ns = pyre_object::w_type_get_dict_ptr(w_type) as *mut crate::DictStorage;
-            if !type_ns.is_null() && (*type_ns).get("__dict__").is_none() {
-                (*type_ns).insert("__dict__".to_string(), descr);
+            if !crate::type_dict_contains(w_type, "__dict__") {
+                crate::type_dict_store(w_type, "__dict__", descr);
             }
             pyre_object::w_type_set_hasdict(w_type, true);
         }
@@ -4037,9 +4035,8 @@ unsafe fn create_weakref_slot(w_type: pyre_object::PyObjectRef) {
         if !pyre_object::w_type_get_weakrefable(w_type) {
             let descr =
                 crate::typedef::copy_descriptor_for_type(crate::typedef::weakref_descr(), w_type);
-            let type_ns = pyre_object::w_type_get_dict_ptr(w_type) as *mut crate::DictStorage;
-            if !type_ns.is_null() && (*type_ns).get("__weakref__").is_none() {
-                (*type_ns).insert("__weakref__".to_string(), descr);
+            if !crate::type_dict_contains(w_type, "__weakref__") {
+                crate::type_dict_store(w_type, "__weakref__", descr);
             }
             pyre_object::w_type_set_weakrefable(w_type, true);
         }
