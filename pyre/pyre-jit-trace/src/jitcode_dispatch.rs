@@ -13998,6 +13998,32 @@ fn try_walker_call_assembler_self_recursive(
     // get_list_of_active_boxes).
     write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, ca_result)?;
 
+    // The CALL_ASSEMBLER fold records both post-call guards before the walk
+    // reaches the next Python-opcode boundary, so advance the caller's stack
+    // mirror here.  Keep any operands below the call, discard the callable,
+    // NULL marker, and arguments, then put the assembler result on the new
+    // TOS.  The register writeback above already carries the same result, but
+    // guard snapshotting sources operand-stack slots from this mirror.
+    if ctx.vstack_valid {
+        let caller_jitcode = unsafe { &*sym.jitcode };
+        let caller_code = unsafe { &*caller_jitcode.payload.code_ptr };
+        let call_py_pc = python_pc_for_jitcode_pc(&caller_jitcode.payload.metadata, op.pc) as usize;
+        let resume_py_pc = crate::pyjitpl::semantic_fallthrough_pc(caller_code, call_py_pc) as u32;
+        let resume_depth = crate::liveness::liveness_for(caller_jitcode.payload.code_ptr)
+            .depth_at_py_pc()
+            .get(resume_py_pc as usize)
+            .copied()
+            .unwrap_or(0) as usize;
+        ctx.vstack_boxes.truncate(resume_depth);
+        ctx.vstack_boxes.resize(resume_depth, OpRef::NONE);
+        if resume_depth > 0 {
+            ctx.vstack_boxes[resume_depth - 1] = ca_result;
+        }
+        ctx.vstack_cur_pypc = resume_py_pc;
+        ctx.vstack_depth = resume_depth;
+        ctx.vstack_last_ref = OpRef::NONE;
+    }
+
     // pyjitpl.py:2079: GUARD_NOT_FORCED + resume snapshot advanced past
     // the call (`capture_resumedata(after_residual_call=True)`).
     ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);

@@ -2890,6 +2890,15 @@ fn jit_ca_handle_guard_failure(
         return false;
     };
 
+    // This callback has no channel for the exception value carried by a
+    // failing CALL_ASSEMBLER exception guard.  Compiling from its post-call
+    // resume state would treat the null call result as a normal operand.
+    // Leave exception-guard recovery to the blackhole path, which owns the
+    // callee exception and propagates it through the caller frames.
+    if descr_arc.is_guard_exc() {
+        return false;
+    }
+
     // compile.py:738-784 must_compile: jitcounter.tick(guard_hash, increment)
     let (must_compile, owning_key) = {
         let (driver, _) = crate::eval::driver_pair();

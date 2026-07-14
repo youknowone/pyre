@@ -11338,12 +11338,9 @@ impl CraneliftBackend {
                         builder.switch_to_block(helper_block);
                         builder.seal_block(helper_block);
                         builder.set_cold_block(helper_block);
-                        // `call_assembler_guard_failure_inner` follows
-                        // RPython handle_fail via faildescr/resumedata and
-                        // does not consume the old vloc/frame_ptr argument.
-                        // Keep the argument slot for ABI parity without
-                        // loading the callee frame on the normal finish path.
-                        let frame_ptr = builder.ins().iconst(cl_types::I64, 0);
+                        // The helper reads the saved exception from the
+                        // returned callee JitFrame before blackhole resume.
+                        let frame_ptr = ptr_arg_as_i64(&mut builder, result_jf, ptr_type);
                         // CALL_ASSEMBLER helper can compile/execute bridges
                         // and allocate. Treat it as a collecting call for
                         // the caller frame, matching the pending-gcmap
