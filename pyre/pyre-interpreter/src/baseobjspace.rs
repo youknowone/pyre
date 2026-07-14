@@ -1268,14 +1268,22 @@ fn index_type_error(descr: &str, index: PyObjectRef) -> PyError {
 unsafe fn getitem_list(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     if is_slice(index) {
         let len = w_list_len(obj) as i64;
-        let (start, stop, step) = normalize_slice(index, len)?;
+        let (rs, rp, st) = crate::sliceobject::slice_unpack(
+            w_slice_get_start(index),
+            w_slice_get_stop(index),
+            w_slice_get_step(index),
+        )?;
+        let (start, _stop, step, slicelength) =
+            crate::sliceobject::slice_adjust_indices(rs, rp, st, len);
         let mut items = Vec::new();
         let mut i = start;
-        while (step > 0 && i < stop) || (step < 0 && i > stop) {
+        for n in 0..slicelength {
             if let Some(v) = w_list_getitem(obj, i) {
                 items.push(v);
             }
-            i += step;
+            if n + 1 < slicelength {
+                i += step;
+            }
         }
         return Ok(w_list_new(items));
     }
@@ -1323,14 +1331,22 @@ unsafe fn getitem_tuple(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     if is_slice(index) {
         // tupleobject.py descr_getslice → slice.indices.
         let len = w_tuple_len(obj) as i64;
-        let (start, stop, step) = normalize_slice(index, len)?;
+        let (rs, rp, st) = crate::sliceobject::slice_unpack(
+            w_slice_get_start(index),
+            w_slice_get_stop(index),
+            w_slice_get_step(index),
+        )?;
+        let (start, _stop, step, slicelength) =
+            crate::sliceobject::slice_adjust_indices(rs, rp, st, len);
         let mut items = Vec::new();
         let mut i = start;
-        while (step > 0 && i < stop) || (step < 0 && i > stop) {
+        for n in 0..slicelength {
             if let Some(v) = w_tuple_getitem(obj, i) {
                 items.push(v);
             }
-            i += step;
+            if n + 1 < slicelength {
+                i += step;
+            }
         }
         return Ok(w_tuple_new(items));
     }
@@ -1377,17 +1393,25 @@ unsafe fn getitem_str(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     if is_slice(index) {
         // `pypy/objspace/std/unicodeobject.py W_UnicodeObject._getitem_slice`
         // → `slice.indices(len)` (`pypy/objspace/std/sliceobject.py`).
-        // Reuse the shared `normalize_slice` helper so negative-step
-        // defaults (`s[::-1]`, `s[5::-1]`) match list/tuple semantics.
+        // Use the shared adjusted slice count so very large steps do not
+        // overflow the index loop.
         let len = cps.len() as i64;
-        let (start, stop, step) = normalize_slice(index, len)?;
+        let (rs, rp, st) = crate::sliceobject::slice_unpack(
+            w_slice_get_start(index),
+            w_slice_get_stop(index),
+            w_slice_get_step(index),
+        )?;
+        let (start, _stop, step, slicelength) =
+            crate::sliceobject::slice_adjust_indices(rs, rp, st, len);
         let mut result = Wtf8Buf::new();
         let mut i = start;
-        while (step > 0 && i < stop) || (step < 0 && i > stop) {
+        for n in 0..slicelength {
             if i >= 0 && (i as usize) < cps.len() {
                 result.push(cps[i as usize]);
             }
-            i += step;
+            if n + 1 < slicelength {
+                i += step;
+            }
         }
         return Ok(w_str_from_wtf8(result));
     }

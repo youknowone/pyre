@@ -541,16 +541,12 @@ unsafe fn memoryview_slice_view(
             0
         };
         let (start, stop, step) = crate::baseobjspace::normalize_slice(index, count)?;
-        let slicelength = if step > 0 {
-            if stop > start {
-                (stop - start + step - 1) / step
-            } else {
-                0
-            }
-        } else if start > stop {
-            (start - stop - step - 1) / -step
-        } else {
+        let slicelength = if (step < 0 && stop >= start) || (step > 0 && start >= stop) {
             0
+        } else if step < 0 {
+            (stop - start + 1) / step + 1
+        } else {
+            (stop - start - 1) / step + 1
         };
         Ok(w_memoryview_new_derived(mv, |v| unsafe {
             v.new_slice(start, step, slicelength)
