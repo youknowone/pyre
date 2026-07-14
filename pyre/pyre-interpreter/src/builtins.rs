@@ -7724,13 +7724,15 @@ fn builtin_any(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             args.len()
         )));
     }
-    let items = collect_iterable(args[0])?;
-    for item in items {
-        if crate::baseobjspace::is_true(item)? {
-            return Ok(w_bool_from(true));
+    let it = crate::baseobjspace::iter(args[0])?;
+    loop {
+        match crate::baseobjspace::next(it) {
+            Ok(item) if crate::baseobjspace::is_true(item)? => return Ok(w_bool_from(true)),
+            Ok(_) => {}
+            Err(e) if e.kind == crate::PyErrorKind::StopIteration => return Ok(w_bool_from(false)),
+            Err(e) => return Err(e),
         }
     }
-    Ok(w_bool_from(false))
 }
 
 /// `all(iterable)` — PyPy: operation.py all
@@ -9002,13 +9004,15 @@ fn builtin_all(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             args.len()
         )));
     }
-    let items = collect_iterable(args[0])?;
-    for item in items {
-        if !crate::baseobjspace::is_true(item)? {
-            return Ok(w_bool_from(false));
+    let it = crate::baseobjspace::iter(args[0])?;
+    loop {
+        match crate::baseobjspace::next(it) {
+            Ok(item) if !crate::baseobjspace::is_true(item)? => return Ok(w_bool_from(false)),
+            Ok(_) => {}
+            Err(e) if e.kind == crate::PyErrorKind::StopIteration => return Ok(w_bool_from(true)),
+            Err(e) => return Err(e),
         }
     }
-    Ok(w_bool_from(true))
 }
 
 /// `sum(sequence, start=0)` — PyPy `__builtin__/app_functional.py sum`.
