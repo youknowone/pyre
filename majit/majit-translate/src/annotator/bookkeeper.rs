@@ -1687,6 +1687,50 @@ impl Bookkeeper {
         self.classdefs.borrow().clone()
     }
 
+    /// Redirect a bare-leaf `root` whose field alias was withdrawn by
+    /// `harden_duplicate_leaf_metadata` (a cross-namespace leaf collision —
+    /// e.g. a struct leaf colliding with an enum variant of the same name) to
+    /// the unique surviving *qualified* struct key that carries that leaf.
+    /// A withdrawn bare leaf has no `fields` entry, so `project_struct_rows`
+    /// finds nothing and the classdef stays attrs-empty (every field getattr
+    /// on the cast result then blocks). The qualified key survives hardening
+    /// (only the bare alias is removed), so resolving through it projects the
+    /// struct's rows. Returns `None` — leaving the current bare-leaf behaviour
+    /// — unless there is exactly one surviving non-enum-variant qualified key
+    /// with this leaf: a genuinely ambiguous leaf (>=2 real struct keys) stays
+    /// unresolved, and an unwithdrawn leaf is untouched.
+    fn redirect_withdrawn_struct_leaf(self: &Rc<Self>, root: &str) -> Option<String> {
+        // Only a bare leaf can be a withdrawal victim; a qualified or
+        // per-instantiation spelling already survives hardening.
+        if root.contains("::") || root.contains('<') {
+            return None;
+        }
+        let guard = self.pyre_struct_fields.borrow();
+        let reg = guard.as_ref()?;
+        if reg.fields.contains_key(root) {
+            return None;
+        }
+        let mut hit: Option<&String> = None;
+        for k in reg.fields.keys() {
+            let Some((head, leaf)) = k.rsplit_once("::") else {
+                continue;
+            };
+            if leaf != root {
+                continue;
+            }
+            // An `{Enum}::{Variant}` key's tail is a variant name, not a
+            // struct leaf — the enum base carries the `__discriminant` row.
+            if reg.is_enum_base(head) {
+                continue;
+            }
+            if hit.is_some() {
+                return None;
+            }
+            hit = Some(k);
+        }
+        hit.cloned()
+    }
+
     /// Resolve a struct type-root name to its canonical, bookkeeper-
     /// REGISTERED `ClassDef`, with instance attributes projected from
     /// the threaded `StructFieldRegistry`.
@@ -1726,6 +1770,8 @@ impl Bookkeeper {
         self: &Rc<Self>,
         root: &str,
     ) -> Result<Rc<RefCell<ClassDef>>, AnnotatorError> {
+        let redirected = self.redirect_withdrawn_struct_leaf(root);
+        let root: &str = redirected.as_deref().unwrap_or(root);
         // Pass 1 — traverse the registry's struct-field graph from `root`,
         // registering an identity-keyed `ClassDef` in `descs` for every
         // reachable struct (via `intern_class_by_qualname` ->
