@@ -1096,6 +1096,11 @@ pub struct BhSizeSpec {
     /// emitting its guard (default `true`).
     #[serde(default = "bh_gc_managed_default")]
     pub is_gc_managed: bool,
+    /// True when `NEW` for this descr should use the headerless nursery
+    /// allocation opcode.  Default false for older serialized specs and
+    /// analyzer paths that describe ordinary GC-headered structs.
+    #[serde(default)]
+    pub headerless: bool,
     pub all_fielddescrs: Vec<BhFieldSpec>,
 }
 

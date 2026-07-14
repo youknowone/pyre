@@ -1028,13 +1028,9 @@ impl LowererConfig {
             force_at_guard_fields: force_at_guard
                 .iter()
                 .map(|entry| {
-                    let struct_name = entry
-                        .struct_type
-                        .segments
-                        .last()
-                        .map(|s| s.ident.to_string())
-                        .unwrap_or_default();
-                    format!("{}::{}", struct_name, entry.field)
+                    let mut key = canonical_path_segments(&entry.struct_type);
+                    key.push(entry.field.to_string());
+                    key.join("::")
                 })
                 .collect(),
             pool_arrays: pool_arrays
@@ -1078,13 +1074,9 @@ impl LowererConfig {
         struct_path: &syn::Path,
         field_name: &str,
     ) -> bool {
-        let struct_name = struct_path
-            .segments
-            .last()
-            .map(|s| s.ident.to_string())
-            .unwrap_or_default();
-        self.force_at_guard_fields
-            .contains(&format!("{}::{}", struct_name, field_name))
+        let mut key = canonical_path_segments(struct_path);
+        key.push(field_name.to_string());
+        self.force_at_guard_fields.contains(&key.join("::"))
     }
 }
 

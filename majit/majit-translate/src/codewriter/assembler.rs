@@ -3032,6 +3032,7 @@ fn bh_size_spec_from_callcontrol(
         // header-less gate is driven by the runtime
         // `register_struct_layout` path.
         is_gc_managed: true,
+        headerless: false,
         // `descr.py:105-127 get_size_descr` keys `_cache_size[STRUCT]` on
         // the lltype STRUCT object identity.  Pyre's analogue is
         // `path_hash(owner)` per `majit_ir::descr::path_hash` doc
@@ -3380,6 +3381,7 @@ fn bh_size_spec_from_descr(sd: &dyn majit_ir::descr::SizeDescr) -> crate::jitcod
         // struct stays raw through the inverse path (it must not regain
         // a spurious `GUARD_GC_TYPE`).
         is_gc_managed: sd.is_gc_managed(),
+        headerless: sd.headerless(),
         all_fielddescrs: sd
             .all_fielddescrs()
             .iter()
@@ -3407,6 +3409,7 @@ pub(crate) fn bh_interior_field_specs_from_array_descr(
                     type_id: 0,
                     vtable: 0,
                     is_gc_managed: true,
+                    headerless: false,
                     all_fielddescrs: vec![field.clone()],
                 });
             Some(crate::jitcode::BhInteriorFieldSpec {

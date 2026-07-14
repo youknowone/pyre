@@ -1011,6 +1011,11 @@ impl GcRewriterImpl {
 
         if descr.headerless() {
             let size = round_up(descr.size());
+            debug_assert!(
+                self.can_use_nursery(size),
+                "headerless NEW currently has only a nursery allocation path; \
+                 headerless structs must remain fixed-size and nursery-eligible"
+            );
             let result_pos = op.pos.get();
             st.emitting_an_operation_that_can_collect();
             let size_ref = st.const_int(size as i64);

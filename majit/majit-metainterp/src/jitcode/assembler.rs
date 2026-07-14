@@ -473,8 +473,13 @@ impl JitCodeBuilder {
         self.touch_ref_reg(dest);
         // descr.py:108-120 get_size_descr + init_size_descr: cache the
         // full per-struct layout so the matching setfield_gc_* resolves
-        // the parent SizeDescr and field index (descr.py:238).  A JIT
-        // `new` allocates a GC-headered struct, so `is_gc_managed = true`.
+        // the parent SizeDescr and field index (descr.py:238).  Even a
+        // headerless JIT `new` keeps `is_gc_managed = true`: the result
+        // ref is still rooted by the reg/frame gcmap walk and collector
+        // traced.  It just carries no GcHeader, so it must never be
+        // subject to GUARD_GC_TYPE (which reads at `ref - GcHeader::SIZE`).
+        // Headerless is only used for monomorphic structs that are never
+        // type-guarded.
         self.register_struct_layout(size, type_id, true, headerless, fields);
         let all_fielddescrs = self
             .struct_size_specs
@@ -556,6 +561,7 @@ impl JitCodeBuilder {
                     type_id,
                     vtable: 0,
                     is_gc_managed,
+                    headerless,
                     all_fielddescrs: new_fields,
                 },
             );
