@@ -867,6 +867,16 @@ fn inject_root_call_result(sym: &mut PyreSym, root_pc: usize, result: majit_ir::
     }
     let jitcode_index = unsafe { (*sym.jitcode).index as i32 };
     let root_py_pc = crate::state::backxlat_py_pc(jitcode_index, root_pc as i32) as usize;
+    if crate::jitcode_dispatch::result_color_audit_enabled() {
+        let payload = unsafe { &(*sym.jitcode).payload };
+        let py_pc =
+            crate::jitcode_dispatch::python_pc_for_jitcode_pc(&payload.metadata, root_pc) as usize;
+        assert_eq!(
+            payload.result_color_for_jitcode_pc_pred(root_pc),
+            payload.metadata.result_color_at_pc.get(py_pc).copied(),
+            "result_color_by_jit_pc diverges from result_color_at_pc at jit_pc={root_pc}"
+        );
+    }
     let Some(result_color) = crate::state::result_color_at_pc_at(jitcode_index, root_py_pc) else {
         return false;
     };

@@ -2857,6 +2857,15 @@ fn compute_bridge_root_parent_frame(
         .clone()
         .unwrap_or_else(|| root_sym.registers_r.clone());
     let root_py_pc = crate::state::backxlat_py_pc(jitcode_index as i32, root_pc as i32) as usize;
+    if result_color_audit_enabled() {
+        let payload = unsafe { &(*root_sym.jitcode).payload };
+        let py_pc = python_pc_for_jitcode_pc(&payload.metadata, root_pc) as usize;
+        assert_eq!(
+            payload.result_color_for_jitcode_pc_pred(root_pc),
+            payload.metadata.result_color_at_pc.get(py_pc).copied(),
+            "result_color_by_jit_pc diverges from result_color_at_pc at jit_pc={root_pc}"
+        );
+    }
     if let Some(result_color) =
         crate::state::result_color_at_pc_at(jitcode_index as i32, root_py_pc)
     {
@@ -10508,6 +10517,15 @@ pub(crate) fn bridge_audit_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_BRIDGE_AUDIT").is_some())
 }
 
+/// `PYRE_PCMAP_RESULT_AUDIT` enables assertions that the audit-only
+/// `result_color_by_jit_pc` twin reproduces `result_color_at_pc` at seams
+/// already carrying a genuine JitCode byte offset. Diagnostic only; off in
+/// production while #73 retains the py_pc-keyed reader.
+pub(crate) fn result_color_audit_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_RESULT_AUDIT").is_some())
+}
+
 /// `PYRE_M73_PEROP_CARRY` (#73 S2, default ON): source a specialization
 /// guard's (`GuardValue`/`GuardClass`) resume coordinate from the walk
 /// cursor's per-op `-live-` BEFORE anchor (`ctx.live_before_jit_pc`,
@@ -12650,6 +12668,17 @@ fn compute_inline_caller_frame(
     if depth == 0 {
         return Err(InlineCallerFrameDecline::Unavailable);
     }
+    if result_color_audit_enabled() {
+        if let Some(jit_pc) = resume_marker_jit_pc {
+            let payload = unsafe { &(*caller_sym.jitcode).payload };
+            let py_pc = python_pc_for_jitcode_pc(&payload.metadata, jit_pc) as usize;
+            assert_eq!(
+                payload.result_color_for_jitcode_pc_pred(jit_pc),
+                payload.metadata.result_color_at_pc.get(py_pc).copied(),
+                "result_color_by_jit_pc diverges from result_color_at_pc at jit_pc={jit_pc}"
+            );
+        }
+    }
     let call_stack_overrides = collect_call_stack_overrides(caller_sym, ctx, call_py_pc as usize);
     // #73: the result slot's color comes from the codewriter-precomputed
     // `result_color_at_pc` (top-of-stack color at the return pc), not the flat
@@ -12737,6 +12766,16 @@ fn compute_nested_inline_caller_frame(
     };
     if depth == 0 {
         return Err(InlineCallerFrameDecline::Unavailable);
+    }
+    if result_color_audit_enabled() {
+        if let Some(jit_pc) = resume_marker_jit_pc {
+            let py_pc = python_pc_for_jitcode_pc(&pjc.metadata, jit_pc) as usize;
+            assert_eq!(
+                pjc.result_color_for_jitcode_pc_pred(jit_pc),
+                pjc.metadata.result_color_at_pc.get(py_pc).copied(),
+                "result_color_by_jit_pc diverges from result_color_at_pc at jit_pc={jit_pc}"
+            );
+        }
     }
     // #73: result slot color from the precomputed `result_color_at_pc`, not
     // the flat `stack_slot_color_map` (see `compute_inline_caller_frame`).

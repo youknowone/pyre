@@ -12399,6 +12399,7 @@ mod tests {
                 after_residual_marker_pred_by_jit_pc: Vec::new(),
                 depth_at_py_pc: vec![2],
                 result_color_at_pc: Vec::new(),
+                result_color_by_jit_pc: Vec::new(),
                 portal_frame_reg: 0,
                 portal_ec_reg: 0,
                 built_as_portal: true,
