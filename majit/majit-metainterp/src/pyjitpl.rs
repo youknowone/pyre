@@ -14245,6 +14245,10 @@ impl<M: Clone> MetaInterp<M> {
         &mut self.backend
     }
 
+    pub fn backend_supports_dispatch_key_entry(&self) -> bool {
+        self.backend.supports_dispatch_key_entry()
+    }
+
     /// Register a helper that boxes a raw integer into an interpreter object.
     /// PyPy warmspot.py set_param_max_unroll_recursion().
     pub fn set_max_unroll_recursion(&mut self, value: usize) {

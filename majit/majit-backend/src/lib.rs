@@ -1807,6 +1807,16 @@ pub trait Backend: Send {
         self.execute_token(token, args)
     }
 
+    /// Whether [`Backend::execute_token_with_dispatch_key`] honors non-zero
+    /// dispatch keys as alternate compiled-loop entry points.
+    ///
+    /// Backends that use the default `execute_token_with_dispatch_key`
+    /// implementation enter the ordinary token entry regardless of the key, so
+    /// metainterp direct-LABEL handoffs must stay disabled for them.
+    fn supports_dispatch_key_entry(&self) -> bool {
+        false
+    }
+
     /// Execute compiled code with integer-only arguments.
     ///
     /// Avoids the `Value::Int` wrapping/unwrapping overhead when all

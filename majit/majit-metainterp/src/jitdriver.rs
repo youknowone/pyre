@@ -1553,7 +1553,8 @@ impl<S: JitState> JitDriver<S> {
             return;
         }
         self.meta.single_pass_label_entry_key = self.meta.single_pass_compiled_key.filter(|&key| {
-            self.meta.has_compiled_loop(key)
+            self.meta.backend_supports_dispatch_key_entry()
+                && self.meta.has_compiled_loop(key)
                 && self.meta.loop_header_pc_for(key) != Some(0)
                 && self.meta.front_target_dispatch_key(key).is_some()
         });
@@ -1625,6 +1626,9 @@ impl<S: JitState> JitDriver<S> {
             return None;
         }
         if self.meta.loop_header_pc_for(key) == Some(0) {
+            return None;
+        }
+        if !self.meta.backend_supports_dispatch_key_entry() {
             return None;
         }
         let dispatch_key = self.meta.front_target_dispatch_key(key)?;

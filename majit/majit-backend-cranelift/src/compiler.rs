@@ -16044,6 +16044,10 @@ impl majit_backend::Backend for CraneliftBackend {
         Self::execute_with_inputs_at_dispatch_key(compiled, &inputs, dispatch_key)
     }
 
+    fn supports_dispatch_key_entry(&self) -> bool {
+        true
+    }
+
     fn execute_token_ints(&self, token: &JitCellToken, args: &[i64]) -> DeadFrame {
         let compiled = token
             .compiled
