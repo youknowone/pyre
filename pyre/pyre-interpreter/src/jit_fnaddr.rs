@@ -1022,6 +1022,12 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     );
     push_alias_pair(
         &mut entries,
+        "pyre_object::dict_eq_hook::eq_error_pending",
+        "pyre_object::eq_error_pending",
+        pyre_object::dict_eq_hook::eq_error_pending as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
         "pyre_interpreter::stack_check::stack_almost_full",
         "pyre_interpreter::stack_almost_full",
         crate::stack_check::stack_almost_full as *const (),
@@ -2112,6 +2118,21 @@ pub fn jit_static_int_values() -> Vec<(&'static str, i64)> {
         // overflow clamp. Charon leaves the associated const as a global
         // accessor path, so bake the native signed max value.
         ("core::num::<Impl>::MAX", i64::MAX),
+        // `compares_by_identity_status` tri-state markers, read as opaque
+        // global accessor paths in `mutated` / the `__eq__`/`__hash__`
+        // fast paths. Bake the build-time `u8` values.
+        (
+            "typeobject::COMPARES_BY_IDENTITY_UNKNOWN",
+            pyre_object::typeobject::COMPARES_BY_IDENTITY_UNKNOWN as i64,
+        ),
+        (
+            "typeobject::COMPARES_BY_IDENTITY_YES",
+            pyre_object::typeobject::COMPARES_BY_IDENTITY_YES as i64,
+        ),
+        (
+            "typeobject::COMPARES_BY_IDENTITY_NO",
+            pyre_object::typeobject::COMPARES_BY_IDENTITY_NO as i64,
+        ),
     ]
 }
 

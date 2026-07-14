@@ -138,8 +138,10 @@ pub extern "C" fn take_eq_error() -> bool {
 /// user `__eq__` calls means no extra comparison runs and the FIRST
 /// exception is the one retained — matching `r_dict(space.eq_w, ...)`
 /// which raises at the first comparison (`dictmultiobject.py:1209`).
-#[inline]
-pub(crate) fn eq_error_pending() -> bool {
+/// `dont_look_inside`: thread-local read, residualizes via the
+/// registered fnaddr (the `take_eq_error` twin).
+#[majit_macros::dont_look_inside]
+pub extern "C" fn eq_error_pending() -> bool {
     EQ_W_ERROR.with(|cell| !cell.get().is_null())
 }
 
