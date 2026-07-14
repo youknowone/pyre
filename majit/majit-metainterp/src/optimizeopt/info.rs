@@ -548,22 +548,19 @@ impl PtrInfoExt for PtrInfo {
                 //       short.extend([GUARD_NONNULL[op],
                 //                     GUARD_GC_TYPE[op, c_typeid]])
                 short.push(Op::new(OpCode::GuardNonnull, &[op_b.clone()]));
-                // GUARD_GC_TYPE only for a real `GcStruct`: it reads a
-                // type-id word at `ref - 8` (the GC header).  A header-less
-                // raw native struct (registered via `register_struct_layout`
-                // — e.g. a `ref(T)` state scalar's target, or a `pools[i]`
-                // element loaded by `getarrayitem_gc_r`) has no such word,
-                // so the guard would read content-dependent garbage that
-                // mutates on every push/pop and fail on every loop
-                // re-entry.  RPython emits GUARD_GC_TYPE only for
-                // `lltype.GcStruct`; a raw `Struct` gets GUARD_NONNULL only.
+                // GUARD_GC_TYPE only for a real headered `GcStruct`: it
+                // reads a type-id word at `ref - 8` (the GC header).  A raw
+                // native struct and a headerless nursery allocation both lack
+                // that word, so the guard would read payload bytes and fail
+                // spuriously.  RPython emits GUARD_GC_TYPE only when a header
+                // exists; headerless structs get GUARD_NONNULL only.
                 // No descr → preserve the guard (default true).
-                let is_gc_managed = info
+                let has_gc_type_header = info
                     .descr
                     .as_size_descr()
-                    .map(|sd| sd.is_gc_managed())
+                    .map(|sd| sd.is_gc_managed() && !sd.headerless())
                     .unwrap_or(true);
-                if is_gc_managed {
+                if has_gc_type_header {
                     let type_id = info
                         .descr
                         .as_size_descr()

@@ -2486,7 +2486,6 @@ pub fn ec_sys_exc_value_descr() -> DescrRef {
                 is_quasi_immutable: false,
                 flag: ArrayFlag::Unsigned,
                 virtualizable: false,
-                force_virtual_at_guard: false,
                 index_in_parent: 0,
             }],
         )
@@ -2769,7 +2768,6 @@ mod tests {
                     is_field_signed: false,
                     is_immutable: false,
                     is_quasi_immutable: false,
-                    force_virtual_at_guard: false,
                     index_in_parent: 0,
                 },
                 BhFieldSpec {
@@ -2782,7 +2780,6 @@ mod tests {
                     is_field_signed: true,
                     is_immutable: true,
                     is_quasi_immutable: false,
-                    force_virtual_at_guard: false,
                     index_in_parent: 1,
                 },
             ],
@@ -3000,7 +2997,6 @@ mod tests {
                 is_field_signed: true,
                 is_immutable: false,
                 is_quasi_immutable: false,
-                force_virtual_at_guard: false,
                 index_in_parent: 0,
             },
             BhFieldSpec {
@@ -3013,7 +3009,6 @@ mod tests {
                 is_field_signed: false,
                 is_immutable: false,
                 is_quasi_immutable: false,
-                force_virtual_at_guard: false,
                 index_in_parent: 1,
             },
         ];
@@ -3129,7 +3124,6 @@ fn simple_field_spec_from_bh(
         is_quasi_immutable: spec.is_quasi_immutable,
         flag: spec.field_flag,
         virtualizable: false,
-        force_virtual_at_guard: spec.force_virtual_at_guard,
         index_in_parent: spec.index_in_parent,
     }
 }
@@ -3808,7 +3802,6 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
                 is_field_signed: *is_field_signed,
                 is_immutable: *is_immutable,
                 is_quasi_immutable: *is_quasi_immutable,
-                force_virtual_at_guard: false,
                 index_in_parent: *index_in_parent,
             };
             field_descr_from_bh_field(&field, parent.as_ref())

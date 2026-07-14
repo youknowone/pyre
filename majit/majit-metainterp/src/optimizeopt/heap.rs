@@ -1320,10 +1320,6 @@ impl OptHeap {
             // heap.py:617-618: val = op.getarg(1); if is_virtual(val)
             let is_virtual = ctx.is_virtual(&op.arg(1).get_box_replacement(false));
             if is_virtual {
-                if descr.force_virtual_at_guard() {
-                    self.force_lazy_set_field(&descr, true, ctx);
-                    continue;
-                }
                 // heap.py:618-619: virtual value → pendingfields
                 pendingfields.push(op);
                 continue;

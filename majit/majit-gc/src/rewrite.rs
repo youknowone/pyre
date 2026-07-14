@@ -1016,6 +1016,13 @@ impl GcRewriterImpl {
                 "headerless NEW currently has only a nursery allocation path; \
                  headerless structs must remain fixed-size and nursery-eligible"
             );
+            // Headerless nursery allocations intentionally skip
+            // clear_gc_fields: there is no GC header/tid store, and the fast
+            // path exists for structs whose ref fields are fully initialized by
+            // immediate SETFIELD_GC ops before any can-collect operation.  A
+            // collector must never observe an uninitialized headerless ref
+            // field; keep new headerless users to that invariant instead of
+            // adding per-field zeroing here.
             let result_pos = op.pos.get();
             st.emitting_an_operation_that_can_collect();
             let size_ref = st.const_int(size as i64);

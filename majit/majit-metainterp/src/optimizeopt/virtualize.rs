@@ -3736,7 +3736,6 @@ mod tests {
                 is_quasi_immutable: false,
                 flag: majit_ir::ArrayFlag::Signed,
                 virtualizable: false,
-                force_virtual_at_guard: false,
                 index_in_parent: 0,
             }],
         );
@@ -5377,7 +5376,6 @@ mod tests {
                 is_quasi_immutable: false,
                 flag: majit_ir::ArrayFlag::Unsigned,
                 virtualizable: false,
-                force_virtual_at_guard: false,
                 index_in_parent: 0,
             }],
         );

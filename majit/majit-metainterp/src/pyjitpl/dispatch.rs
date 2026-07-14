@@ -62,7 +62,6 @@ fn field_spec_from_bh(
         is_quasi_immutable: f.is_quasi_immutable,
         flag: f.field_flag,
         virtualizable: false,
-        force_virtual_at_guard: f.force_virtual_at_guard,
         index_in_parent: f.index_in_parent,
     }
 }
@@ -246,7 +245,6 @@ pub fn struct_field_write_effect_info(
                 is_quasi_immutable: false,
                 flag,
                 virtualizable: false,
-                force_virtual_at_guard: false,
                 index_in_parent: idx,
             }
         })

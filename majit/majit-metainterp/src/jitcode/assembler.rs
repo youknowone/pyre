@@ -454,7 +454,7 @@ impl JitCodeBuilder {
     /// Emit `new/d>r` (`blackhole.py:1301 bhimpl_new`): allocate a zeroed
     /// struct of `size` bytes; ref result in `dest`. No vtable write.
     ///
-    /// `fields` is the struct's full `(offset, is_ref, name, force_at_guard)` layout in
+    /// `fields` is the struct's full `(offset, is_ref, name)` layout in
     /// `index_in_parent` order (`descr.py:122-126` `init_size_descr`
     /// populates `SizeDescr.all_fielddescrs` from
     /// `heaptracker.all_fielddescrs(STRUCT)`).  It is recorded into the
@@ -468,7 +468,7 @@ impl JitCodeBuilder {
         size: usize,
         type_id: u64,
         headerless: bool,
-        fields: &[(usize, bool, &str, bool)],
+        fields: &[(usize, bool, &str)],
     ) {
         self.touch_ref_reg(dest);
         // descr.py:108-120 get_size_descr + init_size_descr: cache the
@@ -504,7 +504,7 @@ impl JitCodeBuilder {
         self.push_reg_u8(dest, "new result");
     }
 
-    /// Register a struct's `(offset, is_ref, name, force_at_guard)` layout under `type_id`
+    /// Register a struct's `(offset, is_ref, name)` layout under `type_id`
     /// WITHOUT emitting a `new/d>r` allocation op.  Used for a struct that
     /// is allocated natively (outside the JIT) but whose fields are still
     /// read/written through `getfield_gc_*` / `setfield_gc_*`: the layout
@@ -527,7 +527,7 @@ impl JitCodeBuilder {
         type_id: u64,
         is_gc_managed: bool,
         headerless: bool,
-        fields: &[(usize, bool, &str, bool)],
+        fields: &[(usize, bool, &str)],
     ) {
         let new_fields = Self::field_specs_from_layout(fields);
         // Merge into existing spec if present — each getfield/setfield
@@ -568,7 +568,7 @@ impl JitCodeBuilder {
         }
     }
 
-    /// Build `Vec<BhFieldSpec>` from a `(offset, is_ref, name, force_at_guard)` layout,
+    /// Build `Vec<BhFieldSpec>` from a `(offset, is_ref, name)` layout,
     /// mirroring `descr.py:230-231 FieldDescr(name, offset, size, flag,
     /// index_in_parent, is_pure)` for each field.  Scalar fields are one
     /// machine word (`field_size = 8`); the flag/sign follow the field
@@ -583,13 +583,13 @@ impl JitCodeBuilder {
     /// literal of the same struct an identical, deterministic
     /// `all_fielddescrs` order so the `type_id`-keyed cache is not polluted
     /// and the optimizer's `FieldDescr.n()` indexing stays consistent.
-    fn field_specs_from_layout(fields: &[(usize, bool, &str, bool)]) -> Vec<BhFieldSpec> {
-        let mut ordered: Vec<(usize, bool, &str, bool)> = fields.to_vec();
-        ordered.sort_by_key(|&(offset, _, _, _)| offset);
+    fn field_specs_from_layout(fields: &[(usize, bool, &str)]) -> Vec<BhFieldSpec> {
+        let mut ordered: Vec<(usize, bool, &str)> = fields.to_vec();
+        ordered.sort_by_key(|&(offset, _, _)| offset);
         ordered
             .iter()
             .enumerate()
-            .map(|(idx, &(offset, is_ref, name, force_virtual_at_guard))| {
+            .map(|(idx, &(offset, is_ref, name))| {
                 let (field_type, field_flag, is_field_signed) = if is_ref {
                     (
                         majit_ir::value::Type::Ref,
@@ -616,7 +616,6 @@ impl JitCodeBuilder {
                     is_field_signed,
                     is_immutable: false,
                     is_quasi_immutable: false,
-                    force_virtual_at_guard,
                     index_in_parent: idx,
                 }
             })

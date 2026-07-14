@@ -294,16 +294,11 @@ impl<'c> Lowerer<'c> {
             .iter()
             .map(|(member, value)| {
                 let is_ref = matches!(value.kind, BindingKind::Ref);
-                let force_virtual_at_guard = self.config.map_or(false, |cfg| {
-                    let member_name = canonical_member_name(member);
-                    cfg.force_virtual_at_guard_field(struct_path, &member_name)
-                });
                 quote! {
                     (
                         ::core::mem::offset_of!(#struct_path, #member),
                         #is_ref,
                         stringify!(#member),
-                        #force_virtual_at_guard,
                     )
                 }
             })

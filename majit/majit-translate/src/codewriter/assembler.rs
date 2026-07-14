@@ -2996,7 +2996,6 @@ fn bh_field_spec_from_parts(
         is_field_signed: field_flag == majit_ir::descr::ArrayFlag::Signed,
         is_immutable,
         is_quasi_immutable,
-        force_virtual_at_guard: false,
         index_in_parent,
     }
 }
@@ -3357,7 +3356,6 @@ fn bh_field_spec_from_descr(fd: &dyn majit_ir::descr::FieldDescr) -> crate::jitc
         is_field_signed: fd.is_field_signed(),
         is_immutable: fd.is_immutable(),
         is_quasi_immutable: fd.is_quasi_immutable(),
-        force_virtual_at_guard: fd.force_virtual_at_guard(),
         index_in_parent: fd.index_in_parent(),
     }
 }

@@ -198,8 +198,6 @@ pub struct LowererConfig {
     pub(super) call_returns: HashMap<Vec<String>, syn::Path>,
     /// Struct types whose `New` allocation should carry the headerless bit.
     pub(super) headerless_structs: std::collections::HashSet<Vec<String>>,
-    /// Field keys (`StructLast::field`) whose virtual RHS is guard-forced.
-    pub(super) force_at_guard_fields: std::collections::HashSet<String>,
     /// Pure function → native IR integer binop aliases.  Key = canonical func
     /// path segments, value = IR opcode name (e.g. "IntAdd").  When
     /// `lower_native_int_binop_call` encounters a call whose path matches a
@@ -833,7 +831,6 @@ impl LowererConfig {
         ref_fields: &[crate::jit_interp::RefFieldEntry],
         call_returns: &[(Path, Path)],
         headerless_structs: &[Path],
-        force_at_guard: &[crate::jit_interp::ForceAtGuardEntry],
         native_int_binops: &[(Path, Ident)],
         native_tag_small: &[Path],
         split_dispatch: bool,
@@ -1025,14 +1022,6 @@ impl LowererConfig {
                 .iter()
                 .map(canonical_path_segments)
                 .collect(),
-            force_at_guard_fields: force_at_guard
-                .iter()
-                .map(|entry| {
-                    let mut key = canonical_path_segments(&entry.struct_type);
-                    key.push(entry.field.to_string());
-                    key.join("::")
-                })
-                .collect(),
             pool_arrays: pool_arrays
                 .iter()
                 .map(|entry| {
@@ -1069,15 +1058,6 @@ impl LowererConfig {
             .contains(&canonical_path_segments(struct_path))
     }
 
-    pub(super) fn force_virtual_at_guard_field(
-        &self,
-        struct_path: &syn::Path,
-        field_name: &str,
-    ) -> bool {
-        let mut key = canonical_path_segments(struct_path);
-        key.push(field_name.to_string());
-        self.force_at_guard_fields.contains(&key.join("::"))
-    }
 }
 
 pub(super) fn canonical_path_segments(path: &Path) -> Vec<String> {

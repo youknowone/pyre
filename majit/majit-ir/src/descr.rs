@@ -1900,12 +1900,6 @@ pub trait Descr: Send + Sync + std::fmt::Debug {
         false
     }
 
-    /// Whether a virtual RHS stored to this field must be materialized at
-    /// guard time instead of being recorded in rd_pendingfields.
-    fn force_virtual_at_guard(&self) -> bool {
-        false
-    }
-
     /// compile.py: isinstance(resumekey, ResumeAtPositionDescr).
     /// Guards created during loop unrolling / short preamble inlining
     /// return true. When bridge compilation starts from such a guard,
@@ -3628,7 +3622,6 @@ pub struct SimpleFieldDescr {
     /// FLAG_POINTER, FLAG_FLOAT, FLAG_SIGNED, FLAG_UNSIGNED, FLAG_STRUCT, FLAG_VOID.
     flag: ArrayFlag,
     virtualizable: bool,
-    force_virtual_at_guard: bool,
     /// descr.py:158 FieldDescr.index — slot position within the
     /// parent struct's `all_fielddescrs`.
     pub index_in_parent: usize,
@@ -3662,7 +3655,6 @@ impl Clone for SimpleFieldDescr {
             is_quasi_immutable: self.is_quasi_immutable,
             flag: self.flag,
             virtualizable: self.virtualizable,
-            force_virtual_at_guard: self.force_virtual_at_guard,
             index_in_parent: self.index_in_parent,
             parent_descr: self.parent_descr.clone(),
             vinfo: self.vinfo.clone(),
@@ -3693,7 +3685,6 @@ impl SimpleFieldDescr {
             is_quasi_immutable: false,
             flag,
             virtualizable: false,
-            force_virtual_at_guard: false,
             index_in_parent: 0,
             parent_descr: None,
             vinfo: None,
@@ -3724,7 +3715,6 @@ impl SimpleFieldDescr {
             is_quasi_immutable: false,
             flag,
             virtualizable: false,
-            force_virtual_at_guard: false,
             index_in_parent: 0,
             parent_descr: None,
             vinfo: None,
@@ -3766,11 +3756,6 @@ impl SimpleFieldDescr {
 
     pub fn with_virtualizable(mut self, virtualizable: bool) -> Self {
         self.virtualizable = virtualizable;
-        self
-    }
-
-    pub fn with_force_virtual_at_guard(mut self, force_virtual_at_guard: bool) -> Self {
-        self.force_virtual_at_guard = force_virtual_at_guard;
         self
     }
 
@@ -3828,9 +3813,6 @@ impl Descr for SimpleFieldDescr {
     }
     fn is_virtualizable(&self) -> bool {
         self.virtualizable
-    }
-    fn force_virtual_at_guard(&self) -> bool {
-        self.force_virtual_at_guard
     }
     fn as_field_descr(&self) -> Option<&dyn FieldDescr> {
         Some(self)
@@ -4082,7 +4064,6 @@ pub struct SimpleFieldDescrSpec {
     /// descr.py:151: FieldDescr.flag — get_type_flag(FIELDTYPE).
     pub flag: ArrayFlag,
     pub virtualizable: bool,
-    pub force_virtual_at_guard: bool,
     pub index_in_parent: usize,
 }
 
@@ -4210,7 +4191,6 @@ fn make_simple_descr_group_inner(
                     is_quasi_immutable: spec.is_quasi_immutable,
                     flag: spec.flag,
                     virtualizable: spec.virtualizable,
-                    force_virtual_at_guard: spec.force_virtual_at_guard,
                     index_in_parent: spec.index_in_parent,
                     parent_descr: Some(parent_descr.clone()),
                     vinfo: None,
@@ -4871,7 +4851,6 @@ pub fn make_vtable_field_descr() -> DescrRef {
                     is_quasi_immutable: false,
                     flag: ArrayFlag::Signed,
                     virtualizable: false,
-                    force_virtual_at_guard: false,
                     index_in_parent: 0,
                     parent_descr: Some(parent_descr),
                     vinfo: None,

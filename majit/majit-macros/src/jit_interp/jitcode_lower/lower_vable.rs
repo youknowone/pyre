@@ -708,8 +708,6 @@ impl<'c> Lowerer<'c> {
         let ref_field_key = format!("{}::{}", struct_last, member_name);
         let ref_field_entry = config.ref_fields.get(&ref_field_key);
         let is_ref_field = ref_field_entry.is_some();
-        let force_virtual_at_guard =
-            config.force_virtual_at_guard_field(&struct_path, &member_name);
         // Raw (headerless) ref-scalar pointee → `is_gc_managed = false`, a
         // distinct descriptor id from any GC `new_struct` of the same type.
         let tid = struct_type_id(&struct_path, false);
@@ -740,7 +738,6 @@ impl<'c> Lowerer<'c> {
                             ::core::mem::offset_of!(#struct_path, #member),
                             true,
                             stringify!(#member),
-                            #force_virtual_at_guard,
                         )],
                     );
                     __builder.getfield_gc_r(
@@ -775,7 +772,6 @@ impl<'c> Lowerer<'c> {
                             ::core::mem::offset_of!(#struct_path, #member),
                             false,
                             stringify!(#member),
-                            #force_virtual_at_guard,
                         )],
                     );
                     __builder.getfield_gc_i(
@@ -825,8 +821,6 @@ impl<'c> Lowerer<'c> {
         let ref_field_key = format!("{}::{}", struct_last, member_name);
         let ref_field_entry = config.ref_fields.get(&ref_field_key);
         let is_ref_field = ref_field_entry.is_some();
-        let force_virtual_at_guard =
-            config.force_virtual_at_guard_field(&struct_path, &member_name);
         let tid = struct_type_id(&struct_path, false);
         let base_reg = binding.reg;
         let result_reg = self.alloc_reg();
@@ -847,7 +841,6 @@ impl<'c> Lowerer<'c> {
                             ::core::mem::offset_of!(#struct_path, #member),
                             true,
                             stringify!(#member),
-                            #force_virtual_at_guard,
                         )],
                     );
                     __builder.getfield_gc_r(
@@ -881,7 +874,6 @@ impl<'c> Lowerer<'c> {
                             ::core::mem::offset_of!(#struct_path, #member),
                             false,
                             stringify!(#member),
-                            #force_virtual_at_guard,
                         )],
                     );
                     __builder.getfield_gc_i(
@@ -1013,8 +1005,6 @@ impl<'c> Lowerer<'c> {
             .unwrap_or_default();
         let ref_field_key = format!("{}::{}", struct_last, member_name);
         let is_ref_field = config.ref_fields.contains_key(&ref_field_key);
-        let force_virtual_at_guard =
-            config.force_virtual_at_guard_field(&struct_path, &member_name);
         // Raw (headerless) ref-scalar pointee → `is_gc_managed = false`, the
         // same id the matching getfield uses so this setfield invalidates it.
         let tid = struct_type_id(&struct_path, false);
@@ -1046,7 +1036,6 @@ impl<'c> Lowerer<'c> {
                             ::core::mem::offset_of!(#struct_path, #member),
                             true,
                             stringify!(#member),
-                            #force_virtual_at_guard,
                         )],
                     );
                     __builder.setfield_gc_r(
@@ -1079,7 +1068,6 @@ impl<'c> Lowerer<'c> {
                             ::core::mem::offset_of!(#struct_path, #member),
                             false,
                             stringify!(#member),
-                            #force_virtual_at_guard,
                         )],
                     );
                     __builder.setfield_gc_i(
@@ -1124,8 +1112,6 @@ impl<'c> Lowerer<'c> {
             .unwrap_or_default();
         let ref_field_key = format!("{}::{}", struct_last, member_name);
         let is_ref_field = config.ref_fields.contains_key(&ref_field_key);
-        let force_virtual_at_guard =
-            config.force_virtual_at_guard_field(&struct_path, &member_name);
         let tid = struct_type_id(&struct_path, false);
         let base_reg = binding.reg;
         let rhs = self.lower_value_expr(&assign.right)?;
@@ -1150,7 +1136,6 @@ impl<'c> Lowerer<'c> {
                             ::core::mem::offset_of!(#struct_path, #member),
                             true,
                             stringify!(#member),
-                            #force_virtual_at_guard,
                         )],
                     );
                     __builder.setfield_gc_r(
@@ -1182,7 +1167,6 @@ impl<'c> Lowerer<'c> {
                             ::core::mem::offset_of!(#struct_path, #member),
                             false,
                             stringify!(#member),
-                            #force_virtual_at_guard,
                         )],
                     );
                     __builder.setfield_gc_i(

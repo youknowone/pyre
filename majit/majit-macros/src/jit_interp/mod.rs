@@ -152,9 +152,6 @@ pub struct JitInterpConfig {
     /// Structs whose `New` allocation should use the headerless nursery opcode.
     /// `headerless_structs = { StructType, ... }`.
     pub headerless_structs: Vec<Path>,
-    /// Fields whose virtual RHS must be forced to memory at guards.
-    /// `force_at_guard = { StructType::field, ... }`.
-    pub force_at_guard: Vec<ForceAtGuardEntry>,
     /// Pure function → native IR integer binop aliases.
     /// `native_int_binops = { val_add => IntAdd, ... }`.  When the JIT-path
     /// lowerer encounters a call whose path matches a key, it emits the named
@@ -382,12 +379,6 @@ pub struct RefFieldEntry {
     pub pointee_type: Path,
 }
 
-#[derive(Clone)]
-pub struct ForceAtGuardEntry {
-    pub struct_type: Path,
-    pub field: Ident,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CallPolicyKind {
     ResidualVoid,
@@ -565,7 +556,6 @@ impl Parse for JitInterpConfig {
         let mut call_returns: Vec<(Path, Path)> = Vec::new();
         let mut struct_allocs: Vec<(Path, Path)> = Vec::new();
         let mut headerless_structs: Vec<Path> = Vec::new();
-        let mut force_at_guard: Vec<ForceAtGuardEntry> = Vec::new();
         let mut native_int_binops: Vec<(Path, Ident)> = Vec::new();
         let mut native_tag_small: Vec<Path> = Vec::new();
         let mut split_dispatch = false;
@@ -634,9 +624,6 @@ impl Parse for JitInterpConfig {
                 "headerless_structs" => {
                     headerless_structs = parse_path_set(input)?;
                 }
-                "force_at_guard" => {
-                    force_at_guard = parse_force_at_guard_set(input)?;
-                }
                 "native_int_binops" => {
                     native_int_binops = parse_native_int_binops_map(input)?;
                 }
@@ -698,7 +685,6 @@ impl Parse for JitInterpConfig {
             call_returns,
             struct_allocs,
             headerless_structs,
-            force_at_guard,
             native_int_binops,
             native_tag_small,
             split_dispatch,
@@ -833,18 +819,6 @@ fn split_struct_field_path(full_path: Path) -> syn::Result<(Path, Ident)> {
         segments: segments.into_iter().collect(),
     };
     Ok((struct_type, field))
-}
-
-fn parse_force_at_guard_set(input: ParseStream) -> syn::Result<Vec<ForceAtGuardEntry>> {
-    let content;
-    braced!(content in input);
-    let mut entries = Vec::new();
-    while !content.is_empty() {
-        let (struct_type, field) = split_struct_field_path(content.parse::<Path>()?)?;
-        entries.push(ForceAtGuardEntry { struct_type, field });
-        let _ = content.parse::<Token![,]>();
-    }
-    Ok(entries)
 }
 
 fn parse_ref_fields_map(input: ParseStream) -> syn::Result<Vec<RefFieldEntry>> {
