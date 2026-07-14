@@ -2283,7 +2283,13 @@ pub unsafe fn w_module_dict_store_inner_checked(
 /// Write a str-keyed assignment back to the dict's backing DictStorage,
 /// if any. Declared in pyre-interpreter and re-exported via an `extern`
 /// hook registered at startup to avoid a circular dependency.
-unsafe fn maybe_sync_dict_storage_store(ns_ptr: *mut u8, key: PyObjectRef, value: PyObjectRef) {
+// `dont_look_inside`: the store-through target is a process-global atomic
+// fn-pointer cell (`DICT_STORAGE_STORE_HOOK`) whose dispatch stays opaque to
+// the JIT; calls residualize via the registered fnaddr. All three args are
+// word-sized (`*mut u8` + two refs) and the `()` return cannot raise — the
+// `try_gc_owns_object` / `maybe_register_finalizer` twin.
+#[majit_macros::dont_look_inside]
+pub unsafe fn maybe_sync_dict_storage_store(ns_ptr: *mut u8, key: PyObjectRef, value: PyObjectRef) {
     if ns_ptr.is_null() {
         return;
     }

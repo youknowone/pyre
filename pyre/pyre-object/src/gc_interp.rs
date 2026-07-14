@@ -160,7 +160,15 @@ pub fn note_alloc() {
 /// ([`at_outermost_activation`]) so a Python callback nested inside native
 /// module code — whose Rust-stack roots the pyframe walker cannot see — never
 /// triggers it.
-#[inline]
+///
+/// Reads the runtime-mutable `ALLOC_SINCE_GC` atomic and dispatches to the
+/// installed collection hook, neither a build-time constant, so the JIT
+/// residualizes the call instead of tracing into it (`@dont_look_inside`, the
+/// [`enabled`] sibling). A `()` return has no discriminant to erase and it
+/// cannot raise. On the cold interpreter dispatch loop its first act is
+/// already the non-inlined `enabled()` early-return; the residual adds no
+/// hot-path cost the un-residualized form did not already pay.
+#[majit_macros::dont_look_inside]
 pub fn safepoint() {
     if !enabled() {
         return;
