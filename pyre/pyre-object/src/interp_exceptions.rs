@@ -1459,6 +1459,16 @@ mod tests {
             "BaseException"
         ));
         assert!(!exc_kind_matches(ExcKind::ZeroDivisionError, "ValueError"));
+        assert!(exc_kind_matches(
+            ExcKind::UnboundLocalError,
+            "UnboundLocalError"
+        ));
+        assert!(exc_kind_matches(ExcKind::UnboundLocalError, "NameError"));
+        assert!(exc_kind_matches(ExcKind::UnboundLocalError, "Exception"));
+        assert!(exc_kind_matches(
+            ExcKind::UnboundLocalError,
+            "BaseException"
+        ));
     }
 
     #[test]

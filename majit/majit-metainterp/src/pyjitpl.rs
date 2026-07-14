@@ -7080,6 +7080,8 @@ impl<M: Clone> MetaInterp<M> {
                 if let Some(ref hook) = self.hooks.on_compile_loop {
                     hook(green_key, 0, num_combined_ops);
                 }
+                self.last_quasi_immutable_deps =
+                    std::mem::take(&mut unroll_opt.quasi_immutable_deps);
                 true
             }
             Err(e) => {

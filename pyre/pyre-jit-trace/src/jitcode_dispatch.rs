@@ -14256,7 +14256,10 @@ fn try_walker_inline_user_call(
     for i in 0..2 {
         if matches!(arg_concretes.get(i), Some(ConcreteValue::Null)) {
             if let Some(majit_ir::Value::Ref(r)) = ctx.trace_ctx.box_value(r_args[i]) {
-                arg_concretes[i] = ConcreteValue::Ref(r.as_usize() as pyre_object::PyObjectRef);
+                if r != majit_ir::GcRef::NO_CONCRETE && r.as_usize() != 0 {
+                    arg_concretes[i] =
+                        ConcreteValue::Ref(r.as_usize() as pyre_object::PyObjectRef);
+                }
             }
         }
     }
