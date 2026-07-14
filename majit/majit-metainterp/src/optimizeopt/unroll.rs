@@ -2890,14 +2890,9 @@ impl OptUnroll {
         }
         // unroll.py:462-463 `label_args, virtuals =
         //   virtual_state.make_inputargs_and_virtuals(end_args, self.optimizer)`.
-        let (label_args, virtuals) = virtual_state
-            .make_inputargs_and_virtuals(&end_args, optimizer, ctx, false)
+        let (label_args, virtuals, label_source_positions) = virtual_state
+            .make_inputargs_and_virtuals_with_source_positions(&end_args, optimizer, ctx, false)
             .expect("export_state make_inputargs_and_virtuals failed");
-        let label_source_positions = end_args
-            .iter()
-            .enumerate()
-            .filter_map(|(index, arg)| (!arg.is_constant()).then_some(index))
-            .collect::<Vec<_>>();
         if crate::callee_rca_enabled() {
             eprintln!(
                 "[callee-rca][export-state] original_label_args={:?} end_args={:?} \

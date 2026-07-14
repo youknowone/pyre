@@ -784,6 +784,59 @@ impl VirtualState {
         Ok((inputargs, virtuals))
     }
 
+    /// Return `make_inputargs_and_virtuals` plus the close-loop live-value
+    /// source positions for each emitted non-virtual LABEL arg.
+    ///
+    /// The positions follow the `make_inputargs` output order from
+    /// virtualstate.py:655-683, not a separate top-level `end_args` filter.
+    /// Top-level virtual entries are skipped, so a LABEL arg produced by a
+    /// virtual field maps to that field's concrete live-value slot when it is
+    /// present in `concrete_refs`.
+    pub fn make_inputargs_and_virtuals_with_source_positions(
+        &self,
+        concrete_refs: &[OpRef],
+        optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
+        ctx: &mut OptContext,
+        force_boxes: bool,
+    ) -> Result<(Vec<OpRef>, Vec<OpRef>, Vec<usize>), ()> {
+        let (inputargs, virtuals) =
+            self.make_inputargs_and_virtuals(concrete_refs, optimizer, ctx, force_boxes)?;
+        let label_source_positions = self
+            .label_source_positions_for_inputargs(concrete_refs, &inputargs, ctx)
+            // No corresponding close-loop live slot: direct LABEL packing
+            // is unavailable for this trace, so leave metadata empty and
+            // let pack_front_target_live_values decline.
+            .unwrap_or_default();
+        Ok((inputargs, virtuals, label_source_positions))
+    }
+
+    fn label_source_positions_for_inputargs(
+        &self,
+        concrete_refs: &[OpRef],
+        inputargs: &[OpRef],
+        ctx: &mut OptContext,
+    ) -> Option<Vec<usize>> {
+        if concrete_refs.len() != self.state.len() {
+            return None;
+        }
+        inputargs
+            .iter()
+            .map(|&inputarg| {
+                let resolved_inputarg = ctx.get_replacement_opref(inputarg);
+                concrete_refs
+                    .iter()
+                    .enumerate()
+                    .find_map(|(index, &candidate)| {
+                        if self.state[index].is_virtual() || candidate.is_constant() {
+                            return None;
+                        }
+                        (ctx.get_replacement_opref(candidate) == resolved_inputarg).then_some(index)
+                    })
+                    .or_else(|| inputarg.is_input_arg().then_some(inputarg.raw() as usize))
+            })
+            .collect()
+    }
+
     /// Walk the virtual state tree the way RPython's `enum_forced_boxes`
     /// does (virtualstate.py:182-198 AbstractVirtualStructStateInfo,
     /// 263-275 VArrayStateInfo, 333-354 VArrayStructStateInfo,
@@ -3157,6 +3210,49 @@ mod tests {
             .expect("make_inputargs_and_virtuals");
         assert_eq!(inputargs, vec![OpRef::int_op(20), OpRef::ref_op(22)]);
         assert_eq!(virtuals, vec![OpRef::ref_op(21)]);
+    }
+
+    #[test]
+    fn test_label_source_positions_follow_make_inputargs_for_virtual_field() {
+        let descr = test_descr(10);
+        let mut ctx = OptContext::new(32);
+        let object = OpRef::ref_op(10);
+        let field = OpRef::int_op(11);
+        let scalar = OpRef::int_op(12);
+        ctx.materialize_operand_at(object);
+        ctx.materialize_operand_at(field);
+        ctx.materialize_operand_at(scalar);
+
+        let object_box = ctx
+            .get_box_replacement_operand_opt(object)
+            .expect("object box is bound");
+        let mut info = PtrInfo::virtual_obj(descr, None);
+        info.setfield(
+            0,
+            crate::history::test_support::rooted_resop_operand(Type::Int, field.raw()),
+        );
+        ctx.set_ptr_info(&object_box, info);
+
+        let state = export_state(&[object, field, scalar], &ctx);
+        let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
+        let (inputargs, virtuals, source_positions) = state
+            .make_inputargs_and_virtuals_with_source_positions(
+                &[object, field, scalar],
+                &mut optimizer,
+                &mut ctx,
+                false,
+            )
+            .expect("make_inputargs_and_virtuals_with_source_positions");
+
+        assert_eq!(inputargs, vec![field, scalar]);
+        assert_eq!(virtuals, vec![object]);
+        assert_eq!(
+            source_positions,
+            vec![1, 2],
+            "virtualstate.py:655-683 make_inputargs skips the top-level virtual; \
+             unroll.py:462-465 LABEL packing must source the field slot, not \
+             the virtual object slot"
+        );
     }
 
     /// virtualstate.py:196 / 274 / 352 — `state.position > self.position`
