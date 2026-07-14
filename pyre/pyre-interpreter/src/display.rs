@@ -460,6 +460,12 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
     if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj) {
         return Ok(format!("{}", pyre_object::tagged_int::untag_int(obj)));
     }
+    // The recursive container branches below (dict/list/tuple/set/deque/
+    // slice/range) re-enter `py_repr` on each element in native Rust with
+    // no Python frame push, so a deeply nested structure blows the C stack
+    // before any frame-level check fires. Guard the stack here so
+    // `repr(deeply_nested)` raises RecursionError instead of overflowing.
+    crate::stack_check::stack_check()?;
     if obj.is_null() {
         return Ok("NULL".to_string());
     }
