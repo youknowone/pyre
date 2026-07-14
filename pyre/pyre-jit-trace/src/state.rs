@@ -1545,7 +1545,12 @@ pub(crate) fn bridge_semantic_maps_at_with_jitcode_pc(
         // they've been consumed and carry no pcdep entry.
         // Index the py_pc-keyed depth/pcdep tables at a resolved Python PC.
         let via_py_pc = |rp: usize| {
-            let depth = payload.metadata.depth_at_py_pc.get(rp).copied().unwrap_or(0) as usize;
+            let depth = payload
+                .metadata
+                .depth_at_py_pc
+                .get(rp)
+                .copied()
+                .unwrap_or(0) as usize;
             let pcdep = payload
                 .metadata
                 .pcdep_color_slots
@@ -1554,39 +1559,37 @@ pub(crate) fn bridge_semantic_maps_at_with_jitcode_pc(
                 .unwrap_or_default();
             (depth, pcdep)
         };
-        let (stack_depth_at_pc, pcdep_entries) = if jitcode_pc
-            != majit_ir::resumedata::NO_JITCODE_PC
-            && jitcode_pc >= 0
-        {
-            let jp = jitcode_pc as usize;
-            // Validate with `can_decode_live_vars` — symmetric with the
-            // liveness decode in `resolve_resume_pc_with_jitcode_pc`.
-            // A non-decodable carried coordinate falls back to the
-            // merge-target PC so liveness and pcdep key the same point.
-            if payload.jitcode.can_decode_live_vars(jp, sd.op_live) {
-                // Decode-identity: source depth/pcdep from the carried genuine
-                // `jitcode_pc` via the predecessor-keyed twins. Every real carried
-                // coordinate is an op-start or block-head offset of a colored
-                // jitcode, for which the codewriter seeds these twins; a twin miss
-                // degrades to the merge-target PC (the same fallback the
-                // non-decodable path uses below), keeping liveness and pcdep on one
-                // coordinate. A portal bridge is uncolored — `pcdep_color_slots` /
-                // `depth_at_py_pc` are empty, so `via_py_pc` returns `(0, empty)`
-                // for any resolved py — so the merge-target fallback is identical
-                // to the retired `python_pc_for_jitcode_pc` re-inversion there.
-                match (
-                    payload.depth_for_jitcode_pc_pred(jp),
-                    payload.pcdep_for_jitcode_pc(jp),
-                ) {
-                    (Some(depth), Some(pcdep)) => (depth as usize, pcdep),
-                    _ => via_py_pc(majit_ir::resumedata::decode_resume_pc(pc).0 as usize),
+        let (stack_depth_at_pc, pcdep_entries) =
+            if jitcode_pc != majit_ir::resumedata::NO_JITCODE_PC && jitcode_pc >= 0 {
+                let jp = jitcode_pc as usize;
+                // Validate with `can_decode_live_vars` — symmetric with the
+                // liveness decode in `resolve_resume_pc_with_jitcode_pc`.
+                // A non-decodable carried coordinate falls back to the
+                // merge-target PC so liveness and pcdep key the same point.
+                if payload.jitcode.can_decode_live_vars(jp, sd.op_live) {
+                    // Decode-identity: source depth/pcdep from the carried genuine
+                    // `jitcode_pc` via the predecessor-keyed twins. Every real carried
+                    // coordinate is an op-start or block-head offset of a colored
+                    // jitcode, for which the codewriter seeds these twins; a twin miss
+                    // degrades to the merge-target PC (the same fallback the
+                    // non-decodable path uses below), keeping liveness and pcdep on one
+                    // coordinate. A portal bridge is uncolored — `pcdep_color_slots` /
+                    // `depth_at_py_pc` are empty, so `via_py_pc` returns `(0, empty)`
+                    // for any resolved py — so the merge-target fallback is identical
+                    // to the retired `python_pc_for_jitcode_pc` re-inversion there.
+                    match (
+                        payload.depth_for_jitcode_pc_pred(jp),
+                        payload.pcdep_for_jitcode_pc(jp),
+                    ) {
+                        (Some(depth), Some(pcdep)) => (depth as usize, pcdep),
+                        _ => via_py_pc(majit_ir::resumedata::decode_resume_pc(pc).0 as usize),
+                    }
+                } else {
+                    via_py_pc(majit_ir::resumedata::decode_resume_pc(pc).0 as usize)
                 }
             } else {
                 via_py_pc(majit_ir::resumedata::decode_resume_pc(pc).0 as usize)
-            }
-        } else {
-            via_py_pc(majit_ir::resumedata::decode_resume_pc(pc).0 as usize)
-        };
+            };
         BridgeSemanticMaps {
             // #73: the codewriter colored this jitcode iff `pcdep_color_slots`
             // is non-empty — the field-free replacement for the retired flat
