@@ -237,7 +237,9 @@ mod tests {
     fn test_w_int_new_identity_matches_config() {
         let a = w_int_new(42);
         let b = w_int_new(42);
-        if WITHPREBUILTINT && (PREBUILTINTFROM..PREBUILTINTTO).contains(&42) {
+        if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::fits_tagged(42) {
+            assert_eq!(a, b, "tagged immediates are value-identical (1 is 1)");
+        } else if WITHPREBUILTINT && (PREBUILTINTFROM..PREBUILTINTTO).contains(&42) {
             assert_eq!(a, b, "in-cache values share the prebuilt pointer");
         } else {
             assert_ne!(a, b, "no cache: each wrapint allocates fresh");
@@ -270,7 +272,11 @@ mod tests {
     fn test_outside_cache_allocates_fresh() {
         let a = w_int_new(1000);
         let b = w_int_new(1000);
-        assert_ne!(a, b, "out-of-cache ints allocate fresh per wrapint");
+        if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::fits_tagged(1000) {
+            assert_eq!(a, b, "tagged immediates are value-identical");
+        } else {
+            assert_ne!(a, b, "out-of-cache ints allocate fresh per wrapint");
+        }
         unsafe {
             assert_eq!(w_int_get_value(a), 1000);
             assert_eq!(w_int_get_value(b), 1000);

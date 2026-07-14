@@ -2245,9 +2245,9 @@ pub fn jit_static_int_values() -> Vec<(&'static str, i64)> {
             "objectobject::W_OBJECT_OBJECT_SIZE",
             pyre_object::objectobject::W_OBJECT_OBJECT_SIZE as i64,
         ),
-        // `pub const CAN_BE_TAGGED: bool` (tagged-int scaffolding, currently
-        // `false`); Charon emits the read as an opaque global rather than
-        // folding it, so bake the build-time value (`false as i64` == 0).
+        // `pub const CAN_BE_TAGGED: bool` (tagged-int enablement, currently
+        // `true`); Charon emits the read as an opaque global rather than
+        // folding it, so bake the build-time value (`true as i64` == 1).
         (
             "tagged_int::CAN_BE_TAGGED",
             pyre_object::tagged_int::CAN_BE_TAGGED as i64,

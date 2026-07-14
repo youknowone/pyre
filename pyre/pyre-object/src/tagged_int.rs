@@ -9,11 +9,11 @@
 //! real pointer; `None`/`True`/`False` are even-aligned statics and are
 //! never tagged.
 //!
-//! This module is the structural primitive only: it has **zero call
-//! sites** and is inert behind [`CAN_BE_TAGGED`]. The maker
-//! (`intobject::w_int_new`), the readers/dispatch chokepoints, the GC
-//! collector skip, and the enablement flip land in later slices; the
-//! enablement itself is gated on the symbolic-valuestack work (#73).
+//! The tag path is live behind [`CAN_BE_TAGGED`] (#22 enablement): the
+//! maker (`intobject::w_int_new`) returns small ints as immediates, the
+//! readers/dispatch chokepoints `& 1`-precheck before any `ob_type`
+//! deref, and the GC collector skips tagged immediates
+//! (`taggedpointers`, wired through `pyre-jit`'s `build_gc`).
 //!
 //! The bit layout mirrors the already-ported rtyper helper
 //! `majit/majit-translate/src/translator/rtyper/lltypesystem/rtagged.rs`
@@ -23,13 +23,14 @@
 use crate::pyobject::PyObjectRef;
 
 /// `rpython/rtyper/lltypesystem/rtagged.py:64-96` static `can_be_tagged`
-/// gate, collapsed to the single runtime `int` class. Defaults `false`,
+/// gate, collapsed to the single runtime `int` class. Enabled (#22),
 /// mirroring `rpython/config/translationoption.py:185 taggedpointers`
-/// (off by default), so every consumer chokepoint short-circuits to the
-/// untagged path and this primitive stays inert until the enablement
-/// slice. `rerased.py:1-3`: the point is to avoid putting `& 1` tag
-/// checks on every object — they are gated on this static.
-pub const CAN_BE_TAGGED: bool = false;
+/// turned on, so every consumer chokepoint takes the `& 1` tag precheck
+/// and the maker emits small ints as immediates. `rerased.py:1-3`: the
+/// point is to avoid putting `& 1` tag checks on every object — they are
+/// gated on this static, which is kept in lockstep with the GC
+/// `taggedpointers` config (`pyre-jit` `build_gc`).
+pub const CAN_BE_TAGGED: bool = true;
 
 /// `value` fits the tagged immediate range, i.e. `value << 1` does not
 /// overflow `i64`. Callers range-check with this before [`tag_int`];
@@ -70,10 +71,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_to_untagged() {
-        // The enablement gate is off, matching the `taggedpointers`
-        // default; consumers must short-circuit to the heap-box path.
-        assert!(!CAN_BE_TAGGED);
+    fn enabled_after_flip() {
+        // #22 enablement: the tag path is live and consumers take the
+        // `& 1` precheck; the GC `taggedpointers` config is in lockstep.
+        assert!(CAN_BE_TAGGED);
     }
 
     #[test]
