@@ -981,6 +981,12 @@ impl Optimization for OptPure {
                 }
                 // Record and emit both the OVF op and the guard.
                 self.cache.insert(key, postponed.pos.get());
+                // pure.py:321-322: an is_ovf op followed by GUARD_NO_OVERFLOW is
+                // hoistable into the short preamble, like an is_always_pure op
+                // (pure.py:319-320). Push it so produce_potential_short_preamble_ops
+                // replays it and a loop-invariant overflow-checked op is computed
+                // once in the peeled preamble instead of every iteration.
+                self.short_preamble_pure_ops.push(postponed.clone());
                 ctx.emit(postponed);
                 return OptimizationResult::PassOn; // guard passes through
             } else {
