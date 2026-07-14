@@ -1739,9 +1739,9 @@ fn list_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     }
     unsafe { pyre_object::w_list_clear(list) };
     if let Some(&iterable) = params.get(1) {
-        for item in crate::builtins::collect_iterable(iterable)? {
-            unsafe { pyre_object::w_list_append(list, item) };
-        }
+        // listobject.py:557-566 — append as the iterator yields, retaining
+        // a completed prefix if a later next() fails.
+        crate::type_methods::list_method_extend(&[list, iterable])?;
     }
     Ok(pyre_object::w_none())
 }

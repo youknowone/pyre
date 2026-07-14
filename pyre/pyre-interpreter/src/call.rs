@@ -3359,7 +3359,11 @@ fn build_class_inner(
     } else {
         bases
     };
-    unsafe { crate::baseobjspace::validate_c3_mro(w_effective_bases)? };
+    // A custom metaclass owns its bases until (and unless) it invokes
+    // type.__new__; do not perform type's C3 validation before dispatch.
+    if w_metaclass.is_none() {
+        unsafe { crate::baseobjspace::validate_c3_mro(w_effective_bases)? };
+    }
     // Create class via metaclass or default type()
     // PyPy: typeobject.py — metaclass(name, bases, dict_w) or type.__new__
     // Keep the default path's fresh managed namespace rooted until slot

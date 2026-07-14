@@ -225,14 +225,17 @@ pub fn list_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     let list = args[0];
     let other = args[1];
     unsafe {
-        if is_list(other) {
+        // listobject.py:1019-1033 only takes the storage-copy path when a
+        // list/tuple uses its inherited iterator.  An overridden subclass
+        // must use the generic incremental iterator path below.
+        if is_exact_list(other) {
             let n = w_list_len(other);
             for i in 0..n {
                 if let Some(item) = w_list_getitem(other, i as i64) {
                     w_list_append(list, item);
                 }
             }
-        } else if is_tuple(other) {
+        } else if is_exact_tuple(other) {
             let n = w_tuple_len(other);
             for i in 0..n {
                 if let Some(item) = w_tuple_getitem(other, i as i64) {

@@ -3235,8 +3235,6 @@ fn type_descr_new_with_metaclass(
             } else {
                 bases
             };
-        unsafe { crate::baseobjspace::validate_c3_mro(w_effective_bases)? };
-
         // CPython: calculate_metaclass — delegate to winner if different
         let default_meta = if w_metaclass.is_null() {
             crate::typedef::w_type()
@@ -3268,6 +3266,10 @@ fn type_descr_new_with_metaclass(
             }
         }
         let w_metaclass = w_winner;
+
+        // This is type.__new__'s own construction path. A different winning
+        // metaclass above received the original bases without a C3 pre-check.
+        unsafe { crate::baseobjspace::validate_c3_mro(w_effective_bases)? };
 
         let _dict_root = pyre_object::gc_roots::push_roots();
         let dict_root = pyre_object::gc_roots::shadow_stack_len();
