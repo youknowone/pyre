@@ -190,7 +190,7 @@ pub(crate) unsafe fn issubtype_w(w_type: PyObjectRef, cls: PyObjectRef) -> bool 
     }
     let mro_ptr = w_type_get_mro(w_type);
     if !mro_ptr.is_null() {
-        return (*mro_ptr).iter().any(|&t| std::ptr::eq(t, cls));
+        return (*mro_ptr).as_slice().iter().any(|&t| std::ptr::eq(t, cls));
     }
     compute_default_mro(w_type)
         .iter()
@@ -2803,7 +2803,7 @@ pub fn exception_match(exc_type: PyObjectRef, check_class: PyObjectRef) -> bool 
         return false;
     }
 
-    let mro = unsafe { &*mro_ptr };
+    let mro = unsafe { (*mro_ptr).as_slice() };
     mro.iter().any(|&klass| is_w(klass, check_class))
 }
 
@@ -3303,8 +3303,10 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
             let mro_ptr = w_type_get_mro(w_obj_type);
             if !mro_ptr.is_null() {
                 let mro = &*mro_ptr;
+                let mro_len = mro.len();
                 let mut past_super = false;
-                for &t in mro {
+                for i in 0..mro_len {
+                    let t = mro[i];
                     if std::ptr::eq(t, super_type) {
                         past_super = true;
                         continue;
@@ -4499,7 +4501,7 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
             if name == "__mro__" {
                 let mro_ptr = w_type_get_mro(obj);
                 if !mro_ptr.is_null() {
-                    return Ok(w_tuple_new((*mro_ptr).clone()));
+                    return Ok(w_tuple_new((*mro_ptr).to_vec()));
                 }
             }
             if name == "__flags__" {
@@ -5786,7 +5788,7 @@ pub unsafe fn compares_by_identity(w_type: PyObjectRef) -> bool {
     let cached_mro = pyre_object::typeobject::w_type_get_mro(w_type);
     let mro_owned;
     let mro: &[PyObjectRef] = if !cached_mro.is_null() {
-        &*cached_mro
+        (*cached_mro).as_slice()
     } else {
         mro_owned = compute_mro(w_type);
         &mro_owned
@@ -5900,11 +5902,11 @@ pub(crate) unsafe fn lookup_where(
     if w_type.is_null() || !is_type(w_type) {
         return None;
     }
-    // Use cached MRO if available (PyPy: W_TypeObject.mro_w)
+    // Use cached MRO if available (W_TypeObject.mro_w)
     let cached = w_type_get_mro(w_type);
     let mro_owned;
     let mro: &[PyObjectRef] = if !cached.is_null() {
-        &*cached
+        (*cached).as_slice()
     } else {
         mro_owned = compute_mro(w_type);
         &mro_owned
@@ -6004,7 +6006,7 @@ pub(crate) unsafe fn lookup_in_type_wtf8(w_type: PyObjectRef, name: &Wtf8) -> Op
     let cached = w_type_get_mro(w_type);
     let mro_owned;
     let mro: &[PyObjectRef] = if !cached.is_null() {
-        &*cached
+        (*cached).as_slice()
     } else {
         mro_owned = compute_mro(w_type);
         &mro_owned
@@ -6560,7 +6562,7 @@ pub unsafe fn super_lookup_binding(
     };
     let mro_ptr = w_type_get_mro(w_obj_type);
     if !mro_ptr.is_null() {
-        let mro = &*mro_ptr;
+        let mro = (*mro_ptr).as_slice();
         let mut past_super = false;
         for &t in mro {
             if std::ptr::eq(t, super_type) {
@@ -10685,20 +10687,33 @@ fn generator_next(gen_obj: PyObjectRef) -> PyResult {
 
 /// __next__ method wrapper
 fn generator_next_method(args: &[PyObjectRef]) -> PyResult {
-    let gen_obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    let gen_obj = if args.is_empty() {
+        pyre_object::PY_NULL
+    } else {
+        args[0]
+    };
     generator_next(gen_obj)
 }
 
 /// Generic __next__ wrapper for iterators that delegate to `next()`.
 /// Used for itertools count/repeat etc.
 fn iter_next_method(args: &[PyObjectRef]) -> PyResult {
-    let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    let obj = if args.is_empty() {
+        pyre_object::PY_NULL
+    } else {
+        args[0]
+    };
     next(obj)
 }
 
 /// `__iter__` for an iterator — returns the iterator itself.
 fn iter_self_method(args: &[PyObjectRef]) -> PyResult {
-    Ok(args.first().copied().unwrap_or(pyre_object::PY_NULL))
+    let obj = if args.is_empty() {
+        pyre_object::PY_NULL
+    } else {
+        args[0]
+    };
+    Ok(obj)
 }
 
 /// `takewhile.__reduce__` — `interp_itertools.py W_TakeWhile.descr_reduce`:
@@ -10916,16 +10931,32 @@ fn chain_setstate_method(args: &[PyObjectRef]) -> PyResult {
 
 /// PyPy: GeneratorIterator.descr_send(w_arg)
 fn generator_send_method(args: &[PyObjectRef]) -> PyResult {
-    let gen_obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-    let value = args.get(1).copied().unwrap_or(w_none());
+    let gen_obj = if args.is_empty() {
+        pyre_object::PY_NULL
+    } else {
+        args[0]
+    };
+    let value = if args.len() > 1 { args[1] } else { w_none() };
     generator_send_ex(gen_obj, value, None)
 }
 
 /// PyPy: GeneratorIterator.descr_throw(w_type, w_val=None, w_tb=None)
 fn generator_throw_method(args: &[PyObjectRef]) -> PyResult {
-    let gen_obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-    let w_type = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-    let w_val = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
+    let gen_obj = if args.is_empty() {
+        pyre_object::PY_NULL
+    } else {
+        args[0]
+    };
+    let w_type = if args.len() > 1 {
+        args[1]
+    } else {
+        pyre_object::PY_NULL
+    };
+    let w_val = if args.len() > 2 {
+        args[2]
+    } else {
+        pyre_object::PY_NULL
+    };
     // w_tb (args[3]) ignored for now — traceback not yet supported
 
     let err = normalize_throw_args(w_type, w_val);
@@ -10934,7 +10965,11 @@ fn generator_throw_method(args: &[PyObjectRef]) -> PyResult {
 
 /// PyPy: GeneratorIterator.descr_close()
 fn generator_close_method(args: &[PyObjectRef]) -> PyResult {
-    let gen_obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    let gen_obj = if args.is_empty() {
+        pyre_object::PY_NULL
+    } else {
+        args[0]
+    };
     unsafe {
         use pyre_object::generator::*;
         if w_generator_is_exhausted(gen_obj) {

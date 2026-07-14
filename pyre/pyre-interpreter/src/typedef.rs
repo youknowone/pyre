@@ -1155,7 +1155,7 @@ fn new_typeobject_with_base_and_layout(
     let base_mro = unsafe { w_type_get_mro(base) };
     let mut mro = vec![type_obj];
     if !base_mro.is_null() {
-        mro.extend_from_slice(unsafe { &*base_mro });
+        mro.extend_from_slice(unsafe { (*base_mro).as_slice() });
     } else {
         mro.push(base);
     }
@@ -1864,8 +1864,13 @@ fn check_user_subclass(w_self: PyObjectRef, w_subtype: PyObjectRef) -> Result<()
         return Ok(());
     }
     let mro_ptr = unsafe { pyre_object::w_type_get_mro(w_subtype) };
-    let is_sub =
-        !mro_ptr.is_null() && unsafe { (*mro_ptr).iter().any(|&t| std::ptr::eq(t, w_self)) };
+    let is_sub = !mro_ptr.is_null()
+        && unsafe {
+            (*mro_ptr)
+                .as_slice()
+                .iter()
+                .any(|&t| std::ptr::eq(t, w_self))
+        };
     if !is_sub {
         let self_name = unsafe { pyre_object::w_type_get_name(w_self) };
         let sub_name = unsafe { pyre_object::w_type_get_name(w_subtype) };
@@ -6101,7 +6106,7 @@ fn init_type_type(ns: &mut DictStorage) {
                 if mro_ptr.is_null() {
                     return Ok(pyre_object::w_tuple_new(vec![]));
                 }
-                Ok(pyre_object::w_tuple_new((*mro_ptr).clone()))
+                Ok(pyre_object::w_tuple_new((*mro_ptr).to_vec()))
             }
         },
         2,
@@ -6130,7 +6135,7 @@ fn init_type_type(ns: &mut DictStorage) {
             if mro_ptr.is_null() {
                 return Ok(pyre_object::w_list_new(vec![]));
             }
-            Ok(pyre_object::w_list_new((*mro_ptr).clone()))
+            Ok(pyre_object::w_list_new((*mro_ptr).to_vec()))
         }
     });
     dict_storage_store(ns, "mro", mro_method);

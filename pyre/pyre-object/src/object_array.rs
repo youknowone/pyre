@@ -763,6 +763,58 @@ impl IndexMut<usize> for FixedObjectArray {
     }
 }
 
+/// Allocate a fixed-length `FixedObjectArray` GcArray pre-filled from
+/// `values`, for `W_TypeObject.mro_w` (typeobject.py:179 `mro_w?[*]`, an
+/// immutable `[W_Root]`). The block is `PY_OBJECT_ARRAY_GC_TYPE_ID`
+/// (`Ptr(GcArray(OBJECTPTR))`), so the collector reads its length from the
+/// offset-0 header and forwards items[0..len]; the prepass types
+/// `w_type_get_mro`'s result as `SomeList(SomeInstance(PyObjectRef))`.
+///
+/// Allocated on the **stable** (non-moving old-gen) path via
+/// [`crate::gc_hook::try_gc_alloc_stable_raw`] — the owning `W_TypeObject`
+/// is a `malloc_typed` Box-immortal whose custom trace never fires, so the
+/// MRO block cannot be marked through its owner; keeping it old-gen means
+/// the major collector always scans it from the prebuilt-root set (the
+/// `walk_type_dicts_gc` mro forwarding), never minor-relocates it, and the
+/// caller's `values` slice stays valid because the stable allocator does
+/// not collect. Falls back to a header-prefixed `std::alloc` block when no
+/// GC hook is installed (bootstrap / pure interpreter). A young MRO element
+/// (a metaclass `mro()` returning fresh types) is registered on the
+/// remembered set via the old→young write barrier.
+pub unsafe fn alloc_mro_block_gc(values: &[PyObjectRef]) -> *mut FixedObjectArray {
+    let len = values.len();
+    let payload = FIXED_ARRAY_ITEMS_OFFSET + len * std::mem::size_of::<PyObjectRef>();
+    let raw = crate::gc_hook::try_gc_alloc_stable_raw(PY_OBJECT_ARRAY_GC_TYPE_ID, payload);
+    let block = if !raw.is_null() {
+        raw as *mut FixedObjectArray
+    } else {
+        // Bootstrap / no-hook fallback: a plain `std::alloc` block. It carries
+        // no GcHeader (the collector never observes it — `try_gc_owns_object`
+        // reports false), matching the mapdict-storage fallback contract.
+        let layout = Layout::from_size_align(payload, std::mem::align_of::<FixedObjectArray>())
+            .expect("mro block layout");
+        let mem = unsafe { alloc(layout) };
+        if mem.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        mem as *mut FixedObjectArray
+    };
+    unsafe {
+        (*block).len = len;
+        let items = (*block).items_mut_ptr();
+        for (i, &v) in values.iter().enumerate() {
+            items.add(i).write(v);
+        }
+        // Old→young barrier if the block landed in old-gen and any element is a
+        // young object: registers the block on the remembered set so a later
+        // minor collection forwards the young MRO entries.
+        if crate::gc_hook::try_gc_owns_object(block as *mut u8) {
+            crate::gc_hook::try_gc_write_barrier(block as *mut u8);
+        }
+    }
+    block
+}
+
 // ─── GcTypedArray: typed array helper for resume / blackhole ─────────
 //
 // llmodel.py:788-789: bh_new_array / bh_new_array_clear

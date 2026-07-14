@@ -932,6 +932,12 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     );
     push_alias_pair(
         &mut entries,
+        "pyre_object::gc_hook::try_gc_owns_object",
+        "pyre_object::try_gc_owns_object",
+        pyre_object::gc_hook::try_gc_owns_object as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
         "pyre_object::dict_eq_hook::has_hash_w_hook",
         "pyre_object::has_hash_w_hook",
         pyre_object::dict_eq_hook::has_hash_w_hook as *const (),

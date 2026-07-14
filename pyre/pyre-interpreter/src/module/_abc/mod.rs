@@ -110,7 +110,7 @@ fn subclass_of(cls: PyObjectRef, subclass: PyObjectRef) -> Result<bool, crate::P
     unsafe {
         let mro_ptr = w_type_get_mro(subclass);
         if !mro_ptr.is_null() {
-            for &t in &*mro_ptr {
+            for &t in (*mro_ptr).as_slice() {
                 if std::ptr::eq(t, cls) {
                     return Ok(true);
                 }

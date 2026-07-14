@@ -105,8 +105,12 @@ pub struct W_TypeObject {
     pub bases: PyObjectRef,
     /// Raw pointer to the class dict backing storage (`dict_w` analogue).
     pub dict: *mut u8,
-    /// Cached C3 MRO — W_TypeObject.mro_w.
-    pub mro_w: *mut Vec<PyObjectRef>,
+    /// Cached C3 MRO — W_TypeObject.mro_w (typeobject.py:179 `mro_w?[*]`,
+    /// an immutable `[W_Root]`). Stored as a stable `Ptr(GcArray(OBJECTPTR))`
+    /// block (`alloc_mro_block_gc`) so the length-prefixed inline layout
+    /// matches upstream and a JIT-prepass read types as
+    /// `SomeList(SomeInstance(PyObjectRef))`.
+    pub mro_w: *mut crate::object_array::FixedObjectArray,
     /// typeobject.py:184 `flag_heaptype` — immutable after creation.
     pub flag_heaptype: bool,
     /// typeobject.py:195 `layout` — pointer to shared Layout object.
@@ -714,8 +718,8 @@ pub unsafe fn w_type_get_dict_ptr(obj: PyObjectRef) -> *mut u8 {
     (*(obj as *const W_TypeObject)).dict
 }
 
-/// Get the cached MRO, or null if not yet set.
-pub unsafe fn w_type_get_mro(obj: PyObjectRef) -> *mut Vec<PyObjectRef> {
+/// Get the cached MRO block, or null if not yet set.
+pub unsafe fn w_type_get_mro(obj: PyObjectRef) -> *mut crate::object_array::FixedObjectArray {
     (*(obj as *const W_TypeObject)).mro_w
 }
 
@@ -747,7 +751,7 @@ pub unsafe fn w_type_issubtype(w_type: PyObjectRef, cls: PyObjectRef) -> bool {
         }
         return false;
     }
-    (*mro_ptr).iter().any(|&t| std::ptr::eq(t, cls))
+    (*mro_ptr).as_slice().iter().any(|&t| std::ptr::eq(t, cls))
 }
 
 /// typeobject.py:1335-1354 find_best_base — the type base whose instance
@@ -790,7 +794,7 @@ unsafe fn find_best_base(w_type: PyObjectRef) -> PyObjectRef {
 /// uncacheable) — `mutated()` then never refreshes it.
 pub unsafe fn w_type_set_mro(obj: PyObjectRef, mro: Vec<PyObjectRef>) {
     let purely_of_types = is_mro_purely_of_types(&mro);
-    (*(obj as *mut W_TypeObject)).mro_w = crate::lltype::malloc_raw(mro);
+    (*(obj as *mut W_TypeObject)).mro_w = crate::object_array::alloc_mro_block_gc(&mro);
     crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
     if !purely_of_types {
         w_type_set_version_tag(obj, 0);

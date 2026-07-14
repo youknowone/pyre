@@ -620,6 +620,14 @@ fn set_orig_class(result: PyObjectRef, alias: PyObjectRef) -> Result<(), crate::
     }
 }
 
+// `dont_look_inside`: a builtin is invoked through a runtime `BuiltinCodeFn`
+// value (`func(args)`), a call through a fn-pointer the tracer has no lowering
+// for (only static `CallPath`s lower). The builtin body is the residual
+// boundary — the JIT residualizes the whole dispatch (signature-aware kwarg
+// packing + the C-level call) instead of tracing into it, mirroring
+// `cpu.bh_call_*`. This also keeps `builtin_code_get_signature`'s raw-ptr
+// `as_ref` read out of any traced graph.
+#[majit_macros::dont_look_inside]
 fn call_builtin_code_positional(code: PyObjectRef, args: &[PyObjectRef]) -> PyResult {
     let func = unsafe { builtin_code_get(code) };
     if let Some(sig) = unsafe { crate::builtin_code_get_signature(code) } {
@@ -2187,16 +2195,26 @@ pub fn call_function_impl_raw(callable: PyObjectRef, args: &[PyObjectRef]) -> Py
     match call_function_impl_result(callable, args) {
         Ok(result) => result,
         Err(e) => {
-            // Debug diagnostic reads the real process env + writes real stderr;
-            // keep it out of the sandbox build (host access must go the seam).
-            #[cfg(not(feature = "sandbox"))]
-            if pyre_debug_call_enabled() {
-                eprintln!("[call_function_impl] error: {}", e.message);
-            }
+            log_call_error(&e.message);
             set_call_error(e);
             PY_NULL
         }
     }
+}
+
+/// Cold debug-diagnostic sink for `call_function_impl_raw`. Residualized so
+/// the `eprintln!` formatting machinery (`fmt::rt::Argument`) stays out of the
+/// traced graph — the whole body is a host-stderr write behind the env probe,
+/// which the tracer cannot model. No-op under `sandbox` (host access must go
+/// through the seam).
+#[majit_macros::dont_look_inside]
+fn log_call_error(message: &str) {
+    #[cfg(not(feature = "sandbox"))]
+    if pyre_debug_call_enabled() {
+        eprintln!("[call_function_impl] error: {message}");
+    }
+    #[cfg(feature = "sandbox")]
+    let _ = message;
 }
 
 pub(crate) fn call_function_impl(callable: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {

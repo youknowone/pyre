@@ -334,9 +334,21 @@ unsafe fn type_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
     f(&mut t.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut t.bases as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     if !t.mro_w.is_null() {
-        let mro = unsafe { &mut *t.mro_w };
-        for slot in mro.iter_mut() {
-            f(slot as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+        if pyre_object::gc_hook::try_gc_owns_object(t.mro_w as *mut u8) {
+            // GC-owned type-9 block: forward the `mro_w` field slot; the
+            // varsize walker forwards items[0..len]. Forwarding each element
+            // instead would mark the elements but leave the block itself
+            // unmarked, so a major collection would sweep it (UAF). Mirrors
+            // `list_object_custom_trace`'s GC-owned branch.
+            let mro_slot = std::ptr::addr_of_mut!(t.mro_w);
+            f(mro_slot as *mut majit_ir::GcRef);
+        } else {
+            // std::alloc fallback block (no GC hook): forward each element in
+            // place — the block is stationary and the collector does not own it.
+            let mro = unsafe { &mut *t.mro_w };
+            for slot in mro.as_mut_slice().iter_mut() {
+                f(slot as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+            }
         }
     }
     if !t.weak_subclasses.is_null() {

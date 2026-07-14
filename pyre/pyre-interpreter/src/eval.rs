@@ -414,6 +414,20 @@ unsafe fn walk_builtin_type_dicts_gc(forward: &mut dyn FnMut(&mut PyObjectRef)) 
                         );
                     }
                 }
+                // `mro_w` is a stable type-9 GcArray block (`alloc_mro_block_gc`)
+                // whose only strong root is this immortal type. The custom
+                // trace `type_object_custom_trace` never fires for a Box-immortal
+                // owner, so forward the block field slot here: the collector
+                // marks the tid-9 block and its varsize walker forwards
+                // items[0..len]. Omitting this lets the first major collection
+                // sweep the block — a UAF on the next MRO read. Guard on GC
+                // ownership so the `std::alloc` bootstrap fallback (not owned)
+                // is left in place.
+                if !t.mro_w.is_null()
+                    && pyre_object::gc_hook::try_gc_owns_object(t.mro_w as *mut u8)
+                {
+                    forward(&mut *(std::ptr::addr_of_mut!(t.mro_w) as *mut PyObjectRef));
+                }
             }
         }
     }
