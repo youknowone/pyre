@@ -13672,15 +13672,20 @@ fn try_walker_call_assembler_self_recursive(
     {
         return Ok(None);
     }
-    // Every positional argument must be a boxed int at trace time
+    // Every positional argument must be an exact boxed int at trace time
     // (`concrete_arg is_int`): the callee was traced against int locals whose
-    // speculative low-bit guard would deopt on a non-int box.  A non-int
-    // argument declines to the residual call.
+    // speculative low-bit guard would deopt on a non-int box.  `is_int` also
+    // accepts `bool`, whose payload reads through a different accessor than the
+    // int one the unbox below uses, so a `bool` argument must decline too.  A
+    // non-int (or bool) argument declines to the residual call.
     for i in 0..nparams {
         let ConcreteValue::Ref(arg_obj) = arg_concretes[2 + i] else {
             return Ok(None);
         };
-        if arg_obj.is_null() || !unsafe { pyre_object::is_int(arg_obj) } {
+        if arg_obj.is_null()
+            || !unsafe { pyre_object::is_int(arg_obj) }
+            || unsafe { pyre_object::is_bool(arg_obj) }
+        {
             return Ok(None);
         }
     }
