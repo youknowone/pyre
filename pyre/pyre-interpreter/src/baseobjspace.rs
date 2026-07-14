@@ -12082,46 +12082,19 @@ pub fn hash_w(obj: PyObjectRef) -> i64 {
 
 /// `pypy/objspace/descroperation.py:553-580 hash_w` — strict variant
 /// that raises `TypeError: unhashable type: '<typename>'` instead of
-/// silently returning a sentinel hash.  Built-in mutable containers
-/// (dict / list / set / bytearray / dict view) are explicit
-/// unhashables per `dictmultiobject.py:1431` + `listobject.py` +
-/// `setobject.py`; everything else routes through `hash_value`'s
-/// hashable type ladder.  Mirrors the entry-point gate already in
-/// `builtins::builtin_hash` so callers that need to surface PyPy's
-/// `TypeError` directly (EmptyDictStrategy `getitem` /
-/// ObjectDictStrategy lookups per `dictmultiobject.py:738-743`) can
-/// reuse the same dispatch without duplicating the type ladder.
+/// silently returning a sentinel hash.  Shares the single dispatch with
+/// the `hash()` entry point (`builtins::builtin_hash`): `try_hash_value`
+/// covers the unhashable ladder (dict / list / set / bytearray / dict
+/// view / slice per `dictmultiobject.py:1431` + `listobject.py` +
+/// `setobject.py`), memoryview, tuple / frozenset / GenericAlias /
+/// UnionType, and user-class + typed-payload `__hash__` overrides (e.g.
+/// `class D(deque): __hash__ = ...`) before the `hash_value` fallback.
+/// Callers that must surface the `TypeError` directly (EmptyDictStrategy
+/// `getitem` / ObjectDictStrategy lookups per `dictmultiobject.py:738-743`)
+/// reuse it here rather than duplicating a subset of the ladder that would
+/// drop those overrides.
 pub fn hash_w_strict(obj: PyObjectRef) -> Result<i64, PyError> {
-    if obj.is_null() {
-        return Err(PyError::type_error("hash() argument is null"));
-    }
-    unsafe {
-        let kind = if pyre_object::is_dict(obj) {
-            Some("dict")
-        } else if pyre_object::is_list(obj) {
-            Some("list")
-        } else if pyre_object::is_set(obj) {
-            Some("set")
-        } else if pyre_object::is_bytearray(obj) {
-            Some("bytearray")
-        } else if pyre_object::dictmultiobject::is_dict_view(obj) {
-            Some("dict view")
-        } else if pyre_object::sliceobject::is_slice(obj) {
-            Some("slice")
-        } else {
-            None
-        };
-        if let Some(name) = kind {
-            return Err(PyError::type_error(format!("unhashable type: '{}'", name)));
-        }
-        // A released or writable memoryview is unhashable; route through the
-        // fallible hasher so it raises the proper ValueError instead of an
-        // infallible identity hash (`memoryobject.py descr_hash`).
-        if pyre_object::memoryview::is_w_memoryview(obj) {
-            return crate::builtins::try_hash_value(obj);
-        }
-    }
-    Ok(crate::builtins::hash_value(obj))
+    crate::builtins::try_hash_value(obj)
 }
 
 /// Compare two objects for equality (returns bool, not PyObjectRef).
