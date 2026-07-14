@@ -6167,6 +6167,13 @@ impl<M: Clone> MetaInterp<M> {
                         next_global_opref,
                     },
                 );
+                self.warm_state.log_compile(
+                    green_key,
+                    num_ops_before,
+                    num_ops_after,
+                    std::time::Duration::ZERO,
+                    std::time::Duration::ZERO,
+                );
                 // warmstate.py:339-348 attach the same compiled token object.
                 self.attach_procedure_with_redirect(green_key, Arc::clone(&token));
 
@@ -6742,6 +6749,7 @@ impl<M: Clone> MetaInterp<M> {
                 .map(|rc| (**rc).clone())
                 .collect()
         };
+        let num_ops_before = trace_ops.len();
 
         if crate::majit_log_enabled() {
             eprintln!("--- retrace body (before opt) ---");
@@ -7072,6 +7080,13 @@ impl<M: Clone> MetaInterp<M> {
                         next_global_opref,
                     },
                 );
+                self.warm_state.log_compile(
+                    green_key,
+                    num_ops_before,
+                    num_combined_ops,
+                    std::time::Duration::ZERO,
+                    std::time::Duration::ZERO,
+                );
                 self.attach_procedure_with_redirect(green_key, Arc::clone(&token));
                 self.stats.loops_compiled += 1;
                 // `cpu.tracker.total_compiled_loops` is bumped inside
@@ -7164,15 +7179,31 @@ impl<M: Clone> MetaInterp<M> {
         self.clear_trace_session();
     }
 
-    /// Drop the `pending_abort_*` payload staged by `abort_trace_live`.
+    /// Successful trace teardown: same live cleanup as `abort_trace_live`,
+    /// but without abort accounting on the warm-state cell or JIT logger.
+    pub fn finish_trace_live(&mut self) {
+        self.force_finish_trace = false;
+        self.clear_retrace_state();
+        if let Some(ctx) = self.tracing.take() {
+            let green_key = ctx.green_key;
+            self.warm_state.finish_tracing(green_key);
+            self.pending_token = None;
+            self.pending_abort_green_key = Some(green_key);
+            self.pending_abort_permanent = false;
+            self.clear_trace_session();
+        }
+        self.clear_trace_session();
+    }
+
+    /// Drop the `pending_abort_*` payload staged by live trace teardown.
     ///
-    /// `abort_trace_live` always stages `(green_key, permanent)` for the
+    /// `abort_trace_live` stages `(green_key, permanent)` for the
     /// `aborted_tracing` call that normally follows on the `SwitchToBlackhole`
-    /// unwind. A *successful* compile teardown runs `abort_trace_live` for its
-    /// live cleanup but fires no `aborted_tracing` (raise_if_successful raises
+    /// unwind. Successful compile teardown stages the same payload for cleanup
+    /// parity but fires no `aborted_tracing` (raise_if_successful raises
     /// `ContinueRunningNormally`, pyjitpl.py:3095-3123), so the staged key must
-    /// be dropped here — leaving it would attach this successfully-compiled
-    /// key to a later, unrelated abort's `on_trace_abort` hook.
+    /// be dropped here — leaving it would attach this successfully-compiled key
+    /// to a later, unrelated abort's `on_trace_abort` hook.
     pub fn clear_pending_abort(&mut self) {
         self.pending_abort_green_key = None;
         self.pending_abort_permanent = false;

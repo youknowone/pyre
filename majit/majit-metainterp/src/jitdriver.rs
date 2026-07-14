@@ -2211,7 +2211,7 @@ impl<S: JitState> JitDriver<S> {
                                     // Success edge: live teardown only, no
                                     // aborted_tracing accounting (see the
                                     // CompileTrace arm above).
-                                    self.meta.abort_trace_live(false);
+                                    self.meta.finish_trace_live();
                                     self.meta.clear_pending_abort();
                                     return;
                                 }
@@ -2371,7 +2371,7 @@ impl<S: JitState> JitDriver<S> {
                                 // Success edge: live teardown only, no
                                 // aborted_tracing accounting (see the
                                 // CompileTrace arm above).
-                                self.meta.abort_trace_live(false);
+                                self.meta.finish_trace_live();
                                 self.meta.clear_pending_abort();
                                 return;
                             }

@@ -196,6 +196,7 @@ impl Logger {
 === JIT Statistics ===
 Traces compiled: {}
 Traces aborted: {}
+Traces bridged: {}
 Total ops recorded: {}
 Total ops after opt: {} ({:.0}% reduction)
 Guard failures: {}
@@ -203,6 +204,7 @@ Optimization time: {:.1}ms
 Compilation time: {:.1}ms",
             self.traces_compiled(),
             self.traces_aborted(),
+            self.bridges_compiled(),
             total_before,
             total_after,
             reduction_pct,
