@@ -6211,11 +6211,18 @@ fn try_execute_residual_call_via_executor(
     //    FRESH object and rebinds the journaled local, so a plain deliver re-run
     //    is exact with no journaling.
     //
-    // Any OTHER receiver — an object-/float-strategy list, `bytearray`, `set`,
-    // `dict`, `array`, a mixed `int-list += non-ints` that would change strategy,
-    // … — commits a mutation the rollback cannot rewind, so decline the walk
-    // here and let this loop run interpreted (exact), like the gate refusing an
-    // unsupported body op.
+    // Any OTHER *exact builtin* receiver — an object-/float-strategy list,
+    // `bytearray`, `set`, `dict`, `array`, a mixed `int-list += non-ints` that
+    // would change strategy, … — may commit a mutation the rollback cannot
+    // rewind, so decline the walk here and let this loop run interpreted
+    // (exact), like the gate refusing an unsupported body op.  A user instance
+    // must not take that decline: its `__iadd__`/`__isub__`/… has not run yet,
+    // while the in-flight `FOR_ITER` item has already been consumed.  The
+    // permanent-abort path then drops that item (the conservative delivery
+    // gate sees the loop's preceding `STORE_NAME`), silently skipping one
+    // augmented-assignment iteration at the trace-entry boundary.  Let the
+    // normal residual dispatch execute user special methods; its existing
+    // user-frame effect accounting handles any later abort.
     let inplace_list_journal: Option<(pyre_object::PyObjectRef, usize)> =
         if call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::BinaryOp
             && args.len() >= 3
@@ -6237,8 +6244,10 @@ fn try_execute_residual_call_via_executor(
                     || pyre_object::pyobject::is_tuple(lhs)
                 {
                     None
-                } else {
+                } else if pyre_object::pyobject::is_exact_builtin_instance(lhs) {
                     return Err(DispatchError::InplaceContainerMutationUnsupported { pc: op_pc });
+                } else {
+                    None
                 }
             }
         } else {
