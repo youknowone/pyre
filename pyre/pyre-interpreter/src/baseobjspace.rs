@@ -11274,6 +11274,31 @@ fn generator_close_method(args: &[PyObjectRef]) -> PyResult {
     }
 }
 
+/// generator.py:302 `_finalize_` — called by the GC finalizer when a suspended generator
+/// is collected. If the suspended frame is still live and its current instruction is
+/// covered by an exception-table handler (a `finally`/`except`/`with` cleanup), raise
+/// GeneratorExit into it so the cleanup runs.
+pub fn generator_finalize(gen_obj: PyObjectRef) -> PyResult {
+    unsafe {
+        use pyre_object::generator::*;
+        let frame_ptr = w_generator_get_frame(gen_obj);
+        if frame_ptr.is_null() {
+            return Ok(w_none()); // frame finished — nothing to close
+        }
+        let frame = &*(frame_ptr as *const crate::pyframe::PyFrame);
+        let last_instr = frame.last_instr;
+        if last_instr < 0 {
+            return Ok(w_none()); // not started — cannot be inside a handler
+        }
+        let code = frame.code();
+        let pc_bytes = (last_instr as u32) * 2; // last_instr is a word index; table is byte offsets
+        if crate::pycode::lookup_exceptiontable(&code.exceptiontable, pc_bytes).is_some() {
+            return generator_close_method(&[gen_obj]);
+        }
+    }
+    Ok(w_none())
+}
+
 /// Normalize throw() arguments into a PyError.
 ///
 /// PyPy: generator.py throw() → OperationError(w_type, w_val, tb) + normalize

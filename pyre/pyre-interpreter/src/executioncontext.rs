@@ -577,6 +577,16 @@ pub fn maybe_register_user_finalizer(obj: PyObjectRef) {
     }
 }
 
+/// Register a suspended-generator finalizer so its `finally`/`with` cleanup runs if the
+/// generator is collected while suspended inside a handler range. PyPy
+/// (generator.py:27) gates registration on `co_flags & CO_YIELD_INSIDE_TRY`; that
+/// compile-time flag is unavailable here (external compiler), so the caller gates on a
+/// non-empty code exception table — a sound necessary condition for any reachable
+/// `finally`/`except`/`with`.
+pub fn register_generator_finalizer(obj: PyObjectRef) {
+    pyre_object::gc_hook::try_gc_register_finalizer(0, obj, finalizer_queue_trigger);
+}
+
 /// Shared execution context for all frames in one interpreter run.
 ///
 /// Holds the builtin dict storage seed. Module-level frames call
@@ -2378,6 +2388,15 @@ impl UserDelAction {
     }
 
     pub fn _call_finalizer(&mut self, w_obj: PyObjectRef) {
+        if unsafe { pyre_object::generator::is_generator(w_obj) } {
+            if self.gc_disabled(w_obj) {
+                return;
+            }
+            if let Err(error) = crate::baseobjspace::generator_finalize(w_obj) {
+                report_error(self.base.space, &error, "", w_obj);
+            }
+            return;
+        }
         let Some(w_type) = crate::typedef::r#type(w_obj) else {
             return;
         };

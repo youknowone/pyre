@@ -432,6 +432,7 @@ impl FrameBox {
     /// needs for the borrowed-`&mut self` case.
     pub fn into_generator(mut self) -> crate::PyResult {
         self.fix_array_ptrs();
+        let register_final = !self.code().exceptiontable.is_empty();
         // A suspended generator frame is off the call chain — `f_back` is
         // None until a resume re-links it (`executioncontext.py enter`
         // rebinds `f_backref = topframeref`; pyre does the same at
@@ -451,6 +452,9 @@ impl FrameBox {
         let generator = pyre_object::generator::w_generator_new(frame_ptr as *mut u8);
         unsafe {
             (*frame_ptr).f_generator_nowref = generator;
+        }
+        if register_final {
+            crate::executioncontext::register_generator_finalizer(generator);
         }
         Ok(generator)
     }
