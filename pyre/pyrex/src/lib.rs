@@ -105,15 +105,27 @@ fn drain_args(parser: &mut lexopt::Parser) -> Result<Vec<String>, lexopt::Error>
     Ok(rest)
 }
 
+/// Emit the `preconfig_init_utf8_mode` fatal error for an invalid PYTHONUTF8 /
+/// `-X utf8` value and exit; the value is validated during pre-init config.
+fn fatal_utf8_config_error(detail: &str) -> ! {
+    eprintln!("Fatal Python error: preconfig_init_utf8_mode: {detail}");
+    eprintln!("Python runtime state: preinitializing");
+    eprintln!();
+    std::process::exit(1);
+}
+
 fn locale_implies_utf8_mode() -> bool {
     let locale = std::env::var("LC_ALL")
         .ok()
         .or_else(|| std::env::var("LC_CTYPE").ok())
         .or_else(|| std::env::var("LANG").ok());
-    match locale.as_deref() {
-        None | Some("") | Some("C") | Some("POSIX") => true,
-        Some(value) => !value.contains('.'),
-    }
+    // Only the legacy C/POSIX locale — or an unset/empty locale, which resolves
+    // to C — coerces utf8_mode to 1; every named locale (en_US, C.UTF-8, …)
+    // leaves it 0.
+    matches!(
+        locale.as_deref(),
+        None | Some("") | Some("C") | Some("POSIX")
+    )
 }
 
 fn resolve_utf8_mode(flags: &LaunchFlags) -> i64 {
@@ -123,7 +135,11 @@ fn resolve_utf8_mode(flags: &LaunchFlags) -> i64 {
     if !flags.ignore_environment {
         if let Ok(value) = std::env::var("PYTHONUTF8") {
             if !value.is_empty() {
-                return if value == "0" { 0 } else { 1 };
+                return match value.as_str() {
+                    "0" => 0,
+                    "1" => 1,
+                    _ => fatal_utf8_config_error("invalid PYTHONUTF8 environment variable value"),
+                };
             }
         }
     }
@@ -171,6 +187,9 @@ fn parse_args(binary_name: &str) -> Result<(RunMode, LaunchFlags, Vec<String>), 
                     "dev" => flags.dev_mode = true,
                     "utf8" | "utf8=1" => flags.utf8_mode = Some(1),
                     "utf8=0" => flags.utf8_mode = Some(0),
+                    _ if option.starts_with("utf8=") => {
+                        fatal_utf8_config_error("invalid -X utf8 option value")
+                    }
                     _ => {}
                 }
             }
