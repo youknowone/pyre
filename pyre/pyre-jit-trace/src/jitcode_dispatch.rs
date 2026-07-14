@@ -417,7 +417,6 @@ pub struct InlineFrame {
 /// Per-trace-attempt walk session, owned by the walk driver and threaded
 /// through [`WalkContext`] — `MetaInterp.framestack` (`pyjitpl.py:2475`,
 /// `:2487`; depth scan `:1390`). Innermost level last.
-#[derive(Default)]
 pub struct WalkSession {
     /// Inlined callee levels. Parent snapshots are outermost-first, matching
     /// `Snapshot.frames`; a caller is pushed at its inline CALL and popped
@@ -428,6 +427,30 @@ pub struct WalkSession {
     /// the outer snapshot root's py_pc→jitcode translation, so abort-point
     /// flushing must decline after the sub-walk unwinds.
     pub abort_in_subwalk: bool,
+    /// Blackhole `tmpreg_r`/`tmpreg_i`/`tmpreg_f` (`blackhole.py:661-679`):
+    /// the single-slot scratch that `insert_renamings` (`flatten.py:154`)
+    /// routes a cyclic parallel move through via `*_push`/`*_pop` pairs.
+    /// `ref_push/r` writes the source Ref (+ its concrete shadow) here;
+    /// `ref_pop/>r` reads it back into a dst register.  Persisted on the
+    /// per-walk session because a push and its matching pop straddle
+    /// intervening `*_copy` ops within one trampoline.
+    pub tmpreg_r: OpRef,
+    pub tmpreg_r_concrete: ConcreteValue,
+    pub tmpreg_i: OpRef,
+    pub tmpreg_f: OpRef,
+}
+
+impl Default for WalkSession {
+    fn default() -> Self {
+        Self {
+            framestack: Vec::new(),
+            abort_in_subwalk: false,
+            tmpreg_r: OpRef::NONE,
+            tmpreg_r_concrete: ConcreteValue::Null,
+            tmpreg_i: OpRef::NONE,
+            tmpreg_f: OpRef::NONE,
+        }
+    }
 }
 
 /// Compile-time-constant frame fields of an inlined callee.
@@ -23251,6 +23274,88 @@ fn handle(
                     bank: "f",
                 })?;
             *slot = src_val;
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
+        "ref_push/r" => {
+            // Blackhole `bhimpl_ref_push` (`blackhole.py:664-666`):
+            // `self.tmpreg_r = a`.  `insert_renamings` (`flatten.py:154`)
+            // emits `*_push`/`*_pop` around a cyclic parallel move — the
+            // swap `r_a <-> r_b` lowers to `push r_b; copy r_b<-r_a;
+            // pop r_a` so the overwritten value survives in the tmpreg.
+            // Pure SSA-level scratch move, no IR op recorded.  Operand
+            // layout `r`: 1B src.
+            let src_val = read_ref_reg(code, op, 0, ctx)?;
+            let src_concrete = read_ref_reg_concrete(code, op, 0, ctx);
+            {
+                let mut sess = ctx.session.borrow_mut();
+                sess.tmpreg_r = src_val;
+                sess.tmpreg_r_concrete = src_concrete;
+            }
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
+        "ref_pop/>r" => {
+            // Blackhole `bhimpl_ref_pop` (`blackhole.py:674-676`):
+            // `return self.get_tmpreg_r()`.  Reads the value stashed by
+            // the matching `ref_push/r` back into a dst register, in
+            // lock-step with its concrete shadow.  Operand layout `>r`:
+            // 1B dst.
+            let (val, concrete) = {
+                let sess = ctx.session.borrow();
+                (sess.tmpreg_r, sess.tmpreg_r_concrete)
+            };
+            let dst = code[op.pc + 1] as usize;
+            write_ref_reg(ctx, op.pc, dst, val, concrete)?;
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
+        "int_push/i" => {
+            // Blackhole `bhimpl_int_push` (`blackhole.py:661-663`):
+            // `self.tmpreg_i = a`.  Int-bank sibling of `ref_push/r`.
+            // Operand layout `i`: 1B src.
+            let src_val = read_int_reg(code, op, 0, ctx)?;
+            ctx.session.borrow_mut().tmpreg_i = src_val;
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
+        "int_pop/>i" => {
+            // Blackhole `bhimpl_int_pop` (`blackhole.py:671-673`).
+            // Operand layout `>i`: 1B dst.
+            let val = ctx.session.borrow().tmpreg_i;
+            let dst = code[op.pc + 1] as usize;
+            let len = ctx.registers_i.len();
+            let slot = ctx
+                .registers_i
+                .get_mut(dst)
+                .ok_or(DispatchError::RegisterOutOfRange {
+                    pc: op.pc,
+                    reg: dst,
+                    len,
+                    bank: "i",
+                })?;
+            *slot = val;
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
+        "float_push/f" => {
+            // Blackhole `bhimpl_float_push` (`blackhole.py:667-669`).
+            // Operand layout `f`: 1B src.
+            let src_val = read_float_reg(code, op, 0, ctx)?;
+            ctx.session.borrow_mut().tmpreg_f = src_val;
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
+        "float_pop/>f" => {
+            // Blackhole `bhimpl_float_pop` (`blackhole.py:677-679`).
+            // Operand layout `>f`: 1B dst.
+            let val = ctx.session.borrow().tmpreg_f;
+            let dst = code[op.pc + 1] as usize;
+            let len = ctx.registers_f.len();
+            let slot = ctx
+                .registers_f
+                .get_mut(dst)
+                .ok_or(DispatchError::RegisterOutOfRange {
+                    pc: op.pc,
+                    reg: dst,
+                    len,
+                    bank: "f",
+                })?;
+            *slot = val;
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         "ref_copy/r>r" => {
