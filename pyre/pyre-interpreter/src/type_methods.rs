@@ -493,7 +493,7 @@ fn cps_to_str(cps: &[CodePoint]) -> PyObjectRef {
 /// A lone surrogate is not whitespace.
 fn cp_is_whitespace(cp: CodePoint) -> bool {
     match cp.to_char() {
-        Some(c) => c.is_whitespace(),
+        Some(c) => classify::is_space(c),
         None => false,
     }
 }
@@ -712,7 +712,7 @@ pub fn str_method_format_map(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 
 /// `pypy/objspace/std/unicodeobject.py W_UnicodeObject._strip` —
 /// `s.strip([chars])`.  When `chars` is missing or None, defaults to
-/// ASCII whitespace (the `str::trim` set).  When provided, removes
+/// the same Unicode whitespace predicate as `str.isspace()`.  When provided, removes
 /// any character contained in `chars` from each end (NOT a substring
 /// match — `'aabaa'.strip('a') == 'b'`).
 fn strip_chars(s: &Wtf8, chars: Option<&Wtf8>, left: bool, right: bool) -> Wtf8Buf {
@@ -721,13 +721,13 @@ fn strip_chars(s: &Wtf8, chars: Option<&Wtf8>, left: bool, right: bool) -> Wtf8B
     if left {
         current = match chars_set.as_ref() {
             Some(set) => current.trim_start_matches(|cp: CodePoint| set.contains(&cp)),
-            None => current.trim_start(),
+            None => current.trim_start_matches(cp_is_whitespace),
         };
     }
     if right {
         current = match chars_set.as_ref() {
             Some(set) => current.trim_end_matches(|cp: CodePoint| set.contains(&cp)),
-            None => current.trim_end(),
+            None => current.trim_end_matches(cp_is_whitespace),
         };
     }
     current.to_wtf8_buf()
@@ -4381,10 +4381,27 @@ pub fn str_method_rpartition(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 }
 
 /// PyPy: unicodeobject.py descr_splitlines.
-/// Walks `\n`, `\r`, and `\r\n` boundaries explicitly so that
+/// Walks the Unicode line-boundary set explicitly so that
 /// `keepends=True` retains the terminator on each emitted line and a
 /// trailing `\n` does NOT produce an extra empty entry — matching
 /// `'a\nb\n'.splitlines() == ['a', 'b']`.
+fn cp_is_linebreak(cp: CodePoint) -> bool {
+    matches!(
+        cp.to_char(),
+        Some(
+            '\n' | '\r'
+                | '\u{000b}'
+                | '\u{000c}'
+                | '\u{001c}'
+                | '\u{001d}'
+                | '\u{001e}'
+                | '\u{0085}'
+                | '\u{2028}'
+                | '\u{2029}'
+        )
+    )
+}
+
 pub fn str_method_splitlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_receiver(args, "splitlines")?;
     let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
@@ -4401,10 +4418,7 @@ pub fn str_method_splitlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
         "keepends",
         pos.get(1).is_some(),
     )?;
-    // `\n` / `\r` are single bytes that cannot occur inside a multi-byte
-    // WTF-8 sequence, so the line boundaries are found by walking bytes;
-    // each emitted slice cuts on a code-point boundary.
-    let bytes = unsafe { w_str_get_wtf8(pos[0]) }.as_bytes();
+    let cps: Vec<CodePoint> = unsafe { w_str_get_wtf8(pos[0]) }.code_points().collect();
     // keepends is positional-or-keyword.
     let keepends = crate::builtins::kwarg_get(kwargs, "keepends")
         .or_else(|| pos.get(1).copied())
@@ -4414,22 +4428,25 @@ pub fn str_method_splitlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     let mut parts: Vec<PyObjectRef> = Vec::new();
     let mut start = 0usize;
     let mut i = 0usize;
-    while i < bytes.len() {
-        if bytes[i] == b'\n' || bytes[i] == b'\r' {
+    while i < cps.len() {
+        if cp_is_linebreak(cps[i]) {
             let mut term_end = i + 1;
-            if bytes[i] == b'\r' && term_end < bytes.len() && bytes[term_end] == b'\n' {
+            if cps[i].to_char() == Some('\r')
+                && term_end < cps.len()
+                && cps[term_end].to_char() == Some('\n')
+            {
                 term_end += 1;
             }
             let end = if keepends { term_end } else { i };
-            parts.push(wtf8_slice_str(&bytes[start..end]));
+            parts.push(cps_to_str(&cps[start..end]));
             start = term_end;
             i = term_end;
         } else {
             i += 1;
         }
     }
-    if start < bytes.len() {
-        parts.push(wtf8_slice_str(&bytes[start..]));
+    if start < cps.len() {
+        parts.push(cps_to_str(&cps[start..]));
     }
     Ok(w_list_new(parts))
 }

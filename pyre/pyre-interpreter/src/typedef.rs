@@ -7850,13 +7850,20 @@ fn init_property_type(ns: &mut DictStorage) {
 }
 
 /// `self` as a plain int — `int.real` / `numerator` / `conjugate` /
-/// `as_integer_ratio` return the integer value, so a `bool` receiver
-/// yields `1` / `0` rather than itself.
+/// `as_integer_ratio` and the integer conversion dunders return the
+/// integer value, so a non-exact receiver is down-converted.
 fn int_as_plain_int(args: &[PyObjectRef]) -> PyObjectRef {
     let obj = args.first().copied().unwrap_or(pyre_object::w_int_new(0));
     unsafe {
         if pyre_object::is_bool(obj) {
             return pyre_object::w_int_new(pyre_object::w_bool_get_value(obj) as i64);
+        }
+        if pyre_object::is_int(obj)
+            && !(pyre_object::tagged_int::CAN_BE_TAGGED
+                && pyre_object::tagged_int::is_tagged_int(obj))
+            && (*obj).w_class != pyre_object::get_instantiate(&pyre_object::INT_TYPE)
+        {
+            return pyre_object::w_int_new(pyre_object::w_int_get_value(obj));
         }
     }
     obj
@@ -8533,16 +8540,13 @@ fn init_int_type(ns: &mut DictStorage) {
             int_from_bytes,
         )),
     );
-    // int.__index__ / __int__ / __trunc__ — identity
+    // int.__index__ / __int__ / __trunc__ — exact ints preserve identity;
+    // subclasses and bools are normalized by `int_as_plain_int`.
     for method in ["__index__", "__int__", "__trunc__"] {
         dict_storage_store(
             ns,
             method,
-            make_builtin_function_with_arity(
-                method,
-                |args| Ok(args.first().copied().unwrap_or(pyre_object::w_int_new(0))),
-                1,
-            ),
+            make_builtin_function_with_arity(method, |args| Ok(int_as_plain_int(args)), 1),
         );
     }
     // int.conjugate — identity (bool → int)

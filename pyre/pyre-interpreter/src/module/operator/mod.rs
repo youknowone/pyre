@@ -9,16 +9,8 @@ fn op_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             args.len()
         )));
     }
-    let obj = args[0];
-    unsafe {
-        if is_int(obj) {
-            return Ok(obj);
-        }
-        if is_bool(obj) {
-            return Ok(w_int_new(if w_bool_get_value(obj) { 1 } else { 0 }));
-        }
-    }
-    Ok(crate::call_function_or_identity(obj, "__index__"))
+    let indexed = crate::baseobjspace::space_index(args[0])?;
+    unsafe { Ok(range_bigint_to_obj(range_obj_to_bigint(indexed))) }
 }
 
 /// Shared body for the binary-arithmetic thunks (`add`/`sub`/`mul`): a

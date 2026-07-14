@@ -5221,35 +5221,52 @@ fn parse_int_from_str(s: &str, base: u32) -> Result<PyObjectRef, crate::PyError>
     } else {
         (1i64, s)
     };
-    let (radix, digits) = if base == 0 {
+    let (radix, digits, had_base_prefix) = if base == 0 {
         if let Some(r) = rest.strip_prefix("0x").or(rest.strip_prefix("0X")) {
-            (16u32, r)
+            (16u32, r, true)
         } else if let Some(r) = rest.strip_prefix("0b").or(rest.strip_prefix("0B")) {
-            (2u32, r)
+            (2u32, r, true)
         } else if let Some(r) = rest.strip_prefix("0o").or(rest.strip_prefix("0O")) {
-            (8u32, r)
+            (8u32, r, true)
         } else {
-            (10u32, rest)
+            (10u32, rest, false)
         }
     } else {
-        let stripped = match base {
-            16 => rest
-                .strip_prefix("0x")
-                .or(rest.strip_prefix("0X"))
-                .unwrap_or(rest),
-            2 => rest
-                .strip_prefix("0b")
-                .or(rest.strip_prefix("0B"))
-                .unwrap_or(rest),
-            8 => rest
-                .strip_prefix("0o")
-                .or(rest.strip_prefix("0O"))
-                .unwrap_or(rest),
-            _ => rest,
+        let (stripped, had_base_prefix) = match base {
+            16 => match rest.strip_prefix("0x").or(rest.strip_prefix("0X")) {
+                Some(r) => (r, true),
+                None => (rest, false),
+            },
+            2 => match rest.strip_prefix("0b").or(rest.strip_prefix("0B")) {
+                Some(r) => (r, true),
+                None => (rest, false),
+            },
+            8 => match rest.strip_prefix("0o").or(rest.strip_prefix("0O")) {
+                Some(r) => (r, true),
+                None => (rest, false),
+            },
+            _ => (rest, false),
         };
-        (base, stripped)
+        (base, stripped, had_base_prefix)
     };
-    let cleaned: String = digits.chars().filter(|&c| c != '_').collect();
+    let is_digit = |c: char| c.to_digit(radix).is_some();
+    let digit_chars: Vec<char> = digits.chars().collect();
+    let mut cleaned = String::with_capacity(digits.len());
+    for (i, &c) in digit_chars.iter().enumerate() {
+        if c == '_' {
+            let after_prefix = had_base_prefix && i == 0;
+            let prev_is_digit = i > 0 && is_digit(digit_chars[i - 1]);
+            let next_is_digit = i + 1 < digit_chars.len() && is_digit(digit_chars[i + 1]);
+            if next_is_digit && (prev_is_digit || after_prefix) {
+                continue;
+            }
+            return Err(crate::PyError::new(
+                crate::PyErrorKind::ValueError,
+                format!("invalid literal for int() with base {base}: '{s}'"),
+            ));
+        }
+        cleaned.push(c);
+    }
     if let Ok(v) = i64::from_str_radix(&cleaned, radix) {
         return Ok(w_int_new(sign * v));
     }
