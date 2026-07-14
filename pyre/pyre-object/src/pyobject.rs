@@ -644,6 +644,17 @@ pub fn all_foreign_pytypes() -> &'static [(&'static PyType, &'static PyType)] {
             &crate::interp_exceptions::EXC_NAME_ERROR_TYPE,
             &crate::interp_exceptions::EXC_EXCEPTION_TYPE,
         ),
+        // UnboundLocalError subclasses NameError; listed after it so the
+        // topological-order constraint of the foreign-pytype loop holds.
+        // Its GC tid is pre-registered to the shared `W_BaseException`
+        // tid by the per-ExcKind loop in `pyre-jit/src/eval.rs`, so that
+        // loop skips this entry; without the pre-registration it would
+        // assign an undersized standalone `sizeof(PyObject)` tid and shift
+        // every hardcoded post-loop GC tid.
+        (
+            &crate::interp_exceptions::EXC_UNBOUND_LOCAL_ERROR_TYPE,
+            &crate::interp_exceptions::EXC_NAME_ERROR_TYPE,
+        ),
         // LookupError is the intermediate parent of IndexError and
         // KeyError per `pypy/module/exceptions/interp_exceptions.py:474
         // W_LookupError = _new_exception('LookupError', W_Exception,

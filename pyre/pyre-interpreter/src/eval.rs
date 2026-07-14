@@ -2921,6 +2921,14 @@ impl OpcodeStepExecutor for PyFrame {
     // ── DeleteFast ──
 
     fn delete_fast(&mut self, idx: usize) -> Result<(), PyError> {
+        if self.locals_w()[idx].is_null() {
+            let code = unsafe { &*crate::pyframe_get_pycode(self) };
+            let name = code.varnames.get(idx).map(String::as_str).unwrap_or("");
+            return Err(PyError::unbound_local_error_with_name(
+                format!("local variable '{name}' referenced before assignment"),
+                name,
+            ));
+        }
         self.locals_w_mut()[idx] = PY_NULL;
         Ok(())
     }
