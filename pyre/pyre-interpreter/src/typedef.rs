@@ -8036,19 +8036,30 @@ int_binop_rev!(
 /// three-argument modular power.
 fn int_dunder_pow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::arity_pow(args)?;
-    if unsafe { pyre_object::pyobject::is_int_or_long(args[1]) } {
-        if args.len() >= 3 {
-            if unsafe { pyre_object::pyobject::is_none(args[2]) } {
-                crate::objspace::descroperation::pow_builtin(args[0], args[1])
-            } else {
-                crate::objspace::descroperation::pow3(args[0], args[1], args[2])
-            }
-        } else {
-            crate::objspace::descroperation::pow_builtin(args[0], args[1])
-        }
-    } else {
-        Ok(pyre_object::w_not_implemented())
+    // intobject.py:674 descr_pow — a non-int exponent defers to the other
+    // operand's reflected slot.
+    if !unsafe { pyre_object::pyobject::is_int_or_long(args[1]) } {
+        return Ok(pyre_object::w_not_implemented());
     }
+    if args.len() >= 3 && !unsafe { pyre_object::pyobject::is_none(args[2]) } {
+        // Only an integer modulus routes through the modular-power path.
+        // The object protocol has no ternary reflected slot, so an int base
+        // with a non-int modulus yields NotImplemented and the caller raises
+        // the three-operand type error.
+        if !unsafe { pyre_object::pyobject::is_int_or_long(args[2]) } {
+            return Ok(pyre_object::w_not_implemented());
+        }
+        // intobject.py:686 — self, exponent and modulus are all integers, so
+        // compute the modular power here rather than re-entering the ternary
+        // dispatch (which would recurse back into this slot).
+        return match crate::objspace::descroperation::try_int_long_pow_with_modulo(
+            args[0], args[1], args[2],
+        )? {
+            Some(result) => Ok(result),
+            None => Ok(pyre_object::w_not_implemented()),
+        };
+    }
+    crate::objspace::descroperation::pow_builtin(args[0], args[1])
 }
 
 float_binop_fwd!(
@@ -8107,12 +8118,24 @@ float_binop_rev!(
     float_dunder_rdivmod,
     crate::objspace::descroperation::divmod_builtin
 );
+/// floatobject.py:588 — a float `__pow__`/`__rpow__` rejects a ternary
+/// modulus argument, which is meaningful only for integer power.
+fn float_pow_reject_modulus(args: &[PyObjectRef]) -> Result<(), crate::PyError> {
+    if args.len() >= 3 && !unsafe { pyre_object::pyobject::is_none(args[2]) } {
+        return Err(crate::PyError::type_error(
+            "pow() 3rd argument not allowed unless all arguments are integers",
+        ));
+    }
+    Ok(())
+}
+
 /// `float.__pow__` / `__rpow__` — the ternary-power slot accepts an
 /// optional modulus argument, so arity is validated as one-or-two.
 fn float_dunder_pow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::arity_pow(args)?;
     let b = args[1];
     if unsafe { pyre_object::pyobject::is_float(b) || pyre_object::pyobject::is_int_or_long(b) } {
+        float_pow_reject_modulus(args)?;
         crate::objspace::descroperation::pow_builtin(args[0], b)
     } else {
         Ok(pyre_object::w_not_implemented())
@@ -8122,6 +8145,7 @@ fn float_dunder_rpow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     crate::type_methods::arity_pow(args)?;
     let b = args[1];
     if unsafe { pyre_object::pyobject::is_float(b) || pyre_object::pyobject::is_int_or_long(b) } {
+        float_pow_reject_modulus(args)?;
         crate::objspace::descroperation::pow_builtin(b, args[0])
     } else {
         Ok(pyre_object::w_not_implemented())
@@ -8160,11 +8184,21 @@ complex_binop_rev!(
     complex_dunder_rtruediv,
     crate::objspace::descroperation::truediv_builtin
 );
+/// complexobject.py:525 — a complex `__pow__`/`__rpow__` rejects a ternary
+/// modulus argument with `ValueError: complex modulo`.
+fn complex_pow_reject_modulus(args: &[PyObjectRef]) -> Result<(), crate::PyError> {
+    if args.len() >= 3 && !unsafe { pyre_object::pyobject::is_none(args[2]) } {
+        return Err(crate::PyError::value_error("complex modulo"));
+    }
+    Ok(())
+}
+
 /// `complex.__pow__` / `__rpow__` — the ternary-power slot accepts an
 /// optional modulus argument, so arity is validated as one-or-two.
 fn complex_dunder_pow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::arity_pow(args)?;
     if complex_binop_operand(args[1]) {
+        complex_pow_reject_modulus(args)?;
         crate::objspace::descroperation::pow_builtin(args[0], args[1])
     } else {
         Ok(pyre_object::w_not_implemented())
@@ -8173,6 +8207,7 @@ fn complex_dunder_pow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 fn complex_dunder_rpow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::arity_pow(args)?;
     if complex_binop_operand(args[1]) {
+        complex_pow_reject_modulus(args)?;
         crate::objspace::descroperation::pow_builtin(args[1], args[0])
     } else {
         Ok(pyre_object::w_not_implemented())

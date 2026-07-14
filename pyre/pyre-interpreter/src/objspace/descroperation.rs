@@ -2495,25 +2495,6 @@ pub(crate) unsafe fn lookup_type_special(obj: PyObjectRef, dunder: &str) -> Opti
     crate::typedef::r#type(obj).and_then(|tp| lookup_in_type(tp, dunder))
 }
 
-/// descroperation.py `_binop_impl` — when `type(rhs)` is a proper
-/// subtype of `type(lhs)` and defines the reflected dunder, the
-/// reflected operand is tried first.
-pub(crate) unsafe fn should_try_reverse_first(
-    lhs: PyObjectRef,
-    rhs: PyObjectRef,
-    rdunder: &str,
-) -> bool {
-    let Some(lhs_type) = crate::typedef::r#type(lhs) else {
-        return false;
-    };
-    let Some(rhs_type) = crate::typedef::r#type(rhs) else {
-        return false;
-    };
-    !std::ptr::eq(lhs_type, rhs_type)
-        && issubtype_w(rhs_type, lhs_type)
-        && lookup_in_type(rhs_type, rdunder).is_some()
-}
-
 /// Call a special method and treat NotImplemented as "no result", per
 /// descroperation.py `_check_notimplemented`.
 pub(crate) fn try_call_special(
@@ -2648,39 +2629,6 @@ pub(crate) fn try_inplace_special(
     Ok(None)
 }
 
-/// descroperation.py:399 `def pow(space, w_obj1, w_obj2, w_obj3)` —
-/// the same forward/reverse dance as the binary version but threading
-/// the third (modulo) operand through to both arms.
-pub(crate) fn try_dispatch_ternary_special(
-    lhs: PyObjectRef,
-    rhs: PyObjectRef,
-    third: PyObjectRef,
-    dunder: &str,
-    rdunder: &str,
-) -> Result<Option<PyObjectRef>, PyError> {
-    let try_reverse_first = unsafe { should_try_reverse_first(lhs, rhs, rdunder) };
-    if try_reverse_first {
-        if let Some(method) = unsafe { lookup_type_special(rhs, rdunder) } {
-            if let Some(result) = try_call_special(method, &[rhs, lhs, third])? {
-                return Ok(Some(result));
-            }
-        }
-    }
-    if let Some(method) = unsafe { lookup_type_special(lhs, dunder) } {
-        if let Some(result) = try_call_special(method, &[lhs, rhs, third])? {
-            return Ok(Some(result));
-        }
-    }
-    if !try_reverse_first {
-        if let Some(method) = unsafe { lookup_type_special(rhs, rdunder) } {
-            if let Some(result) = try_call_special(method, &[rhs, lhs, third])? {
-                return Ok(Some(result));
-            }
-        }
-    }
-    Ok(None)
-}
-
 /// `(int|long) ** (int|long) % (int|long)` fast path used by `space.pow`
 /// when a modulus is supplied — longobject.py `int_pow`.
 pub(crate) fn try_int_long_pow_with_modulo(
@@ -2755,34 +2703,51 @@ pub(crate) fn box_bigint_result(value: BigInt) -> PyObjectRef {
     }
 }
 
+/// `%T` — the runtime type name of `obj` (`space.type(obj).name`), falling
+/// back to the layout-level type for objects without a Python type.
+fn operand_type_name(obj: PyObjectRef) -> String {
+    unsafe {
+        match crate::typedef::r#type(obj) {
+            Some(tp) => pyre_object::w_type_get_name(tp).to_string(),
+            None => (*ll_type(obj)).name.to_string(),
+        }
+    }
+}
+
 pub(crate) fn binary_builtin_type_error(
     opname: &str,
     lhs: PyObjectRef,
     rhs: PyObjectRef,
 ) -> PyError {
-    let lhs_name = unsafe {
-        match crate::typedef::r#type(lhs) {
-            Some(tp) => pyre_object::w_type_get_name(tp).to_string(),
-            None => (*ll_type(lhs)).name.to_string(),
-        }
-    };
-    let rhs_name = unsafe {
-        match crate::typedef::r#type(rhs) {
-            Some(tp) => pyre_object::w_type_get_name(tp).to_string(),
-            None => (*ll_type(rhs)).name.to_string(),
-        }
-    };
+    let lhs_name = operand_type_name(lhs);
+    let rhs_name = operand_type_name(rhs);
     PyError::type_error(format!(
         "unsupported operand type(s) for {opname}: '{lhs_name}' and '{rhs_name}'"
     ))
 }
 
-/// 3-arg `pow(a, b, c)` dispatch — pypy/objspace/descroperation.py:399
+/// The three-operand form of [`binary_builtin_type_error`] for `pow(a, b, c)`
+/// — descroperation.py:469 `unsupported operand type(s) for pow(): T, T, T`.
+pub(crate) fn ternary_builtin_type_error(
+    opname: &str,
+    a: PyObjectRef,
+    b: PyObjectRef,
+    c: PyObjectRef,
+) -> PyError {
+    let a_name = operand_type_name(a);
+    let b_name = operand_type_name(b);
+    let c_name = operand_type_name(c);
+    PyError::type_error(format!(
+        "unsupported operand type(s) for {opname}: '{a_name}', '{b_name}', '{c_name}'"
+    ))
+}
+
+/// 3-arg `pow(a, b, c)` dispatch — pypy/objspace/descroperation.py:441
 /// `def pow(space, w_obj1, w_obj2, w_obj3)`. Tries the int/long modulus
-/// fast path, then forward `__pow__` and reverse `__rpow__` with the
-/// usual NotImplemented fallback. PyPy's MethodTable lists `pow` with
-/// arity=3 (`('pow', '**', 3, ['__pow__', '__rpow__'])`) so a 3-arg
-/// space op exists for the proxy wrapper to call.
+/// fast path, then only the forward `__pow__` on the base; the reflected
+/// `__rpow__` is not consulted for three-arg power (unlike two-arg), so a
+/// forward `NotImplemented` raises the three-operand type error rather than
+/// falling through to the right operand.
 pub fn pow3(base: PyObjectRef, exp: PyObjectRef, modulus: PyObjectRef) -> PyResult {
     let base = unwrap_cell(base);
     let exp = unwrap_cell(exp);
@@ -2790,13 +2755,16 @@ pub fn pow3(base: PyObjectRef, exp: PyObjectRef, modulus: PyObjectRef) -> PyResu
     if unsafe { is_none(modulus) } {
         return pow(base, exp);
     }
-    if let Some(result) = try_int_long_pow_with_modulo(base, exp, modulus)? {
-        return Ok(result);
+    // descroperation.py:459 — three-arg power looks up only the forward
+    // `__pow__` on the base (so a subclass override is honoured) and never
+    // the reflected `__rpow__`. The integer modular-power computation lives
+    // in `int.__pow__`, reached through this lookup.
+    if let Some(method) = unsafe { lookup_type_special(base, "__pow__") } {
+        if let Some(result) = try_call_special(method, &[base, exp, modulus])? {
+            return Ok(result);
+        }
     }
-    if let Some(result) = try_dispatch_ternary_special(base, exp, modulus, "__pow__", "__rpow__")? {
-        return Ok(result);
-    }
-    Err(binary_builtin_type_error("pow()", base, exp))
+    Err(ternary_builtin_type_error("pow()", base, exp, modulus))
 }
 
 /// `divmod(a, b)` dispatch — pypy/interpreter/baseobjspace.py:2159

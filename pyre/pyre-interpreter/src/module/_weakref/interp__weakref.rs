@@ -1092,10 +1092,10 @@ proxy_binary_reflected!(proxy_rmod, crate::baseobjspace::mod_);
 // pow / rpow — interp__weakref.py:363 generates a 3-arg wrapper because
 // `('pow', '**', 3, ['__pow__', '__rpow__'])` has arity=3 but
 // `forcing_count = len(special_methods) = 2`, so the optional modulo
-// operand passes through unforced. The wrapper hands the result to
-// `space.pow(w_obj0, w_obj1, w_obj2)` (descroperation.py:399), so
-// NotImplemented from forward `__pow__` properly falls through to the
-// reflected `__rpow__` and vice versa.
+// operand passes through unforced. The two-arg form hands off to
+// `space.pow`, whose forward/reverse dance lets `__rpow__` answer; the
+// three-arg form hands off to `space.pow3`, which consults only the
+// forward `__pow__` (descroperation.py:450) and never the reflected slot.
 pub fn proxy_pow(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let w_obj0 = force(args[0])?;
     let w_obj1 = force(args[1])?;
@@ -1967,12 +1967,13 @@ mod tests {
         assert_eq!(unsafe { pyre_object::w_int_get_value(result) }, 7777);
     }
 
-    /// 3-arg `pow(proxy, b, c)` must end up in
-    /// `space.pow3 → try_dispatch_ternary_special`, so a forward
-    /// `__pow__` returning NotImplemented falls through to the
-    /// reflected `__rpow__`.
+    /// 3-arg `pow(proxy, b, c)` reaches `space.pow3`, which consults only the
+    /// forward `__pow__` on the base — the reflected `__rpow__` is not tried
+    /// for ternary power (descroperation.py:450). A forward `NotImplemented`
+    /// therefore raises the three-operand type error rather than falling
+    /// through to the right operand's `__rpow__`.
     #[test]
-    fn test_proxy_pow_three_arg_falls_through_to_rpow() {
+    fn test_proxy_pow_three_arg_does_not_use_rpow() {
         crate::typedef::init_typeobjects();
         let lhs_type = crate::typedef::make_builtin_type("Pow3Lhs", |ns| {
             crate::dict_storage_store(
@@ -1987,18 +1988,18 @@ mod tests {
             crate::dict_storage_store(
                 ns,
                 "__rpow__",
-                crate::make_builtin_function("__rpow__", |args| {
-                    // Echo the modulus operand so we can confirm it
-                    // threaded through to the reflected wrapper.
-                    Ok(args[2])
-                }),
+                crate::make_builtin_function("__rpow__", |args| Ok(args[2])),
             );
         });
         let lhs = pyre_object::objectobject::w_instance_new(lhs_type);
         let rhs = pyre_object::objectobject::w_instance_new(rhs_type);
         let proxy_lhs = W_Proxy_new(lhs, PY_NULL);
-        let result = proxy_pow(&[proxy_lhs, rhs, pyre_object::w_int_new(99)]).unwrap();
-        assert_eq!(unsafe { pyre_object::w_int_get_value(result) }, 99);
+        let err = proxy_pow(&[proxy_lhs, rhs, pyre_object::w_int_new(99)]).unwrap_err();
+        assert_eq!(err.kind, crate::PyErrorKind::TypeError);
+        assert_eq!(
+            err.message,
+            "unsupported operand type(s) for pow(): 'Pow3Lhs', 'Pow3Rhs', 'int'"
+        );
     }
 
     /// `divmod(proxy, rhs)` where `lhs.__divmod__` returns NotImplemented
