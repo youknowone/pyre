@@ -841,18 +841,22 @@ const WASM_DIRECT_RESIDUAL_CALL: bool = true;
 /// trampoline: void / float / release-GIL / cond / assembler calls, a missing
 /// call descr, or an arg-count/descr-shape mismatch (defensive).
 ///
-/// `CallMayForce*` is deliberately excluded (kept on the `jit_call` trampoline):
-/// `jf_descr` "is also set immediately before doing CALL_MAY_FORCE", and the
-/// direct `call_indirect` does not reproduce that pre-call force-descr store
-/// (`guard_not_forced`'s source). The wasm backend has no force tokens (the
-/// virtualizable is materialized), so a plain call would in fact be sound — but
-/// the fast-path stays parity-conservative and only covers the non-forceable
-/// residual calls (`Call{,Pure,Loopinvariant}{I,R}`), which are the hot cases.
+/// This includes `CallMayForce{I,R}` when their ABI is uniformly i64: the wasm
+/// virtualizable is always materialized, so `GuardNotForced` is a no-op and a
+/// direct call is sound. Float / release-GIL / cond / assembler calls and
+/// non-reflectable descrs remain on the trampoline.
 fn residual_call_i64_arity(op: &Op) -> Option<usize> {
     use OpCode::*;
     if !matches!(
         op.opcode,
-        CallI | CallR | CallPureI | CallPureR | CallLoopinvariantI | CallLoopinvariantR
+        CallI
+            | CallR
+            | CallPureI
+            | CallPureR
+            | CallLoopinvariantI
+            | CallLoopinvariantR
+            | CallMayForceI
+            | CallMayForceR
     ) {
         return None;
     }
@@ -884,11 +888,16 @@ fn residual_call_i64_arity(op: &Op) -> Option<usize> {
 /// through the same i64 type family with a trailing `drop`. A plain void
 /// descr (`result_size == 0`) may target a genuinely `()`-returning callee
 /// OR a word-returning one (the reflective host trampoline absorbs the
-/// difference), so it stays on `jit_call`. Same force/GIL/cond exclusions
-/// as the i64 family.
+/// difference), so it stays on `jit_call`. This includes `CallMayForceN`
+/// with the word ABI: the wasm virtualizable is always materialized, so
+/// `GuardNotForced` is a no-op and a direct call is sound. Float / release-GIL
+/// / cond / assembler calls and non-reflectable descrs remain on the trampoline.
 fn residual_call_void_word_arity(op: &Op) -> Option<usize> {
     use OpCode::*;
-    if !matches!(op.opcode, CallN | CallPureN | CallLoopinvariantN) {
+    if !matches!(
+        op.opcode,
+        CallN | CallPureN | CallLoopinvariantN | CallMayForceN
+    ) {
         return None;
     }
     let descr = op.getdescr()?;
