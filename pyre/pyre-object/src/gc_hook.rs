@@ -231,7 +231,12 @@ pub fn clear_gc_collect_oldgen_hook() {
 
 /// Trigger a non-moving old-gen-only major collection via the installed hook.
 /// No-op when no hook is installed.
-#[inline]
+///
+/// Reads the runtime-mutable `GC_COLLECT_OLDGEN_HOOK` fn-pointer cell, not a
+/// build-time constant, so the JIT residualizes the call instead of tracing
+/// into it (`@dont_look_inside`, the [`try_gc_owns_object`] twin). A `()`
+/// return has no discriminant to erase and it cannot raise.
+#[majit_macros::dont_look_inside]
 pub fn try_gc_collect_oldgen() {
     if let Some(f) = GC_COLLECT_OLDGEN_HOOK.get() {
         f();
@@ -335,7 +340,12 @@ pub fn clear_gc_jitframe_empty_hook() {
 /// Whether no compiled trace is suspended (jitframe shadow stack empty),
 /// via the installed hook. `true` when no hook is installed (no JIT →
 /// no jitframes).
-#[inline]
+///
+/// Reads the runtime-mutable `GC_JITFRAME_EMPTY_HOOK` fn-pointer cell, not a
+/// build-time constant, so the JIT residualizes the call instead of tracing
+/// into it (`@dont_look_inside`, the [`try_gc_collect_oldgen`] twin). The
+/// `-> bool` return fits a single word and it cannot raise.
+#[majit_macros::dont_look_inside]
 pub fn try_gc_jitframe_empty() -> bool {
     match GC_JITFRAME_EMPTY_HOOK.get() {
         Some(f) => f(),

@@ -86,8 +86,13 @@ impl Drop for EvalActivationGuard {
 /// `sorted` key). The outer handler holds live `PyObjectRef`s on the
 /// Rust stack that the walker cannot reach — a collection would free
 /// still-reachable old-gen objects. Block the safepoint there.
-#[inline]
-fn at_outermost_activation() -> bool {
+///
+/// Reads the runtime-mutable `EVAL_NESTING` thread-local, not a build-time
+/// constant, so the JIT residualizes the call instead of tracing into it
+/// (`@dont_look_inside`, the [`enabled`] sibling). The `-> bool` return fits
+/// a single word and it cannot raise.
+#[majit_macros::dont_look_inside]
+pub fn at_outermost_activation() -> bool {
     EVAL_NESTING.with(|d| d.get() <= 2)
 }
 
@@ -172,8 +177,13 @@ pub fn safepoint() {
 
 /// Whether the safepoint actually collects. Off via `PYRE_GC_INTERP_COLLECT=0`
 /// to isolate the allocation routing from the collection while diagnosing.
-#[inline]
-fn collect_enabled() -> bool {
+///
+/// Reads (and lazily initialises) the runtime-mutable `COLLECT_STATE` atomic,
+/// not a build-time constant, so the JIT residualizes the call instead of
+/// tracing into it (`@dont_look_inside`, the [`enabled`] sibling). The
+/// `-> bool` return fits a single word and it cannot raise.
+#[majit_macros::dont_look_inside]
+pub fn collect_enabled() -> bool {
     match COLLECT_STATE.load(Ordering::Relaxed) {
         1 => false,
         2 => true,

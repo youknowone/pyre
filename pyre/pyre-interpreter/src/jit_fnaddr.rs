@@ -679,6 +679,48 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::bigint_gc_type_id",
         pyre_object::longobject::bigint_gc_type_id as *const (),
     );
+    // The dispatch-loop safepoint's four toucher residuals plus the frame-entry
+    // odometer bump and the items-block strategy gate: each reads a
+    // runtime-mutable global (`COLLECT_STATE` / `EVAL_NESTING` atomics, the two
+    // GC hook fn-pointer cells, `FRAME_ENTRY_COUNT` TLS, the `PYRE_GC_ITEMSBLOCK`
+    // `OnceLock`) — none a build-time constant — so all carry
+    // `#[dont_look_inside]` and bind their `-> bool` / `()` Rust `fn` directly by
+    // qualified path (siblings of `gc_interp::enabled` / `note_alloc`).
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::gc_interp::collect_enabled",
+        "pyre_object::collect_enabled",
+        pyre_object::gc_interp::collect_enabled as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::gc_interp::at_outermost_activation",
+        "pyre_object::at_outermost_activation",
+        pyre_object::gc_interp::at_outermost_activation as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::gc_hook::try_gc_collect_oldgen",
+        "pyre_object::try_gc_collect_oldgen",
+        pyre_object::gc_hook::try_gc_collect_oldgen as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::gc_hook::try_gc_jitframe_empty",
+        "pyre_object::try_gc_jitframe_empty",
+        pyre_object::gc_hook::try_gc_jitframe_empty as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::object_array::itemsblock_gc_enabled",
+        "pyre_object::itemsblock_gc_enabled",
+        pyre_object::object_array::itemsblock_gc_enabled as *const (),
+    );
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::call::bump_frame_entry_count",
+        crate::call::bump_frame_entry_count as *const (),
+    );
     // `jit_bigint_div` / `jit_bigint_rem` residualize the `div_rem()` tuple
     // synth (`front::bigint_div_rem`): the foreign malachite `div_rem` returns
     // a `(BigInt, BigInt)` the tracer models as a `__pos_0`/`__pos_1` tuple
@@ -2260,6 +2302,70 @@ mod tests {
         assert_eq!(
             bindings["pyre_interpreter::var_nums_to_second_index"],
             second
+        );
+    }
+
+    /// The dispatch-loop safepoint's global-state readers residualize by
+    /// qualified path; a typo in either the module-qualified or root alias
+    /// silently regresses the `#[dont_look_inside]` call to a symbolic hash,
+    /// so pin both spellings against the live fnaddr (siblings of the
+    /// `gc_interp::enabled` / `note_alloc` registrations).
+    #[test]
+    fn jit_trace_fnaddrs_covers_interp_gc_safepoint_readers() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+
+        let collect_enabled = pyre_object::gc_interp::collect_enabled as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_object::gc_interp::collect_enabled"],
+            collect_enabled
+        );
+        assert_eq!(bindings["pyre_object::collect_enabled"], collect_enabled);
+
+        let at_outermost =
+            pyre_object::gc_interp::at_outermost_activation as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_object::gc_interp::at_outermost_activation"],
+            at_outermost
+        );
+        assert_eq!(
+            bindings["pyre_object::at_outermost_activation"],
+            at_outermost
+        );
+
+        let collect_oldgen =
+            pyre_object::gc_hook::try_gc_collect_oldgen as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_object::gc_hook::try_gc_collect_oldgen"],
+            collect_oldgen
+        );
+        assert_eq!(
+            bindings["pyre_object::try_gc_collect_oldgen"],
+            collect_oldgen
+        );
+
+        let jitframe_empty =
+            pyre_object::gc_hook::try_gc_jitframe_empty as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_object::gc_hook::try_gc_jitframe_empty"],
+            jitframe_empty
+        );
+        assert_eq!(
+            bindings["pyre_object::try_gc_jitframe_empty"],
+            jitframe_empty
+        );
+
+        let itemsblock =
+            pyre_object::object_array::itemsblock_gc_enabled as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_object::object_array::itemsblock_gc_enabled"],
+            itemsblock
+        );
+        assert_eq!(bindings["pyre_object::itemsblock_gc_enabled"], itemsblock);
+
+        let bump = crate::call::bump_frame_entry_count as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_interpreter::call::bump_frame_entry_count"],
+            bump
         );
     }
 

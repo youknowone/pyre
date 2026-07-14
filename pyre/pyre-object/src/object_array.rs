@@ -266,7 +266,13 @@ unsafe fn alloc_mapdict_storage_block(cap: usize) -> *mut ItemsBlock {
 /// fannkuch/nbody/spectral_norm timings unchanged). `PYRE_GC_ITEMSBLOCK=0`
 /// (or `off`/`false`) restores the `std::alloc` fallback to bisect a
 /// suspected block-GC regression.
-fn itemsblock_gc_enabled() -> bool {
+///
+/// Reads (and lazily initialises) the runtime-mutable `ENABLED` `OnceLock`,
+/// not a build-time constant, so the JIT residualizes the call instead of
+/// tracing into it (`@dont_look_inside`, the `gc_interp::enabled` sibling).
+/// The `-> bool` return fits a single word and it cannot raise.
+#[majit_macros::dont_look_inside]
+pub fn itemsblock_gc_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {

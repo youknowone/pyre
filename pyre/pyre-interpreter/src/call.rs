@@ -152,7 +152,12 @@ pub fn frame_entry_count() -> u64 {
 /// ([`FRAME_ENTRY_COUNT`]).  Called once at every `eval_loop` /
 /// `eval_loop_jit` entry, i.e. each time a user Python frame begins
 /// executing bytecode.
-#[inline(always)]
+///
+/// Touches the runtime-mutable `FRAME_ENTRY_COUNT` thread-local, not a
+/// build-time constant, so the JIT residualizes the call instead of tracing
+/// into it (`@dont_look_inside`, the `note_alloc` sibling). A `()` return has
+/// no discriminant to erase and it cannot raise.
+#[majit_macros::dont_look_inside]
 pub fn bump_frame_entry_count() {
     FRAME_ENTRY_COUNT.with(|c| c.set(c.get().wrapping_add(1)));
 }
