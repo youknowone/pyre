@@ -89,6 +89,28 @@ fn op_compare_digest(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     Ok(w_bool_from(result == 0))
 }
 
+/// `interp_operator.py:204 iconcat` — `a += b` for two subscriptable
+/// sequences; either operand missing `__getitem__` is a TypeError that
+/// names the left operand.
+fn op_iconcat(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() != 2 {
+        return Err(crate::PyError::type_error(format!(
+            "iconcat expected 2 arguments, got {}",
+            args.len()
+        )));
+    }
+    if unsafe {
+        crate::baseobjspace::lookup(args[0], "__getitem__").is_none()
+            || crate::baseobjspace::lookup(args[1], "__getitem__").is_none()
+    } {
+        return Err(crate::PyError::type_error(format!(
+            "'{}' object can't be concatenated",
+            crate::baseobjspace::object_functionstr_type_name(args[0])
+        )));
+    }
+    crate::opcode_ops::binary_value(args[0], args[1], crate::bytecode::BinaryOperator::InplaceAdd)
+}
+
 // Binary arithmetic / comparison thunks share one shape — call
 // `baseobjspace::OP(args[0], args[1])` and unwrap-or-none the result.
 // Inline closures below preserve the per-name `assert!` checks.
@@ -124,7 +146,21 @@ crate::py_module! {
         "and_"     / 2 = |args| and_(args[0], args[1]),
         "or_"      / 2 = |args| or_(args[0], args[1]),
         "xor"      / 2 = |args| xor(args[0], args[1]),
-        "imatmul"  / 2 = |args| op_binary(args, "imatmul", |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceMatrixMultiply)),
+        // interp_operator.py:150-210 — in-place operations, each `space.inplace_X`.
+        "iadd"      / 2 = |args| op_binary(args, "iadd", |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceAdd)),
+        "isub"      / 2 = |args| op_binary(args, "isub", |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceSubtract)),
+        "imul"      / 2 = |args| op_binary(args, "imul", |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceMultiply)),
+        "imatmul"   / 2 = |args| op_binary(args, "imatmul", |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceMatrixMultiply)),
+        "ifloordiv" / 2 = |args| op_binary(args, "ifloordiv", |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceFloorDivide)),
+        "imod"      / 2 = |args| op_binary(args, "imod", |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceRemainder)),
+        "itruediv"  / 2 = |args| op_binary(args, "itruediv", |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceTrueDivide)),
+        "ipow"      / 2 = |args| op_binary(args, "ipow", |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplacePower)),
+        "ilshift"   / 2 = |args| op_binary(args, "ilshift", |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceLshift)),
+        "irshift"   / 2 = |args| op_binary(args, "irshift", |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceRshift)),
+        "iand"      / 2 = |args| op_binary(args, "iand", |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceAnd)),
+        "ior"       / 2 = |args| op_binary(args, "ior", |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceOr)),
+        "ixor"      / 2 = |args| op_binary(args, "ixor", |a, b| crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceXor)),
+        "iconcat"   / 2 = op_iconcat,
         "not_"     / 1 = |args| Ok(w_bool_from(!is_true(args[0])?)),
         // interp_operator.py:138
         "truth"    / 1 = |args| Ok(w_bool_from(is_true(args[0])?)),

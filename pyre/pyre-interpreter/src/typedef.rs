@@ -15331,6 +15331,177 @@ fn set_method_ge(
     Ok(pyre_object::w_bool_from(true))
 }
 
+// `setobject.py` W_BaseSetObject mutating helpers — shared by the
+// `*_update` methods (which accept any iterable) and the in-place operator
+// slots (which pre-filter their operand to a set/frozenset).
+fn set_method_update(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    if args.is_empty() {
+        return Ok(pyre_object::w_none());
+    }
+    // `self` (`args[0]`) is rooted once for the whole method body: both
+    // `collect_iterable` (an arbitrary iterator) and `try_hash_value` (an
+    // arbitrary `__hash__`) are collection points that can move it, and every
+    // element of the current `other`'s collected items is rooted for its own
+    // loop for the same reason.
+    unsafe {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let set_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(args[0]);
+        for other in &args[1..] {
+            let other_items = crate::builtins::collect_iterable(*other)?;
+            let _item_roots = pyre_object::gc_roots::push_roots();
+            let item_base = pyre_object::gc_roots::shadow_stack_len();
+            for item in other_items {
+                pyre_object::gc_roots::pin_root(item);
+            }
+            let item_len = pyre_object::gc_roots::shadow_stack_len() - item_base;
+            for i in 0..item_len {
+                let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
+                crate::builtins::try_hash_value(item)?;
+                let set = pyre_object::gc_roots::shadow_stack_get(set_slot);
+                let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
+                pyre_object::w_set_add(set, item);
+            }
+        }
+    }
+    Ok(pyre_object::w_none())
+}
+
+fn set_method_difference_update(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    if args.is_empty() {
+        return Ok(pyre_object::w_none());
+    }
+    for other in &args[1..] {
+        let other_items = crate::builtins::collect_iterable(*other)?;
+        for item in other_items {
+            unsafe { pyre_object::w_set_discard(args[0], item) };
+        }
+    }
+    Ok(pyre_object::w_none())
+}
+
+fn set_method_intersection_update(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    if args.is_empty() {
+        return Ok(pyre_object::w_none());
+    }
+    // Snapshot self's items, drop any not present in EVERY other.
+    let self_items = unsafe { pyre_object::w_set_items(args[0]) };
+    for item in self_items {
+        let mut keep = true;
+        for other in &args[1..] {
+            let other_items = crate::builtins::collect_iterable(*other)?;
+            let mut found = false;
+            for &o in other_items.iter() {
+                if crate::baseobjspace::eq_w(item, o)? {
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                keep = false;
+                break;
+            }
+        }
+        if !keep {
+            unsafe { pyre_object::w_set_discard(args[0], item) };
+        }
+    }
+    Ok(pyre_object::w_none())
+}
+
+fn set_method_symmetric_difference_update(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    if args.is_empty() || args.len() < 2 {
+        return Ok(pyre_object::w_none());
+    }
+    let other_items = crate::builtins::collect_iterable(args[1])?;
+    // `self` (`args[0]`) is rooted once for the whole loop, and every
+    // collected `other` item is rooted for the loop's duration;
+    // `try_hash_value` (an arbitrary `__hash__`, on the add arm) is a
+    // collection point that can move either.
+    unsafe {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let set_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(args[0]);
+        let item_base = set_slot + 1;
+        for item in other_items {
+            pyre_object::gc_roots::pin_root(item);
+        }
+        let item_len = pyre_object::gc_roots::shadow_stack_len() - item_base;
+        for i in 0..item_len {
+            // toggle: remove if present, add otherwise
+            let set = pyre_object::gc_roots::shadow_stack_get(set_slot);
+            let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
+            let self_items = pyre_object::w_set_items(set);
+            let mut present = false;
+            for &existing in self_items.iter() {
+                if crate::baseobjspace::eq_w(item, existing)? {
+                    present = true;
+                    break;
+                }
+            }
+            let set = pyre_object::gc_roots::shadow_stack_get(set_slot);
+            let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
+            if present {
+                pyre_object::w_set_discard(set, item);
+            } else {
+                crate::builtins::try_hash_value(item)?;
+                let set = pyre_object::gc_roots::shadow_stack_get(set_slot);
+                let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
+                pyre_object::w_set_add(set, item);
+            }
+        }
+    }
+    Ok(pyre_object::w_none())
+}
+
+// `setobject.py:417` W_SetObject.descr_inplace_sub / _and / _or / _xor — a
+// non-set/-frozenset operand yields NotImplemented; otherwise mutate self
+// through the matching update helper and return self.
+fn set_op_inplace_sub(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    if set_op_requires_set(args) {
+        return Ok(pyre_object::w_not_implemented());
+    }
+    set_method_difference_update(args)?;
+    Ok(args[0])
+}
+fn set_op_inplace_and(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    if set_op_requires_set(args) {
+        return Ok(pyre_object::w_not_implemented());
+    }
+    set_method_intersection_update(args)?;
+    Ok(args[0])
+}
+fn set_op_inplace_or(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    if set_op_requires_set(args) {
+        return Ok(pyre_object::w_not_implemented());
+    }
+    set_method_update(args)?;
+    Ok(args[0])
+}
+fn set_op_inplace_xor(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    if set_op_requires_set(args) {
+        return Ok(pyre_object::w_not_implemented());
+    }
+    set_method_symmetric_difference_update(args)?;
+    Ok(args[0])
+}
+
 fn init_set_type(ns: PyObjectRef) {
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
@@ -15473,145 +15644,62 @@ fn init_set_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "update",
-            make_builtin_function("update", |args| {
-                if args.is_empty() {
-                    return Ok(pyre_object::w_none());
-                }
-                // `self` (`args[0]`) is rooted once for the whole method body:
-                // both `collect_iterable` (an arbitrary iterator) and
-                // `try_hash_value` (an arbitrary `__hash__`) are collection
-                // points that can move it, and every element of the current
-                // `other`'s collected items is rooted for its own loop for the
-                // same reason.
-                unsafe {
-                    let _roots = pyre_object::gc_roots::push_roots();
-                    let set_slot = pyre_object::gc_roots::shadow_stack_len();
-                    pyre_object::gc_roots::pin_root(args[0]);
-                    for other in &args[1..] {
-                        let other_items = crate::builtins::collect_iterable(*other)?;
-                        let _item_roots = pyre_object::gc_roots::push_roots();
-                        let item_base = pyre_object::gc_roots::shadow_stack_len();
-                        for item in other_items {
-                            pyre_object::gc_roots::pin_root(item);
-                        }
-                        let item_len = pyre_object::gc_roots::shadow_stack_len() - item_base;
-                        for i in 0..item_len {
-                            let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
-                            crate::builtins::try_hash_value(item)?;
-                            let set = pyre_object::gc_roots::shadow_stack_get(set_slot);
-                            let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
-                            pyre_object::w_set_add(set, item);
-                        }
-                    }
-                }
-                Ok(pyre_object::w_none())
-            }),
+            make_builtin_function("update", set_method_update),
         )
     };
-    // `pypy/objspace/std/setobject.py:1188 W_BaseSetObject.descr_difference_update`
-    // / `:1217 descr_intersection_update` / `:1244 descr_symmetric_difference_update`
-    // — in-place set ops that mirror the non-update variants but
-    // mutate `self` instead of returning a fresh set.
+    // `setobject.py:1188 W_BaseSetObject.descr_difference_update` /
+    // `:1217 descr_intersection_update` / `:1244
+    // descr_symmetric_difference_update` — in-place set ops that mirror the
+    // non-update variants but mutate `self` instead of returning a fresh set.
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "difference_update",
-            make_builtin_function("difference_update", |args| {
-                if args.is_empty() {
-                    return Ok(pyre_object::w_none());
-                }
-                for other in &args[1..] {
-                    let other_items = crate::builtins::collect_iterable(*other)?;
-                    for item in other_items {
-                        unsafe { pyre_object::w_set_discard(args[0], item) };
-                    }
-                }
-                Ok(pyre_object::w_none())
-            }),
+            make_builtin_function("difference_update", set_method_difference_update),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "intersection_update",
-            make_builtin_function("intersection_update", |args| {
-                if args.is_empty() {
-                    return Ok(pyre_object::w_none());
-                }
-                // Snapshot self's items, drop any not present in EVERY other.
-                let self_items = unsafe { pyre_object::w_set_items(args[0]) };
-                for item in self_items {
-                    let mut keep = true;
-                    for other in &args[1..] {
-                        let other_items = crate::builtins::collect_iterable(*other)?;
-                        let mut found = false;
-                        for &o in other_items.iter() {
-                            if crate::baseobjspace::eq_w(item, o)? {
-                                found = true;
-                                break;
-                            }
-                        }
-                        if !found {
-                            keep = false;
-                            break;
-                        }
-                    }
-                    if !keep {
-                        unsafe { pyre_object::w_set_discard(args[0], item) };
-                    }
-                }
-                Ok(pyre_object::w_none())
-            }),
+            make_builtin_function("intersection_update", set_method_intersection_update),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "symmetric_difference_update",
-            make_builtin_function("symmetric_difference_update", |args| {
-                if args.is_empty() || args.len() < 2 {
-                    return Ok(pyre_object::w_none());
-                }
-                let other_items = crate::builtins::collect_iterable(args[1])?;
-                // `self` (`args[0]`) is rooted once for the whole loop, and
-                // every collected `other` item is rooted for the loop's
-                // duration; `try_hash_value` (an arbitrary `__hash__`, on the
-                // add arm) is a collection point that can move either.
-                unsafe {
-                    let _roots = pyre_object::gc_roots::push_roots();
-                    let set_slot = pyre_object::gc_roots::shadow_stack_len();
-                    pyre_object::gc_roots::pin_root(args[0]);
-                    let item_base = set_slot + 1;
-                    for item in other_items {
-                        pyre_object::gc_roots::pin_root(item);
-                    }
-                    let item_len = pyre_object::gc_roots::shadow_stack_len() - item_base;
-                    for i in 0..item_len {
-                        // toggle: remove if present, add otherwise
-                        let set = pyre_object::gc_roots::shadow_stack_get(set_slot);
-                        let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
-                        let self_items = pyre_object::w_set_items(set);
-                        let mut present = false;
-                        for &existing in self_items.iter() {
-                            if crate::baseobjspace::eq_w(item, existing)? {
-                                present = true;
-                                break;
-                            }
-                        }
-                        let set = pyre_object::gc_roots::shadow_stack_get(set_slot);
-                        let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
-                        if present {
-                            pyre_object::w_set_discard(set, item);
-                        } else {
-                            crate::builtins::try_hash_value(item)?;
-                            let set = pyre_object::gc_roots::shadow_stack_get(set_slot);
-                            let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
-                            pyre_object::w_set_add(set, item);
-                        }
-                    }
-                }
-                Ok(pyre_object::w_none())
-            }),
+            make_builtin_function("symmetric_difference_update", set_method_symmetric_difference_update),
+        )
+    };
+    // `setobject.py:553` __isub__/__iand__/__ior__/__ixor__ — mutable-set-only
+    // in-place operator slots.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__isub__",
+            make_builtin_function_with_arity("__isub__", set_op_inplace_sub, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__iand__",
+            make_builtin_function_with_arity("__iand__", set_op_inplace_and, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__ior__",
+            make_builtin_function_with_arity("__ior__", set_op_inplace_or, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__ixor__",
+            make_builtin_function_with_arity("__ixor__", set_op_inplace_xor, 2),
         )
     };
 }
