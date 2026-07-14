@@ -9648,29 +9648,18 @@ impl<M: Clone> MetaInterp<M> {
 impl<M: Clone> MetaInterp<M> {
     fn recovery_slot_types_from_exit_types_and_layout(
         exit_types: &[Type],
-        recovery_layout: Option<&majit_backend::ExitRecoveryLayout>,
+        _recovery_layout: Option<&majit_backend::ExitRecoveryLayout>,
     ) -> Vec<Type> {
-        let Some(recovery) = recovery_layout else {
-            return exit_types.to_vec();
-        };
-        let mut types = Vec::new();
-        for frame in recovery.frames.iter().rev() {
-            let Some(slot_types) = frame.slot_types.as_ref() else {
-                return exit_types.to_vec();
-            };
-            types.extend_from_slice(slot_types);
-        }
-        if types.len() == exit_types.len() {
-            types
-        } else {
-            exit_types.to_vec()
-        }
+        exit_types.to_vec()
     }
 
-    /// Return the full recovery slot types for a guard exit, concatenated
-    /// from all frames in callee-first order (matching the blackhole
-    /// consumer's section convention). Falls back to exit_types when
-    /// recovery_layout is absent.
+    /// Return the compact fail-argument types for a guard exit.
+    ///
+    /// `ResumeDataDirectReader` indexes `deadframe` with TAGBOX numbers, so
+    /// this vector must stay parallel to the guard's compact fail arguments.
+    /// `ExitFrameLayout::slot_types` describes semantic frame slots in frame
+    /// order and is not interchangeable, even when the two vectors happen to
+    /// have the same length.
     pub fn get_recovery_slot_types(
         &self,
         green_key: u64,
@@ -19204,7 +19193,7 @@ mod tests {
     }
 
     #[test]
-    fn test_recovery_slot_types_use_single_frame_slot_types_when_available() {
+    fn test_recovery_slot_types_keep_compact_failarg_types() {
         let recovery_layout = majit_backend::ExitRecoveryLayout {
             vable_array: vec![],
             vref_array: vec![],
@@ -19226,7 +19215,7 @@ mod tests {
                 &[Type::Ref],
                 Some(&recovery_layout),
             ),
-            vec![Type::Int]
+            vec![Type::Ref]
         );
     }
 
@@ -19258,7 +19247,7 @@ mod tests {
     }
 
     #[test]
-    fn test_recovery_slot_types_concatenate_frames_in_callee_first_order() {
+    fn test_recovery_slot_types_do_not_substitute_frame_slot_order() {
         let recovery_layout = majit_backend::ExitRecoveryLayout {
             vable_array: vec![],
             vref_array: vec![],
@@ -19297,7 +19286,39 @@ mod tests {
                 &[Type::Ref, Type::Int, Type::Float, Type::Ref],
                 Some(&recovery_layout),
             ),
-            vec![Type::Float, Type::Ref, Type::Ref, Type::Int]
+            vec![Type::Ref, Type::Int, Type::Float, Type::Ref]
+        );
+    }
+
+    #[test]
+    fn test_module_frame_slot_types_do_not_retype_vable_identity() {
+        let recovery_layout = majit_backend::ExitRecoveryLayout {
+            vable_array: vec![],
+            vref_array: vec![],
+            frames: vec![majit_backend::ExitFrameLayout {
+                trace_id: None,
+                header_pc: Some(9),
+                source_guard: None,
+                pc: 9,
+                jitcode_index: 0,
+                slots: vec![
+                    majit_backend::ExitValueSourceLayout::ExitValue(0),
+                    majit_backend::ExitValueSourceLayout::ExitValue(1),
+                    majit_backend::ExitValueSourceLayout::ExitValue(2),
+                    majit_backend::ExitValueSourceLayout::ExitValue(3),
+                ],
+                slot_types: Some(vec![Type::Int, Type::Ref, Type::Int, Type::Ref]),
+            }],
+            virtual_layouts: vec![],
+            pending_field_layouts: vec![],
+        };
+
+        assert_eq!(
+            MetaInterp::<()>::recovery_slot_types_from_exit_types_and_layout(
+                &[Type::Ref, Type::Ref, Type::Int, Type::Ref],
+                Some(&recovery_layout),
+            ),
+            vec![Type::Ref, Type::Ref, Type::Int, Type::Ref]
         );
     }
 
@@ -19388,7 +19409,7 @@ mod tests {
         );
         assert_eq!(
             meta.get_recovery_slot_types(green_key, trace_id, fail_index),
-            Some(vec![Type::Int])
+            Some(vec![Type::Ref])
         );
         assert_eq!(
             meta.get_rd_virtuals(green_key, trace_id, fail_index),
