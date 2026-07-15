@@ -115,10 +115,16 @@ pub(crate) mod test_hooks {
         }
     }
 
-    /// Install the real `hash_w` on the current test thread.  Call at the
-    /// top of any `#[test]` that constructs an object/str-keyed dict.
+    unsafe fn test_hash_str(ptr: *const u8, len: usize) -> i64 {
+        crate::builtins::hash_str_bytes(unsafe { std::slice::from_raw_parts(ptr, len) })
+    }
+
+    /// Install the real `hash_w` and `hash_str` on the current test thread.
+    /// Call at the top of any `#[test]` that constructs an object/str-keyed
+    /// dict.
     pub(crate) fn install_hash_hook() {
         pyre_object::dict_eq_hook::register_hash_w_hook(test_hash_w);
+        pyre_object::dict_eq_hook::register_hash_str_hook(test_hash_str);
     }
 }
 

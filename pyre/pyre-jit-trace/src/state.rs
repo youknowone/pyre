@@ -9953,11 +9953,11 @@ mod tests {
         });
     }
 
-    /// Install the real `hash_w` on this test thread so object/str-keyed
-    /// dicts built while running interpreted Python bucket through the
-    /// single hash path (`baseobjspace.py:840-845`).  These tests don't go
-    /// through `init_jit_hooks`, which installs the hook at boot for the
-    /// pyrex binary; the thread-local cell must be set on the test thread.
+    /// Install the real `hash_w` and `hash_str` on this test thread so
+    /// object/str-keyed dicts built while running interpreted Python bucket
+    /// through the single hash path (`baseobjspace.py:840-845`).  These tests
+    /// don't go through `init_jit_hooks`, which installs the hooks at boot for
+    /// the pyrex binary; the thread-local cell must be set on the test thread.
     fn install_test_hash_hook() {
         unsafe fn test_hash_w(obj: pyre_object::PyObjectRef) -> i64 {
             match pyre_interpreter::builtins::try_hash_value(obj) {
@@ -9969,7 +9969,13 @@ mod tests {
                 }
             }
         }
+        unsafe fn test_hash_str(ptr: *const u8, len: usize) -> i64 {
+            pyre_interpreter::builtins::hash_str_bytes(unsafe {
+                std::slice::from_raw_parts(ptr, len)
+            })
+        }
         pyre_object::dict_eq_hook::register_hash_w_hook(test_hash_w);
+        pyre_object::dict_eq_hook::register_hash_str_hook(test_hash_str);
     }
 
     /// Install a populated `PyJitCode` for `code_ref` so a subsequent
