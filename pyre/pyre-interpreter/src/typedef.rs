@@ -229,6 +229,15 @@ pub fn r#type(obj: PyObjectRef) -> Option<PyObjectRef> {
 ///
 /// Must be called before any getattr on builtin objects.
 pub fn init_typeobjects() {
+    // Interpreter-only test path: libtest runs each `#[test]` on a fresh
+    // thread and `dict_eq_hook`'s hash hook is thread-local, so install it
+    // here — the single type-system entry every dict-building test funnels
+    // through — before the builtin type namespaces (GC dicts) are built or
+    // probed.  Production installs the hook at boot (`pyre-jit::eval::
+    // init_jit_hooks`); this `cfg(test)` call is compiled out of every
+    // non-test build.
+    #[cfg(test)]
+    crate::test_hooks::install_hash_hook();
     TYPEOBJECT_CACHE.get_or_init(|| {
         // Seed preorder `subclassrange_{min,max}` on every PyType
         // reachable from `INSTANCE_TYPE` so `ll_isinstance` works on

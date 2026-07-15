@@ -11282,6 +11282,7 @@ mod tests {
 
     #[test]
     fn test_getattr_missing() {
+        crate::test_hooks::install_hash_hook();
         let obj = w_int_new(1);
         let err = getattr_str(obj, "missing").unwrap_err();
         assert!(matches!(err.kind, PyErrorKind::AttributeError));
@@ -11338,6 +11339,7 @@ mod tests {
 
     #[test]
     fn test_module_setattr_getattr() {
+        crate::test_hooks::install_hash_hook();
         let module = pyre_object::module::w_module_new("test_module");
 
         setattr_str(module, "ps1", w_str_new("py> ")).unwrap();
@@ -11347,6 +11349,7 @@ mod tests {
 
     #[test]
     fn test_module_delattr() {
+        crate::test_hooks::install_hash_hook();
         let module = pyre_object::module::w_module_new("test_module");
 
         setattr_str(module, "ps1", w_str_new("py> ")).unwrap();
@@ -11514,6 +11517,7 @@ mod tests {
     /// scalar types (int) without `__iter__` / `__getitem__` return false.
     #[test]
     fn is_iterable_false_for_scalar() {
+        crate::test_hooks::install_hash_hook();
         assert!(!is_iterable(w_int_new(42)));
         assert!(!is_iterable(w_none()));
     }
