@@ -9,7 +9,7 @@ use std::sync::OnceLock;
 use rustpython_wtf8::Wtf8Buf;
 
 use crate::{
-    DictStorage, PyError, PyResult, builtin_code_get, dispatch_callable, function_get_closure,
+    PyError, PyResult, builtin_code_get, dispatch_callable, function_get_closure,
     function_get_globals_obj,
 };
 

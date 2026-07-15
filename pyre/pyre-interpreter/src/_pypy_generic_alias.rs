@@ -7,9 +7,7 @@
 //! this module is the behaviour surface (class-getitem constructor,
 //! parameter collection, and the typedef methods).
 
-use crate::{
-    DictStorage, dict_storage_store, make_builtin_function, make_builtin_function_with_arity,
-};
+use crate::{make_builtin_function, make_builtin_function_with_arity};
 use pyre_object::*;
 
 /// `_ATTR_EXCEPTIONS` (`_pypy_generic_alias.py:1`) — attribute names that

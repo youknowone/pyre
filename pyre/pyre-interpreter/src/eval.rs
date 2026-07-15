@@ -11,8 +11,8 @@ use crate::{
     IterOpcodeHandler, LocalOpcodeHandler, NamespaceOpcodeHandler, OpcodeStepExecutor, PyError,
     PyErrorKind, PyResult, SharedOpcodeHandler, StackOpcodeHandler, StepResult, TruthOpcodeHandler,
     build_list_from_refs, build_map_from_refs, build_tuple_from_refs,
-    decode_instruction_for_dispatch, dict_storage_load, dict_storage_store, ensure_range_iter,
-    execute_opcode_step, stack_underflow_error, unpack_sequence_exact,
+    decode_instruction_for_dispatch, ensure_range_iter, execute_opcode_step, stack_underflow_error,
+    unpack_sequence_exact,
 };
 use pyre_object::*;
 

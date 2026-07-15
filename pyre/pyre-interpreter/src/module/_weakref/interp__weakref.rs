@@ -11,10 +11,7 @@
 
 #![allow(non_camel_case_types, non_snake_case)]
 
-use crate::{
-    DictStorage, PyError, dict_storage_store, make_builtin_function,
-    make_builtin_function_with_arity,
-};
+use crate::{PyError, make_builtin_function, make_builtin_function_with_arity};
 use pyre_object::*;
 
 use std::sync::OnceLock;

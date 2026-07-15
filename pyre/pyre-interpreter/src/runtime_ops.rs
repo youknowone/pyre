@@ -11,8 +11,8 @@ use pyre_object::{
 use rustpython_wtf8::{Wtf8, Wtf8Buf};
 
 use crate::{
-    DictStorage, PyError, PyErrorKind, builtin_code_get, function_get_code, is_builtin_code,
-    is_function, w_code_get_ptr,
+    PyError, PyErrorKind, builtin_code_get, function_get_code, is_builtin_code, is_function,
+    w_code_get_ptr,
 };
 
 /// `pypy/interpreter/pyopcode.py:1457 MAKE_FUNCTION` stamps the new
@@ -1021,33 +1021,6 @@ pub fn flat_build_helper(kind: FlatBuildKind, count: usize) -> Option<*const ()>
         FlatBuildKind::Tuple => tuple_build_helper(count),
         FlatBuildKind::Map => map_build_helper(count),
     }
-}
-
-pub fn dict_storage_get(namespace: &DictStorage, name: &str) -> Option<PyObjectRef> {
-    namespace.get(name).copied()
-}
-
-pub fn dict_storage_load(namespace: &DictStorage, name: &str) -> Result<PyObjectRef, PyError> {
-    dict_storage_get(namespace, name)
-        .ok_or_else(|| PyError::name_error_with_name(format!("name '{name}' is not defined"), name))
-}
-
-pub fn dict_storage_store(namespace: &mut DictStorage, name: &str, value: PyObjectRef) {
-    namespace.insert(name.to_string(), value);
-}
-
-/// WTF-8 keyed store — surrogate-safe sibling of [`dict_storage_store`].
-pub fn dict_storage_store_wtf8(namespace: &mut DictStorage, name: &Wtf8, value: PyObjectRef) {
-    namespace.insert_wtf8(name.to_wtf8_buf(), value);
-}
-
-pub fn dict_storage_delete(namespace: &mut DictStorage, name: &str) -> bool {
-    namespace.remove(name).is_some()
-}
-
-/// WTF-8 keyed deletion — surrogate-safe sibling of [`dict_storage_delete`].
-pub fn dict_storage_delete_wtf8(namespace: &mut DictStorage, name: &Wtf8) -> bool {
-    namespace.remove_wtf8(name).is_some()
 }
 
 /// Look up an entry in a proxy-free GC module/namespace dict.
