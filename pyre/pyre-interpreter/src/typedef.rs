@@ -9109,6 +9109,9 @@ fn float_dunder_pow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     crate::type_methods::arity_pow(args)?;
     let b = args[1];
     if unsafe { pyre_object::pyobject::is_float(b) || pyre_object::pyobject::is_int_or_long(b) } {
+        // The operand is coerced to a double first, so an over-range int
+        // raises OverflowError before the ternary modulus is rejected.
+        unsafe { crate::objspace::descroperation::reject_pow_operand_overflow(b)? };
         float_pow_reject_modulus(args)?;
         crate::objspace::descroperation::pow_builtin(args[0], b)
     } else {
@@ -9119,6 +9122,7 @@ fn float_dunder_rpow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     crate::type_methods::arity_pow(args)?;
     let b = args[1];
     if unsafe { pyre_object::pyobject::is_float(b) || pyre_object::pyobject::is_int_or_long(b) } {
+        unsafe { crate::objspace::descroperation::reject_pow_operand_overflow(b)? };
         float_pow_reject_modulus(args)?;
         crate::objspace::descroperation::pow_builtin(b, args[0])
     } else {

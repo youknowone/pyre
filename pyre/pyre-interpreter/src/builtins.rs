@@ -5268,13 +5268,15 @@ pub(crate) fn getindex_w(w_obj: PyObjectRef) -> Result<i64, crate::PyError> {
             // baseobjspace.py:1586-1591: try int_w, on overflow clamp to
             // -sys.maxint-1 for a negative value, sys.maxint otherwise.
             let big = pyre_object::longobject::w_long_get_value(w_obj);
-            return Ok(if pyre_object::longobject::jit_bigint_to_i64_fits(big) != 0 {
-                pyre_object::longobject::jit_bigint_to_i64_value(big)
-            } else if pyre_object::longobject::jit_bigint_sign_i64(big) < 0 {
-                i64::MIN
-            } else {
-                i64::MAX
-            });
+            return Ok(
+                if pyre_object::longobject::jit_bigint_to_i64_fits(big) != 0 {
+                    pyre_object::longobject::jit_bigint_to_i64_value(big)
+                } else if pyre_object::longobject::jit_bigint_sign_i64(big) < 0 {
+                    i64::MIN
+                } else {
+                    i64::MAX
+                },
+            );
         }
         // baseobjspace.py:1568: w_index = self.index(w_obj)
         if let Some(method) = crate::baseobjspace::lookup(w_obj, "__index__") {
@@ -5284,13 +5286,15 @@ pub(crate) fn getindex_w(w_obj: PyObjectRef) -> Result<i64, crate::PyError> {
             }
             if pyre_object::pyobject::is_long(w_index) {
                 let big = pyre_object::longobject::w_long_get_value(w_index);
-                return Ok(if pyre_object::longobject::jit_bigint_to_i64_fits(big) != 0 {
-                    pyre_object::longobject::jit_bigint_to_i64_value(big)
-                } else if pyre_object::longobject::jit_bigint_sign_i64(big) < 0 {
-                    i64::MIN
-                } else {
-                    i64::MAX
-                });
+                return Ok(
+                    if pyre_object::longobject::jit_bigint_to_i64_fits(big) != 0 {
+                        pyre_object::longobject::jit_bigint_to_i64_value(big)
+                    } else if pyre_object::longobject::jit_bigint_sign_i64(big) < 0 {
+                        i64::MIN
+                    } else {
+                        i64::MAX
+                    },
+                );
             }
         }
     }

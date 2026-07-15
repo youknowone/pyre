@@ -752,6 +752,18 @@ unsafe fn reject_float_coercion_overflow(obj: PyObjectRef, v: f64) -> Result<(),
     Ok(())
 }
 
+/// A `float`/`complex` power coerces each `int` operand to a double before the
+/// power is computed, so an over-range `int` (base or exponent) raises
+/// OverflowError up front — even for `1.0 ** huge`, which never reaches the
+/// arithmetic. Only an over-range `int` raises; a genuine float infinity does
+/// not.
+pub(crate) unsafe fn reject_pow_operand_overflow(obj: PyObjectRef) -> Result<(), PyError> {
+    if is_long(obj) && !jit_bigint_to_f64_or_inf(w_long_get_value(obj)).is_finite() {
+        return Err(PyError::overflow_error("int too large to convert to float"));
+    }
+    Ok(())
+}
+
 /// True if both operands are numeric and at least one is float.
 
 unsafe fn is_float_pair(a: PyObjectRef, b: PyObjectRef) -> bool {
@@ -2306,9 +2318,13 @@ pub fn pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             return long_pow(a, b);
         }
         if is_float_pair(a, b) {
+            reject_pow_operand_overflow(a)?;
+            reject_pow_operand_overflow(b)?;
             return float_pow_impl(as_float(a), as_float(b));
         }
         if is_complex_pair(a, b) {
+            reject_pow_operand_overflow(a)?;
+            reject_pow_operand_overflow(b)?;
             return complex_pow(a, b);
         }
         if let Some(result) = try_dispatch_binary_special(a, b, "__pow__", "__rpow__")? {
@@ -2470,9 +2486,13 @@ pub(crate) fn pow_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             return long_pow(a, b);
         }
         if is_float_pair(a, b) {
+            reject_pow_operand_overflow(a)?;
+            reject_pow_operand_overflow(b)?;
             return float_pow_impl(as_float(a), as_float(b));
         }
         if is_complex_pair(a, b) {
+            reject_pow_operand_overflow(a)?;
+            reject_pow_operand_overflow(b)?;
             return complex_pow(a, b);
         }
         Ok(w_not_implemented())

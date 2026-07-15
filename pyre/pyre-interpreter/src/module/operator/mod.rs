@@ -108,7 +108,11 @@ fn op_iconcat(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             crate::baseobjspace::object_functionstr_type_name(args[0])
         )));
     }
-    crate::opcode_ops::binary_value(args[0], args[1], crate::bytecode::BinaryOperator::InplaceAdd)
+    crate::opcode_ops::binary_value(
+        args[0],
+        args[1],
+        crate::bytecode::BinaryOperator::InplaceAdd,
+    )
 }
 
 // Binary arithmetic / comparison thunks share one shape — call

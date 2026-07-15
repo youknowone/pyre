@@ -935,7 +935,9 @@ fn str_slice_args<'a>(
         .code_point_indices()
         .nth(end)
         .map_or(bytes.len(), |(i, _)| i);
-    Ok(Some(unsafe { Wtf8::from_bytes_unchecked(&bytes[byte_start..byte_end]) }))
+    Ok(Some(unsafe {
+        Wtf8::from_bytes_unchecked(&bytes[byte_start..byte_end])
+    }))
 }
 
 fn str_prefix_match(
