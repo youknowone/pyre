@@ -1451,11 +1451,11 @@ pub enum DispatchError {
     /// produced inside the arm, so the blackhole resumes it as NULL and
     /// feeds NULL into the consuming op — the boxed-int short-circuit /
     /// conditional-expression resume miscompile (a heap `ConstPtr`, an int
-    /// outside the small-int cache, parked in a register live-across the
-    /// guard).  Unlike [`BranchGuardKeptStackUnsupported`], this shape is
-    /// miscompiled the SAME way by BOTH the full-body walk and the trait
-    /// leg (both re-execute the identical not-taken arm on deopt), so a
-    /// recoverable [`TraceAction::Abort`] would retry the unsound shape.
+    /// outside the 1-byte immediate range `[0, 256)`, parked in a register
+    /// live-across the guard).  Unlike [`BranchGuardKeptStackUnsupported`],
+    /// this shape is miscompiled the SAME way by BOTH the full-body walk and
+    /// the trait leg (both re-execute the identical not-taken arm on deopt),
+    /// so a recoverable [`TraceAction::Abort`] would retry the unsound shape.
     /// The driver maps this to
     /// `TraceAction::AbortPermanent` → `DONT_TRACE_HERE`: the loop runs in
     /// the interpreter (correct, matching the pre-#416/#420 decline) and is
@@ -8302,28 +8302,6 @@ pub(crate) fn fbw_vable_scalar_ca_enabled() -> bool {
     })
 }
 
-/// `PYRE_FBW_DEEPKEPT_INT` (default OFF) — extend the deep-kept operand-stack
-/// recovery in [`walker_capture_snapshot_for_last_guard_impl`] to fill an
-/// UNBOXED-INT hole from the Int register bank. A Ref-typed stack slot
-/// semantically holding an Int (e.g. condexpr's `a+i` `IntAdd` result) is left
-/// a hole by the Ref-only fill; when on, the capture reads `registers_i[color]`
-/// (the color named by `semantic_slot_color_for_int_slot`) and boxes the raw
-/// int into a `W_IntObject` (`wrapint`) so the vable array carries a Ref.
-/// Ports the `if length_i:` i-bank section of `get_list_of_active_boxes`
-/// (`pyjitpl.py:206-210`). Default OFF: flag-off is byte-identical to the
-/// int-as-hole behavior (resume re-materializes the int from its defining IR),
-/// mirroring how the S1 mirror extension staged behind `PYRE_FBW_DEEPKEPT_MIRROR`.
-pub(crate) fn deepkept_int_recovery_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_DEEPKEPT_INT") {
-        Some(v) => {
-            let v = v.to_string_lossy();
-            v != "0" && !v.eq_ignore_ascii_case("false")
-        }
-        None => false,
-    })
-}
-
 /// `PYRE_FBW_RAISE` (default ON) — the FBW walker owns the Python raise/except
 /// loop.  The twin NULL-ref guards exempt the trailing `cause` sentinel of a
 /// [`PyreHelperKind::RaiseVarargs`] residual so the walker records the raise.
@@ -10193,6 +10171,14 @@ fn classify_vstack_opcode(
         | Instruction::ConvertValue { .. }
         | Instruction::BinarySlice
         | Instruction::ImportName { .. }
+        // MAKE_FUNCTION pops the code object and pushes the built function
+        // (net 0, `stack_effects` `(d, d)`).  The `make_function_value`
+        // residual's Ref result reaches the new TOS through the operand-stack
+        // push chokepoint (`emit_pushvalue_ref!`, codewriter.rs:9260), so it is
+        // the same `ResultToTos` shape as the value producers above.  Left
+        // unmodeled it killed the mirror for the rest of the walk at the first
+        // nested `def`, declining any later depth > 1 kept-stack branch guard.
+        | Instruction::MakeFunction
         // #73: LOAD_FAST/STORE_FAST super-instructions.  Their net
         // result still lands on the new TOS as the LAST Ref written (the
         // second load, resp. the load following the store), so `ResultToTos`
@@ -11765,11 +11751,12 @@ fn branch_resume_target_stack_depth(frame: &ActiveResumeFrame, target: usize) ->
 }
 
 /// Flat-free (#267) boxed-int kept-slot hazard: a kept operand-stack slot
-/// holding a heap int outside `[0, 256)` is reconstructed with a WRONG / NULL
-/// value on a kept-stack branch-guard resume (the conditional-expression /
-/// short-circuit boxed-int crash), so its presence forces the conservative
-/// decline.  This replaces the dense `stack_slot_color_map` read the gate used
-/// to inspect: every kept-slot kind has a per-PC source — a live Variable
+/// holding a heap int outside the 1-byte immediate range `[0, 256)` is
+/// reconstructed with a WRONG / NULL value on a kept-stack branch-guard resume
+/// (the conditional-expression / short-circuit boxed-int crash), so its
+/// presence forces the conservative decline.  This replaces the dense
+/// `stack_slot_color_map` read the gate used to inspect: every kept-slot kind
+/// has a per-PC source — a live Variable
 /// through `pcdep_color_slots` (inspect its concrete register), a Ref constant
 /// (the hoisted boxed int `pcdep_color_slots` omits) through
 /// `const_ref_slots_at_pc` (inspect the raw value).  A kept slot in NEITHER map
@@ -11929,10 +11916,10 @@ fn branch_arm_resume_ref_liveness(
 ///
 /// That is the boxed-int short-circuit / conditional-expression resume
 /// miscompile: when the codewriter parks a heap constant (a co_consts
-/// `ConstPtr` — an int outside the small-int cache, `>= 257` or negative —
-/// or any value computed before the branch) in a regular register
+/// `ConstPtr` — an int outside the 1-byte immediate range `[0, 256)` — or any
+/// value computed before the branch) in a regular register
 /// live-ACROSS the guard rather than materializing it inside the arm, the
-/// resume cannot restore it.  Cached small ints materialize via an in-arm
+/// resume cannot restore it.  One-byte immediates materialize via an in-arm
 /// `residual_call` (a write the blackhole re-executes), so their arms stay
 /// restorable and keep compiling.
 ///
@@ -12756,65 +12743,29 @@ fn walker_capture_snapshot_for_last_guard_impl(
                             // `OpRef::ty()`.  An unboxed-int kept temp (a `Ref`-
                             // bank color holding an `IntAdd` result, e.g.
                             // condexpr's `a+i`) is Int-typed and would decode as
-                            // `Box type Int != expected Ref`; it needs a
-                            // `NEW_W_INT` box the capture cannot synthesize
-                            // (boxing here emits into a settled trace →
-                            // `store_final_boxes_in_guard` panic), so leave it a
-                            // hole (the mirror already sourced every restorable
-                            // slot). The int-bank recovery below handles the
-                            // bank-0 channel where a raw int lives in the Int
-                            // register file instead.
+                            // `Box type Int != expected Ref`. Boxing it after
+                            // the guard is appended would make the guard
+                            // snapshot reference a box defined after the guard,
+                            // so the box was never computed on guard failure.
+                            // RPython materializes failargs before appending the
+                            // guard (`optimizer.py:664-672,705,708-710`).
+                            //
+                            // The hole stands because pyre elides the int box at
+                            // the tracer layer, losing the descr/known_class/
+                            // field structure deopt needs. RPython elides at
+                            // the optimizer layer (`virtualize.py:197-209`),
+                            // keeps `InstancePtrInfo`, and serializes a
+                            // TAGVIRTUAL recipe (`resume.py:415-426,487-500`)
+                            // materialized lazily only on guard failure
+                            // (`resume.py:618-621`). The orthodox fix is
+                            // push-time boxing plus optimizer virtualization,
+                            // beyond this capture hook.
                             if box_op != OpRef::NONE
                                 && !opref_is_null_const_ptr(box_op)
                                 && box_op.ty() == Some(majit_ir::Type::Ref)
                             {
                                 augmented.push((vidx, box_op));
                                 covered.insert(vidx);
-                            }
-                        }
-                    }
-                    // Int-bank fill (`get_list_of_active_boxes` `if length_i:`
-                    // section, `pyjitpl.py:206-210` —
-                    // `add_box_to_storage(self.registers_i[index])`), gated
-                    // `PYRE_FBW_DEEPKEPT_INT` (default OFF). Ref precedence:
-                    // only fill a slot the Ref bank left a hole. A bank-0 (Int)
-                    // pcdep entry names the Int-bank color owning slot
-                    // `nlocals + s`, and `registers_i[color]` holds the raw
-                    // unboxed int; box it into a `W_IntObject` (`wrapint`, the
-                    // `NewWithVtable` + `SetfieldGc(intval)` pair
-                    // `materialize_loop_carried_value` emits for a Ref-typed
-                    // loop-carried slot) so the uniformly Ref-typed vable array
-                    // carries a Ref, not a raw Int the resume decode would
-                    // reject as `Box type Int != expected Ref`. Default OFF:
-                    // flag-off leaves the int a hole, byte-identical to today
-                    // (resume re-materializes it from its defining IR).
-                    //
-                    // Scaffolding on the current frontend: pyre's operand stack
-                    // is uniformly Ref-banked in the pcdep map
-                    // (`locals_cells_stack_w` is a `W_Root[]` array), so no
-                    // bank-0 stack entry exists yet and this fires nowhere. The
-                    // real int-hole source — a Ref-bank color whose
-                    // `registers_r[color]` OpRef is itself Int-typed — CANNOT be
-                    // boxed here: `wrapint` emits `NewWithVtable` + `SetfieldGc`
-                    // into an already-settled trace at capture time, which trips
-                    // `store_final_boxes_in_guard` (`resume.py:397`
-                    // `resume_position >= 0`). The box must be synthesized at
-                    // operand-stack PUSH time, not lazily at snapshot capture —
-                    // that is a frontend change beyond this capture hook (a
-                    // bank-0 channel, e.g. the tagged-int epic, or a push-time
-                    // NEW_W_INT), tracked as a follow-up. This literal i-bank
-                    // read stays as the RPython-parity channel for when bank-0
-                    // stack entries do exist.
-                    if deepkept_int_recovery_enabled() && !covered.contains(&vidx) {
-                        if let Some(color) =
-                            crate::state::semantic_slot_color_for_int_slot(&pcdep, nlocals + s)
-                        {
-                            if let Some(&raw) = ctx.registers_i.get(color) {
-                                if raw != OpRef::NONE && raw.ty() == Some(majit_ir::Type::Int) {
-                                    let boxed = crate::state::wrapint(ctx.trace_ctx, raw);
-                                    augmented.push((vidx, boxed));
-                                    covered.insert(vidx);
-                                }
                             }
                         }
                     }
