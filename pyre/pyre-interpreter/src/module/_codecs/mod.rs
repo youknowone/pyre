@@ -1139,9 +1139,45 @@ fn utf7_encode_impl(w_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     ]))
 }
 
+/// Route a utf-7 decode error through the requested handler, shaped like
+/// `unicode_escape_error`. Returns the resume position and, when a custom
+/// handler replaced `exc.object`, the new input bytes to resume from.
+fn utf7_decode_error(
+    errors: &str,
+    original: &[u8],
+    start: usize,
+    end: usize,
+    reason: &str,
+    out: &mut rustpython_wtf8::Wtf8Buf,
+) -> Result<(usize, Option<Vec<u8>>), crate::PyError> {
+    match errors {
+        "strict" => Err(crate::typedef::unicode_decode_error(
+            "utf7", original, start, end, reason,
+        )),
+        "ignore" => Ok((end, None)),
+        "replace" => {
+            out.push_char('\u{FFFD}');
+            Ok((end, None))
+        }
+        "backslashreplace" => {
+            for &b in &original[start..end.min(original.len())] {
+                out.push_str(&format!("\\x{b:02x}"));
+            }
+            Ok((end, None))
+        }
+        "xmlcharrefreplace" | "namereplace" => {
+            Err(crate::typedef::decode_error_encode_only_handler())
+        }
+        _ => crate::type_methods::call_registered_decode_error_handler(
+            errors, "utf7", original, start, end, reason, out,
+        ),
+    }
+}
+
 fn utf7_decode_impl(
     w_obj: PyObjectRef,
     errors: PyObjectRef,
+    is_final: bool,
 ) -> Result<PyObjectRef, crate::PyError> {
     if !unsafe { pyre_object::bytesobject::is_bytes_like(w_obj) } {
         return Err(crate::PyError::type_error(
@@ -1154,14 +1190,22 @@ fn utf7_decode_impl(
     } else {
         "strict"
     };
-    let data = unsafe { pyre_object::bytesobject::bytes_like_data(w_obj) };
+    // A custom error handler may replace `exc.object`; decoding then resumes
+    // from the new bytes (`data`).
+    let mut data: std::borrow::Cow<[u8]> =
+        std::borrow::Cow::Borrowed(unsafe { pyre_object::bytesobject::bytes_like_data(w_obj) });
     let mut out = rustpython_wtf8::Wtf8Buf::new();
     let mut pos = 0usize;
     let mut in_shift = false;
     let mut base64bits = 0u32;
     let mut base64buffer = 0u32;
     let mut surrogate = 0u32;
+    // Output byte length captured when a shift opened (`shiftOutStartPos`),
+    // used to back off an unterminated shift in a non-final chunk.
     let mut shift_out_start = 0usize;
+    // Input position of the `+` that opened the current shift, used as the
+    // start anchor for its error spans (`startinpos`).
+    let mut startinpos = 0usize;
     while pos < data.len() {
         let ch = data[pos];
         if in_shift {
@@ -1190,52 +1234,76 @@ fn utf7_decode_impl(
                     }
                 }
             } else {
+                // now leaving a base-64 section
                 in_shift = false;
-                if base64bits > 0 {
-                    let bad = base64bits >= 6 || base64buffer != 0;
-                    if bad {
-                        if errors_s == "ignore" {
-                            pos += 1;
-                            continue;
-                        }
-                        return Err(crate::typedef::unicode_decode_error(
-                            "utf7",
-                            data,
-                            pos.saturating_sub(1),
-                            pos,
-                            "partial character in shift sequence",
-                        ));
+                if base64bits >= 6 {
+                    // At least one base-64 character was seen but a whole
+                    // unit was not: partial character. The terminating byte
+                    // is consumed and folded into the error span.
+                    pos += 1;
+                    let (np, nb) = utf7_decode_error(
+                        errors_s,
+                        &data[..],
+                        startinpos,
+                        pos,
+                        "partial character in shift sequence",
+                        &mut out,
+                    )?;
+                    if let Some(nb) = nb {
+                        data = std::borrow::Cow::Owned(nb);
                     }
+                    pos = np;
+                    continue;
+                } else if base64bits > 0 && base64buffer != 0 {
+                    // Leftover bits that should have been zero.
+                    pos += 1;
+                    let (np, nb) = utf7_decode_error(
+                        errors_s,
+                        &data[..],
+                        startinpos,
+                        pos,
+                        "non-zero padding bits in shift sequence",
+                        &mut out,
+                    )?;
+                    if let Some(nb) = nb {
+                        data = std::borrow::Cow::Owned(nb);
+                    }
+                    pos = np;
+                    continue;
                 }
                 if surrogate != 0 && utf7_decode_direct(ch) {
                     out.push(rustpython_wtf8::CodePoint::from_u32(surrogate).unwrap());
                 }
                 surrogate = 0;
                 if ch == b'-' {
+                    // '-' is absorbed; other terminating characters are preserved.
                     pos += 1;
                 }
             }
         } else if ch == b'+' {
+            startinpos = pos;
             pos += 1;
             if pos < data.len() && data[pos] == b'-' {
                 pos += 1;
                 out.push_char('+');
             } else if pos < data.len() && !utf7_is_base64(data[pos]) {
-                if errors_s == "ignore" {
-                    pos += 1;
-                    continue;
-                }
-                return Err(crate::typedef::unicode_decode_error(
-                    "utf7",
-                    data,
-                    pos.saturating_sub(1),
-                    (pos + 1).min(data.len()),
+                let (np, nb) = utf7_decode_error(
+                    errors_s,
+                    &data[..],
+                    startinpos,
+                    startinpos + 2,
                     "ill-formed sequence",
-                ));
+                    &mut out,
+                )?;
+                if let Some(nb) = nb {
+                    data = std::borrow::Cow::Owned(nb);
+                }
+                pos = np;
             } else {
+                // begin base64-encoded section
                 in_shift = true;
                 surrogate = 0;
-                shift_out_start = pos - 1;
+                shift_out_start = out.len();
                 base64bits = 0;
                 base64buffer = 0;
             }
@@ -1243,34 +1311,47 @@ fn utf7_decode_impl(
             out.push_char(ch as char);
             pos += 1;
         } else {
-            if errors_s == "ignore" {
-                pos += 1;
-                continue;
-            }
-            return Err(crate::typedef::unicode_decode_error(
-                "utf7",
-                data,
+            startinpos = pos;
+            pos += 1;
+            let (np, nb) = utf7_decode_error(
+                errors_s,
+                &data[..],
+                startinpos,
                 pos,
-                (pos + 1).min(data.len()),
                 "unexpected special character",
-            ));
+                &mut out,
+            )?;
+            if let Some(nb) = nb {
+                data = std::borrow::Cow::Owned(nb);
+            }
+            pos = np;
         }
     }
-    if in_shift && (surrogate != 0 || base64bits >= 6 || (base64bits > 0 && base64buffer != 0)) {
-        if errors_s != "ignore" {
-            return Err(crate::typedef::unicode_decode_error(
-                "utf7",
-                data,
-                shift_out_start,
+    // end of string
+    let mut consumed = data.len();
+    if in_shift && is_final {
+        // in shift sequence with no more input to follow
+        in_shift = false;
+        if surrogate != 0 || base64bits >= 6 || (base64bits > 0 && base64buffer != 0) {
+            // The handler pushes its replacement into `out` itself; the input
+            // is fully consumed, so its returned position is not reused.
+            let (_np, _nb) = utf7_decode_error(
+                errors_s,
+                &data[..],
+                startinpos,
                 pos,
                 "unterminated shift sequence",
-            ));
+                &mut out,
+            )?;
         }
-        pos = shift_out_start;
+    } else if in_shift {
+        // Non-final chunk ending mid-shift: back off to the '+' that opened it.
+        consumed = startinpos;
+        out.truncate(shift_out_start);
     }
     Ok(w_tuple_new(vec![
         w_str_from_wtf8(out),
-        w_int_new(pos as i64),
+        w_int_new(consumed as i64),
     ]))
 }
 
@@ -1713,9 +1794,9 @@ crate::py_module! {
         fn utf_7_decode(
             obj: PyObjectRef,
             #[default(w_str_new("strict"))] errors: PyObjectRef,
-            #[default(w_bool_from(false))] _final: PyObjectRef,
+            #[default(w_bool_from(false))] is_final: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
-            utf7_decode_impl(obj, errors)
+            utf7_decode_impl(obj, errors, crate::baseobjspace::is_true(is_final)?)
         }
         fn unicode_escape_encode(
             obj: PyObjectRef,
