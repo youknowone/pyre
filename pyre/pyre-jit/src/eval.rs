@@ -3847,6 +3847,16 @@ enum UnsupportedJitShape {
     None,
     CurrentFrameOnly,
     StructuralRegion,
+    /// The frame's constant pool plus register file would exceed the
+    /// single-byte (`< 256`) register-or-constant index encoding
+    /// (`assembler.py:72 chr()`, `assembler.py:132-133`
+    /// `count_regs + len(constants) < 256`). RPython builds jitcodes at
+    /// translation time from the hand-written interpreter, where this
+    /// ceiling is a bounded programming invariant; pyre builds a jitcode
+    /// per *user* Python frame at runtime, so a data-heavy frame (e.g. a
+    /// module body with thousands of literal constants) genuinely exceeds
+    /// it. Such a frame cannot be encoded and must run in the interpreter.
+    ConstEncodingOverflow,
 }
 
 /// True for opcodes that may appear in a `FOR_ITER` loop body without ever
@@ -4048,6 +4058,34 @@ fn for_iter_frame_is_finally_duplicated(code: &pyre_interpreter::CodeObject) -> 
     for_iter_count > 1 && any_in_handler
 }
 
+/// Upper bound on the constant-pool slots one code-object constant can
+/// contribute to the assembled jitcode. A `Tuple`/`Frozenset`/`Slice`
+/// constant can be unpacked into its elements during graph construction —
+/// e.g. a `BUILD_CONST_KEY_MAP` keys tuple lowered to one `ConstRef` per key,
+/// which is how a module body like `html.entities` turns a handful of literal
+/// `code.constants` entries into thousands of pool slots — so every nested
+/// leaf is counted. A `Code` constant belongs to a *separate* callee frame
+/// with its own pool, so it counts as a single ref here (its inner constants
+/// never enter this frame's pool).
+fn const_pool_slot_upper_bound(c: &pyre_interpreter::ConstantData) -> usize {
+    use pyre_interpreter::ConstantData;
+    match c {
+        ConstantData::Tuple { elements } | ConstantData::Frozenset { elements } => {
+            1 + elements
+                .iter()
+                .map(const_pool_slot_upper_bound)
+                .sum::<usize>()
+        }
+        ConstantData::Slice { elements } => {
+            1 + elements
+                .iter()
+                .map(const_pool_slot_upper_bound)
+                .sum::<usize>()
+        }
+        _ => 1,
+    }
+}
+
 fn unsupported_jit_shape(code: &pyre_interpreter::CodeObject) -> UnsupportedJitShape {
     // Structural adaptation: RPython/PyPy traces these bytecodes with
     // fully translated support. Pyre's codewriter still lowers
@@ -4073,6 +4111,42 @@ fn unsupported_jit_shape(code: &pyre_interpreter::CodeObject) -> UnsupportedJitS
     // iteration is silently dropped (#57). Bodies with no explicit
     // mutation/call and no nested `FOR_ITER` cannot reach that path — verified
     // against the battery and adversarial mutation probes.
+
+    // Single-byte register-or-constant index ceiling (`assembler.py:72`
+    // `chr(reg)`; `assembler.py:132-133` / `check_result` assert
+    // `count_regs[kind] + len(constants) <= 256`). RPython assembles jitcodes
+    // at translation time from the hand-written interpreter, where the ceiling
+    // is a bounded invariant; pyre assembles a jitcode per *user* Python frame
+    // at runtime, so a data-heavy frame (a module body with thousands of
+    // literal constants — e.g. `html.entities`, whose `<module>` frame carries
+    // ~4000 string constants) genuinely overruns it and the assembler asserts
+    // mid-emission. Decline such a frame to the interpreter before tracing.
+    //
+    // The predicate over-approximates the assembled counts, so it never admits
+    // an unencodable frame: the per-kind constant pool is bounded above by the
+    // whole constant table (flattened through nestable constants, see
+    // `const_pool_slot_upper_bound`) plus the name table, and each kind's
+    // register file is bounded above by the frame's live-slot capacity — the
+    // operand stack plus every local/cell/free slot, padded for the always-live
+    // vable red args and the transient temporaries one opcode lowering keeps
+    // live at once. When even this loose sum cannot fit in a byte, no assembler
+    // kind bank can encode the frame.
+    const SYNTHESIZED_REG_HEADROOM: usize = 16;
+    let register_slots_upper_bound = SYNTHESIZED_REG_HEADROOM
+        + code.max_stackdepth as usize
+        + code.varnames.len()
+        + code.cellvars.len()
+        + code.freevars.len();
+    let constant_slots_upper_bound = code
+        .constants
+        .iter()
+        .map(const_pool_slot_upper_bound)
+        .sum::<usize>()
+        + code.names.len();
+    if register_slots_upper_bound + constant_slots_upper_bound > 256 {
+        return UnsupportedJitShape::ConstEncodingOverflow;
+    }
+
     let mut arg_state = pyre_interpreter::OpArgState::default();
     let mut has_for_iter = false;
     for unit in code.instructions.iter().copied() {
@@ -4150,6 +4224,20 @@ fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
                 "FrameShape::StructuralRegion",
             );
             let _guard = JitSuppressionGuard::new();
+            return frame_root.frame().execute_frame(None, None);
+        }
+        UnsupportedJitShape::ConstEncodingOverflow => {
+            // The frame's constant pool plus register file overruns the
+            // single-byte register-or-constant index encoding, so no jitcode
+            // can be assembled for it (`unsupported_jit_shape`).  Run this frame
+            // in the plain interpreter; nested callees stay JIT-eligible (the
+            // overflow is per-frame), so no `JitSuppressionGuard`.  Record the
+            // decline in the census so the interpreted frame is visible, not a
+            // silent no-token gap.
+            pyre_jit_trace::jitcode_dispatch::census_record_frame_shape_decline(
+                code as *const _ as usize,
+                "FrameShape::ConstEncodingOverflow",
+            );
             return frame_root.frame().execute_frame(None, None);
         }
     }
@@ -4373,7 +4461,9 @@ pub(crate) fn portal_runner_result(frame: &mut PyFrame) -> PyResult {
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame_root.frame()) };
     let _suppression = match unsupported_jit_shape(code) {
         UnsupportedJitShape::StructuralRegion => Some(JitSuppressionGuard::new()),
-        UnsupportedJitShape::None | UnsupportedJitShape::CurrentFrameOnly => None,
+        UnsupportedJitShape::None
+        | UnsupportedJitShape::CurrentFrameOnly
+        | UnsupportedJitShape::ConstEncodingOverflow => None,
     };
     portal_runner_dispatch(frame_root.frame())
 }
