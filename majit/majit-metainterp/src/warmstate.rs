@@ -543,7 +543,14 @@ impl WarmEnterState {
             if cell.is_compiled() || cell.is_tracing() {
                 return true;
             }
-            if cell.flags & jc_flags::DONT_TRACE_HERE != 0 && cell.has_seen_a_procedure_token() {
+            // A JC_DONT_TRACE_HERE cell declines here, except when the
+            // procedure token it once saw has since been invalidated: that
+            // dead entry must fall through to cleanup_chain (warmstate.py:483-491)
+            // instead of returning early and lingering in the chain.
+            if cell.flags & jc_flags::DONT_TRACE_HERE != 0
+                && cell.has_seen_a_procedure_token()
+                && cell.get_procedure_token().is_some()
+            {
                 return false;
             }
             if cell.has_seen_a_procedure_token() && cell.get_procedure_token().is_none() {
@@ -580,10 +587,15 @@ impl WarmEnterState {
             ) {
                 return self.start_tracing_cell(green_key_hash);
             }
-            if flags & jc_flags::DONT_TRACE_HERE != 0 {
+            // A JC_DONT_TRACE_HERE cell declines here, except when it once saw a
+            // procedure token that has since been invalidated — that dead entry
+            // must fall through to cleanup_chain below (warmstate.py:483-491),
+            // not linger and stall the counter re-arm.
+            let dead_token = has_seen_a_procedure_token && !has_procedure_token;
+            if flags & jc_flags::DONT_TRACE_HERE != 0 && !dead_token {
                 return HotResult::NotHot;
             }
-            if has_seen_a_procedure_token && !has_procedure_token {
+            if dead_token {
                 cleanup_dead_token_cell = true;
             }
         }
@@ -644,10 +656,15 @@ impl WarmEnterState {
             if self.should_start_dont_trace_here_trace(hash, flags, has_seen_a_procedure_token) {
                 return self.start_tracing_cell_for_key(key);
             }
-            if flags & jc_flags::DONT_TRACE_HERE != 0 {
+            // A JC_DONT_TRACE_HERE cell declines here, except when it once saw a
+            // procedure token that has since been invalidated — that dead entry
+            // must fall through to cleanup_chain below (warmstate.py:483-491),
+            // not linger and stall the counter re-arm.
+            let dead_token = has_seen_a_procedure_token && !has_procedure_token;
+            if flags & jc_flags::DONT_TRACE_HERE != 0 && !dead_token {
                 return HotResult::NotHot;
             }
-            if has_seen_a_procedure_token && !has_procedure_token {
+            if dead_token {
                 cleanup_dead_token_cell = true;
             }
         }
@@ -1395,9 +1412,14 @@ impl WarmEnterState {
             }
             if cell.flags & jc_flags::DONT_TRACE_HERE != 0 {
                 if cell.has_seen_a_procedure_token() {
-                    return false;
-                }
-                if cell.flags & jc_flags::TRACING_OCCURRED == 0 {
+                    // A live TEMPORARY token still declines; a token that was
+                    // once seen but has since been invalidated falls through to
+                    // the cleanup gate below (warmstate.py:483-491) rather than
+                    // re-entering the never-traced retry.
+                    if cell.get_procedure_token().is_some() {
+                        return false;
+                    }
+                } else if cell.flags & jc_flags::TRACING_OCCURRED == 0 {
                     return true;
                 }
             }
