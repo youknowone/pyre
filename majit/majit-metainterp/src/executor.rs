@@ -799,7 +799,7 @@ pub fn execute_pure_call(
             crate::pyjitpl::call_int_function(func_ptr, args)
         }
         majit_ir::Type::Void => {
-            crate::pyjitpl::call_void_function(func_ptr, args);
+            crate::pyjitpl::call_void_function_typed(func_ptr, args, descr.arg_types());
             0
         }
         // See `execute_varargs`'s Float arm for the i64-bits ABI rationale:
@@ -854,7 +854,7 @@ pub fn execute_residual_call(
             crate::pyjitpl::call_int_function(func_ptr, args)
         }
         majit_ir::Type::Void => {
-            crate::pyjitpl::call_void_function(func_ptr, args);
+            crate::pyjitpl::call_void_function_typed(func_ptr, args, descr.arg_types());
             0
         }
         // See `execute_varargs`'s Float arm for the i64-bits ABI

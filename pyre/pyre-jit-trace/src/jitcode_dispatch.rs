@@ -17993,8 +17993,8 @@ fn walker_guard_mapdict_instance_shape(
 /// `mapdict.py:1479-1537 LOAD_ATTR_caching` full-body-walker fast path for a
 /// plain (non-method) instance attribute.  When the concrete receiver is a
 /// monomorphic instance whose attribute resolves to a boxed plain storage slot
-/// or an unboxed integer slot, emit the guarded read PyPy compiles LOAD_ATTR to
-/// under the JIT —
+/// or an unboxed integer/float slot, emit the guarded read PyPy compiles
+/// LOAD_ATTR to under the JIT —
 ///   * `guard_class(obj, &INSTANCE_TYPE)` — the receiver is a `W_ObjectObject`
 ///     (so the `map`/`storage` field reads below are valid; `mapdict.py:1495`
 ///     `if map is not None:` also filters non-instances at trace time).
@@ -18007,18 +18007,18 @@ fn walker_guard_mapdict_instance_shape(
 ///   * boxed: `getfield_gc_r(obj, storage)` +
 ///     `getarrayitem_gc_r(block, C_index)` for
 ///     `mapdict.py:914-916 _mapdict_read_storage`;
-///   * unboxed int: a non-forcing raw longlong read plus `wrapint`, matching
-///     `_prim_direct_read` (mapdict.py:600-601).
+///   * unboxed int/float: a non-forcing typed read plus `wrapint`/`wrapfloat`,
+///     matching `_prim_direct_read` (mapdict.py:577-584, 600-601).
 /// — instead of the opaque `getattr_fn` `CALL_MAY_FORCE` MRO-walk residual.
 ///
 /// Returns `Some(())` after writing the dst; `None` (fall through to the
 /// residual) for every shape [`load_attr_fast_path`] declines: non-instance
 /// receiver, missing map, custom `__getattribute__`, uncacheable `version_tag`,
-/// a data-descriptor / `INVALID` classification, an attribute not on this
-/// instance's map, or an unboxed float slot.  The map `guard_value` proves the
-/// attribute is present on this shape, so a successful fold provably cannot
-/// raise `AttributeError` — dropping the residual's exception guard is sound
-/// even in a handler-bearing body (same reasoning as the LoadGlobal fold).
+/// a data-descriptor / `INVALID` classification, or an attribute not on this
+/// instance's map.  The map `guard_value` proves the attribute is present on
+/// this shape, so a successful fold provably cannot raise `AttributeError` —
+/// dropping the residual's exception guard is sound even in a handler-bearing
+/// body (same reasoning as the LoadGlobal fold).
 #[allow(clippy::too_many_arguments)]
 fn try_walker_specialize_load_attr(
     ctx: &mut WalkContext<'_, '_>,
@@ -18069,12 +18069,6 @@ fn try_walker_specialize_load_attr(
     }) else {
         return Ok(None);
     };
-    // Float slots still use the unchanged getattr residual until an Int-bank
-    // longlong-to-Float-bank bitcast is available to feed `wrapfloat`.
-    if unbox_type == pyre_interpreter::objspace::std::mapdict::UnboxType::Float {
-        return Ok(None);
-    }
-
     walker_guard_mapdict_instance_shape(ctx, op_pc, obj, w_type, version_tag, map)?;
 
     // `_prim_direct_read` (mapdict.py:600-601): read the raw longlong from the
@@ -18083,16 +18077,6 @@ fn try_walker_specialize_load_attr(
     // lets an immediate integer consumer virtualize it away.
     let storageindex_const = ctx.trace_ctx.const_int(storageindex as i64);
     let listindex_const = ctx.trace_ctx.const_int(listindex as i64);
-    let raw = crate::helpers::emit_trace_call_int_typed(
-        ctx.trace_ctx,
-        crate::helpers::jit_mapdict_unboxed_read_raw as *const (),
-        &[obj, storageindex_const, listindex_const],
-        &[
-            majit_ir::Type::Ref,
-            majit_ir::Type::Int,
-            majit_ir::Type::Int,
-        ],
-    );
     let live = unsafe {
         pyre_interpreter::objspace::std::mapdict::read_unboxed_storage_raw(
             concrete_obj,
@@ -18100,19 +18084,55 @@ fn try_walker_specialize_load_attr(
             listindex,
         )
     };
-    ctx.trace_ctx
-        .set_opref_concrete(raw, majit_ir::Value::Int(live));
-    let boxed = walker_box_int(ctx, op_pc, raw, live)?;
-    // The `wrapint` op is a heap box, so its concrete must be a heap ptr too:
-    // box the raw longlong through the same `w_int_new` the unboxed read uses
-    // (mapdict.py:579-584 `_box`); `box_int_concrete` re-homes a tagged small
-    // int to a fresh heap `W_IntObject` so op(NewWithVtable) == concrete(heap).
-    // Without this stamp the boxed result carries no concrete, so a downstream
-    // eager void residual (e.g. the STORE_ATTR that writes `self.value`) cannot
-    // resolve its value arg and the walk aborts `ResidualCallArgUnbound`.
-    let live_ptr = pyre_object::w_int_new(live) as i64;
-    ctx.trace_ctx
-        .set_opref_concrete(boxed, box_int_concrete(live, live_ptr));
+    let boxed = match unbox_type {
+        pyre_interpreter::objspace::std::mapdict::UnboxType::Int => {
+            let raw = crate::helpers::emit_trace_call_int_typed(
+                ctx.trace_ctx,
+                crate::helpers::jit_mapdict_unboxed_read_raw as *const (),
+                &[obj, storageindex_const, listindex_const],
+                &[
+                    majit_ir::Type::Ref,
+                    majit_ir::Type::Int,
+                    majit_ir::Type::Int,
+                ],
+            );
+            ctx.trace_ctx
+                .set_opref_concrete(raw, majit_ir::Value::Int(live));
+            let boxed = walker_box_int(ctx, op_pc, raw, live)?;
+            // The `wrapint` op is a heap box, so its concrete must be a heap ptr too:
+            // box the raw longlong through the same `w_int_new` the unboxed read uses
+            // (mapdict.py:579-584 `_box`); `box_int_concrete` re-homes a tagged small
+            // int to a fresh heap `W_IntObject` so op(NewWithVtable) == concrete(heap).
+            // Without this stamp the boxed result carries no concrete, so a downstream
+            // eager void residual (e.g. the STORE_ATTR that writes `self.value`) cannot
+            // resolve its value arg and the walk aborts `ResidualCallArgUnbound`.
+            let live_ptr = pyre_object::w_int_new(live) as i64;
+            ctx.trace_ctx
+                .set_opref_concrete(boxed, box_int_concrete(live, live_ptr));
+            boxed
+        }
+        pyre_interpreter::objspace::std::mapdict::UnboxType::Float => {
+            let raw = crate::helpers::emit_trace_call_float_typed(
+                ctx.trace_ctx,
+                crate::helpers::jit_mapdict_unboxed_read_f as *const (),
+                &[obj, storageindex_const, listindex_const],
+                &[
+                    majit_ir::Type::Ref,
+                    majit_ir::Type::Int,
+                    majit_ir::Type::Int,
+                ],
+            );
+            let live_f = f64::from_bits(live as u64);
+            ctx.trace_ctx
+                .set_opref_concrete(raw, majit_ir::Value::Float(live_f));
+            let boxed = crate::state::wrapfloat(ctx.trace_ctx, raw);
+            ctx.trace_ctx.set_opref_concrete(
+                boxed,
+                majit_ir::Value::Ref(majit_ir::GcRef(pyre_object::w_float_new(live_f) as usize)),
+            );
+            boxed
+        }
+    };
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
     Ok(Some(()))
 }
@@ -18354,12 +18374,12 @@ fn try_walker_fold_load_method_self(
 }
 
 /// STORE_ATTR mirror of [`try_walker_specialize_load_attr`] for an existing
-/// unboxed integer slot.  Recognition proves the plain mapdict write cannot
-/// invoke Python or raise; the returned descriptor/arglist replaces only the
-/// residual helper and effect.  The caller deliberately continues through the
-/// generic residual recorder/executor so concrete execution, body-effect
+/// unboxed integer or float slot.  Recognition proves the plain mapdict write
+/// cannot invoke Python or raise; the returned descriptor/arglist replaces only
+/// the residual helper and effect.  The caller deliberately continues through
+/// the generic residual recorder/executor so concrete execution, body-effect
 /// tracking, and rollback semantics remain identical to the generic setattr
-/// path (mapdict.py:615-619).
+/// path (mapdict.py:577-584, 615-619).
 fn try_walker_specialize_store_attr(
     ctx: &mut WalkContext<'_, '_>,
     op_pc: usize,
@@ -18394,27 +18414,53 @@ fn try_walker_specialize_store_attr(
     }) else {
         return Ok(None);
     };
-    if unbox_type != pyre_interpreter::objspace::std::mapdict::UnboxType::Int {
-        return Ok(None);
-    }
-    // `type(w_value) is space.IntObjectCls` (mapdict.py:615): reject bool,
-    // float, boxed/type-changing values, and every value whose concrete
-    // payload is not the integer representation before emitting any guards.
-    if unsafe {
-        pyre_object::pyobject::is_bool(concrete_value)
-            || !pyre_object::pyobject::is_int(concrete_value)
-    } {
-        return Ok(None);
+    match unbox_type {
+        pyre_interpreter::objspace::std::mapdict::UnboxType::Int => {
+            // `type(w_value) is space.IntObjectCls` (mapdict.py:615): reject bool
+            // and every type-changing value before emitting any guards.
+            if unsafe {
+                pyre_object::pyobject::is_bool(concrete_value)
+                    || !pyre_object::pyobject::is_int(concrete_value)
+            } {
+                return Ok(None);
+            }
+        }
+        pyre_interpreter::objspace::std::mapdict::UnboxType::Float => {
+            // A non-float changes the slot to boxed storage and freezes further
+            // unboxing (mapdict.py:615-619), so retain setattr.
+            if !unsafe { pyre_object::pyobject::is_float(concrete_value) } {
+                return Ok(None);
+            }
+        }
     }
 
     walker_guard_mapdict_instance_shape(ctx, op_pc, obj, w_type, version_tag, map)?;
-    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-    let raw = walker_unbox_int(ctx, op_pc, value, int_type_addr)?;
     let storageindex_const = ctx.trace_ctx.const_int(storageindex as i64);
     let listindex_const = ctx.trace_ctx.const_int(listindex as i64);
-    let helper = ctx
-        .trace_ctx
-        .const_int(crate::helpers::jit_mapdict_unboxed_write_raw as *const () as usize as i64);
+    let (helper_fn, raw, value_type) = match unbox_type {
+        pyre_interpreter::objspace::std::mapdict::UnboxType::Int => {
+            let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+            let raw = walker_unbox_int(ctx, op_pc, value, int_type_addr)?;
+            (
+                crate::helpers::jit_mapdict_unboxed_write_raw as *const (),
+                raw,
+                majit_ir::Type::Int,
+            )
+        }
+        pyre_interpreter::objspace::std::mapdict::UnboxType::Float => {
+            let float_type_addr = &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64;
+            let raw = walker_unbox_float(ctx, op_pc, value, float_type_addr)?;
+            let live_f = unsafe { pyre_object::w_float_get_value(concrete_value) };
+            ctx.trace_ctx
+                .set_opref_concrete(raw, majit_ir::Value::Float(live_f));
+            (
+                crate::helpers::jit_mapdict_unboxed_write_f as *const (),
+                raw,
+                majit_ir::Type::Float,
+            )
+        }
+    };
+    let helper = ctx.trace_ctx.const_int(helper_fn as usize as i64);
 
     let mut effect = original_effect.clone();
     effect.extraeffect = majit_ir::ExtraEffect::CannotRaise;
@@ -18424,14 +18470,14 @@ fn try_walker_specialize_store_attr(
             majit_ir::Type::Ref,
             majit_ir::Type::Int,
             majit_ir::Type::Int,
-            majit_ir::Type::Int,
+            value_type,
         ],
         majit_ir::Type::Void,
         effect,
     );
-    // ABI order follows `jit_mapdict_unboxed_write_raw`: receiver and the two
-    // guarded green coordinates, then the raw symbolic integer value.  No
-    // W_IntObject is materialized for this write.
+    // ABI order follows the write helpers: receiver and the two guarded green
+    // coordinates, then the raw symbolic value in its own bank.  No box is
+    // materialized for this write.
     Ok(Some((
         descr,
         vec![helper, obj, storageindex_const, listindex_const, raw],

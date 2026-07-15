@@ -8,7 +8,7 @@
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use majit_ir::{OpCode, OpRef, Value};
+use majit_ir::{OpCode, OpRef, Type, Value};
 
 use super::{MIFrame, MIFrameStack};
 use crate::jitcode::insns::MAX_HOST_CALL_ARITY;
@@ -7581,6 +7581,27 @@ pub fn call_void_function(func_ptr: *const (), args: &[i64]) {
                 MAX_HOST_CALL_ARITY
             ),
         }
+    }
+}
+
+/// Void-call dispatcher for signatures carrying Float-bank arguments.  Args
+/// reach here packed into machine words, so a float argument holds its bits in
+/// an `i64` while the callee's C ABI expects it in a floating-point register;
+/// only `arg_types` still records which is which.  Shapes with no float
+/// argument, and the host-trampoline path (which reflects the callee's real
+/// signature and coerces each argument itself), defer to `call_void_function`.
+pub fn call_void_function_typed(func_ptr: *const (), args: &[i64], arg_types: &[Type]) {
+    if majit_backend::call_stub::residual_host_call().is_some() || !arg_types.contains(&Type::Float)
+    {
+        call_void_function(func_ptr, args);
+        return;
+    }
+    match (args, arg_types) {
+        ([a0, a1, a2, a3], [Type::Ref, Type::Int, Type::Int, Type::Float]) => unsafe {
+            let func: extern "C" fn(i64, i64, i64, f64) = std::mem::transmute(func_ptr);
+            func(*a0, *a1, *a2, f64::from_bits(*a3 as u64));
+        },
+        _ => call_void_function(func_ptr, args),
     }
 }
 
