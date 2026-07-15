@@ -150,6 +150,23 @@ pub trait GcAllocator: Send {
     /// Allocate a fixed-size object in the nursery.
     fn alloc_nursery(&mut self, size: usize) -> GcRef;
 
+    /// Allocate a HEADERLESS nursery object of exactly `size` bytes and return
+    /// the RAW base (no GcHeader, no type word), matching the JIT headerless
+    /// fast-path contract. Only a headerless-aware GC box may serve this.
+    /// `MiniMarkGC` is a headered collector: its nursery walk reads a GcHeader
+    /// at `obj - GcHeader::SIZE`, which a headerless object lacks, so it must
+    /// never serve a headerless allocation. The default panics to turn a future
+    /// misconfiguration (an interpreter that declares `headerless_structs` while
+    /// leaving MiniMarkGC as the active dynasm GC) into a loud failure instead of
+    /// a silently mis-based pointer + untraceable object.
+    fn alloc_nursery_headerless(&mut self, _size: usize) -> GcRef {
+        panic!(
+            "alloc_nursery_headerless called on a headerless-unaware GcAllocator \
+             (e.g. MiniMarkGC); headerless nursery allocation requires a \
+             headerless-aware active dynasm GC box"
+        );
+    }
+
     /// Allocate a fixed-size object with a known GC type id.
     fn alloc_nursery_typed(&mut self, type_id: u32, size: usize) -> GcRef {
         let _ = type_id;

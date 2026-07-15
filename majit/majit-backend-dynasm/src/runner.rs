@@ -681,9 +681,10 @@ pub extern "C" fn dynasm_nursery_slowpath(total_size: u64) -> u64 {
 /// Headerless nursery overflow slow path.
 ///
 /// `size` is the exact allocation size.  Returns the allocation base,
-/// matching the headerless fast path.
+/// matching the headerless fast path.  Headered collectors such as MiniMarkGC
+/// are not headerless-aware and must fail via `alloc_nursery_headerless`.
 pub extern "C" fn dynasm_nursery_slowpath_headerless(size: u64) -> u64 {
-    let ptr = with_dynasm_active_gc_mut(|gc| gc.alloc_nursery(size as usize).0 as u64)
+    let ptr = with_dynasm_active_gc_mut(|gc| gc.alloc_nursery_headerless(size as usize).0 as u64)
         .unwrap_or_else(|| unsafe { libc::calloc(1, size as usize) as u64 });
     if majit_ir::debug::have_debug_prints() {
         majit_ir::debug::log_one(
