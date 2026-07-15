@@ -13013,6 +13013,29 @@ pub(crate) fn setup_reconstructed_callee_frame(
     let ec_const = ctx.const_ref(execution_context as i64);
 
     let locals_boxes: Vec<OpRef> = recipe.registers_r[..nlocals].to_vec();
+    // `registers_r` are the paused root's OpRefs, whose trace concrete can still
+    // read as a stale NULL once reused as the reconstructed callee's locals,
+    // while `concrete_r[k]` holds the value captured at guard failure. A
+    // residual call consuming such a local folds its Ref arg to concrete NULL
+    // and the walk stops on `MayForceNullRefArgUnsupported`, so no bridge is
+    // ever built and the guard re-deopts forever. Restamp each local from its
+    // captured value; a NULL/Void capture is an unmaterialized hole and is left
+    // alone, matching how `setup_bridge_sym` seeds the root frame's slots.
+    for (k, &opref) in locals_boxes.iter().enumerate() {
+        if opref.is_none() {
+            continue;
+        }
+        let Some(&captured) = recipe.concrete_r.get(k) else {
+            continue;
+        };
+        if matches!(
+            captured,
+            majit_ir::Value::Void | majit_ir::Value::Ref(majit_ir::GcRef(0))
+        ) {
+            continue;
+        }
+        ctx.try_set_opref_concrete(opref, captured);
+    }
     let frame_vable = crate::helpers::emit_new_pyframe_inline_with_params(
         ctx,
         &locals_boxes,

@@ -4857,7 +4857,21 @@ fn getarrayitem_vable_via_metainterp(
     // Mirror `getfield_vable_via_metainterp`: stamp the read result's
     // concrete so `concrete_of_opref(result)` honors the Box.value
     // contract for downstream consumers; `Value::Void` = no live concrete.
-    if !matches!(shadow_value, Value::Void) {
+    //
+    // An indexed read hands back the STORED box, so the stamp is a write onto a
+    // box that may already carry a live concrete. A frame whose array slot is
+    // still an unmaterialized hole reads NULL while the real Ref lives in the
+    // guard's register file, so stamping that NULL would clobber the live value
+    // (last write wins) and fold a downstream may-force residual's Ref arg to
+    // NULL -> `MayForceNullRefArgUnsupported`. Skip ONLY that clobber: a NULL
+    // read onto a box with no live Ref still stamps, keeping NULL a real
+    // concrete for the slots that genuinely hold one.
+    let clobbers_live_ref = matches!(shadow_value, Value::Ref(majit_ir::GcRef(0)))
+        && matches!(
+            ctx.trace_ctx.box_value(result),
+            Some(Value::Ref(majit_ir::GcRef(addr))) if addr != 0
+        );
+    if !matches!(shadow_value, Value::Void) && !clobbers_live_ref {
         ctx.trace_ctx.set_opref_concrete(result, shadow_value);
     }
     let dst = code[op.pc + 7] as usize;
@@ -24305,13 +24319,48 @@ fn handle(
             // sub-walk — the framestack is non-empty — and only when a token
             // exists) routes the inlined loop-bearing callee to its own compiled
             // loop, the trait-parity `LoopTargetDescr`/`CALL_ASSEMBLER` shape.
+            //
+            // "An inlined callee's own loop" is whose loop this header is, which
+            // a non-empty framestack does not establish: a bridge's outer-frame
+            // continuation runs the trace ROOT forward (with a frame still on the
+            // stack) and reaches the very loop it exited, so the framestack proxy
+            // matches there too and routes a bridge that must close with a JUMP
+            // back into that loop (`CloseLoop` -> `CloseLoopWithArgs`) into a
+            // CALL_ASSEMBLER request no caller consumes, aborting it
+            // (`OuterNonTerminate`). Discriminate on the header's frame vs the
+            // trace root: same code = the root's own loop, so fall through to the
+            // normal loop-crossing path.
+            let fbw_root_code = {
+                let sym_ptr = ctx.fbw_mode.snapshot_sym;
+                if sym_ptr.is_null() {
+                    None
+                } else {
+                    unsafe {
+                        let sym = &*sym_ptr;
+                        if sym.jitcode.is_null() {
+                            None
+                        } else {
+                            let jc = &*sym.jitcode;
+                            let raw = jc.payload.code_ptr;
+                            if raw.is_null() {
+                                None
+                            } else {
+                                Some(pyre_interpreter::live_code_wrapper(raw as *const ()))
+                            }
+                        }
+                    }
+                }
+            };
             if fbw_loop_callee_ca_enabled() {
                 let callee_code = ctx
                     .session
                     .borrow()
                     .framestack
                     .last()
-                    .map(|frame| frame.w_code);
+                    .map(|frame| frame.w_code)
+                    .filter(|&cc| {
+                        fbw_root_code.is_none_or(|root| root as *const () != cc as *const ())
+                    });
                 if let Some(callee_code) = callee_code {
                     let callee_key =
                         crate::driver::make_green_key(callee_code as *const (), next_instr);
