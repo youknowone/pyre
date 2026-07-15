@@ -917,6 +917,36 @@ pub struct W_ModuleDictObject {
     pub object_storage: *mut indexmap::IndexMap<ObjectKey, PyObjectRef>,
 }
 
+/// Free the three off-GC `malloc_raw` storages owned by a
+/// `W_ModuleDictObject`.  Called from the GC-sweep destructor
+/// (`pyre-jit::eval::module_dict_object_destructor`).  Mirrors
+/// `W_DictObject`'s `dstrategy.dealloc_storage`: the GC frees the
+/// `W_ModuleDictObject` cell itself, but its `dstorage`/`mstrategy`/
+/// `object_storage` are plain `Box::into_raw` allocations the GC never
+/// sees, so they must be reclaimed here.  Null-checked and nulled after
+/// free so a second call is a no-op.  The `PyObjectRef` values inside the
+/// dropped containers are `Copy` (no `Drop`), so dropping frees only the
+/// container heap, never a GC object.
+///
+/// # Safety
+/// `obj` must point at a valid `W_ModuleDictObject` whose Boxes are not
+/// aliased by any other owner (they are not — nothing else frees them).
+pub unsafe fn w_module_dict_dealloc_storage(obj: PyObjectRef) {
+    let raw = &mut *(obj as *mut W_ModuleDictObject);
+    if !raw.dstorage.is_null() {
+        drop(Box::from_raw(raw.dstorage));
+        raw.dstorage = std::ptr::null_mut();
+    }
+    if !raw.mstrategy.is_null() {
+        drop(Box::from_raw(raw.mstrategy));
+        raw.mstrategy = std::ptr::null_mut();
+    }
+    if !raw.object_storage.is_null() {
+        drop(Box::from_raw(raw.object_storage));
+        raw.object_storage = std::ptr::null_mut();
+    }
+}
+
 /// GC type id assigned to `W_ModuleDictObject`.  Lands at slot 48,
 /// the first free id after the foreign-pytype loop in
 /// `pyre/pyre-jit/src/eval.rs` registers NONE_TYPE (43),

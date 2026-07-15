@@ -470,6 +470,14 @@ unsafe fn dict_object_destructor(obj_addr: usize) {
     }
 }
 
+/// Sweep-time destructor for `W_ModuleDictObject`: reclaim the three
+/// off-GC storage Boxes (`dstorage`/`mstrategy`/`object_storage`) the GC
+/// does not own.  Mirrors `dict_object_destructor`.
+unsafe fn module_dict_object_destructor(obj_addr: usize) {
+    let obj = obj_addr as pyre_object::PyObjectRef;
+    unsafe { pyre_object::dictmultiobject::w_module_dict_dealloc_storage(obj) };
+}
+
 /// Custom trace for `W_ObjectObject` (instance `map`+`storage`,
 /// `mapdict.py:907-910`).  The `storage` list is an off-GC
 /// `Box<Vec<PyObjectRef>>`, so — exactly as `dict_object_custom_trace`
@@ -1905,11 +1913,14 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     // after `switch_to_object_strategy`).  Register a custom trace
     // hook so the GC walks all three indirect storages — matching
     // the W_DictObject pattern at line 851.
-    let w_module_dict_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
-        std::mem::size_of::<pyre_object::dictmultiobject::W_ModuleDictObject>(),
-        object_tid,
-        module_dict_object_custom_trace,
-    ));
+    let w_module_dict_tid = gc.register_type(
+        TypeInfo::object_subclass_with_custom_trace(
+            std::mem::size_of::<pyre_object::dictmultiobject::W_ModuleDictObject>(),
+            object_tid,
+            module_dict_object_custom_trace,
+        )
+        .with_destructor_fn(module_dict_object_destructor),
+    );
     debug_assert_eq!(w_module_dict_tid, W_MODULE_DICT_GC_TYPE_ID);
     majit_gc::GcAllocator::register_vtable_for_type(
         &mut gc,
