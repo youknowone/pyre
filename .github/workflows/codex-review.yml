@@ -111,6 +111,7 @@ jobs:
               marker,
               '## 🤖 Codex parity review',
               `Static analysis of this diff vs the local RPython/PyPy sources (commit ${context.sha.slice(0, 7)}).`,
+              `Updated: ${new Date().toISOString()}`,
               '',
               report,
             ].join('\n');
