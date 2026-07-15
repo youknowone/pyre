@@ -2054,13 +2054,32 @@ fn frozenset_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     }
 
     let obj = set_alloc_for_class(cls, frozenset_type, true)?;
-    if !iterable.is_null() {
+    let obj = if !iterable.is_null() {
         let items = crate::builtins::collect_iterable(iterable)?;
-        for item in items {
-            crate::builtins::try_hash_value(item)?;
-            unsafe { pyre_object::w_set_add(obj, item) };
+        // `try_hash_value` may run a user `__hash__` that allocates and
+        // triggers a moving minor collection; `obj` and every not-yet-added
+        // item are rooted for the whole loop and reloaded after each hash.
+        unsafe {
+            let _roots = pyre_object::gc_roots::push_roots();
+            let sp = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(obj);
+            let item_base = sp + 1;
+            for item in items {
+                pyre_object::gc_roots::pin_root(item);
+            }
+            let item_len = pyre_object::gc_roots::shadow_stack_len() - item_base;
+            for i in 0..item_len {
+                let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
+                crate::builtins::try_hash_value(item)?;
+                let obj = pyre_object::gc_roots::shadow_stack_get(sp);
+                let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
+                pyre_object::w_set_add(obj, item);
+            }
+            pyre_object::gc_roots::shadow_stack_get(sp)
         }
-    }
+    } else {
+        obj
+    };
     Ok(obj)
 }
 
@@ -2128,9 +2147,26 @@ fn set_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // is not None (the parsed default).
     if !w_iterable.is_null() && !unsafe { pyre_object::is_none(w_iterable) } {
         let items = crate::builtins::collect_iterable(w_iterable)?;
-        for item in items {
-            crate::builtins::try_hash_value(item)?;
-            unsafe { pyre_object::w_set_add(set_obj, item) };
+        // `try_hash_value` may run a user `__hash__` that allocates and
+        // triggers a moving minor collection; `set_obj` and every
+        // not-yet-added item are rooted for the whole loop and reloaded
+        // after each hash.
+        unsafe {
+            let _roots = pyre_object::gc_roots::push_roots();
+            let sp = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(set_obj);
+            let item_base = sp + 1;
+            for item in items {
+                pyre_object::gc_roots::pin_root(item);
+            }
+            let item_len = pyre_object::gc_roots::shadow_stack_len() - item_base;
+            for i in 0..item_len {
+                let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
+                crate::builtins::try_hash_value(item)?;
+                let set_obj = pyre_object::gc_roots::shadow_stack_get(sp);
+                let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
+                pyre_object::w_set_add(set_obj, item);
+            }
         }
     }
     Ok(pyre_object::w_none())
@@ -3492,10 +3528,31 @@ fn init_dict_type(ns: &mut DictStorage) {
             let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
             if cls.is_null() || crate::baseobjspace::is_w(cls, w_dict_type) {
                 let d = pyre_object::w_dict_new();
-                for key in items {
-                    crate::builtins::try_hash_value(key)?;
-                    unsafe { pyre_object::w_dict_store(d, key, value) };
-                }
+                // `try_hash_value` may run a user `__hash__` that allocates
+                // and triggers a moving minor collection; `d`, the shared
+                // `value` (reused across every key), and every not-yet-added
+                // key are rooted for the whole loop and reloaded after each
+                // hash.
+                let d = unsafe {
+                    let _roots = pyre_object::gc_roots::push_roots();
+                    let sp = pyre_object::gc_roots::shadow_stack_len();
+                    pyre_object::gc_roots::pin_root(d);
+                    pyre_object::gc_roots::pin_root(value);
+                    let key_base = sp + 2;
+                    for key in items {
+                        pyre_object::gc_roots::pin_root(key);
+                    }
+                    let key_len = pyre_object::gc_roots::shadow_stack_len() - key_base;
+                    for i in 0..key_len {
+                        let key = pyre_object::gc_roots::shadow_stack_get(key_base + i);
+                        crate::builtins::try_hash_value(key)?;
+                        let d = pyre_object::gc_roots::shadow_stack_get(sp);
+                        let key = pyre_object::gc_roots::shadow_stack_get(key_base + i);
+                        let value = pyre_object::gc_roots::shadow_stack_get(sp + 1);
+                        pyre_object::w_dict_store(d, key, value);
+                    }
+                    pyre_object::gc_roots::shadow_stack_get(sp)
+                };
                 Ok(d)
             } else {
                 let d = crate::call::call_function_impl_result(cls, &[])?;
@@ -13895,8 +13952,19 @@ fn init_set_type(ns: &mut DictStorage) {
             "add",
             |args| {
                 if args.len() >= 2 {
-                    crate::builtins::try_hash_value(args[1])?;
-                    unsafe { pyre_object::w_set_add(args[0], args[1]) };
+                    // `try_hash_value` may run a user `__hash__` that
+                    // allocates and triggers a moving minor collection;
+                    // root `self` and the element across it, then reload.
+                    unsafe {
+                        let _roots = pyre_object::gc_roots::push_roots();
+                        let sp = pyre_object::gc_roots::shadow_stack_len();
+                        pyre_object::gc_roots::pin_root(args[0]);
+                        pyre_object::gc_roots::pin_root(args[1]);
+                        crate::builtins::try_hash_value(args[1])?;
+                        let set = pyre_object::gc_roots::shadow_stack_get(sp);
+                        let item = pyre_object::gc_roots::shadow_stack_get(sp + 1);
+                        pyre_object::w_set_add(set, item);
+                    }
                 }
                 Ok(pyre_object::w_none())
             },
@@ -13984,11 +14052,31 @@ fn init_set_type(ns: &mut DictStorage) {
             if args.is_empty() {
                 return Ok(pyre_object::w_none());
             }
-            for other in &args[1..] {
-                let other_items = crate::builtins::collect_iterable(*other)?;
-                for item in other_items {
-                    crate::builtins::try_hash_value(item)?;
-                    unsafe { pyre_object::w_set_add(args[0], item) };
+            // `self` (`args[0]`) is rooted once for the whole method body:
+            // both `collect_iterable` (an arbitrary iterator) and
+            // `try_hash_value` (an arbitrary `__hash__`) are collection
+            // points that can move it, and every element of the current
+            // `other`'s collected items is rooted for its own loop for the
+            // same reason.
+            unsafe {
+                let _roots = pyre_object::gc_roots::push_roots();
+                let set_slot = pyre_object::gc_roots::shadow_stack_len();
+                pyre_object::gc_roots::pin_root(args[0]);
+                for other in &args[1..] {
+                    let other_items = crate::builtins::collect_iterable(*other)?;
+                    let _item_roots = pyre_object::gc_roots::push_roots();
+                    let item_base = pyre_object::gc_roots::shadow_stack_len();
+                    for item in other_items {
+                        pyre_object::gc_roots::pin_root(item);
+                    }
+                    let item_len = pyre_object::gc_roots::shadow_stack_len() - item_base;
+                    for i in 0..item_len {
+                        let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
+                        crate::builtins::try_hash_value(item)?;
+                        let set = pyre_object::gc_roots::shadow_stack_get(set_slot);
+                        let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
+                        pyre_object::w_set_add(set, item);
+                    }
                 }
             }
             Ok(pyre_object::w_none())
@@ -14054,21 +14142,41 @@ fn init_set_type(ns: &mut DictStorage) {
                 return Ok(pyre_object::w_none());
             }
             let other_items = crate::builtins::collect_iterable(args[1])?;
-            for item in other_items {
-                // toggle: remove if present, add otherwise
-                let self_items = unsafe { pyre_object::w_set_items(args[0]) };
-                let mut present = false;
-                for &existing in self_items.iter() {
-                    if crate::baseobjspace::eq_w(item, existing)? {
-                        present = true;
-                        break;
-                    }
+            // `self` (`args[0]`) is rooted once for the whole loop, and
+            // every collected `other` item is rooted for the loop's
+            // duration; `try_hash_value` (an arbitrary `__hash__`, on the
+            // add arm) is a collection point that can move either.
+            unsafe {
+                let _roots = pyre_object::gc_roots::push_roots();
+                let set_slot = pyre_object::gc_roots::shadow_stack_len();
+                pyre_object::gc_roots::pin_root(args[0]);
+                let item_base = set_slot + 1;
+                for item in other_items {
+                    pyre_object::gc_roots::pin_root(item);
                 }
-                if present {
-                    unsafe { pyre_object::w_set_discard(args[0], item) };
-                } else {
-                    crate::builtins::try_hash_value(item)?;
-                    unsafe { pyre_object::w_set_add(args[0], item) };
+                let item_len = pyre_object::gc_roots::shadow_stack_len() - item_base;
+                for i in 0..item_len {
+                    // toggle: remove if present, add otherwise
+                    let set = pyre_object::gc_roots::shadow_stack_get(set_slot);
+                    let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
+                    let self_items = pyre_object::w_set_items(set);
+                    let mut present = false;
+                    for &existing in self_items.iter() {
+                        if crate::baseobjspace::eq_w(item, existing)? {
+                            present = true;
+                            break;
+                        }
+                    }
+                    let set = pyre_object::gc_roots::shadow_stack_get(set_slot);
+                    let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
+                    if present {
+                        pyre_object::w_set_discard(set, item);
+                    } else {
+                        crate::builtins::try_hash_value(item)?;
+                        let set = pyre_object::gc_roots::shadow_stack_get(set_slot);
+                        let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
+                        pyre_object::w_set_add(set, item);
+                    }
                 }
             }
             Ok(pyre_object::w_none())

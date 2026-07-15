@@ -307,7 +307,17 @@ pub fn list_extend_value(list: PyObjectRef, iterable: PyObjectRef) -> Result<(),
 pub fn set_add_value(set: PyObjectRef, value: PyObjectRef) -> Result<(), PyError> {
     unsafe {
         if pyre_object::is_set_or_frozenset(set) {
+            // `try_hash_value` may run a user `__hash__` that allocates and
+            // triggers a moving minor collection; `set`/`value` must be
+            // shadow-stack roots across it, then reloaded, or the store
+            // below can write through a relocated (stale) pointer.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let sp = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(set);
+            pyre_object::gc_roots::pin_root(value);
             crate::builtins::try_hash_value(value)?;
+            let set = pyre_object::gc_roots::shadow_stack_get(sp);
+            let value = pyre_object::gc_roots::shadow_stack_get(sp + 1);
             pyre_object::w_set_add(set, value);
         } else if pyre_object::is_list(set) {
             pyre_object::w_list_append(set, value);
@@ -323,9 +333,25 @@ pub fn set_add_value(set: PyObjectRef, value: PyObjectRef) -> Result<(), PyError
 pub fn set_update_value(set: PyObjectRef, iterable: PyObjectRef) -> Result<(), PyError> {
     unsafe {
         if pyre_object::is_set_or_frozenset(set) {
+            // `collect_iterable` pops its own shadow-stack roots before
+            // returning, so `items` is a bare, unrooted `Vec` — each
+            // element (and `set`) needs re-pinning for the duration of
+            // this loop, since any iteration's `try_hash_value` can move
+            // both `set` and every not-yet-processed item.
             let items = crate::builtins::collect_iterable(iterable)?;
+            let _roots = pyre_object::gc_roots::push_roots();
+            let sp = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(set);
+            let item_base = sp + 1;
             for item in items {
+                pyre_object::gc_roots::pin_root(item);
+            }
+            let item_len = pyre_object::gc_roots::shadow_stack_len() - item_base;
+            for i in 0..item_len {
+                let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
                 crate::builtins::try_hash_value(item)?;
+                let set = pyre_object::gc_roots::shadow_stack_get(sp);
+                let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
                 pyre_object::w_set_add(set, item);
             }
         } else if pyre_object::is_list(set) {
@@ -353,8 +379,19 @@ pub fn map_add_value(
     key: PyObjectRef,
     value: PyObjectRef,
 ) -> Result<(), PyError> {
-    crate::builtins::try_hash_value(key)?;
     unsafe {
+        // Root across `try_hash_value` (a possible collection point from a
+        // user `__hash__`) and reload before the store, mirroring
+        // `set_add_value`.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let sp = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(dict);
+        pyre_object::gc_roots::pin_root(key);
+        pyre_object::gc_roots::pin_root(value);
+        crate::builtins::try_hash_value(key)?;
+        let dict = pyre_object::gc_roots::shadow_stack_get(sp);
+        let key = pyre_object::gc_roots::shadow_stack_get(sp + 1);
+        let value = pyre_object::gc_roots::shadow_stack_get(sp + 2);
         pyre_object::w_dict_store(dict, key, value);
     }
     Ok(())
@@ -385,9 +422,38 @@ pub fn dict_update_value(dict: PyObjectRef, source: PyObjectRef) -> Result<(), P
     };
     let keys_obj = crate::call::call_function_impl_result(keys_method, &[])?;
     let keys = crate::builtins::collect_iterable(keys_obj)?;
-    for key in keys {
-        let val = crate::baseobjspace::getitem(source, key)?;
-        unsafe { pyre_object::w_dict_store(dict, key, val) };
+    unsafe {
+        // A generic mapping's keys are not pre-validated the way a real
+        // dict's are (the `is_dict(source)` fast path above skips the hash
+        // check for exactly that reason) — `d[key] = mapping[key]` still
+        // hashes `key`, so an unhashable one must raise here too.  `dict`,
+        // `source`, and every collected key are rooted for the loop's
+        // duration: `getitem` (arbitrary `__getitem__`) and
+        // `try_hash_value` (arbitrary `__hash__`) both may allocate and
+        // move them.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let sp = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(dict);
+        pyre_object::gc_roots::pin_root(source);
+        let key_base = sp + 2;
+        for key in keys {
+            pyre_object::gc_roots::pin_root(key);
+        }
+        let key_len = pyre_object::gc_roots::shadow_stack_len() - key_base;
+        for i in 0..key_len {
+            let source = pyre_object::gc_roots::shadow_stack_get(sp + 1);
+            let key = pyre_object::gc_roots::shadow_stack_get(key_base + i);
+            let val = crate::baseobjspace::getitem(source, key)?;
+            let _val_root = pyre_object::gc_roots::push_roots();
+            let val_slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(val);
+            let key = pyre_object::gc_roots::shadow_stack_get(key_base + i);
+            crate::builtins::try_hash_value(key)?;
+            let dict = pyre_object::gc_roots::shadow_stack_get(sp);
+            let key = pyre_object::gc_roots::shadow_stack_get(key_base + i);
+            let val = pyre_object::gc_roots::shadow_stack_get(val_slot);
+            pyre_object::w_dict_store(dict, key, val);
+        }
     }
     Ok(())
 }
@@ -738,6 +804,32 @@ mod tests {
             set_add_value(set, value).expect_err("SET_ADD should reject an unhashable element");
         assert_eq!(set_err.kind, crate::PyErrorKind::TypeError);
         assert_eq!(unsafe { w_set_len(set) }, 0);
+    }
+
+    /// SET_UPDATE (`set.update(iterable)`) rejects an unhashable element
+    /// mid-iterable without inserting the elements that precede it, and
+    /// the rooting added around the per-item `try_hash_value` call does
+    /// not disturb the accept path. Exercises `set_update_value`'s SET
+    /// branch loop added by `416dc05`.
+    #[test]
+    fn test_set_update_value_rejects_unhashable_element_without_inserting() {
+        install_hash_hook();
+
+        let set = pyre_object::w_set_new();
+        let unhashable = pyre_object::w_list_new(vec![]);
+        let iterable = pyre_object::w_list_new(vec![w_int_new(1), w_int_new(2), unhashable]);
+        let err = set_update_value(set, iterable)
+            .expect_err("SET_UPDATE should reject an unhashable element");
+        assert_eq!(err.kind, crate::PyErrorKind::TypeError);
+        // Reject-before-mutate is per-element (matches CPython's left-to-right
+        // partial-update behavior for `set.update`), so the hashable elements
+        // preceding the unhashable one are still inserted.
+        assert_eq!(unsafe { w_set_len(set) }, 2);
+
+        let set = pyre_object::w_set_new();
+        let iterable = pyre_object::w_list_new(vec![w_int_new(1), w_int_new(2), w_int_new(3)]);
+        set_update_value(set, iterable).expect("SET_UPDATE should accept hashable elements");
+        assert_eq!(unsafe { w_set_len(set) }, 3);
     }
 
     #[test]
