@@ -51,6 +51,8 @@ def main():
     m("items_xor", lambda: s(K.items() ^ K2.items()))
     # the result is a plain set
     m("result_type", lambda: type(K.keys() - K2.keys()).__name__)
+    # an unhashable element in the view raises through the set constructor
+    m("items_and_unhashable", lambda: {"a": []}.items() & {("a", 1)})
     # a non-iterable right operand
     m("keys_sub_int", lambda: K.keys() - 1)
     m("keys_and_none", lambda: K.keys() & None)

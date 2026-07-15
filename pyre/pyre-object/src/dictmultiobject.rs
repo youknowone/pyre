@@ -298,7 +298,7 @@ pub struct DictKeyError;
 /// both flags.  The concrete `PyError` rides the interpreter-side
 /// pending slot, retrieved via `take_pending_hash_error`.
 #[inline]
-unsafe fn take_dict_key_error() -> bool {
+pub(crate) unsafe fn take_dict_key_error() -> bool {
     let hash = crate::dict_eq_hook::take_hash_error();
     let eq = crate::dict_eq_hook::take_eq_error();
     hash || eq

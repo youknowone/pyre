@@ -136,6 +136,17 @@ pub fn w_set_from_items(items: &[PyObjectRef]) -> PyObjectRef {
     s
 }
 
+/// Fallible variant of [`w_set_from_items`].
+pub fn w_set_from_items_checked(
+    items: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::dictmultiobject::DictKeyError> {
+    let s = w_set_new();
+    for &item in items {
+        unsafe { w_set_add_checked(s, item)? };
+    }
+    Ok(s)
+}
+
 /// Allocate a populated frozenset from a slice of elements (deduped).
 pub fn w_frozenset_from_items(items: &[PyObjectRef]) -> PyObjectRef {
     let s = w_frozenset_new();
@@ -143,6 +154,17 @@ pub fn w_frozenset_from_items(items: &[PyObjectRef]) -> PyObjectRef {
         unsafe { w_set_add(s, item) };
     }
     s
+}
+
+/// Fallible variant of [`w_frozenset_from_items`].
+pub fn w_frozenset_from_items_checked(
+    items: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::dictmultiobject::DictKeyError> {
+    let s = w_frozenset_new();
+    for &item in items {
+        unsafe { w_set_add_checked(s, item)? };
+    }
+    Ok(s)
 }
 
 /// Insert an element. No-op when already present.
@@ -159,6 +181,40 @@ pub unsafe fn w_set_add(obj: PyObjectRef, item: PyObjectRef) {
     }
 }
 
+/// Fallible variant of [`w_set_add`].
+///
+/// `setobject.py:1611 newset` — the set's backing `r_dict` is built with
+/// `space.hash_w` as its hash function, so storing an element runs the hash
+/// protocol and an unhashable element raises there instead of being stored
+/// under a structural hash.
+///
+/// # Safety
+/// `obj` must point to a valid `W_SetObject`.
+pub unsafe fn w_set_add_checked(
+    obj: PyObjectRef,
+    item: PyObjectRef,
+) -> Result<(), crate::dictmultiobject::DictKeyError> {
+    let key = crate::dictmultiobject::object_key_for_checked(item)?;
+    let s = &mut *(obj as *mut W_SetObject);
+    let entries = &mut *s.items;
+    // Single insert probe, as in `w_dict_store_object_strategy_checked`: when
+    // `space.eq_w` raises mid-probe the comparison reads as "not equal", so
+    // `insert` appends a spurious entry at the end; drop it so the add leaves
+    // the set unchanged.
+    let appended = entries.insert(key, ()).is_none();
+    if crate::dictmultiobject::take_dict_key_error() {
+        if appended {
+            entries.pop();
+        }
+        return Err(crate::dictmultiobject::DictKeyError);
+    }
+    if appended {
+        s.len += 1;
+        set_write_barrier(obj);
+    }
+    Ok(())
+}
+
 /// Membership test.
 ///
 /// # Safety
@@ -167,6 +223,28 @@ pub unsafe fn w_set_contains(obj: PyObjectRef, item: PyObjectRef) -> bool {
     let s = &*(obj as *const W_SetObject);
     let entries = &*s.items;
     entries.contains_key(&crate::dictmultiobject::object_key_for(item))
+}
+
+/// Fallible variant of [`w_set_contains`].
+///
+/// `setobject.py:842-844 EmptySetStrategy.has_key` — the element is hashed
+/// even when the set is empty, so an unhashable element raises rather than
+/// reading as absent.
+///
+/// # Safety
+/// `obj` must point to a valid `W_SetObject`.
+pub unsafe fn w_set_contains_checked(
+    obj: PyObjectRef,
+    item: PyObjectRef,
+) -> Result<bool, crate::dictmultiobject::DictKeyError> {
+    let key = crate::dictmultiobject::object_key_for_checked(item)?;
+    let s = &*(obj as *const W_SetObject);
+    let entries = &*s.items;
+    let found = entries.contains_key(&key);
+    if crate::dictmultiobject::take_dict_key_error() {
+        return Err(crate::dictmultiobject::DictKeyError);
+    }
+    Ok(found)
 }
 
 /// Remove an element if present. Returns true when removed.
@@ -185,6 +263,27 @@ pub unsafe fn w_set_discard(obj: PyObjectRef, item: PyObjectRef) -> bool {
     } else {
         false
     }
+}
+
+/// Fallible variant of [`w_set_discard`].
+///
+/// # Safety
+/// `obj` must point to a valid `W_SetObject`.
+pub unsafe fn w_set_discard_checked(
+    obj: PyObjectRef,
+    item: PyObjectRef,
+) -> Result<bool, crate::dictmultiobject::DictKeyError> {
+    let key = crate::dictmultiobject::object_key_for_checked(item)?;
+    let s = &mut *(obj as *mut W_SetObject);
+    let entries = &mut *s.items;
+    let removed = entries.shift_remove(&key).is_some();
+    if crate::dictmultiobject::take_dict_key_error() {
+        return Err(crate::dictmultiobject::DictKeyError);
+    }
+    if removed {
+        s.len -= 1;
+    }
+    Ok(removed)
 }
 
 /// Number of elements in the set.

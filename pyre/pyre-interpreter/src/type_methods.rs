@@ -4739,6 +4739,23 @@ pub(crate) fn dict_store_checked(
     }
 }
 
+/// Add an element to a set, hashing it through the protocol.
+///
+/// `setobject.py:1611 newset` — the set's backing `r_dict` hashes with
+/// `space.hash_w`, so an unhashable element raises instead of being stored.
+pub(crate) fn set_add_checked(set: PyObjectRef, item: PyObjectRef) -> Result<(), crate::PyError> {
+    unsafe {
+        pyre_object::setobject::w_set_add_checked(set, item)
+            .map_err(|_| crate::baseobjspace::take_pending_hash_error())
+    }
+}
+
+/// Populate a fresh set from `items`, hashing each through the protocol.
+pub(crate) fn set_from_items_checked(items: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    pyre_object::setobject::w_set_from_items_checked(items)
+        .map_err(|_| crate::baseobjspace::take_pending_hash_error())
+}
+
 pub fn dict_method_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "get", 1)?;
     let dict = resolve_dict_backing(args[0]);
