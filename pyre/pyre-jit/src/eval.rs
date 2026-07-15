@@ -2556,8 +2556,13 @@ fn build_gc_global() {
         return;
     }
     let gc = build_gc();
-    majit_gc::gc_sync::store_singleton(gc);
+    // Publish the eval-breaker word address before store_singleton flips the
+    // GC-initialized flag (Release). A concurrent initializer that observes the
+    // flag set (Acquire) early-returns above; ordering the publish first makes
+    // that observer also see a non-zero poll address, so its compiled
+    // GuardEvalBreaker ops are not baked inert.
     majit_ir::eval_breaker_word::publish_addr();
+    majit_gc::gc_sync::store_singleton(gc);
 }
 
 /// Test-support: give the calling `gc_stress` worker a pristine GC heap by
