@@ -267,11 +267,23 @@ fn setfield_store_size_from_descr(op: &Op) -> usize {
     std::mem::size_of::<usize>()
 }
 
+fn field_is_float_from_descr(op: &Op) -> bool {
+    op.getdescr()
+        .as_ref()
+        .and_then(|d| d.as_field_descr())
+        .is_some_and(|fd| fd.is_float_field())
+}
+
 /// `(item_size, is_signed)` from an op's ArrayDescr; defaults to 8-byte
 /// signed when the descr is absent.
 fn array_item_size_sign_from_descr(op: &Op) -> (usize, bool) {
     op.with_array_descr(|ad| (ad.item_size(), ad.is_item_signed()))
         .unwrap_or((8, true))
+}
+
+fn array_item_is_float_from_descr(op: &Op) -> bool {
+    op.with_array_descr(|ad| ad.item_type() == Type::Float)
+        .unwrap_or(false)
 }
 
 /// Dense census of every non-constant Ref-typed value (input arg / op result),
@@ -495,6 +507,7 @@ fn has_ref_store_op(ops: &[Op], ref_values: &RefValues) -> bool {
 fn emit_write_barrier(
     sink: &mut InstructionSink<'_>,
     constants: &indexmap::IndexMap<u32, i64>,
+    value_types: &[ValType],
     jit_call_idx: Option<u32>,
     residual_type_base: Option<u32>,
     wb_fn_ptr: i64,
@@ -509,7 +522,7 @@ fn emit_write_barrier(
         const WB_FLAG: i32 = majit_gc::flags::TRACK_YOUNG_PTRS as i32;
         const _: () = assert!(majit_gc::header::FLAG_SHIFT == 32);
         const _: () = assert!(majit_gc::flags::TRACK_YOUNG_PTRS <= u32::MAX as u64);
-        emit_resolve(sink, constants, base_ref);
+        emit_resolve(sink, constants, value_types, base_ref);
         sink.i32_wrap_i64();
         sink.i32_const(FLAGS_HALF_BACKOFS);
         sink.i32_sub();
@@ -521,7 +534,7 @@ fn emit_write_barrier(
         sink.i32_const(WB_FLAG);
         sink.i32_and();
         sink.if_(BlockType::Empty);
-        emit_resolve(sink, constants, base_ref);
+        emit_resolve(sink, constants, value_types, base_ref);
         sink.i32_const(wb_fn_ptr as i32);
         sink.call_indirect(0, base + 1);
         sink.drop(); // returns 0; ignored
@@ -542,7 +555,7 @@ fn emit_write_barrier(
     sink.i64_store(mem64(frame.call_nargs_ofs));
     // arg0 = base object pointer
     sink.local_get(0);
-    emit_resolve(sink, constants, base_ref);
+    emit_resolve(sink, constants, value_types, base_ref);
     sink.i64_store(mem64(frame.call_args_ofs));
     // call trampoline; void result ignored
     sink.local_get(0);
@@ -1089,6 +1102,28 @@ fn collect_guards_and_vars(inputargs: &[InputArg], ops: &[Op]) -> (Vec<GuardExit
     (guards, max_var)
 }
 
+/// Wasm local type for each SSA value. Frame slots deliberately remain i64
+/// bit carriers, while Float values stay in f64 locals between operations.
+fn collect_value_types(inputargs: &[InputArg], ops: &[Op], num_vars: u32) -> Vec<ValType> {
+    let mut value_types = vec![ValType::I64; num_vars as usize];
+    for ia in inputargs {
+        if ia.tp == Type::Float && (ia.index as usize) < value_types.len() {
+            value_types[ia.index as usize] = ValType::F64;
+        }
+    }
+    for op in ops {
+        let result = op.pos.get();
+        if result != OpRef::NONE
+            && !result.is_constant()
+            && op.result_type() == Type::Float
+            && (result.raw() as usize) < value_types.len()
+        {
+            value_types[result.raw() as usize] = ValType::F64;
+        }
+    }
+    value_types
+}
+
 /// Assign each Ref-typed value (input arg or op result) a dense home-slot
 /// index, keyed by its value id (`raw()`), the same id its wasm local uses
 /// (`1 + raw`). Input args and op results share one value-id space (see
@@ -1303,6 +1338,7 @@ pub fn build_wasm_module(
         )));
     }
 
+    let value_types = collect_value_types(inputargs, ops, num_vars);
     let ref_values = RefValues::collect(inputargs, ops);
     let ref_homes = RefHomes::collect(inputargs, ops, ca.emit_ca);
     let num_ref_homes = ref_homes.len();
@@ -1504,6 +1540,7 @@ pub fn build_wasm_module(
         ops,
         constants,
         num_vars,
+        &value_types,
         jit_call_idx,
         vtable_offset,
         classptr_to_typeid,
@@ -1544,6 +1581,7 @@ fn build_function(
     ops: &[Op],
     constants: &indexmap::IndexMap<u32, i64>,
     num_vars: u32,
+    value_types: &[ValType],
     jit_call_idx: Option<u32>,
     vtable_offset: Option<usize>,
     classptr_to_typeid: &HashMap<i64, u32>,
@@ -1607,18 +1645,33 @@ fn build_function(
     let base_i32_locals: u32 = if ca.emit_ca { 3 } else { 1 };
     let alloc_scratch_local = num_vars + UMULHI_SCRATCH + 1 + base_i32_locals;
     let alloc_size_local = alloc_scratch_local + 1;
-    let mut func = Function::new(vec![
-        (num_vars + UMULHI_SCRATCH, ValType::I64),
-        (
-            base_i32_locals
-                + if nursery.is_some() || ca.inline.is_some() {
-                    2
-                } else {
-                    0
-                },
-            ValType::I32,
-        ),
-    ]);
+    debug_assert_eq!(value_types.len(), num_vars as usize);
+    let mut locals = Vec::new();
+    let mut start = 0;
+    while start < value_types.len() {
+        let ty = value_types[start];
+        let mut end = start + 1;
+        while end < value_types.len() && value_types[end] == ty {
+            end += 1;
+        }
+        locals.push(((end - start) as u32, ty));
+        start = end;
+    }
+    if let Some((count, ValType::I64)) = locals.last_mut() {
+        *count += UMULHI_SCRATCH;
+    } else {
+        locals.push((UMULHI_SCRATCH, ValType::I64));
+    }
+    locals.push((
+        base_i32_locals
+            + if nursery.is_some() || ca.inline.is_some() {
+                2
+            } else {
+                0
+            },
+        ValType::I32,
+    ));
+    let mut func = Function::new(locals);
     let mut sink = func.instructions();
 
     // Null-init every Ref-home slot so a slot read before its value is defined
@@ -1712,9 +1765,11 @@ fn build_function(
     for (k, ia) in inputargs.iter().enumerate() {
         let local_idx = 1 + ia.index;
         let offset = FRAME_SLOT_BASE + k as u64 * SLOT_SIZE;
-        sink.local_get(0)
-            .i64_load(mem64(offset))
-            .local_set(local_idx);
+        sink.local_get(0).i64_load(mem64(offset));
+        if value_types[ia.index as usize] == ValType::F64 {
+            sink.f64_reinterpret_i64();
+        }
+        sink.local_set(local_idx);
         if let Some(h) = ref_homes.home_id(ia.index) {
             sink.local_get(0);
             sink.local_get(local_idx);
@@ -1756,6 +1811,9 @@ fn build_function(
             for (i, la) in all_label_args[labels_passed].iter().enumerate() {
                 sink.local_get(0);
                 sink.i64_load(mem64(FRAME_SLOT_BASE + i as u64 * SLOT_SIZE));
+                if value_types[la.raw() as usize] == ValType::F64 {
+                    sink.f64_reinterpret_i64();
+                }
                 sink.local_set(1 + la.raw());
                 if let Some(h) = ref_homes.home(*la) {
                     sink.local_get(0);
@@ -1810,7 +1868,7 @@ fn build_function(
                 let jump_args = op.getarglist();
                 for (i, jump_arg) in jump_args.iter().enumerate() {
                     sink.local_get(0); // frame_ptr
-                    emit_resolve(&mut sink, constants, jump_arg.to_opref());
+                    emit_resolve(&mut sink, constants, value_types, jump_arg.to_opref());
                     sink.i64_store(mem64(FRAME_SLOT_BASE + i as u64 * SLOT_SIZE));
                 }
                 // Set the resume-at-LABEL dispatch key so a peeled target
@@ -1840,8 +1898,12 @@ fn build_function(
                 let label_args = find_label_args(ops, op);
                 let jump_args = op.getarglist();
                 let n = jump_args.len().min(label_args.len());
-                for jump_arg in jump_args.iter().take(n) {
-                    emit_resolve(&mut sink, constants, jump_arg.to_opref());
+                for (jump_arg, label_arg) in jump_args.iter().zip(label_args.iter()).take(n) {
+                    if value_types[label_arg.raw() as usize] == ValType::F64 {
+                        emit_resolve_f64(&mut sink, constants, value_types, jump_arg.to_opref());
+                    } else {
+                        emit_resolve(&mut sink, constants, value_types, jump_arg.to_opref());
+                    }
                 }
                 for i in (0..n).rev() {
                     sink.local_set(1 + label_args[i].raw());
@@ -1875,7 +1937,7 @@ fn build_function(
             }
 
             OpCode::Finish => {
-                emit_guard_exit(&mut sink, constants, guard_idx, op);
+                emit_guard_exit(&mut sink, constants, value_types, guard_idx, op);
                 if let Some(d) = block_exit_depth {
                     sink.br(d);
                 }
@@ -1884,31 +1946,75 @@ fn build_function(
 
             // ── Guards ──
             OpCode::GuardTrue => {
-                emit_guard_true(&mut sink, constants, guard_idx, op, block_exit_depth);
+                emit_guard_true(
+                    &mut sink,
+                    constants,
+                    value_types,
+                    guard_idx,
+                    op,
+                    block_exit_depth,
+                );
                 guard_idx += 1;
             }
             OpCode::GuardFalse => {
-                emit_guard_false(&mut sink, constants, guard_idx, op, block_exit_depth);
+                emit_guard_false(
+                    &mut sink,
+                    constants,
+                    value_types,
+                    guard_idx,
+                    op,
+                    block_exit_depth,
+                );
                 guard_idx += 1;
             }
             OpCode::GuardValue => {
-                emit_resolve(&mut sink, constants, op.arg(0).to_opref());
-                emit_resolve(&mut sink, constants, op.arg(1).to_opref());
-                sink.i64_ne();
-                emit_guard_if_exit(&mut sink, constants, guard_idx, op, block_exit_depth);
+                let arg0 = op.arg(0).to_opref();
+                let is_float =
+                    !arg0.is_constant() && value_types[arg0.raw() as usize] == ValType::F64;
+                if is_float {
+                    emit_resolve_f64(&mut sink, constants, value_types, arg0);
+                    emit_resolve_f64(&mut sink, constants, value_types, op.arg(1).to_opref());
+                    sink.f64_ne();
+                } else {
+                    emit_resolve(&mut sink, constants, value_types, arg0);
+                    emit_resolve(&mut sink, constants, value_types, op.arg(1).to_opref());
+                    sink.i64_ne();
+                }
+                emit_guard_if_exit(
+                    &mut sink,
+                    constants,
+                    value_types,
+                    guard_idx,
+                    op,
+                    block_exit_depth,
+                );
                 guard_idx += 1;
             }
             OpCode::GuardNonnull => {
-                emit_resolve(&mut sink, constants, op.arg(0).to_opref());
+                emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                 sink.i64_eqz();
-                emit_guard_if_exit(&mut sink, constants, guard_idx, op, block_exit_depth);
+                emit_guard_if_exit(
+                    &mut sink,
+                    constants,
+                    value_types,
+                    guard_idx,
+                    op,
+                    block_exit_depth,
+                );
                 guard_idx += 1;
             }
             OpCode::GuardIsnull => {
-                emit_resolve(&mut sink, constants, op.arg(0).to_opref());
+                emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                 sink.i64_const(0);
                 sink.i64_ne();
-                emit_guard_if_exit(&mut sink, constants, guard_idx, op, block_exit_depth);
+                emit_guard_if_exit(
+                    &mut sink,
+                    constants,
+                    value_types,
+                    guard_idx,
+                    op,
+                    block_exit_depth,
+                );
                 guard_idx += 1;
             }
             OpCode::GuardClass | OpCode::GuardNonnullClass => {
@@ -1922,7 +2028,7 @@ fn build_function(
                 //       _cmp_guard_gc_type(loc_ptr, ImmedLoc(expected_typeid))
                 if let Some(off_usize) = vtable_offset {
                     let off = off_usize as u64;
-                    emit_resolve(&mut sink, constants, op.arg(0).to_opref());
+                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.i32_wrap_i64(); // struct ptr (i64) → i32 address
                     // The typeptr (`ob_type`) is a pointer-width field: 4
                     // bytes on wasm32. Reading it as i64 would fold in the
@@ -1934,7 +2040,7 @@ fn build_function(
                         memory_index: 0,
                     });
                     sink.i64_extend_i32_u();
-                    emit_resolve(&mut sink, constants, op.arg(1).to_opref());
+                    emit_resolve(&mut sink, constants, value_types, op.arg(1).to_opref());
                     sink.i64_ne();
                 } else {
                     // gcremovetypeptr fallback (assembler.py:1893-1901):
@@ -1952,7 +2058,7 @@ fn build_function(
                                  backend has no gc_ll_descr.\
                                  get_typeid_from_classptr_if_gcremovetypeptr",
                         );
-                    emit_resolve(&mut sink, constants, op.arg(0).to_opref());
+                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.i32_wrap_i64();
                     sink.i32_load(MemArg {
                         offset: 0,
@@ -1962,7 +2068,14 @@ fn build_function(
                     sink.i32_const(expected_typeid as i32);
                     sink.i32_ne();
                 }
-                emit_guard_if_exit(&mut sink, constants, guard_idx, op, block_exit_depth);
+                emit_guard_if_exit(
+                    &mut sink,
+                    constants,
+                    value_types,
+                    guard_idx,
+                    op,
+                    block_exit_depth,
+                );
                 guard_idx += 1;
             }
             OpCode::GuardNoOverflow => {
@@ -1972,7 +2085,7 @@ fn build_function(
             }
             OpCode::GuardOverflow => {
                 // Always fails (no overflow detected in wasm MVP).
-                emit_guard_exit(&mut sink, constants, guard_idx, op);
+                emit_guard_exit(&mut sink, constants, value_types, guard_idx, op);
                 match block_exit_depth {
                     Some(d) => {
                         sink.br(d);
@@ -2008,7 +2121,14 @@ fn build_function(
                 sink.i64_load(mem64(0));
                 sink.i64_const(0);
                 sink.i64_ne();
-                emit_guard_if_exit(&mut sink, constants, guard_idx, op, block_exit_depth);
+                emit_guard_if_exit(
+                    &mut sink,
+                    constants,
+                    value_types,
+                    guard_idx,
+                    op,
+                    block_exit_depth,
+                );
                 guard_idx += 1;
             }
             OpCode::GuardException => {
@@ -2020,9 +2140,16 @@ fn build_function(
                 let exc_value_addr = crate::jit_exc_value_addr() as i32;
                 sink.i32_const(exc_type_addr);
                 sink.i64_load(mem64(0));
-                emit_resolve(&mut sink, constants, op.arg(0).to_opref());
+                emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                 sink.i64_ne();
-                emit_guard_if_exit(&mut sink, constants, guard_idx, op, block_exit_depth);
+                emit_guard_if_exit(
+                    &mut sink,
+                    constants,
+                    value_types,
+                    guard_idx,
+                    op,
+                    block_exit_depth,
+                );
                 guard_idx += 1;
                 // Success path: capture the caught exception into the result
                 // var, then clear both slots.
@@ -2041,53 +2168,62 @@ fn build_function(
             }
 
             // ── Integer arithmetic ──
-            OpCode::IntAdd => emit_binop(&mut sink, constants, op, BinOp::I64Add),
-            OpCode::IntSub => emit_binop(&mut sink, constants, op, BinOp::I64Sub),
-            OpCode::IntMul => emit_binop(&mut sink, constants, op, BinOp::I64Mul),
-            OpCode::IntFloorDiv => emit_binop(&mut sink, constants, op, BinOp::I64DivS),
-            OpCode::IntMod => emit_binop(&mut sink, constants, op, BinOp::I64RemS),
-            OpCode::IntAnd => emit_binop(&mut sink, constants, op, BinOp::I64And),
-            OpCode::IntOr => emit_binop(&mut sink, constants, op, BinOp::I64Or),
-            OpCode::IntXor => emit_binop(&mut sink, constants, op, BinOp::I64Xor),
-            OpCode::IntLshift => emit_binop(&mut sink, constants, op, BinOp::I64Shl),
-            OpCode::IntRshift => emit_binop(&mut sink, constants, op, BinOp::I64ShrS),
-            OpCode::UintRshift => emit_binop(&mut sink, constants, op, BinOp::I64ShrU),
+            OpCode::IntAdd => emit_binop(&mut sink, constants, value_types, op, BinOp::I64Add),
+            OpCode::IntSub => emit_binop(&mut sink, constants, value_types, op, BinOp::I64Sub),
+            OpCode::IntMul => emit_binop(&mut sink, constants, value_types, op, BinOp::I64Mul),
+            OpCode::IntFloorDiv => {
+                emit_binop(&mut sink, constants, value_types, op, BinOp::I64DivS)
+            }
+            OpCode::IntMod => emit_binop(&mut sink, constants, value_types, op, BinOp::I64RemS),
+            OpCode::IntAnd => emit_binop(&mut sink, constants, value_types, op, BinOp::I64And),
+            OpCode::IntOr => emit_binop(&mut sink, constants, value_types, op, BinOp::I64Or),
+            OpCode::IntXor => emit_binop(&mut sink, constants, value_types, op, BinOp::I64Xor),
+            OpCode::IntLshift => emit_binop(&mut sink, constants, value_types, op, BinOp::I64Shl),
+            OpCode::IntRshift => emit_binop(&mut sink, constants, value_types, op, BinOp::I64ShrS),
+            OpCode::UintRshift => emit_binop(&mut sink, constants, value_types, op, BinOp::I64ShrU),
             // High 64 bits of the unsigned 64×64→128 product. The optimizer
             // emits this for division/modulo-by-constant strength reduction;
             // wasm has no mul-high instruction, so expand via 32-bit split.
-            OpCode::UintMulHigh => emit_umulhi(&mut sink, constants, op, num_vars),
+            OpCode::UintMulHigh => emit_umulhi(&mut sink, constants, value_types, op, num_vars),
 
             // Overflow variants: compute result + overflow flag
-            OpCode::IntAddOvf => emit_ovf_binop(&mut sink, constants, op, BinOp::I64Add),
-            OpCode::IntSubOvf => emit_ovf_binop(&mut sink, constants, op, BinOp::I64Sub),
-            OpCode::IntMulOvf => emit_ovf_binop(&mut sink, constants, op, BinOp::I64Mul),
+            OpCode::IntAddOvf => {
+                emit_ovf_binop(&mut sink, constants, value_types, op, BinOp::I64Add)
+            }
+            OpCode::IntSubOvf => {
+                emit_ovf_binop(&mut sink, constants, value_types, op, BinOp::I64Sub)
+            }
+            OpCode::IntMulOvf => {
+                emit_ovf_binop(&mut sink, constants, value_types, op, BinOp::I64Mul)
+            }
 
             // ── Integer comparisons (signed) ──
-            OpCode::IntLt => emit_cmp(&mut sink, constants, op, CmpOp::I64LtS),
-            OpCode::IntLe => emit_cmp(&mut sink, constants, op, CmpOp::I64LeS),
-            OpCode::IntEq => emit_cmp(&mut sink, constants, op, CmpOp::I64Eq),
-            OpCode::IntNe => emit_cmp(&mut sink, constants, op, CmpOp::I64Ne),
-            OpCode::IntGt => emit_cmp(&mut sink, constants, op, CmpOp::I64GtS),
-            OpCode::IntGe => emit_cmp(&mut sink, constants, op, CmpOp::I64GeS),
+            OpCode::IntLt => emit_cmp(&mut sink, constants, value_types, op, CmpOp::I64LtS),
+            OpCode::IntLe => emit_cmp(&mut sink, constants, value_types, op, CmpOp::I64LeS),
+            OpCode::IntEq => emit_cmp(&mut sink, constants, value_types, op, CmpOp::I64Eq),
+            OpCode::IntNe => emit_cmp(&mut sink, constants, value_types, op, CmpOp::I64Ne),
+            OpCode::IntGt => emit_cmp(&mut sink, constants, value_types, op, CmpOp::I64GtS),
+            OpCode::IntGe => emit_cmp(&mut sink, constants, value_types, op, CmpOp::I64GeS),
 
             // ── Integer comparisons (unsigned) ──
-            OpCode::UintLt => emit_cmp(&mut sink, constants, op, CmpOp::I64LtU),
-            OpCode::UintLe => emit_cmp(&mut sink, constants, op, CmpOp::I64LeU),
-            OpCode::UintGt => emit_cmp(&mut sink, constants, op, CmpOp::I64GtU),
-            OpCode::UintGe => emit_cmp(&mut sink, constants, op, CmpOp::I64GeU),
+            OpCode::UintLt => emit_cmp(&mut sink, constants, value_types, op, CmpOp::I64LtU),
+            OpCode::UintLe => emit_cmp(&mut sink, constants, value_types, op, CmpOp::I64LeU),
+            OpCode::UintGt => emit_cmp(&mut sink, constants, value_types, op, CmpOp::I64GtU),
+            OpCode::UintGe => emit_cmp(&mut sink, constants, value_types, op, CmpOp::I64GeU),
 
             // ── Pointer comparisons ──
             OpCode::PtrEq | OpCode::InstancePtrEq => {
-                emit_cmp(&mut sink, constants, op, CmpOp::I64Eq);
+                emit_cmp(&mut sink, constants, value_types, op, CmpOp::I64Eq);
             }
             OpCode::PtrNe | OpCode::InstancePtrNe => {
-                emit_cmp(&mut sink, constants, op, CmpOp::I64Ne);
+                emit_cmp(&mut sink, constants, value_types, op, CmpOp::I64Ne);
             }
 
             // ── Unary ops ──
             OpCode::IntNeg => emit_unary_vi(
                 &mut sink,
                 constants,
+                value_types,
                 op,
                 |s| {
                     s.i64_const(0);
@@ -2099,6 +2235,7 @@ fn build_function(
             OpCode::IntInvert => emit_unary_vi(
                 &mut sink,
                 constants,
+                value_types,
                 op,
                 |s| {
                     s.i64_const(-1);
@@ -2110,7 +2247,7 @@ fn build_function(
             OpCode::IntIsTrue => {
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
-                    emit_resolve(&mut sink, constants, op.arg(0).to_opref());
+                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.i64_const(0);
                     sink.i64_ne();
                     sink.i64_extend_i32_u();
@@ -2120,7 +2257,7 @@ fn build_function(
             OpCode::IntIsZero => {
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
-                    emit_resolve(&mut sink, constants, op.arg(0).to_opref());
+                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.i64_eqz();
                     sink.i64_extend_i32_u();
                     sink.local_set(1 + vi);
@@ -2132,7 +2269,7 @@ fn build_function(
                 // int_signext(val, num_bytes): sign-extend from num_bytes width
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
-                    emit_resolve(&mut sink, constants, op.arg(0).to_opref());
+                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                     // num_bytes is arg(1), typically a constant
                     let arg1 = op.arg(1).to_opref();
                     let num_bytes = if arg1.is_constant() {
@@ -2156,7 +2293,7 @@ fn build_function(
                 // max(val, 0)
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
-                    emit_resolve(&mut sink, constants, op.arg(0).to_opref());
+                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                     // if val < 0, use 0; else use val
                     // Wasm: local.tee + i64.const 0 + local.get + i64.lt_s + select
                     let tmp_local = 1 + vi; // reuse result local as temp
@@ -2171,24 +2308,21 @@ fn build_function(
             }
 
             // ── Float comparisons ──
-            OpCode::FloatLt => emit_float_cmp(&mut sink, constants, op, FloatCmp::Lt),
-            OpCode::FloatLe => emit_float_cmp(&mut sink, constants, op, FloatCmp::Le),
-            OpCode::FloatEq => emit_float_cmp(&mut sink, constants, op, FloatCmp::Eq),
-            OpCode::FloatNe => emit_float_cmp(&mut sink, constants, op, FloatCmp::Ne),
-            OpCode::FloatGt => emit_float_cmp(&mut sink, constants, op, FloatCmp::Gt),
-            OpCode::FloatGe => emit_float_cmp(&mut sink, constants, op, FloatCmp::Ge),
+            OpCode::FloatLt => emit_float_cmp(&mut sink, constants, value_types, op, FloatCmp::Lt),
+            OpCode::FloatLe => emit_float_cmp(&mut sink, constants, value_types, op, FloatCmp::Le),
+            OpCode::FloatEq => emit_float_cmp(&mut sink, constants, value_types, op, FloatCmp::Eq),
+            OpCode::FloatNe => emit_float_cmp(&mut sink, constants, value_types, op, FloatCmp::Ne),
+            OpCode::FloatGt => emit_float_cmp(&mut sink, constants, value_types, op, FloatCmp::Gt),
+            OpCode::FloatGe => emit_float_cmp(&mut sink, constants, value_types, op, FloatCmp::Ge),
 
             // ── Float floor/mod ──
             OpCode::FloatFloorDiv => {
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
-                    emit_resolve(&mut sink, constants, op.arg(0).to_opref());
-                    sink.f64_reinterpret_i64();
-                    emit_resolve(&mut sink, constants, op.arg(1).to_opref());
-                    sink.f64_reinterpret_i64();
+                    emit_resolve_f64(&mut sink, constants, value_types, op.arg(0).to_opref());
+                    emit_resolve_f64(&mut sink, constants, value_types, op.arg(1).to_opref());
                     sink.f64_div();
                     sink.f64_floor();
-                    sink.i64_reinterpret_f64();
                     sink.local_set(1 + vi);
                 }
             }
@@ -2197,8 +2331,7 @@ fn build_function(
             OpCode::CastFloatToInt => {
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
-                    emit_resolve(&mut sink, constants, op.arg(0).to_opref());
-                    sink.f64_reinterpret_i64();
+                    emit_resolve_f64(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.i64_trunc_sat_f64_s();
                     sink.local_set(1 + vi);
                 }
@@ -2206,17 +2339,23 @@ fn build_function(
             OpCode::CastIntToFloat => {
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
-                    emit_resolve(&mut sink, constants, op.arg(0).to_opref());
+                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.f64_convert_i64_s();
-                    sink.i64_reinterpret_f64();
                     sink.local_set(1 + vi);
                 }
             }
-            OpCode::ConvertFloatBytesToLonglong | OpCode::ConvertLonglongBytesToFloat => {
-                // These are bitcast (no-op on the i64 representation)
+            OpCode::ConvertFloatBytesToLonglong => {
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
-                    emit_resolve(&mut sink, constants, op.arg(0).to_opref());
+                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
+                    sink.local_set(1 + vi);
+                }
+            }
+            OpCode::ConvertLonglongBytesToFloat => {
+                let vi = op.pos.get().raw();
+                if !OpRef::raw_is_constant(vi) {
+                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
+                    sink.f64_reinterpret_i64();
                     sink.local_set(1 + vi);
                 }
             }
@@ -2225,16 +2364,23 @@ fn build_function(
             OpCode::CastPtrToInt | OpCode::CastIntToPtr | OpCode::CastOpaquePtr => {
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
-                    emit_resolve(&mut sink, constants, op.arg(0).to_opref());
+                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.local_set(1 + vi);
                 }
             }
 
             // ── SameAs (forwarding) ──
-            OpCode::SameAsI | OpCode::SameAsR | OpCode::SameAsF => {
+            OpCode::SameAsI | OpCode::SameAsR => {
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
-                    emit_resolve(&mut sink, constants, op.arg(0).to_opref());
+                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
+                    sink.local_set(1 + vi);
+                }
+            }
+            OpCode::SameAsF => {
+                let vi = op.pos.get().raw();
+                if !OpRef::raw_is_constant(vi) {
+                    emit_resolve_f64(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.local_set(1 + vi);
                 }
             }
@@ -2243,7 +2389,7 @@ fn build_function(
             OpCode::GetfieldGcI | OpCode::GetfieldGcPureI | OpCode::GetfieldRawI => {
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
-                    emit_resolve(&mut sink, constants, op.arg(0).to_opref()); // struct ptr (i64)
+                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref()); // struct ptr (i64)
                     sink.i32_wrap_i64(); // convert to i32 address
                     let field_offset = field_offset_from_descr(op);
                     let (size, signed) = field_size_sign_from_descr(op);
@@ -2254,7 +2400,7 @@ fn build_function(
             OpCode::GetfieldGcR | OpCode::GetfieldGcPureR | OpCode::GetfieldRawR => {
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
-                    emit_resolve(&mut sink, constants, op.arg(0).to_opref());
+                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.i32_wrap_i64();
                     let field_offset = field_offset_from_descr(op);
                     // Load as i32 (pointer on wasm32) and extend to i64
@@ -2272,6 +2418,7 @@ fn build_function(
                     emit_write_barrier(
                         &mut sink,
                         constants,
+                        value_types,
                         jit_call_idx,
                         residual_type_base,
                         wb_fn_ptr,
@@ -2279,19 +2426,28 @@ fn build_function(
                         frame,
                     );
                 }
-                emit_resolve(&mut sink, constants, op.arg(0).to_opref()); // struct ptr
+                emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref()); // struct ptr
                 sink.i32_wrap_i64();
                 let field_offset = field_offset_from_descr(op);
-                emit_resolve(&mut sink, constants, op.arg(1).to_opref()); // value
-                let size = setfield_store_size_from_descr(op);
-                emit_sized_int_store(&mut sink, field_offset, size);
+                if field_is_float_from_descr(op) {
+                    emit_resolve_f64(&mut sink, constants, value_types, op.arg(1).to_opref());
+                    sink.f64_store(MemArg {
+                        offset: field_offset,
+                        align: 3,
+                        memory_index: 0,
+                    });
+                } else {
+                    emit_resolve(&mut sink, constants, value_types, op.arg(1).to_opref()); // value
+                    let size = setfield_store_size_from_descr(op);
+                    emit_sized_int_store(&mut sink, field_offset, size);
+                }
             }
 
             // ── Float field access ──
             OpCode::GetfieldGcF | OpCode::GetfieldGcPureF | OpCode::GetfieldRawF => {
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
-                    emit_resolve(&mut sink, constants, op.arg(0).to_opref());
+                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.i32_wrap_i64();
                     let field_offset = field_offset_from_descr(op);
                     sink.f64_load(MemArg {
@@ -2299,7 +2455,6 @@ fn build_function(
                         align: 3,
                         memory_index: 0,
                     });
-                    sink.i64_reinterpret_f64();
                     sink.local_set(1 + vi);
                 }
             }
@@ -2308,7 +2463,7 @@ fn build_function(
             OpCode::ArraylenGc => {
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
-                    emit_resolve(&mut sink, constants, op.arg(0).to_opref()); // array ptr
+                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref()); // array ptr
                     sink.i32_wrap_i64();
                     let (len_offset, len_size) = array_len_layout_from_descr(op);
                     // The length is a word-sized field (`Signed`/`WORD`): read it
@@ -2322,7 +2477,7 @@ fn build_function(
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     // addr = base + base_size + index * item_size
-                    emit_array_addr(&mut sink, constants, op);
+                    emit_array_addr(&mut sink, constants, value_types, op);
                     let (item_size, signed) = array_item_size_sign_from_descr(op);
                     emit_sized_int_load(&mut sink, 0, item_size, signed);
                     sink.local_set(1 + vi);
@@ -2331,7 +2486,7 @@ fn build_function(
             OpCode::GetarrayitemGcR | OpCode::GetarrayitemGcPureR | OpCode::GetarrayitemRawR => {
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
-                    emit_array_addr(&mut sink, constants, op);
+                    emit_array_addr(&mut sink, constants, value_types, op);
                     sink.i32_load(MemArg {
                         offset: 0,
                         align: 2,
@@ -2344,16 +2499,12 @@ fn build_function(
             OpCode::GetarrayitemGcF | OpCode::GetarrayitemGcPureF | OpCode::GetarrayitemRawF => {
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
-                    // A Float item is 8 bytes; load it as f64 and carry its bit
-                    // pattern in the i64 value slot (the IntArray/value-slot ABI
-                    // is i64).
-                    emit_array_addr(&mut sink, constants, op);
+                    emit_array_addr(&mut sink, constants, value_types, op);
                     sink.f64_load(MemArg {
                         offset: 0,
                         align: 3,
                         memory_index: 0,
                     });
-                    sink.i64_reinterpret_f64();
                     sink.local_set(1 + vi);
                 }
             }
@@ -2362,6 +2513,7 @@ fn build_function(
                     emit_write_barrier(
                         &mut sink,
                         constants,
+                        value_types,
                         jit_call_idx,
                         residual_type_base,
                         wb_fn_ptr,
@@ -2369,14 +2521,18 @@ fn build_function(
                         frame,
                     );
                 }
-                emit_array_addr(&mut sink, constants, op);
-                emit_resolve(&mut sink, constants, op.arg(2).to_opref()); // value
-                // A Ref item is pointer-width (4 bytes on wasm32). Storing a
-                // fixed 8 bytes would clobber the next item, or run past the
-                // array end on the last item and corrupt the heap. A Float
-                // item is 8 bytes, so its bit pattern stores via the i64 path.
-                let (item_size, _signed) = array_item_size_sign_from_descr(op);
-                emit_sized_int_store(&mut sink, 0, item_size);
+                emit_array_addr(&mut sink, constants, value_types, op);
+                if array_item_is_float_from_descr(op) {
+                    emit_resolve_f64(&mut sink, constants, value_types, op.arg(2).to_opref());
+                    sink.f64_store(mem64(0));
+                } else {
+                    emit_resolve(&mut sink, constants, value_types, op.arg(2).to_opref()); // value
+                    // A Ref item is pointer-width (4 bytes on wasm32). Storing a
+                    // fixed 8 bytes would clobber the next item, or run past the
+                    // array end on the last item and corrupt the heap.
+                    let (item_size, _signed) = array_item_size_sign_from_descr(op);
+                    emit_sized_int_store(&mut sink, 0, item_size);
+                }
             }
 
             // ── Interior field access ──
@@ -2384,7 +2540,7 @@ fn build_function(
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     // getinteriorfield(array, index, offset)
-                    emit_resolve(&mut sink, constants, op.arg(0).to_opref()); // array ptr
+                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref()); // array ptr
                     sink.i32_wrap_i64();
                     let field_offset = field_offset_from_descr(op);
                     // Simplified: use field_offset directly (RPython computes base+index*itemsize+offset)
@@ -2396,7 +2552,7 @@ fn build_function(
             OpCode::GetinteriorfieldGcF => {
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
-                    emit_resolve(&mut sink, constants, op.arg(0).to_opref()); // array ptr
+                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref()); // array ptr
                     sink.i32_wrap_i64();
                     let field_offset = field_offset_from_descr(op);
                     sink.f64_load(MemArg {
@@ -2404,7 +2560,6 @@ fn build_function(
                         align: 3,
                         memory_index: 0,
                     });
-                    sink.i64_reinterpret_f64();
                     sink.local_set(1 + vi);
                 }
             }
@@ -2413,6 +2568,7 @@ fn build_function(
                     emit_write_barrier(
                         &mut sink,
                         constants,
+                        value_types,
                         jit_call_idx,
                         residual_type_base,
                         wb_fn_ptr,
@@ -2420,19 +2576,28 @@ fn build_function(
                         frame,
                     );
                 }
-                emit_resolve(&mut sink, constants, op.arg(0).to_opref());
+                emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                 sink.i32_wrap_i64();
                 let field_offset = field_offset_from_descr(op);
-                emit_resolve(&mut sink, constants, op.arg(2).to_opref()); // value
-                let (size, _signed) = field_size_sign_from_descr(op);
-                emit_sized_int_store(&mut sink, field_offset, size);
+                if field_is_float_from_descr(op) {
+                    emit_resolve_f64(&mut sink, constants, value_types, op.arg(2).to_opref());
+                    sink.f64_store(MemArg {
+                        offset: field_offset,
+                        align: 3,
+                        memory_index: 0,
+                    });
+                } else {
+                    emit_resolve(&mut sink, constants, value_types, op.arg(2).to_opref()); // value
+                    let (size, _signed) = field_size_sign_from_descr(op);
+                    emit_sized_int_store(&mut sink, field_offset, size);
+                }
             }
 
             // ── String/Unicode ops (direct memory access) ──
             OpCode::Strlen | OpCode::Unicodelen => {
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
-                    emit_resolve(&mut sink, constants, op.arg(0).to_opref());
+                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.i32_wrap_i64();
                     // Length at offset 8 (after ob_type pointer on wasm32)
                     sink.i64_load(mem64(8));
@@ -2443,9 +2608,9 @@ fn build_function(
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     // str[index]: base + header_size + index
-                    emit_resolve(&mut sink, constants, op.arg(0).to_opref());
+                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.i32_wrap_i64();
-                    emit_resolve(&mut sink, constants, op.arg(1).to_opref()); // index
+                    emit_resolve(&mut sink, constants, value_types, op.arg(1).to_opref()); // index
                     sink.i32_wrap_i64();
                     sink.i32_add();
                     // String data starts after header (assume 16 bytes: ob_type + length)
@@ -2463,7 +2628,7 @@ fn build_function(
             OpCode::GcLoadI => {
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
-                    emit_resolve(&mut sink, constants, op.arg(0).to_opref());
+                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.i32_wrap_i64();
                     let offset = field_offset_from_descr(op);
                     sink.i64_load(mem64(offset));
@@ -2473,7 +2638,7 @@ fn build_function(
             OpCode::GcLoadR => {
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
-                    emit_resolve(&mut sink, constants, op.arg(0).to_opref());
+                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.i32_wrap_i64();
                     let offset = field_offset_from_descr(op);
                     sink.i32_load(MemArg {
@@ -2486,10 +2651,10 @@ fn build_function(
                 }
             }
             OpCode::GcStore => {
-                emit_resolve(&mut sink, constants, op.arg(0).to_opref());
+                emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                 sink.i32_wrap_i64();
                 let offset = field_offset_from_descr(op);
-                emit_resolve(&mut sink, constants, op.arg(1).to_opref());
+                emit_resolve(&mut sink, constants, value_types, op.arg(1).to_opref());
                 sink.i64_store(mem64(offset));
             }
 
@@ -2497,9 +2662,9 @@ fn build_function(
             OpCode::RawLoadI => {
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
-                    emit_resolve(&mut sink, constants, op.arg(0).to_opref()); // ptr
+                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref()); // ptr
                     sink.i32_wrap_i64();
-                    emit_resolve(&mut sink, constants, op.arg(1).to_opref()); // offset
+                    emit_resolve(&mut sink, constants, value_types, op.arg(1).to_opref()); // offset
                     sink.i32_wrap_i64();
                     sink.i32_add();
                     sink.i64_load(mem64(0));
@@ -2507,12 +2672,12 @@ fn build_function(
                 }
             }
             OpCode::RawStore => {
-                emit_resolve(&mut sink, constants, op.arg(0).to_opref());
+                emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                 sink.i32_wrap_i64();
-                emit_resolve(&mut sink, constants, op.arg(1).to_opref());
+                emit_resolve(&mut sink, constants, value_types, op.arg(1).to_opref());
                 sink.i32_wrap_i64();
                 sink.i32_add();
-                emit_resolve(&mut sink, constants, op.arg(2).to_opref());
+                emit_resolve(&mut sink, constants, value_types, op.arg(2).to_opref());
                 sink.i64_store(mem64(0));
             }
 
@@ -2544,7 +2709,7 @@ fn build_function(
             OpCode::GuardGcType => {
                 let _ = classptr_to_typeid; // typeid is already an immediate
                 if op.num_args() >= 2 {
-                    emit_resolve(&mut sink, constants, op.arg(0).to_opref());
+                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                     // header address = obj - GcHeader::SIZE
                     sink.i64_const(GcHeader::SIZE as i64);
                     sink.i64_sub();
@@ -2556,9 +2721,16 @@ fn build_function(
                     sink.i64_and();
                     // Compare against expected_typeid (arg1 — already an
                     // i64 in the constant pool or a frame slot).
-                    emit_resolve(&mut sink, constants, op.arg(1).to_opref());
+                    emit_resolve(&mut sink, constants, value_types, op.arg(1).to_opref());
                     sink.i64_ne();
-                    emit_guard_if_exit(&mut sink, constants, guard_idx, op, block_exit_depth);
+                    emit_guard_if_exit(
+                        &mut sink,
+                        constants,
+                        value_types,
+                        guard_idx,
+                        op,
+                        block_exit_depth,
+                    );
                 }
                 guard_idx += 1;
             }
@@ -2593,7 +2765,7 @@ fn build_function(
                 // assembler.py:1931-1932 MOV32 loc_typeid, mem(loc_object, 0).
                 // majit's GC header sits at obj - GcHeader::SIZE; the
                 // typeid occupies the lower TYPE_ID_BITS of that word.
-                emit_resolve(&mut sink, constants, op.arg(0).to_opref());
+                emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                 sink.i64_const(GcHeader::SIZE as i64);
                 sink.i64_sub();
                 sink.i32_wrap_i64();
@@ -2626,7 +2798,14 @@ fn build_function(
                 // assembler.py:1942 guard_success_cc = Conditions['NZ']:
                 // guard passes when byte & flag != 0; fail when == 0.
                 sink.i32_eqz();
-                emit_guard_if_exit(&mut sink, constants, guard_idx, op, block_exit_depth);
+                emit_guard_if_exit(
+                    &mut sink,
+                    constants,
+                    value_types,
+                    guard_idx,
+                    op,
+                    block_exit_depth,
+                );
                 guard_idx += 1;
             }
             // x86/assembler.py:1945-1980 genop_guard_guard_subclass.
@@ -2695,7 +2874,7 @@ fn build_function(
                     // assembler.py:1953-1956
                     //     MOV_rm(loc_tmp, (loc_object, offset))
                     //     MOV_rm(loc_tmp, (loc_tmp, offset2))
-                    emit_resolve(&mut sink, constants, op.arg(0).to_opref());
+                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.i32_wrap_i64();
                     sink.i64_load(mem64(vtable_off as u64));
                     sink.i32_wrap_i64();
@@ -2707,7 +2886,7 @@ fn build_function(
                     //     MOV loc_tmp, [base_type_info
                     //         + (loc_tmp << shift_by)
                     //         + sizeof_ti + offset2]
-                    emit_resolve(&mut sink, constants, op.arg(0).to_opref());
+                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.i64_const(GcHeader::SIZE as i64);
                     sink.i64_sub();
                     sink.i32_wrap_i64();
@@ -2735,12 +2914,19 @@ fn build_function(
                 // assembler.py:1979 guard_success_cc = Conditions['B']:
                 // guard passes when sub <u limit; fail when sub >=u limit.
                 sink.i64_ge_u();
-                emit_guard_if_exit(&mut sink, constants, guard_idx, op, block_exit_depth);
+                emit_guard_if_exit(
+                    &mut sink,
+                    constants,
+                    value_types,
+                    guard_idx,
+                    op,
+                    block_exit_depth,
+                );
                 guard_idx += 1;
             }
             OpCode::GuardFutureCondition | OpCode::GuardAlwaysFails => {
                 // GuardAlwaysFails always exits.
-                emit_guard_exit(&mut sink, constants, guard_idx, op);
+                emit_guard_exit(&mut sink, constants, value_types, guard_idx, op);
                 if let Some(d) = block_exit_depth {
                     sink.br(d);
                 }
@@ -2763,7 +2949,7 @@ fn build_function(
                 if let Some(jit_call) = jit_call_idx {
                     let vi = op.pos.get().raw();
                     sink.local_get(0);
-                    emit_resolve(&mut sink, constants, op.arg(0).to_opref()); // length
+                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref()); // length
                     sink.i64_store(mem64(frame.call_args_ofs));
                     sink.local_get(0);
                     sink.i64_const(0); // func_ptr = 0 signals "newstr" to host
@@ -2790,8 +2976,8 @@ fn build_function(
             OpCode::NurseryPtrIncrement => {
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
-                    emit_resolve(&mut sink, constants, op.arg(0).to_opref());
-                    emit_resolve(&mut sink, constants, op.arg(1).to_opref());
+                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
+                    emit_resolve(&mut sink, constants, value_types, op.arg(1).to_opref());
                     sink.i64_add();
                     sink.local_set(1 + vi);
                 }
@@ -2999,10 +3185,10 @@ fn build_function(
                 sink.i64_store(mem64(frame.dispatch_key_ofs));
                 // inputs: F'[1] = arg0 (callee frame), F'[2] = arg1 (ec).
                 sink.local_get(ca_cfp_local);
-                emit_resolve(&mut sink, constants, op.arg(0).to_opref());
+                emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                 sink.i64_store(mem64(FRAME_SLOT_BASE));
                 sink.local_get(ca_cfp_local);
-                emit_resolve(&mut sink, constants, op.arg(1).to_opref());
+                emit_resolve(&mut sink, constants, value_types, op.arg(1).to_opref());
                 sink.i64_store(mem64(FRAME_SLOT_BASE + SLOT_SIZE));
                 // run the source loop on F' (non-tail: one wasm frame per
                 // recursion level); discard the returned frame_ptr.
@@ -3176,10 +3362,10 @@ fn build_function(
                 {
                     let call_args = &op.getarglist()[1..];
                     for arg in call_args {
-                        emit_resolve(&mut sink, constants, arg.to_opref());
+                        emit_resolve(&mut sink, constants, value_types, arg.to_opref());
                     }
                     // func_ptr (arg 0) is the table slot — wrap to i32 index.
-                    emit_resolve(&mut sink, constants, op.arg(0).to_opref());
+                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.i32_wrap_i64();
                     // call_indirect(table_index, type_index): table 0, type for arity n.
                     sink.call_indirect(0, base + nargs as u32);
@@ -3212,9 +3398,9 @@ fn build_function(
                     // the i64 family and drop the dummy result.
                     let call_args = &op.getarglist()[1..];
                     for arg in call_args {
-                        emit_resolve(&mut sink, constants, arg.to_opref());
+                        emit_resolve(&mut sink, constants, value_types, arg.to_opref());
                     }
-                    emit_resolve(&mut sink, constants, op.arg(0).to_opref());
+                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.i32_wrap_i64();
                     sink.call_indirect(0, base + nargs as u32);
                     sink.drop();
@@ -3232,24 +3418,21 @@ fn build_function(
                         .get(&sig)
                         .map(|type_idx| (sig, type_idx))
                 }) {
-                    // Direct in-module float residual call. Float SSA values
-                    // are i64 bit carriers, while the target's table entry has
-                    // the descr-derived mixed `(i64/f64...) -> f64` signature.
+                    // Direct in-module float residual call with the
+                    // descr-derived mixed `(i64/f64...) -> f64` signature.
                     let call_args = &op.getarglist()[1..];
                     debug_assert_eq!(call_args.len(), sig.len());
                     for (arg, ty) in call_args.iter().zip(&sig) {
-                        emit_resolve(&mut sink, constants, arg.to_opref());
                         if *ty == ValType::F64 {
-                            sink.f64_reinterpret_i64();
+                            emit_resolve_f64(&mut sink, constants, value_types, arg.to_opref());
+                        } else {
+                            emit_resolve(&mut sink, constants, value_types, arg.to_opref());
                         }
                     }
                     // func_ptr (arg 0) is the table slot — wrap to i32 index.
-                    emit_resolve(&mut sink, constants, op.arg(0).to_opref());
+                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.i32_wrap_i64();
                     sink.call_indirect(0, type_idx);
-                    // Retain Float's i64 SSA carrier after the f64-returning
-                    // table entry has completed.
-                    sink.i64_reinterpret_f64();
                     if !OpRef::raw_is_constant(vi) {
                         sink.local_set(1 + vi);
                     } else {
@@ -3278,7 +3461,7 @@ fn build_function(
 
                     // Store func_ptr to call area
                     sink.local_get(0);
-                    emit_resolve(&mut sink, constants, func_ptr_ref);
+                    emit_resolve(&mut sink, constants, value_types, func_ptr_ref);
                     sink.i64_store(mem64(frame.call_func_ofs));
 
                     // Store num_args
@@ -3289,7 +3472,7 @@ fn build_function(
                     // Store each arg
                     for (i, arg) in call_args.iter().enumerate() {
                         sink.local_get(0);
-                        emit_resolve(&mut sink, constants, arg.to_opref());
+                        emit_resolve(&mut sink, constants, value_types, arg.to_opref());
                         sink.i64_store(mem64(frame.call_args_ofs + i as u64 * SLOT_SIZE));
                     }
 
@@ -3310,6 +3493,9 @@ fn build_function(
                     if !OpRef::raw_is_constant(vi) && !is_void {
                         sink.local_get(0);
                         sink.i64_load(mem64(frame.call_result_ofs));
+                        if value_types[vi as usize] == ValType::F64 {
+                            sink.f64_reinterpret_i64();
+                        }
                         sink.local_set(1 + vi);
                     }
                     // Mirror the direct path: a trampoline residual call may force and collect.
@@ -3669,14 +3855,14 @@ fn build_function(
                 {
                     // malloc_cond_varsize: negative lengths compare greater in
                     // the unsigned precheck and go to the collecting slow path.
-                    emit_resolve(&mut sink, constants, op.arg(0).to_opref());
+                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.i64_const(max_len);
                     sink.i64_gt_u();
                     sink.if_(BlockType::Result(ValType::I64));
                     sink.i64_const(type_id);
                     sink.i64_const(base_size);
                     sink.i64_const(item_size);
-                    emit_resolve(&mut sink, constants, op.arg(0).to_opref());
+                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.i64_const(len_offset);
                     sink.i32_const(alloc_array_fn_ptr as i32);
                     sink.call_indirect(0, base + 5);
@@ -3697,7 +3883,7 @@ fn build_function(
                     sink.else_();
                     // total = round_up_8(max(header + base + item * length,
                     // MIN_NURSERY_OBJ_SIZE)).
-                    emit_resolve(&mut sink, constants, op.arg(0).to_opref());
+                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.i64_const(item_size);
                     sink.i64_mul();
                     sink.i64_const(base_total);
@@ -3740,7 +3926,7 @@ fn build_function(
                     sink.i64_const(type_id);
                     sink.i64_const(base_size);
                     sink.i64_const(item_size);
-                    emit_resolve(&mut sink, constants, op.arg(0).to_opref());
+                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.i64_const(len_offset);
                     sink.i32_const(alloc_array_fn_ptr as i32);
                     sink.call_indirect(0, base + 5);
@@ -3778,7 +3964,7 @@ fn build_function(
                     // Length field (usize, 4 bytes on wasm32) at
                     // `payload + len_offset`.
                     sink.local_get(alloc_scratch_local);
-                    emit_resolve(&mut sink, constants, op.arg(0).to_opref());
+                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.i32_wrap_i64();
                     sink.i32_store(MemArg {
                         offset: majit_gc::header::GcHeader::SIZE as u64 + len_offset as u64,
@@ -3804,7 +3990,7 @@ fn build_function(
                     sink.i64_const(type_id);
                     sink.i64_const(base_size);
                     sink.i64_const(item_size);
-                    emit_resolve(&mut sink, constants, op.arg(0).to_opref());
+                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.i64_const(len_offset);
                     sink.i32_const(alloc_array_fn_ptr as i32);
                     sink.call_indirect(0, base + 5);
@@ -3838,7 +4024,7 @@ fn build_function(
                     sink.i64_store(mem64(frame.call_args_ofs + 2 * SLOT_SIZE));
                     // arg3 = length (op.arg(0))
                     sink.local_get(0);
-                    emit_resolve(&mut sink, constants, op.arg(0).to_opref());
+                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.i64_store(mem64(frame.call_args_ofs + 3 * SLOT_SIZE));
                     // arg4 = len_offset
                     sink.local_get(0);
@@ -3885,11 +4071,8 @@ fn build_function(
             OpCode::FloatAdd | OpCode::FloatSub | OpCode::FloatMul | OpCode::FloatTrueDiv => {
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
-                    // Values stored as i64 (bitcast from f64)
-                    emit_resolve(&mut sink, constants, op.arg(0).to_opref());
-                    sink.f64_reinterpret_i64();
-                    emit_resolve(&mut sink, constants, op.arg(1).to_opref());
-                    sink.f64_reinterpret_i64();
+                    emit_resolve_f64(&mut sink, constants, value_types, op.arg(0).to_opref());
+                    emit_resolve_f64(&mut sink, constants, value_types, op.arg(1).to_opref());
                     match op.opcode {
                         OpCode::FloatAdd => {
                             sink.f64_add();
@@ -3905,27 +4088,22 @@ fn build_function(
                         }
                         _ => unreachable!(),
                     }
-                    sink.i64_reinterpret_f64();
                     sink.local_set(1 + vi);
                 }
             }
             OpCode::FloatNeg => {
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
-                    emit_resolve(&mut sink, constants, op.arg(0).to_opref());
-                    sink.f64_reinterpret_i64();
+                    emit_resolve_f64(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.f64_neg();
-                    sink.i64_reinterpret_f64();
                     sink.local_set(1 + vi);
                 }
             }
             OpCode::FloatAbs => {
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
-                    emit_resolve(&mut sink, constants, op.arg(0).to_opref());
-                    sink.f64_reinterpret_i64();
+                    emit_resolve_f64(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.f64_abs();
-                    sink.i64_reinterpret_f64();
                     sink.local_set(1 + vi);
                 }
             }
@@ -4149,6 +4327,7 @@ fn find_label_args(ops: &[Op], jump: &Op) -> Vec<OpRef> {
 fn emit_resolve(
     sink: &mut InstructionSink<'_>,
     constants: &indexmap::IndexMap<u32, i64>,
+    value_types: &[ValType],
     opref: OpRef,
 ) {
     if opref.is_constant() {
@@ -4158,6 +4337,29 @@ fn emit_resolve(
             .unwrap_or_else(|| constants.get(&opref.raw()).copied().unwrap_or(0));
         sink.i64_const(val);
     } else {
+        sink.local_get(1 + opref.raw());
+        if value_types[opref.raw() as usize] == ValType::F64 {
+            sink.i64_reinterpret_f64();
+        }
+    }
+}
+
+/// Resolve a Float operand as f64. Constants retain their i64 bit encoding in
+/// the constant pool and are converted at the local boundary.
+fn emit_resolve_f64(
+    sink: &mut InstructionSink<'_>,
+    constants: &indexmap::IndexMap<u32, i64>,
+    value_types: &[ValType],
+    opref: OpRef,
+) {
+    if opref.is_constant() {
+        let val = opref
+            .inline_const_bits()
+            .unwrap_or_else(|| constants.get(&opref.raw()).copied().unwrap_or(0));
+        sink.i64_const(val);
+        sink.f64_reinterpret_i64();
+    } else {
+        debug_assert_eq!(value_types[opref.raw() as usize], ValType::F64);
         sink.local_get(1 + opref.raw());
     }
 }
@@ -4205,15 +4407,16 @@ fn array_len_layout_from_descr(op: &Op) -> (u64, usize) {
 fn emit_array_addr(
     sink: &mut InstructionSink<'_>,
     constants: &indexmap::IndexMap<u32, i64>,
+    value_types: &[ValType],
     op: &Op,
 ) {
     let (base_size, item_size) = op
         .with_array_descr(|ad| (ad.base_size() as u64, ad.item_size() as u64))
         .unwrap_or((16, 8));
-    emit_resolve(sink, constants, op.arg(0).to_opref()); // array ptr
+    emit_resolve(sink, constants, value_types, op.arg(0).to_opref()); // array ptr
     sink.i32_wrap_i64();
     // base + base_size + index * item_size
-    emit_resolve(sink, constants, op.arg(1).to_opref()); // index
+    emit_resolve(sink, constants, value_types, op.arg(1).to_opref()); // index
     sink.i32_wrap_i64();
     sink.i32_const(item_size as i32);
     sink.i32_mul();
@@ -4227,26 +4430,42 @@ fn emit_array_addr(
 fn emit_guard_true(
     sink: &mut InstructionSink<'_>,
     constants: &indexmap::IndexMap<u32, i64>,
+    value_types: &[ValType],
     guard_idx: u32,
     op: &Op,
     block_exit_depth: Option<u32>,
 ) {
-    emit_resolve(sink, constants, op.arg(0).to_opref());
+    emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
     sink.i64_eqz();
-    emit_guard_if_exit(sink, constants, guard_idx, op, block_exit_depth);
+    emit_guard_if_exit(
+        sink,
+        constants,
+        value_types,
+        guard_idx,
+        op,
+        block_exit_depth,
+    );
 }
 
 fn emit_guard_false(
     sink: &mut InstructionSink<'_>,
     constants: &indexmap::IndexMap<u32, i64>,
+    value_types: &[ValType],
     guard_idx: u32,
     op: &Op,
     block_exit_depth: Option<u32>,
 ) {
-    emit_resolve(sink, constants, op.arg(0).to_opref());
+    emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
     sink.i64_const(0);
     sink.i64_ne();
-    emit_guard_if_exit(sink, constants, guard_idx, op, block_exit_depth);
+    emit_guard_if_exit(
+        sink,
+        constants,
+        value_types,
+        guard_idx,
+        op,
+        block_exit_depth,
+    );
 }
 
 /// Common guard exit: condition is on stack (i32), emit if + exit.
@@ -4257,12 +4476,13 @@ fn emit_guard_false(
 fn emit_guard_if_exit(
     sink: &mut InstructionSink<'_>,
     constants: &indexmap::IndexMap<u32, i64>,
+    value_types: &[ValType],
     guard_idx: u32,
     op: &Op,
     block_exit_depth: Option<u32>,
 ) {
     sink.if_(BlockType::Empty);
-    emit_guard_exit(sink, constants, guard_idx, op);
+    emit_guard_exit(sink, constants, value_types, guard_idx, op);
     match block_exit_depth {
         // Loop traces: `br` out of this `if` and the enclosing exit `block`
         // (the `+ 1` accounts for the `if`) to the function epilogue.
@@ -4284,6 +4504,7 @@ fn emit_guard_if_exit(
 fn emit_guard_exit(
     sink: &mut InstructionSink<'_>,
     constants: &indexmap::IndexMap<u32, i64>,
+    value_types: &[ValType],
     guard_idx: u32,
     op: &Op,
 ) {
@@ -4295,7 +4516,7 @@ fn emit_guard_exit(
     for (i, &arg_ref) in fail_args.iter().enumerate() {
         let offset = FRAME_SLOT_BASE + i as u64 * SLOT_SIZE;
         sink.local_get(0);
-        emit_resolve(sink, constants, arg_ref);
+        emit_resolve(sink, constants, value_types, arg_ref);
         sink.i64_store(mem64(offset));
     }
 
@@ -4361,6 +4582,7 @@ fn apply_binop(sink: &mut InstructionSink<'_>, op: BinOp) {
 fn emit_binop(
     sink: &mut InstructionSink<'_>,
     constants: &indexmap::IndexMap<u32, i64>,
+    value_types: &[ValType],
     op: &Op,
     binop: BinOp,
 ) {
@@ -4368,8 +4590,8 @@ fn emit_binop(
     if OpRef::raw_is_constant(vi) {
         return;
     }
-    emit_resolve(sink, constants, op.arg(0).to_opref());
-    emit_resolve(sink, constants, op.arg(1).to_opref());
+    emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
+    emit_resolve(sink, constants, value_types, op.arg(1).to_opref());
     apply_binop(sink, binop);
     sink.local_set(1 + vi);
 }
@@ -4383,6 +4605,7 @@ fn emit_binop(
 fn emit_umulhi(
     sink: &mut InstructionSink<'_>,
     constants: &indexmap::IndexMap<u32, i64>,
+    value_types: &[ValType],
     op: &Op,
     num_vars: u32,
 ) {
@@ -4398,22 +4621,22 @@ fn emit_umulhi(
     let mid1 = num_vars + 5;
 
     // al = a & 0xFFFFFFFF
-    emit_resolve(sink, constants, op.arg(0).to_opref());
+    emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
     sink.i64_const(MASK32);
     sink.i64_and();
     sink.local_set(al);
     // ah = a >>u 32
-    emit_resolve(sink, constants, op.arg(0).to_opref());
+    emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
     sink.i64_const(32);
     sink.i64_shr_u();
     sink.local_set(ah);
     // bl = b & 0xFFFFFFFF
-    emit_resolve(sink, constants, op.arg(1).to_opref());
+    emit_resolve(sink, constants, value_types, op.arg(1).to_opref());
     sink.i64_const(MASK32);
     sink.i64_and();
     sink.local_set(bl);
     // bh = b >>u 32
-    emit_resolve(sink, constants, op.arg(1).to_opref());
+    emit_resolve(sink, constants, value_types, op.arg(1).to_opref());
     sink.i64_const(32);
     sink.i64_shr_u();
     sink.local_set(bh);
@@ -4458,12 +4681,13 @@ fn emit_umulhi(
 fn emit_ovf_binop(
     sink: &mut InstructionSink<'_>,
     constants: &indexmap::IndexMap<u32, i64>,
+    value_types: &[ValType],
     op: &Op,
     binop: BinOp,
 ) {
     // For wasm MVP, just compute the result without overflow detection.
     // GuardNoOverflow/GuardOverflow are treated as always-pass.
-    emit_binop(sink, constants, op, binop);
+    emit_binop(sink, constants, value_types, op, binop);
 }
 
 // ── Comparison ops ──
@@ -4530,6 +4754,7 @@ enum FloatCmp {
 fn emit_float_cmp(
     sink: &mut InstructionSink<'_>,
     constants: &indexmap::IndexMap<u32, i64>,
+    value_types: &[ValType],
     op: &Op,
     cmp: FloatCmp,
 ) {
@@ -4537,10 +4762,8 @@ fn emit_float_cmp(
     if OpRef::raw_is_constant(vi) {
         return;
     }
-    emit_resolve(sink, constants, op.arg(0).to_opref());
-    sink.f64_reinterpret_i64();
-    emit_resolve(sink, constants, op.arg(1).to_opref());
-    sink.f64_reinterpret_i64();
+    emit_resolve_f64(sink, constants, value_types, op.arg(0).to_opref());
+    emit_resolve_f64(sink, constants, value_types, op.arg(1).to_opref());
     match cmp {
         FloatCmp::Lt => {
             sink.f64_lt();
@@ -4568,6 +4791,7 @@ fn emit_float_cmp(
 fn emit_cmp(
     sink: &mut InstructionSink<'_>,
     constants: &indexmap::IndexMap<u32, i64>,
+    value_types: &[ValType],
     op: &Op,
     cmpop: CmpOp,
 ) {
@@ -4575,8 +4799,8 @@ fn emit_cmp(
     if OpRef::raw_is_constant(vi) {
         return;
     }
-    emit_resolve(sink, constants, op.arg(0).to_opref());
-    emit_resolve(sink, constants, op.arg(1).to_opref());
+    emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
+    emit_resolve(sink, constants, value_types, op.arg(1).to_opref());
     apply_cmp(sink, cmpop);
     sink.i64_extend_i32_u();
     sink.local_set(1 + vi);
@@ -4587,6 +4811,7 @@ fn emit_cmp(
 fn emit_unary_vi(
     sink: &mut InstructionSink<'_>,
     constants: &indexmap::IndexMap<u32, i64>,
+    value_types: &[ValType],
     op: &Op,
     prefix: impl FnOnce(&mut InstructionSink<'_>),
     suffix: impl FnOnce(&mut InstructionSink<'_>),
@@ -4594,7 +4819,7 @@ fn emit_unary_vi(
     let vi = op.pos.get().raw();
     if !OpRef::raw_is_constant(vi) {
         prefix(sink);
-        emit_resolve(sink, constants, op.arg(0).to_opref());
+        emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
         suffix(sink);
         sink.local_set(1 + vi);
     }
