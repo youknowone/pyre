@@ -2921,8 +2921,96 @@ fn compute_bridge_root_parent_frame(
 /// and aborts (trace discarded).  Threading `SubReturn` into the root operand
 /// stack + the root top-level walk forward to a terminator is increment 2b-ii.
 /// `None` signals a setup failure (terminal descrs unwired / no root frame).
+fn call_dst_reg_for_residual_return(code: &[u8], entry: usize) -> Option<usize> {
+    for op in crate::jitcode_runtime::decoded_ops(code) {
+        if op.next_pc == entry {
+            return (op.opname.starts_with("residual_call") && op.argcodes.ends_with(">r"))
+                .then(|| code.get(entry - 1).map(|&b| b as usize))
+                .flatten();
+        }
+    }
+    None
+}
+
+fn recipe_parent_frame_from_recipe(
+    ctx: &mut TraceCtx,
+    recipe: &majit_metainterp::ReconstructRecipe,
+) -> Option<InlineParentFrame> {
+    let py_pc = crate::state::backxlat_py_pc(recipe.jitcode_index, recipe.jitcode_pc) as usize;
+    let pjc = crate::state::pyjitcode_for_jitcode_index(recipe.jitcode_index)?;
+    if !pjc.is_populated() || pjc.code_ptr.is_null() {
+        return None;
+    }
+    let entry =
+        if crate::state::frame_pc_is_resolved_offset_at(recipe.jitcode_index, recipe.jitcode_pc) {
+            recipe.jitcode_pc as usize
+        } else {
+            pjc.resume_jitcode_pc_for(py_pc)?
+        };
+    let call_jit_pc = crate::jitcode_runtime::decoded_ops(pjc.jitcode.code.as_slice())
+        .find(|op| op.next_pc == entry && op.opname.starts_with("residual_call"))
+        .map(|op| op.pc);
+    let resume_marker_jit_pc =
+        call_jit_pc.and_then(|pc| pjc.after_residual_marker_for_jitcode_pc(pc));
+
+    let mut banks = crate::state::frame_liveness_reg_indices_by_bank_from_pc(
+        recipe.jitcode_index,
+        recipe.jitcode_pc,
+    );
+    if let Some(result_color) = crate::state::result_color_at_pc_at(recipe.jitcode_index, py_pc) {
+        banks.ref_.retain(|&c| c as usize != result_color);
+    }
+
+    let stack_only = recipe.valuestackdepth.saturating_sub(recipe.nlocals);
+    let maps = crate::state::bridge_semantic_maps_at(recipe.jitcode_index, recipe.jitcode_pc);
+    let mut boxes = Vec::with_capacity(banks.total_len());
+    for &color in &banks.int {
+        boxes.push(
+            recipe
+                .registers_i
+                .get(color as usize)
+                .copied()
+                .unwrap_or(OpRef::NONE),
+        );
+    }
+    for &color in &banks.ref_ {
+        let slot = crate::state::semantic_ref_slot_for_reg_color(
+            recipe.nlocals,
+            stack_only,
+            &maps.pcdep_entries,
+            color as usize,
+        )
+        .or_else(|| {
+            let c = color as usize;
+            (c < recipe.valuestackdepth).then_some(c)
+        })?;
+        boxes.push(recipe.registers_r.get(slot).copied().unwrap_or(OpRef::NONE));
+    }
+    for &color in &banks.float {
+        boxes.push(
+            recipe
+                .registers_f
+                .get(color as usize)
+                .copied()
+                .unwrap_or(OpRef::NONE),
+        );
+    }
+    if boxes.iter().any(|b| b.is_none()) {
+        return None;
+    }
+
+    Some(InlineParentFrame {
+        jitcode_index: recipe.jitcode_index as u32,
+        call_py_pc: call_jit_pc.map(|pc| python_pc_for_jitcode_pc(&pjc.metadata, pc)),
+        call_stack_overrides: Vec::new(),
+        resume_py_pc: py_pc as u32,
+        resume_marker_jit_pc,
+        boxes,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn drive_bridge_carrier_subwalk(
+fn drive_bridge_frame_subwalk(
     ctx: &mut TraceCtx,
     session: &std::cell::RefCell<WalkSession>,
     root_sym: &crate::state::PyreSym,
@@ -2933,6 +3021,8 @@ pub(crate) fn drive_bridge_carrier_subwalk(
     entry: usize,
     argboxes_r: &[OpRef],
     local_concretes: &[majit_ir::Value],
+    child_result: Option<OpRef>,
+    paused_parent_recipes: &[majit_metainterp::ReconstructRecipe],
 ) -> Option<Result<(DispatchOutcome, usize), DispatchError>> {
     use majit_metainterp::jitcode::RuntimeBhDescr;
 
@@ -3023,6 +3113,20 @@ pub(crate) fn drive_bridge_carrier_subwalk(
             concrete_r[i] = ConcreteValue::Ref(ptr as pyre_object::PyObjectRef);
         }
     }
+    if let Some(result) = child_result {
+        let call_dst_reg = call_dst_reg_for_residual_return(jc.code.as_slice(), entry)?;
+        if call_dst_reg >= regs_r.len() {
+            return Some(Err(DispatchError::InlineCallArityMismatch {
+                pc: entry,
+                provided: call_dst_reg + 1,
+                callee_num_regs_r: regs_r.len(),
+            }));
+        }
+        regs_r[call_dst_reg] = result;
+        if let Some(majit_ir::Value::Ref(majit_ir::GcRef(ptr))) = ctx.box_value(result) {
+            concrete_r[call_dst_reg] = ConcreteValue::Ref(ptr as pyre_object::PyObjectRef);
+        }
+    }
 
     // Paused root portal frame for the multi-frame guard snapshot.
     let root_frame = compute_bridge_root_parent_frame(root_sym, ctx, root_pc)?;
@@ -3039,6 +3143,18 @@ pub(crate) fn drive_bridge_carrier_subwalk(
     // Install the ROOT sym as the snapshot sym (NOT the callee's) so in-callee
     // guards snapshot the paused root.
     let root_sym_ptr = root_sym as *const crate::state::PyreSym;
+
+    let mut parent_guards = Vec::new();
+    let mut parent_for_current = root_frame.clone();
+    for parent_recipe in paused_parent_recipes {
+        let guard_parent = parent_for_current.clone();
+        parent_guards.push(InlineFrameGuard::enter(
+            session,
+            parent_recipe.code_ptr as usize,
+            Some(guard_parent),
+        ));
+        parent_for_current = recipe_parent_frame_from_recipe(ctx, parent_recipe)?;
+    }
 
     let outcome = {
         let mut sub_wc = WalkContext {
@@ -3097,7 +3213,8 @@ pub(crate) fn drive_bridge_carrier_subwalk(
             outer_jitcode_index,
             outer_active_boxes,
         };
-        let _inline_frame = InlineFrameGuard::enter(session, callee_code_key, Some(root_frame));
+        let _inline_frame =
+            InlineFrameGuard::enter(session, callee_code_key, Some(parent_for_current));
         // Nested self-recursive calls inside the resumed callee fold straight to
         // a recursive-portal CALL_ASSEMBLER (the bridge is the deopt
         // continuation, not a fresh unroll).
@@ -3117,7 +3234,68 @@ pub(crate) fn drive_bridge_carrier_subwalk(
         }
         walk(callee_code, entry, &mut sub_wc)
     };
+    drop(parent_guards);
     Some(outcome)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn drive_bridge_carrier_subwalk(
+    ctx: &mut TraceCtx,
+    session: &std::cell::RefCell<WalkSession>,
+    root_sym: &crate::state::PyreSym,
+    root_pc: usize,
+    callee_pjc: &std::sync::Arc<crate::PyJitCode>,
+    callee_code_key: usize,
+    callee_w_globals: usize,
+    entry: usize,
+    argboxes_r: &[OpRef],
+    local_concretes: &[majit_ir::Value],
+    paused_parent_recipes: &[majit_metainterp::ReconstructRecipe],
+) -> Option<Result<(DispatchOutcome, usize), DispatchError>> {
+    drive_bridge_frame_subwalk(
+        ctx,
+        session,
+        root_sym,
+        root_pc,
+        callee_pjc,
+        callee_code_key,
+        callee_w_globals,
+        entry,
+        argboxes_r,
+        local_concretes,
+        None,
+        paused_parent_recipes,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn drive_bridge_middle_frame(
+    ctx: &mut TraceCtx,
+    session: &std::cell::RefCell<WalkSession>,
+    root_sym: &crate::state::PyreSym,
+    root_pc: usize,
+    middle_pjc: &std::sync::Arc<crate::PyJitCode>,
+    middle_code_key: usize,
+    middle_w_globals: usize,
+    entry: usize,
+    argboxes_r: &[OpRef],
+    local_concretes: &[majit_ir::Value],
+    child_result: OpRef,
+) -> Option<Result<(DispatchOutcome, usize), DispatchError>> {
+    drive_bridge_frame_subwalk(
+        ctx,
+        session,
+        root_sym,
+        root_pc,
+        middle_pjc,
+        middle_code_key,
+        middle_w_globals,
+        entry,
+        argboxes_r,
+        local_concretes,
+        Some(child_result),
+        &[],
+    )
 }
 
 /// #41 continuous cross-frame walk: after the deepest callee sub-walk
@@ -7576,12 +7754,21 @@ const FBW_MAX_INLINE_RECURSION: usize = 7;
 /// bound the recursive call folds straight to `CALL_ASSEMBLER`
 /// (`_opimpl_recursive_call` → `do_recursive_call`, `pyjitpl.py:1404-1416`)
 /// rather than continuing to unroll the call tree.  `try_multiframe`
-/// (`inline_depth < FBW_MAX_MULTIFRAME_DEPTH`) therefore only fires at the top
-/// inline level.  (The depth-≥2 blackhole-resume crash that previously blocked
-/// this path was a GC-rooting gap in the nested `run()` chain, fixed by rooting
-/// the whole pending `nextblackholeinterp` chain across `run()`; raising the
-/// bound is now a performance, not a soundness, question.)
-const FBW_MAX_MULTIFRAME_DEPTH: usize = 1;
+/// (`inline_depth < fbw_max_multiframe_depth()`) therefore only fires at the
+/// top inline level by default. (The depth-≥2 blackhole-resume crash that
+/// previously blocked this path was a GC-rooting gap in the nested `run()`
+/// chain, fixed by rooting the whole pending `nextblackholeinterp` chain across
+/// `run()`; raising the bound is now a performance, not a soundness, question.)
+pub(crate) fn fbw_max_multiframe_depth() -> usize {
+    static DEPTH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *DEPTH.get_or_init(|| {
+        std::env::var("PYRE_FBW_MULTIFRAME_DEPTH")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1)
+            .clamp(1, 2)
+    })
+}
 
 /// Upper bound on the parameter count the self-recursive `CALL_ASSEMBLER` fold
 /// accepts. Accumulator/linear recursion is low-arity; the cap keeps a
@@ -14461,7 +14648,7 @@ fn try_walker_inline_user_call(
     };
     let inline_depth = ctx.session.borrow().framestack.len();
     let try_multiframe = multiframe_eligible
-        && inline_depth < FBW_MAX_MULTIFRAME_DEPTH
+        && inline_depth < fbw_max_multiframe_depth()
         && callee_fast_path_inlinable_allowing_forward_branch(
             body.code,
             callee_descr_refs,
@@ -14587,10 +14774,10 @@ fn try_walker_inline_user_call(
     let mut ca_nlocals = 0usize;
     // A strict straight-line callee at the top inline level is seeded the same
     // way, so its in-callee guards route through the multi-frame snapshot.  A
-    // deeper strict callee (`inline_depth >= FBW_MAX_MULTIFRAME_DEPTH`) keeps the
+    // deeper strict callee (`inline_depth >= fbw_max_multiframe_depth()`) keeps the
     // single-frame collapse — a 3-frame snapshot the resume path is sound for
     // only one paused caller frame (task #126 multiframe depth).
-    let strict_seed = strict_inlinable && inline_depth < FBW_MAX_MULTIFRAME_DEPTH;
+    let strict_seed = strict_inlinable && inline_depth < fbw_max_multiframe_depth();
     // True once the callee frame reds are actually seeded (all preconditions
     // below met).  For a strict callee this gates routing its guards through the
     // multi-frame snapshot vs. falling back to collapse.
@@ -14800,7 +14987,7 @@ fn try_walker_inline_user_call(
     } else {
         // Single-frame collapse (resume at the CALL boundary, re-execute the
         // whole call on deopt): a nested strict callee
-        // (`inline_depth >= FBW_MAX_MULTIFRAME_DEPTH`, task #126), an un-seedable
+        // (`inline_depth >= fbw_max_multiframe_depth()`, task #126), an un-seedable
         // strict callee, or a callee neither seed served.  Sound for a pure
         // value-returning leaf (idempotent re-execute) and for a nested
         // straight-line callee (its pre-multiframe behavior).

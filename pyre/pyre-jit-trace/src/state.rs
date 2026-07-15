@@ -5851,6 +5851,7 @@ fn reconstruct_inline_recipe(
     fail_types: &[Type],
     backend: &dyn majit_backend::Backend,
     cache: &mut BridgeVirtualCache,
+    in_a_call: bool,
 ) -> Option<ReconstructRecipe> {
     if frame.pc < 0 {
         return None;
@@ -5882,7 +5883,29 @@ fn reconstruct_inline_recipe(
     }
     let nlocals = code_ref.varnames.len();
 
-    let reg_indices = frame_liveness_reg_indices_by_bank_from_pc(frame.jitcode_index, frame.pc);
+    let stack_only = match crate::liveness::liveness_for(raw_code).stack_depth_at(py_pc) {
+        Some(d) => d,
+        None => return None,
+    };
+    let pending_result_abs_slot = if in_a_call && stack_only > 0 {
+        Some(nlocals + stack_only - 1)
+    } else {
+        None
+    };
+    let pending_result_color = if in_a_call {
+        Some(result_color_at_pc_at(frame.jitcode_index, py_pc)?)
+    } else {
+        None
+    };
+    let mut reg_indices = frame_liveness_reg_indices_by_bank_from_pc(frame.jitcode_index, frame.pc);
+    if let Some(color) = pending_result_color {
+        if reg_indices.int.iter().any(|&c| c as usize == color)
+            || reg_indices.float.iter().any(|&c| c as usize == color)
+        {
+            return None;
+        }
+        reg_indices.ref_.retain(|&c| c as usize != color);
+    }
     // resume.py:1054 consume_boxes: the liveness enumeration count must match
     // the encoded frame section exactly.
     if reg_indices.total_len() != frame.values.len() {
@@ -5952,10 +5975,7 @@ fn reconstruct_inline_recipe(
             | majit_ir::RdVirtualInfo::VArrayInfoNotClear { fieldnums, .. } => fieldnums.clone(),
             _ => return None,
         };
-        let valuestackdepth = match crate::liveness::liveness_for(raw_code).stack_depth_at(py_pc) {
-            Some(d) => nlocals + d,
-            None => return None,
-        };
+        let valuestackdepth = nlocals + stack_only;
         if valuestackdepth > arr.len() {
             return None;
         }
@@ -5967,6 +5987,9 @@ fn reconstruct_inline_recipe(
         // NULL in the rebuilt frame; a missing operand-stack slot is
         // unreconstructable and declines below.
         for k in 0..valuestackdepth {
+            if Some(k) == pending_result_abs_slot {
+                continue;
+            }
             let tag = arr[k];
             if tag == UNINITIALIZED_TAG {
                 continue;
@@ -5986,6 +6009,9 @@ fn reconstruct_inline_recipe(
             concrete_r[k] = value_for_slot(Type::Ref, bits);
         }
         for s in nlocals..valuestackdepth {
+            if Some(s) == pending_result_abs_slot {
+                continue;
+            }
             if registers_r[s] == OpRef::NONE {
                 return None;
             }
@@ -6021,10 +6047,6 @@ fn reconstruct_inline_recipe(
     // resume pc there is no per-pc map to faithfully rebuild the frame, so
     // decline to the single-frame bridge (whose vable payload IS semantic-
     // ordered) rather than rebuild the frame with mis-slotted boxes.
-    let stack_only = match crate::liveness::liveness_for(raw_code).stack_depth_at(py_pc) {
-        Some(d) => d,
-        None => return None,
-    };
     let maps = bridge_semantic_maps_at(frame.jitcode_index, frame.pc);
     if maps.pcdep_entries.is_empty() {
         return None;
@@ -6125,10 +6147,7 @@ fn reconstruct_inline_recipe(
     // `valuestackdepth` scalar (state.rs:6382); an inline frame has no such
     // scalar, so derive it from the bytecode here. An unreachable resume pc
     // aborts the multi-frame path.
-    let valuestackdepth = match crate::liveness::liveness_for(raw_code).stack_depth_at(py_pc) {
-        Some(d) => nlocals + d,
-        None => return None,
-    };
+    let valuestackdepth = nlocals + stack_only;
 
     // Invert the COLOR-indexed decode into SLOT-indexed `registers_r`/
     // `concrete_r`, mirroring the root frame's `setup_bridge_sym` color→slot
@@ -6154,6 +6173,9 @@ fn reconstruct_inline_recipe(
     // inlined callee has no value-stack resumedata to rematerialize them from).
     for (slot, raw) in const_ref_slots_from_pc(frame.jitcode_index, frame.pc) {
         let s = slot as usize;
+        if Some(s) == pending_result_abs_slot {
+            continue;
+        }
         if s < valuestackdepth {
             registers_r[s] = ctx.const_ref(raw);
             concrete_r[s] = value_for_slot(Type::Ref, raw);
@@ -6166,6 +6188,9 @@ fn reconstruct_inline_recipe(
     // constant, or an unsupported shape) — decline to the single-frame bridge
     // rather than seed a NULL operand the re-executed bridge would deref.
     for s in nlocals..valuestackdepth {
+        if Some(s) == pending_result_abs_slot {
+            continue;
+        }
         if registers_r[s] == OpRef::NONE {
             return None;
         }
@@ -9046,7 +9071,9 @@ impl JitState for PyreJitState {
                 Vec::with_capacity(resume_data.frames.len() - 1);
             let mut ok = root_pc_valid;
             if root_pc_valid {
-                for frame in &resume_data.frames[1..] {
+                let inline_frames = &resume_data.frames[1..];
+                for (idx, frame) in inline_frames.iter().enumerate() {
+                    let in_a_call = idx + 1 < inline_frames.len();
                     match reconstruct_inline_recipe(
                         ctx,
                         frame,
@@ -9056,6 +9083,7 @@ impl JitState for PyreJitState {
                         fail_types,
                         backend,
                         &mut virtuals_cache,
+                        in_a_call,
                     ) {
                         Some(recipe) => recipes.push(recipe),
                         None => {

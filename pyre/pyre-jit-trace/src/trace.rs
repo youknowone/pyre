@@ -970,6 +970,7 @@ fn drive_bridge_carrier_walk(
         entry,
         &argboxes_r,
         local_concretes,
+        &[],
     );
     // 2b-ii: on a clean single-recipe `SubReturn`, thread the callee result
     // into the root's operand-stack result slot and walk the ROOT top-level to
@@ -1150,6 +1151,11 @@ fn drive_bridge_framestack_walk(
         entry,
         &argboxes_r,
         local_concretes,
+        if carrier.recipes.len() == 2 && crate::jitcode_dispatch::fbw_max_multiframe_depth() >= 2 {
+            &carrier.recipes[..1]
+        } else {
+            &[]
+        },
     );
     let subwalk_result = match &walk {
         Some(Ok((crate::jitcode_dispatch::DispatchOutcome::SubReturn { result: Some(r) }, _))) => {
@@ -1189,12 +1195,89 @@ fn drive_bridge_framestack_walk(
     // result is delivered into the outer's call-dst register
     // (`make_result_of_lastop`), never a resume color, so the outer resumes with
     // the 1st-call result live and records its 2nd call + ADD + return.
-    if let Some(result) = subwalk_result {
+    if let Some(mut result) = subwalk_result {
         // A single-recipe (depth-1) reconstruction continues the OUTER frame
-        // forward and compiles the whole cross-frame bridge. `recipes.len() != 1`
-        // (depth≥2) and any continuation-setup failure fall through to the clean
-        // `SafeAbortReconstruction` below (correct no-JIT re-interpret).
-        if carrier.recipes.len() == 1 {
+        // forward and compiles the whole cross-frame bridge. With the explicit
+        // depth-2 cap override, first continue the one middle frame and deliver
+        // the deepest result into its residual-call return register, then deliver
+        // the middle result into the root. Deeper chains and any continuation
+        // setup failure fall through to the clean SafeAbort below.
+        if carrier.recipes.len() == 2 && crate::jitcode_dispatch::fbw_max_multiframe_depth() >= 2 {
+            let middle = &carrier.recipes[0];
+            let Some((_pending, middle_argboxes_r)) =
+                crate::state::setup_reconstructed_callee_frame(ctx, middle, root_ec, Vec::new())
+            else {
+                ctx.cut_trace(pre_pos);
+                crate::jitcode_dispatch::census_record("P2Framestack::MiddleSetupFailed");
+                return TraceAction::Abort;
+            };
+            let Some(middle_pjc) = crate::state::pyjitcode_for_code(middle.code_ptr) else {
+                ctx.cut_trace(pre_pos);
+                crate::jitcode_dispatch::census_record("P2Framestack::NoMiddlePjc");
+                return TraceAction::Abort;
+            };
+            let middle_entry = select_recipe_entry(
+                middle.jitcode_index,
+                middle_pjc.jitcode.index() as i32,
+                crate::state::backxlat_py_pc(middle.jitcode_index, middle.jitcode_pc) as usize,
+                middle.jitcode_pc,
+                || {
+                    middle_pjc.resume_jitcode_pc_for(crate::state::backxlat_py_pc(
+                        middle.jitcode_index,
+                        middle.jitcode_pc,
+                    ) as usize)
+                },
+            );
+            let Some(middle_entry) = middle_entry else {
+                ctx.cut_trace(pre_pos);
+                crate::jitcode_dispatch::census_record("P2Framestack::NoMiddleEntry");
+                return TraceAction::Abort;
+            };
+            let middle_w_globals =
+                crate::state::recover_inline_callee_globals(middle.code_ptr) as usize;
+            let middle_nlocals = middle.nlocals.min(middle.concrete_r.len());
+            let middle_local_concretes = &middle.concrete_r[..middle_nlocals];
+            let middle_walk = crate::jitcode_dispatch::drive_bridge_middle_frame(
+                ctx,
+                &session,
+                sym,
+                root_pc,
+                &middle_pjc,
+                middle.code_ptr as usize,
+                middle_w_globals,
+                middle_entry,
+                &middle_argboxes_r,
+                middle_local_concretes,
+                result,
+            );
+            match middle_walk {
+                Some(Ok((
+                    crate::jitcode_dispatch::DispatchOutcome::SubReturn {
+                        result: Some(mid_result),
+                    },
+                    _,
+                ))) => {
+                    result = mid_result;
+                }
+                _ => {
+                    if std::env::var_os("PYRE_P2_DIAG").is_some() {
+                        eprintln!(
+                            "[p2-fs] middle outcome={:?}",
+                            middle_walk
+                                .as_ref()
+                                .map(|r| r.as_ref().map(|(o, pc)| (format!("{o:?}"), *pc)))
+                        );
+                    }
+                    ctx.cut_trace(pre_pos);
+                    crate::jitcode_dispatch::census_record("P2Framestack::MiddleDriveFailed");
+                    return TraceAction::Abort;
+                }
+            }
+        }
+        if carrier.recipes.len() == 1
+            || (carrier.recipes.len() == 2
+                && crate::jitcode_dispatch::fbw_max_multiframe_depth() >= 2)
+        {
             if let Some(action) = drive_outer_continuation_and_map(
                 ctx, &session, sym, w_code, root_pc, cf_addr, result, pre_pos,
             ) {
