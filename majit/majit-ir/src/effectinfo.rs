@@ -680,6 +680,14 @@ pub enum PyreHelperKind {
     /// `__getattribute__`, data descriptor, unboxed slot, attribute absent from
     /// this instance's map).
     LoadAttr,
+    /// `bh_setattr_fn(obj, value, code, name_idx)` — the plain STORE_ATTR
+    /// residual (`lower_setattr_hlop_to_insn` → `space.setattr`).  The Ref
+    /// operands are the receiver, value, and jitcode's own PyCode; the Int
+    /// operand is the co_names index.  The full-body walker recognises this
+    /// tag to fold a plain unboxed same-type integer store to a non-forcing
+    /// raw longlong-list write.  Every unsupported shape keeps the original
+    /// generic setattr residual.
+    StoreAttr,
     /// aheui headerless-Node nursery allocation (`jit_alloc_node(value,next)`).
     /// The dynasm backend recognises this tag on the CallR descr to emit an
     /// inline nursery bump (RPython malloc_cond shape) instead of a full

@@ -269,6 +269,32 @@ pub extern "C" fn jit_mapdict_unboxed_read_raw(
     }
 }
 
+/// Non-forcing raw write for a mapdict unboxed attribute.  The full-body
+/// walker has already guarded the receiver's instance class and exact map,
+/// and proved that the incoming value is an integer, so this is only the
+/// same-type longlong-list update (mapdict.py:615-619).  A torn recording can
+/// reach the wrapper with a null/non-instance receiver; keep that defensive
+/// path a no-op.
+pub extern "C" fn jit_mapdict_unboxed_write_raw(
+    w_obj: i64,
+    storageindex: i64,
+    listindex: i64,
+    raw: i64,
+) {
+    let w_obj = w_obj as usize as PyObjectRef;
+    if w_obj.is_null() || !unsafe { is_instance(w_obj) } {
+        return;
+    }
+    unsafe {
+        pyre_interpreter::objspace::std::mapdict::write_unboxed_storage_raw(
+            w_obj,
+            storageindex as usize,
+            listindex as usize,
+            raw,
+        );
+    }
+}
+
 pub fn emit_trace_call_void(ctx: &mut TraceCtx, helper: *const (), args: &[OpRef]) {
     ctx.call_void(helper, args);
 }

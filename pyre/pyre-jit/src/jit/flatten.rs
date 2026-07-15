@@ -5341,7 +5341,11 @@ where
     let value = operand_for_value_arg(&op.args[1], get_register, lower_constant)?;
     let code = operand_for_value_arg(&op.args[2], get_register, lower_constant)?;
     let name_idx = const_int_for_value_arg(&op.args[3])?;
-    let effect_info = effect_info_for_call_flavor(CallFlavor::MayForce);
+    let mut effect_info = effect_info_for_call_flavor(CallFlavor::MayForce);
+    // Tag the STORE_ATTR helper calldescr so the full-body walker can replace
+    // a plain unboxed same-type integer store with the non-forcing raw write.
+    // A declined fold continues with this unchanged MayForce residual.
+    effect_info.pyre_helper = majit_ir::PyreHelperKind::StoreAttr;
     let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
         effect_info,
         arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Int],
