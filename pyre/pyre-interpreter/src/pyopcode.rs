@@ -178,6 +178,43 @@ pub fn decode_instruction_for_dispatch(
     Ok((opcode_pc, instruction, op_arg))
 }
 
+/// pypy/interpreter/pyopcode.py:213-237 dispatch loop forward decode.
+///
+/// Forward-only single-pass decode for the hot dispatch path: reads units
+/// starting at `pc`, accumulating any `ExtendedArg` prefix forward with a
+/// fresh `OpArgState`, and returns the real opcode's `(pc, instruction,
+/// op_arg)` without ever scanning backward.
+///
+/// `pc` must be a logical-instruction start (a real opcode, or the first
+/// `ExtendedArg` of a prefix run). `OpArgState` resets its accumulator after
+/// every real opcode, so a fresh state accumulated forward from such a `pc`
+/// yields the same triple `decode_instruction_for_dispatch` returns, sharing
+/// its `u8 < 44` malformed-chain guard and `BytecodeCorruption` on out of
+/// bounds.
+#[inline]
+pub fn decode_instruction_forward(
+    code: &CodeObject,
+    pc: usize,
+) -> Result<(usize, Instruction, OpArg), crate::pycode::BytecodeCorruption> {
+    let mut opcode_pc = pc;
+    let mut state = OpArgState::default();
+    loop {
+        let unit = *code
+            .instructions
+            .get(opcode_pc)
+            .ok_or(crate::pycode::BytecodeCorruption)?;
+        let (instruction, op_arg) = state.get(unit);
+        if matches!(instruction, Instruction::ExtendedArg) {
+            opcode_pc += 1;
+            continue;
+        }
+        if opcode_pc != pc && u8::from(instruction) < 44 {
+            return Err(crate::pycode::BytecodeCorruption);
+        }
+        return Ok((opcode_pc, instruction, op_arg));
+    }
+}
+
 pub trait LocalOpcodeHandler: SharedOpcodeHandler {
     fn load_local_value(&mut self, idx: usize) -> Result<Self::Value, PyError>;
     fn load_local_checked_value(&mut self, idx: usize, name: &str) -> Result<Self::Value, PyError> {
@@ -3568,7 +3605,9 @@ pub fn skip_caches(instructions: &[CodeUnit], mut pos: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_instruction_at, decode_instruction_for_dispatch};
+    use super::{
+        decode_instruction_at, decode_instruction_for_dispatch, decode_instruction_forward,
+    };
     use crate::bytecode::Instruction;
     use crate::{OpArgState, compile_exec};
 
@@ -3630,6 +3669,29 @@ mod tests {
             std::mem::discriminant(&target_instr)
         );
         assert_eq!(u32::from(decoded_arg), u32::from(target_arg));
+
+        // decode_instruction_forward, entered on the ExtendedArg prefix start,
+        // reconstructs the identical dispatch triple with no backward scan.
+        let (fwd_pc, fwd_instr, fwd_arg) =
+            decode_instruction_forward(&code, prefix_pc).expect("forward decode failed");
+        assert_eq!(fwd_pc, decoded_pc);
+        assert_eq!(
+            std::mem::discriminant(&fwd_instr),
+            std::mem::discriminant(&decoded_instr)
+        );
+        assert_eq!(u32::from(fwd_arg), u32::from(decoded_arg));
+
+        // Entered at target_pc (mid-prefix, past the ExtendedArg), a fresh
+        // forward state lands on the same opcode; the accumulated arg reflects
+        // only target_pc's own unit, so pc and opcode match but the extended
+        // arg bits do not.
+        let (fwd_target_pc, fwd_target_instr, _) =
+            decode_instruction_forward(&code, target_pc).expect("forward decode at target failed");
+        assert_eq!(fwd_target_pc, target_pc);
+        assert_eq!(
+            std::mem::discriminant(&fwd_target_instr),
+            std::mem::discriminant(&target_instr)
+        );
     }
 
     #[test]
@@ -3644,5 +3706,90 @@ mod tests {
             code.instructions.replace_op(1, Instruction::GetIter);
         }
         assert!(decode_instruction_for_dispatch(&code, 0).is_err());
+    }
+
+    #[test]
+    fn forward_decode_matches_full_scan_and_dispatch() {
+        let source = (0..400)
+            .map(|i| format!("v{i} = {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let code = compile_exec(&source).expect("compile failed");
+
+        // Naive full-scan reference: a single OpArgState folded over the whole
+        // instruction stream, recording the decoded (instruction, arg) at every
+        // index.
+        let full: Vec<_> = {
+            let mut state = OpArgState::default();
+            code.instructions
+                .iter()
+                .copied()
+                .map(|unit| state.get(unit))
+                .collect()
+        };
+
+        let mut prefix_starts = 0usize;
+        let mut real_opcodes = 0usize;
+
+        // Walk logical instructions. `i` is always a logical-instruction start
+        // (a bare real opcode or the first ExtendedArg of a prefix run), never
+        // mid-prefix, so it is a valid dispatch entry.
+        let mut i = 0;
+        while i < code.instructions.len() {
+            let is_prefix_start = matches!(full[i].0, Instruction::ExtendedArg);
+
+            // Real opcode pc: skip the contiguous ExtendedArg prefix forward.
+            let mut real = i;
+            while matches!(full[real].0, Instruction::ExtendedArg) {
+                real += 1;
+            }
+            real_opcodes += 1;
+            if is_prefix_start {
+                prefix_starts += 1;
+            }
+
+            let (fwd_pc, fwd_instr, fwd_arg) =
+                decode_instruction_forward(&code, i).expect("forward decode failed");
+            let (disp_pc, disp_instr, disp_arg) =
+                decode_instruction_for_dispatch(&code, i).expect("dispatch decode failed");
+
+            // forward decode == naive full-scan at the resolved real opcode.
+            assert_eq!(fwd_pc, real);
+            assert_eq!(
+                std::mem::discriminant(&fwd_instr),
+                std::mem::discriminant(&full[real].0)
+            );
+            assert_eq!(u32::from(fwd_arg), u32::from(full[real].1));
+
+            // forward decode == decode_instruction_for_dispatch.
+            assert_eq!(fwd_pc, disp_pc);
+            assert_eq!(
+                std::mem::discriminant(&fwd_instr),
+                std::mem::discriminant(&disp_instr)
+            );
+            assert_eq!(u32::from(fwd_arg), u32::from(disp_arg));
+
+            i = real + 1;
+        }
+
+        assert!(
+            prefix_starts > 0,
+            "expected the 400-assignment source to emit an ExtendedArg prefix"
+        );
+        assert!(real_opcodes > 0);
+    }
+
+    #[test]
+    fn decode_instruction_forward_rejects_malformed_extended_arg_chain() {
+        let code = compile_exec("x = 1").expect("compile failed");
+        assert!(
+            code.instructions.len() >= 2,
+            "expected at least two instructions"
+        );
+        unsafe {
+            code.instructions.replace_op(0, Instruction::ExtendedArg);
+            code.instructions.replace_op(1, Instruction::GetIter);
+        }
+        assert!(decode_instruction_forward(&code, 0).is_err());
     }
 }
