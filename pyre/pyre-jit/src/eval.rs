@@ -2811,17 +2811,32 @@ unsafe fn compile_snapshot_root_walker_area(
 ///
 /// # Safety / aliasing
 ///
-/// This mints a `&mut JitDriverPair` from the `JIT_DRIVER` cell. When a
-/// collection is triggered by an allocation inside a `MetaInterp` method that
-/// is itself reached through a live `driver_pair()` `&mut`, that outer borrow
-/// and this one both alias the same cell — formally undefined under
-/// stacked/tree borrows. It holds in practice because the collection runs at a
-/// safepoint with the mutator paused and the walker only rewrites `GcRef`
-/// slots in place (moving-GC forwarding), which the outer borrow re-reads as
-/// forwarded pointers when it resumes. The orthodox fix is to move the
-/// GC-visible root fields (`compiled_loops` / `partial_trace` /
-/// `exported_state` / `framestack` / `tracing`) behind interior mutability so
-/// the walker forwards them without re-borrowing the whole driver.
+/// This mints a second `&mut JitDriverPair` from the `JIT_DRIVER` cell. A
+/// collection triggered by an allocation under a live `driver_pair()` `&mut`
+/// arrives here on the *same* thread — the allocating thread becomes the
+/// collector and walks its own registered areas — so the outer borrow is a
+/// suspended frame on this stack, not another thread's. Two live `&mut` to one
+/// cell is undefined under stacked/tree borrows.
+///
+/// It has not been observed to miscompile: the walker only rewrites `GcRef`
+/// slots in place (moving-GC forwarding) and the outer borrow re-reads them as
+/// forwarded pointers when it resumes. That explains why it survives; it does
+/// not license the aliasing.
+///
+/// The minimum sound configuration is a load-bearing triple — dropping any one
+/// leg leaves the aliasing intact:
+///   1. this walker stops forming a `&mut` (or `&`) to the pair;
+///   2. `driver_pair()` stops returning `&'static mut` — the exclusivity is
+///      minted there, and that is what invalidates every other access;
+///   3. the GC-visible root fields (`compiled_loops` / `partial_trace` /
+///      `exported_state` / `framestack` / `tracing`) move behind interior
+///      mutability.
+///
+/// Wrapping the fields alone does NOT help: `UnsafeCell` only opts out of the
+/// immutability of `&T`, while a `&mut T` retag is `Unique` over the whole
+/// pointee, UnsafeCell bytes included. Nor does switching this walker to raw
+/// pointers: its `data` is captured at registration, so its tag sits below the
+/// outer `&mut`'s on the borrow stack and even a read through it pops that tag.
 unsafe fn jit_driver_pair_from_root_area(data: *const ()) -> Option<&'static mut JitDriverPair> {
     let cell = unsafe { &*(data as *const UnsafeCell<Option<JitDriverPair>>) };
     unsafe { (&mut *cell.get()).as_mut() }
