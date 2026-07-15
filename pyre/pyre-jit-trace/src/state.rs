@@ -12345,6 +12345,8 @@ mod tests {
                 pcdep_trivia_pred_by_jit_pc: Vec::new(),
                 const_ref_trivia_marker_by_jit_pc: Vec::new(),
                 const_ref_trivia_pred_by_jit_pc: Vec::new(),
+                result_color_trivia_marker_by_jit_pc: Vec::new(),
+                result_color_trivia_pred_by_jit_pc: Vec::new(),
                 resume_marker_marker_by_jit_pc: Vec::new(),
                 resume_marker_pred_by_jit_pc: vec![(0, Some(0))],
                 after_residual_marker_marker_by_jit_pc: Vec::new(),

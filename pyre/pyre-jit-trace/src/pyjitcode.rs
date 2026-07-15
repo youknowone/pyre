@@ -148,6 +148,13 @@ pub struct PyJitCodeMetadata {
     pub const_ref_trivia_marker_by_jit_pc: Vec<(usize, Vec<(u16, i64)>)>,
     /// Predecessor-op-start tier of the trivia-aware `const_ref_slots_at_pc` twin.
     pub const_ref_trivia_pred_by_jit_pc: Vec<(usize, Vec<(u16, i64)>)>,
+    /// #73-core: trivia-aware twin of `result_color_at_pc`, split into the
+    /// SAME exact-marker / predecessor-op-start tiers as the depth-trivia
+    /// twin. Each entry records
+    /// `result_color_at_pc[skip_python_trivia_forward(py)]`, including an
+    /// out-of-range trailing-trivia overshoot as `None`.
+    pub result_color_trivia_marker_by_jit_pc: Vec<(usize, Option<u16>)>,
+    pub result_color_trivia_pred_by_jit_pc: Vec<(usize, Option<u16>)>,
     /// task#73 S5 phase-0: resume-marker twin split into the SAME two tiers as
     /// `python_pc_for_jitcode_pc` — an EXACT-match marker table
     /// (`resume_marker_marker_by_jit_pc`, block-head precedence) and a
@@ -656,6 +663,26 @@ impl PyJitCode {
         Self::predecessor_index(search).map(|i| pred[i].1.as_slice())
     }
 
+    /// #73-core: trivia-aware result color keyed by a JitCode byte offset,
+    /// resolved with the SAME two tiers as `python_pc_for_jitcode_pc`.
+    /// Equals
+    /// `result_color_at_pc[skip_python_trivia_forward(python_pc_for_jitcode_pc(jit_pc))]`
+    /// by construction, including a trailing-trivia overshoot as `None`.
+    /// `None` when the twin is empty (skeleton / fixture) — distinguish that
+    /// from an in-table `None` via [`Self::result_color_trivia_populated`].
+    pub fn result_color_trivia_for_jitcode_pc(&self, jit_pc: usize) -> Option<u16> {
+        let marker = &self.metadata.result_color_trivia_marker_by_jit_pc;
+        let pred = &self.metadata.result_color_trivia_pred_by_jit_pc;
+        if marker.is_empty() && pred.is_empty() {
+            return None;
+        }
+        if let Ok(i) = marker.binary_search_by_key(&jit_pc, |&(off, _)| off) {
+            return marker[i].1;
+        }
+        let search = pred.binary_search_by_key(&jit_pc, |&(off, _)| off);
+        Self::predecessor_index(search).and_then(|i| pred[i].1)
+    }
+
     /// task#73 S5 phase-0: codewrite-time resume marker keyed by a JitCode byte
     /// offset, resolved with the SAME two tiers as `python_pc_for_jitcode_pc`:
     /// an EXACT marker match first (block-head precedence), else a PREDECESSOR
@@ -715,6 +742,17 @@ impl PyJitCode {
     pub fn depth_trivia_populated(&self) -> bool {
         !self.metadata.depth_trivia_marker_by_jit_pc.is_empty()
             || !self.metadata.depth_trivia_pred_by_jit_pc.is_empty()
+    }
+
+    /// Whether the trivia-aware result-color twin carries entries. `false`
+    /// distinguishes a skeleton / fixture from an in-table `None` caused by a
+    /// trailing-trivia overshoot.
+    pub fn result_color_trivia_populated(&self) -> bool {
+        !self
+            .metadata
+            .result_color_trivia_marker_by_jit_pc
+            .is_empty()
+            || !self.metadata.result_color_trivia_pred_by_jit_pc.is_empty()
     }
 
     /// Resolve a guard frame from its carried direct JitCode coordinate.
@@ -806,6 +844,8 @@ impl PyJitCode {
                 pcdep_trivia_pred_by_jit_pc: Vec::new(),
                 const_ref_trivia_marker_by_jit_pc: Vec::new(),
                 const_ref_trivia_pred_by_jit_pc: Vec::new(),
+                result_color_trivia_marker_by_jit_pc: Vec::new(),
+                result_color_trivia_pred_by_jit_pc: Vec::new(),
                 resume_marker_marker_by_jit_pc: Vec::new(),
                 resume_marker_pred_by_jit_pc: Vec::new(),
                 after_residual_marker_marker_by_jit_pc: Vec::new(),

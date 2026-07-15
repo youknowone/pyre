@@ -12783,6 +12783,8 @@ impl CodeWriter {
         let mut pcdep_trivia_pred_by_jit_pc: Vec<(usize, Vec<(u8, u16, u16)>)> = Vec::new();
         let mut const_ref_trivia_marker_by_jit_pc: Vec<(usize, Vec<(u16, i64)>)> = Vec::new();
         let mut const_ref_trivia_pred_by_jit_pc: Vec<(usize, Vec<(u16, i64)>)> = Vec::new();
+        let mut result_color_trivia_marker_by_jit_pc: Vec<(usize, Option<u16>)> = Vec::new();
+        let mut result_color_trivia_pred_by_jit_pc: Vec<(usize, Option<u16>)> = Vec::new();
         let mut resume_marker_marker_by_jit_pc: Vec<(usize, Option<usize>)> = Vec::new();
         let mut resume_marker_pred_by_jit_pc: Vec<(usize, Option<usize>)> = Vec::new();
         let mut after_residual_marker_marker_by_jit_pc: Vec<(usize, Option<usize>)> = Vec::new();
@@ -12839,10 +12841,13 @@ impl CodeWriter {
                         .cloned()
                         .unwrap_or_default(),
                 ));
+                let result_color_trivia = result_color_at_pc.get(skipped_py).copied();
+                result_color_trivia_marker_by_jit_pc.push((off, result_color_trivia));
             }
             depth_trivia_marker_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
             pcdep_trivia_marker_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
             const_ref_trivia_marker_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
+            result_color_trivia_marker_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
             // Op-start tier: predecessor scan, markers EXCLUDED.
             for (py, &pos) in first_jit_pc_by_py_pc.iter().enumerate() {
                 if pos != usize::MAX {
@@ -12864,11 +12869,14 @@ impl CodeWriter {
                             .cloned()
                             .unwrap_or_default(),
                     ));
+                    let result_color_trivia = result_color_at_pc.get(skipped_py).copied();
+                    result_color_trivia_pred_by_jit_pc.push((pos, result_color_trivia));
                 }
             }
             depth_trivia_pred_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
             pcdep_trivia_pred_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
             const_ref_trivia_pred_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
+            result_color_trivia_pred_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
             // Marker tier: exact-match, block-head precedence.
             for &(off, py) in &block_head_py_by_jit_pc {
                 let skipped_py =
@@ -12977,6 +12985,8 @@ impl CodeWriter {
             pcdep_trivia_pred_by_jit_pc,
             const_ref_trivia_marker_by_jit_pc,
             const_ref_trivia_pred_by_jit_pc,
+            result_color_trivia_marker_by_jit_pc,
+            result_color_trivia_pred_by_jit_pc,
             resume_marker_marker_by_jit_pc,
             resume_marker_pred_by_jit_pc,
             after_residual_marker_marker_by_jit_pc,
