@@ -7888,6 +7888,26 @@ pub(crate) fn fbw_inline_multiframe_enabled() -> bool {
     })
 }
 
+/// `PYRE_FBW_REC_MULTIFRAME` (default OFF): route primary-trace
+/// self-recursive Python calls through the multiframe inline path while below
+/// `PYRE_FBW_MULTIFRAME_DEPTH`, instead of folding immediately to the
+/// recursive portal `CALL_ASSEMBLER`.
+///
+/// RPython parity target: `opimpl_recursive_call` / `do_recursive_call`
+/// (`pyjitpl.py:1376-1432`) inline within `max_unroll_recursion`; once the
+/// cap is reached, recursion falls back to the assembler-call path.  Pyre keeps
+/// this route opt-in while the default remains the existing fold-only policy.
+pub(crate) fn fbw_rec_multiframe_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_REC_MULTIFRAME") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => false,
+    })
+}
+
 /// `PYRE_FBW_LOOP_CALLEE_CA` (gap-10, general loop-bearing-callee →
 /// CALL_ASSEMBLER): when a multi-frame inlined callee sub-walk reaches the
 /// callee's own `jit_merge_point` and a compiled loop token already exists
@@ -9292,6 +9312,38 @@ pub(crate) fn fbw_abort_carrier_clear() {
 /// every iteration exactly once) instead.  At top level (no active inline)
 /// the unjournaled-effect / legacy-replay path is sound, so only abort when
 /// nested.
+thread_local! {
+    /// Marks the self-recursive `CALL_ASSEMBLER` fold's concrete-stamp
+    /// executor call. RPython `do_residual_call` executes the recorded
+    /// residual at any framestack depth (`pyjitpl.py:2019-2044`), while
+    /// pyre's nested-residual decline below is a local protection for
+    /// FOREIGN unjournaled residuals.
+    static SELFREC_CA_FOLD_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Scoped setter for [`SELFREC_CA_FOLD_ACTIVE`]. Restores the prior value so
+/// nested folds and early `?` unwinds cannot strand the exemption enabled.
+struct SelfRecCaFoldGuard {
+    prior: bool,
+}
+
+impl SelfRecCaFoldGuard {
+    fn enter() -> Self {
+        let prior = SELFREC_CA_FOLD_ACTIVE.with(|c| {
+            let prior = c.get();
+            c.set(true);
+            prior
+        });
+        Self { prior }
+    }
+}
+
+impl Drop for SelfRecCaFoldGuard {
+    fn drop(&mut self) {
+        SELFREC_CA_FOLD_ACTIVE.with(|c| c.set(self.prior));
+    }
+}
+
 fn fbw_abort_nested_unjournaled_residual(
     ctx: &WalkContext<'_, '_>,
     pc: usize,
@@ -9303,7 +9355,12 @@ fn fbw_abort_nested_unjournaled_residual(
         std::env::var_os("PYRE_FBW_NESTED_RESID_ABORT").as_deref()
             != Some(std::ffi::OsStr::new("0"))
     });
-    if enabled && !ctx.session.borrow().framestack.is_empty() {
+    // RPython `do_residual_call` runs the residual executor at any framestack
+    // depth (`pyjitpl.py:2019-2044`). Exempt only the self-recursive
+    // `CALL_ASSEMBLER` fold's concrete-stamp executor from this pyre-local
+    // nested-decline guard, which is for FOREIGN unjournaled residuals.
+    let in_selfrec_fold = SELFREC_CA_FOLD_ACTIVE.with(|c| c.get());
+    if enabled && !in_selfrec_fold && !ctx.session.borrow().framestack.is_empty() {
         let (outer_resume_py_pc, stack_overrides) = {
             let session = ctx.session.borrow();
             match session.framestack.first().and_then(|f| f.parent.as_ref()) {
@@ -14140,14 +14197,17 @@ fn try_walker_call_assembler_self_recursive(
     // standing exception state on a raise.
     let argbox_types: Vec<Type> = vec![Type::Ref; r_args.len()];
     let allboxes = build_allboxes(funcptr, r_args, &argbox_types, call_descr.arg_types());
-    let exec = try_execute_residual_call_via_executor(
-        ctx,
-        OpCode::CallMayForceR,
-        &allboxes,
-        call_descr,
-        ca_result,
-        op.pc,
-    )?;
+    let exec = {
+        let _selfrec_ca_fold_guard = SelfRecCaFoldGuard::enter();
+        try_execute_residual_call_via_executor(
+            ctx,
+            OpCode::CallMayForceR,
+            &allboxes,
+            call_descr,
+            ca_result,
+            op.pc,
+        )?
+    };
     // A decline leaves the CALL_ASSEMBLER recorded symbolically WITHOUT
     // running it — a side effect only the legacy replay applies, so the
     // walk-end no-replay commit must stay off for this trace (see
@@ -14604,26 +14664,19 @@ fn try_walker_inline_user_call(
                     as *const ()
             } as usize
                 == w_code as usize;
-        if ctx.fbw_mode.carrier_resume && std::env::var_os("PYRE_P2_DIAG").is_some() {
-            eprintln!(
-                "[p2-diag] nested call pc={} self_recursive={self_recursive} strict_inlinable={strict_inlinable} recursion_count={}",
-                op.pc,
-                fbw_inline_recursion_count(ctx, callee_code_key)
-            );
-        }
         if self_recursive {
-            // A bridge-carrier resume is the deopt continuation of an
-            // already-compiled recursive portal, so a nested self-recursive
-            // call folds straight to the recursive-portal `CALL_ASSEMBLER`
-            // rather than re-unrolling the call tree (which would bottom out at
-            // the multiframe depth cap).
-            if ctx.fbw_mode.carrier_resume {
+            // RPython `opimpl_recursive_call` / `do_recursive_call`
+            // (`pyjitpl.py:1376-1432`) unroll within `max_unroll_recursion`,
+            // then falls back to the assembler-call path.  Keep pyre's
+            // default fold-only route unchanged; the opt-in flag lets a
+            // primary trace spend the multiframe budget on recursion unrolls.
+            let unroll = fbw_rec_multiframe_enabled()
+                && !ctx.fbw_mode.carrier_resume
+                && ctx.session.borrow().framestack.len() < fbw_max_multiframe_depth();
+            if !unroll {
                 return Ok(None);
             }
-            // A self-recursive all-int callee folds to the recursive-portal
-            // `CALL_ASSEMBLER` tail.  Other self-recursive shapes decline from
-            // that fold to the plain residual call.
-            return Ok(None);
+            // fall through to the multiframe gate (unroll one level)
         }
     }
     // #68: under `PYRE_FBW_INLINE_MULTIFRAME`, a forward-branch-bearing callee
