@@ -5898,17 +5898,37 @@ fn reconstruct_inline_recipe(
         None
     };
     let mut reg_indices = frame_liveness_reg_indices_by_bank_from_pc(frame.jitcode_index, frame.pc);
+    // The encoder enumerates live boxes in bank order [int | ref | float] and
+    // `frame.values` mirrors that order. A pending call-result color (the dst of
+    // an in-flight residual call) is removed from the ref bank below because the
+    // framestack walk delivers that value via `make_result_of_lastop`, not from
+    // resumedata. Drop its encoded value from the SAME position so the liveness
+    // enumeration and the consumed value section stay aligned
+    // (resume.py:1054 consume_boxes).
+    let mut pending_value_index: Option<usize> = None;
     if let Some(color) = pending_result_color {
         if reg_indices.int.iter().any(|&c| c as usize == color)
             || reg_indices.float.iter().any(|&c| c as usize == color)
         {
             return None;
         }
-        reg_indices.ref_.retain(|&c| c as usize != color);
+        if let Some(ref_pos) = reg_indices.ref_.iter().position(|&c| c as usize == color) {
+            pending_value_index = Some(reg_indices.int.len() + ref_pos);
+            reg_indices.ref_.remove(ref_pos);
+        }
     }
+    let values: Vec<&majit_ir::resumedata::RebuiltValue> = match pending_value_index {
+        Some(idx) => frame
+            .values
+            .iter()
+            .enumerate()
+            .filter_map(|(i, v)| if i == idx { None } else { Some(v) })
+            .collect(),
+        None => frame.values.iter().collect(),
+    };
     // resume.py:1054 consume_boxes: the liveness enumeration count must match
-    // the encoded frame section exactly.
-    if reg_indices.total_len() != frame.values.len() {
+    // the (pending-excluded) encoded frame section exactly.
+    if reg_indices.total_len() != values.len() {
         return None;
     }
     // virtualizable.py:86-98: at a bytecode boundary (every resume pc is one)
@@ -5943,7 +5963,7 @@ fn reconstruct_inline_recipe(
     {
         use majit_ir::resumedata::{RebuiltValue, TAGVIRTUAL, UNINITIALIZED_TAG, untag};
         let frame_pos = reg_indices.ref_.iter().position(|&c| c == pframe_reg)?;
-        let RebuiltValue::Virtual(frame_vidx) = &frame.values[frame_pos] else {
+        let RebuiltValue::Virtual(frame_vidx) = values[frame_pos] else {
             return None;
         };
         // The `frame` red virtual is a PyFrame VirtualInfo; its
@@ -6082,7 +6102,7 @@ fn reconstruct_inline_recipe(
     for &reg_idx in &reg_indices.int {
         let (op, _val) = bridge_decode_box(
             ctx,
-            &frame.values[value_cursor],
+            values[value_cursor],
             Type::Int,
             rd_virtuals,
             resume_data,
@@ -6101,7 +6121,7 @@ fn reconstruct_inline_recipe(
     for &reg_idx in &reg_indices.ref_ {
         let (op, val) = bridge_decode_box(
             ctx,
-            &frame.values[value_cursor],
+            values[value_cursor],
             Type::Ref,
             rd_virtuals,
             resume_data,
@@ -6122,7 +6142,7 @@ fn reconstruct_inline_recipe(
     for &reg_idx in &reg_indices.float {
         let (op, _val) = bridge_decode_box(
             ctx,
-            &frame.values[value_cursor],
+            values[value_cursor],
             Type::Float,
             rd_virtuals,
             resume_data,
