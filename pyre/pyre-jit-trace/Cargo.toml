@@ -51,3 +51,7 @@ walkdir = { workspace = true }
 [dev-dependencies]
 majit-ir = { workspace = true, features = ["test-support"] }
 insta = { workspace = true }
+# `#[test]`s here drive interpreter frames through `init_typeobjects` without
+# compiling pyre-interpreter under `cfg(test)`; enable its `test-hooks` feature
+# so the thread-local dict hash hook is installed on the test threads.
+pyre-interpreter = { workspace = true, features = ["test-hooks"] }

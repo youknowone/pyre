@@ -95,9 +95,12 @@ pub mod pyframe;
 /// unit tests that build object- or str-keyed dicts must install the same
 /// single hash path on their own thread, because
 /// `pyre_object::dict_eq_hook` stores the hook thread-locally and libtest
-/// runs each `#[test]` on a fresh thread.
-#[cfg(test)]
-pub(crate) mod test_hooks {
+/// runs each `#[test]` on a fresh thread.  The `test-hooks` feature exposes
+/// the module to downstream test builds (`pyre-jit`'s dev-dependency enables
+/// it) whose `#[test]`s drive interpreter frames through `init_typeobjects`
+/// without compiling this crate under `cfg(test)`.
+#[cfg(any(test, feature = "test-hooks"))]
+pub mod test_hooks {
     use pyre_object::PyObjectRef;
 
     /// `baseobjspace.py:840-845 hash_w` — the single hash entry point,
@@ -121,8 +124,10 @@ pub(crate) mod test_hooks {
 
     /// Install the real `hash_w` and `hash_str` on the current test thread.
     /// Call at the top of any `#[test]` that constructs an object/str-keyed
-    /// dict.
-    pub(crate) fn install_hash_hook() {
+    /// dict.  Public (under the same gate) so downstream test builds that
+    /// enable `test-hooks` can install the hook at their own test chokepoints
+    /// for `#[test]`s that never reach `init_typeobjects`.
+    pub fn install_hash_hook() {
         pyre_object::dict_eq_hook::register_hash_w_hook(test_hash_w);
         pyre_object::dict_eq_hook::register_hash_str_hook(test_hash_str);
     }

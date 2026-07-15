@@ -375,6 +375,7 @@ mod tests {
 
     #[test]
     fn reads_prompt_from_sys_module() {
+        pyre_interpreter::test_hooks::install_hash_hook();
         let canonical = pyre_object::w_module_dict_new();
         unsafe {
             pyre_object::w_dict_setitem_str(canonical, "ps1", pyre_object::w_str_new("py> "));

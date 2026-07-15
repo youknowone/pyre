@@ -56,4 +56,4 @@ majit-backend-wasm = { path = "../../majit/majit-backend-wasm", version = "0.0.2
 [dev-dependencies]
 pyre-jit-trace = { workspace = true, features = ["test-support"] }
 pyre-object = { workspace = true }
-pyre-interpreter = { workspace = true }
+pyre-interpreter = { workspace = true, features = ["test-hooks"] }

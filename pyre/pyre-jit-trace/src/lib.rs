@@ -45,6 +45,14 @@ pub mod virtualizable_gen;
 pub mod virtualizable_spec;
 pub mod walker_frame_ops;
 
+/// Build a standalone trace context on a libtest thread after installing the
+/// interpreter's test-only dict hash hooks for that thread.
+#[cfg(test)]
+pub(crate) fn trace_ctx_for_test(num_inputs: usize) -> majit_metainterp::TraceCtx {
+    pyre_interpreter::test_hooks::install_hash_hook();
+    majit_metainterp::TraceCtx::for_test(num_inputs)
+}
+
 // pyre-jit-trace local invariant: PyFrame's `_virtualizable_` declares
 // exactly one extra red (ec, see `virtualizable_gen.rs:29-31` and
 // `pypy/module/pypyjit/interp_jit.py:67 reds = ['frame', 'ec']`).

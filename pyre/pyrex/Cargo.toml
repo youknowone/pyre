@@ -57,3 +57,9 @@ mimalloc = { version = "0.1", optional = true }
 # unix-only; on other targets `pyre-sandbox` is neither referenced nor linked.
 [target.'cfg(unix)'.dependencies]
 pyre-sandbox = { workspace = true }
+
+[dev-dependencies]
+# The repl `#[test]`s build str-keyed dicts without booting the JIT (which is
+# where production installs the hash hook), so enable pyre-interpreter's
+# `test-hooks` feature to install the thread-local hook on the test threads.
+pyre-interpreter = { workspace = true, features = ["test-hooks"] }

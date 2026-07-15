@@ -9949,7 +9949,7 @@ mod tests {
         sym.registers_r = vec![OpRef::NONE, ref_box];
         sym.registers_f = vec![OpRef::NONE, OpRef::NONE, OpRef::NONE, float_box];
 
-        let mut ctx = TraceCtx::for_test(1);
+        let mut ctx = crate::trace_ctx_for_test(1);
         let mut frame = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
@@ -10045,7 +10045,7 @@ mod tests {
         // reusing dead local0's color.
         sym.registers_r = vec![local0, local1, stack0];
 
-        let mut ctx = TraceCtx::for_test(1);
+        let mut ctx = crate::trace_ctx_for_test(1);
         let mut frame = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,

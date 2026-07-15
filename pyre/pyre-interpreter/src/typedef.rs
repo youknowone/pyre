@@ -234,9 +234,10 @@ pub fn init_typeobjects() {
     // here — the single type-system entry every dict-building test funnels
     // through — before the builtin type namespaces (GC dicts) are built or
     // probed.  Production installs the hook at boot (`pyre-jit::eval::
-    // init_jit_hooks`); this `cfg(test)` call is compiled out of every
-    // non-test build.
-    #[cfg(test)]
+    // init_jit_hooks`); this call is compiled out of every non-test build
+    // (gated on `cfg(test)` here, or the `test-hooks` feature that
+    // downstream test builds such as `pyre-jit` enable via a dev-dependency).
+    #[cfg(any(test, feature = "test-hooks"))]
     crate::test_hooks::install_hash_hook();
     TYPEOBJECT_CACHE.get_or_init(|| {
         // Seed preorder `subclassrange_{min,max}` on every PyType

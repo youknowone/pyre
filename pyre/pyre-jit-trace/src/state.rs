@@ -10550,7 +10550,7 @@ mod tests {
 
     #[test]
     fn test_reraise_reuses_last_exception_object() {
-        let mut ctx = TraceCtx::for_test(1);
+        let mut ctx = crate::trace_ctx_for_test(1);
         let exc = pyre_interpreter::PyError::runtime_error("boom").to_exc_object();
         let exc_opref = ctx.const_ref(exc as i64);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
@@ -10589,7 +10589,7 @@ mod tests {
 
     #[test]
     fn test_reraise_nonzero_oparg_threads_saved_lasti() {
-        let mut ctx = TraceCtx::for_test(1);
+        let mut ctx = crate::trace_ctx_for_test(1);
         let exc = pyre_interpreter::PyError::runtime_error("boom").to_exc_object();
         let exc_opref = ctx.const_ref(exc as i64);
         // pyopcode.py:165-170 lasti push synthesizes
@@ -10639,7 +10639,7 @@ mod tests {
 
     #[test]
     fn test_reraise_nonconst_lasti_signals_abort_to_dispatcher() {
-        let mut ctx = TraceCtx::for_test(1);
+        let mut ctx = crate::trace_ctx_for_test(1);
         let exc = pyre_interpreter::PyError::runtime_error("boom").to_exc_object();
         let exc_opref = ctx.const_ref(exc as i64);
         // Non-Int slot at peek(oparg): an exception object stands in for
@@ -10684,7 +10684,7 @@ mod tests {
 
     #[test]
     fn test_raise_varargs_zero_reuses_last_exception_object() {
-        let mut ctx = TraceCtx::for_test(1);
+        let mut ctx = crate::trace_ctx_for_test(1);
         let exc = pyre_interpreter::PyError::runtime_error("boom").to_exc_object();
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
         sym.last_exc_value = exc;
@@ -10716,7 +10716,7 @@ mod tests {
 
     #[test]
     fn test_raise_varargs_seeds_last_exception_box_for_finishframe_exception() {
-        let mut ctx = TraceCtx::for_test(1);
+        let mut ctx = crate::trace_ctx_for_test(1);
         let exc = pyre_interpreter::PyError::runtime_error("boom").to_exc_object();
         let exc_ref = ctx.const_ref(exc as i64);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
@@ -10753,7 +10753,7 @@ mod tests {
 
     #[test]
     fn test_raise_varargs_rejects_non_exception_values_like_interpreter() {
-        let mut ctx = TraceCtx::for_test(1);
+        let mut ctx = crate::trace_ctx_for_test(1);
         let bad = pyre_object::w_int_new(7);
         let bad_ref = ctx.const_ref(bad as i64);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
@@ -10798,7 +10798,7 @@ mod tests {
         let ty = unsafe { pyre_object::w_dict_getitem_str(frame.get_w_globals(), "x") }
             .expect("namespace should contain x");
 
-        let mut ctx = TraceCtx::for_test(1);
+        let mut ctx = crate::trace_ctx_for_test(1);
         let ty_ref = ctx.const_ref(ty as i64);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
         let mut state = MIFrame {
@@ -10841,7 +10841,7 @@ mod tests {
         let callable = unsafe { pyre_object::w_dict_getitem_str(frame.get_w_globals(), "x") }
             .expect("namespace should contain x");
 
-        let mut ctx = TraceCtx::for_test(1);
+        let mut ctx = crate::trace_ctx_for_test(1);
         let callable_ref = ctx.const_ref(callable as i64);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
         let mut state = MIFrame {
@@ -10876,7 +10876,7 @@ mod tests {
 
     #[test]
     fn test_raise_varargs_sets_cause_like_interpreter() {
-        let mut ctx = TraceCtx::for_test(1);
+        let mut ctx = crate::trace_ctx_for_test(1);
         let exc = pyre_interpreter::PyError::runtime_error("boom").to_exc_object();
         let cause = pyre_interpreter::PyError::value_error("root").to_exc_object();
         let exc_ref = ctx.const_ref(exc as i64);
@@ -10921,7 +10921,7 @@ mod tests {
 
     #[test]
     fn test_raise_varargs_rejects_invalid_cause_like_interpreter() {
-        let mut ctx = TraceCtx::for_test(1);
+        let mut ctx = crate::trace_ctx_for_test(1);
         let exc = pyre_interpreter::PyError::runtime_error("boom").to_exc_object();
         let cause = pyre_object::w_int_new(5);
         let exc_ref = ctx.const_ref(exc as i64);
@@ -10989,7 +10989,7 @@ mod tests {
         let _saved_ctx = ExecCtxRestore(pyre_interpreter::call::take_last_exec_ctx());
         pyre_interpreter::call::set_last_exec_ctx(frame.execution_context);
 
-        let mut ctx = TraceCtx::for_test(1);
+        let mut ctx = crate::trace_ctx_for_test(1);
         let prev_exc_ref = ctx.const_ref(prev_exc as i64);
         let caught_exc_ref = ctx.const_ref(caught_exc as i64);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
@@ -11128,7 +11128,7 @@ mod tests {
 
     #[test]
     fn test_pypyjit_collect_jump_args_inserts_ec_after_frame() {
-        let mut ctx = TraceCtx::for_test(0);
+        let mut ctx = crate::trace_ctx_for_test(0);
         let frame_ref = ctx.const_ref(0x1000);
         let ec_ref = ctx.const_ref(0x7000);
         let code_ref = ctx.const_ref(0x2000);
@@ -11262,7 +11262,7 @@ mod tests {
     #[ignore = "PyreSym::new_uninit hits the Phase X-1 skeleton-panic since the \
                 debug-only fallback was removed; needs a populated-jitcode harness."]
     fn test_guard_class_uses_guard_nonnull_class() {
-        let mut ctx = TraceCtx::for_test(1);
+        let mut ctx = crate::trace_ctx_for_test(1);
         // registers_r[i] tracks locals_cells_stack_w[*] — W_Root array, Type::Ref.
         let obj = OpRef::input_arg_ref(0);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
@@ -11362,7 +11362,7 @@ mod tests {
 
     #[test]
     fn test_trace_unbox_int_with_resume_skips_guard_for_constant_object() {
-        let mut ctx = TraceCtx::for_test(0);
+        let mut ctx = crate::trace_ctx_for_test(0);
         let int_obj = ctx.const_ref(w_int_new(7) as i64);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
 
@@ -11415,7 +11415,7 @@ mod tests {
             .expect("namespace should contain c");
 
         install_test_jitcode(&code, frame.pycode);
-        let mut ctx = TraceCtx::for_test(1);
+        let mut ctx = crate::trace_ctx_for_test(1);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
         sym.jitcode = jitcode_for(frame.pycode);
 
@@ -11468,7 +11468,7 @@ mod tests {
         frame.fix_array_ptrs();
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
         install_test_jitcode(&code, frame.pycode);
-        let mut ctx = TraceCtx::for_test(1);
+        let mut ctx = crate::trace_ctx_for_test(1);
         let mut sym = PyreSym::new_uninit(OpRef::input_arg_ref(0));
         sym.become_active_vable_owner();
 
@@ -11721,7 +11721,7 @@ mod tests {
                 debug-only fallback was removed; needs a populated-jitcode harness."]
     fn test_load_local_checked_value_respects_symbolic_local_type() {
         let run_case = |symbolic_type: Type, name: &str, expected_guard: Option<OpCode>| {
-            let mut ctx = TraceCtx::for_test(1);
+            let mut ctx = crate::trace_ctx_for_test(1);
             // The slot type matches `symbolic_type` (resoperation.py:719/727/739
             // InputArg{Int,Float,Ref}); Void has no inputarg variant in RPython.
             let local = OpRef::input_arg_typed(0, symbolic_type);
@@ -11776,7 +11776,7 @@ mod tests {
         let mut frame = PyFrame::new(code);
         frame.locals_w_mut()[0] = w_int_new(41);
         frame.fix_array_ptrs();
-        let mut ctx = TraceCtx::for_test(1);
+        let mut ctx = crate::trace_ctx_for_test(1);
         // Pre-wrapped Ref — this is the shape producers hand us.
         let ref_value = ctx.const_ref(pyre_object::PY_NULL as i64);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
@@ -11818,7 +11818,7 @@ mod tests {
             pyre_interpreter::w_code_new(Box::into_raw(Box::new(code.clone())) as *const ())
                 as *const ();
         install_test_jitcode(&code, code_ref);
-        let mut ctx = TraceCtx::for_test(2);
+        let mut ctx = crate::trace_ctx_for_test(2);
         let lhs = OpRef::input_arg_float(0);
         let rhs = OpRef::input_arg_int(1);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
@@ -11884,7 +11884,7 @@ mod tests {
             pyre_interpreter::w_code_new(Box::into_raw(Box::new(code.clone())) as *const ())
                 as *const ();
         install_test_jitcode(&code, code_ref);
-        let mut ctx = TraceCtx::for_test(2);
+        let mut ctx = crate::trace_ctx_for_test(2);
         let callable = OpRef::input_arg_ref(0);
         let arg = OpRef::input_arg_int(1);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
@@ -11959,7 +11959,7 @@ mod tests {
         frame.fix_array_ptrs();
         let _frame_ptr = (&mut *frame) as *mut PyFrame as usize;
 
-        let mut ctx = TraceCtx::for_test(2);
+        let mut ctx = crate::trace_ctx_for_test(2);
         // Typed `InputArgInt` inputarg slots — `compare_value_direct`
         // routes through `is_int_typed` lookups (history.py:220
         // box.type) and Untyped slots silently fall through to the
@@ -12050,7 +12050,7 @@ mod tests {
         frame.fix_array_ptrs();
         let _frame_ptr = (&mut *frame) as *mut PyFrame as usize;
 
-        let mut ctx = TraceCtx::for_test(2);
+        let mut ctx = crate::trace_ctx_for_test(2);
         // Typed `InputArgInt` inputarg slots — `compare_value_direct`
         // routes through `is_int_typed` lookups (history.py:220
         // box.type) and Untyped slots silently fall through to the
@@ -12153,7 +12153,7 @@ mod tests {
         let mut frame = PyFrame::new(code.clone());
         frame.fix_array_ptrs();
 
-        let mut ctx = TraceCtx::for_test(2);
+        let mut ctx = crate::trace_ctx_for_test(2);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
         sym.valuestackdepth = 0;
         sym.jitcode = jitcode_for(code_ref);
@@ -12238,7 +12238,7 @@ mod tests {
         assert_eq!(sym.registers_r.len(), 0);
         assert_eq!(sym.registers_f.len(), 0);
 
-        let mut ctx = TraceCtx::for_test(1);
+        let mut ctx = crate::trace_ctx_for_test(1);
         sym.setup_kind_register_banks(&mut ctx);
 
         // bank size = num_regs_X + len(constants_X)
@@ -12329,7 +12329,7 @@ mod tests {
     fn test_setup_kind_register_banks_is_no_op_for_null_jitcode_placeholder() {
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
         // sym.jitcode was initialized by new_uninit to null_jitcode().
-        let mut ctx = TraceCtx::for_test(1);
+        let mut ctx = crate::trace_ctx_for_test(1);
         sym.setup_kind_register_banks(&mut ctx);
         assert_eq!(sym.registers_i.len(), 0);
         assert_eq!(sym.registers_f.len(), 0);
