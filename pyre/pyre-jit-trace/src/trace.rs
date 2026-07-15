@@ -2269,11 +2269,13 @@ fn probe_walk_perfn_jitcode(
 /// tail — double-running its side effects and leaving the frame positioned
 /// past the loop.  The walk's reactive `abort_permanent` decline
 /// never fires because the corrupted guard exits before reaching the
-/// marker.  When the loop is not inside a `try`, the scan is scoped to ops
-/// after the first `jit_merge_point` and before the loop's final back-edge, so
-/// neither a prologue-only marker (e.g. `COPY_FREE_VARS` ahead of a clean hot
-/// loop) nor a post-loop marker over-declines the loop.  A loop covered by an
-/// exception handler keeps the full-tail scan so a post-loop
+/// marker.  The scan is anchored at the merge point governing the loop being
+/// traced, so a marker in a preceding sibling loop cannot decline a clean
+/// following loop.  When the loop is not inside a `try`, the scan is scoped to
+/// ops after that merge point and before the loop's final back-edge, so neither
+/// a prologue-only marker (e.g. `COPY_FREE_VARS` ahead of a clean hot loop) nor
+/// a post-loop marker over-declines the loop.  A loop covered by an exception
+/// handler keeps the full-tail scan so a post-loop
 /// `abort_permanent` (e.g. the `DELETE_FAST` cleanup for `except X as e`)
 /// still declines it, because compiled-loop delivery of an uncaught raise to
 /// the handler is not yet supported.
@@ -2282,9 +2284,19 @@ fn loop_body_has_abort_permanent(w_code: *const (), start_pc: usize) -> bool {
         return false;
     };
     let code = pjc.jitcode.code.as_slice();
-    let Some(merge_point) = crate::jitcode_runtime::decoded_ops(code)
-        .find(|op| op.opname == "jit_merge_point")
-        .map(|op| op.pc)
+    let Some(merge_point) = pjc
+        .merge_entry_for(start_pc)
+        .and_then(|entry| {
+            crate::jitcode_runtime::decoded_ops(code)
+                .filter(|op| op.opname == "jit_merge_point" && op.pc >= entry)
+                .map(|op| op.pc)
+                .min()
+        })
+        .or_else(|| {
+            crate::jitcode_runtime::decoded_ops(code)
+                .find(|op| op.opname == "jit_merge_point")
+                .map(|op| op.pc)
+        })
     else {
         return false;
     };
