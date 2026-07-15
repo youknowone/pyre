@@ -6,7 +6,7 @@
 //! typed fields, `pyre_object::interp_sre`).
 
 use crate::{
-    DictStorage, dict_storage_store, make_builtin_function, make_builtin_function_with_arity,
+    module_ns_store, make_builtin_function, make_builtin_function_with_arity,
     make_module_builtin_function, make_module_builtin_function_with_arity,
 };
 use pyre_object::interp_sre::{
@@ -17,21 +17,21 @@ use pyre_object::*;
 use sre_engine::engine::{Request, SearchIter, State};
 use sre_engine::string::StrDrive;
 
-pub fn register_module(ns: &mut DictStorage) {
+pub fn register_module(ns: pyre_object::PyObjectRef) {
     // Must equal `re/_constants.py:MAGIC` (the bundled stdlib) — `_compiler.py`
     // asserts `_sre.MAGIC == MAGIC` at import time.
-    dict_storage_store(ns, "MAGIC", w_int_new(20230612)); // SRE magic number
-    dict_storage_store(ns, "CODESIZE", w_int_new(sre_engine::CODESIZE as i64));
-    dict_storage_store(ns, "MAXREPEAT", w_int_new(sre_engine::MAXREPEAT as i64));
-    dict_storage_store(ns, "MAXGROUPS", w_int_new(sre_engine::MAXGROUPS as i64));
+    module_ns_store(ns, "MAGIC", w_int_new(20230612)); // SRE magic number
+    module_ns_store(ns, "CODESIZE", w_int_new(sre_engine::CODESIZE as i64));
+    module_ns_store(ns, "MAXREPEAT", w_int_new(sre_engine::MAXREPEAT as i64));
+    module_ns_store(ns, "MAXGROUPS", w_int_new(sre_engine::MAXGROUPS as i64));
     // _sre module-level functions: PyPy mixedmodule.py:111-116 wraps these
     // as BuiltinFunction so storing them on a user class does not bind self.
-    dict_storage_store(
+    module_ns_store(
         ns,
         "compile",
         make_module_builtin_function("compile", sre_compile),
     );
-    dict_storage_store(
+    module_ns_store(
         ns,
         "ascii_iscased",
         make_module_builtin_function_with_arity(
@@ -46,7 +46,7 @@ pub fn register_module(ns: &mut DictStorage) {
             1,
         ),
     );
-    dict_storage_store(
+    module_ns_store(
         ns,
         "unicode_iscased",
         make_module_builtin_function_with_arity(
@@ -61,7 +61,7 @@ pub fn register_module(ns: &mut DictStorage) {
             1,
         ),
     );
-    dict_storage_store(
+    module_ns_store(
         ns,
         "ascii_tolower",
         make_module_builtin_function_with_arity(
@@ -77,7 +77,7 @@ pub fn register_module(ns: &mut DictStorage) {
             1,
         ),
     );
-    dict_storage_store(
+    module_ns_store(
         ns,
         "unicode_tolower",
         make_module_builtin_function_with_arity(
@@ -92,7 +92,7 @@ pub fn register_module(ns: &mut DictStorage) {
             1,
         ),
     );
-    dict_storage_store(
+    module_ns_store(
         ns,
         "getcodesize",
         make_module_builtin_function_with_arity(
@@ -101,7 +101,7 @@ pub fn register_module(ns: &mut DictStorage) {
             0,
         ),
     );
-    dict_storage_store(
+    module_ns_store(
         ns,
         "getlower",
         make_module_builtin_function_with_arity(

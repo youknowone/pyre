@@ -1,7 +1,6 @@
 use malachite_bigint::BigInt;
 use num_traits::ToPrimitive;
 
-use crate::executioncontext::DictStorage;
 use crate::{
     make_builtin_function, make_builtin_function_with_arity, make_module_builtin_function,
     make_module_builtin_function_with_arity,
@@ -1619,14 +1618,14 @@ pub(crate) fn init_memoryview_type(ns: PyObjectRef) {
     }
 }
 
-pub fn install_default_builtins(namespace: &mut DictStorage) {
-    namespace.get_or_insert_with("print", || {
+pub fn install_default_builtins(ns: PyObjectRef) {
+    crate::module_ns_get_or_insert_with(ns, "print", || {
         make_module_builtin_function("print", builtin_print)
     });
-    namespace.get_or_insert_with("range", || {
+    crate::module_ns_get_or_insert_with(ns, "range", || {
         crate::typedef::gettypeobject(&pyre_object::functional::RANGE_TYPE)
     });
-    namespace.get_or_insert_with("len", || {
+    crate::module_ns_get_or_insert_with(ns, "len", || {
         // operation.py `len(space, w_obj)` — one positional-only `obj`, so
         // `len` no longer receives the `__pyre_kw__` marker dict and any
         // keyword is rejected with "takes no keyword arguments".
@@ -1637,7 +1636,7 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
             crate::gateway::Signature::new(vec!["obj"], None, None, 0, 1),
         )
     });
-    namespace.get_or_insert_with("abs", || {
+    crate::module_ns_get_or_insert_with(ns, "abs", || {
         // operation.py `abs(space, w_val)` — one positional-only `val`, so
         // `abs` no longer receives the `__pyre_kw__` marker dict and any
         // keyword is rejected with "takes no keyword arguments".
@@ -1648,153 +1647,159 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
             crate::gateway::Signature::new(vec!["val"], None, None, 0, 1),
         )
     });
-    namespace.get_or_insert_with("min", || make_module_builtin_function("min", builtin_min));
-    namespace.get_or_insert_with("max", || make_module_builtin_function("max", builtin_max));
-    namespace.get_or_insert_with("type", || crate::typedef::w_type());
-    namespace.get_or_insert_with("isinstance", || {
+    crate::module_ns_get_or_insert_with(ns, "min", || {
+        make_module_builtin_function("min", builtin_min)
+    });
+    crate::module_ns_get_or_insert_with(ns, "max", || {
+        make_module_builtin_function("max", builtin_max)
+    });
+    crate::module_ns_get_or_insert_with(ns, "type", || crate::typedef::w_type());
+    crate::module_ns_get_or_insert_with(ns, "isinstance", || {
         make_module_builtin_function_with_arity("isinstance", builtin_isinstance, 2)
     });
-    namespace.get_or_insert_with("str", || crate::typedef::gettypeobject(&STR_TYPE));
-    namespace.get_or_insert_with("repr", || {
+    crate::module_ns_get_or_insert_with(ns, "str", || crate::typedef::gettypeobject(&STR_TYPE));
+    crate::module_ns_get_or_insert_with(ns, "repr", || {
         make_module_builtin_function_with_arity("repr", builtin_repr, 1)
     });
-    namespace.get_or_insert_with("ascii", || {
+    crate::module_ns_get_or_insert_with(ns, "ascii", || {
         make_module_builtin_function_with_arity("ascii", builtin_ascii, 1)
     });
-    namespace.get_or_insert_with("int", || crate::typedef::gettypeobject(&INT_TYPE));
-    namespace.get_or_insert_with("float", || crate::typedef::gettypeobject(&FLOAT_TYPE));
-    namespace.get_or_insert_with("bool", || crate::typedef::gettypeobject(&BOOL_TYPE));
-    namespace.get_or_insert_with("True", || w_bool_from(true));
-    namespace.get_or_insert_with("False", || w_bool_from(false));
-    namespace.get_or_insert_with("None", || w_none());
-    namespace.get_or_insert_with("NotImplemented", || w_not_implemented());
-    namespace.get_or_insert_with("hasattr", || {
+    crate::module_ns_get_or_insert_with(ns, "int", || crate::typedef::gettypeobject(&INT_TYPE));
+    crate::module_ns_get_or_insert_with(ns, "float", || crate::typedef::gettypeobject(&FLOAT_TYPE));
+    crate::module_ns_get_or_insert_with(ns, "bool", || crate::typedef::gettypeobject(&BOOL_TYPE));
+    crate::module_ns_get_or_insert_with(ns, "True", || w_bool_from(true));
+    crate::module_ns_get_or_insert_with(ns, "False", || w_bool_from(false));
+    crate::module_ns_get_or_insert_with(ns, "None", || w_none());
+    crate::module_ns_get_or_insert_with(ns, "NotImplemented", || w_not_implemented());
+    crate::module_ns_get_or_insert_with(ns, "hasattr", || {
         make_module_builtin_function_with_arity("hasattr", builtin_hasattr, 2)
     });
-    namespace.get_or_insert_with("getattr", || {
+    crate::module_ns_get_or_insert_with(ns, "getattr", || {
         make_module_builtin_function("getattr", builtin_getattr)
     });
-    namespace.get_or_insert_with("setattr", || {
+    crate::module_ns_get_or_insert_with(ns, "setattr", || {
         make_module_builtin_function_with_arity("setattr", builtin_setattr, 3)
     });
-    namespace.get_or_insert_with("delattr", || {
+    crate::module_ns_get_or_insert_with(ns, "delattr", || {
         make_module_builtin_function_with_arity("delattr", builtin_delattr, 2)
     });
-    namespace.get_or_insert_with("tuple", || crate::typedef::gettypeobject(&TUPLE_TYPE));
-    namespace.get_or_insert_with("list", || crate::typedef::gettypeobject(&LIST_TYPE));
-    namespace.get_or_insert_with("dict", || crate::typedef::gettypeobject(&DICT_TYPE));
-    namespace.get_or_insert_with("object", || {
+    crate::module_ns_get_or_insert_with(ns, "tuple", || crate::typedef::gettypeobject(&TUPLE_TYPE));
+    crate::module_ns_get_or_insert_with(ns, "list", || crate::typedef::gettypeobject(&LIST_TYPE));
+    crate::module_ns_get_or_insert_with(ns, "dict", || crate::typedef::gettypeobject(&DICT_TYPE));
+    crate::module_ns_get_or_insert_with(ns, "object", || {
         // `object` is a W_TypeObject, not a builtin function.
         // PyPy: baseobjspace.py w_object = W_TypeObject("object", ...)
         crate::typedef::w_object()
     });
-    namespace.get_or_insert_with("super", || {
+    crate::module_ns_get_or_insert_with(ns, "super", || {
         make_module_builtin_function("super", builtin_super)
     });
-    namespace.get_or_insert_with("id", || {
+    crate::module_ns_get_or_insert_with(ns, "id", || {
         make_module_builtin_function_with_arity("id", builtin_id, 1)
     });
-    namespace.get_or_insert_with("hash", || {
+    crate::module_ns_get_or_insert_with(ns, "hash", || {
         make_module_builtin_function_with_arity("hash", builtin_hash, 1)
     });
-    namespace.get_or_insert_with("ord", || {
+    crate::module_ns_get_or_insert_with(ns, "ord", || {
         make_module_builtin_function_with_arity("ord", builtin_ord, 1)
     });
-    namespace.get_or_insert_with("chr", || {
+    crate::module_ns_get_or_insert_with(ns, "chr", || {
         make_module_builtin_function_with_arity("chr", builtin_chr, 1)
     });
-    namespace.get_or_insert_with("map", || {
+    crate::module_ns_get_or_insert_with(ns, "map", || {
         crate::typedef::gettypeobject(&pyre_object::functional::MAP_TYPE)
     });
-    namespace.get_or_insert_with("zip", || {
+    crate::module_ns_get_or_insert_with(ns, "zip", || {
         crate::typedef::gettypeobject(&pyre_object::functional::ZIP_TYPE)
     });
-    namespace.get_or_insert_with("enumerate", || {
+    crate::module_ns_get_or_insert_with(ns, "enumerate", || {
         crate::typedef::gettypeobject(&pyre_object::functional::ENUMERATE_TYPE)
     });
-    namespace.get_or_insert_with("reversed", || {
+    crate::module_ns_get_or_insert_with(ns, "reversed", || {
         crate::typedef::gettypeobject(&pyre_object::functional::REVERSED_TYPE)
     });
-    namespace.get_or_insert_with("sorted", || {
+    crate::module_ns_get_or_insert_with(ns, "sorted", || {
         make_module_builtin_function("sorted", builtin_sorted)
     });
-    namespace.get_or_insert_with("iter", || {
+    crate::module_ns_get_or_insert_with(ns, "iter", || {
         make_module_builtin_function("iter", builtin_iter)
     });
-    namespace.get_or_insert_with("next", || {
+    crate::module_ns_get_or_insert_with(ns, "next", || {
         make_module_builtin_function("next", builtin_next)
     });
-    namespace.get_or_insert_with("callable", || {
+    crate::module_ns_get_or_insert_with(ns, "callable", || {
         make_module_builtin_function_with_arity("callable", builtin_callable, 1)
     });
-    namespace.get_or_insert_with("vars", || {
+    crate::module_ns_get_or_insert_with(ns, "vars", || {
         make_module_builtin_function("vars", builtin_vars)
     });
-    namespace.get_or_insert_with("dir", || make_module_builtin_function("dir", builtin_dir));
-    namespace.get_or_insert_with("__build_class__", || {
+    crate::module_ns_get_or_insert_with(ns, "dir", || {
+        make_module_builtin_function("dir", builtin_dir)
+    });
+    crate::module_ns_get_or_insert_with(ns, "__build_class__", || {
         make_module_builtin_function("__build_class__", |args| {
             crate::call::real_build_class(args)
         })
     });
     // bytearrayobject.py W_BytearrayObject — register the real type
     // (callable as a constructor and usable in isinstance(x, bytearray)).
-    namespace.get_or_insert_with("bytearray", || {
+    crate::module_ns_get_or_insert_with(ns, "bytearray", || {
         crate::typedef::gettypeobject(&pyre_object::bytearrayobject::BYTEARRAY_TYPE)
     });
     // bytesobject.py W_BytesObject — immutable bytes type.
-    namespace.get_or_insert_with("bytes", || {
+    crate::module_ns_get_or_insert_with(ns, "bytes", || {
         crate::typedef::gettypeobject(&pyre_object::bytesobject::BYTES_TYPE)
     });
-    namespace.get_or_insert_with("slice", || {
+    crate::module_ns_get_or_insert_with(ns, "slice", || {
         // The slice type object, for isinstance(x, slice) checks.
         crate::typedef::gettypefor(&pyre_object::sliceobject::SLICE_TYPE)
             .unwrap_or(pyre_object::PY_NULL)
     });
-    namespace.get_or_insert_with("frozenset", || {
+    crate::module_ns_get_or_insert_with(ns, "frozenset", || {
         crate::typedef::gettypeobject(&pyre_object::setobject::FROZENSET_TYPE)
     });
-    namespace.get_or_insert_with("set", || {
+    crate::module_ns_get_or_insert_with(ns, "set", || {
         crate::typedef::gettypeobject(&pyre_object::setobject::SET_TYPE)
     });
-    namespace.get_or_insert_with("property", || {
+    crate::module_ns_get_or_insert_with(ns, "property", || {
         crate::typedef::gettypeobject(&pyre_object::descriptor::PROPERTY_TYPE)
     });
-    namespace.get_or_insert_with("staticmethod", || {
+    crate::module_ns_get_or_insert_with(ns, "staticmethod", || {
         crate::typedef::gettypeobject(&pyre_object::function::STATICMETHOD_TYPE)
     });
-    namespace.get_or_insert_with("classmethod", || {
+    crate::module_ns_get_or_insert_with(ns, "classmethod", || {
         crate::typedef::gettypeobject(&pyre_object::function::CLASSMETHOD_TYPE)
     });
-    namespace.get_or_insert_with("Ellipsis", || pyre_object::special::w_ellipsis());
-    namespace.get_or_insert_with("__debug__", || w_bool_from(true));
-    namespace.get_or_insert_with("memoryview", || {
+    crate::module_ns_get_or_insert_with(ns, "Ellipsis", || pyre_object::special::w_ellipsis());
+    crate::module_ns_get_or_insert_with(ns, "__debug__", || w_bool_from(true));
+    crate::module_ns_get_or_insert_with(ns, "memoryview", || {
         crate::typedef::gettypeobject(&pyre_object::memoryview::MEMORYVIEW_TYPE)
     });
-    namespace.get_or_insert_with("globals", || {
+    crate::module_ns_get_or_insert_with(ns, "globals", || {
         make_module_builtin_function_with_arity("globals", builtin_globals, 0)
     });
-    namespace.get_or_insert_with("locals", || {
+    crate::module_ns_get_or_insert_with(ns, "locals", || {
         make_module_builtin_function_with_arity("locals", builtin_locals, 0)
     });
-    namespace.get_or_insert_with("exec", || {
+    crate::module_ns_get_or_insert_with(ns, "exec", || {
         make_module_builtin_function("exec", builtin_exec)
     });
-    namespace.get_or_insert_with("eval", || {
+    crate::module_ns_get_or_insert_with(ns, "eval", || {
         make_module_builtin_function("eval", builtin_eval)
     });
-    namespace.get_or_insert_with("compile", || {
+    crate::module_ns_get_or_insert_with(ns, "compile", || {
         make_module_builtin_function("compile", builtin_compile)
     });
-    namespace.get_or_insert_with("complex", || {
+    crate::module_ns_get_or_insert_with(ns, "complex", || {
         crate::typedef::gettypeobject(&pyre_object::COMPLEX_TYPE)
     });
-    namespace.get_or_insert_with("filter", || {
+    crate::module_ns_get_or_insert_with(ns, "filter", || {
         crate::typedef::gettypeobject(&pyre_object::functional::FILTER_TYPE)
     });
-    namespace.get_or_insert_with("input", || {
+    crate::module_ns_get_or_insert_with(ns, "input", || {
         make_module_builtin_function("input", |_| Ok(pyre_object::w_str_new("")))
     });
-    namespace.get_or_insert_with("open", || {
+    crate::module_ns_get_or_insert_with(ns, "open", || {
         make_module_builtin_function("open", builtin_open)
     });
     // Exception hierarchy — exceptions are real types so they can be
@@ -1808,44 +1813,44 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
         Some(exc_base_exception_init),
         crate::typedef::w_object(),
     );
-    crate::dict_storage_store(namespace, "BaseException", base_exc);
+    crate::module_ns_store(ns, "BaseException", base_exc);
 
     let exception = make_exc_type("Exception", exc_exception_new, base_exc);
-    crate::dict_storage_store(namespace, "Exception", exception);
+    crate::module_ns_store(ns, "Exception", exception);
 
     let arithmetic = make_exc_type("ArithmeticError", exc_arithmetic_error_new, exception);
-    crate::dict_storage_store(namespace, "ArithmeticError", arithmetic);
-    crate::dict_storage_store(
-        namespace,
+    crate::module_ns_store(ns, "ArithmeticError", arithmetic);
+    crate::module_ns_store(
+        ns,
         "ZeroDivisionError",
         make_exc_type("ZeroDivisionError", exc_zero_division_new, arithmetic),
     );
-    crate::dict_storage_store(
-        namespace,
+    crate::module_ns_store(
+        ns,
         "OverflowError",
         make_exc_type("OverflowError", exc_overflow_error_new, arithmetic),
     );
-    crate::dict_storage_store(
-        namespace,
+    crate::module_ns_store(
+        ns,
         "FloatingPointError",
         make_exc_type("FloatingPointError", exc_arithmetic_error_new, arithmetic),
     );
 
     let lookup_error = make_exc_type("LookupError", exc_lookup_error_new, exception);
-    crate::dict_storage_store(namespace, "LookupError", lookup_error);
-    crate::dict_storage_store(
-        namespace,
+    crate::module_ns_store(ns, "LookupError", lookup_error);
+    crate::module_ns_store(
+        ns,
         "IndexError",
         make_exc_type("IndexError", exc_index_error_new, lookup_error),
     );
-    crate::dict_storage_store(
-        namespace,
+    crate::module_ns_store(
+        ns,
         "KeyError",
         make_exc_type("KeyError", exc_key_error_new, lookup_error),
     );
 
-    crate::dict_storage_store(
-        namespace,
+    crate::module_ns_store(
+        ns,
         "AttributeError",
         make_exc_type_with_init(
             "AttributeError",
@@ -1854,31 +1859,31 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
             exception,
         ),
     );
-    crate::dict_storage_store(
-        namespace,
+    crate::module_ns_store(
+        ns,
         "TypeError",
         make_exc_type("TypeError", exc_type_error_new, exception),
     );
     let value_error = make_exc_type("ValueError", exc_value_error_new, exception);
-    crate::dict_storage_store(namespace, "ValueError", value_error);
+    crate::module_ns_store(ns, "ValueError", value_error);
     let name_error = make_exc_type_with_init(
         "NameError",
         exc_name_error_new,
         Some(exc_name_error_init),
         exception,
     );
-    crate::dict_storage_store(namespace, "NameError", name_error);
+    crate::module_ns_store(ns, "NameError", name_error);
     // `exceptions.c` — `UnboundLocalError(NameError)`.
-    crate::dict_storage_store(
-        namespace,
+    crate::module_ns_store(
+        ns,
         "UnboundLocalError",
         make_exc_type("UnboundLocalError", exc_name_error_new, name_error),
     );
 
     let runtime_error = make_exc_type("RuntimeError", exc_runtime_error_new, exception);
-    crate::dict_storage_store(namespace, "RuntimeError", runtime_error);
-    crate::dict_storage_store(
-        namespace,
+    crate::module_ns_store(ns, "RuntimeError", runtime_error);
+    crate::module_ns_store(
+        ns,
         "NotImplementedError",
         make_exc_type(
             "NotImplementedError",
@@ -1886,34 +1891,34 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
             runtime_error,
         ),
     );
-    crate::dict_storage_store(
-        namespace,
+    crate::module_ns_store(
+        ns,
         "RecursionError",
         make_exc_type("RecursionError", exc_recursion_error_new, runtime_error),
     );
 
-    crate::dict_storage_store(
-        namespace,
+    crate::module_ns_store(
+        ns,
         "StopIteration",
         make_exc_type("StopIteration", exc_stop_iteration_new, exception),
     );
-    crate::dict_storage_store(
-        namespace,
+    crate::module_ns_store(
+        ns,
         "StopAsyncIteration",
         make_exc_type("StopAsyncIteration", exc_exception_new, exception),
     );
-    crate::dict_storage_store(
-        namespace,
+    crate::module_ns_store(
+        ns,
         "GeneratorExit",
         make_exc_type("GeneratorExit", exc_generator_exit_new, base_exc),
     );
-    crate::dict_storage_store(
-        namespace,
+    crate::module_ns_store(
+        ns,
         "SystemExit",
         make_exc_type("SystemExit", exc_system_exit_new, base_exc),
     );
-    crate::dict_storage_store(
-        namespace,
+    crate::module_ns_store(
+        ns,
         "KeyboardInterrupt",
         make_exc_type("KeyboardInterrupt", exc_base_exception_new, base_exc),
     );
@@ -1924,14 +1929,14 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
         Some(exc_import_error_init),
         exception,
     );
-    crate::dict_storage_store(namespace, "ImportError", import_error);
-    crate::dict_storage_store(
-        namespace,
+    crate::module_ns_store(ns, "ImportError", import_error);
+    crate::module_ns_store(
+        ns,
         "ModuleNotFoundError",
         make_exc_type("ModuleNotFoundError", exc_import_error_new, import_error),
     );
-    crate::dict_storage_store(
-        namespace,
+    crate::module_ns_store(
+        ns,
         "AssertionError",
         make_exc_type("AssertionError", exc_assertion_error_new, exception),
     );
@@ -1942,38 +1947,38 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
         Some(exc_os_error_init),
         exception,
     );
-    crate::dict_storage_store(namespace, "OSError", os_error);
-    crate::dict_storage_store(namespace, "IOError", os_error);
+    crate::module_ns_store(ns, "OSError", os_error);
+    crate::module_ns_store(ns, "IOError", os_error);
     // `exceptions.c` — `EnvironmentError` is a deprecated alias of `OSError`.
-    crate::dict_storage_store(namespace, "EnvironmentError", os_error);
-    crate::dict_storage_store(
-        namespace,
+    crate::module_ns_store(ns, "EnvironmentError", os_error);
+    crate::module_ns_store(
+        ns,
         "FileNotFoundError",
         make_exc_type("FileNotFoundError", exc_file_not_found_error_new, os_error),
     );
-    crate::dict_storage_store(
-        namespace,
+    crate::module_ns_store(
+        ns,
         "FileExistsError",
         make_exc_type("FileExistsError", exc_os_error_new, os_error),
     );
-    crate::dict_storage_store(
-        namespace,
+    crate::module_ns_store(
+        ns,
         "PermissionError",
         make_exc_type("PermissionError", exc_os_error_new, os_error),
     );
-    crate::dict_storage_store(
-        namespace,
+    crate::module_ns_store(
+        ns,
         "NotADirectoryError",
         make_exc_type("NotADirectoryError", exc_os_error_new, os_error),
     );
-    crate::dict_storage_store(
-        namespace,
+    crate::module_ns_store(
+        ns,
         "IsADirectoryError",
         make_exc_type("IsADirectoryError", exc_os_error_new, os_error),
     );
 
     let warning = make_exc_type("Warning", exc_exception_new, exception);
-    crate::dict_storage_store(namespace, "Warning", warning);
+    crate::module_ns_store(ns, "Warning", warning);
     for warn_name in [
         "UserWarning",
         "DeprecationWarning",
@@ -1987,17 +1992,17 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
         "SyntaxWarning",
         "EncodingWarning",
     ] {
-        crate::dict_storage_store(
-            namespace,
+        crate::module_ns_store(
+            ns,
             warn_name,
             make_exc_type(warn_name, exc_exception_new, warning),
         );
     }
 
     let unicode_error = make_exc_type("UnicodeError", exc_unicode_error_new, value_error);
-    crate::dict_storage_store(namespace, "UnicodeError", unicode_error);
-    crate::dict_storage_store(
-        namespace,
+    crate::module_ns_store(ns, "UnicodeError", unicode_error);
+    crate::module_ns_store(
+        ns,
         "UnicodeDecodeError",
         make_exc_type_with_init(
             "UnicodeDecodeError",
@@ -2006,8 +2011,8 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
             unicode_error,
         ),
     );
-    crate::dict_storage_store(
-        namespace,
+    crate::module_ns_store(
+        ns,
         "UnicodeEncodeError",
         make_exc_type_with_init(
             "UnicodeEncodeError",
@@ -2016,8 +2021,8 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
             unicode_error,
         ),
     );
-    crate::dict_storage_store(
-        namespace,
+    crate::module_ns_store(
+        ns,
         "UnicodeTranslateError",
         make_exc_type_with_init(
             "UnicodeTranslateError",
@@ -2027,99 +2032,99 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
         ),
     );
 
-    crate::dict_storage_store(
-        namespace,
+    crate::module_ns_store(
+        ns,
         "BufferError",
         make_exc_type("BufferError", exc_exception_new, exception),
     );
-    crate::dict_storage_store(
-        namespace,
+    crate::module_ns_store(
+        ns,
         "MemoryError",
         make_exc_type("MemoryError", exc_memory_error_new, exception),
     );
-    crate::dict_storage_store(
-        namespace,
+    crate::module_ns_store(
+        ns,
         "ReferenceError",
         make_exc_type("ReferenceError", exc_reference_error_new, exception),
     );
-    crate::dict_storage_store(
-        namespace,
+    crate::module_ns_store(
+        ns,
         "SystemError",
         make_exc_type("SystemError", exc_system_error_new, exception),
     );
-    crate::dict_storage_store(
-        namespace,
+    crate::module_ns_store(
+        ns,
         "EOFError",
         make_exc_type("EOFError", exc_exception_new, exception),
     );
     let syntax_error = make_exc_type("SyntaxError", exc_syntax_error_new, exception);
-    crate::dict_storage_store(namespace, "SyntaxError", syntax_error);
+    crate::module_ns_store(ns, "SyntaxError", syntax_error);
     let indentation_error = make_exc_type("IndentationError", exc_syntax_error_new, syntax_error);
-    crate::dict_storage_store(namespace, "IndentationError", indentation_error);
-    crate::dict_storage_store(
-        namespace,
+    crate::module_ns_store(ns, "IndentationError", indentation_error);
+    crate::module_ns_store(
+        ns,
         "TabError",
         make_exc_type("TabError", exc_syntax_error_new, indentation_error),
     );
-    crate::dict_storage_store(
-        namespace,
+    crate::module_ns_store(
+        ns,
         "BlockingIOError",
         make_exc_type("BlockingIOError", exc_os_error_new, os_error),
     );
-    crate::dict_storage_store(
-        namespace,
+    crate::module_ns_store(
+        ns,
         "ChildProcessError",
         make_exc_type("ChildProcessError", exc_os_error_new, os_error),
     );
     let connection_error = make_exc_type("ConnectionError", exc_os_error_new, os_error);
-    crate::dict_storage_store(namespace, "ConnectionError", connection_error);
-    crate::dict_storage_store(
-        namespace,
+    crate::module_ns_store(ns, "ConnectionError", connection_error);
+    crate::module_ns_store(
+        ns,
         "BrokenPipeError",
         make_exc_type("BrokenPipeError", exc_os_error_new, connection_error),
     );
-    crate::dict_storage_store(
-        namespace,
+    crate::module_ns_store(
+        ns,
         "ConnectionAbortedError",
         make_exc_type("ConnectionAbortedError", exc_os_error_new, connection_error),
     );
-    crate::dict_storage_store(
-        namespace,
+    crate::module_ns_store(
+        ns,
         "ConnectionRefusedError",
         make_exc_type("ConnectionRefusedError", exc_os_error_new, connection_error),
     );
-    crate::dict_storage_store(
-        namespace,
+    crate::module_ns_store(
+        ns,
         "ConnectionResetError",
         make_exc_type("ConnectionResetError", exc_os_error_new, connection_error),
     );
-    crate::dict_storage_store(
-        namespace,
+    crate::module_ns_store(
+        ns,
         "InterruptedError",
         make_exc_type("InterruptedError", exc_os_error_new, os_error),
     );
-    crate::dict_storage_store(
-        namespace,
+    crate::module_ns_store(
+        ns,
         "ProcessLookupError",
         make_exc_type("ProcessLookupError", exc_os_error_new, os_error),
     );
-    crate::dict_storage_store(
-        namespace,
+    crate::module_ns_store(
+        ns,
         "TimeoutError",
         make_exc_type("TimeoutError", exc_os_error_new, os_error),
     );
-    crate::dict_storage_store(
-        namespace,
+    crate::module_ns_store(
+        ns,
         "BaseExceptionGroup",
         make_exc_type("BaseExceptionGroup", exc_base_exception_new, base_exc),
     );
-    crate::dict_storage_store(
-        namespace,
+    crate::module_ns_store(
+        ns,
         "ExceptionGroup",
         make_exc_type("ExceptionGroup", exc_exception_new, exception),
     );
-    crate::dict_storage_store(
-        namespace,
+    crate::module_ns_store(
+        ns,
         "PythonFinalizationError",
         make_exc_type(
             "PythonFinalizationError",
@@ -2127,77 +2132,85 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
             runtime_error,
         ),
     );
-    namespace.get_or_insert_with("any", || {
+    crate::module_ns_get_or_insert_with(ns, "any", || {
         make_module_builtin_function_with_arity("any", builtin_any, 1)
     });
-    namespace.get_or_insert_with("all", || {
+    crate::module_ns_get_or_insert_with(ns, "all", || {
         make_module_builtin_function_with_arity("all", builtin_all, 1)
     });
-    namespace.get_or_insert_with("sum", || make_module_builtin_function("sum", builtin_sum));
-    namespace.get_or_insert_with("round", || {
+    crate::module_ns_get_or_insert_with(ns, "sum", || {
+        make_module_builtin_function("sum", builtin_sum)
+    });
+    crate::module_ns_get_or_insert_with(ns, "round", || {
         make_module_builtin_function("round", builtin_round)
     });
-    namespace.get_or_insert_with("divmod", || {
+    crate::module_ns_get_or_insert_with(ns, "divmod", || {
         make_module_builtin_function("divmod", builtin_divmod)
     });
-    namespace.get_or_insert_with("pow", || make_module_builtin_function("pow", builtin_pow));
-    namespace.get_or_insert_with("hex", || make_module_builtin_function("hex", builtin_hex));
-    namespace.get_or_insert_with("oct", || make_module_builtin_function("oct", builtin_oct));
-    namespace.get_or_insert_with("bin", || make_module_builtin_function("bin", builtin_bin));
-    namespace.get_or_insert_with("format", || {
+    crate::module_ns_get_or_insert_with(ns, "pow", || {
+        make_module_builtin_function("pow", builtin_pow)
+    });
+    crate::module_ns_get_or_insert_with(ns, "hex", || {
+        make_module_builtin_function("hex", builtin_hex)
+    });
+    crate::module_ns_get_or_insert_with(ns, "oct", || {
+        make_module_builtin_function("oct", builtin_oct)
+    });
+    crate::module_ns_get_or_insert_with(ns, "bin", || {
+        make_module_builtin_function("bin", builtin_bin)
+    });
+    crate::module_ns_get_or_insert_with(ns, "format", || {
         make_module_builtin_function("format", builtin_format)
     });
-    namespace.get_or_insert_with("issubclass", || {
+    crate::module_ns_get_or_insert_with(ns, "issubclass", || {
         make_module_builtin_function_with_arity("issubclass", builtin_issubclass, 2)
     });
-    namespace.get_or_insert_with("__import__", || {
+    crate::module_ns_get_or_insert_with(ns, "__import__", || {
         make_module_builtin_function("__import__", builtin_import_stub)
     });
 
     // Descriptor types
-    namespace.get_or_insert_with("property", || {
+    crate::module_ns_get_or_insert_with(ns, "property", || {
         crate::typedef::gettypeobject(&pyre_object::descriptor::PROPERTY_TYPE)
     });
     // staticmethod/classmethod registered as types for isinstance() support.
     // The type's __new__ creates the descriptor wrapper.
-    namespace.get_or_insert_with("staticmethod", || {
+    crate::module_ns_get_or_insert_with(ns, "staticmethod", || {
         crate::typedef::gettypeobject(&pyre_object::function::STATICMETHOD_TYPE)
     });
-    namespace.get_or_insert_with("classmethod", || {
+    crate::module_ns_get_or_insert_with(ns, "classmethod", || {
         crate::typedef::gettypeobject(&pyre_object::function::CLASSMETHOD_TYPE)
     });
-}
-
-/// Create a fresh namespace seeded with the default builtins.
-pub fn new_builtin_dict_storage() -> DictStorage {
-    crate::typedef::init_typeobjects();
-    let mut namespace = DictStorage::new();
-    install_default_builtins(&mut namespace);
-    namespace
 }
 
 /// `pypy/objspace/std/dictmultiobject.py:60-69
 /// allocate_and_init_instance(module=True)` parity — allocate the
 /// builtins module dict as a `W_ModuleDictObject` backed by
-/// `ModuleDictStrategy` (`celldict.py:28`).  Seeds the same entries
-/// `install_default_builtins` populates on a `DictStorage`, then
-/// transfers them into the strategy storage; the temporary
-/// `DictStorage` drops at function exit and the W_ModuleDictObject
-/// owns the live builtins.
+/// `ModuleDictStrategy` (`celldict.py:28`). `install_default_builtins`
+/// writes directly into the GC module dict. MixedModule parity stamps
+/// interp-level builtins with `__module__ = "builtins"` so pickle can
+/// save them by reference without an unstable `whichmodule` guess.
 pub fn new_builtin_module_dict() -> pyre_object::PyObjectRef {
     crate::typedef::init_typeobjects();
-    let mut seed = DictStorage::new();
-    install_default_builtins(&mut seed);
     let w_dict = pyre_object::w_module_dict_new();
-    // MixedModule parity: the interp-level builtins carry "builtins" as
-    // `__module__`, so `pickle.save_global` resolves them by reference
-    // without the `whichmodule` guess (every module namespace exposes the
-    // builtins, which makes that guess unstable).
-    let module_name = w_str_new("builtins");
-    for (key, &value) in seed.entries() {
-        if !value.is_null() {
-            unsafe { crate::function::builtin_function_set_module(value, module_name) };
-            unsafe { pyre_object::w_dict_setitem_str(w_dict, key, value) };
+    let _roots = pyre_object::gc_roots::push_roots();
+    let save_point = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_dict);
+    let name_obj = pyre_object::w_str_new("builtins");
+    pyre_object::gc_roots::pin_root(name_obj);
+    install_default_builtins(w_dict);
+    let keys: Vec<String> = unsafe { pyre_object::w_dict_str_entries(w_dict) }
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect();
+    for key in &keys {
+        if let Some(value) = unsafe { pyre_object::w_dict_getitem_str(w_dict, key) } {
+            unsafe {
+                crate::function::builtin_function_set_module(
+                    value,
+                    pyre_object::gc_roots::shadow_stack_get(save_point + 1),
+                );
+            }
         }
     }
     w_dict

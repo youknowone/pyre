@@ -1050,6 +1050,41 @@ pub fn dict_storage_delete_wtf8(namespace: &mut DictStorage, name: &Wtf8) -> boo
     namespace.remove_wtf8(name).is_some()
 }
 
+/// Look up an entry in a proxy-free GC module/namespace dict.
+pub fn module_ns_get(ns: PyObjectRef, name: &str) -> Option<PyObjectRef> {
+    unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(ns, name) }
+}
+
+/// Store into a proxy-free GC module/namespace dict (successor to
+/// `dict_storage_store` for migrated namespaces). `ns` must be a
+/// non-moving module dict so the by-value handle stays valid across stores.
+pub fn module_ns_store(ns: PyObjectRef, name: &str, value: PyObjectRef) {
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, name, value) }
+}
+
+pub fn module_ns_store_wtf8(ns: PyObjectRef, name: &Wtf8, value: PyObjectRef) {
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_wtf8_no_proxy(ns, name, value) }
+}
+
+pub fn module_ns_delete(ns: PyObjectRef, name: &str) -> bool {
+    unsafe { pyre_object::dictmultiobject::w_dict_delitem_str_no_proxy(ns, name) }
+}
+
+/// WTF-8 keyed delete from a proxy-free GC module/namespace dict.
+pub fn module_ns_delete_wtf8(ns: PyObjectRef, name: &Wtf8) -> bool {
+    unsafe { pyre_object::dictmultiobject::w_dict_delitem_wtf8_no_proxy(ns, name) }
+}
+
+/// Run and store `f()` only when `name` is absent from a GC namespace dict.
+pub fn module_ns_get_or_insert_with(ns: PyObjectRef, name: &str, f: impl FnOnce() -> PyObjectRef) {
+    unsafe {
+        if pyre_object::dictmultiobject::w_dict_getitem_str(ns, name).is_none() {
+            let value = f();
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, name, value);
+        }
+    }
+}
+
 fn type_dict_ptr(cls: PyObjectRef) -> *mut u8 {
     unsafe { pyre_object::w_type_get_dict_ptr(cls) }
 }

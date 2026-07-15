@@ -347,7 +347,7 @@ crate::py_module! {
     "_posixsubprocess",
     extra_init: |ns| {
         #[cfg(all(unix, feature = "host_env"))]
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "fork_exec",
             crate::make_builtin_function("fork_exec", imp::fork_exec),

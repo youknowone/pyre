@@ -2,7 +2,6 @@
 //!
 //! Verbatim move of the inline block previously in importing.rs.
 
-use crate::DictStorage;
 use crate::importing::BUILTIN_MODULES;
 
 /// _imp stub — PyPy: pypy/module/imp/
@@ -10,8 +9,8 @@ use crate::importing::BUILTIN_MODULES;
 /// Minimal subset required by importlib._bootstrap to decide which loader
 /// handles a name. We report every name we know about as a builtin so
 /// pyre's own registrations remain authoritative.
-pub fn register_module(ns: &mut DictStorage) {
-    crate::dict_storage_store(
+pub fn register_module(ns: pyre_object::PyObjectRef) {
+    crate::module_ns_store(
         ns,
         "is_builtin",
         crate::make_builtin_function_with_arity(
@@ -33,7 +32,7 @@ pub fn register_module(ns: &mut DictStorage) {
             1,
         ),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "is_frozen",
         crate::make_builtin_function_with_arity(
@@ -42,7 +41,7 @@ pub fn register_module(ns: &mut DictStorage) {
             1,
         ),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "is_frozen_package",
         crate::make_builtin_function_with_arity(
@@ -55,7 +54,7 @@ pub fn register_module(ns: &mut DictStorage) {
     // treats None as "not a frozen module". Pyre has no frozen modules, so
     // every name resolves to None and the import falls through to the next
     // finder on `sys.meta_path`.
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "find_frozen",
         crate::make_builtin_function_with_arity(
@@ -67,7 +66,7 @@ pub fn register_module(ns: &mut DictStorage) {
     // `_imp._override_frozen_modules_for_tests(value)` — the CPython test
     // harness (`test.support.import_helper`) toggles frozen-module
     // overriding.  Pyre has no frozen modules, so accept and ignore.
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "_override_frozen_modules_for_tests",
         crate::make_builtin_function("_override_frozen_modules_for_tests", |_| {
@@ -77,7 +76,7 @@ pub fn register_module(ns: &mut DictStorage) {
     // `_imp.get_frozen_object(name, data=None)` — pyre has no frozen modules,
     // so every name is unknown and `set_frozen_error(FROZEN_NOT_FOUND)` raises
     // `ImportError("No such frozen object named %R")`.
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "get_frozen_object",
         crate::make_builtin_function_with_arity(
@@ -98,7 +97,7 @@ pub fn register_module(ns: &mut DictStorage) {
             1,
         ),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "create_builtin",
         crate::make_builtin_function_with_arity(
@@ -112,7 +111,7 @@ pub fn register_module(ns: &mut DictStorage) {
             1,
         ),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "exec_builtin",
         crate::make_builtin_function_with_arity(
@@ -121,7 +120,7 @@ pub fn register_module(ns: &mut DictStorage) {
             1,
         ),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "exec_dynamic",
         crate::make_builtin_function_with_arity(
@@ -130,17 +129,17 @@ pub fn register_module(ns: &mut DictStorage) {
             1,
         ),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "acquire_lock",
         crate::make_builtin_function_with_arity("acquire_lock", |_| Ok(pyre_object::w_none()), 0),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "release_lock",
         crate::make_builtin_function_with_arity("release_lock", |_| Ok(pyre_object::w_none()), 0),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "lock_held",
         crate::make_builtin_function_with_arity(
@@ -149,7 +148,7 @@ pub fn register_module(ns: &mut DictStorage) {
             0,
         ),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "_fix_co_filename",
         crate::make_builtin_function_with_arity(
@@ -158,7 +157,7 @@ pub fn register_module(ns: &mut DictStorage) {
             0,
         ),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "extension_suffixes",
         crate::make_builtin_function_with_arity(
@@ -167,7 +166,7 @@ pub fn register_module(ns: &mut DictStorage) {
             0,
         ),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "source_hash",
         crate::make_builtin_function_with_arity(
@@ -176,10 +175,10 @@ pub fn register_module(ns: &mut DictStorage) {
             2,
         ),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "check_hash_based_pycs",
         pyre_object::w_str_new("default"),
     );
-    crate::dict_storage_store(ns, "pyc_magic_number_token", pyre_object::w_int_new(3495));
+    crate::module_ns_store(ns, "pyc_magic_number_token", pyre_object::w_int_new(3495));
 }

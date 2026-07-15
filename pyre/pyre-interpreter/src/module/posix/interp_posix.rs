@@ -4,7 +4,6 @@
 //! shared `stat_result_type` helper is carried in here too; `init_posix`
 //! is renamed to `register_module`.
 
-use crate::DictStorage;
 use crate::importing::host::{fs as host_fs, os as host_os};
 use pyre_object::PyObjectRef;
 // Under sandbox, name libc through the seam facade so any direct syscall call
@@ -149,7 +148,7 @@ fn times_result_seq_type() -> PyObjectRef {
 ///
 /// Provides the minimal surface that os.py module init needs to succeed.
 /// Real posix calls are not implemented — they raise or return defaults.
-pub fn register_module(ns: &mut DictStorage) {
+pub fn register_module(ns: pyre_object::PyObjectRef) {
     // environ — dict populated from the host environment.
     // PyPy equivalent: posix.State.startup → _convertenviron copies
     // os.environ.items() into w_environ at interpreter startup.
@@ -186,7 +185,7 @@ pub fn register_module(ns: &mut DictStorage) {
             }
         }
     }
-    crate::dict_storage_store(ns, "environ", w_environ);
+    crate::module_ns_store(ns, "environ", w_environ);
     // _have_functions — list of HAVE_* macro names that were defined at
     // build time. os.py uses this to populate the supports_* capability sets
     // (supports_dir_fd / supports_fd / supports_follow_symlinks), which
@@ -220,7 +219,7 @@ pub fn register_module(ns: &mut DictStorage) {
         "HAVE_FUTIMES",
         "HAVE_LSTAT",
     ];
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "_have_functions",
         pyre_object::w_list_new(
@@ -278,7 +277,7 @@ pub fn register_module(ns: &mut DictStorage) {
         ("SEEK_CUR", libc::SEEK_CUR as i64),
         ("SEEK_END", libc::SEEK_END as i64),
     ] {
-        crate::dict_storage_store(ns, name, pyre_object::w_int_new(val));
+        crate::module_ns_store(ns, name, pyre_object::w_int_new(val));
     }
     // Non-critical constants — zero stubs are fine for os.py init.
     for name in [
@@ -322,7 +321,7 @@ pub fn register_module(ns: &mut DictStorage) {
         "PRIO_PGRP",
         "PRIO_USER",
     ] {
-        crate::dict_storage_store(ns, name, pyre_object::w_int_new(0));
+        crate::module_ns_store(ns, name, pyre_object::w_int_new(0));
     }
     // Remaining noop stubs — functions os.py references at module level.
     // Functions with real implementations are registered individually below.
@@ -440,7 +439,7 @@ pub fn register_module(ns: &mut DictStorage) {
         "system",
         "popen",
     ] {
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             name,
             crate::make_builtin_function(name, |_| Ok(pyre_object::w_none())),
@@ -461,7 +460,7 @@ pub fn register_module(ns: &mut DictStorage) {
     }
 
     // ── posix.open(path, flags, mode=0o777) → fd ──
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "open",
         crate::make_builtin_function("open", |args| {
@@ -504,7 +503,7 @@ pub fn register_module(ns: &mut DictStorage) {
     );
 
     // ── posix.close(fd) ──
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "close",
         crate::make_builtin_function_with_arity(
@@ -530,7 +529,7 @@ pub fn register_module(ns: &mut DictStorage) {
     );
 
     // ── posix.read(fd, n) → bytes ──
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "read",
         crate::make_builtin_function_with_arity(
@@ -571,7 +570,7 @@ pub fn register_module(ns: &mut DictStorage) {
     );
 
     // ── posix.write(fd, data) → nbytes ──
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "write",
         crate::make_builtin_function_with_arity(
@@ -612,7 +611,7 @@ pub fn register_module(ns: &mut DictStorage) {
     );
 
     // ── posix.lseek(fd, offset, whence) → position ──
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "lseek",
         crate::make_builtin_function_with_arity(
@@ -663,12 +662,12 @@ pub fn register_module(ns: &mut DictStorage) {
             .map_err(|e| crate::host_seam::seam_os_err(e, &path))?;
         Ok(pyre_object::w_none())
     }
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "unlink",
         crate::make_builtin_function_with_arity("unlink", posix_unlink, 1),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "remove",
         crate::make_builtin_function_with_arity("remove", posix_unlink, 1),
@@ -681,7 +680,7 @@ pub fn register_module(ns: &mut DictStorage) {
     // readlink handler); the stub override loop registers a raising stub, so
     // keep the raw std::fs::read_link body out of the sandbox build.
     #[cfg(not(feature = "sandbox"))]
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "readlink",
         crate::make_builtin_function("readlink", |args| {
@@ -698,7 +697,7 @@ pub fn register_module(ns: &mut DictStorage) {
     );
 
     // ── posix.mkdir(path, mode=0o777) ──
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "mkdir",
         crate::make_builtin_function("mkdir", |args| {
@@ -734,7 +733,7 @@ pub fn register_module(ns: &mut DictStorage) {
     // Mutates the host filesystem; stubbed under sandbox, so the real body
     // (and its libc call) is compiled out.
     #[cfg(not(feature = "sandbox"))]
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "rmdir",
         crate::make_builtin_function_with_arity(
@@ -760,7 +759,7 @@ pub fn register_module(ns: &mut DictStorage) {
     // A non-None `src_dir_fd` / `dst_dir_fd` resolves the path relative to the
     // open directory descriptor (`renameat`); the descriptors are only usable
     // where `renameat` exists (unix).
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "rename",
         crate::make_builtin_function("rename", |args| {
@@ -822,7 +821,7 @@ pub fn register_module(ns: &mut DictStorage) {
     );
 
     // ── posix.listdir(path=".") → list of str ──
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "listdir",
         crate::make_builtin_function("listdir", |args| {
@@ -856,7 +855,7 @@ pub fn register_module(ns: &mut DictStorage) {
     );
 
     // ── posix.isatty(fd) → bool ──
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "isatty",
         crate::make_builtin_function_with_arity(
@@ -880,7 +879,7 @@ pub fn register_module(ns: &mut DictStorage) {
     );
 
     // ── posix.urandom(n) → bytes ──
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "urandom",
         crate::make_builtin_function_with_arity(
@@ -909,13 +908,13 @@ pub fn register_module(ns: &mut DictStorage) {
             vec![pyre_object::w_int_new(cols), pyre_object::w_int_new(lines)],
         )
     }
-    crate::dict_storage_store(ns, "terminal_size", terminal_size_seq_type());
+    crate::module_ns_store(ns, "terminal_size", terminal_size_seq_type());
 
     // ── posix.get_terminal_size(fd=1) → os.terminal_size(columns, lines) ──
     // Inspects the controlling terminal via ioctl(TIOCGWINSZ); stubbed under
     // sandbox, so the real body is compiled out.
     #[cfg(not(feature = "sandbox"))]
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "get_terminal_size",
         crate::make_builtin_function_with_arity(
@@ -945,7 +944,7 @@ pub fn register_module(ns: &mut DictStorage) {
     // os.fspath() — posixmodule.c posix_fspath / PyOS_FSPath.  str/bytes
     // pass through unchanged (the protocol's identity case); any other
     // object is resolved via `type(path).__fspath__(path)`.
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "fspath",
         crate::make_builtin_function_with_arity(
@@ -1469,15 +1468,15 @@ pub fn register_module(ns: &mut DictStorage) {
         let _ = crate::baseobjspace::setattr_str(it, "_index", pyre_object::w_int_new(0));
         Ok(it)
     }
-    crate::dict_storage_store(ns, "scandir", crate::make_builtin_function("scandir", scandir_fn));
-    crate::dict_storage_store(ns, "DirEntry", dir_entry_type());
+    crate::module_ns_store(ns, "scandir", crate::make_builtin_function("scandir", scandir_fn));
+    crate::module_ns_store(ns, "DirEntry", dir_entry_type());
 
     // os.uname() — returns structseq (sysname, nodename, release, version, machine).
     // Routed through `host_env::posix::uname_info` when available so the
     // result reports the host's real POSIX strings ("Darwin", "Linux",
     // node hostname, kernel release, etc.) instead of Rust's compile-time
     // `std::env::consts::OS` ("macos"/"linux"/...).
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "uname",
         crate::make_builtin_function_with_arity(
@@ -1524,17 +1523,17 @@ pub fn register_module(ns: &mut DictStorage) {
             0,
         ),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "stat",
         crate::make_builtin_function_with_arity("stat", |args| stat_impl(args, true), 1),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "lstat",
         crate::make_builtin_function_with_arity("lstat", |args| stat_impl(args, false), 1),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "fstat",
         crate::make_builtin_function_with_arity(
@@ -1581,9 +1580,9 @@ pub fn register_module(ns: &mut DictStorage) {
     );
     // stat_result type — structseq (tuple subclass). Exported so that
     // `posix.stat_result` and `isinstance(os.stat(p), os.stat_result)` work.
-    crate::dict_storage_store(ns, "stat_result", stat_result_seq_type());
+    crate::module_ns_store(ns, "stat_result", stat_result_seq_type());
     // os.getcwd() — PyPy: posixmodule.c posix_getcwd.
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "getcwd",
         crate::make_builtin_function_with_arity(
@@ -1610,7 +1609,7 @@ pub fn register_module(ns: &mut DictStorage) {
         ),
     );
     // os.getcwdb() — bytes form of getcwd.
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "getcwdb",
         crate::make_builtin_function_with_arity(
@@ -1647,7 +1646,7 @@ pub fn register_module(ns: &mut DictStorage) {
         fn getgid() -> u32;
         fn getegid() -> u32;
     }
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "getuid",
         crate::make_builtin_function_with_arity(
@@ -1669,7 +1668,7 @@ pub fn register_module(ns: &mut DictStorage) {
             0,
         ),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "geteuid",
         crate::make_builtin_function_with_arity(
@@ -1691,7 +1690,7 @@ pub fn register_module(ns: &mut DictStorage) {
             0,
         ),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "getgid",
         crate::make_builtin_function_with_arity(
@@ -1713,7 +1712,7 @@ pub fn register_module(ns: &mut DictStorage) {
             0,
         ),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "getegid",
         crate::make_builtin_function_with_arity(
@@ -1736,7 +1735,7 @@ pub fn register_module(ns: &mut DictStorage) {
         ),
     );
     // os.getpid — host_os::process_id (std::process::id).
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "getpid",
         crate::make_builtin_function_with_arity(
@@ -1748,7 +1747,7 @@ pub fn register_module(ns: &mut DictStorage) {
     // os.environ lookups from setenv / unsetenv / putenv / getenv — mutate
     // posix.environ (the dict) rather than calling libc; os.py writes back
     // into that dict in its _Environ wrapper.
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "getenv",
         crate::make_builtin_function("getenv", |args| {
@@ -1788,7 +1787,7 @@ pub fn register_module(ns: &mut DictStorage) {
         use rustpython_host_env::posix as host_posix;
 
         // os.strerror(code) -> str
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "strerror",
             crate::make_builtin_function_with_arity(
@@ -1816,7 +1815,7 @@ pub fn register_module(ns: &mut DictStorage) {
         );
 
         // os.pipe() -> (r_fd, w_fd)
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "pipe",
             crate::make_builtin_function_with_arity(
@@ -1836,7 +1835,7 @@ pub fn register_module(ns: &mut DictStorage) {
         );
 
         // os.sched_yield()
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "sched_yield",
             crate::make_builtin_function_with_arity(
@@ -1850,7 +1849,7 @@ pub fn register_module(ns: &mut DictStorage) {
         );
 
         // os.nice(increment) -> new niceness
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "nice",
             crate::make_builtin_function_with_arity(
@@ -1868,7 +1867,7 @@ pub fn register_module(ns: &mut DictStorage) {
         );
 
         // os.umask(mask) -> previous mask
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "umask",
             crate::make_builtin_function_with_arity(
@@ -1886,7 +1885,7 @@ pub fn register_module(ns: &mut DictStorage) {
         );
 
         // os.getlogin() -> str
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "getlogin",
             crate::make_builtin_function_with_arity(
@@ -1903,7 +1902,7 @@ pub fn register_module(ns: &mut DictStorage) {
         );
 
         // os.getgroups() -> list[int]
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "getgroups",
             crate::make_builtin_function_with_arity(
@@ -1921,7 +1920,7 @@ pub fn register_module(ns: &mut DictStorage) {
         );
 
         // os.sched_get_priority_max(policy) -> int
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "sched_get_priority_max",
             crate::make_builtin_function_with_arity(
@@ -1942,7 +1941,7 @@ pub fn register_module(ns: &mut DictStorage) {
         );
 
         // os.sched_get_priority_min(policy) -> int
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "sched_get_priority_min",
             crate::make_builtin_function_with_arity(
@@ -1964,7 +1963,7 @@ pub fn register_module(ns: &mut DictStorage) {
 
         // os.sync()
         #[cfg(not(any(target_os = "redox", target_os = "android")))]
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "sync",
             crate::make_builtin_function_with_arity(
@@ -1978,7 +1977,7 @@ pub fn register_module(ns: &mut DictStorage) {
         );
 
         // os.chdir(path)
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "chdir",
             crate::make_builtin_function_with_arity(
@@ -2000,7 +1999,7 @@ pub fn register_module(ns: &mut DictStorage) {
         );
 
         // os.fchdir(fd)
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "fchdir",
             crate::make_builtin_function_with_arity(
@@ -2018,7 +2017,7 @@ pub fn register_module(ns: &mut DictStorage) {
         );
 
         // os.fork() -> child pid in parent, 0 in child
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "fork",
             crate::make_builtin_function_with_arity(
@@ -2033,7 +2032,7 @@ pub fn register_module(ns: &mut DictStorage) {
 
         // os.getppid() -> int
         #[cfg(not(feature = "sandbox"))]
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "getppid",
             crate::make_builtin_function_with_arity(
@@ -2044,7 +2043,7 @@ pub fn register_module(ns: &mut DictStorage) {
         );
 
         // os.waitpid(pid, options) -> (pid, status)
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "waitpid",
             crate::make_builtin_function_with_arity(
@@ -2068,7 +2067,7 @@ pub fn register_module(ns: &mut DictStorage) {
         );
 
         // os.wait() -> (pid, status)
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "wait",
             crate::make_builtin_function_with_arity(
@@ -2087,7 +2086,7 @@ pub fn register_module(ns: &mut DictStorage) {
         );
 
         // os._exit(code) — immediate process exit, no cleanup.
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "_exit",
             crate::make_builtin_function_with_arity(
@@ -2107,7 +2106,7 @@ pub fn register_module(ns: &mut DictStorage) {
         // the noop stubs registered above with the libc bit-math.
         macro_rules! reg_wstatus {
             ($name:literal, |$s:ident| $body:expr) => {
-                crate::dict_storage_store(
+                crate::module_ns_store(
                     ns,
                     $name,
                     crate::make_builtin_function_with_arity(
@@ -2145,13 +2144,13 @@ pub fn register_module(ns: &mut DictStorage) {
         // Wait option flags — override the `0` placeholders registered above
         // with their real libc values (os.WNOHANG must be non-zero for
         // subprocess.poll()).
-        crate::dict_storage_store(ns, "WNOHANG", pyre_object::w_int_new(libc::WNOHANG as i64));
-        crate::dict_storage_store(
+        crate::module_ns_store(ns, "WNOHANG", pyre_object::w_int_new(libc::WNOHANG as i64));
+        crate::module_ns_store(
             ns,
             "WUNTRACED",
             pyre_object::w_int_new(libc::WUNTRACED as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "WCONTINUED",
             pyre_object::w_int_new(libc::WCONTINUED as i64),
@@ -2159,7 +2158,7 @@ pub fn register_module(ns: &mut DictStorage) {
 
         // os.dup(fd) -> new_fd
         #[cfg(not(feature = "sandbox"))]
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "dup",
             crate::make_builtin_function_with_arity(
@@ -2181,7 +2180,7 @@ pub fn register_module(ns: &mut DictStorage) {
 
         // os.dup2(fd, fd2, inheritable=True) -> fd2
         #[cfg(not(feature = "sandbox"))]
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "dup2",
             crate::make_builtin_function("dup2", |args| {
@@ -2200,7 +2199,7 @@ pub fn register_module(ns: &mut DictStorage) {
 
         // os.fsync(fd)
         #[cfg(not(feature = "sandbox"))]
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "fsync",
             crate::make_builtin_function_with_arity(
@@ -2223,7 +2222,7 @@ pub fn register_module(ns: &mut DictStorage) {
         // os.fdatasync(fd) — falls back to fsync on macOS, which has no
         // fdatasync syscall but exposes the same semantics through fsync.
         #[cfg(not(feature = "sandbox"))]
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "fdatasync",
             crate::make_builtin_function_with_arity(
@@ -2250,7 +2249,7 @@ pub fn register_module(ns: &mut DictStorage) {
 
         // os.mkfifo(path, mode=0o666) -> None
         #[cfg(not(feature = "sandbox"))]
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "mkfifo",
             crate::make_builtin_function("mkfifo", |args| {
@@ -2275,7 +2274,7 @@ pub fn register_module(ns: &mut DictStorage) {
 
         // os.kill(pid, sig) / os.killpg(pgid, sig)
         #[cfg(not(feature = "sandbox"))]
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "kill",
             crate::make_builtin_function_with_arity(
@@ -2296,7 +2295,7 @@ pub fn register_module(ns: &mut DictStorage) {
             ),
         );
         #[cfg(not(feature = "sandbox"))]
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "killpg",
             crate::make_builtin_function_with_arity(
@@ -2338,7 +2337,7 @@ pub fn register_module(ns: &mut DictStorage) {
             crate::_structseq::new_instance_with_extra(statvfs_result_seq_type(), seq, extras)
         }
         #[cfg(not(target_os = "redox"))]
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "statvfs",
             crate::make_builtin_function_with_arity(
@@ -2357,7 +2356,7 @@ pub fn register_module(ns: &mut DictStorage) {
             ),
         );
         #[cfg(not(target_os = "redox"))]
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "fstatvfs",
             crate::make_builtin_function_with_arity(
@@ -2375,7 +2374,7 @@ pub fn register_module(ns: &mut DictStorage) {
         );
 
         // os.cpu_count() -> int | None
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "cpu_count",
             crate::make_builtin_function_with_arity(
@@ -2392,7 +2391,7 @@ pub fn register_module(ns: &mut DictStorage) {
             ),
         );
         // _cpu_count alias — newer CPython exposes both.
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "_cpu_count",
             crate::make_builtin_function_with_arity(
@@ -2411,7 +2410,7 @@ pub fn register_module(ns: &mut DictStorage) {
 
         // os.symlink(src, dst, target_is_directory=False) -> None
         #[cfg(not(feature = "sandbox"))]
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "symlink",
             crate::make_builtin_function("symlink", |args| {
@@ -2435,7 +2434,7 @@ pub fn register_module(ns: &mut DictStorage) {
         );
 
         // os.fchmod(fd, mode) -> None
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "fchmod",
             crate::make_builtin_function_with_arity(
@@ -2456,7 +2455,7 @@ pub fn register_module(ns: &mut DictStorage) {
         );
 
         // os.fchown(fd, uid, gid) -> None  (uid/gid of -1 means "leave unchanged")
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "fchown",
             crate::make_builtin_function_with_arity(
@@ -2488,7 +2487,7 @@ pub fn register_module(ns: &mut DictStorage) {
         );
 
         // os.set_inheritable(fd, inheritable) -> None
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "set_inheritable",
             crate::make_builtin_function_with_arity(
@@ -2511,7 +2510,7 @@ pub fn register_module(ns: &mut DictStorage) {
         );
 
         // os.access(path, mode) -> bool
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "access",
             crate::make_builtin_function("access", |args| {
@@ -2536,7 +2535,7 @@ pub fn register_module(ns: &mut DictStorage) {
         );
 
         // os.chroot(path) -> None
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "chroot",
             crate::make_builtin_function_with_arity(
@@ -2555,7 +2554,7 @@ pub fn register_module(ns: &mut DictStorage) {
         );
 
         // os.getloadavg() -> (1m, 5m, 15m)
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "getloadavg",
             crate::make_builtin_function_with_arity(
@@ -2575,7 +2574,7 @@ pub fn register_module(ns: &mut DictStorage) {
 
         // os.times() -> posix.times_result(user, system, children_user,
         //                                  children_system, elapsed)
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "times",
             crate::make_builtin_function_with_arity(
@@ -2599,7 +2598,7 @@ pub fn register_module(ns: &mut DictStorage) {
         );
 
         // os.waitstatus_to_exitcode(status) -> int
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "waitstatus_to_exitcode",
             crate::make_builtin_function_with_arity(
@@ -2623,7 +2622,7 @@ pub fn register_module(ns: &mut DictStorage) {
         );
 
         // os.system(command) -> exit_status
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "system",
             crate::make_builtin_function_with_arity(
@@ -2669,7 +2668,7 @@ pub fn register_module(ns: &mut DictStorage) {
         // matching pyre-wide convention rather than introducing a single
         // outlier.
         #[cfg(all(any(target_os = "linux", target_os = "macos"), not(feature = "sandbox")))]
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "sendfile",
             crate::make_builtin_function("sendfile", |args| {
@@ -2943,23 +2942,23 @@ pub fn register_module(ns: &mut DictStorage) {
                 }
                 Ok(out)
             }
-            crate::dict_storage_store(
+            crate::module_ns_store(
                 ns,
                 "posix_spawn",
                 crate::make_builtin_function("posix_spawn", |args| build_posix_spawn(args, false)),
             );
-            crate::dict_storage_store(
+            crate::module_ns_store(
                 ns,
                 "posix_spawnp",
                 crate::make_builtin_function("posix_spawnp", |args| build_posix_spawn(args, true)),
             );
-            crate::dict_storage_store(ns, "POSIX_SPAWN_OPEN", pyre_object::w_int_new(0));
-            crate::dict_storage_store(ns, "POSIX_SPAWN_CLOSE", pyre_object::w_int_new(1));
-            crate::dict_storage_store(ns, "POSIX_SPAWN_DUP2", pyre_object::w_int_new(2));
+            crate::module_ns_store(ns, "POSIX_SPAWN_OPEN", pyre_object::w_int_new(0));
+            crate::module_ns_store(ns, "POSIX_SPAWN_CLOSE", pyre_object::w_int_new(1));
+            crate::module_ns_store(ns, "POSIX_SPAWN_DUP2", pyre_object::w_int_new(2));
         }
 
         // os.ttyname(fd) -> str
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "ttyname",
             crate::make_builtin_function_with_arity(
@@ -2979,7 +2978,7 @@ pub fn register_module(ns: &mut DictStorage) {
         );
 
         // os.tcgetpgrp(fd) -> pgid
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "tcgetpgrp",
             crate::make_builtin_function_with_arity(
@@ -2999,7 +2998,7 @@ pub fn register_module(ns: &mut DictStorage) {
         );
 
         // os.tcsetpgrp(fd, pgid) -> None
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "tcsetpgrp",
             crate::make_builtin_function_with_arity(
@@ -3020,7 +3019,7 @@ pub fn register_module(ns: &mut DictStorage) {
         );
 
         // os.getpriority(which, who) -> int
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "getpriority",
             crate::make_builtin_function_with_arity(
@@ -3043,7 +3042,7 @@ pub fn register_module(ns: &mut DictStorage) {
         );
 
         // os.setpriority(which, who, priority) -> None
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "setpriority",
             crate::make_builtin_function_with_arity(
@@ -3066,24 +3065,24 @@ pub fn register_module(ns: &mut DictStorage) {
             ),
         );
 
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "PRIO_PROCESS",
             pyre_object::w_int_new(libc::PRIO_PROCESS as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "PRIO_PGRP",
             pyre_object::w_int_new(libc::PRIO_PGRP as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "PRIO_USER",
             pyre_object::w_int_new(libc::PRIO_USER as i64),
         );
 
         // os.pathconf(path, name) -> int | None
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "pathconf",
             crate::make_builtin_function_with_arity(
@@ -3107,7 +3106,7 @@ pub fn register_module(ns: &mut DictStorage) {
         );
 
         // os.fpathconf(fd, name) -> int | None
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "fpathconf",
             crate::make_builtin_function_with_arity(
@@ -3128,7 +3127,7 @@ pub fn register_module(ns: &mut DictStorage) {
         );
 
         // os.sysconf(name) -> int
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "sysconf",
             crate::make_builtin_function_with_arity(
@@ -3147,7 +3146,7 @@ pub fn register_module(ns: &mut DictStorage) {
 
         // os.initgroups(username, gid) -> None
         #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "openbsd"))]
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "initgroups",
             crate::make_builtin_function_with_arity(
@@ -3179,7 +3178,7 @@ pub fn register_module(ns: &mut DictStorage) {
         );
 
         // os.openpty() -> (master_fd, slave_fd)
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "openpty",
             crate::make_builtin_function_with_arity(
@@ -3198,7 +3197,7 @@ pub fn register_module(ns: &mut DictStorage) {
 
         // os.getresuid() -> (ruid, euid, suid)
         #[cfg(any(target_os = "android", target_os = "linux", target_os = "openbsd"))]
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "getresuid",
             crate::make_builtin_function_with_arity(
@@ -3217,7 +3216,7 @@ pub fn register_module(ns: &mut DictStorage) {
 
         // os.getresgid() -> (rgid, egid, sgid)
         #[cfg(any(target_os = "android", target_os = "linux", target_os = "openbsd"))]
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "getresgid",
             crate::make_builtin_function_with_arity(
@@ -3241,7 +3240,7 @@ pub fn register_module(ns: &mut DictStorage) {
             target_os = "linux",
             target_os = "openbsd"
         ))]
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "setresuid",
             crate::make_builtin_function_with_arity(
@@ -3264,7 +3263,7 @@ pub fn register_module(ns: &mut DictStorage) {
 
         // os.setresgid(rgid, egid, sgid) -> None
         #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "openbsd"))]
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "setresgid",
             crate::make_builtin_function_with_arity(
@@ -3334,7 +3333,7 @@ pub fn register_module(ns: &mut DictStorage) {
             // terminal / tty inspection + control
             "tcgetpgrp", "tcsetpgrp", "get_terminal_size", "ttyname",
         ] {
-            crate::dict_storage_store(
+            crate::module_ns_store(
                 ns,
                 name,
                 crate::make_builtin_function(name, sandbox_unavailable),
@@ -3342,5 +3341,5 @@ pub fn register_module(ns: &mut DictStorage) {
         }
     }
 
-    crate::dict_storage_store(ns, "error", crate::typedef::w_object());
+    crate::module_ns_store(ns, "error", crate::typedef::w_object());
 }

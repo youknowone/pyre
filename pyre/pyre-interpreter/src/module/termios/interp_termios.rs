@@ -4,7 +4,6 @@
 //! the host_env real impl and the no-host_env stub are renamed to
 //! `register_module` so moduledef::init can call a single name.
 
-use crate::DictStorage;
 
 /// `interp_termios.py:13-19 convert_error` — every termios syscall
 /// failure is raised as the cached module exception `termios.error`
@@ -40,7 +39,7 @@ fn termios_converted_error(errno: i32, message: impl Into<String>) -> crate::PyE
 /// `cfgetospeed` calls are direct wrappers.  All constants come from
 /// `rustpython_host_env::termios::*` so the values match the platform.
 #[cfg(all(unix, feature = "host_env"))]
-pub fn register_module(ns: &mut DictStorage) {
+pub fn register_module(ns: pyre_object::PyObjectRef) {
     use rustpython_host_env::termios as host_termios;
 
     fn make_cc_bytes(cc: &[libc::cc_t]) -> pyre_object::PyObjectRef {
@@ -52,7 +51,7 @@ pub fn register_module(ns: &mut DictStorage) {
         pyre_object::w_list_new(items)
     }
 
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "tcgetattr",
         crate::make_builtin_function_with_arity(
@@ -105,7 +104,7 @@ pub fn register_module(ns: &mut DictStorage) {
         ),
     );
 
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "tcsetattr",
         crate::make_builtin_function("tcsetattr", |args| {
@@ -203,7 +202,7 @@ pub fn register_module(ns: &mut DictStorage) {
         }),
     );
 
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "tcsendbreak",
         crate::make_builtin_function_with_arity(
@@ -229,7 +228,7 @@ pub fn register_module(ns: &mut DictStorage) {
         ),
     );
 
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "tcdrain",
         crate::make_builtin_function_with_arity(
@@ -251,7 +250,7 @@ pub fn register_module(ns: &mut DictStorage) {
         ),
     );
 
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "tcflush",
         crate::make_builtin_function_with_arity(
@@ -275,7 +274,7 @@ pub fn register_module(ns: &mut DictStorage) {
         ),
     );
 
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "tcflow",
         crate::make_builtin_function_with_arity(
@@ -299,7 +298,7 @@ pub fn register_module(ns: &mut DictStorage) {
         ),
     );
 
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "tcgetwinsize",
         crate::make_builtin_function_with_arity(
@@ -330,7 +329,7 @@ pub fn register_module(ns: &mut DictStorage) {
         ),
     );
 
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "tcsetwinsize",
         crate::make_builtin_function_with_arity(
@@ -390,362 +389,362 @@ pub fn register_module(ns: &mut DictStorage) {
     );
 
     // ── Constants ──
-    crate::dict_storage_store(ns, "B0", pyre_object::w_int_new(host_termios::B0 as i64));
-    crate::dict_storage_store(ns, "B50", pyre_object::w_int_new(host_termios::B50 as i64));
-    crate::dict_storage_store(ns, "B75", pyre_object::w_int_new(host_termios::B75 as i64));
-    crate::dict_storage_store(
+    crate::module_ns_store(ns, "B0", pyre_object::w_int_new(host_termios::B0 as i64));
+    crate::module_ns_store(ns, "B50", pyre_object::w_int_new(host_termios::B50 as i64));
+    crate::module_ns_store(ns, "B75", pyre_object::w_int_new(host_termios::B75 as i64));
+    crate::module_ns_store(
         ns,
         "B110",
         pyre_object::w_int_new(host_termios::B110 as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "B134",
         pyre_object::w_int_new(host_termios::B134 as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "B150",
         pyre_object::w_int_new(host_termios::B150 as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "B200",
         pyre_object::w_int_new(host_termios::B200 as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "B300",
         pyre_object::w_int_new(host_termios::B300 as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "B600",
         pyre_object::w_int_new(host_termios::B600 as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "B1200",
         pyre_object::w_int_new(host_termios::B1200 as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "B1800",
         pyre_object::w_int_new(host_termios::B1800 as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "B2400",
         pyre_object::w_int_new(host_termios::B2400 as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "B4800",
         pyre_object::w_int_new(host_termios::B4800 as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "B9600",
         pyre_object::w_int_new(host_termios::B9600 as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "B19200",
         pyre_object::w_int_new(host_termios::B19200 as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "B38400",
         pyre_object::w_int_new(host_termios::B38400 as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "B57600",
         pyre_object::w_int_new(host_termios::B57600 as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "B115200",
         pyre_object::w_int_new(host_termios::B115200 as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "B230400",
         pyre_object::w_int_new(host_termios::B230400 as i64),
     );
 
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "BRKINT",
         pyre_object::w_int_new(host_termios::BRKINT as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "CLOCAL",
         pyre_object::w_int_new(host_termios::CLOCAL as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "CREAD",
         pyre_object::w_int_new(host_termios::CREAD as i64),
     );
-    crate::dict_storage_store(ns, "CS5", pyre_object::w_int_new(host_termios::CS5 as i64));
-    crate::dict_storage_store(ns, "CS6", pyre_object::w_int_new(host_termios::CS6 as i64));
-    crate::dict_storage_store(ns, "CS7", pyre_object::w_int_new(host_termios::CS7 as i64));
-    crate::dict_storage_store(ns, "CS8", pyre_object::w_int_new(host_termios::CS8 as i64));
-    crate::dict_storage_store(
+    crate::module_ns_store(ns, "CS5", pyre_object::w_int_new(host_termios::CS5 as i64));
+    crate::module_ns_store(ns, "CS6", pyre_object::w_int_new(host_termios::CS6 as i64));
+    crate::module_ns_store(ns, "CS7", pyre_object::w_int_new(host_termios::CS7 as i64));
+    crate::module_ns_store(ns, "CS8", pyre_object::w_int_new(host_termios::CS8 as i64));
+    crate::module_ns_store(
         ns,
         "CSIZE",
         pyre_object::w_int_new(host_termios::CSIZE as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "CSTOPB",
         pyre_object::w_int_new(host_termios::CSTOPB as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "ECHO",
         pyre_object::w_int_new(host_termios::ECHO as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "ECHOE",
         pyre_object::w_int_new(host_termios::ECHOE as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "ECHOK",
         pyre_object::w_int_new(host_termios::ECHOK as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "ECHONL",
         pyre_object::w_int_new(host_termios::ECHONL as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "HUPCL",
         pyre_object::w_int_new(host_termios::HUPCL as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "ICANON",
         pyre_object::w_int_new(host_termios::ICANON as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "ICRNL",
         pyre_object::w_int_new(host_termios::ICRNL as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "IEXTEN",
         pyre_object::w_int_new(host_termios::IEXTEN as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "IGNBRK",
         pyre_object::w_int_new(host_termios::IGNBRK as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "IGNCR",
         pyre_object::w_int_new(host_termios::IGNCR as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "IGNPAR",
         pyre_object::w_int_new(host_termios::IGNPAR as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "INLCR",
         pyre_object::w_int_new(host_termios::INLCR as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "INPCK",
         pyre_object::w_int_new(host_termios::INPCK as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "ISIG",
         pyre_object::w_int_new(host_termios::ISIG as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "ISTRIP",
         pyre_object::w_int_new(host_termios::ISTRIP as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "IXANY",
         pyre_object::w_int_new(host_termios::IXANY as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "IXOFF",
         pyre_object::w_int_new(host_termios::IXOFF as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "IXON",
         pyre_object::w_int_new(host_termios::IXON as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "NOFLSH",
         pyre_object::w_int_new(host_termios::NOFLSH as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "OCRNL",
         pyre_object::w_int_new(host_termios::OCRNL as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "ONLCR",
         pyre_object::w_int_new(host_termios::ONLCR as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "ONLRET",
         pyre_object::w_int_new(host_termios::ONLRET as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "ONOCR",
         pyre_object::w_int_new(host_termios::ONOCR as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "OPOST",
         pyre_object::w_int_new(host_termios::OPOST as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "PARENB",
         pyre_object::w_int_new(host_termios::PARENB as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "PARMRK",
         pyre_object::w_int_new(host_termios::PARMRK as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "PARODD",
         pyre_object::w_int_new(host_termios::PARODD as i64),
     );
 
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "TCIFLUSH",
         pyre_object::w_int_new(host_termios::TCIFLUSH as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "TCOFLUSH",
         pyre_object::w_int_new(host_termios::TCOFLUSH as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "TCIOFLUSH",
         pyre_object::w_int_new(host_termios::TCIOFLUSH as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "TCIOFF",
         pyre_object::w_int_new(host_termios::TCIOFF as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "TCION",
         pyre_object::w_int_new(host_termios::TCION as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "TCOOFF",
         pyre_object::w_int_new(host_termios::TCOOFF as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "TCOON",
         pyre_object::w_int_new(host_termios::TCOON as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "TCSANOW",
         pyre_object::w_int_new(host_termios::TCSANOW as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "TCSADRAIN",
         pyre_object::w_int_new(host_termios::TCSADRAIN as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "TCSAFLUSH",
         pyre_object::w_int_new(host_termios::TCSAFLUSH as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "TOSTOP",
         pyre_object::w_int_new(host_termios::TOSTOP as i64),
     );
 
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "VEOF",
         pyre_object::w_int_new(host_termios::VEOF as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "VEOL",
         pyre_object::w_int_new(host_termios::VEOL as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "VERASE",
         pyre_object::w_int_new(host_termios::VERASE as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "VINTR",
         pyre_object::w_int_new(host_termios::VINTR as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "VKILL",
         pyre_object::w_int_new(host_termios::VKILL as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "VMIN",
         pyre_object::w_int_new(host_termios::VMIN as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "VQUIT",
         pyre_object::w_int_new(host_termios::VQUIT as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "VSTART",
         pyre_object::w_int_new(host_termios::VSTART as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "VSTOP",
         pyre_object::w_int_new(host_termios::VSTOP as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "VSUSP",
         pyre_object::w_int_new(host_termios::VSUSP as i64),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "VTIME",
         pyre_object::w_int_new(host_termios::VTIME as i64),
@@ -760,8 +759,8 @@ pub fn register_module(ns: &mut DictStorage) {
         crate::builtins::exc_exception_new,
         w_os_error,
     );
-    crate::dict_storage_store(ns, "error", w_error);
+    crate::module_ns_store(ns, "error", w_error);
 }
 
 #[cfg(not(all(unix, feature = "host_env")))]
-pub fn register_module(_ns: &mut DictStorage) {}
+pub fn register_module(_ns: pyre_object::PyObjectRef) {}

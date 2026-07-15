@@ -1047,8 +1047,10 @@ impl W_DictMultiObject for W_ModuleDictObject {
     }
 }
 
-/// Allocate a fresh `W_ModuleDictObject` whose storage is empty and
-/// whose strategy carries a fresh `VersionTag`.  Mirrors
+/// Allocate a fresh non-moving `W_ModuleDictObject` whose storage is empty
+/// and whose strategy carries a fresh `VersionTag`. Module dicts are
+/// long-lived, and their by-value handle is passed to initializers across
+/// allocating stores, so the header must keep a stable address. Mirrors
 /// `dictmultiobject.py:57-69 allocate_and_init_instance(module=True)`
 /// path:
 ///
@@ -1070,9 +1072,12 @@ pub fn w_module_dict_new() -> PyObjectRef {
 /// `ns` on a local miss.  Used by `dict_storage_to_dict` so source
 /// modules surface as W_ModuleDictObject while the frame-side
 /// `PyFrame.w_globals = *mut DictStorage` carrier still works.
+/// The header is allocated non-moving because module dicts are long-lived
+/// and builtin initializers carry their by-value handle across allocating
+/// stores.
 ///
 /// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py:139`):
-/// the body performs an unported `lltype::malloc_typed` NewWithVtable
+/// the body performs an unported `lltype::malloc_typed_stable` NewWithVtable
 /// (`W_ModuleDictObject`) that survives `fuse_boxing_alloc` unfused, so
 /// the JIT residualises the whole call to a stable runtime fnaddr
 /// instead of tracing the allocation.  The `-> PyObjectRef` result is a
@@ -1081,7 +1086,7 @@ pub fn w_module_dict_new() -> PyObjectRef {
 pub fn w_module_dict_new_with_storage_proxy(ns: *mut u8) -> PyObjectRef {
     let strategy = crate::lltype::malloc_raw(crate::celldict::ModuleDictStrategy::new());
     let storage = unsafe { crate::lltype::malloc_raw((*strategy).get_empty_storage()) };
-    crate::lltype::malloc_typed(W_ModuleDictObject {
+    crate::lltype::malloc_typed_stable(W_ModuleDictObject {
         ob_header: PyObject {
             // `dictmultiobject.py:67 space.allocate_instance(...,
             // space.w_dict)` — module dicts present as `dict` to
@@ -1403,6 +1408,7 @@ unsafe fn w_module_dict_setitem_str_internal(
         };
         let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
         strategy.mutated();
+        dict_write_barrier(obj);
         maybe_sync_dict_storage_store(proxy, w_key, w_value);
         return;
     }
@@ -1411,6 +1417,7 @@ unsafe fn w_module_dict_setitem_str_internal(
         let storage = &mut *(*(obj as *mut W_ModuleDictObject)).dstorage;
         strategy.setitem_str(storage, key, w_value);
     }
+    dict_write_barrier(obj);
     // Only wrap the key into a W_UnicodeObject when there is a proxy to forward
     // to.  The back-mirror from `DictStorage::insert` runs with a null proxy
     // (`fire_proxy=false`), so eagerly allocating the key here would discard it.
@@ -1463,9 +1470,10 @@ pub unsafe fn w_module_dict_getitem_str(obj: PyObjectRef, key: &str) -> Option<P
 /// pointers — the `dstorage` cell map, the post-`switch_to_object_strategy`
 /// `object_storage`, the `mstrategy.caches` cell registry, and the
 /// `dict_storage_proxy` str-key back-mirror — none of which are inline
-/// `gc_ptr_offsets`.  The W_ModuleDictObject is currently `malloc_typed`
-/// (Box-immortal), so its registered `module_dict_object_custom_trace`
-/// never fires; without an explicit walk, `LOAD_GLOBAL`
+/// `gc_ptr_offsets`. The non-moving W_ModuleDictObject's registered
+/// `module_dict_object_custom_trace` invokes this walk; the explicit frame
+/// root walker does too for raw globals/builtins carriers. Without the walk,
+/// `LOAD_GLOBAL`
 /// (`w_module_dict_getitem_str`, which reads the authoritative `dstorage`
 /// cell map ahead of the proxy back-mirror) would observe relocated values
 /// through never-forwarded slots.  The proxy independently caches aliased
@@ -2260,6 +2268,7 @@ pub unsafe fn w_module_dict_store_inner(obj: PyObjectRef, key: PyObjectRef, valu
     entries.insert(object_key_for(key), value);
     let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
     strategy.mutated();
+    dict_write_barrier(obj);
     if crate::is_str(key) {
         maybe_sync_dict_storage_store(proxy, key, value);
     }
@@ -2292,6 +2301,7 @@ pub unsafe fn w_module_dict_store_inner_checked(
     }
     let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
     strategy.mutated();
+    dict_write_barrier(obj);
     if crate::is_str(key) {
         maybe_sync_dict_storage_store(proxy, key, value);
     }
@@ -2815,21 +2825,32 @@ pub unsafe fn w_dict_setitem_wtf8(
 }
 
 /// WTF-8 keyed sibling of `w_dict_setitem_str_no_proxy` — lets a
-/// lone-surrogate namespace key reach the back-mirror `W_DictObject`.
-/// The dict is forced onto `ObjectDictStrategy` (ObjectKey-keyed via
-/// hashed WTF-8 bytes); the Unicode strategy's str fast paths would
-/// hit `w_str_get_value`, which panics on a lone surrogate.  Only the
-/// regular (Instance) `W_DictObject` shape back-mirrors a type
-/// namespace, so the module-dict case is a no-op.
+/// lone-surrogate namespace key reach the back-mirror dict. The dict is
+/// forced onto `ObjectDictStrategy` (ObjectKey-keyed via hashed WTF-8
+/// bytes); the Unicode strategy's str fast paths would hit
+/// `w_str_get_value`, which panics on a lone surrogate.
 ///
 /// # Safety
-/// `obj` must point to a valid regular `W_DictObject`.
+/// `obj` must point to a valid `W_DictObject` or `W_ModuleDictObject`.
 pub unsafe fn w_dict_setitem_wtf8_no_proxy(
     obj: PyObjectRef,
     key: &rustpython_wtf8::Wtf8,
     value: PyObjectRef,
 ) {
     if is_module_dict(obj) {
+        if let Ok(key) = key.as_str() {
+            return w_module_dict_setitem_str_no_proxy(obj, key, value);
+        }
+        crate::gc_roots::mark_prebuilt_roots_dirty();
+        if !w_module_dict_is_object_strategy(obj) {
+            w_module_dict_switch_to_object_strategy(obj);
+        }
+        let entries = w_module_dict_object_storage_mut(obj);
+        let w_key = crate::w_str_from_wtf8(key.to_wtf8_buf());
+        entries.insert(object_key_for(w_key), value);
+        let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
+        strategy.mutated();
+        dict_write_barrier(obj);
         return;
     }
     let dict = &mut *(obj as *mut W_DictObject);
@@ -2848,10 +2869,23 @@ pub unsafe fn w_dict_setitem_wtf8_no_proxy(
 /// WTF-8 keyed sibling of `w_dict_delitem_str_no_proxy`.
 ///
 /// # Safety
-/// `obj` must point to a valid regular `W_DictObject`.
+/// `obj` must point to a valid `W_DictObject` or `W_ModuleDictObject`.
 pub unsafe fn w_dict_delitem_wtf8_no_proxy(obj: PyObjectRef, key: &rustpython_wtf8::Wtf8) -> bool {
     if is_module_dict(obj) {
-        return false;
+        if let Ok(key) = key.as_str() {
+            return w_module_dict_delitem_str_no_proxy(obj, key).is_some();
+        }
+        if !w_module_dict_is_object_strategy(obj) {
+            w_module_dict_switch_to_object_strategy(obj);
+        }
+        let entries = w_module_dict_object_storage_mut(obj);
+        let w_key = crate::w_str_from_wtf8(key.to_wtf8_buf());
+        let removed = entries.shift_remove(&object_key_for(w_key)).is_some();
+        if removed {
+            let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
+            strategy.mutated();
+        }
+        return removed;
     }
     let dict = &mut *(obj as *mut W_DictObject);
     // Detect via `strategy_kind()`; the strategy singletons are

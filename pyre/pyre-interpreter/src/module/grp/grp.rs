@@ -2,8 +2,6 @@
 //!
 //! Verbatim move of the inline block previously in importing.rs.
 
-use crate::DictStorage;
-
 #[cfg(unix)]
 thread_local! {
     /// `lib_pypy/grp.py:14-20 class struct_group(metaclass=structseqtype)`
@@ -33,7 +31,7 @@ fn struct_group_type() -> pyre_object::PyObjectRef {
 /// structseq (subclass of tuple) with named fields `gr_name`,
 /// `gr_passwd`, `gr_gid`, `gr_mem` per `lib_pypy/grp.py:14-20`.
 #[cfg(unix)]
-pub fn register_module(ns: &mut DictStorage) {
+pub fn register_module(ns: pyre_object::PyObjectRef) {
     #[cfg(feature = "host_env")]
     fn make_struct_group(g: &rustpython_host_env::grp::Group) -> pyre_object::PyObjectRef {
         let mem_items: Vec<pyre_object::PyObjectRef> =
@@ -79,8 +77,8 @@ pub fn register_module(ns: &mut DictStorage) {
     }
     // `lib_pypy/grp.py:14-20 class struct_group` — exposed as
     // `grp.struct_group`; every result type uses this same class.
-    crate::dict_storage_store(ns, "struct_group", struct_group_type());
-    crate::dict_storage_store(
+    crate::module_ns_store(ns, "struct_group", struct_group_type());
+    crate::module_ns_store(
         ns,
         "getgrgid",
         crate::make_builtin_function_with_arity(
@@ -139,7 +137,7 @@ pub fn register_module(ns: &mut DictStorage) {
             1,
         ),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "getgrnam",
         crate::make_builtin_function_with_arity(
@@ -192,7 +190,7 @@ pub fn register_module(ns: &mut DictStorage) {
             1,
         ),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "getgrall",
         crate::make_builtin_function_with_arity(

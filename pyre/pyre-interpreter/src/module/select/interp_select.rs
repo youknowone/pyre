@@ -2,7 +2,6 @@
 //!
 //! Verbatim move of the inline block previously in importing.rs.
 
-use crate::DictStorage;
 #[cfg(all(unix, feature = "host_env"))]
 use pyre_object::PyObjectRef;
 
@@ -233,8 +232,8 @@ impl Poll {
 /// `rustpython_host_env::select::{FdSet, select, sec_to_timeval}` and the
 /// `select.poll()` polling object.  epoll / kqueue object types are not
 /// implemented yet.
-pub fn register_module(ns: &mut DictStorage) {
-    crate::dict_storage_store(
+pub fn register_module(ns: pyre_object::PyObjectRef) {
+    crate::module_ns_store(
         ns,
         "select",
         crate::make_builtin_function("select", |args| {
@@ -413,7 +412,7 @@ pub fn register_module(ns: &mut DictStorage) {
         // Poll.typedef.acceptable_as_base_class = False`.
         let _ = type_object();
         unsafe { pyre_object::w_type_set_acceptable_as_base_class(type_object(), false) };
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "poll",
             crate::make_builtin_function_with_arity(
@@ -426,7 +425,7 @@ pub fn register_module(ns: &mut DictStorage) {
         // constants (`rpoll.eventnames`).
         macro_rules! ev {
             ($name:literal, $val:expr) => {
-                crate::dict_storage_store(ns, $name, pyre_object::w_int_new($val as i64));
+                crate::module_ns_store(ns, $name, pyre_object::w_int_new($val as i64));
             };
         }
         ev!("POLLIN", libc::POLLIN);
@@ -445,8 +444,8 @@ pub fn register_module(ns: &mut DictStorage) {
     // filter and flag constants (BSD/macOS only).
     #[cfg(all(target_os = "macos", feature = "host_env"))]
     {
-        crate::dict_storage_store(ns, "kqueue", super::interp_kqueue::type_object());
-        crate::dict_storage_store(ns, "kevent", super::interp_kevent::type_object());
+        crate::module_ns_store(ns, "kqueue", super::interp_kqueue::type_object());
+        crate::module_ns_store(ns, "kevent", super::interp_kevent::type_object());
         // `interp_kqueue.py:262 W_Kqueue.typedef.acceptable_as_base_class
         // = False` / `:406 W_Kevent.typedef.acceptable_as_base_class =
         // False`.
@@ -462,7 +461,7 @@ pub fn register_module(ns: &mut DictStorage) {
         }
         macro_rules! kq {
             ($name:literal, $val:expr) => {
-                crate::dict_storage_store(ns, $name, pyre_object::w_int_new($val as i64));
+                crate::module_ns_store(ns, $name, pyre_object::w_int_new($val as i64));
             };
         }
         // `interp_kqueue.py:62 symbol_map` — KQ_FILTER_* / KQ_EV_*.
@@ -487,10 +486,10 @@ pub fn register_module(ns: &mut DictStorage) {
     // `except select.error` catches what selectors raise.
     let w_os_error = crate::builtins::lookup_exc_class("OSError")
         .expect("OSError must be installed before select init");
-    crate::dict_storage_store(ns, "error", w_os_error);
+    crate::module_ns_store(ns, "error", w_os_error);
     #[cfg(unix)]
     {
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "PIPE_BUF",
             pyre_object::w_int_new(libc::PIPE_BUF as i64),

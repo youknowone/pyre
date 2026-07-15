@@ -10,10 +10,7 @@
 
 use crate::baseobjspace::{float_w, int_w, uint_w};
 use crate::objspace::descroperation::{CompareOp, compare};
-use crate::{
-    DictStorage, PyError, PyErrorKind, PyResult, dict_storage_store,
-    make_builtin_function_with_arity,
-};
+use crate::{PyError, PyErrorKind, PyResult, make_builtin_function_with_arity, module_ns_store};
 use pyre_object::interp_array as arr;
 use pyre_object::{PY_NULL, PyObjectRef};
 use rustpython_wtf8::{CodePoint, Wtf8Buf};
@@ -1093,12 +1090,12 @@ pub fn init_array_type(ns: PyObjectRef) {
 }
 
 /// `array` module init — `moduledef.py interpleveldefs`.
-pub fn init_array_module(ns: &mut DictStorage) {
+pub fn init_array_module(ns: pyre_object::PyObjectRef) {
     let type_obj = crate::typedef::gettypeobject(&pyre_object::interp_array::ARRAY_TYPE);
-    dict_storage_store(ns, "array", type_obj);
-    dict_storage_store(ns, "ArrayType", type_obj);
-    dict_storage_store(ns, "typecodes", pyre_object::w_str_new(arr::TYPECODES));
-    dict_storage_store(
+    module_ns_store(ns, "array", type_obj);
+    module_ns_store(ns, "ArrayType", type_obj);
+    module_ns_store(ns, "typecodes", pyre_object::w_str_new(arr::TYPECODES));
+    module_ns_store(
         ns,
         "_array_reconstructor",
         crate::make_builtin_function("_array_reconstructor", array_reconstructor),

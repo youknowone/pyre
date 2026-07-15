@@ -133,12 +133,12 @@ crate::py_module! {
     extra_init: |ns| {
         #[cfg(all(unix, feature = "host_env"))]
         {
-            crate::dict_storage_store(ns, "SemLock", type_object());
+            crate::module_ns_store(ns, "SemLock", type_object());
 
             // `_SemLock_new(kind, value, maxvalue, name, unlink)` —
             // Python-side factory; allocates a libc sem_t and stamps
             // its raw pointer onto a fresh SemLock instance.
-            crate::dict_storage_store(
+            crate::module_ns_store(
                 ns,
                 "_SemLock_new",
                 crate::make_builtin_function("_SemLock_new", |args| {
@@ -187,19 +187,19 @@ crate::py_module! {
                 }),
             );
 
-            crate::dict_storage_store(
+            crate::module_ns_store(
                 ns,
                 "sem_unlink",
                 crate::make_builtin_function_with_arity("sem_unlink", sem_unlink, 1),
             );
 
-            crate::dict_storage_store(
+            crate::module_ns_store(
                 ns,
                 "SEM_VALUE_MAX",
                 w_int_new(rustpython_host_env::multiprocessing::sem_value_max() as i64),
             );
-            crate::dict_storage_store(ns, "RECURSIVE_MUTEX", w_int_new(0));
-            crate::dict_storage_store(ns, "SEMAPHORE", w_int_new(1));
+            crate::module_ns_store(ns, "RECURSIVE_MUTEX", w_int_new(0));
+            crate::module_ns_store(ns, "SEMAPHORE", w_int_new(1));
         }
     }
 }

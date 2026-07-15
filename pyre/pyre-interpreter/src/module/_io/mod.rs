@@ -46,11 +46,11 @@ crate::py_module! {
             crate::builtins::exc_exception_new,
             bases,
         );
-        crate::dict_storage_store(ns, "UnsupportedOperation", unsupported);
+        crate::module_ns_store(ns, "UnsupportedOperation", unsupported);
 
         // `_io.BlockingIOError` aliases the builtin BlockingIOError.
         if let Some(blocking) = crate::builtins::lookup_exc_class("BlockingIOError") {
-            crate::dict_storage_store(ns, "BlockingIOError", blocking);
+            crate::module_ns_store(ns, "BlockingIOError", blocking);
         }
 
         // Abstract base classes as W_TypeObject (required for io.py class inheritance).
@@ -66,7 +66,7 @@ crate::py_module! {
             unsafe { pyre_object::w_type_set_mro(t, vec![t, obj_type]) };
             unsafe { pyre_object::typeobject::w_type_ready(t) };
             io_base_types.insert(name, t);
-            crate::dict_storage_store(ns, name, t);
+            crate::module_ns_store(ns, name, t);
         }
 
         // Concrete stream classes as subclassable W_TypeObjects.  stdlib
@@ -88,7 +88,7 @@ crate::py_module! {
                 pyre_object::w_type_set_acceptable_as_base_class(t, true);
                 pyre_object::typeobject::w_type_set_hasdict(t, true);
             }
-            crate::dict_storage_store(ns, name, t);
+            crate::module_ns_store(ns, name, t);
         }
 
         // `TextIOWrapper` is a real (subclassable) type: stdlib modules such
@@ -100,6 +100,6 @@ crate::py_module! {
         unsafe {
             pyre_object::w_type_set_acceptable_as_base_class(text_io_wrapper, true);
         }
-        crate::dict_storage_store(ns, "TextIOWrapper", text_io_wrapper);
+        crate::module_ns_store(ns, "TextIOWrapper", text_io_wrapper);
     }
 }

@@ -6,7 +6,6 @@
 //! module namespace with constants, error classes, module-level
 //! functions and the `socket` type definition.
 
-use crate::DictStorage;
 
 // POSIX socket FFI declarations missing from libc 0.2.186.  These are
 // universal symbols from <arpa/inet.h>, <netdb.h>, <unistd.h>; we
@@ -231,7 +230,7 @@ fn socket_writebuf(obj: pyre_object::PyObjectRef) -> Result<&'static mut [u8], c
     ))
 }
 
-pub fn register_module(ns: &mut DictStorage) {
+pub fn register_module(ns: pyre_object::PyObjectRef) {
     // `_rsocket_rffi.py:140-220 constant_names` + `:234-262
     // constants_w_defaults` — populated through the libc crate where
     // available, hardcoded for platform-specific constants the crate
@@ -242,7 +241,7 @@ pub fn register_module(ns: &mut DictStorage) {
     {
         macro_rules! cst {
             ($name:literal, $val:expr) => {
-                crate::dict_storage_store(ns, $name, pyre_object::w_int_new($val as i64));
+                crate::module_ns_store(ns, $name, pyre_object::w_int_new($val as i64));
             };
         }
         // ── Address families ──
@@ -483,7 +482,7 @@ pub fn register_module(ns: &mut DictStorage) {
     }
 
     // ── htons / htonl / ntohs / ntohl ──
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "htons",
         crate::make_builtin_function_with_arity(
@@ -498,7 +497,7 @@ pub fn register_module(ns: &mut DictStorage) {
             1,
         ),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "ntohs",
         crate::make_builtin_function_with_arity(
@@ -513,7 +512,7 @@ pub fn register_module(ns: &mut DictStorage) {
             1,
         ),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "htonl",
         crate::make_builtin_function_with_arity(
@@ -528,7 +527,7 @@ pub fn register_module(ns: &mut DictStorage) {
             1,
         ),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "ntohl",
         crate::make_builtin_function_with_arity(
@@ -547,7 +546,7 @@ pub fn register_module(ns: &mut DictStorage) {
     // ── inet_aton / inet_ntoa ──
     #[cfg(unix)]
     {
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "inet_aton",
             crate::make_builtin_function_with_arity(
@@ -579,7 +578,7 @@ pub fn register_module(ns: &mut DictStorage) {
                 1,
             ),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "inet_ntoa",
             crate::make_builtin_function_with_arity(
@@ -616,7 +615,7 @@ pub fn register_module(ns: &mut DictStorage) {
         );
 
         // inet_pton(af, ip) → bytes
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "inet_pton",
             crate::make_builtin_function_with_arity(
@@ -661,7 +660,7 @@ pub fn register_module(ns: &mut DictStorage) {
         );
 
         // inet_ntop(af, packed) → str
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "inet_ntop",
             crate::make_builtin_function_with_arity(
@@ -713,7 +712,7 @@ pub fn register_module(ns: &mut DictStorage) {
         );
 
         // gethostname() → str
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "gethostname",
             crate::make_builtin_function_with_arity(
@@ -739,7 +738,7 @@ pub fn register_module(ns: &mut DictStorage) {
 
         // sethostname(name) → None  (host_env::socket-backed)
         #[cfg(feature = "host_env")]
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "sethostname",
             crate::make_builtin_function_with_arity(
@@ -773,7 +772,7 @@ pub fn register_module(ns: &mut DictStorage) {
         // gethostbyname(name) → ip_string.  `interp_func.py:32-44` —
         // host argument runs through encode_idna (→ idna_converter)
         // before the rsocket call.
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "gethostbyname",
             crate::make_builtin_function_with_arity(
@@ -822,7 +821,7 @@ pub fn register_module(ns: &mut DictStorage) {
         // gethostbyname_ex(name) → (name, aliases, addresses)
         // `interp_func.py:53-65` — same lookup as gethostbyname but
         // returns the full hostent triple.
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "gethostbyname_ex",
             crate::make_builtin_function_with_arity(
@@ -855,7 +854,7 @@ pub fn register_module(ns: &mut DictStorage) {
         // `interp_func.py:67-79` — reverse lookup; `addr` is an
         // IPv4/IPv6 string we resolve through inet_pton, then feed
         // to gethostbyaddr.
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "gethostbyaddr",
             crate::make_builtin_function_with_arity(
@@ -959,7 +958,7 @@ pub fn register_module(ns: &mut DictStorage) {
         );
 
         // getservbyname(name[, proto]) → port
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "getservbyname",
             crate::make_builtin_function("getservbyname", |args| {
@@ -1010,7 +1009,7 @@ pub fn register_module(ns: &mut DictStorage) {
         );
 
         // getservbyport(port[, proto]) → name
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "getservbyport",
             crate::make_builtin_function("getservbyport", |args| {
@@ -1063,8 +1062,8 @@ pub fn register_module(ns: &mut DictStorage) {
     //   timeout  = new_exception_class("_socket.timeout",  w_OSError)
     let w_os_error = crate::builtins::lookup_exc_class("OSError")
         .expect("OSError must be installed before _socket init");
-    crate::dict_storage_store(ns, "error", w_os_error);
-    crate::dict_storage_store(
+    crate::module_ns_store(ns, "error", w_os_error);
+    crate::module_ns_store(
         ns,
         "herror",
         crate::builtins::make_exc_type(
@@ -1073,7 +1072,7 @@ pub fn register_module(ns: &mut DictStorage) {
             w_os_error,
         ),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "gaierror",
         crate::builtins::make_exc_type(
@@ -1082,7 +1081,7 @@ pub fn register_module(ns: &mut DictStorage) {
             w_os_error,
         ),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "timeout",
         crate::builtins::make_exc_type(
@@ -1094,16 +1093,16 @@ pub fn register_module(ns: &mut DictStorage) {
 
     // Default timeout (None) — modulus has a getter/setter; we just stash
     // a None so attribute lookups succeed.
-    crate::dict_storage_store(ns, "_default_timeout", pyre_object::w_none());
+    crate::module_ns_store(ns, "_default_timeout", pyre_object::w_none());
 
     // `_rsocket_rffi.py:1155 constants['has_ipv6'] = True` — exposed by
     // PyPy's moduledef.py constants loop as a module-level boolean.
-    crate::dict_storage_store(ns, "has_ipv6", pyre_object::boolobject::w_bool_from(true));
+    crate::module_ns_store(ns, "has_ipv6", pyre_object::boolobject::w_bool_from(true));
 
     // ── module-level getdefaulttimeout / setdefaulttimeout ──
     // `interp_func.py:378-397` — None means "blocking", float means
     // "timeout in seconds".  Stored as a process-wide cell.
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "getdefaulttimeout",
         crate::make_builtin_function_with_arity(
@@ -1112,7 +1111,7 @@ pub fn register_module(ns: &mut DictStorage) {
             0,
         ),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "setdefaulttimeout",
         crate::make_builtin_function_with_arity(
@@ -1153,7 +1152,7 @@ pub fn register_module(ns: &mut DictStorage) {
     // `interp_socket.py:close(fd)` — raw libc close, used for fd
     // cleanup when callers obtain a bare fd via .detach().
     #[cfg(unix)]
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "close",
         crate::make_builtin_function_with_arity(
@@ -1181,7 +1180,7 @@ pub fn register_module(ns: &mut DictStorage) {
     // protocol name.  libc getprotobyname returns NULL on lookup
     // failure; we surface that as OSError to match `converted_error`.
     #[cfg(unix)]
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "getprotobyname",
         crate::make_builtin_function_with_arity(
@@ -1211,7 +1210,7 @@ pub fn register_module(ns: &mut DictStorage) {
     // — direct wrappers around libc's network-interface accessors.
     #[cfg(unix)]
     {
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "if_nameindex",
             crate::make_builtin_function_with_arity(
@@ -1241,7 +1240,7 @@ pub fn register_module(ns: &mut DictStorage) {
                 0,
             ),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "if_nametoindex",
             crate::make_builtin_function_with_arity(
@@ -1264,7 +1263,7 @@ pub fn register_module(ns: &mut DictStorage) {
                 1,
             ),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "if_indextoname",
             crate::make_builtin_function_with_arity(
@@ -1296,7 +1295,7 @@ pub fn register_module(ns: &mut DictStorage) {
     // unix target we ship, so we register them under the same cfg.
     #[cfg(unix)]
     {
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "CMSG_SPACE",
             crate::make_builtin_function_with_arity(
@@ -1324,7 +1323,7 @@ pub fn register_module(ns: &mut DictStorage) {
                 1,
             ),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "CMSG_LEN",
             crate::make_builtin_function_with_arity(
@@ -1367,11 +1366,11 @@ pub fn register_module(ns: &mut DictStorage) {
         let socket_tp = socket_type();
         // Expose the type itself as `socket` AND `SocketType` so the
         // stdlib's `class socket(_socket.socket):` pattern works.
-        crate::dict_storage_store(ns, "socket", socket_tp);
-        crate::dict_storage_store(ns, "SocketType", socket_tp);
+        crate::module_ns_store(ns, "socket", socket_tp);
+        crate::module_ns_store(ns, "SocketType", socket_tp);
 
         // socketpair(family=AF_UNIX, type=SOCK_STREAM, proto=0)
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "socketpair",
             crate::make_builtin_function("socketpair", |args| {
@@ -1419,7 +1418,7 @@ pub fn register_module(ns: &mut DictStorage) {
         // dup(fd) → new fd.  Per `rsocket.py:dup()` the duplicated
         // descriptor sets FD_CLOEXEC (rsocket goes through dup3+CLOEXEC
         // on Linux; we use the portable fcntl path).
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "dup",
             crate::make_builtin_function_with_arity(
@@ -1450,7 +1449,7 @@ pub fn register_module(ns: &mut DictStorage) {
         // original) and wrap it in a fresh `_socket.socket`.  CPython
         // requires the dup so close() on the returned socket leaves the
         // input descriptor intact.
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "fromfd",
             crate::make_builtin_function("fromfd", |args| {
@@ -1595,8 +1594,8 @@ fn set_default_socket_timeout(v: Option<f64>) {
 // path used by stdlib socket.getnameinfo.
 
 #[cfg(unix)]
-fn init_socket_getaddrinfo(ns: &mut DictStorage) {
-    crate::dict_storage_store(
+fn init_socket_getaddrinfo(ns: pyre_object::PyObjectRef) {
+    crate::module_ns_store(
         ns,
         "getaddrinfo",
         crate::make_builtin_function("getaddrinfo", |args| {
@@ -1724,7 +1723,7 @@ fn init_socket_getaddrinfo(ns: &mut DictStorage) {
         }),
     );
 
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "getnameinfo",
         crate::make_builtin_function_with_arity(

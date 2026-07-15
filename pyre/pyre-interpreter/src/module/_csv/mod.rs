@@ -1258,6 +1258,6 @@ crate::py_module! {
     extra_init: |ns| {
         // `app_csv._dialects = {}` — the registry mapping, kept in the module
         // namespace so it is reachable for GC.
-        crate::dict_storage_store(ns, "_dialects", pyre_object::w_dict_new());
+        crate::module_ns_store(ns, "_dialects", pyre_object::w_dict_new());
     },
 }

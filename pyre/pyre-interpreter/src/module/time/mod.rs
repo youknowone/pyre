@@ -44,27 +44,27 @@ crate::py_module! {
         // CPython exposes a different surface there.)
         #[cfg(all(unix, feature = "host_env"))]
         {
-            crate::dict_storage_store(ns, "clock_gettime",
+            crate::module_ns_store(ns, "clock_gettime",
                 crate::make_builtin_function_with_arity("clock_gettime", t::clock_gettime, 1));
-            crate::dict_storage_store(ns, "clock_gettime_ns",
+            crate::module_ns_store(ns, "clock_gettime_ns",
                 crate::make_builtin_function_with_arity("clock_gettime_ns", t::clock_gettime_ns, 1));
             #[cfg(not(target_os = "redox"))]
             {
-                crate::dict_storage_store(ns, "clock_getres",
+                crate::module_ns_store(ns, "clock_getres",
                     crate::make_builtin_function_with_arity("clock_getres", t::clock_getres, 1));
                 // clock_settime{,_ns} set the system clock (a privileged
                 // syscall that escapes mediation); omit them under sandbox.
                 #[cfg(not(feature = "sandbox"))]
                 {
-                    crate::dict_storage_store(ns, "clock_settime",
+                    crate::module_ns_store(ns, "clock_settime",
                         crate::make_builtin_function_with_arity("clock_settime", t::clock_settime, 2));
-                    crate::dict_storage_store(ns, "clock_settime_ns",
+                    crate::module_ns_store(ns, "clock_settime_ns",
                         crate::make_builtin_function_with_arity("clock_settime_ns", t::clock_settime_ns, 2));
                 }
             }
-            crate::dict_storage_store(ns, "CLOCK_REALTIME",
+            crate::module_ns_store(ns, "CLOCK_REALTIME",
                 pyre_object::w_int_new(libc::CLOCK_REALTIME as i64));
-            crate::dict_storage_store(ns, "CLOCK_MONOTONIC",
+            crate::module_ns_store(ns, "CLOCK_MONOTONIC",
                 pyre_object::w_int_new(libc::CLOCK_MONOTONIC as i64));
             #[cfg(not(any(
                 target_os = "illumos",
@@ -73,7 +73,7 @@ crate::py_module! {
                 target_os = "openbsd",
                 target_os = "wasi",
             )))]
-            crate::dict_storage_store(ns, "CLOCK_PROCESS_CPUTIME_ID",
+            crate::module_ns_store(ns, "CLOCK_PROCESS_CPUTIME_ID",
                 pyre_object::w_int_new(libc::CLOCK_PROCESS_CPUTIME_ID as i64));
             #[cfg(not(any(
                 target_os = "illumos",
@@ -82,7 +82,7 @@ crate::py_module! {
                 target_os = "openbsd",
                 target_os = "redox",
             )))]
-            crate::dict_storage_store(ns, "CLOCK_THREAD_CPUTIME_ID",
+            crate::module_ns_store(ns, "CLOCK_THREAD_CPUTIME_ID",
                 pyre_object::w_int_new(libc::CLOCK_THREAD_CPUTIME_ID as i64));
         }
         // localtime/mktime/ctime/strftime consult $TZ + /etc/localtime (and
@@ -96,7 +96,7 @@ crate::py_module! {
                 Err(crate::host_seam::stub("this time function"))
             }
             for name in ["localtime", "mktime", "ctime", "strftime"] {
-                crate::dict_storage_store(
+                crate::module_ns_store(
                     ns,
                     name,
                     crate::make_builtin_function(name, tz_unavailable),

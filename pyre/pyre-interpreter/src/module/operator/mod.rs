@@ -174,8 +174,8 @@ crate::py_module! {
             ("__ixor__", "ixor"),
         ];
         for (dunder, src) in ALIASES {
-            if let Some(f) = crate::runtime_ops::dict_storage_get(ns, src) {
-                crate::dict_storage_store(ns, dunder, f);
+            if let Some(f) = crate::module_ns_get(ns, src) {
+                crate::module_ns_store(ns, dunder, f);
             }
         }
     },

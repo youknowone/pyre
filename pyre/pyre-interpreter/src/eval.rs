@@ -573,6 +573,15 @@ pub unsafe fn walk_pyframe_roots_area(
                 // fast path field anymore.
                 let w_builtin_slot = &mut (*(frame)).w_builtin as *mut PyObjectRef;
                 visitor(&mut *(w_builtin_slot as *mut majit_ir::GcRef));
+                let w_builtin = (*frame).w_builtin;
+                if !w_builtin.is_null() && pyre_object::is_module(w_builtin) {
+                    // Module is a Box-immortal carrier, but its module dict is
+                    // now a non-moving GC object. Mark the header through the
+                    // owning field so its custom trace can retain the values.
+                    let w_dict_slot = &mut (*(w_builtin as *mut pyre_object::module::Module)).w_dict
+                        as *mut PyObjectRef;
+                    visitor(&mut *(w_dict_slot as *mut majit_ir::GcRef));
+                }
                 // pyframe.py:49 `self.w_globals` is the dict OBJECT.  Forward
                 // its slot BEFORE anything chases its `dict_storage_proxy`:
                 // both the NEWLOCALS `w_locals` alias check below and the
@@ -827,6 +836,12 @@ pub fn walk_suspended_generator_frame(
         visitor(&mut *(w_globals_obj_slot as *mut majit_ir::GcRef));
         let w_builtin_slot = &mut (*frame).w_builtin as *mut PyObjectRef;
         visitor(&mut *(w_builtin_slot as *mut majit_ir::GcRef));
+        let w_builtin = (*frame).w_builtin;
+        if !w_builtin.is_null() && pyre_object::is_module(w_builtin) {
+            let w_dict_slot =
+                &mut (*(w_builtin as *mut pyre_object::module::Module)).w_dict as *mut PyObjectRef;
+            visitor(&mut *(w_dict_slot as *mut majit_ir::GcRef));
+        }
 
         if !(*frame).debugdata.is_null() {
             if pyre_object::gc_hook::try_gc_owns_object((*frame).debugdata as *mut u8) {

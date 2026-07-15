@@ -1905,8 +1905,8 @@ crate::py_module! {
     },
     extra_init: |ns| {
         // `ExpatError` is an alias of `error` (pyexpat exposes both).
-        if let Some(err) = crate::runtime_ops::dict_storage_get(ns, "error") {
-            crate::dict_storage_store(ns, "ExpatError", err);
+        if let Some(err) = crate::module_ns_get(ns, "error") {
+            crate::module_ns_store(ns, "ExpatError", err);
         }
 
         // model — content-model integer constants.
@@ -1914,7 +1914,7 @@ crate::py_module! {
         for (name, value) in MODEL_CONSTANTS {
             crate::baseobjspace::setdictvalue(model, name, w_int_new(*value));
         }
-        crate::dict_storage_store(ns, "model", model);
+        crate::module_ns_store(ns, "model", model);
 
         // errors — XML_ERROR_* message strings plus the `codes`
         // (message -> code) and `messages` (code -> message) maps.
@@ -1936,7 +1936,7 @@ crate::py_module! {
         }
         crate::baseobjspace::setdictvalue(errors, "codes", codes);
         crate::baseobjspace::setdictvalue(errors, "messages", messages);
-        crate::dict_storage_store(ns, "errors", errors);
+        crate::module_ns_store(ns, "errors", errors);
 
         // features — list of (name, value) capability tuples.
         let features = w_list_new(vec![
@@ -1946,6 +1946,6 @@ crate::py_module! {
             w_tuple_new(vec![w_str_new("XML_CONTEXT_BYTES"), w_int_new(1024)]),
             w_tuple_new(vec![w_str_new("XML_NS"), w_int_new(0)]),
         ]);
-        crate::dict_storage_store(ns, "features", features);
+        crate::module_ns_store(ns, "features", features);
     },
 }

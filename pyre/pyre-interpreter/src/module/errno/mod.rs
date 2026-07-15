@@ -13,9 +13,9 @@ crate::py_module! {
         // alongside each exported constant.  We populate it incrementally
         // as we register the constants below.
         let errorcode = pyre_object::w_dict_new();
-        crate::dict_storage_store(ns, "errorcode", errorcode);
+        crate::module_ns_store(ns, "errorcode", errorcode);
         let mut store = |name: &str, value: i64| {
-            crate::dict_storage_store(ns, name, pyre_object::w_int_new(value));
+            crate::module_ns_store(ns, name, pyre_object::w_int_new(value));
             unsafe {
                 pyre_object::w_dict_store(
                     errorcode,

@@ -13,4 +13,4 @@ pub mod grp;
 pub use grp::register_module as init;
 
 #[cfg(not(unix))]
-pub fn init(_ns: &mut crate::DictStorage) {}
+pub fn init(_ns: pyre_object::PyObjectRef) {}

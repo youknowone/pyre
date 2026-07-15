@@ -4,7 +4,6 @@
 //! was renamed to `register_module`; the host_env signal handlers and the
 //! `faulthandler_extract_fd` helper stay private.
 
-use crate::DictStorage;
 
 // faulthandler module — PyPy: pypy/module/faulthandler/.
 //
@@ -54,8 +53,8 @@ fn faulthandler_extract_fd(w_file: pyre_object::PyObjectRef) -> Result<i32, crat
     Ok(unsafe { pyre_object::w_int_get_value(res) } as i32)
 }
 
-pub fn register_module(ns: &mut DictStorage) {
-    crate::dict_storage_store(
+pub fn register_module(ns: pyre_object::PyObjectRef) {
+    crate::module_ns_store(
         ns,
         "enable",
         crate::make_builtin_function_with_signature(
@@ -88,7 +87,7 @@ pub fn register_module(ns: &mut DictStorage) {
             crate::Signature::new(vec!["file", "all_threads", "c_stack"], None, None, 0, 0),
         ),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "disable",
         crate::make_builtin_function_with_arity(
@@ -104,7 +103,7 @@ pub fn register_module(ns: &mut DictStorage) {
             0,
         ),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "is_enabled",
         crate::make_builtin_function_with_arity(
@@ -122,7 +121,7 @@ pub fn register_module(ns: &mut DictStorage) {
             0,
         ),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "dump_traceback",
         crate::make_builtin_function("dump_traceback", |_| {
@@ -138,12 +137,12 @@ pub fn register_module(ns: &mut DictStorage) {
             Ok(pyre_object::w_none())
         }),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "dump_traceback_later",
         crate::make_builtin_function("dump_traceback_later", |_| Ok(pyre_object::w_none())),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "cancel_dump_traceback_later",
         crate::make_builtin_function_with_arity(
@@ -158,7 +157,7 @@ pub fn register_module(ns: &mut DictStorage) {
     // registering, restore on unregister.  The handler writes a short
     // "user signal NN delivered" message to fd 2 (no traceback).
     // `handler.py:115-128 register(signum, file=None, all_threads=True, chain=False)`.
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "register",
         crate::make_builtin_function_with_signature(
@@ -226,7 +225,7 @@ pub fn register_module(ns: &mut DictStorage) {
             ),
         ),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "unregister",
         crate::make_builtin_function_with_arity(
@@ -257,7 +256,7 @@ pub fn register_module(ns: &mut DictStorage) {
     // process — only ever called from test_faulthandler.py in a
     // subprocess.  Pyre cannot construct an OperationError here
     // because the abort/segfault leaves no caller to catch it.
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "_read_null",
         crate::make_builtin_function_with_arity(
@@ -271,7 +270,7 @@ pub fn register_module(ns: &mut DictStorage) {
             0,
         ),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "_sigsegv",
         crate::make_builtin_function_with_arity(
@@ -286,7 +285,7 @@ pub fn register_module(ns: &mut DictStorage) {
             0,
         ),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "_sigfpe",
         crate::make_builtin_function_with_arity(
@@ -301,7 +300,7 @@ pub fn register_module(ns: &mut DictStorage) {
             0,
         ),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "_sigabrt",
         crate::make_builtin_function_with_arity(
@@ -317,7 +316,7 @@ pub fn register_module(ns: &mut DictStorage) {
             0,
         ),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "_stack_overflow",
         crate::make_builtin_function_with_arity(

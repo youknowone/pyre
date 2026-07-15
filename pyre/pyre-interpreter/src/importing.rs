@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::path::Path;
 
 use crate::{CodeObject, Mode, PyFrame, compile_source_with_filename};
-use crate::{DictStorage, PyExecutionContext, dict_storage_store};
+use crate::{DictStorage, PyExecutionContext};
 use pyre_object::*;
 use rustpython_wtf8::Wtf8Buf;
 
@@ -363,9 +363,9 @@ thread_local! {
     static SYS_PATH: RefCell<Vec<PathBuf>> = RefCell::new(Vec::new());
     /// Builtin modules registry — PyPy equivalent: space.builtin_modules
     ///
-    /// Maps module name → initializer function that populates a DictStorage.
+    /// Maps module name → initializer function that populates a GC module dict.
     /// Each builtin module is lazily created on first import.
-    pub(crate) static BUILTIN_MODULES: RefCell<HashMap<&'static str, fn(&mut DictStorage)>> =
+    pub(crate) static BUILTIN_MODULES: RefCell<HashMap<&'static str, fn(PyObjectRef)>> =
         RefCell::new(HashMap::new());
 
     static IMPORT_ROOT_AREA: ImportRootArea = ImportRootArea {
@@ -402,7 +402,7 @@ struct ImportRootArea {
 /// Register a builtin module initializer.
 ///
 /// PyPy equivalent: Module.install() → space.builtin_modules[name] = mod
-pub fn register_builtin_module(name: &'static str, init: fn(&mut DictStorage)) {
+pub fn register_builtin_module(name: &'static str, init: fn(PyObjectRef)) {
     BUILTIN_MODULES.with(|m| {
         m.borrow_mut().insert(name, init);
     });
@@ -608,8 +608,8 @@ fn require_string_module_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     Ok(arg)
 }
 
-fn init_string_module(ns: &mut DictStorage) {
-    crate::dict_storage_store(
+fn init_string_module(ns: PyObjectRef) {
+    crate::module_ns_store(
         ns,
         "formatter_parser",
         crate::make_builtin_function("formatter_parser", |args| {
@@ -655,7 +655,7 @@ fn init_string_module(ns: &mut DictStorage) {
             Ok(pyre_object::w_list_new(tuples))
         }),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "formatter_field_name_split",
         crate::make_builtin_function("formatter_field_name_split", |args| {
@@ -699,8 +699,8 @@ fn init_string_module(ns: &mut DictStorage) {
 /// `_sysconfig` stub — exposes `config_vars()` returning an empty dict. On
 /// POSIX `sysconfig` only consults this for the build variables that pyre does
 /// not generate; importing it is enough to satisfy `test_sysconfig`.
-fn init_sysconfig_stub(ns: &mut DictStorage) {
-    crate::dict_storage_store(
+fn init_sysconfig_stub(ns: PyObjectRef) {
+    crate::module_ns_store(
         ns,
         "config_vars",
         crate::make_builtin_function("config_vars", |_| Ok(pyre_object::w_dict_new())),
@@ -710,43 +710,43 @@ fn init_sysconfig_stub(ns: &mut DictStorage) {
 /// `_tracemalloc` stub — allocation tracking is not implemented, so the
 /// tracing primitives are neutral no-ops that let `tracemalloc` import and
 /// report an inactive tracer.
-fn init_tracemalloc(ns: &mut DictStorage) {
-    crate::dict_storage_store(
+fn init_tracemalloc(ns: PyObjectRef) {
+    crate::module_ns_store(
         ns,
         "start",
         crate::make_builtin_function("start", |_| Ok(pyre_object::w_none())),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "stop",
         crate::make_builtin_function("stop", |_| Ok(pyre_object::w_none())),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "clear_traces",
         crate::make_builtin_function("clear_traces", |_| Ok(pyre_object::w_none())),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "reset_peak",
         crate::make_builtin_function("reset_peak", |_| Ok(pyre_object::w_none())),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "is_tracing",
         crate::make_builtin_function("is_tracing", |_| Ok(pyre_object::w_bool_from(false))),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "get_traceback_limit",
         crate::make_builtin_function("get_traceback_limit", |_| Ok(pyre_object::w_int_new(1))),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "get_tracemalloc_memory",
         crate::make_builtin_function("get_tracemalloc_memory", |_| Ok(pyre_object::w_int_new(0))),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "get_traced_memory",
         crate::make_builtin_function("get_traced_memory", |_| {
@@ -756,12 +756,12 @@ fn init_tracemalloc(ns: &mut DictStorage) {
             ]))
         }),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "_get_traces",
         crate::make_builtin_function("_get_traces", |_| Ok(pyre_object::w_list_new(Vec::new()))),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "_get_object_traceback",
         crate::make_builtin_function("_get_object_traceback", |_| Ok(pyre_object::w_none())),
@@ -772,13 +772,13 @@ fn init_tracemalloc(ns: &mut DictStorage) {
 /// `urllib.request.getproxies_macosx_sysconf` / `proxy_bypass_macosx_sysconf`
 /// import.  Report "no system proxy configured" so the import succeeds and
 /// proxy resolution yields an empty mapping.
-fn init_scproxy(ns: &mut DictStorage) {
-    crate::dict_storage_store(
+fn init_scproxy(ns: PyObjectRef) {
+    crate::module_ns_store(
         ns,
         "_get_proxies",
         crate::make_builtin_function("_get_proxies", |_| Ok(pyre_object::w_dict_new())),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "_get_proxy_settings",
         crate::make_builtin_function("_get_proxy_settings", |_| {
@@ -801,18 +801,18 @@ fn init_scproxy(ns: &mut DictStorage) {
 }
 
 /// Empty module initializer for C-extension stubs.
-fn empty_module_init(_ns: &mut DictStorage) {}
+fn empty_module_init(_ns: PyObjectRef) {}
 
 /// `_sysconfigdata_*` stub — sysconfig imports this generated module to
 /// read the CPython build variables. We expose a minimal `build_time_vars`
 /// dict that lets sysconfig initialize without crashing.
-fn init_sysconfigdata_empty(ns: &mut DictStorage) {
+fn init_sysconfigdata_empty(ns: PyObjectRef) {
     let vars = pyre_object::w_dict_new();
     // A few keys are load-bearing — sysconfig.get_config_vars() populates
     // them, but an import-time crash hits on 'Py_GIL_DISABLED' and
     // similar. Leave the dict empty; .get('X') returns None for unknown
     // keys which every caller already handles.
-    crate::dict_storage_store(ns, "build_time_vars", vars);
+    crate::module_ns_store(ns, "build_time_vars", vars);
 }
 
 /// Try to load a builtin module by name.
@@ -822,39 +822,42 @@ fn init_sysconfigdata_empty(ns: &mut DictStorage) {
 ///
 /// PyPy `pypy/objspace/std/dictmultiobject.py:60-69` allocates a
 /// `W_ModuleDictObject` for every module via
-/// `allocate_and_init_instance(module=True)`.  Pyre mirrors that here
-/// by running the legacy `init_fn(&mut DictStorage)` against a
-/// temporary `DictStorage`, then folding the populated entries into a
-/// fresh `W_ModuleDictObject` whose `ModuleDictStrategy` (from
-/// `celldict.py:28`) is the post-Phase-5 canonical store.  The
-/// temporary storage drops at function exit; the module's `w_dict`
-/// is the `W_ModuleDictObject`.
+/// `allocate_and_init_instance(module=True)`. Pyre mirrors that here:
+/// the initializer writes directly into a rooted, non-moving module dict.
 fn load_builtin_module(name: &str) -> Option<PyObjectRef> {
     let init_fn = BUILTIN_MODULES.with(|m| m.borrow().get(name).copied())?;
-
-    let mut namespace = DictStorage::new();
-    namespace.fix_ptr();
-
-    // Set __name__ (PyPy: Module.__init__ sets __name__)
+    let w_dict = pyre_object::dictmultiobject::w_module_dict_new();
+    let _roots = pyre_object::gc_roots::push_roots();
+    let save_point = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_dict);
     let name_obj = pyre_object::w_str_new(name);
-    dict_storage_store(&mut namespace, "__name__", name_obj);
-
+    pyre_object::gc_roots::pin_root(name_obj);
+    // Set __name__ (PyPy: Module.__init__ sets __name__)
+    crate::module_ns_store(
+        w_dict,
+        "__name__",
+        pyre_object::gc_roots::shadow_stack_get(save_point + 1),
+    );
     // Run module-specific initializer (PyPy: interpleveldefs)
-    init_fn(&mut namespace);
-
-    // Fold the legacy DictStorage population into the upstream
-    // `W_ModuleDictObject` carrier.  `init_fn` continues to take
-    // `&mut DictStorage` so the ~20 builtin moduledef.rs init
-    // functions remain untouched in this slice; the storage drops at
-    // function exit and the W_ModuleDictObject owns the live state.
-    let w_dict = pyre_object::w_module_dict_new();
-    for (key, &value) in namespace.entries() {
-        if !value.is_null() {
-            // MixedModule parity: interp-level builtin functions carry the
-            // module name as `__module__`, so `pickle` can save them by
-            // reference (`save_global`) without guessing via `whichmodule`.
-            unsafe { crate::function::builtin_function_set_module(value, name_obj) };
-            unsafe { pyre_object::w_dict_setitem_str(w_dict, key, value) };
+    init_fn(w_dict);
+    // MixedModule parity: interp-level builtin functions carry the module
+    // name as `__module__`, so `pickle` can save them by reference
+    // (`save_global`) without guessing via `whichmodule`. Snapshot owned
+    // keys, then reload each movable value and the rooted name afresh.
+    let keys: Vec<String> = unsafe { pyre_object::dictmultiobject::w_dict_str_entries(w_dict) }
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect();
+    for key in &keys {
+        if let Some(value) =
+            unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(w_dict, key) }
+        {
+            unsafe {
+                crate::function::builtin_function_set_module(
+                    value,
+                    pyre_object::gc_roots::shadow_stack_get(save_point + 1),
+                );
+            }
         }
     }
     let module = pyre_object::w_module_new_aliasing_dict(name, std::ptr::null_mut(), w_dict);
@@ -868,7 +871,7 @@ fn load_builtin_module(name: &str) -> Option<PyObjectRef> {
     // so `import builtins; builtins.__builtins__ is builtins` holds
     // for user code regardless of the split.
     if name == "builtins" {
-        unsafe { pyre_object::w_dict_setitem_str(w_dict, "__builtins__", module) };
+        crate::module_ns_store(w_dict, "__builtins__", module);
     }
     Some(module)
 }
@@ -1106,11 +1109,11 @@ pub fn remove_sys_module(name: &str) {
 
 /// GC root walk over every loaded module's dict storage.
 ///
-/// Modules (`malloc_typed`) and their `W_ModuleDictObject`s are
-/// Box-immortal, so the collector cannot reach a module dict's
-/// authoritative `dstorage` / `object_storage` / cell registry
-/// transitively (a Box-immortal object is never relocated and never
-/// has its custom trace fired).  A movable value bound at module scope
+/// Modules (`malloc_typed`) are Box-immortal, while their non-moving
+/// `W_ModuleDictObject`s are GC-managed. Visit each `Module.w_dict` field
+/// first so the header is marked and its custom trace can reach the
+/// authoritative `dstorage` / `object_storage` / cell registry. A movable
+/// value bound at module scope
 /// — e.g. `gc.collect` reached through `gc.__dict__`, or any
 /// module-level list / instance — would otherwise be read back stale
 /// after a collection relocates it.  Treat each loaded module's dict as
@@ -1129,7 +1132,9 @@ pub unsafe fn walk_module_dicts_gc(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
                 continue;
             }
             unsafe {
-                let w_dict = pyre_object::w_module_get_w_dict(module);
+                let module = &mut *(module as *mut pyre_object::module::Module);
+                visitor(&mut module.w_dict);
+                let w_dict = module.w_dict;
                 pyre_object::dictmultiobject::w_module_dict_walk_gc_cells(w_dict, visitor);
             }
         }
@@ -1180,7 +1185,9 @@ pub(crate) unsafe fn walk_import_roots_area(
             continue;
         }
         unsafe {
-            let w_dict = pyre_object::w_module_get_w_dict(module);
+            let module = &mut *(module as *mut pyre_object::module::Module);
+            visitor(&mut module.w_dict);
+            let w_dict = module.w_dict;
             pyre_object::dictmultiobject::w_module_dict_walk_gc_cells(w_dict, visitor);
         }
     }
@@ -1585,7 +1592,32 @@ fn exec_code_module(
 /// only.  Every function defined in `source` retains the intermediate
 /// namespace as its `__globals__`; once copied into the caller's module,
 /// those functions keep the namespace transitively reachable.
-pub fn appleveldef_install(ns: &mut DictStorage, source: &str, filename: &str, names: &[&str]) {
+#[doc(hidden)]
+pub trait AppleveldefNamespace {
+    fn store(&mut self, name: &str, value: PyObjectRef);
+}
+
+impl AppleveldefNamespace for PyObjectRef {
+    fn store(&mut self, name: &str, value: PyObjectRef) {
+        crate::module_ns_store(*self, name, value);
+    }
+}
+
+// `reduce_protocol.rs` deliberately retains its leaked DictStorage scratch
+// until S5. Keep that caller source-identical while module initializers move
+// to the PyObjectRef implementation above.
+impl AppleveldefNamespace for &mut DictStorage {
+    fn store(&mut self, name: &str, value: PyObjectRef) {
+        crate::dict_storage_store(self, name, value);
+    }
+}
+
+pub fn appleveldef_install(
+    mut ns: impl AppleveldefNamespace,
+    source: &str,
+    filename: &str,
+    names: &[&str],
+) {
     let code = compile_source_with_filename(source, Mode::Exec, filename)
         .unwrap_or_else(|e| panic!("appleveldef `{filename}`: compile failed — {e}"));
     let ctx = crate::call::getexecutioncontext();
@@ -1604,7 +1636,7 @@ pub fn appleveldef_install(ns: &mut DictStorage, source: &str, filename: &str, n
     }
     for &name in names {
         match unsafe { pyre_object::w_dict_getitem_str(w_app_globals, name) } {
-            Some(val) => crate::dict_storage_store(ns, name, val),
+            Some(val) => ns.store(name, val),
             None => panic!("appleveldef `{filename}`: name `{name}` not bound by source"),
         }
     }

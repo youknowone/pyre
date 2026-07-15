@@ -2,8 +2,6 @@
 //!
 //! Verbatim move of the inline block previously in importing.rs.
 
-use crate::DictStorage;
-
 #[cfg(unix)]
 thread_local! {
     /// `app_pwd.py:3-19 class struct_passwd(metaclass=structseqtype)`.
@@ -82,7 +80,7 @@ fn pwd_uid_converter(w_uid: pyre_object::PyObjectRef) -> Result<libc::uid_t, cra
 ///
 /// Backed by `rustpython_host_env::pwd` (a thin `nix` wrapper).
 #[cfg(unix)]
-pub fn register_module(ns: &mut DictStorage) {
+pub fn register_module(ns: pyre_object::PyObjectRef) {
     #[cfg(feature = "host_env")]
     fn make_struct_passwd(pw: &rustpython_host_env::pwd::Passwd) -> pyre_object::PyObjectRef {
         crate::_structseq::new_instance(
@@ -124,9 +122,9 @@ pub fn register_module(ns: &mut DictStorage) {
         )
     }
     // `app_pwd.py:1-21 class struct_passwd(metaclass=structseqtype)`.
-    crate::dict_storage_store(ns, "struct_passwd", struct_passwd_type());
-    crate::dict_storage_store(ns, "struct_pwent", struct_passwd_type());
-    crate::dict_storage_store(
+    crate::module_ns_store(ns, "struct_passwd", struct_passwd_type());
+    crate::module_ns_store(ns, "struct_pwent", struct_passwd_type());
+    crate::module_ns_store(
         ns,
         "getpwuid",
         crate::make_builtin_function_with_arity(
@@ -184,7 +182,7 @@ pub fn register_module(ns: &mut DictStorage) {
             1,
         ),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "getpwnam",
         crate::make_builtin_function_with_arity(
@@ -231,7 +229,7 @@ pub fn register_module(ns: &mut DictStorage) {
             1,
         ),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "getpwall",
         crate::make_builtin_function_with_arity(

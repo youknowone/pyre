@@ -28,7 +28,7 @@ crate::py_module! {
     extra_init: |ns| {
         // Mark as a package so `from __pypy__.builders import ...`
         // treats `__pypy__` as a package with submodules.
-        crate::dict_storage_store(ns, "__path__", pyre_object::w_list_new(vec![]));
+        crate::module_ns_store(ns, "__path__", pyre_object::w_list_new(vec![]));
     }
 }
 

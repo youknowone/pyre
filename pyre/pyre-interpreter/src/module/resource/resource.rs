@@ -2,7 +2,6 @@
 //!
 //! Verbatim move of the inline block previously in importing.rs.
 
-use crate::DictStorage;
 
 thread_local! {
     /// `lib_pypy/resource.py:15-37 class struct_rusage(
@@ -47,13 +46,13 @@ fn struct_rusage_type() -> pyre_object::PyObjectRef {
 /// Exposes getrusage / getrlimit / setrlimit plus the standard RUSAGE_*
 /// and RLIMIT_* constants, the `struct_rusage` type attribute, and the
 /// `error = OSError` alias.  Backed by `rustpython_host_env::resource`.
-pub fn register_module(ns: &mut DictStorage) {
+pub fn register_module(ns: pyre_object::PyObjectRef) {
     // `lib_pypy/resource.py:13 error = OSError` and
     // `:15-37 class struct_rusage`.
     let w_os_error = crate::builtins::lookup_exc_class("OSError")
         .expect("OSError must be installed before init_resource");
-    crate::dict_storage_store(ns, "error", w_os_error);
-    crate::dict_storage_store(ns, "struct_rusage", struct_rusage_type());
+    crate::module_ns_store(ns, "error", w_os_error);
+    crate::module_ns_store(ns, "struct_rusage", struct_rusage_type());
     // ── struct_rusage tuple (16-field layout matches CPython) ──
     #[cfg(all(unix, feature = "host_env"))]
     fn make_struct_rusage(r: &rustpython_host_env::resource::RUsage) -> pyre_object::PyObjectRef {
@@ -80,7 +79,7 @@ pub fn register_module(ns: &mut DictStorage) {
             ],
         )
     }
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "getrusage",
         crate::make_builtin_function_with_arity(
@@ -127,7 +126,7 @@ pub fn register_module(ns: &mut DictStorage) {
             1,
         ),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "getrlimit",
         crate::make_builtin_function_with_arity(
@@ -172,7 +171,7 @@ pub fn register_module(ns: &mut DictStorage) {
             1,
         ),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "setrlimit",
         crate::make_builtin_function_with_arity(
@@ -264,68 +263,68 @@ pub fn register_module(ns: &mut DictStorage) {
     // ── Constants (POSIX subset matching CPython) ──
     #[cfg(unix)]
     {
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "RUSAGE_SELF",
             pyre_object::w_int_new(libc::RUSAGE_SELF as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "RUSAGE_CHILDREN",
             pyre_object::w_int_new(libc::RUSAGE_CHILDREN as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "RLIMIT_CPU",
             pyre_object::w_int_new(libc::RLIMIT_CPU as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "RLIMIT_FSIZE",
             pyre_object::w_int_new(libc::RLIMIT_FSIZE as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "RLIMIT_DATA",
             pyre_object::w_int_new(libc::RLIMIT_DATA as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "RLIMIT_STACK",
             pyre_object::w_int_new(libc::RLIMIT_STACK as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "RLIMIT_CORE",
             pyre_object::w_int_new(libc::RLIMIT_CORE as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "RLIMIT_NOFILE",
             pyre_object::w_int_new(libc::RLIMIT_NOFILE as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "RLIMIT_AS",
             pyre_object::w_int_new(libc::RLIMIT_AS as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "RLIMIT_RSS",
             pyre_object::w_int_new(libc::RLIMIT_RSS as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "RLIMIT_NPROC",
             pyre_object::w_int_new(libc::RLIMIT_NPROC as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "RLIMIT_MEMLOCK",
             pyre_object::w_int_new(libc::RLIMIT_MEMLOCK as i64),
         );
         // RLIM_INFINITY: unsigned max — pyre stores as i64 (-1 on signed widen).
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "RLIM_INFINITY",
             pyre_object::w_int_new(libc::RLIM_INFINITY as i64),

@@ -2,7 +2,6 @@
 //!
 //! Verbatim move of the inline block previously in importing.rs.
 
-use crate::DictStorage;
 
 // ──────────────────────────────────────────────────────────────────────
 // _ctypes module — PyPy: `pypy/module/_rawffi/` plus `lib_pypy/_ctypes/`.
@@ -16,33 +15,33 @@ use crate::DictStorage;
 // state — those are later slices.
 // ──────────────────────────────────────────────────────────────────────
 
-pub fn register_module(ns: &mut DictStorage) {
+pub fn register_module(ns: pyre_object::PyObjectRef) {
     #[cfg(all(unix, feature = "host_env"))]
     {
         use rustpython_host_env::ctypes as host_ctypes;
 
         // dlopen flags (POSIX).
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "RTLD_LOCAL",
             pyre_object::w_int_new(libc::RTLD_LOCAL as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "RTLD_GLOBAL",
             pyre_object::w_int_new(libc::RTLD_GLOBAL as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "RTLD_LAZY",
             pyre_object::w_int_new(libc::RTLD_LAZY as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "RTLD_NOW",
             pyre_object::w_int_new(libc::RTLD_NOW as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "DEFAULT_MODE",
             pyre_object::w_int_new(host_ctypes::dlopen_mode(None) as i64),
@@ -50,7 +49,7 @@ pub fn register_module(ns: &mut DictStorage) {
 
         // dlopen(name, mode=DEFAULT_MODE) → handle (opaque integer that
         // indexes into host_env's libcache).
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "dlopen",
             crate::make_builtin_function("dlopen", |args| {
@@ -90,7 +89,7 @@ pub fn register_module(ns: &mut DictStorage) {
 
         // dlsym(handle, name) → address (int).  Returns the function
         // pointer; for data symbols use dlsym(handle, name) the same way.
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "dlsym",
             crate::make_builtin_function_with_arity(
@@ -126,7 +125,7 @@ pub fn register_module(ns: &mut DictStorage) {
         );
 
         // dlclose(handle) → None
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "dlclose",
             crate::make_builtin_function_with_arity(
@@ -146,7 +145,7 @@ pub fn register_module(ns: &mut DictStorage) {
         // get_errno / set_errno — ctypes routes them through host_env so
         // a saved-errno round-trip across foreign calls survives the
         // global libc::errno being overwritten by intermediate syscalls.
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "get_errno",
             crate::make_builtin_function_with_arity(
@@ -159,7 +158,7 @@ pub fn register_module(ns: &mut DictStorage) {
                 0,
             ),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "set_errno",
             crate::make_builtin_function_with_arity(
@@ -177,7 +176,7 @@ pub fn register_module(ns: &mut DictStorage) {
         );
 
         // sizeof / alignment of simple ctypes type codes ('i', 'l', 'd', etc.).
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "_sizeof_typecode",
             crate::make_builtin_function_with_arity(
@@ -199,7 +198,7 @@ pub fn register_module(ns: &mut DictStorage) {
                 1,
             ),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "_alignof_typecode",
             crate::make_builtin_function_with_arity(
@@ -223,7 +222,7 @@ pub fn register_module(ns: &mut DictStorage) {
         );
 
         // Address of memmove / memset for ctypes.memmove / memset.
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "memmove",
             crate::make_builtin_function_with_arity(
@@ -245,7 +244,7 @@ pub fn register_module(ns: &mut DictStorage) {
                 3,
             ),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "memset",
             crate::make_builtin_function_with_arity(
@@ -266,7 +265,7 @@ pub fn register_module(ns: &mut DictStorage) {
         );
 
         // string_at(ptr, size=-1) -> bytes
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "string_at",
             crate::make_builtin_function("string_at", |args| {
@@ -295,7 +294,7 @@ pub fn register_module(ns: &mut DictStorage) {
         // FFI library helpers used by stdlib ctypes/util.py:
         //   _ctypes.dlopen + DEFAULT_MODE typically come above, but stdlib
         //   also looks for _ctypes.SIZEOF_TIME_T to size struct timespec.
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "SIZEOF_TIME_T",
             pyre_object::w_int_new(rustpython_host_env::ctypes::SIZEOF_TIME_T as i64),
@@ -303,19 +302,19 @@ pub fn register_module(ns: &mut DictStorage) {
     }
 
     // Error type alias.
-    crate::dict_storage_store(ns, "ArgumentError", crate::typedef::w_object());
-    crate::dict_storage_store(ns, "_Pointer", crate::typedef::w_object());
-    crate::dict_storage_store(ns, "Structure", crate::typedef::w_object());
-    crate::dict_storage_store(ns, "Union", crate::typedef::w_object());
-    crate::dict_storage_store(ns, "Array", crate::typedef::w_object());
-    crate::dict_storage_store(ns, "_CFuncPtr", crate::typedef::w_object());
-    crate::dict_storage_store(ns, "_SimpleCData", crate::typedef::w_object());
-    crate::dict_storage_store(ns, "CFuncPtr", crate::typedef::w_object());
-    crate::dict_storage_store(ns, "POINTER", crate::typedef::w_object());
-    crate::dict_storage_store(ns, "pointer", crate::typedef::w_object());
-    crate::dict_storage_store(ns, "byref", crate::typedef::w_object());
-    crate::dict_storage_store(ns, "addressof", crate::typedef::w_object());
-    crate::dict_storage_store(ns, "sizeof", crate::typedef::w_object());
-    crate::dict_storage_store(ns, "alignment", crate::typedef::w_object());
-    crate::dict_storage_store(ns, "_check_HRESULT", crate::typedef::w_object());
+    crate::module_ns_store(ns, "ArgumentError", crate::typedef::w_object());
+    crate::module_ns_store(ns, "_Pointer", crate::typedef::w_object());
+    crate::module_ns_store(ns, "Structure", crate::typedef::w_object());
+    crate::module_ns_store(ns, "Union", crate::typedef::w_object());
+    crate::module_ns_store(ns, "Array", crate::typedef::w_object());
+    crate::module_ns_store(ns, "_CFuncPtr", crate::typedef::w_object());
+    crate::module_ns_store(ns, "_SimpleCData", crate::typedef::w_object());
+    crate::module_ns_store(ns, "CFuncPtr", crate::typedef::w_object());
+    crate::module_ns_store(ns, "POINTER", crate::typedef::w_object());
+    crate::module_ns_store(ns, "pointer", crate::typedef::w_object());
+    crate::module_ns_store(ns, "byref", crate::typedef::w_object());
+    crate::module_ns_store(ns, "addressof", crate::typedef::w_object());
+    crate::module_ns_store(ns, "sizeof", crate::typedef::w_object());
+    crate::module_ns_store(ns, "alignment", crate::typedef::w_object());
+    crate::module_ns_store(ns, "_check_HRESULT", crate::typedef::w_object());
 }

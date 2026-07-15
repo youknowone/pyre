@@ -3,7 +3,6 @@
 //! Verbatim move of the inline block previously in importing.rs.
 
 use super::signalstate;
-use crate::DictStorage;
 use crate::executioncontext::{
     AsyncAction, AsyncActionOps, ExecutionContext, PeriodicAsyncAction, PeriodicAsyncActionOps,
 };
@@ -451,15 +450,15 @@ pub fn install_signal_handling(ec: &mut ExecutionContext) {
 /// from `libc::*` so they match the host's POSIX numbering (the previous
 /// macOS-flavoured hard-coded list disagreed with Linux for
 /// SIGUSR1/SIGUSR2/SIGCHLD).
-pub fn register_module(ns: &mut DictStorage) {
+pub fn register_module(ns: pyre_object::PyObjectRef) {
     // interp_signal.py:291-326 `signal(signum, handler) -> previous`.
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "signal",
         crate::make_builtin_function_with_arity("signal", |args| signal_signal(args[0], args[1]), 2),
     );
     // interp_signal.py:238-251 `getsignal(signum) -> action`.
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "getsignal",
         crate::make_builtin_function_with_arity("getsignal", |args| signal_getsignal(args[0]), 1),
@@ -467,14 +466,14 @@ pub fn register_module(ns: &mut DictStorage) {
     // `interp_signal.py:default_int_handler` — `raise KeyboardInterrupt`.
     // Shares one identity with the SIGINT handler installed at startup so
     // `getsignal(SIGINT) is signal.default_int_handler`.
-    crate::dict_storage_store(ns, "default_int_handler", default_int_handler_obj());
+    crate::module_ns_store(ns, "default_int_handler", default_int_handler_obj());
     // `interp_signal.py:set_wakeup_fd` — stores the fd in a
     // process-wide cell and returns the previous value.  Real signal
     // delivery on the fd needs interpreter-side trampolines (still
     // unimplemented per the header comment); we still surface the
     // get/set contract so callers like `signal.set_wakeup_fd(-1)` no
     // longer silently report a stale −1.
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "set_wakeup_fd",
         crate::make_builtin_function("set_wakeup_fd", |args| {
@@ -553,7 +552,7 @@ pub fn register_module(ns: &mut DictStorage) {
         }),
     );
     // ── real host_env-backed entry points ──
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "raise_signal",
         crate::make_builtin_function_with_arity(
@@ -600,7 +599,7 @@ pub fn register_module(ns: &mut DictStorage) {
             1,
         ),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "strsignal",
         crate::make_builtin_function_with_arity(
@@ -628,7 +627,7 @@ pub fn register_module(ns: &mut DictStorage) {
             1,
         ),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "valid_signals",
         crate::make_builtin_function_with_arity(
@@ -660,7 +659,7 @@ pub fn register_module(ns: &mut DictStorage) {
     // instance carries errno / strerror.
     let w_os_error = crate::builtins::lookup_exc_class("OSError")
         .expect("OSError must be installed before _signal init");
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "ItimerError",
         crate::builtins::make_exc_type(
@@ -671,7 +670,7 @@ pub fn register_module(ns: &mut DictStorage) {
     );
     #[cfg(unix)]
     {
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "alarm",
             crate::make_builtin_function_with_arity(
@@ -704,7 +703,7 @@ pub fn register_module(ns: &mut DictStorage) {
                 1,
             ),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "pause",
             crate::make_builtin_function_with_arity(
@@ -730,7 +729,7 @@ pub fn register_module(ns: &mut DictStorage) {
             ),
         );
         // setitimer(which, seconds, interval=0.0) -> (delay, interval)
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "setitimer",
             crate::make_builtin_function("setitimer", |args| {
@@ -784,7 +783,7 @@ pub fn register_module(ns: &mut DictStorage) {
             }),
         );
         // getitimer(which) -> (delay, interval)
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "getitimer",
             crate::make_builtin_function_with_arity(
@@ -828,7 +827,7 @@ pub fn register_module(ns: &mut DictStorage) {
             ),
         );
         // siginterrupt(signalnum, flag) -> None
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "siginterrupt",
             crate::make_builtin_function_with_arity(
@@ -863,23 +862,23 @@ pub fn register_module(ns: &mut DictStorage) {
             ),
         );
         // ITIMER_REAL/VIRTUAL/PROF
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "ITIMER_REAL",
             pyre_object::w_int_new(libc::ITIMER_REAL as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "ITIMER_VIRTUAL",
             pyre_object::w_int_new(libc::ITIMER_VIRTUAL as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "ITIMER_PROF",
             pyre_object::w_int_new(libc::ITIMER_PROF as i64),
         );
         // sigwait(sigset) -> signum — interp_signal.py:515-524
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "sigwait",
             crate::make_builtin_function_with_arity(
@@ -936,7 +935,7 @@ pub fn register_module(ns: &mut DictStorage) {
             ),
         );
         // sigpending() -> set of pending signals — interp_signal.py:526-535
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "sigpending",
             crate::make_builtin_function_with_arity(
@@ -968,7 +967,7 @@ pub fn register_module(ns: &mut DictStorage) {
             ),
         );
         // pthread_kill(tid, signum) -> None — interp_signal.py:466-474
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "pthread_kill",
             crate::make_builtin_function_with_arity(
@@ -1012,7 +1011,7 @@ pub fn register_module(ns: &mut DictStorage) {
             ),
         );
         // pthread_sigmask(how, mask) -> previous mask (set of signums)
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "pthread_sigmask",
             crate::make_builtin_function_with_arity(
@@ -1100,24 +1099,24 @@ pub fn register_module(ns: &mut DictStorage) {
                 2,
             ),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "SIG_BLOCK",
             pyre_object::w_int_new(libc::SIG_BLOCK as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "SIG_UNBLOCK",
             pyre_object::w_int_new(libc::SIG_UNBLOCK as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "SIG_SETMASK",
             pyre_object::w_int_new(libc::SIG_SETMASK as i64),
         );
         // pidfd_send_signal(pidfd, sig, siginfo=None, flags=0) - Linux-only
         #[cfg(target_os = "linux")]
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "pidfd_send_signal",
             crate::make_builtin_function("pidfd_send_signal", |args| {
@@ -1162,50 +1161,50 @@ pub fn register_module(ns: &mut DictStorage) {
             }),
         );
     }
-    crate::dict_storage_store(ns, "SIG_DFL", pyre_object::w_int_new(0));
-    crate::dict_storage_store(ns, "SIG_IGN", pyre_object::w_int_new(1));
+    crate::module_ns_store(ns, "SIG_DFL", pyre_object::w_int_new(0));
+    crate::module_ns_store(ns, "SIG_IGN", pyre_object::w_int_new(1));
     // libc crate doesn't surface NSIG portably; use POSIX 64-signal cap.
-    crate::dict_storage_store(ns, "NSIG", pyre_object::w_int_new(64));
+    crate::module_ns_store(ns, "NSIG", pyre_object::w_int_new(64));
     // Common signal numbers (POSIX subset, sourced from libc so numerics
     // match the host — Linux SIGUSR1=10 / macOS SIGUSR1=30, etc.).
     #[cfg(unix)]
     {
-        crate::dict_storage_store(ns, "SIGHUP", pyre_object::w_int_new(libc::SIGHUP as i64));
-        crate::dict_storage_store(ns, "SIGINT", pyre_object::w_int_new(libc::SIGINT as i64));
-        crate::dict_storage_store(ns, "SIGQUIT", pyre_object::w_int_new(libc::SIGQUIT as i64));
-        crate::dict_storage_store(ns, "SIGILL", pyre_object::w_int_new(libc::SIGILL as i64));
-        crate::dict_storage_store(ns, "SIGTRAP", pyre_object::w_int_new(libc::SIGTRAP as i64));
-        crate::dict_storage_store(ns, "SIGABRT", pyre_object::w_int_new(libc::SIGABRT as i64));
-        crate::dict_storage_store(ns, "SIGBUS", pyre_object::w_int_new(libc::SIGBUS as i64));
-        crate::dict_storage_store(ns, "SIGFPE", pyre_object::w_int_new(libc::SIGFPE as i64));
-        crate::dict_storage_store(ns, "SIGKILL", pyre_object::w_int_new(libc::SIGKILL as i64));
-        crate::dict_storage_store(ns, "SIGUSR1", pyre_object::w_int_new(libc::SIGUSR1 as i64));
-        crate::dict_storage_store(ns, "SIGSEGV", pyre_object::w_int_new(libc::SIGSEGV as i64));
-        crate::dict_storage_store(ns, "SIGUSR2", pyre_object::w_int_new(libc::SIGUSR2 as i64));
-        crate::dict_storage_store(ns, "SIGPIPE", pyre_object::w_int_new(libc::SIGPIPE as i64));
-        crate::dict_storage_store(ns, "SIGALRM", pyre_object::w_int_new(libc::SIGALRM as i64));
-        crate::dict_storage_store(ns, "SIGTERM", pyre_object::w_int_new(libc::SIGTERM as i64));
-        crate::dict_storage_store(ns, "SIGCHLD", pyre_object::w_int_new(libc::SIGCHLD as i64));
-        crate::dict_storage_store(ns, "SIGCONT", pyre_object::w_int_new(libc::SIGCONT as i64));
-        crate::dict_storage_store(ns, "SIGSTOP", pyre_object::w_int_new(libc::SIGSTOP as i64));
-        crate::dict_storage_store(ns, "SIGTSTP", pyre_object::w_int_new(libc::SIGTSTP as i64));
-        crate::dict_storage_store(ns, "SIGTTIN", pyre_object::w_int_new(libc::SIGTTIN as i64));
-        crate::dict_storage_store(ns, "SIGTTOU", pyre_object::w_int_new(libc::SIGTTOU as i64));
-        crate::dict_storage_store(ns, "SIGURG", pyre_object::w_int_new(libc::SIGURG as i64));
-        crate::dict_storage_store(ns, "SIGXCPU", pyre_object::w_int_new(libc::SIGXCPU as i64));
-        crate::dict_storage_store(ns, "SIGXFSZ", pyre_object::w_int_new(libc::SIGXFSZ as i64));
-        crate::dict_storage_store(
+        crate::module_ns_store(ns, "SIGHUP", pyre_object::w_int_new(libc::SIGHUP as i64));
+        crate::module_ns_store(ns, "SIGINT", pyre_object::w_int_new(libc::SIGINT as i64));
+        crate::module_ns_store(ns, "SIGQUIT", pyre_object::w_int_new(libc::SIGQUIT as i64));
+        crate::module_ns_store(ns, "SIGILL", pyre_object::w_int_new(libc::SIGILL as i64));
+        crate::module_ns_store(ns, "SIGTRAP", pyre_object::w_int_new(libc::SIGTRAP as i64));
+        crate::module_ns_store(ns, "SIGABRT", pyre_object::w_int_new(libc::SIGABRT as i64));
+        crate::module_ns_store(ns, "SIGBUS", pyre_object::w_int_new(libc::SIGBUS as i64));
+        crate::module_ns_store(ns, "SIGFPE", pyre_object::w_int_new(libc::SIGFPE as i64));
+        crate::module_ns_store(ns, "SIGKILL", pyre_object::w_int_new(libc::SIGKILL as i64));
+        crate::module_ns_store(ns, "SIGUSR1", pyre_object::w_int_new(libc::SIGUSR1 as i64));
+        crate::module_ns_store(ns, "SIGSEGV", pyre_object::w_int_new(libc::SIGSEGV as i64));
+        crate::module_ns_store(ns, "SIGUSR2", pyre_object::w_int_new(libc::SIGUSR2 as i64));
+        crate::module_ns_store(ns, "SIGPIPE", pyre_object::w_int_new(libc::SIGPIPE as i64));
+        crate::module_ns_store(ns, "SIGALRM", pyre_object::w_int_new(libc::SIGALRM as i64));
+        crate::module_ns_store(ns, "SIGTERM", pyre_object::w_int_new(libc::SIGTERM as i64));
+        crate::module_ns_store(ns, "SIGCHLD", pyre_object::w_int_new(libc::SIGCHLD as i64));
+        crate::module_ns_store(ns, "SIGCONT", pyre_object::w_int_new(libc::SIGCONT as i64));
+        crate::module_ns_store(ns, "SIGSTOP", pyre_object::w_int_new(libc::SIGSTOP as i64));
+        crate::module_ns_store(ns, "SIGTSTP", pyre_object::w_int_new(libc::SIGTSTP as i64));
+        crate::module_ns_store(ns, "SIGTTIN", pyre_object::w_int_new(libc::SIGTTIN as i64));
+        crate::module_ns_store(ns, "SIGTTOU", pyre_object::w_int_new(libc::SIGTTOU as i64));
+        crate::module_ns_store(ns, "SIGURG", pyre_object::w_int_new(libc::SIGURG as i64));
+        crate::module_ns_store(ns, "SIGXCPU", pyre_object::w_int_new(libc::SIGXCPU as i64));
+        crate::module_ns_store(ns, "SIGXFSZ", pyre_object::w_int_new(libc::SIGXFSZ as i64));
+        crate::module_ns_store(
             ns,
             "SIGVTALRM",
             pyre_object::w_int_new(libc::SIGVTALRM as i64),
         );
-        crate::dict_storage_store(ns, "SIGPROF", pyre_object::w_int_new(libc::SIGPROF as i64));
-        crate::dict_storage_store(
+        crate::module_ns_store(ns, "SIGPROF", pyre_object::w_int_new(libc::SIGPROF as i64));
+        crate::module_ns_store(
             ns,
             "SIGWINCH",
             pyre_object::w_int_new(libc::SIGWINCH as i64),
         );
-        crate::dict_storage_store(ns, "SIGIO", pyre_object::w_int_new(libc::SIGIO as i64));
-        crate::dict_storage_store(ns, "SIGSYS", pyre_object::w_int_new(libc::SIGSYS as i64));
+        crate::module_ns_store(ns, "SIGIO", pyre_object::w_int_new(libc::SIGIO as i64));
+        crate::module_ns_store(ns, "SIGSYS", pyre_object::w_int_new(libc::SIGSYS as i64));
     }
 }

@@ -346,6 +346,6 @@ crate::py_module! {
         bind("normalize", normalize);
         bind("is_normalized", is_normalized);
         unsafe { w_dict_setitem_str(d, "unidata_version", w_str_new("3.2.0")) };
-        crate::dict_storage_store(ns, "ucd_3_2_0", ucd);
+        crate::module_ns_store(ns, "ucd_3_2_0", ucd);
     },
 }

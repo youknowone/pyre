@@ -37,13 +37,13 @@ crate::py_module! {
         // `Python/bytecodes.c` exposes `ENABLE_SPECIALIZATION`; pyre has no
         // CPython-style adaptive specialization, so it reads False — tests
         // gated on `@requires_specialization` then skip.
-        crate::dict_storage_store(ns, "ENABLE_SPECIALIZATION", w_bool_from(false));
-        crate::dict_storage_store(ns, "ENABLE_SPECIALIZATION_FT", w_bool_from(false));
+        crate::module_ns_store(ns, "ENABLE_SPECIALIZATION", w_bool_from(false));
+        crate::module_ns_store(ns, "ENABLE_SPECIALIZATION_FT", w_bool_from(false));
         for name in [
             "has_arg", "has_const", "has_name", "has_jump", "has_jrel",
             "has_jabs", "has_free", "has_local", "has_exc",
         ] {
-            crate::dict_storage_store(
+            crate::module_ns_store(
                 ns, name,
                 crate::make_builtin_function_with_arity(name, |_| Ok(w_bool_from(false)), 0),
             );

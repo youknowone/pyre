@@ -3,7 +3,6 @@
 //!
 //! Verbatim move of the inline block previously in importing.rs.
 
-use crate::DictStorage;
 use pyre_object::PyObjectRef;
 
 /// _ast stub — PyPy: pypy/module/_ast/
@@ -14,7 +13,7 @@ use pyre_object::PyObjectRef;
 /// (`class Suite(mod)`) and monkeypatch them (`Tuple.dims = property(...)`),
 /// matching CPython where `_ast` types are heap types. Actual AST node
 /// construction is not supported because pyre uses RustPython's compiler.
-pub fn register_module(ns: &mut DictStorage) {
+pub fn register_module(ns: pyre_object::PyObjectRef) {
     // `type(name, (base,), {"__module__": "ast"})` — a fresh heap type. The
     // generated AST types report `__module__ == "ast"` (astcompiler/ast.py:150;
     // the host `_ast.Module.__module__` is likewise `'ast'`).
@@ -32,7 +31,7 @@ pub fn register_module(ns: &mut DictStorage) {
 
     // Root: AST(object).
     let ast = make("AST", crate::typedef::w_object());
-    crate::dict_storage_store(ns, "AST", ast);
+    crate::module_ns_store(ns, "AST", ast);
 
     // Abstract groups (direct AST subclasses) and their concrete members,
     // per the ASDL grammar.
@@ -80,10 +79,10 @@ pub fn register_module(ns: &mut DictStorage) {
     ];
     for (group, members) in groups {
         let g = make(group, ast);
-        crate::dict_storage_store(ns, group, g);
+        crate::module_ns_store(ns, group, g);
         for m in *members {
             let t = make(m, g);
-            crate::dict_storage_store(ns, m, t);
+            crate::module_ns_store(ns, m, t);
         }
     }
 
@@ -92,7 +91,7 @@ pub fn register_module(ns: &mut DictStorage) {
         "comprehension", "arguments", "arg", "keyword", "alias", "withitem", "match_case",
     ] {
         let t = make(name, ast);
-        crate::dict_storage_store(ns, name, t);
+        crate::module_ns_store(ns, name, t);
     }
 
     // `compile()` / `ast.parse()` flag bitmasks, used by `lib-python/3/ast.py`
@@ -104,6 +103,6 @@ pub fn register_module(ns: &mut DictStorage) {
         ("PyCF_TYPE_COMMENTS", 0x4000_0000),
         ("PyCF_OPTIMIZED_AST", 0x8000),
     ] {
-        crate::dict_storage_store(ns, name, pyre_object::w_int_new(*value));
+        crate::module_ns_store(ns, name, pyre_object::w_int_new(*value));
     }
 }

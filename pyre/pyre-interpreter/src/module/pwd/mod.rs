@@ -14,4 +14,4 @@ pub mod interp_pwd;
 pub use interp_pwd::register_module as init;
 
 #[cfg(not(unix))]
-pub fn init(_ns: &mut crate::DictStorage) {}
+pub fn init(_ns: pyre_object::PyObjectRef) {}

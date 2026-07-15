@@ -83,9 +83,9 @@ crate::py_module! {
     extra_init: |ns| {
         #[cfg(all(unix, feature = "host_env"))]
         {
-            crate::dict_storage_store(ns, "shm_open",
+            crate::module_ns_store(ns, "shm_open",
                 crate::make_builtin_function("shm_open", shm_open));
-            crate::dict_storage_store(ns, "shm_unlink",
+            crate::module_ns_store(ns, "shm_unlink",
                 crate::make_builtin_function_with_arity("shm_unlink", shm_unlink, 1));
         }
         #[cfg(not(all(unix, feature = "host_env")))]

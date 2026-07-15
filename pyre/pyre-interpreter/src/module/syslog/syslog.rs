@@ -2,7 +2,6 @@
 //!
 //! Verbatim move of the inline block previously in importing.rs.
 
-use crate::DictStorage;
 
 /// `lib_pypy/syslog.py:35-44` — process-global tracking of whether
 /// `openlog()` has been called so the first `syslog()` can auto-open with
@@ -14,8 +13,8 @@ static SYSLOG_OPENED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 ///
 /// openlog / syslog / closelog / setlogmask.  Backed by
 /// `rustpython_host_env::syslog`.  Unix-only.
-pub fn register_module(ns: &mut DictStorage) {
-    crate::dict_storage_store(
+pub fn register_module(ns: pyre_object::PyObjectRef) {
+    crate::module_ns_store(
         ns,
         "openlog",
         crate::make_builtin_function("openlog", |args| {
@@ -60,7 +59,7 @@ pub fn register_module(ns: &mut DictStorage) {
             }
         }),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "syslog",
         crate::make_builtin_function("syslog", |args| {
@@ -109,7 +108,7 @@ pub fn register_module(ns: &mut DictStorage) {
             }
         }),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "closelog",
         crate::make_builtin_function_with_arity(
@@ -124,7 +123,7 @@ pub fn register_module(ns: &mut DictStorage) {
             0,
         ),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "setlogmask",
         crate::make_builtin_function_with_arity(
@@ -160,145 +159,145 @@ pub fn register_module(ns: &mut DictStorage) {
     // Priorities + facilities (POSIX subset matching CPython).
     #[cfg(unix)]
     {
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "LOG_EMERG",
             pyre_object::w_int_new(libc::LOG_EMERG as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "LOG_ALERT",
             pyre_object::w_int_new(libc::LOG_ALERT as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "LOG_CRIT",
             pyre_object::w_int_new(libc::LOG_CRIT as i64),
         );
-        crate::dict_storage_store(ns, "LOG_ERR", pyre_object::w_int_new(libc::LOG_ERR as i64));
-        crate::dict_storage_store(
+        crate::module_ns_store(ns, "LOG_ERR", pyre_object::w_int_new(libc::LOG_ERR as i64));
+        crate::module_ns_store(
             ns,
             "LOG_WARNING",
             pyre_object::w_int_new(libc::LOG_WARNING as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "LOG_NOTICE",
             pyre_object::w_int_new(libc::LOG_NOTICE as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "LOG_INFO",
             pyre_object::w_int_new(libc::LOG_INFO as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "LOG_DEBUG",
             pyre_object::w_int_new(libc::LOG_DEBUG as i64),
         );
-        crate::dict_storage_store(ns, "LOG_PID", pyre_object::w_int_new(libc::LOG_PID as i64));
-        crate::dict_storage_store(
+        crate::module_ns_store(ns, "LOG_PID", pyre_object::w_int_new(libc::LOG_PID as i64));
+        crate::module_ns_store(
             ns,
             "LOG_CONS",
             pyre_object::w_int_new(libc::LOG_CONS as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "LOG_NDELAY",
             pyre_object::w_int_new(libc::LOG_NDELAY as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "LOG_NOWAIT",
             pyre_object::w_int_new(libc::LOG_NOWAIT as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "LOG_PERROR",
             pyre_object::w_int_new(libc::LOG_PERROR as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "LOG_KERN",
             pyre_object::w_int_new(libc::LOG_KERN as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "LOG_USER",
             pyre_object::w_int_new(libc::LOG_USER as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "LOG_MAIL",
             pyre_object::w_int_new(libc::LOG_MAIL as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "LOG_DAEMON",
             pyre_object::w_int_new(libc::LOG_DAEMON as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "LOG_AUTH",
             pyre_object::w_int_new(libc::LOG_AUTH as i64),
         );
-        crate::dict_storage_store(ns, "LOG_LPR", pyre_object::w_int_new(libc::LOG_LPR as i64));
-        crate::dict_storage_store(
+        crate::module_ns_store(ns, "LOG_LPR", pyre_object::w_int_new(libc::LOG_LPR as i64));
+        crate::module_ns_store(
             ns,
             "LOG_NEWS",
             pyre_object::w_int_new(libc::LOG_NEWS as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "LOG_UUCP",
             pyre_object::w_int_new(libc::LOG_UUCP as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "LOG_CRON",
             pyre_object::w_int_new(libc::LOG_CRON as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "LOG_SYSLOG",
             pyre_object::w_int_new(libc::LOG_SYSLOG as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "LOG_LOCAL0",
             pyre_object::w_int_new(libc::LOG_LOCAL0 as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "LOG_LOCAL1",
             pyre_object::w_int_new(libc::LOG_LOCAL1 as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "LOG_LOCAL2",
             pyre_object::w_int_new(libc::LOG_LOCAL2 as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "LOG_LOCAL3",
             pyre_object::w_int_new(libc::LOG_LOCAL3 as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "LOG_LOCAL4",
             pyre_object::w_int_new(libc::LOG_LOCAL4 as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "LOG_LOCAL5",
             pyre_object::w_int_new(libc::LOG_LOCAL5 as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "LOG_LOCAL6",
             pyre_object::w_int_new(libc::LOG_LOCAL6 as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "LOG_LOCAL7",
             pyre_object::w_int_new(libc::LOG_LOCAL7 as i64),
@@ -308,7 +307,7 @@ pub fn register_module(ns: &mut DictStorage) {
     // helpers for building setlogmask() arguments.
     //   LOG_MASK(pri)  → 1 << pri
     //   LOG_UPTO(pri)  → (1 << (pri + 1)) - 1
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "LOG_MASK",
         crate::make_builtin_function_with_arity(
@@ -323,7 +322,7 @@ pub fn register_module(ns: &mut DictStorage) {
             1,
         ),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "LOG_UPTO",
         crate::make_builtin_function_with_arity(

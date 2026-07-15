@@ -2,7 +2,6 @@
 //!
 //! Verbatim move of the inline block previously in importing.rs.
 
-use crate::DictStorage;
 
 /// fcntl module — PyPy: pypy/module/fcntl/interp_fcntl.py.
 ///
@@ -10,8 +9,8 @@ use crate::DictStorage;
 /// lockf(fd, cmd, len=0, start=0, whence=0).  Backed by
 /// `rustpython_host_env::fcntl`.  Only the integer-argument forms are
 /// implemented; bytes-buffer (out-arg) variants are out of scope.
-pub fn register_module(ns: &mut DictStorage) {
-    crate::dict_storage_store(
+pub fn register_module(ns: pyre_object::PyObjectRef) {
+    crate::module_ns_store(
         ns,
         "fcntl",
         crate::make_builtin_function("fcntl", |args| {
@@ -54,7 +53,7 @@ pub fn register_module(ns: &mut DictStorage) {
             }
         }),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "ioctl",
         crate::make_builtin_function("ioctl", |args| {
@@ -98,7 +97,7 @@ pub fn register_module(ns: &mut DictStorage) {
             }
         }),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "flock",
         crate::make_builtin_function_with_arity(
@@ -137,7 +136,7 @@ pub fn register_module(ns: &mut DictStorage) {
             2,
         ),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "lockf",
         crate::make_builtin_function("lockf", |args| {
@@ -210,7 +209,7 @@ pub fn register_module(ns: &mut DictStorage) {
     {
         macro_rules! cst {
             ($name:literal, $val:expr) => {
-                crate::dict_storage_store(ns, $name, pyre_object::w_int_new($val as i64));
+                crate::module_ns_store(ns, $name, pyre_object::w_int_new($val as i64));
             };
         }
         cst!("F_GETFD", libc::F_GETFD);

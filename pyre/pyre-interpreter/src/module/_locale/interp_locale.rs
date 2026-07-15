@@ -2,7 +2,6 @@
 //!
 //! Verbatim move of the inline block previously in importing.rs.
 
-use crate::DictStorage;
 // Under sandbox, name libc through the seam facade so any direct syscall call
 // in this module is a compile error (only types/constants/pure fns resolve).
 #[cfg(feature = "sandbox")]
@@ -119,56 +118,56 @@ fn c_locale_conv() -> LocaleConvData {
 /// This mirrors the `except ImportError` fallback in the stdlib's
 /// `locale` module, but routed through pyre's builtin-module registry
 /// so a single import succeeds.
-pub fn register_module(ns: &mut DictStorage) {
+pub fn register_module(ns: pyre_object::PyObjectRef) {
     // Locale category constants sourced from libc so the values match
     // the host (Linux: LC_CTYPE=0; macOS: LC_ALL=0, LC_CTYPE=2; ...).
     #[cfg(unix)]
     {
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "LC_CTYPE",
             pyre_object::w_int_new(libc::LC_CTYPE as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "LC_NUMERIC",
             pyre_object::w_int_new(libc::LC_NUMERIC as i64),
         );
-        crate::dict_storage_store(ns, "LC_TIME", pyre_object::w_int_new(libc::LC_TIME as i64));
-        crate::dict_storage_store(
+        crate::module_ns_store(ns, "LC_TIME", pyre_object::w_int_new(libc::LC_TIME as i64));
+        crate::module_ns_store(
             ns,
             "LC_COLLATE",
             pyre_object::w_int_new(libc::LC_COLLATE as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "LC_MONETARY",
             pyre_object::w_int_new(libc::LC_MONETARY as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "LC_MESSAGES",
             pyre_object::w_int_new(libc::LC_MESSAGES as i64),
         );
-        crate::dict_storage_store(ns, "LC_ALL", pyre_object::w_int_new(libc::LC_ALL as i64));
+        crate::module_ns_store(ns, "LC_ALL", pyre_object::w_int_new(libc::LC_ALL as i64));
     }
     #[cfg(not(unix))]
     {
-        crate::dict_storage_store(ns, "LC_CTYPE", pyre_object::w_int_new(0));
-        crate::dict_storage_store(ns, "LC_NUMERIC", pyre_object::w_int_new(1));
-        crate::dict_storage_store(ns, "LC_TIME", pyre_object::w_int_new(2));
-        crate::dict_storage_store(ns, "LC_COLLATE", pyre_object::w_int_new(3));
-        crate::dict_storage_store(ns, "LC_MONETARY", pyre_object::w_int_new(4));
-        crate::dict_storage_store(ns, "LC_MESSAGES", pyre_object::w_int_new(5));
-        crate::dict_storage_store(ns, "LC_ALL", pyre_object::w_int_new(6));
+        crate::module_ns_store(ns, "LC_CTYPE", pyre_object::w_int_new(0));
+        crate::module_ns_store(ns, "LC_NUMERIC", pyre_object::w_int_new(1));
+        crate::module_ns_store(ns, "LC_TIME", pyre_object::w_int_new(2));
+        crate::module_ns_store(ns, "LC_COLLATE", pyre_object::w_int_new(3));
+        crate::module_ns_store(ns, "LC_MONETARY", pyre_object::w_int_new(4));
+        crate::module_ns_store(ns, "LC_MESSAGES", pyre_object::w_int_new(5));
+        crate::module_ns_store(ns, "LC_ALL", pyre_object::w_int_new(6));
     }
-    crate::dict_storage_store(ns, "CHAR_MAX", pyre_object::w_int_new(127));
+    crate::module_ns_store(ns, "CHAR_MAX", pyre_object::w_int_new(127));
     #[cfg(all(
         unix,
         not(any(target_os = "ios", target_os = "android", target_os = "redox"))
     ))]
     {
-        crate::dict_storage_store(ns, "CODESET", pyre_object::w_int_new(libc::CODESET as i64));
+        crate::module_ns_store(ns, "CODESET", pyre_object::w_int_new(libc::CODESET as i64));
     }
     // `interp_locale.py:11 W_Error = _new_exception('Error', W_Exception, 'locale error')`
     let exception_base = crate::builtins::lookup_exc_class("Exception")
@@ -178,13 +177,13 @@ pub fn register_module(ns: &mut DictStorage) {
         crate::builtins::exc_exception_new,
         exception_base,
     );
-    crate::dict_storage_store(ns, "Error", w_error);
+    crate::module_ns_store(ns, "Error", w_error);
 
     // localeconv() — numeric/monetary parameters of the current locale.
     // Reads the host locale DB; under sandbox the stub override below replaces
     // it, so the real body (and its libc/host_env calls) is compiled out.
     #[cfg(not(feature = "sandbox"))]
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "localeconv",
         crate::make_builtin_function_with_arity(
@@ -259,7 +258,7 @@ pub fn register_module(ns: &mut DictStorage) {
     // setlocale() mutates/reads the host locale (and $LANG/$LC_*); stubbed under
     // sandbox, so the real body is compiled out.
     #[cfg(not(feature = "sandbox"))]
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "setlocale",
         crate::make_builtin_function("setlocale", |args| {
@@ -315,7 +314,7 @@ pub fn register_module(ns: &mut DictStorage) {
     // nl_langinfo() reads the active-locale codeset/DB; stubbed under sandbox,
     // so the real body is compiled out.
     #[cfg(not(feature = "sandbox"))]
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "nl_langinfo",
         crate::make_builtin_function_with_arity(
@@ -369,7 +368,7 @@ pub fn register_module(ns: &mut DictStorage) {
             1,
         ),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "strcoll",
         crate::make_builtin_function_with_arity(
@@ -420,7 +419,7 @@ pub fn register_module(ns: &mut DictStorage) {
             2,
         ),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "strxfrm",
         crate::make_builtin_function_with_arity(
@@ -455,7 +454,7 @@ pub fn register_module(ns: &mut DictStorage) {
             1,
         ),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "getencoding",
         crate::make_builtin_function_with_arity(
@@ -475,7 +474,7 @@ pub fn register_module(ns: &mut DictStorage) {
             Err(crate::host_seam::stub("this locale function"))
         }
         for name in ["setlocale", "localeconv", "nl_langinfo"] {
-            crate::dict_storage_store(
+            crate::module_ns_store(
                 ns,
                 name,
                 crate::make_builtin_function(name, locale_unavailable),

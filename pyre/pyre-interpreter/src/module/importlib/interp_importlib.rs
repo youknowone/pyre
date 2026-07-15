@@ -4,18 +4,16 @@
 //! importing.rs.  Each one is renamed to register_<suffix> to match
 //! the moduledef entry points.
 
-use crate::DictStorage;
-
 /// importlib stub — PyPy uses `pypy/module/_frozen_importlib/` plus
 /// `lib-python/3/importlib/`.
 /// Avoid loading the real importlib.__init__ since it drags in
 /// _bootstrap and _bootstrap_external.
-pub fn register_pkg(ns: &mut DictStorage) {
+pub fn register_pkg(ns: pyre_object::PyObjectRef) {
     // importlib.import_module(name, package=None) — return an imported
     // module by name. PyPy: Lib/importlib/__init__.py import_module →
     // _bootstrap._gcd_import. We defer to the interpreter's importhook
     // since it handles both builtins and source modules.
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "import_module",
         crate::make_builtin_function("import_module", |args| {
@@ -40,7 +38,7 @@ pub fn register_pkg(ns: &mut DictStorage) {
             }
         }),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "invalidate_caches",
         crate::make_builtin_function_with_arity(
@@ -49,7 +47,7 @@ pub fn register_pkg(ns: &mut DictStorage) {
             0,
         ),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "reload",
         crate::make_builtin_function_with_arity(
@@ -72,11 +70,11 @@ pub fn register_pkg(ns: &mut DictStorage) {
     };
     #[cfg(not(feature = "host_env"))]
     let path_items: Vec<pyre_object::PyObjectRef> = vec![];
-    crate::dict_storage_store(ns, "__path__", pyre_object::w_list_new(path_items));
+    crate::module_ns_store(ns, "__path__", pyre_object::w_list_new(path_items));
 }
 
 /// importlib.abc stub — abstract base classes.
-pub fn register_abc(ns: &mut DictStorage) {
+pub fn register_abc(ns: pyre_object::PyObjectRef) {
     for name in [
         "Loader",
         "Finder",
@@ -88,40 +86,40 @@ pub fn register_abc(ns: &mut DictStorage) {
         "FileLoader",
         "SourceLoader",
     ] {
-        crate::dict_storage_store(ns, name, crate::typedef::w_object());
+        crate::module_ns_store(ns, name, crate::typedef::w_object());
     }
 }
 
 /// importlib.machinery stub — provides the names inspect.py references.
 /// PyPy ships the real importlib; we shortcut it with a stub so pyre does
 /// not have to execute _bootstrap_external.
-pub fn register_machinery(ns: &mut DictStorage) {
-    crate::dict_storage_store(
+pub fn register_machinery(ns: pyre_object::PyObjectRef) {
+    crate::module_ns_store(
         ns,
         "SOURCE_SUFFIXES",
         pyre_object::w_list_new(vec![pyre_object::w_str_new(".py")]),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "BYTECODE_SUFFIXES",
         pyre_object::w_list_new(vec![pyre_object::w_str_new(".pyc")]),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "EXTENSION_SUFFIXES",
         pyre_object::w_list_new(vec![pyre_object::w_str_new(".so")]),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "DEBUG_BYTECODE_SUFFIXES",
         pyre_object::w_list_new(vec![pyre_object::w_str_new(".pyc")]),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "OPTIMIZED_BYTECODE_SUFFIXES",
         pyre_object::w_list_new(vec![pyre_object::w_str_new(".pyc")]),
     );
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "all_suffixes",
         crate::make_builtin_function_with_arity(
@@ -136,15 +134,15 @@ pub fn register_machinery(ns: &mut DictStorage) {
             0,
         ),
     );
-    crate::dict_storage_store(ns, "ModuleSpec", crate::typedef::w_object());
-    crate::dict_storage_store(ns, "BuiltinImporter", crate::typedef::w_object());
-    crate::dict_storage_store(ns, "FrozenImporter", crate::typedef::w_object());
-    crate::dict_storage_store(ns, "PathFinder", crate::typedef::w_object());
-    crate::dict_storage_store(ns, "FileFinder", crate::typedef::w_object());
-    crate::dict_storage_store(ns, "SourceFileLoader", crate::typedef::w_object());
-    crate::dict_storage_store(ns, "SourcelessFileLoader", crate::typedef::w_object());
-    crate::dict_storage_store(ns, "ExtensionFileLoader", crate::typedef::w_object());
-    crate::dict_storage_store(ns, "AppleFrameworkLoader", crate::typedef::w_object());
-    crate::dict_storage_store(ns, "NamespaceLoader", crate::typedef::w_object());
-    crate::dict_storage_store(ns, "WindowsRegistryFinder", crate::typedef::w_object());
+    crate::module_ns_store(ns, "ModuleSpec", crate::typedef::w_object());
+    crate::module_ns_store(ns, "BuiltinImporter", crate::typedef::w_object());
+    crate::module_ns_store(ns, "FrozenImporter", crate::typedef::w_object());
+    crate::module_ns_store(ns, "PathFinder", crate::typedef::w_object());
+    crate::module_ns_store(ns, "FileFinder", crate::typedef::w_object());
+    crate::module_ns_store(ns, "SourceFileLoader", crate::typedef::w_object());
+    crate::module_ns_store(ns, "SourcelessFileLoader", crate::typedef::w_object());
+    crate::module_ns_store(ns, "ExtensionFileLoader", crate::typedef::w_object());
+    crate::module_ns_store(ns, "AppleFrameworkLoader", crate::typedef::w_object());
+    crate::module_ns_store(ns, "NamespaceLoader", crate::typedef::w_object());
+    crate::module_ns_store(ns, "WindowsRegistryFinder", crate::typedef::w_object());
 }

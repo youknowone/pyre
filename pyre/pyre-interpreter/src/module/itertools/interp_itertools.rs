@@ -2,10 +2,9 @@
 //!
 //! Verbatim move of the inline block previously in importing.rs.
 
-use crate::DictStorage;
 
 /// itertools stub
-pub fn register_module(ns: &mut DictStorage) {
+pub fn register_module(ns: pyre_object::PyObjectRef) {
     // chain(*iterables) — W_Chain___new__: store `iter(newtuple(args))` as
     // the source-iterables iterator.  W_Chain.next_w (baseobjspace::next)
     // lazily draws each sub-iterable's iterator on demand, so infinite
@@ -28,10 +27,10 @@ pub fn register_module(ns: &mut DictStorage) {
     });
     crate::setattr_str(chain_fn, "from_iterable", from_iterable_fn)
         .expect("attach itertools.chain.from_iterable");
-    crate::dict_storage_store(ns, "chain", chain_fn);
+    crate::module_ns_store(ns, "chain", chain_fn);
     // starmap(function, iterable) — PyPy: W_StarMap.  Calls
     // `function(*args)` for each `args` tuple produced by the iterable.
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "starmap",
         crate::make_builtin_function_with_arity(
@@ -55,7 +54,7 @@ pub fn register_module(ns: &mut DictStorage) {
     //
     //     def W_Count___new__(space, w_subtype, w_start=0, w_step=1):
     //         return W_Count(space, w_start, w_step)
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "count",
         crate::make_builtin_function("count", |args| {
@@ -68,7 +67,7 @@ pub fn register_module(ns: &mut DictStorage) {
     //
     //     def W_Repeat___new__(space, w_subtype, w_obj, w_times=None):
     //         return W_Repeat(space, w_obj, w_times)
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "repeat",
         crate::make_builtin_function("repeat", |args| {
@@ -95,7 +94,7 @@ pub fn register_module(ns: &mut DictStorage) {
     // islice(iterable, stop) | islice(iterable, start, stop[, step]) —
     // PyPy: W_ISlice.__init__.  Pulled lazily from the source iterator so
     // an unbounded input (`count`, `cycle`) is bounded by `stop`.
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "islice",
         crate::make_builtin_function("islice", |args| {
@@ -189,13 +188,13 @@ pub fn register_module(ns: &mut DictStorage) {
         }),
     );
     // groupby
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "groupby",
         crate::make_builtin_function("groupby", |_| Ok(pyre_object::w_none())),
     );
     // permutations(iterable, r=None) — PyPy: pypy/module/itertools/interp_itertools.py
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "permutations",
         crate::make_builtin_function("permutations", |args| {
@@ -251,7 +250,7 @@ pub fn register_module(ns: &mut DictStorage) {
         }),
     );
     // combinations(iterable, r)
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "combinations",
         crate::make_builtin_function_with_arity(
@@ -293,7 +292,7 @@ pub fn register_module(ns: &mut DictStorage) {
         ),
     );
     // product(*iterables, repeat=1)
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "product",
         crate::make_builtin_function("product", |args| {
@@ -353,7 +352,7 @@ pub fn register_module(ns: &mut DictStorage) {
     // `__pyre_kw__` dict (`call.rs:727-744`); strip it before
     // collecting the iterable pools so the kwarg doesn't surface as
     // an extra positional pool.
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "zip_longest",
         crate::make_builtin_function("zip_longest", |args| {
@@ -385,7 +384,7 @@ pub fn register_module(ns: &mut DictStorage) {
         }),
     );
     // accumulate(iterable) — sums only, PyPy interp_itertools W_Accumulate.
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "accumulate",
         crate::make_builtin_function("accumulate", |args| {
@@ -408,7 +407,7 @@ pub fn register_module(ns: &mut DictStorage) {
         }),
     );
     // compress(data, selectors)
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "compress",
         crate::make_builtin_function_with_arity(
@@ -435,7 +434,7 @@ pub fn register_module(ns: &mut DictStorage) {
     // takewhile(predicate, iterable) — W_TakeWhile.__init__: store the
     // predicate and `space.iter(w_iterable)`; elements are pulled lazily
     // by W_TakeWhile.next_w (baseobjspace::next).
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "takewhile",
         crate::make_builtin_function_with_arity(
@@ -452,7 +451,7 @@ pub fn register_module(ns: &mut DictStorage) {
     // dropwhile(predicate, iterable) — W_DropWhile.__init__: store the
     // predicate and `space.iter(w_iterable)`; the drop phase runs lazily
     // inside W_DropWhile.next_w (baseobjspace::next).
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "dropwhile",
         crate::make_builtin_function_with_arity(
@@ -469,7 +468,7 @@ pub fn register_module(ns: &mut DictStorage) {
     // filterfalse(predicate, iterable) — W_FilterFalse (W_Filter with
     // reverse=True).  W_Filter.__init__ normalizes a None predicate to
     // null; elements are filtered lazily in next_w (baseobjspace::next).
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "filterfalse",
         crate::make_builtin_function_with_arity(
@@ -490,7 +489,7 @@ pub fn register_module(ns: &mut DictStorage) {
     );
     // pairwise(iterable) — W_Pairwise__new__: store `space.iter(w_iterable)`;
     // pairs are produced lazily by W_Pairwise.next_w (baseobjspace::next).
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "pairwise",
         crate::make_builtin_function_with_arity(
@@ -506,7 +505,7 @@ pub fn register_module(ns: &mut DictStorage) {
     // empty `saved` list.  W_Cycle.next_w (baseobjspace::next) pulls from the
     // source on the first pass, saving each element, then replays `saved`
     // forever.
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "cycle",
         crate::make_builtin_function_with_arity(
@@ -522,7 +521,7 @@ pub fn register_module(ns: &mut DictStorage) {
     // Batches the input into tuples of length `n`; the last tuple may be
     // shorter unless `strict` is set, in which case a short final batch
     // raises ValueError.  Materialized eagerly like the other builtins here.
-    crate::dict_storage_store(
+    crate::module_ns_store(
         ns,
         "batched",
         crate::make_builtin_function("batched", |args| {

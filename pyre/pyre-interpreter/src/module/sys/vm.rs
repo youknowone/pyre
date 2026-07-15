@@ -2,7 +2,7 @@
 //!
 //! PyPy equivalent: `pypy/module/sys/vm.py`.
 
-use crate::{DictStorage, dict_storage_store, make_builtin_function_with_arity};
+use crate::{module_ns_store, make_builtin_function_with_arity};
 use pyre_object::*;
 use std::sync::OnceLock;
 
@@ -208,13 +208,13 @@ pub fn exc_info_direct() -> PyObjectRef {
     }
 }
 
-pub fn register_module(ns: &mut DictStorage) {
-    dict_storage_store(ns, "maxsize", w_int_new(i64::MAX));
-    dict_storage_store(ns, "maxunicode", w_int_new(0x10FFFF));
+pub fn register_module(ns: pyre_object::PyObjectRef) {
+    module_ns_store(ns, "maxsize", w_int_new(i64::MAX));
+    module_ns_store(ns, "maxunicode", w_int_new(0x10FFFF));
     // Format matches `platform._sys_version`'s CPython parser:
     // `version (buildinfo) [compiler]`.
-    dict_storage_store(ns, "version", w_str_new("3.14.6 (pyre 0.0.1) [Rust]"));
-    dict_storage_store(
+    module_ns_store(ns, "version", w_str_new("3.14.6 (pyre 0.0.1) [Rust]"));
+    module_ns_store(
         ns,
         "platform",
         w_str_new(if cfg!(target_os = "macos") {
@@ -227,7 +227,7 @@ pub fn register_module(ns: &mut DictStorage) {
             "unknown"
         }),
     );
-    dict_storage_store(
+    module_ns_store(
         ns,
         "byteorder",
         w_str_new(if cfg!(target_endian = "little") {
@@ -253,14 +253,14 @@ pub fn register_module(ns: &mut DictStorage) {
                 w_int_new(0),
             ],
         );
-        dict_storage_store(ns, "version_info", vi);
+        module_ns_store(ns, "version_info", vi);
     }
     // sys.modules — live dict synced with the import cache.
     let modules_dict = w_dict_new();
     crate::importing::set_sys_modules_dict(modules_dict);
-    dict_storage_store(ns, "modules", modules_dict);
+    module_ns_store(ns, "modules", modules_dict);
     // sys.path — empty list placeholder
-    dict_storage_store(ns, "path", w_list_new(vec![]));
+    module_ns_store(ns, "path", w_list_new(vec![]));
     // sys.stdout/stderr/stdin — `_io.TextIOWrapper`-typed file-like objects.
     // Real CPython wires these through io.TextIOWrapper around the std fds;
     // pyre exposes objects of the same type with the minimum surface so
@@ -269,12 +269,12 @@ pub fn register_module(ns: &mut DictStorage) {
     let stdout = make_std_stream("<stdout>", 1);
     let stderr = make_std_stream("<stderr>", 2);
     let stdin = make_std_stream("<stdin>", 0);
-    dict_storage_store(ns, "stdout", stdout);
-    dict_storage_store(ns, "stderr", stderr);
-    dict_storage_store(ns, "stdin", stdin);
-    dict_storage_store(ns, "__stdout__", stdout);
-    dict_storage_store(ns, "__stderr__", stderr);
-    dict_storage_store(ns, "__stdin__", stdin);
+    module_ns_store(ns, "stdout", stdout);
+    module_ns_store(ns, "stderr", stderr);
+    module_ns_store(ns, "stdin", stdin);
+    module_ns_store(ns, "__stdout__", stdout);
+    module_ns_store(ns, "__stderr__", stderr);
+    module_ns_store(ns, "__stdin__", stdin);
     // `pypy/module/sys/vm.py:30 _getframe` walks the
     // `space.getexecutioncontext().gettopframe_nohidden()` chain,
     // following `f_back` `depth` times.  PyPy returns the frame
@@ -285,7 +285,7 @@ pub fn register_module(ns: &mut DictStorage) {
     // PyFrame.  `f_globals` / `f_locals` flow through
     // `dict_storage_to_dict` (canonical W_DictObject) so the
     // `is module.__dict__` invariant survives sys._getframe access.
-    dict_storage_store(
+    module_ns_store(
         ns,
         "_getframe",
         crate::make_builtin_function("_getframe", |args| {
@@ -358,7 +358,7 @@ pub fn register_module(ns: &mut DictStorage) {
     // entry registered below), so the regular call path and the JIT bypass
     // observe the same value.
     let exc_info_fn = make_builtin_function_with_arity("exc_info", |_| Ok(exc_info_direct()), 0);
-    dict_storage_store(ns, "exc_info", exc_info_fn);
+    module_ns_store(ns, "exc_info", exc_info_fn);
     // baseobjspace.py: register `space._code_of_sys_exc_info` so
     // `function.funccall_valuestack` can take the JIT direct path
     // (function.py:146-150). The builtin code pointer lives on the
@@ -435,10 +435,10 @@ pub fn register_module(ns: &mut DictStorage) {
             unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(fns, "thread_inherit_context", w_int_new(0)) };
         });
         let flags = w_instance_new(flags_type);
-        dict_storage_store(ns, "flags", flags);
+        module_ns_store(ns, "flags", flags);
     }
     // sys.getdefaultencoding
-    dict_storage_store(
+    module_ns_store(
         ns,
         "getdefaultencoding",
         make_builtin_function_with_arity("getdefaultencoding", |_| Ok(w_str_new("utf-8")), 0),
@@ -447,7 +447,7 @@ pub fn register_module(ns: &mut DictStorage) {
     // The runtime stack budget lives in `crate::stack_check`; both
     // helpers route through it so the interpreter, JIT prologue probe,
     // and blackhole resume see a consistent recursion budget.
-    dict_storage_store(
+    module_ns_store(
         ns,
         "getrecursionlimit",
         make_builtin_function_with_arity(
@@ -464,7 +464,7 @@ pub fn register_module(ns: &mut DictStorage) {
             0,
         ),
     );
-    dict_storage_store(
+    module_ns_store(
         ns,
         "setrecursionlimit",
         make_builtin_function_with_arity(
@@ -489,7 +489,7 @@ pub fn register_module(ns: &mut DictStorage) {
         ),
     );
     // sys.intern
-    dict_storage_store(
+    module_ns_store(
         ns,
         "intern",
         make_builtin_function_with_arity(
@@ -522,7 +522,7 @@ pub fn register_module(ns: &mut DictStorage) {
         crate::baseobjspace::setdictvalue(impl_obj, "hexversion", w_int_new(0x030e06f0));
         crate::baseobjspace::setdictvalue(impl_obj, "cache_tag", w_str_new("pyre-3.14"));
         crate::baseobjspace::setdictvalue(impl_obj, "_multiarch", w_str_new(""));
-        dict_storage_store(ns, "implementation", impl_obj);
+        module_ns_store(ns, "implementation", impl_obj);
     }
     // sys.hash_info — structseq with width/modulus/... fields.
     // PyPy: pypy/module/sys/system.py hash_info.
@@ -537,7 +537,7 @@ pub fn register_module(ns: &mut DictStorage) {
         crate::baseobjspace::setdictvalue(hash_info, "hash_bits", w_int_new(64));
         crate::baseobjspace::setdictvalue(hash_info, "seed_bits", w_int_new(128));
         crate::baseobjspace::setdictvalue(hash_info, "cutoff", w_int_new(0));
-        dict_storage_store(ns, "hash_info", hash_info);
+        module_ns_store(ns, "hash_info", hash_info);
     }
     // sys.float_info — structseq with IEEE 754 double metadata.
     // PyPy: pypy/module/sys/system.py float_info.
@@ -554,18 +554,18 @@ pub fn register_module(ns: &mut DictStorage) {
         crate::baseobjspace::setdictvalue(fi, "epsilon", w_float_new(f64::EPSILON));
         crate::baseobjspace::setdictvalue(fi, "radix", w_int_new(2));
         crate::baseobjspace::setdictvalue(fi, "rounds", w_int_new(1));
-        dict_storage_store(ns, "float_info", fi);
+        module_ns_store(ns, "float_info", fi);
     }
     // sysmodule.c — `sys.float_repr_style` is "short" wherever float repr
     // uses David Gay's shortest-round-trip algorithm (always, here).
-    dict_storage_store(ns, "float_repr_style", w_str_new("short"));
+    module_ns_store(ns, "float_repr_style", w_str_new("short"));
     // sys.thread_info — structseq(name, lock, version).
     {
         let ti = make_sys_namespace_instance();
         crate::baseobjspace::setdictvalue(ti, "name", w_str_new("pthread"));
         crate::baseobjspace::setdictvalue(ti, "lock", w_str_new("semaphore"));
         crate::baseobjspace::setdictvalue(ti, "version", w_none());
-        dict_storage_store(ns, "thread_info", ti);
+        module_ns_store(ns, "thread_info", ti);
     }
     // sys.int_info — structseq with int implementation details.
     {
@@ -574,9 +574,9 @@ pub fn register_module(ns: &mut DictStorage) {
         crate::baseobjspace::setdictvalue(ii, "sizeof_digit", w_int_new(4));
         crate::baseobjspace::setdictvalue(ii, "default_max_str_digits", w_int_new(4300));
         crate::baseobjspace::setdictvalue(ii, "str_digits_check_threshold", w_int_new(640));
-        dict_storage_store(ns, "int_info", ii);
+        module_ns_store(ns, "int_info", ii);
     }
-    dict_storage_store(ns, "hexversion", w_int_new(0x030e06f0));
+    module_ns_store(ns, "hexversion", w_int_new(0x030e06f0));
     // sys.executable — absolute path to the running interpreter so that
     // subprocess spawns via `sys.executable` resolve.
     #[cfg(not(feature = "sandbox"))]
@@ -588,14 +588,14 @@ pub fn register_module(ns: &mut DictStorage) {
     // path (and username), and subprocess spawning is unavailable anyway.
     #[cfg(feature = "sandbox")]
     let executable = "/bin/pyre".to_owned();
-    dict_storage_store(ns, "executable", w_str_new(&executable));
+    module_ns_store(ns, "executable", w_str_new(&executable));
     // sys.prefix / exec_prefix
-    dict_storage_store(ns, "prefix", w_str_new(""));
-    dict_storage_store(ns, "exec_prefix", w_str_new(""));
-    dict_storage_store(ns, "base_prefix", w_str_new(""));
-    dict_storage_store(ns, "base_exec_prefix", w_str_new(""));
+    module_ns_store(ns, "prefix", w_str_new(""));
+    module_ns_store(ns, "exec_prefix", w_str_new(""));
+    module_ns_store(ns, "base_prefix", w_str_new(""));
+    module_ns_store(ns, "base_exec_prefix", w_str_new(""));
     // sys._framework — macOS framework name (empty string on non-framework builds)
-    dict_storage_store(ns, "_framework", w_str_new(""));
+    module_ns_store(ns, "_framework", w_str_new(""));
     // sys._jit — namespace with is_enabled/is_available methods.
     // Python 3.14+ introduced sys._jit for CPython tier-2 JIT support checks.
     {
@@ -610,7 +610,7 @@ pub fn register_module(ns: &mut DictStorage) {
             "is_available",
             make_builtin_function_with_arity("is_available", |_| Ok(w_bool_from(false)), 0),
         );
-        dict_storage_store(ns, "_jit", jit);
+        module_ns_store(ns, "_jit", jit);
     }
     // sys.monitoring — PEP 669 low-impact monitoring API. The runtime hooks
     // are stubbed (no events ever fire), but the namespace, tool-id
@@ -684,11 +684,11 @@ pub fn register_module(ns: &mut DictStorage) {
         store_fn(mon, "set_local_events", |_| Ok(w_none()), 3);
         store_fn(mon, "get_local_events", |_| Ok(w_int_new(0)), 2);
         store_fn(mon, "restart_events", |_| Ok(w_none()), 0);
-        dict_storage_store(ns, "monitoring", mon);
+        module_ns_store(ns, "monitoring", mon);
     }
     // sys.platlibdir — typically "lib" on POSIX; used by sysconfig to
     // construct install paths.
-    dict_storage_store(ns, "platlibdir", w_str_new("lib"));
+    module_ns_store(ns, "platlibdir", w_str_new("lib"));
     // `sys/app.py:114-126 exit(exitcode=None)` — raise SystemExit(exitcode),
     // de-tupelizing a tuple argument so `exit((a, b))` becomes
     // `SystemExit(a, b)` (the extra de-tupelizing normalize_exception does
@@ -697,7 +697,7 @@ pub fn register_module(ns: &mut DictStorage) {
     // Interpreting the code (None → 0, int() coercion,
     // print-non-integral-and-exit-1) is the launcher's job
     // (`app_main.py:114-129 handle_sys_exit`).
-    dict_storage_store(
+    module_ns_store(
         ns,
         "exit",
         crate::make_builtin_function("exit", |args| {
@@ -737,7 +737,7 @@ pub fn register_module(ns: &mut DictStorage) {
         }),
     );
     // sys.abiflags
-    dict_storage_store(ns, "abiflags", w_str_new(""));
+    module_ns_store(ns, "abiflags", w_str_new(""));
     // sys.argv — pick up pending argv from set_sys_argv if available.
     let pending = crate::importing::take_pending_sys_argv();
     let argv = if pending.is_null() {
@@ -745,9 +745,9 @@ pub fn register_module(ns: &mut DictStorage) {
     } else {
         pending
     };
-    dict_storage_store(ns, "argv", argv);
+    module_ns_store(ns, "argv", argv);
     // sys.warnoptions
-    dict_storage_store(ns, "warnoptions", w_list_new(vec![]));
+    module_ns_store(ns, "warnoptions", w_list_new(vec![]));
     // sys.builtin_module_names — tuple of names of modules compiled into
     // the interpreter. PyPy: pypy/module/sys/state.py get_builtin_module_names.
     // Pyre: include all stub/native built-ins from importing.rs. The host-access
@@ -770,7 +770,7 @@ pub fn register_module(ns: &mut DictStorage) {
     // in place — the surrounding order is left untouched.
     #[cfg(feature = "sandbox")]
     builtin_names.retain(|n| !matches!(*n, "_signal" | "_socket" | "fcntl" | "grp" | "pwd" | "select"));
-    dict_storage_store(
+    module_ns_store(
         ns,
         "builtin_module_names",
         w_tuple_new(builtin_names.into_iter().map(w_str_new).collect()),
@@ -781,7 +781,7 @@ pub fn register_module(ns: &mut DictStorage) {
     // compiled-in builtin module names; the full pure-Python stdlib set is
     // not enumerated yet, so a name absent here simply yields no hint
     // rather than a crash.
-    dict_storage_store(
+    module_ns_store(
         ns,
         "stdlib_module_names",
         pyre_object::setobject::w_frozenset_from_items(&[
@@ -807,7 +807,7 @@ pub fn register_module(ns: &mut DictStorage) {
     );
     // sys.exception() — the value half of `sys.exc_info()`: the exception
     // instance currently being handled, or None outside an `except` block.
-    dict_storage_store(
+    module_ns_store(
         ns,
         "exception",
         make_builtin_function_with_arity(
@@ -826,14 +826,14 @@ pub fn register_module(ns: &mut DictStorage) {
         ),
     );
     // sys.exc_clear — no-op
-    dict_storage_store(
+    module_ns_store(
         ns,
         "exc_clear",
         make_builtin_function_with_arity("exc_clear", |_| Ok(w_none()), 0),
     );
     // sys.is_remote_debug_enabled() — no remote-debug interface is wired,
     // so always False.
-    dict_storage_store(
+    module_ns_store(
         ns,
         "is_remote_debug_enabled",
         make_builtin_function_with_arity(
@@ -843,7 +843,7 @@ pub fn register_module(ns: &mut DictStorage) {
         ),
     );
     // sys.copyright — informational string consumed by `site` and `test`.
-    dict_storage_store(
+    module_ns_store(
         ns,
         "copyright",
         w_str_new("Copyright (c) 2001-2024 Python Software Foundation.\nAll Rights Reserved."),
@@ -851,7 +851,7 @@ pub fn register_module(ns: &mut DictStorage) {
     // sys.getsizeof(obj[, default]) — PyPy vm.py returns the supplied default
     // for untracked objects.  str additionally exposes its PEP 393-compatible
     // `__sizeof__`, needed by the shared CPython test_str overflow check.
-    dict_storage_store(
+    module_ns_store(
         ns,
         "getsizeof",
         make_builtin_function_with_arity(
@@ -872,34 +872,34 @@ pub fn register_module(ns: &mut DictStorage) {
         ),
     );
     // sys.gettrace / settrace
-    dict_storage_store(
+    module_ns_store(
         ns,
         "gettrace",
         make_builtin_function_with_arity("gettrace", sys_gettrace_impl, 0),
     );
-    dict_storage_store(
+    module_ns_store(
         ns,
         "settrace",
         make_builtin_function_with_arity("settrace", sys_settrace_impl, 1),
     );
     // sys.getprofile / setprofile
-    dict_storage_store(
+    module_ns_store(
         ns,
         "getprofile",
         make_builtin_function_with_arity("getprofile", sys_getprofile_impl, 0),
     );
-    dict_storage_store(
+    module_ns_store(
         ns,
         "setprofile",
         make_builtin_function_with_arity("setprofile", sys_setprofile_impl, 1),
     );
     // sys.getfilesystemencoding
-    dict_storage_store(
+    module_ns_store(
         ns,
         "getfilesystemencoding",
         make_builtin_function_with_arity("getfilesystemencoding", |_| Ok(w_str_new("utf-8")), 0),
     );
-    dict_storage_store(
+    module_ns_store(
         ns,
         "getfilesystemencodeerrors",
         make_builtin_function_with_arity(
@@ -909,7 +909,7 @@ pub fn register_module(ns: &mut DictStorage) {
         ),
     );
     // sys.audit — no-op
-    dict_storage_store(
+    module_ns_store(
         ns,
         "audit",
         crate::make_builtin_function("audit", |_| Ok(w_none())),
@@ -918,30 +918,30 @@ pub fn register_module(ns: &mut DictStorage) {
     // before `dataclasses._add_slots` rebuilds the class with __slots__.  The
     // rebuilt class is constructed fresh from the original's dict, so dropping
     // the descriptors on the soon-discarded original is a no-op here.
-    dict_storage_store(
+    module_ns_store(
         ns,
         "_clear_type_descriptors",
         crate::make_builtin_function("_clear_type_descriptors", |_| Ok(w_none())),
     );
     // sys.is_finalizing
-    dict_storage_store(
+    module_ns_store(
         ns,
         "is_finalizing",
         make_builtin_function_with_arity("is_finalizing", |_| Ok(w_bool_from(false)), 0),
     );
     // sys.displayhook / excepthook. `__displayhook__` keeps the original so
     // code (e.g. doctest) can save and restore the hook.
-    dict_storage_store(
+    module_ns_store(
         ns,
         "displayhook",
         make_builtin_function_with_arity("displayhook", crate::builtins::sys_displayhook, 1),
     );
-    dict_storage_store(
+    module_ns_store(
         ns,
         "__displayhook__",
         make_builtin_function_with_arity("displayhook", crate::builtins::sys_displayhook, 1),
     );
-    dict_storage_store(
+    module_ns_store(
         ns,
         "excepthook",
         make_builtin_function_with_arity("excepthook", |_| Ok(w_none()), 3),
@@ -951,21 +951,21 @@ pub fn register_module(ns: &mut DictStorage) {
     // `__unraisablehook__` original so code can save and restore it.
     let unraisablehook_fn =
         make_builtin_function_with_arity("unraisablehook", sys_unraisablehook, 1);
-    dict_storage_store(ns, "unraisablehook", unraisablehook_fn);
-    dict_storage_store(ns, "__unraisablehook__", unraisablehook_fn);
+    module_ns_store(ns, "unraisablehook", unraisablehook_fn);
+    module_ns_store(ns, "__unraisablehook__", unraisablehook_fn);
     // sys.path_hooks / path_importer_cache
-    dict_storage_store(ns, "path_hooks", w_list_new(vec![]));
-    dict_storage_store(ns, "path_importer_cache", w_dict_new());
+    module_ns_store(ns, "path_hooks", w_list_new(vec![]));
+    module_ns_store(ns, "path_importer_cache", w_dict_new());
     // sys.meta_path — empty
-    dict_storage_store(ns, "meta_path", w_list_new(vec![]));
+    module_ns_store(ns, "meta_path", w_list_new(vec![]));
     // sys.dont_write_bytecode
-    dict_storage_store(ns, "dont_write_bytecode", w_bool_from(true));
+    module_ns_store(ns, "dont_write_bytecode", w_bool_from(true));
     // sys.pycache_prefix — None unless -X pycache_prefix / PYTHONPYCACHEPREFIX.
     // `importlib._bootstrap_external.cache_from_source` reads it to compute the
     // bytecode path before `dont_write_bytecode` is consulted.
-    dict_storage_store(ns, "pycache_prefix", w_none());
+    module_ns_store(ns, "pycache_prefix", w_none());
     // sys.addaudithook
-    dict_storage_store(
+    module_ns_store(
         ns,
         "addaudithook",
         make_builtin_function_with_arity("addaudithook", |_| Ok(w_none()), 1),

@@ -4,7 +4,6 @@
 //! `init_mmap` entry point has been renamed to `register_module` so that
 //! moduledef.rs can call it directly; `init_mmap_type` remains private.
 
-use crate::DictStorage;
 
 // ──────────────────────────────────────────────────────────────────────
 // mmap module — PyPy: pypy/module/mmap/.
@@ -1244,130 +1243,130 @@ fn mmap_construct(
     Ok(obj)
 }
 
-pub fn register_module(ns: &mut DictStorage) {
+pub fn register_module(ns: pyre_object::PyObjectRef) {
     #[cfg(unix)]
     {
         // `interp_mmap.py:42 error = OSError` alias.
         let w_os_error = crate::builtins::lookup_exc_class("OSError")
             .expect("OSError must be installed before init_mmap");
-        crate::dict_storage_store(ns, "error", w_os_error);
+        crate::module_ns_store(ns, "error", w_os_error);
 
         // Constants.  CPython exposes both POSIX MAP_/PROT_/MADV_ and the
         // Python ACCESS_* aliases.  The portable subset sources from
         // host_env's re-exports; the platform-specific extras host_env does
         // not re-export (MAP_FIXED, the Linux-only MAP_* flags, PROT_NONE)
         // stay on libc.
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "MAP_SHARED",
             pyre_object::w_int_new(host_mmap::MAP_SHARED as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "MAP_PRIVATE",
             pyre_object::w_int_new(host_mmap::MAP_PRIVATE as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "MAP_ANON",
             pyre_object::w_int_new(host_mmap::MAP_ANON as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "MAP_ANONYMOUS",
             pyre_object::w_int_new(host_mmap::MAP_ANONYMOUS as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "MAP_FIXED",
             pyre_object::w_int_new(libc::MAP_FIXED as i64),
         );
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
-            crate::dict_storage_store(
+            crate::module_ns_store(
                 ns,
                 "MAP_POPULATE",
                 pyre_object::w_int_new(libc::MAP_POPULATE as i64),
             );
-            crate::dict_storage_store(
+            crate::module_ns_store(
                 ns,
                 "MAP_STACK",
                 pyre_object::w_int_new(libc::MAP_STACK as i64),
             );
-            crate::dict_storage_store(
+            crate::module_ns_store(
                 ns,
                 "MAP_HUGETLB",
                 pyre_object::w_int_new(libc::MAP_HUGETLB as i64),
             );
-            crate::dict_storage_store(
+            crate::module_ns_store(
                 ns,
                 "MAP_NORESERVE",
                 pyre_object::w_int_new(libc::MAP_NORESERVE as i64),
             );
-            crate::dict_storage_store(
+            crate::module_ns_store(
                 ns,
                 "MAP_LOCKED",
                 pyre_object::w_int_new(libc::MAP_LOCKED as i64),
             );
-            crate::dict_storage_store(
+            crate::module_ns_store(
                 ns,
                 "MAP_NONBLOCK",
                 pyre_object::w_int_new(libc::MAP_NONBLOCK as i64),
             );
         }
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "PROT_READ",
             pyre_object::w_int_new(host_mmap::PROT_READ as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "PROT_WRITE",
             pyre_object::w_int_new(host_mmap::PROT_WRITE as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "PROT_EXEC",
             pyre_object::w_int_new(host_mmap::PROT_EXEC as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "PROT_NONE",
             pyre_object::w_int_new(libc::PROT_NONE as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "ACCESS_DEFAULT",
             pyre_object::w_int_new(MMAP_ACCESS_DEFAULT),
         );
-        crate::dict_storage_store(ns, "ACCESS_READ", pyre_object::w_int_new(MMAP_ACCESS_READ));
-        crate::dict_storage_store(
+        crate::module_ns_store(ns, "ACCESS_READ", pyre_object::w_int_new(MMAP_ACCESS_READ));
+        crate::module_ns_store(
             ns,
             "ACCESS_WRITE",
             pyre_object::w_int_new(MMAP_ACCESS_WRITE),
         );
-        crate::dict_storage_store(ns, "ACCESS_COPY", pyre_object::w_int_new(MMAP_ACCESS_COPY));
-        crate::dict_storage_store(
+        crate::module_ns_store(ns, "ACCESS_COPY", pyre_object::w_int_new(MMAP_ACCESS_COPY));
+        crate::module_ns_store(
             ns,
             "MADV_NORMAL",
             pyre_object::w_int_new(host_mmap::MADV_NORMAL as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "MADV_RANDOM",
             pyre_object::w_int_new(host_mmap::MADV_RANDOM as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "MADV_SEQUENTIAL",
             pyre_object::w_int_new(host_mmap::MADV_SEQUENTIAL as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "MADV_WILLNEED",
             pyre_object::w_int_new(host_mmap::MADV_WILLNEED as i64),
         );
-        crate::dict_storage_store(
+        crate::module_ns_store(
             ns,
             "MADV_DONTNEED",
             pyre_object::w_int_new(host_mmap::MADV_DONTNEED as i64),
@@ -1375,10 +1374,10 @@ pub fn register_module(ns: &mut DictStorage) {
 
         // Page-related constants (sys.PAGESIZE in CPython mmap module).
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-        crate::dict_storage_store(ns, "PAGESIZE", pyre_object::w_int_new(page));
-        crate::dict_storage_store(ns, "ALLOCATIONGRANULARITY", pyre_object::w_int_new(page));
+        crate::module_ns_store(ns, "PAGESIZE", pyre_object::w_int_new(page));
+        crate::module_ns_store(ns, "ALLOCATIONGRANULARITY", pyre_object::w_int_new(page));
 
         // Register the type itself.
-        crate::dict_storage_store(ns, "mmap", mmap_type());
+        crate::module_ns_store(ns, "mmap", mmap_type());
     }
 }

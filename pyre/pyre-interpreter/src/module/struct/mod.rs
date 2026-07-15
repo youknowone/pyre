@@ -1260,6 +1260,6 @@ crate::py_module! {
             crate::builtins::exc_exception_new,
             base,
         );
-        crate::dict_storage_store(ns, "error", error);
+        crate::module_ns_store(ns, "error", error);
     },
 }

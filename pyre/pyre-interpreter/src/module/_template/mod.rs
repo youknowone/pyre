@@ -18,7 +18,7 @@ crate::py_module! {
         // App-level classes default to `acceptable_as_base_class=true`, so
         // flip it off here to reject subclassing.
         for name in ["Template", "Interpolation"] {
-            if let Some(t) = crate::runtime_ops::dict_storage_get(ns, name) {
+            if let Some(t) = crate::module_ns_get(ns, name) {
                 unsafe { pyre_object::w_type_set_acceptable_as_base_class(t, false) };
             }
         }

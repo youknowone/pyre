@@ -128,14 +128,14 @@ pub(crate) mod test_hooks {
 // literal — `interpleveldefs = { 'name': 'interp_x.func', ... }` — and
 // PyPy's MixedModule machinery walks the dict at import time.  Pyre
 // mirrors that with the `py_module!` macro below: each call expands to
-// a `pub fn init(ns: &mut DictStorage)` that stores every entry via
-// `dict_storage_store`.  The previous one-line `moduledef.rs` shim
+// a `pub fn init(ns: PyObjectRef)` that stores every entry via
+// `module_ns_store`.  The previous one-line `moduledef.rs` shim
 // (which did nothing but `super::interp_x::register_module(ns)`) has
 // been retired across every builtin module.
 //
 // The macro is intentionally minimal at the value layer — each entry's
 // RHS is just a `PyObjectRef` expression — so call-site code stays the
-// same as the hand-written `dict_storage_store` calls it replaces.  An
+// same as the hand-written `module_ns_store` calls it replaces.  An
 // `extra_init: |ns| { ... }` escape hatch covers PyPy's
 // `buildloaders` / `startup` post-processing (constants loops, cfg
 // gating, helper-typed registration).  For modules whose
@@ -206,18 +206,18 @@ macro_rules! py_module {
         $(, extra_init: |$ns:ident| $body:block)?
         $(,)?
     ) => {
-        pub fn init(ns: &mut $crate::DictStorage) {
+        pub fn init(ns: ::pyre_object::PyObjectRef) {
             let _name = $name;
             $($(
-                $crate::dict_storage_store(ns, $key, $value);
+                $crate::module_ns_store(ns, $key, $value);
             )*)?
             // int_constants: integer module constants — PyPy MixedModule
             // `interpleveldefs = {'NAME': 'space.wrap(value)'}` for the
             // common int case (errno/fcntl/select flags).  Each `$int_value`
             // is an `i64`-valued expression wrapped via `w_int_new`, saving
-            // the per-entry `dict_storage_store(ns, k, w_int_new(v))`.
+            // the per-entry `module_ns_store(ns, k, w_int_new(v))`.
             $($(
-                $crate::dict_storage_store(
+                $crate::module_ns_store(
                     ns, $int_key,
                     ::pyre_object::w_int_new($int_value as i64),
                 );
@@ -230,7 +230,7 @@ macro_rules! py_module {
             // stored in the module dict.  The RHS is the base class
             // expression, e.g. `lookup_exc_class("OSError").unwrap()`.
             $($(
-                $crate::dict_storage_store(
+                $crate::module_ns_store(
                     ns, $exc_key,
                     $crate::builtins::make_exc_type(
                         ::std::concat!($name, ".", $exc_key),
@@ -274,7 +274,7 @@ macro_rules! py_module {
                 {
                     #[$crate::pyre_function]
                     fn $ifn_name ( $($ifn_args)* ) $(-> $ifn_ret)? $ifn_body
-                    $crate::dict_storage_store(
+                    $crate::module_ns_store(
                         ns,
                         stringify!($ifn_name),
                         $crate::make_module_builtin_function_with_arity_and_maybe_sig(
@@ -287,20 +287,20 @@ macro_rules! py_module {
                 }
             )*)?
             $($(
-                $crate::dict_storage_store(
+                $crate::module_ns_store(
                     ns, $fn_key,
                     $crate::py_module_fn!($fn_key, $fn_arity, $fn_path),
                 );
             )*)?
             $($(
-                $crate::dict_storage_store(
+                $crate::module_ns_store(
                     ns, $mfn_key,
                     $crate::py_module_module_fn!($mfn_key, $mfn_arity, $mfn_path),
                 );
             )*)?
             $(
                 {
-                    let $ns: &mut $crate::DictStorage = ns;
+                    let $ns: ::pyre_object::PyObjectRef = ns;
                     $body
                 }
             )?
