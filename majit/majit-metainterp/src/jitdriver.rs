@@ -3941,6 +3941,20 @@ impl<S: JitState> JitDriver<S> {
         &mut self.meta
     }
 
+    fn prepare_exit_resume_heap_with_blackhole_allocator(
+        &self,
+        exit_layout: &CompiledExitLayout,
+        raw_values: &[i64],
+    ) {
+        let fallback_alloc = crate::resume::NullAllocator;
+        let allocator: &dyn crate::resume::BlackholeAllocator = self
+            .blackhole_allocator
+            .as_deref()
+            .unwrap_or(&fallback_alloc);
+        let all_liveness = self.meta_interp().staticdata.liveness_info.as_slice();
+        prepare_exit_resume_heap(exit_layout, raw_values, all_liveness, allocator);
+    }
+
     /// framework.py `root_walker.walk_roots` parity: visit every Ref-typed
     /// entry in every live compiled trace's `rd_consts` pool so the minor
     /// collector can forward them. See `MetaInterp::walk_rd_consts_refs`
@@ -5294,15 +5308,7 @@ impl<S: JitState> JitDriver<S> {
                 // recover) reads the post-write heap. Route through the resume
                 // reader so TAGVIRTUAL pending values materialize under the same
                 // resume-ref roots as `blackhole_from_resumedata`.
-                {
-                    let fallback_alloc = crate::resume::NullAllocator;
-                    let allocator: &dyn crate::resume::BlackholeAllocator = self
-                        .blackhole_allocator
-                        .as_deref()
-                        .unwrap_or(&fallback_alloc);
-                    let all_liveness = self.meta_interp().staticdata.liveness_info.as_slice();
-                    prepare_exit_resume_heap(&exit_layout, &raw_values, all_liveness, allocator);
-                }
+                self.prepare_exit_resume_heap_with_blackhole_allocator(&exit_layout, &raw_values);
                 // Restore state for bridge tracing start point.
                 let resume_pc = on_guard_failure(state, &result_meta, &raw_values, &exit_layout);
                 let resume_pc = resume_pc.unwrap_or(guard_resume_pc);
@@ -5445,15 +5451,7 @@ impl<S: JitState> JitDriver<S> {
             // resume.py:993 `_prepare(storage)`: pending heap writes before
             // reconstruction (mirrors the bridge branch above), with virtual
             // materialization rooted by the resume reader.
-            {
-                let fallback_alloc = crate::resume::NullAllocator;
-                let allocator: &dyn crate::resume::BlackholeAllocator = self
-                    .blackhole_allocator
-                    .as_deref()
-                    .unwrap_or(&fallback_alloc);
-                let all_liveness = self.meta_interp().staticdata.liveness_info.as_slice();
-                prepare_exit_resume_heap(&exit_layout, &raw_values, all_liveness, allocator);
-            }
+            self.prepare_exit_resume_heap_with_blackhole_allocator(&exit_layout, &raw_values);
             let resume_pc = on_guard_failure(state, &result_meta, &raw_values, &exit_layout);
             let resume_pc = resume_pc.unwrap_or(target_pc);
             self.sync_after(state, &result_meta, descriptor.as_ref());
