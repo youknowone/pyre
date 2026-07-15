@@ -10683,24 +10683,6 @@ pub(crate) fn m73_loopclose_carry_enabled() -> bool {
     })
 }
 
-/// `PYRE_M73_ARMDST_CARRY` (#73 S5 phase-5 slice-1, default ON): key the
-/// `compare_box_provably_dead` branch-arm liveness queries (`arm_dst_live`)
-/// on the resume-marker twin at the arm offset instead of the
-/// historical block-head translation of the inverted py pc. Certified by
-/// the `M73_ARMDST` census (858 queries across pyre/bench + synth, 100%
-/// bank-equal) and check.py (162×2, on and off). Disable with
-/// `PYRE_M73_ARMDST_CARRY=0`.
-pub(crate) fn m73_armdst_carry_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M73_ARMDST_CARRY") {
-        Some(v) => {
-            let v = v.to_string_lossy();
-            v != "0" && !v.eq_ignore_ascii_case("false")
-        }
-        None => true,
-    })
-}
-
 /// `PYRE_M73_LCLIVE_CARRY` (#73 S5 phase-5 slice-2, default ON): resolve
 /// the loop-close guards' liveness coordinate in
 /// `get_list_of_active_boxes` from the merge-point resume-marker twin
@@ -18596,13 +18578,7 @@ fn compare_box_provably_dead(ctx: &WalkContext<'_, '_>, compare_pc: usize, dst_r
     }
     // SAFETY: same contract as walker_capture_snapshot_for_last_guard_impl —
     // pointer live for the full-body walk, immutable layout fields only.
-    let (code, metadata, jitcode_index, code_ptr, payload): (
-        &[u8],
-        &crate::PyJitCodeMetadata,
-        i32,
-        *const _,
-        &crate::PyJitCode,
-    ) = unsafe {
+    let (code, jitcode_index, payload): (&[u8], i32, &crate::PyJitCode) = unsafe {
         let sym = &*full_body_sym;
         if sym.jitcode.is_null() {
             return false;
@@ -18613,9 +18589,7 @@ fn compare_box_provably_dead(ctx: &WalkContext<'_, '_>, compare_pc: usize, dst_r
         }
         (
             jc.payload.jitcode.code.as_slice(),
-            &jc.payload.metadata,
             jc.index as i32,
-            jc.payload.code_ptr,
             &jc.payload,
         )
     };
@@ -18708,8 +18682,6 @@ fn compare_box_provably_dead(ctx: &WalkContext<'_, '_>, compare_pc: usize, dst_r
     // 2-byte target label.)
     let fallthrough_jc = gin_op.next_pc;
     let target_jc = read_label(code, &gin_op, 1);
-    // SAFETY: code_ptr captured non-null above, live for the walk.
-    let code_obj = unsafe { &*code_ptr };
     // The `jc_pc` here is a branch ARM's op-start (`gin_op.next_pc` /
     // `read_label`), NOT the guard's resume marker, so the RAW offset does
     // not satisfy the carried-coordinate contract (`can_decode_live_vars`
@@ -18719,22 +18691,17 @@ fn compare_box_provably_dead(ctx: &WalkContext<'_, '_>, compare_pc: usize, dst_r
     // The normalization this reader wants — the containing py opcode's
     // resume `-live-` — IS the resume-marker twin at `jc_pc`
     // (`resume_marker_for_jitcode_pc`, the invert→trivia-skip→resolve
-    // composition built at codewrite time), so liveness is keyed on the twin.
-    // A missing twin conservatively keeps the box: treating its liveness as
-    // empty would incorrectly prove the register dead.
+    // composition built at codewrite time), so liveness is keyed on the twin
+    // alone.
     let arm_dst_live = |jc_pc: usize| -> bool {
-        let py = skip_python_trivia_forward(
-            code_obj,
-            python_pc_for_jitcode_pc(metadata, jc_pc) as usize,
-        );
-        let Some(twin) = payload.resume_marker_for_jitcode_pc(jc_pc) else {
+        // No twin ⇒ cannot prove the color dead ⇒ treat as live. Treating a
+        // missing twin's liveness as empty would wrongly prove the register
+        // dead and drop a live box.
+        let Some(marker) = payload.resume_marker_for_jitcode_pc(jc_pc) else {
             return true;
         };
-        let banks = crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
-            jitcode_index,
-            py as i32,
-            twin as i32,
-        );
+        let banks =
+            crate::state::frame_liveness_reg_indices_by_bank_from_pc(jitcode_index, marker as i32);
         banks.ref_.iter().any(|&c| c as u8 == dst_reg)
     };
     if arm_dst_live(fallthrough_jc) || arm_dst_live(target_jc) {
