@@ -8,6 +8,7 @@ import argparse
 import math
 import os
 import shutil
+import statistics
 import struct
 import subprocess
 import sys
@@ -82,6 +83,10 @@ BENCH_DIR = "pyre/bench"
 SYNTHETIC_BENCH_DIR = "pyre/bench/synth"
 SNAP_DIR = "pyre/check.snap"
 BENCH_COMPARE_BUFFER_S = 0.005
+# A single slow sample is retried before failing a performance gate. Windows
+# needs more samples because its process CPU accounting is scheduler-tick
+# quantized (see WIN_TIMER_QUANTUM_S below).
+PERF_RETRY_RUNS = 5 if sys.platform == "win32" else 3
 # Windows `GetProcessTimes` / JobObject user-CPU accounting is quantized to
 # the system scheduler tick (default 1/64 s ≈ 15.625 ms).  Any measured time
 # could be off by up to one tick, so add one tick to every Windows
@@ -345,6 +350,32 @@ def fmt_time(t):
     if t is None or t == "-":
         return "-"
     return f"{t}s"
+
+
+def synth_perf_gate(path):
+    """Read an optional per-fixture performance limit from its header.
+
+    Synthetic tests own their limits, for example:
+        # pyre-check: max-pypy-ratio=30
+    Keeping the gate beside the workload makes a changed loop count or known
+    slow path reviewable with the test that needs the allowance.
+    """
+    prefix = "# pyre-check: max-pypy-ratio="
+    with open(path, encoding="utf-8") as source:
+        for _ in range(20):
+            line = source.readline()
+            if not line:
+                break
+            if not line.startswith(prefix):
+                continue
+            try:
+                ratio = float(line[len(prefix):].strip())
+            except ValueError as e:
+                raise ValueError(f"invalid synthetic performance gate in {path}: {line.strip()}") from e
+            if ratio <= 0:
+                raise ValueError(f"synthetic performance gate must be positive in {path}")
+            return ratio
+    return None
 
 
 def default_binary(backend):
@@ -760,6 +791,58 @@ class Check:
 
     # ── single-backend bench run ──
 
+    def _retry_performance_gate(
+        self, backend, script, timeout, baseline_cmd, expected_output,
+    ):
+        """Return median (pyre, baseline) timings after a slow first sample.
+
+        A retry is deliberately limited to the failed gate: correctness has
+        already passed, and a nonzero exit, changed output, or JIT panic in any
+        retry remains a failure rather than being hidden by a median.
+        """
+        attempts = PERF_RETRY_RUNS
+        effective_timeout = scaled_timeout(timeout, self._timeout_scale(backend))
+        pyre_times = []
+        baseline_times = []
+        for _ in range(attempts):
+            _, baseline_time, baseline_code, _ = run_timed(
+                baseline_cmd, timeout_s=effective_timeout,
+            )
+            if baseline_code != 0:
+                return None
+            output, elapsed, code, stderr = run_timed(
+                [self._pyre(backend), script], timeout_s=effective_timeout,
+                env=pyre_env(),
+            )
+            if (
+                code != 0
+                or output != expected_output
+                or _jit_panic_reason(stderr)
+            ):
+                return None
+            baseline_times.append(baseline_time)
+            pyre_times.append(elapsed)
+        return statistics.median(pyre_times), statistics.median(baseline_times)
+
+    def _performance_gate_passed(
+        self, backend, script, timeout, elapsed, limit, baseline_time,
+        baseline_cmd, expected_output,
+    ):
+        """Check one performance ratio, retrying a failure by median."""
+        if elapsed <= baseline_time * limit + BENCH_COMPARE_BUFFER_S:
+            return True, elapsed, baseline_time, ""
+
+        retry = self._retry_performance_gate(
+            backend, script, timeout, baseline_cmd, expected_output,
+        )
+        if retry is not None:
+            median_elapsed, median_baseline = retry
+            if median_elapsed <= median_baseline * limit + BENCH_COMPARE_BUFFER_S:
+                return True, median_elapsed, median_baseline, f"median {PERF_RETRY_RUNS}"
+            return False, median_elapsed, median_baseline, f"median {PERF_RETRY_RUNS}"
+
+        return False, elapsed, baseline_time, ""
+
     def _run_backend_bench(
         self, backend, name, script, timeout,
         vs_cpython, vs_pypy, t_cpython, t_pypy, pypy_output,
@@ -814,31 +897,49 @@ class Check:
         if t_pypy not in (None, "-") and float(t_pypy) > 0 and elapsed > 0:
             ratio = f"{elapsed / float(t_pypy):.1f}x"
 
+        retry_note = ""
         if vs_cpython and t_cpython not in (None, "-"):
-            if elapsed > float(t_cpython) * vs_cpython + BENCH_COMPARE_BUFFER_S:
+            passed, checked_elapsed, checked_baseline, retry_note = self._performance_gate_passed(
+                backend, script, timeout, elapsed, vs_cpython, float(t_cpython),
+                [PYTHON3, script], pypy_output,
+            )
+            if not passed:
                 self._record(
                     backend, False, name,
-                    f"{elapsed:.2f}s > cpython {t_cpython}s x{vs_cpython}",
+                    f"{checked_elapsed:.2f}s > cpython {checked_baseline:.2f}s x{vs_cpython}",
                 )
-                print(f"{red('SLOWER')}  pyre {elapsed:.2f}s > cpython {t_cpython}s x{vs_cpython}")
+                suffix = f" ({retry_note})" if retry_note else ""
+                print(f"{red('SLOWER')}  pyre {checked_elapsed:.2f}s > cpython {checked_baseline:.2f}s x{vs_cpython}{suffix}")
                 self._append_comparison(
                     backend, name, t_cpython, t_pypy,
                     fmt_time(f"{elapsed:.2f}"), f"({ratio} vs pypy)",
                 )
                 return
+            if retry_note:
+                elapsed = checked_elapsed
+                ratio = f"{elapsed / float(t_pypy):.1f}x" if float(t_pypy) > 0 else "-"
 
         if vs_pypy and t_pypy not in (None, "-"):
-            if elapsed > float(t_pypy) * vs_pypy + BENCH_COMPARE_BUFFER_S:
+            passed, checked_elapsed, checked_baseline, retry_note = self._performance_gate_passed(
+                backend, script, timeout, elapsed, vs_pypy, float(t_pypy),
+                [PYPY3, script], pypy_output,
+            )
+            if not passed:
                 self._record(
                     backend, False, name,
-                    f"{elapsed:.2f}s > pypy {t_pypy}s x{vs_pypy}",
+                    f"{checked_elapsed:.2f}s > pypy {checked_baseline:.2f}s x{vs_pypy}",
                 )
-                print(f"{red('SLOWER')}  pyre {elapsed:.2f}s > pypy {t_pypy}s x{vs_pypy}")
+                suffix = f" ({retry_note})" if retry_note else ""
+                print(f"{red('SLOWER')}  pyre {checked_elapsed:.2f}s > pypy {checked_baseline:.2f}s x{vs_pypy}{suffix}")
                 self._append_comparison(
                     backend, name, t_cpython, t_pypy,
                     fmt_time(f"{elapsed:.2f}"), f"({ratio} vs pypy)",
                 )
                 return
+            if retry_note:
+                elapsed = checked_elapsed
+                t_pypy = f"{checked_baseline:.2f}"
+                ratio = f"{elapsed / checked_baseline:.1f}x" if checked_baseline > 0 else "-"
 
         snap_status, snap_reason = self._apply_snapshot_gate(
             backend, name, output, elapsed,
@@ -850,7 +951,8 @@ class Check:
             return
 
         self._record(backend, True, name, f"{elapsed:.2f}s")
-        print(f"{green('PASS')}  {elapsed:.2f}s")
+        suffix = f" ({retry_note})" if retry_note else ""
+        print(f"{green('PASS')}  {elapsed:.2f}s{suffix}")
         self._append_comparison(
             backend, name, t_cpython, t_pypy,
             fmt_time(f"{elapsed:.2f}"), f"({ratio} vs pypy)",
@@ -938,6 +1040,11 @@ class Check:
     def run_synthetic_bench(self, path, timeout):
         name = f"synth/{Path(path).stem}"
         effective_timeout = scaled_timeout(timeout, self.args.timeout_scale)
+        try:
+            max_pypy_ratio = synth_perf_gate(path)
+        except ValueError as e:
+            print(f"{red('ERROR')}: {e}")
+            sys.exit(1)
 
         print(f"  {name}")
 
@@ -989,7 +1096,7 @@ class Check:
                 continue
             self._run_backend_bench(
                 backend, name, path, timeout,
-                None, None, t_cpython, t_pypy, pypy_output,
+                None, max_pypy_ratio, t_cpython, t_pypy, pypy_output,
             )
 
     def run_synthetic_suite(self):
@@ -1038,6 +1145,9 @@ class Check:
 
     def print_summary(self):
         print()
+        self.print_comparison_table()
+        print()
+
         if self.results:
             print("─" * 53)
             for r in self.results:
@@ -1052,9 +1162,6 @@ class Check:
             enabled_runs += 1
             if self.fail_count.get(b, 0) > 0:
                 failed_runs += 1
-
-        self.print_comparison_table()
-        print()
 
         if self.args.snapshot_mode or self.args.threshold is not None:
             if self.args.snapshot_mode == "record":

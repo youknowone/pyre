@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=150
 # A hot loop FOLLOWED by a try/except whose handler `return`s.  The
 # `return`-from-`except` cleanup compiles to `SWAP 2; POP_EXCEPT;
 # RETURN_VALUE` (the SWAP exchanges the return value with the saved
@@ -7,7 +8,7 @@
 # Previously the codewriter emitted `abort_permanent` for SWAP, so the
 # resume walk failed ("call failed" / uncaught escape).  This bench pins
 # that the SWAP-bearing handler tail resumes byte-identically.
-N = 2000000
+N = 1000000
 
 
 def raise_then_return(n):

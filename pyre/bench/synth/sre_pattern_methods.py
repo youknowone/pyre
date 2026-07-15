@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=30
 import re
 
 # Regex work runs through the `re` layer and native `_sre`, which the trace
@@ -5,8 +6,8 @@ import re
 # per-iteration cost of a JIT-compiled arithmetic loop).  The JIT pipeline it
 # guards (loop compile, guard-failure bridge, resume paths) and its GC-rooting
 # pressure saturate well below this count, so it stays a regression sentinel
-# while finishing in ~1-3s instead of brushing the suite timeout.
-N = 5000
+# while staying well below the three-second per-test budget.
+N = 2500
 
 pair = re.compile(r"([a-z]+)(\d+)")
 digit = re.compile(r"\d")
