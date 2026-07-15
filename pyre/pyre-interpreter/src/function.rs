@@ -477,10 +477,10 @@ pub unsafe fn is_function(obj: PyObjectRef) -> bool {
 /// Stamp a module-level builtin function's `__module__` with its
 /// containing module at install time — `MixedModule` registration sets
 /// `func.w_module = w(modulename)` for each interp-level definition.
-/// Touches `BUILTIN_FUNCTION_TYPE` objects and globals-less
-/// `FUNCTION_TYPE` objects (the `py_module!` `inline_functions` /
-/// `functions` carriers) whose module is still unset.  App-level
-/// functions carry globals and derive `__module__` lazily from
+/// Touches `BUILTIN_FUNCTION_TYPE` objects (the `py_module!`
+/// `inline_functions` / `functions` / `module_functions` carriers) and any
+/// globals-less `FUNCTION_TYPE` object whose module is still unset.
+/// App-level functions carry globals and derive `__module__` lazily from
 /// `globals['__name__']`, so a function with globals is left alone.
 ///
 /// # Safety

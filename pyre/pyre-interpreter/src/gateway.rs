@@ -834,6 +834,34 @@ pub fn make_module_builtin_function_with_arity_and_sig(
     crate::function_new_builtin(code as *const (), name.to_string(), pyre_object::PY_NULL)
 }
 
+/// Non-binding (`BuiltinFunction`) twin of
+/// `make_builtin_function_with_arity_and_maybe_sig`, used by the
+/// `py_module!` `inline_functions:` arm.  A module-level `#[pyre_function]`
+/// builtin must be a `BuiltinFunction` (typedef omits `__get__`) rather than
+/// a `FunctionWithFixedCode`: `mixedmodule.py:_load_lazily` gives every
+/// function directly in a mixed-module a builtin type without `__get__`, so
+/// storing one on a user class does not synthesize a bound method.  `None`
+/// keeps the positional-only fast path; `Some` records the argument
+/// `Signature` for keyword binding and demotes a `*args`/`**kwargs`/kw-only
+/// signature to `HOPELESS`.
+pub fn make_module_builtin_function_with_arity_and_maybe_sig(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    arity: u16,
+    signature: Option<Signature>,
+) -> PyObjectRef {
+    let arity = match &signature {
+        Some(s) if s.has_vararg() || s.has_kwarg() || s.num_kwonlyargnames() > 0 => HOPELESS,
+        _ => arity,
+    };
+    let sig: *const Signature = match signature {
+        Some(signature) => Box::into_raw(Box::new(signature)),
+        None => std::ptr::null(),
+    };
+    let code = builtin_code_new_full(name, func, None, arity, sig);
+    crate::function_new_builtin(code as *const (), name.to_string(), pyre_object::PY_NULL)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -277,7 +277,7 @@ macro_rules! py_module {
                     $crate::dict_storage_store(
                         ns,
                         stringify!($ifn_name),
-                        $crate::make_builtin_function_with_arity_and_maybe_sig(
+                        $crate::make_module_builtin_function_with_arity_and_maybe_sig(
                             stringify!($ifn_name),
                             $ifn_name,
                             $crate::pyre_count_typed_args!($($ifn_args)*) as u16,
@@ -536,14 +536,19 @@ macro_rules! py_class_typed {
 }
 
 /// Helper for `py_module!`'s `functions:` arm.  `*` → varargs
-/// (`make_builtin_function`); numeric arity → `make_builtin_function_with_arity`.
+/// (`make_module_builtin_function`); numeric arity →
+/// `make_module_builtin_function_with_arity`.  Functions directly in a
+/// mixed-module are non-descriptors (`mixedmodule.py:_load_lazily` converts
+/// every mixed-module function to `BuiltinFunction`, whose typedef omits
+/// `__get__`), so storing one on a user class must not synthesize a bound
+/// method — identical to the `module_functions:` arm.
 #[macro_export]
 macro_rules! py_module_fn {
     ($key:literal, *, $path:expr) => {
-        $crate::make_builtin_function($key, $path)
+        $crate::make_module_builtin_function($key, $path)
     };
     ($key:literal, $arity:literal, $path:expr) => {
-        $crate::make_builtin_function_with_arity($key, $path, $arity)
+        $crate::make_module_builtin_function_with_arity($key, $path, $arity)
     };
 }
 
@@ -767,7 +772,7 @@ pub use gateway::{
     make_builtin_function_maybe_sig, make_builtin_function_passthrough_args1,
     make_builtin_function_with_arity, make_builtin_function_with_arity_and_maybe_sig,
     make_builtin_function_with_signature, make_module_builtin_function,
-    make_module_builtin_function_with_arity,
+    make_module_builtin_function_with_arity, make_module_builtin_function_with_arity_and_maybe_sig,
 };
 pub use jit_fnaddr::*;
 pub use malachite_bigint::BigInt as PyBigInt;
