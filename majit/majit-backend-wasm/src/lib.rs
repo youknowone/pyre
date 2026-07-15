@@ -1046,6 +1046,41 @@ fn wasm_unsupported_trace_reason(ops: &[Op], is_loop: bool, allow_ca: bool) -> O
                 "wasm backend: loop trace with cross-loop terminal JUMP (no local LABEL)".into(),
             );
         }
+        // The loop lowering assumes the closing back-edge JUMP targets the LAST
+        // label: `build_function` picks the loop-back label with
+        // `ops.rposition(Label)`, `find_label_args` returns that label's args,
+        // and the JUMP arm maps the jump args onto it positionally then `br`s to
+        // it. A loop re-traced after a quasi-immutable invalidation can instead
+        // close with a JUMP back to its wider preamble entry label while a
+        // narrower peeled header sits last; mapping the wide jump's args onto the
+        // narrow last label's params leaks preamble constants into loop-carried
+        // slots. The JUMP and the label it targets share the loop-target descr
+        // Arc, so a differing descr identity marks a non-last target — decline it
+        // (`compile_bridge` declines the analogous loop-closing JUMP). The
+        // interpreter runs the invalidated loop correctly.
+        let last_label_descr = ops
+            .iter()
+            .rev()
+            .find(|op| op.opcode == majit_ir::OpCode::Label)
+            .and_then(|op| {
+                op.getdescr()
+                    .map(|d| std::sync::Arc::as_ptr(&d) as *const () as usize)
+            });
+        let closing_jump_descr = ops
+            .iter()
+            .rev()
+            .find(|op| op.opcode == majit_ir::OpCode::Jump)
+            .and_then(|op| {
+                op.getdescr()
+                    .map(|d| std::sync::Arc::as_ptr(&d) as *const () as usize)
+            });
+        if matches!((last_label_descr, closing_jump_descr), (Some(label), Some(jump)) if label != jump)
+        {
+            return Some(
+                "wasm backend: loop back-edge JUMP targets a non-last label (re-traced/unpeeled loop shape)"
+                    .into(),
+            );
+        }
     }
     // A JUMP with no local LABEL inside a bridge (a loop-closing bridge) is
     // lowered to a `return_call_indirect` into the source loop's table slot — a
