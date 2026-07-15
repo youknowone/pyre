@@ -1015,7 +1015,11 @@ fn drive_bridge_carrier_walk(
     ctx.cut_trace(pre_pos);
     crate::jitcode_dispatch::bool_box_truth_reset();
     crate::jitcode_dispatch::fbw_finish_payload_reset();
-    crate::jitcode_dispatch::fbw_store_journal_reset();
+    // Non-commit epilogue: the sub-walk concrete-executed the reconstructed
+    // callee, and the blackhole replays it from the guard, so restore the
+    // pre-walk heap rather than dropping the journals (which would leave every
+    // eager store standing to be applied a second time).
+    crate::jitcode_dispatch::fbw_store_journal_rollback();
     TraceAction::Abort
 }
 
