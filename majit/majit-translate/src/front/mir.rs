@@ -8011,8 +8011,9 @@ impl<'a> Lowering<'a> {
 
     /// The per-instantiation `Option` enum root for a residual-call
     /// destination `dest_ty` that is an `Option<*mut RegisteredStruct>`
-    /// (`Option<PyObjectRef>`), or `None` when `dest_ty` is not an Option
-    /// whose payload is a raw pointer to a registered struct root.
+    /// (`Option<PyObjectRef>`) or an `Option<SplitEligibleEnum>`
+    /// (`Option<Result<*mut PyObject, PyError>>`), or `None` when `dest_ty`
+    /// is not an Option whose payload keys a suffixed constructor classdef.
     ///
     /// A `dont_look_inside` residual returning `Option<*mut PyObject>` has
     /// its result kind erased to the `ref` GCREF token, so the call result
@@ -8025,25 +8026,43 @@ impl<'a> Lowering<'a> {
     /// the residual and constructed Options unify at a phi merge and the
     /// discriminant / payload reads resolve.
     ///
-    /// The payload distinguisher is [`raw_ptr_pointee_class_root`] on the
-    /// Option's first type argument: `Some` for `Option<*mut PyObject>`,
-    /// `None` for `Option<u64>` (no raw pointer) and `Option<*mut u8>` (a
-    /// primitive pointee with no registered struct root) — both of which
-    /// stay classdef-less GCREF, unchanged.
+    /// The payload distinguisher accepts the Option's first type argument
+    /// when it is either a raw pointer whose pointee resolves through
+    /// [`raw_ptr_pointee_class_root`] (`Some` for `Option<*mut PyObject>`),
+    /// or a split-eligible enum whose head [`adt_head_instantiation_suffix`]
+    /// suffixes (`Some` for `Option<Result<..>>` — the same instantiation the
+    /// inlined constructor mints a suffixed `Some`/`None` classdef for).
+    /// `None` for `Option<u64>` (no raw pointer, not an enum), `Option<*mut
+    /// u8>` (primitive pointee, no registered root) and a non-split enum arg
+    /// — all stay classdef-less GCREF, unchanged.
     fn option_residual_narrow_root(&self, dest_ty: &TyRef) -> Option<String> {
         if !crate::front::result_exc::tyref_is_option(dest_ty, self.llbc) {
             return None;
         }
-        // Distinguisher: the Option's payload must be a raw pointer whose
-        // pointee resolves to a registered struct root.
+        // Distinguisher: the Option's payload must be either a raw pointer
+        // whose pointee resolves to a registered struct root, or a
+        // split-eligible enum (`Option<Result<..>>`) — both cases the
+        // constructor path mints a suffixed classdef for, so the residual
+        // receiver must key the same suffixed root instead of a bare GCREF.
+        // Foreign value payloads (`BigInt` / `Wtf8Buf`, no registered root;
+        // a non-split enum arg) still bail, keeping them classdef-less.
         let payload = tyref_node(dest_ty, self.llbc)?
             .as_object()?
             .get("Adt")?
             .get("generics")?
             .get("types")?
             .get(0)?;
-        strip_ty_wrappers(payload, self.llbc)
-            .and_then(|n| raw_ptr_pointee_class_root(n, self.llbc))?;
+        let payload_node = strip_ty_wrappers(payload, self.llbc)?;
+        let payload_ok = raw_ptr_pointee_class_root(payload_node, self.llbc).is_some()
+            || payload_node
+                .as_object()
+                .and_then(|o| o.get("Adt"))
+                .and_then(serde_json::Value::as_object)
+                .and_then(|adt| adt_head_instantiation_suffix(adt, self.llbc))
+                .is_some();
+        if !payload_ok {
+            return None;
+        }
         // The narrow root is the Option enum instantiation itself — the same
         // spelling a static `Some(..)` construction of this instantiation mints.
         let def_id = self.tyref_adt_def_id(dest_ty)?;
