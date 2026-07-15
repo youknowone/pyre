@@ -927,6 +927,10 @@ pub(crate) fn load_builtin_module(name: &str) -> Option<PyObjectRef> {
             unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(w_dict, key) }
         {
             unsafe {
+                // MixedModule._load_lazily: every function directly in a
+                // mixed-module is a non-descriptor `BuiltinFunction` (no
+                // `__get__`), so storing it on a user class does not bind `self`.
+                crate::function::demote_module_function_to_builtin(value);
                 crate::function::builtin_function_set_module(
                     value,
                     pyre_object::gc_roots::shadow_stack_get(save_point + 1),

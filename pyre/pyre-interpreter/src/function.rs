@@ -656,6 +656,36 @@ pub unsafe fn builtin_function_set_module_attr(obj: PyObjectRef, value: PyObject
     }
 }
 
+/// mixedmodule.py:_load_lazily — "all functions that are directly in a
+/// mixed-module are 'builtin', e.g. they get a special type without a
+/// `__get__`".  A module dict entry that is a globals-less
+/// `FunctionWithFixedCode` is retagged in place to `BuiltinFunction`
+/// (`BUILTIN_FUNCTION_TYPE`, whose typedef omits `__get__`) so storing it on a
+/// user class and reading it through an instance does not synthesize a bound
+/// method (`typedef.py:918 del BuiltinFunction.typedef.rawdict['__get__']`).
+///
+/// Both PyTypes share the `Function` layout and GC type id
+/// (`eval.rs` maps both to `function_tid`), so only `ob_type` (the binding
+/// dispatch tag read by `getdescriptor`) and `w_class` (the Python-visible
+/// `type()`) are retagged — code, name, and every other field are preserved
+/// and object identity is kept, so two dict keys aliasing one function stay
+/// identical.  Callers pass module dict values only; builtin-type methods live
+/// in type dicts, never reach this, and keep `Function.__get__` to bind as
+/// methods.  App-level functions carry globals and are left alone.
+///
+/// # Safety
+/// `obj` must be a valid, non-null pointer to a `PyObject`.
+pub unsafe fn demote_module_function_to_builtin(obj: PyObjectRef) {
+    unsafe {
+        if py_type_check(obj, &FUNCTION_TYPE)
+            && (*(obj as *const Function)).w_func_globals_obj.is_null()
+        {
+            (*obj).ob_type = &BUILTIN_FUNCTION_TYPE as *const PyType;
+            (*obj).w_class = pyre_object::pyobject::get_instantiate(&BUILTIN_FUNCTION_TYPE);
+        }
+    }
+}
+
 /// Stamp the `__self__` of a builtin `__new__` carrier — the defining
 /// type whose `tp_new` it wraps (`typeobject.c add_tp_new_wrapper`).
 /// Only touches functions whose `w_new_self` is still unset, so an

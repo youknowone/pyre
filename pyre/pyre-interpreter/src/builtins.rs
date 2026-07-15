@@ -2767,6 +2767,9 @@ pub fn new_builtin_module_dict() -> pyre_object::PyObjectRef {
     for key in &keys {
         if let Some(value) = unsafe { pyre_object::w_dict_getitem_str(w_dict, key) } {
             unsafe {
+                // MixedModule._load_lazily: a function directly in the builtins
+                // module is a non-descriptor `BuiltinFunction` (no `__get__`).
+                crate::function::demote_module_function_to_builtin(value);
                 crate::function::builtin_function_set_module(
                     value,
                     pyre_object::gc_roots::shadow_stack_get(save_point + 1),
