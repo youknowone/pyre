@@ -39,6 +39,74 @@ fn run_runtime_program(
         .unwrap_or_else(|err| panic!("failed to run {}: {err}", binary.display()))
 }
 
+fn stat_value(stderr: &str, name: &str) -> u64 {
+    stderr
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix(&format!("{name}=")))
+        .unwrap_or_else(|| panic!("missing {name}= in wasm JIT stats:\n{stderr}"))
+        .parse()
+        .unwrap_or_else(|err| panic!("invalid {name}= in wasm JIT stats: {err}\n{stderr}"))
+}
+
+#[test]
+fn global_reassign_retraces_non_last_label_backedge_at_runtime() {
+    let root = workspace_root();
+    let dynasm = root.join("target/release/pyre-dynasm");
+    let wasm_runner = root.join("target/release/pyre-wasm-runner");
+    let host_module = root.join("target/wasm32-unknown-unknown/release/pyre_wasm.wasm-host.wasm");
+    let plain_module = root.join("target/wasm32-unknown-unknown/release/pyre_wasm.wasm");
+    let wasm_module = if host_module.exists() {
+        host_module
+    } else {
+        plain_module
+    };
+
+    for artifact in [&dynasm, &wasm_runner, &wasm_module] {
+        assert!(
+            artifact.exists(),
+            "runtime global-reassign regression needs {}; build the requested dynasm and wasm-host artifacts first",
+            artifact.display()
+        );
+    }
+
+    let module = wasm_module.to_str().expect("workspace paths must be UTF-8");
+    for bench in ["global_reassign.py", "global_reassign_obj.py"] {
+        let script = root.join("pyre/bench/synth").join(bench);
+        let dynasm_run = run_runtime_program(&dynasm, &script, &[]);
+        assert!(
+            dynasm_run.status.success(),
+            "dynasm failed for {bench}:\n{}",
+            String::from_utf8_lossy(&dynasm_run.stderr)
+        );
+        let wasm_run = run_runtime_program(
+            &wasm_runner,
+            &script,
+            &[
+                ("PYRE_WASM_MODULE", module),
+                ("PYRE_WASM_ENGINE", "wasmtime"),
+                ("PYRE_WASM_JIT_STATS", "1"),
+            ],
+        );
+        let stderr = String::from_utf8_lossy(&wasm_run.stderr);
+        assert!(
+            wasm_run.status.success(),
+            "wasm failed for {bench}:\n{stderr}"
+        );
+        assert_eq!(
+            wasm_run.stdout, dynasm_run.stdout,
+            "wasm output diverged from dynasm for {bench}:\n{stderr}"
+        );
+        assert!(
+            stat_value(&stderr, "compiles") > 1,
+            "{bench} did not recompile after its global invalidation:\n{stderr}"
+        );
+        assert!(
+            stat_value(&stderr, "gc_majors") < 10,
+            "{bench} fell back to the allocating interpreter loop:\n{stderr}"
+        );
+    }
+}
+
 #[test]
 fn terminal_declined_call_assembler_matches_dynasm_at_runtime() {
     let root = workspace_root();
@@ -728,6 +796,58 @@ fn test_multi_label_peeled_resumes_at_last_label_validates() {
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1);
     assert!(!guards[0].is_finish);
+}
+
+#[test]
+fn test_non_last_label_backedge_validates() {
+    // Quasi-immutable invalidation can re-trace a loop with a wide entry
+    // LABEL followed by a narrower peeled header, while the closing JUMP
+    // targets the earlier entry label.  The LABEL/JUMP descr identity, not
+    // source position, is the loop target and determines the parallel move.
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+    let wide_descr = majit_ir::make_loop_target_descr(10, false);
+    let narrow_descr = majit_ir::make_loop_target_descr(11, false);
+
+    let wide_label = Op::new(
+        OpCode::Label,
+        &[rb(OpRef::int_op(1)), rb(OpRef::input_arg_int(0))],
+    );
+    wide_label.setdescr(wide_descr.clone());
+    let narrow_label = Op::new(OpCode::Label, &[rb(OpRef::int_op(2))]);
+    narrow_label.setdescr(narrow_descr);
+    let jump = Op::new(
+        OpCode::Jump,
+        &[rb(OpRef::int_op(3)), rb(OpRef::input_arg_int(0))],
+    );
+    jump.setdescr(wide_descr);
+
+    let ops = vec![
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+            OpRef::int_op(1),
+        ),
+        wide_label,
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::int_op(1), OpRef::const_int(1)],
+            OpRef::int_op(2),
+        ),
+        narrow_label,
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::int_op(2), OpRef::const_int(1)],
+            OpRef::int_op(3),
+        ),
+        jump,
+    ];
+
+    // The key-dispatch wrapper intentionally remains restricted to a last-label
+    // target, but ordinary local lowering must accept this shape.
+    assert!(!codegen::is_resumable_peeled(&ops));
+    let (bytes, _) = build_module_default(&inputargs, &ops, &constants);
+    validate_wasm(&bytes);
 }
 
 #[test]
