@@ -3958,18 +3958,21 @@ fn for_iter_body_op_is_jit_safe(instr: pyre_interpreter::Instruction) -> bool {
 /// (resume.py:1312), which never drops or doubles an iteration.
 ///
 /// The direct heap-mutation opcodes `STORE_SUBSCR`, `STORE_ATTR`, `STORE_NAME`,
-/// `STORE_GLOBAL`, `DELETE_SUBSCR`, `DELETE_ATTR`, and the `LOAD_NAME` that reads
-/// module globals are admitted in any body, including one with a call, branch or
-/// nested loop. A mid-body abort after a committed un-journaled store or delete
-/// now resumes exactly through `try_commit_midbody_abort`:
+/// `STORE_GLOBAL`, `STORE_DEREF`, `DELETE_SUBSCR`, `DELETE_ATTR`, and the
+/// `LOAD_NAME` that reads module globals are admitted in any body, including one
+/// with a call, branch or nested loop. A mid-body abort after a committed
+/// un-journaled store, cell write, or delete now resumes exactly through
+/// `try_commit_midbody_abort`:
 /// forward-exception-delivery or CALL-forward replaces the FBW refuse-drop that
 /// skipped the iteration tail. The mutation therefore commits exactly once and
 /// the tail is never dropped, matching the forward-only resume of
-/// `blackhole_from_resumedata`. A delete that raises propagates through
-/// forward-exception-delivery; Fix A's exit-frame traceback recording preserves
-/// its traceback exactly. `LOAD_ATTR` is admitted because a mid-body abort from
-/// its method call follows the same exact-resume path rather than dropping the
-/// remainder of the iteration.
+/// `blackhole_from_resumedata`. STORE_DEREF's cell slot and every subsequent
+/// operand-stack slot are reconstructed independently, including both method
+/// slots consumed by a tail CALL. A mutation that raises, or a later exception
+/// after the cell write, propagates through forward-exception-delivery; Fix A's
+/// exit-frame traceback recording preserves its traceback exactly. `LOAD_ATTR`
+/// is admitted because a mid-body abort from its method call follows the same
+/// exact-resume path rather than dropping the remainder of the iteration.
 fn for_iter_bodies_all_jit_safe(code: &pyre_interpreter::CodeObject) -> bool {
     use pyre_interpreter::Instruction as I;
     let instructions = &code.instructions;
@@ -3993,6 +3996,7 @@ fn for_iter_bodies_all_jit_safe(code: &pyre_interpreter::CodeObject) -> bool {
                             | I::StoreAttr { .. }
                             | I::StoreName { .. }
                             | I::StoreGlobal { .. }
+                            | I::StoreDeref { .. }
                             | I::DeleteSubscr
                             | I::DeleteAttr { .. }
                             | I::LoadName { .. }
@@ -8884,6 +8888,25 @@ mod tests {
         )
         .expect("test code should compile");
         let code = function_code_from_module(&module, "w");
+        assert!(for_iter_bodies_all_jit_safe(&code));
+        assert_eq!(unsupported_jit_shape(&code), UnsupportedJitShape::None);
+    }
+
+    #[test]
+    fn for_iter_store_deref_with_branch_and_call_body_is_jit_safe() {
+        use pyre_interpreter::{Instruction, compile_exec};
+        let module = compile_exec(
+            "def outer(src, fn, acc):\n    n = -1\n    def read():\n        return n\n    for i in src:\n        if i & 1:\n            n = i * 17 + 3\n        n += fn(i)\n        acc.append((i, n))\n    return n, read()\n",
+        )
+        .expect("test code should compile");
+        let code = function_code_from_module(&module, "outer");
+        let mut arg_state = pyre_interpreter::OpArgState::default();
+        assert!(
+            code.instructions
+                .iter()
+                .copied()
+                .any(|unit| { matches!(arg_state.get(unit).0, Instruction::StoreDeref { .. }) })
+        );
         assert!(for_iter_bodies_all_jit_safe(&code));
         assert_eq!(unsupported_jit_shape(&code), UnsupportedJitShape::None);
     }

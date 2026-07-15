@@ -4737,22 +4737,53 @@ fn setarrayitem_vable_via_metainterp(
         shadow.set_concrete(code[op.pc + 1] as u16, index_value, concrete);
     }
     walker_capture_inline_nonstandard_vable_guard(ctx, op.pc, guards_before)?;
-    // #73 (SLICE 1, INERT): a Ref stored to the operand-stack region of the
-    // vable array is an operand-stack PUSH (portal `pyframe.pushvalue`
-    // lowers to `setarrayitem_vable_r(locals_cells_stack_w, depth, w_obj)`).
-    // Capture it as the current opcode's TOS box for the walk-level
-    // operand-stack mirror — this is the chokepoint that catches pushes which
-    // never go through `write_ref_reg` (notably COPY, whose duplicate is
-    // emitted as a bare pushvalue with no compute step).  Gate on the stack
-    // region (`index >= nlocals`) so a STORE_FAST/local-slot store does not
-    // masquerade as a stack TOS.  Writes ONLY `vstack_last_ref` (side-data);
-    // consumed only when the mirror is valid.
+    // A Ref stored to the operand-stack region of the vable array is an
+    // operand-stack push (`pyframe.pushvalue` lowers to
+    // `setarrayitem_vable_r(locals_cells_stack_w, depth, w_obj)`). Retain the
+    // last-write TOS candidate for ordinary single-result opcodes. Method-form
+    // LOAD_ATTR is the one two-result shape that also needs its exact lower
+    // slot mirrored: it writes `[method, self]`, and retaining only `self`
+    // made boundary reconciliation refill the method hole from the stale
+    // pre-LOAD_ATTR receiver. A later guard then resumed CALL with that
+    // receiver as its callee. Scope the positional write to that opcode; the
+    // general boundary model remains authoritative for other push/pop shapes.
+    // Local/cell stores remain excluded by the `index >= nlocals` gate.
     if value_bank == 'r' && ctx.vstack_valid {
         let full_body_sym = ctx.fbw_mode.snapshot_sym;
         if !full_body_sym.is_null() {
             // SAFETY: pointer live for the full-body walk; read-only.
             let nlocals = unsafe { (*full_body_sym).nlocals } as i64;
             if index_value >= nlocals {
+                let method_load = unsafe {
+                    let jitcode = (*full_body_sym).jitcode;
+                    if jitcode.is_null() {
+                        false
+                    } else {
+                        let jitcode = &*jitcode;
+                        if jitcode.payload.code_ptr.is_null() {
+                            false
+                        } else {
+                            pyre_interpreter::decode_instruction_at(
+                                &*jitcode.payload.code_ptr,
+                                ctx.vstack_cur_pypc as usize,
+                            )
+                            .is_some_and(|(instr, op_arg)| match instr
+                            {
+                                pyre_interpreter::Instruction::LoadAttr { namei } => {
+                                    namei.get(op_arg).is_method()
+                                }
+                                _ => false,
+                            })
+                        }
+                    }
+                };
+                if method_load {
+                    let stack_slot = (index_value - nlocals) as usize;
+                    if ctx.vstack_boxes.len() <= stack_slot {
+                        ctx.vstack_boxes.resize(stack_slot + 1, OpRef::NONE);
+                    }
+                    ctx.vstack_boxes[stack_slot] = value;
+                }
                 ctx.vstack_last_ref = value;
             }
         }
