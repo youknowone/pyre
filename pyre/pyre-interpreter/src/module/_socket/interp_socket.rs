@@ -2252,11 +2252,11 @@ fn unpack_inet_addr(storage: &libc::sockaddr_storage) -> pyre_object::PyObjectRe
 }
 
 #[cfg(unix)]
-fn init_socket_type(ns: &mut DictStorage) {
+fn init_socket_type(ns: pyre_object::PyObjectRef) {
     // The `socket` callable: socket(family=AF_INET, type=SOCK_STREAM, proto=0, fileno=None)
     // CPython lets you pass a pre-existing fd via fileno=; we honor that
     // by wrapping the fd directly instead of calling socket(2).
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "__new__",
         crate::make_builtin_function("__new__", |args| {
@@ -2368,13 +2368,13 @@ fn init_socket_type(ns: &mut DictStorage) {
             }
             Ok(socket_from_fd(fd, family, ty, proto))
         }),
-    );
+    ) };
 
     // `interp_socket.py:1157-1160` — `family`/`type`/`proto`/`timeout`
     // are GetSetProperty data descriptors (plain attribute access, not
     // callables).  The getter receives `(descriptor, instance)`, so the
     // socket object is `args[1]`.
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "family",
         crate::typedef::make_getset_descriptor_named(
@@ -2385,8 +2385,8 @@ fn init_socket_type(ns: &mut DictStorage) {
             ),
             "family",
         ),
-    );
-    crate::dict_storage_store(
+    ) };
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "type",
         crate::typedef::make_getset_descriptor_named(
@@ -2397,8 +2397,8 @@ fn init_socket_type(ns: &mut DictStorage) {
             ),
             "type",
         ),
-    );
-    crate::dict_storage_store(
+    ) };
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "proto",
         crate::typedef::make_getset_descriptor_named(
@@ -2409,10 +2409,10 @@ fn init_socket_type(ns: &mut DictStorage) {
             ),
             "proto",
         ),
-    );
+    ) };
     // `interp_socket.py:454 gettimeout_w` — `timeout` is the stored
     // `_timeout` object (float, or `None` when disabled).
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "timeout",
         crate::typedef::make_getset_descriptor_named(
@@ -2430,9 +2430,9 @@ fn init_socket_type(ns: &mut DictStorage) {
             ),
             "timeout",
         ),
-    );
+    ) };
 
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "fileno",
         crate::make_builtin_function_with_arity(
@@ -2443,9 +2443,9 @@ fn init_socket_type(ns: &mut DictStorage) {
             },
             1,
         ),
-    );
+    ) };
 
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "close",
         crate::make_builtin_function_with_arity(
@@ -2461,10 +2461,10 @@ fn init_socket_type(ns: &mut DictStorage) {
             },
             1,
         ),
-    );
+    ) };
 
     // detach() → returns the fd and forgets it.
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "detach",
         crate::make_builtin_function_with_arity(
@@ -2477,14 +2477,14 @@ fn init_socket_type(ns: &mut DictStorage) {
             },
             1,
         ),
-    );
+    ) };
 
     // `interp_socket.py:978-996 _reuse_w / _drop_w` — refcount methods
     // the app-level `socket._socketobject` wrapper uses to share one
     // underlying fd across `socket.makefile()` file-like aliases.
     // `_reuse` increments the usecount; `_drop` decrements and closes
     // when it reaches zero.
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "_reuse",
         crate::make_builtin_function_with_arity(
@@ -2498,8 +2498,8 @@ fn init_socket_type(ns: &mut DictStorage) {
             },
             1,
         ),
-    );
-    crate::dict_storage_store(
+    ) };
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "_drop",
         crate::make_builtin_function_with_arity(
@@ -2521,11 +2521,11 @@ fn init_socket_type(ns: &mut DictStorage) {
             },
             1,
         ),
-    );
+    ) };
 
     // bind(addr) — addr is (host, port) for AF_INET / (host, port, flowinfo,
     // scopeid) for AF_INET6 / path string for AF_UNIX.
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "bind",
         crate::make_builtin_function_with_arity(
@@ -2547,9 +2547,9 @@ fn init_socket_type(ns: &mut DictStorage) {
             },
             2,
         ),
-    );
+    ) };
 
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "listen",
         crate::make_builtin_function("listen", |args| {
@@ -2566,9 +2566,9 @@ fn init_socket_type(ns: &mut DictStorage) {
             }
             Ok(pyre_object::w_none())
         }),
-    );
+    ) };
 
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "accept",
         crate::make_builtin_function_with_arity(
@@ -2608,14 +2608,14 @@ fn init_socket_type(ns: &mut DictStorage) {
             },
             1,
         ),
-    );
+    ) };
 
     // `interp_socket.py:1090 socketmethodnames _accept` — primitive
     // returning `(fd, addr)`.  CPython's app-level `socket.py:262 def
     // accept` wraps this to construct the new socket object;
     // pyre's `accept` above bundles both steps for callers that
     // bypass the stdlib wrapper.
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "_accept",
         crate::make_builtin_function_with_arity(
@@ -2651,9 +2651,9 @@ fn init_socket_type(ns: &mut DictStorage) {
             },
             1,
         ),
-    );
+    ) };
 
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "connect",
         crate::make_builtin_function_with_arity(
@@ -2685,12 +2685,12 @@ fn init_socket_type(ns: &mut DictStorage) {
             },
             2,
         ),
-    );
+    ) };
 
     // connect_ex(address) → errno (no exception on error)
     // `interp_socket.py:376-392` — `try: connect; except` equivalent
     // that returns the errno integer instead of raising OSError.
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "connect_ex",
         crate::make_builtin_function_with_arity(
@@ -2724,9 +2724,9 @@ fn init_socket_type(ns: &mut DictStorage) {
             },
             2,
         ),
-    );
+    ) };
 
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "send",
         crate::make_builtin_function("send", |args| {
@@ -2765,9 +2765,9 @@ fn init_socket_type(ns: &mut DictStorage) {
             };
             Ok(pyre_object::w_int_new(n as i64))
         }),
-    );
+    ) };
 
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "sendall",
         crate::make_builtin_function("sendall", |args| {
@@ -2813,9 +2813,9 @@ fn init_socket_type(ns: &mut DictStorage) {
             }
             Ok(pyre_object::w_none())
         }),
-    );
+    ) };
 
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "recv",
         crate::make_builtin_function("recv", |args| {
@@ -2857,9 +2857,9 @@ fn init_socket_type(ns: &mut DictStorage) {
             buf.truncate(got as usize);
             Ok(pyre_object::bytesobject::w_bytes_from_bytes(&buf))
         }),
-    );
+    ) };
 
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "sendto",
         crate::make_builtin_function("sendto", |args| {
@@ -2916,9 +2916,9 @@ fn init_socket_type(ns: &mut DictStorage) {
             };
             Ok(pyre_object::w_int_new(n as i64))
         }),
-    );
+    ) };
 
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "recvfrom",
         crate::make_builtin_function("recvfrom", |args| {
@@ -2981,12 +2981,12 @@ fn init_socket_type(ns: &mut DictStorage) {
                 addr,
             ]))
         }),
-    );
+    ) };
 
     // recv_into(buffer, [nbytes, flags]) → nbytes_read
     // `interp_socket.py:831-863` — writes directly into a writable
     // bytes-like buffer.  nbytes==0 uses the full buffer length.
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "recv_into",
         crate::make_builtin_function("recv_into", |args| {
@@ -3047,12 +3047,12 @@ fn init_socket_type(ns: &mut DictStorage) {
             };
             Ok(pyre_object::w_int_new(got as i64))
         }),
-    );
+    ) };
 
     // recvfrom_into(buffer, [nbytes, flags]) → (nbytes, address)
     // `interp_socket.py:866-899` — recvfrom variant that fills a
     // caller-provided buffer rather than allocating a new bytes.
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "recvfrom_into",
         crate::make_builtin_function("recvfrom_into", |args| {
@@ -3126,14 +3126,14 @@ fn init_socket_type(ns: &mut DictStorage) {
                 addr,
             ]))
         }),
-    );
+    ) };
 
     // recvmsg(bufsize, [ancbufsize, flags]) → (data, ancdata, msg_flags, address)
     // `interp_socket.py:525-569` — receives normal + ancillary data
     // via libc::recvmsg.  ancdata is a list of (cmsg_level, cmsg_type,
     // cmsg_data:bytes) triples walked through CMSG_FIRSTHDR /
     // CMSG_NXTHDR / CMSG_DATA.
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "recvmsg",
         crate::make_builtin_function("recvmsg", |args| {
@@ -3253,14 +3253,14 @@ fn init_socket_type(ns: &mut DictStorage) {
                 addr,
             ]))
         }),
-    );
+    ) };
 
     // recvmsg_into(buffers, [ancbufsize, [flags]]) ->
     //   (nbytes, ancdata, msg_flags, address)
     // `interp_socket.py:572-652 recvmsg_into_w` — scatter-receive into
     // a list/tuple of writable buffers; each `writebuf_w` slice
     // contributes one iovec entry.
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "recvmsg_into",
         crate::make_builtin_function("recvmsg_into", |args| {
@@ -3394,14 +3394,14 @@ fn init_socket_type(ns: &mut DictStorage) {
                 addr,
             ]))
         }),
-    );
+    ) };
 
     // sendmsg(data_iter[, ancillary[, flags[, address]]]) → bytes_sent
     // `interp_socket.py:711-773` — gather-write of multiple bytes-like
     // buffers plus optional ancillary control messages.  Each cmsg is
     // a (cmsg_level, cmsg_type, cmsg_data) 3-tuple; we lay them out
     // into a single control buffer via CMSG_SPACE / CMSG_NXTHDR.
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "sendmsg",
         crate::make_builtin_function("sendmsg", |args| {
@@ -3580,9 +3580,9 @@ fn init_socket_type(ns: &mut DictStorage) {
             };
             Ok(pyre_object::w_int_new(sent as i64))
         }),
-    );
+    ) };
 
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "shutdown",
         crate::make_builtin_function_with_arity(
@@ -3601,9 +3601,9 @@ fn init_socket_type(ns: &mut DictStorage) {
             },
             2,
         ),
-    );
+    ) };
 
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "getsockname",
         crate::make_builtin_function_with_arity(
@@ -3622,9 +3622,9 @@ fn init_socket_type(ns: &mut DictStorage) {
             },
             1,
         ),
-    );
+    ) };
 
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "getpeername",
         crate::make_builtin_function_with_arity(
@@ -3643,9 +3643,9 @@ fn init_socket_type(ns: &mut DictStorage) {
             },
             1,
         ),
-    );
+    ) };
 
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "setsockopt",
         crate::make_builtin_function("setsockopt", |args| {
@@ -3688,9 +3688,9 @@ fn init_socket_type(ns: &mut DictStorage) {
             }
             Ok(pyre_object::w_none())
         }),
-    );
+    ) };
 
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "getsockopt",
         crate::make_builtin_function("getsockopt", |args| {
@@ -3749,14 +3749,14 @@ fn init_socket_type(ns: &mut DictStorage) {
                 Ok(pyre_object::bytesobject::w_bytes_from_bytes(&buf))
             }
         }),
-    );
+    ) };
 
     // `interp_socket.py:777-797 setblocking_w` per PyPy docstring: True
     // is equivalent to `settimeout(None)`, False to `settimeout(0.0)`.
     // Routing through `socket_apply_timeout` keeps the SO_*TIMEO state
     // consistent with the timeout attribute and prevents a stale
     // SO_RCVTIMEO from surviving a `setblocking(True)` call.
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "setblocking",
         crate::make_builtin_function_with_arity(
@@ -3782,9 +3782,9 @@ fn init_socket_type(ns: &mut DictStorage) {
             },
             2,
         ),
-    );
+    ) };
 
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "getblocking",
         crate::make_builtin_function_with_arity(
@@ -3799,14 +3799,14 @@ fn init_socket_type(ns: &mut DictStorage) {
             },
             1,
         ),
-    );
+    ) };
 
     // `interp_socket.py:811-828 settimeout_w` then `rsocket.py:RSocket.
     // settimeout`: None → blocking (no O_NONBLOCK, no SO_*TIMEO); 0.0 →
     // non-blocking (O_NONBLOCK on); >0 → blocking + SO_RCVTIMEO +
     // SO_SNDTIMEO set to the duration; <0 → ValueError "Timeout value
     // out of range".
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "settimeout",
         crate::make_builtin_function_with_arity(
@@ -3843,9 +3843,9 @@ fn init_socket_type(ns: &mut DictStorage) {
             },
             2,
         ),
-    );
+    ) };
 
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "gettimeout",
         crate::make_builtin_function_with_arity(
@@ -3861,9 +3861,9 @@ fn init_socket_type(ns: &mut DictStorage) {
             },
             1,
         ),
-    );
+    ) };
 
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "__enter__",
         crate::make_builtin_function_with_arity(
@@ -3871,9 +3871,9 @@ fn init_socket_type(ns: &mut DictStorage) {
             |args| Ok(args.first().copied().unwrap_or(pyre_object::w_none())),
             1,
         ),
-    );
+    ) };
 
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "__exit__",
         crate::make_builtin_function("__exit__", |args| {
@@ -3886,11 +3886,11 @@ fn init_socket_type(ns: &mut DictStorage) {
             }
             Ok(pyre_object::w_bool_from(false))
         }),
-    );
+    ) };
 
     // __repr__ — `interp_socket.py:304-312 descr_repr`.  Format
     // matches CPython: `<socket object, fd=N, family=F, type=T, proto=P>`.
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "__repr__",
         crate::make_builtin_function_with_arity(
@@ -3907,11 +3907,11 @@ fn init_socket_type(ns: &mut DictStorage) {
             },
             1,
         ),
-    );
+    ) };
 
     // set_inheritable / get_inheritable — `interp_socket.py` wraps
     // the FD_CLOEXEC bit on `F_GETFD` / `F_SETFD`.
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "set_inheritable",
         crate::make_builtin_function_with_arity(
@@ -3953,8 +3953,8 @@ fn init_socket_type(ns: &mut DictStorage) {
             },
             2,
         ),
-    );
-    crate::dict_storage_store(
+    ) };
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "get_inheritable",
         crate::make_builtin_function_with_arity(
@@ -3969,7 +3969,7 @@ fn init_socket_type(ns: &mut DictStorage) {
             },
             1,
         ),
-    );
+    ) };
 }
 
 #[cfg(not(unix))]

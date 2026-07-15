@@ -178,8 +178,8 @@ fn make_mmap_iterator(m: pyre_object::PyObjectRef, start: i64, step: i64) -> pyr
 }
 
 #[cfg(unix)]
-fn init_mmap_iterator_type(ns: &mut DictStorage) {
-    crate::dict_storage_store(
+fn init_mmap_iterator_type(ns: pyre_object::PyObjectRef) {
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "__iter__",
         crate::make_builtin_function_with_arity(
@@ -187,8 +187,8 @@ fn init_mmap_iterator_type(ns: &mut DictStorage) {
             |args| Ok(args.first().copied().unwrap_or(pyre_object::w_none())),
             1,
         ),
-    );
-    crate::dict_storage_store(
+    ) };
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "__next__",
         crate::make_builtin_function_with_arity(
@@ -208,15 +208,15 @@ fn init_mmap_iterator_type(ns: &mut DictStorage) {
             },
             1,
         ),
-    );
+    ) };
 }
 
 #[cfg(unix)]
-fn init_mmap_type(ns: &mut DictStorage) {
+fn init_mmap_type(ns: pyre_object::PyObjectRef) {
     // `interp_mmap.py:341 __new__ = interp2app(mmap)` — the class call
     // `mmap.mmap(fileno, length, ...)` lands here.  args[0] is the
     // type, the rest are the constructor positionals.
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "__new__",
         crate::make_builtin_function("__new__", |args| {
@@ -227,10 +227,10 @@ fn init_mmap_type(ns: &mut DictStorage) {
             }
             mmap_construct(&args[1..])
         }),
-    );
+    ) };
 
     // close() — munmap and zero the pointer.
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "close",
         crate::make_builtin_function_with_arity(
@@ -248,12 +248,12 @@ fn init_mmap_type(ns: &mut DictStorage) {
             },
             1,
         ),
-    );
+    ) };
 
     // `interp_mmap.py:391 closed = GetSetProperty(W_MMap.closed_get)` —
     // bare attribute access (`m.closed`) returns the bool directly via
     // descriptor lookup, not a bound method.
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "closed",
         crate::typedef::make_getset_descriptor_named(
@@ -271,13 +271,13 @@ fn init_mmap_type(ns: &mut DictStorage) {
             ),
             "closed",
         ),
-    );
+    ) };
 
     // `interp_mmap.py:98-103 descr_size` returns `mmap.file_size()` —
     // the underlying file's current size via fstat, not the mapped
     // length.  The two diverge after `resize()`, and an anonymous mmap
     // (no fd) raises ValueError per rmmap.py:MMap.file_size.
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "size",
         crate::make_builtin_function_with_arity(
@@ -305,9 +305,9 @@ fn init_mmap_type(ns: &mut DictStorage) {
             },
             1,
         ),
-    );
+    ) };
 
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "tell",
         crate::make_builtin_function_with_arity(
@@ -318,9 +318,9 @@ fn init_mmap_type(ns: &mut DictStorage) {
             },
             1,
         ),
-    );
+    ) };
 
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "seek",
         crate::make_builtin_function("seek", |args| {
@@ -360,9 +360,9 @@ fn init_mmap_type(ns: &mut DictStorage) {
             mmap_set_attr(obj, "_pos", pyre_object::w_int_new(new_pos));
             Ok(pyre_object::w_none())
         }),
-    );
+    ) };
 
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "read",
         crate::make_builtin_function("read", |args| {
@@ -395,9 +395,9 @@ fn init_mmap_type(ns: &mut DictStorage) {
             mmap_set_attr(obj, "_pos", pyre_object::w_int_new((pos + n) as i64));
             Ok(pyre_object::bytesobject::w_bytes_from_bytes(&data))
         }),
-    );
+    ) };
 
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "read_byte",
         crate::make_builtin_function_with_arity(
@@ -415,12 +415,12 @@ fn init_mmap_type(ns: &mut DictStorage) {
             },
             1,
         ),
-    );
+    ) };
 
     // `interp_mmap.py:42 readline` — read bytes from current pos until
     // the first '\n' (inclusive); if absent, read to end.  Mirrors
     // `rmmap.py:421-432`.
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "readline",
         crate::make_builtin_function_with_arity(
@@ -443,9 +443,9 @@ fn init_mmap_type(ns: &mut DictStorage) {
             },
             1,
         ),
-    );
+    ) };
 
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "write",
         crate::make_builtin_function_with_arity(
@@ -482,9 +482,9 @@ fn init_mmap_type(ns: &mut DictStorage) {
             },
             2,
         ),
-    );
+    ) };
 
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "write_byte",
         crate::make_builtin_function_with_arity(
@@ -524,9 +524,9 @@ fn init_mmap_type(ns: &mut DictStorage) {
             },
             2,
         ),
-    );
+    ) };
 
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         // `interp_mmap.py:123-134 flush(offset=0, size=0)` —
         // `@unwrap_spec(offset=int, size=int)` then `mmap.flush(offset,
@@ -576,9 +576,9 @@ fn init_mmap_type(ns: &mut DictStorage) {
                 .map_err(|e| mmap_io_err(e, "msync"))?;
             Ok(pyre_object::w_none())
         }),
-    );
+    ) };
 
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "find",
         crate::make_builtin_function("find", |args| {
@@ -630,9 +630,9 @@ fn init_mmap_type(ns: &mut DictStorage) {
                 .unwrap_or(-1);
             Ok(pyre_object::w_int_new(pos))
         }),
-    );
+    ) };
 
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "rfind",
         crate::make_builtin_function("rfind", |args| {
@@ -685,9 +685,9 @@ fn init_mmap_type(ns: &mut DictStorage) {
                 .unwrap_or(-1);
             Ok(pyre_object::w_int_new(pos))
         }),
-    );
+    ) };
 
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "__enter__",
         crate::make_builtin_function_with_arity(
@@ -695,8 +695,8 @@ fn init_mmap_type(ns: &mut DictStorage) {
             |args| Ok(args.first().copied().unwrap_or(pyre_object::w_none())),
             1,
         ),
-    );
-    crate::dict_storage_store(
+    ) };
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "__exit__",
         crate::make_builtin_function("__exit__", |args| {
@@ -711,9 +711,9 @@ fn init_mmap_type(ns: &mut DictStorage) {
             }
             Ok(pyre_object::w_bool_from(false))
         }),
-    );
+    ) };
 
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "__len__",
         crate::make_builtin_function_with_arity(
@@ -724,12 +724,12 @@ fn init_mmap_type(ns: &mut DictStorage) {
             },
             1,
         ),
-    );
+    ) };
 
     // `interp_mmap.py:188 descr_getitem` — integer index returns a
     // single int byte; slice returns bytes (contiguous fast path for
     // step=1, stepped extraction otherwise).
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "__getitem__",
         crate::make_builtin_function_with_arity(
@@ -778,12 +778,12 @@ fn init_mmap_type(ns: &mut DictStorage) {
             },
             2,
         ),
-    );
+    ) };
 
     // `interp_mmap.py:206 descr_setitem` — integer index writes a
     // single byte (0..256); slice writes a buffer whose length matches
     // the slice length.  Read-only mmaps raise TypeError.
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "__setitem__",
         crate::make_builtin_function_with_arity(
@@ -871,11 +871,11 @@ fn init_mmap_type(ns: &mut DictStorage) {
             },
             3,
         ),
-    );
+    ) };
 
     // `interp_mmap.py:243 descr_iter` — iterate the 1-byte slices
     // `m[i:i+1]` forwards.
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "__iter__",
         crate::make_builtin_function_with_arity(
@@ -886,11 +886,11 @@ fn init_mmap_type(ns: &mut DictStorage) {
             },
             1,
         ),
-    );
+    ) };
 
     // `interp_mmap.py:256 descr_reversed` — iterate the 1-byte slices
     // `m[i:i+1]` from `len(m) - 1` down to `0`.
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "__reversed__",
         crate::make_builtin_function_with_arity(
@@ -902,11 +902,11 @@ fn init_mmap_type(ns: &mut DictStorage) {
             },
             1,
         ),
-    );
+    ) };
 
     // `interp_mmap.py:descr_madvise` — call madvise(addr+start, length,
     // advice).  Defaults: start=0, length=remaining bytes.
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "madvise",
         crate::make_builtin_function("madvise", |args| {
@@ -954,11 +954,11 @@ fn init_mmap_type(ns: &mut DictStorage) {
             }
             Ok(pyre_object::w_none())
         }),
-    );
+    ) };
 
     // `interp_mmap.py:descr_move` — copy `length` bytes from source
     // offset to dest offset within the mapping (memmove semantics).
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "move",
         crate::make_builtin_function_with_arity(
@@ -1011,7 +1011,7 @@ fn init_mmap_type(ns: &mut DictStorage) {
             },
             4,
         ),
-    );
+    ) };
 
     // `interp_mmap.py:146 resize` → `rmmap.py:589-601`.  POSIX path:
     // ftruncate the backing fd (if any) to `offset + newsize`, then
@@ -1019,7 +1019,7 @@ fn init_mmap_type(ns: &mut DictStorage) {
     // raise SystemError to match PyPy's RValueError→SystemError
     // translation at `interp_mmap.py:155-157`.  Read-only / copy
     // mappings reject with TypeError.
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "resize",
         crate::make_builtin_function_with_arity(
@@ -1097,10 +1097,10 @@ fn init_mmap_type(ns: &mut DictStorage) {
             },
             2,
         ),
-    );
+    ) };
 
     // `interp_mmap.py:descr_repr` — `<mmap.mmap closed=False, access=...>`.
-    crate::dict_storage_store(
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "__repr__",
         crate::make_builtin_function_with_arity(
@@ -1131,7 +1131,7 @@ fn init_mmap_type(ns: &mut DictStorage) {
             },
             1,
         ),
-    );
+    ) };
 }
 
 #[cfg(unix)]

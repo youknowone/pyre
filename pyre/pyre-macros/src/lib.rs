@@ -1776,19 +1776,19 @@ fn expand_pyre_methods(
         match &kind {
             MethodKind::Instance => {
                 registrations.push(quote! {
-                    crate::dict_storage_store(ns, #py_name, #raw_fn);
+                    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, #py_name, #raw_fn) };
                 });
             }
             MethodKind::Static => {
                 registrations.push(quote! {
-                    crate::dict_storage_store(ns, #py_name,
-                        ::pyre_object::w_staticmethod_new(#raw_fn));
+                    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, #py_name,
+                        ::pyre_object::w_staticmethod_new(#raw_fn)) };
                 });
             }
             MethodKind::Class => {
                 registrations.push(quote! {
-                    crate::dict_storage_store(ns, #py_name,
-                        ::pyre_object::w_classmethod_new(#raw_fn));
+                    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, #py_name,
+                        ::pyre_object::w_classmethod_new(#raw_fn)) };
                 });
             }
             MethodKind::Getter(prop_name, doc) => {
@@ -1843,7 +1843,7 @@ fn expand_pyre_methods(
             None => quote! { ::pyre_object::PY_NULL },
         };
         registrations.push(quote! {
-            crate::dict_storage_store(
+            unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ns,
                 #prop_name,
                 ::pyre_object::typedef::w_getset_property_new(
@@ -1855,7 +1855,7 @@ fn expand_pyre_methods(
                     false,
                     ::pyre_object::w_str_new(#prop_name),
                 ),
-            );
+            ) };
         });
     }
 
@@ -1868,21 +1868,21 @@ fn expand_pyre_methods(
     // `w_type_set_weakrefable`.
     if let Some(lit) = attrs.doc.as_ref() {
         registrations.push(quote! {
-            crate::dict_storage_store(ns, "__doc__", ::pyre_object::w_str_new(#lit));
+            unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, "__doc__", ::pyre_object::w_str_new(#lit)) };
         });
     }
     if attrs.weakrefable {
         registrations.push(quote! {
-            crate::dict_storage_store(
+            unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ns,
                 "__weakref__",
                 crate::typedef::make_weakref_descr(::pyre_object::PY_NULL),
-            );
+            ) };
         });
     }
     if attrs.unhashable {
         registrations.push(quote! {
-            crate::dict_storage_store(ns, "__hash__", ::pyre_object::w_none());
+            unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, "__hash__", ::pyre_object::w_none()) };
         });
     }
 

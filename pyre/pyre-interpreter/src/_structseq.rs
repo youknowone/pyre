@@ -421,43 +421,63 @@ fn make_struct_seq_impl(
             // `_structseq.py:79-80` — `__new__` / `__reduce__` /
             // `__setattr__` / `__repr__` / `__str__` are wired by the
             // metaclass.
-            crate::dict_storage_store(
-                ns,
-                "__new__",
-                crate::make_builtin_function("__new__", structseq_descr_new),
-            );
-            crate::dict_storage_store(
-                ns,
-                "__repr__",
-                crate::make_builtin_function_with_arity("__repr__", structseq_repr, 1),
-            );
-            crate::dict_storage_store(
-                ns,
-                "__str__",
-                crate::make_builtin_function_with_arity("__str__", structseq_repr, 1),
-            );
-            crate::dict_storage_store(
-                ns,
-                "__reduce__",
-                crate::make_builtin_function_with_arity("__reduce__", structseq_reduce, 1),
-            );
-            crate::dict_storage_store(
-                ns,
-                "__setattr__",
-                crate::make_builtin_function_with_arity("__setattr__", structseq_setattr, 3),
-            );
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    ns,
+                    "__new__",
+                    crate::make_builtin_function("__new__", structseq_descr_new),
+                )
+            };
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    ns,
+                    "__repr__",
+                    crate::make_builtin_function_with_arity("__repr__", structseq_repr, 1),
+                )
+            };
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    ns,
+                    "__str__",
+                    crate::make_builtin_function_with_arity("__str__", structseq_repr, 1),
+                )
+            };
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    ns,
+                    "__reduce__",
+                    crate::make_builtin_function_with_arity("__reduce__", structseq_reduce, 1),
+                )
+            };
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    ns,
+                    "__setattr__",
+                    crate::make_builtin_function_with_arity("__setattr__", structseq_setattr, 3),
+                )
+            };
 
-            crate::dict_storage_store(
-                ns,
-                "n_sequence_fields",
-                pyre_object::w_int_new(n_sequence_fields as i64),
-            );
-            crate::dict_storage_store(ns, "n_fields", pyre_object::w_int_new(n_fields as i64));
-            crate::dict_storage_store(
-                ns,
-                "n_unnamed_fields",
-                pyre_object::w_int_new(n_unnamed_fields as i64),
-            );
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    ns,
+                    "n_sequence_fields",
+                    pyre_object::w_int_new(n_sequence_fields as i64),
+                )
+            };
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    ns,
+                    "n_fields",
+                    pyre_object::w_int_new(n_fields as i64),
+                )
+            };
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    ns,
+                    "n_unnamed_fields",
+                    pyre_object::w_int_new(n_unnamed_fields as i64),
+                )
+            };
 
             // Per-field GetSetProperty descriptors.  `_structseq.py:31-37`
             // implements `structseqfield.__get__` — pyre fans out to the
@@ -469,7 +489,13 @@ fn make_struct_seq_impl(
                     2,
                 );
                 let desc = crate::typedef::make_getset_descriptor_named(getter, fname.as_str());
-                crate::dict_storage_store(ns, fname.as_str(), desc);
+                unsafe {
+                    pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                        ns,
+                        fname.as_str(),
+                        desc,
+                    )
+                };
             }
 
             // `_structseq.py:85-86` — `__match_args__` excludes
@@ -479,7 +505,13 @@ fn make_struct_seq_impl(
                 .filter(|n| !n.starts_with('_'))
                 .map(|n| pyre_object::w_str_new(n.as_str()))
                 .collect();
-            crate::dict_storage_store(ns, "__match_args__", pyre_object::w_tuple_new(match_args));
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    ns,
+                    "__match_args__",
+                    pyre_object::w_tuple_new(match_args),
+                )
+            };
         },
         tuple_type,
     );

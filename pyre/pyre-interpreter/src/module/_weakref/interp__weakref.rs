@@ -121,42 +121,56 @@ fn weakref_lifeline_type() -> PyObjectRef {
 ///     __repr__ = interp2app(W_WeakrefBase.descr__repr__),
 /// )
 /// ```
-fn init_weakref_type(ns: &mut DictStorage) {
-    dict_storage_store(
-        ns,
-        "__new__",
-        make_builtin_function("__new__", descr__new__weakref_typecall),
-    );
-    dict_storage_store(
-        ns,
-        "__init__",
-        make_builtin_function("__init__", descr__init__weakref),
-    );
-    dict_storage_store(
-        ns,
-        "__eq__",
-        make_builtin_function_with_arity("__eq__", descr__eq__, 2),
-    );
-    dict_storage_store(
-        ns,
-        "__ne__",
-        make_builtin_function_with_arity("__ne__", descr__ne__, 2),
-    );
-    dict_storage_store(
-        ns,
-        "__hash__",
-        make_builtin_function_with_arity("__hash__", descr_hash, 1),
-    );
-    dict_storage_store(
-        ns,
-        "__call__",
-        make_builtin_function_with_arity("__call__", descr_call, 1),
-    );
-    dict_storage_store(
-        ns,
-        "__repr__",
-        make_builtin_function_with_arity("__repr__", descr__repr__, 1),
-    );
+fn init_weakref_type(ns: PyObjectRef) {
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__new__",
+            make_builtin_function("__new__", descr__new__weakref_typecall),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__init__",
+            make_builtin_function("__init__", descr__init__weakref),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__eq__",
+            make_builtin_function_with_arity("__eq__", descr__eq__, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__ne__",
+            make_builtin_function_with_arity("__ne__", descr__ne__, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__hash__",
+            make_builtin_function_with_arity("__hash__", descr_hash, 1),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__call__",
+            make_builtin_function_with_arity("__call__", descr_call, 1),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__repr__",
+            make_builtin_function_with_arity("__repr__", descr__repr__, 1),
+        )
+    };
 }
 
 pub fn weakref_type() -> PyObjectRef {
@@ -179,22 +193,28 @@ pub fn weakref_type() -> PyObjectRef {
 ///     **proxy_typedef_dict)
 /// W_Proxy.typedef.acceptable_as_base_class = False
 /// ```
-fn init_proxy_type(ns: &mut DictStorage) {
-    dict_storage_store(
-        ns,
-        "__new__",
-        make_builtin_function("__new__", descr__new__proxy),
-    );
-    dict_storage_store(
-        ns,
-        "__hash__",
-        make_builtin_function_with_arity("__hash__", proxy_descr__hash__, 1),
-    );
-    dict_storage_store(
-        ns,
-        "__repr__",
-        make_builtin_function_with_arity("__repr__", descr__repr__, 1),
-    );
+fn init_proxy_type(ns: PyObjectRef) {
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__new__",
+            make_builtin_function("__new__", descr__new__proxy),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__hash__",
+            make_builtin_function_with_arity("__hash__", proxy_descr__hash__, 1),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__repr__",
+            make_builtin_function_with_arity("__repr__", descr__repr__, 1),
+        )
+    };
     // **proxy_typedef_dict — interp__weakref.py:409.
     register_proxy_typedef_dict(ns, /*include_comparisons=*/ true);
 }
@@ -227,27 +247,35 @@ pub fn proxy_type() -> PyObjectRef {
 ///     **callable_proxy_typedef_dict)
 /// W_CallableProxy.typedef.acceptable_as_base_class = False
 /// ```
-fn init_callable_proxy_type(ns: &mut DictStorage) {
-    dict_storage_store(
-        ns,
-        "__new__",
-        make_builtin_function("__new__", descr__new__callableproxy),
-    );
-    dict_storage_store(
-        ns,
-        "__hash__",
-        make_builtin_function_with_arity("__hash__", proxy_descr__hash__, 1),
-    );
-    dict_storage_store(
-        ns,
-        "__repr__",
-        make_builtin_function_with_arity("__repr__", descr__repr__, 1),
-    );
-    dict_storage_store(
-        ns,
-        "__call__",
-        make_builtin_function("__call__", callable_proxy_descr__call__),
-    );
+fn init_callable_proxy_type(ns: PyObjectRef) {
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__new__",
+            make_builtin_function("__new__", descr__new__callableproxy),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__hash__",
+            make_builtin_function_with_arity("__hash__", proxy_descr__hash__, 1),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__repr__",
+            make_builtin_function_with_arity("__repr__", descr__repr__, 1),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__call__",
+            make_builtin_function("__call__", callable_proxy_descr__call__),
+        )
+    };
     // **callable_proxy_typedef_dict — interp__weakref.py:417. Comparison
     // ops are excluded (interp__weakref.py:390-391 only writes them to
     // `proxy_typedef_dict`).
@@ -1362,364 +1390,508 @@ pub fn proxy_delete(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 /// Called from `init_proxy_type` (`include_comparisons=true`) and
 /// `init_callable_proxy_type` (`include_comparisons=false`) so the two
 /// typedefs end up with the same set of methods PyPy generates.
-fn register_proxy_typedef_dict(ns: &mut DictStorage, include_comparisons: bool) {
+fn register_proxy_typedef_dict(ns: PyObjectRef, include_comparisons: bool) {
     // Forward + reflected binary arithmetic — interp__weakref.py:376-389.
-    dict_storage_store(
-        ns,
-        "__add__",
-        make_builtin_function_with_arity("__add__", proxy_add, 2),
-    );
-    dict_storage_store(
-        ns,
-        "__radd__",
-        make_builtin_function_with_arity("__radd__", proxy_radd, 2),
-    );
-    dict_storage_store(
-        ns,
-        "__sub__",
-        make_builtin_function_with_arity("__sub__", proxy_sub, 2),
-    );
-    dict_storage_store(
-        ns,
-        "__rsub__",
-        make_builtin_function_with_arity("__rsub__", proxy_rsub, 2),
-    );
-    dict_storage_store(
-        ns,
-        "__mul__",
-        make_builtin_function_with_arity("__mul__", proxy_mul, 2),
-    );
-    dict_storage_store(
-        ns,
-        "__rmul__",
-        make_builtin_function_with_arity("__rmul__", proxy_rmul, 2),
-    );
-    dict_storage_store(
-        ns,
-        "__truediv__",
-        make_builtin_function_with_arity("__truediv__", proxy_truediv, 2),
-    );
-    dict_storage_store(
-        ns,
-        "__rtruediv__",
-        make_builtin_function_with_arity("__rtruediv__", proxy_rtruediv, 2),
-    );
-    dict_storage_store(
-        ns,
-        "__floordiv__",
-        make_builtin_function_with_arity("__floordiv__", proxy_floordiv, 2),
-    );
-    dict_storage_store(
-        ns,
-        "__rfloordiv__",
-        make_builtin_function_with_arity("__rfloordiv__", proxy_rfloordiv, 2),
-    );
-    dict_storage_store(
-        ns,
-        "__mod__",
-        make_builtin_function_with_arity("__mod__", proxy_mod, 2),
-    );
-    dict_storage_store(
-        ns,
-        "__rmod__",
-        make_builtin_function_with_arity("__rmod__", proxy_rmod, 2),
-    );
-    dict_storage_store(ns, "__pow__", make_builtin_function("__pow__", proxy_pow));
-    dict_storage_store(
-        ns,
-        "__rpow__",
-        make_builtin_function("__rpow__", proxy_rpow),
-    );
-    dict_storage_store(
-        ns,
-        "__lshift__",
-        make_builtin_function_with_arity("__lshift__", proxy_lshift, 2),
-    );
-    dict_storage_store(
-        ns,
-        "__rlshift__",
-        make_builtin_function_with_arity("__rlshift__", proxy_rlshift, 2),
-    );
-    dict_storage_store(
-        ns,
-        "__rshift__",
-        make_builtin_function_with_arity("__rshift__", proxy_rshift, 2),
-    );
-    dict_storage_store(
-        ns,
-        "__rrshift__",
-        make_builtin_function_with_arity("__rrshift__", proxy_rrshift, 2),
-    );
-    dict_storage_store(
-        ns,
-        "__and__",
-        make_builtin_function_with_arity("__and__", proxy_and, 2),
-    );
-    dict_storage_store(
-        ns,
-        "__rand__",
-        make_builtin_function_with_arity("__rand__", proxy_rand, 2),
-    );
-    dict_storage_store(
-        ns,
-        "__or__",
-        make_builtin_function_with_arity("__or__", proxy_or, 2),
-    );
-    dict_storage_store(
-        ns,
-        "__ror__",
-        make_builtin_function_with_arity("__ror__", proxy_ror, 2),
-    );
-    dict_storage_store(
-        ns,
-        "__xor__",
-        make_builtin_function_with_arity("__xor__", proxy_xor, 2),
-    );
-    dict_storage_store(
-        ns,
-        "__rxor__",
-        make_builtin_function_with_arity("__rxor__", proxy_rxor, 2),
-    );
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__add__",
+            make_builtin_function_with_arity("__add__", proxy_add, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__radd__",
+            make_builtin_function_with_arity("__radd__", proxy_radd, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__sub__",
+            make_builtin_function_with_arity("__sub__", proxy_sub, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__rsub__",
+            make_builtin_function_with_arity("__rsub__", proxy_rsub, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__mul__",
+            make_builtin_function_with_arity("__mul__", proxy_mul, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__rmul__",
+            make_builtin_function_with_arity("__rmul__", proxy_rmul, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__truediv__",
+            make_builtin_function_with_arity("__truediv__", proxy_truediv, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__rtruediv__",
+            make_builtin_function_with_arity("__rtruediv__", proxy_rtruediv, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__floordiv__",
+            make_builtin_function_with_arity("__floordiv__", proxy_floordiv, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__rfloordiv__",
+            make_builtin_function_with_arity("__rfloordiv__", proxy_rfloordiv, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__mod__",
+            make_builtin_function_with_arity("__mod__", proxy_mod, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__rmod__",
+            make_builtin_function_with_arity("__rmod__", proxy_rmod, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__pow__",
+            make_builtin_function("__pow__", proxy_pow),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__rpow__",
+            make_builtin_function("__rpow__", proxy_rpow),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__lshift__",
+            make_builtin_function_with_arity("__lshift__", proxy_lshift, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__rlshift__",
+            make_builtin_function_with_arity("__rlshift__", proxy_rlshift, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__rshift__",
+            make_builtin_function_with_arity("__rshift__", proxy_rshift, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__rrshift__",
+            make_builtin_function_with_arity("__rrshift__", proxy_rrshift, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__and__",
+            make_builtin_function_with_arity("__and__", proxy_and, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__rand__",
+            make_builtin_function_with_arity("__rand__", proxy_rand, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__or__",
+            make_builtin_function_with_arity("__or__", proxy_or, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__ror__",
+            make_builtin_function_with_arity("__ror__", proxy_ror, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__xor__",
+            make_builtin_function_with_arity("__xor__", proxy_xor, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__rxor__",
+            make_builtin_function_with_arity("__rxor__", proxy_rxor, 2),
+        )
+    };
     // baseobjspace.py:2159 divmod row — forward + reflected.
-    dict_storage_store(
-        ns,
-        "__divmod__",
-        make_builtin_function_with_arity("__divmod__", proxy_divmod, 2),
-    );
-    dict_storage_store(
-        ns,
-        "__rdivmod__",
-        make_builtin_function_with_arity("__rdivmod__", proxy_rdivmod, 2),
-    );
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__divmod__",
+            make_builtin_function_with_arity("__divmod__", proxy_divmod, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__rdivmod__",
+            make_builtin_function_with_arity("__rdivmod__", proxy_rdivmod, 2),
+        )
+    };
 
     // Inplace ops — interp__weakref.py:367-369.
-    dict_storage_store(
-        ns,
-        "__iadd__",
-        make_builtin_function_with_arity("__iadd__", proxy_iadd, 2),
-    );
-    dict_storage_store(
-        ns,
-        "__isub__",
-        make_builtin_function_with_arity("__isub__", proxy_isub, 2),
-    );
-    dict_storage_store(
-        ns,
-        "__imul__",
-        make_builtin_function_with_arity("__imul__", proxy_imul, 2),
-    );
-    dict_storage_store(
-        ns,
-        "__itruediv__",
-        make_builtin_function_with_arity("__itruediv__", proxy_itruediv, 2),
-    );
-    dict_storage_store(
-        ns,
-        "__ifloordiv__",
-        make_builtin_function_with_arity("__ifloordiv__", proxy_ifloordiv, 2),
-    );
-    dict_storage_store(
-        ns,
-        "__imod__",
-        make_builtin_function_with_arity("__imod__", proxy_imod, 2),
-    );
-    dict_storage_store(
-        ns,
-        "__ipow__",
-        make_builtin_function_with_arity("__ipow__", proxy_ipow, 2),
-    );
-    dict_storage_store(
-        ns,
-        "__ilshift__",
-        make_builtin_function_with_arity("__ilshift__", proxy_ilshift, 2),
-    );
-    dict_storage_store(
-        ns,
-        "__irshift__",
-        make_builtin_function_with_arity("__irshift__", proxy_irshift, 2),
-    );
-    dict_storage_store(
-        ns,
-        "__iand__",
-        make_builtin_function_with_arity("__iand__", proxy_iand, 2),
-    );
-    dict_storage_store(
-        ns,
-        "__ior__",
-        make_builtin_function_with_arity("__ior__", proxy_ior, 2),
-    );
-    dict_storage_store(
-        ns,
-        "__ixor__",
-        make_builtin_function_with_arity("__ixor__", proxy_ixor, 2),
-    );
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__iadd__",
+            make_builtin_function_with_arity("__iadd__", proxy_iadd, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__isub__",
+            make_builtin_function_with_arity("__isub__", proxy_isub, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__imul__",
+            make_builtin_function_with_arity("__imul__", proxy_imul, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__itruediv__",
+            make_builtin_function_with_arity("__itruediv__", proxy_itruediv, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__ifloordiv__",
+            make_builtin_function_with_arity("__ifloordiv__", proxy_ifloordiv, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__imod__",
+            make_builtin_function_with_arity("__imod__", proxy_imod, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__ipow__",
+            make_builtin_function_with_arity("__ipow__", proxy_ipow, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__ilshift__",
+            make_builtin_function_with_arity("__ilshift__", proxy_ilshift, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__irshift__",
+            make_builtin_function_with_arity("__irshift__", proxy_irshift, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__iand__",
+            make_builtin_function_with_arity("__iand__", proxy_iand, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__ior__",
+            make_builtin_function_with_arity("__ior__", proxy_ior, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__ixor__",
+            make_builtin_function_with_arity("__ixor__", proxy_ixor, 2),
+        )
+    };
 
     // Single-dunder rows — interp__weakref.py:393-395.
-    dict_storage_store(
-        ns,
-        "__format__",
-        make_builtin_function_with_arity("__format__", proxy_format, 2),
-    );
-    dict_storage_store(
-        ns,
-        "__str__",
-        make_builtin_function_with_arity("__str__", proxy_str, 1),
-    );
-    dict_storage_store(
-        ns,
-        "__len__",
-        make_builtin_function_with_arity("__len__", proxy_len, 1),
-    );
-    dict_storage_store(
-        ns,
-        "__getattribute__",
-        make_builtin_function_with_arity("__getattribute__", proxy_getattribute, 2),
-    );
-    dict_storage_store(
-        ns,
-        "__setattr__",
-        make_builtin_function_with_arity("__setattr__", proxy_setattr, 3),
-    );
-    dict_storage_store(
-        ns,
-        "__delattr__",
-        make_builtin_function_with_arity("__delattr__", proxy_delattr, 2),
-    );
-    dict_storage_store(
-        ns,
-        "__getitem__",
-        make_builtin_function_with_arity("__getitem__", proxy_getitem, 2),
-    );
-    dict_storage_store(
-        ns,
-        "__setitem__",
-        make_builtin_function_with_arity("__setitem__", proxy_setitem, 3),
-    );
-    dict_storage_store(
-        ns,
-        "__delitem__",
-        make_builtin_function_with_arity("__delitem__", proxy_delitem, 2),
-    );
-    dict_storage_store(
-        ns,
-        "__trunc__",
-        make_builtin_function_with_arity("__trunc__", proxy_trunc, 1),
-    );
-    dict_storage_store(
-        ns,
-        "__pos__",
-        make_builtin_function_with_arity("__pos__", proxy_pos, 1),
-    );
-    dict_storage_store(
-        ns,
-        "__neg__",
-        make_builtin_function_with_arity("__neg__", proxy_neg, 1),
-    );
-    dict_storage_store(
-        ns,
-        "__bool__",
-        make_builtin_function_with_arity("__bool__", proxy_bool, 1),
-    );
-    dict_storage_store(
-        ns,
-        "__abs__",
-        make_builtin_function_with_arity("__abs__", proxy_abs, 1),
-    );
-    dict_storage_store(
-        ns,
-        "__invert__",
-        make_builtin_function_with_arity("__invert__", proxy_invert, 1),
-    );
-    dict_storage_store(
-        ns,
-        "__int__",
-        make_builtin_function_with_arity("__int__", proxy_int, 1),
-    );
-    dict_storage_store(
-        ns,
-        "__index__",
-        make_builtin_function_with_arity("__index__", proxy_index, 1),
-    );
-    dict_storage_store(
-        ns,
-        "__float__",
-        make_builtin_function_with_arity("__float__", proxy_float, 1),
-    );
-    dict_storage_store(
-        ns,
-        "__contains__",
-        make_builtin_function_with_arity("__contains__", proxy_contains, 2),
-    );
-    dict_storage_store(
-        ns,
-        "__iter__",
-        make_builtin_function_with_arity("__iter__", proxy_iter, 1),
-    );
-    dict_storage_store(
-        ns,
-        "__next__",
-        make_builtin_function_with_arity("__next__", proxy_next, 1),
-    );
-    dict_storage_store(
-        ns,
-        "__get__",
-        make_builtin_function_with_arity("__get__", proxy_get, 3),
-    );
-    dict_storage_store(
-        ns,
-        "__set__",
-        make_builtin_function_with_arity("__set__", proxy_set, 3),
-    );
-    dict_storage_store(
-        ns,
-        "__delete__",
-        make_builtin_function_with_arity("__delete__", proxy_delete, 2),
-    );
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__format__",
+            make_builtin_function_with_arity("__format__", proxy_format, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__str__",
+            make_builtin_function_with_arity("__str__", proxy_str, 1),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__len__",
+            make_builtin_function_with_arity("__len__", proxy_len, 1),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__getattribute__",
+            make_builtin_function_with_arity("__getattribute__", proxy_getattribute, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__setattr__",
+            make_builtin_function_with_arity("__setattr__", proxy_setattr, 3),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__delattr__",
+            make_builtin_function_with_arity("__delattr__", proxy_delattr, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__getitem__",
+            make_builtin_function_with_arity("__getitem__", proxy_getitem, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__setitem__",
+            make_builtin_function_with_arity("__setitem__", proxy_setitem, 3),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__delitem__",
+            make_builtin_function_with_arity("__delitem__", proxy_delitem, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__trunc__",
+            make_builtin_function_with_arity("__trunc__", proxy_trunc, 1),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__pos__",
+            make_builtin_function_with_arity("__pos__", proxy_pos, 1),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__neg__",
+            make_builtin_function_with_arity("__neg__", proxy_neg, 1),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__bool__",
+            make_builtin_function_with_arity("__bool__", proxy_bool, 1),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__abs__",
+            make_builtin_function_with_arity("__abs__", proxy_abs, 1),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__invert__",
+            make_builtin_function_with_arity("__invert__", proxy_invert, 1),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__int__",
+            make_builtin_function_with_arity("__int__", proxy_int, 1),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__index__",
+            make_builtin_function_with_arity("__index__", proxy_index, 1),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__float__",
+            make_builtin_function_with_arity("__float__", proxy_float, 1),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__contains__",
+            make_builtin_function_with_arity("__contains__", proxy_contains, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__iter__",
+            make_builtin_function_with_arity("__iter__", proxy_iter, 1),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__next__",
+            make_builtin_function_with_arity("__next__", proxy_next, 1),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__get__",
+            make_builtin_function_with_arity("__get__", proxy_get, 3),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__set__",
+            make_builtin_function_with_arity("__set__", proxy_set, 3),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__delete__",
+            make_builtin_function_with_arity("__delete__", proxy_delete, 2),
+        )
+    };
     // baseobjspace.py:2127-2128 isinstance / issubtype rows.
-    dict_storage_store(
-        ns,
-        "__instancecheck__",
-        make_builtin_function_with_arity("__instancecheck__", proxy_instancecheck, 2),
-    );
-    dict_storage_store(
-        ns,
-        "__subclasscheck__",
-        make_builtin_function_with_arity("__subclasscheck__", proxy_subclasscheck, 2),
-    );
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__instancecheck__",
+            make_builtin_function_with_arity("__instancecheck__", proxy_instancecheck, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__subclasscheck__",
+            make_builtin_function_with_arity("__subclasscheck__", proxy_subclasscheck, 2),
+        )
+    };
 
     // interp__weakref.py:390-391 — comparison ops are registered only on
     // `proxy_typedef_dict`, not `callable_proxy_typedef_dict`.
     if include_comparisons {
-        dict_storage_store(
-            ns,
-            "__lt__",
-            make_builtin_function_with_arity("__lt__", proxy_lt, 2),
-        );
-        dict_storage_store(
-            ns,
-            "__le__",
-            make_builtin_function_with_arity("__le__", proxy_le, 2),
-        );
-        dict_storage_store(
-            ns,
-            "__gt__",
-            make_builtin_function_with_arity("__gt__", proxy_gt, 2),
-        );
-        dict_storage_store(
-            ns,
-            "__ge__",
-            make_builtin_function_with_arity("__ge__", proxy_ge, 2),
-        );
-        dict_storage_store(
-            ns,
-            "__eq__",
-            make_builtin_function_with_arity("__eq__", proxy_eq, 2),
-        );
-        dict_storage_store(
-            ns,
-            "__ne__",
-            make_builtin_function_with_arity("__ne__", proxy_ne, 2),
-        );
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                "__lt__",
+                make_builtin_function_with_arity("__lt__", proxy_lt, 2),
+            )
+        };
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                "__le__",
+                make_builtin_function_with_arity("__le__", proxy_le, 2),
+            )
+        };
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                "__gt__",
+                make_builtin_function_with_arity("__gt__", proxy_gt, 2),
+            )
+        };
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                "__ge__",
+                make_builtin_function_with_arity("__ge__", proxy_ge, 2),
+            )
+        };
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                "__eq__",
+                make_builtin_function_with_arity("__eq__", proxy_eq, 2),
+            )
+        };
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                "__ne__",
+                make_builtin_function_with_arity("__ne__", proxy_ne, 2),
+            )
+        };
     }
 }
 
@@ -1903,13 +2075,15 @@ mod tests {
     fn test_isinstance_user_instancecheck_override() {
         crate::typedef::init_typeobjects();
         let user_type = crate::typedef::make_builtin_type("Checker", |ns| {
-            crate::dict_storage_store(
-                ns,
-                "__instancecheck__",
-                crate::make_builtin_function("__instancecheck__", |_args| {
-                    Ok(pyre_object::w_bool_from(true))
-                }),
-            );
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    ns,
+                    "__instancecheck__",
+                    crate::make_builtin_function("__instancecheck__", |_args| {
+                        Ok(pyre_object::w_bool_from(true))
+                    }),
+                )
+            };
         });
         let checker = pyre_object::objectobject::w_instance_new(user_type);
         let yes = crate::baseobjspace::isinstance(pyre_object::w_int_new(123), checker).unwrap();
@@ -1921,13 +2095,15 @@ mod tests {
     fn test_issubclass_user_subclasscheck_override() {
         crate::typedef::init_typeobjects();
         let user_type = crate::typedef::make_builtin_type("ClassChecker", |ns| {
-            crate::dict_storage_store(
-                ns,
-                "__subclasscheck__",
-                crate::make_builtin_function("__subclasscheck__", |_args| {
-                    Ok(pyre_object::w_bool_from(true))
-                }),
-            );
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    ns,
+                    "__subclasscheck__",
+                    crate::make_builtin_function("__subclasscheck__", |_args| {
+                        Ok(pyre_object::w_bool_from(true))
+                    }),
+                )
+            };
         });
         let checker = pyre_object::objectobject::w_instance_new(user_type);
         let int_type = crate::typedef::r#type(pyre_object::w_int_new(0)).unwrap();
@@ -1944,20 +2120,26 @@ mod tests {
     fn test_proxy_pow_falls_through_to_rpow() {
         crate::typedef::init_typeobjects();
         let lhs_type = crate::typedef::make_builtin_type("PowLhs", |ns| {
-            crate::dict_storage_store(
-                ns,
-                "__pow__",
-                crate::make_builtin_function("__pow__", |_args| {
-                    Ok(pyre_object::w_not_implemented())
-                }),
-            );
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    ns,
+                    "__pow__",
+                    crate::make_builtin_function("__pow__", |_args| {
+                        Ok(pyre_object::w_not_implemented())
+                    }),
+                )
+            };
         });
         let rhs_type = crate::typedef::make_builtin_type("PowRhs", |ns| {
-            crate::dict_storage_store(
-                ns,
-                "__rpow__",
-                crate::make_builtin_function("__rpow__", |_args| Ok(pyre_object::w_int_new(7777))),
-            );
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    ns,
+                    "__rpow__",
+                    crate::make_builtin_function("__rpow__", |_args| {
+                        Ok(pyre_object::w_int_new(7777))
+                    }),
+                )
+            };
         });
         let lhs = pyre_object::objectobject::w_instance_new(lhs_type);
         let rhs = pyre_object::objectobject::w_instance_new(rhs_type);
@@ -1976,20 +2158,24 @@ mod tests {
     fn test_proxy_pow_three_arg_does_not_use_rpow() {
         crate::typedef::init_typeobjects();
         let lhs_type = crate::typedef::make_builtin_type("Pow3Lhs", |ns| {
-            crate::dict_storage_store(
-                ns,
-                "__pow__",
-                crate::make_builtin_function("__pow__", |_args| {
-                    Ok(pyre_object::w_not_implemented())
-                }),
-            );
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    ns,
+                    "__pow__",
+                    crate::make_builtin_function("__pow__", |_args| {
+                        Ok(pyre_object::w_not_implemented())
+                    }),
+                )
+            };
         });
         let rhs_type = crate::typedef::make_builtin_type("Pow3Rhs", |ns| {
-            crate::dict_storage_store(
-                ns,
-                "__rpow__",
-                crate::make_builtin_function("__rpow__", |args| Ok(args[2])),
-            );
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    ns,
+                    "__rpow__",
+                    crate::make_builtin_function("__rpow__", |args| Ok(args[2])),
+                )
+            };
         });
         let lhs = pyre_object::objectobject::w_instance_new(lhs_type);
         let rhs = pyre_object::objectobject::w_instance_new(rhs_type);
@@ -2009,22 +2195,26 @@ mod tests {
     fn test_proxy_divmod_falls_through_to_rdivmod() {
         crate::typedef::init_typeobjects();
         let lhs_type = crate::typedef::make_builtin_type("DivmodLhsNI", |ns| {
-            crate::dict_storage_store(
-                ns,
-                "__divmod__",
-                crate::make_builtin_function("__divmod__", |_args| {
-                    Ok(pyre_object::w_not_implemented())
-                }),
-            );
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    ns,
+                    "__divmod__",
+                    crate::make_builtin_function("__divmod__", |_args| {
+                        Ok(pyre_object::w_not_implemented())
+                    }),
+                )
+            };
         });
         let rhs_type = crate::typedef::make_builtin_type("DivmodRhs", |ns| {
-            crate::dict_storage_store(
-                ns,
-                "__rdivmod__",
-                crate::make_builtin_function("__rdivmod__", |_args| {
-                    Ok(pyre_object::w_int_new(123456))
-                }),
-            );
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    ns,
+                    "__rdivmod__",
+                    crate::make_builtin_function("__rdivmod__", |_args| {
+                        Ok(pyre_object::w_int_new(123456))
+                    }),
+                )
+            };
         });
         let lhs = pyre_object::objectobject::w_instance_new(lhs_type);
         let rhs = pyre_object::objectobject::w_instance_new(rhs_type);

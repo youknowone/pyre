@@ -739,88 +739,138 @@ fn ga_new(args: &[PyObjectRef]) -> crate::PyResult {
 }
 
 /// Build the `types.GenericAlias` namespace.
-pub(crate) fn init_generic_alias_type(ns: &mut DictStorage) {
-    dict_storage_store(ns, "__new__", crate::typedef::make_new_descr(ga_new));
-    dict_storage_store(
-        ns,
-        "__origin__",
-        crate::typedef::make_getset_descriptor_named(
-            make_builtin_function_with_arity("__origin__", ga_get_origin, 2),
+pub(crate) fn init_generic_alias_type(ns: PyObjectRef) {
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__new__",
+            crate::typedef::make_new_descr(ga_new),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "__origin__",
-        ),
-    );
-    dict_storage_store(
-        ns,
-        "__args__",
-        crate::typedef::make_getset_descriptor_named(
-            make_builtin_function_with_arity("__args__", ga_get_args, 2),
+            crate::typedef::make_getset_descriptor_named(
+                make_builtin_function_with_arity("__origin__", ga_get_origin, 2),
+                "__origin__",
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "__args__",
-        ),
-    );
-    dict_storage_store(
-        ns,
-        "__parameters__",
-        crate::typedef::make_getset_descriptor_named(
-            make_builtin_function_with_arity("__parameters__", ga_get_parameters, 2),
+            crate::typedef::make_getset_descriptor_named(
+                make_builtin_function_with_arity("__args__", ga_get_args, 2),
+                "__args__",
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "__parameters__",
-        ),
-    );
-    dict_storage_store(ns, "__eq__", make_builtin_function("__eq__", ga_eq));
+            crate::typedef::make_getset_descriptor_named(
+                make_builtin_function_with_arity("__parameters__", ga_get_parameters, 2),
+                "__parameters__",
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__eq__",
+            make_builtin_function("__eq__", ga_eq),
+        )
+    };
     // __hash__ and __call__ are resolved at their dispatch points
     // (`builtins::hash_value`, `call::call_function_impl_result`) because
     // pyre does not consult a typedef slot for them on builtin W_Roots.
-    dict_storage_store(
-        ns,
-        "__getitem__",
-        make_builtin_function("__getitem__", ga_getitem),
-    );
-    dict_storage_store(
-        ns,
-        "__mro_entries__",
-        make_builtin_function("__mro_entries__", ga_mro_entries),
-    );
-    dict_storage_store(ns, "__or__", make_builtin_function("__or__", ga_or));
-    dict_storage_store(ns, "__ror__", make_builtin_function("__ror__", ga_ror));
-    dict_storage_store(
-        ns,
-        "__instancecheck__",
-        make_builtin_function("__instancecheck__", ga_instancecheck),
-    );
-    dict_storage_store(
-        ns,
-        "__subclasscheck__",
-        make_builtin_function("__subclasscheck__", ga_subclasscheck),
-    );
-    dict_storage_store(
-        ns,
-        "__reduce__",
-        make_builtin_function("__reduce__", ga_reduce),
-    );
-    dict_storage_store(
-        ns,
-        "__unpacked__",
-        crate::typedef::make_getset_descriptor_named(
-            make_builtin_function_with_arity("__unpacked__", ga_get_unpacked, 2),
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__getitem__",
+            make_builtin_function("__getitem__", ga_getitem),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__mro_entries__",
+            make_builtin_function("__mro_entries__", ga_mro_entries),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__or__",
+            make_builtin_function("__or__", ga_or),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__ror__",
+            make_builtin_function("__ror__", ga_ror),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__instancecheck__",
+            make_builtin_function("__instancecheck__", ga_instancecheck),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__subclasscheck__",
+            make_builtin_function("__subclasscheck__", ga_subclasscheck),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__reduce__",
+            make_builtin_function("__reduce__", ga_reduce),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "__unpacked__",
-        ),
-    );
-    dict_storage_store(
-        ns,
-        "__typing_unpacked_tuple_args__",
-        crate::typedef::make_getset_descriptor_named(
-            make_builtin_function_with_arity(
-                "__typing_unpacked_tuple_args__",
-                ga_get_typing_unpacked_tuple_args,
-                2,
+            crate::typedef::make_getset_descriptor_named(
+                make_builtin_function_with_arity("__unpacked__", ga_get_unpacked, 2),
+                "__unpacked__",
             ),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "__typing_unpacked_tuple_args__",
-        ),
-    );
+            crate::typedef::make_getset_descriptor_named(
+                make_builtin_function_with_arity(
+                    "__typing_unpacked_tuple_args__",
+                    ga_get_typing_unpacked_tuple_args,
+                    2,
+                ),
+                "__typing_unpacked_tuple_args__",
+            ),
+        )
+    };
     // `_make_starred` (`_pypy_generic_alias.py:118`) — the module-level reduce
     // target.  pyre has no app-level `_pypy_generic_alias` Python module, so
     // the single shared callable lives on the type namespace; storing it here keeps it reachable
     // for the collector and gives `__reduce__` a stable callable identity.
-    dict_storage_store(ns, "_make_starred", make_starred_fn());
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "_make_starred",
+            make_starred_fn(),
+        )
+    };
     // `__iter__` and `__dir__` are intercepted directly by `baseobjspace::iter`
     // and `builtins::builtin_dir`; explicit `ga.__iter__`/`ga.__dir__` access
     // delegates to `__origin__` (they are not in `_ATTR_EXCEPTIONS`).

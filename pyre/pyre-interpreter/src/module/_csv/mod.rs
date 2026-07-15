@@ -506,35 +506,43 @@ mod dialect_class {
         static CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         *CELL.get_or_init(|| {
             let tp = crate::typedef::make_builtin_type("_csv.Dialect", |ns| {
-                crate::dict_storage_store(
-                    ns,
-                    "__new__",
-                    crate::typedef::make_new_descr(dialect_new),
-                );
+                unsafe {
+                    pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                        ns,
+                        "__new__",
+                        crate::typedef::make_new_descr(dialect_new),
+                    )
+                };
                 // `dialect_new` does all the work; a no-op `__init__`
                 // keeps the template argument from reaching
                 // `object.__init__`.
-                crate::dict_storage_store(
-                    ns,
-                    "__init__",
-                    crate::make_builtin_function("__init__", |_| Ok(pyre_object::w_none())),
-                );
+                unsafe {
+                    pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                        ns,
+                        "__init__",
+                        crate::make_builtin_function("__init__", |_| Ok(pyre_object::w_none())),
+                    )
+                };
                 // `W_Dialect.reduce_ex_w` — dialects are not picklable
                 // (and so not copyable).
-                crate::dict_storage_store(
-                    ns,
-                    "__reduce_ex__",
-                    crate::make_builtin_function("__reduce_ex__", |_| {
-                        Err(PyError::type_error("can't pickle _csv.Dialect objects"))
-                    }),
-                );
-                crate::dict_storage_store(
-                    ns,
-                    "__reduce__",
-                    crate::make_builtin_function("__reduce__", |_| {
-                        Err(PyError::type_error("can't pickle _csv.Dialect objects"))
-                    }),
-                );
+                unsafe {
+                    pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                        ns,
+                        "__reduce_ex__",
+                        crate::make_builtin_function("__reduce_ex__", |_| {
+                            Err(PyError::type_error("can't pickle _csv.Dialect objects"))
+                        }),
+                    )
+                };
+                unsafe {
+                    pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                        ns,
+                        "__reduce__",
+                        crate::make_builtin_function("__reduce__", |_| {
+                            Err(PyError::type_error("can't pickle _csv.Dialect objects"))
+                        }),
+                    )
+                };
                 for (name, getter) in [
                     (
                         "delimiter",
@@ -548,14 +556,16 @@ mod dialect_class {
                     ("skipinitialspace", get_skipinitialspace),
                     ("strict", get_strict),
                 ] {
-                    crate::dict_storage_store(
-                        ns,
-                        name,
-                        crate::typedef::make_getset_descriptor_named(
-                            crate::make_builtin_function(name, getter),
+                    unsafe {
+                        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                            ns,
                             name,
-                        ),
-                    );
+                            crate::typedef::make_getset_descriptor_named(
+                                crate::make_builtin_function(name, getter),
+                                name,
+                            ),
+                        )
+                    };
                 }
             });
             unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };

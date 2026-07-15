@@ -1394,7 +1394,7 @@ pub fn register_module(ns: &mut DictStorage) {
                         ("__fspath__", dir_entry_fspath),
                         ("__repr__", dir_entry_repr),
                     ] {
-                        crate::dict_storage_store(ns, name, crate::make_builtin_function(name, f));
+                        unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, name, crate::make_builtin_function(name, f)) };
                     }
                 });
                 unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
@@ -1438,7 +1438,7 @@ pub fn register_module(ns: &mut DictStorage) {
                         ("__exit__", scandir_iter_close),
                         ("close", scandir_iter_close),
                     ] {
-                        crate::dict_storage_store(ns, name, crate::make_builtin_function(name, f));
+                        unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, name, crate::make_builtin_function(name, f)) };
                     }
                 });
                 unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };

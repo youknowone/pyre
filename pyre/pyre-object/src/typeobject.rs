@@ -388,7 +388,12 @@ pub fn w_type_new_builtin(
     let name = crate::lltype::malloc_raw(name.to_string());
     // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`).
     let _roots = crate::gc_roots::push_roots();
+    let save_point = crate::gc_roots::shadow_stack_len();
     crate::gc_roots::pin_root(bases);
+    crate::gc_roots::pin_root(dict_ptr as PyObjectRef);
+
+    let bases = crate::gc_roots::shadow_stack_get(save_point);
+    let dict_ptr = crate::gc_roots::shadow_stack_get(save_point + 1) as *mut u8;
 
     let w_type = crate::lltype::malloc_typed(W_TypeObject {
         ob_header: PyObject {

@@ -58,11 +58,11 @@ fn abc_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 }
             }
         }
-        let namespace = unsafe { w_type_get_dict_ptr(cls) as *mut crate::DictStorage };
+        let namespace = unsafe { w_type_get_dict_ptr(cls) as PyObjectRef };
         if !namespace.is_null() {
-            for (name, &value) in unsafe { (*namespace).entries() } {
+            for (name, value) in unsafe { w_dict_items(namespace) } {
                 if crate::baseobjspace::isabstractmethod_w(value)? {
-                    abstract_names.push(w_str_new(name));
+                    abstract_names.push(name);
                 }
             }
         }

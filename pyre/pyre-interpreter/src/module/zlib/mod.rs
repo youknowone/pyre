@@ -162,48 +162,52 @@ fn compress_type() -> PyObjectRef {
     })
 }
 
-fn init_compress_type(ns: &mut crate::DictStorage) {
-    crate::dict_storage_store(
-        ns,
-        "compress",
-        crate::make_builtin_function_with_arity(
+fn init_compress_type(ns: PyObjectRef) {
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "compress",
-            |args| {
-                if args.len() < 2 {
-                    return Err(crate::PyError::type_error("compress() missing data"));
+            crate::make_builtin_function_with_arity(
+                "compress",
+                |args| {
+                    if args.len() < 2 {
+                        return Err(crate::PyError::type_error("compress() missing data"));
+                    }
+                    let id = get_id(args[0]);
+                    let data = as_bytes(args[1])?;
+                    let mut reg = COMPRESSORS.lock().unwrap();
+                    let c = reg
+                        .get_mut(&id)
+                        .ok_or_else(|| zlib_error("Error -2: inconsistent stream state"))?;
+                    let out = c.compress(&data).map_err(zlib_error)?;
+                    Ok(bytesobject::w_bytes_from_bytes(&out))
+                },
+                2,
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "flush",
+            crate::make_builtin_function("flush", |args| {
+                if args.is_empty() {
+                    return Err(crate::PyError::type_error("flush() missing self"));
                 }
                 let id = get_id(args[0]);
-                let data = as_bytes(args[1])?;
+                let mode = match args.get(1).copied() {
+                    Some(o) if !unsafe { is_none(o) } => crate::baseobjspace::int_w(o)? as i32,
+                    _ => backend::Z_FINISH,
+                };
                 let mut reg = COMPRESSORS.lock().unwrap();
                 let c = reg
                     .get_mut(&id)
                     .ok_or_else(|| zlib_error("Error -2: inconsistent stream state"))?;
-                let out = c.compress(&data).map_err(zlib_error)?;
+                let out = c.flush(mode).map_err(zlib_error)?;
                 Ok(bytesobject::w_bytes_from_bytes(&out))
-            },
-            2,
-        ),
-    );
-    crate::dict_storage_store(
-        ns,
-        "flush",
-        crate::make_builtin_function("flush", |args| {
-            if args.is_empty() {
-                return Err(crate::PyError::type_error("flush() missing self"));
-            }
-            let id = get_id(args[0]);
-            let mode = match args.get(1).copied() {
-                Some(o) if !unsafe { is_none(o) } => crate::baseobjspace::int_w(o)? as i32,
-                _ => backend::Z_FINISH,
-            };
-            let mut reg = COMPRESSORS.lock().unwrap();
-            let c = reg
-                .get_mut(&id)
-                .ok_or_else(|| zlib_error("Error -2: inconsistent stream state"))?;
-            let out = c.flush(mode).map_err(zlib_error)?;
-            Ok(bytesobject::w_bytes_from_bytes(&out))
-        }),
-    );
+            }),
+        )
+    };
 }
 
 fn make_compress(
@@ -231,79 +235,81 @@ fn decompress_type() -> PyObjectRef {
     })
 }
 
-fn decompress_getset(
-    ns: &mut crate::DictStorage,
-    name: &'static str,
-    f: crate::gateway::BuiltinCodeFn,
-) {
-    crate::dict_storage_store(
-        ns,
-        name,
-        crate::typedef::make_getset_descriptor_named(
-            crate::make_builtin_function_with_arity(name, f, 2),
+fn decompress_getset(ns: PyObjectRef, name: &'static str, f: crate::gateway::BuiltinCodeFn) {
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             name,
-        ),
-    );
+            crate::typedef::make_getset_descriptor_named(
+                crate::make_builtin_function_with_arity(name, f, 2),
+                name,
+            ),
+        )
+    };
 }
 
-fn init_decompress_type(ns: &mut crate::DictStorage) {
-    crate::dict_storage_store(
-        ns,
-        "decompress",
-        crate::make_builtin_function("decompress", |args| {
-            if args.len() < 2 {
-                return Err(crate::PyError::type_error("decompress() missing data"));
-            }
-            let id = get_id(args[0]);
-            let data = as_bytes(args[1])?;
-            let max_length = match args.get(2).copied() {
-                Some(o) if !unsafe { is_none(o) } => {
-                    let v = crate::baseobjspace::int_w(o)?;
-                    if v < 0 {
-                        return Err(crate::PyError::value_error(
-                            "max_length must be non-negative",
-                        ));
-                    }
-                    (v != 0).then_some(v as usize)
+fn init_decompress_type(ns: PyObjectRef) {
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "decompress",
+            crate::make_builtin_function("decompress", |args| {
+                if args.len() < 2 {
+                    return Err(crate::PyError::type_error("decompress() missing data"));
                 }
-                _ => None,
-            };
-            let mut reg = DECOMPRESSORS.lock().unwrap();
-            let d = reg
-                .get_mut(&id)
-                .ok_or_else(|| zlib_error("Error -2: inconsistent stream state"))?;
-            let out = d.decompress(&data, max_length).map_err(zlib_error)?;
-            Ok(bytesobject::w_bytes_from_bytes(&out))
-        }),
-    );
-    crate::dict_storage_store(
-        ns,
-        "flush",
-        crate::make_builtin_function("flush", |args| {
-            if args.is_empty() {
-                return Err(crate::PyError::type_error("flush() missing self"));
-            }
-            let id = get_id(args[0]);
-            let length = match args.get(1).copied() {
-                Some(o) if !unsafe { is_none(o) } => {
-                    let v = crate::baseobjspace::int_w(o)?;
-                    if v <= 0 {
-                        return Err(crate::PyError::value_error(
-                            "length must be greater than zero",
-                        ));
+                let id = get_id(args[0]);
+                let data = as_bytes(args[1])?;
+                let max_length = match args.get(2).copied() {
+                    Some(o) if !unsafe { is_none(o) } => {
+                        let v = crate::baseobjspace::int_w(o)?;
+                        if v < 0 {
+                            return Err(crate::PyError::value_error(
+                                "max_length must be non-negative",
+                            ));
+                        }
+                        (v != 0).then_some(v as usize)
                     }
-                    v as usize
+                    _ => None,
+                };
+                let mut reg = DECOMPRESSORS.lock().unwrap();
+                let d = reg
+                    .get_mut(&id)
+                    .ok_or_else(|| zlib_error("Error -2: inconsistent stream state"))?;
+                let out = d.decompress(&data, max_length).map_err(zlib_error)?;
+                Ok(bytesobject::w_bytes_from_bytes(&out))
+            }),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "flush",
+            crate::make_builtin_function("flush", |args| {
+                if args.is_empty() {
+                    return Err(crate::PyError::type_error("flush() missing self"));
                 }
-                _ => backend::DEF_BUF_SIZE,
-            };
-            let mut reg = DECOMPRESSORS.lock().unwrap();
-            let d = reg
-                .get_mut(&id)
-                .ok_or_else(|| zlib_error("Error -2: inconsistent stream state"))?;
-            let out = d.flush(length).map_err(zlib_error)?;
-            Ok(bytesobject::w_bytes_from_bytes(&out))
-        }),
-    );
+                let id = get_id(args[0]);
+                let length = match args.get(1).copied() {
+                    Some(o) if !unsafe { is_none(o) } => {
+                        let v = crate::baseobjspace::int_w(o)?;
+                        if v <= 0 {
+                            return Err(crate::PyError::value_error(
+                                "length must be greater than zero",
+                            ));
+                        }
+                        v as usize
+                    }
+                    _ => backend::DEF_BUF_SIZE,
+                };
+                let mut reg = DECOMPRESSORS.lock().unwrap();
+                let d = reg
+                    .get_mut(&id)
+                    .ok_or_else(|| zlib_error("Error -2: inconsistent stream state"))?;
+                let out = d.flush(length).map_err(zlib_error)?;
+                Ok(bytesobject::w_bytes_from_bytes(&out))
+            }),
+        )
+    };
     decompress_getset(ns, "unused_data", |args| {
         let id = get_id(args.get(1).copied().unwrap_or(PY_NULL));
         let reg = DECOMPRESSORS.lock().unwrap();
@@ -350,72 +356,74 @@ fn zdecompress_type() -> PyObjectRef {
     })
 }
 
-fn zdecompress_getset(
-    ns: &mut crate::DictStorage,
-    name: &'static str,
-    f: crate::gateway::BuiltinCodeFn,
-) {
-    crate::dict_storage_store(
-        ns,
-        name,
-        crate::typedef::make_getset_descriptor_named(
-            crate::make_builtin_function_with_arity(name, f, 2),
+fn zdecompress_getset(ns: PyObjectRef, name: &'static str, f: crate::gateway::BuiltinCodeFn) {
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             name,
-        ),
-    );
+            crate::typedef::make_getset_descriptor_named(
+                crate::make_builtin_function_with_arity(name, f, 2),
+                name,
+            ),
+        )
+    };
 }
 
-fn init_zdecompress_type(ns: &mut crate::DictStorage) {
+fn init_zdecompress_type(ns: PyObjectRef) {
     // _ZlibDecompressor(wbits=MAX_WBITS, zdict=b'') — the DecompressReader
     // factory gzip calls with wbits=-MAX_WBITS.
-    crate::dict_storage_store(
-        ns,
-        "__new__",
-        crate::make_builtin_function("__new__", |args| {
-            // args[0] is the type; the rest are the constructor arguments.
-            let (pos, kwargs) = crate::builtins::split_builtin_kwargs(&args[1..]);
-            let wbits = to_wbits(arg_int(pos, kwargs, "wbits", 0, backend::MAX_WBITS as i64)?);
-            let zdict = arg_zdict(pos, kwargs, 1)?;
-            let d = backend::ZlibDecompressor::new(wbits, zdict).map_err(zlib_error)?;
-            let id = next_id();
-            ZDECOMPRESSORS.lock().unwrap().insert(id, d);
-            let obj = w_instance_new(zdecompress_type());
-            set_id(obj, id);
-            Ok(obj)
-        }),
-    );
-    crate::dict_storage_store(
-        ns,
-        "decompress",
-        crate::make_builtin_function("decompress", |args| {
-            if args.len() < 2 {
-                return Err(crate::PyError::type_error("decompress() missing data"));
-            }
-            let (pos, kwargs) = crate::builtins::split_builtin_kwargs(&args[1..]);
-            let data = as_bytes(pos.first().copied().unwrap_or(w_none()))?;
-            let max_length = match crate::builtins::kwarg_get(kwargs, "max_length")
-                .or_else(|| pos.get(1).copied())
-            {
-                Some(o) if !unsafe { is_none(o) } => {
-                    let v = crate::baseobjspace::int_w(o)?;
-                    usize::try_from(v).ok()
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__new__",
+            crate::make_builtin_function("__new__", |args| {
+                // args[0] is the type; the rest are the constructor arguments.
+                let (pos, kwargs) = crate::builtins::split_builtin_kwargs(&args[1..]);
+                let wbits = to_wbits(arg_int(pos, kwargs, "wbits", 0, backend::MAX_WBITS as i64)?);
+                let zdict = arg_zdict(pos, kwargs, 1)?;
+                let d = backend::ZlibDecompressor::new(wbits, zdict).map_err(zlib_error)?;
+                let id = next_id();
+                ZDECOMPRESSORS.lock().unwrap().insert(id, d);
+                let obj = w_instance_new(zdecompress_type());
+                set_id(obj, id);
+                Ok(obj)
+            }),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "decompress",
+            crate::make_builtin_function("decompress", |args| {
+                if args.len() < 2 {
+                    return Err(crate::PyError::type_error("decompress() missing data"));
                 }
-                _ => None,
-            };
-            let id = get_id(args[0]);
-            let mut reg = ZDECOMPRESSORS.lock().unwrap();
-            let d = reg
-                .get_mut(&id)
-                .ok_or_else(|| zlib_error("Error -2: inconsistent stream state"))?;
-            match d.decompress(&data, max_length) {
-                Ok(out) => Ok(bytesobject::w_bytes_from_bytes(&out)),
-                Err(backend::DecompressError::Zlib(m)) => Err(zlib_error(m)),
-                Err(backend::DecompressError::Eof) => {
-                    Err(eof_error("End of stream already reached"))
+                let (pos, kwargs) = crate::builtins::split_builtin_kwargs(&args[1..]);
+                let data = as_bytes(pos.first().copied().unwrap_or(w_none()))?;
+                let max_length = match crate::builtins::kwarg_get(kwargs, "max_length")
+                    .or_else(|| pos.get(1).copied())
+                {
+                    Some(o) if !unsafe { is_none(o) } => {
+                        let v = crate::baseobjspace::int_w(o)?;
+                        usize::try_from(v).ok()
+                    }
+                    _ => None,
+                };
+                let id = get_id(args[0]);
+                let mut reg = ZDECOMPRESSORS.lock().unwrap();
+                let d = reg
+                    .get_mut(&id)
+                    .ok_or_else(|| zlib_error("Error -2: inconsistent stream state"))?;
+                match d.decompress(&data, max_length) {
+                    Ok(out) => Ok(bytesobject::w_bytes_from_bytes(&out)),
+                    Err(backend::DecompressError::Zlib(m)) => Err(zlib_error(m)),
+                    Err(backend::DecompressError::Eof) => {
+                        Err(eof_error("End of stream already reached"))
+                    }
                 }
-            }
-        }),
-    );
+            }),
+        )
+    };
     zdecompress_getset(ns, "unused_data", |args| {
         let id = get_id(args.get(1).copied().unwrap_or(PY_NULL));
         let reg = ZDECOMPRESSORS.lock().unwrap();

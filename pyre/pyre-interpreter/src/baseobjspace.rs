@@ -4671,16 +4671,7 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 if dict_ptr.is_null() {
                     return Ok(pyre_object::w_dict_proxy_new(pyre_object::w_dict_new()));
                 }
-                let canonical = if w_type_is_heaptype(obj) {
-                    dict_ptr as PyObjectRef
-                } else {
-                    // Static builtin types keep their raw namespace and lazily
-                    // materialize the canonical regular dict mirror.
-                    dict_storage_to_dict_kind(
-                        dict_ptr as *const crate::DictStorage,
-                        DictWrapKind::Instance,
-                    )
-                };
+                let canonical = dict_ptr as PyObjectRef;
                 return Ok(pyre_object::w_dict_proxy_new(canonical));
             }
             if name == "__bases__" {
@@ -11554,6 +11545,32 @@ mod tests {
         }
     }
 
+    /// A regular proxy-backed W_DictObject starts on EmptyDictStrategy;
+    /// its first string store promotes it to UnicodeDictStrategy.  That
+    /// strategy's fast raw-hash insertion must still write through to the
+    /// authoritative DictStorage, just as ObjectDictStrategy::setitem does.
+    #[test]
+    fn test_proxy_bridged_unicode_setitem_forwards_to_dict_storage() {
+        crate::test_hooks::install_hash_hook();
+        crate::call::install_dict_storage_hooks();
+        let mut namespace = crate::DictStorage::new();
+        let dict = super::dict_storage_to_dict_kind(&mut namespace, super::DictWrapKind::Instance);
+        let value = w_int_new(1);
+
+        unsafe {
+            pyre_object::w_dict_setitem_str(dict, "x", value);
+        }
+
+        let stored = namespace
+            .get("x")
+            .copied()
+            .expect("proxy-bridged Unicode setitem must forward to DictStorage");
+        assert_eq!(stored, value);
+        unsafe {
+            assert_eq!(w_int_get_value(stored), 1);
+        }
+    }
+
     /// `pypy/interpreter/module.py:77 Module.getdict()` parity invariant
     /// for the new module-creation pattern (canonical W_DictObject reuse
     /// via `dict_storage_to_dict` + `w_module_new_aliasing_dict`):
@@ -11673,7 +11690,13 @@ mod tests {
     fn test_issubclass_pseudo_class_via_bases() {
         crate::typedef::init_typeobjects();
         let inner_type = crate::typedef::make_builtin_type("PseudoInner", |ns| {
-            crate::dict_storage_store(ns, "__bases__", w_tuple_new(vec![]));
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    ns,
+                    "__bases__",
+                    w_tuple_new(vec![]),
+                )
+            };
         });
         let inner = pyre_object::objectobject::w_instance_new(inner_type);
         let outer_type = crate::typedef::make_builtin_type("PseudoOuter", |_ns| {

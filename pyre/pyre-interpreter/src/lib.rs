@@ -403,11 +403,11 @@ macro_rules! py_class {
                             {
                                 #[$crate::pyre_function]
                                 fn $mname ( $($margs)* ) $(-> $mret)? $mbody
-                                $crate::dict_storage_store(
+                                unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                                     ns,
                                     stringify!($mname),
                                     $crate::make_builtin_function(stringify!($mname), $mname),
-                                );
+                                ) };
                             }
                         )*)?
                         // `properties:` — each fn registered as a
@@ -418,14 +418,14 @@ macro_rules! py_class {
                             {
                                 #[$crate::pyre_function]
                                 fn $pname ( $($pargs)* ) $(-> $pret)? $pbody
-                                $crate::dict_storage_store(
+                                unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                                     ns,
                                     stringify!($pname),
                                     $crate::typedef::make_getset_descriptor_named(
                                         $crate::make_builtin_function(stringify!($pname), $pname),
                                         stringify!($pname),
                                     ),
-                                );
+                                ) };
                             }
                         )*)?
                     });
@@ -494,25 +494,25 @@ macro_rules! py_class_typed {
                                 {
                                     #[$crate::pyre_function]
                                     fn $mname ( $($margs)* ) $(-> $mret)? $mbody
-                                    $crate::dict_storage_store(
+                                    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                                         ns,
                                         stringify!($mname),
                                         $crate::make_builtin_function(stringify!($mname), $mname),
-                                    );
+                                    ) };
                                 }
                             )*)?
                             $($(
                                 {
                                     #[$crate::pyre_function]
                                     fn $pname ( $($pargs)* ) $(-> $pret)? $pbody
-                                    $crate::dict_storage_store(
+                                    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                                         ns,
                                         stringify!($pname),
                                         $crate::typedef::make_getset_descriptor_named(
                                             $crate::make_builtin_function(stringify!($pname), $pname),
                                             stringify!($pname),
                                         ),
-                                    );
+                                    ) };
                                 }
                             )*)?
                         },

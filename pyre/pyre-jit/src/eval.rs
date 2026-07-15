@@ -356,16 +356,7 @@ unsafe fn type_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
             f(slot as *mut *mut pyre_object::weakref::Weakref as *mut majit_ir::GcRef);
         }
     }
-    if unsafe { pyre_object::w_type_is_heaptype(obj_addr as pyre_object::PyObjectRef) } {
-        f(&mut t.dict as *mut *mut u8 as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-    } else {
-        pyre_interpreter::eval::type_walk_namespace_values(
-            obj_addr as pyre_object::PyObjectRef,
-            &mut |slot: &mut pyre_object::PyObjectRef| {
-                f(slot as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-            },
-        );
-    }
+    f(&mut t.dict as *mut *mut u8 as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
 }
 
 /// Reclaim the two Rust-owned, out-of-line containers of a swept heap type.

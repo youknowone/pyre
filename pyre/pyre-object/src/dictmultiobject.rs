@@ -219,6 +219,24 @@ unsafe fn dict_entries_index_of_str(
     }
 }
 
+/// Build the persistent exact-str key for a new `setitem_str` entry.
+/// When the raw-string hash hook is installed, use it directly instead of
+/// re-entering Python-level `hash_w` on the freshly boxed string.  This is
+/// required while bootstrapping `str.__hash__` itself: its defining type dict
+/// is already a W_DictObject, so `hash_w(w_str)` would recursively look up
+/// `str.__hash__` in the dict currently being filled.
+#[inline]
+unsafe fn object_key_for_new_str(key: &str) -> ObjectKey {
+    let obj = crate::w_str_new(key);
+    match crate::dict_eq_hook::try_hash_str(key.as_bytes()) {
+        Some(hash) => {
+            crate::dict_eq_hook::take_eq_error();
+            ObjectKey { hash, obj }
+        }
+        None => object_key_for(obj),
+    }
+}
+
 /// Fallible variant of [`object_key_for`].  When the `hash_w` hook
 /// signals an error (unhashable type, user `__hash__` raised), this
 /// returns `Err(DictKeyError)`.  The caller retrieves the concrete
@@ -2720,8 +2738,12 @@ pub unsafe fn w_dict_setitem_str_no_proxy(obj: PyObjectRef, key: &str, value: Py
         _ => dict.dstrategy.switch_to_object_strategy(obj),
     }
     let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>);
-    let w_key = crate::w_str_new(key);
-    entries.insert(object_key_for(w_key), value);
+    match dict_entries_index_of_str(entries, key) {
+        Some(idx) => *entries.get_index_mut(idx).unwrap().1 = value,
+        None => {
+            entries.insert(object_key_for_new_str(key), value);
+        }
+    }
     dict_write_barrier(obj);
 }
 
@@ -5244,14 +5266,27 @@ impl DictStrategy for UnicodeDictStrategy {
     /// key then dispatches to `setitem`.  UnicodeDictStrategy keeps
     /// str keys on the fast path; no promotion.
     unsafe fn setitem_str(&self, w_dict: PyObjectRef, key: &str, w_value: PyObjectRef) {
-        let w_key = crate::w_str_new(key);
-        crate::dictmultiobject::w_dict_store_object_strategy(w_dict, w_key, w_value);
+        let dict = &mut *(w_dict as *mut W_DictObject);
+        let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>);
+        let w_key = match dict_entries_index_of_str(entries, key) {
+            Some(idx) => {
+                let (stored_key, stored_value) = entries.get_index_mut(idx).unwrap();
+                *stored_value = w_value;
+                stored_key.obj
+            }
+            None => {
+                let stored_key = object_key_for_new_str(key);
+                entries.insert(stored_key, w_value);
+                stored_key.obj
+            }
+        };
+        dict_write_barrier(w_dict);
+        maybe_sync_dict_storage_store(dict.dict_storage_proxy, w_key, w_value);
     }
 
     /// `dictmultiobject.py:1315-1318 getitem_str` override.
     unsafe fn getitem_str(&self, w_dict: PyObjectRef, key: &str) -> Option<PyObjectRef> {
-        let w_key = crate::w_str_new(key);
-        crate::dictmultiobject::w_dict_lookup_object_strategy(w_dict, w_key)
+        crate::dictmultiobject::w_dict_getitem_str_proxy_first(w_dict, key)
     }
 
     /// `dictmultiobject.py:1061-1067 AbstractTypedStrategy.setitem`.

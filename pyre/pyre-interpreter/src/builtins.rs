@@ -1535,17 +1535,19 @@ fn memoryview_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 /// Install the `memoryview` type-dict methods and properties.  Wired into
 /// `MEMORYVIEW_TYPE` from `typedef::init_typeobjects`; each method reads the
 /// native `W_MemoryView` fields rather than per-instance attribute slots.
-pub(crate) fn init_memoryview_type(ns: &mut DictStorage) {
+pub(crate) fn init_memoryview_type(ns: PyObjectRef) {
     type MvFn = fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>;
     // `__new__` is a `BuiltinFunction`-typed staticmethod descriptor like
     // every other native type's `tp_new` (typedef::make_new_descr), so it
     // does not bind the class and pickle's `isinstance(new, type(int.__new__))`
     // check matches.
-    crate::dict_storage_store(
-        ns,
-        "__new__",
-        crate::typedef::make_new_descr(memoryview_descr_new),
-    );
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__new__",
+            crate::typedef::make_new_descr(memoryview_descr_new),
+        )
+    };
     for (name, f, arity) in [
         ("__getitem__", memoryview_getitem as MvFn, 2u16),
         ("__setitem__", memoryview_setitem, 3),
@@ -1562,7 +1564,13 @@ pub(crate) fn init_memoryview_type(ns: &mut DictStorage) {
         ("__hash__", memoryview_hash, 1),
         ("_pypy_raw_address", memoryview_raw_address, 1),
     ] {
-        crate::dict_storage_store(ns, name, make_builtin_function_with_arity(name, f, arity));
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                make_builtin_function_with_arity(name, f, arity),
+            )
+        };
     }
     // `__exit__(self, *exc)`, `__release_buffer__(self, view)`,
     // `__delitem__(self, *args)`, `hex(self, sep=, bytes_per_sep=)`, and
@@ -1575,7 +1583,13 @@ pub(crate) fn init_memoryview_type(ns: &mut DictStorage) {
         ("hex", memoryview_hex),
         ("cast", memoryview_cast),
     ] {
-        crate::dict_storage_store(ns, name, make_builtin_function(name, f));
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                make_builtin_function(name, f),
+            )
+        };
     }
     for (attr, getter) in [
         ("obj", memoryview_obj as MvFn),
@@ -1591,15 +1605,17 @@ pub(crate) fn init_memoryview_type(ns: &mut DictStorage) {
         ("f_contiguous", memoryview_f_contiguous),
         ("contiguous", memoryview_contiguous),
     ] {
-        crate::dict_storage_store(
-            ns,
-            attr,
-            pyre_object::w_property_new(
-                make_builtin_function_with_arity(attr, getter, 1),
-                pyre_object::PY_NULL,
-                pyre_object::PY_NULL,
-            ),
-        );
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                attr,
+                pyre_object::w_property_new(
+                    make_builtin_function_with_arity(attr, getter, 1),
+                    pyre_object::PY_NULL,
+                    pyre_object::PY_NULL,
+                ),
+            )
+        };
     }
 }
 
@@ -4556,13 +4572,21 @@ fn make_exc_type_with_init(
     let cls = crate::typedef::make_builtin_type_with_base(
         name,
         move |ns| {
-            crate::dict_storage_store(ns, "__new__", make_builtin_function("__new__", new_fn));
-            if let Some(init_fn) = init_fn {
-                crate::dict_storage_store(
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                     ns,
-                    "__init__",
-                    make_builtin_function("__init__", init_fn),
-                );
+                    "__new__",
+                    make_builtin_function("__new__", new_fn),
+                )
+            };
+            if let Some(init_fn) = init_fn {
+                unsafe {
+                    pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                        ns,
+                        "__init__",
+                        make_builtin_function("__init__", init_fn),
+                    )
+                };
             }
             // `pypy/module/exceptions/interp_exceptions.py:225-235`
             // `BaseException.with_traceback` — installed on every
@@ -4576,24 +4600,27 @@ fn make_exc_type_with_init(
             // time, so without per-class install `subclass.with_traceback`
             // raises AttributeError.
             if name == "BaseException" {
-                crate::dict_storage_store(
-                    ns,
-                    "with_traceback",
-                    make_builtin_function_with_arity(
+                unsafe {
+                    pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                        ns,
                         "with_traceback",
-                        |args| {
-                            let w_self = *args.first().ok_or_else(|| {
+                        make_builtin_function_with_arity(
+                            "with_traceback",
+                            |args| {
+                                let w_self = *args.first().ok_or_else(|| {
                                 crate::PyError::type_error(
                                     "with_traceback() missing 1 required positional argument: 'self'",
                                 )
                             })?;
-                            let w_tb = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-                            if !w_self.is_null() && unsafe { pyre_object::is_exception(w_self) } {
-                                // `interp_exceptions.py:213-219
-                                // descr_settraceback` — only None or
-                                // PyTraceback is accepted.
-                                let value =
-                                    if w_tb.is_null() || unsafe { pyre_object::is_none(w_tb) } {
+                                let w_tb = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+                                if !w_self.is_null() && unsafe { pyre_object::is_exception(w_self) }
+                                {
+                                    // `interp_exceptions.py:213-219
+                                    // descr_settraceback` — only None or
+                                    // PyTraceback is accepted.
+                                    let value = if w_tb.is_null()
+                                        || unsafe { pyre_object::is_none(w_tb) }
+                                    {
                                         pyre_object::PY_NULL
                                     } else if unsafe { crate::pytraceback::is_pytraceback(w_tb) } {
                                         w_tb
@@ -4602,112 +4629,138 @@ fn make_exc_type_with_init(
                                             "__traceback__ must be a traceback or None",
                                         ));
                                     };
-                                unsafe {
-                                    pyre_object::interp_exceptions::w_exception_set_traceback(
-                                        w_self, value,
-                                    );
+                                    unsafe {
+                                        pyre_object::interp_exceptions::w_exception_set_traceback(
+                                            w_self, value,
+                                        );
+                                    }
                                 }
-                            }
-                            Ok(w_self)
-                        },
-                        2,
-                    ),
-                );
+                                Ok(w_self)
+                            },
+                            2,
+                        ),
+                    )
+                };
                 // `interp_exceptions.py:236-247 BaseException.add_note`
                 // (Python 3.11+ PEP 678).  Appends a string to
                 // `self.__notes__`, allocating the list on first call.
                 // The list lives in the exception's instance dict
                 // (`W_BaseException.w_dict`), reached through the
                 // setattr/getattr paths in baseobjspace.
-                crate::dict_storage_store(
-                    ns,
-                    "add_note",
-                    make_builtin_function_with_arity(
+                unsafe {
+                    pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                        ns,
                         "add_note",
-                        |args| {
-                            let w_self = *args.first().ok_or_else(|| {
-                                crate::PyError::type_error(
-                                    "add_note() missing 1 required positional argument: 'self'",
-                                )
-                            })?;
-                            let w_note = *args.get(1).ok_or_else(|| {
-                                crate::PyError::type_error(
-                                    "add_note() missing 1 required positional argument: 'note'",
-                                )
-                            })?;
-                            // `interp_exceptions.py:238-239` — accept
-                            // `str` and any `str` subclass
-                            // (`isinstance_w(w_note, space.w_unicode)`).
-                            if !unsafe { crate::baseobjspace::isinstance_str_w(w_note) } {
-                                return Err(crate::PyError::type_error("note must be a string"));
-                            }
-                            // `interp_exceptions.py:240-254` — lazy
-                            // list allocation on first call; if the
-                            // attribute is already set but NOT a list,
-                            // PyPy raises TypeError("Cannot add note:
-                            // __notes__ is not a list") per `:254`.
-                            let existing = crate::baseobjspace::getattr_str(w_self, "__notes__")
-                                .ok()
-                                .filter(|w| !w.is_null());
-                            let notes = match existing {
-                                Some(v) if unsafe { crate::baseobjspace::isinstance_list_w(v) } => {
-                                    v
-                                }
-                                Some(_) => {
+                        make_builtin_function_with_arity(
+                            "add_note",
+                            |args| {
+                                let w_self = *args.first().ok_or_else(|| {
+                                    crate::PyError::type_error(
+                                        "add_note() missing 1 required positional argument: 'self'",
+                                    )
+                                })?;
+                                let w_note = *args.get(1).ok_or_else(|| {
+                                    crate::PyError::type_error(
+                                        "add_note() missing 1 required positional argument: 'note'",
+                                    )
+                                })?;
+                                // `interp_exceptions.py:238-239` — accept
+                                // `str` and any `str` subclass
+                                // (`isinstance_w(w_note, space.w_unicode)`).
+                                if !unsafe { crate::baseobjspace::isinstance_str_w(w_note) } {
                                     return Err(crate::PyError::type_error(
-                                        "Cannot add note: __notes__ is not a list",
+                                        "note must be a string",
                                     ));
                                 }
-                                None => {
-                                    let fresh = pyre_object::w_list_new(Vec::new());
-                                    crate::baseobjspace::setattr_str(w_self, "__notes__", fresh)?;
-                                    fresh
-                                }
-                            };
-                            unsafe { pyre_object::w_list_append(notes, w_note) };
-                            Ok(pyre_object::w_none())
-                        },
-                        2,
-                    ),
-                );
+                                // `interp_exceptions.py:240-254` — lazy
+                                // list allocation on first call; if the
+                                // attribute is already set but NOT a list,
+                                // PyPy raises TypeError("Cannot add note:
+                                // __notes__ is not a list") per `:254`.
+                                let existing =
+                                    crate::baseobjspace::getattr_str(w_self, "__notes__")
+                                        .ok()
+                                        .filter(|w| !w.is_null());
+                                let notes = match existing {
+                                    Some(v)
+                                        if unsafe { crate::baseobjspace::isinstance_list_w(v) } =>
+                                    {
+                                        v
+                                    }
+                                    Some(_) => {
+                                        return Err(crate::PyError::type_error(
+                                            "Cannot add note: __notes__ is not a list",
+                                        ));
+                                    }
+                                    None => {
+                                        let fresh = pyre_object::w_list_new(Vec::new());
+                                        crate::baseobjspace::setattr_str(
+                                            w_self,
+                                            "__notes__",
+                                            fresh,
+                                        )?;
+                                        fresh
+                                    }
+                                };
+                                unsafe { pyre_object::w_list_append(notes, w_note) };
+                                Ok(pyre_object::w_none())
+                            },
+                            2,
+                        ),
+                    )
+                };
                 // `interp_exceptions.py:233-241` — `descr_reduce` /
                 // `descr_setstate`, installed on `BaseException` so every
                 // subclass inherits them through the MRO.
-                crate::dict_storage_store(
-                    ns,
-                    "__reduce__",
-                    make_builtin_function_with_arity("__reduce__", base_exception_reduce, 1),
-                );
-                crate::dict_storage_store(
-                    ns,
-                    "__setstate__",
-                    make_builtin_function_with_arity("__setstate__", base_exception_setstate, 2),
-                );
+                unsafe {
+                    pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                        ns,
+                        "__reduce__",
+                        make_builtin_function_with_arity("__reduce__", base_exception_reduce, 1),
+                    )
+                };
+                unsafe {
+                    pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                        ns,
+                        "__setstate__",
+                        make_builtin_function_with_arity(
+                            "__setstate__",
+                            base_exception_setstate,
+                            2,
+                        ),
+                    )
+                };
             }
             // `interp_exceptions.py:379-397` — ImportError overrides reduce
             // and setstate to carry the `name`/`path`/`name_from` slots.
             // ModuleNotFoundError (built via `make_exc_type`) inherits these
             // through the MRO.
             if name == "ImportError" {
-                crate::dict_storage_store(
-                    ns,
-                    "__reduce__",
-                    make_builtin_function_with_arity("__reduce__", import_error_reduce, 1),
-                );
-                crate::dict_storage_store(
-                    ns,
-                    "__setstate__",
-                    make_builtin_function_with_arity("__setstate__", import_error_setstate, 2),
-                );
+                unsafe {
+                    pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                        ns,
+                        "__reduce__",
+                        make_builtin_function_with_arity("__reduce__", import_error_reduce, 1),
+                    )
+                };
+                unsafe {
+                    pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                        ns,
+                        "__setstate__",
+                        make_builtin_function_with_arity("__setstate__", import_error_setstate, 2),
+                    )
+                };
             }
             // `interp_exceptions.py:655-665` — OSError overrides reduce to
             // re-append the filename(s); its subclasses inherit it.
             if name == "OSError" {
-                crate::dict_storage_store(
-                    ns,
-                    "__reduce__",
-                    make_builtin_function_with_arity("__reduce__", os_error_reduce, 1),
-                );
+                unsafe {
+                    pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                        ns,
+                        "__reduce__",
+                        make_builtin_function_with_arity("__reduce__", os_error_reduce, 1),
+                    )
+                };
             }
         },
         base,
@@ -4732,7 +4785,13 @@ pub(crate) fn make_exc_type_multi(
     let cls = crate::typedef::make_builtin_type_with_bases(
         name,
         move |ns| {
-            crate::dict_storage_store(ns, "__new__", make_builtin_function("__new__", new_fn));
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    ns,
+                    "__new__",
+                    make_builtin_function("__new__", new_fn),
+                )
+            };
         },
         bases,
     );
@@ -7963,229 +8022,265 @@ pub fn file_wrapper_type() -> PyObjectRef {
 }
 
 /// PyPy: pypy/module/_io/interp_iobase.py W_IOBase.
-fn init_file_wrapper_type(ns: &mut DictStorage) {
-    crate::dict_storage_store(ns, "read", make_builtin_function("read", file_method_read));
-    crate::dict_storage_store(
-        ns,
-        "readline",
-        make_builtin_function_with_arity("readline", file_method_readline, 1),
-    );
-    crate::dict_storage_store(
-        ns,
-        "readlines",
-        make_builtin_function_with_arity("readlines", file_method_readlines, 1),
-    );
-    crate::dict_storage_store(
-        ns,
-        "write",
-        make_builtin_function_with_arity("write", file_method_write, 2),
-    );
-    crate::dict_storage_store(
-        ns,
-        "close",
-        make_builtin_function_with_arity("close", file_method_close, 1),
-    );
-    crate::dict_storage_store(
-        ns,
-        "flush",
-        make_builtin_function_with_arity("flush", file_method_flush, 1),
-    );
-    crate::dict_storage_store(
-        ns,
-        "__enter__",
-        make_builtin_function_with_arity("__enter__", |args| Ok(args[0]), 1),
-    );
-    crate::dict_storage_store(
-        ns,
-        "__exit__",
-        make_builtin_function("__exit__", |args| {
-            // Call close on exit.
-            file_method_close(&args[..1])?;
-            Ok(w_none())
-        }),
-    );
-    crate::dict_storage_store(
-        ns,
-        "__iter__",
-        make_builtin_function_with_arity("__iter__", |args| Ok(args[0]), 1),
-    );
-    crate::dict_storage_store(
-        ns,
-        "__next__",
-        make_builtin_function_with_arity(
+fn init_file_wrapper_type(ns: PyObjectRef) {
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "read",
+            make_builtin_function("read", file_method_read),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "readline",
+            make_builtin_function_with_arity("readline", file_method_readline, 1),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "readlines",
+            make_builtin_function_with_arity("readlines", file_method_readlines, 1),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "write",
+            make_builtin_function_with_arity("write", file_method_write, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "close",
+            make_builtin_function_with_arity("close", file_method_close, 1),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "flush",
+            make_builtin_function_with_arity("flush", file_method_flush, 1),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__enter__",
+            make_builtin_function_with_arity("__enter__", |args| Ok(args[0]), 1),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__exit__",
+            make_builtin_function("__exit__", |args| {
+                // Call close on exit.
+                file_method_close(&args[..1])?;
+                Ok(w_none())
+            }),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__iter__",
+            make_builtin_function_with_arity("__iter__", |args| Ok(args[0]), 1),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "__next__",
-            |args| {
-                let line = file_method_readline(args)?;
-                unsafe {
-                    let s = pyre_object::w_str_get_value(line);
-                    if s.is_empty() {
-                        return Err(crate::PyError::stop_iteration());
-                    }
-                }
-                Ok(line)
-            },
-            1,
-        ),
-    );
-    crate::dict_storage_store(
-        ns,
-        "fileno",
-        make_builtin_function_with_arity(
-            "fileno",
-            |args| match args.first().copied().and_then(file_get_fd) {
-                Some(fd) => Ok(w_int_new(fd as i64)),
-                None => Err(crate::PyError::os_error(
-                    "fileno() on a file without a descriptor",
-                )),
-            },
-            1,
-        ),
-    );
-    crate::dict_storage_store(
-        ns,
-        "readable",
-        make_builtin_function_with_arity(
-            "readable",
-            |args| {
-                let mode = crate::baseobjspace::getattr_str(args[0], "__file_mode__")
-                    .ok()
-                    .map(|m| unsafe { pyre_object::w_str_get_value(m).to_string() })
-                    .unwrap_or_default();
-                Ok(w_bool_from(mode.contains('r') || mode.contains('+')))
-            },
-            1,
-        ),
-    );
-    crate::dict_storage_store(
-        ns,
-        "writable",
-        make_builtin_function_with_arity(
-            "writable",
-            |args| {
-                let mode = crate::baseobjspace::getattr_str(args[0], "__file_mode__")
-                    .ok()
-                    .map(|m| unsafe { pyre_object::w_str_get_value(m).to_string() })
-                    .unwrap_or_default();
-                Ok(w_bool_from(
-                    mode.contains('w')
-                        || mode.contains('a')
-                        || mode.contains('x')
-                        || mode.contains('+'),
-                ))
-            },
-            1,
-        ),
-    );
-    crate::dict_storage_store(
-        ns,
-        "seekable",
-        make_builtin_function_with_arity(
-            "seekable",
-            // An fd-backed object is seekable iff `lseek` succeeds: a real
-            // file does, a pipe/socket fails with ESPIPE.  The in-memory
-            // path wrapper is always seekable.
-            |args| {
-                if let Some(fd) = file_get_fd(args[0]) {
-                    #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
-                    {
-                        #[cfg(not(feature = "sandbox"))]
-                        return Ok(w_bool_from(
-                            unsafe { libc::lseek(fd, 0, libc::SEEK_CUR) } >= 0,
-                        ));
-                        #[cfg(feature = "sandbox")]
-                        return Ok(w_bool_from(
-                            crate::host_seam::ops::lseek(fd, 0, libc::SEEK_CUR).is_ok(),
-                        ));
-                    }
-                    #[cfg(any(not(feature = "host_env"), target_arch = "wasm32"))]
-                    {
-                        let _ = fd;
-                        return Ok(w_bool_from(false));
-                    }
-                }
-                Ok(w_bool_from(true))
-            },
-            1,
-        ),
-    );
-    crate::dict_storage_store(
-        ns,
-        "seek",
-        make_builtin_function("seek", |args| {
-            if let Some(fd) = file_get_fd(args[0]) {
-                let offset = args
-                    .get(1)
-                    .map(|&o| unsafe { pyre_object::w_int_get_value(o) })
-                    .unwrap_or(0);
-                let whence = args
-                    .get(2)
-                    .map(|&o| unsafe { pyre_object::w_int_get_value(o) })
-                    .unwrap_or(0) as i32;
-                #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
-                {
-                    #[cfg(not(feature = "sandbox"))]
-                    let pos = {
-                        let pos = unsafe { libc::lseek(fd, offset as libc::off_t, whence) };
-                        if pos < 0 {
-                            return Err(fd_io_err(std::io::Error::last_os_error()));
+            make_builtin_function_with_arity(
+                "__next__",
+                |args| {
+                    let line = file_method_readline(args)?;
+                    unsafe {
+                        let s = pyre_object::w_str_get_value(line);
+                        if s.is_empty() {
+                            return Err(crate::PyError::stop_iteration());
                         }
-                        pos
-                    };
-                    #[cfg(feature = "sandbox")]
-                    let pos = crate::host_seam::ops::lseek(fd, offset, whence)
-                        .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
-                    return Ok(w_int_new(pos as i64));
-                }
-                #[cfg(any(not(feature = "host_env"), target_arch = "wasm32"))]
-                {
-                    let _ = (fd, offset, whence);
-                    return Err(crate::PyError::not_implemented(
-                        "fd seek requires host_env feature",
-                    ));
-                }
-            }
-            if args.len() >= 2 {
-                let _ = crate::baseobjspace::setattr_str(args[0], "__file_pos__", args[1]);
-            }
-            Ok(w_none())
-        }),
-    );
-    crate::dict_storage_store(
-        ns,
-        "tell",
-        make_builtin_function_with_arity(
-            "tell",
-            |args| {
+                    }
+                    Ok(line)
+                },
+                1,
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "fileno",
+            make_builtin_function_with_arity(
+                "fileno",
+                |args| match args.first().copied().and_then(file_get_fd) {
+                    Some(fd) => Ok(w_int_new(fd as i64)),
+                    None => Err(crate::PyError::os_error(
+                        "fileno() on a file without a descriptor",
+                    )),
+                },
+                1,
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "readable",
+            make_builtin_function_with_arity(
+                "readable",
+                |args| {
+                    let mode = crate::baseobjspace::getattr_str(args[0], "__file_mode__")
+                        .ok()
+                        .map(|m| unsafe { pyre_object::w_str_get_value(m).to_string() })
+                        .unwrap_or_default();
+                    Ok(w_bool_from(mode.contains('r') || mode.contains('+')))
+                },
+                1,
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "writable",
+            make_builtin_function_with_arity(
+                "writable",
+                |args| {
+                    let mode = crate::baseobjspace::getattr_str(args[0], "__file_mode__")
+                        .ok()
+                        .map(|m| unsafe { pyre_object::w_str_get_value(m).to_string() })
+                        .unwrap_or_default();
+                    Ok(w_bool_from(
+                        mode.contains('w')
+                            || mode.contains('a')
+                            || mode.contains('x')
+                            || mode.contains('+'),
+                    ))
+                },
+                1,
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "seekable",
+            make_builtin_function_with_arity(
+                "seekable",
+                // An fd-backed object is seekable iff `lseek` succeeds: a real
+                // file does, a pipe/socket fails with ESPIPE.  The in-memory
+                // path wrapper is always seekable.
+                |args| {
+                    if let Some(fd) = file_get_fd(args[0]) {
+                        #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
+                        {
+                            #[cfg(not(feature = "sandbox"))]
+                            return Ok(w_bool_from(
+                                unsafe { libc::lseek(fd, 0, libc::SEEK_CUR) } >= 0,
+                            ));
+                            #[cfg(feature = "sandbox")]
+                            return Ok(w_bool_from(
+                                crate::host_seam::ops::lseek(fd, 0, libc::SEEK_CUR).is_ok(),
+                            ));
+                        }
+                        #[cfg(any(not(feature = "host_env"), target_arch = "wasm32"))]
+                        {
+                            let _ = fd;
+                            return Ok(w_bool_from(false));
+                        }
+                    }
+                    Ok(w_bool_from(true))
+                },
+                1,
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "seek",
+            make_builtin_function("seek", |args| {
                 if let Some(fd) = file_get_fd(args[0]) {
+                    let offset = args
+                        .get(1)
+                        .map(|&o| unsafe { pyre_object::w_int_get_value(o) })
+                        .unwrap_or(0);
+                    let whence = args
+                        .get(2)
+                        .map(|&o| unsafe { pyre_object::w_int_get_value(o) })
+                        .unwrap_or(0) as i32;
                     #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
                     {
                         #[cfg(not(feature = "sandbox"))]
                         let pos = {
-                            let pos = unsafe { libc::lseek(fd, 0, libc::SEEK_CUR) };
+                            let pos = unsafe { libc::lseek(fd, offset as libc::off_t, whence) };
                             if pos < 0 {
                                 return Err(fd_io_err(std::io::Error::last_os_error()));
                             }
                             pos
                         };
                         #[cfg(feature = "sandbox")]
-                        let pos = crate::host_seam::ops::lseek(fd, 0, libc::SEEK_CUR)
+                        let pos = crate::host_seam::ops::lseek(fd, offset, whence)
                             .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
                         return Ok(w_int_new(pos as i64));
                     }
                     #[cfg(any(not(feature = "host_env"), target_arch = "wasm32"))]
                     {
-                        let _ = fd;
+                        let _ = (fd, offset, whence);
+                        return Err(crate::PyError::not_implemented(
+                            "fd seek requires host_env feature",
+                        ));
                     }
                 }
-                if let Ok(pos) = crate::baseobjspace::getattr_str(args[0], "__file_pos__") {
-                    Ok(pos)
-                } else {
-                    Ok(w_int_new(0))
+                if args.len() >= 2 {
+                    let _ = crate::baseobjspace::setattr_str(args[0], "__file_pos__", args[1]);
                 }
-            },
-            1,
-        ),
-    );
+                Ok(w_none())
+            }),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "tell",
+            make_builtin_function_with_arity(
+                "tell",
+                |args| {
+                    if let Some(fd) = file_get_fd(args[0]) {
+                        #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
+                        {
+                            #[cfg(not(feature = "sandbox"))]
+                            let pos = {
+                                let pos = unsafe { libc::lseek(fd, 0, libc::SEEK_CUR) };
+                                if pos < 0 {
+                                    return Err(fd_io_err(std::io::Error::last_os_error()));
+                                }
+                                pos
+                            };
+                            #[cfg(feature = "sandbox")]
+                            let pos = crate::host_seam::ops::lseek(fd, 0, libc::SEEK_CUR)
+                                .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
+                            return Ok(w_int_new(pos as i64));
+                        }
+                        #[cfg(any(not(feature = "host_env"), target_arch = "wasm32"))]
+                        {
+                            let _ = fd;
+                        }
+                    }
+                    if let Ok(pos) = crate::baseobjspace::getattr_str(args[0], "__file_pos__") {
+                        Ok(pos)
+                    } else {
+                        Ok(w_int_new(0))
+                    }
+                },
+                1,
+            ),
+        )
+    };
 }
 
 /// The path-backed file object's buffered contents as raw bytes.  Binary and
@@ -9076,130 +9171,162 @@ pub fn text_io_wrapper_type() -> PyObjectRef {
     })
 }
 
-fn init_text_io_wrapper_type(ns: &mut DictStorage) {
-    crate::dict_storage_store(
-        ns,
-        "__init__",
-        make_builtin_function("__init__", textio_method_init),
-    );
-    crate::dict_storage_store(
-        ns,
-        "read",
-        make_builtin_function("read", textio_method_read),
-    );
-    crate::dict_storage_store(
-        ns,
-        "readline",
-        make_builtin_function_with_arity("readline", textio_method_readline, 1),
-    );
-    crate::dict_storage_store(
-        ns,
-        "readlines",
-        make_builtin_function_with_arity(
+fn init_text_io_wrapper_type(ns: PyObjectRef) {
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__init__",
+            make_builtin_function("__init__", textio_method_init),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "read",
+            make_builtin_function("read", textio_method_read),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "readline",
+            make_builtin_function_with_arity("readline", textio_method_readline, 1),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
             "readlines",
-            |args| {
-                let mut lines = Vec::new();
-                loop {
+            make_builtin_function_with_arity(
+                "readlines",
+                |args| {
+                    let mut lines = Vec::new();
+                    loop {
+                        let line = textio_method_readline(args)?;
+                        if unsafe { pyre_object::w_str_get_value(line).is_empty() } {
+                            break;
+                        }
+                        lines.push(line);
+                    }
+                    Ok(w_list_new(lines))
+                },
+                1,
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "write",
+            make_builtin_function_with_arity("write", textio_method_write, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "close",
+            make_builtin_function_with_arity("close", textio_method_close, 1),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "flush",
+            make_builtin_function_with_arity("flush", |_| Ok(w_none()), 1),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "fileno",
+            make_builtin_function_with_arity(
+                "fileno",
+                |args| textio_call_buffer(args[0], "fileno", &[]),
+                1,
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "detach",
+            make_builtin_function_with_arity("detach", |args| textio_buffer(args[0]), 1),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "readable",
+            make_builtin_function_with_arity(
+                "readable",
+                |args| textio_call_buffer(args[0], "readable", &[]),
+                1,
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "writable",
+            make_builtin_function_with_arity(
+                "writable",
+                |args| textio_call_buffer(args[0], "writable", &[]),
+                1,
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "seekable",
+            make_builtin_function_with_arity(
+                "seekable",
+                |args| textio_call_buffer(args[0], "seekable", &[]),
+                1,
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__enter__",
+            make_builtin_function_with_arity("__enter__", |args| Ok(args[0]), 1),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__exit__",
+            make_builtin_function("__exit__", |args| {
+                let _ = textio_method_close(&args[..1]);
+                Ok(w_none())
+            }),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__iter__",
+            make_builtin_function_with_arity("__iter__", |args| Ok(args[0]), 1),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__next__",
+            make_builtin_function_with_arity(
+                "__next__",
+                |args| {
                     let line = textio_method_readline(args)?;
                     if unsafe { pyre_object::w_str_get_value(line).is_empty() } {
-                        break;
+                        return Err(crate::PyError::stop_iteration());
                     }
-                    lines.push(line);
-                }
-                Ok(w_list_new(lines))
-            },
-            1,
-        ),
-    );
-    crate::dict_storage_store(
-        ns,
-        "write",
-        make_builtin_function_with_arity("write", textio_method_write, 2),
-    );
-    crate::dict_storage_store(
-        ns,
-        "close",
-        make_builtin_function_with_arity("close", textio_method_close, 1),
-    );
-    crate::dict_storage_store(
-        ns,
-        "flush",
-        make_builtin_function_with_arity("flush", |_| Ok(w_none()), 1),
-    );
-    crate::dict_storage_store(
-        ns,
-        "fileno",
-        make_builtin_function_with_arity(
-            "fileno",
-            |args| textio_call_buffer(args[0], "fileno", &[]),
-            1,
-        ),
-    );
-    crate::dict_storage_store(
-        ns,
-        "detach",
-        make_builtin_function_with_arity("detach", |args| textio_buffer(args[0]), 1),
-    );
-    crate::dict_storage_store(
-        ns,
-        "readable",
-        make_builtin_function_with_arity(
-            "readable",
-            |args| textio_call_buffer(args[0], "readable", &[]),
-            1,
-        ),
-    );
-    crate::dict_storage_store(
-        ns,
-        "writable",
-        make_builtin_function_with_arity(
-            "writable",
-            |args| textio_call_buffer(args[0], "writable", &[]),
-            1,
-        ),
-    );
-    crate::dict_storage_store(
-        ns,
-        "seekable",
-        make_builtin_function_with_arity(
-            "seekable",
-            |args| textio_call_buffer(args[0], "seekable", &[]),
-            1,
-        ),
-    );
-    crate::dict_storage_store(
-        ns,
-        "__enter__",
-        make_builtin_function_with_arity("__enter__", |args| Ok(args[0]), 1),
-    );
-    crate::dict_storage_store(
-        ns,
-        "__exit__",
-        make_builtin_function("__exit__", |args| {
-            let _ = textio_method_close(&args[..1]);
-            Ok(w_none())
-        }),
-    );
-    crate::dict_storage_store(
-        ns,
-        "__iter__",
-        make_builtin_function_with_arity("__iter__", |args| Ok(args[0]), 1),
-    );
-    crate::dict_storage_store(
-        ns,
-        "__next__",
-        make_builtin_function_with_arity(
-            "__next__",
-            |args| {
-                let line = textio_method_readline(args)?;
-                if unsafe { pyre_object::w_str_get_value(line).is_empty() } {
-                    return Err(crate::PyError::stop_iteration());
-                }
-                Ok(line)
-            },
-            1,
-        ),
-    );
+                    Ok(line)
+                },
+                1,
+            ),
+        )
+    };
 }
 
 pub fn builtin_all_fn(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -9938,13 +10065,15 @@ mod tests {
     fn test_builtin_divmod_allows_lhs_dunder_before_dead_proxy_rhs() {
         crate::typedef::init_typeobjects();
         let user_type = crate::typedef::make_builtin_type("DivmodLhs", |ns| {
-            crate::dict_storage_store(
-                ns,
-                "__divmod__",
-                make_builtin_function("__divmod__", |_| {
-                    Ok(w_tuple_new(vec![w_int_new(41), w_int_new(1)]))
-                }),
-            );
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    ns,
+                    "__divmod__",
+                    make_builtin_function("__divmod__", |_| {
+                        Ok(w_tuple_new(vec![w_int_new(41), w_int_new(1)]))
+                    }),
+                )
+            };
         });
         let lhs = pyre_object::objectobject::w_instance_new(user_type);
         let dead_proxy = crate::module::_weakref::interp__weakref::W_Proxy_new(w_none(), PY_NULL);
@@ -9979,11 +10108,13 @@ mod tests {
     fn test_builtin_pow_three_arg_allows_lhs_dunder_before_dead_proxy_exp() {
         crate::typedef::init_typeobjects();
         let user_type = crate::typedef::make_builtin_type("PowLhs", |ns| {
-            crate::dict_storage_store(
-                ns,
-                "__pow__",
-                make_builtin_function("__pow__", |_| Ok(w_int_new(99))),
-            );
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    ns,
+                    "__pow__",
+                    make_builtin_function("__pow__", |_| Ok(w_int_new(99))),
+                )
+            };
         });
         let lhs = pyre_object::objectobject::w_instance_new(user_type);
         let dead_proxy = crate::module::_weakref::interp__weakref::W_Proxy_new(w_none(), PY_NULL);
