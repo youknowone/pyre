@@ -15315,7 +15315,9 @@ fn set_method_difference_update(
     for other in &args[1..] {
         let other_items = crate::builtins::collect_iterable(*other)?;
         for item in other_items {
-            unsafe { pyre_object::w_set_discard(args[0], item) };
+            // Each element is hashed as it is looked up, so an unhashable one
+            // raises even when self is empty and nothing can match.
+            crate::type_methods::set_discard_checked(args[0], item)?;
         }
     }
     Ok(pyre_object::w_none())
@@ -15327,12 +15329,22 @@ fn set_method_intersection_update(
     if args.is_empty() {
         return Ok(pyre_object::w_none());
     }
+    // Collect every other operand up front and hash its elements as they
+    // enter the intersection, so an unhashable one raises even when self is
+    // empty and there is nothing left to compare against.
+    let mut others: Vec<Vec<pyre_object::PyObjectRef>> = Vec::with_capacity(args.len() - 1);
+    for other in &args[1..] {
+        let other_items = crate::builtins::collect_iterable(*other)?;
+        for &o in other_items.iter() {
+            crate::builtins::try_hash_value(o)?;
+        }
+        others.push(other_items);
+    }
     // Snapshot self's items, drop any not present in EVERY other.
     let self_items = unsafe { pyre_object::w_set_items(args[0]) };
     for item in self_items {
         let mut keep = true;
-        for other in &args[1..] {
-            let other_items = crate::builtins::collect_iterable(*other)?;
+        for other_items in others.iter() {
             let mut found = false;
             for &o in other_items.iter() {
                 if crate::baseobjspace::eq_w(item, o)? {
