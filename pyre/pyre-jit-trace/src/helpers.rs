@@ -246,6 +246,29 @@ pub extern "C" fn jit_mapdict_read(w_obj: i64, storageindex: i64) -> i64 {
     }
 }
 
+/// Raw unboxed counterpart of [`jit_mapdict_read`].  The guarded map pins the
+/// shared longlong-list coordinates, so this non-forcing helper performs only
+/// `_prim_direct_read`'s storage read (mapdict.py:600-601); boxing stays in the
+/// trace so an immediate consumer can virtualize it away.  Null receiver /
+/// non-instance returns zero only for a torn recording.
+pub extern "C" fn jit_mapdict_unboxed_read_raw(
+    w_obj: i64,
+    storageindex: i64,
+    listindex: i64,
+) -> i64 {
+    let w_obj = w_obj as PyObjectRef;
+    if w_obj.is_null() || !unsafe { is_instance(w_obj) } {
+        return 0;
+    }
+    unsafe {
+        pyre_interpreter::objspace::std::mapdict::read_unboxed_storage_raw(
+            w_obj,
+            storageindex as usize,
+            listindex as usize,
+        )
+    }
+}
+
 pub fn emit_trace_call_void(ctx: &mut TraceCtx, helper: *const (), args: &[OpRef]) {
     ctx.call_void(helper, args);
 }

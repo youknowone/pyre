@@ -1215,6 +1215,59 @@ pub unsafe fn load_attr_fast_path(
     Some((w_type, version_tag, map, p.storageindex))
 }
 
+/// The unboxed counterpart of [`load_attr_fast_path`].  It applies the same
+/// LOAD_ATTR resolution gates, but accepts only an `UnboxedPlainAttribute`
+/// and returns the shared longlong-list coordinates and type needed to perform
+/// `_prim_direct_read` (mapdict.py:600-601).
+///
+/// # Safety
+/// `w_obj` must be a live object.
+pub unsafe fn load_attr_unboxed_fast_path(
+    w_obj: PyObjectRef,
+    name: &str,
+) -> Option<(PyObjectRef, u64, MapRef, usize, usize, UnboxType)> {
+    // mapdict.py:1495 `if map is not None:` — also filters non-instances.
+    let map = unsafe { mapdict_map_or_null(w_obj) };
+    if map.is_null() {
+        return None;
+    }
+    // mapdict.py:1496 `w_type = map.terminator.w_cls`.
+    let w_type = unsafe { (*(*map).terminator()).as_terminator() }.w_cls;
+    if w_type.is_null() {
+        return None;
+    }
+    // mapdict.py:1497-1499 — a custom `__getattribute__` handles the access;
+    // not soundly foldable to a storage read.
+    if unsafe { crate::baseobjspace::getattribute_if_not_from_object(w_type) }.is_some() {
+        return None;
+    }
+    // mapdict.py:1500-1501 `version_tag = w_type.version_tag(); if is not None:`.
+    let version_tag = unsafe { crate::baseobjspace::w_type_version_tag(w_type) };
+    if version_tag == 0 {
+        return None;
+    }
+    // mapdict.py:1504-1524 `_pure_lookup_where_with_method_cache` + classify.
+    let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where(w_type, name) };
+    let (attrkind, is_slot) = unsafe { classify_attr(w_type, w_descr, false) };
+    // mapdict.py:1526 `if attrkind != INVALID:`.
+    if attrkind == INVALID {
+        return None;
+    }
+    let attrname = if is_slot { "slot" } else { name };
+    // mapdict.py:1527 `attr = map.find_map_attr(attrname, attrkind)`.
+    let attr = unsafe { find_map_attr(map, Wtf8::new(attrname), attrkind) }?;
+    let p = unsafe { (*attr).as_plain() };
+    let u = p.unboxed.as_ref()?;
+    Some((
+        w_type,
+        version_tag,
+        map,
+        p.storageindex,
+        u.listindex,
+        u.typ,
+    ))
+}
+
 /// mapdict.py:914-916 `_mapdict_read_storage(storageindex)` for a
 /// `W_ObjectObject` — the boxed-slot read the JIT LOAD_ATTR fast path folds
 /// to. `load_attr_fast_path` already established that the resolved attribute
@@ -1228,6 +1281,25 @@ pub unsafe fn load_attr_fast_path(
 pub unsafe fn read_boxed_storage(w_obj: PyObjectRef, storageindex: usize) -> PyObjectRef {
     let inst = unsafe { &*(w_obj as *const pyre_object::W_ObjectObject) };
     inst._mapdict_read_storage(storageindex)
+}
+
+/// Read the raw longlong at an unboxed attribute's `(storageindex,
+/// listindex)`, matching `_prim_direct_read` before it boxes the value
+/// (mapdict.py:600-601).
+///
+/// # Safety
+/// `w_obj` must be a live `W_ObjectObject` whose guarded map owns the supplied
+/// unboxed storage coordinates.
+pub unsafe fn read_unboxed_storage_raw(
+    w_obj: PyObjectRef,
+    storageindex: usize,
+    listindex: usize,
+) -> i64 {
+    let slot = unsafe { read_boxed_storage(w_obj, storageindex) };
+    unsafe {
+        let list: &Vec<i64> = &*unerase_unboxed(slot);
+        list[listindex]
+    }
 }
 
 /// mapdict.py:1574-1586 `STORE_ATTR_caching`. The interpreter STORE_ATTR fast

@@ -17902,8 +17902,9 @@ fn try_walker_specialize_unpack(
 
 /// `mapdict.py:1479-1537 LOAD_ATTR_caching` full-body-walker fast path for a
 /// plain (non-method) instance attribute.  When the concrete receiver is a
-/// monomorphic instance whose attribute resolves to a boxed plain storage slot,
-/// emit the inline read PyPy compiles LOAD_ATTR to under the JIT —
+/// monomorphic instance whose attribute resolves to a boxed plain storage slot
+/// or an unboxed integer slot, emit the guarded read PyPy compiles LOAD_ATTR to
+/// under the JIT —
 ///   * `guard_class(obj, &INSTANCE_TYPE)` — the receiver is a `W_ObjectObject`
 ///     (so the `map`/`storage` field reads below are valid; `mapdict.py:1495`
 ///     `if map is not None:` also filters non-instances at trace time).
@@ -17913,19 +17914,21 @@ fn try_walker_specialize_unpack(
 ///   * `guard_value(getfield_gc_i(obj, map), C_map)` — `jit.promote(self.map)`
 ///     (`mapdict.py:905`); pins the exact instance shape so `find_map_attr`
 ///     const-folds `storageindex` to a green constant.
-///   * `getfield_gc_r(obj, storage)` + `getarrayitem_gc_r(block, C_index)` —
-///     the inline value read `mapdict.py:914-916 _mapdict_read_storage`.
+///   * boxed: `getfield_gc_r(obj, storage)` +
+///     `getarrayitem_gc_r(block, C_index)` for
+///     `mapdict.py:914-916 _mapdict_read_storage`;
+///   * unboxed int: a non-forcing raw longlong read plus `wrapint`, matching
+///     `_prim_direct_read` (mapdict.py:600-601).
 /// — instead of the opaque `getattr_fn` `CALL_MAY_FORCE` MRO-walk residual.
 ///
 /// Returns `Some(())` after writing the dst; `None` (fall through to the
 /// residual) for every shape [`load_attr_fast_path`] declines: non-instance
 /// receiver, missing map, custom `__getattribute__`, uncacheable `version_tag`,
 /// a data-descriptor / `INVALID` classification, an attribute not on this
-/// instance's map, or an unboxed slot (whose read boxes a longlong, not a plain
-/// fetch).  The map `guard_value` proves the attribute is present on this shape,
-/// so a successful fold provably cannot raise `AttributeError` — dropping the
-/// residual's exception guard is sound even in a handler-bearing body (same
-/// reasoning as the LoadGlobal fold).
+/// instance's map, or an unboxed float slot.  The map `guard_value` proves the
+/// attribute is present on this shape, so a successful fold provably cannot
+/// raise `AttributeError` — dropping the residual's exception guard is sound
+/// even in a handler-bearing body (same reasoning as the LoadGlobal fold).
 #[allow(clippy::too_many_arguments)]
 fn try_walker_specialize_load_attr(
     ctx: &mut WalkContext<'_, '_>,
@@ -17951,11 +17954,112 @@ fn try_walker_specialize_load_attr(
     };
     // `mapdict.py:1495-1533` resolution, returning the fold ingredients (the
     // read is left to the caller so it can be folded to a guarded inline read).
-    let Some((w_type, version_tag, map, storageindex)) = (unsafe {
+    if let Some((w_type, version_tag, map, storageindex)) = unsafe {
         pyre_interpreter::objspace::std::mapdict::load_attr_fast_path(concrete_obj, &name)
+    } {
+        // guard_class(obj, &INSTANCE_TYPE): the receiver is a `W_ObjectObject`, so
+        // its `map`/`storage` fields lie at the fixed offsets read below.  Instances
+        // all share `ob_type == &INSTANCE_TYPE` (the class identity lives in
+        // `w_class`); the map `guard_value` then pins the exact class + layout.
+        let instance_type_addr = &pyre_object::pyobject::INSTANCE_TYPE as *const _ as i64;
+        if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
+            let type_const = ctx.trace_ctx.const_int(instance_type_addr);
+            walker_emit_fold_guard_with_snapshot(
+                ctx,
+                op_pc,
+                OpCode::GuardClass,
+                &[obj, type_const],
+            )?;
+            ctx.trace_ctx
+                .heap_cache_mut()
+                .class_now_known(obj, instance_type_addr);
+        }
+
+        // The instance map pins the storage layout, but class mutation can change
+        // lookup precedence without changing that map. Re-read the receiver type's
+        // live version tag at every trace entry and deopt before the inline storage
+        // read when it changes.
+        let w_type_const = ctx.trace_ctx.const_ref(w_type as i64);
+        let version_op = crate::state::opimpl_getfield_gc_i(
+            ctx.trace_ctx,
+            w_type_const,
+            crate::descr::type_version_tag_descr(),
+        );
+        let version_const = ctx.trace_ctx.const_int(version_tag as i64);
+        walker_emit_fold_guard_with_snapshot(
+            ctx,
+            op_pc,
+            OpCode::GuardValue,
+            &[version_op, version_const],
+        )?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(version_op, version_const);
+
+        // guard_value(getfield_gc_i(obj, map), C_map): `jit.promote(self.map)`
+        // (`mapdict.py:905-906`).  The map nodes are interned + immortal, so the
+        // pointer is a stable identity guarded as an opaque word (object_map_descr
+        // is Int-typed).
+        //
+        // The guard may only be elided when the map read is ALREADY a compile-time
+        // constant — i.e. a prior promotion in this trace pinned it via
+        // `replace_box`.  It must NOT be elided merely because `box_value(map_op)`
+        // reports the concrete map: every traced getfield op carries its live value
+        // (`opimpl_getfield_gc_i` → `set_opref_concrete`, `history.py:803`
+        // FrontendOp), so `box_value == map` holds for the very first read and
+        // would drop the guard on the trace's entry.  A trace whose map guard is
+        // dropped reads `storage[storageindex]` off any same-class receiver whose
+        // map differs (GuardClass alone does not pin the layout), returning a wild
+        // slot value.  Pin the map with `replace_box` after guarding so a later
+        // fold on the same receiver correctly elides (matching the trait
+        // `implement_guard_value`, `trace_opcode.rs:4631-4633`).
+        let map_op = crate::state::opimpl_getfield_gc_i(
+            ctx.trace_ctx,
+            obj,
+            crate::descr::object_map_descr(),
+        );
+        if !map_op.is_constant() {
+            let map_const = ctx.trace_ctx.const_int(map as i64);
+            walker_emit_fold_guard_with_snapshot(
+                ctx,
+                op_pc,
+                OpCode::GuardValue,
+                &[map_op, map_const],
+            )?;
+            ctx.trace_ctx
+                .heap_cache_mut()
+                .replace_box(map_op, map_const);
+        }
+
+        // getfield_gc_r(obj, storage) + getarrayitem_gc_r(block, C_storageindex):
+        // the inline value read (`mapdict.py:914-916`).  `storageindex` is a green
+        // constant (the map guard pinned it); `trace_items_block_getitem_value`
+        // stamps the dst's concrete shadow from the live block slot.
+        let block = crate::state::opimpl_getfield_gc_r(
+            ctx.trace_ctx,
+            obj,
+            crate::descr::object_storage_descr(),
+        );
+        let idx_const = ctx.trace_ctx.const_int(storageindex as i64);
+        let value =
+            crate::state::trace_items_block_getitem_value(ctx.trace_ctx, block, idx_const);
+        write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, value)?;
+        return Ok(Some(()));
+    }
+
+    let Some((w_type, version_tag, map, storageindex, listindex, unbox_type)) = (unsafe {
+        pyre_interpreter::objspace::std::mapdict::load_attr_unboxed_fast_path(
+            concrete_obj,
+            &name,
+        )
     }) else {
         return Ok(None);
     };
+    // Float slots still use the unchanged getattr residual until an Int-bank
+    // longlong-to-Float-bank bitcast is available to feed `wrapfloat`.
+    if unbox_type == pyre_interpreter::objspace::std::mapdict::UnboxType::Float {
+        return Ok(None);
+    }
 
     // guard_class(obj, &INSTANCE_TYPE): the receiver is a `W_ObjectObject`, so
     // its `map`/`storage` fields lie at the fixed offsets read below.  Instances
@@ -18018,18 +18122,39 @@ fn try_walker_specialize_load_attr(
             .replace_box(map_op, map_const);
     }
 
-    // getfield_gc_r(obj, storage) + getarrayitem_gc_r(block, C_storageindex):
-    // the inline value read (`mapdict.py:914-916`).  `storageindex` is a green
-    // constant (the map guard pinned it); `trace_items_block_getitem_value`
-    // stamps the dst's concrete shadow from the live block slot.
-    let block = crate::state::opimpl_getfield_gc_r(
+    // `_prim_direct_read` (mapdict.py:600-601): read the raw longlong from the
+    // shared list through a non-forcing, non-elidable residual.  Both indices
+    // are green constants pinned by the map guard; keeping boxing in the trace
+    // lets an immediate integer consumer virtualize it away.
+    let storageindex_const = ctx.trace_ctx.const_int(storageindex as i64);
+    let listindex_const = ctx.trace_ctx.const_int(listindex as i64);
+    let raw = crate::helpers::emit_trace_call_int_typed(
         ctx.trace_ctx,
-        obj,
-        crate::descr::object_storage_descr(),
+        crate::helpers::jit_mapdict_unboxed_read_raw as *const (),
+        &[obj, storageindex_const, listindex_const],
+        &[majit_ir::Type::Ref, majit_ir::Type::Int, majit_ir::Type::Int],
     );
-    let idx_const = ctx.trace_ctx.const_int(storageindex as i64);
-    let value = crate::state::trace_items_block_getitem_value(ctx.trace_ctx, block, idx_const);
-    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, value)?;
+    let live = unsafe {
+        pyre_interpreter::objspace::std::mapdict::read_unboxed_storage_raw(
+            concrete_obj,
+            storageindex,
+            listindex,
+        )
+    };
+    ctx.trace_ctx
+        .set_opref_concrete(raw, majit_ir::Value::Int(live));
+    let boxed = walker_box_int(ctx, op_pc, raw, live)?;
+    // The `wrapint` op is a heap box, so its concrete must be a heap ptr too:
+    // box the raw longlong through the same `w_int_new` the unboxed read uses
+    // (mapdict.py:579-584 `_box`); `box_int_concrete` re-homes a tagged small
+    // int to a fresh heap `W_IntObject` so op(NewWithVtable) == concrete(heap).
+    // Without this stamp the boxed result carries no concrete, so a downstream
+    // eager void residual (e.g. the STORE_ATTR that writes `self.value`) cannot
+    // resolve its value arg and the walk aborts `ResidualCallArgUnbound`.
+    let live_ptr = pyre_object::w_int_new(live) as i64;
+    ctx.trace_ctx
+        .set_opref_concrete(boxed, box_int_concrete(live, live_ptr));
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
     Ok(Some(()))
 }
 
