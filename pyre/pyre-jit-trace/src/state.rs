@@ -13048,10 +13048,46 @@ pub(crate) fn setup_reconstructed_callee_frame(
     let mut argboxes_r: Vec<OpRef> = vec![OpRef::NONE; max_reg];
     argboxes_r[frame_reg as usize] = frame_vable;
     argboxes_r[ec_reg as usize] = ec_const;
-    for i in nlocals..valuestackdepth {
-        let opref = recipe.registers_r[i];
-        if !opref.is_none() {
-            argboxes_r[i] = opref;
+    // The recipe's `registers_r` is SEMANTIC-slot-indexed (filled from the
+    // frame vable's `locals_cells_stack_w` array), but the re-executed callee
+    // reads its registers by post-rename COLOR. After stack-slot-pinning
+    // removal a live operand-stack slot's color is per-program-point
+    // (`pcdep_color_slots`) and need not equal `nlocals + d` — the encoder
+    // (`get_list_of_active_boxes`) maps color→slot via
+    // `semantic_ref_slot_for_reg_color`, so invert it here to land each stack
+    // value at the color the dispatcher will touch. Placing it at the raw slot
+    // index (the old identity assumption) lands it under the wrong register and
+    // leaves the true color still holding the portal-red seed (frame/ec) whose
+    // color the register allocator reused for this stack slot. Runs AFTER the
+    // frame/ec seeding so a reused color resolves to the live stack value.
+    // Falls back to identity when no live color owns the slot (empty map /
+    // non-diverging coloring).
+    let py_pc = backxlat_py_pc(recipe.jitcode_index, recipe.jitcode_pc);
+    let pcdep = pcdep_color_slots_at(recipe.jitcode_index, py_pc);
+    for k in nlocals..valuestackdepth {
+        let opref = recipe.registers_r[k];
+        if opref.is_none() {
+            continue;
+        }
+        let color = semantic_slot_color_for_ref_slot(&pcdep, k).unwrap_or(k);
+        if color >= argboxes_r.len() {
+            argboxes_r.resize(color + 1, OpRef::NONE);
+        }
+        argboxes_r[color] = opref;
+        // `box.value` parity at the frame boundary (mirror `ref_return/r`):
+        // thread the reconstructed slot's concrete onto the OpRef-keyed shadow
+        // so the re-executed callee's speculation gates
+        // (`walker_int_specialization_operands`) see the live value's class. The
+        // emitted specialization stays runtime-correct (guard_class + int_op on
+        // the unboxed register); the concrete is only the tracing shadow, as for
+        // any resumed operand. Skips constants (`constants.get_value` is
+        // authoritative) and non-value (`Void`) slots.
+        if !opref.is_constant() {
+            if let Some(v @ (majit_ir::Value::Ref(_) | majit_ir::Value::Int(_))) =
+                recipe.concrete_r.get(k).copied()
+            {
+                ctx.set_opref_concrete(opref, v);
+            }
         }
     }
 
