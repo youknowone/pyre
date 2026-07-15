@@ -3936,10 +3936,22 @@ impl<'a> Lowering<'a> {
             // case) registers 0, identical to the prior heuristic.  An
             // unresolvable place type falls back to the unowned read.
             Rvalue::Discriminant(place) => {
-                let (owner_root, owner_id) = match self.tyref_adt_name_path(&place.ty) {
-                    Some(name_path) => {
-                        let canon = strip_crate_prefix(&name_path);
-                        let sid = majit_ir::descr::StructId::from_canonical(&canon);
+                // `owner_root` is the annotation-side classdef key: a
+                // reference-payload enum instantiation reads its tag off
+                // the per-instantiation base class (`Option<Result<…>>`),
+                // the same spelling the constructor / receiver / field-read
+                // sites project, so the `__discriminant` read and the
+                // constructor's `setattr` land on ONE classdef per
+                // instantiation (`enum_variant_narrowing_knowntypedata`
+                // then mints matching variant subclasses).  `owner_id` (the
+                // layout-side `StructId`) stays on the bare template name so
+                // every instantiation shares the one template tag layout —
+                // `from_canonical` keys the un-suffixed path.
+                let (owner_root, owner_id) = match self.tyref_adt_class_root(&place.ty) {
+                    Some(class_root) => {
+                        let canon = strip_crate_prefix(&class_root);
+                        let bare = majit_ir::descr::strip_instantiation_suffix(&canon);
+                        let sid = majit_ir::descr::StructId::from_canonical(bare);
                         (Some(canon), Some(sid))
                     }
                     None => (None, None),
@@ -8963,10 +8975,15 @@ impl<'a> Lowering<'a> {
         .then(|| arg.clone())
     }
 
-    /// The fully-qualified `name_path()` of the ADT a [`TyRef`]
-    /// resolves to, following `Deduplicated` / `HashConsedValue`
-    /// wrapper layers.  `None` for non-ADT shapes.
-    fn tyref_adt_name_path(&self, ty: &TyRef) -> Option<String> {
+    /// The unwrapped ADT body `Value` a [`TyRef`] resolves to, following
+    /// `Deduplicated` / `HashConsedValue` wrapper layers.  The returned
+    /// object carries the `{"Adt": {"id": …, "generics": …}}` shape both
+    /// [`inline_adt_def_id`] and [`adt_head_instantiation_suffix`] decode.
+    /// `None` for non-ADT shapes.
+    fn tyref_adt_body<'t>(&self, ty: &'t TyRef) -> Option<&'t serde_json::Value>
+    where
+        'a: 't,
+    {
         let mut v = self.tyref_body(ty)?;
         loop {
             let obj = v.as_object()?;
@@ -8984,9 +9001,40 @@ impl<'a> Lowering<'a> {
             }
             break;
         }
+        Some(v)
+    }
+
+    /// The fully-qualified `name_path()` of the ADT a [`TyRef`]
+    /// resolves to, following `Deduplicated` / `HashConsedValue`
+    /// wrapper layers.  `None` for non-ADT shapes.
+    fn tyref_adt_name_path(&self, ty: &TyRef) -> Option<String> {
+        let v = self.tyref_adt_body(ty)?;
         let def_id = inline_adt_def_id(v)?;
         let td = self.llbc.type_by_id(def_id)?;
         Some(td.item_meta.name_path())
+    }
+
+    /// The per-instantiation classdef root of the ADT a [`TyRef`]
+    /// resolves to: the fully-qualified `name_path()` plus the `<…>`
+    /// instantiation suffix ([`adt_head_instantiation_suffix`]) when the
+    /// ADT is a reference-payload enum whose args all split.  This is the
+    /// same spelling the receiver-type ([`adt_node_class_root`]),
+    /// constructor ([`resolve_aggregate_adt`]) and field-read
+    /// ([`resolve_adt_field`]) sites project, so a `Discriminant` read
+    /// keys the SAME per-instantiation base class the constructor wrote
+    /// (`Option<Result<…>>` rather than the bare `Option`) and the
+    /// discriminant narrowing mints matching variant subclasses.  Bare
+    /// leaf (no suffix) for non-enum / primitive-payload heads.  `None`
+    /// for non-ADT shapes.
+    fn tyref_adt_class_root(&self, ty: &TyRef) -> Option<String> {
+        let v = self.tyref_adt_body(ty)?;
+        let def_id = inline_adt_def_id(v)?;
+        let name_path = self.llbc.type_by_id(def_id)?.item_meta.name_path();
+        let adt = v.as_object()?.get("Adt")?.as_object()?;
+        match adt_head_instantiation_suffix(adt, self.llbc) {
+            Some(suffix) => Some(format!("{name_path}{suffix}")),
+            None => Some(name_path),
+        }
     }
 
     /// `true` when `ty` resolves to a FIELDLESS enum whose discriminant
