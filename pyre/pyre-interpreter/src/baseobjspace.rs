@@ -11896,6 +11896,40 @@ pub fn hash_w(obj: PyObjectRef) -> i64 {
 /// reuse it here rather than duplicating a subset of the ladder that would
 /// drop those overrides.
 pub fn hash_w_strict(obj: PyObjectRef) -> Result<i64, PyError> {
+    if obj.is_null() {
+        return Err(PyError::type_error("hash() argument is null"));
+    }
+    unsafe {
+        let kind = if pyre_object::is_dict(obj) {
+            Some("dict")
+        } else if pyre_object::is_list(obj) {
+            Some("list")
+        } else if pyre_object::is_set(obj) {
+            Some("set")
+        } else if pyre_object::is_bytearray(obj) {
+            Some("bytearray")
+        } else if pyre_object::dictmultiobject::is_dict_view_keys(obj) {
+            // `dictmultiobject.py:1626 _is_set_like` — only the keys and items
+            // views are set-like: they define `__eq__` and so are unhashable.
+            // The values view keeps `object.__hash__`.
+            Some("dict_keys")
+        } else if pyre_object::dictmultiobject::is_dict_view_items(obj) {
+            Some("dict_items")
+        } else if pyre_object::sliceobject::is_slice(obj) {
+            Some("slice")
+        } else {
+            None
+        };
+        if let Some(name) = kind {
+            return Err(PyError::type_error(format!("unhashable type: '{}'", name)));
+        }
+        // A released or writable memoryview is unhashable; route through the
+        // fallible hasher so it raises the proper ValueError instead of an
+        // infallible identity hash (`memoryobject.py descr_hash`).
+        if pyre_object::memoryview::is_w_memoryview(obj) {
+            return crate::builtins::try_hash_value(obj);
+        }
+    }
     crate::builtins::try_hash_value(obj)
 }
 

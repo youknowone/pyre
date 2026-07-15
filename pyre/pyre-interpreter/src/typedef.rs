@@ -3919,9 +3919,10 @@ fn init_dict_type(ns: PyObjectRef) {
                 };
                 let items = crate::builtins::collect_iterable(iterable)?;
                 // dictmultiobject.py:120-134 descr_fromkeys — for `dict` itself,
-                // fill a fresh dict directly; for a dict subclass, construct an
-                // instance via `cls()` and route through `space.setitem` so the
-                // result is an instance of the subclass.
+                // fill a fresh dict through the dict's own setitem, which hashes
+                // each key; for a dict subclass, construct an instance via `cls()`
+                // and route through `space.setitem` so the result is an instance
+                // of the subclass.
                 let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
                 if cls.is_null() || crate::baseobjspace::is_w(cls, w_dict_type) {
                     let d = pyre_object::w_dict_new();

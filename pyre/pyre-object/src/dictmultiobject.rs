@@ -3139,6 +3139,32 @@ pub unsafe fn is_dict_view(obj: PyObjectRef) -> bool {
     }
 }
 
+/// Test whether `obj` is the keys view.
+///
+/// `dictmultiobject.py:1626 _is_set_like` — `isinstance(w_other,
+/// W_DictViewKeysObject)`.  The keys view is set-like: it defines `__eq__`
+/// and so is unhashable.
+///
+/// # Safety
+/// `obj` must be a valid, non-null pointer to a `PyObject`.
+#[inline]
+pub unsafe fn is_dict_view_keys(obj: PyObjectRef) -> bool {
+    unsafe { py_type_check(obj, &DICT_KEYS_TYPE) }
+}
+
+/// Test whether `obj` is the items view.
+///
+/// `dictmultiobject.py:1626 _is_set_like` — `isinstance(w_other,
+/// W_DictViewItemsObject)`.  The items view is set-like: it defines `__eq__`
+/// and so is unhashable.
+///
+/// # Safety
+/// `obj` must be a valid, non-null pointer to a `PyObject`.
+#[inline]
+pub unsafe fn is_dict_view_items(obj: PyObjectRef) -> bool {
+    unsafe { py_type_check(obj, &DICT_ITEMS_TYPE) }
+}
+
 /// # Safety
 /// `obj` must point to a valid `W_DictViewObject`.
 #[inline]

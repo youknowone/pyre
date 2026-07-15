@@ -7084,10 +7084,13 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
             Some("set")
         } else if pyre_object::is_bytearray(obj) {
             Some("bytearray")
-        } else if pyre_object::dictmultiobject::is_dict_view(obj) {
-            // `dictmultiobject.py:1619 _is_set_like` views inherit set's
-            // unhashable semantics; values view also isn't hashable.
-            Some("dict view")
+        } else if pyre_object::dictmultiobject::is_dict_view_keys(obj) {
+            // `dictmultiobject.py:1626 _is_set_like` — only the keys and items
+            // views are set-like: they define `__eq__` and so are unhashable.
+            // The values view keeps `object.__hash__`.
+            Some("dict_keys")
+        } else if pyre_object::dictmultiobject::is_dict_view_items(obj) {
+            Some("dict_items")
         } else if pyre_object::sliceobject::is_slice(obj) {
             // sliceobject.py:205 `__hash__ = None`.
             Some("slice")
