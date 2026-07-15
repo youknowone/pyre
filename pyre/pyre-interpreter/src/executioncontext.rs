@@ -1995,6 +1995,16 @@ impl ActionFlagOps for ActionFlag {
                 majit_ir::eval_breaker_word::set_async();
             } else {
                 majit_ir::eval_breaker_word::clear_async();
+                // A signal delivered between the ticker store and this clear
+                // rearms the ticker to -1 and re-sets the async bit; the clear
+                // would then drop it, leaving a negative ticker with the bit
+                // clear so a non-allocating compiled loop misses the signal.
+                // Re-read the ticker — the handler writes it through the
+                // registered pointer, so force a fresh load — and restore the
+                // bit if it was rearmed.
+                if unsafe { std::ptr::read_volatile(&self._ticker) } < 0 {
+                    majit_ir::eval_breaker_word::set_async();
+                }
             }
         }
     }
