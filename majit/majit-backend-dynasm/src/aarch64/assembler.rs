@@ -35,6 +35,22 @@ const AARCH64_GEN_REGS: [crate::regloc::RegLoc; 18] = crate::aarch64::registers:
 
 const AARCH64_FLOAT_REGS: [crate::regloc::RegLoc; 8] = crate::aarch64::registers::ALL_VFP_REGS;
 
+/// Bytes the trace entry frame reserves: the frame-pointer/link pair, the
+/// callee-saved registers the trace body clobbers, and the reserved
+/// bitmask-address register. The prologue, the stack-overflow early return and
+/// the epilogue must all agree on this, or the return unwinds a corrupt SP.
+const CALL_FRAME_SIZE: u32 = 64;
+
+/// Offset of `BITMASK_ADDR_REG`'s save slot within the entry frame.
+const X24_SAVE_OFFSET: u32 = 56;
+
+const _: () = assert!(X24_SAVE_OFFSET + 8 <= CALL_FRAME_SIZE);
+const _: () = assert!(CALL_FRAME_SIZE % 16 == 0, "aarch64 SP stays 16-byte aligned");
+// The prologue/epilogue spell the reserved register as a dynasm `x24` literal,
+// which no expression ties back to `registers`. Fail the build rather than
+// silently save the wrong register if the reservation ever moves.
+const _: () = assert!(crate::aarch64::registers::BITMASK_ADDR_REG.value == 24);
+
 /// Resolved argument: either a frame slot (frame-pointer-relative offset) or a constant.
 enum ResolvedArg {
     /// Frame-pointer-relative byte offset: [rbp + offset] on x64, [x29, #offset] on aarch64.
@@ -1262,10 +1278,10 @@ impl<'a> AssemblerARM64<'a> {
     /// ```
     fn _call_header(&mut self, inputargs: &[InputArg]) {
         dynasm!(self.mc ; .arch aarch64
-            ; stp x29, x30, [sp, #-64]!
+            ; stp x29, x30, [sp, -(CALL_FRAME_SIZE as i32)]!
             ; stp x19, x20, [sp, #16]   // save callee-saved regs
             ; stp x21, x22, [sp, #32]   // save callee-saved regs
-            ; str x24, [sp, #56]        // save reserved bitmask-addr reg
+            ; str x24, [sp, X24_SAVE_OFFSET]  // save reserved bitmask-addr reg
             ; mov x29, x0
         );
         // Bake the process-global eval-breaker-word address into the reserved
@@ -1326,8 +1342,8 @@ impl<'a> AssemblerARM64<'a> {
                     ; mov x0, x29
                     ; ldp x19, x20, [sp, #16]
                     ; ldp x21, x22, [sp, #32]
-                    ; ldr x24, [sp, #56]
-                    ; ldp x29, x30, [sp], #64
+                    ; ldr x24, [sp, X24_SAVE_OFFSET]
+                    ; ldp x29, x30, [sp], CALL_FRAME_SIZE as i32
                     ; ret
                     ; =>continue_label
                 );
@@ -1350,8 +1366,8 @@ impl<'a> AssemblerARM64<'a> {
             ; mov x0, x29
             ; ldp x19, x20, [sp, #16]   // restore callee-saved regs
             ; ldp x21, x22, [sp, #32]   // restore callee-saved regs
-            ; ldr x24, [sp, #56]        // restore reserved bitmask-addr reg
-            ; ldp x29, x30, [sp], #64
+            ; ldr x24, [sp, X24_SAVE_OFFSET]  // restore reserved bitmask-addr reg
+            ; ldp x29, x30, [sp], CALL_FRAME_SIZE as i32
             ; ret
         );
     }
