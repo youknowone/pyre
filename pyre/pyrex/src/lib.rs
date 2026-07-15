@@ -115,17 +115,17 @@ fn fatal_utf8_config_error(detail: &str) -> ! {
 }
 
 fn locale_implies_utf8_mode() -> bool {
-    let locale = std::env::var("LC_ALL")
-        .ok()
-        .or_else(|| std::env::var("LC_CTYPE").ok())
-        .or_else(|| std::env::var("LANG").ok());
-    // Only the legacy C/POSIX locale — or an unset/empty locale, which resolves
-    // to C — coerces utf8_mode to 1; every named locale (en_US, C.UTF-8, …)
-    // leaves it 0.
-    matches!(
-        locale.as_deref(),
-        None | Some("") | Some("C") | Some("POSIX")
-    )
+    // An empty variable is treated as unset (`setlocale` POSIX semantics) and
+    // falls through to the next, so `LC_ALL= LC_CTYPE=en_US.UTF-8` resolves to
+    // en_US.UTF-8, not C.
+    let read = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+    let locale = read("LC_ALL")
+        .or_else(|| read("LC_CTYPE"))
+        .or_else(|| read("LANG"));
+    // Only the legacy C/POSIX locale — or a fully unset chain, which resolves to
+    // C — coerces utf8_mode to 1; every named locale (en_US, C.UTF-8, …) leaves
+    // it 0.
+    matches!(locale.as_deref(), None | Some("C") | Some("POSIX"))
 }
 
 fn resolve_utf8_mode(flags: &LaunchFlags) -> i64 {
