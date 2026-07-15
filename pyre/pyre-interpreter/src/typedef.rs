@@ -4909,111 +4909,43 @@ fn dict_view_isdisjoint(
     Ok(pyre_object::w_bool_from(true))
 }
 
-/// `dictmultiobject.py:1692-1708 _as_set_op` — produce a fresh set
-/// holding the result of the named set operation between
-/// `self_view` and `other`.  PyPy delegates to set's `_update`
-/// methods for efficiency; pyre computes the result inline because
-/// pyre's set typedef does not expose the in-place mutators yet.
-/// Both shapes (forward and reflected) are reachable from the same
-/// helper because set ops on the supported subset (-, &, |, ^) are
-/// commutative under "build set(LHS) and combine with RHS"
-/// semantics — the reverse caller just swaps the operand order.
-#[derive(Clone, Copy)]
-enum DictViewSetOp {
-    Sub,
-    And,
-    Or,
-    Xor,
-}
-
-fn dict_view_set_op_compute(
-    self_view: pyre_object::PyObjectRef,
-    other: pyre_object::PyObjectRef,
-    op: DictViewSetOp,
+/// `dictmultiobject.py:1699-1710 _as_set_op` — build a set from the left
+/// operand and run the named in-place set method against the right one.
+///
+/// Materialising the left operand through the set constructor is what
+/// enforces the hash protocol: an unhashable element raises there rather
+/// than being dropped or stored unhashed.
+fn dict_view_as_set_op(
+    lhs: pyre_object::PyObjectRef,
+    rhs: pyre_object::PyObjectRef,
+    methname: &str,
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
-    let self_items = crate::type_methods::dict_view_snapshot(self_view);
-    let other_items = crate::builtins::collect_iterable(other)?;
-    // Materialise `other` as a set for O(1) `contains` lookups.  `set`
-    // requires hashable elements; PyPy raises TypeError naturally
-    // through the underlying set constructor, which is what `_as_set_op`
-    // surfaces too.
-    let other_set = pyre_object::w_set_from_items(&other_items);
-    let result_items: Vec<pyre_object::PyObjectRef> = match op {
-        // dictmultiobject.py:1705 sub → difference_update on set(self)
-        DictViewSetOp::Sub => self_items
-            .into_iter()
-            .filter(|&item| !unsafe { pyre_object::w_set_contains(other_set, item) })
-            .collect(),
-        // dictmultiobject.py:1706 and → intersection_update
-        DictViewSetOp::And => self_items
-            .into_iter()
-            .filter(|&item| unsafe { pyre_object::w_set_contains(other_set, item) })
-            .collect(),
-        // dictmultiobject.py:1707 or → update (set union, dedup via set ctor below)
-        DictViewSetOp::Or => {
-            let mut combined: Vec<pyre_object::PyObjectRef> = self_items;
-            combined.extend(other_items);
-            combined
-        }
-        // dictmultiobject.py:1708 xor → symmetric_difference_update
-        DictViewSetOp::Xor => {
-            let self_set = pyre_object::w_set_from_items(&self_items);
-            let mut out: Vec<pyre_object::PyObjectRef> = self_items
-                .into_iter()
-                .filter(|&item| !unsafe { pyre_object::w_set_contains(other_set, item) })
-                .collect();
-            for item in other_items {
-                if !unsafe { pyre_object::w_set_contains(self_set, item) } {
-                    out.push(item);
-                }
-            }
-            out
-        }
-    };
-    Ok(pyre_object::w_set_from_items(&result_items))
+    let w_set_type = crate::typedef::gettypeobject(&pyre_object::setobject::SET_TYPE);
+    let w_set = crate::call::call_function_impl_result(w_set_type, &[lhs])?;
+    let method = crate::baseobjspace::getattr_str(w_set, methname)?;
+    crate::call::call_function_impl_result(method, &[rhs])?;
+    Ok(w_set)
 }
 
+/// `dictmultiobject.py:1701-1704 _as_set_op.op` — `set(self)` combined with
+/// `w_other`.
 fn dict_view_set_op(
     self_view: pyre_object::PyObjectRef,
     other: pyre_object::PyObjectRef,
     op_name: &str,
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
-    let op = match op_name {
-        "difference_update" => DictViewSetOp::Sub,
-        "intersection_update" => DictViewSetOp::And,
-        "update" => DictViewSetOp::Or,
-        "symmetric_difference_update" => DictViewSetOp::Xor,
-        _ => return Err(crate::PyError::type_error("unknown set op")),
-    };
-    dict_view_set_op_compute(self_view, other, op)
+    dict_view_as_set_op(self_view, other, op_name)
 }
 
+/// `dictmultiobject.py:1705-1709 _as_set_op.rop` — the reflected shape builds
+/// the set from `w_other` instead, so the non-commutative `-` and `&` keep
+/// their operand order.
 fn dict_view_rset_op(
     self_view: pyre_object::PyObjectRef,
     other: pyre_object::PyObjectRef,
     op_name: &str,
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
-    let op = match op_name {
-        // PyPy's reverse ops swap operand order: `other - self_view`,
-        // `other & self_view`, etc.  Sub/And are not commutative, so
-        // the swap matters; Or/Xor are commutative.
-        "difference_update" => {
-            // other - self_view
-            let other_items = crate::builtins::collect_iterable(other)?;
-            let self_items = crate::type_methods::dict_view_snapshot(self_view);
-            let self_set = pyre_object::w_set_from_items(&self_items);
-            let result_items: Vec<pyre_object::PyObjectRef> = other_items
-                .into_iter()
-                .filter(|&item| !unsafe { pyre_object::w_set_contains(self_set, item) })
-                .collect();
-            return Ok(pyre_object::w_set_from_items(&result_items));
-        }
-        "intersection_update" => DictViewSetOp::And,
-        "update" => DictViewSetOp::Or,
-        "symmetric_difference_update" => DictViewSetOp::Xor,
-        _ => return Err(crate::PyError::type_error("unknown set op")),
-    };
-    dict_view_set_op_compute(self_view, other, op)
+    dict_view_as_set_op(other, self_view, op_name)
 }
 
 // Top-level fn-pointer dispatchers for each comparator and set op
