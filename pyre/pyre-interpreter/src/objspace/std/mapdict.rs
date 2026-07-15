@@ -1313,6 +1313,60 @@ pub unsafe fn store_attr_unboxed_fast_path(
     Some((w_type, version_tag, map, p.storageindex, u.listindex, u.typ))
 }
 
+/// Resolve an existing boxed plain slot through the STORE_ATTR caching gates.
+/// Unlike an unboxed slot, the value remains a `PyObjectRef`, so the caller
+/// needs only the guarded map and storage index for the direct write
+/// (mapdict.py:446-447).
+///
+/// # Safety
+/// `w_obj` must be a live object.
+pub unsafe fn store_attr_boxed_fast_path(
+    w_obj: PyObjectRef,
+    name: &str,
+) -> Option<(PyObjectRef, u64, MapRef, usize)> {
+    if name == "__class__" {
+        return None;
+    }
+    // mapdict.py:1591 `if map is not None:` — also filters non-instances.
+    let map = unsafe { mapdict_map_or_null(w_obj) };
+    if map.is_null() {
+        return None;
+    }
+    // mapdict.py:1592 `w_type = map.terminator.w_cls`.
+    let w_type = unsafe { (*(*map).terminator()).as_terminator() }.w_cls;
+    if w_type.is_null() {
+        return None;
+    }
+    // mapdict.py:1612-1614 — a custom `__setattr__` owns the write.
+    if unsafe { crate::baseobjspace::setattr_if_not_from_object(w_type) }.is_some() {
+        return None;
+    }
+    // mapdict.py:1630-1631 — STORE caching also requires the standard
+    // `__getattribute__` so the cached map invariant remains valid.
+    if unsafe { crate::baseobjspace::getattribute_if_not_from_object(w_type) }.is_some() {
+        return None;
+    }
+    // mapdict.py:1616 `if version_tag is not None:`.
+    let version_tag = unsafe { crate::baseobjspace::w_type_version_tag(w_type) };
+    if version_tag == 0 {
+        return None;
+    }
+    // mapdict.py:1618-1627 `_pure_lookup_where_with_method_cache` + classify.
+    let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where(w_type, name) };
+    let (attrkind, is_slot) = unsafe { classify_attr(w_type, w_descr, true) };
+    if attrkind == INVALID {
+        return None;
+    }
+    let attrname = if is_slot { "slot" } else { name };
+    // mapdict.py:1628 `attr = map.find_map_attr(attrname, attrkind)`.
+    let attr = unsafe { find_map_attr(map, Wtf8::new(attrname), attrkind) }?;
+    let p = unsafe { (*attr).as_plain() };
+    if p.unboxed.is_some() {
+        return None;
+    }
+    Some((w_type, version_tag, map, p.storageindex))
+}
+
 /// mapdict.py:914-916 `_mapdict_read_storage(storageindex)` for a
 /// `W_ObjectObject` — the boxed-slot read the JIT LOAD_ATTR fast path folds
 /// to. `load_attr_fast_path` already established that the resolved attribute
@@ -1326,6 +1380,17 @@ pub unsafe fn store_attr_unboxed_fast_path(
 pub unsafe fn read_boxed_storage(w_obj: PyObjectRef, storageindex: usize) -> PyObjectRef {
     let inst = unsafe { &*(w_obj as *const pyre_object::W_ObjectObject) };
     inst._mapdict_read_storage(storageindex)
+}
+
+/// Write a boxed attribute value directly to an existing storage slot,
+/// matching `PlainAttribute._direct_write` (mapdict.py:446-447).
+///
+/// # Safety
+/// `w_obj` must be a live `W_ObjectObject` whose guarded map owns the supplied
+/// boxed storage index.
+pub unsafe fn write_boxed_storage(w_obj: PyObjectRef, storageindex: usize, value: PyObjectRef) {
+    let inst = unsafe { &mut *(w_obj as *mut pyre_object::W_ObjectObject) };
+    inst._mapdict_write_storage(storageindex, value);
 }
 
 /// Read the raw longlong at an unboxed attribute's `(storageindex,

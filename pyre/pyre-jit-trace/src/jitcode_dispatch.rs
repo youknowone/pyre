@@ -18409,79 +18409,110 @@ fn try_walker_specialize_store_attr(
             None => return Ok(None),
         }
     };
-    let Some((w_type, version_tag, map, storageindex, listindex, unbox_type)) = (unsafe {
+    if let Some((w_type, version_tag, map, storageindex, listindex, unbox_type)) = unsafe {
         pyre_interpreter::objspace::std::mapdict::store_attr_unboxed_fast_path(concrete_obj, &name)
+    } {
+        match unbox_type {
+            pyre_interpreter::objspace::std::mapdict::UnboxType::Int => {
+                // `type(w_value) is space.IntObjectCls` (mapdict.py:615): reject bool
+                // and every type-changing value before emitting any guards.
+                if unsafe {
+                    pyre_object::pyobject::is_bool(concrete_value)
+                        || !pyre_object::pyobject::is_int(concrete_value)
+                } {
+                    return Ok(None);
+                }
+            }
+            pyre_interpreter::objspace::std::mapdict::UnboxType::Float => {
+                // A non-float changes the slot to boxed storage and freezes further
+                // unboxing (mapdict.py:615-619), so retain setattr.
+                if !unsafe { pyre_object::pyobject::is_float(concrete_value) } {
+                    return Ok(None);
+                }
+            }
+        }
+
+        walker_guard_mapdict_instance_shape(ctx, op_pc, obj, w_type, version_tag, map)?;
+        let storageindex_const = ctx.trace_ctx.const_int(storageindex as i64);
+        let listindex_const = ctx.trace_ctx.const_int(listindex as i64);
+        let (helper_fn, raw, value_type) = match unbox_type {
+            pyre_interpreter::objspace::std::mapdict::UnboxType::Int => {
+                let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+                let raw = walker_unbox_int(ctx, op_pc, value, int_type_addr)?;
+                (
+                    crate::helpers::jit_mapdict_unboxed_write_raw as *const (),
+                    raw,
+                    majit_ir::Type::Int,
+                )
+            }
+            pyre_interpreter::objspace::std::mapdict::UnboxType::Float => {
+                let float_type_addr = &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64;
+                let raw = walker_unbox_float(ctx, op_pc, value, float_type_addr)?;
+                let live_f = unsafe { pyre_object::w_float_get_value(concrete_value) };
+                ctx.trace_ctx
+                    .set_opref_concrete(raw, majit_ir::Value::Float(live_f));
+                (
+                    crate::helpers::jit_mapdict_unboxed_write_f as *const (),
+                    raw,
+                    majit_ir::Type::Float,
+                )
+            }
+        };
+        let helper = ctx.trace_ctx.const_int(helper_fn as usize as i64);
+
+        let mut effect = original_effect.clone();
+        effect.extraeffect = majit_ir::ExtraEffect::CannotRaise;
+        effect.pyre_helper = majit_ir::PyreHelperKind::StoreAttr;
+        let descr = majit_metainterp::make_call_descr_with_effect(
+            &[
+                majit_ir::Type::Ref,
+                majit_ir::Type::Int,
+                majit_ir::Type::Int,
+                value_type,
+            ],
+            majit_ir::Type::Void,
+            effect,
+        );
+        // ABI order follows the write helpers: receiver and the two guarded green
+        // coordinates, then the raw symbolic value in its own bank.  No box is
+        // materialized for this write.
+        return Ok(Some((
+            descr,
+            vec![helper, obj, storageindex_const, listindex_const, raw],
+        )));
+    }
+
+    let Some((w_type, version_tag, map, storageindex)) = (unsafe {
+        pyre_interpreter::objspace::std::mapdict::store_attr_boxed_fast_path(concrete_obj, &name)
     }) else {
         return Ok(None);
     };
-    match unbox_type {
-        pyre_interpreter::objspace::std::mapdict::UnboxType::Int => {
-            // `type(w_value) is space.IntObjectCls` (mapdict.py:615): reject bool
-            // and every type-changing value before emitting any guards.
-            if unsafe {
-                pyre_object::pyobject::is_bool(concrete_value)
-                    || !pyre_object::pyobject::is_int(concrete_value)
-            } {
-                return Ok(None);
-            }
-        }
-        pyre_interpreter::objspace::std::mapdict::UnboxType::Float => {
-            // A non-float changes the slot to boxed storage and freezes further
-            // unboxing (mapdict.py:615-619), so retain setattr.
-            if !unsafe { pyre_object::pyobject::is_float(concrete_value) } {
-                return Ok(None);
-            }
-        }
-    }
-
     walker_guard_mapdict_instance_shape(ctx, op_pc, obj, w_type, version_tag, map)?;
     let storageindex_const = ctx.trace_ctx.const_int(storageindex as i64);
-    let listindex_const = ctx.trace_ctx.const_int(listindex as i64);
-    let (helper_fn, raw, value_type) = match unbox_type {
-        pyre_interpreter::objspace::std::mapdict::UnboxType::Int => {
-            let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-            let raw = walker_unbox_int(ctx, op_pc, value, int_type_addr)?;
-            (
-                crate::helpers::jit_mapdict_unboxed_write_raw as *const (),
-                raw,
-                majit_ir::Type::Int,
-            )
-        }
-        pyre_interpreter::objspace::std::mapdict::UnboxType::Float => {
-            let float_type_addr = &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64;
-            let raw = walker_unbox_float(ctx, op_pc, value, float_type_addr)?;
-            let live_f = unsafe { pyre_object::w_float_get_value(concrete_value) };
-            ctx.trace_ctx
-                .set_opref_concrete(raw, majit_ir::Value::Float(live_f));
-            (
-                crate::helpers::jit_mapdict_unboxed_write_f as *const (),
-                raw,
-                majit_ir::Type::Float,
-            )
-        }
-    };
-    let helper = ctx.trace_ctx.const_int(helper_fn as usize as i64);
+    let helper = ctx
+        .trace_ctx
+        .const_int(crate::helpers::jit_mapdict_boxed_write as *const () as usize as i64);
 
+    // Unlike the unboxed arm, this write stores a GC reference, so the
+    // residual's original may-force effect is kept: only the opaque `setattr_fn`
+    // MRO walk is replaced by the direct slot write, while the force token, the
+    // virtualizable spill, and the trailing force/exception guards stay exactly
+    // as the generic setattr emitted them.
     let mut effect = original_effect.clone();
-    effect.extraeffect = majit_ir::ExtraEffect::CannotRaise;
     effect.pyre_helper = majit_ir::PyreHelperKind::StoreAttr;
     let descr = majit_metainterp::make_call_descr_with_effect(
         &[
             majit_ir::Type::Ref,
             majit_ir::Type::Int,
-            majit_ir::Type::Int,
-            value_type,
+            majit_ir::Type::Ref,
         ],
         majit_ir::Type::Void,
         effect,
     );
-    // ABI order follows the write helpers: receiver and the two guarded green
-    // coordinates, then the raw symbolic value in its own bank.  No box is
-    // materialized for this write.
-    Ok(Some((
-        descr,
-        vec![helper, obj, storageindex_const, listindex_const, raw],
-    )))
+    // ABI order follows `jit_mapdict_boxed_write`: receiver, guarded green
+    // storage index, and the original symbolic object reference.  The value is
+    // neither unboxed nor guarded by type.
+    Ok(Some((descr, vec![helper, obj, storageindex_const, value])))
 }
 
 /// Walker-native mirror of the trait `trace_guard_exact_w_class`

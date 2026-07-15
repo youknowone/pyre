@@ -259,6 +259,24 @@ pub extern "C" fn jit_mapdict_read(w_obj: i64, storageindex: i64) -> i64 {
     }
 }
 
+/// Non-forcing boxed write for an existing mapdict attribute.  The guarded
+/// instance class and exact map pin the storage index, and a boxed slot accepts
+/// the incoming object reference directly (mapdict.py:446-447).  A torn
+/// recording with a null/non-instance receiver is a defensive no-op.
+pub extern "C" fn jit_mapdict_boxed_write(w_obj: i64, storageindex: i64, value: i64) {
+    let w_obj = w_obj as PyObjectRef;
+    if w_obj.is_null() || !unsafe { is_instance(w_obj) } {
+        return;
+    }
+    unsafe {
+        pyre_interpreter::objspace::std::mapdict::write_boxed_storage(
+            w_obj,
+            storageindex as usize,
+            value as PyObjectRef,
+        );
+    }
+}
+
 /// Raw unboxed counterpart of [`jit_mapdict_read`].  The guarded map pins the
 /// shared longlong-list coordinates, so this non-forcing helper performs only
 /// `_prim_direct_read`'s storage read (mapdict.py:600-601); boxing stays in the
