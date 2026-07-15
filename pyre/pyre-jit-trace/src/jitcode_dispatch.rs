@@ -9895,6 +9895,13 @@ fn classify_vstack_opcode(
         | Instruction::StoreSubscr
         | Instruction::DeleteSubscr
         | Instruction::StoreSlice
+        // LIST_APPEND / SET_ADD / MAP_ADD / LIST_EXTEND pop their value operand(s)
+        // and mutate the collection PEEK'd in place below them — a side-store,
+        // same shape as STORE_SUBSCR: the surviving TOS box stays put.
+        | Instruction::ListAppend { .. }
+        | Instruction::SetAdd { .. }
+        | Instruction::MapAdd { .. }
+        | Instruction::ListExtend { .. }
         | Instruction::DeleteFast { .. }
         | Instruction::DeleteName { .. }
         | Instruction::DeleteGlobal { .. }
