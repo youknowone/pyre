@@ -2558,10 +2558,17 @@ pub unsafe fn w_dict_copy(obj: PyObjectRef) -> PyObjectRef {
 /// matching `dictmultiobject.py:1061-1064` (`self.unerase
 /// (w_dict.dstorage)[self.unwrap(w_key)] = w_value`).  Caller must
 /// have already verified `is_correct_type(w_key)`.
+///
+/// Residualise the int-storage setitem leaf (`@dont_look_inside`,
+/// `rlib/jit.py:139`): the `IndexMap::insert` it wraps is an external-crate
+/// heap-store the tracer cannot model — the oopspec'd residual arm of
+/// `rordereddict.ll_dict_setitem` (traced only for a virtual dict).
+///
 /// # Safety
 /// `obj` must point to a valid `W_DictObject` on
 /// [`crate::dictmultiobject::INT_DICT_STRATEGY`]; `key` must be a
 /// plain `W_IntObject` (not bool).
+#[majit_macros::dont_look_inside]
 pub unsafe fn w_dict_store_int_strategy(obj: PyObjectRef, key: PyObjectRef, value: PyObjectRef) {
     let dict = &mut *(obj as *mut W_DictObject);
     let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<i64, PyObjectRef>);
@@ -2574,8 +2581,14 @@ pub unsafe fn w_dict_store_int_strategy(obj: PyObjectRef, key: PyObjectRef, valu
 /// `dictmultiobject.py:1098 self.unerase(w_dict.dstorage).get(self.unwrap(w_key), None)`.
 /// Caller must have already verified `is_correct_type(w_key)`.
 ///
+/// Residualise the int-storage getitem leaf (`@dont_look_inside`,
+/// `rlib/jit.py:139`): the `IndexMap::get` it wraps is an external-crate
+/// heap-lookup the tracer cannot model — the oopspec'd residual arm of
+/// `rordereddict.ll_dict_getitem` (traced only for a virtual dict).
+///
 /// # Safety
 /// Same as [`w_dict_store_int_strategy`].
+#[majit_macros::dont_look_inside]
 pub unsafe fn w_dict_lookup_int_strategy(
     obj: PyObjectRef,
     key: PyObjectRef,
@@ -2661,10 +2674,16 @@ pub unsafe fn w_dict_clear_int_strategy(obj: PyObjectRef) {
 /// `dictmultiobject.py:1061-1064` direct typed-storage write.  Caller
 /// must have already verified `is_correct_type(w_key)`.
 ///
+/// Residualise the bytes-storage setitem leaf (`@dont_look_inside`,
+/// `rlib/jit.py:139`): the `IndexMap::insert` it wraps is an external-crate
+/// heap-store the tracer cannot model — the oopspec'd residual arm of
+/// `rordereddict.ll_dict_setitem` (traced only for a virtual dict).
+///
 /// # Safety
 /// `obj` must point to a valid `W_DictObject` on
 /// [`crate::dictmultiobject::BYTES_DICT_STRATEGY`]; `key` must be a
 /// `W_BytesObject`.
+#[majit_macros::dont_look_inside]
 pub unsafe fn w_dict_store_bytes_strategy(obj: PyObjectRef, key: PyObjectRef, value: PyObjectRef) {
     let dict = &mut *(obj as *mut W_DictObject);
     let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<Vec<u8>, PyObjectRef>);
@@ -2677,8 +2696,14 @@ pub unsafe fn w_dict_store_bytes_strategy(obj: PyObjectRef, key: PyObjectRef, va
 /// `dictmultiobject.py:1098`.  Caller must have already verified
 /// `is_correct_type(w_key)`.
 ///
+/// Residualise the bytes-storage getitem leaf (`@dont_look_inside`,
+/// `rlib/jit.py:139`): the `IndexMap::get` it wraps is an external-crate
+/// heap-lookup the tracer cannot model — the oopspec'd residual arm of
+/// `rordereddict.ll_dict_getitem` (traced only for a virtual dict).
+///
 /// # Safety
 /// Same as [`w_dict_store_bytes_strategy`].
+#[majit_macros::dont_look_inside]
 pub unsafe fn w_dict_lookup_bytes_strategy(
     obj: PyObjectRef,
     key: PyObjectRef,

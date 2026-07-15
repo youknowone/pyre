@@ -6077,6 +6077,46 @@ impl<'a> Lowering<'a> {
                 )? {
                     return Ok(());
                 }
+                // `<BigInt as {One,Zero}>::{one,zero}()` — a 0-arg associated
+                // fn returning a fresh `BigInt` constant.  Emit `BigInt::from(1)`
+                // / `BigInt::from(0)` (a `ConstInt` operand feeding the
+                // `["BigInt", "from"]` residual-external) instead of leaving the
+                // owner-resolved `["bigint", "BigInt", <leaf>]` call unregistered.
+                // `BigInt::from(1i64)` == `Integer::ONE` and `from(0i64)` ==
+                // `Integer::ZERO`, so the constants are byte-identical.
+                if args.is_empty()
+                    && let [.., owner_a, owner_b, leaf] = segments.as_slice()
+                    && owner_a == "bigint"
+                    && owner_b == "BigInt"
+                    && matches!(leaf.as_str(), "one" | "zero")
+                {
+                    let n = if leaf == "one" { 1 } else { 0 };
+                    let cst = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(cst.clone()),
+                        kind: OpKind::ConstInt(n),
+                    });
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::Call {
+                            target: CallTarget::FunctionPath {
+                                segments: vec!["BigInt".to_string(), "from".to_string()],
+                            },
+                            args: vec![cst],
+                            result_ty: ValueType::Ref(None),
+                        },
+                    });
+                    self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `<str as PartialEq>::eq(a, b)` is the string-equality
                 // `BinOp("eq")` (pairtype `rtype_eq` → `ll_streq`) — emit it
                 // instead of leaving the graph-less trait-method extern.
@@ -6448,6 +6488,31 @@ impl<'a> Lowering<'a> {
                 )
             })
             && let Some(residual) = crate::front::bigint_binop::bigint_shift_residual_path(segments)
+        {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments: residual },
+                args: args.clone(),
+                result_ty: ValueType::Ref(None),
+            }
+        } else {
+            op_kind
+        };
+
+        // Retarget a foreign BigInt unary-operator call (`<BigInt as Neg>::neg`)
+        // to its `jit_bigint_neg` residual.  Split from the binary retarget
+        // above because the operator takes a single `BigInt` operand: the guard
+        // requires the sole operand to be the opaque `BigInt` ADT.  Same
+        // pure-target-swap, fail-safe contract.
+        let op_kind = if let OpKind::Call {
+            target: CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } = &op_kind
+            && args.len() == 1
+            && first_arg_ty
+                .as_ref()
+                .is_some_and(|t| tyref_is_opaque_bigint(t, self.llbc))
+            && let Some(residual) = crate::front::bigint_binop::bigint_unop_residual_path(segments)
         {
             OpKind::Call {
                 target: CallTarget::FunctionPath { segments: residual },

@@ -551,6 +551,33 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::w_dict_setitem_str",
         pyre_object::dictmultiobject::w_dict_setitem_str as *const (),
     );
+    // The typed int/bytes dict-storage leaves residualise their
+    // `IndexMap::{insert,get}` (an external-crate heap store/lookup the tracer
+    // cannot model): the stores return `()`, the lookups `Option<PyObjectRef>`.
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dictmultiobject::w_dict_store_int_strategy",
+        "pyre_object::w_dict_store_int_strategy",
+        pyre_object::dictmultiobject::w_dict_store_int_strategy as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dictmultiobject::w_dict_lookup_int_strategy",
+        "pyre_object::w_dict_lookup_int_strategy",
+        pyre_object::dictmultiobject::w_dict_lookup_int_strategy as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dictmultiobject::w_dict_store_bytes_strategy",
+        "pyre_object::w_dict_store_bytes_strategy",
+        pyre_object::dictmultiobject::w_dict_store_bytes_strategy as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dictmultiobject::w_dict_lookup_bytes_strategy",
+        "pyre_object::w_dict_lookup_bytes_strategy",
+        pyre_object::dictmultiobject::w_dict_lookup_bytes_strategy as *const (),
+    );
     push_alias_pair(
         &mut entries,
         "pyre_object::dictmultiobject::w_module_dict_new",
@@ -791,6 +818,13 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         &mut entries,
         "pyre_interpreter::objspace::descroperation::jit_bigint_add",
         crate::objspace::descroperation::jit_bigint_add as *const (),
+    );
+    // `jit_bigint_neg` residualizes the unary `<BigInt as Neg>::neg` operator;
+    // a single operand pointer.
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::jit_bigint_neg",
+        crate::objspace::descroperation::jit_bigint_neg as *const (),
     );
     // `jit_bigint_{shl,shr}` residualize the BigInt shift-by-`usize` operators
     // (`<BigInt as Shl<usize>>::shl`, …); `b` is the machine shift count.

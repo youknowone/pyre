@@ -882,7 +882,7 @@ pub unsafe fn w_range_compute_item(obj: PyObjectRef, index: &BigInt) -> Option<P
         let len_b = range_obj_to_bigint(w_range_length(obj));
         let mut idx = index.clone();
         if idx < BigInt::zero() {
-            idx += &len_b;
+            idx = &idx + &len_b;
         }
         if idx >= len_b || idx < BigInt::zero() {
             return None;

@@ -1,4 +1,4 @@
-//! `<BigInt as {BitAnd,BitOr,BitXor,Sub,Mul}>::op()` → `jit_bigint_*` residual.
+//! `<BigInt as {BitAnd,BitOr,BitXor,Sub,Mul,Add,Div}>::op()` → `jit_bigint_*` residual.
 //!
 //! ## Positioning
 //!
@@ -49,6 +49,7 @@ pub(crate) fn bigint_binop_residual_path(segments: &[String]) -> Option<Vec<Stri
         "sub" => "jit_bigint_sub",
         "mul" => "jit_bigint_mul",
         "add" => "jit_bigint_add",
+        "div" => "jit_bigint_div",
         _ => return None,
     };
     Some(residual_path(residual_leaf))
@@ -70,6 +71,25 @@ pub(crate) fn bigint_shift_residual_path(segments: &[String]) -> Option<Vec<Stri
     let residual_leaf = match leaf.as_str() {
         "shl" => "jit_bigint_shl",
         "shr" => "jit_bigint_shr",
+        _ => return None,
+    };
+    Some(residual_path(residual_leaf))
+}
+
+/// If `segments` is a foreign BigInt **unary** operator impl-method path
+/// (`[…, "<Impl>", "neg"]`), return the `jit_bigint_neg` residual path;
+/// otherwise `None`.  Split from [`bigint_binop_residual_path`] because the
+/// operator takes a single `BigInt` operand: the caller confirms the sole
+/// operand is the opaque `BigInt` ADT before applying the retarget.
+pub(crate) fn bigint_unop_residual_path(segments: &[String]) -> Option<Vec<String>> {
+    let [.., impl_seg, leaf] = segments else {
+        return None;
+    };
+    if impl_seg != "<Impl>" {
+        return None;
+    }
+    let residual_leaf = match leaf.as_str() {
+        "neg" => "jit_bigint_neg",
         _ => return None,
     };
     Some(residual_path(residual_leaf))
@@ -103,6 +123,7 @@ mod tests {
             ("sub", "jit_bigint_sub"),
             ("mul", "jit_bigint_mul"),
             ("add", "jit_bigint_add"),
+            ("div", "jit_bigint_div"),
         ] {
             let path =
                 bigint_binop_residual_path(&segs(&["malachite_bigint", "bigint", "<Impl>", op]))
@@ -128,6 +149,20 @@ mod tests {
             bigint_shift_residual_path(&segs(&["malachite_bigint", "bigint", "<Impl>", "sub"]))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn maps_unary_neg_to_its_residual() {
+        let path =
+            bigint_unop_residual_path(&segs(&["malachite_bigint", "bigint", "<Impl>", "neg"]))
+                .expect("neg must map");
+        assert_eq!(path, desc("jit_bigint_neg"));
+        // Binary operators / shifts are not in the unary map.
+        assert!(
+            bigint_unop_residual_path(&segs(&["malachite_bigint", "bigint", "<Impl>", "add"]))
+                .is_none()
+        );
+        assert!(bigint_unop_residual_path(&segs(&["bigint", "BigInt", "neg"])).is_none());
     }
 
     #[test]

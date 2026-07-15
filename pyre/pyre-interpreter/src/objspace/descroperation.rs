@@ -199,6 +199,14 @@ pub extern "C" fn jit_bigint_add(a: i64, b: i64) -> *mut BigInt {
     unsafe { pyre_object::longobject::alloc_bigint_nursery_collecting(&*a + &*b) }
 }
 
+/// `rbigint.neg` payload — `-&BigInt`. A unary operator, so a single operand
+/// pointer; the result is a fresh negated `BigInt`. See [`jit_bigint_and`].
+#[majit_macros::dont_look_inside]
+pub extern "C" fn jit_bigint_neg(a: i64) -> *mut BigInt {
+    let a = a as *const BigInt;
+    unsafe { pyre_object::longobject::alloc_bigint_nursery_collecting(-&*a) }
+}
+
 // ── BigInt shift-by-`usize` residuals ────────────────────────────────
 // `<BigInt as Shl<usize>>::shl` / `Shr<usize>::shr` — the shift amount is a
 // plain machine integer, NOT a `BigInt`, so `b` is the count value itself
