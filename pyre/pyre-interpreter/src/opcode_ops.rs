@@ -307,6 +307,7 @@ pub fn list_extend_value(list: PyObjectRef, iterable: PyObjectRef) -> Result<(),
 pub fn set_add_value(set: PyObjectRef, value: PyObjectRef) -> Result<(), PyError> {
     unsafe {
         if pyre_object::is_set_or_frozenset(set) {
+            crate::builtins::try_hash_value(value)?;
             pyre_object::w_set_add(set, value);
         } else if pyre_object::is_list(set) {
             pyre_object::w_list_append(set, value);
@@ -318,12 +319,13 @@ pub fn set_add_value(set: PyObjectRef, value: PyObjectRef) -> Result<(), PyError
 /// SET_UPDATE — `set.update(iterable)` (or `list.extend` for the
 /// list-shaped accumulator).  Shared by the interpreter's `set_update`
 /// and the JIT residual `bh_set_update_fn`.  `set` is peeked, mutated in
-/// place; a user iterator may run Python.
+/// place; a user iterator or element `__hash__` may run Python.
 pub fn set_update_value(set: PyObjectRef, iterable: PyObjectRef) -> Result<(), PyError> {
     unsafe {
         if pyre_object::is_set_or_frozenset(set) {
             let items = crate::builtins::collect_iterable(iterable)?;
             for item in items {
+                crate::builtins::try_hash_value(item)?;
                 pyre_object::w_set_add(set, item);
             }
         } else if pyre_object::is_list(set) {
@@ -344,12 +346,14 @@ pub fn set_update_value(set: PyObjectRef, iterable: PyObjectRef) -> Result<(), P
 
 /// MAP_ADD — `dict[key] = value`.  Shared by the interpreter's `map_add`
 /// and the JIT residual `bh_map_add_fn`.  `dict` is peeked, mutated in
-/// place; runs no user code (raw dict store).
+/// place; the key is hashed before the raw dict store, so a user `__hash__`
+/// may run Python.
 pub fn map_add_value(
     dict: PyObjectRef,
     key: PyObjectRef,
     value: PyObjectRef,
 ) -> Result<(), PyError> {
+    crate::builtins::try_hash_value(key)?;
     unsafe {
         pyre_object::w_dict_store(dict, key, value);
     }
@@ -714,7 +718,27 @@ pub extern "C" fn bh_lookup_exc_class_for_kind(kind_disc: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pyre_object::{w_bool_get_value, w_int_get_value, w_int_new};
+    use crate::test_hooks::install_hash_hook;
+    use pyre_object::{w_bool_get_value, w_dict_len, w_int_get_value, w_int_new, w_set_len};
+
+    #[test]
+    fn test_accumulator_helpers_reject_unhashable_values_without_inserting() {
+        install_hash_hook();
+
+        let key = pyre_object::w_list_new(vec![]);
+        let dict = pyre_object::w_dict_new();
+        let map_err = map_add_value(dict, key, w_int_new(1))
+            .expect_err("MAP_ADD should reject an unhashable key");
+        assert_eq!(map_err.kind, crate::PyErrorKind::TypeError);
+        assert_eq!(unsafe { w_dict_len(dict) }, 0);
+
+        let value = pyre_object::w_list_new(vec![]);
+        let set = pyre_object::w_set_new();
+        let set_err =
+            set_add_value(set, value).expect_err("SET_ADD should reject an unhashable element");
+        assert_eq!(set_err.kind, crate::PyErrorKind::TypeError);
+        assert_eq!(unsafe { w_set_len(set) }, 0);
+    }
 
     #[test]
     fn test_binary_value_reuses_objspace_dispatch() {

@@ -2057,6 +2057,7 @@ fn frozenset_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     if !iterable.is_null() {
         let items = crate::builtins::collect_iterable(iterable)?;
         for item in items {
+            crate::builtins::try_hash_value(item)?;
             unsafe { pyre_object::w_set_add(obj, item) };
         }
     }
@@ -2128,6 +2129,7 @@ fn set_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if !w_iterable.is_null() && !unsafe { pyre_object::is_none(w_iterable) } {
         let items = crate::builtins::collect_iterable(w_iterable)?;
         for item in items {
+            crate::builtins::try_hash_value(item)?;
             unsafe { pyre_object::w_set_add(set_obj, item) };
         }
     }
@@ -3491,6 +3493,7 @@ fn init_dict_type(ns: &mut DictStorage) {
             if cls.is_null() || crate::baseobjspace::is_w(cls, w_dict_type) {
                 let d = pyre_object::w_dict_new();
                 for key in items {
+                    crate::builtins::try_hash_value(key)?;
                     unsafe { pyre_object::w_dict_store(d, key, value) };
                 }
                 Ok(d)
@@ -13892,6 +13895,7 @@ fn init_set_type(ns: &mut DictStorage) {
             "add",
             |args| {
                 if args.len() >= 2 {
+                    crate::builtins::try_hash_value(args[1])?;
                     unsafe { pyre_object::w_set_add(args[0], args[1]) };
                 }
                 Ok(pyre_object::w_none())
@@ -13983,6 +13987,7 @@ fn init_set_type(ns: &mut DictStorage) {
             for other in &args[1..] {
                 let other_items = crate::builtins::collect_iterable(*other)?;
                 for item in other_items {
+                    crate::builtins::try_hash_value(item)?;
                     unsafe { pyre_object::w_set_add(args[0], item) };
                 }
             }
@@ -14062,6 +14067,7 @@ fn init_set_type(ns: &mut DictStorage) {
                 if present {
                     unsafe { pyre_object::w_set_discard(args[0], item) };
                 } else {
+                    crate::builtins::try_hash_value(item)?;
                     unsafe { pyre_object::w_set_add(args[0], item) };
                 }
             }

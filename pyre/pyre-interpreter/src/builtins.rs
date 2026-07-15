@@ -5745,6 +5745,7 @@ pub(crate) fn builtin_dict_ctor(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
         let keys = collect_iterable(keys_obj)?;
         for key in keys {
             let val = crate::baseobjspace::getitem(src, key)?;
+            try_hash_value(key)?;
             unsafe { w_dict_store(dict, key, val) };
         }
         return Ok(dict);
@@ -5762,6 +5763,7 @@ pub(crate) fn builtin_dict_ctor(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
                 elems.len()
             )));
         }
+        try_hash_value(elems[0])?;
         unsafe { w_dict_store(dict, elems[0], elems[1]) };
     }
     Ok(dict)
