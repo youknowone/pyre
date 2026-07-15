@@ -4942,12 +4942,39 @@ fn setarrayitem_vable_via_metainterp(
             });
         }
     };
-    let value = match value_bank {
+    let mut value = match value_bank {
         'i' => read_int_reg(code, op, 2, ctx)?,
         'r' => read_ref_reg(code, op, 2, ctx)?,
         'f' => read_float_reg(code, op, 2, ctx)?,
         _ => unreachable!("value_bank must be 'i', 'r' or 'f'"),
     };
+    // A STORE_FAST (`index < nlocals`) pops the operand-stack TOS and writes
+    // it into a local slot.  When the popped value lives in an operand-stack
+    // temp that spans a nested loop, the loop-header merge-point seeds no
+    // operand-stack color (`trace.rs` loop-header entry), so the codewriter's
+    // value register reads back `OpRef::NONE` even though the box is live.
+    // The walk-level operand-stack mirror (`vstack_boxes`, the analog of
+    // `MIFrame.registers_r`) is the authoritative kept-stack source and was
+    // maintained across the nested loop; recover the TOS box from it.  Writing
+    // the unbound `NONE` into the vable array otherwise leaves an untyped slot
+    // that fails the guard-snapshot buildability precondition
+    // (`GuardSnapshotVableUntyped`).  Gate on a live mirror + a Ref store into
+    // the local region so a genuine null / non-mirrored slot keeps the legacy
+    // read.
+    if value.is_none() && value_bank == 'r' && ctx.vstack_valid {
+        let full_body_sym = ctx.fbw_mode.snapshot_sym;
+        if !full_body_sym.is_null() {
+            // SAFETY: pointer live for the full-body walk; read-only.
+            let nlocals = unsafe { (*full_body_sym).nlocals as i64 };
+            if index_value >= 0 && index_value < nlocals {
+                if let Some(&tos) = ctx.vstack_boxes.last() {
+                    if !tos.is_none() {
+                        value = tos;
+                    }
+                }
+            }
+        }
+    }
     let (fdescr, adescr) = vable_array_descrs_from_jitcode(code, op, 3, 5, ctx)?;
     let concrete = ctx
         .trace_ctx
