@@ -953,8 +953,7 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
     }
 
     /// `celldict.py:96-100 getitem_str` — str fast path matches
-    /// `w_module_dict_getitem_str` (which honours `dict_storage_proxy`
-    /// and the `mstrategy.caches` cell-cache when present).
+    /// `w_module_dict_getitem_str` and its cell-cache behavior.
     unsafe fn getitem_str(&self, w_dict: PyObjectRef, key: &str) -> Option<PyObjectRef> {
         crate::dictmultiobject::w_module_dict_getitem_str(w_dict, key)
     }
@@ -1014,9 +1013,7 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
     }
 
     /// `celldict.py:157-159 clear`.  Branches on
-    /// `is_object_strategy` and drains whichever storage half is
-    /// live; `w_dict_clear` (the public wrapper) handles
-    /// `dict_storage_proxy` flush bookkeeping.
+    /// `is_object_strategy` and drains whichever storage half is live.
     unsafe fn clear(&self, w_dict: PyObjectRef) {
         crate::dictmultiobject::w_module_dict_clear_inner(w_dict);
     }

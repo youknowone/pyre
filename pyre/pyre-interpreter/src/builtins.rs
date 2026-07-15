@@ -6759,12 +6759,8 @@ fn builtin_globals(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         // wrapping.  PyPy keeps a single dict per module so subsequent
         // `globals()` / `frame.f_globals` / `f.__globals__` /
         // `module.__dict__` accesses on the same module share one
-        // identity.  Pyre routes through the lazy cached
-        // `get_w_globals` (Step 1 of the w_globals type
-        // migration) which returns the canonical W_DictObject paired
-        // with the frame's storage — same identity invariant via
-        // `dict_storage_to_dict`'s mirror_target.  Returning a fresh
-        // wrapper per call (as the previous shape did) silently
+        // identity. Pyre returns the frame's globals dict object directly.
+        // Returning a fresh wrapper per call would silently
         // diverged on `globals() is module.__dict__`.
         let dict = unsafe { (*frame).get_w_globals() };
         if dict.is_null() {

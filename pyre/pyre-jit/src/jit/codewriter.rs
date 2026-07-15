@@ -8168,8 +8168,7 @@ impl CodeWriter {
                             // cranelift null-softens the read).  Resolve those
                             // through the `bh_load_global_fn` residual whose
                             // namespace operand is the callee's module dict
-                            // OBJECT (`dict_storage_to_dict`, built eagerly at
-                            // `PyFrame.__init__` so it reaches the non-moving
+                            // object, built eagerly at `PyFrame.__init__` so it reaches the non-moving
                             // oldgen before any jitcode build): the cell-fold
                             // then reads the container value live through that
                             // stable dict every iteration instead of baking the
@@ -14222,15 +14221,11 @@ mod tests {
     fn frontend_global_flow_value_reads_w_code_globals_as_constant() {
         let code = compile_exec("x\n").expect("compile failed");
         let w_code = pyre_interpreter::box_code_constant(&code);
-        let mut globals = Box::new(pyre_interpreter::DictStorage::new());
+        let globals = pyre_object::w_module_dict_new();
         let w_value = pyre_object::intobject::w_int_new(42);
-        pyre_interpreter::dict_storage_store(globals.as_mut(), "x", w_value);
-        let globals_ptr = Box::into_raw(globals);
         unsafe {
-            pyre_interpreter::w_code_set_w_globals(
-                w_code,
-                pyre_interpreter::baseobjspace::dict_storage_to_dict(globals_ptr),
-            );
+            pyre_object::w_dict_setitem_str(globals, "x", w_value);
+            pyre_interpreter::w_code_set_w_globals(w_code, globals);
         }
 
         let value = frontend_global_flow_value(w_code as *const (), "x").expect("global constant");

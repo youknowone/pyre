@@ -70,11 +70,7 @@ pub fn run_repl(quiet: bool, no_site: bool) {
     // W_DictObject so REPL STORE_NAME writes, `globals()`, `f.__globals__`,
     // and `__main__.__dict__` all share one identity.
     let canonical = w_globals;
-    let main_module = pyre_object::module::w_module_new_aliasing_dict(
-        "__main__",
-        std::ptr::null_mut(),
-        canonical,
-    );
+    let main_module = pyre_object::module::w_module_new_aliasing_dict("__main__", canonical);
     importing::set_sys_module("__main__", main_module);
 
     let sys_module = match importing::importhook(
@@ -379,18 +375,11 @@ mod tests {
 
     #[test]
     fn reads_prompt_from_sys_module() {
-        let mut namespace = Box::new(pyre_interpreter::DictStorage::default());
-        namespace.fix_ptr();
-        pyre_interpreter::dict_storage_store(&mut namespace, "ps1", pyre_object::w_str_new("py> "));
-        let ns_ptr = Box::into_raw(namespace);
-        // Use the canonical W_DictObject paired with the storage so
-        // `read_prompt` → `getattr` → `finditem_str(w_dict, ...)` sees
-        // the pre-existing `ps1` binding via the entries Vec snapshot
-        // populated by `dict_storage_to_dict`'s lazy mirror_target
-        // registration.
-        let canonical = pyre_interpreter::baseobjspace::dict_storage_to_dict(ns_ptr);
-        let sys_module =
-            pyre_object::module::w_module_new_aliasing_dict("sys", ns_ptr as *mut u8, canonical);
+        let canonical = pyre_object::w_module_dict_new();
+        unsafe {
+            pyre_object::w_dict_setitem_str(canonical, "ps1", pyre_object::w_str_new("py> "));
+        }
+        let sys_module = pyre_object::module::w_module_new_aliasing_dict("sys", canonical);
 
         assert_eq!(read_prompt(sys_module, "ps1").as_deref(), Some("py> "));
     }

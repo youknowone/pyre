@@ -1443,14 +1443,8 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
                 false,
             ),
-            // R3.3b prep: canonical W_DictObject sibling slot
-            // (`pyframe.py:49 self.w_globals` parity).  Used by the inline
-            // new-PyFrame helper to populate the slot from the
-            // function's `w_func_globals_obj` cache so trace-time
-            // chases through `w_dict_get_dict_storage_proxy` observe
-            // a non-null PyObjectRef.  R3.3 cutover will retire the
-            // adjacent raw `PyFrame.w_globals` entry above and rename
-            // this one to fully match PyPy's pyframe.py:49 shape.
+            // `pyframe.py:49 self.w_globals` parity. The inline new-PyFrame
+            // helper populates this slot from the function's globals dict.
             (
                 "PyFrame.w_globals",
                 crate::frame_layout::PYFRAME_W_GLOBALS_OFFSET,

@@ -1470,7 +1470,7 @@ fn make_maketrans_descr(
 /// `__new__` ignores its arguments.  A subclass instance is retagged
 /// with the actual class.
 fn module_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let w_module = pyre_object::w_module_new("", std::ptr::null_mut());
+    let w_module = pyre_object::w_module_new("");
     if let Some(cls) = args.first().copied() {
         if !cls.is_null() {
             unsafe { (*w_module).w_class = cls };
@@ -3766,11 +3766,8 @@ fn init_dict_type(ns: PyObjectRef) {
                         return Ok(pyre_object::w_not_implemented());
                     }
                     // `descr_copy` then `descr_update`: copy LHS, overlay
-                    // RHS — both reads go through `w_dict_items` so a
-                    // dict backed by a `dict_storage_proxy` (globals() /
-                    // module.__dict__) contributes its storage-only
-                    // entries too, matching PyPy's storage-strategy
-                    // delitem/iter parity.
+                    // RHS — both reads go through `w_dict_items`, matching
+                    // PyPy's storage-strategy delitem/iter parity.
                     let dst = pyre_object::w_dict_new();
                     if !src.is_null() {
                         for (k, v) in unsafe { pyre_object::w_dict_items(src) } {

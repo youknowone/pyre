@@ -2117,55 +2117,6 @@ pub fn call_with_kwargs(
 
 pub fn register_build_class() {
     crate::typedef::init_typeobjects();
-    install_dict_storage_hooks();
-}
-
-/// Wire the storage ↔ W_DictObject sync hooks.  Idempotent — guarded
-/// by an internal `Once` so repeated invocations
-/// (`register_build_class` at runtime startup, `ExecutionContext::new`
-/// defensive registration before module allocation) collapse to a
-/// single registration without leaking additional function pointers
-/// per call.  PyPy's single `W_DictMultiObject` owns both halves of
-/// the dict view; pyre's split storage / W_DictObject layout would
-/// otherwise let an early `w_dict_setitem_str` (e.g.
-/// `Module.__init__`'s `__name__` write) silently miss the storage if
-/// these hooks are not yet registered.
-pub fn install_dict_storage_hooks() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        pyre_object::dictmultiobject::register_dict_storage_store_hook(
-            |ns_ptr, name, value| unsafe {
-                let ns = &mut *(ns_ptr as *mut crate::DictStorage);
-                crate::dict_storage_store(ns, name, value);
-            },
-        );
-        pyre_object::dictmultiobject::register_dict_storage_delete_hook(|ns_ptr, name| unsafe {
-            let ns = &mut *(ns_ptr as *mut crate::DictStorage);
-            ns.remove(name);
-        });
-        pyre_object::dictmultiobject::register_dict_storage_lookup_hook(|ns_ptr, name| unsafe {
-            let ns = &*(ns_ptr as *const crate::DictStorage);
-            crate::dict_storage_get(ns, name)
-        });
-        pyre_object::dictmultiobject::register_dict_storage_items_hook(|ns_ptr| unsafe {
-            let ns = &*(ns_ptr as *const crate::DictStorage);
-            ns.entries().map(|(k, v)| (k.to_string(), *v)).collect()
-        });
-        pyre_object::dictmultiobject::register_dict_storage_walk_hook(|ns_ptr, forward| unsafe {
-            let ns = &mut *(ns_ptr as *mut crate::DictStorage);
-            let value_slots: Vec<*mut PyObjectRef> = ns
-                .values_mut()
-                .iter_mut()
-                .map(|value| value as *mut PyObjectRef)
-                .collect();
-            for slot in value_slots {
-                forward(&mut *slot);
-            }
-            if let Some(slot) = ns.mirror_target_slot_mut() {
-                forward(slot);
-            }
-        });
-    });
 }
 
 /// `ObjSpace.call_function(callable, *args)` — direct implementation.

@@ -3,7 +3,7 @@
 //! The app-level helpers `reduce_1` / `reduce_2` / `get_slotvalues` /
 //! `slotnames` (objectobject.py:23-84) are bundled in
 //! `reduce_protocol_app.py` and resolved lazily through
-//! `appleveldef_install` into a leaked scratch namespace.  The three
+//! `appleveldef_install` into a rooted GC module dict.  The three
 //! handles the interp-level code calls (`reduce_1`, `reduce_2`,
 //! `get_slotvalues`) keep that namespace as their `__globals__`, so
 //! `get_slotvalues` can still reach its sibling `slotnames`.
@@ -32,11 +32,11 @@ thread_local! {
 
 /// Resolve (and cache) the three app-level handles.
 ///
-/// Executes `reduce_protocol_app.py` into a fresh, intentionally leaked
-/// `DictStorage` and reads back the named globals.  The functions retain
-/// that namespace as their `__globals__`, which keeps `slotnames`
-/// reachable from `get_slotvalues` even though only three names are
-/// surfaced.
+/// Executes `reduce_protocol_app.py` into its own fresh module globals and
+/// stores the selected handles in a rooted GC module dict.  The functions
+/// retain the execution namespace as their `__globals__`, which keeps
+/// `slotnames` reachable from `get_slotvalues` even though only three names
+/// are surfaced.
 fn handle(which: usize) -> PyObjectRef {
     HANDLES.with(|cell| {
         cell.get_or_init(|| {
@@ -44,16 +44,17 @@ fn handle(which: usize) -> PyObjectRef {
             if ctx.is_null() {
                 panic!("reduce_protocol: no execution context");
             }
-            let mut app_ns = Box::new(unsafe { (*ctx).fresh_dict_storage() });
-            app_ns.fix_ptr();
-            let app_ns_ptr: *mut crate::DictStorage = Box::leak(app_ns);
-            let w_app_globals = crate::baseobjspace::dict_storage_to_dict(app_ns_ptr);
+            let _roots = pyre_object::gc_roots::push_roots();
+            let save_point = pyre_object::gc_roots::shadow_stack_len();
+            let w_app_globals = pyre_object::dictmultiobject::w_module_dict_new();
+            pyre_object::gc_roots::pin_root(w_app_globals);
             crate::importing::appleveldef_install(
-                unsafe { &mut *app_ns_ptr },
+                pyre_object::gc_roots::shadow_stack_get(save_point),
                 include_str!("reduce_protocol_app.py"),
                 "reduce_protocol_app.py",
                 &["reduce_1", "reduce_2", "get_slotvalues"],
             );
+            let w_app_globals = pyre_object::gc_roots::shadow_stack_get(save_point);
             let get = |name: &str| {
                 unsafe { pyre_object::w_dict_getitem_str(w_app_globals, name) }
                     .unwrap_or_else(|| panic!("reduce_protocol: `{name}` not bound"))

@@ -582,14 +582,8 @@ pub unsafe fn walk_pyframe_roots_area(
                         as *mut PyObjectRef;
                     visitor(&mut *(w_dict_slot as *mut majit_ir::GcRef));
                 }
-                // pyframe.py:49 `self.w_globals` is the dict OBJECT.  Forward
-                // its slot BEFORE anything chases its `dict_storage_proxy`:
-                // both the NEWLOCALS `w_locals` alias check below and the
-                // globals-storage walk further down read the proxy off this
-                // object, and reading the proxy off a not-yet-forwarded object
-                // would dereference a stale nursery address — a forwarding
-                // marker left by a sibling frame that shares the same module
-                // globals and was walked earlier in this collection.
+                // pyframe.py:49 `self.w_globals` is the dict OBJECT. Forward
+                // the field before following the dict's own storage.
                 let w_globals_obj_slot = &mut (*frame).w_globals as *mut PyObjectRef;
                 visitor(&mut *(w_globals_obj_slot as *mut majit_ir::GcRef));
                 // pyframe.py:147 `debugdata.w_locals` (the frame's locals
@@ -619,43 +613,10 @@ pub unsafe fn walk_pyframe_roots_area(
                         &mut (*frame).lastblock as *mut *mut crate::pyframe::FrameBlock;
                     visitor(&mut *(lastblock_slot as *mut majit_ir::GcRef));
                 }
-                // pyframe.py:49 `self.w_globals` is the dict OBJECT.  Its slot
-                // was forwarded above (before the debugdata walk), so this
-                // object — and any forwarding marker a sibling frame sharing
-                // the same module globals already resolved — is current here;
-                // the object's `dict_storage_proxy` is therefore safe to chase
-                // for the backing storage.
                 let live_obj = (*frame).w_globals;
-                if !live_obj.is_null() {
-                    let globals_ptr =
-                        pyre_object::dictmultiobject::w_dict_get_dict_storage_proxy(live_obj)
-                            as *mut crate::DictStorage;
-                    if !globals_ptr.is_null() {
-                        // Prebuilt-family value scan (see `scan_prebuilt`
-                        // above); the mirror-target refresh below stays
-                        // unconditional — it re-syncs the (immortal) module
-                        // dict pointer, not a movable value.
-                        if scan_prebuilt {
-                            let value_slots: Vec<*mut PyObjectRef> = (&mut *globals_ptr)
-                                .values_mut()
-                                .iter_mut()
-                                .map(|value| value as *mut PyObjectRef)
-                                .collect();
-                            for value in value_slots {
-                                visitor(&mut *(value as *mut majit_ir::GcRef));
-                                walk_raw_function_roots(*value, visitor);
-                            }
-                        }
-                        (&mut *globals_ptr).set_mirror_target(live_obj);
-                    }
-                }
-                // The proxy mirror above only covers the back-mirror
-                // DictStorage.  For a W_ModuleDictObject the LOAD_GLOBAL
-                // read path (`w_module_dict_getitem_str`) consults the
+                // For a W_ModuleDictObject the LOAD_GLOBAL read path consults the
                 // authoritative `dstorage` cell map / `object_storage` /
-                // strategy caches ahead of the proxy, none of which the
-                // proxy walk reaches; the module dict is Box-immortal so
-                // its own custom trace never fires.  Forward those movable
+                // strategy caches. Forward those movable
                 // values here so a relocated global is not read back stale.
                 // No-op for non-module dicts.  The picked builtin Module's
                 // dict is consulted on a globals miss (`_load_global`
@@ -1466,8 +1427,8 @@ impl SharedOpcodeHandler for PyFrame {
         // canonical sibling via `get_w_globals()` and threads it
         // through `make_function_from_code_obj_with_globals_obj` so
         // the freshly-created function's `__globals__` identity IS
-        // the frame's view — no lazy `dict_storage_to_dict` second
-        // resolution that could surface a different W_DictObject.
+        // the frame's view, with no second resolution that could surface a
+        // different dict object.
         let w_globals = self.get_w_globals();
         // Capture the globals OBJECT only; the raw `*mut DictStorage` is
         // recovered from the object via the proxy back-link wherever a frame
@@ -3497,9 +3458,7 @@ impl OpcodeStepExecutor for PyFrame {
     //   `self.space.delitem(self.get_w_globals_storage(), w_varname)`.
     // `space.delitem` on a dict raises `KeyError(w_varname)` when the
     // key is missing; pyre routes through `w_dict_delitem_str` on the
-    // canonical W_DictObject so the W_ModuleDictObject's strategy and
-    // its mirror `DictStorage` stay coherent via
-    // `maybe_sync_dict_storage_delete`.
+    // canonical W_DictObject so the W_ModuleDictObject's strategy is updated.
     fn delete_global(&mut self, name: &str) -> Result<(), PyError> {
         let w_globals = self.get_w_globals();
         let found =

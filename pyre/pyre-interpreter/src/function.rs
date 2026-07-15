@@ -6,8 +6,6 @@
 //! When called, the interpreter creates a new PyFrame that *shares*
 //! the globals pointer (no clone).
 
-#[cfg(test)]
-use crate::executioncontext::DictStorage;
 use pyre_object::pyobject::*;
 
 /// Type descriptor for user-defined functions.
@@ -52,11 +50,8 @@ pub struct Function {
     /// `function.py:57 self.w_func_globals = w_globals` stores the dict
     /// object directly; this is the function's sole globals carrier, so
     /// `function.__globals__` returns the same identity as the module's
-    /// `__dict__` and frames built from this function share globals.  The
-    /// raw `*mut DictStorage` a frame builder needs is recovered from this
-    /// object via the `dict_storage_proxy` back-link
-    /// (`w_dict_get_dict_storage_proxy`).  `PY_NULL` for globals-less
-    /// carriers (gateway builtins).
+    /// `__dict__` and frames built from this function share globals.
+    /// `PY_NULL` for globals-less carriers (gateway builtins).
     pub w_func_globals_obj: PyObjectRef,
     /// `function.py:50 w_ann=None` constructor default plus
     /// `function.py:548-551 fget_func_annotations` lazy-init shape:
@@ -714,9 +709,7 @@ pub unsafe fn fget_func_name(obj: PyObjectRef) -> PyObjectRef {
 ///
 /// `function.py:57 self.w_func_globals = w_globals` stores the dict
 /// object directly; this is a plain field load.  Returns `PY_NULL` for
-/// a globals-less carrier (gateway builtins); callers that want the raw
-/// `*mut DictStorage` recover it from this object via
-/// `w_dict_get_dict_storage_proxy`.
+/// a globals-less carrier (gateway builtins).
 ///
 /// # Safety
 /// `obj` must point to a valid `Function`.
@@ -2433,8 +2426,7 @@ mod tests {
         // Function.code now stores a Code-level wrapper (PyCode).
         let raw_code = 0xDEAD_BEEF as *const ();
         let w_code = crate::w_code_new(raw_code);
-        let mut ns = DictStorage::new();
-        let w_globals = crate::baseobjspace::dict_storage_to_dict(&mut ns as *mut DictStorage);
+        let w_globals = pyre_object::w_module_dict_new();
         let obj = function_new(w_code as *const (), "myfunc".to_string(), w_globals);
         unsafe {
             assert!(is_function(obj));

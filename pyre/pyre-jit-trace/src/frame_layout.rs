@@ -54,11 +54,9 @@ pub const PYFRAME_W_BUILTIN_OFFSET: usize = std::mem::offset_of!(PyFrame, w_buil
 
 /// Byte offset of `w_globals` in `PyFrame`.
 ///
-/// Lazy-cached canonical W_DictObject sibling for `frame.w_globals`.
-/// The slot is a GCREF and must be visible to the descr / nursery GC
-/// walkers so the cached dict survives across minor collections; once
-/// populated it remains the same identity for the frame's lifetime
-/// (guaranteed by `dict_storage_to_dict`'s `mirror_target` invariant).
+/// Canonical globals dict object for `frame.w_globals`. The slot is a GCREF
+/// and must be visible to the descr / nursery GC walkers so the dict survives
+/// across minor collections.
 pub const PYFRAME_W_GLOBALS_OFFSET: usize = std::mem::offset_of!(PyFrame, w_globals);
 
 // Backward-compat aliases used by JIT descriptor helpers.

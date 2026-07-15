@@ -118,7 +118,7 @@ pub extern "C" fn jit_load_name_from_namespace(
     // varname)`.  Dispatch through the dict strategy on the object
     // (`dictmultiobject.py:113-115 getitem_str`) so module dicts
     // (celldict cells) and plain dicts (exec/eval globals) are both
-    // handled without requiring a dict_storage_proxy.  Mirrors the
+    // handled directly. Mirrors the
     // interpreter `load_global_value` (eval.rs).
     if !w_globals.is_null() {
         if let Some(v) =

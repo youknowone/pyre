@@ -3258,117 +3258,6 @@ pub fn delweakref(obj: PyObjectRef) {
     }
 }
 
-/// `pypy/interpreter/module.py:77 Module.getdict()` parity: return
-/// the **canonical** `W_DictObject` already paired with this storage,
-/// not a fresh snapshot.  When the storage was first allocated
-/// (`w_module_new`, exec/eval anonymous path, etc.) it was bound to
-/// a sibling `W_DictObject` via `set_mirror_target` so that
-/// storage-side writes back-mirror into that one dict's entries Vec.
-/// This lookup retrieves that canonical dict so
-/// `function.__globals__`, `globals()`, and the module's own
-/// `__dict__` all share **one** identity (`f.__globals__ is
-/// m.__dict__` invariant) and the iterating surfaces (`keys`,
-/// `values`, `items`, `update`, `copy`, `iter`, `repr`) line up with
-/// `lookup` / `len` on the same logical state.
-///
-/// `type.__dict__` is **not** routed through this helper: PyPy
-/// `pypy/objspace/std/typeobject.py:1277 descr_get_dict` returns
-/// `W_DictProxyObject(w_dict)` (a read-only live view), not the
-/// type's underlying `W_DictObject`.  The dictproxy keeps its own
-/// identity per call and forwards reads/iterations to the type's
-/// `w_dict`; pyre's type.__dict__ readers stay on that path.
-///
-/// Lazy-canonical fallback: a storage that has not yet been paired
-/// (the `set_mirror_target` call has not happened) gets one allocated
-/// here and registered as the `mirror_target`, so subsequent calls
-/// return the same object.
-pub fn dict_storage_to_dict(ns_ptr: *const crate::DictStorage) -> PyObjectRef {
-    dict_storage_to_dict_kind(ns_ptr, DictWrapKind::Module)
-}
-
-/// `pypy/objspace/std/dictmultiobject.py:57-89 allocate_and_init_instance`
-/// distinguishes `module=True` (W_ModuleDictObject backed by
-/// ModuleDictStrategy with version-tag caches), `instance=True`
-/// (mapdict.make_instance_dict), and the default branch (regular
-/// W_DictObject on EmptyDictStrategy).  Pyre exposes the choice to
-/// callers so module globals get the strategy-cache machinery while
-/// function locals / type namespaces / generic dicts land on the
-/// regular path.
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
-pub enum DictWrapKind {
-    /// `dictmultiobject.py:60-69` — Module.__init__ globals path.
-    /// Wraps into W_ModuleDictObject with ModuleDictStrategy +
-    /// GlobalCache slot map.  Used by `PyFrame.w_globals`,
-    /// `function.w_func_globals`, REPL globals, module sys.
-    Module,
-    /// `dictmultiobject.py:70-89` — instance / default path.  PyPy's
-    /// `instance=True` goes through `mapdict.make_instance_dict`
-    /// which pyre has not ported; pyre's default (no `module=True`,
-    /// no mapdict) lands on a regular W_DictObject with
-    /// EmptyDictStrategy.  Used by `type.__dict__`, `frame.f_locals`,
-    /// and exec/eval-only locals stores.
-    Instance,
-}
-
-/// Wrap a `DictStorage` as a Python dict object, classifying the
-/// shape per `DictWrapKind`.  Maintains the `mirror_target` invariant
-/// — the same storage always returns the same wrapper.
-pub fn dict_storage_to_dict_kind(
-    ns_ptr: *const crate::DictStorage,
-    kind: DictWrapKind,
-) -> PyObjectRef {
-    if ns_ptr.is_null() {
-        return pyre_object::w_dict_new();
-    }
-    let storage = unsafe { &mut *(ns_ptr as *mut crate::DictStorage) };
-    let target = storage.mirror_target();
-    if !target.is_null() {
-        return target;
-    }
-    // Lazy canonical: snapshot-populate a fresh wrapper of the
-    // requested flavor and register it as the storage's permanent
-    // back-mirror target.  The wrapper's `dict_storage_proxy = ns_ptr`
-    // keeps forward writes (module.__dict__ / cls.__dict__ /
-    // f_locals[k] = ...) in step with the legacy storage that
-    // `PyFrame.w_globals` and friends still read through.
-    let dict = match kind {
-        DictWrapKind::Module => {
-            // `pypy/interpreter/module.py:18 Module.__init__` uses
-            // `space.newdict(module=True)`; the resulting W_ModuleDictObject
-            // carries ModuleDictStrategy + GlobalCache slot map.
-            pyre_object::dictmultiobject::w_module_dict_new_with_storage_proxy(ns_ptr as *mut u8)
-        }
-        DictWrapKind::Instance => {
-            // `dictmultiobject.py:81-89` default branch — EmptyDictStrategy
-            // regular W_DictObject (PyPy `instance=True`'s mapdict path
-            // is a TODO: pyre stops at the regular
-            // W_DictObject shape until mapdict is ported).
-            pyre_object::dictmultiobject::w_dict_new_with_storage_proxy(ns_ptr as *mut u8)
-        }
-    };
-    unsafe {
-        for (key, &value) in storage.entries_wtf8() {
-            if value.is_null() {
-                continue;
-            }
-            // Valid names take the str no-proxy setter (Unicode strategy);
-            // a lone-surrogate name routes through the WTF-8 setter, which
-            // forces the dict onto the surrogate-safe ObjectKey strategy.
-            match key.as_str() {
-                Ok(s) => pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(dict, s, value),
-                Err(_) => {
-                    pyre_object::dictmultiobject::w_dict_setitem_wtf8_no_proxy(dict, key, value)
-                }
-            }
-        }
-    }
-    storage.set_mirror_target(dict);
-    // Fresh proxy link: the immortal storage's slots became reachable
-    // through a new path; rescan on the next minor collection.
-    pyre_object::gc_roots::mark_prebuilt_roots_dirty();
-    dict
-}
-
 /// Get an attribute from an object: `obj.name`.
 ///
 /// For module objects, looks up the name in the module's namespace dict
@@ -8870,26 +8759,6 @@ pub fn getindex_w(obj: PyObjectRef) -> Result<i64, PyError> {
 /// reached only when this flag is set.
 pub const HONOR_BUILTINS: bool = false;
 
-/// Resolve the frame builtin for a raw-storage globals.  Default
-/// (`HONOR_BUILTINS=false`) returns `space.builtin` (`ec.get_builtin()`),
-/// ignoring a custom `__builtins__`; the `true` path delegates to
-/// [`pick_builtin`].
-pub fn frame_builtin(
-    w_globals: *mut crate::DictStorage,
-    exec_ctx: *const crate::PyExecutionContext,
-) -> PyObjectRef {
-    if HONOR_BUILTINS {
-        return pick_builtin(w_globals, exec_ctx);
-    }
-    if !exec_ctx.is_null() {
-        let b = unsafe { (*exec_ctx).get_builtin() };
-        if !b.is_null() {
-            return b;
-        }
-    }
-    build_default_pick_builtin_module()
-}
-
 /// Resolve the frame builtin for an object globals.  Default
 /// (`HONOR_BUILTINS=false`) returns `space.builtin`; the `true` path
 /// delegates to [`pick_builtin_obj`].
@@ -8940,18 +8809,6 @@ pub fn frame_builtin_obj_checked(
 ///      with only `None=w_None` defined — matches `moduledef.py:106-108`
 ///      `builtin = module.Module(space, None); space.setitem(builtin
 ///      .w_dict, 'None', w_None); return builtin`.
-pub fn pick_builtin(
-    w_globals: *mut crate::DictStorage,
-    exec_ctx: *const crate::PyExecutionContext,
-) -> PyObjectRef {
-    let w_globals = if w_globals.is_null() {
-        pyre_object::PY_NULL
-    } else {
-        dict_storage_to_dict(w_globals)
-    };
-    pick_builtin_obj(w_globals, exec_ctx)
-}
-
 /// Object-based `pick_builtin` for call frames whose globals came from
 /// `Function.w_func_globals` as a W_DictObject, matching PyPy's
 /// `pyframe.py:115 self.builtin = space.builtin.pick_builtin(w_globals)`.
@@ -8979,11 +8836,7 @@ pub fn pick_builtin_obj_checked(
                 }
                 let backing = crate::type_methods::resolve_dict_backing(w_builtin);
                 if !backing.is_null() {
-                    return Ok(pyre_object::w_module_new_aliasing_dict(
-                        "",
-                        std::ptr::null_mut(),
-                        w_builtin,
-                    ));
+                    return Ok(pyre_object::w_module_new_aliasing_dict("", w_builtin));
                 }
             }
             // `__builtins__` absent — moduledef.py:106-108 default Module.
@@ -9027,7 +8880,7 @@ fn build_default_pick_builtin_module() -> PyObjectRef {
     unsafe {
         pyre_object::w_dict_setitem_str(w_dict, "None", pyre_object::w_none());
     }
-    pyre_object::w_module_new_aliasing_dict("", std::ptr::null_mut(), w_dict)
+    pyre_object::w_module_new_aliasing_dict("", w_dict)
 }
 
 /// pypy/interpreter/baseobjspace.py:1031-1053
@@ -11485,10 +11338,7 @@ mod tests {
 
     #[test]
     fn test_module_setattr_getattr() {
-        let mut namespace = Box::new(crate::DictStorage::default());
-        namespace.fix_ptr();
-        let module =
-            pyre_object::module::w_module_new("test_module", Box::into_raw(namespace) as *mut u8);
+        let module = pyre_object::module::w_module_new("test_module");
 
         setattr_str(module, "ps1", w_str_new("py> ")).unwrap();
         let result = getattr_str(module, "ps1").unwrap();
@@ -11497,128 +11347,12 @@ mod tests {
 
     #[test]
     fn test_module_delattr() {
-        let mut namespace = Box::new(crate::DictStorage::default());
-        namespace.fix_ptr();
-        let module =
-            pyre_object::module::w_module_new("test_module", Box::into_raw(namespace) as *mut u8);
+        let module = pyre_object::module::w_module_new("test_module");
 
         setattr_str(module, "ps1", w_str_new("py> ")).unwrap();
         delattr_str(module, "ps1").unwrap();
         let err = getattr_str(module, "ps1").unwrap_err();
         assert!(matches!(err.kind, PyErrorKind::AttributeError));
-    }
-
-    /// `pypy/interpreter/module.py:77 Module.getdict()` parity invariant:
-    /// every call to `dict_storage_to_dict(storage)` must return the
-    /// **same** `W_DictObject` (single canonical) for a given storage.
-    /// This is the foundation of `f.__globals__ is m.__dict__` and
-    /// `globals() is __main__.__dict__` — pyre's split entries Vec /
-    /// DictStorage no longer creates fresh snapshot wrappers per call.
-    ///
-    /// The first call lazy-allocates a W_DictObject and registers it as
-    /// the storage's `mirror_target`; subsequent calls retrieve that
-    /// same dict via `mirror_target` lookup.
-    #[test]
-    fn test_dict_storage_to_dict_returns_canonical_w_dict() {
-        let mut namespace = Box::new(crate::DictStorage::default());
-        namespace.fix_ptr();
-        crate::dict_storage_store(&mut namespace, "alpha", w_int_new(7));
-        let ns_ptr: *const crate::DictStorage = &*namespace;
-
-        let first = super::dict_storage_to_dict(ns_ptr);
-        let second = super::dict_storage_to_dict(ns_ptr);
-        assert!(
-            std::ptr::eq(first, second),
-            "dict_storage_to_dict must return the canonical W_DictObject \
-             (storage's mirror_target), not a fresh snapshot",
-        );
-
-        // Storage-side write after the canonical has been allocated
-        // surfaces in the same W_DictObject via the back-mirror.
-        crate::dict_storage_store(&mut namespace, "beta", w_int_new(11));
-        unsafe {
-            assert_eq!(
-                w_int_get_value(pyre_object::w_dict_lookup(first, w_str_new("beta")).unwrap()),
-                11,
-                "post-canonicalization storage write must mirror into the canonical W_DictObject's entries Vec",
-            );
-        }
-    }
-
-    /// A regular proxy-backed W_DictObject starts on EmptyDictStrategy;
-    /// its first string store promotes it to UnicodeDictStrategy.  That
-    /// strategy's fast raw-hash insertion must still write through to the
-    /// authoritative DictStorage, just as ObjectDictStrategy::setitem does.
-    #[test]
-    fn test_proxy_bridged_unicode_setitem_forwards_to_dict_storage() {
-        crate::test_hooks::install_hash_hook();
-        crate::call::install_dict_storage_hooks();
-        let mut namespace = crate::DictStorage::new();
-        let dict = super::dict_storage_to_dict_kind(&mut namespace, super::DictWrapKind::Instance);
-        let value = w_int_new(1);
-
-        unsafe {
-            pyre_object::w_dict_setitem_str(dict, "x", value);
-        }
-
-        let stored = namespace
-            .get("x")
-            .copied()
-            .expect("proxy-bridged Unicode setitem must forward to DictStorage");
-        assert_eq!(stored, value);
-        unsafe {
-            assert_eq!(w_int_get_value(stored), 1);
-        }
-    }
-
-    /// `pypy/interpreter/module.py:77 Module.getdict()` parity invariant
-    /// for the new module-creation pattern (canonical W_DictObject reuse
-    /// via `dict_storage_to_dict` + `w_module_new_aliasing_dict`):
-    /// `module.w_dict` IS the storage's canonical W_DictObject, and
-    /// `dict_storage_to_dict(module.dict_storage)` returns that same
-    /// object on every call.
-    #[test]
-    fn test_module_w_dict_is_canonical_for_storage() {
-        let mut namespace = Box::new(crate::DictStorage::default());
-        namespace.fix_ptr();
-        crate::dict_storage_store(&mut namespace, "x", w_int_new(42));
-        let ns_ptr = Box::into_raw(namespace);
-
-        // Pattern matches the production module-creation path
-        // (executioncontext::get_builtin / importing::init_builtin_module
-        //  / pyrex::run_source __main__).
-        let canonical = super::dict_storage_to_dict(ns_ptr);
-        let module = pyre_object::module::w_module_new_aliasing_dict(
-            "test_canonical",
-            ns_ptr as *mut u8,
-            canonical,
-        );
-
-        // Module's w_dict identity equals the canonical lazy-paired
-        // W_DictObject — `f.__globals__ is m.__dict__` invariant.
-        let module_w_dict = unsafe { pyre_object::w_module_get_w_dict(module) };
-        assert!(
-            std::ptr::eq(module_w_dict, canonical),
-            "Module.w_dict must alias the storage's canonical W_DictObject",
-        );
-
-        // Repeat lookup of the canonical (e.g. function.__globals__
-        // path in production) returns the same object.
-        let again = super::dict_storage_to_dict(ns_ptr);
-        assert!(
-            std::ptr::eq(again, canonical),
-            "subsequent dict_storage_to_dict on the same storage must return the same W_DictObject",
-        );
-
-        // `module.__dict__["x"]` (resolved via the canonical W_DictObject)
-        // sees the storage-pre-populated entry.
-        unsafe {
-            assert_eq!(
-                w_int_get_value(pyre_object::w_dict_lookup(module_w_dict, w_str_new("x")).unwrap()),
-                42,
-                "canonical W_DictObject must surface storage-side entries that pre-date canonicalization",
-            );
-        }
     }
 
     #[test]
@@ -12390,8 +12124,7 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
 /// dispatch (IntDictStrategy / BytesDictStrategy / KwargsDictStrategy
 /// etc. each own their layout — the previous raw
 /// `Vec<(PyObjectRef, PyObjectRef)>` cast assumed ObjectDictStrategy).
-/// `ObjectDictStrategy::delitem` + `ModuleDictStrategy::delitem` both
-/// honour the W_DictObject `dict_storage_proxy` back-mirror via
+/// `ObjectDictStrategy::delitem` + `ModuleDictStrategy::delitem` dispatch via
 /// `w_dict_delitem_object_strategy` / `w_module_dict_delitem_inner`.
 fn dict_delitem(obj: PyObjectRef, key: PyObjectRef) -> Result<(), PyError> {
     unsafe {

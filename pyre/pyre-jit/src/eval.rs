@@ -533,10 +533,6 @@ unsafe fn object_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut maj
 ///     Rc<RefCell<GlobalCache>>>>) — every live cache's `cell`
 ///   * `object_storage` → post-`switch_to_object_strategy`
 ///     Vec<(PyObjectRef, PyObjectRef)> — both halves of every entry
-///
-/// `dict_storage_proxy` points at a `DictStorage` (interpreter-side
-/// allocation, not GC-managed) and is traced through its W_DictObject
-/// counterpart, not from here.
 unsafe fn module_dict_object_custom_trace(
     obj_addr: usize,
     f: &mut dyn FnMut(*mut majit_ir::GcRef),

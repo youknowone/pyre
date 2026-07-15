@@ -4879,9 +4879,8 @@ pub(crate) fn dict_update1(w_dict: PyObjectRef, w_data: PyObjectRef) -> Result<(
             && dict_subclass_uses_default_iter(w_data);
         if fast_path_eligible {
             // `dictmultiobject.py:1401-1406 update1_dict_dict`
-            let dst_is_empty = pyre_object::dictmultiobject::w_dict_is_regular_empty_no_proxy(dict);
-            let src_proxy_free = pyre_object::w_dict_get_dict_storage_proxy(other_raw).is_null();
-            if dst_is_empty && src_proxy_free {
+            let dst_is_empty = pyre_object::dictmultiobject::w_dict_is_regular_empty(dict);
+            if dst_is_empty {
                 let w_copy = pyre_object::dictmultiobject::w_dict_copy(other_raw);
                 pyre_object::dictmultiobject::w_dict_adopt_regular_copy_for_empty_update(
                     dict, w_copy,
@@ -4969,7 +4968,6 @@ pub fn dict_init_or_update(
             }
         }
     }
-    dict_sync_dict_storage_proxy(backing);
     Ok(w_none())
 }
 
@@ -5016,38 +5014,6 @@ fn dict_subclass_uses_default_iter(other: PyObjectRef) -> bool {
     match (other_iter, dict_iter) {
         (Some(a), Some(b)) => std::ptr::eq(a, b),
         _ => false,
-    }
-}
-
-/// If dict has a dict_storage_proxy (i.e. it was returned by `globals()`),
-/// sync all str-keyed entries back to the DictStorage.
-///
-/// For `W_ModuleDictObject` every str-keyed write already fires
-/// `maybe_sync_dict_storage_store` through `w_module_dict_setitem_str`
-/// (`dictmultiobject.rs:362-398`), so the redundant walk would only
-/// duplicate work — and would mis-cast the module-dict layout to the
-/// regular `W_DictObject` shape (different field offsets for
-/// `entries` / `dstorage`).  Early-return for module dicts.
-fn dict_sync_dict_storage_proxy(dict: PyObjectRef) {
-    unsafe {
-        if dict.is_null() {
-            return;
-        }
-        if pyre_object::dictmultiobject::is_module_dict(dict) {
-            return;
-        }
-        let ns_ptr = pyre_object::w_dict_get_dict_storage_proxy(dict);
-        if ns_ptr.is_null() {
-            return;
-        }
-        let ns = &mut *(ns_ptr as *mut crate::DictStorage);
-        let entries = pyre_object::dictmultiobject::w_dict_object_storage(dict);
-        for (k, v) in entries {
-            if pyre_object::is_str(k.obj) {
-                let name = pyre_object::w_str_get_value(k.obj);
-                crate::dict_storage_store(ns, name, *v);
-            }
-        }
     }
 }
 

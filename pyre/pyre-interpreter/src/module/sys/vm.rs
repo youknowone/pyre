@@ -282,8 +282,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     // `frame.f_globals is globals()` (callee's scope) holds.  Pyre
     // mirrors the depth walk through `CURRENT_FRAME` + `f_back`,
     // populating the stub frame's attributes from the resolved
-    // PyFrame.  `f_globals` / `f_locals` flow through
-    // `dict_storage_to_dict` (canonical W_DictObject) so the
+    // PyFrame. `f_globals` / `f_locals` use the frame's canonical dict so the
     // `is module.__dict__` invariant survives sys._getframe access.
     module_ns_store(
         ns,

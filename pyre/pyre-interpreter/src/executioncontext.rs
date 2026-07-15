@@ -101,19 +101,6 @@ pub struct DictStorage {
     /// QuasiImmut watcher list. Only loops that depend on a specific
     /// slot are invalidated when that slot is overwritten.
     slot_watchers: Vec<Vec<std::sync::Weak<std::sync::atomic::AtomicBool>>>,
-    /// Optional W_DictObject to mirror str-keyed writes/deletes back
-    /// into.  When non-null, `insert(name, value)` also updates the
-    /// W_DictObject's entries Vec via `w_dict_setitem_str_no_proxy`
-    /// and `remove(name)` via `w_dict_delitem_str_no_proxy`.  The
-    /// no-proxy helpers skip the forward storage-store hook, so
-    /// pairing the W_DictObject's `dict_storage_proxy` with this
-    /// `mirror_target` produces a non-cyclic bidirectional sync —
-    /// the structural stand-in for PyPy's single `W_DictMultiObject`
-    /// (`pypy/objspace/std/dictmultiobject.py`) that owns both halves.
-    /// The exec/eval globals path uses this to drop the post-exec
-    /// drain loop entirely (`pypy/interpreter/pyopcode.py:771-776`
-    /// runs the frame on the user dict directly).
-    mirror_target: pyre_object::PyObjectRef,
 }
 
 impl Clone for DictStorage {
@@ -130,12 +117,6 @@ impl Clone for DictStorage {
             // Cloned storages start with no registered invalidation watchers,
             // but the per-slot shape must stay aligned with names/values.
             slot_watchers: vec![Vec::new(); self.names.len()],
-            // Cloned storages do not inherit a mirror target — the
-            // back-mirror is bound to a specific W_DictObject and
-            // copying the storage would have two storages racing for
-            // ownership of the same entries Vec.  Callers that need a
-            // mirror on the clone re-attach explicitly.
-            mirror_target: pyre_object::PY_NULL,
         }
     }
 }
@@ -154,38 +135,6 @@ impl DictStorage {
             length: 0,
             values,
             slot_watchers: Vec::new(),
-            mirror_target: pyre_object::PY_NULL,
-        }
-    }
-
-    /// Bind a W_DictObject as the back-mirror target for str-keyed
-    /// writes and deletes.  See the field doc-comment for the
-    /// PyPy-parity rationale.  Pass `pyre_object::PY_NULL` to detach.
-    #[inline]
-    pub fn set_mirror_target(&mut self, target: pyre_object::PyObjectRef) {
-        self.mirror_target = target;
-    }
-
-    /// Read the currently bound back-mirror target (`PY_NULL` when
-    /// none).  Provided for invariant assertions in tests / callers
-    /// that need to detach symmetrically.
-    #[inline]
-    pub fn mirror_target(&self) -> pyre_object::PyObjectRef {
-        self.mirror_target
-    }
-
-    /// Mutable handle to the `mirror_target` slot for in-place GC
-    /// forwarding (`None` when no mirror is bound).  The cached canonical
-    /// `W_DictObject` is GC-managed and reachable only through this off-GC
-    /// field, so an owner's root walk must forward it or a moving
-    /// collection relocates/reclaims the dict and leaves the cache
-    /// dangling.
-    #[inline]
-    pub fn mirror_target_slot_mut(&mut self) -> Option<&mut pyre_object::PyObjectRef> {
-        if self.mirror_target.is_null() {
-            None
-        } else {
-            Some(&mut self.mirror_target)
         }
     }
 
@@ -329,15 +278,6 @@ impl DictStorage {
         self.names.push(Wtf8Buf::from_string(name.to_string()));
         unsafe { self.push(value) };
         self.slot_watchers.push(Vec::new());
-        if !self.mirror_target.is_null() {
-            unsafe {
-                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                    self.mirror_target,
-                    name,
-                    value,
-                );
-            }
-        }
         value
     }
 
@@ -358,28 +298,11 @@ impl DictStorage {
             self.slot_watchers.push(Vec::new());
             None
         };
-        // Back-mirror to the bound W_DictObject so storage-side writes
-        // are visible to Python-level dict operations on the user dict
-        // (`exec("g['x']=1", g)` followed by `g['x']` succeeds without
-        // a post-exec drain).  The no-proxy variant skips the forward
-        // store hook so we don't bounce the same write back into
-        // `self`.
-        if !self.mirror_target.is_null() {
-            unsafe {
-                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                    self.mirror_target,
-                    &name,
-                    value,
-                );
-            }
-        }
         result
     }
 
     /// WTF-8 keyed store — surrogate-safe sibling of [`insert`].  The
-    /// back-mirror uses the WTF-8 no-proxy setter so a lone-surrogate
-    /// key reaches the bound `W_DictObject` (which is `ObjectKey`-keyed
-    /// and surrogate-safe).
+    /// key can be stored without requiring valid UTF-8.
     pub fn insert_wtf8(&mut self, name: Wtf8Buf, value: PyObjectRef) -> Option<PyObjectRef> {
         // Prebuilt-family store (see `get_or_insert_with`).
         pyre_object::gc_roots::mark_prebuilt_roots_dirty();
@@ -397,15 +320,6 @@ impl DictStorage {
             self.slot_watchers.push(Vec::new());
             None
         };
-        if !self.mirror_target.is_null() {
-            unsafe {
-                pyre_object::dictmultiobject::w_dict_setitem_wtf8_no_proxy(
-                    self.mirror_target,
-                    &name,
-                    value,
-                );
-            }
-        }
         result
     }
 
@@ -421,11 +335,6 @@ impl DictStorage {
         } else {
             None
         };
-        if !self.mirror_target.is_null() {
-            unsafe {
-                pyre_object::dictmultiobject::w_dict_delitem_str_no_proxy(self.mirror_target, name);
-            }
-        }
         result
     }
 
@@ -440,14 +349,6 @@ impl DictStorage {
         } else {
             None
         };
-        if !self.mirror_target.is_null() {
-            unsafe {
-                pyre_object::dictmultiobject::w_dict_delitem_wtf8_no_proxy(
-                    self.mirror_target,
-                    name,
-                );
-            }
-        }
         result
     }
 
@@ -578,9 +479,7 @@ pub fn register_generator_finalizer(obj: PyObjectRef) {
 
 /// Shared execution context for all frames in one interpreter run.
 ///
-/// Holds the builtin dict storage seed. Module-level frames call
-/// `fresh_dict_storage()` once to create a leaked globals dict;
-/// function calls share the globals pointer without cloning.
+/// Holds the builtin module dict used by module-level frames.
 #[derive(Clone)]
 pub struct ExecutionContext {
     pub space: PyObjectRef,
@@ -609,8 +508,7 @@ pub struct ExecutionContext {
     builtins_module: PyObjectRef,
     // `space.builtin.w_dict` is a single W_ModuleDictObject in PyPy
     // (`pypy/interpreter/baseobjspace.py:642`).  Pyre used to keep a
-    // parallel `builtins: DictStorage` snapshot here as the seed for
-    // `fresh_dict_storage`, but that snapshot froze the builtin set at
+    // parallel `builtins: DictStorage` snapshot here, but that snapshot froze the builtin set at
     // EC construction time — runtime mutations to `__builtins__`
     // weren't visible to new frames.  Reading the live storage from
     // `builtins_module` each call removes the double-storage gap.
@@ -662,16 +560,6 @@ impl Default for ExecutionContext {
 impl ExecutionContext {
     #[inline]
     pub fn new() -> Self {
-        // Register the storage ↔ W_DictObject sync hooks before any
-        // module / dict allocation observes a missed mirror.  PyPy's
-        // single `W_DictMultiObject` owns both views; pyre's split
-        // requires the hooks to be live so that early construction
-        // (`get_builtin()` calling `w_module_new("builtins", ns)` —
-        // which writes `__name__` via `w_dict_setitem_str`) propagates
-        // into the storage instead of silently being dropped on the
-        // floor.  `Once` makes this idempotent across multiple ECs.
-        static HOOKS_INSTALLED: std::sync::Once = std::sync::Once::new();
-        HOOKS_INSTALLED.call_once(crate::call::install_dict_storage_hooks);
         let builtins_module = crate::builtins::new_builtin_module_dict();
         pyre_object::gc_roots::pin_root(builtins_module);
         Self {
@@ -1460,61 +1348,12 @@ impl ExecutionContext {
         if !self.topframeref.is_null() {}
     }
 
-    /// Create a fresh module/global dict storage seeded with builtins.
-    ///
-    /// TODO vs `pypy/interpreter/main.py:43-45`: PyPy
-    /// emits `space.setitem(w_globals, '__builtins__', space.builtin)`
-    /// PyPy `pyopcode.py:773-774 setdefault('__builtins__', ...)` and
-    /// the `Module.__init__` flow seed a freshly-imported module's
-    /// dict with only `__builtins__`; reaching `print`/`len`/... is
-    /// the LOAD_GLOBAL builtins fallback path `pyopcode.py:918-927
-    /// frame.get_builtin().getdictvalue(...)`.  Pyre mirrors this
-    /// shape: the new storage starts empty and only the
-    /// `__builtins__` Module pointer is seeded.
-    ///
-    /// The caller is responsible for leaking the result via
-    /// `Box::into_raw` so it can be shared across frames as a raw
-    /// pointer.
-    pub fn fresh_dict_storage(&self) -> DictStorage {
-        // Read the live builtins from `self.builtins_module` so any
-        // runtime mutation of `__builtins__` is visible to subsequent
-        // frame globals — PyPy's `space.builtin.w_dict` is a single
-        // source of truth (`pypy/interpreter/baseobjspace.py:642`),
-        // and `pick_builtin` (`moduledef.py:89-109`) consults that
-        // same dict on every LOAD_GLOBAL fallback.
-        //
-        // The seed-vs-fallback choice is load-bearing for JIT-compiled
-        // trace stability: traces that read globals by name see the
-        // entries vector populated up-front, and the shape stays
-        // stable across frames so bridges can reconnect to the parent
-        // loop.  An empty-globals start triggers per-frame shape
-        // divergence and bridge-to-parent reconnect failures that
-        // cascade into blackhole interpretation of the whole user
-        // loop — that's the JIT-stability adaptation pyre keeps on
-        // top of upstream's lazy lookup.
-        let mut ns = DictStorage::new();
-        unsafe {
-            for (k, v) in pyre_object::w_dict_str_entries(self.builtins_module) {
-                crate::dict_storage_store(&mut ns, &k, v);
-            }
-        }
-        let w_builtin = self.get_builtin();
-        if !w_builtin.is_null() {
-            crate::dict_storage_store(&mut ns, "__builtins__", w_builtin);
-        }
-        ns
-    }
-
-    /// Proxy-less celldict globals for a fresh module (`__main__`, imported
-    /// source modules) — the `dict_storage_proxy`-free analog of
-    /// `fresh_dict_storage`.  Seeds the builtins + `__builtins__` directly into
+    /// Celldict globals for a fresh module (`__main__`, imported source
+    /// modules). Seeds the builtins + `__builtins__` directly into
     /// the `W_ModuleDictObject`'s authoritative cell storage so the JIT sees a
     /// stable globals shape up front (same seed-vs-fallback rationale as
-    /// `fresh_dict_storage`), and module `STORE_NAME` / `STORE_GLOBAL` skip the
-    /// legacy proxy fan-out — `maybe_sync_dict_storage_store` no-ops on a null
-    /// proxy, so the per-store `w_str_new` + `DictStorage::insert` +
-    /// back-mirror disappear (the `IntMutableCell` in-place write stands alone,
-    /// matching pypy's `ModuleDictStrategy`).
+    /// module dict. The `IntMutableCell` in-place write stands alone, matching
+    /// PyPy's `ModuleDictStrategy`.
     pub fn fresh_module_globals(&self) -> PyObjectRef {
         let dict = pyre_object::dictmultiobject::w_module_dict_new();
         // Root the fresh dict across the seeding loop: each
@@ -1560,11 +1399,7 @@ impl ExecutionContext {
         // W_ModuleDictObject in `self.builtins_module`; wrap it
         // through `w_module_new_aliasing_dict` without a raw storage
         // pointer (the strategy storage IS the canonical store).
-        let module = pyre_object::w_module_new_aliasing_dict(
-            "builtins",
-            std::ptr::null_mut(),
-            self.builtins_module,
-        );
+        let module = pyre_object::w_module_new_aliasing_dict("builtins", self.builtins_module);
         self.builtin_dict_cache.set(module);
         // `pypy/interpreter/baseobjspace.py:647` —
         // `self.setitem(self.builtin.w_dict, 'builtins',  w_builtin)`.
@@ -2494,25 +2329,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_fresh_dict_storage_clones_builtins_with_module_pointer() {
-        // Every freshly-created frame's globals start with the EC's
-        // builtins inlined (`print`, `abs`, ...), then `__builtins__`
-        // is set to the picked Module (so `pick_builtin` /
-        // `pyopcode.py:773-774` see a Module reference and
-        // `f_builtins` returns the Module's dict).
-        let ctx = PyExecutionContext::new();
-        let namespace = ctx.fresh_dict_storage();
-
-        let w_builtin = *namespace.get("__builtins__").unwrap();
-        unsafe {
-            assert!(pyre_object::is_module(w_builtin));
-        }
-        assert!(namespace.get("print").is_some());
-        assert!(namespace.get("range").is_some());
-        assert!(namespace.get("__name__").is_none());
-    }
-
-    #[test]
     fn test_namespace_slots_stay_stable_when_appending_names() {
         let mut namespace = DictStorage::new();
         namespace.insert("x".to_string(), pyre_object::w_int_new(1));
@@ -2525,8 +2341,8 @@ mod tests {
 
     #[test]
     fn test_namespace_slot_watchers_align_for_removal() {
-        let ctx = PyExecutionContext::new();
-        let mut namespace = ctx.fresh_dict_storage();
+        let mut namespace = DictStorage::new();
+        namespace.insert("__builtins__".to_string(), pyre_object::w_none());
 
         assert!(namespace.remove("__builtins__").is_some());
         assert!(namespace.get("__builtins__").is_none());

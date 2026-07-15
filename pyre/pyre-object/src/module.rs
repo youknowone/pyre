@@ -1,7 +1,6 @@
 //! `pypy/interpreter/module.py` — Python `module` type.
 //!
-//! A module holds a name (str) and a pointer to its backing dict storage.
-//! The storage holds all names defined in the module after execution.
+//! A module holds a name (str) and its backing dict object.
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
@@ -14,17 +13,10 @@ use crate::pyobject::*;
 /// `w_dict` mirrors PyPy `module.py:20 self.w_dict = w_dict` — every
 /// Module owns a non-null `W_DictObject` (or dict subclass instance
 /// for the user-supplied wrap case at `moduledef.py:102-103`).  For
-/// storage-only Modules pyre constructs a `W_DictObject` whose
-/// `dict_storage_proxy` points at the backing `DictStorage`, so reads
-/// on the wrapper fall through to the storage and `getdict(space)`
-/// returns a stable identity across calls.  For the user-supplied
+/// ordinary Modules pyre constructs a `W_ModuleDictObject`, so
+/// `getdict(space)` returns a stable identity across calls. For the user-supplied
 /// case `w_dict` is the caller's object directly, preserving subclass
 /// identity for `space.finditem_str` dispatch.
-///
-/// The PyPy-side `Module.dict` (the raw cell-strategy backing) lives
-/// inside `w_dict.dict_storage_proxy` for storage-backed Modules; pyre
-/// no longer carries a parallel `dict: *mut u8` field — single source
-/// of truth on the W_DictObject.
 #[repr(C)]
 pub struct Module {
     pub ob_header: PyObject,
@@ -56,37 +48,27 @@ impl crate::lltype::GcType for Module {
     const SIZE: usize = W_MODULE_OBJECT_SIZE;
 }
 
-/// Allocate a new Module backed by a `DictStorage`.  Use this
+/// Allocate a new Module backed by a fresh `W_ModuleDictObject`. Use this
 /// for `space.builtin`, freshly-imported modules, REPL `__main__`, and
-/// other Modules whose authoritative dict IS the storage.  The Module
-/// owns a `W_DictObject` whose `dict_storage_proxy` points at `dict_ptr`,
-/// so reads on the wrapper fall through to the storage and
-/// `getdict(space)` returns a stable identity across calls.
+/// other Modules whose authoritative namespace is their dict object.
 ///
 /// `module.py:24` — `if w_name is not None: setitem(w_dict, '__name__',
-/// w_name)`.  Pyre seeds `__name__` through `w_dict_setitem_str` which
-/// also propagates the entry into the proxy storage (so storage-keyed
-/// readers observe it without going through the `W_DictObject`).
+/// w_name)`. Pyre seeds `__name__` through `w_dict_setitem_str`.
 ///
 /// `name` — the module name (e.g. "math", "os.path"); empty string is
 ///   the anonymous-name sentinel for `pick_builtin`'s default Module
 ///   case (`moduledef.py:106-108`, PyPy `Module(space, None, ...)`)
 ///   in which `Module.__init__` skips the `__name__` setitem.
-/// `dict_ptr` — raw pointer to the module's backing dict storage; may
-///   be null only for tests and the anonymous default Module.
-pub fn w_module_new(name: &str, dict_ptr: *mut u8) -> PyObjectRef {
+pub fn w_module_new(name: &str) -> PyObjectRef {
     // `pypy/interpreter/module.py:18 Module.__init__` opens
     // `w_dict = space.newdict(module=True)` per `dictmultiobject.py:440-451
     // _newdict(module=True)`, which lands on `W_ModuleDictObject`
-    // (ModuleDictStrategy + cell-cache).  Pyre routes through
-    // `w_module_dict_new_with_storage_proxy` so the legacy
-    // `*mut DictStorage` mirror still surfaces via
-    // `W_ModuleDictObject.dict_storage_proxy` while
-    // `pypy/objspace/std/celldict.py` strategy semantics
+    // (ModuleDictStrategy + cell-cache). Pyre routes through
+    // `w_module_dict_new`; `pypy/objspace/std/celldict.py` strategy semantics
     // (`get_global_cache`, `invalidate_caches`,
     // `switch_to_object_strategy`) cover the module surface.
     let name_box = crate::lltype::malloc_raw(name.to_string());
-    let w_dict = crate::dictmultiobject::w_module_dict_new_with_storage_proxy(dict_ptr);
+    let w_dict = crate::dictmultiobject::w_module_dict_new();
     if !name.is_empty() {
         unsafe {
             crate::dictmultiobject::w_dict_setitem_str(w_dict, "__name__", crate::w_str_new(name));
@@ -107,11 +89,7 @@ pub fn w_module_new(name: &str, dict_ptr: *mut u8) -> PyObjectRef {
 /// module.Module(space, None, w_builtin)`: the Module's dict identity
 /// IS the user dict (PyPy `module.w_dict = w_builtin`).
 ///
-/// `dict_ptr` is optional.  When non-null, storage-keyed callers may
-/// reach that mirror via the `dict` field.  When null, the Module is
-/// still valid and callers must route through `w_dict` with the normal
-/// object-space operations.  The null-storage shape is the closer port
-/// of PyPy's `Module(space, None, w_builtin)` for dict subclasses:
+/// This is the direct port of PyPy's `Module(space, None, w_builtin)` for dict subclasses:
 /// `LOAD_GLOBAL` falls through to `space.finditem_str(module.w_dict,
 /// name)` so subclass `__getitem__` overrides are not bypassed.
 ///
@@ -132,21 +110,10 @@ pub fn w_module_new(name: &str, dict_ptr: *mut u8) -> PyObjectRef {
 /// the body performs an unported `lltype::malloc_typed` NewWithVtable
 /// (`Module`) that survives `fuse_boxing_alloc` unfused, so the JIT
 /// residualises the whole call to a stable runtime fnaddr instead of
-/// tracing the allocation — the `w_module_dict_new_with_storage_proxy`
-/// twin.  The `-> PyObjectRef` result is a plain GCREF with no
+/// tracing the allocation. The `-> PyObjectRef` result is a plain GCREF with no
 /// discriminant to erase.
 #[majit_macros::dont_look_inside]
-pub fn w_module_new_aliasing_dict(
-    name: &str,
-    _dict_ptr: *mut u8,
-    w_dict_object: PyObjectRef,
-) -> PyObjectRef {
-    // `_dict_ptr` retained in the signature for caller-site clarity:
-    // the PyPy `module.Module(space, None, w_builtin)` shape carries
-    // the original dict identity in `w_dict_object`; the parallel
-    // `dict: *mut u8` field has been retired in favour of
-    // `w_dict_object.dict_storage_proxy` (`w_module_get_dict_ptr`
-    // resolves it through the W_DictObject).
+pub fn w_module_new_aliasing_dict(name: &str, w_dict_object: PyObjectRef) -> PyObjectRef {
     if !name.is_empty() && !w_dict_object.is_null() && unsafe { crate::is_dict(w_dict_object) } {
         unsafe {
             crate::dictmultiobject::w_dict_setitem_str(
@@ -185,54 +152,6 @@ pub unsafe fn w_module_get_name(obj: PyObjectRef) -> &'static str {
 pub unsafe fn w_module_set_name(obj: PyObjectRef, name: &str) {
     let module = &mut *(obj as *mut Module);
     module.name = crate::lltype::malloc_raw(name.to_string());
-}
-
-/// Get the module's backing `DictStorage` pointer (`*mut u8`).
-///
-/// Resolves through `w_dict.dict_storage_proxy` — pyre no longer carries a
-/// parallel `Module.dict` field; the storage identity is owned by the
-/// `W_DictObject` and the proxy slot is the single source.
-///
-/// # Returning null
-///
-/// - `module.w_dict` is null (uninitialised Module — should not happen
-///   in production paths).
-/// - `module.w_dict` is a non-`W_DictObject` (dict subclass instance —
-///   `pypy/module/__builtin__/moduledef.py:102-103
-///   Module(space, None, w_builtin)` parity for the `__builtins__` of
-///   `exec` with a custom dict subclass).  PyPy's `Module.getdict()`
-///   returns the user-supplied subclass directly; pyre's storage-keyed
-///   helpers (`dict_storage_get` / `_store`) cannot operate on a
-///   subclass instance, so callers fall back to
-///   `space.finditem_str(w_module.w_dict, name)` via
-///   `w_module_get_w_dict` for that case.  Callers that *must* reach
-///   the underlying str-keyed map should use `w_module_get_w_dict`
-///   and dispatch through the W_DictObject API; the storage_ptr is a
-///   fast-path, not a complete replacement for PyPy's `Module.getdict()`.
-///
-/// PyPy parity: `pypy/interpreter/module.py:77 Module.getdict()`
-/// returns the W_DictMultiObject directly.  Pyre's
-/// `w_module_get_w_dict` is the closer equivalent;
-/// `w_module_get_dict_ptr` returns the storage-keyed fast path that
-/// only exists for storage-backed Modules.
-///
-/// # Safety
-/// `obj` must point to a valid `Module`.
-pub unsafe fn w_module_get_dict_ptr(obj: PyObjectRef) -> *mut u8 {
-    let module = &*(obj as *const Module);
-    if module.w_dict.is_null() {
-        return std::ptr::null_mut();
-    }
-    // Accept both `W_DictObject` (legacy storage-backed Modules) and
-    // `W_ModuleDictObject` (`space.newdict(module=True)` per
-    // `module.py:18`).  Dict subclass instances reach `w_dict_get_dict_
-    // storage_proxy` only when they expose a real backing dict;
-    // arbitrary subclasses still bail out here so storage-keyed
-    // helpers (`dict_storage_get`/`_store`) stay safe.
-    if !crate::is_dict(module.w_dict) && !crate::dictmultiobject::is_module_dict(module.w_dict) {
-        return std::ptr::null_mut();
-    }
-    crate::dictmultiobject::w_dict_get_dict_storage_proxy(module.w_dict)
 }
 
 /// Get the aliased `W_DictObject` (`PY_NULL` when storage-only).
@@ -290,12 +209,11 @@ mod tests {
 
     #[test]
     fn test_module_create_and_check() {
-        let obj = w_module_new("test_mod", std::ptr::null_mut());
+        let obj = w_module_new("test_mod");
         unsafe {
             assert!(is_module(obj));
             assert!(!is_int(obj));
             assert_eq!(w_module_get_name(obj), "test_mod");
-            assert!(w_module_get_dict_ptr(obj).is_null());
         }
     }
 }

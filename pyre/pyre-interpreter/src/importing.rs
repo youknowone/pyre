@@ -18,8 +18,8 @@ use std::path::PathBuf;
 #[cfg(feature = "host_env")]
 use std::path::Path;
 
+use crate::PyExecutionContext;
 use crate::{CodeObject, Mode, PyFrame, compile_source_with_filename};
-use crate::{DictStorage, PyExecutionContext};
 use pyre_object::*;
 use rustpython_wtf8::Wtf8Buf;
 
@@ -860,7 +860,7 @@ fn load_builtin_module(name: &str) -> Option<PyObjectRef> {
             }
         }
     }
-    let module = pyre_object::w_module_new_aliasing_dict(name, std::ptr::null_mut(), w_dict);
+    let module = pyre_object::w_module_new_aliasing_dict(name, w_dict);
     // `pypy/interpreter/baseobjspace.py:647` installs the self
     // reference `space.builtin.w_dict['__builtins__'] = space.builtin`
     // so user code can reach the builtins module through
@@ -1603,15 +1603,6 @@ impl AppleveldefNamespace for PyObjectRef {
     }
 }
 
-// `reduce_protocol.rs` deliberately retains its leaked DictStorage scratch
-// until S5. Keep that caller source-identical while module initializers move
-// to the PyObjectRef implementation above.
-impl AppleveldefNamespace for &mut DictStorage {
-    fn store(&mut self, name: &str, value: PyObjectRef) {
-        crate::dict_storage_store(self, name, value);
-    }
-}
-
 pub fn appleveldef_install(
     mut ns: impl AppleveldefNamespace,
     source: &str,
@@ -1723,8 +1714,7 @@ fn load_source_module(
     // PyPy: load_source_module → set_sys_modules BEFORE exec_code_module.
     // This prevents infinite recursion on circular imports.
     let canonical = w_globals;
-    let module =
-        pyre_object::w_module_new_aliasing_dict(modulename, std::ptr::null_mut(), canonical);
+    let module = pyre_object::w_module_new_aliasing_dict(modulename, canonical);
     set_sys_module(modulename, module);
 
     // PyPy `importing.py:300` passes `pathname`/`cpathname` to
@@ -1810,8 +1800,7 @@ fn load_namespace_package(
         pyre_object::w_dict_setitem_str(w_globals, "__path__", pyre_object::w_list_new(path_items));
     }
 
-    let module =
-        pyre_object::w_module_new_aliasing_dict(modulename, std::ptr::null_mut(), w_globals);
+    let module = pyre_object::w_module_new_aliasing_dict(modulename, w_globals);
     set_sys_module(modulename, module);
     Ok(module)
 }

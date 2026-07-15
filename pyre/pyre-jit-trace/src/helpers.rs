@@ -1312,9 +1312,7 @@ pub fn emit_new_pyframe_inline_self_recursive(
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, pycode], code_descr);
     ctx.heapcache_setfield_cached(new_frame, code_idx, pycode);
 
-    // pyframe.py:49 `self.w_globals = w_globals` — store the canonical
-    // W_DictObject (w_globals).  frame_get_namespace chases through
-    // dict_storage_proxy to reach the underlying DictStorage.
+    // pyframe.py:49 `self.w_globals = w_globals` — store the canonical dict.
     let globals_obj_descr = pyframe_w_globals_obj_descr();
     let globals_obj_idx = globals_obj_descr.index();
     ctx.record_op_with_descr(

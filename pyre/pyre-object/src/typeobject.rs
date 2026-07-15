@@ -242,8 +242,8 @@ thread_local! {
     /// Builtin types (`w_type_new_builtin`) are created before the GC is
     /// built and remain `malloc_typed` Box-immortal, so the collector never
     /// fires their `W_TYPE_GC_TYPE_ID` custom trace.  Their namespaces can
-    /// still acquire young GC children after boot, including the cached
-    /// `type.__dict__` `mirror_target` and subclass weakrefs.  This registry
+    /// still acquire young GC children after boot, including type-dict values
+    /// and subclass weakrefs. This registry
     /// roots those children on each collection.  It also covers the rare
     /// pre-GC immortal fallback from `w_type_new` when no GC hook is installed.
     /// Heap types allocated after GC startup are GC-managed instead and are
@@ -433,12 +433,10 @@ pub fn w_type_new_builtin(
         flag_disallow_instantiation: std::sync::atomic::AtomicBool::new(false),
         flag_abstract: std::sync::atomic::AtomicBool::new(false),
     }) as PyObjectRef;
-    // A builtin type is Box-immortal, so its namespace values, `bases`, and
-    // the lazily-cached `type.__dict__` `mirror_target` are reachable only
+    // A builtin type is Box-immortal, so its namespace values and `bases` are reachable only
     // through `walk_builtin_type_dicts_gc` (`pyre_interpreter::eval`).
     // Register it so that walk forwards them; without this a
-    // collection reclaims the cached `__dict__` wrapper and the next
-    // `cls.__dict__` access reads a dangling pointer.
+    // collection could otherwise reclaim a young namespace value.
     register_builtin_type_roots(w_type as usize);
     w_type
 }

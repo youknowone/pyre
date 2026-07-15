@@ -553,9 +553,9 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     );
     push_alias_pair(
         &mut entries,
-        "pyre_object::dictmultiobject::w_module_dict_new_with_storage_proxy",
-        "pyre_object::w_module_dict_new_with_storage_proxy",
-        pyre_object::dictmultiobject::w_module_dict_new_with_storage_proxy as *const (),
+        "pyre_object::dictmultiobject::w_module_dict_new",
+        "pyre_object::w_module_dict_new",
+        pyre_object::dictmultiobject::w_module_dict_new as *const (),
     );
     push_alias_pair(
         &mut entries,
@@ -722,26 +722,12 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         crate::call::bump_frame_entry_count as *const (),
     );
     // The dispatch-loop safepoint entry itself reads `ALLOC_SINCE_GC` inline and
-    // dispatches to the collection hook, and `maybe_sync_dict_storage_store`
-    // stores through the `DICT_STORAGE_STORE_HOOK` fn-pointer cell — both
-    // runtime-mutable, `()`-returning, cannot-raise, word-argument residuals
-    // (`#[dont_look_inside]`), bound by qualified path.
+    // dispatches to the collection hook.
     push_alias_pair(
         &mut entries,
         "pyre_object::gc_interp::safepoint",
         "pyre_object::safepoint",
         pyre_object::gc_interp::safepoint as *const (),
-    );
-    let maybe_sync_dict_storage_store: unsafe fn(
-        *mut u8,
-        pyre_object::PyObjectRef,
-        pyre_object::PyObjectRef,
-    ) = pyre_object::dictmultiobject::maybe_sync_dict_storage_store;
-    push_alias_pair(
-        &mut entries,
-        "pyre_object::dictmultiobject::maybe_sync_dict_storage_store",
-        "pyre_object::maybe_sync_dict_storage_store",
-        maybe_sync_dict_storage_store as *const (),
     );
     // `jit_bigint_div` / `jit_bigint_rem` residualize the `div_rem()` tuple
     // synth (`front::bigint_div_rem`): the foreign malachite `div_rem` returns
@@ -2393,18 +2379,6 @@ mod tests {
         let safepoint = pyre_object::gc_interp::safepoint as *const () as usize as i64;
         assert_eq!(bindings["pyre_object::gc_interp::safepoint"], safepoint);
         assert_eq!(bindings["pyre_object::safepoint"], safepoint);
-
-        let store_sync: unsafe fn(*mut u8, pyre_object::PyObjectRef, pyre_object::PyObjectRef) =
-            pyre_object::dictmultiobject::maybe_sync_dict_storage_store;
-        let store_sync = store_sync as *const () as usize as i64;
-        assert_eq!(
-            bindings["pyre_object::dictmultiobject::maybe_sync_dict_storage_store"],
-            store_sync
-        );
-        assert_eq!(
-            bindings["pyre_object::maybe_sync_dict_storage_store"],
-            store_sync
-        );
     }
 
     /// `is_pyframe_operand_stack_accessor` must recognise the funcptr the

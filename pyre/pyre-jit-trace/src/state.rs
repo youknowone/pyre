@@ -2628,9 +2628,6 @@ pub(crate) fn frame_locals_cells_stack_descr() -> DescrRef {
     crate::descr::pyframe_locals_cells_stack_descr()
 }
 
-// R3.3: frame_dict_storage_descr retired — frame_get_namespace now
-// reads through w_globals → dict_storage_proxy.
-
 pub(crate) fn wrapint(ctx: &mut TraceCtx, value: OpRef) -> OpRef {
     let boxed =
         crate::helpers::emit_box_int_inline(ctx, value, w_int_size_descr(), int_intval_descr());
@@ -3511,9 +3508,8 @@ pub(crate) fn trace_float_block_setitem_value(
 }
 
 /// pyframe.py:49 `self.w_globals` — read the canonical dict object
-/// from the frame.  Returns a PyObjectRef (W_DictObject or
-/// W_ModuleDictObject).  FFI helpers that receive namespace_ptr
-/// chase dict_storage_proxy internally.
+/// from the frame. Returns a PyObjectRef (W_DictObject or
+/// W_ModuleDictObject).
 pub(crate) fn frame_get_globals_obj(ctx: &mut TraceCtx, frame: OpRef) -> OpRef {
     ctx.record_op_with_descr(
         OpCode::GetfieldGcR,
@@ -3522,9 +3518,6 @@ pub(crate) fn frame_get_globals_obj(ctx: &mut TraceCtx, frame: OpRef) -> OpRef {
     )
 }
 
-/// Read through w_globals → dict_storage_proxy to reach the raw
-/// DictStorage* for slot-based namespace reads (celldict quasiimmut
-/// path).  Only valid when globals is a W_ModuleDictObject.
 /// Read a value from the unified `locals_cells_stack_w` at the given absolute index.
 pub fn concrete_stack_value(frame: usize, abs_idx: usize) -> Option<PyObjectRef> {
     let frame_ptr = (frame != 0).then_some(frame as *const u8)?;
@@ -3649,8 +3642,7 @@ pub(crate) fn callee_layout_for_call_assembler(
 }
 
 /// `celldict.py:42-50 getdictvalue_no_unwrapping` slot lookup against the
-/// module dict's `ModuleDictStorage` (the cell store), bypassing the
-/// `DictStorage` shadow.  `None` for non-module dicts and after
+/// module dict's `ModuleDictStorage` (the cell store). `None` for non-module dicts and after
 /// `switch_to_object_strategy`.  Used by the cell fast path to derive the
 /// elidable lookup key.
 pub(crate) fn module_dict_cell_slot_direct(obj: PyObjectRef, name: &str) -> Option<usize> {
@@ -5302,8 +5294,7 @@ impl PyreJitState {
             return 0;
         }
         // `dictmultiobject.py:107-109 W_DictMultiObject.length`. The common
-        // module-dict case reads `ModuleDictStorage` directly (O(1), no
-        // `dict_storage_proxy` reconciliation) — this guard is on the
+        // module-dict case reads `ModuleDictStorage` directly (O(1)) — this guard is on the
         // per-portal-entry path. Plain dict globals (exec/eval) fall back to
         // the polymorphic strategy length.
         unsafe {
