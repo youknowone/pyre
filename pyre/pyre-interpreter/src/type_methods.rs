@@ -4767,6 +4767,17 @@ pub(crate) fn set_discard_checked(
     }
 }
 
+/// Test membership in a set, hashing the element through the protocol.
+pub(crate) fn set_contains_checked(
+    set: PyObjectRef,
+    item: PyObjectRef,
+) -> Result<bool, crate::PyError> {
+    unsafe {
+        pyre_object::setobject::w_set_contains_checked(set, item)
+            .map_err(|_| crate::baseobjspace::take_pending_hash_error())
+    }
+}
+
 pub fn dict_method_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "get", 1)?;
     let dict = resolve_dict_backing(args[0]);

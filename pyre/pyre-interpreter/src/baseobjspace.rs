@@ -11818,7 +11818,7 @@ pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Resul
         }
         // set / frozenset (setobject.py W_BaseSetObject.descr_contains)
         if pyre_object::is_set_or_frozenset(haystack) {
-            return Ok(pyre_object::w_set_contains(haystack, needle));
+            return crate::typedef::set_descr_contains(haystack, needle);
         }
     }
     // Instance __contains__ — PyPy: descroperation.py contains_w

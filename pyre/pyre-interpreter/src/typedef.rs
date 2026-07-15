@@ -14802,6 +14802,76 @@ fn init_bytearray_type(ns: PyObjectRef) {
 // pyre splits the shared methods through `init_setlike_common` so the
 // frozenset typedef can omit the in-place mutators.
 
+/// `setobject.py:1726 _convert_set_to_frozenset` — a set is unhashable, but
+/// it stands in for the frozenset holding the same elements when it is used
+/// to look one up. Returns `None` for anything that is not a set, leaving the
+/// caller to re-raise. Upstream hands the strategy and storage to the new
+/// frozenset rather than copying; the elements hashed when they entered the
+/// set, so sharing them cannot raise.
+fn convert_set_to_frozenset(w_obj: PyObjectRef) -> Option<PyObjectRef> {
+    unsafe {
+        if !pyre_object::is_set(w_obj) {
+            return None;
+        }
+        Some(pyre_object::w_frozenset_from_items(
+            &pyre_object::w_set_items(w_obj),
+        ))
+    }
+}
+
+/// `setobject.py:842-844 EmptySetStrategy.has_key` hashes the key ("make sure
+/// the key is hashable, issue 3824"), so membership hashes even against an
+/// empty set, unlike removal.
+///
+/// `setobject.py:231 W_BaseSetObject.descr_contains`.
+pub(crate) fn set_descr_contains(
+    w_set: PyObjectRef,
+    w_other: PyObjectRef,
+) -> Result<bool, crate::PyError> {
+    match crate::type_methods::set_contains_checked(w_set, w_other) {
+        Ok(found) => Ok(found),
+        Err(e) => {
+            if e.kind == crate::PyErrorKind::TypeError {
+                if let Some(w_f) = convert_set_to_frozenset(w_other) {
+                    return crate::type_methods::set_contains_checked(w_set, w_f);
+                }
+            }
+            Err(e)
+        }
+    }
+}
+
+/// `setobject.py:830-831 EmptySetStrategy.remove` returns False without
+/// hashing, so an empty set removes nothing and never raises. Every other
+/// strategy hashes; pyre carries no strategies, so the length stands in for
+/// the strategy dispatch.
+fn set_remove(w_set: PyObjectRef, w_item: PyObjectRef) -> Result<bool, crate::PyError> {
+    if unsafe { pyre_object::w_set_len(w_set) } == 0 {
+        return Ok(false);
+    }
+    crate::type_methods::set_discard_checked(w_set, w_item)
+}
+
+/// Discard an element from a set, with automatic conversion to frozenset if
+/// the argument is a set. Returns true if successfully removed.
+///
+/// `setobject.py:452 W_BaseSetObject._discard_from_set`. Upstream's trailing
+/// `switch_to_empty_strategy` has no counterpart here.
+fn set_discard_from_set(w_set: PyObjectRef, w_item: PyObjectRef) -> Result<bool, crate::PyError> {
+    match set_remove(w_set, w_item) {
+        Ok(deleted) => Ok(deleted),
+        Err(e) => {
+            if e.kind != crate::PyErrorKind::TypeError {
+                return Err(e);
+            }
+            match convert_set_to_frozenset(w_item) {
+                None => Err(e),
+                Some(w_f) => set_remove(w_set, w_f),
+            }
+        }
+    }
+}
+
 fn init_setlike_common(ns: PyObjectRef) {
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
@@ -14815,9 +14885,9 @@ fn init_setlike_common(ns: PyObjectRef) {
                     }
                     unsafe {
                         if pyre_object::is_set_or_frozenset(args[0]) {
-                            return Ok(pyre_object::w_bool_from(pyre_object::w_set_contains(
+                            return Ok(pyre_object::w_bool_from(set_descr_contains(
                                 args[0], args[1],
-                            )));
+                            )?));
                         }
                     }
                     Ok(pyre_object::w_bool_from(false))
@@ -15515,7 +15585,7 @@ fn init_set_type(ns: PyObjectRef) {
                 "discard",
                 |args| {
                     if args.len() >= 2 {
-                        unsafe { pyre_object::w_set_discard(args[0], args[1]) };
+                        set_discard_from_set(args[0], args[1])?;
                     }
                     Ok(pyre_object::w_none())
                 },
@@ -15533,8 +15603,7 @@ fn init_set_type(ns: PyObjectRef) {
                     if args.len() < 2 {
                         return Err(crate::PyError::type_error("remove() requires an argument"));
                     }
-                    let removed = unsafe { pyre_object::w_set_discard(args[0], args[1]) };
-                    if !removed {
+                    if !set_discard_from_set(args[0], args[1])? {
                         return Err(crate::PyError::key_error_with_key(args[1]));
                     }
                     Ok(pyre_object::w_none())
