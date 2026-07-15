@@ -3782,6 +3782,46 @@ extern "C" fn gc_alloc_nursery_shim(size: u64) -> u64 {
     with_cranelift_gc_required(|gc| gc.alloc_nursery(size as usize).0 as u64)
 }
 
+fn try_headerless_nursery_bump(gc: &mut dyn GcAllocator, size: usize) -> Option<u64> {
+    let nf_addr = gc.nursery_free_addr();
+    let nt_addr = gc.nursery_top_addr();
+    if nf_addr == 0 || nt_addr == 0 {
+        return None;
+    }
+
+    unsafe {
+        let nf = nf_addr as *mut usize;
+        let nt = nt_addr as *const usize;
+        let free = nf.read();
+        let top = nt.read();
+        let new_free = free.checked_add(size)?;
+        if new_free > top {
+            return None;
+        }
+        nf.write(new_free);
+        Some(free as u64)
+    }
+}
+
+/// Headerless nursery overflow helper.  Returns the raw allocation base with
+/// no GC header, matching the dynasm headerless fast-path contract.
+extern "C" fn gc_alloc_nursery_headerless_shim(size: u64) -> u64 {
+    with_cranelift_gc_required(|gc| {
+        let size = size as usize;
+        if let Some(base) = try_headerless_nursery_bump(gc, size) {
+            return base;
+        }
+        gc.collect_nursery();
+        if let Some(base) = try_headerless_nursery_bump(gc, size) {
+            return base;
+        }
+
+        let layout = std::alloc::Layout::from_size_align(size, 8)
+            .unwrap_or_else(|_| std::alloc::Layout::new::<u8>());
+        unsafe { std::alloc::alloc_zeroed(layout) as u64 }
+    })
+}
+
 /// Plain malloc fallback for New() when no GC runtime is configured.
 extern "C" fn plain_malloc_zeroed_shim(size: u64) -> u64 {
     let layout = std::alloc::Layout::from_size_align(size as usize, 8)
@@ -11901,7 +11941,34 @@ impl CraneliftBackend {
 
                 // ── GC allocation calls ──
                 OpCode::CallMallocNurseryHeaderless => {
-                    unreachable!("headerless nursery alloc is aheui-dynasm-only");
+                    if !cranelift_gc_active() {
+                        return Err(missing_gc_runtime(op.opcode));
+                    }
+                    let size = resolve_opref_or_imm(
+                        &mut builder,
+                        &constants,
+                        &known_values,
+                        op.arg(0).to_opref(),
+                    );
+                    let result = emit_collecting_gc_call(
+                        &mut builder,
+                        ptr_type,
+                        call_conv,
+                        jf_ptr,
+                        &ref_root_slots,
+                        &defined_ref_vars,
+                        &stale_ref_vars,
+                        &demoted_failarg_slots,
+                        ref_root_base_ofs,
+                        per_call_gcmap,
+                        gc_alloc_nursery_headerless_shim as *const () as usize,
+                        &[size],
+                        Some(cl_types::I64),
+                    )
+                    .expect("headerless nursery allocation helper must return a value");
+                    jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                    builder.ins().set_pinned_reg(jf_ptr);
+                    builder.def_var(var(vi), result);
                 }
                 OpCode::CallMallocNursery => {
                     // x86/assembler.py:2556-2565 malloc_cond parity.
