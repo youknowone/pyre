@@ -2036,13 +2036,12 @@ impl<S: JitState> JitDriver<S> {
                 // Successful compile-into-existing-target: raise_if_successful()
                 // raises ContinueRunningNormally (pyjitpl.py:3095-3123), which
                 // bypasses the `except SwitchToBlackhole` handler, so only the
-                // live history teardown runs — `aborted_tracing` accounting is
-                // NOT reached on success (the loop/bridge counter was already
-                // bumped at backend-compile time). Call the live-teardown half
-                // only, not the accounting half.
-                self.meta.abort_trace_live(false);
+                // successful live history teardown runs — `aborted_tracing`
+                // accounting is NOT reached on success (the loop/bridge counter
+                // was already bumped at backend-compile time).
+                self.meta.finish_trace_live();
                 // No aborted_tracing follows on success, so drop the
-                // pending_abort_* payload abort_trace_live staged (else it
+                // pending_abort_* payload finish_trace_live staged (else it
                 // attaches this key to a later, unrelated abort's hook).
                 self.meta.clear_pending_abort();
                 self.sym = None;
