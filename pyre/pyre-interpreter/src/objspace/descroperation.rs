@@ -82,6 +82,36 @@ fn bigint_lshift(a: BigInt, shift: usize) -> BigInt {
     a << shift
 }
 
+/// `longobject.py` left shift — the underlying big-int `<<` aborts the process
+/// when the shifted result cannot be allocated, so pre-flight a fallible
+/// reservation of the result's 64-bit limbs and raise a catchable MemoryError
+/// instead. The probe uses the same global allocator and a limb count that
+/// upper-bounds the shift's own allocation, so it fails exactly when the real
+/// shift would.
+fn checked_bigint_lshift(a: BigInt, shift: u64) -> Result<BigInt, PyError> {
+    let result_bits = a.bits().saturating_add(shift);
+    let limbs = (result_bits / 64).saturating_add(2);
+    // The shift and the result's limb count must both fit a machine word
+    // (`usize` is 32-bit on wasm), so anything exceeding it is unallocatable.
+    let shift = match usize::try_from(shift) {
+        Ok(s) => s,
+        Err(_) => return Err(PyError::new(PyErrorKind::MemoryError, "")),
+    };
+    let reservable = match usize::try_from(limbs) {
+        Ok(n) => {
+            let mut probe: Vec<u64> = Vec::new();
+            let ok = probe.try_reserve_exact(n).is_ok();
+            drop(probe);
+            ok
+        }
+        Err(_) => false,
+    };
+    if !reservable {
+        return Err(PyError::new(PyErrorKind::MemoryError, ""));
+    }
+    Ok(bigint_lshift(a, shift))
+}
+
 #[majit_macros::elidable]
 fn bigint_rshift(a: BigInt, shift: usize) -> BigInt {
     a >> shift
@@ -911,7 +941,7 @@ unsafe fn int_lshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     // happily returns a wrapped result when the VALUE overflows (e.g.
     // `(10**18) << 4`). Detect real value overflow by computing the shift
     // in BigInt and demoting to i64 only when the result fits.
-    let big = bigint_lshift(BigInt::from(va), vb as usize);
+    let big = checked_bigint_lshift(BigInt::from(va), vb as u64)?;
     Ok(bigint_result(big))
 }
 
@@ -943,7 +973,7 @@ unsafe fn long_lshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     // when the count exceeds i64::MAX → 0 if base is zero, OverflowError
     // otherwise.
     let shift = if jit_bigint_to_i64_fits(&vb) != 0 {
-        jit_bigint_to_i64_value(&vb) as usize
+        jit_bigint_to_i64_value(&vb) as u64
     } else {
         let va = as_bigint(a);
         if pyre_object::longobject::jit_bigint_sign_i64(&va) == 0 {
@@ -951,7 +981,7 @@ unsafe fn long_lshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         }
         return Err(PyError::overflow_error("shift count too large"));
     };
-    Ok(bigint_result(bigint_lshift(as_bigint(a), shift)))
+    Ok(bigint_result(checked_bigint_lshift(as_bigint(a), shift)?))
 }
 
 unsafe fn long_rshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
