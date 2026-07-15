@@ -1561,6 +1561,25 @@ fn handler_entry_has_lasti_exception_slots(
     })
 }
 
+/// True when an explicit raise can enter this cleanup handler.  Its
+/// propagated value is already in the durable frame stack slot; a reraise
+/// instead continues to use the live exception payload supplied by the
+/// exception edge.
+fn handler_entry_has_explicit_raise_source(
+    code: &CodeObject,
+    catch_sites: &[ExceptionCatchSite],
+    handler_py_pc: usize,
+) -> bool {
+    catch_sites.iter().any(|site| {
+        site.handler_py_pc == handler_py_pc
+            && site.push_lasti
+            && matches!(
+                pyre_interpreter::decode_instruction_at(code, site.lasti_py_pc),
+                Some((Instruction::RaiseVarargs { .. }, _))
+            )
+    })
+}
+
 fn initialize_spam_block(
     code: &CodeObject,
     graph: &mut super::flow::FunctionGraph,
@@ -7334,13 +7353,46 @@ impl CodeWriter {
                         && handler_entry_has_lasti_exception_slots(&catch_sites, py_pc)
                     {
                         if let Some(exc_value) = current_state.stack.last().cloned() {
-                            record_graph_op(
-                                &current_block.block(),
-                                "last_exc_value",
-                                Vec::new(),
-                                Some(exc_value),
-                                py_pc as i64,
-                            );
+                            if matches!(
+                                pyre_interpreter::decode_instruction_at(code, py_pc),
+                                Some((Instruction::Copy { .. }, _))
+                            ) && handler_entry_has_explicit_raise_source(
+                                code,
+                                &catch_sites,
+                                py_pc,
+                            ) {
+                                // Catch dispatch has already stored the
+                                // propagated exception in the frame's top stack
+                                // slot.  Reload that durable slot while giving
+                                // the shadow graph the definition it needs to
+                                // keep the exception and lasti colours distinct.
+                                // Re-reading `last_exc_value` is not sound after
+                                // a clearing residual, and the current-exception
+                                // slot can still name the older exception whose
+                                // handler raised this one.
+                                let stack_slot =
+                                    stack_base_absolute + current_depth.saturating_sub(1) as usize;
+                                let stack_idx: super::flow::FlowValue =
+                                    super::flow::Constant::signed(stack_slot as i64).into();
+                                record_graph_op(
+                                    &current_block.block(),
+                                    "getarrayitem_vable_r",
+                                    vable_getarrayitem_ref_graph_args(
+                                        frame_var.into(),
+                                        stack_idx.into(),
+                                    ),
+                                    Some(exc_value),
+                                    py_pc as i64,
+                                );
+                            } else {
+                                record_graph_op(
+                                    &current_block.block(),
+                                    "last_exc_value",
+                                    Vec::new(),
+                                    Some(exc_value),
+                                    py_pc as i64,
+                                );
+                            }
                         }
                     }
                     // The walker emits one block-identity `Label(block)`

@@ -21123,6 +21123,19 @@ fn try_walker_trace_raise_builtin(
         &[exc_op, active],
         crate::descr::w_exception_context_descr(kind),
     );
+    // The full-body walk is also the authoritative execution of the
+    // tracing iteration.  Apply the same context write to its concrete,
+    // freshly-built exception that the recorded SETFIELD performs on later
+    // compiled iterations; otherwise Python code reached later in this walk
+    // observes a missing __context__ exactly once, while the trace itself is
+    // correct.  This object is private to the inline construction, so no
+    // rollback journal is needed.
+    let active_concrete = pyre_interpreter::eval::get_current_exception();
+    if !active_concrete.is_null() {
+        unsafe {
+            pyre_object::interp_exceptions::w_exception_set_context(exc, active_concrete);
+        }
+    }
 
     // The normalized publish result is the same flat builtin instance;
     // forward the inline-built exc OpRef (carrying its concrete shadow)
