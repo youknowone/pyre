@@ -20,8 +20,14 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 EXE = ".exe" if sys.platform == "win32" else ""
-PYTHON3 = os.environ.get("PYRE_CHECK_PYTHON3") or (
-    "python3" if shutil.which("python3") else "python"
+# pyre's compat target is CPython 3.14; its native modules (`_sre.MAGIC`) and the
+# vendored `lib-python/3` are coupled to that version. Prefer a version-matched
+# oracle so a stale `python3` on PATH (an older system CPython) does not diverge
+# from pypy on version-sensitive error text and trip a spurious cpython-vs-pypy
+# baseline mismatch.
+PYTHON3 = os.environ.get("PYRE_CHECK_PYTHON3") or next(
+    (cand for cand in ("python3.14", "python3", "python") if shutil.which(cand)),
+    "python3",
 )
 PYPY3 = os.environ.get("PYRE_CHECK_PYPY3") or (
     "pypy3" if shutil.which("pypy3") else "pypy"
