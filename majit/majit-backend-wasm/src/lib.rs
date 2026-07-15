@@ -1736,31 +1736,6 @@ impl majit_backend::Backend for WasmBackend {
         let bridge_has_trampoline_calls =
             codegen::has_trampoline_calls(inputargs, ops, ca_candidate);
 
-        // Decline exception-resume bridges (`GuardException`): the guarded call
-        // raised, so the bridge resumes into the exception handler by re-entering
-        // the interpreter at the raising bytecode. That re-entry reads the
-        // pre-call operand stack, whose constant entries (e.g. a float dividend)
-        // live only in the guard's `rd_consts` resume data, not in a spilled
-        // frame slot. The compiled bridge reconstructs its state from inputargs
-        // (spilled slots) alone and cannot see `rd_consts`, so such a constant
-        // materialises as NULL and the re-entered interpreter runs e.g.
-        // `truediv(NULL, int)`, raising a spurious `unsupported operand type(s)
-        // for /`. Declining routes the deopt through the blackhole interpreter,
-        // which rematerialises constants from `rd_consts` (the native path).
-        // Non-raising (`GuardNoException`) loop-closing bridges keep their
-        // compiled fast path — the CallMayForce bridges wasm relies on for speed
-        // are unaffected, so this does not regress them.
-        if ops
-            .iter()
-            .any(|op| op.opcode == majit_ir::OpCode::GuardException)
-        {
-            return Err(BackendError::Unsupported(
-                "wasm backend: exception-resume bridge (GuardException) re-enters \
-                 the interpreter with unreconstructable rd_consts stack entries"
-                    .into(),
-            ));
-        }
-
         // The source guard this bridge attaches to. `fail_index` is its index in
         // the source loop's `fail_descrs` / cell array; `trace_id` identifies the
         // owning trace.
