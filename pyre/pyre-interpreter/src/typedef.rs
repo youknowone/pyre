@@ -15440,6 +15440,9 @@ fn set_method_update(
     Ok(pyre_object::w_none())
 }
 
+/// `setobject.py:389 W_BaseSetObject.descr_difference_update` — a non-set
+/// operand is turned into a set first, so it is hashed and deduped before
+/// anything is removed and a later unhashable element leaves self untouched.
 fn set_method_difference_update(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
@@ -15447,11 +15450,9 @@ fn set_method_difference_update(
         return Ok(pyre_object::w_none());
     }
     for other in &args[1..] {
-        let other_items = crate::builtins::collect_iterable(*other)?;
+        let other_items = set_newobj_items(*other)?;
         for item in other_items {
-            // Each element is hashed as it is looked up, so an unhashable one
-            // raises even when self is empty and nothing can match.
-            crate::type_methods::set_discard_checked(args[0], item)?;
+            unsafe { pyre_object::w_set_discard(args[0], item) };
         }
     }
     Ok(pyre_object::w_none())
@@ -15478,17 +15479,21 @@ fn set_method_intersection_update(
     Ok(pyre_object::w_none())
 }
 
+/// `setobject.py:497 W_SetObject.descr_symmetric_difference_update` — a
+/// non-set operand is turned into a set first, so it is hashed and deduped
+/// before anything is toggled: a later unhashable element leaves self
+/// untouched, and a duplicate toggles once rather than twice.
 fn set_method_symmetric_difference_update(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
     if args.is_empty() || args.len() < 2 {
         return Ok(pyre_object::w_none());
     }
-    let other_items = crate::builtins::collect_iterable(args[1])?;
-    // `self` (`args[0]`) is rooted once for the whole loop, and every
-    // collected `other` item is rooted for the loop's duration;
-    // `try_hash_value` (an arbitrary `__hash__`, on the add arm) is a
-    // collection point that can move either.
+    let other_items = set_newobj_items(args[1])?;
+    // `self` (`args[0]`) is rooted once for the whole loop, and every item is
+    // rooted for the loop's duration; `eq_w` (an arbitrary `__eq__`) is a
+    // collection point that can move either. The items were hashed building
+    // the set above, so the add arm no longer runs one.
     unsafe {
         let _roots = pyre_object::gc_roots::push_roots();
         let set_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -15515,9 +15520,6 @@ fn set_method_symmetric_difference_update(
             if present {
                 pyre_object::w_set_discard(set, item);
             } else {
-                crate::builtins::try_hash_value(item)?;
-                let set = pyre_object::gc_roots::shadow_stack_get(set_slot);
-                let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
                 pyre_object::w_set_add(set, item);
             }
         }

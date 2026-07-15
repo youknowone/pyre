@@ -89,6 +89,11 @@ fn bigint_lshift(a: BigInt, shift: usize) -> BigInt {
 /// upper-bounds the shift's own allocation, so it fails exactly when the real
 /// shift would.
 fn checked_bigint_lshift(a: BigInt, shift: u64) -> Result<BigInt, PyError> {
+    // `rbigint.py:1323 lshift` returns self for a zero shift or a zero
+    // operand, so neither allocates however large the count is.
+    if shift == 0 || a.sign() == malachite_bigint::Sign::NoSign {
+        return Ok(a);
+    }
     let result_bits = a.bits().saturating_add(shift);
     let limbs = (result_bits / 64).saturating_add(2);
     // The shift and the result's limb count must both fit a machine word

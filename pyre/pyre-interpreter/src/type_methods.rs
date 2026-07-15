@@ -901,11 +901,14 @@ pub fn str_method_endswith(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 /// returning the code-point window as WTF-8. `stringmethods.py:23
 /// _convert_idx_params` → `unwrap_start_stop`: each bound runs through
 /// `adapt_lower_bound(_eval_slice_index(...))`, so a non-index bound raises a
-/// TypeError and a bound is coerced via `__index__`. `None` signals an empty,
-/// out-of-range window (`start` past the end, or `start > end`), for which the
-/// tail match is always `False` — even for an empty needle. A positive `start`
-/// is not upper-clamped so `''.endswith('', 1, 0)` stays `start > end` rather
-/// than collapsing to a valid empty slice.
+/// TypeError and a bound is coerced via `__index__`.
+///
+/// `unicodeobject.py:1319 _unwrap_and_compute_idx_params` then converts the
+/// two code-point bounds to byte offsets: a `start` past the end becomes
+/// `end_index + 1` rather than being clamped, and `end` is only lowered when
+/// it is short of the end. `None` signals the resulting window is inverted,
+/// for which the match is always `False` — even for an empty needle, which is
+/// why `'abc'.startswith('', 5, 10)` and `''.endswith('', 1, 0)` are `False`.
 fn str_slice_args<'a>(
     s: &'a Wtf8,
     args: &[pyre_object::PyObjectRef],
@@ -922,21 +925,29 @@ fn str_slice_args<'a>(
     } else {
         char_len
     };
-    if start > end {
+    let bytes = s.as_bytes();
+    let index_to_byte = |cp: i64| {
+        s.code_point_indices()
+            .nth(cp as usize)
+            .map_or(bytes.len(), |(i, _)| i)
+    };
+    let mut end_index = bytes.len();
+    if end < char_len {
+        end_index = index_to_byte(end);
+    }
+    let mut start_index = 0usize;
+    if start > 0 {
+        start_index = if start > char_len {
+            end_index + 1
+        } else {
+            index_to_byte(start)
+        };
+    }
+    if start_index > end_index {
         return Ok(None);
     }
-    let (start, end) = (start as usize, end as usize);
-    let bytes = s.as_bytes();
-    let byte_start = s
-        .code_point_indices()
-        .nth(start)
-        .map_or(bytes.len(), |(i, _)| i);
-    let byte_end = s
-        .code_point_indices()
-        .nth(end)
-        .map_or(bytes.len(), |(i, _)| i);
     Ok(Some(unsafe {
-        Wtf8::from_bytes_unchecked(&bytes[byte_start..byte_end])
+        Wtf8::from_bytes_unchecked(&bytes[start_index..end_index])
     }))
 }
 
@@ -4735,17 +4746,6 @@ pub(crate) fn dict_store_checked(
 ) -> Result<(), crate::PyError> {
     unsafe {
         pyre_object::dictmultiobject::w_dict_store_checked(dict, key, value)
-            .map_err(|_| crate::baseobjspace::take_pending_hash_error())
-    }
-}
-
-/// Add an element to a set, hashing it through the protocol.
-///
-/// `setobject.py:1611 newset` — the set's backing `r_dict` hashes with
-/// `space.hash_w`, so an unhashable element raises instead of being stored.
-pub(crate) fn set_add_checked(set: PyObjectRef, item: PyObjectRef) -> Result<(), crate::PyError> {
-    unsafe {
-        pyre_object::setobject::w_set_add_checked(set, item)
             .map_err(|_| crate::baseobjspace::take_pending_hash_error())
     }
 }

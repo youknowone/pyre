@@ -156,17 +156,6 @@ pub fn w_frozenset_from_items(items: &[PyObjectRef]) -> PyObjectRef {
     s
 }
 
-/// Fallible variant of [`w_frozenset_from_items`].
-pub fn w_frozenset_from_items_checked(
-    items: &[PyObjectRef],
-) -> Result<PyObjectRef, crate::dictmultiobject::DictKeyError> {
-    let s = w_frozenset_new();
-    for &item in items {
-        unsafe { w_set_add_checked(s, item)? };
-    }
-    Ok(s)
-}
-
 /// Insert an element. No-op when already present.
 ///
 /// # Safety
