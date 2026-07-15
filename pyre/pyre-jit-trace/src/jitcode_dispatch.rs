@@ -11213,22 +11213,16 @@ fn kept_stack_has_boxed_int_hazard(
         // declines; report no hazard so this predicate adds nothing there.
         return false;
     }
-    // SAFETY: `code_ptr` / `metadata` are immutable payload layout fields kept
-    // alive by the frame's `Arc<PyJitCode>`; const raws are runtime PyObject
-    // pointers captured at codewrite time and read-only here.
+    // SAFETY: `metadata` is an immutable payload layout field kept alive by the
+    // frame's `Arc<PyJitCode>`; const raws are runtime PyObject pointers
+    // captured at codewrite time and read-only here.
     unsafe {
-        let code = &*pjc.code_ptr;
-        let py = python_pc_for_jitcode_pc(&pjc.metadata, target) as usize;
-        let py = skip_python_trivia_forward(code, py);
-        let depth_opt = crate::liveness::liveness_for(pjc.code_ptr)
-            .depth_at_py_pc()
-            .get(py)
-            .copied();
-        let depth_opt = if pjc.depth_trivia_populated() {
-            pjc.depth_trivia_for_jitcode_pc(target)
-        } else {
-            depth_opt
-        };
+        // Depth, pcdep and consts all key on the trivia-folded twin at `target`,
+        // so they cannot land on different resume coordinates. An empty twin (a
+        // skeleton / fixture install) yields no depth and declines below.
+        let depth_opt = pjc.depth_trivia_for_jitcode_pc(target);
+        let pcdep = pjc.pcdep_trivia_for_jitcode_pc(target);
+        let consts = pjc.const_ref_trivia_for_jitcode_pc(target);
         let Some(depth) = depth_opt.map(|d| d as usize) else {
             // Unknown resume depth — cannot prove safe.
             return true;
@@ -11237,8 +11231,6 @@ fn kept_stack_has_boxed_int_hazard(
             return false;
         }
         let stack_base = pjc.metadata.stack_base;
-        let pcdep = pjc.metadata.pcdep_color_slots.get(py);
-        let consts = pjc.metadata.const_ref_slots_at_pc.get(py);
         // The concrete shadow unboxes exact ints, so a kept slot that holds a
         // heap int surfaces either already-unboxed as `Int(v)` or still-boxed
         // as `Ref(W_IntObject)`; a value `< 0` or `>= 256` is the unrestorable

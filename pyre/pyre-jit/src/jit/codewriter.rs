@@ -12780,6 +12780,10 @@ impl CodeWriter {
         // `None`-means-decline hazard reader (S9394) into a compile.
         let mut depth_trivia_marker_by_jit_pc: Vec<(usize, Option<u16>)> = Vec::new();
         let mut depth_trivia_pred_by_jit_pc: Vec<(usize, Option<u16>)> = Vec::new();
+        let mut pcdep_trivia_marker_by_jit_pc: Vec<(usize, Vec<(u8, u16, u16)>)> = Vec::new();
+        let mut pcdep_trivia_pred_by_jit_pc: Vec<(usize, Vec<(u8, u16, u16)>)> = Vec::new();
+        let mut const_ref_trivia_marker_by_jit_pc: Vec<(usize, Vec<(u16, i64)>)> = Vec::new();
+        let mut const_ref_trivia_pred_by_jit_pc: Vec<(usize, Vec<(u16, i64)>)> = Vec::new();
         let mut resume_marker_marker_by_jit_pc: Vec<(usize, Option<usize>)> = Vec::new();
         let mut resume_marker_pred_by_jit_pc: Vec<(usize, Option<usize>)> = Vec::new();
         let mut after_residual_marker_marker_by_jit_pc: Vec<(usize, Option<usize>)> = Vec::new();
@@ -12822,8 +12826,24 @@ impl CodeWriter {
                     pyre_jit_trace::jitcode_dispatch::skip_python_trivia_forward(code, py as usize);
                 let depth_trivia = static_depth.get(skipped_py).copied();
                 depth_trivia_marker_by_jit_pc.push((off, depth_trivia));
+                pcdep_trivia_marker_by_jit_pc.push((
+                    off,
+                    pcdep_color_slots
+                        .get(skipped_py)
+                        .cloned()
+                        .unwrap_or_default(),
+                ));
+                const_ref_trivia_marker_by_jit_pc.push((
+                    off,
+                    const_ref_slots_at_pc
+                        .get(skipped_py)
+                        .cloned()
+                        .unwrap_or_default(),
+                ));
             }
             depth_trivia_marker_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
+            pcdep_trivia_marker_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
+            const_ref_trivia_marker_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
             // Op-start tier: predecessor scan, markers EXCLUDED.
             for (py, &pos) in first_jit_pc_by_py_pc.iter().enumerate() {
                 if pos != usize::MAX {
@@ -12831,9 +12851,25 @@ impl CodeWriter {
                         pyre_jit_trace::jitcode_dispatch::skip_python_trivia_forward(code, py);
                     let depth_trivia = static_depth.get(skipped_py).copied();
                     depth_trivia_pred_by_jit_pc.push((pos, depth_trivia));
+                    pcdep_trivia_pred_by_jit_pc.push((
+                        pos,
+                        pcdep_color_slots
+                            .get(skipped_py)
+                            .cloned()
+                            .unwrap_or_default(),
+                    ));
+                    const_ref_trivia_pred_by_jit_pc.push((
+                        pos,
+                        const_ref_slots_at_pc
+                            .get(skipped_py)
+                            .cloned()
+                            .unwrap_or_default(),
+                    ));
                 }
             }
             depth_trivia_pred_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
+            pcdep_trivia_pred_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
+            const_ref_trivia_pred_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
             // Marker tier: exact-match, block-head precedence.
             for &(off, py) in &block_head_py_by_jit_pc {
                 let skipped_py =
@@ -12938,6 +12974,10 @@ impl CodeWriter {
             depth_pred_by_jit_pc,
             depth_trivia_marker_by_jit_pc,
             depth_trivia_pred_by_jit_pc,
+            pcdep_trivia_marker_by_jit_pc,
+            pcdep_trivia_pred_by_jit_pc,
+            const_ref_trivia_marker_by_jit_pc,
+            const_ref_trivia_pred_by_jit_pc,
             resume_marker_marker_by_jit_pc,
             resume_marker_pred_by_jit_pc,
             after_residual_marker_marker_by_jit_pc,
