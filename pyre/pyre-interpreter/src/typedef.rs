@@ -11950,7 +11950,7 @@ pub(crate) fn bytes_method_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
 }
 
 /// interp_codecs.py:298/363 — encode-only handlers raise TypeError on decode
-fn decode_error_encode_only_handler() -> crate::PyError {
+pub(crate) fn decode_error_encode_only_handler() -> crate::PyError {
     crate::PyError::type_error("don't know how to handle UnicodeDecodeError in error callback")
 }
 
