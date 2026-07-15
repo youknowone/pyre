@@ -478,8 +478,7 @@ impl JitCodeBuilder {
         // ref is still rooted by the reg/frame gcmap walk and collector
         // traced.  It just carries no GcHeader, so it must never be
         // subject to GUARD_GC_TYPE (which reads at `ref - GcHeader::SIZE`).
-        // Headerless is only used for monomorphic structs that are never
-        // type-guarded.
+        // `StructPtrInfo.make_guards` gates that guard on `!sd.headerless()`.
         self.register_struct_layout(size, type_id, true, headerless, fields);
         let all_fielddescrs = self
             .struct_size_specs
