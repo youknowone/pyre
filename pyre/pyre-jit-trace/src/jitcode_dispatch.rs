@@ -2935,6 +2935,7 @@ fn call_dst_reg_for_residual_return(code: &[u8], entry: usize) -> Option<usize> 
 fn recipe_parent_frame_from_recipe(
     ctx: &mut TraceCtx,
     recipe: &majit_metainterp::ReconstructRecipe,
+    root_ec: *const pyre_interpreter::PyExecutionContext,
 ) -> Option<InlineParentFrame> {
     let py_pc = crate::state::backxlat_py_pc(recipe.jitcode_index, recipe.jitcode_pc) as usize;
     let pjc = crate::state::pyjitcode_for_jitcode_index(recipe.jitcode_index)?;
@@ -2953,16 +2954,31 @@ fn recipe_parent_frame_from_recipe(
     let resume_marker_jit_pc =
         call_jit_pc.and_then(|pc| pjc.after_residual_marker_for_jitcode_pc(pc));
 
-    let mut banks = crate::state::frame_liveness_reg_indices_by_bank_from_pc(
+    // Reconstruct this paused parent frame's vable + ec (the same
+    // `emit_new_pyframe_inline_with_params` the deepest-callee setup uses) so
+    // the paused-frame snapshot resolves the portal reds
+    // [frame, ec] (`interp_jit.py:67`) to real boxes rather than reading the
+    // slot-indexed `registers_r` at the portal-red color positions.  Only
+    // `pending.sym.frame` / `pending.sym.execution_context` are consumed here;
+    // the `argboxes_r` register seeding is for the forward drive, not the
+    // snapshot.
+    let (pending, _argboxes_r) =
+        crate::state::setup_reconstructed_callee_frame(ctx, recipe, root_ec, Vec::new())?;
+    let frame_box = pending.sym.frame;
+    let ec_box = pending.sym.execution_context;
+
+    let (frame_reg, ec_reg) = crate::state::portal_red_regs_at(recipe.jitcode_index);
+    let (frame_reg, ec_reg) = (u32::from(frame_reg), u32::from(ec_reg));
+    let sentinel = u32::from(u16::MAX);
+    let result_color = crate::state::result_color_at_pc_at(recipe.jitcode_index, py_pc);
+
+    let banks = crate::state::frame_liveness_reg_indices_by_bank_from_pc(
         recipe.jitcode_index,
         recipe.jitcode_pc,
     );
-    if let Some(result_color) = crate::state::result_color_at_pc_at(recipe.jitcode_index, py_pc) {
-        banks.ref_.retain(|&c| c as usize != result_color);
-    }
-
     let stack_only = recipe.valuestackdepth.saturating_sub(recipe.nlocals);
     let maps = crate::state::bridge_semantic_maps_at(recipe.jitcode_index, recipe.jitcode_pc);
+    let null_ref = ctx.const_ref(pyre_object::PY_NULL as i64);
     let mut boxes = Vec::with_capacity(banks.total_len());
     for &color in &banks.int {
         boxes.push(
@@ -2973,17 +2989,38 @@ fn recipe_parent_frame_from_recipe(
                 .unwrap_or(OpRef::NONE),
         );
     }
+    // Ref bank, in liveness-color order — mirror the trait encoder
+    // `get_list_of_active_boxes` (trace_opcode.rs:1902-1957) box-for-box:
+    //   * the not-yet-produced call-result color is NULL-seeded (`in_a_call`);
+    //   * a force-alived portal-red SCRATCH color (no live semantic slot at this
+    //     pc) routes to the reconstructed frame's `frame`/`ec` box, NOT the
+    //     slot-indexed register file;
+    //   * every other live color reads its semantic `locals_cells_stack_w` slot
+    //     from the slot-indexed `registers_r` (the reconstruct decode).
     for &color in &banks.ref_ {
-        let slot = crate::state::semantic_ref_slot_for_reg_color(
+        let c = color as usize;
+        if result_color == Some(c) {
+            boxes.push(null_ref);
+            continue;
+        }
+        let semantic_idx = crate::state::semantic_ref_slot_for_reg_color(
             recipe.nlocals,
             stack_only,
             &maps.pcdep_entries,
-            color as usize,
-        )
-        .or_else(|| {
-            let c = color as usize;
-            (c < recipe.valuestackdepth).then_some(c)
-        })?;
+            c,
+        );
+        let is_portal_red_scratch = semantic_idx.is_none()
+            && ((color == frame_reg && frame_reg != sentinel)
+                || (color == ec_reg && ec_reg != sentinel));
+        if is_portal_red_scratch {
+            boxes.push(if color == frame_reg {
+                frame_box
+            } else {
+                ec_box
+            });
+            continue;
+        }
+        let slot = semantic_idx.or_else(|| (c < recipe.valuestackdepth).then_some(c))?;
         boxes.push(recipe.registers_r.get(slot).copied().unwrap_or(OpRef::NONE));
     }
     for &color in &banks.float {
@@ -3153,7 +3190,11 @@ fn drive_bridge_frame_subwalk(
             parent_recipe.code_ptr as usize,
             Some(guard_parent),
         ));
-        parent_for_current = recipe_parent_frame_from_recipe(ctx, parent_recipe)?;
+        parent_for_current = recipe_parent_frame_from_recipe(
+            ctx,
+            parent_recipe,
+            root_sym.concrete_execution_context,
+        )?;
     }
 
     let outcome = {
