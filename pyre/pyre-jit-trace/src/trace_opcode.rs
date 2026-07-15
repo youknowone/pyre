@@ -9956,7 +9956,11 @@ mod tests {
             pending_result_type: None,
             pending_inline_frame: None,
             residual_call_pc: None,
-            loop_close_marker_jit_pc: None,
+            // The hand-crafted body carries a single `-live-` at JitCode byte 0
+            // (`block_head_py_by_jit_pc = [(0, 0)]`); seed that jitcode resume
+            // marker so `get_list_of_active_boxes` reads liveness at offset 0
+            // instead of declining on an unset marker.
+            loop_close_marker_jit_pc: Some(0),
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
@@ -10012,6 +10016,14 @@ mod tests {
             .metadata
             .pcdep_color_slots
             .push(vec![(1, 0, 0), (1, 0, 2), (1, 1, 1)]);
+        // JitCode-native twins the migrated `get_list_of_active_boxes` reads
+        // (`pcdep_for_jitcode_pc` / `depth_for_jitcode_pc_pred`): mirror the
+        // py_pc-keyed tables above at the single `-live-` JitCode offset 0.
+        pyjit
+            .metadata
+            .pcdep_by_jit_pc
+            .push((0, vec![(1, 0, 0), (1, 0, 2), (1, 1, 1)]));
+        pyjit.metadata.depth_pred_by_jit_pc.push((0, 1));
         let inner_jc = crate::state::JitCode {
             index: 0,
             payload: Arc::new(pyjit),
@@ -10040,7 +10052,10 @@ mod tests {
             pending_result_type: None,
             pending_inline_frame: None,
             residual_call_pc: None,
-            loop_close_marker_jit_pc: None,
+            // Single `-live-` at JitCode byte 0 (`block_head_py_by_jit_pc =
+            // [(0, 0)]`); seed the jitcode resume marker so the snapshot reads
+            // liveness at offset 0 rather than declining on an unset marker.
+            loop_close_marker_jit_pc: Some(0),
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: Some(vec![local0, local1, stack0]),
