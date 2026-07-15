@@ -2971,19 +2971,34 @@ pub(crate) fn trace_unbox_int_with_resume_descr<F: crate::walker_frame_ops::Walk
             if r != majit_ir::GcRef::NO_CONCRETE {
                 let o = r.as_usize() as pyre_object::PyObjectRef;
                 if !o.is_null() {
-                    if pyre_object::tagged_int::is_tagged_int(o) {
+                    let tagged = pyre_object::tagged_int::is_tagged_int(o);
+                    // rtagged.py:155 ll_unboxed_getclass tag discrimination:
+                    // IntAnd(CastPtrToInt(obj), 1), guarded GUARD_TRUE (tagged
+                    // leg) / GUARD_FALSE (boxed leg). Both the lowbit test and
+                    // its guard derive purely from `obj`; when `obj` is a Const
+                    // the metainterp folds the arithmetic to a ConstInt and the
+                    // guard is elided (pyjitpl.py:2583 generate_guard "if
+                    // isinstance(box, Const): return"). Emit the runtime tag
+                    // discrimination only for a non-constant operand — a
+                    // constant tag is statically known.
+                    if !obj.is_constant() {
                         let lowbit =
-                            crate::helpers::emit_tag_lowbit_test(frame.ctx_mut(), obj, true);
-                        frame.generate_guard(OpCode::GuardTrue, &[lowbit]);
+                            crate::helpers::emit_tag_lowbit_test(frame.ctx_mut(), obj, tagged);
+                        let guard = if tagged {
+                            OpCode::GuardTrue
+                        } else {
+                            OpCode::GuardFalse
+                        };
+                        frame.generate_guard(guard, &[lowbit]);
+                    }
+                    if tagged {
+                        // rtagged.py:147 ll_unboxed_to_int: arithmetic
+                        // IntRshift(CastPtrToInt(obj), 1), no guard.
                         return crate::helpers::emit_untag_int(
                             frame.ctx_mut(),
                             obj,
                             pyre_object::tagged_int::untag_int(o),
                         );
-                    } else {
-                        let lowbit =
-                            crate::helpers::emit_tag_lowbit_test(frame.ctx_mut(), obj, false);
-                        frame.generate_guard(OpCode::GuardFalse, &[lowbit]);
                     }
                 }
             }
@@ -11501,18 +11516,33 @@ mod tests {
         };
 
         let recorder = ctx.into_recorder();
+        // w_int_new(7) is a tagged immediate under CAN_BE_TAGGED, so the
+        // constant unbox lowers to rtagged.py:147 ll_unboxed_to_int:
+        // IntRshift(CastPtrToInt(obj), 1) — pure arithmetic, no guard. The
+        // tag-discrimination guard (rtagged.py:155) is elided because `obj`
+        // is a Const (pyjitpl.py:2583 generate_guard const-skip), and the
+        // tagged branch returns before the boxed GUARD_CLASS.
         let payload_op = recorder
             .get_op_by_pos(payload)
             .expect("payload op should be present");
-        assert_eq!(payload_op.opcode, OpCode::GetfieldGcPureI);
+        assert_eq!(payload_op.opcode, OpCode::IntRshift);
+        // The untag reads CastPtrToInt(obj): payload arg(0) is the cast op,
+        // whose arg(0) is the constant `obj` — the payload derives from the
+        // proven-constant operand, not an unrelated value.
+        let cast_ref = payload_op.arg(0).to_opref();
+        let cast_op = recorder
+            .get_op_by_pos(cast_ref)
+            .expect("cast op should be present");
+        assert_eq!(cast_op.opcode, OpCode::CastPtrToInt);
+        assert_eq!(cast_op.arg(0).to_opref(), int_obj);
         for pos in 1..(1 + recorder.num_ops() as u32) {
             let Some(op) = recorder.get_op_by_raw_pos(pos) else {
                 continue;
             };
-            assert_ne!(
+            assert!(
+                !op.opcode.is_guard(),
+                "constant unbox must not emit any guard (got {:?})",
                 op.opcode,
-                OpCode::GuardClass,
-                "constant unbox must not emit GUARD_CLASS",
             );
         }
     }

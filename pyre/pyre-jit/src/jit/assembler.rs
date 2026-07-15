@@ -2440,9 +2440,12 @@ mod tests {
     #[test]
     fn assemble_raise_accepts_const_ref() {
         let mut ssarepr = SSARepr::new("raise_const");
+        // A `ConstRef` sentinel models a real gcref: word-aligned, low bit
+        // clear. An odd value would read as a tagged int immediate and be
+        // re-realized into a fresh heap box by `untag_const_ref_value`.
         ssarepr
             .insns
-            .push(Insn::op("raise", vec![Operand::ConstRef(7)]));
+            .push(Insn::op("raise", vec![Operand::ConstRef(8)]));
 
         let jitcode = assemble(
             &mut ssarepr,
@@ -2457,7 +2460,7 @@ mod tests {
             .get("raise/r")
             .expect("raise must be registered in wellknown insns");
         assert_eq!(jitcode.code, vec![opcode, 2]);
-        assert_eq!(jitcode.constants_r, vec![7]);
+        assert_eq!(jitcode.constants_r, vec![8]);
     }
 
     #[test]

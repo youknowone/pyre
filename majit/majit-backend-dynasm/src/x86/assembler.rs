@@ -4426,11 +4426,19 @@ impl<'a> Assembler386<'a> {
                     dynasm!(self.mc ; .arch x64 ; mov Rq(rv), rcx);
                 }
                 dynasm!(self.mc ; .arch x64 ; =>done);
-                if !op.pos.get().is_none() {
-                    if result_reg.value != 0 {
-                        dynasm!(self.mc ; .arch x64 ; mov rax, Rq(result_reg.value));
-                    }
-                    self.store_rax_to_result(op.pos.get());
+                // Spill the result to the regalloc-assigned jitframe slot
+                // directly from `result_reg`.  The malloc-nursery clobber
+                // set is only ECX/EDX (SAVE_DEFAULT_REGS), so RAX may hold
+                // a live Box the regalloc bound to it across this op;
+                // routing the spill through RAX (`mov rax, result_reg`)
+                // silently destroyed that value — this mirrors the
+                // fixed-size `genop_call_malloc_nursery` final block, which
+                // was already corrected for the same reason.
+                let pos = op.pos.get();
+                if !pos.is_none() {
+                    let slot = self.allocate_slot(pos);
+                    let offset = Self::slot_offset(slot);
+                    dynasm!(self.mc ; .arch x64 ; mov [rbp + offset], Rq(rv));
                 }
             }
             // x86/assembler.py:2567 malloc_cond_varsize parity

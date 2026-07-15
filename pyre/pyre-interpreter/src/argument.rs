@@ -23,6 +23,10 @@ use pyre_object::PyObjectRef;
 /// iterable, not %T", "argument after ** must be a mapping, not %T",
 /// "keywords must be strings, not '%T'").
 fn type_name_of(w_obj: PyObjectRef) -> String {
+    // A tagged int immediate is an exact builtin int; skip the ob_type deref.
+    if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(w_obj) {
+        return "int".to_string();
+    }
     unsafe {
         match crate::typedef::r#type(w_obj) {
             Some(tp) => pyre_object::w_type_get_name(tp).to_string(),

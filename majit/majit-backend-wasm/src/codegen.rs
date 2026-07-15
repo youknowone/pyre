@@ -2392,7 +2392,29 @@ fn build_function(
             }
 
             // ── Pointer/Int conversions ──
-            OpCode::CastPtrToInt | OpCode::CastIntToPtr | OpCode::CastOpaquePtr => {
+            OpCode::CastPtrToInt => {
+                // `cast_ptr_to_int` produces `Signed` (a machine word). On
+                // wasm32 a pointer is 4 bytes, so the value carried in the i64
+                // value ABI must be the 32-bit pointer reinterpreted as a
+                // signed word — a sign-extending widen, not the zero-extension
+                // a Ref receives on entry (`i64_extend_i32_u` loads, or a Rust
+                // residual shim's `ptr as i64`). Without this, a tagged small
+                // int with the top payload bit set (`(v<<1)|1` for v<0 or large
+                // v, rtagged.py:147 `ll_unboxed_to_int`) reads back with a zero
+                // high half, and the trailing arithmetic `IntRshift(,1)` untag
+                // (a 64-bit `i64.shr_s`) recovers the wrong value. `i32.wrap` +
+                // `i64.extend_i32_s` is a no-op for a real heap pointer (top bit
+                // clear on a <2GB linear memory), so this is the width-correct
+                // lowering for both tagged and boxed operands.
+                let vi = op.pos.get().raw();
+                if !OpRef::raw_is_constant(vi) {
+                    emit_resolve(&mut sink, constants, op.arg(0).to_opref());
+                    sink.i32_wrap_i64();
+                    sink.i64_extend_i32_s();
+                    sink.local_set(1 + vi);
+                }
+            }
+            OpCode::CastIntToPtr | OpCode::CastOpaquePtr => {
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());

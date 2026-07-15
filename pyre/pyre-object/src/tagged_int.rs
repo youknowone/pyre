@@ -32,13 +32,21 @@ use crate::pyobject::PyObjectRef;
 /// `taggedpointers` config (`pyre-jit` `build_gc`).
 pub const CAN_BE_TAGGED: bool = true;
 
-/// `value` fits the tagged immediate range, i.e. `value << 1` does not
-/// overflow `i64`. Callers range-check with this before [`tag_int`];
-/// it mirrors the `checked_mul`/`checked_add` overflow guard in
-/// `rtagged.rs::ll_int_to_unboxed`.
+/// `value` fits the tagged immediate range, i.e. the payload survives
+/// `<< 1` within pointer width. Callers range-check with this before
+/// [`tag_int`]; it mirrors the `checked_mul`/`checked_add` overflow
+/// guard in `rtagged.rs::ll_int_to_unboxed`. On 64-bit this is the full
+/// `i64::MIN>>1 ..= i64::MAX>>1` range; on wasm32 it narrows to a
+/// 31-bit signed payload.
 #[inline]
 pub fn fits_tagged(value: i64) -> bool {
-    value >= (i64::MIN >> 1) && value <= (i64::MAX >> 1)
+    // The tagged immediate `(value << 1) | 1` is stored in a pointer-width
+    // slot, so the payload must survive `<< 1` within `isize` (sign
+    // preserving). On 64-bit this is the full `i64::MIN>>1 ..= i64::MAX>>1`
+    // range; on wasm32 it narrows to a 31-bit signed payload.
+    const LO: i64 = (isize::MIN >> 1) as i64;
+    const HI: i64 = (isize::MAX >> 1) as i64;
+    value >= LO && value <= HI
 }
 
 /// `ll_int_to_unboxed` — reinterpret `(value << 1) | 1` as a pointer.
@@ -49,14 +57,14 @@ pub fn fits_tagged(value: i64) -> bool {
 #[inline]
 pub fn tag_int(value: i64) -> PyObjectRef {
     debug_assert!(fits_tagged(value), "tag_int: value out of taggable range");
-    (((value << 1) | 1) as usize) as PyObjectRef
+    ((((value as isize) << 1) | 1) as usize) as PyObjectRef
 }
 
 /// `ll_unboxed_to_int` — recover the payload with an arithmetic (sign
 /// preserving) `>> 1`. Caller must have established [`is_tagged_int`].
 #[inline]
 pub fn untag_int(p: PyObjectRef) -> i64 {
-    (p as usize as i64) >> 1
+    ((p as usize as isize) >> 1) as i64
 }
 
 /// `is_unboxed_instance` — the low bit distinguishes a tagged immediate
@@ -88,8 +96,10 @@ mod tests {
 
     #[test]
     fn tag_round_trips_range_boundaries() {
-        let lo = i64::MIN >> 1;
-        let hi = i64::MAX >> 1;
+        // Derive the boundary from pointer width so the round-trip is
+        // correct on any target (full i64>>1 on 64-bit, 31-bit on wasm32).
+        let lo = (isize::MIN >> 1) as i64;
+        let hi = (isize::MAX >> 1) as i64;
         assert!(fits_tagged(lo) && fits_tagged(hi));
         assert_eq!(untag_int(tag_int(lo)), lo);
         assert_eq!(untag_int(tag_int(hi)), hi);
@@ -97,10 +107,22 @@ mod tests {
 
     #[test]
     fn fits_tagged_rejects_top_bit_values() {
-        assert!(!fits_tagged(i64::MAX));
-        assert!(!fits_tagged(i64::MIN));
-        assert!(fits_tagged(i64::MAX >> 1));
-        assert!(fits_tagged(i64::MIN >> 1));
+        let lo = (isize::MIN >> 1) as i64;
+        let hi = (isize::MAX >> 1) as i64;
+        assert!(fits_tagged(hi));
+        assert!(fits_tagged(lo));
+        // hi = i64::MAX>>1 < i64::MAX and lo = i64::MIN>>1 > i64::MIN on
+        // both 32- and 64-bit, so the `+1`/`-1` cannot overflow.
+        assert!(!fits_tagged(hi + 1));
+        assert!(!fits_tagged(lo - 1));
+    }
+
+    #[test]
+    fn fits_tagged_matches_pointer_width() {
+        // The taggable range tracks pointer width: the top payload fits,
+        // one past it does not.
+        assert!(fits_tagged((isize::MAX >> 1) as i64));
+        assert!(!fits_tagged(((isize::MAX >> 1) as i64) + 1));
     }
 
     #[test]

@@ -16013,6 +16013,10 @@ fn require_bytes_like(obj: PyObjectRef) -> Result<&'static [u8], crate::PyError>
 /// bytes-method TypeErrors.  More accurate than the raw `ob_type` name for
 /// instance-layout objects (e.g. a memoryview reports `memoryview`).
 fn type_name_of(obj: PyObjectRef) -> String {
+    // A tagged int immediate is an exact builtin int; skip the ob_type deref.
+    if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj) {
+        return "int".to_string();
+    }
     match r#type(obj) {
         Some(tp) => unsafe { pyre_object::w_type_get_name(tp) }.to_string(),
         None => unsafe { (*(*obj).ob_type).name.to_string() },
