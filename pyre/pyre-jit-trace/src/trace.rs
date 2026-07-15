@@ -1484,11 +1484,21 @@ fn run_perfn_walk(
     if let Some(entry_depth) = pjc.depth_for_jitcode_pc_pred(entry) {
         let stack_base = crate::state::concrete_nlocals(cf_addr).unwrap_or(sym.nlocals);
         let live_stack = sym.valuestackdepth.saturating_sub(stack_base);
-        if live_stack != entry_depth as usize {
+        // A mismatch is unsound only when the carried coordinate IS the
+        // resume marker.  That is the marker-inside-super-instruction shape:
+        // the live frame has advanced through the super-instruction while the
+        // predecessor depth twin still describes the marker's pre-op stack.
+        // An interior branch resume resolves *through* a marker but carries
+        // its own jitcode offset, so it may legitimately have a different
+        // live depth and must continue walking.
+        let entry_is_resume_marker = pjc.resume_marker_for_jitcode_pc(entry) == Some(entry);
+        if live_stack != entry_depth as usize && entry_is_resume_marker {
             if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                let marker_py =
+                    crate::jitcode_dispatch::python_pc_for_jitcode_pc(&pjc.metadata, entry);
                 eprintln!(
                     "[fbw-abort] start_pc={start_pc} entry={entry} live_stack={live_stack} \\
-                     entry_depth={entry_depth}; declining walk"
+                     entry_depth={entry_depth} marker_py={marker_py}; declining marker-entry walk"
                 );
             }
             fbw_decline(crate::driver::make_green_key(w_code, start_pc));
