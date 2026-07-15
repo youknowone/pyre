@@ -2517,9 +2517,12 @@ pub fn encode_raw_unicode_escape(s: &Wtf8) -> Vec<u8> {
 /// malformed escape) is taken as a Latin-1 code point.
 pub fn decode_raw_unicode_escape(data: &[u8], errors: &str) -> Result<Wtf8Buf, crate::PyError> {
     let mut out = Wtf8Buf::new();
+    // A custom error handler may replace exc.object; decoding then resumes
+    // from the new bytes (`buf`).
+    let mut buf: std::borrow::Cow<[u8]> = std::borrow::Cow::Borrowed(data);
     let mut i = 0usize;
-    while i < data.len() {
-        let b = data[i];
+    while i < buf.len() {
+        let b = buf[i];
         if b != b'\\' {
             out.push_char(b as char);
             i += 1;
@@ -2530,7 +2533,7 @@ pub fn decode_raw_unicode_escape(data: &[u8], errors: &str) -> Result<Wtf8Buf, c
         // but raw-unicode-escape does not collapse them — each `\` is a
         // literal byte 0x5c).  The escape applies when `\` is followed by
         // `u` or `U` with enough hex digits.
-        let kind = data.get(i + 1).copied();
+        let kind = buf.get(i + 1).copied();
         let want = match kind {
             Some(b'u') => 4usize,
             Some(b'U') => 8usize,
@@ -2539,13 +2542,13 @@ pub fn decode_raw_unicode_escape(data: &[u8], errors: &str) -> Result<Wtf8Buf, c
         if want != 0 {
             let escape_start = i;
             let digits_start = i + 2;
-            let available_end = (digits_start + want).min(data.len());
+            let available_end = (digits_start + want).min(buf.len());
             let mut hex_end = digits_start;
-            while hex_end < available_end && data[hex_end].is_ascii_hexdigit() {
+            while hex_end < available_end && buf[hex_end].is_ascii_hexdigit() {
                 hex_end += 1;
             }
             let numeric = if available_end == digits_start + want && hex_end == available_end {
-                std::str::from_utf8(&data[digits_start..available_end])
+                std::str::from_utf8(&buf[digits_start..available_end])
                     .ok()
                     .and_then(|s| u32::from_str_radix(s, 16).ok())
             } else {
@@ -2573,20 +2576,24 @@ pub fn decode_raw_unicode_escape(data: &[u8], errors: &str) -> Result<Wtf8Buf, c
                 "ignore" => {}
                 "replace" => out.push_char('\u{FFFD}'),
                 "backslashreplace" => {
-                    for &byte in &data[escape_start..error_end] {
+                    for &byte in &buf[escape_start..error_end] {
                         out.push_str(&format!("\\x{byte:02x}"));
                     }
                 }
                 _ => {
-                    i = call_registered_decode_error_handler(
+                    let (np, nb) = call_registered_decode_error_handler(
                         errors,
                         "rawunicodeescape",
-                        data,
+                        &buf,
                         escape_start,
                         error_end,
                         reason,
                         &mut out,
                     )?;
+                    if let Some(nb) = nb {
+                        buf = std::borrow::Cow::Owned(nb);
+                    }
+                    i = np;
                     continue;
                 }
             }
@@ -2943,6 +2950,12 @@ fn read_code_unit(data: &[u8], pos: usize, unit: usize, big_endian: bool) -> u32
 /// interp_codecs.py:33-108 `call_errorhandler` (decode branch): invoke a
 /// custom handler registered through `_codecs.register_error` for a decode
 /// error position.
+/// Returns `(newpos, resume)`.  `newpos` is the byte position to resume
+/// decoding at, folded against the length of the buffer decoding will
+/// continue in.  `resume` is `Some(new_bytes)` when the handler replaced
+/// `exc.object` with different bytes (the caller must rebind its working
+/// buffer to them) and `None` when the object was left unchanged (the
+/// caller keeps decoding the same slice, no allocation).
 pub(crate) fn call_registered_decode_error_handler(
     err_mode: &str,
     codec: &str,
@@ -2951,7 +2964,7 @@ pub(crate) fn call_registered_decode_error_handler(
     end: usize,
     reason: &str,
     out: &mut Wtf8Buf,
-) -> Result<usize, crate::PyError> {
+) -> Result<(usize, Option<Vec<u8>>), crate::PyError> {
     let w_handler = crate::module::_codecs::lookup_registered_error(err_mode).ok_or_else(|| {
         crate::PyError::new(
             crate::PyErrorKind::LookupError,
@@ -2980,9 +2993,21 @@ pub(crate) fn call_registered_decode_error_handler(
         ));
     }
 
-    // Bounds stay against original data; these loops resume into the
-    // original byte slice.
-    let length = data.len() as i64;
+    // interp_codecs.py:94-104 — reread exc.object after the handler
+    // returns.  The handler may have replaced it, in which case decoding
+    // resumes from the new bytes.  A non-bytes object is rejected (the
+    // decode C code checks PyBytes_Check on the reread object).
+    let w_obj = unsafe { pyre_object::interp_exceptions::w_exception_get_object(w_exc) };
+    if !unsafe { pyre_object::bytesobject::is_bytes(w_obj) } {
+        return Err(crate::PyError::type_error(
+            "UnicodeError 'object' attribute must be a bytes",
+        ));
+    }
+    let new_bytes = unsafe { pyre_object::bytesobject::bytes_like_data(w_obj) };
+
+    // newpos folds against the reread object's length (unicodeobject.c
+    // insize), which the loop resumes into.
+    let length = new_bytes.len() as i64;
     let mut newpos = match crate::baseobjspace::int_w(w_newpos) {
         Ok(n) => n,
         Err(e) => {
@@ -3004,7 +3029,12 @@ pub(crate) fn call_registered_decode_error_handler(
     }
 
     out.push_wtf8(unsafe { pyre_object::w_str_get_wtf8(w_replace) });
-    Ok(newpos as usize)
+    let resume = if new_bytes == data {
+        None
+    } else {
+        Some(new_bytes.to_vec())
+    };
+    Ok((newpos as usize, resume))
 }
 
 /// Replacement returned by a custom encode error handler: either a str
@@ -3111,21 +3141,21 @@ fn utf16_32_decode_error(
     big_endian: bool,
     unit: usize,
     out: &mut Wtf8Buf,
-) -> Result<usize, crate::PyError> {
+) -> Result<(usize, Option<Vec<u8>>), crate::PyError> {
     match err_mode {
         "strict" => Err(crate::typedef::unicode_decode_error(
             codec, data, start, end, reason,
         )),
-        "ignore" => Ok(end),
+        "ignore" => Ok((end, None)),
         "replace" => {
             out.push_char('\u{FFFD}');
-            Ok(end)
+            Ok((end, None))
         }
         "backslashreplace" => {
             for &b in &data[start..end.min(data.len())] {
                 out.push_str(&format!("\\x{b:02x}"));
             }
-            Ok(end)
+            Ok((end, None))
         }
         // surrogatepass: reconstruct one surrogate from the unit at
         // `start` and keep it; a non-surrogate value re-raises
@@ -3135,7 +3165,7 @@ fn utf16_32_decode_error(
                 let ch = read_code_unit(data, start, unit, big_endian);
                 if (0xD800..=0xDFFF).contains(&ch) {
                     out.push(CodePoint::from_u32(ch).unwrap());
-                    return Ok(start + unit);
+                    return Ok((start + unit, None));
                 }
             }
             Err(crate::typedef::unicode_decode_error(
@@ -3159,7 +3189,7 @@ fn utf16_32_decode_error(
                     codec, data, start, end, reason,
                 ));
             }
-            Ok(start + consumed)
+            Ok((start + consumed, None))
         }
         _ => call_registered_decode_error_handler(err_mode, codec, data, start, end, reason, out),
     }
@@ -3173,78 +3203,55 @@ fn decode_utf16_impl(
     err_mode: &str,
 ) -> Result<Wtf8Buf, crate::PyError> {
     let (big_endian, mut pos) = resolve_bom(data, false, fixed_be);
-    let len = data.len();
+    // A custom error handler may replace exc.object; the loop then resumes
+    // from the new bytes (`buf`), re-evaluating `len` each iteration.
+    let mut buf: std::borrow::Cow<[u8]> = std::borrow::Cow::Borrowed(data);
+    let mut len = buf.len();
     let mut out = Wtf8Buf::with_capacity(len / 2);
+    // Run a utf-16 error handler and rebind `buf`/`len` when it returns
+    // replacement bytes; evaluates to the resume position.
+    macro_rules! run16 {
+        ($start:expr, $end:expr, $reason:expr) => {{
+            let (np, nb) = utf16_32_decode_error(
+                err_mode, codec, &buf, $start, $end, $reason, big_endian, 2, &mut out,
+            )?;
+            if let Some(b) = nb {
+                buf = std::borrow::Cow::Owned(b);
+                len = buf.len();
+            }
+            np
+        }};
+    }
     while pos < len {
         if len - pos < 2 {
-            pos = utf16_32_decode_error(
-                err_mode,
-                codec,
-                data,
-                pos,
-                len,
-                "truncated data",
-                big_endian,
-                2,
-                &mut out,
-            )?;
+            pos = run16!(pos, len, "truncated data");
             if len - pos < 2 {
                 break;
             }
             continue;
         }
-        let ch = read_code_unit(data, pos, 2, big_endian);
+        let ch = read_code_unit(&buf, pos, 2, big_endian);
         pos += 2;
         if !(0xD800..=0xDFFF).contains(&ch) {
             out.push(CodePoint::from_u32(ch).unwrap());
             continue;
         } else if ch >= 0xDC00 {
             // unexpected lone low surrogate
-            pos = utf16_32_decode_error(
-                err_mode,
-                codec,
-                data,
-                pos - 2,
-                pos,
-                "illegal encoding",
-                big_endian,
-                2,
-                &mut out,
-            )?;
+            pos = run16!(pos - 2, pos, "illegal encoding");
             continue;
         }
         // high surrogate: a low surrogate must follow
         if len - pos < 2 {
             pos -= 2;
-            pos = utf16_32_decode_error(
-                err_mode,
-                codec,
-                data,
-                pos,
-                len,
-                "unexpected end of data",
-                big_endian,
-                2,
-                &mut out,
-            )?;
+            pos = run16!(pos, len, "unexpected end of data");
         } else {
-            let ch2 = read_code_unit(data, pos, 2, big_endian);
+            let ch2 = read_code_unit(&buf, pos, 2, big_endian);
             pos += 2;
             if (0xDC00..=0xDFFF).contains(&ch2) {
                 let c = (((ch & 0x3FF) << 10) | (ch2 & 0x3FF)) + 0x10000;
                 out.push(CodePoint::from_u32(c).unwrap());
             } else {
-                pos = utf16_32_decode_error(
-                    err_mode,
-                    codec,
-                    data,
-                    pos - 4,
-                    pos - 2,
-                    "illegal UTF-16 surrogate",
-                    big_endian,
-                    2,
-                    &mut out,
-                )?;
+                pos = run16!(pos - 4, pos - 2, "illegal UTF-16 surrogate");
             }
         }
     }
@@ -3261,52 +3268,41 @@ fn decode_utf32_impl(
     err_mode: &str,
 ) -> Result<Wtf8Buf, crate::PyError> {
     let (big_endian, mut pos) = resolve_bom(data, true, fixed_be);
-    let len = data.len();
+    // A custom error handler may replace exc.object; the loop then resumes
+    // from the new bytes (`buf`), re-evaluating `len` each iteration.
+    let mut buf: std::borrow::Cow<[u8]> = std::borrow::Cow::Borrowed(data);
+    let mut len = buf.len();
     let mut out = Wtf8Buf::with_capacity(len / 4);
+    macro_rules! run32 {
+        ($start:expr, $end:expr, $reason:expr) => {{
+            let (np, nb) = utf16_32_decode_error(
+                err_mode, codec, &buf, $start, $end, $reason, big_endian, 4, &mut out,
+            )?;
+            if let Some(b) = nb {
+                buf = std::borrow::Cow::Owned(b);
+                len = buf.len();
+            }
+            np
+        }};
+    }
     while pos < len {
         if len - pos < 4 {
-            pos = utf16_32_decode_error(
-                err_mode,
-                codec,
-                data,
-                pos,
-                len,
-                "truncated data",
-                big_endian,
-                4,
-                &mut out,
-            )?;
+            pos = run32!(pos, len, "truncated data");
             if len - pos < 4 {
                 break;
             }
             continue;
         }
-        let ch = read_code_unit(data, pos, 4, big_endian);
+        let ch = read_code_unit(&buf, pos, 4, big_endian);
         if (0xD800..=0xDFFF).contains(&ch) {
-            pos = utf16_32_decode_error(
-                err_mode,
-                codec,
-                data,
+            pos = run32!(
                 pos,
                 pos + 4,
-                "code point in surrogate code point range(0xd800, 0xe000)",
-                big_endian,
-                4,
-                &mut out,
-            )?;
+                "code point in surrogate code point range(0xd800, 0xe000)"
+            );
             continue;
         } else if ch >= 0x110000 {
-            pos = utf16_32_decode_error(
-                err_mode,
-                codec,
-                data,
-                pos,
-                len,
-                "code point not in range(0x110000)",
-                big_endian,
-                4,
-                &mut out,
-            )?;
+            pos = run32!(pos, len, "code point not in range(0x110000)");
             continue;
         }
         out.push(CodePoint::from_u32(ch).unwrap());

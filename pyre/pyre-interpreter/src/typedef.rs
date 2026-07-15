@@ -12110,16 +12110,16 @@ fn utf8_error_handler(
     end: usize,
     reason: &str,
     out: &mut Wtf8Buf,
-) -> Result<usize, crate::PyError> {
+) -> Result<(usize, Option<Vec<u8>>), crate::PyError> {
     match err_mode {
         "strict" => {
             utf8_strict_handler(data, start, end, reason)?;
             unreachable!()
         }
-        "ignore" => Ok(end),
+        "ignore" => Ok((end, None)),
         "replace" => {
             out.push_char('\u{FFFD}');
-            Ok(end)
+            Ok((end, None))
         }
         // interp_codecs.py:536-555 surrogateescape_errors (decode branch).
         // Escape up to four non-ASCII bytes as lone surrogates 0xdc00+c;
@@ -12139,7 +12139,7 @@ fn utf8_error_handler(
                 // codec complained about ASCII byte.
                 return Err(unicode_decode_error("utf-8", data, start, end, reason));
             }
-            Ok(start + consumed)
+            Ok((start + consumed, None))
         }
         // interp_codecs.py:476-510 surrogatepass_errors (decode branch).
         // Decode a single three-byte UTF-8 surrogate (ED A0..BF 80..BF) at
@@ -12178,13 +12178,13 @@ fn utf8_error_handler(
                 return Err(unicode_decode_error("utf-8", data, start, end, reason));
             }
             out.push(CodePoint::from_u32(ch as u32).unwrap());
-            Ok(start + 3)
+            Ok((start + 3, None))
         }
         "backslashreplace" => {
             for &b in &data[start..end] {
                 out.push_str(&format!("\\x{:02x}", b));
             }
-            Ok(end)
+            Ok((end, None))
         }
         "xmlcharrefreplace" | "namereplace" => Err(decode_error_encode_only_handler()),
         _ => crate::type_methods::call_registered_decode_error_handler(
@@ -12239,11 +12239,27 @@ pub(crate) fn charp2uni(data: &[u8]) -> PyObjectRef {
 /// Unicode scalar values via char::from_u32.  Surrogates are always
 /// rejected by invalid_byte_2_of_3 and routed to the error handler.
 fn decode_utf8_with_errors(data: &[u8], err_mode: &str) -> Result<Wtf8Buf, crate::PyError> {
-    let s = data;
-    let size = s.len();
+    // A custom error handler may replace exc.object; decoding then resumes
+    // from the new bytes (`s`), re-evaluating `size` each iteration.  The
+    // common path keeps the borrowed slice (no allocation).
+    let mut s: std::borrow::Cow<[u8]> = std::borrow::Cow::Borrowed(data);
+    let mut size = s.len();
     let mut result = Wtf8Buf::new();
     let mut pos = 0;
     let final_ = true; // pyre always decodes complete buffers
+
+    // Run a utf-8 error handler and rebind `s`/`size` when it returns
+    // replacement bytes; then advance `pos` to the resume position.
+    macro_rules! run_err {
+        ($start:expr, $end:expr, $reason:expr) => {{
+            let (np, nb) = utf8_error_handler(err_mode, &s, $start, $end, $reason, &mut result)?;
+            if let Some(b) = nb {
+                s = std::borrow::Cow::Owned(b);
+                size = s.len();
+            }
+            pos = np;
+        }};
+    }
 
     while pos < size {
         let ordch1 = s[pos];
@@ -12265,77 +12281,35 @@ fn decode_utf8_with_errors(data: &[u8], err_mode: &str) -> Result<Wtf8Buf, crate
                 if !final_ {
                     break;
                 }
-                pos = utf8_error_handler(
-                    err_mode,
-                    s,
-                    pos,
-                    pos + 1,
-                    "unexpected end of data",
-                    &mut result,
-                )?;
+                run_err!(pos, pos + 1, "unexpected end of data");
                 continue;
             }
             let ordch2 = s[pos + 1];
             if n == 3 {
                 // unicodehelper.py:417-434
                 if invalid_byte_2_of_3(ordch1, ordch2) {
-                    pos = utf8_error_handler(
-                        err_mode,
-                        s,
-                        pos,
-                        pos + 1,
-                        "invalid continuation byte",
-                        &mut result,
-                    )?;
+                    run_err!(pos, pos + 1, "invalid continuation byte");
                     continue;
                 }
                 if !final_ {
                     break;
                 }
-                pos = utf8_error_handler(
-                    err_mode,
-                    s,
-                    pos,
-                    pos + 2,
-                    "unexpected end of data",
-                    &mut result,
-                )?;
+                run_err!(pos, pos + 2, "unexpected end of data");
                 continue;
             } else if n == 4 {
                 // unicodehelper.py:435-459
                 if invalid_byte_2_of_4(ordch1, ordch2) {
-                    pos = utf8_error_handler(
-                        err_mode,
-                        s,
-                        pos,
-                        pos + 1,
-                        "invalid continuation byte",
-                        &mut result,
-                    )?;
+                    run_err!(pos, pos + 1, "invalid continuation byte");
                     continue;
                 }
                 if charsleft == 2 && invalid_cont_byte(s[pos + 2]) {
-                    pos = utf8_error_handler(
-                        err_mode,
-                        s,
-                        pos,
-                        pos + 2,
-                        "invalid continuation byte",
-                        &mut result,
-                    )?;
+                    run_err!(pos, pos + 2, "invalid continuation byte");
                     continue;
                 }
                 if !final_ {
                     break;
                 }
-                pos = utf8_error_handler(
-                    err_mode,
-                    s,
-                    pos,
-                    pos + charsleft + 1,
-                    "unexpected end of data",
-                    &mut result,
-                )?;
+                run_err!(pos, pos + charsleft + 1, "unexpected end of data");
                 continue;
             }
             unreachable!("n must be 3 or 4 when charsleft > 0");
@@ -12343,7 +12317,7 @@ fn decode_utf8_with_errors(data: &[u8], err_mode: &str) -> Result<Wtf8Buf, crate
 
         // unicodehelper.py:462 n == 0 → invalid start byte
         if n == 0 {
-            pos = utf8_error_handler(err_mode, s, pos, pos + 1, "invalid start byte", &mut result)?;
+            run_err!(pos, pos + 1, "invalid start byte");
             continue;
         }
 
@@ -12351,14 +12325,7 @@ fn decode_utf8_with_errors(data: &[u8], err_mode: &str) -> Result<Wtf8Buf, crate
             // unicodehelper.py:471-482
             let ordch2 = s[pos + 1];
             if invalid_cont_byte(ordch2) {
-                pos = utf8_error_handler(
-                    err_mode,
-                    s,
-                    pos,
-                    pos + 1,
-                    "invalid continuation byte",
-                    &mut result,
-                )?;
+                run_err!(pos, pos + 1, "invalid continuation byte");
                 continue;
             }
             // 110yyyyy 10zzzzzz
@@ -12372,25 +12339,11 @@ fn decode_utf8_with_errors(data: &[u8], err_mode: &str) -> Result<Wtf8Buf, crate
             let ordch2 = s[pos + 1];
             let ordch3 = s[pos + 2];
             if invalid_byte_2_of_3(ordch1, ordch2) {
-                pos = utf8_error_handler(
-                    err_mode,
-                    s,
-                    pos,
-                    pos + 1,
-                    "invalid continuation byte",
-                    &mut result,
-                )?;
+                run_err!(pos, pos + 1, "invalid continuation byte");
                 continue;
             }
             if invalid_cont_byte(ordch3) {
-                pos = utf8_error_handler(
-                    err_mode,
-                    s,
-                    pos,
-                    pos + 2,
-                    "invalid continuation byte",
-                    &mut result,
-                )?;
+                run_err!(pos, pos + 2, "invalid continuation byte");
                 continue;
             }
             // 1110xxxx 10yyyyyy 10zzzzzz
@@ -12407,36 +12360,15 @@ fn decode_utf8_with_errors(data: &[u8], err_mode: &str) -> Result<Wtf8Buf, crate
             let ordch3 = s[pos + 2];
             let ordch4 = s[pos + 3];
             if invalid_byte_2_of_4(ordch1, ordch2) {
-                pos = utf8_error_handler(
-                    err_mode,
-                    s,
-                    pos,
-                    pos + 1,
-                    "invalid continuation byte",
-                    &mut result,
-                )?;
+                run_err!(pos, pos + 1, "invalid continuation byte");
                 continue;
             }
             if invalid_cont_byte(ordch3) {
-                pos = utf8_error_handler(
-                    err_mode,
-                    s,
-                    pos,
-                    pos + 2,
-                    "invalid continuation byte",
-                    &mut result,
-                )?;
+                run_err!(pos, pos + 2, "invalid continuation byte");
                 continue;
             }
             if invalid_cont_byte(ordch4) {
-                pos = utf8_error_handler(
-                    err_mode,
-                    s,
-                    pos,
-                    pos + 3,
-                    "invalid continuation byte",
-                    &mut result,
-                )?;
+                run_err!(pos, pos + 3, "invalid continuation byte");
                 continue;
             }
             // 11110www 10xxxxxx 10yyyyyy 10zzzzzz
@@ -12546,15 +12478,18 @@ pub(crate) fn decode_bytes_to_wtf8(
         "utf-8" | "utf8" | "u8" => decode_utf8_with_errors(data, err_mode)?,
         "ascii" | "us-ascii" | "646" => {
             let mut out = Wtf8Buf::new();
+            // A custom error handler may replace exc.object; decoding then
+            // resumes from the new bytes (`abuf`).
+            let mut abuf: std::borrow::Cow<[u8]> = std::borrow::Cow::Borrowed(data);
             let mut i = 0;
-            while i < data.len() {
-                let b = data[i];
+            while i < abuf.len() {
+                let b = abuf[i];
                 if b >= 0x80 {
                     match err_mode {
                         "strict" => {
                             return Err(unicode_decode_error(
                                 "ascii",
-                                data,
+                                &abuf,
                                 i,
                                 i + 1,
                                 "ordinal not in range(128)",
@@ -12582,7 +12517,7 @@ pub(crate) fn decode_bytes_to_wtf8(
                         "surrogatepass" => {
                             return Err(unicode_decode_error(
                                 "ascii",
-                                data,
+                                &abuf,
                                 i,
                                 i + 1,
                                 "ordinal not in range(128)",
@@ -12597,15 +12532,20 @@ pub(crate) fn decode_bytes_to_wtf8(
                             return Err(decode_error_encode_only_handler());
                         }
                         _ => {
-                            i = crate::type_methods::call_registered_decode_error_handler(
-                                err_mode,
-                                "ascii",
-                                data,
-                                i,
-                                i + 1,
-                                "ordinal not in range(128)",
-                                &mut out,
-                            )?;
+                            let (np, nb) =
+                                crate::type_methods::call_registered_decode_error_handler(
+                                    err_mode,
+                                    "ascii",
+                                    &abuf,
+                                    i,
+                                    i + 1,
+                                    "ordinal not in range(128)",
+                                    &mut out,
+                                )?;
+                            if let Some(nb) = nb {
+                                abuf = std::borrow::Cow::Owned(nb);
+                            }
+                            i = np;
                             continue;
                         }
                     }
