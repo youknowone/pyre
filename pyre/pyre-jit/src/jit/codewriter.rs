@@ -7021,18 +7021,18 @@ impl CodeWriter {
             }};
         }
 
-        // pyframe.py:378-381 `pushvalue` lowers to
+        // `pushvalue` (pyframe.py) lowers to
         // `setarrayitem_vable_r(locals_cells_stack_w, depth, w_object)`
         // + `setfield_vable_i(valuestackdepth, depth + 1)` via
-        // jtransform.py:1898 `do_fixed_list_setitem` +
-        // jtransform.py:920-928. RPython's optimizer folds the per-push
-        // `setarrayitem_vable_r` via OptVirtualize so that the compiled
-        // trace pays only the final force-vable cost; pyre's
-        // OptVirtualize does not yet fold these at the same grain, so
-        // the emission is load-bearing for shadow parity with
-        // `list_of_boxes_virtualizable` + BH `virtualizable_boxes`
-        // reconstruction and the per-push cost is recovered only as the
-        // optimizer port progresses.
+        // `do_fixed_list_setitem` and `do_setfield` (jtransform.py).
+        //
+        // Both are jitcode operations, not IR: `_opimpl_setarrayitem_vable`
+        // (pyjitpl.py) consumes the write at trace time by assigning
+        // `virtualizable_boxes[index]` and synchronizing the image, and only
+        // the `_nonstandard_virtualizable` fallback records a SETARRAYITEM_GC.
+        // On the standard virtualizable the emission therefore costs no
+        // operation in the compiled trace, and no optimizer pass folds it —
+        // there is nothing in the IR to fold.
         macro_rules! emit_pushvalue_ref {
             ($depth:ident, $src:expr, $src_value:expr, $py_pc:expr) => {{
                 let _ = $src;
