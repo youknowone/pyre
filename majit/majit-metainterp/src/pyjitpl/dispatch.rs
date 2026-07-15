@@ -161,7 +161,7 @@ fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, majit_i
                         p.type_id,
                         p.vtable as usize,
                         p.is_gc_managed,
-                        false,
+                        p.headerless,
                         &specs,
                     );
                     let struct_key = majit_ir::descr::LLType::Struct(p.type_id);
