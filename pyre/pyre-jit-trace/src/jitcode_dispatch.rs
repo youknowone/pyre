@@ -10736,22 +10736,6 @@ fn m73_outercap_carry_enabled() -> bool {
     })
 }
 
-/// `PYRE_M73_MFCALLEE_CARRY` (#73 S5 phase-3 slice-3, default ON): carry
-/// the multi-frame callee's codewrite-time resume-marker twin in its top-frame
-/// word. Certified by the `M73_MFRAW`/`M73_MFAR` censuses (legacy==twin
-/// 2197/2197 and 44/44) and check.py (162×2, on and off). Disable with
-/// `PYRE_M73_MFCALLEE_CARRY=0`.
-pub(crate) fn m73_mfcallee_carry_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M73_MFCALLEE_CARRY") {
-        Some(v) => {
-            let v = v.to_string_lossy();
-            v != "0" && !v.eq_ignore_ascii_case("false")
-        }
-        None => true,
-    })
-}
-
 /// `PYRE_M73_ARMARKER_CARRY` (#73 S5 phase-2, default ON): source the plain
 /// after-residual-call marker from the codewrite-time fallthrough-marker twin
 /// at the guard's own jitcode offset, retaining runtime resume-marker
@@ -12758,7 +12742,8 @@ fn compute_nested_inline_caller_frame(
     }
     // The after-residual marker names the same `-live-` the fallthrough
     // translation resolves to (M73_PFMARKER identity), bypassing the py channel.
-    // `PYRE_M73_INLCALLER_CARRY=0` falls back to the sentinel + translation.
+    // Without a marker there is no coordinate to encode against, so the sentinel
+    // declines the caller frame (`PYRE_M73_INLCALLER_CARRY=0` forces that).
     let caller_liveness_word = match resume_marker_jit_pc.filter(|_| m73_inlcaller_carry_enabled())
     {
         Some(m) => m as i32,
@@ -12769,7 +12754,6 @@ fn compute_nested_inline_caller_frame(
         ctx.registers_r,
         ctx.registers_f,
         jitcode_index,
-        fallthrough_py_pc,
         call_jit_pc,
         caller_liveness_word,
     );
@@ -12828,16 +12812,16 @@ fn walker_capture_multi_frame_inline_snapshot(
     if !callee_pjc.is_populated() || callee_pjc.code_ptr.is_null() {
         return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: callee_op_pc });
     }
-    let callee_py_pc = unsafe {
-        let code = &*callee_pjc.code_ptr;
-        let mut py = python_pc_for_jitcode_pc(&callee_pjc.metadata, callee_op_pc);
-        py = skip_python_trivia_forward(code, py as usize) as u32;
-        if after_residual_call {
-            py = crate::pyjitpl::semantic_fallthrough_pc(code, py as usize) as u32;
-        }
-        py
-    };
     if std::env::var_os("PYRE_FBW_MF_DIAG").is_some() {
+        let callee_py_pc = unsafe {
+            let code = &*callee_pjc.code_ptr;
+            let mut py = python_pc_for_jitcode_pc(&callee_pjc.metadata, callee_op_pc);
+            py = skip_python_trivia_forward(code, py as usize) as u32;
+            if after_residual_call {
+                py = crate::pyjitpl::semantic_fallthrough_pc(code, py as usize) as u32;
+            }
+            py
+        };
         let pcdep = callee_pjc
             .metadata
             .pcdep_color_slots
@@ -12892,38 +12876,30 @@ fn walker_capture_multi_frame_inline_snapshot(
             }
         }
     }
-    // #124 Approach B (M2), mirror of the single-frame path: the callee (top)
-    // frame carries a branch guard's supplied pc
-    // (`GuardCaptureScope::branch_guard_jitcode_pc`) unchanged.  With
-    // `PYRE_M73_MFCALLEE_CARRY`, other guards source their word from the callee
-    // payload's resume-marker twin: after-residual guards use the fallthrough
-    // twin and retain the sentinel on a miss, while plain guards retain the raw
-    // `callee_op_pc` on a miss.  Computed BEFORE box collection so encoder
-    // liveness and decoder resume use the same coordinate.
+    // Mirror of the single-frame path: the callee (top) frame carries a branch
+    // guard's supplied pc (`GuardCaptureScope::branch_guard_jitcode_pc`)
+    // unchanged. For other guards, the callee payload supplies the
+    // resume-marker twin:
+    // after-residual guards use the fallthrough twin and retain the sentinel
+    // on a miss, while plain guards retain the raw `callee_op_pc` on a miss.
+    // Computed before box collection so encoder liveness and decoder resume
+    // use the same coordinate.
     let callee_jitcode_pc: i32 = match scope.branch_guard_jitcode_pc {
         Some(g) => g as i32,
-        None if after_residual_call => {
-            if m73_mfcallee_carry_enabled() {
-                callee_pjc
-                    .after_residual_marker_for_jitcode_pc(callee_op_pc)
-                    .map(|m| m as i32)
-                    .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC)
-            } else {
-                majit_ir::resumedata::NO_JITCODE_PC
-            }
-        }
-        None if m73_mfcallee_carry_enabled() => callee_pjc
+        None if after_residual_call => callee_pjc
+            .after_residual_marker_for_jitcode_pc(callee_op_pc)
+            .map(|m| m as i32)
+            .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC),
+        None => callee_pjc
             .resume_marker_for_jitcode_pc(callee_op_pc)
             .map(|m| m as i32)
             .unwrap_or(callee_op_pc as i32),
-        None => callee_op_pc as i32,
     };
     let callee_boxes = collect_callee_active_boxes(
         ctx.registers_i,
         ctx.registers_r,
         ctx.registers_f,
         callee_jitcode_index as u32,
-        callee_py_pc,
         callee_op_pc,
         callee_jitcode_pc,
     )?;
@@ -12998,21 +12974,9 @@ fn walker_capture_multi_frame_inline_snapshot(
         };
         frames.push((pf.jitcode_index, pf_pc_word, pf.boxes.as_slice()));
     }
-    let Some(callee_pc_word) = crate::state::pyjitcode_for_jitcode_index(callee_jitcode_index)
-        .and_then(|payload| {
-            payload.resolve_resume_pc_with_jitcode_pc(
-                callee_py_pc as i32,
-                callee_jitcode_pc,
-                crate::state::op_live(),
-            )
-        })
-        .map(|offset| offset as u32)
-    else {
-        return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: callee_op_pc });
-    };
     frames.push((
         callee_jitcode_index as u32,
-        callee_pc_word,
+        callee_jitcode_pc as u32,
         callee_boxes.as_slice(),
     ));
 
@@ -13917,7 +13881,7 @@ fn method_form_callee_body_supported(body_code: &[u8], callee_descr_refs: &[Desc
 /// violation (callee banks are sized to the jitcode num_regs co-published with
 /// liveness), so panic loudly rather than bleed NONE into the encoder.
 /// Build the inlined callee (top/innermost) snapshot frame's live box list
-/// from the sub-walk register banks at the guard's callee py_pc.
+/// from the sub-walk register banks at the guard's carried resume coordinate.
 ///
 /// Unlike [`collect_outer_active_boxes`], the callee sub-walk is sym-less and
 /// owns no virtualizable, so none of the vable-shadow / portal-red / #124
@@ -13933,22 +13897,23 @@ fn collect_callee_active_boxes(
     regs_r: &[OpRef],
     regs_f: &[OpRef],
     callee_jitcode_index: u32,
-    callee_py_pc: u32,
     callee_op_pc: usize,
     carried_jitcode_pc: i32,
 ) -> Result<Vec<OpRef>, DispatchError> {
+    // Without a carried coordinate there is no `-live-` window to size this
+    // frame's box section from, and the decoder would resume on one anyway;
+    // decline the inline rather than encode against an empty window.
+    if carried_jitcode_pc == majit_ir::resumedata::NO_JITCODE_PC {
+        return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: callee_op_pc });
+    }
     // The resume decoder consumes this frame's section per the liveness at the
     // carried `jitcode_pc` (`setposition` → `get_current_position_info`), not
-    // the lossy py_pc-keyed liveness window. Query the SAME
-    // carried
-    // coordinate so the encoder's box bank set agrees with the decoder's
-    // section sizes (mirror of `collect_outer_active_boxes`:5060 and
-    // `state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc`:1399).  A
+    // a Python-pc translation. Query the same carried coordinate so the
+    // encoder's box bank set agrees with the decoder's section sizes. A
     // mismatched window let a callee that int-specializes a param encode a Ref
     // where the decoder expects an int → `getvirtual_int: not a raw virtual`.
-    let banks = crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
+    let banks = crate::state::frame_liveness_reg_indices_by_bank_from_pc(
         callee_jitcode_index as i32,
-        callee_py_pc as i32,
         carried_jitcode_pc,
     );
     let mut active = Vec::with_capacity(banks.int.len() + banks.ref_.len() + banks.float.len());
@@ -13961,8 +13926,7 @@ fn collect_callee_active_boxes(
                     eprintln!(
                         "[fbw-mf-diag] decline: callee {name} reg {idx} {} \
                          (callee_jitcode_index={callee_jitcode_index}, \
-                         callee_py_pc={callee_py_pc}, bank_len={}, \
-                         live_i={:?} live_r={:?} live_f={:?})",
+                         bank_len={}, live_i={:?} live_r={:?} live_f={:?})",
                         if other.is_none() {
                             "out-of-range"
                         } else {
