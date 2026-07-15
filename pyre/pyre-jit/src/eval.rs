@@ -14,7 +14,7 @@ use pyre_interpreter::PyExecutionContext;
 use pyre_interpreter::executioncontext::ActionFlagOps;
 use pyre_interpreter::pyframe::PyFrame;
 use pyre_interpreter::{
-    PyError, PyResult, StepResult, decode_instruction_for_dispatch, execute_opcode_step,
+    PyError, PyResult, StepResult, decode_instruction_forward, execute_opcode_step,
 };
 use std::cell::{Cell, UnsafeCell};
 use std::collections::HashMap;
@@ -4901,7 +4901,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
             marker_profiled,
         );
 
-        let (opcode_pc, instruction, op_arg) = match decode_instruction_for_dispatch(code, pc) {
+        let (opcode_pc, instruction, op_arg) = match decode_instruction_forward(code, pc) {
             Ok(decoded) => decoded,
             Err(err) => return LoopResult::Done(Err(err.into())),
         };
