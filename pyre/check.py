@@ -365,6 +365,9 @@ def synth_perf_gate(path):
         # pyre-check: max-pypy-ratio=30
     Keeping the gate beside the workload makes a changed loop count or known
     slow path reviewable with the test that needs the allowance.
+
+    The limit is read against the native backends only; `run_synthetic_bench`
+    exempts wasm.
     """
     prefix = "# pyre-check: max-pypy-ratio="
     with open(path, encoding="utf-8") as source:
@@ -1166,9 +1169,15 @@ class Check:
         for backend in ALL_BACKENDS:
             if not self.enabled(backend):
                 continue
+            # wasm carries no perf-ratio gate, matching `run_bench` (which has no
+            # `wasm_vs_*` parameter at all): it legitimately runs a few× slower
+            # than the native backends a fixture's ratio is tuned for, so one
+            # ratio cannot gate both — see WASM_TIMEOUT_SCALE. Its per-bench
+            # timeout stays the hang guard.
+            vs_pypy = None if backend == "wasm" else max_pypy_ratio
             self._run_backend_bench(
                 backend, name, path, timeout,
-                None, max_pypy_ratio, t_cpython, t_pypy, pypy_output,
+                None, vs_pypy, t_cpython, t_pypy, pypy_output,
             )
 
     def run_synthetic_suite(self):
