@@ -481,10 +481,12 @@ pub(super) fn opcode_for_binop(op: &BinOp) -> Option<Ident> {
         BinOp::BitOr(_) => "IntOr",
         BinOp::BitXor(_) => "IntXor",
         // Logical `&&`/`||` on boolean operands (Rust requires `bool`, whose
-        // lowered register holds 0/1) is bit-for-bit the same as `&`/`|`; the
-        // operands are evaluated unconditionally, matching the IntEq+IntOr
-        // chain `lower_match_stmt` emits for multi-value arms.  A green operand
-        // folds so only the taken branch survives.
+        // lowered register holds 0/1) is bit-for-bit the same as `&`/`|`.
+        // M4 audit: every macro-lowered `&&`/`||` operand is pure/safe to
+        // evaluate unconditionally; no audited `#[jit_interp]` body depends on
+        // short-circuiting (only closure-literal `|| {}` tokens appear in the
+        // current annotated bodies).  A green operand folds so only the taken
+        // branch survives.
         BinOp::And(_) => "IntAnd",
         BinOp::Or(_) => "IntOr",
         BinOp::Shl(_) => "IntLshift",
