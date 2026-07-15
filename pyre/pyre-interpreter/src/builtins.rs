@@ -5852,10 +5852,11 @@ pub fn builtin_set_from_items(items: &[PyObjectRef]) -> Result<PyObjectRef, crat
         let item_len = pyre_object::gc_roots::shadow_stack_len() - item_base;
         for i in 0..item_len {
             let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
-            try_hash_value(item)?;
+            let hash = try_hash_value(item)?;
             let set = pyre_object::gc_roots::shadow_stack_get(sp);
             let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
-            pyre_object::w_set_add(set, item);
+            pyre_object::w_set_add_hashed_checked(set, item, hash)
+                .map_err(|_| crate::baseobjspace::take_pending_hash_error())?;
         }
         Ok(pyre_object::gc_roots::shadow_stack_get(sp))
     }
@@ -5915,11 +5916,12 @@ pub(crate) fn builtin_dict_ctor(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
                 let val_slot = pyre_object::gc_roots::shadow_stack_len();
                 pyre_object::gc_roots::pin_root(val);
                 let key = pyre_object::gc_roots::shadow_stack_get(key_base + i);
-                try_hash_value(key)?;
+                let hash = try_hash_value(key)?;
                 let dict = pyre_object::gc_roots::shadow_stack_get(sp);
                 let key = pyre_object::gc_roots::shadow_stack_get(key_base + i);
                 let val = pyre_object::gc_roots::shadow_stack_get(val_slot);
-                w_dict_store(dict, key, val);
+                pyre_object::w_dict_store_hashed_checked(dict, key, val, hash)
+                    .map_err(|_| crate::baseobjspace::take_pending_hash_error())?;
             }
             pyre_object::gc_roots::shadow_stack_get(sp)
         };
@@ -5955,11 +5957,12 @@ pub(crate) fn builtin_dict_ctor(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
             let pair_slot = pyre_object::gc_roots::shadow_stack_len();
             pyre_object::gc_roots::pin_root(elems[0]);
             pyre_object::gc_roots::pin_root(elems[1]);
-            try_hash_value(elems[0])?;
+            let hash = try_hash_value(elems[0])?;
             let dict = pyre_object::gc_roots::shadow_stack_get(sp);
             let key = pyre_object::gc_roots::shadow_stack_get(pair_slot);
             let val = pyre_object::gc_roots::shadow_stack_get(pair_slot + 1);
-            w_dict_store(dict, key, val);
+            pyre_object::w_dict_store_hashed_checked(dict, key, val, hash)
+                .map_err(|_| crate::baseobjspace::take_pending_hash_error())?;
         }
         pyre_object::gc_roots::shadow_stack_get(sp)
     };

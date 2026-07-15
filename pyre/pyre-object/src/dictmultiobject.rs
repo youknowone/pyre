@@ -247,6 +247,26 @@ pub unsafe fn object_key_for_checked(obj: PyObjectRef) -> Result<ObjectKey, Dict
     Ok(ObjectKey { hash, obj })
 }
 
+/// [`ObjectKey`] from a `space.hash_w` digest the caller already holds.
+///
+/// The pair to [`object_key_for_checked`] for callers that must hash at a
+/// point where `obj` can still be rooted — a user `__hash__` is a collection
+/// point, and the key caches `obj`, so a key built around the hash call
+/// captures the pre-move pointer.  Hashing first and handing the digest down
+/// here keys the element on the reloaded pointer and, because `hash_w` runs
+/// once, keeps `__hash__` at the single call `r_dict` makes.
+///
+/// `hash` must come from the same `space.hash_w` [`object_key_for`] would
+/// have invoked, or the key lands in a different bucket than an equal one
+/// stored through that path.
+#[inline]
+pub unsafe fn object_key_hashed(obj: PyObjectRef, hash: i64) -> ObjectKey {
+    // Clean slate for the bucket probe that follows in the caller, as in
+    // `object_key_for_checked`.
+    crate::dict_eq_hook::take_eq_error();
+    ObjectKey { hash, obj }
+}
+
 #[inline]
 pub unsafe fn hash_key_checked(obj: PyObjectRef) -> Result<(), DictKeyError> {
     let _ = crate::dict_eq_hook::try_hash_w(obj);
@@ -1791,23 +1811,45 @@ pub unsafe fn w_dict_store_checked(
     key: PyObjectRef,
     value: PyObjectRef,
 ) -> Result<(), DictKeyError> {
+    w_dict_store_checked_inner(obj, key, value, None)
+}
+
+/// [`w_dict_store_checked`] keyed on a `space.hash_w` digest the caller
+/// already holds — see [`object_key_hashed`] for why hashing moves out to the
+/// caller.  Only the object strategy consults `hash`; the typed strategies key
+/// on the unwrapped payload and never reach `space.hash_w`.
+pub unsafe fn w_dict_store_hashed_checked(
+    obj: PyObjectRef,
+    key: PyObjectRef,
+    value: PyObjectRef,
+    hash: i64,
+) -> Result<(), DictKeyError> {
+    w_dict_store_checked_inner(obj, key, value, Some(hash))
+}
+
+unsafe fn w_dict_store_checked_inner(
+    obj: PyObjectRef,
+    key: PyObjectRef,
+    value: PyObjectRef,
+    hash: Option<i64>,
+) -> Result<(), DictKeyError> {
     if is_module_dict(obj) {
         return w_module_dict_store_inner_checked(obj, key, value);
     }
     let strategy = (*(obj as *const W_DictObject)).dstrategy;
     if strategy_is(strategy, &crate::dictmultiobject::EMPTY_DICT_STRATEGY) {
         crate::dictmultiobject::EMPTY_DICT_STRATEGY.switch_to_correct_strategy(obj, key);
-        return w_dict_store_checked(obj, key, value);
+        return w_dict_store_checked_inner(obj, key, value, hash);
     }
     if strategy_is(
         strategy,
         &crate::dictmultiobject::EMPTY_KWARGS_DICT_STRATEGY,
     ) {
         crate::dictmultiobject::EMPTY_KWARGS_DICT_STRATEGY.switch_to_correct_strategy(obj, key);
-        return w_dict_store_checked(obj, key, value);
+        return w_dict_store_checked_inner(obj, key, value, hash);
     }
     if strategy_is(strategy, &crate::dictmultiobject::OBJECT_DICT_STRATEGY) {
-        return w_dict_store_object_strategy_checked(obj, key, value);
+        return w_dict_store_object_strategy_checked_inner(obj, key, value, hash);
     }
     if strategy_is(strategy, &crate::dictmultiobject::BYTES_DICT_STRATEGY) {
         if crate::is_bytes(key) {
@@ -1815,14 +1857,13 @@ pub unsafe fn w_dict_store_checked(
             return Ok(());
         }
         strategy.switch_to_object_strategy(obj);
-        return w_dict_store_object_strategy_checked(obj, key, value);
+        return w_dict_store_object_strategy_checked_inner(obj, key, value, hash);
     }
     if strategy_is(strategy, &crate::dictmultiobject::UNICODE_DICT_STRATEGY) {
-        if crate::is_str(key) {
-            return w_dict_store_object_strategy_checked(obj, key, value);
+        if !crate::is_str(key) {
+            w_dict_set_strategy(obj, &crate::dictmultiobject::OBJECT_DICT_STRATEGY);
         }
-        w_dict_set_strategy(obj, &crate::dictmultiobject::OBJECT_DICT_STRATEGY);
-        return w_dict_store_object_strategy_checked(obj, key, value);
+        return w_dict_store_object_strategy_checked_inner(obj, key, value, hash);
     }
     if strategy_is(strategy, &crate::dictmultiobject::INT_DICT_STRATEGY) {
         if crate::is_int(key) && !crate::is_bool(key) {
@@ -1830,7 +1871,7 @@ pub unsafe fn w_dict_store_checked(
             return Ok(());
         }
         strategy.switch_to_object_strategy(obj);
-        return w_dict_store_object_strategy_checked(obj, key, value);
+        return w_dict_store_object_strategy_checked_inner(obj, key, value, hash);
     }
     if strategy_is(strategy, &crate::identitydict::IDENTITY_DICT_STRATEGY) {
         if key_compares_by_identity(key) {
@@ -1838,7 +1879,7 @@ pub unsafe fn w_dict_store_checked(
             return Ok(());
         }
         strategy.switch_to_object_strategy(obj);
-        return w_dict_store_object_strategy_checked(obj, key, value);
+        return w_dict_store_object_strategy_checked_inner(obj, key, value, hash);
     }
     if strategy_is(strategy, &crate::kwargsdict::KWARGS_DICT_STRATEGY) {
         if crate::is_str(key) {
@@ -1846,7 +1887,7 @@ pub unsafe fn w_dict_store_checked(
             return Ok(());
         }
         strategy.switch_to_object_strategy(obj);
-        return w_dict_store_object_strategy_checked(obj, key, value);
+        return w_dict_store_object_strategy_checked_inner(obj, key, value, hash);
     }
     strategy.setitem(obj, key, value);
     if take_dict_key_error() {
@@ -1979,7 +2020,19 @@ pub unsafe fn w_dict_store_object_strategy_checked(
     key: PyObjectRef,
     value: PyObjectRef,
 ) -> Result<(), DictKeyError> {
-    let object_key = object_key_for_checked(key)?;
+    w_dict_store_object_strategy_checked_inner(obj, key, value, None)
+}
+
+unsafe fn w_dict_store_object_strategy_checked_inner(
+    obj: PyObjectRef,
+    key: PyObjectRef,
+    value: PyObjectRef,
+    hash: Option<i64>,
+) -> Result<(), DictKeyError> {
+    let object_key = match hash {
+        Some(hash) => object_key_hashed(key, hash),
+        None => object_key_for_checked(key)?,
+    };
     let dict = &mut *(obj as *mut W_DictObject);
     let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>);
     // Single setitem probe (matches `r_dict.setitem`'s one bucket scan).

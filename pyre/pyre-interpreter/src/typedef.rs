@@ -2178,10 +2178,11 @@ fn frozenset_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
             let item_len = pyre_object::gc_roots::shadow_stack_len() - item_base;
             for i in 0..item_len {
                 let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
-                crate::builtins::try_hash_value(item)?;
+                let hash = crate::builtins::try_hash_value(item)?;
                 let obj = pyre_object::gc_roots::shadow_stack_get(sp);
                 let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
-                pyre_object::w_set_add(obj, item);
+                pyre_object::w_set_add_hashed_checked(obj, item, hash)
+                    .map_err(|_| crate::baseobjspace::take_pending_hash_error())?;
             }
             pyre_object::gc_roots::shadow_stack_get(sp)
         }
@@ -2270,10 +2271,11 @@ fn set_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             let item_len = pyre_object::gc_roots::shadow_stack_len() - item_base;
             for i in 0..item_len {
                 let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
-                crate::builtins::try_hash_value(item)?;
+                let hash = crate::builtins::try_hash_value(item)?;
                 let set_obj = pyre_object::gc_roots::shadow_stack_get(sp);
                 let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
-                pyre_object::w_set_add(set_obj, item);
+                pyre_object::w_set_add_hashed_checked(set_obj, item, hash)
+                    .map_err(|_| crate::baseobjspace::take_pending_hash_error())?;
             }
         }
     }
@@ -3943,11 +3945,12 @@ fn init_dict_type(ns: PyObjectRef) {
                         let key_len = pyre_object::gc_roots::shadow_stack_len() - key_base;
                         for i in 0..key_len {
                             let key = pyre_object::gc_roots::shadow_stack_get(key_base + i);
-                            crate::builtins::try_hash_value(key)?;
+                            let hash = crate::builtins::try_hash_value(key)?;
                             let d = pyre_object::gc_roots::shadow_stack_get(sp);
                             let key = pyre_object::gc_roots::shadow_stack_get(key_base + i);
                             let value = pyre_object::gc_roots::shadow_stack_get(sp + 1);
-                            pyre_object::w_dict_store(d, key, value);
+                            pyre_object::w_dict_store_hashed_checked(d, key, value, hash)
+                                .map_err(|_| crate::baseobjspace::take_pending_hash_error())?;
                         }
                         pyre_object::gc_roots::shadow_stack_get(sp)
                     };
@@ -15430,10 +15433,11 @@ fn set_method_update(
             let item_len = pyre_object::gc_roots::shadow_stack_len() - item_base;
             for i in 0..item_len {
                 let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
-                crate::builtins::try_hash_value(item)?;
+                let hash = crate::builtins::try_hash_value(item)?;
                 let set = pyre_object::gc_roots::shadow_stack_get(set_slot);
                 let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
-                pyre_object::w_set_add(set, item);
+                pyre_object::w_set_add_hashed_checked(set, item, hash)
+                    .map_err(|_| crate::baseobjspace::take_pending_hash_error())?;
             }
         }
     }
@@ -15606,15 +15610,18 @@ fn init_set_type(ns: PyObjectRef) {
                         // `try_hash_value` may run a user `__hash__` that
                         // allocates and triggers a moving minor collection;
                         // root `self` and the element across it, then reload.
+                        // Its digest keys the store, so the element is hashed
+                        // once.
                         unsafe {
                             let _roots = pyre_object::gc_roots::push_roots();
                             let sp = pyre_object::gc_roots::shadow_stack_len();
                             pyre_object::gc_roots::pin_root(args[0]);
                             pyre_object::gc_roots::pin_root(args[1]);
-                            crate::builtins::try_hash_value(args[1])?;
+                            let hash = crate::builtins::try_hash_value(args[1])?;
                             let set = pyre_object::gc_roots::shadow_stack_get(sp);
                             let item = pyre_object::gc_roots::shadow_stack_get(sp + 1);
-                            pyre_object::w_set_add(set, item);
+                            pyre_object::w_set_add_hashed_checked(set, item, hash)
+                                .map_err(|_| crate::baseobjspace::take_pending_hash_error())?;
                         }
                     }
                     Ok(pyre_object::w_none())

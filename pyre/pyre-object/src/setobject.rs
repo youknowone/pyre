@@ -204,6 +204,44 @@ pub unsafe fn w_set_add_checked(
     Ok(())
 }
 
+/// [`w_set_add_checked`] keyed on a `space.hash_w` digest the caller already
+/// holds.
+///
+/// `setobject.py:1611 newset` builds the backing `r_dict` with both
+/// `space.eq_w` and `space.hash_w`, so one `add` hashes the element once and
+/// compares it with `eq_w`, and either callback raising aborts the store.
+/// A user `__hash__` is a collection point that can move both `obj` and
+/// `item`, so the hash is taken by the caller while they are still rooted and
+/// the digest handed down here; `hash` must be the `space.hash_w` result for
+/// `item` (see [`object_key_hashed`](crate::dictmultiobject::object_key_hashed)).
+///
+/// # Safety
+/// `obj` must point to a valid `W_SetObject`.
+pub unsafe fn w_set_add_hashed_checked(
+    obj: PyObjectRef,
+    item: PyObjectRef,
+    hash: i64,
+) -> Result<(), crate::dictmultiobject::DictKeyError> {
+    let key = crate::dictmultiobject::object_key_hashed(item, hash);
+    let s = &mut *(obj as *mut W_SetObject);
+    let entries = &mut *s.items;
+    // Single insert probe, as in `w_set_add_checked`: an `eq_w` that raises
+    // mid-probe reads as "not equal", so `insert` appends a spurious entry at
+    // the end; drop it so the add leaves the set unchanged.
+    let appended = entries.insert(key, ()).is_none();
+    if crate::dictmultiobject::take_dict_key_error() {
+        if appended {
+            entries.pop();
+        }
+        return Err(crate::dictmultiobject::DictKeyError);
+    }
+    if appended {
+        s.len += 1;
+        set_write_barrier(obj);
+    }
+    Ok(())
+}
+
 /// Membership test.
 ///
 /// # Safety
