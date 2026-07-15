@@ -1578,7 +1578,9 @@ impl LocalOpcodeHandler for PyFrame {
         let value = self.locals_w()[idx];
         if value.is_null() {
             return Err(PyError::unbound_local_error_with_name(
-                format!("local variable '{name}' referenced before assignment"),
+                format!(
+                    "cannot access local variable '{name}' where it is not associated with a value"
+                ),
                 name,
             ));
         }
@@ -2925,7 +2927,9 @@ impl OpcodeStepExecutor for PyFrame {
             let code = unsafe { &*crate::pyframe_get_pycode(self) };
             let name = code.varnames.get(idx).map(String::as_str).unwrap_or("");
             return Err(PyError::unbound_local_error_with_name(
-                format!("local variable '{name}' referenced before assignment"),
+                format!(
+                    "cannot access local variable '{name}' where it is not associated with a value"
+                ),
                 name,
             ));
         }

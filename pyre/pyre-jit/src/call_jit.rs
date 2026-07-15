@@ -5648,7 +5648,7 @@ pub extern "C" fn bh_load_fast_check_fn(value: i64, w_code_ptr: i64, name_idx: i
         "<cell>"
     };
     let exc_obj = pyre_interpreter::PyError::unbound_local_error_with_name(
-        format!("local variable '{name}' referenced before assignment"),
+        format!("cannot access local variable '{name}' where it is not associated with a value"),
         name,
     )
     .to_exc_object();

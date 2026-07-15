@@ -7391,7 +7391,9 @@ impl MIFrame {
             })?;
             if is_unbound {
                 return Err(PyError::unbound_local_error_with_name(
-                    format!("local variable '{name}' referenced before assignment"),
+                    format!(
+                        "cannot access local variable '{name}' where it is not associated with a value"
+                    ),
                     name,
                 ));
             }
@@ -7441,7 +7443,9 @@ impl MIFrame {
                 })?;
                 if is_unbound {
                     return Err(PyError::unbound_local_error_with_name(
-                        format!("local variable '{name}' referenced before assignment"),
+                        format!(
+                            "cannot access local variable '{name}' where it is not associated with a value"
+                        ),
                         name,
                     ));
                 }
@@ -7576,7 +7580,9 @@ impl MIFrame {
                 })?;
                 if concrete_unbound || traced_unbound {
                     return Err(PyError::unbound_local_error_with_name(
-                        format!("local variable '{name}' referenced before assignment"),
+                        format!(
+                            "cannot access local variable '{name}' where it is not associated with a value"
+                        ),
                         name,
                     ));
                 }

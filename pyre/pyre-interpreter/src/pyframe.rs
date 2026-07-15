@@ -1408,9 +1408,10 @@ pub fn hidden_local(code: &CodeObject, idx: usize) -> bool {
 ///
 /// pyopcode.py `_load_deref_unbound`: a cell variable (a captured local whose
 /// deref slot shares its `varnames` index via `MAKE_CELL`, or a pure cellvar
-/// in the `[nvarnames, nvarnames + npure_cellvars)` band) reports "local
-/// variable '{name}' referenced before assignment"; a free variable reports
-/// "free variable '{name}' referenced before assignment in enclosing scope".
+/// in the `[nvarnames, nvarnames + npure_cellvars)` band) reports "cannot
+/// access local variable '{name}' where it is not associated with a value"; a
+/// free variable reports "cannot access free variable '{name}' where it is not
+/// associated with a value in enclosing scope".
 /// `idx` follows the `npure_cellvars` slot layout: `varnames` occupy
 /// `[0, nvarnames)`, pure cellvars (those not also varnames) the next
 /// `npure_cellvars` slots, then freevars.
@@ -1453,9 +1454,11 @@ pub fn deref_name_and_kind(code: &CodeObject, idx: usize) -> (&str, bool) {
 pub fn deref_unbound_error(code: &CodeObject, idx: usize) -> crate::PyError {
     let (name, is_free) = deref_name_and_kind(code, idx);
     let message = if is_free {
-        format!("free variable '{name}' referenced before assignment in enclosing scope")
+        format!(
+            "cannot access free variable '{name}' where it is not associated with a value in enclosing scope"
+        )
     } else {
-        format!("local variable '{name}' referenced before assignment")
+        format!("cannot access local variable '{name}' where it is not associated with a value")
     };
     if is_free {
         crate::PyError::name_error_with_name(message, name)
