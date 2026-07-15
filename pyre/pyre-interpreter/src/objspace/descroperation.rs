@@ -3097,17 +3097,7 @@ pub fn and_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         // descr_and returns NotImplemented for a non-set rhs, so `&` requires
         // both operands to be sets (the `intersection` method takes iterables).
         if pyre_object::is_set_or_frozenset(a) && pyre_object::is_set_or_frozenset(b) {
-            let other_items = crate::builtins::collect_iterable(b)?;
-            let probe = pyre_object::w_set_from_items(&other_items);
-            let result: Vec<PyObjectRef> = pyre_object::w_set_items(a)
-                .into_iter()
-                .filter(|&item| pyre_object::w_set_contains(probe, item))
-                .collect();
-            return Ok(if pyre_object::is_frozenset(a) {
-                pyre_object::w_frozenset_from_items(&result)
-            } else {
-                pyre_object::w_set_from_items(&result)
-            });
+            return crate::typedef::set_method_intersection(&[a, b]);
         }
         if let Some(result) = try_dispatch_binary_special(a, b, "__and__", "__rand__")? {
             return Ok(result);

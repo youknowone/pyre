@@ -286,6 +286,26 @@ pub unsafe fn w_set_discard_checked(
     Ok(removed)
 }
 
+/// Replace the elements wholesale with `items`, which must already have
+/// hashed — they come from a set that was built through a checked path.
+///
+/// `setobject.py:483-484 descr_intersection_update` hands the computed
+/// result's strategy and storage straight to the set rather than removing
+/// the elements that fell out one by one.
+///
+/// # Safety
+/// `obj` must point to a valid `W_SetObject`.
+pub unsafe fn w_set_replace_items(obj: PyObjectRef, items: &[PyObjectRef]) {
+    let s = &mut *(obj as *mut W_SetObject);
+    let entries = &mut *s.items;
+    entries.clear();
+    for &item in items {
+        entries.insert(crate::dictmultiobject::object_key_for(item), ());
+    }
+    s.len = entries.len();
+    set_write_barrier(obj);
+}
+
 /// Number of elements in the set.
 ///
 /// # Safety

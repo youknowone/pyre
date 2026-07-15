@@ -15209,18 +15209,82 @@ fn set_method_union(
     Ok(pyre_object::w_set_from_items(&items))
 }
 
-fn set_method_intersection(
+/// Build a set from `w_iterable`, hashing each element as it enters.
+///
+/// `setobject.py:407 W_SetObject._newobj` / `setobject.py:609
+/// W_FrozensetObject._newobj` — both take ownership of the iterable's
+/// elements; only the resulting class differs, and the intersection reads
+/// back the elements rather than the object, so one set-shaped result
+/// serves both.
+fn set_newobj_items(
+    w_iterable: pyre_object::PyObjectRef,
+) -> Result<Vec<pyre_object::PyObjectRef>, crate::PyError> {
+    let items = crate::builtins::collect_iterable(w_iterable)?;
+    let w_set = crate::type_methods::set_from_items_checked(&items)?;
+    Ok(unsafe { pyre_object::w_set_items(w_set) })
+}
+
+/// Keep only the elements the two sides share.
+///
+/// `setobject.py:1160 AbstractUnwrappedSetStrategy.intersect_update` swaps the
+/// operands when self is the longer, and `setobject.py:1116 _intersect_base`
+/// swaps again on the way through, so either way the shorter side is walked
+/// and it is that side's objects the result holds. Equal elements can be
+/// distinct objects, so which side is walked is observable; a tie walks self.
+fn set_intersect_update(
+    w_set: Vec<pyre_object::PyObjectRef>,
+    w_other: Vec<pyre_object::PyObjectRef>,
+) -> Vec<pyre_object::PyObjectRef> {
+    let (keep, probe) = if w_set.len() > w_other.len() {
+        (w_other, w_set)
+    } else {
+        (w_set, w_other)
+    };
+    let probe = pyre_object::w_set_from_items(&probe);
+    keep.into_iter()
+        .filter(|&item| unsafe { pyre_object::w_set_contains(probe, item) })
+        .collect()
+}
+
+/// `setobject.py:286 W_BaseSetObject.descr_intersection` — the shortest
+/// operand seeds the result and the rest are intersected into it. Length is
+/// measured on the operands as given, before any is turned into a set, so an
+/// operand whose length cannot be taken (a generator) never seeds and a list
+/// with duplicates is measured longer than the set it becomes. That measure
+/// disagreeing with the set lengths is what leaves work for the swap in
+/// `set_intersect_update`.
+pub(crate) fn set_method_intersection(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
     if args.is_empty() {
         return Ok(pyre_object::w_set_new());
     }
-    let self_items = unsafe { pyre_object::w_set_items(args[0]) };
-    let mut result: Vec<pyre_object::PyObjectRef> = self_items;
-    for other in &args[1..] {
-        let other_items = crate::builtins::collect_iterable(*other)?;
-        let probe = pyre_object::w_set_from_items(&other_items);
-        result.retain(|&item| unsafe { pyre_object::w_set_contains(probe, item) });
+    let mut others_w: Vec<pyre_object::PyObjectRef> = args.to_vec();
+
+    // find smallest set in others_w to reduce comparisons
+    let mut startindex = 0usize;
+    let mut startlength: i64 = -1;
+    for i in 0..others_w.len() {
+        let length = match crate::baseobjspace::len_w(others_w[i]) {
+            Ok(length) => length,
+            Err(e)
+                if e.kind == crate::PyErrorKind::TypeError
+                    || e.kind == crate::PyErrorKind::AttributeError =>
+            {
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        if startlength == -1 || length < startlength {
+            startindex = i;
+            startlength = length;
+        }
+    }
+    others_w.swap(0, startindex);
+
+    let mut result = set_newobj_items(others_w[0])?;
+    for &w_other in &others_w[1..] {
+        result = set_intersect_update(result, set_newobj_items(w_other)?);
     }
     unsafe {
         if pyre_object::is_frozenset(args[0]) {
@@ -15393,43 +15457,23 @@ fn set_method_difference_update(
     Ok(pyre_object::w_none())
 }
 
+/// `setobject.py:480 W_SetObject.descr_intersection_update` — the result of
+/// `descr_intersection` replaces self's storage wholesale, so self keeps the
+/// surviving objects of whichever operand seeded that result rather than its
+/// own.
 fn set_method_intersection_update(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
     if args.is_empty() {
         return Ok(pyre_object::w_none());
     }
-    // Collect every other operand up front and hash its elements as they
-    // enter the intersection, so an unhashable one raises even when self is
-    // empty and there is nothing left to compare against.
-    let mut others: Vec<Vec<pyre_object::PyObjectRef>> = Vec::with_capacity(args.len() - 1);
-    for other in &args[1..] {
-        let other_items = crate::builtins::collect_iterable(*other)?;
-        for &o in other_items.iter() {
-            crate::builtins::try_hash_value(o)?;
-        }
-        others.push(other_items);
-    }
-    // Snapshot self's items, drop any not present in EVERY other.
-    let self_items = unsafe { pyre_object::w_set_items(args[0]) };
-    for item in self_items {
-        let mut keep = true;
-        for other_items in others.iter() {
-            let mut found = false;
-            for &o in other_items.iter() {
-                if crate::baseobjspace::eq_w(item, o)? {
-                    found = true;
-                    break;
-                }
-            }
-            if !found {
-                keep = false;
-                break;
-            }
-        }
-        if !keep {
-            unsafe { pyre_object::w_set_discard(args[0], item) };
-        }
+    // Every other operand becomes a set, hashing its elements, so an
+    // unhashable one raises even when self is empty and there is nothing
+    // left to compare against.
+    let result = set_method_intersection(args)?;
+    unsafe {
+        let items = pyre_object::w_set_items(result);
+        pyre_object::w_set_replace_items(args[0], &items);
     }
     Ok(pyre_object::w_none())
 }
