@@ -2960,7 +2960,7 @@ fn recipe_parent_frame_from_recipe(
         if crate::state::frame_pc_is_resolved_offset_at(recipe.jitcode_index, recipe.jitcode_pc) {
             recipe.jitcode_pc as usize
         } else {
-            pjc.resume_jitcode_pc_for(py_pc)?
+            return None;
         };
     let call_jit_pc = crate::jitcode_runtime::decoded_ops(pjc.jitcode.code.as_slice())
         .find(|op| op.next_pc == entry && op.opname.starts_with("residual_call"))

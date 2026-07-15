@@ -1202,14 +1202,7 @@ fn drive_bridge_framestack_walk(
             let middle_entry = select_recipe_entry(
                 middle.jitcode_index,
                 middle_pjc.jitcode.index() as i32,
-                crate::state::backxlat_py_pc(middle.jitcode_index, middle.jitcode_pc) as usize,
                 middle.jitcode_pc,
-                || {
-                    middle_pjc.resume_jitcode_pc_for(crate::state::backxlat_py_pc(
-                        middle.jitcode_index,
-                        middle.jitcode_pc,
-                    ) as usize)
-                },
             );
             let Some(middle_entry) = middle_entry else {
                 ctx.cut_trace(pre_pos);
