@@ -3099,24 +3099,8 @@ impl<S: JitState> JitDriver<S> {
                 let rd_consts_slice: &[Const] = storage.rd_consts();
 
                 // Convert RdVirtualInfo → VirtualInfo for blackhole resume.
-                let rd_virtuals_converted: Option<Vec<crate::resume::VirtualInfo>> = {
-                    let count = raw_values.len() as i32;
-                    let num_virtuals = storage.rd_virtuals.len();
-                    Some(
-                        storage
-                            .rd_virtuals
-                            .iter()
-                            .map(|rd| {
-                                crate::resume::rd_virtual_to_virtual_info(
-                                    rd,
-                                    rd_consts_slice,
-                                    count,
-                                    num_virtuals,
-                                )
-                            })
-                            .collect(),
-                    )
-                };
+                let rd_virtuals_converted =
+                    Some(convert_rd_virtuals_for_storage(storage, raw_values.len()));
                 let rd_virtuals_slice = rd_virtuals_converted.as_deref();
 
                 // resume.py:1338-1340: `jitcode = jitcodes[jitcode_pos];
