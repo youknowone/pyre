@@ -13872,6 +13872,17 @@ fn residual_call_helper_kind_in_body(
     d: &DecodedOp,
     callee_descr_refs: &[DescrRef],
 ) -> Option<majit_ir::PyreHelperKind> {
+    let descr_index = residual_call_descr_index_in_body(body_code, d)?;
+    callee_descr_refs
+        .get(descr_index)
+        .and_then(|descr| descr.as_call_descr())
+        .map(|cd| cd.get_extra_info().pyre_helper)
+}
+
+/// Return the per-function descriptor-pool index carried by a residual call
+/// in a callee jitcode body.  The layouts mirror the residual dispatchers:
+/// the descriptor follows the one or two variable-length argument lists.
+fn residual_call_descr_index_in_body(body_code: &[u8], d: &DecodedOp) -> Option<usize> {
     let descr_offset = match d.key {
         "residual_call_r_r/iRd>r" | "residual_call_r_i/iRd>i" | "residual_call_r_v/iRd" => {
             let r_len_pc = d.pc + 2;
@@ -13887,11 +13898,143 @@ fn residual_call_helper_kind_in_body(
         }
         _ => return None,
     };
-    let descr_index = decode_descr_index(body_code, d, descr_offset);
-    callee_descr_refs
-        .get(descr_index)
-        .and_then(|descr| descr.as_call_descr())
-        .map(|cd| cd.get_extra_info().pyre_helper)
+    Some(decode_descr_index(body_code, d, descr_offset))
+}
+
+/// Whether an inline callee can be replayed from its caller's CALL boundary
+/// without duplicating a live-heap effect.  The inline sub-walk's deopt
+/// snapshot does not yet carry its own callee frame, so this is deliberately
+/// stricter than ordinary inlining: unknown calls and every live-heap write
+/// decline up front.
+///
+/// A `new_with_vtable/d>r` result is fresh within this body.  Its
+/// initialization write is benign only when the target field is immutable;
+/// `wrapint` is the important instance (`W_IntObject.intval`).  Freshness may
+/// pass through `ref_copy`, but every other Ref-producing instruction clears
+/// it, so a later `setfield_gc` cannot accidentally be classified as an
+/// initialization of an earlier allocation.
+fn fbw_callee_body_side_effect_free(
+    body_code: &[u8],
+    num_regs_i: usize,
+    constants_i: &[i64],
+    callee_descr_refs: &[DescrRef],
+) -> bool {
+    let mut fresh_ref_regs = [false; u8::MAX as usize + 1];
+    let mut pc = 0usize;
+    while pc < body_code.len() {
+        let Some(d) = crate::jitcode_runtime::decode_op_at(body_code, pc) else {
+            return false;
+        };
+
+        if d.opname.starts_with("residual_call") {
+            let Some(descr_index) = residual_call_descr_index_in_body(body_code, &d) else {
+                return false;
+            };
+            let Some(call_descr) = callee_descr_refs
+                .get(descr_index)
+                .and_then(|descr| descr.as_call_descr())
+            else {
+                return false;
+            };
+            let ei = call_descr.get_extra_info();
+            let provably_side_effect_free = ei.check_is_elidable()
+                || ei.extraeffect == majit_ir::ExtraEffect::LoopInvariant
+                || ei.pyre_helper == majit_ir::PyreHelperKind::ForIterNext;
+            if !provably_side_effect_free
+                && !residual_call_is_specialized_plain_int_add(
+                    body_code,
+                    &d,
+                    num_regs_i,
+                    constants_i,
+                    callee_descr_refs,
+                )
+            {
+                return false;
+            }
+        } else if d.opname.starts_with("setfield_gc") {
+            // Canonical setfield shapes are `r<value>d`: the target ref is
+            // operand 0 and the field descr is operand 2.
+            let Some(&target_reg) = body_code.get(d.pc + 1) else {
+                return false;
+            };
+            let descr_index = decode_descr_index(body_code, &d, 2);
+            let immutable_field = callee_descr_refs
+                .get(descr_index)
+                .and_then(|descr| descr.as_field_descr())
+                .is_some_and(|field| field.is_immutable());
+            if !fresh_ref_regs[target_reg as usize] || !immutable_field {
+                return false;
+            }
+        } else if d.opname.starts_with("setarrayitem_gc")
+            || d.opname.starts_with("setinteriorfield_gc")
+            || d.opname.starts_with("raw_store")
+            || d.opname.starts_with("cond_call")
+            || d.opname.starts_with("call_assembler")
+            || d.opname.starts_with("inline_call")
+        {
+            // Array/interior/raw stores and non-residual call forms cannot be
+            // proven replay-safe from this single callee body.
+            return false;
+        }
+
+        // The result byte is always the final operand for `>r` forms.
+        if d.argcodes.ends_with(">r") {
+            let Some(&dst) = body_code.get(d.next_pc.saturating_sub(1)) else {
+                return false;
+            };
+            fresh_ref_regs[dst as usize] = d.key == "new_with_vtable/d>r"
+                || (d.key == "ref_copy/r>r"
+                    && body_code
+                        .get(d.pc + 1)
+                        .is_some_and(|src| fresh_ref_regs[*src as usize]));
+        }
+        pc = d.next_pc;
+    }
+    true
+}
+
+/// `BINARY_OP Add` has the generic residual shape in a per-function jitcode,
+/// but the walker replaces a statically tagged plain add with `IntAddOvf`
+/// before the generic residual executor (and its nested-residual decline) is
+/// reached.  Accept only the constant `Add` tag here; every in-place tag and
+/// every dynamic or different binary operation remains conservative.
+fn residual_call_is_specialized_plain_int_add(
+    body_code: &[u8],
+    d: &DecodedOp,
+    num_regs_i: usize,
+    constants_i: &[i64],
+    callee_descr_refs: &[DescrRef],
+) -> bool {
+    if !matches!(
+        d.key,
+        "residual_call_ir_r/iIRd>r" | "residual_call_ir_i/iIRd>i" | "residual_call_ir_v/iIRd"
+    ) || residual_call_helper_kind_in_body(body_code, d, callee_descr_refs)
+        != Some(majit_ir::PyreHelperKind::BinaryOp)
+    {
+        return false;
+    }
+    // `iIR`: funcptr i-reg, then the I-list.  The first I-list item is the
+    // BINARY_OP tag.  It must be in the callee's immutable constants window;
+    // a runtime tag could select an in-place or user-defined operation.
+    let Some(&i_len) = body_code.get(d.pc + 2) else {
+        return false;
+    };
+    if i_len == 0 {
+        return false;
+    }
+    let Some(&tag_reg) = body_code.get(d.pc + 3) else {
+        return false;
+    };
+    let Some(&tag) = (tag_reg as usize)
+        .checked_sub(num_regs_i)
+        .and_then(|constant_index| constants_i.get(constant_index))
+    else {
+        return false;
+    };
+    matches!(
+        pyre_interpreter::runtime_ops::binary_op_from_tag(tag),
+        Some(pyre_interpreter::bytecode::BinaryOperator::Add)
+    )
 }
 
 fn method_form_callee_body_supported(body_code: &[u8], callee_descr_refs: &[DescrRef]) -> bool {
@@ -14619,14 +14762,6 @@ fn try_walker_inline_user_call(
     if pyre_helper != majit_ir::PyreHelperKind::CallFn {
         return Ok(None);
     }
-    // An inline sub-walk inside a FOR_ITER body captures guards with
-    // the loop-header outer_active_boxes, but vable sync writes mid-body
-    // shadow state. On deopt the mismatch replays the last body
-    // iteration. Decline the inline; the call still executes concretely
-    // as a normal residual.
-    if fbw_foriter_inflight_active() {
-        return Ok(None);
-    }
     if r_args.is_empty() {
         return Ok(None);
     }
@@ -14695,6 +14830,23 @@ fn try_walker_inline_user_call(
     else {
         return Ok(None);
     };
+    // An inline sub-walk inside a FOR_ITER body resumes a guard at the
+    // caller's CALL boundary, so deopt re-executes the whole callee.  Replaying
+    // a live-heap mutation would double it; the nested-residual decline catches
+    // that only after an abort storm.  A side-effect-free callee replays
+    // benignly, so admit it.  `PYRE_FBW_FORITER_INLINE=0` restores the former
+    // blanket decline as a rollback escape hatch.
+    if fbw_foriter_inflight_active()
+        && (std::env::var("PYRE_FBW_FORITER_INLINE").as_deref() == Ok("0")
+            || !fbw_callee_body_side_effect_free(
+                body.code,
+                body.num_regs_i,
+                body.constants_i,
+                callee_descr_refs,
+            ))
+    {
+        return Ok(None);
+    }
     if method_form && !method_form_callee_body_supported(body.code, callee_descr_refs) {
         return Ok(None);
     }
@@ -14711,7 +14863,6 @@ fn try_walker_inline_user_call(
             shown += 1;
         }
     }
-
     // The inlined callee body is entered at pc=0 with the fast-path
     // register convention `registers_r[0..nparams] = positional args` —
     // the same seeding `dispatch_inline_call_dr_kind` uses for `n_*`
