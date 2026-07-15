@@ -1079,6 +1079,12 @@ impl MIFrame {
         self.with_ctx(|this, ctx| this.current_fail_args(ctx))
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn set_resume_marker_for_test(&mut self, jit_pc: usize) {
+        self.loop_close_marker_jit_pc = Some(jit_pc);
+    }
+
     #[doc(hidden)]
     pub fn capture_guard_class(
         &mut self,
@@ -1388,12 +1394,6 @@ impl MIFrame {
         after_residual_call: bool,
         top_frame_marker_call_pc: Option<usize>,
     ) -> Vec<OpRef> {
-        // pyjitpl.py:194: in_a_call or after_residual_call → self.pc
-        let live_pc = if in_a_call || after_residual_call {
-            self.fallthrough_pc
-        } else {
-            self.orgpc
-        };
         // resume.py:1045 consume_one_section invariant: every register
         // reported as live must be reachable via a valid OpRef. RPython
         // trivially satisfies this because every read populates
@@ -1545,21 +1545,15 @@ impl MIFrame {
             } else {
                 unsafe {
                     let jc = &*s.jitcode;
-                    (
-                        jc.payload
-                            .metadata
-                            .depth_at_py_pc
-                            .get(live_pc)
-                            .copied()
-                            .map(|d| d as usize),
-                        // #348 Part (2): per-PC color→slot entries at live_pc.
-                        jc.payload
-                            .metadata
-                            .pcdep_color_slots
-                            .get(live_pc)
-                            .cloned()
-                            .unwrap_or_default(),
-                    )
+                    match resume_jit_pc {
+                        Some(jit_pc) => (
+                            jc.payload
+                                .depth_for_jitcode_pc_pred(jit_pc)
+                                .map(|d| d as usize),
+                            jc.payload.pcdep_for_jitcode_pc(jit_pc).unwrap_or_default(),
+                        ),
+                        None => (None, Vec::new()),
+                    }
                 }
             };
             let valid_stack_only = if self.pre_opcode_registers_r.is_some() {
@@ -1770,14 +1764,16 @@ impl MIFrame {
                             // `pcdep_color_slots` entry; its color comes from
                             // the precomputed `result_color_at_pc` table (the
                             // `_result_argcode` analog, same source as
-                            // `compute_inline_caller_frame`). `live_pc` is the
-                            // fallthrough pc here (`in_a_call`), where the
-                            // result slot is the top of stack. `u16::MAX` =
-                            // empty stack / skeleton, skip the bank null.
+                            // `compute_inline_caller_frame`). The carried
+                            // JitCode marker names the result's live stack
+                            // position. `u16::MAX` = empty stack / skeleton,
+                            // skip the bank null.
                             let color_idx_opt = (!jitcode_ptr.is_null())
                                 .then(|| unsafe { &*jitcode_ptr })
                                 .and_then(|jc| {
-                                    jc.payload.metadata.result_color_at_pc.get(live_pc).copied()
+                                    resume_jit_pc.and_then(|jit_pc| {
+                                        jc.payload.result_color_for_jitcode_pc_pred(jit_pc)
+                                    })
                                 })
                                 .and_then(|c| (c != u16::MAX).then_some(c as usize));
                             if let Some(color_idx) = color_idx_opt {
@@ -1825,9 +1821,9 @@ impl MIFrame {
             // `pyre-jit`. Unconditional panic — any hit is a bug.
             panic!(
                 "get_list_of_active_boxes: skeleton jitcode (pc_map empty) \
-                 at live_pc={} — Phase X-0/X-1 removed all known triggers; \
+                 at jitcode_pc={:?} — Phase X-0/X-1 removed all known triggers; \
                  further hits are bugs.",
-                live_pc
+                resume_jit_pc
             );
         }
         // `pyjitpl.py:199-233` parity: decode the `-live-` offset from
@@ -1849,13 +1845,8 @@ impl MIFrame {
         // the CALL result ref the next opcode pops, so the decoder reads one
         // more ref than the encoder wrote.  Without a catch marker, use the
         // plain fallthrough `-live-` via `pc_map`.
-        let jit_pc = resume_jit_pc.unwrap_or_else(|| {
-            panic!(
-                "get_list_of_active_boxes: no pc_map entry for live_pc={} (pc_map.len={})",
-                live_pc,
-                jc.payload.metadata.first_jit_pc_by_py_pc.len()
-            )
-        });
+        let jit_pc =
+            resume_jit_pc.expect("get_list_of_active_boxes: no carried JitCode resume marker");
         let op_live = crate::state::op_live();
         let off = jc.payload.jitcode.get_live_vars_info(jit_pc, op_live);
         let all_liveness = crate::state::liveness_info_snapshot();
@@ -1933,8 +1924,8 @@ impl MIFrame {
                 } else {
                     if is_portal_red && std::env::var_os("PYRE_P2_DIAG").is_some() {
                         eprintln!(
-                            "[p2-trait-scratch] live_pc={} color={} owned by frame slot; keeping bank box",
-                            live_pc, reg_idx
+                            "[p2-trait-scratch] jitcode_pc={} color={} owned by frame slot; keeping bank box",
+                            jit_pc, reg_idx
                         );
                     }
                     registers_r_bank[reg_idx as usize]

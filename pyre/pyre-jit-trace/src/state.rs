@@ -1178,8 +1178,8 @@ impl FrameLivenessRegIndices {
     }
 }
 
-/// resume.py:1054 consume_boxes(info, boxes_i, boxes_r, boxes_f) parity:
-/// return live register indices split by the three liveness banks.
+/// Test/diagnostic-only direct JitCode `-live-` query: return live register
+/// indices split by the three liveness banks.
 /// RPython writes decoded values through `_callback_i/_callback_r/_callback_f`
 /// into `registers_i/r/f[index]`; keeping the banks separate prevents Ref-only
 /// semantic-slot remapping from swallowing Int/Float slots.
@@ -1187,11 +1187,7 @@ pub fn frame_liveness_reg_indices_by_bank_at(
     jitcode_index: i32,
     pc: i32,
 ) -> FrameLivenessRegIndices {
-    frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
-        jitcode_index,
-        pc,
-        majit_ir::resumedata::NO_JITCODE_PC,
-    )
+    frame_liveness_reg_indices_by_bank_from_pc(jitcode_index, pc)
 }
 
 /// `#124` Approach B encoder/decoder liveness query: identical to
@@ -1319,7 +1315,7 @@ pub fn seed_compiled_trace_jitcode_test_state(
     sym: &mut PyreSym,
     ctx: &mut TraceCtx,
     jitcode_index: i32,
-    live_pc: i32,
+    live_jit_pc: i32,
     stack_slots: &[(usize, OpRef)],
 ) {
     if !sym.jitcode.is_null() {
@@ -1337,7 +1333,7 @@ pub fn seed_compiled_trace_jitcode_test_state(
         sym.registers_r[reg_idx] = opref;
     }
 
-    let banks = frame_liveness_reg_indices_by_bank_at(jitcode_index, live_pc);
+    let banks = frame_liveness_reg_indices_by_bank_from_pc(jitcode_index, live_jit_pc);
     for &reg in &banks.int {
         let r = reg as usize;
         if r >= sym.registers_i.len() {

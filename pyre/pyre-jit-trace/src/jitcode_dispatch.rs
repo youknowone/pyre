@@ -10247,7 +10247,7 @@ fn vstack_containing_py_pc(metadata: &crate::PyJitCodeMetadata, jit_pc: usize) -
 /// non-derivable divergences), everything else derives via
 /// [`crate::pyjitcode::derive_resume_marker`].  `None` when `py` is out of
 /// range or the tables are empty (skeleton / fixture).
-fn pc_map_marker_for(metadata: &crate::PyJitCodeMetadata, py: usize) -> Option<usize> {
+pub(crate) fn pc_map_marker_for(metadata: &crate::PyJitCodeMetadata, py: usize) -> Option<usize> {
     if let Ok(i) = metadata
         .carryfwd_resume_pc
         .binary_search_by_key(&(py as u32), |&(p, _)| p)
@@ -12870,7 +12870,7 @@ fn walker_capture_multi_frame_inline_snapshot(
             .unwrap_or(0);
         let banks = crate::state::frame_liveness_reg_indices_by_bank_at(
             callee_jitcode_index as i32,
-            callee_py_pc as i32,
+            callee_op_pc as i32,
         );
         eprintln!(
             "[fbw-mf-diag] callee jc={callee_jitcode_index} op_pc={callee_op_pc} \
