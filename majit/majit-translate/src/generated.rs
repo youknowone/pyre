@@ -1,5 +1,5 @@
 //! Static registry of `Arc<JitCode>`s produced from
-//! pyre-interpreter handler graphs.
+//! pyre-interpreter graphs.
 //!
 //! ## Positioning (TODO)
 //!
@@ -8,7 +8,7 @@
 //! `rpython/jit/codewriter/codewriter.py:74 make_jitcodes` is handed
 //! `translator.graphs` — the rtyper has already materialised every graph
 //! in process memory by the time codewriter runs. pyre cannot inherit
-//! that assumption: Rust handler sources are on disk in a sibling crate
+//! that assumption: Rust interpreter sources are on disk in a sibling crate
 //! (`pyre/pyre-interpreter/`) and must become `FunctionGraph`s before
 //! the codewriter can touch them.
 //!
@@ -49,7 +49,7 @@
 //! that calls `analyze_multiple_pipeline_with_modules`
 //! with `pyre_interpreter::jit_trace_fnaddrs()` and then bincode-embeds
 //! the resulting `pipeline.jitcodes` into the `pyre-jit-trace` binary
-//! (`$OUT_DIR/opcode_jitcodes.bin`). That separate path is what supplies
+//! (`$OUT_DIR/jitcodes.bin`). That separate path is what supplies
 //! real `JitCode.fnaddr` values to the metainterp / blackhole runtime;
 //! `all_jitcodes()` here intentionally retains the **symbolic fnaddr
 //! fallback** because exercising the pipeline without `&fnaddr_bindings`
@@ -69,7 +69,7 @@
 //! ## Why this wraps the full pipeline
 //!
 //! An earlier draft of this module ran its own narrow pipeline
-//! (opcode_* free functions + trait impl methods only, with empty
+//! (a hand-picked set of free functions + trait impl methods only, with empty
 //! `StructFieldRegistry` / `known_struct_names`).
 //! That shape is **narrower than `translator.graphs`** upstream assumes
 //! and drops structural context:
@@ -185,7 +185,7 @@ fn build() -> AllJitCodes {
     // struct-field / return-type / known-struct context, wires up
     // jitdriver / portal / oopspec metadata, then calls
     // `grab_initial_jitcodes` + `drain_pending_graphs` through
-    // `build_canonical_opcode_dispatch`. The output mirrors RPython
+    // `make_jitcodes`. The output mirrors RPython
     // `call.py:87 self.jitcodes` (dict) + `call.py:88 self.all_jitcodes`
     // (list).
     //
@@ -218,7 +218,23 @@ fn build() -> AllJitCodes {
     // down by the unit tests below.
     let result = crate::analyze_multiple_pipeline_with_modules(
         PYRE_JIT_GRAPH_MODULES,
-        &crate::AnalyzeConfig::default(),
+        &crate::AnalyzeConfig {
+            pipeline: crate::PipelineConfig {
+                transform: crate::GraphTransformConfig::default(),
+                jit_drivers: vec![crate::JitDriverSpec {
+                    portal: crate::CallPath::from_segments(["eval", "eval_loop_jit"]),
+                    greens: vec![
+                        "next_instr".to_string(),
+                        "is_being_profiled".to_string(),
+                        "pycode".to_string(),
+                    ],
+                    reds: vec!["frame".to_string(), "ec".to_string()],
+                    virtualizables: vec!["frame".to_string()],
+                    red_types: vec!["PyFrame".to_string(), "ExecutionContext".to_string()],
+                }],
+                register_trait_families: Vec::new(),
+            },
+        },
         None,
         &|_, _| None,
         &[],

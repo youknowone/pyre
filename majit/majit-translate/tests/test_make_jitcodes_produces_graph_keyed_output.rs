@@ -1,4 +1,4 @@
-//! Structural anchor for `make_jitcodes` graph-keyed output.
+//! Structural anchor for portal-closure `make_jitcodes` output.
 //!
 //! Runs as
 //! `cargo test -p majit-translate test_make_jitcodes_produces_graph_keyed_output`.
@@ -22,51 +22,40 @@
 //!
 //! ## What this test anchors
 //!
-//! `make_jitcodes` output is **graph-keyed** — one `JitCode` per
-//! `CallPath`, with no `Instruction`-variant tables, no
-//! opcode-to-fragment lookups, no anything Python bytecode-shaped. The
-//! structural prohibition is: output is `{graph: JitCode}` only, no
-//! variant-keyed map.
-//!
-//! `test_phase_f_all_jitcodes.rs` covers most of the behavioural
-//! acceptance; this file adds the **structural** anchor, with focused
-//! assertions that detect any future drift toward variant-keyed output
-//! schemas.
+//! `make_jitcodes` output is graph-keyed: one `JitCode` per `CallPath`, with
+//! no `Instruction`-variant tables or opcode-to-fragment lookup. Portal and
+//! dispatch functions participate as ordinary graphs in the same closure.
+//! The structural prohibition is that output remains `{graph: JitCode}` only,
+//! with no variant-keyed map or synthetic dispatch root.
 
 use majit_translate::{
-    CallPath,
+    CallPath, HostStaticAddrs,
+    flowspace::model::ConstValue,
+    front::{
+        mir::build_semantic_program_from_llbcs_with_static_addrs_and_module_paths,
+        semantic::MirGraphLookup,
+    },
     generated::{AllJitCodes, with_all_jitcodes},
     jitcode::JitCode,
+    model::{ExitCase, ExitSwitch},
 };
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 #[test]
 fn test_make_jitcodes_produces_graph_keyed_output() {
     let reg = fixture_all_jitcodes();
 
-    // This is the cheap structural floor: `make_jitcodes` output is a
-    // graph-keyed registry (`CallPath -> JitCode`) with opcode-dispatch arms
-    // represented as ordinary synthetic CallPaths, not as a separate
-    // Instruction-keyed table. The full interpreter LLBC translation is
-    // deliberately kept out of the default test path.
+    // This is the cheap structural floor. The full interpreter LLBC
+    // translation is deliberately kept out of the default test path.
     assert_registry_is_graph_keyed(&reg);
-
-    let dispatch_selectors = dispatch_selectors(&reg);
-    assert_eq!(
-        dispatch_selectors.len(),
-        2,
-        "fixture should contain one named opcode arm and one wildcard arm"
-    );
     assert!(
-        dispatch_selectors.contains("Instruction::LoadConst"),
-        "named opcode arm present"
+        reg.by_path.keys().all(|path| path
+            .segments
+            .first()
+            .is_none_or(|segment| segment != "__opcode_dispatch__")),
+        "synthetic opcode-dispatch roots are not part of make_jitcodes output",
     );
-    assert!(
-        dispatch_selectors.contains("_"),
-        "wildcard opcode arm present"
-    );
-
     assert_no_instruction_keyed_output_map();
 }
 
@@ -75,7 +64,7 @@ fn test_make_jitcodes_produces_graph_keyed_output() {
     debug_assertions,
     ignore = "release-only: runs full LLBC translation; use `cargo test --release --test test_make_jitcodes_produces_graph_keyed_output`"
 )]
-fn slow_generated_jitcodes_keep_opcode_dispatch_shape() {
+fn slow_generated_jitcodes_preserve_complete_dispatcher_graph() {
     if !ensure_workspace_llbc_env() {
         eprintln!(
             "skipping: build/llbc/{{pyre-object,pyre-interpreter,pyre-jit}}.ullbc missing — \
@@ -84,82 +73,243 @@ fn slow_generated_jitcodes_keep_opcode_dispatch_shape() {
         return;
     }
 
+    // The runtime artifact stays graph-keyed, but the acceptance test must
+    // still prove that lowering preserved the complete interpreter dispatch.
+    // Cross-check source match arms against target-sharing MIR switch exits:
+    // this catches a dropped switch branch, an accidentally split/merged
+    // Or-pattern, or a missing wildcard without publishing an opcode side
+    // table to production consumers.
+    let llbc_paths: Vec<std::path::PathBuf> = std::env::split_paths(
+        &std::env::var_os("PYRE_MIR_FRONTEND_LLBC")
+            .expect("ensure_workspace_llbc_env installs the LLBC path list"),
+    )
+    .collect();
+    let mut ordered_paths = llbc_paths;
+    ordered_paths.sort_by_key(|path| {
+        !path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.contains("pyre-interpreter"))
+    });
+    let mut dispatcher_program = None;
+    for path in ordered_paths {
+        let llbc = majit_charon_reader::Llbc::load(&path)
+            .unwrap_or_else(|error| panic!("failed to load {}: {error}", path.display()));
+        if llbc.local_fn("execute_opcode_step").is_some() {
+            dispatcher_program = Some(
+                build_semantic_program_from_llbcs_with_static_addrs_and_module_paths(
+                    &[llbc],
+                    HostStaticAddrs::default(),
+                    &["pyopcode"],
+                )
+                .expect("lower pyopcode dispatcher from interpreter LLBC"),
+            );
+            break;
+        }
+    }
+    let program = dispatcher_program.expect("an LLBC input must define execute_opcode_step");
+    let lookup = MirGraphLookup::from_program(&program);
+    let dispatcher = lookup
+        .lookup_free("execute_opcode_step")
+        .expect("execute_opcode_step must lower to one unambiguous free-function graph");
+    let switch = dispatcher.block(dispatcher.startblock);
+    assert!(
+        matches!(switch.exitswitch, Some(ExitSwitch::Value(_))),
+        "execute_opcode_step must start with an Instruction discriminant switch",
+    );
+    let variants = program
+        .enum_variant_by_discriminant
+        .get("Instruction")
+        .expect("Instruction discriminants must be present in the semantic program");
+    let mut seen_discriminants = HashSet::new();
+    let mut mir_groups: Vec<(majit_translate::BlockId, BTreeSet<String>)> = Vec::new();
+    let mut mir_wildcards = 0usize;
+    let mut mir_wildcard_target = None;
+    for link in &switch.exits {
+        match &link.exitcase {
+            Some(ExitCase::Const(ConstValue::Int(discriminant))) => {
+                assert!(
+                    seen_discriminants.insert(*discriminant),
+                    "Instruction discriminant {discriminant} appears twice in the MIR switch",
+                );
+                let variant = variants.get(discriminant).unwrap_or_else(|| {
+                    panic!("MIR switch discriminant {discriminant} has no Instruction variant name")
+                });
+                if let Some((_, group)) = mir_groups
+                    .iter_mut()
+                    .find(|(target, _)| *target == link.target)
+                {
+                    assert!(group.insert(variant.clone()));
+                } else {
+                    mir_groups.push((link.target, BTreeSet::from([variant.clone()])));
+                }
+            }
+            Some(ExitCase::Const(ConstValue::UniStr(value))) if value == "default" => {
+                mir_wildcards += 1;
+                assert!(
+                    mir_wildcard_target.replace(link.target).is_none(),
+                    "the MIR switch contains more than one wildcard target",
+                );
+            }
+            other => panic!("unexpected execute_opcode_step switch case: {other:?}"),
+        }
+    }
+
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..");
+    let source =
+        std::fs::read_to_string(workspace_root.join("pyre/pyre-interpreter/src/pyopcode.rs"))
+            .expect("read execute_opcode_step source");
+    let syntax = syn::parse_file(&source).expect("parse pyopcode.rs");
+    let function = syntax
+        .items
+        .iter()
+        .find_map(|item| match item {
+            syn::Item::Fn(function) if function.sig.ident == "execute_opcode_step" => {
+                Some(function)
+            }
+            _ => None,
+        })
+        .expect("pyopcode.rs defines execute_opcode_step");
+    let match_expr = function
+        .block
+        .stmts
+        .iter()
+        .find_map(|statement| match statement {
+            syn::Stmt::Expr(syn::Expr::Match(match_expr), _) => Some(match_expr),
+            _ => None,
+        })
+        .expect("execute_opcode_step contains its dispatcher match");
+    let mut source_groups = Vec::new();
+    let mut source_wildcards = 0usize;
+    for arm in &match_expr.arms {
+        let mut pending = vec![&arm.pat];
+        let mut group = BTreeSet::new();
+        let mut wildcard = false;
+        while let Some(pattern) = pending.pop() {
+            match pattern {
+                syn::Pat::Or(or_pattern) => pending.extend(or_pattern.cases.iter()),
+                syn::Pat::Paren(paren) => pending.push(&paren.pat),
+                syn::Pat::Path(path) => {
+                    let variant = path
+                        .path
+                        .segments
+                        .last()
+                        .expect("Instruction pattern path has a variant")
+                        .ident
+                        .to_string();
+                    assert!(group.insert(variant));
+                }
+                syn::Pat::Struct(struct_pattern) => {
+                    let variant = struct_pattern
+                        .path
+                        .segments
+                        .last()
+                        .expect("Instruction struct pattern has a variant")
+                        .ident
+                        .to_string();
+                    assert!(group.insert(variant));
+                }
+                syn::Pat::TupleStruct(tuple_pattern) => {
+                    let variant = tuple_pattern
+                        .path
+                        .segments
+                        .last()
+                        .expect("Instruction tuple pattern has a variant")
+                        .ident
+                        .to_string();
+                    assert!(group.insert(variant));
+                }
+                syn::Pat::Wild(_) => wildcard = true,
+                other => panic!(
+                    "unexpected execute_opcode_step source pattern kind: {:?}",
+                    std::mem::discriminant(other),
+                ),
+            }
+        }
+        if wildcard {
+            source_wildcards += 1;
+            assert!(group.is_empty(), "wildcard arm must not mix named variants");
+        } else {
+            assert!(
+                !group.is_empty(),
+                "dispatcher arm has no Instruction variants"
+            );
+            source_groups.push(group);
+        }
+    }
+
+    assert!(
+        mir_groups
+            .iter()
+            .all(|(target, _)| Some(*target) != mir_wildcard_target),
+        "the wildcard and an explicit Instruction case share a target",
+    );
+    let mut mir_groups: Vec<Vec<String>> = mir_groups
+        .into_iter()
+        .map(|(_, group)| group.into_iter().collect())
+        .collect();
+    let mut source_groups: Vec<Vec<String>> = source_groups
+        .into_iter()
+        .map(|group| group.into_iter().collect())
+        .collect();
+    mir_groups.sort();
+    source_groups.sort();
+    assert_eq!(mir_wildcards, 1, "MIR dispatcher must retain one wildcard");
+    assert_eq!(
+        source_wildcards, 1,
+        "source dispatcher must declare one wildcard"
+    );
+    assert_eq!(source_groups.len() + source_wildcards, 111);
+    assert_eq!(mir_groups.len() + mir_wildcards, 111);
+    assert_eq!(
+        seen_discriminants.len(),
+        118,
+        "the 110 named source arms must retain all grouped Instruction cases",
+    );
+    assert_eq!(
+        mir_groups, source_groups,
+        "lowered MIR dispatcher groups differ from the source match",
+    );
+    assert_eq!(
+        mir_groups.iter().filter(|group| group.len() > 1).count(),
+        3,
+        "the dispatcher must retain all three grouped source arms",
+    );
+
     with_all_jitcodes(|reg| {
         assert_registry_is_graph_keyed(reg);
 
-        // Registry size reflects the expected closure. The
-        // 28 `opcode_*` handlers lower to FunctionGraphs, every PyFrame
-        // trait method has a graph, and the registry holds at least that
-        // many JitCodes (plus whatever shared_opcode / inherent method
-        // closure the BFS pulls in).
-        //
-        // Lower floor is intentional — the upper bound drifts as more
-        // helpers get pulled into the closure by the BFS. A count
-        // regression is the signal; any growth is fine.
+        // Lower floor is intentional: the upper bound grows as more ordinary
+        // helpers become reachable from the portal. A count regression is the
+        // signal; growth is valid.
         assert!(
             reg.in_order.len() >= 28,
-            "expected at least 28 JitCodes (Phase A opcode_* floor); got {}",
-            reg.in_order.len()
+            "portal closure unexpectedly small"
         );
+        let portal_path = CallPath::from_segments(["eval", "eval_loop_jit"]);
+        let portal = reg
+            .by_path
+            .get(&portal_path)
+            .expect("the exact configured eval::eval_loop_jit portal must be compiled");
+        assert!(portal.jitdriver_sd().is_some());
 
-        // Registry contains every per-opcode-arm dispatch JitCode,
-        // produced by `build_canonical_opcode_dispatch` (lib.rs:965-1027)
-        // from the decomposed `execute_opcode_step` match arms. The portal
-        // selector itself is not separately registered; each arm becomes
-        // one `__opcode_dispatch__::<selector>#<arm_id>` JitCode mirroring
-        // RPython's per-opcode handler graphs at `call.py:145-148
-        // grab_initial_jitcodes`.
-        let dispatch_keys = dispatch_keys(reg);
-        assert_eq!(
-            dispatch_keys.len(),
-            111,
-            "expected 111 per-opcode dispatch arms in `by_path`; got {}",
-            dispatch_keys.len()
-        );
-        let dispatch_selectors = selectors_from_dispatch_keys(&dispatch_keys);
-        assert_eq!(
-            dispatch_selectors.len(),
-            dispatch_keys.len(),
-            "opcode dispatch selectors must be unique across arms"
-        );
-        assert_eq!(
-            dispatch_selectors
-                .iter()
-                .filter(|selector| selector.contains(" | "))
-                .count(),
-            3,
-            "expected three Or-pattern dispatch arms"
-        );
+        for required_leaf in ["execute_opcode_step", "execute_pop_top"] {
+            assert!(
+                reg.by_path
+                    .keys()
+                    .any(|path| path.last_segment() == Some(required_leaf)),
+                "ordinary portal closure must contain `{required_leaf}`",
+            );
+        }
         assert!(
-            dispatch_selectors.contains("Instruction::PopTop"),
-            "PopTop arm present"
-        );
-        assert!(
-            dispatch_selectors.contains("Instruction::LoadConst"),
-            "LoadConst arm present"
-        );
-        assert!(
-            dispatch_selectors.contains("Instruction::ExitInitCheck"),
-            "ExitInitCheck present as its own arm"
-        );
-        assert!(dispatch_selectors.contains("_"), "wildcard key present");
-        let async_stub_cases = [
-            "Instruction::CleanupThrow",
-            "Instruction::EndAsyncFor",
-            "Instruction::GetAiter",
-            "Instruction::GetAnext",
-        ];
-        assert!(
-            dispatch_selectors.iter().any(|selector| {
-                async_stub_cases
-                    .iter()
-                    .all(|case| selector.split(" | ").any(|part| part == *case))
+            reg.by_path.keys().all(|path| {
+                path.segments
+                    .first()
+                    .is_none_or(|segment| segment != "__opcode_dispatch__")
             }),
-            "async-stub Or group present: got {dispatch_selectors:?}"
-        );
-        assert!(
-            dispatch_selectors.contains("Instruction::GetAwaitable"),
-            "GetAwaitable present as its own arm"
+            "portal closure must not contain synthetic dispatch roots",
         );
     });
 
@@ -167,27 +317,27 @@ fn slow_generated_jitcodes_keep_opcode_dispatch_shape() {
 }
 
 fn fixture_all_jitcodes() -> AllJitCodes {
-    let portal = Arc::new(JitCode::new("portal"));
-    let load_const = Arc::new(JitCode::new("Instruction::LoadConst#0"));
-    let wildcard = Arc::new(JitCode::new("_#1"));
+    let portal = Arc::new(JitCode::new("mainloop"));
+    let dispatch = Arc::new(JitCode::new("dispatch_step"));
     let helper = Arc::new(JitCode::new("helper"));
-
     AllJitCodes {
         by_path: [
-            (CallPath::from_segments(["portal"]), Arc::clone(&portal)),
             (
-                CallPath::from_segments(["__opcode_dispatch__", "Instruction::LoadConst#0"]),
-                Arc::clone(&load_const),
+                CallPath::from_segments(["engine", "mainloop"]),
+                Arc::clone(&portal),
             ),
             (
-                CallPath::from_segments(["__opcode_dispatch__", "_#1"]),
-                Arc::clone(&wildcard),
+                CallPath::from_segments(["engine", "dispatch_step"]),
+                Arc::clone(&dispatch),
             ),
-            (CallPath::from_segments(["helper"]), Arc::clone(&helper)),
+            (
+                CallPath::from_segments(["engine", "helper"]),
+                Arc::clone(&helper),
+            ),
         ]
         .into_iter()
         .collect(),
-        in_order: vec![portal, load_const, wildcard, helper],
+        in_order: vec![portal, dispatch, helper],
     }
 }
 
@@ -233,70 +383,34 @@ fn assert_registry_is_graph_keyed(reg: &AllJitCodes) {
     }
 }
 
-fn dispatch_keys(reg: &AllJitCodes) -> Vec<String> {
-    reg.by_path
-        .keys()
-        .filter_map(|k| {
-            if k.segments.first().map(|s| s.as_str()) == Some("__opcode_dispatch__") {
-                k.segments.get(1).cloned()
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
-fn selectors_from_dispatch_keys(dispatch_keys: &[String]) -> HashSet<String> {
-    dispatch_keys
-        .iter()
-        .map(|k| {
-            k.rsplit_once('#')
-                .map(|(selector, _)| selector)
-                .unwrap_or(k)
-        })
-        .map(str::to_string)
-        .collect()
-}
-
-fn dispatch_selectors(reg: &AllJitCodes) -> HashSet<String> {
-    selectors_from_dispatch_keys(&dispatch_keys(reg))
-}
-
 fn assert_no_instruction_keyed_output_map() {
-    // Registry is not keyed by Instruction. This is a
-    // structural assertion: `by_path` is `HashMap<CallPath, Arc<JitCode>>`
-    // at the type level, so we can't even construct a variant-keyed
-    // view. The assertion below verifies the grep floor agrees — a
-    // compile-time type enforces no variant-key lookup ever compiles.
+    // Registry output is not keyed by Instruction. `by_path` enforces this at
+    // the type level; the source scan additionally prevents a parallel
+    // variant-keyed output map or synthetic dispatch namespace from returning.
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut offenders: Vec<String> = Vec::new();
+    let mut offenders = Vec::new();
     walk_rs_files(&root, &mut |path, contents| {
         for (i, line) in contents.lines().enumerate() {
             let trimmed = line.trim_start();
-            // Skip doc comments and regular comments — they may
-            // legitimately reference the negative form.
             if trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with("*") {
                 continue;
             }
-            if line.contains("HashMap<Instruction") {
+            if line.contains("HashMap<Instruction") || line.contains("__opcode_dispatch__") {
                 offenders.push(format!("{}:{}: {}", path.display(), i + 1, line.trim()));
             }
         }
     });
     assert!(
         offenders.is_empty(),
-        "variant-keyed output forbidden — RPython `call.py:87 self.jitcodes` \
-         is graph-keyed only:\n{}",
+        "JitCode output must be graph-keyed only:\n{}",
         offenders.join("\n")
     );
 }
 
 /// Resolve workspace LLBC artefacts and export `PYRE_MIR_FRONTEND_LLBC`
-/// when they exist. The 5-module `PYRE_JIT_GRAPH_MODULES` fixture used
-/// by `generated::with_all_jitcodes` falls below the production
-/// auto-discovery floor (>=50 parsed_files), so test invocations must
-/// opt in explicitly. Returns `false` when the artefacts are absent so
-/// the caller can skip cleanly.
+/// when they exist. The compact `PYRE_JIT_GRAPH_MODULES` fixture cannot rely on
+/// production auto-discovery, so this release-only test opts in explicitly.
+/// Returns `false` when the artefacts are absent so the caller can skip.
 fn ensure_workspace_llbc_env() -> bool {
     if std::env::var_os("PYRE_MIR_FRONTEND_LLBC").is_some() {
         return true;
@@ -318,12 +432,13 @@ fn ensure_workspace_llbc_env() -> bool {
         }
         paths.push(p.to_string_lossy().into_owned());
     }
-    // Join with the OS path-list separator (`;` on Windows, `:` else)
-    // so Windows drive letters survive; lib.rs parses it via split_paths.
     let joined = std::env::join_paths(&paths).expect("join llbc paths");
-    // SAFETY: set_var is unsafe in Rust 2024 because multi-threaded
-    // env mutation races; this test binary runs single-threaded before
-    // `with_all_jitcodes` spawns any worker, so the call is sound.
+    // `join_paths` uses the OS path-list separator (`;` on Windows, `:`
+    // elsewhere), so Windows drive letters survive lib.rs's `split_paths`.
+    //
+    // SAFETY: `set_var` is unsafe in Rust 2024 because concurrent environment
+    // mutation races. This release-only integration test configures the
+    // process before the thread-local generated registry is initialized.
     unsafe { std::env::set_var("PYRE_MIR_FRONTEND_LLBC", joined) };
     true
 }

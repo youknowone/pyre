@@ -47,7 +47,17 @@ pub(crate) fn pyre_pipeline_config() -> crate::PipelineConfig {
                 .collect(),
             ..Default::default()
         },
-        portal: None,
+        jit_drivers: vec![crate::JitDriverSpec {
+            portal: crate::CallPath::from_segments(["eval", "eval_loop_jit"]),
+            greens: vec![
+                "next_instr".to_string(),
+                "is_being_profiled".to_string(),
+                "pycode".to_string(),
+            ],
+            reds: vec!["frame".to_string(), "ec".to_string()],
+            virtualizables: vec!["frame".to_string()],
+            red_types: vec!["PyFrame".to_string(), "ExecutionContext".to_string()],
+        }],
         register_trait_families: Vec::new(),
     }
 }

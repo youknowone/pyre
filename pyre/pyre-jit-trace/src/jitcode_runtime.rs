@@ -7,25 +7,23 @@
 //! stores reference the same Python objects.
 //!
 //! majit's build-time side lives in `majit_translate::jitcode::JitCode`
-//! (serde-serializable, emitted by `build.rs` into
-//! `$OUT_DIR/opcode_jitcodes.bin`). This module deserializes that blob once
-//! on first access and hands out `Arc<JitCode>` shells. The `PipelineOpcodeArm
-//! .entry_jitcode_index` field (already present in the canonical pipeline
-//! result) indexes into this table.
+//! (serde-serializable, emitted by `build.rs` into `$OUT_DIR/jitcodes.bin`).
+//! This module deserializes that blob once on first access and hands out
+//! `Arc<JitCode>` shells. The configured portal index is read from the
+//! separately serialized generic `CompiledJitDriver` metadata.
 //!
-//! No side-table serialization: the only persisted collection is
-//! `pipeline.jitcodes`, in allocation order, matching RPython's single-store
-//! model (`feedback_single_jitcodes_store`).
+//! No opcode-body side table is serialized: `pipeline.jitcodes`, in allocation
+//! order, remains the single executable store matching RPython's model
+//! (`feedback_single_jitcodes_store`). Driver metadata only identifies indices
+//! in that store; it does not duplicate JitCode bodies.
 
 use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
 use majit_ir::DescrRef;
+use majit_translate::CompiledJitDriver;
 use majit_translate::jitcode::{BhDescr, JitCode};
-use majit_translate::opcode_dispatch::PipelineOpcodeArm;
-use majit_translate::{CallPath, OpcodeDispatchSelector};
-use pyre_interpreter::bytecode::Instruction;
 
 thread_local! {
     /// Per-thread cached `&'static` to the build-time `pipeline.jitcodes`
@@ -48,19 +46,16 @@ thread_local! {
     /// matching the previous `LazyLock<Vec<...>>` storage.
     static ALL_JITCODES: OnceCell<&'static [Arc<JitCode>]> = const { OnceCell::new() };
 
-    /// Per-thread cached `&'static` to the build-time
-    /// `pipeline.opcode_dispatch` table.  Same single-thread invariant
-    /// and `Box::leak` strategy as `ALL_JITCODES` —
-    /// `PipelineOpcodeArm.flattened: Option<SSARepr>` transitively
-    /// embeds `Variable`.
-    static ALL_OPCODE_ARMS: OnceCell<&'static [PipelineOpcodeArm]> = const { OnceCell::new() };
+    /// Explicit build-time JIT-driver metadata. Pyre currently configures
+    /// exactly one driver, but the serialized shape remains generic.
+    static COMPILED_JIT_DRIVERS: OnceCell<&'static [CompiledJitDriver]> = const { OnceCell::new() };
 }
 
 fn load_all_jitcodes() -> &'static [Arc<JitCode>] {
-    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/opcode_jitcodes.bin"));
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/jitcodes.bin"));
     let mut vec: Vec<Arc<JitCode>> = bincode::deserialize(BYTES).unwrap_or_else(|e| {
         panic!(
-            "pyre-jit-trace: failed to deserialize opcode_jitcodes.bin \
+            "pyre-jit-trace: failed to deserialize jitcodes.bin \
              ({} bytes): {e}",
             BYTES.len(),
         )
@@ -98,11 +93,11 @@ fn load_all_jitcodes() -> &'static [Arc<JitCode>] {
     Box::leak(vec.into_boxed_slice())
 }
 
-fn load_all_opcode_arms() -> &'static [PipelineOpcodeArm] {
-    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/opcode_dispatch.bin"));
-    let vec: Vec<PipelineOpcodeArm> = bincode::deserialize(BYTES).unwrap_or_else(|e| {
+fn load_compiled_jit_drivers() -> &'static [CompiledJitDriver] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/jit_drivers.bin"));
+    let vec: Vec<CompiledJitDriver> = bincode::deserialize(BYTES).unwrap_or_else(|e| {
         panic!(
-            "pyre-jit-trace: failed to deserialize opcode_dispatch.bin \
+            "pyre-jit-trace: failed to deserialize jit_drivers.bin \
              ({} bytes): {e}",
             BYTES.len(),
         )
@@ -117,9 +112,8 @@ pub fn all_jitcodes() -> &'static [Arc<JitCode>] {
 
 /// RPython: `metainterp_sd.jitcodes[index]` where `index == jitcode.index`.
 ///
-/// Build-time `PipelineOpcodeArm.entry_jitcode_index` is this logical
-/// index. The dense invariant (`ALL_JITCODES[i].index == i`) is asserted
-/// at load time, so direct vec indexing is correct.
+/// The dense invariant (`ALL_JITCODES[i].index == i`) is asserted at load
+/// time, so direct vec indexing is correct.
 pub fn get_jitcode_by_index(index: usize) -> Option<Arc<JitCode>> {
     all_jitcodes().get(index).cloned()
 }
@@ -128,19 +122,10 @@ pub fn get_jitcode_by_index(index: usize) -> Option<Arc<JitCode>> {
 //
 // RPython `warmspot.py:281-282` + `call.py:147-148`:
 // `jd.mainjitcode = self.get_jitcode(jd.portal_graph)` followed by
-// `jd.mainjitcode.jitdriver_sd = jd`. The single jitcode whose
-// `jitdriver_sd` is set is the portal — every other entry in
-// `metainterp_sd.jitcodes` is either an inlined callee or an indirect
-// call target. Pyre's bincode preserves that flag through
-// `oncelock_usize_serde`, so the scan below identifies the same
-// jitcode the codewriter side stored in
-// `JitDriverStaticData.mainjitcode`.
-//
-// Production identity: `pyre-jit-trace/build.rs:33-54`
-// includes `pyre/pyre-jit/src/eval.rs` in the source-only walk so the
-// scan below picks up the `eval_loop_jit` jitcode whose
-// `jitdriver_sd` is populated by `assign_portal_jitdriver_indices`
-// (`pyre-jit/src/jit/codewriter.rs:6544` — call.py:148 deferred port).
+// `jd.mainjitcode.jitdriver_sd = jd`. The build artifact serializes that
+// index directly in `CompiledJitDriver`; runtime validates the referenced
+// JitCode still carries the driver marker instead of rediscovering portal
+// identity from a name or flag scan.
 thread_local! {
     /// Cached portal jitcode index for the current thread.  See
     /// `portal_jitcode` for the resolution semantics.  `thread_local!`
@@ -150,33 +135,32 @@ thread_local! {
 }
 
 fn compute_portal_jitcode_index() -> Option<usize> {
-    let all = all_jitcodes();
-    let mut hits = all
-        .iter()
-        .enumerate()
-        .filter(|(_, jc)| jc.jitdriver_sd().is_some())
-        .map(|(i, _)| i);
-    let first = hits.next();
-    // RPython `call.py:147` `jd.mainjitcode = self.get_jitcode(jd.portal_graph)`
-    // assigns once per JitDriverStaticData; pyre runs a single jitdriver
-    // (PyJitDriver) so at most one `jitdriver_sd` flag should be set in
-    // the build-time pipeline. A second hit signals a structural
-    // regression in `setup_jitdriver` and must surface immediately.
-    if hits.next().is_some() {
+    let drivers = COMPILED_JIT_DRIVERS.with(|cell| *cell.get_or_init(load_compiled_jit_drivers));
+    assert_eq!(
+        drivers.len(),
+        1,
+        "pyre-jit-trace requires exactly one configured JIT driver"
+    );
+    let index = drivers[0].main_jitcode_index;
+    let jitcode = all_jitcodes().get(index).unwrap_or_else(|| {
         panic!(
-            "pyre-jit-trace: build-time pipeline has more than one portal \
-             jitcode (jitdriver_sd populated). RPython `call.py:147` allows \
-             exactly one per `JitDriverStaticData`."
-        );
-    }
-    first
+            "configured portal `{}` refers to missing JitCode index {index}",
+            drivers[0].portal.canonical_key(),
+        )
+    });
+    assert!(
+        jitcode.jitdriver_sd().is_some(),
+        "configured portal `{}` does not carry its JitDriverStaticData marker",
+        drivers[0].portal.canonical_key(),
+    );
+    Some(index)
 }
 
 /// RPython: `metainterp_sd.jitcodes[jitdriver_sd.mainjitcode.index]`
 /// (warmspot.py:281-282 + call.py:147-148) — the single portal jitcode
 /// that `find_all_graphs(portal, policy)` seeds the jitcode closure
-/// from. Returns `None` only when the build-time pipeline has no
-/// jitdriver registered (e.g. compact test inputs).
+/// from. The `Option` return is retained for existing runtime call sites;
+/// a production artifact with no compiled driver fails loudly while loading.
 ///
 /// Trace-side user-function calls (`callee_frame_helper`,
 /// `jit_create_callee_frame_*`, `jit_force_callee_frame`) route through
@@ -194,9 +178,9 @@ pub fn portal_jitcode() -> Option<Arc<JitCode>> {
 // Cached index of the charon-extracted `w_list_append` body within
 // `ALL_JITCODES`.
 //
-// Unlike the portal (resolved by its `jitdriver_sd` flag) or opcode arms
-// (resolved by `entry_jitcode_index`), the list-op helper bodies carry
-// no runtime marker — they are ordinary `make_jitcodes` function entries
+// Unlike the portal (resolved by explicit `CompiledJitDriver` metadata),
+// the list-op helper bodies carry no runtime marker — they are ordinary
+// `make_jitcodes` function entries
 // whose only stable handle is their `name`, which `get_jitcode` sets to
 // the graph's last path segment (call.rs:3071). The positional index
 // shifts whenever the jitcode set changes, so it must be resolved by
@@ -239,6 +223,13 @@ fn compute_named_jitcode_index(name: &str) -> Option<usize> {
     first
 }
 
+/// Resolve an ordinary portal-closure JitCode by its unique graph leaf name.
+/// Prefer stable graph paths at build time; this runtime helper exists for
+/// diagnostics and tests whose serialized artifact stores names only.
+pub(crate) fn named_jitcode(name: &str) -> Option<Arc<JitCode>> {
+    get_jitcode_by_index(compute_named_jitcode_index(name)?)
+}
+
 /// The charon `w_list_append` body in `ALL_JITCODES`, resolved by name
 /// and cached per thread. `None` if the helper is absent from the
 /// build-time pipeline. See `LIST_APPEND_JITCODE_INDEX`.
@@ -246,102 +237,6 @@ pub fn list_append_jitcode() -> Option<Arc<JitCode>> {
     let idx = LIST_APPEND_JITCODE_INDEX
         .with(|cell| *cell.get_or_init(|| compute_named_jitcode_index("w_list_append")))?;
     get_jitcode_by_index(idx)
-}
-
-/// RPython: opcode dispatch arm table (analogue of PyPy's per-opcode
-/// Python methods). One `PipelineOpcodeArm` per Rust `match` arm.
-pub fn all_opcode_arms() -> &'static [PipelineOpcodeArm] {
-    ALL_OPCODE_ARMS.with(|cell| *cell.get_or_init(load_all_opcode_arms))
-}
-
-/// Returns the arm with the given `arm_id`.
-pub fn get_arm(arm_id: usize) -> Option<&'static PipelineOpcodeArm> {
-    all_opcode_arms().iter().find(|a| a.arm_id == arm_id)
-}
-
-/// Convenience: resolve `arm_id` → entry jitcode. Returns `None` if arm
-/// doesn't exist or the arm has no body graph.
-pub fn jitcode_for_arm(arm_id: usize) -> Option<Arc<JitCode>> {
-    let arm = get_arm(arm_id)?;
-    let idx = arm.entry_jitcode_index?;
-    get_jitcode_by_index(idx)
-}
-
-/// Variant-name → arm_id index built from `ALL_OPCODE_ARMS` selectors.
-/// Multi-pattern `Instruction::A | Instruction::B` arms expand each
-/// variant to the same arm_id, matching the RPython model where a
-/// single Python method is registered under each dispatched opcode.
-///
-/// Keyed by the bare variant name (e.g. `"PopTop"`, `"LoadFast"`) — the
-/// last segment of `OpcodeDispatchSelector::Path.segments`. Derived Debug
-/// on `Instruction` yields the same variant prefix, so
-/// `arm_id_for_instruction` uses this to resolve an `Instruction` value
-/// at runtime.
-static ARM_ID_BY_VARIANT: LazyLock<HashMap<String, usize>> = LazyLock::new(|| {
-    let mut map = HashMap::new();
-    for arm in all_opcode_arms() {
-        collect_variant_names(&arm.selector, arm.arm_id, &mut map);
-    }
-    map
-});
-
-fn collect_variant_names(
-    sel: &OpcodeDispatchSelector,
-    arm_id: usize,
-    out: &mut HashMap<String, usize>,
-) {
-    match sel {
-        OpcodeDispatchSelector::Path(cp) => {
-            if let Some(name) = variant_name_from_path(cp) {
-                out.insert(name.to_string(), arm_id);
-            }
-        }
-        OpcodeDispatchSelector::Or(cases) => {
-            for c in cases {
-                collect_variant_names(c, arm_id, out);
-            }
-        }
-        OpcodeDispatchSelector::Wildcard | OpcodeDispatchSelector::Unsupported => {}
-    }
-}
-
-fn variant_name_from_path(cp: &CallPath) -> Option<&str> {
-    cp.segments.last().map(String::as_str)
-}
-
-/// Extracts the variant identifier from `format!("{instr:?}")`. The
-/// derived `Debug` for an `Instruction` variant starts with the variant
-/// name, optionally followed by ` { .. }` for struct variants or ` (..)`
-/// for tuple variants.
-fn extract_variant_name(instr_debug: &str) -> &str {
-    instr_debug
-        .split(|c: char| c.is_whitespace() || c == '(' || c == '{')
-        .next()
-        .unwrap_or(instr_debug)
-}
-
-/// Runtime variant name for `Instruction` — matches the last segment of
-/// the build-time `OpcodeDispatchSelector::Path` emitted by the parser
-/// (e.g. `Instruction::PopTop` → `"PopTop"`).
-pub fn instruction_variant_name(instruction: &Instruction) -> String {
-    extract_variant_name(&format!("{instruction:?}")).to_string()
-}
-
-/// Resolve an `Instruction` to its `PipelineOpcodeArm.arm_id`.
-///
-/// Returns `None` for variants not covered by any dispatch arm — either
-/// because the parser emitted `Wildcard`/`Unsupported` for that arm, or
-/// the variant has no match arm in `execute_opcode_step`.
-pub fn arm_id_for_instruction(instruction: &Instruction) -> Option<usize> {
-    ARM_ID_BY_VARIANT
-        .get(&instruction_variant_name(instruction))
-        .copied()
-}
-
-/// Resolve an `Instruction` directly to its entry jitcode. This is the
-/// MIFrame-side entry for shadow dispatch.
-pub fn jitcode_for_instruction(instruction: &Instruction) -> Option<Arc<JitCode>> {
-    jitcode_for_arm(arm_id_for_instruction(instruction)?)
 }
 
 /// Deserialized `pipeline.insns` overlaid with `pyre_extension_insns()`
@@ -366,18 +261,18 @@ pub fn jitcode_for_instruction(instruction: &Instruction) -> Option<Arc<JitCode>
 /// consumption at `pyjitpl.py:2227-2243`.
 ///
 /// Static justification: this is not a process-global mutable cache.
-/// `opcode_insns.bin` is a frozen build artifact emitted alongside the
+/// `insns.bin` is a frozen build artifact emitted alongside the
 /// jitcodes whose byte streams it decodes, so every runtime frame in this
 /// binary must see the same immutable opname -> byte table.  RPython keeps
 /// the equivalent `Assembler.insns` object on the translated staticdata /
 /// blackhole-builder path; pyre's `LazyLock` is the binary-embedded form
 /// of that same single translated table.
 static INSNS_OPNAME_TO_BYTE: LazyLock<indexmap::IndexMap<String, u8>> = LazyLock::new(|| {
-    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/opcode_insns.bin"));
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/insns.bin"));
     let mut table: indexmap::IndexMap<String, u8> =
         bincode::deserialize(BYTES).unwrap_or_else(|e| {
             panic!(
-                "pyre-jit-trace: failed to deserialize opcode_insns.bin \
+                "pyre-jit-trace: failed to deserialize insns.bin \
                      ({} bytes): {e}",
                 BYTES.len(),
             )
@@ -465,10 +360,10 @@ pub fn insns_byte_to_opname() -> &'static HashMap<u8, String> {
 /// every `bhimpl_*` handler reads for field offsets, call descriptors,
 /// sub-JitCodes, and switch dicts.
 static ALL_DESCRS: LazyLock<Vec<BhDescr>> = LazyLock::new(|| {
-    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/opcode_descrs.bin"));
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/descrs.bin"));
     bincode::deserialize(BYTES).unwrap_or_else(|e| {
         panic!(
-            "pyre-jit-trace: failed to deserialize opcode_descrs.bin \
+            "pyre-jit-trace: failed to deserialize descrs.bin \
              ({} bytes): {e}",
             BYTES.len(),
         )
@@ -1055,22 +950,10 @@ mod tests {
     }
 
     #[test]
-    fn deserializes_arms_without_error() {
-        let arms = all_opcode_arms();
-        assert!(!arms.is_empty(), "expected at least one opcode arm");
-    }
-
-    #[test]
     fn portal_jitcode_resolves_to_unique_jitdriver_entry() {
         // Verify the portal accessor returns the single build-time
         // JitCode whose `jitdriver_sd` is set (RPython
         // call.py:147 `jd.mainjitcode = self.get_jitcode(jd.portal_graph)`).
-        // Production identity is currently `execute_opcode_step` because
-        // `pyre-jit-trace/build.rs` does not yet include
-        // `pyre/pyre-jit/src/eval.rs` in its source manifest. The
-        // assertion is on uniqueness + jitdriver flag, not name, so the
-        // test stays green when the manifest later widens to make
-        // `eval_loop_jit` the portal.
         let portal = portal_jitcode().expect("build-time pipeline must register a portal jitcode");
         assert!(
             portal.jitdriver_sd().is_some(),
@@ -1106,64 +989,6 @@ mod tests {
     }
 
     #[test]
-    fn pop_top_lookup() {
-        // The opcode dispatch is sourced from the lowered MIR switch, which
-        // orders the arms by first-encounter target-block order of that
-        // switch — a build artifact that shifts when the switch gains or
-        // loses arms, so the arm id is resolved from the instruction rather
-        // than pinned to a literal. Confirm arm → jitcode resolution works
-        // end-to-end and the jitcode carries bytecode bytes (not an empty
-        // shell).
-        let arm_id =
-            arm_id_for_instruction(&Instruction::PopTop).expect("PopTop must resolve to an arm_id");
-        let jc = jitcode_for_arm(arm_id).expect("PopTop arm should resolve to a jitcode");
-        assert!(
-            !jc.code.is_empty(),
-            "PopTop jitcode should have non-empty bytecode"
-        );
-        assert_eq!(
-            jc.name,
-            format!("Instruction::PopTop#{arm_id}"),
-            "jitcode name should match the arm selector"
-        );
-    }
-
-    #[test]
-    fn extract_variant_name_handles_unit_and_struct_variants() {
-        assert_eq!(extract_variant_name("PopTop"), "PopTop");
-        assert_eq!(extract_variant_name("LoadFast { var_num: 3 }"), "LoadFast");
-        assert_eq!(extract_variant_name("Resume { arg: 0 }"), "Resume");
-    }
-
-    #[test]
-    fn instruction_variant_name_round_trips_via_debug() {
-        let instr = Instruction::PopTop;
-        assert_eq!(instruction_variant_name(&instr), "PopTop");
-    }
-
-    #[test]
-    fn arm_id_for_pop_top_round_trips_to_jitcode() {
-        // PopTop is a single-variant arm; the arm_id from
-        // `arm_id_for_instruction` must address the same PopTop jitcode as a
-        // direct `jitcode_for_arm` lookup. The arm-id integer is a build
-        // artifact, so assert the round-trip rather than a literal.
-        let arm_id =
-            arm_id_for_instruction(&Instruction::PopTop).expect("PopTop must resolve to an arm_id");
-        let jc = jitcode_for_arm(arm_id).expect("PopTop arm_id must resolve to a jitcode");
-        assert_eq!(jc.name, format!("Instruction::PopTop#{arm_id}"));
-    }
-
-    #[test]
-    fn jitcode_for_instruction_matches_arm_lookup() {
-        let arm_id =
-            arm_id_for_instruction(&Instruction::PopTop).expect("PopTop must resolve to an arm_id");
-        let jc = jitcode_for_instruction(&Instruction::PopTop)
-            .expect("PopTop must resolve to a jitcode");
-        assert_eq!(jc.name, format!("Instruction::PopTop#{arm_id}"));
-        assert!(!jc.code.is_empty());
-    }
-
-    #[test]
     fn insns_table_is_populated() {
         let table = insns_opname_to_byte();
         assert!(
@@ -1187,18 +1012,17 @@ mod tests {
     }
 
     #[test]
-    fn first_byte_of_pop_top_jitcode_decodes() {
-        // End-to-end: pop top's jitcode bytes must start with an opcode
+    fn first_byte_of_portal_jitcode_decodes() {
+        // End-to-end: the portal's JitCode bytes must start with an opcode
         // byte that `opname_for_byte` can decode.
-        let jc = jitcode_for_instruction(&Instruction::PopTop)
-            .expect("PopTop must resolve to a jitcode");
+        let jc = portal_jitcode().expect("configured portal must resolve to a jitcode");
         let first = *jc
             .code
             .first()
-            .expect("PopTop jitcode should have at least one opcode byte");
+            .expect("portal jitcode should have at least one opcode byte");
         assert!(
             opname_for_byte(first).is_some(),
-            "first byte {first} of PopTop jitcode is unknown to the insns table",
+            "first byte {first} of portal jitcode is unknown to the insns table",
         );
     }
 
@@ -1236,11 +1060,10 @@ mod tests {
     }
 
     #[test]
-    fn decode_pop_top_jitcode_walks_to_end() {
-        // PopTop's jitcode is ~41 bytes. Walking with `decoded_ops`
+    fn decode_portal_jitcode_walks_to_end() {
+        // Walking the configured portal with `decoded_ops`
         // must reach exactly code.len() if every byte decodes cleanly.
-        let jc = jitcode_for_instruction(&Instruction::PopTop)
-            .expect("PopTop must resolve to a jitcode");
+        let jc = portal_jitcode().expect("configured portal must resolve to a jitcode");
         let mut last_next = 0;
         let mut step_count = 0;
         for op in decoded_ops(&jc.code) {
@@ -1251,61 +1074,9 @@ mod tests {
         assert_eq!(
             last_next,
             jc.code.len(),
-            "decoded stream must end exactly at code.len() for PopTop \
+            "decoded stream must end exactly at code.len() for the portal \
              (stopped at {last_next} after {step_count} ops, code.len()={})",
             jc.code.len(),
-        );
-    }
-
-    #[test]
-    fn pop_top_jitcode_op_sequence_matches_expected_shape() {
-        // Lock in the assembler-emitted op sequence
-        // for `Instruction::PopTop`'s arm jitcode. The shape mirrors
-        // what RPython's `assemble.assemble(ssarepr, jitcode)`
-        // (assembler.py:60-86) would emit for a jtransformed
-        // `direct_call(pop_value) ; (return-or-raise)` graph: an
-        // `inline_call_*` for the sub-jitcode, a `live/` jit_merge_point
-        // marker, the standard `catch_exception/goto/reraise` exception
-        // shoulder, then the trampoline tail.
-        //
-        // RPython parity: same byte stream `BlackholeInterpBuilder.dispatch_loop`
-        // walks (blackhole.py:65-100). When the codewriter pipeline
-        // changes shape this test fails — that's the contract: it's
-        // the smallest end-to-end witness that
-        // `pipeline.opcode_dispatch[PopTop].flattened` produces a
-        // dispatch-able byte stream.
-        let jc = jitcode_for_instruction(&Instruction::PopTop)
-            .expect("PopTop must resolve to a jitcode");
-        let sequence: Vec<(String, String)> = decoded_ops(&jc.code)
-            .map(|op| (op.opname.to_string(), op.argcodes.to_string()))
-            .collect();
-        assert_eq!(
-            jc.code.len(),
-            11,
-            "PopTop jitcode size shifted — refresh the expected sequence below",
-        );
-        // The arm wrapper is the single tail-call
-        // `execute_pop_top(executor)`.  `execute_pop_top`'s graph is in
-        // the jitcode closure (`find_all_graphs` BFS discovered it from
-        // the dispatcher callsite), so `guess_call_kind` classifies the
-        // tail-call `Regular` and `handle_regular_call` emits
-        // `inline_call_r_r` with the callee jitcode descr followed by the
-        // mandatory `-live-` marker (jtransform.py:480-481), then the
-        // `ref_return/r` of the callee's result.  The walker recurses into
-        // the `execute_pop_top` jitcode at trace time
-        // (`dispatch_inline_call_dr_kind`) instead of recording a
-        // blackbox residual call.
-        let expected: Vec<(String, String)> = [
-            ("inline_call_r_r", "dR>r"),
-            ("live", ""),
-            ("ref_return", "r"),
-        ]
-        .iter()
-        .map(|(o, a)| (o.to_string(), a.to_string()))
-        .collect();
-        assert_eq!(
-            sequence, expected,
-            "PopTop op sequence drifted — investigate before updating",
         );
     }
 
@@ -1429,24 +1200,6 @@ mod tests {
         assert_eq!(op.result, Some(ResolvedResult::Ref { reg: 4 }));
     }
 
-    #[test]
-    fn arm_id_covers_or_grouped_variants() {
-        // arm_id=3 is the `Instruction::LoadFast | Instruction::LoadFastBorrow`
-        // group (see build-time opcode_dispatch). Both variants must land on
-        // the same arm_id — matching the RPython model where `Or` selectors
-        // register a single Python method under each opcode.
-        use pyre_interpreter::bytecode::Arg;
-        let id_a = arm_id_for_instruction(&Instruction::LoadFast {
-            var_num: Arg::marker(),
-        })
-        .expect("LoadFast must resolve");
-        let id_b = arm_id_for_instruction(&Instruction::LoadFastBorrow {
-            var_num: Arg::marker(),
-        })
-        .expect("LoadFastBorrow must resolve");
-        assert_eq!(id_a, id_b, "Or-grouped variants must share an arm_id");
-    }
-
     // Closure check: the strict builder covers every opname in
     // the generated insns table.  Earlier revisions kept this ignored
     // while kind-flow bugs emitted pyre-only mixed signatures such as
@@ -1560,20 +1313,17 @@ mod tests {
     }
 
     #[test]
-    fn pop_top_jitcode_is_complete_in_canonical_store() {
+    fn portal_jitcode_is_complete_in_canonical_store() {
         // RPython parity target: the deserialized `ALL_JITCODES` entries
         // are themselves the canonical objects produced by
         // `CodeWriter.make_jitcodes()`. Avoid the transitional
         // build→runtime `From` adapter here and assert directly on the
         // canonical object that build.rs persisted.
-        let arm_id =
-            arm_id_for_instruction(&Instruction::PopTop).expect("PopTop must resolve to an arm_id");
-        let arm = get_arm(arm_id).expect("PopTop arm must exist");
-        let bt_jc = jitcode_for_instruction(&Instruction::PopTop)
-            .expect("PopTop must resolve to a jitcode");
+        let bt_jc = portal_jitcode().expect("configured portal must resolve to a jitcode");
         assert!(!bt_jc.code.is_empty());
-        assert_eq!(bt_jc.name, format!("Instruction::PopTop#{arm_id}"));
-        assert_eq!(arm.entry_jitcode_index, Some(bt_jc.index()));
+        let drivers =
+            COMPILED_JIT_DRIVERS.with(|cell| *cell.get_or_init(load_compiled_jit_drivers));
+        assert_eq!(drivers[0].main_jitcode_index, bt_jc.index());
         assert_eq!(
             bt_jc.num_regs_and_consts_i(),
             bt_jc.num_regs_i() + bt_jc.constants_i.len()

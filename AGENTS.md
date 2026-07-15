@@ -72,6 +72,14 @@ Two scripts manage this (both `python3`, run from repo root):
   rewritten. Force a full rebuild with `--force` (or `LLBC_FORCE_REEXTRACT=1`).
   `pyre-interpreter.ullbc` is ~300 MB and a forced re-extract takes minutes.
 
+  While extracting `pyre-jit.ullbc`, the shared extraction driver sets the
+  internal `MAJIT_LLBC_EXTRACTION=1` mode. This breaks the
+  `pyre-jit → pyre-jit-trace → pyre-jit.ullbc` bootstrap cycle by making
+  `pyre-jit-trace/build.rs` emit compile-only placeholder artifacts. Do not set
+  this variable for ordinary builds: the placeholders contain no usable JIT
+  metadata. `cargo::rerun-if-env-changed` makes the next normal build replace
+  them with artifacts generated from the completed LLBC set.
+
 ```bash
 python3 scripts/install-charon.py                 # ensure charon (usually no-op)
 python3 scripts/extract-llbc.py                   # re-extract the 3 default crates

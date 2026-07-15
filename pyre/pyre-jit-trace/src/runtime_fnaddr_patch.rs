@@ -42,10 +42,10 @@ use majit_translate::jitcode::JitCode;
 /// runtime call to `jit_trace_fnaddrs()` below; only the `i64` address
 /// differs across processes.
 fn build_time_fnaddr_bindings() -> Vec<(String, i64)> {
-    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/opcode_fnaddr_bindings.bin"));
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fnaddr_bindings.bin"));
     bincode::deserialize(BYTES).unwrap_or_else(|e| {
         panic!(
-            "pyre-jit-trace: failed to deserialize opcode_fnaddr_bindings.bin \
+            "pyre-jit-trace: failed to deserialize fnaddr_bindings.bin \
              ({} bytes): {e}",
             BYTES.len(),
         )

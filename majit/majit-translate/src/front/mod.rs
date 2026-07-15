@@ -72,8 +72,6 @@ pub(crate) mod checked_arith;
 pub(crate) mod iter_next;
 pub mod llbc_hints;
 pub mod mir;
-pub mod mir_dispatch;
-pub mod opcode_wrapper;
 pub(crate) mod option_closure_select;
 pub(crate) mod option_is_none;
 pub(crate) mod option_map_or;

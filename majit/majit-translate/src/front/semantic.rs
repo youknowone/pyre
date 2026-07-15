@@ -326,9 +326,8 @@ pub struct SemanticProgram {
     )>,
 }
 
-/// Graph lookup table built from a `SemanticProgram` so the
-/// registration loops in `lib.rs` and the opcode-dispatch extractor in
-/// `front::mir_dispatch` can fetch the MIR-built graph for a given
+/// Graph lookup table built from a `SemanticProgram` so registration and
+/// codewriter graph discovery can fetch the MIR-built graph for a given
 /// (impl_type or trait_root, method) pair by name.
 ///
 /// Callers spell `self_ty_root` two ways: a qualified owner

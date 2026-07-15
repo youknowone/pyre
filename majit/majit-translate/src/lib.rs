@@ -36,7 +36,6 @@ pub mod layout;
 mod local_crates;
 pub mod model;
 pub mod model_ssa;
-pub mod opcode_dispatch;
 mod parse;
 pub mod pipeline;
 #[cfg(test)]
@@ -59,9 +58,10 @@ pub use jtransform::{
 };
 pub use layout::{HeuristicLayoutProvider, LayoutProvider};
 pub use model::{Block, BlockId, CallTarget, FunctionGraph, OpKind, SpaceOperation, ValueType};
-pub use opcode_dispatch::PipelineOpcodeArm;
-pub use parse::{CallPath, ExtractedOpcodeArm, OpcodeDispatchSelector};
-pub use pipeline::{PipelineConfig, PipelineResult, PortalSpec, ProgramPipelineResult};
+pub use parse::CallPath;
+pub use pipeline::{
+    CompiledJitDriver, JitDriverSpec, PipelineConfig, PipelineResult, ProgramPipelineResult,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -69,7 +69,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Consumers supply graph-rewrite metadata such as virtualizable
 /// field/array mappings before the codewriter-style passes run.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnalyzeConfig {
     pub pipeline: PipelineConfig,
 }
@@ -104,10 +104,12 @@ pub struct MethodInfo {
 /// through [`front::mir::build_semantic_program_from_llbcs`] using
 /// LLBC artefacts discovered via, in priority order:
 ///
-/// 1. `PYRE_MIR_FRONTEND_LLBC` env-var (OS path-list: `;`-separated on
+/// 1. Paths supplied by an explicit-LLBC analyzer entry point. These are the
+///    complete input set and disable every fallback below.
+/// 2. `PYRE_MIR_FRONTEND_LLBC` env-var (OS path-list: `;`-separated on
 ///    Windows, `:`-separated elsewhere). Explicit override for CI /
 ///    test fixtures targeting a specific LLBC set.
-/// 2. Auto-discovery at `<workspace>/build/llbc/<expected>.ullbc`,
+/// 3. Auto-discovery at `<workspace>/build/llbc/<expected>.ullbc`,
 ///    where `scripts/extract-llbc.py` writes. If every expected file
 ///    exists, the MIR front-end engages automatically.
 ///
@@ -118,6 +120,7 @@ pub struct MethodInfo {
 fn build_semantic_program_via_active_frontend(
     module_paths: &[&str],
     static_addrs: HostStaticAddrs<'_>,
+    explicit_llbc_paths: Option<&[&str]>,
 ) -> front::SemanticProgram {
     #[cfg(feature = "mir-frontend")]
     {
@@ -130,18 +133,23 @@ fn build_semantic_program_via_active_frontend(
         //
         // If the env-var is unset, auto-discover the canonical
         // workspace LLBC artefacts before failing loud.
-        let resolved_paths: Option<Vec<String>> = std::env::var_os("PYRE_MIR_FRONTEND_LLBC")
-            .map(|v| {
-                std::env::split_paths(&v)
-                    .filter(|p| !p.as_os_str().is_empty())
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .collect()
+        let resolved_paths: Option<Vec<String>> = explicit_llbc_paths
+            .filter(|paths| !paths.is_empty())
+            .map(|paths| paths.iter().map(|path| (*path).to_string()).collect())
+            .or_else(|| {
+                std::env::var_os("PYRE_MIR_FRONTEND_LLBC")
+                    .map(|v| {
+                        std::env::split_paths(&v)
+                            .filter(|p| !p.as_os_str().is_empty())
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .collect()
+                    })
+                    // A present-but-blank override (`PYRE_MIR_FRONTEND_LLBC=`)
+                    // collects to an empty vec; treat it as unset so workspace
+                    // auto-discovery still runs instead of feeding an empty LLBC
+                    // set into the frontend.
+                    .filter(|paths: &Vec<String>| !paths.is_empty())
             })
-            // A present-but-blank override (`PYRE_MIR_FRONTEND_LLBC=`)
-            // collects to an empty vec; treat it as unset so workspace
-            // auto-discovery still runs instead of feeding an empty LLBC
-            // set into the frontend.
-            .filter(|paths: &Vec<String>| !paths.is_empty())
             .or_else(|| auto_discover_workspace_llbc_paths(module_paths));
         if let Some(paths) = resolved_paths {
             let llbcs: Vec<majit_charon_reader::Llbc> = paths
@@ -234,10 +242,13 @@ fn build_semantic_program_via_active_frontend(
 ///     Charon installed), or
 ///   - the workspace anchoring fails.
 ///
-/// `pyre-jit.ullbc` is *not* mandatory: when only it is missing the
-/// returned set degrades to the mandatory pair (see the body) so the
-/// `extract-llbc.py pyre-jit` bootstrap can build `pyre-jit-trace`
-/// before `pyre-jit.ullbc` exists.
+/// `pyre-jit.ullbc` is included when present. Pyre's production
+/// `eval::eval_loop_jit` driver requires it; the extraction bootstrap no
+/// longer relies on a different temporary portal and instead bypasses this
+/// analysis explicitly with `MAJIT_LLBC_EXTRACTION=1`. Returning the mandatory
+/// pair when it is absent remains useful only to consumers whose configured
+/// portal is contained in those artifacts; exact driver resolution rejects an
+/// unavailable portal later in the pipeline.
 ///
 /// The two gates together match the production fingerprint:
 /// `pyre-jit-trace/build.rs` calls
@@ -276,17 +287,12 @@ fn auto_discover_workspace_llbc_paths(module_paths: &[&str]) -> Option<Vec<Strin
     // inputs, so a local tree and CI produce byte-identical codegen.
     // `pyre-object.ullbc` and `pyre-interpreter.ullbc` are mandatory.
     //
-    // `pyre-jit.ullbc` is part of the production set (it hosts the
-    // `eval_loop_jit` portal), but it is itself produced by
-    // `scripts/extract-llbc.py pyre-jit`, which builds `pyre-jit` — and
-    // `pyre-jit` depends on `pyre-jit-trace`, whose build script re-enters
-    // this analysis.  During that bootstrap `pyre-jit.ullbc` does not yet
-    // exist, so its absence must NOT abort the build: degrade to the
-    // mandatory pair, which makes the portal fall back to
-    // `execute_opcode_step` at the `has_leaf("eval_loop_jit")` site below.
-    // That degraded codegen is throwaway — it only has to compile so
-    // Charon can extract `pyre-jit`'s MIR; the real build that follows has
-    // all three present and stays on the invariant 3-crate path.
+    // `pyre-jit.ullbc` hosts Pyre's exact `eval::eval_loop_jit` portal. The
+    // extraction driver sets `MAJIT_LLBC_EXTRACTION=1` while producing that
+    // artifact, so `pyre-jit-trace/build.rs` emits compile-only placeholders
+    // and never enters this analysis during the dependency bootstrap. A normal
+    // Pyre build requires all three artifacts; generic consumers whose portal
+    // lives in the mandatory pair may still use the two-artifact result.
     const MANDATORY: &[&str] = &["pyre-object.ullbc", "pyre-interpreter.ullbc"];
     let mut paths = Vec::with_capacity(3);
     for name in MANDATORY {
@@ -301,9 +307,9 @@ fn auto_discover_workspace_llbc_paths(module_paths: &[&str]) -> Option<Vec<Strin
         paths.push(pyre_jit.to_string_lossy().into_owned());
     } else {
         eprintln!(
-            "[majit-translate] pyre-jit.ullbc absent — degrading to the \
-             2-crate front-end (eval_loop_jit portal unavailable). Expected \
-             only while extract-llbc.py bootstraps pyre-jit.ullbc itself."
+            "[majit-translate] pyre-jit.ullbc absent — using the 2-crate \
+             front-end. A configured eval::eval_loop_jit driver will fail \
+             exact portal resolution; run scripts/extract-llbc.py first."
         );
     }
     Some(paths)
@@ -434,6 +440,38 @@ pub fn analyze_multiple_pipeline_with_modules(
 ) -> pipeline::ProgramPipelineResult {
     analyze_pipeline_from_module_paths(
         module_paths,
+        None,
+        config,
+        layout_provider,
+        vinfo_factory,
+        fnaddr_bindings,
+        &[],
+        static_addrs,
+    )
+}
+
+/// Multi-file analysis with an explicit, ordered LLBC input set.
+///
+/// Consumer build scripts should prefer this entry point over the legacy
+/// `PYRE_MIR_FRONTEND_LLBC` compatibility environment variable. The supplied
+/// paths are the complete translation input and never fall back to Pyre's
+/// workspace auto-discovery.
+pub fn analyze_multiple_pipeline_from_llbc_with_modules(
+    llbc_paths: &[&str],
+    module_paths: &[&str],
+    config: &AnalyzeConfig,
+    layout_provider: Option<&dyn layout::LayoutProvider>,
+    vinfo_factory: &VirtualizableInfoFactory<'_>,
+    fnaddr_bindings: &FnAddrBindings<'_>,
+    static_addrs: HostStaticAddrs<'_>,
+) -> pipeline::ProgramPipelineResult {
+    assert!(
+        !llbc_paths.is_empty(),
+        "explicit LLBC analysis requires at least one input artifact"
+    );
+    analyze_pipeline_from_module_paths(
+        module_paths,
+        Some(llbc_paths),
         config,
         layout_provider,
         vinfo_factory,
@@ -539,6 +577,7 @@ fn free_function_alias_paths(name: &str, source_module: &str) -> Vec<crate::pars
 
 fn analyze_pipeline_from_module_paths(
     module_paths: &[&str],
+    explicit_llbc_paths: Option<&[&str]>,
     config: &AnalyzeConfig,
     layout_provider: Option<&dyn layout::LayoutProvider>,
     vinfo_factory: &VirtualizableInfoFactory<'_>,
@@ -582,7 +621,8 @@ fn analyze_pipeline_from_module_paths(
     // `scripts/extract-llbc.py`), located via `PYRE_MIR_FRONTEND_LLBC`
     // or workspace auto-discovery.
     mark_phase!("known_statics + struct_field_attrs populated");
-    let program = build_semantic_program_via_active_frontend(module_paths, static_addrs);
+    let program =
+        build_semantic_program_via_active_frontend(module_paths, static_addrs, explicit_llbc_paths);
     // Publish the `(bare struct leaf → defining crate-relative module
     // path)` map into the process-global `STRUCT_ORIGIN_REGISTRY` so the
     // later `codewriter` `canonical_struct_name` `path_hash` sites
@@ -1495,170 +1535,51 @@ fn analyze_pipeline_from_module_paths(
         }
     }
 
-    // RPython: setup_jitdriver(jitdriver_sd) — register portal + green/red layout.
-    // PyPy interp_jit.py: greens = ['next_instr', 'is_being_profiled', 'pycode'],
-    //                      reds = ['frame', 'ec'], virtualizables = ['frame']
-    // Callers can override the portal binding via `PipelineConfig::portal`.
-    //
-    // Default portal identity: prefer `eval_loop_jit`
-    // (pyre-jit/src/eval.rs:1187), the pyre analogue of upstream's
-    // `warmspot.py::portal_runner` and the single graph seeded into
-    // `find_all_graphs(portal, policy)` at `call.py:57`. When the graph
-    // set does not include pyre-jit/src/eval.rs (e.g. compact test
-    // inputs whose PYRE_JIT_GRAPH_MODULES stops at pyre-interpreter),
-    // fall back to `execute_opcode_step` so those tests retain a portal
-    // target. `execute_opcode_step` itself is a handler reached from the
-    // real portal's match arm, so seeding BFS from it treats a handler
-    // as an entry point — tolerable only for the legacy test
-    // configurations that have no `eval_loop_jit` at all.  When the
-    // tests feed the full production source set the fallback is never
-    // exercised and the eval_loop_jit-only identity is used.
-    let default_portal_name = {
-        // Tolerate module-qualified registrations: `eval_loop_jit` may
-        // land under `["eval", "eval_loop_jit"]` when its file
-        // (`pyre-jit/src/eval.rs`) was parsed with `module_path =
-        // "eval"`.  Suffix-match on the leaf segment covers both shapes.
-        let has_leaf = |leaf: &str| {
-            call_control
-                .function_graphs()
-                .keys()
-                .any(|k| k.segments.last().map(|s| s == leaf).unwrap_or(false))
-        };
-        if has_leaf("eval_loop_jit") {
-            "eval_loop_jit"
-        } else {
-            "execute_opcode_step"
-        }
-    };
-    let (portal_name, portal_greens, portal_reds, portal_virtualizables, portal_red_types) =
-        match &config.pipeline.portal {
-            Some(spec) => (
-                spec.name.clone(),
-                spec.greens.clone(),
-                spec.reds.clone(),
-                spec.virtualizables.clone(),
-                spec.red_types.clone(),
-            ),
-            None => (
-                default_portal_name.to_string(),
-                vec![
-                    "next_instr".to_string(),
-                    "is_being_profiled".to_string(),
-                    "pycode".to_string(),
-                ],
-                vec!["frame".to_string(), "ec".to_string()],
-                // PyPy interp_jit.py: virtualizables = ['frame'] —
-                // jitdriver.virtualizables drives warmspot.py:527-545
-                // make_virtualizable_infos selection.
-                vec!["frame".to_string()],
-                // jit.py / interp_jit.py: red types parallel to reds.
-                // 'frame' is the virtualizable PyFrame; 'ec' is the
-                // ExecutionContext (the wrapping struct in pyre).
-                vec!["PyFrame".to_string(), "ExecutionContext".to_string()],
-            ),
-        };
-    // Resolve the portal `CallPath` tolerantly so the lookup hits
-    // regardless of how `build_graphs_from_items` qualifies the
-    // function's name.  Free functions registered with a non-empty
-    // `parsed.module_path` land under `["module", "name"]` (e.g.
-    // `["pyopcode", "execute_opcode_step"]`); a bare-leaf alias
-    // (`["execute_opcode_step"]`) is also published for cross-module
-    // bare callsites (`lib.rs:432-448`).  Prefer the module-qualified
-    // canonical key over the bare alias so production parity with
-    // `module_path!()` semantics — and downstream tests asserting
-    // `by_path.contains_key(&["module", "name"])` — match the JitCode
-    // registration shape.  Selection order:
-    //  1. module-qualified key whose leaf matches the portal name and
-    //     is NOT `crate`-prefixed (multi-segment, source-of-truth);
-    //  2. bare leaf (legacy empty-`module_path` fixtures);
-    //  3. any remaining suffix-match (last-resort fallback).
-    let portal = {
-        let bare = parse::CallPath::from_segments([portal_name.as_str()]);
-        let leaf_matches = |k: &&parse::CallPath| {
-            k.segments
-                .last()
-                .map(|s| s == portal_name.as_str())
-                .unwrap_or(false)
-        };
-        // Prefer the shortest qualified path among aliases — the
-        // canonical `[module, name]` shape (length 2) over the
-        // `[crate_alias, module, name]` shape (length 3+).  HashMap
-        // iteration order is non-deterministic, so `find()` without
-        // tie-breaking would silently flip between aliases across
-        // builds, making downstream tests (e.g.
-        // `generated::tests::eval_loop_jit_portal_*`) flake on the
-        // by_path key shape.  Choosing the shortest path mirrors
-        // `lib.rs:465-471 register_function_graph_alias` order: the
-        // `[module, name]` form is registered FIRST and is the
-        // source-of-truth canonical name for the graph; the longer
-        // forms are crate-prefixed aliases for cross-crate callsites.
-        //
-        // Tie-break among same-length candidates by deprioritising
-        // keys whose first segment is a local-crate alias root
-        // (`local_crates.rs`), then by
-        // lexicographic order.  Without this, two length-2 keys like
-        // `["eval", "eval_loop_jit"]` (the module-qualified form) and
-        // `["pyre_object", "eval_loop_jit"]` (a crate-alias form
-        // emitted by `free_function_alias_paths`) tie on length, and
-        // the winner depends on HashMap iteration order — the source
-        // of the eval_loop_jit_portal_* flake.
-        let is_crate_alias = |seg: &str| crate::local_crates::is_local_crate_root(seg);
-        let qualified = call_control
-            .function_graphs()
-            .keys()
-            .filter(|k| {
-                leaf_matches(k)
-                    && k.segments.len() > 1
-                    && k.segments.first().map(|s| s != "crate").unwrap_or(false)
-            })
-            .min_by_key(|k| {
-                (
-                    k.segments.len(),
-                    k.segments
-                        .first()
-                        .map(|s| is_crate_alias(s.as_str()))
-                        .unwrap_or(false),
-                    k.segments.clone(),
-                )
-            })
-            .cloned();
-        if let Some(qualified) = qualified {
-            qualified
-        } else if call_control.function_graphs().contains_key(&bare) {
-            bare
-        } else {
-            call_control
-                .function_graphs()
-                .keys()
-                .find(leaf_matches)
-                .cloned()
-                .unwrap_or(bare)
-        }
-    };
-    if call_control.function_graphs().contains_key(&portal) {
-        call_control.setup_jitdriver(
-            portal,
-            portal_greens,
-            portal_reds,
-            portal_virtualizables,
-            portal_red_types,
+    // RPython: setup_jitdriver(jitdriver_sd) — register every explicit
+    // portal and its green/red layout. Portal binding and graph discovery
+    // are independent of any interpreter dispatch representation.
+    assert!(
+        !config.pipeline.jit_drivers.is_empty(),
+        "full JitCode analysis requires at least one explicit JIT driver"
+    );
+    for (index, spec) in config.pipeline.jit_drivers.iter().enumerate() {
+        assert!(
+            !spec.portal.segments.is_empty(),
+            "JIT driver {index} has an empty portal CallPath"
         );
-        // warmspot.py:515-545 WarmRunnerDesc.make_virtualizable_infos —
-        // assigns jd.index_of_virtualizable, builds GreenFieldInfo
-        // when any green name contains '.', and delegates the upstream
-        // `VirtualizableInfo(self, VTYPEPTR)` constructor call
-        // (warmspot.py:543) to `vinfo_factory`.  Hosts entering through
-        // `analyze_multiple_pipeline_with_vinfo_factory` supply a real
-        // closure that builds the metainterp-side `VirtualizableInfo`
-        // (e.g. via `majit_metainterp::virtualizable::VirtualizableInfo::
-        // build_for(VTYPEPTR)`); the default entry points pass
-        // `|_, _| None` so the codewriter slot stays empty until
-        // `MetaInterp::set_virtualizable_info` (jitdriver.rs:285) wires
-        // it at runtime.
-        call_control.make_virtualizable_infos(|jd_idx, vtypeptr_token| {
-            vinfo_factory(jd_idx, vtypeptr_token)
-        });
+        assert!(
+            spec.red_types.is_empty() || spec.red_types.len() == spec.reds.len(),
+            "JIT driver `{}` has {} red types for {} reds",
+            spec.portal.canonical_key(),
+            spec.red_types.len(),
+            spec.reds.len(),
+        );
+        assert!(
+            !config.pipeline.jit_drivers[..index]
+                .iter()
+                .any(|previous| previous.portal == spec.portal),
+            "duplicate JIT driver portal `{}`",
+            spec.portal.canonical_key(),
+        );
+        assert!(
+            call_control.function_graphs().contains_key(&spec.portal),
+            "configured JIT driver portal `{}` does not resolve to an exact graph; \
+             configure its qualified CallPath rather than a leaf-name alias",
+            spec.portal.canonical_key(),
+        );
+        call_control.setup_jitdriver(
+            spec.portal.clone(),
+            spec.greens.clone(),
+            spec.reds.clone(),
+            spec.virtualizables.clone(),
+            spec.red_types.clone(),
+        );
     }
+    // warmspot.py:515-545 WarmRunnerDesc.make_virtualizable_infos —
+    // assigns each registered driver's virtualizable metadata only after the
+    // complete driver set exists.
+    call_control
+        .make_virtualizable_infos(|jd_idx, vtypeptr_token| vinfo_factory(jd_idx, vtypeptr_token));
     // Register oopspecs for jit.* builtin functions.
     // rlib/jit.py: these functions carry @oopspec("jit.*") decorators;
     // the codewriter converts calls to them into dedicated opcodes.
@@ -1686,12 +1607,10 @@ fn analyze_pipeline_from_module_paths(
     call_control.find_all_graphs(&mut policy);
 
     // The canonical jitcode emitter below is the production analysis
-    // path; `ProgramPipelineResult.functions` / `total_*` are populated
-    // only with their default values because every consumer reads
-    // `opcode_dispatch` / `jitcodes` / `insns` / `descrs` instead.
+    // path; `ProgramPipelineResult.functions` / `total_*` remain diagnostic fields.
     let mut pipeline = pipeline::ProgramPipelineResult {
         functions: Vec::new(),
-        opcode_dispatch: Vec::new(),
+        jit_drivers: Vec::new(),
         jitcodes: Vec::new(),
         jitcodes_by_path: indexmap::IndexMap::new(),
         insns: indexmap::IndexMap::new(),
@@ -1702,10 +1621,20 @@ fn analyze_pipeline_from_module_paths(
     };
 
     mark_phase!("call_control + canonical_trait_impls + register graphs");
-    let (opcode_dispatch, jitcodes, insns, descrs) =
-        build_canonical_opcode_dispatch(&program, &config.pipeline, &mut call_control);
-    mark_phase!("build_canonical_opcode_dispatch");
-    pipeline.opcode_dispatch = opcode_dispatch;
+    let (jitcodes, insns, descrs) = make_jitcodes(&config.pipeline, &mut call_control);
+    mark_phase!("make_jitcodes");
+    pipeline.jit_drivers = call_control
+        .jitdrivers_sd()
+        .iter()
+        .map(|driver| pipeline::CompiledJitDriver {
+            portal: driver.portal_graph.clone(),
+            main_jitcode_index: driver
+                .mainjitcode
+                .as_ref()
+                .expect("configured JIT driver must have a main JitCode")
+                .index(),
+        })
+        .collect();
     pipeline.jitcodes = jitcodes;
     // Mirror of `CallControl::jitcodes` (RPython `call.py:87 self.jitcodes`)
     // captured before `call_control` is dropped. Needed because consumers
@@ -1718,7 +1647,7 @@ fn analyze_pipeline_from_module_paths(
     pipeline
 }
 
-/// Build opcode dispatch arms and produce JitCodes for discovered callee graphs.
+/// Produce JitCodes for the graph closure reachable from configured portals.
 ///
 /// RPython parity (`rpython/jit/codewriter/codewriter.py:74-89` `make_jitcodes`):
 ///
@@ -1732,50 +1661,14 @@ fn analyze_pipeline_from_module_paths(
 ///     self.assembler.finished(self.callcontrol.callinfocollection)
 ///     return all_jitcodes
 /// ```
-///
-/// PyPy registers each opcode handler as its own Python method, so PyPy's
-/// codewriter naturally gets one jitcode per opcode via the discovery loop.
-/// pyre's interpreter dispatches inside one big match instead of separate
-/// methods, so we register each match arm body as a synthetic graph here
-/// (`CallPath::["__opcode_dispatch__", "<selector>#<arm_id>"]`) and the
-/// orthodox `drain_pending_graphs` loop picks them up exactly the same way
-/// it picks up callee graphs discovered during jtransform.
-fn build_canonical_opcode_dispatch(
-    program: &front::SemanticProgram,
+fn make_jitcodes(
     pipeline_config: &pipeline::PipelineConfig,
     call_control: &mut call::CallControl,
 ) -> (
-    Vec<opcode_dispatch::PipelineOpcodeArm>,
     Vec<std::sync::Arc<jitcode::JitCode>>,
     indexmap::IndexMap<String, u8>,
     Vec<jitcode::BhDescr>,
 ) {
-    // Reconstruct the opcode-dispatch arms from the lowered MIR
-    // `execute_opcode_step` graph (`front::mir_dispatch`).
-    // `reject_duplicate_opcode_selectors` keeps the parser-level
-    // uniqueness invariant.
-    let opcode_arms = parse::reject_duplicate_opcode_selectors(
-        front::mir_dispatch::extract_opcode_dispatch_arms_from_mir(program),
-    );
-
-    // Fail loud when the interpreter is present but the dispatch table is
-    // empty.  `extract_opcode_dispatch_arms_from_mir` returns an empty
-    // vector both for a legitimately interpreter-free LLBC set and for a
-    // present-but-unrecognised dispatcher (missing `execute_opcode_step`
-    // or a non-`Value`-switch start block).  The latter would silently
-    // ship an opcode-less, non-functional JIT, so gate the emptiness on
-    // the interpreter fingerprint: the `Instruction` enum is the same
-    // signal the extractor itself keys on (front::mir_dispatch).
-    assert!(
-        !opcode_arms.is_empty()
-            || !program
-                .enum_variant_by_discriminant
-                .contains_key("Instruction"),
-        "opcode dispatch is empty but the interpreter `Instruction` enum is \
-         present: `execute_opcode_step` or its discriminant switch is missing \
-         (front::mir_dispatch::extract_opcode_dispatch_arms_from_mir)"
-    );
-
     // RPython codewriter.py:74-89: make_jitcodes().
     //
     // `Arc<JitCode>` shells live in `CallControl::jitcodes`; the drain loop
@@ -1801,7 +1694,7 @@ fn build_canonical_opcode_dispatch(
         std::sync::Arc::new(call::DefaultVirtualRefInfoHandle),
     );
 
-    // Phase 1: RPython grab_initial_jitcodes + drain portal + callees.
+    // RPython grab_initial_jitcodes + drain portals and their callees.
     // RPython call.py:145-148.
     call_control.grab_initial_jitcodes();
     // Two-phase rtyper prepass (production default; `PYRE_TWO_PHASE_RTYPE=0`
@@ -1811,68 +1704,10 @@ fn build_canonical_opcode_dispatch(
     codewriter.run_two_phase_prepass_if_enabled(call_control);
     codewriter.drain_pending_graphs(call_control, &pipeline_config.transform);
 
-    // Phase 2: register each opcode arm body as a synthetic graph.
-    //
-    // PyPy's interpreter has one Python method per opcode and `find_all_graphs`
-    // discovers them naturally; pyre dispatches inside one match, so we walk
-    // the parser-extracted arms and call `register_function_graph` +
-    // `get_jitcode` ourselves. Each arm gets a stable `arm_id` (extract order)
-    // and a synthetic `CallPath::["__opcode_dispatch__", "<selector>#<arm_id>"]`
-    // which decouples display label (selector) from identity (path/index).
-    //
-    // `arm.flattened` is set after `drain_pending_graphs` from the
-    // assembled jitcode's `body._ssarepr`; the previous eager
-    // dual_gate→lower_indirect_calls→jtransform→merge_synth_kinds→
-    // regalloc→flatten chain at this site duplicated the work that
-    // `transform_graph_to_jitcode` does inside the drain loop, so we
-    // register the arm bodies here and let the canonical pipeline
-    // produce the SSARepr we then read back below.
-    let mut dispatch: Vec<opcode_dispatch::PipelineOpcodeArm> =
-        Vec::with_capacity(opcode_arms.len());
-    let mut dispatch_paths: Vec<Option<parse::CallPath>> = Vec::with_capacity(opcode_arms.len());
-    for (arm_id, arm) in opcode_arms.into_iter().enumerate() {
-        // Register the arm body in CallControl. RPython call.py:155-172
-        // `get_jitcode(graph)` returns the callee object; the final
-        // `jitcode.index` is assigned only after assembly completes.
-        let entry_jitcode_path = arm.body_graph.map(|body_graph| {
-            let synthetic_path = synthetic_opcode_arm_path(&arm.selector, arm_id);
-            call_control.register_function_graph(synthetic_path.clone(), body_graph);
-            let _ = call_control.get_jitcode(&synthetic_path);
-            synthetic_path
-        });
-
-        dispatch.push(opcode_dispatch::PipelineOpcodeArm {
-            arm_id,
-            selector: arm.selector,
-            entry_jitcode_index: None,
-            flattened: None,
-        });
-        dispatch_paths.push(entry_jitcode_path);
-    }
-
-    // Phase 3: Drain pending graphs.
-    //
-    // RPython codewriter.py:79-84: `for graph, jitcode in enum_pending_graphs()`.
-    // After Phase 2 every opcode arm body is on `unfinished_graphs`, plus any
-    // callees discovered during the parser-level transform pass above. Each
-    // gets transformed → assembled in turn, and any *new* callees they reach
-    // are added to the queue and picked up by the same loop.
-    codewriter.drain_pending_graphs(call_control, &pipeline_config.transform);
-
     // RPython codewriter.py:85: self.assembler.finished(callinfocollection).
     codewriter
         .assembler
         .finished(&call_control.callinfocollection);
-
-    for (arm, path) in dispatch.iter_mut().zip(dispatch_paths.into_iter()) {
-        if let Some(path) = path {
-            let jitcode = call_control
-                .jitcode_handle(&path)
-                .expect("opcode arm jitcode handle must exist after registration");
-            arm.entry_jitcode_index = Some(jitcode.index());
-            arm.flattened = jitcode.try_body().and_then(|body| body._ssarepr.clone());
-        }
-    }
 
     // Materialise `all_jitcodes[]` from the completed jitcodes. Each
     // jitcode receives its dense index when appended, matching RPython
@@ -1891,27 +1726,7 @@ fn build_canonical_opcode_dispatch(
     // `insns`, mirroring RPython's single-store model.
     let descrs: Vec<jitcode::BhDescr> = codewriter.assembler.snapshot_descrs();
 
-    (dispatch, jitcodes, insns, descrs)
-}
-
-/// Synthetic CallPath for an opcode-dispatch arm body.
-///
-/// PyPy uses `graph.name` (which is the Python method name) as the
-/// debug label and `graph` object identity as the dict key in
-/// `CallControl.jitcodes`. pyre uses `CallPath` as the dict key, so we
-/// build a 2-segment synthetic path:
-///   `["__opcode_dispatch__", "<selector_canonical>#<arm_id>"]`
-/// The `#<arm_id>` suffix guarantees collision-free keys even if two
-/// arms shared a selector string (parser already rejects that, but the
-/// suffix makes the invariant local to this function).
-fn synthetic_opcode_arm_path(
-    selector: &parse::OpcodeDispatchSelector,
-    arm_id: usize,
-) -> parse::CallPath {
-    parse::CallPath::from_segments([
-        "__opcode_dispatch__".to_string(),
-        format!("{}#{}", selector.canonical_key(), arm_id),
-    ])
+    (jitcodes, insns, descrs)
 }
 
 /// Generate tracing code directly from the canonical pipeline result.
@@ -1933,11 +1748,11 @@ pub fn generate_trace_code_from_pipeline_with_flavor(
 
 pub use codegen::CodegenFlavor;
 
-/// Produce a recognition report: how much the pipeline understands.
+/// Produce a recognition report for canonical driver and JitCode output.
 pub fn recognition_report(result: &pipeline::ProgramPipelineResult) -> codegen::RecognitionReport {
     codegen::recognition_report(result)
 }
-pub use codegen::{OpcodeRecognition, RecognitionReport};
+pub use codegen::{JitCodeRecognition, RecognitionReport};
 
 /// Generate code from graph pipeline results.
 

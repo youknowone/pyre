@@ -5,15 +5,15 @@ mod virtualizable_spec;
 
 use walkdir::WalkDir;
 
-const CODEGEN_CACHE_VERSION: &str = "pyre-jit-trace-codegen-cache-v1";
+const CODEGEN_CACHE_VERSION: &str = "pyre-jit-trace-codegen-cache-v2";
 const CODEGEN_OUTPUTS: &[&str] = &[
     "jit_trace_gen.rs",
     "jit_metadata.json",
-    "opcode_jitcodes.bin",
-    "opcode_dispatch.bin",
-    "opcode_insns.bin",
-    "opcode_descrs.bin",
-    "opcode_fnaddr_bindings.bin",
+    "jitcodes.bin",
+    "jit_drivers.bin",
+    "insns.bin",
+    "descrs.bin",
+    "fnaddr_bindings.bin",
     "static_pytype_bindings.bin",
     "static_ref_bindings.bin",
 ];
@@ -26,6 +26,11 @@ const CODEGEN_OUTPUTS: &[&str] = &[
 /// - pyre-object (Python object types: W_IntObject, W_FloatObject, etc.)
 /// - pyre-interpreter (object space, bytecode dispatch, eval loop)
 fn main() {
+    println!("cargo::rerun-if-env-changed=MAJIT_LLBC_EXTRACTION");
+    if std::env::var_os("MAJIT_LLBC_EXTRACTION").as_deref() == Some(std::ffi::OsStr::new("1")) {
+        emit_llbc_extraction_placeholders();
+        return;
+    }
     // Fail fast with an actionable message when the Charon-extracted LLBC
     // artefacts the codegen consumes are absent.  Without this, the missing
     // set surfaces deep inside `real_main` as a worker-thread `panic!`
@@ -48,10 +53,61 @@ fn main() {
     run_worker();
 }
 
+/// Break the LLBC bootstrap dependency cycle explicitly.
+///
+/// Charon compiling `pyre-jit` must compile its `pyre-jit-trace` dependency
+/// before `pyre-jit.ullbc` exists. None of these artifacts execute during
+/// extraction; they only need to satisfy `include!` / `include_bytes!` so
+/// rustc can expose `pyre-jit`'s MIR. The next normal Cargo build observes
+/// `MAJIT_LLBC_EXTRACTION` changing and replaces every placeholder.
+fn emit_llbc_extraction_placeholders() {
+    let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR is set");
+    std::fs::write(
+        format!("{out_dir}/jit_trace_gen.rs"),
+        "pub const COMPILED_JIT_DRIVERS: &[(&str, usize)] = &[];\n\
+         pub const CANONICAL_JITCODES: &[(&str, usize)] = &[];\n",
+    )
+    .unwrap();
+    std::fs::write(format!("{out_dir}/jit_metadata.json"), b"{}\n").unwrap();
+    std::fs::write(
+        format!("{out_dir}/jitcodes.bin"),
+        bincode::serialize(&Vec::<std::sync::Arc<majit_translate::jitcode::JitCode>>::new())
+            .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        format!("{out_dir}/jit_drivers.bin"),
+        bincode::serialize(&Vec::<majit_translate::CompiledJitDriver>::new()).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        format!("{out_dir}/insns.bin"),
+        bincode::serialize(&std::collections::BTreeMap::<String, u8>::new()).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        format!("{out_dir}/descrs.bin"),
+        bincode::serialize(&Vec::<majit_translate::jitcode::BhDescr>::new()).unwrap(),
+    )
+    .unwrap();
+    for name in [
+        "fnaddr_bindings.bin",
+        "static_pytype_bindings.bin",
+        "static_ref_bindings.bin",
+    ] {
+        std::fs::write(
+            format!("{out_dir}/{name}"),
+            bincode::serialize(&Vec::<(String, i64)>::new()).unwrap(),
+        )
+        .unwrap();
+    }
+}
+
 /// Pre-flight the LLBC prerequisite, mirroring the resolution order in
 /// `majit-translate` (`build_semantic_program_via_active_frontend`):
-/// honour the `PYRE_MIR_FRONTEND_LLBC` override, else require the
-/// canonical `build/llbc/{pyre-object,pyre-interpreter}.ullbc` pair.
+/// honour the `PYRE_MIR_FRONTEND_LLBC` override, else require the canonical
+/// `build/llbc/{pyre-object,pyre-interpreter,pyre-jit}.ullbc` set. The third
+/// artifact contains the exact `eval::eval_loop_jit` portal.
 ///
 /// When neither resolves, emit a clean, copy-pasteable bootstrap message
 /// and fail the build *before* the worker spawns — so the contributor
@@ -75,8 +131,13 @@ fn preflight_llbc_or_fail() {
         .join("..")
         .join("..");
     let llbc_dir = repo_root.join("build").join("llbc");
-    // Matches `auto_discover_workspace_llbc_paths`'s REQUIRED set.
-    const REQUIRED: &[&str] = &["pyre-object.ullbc", "pyre-interpreter.ullbc"];
+    // Pyre production configures the exact `eval::eval_loop_jit` portal, so
+    // unlike generic two-artifact consumers it requires pyre-jit.ullbc too.
+    const REQUIRED: &[&str] = &[
+        "pyre-object.ullbc",
+        "pyre-interpreter.ullbc",
+        "pyre-jit.ullbc",
+    ];
     let missing: Vec<&str> = REQUIRED
         .iter()
         .copied()
@@ -104,7 +165,7 @@ fn preflight_llbc_or_fail() {
     if !charon_present {
         println!("cargo::error=Install charon (one-time): scripts/install-charon.py");
     }
-    println!("cargo::error=Extract the LLBC: scripts/extract-llbc.py pyre-object pyre-interpreter");
+    println!("cargo::error=Extract the LLBC: scripts/extract-llbc.py");
 
     // The install step is only needed when the charon binary is absent;
     // with it present the fix is the single extract command.
@@ -122,10 +183,10 @@ fn preflight_llbc_or_fail() {
 {}\n\
  Bootstrap (run from the repo root):\n\
 {}\
-   scripts/extract-llbc.py pyre-object pyre-interpreter\n\
+   scripts/extract-llbc.py\n\
 \n\
  …or point the build at existing artefacts:\n\
-   export PYRE_MIR_FRONTEND_LLBC=/abs/pyre-object.ullbc:/abs/pyre-interpreter.ullbc\n\
+   export PYRE_MIR_FRONTEND_LLBC=/abs/pyre-object.ullbc:/abs/pyre-interpreter.ullbc:/abs/pyre-jit.ullbc\n\
 ========================================================================\n",
         missing
             .iter()
@@ -170,18 +231,11 @@ fn real_main() {
         collect_rs_files(dir, &mut source_paths);
     }
 
-    // Include the portal canonical source so
-    // `majit-translate` finds `eval_loop_jit` in `call_control
-    // .function_graphs()` and the default-portal logic at
-    // `majit-translate/src/lib.rs:621-644` flips from
-    // `execute_opcode_step` (single-opcode dispatch helper) to
-    // `eval_loop_jit` (the real portal with the `match instruction`
-    // dispatch loop).  Pre-fix `portal_jitcode()` returned the
-    // canonical for `execute_opcode_step` which a portal-bridge
-    // install (`canonical_bridge::install_portal_for`) cloned, leaving
-    // BH `setposition(pyjitcode.jitcode, jitcode_pc)` unable to
-    // resume into a user PC because `execute_opcode_step` lacks the
-    // dispatch loop the BH needs to walk forward.
+    // Include the canonical portal source so its module-qualified identity is
+    // present in the analyzer manifest. Production configures the exact
+    // `eval::eval_loop_jit` CallPath; there is no handler-level fallback.
+    // Using the real portal preserves the dispatch loop that blackhole resume
+    // needs to continue from a user bytecode PC.
     //
     // Single-file inclusion (not the whole `pyre-jit/src` tree)
     // because `eval_loop_jit` is the only function in pyre-jit that
@@ -252,7 +306,17 @@ fn real_main() {
                 call_effects: build_call_effect_overrides(),
                 ..Default::default()
             },
-            portal: None,
+            jit_drivers: vec![majit_translate::JitDriverSpec {
+                portal: majit_translate::CallPath::from_segments(["eval", "eval_loop_jit"]),
+                greens: vec![
+                    "next_instr".to_string(),
+                    "is_being_profiled".to_string(),
+                    "pycode".to_string(),
+                ],
+                reds: vec!["frame".to_string(), "ec".to_string()],
+                virtualizables: vec!["frame".to_string()],
+                red_types: vec!["PyFrame".to_string(), "ExecutionContext".to_string()],
+            }],
             // pyre production registers no trait-dispatch families (#346).
             register_trait_families: Vec::new(),
         },
@@ -336,19 +400,15 @@ fn real_main() {
     // single bincode artifact. Runtime deserializes this once into the shared
     // MetaInterpStaticData jitcodes store — same single-store model as
     // RPython `warmspot.py:281-282` `self.metainterp_sd.jitcodes =
-    // codewriter.make_jitcodes()`. No side-table serialization: arm→jitcode
-    // linking goes through the existing `PipelineOpcodeArm.entry_jitcode_index`
-    // field which is already in `jit_metadata.json`.
+    // codewriter.make_jitcodes()`.
     let jitcodes_bin = bincode::serialize(&pipeline.jitcodes).unwrap();
-    std::fs::write(format!("{out_dir}/opcode_jitcodes.bin"), &jitcodes_bin).unwrap();
+    std::fs::write(format!("{out_dir}/jitcodes.bin"), &jitcodes_bin).unwrap();
 
-    // Persist `pipeline.opcode_dispatch` (the arm table)
-    // alongside the jitcodes so the runtime can map opcode → arm_id →
-    // entry_jitcode_index → JitCode. This is the same `PipelineOpcodeArm`
-    // shape already present in `jit_metadata.json`; bincode just avoids the
-    // cost of JSON parse at startup.
-    let dispatch_bin = bincode::serialize(&pipeline.opcode_dispatch).unwrap();
-    std::fs::write(format!("{out_dir}/opcode_dispatch.bin"), &dispatch_bin).unwrap();
+    // Persist the explicit portal → main-JitCode mapping. Runtime consumes
+    // this directly instead of rediscovering the portal through name or flag
+    // scans.
+    let jit_drivers_bin = bincode::serialize(&pipeline.jit_drivers).unwrap();
+    std::fs::write(format!("{out_dir}/jit_drivers.bin"), &jit_drivers_bin).unwrap();
 
     // Persist the runtime opname → u8 table so
     // `JitCode.code` (assembler-local mapping) decodes back to the
@@ -377,7 +437,7 @@ fn real_main() {
     // non-deterministic; RPython's Python dict is insertion-ordered).
     let insns_sorted: std::collections::BTreeMap<&String, &u8> = pipeline.insns.iter().collect();
     let insns_bin = bincode::serialize(&insns_sorted).unwrap();
-    std::fs::write(format!("{out_dir}/opcode_insns.bin"), &insns_bin).unwrap();
+    std::fs::write(format!("{out_dir}/insns.bin"), &insns_bin).unwrap();
 
     // RPython `blackhole.py:59 self.setup_descrs(asm.descrs)` + `:102-103
     // def setup_descrs(self, descrs): self.descrs = descrs`. Persists the
@@ -387,7 +447,7 @@ fn real_main() {
     // model (same list consumed by every `BlackholeInterpreter` produced
     // by `acquire_interp`).
     let descrs_bin = bincode::serialize(&pipeline.descrs).unwrap();
-    std::fs::write(format!("{out_dir}/opcode_descrs.bin"), &descrs_bin).unwrap();
+    std::fs::write(format!("{out_dir}/descrs.bin"), &descrs_bin).unwrap();
 
     // RPython's translator AOT-compiles every helper into a single binary, so
     // `JitCode.fnaddr` / `constants_i` funcptrs are linker-resolved and stable
@@ -406,7 +466,7 @@ fn real_main() {
         .collect();
     let fnaddr_bindings_bin = bincode::serialize(&fnaddr_bindings_owned).unwrap();
     std::fs::write(
-        format!("{out_dir}/opcode_fnaddr_bindings.bin"),
+        format!("{out_dir}/fnaddr_bindings.bin"),
         &fnaddr_bindings_bin,
     )
     .unwrap();
@@ -438,20 +498,9 @@ fn real_main() {
     .unwrap();
 
     // Report
-    let arms_with_jitcode = pipeline
-        .opcode_dispatch
-        .iter()
-        .filter(|arm| arm.entry_jitcode_index.is_some())
-        .count();
     eprintln!(
-        "[pyre-jit-trace build.rs] canonical analysis: {} opcode arms ({} flattened, {} indexed), {} functions, {} blocks, {} flat ops, {} all_jitcodes ({} bytes bincode), generated {} bytes",
-        pipeline.opcode_dispatch.len(),
-        pipeline
-            .opcode_dispatch
-            .iter()
-            .filter(|arm| arm.flattened.is_some())
-            .count(),
-        arms_with_jitcode,
+        "[pyre-jit-trace build.rs] canonical analysis: {} JIT drivers, {} functions, {} blocks, {} flat ops, {} all_jitcodes ({} bytes bincode), generated {} bytes",
+        pipeline.jit_drivers.len(),
         pipeline.functions.len(),
         pipeline.total_blocks,
         pipeline.total_ops,

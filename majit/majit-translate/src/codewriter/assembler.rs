@@ -2248,7 +2248,7 @@ impl Assembler {
     /// `self.insns`; subsequent emissions of the same key reuse the
     /// recorded byte.
     ///
-    /// Pyre serialises `opcode_insns.bin` at build time and the runtime
+    /// Pyre serialises `insns.bin` at build time and the runtime
     /// decoder reads those bytes verbatim, so canonical/extension keys
     /// pin a reserved `BC_*` (`crate::insns::wellknown_bh_insns` /
     /// `pyre_extension_insns`, merged through

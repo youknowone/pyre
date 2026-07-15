@@ -1,27 +1,7 @@
-//! Opcode-dispatch selector types and call-path / inherent-method
-//! metadata carriers shared across the front-end and codewriter.
+//! Call-path and inherent-method metadata carriers shared across the
+//! front-end and codewriter.
 
 use serde::{Deserialize, Serialize};
-
-/// Raw opcode-dispatch arm extracted from the interpreter match.
-///
-/// This is the canonical parse/front-end view of opcode dispatch before
-/// graph/pipeline classification is attached.
-#[derive(Debug, Clone)]
-pub struct ExtractedOpcodeArm {
-    pub selector: OpcodeDispatchSelector,
-    /// Semantic graph of the match arm body.
-    /// This is the handler's own graph — the primary input for
-    /// jtransform/flatten.
-    pub body_graph: Option<crate::model::FunctionGraph>,
-    /// Set when the arm body is a single tail-call to a lifted
-    /// per-opcode handler free fn (`execute_<op>(dispatcher params)`).
-    /// In that case `body_graph` is the mechanically synthesized
-    /// dispatcher-shaped wrapper, and this records the handler's
-    /// [`CallPath`] — the seam that lets the JIT resolve the Charon/MIR
-    /// handler graph by name instead of re-lowering the arm body.
-    pub mir_handler_path: Option<CallPath>,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CallPath {
@@ -105,29 +85,6 @@ pub fn canonical_leaf(name: &str) -> &str {
     after_colon.rsplit('.').next().unwrap_or(after_colon)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum OpcodeDispatchSelector {
-    Path(CallPath),
-    Wildcard,
-    Or(Vec<OpcodeDispatchSelector>),
-    Unsupported,
-}
-
-impl OpcodeDispatchSelector {
-    pub fn canonical_key(&self) -> String {
-        match self {
-            Self::Path(path) => path.canonical_key(),
-            Self::Wildcard => "_".into(),
-            Self::Or(cases) => cases
-                .iter()
-                .map(Self::canonical_key)
-                .collect::<Vec<_>>()
-                .join(" | "),
-            Self::Unsupported => "<unsupported>".into(),
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct InherentMethodInfo {
     pub for_type: String,
@@ -138,21 +95,4 @@ pub struct InherentMethodInfo {
     pub return_type: Option<String>,
     /// RPython: function-level JIT hints (elidable, close_stack, etc.).
     pub hints: Vec<String>,
-}
-
-pub(crate) fn reject_duplicate_opcode_selectors(
-    arms: Vec<ExtractedOpcodeArm>,
-) -> Vec<ExtractedOpcodeArm> {
-    let mut seen = std::collections::HashMap::new();
-    for (idx, arm) in arms.iter().enumerate() {
-        let key = arm.selector.canonical_key();
-        if let Some(first_idx) = seen.insert(key.clone(), idx) {
-            panic!(
-                "duplicate opcode dispatch selector `{key}` at arm {} and arm {}",
-                first_idx + 1,
-                idx + 1
-            );
-        }
-    }
-    arms
 }

@@ -252,7 +252,14 @@ def source_fingerprint(eng: Engine, crates: list[str], cargo_features: str) -> s
     for path in fingerprint_inputs(eng, crates, cargo_features):
         digest.update(path.as_posix().encode("utf-8"))
         digest.update(b"\0")
-        digest.update((eng.root / path).read_bytes())
+        full_path = eng.root / path
+        if full_path.is_file():
+            digest.update(full_path.read_bytes())
+        else:
+            # `git ls-files` includes tracked paths deleted in the working
+            # tree. A deletion is part of the source state and must change the
+            # fingerprint instead of making extraction unusable until commit.
+            digest.update(b"<deleted>")
         digest.update(b"\0")
     return digest.hexdigest()
 
@@ -376,6 +383,13 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
     env.setdefault("CARGO_PROFILE_DEV_DEBUG", "0")
     env["CARGO_UNSTABLE_HOST_CONFIG"] = "true"
     env["CARGO_UNSTABLE_TARGET_APPLIES_TO_HOST"] = "true"
+    # Dependency build scripts run while Charon extracts a target crate. They
+    # must not recursively demand the very LLBC artefact currently being
+    # produced (pyre-jit -> pyre-jit-trace -> pyre-jit.ullbc). Consumers may
+    # use this explicit extraction mode to emit compile-only placeholders;
+    # `rerun-if-env-changed` ensures the following normal build regenerates
+    # production artifacts from the completed LLBC set.
+    env["MAJIT_LLBC_EXTRACTION"] = "1"
     host_config = [
         "--config",
         "target-applies-to-host=false",

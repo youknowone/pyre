@@ -97,7 +97,13 @@ pyre is a structural port of PyPy's interpreter (`pypy/interpreter/` and `pypy/o
 
 ## Key differences from PyPy
 
-- **No annotator/rtyper.** RPython translates Python to C via a whole-program type inferencer. pyre runs `majit-analyze` at `cargo build` time instead — same role, but static analysis on Rust source rather than RPython translation.
+- **Rust-source translation through MaJIT.** RPython translates a live Python
+  program image through flowspace, annotator, rtyper, and codewriter. Pyre
+  extracts Rust crates to Charon `.ullbc` artifacts and runs their graphs
+  through MaJIT's corresponding
+  `front → flowspace → annotator → rtyper → codewriter` pipeline at
+  `cargo build` time. The explicit `eval::eval_loop_jit` portal seeds the
+  ordinary graph closure that becomes assembled JitCodes.
 - **Proc macros instead of decorators.** `@jit.elidable` becomes `#[elidable]`, `driver.jit_merge_point(...)` becomes `jit_merge_point!`. Same semantics, Rust syntax.
 - **No GIL.** pyre is free-threaded from day one. GIL-dependent code paths in PyPy (heapcache resets on GIL release, `release_gil` effect info, etc.) simply don't exist.
 - **Python 3.14, not 2.7.** PyPy's main branch targets Python 2.7/3.10. pyre targets CPython 3.14 bytecodes directly, using RustPython's compiler frontend.

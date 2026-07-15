@@ -72,6 +72,21 @@ majit runs the **same pipeline at `cargo build` time over extracted artifacts**.
    frozen image, extraction can go stale: source changes are invisible until
    re-extraction (fingerprint skipping handles the common case).
 
+   Consumers configure one or more `JitDriverSpec` values with exact,
+   qualified portal `CallPath`s. MaJIT registers every driver before graph
+   discovery, then `make_jitcodes` compiles the ordinary call-graph closure
+   reachable from those portals. Interpreter dispatch functions and opcode
+   helpers are normal graphs in that closure; the LLBC path does not construct
+   a parallel opcode-arm table or synthetic dispatch namespace.
+
+   During `pyre-jit.ullbc` extraction, the extraction driver automatically sets
+   the internal `MAJIT_LLBC_EXTRACTION=1` build mode to break the
+   `pyre-jit → pyre-jit-trace → pyre-jit.ullbc` bootstrap cycle. That mode
+   emits compile-only placeholder artifacts and is not a supported runtime
+   configuration; users should run `scripts/extract-llbc.py`, not set the
+   variable themselves. The next normal Cargo build regenerates real artifacts
+   from the completed LLBC set.
+
 2. **`#[jit_interp]` proc-macro path (used by aheui-mjit and `examples/`)**:
    `build.rs` reads the interpreter source, extracts opcode match arms, and
    generates a JIT mainloop annotated with `#[jit_interp]`. The proc macro

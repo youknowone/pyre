@@ -1077,7 +1077,7 @@ pub struct BhSizeSpec {
     /// the same `LLType::Struct(u64)` cache key in `gc_cache._cache_size`.
     pub type_id: u64,
     /// ob_type pointer captured in the PRODUCING process (build script
-    /// for `opcode_descrs.bin`, live runtime for tracer-minted specs).
+    /// for `descrs.bin`, live runtime for tracer-minted specs).
     /// Declared `u64`, not `usize`: the spec crosses the build→runtime
     /// serialization boundary, and a 64-bit host pointer must survive
     /// deserialization on a 32-bit (wasm32) runtime instead of failing

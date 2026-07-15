@@ -543,6 +543,7 @@ impl GraphStore {
 
     /// Every registered alias spelling (one entry per `CallPath`, not per
     /// shared graph) — matches the old `HashMap<CallPath, _>::keys()`.
+    #[cfg(test)]
     pub(crate) fn keys(&self) -> impl Iterator<Item = &CallPath> {
         self.path_to_key.keys()
     }
@@ -607,7 +608,7 @@ pub struct CallControl {
     /// leaf.  Without an index, the resolver iterates the whole
     /// `function_graphs` HashMap on every direct call (O(N_graphs)
     /// per call op), which dominates `jtransform_transform` for
-    /// large opcode arms.  Maintained incrementally by the three
+    /// large Rust dispatch graphs.  Maintained incrementally by the three
     /// registration helpers below — keep in lockstep with
     /// `function_graphs` so the lookup stays consistent.
     free_fn_leaf_index: HashMap<String, Vec<CallPath>>,

@@ -2649,7 +2649,7 @@ impl<'a> Transformer<'a> {
         // recorder emits a `CallR` op for it. The trait-dispatch path
         // executes the same constructor as zero-cost native code and
         // emits NO IR ops, so shadow-walker validation diverges by one
-        // synthetic `CallR` per opcode arm. Recognise that single known
+        // synthetic `CallR` at every affected wrapper site. Recognise that known
         // family of transparent Rust wrappers here and elide it via the
         // existing alias mechanism — same orthodoxy as RPython
         // `_noop_rewrite` (jtransform.py:399-401), just at the call-shape

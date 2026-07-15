@@ -650,9 +650,8 @@ fn infer_concrete_from_op(kind: &OpKind) -> ConcreteType {
                 c
             }
         }
-        // pyre-only `OpKind::Abort` (emitted by `front::opcode_wrapper`
-        // for unsupported syntax — macros, unsupported literals,
-        // fallback expressions).  Fall back to GcRef so these values
+        // `OpKind::Abort` for unsupported syntax — macros, unsupported
+        // literals, fallback expressions.  Fall back to GcRef so these values
         // still get a regalloc coloring and the assembler's
         // `lookup_reg_with_kind` covers every operand. RPython has no
         // analogue; porting each producer path individually eliminates

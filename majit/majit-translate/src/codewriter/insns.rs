@@ -18,7 +18,7 @@
 //! fixed `BC_*` byte values (compile-time stable) instead of
 //! RPython's dynamic `setdefault(key, len(self.insns))` allocation.
 //! Compile-time stability is required because pyre serialises
-//! `opcode_jitcodes.bin` at build time and the runtime decoder
+//! `jitcodes.bin` at build time and the runtime decoder
 //! reads those exact bytes. RPython runs the assembler at startup
 //! and never serialises across process boundaries, so dynamic
 //! allocation is fine there. Codex review Correction 1
@@ -72,7 +72,7 @@ pub const BC_NEW_WITH_VTABLE: u8 = 219;
 // key joins `pyre_extension_insns()`, and the blackhole handler is bound there.
 // That registration + the macro lowering + the `run_one_step` dispatch arm are
 // wired together (the registration may shift dynamic byte assignments, so it is
-// verified against the serialised `opcode_*.bin` at that point, not here).  The
+// verified against the serialised JitCode artifacts at that point, not here).  The
 // `recursive_call_bytes_reserved_without_collision` test guards these chosen
 // numbers against the currently-reserved tables.
 pub const BC_RECURSIVE_CALL_INT: u8 = 223;

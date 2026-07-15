@@ -2586,9 +2586,9 @@ fn legacy_const_define_hlvalue(op: &SpaceOperation) -> Option<Hlvalue> {
             // `Hlvalue::Constant(HostObject(prebuilt_instance))` to
             // downstream rtyper passes.  This only
             // affects graphs that go through the rtyper Match arm
-            // (`dual_gate_publish_concretetypes`).  Per-opcode arm
-            // body graphs registered via `register_function_graph`
-            // typically take the Skip arm and bypass this pre-fold;
+            // (`dual_gate_publish_concretetypes`).  Graphs registered
+            // directly through `register_function_graph` can take the
+            // Skip arm and bypass this pre-fold;
             // the residual `OpKind::Call` survives into jtransform
             // and is emitted as a `residual_call_r_r` wrapper there.
             // Closing that gap requires either an early-pass on

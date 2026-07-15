@@ -134,8 +134,8 @@
 //!    `heap_cache.is_class_known(exc_box)`, and emits
 //!    `GuardClass(exc_box, cls_const)` when needed — the orthodox
 //!    `pyjitpl.py:1690-1696` flow.
-//! 3. End-to-end real arm tests (`walk_return_value_arm_*`,
-//!    `walk_pop_top_arm_*`) stay `#[ignore]` until handlers exist for
+//! 3. End-to-end portal-closure helper tests (`walk_return_value_helper_*`,
+//!    `walk_pop_top_helper_*`) stay `#[ignore]` until handlers exist for
 //!    every opname the codewriter-emitted callee bodies use (e.g.
 //!    `getfield_vable_i/rd>i`).
 //! 4. (External) `build_default_bh_builder_with_unwired_report` is a
@@ -3621,9 +3621,9 @@ pub(crate) fn drive_outer_frame_continuation(
 ///   register banks, producing fresh per-frame lists of length
 ///   `num_regs_X + len(constants_X)`.  `allocate_callee_register_banks`
 ///   below ports that shape (`pyjitpl.py:97-119 copy_constants`).
-/// * `r0 = frame`: every per-opcode arm body the codewriter emits
+/// * `r0 = frame`: every helper body accepted by this legacy entry
 ///   treats register 0 as the implicit PyFrame argument (verified for
-///   the PopTop arm — `inline_call_r_r/dR>r [r0]` invokes the
+///   `execute_pop_top` — `inline_call_r_r/dR>r [r0]` invokes the
 ///   `pop_value` sub-jitcode with `r0` = caller's r0).  This matches
 ///   RPython's convention where the topmost call site provides the
 ///   PyFrame as the first argument to the jitdriver's portal jitcode
@@ -24113,7 +24113,7 @@ fn handle(
             // BC_LAST_EXC_VALUE)` (`jitcode/mod.rs:305`), but pyre's
             // codewriter does not currently emit `FlatOp::LastExcValue`
             // for any traced Python arm — `dump_unsupported_opnames_in_insns_table`
-            // confirms the opname is absent from `OUT_DIR/opcode_insns.bin`.
+            // confirms the opname is absent from `OUT_DIR/insns.bin`.
             // The handler matches RPython's unconditional `setup_insns`
             // registration so it's ready when an except-handler arm
             // (e.g. `BC_LAST_EXC_VALUE` consumer in CPython 3.14
@@ -24708,10 +24708,9 @@ fn handle(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jitcode_runtime::{insns_opname_to_byte, jitcode_for_instruction};
+    use crate::jitcode_runtime::{insns_opname_to_byte, named_jitcode};
     use majit_ir::Type;
     use majit_metainterp::make_fail_descr;
-    use pyre_interpreter::Instruction;
 
     /// Build a fresh `TraceCtx`. Uses the public `for_test_types` +
     /// `const_ref` / `make_fail_descr` factories so the fixture stays
@@ -25594,8 +25593,8 @@ mod tests {
 
     /// Production-like `sub_jitcode_lookup` that resolves `idx` against
     /// `crate::jitcode_runtime::all_jitcodes()`. Used by the end-to-end
-    /// arm acceptance tests (`walk_return_value_arm_*`,
-    /// `walk_pop_top_arm_*`) so the walker can recurse into real
+    /// helper acceptance tests (`walk_return_value_helper_*`,
+    /// `walk_pop_top_helper_*`) so the walker can recurse into real
     /// callee bodies. Delegates to the production
     /// [`super::sub_jitcode_body_by_index`].
     fn production_sub_jitcodes(idx: usize) -> Option<SubJitCodeBody> {
@@ -27922,7 +27921,7 @@ mod tests {
                 None
             }
         };
-        // Caller layout (matches PopTop arm shape):
+        // Caller layout (matches the execute_pop_top helper shape):
         //   pc=0..6   inline_call_r_r descr=11 R=[r3] >r=r5
         //     opcode(1) + d(2) + R-len(1) + R[0](1) + dst(1)
         //   pc=6..9   live + 2-byte liveness offset (OFFSET_SIZE=2)
@@ -31895,10 +31894,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "end-to-end walk of the real ReturnValue arm reaches a goto_if_not whose value is symbolic in this unit setup (GotoIfNotValueNotConcrete { value: IntOp }); the walker needs concrete register values to decide the branch. Residual-call descrs now resolve (descr_pool_with_jitcode_adapters builds CallDescrs for BhDescr::Call); the remaining gap is a concrete-execution harness for the full arm body."]
-    fn walk_return_value_arm_terminates_at_first_ref_return() {
-        // Acceptance: walk the smallest real
-        // arm jitcode (`Instruction::ReturnValue`, 18 bytes) end-to-end.
+    #[ignore = "end-to-end walk of the execute_return_value helper reaches a goto_if_not whose value is symbolic in this unit setup (GotoIfNotValueNotConcrete { value: IntOp }); the walker needs concrete register values to decide the branch. Residual-call descrs now resolve (descr_pool_with_jitcode_adapters builds CallDescrs for BhDescr::Call); the remaining gap is a concrete-execution harness for the full helper body."]
+    fn walk_return_value_helper_terminates_at_first_ref_return() {
+        // Acceptance: walk the ordinary `execute_return_value` JitCode
+        // discovered through the portal closure end-to-end.
         // Layout (cranelift build):
         //
         //   pc=0..6   inline_call_r_r / dR>r  (recurse → SubReturn → caller dst write → Continue)
@@ -31906,15 +31905,15 @@ mod tests {
         //   pc=9..11  ref_return / r          (terminate — top-level outermost)
         //   pc=11..18 (raise + ref_return tail, dead on this path)
         //
-        // The arm's `inline_call_r_r` now recurses into the callee
+        // The helper's `inline_call_r_r` now recurses into the callee
         // jitcode via `production_sub_jitcodes` and
         // `descr_pool_with_jitcode_adapters`. The callee's
         // own `ref_return/r` surfaces as `SubReturn`; the caller writes
         // its dst register with that result and continues. The
         // caller's own `ref_return/r` at pc=9..11 then records the
         // outermost `Finish`.
-        let jc = jitcode_for_instruction(&Instruction::ReturnValue)
-            .expect("ReturnValue must resolve to a jitcode");
+        let jc = named_jitcode("execute_return_value")
+            .expect("execute_return_value must resolve through the portal closure");
         let mut tc = fresh_trace_ctx();
         // 256 distinct OpRefs (one per possible 1-byte register
         // index). `inline_call_r_r`'s recursion overwrites the dst
@@ -31969,7 +31968,7 @@ mod tests {
             live_after_jit_pc: usize::MAX,
         };
         let (outcome, end_pc) =
-            walk(&jc.code, 0, &mut wc).expect("ReturnValue arm must walk to a terminator");
+            walk(&jc.code, 0, &mut wc).expect("ReturnValue helper must walk to a terminator");
         assert_eq!(
             outcome,
             DispatchOutcome::Terminate,
@@ -31977,13 +31976,13 @@ mod tests {
         );
         assert!(
             end_pc <= jc.code.len(),
-            "walker must not run past the arm body \
+            "walker must not run past the helper body \
              (end_pc={end_pc}, code.len()={})",
             jc.code.len(),
         );
         assert_eq!(
             end_pc, 11,
-            "ReturnValue arm walker must terminate at outermost `ref_return/r` (pc=9..11)",
+            "ReturnValue helper walker must terminate at outermost `ref_return/r` (pc=9..11)",
         );
         drop(wc);
         assert!(
@@ -32016,17 +32015,17 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "end-to-end walk of the real PopTop arm reaches a goto_if_not \
+    #[ignore = "end-to-end walk of the execute_pop_top helper reaches a goto_if_not \
         whose value is symbolic in this unit setup (GotoIfNotValueNotConcrete); \
         the walker needs concrete register values to decide the branch. \
         Residual-call descrs now resolve (descr_pool_with_jitcode_adapters \
         builds CallDescrs for BhDescr::Call); the remaining gap is a \
-        concrete-execution harness for the full arm body. Bench traces never \
+        concrete-execution harness for the full helper body. Bench traces never \
         reach a PopTop opcode at JIT record time, so production is \
         unaffected."]
-    fn walk_pop_top_arm_terminates_with_recorded_ops() {
-        // Acceptance skeleton: walk the entire PopTop arm
-        // jitcode.  The outer arm body is 25 bytes / 9 ops after the
+    fn walk_pop_top_helper_terminates_with_recorded_ops() {
+        // Acceptance skeleton: walk the entire `execute_pop_top` helper
+        // JitCode. The helper body is 25 bytes / 9 ops after the
         // jtransform `Ok` / `Err` / `Some` identity rewrite stripped
         // the trailing `int_copy + residual_call_r_r/iRd>r` wrapper
         // for the `Ok(StepResult::Continue)` return value
@@ -32045,8 +32044,8 @@ mod tests {
         // `UnsupportedOpname` by the walker.  Unignoring this test
         // requires landing the vable-aware getfield handlers (Phase
         // D-3 MIFrame integration).
-        let jc = jitcode_for_instruction(&Instruction::PopTop)
-            .expect("PopTop must resolve to a jitcode");
+        let jc = named_jitcode("execute_pop_top")
+            .expect("execute_pop_top must resolve through the portal closure");
         let mut tc = fresh_trace_ctx();
         // Generously sized banks so any byte the codewriter emits is
         // in-range. 256 is the maximum register index a 1-byte slot
@@ -32101,7 +32100,7 @@ mod tests {
             live_after_jit_pc: usize::MAX,
         };
         let (outcome, end_pc) =
-            walk(&jc.code, 0, &mut wc).expect("PopTop arm must walk to a terminator");
+            walk(&jc.code, 0, &mut wc).expect("PopTop helper must walk to a terminator");
         // PopTop's `inline_call_r_r/dR>r` recurses into the
         // codewriter-emitted callee jitcode (resolved via
         // `production_sub_jitcodes`); on success the outermost

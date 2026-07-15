@@ -2,14 +2,14 @@
 //!
 //! Data carriers consumed by codegen + downstream tooling. The
 //! production producer is `lib::analyze_pipeline_from_module_paths` (which
-//! drives `build_canonical_opcode_dispatch` to fill `opcode_dispatch`,
-//! `jitcodes`, `insns`, `descrs`).
+//! resolves explicitly configured JIT drivers and compiles the graph closure
+//! reachable from their portals).
 
 use serde::{Deserialize, Serialize};
 
 use crate::flatten::SSARepr;
 use crate::jtransform::{GraphTransformConfig, GraphTransformNote};
-use crate::opcode_dispatch::PipelineOpcodeArm;
+use crate::parse::CallPath;
 
 /// JitDriver portal binding.
 ///
@@ -18,11 +18,13 @@ use crate::opcode_dispatch::PipelineOpcodeArm;
 /// (`rlib/jit.py::JitDriver`).
 /// `CallControl.setup_jitdriver` consumes this to register the portal
 /// entry point and its green/red layout.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PortalSpec {
-    /// Function name of the portal entry point (e.g. `"mainloop"` or
-    /// `"execute_opcode_step"`).
-    pub name: String,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JitDriverSpec {
+    /// Exact, qualified graph identity of the portal entry point.
+    ///
+    /// Resolution is deliberately exact: leaf-name fallback makes portal
+    /// selection depend on unrelated functions and aliases in the input set.
+    pub portal: CallPath,
     pub greens: Vec<String>,
     pub reds: Vec<String>,
     /// Optional explicit virtualizable red names. Empty means no
@@ -38,15 +40,19 @@ pub struct PortalSpec {
 /// Configuration for the full analysis pipeline.
 ///
 /// RPython: implicit in `CodeWriter.__init__` + `CallControl.__init__`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineConfig {
     /// jtransform configuration (virtualizable fields, call classification).
     pub transform: GraphTransformConfig,
-    /// Portal binding for `CallControl.setup_jitdriver`. When `None` the
-    /// pipeline falls back to the default pyre portal
-    /// (`execute_opcode_step`) for backwards compatibility with the
-    /// pyre-specific entry path.
-    pub portal: Option<PortalSpec>,
+    /// Explicit JIT-driver bindings consumed by
+    /// `CallControl::setup_jitdriver`.
+    ///
+    /// RPython supports multiple JitDrivers, so the public configuration is
+    /// plural even though current Pyre and Boa integrations each register one.
+    /// Every public analyzer produces JitCodes, so callers must provide at
+    /// least one driver explicitly; there is no consumer-neutral default
+    /// portal.
+    pub jit_drivers: Vec<JitDriverSpec>,
     /// Opt-in receiver-driven method-dispatch families (issue #346):
     /// qualified `name_path()`s of `>=2`-impl traits whose `dyn Trait`
     /// receivers should annotate to a base `ClassDef` linking the impl
@@ -71,16 +77,29 @@ pub struct PipelineResult {
     /// RPython: the SSARepr produced by flatten_graph().
     ///
     /// This stays in-memory only. Build artifacts persist the assembled
-    /// jitcodes and arm table, not the debug SSA dump.
+    /// JitCodes and driver metadata, not the debug SSA dump.
     #[serde(skip, default)]
     pub flattened: SSARepr,
+}
+
+/// Compiled identity of one configured JIT driver.
+///
+/// RPython equivalent: `JitDriverStaticData.portal_graph` together with
+/// `JitDriverStaticData.mainjitcode.index` after
+/// `CallControl.grab_initial_jitcodes()` and codewriter draining.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompiledJitDriver {
+    pub portal: CallPath,
+    pub main_jitcode_index: usize,
 }
 
 /// Result of running the pipeline on a full program.
 #[derive(Debug, Clone, Serialize)]
 pub struct ProgramPipelineResult {
     pub functions: Vec<PipelineResult>,
-    pub opcode_dispatch: Vec<PipelineOpcodeArm>,
+    /// Explicit driver-to-main-JitCode mapping. Consumers should use this
+    /// instead of rediscovering portals by scanning JitCode flags or names.
+    pub jit_drivers: Vec<CompiledJitDriver>,
     /// RPython: all_jitcodes returned by CodeWriter.make_jitcodes() (codewriter.py:89).
     /// Assembled JitCode bytecode for each transformed graph. `Arc` so the
     /// shells handed out earlier (e.g. into
@@ -133,11 +152,9 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    use crate::OpcodeDispatchSelector;
     use crate::flatten::{FlatOp, SSARepr};
     use crate::flowspace::model::ConstValue;
     use crate::jitcode::JitCode;
-    use crate::opcode_dispatch::PipelineOpcodeArm;
 
     #[test]
     fn serialized_program_pipeline_skips_flattened_ssa_consts() {
@@ -158,11 +175,9 @@ mod tests {
                 transform_notes: Vec::new(),
                 flattened: flattened.clone(),
             }],
-            opcode_dispatch: vec![PipelineOpcodeArm {
-                arm_id: 7,
-                selector: OpcodeDispatchSelector::Unsupported,
-                entry_jitcode_index: Some(0),
-                flattened: Some(flattened),
+            jit_drivers: vec![CompiledJitDriver {
+                portal: CallPath::from_segments(["eval", "mainloop"]),
+                main_jitcode_index: 0,
             }],
             jitcodes: vec![Arc::new(JitCode::new("consts"))],
             jitcodes_by_path: indexmap::IndexMap::new(),
@@ -178,7 +193,36 @@ mod tests {
             !json.contains("flattened"),
             "serialized artifact should not persist debug SSA payloads"
         );
-        serde_json::to_string(&program.opcode_dispatch)
-            .expect("opcode dispatch artifact should serialize without SSARepr");
+        assert_eq!(
+            serde_json::to_value(&program).unwrap()["jit_drivers"][0]["main_jitcode_index"],
+            0,
+        );
+    }
+
+    #[test]
+    fn serialized_pipeline_config_requires_explicit_jit_drivers() {
+        let config = PipelineConfig {
+            transform: GraphTransformConfig::default(),
+            jit_drivers: vec![JitDriverSpec {
+                portal: CallPath::from_segments(["engine", "mainloop"]),
+                greens: Vec::new(),
+                reds: Vec::new(),
+                virtualizables: Vec::new(),
+                red_types: Vec::new(),
+            }],
+            register_trait_families: Vec::new(),
+        };
+        let mut value = serde_json::to_value(config).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("jit_drivers")
+            .unwrap();
+
+        let error = serde_json::from_value::<PipelineConfig>(value).unwrap_err();
+        assert!(
+            error.to_string().contains("missing field `jit_drivers`"),
+            "missing driver configuration must fail during deserialization: {error}",
+        );
     }
 }

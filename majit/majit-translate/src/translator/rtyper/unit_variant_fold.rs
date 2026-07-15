@@ -12,11 +12,11 @@
 //! args: [] }`.  The companion fold inside
 //! `translator/rtyper/flowspace_adapter.rs::legacy_const_define_hlvalue`
 //! covers graphs that traverse the Match arm of the dual gate, but
-//! per-opcode arm body graphs registered via
-//! `register_function_graph` take the Skip arm and bypass that fold.
+//! graphs registered directly through `register_function_graph` can
+//! take the Skip arm and bypass that fold.
 //! The residual `Call` op then survives into jtransform and is emitted
-//! as a `residual_call_r/d>r` wrapper, which blocks the walker's arm
-//! dispatch (Task #333).
+//! as a `residual_call_r/d>r` wrapper, which blocks the JitCode walker
+//! (Task #333).
 //!
 //! This pass operates directly on `model::FunctionGraph` after
 //! `lower_indirect_calls` and before `Transformer::transform`, so it

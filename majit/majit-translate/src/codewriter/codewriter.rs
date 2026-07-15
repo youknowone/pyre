@@ -481,7 +481,7 @@ impl CodeWriter {
         // The legacy walker was narrowed to the Skip arm; the dual-gate
         // logic was lifted into the shared
         // [`Self::dual_gate_type_state`] helper so the parser-level
-        // debug snapshot in `build_canonical_opcode_dispatch`
+        // debug snapshot in `make_jitcodes`
         // (lib.rs:898) can route through the same path.
         let canonical_diag = path.canonical_key().to_string();
         // `dual_gate_publish_concretetypes` commits every resolved

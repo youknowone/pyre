@@ -1083,8 +1083,8 @@ pub enum OpKind {
         jitdriver_index: usize,
     },
 
-    /// pyre-only marker emitted by `front::opcode_wrapper` when an
-    /// opcode-dispatch arm cannot be lowered to a canonical opname.
+    /// Translation marker emitted when a graph operation cannot be lowered
+    /// to a canonical opname.
     /// Reaching the op at runtime means tracing or blackhole resume
     /// crossed an untranslatable graph slice; downstream handlers
     /// advance past it (see `blackhole.rs::handler_abort_marker_pyre`).
