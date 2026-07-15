@@ -1057,7 +1057,6 @@ impl LowererConfig {
         self.headerless_structs
             .contains(&canonical_path_segments(struct_path))
     }
-
 }
 
 pub(super) fn canonical_path_segments(path: &Path) -> Vec<String> {

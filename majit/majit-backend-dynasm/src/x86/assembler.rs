@@ -8098,6 +8098,16 @@ impl<'a> Assembler386<'a> {
 
     /// Headerless fixed-size nursery allocation.  `size` excludes any GC
     /// header; result is the old nursery base.
+    ///
+    /// The fast path raw-bumps `dynasm_nursery_addrs()`, so it is correct only
+    /// when the active dynasm GC is headerless-aware — its nursery must yield a
+    /// raw base carrying no `GcHeader` (aheui's `NurseryGcAllocator`, whose
+    /// nursery is the aheui node arena collected by aheui's own copying node
+    /// GC).  A headered collector such as MiniMarkGC must never back this op:
+    /// its nursery walk reads a `GcHeader` at `base - GcHeader::SIZE`, which a
+    /// raw base lacks.  The overflow slowpath enforces this via
+    /// `alloc_nursery_headerless`'s panicking default; the fast path relies on
+    /// the same invariant being upheld by whoever declares `headerless_structs`.
     fn genop_call_malloc_nursery_headerless(&mut self, op: &Op, result_loc: Option<&Loc>) {
         let size_ref = op.arg(0).to_opref();
         let size = size_ref.inline_const_bits().unwrap_or_else(|| {
