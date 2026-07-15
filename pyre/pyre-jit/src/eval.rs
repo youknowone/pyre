@@ -4728,6 +4728,25 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
             }
         }
         let mut next_instr = frame_root.frame().next_instr();
+        let raw_arg: u32 = op_arg.into();
+        let delta = instruction.stack_effect(raw_arg);
+        if delta > 0 {
+            let frame = frame_root.frame();
+            let pushed_top = frame.valuestackdepth.saturating_add(delta as usize);
+            let next_pc = opcode_pc + 1;
+            // A JIT handoff can arrive with the stack depth for the point just
+            // after a super-instruction while `last_instr` still names the
+            // super-instruction itself. If metadata proves the current depth
+            // belongs to the next opcode, advance the pc instead of re-running
+            // pushes that are already reflected in the frame stack.
+            if pushed_top > frame.locals_w().len()
+                && pyre_jit_trace::state::depth_based_vsd_for_wcode(frame.pycode as usize, next_pc)
+                    == Some(frame.valuestackdepth)
+            {
+                frame_root.frame().set_last_instr_from_next_instr(next_pc);
+                continue;
+            }
+        }
         let step_result =
             execute_opcode_step(frame_root.frame(), code, instruction, op_arg, next_instr);
         match step_result {
@@ -5009,8 +5028,12 @@ fn jit_merge_point_hook(
             // iteration's end instead of replaying it (re-applying every
             // concretely executed side effect).  An uncommitted flush
             // leaves the snapshot at entry state — adopting it is a no-op.
-            if pyre_jit_trace::trace::take_walk_end_flush_committed() {
+            let walk_end_flushed = pyre_jit_trace::trace::take_walk_end_flush_committed();
+            let walk_end_restart_pc = pyre_jit_trace::trace::take_walk_end_restart_pc();
+            if walk_end_flushed {
                 frame.restore_resume_state_from(&executed_frame);
+            } else if let Some(restart_pc) = walk_end_restart_pc {
+                frame.set_last_instr_from_next_instr(restart_pc);
             }
             propagated_exception = pyre_jit_trace::trace::take_walk_end_propagated_exception();
             action
@@ -5115,6 +5138,13 @@ fn maybe_compile_and_run(
         || unsupported_jit_shape(code) != UnsupportedJitShape::None
     {
         return None;
+    }
+    if let Some(expected_vsd) =
+        pyre_jit_trace::state::depth_based_vsd_for_wcode(frame.pycode as usize, loop_header_pc)
+    {
+        if frame.valuestackdepth != expected_vsd {
+            return None;
+        }
     }
     // warmstate.py:473-477: JC_TRACING → skip entirely (no counter tick)
     if driver.is_tracing() {
@@ -5829,10 +5859,16 @@ fn bound_reached(
                     );
                     // raise_continue_running_normally seam — see the
                     // jit_merge_point_hook tracing site for the contract.
-                    if pyre_jit_trace::trace::take_walk_end_flush_committed() {
+                    let walk_end_flushed = pyre_jit_trace::trace::take_walk_end_flush_committed();
+                    let walk_end_restart_pc = pyre_jit_trace::trace::take_walk_end_restart_pc();
+                    if walk_end_flushed {
                         frame_root
                             .frame()
                             .restore_resume_state_from(&executed_frame);
+                    } else if let Some(restart_pc) = walk_end_restart_pc {
+                        frame_root
+                            .frame()
+                            .set_last_instr_from_next_instr(restart_pc);
                     }
                     propagated_exception =
                         pyre_jit_trace::trace::take_walk_end_propagated_exception();

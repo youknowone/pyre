@@ -51,6 +51,11 @@ thread_local! {
     /// `WALK_END_PROPAGATED_EXCEPTION`. Bridge tracing leaves this false and
     /// conservatively retains its legacy preflight.
     static WALK_END_PROPAGATE_ALLOWED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Interpreter restart pc for a full-body walk that closes at a JitCode
+    /// marker inside a Python opcode. The compiled-loop key stays at the
+    /// merge point's green pc, but the interpreter fallback must resume at
+    /// the opcode whose entry stack matches the restored live boxes.
+    static WALK_END_RESTART_PC: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
 /// Take-and-reset the walk-end flush flag for the trace that just
@@ -61,6 +66,10 @@ pub fn take_walk_end_flush_committed() -> bool {
 
 pub fn take_walk_end_propagated_exception() -> Option<pyre_interpreter::PyError> {
     WALK_END_PROPAGATED_EXCEPTION.with(|c| c.borrow_mut().take())
+}
+
+pub fn take_walk_end_restart_pc() -> Option<usize> {
+    WALK_END_RESTART_PC.with(|c| c.replace(None))
 }
 
 /// Copy the walk-accumulated `TraceCtx.reads_module_global` flag into the
@@ -370,6 +379,7 @@ pub fn trace_bytecode(
     WALK_END_FLUSH_COMMITTED.with(|c| c.set(false));
     WALK_END_PROPAGATED_EXCEPTION.with(|c| *c.borrow_mut() = None);
     WALK_END_PROPAGATE_ALLOWED.with(|c| c.set(allow_propagate_out));
+    WALK_END_RESTART_PC.with(|c| c.set(None));
     // `TraceCtx.reads_module_global` needs no reset here: a fresh TraceCtx is
     // built per trace (zero-init `false`), unlike the walk-end TLS flags above.
     // Likewise clear any no-replay finish payload a prior trace left
@@ -1471,6 +1481,20 @@ fn run_perfn_walk(
     // (recolored / already consumed) at the guard, which the guard's resume
     // data never preserved. See the field doc on `PyreSym::bridge_walk_entry_pc`.
     let entry = sym.bridge_walk_entry_pc.unwrap_or(pc_map_entry);
+    if let Some(entry_depth) = pjc.depth_for_jitcode_pc_pred(entry) {
+        let stack_base = crate::state::concrete_nlocals(cf_addr).unwrap_or(sym.nlocals);
+        let live_stack = sym.valuestackdepth.saturating_sub(stack_base);
+        if live_stack != entry_depth as usize {
+            if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                eprintln!(
+                    "[fbw-abort] start_pc={start_pc} entry={entry} live_stack={live_stack} \\
+                     entry_depth={entry_depth}; declining walk"
+                );
+            }
+            fbw_decline(crate::driver::make_green_key(w_code, start_pc));
+            return None;
+        }
+    }
     // The full-body walk drives a PORTAL trace, so the body must carry the
     // portal entry INPUT SHAPE (`FrameInputs::Portal`: `[frame, ec]` red inputs
     // + the frame-vable locals prologue). Every drained per-code jitcode is
@@ -1777,6 +1801,19 @@ fn run_perfn_walk(
         )) = &mut walk_result
         {
             let loop_header_pc = *loop_header_pc;
+            let restart_pc = loop_header_marker_jit_pc.map_or(loop_header_pc, |marker| {
+                let marker_py =
+                    crate::jitcode_dispatch::python_pc_for_jitcode_pc(&pjc.metadata, marker)
+                        as usize;
+                if marker_py == loop_header_pc
+                    && pjc.merge_entry_for(loop_header_pc) != Some(marker)
+                {
+                    loop_header_pc + 1
+                } else {
+                    marker_py
+                }
+            });
+            WALK_END_RESTART_PC.with(|c| c.set(Some(restart_pc)));
             // `close_loop_args_at` reads `self.orgpc` for the last_instr anchor; the merge point
             // closes at the loop header, so anchor orgpc there.
             mi.orgpc = loop_header_pc;
@@ -1805,8 +1842,22 @@ fn run_perfn_walk(
             if let Ok((outcome, _end_pc)) = &walk_result {
                 let header_pc = match outcome {
                     crate::jitcode_dispatch::DispatchOutcome::CloseLoop {
-                        loop_header_pc, ..
-                    } => Some(*loop_header_pc),
+                        loop_header_pc,
+                        loop_header_marker_jit_pc,
+                        ..
+                    } => Some(loop_header_marker_jit_pc.map_or(*loop_header_pc, |marker| {
+                        let marker_py = crate::jitcode_dispatch::python_pc_for_jitcode_pc(
+                            &pjc.metadata,
+                            marker,
+                        ) as usize;
+                        if marker_py == *loop_header_pc
+                            && pjc.merge_entry_for(*loop_header_pc) != Some(marker)
+                        {
+                            *loop_header_pc + 1
+                        } else {
+                            marker_py
+                        }
+                    })),
                     crate::jitcode_dispatch::DispatchOutcome::CompileTracePending {
                         loop_header_pc,
                     } => Some(*loop_header_pc),
