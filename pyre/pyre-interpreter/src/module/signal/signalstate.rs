@@ -263,6 +263,14 @@ mod tests {
         unsafe { &*(addr as *const AtomicUsize) }.load(Ordering::Relaxed)
     }
 
+    /// Drives process-global signal state: installs a real SIGINT handler,
+    /// registers this `ActionFlag`'s ticker as *the* cell the handler writes
+    /// (`TICKER_PTR`), raises a real signal, and asserts on the shared
+    /// eval-breaker word. Nothing serializes that, so this must stay the only
+    /// test in the crate that touches those globals — a second one running in
+    /// parallel would race it. Tests that merely build an `ActionFlag` are safe
+    /// alongside it: the async-bit mirror is gated on the registered ticker, so
+    /// an unregistered flag's `reset_ticker` never reaches the shared word.
     #[test]
     fn signal_during_warmup_sets_async_bit() {
         let _reset = ResetSignalState;

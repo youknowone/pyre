@@ -45,7 +45,10 @@ const CALL_FRAME_SIZE: u32 = 64;
 const X24_SAVE_OFFSET: u32 = 56;
 
 const _: () = assert!(X24_SAVE_OFFSET + 8 <= CALL_FRAME_SIZE);
-const _: () = assert!(CALL_FRAME_SIZE % 16 == 0, "aarch64 SP stays 16-byte aligned");
+const _: () = assert!(
+    CALL_FRAME_SIZE % 16 == 0,
+    "aarch64 SP stays 16-byte aligned"
+);
 // The prologue/epilogue spell the reserved register as a dynasm `x24` literal,
 // which no expression ties back to `registers`. Fail the build rather than
 // silently save the wrong register if the reservation ever moves.
