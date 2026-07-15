@@ -13915,6 +13915,7 @@ fn residual_call_descr_index_in_body(body_code: &[u8], d: &DecodedOp) -> Option<
 /// initialization of an earlier allocation.
 fn fbw_callee_body_side_effect_free(
     body_code: &[u8],
+    args_all_numeric: bool,
     num_regs_i: usize,
     constants_i: &[i64],
     callee_descr_refs: &[DescrRef],
@@ -13943,6 +13944,7 @@ fn fbw_callee_body_side_effect_free(
             if !provably_side_effect_free
                 && !residual_call_is_specialized_plain_int_add(
                     body_code,
+                    args_all_numeric,
                     &d,
                     num_regs_i,
                     constants_i,
@@ -13994,22 +13996,28 @@ fn fbw_callee_body_side_effect_free(
 }
 
 /// `BINARY_OP Add` has the generic residual shape in a per-function jitcode,
-/// but the walker replaces a statically tagged plain add with `IntAddOvf`
-/// before the generic residual executor (and its nested-residual decline) is
-/// reached.  Accept only the constant `Add` tag here; every in-place tag and
-/// every dynamic or different binary operation remains conservative.
+/// but the walker replaces a statically tagged plain add with `IntAddOvf` or
+/// `FloatAdd` before the generic residual executor (and its nested-residual
+/// decline) is reached when every incoming callee argument is int or float.
+/// Non-numeric operands stay an impure residual, so admitting them here would
+/// trigger the nested-residual 6421 abort storm.  Accept only the constant
+/// `Add` tag with numeric arguments; every in-place tag and every dynamic or
+/// different binary operation remains conservative.
 fn residual_call_is_specialized_plain_int_add(
     body_code: &[u8],
+    args_all_numeric: bool,
     d: &DecodedOp,
     num_regs_i: usize,
     constants_i: &[i64],
     callee_descr_refs: &[DescrRef],
 ) -> bool {
-    if !matches!(
-        d.key,
-        "residual_call_ir_r/iIRd>r" | "residual_call_ir_i/iIRd>i" | "residual_call_ir_v/iIRd"
-    ) || residual_call_helper_kind_in_body(body_code, d, callee_descr_refs)
-        != Some(majit_ir::PyreHelperKind::BinaryOp)
+    if !args_all_numeric
+        || !matches!(
+            d.key,
+            "residual_call_ir_r/iIRd>r" | "residual_call_ir_i/iIRd>i" | "residual_call_ir_v/iIRd"
+        )
+        || residual_call_helper_kind_in_body(body_code, d, callee_descr_refs)
+            != Some(majit_ir::PyreHelperKind::BinaryOp)
     {
         return false;
     }
@@ -14830,6 +14838,13 @@ fn try_walker_inline_user_call(
     else {
         return Ok(None);
     };
+    let args_all_numeric = callee_arg_concretes.iter().all(|concrete| match concrete {
+        ConcreteValue::Int(_) | ConcreteValue::Float(_) | ConcreteValue::Bool(_) => true,
+        ConcreteValue::Ref(obj) if !obj.is_null() => unsafe {
+            pyre_object::is_int(*obj) || pyre_object::is_float(*obj)
+        },
+        ConcreteValue::Ref(_) | ConcreteValue::Null => false,
+    });
     // An inline sub-walk inside a FOR_ITER body resumes a guard at the
     // caller's CALL boundary, so deopt re-executes the whole callee.  Replaying
     // a live-heap mutation would double it; the nested-residual decline catches
@@ -14840,6 +14855,7 @@ fn try_walker_inline_user_call(
         && (std::env::var("PYRE_FBW_FORITER_INLINE").as_deref() == Ok("0")
             || !fbw_callee_body_side_effect_free(
                 body.code,
+                args_all_numeric,
                 body.num_regs_i,
                 body.constants_i,
                 callee_descr_refs,
