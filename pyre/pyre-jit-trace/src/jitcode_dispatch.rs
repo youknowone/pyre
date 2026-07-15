@@ -2863,18 +2863,29 @@ fn compute_bridge_root_parent_frame(
         .bridge_registers_r
         .clone()
         .unwrap_or_else(|| root_sym.registers_r.clone());
-    let root_py_pc = crate::state::backxlat_py_pc(jitcode_index as i32, root_pc as i32) as usize;
     if result_color_audit_enabled() {
         let payload = unsafe { &(*root_sym.jitcode).payload };
+        let root_py_pc =
+            crate::state::backxlat_py_pc(jitcode_index as i32, root_pc as i32) as usize;
         let py_pc = python_pc_for_jitcode_pc(&payload.metadata, root_pc) as usize;
         assert_eq!(
             payload.result_color_for_jitcode_pc_pred(root_pc),
             payload.metadata.result_color_at_pc.get(py_pc).copied(),
             "result_color_by_jit_pc diverges from result_color_at_pc at jit_pc={root_pc}"
         );
+        assert_eq!(
+            payload
+                .result_color_trivia_for_jitcode_pc(root_pc)
+                .map(|c| c as usize)
+                .filter(|&c| c != u16::MAX as usize),
+            crate::state::result_color_at_pc_at(jitcode_index as i32, root_py_pc),
+            "result_color trivia twin vs backxlat consumer diverges at jit_pc={root_pc}"
+        );
     }
-    if let Some(result_color) =
-        crate::state::result_color_at_pc_at(jitcode_index as i32, root_py_pc)
+    if let Some(result_color) = unsafe { &(*root_sym.jitcode).payload }
+        .result_color_trivia_for_jitcode_pc(root_pc)
+        .map(|c| c as usize)
+        .filter(|&c| c != u16::MAX as usize)
     {
         if result_color < regs_r.len() {
             regs_r[result_color] = trace_ctx.const_ref(pyre_object::PY_NULL as i64);
