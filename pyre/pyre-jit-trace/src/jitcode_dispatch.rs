@@ -19235,20 +19235,23 @@ fn try_walker_specialize_subscr_tuple(
     Ok(Some(()))
 }
 
-/// `len(x)` on an exact canonical `W_ListObject`: lower the opaque
-/// `bh_call_fn(len_builtin, PY_NULL, x)` residual to the strategy-guarded
+/// `len(x)` on an exact canonical `W_ListObject` / `W_UnicodeObject`:
+/// lower the opaque `bh_call_fn(len_builtin, PY_NULL, x)` residual to the
 /// inline length read the meta-tracer produces upstream
-/// (descroperation.py:294 `_len` → `W_ListObject.length()` →
-/// `strategy.length`): `guard_value(callable)` + `guard_class LIST` +
-/// exact `w_class` guard + `guard_value(strategy)` + length
-/// `getfield_gc_i` + `wrapint`.  The exact `w_class` guard is required
-/// because a list SUBCLASS shares `ob_type == &LIST_TYPE` but may
-/// override `__len__` (`baseobjspace::len` dispatches
-/// `subclass_special_override`); it side-exits to the generic residual.
+/// (descroperation.py:294 `_len`): `guard_value(callable)` +
+/// `guard_class` + exact `w_class` guard + length `getfield_gc_i` +
+/// `wrapint`.  For a list this reads `W_ListObject.length()` →
+/// `strategy.length`, so it additionally emits `guard_value(strategy)`
+/// (rlist.py); for a str it reads the codepoint field directly
+/// (`W_UnicodeObject.len` → `bh_unicodelen`, no storage strategy).  The
+/// exact `w_class` guard is required because a SUBCLASS shares
+/// `ob_type == &LIST_TYPE`/`&STR_TYPE` but may override `__len__`
+/// (`baseobjspace::len` dispatches `subclass_special_override`); it
+/// side-exits to the generic residual.
 ///
 /// Returns `None` (fall through to the generic residual, SAFE) for any
-/// other shape: non-list arg, list subclass, empty-strategy list, a bound
-/// receiver, or wrong arity.
+/// other shape: non-list/str arg, a subclass, empty-strategy list, a
+/// bound receiver, or wrong arity.
 fn try_walker_specialize_builtin_len(
     ctx: &mut WalkContext<'_, '_>,
     code: &[u8],
@@ -19277,31 +19280,56 @@ fn try_walker_specialize_builtin_len(
     if !pyre_interpreter::builtins::is_builtin_len_function(concrete_callable) {
         return Ok(None);
     }
-    // Exact canonical list only (see the doc comment on the subclass
-    // `__len__` hazard).
-    let list_canonical = unsafe {
-        std::ptr::eq((*list_obj).ob_type, &pyre_object::pyobject::LIST_TYPE)
+    // Exact canonical list / str only (see the doc comment on the subclass
+    // `__len__` hazard).  `arg_type_addr` / `exact_w_class` pin the guard
+    // target; `is_str` selects the length path.
+    let (arg_type_addr, exact_w_class, is_str) = unsafe {
+        if std::ptr::eq((*list_obj).ob_type, &pyre_object::pyobject::LIST_TYPE)
             && std::ptr::eq(
                 (*list_obj).w_class,
                 pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::LIST_TYPE),
             )
-    };
-    if !list_canonical {
-        return Ok(None);
-    }
-    let (sid, concrete_len) = unsafe {
-        let concrete_len = pyre_object::w_list_len(list_obj);
-        let sid = if pyre_object::w_list_uses_int_storage(list_obj) {
-            1i64
-        } else if pyre_object::w_list_uses_float_storage(list_obj) {
-            2i64
-        } else if pyre_object::w_list_uses_object_storage(list_obj) {
-            0i64
+        {
+            (
+                &pyre_object::pyobject::LIST_TYPE as *const _ as i64,
+                pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::LIST_TYPE),
+                false,
+            )
+        } else if std::ptr::eq((*list_obj).ob_type, &pyre_object::pyobject::STR_TYPE)
+            && std::ptr::eq(
+                (*list_obj).w_class,
+                pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::STR_TYPE),
+            )
+        {
+            (
+                &pyre_object::pyobject::STR_TYPE as *const _ as i64,
+                pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::STR_TYPE),
+                true,
+            )
         } else {
-            // Empty-strategy list: no length field to read.
             return Ok(None);
-        };
-        (sid, concrete_len)
+        }
+    };
+    // Length source: str reads the codepoint field directly (no storage
+    // strategy); list resolves its storage strategy (guarded below).  `sid`
+    // is `None` for str.
+    let (sid, concrete_len) = unsafe {
+        if is_str {
+            (None, pyre_object::w_str_len(list_obj))
+        } else {
+            let concrete_len = pyre_object::w_list_len(list_obj);
+            let sid = if pyre_object::w_list_uses_int_storage(list_obj) {
+                1i64
+            } else if pyre_object::w_list_uses_float_storage(list_obj) {
+                2i64
+            } else if pyre_object::w_list_uses_object_storage(list_obj) {
+                0i64
+            } else {
+                // Empty-strategy list: no length field to read.
+                return Ok(None);
+            };
+            (Some(sid), concrete_len)
+        }
     };
 
     // Authentic boxed result, produced on the plain eval loop exactly as
@@ -19328,42 +19356,41 @@ fn try_walker_specialize_builtin_len(
             .replace_box(callable_op, expected);
     }
     let list_op = r_args[2];
-    // guard_class LIST (skip when class already known / operand is constant).
-    let list_type_addr = &pyre_object::pyobject::LIST_TYPE as *const _ as i64;
+    // guard_class (skip when class already known / operand is constant).
     if !list_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(list_op) {
-        let type_const = ctx.trace_ctx.const_int(list_type_addr);
+        let type_const = ctx.trace_ctx.const_int(arg_type_addr);
         ctx.trace_ctx
             .record_guard(OpCode::GuardClass, &[list_op, type_const], 0);
         walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
     }
     ctx.trace_ctx
         .heap_cache_mut()
-        .class_now_known(list_op, list_type_addr);
-    walker_guard_exact_w_class(
-        ctx,
-        op.pc,
-        list_op,
-        pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::LIST_TYPE),
-    )?;
-    // guard_value(strategy == sid).
-    let strategy = crate::state::opimpl_getfield_gc_i(
-        ctx.trace_ctx,
-        list_op,
-        crate::descr::list_strategy_descr(),
-    );
-    let sid_const = ctx.trace_ctx.const_int(sid);
-    ctx.trace_ctx
-        .record_guard(OpCode::GuardValue, &[strategy, sid_const], 0);
-    walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .replace_box(strategy, sid_const);
-    // Length read by strategy (rlist.py:116 inline field for object
-    // storage; typed items-block length for int/float storage).
-    let len_descr = match sid {
-        0 => crate::descr::list_length_descr(),
-        1 => crate::descr::list_int_items_len_descr(),
-        _ => crate::descr::list_float_items_len_descr(),
+        .class_now_known(list_op, arg_type_addr);
+    walker_guard_exact_w_class(ctx, op.pc, list_op, exact_w_class)?;
+    // Length read.  list: guard the storage strategy, then read that
+    // strategy's length field (rlist.py:116 inline field for object storage;
+    // typed items-block length for int/float storage).  str: a plain
+    // codepoint-length getfield (no strategy, `bh_unicodelen`).
+    let len_descr = if let Some(sid) = sid {
+        let strategy = crate::state::opimpl_getfield_gc_i(
+            ctx.trace_ctx,
+            list_op,
+            crate::descr::list_strategy_descr(),
+        );
+        let sid_const = ctx.trace_ctx.const_int(sid);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardValue, &[strategy, sid_const], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(strategy, sid_const);
+        match sid {
+            0 => crate::descr::list_length_descr(),
+            1 => crate::descr::list_int_items_len_descr(),
+            _ => crate::descr::list_float_items_len_descr(),
+        }
+    } else {
+        crate::descr::str_len_descr()
     };
     let raw_len = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, list_op, len_descr);
     ctx.trace_ctx
