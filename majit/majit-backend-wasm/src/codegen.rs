@@ -881,6 +881,49 @@ fn residual_call_i64_arity(op: &Op) -> Option<usize> {
     Some(nargs)
 }
 
+/// If `op` is a residual float CALL whose ABI uses only wasm-representable
+/// word / float arguments, return its wasm parameter types — eligible for a
+/// direct `call_indirect` returning `f64`. `None` keeps the `jit_call`
+/// trampoline: non-float / release-GIL / assembler calls, a missing call
+/// descr, an unsupported argument or result type, or an arg-count/descr-shape
+/// mismatch (defensive).
+///
+/// This includes `CallMayForceF`: the wasm virtualizable is always
+/// materialized, so `GuardNotForced` is a no-op and a direct call is sound.
+fn residual_call_float_sig(op: &Op) -> Option<Vec<ValType>> {
+    use OpCode::*;
+    if !matches!(
+        op.opcode,
+        CallF | CallPureF | CallLoopinvariantF | CallMayForceF
+    ) {
+        return None;
+    }
+    if op.result_type() != Type::Float {
+        return None;
+    }
+    let descr = op.getdescr()?;
+    let cd = descr.as_call_descr()?;
+    if cd.result_type() != Type::Float {
+        return None;
+    }
+    let arg_types = cd.arg_types();
+    let mut params = Vec::with_capacity(arg_types.len());
+    for ty in arg_types {
+        params.push(match ty {
+            Type::Int | Type::Ref => ValType::I64,
+            Type::Float => ValType::F64,
+            _ => return None,
+        });
+    }
+    // `getarglist()[0]` is the func pointer; the call args are `[1..]`. The
+    // descr's `arg_types` describes those call args, so the counts must match.
+    let nargs = op.getarglist().len().saturating_sub(1);
+    if params.len() != nargs {
+        return None;
+    }
+    Some(params)
+}
+
 /// Void-recorded counterpart of [`residual_call_i64_arity`]: an eligible
 /// void residual CALL whose descr records the dummy-word C ABI
 /// (`result_size == 8`, minted by `make_call_descr_void_word_abi`) — the
@@ -966,10 +1009,10 @@ fn has_call_ops(ops: &[Op]) -> bool {
 /// live CA frame.
 ///
 /// Keep this in lockstep with the individual emission arms below: the uniform
-/// i64 residual family, `New*`, and write barriers are direct under
-/// `WASM_DIRECT_RESIDUAL_CALL`; non-uniform CALLs and string allocation retain
-/// the trampoline.  When the direct family is disabled, all of the existing
-/// call-area users return to the trampoline baseline.
+/// i64 and typed float residual families, `New*`, and write barriers are direct
+/// under `WASM_DIRECT_RESIDUAL_CALL`; non-uniform CALLs and string allocation
+/// retain the trampoline. When the direct family is disabled, all of the
+/// existing call-area users return to the trampoline baseline.
 pub fn has_trampoline_calls(inputargs: &[InputArg], ops: &[Op], emit_ca: bool) -> bool {
     let ref_values = RefValues::collect(inputargs, ops);
     if !WASM_DIRECT_RESIDUAL_CALL {
@@ -984,8 +1027,11 @@ pub fn has_trampoline_calls(inputargs: &[InputArg], ops: &[Op], emit_ca: bool) -
         // These arms have no direct helper lowering.
         OpCode::Newstr | OpCode::Newunicode => true,
         // Every residual CALL uses the trampoline unless its exact lowering
-        // predicate supplies an i64 helper ABI.
-        _ if op.opcode.is_call() => direct_helper_i64_arity(op, &ref_values).is_none(),
+        // predicate supplies an i64 helper ABI or a typed float ABI.
+        _ if op.opcode.is_call() => {
+            direct_helper_i64_arity(op, &ref_values).is_none()
+                && residual_call_float_sig(op).is_none()
+        }
         // `New*` and ref-store write barriers are covered by
         // `direct_helper_i64_arity`, so their direct-family arms do not touch
         // the frame call area.
@@ -1316,9 +1362,26 @@ pub fn build_wasm_module(
     } else {
         None
     };
+    // Typed float residual calls use their descr's faithful wasm ABI instead
+    // of the uniform i64 helper family. Preserve first-use order so a given
+    // trace gets stable type indices while declaring each signature once.
+    let mut float_residual_sigs = Vec::new();
+    if WASM_DIRECT_RESIDUAL_CALL {
+        for op in ops {
+            if let Some(sig) = residual_call_float_sig(op) {
+                if !float_residual_sigs.contains(&sig) {
+                    float_residual_sigs.push(sig);
+                }
+            }
+        }
+    }
     // The shared indirect-function table backs direct residual helpers as well
     // as host-trampoline dispatch, chained bridges, and CA recursion.
-    let needs_table = needs_call || bridge_dispatch || residual_max_arity.is_some() || ca.emit_ca;
+    let needs_table = needs_call
+        || bridge_dispatch
+        || residual_max_arity.is_some()
+        || !float_residual_sigs.is_empty()
+        || ca.emit_ca;
     // `ca.emit_ca` forces the direct helper family to include arities 0..=2,
     // so all CA frame-helper trampoline `else` arms below are baseline-only.
     debug_assert!(!ca.emit_ca || residual_max_arity.is_some());
@@ -1359,6 +1422,20 @@ pub fn build_wasm_module(
         types
             .ty()
             .function(vec![ValType::I64, ValType::I64], vec![ValType::I64]);
+    }
+    // Float residual types follow all pre-existing direct helper types. Their
+    // parameter sequence comes from the call descr (`i64` for Int/Ref, `f64`
+    // for Float) and their result is always `f64`; the emitter uses this map to
+    // select the exact `call_indirect` type for each callee.
+    let float_residual_type_base = ca_helper_type_idx + ca.emit_ca as u32;
+    let float_residual_type_indices = float_residual_sigs
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(offset, sig)| (sig, float_residual_type_base + offset as u32))
+        .collect::<indexmap::IndexMap<_, _>>();
+    for sig in float_residual_type_indices.keys() {
+        types.ty().function(sig.clone(), vec![ValType::F64]);
     }
     module.section(&types);
 
@@ -1444,6 +1521,7 @@ pub fn build_wasm_module(
         external_jump_key,
         frame,
         residual_max_arity.map(|_| residual_type_base),
+        &float_residual_type_indices,
         ca,
         bridge_finish_fi,
         ca_helper_type_idx,
@@ -1491,6 +1569,10 @@ fn build_function(
     // eligible residual call / `New*` / write barrier, so those arms always
     // use the `jit_call` path.
     residual_type_base: Option<u32>,
+    // Exact wasm type indices for direct float residual calls, keyed by their
+    // descr-derived parameter sequence. These types return `f64`; Float SSA
+    // values are converted to/from their i64 bit carrier around the call.
+    float_residual_type_indices: &indexmap::IndexMap<Vec<ValType>, u32>,
     // Self-recursive CALL_ASSEMBLER arm (`PYRE_WASM_CA`). `ca.emit_ca` off keeps
     // the body byte-identical.
     ca: CaParams,
@@ -3144,6 +3226,48 @@ fn build_function(
                     );
                     emit_reload_refs_from_homes(
                         &mut sink, ref_homes, &liveness, op_idx, None, frame,
+                    );
+                } else if let Some((sig, &type_idx)) = residual_call_float_sig(op).and_then(|sig| {
+                    float_residual_type_indices
+                        .get(&sig)
+                        .map(|type_idx| (sig, type_idx))
+                }) {
+                    // Direct in-module float residual call. Float SSA values
+                    // are i64 bit carriers, while the target's table entry has
+                    // the descr-derived mixed `(i64/f64...) -> f64` signature.
+                    let call_args = &op.getarglist()[1..];
+                    debug_assert_eq!(call_args.len(), sig.len());
+                    for (arg, ty) in call_args.iter().zip(&sig) {
+                        emit_resolve(&mut sink, constants, arg.to_opref());
+                        if *ty == ValType::F64 {
+                            sink.f64_reinterpret_i64();
+                        }
+                    }
+                    // func_ptr (arg 0) is the table slot — wrap to i32 index.
+                    emit_resolve(&mut sink, constants, op.arg(0).to_opref());
+                    sink.i32_wrap_i64();
+                    sink.call_indirect(0, type_idx);
+                    // Retain Float's i64 SSA carrier after the f64-returning
+                    // table entry has completed.
+                    sink.i64_reinterpret_f64();
+                    if !OpRef::raw_is_constant(vi) {
+                        sink.local_set(1 + vi);
+                    } else {
+                        sink.drop(); // value-producing call whose result is unused
+                    }
+                    emit_reload_frame_if_necessary(
+                        &mut sink,
+                        residual_type_base,
+                        ca.ca_reload_fn_ptr,
+                        ca.jf_top_addr,
+                    );
+                    emit_reload_refs_from_homes(
+                        &mut sink,
+                        ref_homes,
+                        &liveness,
+                        op_idx,
+                        (!OpRef::raw_is_constant(vi)).then_some(vi),
+                        frame,
                     );
                 } else {
                     let jit_call = jit_call_idx.expect("CALL op present but jit_call not imported");
