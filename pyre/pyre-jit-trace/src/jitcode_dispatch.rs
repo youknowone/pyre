@@ -17416,13 +17416,28 @@ fn try_walker_specialize_load_attr(
     // guard_value(getfield_gc_i(obj, map), C_map): `jit.promote(self.map)`
     // (`mapdict.py:905-906`).  The map nodes are interned + immortal, so the
     // pointer is a stable identity guarded as an opaque word (object_map_descr
-    // is Int-typed).  Skipped when the field read already const-folds to the map
-    // (heapcache hit).
+    // is Int-typed).
+    //
+    // The guard may only be elided when the map read is ALREADY a compile-time
+    // constant — i.e. a prior promotion in this trace pinned it via
+    // `replace_box`.  It must NOT be elided merely because `box_value(map_op)`
+    // reports the concrete map: every traced getfield op carries its live value
+    // (`opimpl_getfield_gc_i` → `set_opref_concrete`, `history.py:803`
+    // FrontendOp), so `box_value == map` holds for the very first read and
+    // would drop the guard on the trace's entry.  A trace whose map guard is
+    // dropped reads `storage[storageindex]` off any same-class receiver whose
+    // map differs (GuardClass alone does not pin the layout), returning a wild
+    // slot value.  Pin the map with `replace_box` after guarding so a later
+    // fold on the same receiver correctly elides (matching the trait
+    // `implement_guard_value`, `trace_opcode.rs:4631-4633`).
     let map_op =
         crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, obj, crate::descr::object_map_descr());
-    if ctx.trace_ctx.box_value(map_op) != Some(majit_ir::Value::Int(map as i64)) {
+    if !map_op.is_constant() {
         let map_const = ctx.trace_ctx.const_int(map as i64);
         walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[map_op, map_const])?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(map_op, map_const);
     }
 
     // getfield_gc_r(obj, storage) + getarrayitem_gc_r(block, C_storageindex):
