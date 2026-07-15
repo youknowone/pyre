@@ -4403,6 +4403,45 @@ impl<'a> Lowering<'a> {
                     });
                     return Ok(res);
                 }
+                // A prebuilt object-space singleton whose declared type is
+                // a zero-field unit struct (the dict-strategy singletons
+                // `EMPTY_DICT_STRATEGY`, `OBJECT_DICT_STRATEGY`, …).  Narrow
+                // the raw GCREF address through `__pyre_cast_instance[<impl>]`
+                // so the read types `SomeInstance(<impl>)` — the prebuilt
+                // instance the annotator would give it (`immutablevalue`).
+                // The bare `ConstRefAddr` types `SomePtr`, which cannot union
+                // with the classdef-less `dstrategy` field cell (`_ptr ∪
+                // <other>`); a classed instance unions cleanly (the None-side
+                // widen arm in `SomeInstance ∪ SomeInstance`).  Gated to
+                // zero-field structs so the field-bearing object singletons
+                // (`None` / `True` / `False` / `Ellipsis` / `NotImplemented`)
+                // in the same `refs` bucket keep their raw-pointer lowering.
+                if let Some(root) = self.refs_static_zerofield_struct_root(&place_ty)
+                    && let Some(op @ OpKind::ConstRefAddr(_)) = self.static_addr_op(&segments)
+                {
+                    let bb_id = self.block_id[mir_bb];
+                    let raw = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(raw.clone()),
+                        kind: op,
+                    });
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::Call {
+                            target: CallTarget::FunctionPath {
+                                segments: vec!["__pyre_cast_instance".to_string(), root.clone()],
+                            },
+                            args: vec![raw],
+                            result_ty: ValueType::Ref(Some(root)),
+                        },
+                    });
+                    return Ok(res);
+                }
                 let op = self
                     .static_addr_op(&segments)
                     .or_else(|| self.static_int_value_op(&segments))
@@ -9031,6 +9070,24 @@ impl<'a> Lowering<'a> {
         let def_id = inline_adt_def_id(v)?;
         let td = self.llbc.type_by_id(def_id)?;
         Some(td.item_meta.name_path())
+    }
+
+    /// The struct-root `name_path()` of `ty` when it resolves to a
+    /// zero-field unit struct — the shape of the prebuilt dict-strategy
+    /// singletons (`EmptyDictStrategy`, `ObjectDictStrategy`, …).  The
+    /// `PlaceKind::Global` reader narrows a `refs`-bucket static of such a
+    /// type through `__pyre_cast_instance[<root>]` to a classed
+    /// `SomeInstance`.  Returns `None` for a field-bearing struct (the
+    /// object singletons `W_NoneObject` / `W_BoolObject` / … in the same
+    /// bucket keep their raw-pointer lowering) or any non-struct shape.
+    fn refs_static_zerofield_struct_root(&self, ty: &TyRef) -> Option<String> {
+        let v = self.tyref_adt_body(ty)?;
+        let def_id = inline_adt_def_id(v)?;
+        let td = self.llbc.type_by_id(def_id)?;
+        match &td.kind {
+            TypeDeclKind::Struct(fields) if fields.is_empty() => Some(td.item_meta.name_path()),
+            _ => None,
+        }
     }
 
     /// The per-instantiation classdef root of the ADT a [`TyRef`]
