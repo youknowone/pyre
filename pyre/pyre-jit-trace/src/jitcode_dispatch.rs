@@ -6740,16 +6740,6 @@ fn try_execute_residual_call_via_executor(
     // the `for_iter_next` consume itself never counts).
     let user_frame_snapshot = (!provably_side_effect_free && fbw_foriter_inflight_active())
         .then(pyre_interpreter::call::frame_entry_count);
-    // #73/#267: the user-frame gate above excludes the `for_iter_next` consume
-    // itself, so sample the frame odometer separately for it — a user-defined
-    // iterator's `__next__`/`__getitem__` runs Python bytecode (the odometer
-    // advances) while a builtin iterator's next runs at the C level (it does
-    // not).  The operand-stack mirror cannot yet reconcile the inline sub-walk
-    // that the user iterator's bytecode drives, so the post-call decline uses
-    // this to keep the legacy resume for a user-iterator FOR_ITER while a
-    // builtin FOR_ITER stays modeled.
-    let foriter_frame_snapshot = (helper == majit_ir::PyreHelperKind::ForIterNext)
-        .then(pyre_interpreter::call::frame_entry_count);
     // #493: a NEW consume attempt for a FOR_ITER whose prior item is still in
     // flight means that item's body ran to completion — mark the entry BEFORE
     // the call so an attempt that aborts mid-way (a kept-stack guard on the
@@ -6869,19 +6859,6 @@ fn try_execute_residual_call_via_executor(
     {
         fbw_bump_executed_effect();
     }
-    // #73/#267: a user-defined iterator's FOR_ITER runs its item producer
-    // (`__next__`/`__getitem__`) as an inline sub-walk whose operand-stack
-    // boundaries the mirror does not yet reconcile — keeping the mirror valid
-    // across such a FOR_ITER grafts a corrupt box at a loop-body guard resume
-    // ("not an iterator").  Decline the mirror for the rest of this walk (the
-    // legacy resume, unchanged from the pre-`ResultToTos` behaviour) when the
-    // `for_iter_next` consume entered a user frame; a BUILTIN iterator's
-    // consume runs at the C level (no user frame) and stays modeled.
-    let foriter_entered_user_frame = foriter_frame_snapshot
-        .is_some_and(|before| pyre_interpreter::call::frame_entry_count() != before);
-    if foriter_entered_user_frame {
-        ctx.vstack_valid = false;
-    }
     match exec_result {
         Ok(result_i64) => {
             fbw_count_executed_residual(is_void, is_may_force);
@@ -6957,11 +6934,9 @@ fn try_execute_residual_call_via_executor(
                 // still holds whatever inner box the ForIterNext produced.  Seed
                 // it with the item OpRef so the FOR_ITER boundary
                 // (`ResultToTos`) places the item, not a stale box, on the new
-                // TOS.  Reached for a builtin iterator only: a user-defined
-                // iterator already latched `vstack_valid = false` above
-                // (`foriter_entered_user_frame`), so this seed is inert for it
-                // (`vstack_last_ref` is consumed only while the mirror is
-                // valid).
+                // TOS.  This runs for every `ForIterNext` residual once it
+                // returns, placing the item OpRef on the new TOS for the
+                // FOR_ITER `ResultToTos` boundary.
                 ctx.vstack_last_ref = recorded;
                 if fbw_debug_abort_enabled() {
                     pcmap_entrypc_audit_ctx_read(ctx, "foriter_debug");
