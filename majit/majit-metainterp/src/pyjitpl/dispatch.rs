@@ -8669,7 +8669,7 @@ mod tests {
             16,
             0xCD,
             false,
-            &[(0, false, "value", false), (8, true, "next", false)],
+            &[(0, false, "value"), (8, true, "next")],
         ); // ref reg 0 = Node*
         builder.load_const_i_value(0, 99); // int reg 0 = 99
         builder.setfield_gc_i(0, 0, 0, 0xCD); // Node.value = 99
@@ -8741,7 +8741,7 @@ mod tests {
             16,
             0xCE,
             false,
-            &[(0, false, "value", false), (8, true, "next", false)],
+            &[(0, false, "value"), (8, true, "next")],
         );
         builder.setfield_gc_i_c(0, -7, 0, 0xCE); // Node.value = -7 (inline const)
         let jitcode = builder.finish();
