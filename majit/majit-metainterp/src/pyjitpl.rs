@@ -6734,6 +6734,7 @@ impl<M: Clone> MetaInterp<M> {
             )
         };
 
+        let partial_ops_before = partial.ops.len();
         let trace_ops: Vec<Op> = {
             let loop_data = compile::UnrolledLoopData::new(
                 &trace,
@@ -6749,7 +6750,9 @@ impl<M: Clone> MetaInterp<M> {
                 .map(|rc| (**rc).clone())
                 .collect()
         };
-        let num_ops_before = trace_ops.len();
+        // `num_combined_ops` below counts the saved partial preamble plus the
+        // retrace body, so the before/after compile-stat slice must do the same.
+        let num_ops_before = partial_ops_before + trace_ops.len();
 
         if crate::majit_log_enabled() {
             eprintln!("--- retrace body (before opt) ---");
