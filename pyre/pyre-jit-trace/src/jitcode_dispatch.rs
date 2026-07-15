@@ -15914,6 +15914,25 @@ fn dispatch_residual_call_iRd_kind(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
+    // #171: virtualize a non-escaping BUILD_LIST (`newlist_from_array`) by
+    // decomposing it into the `opimpl_newlist` shape (`pyjitpl.py:779`) —
+    // `new_with_vtable` + `new_array` + `setarrayitem_gc` + `setfield_gc` —
+    // choosing the storage strategy from the concrete element shadows exactly
+    // like `w_list_new` / `list_strategy_for`, so the traced object matches what
+    // the blackhole rebuilds on deopt.  Gated on `PYRE_NEWLIST_VIRT`
+    // (default-on).  Falls through to the opaque residual for any shape it
+    // cannot reproduce faithfully (empty list, non-const array length, an
+    // element without a concrete Ref shadow) — SAFE, never declined.
+    if ctx.is_authoritative_executor
+        && ctx.is_full_body_walk
+        && dst_bank == 'r'
+        && ei.pyre_helper == majit_ir::PyreHelperKind::NewlistFromArray
+        && newlist_virt_enabled()
+        && try_walker_specialize_newlist(ctx, op.pc, &r_args, dst, dst_bank)?.is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
     // #171: specialize `lst.append(x)` so its array ops reach the trace,
     // replacing the opaque `bh_call_fn` residual (orthodox descent of the
     // real `w_list_append` body; see `try_walker_orthodox_list_append`).  The
@@ -18089,6 +18108,210 @@ fn walker_guard_exact_w_class(
     walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[eq])
 }
 
+/// `PYRE_NEWLIST_VIRT` gate (read once) — routes the `newlist_from_array`
+/// residual through the virtualizable [`try_walker_specialize_newlist`]
+/// instead of recording the opaque CallR.  Default-on (the orthodox
+/// `opimpl_newlist` shape); set `PYRE_NEWLIST_VIRT=0` to fall back to the
+/// residual.
+fn newlist_virt_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("PYRE_NEWLIST_VIRT").map_or(true, |v| v != "0"));
+    *ENABLED
+}
+
+/// #171: FBW virtualization of a non-escaping BUILD_LIST.
+/// `lower_tuple_build_hlop_to_insn` lowers BUILD_LIST to `new_array_clear`
+/// + per-index `setarrayitem_gc` + a `newlist_from_array` residual
+/// (oopspec [`majit_ir::PyreHelperKind::NewlistFromArray`]) whose single
+/// r-arg is the already-built backing array.  Decompose that residual into
+/// the virtualizable `opimpl_newlist` shape (`pyjitpl.py:779`) —
+/// `new_with_vtable` + `new_array` + `setarrayitem_gc` + `setfield_gc` —
+/// so the optimizer folds the whole list (wrapper + block) when it never
+/// escapes and the array build + residual DCE.
+///
+/// The element boxes are recovered from the backing array (its const length
+/// from `heapcache.arraylen`, then per-index element shadows via
+/// `heapcache_getarrayitem`), NOT from residual args.  The storage strategy
+/// is chosen from the concrete element shadows exactly as
+/// `list_strategy_for` / `w_list_new` does at runtime, so the traced object
+/// matches the strategy the blackhole rebuilds on deopt:
+///   * `list_strategy_for` → Integer AND every element an exact
+///     `W_IntObject` → Integer (`int_items` typed block, elements unboxed
+///     via `walker_unbox_int`);
+///   * → Float → Float (`float_items` typed block, strict `W_FloatObject`
+///     elements only, so exact-type by construction);
+///   * → Object → Object (boxed refs into an `ItemsBlock`).
+///
+/// Returns `Ok(None)` to fall through to the opaque residual (always
+/// byte-correct) for any shape it cannot reproduce faithfully: empty list
+/// (Empty strategy), a non-const / unrecoverable array length, an element
+/// without a concrete Ref shadow, or an Integer-strategy list that carries a
+/// fits-in-word `W_LongObject` / tagged immediate (which `walker_unbox_int`'s
+/// `&INT_TYPE` guard does not cover).
+fn try_walker_specialize_newlist(
+    ctx: &mut WalkContext<'_, '_>,
+    op_pc: usize,
+    r_args: &[OpRef],
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    if !ctx.is_authoritative_executor || !ctx.is_full_body_walk || dst_bank != 'r' {
+        return Ok(None);
+    }
+    if r_args.len() != 1 {
+        return Ok(None);
+    }
+    let arr = r_args[0];
+
+    // Const backing-array length (`new_array_clear(Const(len))` seeded
+    // `heapcache.arraylen` — a cleared array has every slot set, so read the
+    // length directly rather than probing getarrayitem until a miss).  Empty
+    // list → Empty strategy: decline (the residual reproduces it).
+    let len = {
+        let Some(len_op) = ctx.trace_ctx.heap_cache().arraylen(arr) else {
+            return Ok(None);
+        };
+        match len_op.inline_const_to_value() {
+            Some(majit_ir::Value::Int(n)) if n >= 1 => n as usize,
+            _ => return Ok(None),
+        }
+    };
+
+    // Recover the element boxes from the array heap-cache (the values the
+    // BUILD_LIST `setarrayitem_gc` ops stored); a cache miss (clobbered array)
+    // bails to the opaque residual.
+    let descr_idx = crate::state::pyobject_gcarray_descr().index();
+    let mut items: Vec<OpRef> = Vec::with_capacity(len);
+    for i in 0..len {
+        let Some(elem) =
+            ctx.trace_ctx
+                .heapcache_getarrayitem(arr, OpRef::ConstInt(i as i64), descr_idx)
+        else {
+            return Ok(None);
+        };
+        items.push(elem);
+    }
+
+    // Concrete element objects (needed to classify the strategy and extract
+    // the payloads before any allocation).  An element without a concrete Ref
+    // shadow declines to the residual.
+    let mut concretes: Vec<pyre_object::PyObjectRef> = Vec::with_capacity(len);
+    for &it in &items {
+        let Some(obj) = walker_concrete_ref_object(ctx, it) else {
+            return Ok(None);
+        };
+        concretes.push(obj);
+    }
+
+    // Strategy the runtime `w_list_new` would pick — the source of truth for
+    // the concrete shadow, so the traced storage matches on deopt.
+    let strategy = pyre_object::listobject::list_strategy_for(&concretes);
+    use pyre_object::listobject::ListStrategy;
+
+    // Pre-extract the machine payloads BEFORE `build_list_from_refs` allocates
+    // (a minor collection there could move the boxed elements, so the raw
+    // pointers must not be dereferenced afterwards).
+    enum Emit {
+        Int(Vec<i64>),
+        Float(Vec<f64>),
+        Object,
+    }
+    let int_ty = &pyre_object::pyobject::INT_TYPE as *const pyre_object::pyobject::PyType;
+    let emit = match strategy {
+        ListStrategy::Integer => {
+            // `list_strategy_for` accepts fits-in-word `W_LongObject` and
+            // tagged immediates under Integer, but `walker_unbox_int` only
+            // covers the exact `W_IntObject` (`&INT_TYPE` + `intval`) shape —
+            // decline otherwise so the residual (correct for any element)
+            // rebuilds the same Integer list.
+            let mut vals = Vec::with_capacity(len);
+            for &p in &concretes {
+                if pyre_object::tagged_int::CAN_BE_TAGGED
+                    && pyre_object::tagged_int::is_tagged_int(p)
+                {
+                    return Ok(None);
+                }
+                let exact_int =
+                    unsafe { pyre_object::is_plain_int1(p) && std::ptr::eq((*p).ob_type, int_ty) };
+                if !exact_int {
+                    return Ok(None);
+                }
+                vals.push(unsafe { pyre_object::w_int_get_value(p) });
+            }
+            Emit::Int(vals)
+        }
+        ListStrategy::Float => {
+            // `all_floats` is strict `type(w) is W_FloatObject`, so every
+            // element is an exact `W_FloatObject` (`walker_unbox_float`'s
+            // `&FLOAT_TYPE` guard holds).
+            let mut vals = Vec::with_capacity(len);
+            for &p in &concretes {
+                vals.push(unsafe { pyre_object::w_float_get_value(p) });
+            }
+            Emit::Float(vals)
+        }
+        ListStrategy::Object => Emit::Object,
+        // Empty is impossible here (len >= 1); decline defensively.
+        ListStrategy::Empty => return Ok(None),
+    };
+
+    // Concrete shadow: a fresh list built from the element shadows
+    // (`w_list_new` parity — picks the same strategy). A new allocation with
+    // no heap mutation, safe during the walk like `wrapint`.
+    let result_concrete = pyre_interpreter::build_list_from_refs(&concretes);
+    if result_concrete.is_null() {
+        return Ok(None);
+    }
+
+    // --- emit the virtualizable decomposed newlist (walker-native) ---
+    let list_op = match emit {
+        Emit::Int(vals) => {
+            let int_type_addr = int_ty as i64;
+            let mut raws: Vec<OpRef> = Vec::with_capacity(len);
+            for (&it, &v) in items.iter().zip(vals.iter()) {
+                let raw = walker_unbox_int(ctx, op_pc, it, int_type_addr)?;
+                ctx.trace_ctx
+                    .set_opref_concrete(raw, majit_ir::Value::Int(v));
+                raws.push(raw);
+            }
+            crate::helpers::emit_typed_list_inline(
+                &mut *ctx.trace_ctx,
+                &raws,
+                crate::state::int_gcarray_descr(),
+                crate::descr::list_int_items_len_descr(),
+                crate::descr::list_int_items_block_descr(),
+                ListStrategy::Integer,
+            )
+        }
+        Emit::Float(vals) => {
+            let float_type_addr = &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64;
+            let mut raws: Vec<OpRef> = Vec::with_capacity(len);
+            for (&it, &v) in items.iter().zip(vals.iter()) {
+                let raw = walker_unbox_float(ctx, op_pc, it, float_type_addr)?;
+                ctx.trace_ctx
+                    .set_opref_concrete(raw, majit_ir::Value::Float(v));
+                raws.push(raw);
+            }
+            crate::helpers::emit_typed_list_inline(
+                &mut *ctx.trace_ctx,
+                &raws,
+                crate::state::float_gcarray_descr(),
+                crate::descr::list_float_items_len_descr(),
+                crate::descr::list_float_items_block_descr(),
+                ListStrategy::Float,
+            )
+        }
+        Emit::Object => crate::helpers::emit_object_list_inline(&mut *ctx.trace_ctx, &items),
+    };
+
+    ctx.trace_ctx.set_opref_concrete(
+        list_op,
+        majit_ir::Value::Ref(majit_ir::GcRef(result_concrete as usize)),
+    );
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, list_op)?;
+    Ok(Some(()))
+}
+
 /// #195 / #73: FBW virtualization of an arity-2 plain-int BUILD_TUPLE.
 /// `lower_tuple_build_hlop_to_insn` lowers BUILD_TUPLE to `new_array_clear`
 /// + per-index `setarrayitem_gc` + a `newtuple_from_array` residual
@@ -20014,7 +20237,7 @@ fn try_walker_trace_exception_new(
 
     // Build `args_w` inline (Object strategy) so the whole list
     // (W_ListObject + ItemsBlock) virtualizes alongside the exception.
-    let args_list = crate::helpers::emit_exception_args_list_inline(ctx.trace_ctx, args);
+    let args_list = crate::helpers::emit_object_list_inline(ctx.trace_ctx, args);
 
     let new_op =
         crate::helpers::emit_exception_new_inline(ctx.trace_ctx, kind, callable_op, args_list);

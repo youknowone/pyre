@@ -6360,9 +6360,9 @@ impl MIFrame {
     /// `gen_initialize_vtable`), so the result is a fully GC-managed
     /// `W_BaseException` identical to the runtime `malloc_typed` +
     /// `exc_new_wrapper` + `descr_init` path.  `args_w` is built inline
-    /// (`emit_exception_args_list_inline`) when `w_list_new` would pick
-    /// the Object strategy, so the args list virtualizes too; Empty /
-    /// Integer / Float strategies fall back to a residual list.
+    /// (`emit_object_list_inline`) when `w_list_new` would pick the Object
+    /// strategy, so the args list virtualizes too; Empty / Integer / Float
+    /// strategies fall back to a residual list.
     ///
     /// Restricted to a callable that is exactly
     /// `lookup_exc_class_for_kind(kind)`: user subclasses (whose ctor may
@@ -6433,7 +6433,7 @@ impl MIFrame {
         let args_list = if pyre_object::listobject::list_strategy_for(concrete_args)
             == pyre_object::listobject::ListStrategy::Object
         {
-            self.with_ctx(|_this, ctx| crate::helpers::emit_exception_args_list_inline(ctx, args))
+            self.with_ctx(|_this, ctx| crate::helpers::emit_object_list_inline(ctx, args))
         } else {
             TraceHelperAccess::trace_build_list(self, args)?
         };

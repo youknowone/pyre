@@ -4501,11 +4501,19 @@ where
             // element boxes passed as args are forced by the residual call
             // regardless of flavor.  Matches the pointer-copy-only
             // `newtuple_from_array` sibling (`Plain`).
+            //
+            // Tag the residual as the BUILD_LIST helper so the FBW walker can
+            // intercept it and emit the virtualizable decomposed `newlist`
+            // shape (`pyjitpl.py:779 opimpl_newlist`) instead of recording the
+            // opaque CallR.  Inert on the assembler/baseline path (it reads
+            // fn_idx + args, not `pyre_helper`) and on the legacy trait path
+            // (which never emits this residual); only the FBW intercept, gated
+            // on `PYRE_NEWLIST_VIRT`, keys on it.
             Some(build_residual_call_r_r_insn_from_operands(
                 ctx.newlist_from_array_fn_idx,
                 vec![array_operand],
                 CallFlavor::Plain,
-                majit_ir::PyreHelperKind::None,
+                majit_ir::PyreHelperKind::NewlistFromArray,
                 dst_reg,
             ))
         }

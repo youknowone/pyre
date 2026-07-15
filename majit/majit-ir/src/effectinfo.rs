@@ -584,6 +584,19 @@ pub enum PyreHelperKind {
     /// `trace_build_tuple_value`), so the backing array build and the
     /// partner [`PyreHelperKind::UnpackItem`] reads DCE to a pure-int loop.
     NewtupleFromArray,
+    /// `newlist_from_array(array)` — the BUILD_LIST array consumer that
+    /// `lower_tuple_build_hlop_to_insn` emits after `new_array_clear` +
+    /// `setarrayitem_gc`.  The full-body walker recognises this tag to
+    /// decompose the list into the virtualizable `opimpl_newlist` shape
+    /// (`pyjitpl.py:779`) — `new_with_vtable` + `new_array` +
+    /// `setarrayitem_gc` + `setfield_gc` — choosing the storage strategy
+    /// from the concrete element shadows the way `w_list_new` /
+    /// `list_strategy_for` does at runtime, so the array build and the
+    /// residual DCE when the list never escapes.  Unlike
+    /// [`PyreHelperKind::NewtupleFromArray`], the element boxes are
+    /// recovered from the backing array (const length + per-index element
+    /// shadows) rather than from residual args.
+    NewlistFromArray,
     /// `n_varargs_fn(frame, exc, cause)` — the RAISE-family residual the
     /// codewriter emits for `n argc>=1` (`build_n_varargs_fn_residual_call_r_r_insn`).
     /// `cause` (the trailing Ref arg) is a `PY_NULL` sentinel for `raise X`

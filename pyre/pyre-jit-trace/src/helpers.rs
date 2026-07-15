@@ -947,12 +947,13 @@ pub fn emit_exception_new_inline(
     new_op
 }
 
-/// Emit inline Object-strategy `W_ListObject` creation for the exception
-/// `args_w` list, so a `raise Type(a, b, ...)` builds its argument list
-/// as traced `NewArrayClear` + `SetarrayitemGc` + `NewWithVtable` +
-/// `SetfieldGc` ops the optimizer can virtualize when the exception (and
-/// therefore its args list) never escapes — instead of the opaque
-/// residual `jit_build_list` CallR.
+/// Emit inline Object-strategy `W_ListObject` creation as traced
+/// `NewArrayClear` + `SetarrayitemGc` + `NewWithVtable` + `SetfieldGc`
+/// ops the optimizer can virtualize when the list never escapes — instead
+/// of the opaque residual `jit_build_list` CallR.  Shared by the
+/// `BUILD_LIST` decomposition (`try_walker_specialize_newlist`, Object
+/// strategy) and the exception `args_w` list a `raise Type(a, b, ...)`
+/// constructs.
 ///
 /// Mirrors `listobject.rs::w_list_new` for the Object strategy:
 ///   - `items` points at an `ItemsBlock` GcArray (capacity == `len`);
@@ -968,7 +969,7 @@ pub fn emit_exception_new_inline(
 /// not all-int AND not all-float); the typed Integer / Float strategies
 /// use `int_items` / `float_items` with `items` null and are NOT emitted
 /// here.
-pub fn emit_exception_args_list_inline(ctx: &mut TraceCtx, items: &[OpRef]) -> OpRef {
+pub fn emit_object_list_inline(ctx: &mut TraceCtx, items: &[OpRef]) -> OpRef {
     use crate::descr::{
         list_items_descr, list_length_descr, list_strategy_descr, w_list_size_descr,
     };
@@ -1014,6 +1015,79 @@ pub fn emit_exception_args_list_inline(ctx: &mut TraceCtx, items: &[OpRef]) -> O
     let strategy_idx = strategy_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[list, strategy_const], strategy_descr);
     ctx.heapcache_setfield_cached(list, strategy_idx, strategy_const);
+
+    list
+}
+
+/// Emit inline Integer / Float-strategy `W_ListObject` creation: a typed
+/// length-prefixed backing block (`NewArray` + per-element `SetarrayitemGc`)
+/// holding the already-unboxed machine values in `raws`, then the
+/// `W_ListObject` wrapper (`NewWithVtable` + `strategy` / `int_items.len` /
+/// `int_items.block` — or the `float_items` pair — `SetfieldGc`).  Mirrors the
+/// Integer / Float arm of `listobject.rs::w_list_new` (`IntArray::from_vec` /
+/// `FloatArray::from_vec`), so OptVirtualize can fold the whole list (wrapper +
+/// block) when it never escapes — the orthodox `newlist` shape
+/// (`rlist.py:324 ll_newlist`, two mallocs).
+///
+/// The typed strategy keeps `length = 0` and `items = null`
+/// (`w_list_new_with_strategy` non-Object arm) — both stay zero-filled by
+/// `NewWithVtable`, matching the runtime.  `items_len_descr` / `items_block_descr`
+/// select the `int_items` / `float_items` sub-struct fields and `array_descr`
+/// the matching `int_gcarray_descr` / `float_gcarray_descr`.  Caller must have
+/// guarded + unboxed each element into `raws` already.
+pub fn emit_typed_list_inline(
+    ctx: &mut TraceCtx,
+    raws: &[OpRef],
+    array_descr: majit_ir::DescrRef,
+    items_len_descr: majit_ir::DescrRef,
+    items_block_descr: majit_ir::DescrRef,
+    strategy: pyre_object::listobject::ListStrategy,
+) -> OpRef {
+    use crate::descr::{list_strategy_descr, w_list_size_descr};
+
+    let len = raws.len();
+    let len_ref = ctx.const_int(len as i64);
+
+    // Step 1 — allocate the typed backing block (length-prefixed
+    // `[capacity][i64|f64 ...]`, capacity == len).  The elements are machine
+    // ints / floats (not refs), so `NewArray` (no GC-safe zeroing) matches
+    // `IntArray::from_vec` / `FloatArray::from_vec`; every slot is filled
+    // immediately below.
+    let block = ctx.record_op_with_descr(OpCode::NewArray, &[len_ref], array_descr.clone());
+    ctx.heap_cache_mut().new_array(block, len_ref, true);
+
+    // Step 2 — block[i] = raws[i].
+    let block_descr_idx = array_descr.index();
+    for (i, &raw) in raws.iter().enumerate() {
+        let idx = ctx.const_int(i as i64);
+        ctx.record_op_with_descr(
+            OpCode::SetarrayitemGc,
+            &[block, idx, raw],
+            array_descr.clone(),
+        );
+        ctx.heapcache_setarrayitem(block, idx, block_descr_idx, raw);
+    }
+
+    // Step 3 — allocate the W_ListObject wrapper.
+    let list = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], w_list_size_descr());
+    ctx.heap_cache_mut().new_object(list);
+
+    // Step 4 — strategy / typed-items `len` + `block` SetfieldGc.  `length`
+    // and `items` stay zero-filled (0 / null) by NewWithVtable, as
+    // `w_list_new_with_strategy` leaves them for the typed strategies.
+    let strategy_const = ctx.const_int(strategy as i64);
+    let strategy_descr = list_strategy_descr();
+    let strategy_idx = strategy_descr.index();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[list, strategy_const], strategy_descr);
+    ctx.heapcache_setfield_cached(list, strategy_idx, strategy_const);
+
+    let items_len_idx = items_len_descr.index();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[list, len_ref], items_len_descr);
+    ctx.heapcache_setfield_cached(list, items_len_idx, len_ref);
+
+    let items_block_idx = items_block_descr.index();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[list, block], items_block_descr);
+    ctx.heapcache_setfield_cached(list, items_block_idx, block);
 
     list
 }
