@@ -563,37 +563,6 @@ pub fn trace_bytecode(
 /// unfolded `residual_call`).  See
 /// `project_issue73_architecture_walker_as_tracer_2026_05_28`.
 ///
-/// Whether the loop whose header merge point is `header_mp_pc` (the loop a
-/// header entry at `entry` is about to trace) is NESTED inside another loop
-/// still active at `entry`.
-///
-/// A backward `goto/L` (target `< pc`) is a loop back-edge spanning
-/// `[target, goto_pc]`.  The loop being traced is nested iff some back-edge
-/// `[t, g]` ENCLOSES it: it starts before the entry (`t < entry`) and closes
-/// AFTER the whole inner loop (`g > header_mp_pc`).  A PRECEDING sibling
-/// loop's back-edge closes before `entry` (`g < header_mp_pc`) so it does not
-/// match; the inner loop's OWN back-edge is excluded because its target lands
-/// at its own header (the first merge point at or after `t` is `header_mp_pc`
-/// itself, not an earlier loop).
-fn header_entry_is_nested(code: &[u8], entry: usize, header_mp_pc: usize) -> bool {
-    let first_mp_at_or_after = |t: usize| {
-        crate::jitcode_runtime::decoded_ops(code)
-            .filter(|op| op.opname == "jit_merge_point")
-            .map(|op| op.pc)
-            .filter(|&pc| pc >= t)
-            .min()
-    };
-    crate::jitcode_runtime::decoded_ops(code)
-        .filter(|op| op.opname == "goto")
-        .any(|op| {
-            let target = crate::jitcode_dispatch::read_label(code, &op, 0);
-            target < op.pc // backward branch = loop back-edge
-                && target < entry
-                && op.pc > header_mp_pc
-                && first_mp_at_or_after(target).is_some_and(|mp| mp < header_mp_pc)
-        })
-}
-
 /// Decode the loop-header `jit_merge_point` that governs the resume
 /// coordinate `entry` and return its green-ref (`gr`) and red (`rr`)
 /// register lists.
@@ -625,15 +594,6 @@ fn header_entry_is_nested(code: &[u8], entry: usize, header_mp_pc: usize) -> boo
 ///    merge point, so the governing op is the LAST merge point at or before
 ///    `entry`.
 ///
-/// EXCEPTION: a header entry into a loop that is NESTED inside another loop
-/// still active at `entry` (a `for` inside a `while`) keeps the pre-fix
-/// behavior — the enclosing loop's (earlier) merge point is selected, which
-/// leaves the inner loop's own green color `OpRef::NONE` so the inner-loop
-/// trace declines at its merge point instead of compiling.  pyre's walker
-/// miscompiles the bridges an inner nested loop closes into (wrong result),
-/// so declining (and running the inner loop interpreted) is the safe shape
-/// until that separate nested-loop limitation is fixed.  Only the top-level
-/// sibling-loop case is newly enabled by the forward selection.
 pub(crate) fn loop_header_merge_point_regs(
     code: &[u8],
     entry: usize,
@@ -650,14 +610,20 @@ pub(crate) fn loop_header_merge_point_regs(
             .max()
             .or_else(|| merge_point_pcs().filter(|&pc| pc >= entry).min())
     } else {
-        let forward = merge_point_pcs().filter(|&pc| pc >= entry).min();
-        match forward {
-            Some(f) if !header_entry_is_nested(code, entry, f) => Some(f),
-            _ => merge_point_pcs()
-                .filter(|&pc| pc <= entry)
-                .max()
-                .or(forward),
-        }
+        // Header entry: the governing merge point is the FIRST at or after
+        // `entry` — the op the walk is about to reach — mirroring
+        // opimpl_jit_merge_point binding the merge point it is about to
+        // execute (pyjitpl.py:1537). A sibling loop and a nested inner loop
+        // both forward-select their own header, so a `for` inside a `while`
+        // seeds its own pycode/frame/ec and compiles standalone
+        // (reached_loop_header closes it via same_greenkey on
+        // current_merge_points, pyjitpl.py:3018-3060). Fall back to the last
+        // preceding merge point only for a straight-line entry with no merge
+        // point ahead.
+        merge_point_pcs()
+            .filter(|&pc| pc >= entry)
+            .min()
+            .or_else(|| merge_point_pcs().filter(|&pc| pc <= entry).max())
     }?;
     let mut cursor = mp_pc + 1 + 1; // opcode byte + jdindex (`c`)
     let mut lists: [Vec<u8>; 6] = Default::default();
