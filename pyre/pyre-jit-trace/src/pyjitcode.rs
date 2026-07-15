@@ -58,18 +58,11 @@ use std::ops::{Deref, DerefMut};
 /// translation maps live here instead of polluting either upstream's
 /// canonical `JitCode` or pyre's eventual single-store replacement.
 pub struct PyJitCodeMetadata {
-    /// py_pc → jitcode byte offset of the post-`residual_call` `-live-`
-    /// marker (the one immediately preceding the opcode's own
-    /// `catch_exception`).  RPython keeps `frame.pc` at this position for
-    /// `capture_resumedata(after_residual_call=True, resumepc=-1)`
-    /// (`pyjitpl.py:2610-2624`); pyre records a direct JitCode coordinate in
-    /// the snapshot and keeps the post-call catch marker separately, so
-    /// after-residual-call resume needs this map to reach the call's own catch rather than
-    /// the next opcode's start marker (`blackhole.py:396-410
-    /// handle_exception_in_frame`).  Sparse `(py_pc, offset)` pairs sorted
-    /// ascending by py_pc for binary search; only residual-call PCs appear
-    /// (most PCs have no entry), empty for skeleton / fixture metadata.
-    pub after_residual_call_resume_pc: Vec<(u32, usize)>,
+    /// Post-residual-call catch resume twin, split into the exact
+    /// block-head-marker and predecessor op-start tiers used by
+    /// `python_pc_for_jitcode_pc`. Empty for skeleton / fixture metadata.
+    pub after_residual_call_resume_marker_by_jit_pc: Vec<(usize, Option<usize>)>,
+    pub after_residual_call_resume_pred_by_jit_pc: Vec<(usize, Option<usize>)>,
     /// py_pc → jitcode byte offset of the FIRST instruction the opcode
     /// emitted (`usize::MAX` for PCs that emit no jitcode of their own:
     /// trivia, folded ops).  The dense marker resolution that
@@ -78,7 +71,6 @@ pub struct PyJitCodeMetadata {
     /// positions and that resolution is not invertible; the full-body walk needs
     /// the exact inverse (jitcode pc → containing Python opcode) for
     /// guard resume coordinates, which this table provides.  Same length
-    /// as `after_residual_call_resume_pc`.
     pub first_jit_pc_by_py_pc: Vec<usize>,
     /// Inverse of the derived marker resolution's block-head case: each distinct
     /// `-live-` marker byte offset that some PC resolves to → the first Python PC
@@ -657,6 +649,22 @@ impl PyJitCode {
         Self::predecessor_index(search).and_then(|i| pred[i].1)
     }
 
+    /// Post-`residual_call` catch resume marker keyed by a JitCode byte
+    /// offset, resolved with the SAME exact-marker / predecessor-op-start
+    /// tiers as `python_pc_for_jitcode_pc`.
+    pub fn after_residual_call_resume_for_jitcode_pc(&self, jit_pc: usize) -> Option<usize> {
+        let marker = &self.metadata.after_residual_call_resume_marker_by_jit_pc;
+        let pred = &self.metadata.after_residual_call_resume_pred_by_jit_pc;
+        if marker.is_empty() && pred.is_empty() {
+            return None;
+        }
+        if let Ok(i) = marker.binary_search_by_key(&jit_pc, |&(off, _)| off) {
+            return marker[i].1;
+        }
+        let search = pred.binary_search_by_key(&jit_pc, |&(off, _)| off);
+        Self::predecessor_index(search).and_then(|i| pred[i].1)
+    }
+
     /// task#50 #73-core: whether the trivia depth twin carries entries. `false`
     /// for skeleton / fixture installs where both tiers are
     /// empty. The audit uses this to distinguish an in-table `None` (overshoot,
@@ -665,20 +673,6 @@ impl PyJitCode {
     pub fn depth_trivia_populated(&self) -> bool {
         !self.metadata.depth_trivia_marker_by_jit_pc.is_empty()
             || !self.metadata.depth_trivia_pred_by_jit_pc.is_empty()
-    }
-
-    /// JitCode byte offset of `py_pc`'s post-`residual_call` `-live-`
-    /// (the marker preceding the opcode's own `catch_exception`), or
-    /// `None` if `py_pc` makes no residual call.  After-residual-call
-    /// guard resume (`blackhole.py:396-410 handle_exception_in_frame`)
-    /// uses this distinct catch-presence table so it lands on the call's own
-    /// catch rather than the next opcode's start marker.
-    pub fn after_residual_call_resume_pc_for(&self, py_pc: usize) -> Option<usize> {
-        let table = &self.metadata.after_residual_call_resume_pc;
-        table
-            .binary_search_by_key(&(py_pc as u32), |&(py, _)| py)
-            .ok()
-            .map(|i| table[i].1)
     }
 
     /// Resolve a guard frame from its carried direct JitCode coordinate.
@@ -739,7 +733,8 @@ impl PyJitCode {
         Self::from_parts(
             std::sync::Arc::new(RuntimeJitCode::default()),
             PyJitCodeMetadata {
-                after_residual_call_resume_pc: Vec::new(),
+                after_residual_call_resume_marker_by_jit_pc: Vec::new(),
+                after_residual_call_resume_pred_by_jit_pc: Vec::new(),
                 first_jit_pc_by_py_pc: Vec::new(),
                 block_head_py_by_jit_pc: Vec::new(),
                 carryfwd_resume_pc: Vec::new(),

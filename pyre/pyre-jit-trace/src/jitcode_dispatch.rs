@@ -11812,6 +11812,7 @@ fn walker_capture_snapshot_for_last_guard_impl(
             // emitted a post-call catch); the snapshot resume pc is then the
             // bit-14-marked CALL pc so the blackhole resumes at that catch.
             let mut marker_call_py_pc: Option<u32> = None;
+            let mut marker_call_jit_pc: Option<usize> = None;
             let (py_pc, jitcode_index, num_instrs) = unsafe {
                 let jc = &*sym.jitcode;
                 let mut py = python_pc_for_jitcode_pc(&jc.payload.metadata, op_pc);
@@ -11858,10 +11859,11 @@ fn walker_capture_snapshot_for_last_guard_impl(
                             && call_py_pc < flag
                             && jc
                                 .payload
-                                .after_residual_call_resume_pc_for(call_py_pc as usize)
+                                .after_residual_call_resume_for_jitcode_pc(op_pc)
                                 .is_some()
                         {
                             marker_call_py_pc = Some(call_py_pc);
+                            marker_call_jit_pc = Some(op_pc);
                         }
                     }
                 }
@@ -12212,7 +12214,7 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 // encoder reg-bank window and decoder liveness symmetric.  It is
                 // a valid startpoint (`can_decode_live_vars` holds).
                 // The `after_residual_call` family is excluded — it routes
-                // through the separate `after_residual_call_resume_pc` map + the
+                // through the separate post-call catch-marker twin + the
                 // bit-14 marker, so the ordinary marker would name a different
                 // Every guard-capture point is emitted after a `-live-` marker;
                 // its populated codewrite-time twin is therefore total here.
@@ -12293,10 +12295,10 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 // the bit-14-marked / plain `py_pc → jitcode` resume-translation.
                 //
                 // Which marker the decoder resolves depends on the sub-case
-                // captured in `marker_call_py_pc` (set above at the CALL pc):
-                //   * `Some(call_py_pc)` — the residual call is in a try-block
+                // captured at the CALL pc:
+                //   * `Some(call_jit_pc)` — the residual call is in a try-block
                 //     (FOR_ITER-next catch resume): decode routes the bit-14
-                //     word through `after_residual_call_resume_pc_for`, so carry
+                //     word through the post-call catch marker, so carry
                 //     that same post-call catch `-live-` offset.
                 //   * `None` — plain sequential residual call resuming at the
                 //     next opcode's start marker: decode routes the plain word
@@ -12315,10 +12317,10 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 // `-live-` marker). Fall back to the sentinel on a map miss.
                 let marker = unsafe {
                     let jc = &*sym.jitcode;
-                    match marker_call_py_pc {
-                        Some(call_py_pc) => jc
+                    match marker_call_jit_pc {
+                        Some(call_jit_pc) => jc
                             .payload
-                            .after_residual_call_resume_pc_for(call_py_pc as usize),
+                            .after_residual_call_resume_for_jitcode_pc(call_jit_pc),
                         None => {
                             // Every plain post-call guard capture is emitted
                             // after its fallthrough `-live-` marker, so this
@@ -12363,7 +12365,7 @@ fn walker_capture_snapshot_for_last_guard_impl(
             let liveness_py_pc = guard_py_pc.unwrap_or(py_pc);
             // The snapshot resume pc folds in the bit-14 marker for a try-block
             // residual call so the decode routes through
-            // `after_residual_call_resume_pc_for` (the call's OWN post-call
+            // the post-call catch marker (the call's OWN post-call
             // `-live-`/catch), mirroring the trait leg's `marker_aware_resume_pc`.
             // Liveness / depth / `last_instr` (above) and `collect_outer_active_boxes`
             // (below) keep the plain (fallthrough) `liveness_py_pc` — the same
@@ -12466,9 +12468,9 @@ enum InlineCallerFrameDecline {
 }
 
 fn decline_inline_caller_frame_for_catch_marker(
-    after_residual_call_resume_pc: Option<usize>,
+    after_residual_call_resume: Option<usize>,
 ) -> Result<(), InlineCallerFrameDecline> {
-    if after_residual_call_resume_pc.is_some() {
+    if after_residual_call_resume.is_some() {
         Err(InlineCallerFrameDecline::TryBlockCatchMarker)
     } else {
         Ok(())
@@ -12624,7 +12626,8 @@ fn compute_inline_caller_frame(
         // marker pc, which the multi-frame capture's `py_pc < FLAG` assert
         // rejects — decline this slice.
         decline_inline_caller_frame_for_catch_marker(
-            jc.payload.after_residual_call_resume_pc_for(call_py),
+            jc.payload
+                .after_residual_call_resume_for_jitcode_pc(call_jit_pc),
         )?;
         let code = &*jc.payload.code_ptr;
         let fallthrough = crate::pyjitpl::semantic_fallthrough_pc(code, call_py) as u32;
@@ -12728,9 +12731,10 @@ fn compute_nested_inline_caller_frame(
     }
     let call_py = python_pc_for_jitcode_pc(&pjc.metadata, call_jit_pc) as usize;
     let resume_marker_jit_pc = pjc.after_residual_marker_for_jitcode_pc(call_jit_pc);
+    let after_residual_call_resume = pjc.after_residual_call_resume_for_jitcode_pc(call_jit_pc);
     // A CALL inside a try-block resumes at its own catch via a bit-14 marker
     // pc, which the multi-frame capture's `py_pc < FLAG` assert rejects.
-    decline_inline_caller_frame_for_catch_marker(pjc.after_residual_call_resume_pc_for(call_py))?;
+    decline_inline_caller_frame_for_catch_marker(after_residual_call_resume)?;
     let fallthrough_py_pc = unsafe {
         let code = &*pjc.code_ptr;
         crate::pyjitpl::semantic_fallthrough_pc(code, call_py) as u32

@@ -1029,8 +1029,7 @@ fn derive_pc_live_indices_from_sparse(
 /// Per-`py_pc` pre-merge index of the post-`residual_call` `-live-` that
 /// immediately precedes a `catch_exception`, derived from a SPLICED
 /// (canonical) SSARepr.  These after-residual-call resume anchors feed the
-/// runtime's `after_residual_call_resume_pc` table (the bit-14 flagged resume
-/// path once
+/// runtime's post-call catch-marker twin (the bit-14 flagged resume path once
 /// `compute_liveness_with_pc_anchors` remaps them (`liveness.rs:78-81`) into
 /// the spliced bytes.  For each `catch_exception`, the bare `-live-` directly
 /// before it is the anchor, keyed to the canraise opcode that owns the call
@@ -12292,7 +12291,7 @@ impl CodeWriter {
         // (translated through its `remove_repeated_live` remap), and the
         // sparse after-residual-call resume anchors — both derived from the
         // spliced stream so the remap addresses valid positions and the
-        // runtime's `after_residual_call_resume_pc` table points into the
+        // runtime's post-call catch-marker twin points into the
         // spliced bytes.
         let walker_tracked_pc_live_indices_out: Option<Vec<usize>> = Some(dense);
         let walker_after_call_pc_indices_out: Option<Vec<Option<usize>>> =
@@ -12645,14 +12644,6 @@ impl CodeWriter {
             assembler.finish_with_positions_from(&mut *asm, ssarepr, &combined_indices, num_regs)
         };
         let pc_map_bytes = combined_bytes[..pc_map.len()].to_vec();
-        // Sparse `(py_pc, offset)` sidecar built in ascending py_pc order
-        // (`after_call_some` is `enumerate`-ordered) so the accessor's binary
-        // search is valid without an extra sort.
-        let after_residual_call_resume_pc: Vec<(u32, usize)> = after_call_some
-            .iter()
-            .enumerate()
-            .map(|(k, (py_pc, _))| (*py_pc as u32, combined_bytes[pc_map.len() + k]))
-            .collect();
         // `usize::MAX` = the PC emitted no jitcode of its own (trivia /
         // folded); see `PyJitCodeMetadata::first_jit_pc_by_py_pc`.
         let mut first_jit_pc_by_py_pc: Vec<usize> = vec![usize::MAX; pc_map.len()];
@@ -12793,6 +12784,9 @@ impl CodeWriter {
         let mut resume_marker_pred_by_jit_pc: Vec<(usize, Option<usize>)> = Vec::new();
         let mut after_residual_marker_marker_by_jit_pc: Vec<(usize, Option<usize>)> = Vec::new();
         let mut after_residual_marker_pred_by_jit_pc: Vec<(usize, Option<usize>)> = Vec::new();
+        let mut after_residual_call_resume_marker_by_jit_pc: Vec<(usize, Option<usize>)> =
+            Vec::new();
+        let mut after_residual_call_resume_pred_by_jit_pc: Vec<(usize, Option<usize>)> = Vec::new();
         if !first_jit_pc_by_py_pc.is_empty() {
             use std::collections::BTreeMap;
             let mut by_off: BTreeMap<usize, usize> = BTreeMap::new();
@@ -12887,6 +12881,28 @@ impl CodeWriter {
                 }
             }
             after_residual_marker_pred_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
+            // Post-residual-call catch marker twin: source values from the
+            // same sparse construction inputs, while resolving its key
+            // with the exact block-head / predecessor-op-start split of the
+            // JitCode-pc inversion.
+            let after_residual_call_resume_for_py = |py: usize| {
+                after_call_some
+                    .binary_search_by_key(&py, |&(key, _)| key)
+                    .ok()
+                    .map(|i| combined_bytes[pc_map.len() + i])
+            };
+            for &(off, py) in &block_head_py_by_jit_pc {
+                after_residual_call_resume_marker_by_jit_pc
+                    .push((off, after_residual_call_resume_for_py(py as usize)));
+            }
+            after_residual_call_resume_marker_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
+            for (py, &pos) in first_jit_pc_by_py_pc.iter().enumerate() {
+                if pos != usize::MAX {
+                    after_residual_call_resume_pred_by_jit_pc
+                        .push((pos, after_residual_call_resume_for_py(py)));
+                }
+            }
+            after_residual_call_resume_pred_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
         }
 
         // call.py:148 `jd.mainjitcode.jitdriver_sd = jd`. RPython mutates
@@ -12911,7 +12927,8 @@ impl CodeWriter {
         let frame_stack_base = code.varnames.len() + pyre_interpreter::pyframe::ncells(code);
 
         let metadata = PyJitCodeMetadata {
-            after_residual_call_resume_pc,
+            after_residual_call_resume_marker_by_jit_pc,
+            after_residual_call_resume_pred_by_jit_pc,
             first_jit_pc_by_py_pc,
             block_head_py_by_jit_pc,
             carryfwd_resume_pc,

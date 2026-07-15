@@ -1436,20 +1436,9 @@ impl MIFrame {
         // here so the lazy-load preamble fills exactly the registers the
         // snapshot below reads, routed through the SAME `-live-` the snapshot
         // pc resolves to (`marker_aware_resume_pc` /
-        // `marker_aware_parent_resume_pc`).  A try-block residual call resumes
-        // at its OWN post-call `-live-`/catch via
-        // `after_residual_call_resume_pc_for`:
-        //   * in_a_call parent → the parent's stored CALL pc
-        //     (`residual_call_pc`).
-        //   * after_residual_call top frame → the CALL pc the caller folded
-        //     into the snapshot pc (`Some(orgpc)` for the marker-routed
-        //     GUARD_NOT_FORCED / GUARD_NO_EXCEPTION guards; `None` for the
-        //     GUARD_EXCEPTION path, which carries the exception via the
-        //     `jf_guard_exc` channel and resumes at a plain fallthrough pc).
-        // No marker entry falls back to the fallthrough `-live-`.  Splitting
-        // the two — preamble/boxes at the fallthrough `-live-`, snapshot at
-        // the post-call `-live-` — would make the decoder consume a different
-        // box count than the encoder wrote.
+        // `marker_aware_parent_resume_pc`). A py_pc-only observer cannot
+        // represent a post-call catch marker after the JitCode-keyed migration;
+        // it declines below rather than publishing an ambiguous snapshot.
         let resume_jit_pc: Option<usize> = unsafe {
             let jc = &*jitcode_ptr_pre;
             if !jc.payload.is_populated() {
@@ -1468,16 +1457,18 @@ impl MIFrame {
                     // recorded (pre-call) snapshot position.
                     None
                 };
-                // The post-call marker or loop-close twin is the complete
+                if marker_call_pc.is_some() {
+                    crate::state::request_trace_abort();
+                    return Vec::new();
+                }
+                // The loop-close twin is the complete
                 // resume coordinate at this capture seam. A missing twin uses
                 // the existing trace-abort path below rather than guessing a
                 // block-head position from `live_pc`.
-                match marker_call_pc
-                    .and_then(|call_pc| jc.payload.after_residual_call_resume_pc_for(call_pc))
-                    .or_else(|| {
-                        self.loop_close_marker_jit_pc
-                            .filter(|_| crate::jitcode_dispatch::m73_lclive_carry_enabled())
-                    }) {
+                match self
+                    .loop_close_marker_jit_pc
+                    .filter(|_| crate::jitcode_dispatch::m73_lclive_carry_enabled())
+                {
                     Some(jit_pc) => Some(jit_pc),
                     None => {
                         // This (parent) frame reports a `live_pc` the jitcode
@@ -3885,70 +3876,26 @@ impl MIFrame {
     /// interpreter rather than crashing.
     fn marker_aware_resume_pc(&self, call_pc: usize, after_residual_call: bool) -> usize {
         let flag = majit_ir::resumedata::AFTER_RESIDUAL_CALL_PC_FLAG as usize;
-        let wants_marker = after_residual_call && {
-            let jitcode_index = unsafe { (*self.sym().jitcode).index } as i32;
-            crate::state::pyjitcode_for_jitcode_index(jitcode_index)
-                .and_then(|pj| pj.after_residual_call_resume_pc_for(call_pc))
-                .is_some()
-        };
-        if wants_marker {
-            // A residual call in a try-block must resume at its OWN catch,
-            // routed by the bit-14 marker.  If `call_pc` cannot fit under the
-            // marker, downgrading to an unmarked pc would silently mis-resume
-            // (decode routes through `pc_map` re-execution instead of
-            // `after_residual_call_resume_pc_for`), so request a trace abort
-            // here too → interpreter fallback.
-            if call_pc >= flag {
-                return crate::state::abort_unencodable_resume_pc(call_pc);
-            }
-            majit_ir::resumedata::encode_after_residual_call_pc(call_pc as i32) as usize
-        } else {
-            let raw = if after_residual_call {
-                self.fallthrough_pc
-            } else {
-                call_pc
-            };
-            if raw >= flag {
-                return crate::state::abort_unencodable_resume_pc(raw);
-            }
-            raw
+        if after_residual_call {
+            return crate::state::abort_unencodable_resume_pc(call_pc);
         }
+        if call_pc >= flag {
+            return crate::state::abort_unencodable_resume_pc(call_pc);
+        }
+        call_pc
     }
 
-    /// Parent-frame analogue of [`Self::marker_aware_resume_pc`].  A parent
-    /// (`in_a_call`) frame whose CALL sits in a try-block must resume at that
-    /// call's OWN `catch_exception` when a guard deopts inside the callee and
-    /// the exception unwinds to a handler here (`pyjitpl.py:2601-2602`;
-    /// `blackhole.py:396-410 handle_exception_in_frame`).  Fold the bit-14
-    /// marker onto the CALL pc so the decoder routes through
-    /// `after_residual_call_resume_pc` (its catch) rather than `pc_map` (the
-    /// next opcode).  Without a catch marker, keep the plain `return_point_pc`
-    /// (fallthrough) — the exception then propagates out of this frame.  The
-    /// liveness encoded for this frame (`get_list_of_active_boxes` →
-    /// `materialize_parent_snapshot_state`) is keyed on the same marker, so
-    /// encode and decode read the one `-live-`.
-    fn marker_aware_parent_resume_pc(
-        parent_jitcode_index: u32,
-        call_pc: Option<usize>,
-        return_point_pc: usize,
-    ) -> usize {
+    /// Parent frames with a py_pc-only CALL observer decline rather than
+    /// reconstructing a post-call catch coordinate.
+    fn marker_aware_parent_resume_pc(call_pc: Option<usize>, return_point_pc: usize) -> usize {
         let flag = majit_ir::resumedata::AFTER_RESIDUAL_CALL_PC_FLAG as usize;
-        let marked_call_pc = call_pc.filter(|&cp| {
-            crate::state::pyjitcode_for_jitcode_index(parent_jitcode_index as i32)
-                .and_then(|pj| pj.after_residual_call_resume_pc_for(cp))
-                .is_some()
-        });
-        if let Some(cp) = marked_call_pc {
-            if cp >= flag {
-                return crate::state::abort_unencodable_resume_pc(cp);
-            }
-            majit_ir::resumedata::encode_after_residual_call_pc(cp as i32) as usize
-        } else {
-            if return_point_pc >= flag {
-                return crate::state::abort_unencodable_resume_pc(return_point_pc);
-            }
-            return_point_pc
+        if call_pc.is_some() {
+            return crate::state::abort_unencodable_resume_pc(return_point_pc);
         }
+        if return_point_pc >= flag {
+            return crate::state::abort_unencodable_resume_pc(return_point_pc);
+        }
+        return_point_pc
     }
 
     fn capture_resumedata(
@@ -3969,13 +3916,12 @@ impl MIFrame {
         // get_list_of_active_boxes.  For after-residual-call guards the
         // resume target depends on whether the residual call sits inside
         // a try-block: only then did the jitcode emit a post-call
-        // `-live-`/`catch_exception` (`after_residual_call_resume_pc` has
-        // an entry keyed by the CALL pc).
+        // `-live-`/`catch_exception` marker.
         //
         //   * try-block call: resume at the call's OWN catch.  Store the
         //     CALL pc (`saved_orgpc`) with the marker bit folded in so the
-        //     decoder routes it through `after_residual_call_resume_pc`
-        //     rather than `pc_map` (which would re-execute the call).
+        //     decoder routes it through the post-call catch marker rather
+        //     than `pc_map` (which would re-execute the call).
         //   * non-try call: no catch to land on, so keep the next-opcode
         //     resume (`fallthrough_pc`) — the exception then propagates
         //     out of the frame via `handle_exception_in_frame`, exactly
@@ -4060,17 +4006,7 @@ impl MIFrame {
             } else {
                 &[]
             };
-            // A parent whose CALL is in a try-block resumes at that call's
-            // own catch (bit-14 marker on the CALL pc); otherwise the raw
-            // return_point_pc, which must leave bit 14 free or decode would
-            // mis-read it as marked (resumedata.rs:48-62).  The marker gate
-            // matches the catch-vs-fallthrough liveness chosen for
-            // `parent_active` in `materialize_parent_snapshot_state`.
-            let parent_pc = Self::marker_aware_parent_resume_pc(
-                parent_jitcode_index,
-                parent.call_pc,
-                parent.resume_pc,
-            );
+            let parent_pc = Self::marker_aware_parent_resume_pc(parent.call_pc, parent.resume_pc);
             let parent_word = if crate::jitcode_dispatch::m369_pframe_carry_enabled() {
                 parent
                     .resume_marker_jit_pc
@@ -6806,7 +6742,7 @@ impl MIFrame {
             // the parent CALL's jitcode op pc is not exposed here.
             resume_marker_jit_pc: None,
             // The caller's CALL pc — its post-call `-live-`/`catch_exception`
-            // (keyed by this pc in `after_residual_call_resume_pc`) is where
+            // is where
             // the blackhole must resume this frame if a guard deopts inside
             // the callee and the exception unwinds to a handler here
             // (`pyjitpl.py:2601-2602`).  `orgpc` is the CALL opcode start.

@@ -12379,7 +12379,8 @@ mod tests {
         let pyjit = std::sync::Arc::new(crate::PyJitCode::from_parts(
             runtime_jitcode,
             crate::PyJitCodeMetadata {
-                after_residual_call_resume_pc: Vec::new(),
+                after_residual_call_resume_marker_by_jit_pc: Vec::new(),
+                after_residual_call_resume_pred_by_jit_pc: Vec::new(),
                 first_jit_pc_by_py_pc: vec![0],
                 block_head_py_by_jit_pc: vec![(0, 0)],
                 carryfwd_resume_pc: Vec::new(),
@@ -13316,7 +13317,7 @@ pub struct ResumeFrameState {
     /// of (the call still on this frame's stack when the callee was
     /// inlined).  When that call sits in a try-block the jitcode emits a
     /// post-call `-live-`/`catch_exception` keyed by this pc
-    /// (`after_residual_call_resume_pc`); on a guard that deopts mid-callee
+    /// (the post-call catch-marker twin); on a guard that deopts mid-callee
     /// the blackhole must resume this frame AT that catch
     /// (`blackhole.py:396-410 handle_exception_in_frame`,
     /// `pyjitpl.py:2601-2602`).  `None` for frames whose call has no catch
