@@ -575,6 +575,28 @@ pub(crate) fn drain_backend_jit_exc() {
     majit_backend_wasm::jit_exc_clear();
 }
 
+extern "C" fn record_caught_blackhole_traceback(
+    exc_value: i64,
+    frame_value: i64,
+    jitcode_index: i32,
+    opcode_position: i32,
+) {
+    let frame_ptr = frame_value as *mut PyFrame;
+    if frame_ptr.is_null() || exc_value == 0 {
+        return;
+    }
+    let last_instruction =
+        pyre_jit_trace::state::python_pc_for_jitcode_pc_public(jitcode_index, opcode_position)
+            .map_or(unsafe { (*frame_ptr).last_instr as i64 }, i64::from);
+    unsafe {
+        pyre_interpreter::pytraceback::record_application_traceback(
+            exc_value as PyObjectRef,
+            frame_ptr,
+            last_instruction,
+        );
+    }
+}
+
 #[majit_macros::jit_may_force]
 pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
     #[cfg(feature = "cranelift")]
@@ -1816,10 +1838,11 @@ pub fn blackhole_resume_via_rd_numb(
     // a frame enters a callee.
     {
         let vinfo = bh.virtualizable_info;
-        let mut caller = bh.nextblackholeinterp.as_deref_mut();
-        while let Some(frame) = caller {
+        let mut current = Some(&mut bh);
+        while let Some(frame) = current {
             frame.virtualizable_info = vinfo;
-            caller = frame.nextblackholeinterp.as_deref_mut();
+            frame.record_caught_exception = Some(record_caught_blackhole_traceback);
+            current = frame.nextblackholeinterp.as_deref_mut();
         }
     }
     // blackhole.py:1095-1099 get_portal_runner parity:
@@ -2032,12 +2055,13 @@ pub fn blackhole_resume_via_rd_numb(
             let frame_ptr = bh.virtualizable_ptr as *mut PyFrame;
             let jitcode_index = bh.jitcode.try_index().map(|v| v as i32);
             let last_opcode_position = bh.last_opcode_position;
+            let last_caught_exception_value = bh.last_caught_exception_value;
             release_bh_rd(bh);
             let Some(mut caller_bh) = next.map(|b| *b) else {
                 // blackhole.py:1679-1682 _exit_frame_with_exception:
                 //   e = cast_opaque_ptr(GCREF, e)
                 //   raise ExitFrameWithExceptionRef(e)
-                let err = if exc_value != 0 {
+                let mut err = if exc_value != 0 {
                     unsafe {
                         pyre_interpreter::PyError::from_exc_object(
                             exc_value as pyre_object::PyObjectRef,
@@ -2049,7 +2073,10 @@ pub fn blackhole_resume_via_rd_numb(
                         "blackhole exception (null exc_value)",
                     )
                 };
-                if !frame_ptr.is_null() {
+                let caught_reraise = exc_value != 0 && last_caught_exception_value == exc_value;
+                if caught_reraise {
+                    err.attach_tb = false;
+                } else if !frame_ptr.is_null() {
                     let last_instruction = jitcode_index
                         .and_then(|index| {
                             pyre_jit_trace::state::python_pc_for_jitcode_pc_public(
