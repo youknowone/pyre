@@ -8111,17 +8111,28 @@ impl<'a> Assembler386<'a> {
         let nt = nt_addr as i64;
         let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
 
-        dynasm!(self.mc ; .arch x64
-            ; mov Rq(scratch), QWORD nf
-            ; mov rcx, [Rq(scratch)]
-            ; lea rdx, [rcx + size as i32]
-            ; mov Rq(scratch), QWORD nt
-            ; cmp rdx, [Rq(scratch)]
-        );
-
         let slow_path = self.mc.new_dynamic_label();
         let done = self.mc.new_dynamic_label();
-        dynasm!(self.mc ; .arch x64 ; ja =>slow_path);
+
+        if nf_addr == 0 || nt_addr == 0 {
+            // Mirror the headered inactive-nursery path without touching
+            // `[nf]`: seed the slowpath's `rdx - rcx` size contract directly.
+            dynasm!(self.mc ; .arch x64
+                ; xor ecx, ecx
+                ; mov rdx, QWORD size
+                ; jmp =>slow_path
+            );
+        } else {
+            dynasm!(self.mc ; .arch x64
+                ; mov Rq(scratch), QWORD nf
+                ; mov rcx, [Rq(scratch)]
+                ; lea rdx, [rcx + size as i32]
+                ; mov Rq(scratch), QWORD nt
+                ; cmp rdx, [Rq(scratch)]
+            );
+
+            dynasm!(self.mc ; .arch x64 ; ja =>slow_path);
+        }
 
         let result_reg = match result_loc {
             Some(Loc::Reg(r)) => r.value,
