@@ -894,12 +894,14 @@ fn residual_call_i64_arity(op: &Op) -> Option<usize> {
     Some(nargs)
 }
 
-/// If `op` is a residual float CALL whose ABI uses only wasm-representable
-/// word / float arguments, return its wasm parameter types — eligible for a
-/// direct `call_indirect` returning `f64`. `None` keeps the `jit_call`
-/// trampoline: non-float / release-GIL / assembler calls, a missing call
-/// descr, an unsupported argument or result type, or an arg-count/descr-shape
-/// mismatch (defensive).
+/// If `op` is a residual float CALL with only float arguments, return its wasm
+/// parameter types — eligible for a direct `call_indirect` returning `f64`.
+/// Float-result targets are not audited for a uniform word ABI: a `Ref` or
+/// `Int` argument may actually be an `i32` pointer, such as
+/// `jit_bigint_to_f64_or_inf`. `None` keeps the `jit_call` trampoline:
+/// non-float / release-GIL / assembler calls, a missing call descr, a
+/// non-float argument or result type, or an arg-count/descr-shape mismatch
+/// (defensive).
 ///
 /// This includes `CallMayForceF`: the wasm virtualizable is always
 /// materialized, so `GuardNotForced` is a no-op and a direct call is sound.
@@ -922,11 +924,10 @@ fn residual_call_float_sig(op: &Op) -> Option<Vec<ValType>> {
     let arg_types = cd.arg_types();
     let mut params = Vec::with_capacity(arg_types.len());
     for ty in arg_types {
-        params.push(match ty {
-            Type::Int | Type::Ref => ValType::I64,
-            Type::Float => ValType::F64,
-            _ => return None,
-        });
+        if *ty != Type::Float {
+            return None;
+        }
+        params.push(ValType::F64);
     }
     // `getarglist()[0]` is the func pointer; the call args are `[1..]`. The
     // descr's `arg_types` describes those call args, so the counts must match.
