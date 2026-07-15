@@ -91,6 +91,43 @@ pub struct LabelTarget {
     pub frame: crate::codegen::FrameGeometry,
 }
 
+/// Frozen metadata for entering a compiled loop from a `CALL_ASSEMBLER` arm.
+/// The table slot and frame layout are published only after the loop module is
+/// installed, so a caller can decline before baking an unresolved target.
+#[derive(Clone, Debug)]
+pub struct CallAssemblerTarget {
+    pub func_handle: u32,
+    pub input_types: Vec<Type>,
+    pub callee_frame_bytes: u32,
+    pub callee_gcmap_ptr: i64,
+    pub loop_finish_fi: u32,
+    pub compiled_ptr: u64,
+    pub terminal_declined_ptr: u32,
+    pub has_trampoline_calls: bool,
+}
+
+/// Compiled loop targets keyed by their `JitCellToken` number. Unlike label
+/// targets, CALL_ASSEMBLER identifies its callee by that number directly.
+pub static CALL_ASSEMBLER_TARGETS: std::sync::Mutex<
+    Option<std::collections::HashMap<u64, CallAssemblerTarget>>,
+> = std::sync::Mutex::new(None);
+
+pub fn call_assembler_target(number: u64) -> Option<CallAssemblerTarget> {
+    CALL_ASSEMBLER_TARGETS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|targets| targets.get(&number).cloned())
+}
+
+pub fn publish_call_assembler_target(number: u64, target: CallAssemblerTarget) {
+    CALL_ASSEMBLER_TARGETS
+        .lock()
+        .unwrap()
+        .get_or_insert_with(Default::default)
+        .insert(number, target);
+}
+
 /// Global `frame[0]` fail-index space.
 ///
 /// Cross-trace chaining (`LABEL_TARGETS`) means the module that last wrote
@@ -197,6 +234,9 @@ pub struct ChainedTraceMeta {
 
 /// Compiled wasm loop metadata, stored in `JitCellToken.compiled`.
 pub struct CompiledWasmLoop {
+    /// Owning `JitCellToken` number, used to retract this loop's
+    /// CALL_ASSEMBLER target metadata on drop.
+    pub token_number: u64,
     pub trace_id: u64,
     pub input_types: Vec<Type>,
     pub func_handle: u32,
@@ -289,6 +329,13 @@ pub struct CompiledWasmLoop {
     /// CA recursion trips a resume seam that reads a clobbered class — see
     /// the decline site for the failing suite shapes.
     pub ca_active: Cell<bool>,
+    /// A guard reached through this loop as a wasm CALL_ASSEMBLER callee was
+    /// structurally declined by `compile_bridge`.  Admission refuses this
+    /// target, because entering it from compiled wasm would only blackhole.
+    pub ca_terminal_declined: Cell<bool>,
+    /// Compiled callers that baked this loop as their CALL_ASSEMBLER target.
+    /// A terminal callee decline invalidates them for a no-CA retrace.
+    pub ca_callers: RefCell<Vec<std::sync::Arc<std::sync::atomic::AtomicBool>>>,
 }
 
 impl CompiledWasmLoop {
@@ -304,6 +351,16 @@ impl CompiledWasmLoop {
 
 impl Drop for CompiledWasmLoop {
     fn drop(&mut self) {
+        let mut ca_targets = CALL_ASSEMBLER_TARGETS.lock().unwrap();
+        if let Some(targets) = ca_targets.as_mut() {
+            let this = self as *const Self as usize as u64;
+            if targets
+                .get(&self.token_number)
+                .is_some_and(|target| target.compiled_ptr == this)
+            {
+                targets.remove(&self.token_number);
+            }
+        }
         // Retract this loop's published label targets so a later bridge
         // cannot chain into a dropped loop's stale table slot. Guarded by
         // `func_handle`: a recompile that re-stamped the same descr onto its
@@ -330,6 +387,7 @@ mod tests {
 
     fn token_with_trampoline_census(has_trampoline_calls: bool) -> CompiledWasmLoop {
         CompiledWasmLoop {
+            token_number: 0,
             trace_id: 0,
             input_types: Vec::new(),
             func_handle: 0,
@@ -349,6 +407,8 @@ mod tests {
             _bridge_cells_owner: None,
             _bridge_owned_cells: RefCell::new(Vec::new()),
             ca_active: Cell::new(false),
+            ca_terminal_declined: Cell::new(false),
+            ca_callers: RefCell::new(Vec::new()),
         }
     }
 

@@ -2929,6 +2929,78 @@ fn jit_ca_handle_guard_failure(
     compiled
 }
 
+/// Feed a CALL_ASSEMBLER callee guard through the normal bridge-hotness path.
+/// The caller has already recovered the live descriptor and exit values; the
+/// rest is the same must-compile/bridge attachment sequence used by the native
+/// CALL_ASSEMBLER guard callback above.
+struct CaBridgeAttempt {
+    terminal_declined: bool,
+}
+
+fn try_compile_ca_bridge(
+    descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
+    raw_values: &[i64],
+) -> CaBridgeAttempt {
+    if raw_values.is_empty() {
+        return CaBridgeAttempt {
+            terminal_declined: false,
+        };
+    }
+    let Some((source_green_key, source_trace_id, source_fail_index)) =
+        bridge_source_identity_from_descr(descr_arc)
+    else {
+        return CaBridgeAttempt {
+            terminal_declined: false,
+        };
+    };
+    let (must_compile, owning_key) = {
+        let (driver, _) = crate::eval::driver_pair();
+        driver
+            .meta_interp_mut()
+            .must_compile_with_values(descr_arc, raw_values, source_green_key)
+    };
+    if !must_compile || majit_metainterp::MetaInterp::<()>::stack_almost_full() {
+        let terminal_declined = {
+            let (driver, _) = crate::eval::driver_pair();
+            driver.meta_interp().bridge_declined_terminally(descr_arc)
+        };
+        return CaBridgeAttempt { terminal_declined };
+    }
+    let exit_layout = {
+        let (driver, _) = crate::eval::driver_pair();
+        driver.meta_interp().get_compiled_exit_layout_in_trace(
+            owning_key,
+            source_trace_id,
+            source_fail_index,
+        )
+    };
+    let Some(exit_layout) = exit_layout else {
+        return CaBridgeAttempt {
+            terminal_declined: false,
+        };
+    };
+    let frame_ptr = raw_values[0] as *mut PyFrame;
+    if frame_ptr.is_null() {
+        return CaBridgeAttempt {
+            terminal_declined: false,
+        };
+    }
+    let frame = unsafe { &mut *frame_ptr };
+    let _guard = crate::eval::GuardCompilingScope::new(descr_arc);
+    let _compiled = matches!(
+        trace_and_compile_from_bridge(descr_arc, frame, raw_values, &exit_layout, 0, false),
+        BridgeResolution::CompiledContinue
+    );
+    // `MetaInterp::compile_bridge` records a wasm `Unsupported` before the
+    // walker returns.  Reuse that canonical guard identity here rather than
+    // creating a separate CA-side decline table.
+    let terminal_declined = {
+        let (driver, _) = crate::eval::driver_pair();
+        driver.meta_interp().bridge_declined_terminally(descr_arc)
+    };
+    CaBridgeAttempt { terminal_declined }
+}
+
 /// Host completion for an in-guest self-recursive CALL_ASSEMBLER callee that
 /// deopted (`PYRE_WASM_CA`). The wasm CA arm `call_indirect`s this through the
 /// shared `__indirect_function_table` (its slot published via
@@ -2957,6 +3029,7 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
     enum Outcome {
         Finished(i64),
         Deopt {
+            descr_arc: std::sync::Arc<dyn majit_ir::Descr>,
             green_key: u64,
             exit_layout: majit_metainterp::CompiledExitLayout,
             raw_values: Vec<i64>,
@@ -2991,6 +3064,7 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
                 .collect();
             let guard_exc = backend.grab_exc_value(&frame).0 as i64;
             Outcome::Deopt {
+                descr_arc,
                 green_key,
                 exit_layout,
                 raw_values,
@@ -3002,17 +3076,43 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
     match outcome {
         Outcome::Finished(r) => r,
         Outcome::Deopt {
+            descr_arc,
             green_key,
             exit_layout,
             raw_values,
             guard_exc,
         } => {
+            let attempt = try_compile_ca_bridge(&descr_arc, &raw_values);
+            if attempt.terminal_declined {
+                // This target cannot reach compiled steady state: each CA
+                // invocation would blackhole.  Invalidate callers so the next
+                // trace refuses this target and returns to the baseline path.
+                majit_backend_wasm::mark_call_assembler_terminal_decline(compiled_ptr as usize);
+            }
             let bh = crate::eval::resume_in_blackhole_from_exit_layout(
                 &raw_values,
                 &exit_layout,
                 guard_exc,
             );
             handle_blackhole_result(bh, green_key).unwrap_or(0)
+        }
+    }
+}
+
+/// Execute a target which previously proved unable to leave its compiled entry
+/// through a compiled bridge.  This is the pre-Slice-A call path: run the
+/// callee's live PyFrame through the normal JIT entry, allowing its own hot
+/// inner traces while avoiding a CA deopt-to-blackhole on every call.
+#[cfg(target_arch = "wasm32")]
+pub extern "C" fn wasm_ca_baseline_call(frame_ptr: i64, _compiled_ptr: i64) -> i64 {
+    let Some(frame) = (unsafe { (frame_ptr as *mut PyFrame).as_mut() }) else {
+        return 0;
+    };
+    match crate::eval::eval_with_jit(frame) {
+        Ok(result) => result as i64,
+        Err(err) => {
+            set_pending_ca_exception(err);
+            0
         }
     }
 }

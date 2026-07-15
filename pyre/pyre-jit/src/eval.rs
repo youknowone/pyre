@@ -2728,6 +2728,10 @@ fn build_jit_driver_pair() -> JitDriverPair {
     majit_backend_wasm::set_ca_deopt_helper_slot(
         crate::call_jit::wasm_ca_resume_deopt as *const () as usize as u32,
     );
+    #[cfg(target_arch = "wasm32")]
+    majit_backend_wasm::set_ca_baseline_helper_slot(
+        crate::call_jit::wasm_ca_baseline_call as *const () as usize as u32,
+    );
     (d, info)
 }
 

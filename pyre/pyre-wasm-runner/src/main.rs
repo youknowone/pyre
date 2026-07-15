@@ -381,7 +381,7 @@ fn run(module_path: &PathBuf, source: &str) -> Result<i32> {
                 "decl_noadvance",
                 "ca_cell_set",
                 "ca_cells_zero",
-                "reserved14",
+                "accepted_ca",
                 "decl_ca_trampoline",
             ];
             let mut parts = Vec::new();

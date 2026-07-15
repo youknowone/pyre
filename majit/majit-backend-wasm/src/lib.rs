@@ -30,8 +30,9 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 /// decline (TEMP, for the resume-at-last-label measurement): 8 = JUMP descr
 /// did not resolve (target_ord None), 9 = target_ord Some but != last label,
 /// 10 = arity mismatch, 11 = loop-closing bridge advances no loop-carried value
-/// (guard side-trace that would livelock the chained loop), 15 = declined CA
-/// because a trace would use the host call trampoline on a movable CA frame.
+/// (guard side-trace that would livelock the chained loop), 14 = accepted
+/// CALL_ASSEMBLER trace, 15 = declined CA because a trace would use the host
+/// call trampoline on a movable CA frame.
 pub static BRIDGE_DIAG: [AtomicU64; 16] = {
     const Z: AtomicU64 = AtomicU64::new(0);
     [Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z]
@@ -63,8 +64,13 @@ fn diag_bump(i: usize) {
 // offsets. The fib CA path measured raw maxima of 9 positional slots and 15
 // Ref homes, but that is not a bridge fail-arg census for the full suite; keep
 // both existing floors until such a census establishes smaller safe bounds.
-const FROZEN_CHAIN_VALUE_SLOTS: usize = 32;
-const FROZEN_CHAIN_REF_HOMES: usize = 16;
+// A CALL_ASSEMBLER target must retain enough frozen spill/home geometry for a
+// later exit bridge.  nbody's callee bridge needs more Ref homes than the old
+// 16-slot floor; declining it turns every CA invocation into a blackhole.  The
+// larger fixed reserve keeps the bridge in compiled wasm and is still bounded
+// per compiled token.
+const FROZEN_CHAIN_VALUE_SLOTS: usize = 64;
+const FROZEN_CHAIN_REF_HOMES: usize = 64;
 
 /// An arithmetic op whose result advances a loop-carried numeric value (the
 /// `IntAdd`/`IntSub`/… and float-arithmetic block plus the overflow-checked
@@ -140,8 +146,9 @@ fn guard_fail_args_advanced(
 }
 
 use failguard::{
-    ChainedTraceMeta, CompiledWasmLoop, LabelTarget, WasmFailDescr, WasmFrameData, fail_descr_base,
-    global_fail_descr, label_target, publish_label_target, register_fail_descrs,
+    CallAssemblerTarget, ChainedTraceMeta, CompiledWasmLoop, LabelTarget, WasmFailDescr,
+    WasmFrameData, call_assembler_target, fail_descr_base, global_fail_descr, label_target,
+    publish_call_assembler_target, publish_label_target, register_fail_descrs,
 };
 use majit_backend::{AsmInfo, BackendError, DeadFrame, JitCellToken};
 use majit_gc::GcAllocator;
@@ -650,10 +657,11 @@ fn build_callee_gcmap(
 ) -> Box<[usize]> {
     let sign = std::mem::size_of::<isize>();
     let bits_per_word = std::mem::size_of::<usize>() * 8;
-    let input_count = input_types.len();
-    let mut indices: Vec<usize> = Vec::with_capacity(input_count + frame.home_slots);
-    for i in 0..input_count {
-        indices.push((codegen::FRAME_SLOT_BASE as usize + i * 8) / sign);
+    let mut indices: Vec<usize> = Vec::with_capacity(input_types.len() + frame.home_slots);
+    for (i, &tp) in input_types.iter().enumerate() {
+        if tp == majit_ir::Type::Ref {
+            indices.push((codegen::FRAME_SLOT_BASE as usize + i * 8) / sign);
+        }
     }
     for h in 0..frame.home_slots {
         indices.push((frame.home_slot_base as usize + h * 8) / sign);
@@ -815,6 +823,7 @@ fn build_home_gcmap(frame: codegen::FrameGeometry) -> Box<[usize]> {
 /// makes `compile_bridge` decline the CA lift, since the arm would have no way
 /// to complete a deopt. Stored as `u64` to reuse the imported atomics.
 static CA_DEOPT_HELPER_SLOT: AtomicU64 = AtomicU64::new(0);
+static CA_BASELINE_HELPER_SLOT: AtomicU64 = AtomicU64::new(0);
 
 /// Host entry point publishing [`CA_DEOPT_HELPER_SLOT`] (called from pyre-jit's
 /// `init_jit_hooks` with `wasm_ca_resume_deopt as *const () as usize`, which on
@@ -826,6 +835,14 @@ pub fn set_ca_deopt_helper_slot(slot: u32) {
 /// Current CA deopt-helper table slot (0 = unset).
 pub fn ca_deopt_helper_slot() -> u32 {
     CA_DEOPT_HELPER_SLOT.load(Ordering::Relaxed) as u32
+}
+
+pub fn set_ca_baseline_helper_slot(slot: u32) {
+    CA_BASELINE_HELPER_SLOT.store(slot as u64, Ordering::Relaxed);
+}
+
+pub fn ca_baseline_helper_slot() -> u32 {
+    CA_BASELINE_HELPER_SLOT.load(Ordering::Relaxed) as u32
 }
 
 /// A legacy pool-indexed const (`ConstInt(u32)` etc.) reached the wasm backend
@@ -1126,6 +1143,113 @@ fn bridge_is_self_recursive_int_ca(ops: &[Op], source_loop_number: u64) -> bool 
     })
 }
 
+/// Resolve the one compiled target used by every CALL_ASSEMBLER in this trace.
+/// Slice A deliberately accepts one target only: a trace containing distinct
+/// callees needs per-op metadata rather than the single `CaParams` payload.
+fn general_int_call_assembler_target(ops: &[Op]) -> Option<CallAssemblerTarget> {
+    let mut resolved: Option<CallAssemblerTarget> = None;
+    let mut saw_ca = false;
+    for op in ops.iter().filter(|op| op.opcode.is_call_assembler()) {
+        saw_ca = true;
+        if !matches!(
+            op.opcode,
+            majit_ir::OpCode::CallAssemblerI | majit_ir::OpCode::CallAssemblerR
+        ) {
+            return None;
+        }
+        let descr_ref = op.getdescr()?;
+        let descr = descr_ref.as_call_descr()?;
+        let arg_types = descr.arg_types();
+        if !arg_types
+            .iter()
+            .all(|&tp| matches!(tp, majit_ir::Type::Int | majit_ir::Type::Ref))
+            || !matches!(
+                descr.result_type(),
+                majit_ir::Type::Int | majit_ir::Type::Ref
+            )
+        {
+            return None;
+        }
+        let target = call_assembler_target(descr.call_target_token()?)?;
+        if target.input_types.as_slice() != arg_types
+            || target.callee_frame_bytes == 0
+            || target.callee_gcmap_ptr == 0
+            || target.compiled_ptr == 0
+            || target.has_trampoline_calls
+        {
+            return None;
+        }
+        if let Some(previous) = &resolved {
+            if previous.compiled_ptr != target.compiled_ptr {
+                return None;
+            }
+        } else {
+            resolved = Some(target);
+        }
+    }
+    saw_ca.then_some(resolved?).filter(|target| {
+        // A successfully compiled loop is retained by its token while it is
+        // registered. Its chained bridges can subsequently add trampoline
+        // calls, so read the live census before baking a CA entry.
+        unsafe {
+            (target.compiled_ptr as *const CompiledWasmLoop)
+                .as_ref()
+                .is_some_and(|loop_| {
+                    !loop_.has_trampoline_calls.get() && !loop_.ca_terminal_declined.get()
+                })
+        }
+    })
+}
+
+fn bridge_int_call_assembler_target(
+    ops: &[Op],
+    source_loop_number: u64,
+) -> Option<CallAssemblerTarget> {
+    if bridge_is_self_recursive_int_ca(ops, source_loop_number) {
+        // Keep the established self-recursive shape on its explicit admission
+        // path while using the registered target's frozen geometry.
+        return general_int_call_assembler_target(ops);
+    }
+    general_int_call_assembler_target(ops)
+}
+
+fn mark_call_assembler_target_active(target: &CallAssemblerTarget, caller: &JitCellToken) {
+    // The target metadata is removed by `CompiledWasmLoop::drop`; compilation
+    // is single-threaded, and callers only retain the pointer while the token
+    // remains compiled. This is the same lifetime used by the deopt helper.
+    unsafe {
+        if let Some(loop_) = (target.compiled_ptr as *const CompiledWasmLoop).as_ref() {
+            loop_.ca_active.set(true);
+            let caller_flag = caller.invalidation_flag();
+            let mut callers = loop_.ca_callers.borrow_mut();
+            if !callers
+                .iter()
+                .any(|known| std::sync::Arc::ptr_eq(known, &caller_flag))
+            {
+                callers.push(caller_flag);
+            }
+        }
+    }
+}
+
+/// Mark a CA target whose callee guard was structurally declined.  The host
+/// deopt helper calls this only after `MetaInterp` recorded the exact guard in
+/// `declined_bridge_guards`; invalidating the callers forces a retrace whose
+/// admission check above restores the pre-Slice-A call path.
+pub fn mark_call_assembler_terminal_decline(compiled_ptr: usize) {
+    unsafe {
+        let Some(loop_) = (compiled_ptr as *const CompiledWasmLoop).as_ref() else {
+            return;
+        };
+        if loop_.ca_terminal_declined.replace(true) {
+            return;
+        }
+        for caller in loop_.ca_callers.borrow().iter() {
+            caller.store(true, Ordering::Release);
+        }
+    }
+}
+
 /// Reconstruct a [`DeadFrame`] from a callee frame an in-guest `call_indirect`
 /// already ran to a guard/finish exit (the self-recursive CALL_ASSEMBLER fast
 /// path, `PYRE_WASM_CA`). This is the post-`glue::execute` tail of
@@ -1265,9 +1389,14 @@ impl majit_backend::Backend for WasmBackend {
         }
         let ops_owned: Vec<Op> = ops.iter().map(|rc| (**rc).clone()).collect();
         let ops: &[Op] = &ops_owned;
+        // A general CALL_ASSEMBLER can enter an already-compiled loop through
+        // the shared table. Keep one frozen target per trace in Slice A.
+        let ca_target = general_int_call_assembler_target(ops);
+        let allow_ca =
+            ca_deopt_helper_slot() != 0 && ca_baseline_helper_slot() != 0 && ca_target.is_some();
         // This must use the same direct-vs-trampoline predicates as codegen:
         // a CA callee runs this source-loop body on a movable nursery frame.
-        let has_trampoline_calls = codegen::has_trampoline_calls(inputargs, ops, false);
+        let has_trampoline_calls = codegen::has_trampoline_calls(inputargs, ops, allow_ca);
 
         // Decline traces the wasm backend cannot compile correctly, so the
         // metainterp falls back to the interpreter (correct, if unaccelerated)
@@ -1280,8 +1409,11 @@ impl majit_backend::Backend for WasmBackend {
         //     (jump-to-existing-trace); compile_loop cannot supply the target
         //     table slot, so codegen would tail-call slot 0 — the wrong
         //     function. Declined here (is_loop=true).
-        if let Some(reason) = wasm_unsupported_trace_reason(ops, true, false) {
+        if let Some(reason) = wasm_unsupported_trace_reason(ops, true, allow_ca) {
             return Err(BackendError::Unsupported(reason));
+        }
+        if allow_ca {
+            diag_bump(14); // accepted general CALL_ASSEMBLER loop
         }
 
         self.collect_constants_from_ops(ops);
@@ -1325,13 +1457,33 @@ impl majit_backend::Backend for WasmBackend {
                 0, // external_jump_slot: a loop's JUMP is a local back-edge `br`
                 0, // external_jump_key: unused without an external JUMP
                 frame,
-                codegen::CaParams {
-                    // Loops do not emit the CA arm, but they can run on a
-                    // nursery CA frame and must reload local 0 after a collect.
-                    ca_reload_fn_ptr: wasm_jit_ca_reload_frame as *const () as usize as i64,
-                    jf_top_addr: jf_top_addr(),
-                    ..codegen::CaParams::default()
-                },
+                ca_target.as_ref().map_or_else(
+                    || codegen::CaParams {
+                        // A loop can run on a nursery CA frame and must reload
+                        // local 0 after a collection even when it emits no CA.
+                        ca_reload_fn_ptr: wasm_jit_ca_reload_frame as *const () as usize as i64,
+                        jf_top_addr: jf_top_addr(),
+                        ..codegen::CaParams::default()
+                    },
+                    |target| codegen::CaParams {
+                        emit_ca: true,
+                        callee_slot: target.func_handle,
+                        callee_frame_bytes: target.callee_frame_bytes,
+                        loop_finish_fi: target.loop_finish_fi,
+                        deopt_helper_slot: ca_deopt_helper_slot(),
+                        baseline_helper_slot: ca_baseline_helper_slot(),
+                        terminal_declined_ptr: target.terminal_declined_ptr,
+                        callee_compiled_ptr: target.compiled_ptr,
+                        ca_alloc_fn_ptr: wasm_jit_ca_alloc_frame as *const () as usize as i64,
+                        ca_pop_fn_ptr: wasm_jit_ca_pop_frame as *const () as usize as i64,
+                        ca_reload_fn_ptr: wasm_jit_ca_reload_frame as *const () as usize as i64,
+                        ca_reload_caller_fn_ptr: wasm_jit_ca_reload_caller_frame as *const ()
+                            as usize as i64,
+                        callee_gcmap_ptr: target.callee_gcmap_ptr,
+                        inline: ca_inline_params(target.callee_frame_bytes),
+                        jf_top_addr: jf_top_addr(),
+                    },
+                ),
             )?;
 
         // Build fail descriptors
@@ -1480,6 +1632,7 @@ impl majit_backend::Backend for WasmBackend {
         }
 
         let compiled = CompiledWasmLoop {
+            token_number: token.number,
             trace_id,
             input_types: inputargs.iter().map(|ia| ia.tp).collect(),
             func_handle,
@@ -1499,9 +1652,43 @@ impl majit_backend::Backend for WasmBackend {
             _bridge_cells_owner: bridge_cells_owner,
             _bridge_owned_cells: std::cell::RefCell::new(Vec::new()),
             ca_active: std::cell::Cell::new(false),
+            ca_terminal_declined: std::cell::Cell::new(false),
+            ca_callers: std::cell::RefCell::new(Vec::new()),
         };
 
         token.compiled = Some(Box::new(compiled));
+        let compiled = token
+            .compiled
+            .as_ref()
+            .and_then(|compiled| compiled.downcast_ref::<CompiledWasmLoop>())
+            .expect("newly compiled wasm loop is missing");
+        let loop_finish_fi = compiled
+            .fail_descrs
+            .borrow()
+            .iter()
+            .find(|descr| descr.is_finish)
+            .map(|descr| descr.fail_index)
+            .unwrap_or(0);
+        let callee_gcmap_ptr =
+            Box::leak(build_callee_gcmap(&compiled.input_types, compiled.frame)).as_ptr() as i64;
+        publish_call_assembler_target(
+            token.number,
+            CallAssemblerTarget {
+                func_handle: compiled.func_handle,
+                input_types: compiled.input_types.clone(),
+                callee_frame_bytes: compiled.frame.ca_frame_bytes,
+                callee_gcmap_ptr,
+                loop_finish_fi,
+                compiled_ptr: compiled as *const CompiledWasmLoop as usize as u64,
+                terminal_declined_ptr: (&compiled.ca_terminal_declined
+                    as *const std::cell::Cell<bool>) as usize
+                    as u32,
+                has_trampoline_calls: compiled.has_trampoline_calls.get(),
+            },
+        );
+        if let Some(target) = ca_target.as_ref() {
+            mark_call_assembler_target_active(target, token);
+        }
 
         Ok(AsmInfo {
             code_addr: 0,
@@ -1553,10 +1740,11 @@ impl majit_backend::Backend for WasmBackend {
         // The CA arm must be able to complete a callee deopt; without the
         // registered `wasm_ca_resume_deopt` slot it could not, so decline the
         // lift (the host round-trip path still handles the CALL_ASSEMBLER).
-        let ca_candidate = ca_deopt_helper_slot() != 0
-            && bridge_is_self_recursive_int_ca(ops, original_token.number);
-        // The CA candidate's `CallAssemblerR` is a dedicated direct arm; all
-        // other ops are scanned against their normal emission paths.
+        let ca_target = bridge_int_call_assembler_target(ops, original_token.number);
+        let ca_candidate =
+            ca_deopt_helper_slot() != 0 && ca_baseline_helper_slot() != 0 && ca_target.is_some();
+        // The CA candidate is a dedicated direct arm; all other ops are
+        // scanned against their normal emission paths.
         let bridge_has_trampoline_calls =
             codegen::has_trampoline_calls(inputargs, ops, ca_candidate);
 
@@ -1599,9 +1787,6 @@ impl majit_backend::Backend for WasmBackend {
             source_func_handle,
             source_has_preamble,
             source_frame,
-            source_input_types,
-            source_loop_finish_fi,
-            source_compiled_ptr,
             source_ca_active,
             source_has_trampoline_calls,
         ) = {
@@ -1614,16 +1799,6 @@ impl majit_backend::Backend for WasmBackend {
                         "wasm backend: bridge source token has no compiled loop".into(),
                     )
                 })?;
-            // `fail_index` the source loop's DoneWithThisFrame Finish writes to
-            // frame[0] on the base-case return (the CA arm accepts it as a clean
-            // callee finish alongside this bridge's own finish).
-            let loop_finish_fi = source_loop
-                .fail_descrs
-                .borrow()
-                .iter()
-                .find(|d| d.is_finish)
-                .map(|d| d.fail_index)
-                .unwrap_or(0);
             // Resolve the failing guard's owning trace by the descr's
             // `trace_id`: the source loop itself, or one of the bridges
             // already chained onto it (`chained_trace_meta`) — a NESTED
@@ -1664,16 +1839,6 @@ impl majit_backend::Backend for WasmBackend {
                 source_loop.func_handle,
                 source_loop.has_preamble,
                 source_loop.frame,
-                source_loop.input_types.clone(),
-                loop_finish_fi,
-                // Address of the source loop's metadata, baked into the CA arm
-                // (opaque cookie in the deopt-helper ABI; `frame[0]` resolution
-                // itself goes through the global fail-index space). Same
-                // lifetime assumption as `source_func_handle` below: a
-                // recompile invalidates this bridge before the loop's
-                // `CompiledWasmLoop` is replaced, so the arm is unreachable
-                // with a stale pointer.
-                source_loop as *const CompiledWasmLoop as usize as u64,
                 source_loop.ca_active.get(),
                 source_loop.has_trampoline_calls.get(),
             )
@@ -1697,10 +1862,8 @@ impl majit_backend::Backend for WasmBackend {
                 "wasm backend: bridge source guard index has no dispatch cell".into(),
             ));
         }
-        // The CA arm bakes source-LOOP metadata (finish index, compiled ptr);
-        // restrict it to direct loop guards. A CA-shaped bridge on a nested
-        // guard then fails codegen's CALL_ASSEMBLER handling — a deterministic
-        // decline.
+        // Keep CA bridges attached directly to their source loop. Nested
+        // bridge metadata is not yet published as a CALL_ASSEMBLER target.
         let mut allow_ca = ca_candidate && source_is_direct;
         let ca_trampoline_decline = if allow_ca && source_has_trampoline_calls {
             Some(
@@ -1723,6 +1886,9 @@ impl majit_backend::Backend for WasmBackend {
             return Err(BackendError::Unsupported(
                 ca_trampoline_decline.unwrap_or(reason.as_str()).to_string(),
             ));
+        }
+        if allow_ca {
+            diag_bump(14); // accepted CALL_ASSEMBLER bridge
         }
 
         // A chained bridge executes in the source token's *same* frame. Its
@@ -1949,28 +2115,26 @@ impl majit_backend::Backend for WasmBackend {
         // Self-recursive CALL_ASSEMBLER (PYRE_WASM_CA): the CA arm allocates a
         // fresh callee using the source token's frozen geometry. The earlier
         // frame-fit decline guarantees this bridge uses those same offsets.
-        let ca_params = if allow_ca {
-            // Per-bridge callee-frame gcmap (real Ref inputs + home Ref slots),
-            // leaked to live for the program — each callee frame's `jf_gcmap`
-            // points at it.
-            let callee_gcmap_ptr =
-                Box::leak(build_callee_gcmap(&source_input_types, source_frame)).as_ptr() as i64;
+        let ca_params = if let Some(target) = ca_target.as_ref().filter(|_| allow_ca) {
             codegen::CaParams {
                 emit_ca: true,
                 // `compile_bridge`'s trampoline-decline floor above guarantees
                 // no trampoline-lowered op executes on this movable CA callee
                 // frame, so its tail call area is never touched.
-                callee_frame_bytes: source_frame.ca_frame_bytes,
-                loop_finish_fi: source_loop_finish_fi,
+                callee_slot: target.func_handle,
+                callee_frame_bytes: target.callee_frame_bytes,
+                loop_finish_fi: target.loop_finish_fi,
                 deopt_helper_slot: ca_deopt_helper_slot(),
-                source_compiled_ptr,
+                baseline_helper_slot: ca_baseline_helper_slot(),
+                terminal_declined_ptr: target.terminal_declined_ptr,
+                callee_compiled_ptr: target.compiled_ptr,
                 ca_alloc_fn_ptr: wasm_jit_ca_alloc_frame as *const () as usize as i64,
                 ca_pop_fn_ptr: wasm_jit_ca_pop_frame as *const () as usize as i64,
                 ca_reload_fn_ptr: wasm_jit_ca_reload_frame as *const () as usize as i64,
                 ca_reload_caller_fn_ptr: wasm_jit_ca_reload_caller_frame as *const () as usize
                     as i64,
-                callee_gcmap_ptr,
-                inline: ca_inline_params(source_frame.ca_frame_bytes),
+                callee_gcmap_ptr: target.callee_gcmap_ptr,
+                inline: ca_inline_params(target.callee_frame_bytes),
                 jf_top_addr: jf_top_addr(),
             }
         } else {
@@ -2087,10 +2251,10 @@ impl majit_backend::Backend for WasmBackend {
             if let Some(owner) = bridge_cells_owner {
                 source_loop._bridge_owned_cells.borrow_mut().push(owner);
             }
-            if allow_ca {
+            if let Some(target) = ca_target.as_ref().filter(|_| allow_ca) {
                 // Freeze this recursion to the CA mechanism: no further bridge
                 // chains here (see the decline above the codegen call).
-                source_loop.ca_active.set(true);
+                mark_call_assembler_target_active(target, original_token);
             }
         }
 

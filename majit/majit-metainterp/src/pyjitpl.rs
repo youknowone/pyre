@@ -9496,6 +9496,21 @@ impl<M: Clone> MetaInterp<M> {
         (fired, owning_key)
     }
 
+    /// Whether this exact guard's bridge was terminally declined by the
+    /// backend.  The wasm CALL_ASSEMBLER host-deopt path queries the same
+    /// `(trace_id, fail_index)` record that normal guard failures populate,
+    /// so it cannot re-trace a structural decline in a side table.
+    pub fn bridge_declined_terminally(
+        &self,
+        descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
+    ) -> bool {
+        let descr = descr_arc
+            .as_fail_descr()
+            .expect("bridge_declined_terminally: descr_arc must be a FailDescr");
+        self.declined_bridge_guards
+            .contains(&(descr.trace_id(), descr.fail_index_per_trace()))
+    }
+
     /// memmgr.py:58-61: keep_loop_alive(looptoken).
     /// warmstate.py:402: warmrunnerdesc.memory_manager.keep_loop_alive(loop_token)
     ///

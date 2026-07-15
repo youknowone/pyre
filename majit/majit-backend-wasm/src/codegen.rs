@@ -388,10 +388,10 @@ impl RefHomes {
         }
         if include_ca_collects {
             // The CA arm allocates its callee frame before it resolves this
-            // CallAssemblerR's arguments. Those Ref operands are used at (not
+            // CALL_ASSEMBLER's arguments. Those Ref operands are used at (not
             // after) this op, so ordinary `live_across` deliberately excludes
             // them; they nevertheless need homes through the prior allocation.
-            for op in ops.iter().filter(|op| op.opcode == OpCode::CallAssemblerR) {
+            for op in ops.iter().filter(|op| op.opcode.is_call_assembler()) {
                 for arg in op.getarglist() {
                     let arg = arg.to_opref();
                     if ref_values.contains(arg) {
@@ -444,7 +444,7 @@ impl RefHomes {
 /// region before codegen runs.
 pub fn count_ref_homes(inputargs: &[InputArg], ops: &[Op]) -> usize {
     // This pre-sizing query is used for CA bridges before `CaParams` exists, so
-    // count `CallAssemblerR` as a collecting position to match CA codegen.
+    // count CALL_ASSEMBLER as a collecting position to match CA codegen.
     RefHomes::collect(inputargs, ops, true).len()
 }
 
@@ -1034,10 +1034,10 @@ pub fn has_trampoline_calls(inputargs: &[InputArg], ops: &[Op], emit_ca: bool) -
     }
 
     ops.iter().any(|op| match op.opcode {
-        // `build_function` handles an enabled CA `CallAssemblerR` before the
-        // generic CALL arm, lowering it directly to the source-loop table
-        // slot. It therefore never uses the host call area.
-        OpCode::CallAssemblerR if emit_ca => false,
+        // `build_function` handles an enabled CALL_ASSEMBLER before the generic
+        // CALL arm, lowering it directly to the callee-loop table slot. It
+        // therefore never uses the host call area.
+        opcode if opcode.is_call_assembler() && emit_ca => false,
         // These arms have no direct helper lowering.
         OpCode::Newstr | OpCode::Newunicode => true,
         // Every residual CALL uses the trampoline unless its exact lowering
@@ -1158,15 +1158,15 @@ fn alloc_bridge_cells(num_guards: usize) -> (u32, Option<Box<[u32]>>) {
     }
 }
 
-/// Parameters for the self-recursive CALL_ASSEMBLER guest→guest `call_indirect`
-/// arm (`PYRE_WASM_CA`). `emit_ca == false` (the default) keeps every emitted
-/// module byte-identical to the pre-feature backend.
+/// Parameters for the guest→guest `CALL_ASSEMBLER` `call_indirect` arm.
+/// `emit_ca == false` (the default) keeps every emitted module byte-identical
+/// to the pre-feature backend.
 #[derive(Clone, Copy, Default)]
 pub struct CaParams {
-    /// Emit the dedicated `CallAssemblerR` arm (an in-module `call_indirect`
-    /// into the source loop). Only set by `compile_bridge` for a self-recursive
-    /// single-int bridge; `compile_loop` never sets it.
+    /// Emit the dedicated `CALL_ASSEMBLER` arm into `callee_slot`.
     pub emit_ca: bool,
+    /// Table slot of the compiled callee loop.
+    pub callee_slot: u32,
     /// Bytes to reserve per CA callee frame (the GC `JitFrame`'s data region,
     /// i.e. its Signed item area). This is the source geometry's prefix through
     /// the Ref homes, excluding its tail call area. The trampoline-decline
@@ -1175,7 +1175,7 @@ pub struct CaParams {
     /// runs on this movable frame, so the omitted tail is unreachable. The alloc
     /// trampoline derives the JitFrame item count from this exact byte count.
     pub callee_frame_bytes: u32,
-    /// `fail_index` the SOURCE loop's DoneWithThisFrame Finish writes to frame[0]
+    /// `fail_index` the callee loop's DoneWithThisFrame Finish writes to frame[0]
     /// on the base-case return. The CA arm treats this — or this bridge's own
     /// finish index — as a clean callee finish; anything else is a deopt.
     pub loop_finish_fi: u32,
@@ -1186,10 +1186,12 @@ pub struct CaParams {
     /// instead of trapping. `0` (unset) ⇒ no helper, so `compile_bridge` declines
     /// the CA lift before reaching codegen.
     pub deopt_helper_slot: u32,
-    /// Address of the source loop's `CompiledWasmLoop`, baked as the first
+    pub baseline_helper_slot: u32,
+    pub terminal_declined_ptr: u32,
+    /// Address of the callee loop's `CompiledWasmLoop`, baked as the first
     /// argument to the deopt helper so it can resolve the deopted callee frame's
     /// `fail_descrs`.
-    pub source_compiled_ptr: u64,
+    pub callee_compiled_ptr: u64,
     /// `__indirect_function_table` slot (`fn as usize`) of
     /// `lib.rs::wasm_jit_ca_alloc_frame`, which allocates each callee frame as
     /// a young nursery GC-managed `JitFrame` (push_jf-rooted, traced by its own
@@ -3006,28 +3008,51 @@ fn build_function(
                 );
             }
 
-            // ── Self-recursive CALL_ASSEMBLER (PYRE_WASM_CA) ──
-            // Lower `vi = CallAssemblerR(frame, ec)` into an in-module
-            // `call_indirect` into the SOURCE loop (self-recursion) instead of a
+            // ── CALL_ASSEMBLER ──
+            // Lower the call into an in-module `call_indirect` into its compiled
+            // callee loop instead of a
             // host round-trip. A fresh callee frame is allocated as a real
             // GC-managed nursery `JitFrame` (push_jf-rooted on the jitframe
             // shadow stack; traced by its OWN per-frame gcmap covering
-            // its input + home Ref slots), the two red inputs are written to its
+            // its input + home Ref slots), the descriptor inputs are written to its
             // input slots, the loop runs on it (recursing through this same arm
             // for deeper levels), then the result Ref is read back from output
-            // slot 0. Only emitted for the fib-shaped bridge `compile_bridge`
-            // validated (`bridge_is_self_recursive_int_ca`); a loop never sets
-            // `emit_ca`. The callee `call_indirect` runs the source loop's full
-            // recursion, which allocates and collects; each live callee frame is
+            // slot 0. `compile_loop` and `compile_bridge` validate the descriptor
+            // and target metadata before enabling this arm. The callee
+            // `call_indirect` runs a full compiled loop, which allocates and
+            // collects; each live callee frame is
             // self-described by its gcmap so a collection forwards its Refs (no
             // shared-arena single-stride walker). This bridge's own wasm-local
             // Refs still hold pre-call (from-space) addresses on return, so
             // reload them from the (forwarded) homes after the call.
-            OpCode::CallAssemblerR if ca.emit_ca => {
+            opcode if opcode.is_call_assembler() && ca.emit_ca => {
                 let vi = op.pos.get().raw();
-                // `external_jump_slot` is the source loop's table slot (the CA
-                // self-target), plumbed by `compile_bridge`.
-                let self_slot = external_jump_slot as i32;
+                let callee_slot = ca.callee_slot as i32;
+
+                // A target with a terminally-declined bridge must immediately
+                // return to the ordinary PyFrame entry path.  The bit lives in
+                // guest linear memory, so clean CA calls pay only one byte load.
+                sink.i32_const(ca.terminal_declined_ptr as i32);
+                sink.i32_load8_u(memarg(0, 0));
+                sink.if_(BlockType::Empty);
+                emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
+                sink.i64_const(ca.callee_compiled_ptr as i64);
+                sink.i32_const(ca.baseline_helper_slot as i32);
+                sink.call_indirect(0, ca_helper_type_idx);
+                if !OpRef::raw_is_constant(vi) {
+                    sink.local_set(1 + vi);
+                } else {
+                    sink.drop();
+                }
+                let skip = (!OpRef::raw_is_constant(vi)).then_some(vi);
+                emit_reload_ca_frame_if_necessary(
+                    &mut sink,
+                    residual_type_base,
+                    ca.ca_reload_fn_ptr,
+                    ca.inline,
+                );
+                emit_reload_refs_from_homes(&mut sink, ref_homes, &liveness, op_idx, skip, frame);
+                sink.else_();
 
                 // Allocate the callee frame as a GC JitFrame
                 // (`wasm_jit_ca_alloc_frame(frame_bytes, gcmap_ptr)` — a
@@ -3184,17 +3209,16 @@ fn build_function(
                 sink.local_get(ca_cfp_local);
                 sink.i64_const(0);
                 sink.i64_store(mem64(frame.dispatch_key_ofs));
-                // inputs: F'[1] = arg0 (callee frame), F'[2] = arg1 (ec).
+                // Marshal the descriptor's uniform i64 Int/Ref ABI inputs into
+                // the callee's positional frame slots.
+                for (arg_index, arg) in op.getarglist().iter().enumerate() {
+                    sink.local_get(ca_cfp_local);
+                    emit_resolve(&mut sink, constants, value_types, arg.to_opref());
+                    sink.i64_store(mem64(FRAME_SLOT_BASE + arg_index as u64 * SLOT_SIZE));
+                }
+                // Run the callee loop on F'; discard the returned frame_ptr.
                 sink.local_get(ca_cfp_local);
-                emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
-                sink.i64_store(mem64(FRAME_SLOT_BASE));
-                sink.local_get(ca_cfp_local);
-                emit_resolve(&mut sink, constants, value_types, op.arg(1).to_opref());
-                sink.i64_store(mem64(FRAME_SLOT_BASE + SLOT_SIZE));
-                // run the source loop on F' (non-tail: one wasm frame per
-                // recursion level); discard the returned frame_ptr.
-                sink.local_get(ca_cfp_local);
-                sink.i32_const(self_slot);
+                sink.i32_const(callee_slot);
                 sink.call_indirect(0, 0);
                 sink.drop();
                 // The recursive call may minor-collect and move this nursery
@@ -3250,7 +3274,7 @@ fn build_function(
                 // deopt: wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64).
                 sink.local_get(ca_cfp_local);
                 sink.i64_extend_i32_u();
-                sink.i64_const(ca.source_compiled_ptr as i64);
+                sink.i64_const(ca.callee_compiled_ptr as i64);
                 sink.i32_const(ca.deopt_helper_slot as i32);
                 // call_indirect(table_index, type_index): the shared table is 0.
                 sink.call_indirect(0, ca_helper_type_idx);
@@ -3322,6 +3346,7 @@ fn build_function(
                     ca.inline,
                 );
                 emit_reload_refs_from_homes(&mut sink, ref_homes, &liveness, op_idx, skip, frame);
+                sink.end();
             }
 
             // ── CALL operations (via trampoline) ──
