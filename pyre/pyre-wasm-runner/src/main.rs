@@ -281,6 +281,18 @@ fn run(module_path: &PathBuf, source: &str) -> Result<i32> {
     let alloc = instance.get_typed_func::<u32, u32>(&mut store, "pyre_alloc")?;
     let run_python = instance.get_typed_func::<(u32, u32), u64>(&mut store, "pyre_run_python")?;
     let dealloc = instance.get_typed_func::<(u32, u32), ()>(&mut store, "pyre_dealloc")?;
+    if let Some(selector) = std::env::var("PYRE_WASM_FORCE_CA_TERMINAL_DECLINE")
+        .ok()
+        .filter(|value| !value.is_empty())
+    {
+        let selector = selector.parse::<u64>().context(
+            "PYRE_WASM_FORCE_CA_TERMINAL_DECLINE must be 1 or a decimal JitCellToken number",
+        )?;
+        let set_force = instance
+            .get_typed_func::<u64, ()>(&mut store, "pyre_set_force_ca_terminal_decline")
+            .context("wasm module lacks terminal-decline regression hook")?;
+        set_force.call(&mut store, selector)?;
+    }
 
     let src = source.as_bytes();
     let len = src.len() as u32;
@@ -364,7 +376,8 @@ fn run(module_path: &PathBuf, source: &str) -> Result<i32> {
         }
         // compile_bridge outcome tallies (diagnostic). 0=entered 1=declCALL_ASM
         // 2=declMultiPeel 3=declNotDirect 4=declRefHome 5=BRIDGE_OK
-        // 6=loopClosing 7=srcHasPreamble 15=declCAHostTrampoline.
+        // 6=loopClosing 7=srcHasPreamble 15=declCAHostTrampoline,
+        // 16=forced terminal-decline regression hook.
         if let Ok(diag) = instance.get_typed_func::<u32, u64>(&mut store, "pyre_jit_bridge_diag") {
             let labels = [
                 "entered",
@@ -383,6 +396,7 @@ fn run(module_path: &PathBuf, source: &str) -> Result<i32> {
                 "ca_cells_zero",
                 "accepted_ca",
                 "decl_ca_trampoline",
+                "forced_ca_terminal_decline",
             ];
             let mut parts = Vec::new();
             for (i, lbl) in labels.iter().enumerate() {

@@ -32,10 +32,11 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 /// 10 = arity mismatch, 11 = loop-closing bridge advances no loop-carried value
 /// (guard side-trace that would livelock the chained loop), 14 = accepted
 /// CALL_ASSEMBLER trace, 15 = declined CA because a trace would use the host
-/// call trampoline on a movable CA frame.
-pub static BRIDGE_DIAG: [AtomicU64; 16] = {
+/// call trampoline on a movable CA frame.  Index 16 records the dormant
+/// forced-terminal-decline runtime regression hook.
+pub static BRIDGE_DIAG: [AtomicU64; 17] = {
     const Z: AtomicU64 = AtomicU64::new(0);
-    [Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z]
+    [Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z]
 };
 
 /// Read a `BRIDGE_DIAG` tally (saturating index). Surfaced to the host through
@@ -823,7 +824,11 @@ fn build_home_gcmap(frame: codegen::FrameGeometry) -> Box<[usize]> {
 /// makes `compile_bridge` decline the CA lift, since the arm would have no way
 /// to complete a deopt. Stored as `u64` to reuse the imported atomics.
 static CA_DEOPT_HELPER_SLOT: AtomicU64 = AtomicU64::new(0);
-static CA_BASELINE_HELPER_SLOT: AtomicU64 = AtomicU64::new(0);
+/// Dormant runtime-regression selector. The wasm runner writes this through a
+/// guest export before executing a test program; zero keeps production runs
+/// unchanged. `1` selects the first admitted target, otherwise the value is a
+/// `JitCellToken` number.
+static FORCE_CA_TERMINAL_DECLINE: AtomicU64 = AtomicU64::new(0);
 
 /// Host entry point publishing [`CA_DEOPT_HELPER_SLOT`] (called from pyre-jit's
 /// `init_jit_hooks` with `wasm_ca_resume_deopt as *const () as usize`, which on
@@ -837,12 +842,9 @@ pub fn ca_deopt_helper_slot() -> u32 {
     CA_DEOPT_HELPER_SLOT.load(Ordering::Relaxed) as u32
 }
 
-pub fn set_ca_baseline_helper_slot(slot: u32) {
-    CA_BASELINE_HELPER_SLOT.store(slot as u64, Ordering::Relaxed);
-}
-
-pub fn ca_baseline_helper_slot() -> u32 {
-    CA_BASELINE_HELPER_SLOT.load(Ordering::Relaxed) as u32
+/// Configure the dormant terminal-decline regression hook.
+pub fn set_force_ca_terminal_decline(selector: u64) {
+    FORCE_CA_TERMINAL_DECLINE.store(selector, Ordering::Relaxed);
 }
 
 /// A legacy pool-indexed const (`ConstInt(u32)` etc.) reached the wasm backend
@@ -1217,18 +1219,45 @@ fn mark_call_assembler_target_active(target: &CallAssemblerTarget, caller: &JitC
     // The target metadata is removed by `CompiledWasmLoop::drop`; compilation
     // is single-threaded, and callers only retain the pointer while the token
     // remains compiled. This is the same lifetime used by the deopt helper.
-    unsafe {
+    let force_terminal_decline = unsafe {
         if let Some(loop_) = (target.compiled_ptr as *const CompiledWasmLoop).as_ref() {
             loop_.ca_active.set(true);
             let caller_flag = caller.invalidation_flag();
-            let mut callers = loop_.ca_callers.borrow_mut();
-            if !callers
-                .iter()
-                .any(|known| std::sync::Arc::ptr_eq(known, &caller_flag))
             {
-                callers.push(caller_flag);
+                let mut callers = loop_.ca_callers.borrow_mut();
+                if !callers
+                    .iter()
+                    .any(|known| std::sync::Arc::ptr_eq(known, &caller_flag))
+                {
+                    callers.push(caller_flag);
+                }
             }
+
+            // Runtime-regression hook for the terminal-decline CA path.  It
+            // is dormant unless explicitly selected, and runs only after this
+            // caller has already admitted and compiled a CA edge.  `1` selects
+            // the first such target; a decimal JitCellToken number selects a
+            // particular target.  The caller's invalidation bit still makes
+            // this a bounded window, exactly like a real terminal bridge
+            // decline.
+            let selector = FORCE_CA_TERMINAL_DECLINE.load(Ordering::Relaxed);
+            if selector != 0 && (selector == 1 || selector == target.token_number) {
+                // One forced target per guest run. A real terminal decline
+                // also transitions its target just once.
+                FORCE_CA_TERMINAL_DECLINE.store(0, Ordering::Relaxed);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
         }
+    };
+    if force_terminal_decline {
+        // `mark_call_assembler_terminal_decline` reads `ca_callers`; release
+        // the registration borrow above before invalidating those callers.
+        mark_call_assembler_terminal_decline(target.compiled_ptr as usize);
+        diag_bump(16);
     }
 }
 
@@ -1392,8 +1421,7 @@ impl majit_backend::Backend for WasmBackend {
         // A general CALL_ASSEMBLER can enter an already-compiled loop through
         // the shared table. Keep one frozen target per trace in Slice A.
         let ca_target = general_int_call_assembler_target(ops);
-        let allow_ca =
-            ca_deopt_helper_slot() != 0 && ca_baseline_helper_slot() != 0 && ca_target.is_some();
+        let allow_ca = ca_deopt_helper_slot() != 0 && ca_target.is_some();
         // This must use the same direct-vs-trampoline predicates as codegen:
         // a CA callee runs this source-loop body on a movable nursery frame.
         let has_trampoline_calls = codegen::has_trampoline_calls(inputargs, ops, allow_ca);
@@ -1471,8 +1499,6 @@ impl majit_backend::Backend for WasmBackend {
                         callee_frame_bytes: target.callee_frame_bytes,
                         loop_finish_fi: target.loop_finish_fi,
                         deopt_helper_slot: ca_deopt_helper_slot(),
-                        baseline_helper_slot: ca_baseline_helper_slot(),
-                        terminal_declined_ptr: target.terminal_declined_ptr,
                         callee_compiled_ptr: target.compiled_ptr,
                         ca_alloc_fn_ptr: wasm_jit_ca_alloc_frame as *const () as usize as i64,
                         ca_pop_fn_ptr: wasm_jit_ca_pop_frame as *const () as usize as i64,
@@ -1674,15 +1700,13 @@ impl majit_backend::Backend for WasmBackend {
         publish_call_assembler_target(
             token.number,
             CallAssemblerTarget {
+                token_number: token.number,
                 func_handle: compiled.func_handle,
                 input_types: compiled.input_types.clone(),
                 callee_frame_bytes: compiled.frame.ca_frame_bytes,
                 callee_gcmap_ptr,
                 loop_finish_fi,
                 compiled_ptr: compiled as *const CompiledWasmLoop as usize as u64,
-                terminal_declined_ptr: (&compiled.ca_terminal_declined
-                    as *const std::cell::Cell<bool>) as usize
-                    as u32,
                 has_trampoline_calls: compiled.has_trampoline_calls.get(),
             },
         );
@@ -1741,8 +1765,7 @@ impl majit_backend::Backend for WasmBackend {
         // registered `wasm_ca_resume_deopt` slot it could not, so decline the
         // lift (the host round-trip path still handles the CALL_ASSEMBLER).
         let ca_target = bridge_int_call_assembler_target(ops, original_token.number);
-        let ca_candidate =
-            ca_deopt_helper_slot() != 0 && ca_baseline_helper_slot() != 0 && ca_target.is_some();
+        let ca_candidate = ca_deopt_helper_slot() != 0 && ca_target.is_some();
         // The CA candidate is a dedicated direct arm; all other ops are
         // scanned against their normal emission paths.
         let bridge_has_trampoline_calls =
@@ -2125,8 +2148,6 @@ impl majit_backend::Backend for WasmBackend {
                 callee_frame_bytes: target.callee_frame_bytes,
                 loop_finish_fi: target.loop_finish_fi,
                 deopt_helper_slot: ca_deopt_helper_slot(),
-                baseline_helper_slot: ca_baseline_helper_slot(),
-                terminal_declined_ptr: target.terminal_declined_ptr,
                 callee_compiled_ptr: target.compiled_ptr,
                 ca_alloc_fn_ptr: wasm_jit_ca_alloc_frame as *const () as usize as i64,
                 ca_pop_fn_ptr: wasm_jit_ca_pop_frame as *const () as usize as i64,

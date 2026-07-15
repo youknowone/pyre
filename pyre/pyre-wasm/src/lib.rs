@@ -308,6 +308,16 @@ pub extern "C" fn pyre_jit_bridge_diag(i: u32) -> u64 {
     majit_backend_wasm::bridge_diag(i as usize)
 }
 
+/// Test-only control plane for the terminal-declined CALL_ASSEMBLER regression.
+/// Exported rather than imported so it cannot perturb table/function indices
+/// used by JIT-emitted modules. Zero disables it; see
+/// `majit_backend_wasm::set_force_ca_terminal_decline` for selector semantics.
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn pyre_set_force_ca_terminal_decline(selector: u64) {
+    majit_backend_wasm::set_force_ca_terminal_decline(selector);
+}
+
 /// Diagnostic-only: number of JIT trace entries made from the guest.
 #[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
 #[unsafe(no_mangle)]

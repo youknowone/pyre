@@ -1186,8 +1186,6 @@ pub struct CaParams {
     /// instead of trapping. `0` (unset) ⇒ no helper, so `compile_bridge` declines
     /// the CA lift before reaching codegen.
     pub deopt_helper_slot: u32,
-    pub baseline_helper_slot: u32,
-    pub terminal_declined_ptr: u32,
     /// Address of the callee loop's `CompiledWasmLoop`, baked as the first
     /// argument to the deopt helper so it can resolve the deopted callee frame's
     /// `fail_descrs`.
@@ -3026,30 +3024,16 @@ fn build_function(
                 let vi = op.pos.get().raw();
                 let callee_slot = ca.callee_slot as i32;
 
-                // A target with a terminally-declined bridge must immediately
-                // return to the ordinary PyFrame entry path.  The bit lives in
-                // guest linear memory, so clean CA calls pay only one byte load.
-                sink.i32_const(ca.terminal_declined_ptr as i32);
-                sink.i32_load8_u(memarg(0, 0));
-                sink.if_(BlockType::Empty);
-                emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
-                sink.i64_const(ca.callee_compiled_ptr as i64);
-                sink.i32_const(ca.baseline_helper_slot as i32);
-                sink.call_indirect(0, ca_helper_type_idx);
-                if !OpRef::raw_is_constant(vi) {
-                    sink.local_set(1 + vi);
-                } else {
-                    sink.drop();
-                }
-                let skip = (!OpRef::raw_is_constant(vi)).then_some(vi);
-                emit_reload_ca_frame_if_necessary(
-                    &mut sink,
-                    residual_type_base,
-                    ca.ca_reload_fn_ptr,
-                    ca.inline,
-                );
-                emit_reload_refs_from_homes(&mut sink, ref_homes, &liveness, op_idx, skip, frame);
-                sink.else_();
+                // A terminally-declined target cannot be restarted from the
+                // CALL_ASSEMBLER reds: these are loop-header live-ins, not a
+                // function-entry PyFrame or necessarily the function's call
+                // arguments.  Continue through the orthodox CA frame path
+                // below instead.  It marshals every live-in into a callee
+                // JitFrame and its non-finish path blackhole-resumes the
+                // callee correctly.  This is temporarily more expensive in
+                // the bounded caller-invalidation window; deopting the outer
+                // trace at the Python CALL needs resume metadata that a
+                // CALL_ASSEMBLER op does not currently carry.
 
                 // Allocate the callee frame as a GC JitFrame
                 // (`wasm_jit_ca_alloc_frame(frame_bytes, gcmap_ptr)` — a
@@ -3343,7 +3327,6 @@ fn build_function(
                     ca.inline,
                 );
                 emit_reload_refs_from_homes(&mut sink, ref_homes, &liveness, op_idx, skip, frame);
-                sink.end();
             }
 
             // ── CALL operations (via trampoline) ──

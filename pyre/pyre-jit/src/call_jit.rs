@@ -3347,24 +3347,6 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
     }
 }
 
-/// Execute a target which previously proved unable to leave its compiled entry
-/// through a compiled bridge.  This is the pre-Slice-A call path: run the
-/// callee's live PyFrame through the normal JIT entry, allowing its own hot
-/// inner traces while avoiding a CA deopt-to-blackhole on every call.
-#[cfg(target_arch = "wasm32")]
-pub extern "C" fn wasm_ca_baseline_call(frame_ptr: i64, _compiled_ptr: i64) -> i64 {
-    let Some(frame) = (unsafe { (frame_ptr as *mut PyFrame).as_mut() }) else {
-        return 0;
-    };
-    match crate::eval::eval_with_jit(frame) {
-        Ok(result) => result as i64,
-        Err(err) => {
-            set_pending_ca_exception(err);
-            0
-        }
-    }
-}
-
 // ── Callee frame creation for call_assembler ─────────────────────
 
 /// Public wrapper for trace-through inlining.

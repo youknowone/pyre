@@ -96,13 +96,15 @@ pub struct LabelTarget {
 /// installed, so a caller can decline before baking an unresolved target.
 #[derive(Clone, Debug)]
 pub struct CallAssemblerTarget {
+    /// Owning `JitCellToken` number. Used only by the dormant wasm regression
+    /// hook to select one target deterministically.
+    pub token_number: u64,
     pub func_handle: u32,
     pub input_types: Vec<Type>,
     pub callee_frame_bytes: u32,
     pub callee_gcmap_ptr: i64,
     pub loop_finish_fi: u32,
     pub compiled_ptr: u64,
-    pub terminal_declined_ptr: u32,
     pub has_trampoline_calls: bool,
 }
 
