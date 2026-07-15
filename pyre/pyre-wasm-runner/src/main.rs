@@ -422,12 +422,16 @@ fn run(module_path: &PathBuf, source: &str) -> Result<i32> {
             }
             eprintln!("[jit-stats] mc_diag {}", parts.join(" "));
         }
+        let guest_jit_execute_count = instance
+            .get_typed_func::<(), u64>(&mut store, "pyre_jit_execute_count")
+            .and_then(|f| f.call(&mut store, ()))
+            .ok();
         let host = store.data();
         eprintln!(
             "[jit-stats] compiles={} executes={} jit_calls={} linear_mem={} gc_oldgen={} gc_nursery={} \
              gc_minors={} gc_majors={} heap_live_bytes={} heap_live_count={}",
             host.jit_compile_count,
-            host.jit_execute_count,
+            guest_jit_execute_count.unwrap_or(host.jit_execute_count),
             host.jit_call_count,
             lin_mem,
             gc_oldgen,

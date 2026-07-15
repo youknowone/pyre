@@ -46,6 +46,12 @@ pub fn bridge_diag(i: usize) -> u64 {
         .unwrap_or(0)
 }
 
+/// Number of JIT trace entries made from the guest.
+#[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+pub fn jit_execute_count() -> u64 {
+    glue::jit_execute_count()
+}
+
 #[inline]
 fn diag_bump(i: usize) {
     BRIDGE_DIAG[i].fetch_add(1, Ordering::Relaxed);

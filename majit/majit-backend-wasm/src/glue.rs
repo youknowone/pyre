@@ -14,6 +14,10 @@
 //! Both expose the same `compile_module` / `execute` / `free` surface, so
 //! the rest of the backend stays binding-agnostic.
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
+static JIT_EXECUTE_COUNT: AtomicU64 = AtomicU64::new(0);
+
 #[cfg(all(feature = "web", feature = "host-import"))]
 compile_error!("features `web` and `host-import` are mutually exclusive; enable exactly one");
 
@@ -81,9 +85,27 @@ pub fn execute(func_id: u32, frame_ptr: u32) -> u32 {
         imports::jit_execute_wasm(func_id, frame_ptr)
     }
     #[cfg(not(feature = "web"))]
-    {
-        unsafe { imports::jit_execute_wasm(func_id, frame_ptr) }
+    unsafe {
+        JIT_EXECUTE_COUNT.fetch_add(1, Ordering::Relaxed);
+        // `func_id` is the shared-table (`__indirect_function_table`, exported as
+        // table 0) slot where the host appended this trace. Calling it directly
+        // keeps execution inside the guest; the trace is `(i32) -> i32`.
+        //
+        // Keep the host import referenced on a never-taken path so `wasm-ld` does
+        // not garbage-collect it: dropping the import would shift the module's
+        // import indices and break JIT-baked indices. `black_box` blocks the
+        // optimizer from proving the branch dead.
+        if core::hint::black_box(false) {
+            return imports::jit_execute_wasm(func_id, frame_ptr);
+        }
+        let trace: extern "C" fn(u32) -> u32 = core::mem::transmute(func_id as usize);
+        trace(frame_ptr)
     }
+}
+
+/// Number of guest-side JIT trace entries.
+pub fn jit_execute_count() -> u64 {
+    JIT_EXECUTE_COUNT.load(Ordering::Relaxed)
 }
 
 /// Free a compiled JIT function.

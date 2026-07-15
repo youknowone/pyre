@@ -308,6 +308,13 @@ pub extern "C" fn pyre_jit_bridge_diag(i: u32) -> u64 {
     majit_backend_wasm::bridge_diag(i as usize)
 }
 
+/// Diagnostic-only: number of JIT trace entries made from the guest.
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn pyre_jit_execute_count() -> u64 {
+    majit_backend_wasm::jit_execute_count()
+}
+
 /// Diagnostic-only: read a guard-failure → bridge-trace gate tally from the
 /// metainterp (`majit_metainterp::MC_DIAG`). Same export-not-import rationale
 /// as `pyre_jit_bridge_diag`.
