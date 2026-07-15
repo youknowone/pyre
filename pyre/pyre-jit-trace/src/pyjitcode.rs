@@ -761,18 +761,13 @@ impl PyJitCode {
     /// data rather than reconstructing a coordinate from a Python pc.
     ///
     /// The encoder (box collection) and decoder (box count + setposition)
-    /// both funnel through this with identical `(raw_pc, carried, op_live)`,
+    /// both funnel through this with identical `(carried, op_live)`,
     /// so the chosen offset — and hence the live-box layout — is symmetric
     /// by construction.
     ///
     /// The carried word is preferred only when it is a `-live-`-anchored
     /// coordinate ([`JitCode::can_decode_live_vars`]).
-    pub fn resolve_resume_pc_with_jitcode_pc(
-        &self,
-        _raw_pc: i32,
-        carried: i32,
-        op_live: u8,
-    ) -> Option<usize> {
+    pub fn resolve_resume_pc_with_jitcode_pc(&self, carried: i32, op_live: u8) -> Option<usize> {
         // #73 S3.5: a depth-0 branch guard may carry its `orgpc` tagged into the
         // word's negative space; expand it to the block-head marker the baseline
         // would have carried before any offset use. No-op for offsets /

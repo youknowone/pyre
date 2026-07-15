@@ -1209,7 +1209,7 @@ pub fn frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
         // No Python-pc reconstruction is available here: an absent carried
         // coordinate returns the empty result to its decline-aware caller.
         let resolved_jit_pc: Option<usize> =
-            payload.resolve_resume_pc_with_jitcode_pc(pc, carried_jitcode_pc, sd.op_live);
+            payload.resolve_resume_pc_with_jitcode_pc(carried_jitcode_pc, sd.op_live);
         let Some(jit_pc) = resolved_jit_pc else {
             return FrameLivenessRegIndices::default();
         };

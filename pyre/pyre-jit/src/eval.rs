@@ -5031,6 +5031,10 @@ fn jit_merge_point_hook(
             if walk_end_flushed {
                 frame.restore_resume_state_from(&executed_frame);
             } else if let Some(restart_pc) = walk_end_restart_pc {
+                // When `fbw_has_unjournaled_effect` / `PYRE_FBW_END_FLUSH=0`
+                // leaves the end flush uncommitted, the live frame stays at trace entry.
+                // At a super-instruction loop close it only corrects `last_instr` to the
+                // marker-consistent restart pc; walked locals/stack stay out for consistent replay.
                 frame.set_last_instr_from_next_instr(restart_pc);
             }
             propagated_exception = pyre_jit_trace::trace::take_walk_end_propagated_exception();
@@ -5141,6 +5145,10 @@ fn maybe_compile_and_run(
         pyre_jit_trace::state::depth_based_vsd_for_wcode(frame.pycode as usize, loop_header_pc)
     {
         if frame.valuestackdepth != expected_vsd {
+            // A pyre super-instruction compiled-loop exit can rewind next_instr to the header
+            // while retaining an over-counted vable stack depth. Valid Python loops have one depth per bytecode offset,
+            // so this never permanently interprets a traceable loop; PyPy's MIFrame.pc JitCode-offset
+            // plus ResumeDataDirectReader exact-resume invariant structurally preclude it.
             return None;
         }
     }

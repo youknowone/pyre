@@ -11661,23 +11661,20 @@ fn walker_capture_inline_nonstandard_vable_guard(
     // re-executing the whole call on deopt — sound for the side-effect-free
     // leaves this path inlines (the non-standard identity guard is itself
     // deterministic and never fails at runtime).
-    let (vable_boxes, vref_boxes) = ctx.trace_ctx.build_snapshot_vable_vref_boxes();
-    // The non-standard identity guard resumes at the caller's CALL
-    // boundary (`entry_py_pc`), re-executing the whole call on deopt —
-    // there is no kept-stack JitCode coordinate to preserve, so the
-    // frame resumes through the Python pc → jitcode resume-translation path.
-    // This sentinel-twin writer is corpus-untested.
+    // The non-standard identity guard has no representable JitCode resume
+    // coordinate: its carried word is the sentinel, so decline rather than
+    // publishing the caller's Python pc as a JitCode offset.
     let nsvable_word = majit_ir::resumedata::NO_JITCODE_PC;
-    let nsvable_pc_word = crate::state::pyjitcode_for_jitcode_index(ctx.outer_jitcode_index as i32)
-        .and_then(|payload| {
-            payload.resolve_resume_pc_with_jitcode_pc(
-                ctx.entry_py_pc as i32,
-                nsvable_word,
-                crate::state::op_live(),
-            )
-        })
-        .map(|offset| offset as u32)
-        .unwrap_or(ctx.entry_py_pc);
+    let Some(nsvable_pc_word) =
+        crate::state::pyjitcode_for_jitcode_index(ctx.outer_jitcode_index as i32)
+            .and_then(|payload| {
+                payload.resolve_resume_pc_with_jitcode_pc(nsvable_word, crate::state::op_live())
+            })
+            .map(|offset| offset as u32)
+    else {
+        return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
+    };
+    let (vable_boxes, vref_boxes) = ctx.trace_ctx.build_snapshot_vable_vref_boxes();
     ctx.trace_ctx
         .capture_snapshot_for_last_guard_op_with_vable_vref(
             &ctx.outer_active_boxes,
@@ -12409,14 +12406,12 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 scope.branch_guard_kept_recovered,
             );
             let payload = unsafe { &(&*sym.jitcode).payload };
-            let pc_word = payload
-                .resolve_resume_pc_with_jitcode_pc(
-                    resume_py_pc as i32,
-                    guard_jitcode_pc,
-                    crate::state::op_live(),
-                )
+            let Some(pc_word) = payload
+                .resolve_resume_pc_with_jitcode_pc(guard_jitcode_pc, crate::state::op_live())
                 .map(|offset| offset as u32)
-                .unwrap_or(resume_py_pc);
+            else {
+                return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
+            };
             ctx.trace_ctx
                 .capture_snapshot_for_last_guard_with_vable_vref(
                     &active,
@@ -12429,11 +12424,9 @@ fn walker_capture_snapshot_for_last_guard_impl(
         }
     }
 
-    // Per-opcode arm path: `op_pc` (arm-local PC) is not a blackhole
-    // resume point, so the snapshot uses the static outer coordinate and
-    // resumes via the Python pc → jitcode resume-translation path (no JitCode
-    // coordinate).
-    let _ = op_pc;
+    // Per-opcode arm path: `op_pc` is arm-local, so its snapshot must use
+    // the carried static outer JitCode coordinate; an absent coordinate
+    // declines instead of reconstructing one from the Python pc.
     let (vable_boxes, vref_boxes) = ctx.trace_ctx.build_snapshot_vable_vref_boxes();
     let arm_word = if m73_armpath_carry_enabled() {
         ctx.outer_resume_marker_jit_pc
@@ -12442,16 +12435,15 @@ fn walker_capture_snapshot_for_last_guard_impl(
     } else {
         majit_ir::resumedata::NO_JITCODE_PC
     };
-    let arm_pc_word = crate::state::pyjitcode_for_jitcode_index(ctx.outer_jitcode_index as i32)
-        .and_then(|payload| {
-            payload.resolve_resume_pc_with_jitcode_pc(
-                ctx.entry_py_pc as i32,
-                arm_word,
-                crate::state::op_live(),
-            )
-        })
-        .map(|offset| offset as u32)
-        .unwrap_or(ctx.entry_py_pc);
+    let Some(arm_pc_word) =
+        crate::state::pyjitcode_for_jitcode_index(ctx.outer_jitcode_index as i32)
+            .and_then(|payload| {
+                payload.resolve_resume_pc_with_jitcode_pc(arm_word, crate::state::op_live())
+            })
+            .map(|offset| offset as u32)
+    else {
+        return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
+    };
     ctx.trace_ctx
         .capture_snapshot_for_last_guard_with_vable_vref(
             &ctx.outer_active_boxes,
@@ -13013,11 +13005,7 @@ fn walker_capture_multi_frame_inline_snapshot(
         };
         let Some(pf_pc_word) = crate::state::pyjitcode_for_jitcode_index(pf.jitcode_index as i32)
             .and_then(|payload| {
-                payload.resolve_resume_pc_with_jitcode_pc(
-                    pf.resume_py_pc as i32,
-                    pf_word,
-                    crate::state::op_live(),
-                )
+                payload.resolve_resume_pc_with_jitcode_pc(pf_word, crate::state::op_live())
             })
             .map(|offset| offset as u32)
         else {
@@ -25343,10 +25331,38 @@ mod tests {
     use majit_ir::Type;
     use majit_metainterp::make_fail_descr;
 
+    /// Install the minimal `-live-`-anchored outer JitCode required by
+    /// per-opcode guard tests. Production obtains this coordinate from the
+    /// codewriter; these isolated dispatcher fixtures supply the same shape.
+    fn test_outer_resume_jitcode_index() -> u32 {
+        thread_local! {
+            static INDEX: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+        }
+        if let Some(index) = INDEX.with(|slot| slot.get()) {
+            return index;
+        }
+        let runtime_jc = majit_metainterp::jitcode::JitCode::new("guard_resume_test");
+        runtime_jc.set_body(majit_translate::jitcode::JitCodeBody {
+            code: vec![crate::state::op_live(), 0, 0],
+            startpoints: Some([0_usize].into_iter().collect()),
+            ..Default::default()
+        });
+        let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
+        pyjit.jitcode = std::sync::Arc::new(runtime_jc);
+        pyjit.metadata.is_drained = true;
+        let jitcode =
+            crate::state::install_jitcode_for(std::ptr::null(), std::sync::Arc::new(pyjit))
+                as *const crate::state::JitCode;
+        let index = unsafe { (*jitcode).index as u32 };
+        INDEX.with(|slot| slot.set(Some(index)));
+        index
+    }
+
     /// Build a fresh `TraceCtx`. Uses the public `for_test_types` +
     /// `const_ref` / `make_fail_descr` factories so the fixture stays
     /// out of `pub(crate)` API.
     fn fresh_trace_ctx() -> TraceCtx {
+        let _ = test_outer_resume_jitcode_index();
         TraceCtx::for_test_types(&[Type::Ref])
     }
 
@@ -28272,6 +28288,8 @@ mod tests {
         };
         // `raise/r` emits the GuardClass during dispatch, then surfaces
         // `SubRaise`; `walk()`'s top-level SubRaise arm records the FINISH.
+        wc.outer_jitcode_index = test_outer_resume_jitcode_index();
+        wc.outer_resume_marker_jit_pc = Some(0);
         let (outcome, _next_pc) = walk(&code, 0, &mut wc).expect("raise/r must dispatch");
         assert_eq!(outcome, DispatchOutcome::Terminate);
         drop(wc);
@@ -30451,6 +30469,8 @@ mod tests {
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
+        wc.outer_jitcode_index = test_outer_resume_jitcode_index();
+        wc.outer_resume_marker_jit_pc = Some(0);
         let (outcome, next_pc) =
             step(&code, 0, &mut wc).expect("ref_guard_value must record GuardValue");
         assert!(matches!(outcome, DispatchOutcome::Continue));
@@ -30638,6 +30658,8 @@ mod tests {
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
+        wc.outer_jitcode_index = test_outer_resume_jitcode_index();
+        wc.outer_resume_marker_jit_pc = Some(0);
         let (outcome, next_pc) =
             step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -30810,6 +30832,8 @@ mod tests {
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
+        wc.outer_jitcode_index = test_outer_resume_jitcode_index();
+        wc.outer_resume_marker_jit_pc = Some(0);
         let _ = step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
         drop(wc);
         assert_eq!(
@@ -31455,6 +31479,8 @@ mod tests {
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
+        wc.outer_jitcode_index = test_outer_resume_jitcode_index();
+        wc.outer_resume_marker_jit_pc = Some(0);
         let _ = step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
         drop(wc);
         assert_eq!(
@@ -31527,6 +31553,8 @@ mod tests {
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
+        wc.outer_jitcode_index = test_outer_resume_jitcode_index();
+        wc.outer_resume_marker_jit_pc = Some(0);
         let _ = step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
         drop(wc);
         assert_eq!(
@@ -31601,6 +31629,8 @@ mod tests {
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
+        wc.outer_jitcode_index = test_outer_resume_jitcode_index();
+        wc.outer_resume_marker_jit_pc = Some(0);
         let _ = step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
         // The dst slot must hold the OpRef of the recorded CallR. Each
         // Op carries its OpRef in `op.pos` (recorder.rs:159), which lets
@@ -31695,6 +31725,8 @@ mod tests {
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
+        wc.outer_jitcode_index = test_outer_resume_jitcode_index();
+        wc.outer_resume_marker_jit_pc = Some(0);
         let _ = step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
         drop(wc);
         let opcodes: Vec<_> = tc.ops().iter().skip(ops_before).map(|o| o.opcode).collect();
@@ -31778,6 +31810,8 @@ mod tests {
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
+        wc.outer_jitcode_index = test_outer_resume_jitcode_index();
+        wc.outer_resume_marker_jit_pc = Some(0);
         let _ = step(&code, 0, &mut wc).expect("residual_call_ir_r/iIRd>r must dispatch");
         drop(wc);
         let opcodes: Vec<_> = tc.ops().iter().skip(ops_before).map(|o| o.opcode).collect();
@@ -32026,6 +32060,8 @@ mod tests {
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
+        wc.outer_jitcode_index = test_outer_resume_jitcode_index();
+        wc.outer_resume_marker_jit_pc = Some(0);
         let (outcome, next_pc) =
             step(&code, 0, &mut wc).expect("residual_call_r_i/iRd>i must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -32234,6 +32270,8 @@ mod tests {
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
+        wc.outer_jitcode_index = test_outer_resume_jitcode_index();
+        wc.outer_resume_marker_jit_pc = Some(0);
         let (outcome, next_pc) =
             step(&code, 0, &mut wc).expect("residual_call_ir_r/iIRd>r must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -32373,6 +32411,8 @@ mod tests {
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
+        wc.outer_jitcode_index = test_outer_resume_jitcode_index();
+        wc.outer_resume_marker_jit_pc = Some(0);
         let _ = step(&code, 0, &mut wc).expect("residual_call_ir_r/iIRd>r must dispatch");
         drop(wc);
         let call_op = tc
