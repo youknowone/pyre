@@ -634,6 +634,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires exclusive process — registers a process-global mutator that conflicts with other tests' collections"]
     fn gc_op_basic() {
         ensure_gc();
         register_test_mutator();
@@ -704,6 +705,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires exclusive process — registers a process-global mutator that conflicts with other tests' collections"]
     fn nested_reentrant_query_inside_gc_op_reads_singleton() {
         ensure_gc();
         register_thread();
