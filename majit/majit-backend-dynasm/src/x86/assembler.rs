@@ -8256,7 +8256,17 @@ impl<'a> Assembler386<'a> {
     fn genop_new_with_vtable(&mut self, op: &Op) {
         // Same as New, but also write vtable at offset 0.
         let obj_size = op.with_size_descr(|sd| sd.size()).unwrap_or(16) as i64;
-        let vtable = op.with_size_descr(|sd| sd.vtable()).unwrap_or(0) as i64;
+        let (vtable, w_class_init) = op
+            .with_size_descr(|sd| {
+                let w_class_init = sd.w_class_obj().and_then(|w_class| {
+                    sd.gc_fielddescrs()
+                        .iter()
+                        .find(|fd| fd.is_w_class())
+                        .map(|fd| (fd.offset() as i32, w_class))
+                });
+                (sd.vtable() as i64, w_class_init)
+            })
+            .unwrap_or((0, None));
         let malloc_ptr = Self::new_alloc_fn_addr();
         self.emit_abi_int_arg_from_imm(0, obj_size);
         dynasm!(self.mc ; .arch x64 ; mov rax, QWORD malloc_ptr);
@@ -8276,6 +8286,14 @@ impl<'a> Assembler386<'a> {
                 ; mov rcx, QWORD vtable
                 ; mov [rax], rcx
             );
+        }
+        if let Some((w_class_offset, w_class)) = w_class_init {
+            if w_class != 0 {
+                dynasm!(self.mc ; .arch x64
+                    ; mov rcx, QWORD w_class
+                    ; mov [rax + w_class_offset], rcx
+                );
+            }
         }
         if !op.pos.get().is_none() {
             self.store_rax_to_result(op.pos.get());

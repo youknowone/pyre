@@ -1093,6 +1093,20 @@ impl GcRewriterImpl {
                 // emit a NULL typeptr.
                 if vtable != 0 {
                     self.gen_initialize_vtable(obj_ref.clone(), vtable, vtable_fd_ref, st);
+                    if let Some(w_class) = descr.w_class_obj() {
+                        if w_class != 0 {
+                            if let Some(w_class_fd) =
+                                descr.gc_fielddescrs().iter().find(|fd| fd.is_w_class())
+                            {
+                                self.gen_initialize_w_class(
+                                    obj_ref.clone(),
+                                    w_class,
+                                    w_class_fd.as_ref(),
+                                    st,
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1120,6 +1134,9 @@ impl GcRewriterImpl {
         // per GC-pointer field (`descr.gc_fielddescrs` / unpack_fielddescr).
         let entries = st.delayed_zero_setfields(&result);
         for fd in descr.gc_fielddescrs() {
+            if fd.is_w_class() {
+                continue;
+            }
             entries.insert(fd.offset() as i64);
         }
     }
@@ -2653,6 +2670,17 @@ impl GcRewriterImpl {
             .expect("gc_ll_descr.fielddescr_vtable must be a FieldDescr");
         let vtable_ref = st.const_int(vtable as i64);
         self.emit_setfield(obj, vtable_ref, vtable_fd, st);
+    }
+
+    fn gen_initialize_w_class(
+        &self,
+        obj: Operand,
+        w_class: i64,
+        w_class_fd: &dyn FieldDescr,
+        st: &mut RewriteState,
+    ) {
+        let w_class_ref = Operand::const_from_value(Value::Ref(GcRef(w_class as usize)));
+        self.emit_setfield(obj, w_class_ref, w_class_fd, st);
     }
 
     /// rewrite.py:920-922 gen_initialize_len parity.

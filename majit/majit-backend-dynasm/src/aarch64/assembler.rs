@@ -6318,7 +6318,17 @@ impl<'a> AssemblerARM64<'a> {
 
     fn genop_new_with_vtable(&mut self, op: &Op) {
         let obj_size = op.with_size_descr(|sd| sd.size()).unwrap_or(16) as i64;
-        let vtable = op.with_size_descr(|sd| sd.vtable()).unwrap_or(0) as i64;
+        let (vtable, w_class_init) = op
+            .with_size_descr(|sd| {
+                let w_class_init = sd.w_class_obj().and_then(|w_class| {
+                    sd.gc_fielddescrs()
+                        .iter()
+                        .find(|fd| fd.is_w_class())
+                        .map(|fd| (fd.offset() as i64, w_class))
+                });
+                (sd.vtable() as i64, w_class_init)
+            })
+            .unwrap_or((0, None));
         self.emit_mov_imm64(0, obj_size);
         self.emit_mov_imm64(2, Self::new_alloc_fn_addr());
         dynasm!(self.mc ; .arch aarch64 ; blr x2);
@@ -6326,6 +6336,12 @@ impl<'a> AssemblerARM64<'a> {
         if vtable != 0 {
             self.emit_mov_imm64(1, vtable);
             dynasm!(self.mc ; .arch aarch64 ; str x1, [x0]);
+        }
+        if let Some((w_class_offset, w_class)) = w_class_init {
+            if w_class != 0 {
+                self.emit_mov_imm64(1, w_class);
+                dynasm!(self.mc ; .arch aarch64 ; str x1, [x0, w_class_offset as u32]);
+            }
         }
         if !op.pos.get().is_none() {
             self.store_rax_to_result(op.pos.get());
