@@ -113,16 +113,17 @@ pub struct PyJitCodeMetadata {
     /// at-or-before `off`). A PREDECESSOR binary search (largest offset ≤ jit_pc)
     /// then reproduces `pcdep_color_slots[python_pc_for_jitcode_pc(jit_pc)]` for
     /// the carried resume coordinates reaching the decode re-inversion at
-    /// `bridge_semantic_maps_at_with_jitcode_pc`. Sorted ascending by offset;
-    /// empty for skeleton / fixture. `PYRE_PCMAP_BRIDGE_AUDIT`
-    /// certifies the equality.
+    /// `bridge_semantic_maps_at_with_jitcode_pc`. Both sides are compile-time
+    /// derivations of the same resume-marker / `first_jit` coordinates, so the
+    /// equality holds by construction. Sorted ascending by offset; empty for
+    /// skeleton / fixture.
     pub pcdep_by_jit_pc: Vec<(usize, Vec<(u8, u16, u16)>)>,
     /// task#50 phase-1: predecessor-keyed jitcode-pc twin of `depth_at_py_pc`,
     /// built alongside `pcdep_by_jit_pc` with the same `python_pc_for_jitcode_pc`
     /// resolution (marker precedence + first_jit predecessor). Predecessor-covers
-    /// op offsets, so it agrees with the depth read
-    /// at the decode seam for every carried coordinate. `PYRE_PCMAP_BRIDGE_AUDIT`
-    /// certifies it equals `depth_at_py_pc[python_pc_for_jitcode_pc(jit_pc)]`.
+    /// op offsets, so it agrees with the depth read at the decode seam for every
+    /// carried coordinate: it equals
+    /// `depth_at_py_pc[python_pc_for_jitcode_pc(jit_pc)]` by construction.
     pub depth_pred_by_jit_pc: Vec<(usize, u16)>,
     /// task#50 #73-core: trivia-aware STATIC-liveness depth twin, split into the
     /// SAME two tiers as `python_pc_for_jitcode_pc` — an EXACT-match marker table
@@ -547,8 +548,7 @@ impl PyJitCode {
     /// offset via the `pcdep_by_jit_pc` predecessor twin. Equals
     /// `pcdep_color_slots[python_pc_for_jitcode_pc(jit_pc)]` by construction for
     /// a carried resume coordinate; `None` when the twin is empty (skeleton /
-    /// fixture). Scaffolding for the decode-side pc_map re-inversion
-    /// retirement (`PYRE_PCMAP_BRIDGE_AUDIT` certifies the equality).
+    /// fixture). Scaffolding for the decode-side pc_map re-inversion retirement.
     pub fn pcdep_for_jitcode_pc(&self, jit_pc: usize) -> Option<Vec<(u8, u16, u16)>> {
         let table = &self.metadata.pcdep_by_jit_pc;
         if table.is_empty() {

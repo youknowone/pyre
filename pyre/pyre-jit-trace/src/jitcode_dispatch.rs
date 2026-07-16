@@ -10561,23 +10561,6 @@ fn vstack_enter_exception_handler(
     let _ = reseed_vstack_from_shadow(ctx, handler_depth);
 }
 
-/// `PYRE_PCMAP_BRIDGE_AUDIT` enables the assertion that the predecessor-keyed
-/// `pcdep_by_jit_pc` / `depth_pred_by_jit_pc` twins reproduce the py_pc-indexed
-/// `pcdep_color_slots` / `depth_at_py_pc` values at the decode re-inversion seam
-/// (`bridge_semantic_maps_at_with_jitcode_pc`): for a carried genuine
-/// `jitcode_pc`, `pcdep_for_jitcode_pc(jp)` equals
-/// `pcdep_color_slots[python_pc_for_jitcode_pc(jp)]` and likewise for depth.
-/// Both are compile-time derivations of the same resume-marker / `first_jit`
-/// coordinates, so the equality holds by construction; the audit certifies the
-/// precondition for retiring the decode-side jitcode-pc→py-pc re-inversion
-/// (the twins
-/// can source pcdep/depth from the carried `jitcode_pc` without the py_pc
-/// channel). Diagnostic only; off in production.
-pub(crate) fn bridge_audit_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_BRIDGE_AUDIT").is_some())
-}
-
 /// `PYRE_PCMAP_RESULT_AUDIT` enables assertions that the audit-only
 /// `result_color_by_jit_pc` twin reproduces `result_color_at_pc` at seams
 /// already carrying a genuine JitCode byte offset. Diagnostic only; off in
@@ -10624,24 +10607,6 @@ pub(crate) fn m73_perop_carry_enabled() -> bool {
 pub(crate) fn m73_branch_carry_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M73_BRANCH_CARRY") {
-        Some(v) => {
-            let v = v.to_string_lossy();
-            v != "0" && !v.eq_ignore_ascii_case("false")
-        }
-        None => true,
-    })
-}
-
-/// `PYRE_M73_MARKER_CARRY` (#73 S5 phase-1, default ON): source the
-/// nonbranch-marker keystone from the codewrite-time jitcode-keyed twin at the
-/// guard's own jitcode offset, retaining runtime resume-marker derivation as
-/// the fallback for twin-`None` rows (the synthetic loop-close overshoot whose
-/// `entry_py_pc` rebind is runtime-only). Certified by `PYRE_M73_MARKER_AUDIT`
-/// (100% eq=1 across the bench corpus) and check.py (161×2, on and off).
-/// Disable with `PYRE_M73_MARKER_CARRY=0`.
-pub(crate) fn m73_marker_carry_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M73_MARKER_CARRY") {
         Some(v) => {
             let v = v.to_string_lossy();
             v != "0" && !v.eq_ignore_ascii_case("false")
@@ -10776,25 +10741,6 @@ pub(crate) fn m73_inlcaller_carry_enabled() -> bool {
 fn m73_outercap_carry_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M73_OUTERCAP_CARRY") {
-        Some(v) => {
-            let v = v.to_string_lossy();
-            v != "0" && !v.eq_ignore_ascii_case("false")
-        }
-        None => true,
-    })
-}
-
-/// `PYRE_M73_ARMARKER_CARRY` (#73 S5 phase-2, default ON): source the plain
-/// after-residual-call marker from the codewrite-time fallthrough-marker twin
-/// at the guard's own jitcode offset, retaining runtime resume-marker
-/// derivation as the fallback for twin-`None` rows (the fallthrough-past-end
-/// overshoot whose `entry_py_pc` rebind is runtime-only). Certified by the
-/// `M73_ARMARKER` census (100% eq=1, 2178 captures across 89 bench+synth
-/// programs) and check.py (161×2, on and off). Disable with
-/// `PYRE_M73_ARMARKER_CARRY=0`.
-pub(crate) fn m73_armarker_carry_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M73_ARMARKER_CARRY") {
         Some(v) => {
             let v = v.to_string_lossy();
             v != "0" && !v.eq_ignore_ascii_case("false")

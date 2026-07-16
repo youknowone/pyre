@@ -12738,8 +12738,9 @@ impl CodeWriter {
         // `table[python_pc_for_jitcode_pc(jit_pc)]` for the carried resume
         // coordinates that reach the decode re-inversion at `state.rs`
         // (`bridge_semantic_maps_at_with_jitcode_pc`), which are the guard's own
-        // op offset or a block-head marker — never a mid-op byte.  Certified by
-        // `PYRE_PCMAP_BRIDGE_AUDIT`; empty for skeleton / portal-bridge.
+        // op offset or a block-head marker — never a mid-op byte.  Both sides
+        // derive from the same coordinates at codewrite time, so the equality
+        // holds by construction; empty for skeleton / portal-bridge.
         let mut pcdep_by_jit_pc: Vec<(usize, Vec<(u8, u16, u16)>)> = Vec::new();
         let mut const_ref_slots_by_jit_pc: Vec<(usize, Vec<(u16, i64)>)> = Vec::new();
         let mut depth_pred_by_jit_pc: Vec<(usize, u16)> = Vec::new();
