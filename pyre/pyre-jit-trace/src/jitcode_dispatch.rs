@@ -641,8 +641,10 @@ pub struct WalkContext<'frame, 'static_a: 'frame> {
     pub is_authoritative_executor: bool,
     /// Whether this walk is a full-body walk (`dispatch_via_miframe`
     /// rooted, including its inline sub-walks) as opposed to a
-    /// per-opcode arm walk (`dispatch_via_miframe_at_opcode_entry`
-    /// rooted).
+    /// per-opcode arm walk (whose production root, the retired
+    /// `dispatch_via_miframe_at_opcode_entry`, is deleted; arm-style
+    /// contexts survive in test fixtures and the guard-capture arm
+    /// path).
     ///
     /// The distinction decides who applies a recorded-but-unexecuted
     /// side effect.  A full-body walk is replay-backed: the walk is
@@ -759,18 +761,21 @@ pub struct WalkContext<'frame, 'static_a: 'frame> {
     /// pyjitcode regardless of how deep the walker's sub-walk nesting
     /// is.
     ///
-    /// Read from `(*sym.jitcode).index()` at production entry
-    /// ([`dispatch_via_miframe_at_opcode_entry`]); sub-walks inherit
-    /// the parent's value (sub-walks don't change the outer Python
+    /// The retired per-opcode arm entry read this from
+    /// `(*sym.jitcode).index()`; inline sub-walks seed it from the
+    /// CALL-site capture (sub-walks don't change the outer Python
     /// opcode).  Test fixtures + [`dispatch_via_miframe`] default to
-    /// `0`.
+    /// `0` — the full-body guard capture reads `sym.jitcode` directly
+    /// instead of this field.
     pub outer_jitcode_index: u32,
     /// Frozen `PyFrame` state at the outer Python opcode boundary —
     /// `sym.registers_r ∪ sym.registers_i.opref ∪ sym.registers_f.opref`
-    /// captured at [`dispatch_via_miframe_at_opcode_entry`] entry,
+    /// captured at walk entry (the retired per-opcode arm entry did
+    /// this; inline sub-walks seed it from the CALL-site capture; the
+    /// full-body root leaves it empty and collects at guard capture),
     /// filtered by `OpRef::is_none()`.  This is what
     /// [`walker_capture_snapshot_for_last_guard`] passes as the
-    /// snapshot frame's active boxes.
+    /// snapshot frame's active boxes on the arm path.
     ///
     /// Sub-walks clone the parent's Vec — outer active-box count is
     /// small (a Python frame's live locals + stack tail) and walker
@@ -784,13 +789,11 @@ pub struct WalkContext<'frame, 'static_a: 'frame> {
     /// emitted by `codewriter.rs:7042
     /// build_store_subscr_fn_residual_call_r_v_insn`.
     ///
-    /// Populated by the production entry caller
-    /// (`dispatch_via_miframe` →
-    /// `dispatch_via_miframe_at_opcode_entry`) which reaches the
-    /// address through pyre-jit's `cpu.store_subscr_fn`.  Sub-walks
-    /// inherit the parent's value.  `None` disables the field-based
-    /// specialization gate (test fixtures, default-test entries, or
-    /// production paths where the address hasn't been plumbed yet).
+    /// Every root entry currently passes `None` (the retired
+    /// per-opcode arm entry was the caller that plumbed the address
+    /// through pyre-jit's `cpu.store_subscr_fn`).  Sub-walks inherit
+    /// the parent's value.  `None` disables the field-based
+    /// specialization gate.
     ///
     /// `PYRE_WALKER_STORE_SUBSCR_FNADDR` is read as the fallback when this
     /// field is `None`, keeping test fixtures and runtime overrides from
@@ -2781,8 +2784,8 @@ pub fn dispatch_via_miframe(
             // This entry (test/fixture) hard-codes
             // `outer_jitcode_index = 0` and an empty `outer_active_boxes`
             // rather than seeding them from `sym.jitcode` /
-            // `collect_outer_active_boxes` like
-            // `dispatch_via_miframe_at_opcode_entry` does.  A specialized
+            // `collect_outer_active_boxes` like the retired per-opcode
+            // arm entry did.  A specialized
             // `generated_store_subscr_value` guard captured via
             // `walker_capture_snapshot_for_last_guard` would attach
             // resume data pointing at the wrong frame, so keep
@@ -12098,7 +12101,8 @@ fn walker_capture_snapshot_for_last_guard_impl(
     // pyjitcode coordinates.  `ctx.outer_jitcode_index` +
     // `ctx.entry_py_pc` track those coordinates; `outer_active_boxes`
     // carries the `PyFrame` state at the Python opcode boundary
-    // (snapshotted once at `dispatch_via_miframe_at_opcode_entry` from
+    // (snapshotted once at walk entry — the retired per-opcode arm
+    // entry, or the inline CALL-site capture — from
     // `sym.registers_r ∪ sym.registers_i.opref ∪ sym.registers_f.opref`
     // via `collect_outer_active_boxes` / `frame_liveness_reg_indices_
     // by_bank_at`).

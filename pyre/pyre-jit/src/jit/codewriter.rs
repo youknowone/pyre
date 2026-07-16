@@ -12133,8 +12133,8 @@ impl CodeWriter {
         // The stream's first marker is a leading-guard / trailing-canraise
         // marker INTERIOR to a block, whose backward-liveness includes
         // block-interior stack temps; but the runtime snapshots the outer
-        // frame at EVERY opcode entry (`dispatch_via_miframe_at_opcode_entry`
-        // resumes at `entry_py_pc = miframe.orgpc`), so the entry PC and the
+        // frame at EVERY opcode entry (walk roots resume at
+        // `entry_py_pc = miframe.orgpc`), so the entry PC and the
         // leading run before that interior marker ARE runtime resume targets.
         // Forward-carrying the interior marker for them would hand
         // `collect_outer_active_boxes` a stack-temp ref color that is

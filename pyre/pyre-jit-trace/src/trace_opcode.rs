@@ -7286,8 +7286,8 @@ impl MIFrame {
         // The auto-gen arm jitcode for `LoadConst` residualises
         // `opcode_load_const(frame, &ConstantData)` — the `&ConstantData`
         // operand is oparg-derived (resolved from `consti` against the
-        // code's constant pool), but the per-opcode arm entry
-        // (`dispatch_via_miframe_at_opcode_entry`) seeds only `r0 = frame`,
+        // code's constant pool), but the per-opcode arm entry (the retired
+        // `dispatch_via_miframe_at_opcode_entry`) seeded only `r0 = frame`,
         // leaving that operand register unbound — the walk aborts with
         // `ResidualCallArgUnbound { arg_index: 2 }`.  (A const-specialising
         // JIT wants the constant BAKED into the IR, not threaded as a
