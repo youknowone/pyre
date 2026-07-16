@@ -141,4 +141,3 @@ pub const CALLEE_RESP: [RegLoc; 4] = CALLEE_SAVED_REGISTERS;
 
 /// registers.py:36 `caller_resp = argument_regs + [x8, x9, x10, x11, x12, x13]`
 pub const CALLER_RESP: [RegLoc; 14] = [X0, X1, X2, X3, X4, X5, X6, X7, X8, X9, X10, X11, X12, X13];
-

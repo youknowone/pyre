@@ -28,6 +28,13 @@ pub const EB_STW: usize = 2;
 /// The shared eval-breaker word (see module docs).
 static EVAL_BREAKER_WORD: AtomicUsize = AtomicUsize::new(0);
 
+/// Width of the word, in bytes. The back-edge poll's load descriptor must use
+/// exactly this size: a wider load reads past the word into the adjacent
+/// static, so the poll's nonzero test would always be true and every back-edge
+/// guard would fail. Pointer-width rather than fixed-64 keeps `fetch_or`
+/// lock-free — `set_async` runs inside an OS signal handler.
+pub const EVAL_BREAKER_WORD_SIZE: usize = size_of::<AtomicUsize>();
+
 /// Published address of `EVAL_BREAKER_WORD`; `0` until published.
 static EVAL_BREAKER_WORD_ADDR: AtomicUsize = AtomicUsize::new(0);
 
@@ -62,3 +69,8 @@ pub fn set_stw() {
 pub fn clear_stw() {
     EVAL_BREAKER_WORD.fetch_and(!EB_STW, Ordering::Release);
 }
+
+/// Every flag must fit in the word the poll actually loads. Checked per target,
+/// so a flag too wide for a 32-bit `usize` fails the wasm32 build rather than
+/// silently reading as unarmed there.
+const _: () = assert!((EB_ASYNC | EB_STW) < (1 << (EVAL_BREAKER_WORD_SIZE * 8 - 1)));

@@ -15,10 +15,21 @@ use majit_metainterp::{
 
 use pyre_interpreter::bytecode::{BinaryOperator, CodeObject, ComparisonOperator, Instruction};
 
+/// Descriptor for the back-edge poll's load of the eval-breaker word.
+///
+/// Mirrors `rffi.CArray(Signed)`: the load is exactly as wide as the word it
+/// reads, taking the width from the word itself rather than restating it.
 fn eval_breaker_word_descr() -> DescrRef {
     static DESCR: OnceLock<DescrRef> = OnceLock::new();
     DESCR
-        .get_or_init(|| majit_ir::descr::make_array_descr_signed(0, 8, Type::Int, true))
+        .get_or_init(|| {
+            majit_ir::descr::make_array_descr_signed(
+                0,
+                majit_ir::eval_breaker_word::EVAL_BREAKER_WORD_SIZE,
+                Type::Int,
+                true,
+            )
+        })
         .clone()
 }
 
