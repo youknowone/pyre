@@ -41,6 +41,9 @@ pub fn w_set_iter_new(w_set: PyObjectRef) -> PyObjectRef {
 
 #[inline]
 pub unsafe fn is_set_iterator(obj: PyObjectRef) -> bool {
+    if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::is_tagged_int(obj) {
+        return false;
+    }
     !obj.is_null() && (*obj).ob_type == &SET_ITERATOR_TYPE as *const PyType
 }
 
