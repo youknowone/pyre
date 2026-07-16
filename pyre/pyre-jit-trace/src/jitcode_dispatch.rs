@@ -10598,6 +10598,16 @@ pub(crate) fn result_color_audit_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_RESULT_AUDIT").is_some())
 }
 
+/// `PYRE_PCMAP_GUARD_KEPT_AUDIT` enables the guard-kept recovery census. It
+/// certifies the plain JitCode-PC pcdep twin before a later slice can retire
+/// the remaining Python-PC consumers; depth is reported as a probe because
+/// its predecessor twin intentionally differs at not-taken branch targets.
+/// Diagnostic only; off in production.
+pub(crate) fn pcmap_guard_kept_audit_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_GUARD_KEPT_AUDIT").is_some())
+}
+
 /// `PYRE_M73_PEROP_CARRY` (#73 S2, default ON): source a specialization
 /// guard's (`GuardValue`/`GuardClass`) resume coordinate from the walk
 /// cursor's per-op `-live-` BEFORE anchor (`ctx.live_before_jit_pc`,
@@ -12052,6 +12062,40 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 && !sym.jitcode.is_null()
             {
                 let gpc = guard_py_pc.unwrap() as usize;
+                // `guard_py_pc` above is the plain JitCode-PC inversion (no
+                // Python-trivia skip), so the pcdep twin here must be the plain
+                // predecessor-keyed flavor too.
+                let gjc = scope.branch_guard_jitcode_pc.unwrap();
+                if pcmap_guard_kept_audit_enabled() {
+                    unsafe {
+                        let jc = &*sym.jitcode;
+                        let twin = jc.payload.pcdep_for_jitcode_pc(gjc).unwrap_or_default();
+                        let table = jc
+                            .payload
+                            .metadata
+                            .pcdep_color_slots
+                            .get(gpc)
+                            .cloned()
+                            .unwrap_or_default();
+                        assert_eq!(
+                            twin, table,
+                            "PCMAP_GUARD_KEPT pcdep mismatch gjc={gjc} gpc={gpc}"
+                        );
+                        if !jc.payload.code_ptr.is_null() {
+                            let twin_d = jc.payload.depth_for_jitcode_pc_pred(gjc).unwrap_or(0);
+                            let table_d = crate::liveness::liveness_for(jc.payload.code_ptr)
+                                .depth_at_py_pc()
+                                .get(gpc)
+                                .copied()
+                                .unwrap_or(0);
+                            if twin_d != table_d {
+                                eprintln!(
+                                    "PCMAP_GUARD_KEPT_DEPTH_DIVERGE gjc={gjc} gpc={gpc} twin={twin_d} table={table_d}"
+                                );
+                            }
+                        }
+                    }
+                }
                 let nlocals = sym.nlocals;
                 let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
                 let depth = unsafe {
@@ -12068,12 +12112,7 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 };
                 let pcdep: Vec<(u8, u16, u16)> = unsafe {
                     let jc = &*sym.jitcode;
-                    jc.payload
-                        .metadata
-                        .pcdep_color_slots
-                        .get(gpc)
-                        .cloned()
-                        .unwrap_or_default()
+                    jc.payload.pcdep_for_jitcode_pc(gjc).unwrap_or_default()
                 };
                 let mut covered: std::collections::HashSet<usize> =
                     stack_sync.iter().map(|&(idx, _)| idx).collect();
