@@ -24,7 +24,7 @@ use pyre_jit_trace::{PyJitCode, PyJitCodeMetadata};
 
 use super::assembler::Assembler;
 use super::ssa_emitter::SSAReprEmitter;
-use pyre_interpreter::bytecode::{CodeFlags, CodeObject, Instruction, OpArgState};
+use pyre_interpreter::bytecode::{CodeFlags, CodeObject, Instruction, OpArgState, SpecialMethod};
 use pyre_interpreter::runtime_ops::{binary_op_tag, compare_op_tag};
 
 use super::flatten::{
@@ -2543,6 +2543,41 @@ fn emit_frontend_load_method_self(
     )
 }
 
+fn emit_frontend_load_special(
+    graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    obj: super::flow::FlowValue,
+    method_kind_const: super::flow::FlowValue,
+    offset: i64,
+) -> super::flow::Variable {
+    emit_graph_op_with_result(
+        graph,
+        block,
+        "load_special",
+        vec![obj.into(), method_kind_const.into()],
+        Kind::Ref,
+        offset,
+    )
+}
+
+fn emit_frontend_load_special_self(
+    graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    obj: super::flow::FlowValue,
+    attr: super::flow::FlowValue,
+    method_kind_const: super::flow::FlowValue,
+    offset: i64,
+) -> super::flow::Variable {
+    emit_graph_op_with_result(
+        graph,
+        block,
+        "load_special_self",
+        vec![obj.into(), attr.into(), method_kind_const.into()],
+        Kind::Ref,
+        offset,
+    )
+}
+
 fn emit_frontend_load_name(
     graph: &mut super::flow::FunctionGraph,
     block: &super::flow::BlockRef,
@@ -3330,6 +3365,8 @@ struct FnPtrIndices {
     set_current_exception_fn: HelperHandle,
     load_attr_fn: HelperHandle,
     load_method_self_fn: HelperHandle,
+    load_special_fn: HelperHandle,
+    load_special_self_fn: HelperHandle,
     store_attr_fn: HelperHandle,
     build_map_from_array_fn: HelperHandle,
     binary_slice_fn: HelperHandle,
@@ -3592,6 +3629,16 @@ fn register_helper_fn_pointers(
         assembler,
         cpu.load_method_self_fn as *const (),
         CallFlavor::PlainCannotRaise,
+    );
+    let load_special_fn = bind(
+        assembler,
+        cpu.load_special_fn as *const (),
+        CallFlavor::MayForce,
+    );
+    let load_special_self_fn = bind(
+        assembler,
+        cpu.load_special_self_fn as *const (),
+        CallFlavor::Plain,
     );
     // `bh_load_name_fn` / `bh_store_name_fn` delegate to the interpreter
     // `NamespaceOpcodeHandler` impl (pyopcode.py:945 LOAD_NAME / :855
@@ -4057,6 +4104,8 @@ fn register_helper_fn_pointers(
         set_current_exception_fn,
         load_attr_fn,
         load_method_self_fn,
+        load_special_fn,
+        load_special_self_fn,
         store_attr_fn,
         build_map_from_array_fn,
         binary_slice_fn,
@@ -5552,6 +5601,16 @@ impl CodeWriter {
                     idx: load_method_self_fn_idx,
                     flavor: _load_method_self_fn_flavor,
                 },
+            load_special_fn:
+                HelperHandle {
+                    idx: load_special_fn_idx,
+                    flavor: _load_special_fn_flavor,
+                },
+            load_special_self_fn:
+                HelperHandle {
+                    idx: load_special_self_fn_idx,
+                    flavor: _load_special_self_fn_flavor,
+                },
             store_attr_fn:
                 HelperHandle {
                     idx: store_attr_fn_idx,
@@ -5893,6 +5952,8 @@ impl CodeWriter {
                 ],
                 load_attr_fn_idx,
                 load_method_self_fn_idx,
+                load_special_fn_idx,
+                load_special_self_fn_idx,
                 store_attr_fn_idx,
                 build_map_from_array_fn_idx,
                 binary_slice_fn_idx,
@@ -10999,23 +11060,57 @@ impl CodeWriter {
                         }
 
                         // LoadSpecial: pops 1 (obj), pushes 2 (callable, self_or_null). Net: +1.
-                        // pyopcode.rs:2059 delegates to load_method; eval.rs:2365 pops 1 pushes 2.
+                        // pyopcode.rs delegates to load_method for a fixed special-method name.
                         //
-                        // Enter/Exit are portable (flowspace records a
-                        // `record_maybe_raise_op`), AEnter/AExit are a genuine
-                        // async boundary (`unsupported_rpython("async with is not
-                        // RPython")`).  The portable Enter/Exit half is latent:
-                        // LOAD_SPECIAL only heads a `with` block, whose exception
-                        // table blocks token creation (see WITH_EXCEPT_START), so
-                        // this abort is never reached in practice. No residual yet.
-                        Instruction::LoadSpecial { .. } => {
-                            pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            push_fresh_ref(&mut current_state, &mut graph);
-                            current_depth += 1;
-                            push_fresh_ref(&mut current_state, &mut graph);
-                            current_depth += 1;
-                            emit_abort_permanent!(py_pc);
-                        }
+                        // Enter/Exit lower through the LOAD_ATTR method-form pipeline with the
+                        // bytecode's special-method discriminant instead of a co_names index.
+                        // AEnter/AExit remain a genuine async boundary (`async with` is not in
+                        // the RPython subset, and the downstream await/send path is unported).
+                        Instruction::LoadSpecial { method } => match method.get(op_arg) {
+                            SpecialMethod::Enter | SpecialMethod::Exit => {
+                                let method_kind_const: super::flow::FlowValue =
+                                    super::flow::Constant::signed(u32::from(op_arg) as i64).into();
+                                let _ = emit_popvalue_ref!(current_depth, py_pc);
+                                let obj_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                                let result_value = emit_frontend_load_special(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    obj_value.clone(),
+                                    method_kind_const.clone(),
+                                    py_pc as i64,
+                                );
+                                current_state.stack.push(result_value.into());
+                                emit_pushvalue_ref!(
+                                    current_depth,
+                                    stack_base + current_depth,
+                                    result_value.into(),
+                                    py_pc
+                                );
+                                let bound_value = emit_frontend_load_special_self(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    obj_value,
+                                    result_value.into(),
+                                    method_kind_const,
+                                    py_pc as i64,
+                                );
+                                current_state.stack.push(bound_value.into());
+                                emit_pushvalue_ref!(
+                                    current_depth,
+                                    stack_base + current_depth,
+                                    bound_value.into(),
+                                    py_pc
+                                );
+                            }
+                            SpecialMethod::AEnter | SpecialMethod::AExit => {
+                                pop_and_decr_depth(&mut current_state, &mut current_depth);
+                                push_fresh_ref(&mut current_state, &mut graph);
+                                current_depth += 1;
+                                push_fresh_ref(&mut current_state, &mut graph);
+                                current_depth += 1;
+                                emit_abort_permanent!(py_pc);
+                            }
+                        },
 
                         // LoadFromDictOrGlobals: pops 1 (dict), pushes 1 (result). Net: 0.
                         // Replace shadow value. eval.rs:2028.

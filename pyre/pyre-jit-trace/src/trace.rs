@@ -2596,9 +2596,9 @@ fn probe_walk_perfn_jitcode(
 /// `abort_permanent` (e.g. the `DELETE_FAST` cleanup for `except X as e`)
 /// still declines it, because compiled-loop delivery of an uncaught raise to
 /// the handler is not yet supported.
-fn loop_body_has_abort_permanent(w_code: *const (), start_pc: usize) -> bool {
+fn loop_body_abort_permanent_pc(w_code: *const (), start_pc: usize) -> Option<usize> {
     let Some(pjc) = crate::state::pyjitcode_for_code(w_code) else {
-        return false;
+        return None;
     };
     let code = pjc.jitcode.code.as_slice();
     let Some(merge_point) = pjc
@@ -2615,7 +2615,7 @@ fn loop_body_has_abort_permanent(w_code: *const (), start_pc: usize) -> bool {
                 .map(|op| op.pc)
         })
     else {
-        return false;
+        return None;
     };
 
     let mut back_edge_end: Option<usize> = None;
@@ -2646,14 +2646,14 @@ fn loop_body_has_abort_permanent(w_code: *const (), start_pc: usize) -> bool {
     } else {
         back_edge_end.unwrap_or(code.len())
     };
-    first_abort_permanent.is_some_and(|pc| pc < scan_end)
+    first_abort_permanent.filter(|pc| *pc < scan_end)
 }
 
 /// True when the hot loop body in `w_code` inline-calls — transitively — a
 /// user function whose per-fn jitcode body carries an `abort_permanent`
 /// marker.
 ///
-/// [`loop_body_has_abort_permanent`] only scans the top-level per-CodeObject
+/// [`loop_body_abort_permanent_pc`] only scans the top-level per-CodeObject
 /// jitcode, so an `abort_permanent` reached through an inlined callee slips
 /// past it.  That gap causes a walk-time double-apply: a non-journaled
 /// concrete heap store (dict/attr/set item, list `extend`, …) in the loop
@@ -2697,7 +2697,7 @@ fn loop_body_has_abort_permanent(w_code: *const (), start_pc: usize) -> bool {
 /// Non-aborting eligible callees are enqueued and their own referenced
 /// functions scanned transitively through THEIR globals, guarded by a
 /// scan-local visited set.  The root `w_code` is pre-marked visited — its own
-/// loop-body marker is already handled by [`loop_body_has_abort_permanent`].
+/// loop-body marker is already handled by [`loop_body_abort_permanent_pc`].
 ///
 /// Frame-local seeding is ROOT-frame only; a deeper (not-yet-pushed) callee's
 /// locals are not available up front.  Callees reached via attribute access,
@@ -2905,12 +2905,15 @@ fn full_body_walk_trace(
     // guard, exit early, and concretely double-execute the post-loop tail;
     // declining before the walk reaches the unported op avoids frame
     // corruption and returns to interpretation.
-    if loop_body_has_abort_permanent(w_code, start_pc) {
+    if let Some(abort_pc) = loop_body_abort_permanent_pc(w_code, start_pc) {
         // Tag the decline so `PYRE_FBW_DEBUG_ABORT` census attributes it to the
         // up-front `abort_permanent` scan, not the trait retry fall-through
         // (`Trait::DeclinedAbort`).  Without this the real declining class is
         // invisible to the census.
         crate::jitcode_dispatch::census_record("FullBodyWalk::LoopBodyAbortPermanent");
+        if std::env::var_os("PYRE_FBW_DEBUG_ABORT").is_some() {
+            eprintln!("[fbw-abort] start_pc={start_pc} abort_permanent_pc={abort_pc}");
+        }
         fbw_decline(crate::driver::make_green_key(w_code, start_pc));
         return TraceAction::Abort;
     }

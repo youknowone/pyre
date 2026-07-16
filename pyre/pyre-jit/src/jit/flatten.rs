@@ -3274,6 +3274,17 @@ pub struct LoweringContext {
     /// `compute_load_method_bound` binding decision (reads the type
     /// MRO, never raises → `PlainCannotRaise`).
     pub load_method_self_fn_idx: u16,
+    /// `load_special_fn` descrs-pool index.  LOAD_SPECIAL Enter/Exit records
+    /// `load_special(obj, method_kind)` and lowers to
+    /// `residual_call_ir_r(ConstInt(fn_idx), ListI([method_kind]),
+    /// ListR([obj]), Descr) → reg`; the helper resolves the fixed method name
+    /// from the discriminant and runs `getattr` (`MayForce`).
+    pub load_special_fn_idx: u16,
+    /// `load_special_self_fn` descrs-pool index.  The LOAD_SPECIAL
+    /// `null_or_self` half records `load_special_self(obj, attr, method_kind)`
+    /// and lowers to `residual_call_ir_r(ConstInt(fn_idx),
+    /// ListI([method_kind]), ListR([obj, attr]), Descr) → reg`.
+    pub load_special_self_fn_idx: u16,
     /// `store_attr_fn` descrs-pool index — see codewriter.rs
     /// `register_helper_fn_pointers` for the production source
     /// (`bind(assembler, cpu.store_attr_fn, CallFlavor::MayForce)`).
@@ -5076,6 +5087,13 @@ where
     if let Some(insn) = lower_load_method_self_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
+    if let Some(insn) = lower_load_special_hlop_to_insn(op, ctx, get_register, lower_constant) {
+        return Some(insn);
+    }
+    if let Some(insn) = lower_load_special_self_hlop_to_insn(op, ctx, get_register, lower_constant)
+    {
+        return Some(insn);
+    }
     if let Some(insn) = lower_setattr_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
@@ -5268,6 +5286,50 @@ where
                 vec![Operand::ConstInt(name_idx)],
             )),
             Operand::ListOfKind(ListOfKind::new(Kind::Ref, vec![obj, code])),
+            descr_operand,
+        ],
+        dst_reg,
+    ))
+}
+
+/// Lower the LOAD_SPECIAL attribute half — pyre HLOp
+/// `load_special(obj, method_kind)` → `result: Ref` — to
+/// `residual_call_ir_r(ConstInt(load_special_fn_idx),
+/// ListI([method_kind]), ListR([obj]), Descr) → reg`.
+pub fn lower_load_special_hlop_to_insn<F, LC>(
+    op: &super::flow::SpaceOperation,
+    ctx: &LoweringContext,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
+{
+    if op.opname != "load_special" || op.args.len() != 2 {
+        return None;
+    }
+    let obj = operand_for_value_arg(&op.args[0], get_register, lower_constant)?;
+    let method_kind = const_int_for_value_arg(&op.args[1])?;
+    let dst_reg = match &op.result {
+        Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
+        _ => return None,
+    };
+    let effect_info = effect_info_for_call_flavor(CallFlavor::MayForce);
+    let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
+        effect_info,
+        arg_kinds: vec![Kind::Ref, Kind::Int],
+        result_kind: Some(Kind::Ref),
+    }));
+    Some(Insn::op_with_result(
+        "residual_call_ir_r",
+        vec![
+            Operand::ConstInt(ctx.load_special_fn_idx as i64),
+            Operand::ListOfKind(ListOfKind::new(
+                Kind::Int,
+                vec![Operand::ConstInt(method_kind)],
+            )),
+            Operand::ListOfKind(ListOfKind::new(Kind::Ref, vec![obj])),
             descr_operand,
         ],
         dst_reg,
@@ -6498,6 +6560,51 @@ where
                 vec![Operand::ConstInt(name_idx)],
             )),
             Operand::ListOfKind(ListOfKind::new(Kind::Ref, vec![obj, attr, code])),
+            descr_operand,
+        ],
+        dst_reg,
+    ))
+}
+
+/// Lower the LOAD_SPECIAL `null_or_self` half — pyre HLOp
+/// `load_special_self(obj, attr, method_kind)` → `result: Ref` — to
+/// `residual_call_ir_r(ConstInt(load_special_self_fn_idx),
+/// ListI([method_kind]), ListR([obj, attr]), Descr) → reg`.
+pub fn lower_load_special_self_hlop_to_insn<F, LC>(
+    op: &super::flow::SpaceOperation,
+    ctx: &LoweringContext,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
+{
+    if op.opname != "load_special_self" || op.args.len() != 3 {
+        return None;
+    }
+    let obj = operand_for_value_arg(&op.args[0], get_register, lower_constant)?;
+    let attr = operand_for_value_arg(&op.args[1], get_register, lower_constant)?;
+    let method_kind = const_int_for_value_arg(&op.args[2])?;
+    let dst_reg = match &op.result {
+        Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
+        _ => return None,
+    };
+    let effect_info = effect_info_for_call_flavor(CallFlavor::Plain);
+    let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
+        effect_info,
+        arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Int],
+        result_kind: Some(Kind::Ref),
+    }));
+    Some(Insn::op_with_result(
+        "residual_call_ir_r",
+        vec![
+            Operand::ConstInt(ctx.load_special_self_fn_idx as i64),
+            Operand::ListOfKind(ListOfKind::new(
+                Kind::Int,
+                vec![Operand::ConstInt(method_kind)],
+            )),
+            Operand::ListOfKind(ListOfKind::new(Kind::Ref, vec![obj, attr])),
             descr_operand,
         ],
         dst_reg,
