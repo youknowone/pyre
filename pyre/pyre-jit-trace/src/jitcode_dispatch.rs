@@ -10598,11 +10598,10 @@ pub(crate) fn result_color_audit_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_RESULT_AUDIT").is_some())
 }
 
-/// `PYRE_PCMAP_GUARD_KEPT_AUDIT` enables the guard-kept recovery census. It
-/// certifies the plain JitCode-PC pcdep twin before a later slice can retire
-/// the remaining Python-PC consumers; depth is reported as a probe because
-/// its predecessor twin intentionally differs at not-taken branch targets.
-/// Diagnostic only; off in production.
+/// `PYRE_PCMAP_GUARD_KEPT_AUDIT` enables assertions that the guard-kept
+/// recovery's plain JitCode-PC pcdep and predecessor-depth twins reproduce
+/// their Python-PC tables at the guard's own emitted opcode. Diagnostic only;
+/// off in production.
 pub(crate) fn pcmap_guard_kept_audit_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_GUARD_KEPT_AUDIT").is_some())
@@ -12088,11 +12087,10 @@ fn walker_capture_snapshot_for_last_guard_impl(
                                 .get(gpc)
                                 .copied()
                                 .unwrap_or(0);
-                            if twin_d != table_d {
-                                eprintln!(
-                                    "PCMAP_GUARD_KEPT_DEPTH_DIVERGE gjc={gjc} gpc={gpc} twin={twin_d} table={table_d}"
-                                );
-                            }
+                            assert_eq!(
+                                twin_d, table_d,
+                                "PCMAP_GUARD_KEPT depth mismatch gjc={gjc} gpc={gpc}"
+                            );
                         }
                     }
                 }
@@ -12100,15 +12098,7 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
                 let depth = unsafe {
                     let jc = &*sym.jitcode;
-                    if jc.payload.code_ptr.is_null() {
-                        0usize
-                    } else {
-                        crate::liveness::liveness_for(jc.payload.code_ptr)
-                            .depth_at_py_pc()
-                            .get(gpc)
-                            .copied()
-                            .unwrap_or(0) as usize
-                    }
+                    jc.payload.depth_for_jitcode_pc_pred(gjc).unwrap_or(0) as usize
                 };
                 let pcdep: Vec<(u8, u16, u16)> = unsafe {
                     let jc = &*sym.jitcode;
