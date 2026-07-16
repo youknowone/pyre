@@ -1384,8 +1384,7 @@ impl TraceCtx {
     /// concrete for an OpRef recorded in a context whose op was not
     /// allocated in the active recorder (a deeper inlined / recursive
     /// frame's result).  Leaving that result symbolic makes the downstream
-    /// branch abort the trace into the trait fallback rather than crash
-    /// the tracer.
+    /// branch abort the trace cleanly rather than crash the tracer.
     pub fn try_set_opref_concrete(&mut self, opref: OpRef, concrete: Value) -> bool {
         if opref.is_constant() {
             return true;

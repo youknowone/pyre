@@ -1146,11 +1146,6 @@ pub struct MetaInterp<M: Clone> {
     pub(crate) vable_array_lengths: Vec<usize>,
     /// warmspot.py:449 jd.result_type — per-driver static result type.
     pub(crate) result_type: Type,
-    /// RPython portal_call_depth parity: call depth at which the current
-    /// trace started. When Some(depth), only merge_point at that depth fires.
-    /// Replaces the pyre-jit TLS JIT_TRACING_DEPTH — state colocated with
-    /// tracing context for single source of truth.
-    pub tracing_call_depth: Option<u32>,
     /// PyPy warmspot.py max_unroll_recursion (default 7).
     pub(crate) max_unroll_recursion: usize,
     /// RPython parity: `prepare_trace_segmenting()` marks the next tracing run
@@ -1285,10 +1280,6 @@ pub struct MetaInterp<M: Clone> {
     /// (pyjitpl.py:2466).  Initialized to `-1` by
     /// `initialize_state_from_start` (pyjitpl.py:3268) so the first
     /// portal frame brings it to `0`.
-    ///
-    /// Distinct from `tracing_call_depth` which captures the depth at
-    /// which the current trace started — that field is a one-shot
-    /// snapshot, this one is the live counter.
     pub portal_call_depth: i32,
 
     /// pyjitpl.py:2400 `self.call_ids = []`.
@@ -2343,7 +2334,6 @@ impl<M: Clone> MetaInterp<M> {
             vable_ptr: std::ptr::null(),
             vable_array_lengths: Vec::new(),
             result_type: Type::Ref,
-            tracing_call_depth: None,
             max_unroll_recursion: 7, // RPython default from rlib/jit.py
             force_finish_trace: false,
             callinfocollection: None,

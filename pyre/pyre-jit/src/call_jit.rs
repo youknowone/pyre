@@ -2741,11 +2741,9 @@ pub fn trace_and_compile_from_bridge(
     // resume state so that a `BridgeCompiled` outcome re-enters
     // `eval_loop_jit` there — the `ContinueRunningNormally` arm does NOT
     // reconstruct the frame, it runs the interpreter forward from the live
-    // frame's `last_instr` / value stack as-is.  The trait tracer interprets
-    // a private `snapshot_for_tracing` copy and never touches the real frame,
-    // so it naturally preserves the resume state.  The full-body walker,
-    // however, runs may-force residual calls concretely through the shared
-    // execution context during the walk, which advances the live frame's
+    // frame's `last_instr` / value stack as-is. The full-body walker runs from
+    // a private `snapshot_for_tracing` copy, but may-force residual calls use
+    // the shared execution context during the walk, which advances the live frame's
     // `last_instr` AND its locals (e.g. a loop counter) to the walked
     // opcode's concrete state.  Snapshot the resume state here and restore it
     // after the walk so the post-bridge interpreter resumes at the guard
@@ -2783,7 +2781,6 @@ pub fn trace_and_compile_from_bridge(
                     resume_pc,
                     trace_frame,
                     live_frame_addr,
-                    false,
                     false,
                 );
                 // pyjitpl.py:3048-3091 raise_continue_running_normally:

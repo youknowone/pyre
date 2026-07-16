@@ -416,7 +416,6 @@ pub fn trace_bytecode(
     mut concrete_frame: pyre_interpreter::pyframe::FrameBox,
     live_frame_addr: usize,
     allow_propagate_out: bool,
-    marker_entry: bool,
 ) -> (TraceAction, pyre_interpreter::pyframe::FrameBox) {
     // `llmodel.py:557` parity — install pyre's `Cpu` impl so the
     // optimizer's `protect_speculative_string` / `bh_strlen` /
@@ -433,13 +432,10 @@ pub fn trace_bytecode(
     // `TraceCtx.reads_module_global` needs no reset here: a fresh TraceCtx is
     // built per trace (zero-init `false`), unlike the walk-end TLS flags above.
     // Likewise clear any no-replay finish payload a prior trace left
-    // unconsumed.  The FBW walk re-clears this in `run_perfn_walk`; the
-    // trait leg (`trace_step_result_to_action`) has no such epilogue, so
-    // reset here covers both before either can stash a capture.
+    // unconsumed. The full-body walk re-clears this in `run_perfn_walk`.
     crate::jitcode_dispatch::fbw_finish_payload_reset();
     // Likewise drop any cross-frame-resume abort request a prior aborted
-    // trace left unconsumed (`metainterp::interpret` clears it on the normal
-    // path; this guards the paths that exit before the poll runs).
+    // trace left unconsumed.
     let _ = crate::state::take_trace_abort_requested();
 
     let ctx = meta
@@ -449,10 +445,8 @@ pub fn trace_bytecode(
     // pc with the OUTERMOST (`frames[0]`) resume pc. The passed `start_pc` is
     // the INNERMOST frame's pc (`decode_and_restore_guard_failure` returns
     // `jit_state.next_instr()`), which belongs to the deepest reconstructed
-    // callee — NOT the root. A carrier resume now re-interprets without JIT (the
-    // trait leg that reconstructed + pushed the callees is retired, gap-10), so
-    // the walker dispatch below routes it to a plain abort; the root pc is the
-    // relevant trace-start either way.
+    // callee — NOT the root. The dedicated carrier walker below starts from
+    // the root pc and reconstructs the in-flight inline frames.
     let carrier = ctx.take_bridge_inline_carrier();
     let start_pc = if let Some(ref c) = carrier {
         c.root_pc
@@ -492,8 +486,7 @@ pub fn trace_bytecode(
     // capture must read pointer-valued fields (`debugdata` / `lastblock`)
     // from the live frame the compiled loop will run on.  See the
     // `live_vable_frame_addr` field doc (state.rs).  Set before the
-    // full-body-walk leg below so the walker path (the production tracer
-    // post-#73) sees it as well as the trait `interpret()` leg.
+    // full-body-walk leg below so the production tracer sees it.
     //
     // gap 10 slice 2b: set this BEFORE `init_symbolic` so the root vable
     // identity (seed_virtualizable_boxes) is baked against the live frame
@@ -538,13 +531,8 @@ pub fn trace_bytecode(
     // inventory on a live bench now that walk-capability gaps #1/#2/#3
     // are closed.  See
     // `project_issue73_architecture_walker_as_tracer_2026_05_28`.
-    // Both walker entries below are gated on `carrier.is_none()`: a
-    // multi-frame bridge resume carries reconstructed inline-callee
-    // recipes that only the trait path assembles+pushes (the carrier
-    // drain before `interpret()` below — `rebuild_from_resumedata`
-    // resume.py:1049-1056).  The walker has no multi-Python-frame
-    // reconstruction yet (#68); entering it would walk the outer root
-    // frame at `root_pc` instead of the deepest resumed callee.
+    // The generic probe is gated on `carrier.is_none()` because multi-frame
+    // bridge resumes are handled by the dedicated carrier walkers above.
     if carrier.is_none() && std::env::var_os("PYRE_WALK_PERFN_JITCODE").is_some() {
         probe_walk_perfn_jitcode(ctx, sym, w_code, start_pc, cf_addr);
         finish_trace_namespace_dependency(meta);
@@ -553,43 +541,22 @@ pub fn trace_bytecode(
     // Issue #73 Phase 5 production flip: the per-CodeObject JitCode body is
     // traced via the authoritative full-body walk — the walker-as-tracer
     // path that makes `miframe.pc == jitcode_pc` and lets `pc_map` retire.
-    // `PYRE_FULL_BODY_WALK=0` opts back into the trait
-    // `metainterp.interpret` loop below (transition escape hatch; the trait
-    // tracer is deleted in Phase 6).
+    // `PYRE_FULL_BODY_WALK=0` disables tracing for the key.
     //
     // A green key in `FBW_DECLINED_KEYS` had a prior walk fail on a
     // structural walker limitation (the recurring error classes in
-    // `full_body_walk_trace`); the retrace routes through the trait
-    // tracer below instead of permanently blacklisting the location
-    // (`DONT_TRACE_HERE`).  Tracing aborts must not mark a location
-    // untraceable — upstream aborts or switches to the blackhole and the
-    // location stays eligible (pyjitpl.py:2392 aborted_tracing /
-    // blackhole switch); the trait leg is pyre's transitional stand-in
-    // until the walker covers those shapes (deleted with the trait in
-    // Phase 6).
+    // `full_body_walk_trace`); retraces bypass the walker and interpret
+    // without JIT instead of permanently blacklisting the location.
     if carrier.is_none()
         && std::env::var_os("PYRE_FULL_BODY_WALK").as_deref() != Some(std::ffi::OsStr::new("0"))
         && !fbw_declined(crate::driver::make_green_key(w_code, start_pc))
     {
-        let action = full_body_walk_trace(
-            ctx,
-            sym,
-            w_code,
-            start_pc,
-            cf_addr,
-            WalkJournals::Reset,
-            marker_entry,
-        );
+        let action = full_body_walk_trace(ctx, sym, w_code, start_pc, cf_addr, WalkJournals::Reset);
         finish_trace_namespace_dependency(meta);
         return (action, concrete_frame);
     }
-    // gap-10: the trait tracer (`PyreMetaInterp` / `owned_concrete_frame`
-    // interpret loop) is retired.  Any path the walker did not trace above — an
-    // `fbw_declined` key whose walk hit a structural limit, a
-    // `PYRE_FULL_BODY_WALK=0` opt-out, or a multi-frame bridge `carrier` resume
-    // (reconstructed only by the deleted trait leg) — re-interprets without JIT
-    // for this key.  The location stays trace-eligible (no `DONT_TRACE_HERE`);
-    // the next hot encounter re-walks.
+    // Any path the walker did not trace above re-interprets without JIT for
+    // this key. The location stays trace-eligible (no `DONT_TRACE_HERE`).
     crate::jitcode_dispatch::census_record(if carrier.is_some() {
         "Trait::CarrierAbort"
     } else {
@@ -620,9 +587,8 @@ pub fn trace_bytecode(
 /// unfolded `residual_call`).  See
 /// `project_issue73_architecture_walker_as_tracer_2026_05_28`.
 ///
-/// Decode the loop-header `jit_merge_point` that governs the resume
-/// coordinate `entry` and return its green-ref (`gr`) and red (`rr`)
-/// register lists.
+/// Decode the loop-header `jit_merge_point` that governs a bridge resume
+/// coordinate and return its green-ref (`gr`) and red (`rr`) register lists.
 ///
 /// These name the jitcode register colors the loop body reads its
 /// loop-invariant pycode (`gr`) and frame/ec (`rr`) from.  A mid-loop walk
@@ -634,54 +600,23 @@ pub fn trace_bytecode(
 /// when no preceding merge point exists (straight-line resume) or the
 /// operand stream is truncated.
 ///
-/// `body_resume` selects which merge point governs `entry`.  RPython binds
-/// each merge point's greenboxes 1:1 from the op it is ABOUT TO execute
-/// (pyjitpl.py:1537 `opimpl_jit_merge_point(greenboxes, ...)`), because the
-/// MIFrame walks every op forward.  pyre resumes PAST that op at a resume
-/// marker, so it must reconstruct the same op's register colors:
-///  - A HEADER entry (`body_resume=false`, a fresh loop trace) sits at the
-///    loop header's leading `-live-` marker, immediately BEFORE the merge
-///    point the walk is about to reach — so the governing op is the FIRST
-///    merge point at or after `entry`.  Picking the largest one BEFORE
-///    `entry` would select a PRECEDING sibling loop's merge point (a
-///    function with two loops), seeding that loop's pycode/frame/ec colors
-///    and leaving this loop's distinct colors `OpRef::NONE` — the
-///    born-between-loops abort.
-///  - A body-guard bridge resume (`body_resume=true`) enters PAST its loop's
-///    merge point, so the governing op is the LAST merge point at or before
-///    `entry`.
+/// A body-guard bridge enters past its loop's merge point, so the governing
+/// op is the last merge point at or before `entry`. Main traces enter before
+/// the static marker and never use this runtime reconstruction.
 ///
-pub(crate) fn loop_header_merge_point_regs(
+pub(crate) fn bridge_resume_merge_point_regs(
     code: &[u8],
     entry: usize,
-    body_resume: bool,
 ) -> Option<(Vec<u8>, Vec<u8>)> {
     let merge_point_pcs = || {
         crate::jitcode_runtime::decoded_ops(code)
             .filter(|op| op.opname == "jit_merge_point")
             .map(|op| op.pc)
     };
-    let mp_pc = if body_resume {
-        merge_point_pcs()
-            .filter(|&pc| pc <= entry)
-            .max()
-            .or_else(|| merge_point_pcs().filter(|&pc| pc >= entry).min())
-    } else {
-        // Header entry: the governing merge point is the FIRST at or after
-        // `entry` — the op the walk is about to reach — mirroring
-        // opimpl_jit_merge_point binding the merge point it is about to
-        // execute (pyjitpl.py:1537). A sibling loop and a nested inner loop
-        // both forward-select their own header, so a `for` inside a `while`
-        // seeds its own pycode/frame/ec and compiles standalone
-        // (reached_loop_header closes it via same_greenkey on
-        // current_merge_points, pyjitpl.py:3018-3060). Fall back to the last
-        // preceding merge point only for a straight-line entry with no merge
-        // point ahead.
-        merge_point_pcs()
-            .filter(|&pc| pc >= entry)
-            .min()
-            .or_else(|| merge_point_pcs().filter(|&pc| pc <= entry).max())
-    }?;
+    let mp_pc = merge_point_pcs()
+        .filter(|&pc| pc <= entry)
+        .max()
+        .or_else(|| merge_point_pcs().filter(|&pc| pc >= entry).min())?;
     let mut cursor = mp_pc + 1 + 1; // opcode byte + jdindex (`c`)
     let mut lists: [Vec<u8>; 6] = Default::default();
     for slot in lists.iter_mut() {
@@ -1015,7 +950,6 @@ fn drive_bridge_carrier_walk(
                     root_py_pc,
                     cf_addr,
                     WalkJournals::Keep,
-                    false,
                 );
             }
             crate::jitcode_dispatch::census_record("P2Drain::ResultSlotUnresolved");
@@ -1466,7 +1400,6 @@ fn run_perfn_walk(
     start_pc: usize,
     cf_addr: usize,
     authoritative: bool,
-    marker_entry: bool,
 ) -> Option<(usize, usize, PerfnWalkResult)> {
     let session = std::cell::RefCell::new(crate::jitcode_dispatch::WalkSession::default());
     let Some(pjc) = crate::state::pyjitcode_for_code(w_code) else {
@@ -1498,9 +1431,9 @@ fn run_perfn_walk(
         // The frozen pc_map of this already-built body does not encode
         // `start_pc` as a resume coordinate, so the same body walked from
         // the same entry recurs identically on every retrace.  Decline the
-        // key (route its retraces to the trait tracer via FBW_DECLINED_KEYS)
-        // instead of re-walking and re-aborting each iteration; mirrors the
-        // `built_as_portal=false` structural decline below.
+        // key so retraces interpret without JIT instead of re-walking and
+        // re-aborting each iteration; mirrors the `built_as_portal=false`
+        // structural decline below.
         if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
             eprintln!(
                 "[walk-perfn] no jitcode entry for start_pc={start_pc} (pc_map_len={}); declining walk",
@@ -1619,7 +1552,7 @@ fn run_perfn_walk(
         // standard virtualizable. The #124 operand-stack override below must
         // not overwrite these (a kept temp never lives in a red-input color).
         let mut reserved_red_colors: Vec<u8> = Vec::new();
-        if marker_entry && !is_bridge_trace {
+        if !is_bridge_trace {
             // C1 marker entry starts at the static sidecar coordinate BEFORE
             // the source marker.  Seed only the root JitCode's formal red
             // inputs at their per-JitCode metadata colors; the pre-marker
@@ -1641,8 +1574,7 @@ fn run_perfn_walk(
             reserved_red_colors.push(frame_color);
             reserved_red_colors.push(ec_color);
         } else {
-            match loop_header_merge_point_regs(pjc.jitcode.code.as_slice(), entry, is_bridge_trace)
-            {
+            match bridge_resume_merge_point_regs(pjc.jitcode.code.as_slice(), entry) {
                 Some((gr, rr)) => {
                     if let Some(&r) = gr.first() {
                         seed(r, pycode_box);
@@ -1852,8 +1784,8 @@ fn run_perfn_walk(
     // `[frame, ec, next_instr, code, valuestackdepth, debugdata, lastblock,
     //  namespace, locals..., stack...]` (len >= NUM_SCALAR_INPUTARGS).
     // `validate_close_with_jump_args` (state.rs) rejects the reds shape, so
-    // rebuild the explicit vector via `close_loop_args_at`, mirroring the
-    // trait path's `reached_loop_header` (trace_opcode.rs close path).  The
+    // rebuild the explicit vector via `close_loop_args_at`, matching
+    // `reached_loop_header` (trace_opcode.rs close path). The
     // loop-carried local/stack OpRefs come from the virtualizable shadow in
     // the TraceCtx (`virtualizable_box_at`, maintained by the authoritative
     // walk's vable ops), NOT from the walk's private register file, so the
@@ -2420,7 +2352,7 @@ fn probe_walk_perfn_jitcode(
     // every op the diagnostic recorded (the walk discards its trace).
     let pre_pos = ctx.get_trace_position();
     let Some((entry, code_len, walk_result)) =
-        run_perfn_walk(ctx, sym, w_code, start_pc, cf_addr, authoritative, false)
+        run_perfn_walk(ctx, sym, w_code, start_pc, cf_addr, authoritative)
     else {
         return;
     };
@@ -2759,10 +2691,7 @@ enum WalkJournals {
 /// end-to-end case (the four loop benches close under authoritative) — is
 /// mapped to a real `CloseLoopWithArgs`; every other outcome (`Terminate`
 /// finish-arg recovery, `SubReturn`/`SubRaise`, `SwitchToBlackhole`, any
-/// `DispatchError`) aborts the trace so the portal falls back to the trait
-/// tracer.  Default-off → the trait `metainterp.interpret` path is
-/// untouched.  The remaining flip blocker is guard-snapshot/resume
-/// correctness, which this harness exists to validate.
+/// `DispatchError`) aborts the trace and returns to interpretation.
 fn full_body_walk_trace(
     ctx: &mut TraceCtx,
     sym: &mut PyreSym,
@@ -2770,14 +2699,12 @@ fn full_body_walk_trace(
     start_pc: usize,
     cf_addr: usize,
     journals: WalkJournals,
-    marker_entry: bool,
 ) -> TraceAction {
     // #125: decline up front when a loop body carries an `abort_permanent`
     // marker.  The authoritative walk would otherwise mis-seed the loop
     // guard, exit early, and concretely double-execute the post-loop tail;
-    // routing to the trait tracer (which handles the unported op) is the
-    // same outcome the reactive in-walk `abort_permanent` decline reaches,
-    // minus the frame corruption.
+    // declining before the walk reaches the unported op avoids frame
+    // corruption and returns to interpretation.
     if loop_body_has_abort_permanent(w_code, start_pc) {
         // Tag the decline so `PYRE_FBW_DEBUG_ABORT` census attributes it to the
         // up-front `abort_permanent` scan, not the trait retry fall-through
@@ -2798,8 +2725,7 @@ fn full_body_walk_trace(
         fbw_decline(crate::driver::make_green_key(w_code, start_pc));
         return TraceAction::Abort;
     }
-    // Mirror the trait path (trace_bytecode pre-interpret): register the
-    // initial merge point with typed input-arg boxes so the trace head
+    // Register the initial merge point with typed input-arg boxes so the trace head
     // carries the portal's entry signature (`inputarg_types()`).  Without
     // it the compiled loop's entry args don't match what the portal
     // supplies, so the portal cannot enter the compiled loop and re-traces
@@ -2840,13 +2766,13 @@ fn full_body_walk_trace(
             .collect();
         ctx.add_merge_point(start_key, input_args, start_pc);
     }
-    let walk_result = run_perfn_walk(ctx, sym, w_code, start_pc, cf_addr, true, marker_entry);
+    let walk_result = run_perfn_walk(ctx, sym, w_code, start_pc, cf_addr, true);
     // A guard snapshot emitted during the walk may have hit a resume
     // coordinate the jitcode pc_map cannot encode (#124/#130) and requested
     // an abort (`state::request_trace_abort`).  The walker does not poll the
     // flag mid-walk, so honor it here before mapping the outcome — otherwise a
     // walk that reaches a terminator would compile a trace carrying the bad
-    // guard.  Discarding the trace matches the trait leg's `interpret()` poll.
+    // guard. Discard the trace before mapping the terminal outcome.
     if crate::state::take_trace_abort_requested() {
         crate::jitcode_dispatch::census_record("TraceAbortRequested");
         if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
@@ -2893,16 +2819,15 @@ fn full_body_walk_trace(
                 // Type::Ref, recorded the vable store-back + GUARD_NOT_FORCED_2,
                 // and stashed the finish payload.  Build the portal-exit FINISH
                 // from it so the compile pipeline records FINISH from
-                // `finish_args` (mirror of the trait `StepResult::Return`
-                // path, trace_opcode.rs).  Ungated → no payload → `Abort`
+                // `finish_args` (matching `StepResult::Return` in
+                // trace_opcode.rs). Ungated → no payload → `Abort`
                 // exactly as before the slice.
                 match crate::jitcode_dispatch::fbw_finish_payload_take() {
                     // A top-level `void_return/` stashes a `Type::Void`-marked
                     // payload: the portal exits with no value, so build a
                     // FINISH with empty args.  The compile pipeline maps an
                     // empty `finish_arg_types` to `done_with_this_frame_descr_void`
-                    // (pyjitpl.rs `done_with_this_frame_descr_from_types`),
-                    // matching the trait tracer's `BC_VOID_RETURN` action.
+                    // (pyjitpl.rs `done_with_this_frame_descr_from_types`).
                     Some((_, majit_ir::Type::Void)) => TraceAction::Finish {
                         finish_args: vec![],
                         finish_arg_types: vec![],
@@ -2929,9 +2854,7 @@ fn full_body_walk_trace(
                 // in-walk `compile_trace` already compiled+installed the
                 // trace as a (entry) bridge jumping into an existing loop;
                 // hand the dedicated action back so the driver neither
-                // compiles nor aborts this session again — the trait-leg
-                // equivalent is `trace_step_result_to_action`'s
-                // `compile_trace_success_pending()` branch.
+                // compiles nor aborts this session again.
                 TraceAction::CompileTrace
             }
             other => {
@@ -2946,8 +2869,7 @@ fn full_body_walk_trace(
             // Structural walker limitations recur identically on every
             // retrace of this location (the same jitcode walked from the same
             // entry produces the same error), so route the key's retraces to
-            // the trait tracer (`FBW_DECLINED_KEYS` → the trait leg of
-            // `trace_bytecode`) instead of thrashing futile deep re-walks —
+            // interpretation instead of thrashing futile deep re-walks —
             // each of which executes the body's residual calls concretely
             // before failing at the unsupported resume / exception / closure
             // shape.  Permanently blacklisting (`AbortPermanent` →
@@ -2968,9 +2890,7 @@ fn full_body_walk_trace(
             }
             match e {
                 // A kept-stack branch guard whose not-taken arm reads an
-                // unrestorable boxed Ref register miscompiles identically in
-                // the trait leg, so re-routing there (the `fbw_decline` +
-                // recoverable `Abort` path below) would crash there too.
+                // unrestorable boxed Ref register cannot safely be retraced.
                 // Mark the location `DONT_TRACE_HERE` so it interprets
                 // permanently — correct, matching the pre-#416/#420 decline.
                 DE::BranchGuardUnrestorableKeptStackPermanent { .. } => TraceAction::AbortPermanent,
@@ -2999,9 +2919,8 @@ fn full_body_walk_trace(
                 // own origin) walk PAST its prior `LoopBearing` decline and reach
                 // such a branch, which would otherwise re-trace unbounded (each
                 // re-walk executes the body's residual calls before failing) —
-                // a slowdown worse than the trait leg.  Decline it permanently to
-                // the trait leg, mirroring the default path's behavior for the
-                // same location.  Gated on the flag so the default path's plain
+                // an unbounded slowdown. Decline it so the location interprets
+                // instead. Gated on the flag so the default path's plain
                 // `Abort` (a capability landing mid-run can still pick it up) is
                 // byte-identical.
                 DE::GotoIfNotValueNotConcrete { .. }

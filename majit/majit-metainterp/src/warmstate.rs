@@ -911,7 +911,7 @@ impl WarmEnterState {
 
     /// warmstate.py:444 `finally: cell.flags &= ~JC_TRACING` parity —
     /// unconditional flag clear on the starting cell after tracing ends.
-    /// Called from the tracing entry point (bound_reached / jit_merge_point_hook)
+    /// Called from the synchronous tracing entry point
     /// regardless of whether tracing succeeded, aborted, or cross-loop-cut
     /// installed under a different inner cell. Does not alter state: the
     /// companion `attach_procedure_to_interp` / `abort_tracing` calls own

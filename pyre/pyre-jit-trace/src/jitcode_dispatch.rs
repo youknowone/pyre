@@ -1134,8 +1134,8 @@ pub enum DispatchError {
     /// `orthodox_list_append_commit`, the generic residual dispatcher
     /// concrete-executes `jit_list_append` WITHOUT `fbw_append_journal_push`,
     /// so `fbw_store_journal_rollback` cannot rewind it; a later trace abort +
-    /// interpreter replay would then apply the SAME append twice.  Decline the
-    /// trace to the trait leg instead of falling through, mirroring the
+    /// interpreter replay would then apply the SAME append twice. Decline the
+    /// trace to interpretation instead of falling through, mirroring the
     /// pre-#171 `emit_abort_permanent` LIST_APPEND lowering — the common
     /// int/float/object append still folds; only the decline shapes abort, and
     /// they aborted before #171 too.
@@ -1248,8 +1248,7 @@ pub enum DispatchError {
     /// unresolved, and the baked NULL arg makes the compiled call pass
     /// NULL where the entry needs the callee's globals/closure — yielding
     /// a NULL result at runtime (closures / functions bound to a local
-    /// and called in a loop). The trait tracer declines to trace through
-    /// this shape (it aborts); the walker surfaces a typed abort so the
+    /// and called in a loop). The walker surfaces a typed abort so the
     /// driver maps it to `TraceAction::Abort` and the loop falls back to
     /// the interpreter instead of compiling a wrong trace.
     MayForceNullRefArgUnsupported { pc: usize },
@@ -1268,7 +1267,7 @@ pub enum DispatchError {
     /// identity box `[-1]` of a deeper inlined / recursive frame). Building
     /// the snapshot would trip the `build_vable_snapshot_boxes`
     /// `OpRef::ty()` invariant. The full-body walk surfaces a typed abort so
-    /// the driver maps it to `TraceAction::Abort` → trait fallback instead
+    /// the driver maps it to `TraceAction::Abort` and interpretation instead
     /// of panicking the tracer. Resuming such a guard needs the multi-frame
     /// vable snapshot machinery (task #124).
     GuardSnapshotVableUntyped { pc: usize },
@@ -1351,8 +1350,8 @@ pub enum DispatchError {
     /// guard).  Unlike [`BranchGuardKeptStackUnsupported`], this shape is
     /// miscompiled the SAME way by BOTH the full-body walk and the trait
     /// leg (both re-execute the identical not-taken arm on deopt), so a
-    /// recoverable [`TraceAction::Abort`] that re-routes to the trait leg
-    /// only crashes there too.  The driver maps this to
+    /// recoverable [`TraceAction::Abort`] would retry the unsound shape.
+    /// The driver maps this to
     /// `TraceAction::AbortPermanent` → `DONT_TRACE_HERE`: the loop runs in
     /// the interpreter (correct, matching the pre-#416/#420 decline) and is
     /// never retraced by either leg.
@@ -1379,7 +1378,7 @@ pub enum DispatchError {
     /// slower than interpreting.  The trait tracer inlines such callees via
     /// `push_inline_frame` + the `recursive-call-assembler` loop back-edge
     /// (`pyjitpl.rs` opimpl_recursive_call_assembler).  Surface a typed
-    /// abort so the key routes to the trait leg (`FBW_DECLINED_KEYS`) until
+    /// abort so the key interprets without JIT (`FBW_DECLINED_KEYS`) until
     /// the walker itself covers loop-callee inlining (task #62, the Phase-6
     /// convergence).
     LoopBearingCalleeInlineUnsupported { pc: usize },
@@ -3796,11 +3795,10 @@ pub fn dispatch_via_miframe_at_opcode_entry<'a>(
             concrete_registers_i: &mut concrete_i,
             descr_refs,
             raw_descrs: RawDescrPool::Global,
-            // The per-opcode arm walk is the sole concrete-execution
-            // leg for the traced iteration: `eval_loop_jit` /
-            // `eval_loop_jit_bridge` return the walk's terminal outcome
-            // (`jit_merge_point_hook` → `Some`) without re-running
-            // `execute_opcode_step`, so nothing else applies the arm's
+            // The per-opcode arm walk is the sole concrete-execution leg for
+            // the traced iteration: the synchronous marker walk returns its
+            // terminal outcome without re-running `execute_opcode_step`, so
+            // nothing else applies the arm's
             // residual-call effects.  Tracing executes as it records
             // (`pyjitpl.py:1995 do_residual_call` →
             // `executor.execute_varargs`).
@@ -5981,8 +5979,7 @@ fn try_fold_pure_call_via_executor(
 /// concrete-NULL Ref argument — the specialized direct-call shape whose
 /// baked `ptr(0x0)` (the `PUSH_NULL` self-slot) makes the runtime call pass
 /// NULL where the callee entry expects its globals/closure, yielding a NULL
-/// result (closures / locals-bound callees called in a loop).  Matches the
-/// trait tracer, which declines this shape and aborts.  See
+/// result (closures / locals-bound callees called in a loop). See
 /// [`DispatchError::MayForceNullRefArgUnsupported`].
 fn walker_abort_if_mayforce_null_ref_arg(
     call_opcode: OpCode,
@@ -6132,9 +6129,8 @@ pub fn bool_box_truth_reset() {
 /// without dragging in a `MetaInterp` seam.
 ///
 /// **Why this exists**: the walk is the sole execution leg for the
-/// traced iteration — `eval_loop_jit` returns the walk's terminal
-/// outcome (`jit_merge_point_hook` → `Some`) without re-running
-/// `execute_opcode_step`.  For opcodes whose body contains a
+/// traced iteration — the synchronous marker walk returns its terminal
+/// outcome without re-running `execute_opcode_step`. For opcodes whose body contains a
 /// non-elidable `residual_call_*` (`store_subscr_fn` /
 /// `set_current_exception` / etc.), the helper is never invoked → heap
 /// mutation never happens → next read derefs stale container → SIGBUS
@@ -8194,7 +8190,7 @@ impl Drop for InlineFrameGuard<'_> {
 }
 
 /// `PYRE_FBW_INLINE_MULTIFRAME` (#68): inline branch-bearing callees with a
-/// multi-frame guard snapshot, instead of declining them to the trait leg
+/// multi-frame guard snapshot instead of declining them to interpretation
 /// (`LoopBearingCalleeInlineUnsupported`).  Default-on; `PYRE_FBW_INLINE_MULTIFRAME=0`
 /// (or `false`) is the rollback escape hatch.  The multi-frame snapshot
 /// encode↔decode contract for walker-emitted callee-frame guards is validated
@@ -8253,7 +8249,7 @@ pub(crate) fn fbw_rec_mutual_cutover_enabled() -> bool {
 /// callee's own `jit_merge_point` and a compiled loop token already exists
 /// for that green key, emit a `CALL_ASSEMBLER` into it (mirror of
 /// `opimpl_recursive_call_assembler`) instead of declining the enclosing
-/// trace to the trait leg (`JitMergePointGreenKeyUnresolved`). Default-ON;
+/// trace (`JitMergePointGreenKeyUnresolved`). Default-ON;
 /// `=0`/`false` opts out.
 ///
 /// The default-ON flip rides the same CALL_ASSEMBLER / residual-executor /
@@ -9665,9 +9661,8 @@ pub(crate) fn fbw_abort_carrier_clear() {
 /// applied, so the first compiled iteration is half-applied — one
 /// iteration's contribution silently dropped (#68 depth-2 multiframe:
 /// `s = s + outer(i)` lands short by exactly `outer(N+1)` because the
-/// nested callee's residual never ran).  Decline the enclosing trace to the
-/// trait leg (which inlines the callee via `push_inline_frame` and applies
-/// every iteration exactly once) instead.  At top level (no active inline)
+/// nested callee's residual never ran). Decline the enclosing trace to
+/// interpretation instead. At top level (no active inline)
 /// the unjournaled-effect / legacy-replay path is sound, so only abort when
 /// nested.
 thread_local! {
@@ -11853,7 +11848,7 @@ fn walker_capture_inline_nonstandard_vable_guard(
     }
     // Same buildability precondition as `walker_capture_snapshot_for_last_guard`:
     // every virtualizable box must carry `OpRef::ty()` or the snapshot
-    // encoder panics — abort to the trait path instead.
+    // encoder panics — abort to interpretation instead.
     if !ctx.trace_ctx.vable_snapshot_buildable() {
         return Err(DispatchError::GuardSnapshotVableUntyped { pc: op_pc });
     }
@@ -11899,7 +11894,7 @@ fn walker_capture_snapshot_for_last_guard_impl(
     // not panic.  `build_vable_snapshot_boxes` requires every virtualizable
     // box (including the identity at `[-1]`) to carry `OpRef::ty()`; a
     // deeper inlined / recursive frame can leave the identity untyped.
-    // Surface a typed abort → trait fallback rather than tripping the
+    // Surface a typed abort rather than tripping the
     // invariant panic (the multi-frame vable snapshot is task #124).
     if !ctx.trace_ctx.vable_snapshot_buildable() {
         return Err(DispatchError::GuardSnapshotVableUntyped { pc: op_pc });
@@ -14341,7 +14336,7 @@ fn method_form_callee_body_supported(body_code: &[u8], callee_descr_refs: &[Desc
 /// wrote (`OpRef::NONE` — e.g. a static-ref operand-stack slot that trace-time
 /// int-specialization left only in the int bank, or a py_pc↔jit_pc round-trip
 /// landing on a different liveness window) cannot be sourced, so return `Err`
-/// to abort the multi-frame inline and fall back to the trait leg rather than
+/// to abort the multi-frame inline and interpret rather than
 /// encode a NONE box.  `PYRE_FBW_MF_DIAG` dumps the missing color.
 fn collect_callee_active_boxes(
     regs_i: &[OpRef],
@@ -15225,8 +15220,7 @@ fn try_walker_inline_user_call(
     // vable) cannot be served by the fast-path register seeding.  Emitting
     // the residual leaves it re-interpreted per iteration and lets its short
     // inner loops compile + deopt-storm — strictly slower than interpreting.
-    // The trait leg inlines such callees via `push_inline_frame` +
-    // `recursive-call-assembler`, so route the enclosing key there
+    // Decline the enclosing key to interpretation
     // (`FBW_DECLINED_KEYS`) instead of recording the slow residual.
     // Resolve the callee's own portal frame register up-front so both the
     // strict predicate (own-frame vable acceptance) and the multiframe gate
@@ -15310,7 +15304,7 @@ fn try_walker_inline_user_call(
         );
     if !strict_inlinable && !try_multiframe {
         // A non-self-recursive loop/branch callee that neither the strict nor
-        // the multiframe fast path can serve declines to the trait leg
+        // the multiframe fast path can serve declines to interpretation
         // (`FBW_DECLINED_KEYS`).  Self-recursive calls were already routed to
         // the `CALL_ASSEMBLER` fold or plain residual path above (`Ok(None)`).
         //
@@ -15470,7 +15464,7 @@ fn try_walker_inline_user_call(
             // (`collect_callee_active_boxes` would read a stale/mismatched box), so
             // the encoded liveness stream disagrees with the decoder
             // (`resume.rs decode_ref: unexpected tag`) and the caller frame is
-            // corrupted.  Decline to the ordinary residual call (trait leg) until
+            // corrupted. Decline to the ordinary residual call until
             // the multi-frame resume reboxes int-specialized identity operands.
             // POP_JUMP_IF_TRUE/FALSE stay inlinable: their `bool` truth folds in the
             // int bank, so no Ref rebox is needed.  A strict straight-line callee
@@ -15595,8 +15589,8 @@ fn try_walker_inline_user_call(
     // paused caller frame on the framestack so its in-callee guards
     // snapshot both frames.  Compute it here, while the caller's live register
     // banks (`ctx.registers_*`) are still in scope — at guard-capture time the
-    // walk context is the callee's.  A caller frame that is not snapshot-able
-    // (try-block catch marker / missing liveness) declines to the trait leg.
+    // walk context is the callee's. A caller frame that is not snapshot-able
+    // (try-block catch marker / missing liveness) declines to interpretation.
     let parent_frame = if try_multiframe {
         match compute_inline_caller_frame(ctx, op.pc) {
             Ok(pf) => Some(pf),
@@ -18152,7 +18146,7 @@ fn try_walker_specialize_truediv_op_long(
 /// trait path's `W_SpecialisedTupleObject_ii` value0/value1 reads.  Returns
 /// `Ok(Some(()))` when folded (the caller returns `Continue`); `Ok(None)` to
 /// fall through to the opaque residual record, which stays correct for any
-/// other shape — so a non-foldable sequence is NOT declined to the trait leg.
+/// other shape — so a non-foldable sequence is not declined.
 #[allow(clippy::too_many_arguments)]
 fn try_walker_specialize_unpack(
     ctx: &mut WalkContext<'_, '_>,
@@ -19074,7 +19068,7 @@ fn try_walker_specialize_newlist(
 /// Returns `Ok(Some(()))` when folded (the caller returns `Continue`);
 /// `Ok(None)` to fall through to the opaque residual, which stays correct
 /// for any other shape (object tuple, arity ≠ 2, long element, cache miss)
-/// — so a non-foldable build is NOT declined to the trait leg.
+/// — so a non-foldable build is not declined.
 fn try_walker_specialize_newtuple(
     ctx: &mut WalkContext<'_, '_>,
     op_pc: usize,
@@ -25580,7 +25574,7 @@ fn handle(
                     // multi-frame inline sub-walk the callee's own
                     // `jit_merge_point` (its loop header) carries a pycode green
                     // with no live Ref shadow, so this resolution fails and the
-                    // enclosing trace would decline to the trait leg. Recover
+                    // enclosing trace would decline. Recover
                     // the callee code from the FBW inline stack; if a compiled
                     // loop token already exists for (callee_code, next_instr),
                     // surface a recursive CALL_ASSEMBLER request to the caller's
