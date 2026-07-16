@@ -31,6 +31,19 @@ impl crate::lltype::GcType for W_BytearrayObject {
     const SIZE: usize = W_BYTEARRAY_OBJECT_SIZE;
 }
 
+/// Free the off-GC byte buffer owned by a `W_BytearrayObject`.
+///
+/// # Safety
+/// `obj` must point at a valid `W_BytearrayObject` whose `data` Box is not
+/// aliased by another owner.
+pub unsafe fn w_bytearray_dealloc(obj: PyObjectRef) {
+    let raw = unsafe { &mut *(obj as *mut W_BytearrayObject) };
+    if !raw.data.is_null() {
+        unsafe { drop(Box::from_raw(raw.data)) };
+        raw.data = std::ptr::null_mut();
+    }
+}
+
 /// Allocate a new bytearray filled with zeros.
 pub fn w_bytearray_new(size: usize) -> PyObjectRef {
     let data = crate::lltype::malloc_raw(vec![0u8; size]);

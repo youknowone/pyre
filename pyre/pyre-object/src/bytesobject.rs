@@ -34,6 +34,19 @@ impl crate::lltype::GcType for W_BytesObject {
     const SIZE: usize = W_BYTES_OBJECT_SIZE;
 }
 
+/// Free the off-GC byte buffer owned by a `W_BytesObject`.
+///
+/// # Safety
+/// `obj` must point at a valid `W_BytesObject` whose `data` Box is not
+/// aliased by another owner.
+pub unsafe fn w_bytes_dealloc(obj: PyObjectRef) {
+    let raw = unsafe { &mut *(obj as *mut W_BytesObject) };
+    if !raw.data.is_null() {
+        unsafe { drop(Box::from_raw(raw.data as *mut Vec<u8>)) };
+        raw.data = std::ptr::null();
+    }
+}
+
 /// Allocate a new bytes object from a byte slice.
 ///
 /// Allocates the `W_BytesObject` via `malloc_typed` (`NewWithVtable`) which

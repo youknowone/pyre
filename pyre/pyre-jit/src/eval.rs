@@ -478,6 +478,30 @@ unsafe fn module_dict_object_destructor(obj_addr: usize) {
     unsafe { pyre_object::dictmultiobject::w_module_dict_dealloc_storage(obj) };
 }
 
+/// Reclaim the off-GC byte buffer of a swept bytes object.
+unsafe fn bytes_object_destructor(obj_addr: usize) {
+    let obj = obj_addr as pyre_object::PyObjectRef;
+    unsafe { pyre_object::bytesobject::w_bytes_dealloc(obj) };
+}
+
+/// Reclaim the off-GC byte buffer of a swept bytearray object.
+unsafe fn bytearray_object_destructor(obj_addr: usize) {
+    let obj = obj_addr as pyre_object::PyObjectRef;
+    unsafe { pyre_object::bytearrayobject::w_bytearray_dealloc(obj) };
+}
+
+/// Reclaim the off-GC item container of a swept set object.
+unsafe fn set_object_destructor(obj_addr: usize) {
+    let obj = obj_addr as pyre_object::PyObjectRef;
+    unsafe { pyre_object::setobject::w_set_dealloc_items(obj) };
+}
+
+/// Reclaim the off-GC name string of a swept function object.
+unsafe fn function_object_destructor(obj_addr: usize) {
+    let obj = obj_addr as pyre_object::PyObjectRef;
+    unsafe { pyre_interpreter::function::function_dealloc_name(obj) };
+}
+
 /// Custom trace for `W_ObjectObject` (instance `map`+`storage`,
 /// `mapdict.py:907-910`).  The `storage` list is an off-GC
 /// `Box<Vec<PyObjectRef>>`, so — exactly as `dict_object_custom_trace`
@@ -1298,11 +1322,14 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     // (`pypy/interpreter/function.py:706 BuiltinFunction`) but its
     // instances are the same Rust struct, so the vtable map sends
     // both PyTypes to `function_tid`.
-    let function_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
-        std::mem::size_of::<pyre_interpreter::function::Function>(),
-        object_tid,
-        pyre_interpreter::function::FUNCTION_GC_PTR_OFFSETS.to_vec(),
-    ));
+    let function_tid = gc.register_type(
+        TypeInfo::object_subclass_with_gc_ptrs(
+            std::mem::size_of::<pyre_interpreter::function::Function>(),
+            object_tid,
+            pyre_interpreter::function::FUNCTION_GC_PTR_OFFSETS.to_vec(),
+        )
+        .with_destructor_fn(function_object_destructor),
+    );
     debug_assert_eq!(function_tid, FUNCTION_GC_TYPE_ID);
     majit_gc::GcAllocator::register_vtable_for_type(
         &mut gc,
@@ -1422,10 +1449,13 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     // `PyObjectRef`. Pre-registered with `object_subclass(size, ...)`
     // so the foreign-pytype loop's `sizeof(PyObject)` approximation
     // does not under-count the payload.
-    let w_bytes_tid = gc.register_type(TypeInfo::object_subclass(
-        std::mem::size_of::<pyre_object::bytesobject::W_BytesObject>(),
-        object_tid,
-    ));
+    let w_bytes_tid = gc.register_type(
+        TypeInfo::object_subclass(
+            std::mem::size_of::<pyre_object::bytesobject::W_BytesObject>(),
+            object_tid,
+        )
+        .with_destructor_fn(bytes_object_destructor),
+    );
     debug_assert_eq!(w_bytes_tid, W_BYTES_GC_TYPE_ID);
     majit_gc::GcAllocator::register_vtable_for_type(
         &mut gc,
@@ -1439,10 +1469,13 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     // W_BytearrayObject (mutable byte sequence) carries a raw
     // `*mut Vec<u8>` (`data`). Same registration shape as
     // W_BytesObject.
-    let w_bytearray_tid = gc.register_type(TypeInfo::object_subclass(
-        std::mem::size_of::<pyre_object::bytearrayobject::W_BytearrayObject>(),
-        object_tid,
-    ));
+    let w_bytearray_tid = gc.register_type(
+        TypeInfo::object_subclass(
+            std::mem::size_of::<pyre_object::bytearrayobject::W_BytearrayObject>(),
+            object_tid,
+        )
+        .with_destructor_fn(bytearray_object_destructor),
+    );
     debug_assert_eq!(w_bytearray_tid, W_BYTEARRAY_GC_TYPE_ID);
     majit_gc::GcAllocator::register_vtable_for_type(
         &mut gc,
@@ -1475,11 +1508,14 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     // W_SetObject carries `items: *mut IndexMap<ObjectKey, ()>`. Register a
     // custom trace hook so GC forwarding updates indirect key object slots.
     // Both `set` and `frozenset` PyTypes share this Rust struct/tid.
-    let w_set_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
-        std::mem::size_of::<pyre_object::setobject::W_SetObject>(),
-        object_tid,
-        set_object_custom_trace,
-    ));
+    let w_set_tid = gc.register_type(
+        TypeInfo::object_subclass_with_custom_trace(
+            std::mem::size_of::<pyre_object::setobject::W_SetObject>(),
+            object_tid,
+            set_object_custom_trace,
+        )
+        .with_destructor_fn(set_object_destructor),
+    );
     debug_assert_eq!(w_set_tid, W_SET_GC_TYPE_ID);
     majit_gc::GcAllocator::register_vtable_for_type(
         &mut gc,

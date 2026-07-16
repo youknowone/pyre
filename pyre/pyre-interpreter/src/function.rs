@@ -20,7 +20,7 @@ pub static BUILTIN_FUNCTION_TYPE: PyType = pyre_object::pyobject::new_pytype("bu
 ///   function.py:47 — `_immutable_fields_ = ['code?', ...]`
 /// - `can_change_code`: function.py:33 — True by default; False for
 ///   `FunctionWithFixedCode` subclass (used by builtins).
-/// - `name_ptr`: leaked `Box<String>` containing the function name
+/// - `name_ptr`: off-GC `Box<String>` containing the function name
 /// - `closure`:  tuple of cell objects, or PY_NULL if no closure
 /// - `w_func_globals_obj`: the module namespace dict object (`__globals__`)
 #[repr(C)]
@@ -32,7 +32,7 @@ pub struct Function {
     /// function.py:33 — `can_change_code = True`
     /// False for FunctionWithFixedCode subclass.
     pub can_change_code: bool,
-    /// Function name (leaked Box<String>).
+    /// Function name (off-GC Box<String>).
     pub name: *const String,
     /// Closure: tuple of cell objects from the enclosing scope,
     /// or PY_NULL if this function has no free variables.
@@ -273,10 +273,23 @@ impl pyre_object::lltype::GcType for Function {
     const SIZE: usize = FUNCTION_OBJECT_SIZE;
 }
 
+/// Free the off-GC name string owned by a `Function`.
+///
+/// # Safety
+/// `obj` must point at a valid `Function` whose `name` Box is not aliased by
+/// another owner.
+pub unsafe fn function_dealloc_name(obj: PyObjectRef) {
+    let raw = unsafe { &mut *(obj as *mut Function) };
+    if !raw.name.is_null() {
+        unsafe { drop(Box::from_raw(raw.name as *mut String)) };
+        raw.name = std::ptr::null();
+    }
+}
+
 /// Allocate a new `Function`.
 ///
 /// `code` is a pointer to a Code object (PyCode) cast to `*const ()`.
-/// `name` is the function name string (leaked).
+/// `name` is the function name string stored in an off-GC Box.
 /// `w_func_globals_obj` is the defining module's namespace dict object
 /// (shared), or `PY_NULL` for a globals-less carrier.
 pub fn function_new(code: *const (), name: String, w_func_globals_obj: PyObjectRef) -> PyObjectRef {

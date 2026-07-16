@@ -39,6 +39,19 @@ impl crate::lltype::GcType for W_SetObject {
     const SIZE: usize = W_SET_OBJECT_SIZE;
 }
 
+/// Free the off-GC item container owned by a `W_SetObject`.
+///
+/// # Safety
+/// `obj` must point at a valid `W_SetObject` whose `items` Box is not aliased
+/// by another owner.
+pub unsafe fn w_set_dealloc_items(obj: PyObjectRef) {
+    let raw = &mut *(obj as *mut W_SetObject);
+    if !raw.items.is_null() {
+        drop(Box::from_raw(raw.items));
+        raw.items = std::ptr::null_mut();
+    }
+}
+
 #[inline]
 pub unsafe fn is_set(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &SET_TYPE) }
