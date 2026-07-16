@@ -134,6 +134,11 @@ fn fbw_bridge_decline(ctx: &TraceCtx) {
     }
 }
 
+fn p2_drain_abort(ctx: &TraceCtx) -> TraceAction {
+    fbw_bridge_decline(ctx);
+    TraceAction::Abort
+}
+
 pub fn take_fbw_bridge_declined() -> bool {
     FBW_BRIDGE_DECLINED.with(|c| c.replace(false))
 }
@@ -994,7 +999,7 @@ fn drive_bridge_carrier_walk(
     }
     let Some(recipe) = carrier.recipes.last() else {
         crate::jitcode_dispatch::census_record("P2Drain::NoRecipes");
-        return TraceAction::Abort;
+        return p2_drain_abort(ctx);
     };
 
     let pre_pos = ctx.get_trace_position();
@@ -1008,12 +1013,12 @@ fn drive_bridge_carrier_walk(
     else {
         ctx.cut_trace(pre_pos);
         crate::jitcode_dispatch::census_record("P2Drain::SetupFailed");
-        return TraceAction::Abort;
+        return p2_drain_abort(ctx);
     };
     let Some(callee_pjc) = crate::state::pyjitcode_for_code(recipe.code_ptr) else {
         ctx.cut_trace(pre_pos);
         crate::jitcode_dispatch::census_record("P2Drain::NoCalleePjc");
-        return TraceAction::Abort;
+        return p2_drain_abort(ctx);
     };
     let entry = select_recipe_entry(
         recipe.jitcode_index,
@@ -1023,7 +1028,7 @@ fn drive_bridge_carrier_walk(
     let Some(entry) = entry else {
         ctx.cut_trace(pre_pos);
         crate::jitcode_dispatch::census_record("P2Drain::NoCalleeEntry");
-        return TraceAction::Abort;
+        return p2_drain_abort(ctx);
     };
     let callee_w_globals = crate::state::recover_inline_callee_globals(recipe.code_ptr) as usize;
     // The reconstructed callee's local slot concretes (`recipe.concrete_r` is
@@ -1117,7 +1122,7 @@ fn drive_bridge_carrier_walk(
     // pre-walk heap rather than dropping the journals (which would leave every
     // eager store standing to be applied a second time).
     crate::jitcode_dispatch::fbw_store_journal_rollback();
-    TraceAction::Abort
+    p2_drain_abort(ctx)
 }
 
 /// Shape A orthodox multi-frame bridge resume: the escape-hatch driver for a
