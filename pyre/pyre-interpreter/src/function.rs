@@ -2001,74 +2001,157 @@ pub unsafe fn descr_method__new__(
     _subtype: PyObjectRef,
     w_function: PyObjectRef,
     w_instance: PyObjectRef,
-    w_class: PyObjectRef,
-) -> PyObjectRef {
+) -> Result<PyObjectRef, crate::PyError> {
     let _ = _subtype;
-    if w_function.is_null() {
-        pyre_object::w_none()
-    } else {
-        pyre_object::w_method_new(w_function, w_instance, w_class)
+    if w_function.is_null() || !crate::baseobjspace::callable_w(w_function) {
+        return Err(crate::PyError::type_error(
+            "first argument must be callable",
+        ));
     }
+    if w_instance.is_null() || unsafe { pyre_object::is_none(w_instance) } {
+        return Err(crate::PyError::type_error("instance must not be None"));
+    }
+    let w_class = crate::typedef::r#type(w_instance).unwrap_or(pyre_object::PY_NULL);
+    Ok(pyre_object::w_method_new(w_function, w_instance, w_class))
 }
 
 #[inline]
 pub unsafe fn descr_method_get(
-    _func: PyObjectRef,
+    method: PyObjectRef,
     obj: PyObjectRef,
     cls: PyObjectRef,
-) -> PyObjectRef {
-    let _ = _func;
-    if obj.is_null() || unsafe { pyre_object::is_none(obj) } {
-        _func
+) -> Result<PyObjectRef, crate::PyError> {
+    let obj_is_none = obj.is_null() || unsafe { pyre_object::is_none(obj) };
+    let cls_is_none = cls.is_null() || unsafe { pyre_object::is_none(cls) };
+    if obj_is_none && cls_is_none {
+        return Err(crate::PyError::type_error("__get__(None, None) is invalid"));
+    }
+    Ok(method)
+}
+
+#[inline]
+pub fn descr_method_call(args: &[PyObjectRef]) -> crate::PyResult {
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let method = positional.first().copied().unwrap_or(pyre_object::PY_NULL);
+    let call_args = positional.get(1..).unwrap_or(&[]);
+    if !crate::builtins::has_real_kwargs(kwargs) {
+        return crate::call::call_function_impl_result(method, call_args);
+    }
+    let keyword_args: Vec<(rustpython_wtf8::Wtf8Buf, PyObjectRef)> = unsafe {
+        pyre_object::w_dict_str_entries(kwargs.unwrap())
+            .into_iter()
+            .filter(|(name, _)| name != "__pyre_kw__")
+            .map(|(name, value)| (rustpython_wtf8::Wtf8Buf::from_string(name), value))
+            .collect()
+    };
+    crate::eval::CURRENT_FRAME.with(|current| {
+        let frame = current.get();
+        if frame.is_null() {
+            return Err(crate::PyError::runtime_error(
+                "method call has no current frame",
+            ));
+        }
+        crate::call::call_with_kwargs(unsafe { &mut *frame }, method, call_args, &keyword_args)
+    })
+}
+
+#[inline]
+pub unsafe fn descr_method_eq(
+    this: PyObjectRef,
+    other: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    if !unsafe { pyre_object::is_method(other) } {
+        return Ok(pyre_object::special::w_not_implemented());
+    }
+    let funcs_equal =
+        crate::baseobjspace::eq_w(unsafe { pyre_object::w_method_get_func(this) }, unsafe {
+            pyre_object::w_method_get_func(other)
+        })?;
+    let selves_identical =
+        unsafe { pyre_object::w_method_get_self(this) == pyre_object::w_method_get_self(other) };
+    Ok(pyre_object::w_bool_from(funcs_equal && selves_identical))
+}
+
+#[inline]
+pub unsafe fn descr_method_ne(
+    this: PyObjectRef,
+    other: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    let equal = unsafe { descr_method_eq(this, other)? };
+    if unsafe { pyre_object::is_not_implemented(equal) } {
+        Ok(equal)
     } else {
-        let owner = if cls.is_null() {
-            pyre_object::w_none()
-        } else {
-            cls
-        };
-        pyre_object::w_method_new(_func, obj, owner)
+        Ok(pyre_object::w_bool_from(!unsafe {
+            pyre_object::w_bool_get_value(equal)
+        }))
     }
 }
 
 #[inline]
-pub unsafe fn descr_method_call(obj: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {
-    if args.is_empty() {
-        call_obj_args(obj, pyre_object::w_none(), args)
-    } else {
-        call_obj_args(obj, args[0], &args[1..])
+pub unsafe fn descr_method_repr(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    let function = unsafe { pyre_object::w_method_get_func(obj) };
+    let instance = unsafe { pyre_object::w_method_get_self(obj) };
+    let w_name = match crate::baseobjspace::getattr_str(function, "__qualname__") {
+        Ok(value) => Some(value),
+        Err(err) if err.kind == crate::PyErrorKind::AttributeError => {
+            match crate::baseobjspace::getattr_str(function, "__name__") {
+                Ok(value) => Some(value),
+                Err(err) if err.kind == crate::PyErrorKind::AttributeError => None,
+                Err(err) => return Err(err),
+            }
+        }
+        Err(err) => return Err(err),
+    };
+    let name = w_name
+        .filter(|&value| unsafe { pyre_object::is_str(value) })
+        .and_then(|value| unsafe { pyre_object::w_str_get_value_opt(value) })
+        .unwrap_or("?");
+    let instance_repr = unsafe { crate::display::py_repr(instance)? };
+    Ok(pyre_object::w_str_new(&format!(
+        "<bound method {name} of {instance_repr}>"
+    )))
+}
+
+#[inline]
+pub unsafe fn descr_method_getattribute(
+    obj: PyObjectRef,
+    name: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    let Some(name) = (unsafe { pyre_object::w_str_get_value_opt(name) }) else {
+        return Err(crate::PyError::type_error("attribute name must be string"));
+    };
+    // function.py:604-614 — method attributes win, except `__doc__`;
+    // an AttributeError falls back to the wrapped function.
+    if name != "__doc__" {
+        match crate::baseobjspace::object_getattribute(obj, name) {
+            Ok(value) => return Ok(value),
+            Err(err) if err.kind == crate::PyErrorKind::AttributeError => {}
+            Err(err) => return Err(err),
+        }
     }
+    let function = unsafe { pyre_object::w_method_get_func(obj) };
+    crate::baseobjspace::getattr_str(function, name)
 }
 
 #[inline]
-pub unsafe fn descr_method_eq(_self: PyObjectRef, other: PyObjectRef) -> bool {
-    _self == other
+pub unsafe fn descr_method_hash(obj: PyObjectRef) -> Result<i64, crate::PyError> {
+    let function = unsafe { pyre_object::w_method_get_func(obj) };
+    let instance = unsafe { pyre_object::w_method_get_self(obj) };
+    let x = pyre_object::gc_hook::gc_identity_hash(instance as usize) as i64;
+    let y = crate::baseobjspace::hash_w_strict(function)?;
+    let value = x ^ y;
+    Ok(if value == -1 { -2 } else { value })
 }
 
 #[inline]
-pub unsafe fn descr_method_ne(_self: PyObjectRef, other: PyObjectRef) -> bool {
-    _self != other
-}
-
-#[inline]
-pub unsafe fn descr_method_repr(obj: PyObjectRef) -> PyObjectRef {
-    pyre_object::w_str_new(&format!("method {obj:?}"))
-}
-
-#[inline]
-pub unsafe fn descr_method_getattribute(obj: PyObjectRef, _name: PyObjectRef) -> PyObjectRef {
-    let _ = _name;
-    obj
-}
-
-#[inline]
-pub unsafe fn descr_method_hash(_self: PyObjectRef) -> isize {
-    _self as isize
-}
-
-#[inline]
-pub unsafe fn descr_method__reduce__(_obj: PyObjectRef) -> PyObjectRef {
-    let _ = _obj;
-    pyre_object::w_tuple_new(vec![pyre_object::w_str_new("method")])
+pub unsafe fn descr_method__reduce__(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    let function = unsafe { pyre_object::w_method_get_func(obj) };
+    let instance = unsafe { pyre_object::w_method_get_self(obj) };
+    let name = crate::baseobjspace::getattr_str(function, "__name__")?;
+    Ok(pyre_object::w_tuple_new(vec![
+        crate::baseobjspace::builtin_callable("getattr"),
+        pyre_object::w_tuple_new(vec![instance, name]),
+    ]))
 }
 
 #[inline]

@@ -4857,6 +4857,22 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 return Ok(w_str_new(crate::typedef::PROPERTY_DOC));
             }
             if name == "__doc__"
+                && std::ptr::eq(
+                    obj,
+                    crate::typedef::gettypeobject(&crate::function::FUNCTION_TYPE),
+                )
+            {
+                return Ok(w_str_new(crate::typedef::FUNCTION_DOC));
+            }
+            if name == "__doc__"
+                && std::ptr::eq(
+                    obj,
+                    crate::typedef::gettypeobject(&pyre_object::function::METHOD_TYPE),
+                )
+            {
+                return Ok(w_str_new(crate::typedef::METHOD_DOC));
+            }
+            if name == "__doc__"
                 || name == "__code__"
                 || name == "__func__"
                 || name == "__self__"

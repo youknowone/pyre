@@ -8627,13 +8627,22 @@ fn init_function_type(ns: PyObjectRef) {
                 // as a plain function rather than a bound method.
                 let cls_is_none = unsafe { w_cls.is_null() || pyre_object::is_none(w_cls) };
                 let obj_is_none = unsafe { w_obj.is_null() || pyre_object::is_none(w_obj) };
-                let cls_is_none_type = std::ptr::eq(w_cls, gettypeobject(&pyre_object::NONE_TYPE));
-                let asking_for_function = cls_is_none || (obj_is_none && !cls_is_none_type);
-                if asking_for_function {
+                // Python 3.14 `func_descr_get`: omitting `type` is equivalent
+                // to passing None, but `__get__(None, None)` is invalid.
+                if obj_is_none && cls_is_none {
+                    return Err(crate::PyError::type_error("__get__(None, None) is invalid"));
+                }
+                if obj_is_none {
                     Ok(w_function)
                 } else {
-                    // function.py:470  Method(space, w_function, w_obj, w_cls)
-                    Ok(pyre_object::w_method_new(w_function, w_obj, w_cls))
+                    // function.py:470 Method(space, w_function, w_obj, w_cls),
+                    // with CPython's inferred owner when `type` is omitted.
+                    let owner = if cls_is_none {
+                        r#type(w_obj).unwrap_or(pyre_object::PY_NULL)
+                    } else {
+                        w_cls
+                    };
+                    Ok(pyre_object::w_method_new(w_function, w_obj, owner))
                 }
             }),
         )
@@ -8951,6 +8960,59 @@ fn init_builtin_code_type(ns: PyObjectRef) {
 }
 
 fn init_method_type(ns: PyObjectRef) {
+    // typedef.py:833-848 Method.typedef, completed with CPython 3.14's
+    // ordering wrappers. Bound methods carry one wrapped callable and one
+    // bound instance; every operation below reads those two typed fields.
+    let doc_getter = make_builtin_function_with_arity(
+        "__doc__",
+        |args| {
+            let method = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+            let function = unsafe { pyre_object::w_method_get_func(method) };
+            crate::baseobjspace::getattr_str(function, "__doc__")
+        },
+        2,
+    );
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__doc__",
+            make_getset_descriptor(doc_getter),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__new__",
+            make_new_descr(|args| {
+                if args.len() != 3 {
+                    return Err(crate::PyError::type_error(format!(
+                        "method expected 2 arguments, got {}",
+                        args.len().saturating_sub(1),
+                    )));
+                }
+                crate::function::descr_method__new__(args[0], args[1], args[2])
+            }),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__call__",
+            make_builtin_function("__call__", crate::function::descr_method_call),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__get__",
+            make_builtin_function("__get__", |args| unsafe {
+                let method = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                let obj = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+                let cls = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
+                crate::function::descr_method_get(method, obj, cls)
+            }),
+        )
+    };
     // typedef.py:839-840 ─
     //   __func__ = interp_attrproperty_w('w_function', cls=Method),
     //   __self__ = interp_attrproperty_w('w_instance', cls=Method),
@@ -9004,6 +9066,89 @@ fn init_method_type(ns: PyObjectRef) {
             ns,
             "__self__",
             make_getset_descriptor(self_getter),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__getattribute__",
+            make_builtin_function_with_arity(
+                "__getattribute__",
+                |args| unsafe { crate::function::descr_method_getattribute(args[0], args[1]) },
+                2,
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__eq__",
+            make_builtin_function_with_arity(
+                "__eq__",
+                |args| unsafe { crate::function::descr_method_eq(args[0], args[1]) },
+                2,
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__ne__",
+            make_builtin_function_with_arity(
+                "__ne__",
+                |args| unsafe { crate::function::descr_method_ne(args[0], args[1]) },
+                2,
+            ),
+        )
+    };
+    for name in ["__lt__", "__le__", "__gt__", "__ge__"] {
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                make_builtin_function_with_arity(
+                    name,
+                    |_args| Ok(pyre_object::special::w_not_implemented()),
+                    2,
+                ),
+            )
+        };
+    }
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__hash__",
+            make_builtin_function_with_arity(
+                "__hash__",
+                |args| unsafe {
+                    Ok(pyre_object::w_int_new(crate::function::descr_method_hash(
+                        args[0],
+                    )?))
+                },
+                1,
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__repr__",
+            make_builtin_function_with_arity(
+                "__repr__",
+                |args| unsafe { crate::function::descr_method_repr(args[0]) },
+                1,
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__reduce__",
+            make_builtin_function_with_arity(
+                "__reduce__",
+                |args| unsafe { crate::function::descr_method__reduce__(args[0]) },
+                1,
+            ),
         )
     };
 }
@@ -10104,6 +10249,27 @@ fn init_classmethod_type(ns: PyObjectRef) {
         unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
     }
 }
+
+/// CPython 3.14 `PyFunction_Type.tp_doc`. The instance `__doc__` getset
+/// occupies the function type dictionary's key, so exact type access is
+/// served separately by `baseobjspace`, as for property.
+pub(crate) const FUNCTION_DOC: &str = r#"Create a function object.
+
+  code
+    a code object
+  globals
+    the globals dictionary
+  name
+    a string that overrides the name from the code object
+  argdefs
+    a tuple that specifies the default argument values
+  closure
+    a tuple that supplies the bindings for free variables
+  kwdefaults
+    a dictionary that specifies the default keyword argument values"#;
+
+/// CPython 3.14 `PyMethod_Type.tp_doc`.
+pub(crate) const METHOD_DOC: &str = "Create a bound instance method object.";
 
 /// CPython 3.14 `PyProperty_Type.tp_doc`.  The instance-level `__doc__`
 /// descriptor occupies the same type-dict key; `baseobjspace` serves this
