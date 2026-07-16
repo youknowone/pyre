@@ -5688,34 +5688,6 @@ fn spill_ref_roots(
     }
 }
 
-/// RPython regalloc keeps many REF boxes frame-resident after
-/// `_sync_var_to_stack` / `_bc_spill`.  When Cranelift has already
-/// written a ref box to its jitframe root slot, re-storing it before a
-/// CALL_ASSEMBLER is redundant: the GC updates that slot in-place.
-fn spill_unsynced_ref_roots(
-    builder: &mut FunctionBuilder,
-    jf_ptr: CValue,
-    ref_root_slots: &[(u32, usize)],
-    defined_ref_vars: &IndexSet<u32>,
-    synced_ref_vars: &IndexSet<u32>,
-    demoted_failarg_slots: &IndexMap<u32, i32>,
-    ref_root_base_ofs: i32,
-) {
-    for &(var_idx, slot) in ref_root_slots {
-        if !defined_ref_vars.contains(&var_idx) || synced_ref_vars.contains(&var_idx) {
-            continue;
-        }
-        // Demoted refs are frame-resident with no loop-body SSA definition
-        // (their slot is already a live gcmap root); never `use_var` them.
-        if is_demoted_failarg(demoted_failarg_slots, var_idx) {
-            continue;
-        }
-        let offset = ref_root_base_ofs + (slot as i32) * 8;
-        let val = builder.use_var(var(var_idx));
-        builder.ins().store(MemFlags::new(), val, jf_ptr, offset);
-    }
-}
-
 /// assembler.py:1369-1377 _pop_all_regs_from_frame:
 /// Reload all defined GC ref variables from jf_frame after a call.
 /// The GC may have moved objects and updated the slots in-place.
@@ -11229,12 +11201,12 @@ impl CraneliftBackend {
                         // pops it (_call_footer_shadowstack). The caller does
                         // NOT touch the shadow stack here.
                         jf_ptr = builder.ins().get_pinned_reg(ptr_type);
-                        spill_unsynced_ref_roots(
+                        spill_ref_roots(
                             &mut builder,
                             jf_ptr,
                             &live_ref_root_slots,
                             &defined_ref_vars,
-                            &synced_ref_vars,
+                            &stale_ref_vars,
                             &demoted_failarg_slots,
                             ref_root_base_ofs,
                         );
@@ -11342,12 +11314,12 @@ impl CraneliftBackend {
                         // the caller frame, matching the pending-gcmap
                         // sequence used by the dynasm backend.
                         jf_ptr = builder.ins().get_pinned_reg(ptr_type);
-                        spill_unsynced_ref_roots(
+                        spill_ref_roots(
                             &mut builder,
                             jf_ptr,
                             &live_ref_root_slots,
                             &defined_ref_vars,
-                            &synced_ref_vars,
+                            &stale_ref_vars,
                             &demoted_failarg_slots,
                             ref_root_base_ofs,
                         );
@@ -11423,12 +11395,12 @@ impl CraneliftBackend {
                     // jitframe pointer through the Variable so Cranelift
                     // threads it through the necessary block params.
                     jf_ptr = builder.ins().get_pinned_reg(ptr_type);
-                    spill_unsynced_ref_roots(
+                    spill_ref_roots(
                         &mut builder,
                         jf_ptr,
                         &live_ref_root_slots,
                         &defined_ref_vars,
-                        &synced_ref_vars,
+                        &stale_ref_vars,
                         &demoted_failarg_slots,
                         ref_root_base_ofs,
                     );

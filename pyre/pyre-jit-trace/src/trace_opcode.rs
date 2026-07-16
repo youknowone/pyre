@@ -2741,7 +2741,14 @@ impl MIFrame {
         //   vinfo.tracing_before_residual_call(virtualizable)
         let info = crate::frame_layout::build_pyframe_virtualizable_info();
         unsafe {
-            info.tracing_before_residual_call(obj_ptr);
+            let sym = self.sym_mut();
+            debug_assert!(sym.active_vable_root_depth.is_none());
+            sym.active_vable_root_depth = Some(majit_gc::shadow_stack::resume_ref_roots_depth());
+            majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_raw_parts_mut(
+                &mut sym.concrete_vable_ptr as *mut *mut u8 as *mut i64,
+                1,
+            ));
+            info.tracing_before_residual_call(sym.concrete_vable_ptr);
         }
         // pyjitpl.py:3332-3335:
         //   force_token = self.history.record0(rop.FORCE_TOKEN,
@@ -2769,11 +2776,18 @@ impl MIFrame {
             return Ok(());
         }
         let obj_ptr = self.sym().concrete_vable_ptr;
+        let root_depth = self.sym_mut().active_vable_root_depth.take();
         if obj_ptr.is_null() {
+            if let Some(depth) = root_depth {
+                majit_gc::shadow_stack::pop_resume_ref_roots_to(depth);
+            }
             return Ok(());
         }
         let info = crate::frame_layout::build_pyframe_virtualizable_info();
         let vable_forced = unsafe { info.tracing_after_residual_call(obj_ptr) };
+        if let Some(depth) = root_depth {
+            majit_gc::shadow_stack::pop_resume_ref_roots_to(depth);
+        }
         if vable_forced {
             // pyjitpl.py:3356: self.load_fields_from_virtualizable()
             self.load_fields_from_virtualizable();

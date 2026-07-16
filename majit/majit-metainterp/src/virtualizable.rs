@@ -95,6 +95,8 @@ pub struct VableArrayInfo {
     pub item_size: usize,
     /// Byte offset of the array pointer in the heap object.
     pub field_offset: usize,
+    /// GC type id of the array object stored in a `DirectPointer` field.
+    pub array_type_id: u32,
     /// Storage model for the array field.
     pub storage: VableArrayStorage,
     /// Offset of the length field within the array object.
@@ -483,6 +485,42 @@ impl VirtualizableInfo {
         self.clear_vable_descr = Some(clear_descr);
     }
 
+    /// Register virtualizable array pointer fields for old virtualizable
+    /// objects currently held in a blackhole ref register bank.  The type-id
+    /// check keeps this targeted to the `VTYPEPTR` described by this vinfo,
+    /// rather than treating every Ref register as if it had the virtualizable
+    /// layout.
+    pub fn push_resume_ref_roots_for_registers(&self, registers_r: &[i64]) {
+        for &value in registers_r {
+            self.push_resume_ref_roots_for_value(value);
+        }
+    }
+
+    /// Register virtualizable array pointer fields for one old virtualizable
+    /// object. Nursery virtualizable objects are already traced through the
+    /// rooted Ref slot that points at the object; old virtualizables need their
+    /// young array fields exposed explicitly.
+    pub fn push_resume_ref_roots_for_value(&self, value: i64) {
+        let Some(parent) = &self.parent_descr else {
+            return;
+        };
+        let Some(size_descr) = parent.as_size_descr() else {
+            return;
+        };
+        let vtype_id = size_descr.type_id();
+        if value == 0 {
+            return;
+        }
+        let ptr = value as usize;
+        if !majit_gc::gc_owns_object(ptr) || majit_gc::gc_is_nursery_object(ptr) {
+            return;
+        }
+        let type_id = unsafe { (*majit_gc::header::header_of(ptr)).type_id() };
+        if type_id == vtype_id {
+            crate::resume::VirtualizableInfo::push_resume_ref_roots(self, value);
+        }
+    }
+
     /// virtualizable.py:300-301 `clear_vable_descr` factory. Creates
     /// the CallDescr for the `COND_CALL` that invokes `clear_vable_ptr`.
     ///
@@ -536,11 +574,16 @@ impl VirtualizableInfo {
         array_descr: DescrRef,
     ) {
         let item_size = array_descr_item_size(&array_descr, item_type);
+        let array_type_id = array_descr
+            .as_array_descr()
+            .map(|descr| descr.type_id())
+            .unwrap_or(0);
         self.array_fields.push(VableArrayInfo {
             name: name.into(),
             item_type,
             item_size,
             field_offset,
+            array_type_id,
             storage: VableArrayStorage::DirectPointer,
             length_offset,
             items_offset,
@@ -565,11 +608,16 @@ impl VirtualizableInfo {
         array_descr: DescrRef,
     ) {
         let item_size = array_descr_item_size(&array_descr, item_type);
+        let array_type_id = array_descr
+            .as_array_descr()
+            .map(|descr| descr.type_id())
+            .unwrap_or(0);
         self.array_fields.push(VableArrayInfo {
             name: name.into(),
             item_type,
             item_size,
             field_offset,
+            array_type_id,
             storage: VableArrayStorage::EmbeddedArray { ptr_offset },
             length_offset,
             items_offset,
@@ -593,11 +641,16 @@ impl VirtualizableInfo {
         array_descr: DescrRef,
     ) {
         let item_size = array_descr_item_size(&array_descr, item_type);
+        let array_type_id = array_descr
+            .as_array_descr()
+            .map(|descr| descr.type_id())
+            .unwrap_or(0);
         self.array_fields.push(VableArrayInfo {
             name: name.into(),
             item_type,
             item_size,
             field_offset,
+            array_type_id,
             storage: VableArrayStorage::RustVec {
                 data_ptr_fn,
                 len_fn,
@@ -2631,6 +2684,56 @@ impl crate::resume::VirtualizableInfo for VirtualizableInfo {
         if !vable_ptr.is_null() {
             unsafe { self.reset_vable_token(vable_ptr) };
         }
+    }
+
+    /// RPython keeps virtualizable array fields reachable through the
+    /// GC-traced virtualizable object while resume data is decoded
+    /// (`rpython/jit/metainterp/resume.py:1399`). pyre stores the same
+    /// array pointers in raw frame fields, so expose the pointer slots to
+    /// the resume-construction root stack before `write_from_resume_data_partial`
+    /// and subsequent blackhole frame construction can allocate.
+    fn push_resume_ref_roots(&self, virtualizable: i64) {
+        let vable_ptr = virtualizable as *mut u8;
+        if vable_ptr.is_null() {
+            return;
+        }
+        for array in &self.array_fields {
+            match array.storage {
+                VableArrayStorage::DirectPointer => {
+                    let slot = unsafe { vable_ptr.add(array.field_offset) as *mut i64 };
+                    let value = unsafe { *slot } as usize;
+                    if value != 0 && majit_gc::gc_owns_object(value) {
+                        let current = majit_gc::gc_current_object_address(value);
+                        if current != value {
+                            unsafe {
+                                *slot = current as i64;
+                            }
+                        }
+                        if array.array_type_id != 0 && majit_gc::gc_is_nursery_object(current) {
+                            let type_id =
+                                unsafe { (*majit_gc::header::header_of(current)).type_id() };
+                            if type_id != array.array_type_id {
+                                continue;
+                            }
+                        }
+                    }
+                    unsafe {
+                        majit_gc::shadow_stack::push_resume_ref_roots(
+                            std::slice::from_raw_parts_mut(slot, 1),
+                        );
+                    }
+                }
+                VableArrayStorage::EmbeddedArray { .. } | VableArrayStorage::RustVec { .. } => {}
+            }
+        }
+    }
+
+    fn push_resume_ref_roots_for_value(&self, value: i64) {
+        VirtualizableInfo::push_resume_ref_roots_for_value(self, value);
+    }
+
+    fn push_resume_ref_roots_for_registers(&self, registers_r: &[i64]) {
+        VirtualizableInfo::push_resume_ref_roots_for_registers(self, registers_r);
     }
 
     /// virtualizable.py:126-137 write_from_resume_data_partial

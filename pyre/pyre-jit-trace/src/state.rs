@@ -2233,6 +2233,11 @@ pub struct PyreSym {
     /// Virtualizable object pointer (PyFrame).
     /// RPython MetaInterp stores the virtualizable separately from MIFrame.
     pub(crate) concrete_vable_ptr: *mut u8,
+    /// Root depth for `concrete_vable_ptr` while a residual call can collect.
+    /// RPython's local `virtualizable` remains a traced GCREF across
+    /// `vable_and_vrefs_before_residual_call` / `vable_after_residual_call`
+    /// (`rpython/jit/metainterp/pyjitpl.py:3317-3366`).
+    pub(crate) active_vable_root_depth: Option<usize>,
     /// Live (interpreter-owned) virtualizable `PyFrame` behind the tracing
     /// snapshot, or 0 when tracing runs without one (tests).
     /// `concrete_vable_ptr` points at the `snapshot_for_tracing` copy whose
@@ -4385,6 +4390,7 @@ impl PyreSym {
             is_function_entry_trace: false,
             concrete_execution_context: std::ptr::null(),
             concrete_vable_ptr: std::ptr::null_mut(),
+            active_vable_root_depth: None,
             live_vable_frame_addr: 0,
             last_exc_value: std::ptr::null_mut(),
             class_of_last_exc_is_const: false,

@@ -1280,7 +1280,23 @@ impl BlackholeInterpreter {
             }
             depth
         };
+        let vable_roots_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
+        unsafe {
+            let mut current = Some(&mut *self);
+            while let Some(frame) = current {
+                if !frame.virtualizable_info.is_null() {
+                    let vinfo = &*frame.virtualizable_info;
+                    vinfo.push_resume_ref_roots_for_registers(&frame.registers_r);
+                    crate::resume::VirtualizableInfo::push_resume_ref_roots(
+                        vinfo,
+                        frame.virtualizable_ptr,
+                    );
+                }
+                current = frame.nextblackholeinterp.as_deref_mut();
+            }
+        }
         let result = self.run_inner();
+        majit_gc::shadow_stack::pop_resume_ref_roots_to(vable_roots_depth);
         majit_gc::shadow_stack::pop_bh_regs_to(bh_depth);
         result
     }

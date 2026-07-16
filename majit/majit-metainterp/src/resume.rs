@@ -5196,6 +5196,23 @@ pub trait VirtualizableInfo {
     /// resume.py:1407 vinfo.reset_token_gcref(virtualizable)
     fn reset_token_gcref(&self, virtualizable: i64);
 
+    /// pyre: register virtualizable-owned Ref buffers for the resume
+    /// construction window. RPython keeps the virtualizable object and its
+    /// array fields GC-traced while `blackhole_from_resumedata` fills frames.
+    fn push_resume_ref_roots(&self, _virtualizable: i64) {}
+
+    /// pyre: register virtualizable-owned Ref buffers for any virtualizable
+    /// object already present in a blackhole Ref register bank.
+    fn push_resume_ref_roots_for_value(&self, _value: i64) {}
+
+    /// pyre: register virtualizable-owned Ref buffers for any virtualizable
+    /// object already present in a blackhole Ref register bank.
+    fn push_resume_ref_roots_for_registers(&self, registers_r: &[i64]) {
+        for &value in registers_r {
+            self.push_resume_ref_roots_for_value(value);
+        }
+    }
+
     /// resume.py:1408 vinfo.write_from_resume_data_partial(virtualizable, self)
     ///
     /// Read fields from the resume reader and write them into the virtualizable.
@@ -5336,6 +5353,8 @@ pub struct ResumeDataDirectReader<'a> {
     /// Wraps both the ptr and int half so callers go through the RPython
     /// `VirtualCache` API (`get_ptr`/`set_ptr`/`get_int`/`set_int`).
     pub virtuals_cache: VirtualCache,
+
+    virtualizable_root_base_depth: Option<usize>,
 
     /// resume.py:1367 — CPU allocation backend.
     /// RPython uses self.cpu (from metainterp_sd.cpu) for allocate_with_vtable etc.
@@ -6005,6 +6024,7 @@ impl<'a> ResumeDataDirectReader<'a> {
             resume_after_guard_not_forced,
             rd_virtuals: None,
             virtuals_cache,
+            virtualizable_root_base_depth: None,
             allocator,
             all_liveness,
             virtualizable_ptr: 0,
@@ -6512,11 +6532,15 @@ impl<'a> ResumeDataDirectReader<'a> {
     ///     info = blackholeinterp.get_current_position_info()
     ///     self._prepare_next_section(info)
     /// ```
-    pub fn consume_one_section(&mut self, bh: &mut BlackholeInterpreter) {
+    pub fn consume_one_section(
+        &mut self,
+        bh: &mut BlackholeInterpreter,
+        vinfo: Option<&dyn VirtualizableInfo>,
+    ) {
         // resume.py:1383
         let info = bh.get_current_position_info();
         // resume.py:1384
-        self._prepare_next_section(info, bh);
+        self._prepare_next_section(info, bh, vinfo);
     }
 
     /// resume.py:1017-1026 `_prepare_next_section(self, info)`.
@@ -6538,7 +6562,12 @@ impl<'a> ResumeDataDirectReader<'a> {
     /// `next_float` on this reader (resume.py:1028-1038), matching
     /// `_callback_i/_callback_r/_callback_f` plus `write_an_int/write_a_ref/
     /// write_a_float` (resume.py:1590-1597).
-    fn _prepare_next_section(&mut self, info: usize, bh: &mut BlackholeInterpreter) {
+    fn _prepare_next_section(
+        &mut self,
+        info: usize,
+        bh: &mut BlackholeInterpreter,
+        vinfo: Option<&dyn VirtualizableInfo>,
+    ) {
         use majit_translate::liveness::LivenessIterator;
 
         let all_liveness: &[u8] = self.all_liveness;
@@ -6581,6 +6610,9 @@ impl<'a> ResumeDataDirectReader<'a> {
                 }
                 // resume.py:1593-1594 `write_a_ref`.
                 bh.setarg_r(reg_idx as usize, value);
+                if let Some(vinfo) = vinfo {
+                    vinfo.push_resume_ref_roots_for_value(value);
+                }
             }
             offset = it.offset;
         }
@@ -6752,6 +6784,11 @@ impl<'a> ResumeDataDirectReader<'a> {
             self.virtualizable_identity_override = None;
         }
         self.virtualizable_ptr = virtualizable;
+        if self.virtualizable_root_base_depth.is_none() {
+            self.virtualizable_root_base_depth =
+                Some(majit_gc::shadow_stack::resume_ref_roots_depth());
+        }
+        vinfo.push_resume_ref_roots(virtualizable);
         // resume.py:1406: assert vinfo.get_total_size(virtualizable) == vable_size - 1
         let expected = vinfo.get_total_size(virtualizable) as i32;
         assert!(
@@ -7011,6 +7048,14 @@ impl<'a> ResumeDataDirectReader<'a> {
     /// resume.py:1599 int_add_const
     pub fn int_add_const(&self, base: i64, offset: i64) -> i64 {
         base + offset
+    }
+}
+
+impl Drop for ResumeDataDirectReader<'_> {
+    fn drop(&mut self) {
+        if let Some(depth) = self.virtualizable_root_base_depth {
+            majit_gc::shadow_stack::pop_resume_ref_roots_to(depth);
+        }
     }
 }
 
@@ -7300,7 +7345,7 @@ pub fn blackhole_from_resumedata<'a>(
         }
 
         // resume.py:1341
-        resumereader.consume_one_section(&mut nextbh);
+        resumereader.consume_one_section(&mut nextbh, vinfo);
 
         // resume.py:1342
         nextbh.handle_rvmprof_enter();

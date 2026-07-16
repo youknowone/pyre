@@ -6668,12 +6668,12 @@ fn try_execute_residual_call_via_executor(
     // virtualizable, or unit-test init disabled the heap pointer) — nothing
     // the callee could force.  The token is armed further below, past every
     // decline gate.
-    let vable_obj_ptr = if is_may_force {
+    let mut vable_obj_root = if is_may_force {
         ctx.trace_ctx
             .standard_virtualizable_box()
             .and_then(|_| ctx.trace_ctx.virtualizable_heap_ptr())
             .filter(|p| !p.is_null())
-            .map(|p| p as *mut u8)
+            .map(|p| Box::new(p as usize as i64))
     } else {
         None
     };
@@ -6776,10 +6776,17 @@ fn try_execute_residual_call_via_executor(
     // `vable_and_vrefs_before_residual_call` (pyjitpl.py:2017) runs only past
     // the OS_NOT_IN_TRACE / force-virtual short-circuits.  Trait mirror:
     // `MIFrame::vable_and_vrefs_before_residual_call` (trace_opcode.rs:2602).
-    if let Some(obj_ptr) = vable_obj_ptr {
+    let vable_root_depth = if let Some(obj) = vable_obj_root.as_mut() {
         let info = crate::frame_layout::build_pyframe_virtualizable_info();
-        unsafe { info.tracing_before_residual_call(obj_ptr) };
-    }
+        let root_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
+        unsafe {
+            majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_mut(&mut **obj));
+            info.tracing_before_residual_call(**obj as usize as *mut u8);
+        }
+        Some(root_depth)
+    } else {
+        None
+    };
     let body_effect_candidate =
         !provably_side_effect_free && writes_live_heap && fbw_foriter_inflight_active();
     // #57 Option C (Finding #1, user-frame signal): the Void/helper-tag write
@@ -6839,8 +6846,13 @@ fn try_execute_residual_call_via_executor(
             fbw_mark_executed_body_residual();
         }
     }
+    let restored_vable_heap_ptr = vable_obj_root
+        .as_ref()
+        .map(|obj| **obj as usize as *const u8)
+        .or(saved_vable_heap_ptr)
+        .unwrap_or(std::ptr::null());
     ctx.trace_ctx
-        .set_virtualizable_heap_ptr(saved_vable_heap_ptr.unwrap_or(std::ptr::null()));
+        .set_virtualizable_heap_ptr(restored_vable_heap_ptr);
     // pyjitpl.py:3349-3353 `vinfo.tracing_after_residual_call(virtualizable)`
     // heap half: a cleared token means the callee forced the virtualizable —
     // the frame escaped, the trace must abort (pyjitpl.py:3365
@@ -6851,9 +6863,12 @@ fn try_execute_residual_call_via_executor(
     // `load_fields_from_virtualizable` analogue is needed because the FBW
     // abort discards the walk shadow instead of handing it to a blackhole
     // leg.  An intact token is cleared back to TOKEN_NONE.
-    if let Some(obj_ptr) = vable_obj_ptr {
+    if let Some(obj) = vable_obj_root.as_ref() {
         let info = crate::frame_layout::build_pyframe_virtualizable_info();
-        let forced = unsafe { info.tracing_after_residual_call(obj_ptr) };
+        let forced = unsafe { info.tracing_after_residual_call(**obj as usize as *mut u8) };
+        if let Some(depth) = vable_root_depth {
+            majit_gc::shadow_stack::pop_resume_ref_roots_to(depth);
+        }
         if forced {
             return Err(DispatchError::VableEscapedDuringResidualCall { pc: op_pc });
         }
