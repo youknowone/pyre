@@ -6621,12 +6621,13 @@ fn try_execute_residual_call_via_executor(
     // exhaustion arm) still records the completion; a successful attempt
     // replaces the entry with a fresh one anyway.
     if helper == majit_ir::PyreHelperKind::ForIterNext {
+        let body_src = fbw_foriter_body_src_from_op_pc(ctx.fbw_mode.snapshot_sym, op_pc);
         let body_pc = fbw_foriter_body_pc_from_op_pc(ctx.fbw_mode.snapshot_sym, op_pc)
             .unwrap_or_else(|| {
                 pcmap_entrypc_audit_ctx_read(ctx, "foriter_attempt_fallback");
                 ctx.entry_py_pc() as usize + 1
             });
-        fbw_foriter_inflight_mark_attempt(body_pc);
+        fbw_foriter_inflight_mark_attempt(body_pc, body_src);
     }
     // gh#467: sample the user-frame odometer UNCONDITIONALLY (not only under an
     // in-flight FOR_ITER) so the concrete-heap-write gate can detect a callee
@@ -6808,6 +6809,7 @@ fn try_execute_residual_call_via_executor(
                 // body and deliver to the wrong pc.  The fallback (no outer
                 // full-body sym / metadata) keeps the entry coordinate, which
                 // is correct for the loop-header FOR_ITER.
+                let body_src = fbw_foriter_body_src_from_op_pc(ctx.fbw_mode.snapshot_sym, op_pc);
                 let body_pc = fbw_foriter_body_pc_from_op_pc(ctx.fbw_mode.snapshot_sym, op_pc)
                     .unwrap_or_else(|| {
                         pcmap_entrypc_audit_ctx_read(ctx, "foriter_capture_fallback");
@@ -6816,6 +6818,7 @@ fn try_execute_residual_call_via_executor(
                 fbw_foriter_inflight_capture(
                     result_i64 as usize as pyre_object::PyObjectRef,
                     body_pc,
+                    body_src,
                 );
                 // #73/#267: the item lands on the operand-stack TOS through the
                 // codewriter's `pin!` slot binding (FOR_ITER lowering), not a
@@ -8593,6 +8596,11 @@ pub unsafe fn fbw_finish_concrete_root_walker_area(
 struct InflightForiter {
     item: pyre_object::PyObjectRef,
     body_pc: usize,
+    /// Phase-1 pc-map migration shadow: the outer Python JitCode identity and
+    /// the `for_iter_next` residual's own JitCode pc that eagerly produced
+    /// `body_pc`. `None` retains the legacy entry-pc fallback, which has no
+    /// JitCode coordinate to carry.
+    body_src: Option<(u32, usize)>,
     body_effect_since_consume: bool,
     /// The walk re-reached this FOR_ITER's consume after the item's body ran
     /// (a NEW `for_iter_next` attempt was dispatched for the same `body_pc`).
@@ -8974,7 +8982,11 @@ pub(crate) fn fbw_store_journal_commit() {
 /// are popped, and the loop's own entry is replaced (a fresh body-effect
 /// window).  The outer loop's in-flight item is thus no longer destroyed by an
 /// inner consume, and a completed inner loop leaves no stale entry.
-pub(crate) fn fbw_foriter_inflight_capture(item: pyre_object::PyObjectRef, body_pc: usize) {
+pub(crate) fn fbw_foriter_inflight_capture(
+    item: pyre_object::PyObjectRef,
+    body_pc: usize,
+    body_src: Option<(u32, usize)>,
+) {
     FBW_FORITER_INFLIGHT.with(|c| {
         let mut stack = c.borrow_mut();
         // The "body effect since consume" window restarts at each consume:
@@ -8983,6 +8995,7 @@ pub(crate) fn fbw_foriter_inflight_capture(item: pyre_object::PyObjectRef, body_
         let entry = InflightForiter {
             item,
             body_pc,
+            body_src,
             body_effect_since_consume: false,
             body_completed: false,
         };
@@ -9011,9 +9024,10 @@ pub(crate) fn fbw_foriter_inflight_active() -> bool {
 /// attempt that aborts mid-way (a kept-stack guard on the exhaustion arm)
 /// still leaves the completion recorded; a successful attempt replaces the
 /// entry with a fresh one anyway ([`fbw_foriter_inflight_capture`]).
-pub(crate) fn fbw_foriter_inflight_mark_attempt(body_pc: usize) {
+pub(crate) fn fbw_foriter_inflight_mark_attempt(body_pc: usize, body_src: Option<(u32, usize)>) {
     FBW_FORITER_INFLIGHT.with(|c| {
         if let Some(entry) = c.borrow_mut().iter_mut().find(|e| e.body_pc == body_pc) {
+            audit_inflight_body_src("mark_attempt", body_pc, body_src);
             entry.body_completed = true;
         }
     });
@@ -9061,6 +9075,7 @@ pub fn fbw_foriter_inflight_take_for_resume(
     FBW_FORITER_INFLIGHT.with(|c| {
         let stack = c.borrow();
         let at = stack.iter().position(|e| e.body_pc == body_pc)?;
+        audit_inflight_body_src("take_for_resume", stack[at].body_pc, stack[at].body_src);
         // R1 never-double guard (cross-checks #33): an irreversible body effect
         // committed since this consume means re-running the body on delivery
         // would double it — refuse delivery.  A body-COMPLETED entry (the walk
@@ -11026,6 +11041,54 @@ pub(crate) fn python_pc_for_jitcode_pc(metadata: &crate::PyJitCodeMetadata, jit_
     best.map_or(0, |(_, py)| py)
 }
 
+/// `PYRE_PCMAP_INFLIGHT_AUDIT` checks the additive native shadow carried by
+/// in-flight FOR_ITER entries. The production selector still keys only on its
+/// legacy Python `body_pc`; this records whether resolving the retained
+/// `(outer_jitcode_index, foriter_op_pc)` at each matching boundary reproduces
+/// that word. `None` is the legacy entry-PC fallback and has no JitCode source.
+fn pcmap_inflight_audit_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_INFLIGHT_AUDIT").is_some())
+}
+
+/// Append one report-only in-flight FOR_ITER pc-map census row. `check.py`
+/// discards diagnostic stderr, so the audit writes to an explicitly supplied
+/// probe file instead.
+fn pcmap_inflight_audit_probe(site: &'static str, verdict: &'static str) {
+    if let Some(path) = std::env::var_os("PYRE_PCMAP_INFLIGHT_AUDIT_PROBE") {
+        use std::io::Write;
+
+        if let Ok(mut probe) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(probe, "inflight\t{site}\t{verdict}");
+        }
+    }
+}
+
+/// Re-derive a matched in-flight FOR_ITER entry's body pc from its carried
+/// native source. This is diagnostic-only in phase 1: `body_pc` remains the
+/// matching and delivery word until the phase-2 channel flip.
+fn audit_inflight_body_src(site: &'static str, body_pc: usize, body_src: Option<(u32, usize)>) {
+    if !pcmap_inflight_audit_enabled() {
+        return;
+    }
+    pcmap_inflight_audit_probe(site, "fire");
+    let verdict = match body_src {
+        Some((outer_jitcode_index, op_pc)) => {
+            crate::state::pyjitcode_for_jitcode_index(outer_jitcode_index as i32)
+                .map(|jc| python_pc_for_jitcode_pc(&jc.metadata, op_pc) as usize + 1)
+                .is_some_and(|derived_body_pc| derived_body_pc == body_pc)
+                .then_some("eq")
+                .unwrap_or("di")
+        }
+        None => "nojit",
+    };
+    pcmap_inflight_audit_probe(site, verdict);
+}
+
 /// #57 Option C (Finding #2): derive the FOR_ITER body pc — the continue-arm
 /// fallthrough — from the `for_iter_next` residual op's OWN JitCode pc.
 ///
@@ -11063,6 +11126,25 @@ fn fbw_foriter_body_pc_from_op_pc(
         python_pc_for_jitcode_pc(&jc.payload.metadata, op_pc) as usize
     };
     Some(foriter_py_pc + 1)
+}
+
+/// Preserve the same outer JitCode identity and `for_iter_next` op coordinate
+/// that [`fbw_foriter_body_pc_from_op_pc`] eagerly inverts today. Phase 1 keeps
+/// this alongside the Python word; phase 2 will make it the stash channel.
+fn fbw_foriter_body_src_from_op_pc(
+    snapshot_sym: *const crate::state::PyreSym,
+    op_pc: usize,
+) -> Option<(u32, usize)> {
+    if snapshot_sym.is_null() {
+        return None;
+    }
+    // SAFETY: identical lifetime and immutable-metadata contract as
+    // `fbw_foriter_body_pc_from_op_pc` above.
+    let sym = unsafe { &*snapshot_sym };
+    if sym.jitcode.is_null() {
+        return None;
+    }
+    Some((unsafe { (*sym.jitcode).index as u32 }, op_pc))
 }
 
 /// Forward-skip Python trivia (`Cache` / `ExtendedArg` / `Resume` / `Nop`
@@ -21491,12 +21573,13 @@ fn try_walker_specialize_for_iter_next(
 
     // A new consume attempt completes the prior in-flight iteration before
     // this irreversible concrete advance, matching the residual executor.
+    let body_src = fbw_foriter_body_src_from_op_pc(ctx.fbw_mode.snapshot_sym, op_pc);
     let body_pc =
         fbw_foriter_body_pc_from_op_pc(ctx.fbw_mode.snapshot_sym, op_pc).unwrap_or_else(|| {
             pcmap_entrypc_audit_ctx_read(ctx, "range_foriter_attempt_fallback");
             ctx.entry_py_pc() as usize + 1
         });
-    fbw_foriter_inflight_mark_attempt(body_pc);
+    fbw_foriter_inflight_mark_attempt(body_pc, body_src);
 
     // guard_class W_IntRangeIterator, unless the operand is already known.
     let range_iter_type_addr = &pyre_object::functional::RANGE_ITER_TYPE as *const _ as i64;
@@ -21612,7 +21695,7 @@ fn try_walker_specialize_for_iter_next(
     );
 
     if concrete_continues {
-        fbw_foriter_inflight_capture(concrete_item_ptr, body_pc);
+        fbw_foriter_inflight_capture(concrete_item_ptr, body_pc, body_src);
         // Range iteration stays at the C level, so the operand-stack mirror
         // remains valid and must receive the item produced by FOR_ITER.
         ctx.vstack_last_ref = masked_item;
