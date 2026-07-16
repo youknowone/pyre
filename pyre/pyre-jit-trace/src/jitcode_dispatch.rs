@@ -12640,16 +12640,40 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 }
                 None => liveness_py_pc,
             };
-            let (entry_twin, entry_caller) = if guard_py_pc.is_some() {
-                (OuterActiveBoxesEntryTwin::Plain, "guard_snapshot_guard_pc")
-            } else {
+            let (entry_jitcode_pc, entry_twin, entry_caller) = if guard_py_pc.is_some() {
                 (
-                    // The live-before anchor does not invert to this
-                    // fallthrough entry coordinate (entry census); retain the
-                    // Python-PC source until a matching carried model exists.
-                    OuterActiveBoxesEntryTwin::PyPc,
-                    "guard_snapshot_fallthrough",
+                    guard_jitcode_pc,
+                    OuterActiveBoxesEntryTwin::Plain,
+                    "guard_snapshot_guard_pc",
                 )
+            } else {
+                // The legacy entry reads are keyed by the fallthrough Python
+                // cursor, not by the guard's bank-liveness marker.  Anchor the
+                // plain twins at that Python opcode's first emitted JitCode op:
+                // their predecessor tier then selects precisely its depth and
+                // pcdep rows.  A `-live-` marker is a block-head coordinate and
+                // can instead select an earlier opcode in the same block.
+                let entry = unsafe {
+                    (&*sym.jitcode)
+                        .payload
+                        .metadata
+                        .first_jit_pc_by_py_pc
+                        .get(liveness_py_pc as usize)
+                        .copied()
+                        .filter(|&pc| pc != usize::MAX)
+                };
+                match entry {
+                    Some(pc) => (
+                        pc as i32,
+                        OuterActiveBoxesEntryTwin::Plain,
+                        "guard_snapshot_fallthrough",
+                    ),
+                    None => (
+                        majit_ir::resumedata::NO_JITCODE_PC,
+                        OuterActiveBoxesEntryTwin::PyPc,
+                        "guard_snapshot_fallthrough",
+                    ),
+                }
             };
             let active = collect_outer_active_boxes(
                 sym,
@@ -12661,7 +12685,7 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 liveness_py_pc,
                 guard_py_pc,
                 guard_jitcode_pc,
-                guard_jitcode_pc,
+                entry_jitcode_pc,
                 entry_twin,
                 entry_caller,
                 ctx.vstack_valid.then_some(ctx.vstack_boxes.as_slice()),
