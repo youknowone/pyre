@@ -932,8 +932,7 @@ fn residual_ref_call_dst_before(code: &[u8], entry: usize) -> Option<usize> {
 /// trailing `>r` destination byte, so use that register when the call ending at
 /// `root_pc` can be decoded.  Fall back to the precomputed result-color table
 /// for older shapes that lack the canonical residual-call encoding.  Returns
-/// `false` (caller declines the compile) when the register is unresolved or
-/// sits below the operand stack.
+/// `false` (caller declines the compile) when the register is unresolved.
 fn inject_root_call_result(sym: &mut PyreSym, root_pc: usize, result: majit_ir::OpRef) -> bool {
     if sym.jitcode.is_null() {
         return false;
@@ -959,21 +958,20 @@ fn inject_root_call_result(sym: &mut PyreSym, root_pc: usize, result: majit_ir::
         return false;
     };
     let nlocals = sym.nlocals;
-    if result_reg < nlocals {
-        return false;
-    }
     if let Some(ref mut bridge_regs) = sym.bridge_registers_r {
         if bridge_regs.len() <= result_reg {
             bridge_regs.resize(result_reg + 1, majit_ir::OpRef::NONE);
         }
         bridge_regs[result_reg] = result;
     }
-    let slot = result_reg - nlocals;
-    let bridge = sym.bridge_stack_oprefs.get_or_insert_with(Vec::new);
-    if bridge.len() <= slot {
-        bridge.resize(slot + 1, majit_ir::OpRef::NONE);
+    if result_reg >= nlocals {
+        let slot = result_reg - nlocals;
+        let bridge = sym.bridge_stack_oprefs.get_or_insert_with(Vec::new);
+        if bridge.len() <= slot {
+            bridge.resize(slot + 1, majit_ir::OpRef::NONE);
+        }
+        bridge[slot] = result;
     }
-    bridge[slot] = result;
     true
 }
 
