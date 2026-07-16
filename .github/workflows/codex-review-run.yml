@@ -112,7 +112,23 @@ jobs:
           # Bind it to this run: the PR it names must have exactly the head this
           # run was triggered for. Without this check a fork could point the
           # review at an unrelated PR and post a report on it.
-          pr_json="$(gh api "/repos/${REPO}/pulls/${PR_NUMBER}")"
+          # The REST API can answer with a 5xx HTML error page during a GitHub
+          # incident; one failed read must not fail the review. Retry with
+          # backoff and treat a non-JSON body as a failure to retry.
+          pr_json=""
+          for attempt in 1 2 3 4 5 6; do
+            if pr_json="$(gh api "/repos/${REPO}/pulls/${PR_NUMBER}")" \
+              && jq -e . >/dev/null 2>&1 <<<"$pr_json"; then
+              break
+            fi
+            echo "::warning::Reading PR #${PR_NUMBER} failed (attempt ${attempt}); retrying."
+            pr_json=""
+            sleep "$((attempt * 5))"
+          done
+          if [ -z "$pr_json" ]; then
+            echo "::error::Could not read PR #${PR_NUMBER} from the API after retries."
+            exit 1
+          fi
           claim_sha="$(jq -r '.head.sha' <<<"$pr_json")"
           claim_repo="$(jq -r '.head.repo.full_name' <<<"$pr_json")"
           if [ "$claim_sha" != "$HEAD_SHA" ] || [ "$claim_repo" != "$HEAD_REPO" ]; then
@@ -133,6 +149,9 @@ jobs:
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         with:
+          # Retry transient 5xx/network errors so a GitHub blip does not fail
+          # the review before it starts.
+          retries: 6
           script: |
             await github.rest.repos.createCommitStatus({
               ...context.repo,
@@ -332,6 +351,9 @@ jobs:
           PR_NUMBER: ${{ steps.pr.outputs.number }}
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
         with:
+          # Retry transient 5xx/network errors so a GitHub blip does not lose
+          # the posted review.
+          retries: 6
           script: |
             const fs = require('fs');
             const marker = '<!-- codex-parity-review -->';
@@ -383,6 +405,9 @@ jobs:
           JOB_STATUS: ${{ job.status }}
           REVIEWED: ${{ steps.auth.outputs.present == 'true' && steps.diff.outputs.empty == 'false' }}
         with:
+          # Retry transient 5xx/network errors so a GitHub blip does not drop
+          # the final review status.
+          retries: 6
           script: |
             // `workflow_run` runs are not attached to the PR's check suite, so
             // without this the review is invisible on the PR — which is how a
