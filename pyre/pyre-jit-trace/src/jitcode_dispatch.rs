@@ -16249,19 +16249,25 @@ fn try_walker_inline_user_call(
                     {
                         return None;
                     }
-                    let Some(depth) = metadata.depth_at_py_pc.get(callee_py_pc).copied() else {
+                    let Some(depth) = callee_pjc
+                        .depth_for_jitcode_pc_pred(abort_pc)
+                        .or_else(|| metadata.depth_at_py_pc.get(callee_py_pc).copied())
+                    else {
                         return None;
                     };
                     let depth = depth as usize;
                     let nlocals = callee_code.varnames.len();
-                    let Some(entries) = metadata.pcdep_color_slots.get(callee_py_pc) else {
+                    let Some(entries) = callee_pjc
+                        .pcdep_for_jitcode_pc(abort_pc)
+                        .or_else(|| metadata.pcdep_color_slots.get(callee_py_pc).cloned())
+                    else {
                         return None;
                     };
                     let mut live_stack = Vec::with_capacity(depth);
                     for rel in 0..depth {
                         let semantic_slot = nlocals + rel;
                         let register_value =
-                            crate::state::semantic_slot_color_for_ref_slot(entries, semantic_slot)
+                            crate::state::semantic_slot_color_for_ref_slot(&entries, semantic_slot)
                                 .and_then(|color| sub_wc.concrete_registers_r.get(color).copied());
                         let value = register_value.or_else(|| {
                             (metadata.built_as_portal && abort_kind == MidBodyAbortKind::Marker)
