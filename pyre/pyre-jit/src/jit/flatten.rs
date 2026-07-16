@@ -3506,6 +3506,12 @@ pub struct LoweringContext {
     /// or raises the unbound NameError (reads no heap, runs no user code →
     /// `Plain`).
     pub load_fast_check_fn_idx: u16,
+    /// `unbound_local_error_fn` descrs-pool index. DELETE_FAST records the
+    /// `unbound_local_error(code, name_idx)` HLOp only on its unbound arm,
+    /// lowered to `residual_call_ir_r(ConstInt(fn_idx), ListI([name_idx]),
+    /// ListR([code]), Descr) -> reg`. The helper constructs and returns the
+    /// exception value (`PlainCannotRaise`) for the explicit raise edge.
+    pub unbound_local_error_fn_idx: u16,
     /// `list_extend_fn` descrs-pool index.  LIST_EXTEND records the
     /// `list_extend(list, iterable)` HLOp lowered to
     /// `residual_call_r_v(ConstInt(fn_idx), ListR([list, iterable]), Descr)`
@@ -5157,6 +5163,11 @@ where
     if let Some(insn) = lower_load_fast_check_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
+    if let Some(insn) =
+        lower_unbound_local_error_hlop_to_insn(op, ctx, get_register, lower_constant)
+    {
+        return Some(insn);
+    }
     None
 }
 
@@ -5307,6 +5318,48 @@ where
                 vec![Operand::ConstInt(name_idx)],
             )),
             Operand::ListOfKind(ListOfKind::new(Kind::Ref, vec![value, code])),
+            descr_operand,
+        ],
+        dst_reg,
+    ))
+}
+
+/// Lower DELETE_FAST's `unbound_local_error(code, name_idx)` HLOp to the
+/// construct-and-return residual used by its explicit raise arm.
+pub fn lower_unbound_local_error_hlop_to_insn<F, LC>(
+    op: &super::flow::SpaceOperation,
+    ctx: &LoweringContext,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
+{
+    if op.opname != "unbound_local_error" || op.args.len() != 2 {
+        return None;
+    }
+    let code = operand_for_value_arg(&op.args[0], get_register, lower_constant)?;
+    let name_idx = const_int_for_value_arg(&op.args[1])?;
+    let dst_reg = match &op.result {
+        Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
+        _ => return None,
+    };
+    let effect_info = effect_info_for_call_flavor(CallFlavor::PlainCannotRaise);
+    let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
+        effect_info,
+        arg_kinds: vec![Kind::Ref, Kind::Int],
+        result_kind: Some(Kind::Ref),
+    }));
+    Some(Insn::op_with_result(
+        "residual_call_ir_r",
+        vec![
+            Operand::ConstInt(ctx.unbound_local_error_fn_idx as i64),
+            Operand::ListOfKind(ListOfKind::new(
+                Kind::Int,
+                vec![Operand::ConstInt(name_idx)],
+            )),
+            Operand::ListOfKind(ListOfKind::new(Kind::Ref, vec![code])),
             descr_operand,
         ],
         dst_reg,

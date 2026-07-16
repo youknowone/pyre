@@ -5760,6 +5760,16 @@ pub extern "C" fn bh_load_fast_check_fn(value: i64, w_code_ptr: i64, name_idx: i
     if value as pyre_object::PyObjectRef != pyre_object::PY_NULL {
         return value;
     }
+    let exc_obj = bh_unbound_local_error_fn(w_code_ptr, name_idx);
+    publish_residual_call_exception(exc_obj);
+    0
+}
+
+/// Construct the value raised by DELETE_FAST when its local is unbound.
+/// Unlike `bh_load_fast_check_fn`, this returns the exception object without
+/// publishing it through the residual-exception channel. It allocates but
+/// runs no user code and never raises (`CallFlavor::PlainCannotRaise`).
+pub extern "C" fn bh_unbound_local_error_fn(w_code_ptr: i64, name_idx: i64) -> i64 {
     let code = unsafe {
         &*(pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef)
             as *const pyre_interpreter::CodeObject)
@@ -5775,13 +5785,11 @@ pub extern "C" fn bh_load_fast_check_fn(value: i64, w_code_ptr: i64, name_idx: i
     } else {
         "<cell>"
     };
-    let exc_obj = pyre_interpreter::PyError::unbound_local_error_with_name(
+    pyre_interpreter::PyError::unbound_local_error_with_name(
         format!("cannot access local variable '{name}' where it is not associated with a value"),
         name,
     )
-    .to_exc_object();
-    publish_residual_call_exception(exc_obj as i64);
-    0
+    .to_exc_object() as i64
 }
 
 #[cfg(test)]
