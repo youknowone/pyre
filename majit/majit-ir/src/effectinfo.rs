@@ -675,18 +675,22 @@ pub enum PyreHelperKind {
     /// `guard_value(getfield(obj, map), map)` + `getfield(obj, storage)` +
     /// `getarrayitem_gc_r(block, C_storageindex)` (the inline read
     /// `mapdict.py:914-916 _mapdict_read_storage`), eliding the opaque
-    /// `CALL_MAY_FORCE` MRO-walk residual.  Falls through to the residual for
-    /// every shape the storage read cannot cover (non-instance receiver, custom
-    /// `__getattribute__`, data descriptor, unboxed slot, attribute absent from
-    /// this instance's map).
+    /// `CALL_MAY_FORCE` MRO-walk residual.  An unboxed slot instead folds to a
+    /// non-forcing raw read of its longlong list (`mapdict.py:600-601
+    /// _prim_direct_read`) with the boxing left in the trace.  Falls through to
+    /// the residual for every shape neither read covers (non-instance receiver,
+    /// custom `__getattribute__`, data descriptor, attribute absent from this
+    /// instance's map, and an unboxed slot whose class has frozen unboxing,
+    /// whose read owes a migration the folded form cannot perform).
     LoadAttr,
     /// `bh_setattr_fn(obj, value, code, name_idx)` — the plain STORE_ATTR
     /// residual (`lower_setattr_hlop_to_insn` → `space.setattr`).  The Ref
     /// operands are the receiver, value, and jitcode's own PyCode; the Int
     /// operand is the co_names index.  The full-body walker recognises this
-    /// tag to fold a plain unboxed same-type integer store to a non-forcing
-    /// raw longlong-list write.  Every unsupported shape keeps the original
-    /// generic setattr residual.
+    /// tag to fold a same-type store to a non-forcing write: an unboxed int or
+    /// float slot takes a raw longlong-list write, a boxed slot a direct
+    /// storage write.  Every unsupported shape keeps the original generic
+    /// setattr residual.
     StoreAttr,
     /// aheui headerless-Node nursery allocation (`jit_alloc_node(value,next)`).
     /// The dynasm backend recognises this tag on the CallR descr to emit an

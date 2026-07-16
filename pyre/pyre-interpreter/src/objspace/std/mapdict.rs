@@ -1258,6 +1258,17 @@ pub unsafe fn load_attr_unboxed_fast_path(
     let attr = unsafe { find_map_attr(map, Wtf8::new(attrname), attrkind) }?;
     let p = unsafe { (*attr).as_plain() };
     let u = p.unboxed.as_ref()?;
+    // mapdict.py:1539 — `LOAD_ATTR_caching` resolves to `attr._direct_read`,
+    // which for an unboxed attribute also migrates `obj` off unboxed storage
+    // once its class froze unboxing (mapdict.py:594-596). The folded read
+    // performs `_prim_direct_read` alone, so leave a frozen class to the
+    // residual, whose `direct_read` still runs that migration.
+    if !unsafe { (*p.terminator).as_terminator() }
+        .allow_unboxing
+        .get()
+    {
+        return None;
+    }
     Some((w_type, version_tag, map, p.storageindex, u.listindex, u.typ))
 }
 
@@ -1265,6 +1276,10 @@ pub unsafe fn load_attr_unboxed_fast_path(
 /// existing plain unboxed slot resolves through the same map lookup; the
 /// caller separately proves that the incoming value has the slot's unbox
 /// type before performing the in-place write (mapdict.py:615-619).
+///
+/// Resolving marks the attribute `ever_mutated`, as `STORE_ATTR_caching` does
+/// before `_direct_write` (mapdict.py:1635-1637): the write the caller folds
+/// out of the trace must not leave the attribute looking unmutated.
 ///
 /// # Safety
 /// `w_obj` must be a live object.
@@ -1310,6 +1325,10 @@ pub unsafe fn store_attr_unboxed_fast_path(
     let attr = unsafe { find_map_attr(map, Wtf8::new(attrname), attrkind) }?;
     let p = unsafe { (*attr).as_plain() };
     let u = p.unboxed.as_ref()?;
+    // mapdict.py:1635-1636 `if not attr.ever_mutated: attr.ever_mutated = True`.
+    if !p.ever_mutated.get() {
+        p.ever_mutated.set(true);
+    }
     Some((w_type, version_tag, map, p.storageindex, u.listindex, u.typ))
 }
 
@@ -1317,6 +1336,9 @@ pub unsafe fn store_attr_unboxed_fast_path(
 /// Unlike an unboxed slot, the value remains a `PyObjectRef`, so the caller
 /// needs only the guarded map and storage index for the direct write
 /// (mapdict.py:446-447).
+///
+/// Marks `ever_mutated` on the resolved attribute for the same reason as
+/// [`store_attr_unboxed_fast_path`].
 ///
 /// # Safety
 /// `w_obj` must be a live object.
@@ -1363,6 +1385,10 @@ pub unsafe fn store_attr_boxed_fast_path(
     let p = unsafe { (*attr).as_plain() };
     if p.unboxed.is_some() {
         return None;
+    }
+    // mapdict.py:1635-1636 `if not attr.ever_mutated: attr.ever_mutated = True`.
+    if !p.ever_mutated.get() {
+        p.ever_mutated.set(true);
     }
     Some((w_type, version_tag, map, p.storageindex))
 }
