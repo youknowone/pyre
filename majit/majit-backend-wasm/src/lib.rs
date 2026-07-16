@@ -151,7 +151,7 @@ use failguard::{
     WasmFrameData, ca_dispatch_exists, ca_dispatch_publish, ca_dispatch_redirect, ca_dispatch_slot,
     call_assembler_target, fail_descr_base, global_fail_descr, label_target,
     publish_call_assembler_target, publish_label_target, register_fail_descrs,
-    register_pending_call_assembler_target, remove_call_assembler_target,
+    register_pending_call_assembler_target,
 };
 use majit_backend::{AsmInfo, BackendError, DeadFrame, JitCellToken};
 use majit_gc::GcAllocator;
@@ -1271,6 +1271,37 @@ fn mark_call_assembler_target_active(target: &CallAssemblerTarget, caller: &JitC
         // the registration borrow above before invalidating those callers.
         mark_call_assembler_terminal_decline(target.compiled_ptr as usize);
         diag_bump(16);
+    }
+}
+
+/// Move the movable-CA caller census from a redirected target to its
+/// replacement. Existing callers retain the old dispatch entry, but terminal
+/// decline of the replacement must still invalidate those callers.
+fn transfer_call_assembler_target_activity(
+    old_target: &CallAssemblerTarget,
+    new_target: &CallAssemblerTarget,
+) {
+    unsafe {
+        let Some(old_loop) = (old_target.compiled_ptr as *const CompiledWasmLoop).as_ref() else {
+            return;
+        };
+        let Some(new_loop) = (new_target.compiled_ptr as *const CompiledWasmLoop).as_ref() else {
+            return;
+        };
+
+        new_loop
+            .ca_active
+            .set(new_loop.ca_active.get() || old_loop.ca_active.get());
+        let old_callers = old_loop.ca_callers.borrow().clone();
+        let mut new_callers = new_loop.ca_callers.borrow_mut();
+        for caller in old_callers {
+            if !new_callers
+                .iter()
+                .any(|known| std::sync::Arc::ptr_eq(known, &caller))
+            {
+                new_callers.push(caller);
+            }
+        }
     }
 }
 
@@ -2746,11 +2777,11 @@ impl majit_backend::Backend for WasmBackend {
         crate::jit_exc_clear();
     }
 
-    fn invalidate_loop(&self, token: &JitCellToken) {
+    fn invalidate_loop(&self, _token: &JitCellToken) {
         // No native code to invalidate — wasm modules are immutable.
-        // Do not leave a CALL_ASSEMBLER dispatch slot pointing at an invalid
-        // table entry while the token is waiting to be freed/recompiled.
-        remove_call_assembler_target(token.number);
+        // A CALL_ASSEMBLER module bakes the stable dispatch entry's address;
+        // its lifetime ends only when CompiledWasmLoop::drop retracts every
+        // alias for that compiled_ptr.
     }
 
     fn redirect_call_assembler(
@@ -2758,15 +2789,44 @@ impl majit_backend::Backend for WasmBackend {
         old: &JitCellToken,
         new: &JitCellToken,
     ) -> Result<(), BackendError> {
-        let Some(mut new_target) = call_assembler_target(new.number) else {
-            return Ok(());
+        let Some(old_target) = call_assembler_target(old.number) else {
+            // Without the old metadata, no baked frame geometry is available
+            // to prove an existing caller can enter the replacement safely.
+            return Err(BackendError::Unsupported(format!(
+                "call-assembler redirect from token {} has no preserved geometry",
+                old.number
+            )));
         };
-        if let Some(old_target) = call_assembler_target(old.number)
-            && old_target.input_types != new_target.input_types
+        let Some(mut new_target) = call_assembler_target(new.number) else {
+            return Err(BackendError::Unsupported(format!(
+                "call-assembler redirect to token {} has no compiled target",
+                new.number
+            )));
+        };
+        if old_target.input_types != new_target.input_types
+            || old_target.callee_frame_bytes != new_target.callee_frame_bytes
+            || old_target.callee_gcmap_ptr != new_target.callee_gcmap_ptr
         {
             return Err(BackendError::Unsupported(format!(
-                "call-assembler redirect from token {} to {} changed input types",
+                "call-assembler redirect from token {} to {} changed baked geometry",
                 old.number, new.number
+            )));
+        }
+        let movable_callee = new_target.callee_frame_bytes != 0
+            && new_target.callee_gcmap_ptr != 0
+            && new_target.compiled_ptr != 0
+            && !new_target.has_trampoline_calls
+            && unsafe {
+                (new_target.compiled_ptr as *const CompiledWasmLoop)
+                    .as_ref()
+                    .is_some_and(|loop_| {
+                        !loop_.has_trampoline_calls.get() && !loop_.ca_terminal_declined.get()
+                    })
+            };
+        if !movable_callee {
+            return Err(BackendError::Unsupported(format!(
+                "call-assembler redirect to token {} is not a movable-CA callee",
+                new.number
             )));
         }
 
@@ -2778,6 +2838,7 @@ impl majit_backend::Backend for WasmBackend {
             new_target.loop_finish_fi,
             new_target.compiled_ptr as u32,
         );
+        transfer_call_assembler_target_activity(&old_target, &new_target);
         new_target.token_number = old.number;
         publish_call_assembler_target(old.number, new_target);
         Ok(())
