@@ -3031,6 +3031,21 @@ fn recipe_parent_frame_from_recipe(
     let (frame_reg, ec_reg) = (u32::from(frame_reg), u32::from(ec_reg));
     let sentinel = u32::from(u16::MAX);
     let result_color = crate::state::result_color_at_pc_at(recipe.jitcode_index, py_pc);
+    if pcmap_recipe_resultcolor_audit_enabled() {
+        // `recipe.jitcode_pc` is the reconstructed frame's resolved RESUME
+        // coordinate. The trivia twin has the same marker/predecessor anchor
+        // tiers as that coordinate's inversion and includes its forward-trivia
+        // semantics, so it is the candidate native replacement for this read.
+        let twin = pjc
+            .result_color_trivia_for_jitcode_pc(recipe.jitcode_pc as usize)
+            .map(|color| color as usize)
+            .filter(|&color| color != u16::MAX as usize);
+        pcmap_recipe_resultcolor_audit_probe("recipe_parent_result_color", "fire");
+        pcmap_recipe_resultcolor_audit_probe(
+            "recipe_parent_result_color",
+            if twin == result_color { "eq" } else { "di" },
+        );
+    }
 
     let banks = crate::state::frame_liveness_reg_indices_by_bank_from_pc(
         recipe.jitcode_index,
@@ -10729,6 +10744,29 @@ pub(crate) fn result_color_audit_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_RESULT_AUDIT").is_some())
 }
 
+/// `PYRE_PCMAP_RECIPE_RESULTCOLOR_AUDIT` is a report-only census for the
+/// recipe resume-coordinate result-color reader and the multi-frame callee
+/// diagnostic's inversion. The optional `_PROBE` receives a fire row followed
+/// by its verdict, since `check.py` discards diagnostic stderr.
+fn pcmap_recipe_resultcolor_audit_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_RECIPE_RESULTCOLOR_AUDIT").is_some())
+}
+
+fn pcmap_recipe_resultcolor_audit_probe(site: &'static str, verdict: &'static str) {
+    if let Some(path) = std::env::var_os("PYRE_PCMAP_RECIPE_RESULTCOLOR_AUDIT_PROBE") {
+        use std::io::Write;
+
+        if let Ok(mut probe) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(probe, "recipe_resultcolor\t{site}\t{verdict}");
+        }
+    }
+}
+
 /// `PYRE_PCMAP_PFRESUME_AUDIT` records paused-parent-frame coordinate
 /// resolution variants and retains the nested builder's twin assertions.
 /// Diagnostic only; phase 2 makes `ParentResumeCoord` authoritative.
@@ -13301,7 +13339,9 @@ fn walker_capture_multi_frame_inline_snapshot(
     if !callee_pjc.is_populated() || callee_pjc.code_ptr.is_null() {
         return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: callee_op_pc });
     }
-    if std::env::var_os("PYRE_FBW_MF_DIAG").is_some() {
+    let mf_diag = std::env::var_os("PYRE_FBW_MF_DIAG").is_some();
+    let recipe_resultcolor_audit = pcmap_recipe_resultcolor_audit_enabled();
+    if mf_diag || recipe_resultcolor_audit {
         let callee_py_pc = unsafe {
             let code = &*callee_pjc.code_ptr;
             let mut py = python_pc_for_jitcode_pc(&callee_pjc.metadata, callee_op_pc);
@@ -13311,56 +13351,89 @@ fn walker_capture_multi_frame_inline_snapshot(
             }
             py
         };
-        let pcdep = callee_pjc
-            .metadata
-            .pcdep_color_slots
-            .get(callee_py_pc as usize)
-            .cloned()
-            .unwrap_or_default();
-        let depth = callee_pjc
-            .metadata
-            .depth_at_py_pc
-            .get(callee_py_pc as usize)
-            .copied()
-            .unwrap_or(0);
-        let banks = crate::state::frame_liveness_reg_indices_by_bank_at(
-            callee_jitcode_index as i32,
-            callee_op_pc as i32,
-        );
-        eprintln!(
-            "[fbw-mf-diag] callee jc={callee_jitcode_index} op_pc={callee_op_pc} \
+        if recipe_resultcolor_audit {
+            // The snapshot selects this native resume coordinate below. For
+            // non-branch captures, its marker construction already applies
+            // the same trivia (and, after a residual call, semantic
+            // fallthrough) transform as the diagnostic inversion above.
+            let (site, native_marker) = match scope.branch_guard_jitcode_pc {
+                Some(_) => ("mf_callee_inversion_branch_external", None),
+                None if after_residual_call => (
+                    "mf_callee_inversion_after_residual",
+                    callee_pjc.after_residual_marker_for_jitcode_pc(callee_op_pc),
+                ),
+                None => (
+                    "mf_callee_inversion_plain",
+                    callee_pjc.resume_marker_for_jitcode_pc(callee_op_pc),
+                ),
+            };
+            pcmap_recipe_resultcolor_audit_probe(site, "fire");
+            let verdict = match (scope.branch_guard_jitcode_pc, native_marker) {
+                (Some(_), _) => "branch_external",
+                (None, Some(marker)) => {
+                    let native_py = python_pc_for_jitcode_pc(&callee_pjc.metadata, marker) as usize;
+                    if native_py == callee_py_pc as usize {
+                        "eq"
+                    } else {
+                        "di"
+                    }
+                }
+                (None, None) => "native_miss",
+            };
+            pcmap_recipe_resultcolor_audit_probe(site, verdict);
+        }
+        if mf_diag {
+            let pcdep = callee_pjc
+                .metadata
+                .pcdep_color_slots
+                .get(callee_py_pc as usize)
+                .cloned()
+                .unwrap_or_default();
+            let depth = callee_pjc
+                .metadata
+                .depth_at_py_pc
+                .get(callee_py_pc as usize)
+                .copied()
+                .unwrap_or(0);
+            let banks = crate::state::frame_liveness_reg_indices_by_bank_at(
+                callee_jitcode_index as i32,
+                callee_op_pc as i32,
+            );
+            eprintln!(
+                "[fbw-mf-diag] callee jc={callee_jitcode_index} op_pc={callee_op_pc} \
              py_pc={callee_py_pc} after_residual={after_residual_call} depth={depth} \
              pcdep_color_slots={pcdep:?}"
-        );
-        eprintln!(
-            "[fbw-mf-diag]   live banks: i={:?} r={:?} f={:?}",
-            banks.int, banks.ref_, banks.float
-        );
-        for &c in &banks.ref_ {
-            eprintln!(
-                "[fbw-mf-diag]   regs_r[{c}] = {:?}",
-                ctx.registers_r.get(c as usize)
             );
-        }
-        for &c in &banks.int {
             eprintln!(
-                "[fbw-mf-diag]   regs_i[{c}] = {:?}",
-                ctx.registers_i.get(c as usize)
+                "[fbw-mf-diag]   live banks: i={:?} r={:?} f={:?}",
+                banks.int, banks.ref_, banks.float
             );
-        }
-        unsafe {
-            let code = &*callee_pjc.code_ptr;
-            let lo = callee_py_pc.saturating_sub(3);
-            for py in lo..callee_py_pc + 5 {
-                if let Some((instr, arg)) =
-                    pyre_interpreter::decode_instruction_at(code, py as usize)
-                {
-                    let mark = if py == callee_py_pc {
-                        " <== resume"
-                    } else {
-                        ""
-                    };
-                    eprintln!("[fbw-mf-diag]   py{py}: {instr:?} arg={arg:?}{mark}");
+            for &c in &banks.ref_ {
+                eprintln!(
+                    "[fbw-mf-diag]   regs_r[{c}] = {:?}",
+                    ctx.registers_r.get(c as usize)
+                );
+            }
+            for &c in &banks.int {
+                eprintln!(
+                    "[fbw-mf-diag]   regs_i[{c}] = {:?}",
+                    ctx.registers_i.get(c as usize)
+                );
+            }
+            unsafe {
+                let code = &*callee_pjc.code_ptr;
+                let lo = callee_py_pc.saturating_sub(3);
+                for py in lo..callee_py_pc + 5 {
+                    if let Some((instr, arg)) =
+                        pyre_interpreter::decode_instruction_at(code, py as usize)
+                    {
+                        let mark = if py == callee_py_pc {
+                            " <== resume"
+                        } else {
+                            ""
+                        };
+                        eprintln!("[fbw-mf-diag]   py{py}: {instr:?} arg={arg:?}{mark}");
+                    }
                 }
             }
         }
