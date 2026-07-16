@@ -12687,7 +12687,7 @@ fn walker_capture_snapshot_for_last_guard_impl(
             // set.
             // Capture-only: writes the transient snapshot overlay, never the live
             // shadow (the trace_opcode.rs:2218 bridge-NULL constraint holds).
-            let stack_sync: Vec<(usize, OpRef)> = if guard_py_pc.is_some()
+            let mut stack_sync: Vec<(usize, OpRef)> = if guard_py_pc.is_some()
                 && sym.owns_virtualizable_shadow()
                 && !sym.jitcode.is_null()
             {
@@ -12823,19 +12823,6 @@ fn walker_capture_snapshot_for_last_guard_impl(
             } else {
                 stack_sync
             };
-            let saved_shadow: Vec<(usize, Option<OpRef>)> = stack_sync
-                .iter()
-                .map(|&(idx, _)| (idx, ctx.trace_ctx.virtualizable_box_at(idx)))
-                .collect();
-            for &(idx, v) in &stack_sync {
-                ctx.trace_ctx.set_virtualizable_box_at(idx, v);
-            }
-            let (vable_boxes, vref_boxes) = ctx.trace_ctx.build_snapshot_vable_vref_boxes();
-            for (idx, old) in saved_shadow {
-                if let Some(old) = old {
-                    ctx.trace_ctx.set_virtualizable_box_at(idx, old);
-                }
-            }
             // `scope.branch_guard_jitcode_pc` / `guard_py_pc` derived above
             // (before the stack overlay, which needs `guard_py_pc` for the #124
             // kept-stack source recovery): map the guard's own jitcode pc to its
@@ -13037,6 +13024,64 @@ fn walker_capture_snapshot_for_last_guard_impl(
             // `collect_outer_active_boxes`.  A non-branch guard carries no guard
             // pc, so it keeps the merge `py_pc` and its exact resume-translation.
             let liveness_py_pc = guard_py_pc.unwrap_or(py_pc);
+            // A residual result is installed in the active register bank before
+            // the exception guard captures resume data
+            // (`rpython/jit/metainterp/pyjitpl.py:1951-1955`).  Project every
+            // live Ref register of the owning frame through the resume
+            // position's color-to-slot map so the separately encoded
+            // virtualizable array read by `virtualizable.py:86-99` carries the
+            // same locals and operand-stack values as the frame section.  Inner
+            // frames have no ownership of this shadow and are handled by the
+            // multi-frame path above.
+            if after_residual_call && sym.owns_virtualizable_shadow() {
+                let maps = crate::state::bridge_semantic_maps_at_with_jitcode_pc(
+                    jitcode_index as i32,
+                    liveness_py_pc as i32,
+                    guard_jitcode_pc,
+                );
+                let banks = crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
+                    jitcode_index as i32,
+                    guard_jitcode_pc,
+                );
+                let semantic_limit = sym.nlocals + maps.stack_depth_at_pc;
+                let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
+                for &(bank, color, slot) in &maps.pcdep_entries {
+                    if bank != 1
+                        || slot as usize >= semantic_limit
+                        || !banks.ref_.contains(&(color as u32))
+                    {
+                        continue;
+                    }
+                    let Some(&value) = ctx.registers_r.get(color as usize) else {
+                        continue;
+                    };
+                    if value == OpRef::NONE || value.ty() != Some(majit_ir::Type::Ref) {
+                        continue;
+                    }
+                    let vable_index = nvs + slot as usize;
+                    if let Some((_, current)) = stack_sync
+                        .iter_mut()
+                        .find(|(index, _)| *index == vable_index)
+                    {
+                        *current = value;
+                    } else {
+                        stack_sync.push((vable_index, value));
+                    }
+                }
+            }
+            let saved_shadow: Vec<(usize, Option<OpRef>)> = stack_sync
+                .iter()
+                .map(|&(idx, _)| (idx, ctx.trace_ctx.virtualizable_box_at(idx)))
+                .collect();
+            for &(idx, value) in &stack_sync {
+                ctx.trace_ctx.set_virtualizable_box_at(idx, value);
+            }
+            let (vable_boxes, vref_boxes) = ctx.trace_ctx.build_snapshot_vable_vref_boxes();
+            for (idx, old) in saved_shadow {
+                if let Some(old) = old {
+                    ctx.trace_ctx.set_virtualizable_box_at(idx, old);
+                }
+            }
             let (entry_jitcode_pc, entry_twin, entry_caller) = if guard_py_pc.is_some() {
                 let entry_jitcode_pc = unsafe {
                     let metadata = &(&*sym.jitcode).payload.metadata;
