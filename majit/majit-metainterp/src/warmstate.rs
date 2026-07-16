@@ -287,9 +287,10 @@ fn default_enable_opts() -> Vec<String> {
     ]
 }
 
-/// Maximum number of trace aborts before permanently marking a green key
-/// as DONT_TRACE_HERE. Prevents infinite retrace loops when optimization
-/// always fails (e.g. InvalidLoop) for the same key.
+/// Pyre-local abort ceiling with no upstream analogue: after repeated aborts,
+/// mark the green key `DONT_TRACE_HERE`.  Pyre walker aborts are structural
+/// and recur identically on retrace; without a ceiling the same body would
+/// retrace forever, each attempt executing its residual calls concretely.
 const MAX_TRACE_ABORT_COUNT: u32 = 5;
 
 /// rlib/jit.py:599 disable_unrolling = 200
@@ -716,7 +717,7 @@ impl WarmEnterState {
 
     /// Typed-key variant of [`Self::abort_tracing`]. Walks the bucket
     /// chain by comparekey so a collided typed green mutates its own
-    /// cell's `JC_TRACING` / abort-count / `DONT_TRACE_HERE` state.
+    /// cell's `JC_TRACING` / pyre-local abort-count / `DONT_TRACE_HERE` state.
     pub fn abort_tracing_for_key(&mut self, key: &GreenKey, disable_noninlinable_function: bool) {
         if let Some(cell) = self.lookup_chain_with_key_mut(key) {
             cell.flags &= !jc_flags::TRACING;
@@ -842,9 +843,8 @@ impl WarmEnterState {
 
     /// Mark that tracing was aborted for a green key.
     ///
-    /// RPython parity:
-    /// - non-permanent aborts clear TRACING and allow a future retry
-    /// - permanent aborts mark the location as DONT_TRACE_HERE
+    /// Non-permanent aborts clear `JC_TRACING` and allow a future retry until
+    /// pyre's abort ceiling marks the location `DONT_TRACE_HERE`.
     pub fn abort_tracing(&mut self, green_key_hash: u64, disable_noninlinable_function: bool) {
         if let Some(cell) = self.cells.get_mut(&green_key_hash) {
             cell.flags &= !jc_flags::TRACING;

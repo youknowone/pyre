@@ -4988,7 +4988,13 @@ fn maybe_compile_and_run(
     if driver.has_compiled_loop(green_key) {
         return execute_assembler(frame, green_key, loop_header_pc, driver, info, env);
     }
-    // warmstate.py:484: DONT_TRACE_HERE → skip counter tick entirely
+    // Pyre-local deviation: this short-circuit treats `DONT_TRACE_HERE` as a
+    // permanent never-trace blacklist and returns before the counter tick.
+    // Upstream `warmstate.py:485-495` uses the identically named flag to force
+    // a separate trace when no procedure token has been seen; the ported
+    // behavior exists in `warmstate.rs::should_start_dont_trace_here_trace`
+    // and `warmstate.rs::can_inline_callable`, but this eval-layer guard
+    // shadows it.
     if driver
         .meta_interp()
         .warm_state_ref()

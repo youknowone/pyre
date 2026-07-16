@@ -600,8 +600,10 @@ pub fn trace_bytecode(
     //
     // A green key in `FBW_DECLINED_KEYS` had a prior walk fail on a
     // structural walker limitation (the recurring error classes in
-    // `full_body_walk_trace`); retraces bypass the walker and interpret
-    // without JIT instead of permanently blacklisting the location.
+    // `full_body_walk_trace`).  `FBW_DECLINED_KEYS` is insert/contains only,
+    // so the decline is permanent for this process: retraces bypass the
+    // walker and the key re-interprets without JIT instead of being
+    // permanently blacklisted (`DONT_TRACE_HERE`).
     if carrier.is_none()
         && std::env::var_os("PYRE_FULL_BODY_WALK").as_deref() != Some(std::ffi::OsStr::new("0"))
         && !fbw_declined(crate::driver::make_green_key(w_code, start_pc))
@@ -3014,21 +3016,17 @@ fn full_body_walk_trace(
         Some((_entry, _code_len, Err(e))) => {
             // Structural walker limitations recur identically on every
             // retrace of this location (the same jitcode walked from the same
-            // entry produces the same error), so route the key's retraces to
-            // interpretation instead of thrashing futile deep re-walks —
+            // entry produces the same error), so record the key in
+            // `FBW_DECLINED_KEYS` instead of thrashing futile deep re-walks —
             // each of which executes the body's residual calls concretely
             // before failing at the unsupported resume / exception / closure
-            // shape.  Permanently blacklisting (`AbortPermanent` →
-            // `DONT_TRACE_HERE`) is wrong here: it leaves the location
-            // interpreting forever (a try-protected raise in a hot loop
-            // deopt-storms past any timeout), and upstream never marks a
-            // location untraceable on an abort (pyjitpl.py:2392
-            // aborted_tracing).  These are the multi-session-blocked
-            // shapes (resume snapshot #124, exception-handler resume #51c,
-            // closure NULL-self #60, unported raise marker, a residual
-            // arg register the walk never binds); other errors retain the
-            // plain `Abort` without declining so a capability that lands
-            // mid-run can still pick the location up.
+            // shape.  `FBW_DECLINED_KEYS` is a permanent per-process decline:
+            // the key re-interprets without tracing.  These are the
+            // multi-session-blocked shapes (resume snapshot #124,
+            // exception-handler resume #51c, closure NULL-self #60, unported
+            // raise marker, a residual arg register the walk never binds);
+            // other errors retain the plain `Abort` without declining so a
+            // capability that lands mid-run can still pick the location up.
             use crate::jitcode_dispatch::DispatchError as DE;
             crate::jitcode_dispatch::census_record(e.variant_name());
             if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
@@ -3036,9 +3034,10 @@ fn full_body_walk_trace(
             }
             match e {
                 // A kept-stack branch guard whose not-taken arm reads an
-                // unrestorable boxed Ref register cannot safely be retraced.
-                // Mark the location `DONT_TRACE_HERE` so it interprets
-                // permanently — correct, matching the pre-#416/#420 decline.
+                // unrestorable boxed Ref register is a structural abort.
+                // Keeping the permanent mapping is behavior-neutral: a plain
+                // `Abort` reaches the same `DONT_TRACE_HERE` terminal state
+                // through pyre's abort ceiling.
                 DE::BranchGuardUnrestorableKeptStackPermanent { .. } => TraceAction::AbortPermanent,
                 // #57 (Finding #1): a non-journalable in-place container mutation
                 // in a FOR_ITER body cannot be rolled back on abort, so this

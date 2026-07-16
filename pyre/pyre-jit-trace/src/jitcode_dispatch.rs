@@ -1452,14 +1452,11 @@ pub enum DispatchError {
     /// feeds NULL into the consuming op — the boxed-int short-circuit /
     /// conditional-expression resume miscompile (a heap `ConstPtr`, an int
     /// outside the 1-byte immediate range `[0, 256)`, parked in a register
-    /// live-across the guard).  Unlike [`BranchGuardKeptStackUnsupported`],
-    /// this shape is miscompiled the SAME way by BOTH the full-body walk and
-    /// the trait leg (both re-execute the identical not-taken arm on deopt),
-    /// so a recoverable [`TraceAction::Abort`] would retry the unsound shape.
-    /// The driver maps this to
-    /// `TraceAction::AbortPermanent` → `DONT_TRACE_HERE`: the loop runs in
-    /// the interpreter (correct, matching the pre-#416/#420 decline) and is
-    /// never retraced by either leg.
+    /// live-across the guard).  The driver maps this to
+    /// `TraceAction::AbortPermanent` → `DONT_TRACE_HERE`.  Demoting it to a
+    /// plain [`TraceAction::Abort`] would still reach the same terminal state
+    /// through pyre's abort ceiling, so the permanent mapping records the
+    /// structural nature of this abort without changing runtime behavior.
     BranchGuardUnrestorableKeptStackPermanent { pc: usize },
     /// A callee compiled as its own Finish portal (reached via
     /// `call_user_function_with_eval`) accessed its frame through a
@@ -10627,12 +10624,12 @@ fn step_vstack_mirror(ctx: &mut WalkContext<'_, '_>, jit_pc: usize) {
     if !ctx.vstack_valid {
         return;
     }
-    // Inside an inline sub-walk the `jit_pc` is a CALLEE coordinate that
-    // does not exist in the outer (`fbw_mode.snapshot_sym`) jitcode's
-    // py_pc→jitcode tables.  Without the `PYRE_FBW_CALLEE_VSTACK` gate the
-    // mirror declines (a callee `write_ref_reg` would clobber
-    // `vstack_last_ref`); with it, the coordinate is resolved through the
-    // active callee jitcode metadata instead.
+    // On genuine callee sub-walk paths, `jit_pc` is a callee coordinate with
+    // no meaning in the outer (`fbw_mode.snapshot_sym`) jitcode's py_pc→jitcode
+    // tables.  `inline_subwalk` is also set for the carrier walk of root code,
+    // where that premise does not hold and the mirror is simply never seeded.
+    // With `PYRE_FBW_CALLEE_VSTACK` off this branch documents intent only:
+    // `seed_callee_vstack_mirror` is gated by the same flag.
     let (new_pypc, code_ptr, new_depth) = if ctx.fbw_mode.inline_subwalk {
         if !fbw_callee_vstack_enabled() {
             ctx.vstack_valid = false;
