@@ -389,6 +389,8 @@ unsafe fn type_object_destructor(obj_addr: usize) {
 /// `gc.collect()` runs) is not reclaimed.
 unsafe fn generator_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let gen_obj = unsafe { &mut *(obj_addr as *mut pyre_object::generator::GeneratorIterator) };
+    f(&mut gen_obj.name as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    f(&mut gen_obj.qualname as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     if !gen_obj.frame_ptr.is_null() {
         let frame = gen_obj.frame_ptr as *mut PyFrame;
         if pyre_object::gc_hook::try_gc_owns_object(gen_obj.frame_ptr) {
@@ -2441,6 +2443,35 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
         )],
     ));
     debug_assert_eq!(frame_block_tid, FRAME_BLOCK_GC_TYPE_ID);
+    // setobject.py W_SetIterObject — AUTO-ID typed payload. Its live `w_set`
+    // edge is traced, preserving a source owned solely by an iterator. Keep
+    // this at the absolute tail of the type-id chain: inserting it before the
+    // fixed FrameDebugData/FrameBlock slots changes their generated ids and
+    // corrupts JIT frame payloads during guard/resume.
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_object::setobject::W_SetIterObject
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_object::iterobject::W_ListIterObject
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_object::iterobject::W_ListReverseIterObject
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_object::iterobject::W_TupleIterObject
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
     // rclass.py:340-346 — assign subclassrange_{min,max} to each
     // vtable entry. freeze_types() runs assign_inheritance_ids
     // (normalizecalls.py:373-389), then we write the computed ranges

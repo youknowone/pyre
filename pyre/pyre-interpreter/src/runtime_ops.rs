@@ -3,10 +3,11 @@ use std::sync::OnceLock;
 
 use crate::bytecode::{BinaryOperator, ComparisonOperator, ConvertValueOparg};
 use pyre_object::{
-    PY_NULL, PyObjectRef, W_SeqIterObject, is_instance, is_list, is_range_iter, is_seq_iter,
-    is_str, is_tuple, w_dict_new, w_dict_store_checked, w_int_get_value, w_int_new, w_list_getitem,
-    w_list_len, w_list_new, w_range_iter_has_next, w_range_iter_next, w_str_from_wtf8,
-    w_str_get_wtf8, w_str_len, w_tuple_getitem, w_tuple_len, w_tuple_new,
+    PY_NULL, PyObjectRef, W_ListIterObject, W_SeqIterObject, W_TupleIterObject, is_instance,
+    is_list, is_list_iter, is_range_iter, is_seq_iter, is_str, is_tuple, is_tuple_iter, w_dict_new,
+    w_dict_store_checked, w_int_get_value, w_int_new, w_list_getitem, w_list_len, w_list_new,
+    w_range_iter_has_next, w_range_iter_next, w_str_from_wtf8, w_str_get_wtf8, w_str_len,
+    w_tuple_getitem, w_tuple_len, w_tuple_new,
 };
 use rustpython_wtf8::{Wtf8, Wtf8Buf};
 
@@ -1319,7 +1320,7 @@ pub fn unpack_ex_slots(
 
 pub fn ensure_range_iter(iter: PyObjectRef) -> Result<(), PyError> {
     unsafe {
-        if is_range_iter(iter) || is_seq_iter(iter) {
+        if is_range_iter(iter) || is_seq_iter(iter) || is_list_iter(iter) || is_tuple_iter(iter) {
             return Ok(());
         }
         // Convert list/tuple to seq iterator
@@ -1391,6 +1392,14 @@ pub fn range_iter_continues(iter: PyObjectRef) -> Result<bool, PyError> {
             let len = seq_iter_current_len(si.seq).unwrap_or(si.length);
             return Ok(si.index < len);
         }
+        if is_list_iter(iter) {
+            let si = &*(iter as *const W_ListIterObject);
+            return Ok(!si.seq.is_null() && si.index < w_list_len(si.seq) as i64);
+        }
+        if is_tuple_iter(iter) {
+            let si = &*(iter as *const W_TupleIterObject);
+            return Ok(!si.seq.is_null() && si.index < w_tuple_len(si.seq) as i64);
+        }
     }
     Err(PyError::type_error("not an iterator"))
 }
@@ -1461,6 +1470,30 @@ pub fn range_iter_next_or_null(iter: PyObjectRef) -> Result<PyObjectRef, PyError
             // held iterator's `__reduce__`/`__length_hint__` report it as an
             // exhausted cursor (matches the generic-`__getitem__` arm of
             // `baseobjspace::next`).
+            si.seq = PY_NULL;
+            return Ok(PY_NULL);
+        }
+        if is_list_iter(iter) {
+            let si = &mut *(iter as *mut W_ListIterObject);
+            if si.seq.is_null() {
+                return Ok(PY_NULL);
+            }
+            if let Some(item) = w_list_getitem(si.seq, si.index) {
+                si.index += 1;
+                return Ok(item);
+            }
+            si.seq = PY_NULL;
+            return Ok(PY_NULL);
+        }
+        if is_tuple_iter(iter) {
+            let si = &mut *(iter as *mut W_TupleIterObject);
+            if si.seq.is_null() {
+                return Ok(PY_NULL);
+            }
+            if let Some(item) = w_tuple_getitem(si.seq, si.index) {
+                si.index += 1;
+                return Ok(item);
+            }
             si.seq = PY_NULL;
             return Ok(PY_NULL);
         }

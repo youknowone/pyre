@@ -1731,14 +1731,14 @@ unsafe fn range_compute_slice(obj: PyObjectRef, slice: PyObjectRef) -> PyResult 
 }
 
 /// `range.count(value)` — `functional.py W_Range.descr_count`.
-fn range_count_method(args: &[PyObjectRef]) -> PyResult {
+pub(crate) fn range_count_method(args: &[PyObjectRef]) -> PyResult {
     let obj = args[0];
     let needle = if args.len() > 1 { args[1] } else { PY_NULL };
     Ok(w_int_new(if contains(obj, needle)? { 1 } else { 0 }))
 }
 
 /// `range.index(value)` — `functional.py W_Range.descr_index`.
-fn range_index_method(args: &[PyObjectRef]) -> PyResult {
+pub(crate) fn range_index_method(args: &[PyObjectRef]) -> PyResult {
     let obj = args[0];
     let needle = if args.len() > 1 { args[1] } else { PY_NULL };
     unsafe {
@@ -1776,18 +1776,18 @@ fn range_index_method(args: &[PyObjectRef]) -> PyResult {
 }
 
 /// `range.__iter__()` — fresh `range_iterator` (word-fit or bignum cursor).
-fn range_iter_method(args: &[PyObjectRef]) -> PyResult {
+pub(crate) fn range_iter_method(args: &[PyObjectRef]) -> PyResult {
     iter(args[0])
 }
 
 /// `range.__reversed__()` — `functional.py W_Range.descr_reversed`.
-fn range_reversed_method(args: &[PyObjectRef]) -> PyResult {
+pub(crate) fn range_reversed_method(args: &[PyObjectRef]) -> PyResult {
     unsafe { Ok(pyre_object::w_range_reversed(args[0])) }
 }
 
 /// `range.__reduce__()` — `functional.py W_Range.descr_reduce`:
 /// `(type(self), (start, stop, step))`.
-fn range_reduce_method(args: &[PyObjectRef]) -> PyResult {
+pub(crate) fn range_reduce_method(args: &[PyObjectRef]) -> PyResult {
     let (start, stop, step) = unsafe { pyre_object::w_range_fields(args[0]) };
     // `range` is bound in builtins as a constructor function, not as the
     // registry type object, so the reconstructor must be that name-bound
@@ -1802,7 +1802,7 @@ fn range_reduce_method(args: &[PyObjectRef]) -> PyResult {
 /// `(length, start, step)` tuple, collapsing trailing fields to `None`
 /// for empty (`(len, None, None)`) and single-element (`(len, start,
 /// None)`) ranges so equal ranges hash equal.
-fn range_hash_method(args: &[PyObjectRef]) -> PyResult {
+pub(crate) fn range_hash_method(args: &[PyObjectRef]) -> PyResult {
     use num_traits::Zero;
     let (start, _stop, step) = unsafe { pyre_object::w_range_fields(args[0]) };
     let len_obj = unsafe { pyre_object::w_range_length(args[0]) };
@@ -1822,7 +1822,7 @@ fn range_hash_method(args: &[PyObjectRef]) -> PyResult {
 /// `space.getbuiltin(name)` — the reduce tuple's first element must be
 /// the live builtin so `pickle` recreates the iterator via `iter(seq)` /
 /// `enumerate(iterable)`.
-fn builtin_callable(name: &str) -> PyObjectRef {
+pub(crate) fn builtin_callable(name: &str) -> PyObjectRef {
     let ctx = crate::call::getexecutioncontext();
     if ctx.is_null() {
         return PY_NULL;
@@ -1834,7 +1834,7 @@ fn builtin_callable(name: &str) -> PyObjectRef {
 /// W_AbstractSeqIterObject.descr_reduce`: `(iter, (seq,), index)` for a live
 /// sequence; an exhausted iterator (`w_seq is None`) pickles to `_empty_iterable`
 /// (`iterobject.py:251-253`) = `(iter, ((),))` so it restores empty.
-fn seq_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
+pub(crate) fn seq_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
     unsafe {
         let seq = pyre_object::w_seq_iter_seq(args[0]);
         if seq.is_null() {
@@ -1856,7 +1856,7 @@ fn seq_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
 /// sequence is live, clamping a negative index to 0.  There is no upper clamp —
 /// an out-of-range cursor is absorbed by `next` raising StopIteration on the
 /// IndexError.
-fn seq_iter_setstate_method(args: &[PyObjectRef]) -> PyResult {
+pub(crate) fn seq_iter_setstate_method(args: &[PyObjectRef]) -> PyResult {
     let mut index = int_w(args[1])?;
     unsafe {
         if pyre_object::w_seq_iter_seq(args[0]).is_null() {
@@ -1877,7 +1877,7 @@ fn seq_iter_setstate_method(args: &[PyObjectRef]) -> PyResult {
 /// reports 0.  A missing or raising `__len__` propagates as a real error;
 /// `operator.length_hint` then maps a TypeError to its default, exactly as a
 /// direct `space.len` would.
-fn seq_iter_length_hint_method(args: &[PyObjectRef]) -> PyResult {
+pub(crate) fn seq_iter_length_hint_method(args: &[PyObjectRef]) -> PyResult {
     unsafe {
         let seq = pyre_object::w_seq_iter_seq(args[0]);
         if seq.is_null() {
@@ -1889,10 +1889,156 @@ fn seq_iter_length_hint_method(args: &[PyObjectRef]) -> PyResult {
     }
 }
 
+/// `iterobject.py W_AbstractSeqIterObject.descr_reduce`, for the specialized
+/// `W_FastListIterObject` payload used by Python 3.14's `list_iterator`.
+pub(crate) fn list_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
+    unsafe {
+        let seq = pyre_object::w_list_iter_seq(args[0]);
+        if seq.is_null() {
+            return Ok(w_tuple_new(vec![
+                builtin_callable("iter"),
+                w_tuple_new(vec![w_tuple_new(vec![])]),
+            ]));
+        }
+        Ok(w_tuple_new(vec![
+            builtin_callable("iter"),
+            w_tuple_new(vec![seq]),
+            w_int_new(pyre_object::w_list_iter_index(args[0])),
+        ]))
+    }
+}
+
+pub(crate) fn list_iter_setstate_method(args: &[PyObjectRef]) -> PyResult {
+    let mut index = int_w(args[1])?;
+    unsafe {
+        if pyre_object::w_list_iter_seq(args[0]).is_null() {
+            return Ok(w_none());
+        }
+        // CPython 3.14's listiter_setstate parses the state through an
+        // unsigned size; a negative value therefore becomes an exhausted
+        // cursor. This is a deliberate 3.14 oracle difference from PyPy's
+        // abstract sequence iterator, which clamps negative state to zero.
+        if index < 0 {
+            index = i64::MAX;
+        }
+        pyre_object::w_list_iter_set_index(args[0], index);
+    }
+    Ok(w_none())
+}
+
+pub(crate) fn list_iter_length_hint_method(args: &[PyObjectRef]) -> PyResult {
+    unsafe {
+        let seq = pyre_object::w_list_iter_seq(args[0]);
+        if seq.is_null() {
+            return Ok(w_int_new(0));
+        }
+        Ok(w_int_new(
+            (pyre_object::w_list_len(seq) as i64 - pyre_object::w_list_iter_index(args[0])).max(0),
+        ))
+    }
+}
+
+pub(crate) fn tuple_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
+    unsafe {
+        let seq = pyre_object::w_tuple_iter_seq(args[0]);
+        if seq.is_null() {
+            return Ok(w_tuple_new(vec![
+                builtin_callable("iter"),
+                w_tuple_new(vec![w_tuple_new(vec![])]),
+            ]));
+        }
+        Ok(w_tuple_new(vec![
+            builtin_callable("iter"),
+            w_tuple_new(vec![seq]),
+            w_int_new(pyre_object::w_tuple_iter_index(args[0])),
+        ]))
+    }
+}
+
+pub(crate) fn tuple_iter_setstate_method(args: &[PyObjectRef]) -> PyResult {
+    let mut index = int_w(args[1])?;
+    unsafe {
+        if pyre_object::w_tuple_iter_seq(args[0]).is_null() {
+            return Ok(w_none());
+        }
+        // PyPy W_AbstractSeqIterObject.descr_setstate and CPython 3.14's
+        // tuple iterator both clamp a negative cursor to zero.
+        if index < 0 {
+            index = 0;
+        }
+        pyre_object::w_tuple_iter_set_index(args[0], index);
+    }
+    Ok(w_none())
+}
+
+pub(crate) fn tuple_iter_length_hint_method(args: &[PyObjectRef]) -> PyResult {
+    unsafe {
+        let seq = pyre_object::w_tuple_iter_seq(args[0]);
+        if seq.is_null() {
+            return Ok(w_int_new(0));
+        }
+        Ok(w_int_new(
+            (pyre_object::w_tuple_len(seq) as i64 - pyre_object::w_tuple_iter_index(args[0]))
+                .max(0),
+        ))
+    }
+}
+
+/// `iterobject.py W_ReverseSeqIterObject` pickle/state/length protocol.
+pub(crate) fn list_reverse_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
+    unsafe {
+        let seq = pyre_object::w_list_reverse_iter_seq(args[0]);
+        if seq.is_null() {
+            return Ok(w_tuple_new(vec![
+                builtin_callable("iter"),
+                w_tuple_new(vec![w_tuple_new(vec![])]),
+            ]));
+        }
+        Ok(w_tuple_new(vec![
+            builtin_callable("reversed"),
+            w_tuple_new(vec![seq]),
+            w_int_new(pyre_object::w_list_reverse_iter_index(args[0])),
+        ]))
+    }
+}
+
+pub(crate) fn list_reverse_iter_setstate_method(args: &[PyObjectRef]) -> PyResult {
+    let mut index = int_w(args[1])?;
+    unsafe {
+        let seq = pyre_object::w_list_reverse_iter_seq(args[0]);
+        if seq.is_null() {
+            return Ok(w_none());
+        }
+        let length = pyre_object::w_list_len(seq) as i64;
+        if index >= length {
+            index = length - 1;
+        }
+        pyre_object::w_list_reverse_iter_set_index(args[0], index);
+    }
+    Ok(w_none())
+}
+
+pub(crate) fn list_reverse_iter_length_hint_method(args: &[PyObjectRef]) -> PyResult {
+    unsafe {
+        let seq = pyre_object::w_list_reverse_iter_seq(args[0]);
+        if seq.is_null() {
+            return Ok(w_int_new(0));
+        }
+        let length = pyre_object::w_list_reverse_iter_index(args[0]) + 1;
+        Ok(w_int_new(
+            if pyre_object::w_list_len(seq) as i64 >= length {
+                length.max(0)
+            } else {
+                0
+            },
+        ))
+    }
+}
+
 /// `range_iterator.__reduce__()` — `functional.py
 /// W_IntRangeIterator.descr_reduce`: pyre rebuilds a `range(current, stop,
 /// step)` covering the remaining span, then returns `(iter, (range,), None)`.
-fn range_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
+pub(crate) fn range_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
     unsafe {
         let (current, remaining, step) = pyre_object::w_range_iter_fields(args[0]);
         let stop = BigInt::from(current) + BigInt::from(remaining) * step;
@@ -1907,14 +2053,14 @@ fn range_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
 }
 
 /// `range_iterator.__length_hint__()` — remaining element count.
-fn range_iter_length_hint_method(args: &[PyObjectRef]) -> PyResult {
+pub(crate) fn range_iter_length_hint_method(args: &[PyObjectRef]) -> PyResult {
     unsafe { Ok(w_int_new(pyre_object::w_range_iter_remaining(args[0]))) }
 }
 
 /// `longrange_iterator.__reduce__()` — rebuild a `range` covering the
 /// remaining span (`current = start + index*step`, `stop = start +
 /// len*step`), `(iter, (range,), None)`.
-fn long_range_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
+pub(crate) fn long_range_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
     unsafe {
         let (start, step, len, index) = pyre_object::w_long_range_iter_fields(args[0]);
         let start_b = pyre_object::range_obj_to_bigint(start);
@@ -1934,7 +2080,7 @@ fn long_range_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
 }
 
 /// `longrange_iterator.__length_hint__()` — remaining element count.
-fn long_range_iter_length_hint_method(args: &[PyObjectRef]) -> PyResult {
+pub(crate) fn long_range_iter_length_hint_method(args: &[PyObjectRef]) -> PyResult {
     unsafe {
         Ok(pyre_object::range_bigint_to_obj(
             pyre_object::w_long_range_iter_len(args[0]),
@@ -1942,10 +2088,66 @@ fn long_range_iter_length_hint_method(args: &[PyObjectRef]) -> PyResult {
     }
 }
 
+/// Python 3.14 `range_iterator.__setstate__(index)` restores a cursor relative
+/// to the iterator's currently remaining span.  Negative indices clamp to
+/// zero and values past the end clamp to exhaustion.  PyPy exposes the same
+/// field-resident state protocol through `W_AbstractRangeIterator`.
+pub(crate) fn range_iter_setstate_method(args: &[PyObjectRef]) -> PyResult {
+    use num_traits::Zero;
+
+    unsafe {
+        if pyre_object::is_range_iter(args[0]) {
+            // CPython 3.14 `rangeiter_setstate`: `PyLong_AsLong`, so an
+            // overflowing Python int raises instead of being clipped.
+            if !(is_int(args[1]) || is_long(args[1]) || is_bool(args[1])) {
+                return Err(PyError::type_error("state must be an int"));
+            }
+            let mut state = BigInt::from(int_w(args[1])?);
+            if state < BigInt::zero() {
+                state = BigInt::zero();
+            }
+            let (current, remaining, step) = pyre_object::w_range_iter_fields(args[0]);
+            let remaining_b = BigInt::from(remaining);
+            if state > remaining_b {
+                state = remaining_b;
+            }
+            let state_obj = pyre_object::range_bigint_to_obj(state);
+            let skipped = pyre_object::range_obj_as_i64(state_obj).unwrap_or(remaining);
+            let next = (current as i128 + skipped as i128 * step as i128) as i64;
+            pyre_object::w_range_iter_set_cursor(args[0], next, remaining - skipped);
+        } else {
+            // CPython 3.14 `longrangeiter_setstate` requires an exact int,
+            // then compares/clips it at arbitrary precision.
+            let int_type = crate::typedef::gettypeobject(&pyre_object::INT_TYPE);
+            if !std::ptr::eq(crate::typedef::r#type(args[1]).unwrap_or(PY_NULL), int_type) {
+                return Err(PyError::type_error(format!(
+                    "state must be an int, not {}",
+                    object_functionstr_type_name(args[1])
+                )));
+            }
+            let mut state = pyre_object::range_obj_to_bigint(args[1]);
+            if state < BigInt::zero() {
+                state = BigInt::zero();
+            }
+            let (_start, _step, len_obj, index_obj) =
+                pyre_object::w_long_range_iter_fields(args[0]);
+            let len = pyre_object::range_obj_to_bigint(len_obj);
+            let index = pyre_object::range_obj_to_bigint(index_obj);
+            let remaining = &len - &index;
+            if state > remaining {
+                state = remaining;
+            }
+            let new_index = pyre_object::range_bigint_to_obj(index + state);
+            pyre_object::w_long_range_iter_set_index(args[0], new_index);
+        }
+    }
+    Ok(w_none())
+}
+
 /// `dict_keyiterator.__reduce__()` (and value/item siblings) —
 /// `dictmultiobject.py W_BaseDictMultiIterObject.descr_reduce`: the remaining
 /// entries as a list, wrapped `(iter, (list,))`.  No third element.
-fn dict_view_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
+pub(crate) fn dict_view_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
     unsafe {
         let w_dict = pyre_object::dictmultiobject::w_dict_view_iterator_get_dict(args[0]);
         let kind = pyre_object::dictmultiobject::w_dict_view_iterator_get_kind(args[0]);
@@ -1966,7 +2168,7 @@ fn dict_view_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
 }
 
 /// `dict_keyiterator.__length_hint__()` — remaining entries.
-fn dict_view_iter_length_hint_method(args: &[PyObjectRef]) -> PyResult {
+pub(crate) fn dict_view_iter_length_hint_method(args: &[PyObjectRef]) -> PyResult {
     unsafe {
         let w_dict = pyre_object::dictmultiobject::w_dict_view_iterator_get_dict(args[0]);
         let index = pyre_object::dictmultiobject::w_dict_view_iterator_get_index(args[0]);
@@ -1977,7 +2179,7 @@ fn dict_view_iter_length_hint_method(args: &[PyObjectRef]) -> PyResult {
 
 /// `enumerate.__reduce__()` — `functional.py W_Enumerate.descr_reduce`:
 /// `(enumerate, (source_iter, index))`.
-fn enumerate_reduce_method(args: &[PyObjectRef]) -> PyResult {
+pub(crate) fn enumerate_reduce_method(args: &[PyObjectRef]) -> PyResult {
     unsafe {
         let i64_index = pyre_object::functional::w_enumerate_get_index(args[0]);
         let raw = pyre_object::functional::w_enumerate_get_iter_or_list(args[0]);
@@ -2016,7 +2218,7 @@ fn enumerate_reduce_method(args: &[PyObjectRef]) -> PyResult {
 /// remaining)` while live; `(reversed, ((),))` once exhausted (the slot
 /// is cleared to `PY_NULL`).  The reconstructor is the `reversed`
 /// builtin so `pickle` recreates the iterator via `reversed(sequence)`.
-fn reversed_reduce_method(args: &[PyObjectRef]) -> PyResult {
+pub(crate) fn reversed_reduce_method(args: &[PyObjectRef]) -> PyResult {
     unsafe {
         let seq = pyre_object::functional::w_reversed_get_sequence(args[0]);
         if !seq.is_null() {
@@ -2037,7 +2239,7 @@ fn reversed_reduce_method(args: &[PyObjectRef]) -> PyResult {
 /// `reversed.__setstate__(index)` — `functional.py:419-429
 /// descr___setstate__`: set `remaining` then clamp into `[-1, n-1]`
 /// (`n == len(sequence)`, or 0 once exhausted).
-fn reversed_setstate_method(args: &[PyObjectRef]) -> PyResult {
+pub(crate) fn reversed_setstate_method(args: &[PyObjectRef]) -> PyResult {
     let mut remaining = int_w(args[1])?;
     unsafe {
         let seq = pyre_object::functional::w_reversed_get_sequence(args[0]);
@@ -2054,7 +2256,7 @@ fn reversed_setstate_method(args: &[PyObjectRef]) -> PyResult {
 
 /// `reversed.__length_hint__()` — `functional.py:374-383
 /// descr_length_hint`: elements not yet produced, `0` once exhausted.
-fn reversed_length_hint_method(args: &[PyObjectRef]) -> PyResult {
+pub(crate) fn reversed_length_hint_method(args: &[PyObjectRef]) -> PyResult {
     unsafe {
         let remaining = pyre_object::functional::w_reversed_get_remaining(args[0]);
         let mut res = 0i64;
@@ -2075,7 +2277,7 @@ fn reversed_length_hint_method(args: &[PyObjectRef]) -> PyResult {
 /// stored predicate is `PY_NULL`.  Pickle recreates the iterator via
 /// `filter(predicate, iterable)`; the captured iterator carries its
 /// position.
-fn filter_reduce_method(args: &[PyObjectRef]) -> PyResult {
+pub(crate) fn filter_reduce_method(args: &[PyObjectRef]) -> PyResult {
     unsafe {
         let w_predicate = pyre_object::functional::w_filter_get_predicate(args[0]);
         let w_predicate = if w_predicate.is_null() {
@@ -2201,7 +2403,7 @@ unsafe fn pull_iterator_tuple(
 /// `map.__reduce__()` — `functional.py:869-873 W_Map.descr_reduce`:
 /// `(map, (func, *iterators))`, with a trailing `True` when `strict`
 /// (CPython 3.14).  The captured iterators carry their positions.
-fn map_reduce_method(args: &[PyObjectRef]) -> PyResult {
+pub(crate) fn map_reduce_method(args: &[PyObjectRef]) -> PyResult {
     unsafe {
         let w_fun = pyre_object::functional::w_map_get_fun(args[0]);
         let w_iterators = pyre_object::functional::w_map_get_iterators(args[0]);
@@ -2223,7 +2425,7 @@ fn map_reduce_method(args: &[PyObjectRef]) -> PyResult {
 
 /// `map.__setstate__(strict)` — CPython 3.14: set the `strict` flag from the
 /// unpickled state.
-fn map_setstate_method(args: &[PyObjectRef]) -> PyResult {
+pub(crate) fn map_setstate_method(args: &[PyObjectRef]) -> PyResult {
     let strict = is_true(args[1])?;
     unsafe {
         pyre_object::functional::w_map_set_strict(args[0], strict);
@@ -2233,7 +2435,7 @@ fn map_setstate_method(args: &[PyObjectRef]) -> PyResult {
 
 /// `zip.__reduce__()` — `functional.py:1081-1087 W_Zip.descr_reduce`:
 /// `(zip, (*iterators))`, with a trailing `True` when `strict`.
-fn zip_reduce_method(args: &[PyObjectRef]) -> PyResult {
+pub(crate) fn zip_reduce_method(args: &[PyObjectRef]) -> PyResult {
     unsafe {
         let w_iterators = pyre_object::functional::w_zip_get_iterators(args[0]);
         let n = pyre_object::w_list_len(w_iterators);
@@ -2253,7 +2455,7 @@ fn zip_reduce_method(args: &[PyObjectRef]) -> PyResult {
 
 /// `zip.__setstate__(strict)` — `functional.py:1089-1091
 /// W_Zip.descr_setstate`: `self.strict = bool(state)`.
-fn zip_setstate_method(args: &[PyObjectRef]) -> PyResult {
+pub(crate) fn zip_setstate_method(args: &[PyObjectRef]) -> PyResult {
     let strict = is_true(args[1])?;
     unsafe {
         pyre_object::functional::w_zip_set_strict(args[0], strict);
@@ -3359,7 +3561,10 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
     // super proxy — PyPy: pypy/module/__builtin__/descriptor.py W_Super.getattribute
     // Looks up `name` in cls's MRO starting AFTER super_type.
     unsafe {
-        if pyre_object::descriptor::is_super(obj) {
+        if pyre_object::descriptor::is_super(obj)
+            && !pyre_object::descriptor::w_super_get_obj(obj).is_null()
+            && name != "__class__"
+        {
             let super_type = pyre_object::descriptor::w_super_get_type(obj);
             let bound_obj = pyre_object::descriptor::w_super_get_obj(obj);
 
@@ -3418,10 +3623,10 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
                     }
                 }
             }
-            return Err(PyError::new(
-                PyErrorKind::AttributeError,
-                format!("'super' object has no attribute '{name}'"),
-            ));
+            // `W_Super.getattribute` falls back to
+            // `object.__getattribute__` when the post-starttype MRO has no
+            // match.  This is how the proxy's own getsets (`__self__`,
+            // `__thisclass__`, ...) remain visible.
         }
     }
 
@@ -3565,6 +3770,9 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
     // `__iter__` so explicit `it.__next__()` / `it.__iter__()` work too.
     unsafe {
         if is_seq_iter(obj)
+            || pyre_object::is_list_iter(obj)
+            || pyre_object::is_list_reverse_iter(obj)
+            || pyre_object::is_tuple_iter(obj)
             || is_range_iter(obj)
             || pyre_object::is_long_range_iter(obj)
             || pyre_object::dictmultiobject::is_dict_view_iterator(obj)
@@ -3596,6 +3804,31 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
                     "__reduce__" => Some((seq_iter_reduce_method, "__reduce__", 1)),
                     "__setstate__" => Some((seq_iter_setstate_method, "__setstate__", 2)),
                     "__length_hint__" => Some((seq_iter_length_hint_method, "__length_hint__", 1)),
+                    _ => None,
+                }
+            } else if pyre_object::is_list_iter(obj) {
+                match name {
+                    "__reduce__" => Some((list_iter_reduce_method, "__reduce__", 1)),
+                    "__setstate__" => Some((list_iter_setstate_method, "__setstate__", 2)),
+                    "__length_hint__" => Some((list_iter_length_hint_method, "__length_hint__", 1)),
+                    _ => None,
+                }
+            } else if pyre_object::is_list_reverse_iter(obj) {
+                match name {
+                    "__reduce__" => Some((list_reverse_iter_reduce_method, "__reduce__", 1)),
+                    "__setstate__" => Some((list_reverse_iter_setstate_method, "__setstate__", 2)),
+                    "__length_hint__" => {
+                        Some((list_reverse_iter_length_hint_method, "__length_hint__", 1))
+                    }
+                    _ => None,
+                }
+            } else if pyre_object::is_tuple_iter(obj) {
+                match name {
+                    "__reduce__" => Some((tuple_iter_reduce_method, "__reduce__", 1)),
+                    "__setstate__" => Some((tuple_iter_setstate_method, "__setstate__", 2)),
+                    "__length_hint__" => {
+                        Some((tuple_iter_length_hint_method, "__length_hint__", 1))
+                    }
                     _ => None,
                 }
             } else if is_range_iter(obj) {
@@ -7272,7 +7505,7 @@ unsafe fn delete(descr: PyObjectRef, obj: PyObjectRef) -> Result<(), crate::PyEr
 /// objectobject.py:137-154 `descr_set___class__(space, w_obj, w_newcls)`.
 ///
 /// Validates and performs `obj.__class__ = newcls`.
-fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> PyResult {
+pub(crate) fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> PyResult {
     unsafe {
         // objectobject.py:139-142 — w_newcls must be a W_TypeObject
         if !is_type(w_newcls) {
@@ -9376,6 +9609,9 @@ pub fn is_iterable(w_obj: PyObjectRef) -> bool {
             || is_range_iter(obj)
             || pyre_object::is_long_range_iter(obj)
             || is_seq_iter(obj)
+            || pyre_object::is_list_iter(obj)
+            || pyre_object::is_list_reverse_iter(obj)
+            || pyre_object::is_tuple_iter(obj)
             || pyre_object::generator::is_generator(obj)
             || pyre_object::interp_itertools::is_count(obj)
             || pyre_object::interp_itertools::is_repeat(obj)
@@ -9534,7 +9770,7 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
                     }
                 }
             }
-            return Ok(pyre_object::w_seq_iter_new(obj, w_list_len(obj)));
+            return Ok(pyre_object::w_list_iter_new(obj));
         }
         if is_tuple(obj) {
             if !pyre_object::is_exact_tuple(obj) {
@@ -9554,7 +9790,7 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
                     }
                 }
             }
-            return Ok(pyre_object::w_seq_iter_new(obj, w_tuple_len(obj)));
+            return Ok(pyre_object::w_tuple_iter_new(obj));
         }
         if pyre_object::is_generic_alias(obj) {
             // GenericAlias.__iter__ (`_pypy_generic_alias.py:108`) — `yield
@@ -9596,13 +9832,13 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
                 pyre_object::dictmultiobject::DictViewKind::Keys,
             ));
         }
-        // set / frozenset → iterate via stable insertion order (PyPy:
-        // setobject.py W_BaseSetObject.descr_iter, W_BaseSetIterObject).
+        // set / frozenset → a live W_SetIterObject over the source storage.
+        // setobject.py:216 descr_iter / :1567 W_SetIterObject.
         if pyre_object::is_set_or_frozenset(obj) {
-            let items = pyre_object::w_set_items(obj);
-            let len = items.len();
-            let key_list = pyre_object::w_list_new(items);
-            return Ok(pyre_object::w_seq_iter_new(key_list, len));
+            return Ok(pyre_object::w_set_iter_new(obj));
+        }
+        if pyre_object::is_set_iterator(obj) {
+            return Ok(obj);
         }
         // `range` sequence → a `rangeiterator` (machine-int, JIT) when the
         // bounds fit a word, else a `longrange_iterator`.
@@ -9613,6 +9849,9 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         if is_range_iter(obj)
             || pyre_object::is_long_range_iter(obj)
             || is_seq_iter(obj)
+            || pyre_object::is_list_iter(obj)
+            || pyre_object::is_list_reverse_iter(obj)
+            || pyre_object::is_tuple_iter(obj)
             || pyre_object::generator::is_generator(obj)
         {
             return Ok(obj);
@@ -9801,6 +10040,51 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
 pub fn next(obj: PyObjectRef) -> PyResult {
     let obj = unwrap_cell(obj);
     unsafe {
+        // iterobject.py W_FastListIterObject.descr_next — read the list's
+        // current length on every step so appends are observed and removals
+        // can end iteration. Exhaustion clears the source reference.
+        if pyre_object::is_list_iter(obj) {
+            let seq = pyre_object::w_list_iter_seq(obj);
+            if seq.is_null() {
+                return Err(PyError::stop_iteration());
+            }
+            let index = pyre_object::w_list_iter_index(obj);
+            if let Some(item) = pyre_object::w_list_getitem(seq, index) {
+                pyre_object::w_list_iter_set_index(obj, index + 1);
+                return Ok(item);
+            }
+            pyre_object::w_list_iter_set_seq(obj, PY_NULL);
+            return Err(PyError::stop_iteration());
+        }
+        // iterobject.py W_ReverseSeqIterObject.descr_next. A list mutation
+        // that removes the current index exhausts the iterator; growth at the
+        // high end does not move the descending cursor.
+        if pyre_object::is_list_reverse_iter(obj) {
+            let seq = pyre_object::w_list_reverse_iter_seq(obj);
+            let index = pyre_object::w_list_reverse_iter_index(obj);
+            if !seq.is_null() && index >= 0 {
+                if let Some(item) = pyre_object::w_list_getitem(seq, index) {
+                    pyre_object::w_list_reverse_iter_set_index(obj, index - 1);
+                    return Ok(item);
+                }
+            }
+            pyre_object::w_list_reverse_iter_set_index(obj, -1);
+            pyre_object::w_list_reverse_iter_set_seq(obj, PY_NULL);
+            return Err(PyError::stop_iteration());
+        }
+        if pyre_object::is_tuple_iter(obj) {
+            let seq = pyre_object::w_tuple_iter_seq(obj);
+            if seq.is_null() {
+                return Err(PyError::stop_iteration());
+            }
+            let index = pyre_object::w_tuple_iter_index(obj);
+            if let Some(item) = pyre_object::w_tuple_getitem(seq, index) {
+                pyre_object::w_tuple_iter_set_index(obj, index + 1);
+                return Ok(item);
+            }
+            pyre_object::w_tuple_iter_set_seq(obj, PY_NULL);
+            return Err(PyError::stop_iteration());
+        }
         // Seq iterator
         if is_seq_iter(obj) {
             // Read through a raw pointer rather than a long-lived `&mut`: the
@@ -9889,6 +10173,31 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             // (the generic arm above already did so on IndexError); the builtin
             // arms clear it here so a held iterator reports as exhausted.
             (*iter_ptr).seq = std::ptr::null_mut();
+            return Err(PyError::stop_iteration());
+        }
+        // setobject.py:1459-1487 IteratorImplementation.next.  The size
+        // mismatch is sticky, and Python 3.14 capitalizes the RuntimeError.
+        if pyre_object::is_set_iterator(obj) {
+            let w_set = pyre_object::w_set_iter_get_set(obj);
+            if w_set.is_null() {
+                return Err(PyError::stop_iteration());
+            }
+            let startlen = pyre_object::w_set_iter_get_startlen(obj);
+            if startlen == usize::MAX || pyre_object::w_set_len(w_set) != startlen {
+                pyre_object::w_set_iter_set_startlen(obj, usize::MAX);
+                return Err(PyError::new(
+                    PyErrorKind::RuntimeError,
+                    "Set changed size during iteration",
+                ));
+            }
+            let index = pyre_object::w_set_iter_get_index(obj);
+            if index < startlen {
+                if let Some(key) = pyre_object::w_set_key_at(w_set, index) {
+                    pyre_object::w_set_iter_set_index(obj, index + 1);
+                    return Ok(key.obj);
+                }
+            }
+            pyre_object::w_set_iter_set_set(obj, pyre_object::PY_NULL);
             return Err(PyError::stop_iteration());
         }
         // Range iterator
@@ -10927,7 +11236,7 @@ fn generator_next(gen_obj: PyObjectRef) -> PyResult {
 }
 
 /// __next__ method wrapper
-fn generator_next_method(args: &[PyObjectRef]) -> PyResult {
+pub(crate) fn generator_next_method(args: &[PyObjectRef]) -> PyResult {
     let gen_obj = if args.is_empty() {
         pyre_object::PY_NULL
     } else {
@@ -10938,7 +11247,7 @@ fn generator_next_method(args: &[PyObjectRef]) -> PyResult {
 
 /// Generic __next__ wrapper for iterators that delegate to `next()`.
 /// Used for itertools count/repeat etc.
-fn iter_next_method(args: &[PyObjectRef]) -> PyResult {
+pub(crate) fn iter_next_method(args: &[PyObjectRef]) -> PyResult {
     let obj = if args.is_empty() {
         pyre_object::PY_NULL
     } else {
@@ -10948,7 +11257,7 @@ fn iter_next_method(args: &[PyObjectRef]) -> PyResult {
 }
 
 /// `__iter__` for an iterator — returns the iterator itself.
-fn iter_self_method(args: &[PyObjectRef]) -> PyResult {
+pub(crate) fn iter_self_method(args: &[PyObjectRef]) -> PyResult {
     let obj = if args.is_empty() {
         pyre_object::PY_NULL
     } else {
@@ -11171,7 +11480,7 @@ fn chain_setstate_method(args: &[PyObjectRef]) -> PyResult {
 }
 
 /// PyPy: GeneratorIterator.descr_send(w_arg)
-fn generator_send_method(args: &[PyObjectRef]) -> PyResult {
+pub(crate) fn generator_send_method(args: &[PyObjectRef]) -> PyResult {
     let gen_obj = if args.is_empty() {
         pyre_object::PY_NULL
     } else {
@@ -11182,7 +11491,7 @@ fn generator_send_method(args: &[PyObjectRef]) -> PyResult {
 }
 
 /// PyPy: GeneratorIterator.descr_throw(w_type, w_val=None, w_tb=None)
-fn generator_throw_method(args: &[PyObjectRef]) -> PyResult {
+pub(crate) fn generator_throw_method(args: &[PyObjectRef]) -> PyResult {
     let gen_obj = if args.is_empty() {
         pyre_object::PY_NULL
     } else {
@@ -11209,7 +11518,7 @@ fn generator_throw_method(args: &[PyObjectRef]) -> PyResult {
 }
 
 /// PyPy: GeneratorIterator.descr_close()
-fn generator_close_method(args: &[PyObjectRef]) -> PyResult {
+pub(crate) fn generator_close_method(args: &[PyObjectRef]) -> PyResult {
     let gen_obj = if args.is_empty() {
         pyre_object::PY_NULL
     } else {

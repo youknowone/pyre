@@ -82,6 +82,24 @@ pub unsafe fn w_super_get_obj(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const W_Super)).obj }
 }
 
+/// Replace the two field-resident pieces of an existing `W_Super`, matching
+/// `W_Super.descr_init` assigning `w_starttype` and `w_self` in place.
+///
+/// # Safety
+/// `obj` must point to a valid `W_Super`.
+#[inline]
+pub unsafe fn w_super_set_fields(
+    obj: PyObjectRef,
+    super_type: PyObjectRef,
+    bound_obj: PyObjectRef,
+) {
+    unsafe {
+        let super_obj = obj as *mut W_Super;
+        (*super_obj).super_type = super_type;
+        (*super_obj).obj = bound_obj;
+    }
+}
+
 #[cfg(test)]
 mod super_tests {
     use super::*;

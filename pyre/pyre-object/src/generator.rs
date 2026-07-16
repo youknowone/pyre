@@ -24,6 +24,12 @@ pub struct GeneratorIterator {
     /// Whether the generator is currently executing (prevents reentrant calls).
     /// PyPy: GeneratorIterator.running
     pub running: bool,
+    /// Per-generator writable `__name__` override. NULL means read the
+    /// suspended frame code's original name.
+    pub name: PyObjectRef,
+    /// Per-generator writable `__qualname__` override. NULL means read the
+    /// suspended frame code's original qualified name.
+    pub qualname: PyObjectRef,
 }
 
 /// GC type id assigned to `GeneratorIterator` at JitDriver init time.
@@ -49,6 +55,8 @@ pub fn w_generator_new(frame_ptr: *mut u8) -> PyObjectRef {
         started: false,
         exhausted: false,
         running: false,
+        name: PY_NULL,
+        qualname: PY_NULL,
     };
     // A generator must be GC-managed, not immortal `malloc_typed`: the
     // collector never reaches an immortal object, so the registered
@@ -111,6 +119,28 @@ pub unsafe fn w_generator_set_running(obj: PyObjectRef, val: bool) {
     unsafe {
         (*(obj as *mut GeneratorIterator)).running = val;
     }
+}
+
+#[inline]
+pub unsafe fn w_generator_get_name(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const GeneratorIterator)).name }
+}
+
+#[inline]
+pub unsafe fn w_generator_set_name(obj: PyObjectRef, value: PyObjectRef) {
+    unsafe { (*(obj as *mut GeneratorIterator)).name = value };
+    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+}
+
+#[inline]
+pub unsafe fn w_generator_get_qualname(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const GeneratorIterator)).qualname }
+}
+
+#[inline]
+pub unsafe fn w_generator_set_qualname(obj: PyObjectRef, value: PyObjectRef) {
+    unsafe { (*(obj as *mut GeneratorIterator)).qualname = value };
+    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
 #[cfg(test)]

@@ -4750,15 +4750,39 @@ pub(crate) fn dict_store_checked(
     }
 }
 
+/// Hash `item` with it rooted, then look it up with `probe`.
+///
+/// A user `__hash__` is a collection point and [`ObjectKey`] caches the element
+/// pointer, so hashing inside the key build (`object_key_for_checked`) captures
+/// the pre-move pointer — the reason `object_key_hashed` exists. The element is
+/// rooted across the hash and reloaded, matching the add path
+/// (`builtin_set_add_items`); the set needs no rooting, being an old-gen
+/// allocation that keeps its address across a collection.
+unsafe fn set_lookup_checked(
+    set: PyObjectRef,
+    item: PyObjectRef,
+    probe: unsafe fn(
+        PyObjectRef,
+        pyre_object::dictmultiobject::ObjectKey,
+    ) -> Result<bool, pyre_object::dictmultiobject::DictKeyError>,
+) -> Result<bool, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let sp = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(item);
+    let hash = crate::builtins::try_hash_value(pyre_object::gc_roots::shadow_stack_get(sp))?;
+    let key = pyre_object::dictmultiobject::object_key_hashed(
+        pyre_object::gc_roots::shadow_stack_get(sp),
+        hash,
+    );
+    probe(set, key).map_err(|_| crate::baseobjspace::take_pending_hash_error())
+}
+
 /// Remove an element from a set, hashing it through the protocol.
 pub(crate) fn set_discard_checked(
     set: PyObjectRef,
     item: PyObjectRef,
 ) -> Result<bool, crate::PyError> {
-    unsafe {
-        pyre_object::setobject::w_set_discard_checked(set, item)
-            .map_err(|_| crate::baseobjspace::take_pending_hash_error())
-    }
+    unsafe { set_lookup_checked(set, item, pyre_object::setobject::w_set_discard_key_checked) }
 }
 
 /// Test membership in a set, hashing the element through the protocol.
@@ -4767,8 +4791,11 @@ pub(crate) fn set_contains_checked(
     item: PyObjectRef,
 ) -> Result<bool, crate::PyError> {
     unsafe {
-        pyre_object::setobject::w_set_contains_checked(set, item)
-            .map_err(|_| crate::baseobjspace::take_pending_hash_error())
+        set_lookup_checked(
+            set,
+            item,
+            pyre_object::setobject::w_set_contains_key_checked,
+        )
     }
 }
 

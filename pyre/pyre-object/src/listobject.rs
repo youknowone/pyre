@@ -946,6 +946,19 @@ pub unsafe fn w_list_len(obj: PyObjectRef) -> usize {
     }
 }
 
+/// Allocated element slots, used by the Python 3.14-compatible
+/// `list.__sizeof__` descriptor. PyPy keeps this behind the active list
+/// strategy; expose the same strategy dispatch without materializing boxes.
+pub unsafe fn w_list_capacity(obj: PyObjectRef) -> usize {
+    let list = &*(obj as *const W_ListObject);
+    match list.strategy {
+        ListStrategy::Empty => 0,
+        ListStrategy::Object => list.object_items_capacity(),
+        ListStrategy::Integer => list.int_items.heap_capacity(),
+        ListStrategy::Float => list.float_items.heap_capacity(),
+    }
+}
+
 /// Whether `obj` is a list currently backed by the Integer strategy — the
 /// only shape [`w_list_int_set_len`] can rewind.
 ///

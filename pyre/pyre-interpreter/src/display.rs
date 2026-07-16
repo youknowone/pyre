@@ -121,7 +121,7 @@ pub(crate) fn format_wtf8_repr(s: &Wtf8) -> String {
 /// The outer quote prefers `'`, flipping to `"` only when the data holds a
 /// `'` but no `"`; the body always backslash-escapes `'` and `\` and never
 /// escapes `"`, so a `'` survives as `\'` even under a `"` outer quote.
-fn bytearray_repr_string(data: &[u8]) -> String {
+pub(crate) fn bytearray_repr_string(data: &[u8], class_name: &str) -> String {
     let has_single = data.contains(&b'\'');
     let has_double = data.contains(&b'"');
     let quote = if has_single && !has_double {
@@ -130,7 +130,8 @@ fn bytearray_repr_string(data: &[u8]) -> String {
         b'\''
     };
     let mut out = String::with_capacity(data.len() + 14);
-    out.push_str("bytearray(b");
+    out.push_str(class_name);
+    out.push_str("(b");
     out.push(quote as char);
     for &c in data {
         match c {
@@ -209,6 +210,45 @@ pub unsafe fn dict_repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
         parts.push(format!("{}: {}", py_repr(k)?, py_repr(v)?));
     }
     Ok(format!("{{{}}}", parts.join(", ")))
+}
+
+/// `listobject.py W_ListObject.descr_repr`, factored out so the TypeDef slot
+/// and the native `py_repr` fast path use the same recursion guard and item
+/// walk. Calling the base descriptor on a subclass must not redispatch its
+/// overriding `__repr__`.
+pub unsafe fn list_repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
+    let Some(_guard) = ReprGuard::enter(obj) else {
+        return Ok("[...]".to_string());
+    };
+    let n = pyre_object::w_list_len(obj);
+    let mut parts = Vec::with_capacity(n);
+    for i in 0..n {
+        if let Some(item) = pyre_object::w_list_getitem(obj, i as i64) {
+            parts.push(py_repr(item)?);
+        }
+    }
+    Ok(format!("[{}]", parts.join(", ")))
+}
+
+/// `tupleobject.py W_AbstractTupleObject.descr_repr`. This is the base slot
+/// body, so it formats tuple storage directly even when invoked through
+/// `super().__repr__()` on a subtype.
+pub unsafe fn tuple_repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
+    let Some(_guard) = ReprGuard::enter(obj) else {
+        return Ok("(...)".to_string());
+    };
+    let n = pyre_object::w_tuple_len(obj);
+    let mut parts = Vec::with_capacity(n);
+    for i in 0..n {
+        if let Some(item) = pyre_object::w_tuple_getitem(obj, i as i64) {
+            parts.push(py_repr(item)?);
+        }
+    }
+    if n == 1 {
+        Ok(format!("({},)", parts[0]))
+    } else {
+        Ok(format!("({})", parts.join(", ")))
+    }
 }
 
 /// Format a PyObjectRef for debug display.
@@ -298,7 +338,12 @@ pub(crate) unsafe fn builtin_subclass_dunder_obj(
             || std::ptr::eq(tp, &LONG_TYPE as *const PyType)
             || std::ptr::eq(tp, &FLOAT_TYPE as *const PyType)
             || std::ptr::eq(tp, &BOOL_TYPE as *const PyType)
-            || std::ptr::eq(tp, &STR_TYPE as *const PyType);
+            || std::ptr::eq(tp, &STR_TYPE as *const PyType)
+            || std::ptr::eq(tp, &pyre_object::LIST_TYPE as *const PyType)
+            || std::ptr::eq(
+                tp,
+                &pyre_object::bytearrayobject::BYTEARRAY_TYPE as *const PyType,
+            );
         if !is_leaf {
             return Ok(None);
         }
@@ -426,17 +471,7 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
         } else if pyre_object::interp_array::is_array(obj) {
             crate::module::array::array_repr_string(obj)?
         } else if std::ptr::eq(tp, &pyre_object::pyobject::LIST_TYPE as *const PyType) {
-            let Some(_guard) = ReprGuard::enter(obj) else {
-                return Ok("[...]".to_string());
-            };
-            let n = pyre_object::w_list_len(obj);
-            let mut parts = Vec::with_capacity(n);
-            for i in 0..n {
-                if let Some(item) = pyre_object::w_list_getitem(obj, i as i64) {
-                    parts.push(py_repr(item)?);
-                }
-            }
-            format!("[{}]", parts.join(", "))
+            list_repr(obj)?
         } else if pyre_object::is_tuple(obj) {
             // `pyre_object::is_tuple` covers `TUPLE_TYPE` plus the
             // arity-2 specialisations (`SPECIALISED_TUPLE_{II,FF,OO}_TYPE`,
@@ -516,7 +551,7 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
                 // from the bytes form: it chooses the same outer quote but
                 // always backslash-escapes an inner `'` (never `"`), so the
                 // shared bytes escaper cannot express it.
-                bytearray_repr_string(data)
+                bytearray_repr_string(data, "bytearray")
             } else {
                 let escape = rustpython_literal::escape::AsciiEscape::new_repr(data);
                 let mut body = String::new();
@@ -529,12 +564,12 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
             // frozenset and `'{%s}' % items_repr_joined` for set.  Empty
             // set keeps the `set()` constructor form.
             let is_frozen = pyre_object::is_frozenset(obj);
+            let is_exact_set = pyre_object::is_exact_type(obj, &pyre_object::setobject::SET_TYPE);
+            let class_name = crate::typedef::r#type(obj)
+                .map(|w_type| pyre_object::w_type_get_name(w_type))
+                .unwrap_or(if is_frozen { "frozenset" } else { "set" });
             let Some(_guard) = ReprGuard::enter(obj) else {
-                return Ok(if is_frozen {
-                    "frozenset(...)".to_string()
-                } else {
-                    "set(...)".to_string()
-                });
+                return Ok(format!("{class_name}(...)"));
             };
             let items = pyre_object::w_set_items(obj);
             let parts: Vec<String> = items
@@ -542,15 +577,11 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
                 .map(|&v| py_repr(v))
                 .collect::<Result<Vec<String>, _>>()?;
             if items.is_empty() {
-                if is_frozen {
-                    "frozenset()".to_string()
-                } else {
-                    "set()".to_string()
-                }
-            } else if is_frozen {
-                format!("frozenset({{{}}})", parts.join(", "))
-            } else {
+                format!("{class_name}()")
+            } else if is_exact_set {
                 format!("{{{}}}", parts.join(", "))
+            } else {
+                format!("{class_name}({{{}}})", parts.join(", "))
             }
         } else if std::ptr::eq(tp, &STR_TYPE as *const PyType) {
             format_wtf8_repr(pyre_object::w_str_get_wtf8(obj))

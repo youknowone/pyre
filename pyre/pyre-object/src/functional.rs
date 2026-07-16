@@ -541,6 +541,19 @@ pub unsafe fn w_range_iter_remaining(obj: PyObjectRef) -> i64 {
     unsafe { (*iter).remaining }
 }
 
+/// Restore the machine range iterator's live cursor fields.
+///
+/// # Safety
+/// `obj` must point to a valid `W_IntRangeIterator`; `remaining` must be
+/// non-negative and `current` must be the value yielded next.
+pub unsafe fn w_range_iter_set_cursor(obj: PyObjectRef, current: i64, remaining: i64) {
+    let iter = obj as *mut W_IntRangeIterator;
+    unsafe {
+        (*iter).current = current;
+        (*iter).remaining = remaining;
+    }
+}
+
 #[cfg(test)]
 mod range_iter_tests {
     use super::*;
@@ -1069,6 +1082,18 @@ pub unsafe fn w_long_range_iter_fields(
 ) -> (PyObjectRef, PyObjectRef, PyObjectRef, PyObjectRef) {
     let it = obj as *const W_LongRangeIterator;
     unsafe { ((*it).start, (*it).step, (*it).len, (*it).index) }
+}
+
+/// Restore the arbitrary-precision range iterator's wrapped index field.
+///
+/// # Safety
+/// `obj` must point to a valid `W_LongRangeIterator` and `index` must be a
+/// wrapped int/long in the inclusive interval `[0, len]`.
+pub unsafe fn w_long_range_iter_set_index(obj: PyObjectRef, index: PyObjectRef) {
+    let it = obj as *mut W_LongRangeIterator;
+    unsafe {
+        (*it).index = index;
+    }
 }
 
 /// Whether the long-range iterator has elements left — peek, non-mutating.

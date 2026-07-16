@@ -81,6 +81,16 @@ pub unsafe fn w_bytearray_len(obj: PyObjectRef) -> usize {
     }
 }
 
+/// Number of payload bytes currently reserved by the backing storage.
+/// `bytearrayobject.py:604 descr_alloc` reports the resizable list allocation;
+/// pyre's `Vec` is the equivalent storage object.
+pub unsafe fn w_bytearray_capacity(obj: PyObjectRef) -> usize {
+    unsafe {
+        let ba = &*(obj as *const W_BytearrayObject);
+        (*ba.data).capacity()
+    }
+}
+
 pub unsafe fn w_bytearray_getitem(obj: PyObjectRef, index: usize) -> u8 {
     unsafe {
         let ba = &*(obj as *const W_BytearrayObject);

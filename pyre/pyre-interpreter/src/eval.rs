@@ -1906,6 +1906,9 @@ impl IterOpcodeHandler for PyFrame {
             if pyre_object::is_range_iter(iter)
                 || pyre_object::is_long_range_iter(iter)
                 || pyre_object::is_seq_iter(iter)
+                || pyre_object::is_list_iter(iter)
+                || pyre_object::is_list_reverse_iter(iter)
+                || pyre_object::is_tuple_iter(iter)
                 || pyre_object::generator::is_generator(iter)
                 || pyre_object::interp_itertools::is_repeat(iter)
                 || pyre_object::interp_itertools::is_count(iter)
@@ -1942,12 +1945,11 @@ impl IterOpcodeHandler for PyFrame {
                 self.locals_w_mut()[tos] = it;
                 return Ok(());
             }
-            // list → seq_iter for an exact list; a subclass may override
+            // list → W_FastListIterObject for an exact list; a subclass may override
             // `__iter__`, so route it through `space.iter`.
             if pyre_object::is_list(iter) {
                 if pyre_object::is_exact_list(iter) {
-                    let len = pyre_object::w_list_len(iter);
-                    let seq_iter = pyre_object::w_seq_iter_new(iter, len);
+                    let seq_iter = pyre_object::w_list_iter_new(iter);
                     let tos = self.valuestackdepth - 1;
                     self.locals_w_mut()[tos] = seq_iter;
                     return Ok(());
@@ -1961,8 +1963,7 @@ impl IterOpcodeHandler for PyFrame {
             // `__iter__`, so route it through `space.iter`.
             if pyre_object::is_tuple(iter) {
                 if pyre_object::is_exact_tuple(iter) {
-                    let len = pyre_object::w_tuple_len(iter);
-                    let seq_iter = pyre_object::w_seq_iter_new(iter, len);
+                    let seq_iter = pyre_object::w_tuple_iter_new(iter);
                     let tos = self.valuestackdepth - 1;
                     self.locals_w_mut()[tos] = seq_iter;
                     return Ok(());
