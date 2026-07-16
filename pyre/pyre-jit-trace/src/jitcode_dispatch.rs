@@ -2920,7 +2920,6 @@ fn compute_bridge_root_parent_frame(
     Some(InlineParentFrame {
         jitcode_index,
         call_jitcode_pc: None,
-        call_py_pc: None,
         call_stack_overrides: Vec::new(),
         resume_py_pc,
         // Parent-frame words are never branch-tagged; negative tags belong to
@@ -3069,7 +3068,6 @@ fn recipe_parent_frame_from_recipe(
     Some(InlineParentFrame {
         jitcode_index: recipe.jitcode_index as u32,
         call_jitcode_pc: call_jit_pc,
-        call_py_pc: call_jit_pc.map(|pc| python_pc_for_jitcode_pc(&pjc.metadata, pc)),
         call_stack_overrides: Vec::new(),
         resume_py_pc: py_pc as u32,
         resume_marker_jit_pc,
@@ -7903,10 +7901,7 @@ struct InlineParentFrame {
     /// The caller CALL opcode's JitCode pc. A nested inline-capture abort
     /// carries this native coordinate to the interpreter-flush boundary.
     call_jitcode_pc: Option<usize>,
-    /// The caller CALL opcode's Python pc. A nested inline-capture abort
-    /// resumes the top-level frame here so the declined callee executes once.
-    call_py_pc: Option<u32>,
-    /// Concrete operand-stack slots at `call_py_pc`, keyed by absolute
+    /// Concrete operand-stack slots at the caller CALL, keyed by absolute
     /// `locals_cells_stack_w` index. Used only by the abort-point flush.
     call_stack_overrides: Vec<(usize, pyre_object::PyObjectRef)>,
     /// The caller's resume Python pc: the CALL's return point (fallthrough),
@@ -7929,12 +7924,12 @@ struct InlineParentFrame {
 struct InlineFrameGuard<'a>(&'a std::cell::RefCell<WalkSession>);
 
 thread_local! {
-    /// Top-level caller CALL Python pc, its native JitCode coordinate, and
-    /// concrete operand-stack slots stashed by
+    /// Top-level caller CALL native JitCode coordinate and concrete
+    /// operand-stack slots stashed by
     /// [`fbw_abort_nested_unjournaled_residual`] at the nested-inline decline,
     /// read back by the trace loop after the walk unwinds
     /// ([`fbw_abort_outer_resume_take`]) to drive the abort-point flush.
-    static FBW_ABORT_OUTER_RESUME: std::cell::Cell<Option<(usize, Option<(u32, usize)>)>> =
+    static FBW_ABORT_OUTER_RESUME: std::cell::Cell<Option<(u32, usize)>> =
         const { std::cell::Cell::new(None) };
     static FBW_ABORT_OUTER_STACK_OVERRIDES: std::cell::RefCell<Vec<(usize, pyre_object::PyObjectRef)>> =
         const { std::cell::RefCell::new(Vec::new()) };
@@ -9503,14 +9498,9 @@ fn fbw_abort_nested_unjournaled_residual(
             let session = ctx.session.borrow();
             match session.framestack.first().and_then(|f| f.parent.as_ref()) {
                 Some(frame) => (
-                    frame.call_py_pc.map(|py_pc| {
-                        (
-                            py_pc as usize,
-                            frame
-                                .call_jitcode_pc
-                                .map(|jit_pc| (frame.jitcode_index, jit_pc)),
-                        )
-                    }),
+                    frame
+                        .call_jitcode_pc
+                        .map(|jit_pc| (frame.jitcode_index, jit_pc)),
                     frame.call_stack_overrides.clone(),
                 ),
                 None => (None, Vec::new()),
@@ -9525,13 +9515,13 @@ fn fbw_abort_nested_unjournaled_residual(
     Ok(())
 }
 
-/// Take the outer-caller resume pc stashed by
+/// Take the outer-caller CALL JitCode coordinate stashed by
 /// [`fbw_abort_nested_unjournaled_residual`].  The stack overrides stay in
 /// `FBW_ABORT_OUTER_STACK_OVERRIDES` (rooted by the #447 area walker,
 /// `abort_overrides`) until [`fbw_abort_outer_stack_overrides_clear`]; the
 /// flush reads them in place from the rooted cell so a minor collection while
 /// boxing Int/Float locals forwards the very refs it writes.
-pub(crate) fn fbw_abort_outer_resume_take() -> Option<(usize, Option<(u32, usize)>)> {
+pub(crate) fn fbw_abort_outer_resume_take() -> Option<(u32, usize)> {
     FBW_ABORT_OUTER_RESUME.with(|c| c.replace(None))
 }
 
@@ -9550,7 +9540,7 @@ pub(crate) fn fbw_abort_outer_stack_overrides_clear() {
 }
 
 /// Clear the nested inline abort resume latch at a walk boundary.
-pub(crate) fn fbw_abort_outer_resume_py_pc_reset() {
+pub(crate) fn fbw_abort_outer_resume_reset() {
     FBW_ABORT_OUTER_RESUME.with(|c| c.set(None));
     FBW_ABORT_OUTER_STACK_OVERRIDES.with(|c| c.borrow_mut().clear());
 }
@@ -10651,8 +10641,8 @@ pub(crate) fn pcmap_guard_kept_audit_enabled() -> bool {
 }
 
 /// `PYRE_PCMAP_CALLPC_AUDIT` certifies that a nested-inline abort's carried
-/// caller CALL JitCode coordinate inverts to its legacy Python resume pc at
-/// the interpreter-flush boundary. Diagnostic only; off in production.
+/// caller CALL JitCode coordinate resolves at the interpreter-flush boundary.
+/// Diagnostic only; off in production.
 pub(crate) fn pcmap_callpc_audit_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_CALLPC_AUDIT").is_some())
@@ -12798,7 +12788,6 @@ fn compute_inline_caller_frame(
     Ok(InlineParentFrame {
         jitcode_index,
         call_jitcode_pc: Some(call_jit_pc),
-        call_py_pc: Some(call_py_pc),
         call_stack_overrides,
         resume_py_pc: fallthrough_py_pc,
         resume_marker_jit_pc,
@@ -12897,7 +12886,6 @@ fn compute_nested_inline_caller_frame(
     Ok(InlineParentFrame {
         jitcode_index,
         call_jitcode_pc: Some(call_jit_pc),
-        call_py_pc: Some(call_py as u32),
         call_stack_overrides: Vec::new(),
         resume_py_pc: fallthrough_py_pc,
         resume_marker_jit_pc,
