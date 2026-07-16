@@ -1875,6 +1875,28 @@ fn run_perfn_walk(
     // the virtualizable shadow to the concrete frame heap, which the
     // read-only probe (trace discarded) must not do.
     if authoritative {
+        let close_loop_restart_pc = match &walk_result {
+            Ok((
+                crate::jitcode_dispatch::DispatchOutcome::CloseLoop {
+                    loop_header_pc,
+                    loop_header_marker_jit_pc,
+                    ..
+                },
+                _end_pc,
+            )) => Some(loop_header_marker_jit_pc.map_or(*loop_header_pc, |marker| {
+                let marker_py =
+                    crate::jitcode_dispatch::python_pc_for_jitcode_pc(&pjc.metadata, marker)
+                        as usize;
+                if marker_py == *loop_header_pc
+                    && pjc.merge_entry_for(*loop_header_pc) != Some(marker)
+                {
+                    *loop_header_pc + 1
+                } else {
+                    marker_py
+                }
+            })),
+            _ => None,
+        };
         if let Ok((
             crate::jitcode_dispatch::DispatchOutcome::CloseLoop {
                 jump_args,
@@ -1885,18 +1907,7 @@ fn run_perfn_walk(
         )) = &mut walk_result
         {
             let loop_header_pc = *loop_header_pc;
-            let restart_pc = loop_header_marker_jit_pc.map_or(loop_header_pc, |marker| {
-                let marker_py =
-                    crate::jitcode_dispatch::python_pc_for_jitcode_pc(&pjc.metadata, marker)
-                        as usize;
-                if marker_py == loop_header_pc
-                    && pjc.merge_entry_for(loop_header_pc) != Some(marker)
-                {
-                    loop_header_pc + 1
-                } else {
-                    marker_py
-                }
-            });
+            let restart_pc = close_loop_restart_pc.expect("close loop has a restart pc");
             WALK_END_RESTART_PC.with(|c| c.set(Some(restart_pc)));
             // `close_loop_args_at` reads `self.orgpc` for the last_instr anchor; the merge point
             // closes at the loop header, so anchor orgpc there.
@@ -1925,23 +1936,9 @@ fn run_perfn_walk(
         if std::env::var_os("PYRE_FBW_END_FLUSH").as_deref() != Some(std::ffi::OsStr::new("0")) {
             if let Ok((outcome, _end_pc)) = &walk_result {
                 let header_pc = match outcome {
-                    crate::jitcode_dispatch::DispatchOutcome::CloseLoop {
-                        loop_header_pc,
-                        loop_header_marker_jit_pc,
-                        ..
-                    } => Some(loop_header_marker_jit_pc.map_or(*loop_header_pc, |marker| {
-                        let marker_py = crate::jitcode_dispatch::python_pc_for_jitcode_pc(
-                            &pjc.metadata,
-                            marker,
-                        ) as usize;
-                        if marker_py == *loop_header_pc
-                            && pjc.merge_entry_for(*loop_header_pc) != Some(marker)
-                        {
-                            *loop_header_pc + 1
-                        } else {
-                            marker_py
-                        }
-                    })),
+                    crate::jitcode_dispatch::DispatchOutcome::CloseLoop { .. } => {
+                        close_loop_restart_pc
+                    }
                     crate::jitcode_dispatch::DispatchOutcome::CompileTracePending {
                         loop_header_pc,
                     } => Some(*loop_header_pc),
