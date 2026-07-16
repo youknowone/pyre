@@ -2870,9 +2870,11 @@ fn compute_bridge_root_parent_frame(
     }
     let jitcode_index = unsafe { (*root_sym.jitcode).index as u32 };
     // `root_pc` (`resume_data.frames[0].pc`) is already the post-call resume
-    // point — the slot the inner frame's result lands in — so it is the
-    // fallthrough `resume_py_pc` directly (no `semantic_fallthrough_pc`).
-    let resume_py_pc = crate::state::backxlat_py_pc(jitcode_index as i32, root_pc as i32) as u32;
+    // point — the slot the inner frame's result lands in — so its Python
+    // coordinate is a direct backtranslation (no `semantic_fallthrough_pc`).
+    // This local remains needed by the outer-active-box collector; the paused
+    // parent frame itself carries `ParentResumeCoord::Backxlat(root_pc)`.
+    let root_py_pc = crate::state::backxlat_py_pc(jitcode_index as i32, root_pc as i32) as u32;
     // Null the not-yet-produced call-result slot before collecting the active
     // boxes (the reconstructed callee supplies it on `SubReturn`), mirroring
     // `compute_inline_caller_frame`.  Operate on a clone so `root_sym` stays a
@@ -2933,7 +2935,7 @@ fn compute_bridge_root_parent_frame(
         &regs_r,
         &root_sym.registers_f,
         jitcode_index,
-        resume_py_pc,
+        root_py_pc,
         None,
         // Key the query off the same carried root-frame word the snapshot and
         // decode side read from `frames[0].jitcode_pc`, so both resolve the
@@ -2950,8 +2952,7 @@ fn compute_bridge_root_parent_frame(
         jitcode_index,
         call_jitcode_pc: None,
         call_stack_overrides: Vec::new(),
-        resume_py_pc,
-        resume_coord: Some(ParentResumeCoord::Root(root_pc)),
+        resume_coord: ParentResumeCoord::Backxlat(root_pc),
         // Parent-frame words are never branch-tagged; negative tags belong to
         // a branch guard's own top-frame word.
         resume_marker_jit_pc: root_word,
@@ -3099,12 +3100,9 @@ fn recipe_parent_frame_from_recipe(
         jitcode_index: recipe.jitcode_index as u32,
         call_jitcode_pc: call_jit_pc,
         call_stack_overrides: Vec::new(),
-        resume_py_pc: py_pc as u32,
-        // Reconstructed recipes already carry their resolved resume word, but
-        // do not preserve enough provenance to select one of the two Slice-5
-        // producer formulas without changing their behavior.  Census it as
-        // `nocoord` if it ever reaches a genuine Python-native consumer.
-        resume_coord: None,
+        // The recipe's resolved word was `backxlat_py_pc(jitcode_index,
+        // jitcode_pc)` by construction, exactly the bridge-root flavor.
+        resume_coord: ParentResumeCoord::Backxlat(recipe.jitcode_pc as usize),
         resume_marker_jit_pc,
         boxes,
     })
@@ -7939,35 +7937,26 @@ struct InlineParentFrame {
     /// Concrete operand-stack slots at the caller CALL, keyed by absolute
     /// `locals_cells_stack_w` index. Used only by the abort-point flush.
     call_stack_overrides: Vec<(usize, pyre_object::PyObjectRef)>,
-    /// The caller's resume Python pc: the CALL's return point (fallthrough),
-    /// where the next opcode pops the call result.  First slice keeps this a
-    /// plain py_pc (`< AFTER_RESIDUAL_CALL_PC_FLAG`); a CALL inside a
-    /// try-block (catch marker) declines multi-frame.
-    resume_py_pc: u32,
-    /// Audit-only carried source of `resume_py_pc`.  Phase 1 retains the
-    /// Python word as authoritative; this coordinate records whether its
-    /// producer was the bridge root's direct backtranslation or an inline
-    /// caller's CALL fallthrough.
-    resume_coord: Option<ParentResumeCoord>,
+    /// Authoritative derivation of the caller's Python resume pc.  The
+    /// Python-native consumers resolve this at their boundary; a CALL inside
+    /// a try-block (catch marker) still declines multi-frame.
+    resume_coord: ParentResumeCoord,
     /// Codewrite-time jitcode-keyed marker for the CALL fallthrough resume
     /// point, queried at the CALL site.  Bridge-root frames have no CALL
     /// offset in hand and carry `None`.
     resume_marker_jit_pc: Option<usize>,
-    /// The caller's `in_a_call` active boxes at `resume_py_pc` — the liveness
+    /// The caller's `in_a_call` active boxes at its resolved resume pc — the liveness
     /// at the return point with the not-yet-produced call-result slot nulled
     /// (`get_list_of_active_boxes(in_a_call=true)` parity, trace_opcode.rs:1779).
     boxes: Vec<OpRef>,
 }
 
-/// The derivation flavor of a paused caller frame's Python resume word.
-///
-/// This is deliberately additive in Layer-2 Slice 5 phase 1.  Phase 2 can
-/// move the two producer formulas to their Python-native consumers after this
-/// census has certified every remaining reader.
+/// The derivation flavor of a paused caller frame's Python resume pc.
 #[derive(Clone, Copy)]
 enum ParentResumeCoord {
-    /// `resume_py_pc = backxlat_py_pc(jitcode_index, root_pc)`.
-    Root(usize),
+    /// `resume_py_pc = backxlat_py_pc(jitcode_index, jitcode_pc)`. Used by
+    /// both bridge-root and reconstructed-recipe parent frames.
+    Backxlat(usize),
     /// `resume_py_pc = semantic_fallthrough_pc(code,
     /// python_pc_for_jitcode_pc(metadata, call_jitcode_pc))`.
     CallFallthrough(usize),
@@ -10740,19 +10729,17 @@ pub(crate) fn result_color_audit_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_RESULT_AUDIT").is_some())
 }
 
-/// `PYRE_PCMAP_PFRESUME_AUDIT` census-certs the remaining Python-native
-/// consumers of a paused caller frame's legacy `resume_py_pc`, together with
-/// the builder metadata reads whose JitCode-PC twins are already carried by
-/// the frame.  Diagnostic only; phase 1 leaves every Python-keyed read and
-/// every frame word unchanged.
+/// `PYRE_PCMAP_PFRESUME_AUDIT` records paused-parent-frame coordinate
+/// resolution variants and retains the nested builder's twin assertions.
+/// Diagnostic only; phase 2 makes `ParentResumeCoord` authoritative.
 fn pcmap_pfresume_audit_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_PFRESUME_AUDIT").is_some())
 }
 
 /// Append one paused-parent-frame resume audit result. `check.py` discards
-/// diagnostic stderr, so the optional probe receives one row per attempted
-/// comparison: `pfresume <site> <eq|di|nocoord>`.
+/// diagnostic stderr, so the optional probe receives one row per resolution
+/// or nested-twin assertion.
 fn pcmap_pfresume_audit_probe(site: &'static str, verdict: &'static str) {
     if let Some(path) = std::env::var_os("PYRE_PCMAP_PFRESUME_AUDIT_PROBE") {
         use std::io::Write;
@@ -10767,18 +10754,36 @@ fn pcmap_pfresume_audit_probe(site: &'static str, verdict: &'static str) {
     }
 }
 
-/// Re-derive a paused parent frame's Python resume word by the formula that
-/// produced it.  This deliberately lives at the genuine Python-native reader,
-/// not at a new producer, so phase 1 remains an additive/report-only census.
-fn parent_resume_py_pc_from_coord(parent: &InlineParentFrame) -> Option<u32> {
-    match parent.resume_coord? {
-        ParentResumeCoord::Root(root_pc) => {
-            Some(crate::state::backxlat_py_pc(parent.jitcode_index as i32, root_pc as i32) as u32)
+/// Resolve the authoritative paused-parent coordinate at a Python-native
+/// consumer. A missing JitCode/code object is reported to the caller as the
+/// same multi-frame snapshot decline used by nearby unavailable-coordinate
+/// paths; it is never a panic.
+fn resolve_parent_resume_py_pc(parent: &InlineParentFrame, site: &'static str) -> Option<u32> {
+    match parent.resume_coord {
+        ParentResumeCoord::Backxlat(jitcode_pc) => {
+            if pcmap_pfresume_audit_enabled() {
+                pcmap_pfresume_audit_probe(site, "backxlat");
+            }
+            Some(
+                crate::state::backxlat_py_pc(parent.jitcode_index as i32, jitcode_pc as i32) as u32,
+            )
         }
         ParentResumeCoord::CallFallthrough(call_jit_pc) => {
-            let pjc = crate::state::pyjitcode_for_jitcode_index(parent.jitcode_index as i32)?;
-            if pjc.code_ptr.is_null() {
+            let Some(pjc) = crate::state::pyjitcode_for_jitcode_index(parent.jitcode_index as i32)
+            else {
+                if pcmap_pfresume_audit_enabled() {
+                    pcmap_pfresume_audit_probe(site, "unavailable");
+                }
                 return None;
+            };
+            if pjc.code_ptr.is_null() {
+                if pcmap_pfresume_audit_enabled() {
+                    pcmap_pfresume_audit_probe(site, "unavailable");
+                }
+                return None;
+            }
+            if pcmap_pfresume_audit_enabled() {
+                pcmap_pfresume_audit_probe(site, "call_fallthrough");
             }
             let call_py_pc = python_pc_for_jitcode_pc(&pjc.metadata, call_jit_pc) as usize;
             let code = unsafe { &*pjc.code_ptr };
@@ -10787,35 +10792,9 @@ fn parent_resume_py_pc_from_coord(parent: &InlineParentFrame) -> Option<u32> {
     }
 }
 
-/// Census one true `InlineParentFrame::resume_py_pc` consumer.  The existing
-/// Python word remains authoritative; an unavailable carried coordinate is a
-/// `di`, while a recipe-origin frame with no coordinate is explicitly
-/// `nocoord`.
-fn audit_parent_resume_py_pc_read(parent: &InlineParentFrame, site: &'static str) {
-    if !pcmap_pfresume_audit_enabled() {
-        return;
-    }
-    if parent.resume_coord.is_none() {
-        pcmap_pfresume_audit_probe(site, "nocoord");
-        return;
-    }
-    let rederived = parent_resume_py_pc_from_coord(parent);
-    let verdict = if rederived == Some(parent.resume_py_pc) {
-        "eq"
-    } else {
-        "di"
-    };
-    pcmap_pfresume_audit_probe(site, verdict);
-    assert_eq!(
-        rederived,
-        Some(parent.resume_py_pc),
-        "PFRESUME {site} rederivation diverges from carried resume_py_pc"
-    );
-}
-
-/// Census one builder's Python-keyed metadata table read against its selected
-/// JitCode-PC twin.  Unlike the frame-word reader above, a missing twin is a
-/// real divergence (`di`), not a missing carried coordinate.
+/// Retained only for the unobserved nested builder: its marker construction is
+/// line-identical to the certified top-level M73_PFMARKER identity, and this
+/// assertion self-checks any future execution.
 fn audit_pfresume_twin<T: PartialEq>(site: &'static str, twin: T, table: T) {
     if !pcmap_pfresume_audit_enabled() {
         return;
@@ -12922,7 +12901,6 @@ fn concrete_ref_for_opref(
 fn collect_call_stack_overrides(
     caller_sym: &crate::state::PyreSym,
     ctx: &WalkContext<'_, '_>,
-    call_py_pc: usize,
     call_jitcode_pc: usize,
 ) -> Vec<(usize, pyre_object::PyObjectRef)> {
     if caller_sym.jitcode.is_null() {
@@ -12933,34 +12911,18 @@ fn collect_call_stack_overrides(
         if jc.payload.code_ptr.is_null() {
             return Vec::new();
         }
-        let table_depth = crate::liveness::liveness_for(jc.payload.code_ptr)
-            .depth_at_py_pc()
-            .get(call_py_pc)
-            .copied();
-        let table_pcdep = jc
+        // The caller CALL key is a plain JitCode→Python inversion, so use the
+        // certified predecessor twins rather than the marker/trivia flavor
+        // reserved for the CALL fallthrough below.
+        let depth = jc
             .payload
-            .metadata
-            .pcdep_color_slots
-            .get(call_py_pc)
-            .cloned();
-        // `call_py_pc` is the plain inversion of the supplied CALL JitCode
-        // offset, so the predecessor twins are the matching flavor here (not
-        // the marker/trivia tables used for the CALL fallthrough below).
-        audit_pfresume_twin(
-            "overrides_depth_plain",
-            jc.payload.depth_for_jitcode_pc_pred(call_jitcode_pc),
-            table_depth,
-        );
-        audit_pfresume_twin(
-            "overrides_pcdep_plain",
-            jc.payload.pcdep_for_jitcode_pc(call_jitcode_pc),
-            table_pcdep.clone(),
-        );
-        (
-            caller_sym.nlocals,
-            table_depth.unwrap_or(0) as usize,
-            table_pcdep.unwrap_or_default(),
-        )
+            .depth_for_jitcode_pc_pred(call_jitcode_pc)
+            .unwrap_or(0) as usize;
+        let pcdep = jc
+            .payload
+            .pcdep_for_jitcode_pc(call_jitcode_pc)
+            .unwrap_or_default();
+        (caller_sym.nlocals, depth, pcdep)
     };
     let stack_end = nlocals + depth;
     if depth == 0 {
@@ -13048,7 +13010,7 @@ fn compute_inline_caller_frame(
     if caller_sym.jitcode.is_null() {
         return Err(InlineCallerFrameDecline::Unavailable);
     }
-    let (jitcode_index, call_py_pc, fallthrough_py_pc, resume_marker_jit_pc, code_ptr) = unsafe {
+    let (jitcode_index, fallthrough_py_pc, resume_marker_jit_pc, code_ptr) = unsafe {
         let jc = &*caller_sym.jitcode;
         if jc.payload.code_ptr.is_null() || !jc.payload.is_populated() {
             return Err(InlineCallerFrameDecline::Unavailable);
@@ -13065,31 +13027,27 @@ fn compute_inline_caller_frame(
         let fallthrough = crate::pyjitpl::semantic_fallthrough_pc(code, call_py) as u32;
         (
             jc.index as u32,
-            call_py as u32,
             fallthrough,
             jc.payload.after_residual_marker_for_jitcode_pc(call_jit_pc),
             jc.payload.code_ptr,
         )
     };
     // The call result is the top operand-stack slot at the return point.
-    let table_depth = unsafe {
-        crate::liveness::liveness_for(code_ptr)
-            .depth_at_py_pc()
-            .get(fallthrough_py_pc as usize)
-            .copied()
+    let depth = match resume_marker_jit_pc {
+        Some(marker) => unsafe { &(*caller_sym.jitcode).payload }
+            .depth_trivia_for_jitcode_pc(marker)
+            .unwrap_or(0) as usize,
+        // A missing marker has no fallthrough-native key. Preserve the
+        // existing Python-keyed path rather than declining a formerly valid
+        // caller frame.
+        None => unsafe {
+            crate::liveness::liveness_for(code_ptr)
+                .depth_at_py_pc()
+                .get(fallthrough_py_pc as usize)
+                .copied()
+                .unwrap_or(0) as usize
+        },
     };
-    if pcmap_pfresume_audit_enabled() {
-        let payload = unsafe { &(*caller_sym.jitcode).payload };
-        match resume_marker_jit_pc {
-            Some(marker) => audit_pfresume_twin(
-                "inline_top_depth_trivia",
-                payload.depth_trivia_for_jitcode_pc(marker),
-                table_depth,
-            ),
-            None => pcmap_pfresume_audit_probe("inline_top_depth_trivia", "nocoord"),
-        }
-    }
-    let depth = table_depth.unwrap_or(0) as usize;
     if depth == 0 {
         return Err(InlineCallerFrameDecline::Unavailable);
     }
@@ -13104,30 +13062,22 @@ fn compute_inline_caller_frame(
             );
         }
     }
-    let call_stack_overrides =
-        collect_call_stack_overrides(caller_sym, ctx, call_py_pc as usize, call_jit_pc);
+    let call_stack_overrides = collect_call_stack_overrides(caller_sym, ctx, call_jit_pc);
     // #73: the result slot's color comes from the codewriter-precomputed
     // `result_color_at_pc` (top-of-stack color at the return pc), not the flat
     // `stack_slot_color_map` — the result is not a live Variable here, so it
     // carries no pcdep entry.
-    let result_color =
-        crate::state::result_color_at_pc_at(jitcode_index as i32, fallthrough_py_pc as usize)
-            .ok_or(InlineCallerFrameDecline::Unavailable)?;
-    if pcmap_pfresume_audit_enabled() {
-        let payload = unsafe { &(*caller_sym.jitcode).payload };
-        match resume_marker_jit_pc {
-            Some(marker) => audit_pfresume_twin(
-                "inline_top_result_color_pred",
-                payload.result_color_for_jitcode_pc_pred(marker),
-                payload
-                    .metadata
-                    .result_color_at_pc
-                    .get(fallthrough_py_pc as usize)
-                    .copied(),
-            ),
-            None => pcmap_pfresume_audit_probe("inline_top_result_color_pred", "nocoord"),
+    let result_color = match resume_marker_jit_pc {
+        Some(marker) => unsafe { &(*caller_sym.jitcode).payload }
+            .result_color_for_jitcode_pc_pred(marker)
+            .filter(|&color| color != u16::MAX)
+            .map(|color| color as usize),
+        // Keep the legacy table only for the unkeyed marker-miss fallback.
+        None => {
+            crate::state::result_color_at_pc_at(jitcode_index as i32, fallthrough_py_pc as usize)
         }
     }
+    .ok_or(InlineCallerFrameDecline::Unavailable)?;
     // Null the not-yet-produced result slot, build the box list, then restore
     // the caller's register (the inlined callee, not the walk, produces the
     // result; the inner frame supplies it on resume).
@@ -13166,8 +13116,7 @@ fn compute_inline_caller_frame(
         jitcode_index,
         call_jitcode_pc: Some(call_jit_pc),
         call_stack_overrides,
-        resume_py_pc: fallthrough_py_pc,
-        resume_coord: Some(ParentResumeCoord::CallFallthrough(call_jit_pc)),
+        resume_coord: ParentResumeCoord::CallFallthrough(call_jit_pc),
         resume_marker_jit_pc,
         boxes,
     })
@@ -13192,36 +13141,48 @@ fn compute_nested_inline_caller_frame(
     if !pjc.is_populated() || pjc.code_ptr.is_null() {
         return Err(InlineCallerFrameDecline::Unavailable);
     }
-    let call_py = python_pc_for_jitcode_pc(&pjc.metadata, call_jit_pc) as usize;
     let resume_marker_jit_pc = pjc.after_residual_marker_for_jitcode_pc(call_jit_pc);
     let after_residual_call_resume = pjc.after_residual_call_resume_for_jitcode_pc(call_jit_pc);
     // A CALL inside a try-block resumes at its own catch via a bit-14 marker
     // pc, which the multi-frame capture's `py_pc < FLAG` assert rejects.
     decline_inline_caller_frame_for_catch_marker(after_residual_call_resume)?;
-    let fallthrough_py_pc = unsafe {
+    let legacy_fallthrough_py_pc = || unsafe {
+        let call_py = python_pc_for_jitcode_pc(&pjc.metadata, call_jit_pc) as usize;
         let code = &*pjc.code_ptr;
         crate::pyjitpl::semantic_fallthrough_pc(code, call_py) as u32
     };
     // The call result is the top operand-stack slot at the return point.
-    let table_depth = unsafe {
-        crate::liveness::liveness_for(pjc.code_ptr)
-            .depth_at_py_pc()
-            .get(fallthrough_py_pc as usize)
-            .copied()
+    let depth = match resume_marker_jit_pc {
+        Some(marker) => pjc.depth_trivia_for_jitcode_pc(marker).unwrap_or(0) as usize,
+        None => {
+            let fallthrough_py_pc = legacy_fallthrough_py_pc();
+            unsafe {
+                crate::liveness::liveness_for(pjc.code_ptr)
+                    .depth_at_py_pc()
+                    .get(fallthrough_py_pc as usize)
+                    .copied()
+                    .unwrap_or(0) as usize
+            }
+        }
     };
+    if depth == 0 {
+        return Err(InlineCallerFrameDecline::Unavailable);
+    }
     if pcmap_pfresume_audit_enabled() {
-        match resume_marker_jit_pc {
-            Some(marker) => audit_pfresume_twin(
+        if let Some(marker) = resume_marker_jit_pc {
+            let fallthrough_py_pc = legacy_fallthrough_py_pc();
+            let table_depth = unsafe {
+                crate::liveness::liveness_for(pjc.code_ptr)
+                    .depth_at_py_pc()
+                    .get(fallthrough_py_pc as usize)
+                    .copied()
+            };
+            audit_pfresume_twin(
                 "inline_nested_depth_trivia",
                 pjc.depth_trivia_for_jitcode_pc(marker),
                 table_depth,
-            ),
-            None => pcmap_pfresume_audit_probe("inline_nested_depth_trivia", "nocoord"),
+            );
         }
-    }
-    let depth = table_depth.unwrap_or(0) as usize;
-    if depth == 0 {
-        return Err(InlineCallerFrameDecline::Unavailable);
     }
     if result_color_audit_enabled() {
         if let Some(jit_pc) = resume_marker_jit_pc {
@@ -13235,20 +13196,28 @@ fn compute_nested_inline_caller_frame(
     }
     // #73: result slot color from the precomputed `result_color_at_pc`, not
     // the flat `stack_slot_color_map` (see `compute_inline_caller_frame`).
-    let result_color =
-        crate::state::result_color_at_pc_at(jitcode_index as i32, fallthrough_py_pc as usize)
-            .ok_or(InlineCallerFrameDecline::Unavailable)?;
+    let result_color = match resume_marker_jit_pc {
+        Some(marker) => pjc
+            .result_color_for_jitcode_pc_pred(marker)
+            .filter(|&color| color != u16::MAX)
+            .map(|color| color as usize),
+        None => crate::state::result_color_at_pc_at(
+            jitcode_index as i32,
+            legacy_fallthrough_py_pc() as usize,
+        ),
+    }
+    .ok_or(InlineCallerFrameDecline::Unavailable)?;
     if pcmap_pfresume_audit_enabled() {
-        match resume_marker_jit_pc {
-            Some(marker) => audit_pfresume_twin(
+        if let Some(marker) = resume_marker_jit_pc {
+            let fallthrough_py_pc = legacy_fallthrough_py_pc();
+            audit_pfresume_twin(
                 "inline_nested_result_color_pred",
                 pjc.result_color_for_jitcode_pc_pred(marker),
                 pjc.metadata
                     .result_color_at_pc
                     .get(fallthrough_py_pc as usize)
                     .copied(),
-            ),
-            None => pcmap_pfresume_audit_probe("inline_nested_result_color_pred", "nocoord"),
+            );
         }
     }
     // Null the not-yet-produced result slot, build the box list, then restore
@@ -13288,8 +13257,7 @@ fn compute_nested_inline_caller_frame(
         jitcode_index,
         call_jitcode_pc: Some(call_jit_pc),
         call_stack_overrides: Vec::new(),
-        resume_py_pc: fallthrough_py_pc,
-        resume_coord: Some(ParentResumeCoord::CallFallthrough(call_jit_pc)),
+        resume_coord: ParentResumeCoord::CallFallthrough(call_jit_pc),
         resume_marker_jit_pc,
         boxes,
     })
@@ -13434,8 +13402,9 @@ fn walker_capture_multi_frame_inline_snapshot(
     if !caller_sym_ptr.is_null() {
         let caller_sym = unsafe { &*caller_sym_ptr };
         if caller_sym.owns_virtualizable_shadow() && !caller_sym.jitcode.is_null() {
-            audit_parent_resume_py_pc_read(outer, "vable_last_instr");
-            let last_instr_value = outer.resume_py_pc as i64 - 1;
+            let resume_py_pc = resolve_parent_resume_py_pc(outer, "vable_last_instr")
+                .ok_or(DispatchError::GuardResumeCoordinateUnavailable { pc: callee_op_pc })?;
+            let last_instr_value = resume_py_pc as i64 - 1;
             let last_instr_op = ctx.trace_ctx.const_int(last_instr_value);
             crate::trace_opcode::mirror_vable_static_to_boxes(
                 ctx.trace_ctx,
@@ -13443,18 +13412,15 @@ fn walker_capture_multi_frame_inline_snapshot(
                 last_instr_op,
                 Value::Int(last_instr_value),
             );
-            audit_parent_resume_py_pc_read(outer, "vable_stack_depth");
+            let resume_py_pc = resolve_parent_resume_py_pc(outer, "vable_stack_depth")
+                .ok_or(DispatchError::GuardResumeCoordinateUnavailable { pc: callee_op_pc })?;
             let vsd_value = unsafe {
                 let jc = &*caller_sym.jitcode;
                 if jc.payload.code_ptr.is_null() {
                     caller_sym.valuestackdepth as i64
                 } else {
                     let lv = crate::liveness::liveness_for(jc.payload.code_ptr);
-                    match lv
-                        .depth_at_py_pc()
-                        .get(outer.resume_py_pc as usize)
-                        .copied()
-                    {
+                    match lv.depth_at_py_pc().get(resume_py_pc as usize).copied() {
                         Some(d) => (caller_sym.nlocals + d as usize) as i64,
                         None => caller_sym.valuestackdepth as i64,
                     }
