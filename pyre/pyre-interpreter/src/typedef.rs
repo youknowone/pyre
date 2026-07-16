@@ -15227,7 +15227,11 @@ fn set_newobj_items(
     w_iterable: pyre_object::PyObjectRef,
 ) -> Result<Vec<pyre_object::PyObjectRef>, crate::PyError> {
     let items = crate::builtins::collect_iterable(w_iterable)?;
-    let w_set = crate::type_methods::set_from_items_checked(&items)?;
+    // Each element's `__hash__` is a collection point that can move both the
+    // temporary set and the elements not yet added, so the build roots them
+    // and reloads across every hash; `builtin_set_from_items` returns the
+    // reloaded set, and reading its elements back allocates nothing.
+    let w_set = crate::builtins::builtin_set_from_items(&items)?;
     Ok(unsafe { pyre_object::w_set_items(w_set) })
 }
 

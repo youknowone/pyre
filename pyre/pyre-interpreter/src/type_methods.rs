@@ -4750,12 +4750,6 @@ pub(crate) fn dict_store_checked(
     }
 }
 
-/// Populate a fresh set from `items`, hashing each through the protocol.
-pub(crate) fn set_from_items_checked(items: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    pyre_object::setobject::w_set_from_items_checked(items)
-        .map_err(|_| crate::baseobjspace::take_pending_hash_error())
-}
-
 /// Remove an element from a set, hashing it through the protocol.
 pub(crate) fn set_discard_checked(
     set: PyObjectRef,
