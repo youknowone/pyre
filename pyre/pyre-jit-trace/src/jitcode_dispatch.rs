@@ -20542,7 +20542,8 @@ fn try_walker_specialize_subscr_tuple(
     Ok(Some(()))
 }
 
-/// `len(x)` on an exact canonical `W_ListObject` / `W_UnicodeObject`:
+/// `len(x)` on an exact canonical `W_ListObject` / `W_UnicodeObject` /
+/// `W_TupleObject`:
 /// lower the opaque `bh_call_fn(len_builtin, PY_NULL, x)` residual to the
 /// inline length read the meta-tracer produces upstream
 /// (descroperation.py:294 `_len`): `guard_value(callable)` +
@@ -20550,14 +20551,16 @@ fn try_walker_specialize_subscr_tuple(
 /// `wrapint`.  For a list this reads `W_ListObject.length()` →
 /// `strategy.length`, so it additionally emits `guard_value(strategy)`
 /// (rlist.py); for a str it reads the codepoint field directly
-/// (`W_UnicodeObject.len` → `bh_unicodelen`, no storage strategy).  The
+/// (`W_UnicodeObject.len` → `bh_unicodelen`, no storage strategy); for a
+/// tuple it reads `wrappeditems` and applies `arraylen_gc`, matching
+/// `tupleobject.py` where the tuple carries no separate length field. The
 /// exact `w_class` guard is required because a SUBCLASS shares
-/// `ob_type == &LIST_TYPE`/`&STR_TYPE` but may override `__len__`
+/// `ob_type == &LIST_TYPE`/`&STR_TYPE`/`&TUPLE_TYPE` but may override `__len__`
 /// (`baseobjspace::len` dispatches `subclass_special_override`); it
 /// side-exits to the generic residual.
 ///
 /// Returns `None` (fall through to the generic residual, SAFE) for any
-/// other shape: non-list/str arg, a subclass, empty-strategy list, a
+/// other shape: non-list/str/tuple arg, a subclass, empty-strategy list, a
 /// bound receiver, or wrong arity.
 fn try_walker_specialize_builtin_len(
     ctx: &mut WalkContext<'_, '_>,
@@ -20587,10 +20590,10 @@ fn try_walker_specialize_builtin_len(
     if !pyre_interpreter::builtins::is_builtin_len_function(concrete_callable) {
         return Ok(None);
     }
-    // Exact canonical list / str only (see the doc comment on the subclass
+    // Exact canonical list / str / tuple only (see the doc comment on the subclass
     // `__len__` hazard).  `arg_type_addr` / `exact_w_class` pin the guard
-    // target; `is_str` selects the length path.
-    let (arg_type_addr, exact_w_class, is_str) = unsafe {
+    // target; the booleans select the length path.
+    let (arg_type_addr, exact_w_class, is_str, is_tuple) = unsafe {
         if std::ptr::eq((*list_obj).ob_type, &pyre_object::pyobject::LIST_TYPE)
             && std::ptr::eq(
                 (*list_obj).w_class,
@@ -20600,6 +20603,7 @@ fn try_walker_specialize_builtin_len(
             (
                 &pyre_object::pyobject::LIST_TYPE as *const _ as i64,
                 pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::LIST_TYPE),
+                false,
                 false,
             )
         } else if std::ptr::eq((*list_obj).ob_type, &pyre_object::pyobject::STR_TYPE)
@@ -20612,17 +20616,32 @@ fn try_walker_specialize_builtin_len(
                 &pyre_object::pyobject::STR_TYPE as *const _ as i64,
                 pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::STR_TYPE),
                 true,
+                false,
+            )
+        } else if std::ptr::eq((*list_obj).ob_type, &pyre_object::pyobject::TUPLE_TYPE)
+            && std::ptr::eq(
+                (*list_obj).w_class,
+                pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::TUPLE_TYPE),
+            )
+        {
+            (
+                &pyre_object::pyobject::TUPLE_TYPE as *const _ as i64,
+                pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::TUPLE_TYPE),
+                false,
+                true,
             )
         } else {
             return Ok(None);
         }
     };
     // Length source: str reads the codepoint field directly (no storage
-    // strategy); list resolves its storage strategy (guarded below).  `sid`
-    // is `None` for str.
+    // strategy); tuple reads the wrappeditems GcArray header; list resolves
+    // its storage strategy (guarded below). `sid` is `None` for str/tuple.
     let (sid, concrete_len) = unsafe {
         if is_str {
             (None, pyre_object::w_str_len(list_obj))
+        } else if is_tuple {
+            (None, pyre_object::w_tuple_len(list_obj))
         } else {
             let concrete_len = pyre_object::w_list_len(list_obj);
             let sid = if pyre_object::w_list_uses_int_storage(list_obj) {
@@ -20678,7 +20697,7 @@ fn try_walker_specialize_builtin_len(
     // strategy's length field (rlist.py:116 inline field for object storage;
     // typed items-block length for int/float storage).  str: a plain
     // codepoint-length getfield (no strategy, `bh_unicodelen`).
-    let len_descr = if let Some(sid) = sid {
+    let raw_len = if let Some(sid) = sid {
         let strategy = crate::state::opimpl_getfield_gc_i(
             ctx.trace_ctx,
             list_op,
@@ -20691,15 +20710,26 @@ fn try_walker_specialize_builtin_len(
         ctx.trace_ctx
             .heap_cache_mut()
             .replace_box(strategy, sid_const);
-        match sid {
+        let len_descr = match sid {
             0 => crate::descr::list_length_descr(),
             1 => crate::descr::list_int_items_len_descr(),
             _ => crate::descr::list_float_items_len_descr(),
-        }
+        };
+        crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, list_op, len_descr)
+    } else if is_tuple {
+        let wrappeditems = crate::state::opimpl_getfield_gc_r(
+            ctx.trace_ctx,
+            list_op,
+            crate::descr::tuple_wrappeditems_descr(),
+        );
+        crate::state::opimpl_arraylen_gc(
+            ctx.trace_ctx,
+            wrappeditems,
+            crate::state::pyobject_gcarray_descr(),
+        )
     } else {
-        crate::descr::str_len_descr()
+        crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, list_op, crate::descr::str_len_descr())
     };
-    let raw_len = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, list_op, len_descr);
     ctx.trace_ctx
         .set_opref_concrete(raw_len, majit_ir::Value::Int(concrete_len as i64));
     let boxed = walker_box_int(ctx, op.pc, raw_len, concrete_len as i64)?;
