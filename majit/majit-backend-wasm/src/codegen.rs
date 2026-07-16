@@ -2408,7 +2408,7 @@ fn build_function(
                 // lowering for both tagged and boxed operands.
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
-                    emit_resolve(&mut sink, constants, op.arg(0).to_opref());
+                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.i32_wrap_i64();
                     sink.i64_extend_i32_s();
                     sink.local_set(1 + vi);
