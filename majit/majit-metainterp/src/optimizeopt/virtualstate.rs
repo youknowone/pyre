@@ -2916,6 +2916,37 @@ mod tests {
     }
 
     #[test]
+    fn int_leaf_joins_int_target_type_gate_passes() {
+        // virtualstate.py:368 not_virtual dispatch: an Int-expected target
+        // accepts Int-typed leaves (Unknown(Int) / IntBounded / Int Constant)
+        // and rejects any Ref-typed leaf; symmetrically a Ref-expected target
+        // rejects an Int-typed leaf. Pins the raw-intval merge-point contract:
+        // a proven-int loop carry joins an Int slot without a box, and a
+        // cross-type Int/Ref join is rejected (falls back to jump_to_preamble),
+        // never silently coerced.
+        assert!(info_type_matches(
+            Type::Int,
+            &VirtualStateInfo::Unknown(Type::Int)
+        ));
+        assert!(info_type_matches(
+            Type::Int,
+            &VirtualStateInfo::IntBounded(IntBound::bounded(0, 100))
+        ));
+        assert!(info_type_matches(
+            Type::Int,
+            &VirtualStateInfo::Constant(Value::Int(0))
+        ));
+        assert!(!info_type_matches(
+            Type::Int,
+            &VirtualStateInfo::Unknown(Type::Ref)
+        ));
+        assert!(!info_type_matches(
+            Type::Ref,
+            &VirtualStateInfo::Unknown(Type::Int)
+        ));
+    }
+
+    #[test]
     fn test_nonnull_compatibility() {
         let mut ctx = OptContext::new(128);
         let nn = vs1(VirtualStateInfo::NonNull);
