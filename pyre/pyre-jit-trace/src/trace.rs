@@ -1579,8 +1579,8 @@ fn run_perfn_walk(
 
     // setup_call argbox: seed r0 = the standard virtualizable identity box
     // (`virtualizable_boxes[-1]`, the `InputArgRef(SYM_FRAME_IDX)` that
-    // `init_symbolic` seeded) — the SAME OpRef production's arm entry uses
-    // (`dispatch_via_miframe_at_opcode_entry` seeds r0 = `sym.frame`, and
+    // `init_symbolic` seeded) — the SAME OpRef the retired per-opcode arm
+    // entry seeded as r0 (= `sym.frame`, and
     // `sym.frame == OpRef::input_arg_typed(SYM_FRAME_IDX, Ref)`).  A fresh
     // `const_ref(cf_addr)` would be a DIFFERENT OpRef than the identity box,
     // so `concrete_of_opref`'s standard-vable resolution (trace_ctx.rs:1842,
