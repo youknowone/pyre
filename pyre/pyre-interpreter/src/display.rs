@@ -389,7 +389,6 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
                 pyre_object::tagged_int::untag_int(obj)
             )));
         }
-        let obj = crate::baseobjspace::unwrap_cell(obj);
         if !obj.is_null() {
             let tp = (*obj).ob_type;
             // A builtin leaf subclass's `__repr__` override may return a
@@ -448,13 +447,12 @@ unsafe fn exc_user_dunder_obj(obj: PyObjectRef, name: &str) -> Option<PyObjectRe
 }
 
 pub unsafe fn py_repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
-    // A tagged immediate must be formatted before `unwrap_cell` /
-    // `ob_type` touch it as a pointer; `repr` of a plain `int` is its
+    // A tagged immediate must be formatted before `ob_type` touches it as a
+    // pointer; `repr` of a plain `int` is its
     // decimal value. Gated on `CAN_BE_TAGGED` (default false).
     if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj) {
         return Ok(format!("{}", pyre_object::tagged_int::untag_int(obj)));
     }
-    let obj = crate::baseobjspace::unwrap_cell(obj);
     if obj.is_null() {
         return Ok("NULL".to_string());
     }
@@ -811,12 +809,11 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
 pub unsafe fn py_str(obj: PyObjectRef) -> Result<String, crate::PyError> {
     unsafe {
         // `str` of a tagged `int` immediate is its decimal value; format
-        // it before `unwrap_cell` / `ob_type` deref. Gated on
+        // it before `ob_type` deref. Gated on
         // `CAN_BE_TAGGED` (default false).
         if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj) {
             return Ok(format!("{}", pyre_object::tagged_int::untag_int(obj)));
         }
-        let obj = crate::baseobjspace::unwrap_cell(obj);
         if obj.is_null() {
             return Ok("NULL".to_string());
         }
@@ -1007,7 +1004,7 @@ pub unsafe fn py_str(obj: PyObjectRef) -> Result<String, crate::PyError> {
 pub unsafe fn py_str_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
     unsafe {
         // A tagged `int` immediate stringifies to its decimal value
-        // (plain ASCII); format it before `unwrap_cell` / `ob_type`
+        // (plain ASCII); format it before `ob_type`
         // touch it as a pointer. Gated on `CAN_BE_TAGGED` (default false).
         if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj) {
             return Ok(Wtf8Buf::from_string(format!(
@@ -1015,7 +1012,6 @@ pub unsafe fn py_str_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
                 pyre_object::tagged_int::untag_int(obj)
             )));
         }
-        let obj = crate::baseobjspace::unwrap_cell(obj);
         if !obj.is_null() {
             let tp = (*obj).ob_type;
             if std::ptr::eq(tp, &STR_TYPE as *const PyType) {
@@ -1109,7 +1105,6 @@ unsafe fn exception_descr_str_wtf8(obj: PyObjectRef) -> Option<Wtf8Buf> {
             return None;
         }
         let first = pyre_object::w_tuple_getitem(args, 0).unwrap_or(args);
-        let first = crate::baseobjspace::unwrap_cell(first);
         if first.is_null() || !std::ptr::eq((*first).ob_type, &STR_TYPE as *const PyType) {
             return None;
         }

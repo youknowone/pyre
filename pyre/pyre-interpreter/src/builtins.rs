@@ -5045,7 +5045,7 @@ pub(crate) fn builtin_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         return crate::typedef::bytes_method_decode(&decode_args);
     }
     // A tagged `int` immediate stringifies to its decimal value; format it
-    // before `is_str` / `unwrap_cell` / `ob_type` touch it as a pointer.
+    // before `is_str` / `ob_type` touch it as a pointer.
     // Mirrors `py_str_wtf8` / `py_repr_obj`. Gated on `CAN_BE_TAGGED`.
     if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj) {
         return Ok(w_str_new(&format!(
@@ -5075,7 +5075,6 @@ pub(crate) fn builtin_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         }
     }
     unsafe {
-        let obj = crate::baseobjspace::unwrap_cell(obj);
         if !obj.is_null() && std::ptr::eq((*obj).ob_type, &INSTANCE_TYPE as *const PyType) {
             if let Some(r) = crate::display::try_call_dunder_obj_above_object(obj, "__str__")? {
                 return Ok(r);
@@ -5097,7 +5096,6 @@ unsafe fn py_repr_obj(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
                 pyre_object::tagged_int::untag_int(obj)
             )));
         }
-        let obj = crate::baseobjspace::unwrap_cell(obj);
         if !obj.is_null() {
             let tp = (*obj).ob_type;
             if let Some(r) = crate::display::builtin_subclass_dunder_obj(obj, tp, "__repr__")? {

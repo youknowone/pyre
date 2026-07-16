@@ -3371,7 +3371,6 @@ fn fill_positional_defaults_for_jit_call<'a>(
         return Cow::Borrowed(args);
     }
 
-    let defaults = pyre_interpreter::baseobjspace::unwrap_cell(defaults);
     let ndefaults = if unsafe { pyre_object::is_tuple(defaults) } {
         unsafe { pyre_object::w_tuple_len(defaults) }
     } else {

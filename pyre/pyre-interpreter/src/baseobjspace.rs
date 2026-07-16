@@ -153,28 +153,6 @@ impl ObjSpace {
     }
 }
 
-// ── Cell unwrap ──────────────────────────────────────────────────────
-// CPython 3.13 unified locals+cells means LoadFast can return cell
-// objects. All operations must transparently unwrap cells.
-// PyPy: each opcode implementation calls space.unwrap_cell() implicitly.
-
-/// Unwrap a cell object to its contents. Non-cells pass through.
-#[inline(always)]
-pub fn unwrap_cell(obj: PyObjectRef) -> PyObjectRef {
-    if obj.is_null() {
-        return obj;
-    }
-    if unsafe { is_cell(obj) } {
-        let inner = unsafe { w_cell_get(obj) };
-        if !inner.is_null() {
-            return inner;
-        }
-        // Cell with null content — return cell itself (caller will handle)
-        return obj;
-    }
-    obj
-}
-
 /// pypy/interpreter/baseobjspace.py `issubtype_w` — `cls` is in
 /// `w_type.mro_w`. Uses the cached MRO when present, otherwise
 /// recomputes via `compute_default_mro`.
@@ -570,8 +548,6 @@ unsafe fn p_recursive_issubclass_w(
 /// looked up via `space.lookup(w_klass_or_tuple, "__instancecheck__")`,
 /// then the abstract `__class__`/`__bases__` walk.
 pub fn isinstance(obj: PyObjectRef, classinfo: PyObjectRef) -> Result<bool, PyError> {
-    let obj = unwrap_cell(obj);
-    let classinfo = unwrap_cell(classinfo);
     unsafe {
         // abstractinst.py:104-106 — quick exact-type test.
         if let Some(t) = crate::typedef::r#type(obj) {
@@ -637,8 +613,6 @@ pub fn isinstance(obj: PyObjectRef, classinfo: PyObjectRef) -> Result<bool, PyEr
 /// Tuple/union recursion, `__subclasscheck__` override looked up on
 /// `type(classinfo)`, then the abstract `__bases__` walk.
 pub fn issubclass(derived: PyObjectRef, classinfo: PyObjectRef) -> Result<bool, PyError> {
-    let derived = unwrap_cell(derived);
-    let classinfo = unwrap_cell(classinfo);
     unsafe {
         // abstractinst.py:181-187 — tuple recursion.
         if is_tuple(classinfo) {
@@ -780,7 +754,6 @@ pub(crate) unsafe fn subclass_special_override(
 /// generic tail, which consults `__bool__` then `__len__`, where the call
 /// exceptions — and the non-bool-`__bool__` TypeError — propagate.
 pub fn is_true(obj: PyObjectRef) -> Result<bool, PyError> {
-    let obj = unwrap_cell(obj);
     // descroperation.py:265 — `__bool__` (anywhere in the MRO) is consulted
     // before `__len__`.  An exact builtin's `__bool__` / `__len__` are the
     // inherited builtin slots, so its truthiness is computed by layout in
@@ -828,7 +801,6 @@ fn is_true_lookup(obj: PyObjectRef) -> Result<bool, PyError> {
 /// `__bool__` base slots bind here so that the lookup path can invoke them
 /// (for non-overriding subclasses) without recursing through `is_true`.
 pub(crate) fn is_true_slot(obj: PyObjectRef) -> Result<bool, PyError> {
-    let obj = unwrap_cell(obj);
     unsafe {
         if is_bool(obj) {
             return Ok(w_bool_get_value(obj));
@@ -1153,8 +1125,6 @@ pub(crate) fn dict_missing_or_key_error(obj: PyObjectRef, index: PyObjectRef) ->
 /// Dispatches based on the type of `obj`.
 
 pub fn getitem(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
-    let obj = unwrap_cell(obj);
-    let index = unwrap_cell(index);
     // `pypy/objspace/std/dictproxyobject.py:35 descr_getitem` →
     // `space.getitem(self.w_mapping, w_key)` — forward through the
     // proxy to its wrapped mapping.  The unwrap happens at the
@@ -1192,8 +1162,6 @@ pub fn getitem(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
 /// to the inherited builtin subscript instead of re-entering override
 /// dispatch (which would recurse).
 pub(crate) fn getitem_slot(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
-    let obj = unwrap_cell(obj);
-    let index = unwrap_cell(index);
     unsafe {
         if is_list(obj) {
             return getitem_list(obj, index);
@@ -2518,9 +2486,6 @@ pub fn finditem(obj: PyObjectRef, index: PyObjectRef) -> Result<Option<PyObjectR
 // result, so the void-ness lives at the opcode boundary, not in this
 // method's `PyResult` type.
 pub fn setitem(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> PyResult {
-    let obj = unwrap_cell(obj);
-    let index = unwrap_cell(index);
-    let value = unwrap_cell(value);
     unsafe {
         // `pypy/objspace/std/dictproxyobject.py` exposes neither
         // `__setitem__` nor `__delitem__`, so `space.setitem` on a
@@ -2551,9 +2516,6 @@ pub fn setitem(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> PyRe
 /// inherited builtin assignment instead of re-entering override dispatch
 /// (which would recurse).
 pub(crate) fn setitem_slot(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> PyResult {
-    let obj = unwrap_cell(obj);
-    let index = unwrap_cell(index);
-    let value = unwrap_cell(value);
     unsafe {
         if is_list(obj) {
             return setitem_list(obj, index, value);
@@ -3531,9 +3493,9 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
     // cell type's descriptor namespace (e.g. `cell_contents` from
     // `nestedscope.py:Cell.typedef`).  Pyre previously prepended an
     // `unwrap_cell` here to keep `LOAD_FAST` on a cellvar slot
-    // transparent, but the only valid escape of a cell to user-visible
-    // code is through `function.__closure__` indexing — where the cell
-    // is what the user wants.
+    // transparent.  Cellvar loads must instead be dereferenced by the
+    // dedicated deref opcodes; a cell that reaches ordinary object-space
+    // operations is a user-visible object in its own right.
     //
     // pypy/module/_weakref/interp__weakref.py:356-394 — proxy_typedef_dict
     // wraps every space op in `force(space, w_obj)`. PyPy then dispatches
@@ -4393,7 +4355,6 @@ unsafe fn setattr_surrogate(
     name: &Wtf8,
     value: PyObjectRef,
 ) -> PyResult {
-    let value = unwrap_cell(value);
     let obj = crate::module::_weakref::interp__weakref::force(obj)?;
     unsafe {
         if is_instance(obj) {
@@ -4419,7 +4380,6 @@ pub(crate) unsafe fn object_setattr_surrogate(
     name: &Wtf8,
     value: PyObjectRef,
 ) -> PyResult {
-    let value = unwrap_cell(value);
     let obj = crate::module::_weakref::interp__weakref::force(obj)?;
     unsafe {
         // descroperation.py:114-123 — a data descriptor's `__set__` takes
@@ -4583,7 +4543,6 @@ fn attr_error_wtf8(obj: PyObjectRef, name: &Wtf8) -> PyError {
 /// `object.__getattribute__` terminal — the default descriptor protocol
 /// without the user `__getattribute__` override check.
 pub fn object_getattribute(obj: PyObjectRef, name: &str) -> PyResult {
-    let obj = unwrap_cell(obj);
     unsafe {
         if is_instance(obj) {
             let w_type = w_instance_get_type(obj);
@@ -7535,7 +7494,6 @@ pub(crate) fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> 
 }
 
 pub fn setattr_str(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult {
-    let value = unwrap_cell(value);
     let obj = crate::module::_weakref::interp__weakref::force(obj)?;
     // `super` proxies only `__getattribute__` (descriptor.py W_Super); it has
     // no `__setattr__`, so `super().name = value` uses the object default and
@@ -7580,7 +7538,6 @@ pub fn setattr_str(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult
 /// through the descriptor / instance-dict path.  Called by
 /// `object.__setattr__` and as the default path in `setattr`.
 pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult {
-    let value = unwrap_cell(value);
     let obj = crate::module::_weakref::interp__weakref::force(obj)?;
     // Data descriptor __set__ takes priority (PyPy: descroperation.py
     // descr__setattr__ step 1). PyPy walks `space.type(obj)` regardless of
@@ -9570,8 +9527,7 @@ pub fn ismapping_w(w_obj: PyObjectRef) -> bool {
     }
 }
 
-pub fn is_iterable(w_obj: PyObjectRef) -> bool {
-    let obj = unwrap_cell(w_obj);
+pub fn is_iterable(obj: PyObjectRef) -> bool {
     if obj.is_null() {
         return false;
     }
@@ -9602,7 +9558,7 @@ pub fn is_iterable(w_obj: PyObjectRef) -> bool {
         }
         // descroperation.py:320 — `space.lookup(w_obj, '__iter__')`.
         // MRO-only walk; no `__getattr__` / descriptor execution.
-        if lookup(w_obj, "__iter__").is_some() {
+        if lookup(obj, "__iter__").is_some() {
             return true;
         }
         // descroperation.py:322-323 — fallback to `__getitem__` only
@@ -9612,9 +9568,9 @@ pub fn is_iterable(w_obj: PyObjectRef) -> bool {
         // lives on `W_TypeObject` (typeobject.py:169) so user-defined
         // `dict`/`list`/`tuple` subclasses inherit the marker via
         // `inherit_flag_map_or_seq` at heap-type construction.
-        let w_type = crate::typedef::r#type(w_obj).unwrap_or(std::ptr::null_mut());
+        let w_type = crate::typedef::r#type(obj).unwrap_or(std::ptr::null_mut());
         let is_mapping = pyre_object::typeobject::w_type_get_flag_map_or_seq(w_type) == b'M';
-        if !is_mapping && lookup(w_obj, "__getitem__").is_some() {
+        if !is_mapping && lookup(obj, "__getitem__").is_some() {
             return true;
         }
     }
@@ -9687,7 +9643,6 @@ unsafe fn iter_check_is_iterator(w_iterator: PyObjectRef) -> PyResult {
 /// `iter(obj)` — PyPy: space.iter(w_obj)
 /// Calls __iter__ on the object if available.
 pub fn iter(obj: PyObjectRef) -> PyResult {
-    let obj = unwrap_cell(obj);
     if obj.is_null() {
         return Err(PyError::type_error("'NoneType' object is not iterable"));
     }
@@ -10014,7 +9969,6 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
 
 /// `next(iterator)` — PyPy: space.next(w_iter)
 pub fn next(obj: PyObjectRef) -> PyResult {
-    let obj = unwrap_cell(obj);
     unsafe {
         // iterobject.py W_FastListIterObject.descr_next — read the list's
         // current length on every step so appends are observed and removals

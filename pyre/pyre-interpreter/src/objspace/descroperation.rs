@@ -17,7 +17,7 @@ use rustpython_wtf8::Wtf8Buf;
 
 use crate::baseobjspace::{
     getattr, getitem, is_true, issubtype_w, lookup, lookup_in_type, lookup_in_type_where,
-    lookup_where_with_method_cache, p_abstract_issubclass_w, unwrap_cell,
+    lookup_where_with_method_cache, p_abstract_issubclass_w,
 };
 pub use crate::{PyError, PyErrorKind, PyResult};
 
@@ -1917,8 +1917,6 @@ unsafe fn try_numeric_unaryop_override(a: PyObjectRef, dunder: &str) -> Option<P
 }
 
 pub fn add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let a = unwrap_cell(a);
-    let b = unwrap_cell(b);
     unsafe {
         if needs_numeric_binop_dispatch(a, b, "__add__", "__radd__") {
             if let Some(result) = try_dispatch_binary_special(a, b, "__add__", "__radd__")? {
@@ -2013,8 +2011,6 @@ pub fn add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 }
 
 pub fn matmul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let a = unwrap_cell(a);
-    let b = unwrap_cell(b);
     unsafe {
         if let Some(result) = try_dispatch_binary_special(a, b, "__matmul__", "__rmatmul__")? {
             return Ok(result);
@@ -2028,8 +2024,6 @@ pub fn matmul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 }
 
 pub fn sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let a = unwrap_cell(a);
-    let b = unwrap_cell(b);
     unsafe {
         let set_override = needs_set_binop_dispatch(a, b);
         if set_override {
@@ -2083,8 +2077,6 @@ pub fn sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 }
 
 pub fn mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let a = unwrap_cell(a);
-    let b = unwrap_cell(b);
     unsafe {
         if needs_numeric_binop_dispatch(a, b, "__mul__", "__rmul__") {
             if let Some(result) = try_dispatch_binary_special(a, b, "__mul__", "__rmul__")? {
@@ -2176,8 +2168,6 @@ pub fn mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 }
 
 pub fn floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let a = unwrap_cell(a);
-    let b = unwrap_cell(b);
     unsafe {
         if needs_numeric_binop_dispatch(a, b, "__floordiv__", "__rfloordiv__") {
             if let Some(result) =
@@ -2210,8 +2200,6 @@ pub fn floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 }
 
 pub fn mod_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let a = unwrap_cell(a);
-    let b = unwrap_cell(b);
     unsafe {
         if needs_numeric_binop_dispatch(a, b, "__mod__", "__rmod__") {
             if let Some(result) = try_dispatch_binary_special(a, b, "__mod__", "__rmod__")? {
@@ -2276,8 +2264,6 @@ pub fn mod_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 /// `rbigint.truediv` and reissues it as
 /// "integer division result too large for a float".
 pub fn truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let a = unwrap_cell(a);
-    let b = unwrap_cell(b);
     unsafe {
         if needs_numeric_binop_dispatch(a, b, "__truediv__", "__rtruediv__") {
             if let Some(result) = try_dispatch_binary_special(a, b, "__truediv__", "__rtruediv__")?
@@ -2320,8 +2306,6 @@ pub fn truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 /// Power operation dispatch (`**` operator).
 
 pub fn pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let a = unwrap_cell(a);
-    let b = unwrap_cell(b);
     unsafe {
         if needs_numeric_binop_dispatch(a, b, "__pow__", "__rpow__") {
             if let Some(result) = try_dispatch_binary_special(a, b, "__pow__", "__rpow__")? {
@@ -2373,8 +2357,6 @@ pub fn pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 // NotImplemented is reached only defensively.
 
 pub(crate) fn add_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let a = unwrap_cell(a);
-    let b = unwrap_cell(b);
     unsafe {
         if is_int_like(a) && is_int_like(b) {
             return int_add(a, b);
@@ -2393,8 +2375,6 @@ pub(crate) fn add_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 }
 
 pub(crate) fn sub_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let a = unwrap_cell(a);
-    let b = unwrap_cell(b);
     unsafe {
         if is_int_like(a) && is_int_like(b) {
             return int_sub(a, b);
@@ -2413,8 +2393,6 @@ pub(crate) fn sub_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 }
 
 pub(crate) fn mul_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let a = unwrap_cell(a);
-    let b = unwrap_cell(b);
     unsafe {
         if is_int_like(a) && is_int_like(b) {
             return int_mul(a, b);
@@ -2433,8 +2411,6 @@ pub(crate) fn mul_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 }
 
 pub(crate) fn truediv_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let a = unwrap_cell(a);
-    let b = unwrap_cell(b);
     unsafe {
         let a_num = is_int(a) || is_float(a) || is_long(a);
         let b_num = is_int(b) || is_float(b) || is_long(b);
@@ -2459,8 +2435,6 @@ pub(crate) fn truediv_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 }
 
 pub(crate) fn floordiv_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let a = unwrap_cell(a);
-    let b = unwrap_cell(b);
     unsafe {
         if is_int_like(a) && is_int_like(b) {
             return int_floordiv(a, b);
@@ -2476,8 +2450,6 @@ pub(crate) fn floordiv_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 }
 
 pub(crate) fn mod_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let a = unwrap_cell(a);
-    let b = unwrap_cell(b);
     unsafe {
         if is_int_like(a) && is_int_like(b) {
             return int_mod(a, b);
@@ -2493,8 +2465,6 @@ pub(crate) fn mod_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 }
 
 pub(crate) fn pow_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let a = unwrap_cell(a);
-    let b = unwrap_cell(b);
     unsafe {
         if is_int_like(a) && is_int_like(b) {
             return int_pow(a, b);
@@ -2517,8 +2487,6 @@ pub(crate) fn pow_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 }
 
 pub(crate) fn divmod_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let a = unwrap_cell(a);
-    let b = unwrap_cell(b);
     unsafe {
         let lhs_num = is_int(a) || is_long(a) || is_float(a);
         let rhs_num = is_int(b) || is_long(b) || is_float(b);
@@ -2532,8 +2500,6 @@ pub(crate) fn divmod_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 }
 
 pub(crate) fn lshift_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let a = unwrap_cell(a);
-    let b = unwrap_cell(b);
     unsafe {
         if is_int_like(a) && is_int_like(b) {
             return int_lshift(a, b);
@@ -2546,8 +2512,6 @@ pub(crate) fn lshift_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 }
 
 pub(crate) fn rshift_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let a = unwrap_cell(a);
-    let b = unwrap_cell(b);
     unsafe {
         if is_int_like(a) && is_int_like(b) {
             return int_rshift(a, b);
@@ -2560,8 +2524,6 @@ pub(crate) fn rshift_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 }
 
 pub(crate) fn and_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let a = unwrap_cell(a);
-    let b = unwrap_cell(b);
     unsafe {
         // int.__and__ — bool operands are treated as ints; the bool-typed
         // result is produced by bool.__and__ (init_bool_type), not here.
@@ -2576,8 +2538,6 @@ pub(crate) fn and_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 }
 
 pub(crate) fn or_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let a = unwrap_cell(a);
-    let b = unwrap_cell(b);
     unsafe {
         if is_int(a) && is_int(b) {
             return int_bitor(a, b);
@@ -2590,8 +2550,6 @@ pub(crate) fn or_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 }
 
 pub(crate) fn xor_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let a = unwrap_cell(a);
-    let b = unwrap_cell(b);
     unsafe {
         if is_int(a) && is_int(b) {
             return int_bitxor(a, b);
@@ -2873,9 +2831,6 @@ pub(crate) fn ternary_builtin_type_error(
 /// forward `NotImplemented` raises the three-operand type error rather than
 /// falling through to the right operand.
 pub fn pow3(base: PyObjectRef, exp: PyObjectRef, modulus: PyObjectRef) -> PyResult {
-    let base = unwrap_cell(base);
-    let exp = unwrap_cell(exp);
-    let modulus = unwrap_cell(modulus);
     if unsafe { is_none(modulus) } {
         return pow(base, exp);
     }
@@ -2898,8 +2853,6 @@ pub fn pow3(base: PyObjectRef, exp: PyObjectRef, modulus: PyObjectRef) -> PyResu
 /// fast path then forward + reverse special-method dispatch with the
 /// standard NotImplemented fallback.
 pub fn divmod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let a = unwrap_cell(a);
-    let b = unwrap_cell(b);
     unsafe {
         let lhs_num = is_int(a) || is_long(a) || is_float(a);
         let rhs_num = is_int(b) || is_long(b) || is_float(b);
@@ -3028,8 +2981,6 @@ fn float_pow_impl(x: f64, y: f64) -> PyResult {
 /// Left shift dispatch (`<<` operator).
 
 pub fn lshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let a = unwrap_cell(a);
-    let b = unwrap_cell(b);
     unsafe {
         if needs_numeric_binop_dispatch(a, b, "__lshift__", "__rlshift__") {
             if let Some(result) = try_dispatch_binary_special(a, b, "__lshift__", "__rlshift__")? {
@@ -3059,8 +3010,6 @@ pub fn lshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 /// Right shift dispatch (`>>` operator).
 
 pub fn rshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let a = unwrap_cell(a);
-    let b = unwrap_cell(b);
     unsafe {
         if needs_numeric_binop_dispatch(a, b, "__rshift__", "__rrshift__") {
             if let Some(result) = try_dispatch_binary_special(a, b, "__rshift__", "__rrshift__")? {
@@ -3090,8 +3039,6 @@ pub fn rshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 /// Bitwise AND dispatch (`&` operator).
 
 pub fn and_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let a = unwrap_cell(a);
-    let b = unwrap_cell(b);
     unsafe {
         let set_override = needs_set_binop_dispatch(a, b);
         if set_override {
@@ -3161,8 +3108,6 @@ pub(crate) fn unionable(obj: PyObjectRef) -> bool {
 /// Bitwise OR dispatch (`|` operator).
 
 pub fn or_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let a = unwrap_cell(a);
-    let b = unwrap_cell(b);
     // `pypy/objspace/std/dictproxyobject.py:51 descr_or` /
     // `pypy/objspace/std/dictproxyobject.py:60 descr_ror` —
     // mappingproxy `|` dispatches by copying the proxy's wrapped
@@ -3257,8 +3202,6 @@ pub fn or_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 /// Bitwise XOR dispatch (`^` operator).
 
 pub fn xor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let a = unwrap_cell(a);
-    let b = unwrap_cell(b);
     unsafe {
         let set_override = needs_set_binop_dispatch(a, b);
         if set_override {
@@ -3313,8 +3256,6 @@ pub fn xor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 /// Comparison operation dispatch.
 
 pub fn compare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
-    let a = unwrap_cell(a);
-    let b = unwrap_cell(b);
     // A builtin subclass overriding the comparison dunder dispatches the
     // override first (with reflected-subclass priority); exact builtins and
     // non-overriding subclasses fall through to the by-layout comparison slot,
@@ -3334,8 +3275,6 @@ pub fn compare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
 /// builtin comparison instead of re-entering override dispatch (which would
 /// recurse).
 pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
-    let a = unwrap_cell(a);
-    let b = unwrap_cell(b);
     unsafe {
         if is_int_like(a) && is_int_like(b) {
             return match op {
@@ -3663,7 +3602,6 @@ impl CompareOp {
 /// Unary positive (`+a`).
 
 pub fn pos(a: PyObjectRef) -> PyResult {
-    let a = unwrap_cell(a);
     unsafe {
         if let Some(result) = try_numeric_unaryop_override(a, "__pos__") {
             return result;
@@ -3699,7 +3637,6 @@ pub fn pos(a: PyObjectRef) -> PyResult {
 /// Unary negation.
 
 pub fn neg(a: PyObjectRef) -> PyResult {
-    let a = unwrap_cell(a);
     unsafe {
         if let Some(result) = try_numeric_unaryop_override(a, "__neg__") {
             return result;
@@ -3739,7 +3676,6 @@ pub fn neg(a: PyObjectRef) -> PyResult {
 /// Unary bitwise inversion.
 
 pub fn invert(a: PyObjectRef) -> PyResult {
-    let a = unwrap_cell(a);
     unsafe {
         if let Some(result) = try_numeric_unaryop_override(a, "__invert__") {
             return result;

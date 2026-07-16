@@ -2221,11 +2221,7 @@ pub fn funccall_valuestack(
         let natural_arity = fast_natural_arity & 0xff;
         if nargs < natural_arity {
             let raw_defs = unsafe { crate::function_get_defaults(func) };
-            let defs = if raw_defs.is_null() {
-                std::ptr::null_mut()
-            } else {
-                crate::baseobjspace::unwrap_cell(raw_defs)
-            };
+            let defs = raw_defs;
             let defs_len = if defs.is_null() || !unsafe { pyre_object::is_tuple(defs) } {
                 0
             } else {

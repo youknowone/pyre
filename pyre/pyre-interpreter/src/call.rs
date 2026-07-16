@@ -326,7 +326,6 @@ fn fill_user_function_args(
     if nargs > nparams && !has_varargs {
         let fname = unsafe { crate::function_get_qualname(callable) };
         let ndefaults = if !defaults.is_null() {
-            let defaults = crate::baseobjspace::unwrap_cell(defaults);
             if unsafe { pyre_object::is_tuple(defaults) } {
                 unsafe { pyre_object::w_tuple_len(defaults) }
             } else {
@@ -371,7 +370,6 @@ fn fill_user_function_args(
 
     // Fill positional defaults for slots [n_pos_copied..nparams).
     if n_pos_copied < nparams && !defaults.is_null() {
-        let defaults = crate::baseobjspace::unwrap_cell(defaults);
         let ndefaults = if unsafe { pyre_object::is_tuple(defaults) } {
             unsafe { pyre_object::w_tuple_len(defaults) }
         } else {
@@ -746,7 +744,7 @@ pub fn call_kw(
     // Unwrap bound methods: load_method pushes (method, PY_NULL) for
     // bound methods. Extract the underlying function and prepend the
     // receiver so resolve_kwargs sees the correct function signature.
-    let callable_unwrapped = crate::baseobjspace::unwrap_cell(callable);
+    let callable_unwrapped = callable;
     let callable_unwrapped = if unsafe { pyre_object::is_method(callable_unwrapped) } {
         let func = unsafe { pyre_object::w_method_get_func(callable_unwrapped) };
         let receiver = unsafe { pyre_object::w_method_get_self(callable_unwrapped) };
@@ -920,7 +918,6 @@ fn call_callable_with_mode(
     args: &[PyObjectRef],
     mode: CallMode,
 ) -> PyResult {
-    let callable = crate::baseobjspace::unwrap_cell(callable);
     if unsafe { pyre_object::is_method(callable) } {
         let func = unsafe { pyre_object::w_method_get_func(callable) };
         let receiver = unsafe {
@@ -1299,7 +1296,6 @@ pub(crate) fn resolve_kwargs(
         let ndefaults = {
             let defaults = unsafe { crate::function_get_defaults(target_func) };
             if !defaults.is_null() {
-                let defaults = crate::baseobjspace::unwrap_cell(defaults);
                 if unsafe { pyre_object::is_tuple(defaults) } {
                     unsafe { pyre_object::w_tuple_len(defaults) }
                 } else {
@@ -1368,7 +1364,6 @@ pub(crate) fn resolve_kwargs(
     // Defaults cover the LAST N of the positional params (arg_count).
     let defaults = unsafe { crate::function_get_defaults(target_func) };
     if !defaults.is_null() {
-        let defaults = crate::baseobjspace::unwrap_cell(defaults);
         if unsafe { pyre_object::is_tuple(defaults) } {
             let ndefaults = unsafe { pyre_object::w_tuple_len(defaults) };
             let first_default = n_pos_params.saturating_sub(ndefaults);
@@ -1603,8 +1598,6 @@ pub fn call_with_kwargs(
     pos_args: &[PyObjectRef],
     kwargs: &[(Wtf8Buf, PyObjectRef)],
 ) -> PyResult {
-    let callable = crate::baseobjspace::unwrap_cell(callable);
-
     // Unwrap bound methods: prepend receiver to pos_args.
     if unsafe { pyre_object::is_method(callable) } {
         let func = unsafe { pyre_object::w_method_get_func(callable) };
@@ -1840,7 +1833,6 @@ pub fn call_with_kwargs(
                 let ndefaults = {
                     let defaults = unsafe { crate::function_get_defaults(callable) };
                     if !defaults.is_null() {
-                        let defaults = crate::baseobjspace::unwrap_cell(defaults);
                         if unsafe { pyre_object::is_tuple(defaults) } {
                             unsafe { pyre_object::w_tuple_len(defaults) }
                         } else {
@@ -1877,7 +1869,6 @@ pub fn call_with_kwargs(
             // Fill positional defaults from __defaults__ tuple.
             let defaults = unsafe { crate::function_get_defaults(callable) };
             if !defaults.is_null() {
-                let defaults = crate::baseobjspace::unwrap_cell(defaults);
                 if unsafe { pyre_object::is_tuple(defaults) } {
                     let ndefaults = unsafe { pyre_object::w_tuple_len(defaults) };
                     let first_default = n_pos_params.saturating_sub(ndefaults);

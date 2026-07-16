@@ -33,8 +33,6 @@ pub fn binary_value(
     b: PyObjectRef,
     op: BinaryOperator,
 ) -> Result<PyObjectRef, PyError> {
-    let a = crate::baseobjspace::unwrap_cell(a);
-    let b = crate::baseobjspace::unwrap_cell(b);
     // descroperation.py:825 `inplace_impl` — consult the in-place
     // special first; fall through to the binary op below when absent or
     // `NotImplemented`.
@@ -117,8 +115,6 @@ pub fn compare_value(
     b: PyObjectRef,
     op: ComparisonOperator,
 ) -> Result<PyObjectRef, PyError> {
-    let a = crate::baseobjspace::unwrap_cell(a);
-    let b = crate::baseobjspace::unwrap_cell(b);
     let cmp_op = match op {
         ComparisonOperator::Less => CompareOp::Lt,
         ComparisonOperator::LessOrEqual => CompareOp::Le,
@@ -160,17 +156,14 @@ pub fn compare_value_from_tag(
 }
 
 pub fn unary_negative_value(value: PyObjectRef) -> Result<PyObjectRef, PyError> {
-    let value = crate::baseobjspace::unwrap_cell(value);
     neg(value)
 }
 
 pub fn unary_invert_value(value: PyObjectRef) -> Result<PyObjectRef, PyError> {
-    let value = crate::baseobjspace::unwrap_cell(value);
     invert(value)
 }
 
 pub fn unary_positive_value(value: PyObjectRef) -> Result<PyObjectRef, PyError> {
-    let value = crate::baseobjspace::unwrap_cell(value);
     crate::baseobjspace::pos(value)
 }
 
@@ -194,7 +187,6 @@ pub fn list_to_tuple_value(value: PyObjectRef) -> Result<PyObjectRef, PyError> {
     Err(PyError::type_error("expected list for list_to_tuple"))
 }
 pub fn truth_value(value: PyObjectRef) -> Result<bool, PyError> {
-    let value = crate::baseobjspace::unwrap_cell(value);
     is_true(value)
 }
 

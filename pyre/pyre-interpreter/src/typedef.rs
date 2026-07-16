@@ -860,9 +860,18 @@ pub fn init_typeobjects() {
             }
             reg.insert(pytype as usize, iterator_type as usize);
         }
+        let cell_type = new_typeobject_with_base_and_layout(
+            "cell",
+            init_cell_type,
+            object_type,
+            &pyre_object::nestedscope::CELL_TYPE as *const PyType,
+        );
+        // typedef.py:953 `Cell.typedef.acceptable_as_base_class = False`;
+        // CPython 3.14 likewise omits Py_TPFLAGS_BASETYPE.
+        unsafe { pyre_object::w_type_set_acceptable_as_base_class(cell_type, false) };
         reg.insert(
             &pyre_object::nestedscope::CELL_TYPE as *const PyType as usize,
-            new_typeobject_with_base("cell", init_cell_type, object_type) as usize,
+            cell_type as usize,
         );
         reg.insert(
             &pyre_object::interp_itertools::COUNT_TYPE as *const PyType as usize,
@@ -1006,6 +1015,7 @@ pub fn init_typeobjects() {
         patch_object_class_descriptor();
         patch_builtin_function_descriptors();
         patch_frame_traceback_descriptors();
+        patch_cell_descriptor();
         patch_getset_descriptor_metadata();
         patch_typeobject_descriptor_names();
     });
@@ -8574,6 +8584,23 @@ fn patch_builtin_function_descriptors() {
     }
 }
 
+/// typedef.py:947-951 stamps `cls=Cell` on `cell_contents`. The descriptor
+/// is constructed before the cell W_TypeObject exists, so fill its `reqcls`
+/// field in the same post-registration pass used for BuiltinFunction and
+/// frame descriptors.
+fn patch_cell_descriptor() {
+    let cell_type =
+        gettypefor(&pyre_object::nestedscope::CELL_TYPE).unwrap_or(pyre_object::PY_NULL);
+    if cell_type.is_null() || !crate::type_dict_has_storage(cell_type) {
+        return;
+    }
+    if let Some(descr) = crate::type_dict_lookup(cell_type, "cell_contents") {
+        if unsafe { pyre_object::typedef::is_getset_property(descr) } {
+            unsafe { pyre_object::typedef::w_getset_set_reqcls(descr, cell_type) };
+        }
+    }
+}
+
 /// typedef.py:736-770 — `PyFrame.typedef` / `PyTraceback.typedef` build
 /// their getsets as `GetSetProperty(PyFrame.fget_*, cls=PyFrame)` /
 /// `GetSetProperty(PyTraceback.descr_*, cls=PyTraceback)`.  The `cls`
@@ -9104,27 +9131,170 @@ fn init_member_descriptor_type(ns: PyObjectRef) {
     };
 }
 
-/// `nestedscope.py:Cell` typedef.  PyPy `typedef.py:934-952 Cell.typedef`:
-///
-/// ```python
-/// Cell.typedef = TypeDef("cell",
-///     ...
-///     __repr__     = interp2app(Cell.descr__repr__),
-///     ...
-///     cell_contents= GetSetProperty(
-///         Cell.descr__cell_contents,
-///         Cell.descr_set_cell_contents,
-///         Cell.descr_del_cell_contents,
-///         cls=Cell),
-/// )
-/// ```
-///
-/// Only the user-visible read/write/delete of `cell_contents` is ported
-/// here.  `__eq__`/`__ne__`/`__lt__`/`__gt__`/`__le__`/`__ge__` cell-vs-cell
-/// comparisons (`nestedscope.py:9-19 make_cell_cmp`) and `__hash__ = None`
-/// remain unimplemented as a wider parity gap — they are not needed for
-/// the descriptor-on-tuple-of-cells path that motivates this work.
+/// CPython 3.14 `cell_new`, matching PyPy `descr_new_cell` except that the
+/// 3.14 positional-only argument surface rejects keywords.
+fn cell_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    if crate::builtins::has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(
+            "cell() takes no keyword arguments",
+        ));
+    }
+    let cls = positional.first().copied().unwrap_or(PY_NULL);
+    let cell_type = gettypefor(&pyre_object::nestedscope::CELL_TYPE).unwrap_or(PY_NULL);
+    check_user_subclass(cell_type, cls)?;
+    let contents = match positional.get(1..) {
+        Some([]) | None => PY_NULL,
+        Some([contents]) => *contents,
+        Some(rest) => {
+            return Err(crate::PyError::type_error(format!(
+                "cell expected at most 1 argument, got {}",
+                rest.len()
+            )));
+        }
+    };
+    Ok(pyre_object::w_cell_new(contents))
+}
+
+/// `nestedscope.py:9-19 make_cell_cmp` / CPython 3.14
+/// `cell_compare_impl`: compare contents, with an empty cell ordered before
+/// a populated cell. A foreign right operand returns NotImplemented.
+fn cell_descr_compare(
+    args: &[PyObjectRef],
+    op: crate::baseobjspace::CompareOp,
+) -> Result<PyObjectRef, crate::PyError> {
+    let a = args.first().copied().unwrap_or(PY_NULL);
+    let b = args.get(1).copied().unwrap_or(PY_NULL);
+    if a.is_null() || !unsafe { pyre_object::is_cell(a) } {
+        let dunder = match op {
+            crate::baseobjspace::CompareOp::Eq => "__eq__",
+            crate::baseobjspace::CompareOp::Ne => "__ne__",
+            crate::baseobjspace::CompareOp::Lt => "__lt__",
+            crate::baseobjspace::CompareOp::Le => "__le__",
+            crate::baseobjspace::CompareOp::Gt => "__gt__",
+            crate::baseobjspace::CompareOp::Ge => "__ge__",
+        };
+        return Err(crate::PyError::type_error(format!(
+            "descriptor '{}' requires a 'cell' object",
+            dunder
+        )));
+    }
+    if b.is_null() || !unsafe { pyre_object::is_cell(b) } {
+        return Ok(pyre_object::w_not_implemented());
+    }
+    let a_value = unsafe { pyre_object::w_cell_get(a) };
+    let b_value = unsafe { pyre_object::w_cell_get(b) };
+    if !a_value.is_null() && !b_value.is_null() {
+        return crate::baseobjspace::compare(a_value, b_value, op);
+    }
+    // Cell._cmp_one_empty: empty/empty = 0, empty/value = -1,
+    // value/empty = 1; compare that result with zero using the requested op.
+    let ordering = match (a_value.is_null(), b_value.is_null()) {
+        (true, true) => 0,
+        (true, false) => -1,
+        (false, true) => 1,
+        (false, false) => unreachable!(),
+    };
+    Ok(pyre_object::w_bool_from(match op {
+        crate::baseobjspace::CompareOp::Eq => ordering == 0,
+        crate::baseobjspace::CompareOp::Ne => ordering != 0,
+        crate::baseobjspace::CompareOp::Lt => ordering < 0,
+        crate::baseobjspace::CompareOp::Le => ordering <= 0,
+        crate::baseobjspace::CompareOp::Gt => ordering > 0,
+        crate::baseobjspace::CompareOp::Ge => ordering >= 0,
+    }))
+}
+
+fn cell_descr_eq(args: &[PyObjectRef]) -> crate::PyResult {
+    cell_descr_compare(args, crate::baseobjspace::CompareOp::Eq)
+}
+fn cell_descr_ne(args: &[PyObjectRef]) -> crate::PyResult {
+    cell_descr_compare(args, crate::baseobjspace::CompareOp::Ne)
+}
+fn cell_descr_lt(args: &[PyObjectRef]) -> crate::PyResult {
+    cell_descr_compare(args, crate::baseobjspace::CompareOp::Lt)
+}
+fn cell_descr_gt(args: &[PyObjectRef]) -> crate::PyResult {
+    cell_descr_compare(args, crate::baseobjspace::CompareOp::Gt)
+}
+fn cell_descr_le(args: &[PyObjectRef]) -> crate::PyResult {
+    cell_descr_compare(args, crate::baseobjspace::CompareOp::Le)
+}
+fn cell_descr_ge(args: &[PyObjectRef]) -> crate::PyResult {
+    cell_descr_compare(args, crate::baseobjspace::CompareOp::Ge)
+}
+
+/// `nestedscope.py:101-110 Cell.descr__repr__`, with CPython 3.14's
+/// 80-character type-name cap from `Objects/cellobject.c:cell_repr`.
+fn cell_descr_repr(args: &[PyObjectRef]) -> crate::PyResult {
+    let cell = args.first().copied().unwrap_or(PY_NULL);
+    if cell.is_null() || !unsafe { pyre_object::is_cell(cell) } {
+        let received = crate::baseobjspace::object_functionstr_type_name(cell);
+        return Err(crate::PyError::type_error(format!(
+            "descriptor '__repr__' requires a 'cell' object but received a '{received}'"
+        )));
+    }
+    let value = unsafe { pyre_object::w_cell_get(cell) };
+    let text = if value.is_null() {
+        format!("<cell at 0x{:x}: empty>", cell as usize)
+    } else {
+        let type_name = crate::typedef::r#type(value)
+            .map(|tp| unsafe { pyre_object::w_type_get_name(tp) })
+            .unwrap_or_else(|| unsafe { (*(*value).ob_type).name });
+        let type_name: String = type_name.chars().take(80).collect();
+        format!(
+            "<cell at 0x{:x}: {type_name} object at 0x{:x}>",
+            cell as usize, value as usize
+        )
+    };
+    Ok(w_str_new(&text))
+}
+
+/// `nestedscope.py:934-952 Cell.typedef`, in source order. CPython 3.14 is
+/// the version oracle where it differs: its public cell type deliberately
+/// omits PyPy 3.11's `__reduce__` and `__setstate__` pickle hooks.
 fn init_cell_type(ns: PyObjectRef) {
+    let entries = [
+        (
+            "__doc__",
+            w_str_new(
+                "Create a new cell object.\n\n  contents\n    the contents of the cell. If not specified, the cell will be empty,\n    and \n further attempts to access its cell_contents attribute will\n    raise a ValueError.",
+            ),
+        ),
+        ("__new__", make_new_descr(cell_descr_new)),
+        (
+            "__eq__",
+            make_builtin_function_with_arity("__eq__", cell_descr_eq, 2),
+        ),
+        (
+            "__ne__",
+            make_builtin_function_with_arity("__ne__", cell_descr_ne, 2),
+        ),
+        (
+            "__lt__",
+            make_builtin_function_with_arity("__lt__", cell_descr_lt, 2),
+        ),
+        (
+            "__gt__",
+            make_builtin_function_with_arity("__gt__", cell_descr_gt, 2),
+        ),
+        (
+            "__le__",
+            make_builtin_function_with_arity("__le__", cell_descr_le, 2),
+        ),
+        (
+            "__ge__",
+            make_builtin_function_with_arity("__ge__", cell_descr_ge, 2),
+        ),
+        ("__hash__", w_none()),
+        (
+            "__repr__",
+            make_builtin_function_with_arity("__repr__", cell_descr_repr, 1),
+        ),
+    ];
+    for (name, value) in entries {
+        unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, name, value) };
+    }
     // `nestedscope.py:112-116 descr__cell_contents`:
     //
     //     def descr__cell_contents(self, space):
@@ -11548,8 +11718,8 @@ fn bool_bitwise_binop(
     if args.len() < 2 {
         return Err(crate::PyError::type_error("expected 1 argument, got 0"));
     }
-    let a = crate::baseobjspace::unwrap_cell(args[0]);
-    let b = crate::baseobjspace::unwrap_cell(args[1]);
+    let a = args[0];
+    let b = args[1];
     if !unsafe { pyre_object::is_bool(b) } {
         return int_op(a, b);
     }
@@ -11707,7 +11877,7 @@ fn object_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
             "object.__new__(): not enough arguments",
         ));
     }
-    let cls = crate::baseobjspace::unwrap_cell(args[0]);
+    let cls = args[0];
     // cls should be a W_TypeObject — create instance of it
     if unsafe { is_type(cls) } {
         // objectobject.py:131 descr__new__ — abstract classes refuse instantiation.
@@ -18538,5 +18708,65 @@ mod tests {
             assert_eq!(pyre_object::w_type_get_name(w_type), "ellipsis");
             assert!(!pyre_object::w_type_get_acceptable_as_base_class(w_type));
         }
+        check_cell_typedef_python314_surface();
+        check_cell_comparison_repr_and_hash();
+    }
+
+    fn check_cell_typedef_python314_surface() {
+        crate::typedef::init_typeobjects();
+        let w_type = crate::typedef::gettypefor(&pyre_object::nestedscope::CELL_TYPE)
+            .expect("cell should resolve to a W_TypeObject");
+        let expected = [
+            "__doc__",
+            "__eq__",
+            "__ge__",
+            "__gt__",
+            "__hash__",
+            "__le__",
+            "__lt__",
+            "__ne__",
+            "__new__",
+            "__repr__",
+            "cell_contents",
+        ];
+        for name in expected {
+            assert!(crate::type_dict_lookup(w_type, name).is_some(), "{name}");
+        }
+        assert!(crate::type_dict_lookup(w_type, "__reduce__").is_none());
+        assert!(crate::type_dict_lookup(w_type, "__setstate__").is_none());
+        unsafe {
+            assert!(!pyre_object::w_type_get_acceptable_as_base_class(w_type));
+        }
+        let contents = crate::type_dict_lookup(w_type, "cell_contents").unwrap();
+        assert!(std::ptr::eq(
+            unsafe { pyre_object::typedef::w_getset_get_reqcls(contents) },
+            w_type
+        ));
+    }
+
+    fn check_cell_comparison_repr_and_hash() {
+        crate::typedef::init_typeobjects();
+        let empty = pyre_object::w_cell_new(pyre_object::PY_NULL);
+        let one = pyre_object::w_cell_new(pyre_object::w_int_new(1));
+        let one_again = pyre_object::w_cell_new(pyre_object::w_int_new(1));
+        let two = pyre_object::w_cell_new(pyre_object::w_int_new(2));
+
+        assert!(
+            crate::baseobjspace::is_true(super::cell_descr_lt(&[empty, one]).unwrap()).unwrap()
+        );
+        assert!(
+            crate::baseobjspace::is_true(super::cell_descr_eq(&[one, one_again]).unwrap()).unwrap()
+        );
+        assert!(crate::baseobjspace::is_true(super::cell_descr_gt(&[two, one]).unwrap()).unwrap());
+        let foreign = super::cell_descr_eq(&[one, pyre_object::w_int_new(1)]).unwrap();
+        assert!(unsafe { pyre_object::is_not_implemented(foreign) });
+
+        let repr = super::cell_descr_repr(&[one]).unwrap();
+        let repr = unsafe { pyre_object::w_str_get_value(repr) };
+        assert!(repr.starts_with("<cell at 0x"));
+        assert!(repr.contains(": int object at 0x"));
+        let err = crate::builtins::try_hash_value(one).unwrap_err();
+        assert_eq!(err.kind, crate::PyErrorKind::TypeError);
+        assert_eq!(err.message, "unhashable type: 'cell'");
     }
 }

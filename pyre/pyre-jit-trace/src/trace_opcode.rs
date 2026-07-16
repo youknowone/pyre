@@ -39,7 +39,7 @@ extern "C" fn trace_function_get_defaults(func: i64) -> i64 {
 
 extern "C" fn trace_function_get_kwdefaults(func: i64) -> i64 {
     let kwdefaults = unsafe { pyre_interpreter::function_get_kwdefaults(func as PyObjectRef) };
-    pyre_interpreter::baseobjspace::unwrap_cell(kwdefaults) as i64
+    kwdefaults as i64
 }
 
 extern "C" fn trace_dict_lookup_jit(dict: i64, key: i64) -> i64 {
@@ -409,7 +409,6 @@ fn positional_defaults_to_load(
         return None;
     }
 
-    let defaults = pyre_interpreter::baseobjspace::unwrap_cell(defaults);
     let ndefaults = if unsafe { pyre_object::is_tuple(defaults) } {
         unsafe { w_tuple_len(defaults) }
     } else {
@@ -9369,7 +9368,6 @@ impl OpcodeStepExecutor for MIFrame {
                 );
                 this.implement_guard_value(ctx, defaults, defaults_obj as i64);
             });
-            let defaults_obj = pyre_interpreter::baseobjspace::unwrap_cell(defaults_obj);
             if unsafe { pyre_object::is_tuple(defaults_obj) } {
                 let ndefaults = unsafe { w_tuple_len(defaults_obj) };
                 let first_default = n_pos_params.saturating_sub(ndefaults);
@@ -9388,9 +9386,7 @@ impl OpcodeStepExecutor for MIFrame {
         }
 
         // Fill keyword-only defaults.
-        let kwdefaults = pyre_interpreter::baseobjspace::unwrap_cell(unsafe {
-            pyre_interpreter::function_get_kwdefaults(target_func)
-        });
+        let kwdefaults = unsafe { pyre_interpreter::function_get_kwdefaults(target_func) };
         if !kwdefaults.is_null() && unsafe { pyre_object::is_dict(kwdefaults) } {
             let kwdefaults_opref = self.with_ctx(|this, ctx| {
                 let runtime_kwdefaults = ctx.call_ref_typed_with_effect(

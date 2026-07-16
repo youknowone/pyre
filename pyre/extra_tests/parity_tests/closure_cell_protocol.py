@@ -1,4 +1,4 @@
-"""Phase 6 parity test: cell object protocol via __closure__.
+"""Cell TypeDef parity via ``types.CellType`` and ``__closure__``.
 
 PyPy `nestedscope.py:22-125 Cell` + `typedef.py:934-952 Cell.typedef`:
 
@@ -18,13 +18,95 @@ PyPy `nestedscope.py:22-125 Cell` + `typedef.py:934-952 Cell.typedef`:
 `ValueError` for a re-delete (`:121-125`).
 
 Pinned contract:
-  1. `f.__closure__[i]` returns a `cell` (not the unwrapped value),
-  2. `cell.cell_contents` reads the captured value,
-  3. assignment to `cell.cell_contents` writes through the cell so
+  1. the Python 3.14 CellType surface is complete,
+  2. construction, comparison, repr and hash semantics match 3.14,
+  3. `f.__closure__[i]` returns a `cell` (not the unwrapped value),
+  4. `cell.cell_contents` reads the captured value,
+  5. assignment to `cell.cell_contents` writes through the cell so
      the inner function observes the new value,
-  4. `del cell.cell_contents` clears the cell; subsequent reads raise
+  6. `del cell.cell_contents` clears the cell; subsequent reads raise
      `ValueError`.
 """
+
+import types
+
+
+CellType = types.CellType
+assert set(CellType.__dict__) == {
+    "__doc__",
+    "__eq__",
+    "__ge__",
+    "__gt__",
+    "__hash__",
+    "__le__",
+    "__lt__",
+    "__ne__",
+    "__new__",
+    "__repr__",
+    "cell_contents",
+}
+assert CellType.__hash__ is None
+
+empty = CellType()
+one = CellType(1)
+one_again = CellType(1)
+two = CellType(2)
+assert repr(empty).startswith("<cell at 0x") and repr(empty).endswith(": empty>")
+assert repr(one).startswith("<cell at 0x") and ": int object at 0x" in repr(one)
+assert empty < one < two
+assert empty <= CellType()
+assert one == one_again and one != two
+assert two > one and two >= one
+assert CellType.__eq__(one, 1) is NotImplemented
+assert CellType.__lt__(one, 1) is NotImplemented
+
+try:
+    hash(one)
+except TypeError:
+    pass
+else:
+    assert False, "cell must be unhashable"
+
+try:
+    CellType(contents=1)
+except TypeError:
+    pass
+else:
+    assert False, "cell constructor arguments are positional-only"
+
+try:
+    CellType(1, 2)
+except TypeError:
+    pass
+else:
+    assert False, "cell accepts at most one content argument"
+
+try:
+    type("CellSubclass", (CellType,), {})
+except TypeError:
+    pass
+else:
+    assert False, "cell is not an acceptable base type"
+
+# A cell is an ordinary visible Python object. Storing one in another cell
+# must not transparently unwrap the inner cell at an object-space boundary.
+nested = CellType(one)
+assert nested.cell_contents is one
+assert nested != one
+assert bool(empty) and bool(one)
+assert not isinstance(one, int)
+box = [None]
+box[0] = one
+assert box[0] is one
+mapping = {"cell": one}
+assert mapping["cell"] is one
+try:
+    one + 1
+except TypeError:
+    pass
+else:
+    assert False, "cell arithmetic must not operate on its contents"
+
 
 def _make(x):
     def _inner():
