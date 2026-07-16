@@ -7724,6 +7724,95 @@ mod tests {
     }
 
     #[test]
+    fn source_driver_calls_lower_to_jitcode_markers_not_residual_calls() {
+        use crate::codewriter::call::CallControl;
+        use crate::codewriter::type_state::ConcreteType;
+        use crate::parse::CallPath;
+
+        let mut cc = CallControl::new();
+        cc.setup_jitdriver(
+            CallPath::from_segments(["pyre_jit", "other_portal"]),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let portal_graph = CallPath::from_segments(["pyre_jit", "eval_loop_jit"]);
+        cc.setup_jitdriver(
+            portal_graph.clone(),
+            vec![
+                "next_instr".into(),
+                "is_being_profiled".into(),
+                "pycode".into(),
+            ],
+            vec!["frame".into(), "ec".into()],
+            Vec::new(),
+            Vec::new(),
+        );
+        let resolved_driver = cc
+            .jitdriver_sd_from_portal_graph(&portal_graph)
+            .expect("portal graph must resolve its own driver")
+            .index;
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .with_portal_jd(Some(resolved_driver));
+        let mut graph = crate::model::FunctionGraph::new("eval_loop_jit_source_markers");
+        let receiver = graph.alloc_value_var();
+        let next_instr = graph.alloc_value_var();
+        let profiled = graph.alloc_value_var();
+        let pycode = graph.alloc_value_var();
+        let frame = graph.alloc_value_var();
+        let ec = graph.alloc_value_var();
+        FunctionGraph::set_concretetype_of_inline(&next_instr, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&profiled, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&pycode, ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&frame, ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&ec, ConcreteType::GcRef);
+        let merge_target = CallTarget::method("jit_merge_point", Some("PyPyJitDriver".into()));
+        let merge_key = jit_marker_key_from_target(&merge_target)
+            .expect("source jit_merge_point method must be recognized");
+        let merge_ops = transformer
+            .try_handle_jit_marker(
+                merge_key,
+                &[receiver, next_instr, profiled, pycode, frame, ec],
+                &graph,
+            )
+            .expect("recognized portal marker must lower");
+        assert!(
+            merge_ops
+                .iter()
+                .any(|op| matches!(op.kind, OpKind::JitMergePoint { .. }))
+        );
+        assert!(
+            !merge_ops
+                .iter()
+                .any(|op| matches!(op.kind, OpKind::Call { .. })),
+            "jit_merge_point must not remain a residual call"
+        );
+
+        let enter_target = CallTarget::method("can_enter_jit", Some("PyPyJitDriver".into()));
+        let enter_key = jit_marker_key_from_target(&enter_target)
+            .expect("source can_enter_jit method must be recognized");
+        let enter_ops = transformer
+            .try_handle_jit_marker(enter_key, &[], &graph)
+            .expect("recognized can_enter_jit marker must lower");
+        assert!(matches!(
+            enter_ops.as_slice(),
+            [SpaceOperation {
+                kind: OpKind::LoopHeader { jitdriver_index },
+                ..
+            }] if *jitdriver_index == resolved_driver
+        ));
+        assert!(
+            !enter_ops
+                .iter()
+                .any(|op| matches!(op.kind, OpKind::Call { .. })),
+            "can_enter_jit must not remain a residual call"
+        );
+    }
+
+    #[test]
     fn try_handle_jit_marker_can_enter_jit_aliases_to_loop_header() {
         let config = GraphTransformConfig::default();
         let mut transformer = Transformer::new(&config).with_portal_jd(Some(2));

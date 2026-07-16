@@ -416,6 +416,7 @@ pub fn trace_bytecode(
     mut concrete_frame: pyre_interpreter::pyframe::FrameBox,
     live_frame_addr: usize,
     allow_propagate_out: bool,
+    marker_entry: bool,
 ) -> (TraceAction, pyre_interpreter::pyframe::FrameBox) {
     // `llmodel.py:557` parity — install pyre's `Cpu` impl so the
     // optimizer's `protect_speculative_string` / `bh_strlen` /
@@ -570,7 +571,15 @@ pub fn trace_bytecode(
         && std::env::var_os("PYRE_FULL_BODY_WALK").as_deref() != Some(std::ffi::OsStr::new("0"))
         && !fbw_declined(crate::driver::make_green_key(w_code, start_pc))
     {
-        let action = full_body_walk_trace(ctx, sym, w_code, start_pc, cf_addr, WalkJournals::Reset);
+        let action = full_body_walk_trace(
+            ctx,
+            sym,
+            w_code,
+            start_pc,
+            cf_addr,
+            WalkJournals::Reset,
+            marker_entry,
+        );
         finish_trace_namespace_dependency(meta);
         return (action, concrete_frame);
     }
@@ -1006,6 +1015,7 @@ fn drive_bridge_carrier_walk(
                     root_py_pc,
                     cf_addr,
                     WalkJournals::Keep,
+                    false,
                 );
             }
             crate::jitcode_dispatch::census_record("P2Drain::ResultSlotUnresolved");
@@ -1456,6 +1466,7 @@ fn run_perfn_walk(
     start_pc: usize,
     cf_addr: usize,
     authoritative: bool,
+    marker_entry: bool,
 ) -> Option<(usize, usize, PerfnWalkResult)> {
     let session = std::cell::RefCell::new(crate::jitcode_dispatch::WalkSession::default());
     let Some(pjc) = crate::state::pyjitcode_for_code(w_code) else {
@@ -1608,56 +1619,80 @@ fn run_perfn_walk(
         // standard virtualizable. The #124 operand-stack override below must
         // not overwrite these (a kept temp never lives in a red-input color).
         let mut reserved_red_colors: Vec<u8> = Vec::new();
-        match loop_header_merge_point_regs(pjc.jitcode.code.as_slice(), entry, is_bridge_trace) {
-            Some((gr, rr)) => {
-                if let Some(&r) = gr.first() {
-                    seed(r, pycode_box);
+        if marker_entry && !is_bridge_trace {
+            // C1 marker entry starts at the static sidecar coordinate BEFORE
+            // the source marker.  Seed only the root JitCode's formal red
+            // inputs at their per-JitCode metadata colors; the pre-marker
+            // instructions and BC_JIT_MERGE_POINT payload establish pycode and
+            // the live green/red marker colors themselves.  In particular,
+            // do not reconstruct the first marker at/after entry here.
+            let frame_color = if portal_frame_reg != u16::MAX {
+                portal_frame_reg as u8
+            } else {
+                1
+            };
+            let ec_color = if portal_ec_reg != u16::MAX {
+                portal_ec_reg as u8
+            } else {
+                2
+            };
+            seed(frame_color, frame_box);
+            seed(ec_color, ec_box);
+            reserved_red_colors.push(frame_color);
+            reserved_red_colors.push(ec_color);
+        } else {
+            match loop_header_merge_point_regs(pjc.jitcode.code.as_slice(), entry, is_bridge_trace)
+            {
+                Some((gr, rr)) => {
+                    if let Some(&r) = gr.first() {
+                        seed(r, pycode_box);
+                    }
+                    if let Some(&r) = rr.first() {
+                        seed(r, frame_box);
+                        reserved_red_colors.push(r);
+                    }
+                    if let Some(&r) = rr.get(1) {
+                        seed(r, ec_box);
+                        reserved_red_colors.push(r);
+                    }
                 }
-                if let Some(&r) = rr.first() {
-                    seed(r, frame_box);
-                    reserved_red_colors.push(r);
+                // Straight-line entry, no governing loop header (e.g. a
+                // non-looping function like `fib` or a leaf method): seed the
+                // portal red args `[frame, ec]` at the AUTHORITATIVE
+                // post-regalloc colors the codewriter recorded
+                // (`metadata.portal_frame_reg` / `portal_ec_reg`), the same
+                // colors the loop-header `jit_merge_point` `rr` list carries.
+                // The earlier positional `[pycode=r0, frame=r1, ec=r2]`
+                // convention only coincided with regalloc for an nlocals==1
+                // function (fib: frame=r1); a 2-local leaf method (`value()`)
+                // places frame at r2 / ec at r3, so the positional seed put
+                // `ec_box` in the frame color and every `getfield/getarrayitem
+                // _vable` of a local took the nonstandard-virtualizable leg
+                // (internal promote `GuardValue` + force store-back, no resume
+                // snapshot → `NonStandardVableFinishPortalUnsupported` abort).
+                // pycode (the jitdriver's green ref) is read from the frame's
+                // `pycode` field via `getfield_vable`, so it needs no register
+                // seed once `frame` resolves to the standard virtualizable; the
+                // r0 seed is retained as a defensive best-effort (overwritten by
+                // the entry prologue's first dst in practice).
+                //
+                None => {
+                    seed(0, pycode_box);
+                    let frame_color = if portal_frame_reg != u16::MAX {
+                        portal_frame_reg as u8
+                    } else {
+                        1
+                    };
+                    let ec_color = if portal_ec_reg != u16::MAX {
+                        portal_ec_reg as u8
+                    } else {
+                        2
+                    };
+                    seed(frame_color, frame_box);
+                    seed(ec_color, ec_box);
+                    reserved_red_colors.push(frame_color);
+                    reserved_red_colors.push(ec_color);
                 }
-                if let Some(&r) = rr.get(1) {
-                    seed(r, ec_box);
-                    reserved_red_colors.push(r);
-                }
-            }
-            // Straight-line entry, no governing loop header (e.g. a
-            // non-looping function like `fib` or a leaf method): seed the
-            // portal red args `[frame, ec]` at the AUTHORITATIVE
-            // post-regalloc colors the codewriter recorded
-            // (`metadata.portal_frame_reg` / `portal_ec_reg`), the same
-            // colors the loop-header `jit_merge_point` `rr` list carries.
-            // The earlier positional `[pycode=r0, frame=r1, ec=r2]`
-            // convention only coincided with regalloc for an nlocals==1
-            // function (fib: frame=r1); a 2-local leaf method (`value()`)
-            // places frame at r2 / ec at r3, so the positional seed put
-            // `ec_box` in the frame color and every `getfield/getarrayitem
-            // _vable` of a local took the nonstandard-virtualizable leg
-            // (internal promote `GuardValue` + force store-back, no resume
-            // snapshot → `NonStandardVableFinishPortalUnsupported` abort).
-            // pycode (the jitdriver's green ref) is read from the frame's
-            // `pycode` field via `getfield_vable`, so it needs no register
-            // seed once `frame` resolves to the standard virtualizable; the
-            // r0 seed is retained as a defensive best-effort (overwritten by
-            // the entry prologue's first dst in practice).
-            //
-            None => {
-                seed(0, pycode_box);
-                let frame_color = if portal_frame_reg != u16::MAX {
-                    portal_frame_reg as u8
-                } else {
-                    1
-                };
-                let ec_color = if portal_ec_reg != u16::MAX {
-                    portal_ec_reg as u8
-                } else {
-                    2
-                };
-                seed(frame_color, frame_box);
-                seed(ec_color, ec_box);
-                reserved_red_colors.push(frame_color);
-                reserved_red_colors.push(ec_color);
             }
         }
         // Loop-trace entry seeds no operand-stack colors.  The codewriter's
@@ -2385,7 +2420,7 @@ fn probe_walk_perfn_jitcode(
     // every op the diagnostic recorded (the walk discards its trace).
     let pre_pos = ctx.get_trace_position();
     let Some((entry, code_len, walk_result)) =
-        run_perfn_walk(ctx, sym, w_code, start_pc, cf_addr, authoritative)
+        run_perfn_walk(ctx, sym, w_code, start_pc, cf_addr, authoritative, false)
     else {
         return;
     };
@@ -2735,6 +2770,7 @@ fn full_body_walk_trace(
     start_pc: usize,
     cf_addr: usize,
     journals: WalkJournals,
+    marker_entry: bool,
 ) -> TraceAction {
     // #125: decline up front when a loop body carries an `abort_permanent`
     // marker.  The authoritative walk would otherwise mis-seed the loop
@@ -2804,7 +2840,7 @@ fn full_body_walk_trace(
             .collect();
         ctx.add_merge_point(start_key, input_args, start_pc);
     }
-    let walk_result = run_perfn_walk(ctx, sym, w_code, start_pc, cf_addr, true);
+    let walk_result = run_perfn_walk(ctx, sym, w_code, start_pc, cf_addr, true, marker_entry);
     // A guard snapshot emitted during the walk may have hit a resume
     // coordinate the jitcode pc_map cannot encode (#124/#130) and requested
     // an abort (`state::request_trace_abort`).  The walker does not poll the
