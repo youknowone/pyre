@@ -116,6 +116,16 @@ impl<'c> Lowerer<'c> {
                         .as_ref()
                         .is_some_and(|(_, e)| self.expr_references_unknown_local(e))
             }
+            Expr::ForLoop(f) => {
+                self.expr_references_unknown_local(&f.expr)
+                    || f.body.stmts.iter().any(|s| {
+                        if let Stmt::Expr(e, _) = s {
+                            self.expr_references_unknown_local(e)
+                        } else {
+                            false
+                        }
+                    })
+            }
             // Literals, returns without expression, etc. are safe.
             _ => false,
         }
@@ -187,6 +197,10 @@ impl<'c> Lowerer<'c> {
                         .iter()
                         .any(|arm| self.expr_modifies_jit_state(&arm.body))
             }
+            Expr::ForLoop(f) => {
+                self.expr_modifies_jit_state(&f.expr)
+                    || f.body.stmts.iter().any(|s| self.stmt_modifies_jit_state(s))
+            }
             Expr::Field(_)
             | Expr::Index(_)
             | Expr::Path(_)
@@ -194,7 +208,6 @@ impl<'c> Lowerer<'c> {
             | Expr::Try(_)
             | Expr::Loop(_)
             | Expr::While(_)
-            | Expr::ForLoop(_)
             | Expr::Break(_)
             | Expr::Continue(_)
             | Expr::Return(_)
@@ -269,6 +282,13 @@ impl<'c> Lowerer<'c> {
                     || m.arms
                         .iter()
                         .any(|arm| self.expr_has_jit_state_reference(&arm.body))
+            }
+            Expr::ForLoop(f) => {
+                self.expr_has_jit_state_reference(&f.expr)
+                    || f.body
+                        .stmts
+                        .iter()
+                        .any(|stmt| self.stmt_touches_jit_state(stmt))
             }
             _ => false,
         }

@@ -1,5 +1,16 @@
 use super::*;
 
+fn literal_nonnegative_i64(expr: &Expr) -> Option<i64> {
+    let Expr::Lit(ExprLit {
+        lit: Lit::Int(lit), ..
+    }) = expr
+    else {
+        return None;
+    };
+    let value = lit.base10_parse::<i64>().ok()?;
+    (value >= 0).then_some(value)
+}
+
 impl<'c> Lowerer<'c> {
     pub(super) fn lower_if_stmt(&mut self, expr_if: &ExprIf) -> Option<()> {
         let cond = self.lower_value_expr(&expr_if.cond)?;
@@ -244,13 +255,86 @@ impl<'c> Lowerer<'c> {
         Some(())
     }
 
-    /// Lower `for _ in _ { body }`.
+    /// Lower a small literal-range `for` loop by proc-macro-time unrolling.
     ///
-    /// For-loops involve Rust's iterator protocol which cannot be
-    /// statically decomposed at proc-macro time. Return `None` so the
-    /// arm falls back to opaque (not traced through by the JIT).
-    pub(super) fn lower_for_loop(&mut self, _expr_for: &syn::ExprForLoop) -> Option<()> {
-        None
+    /// Only `for ident in START..END { ... }`, `for ident in START..=END { ... }`,
+    /// and wildcard variants are accepted.  Other iterator protocol shapes
+    /// still return `None` so the containing arm falls back unchanged.
+    pub(super) fn lower_for_loop(&mut self, expr_for: &syn::ExprForLoop) -> Option<()> {
+        let loop_var = match &*expr_for.pat {
+            Pat::Ident(pat_ident) if pat_ident.subpat.is_none() => Some(pat_ident.ident.clone()),
+            Pat::Wild(_) => None,
+            _ => return None,
+        };
+
+        let Expr::Range(range) = &*expr_for.expr else {
+            return None;
+        };
+        let start = literal_nonnegative_i64(range.start.as_deref()?)?;
+        let end = literal_nonnegative_i64(range.end.as_deref()?)?;
+        let values = match range.limits {
+            syn::RangeLimits::HalfOpen(_) => {
+                if start >= end {
+                    Vec::new()
+                } else {
+                    (start..end).collect::<Vec<_>>()
+                }
+            }
+            syn::RangeLimits::Closed(_) => {
+                if start > end {
+                    Vec::new()
+                } else {
+                    (start..=end).collect::<Vec<_>>()
+                }
+            }
+        };
+        if values.len() > 64 || block_has_loop_control(&expr_for.body) {
+            return None;
+        }
+        if values.is_empty() {
+            return Some(());
+        }
+
+        let snap_stmts = self.statements.len();
+        let snap_meta = self.op_metadata.len();
+        let snap_reg = self.next_reg;
+        let snap_bindings = self.bindings.clone();
+
+        for value in values {
+            if let Some(loop_var) = &loop_var {
+                let loop_let: Stmt = syn::parse_quote! {
+                    let #loop_var = #value;
+                };
+                if self.lower_stmt(&loop_let).is_none() {
+                    self.statements.truncate(snap_stmts);
+                    self.op_metadata.truncate(snap_meta);
+                    self.next_reg = snap_reg;
+                    self.bindings = snap_bindings;
+                    return None;
+                }
+            }
+            for stmt in &expr_for.body.stmts {
+                if self.lower_stmt(stmt).is_none() {
+                    self.statements.truncate(snap_stmts);
+                    self.op_metadata.truncate(snap_meta);
+                    self.next_reg = snap_reg;
+                    self.bindings = snap_bindings;
+                    return None;
+                }
+            }
+        }
+
+        self.bindings
+            .retain(|name, _| snap_bindings.contains_key(name));
+        if let Some(loop_var) = &loop_var {
+            let name = loop_var.to_string();
+            if let Some(old_binding) = snap_bindings.get(&name) {
+                self.bindings.insert(name, old_binding.clone());
+            } else {
+                self.bindings.remove(&name);
+            }
+        }
+        Some(())
     }
 
     /// Lower a loop body block, translating `break` → jump to `break_label`

@@ -10,7 +10,7 @@ use majit_metainterp::jitcode::insns::{
     BC_ABORT, BC_GETARRAYITEM_GC_I, BC_GOTO_IF_NOT_INT_EQ, BC_INLINE_CALL, BC_INT_ADD,
     BC_INT_RETURN, BC_JIT_MERGE_POINT, BC_JIT_MERGE_POINT_C, BC_LIVE, BC_STORE_STATE_FIELD,
 };
-use majit_metainterp::{Assembler, BC_GOTO, JitCode, JitDriver};
+use majit_metainterp::{Assembler, JitCode, JitDriver, BC_GOTO};
 
 struct DispatchTestState {
     a: i64,
@@ -140,10 +140,92 @@ fn dispatch_arm_subjitcode_lowers_state_field_write() {
     );
 }
 
+mod literal_for_unroll {
+    use super::Bytecode;
+    use majit_metainterp::jitcode::insns::BC_STORE_STATE_FIELD;
+    use majit_metainterp::{Assembler, JitDriver};
+
+    const OP_UNROLL: u8 = 3;
+
+    struct LiteralForState {
+        acc: i64,
+    }
+
+    #[majit_macros::jit_interp(
+        state = LiteralForState,
+        env = Bytecode,
+        state_fields = { acc: int },
+    )]
+    #[allow(unused_assignments, unused_variables)]
+    fn dispatch_literal_for_unroll(program: &Bytecode, threshold: u32) -> i64 {
+        let mut driver: JitDriver<LiteralForState> = JitDriver::new(threshold);
+        let mut pc: usize = 0;
+        let mut state = LiteralForState { acc: 0 };
+        {
+            use majit_metainterp::JitState as _;
+            state
+                .build_meta(0, program)
+                .install_canonical_liveness(&mut driver);
+        }
+        while pc < program.len() {
+            jit_merge_point!();
+            let opcode = program[pc];
+            pc += 1;
+            match opcode {
+                OP_UNROLL => {
+                    for k in 0..4 {
+                        state.acc += k;
+                    }
+                }
+                _ => break,
+            }
+        }
+        state.acc
+    }
+
+    fn build_literal_for_unroll() -> majit_metainterp::JitCode {
+        let mut asm = Assembler::new();
+        asm.set_canonical_liveness_triple(vec![0], vec![], vec![]);
+        __prebuild_jitcode_liveness_dispatch_literal_for_unroll(&mut asm);
+        let _ = asm.ensure_canonical_liveness_offset();
+        __dispatch_jitcode_dispatch_literal_for_unroll(&mut asm, 0i64)
+            .expect("literal-range for-loop dispatch lower must succeed")
+    }
+
+    #[test]
+    fn dispatch_arm_unrolls_literal_range_for_loop() {
+        let dispatch_jc = build_literal_for_unroll();
+        let sub_jitcodes = dispatch_jc
+            .exec
+            .descrs
+            .iter()
+            .filter_map(|descr| descr.as_jitcode())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            sub_jitcodes.len(),
+            1,
+            "fixture must register exactly one non-default arm sub-JitCode"
+        );
+
+        let body = sub_jitcodes[0];
+        let store_count = body
+            .code
+            .iter()
+            .filter(|&&b| b == BC_STORE_STATE_FIELD)
+            .count();
+        assert_eq!(
+            store_count, 4,
+            "for k in 0..4 body must be unrolled to four straight-line state writes; bytes: {:?}",
+            body.code
+        );
+    }
+}
+
 mod or_pattern {
     use super::{Bytecode, OP_INC_A, OP_NOP};
     use majit_metainterp::jitcode::insns::BC_INLINE_CALL;
-    use majit_metainterp::{Assembler, BC_GOTO, JitDriver};
+    use majit_metainterp::{Assembler, JitDriver, BC_GOTO};
 
     struct OrDispatchState {
         a: i64,
@@ -974,8 +1056,8 @@ mod oparg_minimal {
     ///      arm boundaries.
     #[test]
     fn dispatch_oparg_minimal_pins_loop_header_jdindex() {
-        use majit_metainterp::BC_GOTO;
         use majit_metainterp::jitcode::insns::BC_LOOP_HEADER;
+        use majit_metainterp::BC_GOTO;
 
         let dispatch_jc = build_oparg_minimal();
         let dispatch_code = &dispatch_jc.code;
