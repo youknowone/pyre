@@ -347,6 +347,46 @@ def _jit_panic_reason(stderr):
 
 # ── Helpers ──────────────────────────────────────────────────────────
 
+def _jit_stats_snapshot(stderr):
+    """Return the last jit-stats line as normalized key/value text."""
+    stats_line = None
+    for line in stderr.splitlines():
+        if line.startswith("[jit-stats]"):
+            stats_line = line
+    if stats_line is None:
+        return None
+
+    fields = {}
+    for token in stats_line[len("[jit-stats]") :].split():
+        if "=" in token:
+            key, value = token.split("=", 1)
+            fields[key] = value
+    # This watches what the JIT compiles, never how well. A regression that
+    # changes no structure (for example, an extra spill) is invisible here.
+    return "".join(f"{key}={fields[key]}\n" for key in sorted(fields))
+
+
+def _jit_stats_diff(saved, current, limit=6):
+    """Describe normalized jit-stats changes, capped for terminal output."""
+    def parse(snapshot):
+        if snapshot is None:
+            return {}
+        return dict(line.split("=", 1) for line in snapshot.splitlines())
+
+    old_fields = parse(saved)
+    new_fields = parse(current)
+    changes = [
+        f"{key} {old_fields.get(key, '<missing>')} -> "
+        f"{new_fields.get(key, '<missing>')}"
+        for key in sorted(old_fields.keys() | new_fields.keys())
+        if old_fields.get(key) != new_fields.get(key)
+    ]
+    shown = changes[:limit]
+    if len(changes) > limit:
+        shown.append(f"... {len(changes) - limit} more")
+    return ", ".join(shown)
+
+
 def scaled_timeout(base, scale):
     v = base * scale
     return int(v) if v == int(v) else float(f"{v:.3f}".rstrip("0").rstrip("."))
@@ -498,6 +538,8 @@ class Check:
         self.pyre = {}
         self.snapshot_diffs = []
         self.snapshot_missing = []
+        self.jitstats_diffs = []
+        self.jitstats_missing = []
 
     # ── backend helpers ──
 
@@ -568,15 +610,28 @@ class Check:
     def _snapshot_path(self, backend, name, suffix):
         return Path(SNAP_DIR) / backend / f"{name}.{suffix}"
 
-    def _apply_snapshot_gate(self, backend, name, output, elapsed):
+    def _jitstats_baseline_path(self, backend, script):
+        # The committed structural-stats baseline sits beside its benchmark
+        # source (pyre/bench/<name>.<backend>.jitstats), not in the gitignored
+        # check.snap scratch tree that holds the local .out/.time snapshots.
+        source = Path(script)
+        return source.with_name(f"{source.stem}.{backend}.jitstats")
+
+    def _apply_snapshot_gate(self, backend, name, script, output, stderr, elapsed):
         status, reason = "ok", ""
         out_path = self._snapshot_path(backend, name, "out")
         time_path = self._snapshot_path(backend, name, "time")
+        jitstats_path = self._jitstats_baseline_path(backend, script)
+        jitstats = _jit_stats_snapshot(stderr)
 
         if self.args.snapshot_mode == "record":
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text(output, encoding="utf-8")
             time_path.write_text(f"{elapsed:.2f}", encoding="utf-8")
+            if jitstats is None:
+                jitstats_path.unlink(missing_ok=True)
+            else:
+                jitstats_path.write_text(jitstats, encoding="utf-8")
 
         if self.args.snapshot_mode == "diff":
             if not out_path.exists():
@@ -586,6 +641,15 @@ class Check:
                 if output != saved_out:
                     self.snapshot_diffs.append(f"{backend}/{name}")
                     return "fail", "snapshot output diff"
+
+            if not jitstats_path.exists():
+                self.jitstats_missing.append(f"{backend}/{name}")
+            else:
+                saved_jitstats = jitstats_path.read_text(encoding="utf-8")
+                if jitstats != saved_jitstats:
+                    self.jitstats_diffs.append(f"{backend}/{name}")
+                    delta = _jit_stats_diff(saved_jitstats, jitstats)
+                    return "fail", f"jit-stats diff: {delta}"
 
         if (
             self.args.threshold is not None
@@ -962,7 +1026,7 @@ class Check:
                 ratio = f"{elapsed / checked_baseline:.1f}x" if checked_baseline > 0 else "-"
 
         snap_status, snap_reason = self._apply_snapshot_gate(
-            backend, name, output, elapsed,
+            backend, name, script, output, stderr, elapsed,
         )
         if snap_status == "fail":
             self._record(backend, False, name, snap_reason)
@@ -1260,6 +1324,18 @@ class Check:
                     )
                 if not self.snapshot_diffs and not self.snapshot_missing:
                     print(dim("snapshot diff: clean"))
+                if self.jitstats_diffs:
+                    print(
+                        f"{red('jit-stats diff')}: {len(self.jitstats_diffs)} bench(es)"
+                        f" — {' '.join(self.jitstats_diffs)}"
+                    )
+                if self.jitstats_missing:
+                    print(
+                        f"{dim('jit-stats missing')}: {len(self.jitstats_missing)} bench(es)"
+                        f" — {' '.join(self.jitstats_missing)}"
+                    )
+                if not self.jitstats_diffs and not self.jitstats_missing:
+                    print(dim("jit-stats diff: clean"))
             if self.args.threshold is not None:
                 print(dim(f"threshold: ±{self.args.threshold}% vs baseline"))
             print()
