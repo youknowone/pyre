@@ -387,6 +387,37 @@ assert result == 3430, result
     );
 }
 
+#[test]
+fn polymorphic_dispatch_loop_int_accumulator() {
+    // Polymorphic method dispatch on a list-subscript-selected receiver with
+    // an int accumulator — the tagged-int flip crash shape (loop-carried int
+    // local carried through a polymorphic bridge). SIGSEGV aborts the test
+    // binary today; asserts the correct accumulator once the carry is raw.
+    const PROGRAM: &str = "\
+class Base:
+    def value(self): return 1
+class Left(Base):
+    def value(self): return 3
+class Right(Base):
+    def value(self): return 5
+def main():
+    objs = [Base(), Left(), Right()]
+    i = 0
+    acc = 0
+    while i < 500000:
+        acc = acc + objs[i % 3].value()
+        i = i + 1
+    assert acc == 1499998, acc
+main()
+";
+    run_on_worker(
+        PROGRAM,
+        "polymorphic_dispatch_loop_int_accumulator",
+        "polymorphic_dispatch_loop_int_accumulator",
+        "polymorphic dispatch int accumulator must equal 1499998",
+    );
+}
+
 /// A heap type's namespace is GC-rooted: a user class's method (a function), its
 /// class attribute (a movable list), and the per-type `__dict__` getset
 /// descriptor (whose `fget` is a collectable function) all survive repeated
