@@ -2807,6 +2807,12 @@ pub fn trace_and_compile_from_bridge(
     // Disarm so the flag cannot leak into a later (non-bridge) walk on this
     // thread; the epilogue has already consumed it.
     pyre_jit_trace::jitcode_dispatch::fbw_bridge_noreplay_arm(false);
+    if pyre_jit_trace::trace::take_fbw_bridge_declined() {
+        let (driver, _) = crate::eval::driver_pair();
+        driver
+            .meta_interp_mut()
+            .record_declined_bridge_guard(descr_arc);
+    }
 
     // #177 bridge `Terminate` no-replay: consume any finish-concrete the walk
     // kept.  A stash survives the epilogue only when `bridge_noreplay_armed`

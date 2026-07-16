@@ -111,6 +111,11 @@ thread_local! {
     /// executing thread's trace; no cross-thread mutable JIT state is needed.
     static RANGE_FORITER_DEMOTED: std::cell::RefCell<std::collections::HashSet<u64>> =
         std::cell::RefCell::new(std::collections::HashSet::new());
+    /// The current bridge trace's full-body walk hit a deterministic
+    /// structural decline.  The walker only knows `(w_code, start_pc)`; the
+    /// bridge launcher still has the originating guard descr and consumes this
+    /// bit to populate `MetaInterp::declined_bridge_guards`.
+    static FBW_BRIDGE_DECLINED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 pub(crate) fn fbw_declined(key: u64) -> bool {
@@ -121,6 +126,16 @@ pub(crate) fn fbw_decline(key: u64) {
     FBW_DECLINED_KEYS.with(|s| {
         s.borrow_mut().insert(key);
     });
+}
+
+fn fbw_bridge_decline(ctx: &TraceCtx) {
+    if ctx.is_bridge_trace {
+        FBW_BRIDGE_DECLINED.with(|c| c.set(true));
+    }
+}
+
+pub fn take_fbw_bridge_declined() -> bool {
+    FBW_BRIDGE_DECLINED.with(|c| c.replace(false))
 }
 
 pub(crate) fn range_foriter_demoted(key: u64) -> bool {
@@ -484,6 +499,7 @@ pub fn trace_bytecode(
     WALK_END_PROPAGATED_EXCEPTION.with(|c| *c.borrow_mut() = None);
     WALK_END_PROPAGATE_ALLOWED.with(|c| c.set(allow_propagate_out));
     WALK_END_RESTART_PC.with(|c| c.set(None));
+    FBW_BRIDGE_DECLINED.with(|c| c.set(false));
     // `TraceCtx.reads_module_global` needs no reset here: a fresh TraceCtx is
     // built per trace (zero-init `false`), unlike the walk-end TLS flags above.
     // Likewise clear any no-replay finish payload a prior trace left
@@ -1552,6 +1568,7 @@ fn run_perfn_walk(
                 pjc.metadata.n_py_instrs as usize
             );
         }
+        fbw_bridge_decline(ctx);
         fbw_decline(crate::driver::make_green_key(w_code, start_pc));
         return None;
     };
@@ -1584,6 +1601,7 @@ fn run_perfn_walk(
                      entry_depth={entry_depth} marker_py={marker_py}; declining marker-entry walk"
                 );
             }
+            fbw_bridge_decline(ctx);
             fbw_decline(crate::driver::make_green_key(w_code, start_pc));
             return None;
         }
@@ -1602,6 +1620,7 @@ fn run_perfn_walk(
                  (built_as_portal=false); declining walk"
             );
         }
+        fbw_bridge_decline(ctx);
         fbw_decline(crate::driver::make_green_key(w_code, start_pc));
         return None;
     }
@@ -3107,6 +3126,7 @@ fn full_body_walk_trace(
             if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                 eprintln!("[fbw-abort] start_pc={start_pc} run_perfn_walk returned None");
             }
+            fbw_bridge_decline(ctx);
             TraceAction::Abort
         }
     }

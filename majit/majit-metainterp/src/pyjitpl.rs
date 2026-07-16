@@ -9566,6 +9566,22 @@ impl<M: Clone> MetaInterp<M> {
             .contains(&(descr.trace_id(), descr.fail_index_per_trace()))
     }
 
+    /// Record that this exact source guard's bridge hit a deterministic
+    /// structural decline before backend compilation.  Subsequent guard
+    /// failures use the existing `must_compile_with_values` short-circuit and
+    /// resume through the blackhole instead of rebuilding the same declined
+    /// bridge every trace-eagerness cycle.
+    pub fn record_declined_bridge_guard(
+        &mut self,
+        descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
+    ) {
+        let descr = descr_arc
+            .as_fail_descr()
+            .expect("record_declined_bridge_guard: descr_arc must be a FailDescr");
+        self.declined_bridge_guards
+            .insert((descr.trace_id(), descr.fail_index_per_trace()));
+    }
+
     /// memmgr.py:58-61: keep_loop_alive(looptoken).
     /// warmstate.py:402: warmrunnerdesc.memory_manager.keep_loop_alive(loop_token)
     ///
