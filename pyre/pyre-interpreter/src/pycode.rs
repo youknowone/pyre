@@ -324,15 +324,17 @@ pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: boo
     // `usize`) routes the pointer through the proper LL conversion.
     // `align_of::<T>()` is always a power of two — `& (align - 1)` is
     // equivalent to `% align` for power-of-two alignments and matches the
-    // RPython pattern bit-for-bit.
+    // RPython pattern bit-for-bit.  The residual is computed once and shared
+    // by every field initializer below.
     let align_mask = std::mem::align_of::<crate::CodeObject>() as i64 - 1;
-    let fast_natural_arity = if code_ptr.is_null() || (code_ptr as i64) & align_mask != 0 {
+    let code_ptr_aligned = !code_ptr.is_null() && (code_ptr as i64) & align_mask == 0;
+    let fast_natural_arity = if !code_ptr_aligned {
         crate::gateway::HOPELESS
     } else {
         compute_flatcall(unsafe { &*(code_ptr as *const crate::CodeObject) })
     };
     // `pycode.py:198 self._globals_caches = [None] * len(self.co_names_w)`.
-    let globals_caches = if code_ptr.is_null() || (code_ptr as i64) & align_mask != 0 {
+    let globals_caches = if !code_ptr_aligned {
         std::ptr::null_mut()
     } else {
         let code_ref = unsafe { &*(code_ptr as *const crate::CodeObject) };
@@ -345,7 +347,7 @@ pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: boo
     };
     // `mapdict.py:1457-1458 self._mapdict_caches = [INVALID_CACHE_ENTRY] *
     // len(co_names_w)` — `None` is `INVALID_CACHE_ENTRY`.
-    let mapdict_caches = if code_ptr.is_null() || (code_ptr as i64) & align_mask != 0 {
+    let mapdict_caches = if !code_ptr_aligned {
         std::ptr::null_mut()
     } else {
         let code_ref = unsafe { &*(code_ptr as *const crate::CodeObject) };
@@ -358,7 +360,7 @@ pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: boo
     // `pycode.py:126 self.co_consts_w = consts` — the realized-constant table
     // sized to the constant count, with code-constant slots filled lazily by
     // `w_code_co_const`.
-    let co_consts_w = if code_ptr.is_null() || (code_ptr as i64) & align_mask != 0 {
+    let co_consts_w = if !code_ptr_aligned {
         std::ptr::null_mut()
     } else {
         let code_ref = unsafe { &*(code_ptr as *const crate::CodeObject) };
@@ -367,7 +369,7 @@ pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: boo
         v.resize(consts_len, std::ptr::null_mut());
         Box::into_raw(Box::new(v))
     };
-    let npure_cellvars = if code_ptr.is_null() || (code_ptr as i64) & align_mask != 0 {
+    let npure_cellvars = if !code_ptr_aligned {
         u32::MAX
     } else {
         let code_ref = unsafe { &*(code_ptr as *const crate::CodeObject) };
