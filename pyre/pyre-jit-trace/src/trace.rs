@@ -2061,9 +2061,36 @@ fn run_perfn_walk(
                              (unjournaled effect) — legacy replay kept"
                         );
                     }
-                } else if let Some(resume_py_pc) =
+                } else if let Some((resume_py_pc, call_jitcode_coord)) =
                     crate::jitcode_dispatch::fbw_abort_outer_resume_take()
                 {
+                    if crate::jitcode_dispatch::pcmap_callpc_audit_enabled() {
+                        if let Some((jitcode_index, call_jitcode_pc)) = call_jitcode_coord {
+                            let pjc =
+                                crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32)
+                                    .expect("PCMAP_CALLPC carried jitcode index must resolve");
+                            let inverted = crate::jitcode_dispatch::python_pc_for_jitcode_pc(
+                                &pjc.metadata,
+                                call_jitcode_pc,
+                            ) as usize;
+                            let verdict = if inverted == resume_py_pc { "eq" } else { "di" };
+                            if let Some(path) = std::env::var_os("PYRE_PCMAP_CALLPC_AUDIT_PROBE") {
+                                use std::io::Write;
+
+                                if let Ok(mut probe) = std::fs::OpenOptions::new()
+                                    .create(true)
+                                    .append(true)
+                                    .open(path)
+                                {
+                                    let _ = writeln!(probe, "fbw_abort_outer_resume\t{verdict}");
+                                }
+                            }
+                            assert_eq!(
+                                inverted, resume_py_pc,
+                                "PCMAP_CALLPC mismatch jitcode_index={jitcode_index} call_jitcode_pc={call_jitcode_pc} inverted={inverted} resume_py_pc={resume_py_pc}",
+                            );
+                        }
+                    }
                     if entry_carrier_call_py_pc == Some(resume_py_pc) {
                         crate::jitcode_dispatch::fbw_abort_outer_stack_overrides_clear();
                         if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
