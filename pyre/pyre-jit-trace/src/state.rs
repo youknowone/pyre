@@ -4584,7 +4584,11 @@ impl PyreSym {
                 self.is_function_entry_trace
             );
         }
-        let valuestackdepth = concrete_stack_depth(concrete_frame).unwrap_or(nlocals);
+        let valuestackdepth = if self.bridge_stack_oprefs.is_some() {
+            self.valuestackdepth
+        } else {
+            concrete_stack_depth(concrete_frame).unwrap_or(nlocals)
+        };
         let stack_only_depth = valuestackdepth.saturating_sub(nlocals);
         self.nlocals = nlocals;
         self.locals_cells_stack_array_ref = if self.is_active_vable_owner {
