@@ -549,8 +549,14 @@ pub unsafe fn w_type_is_abstract(w_type: PyObjectRef) -> bool {
 
 /// `W_TypeObject.set_abstract` (typeobject.py:600-601).
 ///
+/// `dont_look_inside`: the `flag_abstract` atomic store is a runtime-mutable
+/// side effect on per-type state, not a build-time constant, so the JIT
+/// residualises the call via the registered fnaddr rather than tracing the
+/// store the tracer cannot model.
+///
 /// # Safety
 /// `w_type` must point at a `W_TypeObject`.
+#[majit_macros::dont_look_inside]
 pub unsafe fn w_type_set_abstract(w_type: PyObjectRef, abstract_: bool) {
     if w_type.is_null() || !is_type(w_type) {
         return;

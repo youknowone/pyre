@@ -623,6 +623,16 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::try_gc_charge_oldgen_external",
         pyre_object::gc_hook::try_gc_charge_oldgen_external as *const (),
     );
+    // `w_type_set_abstract` stores the runtime-mutable `flag_abstract` atomic — a
+    // side effect on per-type state, not a build-time constant, so it carries
+    // `#[dont_look_inside]` and binds its `()`-returning `fn` directly by
+    // qualified path (sibling of `note_alloc`).
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::typeobject::w_type_set_abstract",
+        "pyre_object::w_type_set_abstract",
+        pyre_object::w_type_set_abstract as *const (),
+    );
     push_fnaddr(
         &mut entries,
         "pyre_interpreter::module::_weakref::interp__weakref::dereference",
@@ -965,6 +975,17 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::listobject::list_write_barrier",
         "pyre_object::list_write_barrier",
         pyre_object::list_write_barrier as *const (),
+    );
+    // The cold list strategy dehomogenization `switch_to_object_strategy` bulk
+    // re-boxes typed int/float storage into an Object items block via
+    // Vec/collect allocation the tracer cannot model. Register it so the hot
+    // append/setitem paths that call it resolve the residual to a
+    // runtime-patchable address instead of tracing into the transition.
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::listobject::switch_to_object_strategy",
+        "pyre_object::switch_to_object_strategy",
+        pyre_object::switch_to_object_strategy as *const (),
     );
     push_alias_pair(
         &mut entries,

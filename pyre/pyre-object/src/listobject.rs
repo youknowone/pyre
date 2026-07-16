@@ -396,7 +396,19 @@ fn boxed_from_floats(values: &[f64]) -> Vec<PyObjectRef> {
     values.iter().map(|&value| w_float_new(value)).collect()
 }
 
-unsafe fn switch_to_object_strategy(list: &mut W_ListObject) {
+/// Cold list strategy dehomogenization: a typed int/float list gained a
+/// non-numeric element, so its unboxed backing storage is bulk re-boxed into
+/// an Object-strategy items block one time.
+///
+/// `dont_look_inside`: the transition drives Vec/collect allocation the tracer
+/// cannot model — `boxed_from_ints` / `boxed_from_floats` build a fresh
+/// `Vec<PyObjectRef>` via `.map(...).collect()`, and
+/// `set_object_items_from_vec` / `IntArray::from_vec` / `FloatArray::from_vec`
+/// tear down the typed storage through raw-Vec construction. Residualize the
+/// whole cold transition via the registered fnaddr so the hot append/setitem
+/// paths that call it stay traceable.
+#[majit_macros::dont_look_inside]
+pub unsafe fn switch_to_object_strategy(list: &mut W_ListObject) {
     if list.strategy == ListStrategy::Object {
         return;
     }
