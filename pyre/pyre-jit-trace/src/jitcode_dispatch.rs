@@ -2911,6 +2911,7 @@ fn compute_bridge_root_parent_frame(
         // identical liveness window. `PYRE_M73_OUTERCAP_CARRY=0` falls back to
         // the sentinel-based decode path.
         root_liveness_word,
+        root_liveness_word,
         OuterActiveBoxesEntryTwin::Trivia,
         "bridge_root_parent",
         None,
@@ -3729,6 +3730,7 @@ pub fn dispatch_via_miframe_at_opcode_entry<'a>(
         outer_jitcode_index,
         entry_py_pc,
         None,
+        majit_ir::resumedata::NO_JITCODE_PC,
         majit_ir::resumedata::NO_JITCODE_PC,
         OuterActiveBoxesEntryTwin::PyPc,
         "opcode_entry",
@@ -7462,7 +7464,7 @@ fn audit_outer_active_boxes_entry_twin(
     assert_eq!(
         twin_pcdep,
         table_pcdep,
-        "PCMAP_ENTRY pcdep mismatch caller={caller} flavor={} cjc={cjc} entry_py_pc={entry_py_pc}",
+        "PCMAP_ENTRY pcdep mismatch caller={caller} flavor={} cjc={cjc} entry_py_pc={entry_py_pc} twin_pcdep={twin_pcdep:?} table_pcdep={table_pcdep:?}",
         twin.name(),
     );
     if !payload.code_ptr.is_null() {
@@ -7474,7 +7476,7 @@ fn audit_outer_active_boxes_entry_twin(
         assert_eq!(
             twin_depth,
             table_depth,
-            "PCMAP_ENTRY depth mismatch caller={caller} flavor={} cjc={cjc} entry_py_pc={entry_py_pc}",
+            "PCMAP_ENTRY depth mismatch caller={caller} flavor={} cjc={cjc} entry_py_pc={entry_py_pc} twin_depth={twin_depth} table_depth={table_depth} twin_pcdep={twin_pcdep:?} table_pcdep={table_pcdep:?}",
             twin.name(),
         );
     }
@@ -7489,7 +7491,11 @@ fn collect_outer_active_boxes(
     outer_jitcode_index: u32,
     entry_py_pc: u32,
     guard_py_pc: Option<u32>,
+    // The resume-carried coordinate remains the bank-liveness source. Entry
+    // metadata can be derived from an earlier raw operation coordinate, so it
+    // must travel independently rather than inheriting that marker word.
     carried_jitcode_pc: i32,
+    entry_jitcode_pc: i32,
     entry_twin: OuterActiveBoxesEntryTwin,
     entry_caller: &'static str,
     vstack: Option<&[OpRef]>,
@@ -7535,7 +7541,7 @@ fn collect_outer_active_boxes(
                 audit_outer_active_boxes_entry_twin(
                     payload,
                     entry_py_pc,
-                    carried_jitcode_pc,
+                    entry_jitcode_pc,
                     entry_twin,
                     entry_caller,
                 );
@@ -7553,13 +7559,13 @@ fn collect_outer_active_boxes(
                 let stack_depth_at_pc = if payload.code_ptr.is_null() {
                     0usize
                 } else {
-                    match (entry_twin, carried_jitcode_pc >= 0) {
+                    match (entry_twin, entry_jitcode_pc >= 0) {
                         (OuterActiveBoxesEntryTwin::Plain, true) => payload
-                            .depth_for_jitcode_pc_pred(carried_jitcode_pc as usize)
+                            .depth_for_jitcode_pc_pred(entry_jitcode_pc as usize)
                             .unwrap_or(0)
                             as usize,
                         (OuterActiveBoxesEntryTwin::Trivia, true) => payload
-                            .depth_trivia_for_jitcode_pc(carried_jitcode_pc as usize)
+                            .depth_trivia_for_jitcode_pc(entry_jitcode_pc as usize)
                             .unwrap_or(0)
                             as usize,
                         _ => crate::liveness::liveness_for(payload.code_ptr)
@@ -7594,14 +7600,14 @@ fn collect_outer_active_boxes(
     } else {
         unsafe {
             let jc = &*sym.jitcode;
-            match (entry_twin, carried_jitcode_pc >= 0) {
+            match (entry_twin, entry_jitcode_pc >= 0) {
                 (OuterActiveBoxesEntryTwin::Plain, true) => jc
                     .payload
-                    .pcdep_for_jitcode_pc(carried_jitcode_pc as usize)
+                    .pcdep_for_jitcode_pc(entry_jitcode_pc as usize)
                     .unwrap_or_default(),
                 (OuterActiveBoxesEntryTwin::Trivia, true) => jc
                     .payload
-                    .pcdep_trivia_for_jitcode_pc(carried_jitcode_pc as usize)
+                    .pcdep_trivia_for_jitcode_pc(entry_jitcode_pc as usize)
                     .map(ToOwned::to_owned)
                     .unwrap_or_default(),
                 _ => jc
@@ -12638,8 +12644,9 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 (OuterActiveBoxesEntryTwin::Plain, "guard_snapshot_guard_pc")
             } else {
                 (
-                    // Both plain and trivia twins diverged from this
-                    // fallthrough coordinate in the entry census.
+                    // The live-before anchor does not invert to this
+                    // fallthrough entry coordinate (entry census); retain the
+                    // Python-PC source until a matching carried model exists.
                     OuterActiveBoxesEntryTwin::PyPc,
                     "guard_snapshot_fallthrough",
                 )
@@ -12653,6 +12660,7 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 jitcode_index,
                 liveness_py_pc,
                 guard_py_pc,
+                guard_jitcode_pc,
                 guard_jitcode_pc,
                 entry_twin,
                 entry_caller,
@@ -12956,6 +12964,7 @@ fn compute_inline_caller_frame(
         jitcode_index,
         fallthrough_py_pc,
         None,
+        caller_liveness_word,
         caller_liveness_word,
         OuterActiveBoxesEntryTwin::Trivia,
         "inline_caller",
@@ -15735,9 +15744,11 @@ fn try_walker_inline_user_call(
                     call_site_py_pc,
                     None,
                     call_site_word,
-                    // The trivia twin diverged at this capture coordinate in
-                    // the entry census.
-                    OuterActiveBoxesEntryTwin::PyPc,
+                    // Keep the marker for the liveness-bank query, but key
+                    // entry metadata to the raw CALL offset that produced the
+                    // pre-adjustment Python coordinate.
+                    op.pc as i32,
+                    OuterActiveBoxesEntryTwin::Plain,
                     "call_site_capture",
                     None,
                     &[],
@@ -20727,8 +20738,10 @@ fn orthodox_list_append_commit(
         call_site_py_pc,
         None,
         call_site_word,
-        // This caller did not fire in the entry census.
-        OuterActiveBoxesEntryTwin::PyPc,
+        // As above, entry metadata is keyed by the append op itself; its
+        // liveness-bank query remains keyed by the resume marker.
+        op.pc as i32,
+        OuterActiveBoxesEntryTwin::Plain,
         "w_list_append_call_site",
         None,
         &[],
