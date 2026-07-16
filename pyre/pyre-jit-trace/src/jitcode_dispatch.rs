@@ -12257,12 +12257,25 @@ fn walker_capture_snapshot_for_last_guard_impl(
             } else {
                 py_pc
             };
-            // The three depth_at_py_pc[py_pc] reads below (vstack reconcile,
-            // valuestackdepth publication, and vable stack sync) intentionally
-            // share this one census verdict. Plain guards key their trivia twin
-            // at `op_pc`; after-residual guards key the same family at their
-            // post-call marker. A loop-close overshoot falls back to entry_py_pc
-            // and has no corresponding op_pc-derived twin.
+            // The three resume-depth consumers below (vstack reconcile,
+            // valuestackdepth publication, and vable stack sync) share one
+            // JitCode-PC twin. Plain guards key their trivia twin at `op_pc`;
+            // after-residual guards key the same family at their post-call
+            // marker. A loop-close overshoot falls back to entry_py_pc and has
+            // no corresponding op_pc-derived twin, so it retains the legacy
+            // Python-PC lookup below.
+            let resume_depth_twin: Option<u16> = unsafe {
+                let jc = &*sym.jitcode;
+                if loop_close_overshoot {
+                    None
+                } else if after_residual_call {
+                    jc.payload
+                        .after_residual_marker_for_jitcode_pc(op_pc)
+                        .and_then(|marker| jc.payload.depth_trivia_for_jitcode_pc(marker))
+                } else {
+                    jc.payload.depth_trivia_for_jitcode_pc(op_pc)
+                }
+            };
             if pcmap_guardcap_audit_enabled() {
                 let jc = unsafe { &*sym.jitcode };
                 let table_depth = if jc.payload.code_ptr.is_null() {
@@ -12282,30 +12295,26 @@ fn walker_capture_snapshot_for_last_guard_impl(
                         },
                         "overshoot",
                     )
-                } else if after_residual_call {
-                    match jc.payload.after_residual_marker_for_jitcode_pc(op_pc) {
-                        Some(marker) => {
-                            let twin_depth = jc.payload.depth_trivia_for_jitcode_pc(marker);
-                            (
-                                "after_residual",
-                                if twin_depth == table_depth {
-                                    "eq"
-                                } else {
-                                    "di"
-                                },
-                            )
-                        }
-                        None => ("after_residual", "no_marker"),
-                    }
+                } else if after_residual_call
+                    && jc
+                        .payload
+                        .after_residual_marker_for_jitcode_pc(op_pc)
+                        .is_none()
+                {
+                    ("after_residual", "no_marker")
                 } else {
-                    let twin_depth = jc.payload.depth_trivia_for_jitcode_pc(op_pc);
+                    let twin_depth = resume_depth_twin;
+                    assert_eq!(
+                        twin_depth, table_depth,
+                        "PCMAP_GUARDCAP depth mismatch op_pc={op_pc} py_pc={py_pc} twin_depth={twin_depth:?} table_depth={table_depth:?}",
+                    );
                     (
-                        "plain",
-                        if twin_depth == table_depth {
-                            "eq"
+                        if after_residual_call {
+                            "after_residual"
                         } else {
-                            "di"
+                            "plain"
                         },
+                        "eq",
                     )
                 };
                 pcmap_guardcap_audit_probe(flavor, verdict);
@@ -12325,11 +12334,14 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 let jc = unsafe { &*sym.jitcode };
                 let code_ptr = jc.payload.code_ptr;
                 if !code_ptr.is_null() {
-                    let resume_depth = crate::liveness::liveness_for(code_ptr)
-                        .depth_at_py_pc()
-                        .get(py_pc as usize)
-                        .copied()
-                        .unwrap_or(0) as usize;
+                    let resume_depth = match resume_depth_twin {
+                        Some(depth) => depth as usize,
+                        None => crate::liveness::liveness_for(code_ptr)
+                            .depth_at_py_pc()
+                            .get(py_pc as usize)
+                            .copied()
+                            .unwrap_or(0) as usize,
+                    };
                     let code = unsafe { &*code_ptr };
                     reconcile_vstack_at_boundary(ctx, code, py_pc, resume_depth);
                 }
@@ -12380,10 +12392,14 @@ fn walker_capture_snapshot_for_last_guard_impl(
                     if jc.payload.code_ptr.is_null() {
                         sym.valuestackdepth as i64
                     } else {
-                        let lv = crate::liveness::liveness_for(jc.payload.code_ptr);
-                        match lv.depth_at_py_pc().get(py_pc as usize).copied() {
+                        match resume_depth_twin {
                             Some(d) => (sym.nlocals + d as usize) as i64,
-                            None => sym.valuestackdepth as i64,
+                            None => crate::liveness::liveness_for(jc.payload.code_ptr)
+                                .depth_at_py_pc()
+                                .get(py_pc as usize)
+                                .copied()
+                                .map(|d| (sym.nlocals + d as usize) as i64)
+                                .unwrap_or(sym.valuestackdepth as i64),
                         }
                     }
                 };
@@ -12430,11 +12446,14 @@ fn walker_capture_snapshot_for_last_guard_impl(
                     if jc.payload.code_ptr.is_null() {
                         0usize
                     } else {
-                        crate::liveness::liveness_for(jc.payload.code_ptr)
-                            .depth_at_py_pc()
-                            .get(py_pc as usize)
-                            .copied()
-                            .unwrap_or(0) as usize
+                        match resume_depth_twin {
+                            Some(depth) => depth as usize,
+                            None => crate::liveness::liveness_for(jc.payload.code_ptr)
+                                .depth_at_py_pc()
+                                .get(py_pc as usize)
+                                .copied()
+                                .unwrap_or(0) as usize,
+                        }
                     }
                 };
                 let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
