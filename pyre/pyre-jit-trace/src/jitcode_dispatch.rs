@@ -20064,6 +20064,20 @@ fn newlist_virt_enabled() -> bool {
     *ENABLED
 }
 
+/// `PYRE_EMPTY_APPEND_VIRT` gate (read once) — admits the empty-list first
+/// append into the orthodox `w_list_append` fold by promoting the receiver
+/// Empty→typed (recording the strategy switch as inline IR) before the
+/// spare-capacity fold runs, instead of aborting with
+/// `UnfoldableListAppendResidualUnsupported`.  Default-off until the slice
+/// series lands; set `PYRE_EMPTY_APPEND_VIRT=1` to enable.
+#[allow(dead_code)]
+fn empty_append_virt_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("PYRE_EMPTY_APPEND_VIRT").is_ok_and(|v| v != "0")
+    });
+    *ENABLED
+}
+
 /// #171: FBW virtualization of a non-escaping BUILD_LIST.
 /// `lower_tuple_build_hlop_to_insn` lowers BUILD_LIST to `new_array_clear`
 /// + per-index `setarrayitem_gc` + a `newlist_from_array` residual
