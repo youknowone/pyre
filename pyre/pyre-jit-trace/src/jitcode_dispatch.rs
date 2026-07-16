@@ -21973,30 +21973,14 @@ fn orthodox_list_append_commit(
         ctx.trace_ctx
             .heap_cache_mut()
             .replace_box(strategy_ref, expected);
-        // Concrete promotion of the real list FIRST, so the typed backing
-        // block exists before the transition IR is emitted; journal so a
-        // non-commit walk rolls back to Empty.
+        // Emit the transition IR mutating the existing wrapper (helpers.rs).
+        // The emitter seeds the new block's capacity getfield cache so the
+        // append body sub-walk's spare-capacity `0 < capacity` check folds.
+        crate::helpers::emit_promote_empty_list_inline(ctx.trace_ctx, self_ref, target);
+        // Concrete promotion of the real list, then journal so a non-commit
+        // walk rolls back to Empty.
         unsafe { pyre_object::w_list_switch_to_strategy_for(inner_self, value) };
         fbw_append_promote_journal_push(inner_self);
-        // Emit the transition IR mutating the existing wrapper (helpers.rs).
-        let block_op =
-            crate::helpers::emit_promote_empty_list_inline(ctx.trace_ctx, self_ref, target);
-        // Stamp the transition's `NewArray` block OpRef with the concrete
-        // address of the freshly-installed backing block. The append body
-        // sub-walk reads `list.items_block` (heapcache-hits this NewArray op)
-        // then `block.capacity`; the getfield's `field_sanity_load` needs the
-        // block's concrete pointer to fold the capacity (== 1) so the
-        // spare-capacity `0 < capacity` branch resolves instead of aborting
-        // with a symbolic `GOTO_IF_NOT` condition.
-        if let Some(block_op) = block_op {
-            let block_ptr = unsafe { pyre_object::listobject::w_list_items_block_ptr(inner_self) };
-            if !block_ptr.is_null() {
-                ctx.trace_ctx.set_opref_concrete(
-                    block_op,
-                    majit_ir::Value::Ref(majit_ir::GcRef(block_ptr as usize)),
-                );
-            }
-        }
     }
 
     // Pin the appended value's class so the inlined `is_plain_int1` type

@@ -1242,25 +1242,6 @@ pub unsafe fn w_list_switch_to_strategy_for(obj: PyObjectRef, value: PyObjectRef
     switch_to_correct_strategy(list, value);
 }
 
-/// The address of the current strategy's backing items block, as a raw
-/// pointer. Integer/Float return the `TypedItemsBlock*` (`int_items.block` /
-/// `float_items.block`); Object returns the `ItemsBlock*` (`items`); Empty
-/// returns null. The block's offset-0 header is the allocated capacity
-/// (rlist.py:251 `len(l.items)`). Used by the JIT to stamp the transition
-/// IR's `NewArray` OpRef with the block's concrete address so a sub-walk's
-/// `list.items_block.capacity` read folds to the concrete capacity.
-/// # Safety
-/// `obj` must point to a valid `W_ListObject`.
-pub unsafe fn w_list_items_block_ptr(obj: PyObjectRef) -> *mut u8 {
-    let list = &*(obj as *const W_ListObject);
-    match list.strategy {
-        ListStrategy::Integer => list.int_items.block as *mut u8,
-        ListStrategy::Float => list.float_items.block as *mut u8,
-        ListStrategy::Object => list.items as *mut u8,
-        ListStrategy::Empty => std::ptr::null_mut(),
-    }
-}
-
 /// listobject.py:1873-1874 IntegerListStrategy.reverse
 /// Strategy-preserving: reverses typed storage in place.
 pub unsafe fn w_list_reverse(obj: PyObjectRef) {

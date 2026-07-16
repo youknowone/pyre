@@ -1262,7 +1262,7 @@ pub fn emit_promote_empty_list_inline(
     ctx: &mut TraceCtx,
     list_op: OpRef,
     strategy: pyre_object::listobject::ListStrategy,
-) -> Option<OpRef> {
+) {
     use crate::descr::{
         list_float_items_block_descr, list_float_items_len_descr, list_int_items_block_descr,
         list_int_items_len_descr, list_items_descr, list_length_descr, list_strategy_descr,
@@ -1297,7 +1297,16 @@ pub fn emit_promote_empty_list_inline(
             let items_block_idx = items_block_descr.index();
             ctx.record_op_with_descr(OpCode::SetfieldGc, &[list_op, block], items_block_descr);
             ctx.heapcache_setfield_cached(list_op, items_block_idx, block);
-            Some(block)
+            // Seed the block's capacity getfield cache with the const (1). The
+            // block is a fresh const-size allocation whose capacity is known,
+            // matching the heapcache length tracking a `new_array` gets for a
+            // const-length array (heapcache.py:508 `new_array` →
+            // `arraylen_now_known`). The append body sub-walk reads
+            // `ItemsBlock.capacity` via a getfield (not arraylen), so seed that
+            // field-index channel explicitly; otherwise the read stays symbolic
+            // and the spare-capacity `0 < capacity` branch cannot fold.
+            let cap_idx = crate::descr::items_block_capacity_descr().index();
+            ctx.heapcache_setfield_cached(block, cap_idx, cap_ref);
         }
         pyre_object::listobject::ListStrategy::Float => {
             let array_descr = float_gcarray_descr();
@@ -1323,7 +1332,11 @@ pub fn emit_promote_empty_list_inline(
             let items_block_idx = items_block_descr.index();
             ctx.record_op_with_descr(OpCode::SetfieldGc, &[list_op, block], items_block_descr);
             ctx.heapcache_setfield_cached(list_op, items_block_idx, block);
-            Some(block)
+            // Seed the block's capacity getfield cache with the const (1); see
+            // the Integer arm above for the rationale (const-size block, getfield
+            // capacity channel distinct from the `new_array` arraylen seed).
+            let cap_idx = crate::descr::items_block_capacity_descr().index();
+            ctx.heapcache_setfield_cached(block, cap_idx, cap_ref);
         }
         pyre_object::listobject::ListStrategy::Object => {
             let array_descr = pyobject_gcarray_descr();
@@ -1349,11 +1362,12 @@ pub fn emit_promote_empty_list_inline(
             let items_idx = items_descr.index();
             ctx.record_op_with_descr(OpCode::SetfieldGc, &[list_op, block], items_descr);
             ctx.heapcache_setfield_cached(list_op, items_idx, block);
-            Some(block)
+            // Object storage needs no capacity seed: the append body reads
+            // capacity through `list.items` (list_items_descr), a path that
+            // already resolves to the concrete block.
         }
         pyre_object::listobject::ListStrategy::Empty => {
             debug_assert_ne!(strategy, pyre_object::listobject::ListStrategy::Empty);
-            None
         }
     }
 }
