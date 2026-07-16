@@ -21820,9 +21820,38 @@ unsafe fn orthodox_list_append_recognize(
     // fits-int results to `W_IntObject` across arithmetic / `int(str)` /
     // literals, so the long arm is an unreachable optimization and the
     // decline is correctness-safe (the generic residual handles it).
-    if !pyre_object::pyobject::is_list(inner_self)
-        || !pyre_object::w_list_can_append_without_realloc(inner_self)
-    {
+    if !pyre_object::pyobject::is_list(inner_self) {
+        return None;
+    }
+    // Empty-strategy first-append promotion (gated). `w_list_can_append_without_realloc`
+    // is false for Empty (no backing block yet), so classify by the value's
+    // type using switch_to_correct_strategy's int -> float -> object order
+    // (listobject.py:1154) and let the commit path install the typed storage.
+    if pyre_object::w_list_uses_empty_storage(inner_self) {
+        if !empty_append_virt_enabled() {
+            // Gate off: preserve the prior behavior (Empty always declined).
+            return None;
+        }
+        let int_ok = pyre_object::is_plain_int1(value)
+            && !pyre_object::pyobject::is_long(value)
+            && !(pyre_object::tagged_int::CAN_BE_TAGGED
+                && pyre_object::tagged_int::is_tagged_int(value));
+        let float_ok = !value.is_null() && pyre_object::is_plain_float_strict(value);
+        // switch_to_correct_strategy routes `is_plain_int1` -> Integer with no
+        // tagged exclusion. Exclude any plain-int / float from the object
+        // fallback so a tagged-int / fits-int `W_LongObject` DECLINES (generic
+        // residual) instead of mis-routing to Object and diverging the traced
+        // strategy from the concrete one the commit installs.
+        let obj_ok = !value.is_null()
+            && !pyre_object::is_plain_int1(value)
+            && !pyre_object::is_plain_float_strict(value);
+        if !int_ok && !float_ok && !obj_ok {
+            return None;
+        }
+        // Empty length is 0 (the journal rewind point).
+        return Some(0);
+    }
+    if !pyre_object::w_list_can_append_without_realloc(inner_self) {
         return None;
     }
     // Int-storage specialization: plain-int value stored unboxed (a
@@ -21904,6 +21933,71 @@ fn orthodox_list_append_commit(
         self_ref,
         majit_ir::Value::Ref(majit_ir::GcRef(inner_self as usize)),
     );
+
+    // Empty-strategy first-append promotion (gated): install typed storage on
+    // the receiver BEFORE the value-class pin / storage read below, so those
+    // observe the post-promotion strategy. Classify the target strategy from
+    // the value with recognize's int -> float -> object guards
+    // (switch_to_correct_strategy, listobject.py:1154), then emit the
+    // transition IR mutating the existing wrapper, promote the concrete list,
+    // and journal the rewind to Empty.
+    use pyre_object::listobject::ListStrategy;
+    let promote_empty = empty_append_virt_enabled()
+        && unsafe { pyre_object::w_list_uses_empty_storage(inner_self) };
+    if promote_empty {
+        let target = unsafe {
+            let int_ok = pyre_object::is_plain_int1(value)
+                && !pyre_object::pyobject::is_long(value)
+                && !(pyre_object::tagged_int::CAN_BE_TAGGED
+                    && pyre_object::tagged_int::is_tagged_int(value));
+            if int_ok {
+                ListStrategy::Integer
+            } else if !value.is_null() && pyre_object::is_plain_float_strict(value) {
+                ListStrategy::Float
+            } else {
+                ListStrategy::Object
+            }
+        };
+        // Guard the current (Empty) strategy so a deopt re-enters the empty
+        // path (mirror of `MIFrame::guard_list_strategy`: getfield strategy +
+        // GuardValue + replace_box).
+        let strategy_ref = crate::state::opimpl_getfield_gc_i(
+            ctx.trace_ctx,
+            self_ref,
+            crate::descr::list_strategy_descr(),
+        );
+        let expected = ctx.trace_ctx.const_int(ListStrategy::Empty as i64);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardValue, &[strategy_ref, expected], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(strategy_ref, expected);
+        // Concrete promotion of the real list FIRST, so the typed backing
+        // block exists before the transition IR is emitted; journal so a
+        // non-commit walk rolls back to Empty.
+        unsafe { pyre_object::w_list_switch_to_strategy_for(inner_self, value) };
+        fbw_append_promote_journal_push(inner_self);
+        // Emit the transition IR mutating the existing wrapper (helpers.rs).
+        let block_op =
+            crate::helpers::emit_promote_empty_list_inline(ctx.trace_ctx, self_ref, target);
+        // Stamp the transition's `NewArray` block OpRef with the concrete
+        // address of the freshly-installed backing block. The append body
+        // sub-walk reads `list.items_block` (heapcache-hits this NewArray op)
+        // then `block.capacity`; the getfield's `field_sanity_load` needs the
+        // block's concrete pointer to fold the capacity (== 1) so the
+        // spare-capacity `0 < capacity` branch resolves instead of aborting
+        // with a symbolic `GOTO_IF_NOT` condition.
+        if let Some(block_op) = block_op {
+            let block_ptr = unsafe { pyre_object::listobject::w_list_items_block_ptr(inner_self) };
+            if !block_ptr.is_null() {
+                ctx.trace_ctx.set_opref_concrete(
+                    block_op,
+                    majit_ir::Value::Ref(majit_ir::GcRef(block_ptr as usize)),
+                );
+            }
+        }
+    }
 
     // Pin the appended value's class so the inlined `is_plain_int1` type
     // predicate folds during the sub-walk: guard_class(value, INT_TYPE) +
