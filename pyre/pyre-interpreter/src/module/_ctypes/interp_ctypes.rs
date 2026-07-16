@@ -67,7 +67,7 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
                 if pyre_object::is_none(args[0]) {
                     // dlopen(None) → process handle
                     let mode = if args.len() >= 2 {
-                        pyre_object::w_int_get_value(args[1]) as libc::c_int
+                        crate::baseobjspace::int_w(args[1])? as libc::c_int
                     } else {
                         libc::RTLD_NOW
                     };
@@ -84,7 +84,7 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
                 pyre_object::w_str_get_value(args[0]).to_string()
             };
             let mode = if args.len() >= 2 {
-                (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32
+                crate::baseobjspace::int_w(args[1])? as i32
             } else {
                 rustpython_host_env::ctypes::dlopen_mode(None)
             };
@@ -104,7 +104,7 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
                 if args.len() < 2 {
                     return Err(crate::PyError::type_error("dlsym() needs 2 arguments"));
                 }
-                let h = (unsafe { pyre_object::w_int_get_value(args[0]) }) as usize;
+                let h = crate::baseobjspace::int_w(args[0])? as usize;
                 let name = unsafe {
                     if !pyre_object::is_str(args[1]) {
                         return Err(crate::PyError::type_error("dlsym: name must be a string"));
@@ -138,7 +138,7 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
                 if args.is_empty() {
                     return Err(crate::PyError::type_error("dlclose() needs handle"));
                 }
-                let h = (unsafe { pyre_object::w_int_get_value(args[0]) }) as usize;
+                let h = crate::baseobjspace::int_w(args[0])? as usize;
                 rustpython_host_env::ctypes::drop_library(h);
                 Ok(pyre_object::w_none())
             },
@@ -169,7 +169,7 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
                 if args.is_empty() {
                     return Err(crate::PyError::type_error("set_errno() needs value"));
                 }
-                let v = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
+                let v = crate::baseobjspace::int_w(args[0])? as i32;
                 let prev = rustpython_host_env::ctypes::set_errno(v);
                 Ok(pyre_object::w_int_new(prev as i64))
             },
@@ -231,9 +231,9 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
             if args.is_empty() {
                 return Err(crate::PyError::type_error("string_at() needs ptr"));
             }
-            let ptr = (unsafe { pyre_object::w_int_get_value(args[0]) }) as usize;
+            let ptr = crate::baseobjspace::int_w(args[0])? as usize;
             let size = if args.len() >= 2 {
-                unsafe { pyre_object::w_int_get_value(args[1]) }
+                crate::baseobjspace::int_w(args[1])?
             } else {
                 -1
             };
@@ -279,9 +279,14 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
         "_memset_addr",
         pyre_object::w_int_new(host_ctypes::memset_addr() as i64),
     );
-    crate::module_ns_store(ns, "_cast_addr", pyre_object::w_int_new(1));
-    crate::module_ns_store(ns, "_string_at_addr", pyre_object::w_int_new(2));
-    crate::module_ns_store(ns, "_memoryview_at_addr", pyre_object::w_int_new(4));
+    // `cast` / `string_at` / `memoryview_at` are not built as `PYFUNCTYPE`
+    // trampolines in this slice.  Export their addresses as NULL rather than
+    // the old `1`/`2`/`4` sentinels: the stdlib wraps these as function
+    // pointers, and a foreign call through NULL raises `ValueError` instead of
+    // jumping to a wild address.
+    crate::module_ns_store(ns, "_cast_addr", pyre_object::w_int_new(0));
+    crate::module_ns_store(ns, "_string_at_addr", pyre_object::w_int_new(0));
+    crate::module_ns_store(ns, "_memoryview_at_addr", pyre_object::w_int_new(0));
 
     // ── ArgumentError — a real Exception subclass ──
     let w_exception = crate::builtins::lookup_exc_class("Exception")
@@ -457,7 +462,8 @@ fn ctypes_byref(
 fn ctypes_resize(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
-    use super::cdata;
+    use super::{cdata, stginfo};
+    use rustpython_host_env::ctypes as host_ctypes;
     if args.len() < 2 {
         return Err(crate::PyError::type_error("resize() needs (obj, size)"));
     }
@@ -470,17 +476,21 @@ fn ctypes_resize(
             "Memory cannot be resized because this object doesn't own it",
         ));
     }
-    let size = crate::baseobjspace::int_w(args[1])? as usize;
-    let cur = cdata::cdata_len(obj).unwrap_or(0);
-    if size < cur {
-        return Err(crate::PyError::value_error(format!(
-            "minimum size is {cur}"
-        )));
+    // The floor is the type's natural size, not the current buffer length, so a
+    // previously enlarged object can be shrunk back down to it.  A negative
+    // request would wrap to a huge `usize`, so reject the signed value first.
+    let requested = crate::baseobjspace::int_w(args[1])?;
+    let cls = unsafe { pyre_object::w_instance_get_type(obj) };
+    let min = stginfo::stginfo_of(cls)
+        .map(stginfo::stginfo_size)
+        .or_else(|| cdata::type_code_of(cls).and_then(|tc| host_ctypes::simple_type_size(&tc)))
+        .unwrap_or(0);
+    if requested < min as i64 {
+        return Err(crate::PyError::value_error(format!("minimum size is {min}")));
     }
-    if size > cur {
-        if let Some(ba) = cdata::cdata_buffer(obj) {
-            unsafe { pyre_object::w_bytearray_vec_mut(ba).resize(size, 0) };
-        }
+    let size = requested as usize;
+    if let Some(ba) = cdata::cdata_buffer(obj) {
+        unsafe { pyre_object::w_bytearray_vec_mut(ba).resize(size, 0) };
     }
     Ok(pyre_object::w_none())
 }

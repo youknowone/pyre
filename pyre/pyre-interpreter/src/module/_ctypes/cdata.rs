@@ -108,13 +108,6 @@ pub(super) fn new_simplecdata_obj(
 ) -> Result<PyObjectRef, crate::PyError> {
     let size = host_ctypes::simple_type_size(tc).ok_or_else(|| invalid_type_code_error())?;
     let ba = pyre_object::w_bytearray_new(size);
-    if let Some(v) = value {
-        let bytes = encode_value(tc, v)?;
-        let n = bytes.len().min(size);
-        unsafe {
-            pyre_object::w_bytearray_data_mut(ba)[..n].copy_from_slice(&bytes[..n]);
-        }
-    }
     let obj = pyre_object::w_instance_new(cls);
     let d = crate::baseobjspace::getdict(obj);
     if d.is_null() {
@@ -123,6 +116,14 @@ pub(super) fn new_simplecdata_obj(
         ));
     }
     unsafe { pyre_object::w_dict_setitem_str(d, CDATA_BUFFER_KEY, ba) };
+    // Encode after the instance exists so a `char*` keepalive can attach to it.
+    if let Some(v) = value {
+        let bytes = encode_value_into(tc, v, obj, "0")?;
+        let n = bytes.len().min(size);
+        unsafe {
+            pyre_object::w_bytearray_data_mut(ba)[..n].copy_from_slice(&bytes[..n]);
+        }
+    }
     Ok(obj)
 }
 
@@ -144,7 +145,7 @@ fn value_setter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let value = args[2];
     let cls = unsafe { pyre_object::w_instance_get_type(obj) };
     let tc = type_code_of(cls).ok_or_else(|| crate::PyError::type_error("abstract class"))?;
-    let bytes = encode_value(&tc, value)?;
+    let bytes = encode_value_into(&tc, value, obj, "0")?;
     cdata_write(obj, 0, &bytes);
     Ok(pyre_object::w_none())
 }
@@ -325,14 +326,23 @@ pub(super) fn make_subview(
 
 /// An `address`-backed instance of `proto` viewing `size` bytes of external
 /// memory (`PyCData::at_address`) — the pyre form of a pointer dereference.
-/// The memory is owned elsewhere; the caller keeps it alive.
-pub(super) fn make_at_address(proto: PyObjectRef, address: usize, size: usize) -> PyObjectRef {
+/// `base` (the pointer object the address came from) is retained under
+/// `_b_base_` so its `_objects_` keepalive chain outlives the returned view.
+pub(super) fn make_at_address(
+    proto: PyObjectRef,
+    address: usize,
+    size: usize,
+    base: PyObjectRef,
+) -> PyObjectRef {
     let inst = pyre_object::w_instance_new(proto);
     let d = crate::baseobjspace::getdict(inst);
     if !d.is_null() {
         unsafe {
             pyre_object::w_dict_setitem_str(d, BADDR_KEY, pyre_object::w_int_new(address as i64));
             pyre_object::w_dict_setitem_str(d, BSZ_KEY, pyre_object::w_int_new(size as i64));
+            if !base.is_null() && !pyre_object::is_none(base) {
+                pyre_object::w_dict_setitem_str(d, BBASE_KEY, base);
+            }
         }
     }
     inst
@@ -413,11 +423,17 @@ pub(super) fn invalid_type_code_error() -> crate::PyError {
 
 /// Encode a Python scalar into the native-endian buffer bytes for `tc`.
 ///
-/// A same-typed `_SimpleCData` instance is accepted and copied byte-for-byte.
+/// A `_SimpleCData` instance of the *same* type code is copied byte-for-byte; a
+/// differently-typed one falls through to normal conversion (which rejects it
+/// unless it is int/float-like), so a larger scalar cannot overwrite a smaller
+/// field with its raw buffer.
 pub(super) fn encode_value(tc: &str, obj: PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
     use host_ctypes::SimpleStorageValue as V;
     if is_simplecdata_instance(obj) {
-        return Ok(cdata_bytes(obj).unwrap_or(&[]).to_vec());
+        let src_cls = unsafe { pyre_object::w_instance_get_type(obj) };
+        if type_code_of(src_cls).as_deref() == Some(tc) {
+            return Ok(cdata_bytes(obj).unwrap_or(&[]).to_vec());
+        }
     }
     let val = match tc {
         "c" => {
@@ -437,8 +453,16 @@ pub(super) fn encode_value(tc: &str, obj: PyObjectRef) -> Result<Vec<u8>, crate:
                 ));
             }
         }
-        "b" | "B" | "h" | "H" | "i" | "I" | "l" | "L" | "q" | "Q" => {
-            V::Signed(crate::baseobjspace::int_w(obj)? as i128)
+        "b" | "h" | "i" | "l" | "q" => V::Signed(crate::baseobjspace::int_w(obj)? as i128),
+        // Unsigned fields carry the full unsigned range; fall back to `uint_w`
+        // when the value exceeds `i64` so `c_ulonglong(2**63)` round-trips.  The
+        // encoder masks the `i128` to the field width, so the signed range still
+        // wraps as ctypes expects.
+        "B" | "H" | "I" | "L" | "Q" => {
+            let v = crate::baseobjspace::int_w(obj)
+                .map(|i| i as i128)
+                .or_else(|_| crate::baseobjspace::uint_w(obj).map(|u| u as i128))?;
+            V::Signed(v)
         }
         "f" | "d" | "g" => V::Float(crate::baseobjspace::float_w(obj)?),
         "?" => V::Bool(crate::baseobjspace::is_true(obj)?),
@@ -460,18 +484,55 @@ pub(super) fn encode_value(tc: &str, obj: PyObjectRef) -> Result<Vec<u8>, crate:
     ))
 }
 
+/// Encode `value` for storage into slot `key` of `dest`, threading `char*`
+/// keepalive.  A `c_char_p` (`z`) initialised from `bytes` is stored as a
+/// pointer to a NUL-terminated copy retained under `key` in `dest`'s root
+/// `_objects_`; every other case defers to [`encode_value`].
+pub(super) fn encode_value_into(
+    tc: &str,
+    value: PyObjectRef,
+    dest: PyObjectRef,
+    key: &str,
+) -> Result<Vec<u8>, crate::PyError> {
+    if tc == "z" && unsafe { pyre_object::is_bytes(value) } {
+        let raw = unsafe { pyre_object::bytesobject::w_bytes_data(value) };
+        let copy = pyre_object::bytesobject::w_bytes_from_bytes(&host_ctypes::null_terminated_bytes(
+            raw,
+        ));
+        // Retain the copy before reading its address, so a GC triggered while
+        // inserting the keepalive cannot leave the stored pointer stale.
+        keep_ref(dest, key, copy);
+        let addr = unsafe { pyre_object::bytesobject::w_bytes_data(copy).as_ptr() } as usize;
+        return Ok(host_ctypes::simple_storage_value_to_bytes_endian(
+            tc,
+            host_ctypes::SimpleStorageValue::Pointer(addr),
+            false,
+        ));
+    }
+    encode_value(tc, value)
+}
+
+/// A `u64` as a non-negative Python integer: an `int` while it fits `i64`, a
+/// `long` above `i64::MAX` so `c_ulonglong` / addresses keep their full range
+/// instead of wrapping to a negative value.
+fn u64_to_pyobject(u: u64) -> PyObjectRef {
+    if u <= i64::MAX as u64 {
+        pyre_object::w_int_new(u as i64)
+    } else {
+        pyre_object::longobject::w_long_new(malachite_bigint::BigInt::from(u))
+    }
+}
+
 /// Turn a decoded scalar into a pyre object.
 pub(super) fn decoded_to_pyobject(d: host_ctypes::DecodedValue) -> PyObjectRef {
     use host_ctypes::DecodedValue as D;
     match d {
         D::Bytes(b) => pyre_object::bytesobject::w_bytes_from_bytes(&b),
         D::Signed(i) => pyre_object::w_int_new(i),
-        // No unsigned-i64 int constructor exists; values above i64::MAX
-        // wrap.  The slice's scalar returns stay within i64 range.
-        D::Unsigned(u) => pyre_object::w_int_new(u as i64),
+        D::Unsigned(u) => u64_to_pyobject(u),
         D::Float(f) => pyre_object::w_float_new(f),
         D::Bool(b) => pyre_object::w_bool_from(b),
-        D::Pointer(p) => pyre_object::w_int_new(p as i64),
+        D::Pointer(p) => u64_to_pyobject(p as u64),
         D::String(s) => pyre_object::w_str_new(&s),
         D::None => pyre_object::w_none(),
     }

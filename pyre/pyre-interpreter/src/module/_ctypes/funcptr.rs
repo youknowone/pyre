@@ -89,7 +89,8 @@ fn cfuncptr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         ));
     }
     let cls = args[0];
-    let (pos, _kwargs) = crate::builtins::split_builtin_kwargs(&args[1..]);
+    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(&args[1..]);
+    reject_kwargs(kwargs)?;
     let addr: usize = match pos.first().copied() {
         None => 0,
         Some(a) if unsafe { pyre_object::is_none(a) } => 0,
@@ -197,8 +198,34 @@ fn argtypes_getter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 }
 
 fn argtypes_setter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    instance_set(args[1], ARGTYPES_KEY, args[2]);
+    let value = args[2];
+    // `_argtypes_` must be a sequence of types; a bare type (`fn.argtypes =
+    // c_int`) or other non-sequence is rejected rather than silently ignored.
+    if !unsafe { pyre_object::is_none(value) } && seq_to_vec(value).is_none() {
+        return Err(crate::PyError::type_error(
+            "argtypes must be a sequence of types",
+        ));
+    }
+    instance_set(args[1], ARGTYPES_KEY, value);
     Ok(pyre_object::w_none())
+}
+
+/// Reject keyword arguments: ctypes foreign calls and `_CFuncPtr(...)` take
+/// only positional arguments, so a stray `fn(x, foo=1)` is an error rather
+/// than a silently dropped `foo`.
+fn reject_kwargs(kwargs: Option<PyObjectRef>) -> Result<(), crate::PyError> {
+    let Some(kw) = kwargs else { return Ok(()) };
+    for (key_obj, _) in unsafe { pyre_object::w_dict_items(kw) } {
+        if unsafe { pyre_object::is_str(key_obj) }
+            && unsafe { pyre_object::w_str_get_value(key_obj) } == "__pyre_kw__"
+        {
+            continue;
+        }
+        return Err(crate::PyError::type_error(
+            "call takes no keyword arguments",
+        ));
+    }
+    Ok(())
 }
 
 // ── call ──────────────────────────────────────────────────────────────
@@ -326,7 +353,8 @@ fn cfuncptr_call(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         return Err(crate::PyError::type_error("__call__ requires self"));
     }
     let self_obj = args[0];
-    let (call_args, _kwargs) = crate::builtins::split_builtin_kwargs(&args[1..]);
+    let (call_args, kwargs) = crate::builtins::split_builtin_kwargs(&args[1..]);
+    reject_kwargs(kwargs)?;
 
     // Marshal arguments into owned scalar data.  `keepalive` owns any
     // null-terminated `bytes` copies that pointer args address; `owned` owns
@@ -344,6 +372,11 @@ fn cfuncptr_call(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                     ))
                 })?;
                 owned.push(marshal_typed_arg(arg, *at, &mut keepalive)?);
+            }
+            // Variadic tail (printf-style): arguments past the declared
+            // argtypes are marshalled by the default conversion rules.
+            for &arg in &call_args[argtypes.len().min(call_args.len())..] {
+                owned.push(marshal_default_arg(arg, &mut keepalive)?);
             }
         }
         None => {
@@ -471,14 +504,14 @@ fn is_aggregate_type(t: PyObjectRef) -> bool {
         .is_some_and(|pf| pf == "struct" || pf == "union")
 }
 
-/// The ordered field types of a struct/union type's `_fields_` (2-tuples only;
-/// bit fields are rejected at class-definition time).
-fn struct_field_types(t: PyObjectRef) -> Result<Vec<PyObjectRef>, crate::PyError> {
-    let fields = unsafe { crate::baseobjspace::lookup_in_type(t, "_fields_") }
-        .ok_or_else(|| crate::PyError::type_error("struct/union type has no '_fields_'"))?;
+/// Append the field types declared in one `_fields_` sequence to `out`
+/// (2-tuples only; bit fields are rejected at class-definition time).
+fn collect_field_types(
+    fields: PyObjectRef,
+    out: &mut Vec<PyObjectRef>,
+) -> Result<(), crate::PyError> {
     let items = seq_to_vec(fields)
         .ok_or_else(|| crate::PyError::type_error("_fields_ must be a sequence"))?;
-    let mut out = Vec::with_capacity(items.len());
     for it in items {
         if !unsafe { pyre_object::is_tuple(it) } {
             return Err(crate::PyError::type_error(
@@ -492,6 +525,32 @@ fn struct_field_types(t: PyObjectRef) -> Result<Vec<PyObjectRef>, crate::PyError
             ));
         }
         out.push(ft);
+    }
+    Ok(())
+}
+
+/// The full, base-first field types of a struct/union type.  A subclass's
+/// `_fields_` lists only its own fields, so the inherited prefix is gathered by
+/// walking the MRO from the least-derived ancestor down to `t`.
+fn struct_field_types(t: PyObjectRef) -> Result<Vec<PyObjectRef>, crate::PyError> {
+    let mro = unsafe { pyre_object::typeobject::w_type_get_mro(t) };
+    if mro.is_null() {
+        return Err(crate::PyError::type_error(
+            "struct/union type has no '_fields_'",
+        ));
+    }
+    let mut out = Vec::new();
+    let mut found = false;
+    for &cls in unsafe { (*mro).as_slice() }.iter().rev() {
+        if let Some(fields) = crate::type_dict_lookup(cls, "_fields_") {
+            found = true;
+            collect_field_types(fields, &mut out)?;
+        }
+    }
+    if !found {
+        return Err(crate::PyError::type_error(
+            "struct/union type has no '_fields_'",
+        ));
     }
     Ok(out)
 }
@@ -588,11 +647,9 @@ fn marshal_typed_arg(
     }
     let tc = cdata::type_code_of(at)
         .ok_or_else(|| crate::PyError::type_error("argtype has no valid '_type_'"))?;
-    let buf: Vec<u8> = if cdata::is_simplecdata_instance(arg) {
-        cdata::cdata_bytes(arg).unwrap_or(&[]).to_vec()
-    } else {
-        cdata::encode_value(&tc, arg)?
-    };
+    // `encode_value` copies a same-typed cdata's bytes and otherwise converts,
+    // so a mismatched cdata cannot be reinterpreted through the wrong argtype.
+    let buf = cdata::encode_value(&tc, arg)?;
     Ok(OwnedArg::Typed(tc, buf))
 }
 

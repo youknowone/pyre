@@ -480,17 +480,36 @@ fn process_fields(cls: PyObjectRef, fields: PyObjectRef, is_union: bool) -> PyRe
     let pack = usize_attr(cls, "_pack_", 0);
     let forced = usize_attr(cls, "_align_", 1).max(1);
 
-    let (mut offset, mut max_align) = match first_base_stginfo(cls) {
+    // Reject before mutating the class: a type already frozen (used as a field
+    // elsewhere) or one that would embed itself by value cannot define fields.
+    // Checking up front keeps a rejected `_fields_` from leaving half-installed
+    // descriptors and a final flag behind.
+    if stginfo::stginfo_of(cls).is_some_and(stginfo::stginfo_is_final)
+        || entries.iter().any(|(_, ft)| *ft == cls)
+    {
+        return Err(crate::PyError::attribute_error(
+            "Structure or union cannot contain itself",
+        ));
+    }
+
+    let (base_size, base_length, mut max_align) = match first_base_stginfo(cls) {
         Some(bi) => (
             stginfo::stginfo_size(bi),
+            stginfo::stginfo_length(bi),
             stginfo::stginfo_align(bi).max(forced),
         ),
-        None => (0usize, forced),
+        None => (0usize, 0usize, forced),
     };
-    let mut union_max = 0usize;
+    // A union inherits its base's footprint as a floor, so a derived union with
+    // only smaller fields cannot shrink below the base; a struct starts laying
+    // its own fields out after the inherited prefix.
+    let mut offset = base_size;
+    let mut union_max = base_size;
     let mut has_pointer = false;
 
-    for (index, (name, ftype)) in entries.iter().enumerate() {
+    // Pass 1 — compute the full layout without touching the class.
+    let mut pending: Vec<(usize, usize, usize)> = Vec::with_capacity(entries.len());
+    for (name, ftype) in &entries {
         let size = stginfo::field_size_of(*ftype)
             .ok_or_else(|| crate::PyError::type_error(format!("field '{name}' has no size")))?;
         let align = stginfo::field_align_of(*ftype).unwrap_or(1).max(1);
@@ -509,11 +528,9 @@ fn process_fields(cls: PyObjectRef, fields: PyObjectRef, is_union: bool) -> PyRe
                 has_pointer = true;
             }
         }
-        mark_type_final(*ftype, size, align);
 
         let field_offset = if is_union { 0 } else { offset };
-        let cf = cfield_new(name, *ftype, field_offset, size, index);
-        set_type_attr(cls, name, cf);
+        pending.push((field_offset, size, align));
 
         if is_union {
             union_max = union_max.max(size);
@@ -530,12 +547,13 @@ fn process_fields(cls: PyObjectRef, fields: PyObjectRef, is_union: bool) -> PyRe
         raw
     };
 
-    if let Some(ci) = stginfo::stginfo_of(cls) {
-        if stginfo::stginfo_is_final(ci) {
-            return Err(crate::PyError::attribute_error(
-                "Structure or union cannot contain itself",
-            ));
-        }
+    // Pass 2 — commit: freeze field types, install `CField` descriptors, then
+    // the class `StgInfo` and `_fields_`.
+    for (index, (name, ftype)) in entries.iter().enumerate() {
+        let (field_offset, size, align) = pending[index];
+        mark_type_final(*ftype, size, align);
+        let cf = cfield_new(name, *ftype, field_offset, size, index);
+        set_type_attr(cls, name, cf);
     }
 
     let mut flags = stginfo::DICTFLAG_FINAL;
@@ -550,7 +568,8 @@ fn process_fields(cls: PyObjectRef, fields: PyObjectRef, is_union: bool) -> PyRe
         total_align,
         if is_union { "union" } else { "struct" },
     );
-    data.length = entries.len();
+    // Field count includes the inherited prefix, not just the own fields.
+    data.length = base_length + entries.len();
     data.flags = flags;
     data.big_endian = is_swapped ^ cfg!(target_endian = "big");
     stginfo::stginfo_set(cls, stginfo::stginfo_new(data));
@@ -737,21 +756,25 @@ fn cfield_set(args: &[PyObjectRef]) -> PyResult {
         "simple" => {
             let tc = cdata::type_code_of(proto)
                 .ok_or_else(|| crate::PyError::type_error("field has no '_type_'"))?;
-            let mut bytes = cdata::encode_value(&tc, value)?;
+            let mut bytes = cdata::encode_value_into(&tc, value, obj, &index.to_string())?;
             if field_needs_swap(obj, proto, size) {
                 bytes.reverse();
             }
             cdata::cdata_write(obj, offset, &bytes);
-            if cdata::is_cdata_instance(value) || unsafe { pyre_object::is_bytes(value) } {
+            if cdata::is_cdata_instance(value) {
                 cdata::keep_ref(obj, &index.to_string(), value);
             }
             Ok(pyre_object::w_none())
         }
-        "struct" | "union" => {
+        // A pointer field stores a pointer-sized value, so a `_Pointer`
+        // instance is copied like a struct/union: its buffer is the address.
+        "struct" | "union" | "pointer" => {
             if !unsafe { crate::baseobjspace::isinstance_w(value, proto) } {
                 return Err(crate::PyError::type_error("incompatible types"));
             }
-            let src = cdata::cdata_bytes(value).unwrap_or(&[]);
+            // Snapshot the source: `s.f = s.f` aliases the destination buffer,
+            // and `cdata_write`'s `copy_from_slice` assumes non-overlap.
+            let src = cdata::cdata_bytes(value).unwrap_or(&[]).to_vec();
             let n = size.min(src.len());
             cdata::cdata_write(obj, offset, &src[..n]);
             cdata::keep_ref(obj, &index.to_string(), value);
@@ -887,12 +910,11 @@ fn type_name(cls: PyObjectRef) -> String {
 
 // ── PyCArrayType + Array ───────────────────────────────────────────────
 
-thread_local! {
-    /// `(element_type, length) → array_type`, the pyre form of the
-    /// `_ctypes._array_type_cache` dict (keyed by type identity + length).
-    static ARRAY_TYPE_CACHE: RefCell<Vec<(PyObjectRef, usize, PyObjectRef)>> =
-        const { RefCell::new(Vec::new()) };
-}
+/// Reserved key under which an element type caches the array types built over
+/// it (`_ctypes._array_type_cache`), an `int`-keyed (by length) dict.  Holding
+/// the cache on the element type's own dict keeps the built array types
+/// GC-traced through the rooted element type rather than an untraced side table.
+const ARRAY_TYPE_CACHE_KEY: &str = "_array_type_cache";
 
 fn carraytype_new(args: &[PyObjectRef]) -> PyResult {
     let cls = crate::builtins::type_descr_new(args)?;
@@ -977,12 +999,17 @@ fn array_init_stginfo(cls: PyObjectRef) -> PyResult {
 
 /// `ctype * n` — cache lookup on `(ctype, n)`, else create `ctype_Array_n`.
 fn array_type_from_ctype(elem: PyObjectRef, n: usize) -> PyResult {
-    if let Some(found) = ARRAY_TYPE_CACHE.with(|c| {
-        c.borrow()
-            .iter()
-            .find(|(t, k, _)| *t == elem && *k == n)
-            .map(|(_, _, ty)| *ty)
-    }) {
+    let cache = match crate::type_dict_lookup(elem, ARRAY_TYPE_CACHE_KEY) {
+        Some(d) => d,
+        None => {
+            let d = pyre_object::w_dict_new();
+            if crate::type_dict_store(elem, ARRAY_TYPE_CACHE_KEY, d) {
+                pyre_object::gc_hook::try_gc_write_barrier(elem as *mut u8);
+            }
+            d
+        }
+    };
+    if let Some(found) = unsafe { pyre_object::w_dict_getitem(cache, n as i64) } {
         return Ok(found);
     }
     let name = format!("{}_Array_{}", type_name(elem), n);
@@ -999,7 +1026,7 @@ fn array_type_from_ctype(elem: PyObjectRef, n: usize) -> PyResult {
         ns,
     ];
     let new_cls = carraytype_new(&args)?;
-    ARRAY_TYPE_CACHE.with(|c| c.borrow_mut().push((elem, n, new_cls)));
+    unsafe { pyre_object::w_dict_setitem(cache, n as i64, new_cls) };
     Ok(new_cls)
 }
 
@@ -1134,9 +1161,9 @@ fn array_set_index(obj: PyObjectRef, meta: &ArrayMeta, idx: usize, value: PyObje
         "simple" => {
             let tc = cdata::type_code_of(meta.proto)
                 .ok_or_else(|| crate::PyError::type_error("element has no '_type_'"))?;
-            let bytes = cdata::encode_value(&tc, value)?;
+            let bytes = cdata::encode_value_into(&tc, value, obj, &idx.to_string())?;
             cdata::cdata_write(obj, offset, &bytes);
-            if cdata::is_cdata_instance(value) || unsafe { pyre_object::is_bytes(value) } {
+            if cdata::is_cdata_instance(value) {
                 cdata::keep_ref(obj, &idx.to_string(), value);
             }
             Ok(pyre_object::w_none())
@@ -1145,7 +1172,9 @@ fn array_set_index(obj: PyObjectRef, meta: &ArrayMeta, idx: usize, value: PyObje
             if !unsafe { crate::baseobjspace::isinstance_w(value, meta.proto) } {
                 return Err(crate::PyError::type_error("incompatible types"));
             }
-            let src = cdata::cdata_bytes(value).unwrap_or(&[]);
+            // Snapshot the source: `a[i] = a[i]` aliases the destination
+            // buffer, and `cdata_write`'s `copy_from_slice` assumes non-overlap.
+            let src = cdata::cdata_bytes(value).unwrap_or(&[]).to_vec();
             let n = meta.element_size.min(src.len());
             cdata::cdata_write(obj, offset, &src[..n]);
             cdata::keep_ref(obj, &idx.to_string(), value);
@@ -1444,7 +1473,7 @@ fn contents_get(args: &[PyObjectRef]) -> PyResult {
         return Err(crate::PyError::value_error("NULL pointer access"));
     }
     let size = stginfo::field_size_of(proto).unwrap_or_else(host_ctypes::pointer_size);
-    Ok(cdata::make_at_address(proto, ptr, size))
+    Ok(cdata::make_at_address(proto, ptr, size, obj))
 }
 
 fn contents_set(args: &[PyObjectRef]) -> PyResult {
@@ -1485,7 +1514,7 @@ fn pointer_getitem(args: &[PyObjectRef]) -> PyResult {
                 &tc, bytes,
             )))
         }
-        _ => Ok(cdata::make_at_address(proto, addr, element_size)),
+        _ => Ok(cdata::make_at_address(proto, addr, element_size, obj)),
     }
 }
 
