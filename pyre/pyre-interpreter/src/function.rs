@@ -2658,9 +2658,8 @@ mod tests {
         );
     }
 
-    /// `FUNCTION_GC_PTR_OFFSETS` must list the five inline
-    /// `PyObjectRef`-shaped fields the GC traces (the four
-    /// `PyObjectRef` payload fields plus `code`, which is `*const ()`
+    /// `FUNCTION_GC_PTR_OFFSETS` must list every inline
+    /// `PyObjectRef`-shaped field the GC traces (`code` is `*const ()`
     /// but points at a `[ob: PyObject, ...]`-prefixed Code object so
     /// the walker can interpret it as a typed reference). If a new GC
     /// field is added to `Function` (or one of these fields is removed)
@@ -2679,6 +2678,8 @@ mod tests {
                 std::mem::offset_of!(Function, w_func_globals_obj),
                 std::mem::offset_of!(Function, w_ann),
                 std::mem::offset_of!(Function, w_annotate),
+                std::mem::offset_of!(Function, w_func_dict),
+                std::mem::offset_of!(Function, w_typeparams),
                 std::mem::offset_of!(Function, w_doc),
                 std::mem::offset_of!(Function, w_qualname),
                 std::mem::offset_of!(Function, w_objclass),
