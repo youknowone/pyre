@@ -657,6 +657,16 @@ pub unsafe fn w_exception_get_args(obj: PyObjectRef) -> PyObjectRef {
     }
 }
 
+/// Raw `args_w` storage for JIT field mirrors.  Unlike
+/// [`w_exception_get_args`], this does not allocate the public tuple view.
+///
+/// # Safety
+/// `obj` must point to a valid `W_BaseException`.
+#[inline]
+pub unsafe fn w_exception_get_args_storage(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const W_BaseException)).args_w }
+}
+
 /// `interp_exceptions.py:123-124 W_BaseException.descr_init` /
 /// `:156-157 descr_setargs` parity —
 ///

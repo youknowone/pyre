@@ -18420,6 +18420,110 @@ fn try_walker_specialize_load_attr(
         return Ok(Some(()));
     }
 
+    if let Some((slot, kind, w_type, version_tag, stored)) = unsafe {
+        pyre_interpreter::baseobjspace::exception_attr_slot_fold(concrete_obj, &name, false)
+    } {
+        if slot == pyre_interpreter::baseobjspace::ExceptionAttrSlot::Args
+            && unsafe { (*(stored as *const pyre_object::listobject::W_ListObject)).strategy }
+                != pyre_object::listobject::ListStrategy::Object
+        {
+            return Ok(None);
+        }
+        walker_guard_exception_attr_slot(ctx, op_pc, obj, concrete_obj, w_type, version_tag)?;
+        let raw_value = crate::state::opimpl_getfield_gc_r(
+            ctx.trace_ctx,
+            obj,
+            crate::descr::w_exception_slot_descr(kind, slot),
+        );
+        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardNonnull, &[raw_value])?;
+        ctx.trace_ctx.set_opref_concrete(
+            raw_value,
+            majit_ir::Value::Ref(majit_ir::GcRef(stored as usize)),
+        );
+        let value = if slot == pyre_interpreter::baseobjspace::ExceptionAttrSlot::Args {
+            let list = unsafe { &*(stored as *const pyre_object::listobject::W_ListObject) };
+            if list.strategy != pyre_object::listobject::ListStrategy::Object {
+                return Ok(None);
+            }
+            let list_type = &pyre_object::LIST_TYPE as *const pyre_object::PyType as i64;
+            if !ctx.trace_ctx.heap_cache().is_class_known(raw_value) {
+                let type_const = ctx.trace_ctx.const_int(list_type);
+                walker_emit_fold_guard_with_snapshot(
+                    ctx,
+                    op_pc,
+                    OpCode::GuardClass,
+                    &[raw_value, type_const],
+                )?;
+                ctx.trace_ctx
+                    .heap_cache_mut()
+                    .class_now_known(raw_value, list_type);
+            }
+            walker_guard_exact_w_class(
+                ctx,
+                op_pc,
+                raw_value,
+                pyre_object::get_instantiate(&pyre_object::LIST_TYPE),
+            )?;
+            let strategy = crate::state::opimpl_getfield_gc_i(
+                ctx.trace_ctx,
+                raw_value,
+                crate::descr::list_strategy_descr(),
+            );
+            let object_strategy = ctx
+                .trace_ctx
+                .const_int(pyre_object::listobject::ListStrategy::Object as i64);
+            walker_emit_fold_guard_with_snapshot(
+                ctx,
+                op_pc,
+                OpCode::GuardValue,
+                &[strategy, object_strategy],
+            )?;
+            let len = unsafe { pyre_object::w_list_len(stored) };
+            let length = crate::state::opimpl_getfield_gc_i(
+                ctx.trace_ctx,
+                raw_value,
+                crate::descr::list_length_descr(),
+            );
+            let len_const = ctx.trace_ctx.const_int(len as i64);
+            walker_emit_fold_guard_with_snapshot(
+                ctx,
+                op_pc,
+                OpCode::GuardValue,
+                &[length, len_const],
+            )?;
+            let block = crate::state::opimpl_getfield_gc_r(
+                ctx.trace_ctx,
+                raw_value,
+                crate::descr::list_items_descr(),
+            );
+            let mut items = Vec::with_capacity(len);
+            let mut concrete_items = Vec::with_capacity(len);
+            for index in 0..len {
+                let index_op = ctx.trace_ctx.const_int(index as i64);
+                items.push(crate::state::trace_items_block_getitem_value(
+                    ctx.trace_ctx,
+                    block,
+                    index_op,
+                ));
+                concrete_items.push(
+                    unsafe { pyre_object::w_list_getitem(stored, index as i64) }
+                        .unwrap_or(pyre_object::PY_NULL),
+                );
+            }
+            let tuple = crate::helpers::emit_object_tuple_inline(ctx.trace_ctx, &items);
+            let concrete_tuple = pyre_object::w_tuple_new(concrete_items);
+            ctx.trace_ctx.set_opref_concrete(
+                tuple,
+                majit_ir::Value::Ref(majit_ir::GcRef(concrete_tuple as usize)),
+            );
+            tuple
+        } else {
+            raw_value
+        };
+        write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, value)?;
+        return Ok(Some(()));
+    }
+
     let Some((w_type, version_tag, map, storageindex, listindex, unbox_type)) = (unsafe {
         pyre_interpreter::objspace::std::mapdict::load_attr_unboxed_fast_path(concrete_obj, &name)
     }) else {
@@ -18491,6 +18595,61 @@ fn try_walker_specialize_load_attr(
     };
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
     Ok(Some(()))
+}
+
+/// Pin every branch input preceding a raw typed exception-slot arm.
+/// `GuardClass` fixes the kind-specific `W_BaseException` layout and kind tag;
+/// `GuardValue(getfield(w_class))` distinguishes heap subclasses sharing that
+/// layout; and the class `version_tag` guard pins the preceding type-dict miss.
+/// Exception `w_dict` lookup follows these arms in `baseobjspace.rs`, so it is
+/// intentionally not part of the guard set.  This is the same promoted-class
+/// lookup shape used by the mapdict folds (`mapdict.py`).
+fn walker_guard_exception_attr_slot(
+    ctx: &mut WalkContext<'_, '_>,
+    op_pc: usize,
+    obj: OpRef,
+    concrete_obj: pyre_object::PyObjectRef,
+    w_type: pyre_object::PyObjectRef,
+    version_tag: u64,
+) -> Result<(), DispatchError> {
+    let physical_type = unsafe { (*concrete_obj).ob_type } as i64;
+    if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
+        let type_const = ctx.trace_ctx.const_int(physical_type);
+        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardClass, &[obj, type_const])?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .class_now_known(obj, physical_type);
+    }
+    let live_w_class =
+        crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, obj, crate::descr::w_class_descr());
+    let w_class_const = ctx.trace_ctx.const_ref(w_type as i64);
+    walker_emit_fold_guard_with_snapshot(
+        ctx,
+        op_pc,
+        OpCode::GuardValue,
+        &[live_w_class, w_class_const],
+    )?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .replace_box(live_w_class, w_class_const);
+
+    let type_const = ctx.trace_ctx.const_ref(w_type as i64);
+    let live_version = crate::state::opimpl_getfield_gc_i(
+        ctx.trace_ctx,
+        type_const,
+        crate::descr::type_version_tag_descr(),
+    );
+    let version_const = ctx.trace_ctx.const_int(version_tag as i64);
+    walker_emit_fold_guard_with_snapshot(
+        ctx,
+        op_pc,
+        OpCode::GuardValue,
+        &[live_version, version_const],
+    )?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .replace_box(live_version, version_const);
+    Ok(())
 }
 
 fn walker_load_name_from_code(w_code_ptr: usize, name_idx: usize) -> Option<String> {
@@ -18736,6 +18895,11 @@ fn try_walker_fold_load_method_self(
 /// the generic residual recorder/executor so concrete execution, body-effect
 /// tracking, and rollback semantics remain identical to the generic setattr
 /// path (mapdict.py:577-584, 615-619).
+enum WalkerStoreAttrSpecialization {
+    Residual(DescrRef, Vec<OpRef>),
+    Direct,
+}
+
 fn try_walker_specialize_store_attr(
     ctx: &mut WalkContext<'_, '_>,
     op_pc: usize,
@@ -18744,7 +18908,7 @@ fn try_walker_specialize_store_attr(
     w_code_ptr: usize,
     name_idx: usize,
     original_effect: &majit_ir::EffectInfo,
-) -> Result<Option<(DescrRef, Vec<OpRef>)>, DispatchError> {
+) -> Result<Option<WalkerStoreAttrSpecialization>, DispatchError> {
     if !ctx.is_authoritative_executor || !ctx.is_full_body_walk {
         return Ok(None);
     }
@@ -18832,10 +18996,144 @@ fn try_walker_specialize_store_attr(
         // ABI order follows the write helpers: receiver and the two guarded green
         // coordinates, then the raw symbolic value in its own bank.  No box is
         // materialized for this write.
-        return Ok(Some((
+        return Ok(Some(WalkerStoreAttrSpecialization::Residual(
             descr,
             vec![helper, obj, storageindex_const, listindex_const, raw],
         )));
+    }
+
+    if let Some((slot, kind, w_type, version_tag, _stored)) = unsafe {
+        pyre_interpreter::baseobjspace::exception_attr_slot_fold(concrete_obj, &name, true)
+    } {
+        if slot == pyre_interpreter::baseobjspace::ExceptionAttrSlot::Args {
+            let tuple_type = &pyre_object::TUPLE_TYPE as *const pyre_object::PyType;
+            let canonical_tuple_class = pyre_object::get_instantiate(&pyre_object::TUPLE_TYPE);
+            if !unsafe {
+                std::ptr::eq((*concrete_value).ob_type, tuple_type)
+                    && std::ptr::eq((*concrete_value).w_class, canonical_tuple_class)
+            } {
+                return Ok(None);
+            }
+        }
+        walker_guard_exception_attr_slot(ctx, op_pc, obj, concrete_obj, w_type, version_tag)?;
+        let (stored_value, concrete_stored) =
+            if slot == pyre_interpreter::baseobjspace::ExceptionAttrSlot::Args {
+                let tuple_type = &pyre_object::TUPLE_TYPE as *const pyre_object::PyType;
+                let canonical_tuple_class = pyre_object::get_instantiate(&pyre_object::TUPLE_TYPE);
+                if !unsafe {
+                    std::ptr::eq((*concrete_value).ob_type, tuple_type)
+                        && std::ptr::eq((*concrete_value).w_class, canonical_tuple_class)
+                } {
+                    return Ok(None);
+                }
+                let tuple_type_addr = tuple_type as i64;
+                if !ctx.trace_ctx.heap_cache().is_class_known(value) {
+                    let type_const = ctx.trace_ctx.const_int(tuple_type_addr);
+                    walker_emit_fold_guard_with_snapshot(
+                        ctx,
+                        op_pc,
+                        OpCode::GuardClass,
+                        &[value, type_const],
+                    )?;
+                    ctx.trace_ctx
+                        .heap_cache_mut()
+                        .class_now_known(value, tuple_type_addr);
+                }
+                walker_guard_exact_w_class(ctx, op_pc, value, canonical_tuple_class)?;
+                let block = crate::state::opimpl_getfield_gc_r(
+                    ctx.trace_ctx,
+                    value,
+                    crate::descr::tuple_wrappeditems_descr(),
+                );
+                let len = unsafe { pyre_object::w_tuple_len(concrete_value) };
+                let length = crate::state::opimpl_arraylen_gc(
+                    ctx.trace_ctx,
+                    block,
+                    crate::state::pyobject_gcarray_descr(),
+                );
+                let len_const = ctx.trace_ctx.const_int(len as i64);
+                walker_emit_fold_guard_with_snapshot(
+                    ctx,
+                    op_pc,
+                    OpCode::GuardValue,
+                    &[length, len_const],
+                )?;
+                let mut items = Vec::with_capacity(len);
+                let mut concrete_items = Vec::with_capacity(len);
+                for index in 0..len {
+                    let index_op = ctx.trace_ctx.const_int(index as i64);
+                    items.push(crate::state::trace_items_block_getitem_value(
+                        ctx.trace_ctx,
+                        block,
+                        index_op,
+                    ));
+                    concrete_items.push(
+                        unsafe { pyre_object::w_tuple_getitem(concrete_value, index as i64) }
+                            .unwrap_or(pyre_object::PY_NULL),
+                    );
+                }
+                let list = crate::helpers::emit_object_list_inline(ctx.trace_ctx, &items);
+                let concrete_list = pyre_object::w_list_new_object(concrete_items);
+                ctx.trace_ctx.set_opref_concrete(
+                    list,
+                    majit_ir::Value::Ref(majit_ir::GcRef(concrete_list as usize)),
+                );
+                (list, concrete_list)
+            } else {
+                (value, concrete_value)
+            };
+        let field_descr = crate::descr::w_exception_slot_descr(kind, slot);
+        let field_index = field_descr.index();
+        ctx.trace_ctx
+            .record_op_with_descr(OpCode::SetfieldGc, &[obj, stored_value], field_descr);
+        ctx.trace_ctx
+            .heapcache_setfield_cached(obj, field_index, stored_value);
+        // The walk is the authoritative execution path.  Apply the same raw
+        // slot writer now so interpreter execution after a side exit observes
+        // the store; the writer supplies the host-side remembered-set barrier.
+        // Compiled SetfieldGc reference stores receive CondCallGcWb from
+        // majit-gc's rewrite pass, consumed by both dynasm and cranelift.
+        unsafe {
+            match slot {
+                pyre_interpreter::baseobjspace::ExceptionAttrSlot::Args => {
+                    pyre_object::interp_exceptions::w_exception_set_args(
+                        concrete_obj,
+                        concrete_stored,
+                    )
+                }
+                pyre_interpreter::baseobjspace::ExceptionAttrSlot::Code => {
+                    pyre_object::interp_exceptions::w_exception_set_code(
+                        concrete_obj,
+                        concrete_value,
+                    )
+                }
+                pyre_interpreter::baseobjspace::ExceptionAttrSlot::Errno => {
+                    pyre_object::interp_exceptions::w_exception_set_errno(
+                        concrete_obj,
+                        concrete_value,
+                    )
+                }
+                pyre_interpreter::baseobjspace::ExceptionAttrSlot::Strerror => {
+                    pyre_object::interp_exceptions::w_exception_set_strerror(
+                        concrete_obj,
+                        concrete_value,
+                    )
+                }
+                pyre_interpreter::baseobjspace::ExceptionAttrSlot::Filename => {
+                    pyre_object::interp_exceptions::w_exception_set_filename(
+                        concrete_obj,
+                        concrete_value,
+                    )
+                }
+                pyre_interpreter::baseobjspace::ExceptionAttrSlot::Filename2 => {
+                    pyre_object::interp_exceptions::w_exception_set_filename2(
+                        concrete_obj,
+                        concrete_value,
+                    )
+                }
+            }
+        }
+        return Ok(Some(WalkerStoreAttrSpecialization::Direct));
     }
 
     let Some((w_type, version_tag, map, storageindex)) = (unsafe {
@@ -18868,7 +19166,10 @@ fn try_walker_specialize_store_attr(
     // ABI order follows `jit_mapdict_boxed_write`: receiver, guarded green
     // storage index, and the original symbolic object reference.  The value is
     // neither unboxed nor guarded by type.
-    Ok(Some((descr, vec![helper, obj, storageindex_const, value])))
+    Ok(Some(WalkerStoreAttrSpecialization::Residual(
+        descr,
+        vec![helper, obj, storageindex_const, value],
+    )))
 }
 
 /// Walker-native mirror of the trait `trace_guard_exact_w_class`
@@ -22444,19 +22745,27 @@ fn dispatch_residual_call_iIRd_kind(
                 ctx.trace_ctx.box_value(code_opref),
                 ctx.trace_ctx.box_value(namei_opref),
             ) {
-                if let Some((specialized_descr, specialized_allboxes)) =
-                    try_walker_specialize_store_attr(
-                        ctx,
-                        op.pc,
-                        obj_opref,
-                        value_opref,
-                        w_code_ptr,
-                        namei as usize,
-                        original_call_descr.get_extra_info(),
-                    )?
-                {
-                    descr = specialized_descr;
-                    allboxes = specialized_allboxes;
+                if let Some(specialization) = try_walker_specialize_store_attr(
+                    ctx,
+                    op.pc,
+                    obj_opref,
+                    value_opref,
+                    w_code_ptr,
+                    namei as usize,
+                    original_call_descr.get_extra_info(),
+                )? {
+                    match specialization {
+                        WalkerStoreAttrSpecialization::Residual(
+                            specialized_descr,
+                            specialized_allboxes,
+                        ) => {
+                            descr = specialized_descr;
+                            allboxes = specialized_allboxes;
+                        }
+                        WalkerStoreAttrSpecialization::Direct => {
+                            return Ok((DispatchOutcome::Continue, op.next_pc));
+                        }
+                    }
                 }
             }
         }

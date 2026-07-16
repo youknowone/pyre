@@ -1143,6 +1143,42 @@ pub fn emit_object_list_inline(ctx: &mut TraceCtx, items: &[OpRef]) -> OpRef {
     list
 }
 
+/// Trace-visible canonical `W_TupleObject` construction from boxed items.
+/// This is the allocation half of `W_BaseException.descr_getargs`: the raw
+/// `args_w` list is copied into a fresh tuple on every public attribute read.
+pub fn emit_object_tuple_inline(ctx: &mut TraceCtx, items: &[OpRef]) -> OpRef {
+    use crate::state::pyobject_gcarray_descr;
+
+    let len = ctx.const_int(items.len() as i64);
+    let array_descr = pyobject_gcarray_descr();
+    let items_block = ctx.record_op_with_descr(OpCode::NewArrayClear, &[len], array_descr.clone());
+    ctx.heap_cache_mut().new_array(items_block, len, true);
+    for (index, &item) in items.iter().enumerate() {
+        let index = ctx.const_int(index as i64);
+        crate::state::trace_items_block_setitem_value(ctx, items_block, index, item);
+    }
+
+    let tuple = ctx.record_op_with_descr(
+        OpCode::NewWithVtable,
+        &[],
+        crate::descr::w_tuple_size_descr(),
+    );
+    ctx.heap_cache_mut().new_object(tuple);
+    let w_class = pyre_object::get_instantiate(&pyre_object::TUPLE_TYPE);
+    let w_class = ctx.const_ref(w_class as i64);
+    let class_descr = crate::descr::tuple_w_class_descr();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[tuple, w_class], class_descr.clone());
+    ctx.heapcache_setfield_cached(tuple, class_descr.index(), w_class);
+    let items_descr = crate::descr::tuple_wrappeditems_descr();
+    ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[tuple, items_block],
+        items_descr.clone(),
+    );
+    ctx.heapcache_setfield_cached(tuple, items_descr.index(), items_block);
+    tuple
+}
+
 /// Emit inline Integer / Float-strategy `W_ListObject` creation: a typed
 /// length-prefixed backing block (`NewArray` + per-element `SetarrayitemGc`)
 /// holding the already-unboxed machine values in `raws`, then the

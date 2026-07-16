@@ -2403,6 +2403,29 @@ pub fn w_exception_context_descr(kind: ExcKind) -> DescrRef {
     field_descr_from_group(group, 3)
 }
 
+/// Cached field descriptor for a raw reference slot selected by the
+/// exception attribute fold.  Indices are those of `build_w_exception_group`;
+/// no parallel descriptor is constructed.
+pub fn w_exception_slot_descr(
+    kind: ExcKind,
+    slot: pyre_interpreter::baseobjspace::ExceptionAttrSlot,
+) -> DescrRef {
+    let idx = kind as u8 as usize;
+    let mut cache = W_BASE_EXCEPTION_DESCR_CACHE.lock().unwrap();
+    if cache[idx].is_none() {
+        cache[idx] = Some(build_w_exception_group(kind));
+    }
+    let field_index = match slot {
+        pyre_interpreter::baseobjspace::ExceptionAttrSlot::Args => 2,
+        pyre_interpreter::baseobjspace::ExceptionAttrSlot::Errno => 11,
+        pyre_interpreter::baseobjspace::ExceptionAttrSlot::Strerror => 12,
+        pyre_interpreter::baseobjspace::ExceptionAttrSlot::Filename => 13,
+        pyre_interpreter::baseobjspace::ExceptionAttrSlot::Filename2 => 14,
+        pyre_interpreter::baseobjspace::ExceptionAttrSlot::Code => 15,
+    };
+    field_descr_from_group(cache[idx].as_ref().unwrap(), field_index)
+}
+
 /// Field descr for `ExecutionContext::sys_exc_value`, used by the JIT
 /// lowering of PUSH_EXC_INFO / POP_EXCEPT to GETFIELD_GC_R / SETFIELD_GC.
 ///

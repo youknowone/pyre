@@ -7992,6 +7992,138 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
     Err(raiseattrerror(obj, name))
 }
 
+/// A direct `W_BaseException` reference slot whose hard-coded getattr/setattr
+/// arm has no value conversion on the selected branch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExceptionAttrSlot {
+    Args,
+    Code,
+    Errno,
+    Strerror,
+    Filename,
+    Filename2,
+}
+
+/// Ingredients for the full-body walker's mirror of the typed exception-slot
+/// attribute arms.  This helper deliberately lives beside `getattr_str_impl`
+/// and `object_setattr`, whose branch order it audits.
+///
+/// PyPy exposes these fields through `readwrite_attrproperty_w` in
+/// `interp_exceptions.py`; `GetSetProperty.descr_property_get/set` in
+/// `typedef.py` reaches the tiny slot accessor.  Pyre's equivalent arms run
+/// only after the receiver type lookup.  Therefore a class-dict hit (a user
+/// property or plain shadowing value) declines, while the returned nonzero
+/// version tag lets the JIT pin that miss.  The exception instance dictionary
+/// is consulted only after these whitelisted arms, so it is not a branch input
+/// and must not shadow them.
+///
+/// `GuardClass` on the returned kind-specific `ob_type` pins the `ExcKind`;
+/// heap exception subclasses share that physical layout, so callers must also
+/// guard the exact `w_class` and its version tag.  Loads select only a concrete
+/// non-NULL slot, pinning the stored-value branch instead of the `args_w`
+/// fallback.  `args` returns the raw `args_w` storage as an ingredient only;
+/// the walker must preserve `fixedview` on stores and allocate the public
+/// tuple view on loads, so it declines shapes it cannot decompose safely.
+pub unsafe fn exception_attr_slot_fold(
+    obj: PyObjectRef,
+    name: &str,
+    is_store: bool,
+) -> Option<(
+    ExceptionAttrSlot,
+    pyre_object::interp_exceptions::ExcKind,
+    PyObjectRef,
+    u64,
+    PyObjectRef,
+)> {
+    if !unsafe { pyre_object::is_exception(obj) } {
+        return None;
+    }
+    let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
+    let slot = match name {
+        "args" => ExceptionAttrSlot::Args,
+        "code" if kind == pyre_object::interp_exceptions::ExcKind::SystemExit => {
+            ExceptionAttrSlot::Code
+        }
+        "errno"
+            if matches!(
+                kind,
+                pyre_object::interp_exceptions::ExcKind::OSError
+                    | pyre_object::interp_exceptions::ExcKind::FileNotFoundError
+            ) =>
+        {
+            ExceptionAttrSlot::Errno
+        }
+        "strerror"
+            if matches!(
+                kind,
+                pyre_object::interp_exceptions::ExcKind::OSError
+                    | pyre_object::interp_exceptions::ExcKind::FileNotFoundError
+            ) =>
+        {
+            ExceptionAttrSlot::Strerror
+        }
+        "filename"
+            if matches!(
+                kind,
+                pyre_object::interp_exceptions::ExcKind::OSError
+                    | pyre_object::interp_exceptions::ExcKind::FileNotFoundError
+            ) =>
+        {
+            ExceptionAttrSlot::Filename
+        }
+        "filename2"
+            if matches!(
+                kind,
+                pyre_object::interp_exceptions::ExcKind::OSError
+                    | pyre_object::interp_exceptions::ExcKind::FileNotFoundError
+            ) =>
+        {
+            ExceptionAttrSlot::Filename2
+        }
+        _ => return None,
+    };
+    let w_type = crate::typedef::r#type(obj)?;
+    // Any hit precedes the hard-coded exception arm.  The version-tag guard
+    // below pins this miss across later heap-subclass mutations.
+    if unsafe { lookup_in_type_where(w_type, name) }.is_some() {
+        return None;
+    }
+    let version_tag = unsafe { w_type_version_tag(w_type) };
+    if version_tag == 0 {
+        return None;
+    }
+    let stored = unsafe {
+        match slot {
+            ExceptionAttrSlot::Args => {
+                pyre_object::interp_exceptions::w_exception_get_args_storage(obj)
+            }
+            ExceptionAttrSlot::Code => pyre_object::interp_exceptions::w_exception_get_code(obj),
+            ExceptionAttrSlot::Errno => pyre_object::interp_exceptions::w_exception_get_errno(obj),
+            ExceptionAttrSlot::Strerror => {
+                pyre_object::interp_exceptions::w_exception_get_strerror(obj)
+            }
+            ExceptionAttrSlot::Filename => {
+                pyre_object::interp_exceptions::w_exception_get_filename(obj)
+            }
+            ExceptionAttrSlot::Filename2 => {
+                pyre_object::interp_exceptions::w_exception_get_filename2(obj)
+            }
+        }
+    };
+    if !is_store {
+        if stored.is_null() {
+            return None;
+        }
+        // `w_exception_get_args` accepts a legacy tuple-backed slot, but the
+        // walker decomposition below reads `W_ListObject` fields and therefore
+        // only mirrors the canonical list storage produced by current setters.
+        if slot == ExceptionAttrSlot::Args && !unsafe { pyre_object::is_list(stored) } {
+            return None;
+        }
+    }
+    Some((slot, kind, w_type, version_tag, stored))
+}
+
 /// `pypy/module/exceptions/interp_exceptions.py:156-157
 /// W_BaseException.descr_setargs` parity helper:
 ///
