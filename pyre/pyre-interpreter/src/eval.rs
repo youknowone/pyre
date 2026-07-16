@@ -10,9 +10,8 @@ use crate::{
     ArithmeticOpcodeHandler, BranchOpcodeHandler, ConstantOpcodeHandler, ControlFlowOpcodeHandler,
     IterOpcodeHandler, LocalOpcodeHandler, NamespaceOpcodeHandler, OpcodeStepExecutor, PyError,
     PyErrorKind, PyResult, SharedOpcodeHandler, StackOpcodeHandler, StepResult, TruthOpcodeHandler,
-    build_list_from_refs, build_map_from_refs, build_tuple_from_refs,
-    decode_instruction_forward, ensure_range_iter, execute_opcode_step, stack_underflow_error,
-    unpack_sequence_exact,
+    build_list_from_refs, build_map_from_refs, build_tuple_from_refs, decode_instruction_forward,
+    ensure_range_iter, execute_opcode_step, stack_underflow_error, unpack_sequence_exact,
 };
 use pyre_object::*;
 
