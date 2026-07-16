@@ -21275,39 +21275,17 @@ fn try_walker_trace_exception_new(
         return Ok(None);
     }
 
-    // Decide the runtime `args_w` list strategy and extract typed payloads
-    // before the concrete constructor can allocate.  The shared typed-list
-    // emitter reproduces `w_list_new`'s Integer layout, allowing the common
-    // `SystemExit(i)` shape to virtualize alongside message-bearing Object
-    // lists.  Other strategies retain the safe residual fallback.
+    // Decide the final runtime `args_w` list strategy and extract typed
+    // payloads.  OSError can rebind the list after parsing a filename, so its
+    // final slice is selected below after the concrete constructor exposes the
+    // value-dependent branch result.  The shared typed-list emitter reproduces
+    // `w_list_new`'s Integer layout, allowing the common `SystemExit(i)` shape
+    // to virtualize alongside message-bearing Object lists.  Other strategies
+    // retain the safe residual fallback.
     enum ArgsEmit {
         Object,
         Int(Vec<i64>),
     }
-    let args_emit = match pyre_object::listobject::list_strategy_for(&concrete_args) {
-        pyre_object::listobject::ListStrategy::Object => ArgsEmit::Object,
-        pyre_object::listobject::ListStrategy::Integer => {
-            let int_ty = &pyre_object::pyobject::INT_TYPE as *const pyre_object::pyobject::PyType;
-            let mut values = Vec::with_capacity(concrete_args.len());
-            for &arg in &concrete_args {
-                if pyre_object::tagged_int::CAN_BE_TAGGED
-                    && pyre_object::tagged_int::is_tagged_int(arg)
-                {
-                    return Ok(None);
-                }
-                let exact_int = unsafe {
-                    pyre_object::is_plain_int1(arg) && std::ptr::eq((*arg).ob_type, int_ty)
-                };
-                if !exact_int {
-                    return Ok(None);
-                }
-                values.push(unsafe { pyre_object::w_int_get_value(arg) });
-            }
-            ArgsEmit::Int(values)
-        }
-        pyre_object::listobject::ListStrategy::Empty
-        | pyre_object::listobject::ListStrategy::Float => return Ok(None),
-    };
 
     let is_canonical = pyre_object::interp_exceptions::is_canonical_exc_class(concrete_callable);
     let mut subclass_lookups = None;
@@ -21411,11 +21389,97 @@ fn try_walker_trace_exception_new(
     ) {
         return Ok(None);
     }
-    // Kinds whose `descr_init` stores extra fields (OSError errno /
-    // strerror / filename; Unicode errors' object / start / end / reason
-    // / encoding) cannot be rebuilt from kind / w_class / args_w alone.
-    if !kind.has_trivial_args_constructor() {
+    let is_os_error_family = matches!(
+        kind,
+        pyre_object::interp_exceptions::ExcKind::OSError
+            | pyre_object::interp_exceptions::ExcKind::FileNotFoundError
+    );
+    // `W_OSError._parse_init_args` / `_init_error`
+    // (`interp_exceptions.py`) fill the flattened slots only for 2..=5
+    // arguments.  Outside that range the ordinary args-only emit is exact.
+    // Unicode constructors still require their dedicated parsing and remain
+    // residual.
+    let fills_os_error_slots = is_os_error_family && (2..=5).contains(&args.len());
+    if !kind.has_trivial_args_constructor() && !is_os_error_family {
         return Ok(None);
+    }
+
+    let exact_os_error = pyre_interpreter::builtins::lookup_exc_class("OSError")
+        .is_some_and(|w_os_error| std::ptr::eq(concrete_callable, w_os_error));
+    if fills_os_error_slots && exact_os_error {
+        // PyPy traces the errno-to-subclass lookup with a loop-variant errno.
+        // The flat NewWithVtable emit needs a constant w_class, so pinning the
+        // unboxed errno deliberately creates per-errno traces/bridges.
+        let errno = concrete_args[0];
+        let exact_int = pyre_object::tagged_int::CAN_BE_TAGGED
+            && pyre_object::tagged_int::is_tagged_int(errno)
+            || unsafe {
+                pyre_object::is_plain_int1(errno)
+                    && std::ptr::eq(
+                        (*errno).ob_type,
+                        &pyre_object::pyobject::INT_TYPE as *const _,
+                    )
+            };
+        if !exact_int {
+            return Ok(None);
+        }
+    }
+
+    let concrete_w_class = unsafe { (*exc).w_class };
+    let is_blocking_io_error = pyre_interpreter::builtins::lookup_exc_class("BlockingIOError")
+        .is_some_and(|blocking| std::ptr::eq(concrete_w_class, blocking));
+    // `W_OSError._init_error` gives an exact BlockingIOError's numeric third
+    // argument the characters_written meaning.  Keep every three-or-more-arg
+    // instance of that concrete class on the complete runtime path.
+    if fills_os_error_slots && args.len() >= 3 && is_blocking_io_error {
+        return Ok(None);
+    }
+
+    let has_filename = fills_os_error_slots
+        && args.len() >= 3
+        && !unsafe { pyre_object::is_none(concrete_args[2]) };
+    let final_args_len = if has_filename { 2 } else { args.len() };
+    let final_args = &args[..final_args_len];
+    let final_concrete_args = &concrete_args[..final_args_len];
+    let args_emit = match pyre_object::listobject::list_strategy_for(final_concrete_args) {
+        pyre_object::listobject::ListStrategy::Object => ArgsEmit::Object,
+        pyre_object::listobject::ListStrategy::Integer => {
+            let int_ty = &pyre_object::pyobject::INT_TYPE as *const pyre_object::pyobject::PyType;
+            let mut values = Vec::with_capacity(final_concrete_args.len());
+            for &arg in final_concrete_args {
+                if pyre_object::tagged_int::CAN_BE_TAGGED
+                    && pyre_object::tagged_int::is_tagged_int(arg)
+                {
+                    return Ok(None);
+                }
+                let exact_int = unsafe {
+                    pyre_object::is_plain_int1(arg) && std::ptr::eq((*arg).ob_type, int_ty)
+                };
+                if !exact_int {
+                    return Ok(None);
+                }
+                values.push(unsafe { pyre_object::w_int_get_value(arg) });
+            }
+            ArgsEmit::Int(values)
+        }
+        pyre_object::listobject::ListStrategy::Empty
+        | pyre_object::listobject::ListStrategy::Float => return Ok(None),
+    };
+
+    // GuardClass pins each None-sensitive `_init_error` branch.  A tagged
+    // immediate cannot be consumed by GuardClass; retain the residual path for
+    // that uncommon filename shape.
+    if fills_os_error_slots {
+        for index in [2usize, 4] {
+            if index >= args.len() || (index == 4 && args.len() != 5) {
+                continue;
+            }
+            if pyre_object::tagged_int::CAN_BE_TAGGED
+                && pyre_object::tagged_int::is_tagged_int(concrete_args[index])
+            {
+                return Ok(None);
+            }
+        }
     }
     // --- commit to the specialization: emit IR (no further declines) ---
     // Pin the callable identity so the trace-time kind / vtable stay
@@ -21453,14 +21517,51 @@ fn try_walker_trace_exception_new(
             .replace_box(live_version, version_const);
     }
 
+    if fills_os_error_slots && exact_os_error {
+        let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+        let raw_errno = walker_unbox_int(ctx, op.pc, args[0], int_type_addr)?;
+        let errno_value = unsafe { pyre_object::w_int_get_value(concrete_args[0]) };
+        let errno_const = ctx.trace_ctx.const_int(errno_value);
+        walker_emit_fold_guard_with_snapshot(
+            ctx,
+            op.pc,
+            OpCode::GuardValue,
+            &[raw_errno, errno_const],
+        )?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(raw_errno, errno_const);
+    }
+    if fills_os_error_slots {
+        for index in [2usize, 4] {
+            if index >= args.len() || (index == 4 && args.len() != 5) {
+                continue;
+            }
+            let arg = args[index];
+            if !ctx.trace_ctx.heap_cache().is_class_known(arg) {
+                let physical_type = unsafe { (*concrete_args[index]).ob_type } as i64;
+                let type_const = ctx.trace_ctx.const_int(physical_type);
+                walker_emit_fold_guard_with_snapshot(
+                    ctx,
+                    op.pc,
+                    OpCode::GuardClass,
+                    &[arg, type_const],
+                )?;
+                ctx.trace_ctx
+                    .heap_cache_mut()
+                    .class_now_known(arg, physical_type);
+            }
+        }
+    }
+
     // Build `args_w` inline so its wrapper and backing block virtualize
     // alongside the exception.
     let args_list = match args_emit {
-        ArgsEmit::Object => crate::helpers::emit_object_list_inline(ctx.trace_ctx, args),
+        ArgsEmit::Object => crate::helpers::emit_object_list_inline(ctx.trace_ctx, final_args),
         ArgsEmit::Int(values) => {
             let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-            let mut raws = Vec::with_capacity(args.len());
-            for (&arg, value) in args.iter().zip(values) {
+            let mut raws = Vec::with_capacity(final_args.len());
+            for (&arg, value) in final_args.iter().zip(values) {
                 let raw = walker_unbox_int(ctx, op.pc, arg, int_type_addr)?;
                 ctx.trace_ctx
                     .set_opref_concrete(raw, majit_ir::Value::Int(value));
@@ -21476,9 +21577,57 @@ fn try_walker_trace_exception_new(
             )
         }
     };
+    // A raised exception can keep args_w live through the execution-context
+    // slot, forcing the otherwise-virtual list.  Stamp the canonical list
+    // class just as w_list_new does so that materialization preserves the
+    // `space.type(args_w) is list` branch used by descr_getargs.
+    let list_w_class = pyre_object::get_instantiate(&pyre_object::pyobject::LIST_TYPE);
+    let list_w_class = ctx.trace_ctx.const_ref(list_w_class as i64);
+    let list_w_class_descr = crate::descr::list_w_class_descr();
+    let list_w_class_index = list_w_class_descr.index();
+    ctx.trace_ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[args_list, list_w_class],
+        list_w_class_descr,
+    );
+    ctx.trace_ctx
+        .heapcache_setfield_cached(args_list, list_w_class_index, list_w_class);
 
+    // `W_OSError.descr_new` can retag exact OSError by errno while retaining
+    // the OSError physical kind.  The guarded errno makes the concrete final
+    // class a valid constant; dedicated classes and subclasses keep the called
+    // class operand as in the ordinary constructor emit.
+    let emitted_w_class = if fills_os_error_slots && exact_os_error {
+        ctx.trace_ctx.const_ref(concrete_w_class as i64)
+    } else {
+        callable_op
+    };
     let new_op =
-        crate::helpers::emit_exception_new_inline(ctx.trace_ctx, kind, callable_op, args_list);
+        crate::helpers::emit_exception_new_inline(ctx.trace_ctx, kind, emitted_w_class, args_list);
+
+    if fills_os_error_slots {
+        use pyre_interpreter::baseobjspace::ExceptionAttrSlot;
+        let mut stores = vec![
+            (ExceptionAttrSlot::Errno, args[0]),
+            (ExceptionAttrSlot::Strerror, args[1]),
+        ];
+        if has_filename {
+            stores.push((ExceptionAttrSlot::Filename, args[2]));
+            // The fourth positional argument is winerror and is ignored on
+            // non-Windows builds, matching W_OSError._parse_init_args.
+            if args.len() == 5 && !unsafe { pyre_object::is_none(concrete_args[4]) } {
+                stores.push((ExceptionAttrSlot::Filename2, args[4]));
+            }
+        }
+        for (slot, value) in stores {
+            let descr = crate::descr::w_exception_slot_descr(kind, slot);
+            let descr_index = descr.index();
+            ctx.trace_ctx
+                .record_op_with_descr(OpCode::SetfieldGc, &[new_op, value], descr);
+            ctx.trace_ctx
+                .heapcache_setfield_cached(new_op, descr_index, value);
+        }
+    }
 
     // Mark the class known so the following `raise/r` skips its
     // redundant GUARD_CLASS (mirrors `seed_raised_exception`'s

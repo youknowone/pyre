@@ -1097,6 +1097,19 @@ static W_LIST_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
                 false,
             ),
+            // The inline list emit can escape through an exception's args_w
+            // slot and be materialized.  Track the inherited Python class in
+            // the same parent group as tuple objects so its SetfieldGc is a
+            // proper virtual field and materialization reproduces w_list_new.
+            (
+                "PyObject.w_class",
+                pyre_object::pyobject::W_CLASS_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
         ],
         "W_ListObject",
         "listobject::W_ListObject",
@@ -1964,6 +1977,10 @@ pub fn list_int_items_block_descr() -> DescrRef {
 /// (`float_gcarray_descr`) for `GetarrayitemGcF` / `SetarrayitemGc`.
 pub fn list_float_items_block_descr() -> DescrRef {
     field_descr_from_group(&W_LIST_DESCR_GROUP, 6)
+}
+
+pub fn list_w_class_descr() -> DescrRef {
+    field_descr_from_group(&W_LIST_DESCR_GROUP, 7)
 }
 
 /// `Ptr(GcArray(OBJECTPTR))` — `wrappeditems` body per
