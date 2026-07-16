@@ -21207,9 +21207,9 @@ fn try_walker_orthodox_list_append_opcode(
     Ok(Some(()))
 }
 
-/// B3 (`PYRE_FBW_RAISE`): walker-native port of the trait's
-/// [`try_trace_exception_new`] (`trace_opcode.rs:7228`).  A `Type(args)`
-/// `CallFn` residual for a *canonical* builtin exception class becomes a
+/// B3 (`PYRE_FBW_RAISE`): walker-native exception-construction fold.  A
+/// `Type(args)` `CallFn` residual for a canonical builtin exception class or
+/// a heap subclass with the same `__new__` / `__init__` descriptors becomes a
 /// traced `NewWithVtable` + `SetfieldGc` (kind / w_class / args_w) the
 /// optimizer can virtualize when the exception never escapes, instead of
 /// the opaque `bh_call_fn` constructor residual + its
@@ -21223,10 +21223,16 @@ fn try_walker_orthodox_list_append_opcode(
 /// fast path; writes the trace-time concrete exception into the dst
 /// shadow so the `raise/r` GUARD_CLASS reads it.
 ///
-/// Returns `None` (fall through to the generic residual) for any
-/// non-matching shape: a user subclass (whose `__init__` may run Python
-/// code), a non-trivial-args kind (OSError / Unicode errors store extra
-/// fields), or a null concrete arg.
+/// PyPy's `W_TypeObject.descr_call` promotes the class, then resolves
+/// `__new__` and `__init__` through its versioned MRO
+/// (`typeobject.py:703-735`).  When both resolve to
+/// `W_BaseException.descr_new` / `descr_init`
+/// (`interp_exceptions.py:76-126`), a trivial subclass has the same traced
+/// allocation and `args_w` store as its builtin base; only `w_class` differs.
+///
+/// Returns `None` (fall through to the generic residual) for any non-matching
+/// shape: an overriding or uncacheable subclass, a non-trivial-args kind
+/// (OSError / Unicode errors store extra fields), or a null concrete arg.
 fn try_walker_trace_exception_new(
     ctx: &mut WalkContext<'_, '_>,
     code: &[u8],
@@ -21268,12 +21274,92 @@ fn try_walker_trace_exception_new(
     if !is_exc_class || concrete_args.iter().any(|a| a.is_null()) {
         return Ok(None);
     }
-    // Reject user subclasses: their Python `__init__` would run
-    // concretely an extra time per trace attempt (a user-visible side
-    // effect).  Canonical per-kind classes have a pure Rust `descr_init`.
-    if !pyre_object::interp_exceptions::is_canonical_exc_class(concrete_callable) {
-        return Ok(None);
+
+    // Decide the runtime `args_w` list strategy and extract typed payloads
+    // before the concrete constructor can allocate.  The shared typed-list
+    // emitter reproduces `w_list_new`'s Integer layout, allowing the common
+    // `SystemExit(i)` shape to virtualize alongside message-bearing Object
+    // lists.  Other strategies retain the safe residual fallback.
+    enum ArgsEmit {
+        Object,
+        Int(Vec<i64>),
     }
+    let args_emit = match pyre_object::listobject::list_strategy_for(&concrete_args) {
+        pyre_object::listobject::ListStrategy::Object => ArgsEmit::Object,
+        pyre_object::listobject::ListStrategy::Integer => {
+            let int_ty = &pyre_object::pyobject::INT_TYPE as *const pyre_object::pyobject::PyType;
+            let mut values = Vec::with_capacity(concrete_args.len());
+            for &arg in &concrete_args {
+                if pyre_object::tagged_int::CAN_BE_TAGGED
+                    && pyre_object::tagged_int::is_tagged_int(arg)
+                {
+                    return Ok(None);
+                }
+                let exact_int = unsafe {
+                    pyre_object::is_plain_int1(arg) && std::ptr::eq((*arg).ob_type, int_ty)
+                };
+                if !exact_int {
+                    return Ok(None);
+                }
+                values.push(unsafe { pyre_object::w_int_get_value(arg) });
+            }
+            ArgsEmit::Int(values)
+        }
+        pyre_object::listobject::ListStrategy::Empty
+        | pyre_object::listobject::ListStrategy::Float => return Ok(None),
+    };
+
+    let is_canonical = pyre_object::interp_exceptions::is_canonical_exc_class(concrete_callable);
+    let mut subclass_lookups = None;
+    let subclass_version_tag = if is_canonical {
+        None
+    } else {
+        // A heap subclass is safe to construct concretely only after both MRO
+        // lookups have been proved identical to a canonical exception class.
+        // Consequently force_plain_eval below can execute only the builtin
+        // Rust `descr_new` / `descr_init`, never user Python code.  This is the
+        // promoted-class lookup contract of typeobject.py:703-735.
+        if !unsafe { pyre_object::typeobject::w_type_is_heaptype(concrete_callable) } {
+            return Ok(None);
+        }
+        let version_tag =
+            unsafe { pyre_object::typeobject::w_type_get_version_tag(concrete_callable) };
+        if version_tag == 0 {
+            return Ok(None);
+        }
+        let Some(class_new) = (unsafe {
+            pyre_interpreter::baseobjspace::lookup_in_type(concrete_callable, "__new__")
+        }) else {
+            return Ok(None);
+        };
+        let Some(class_init) = (unsafe {
+            pyre_interpreter::baseobjspace::lookup_in_type(concrete_callable, "__init__")
+        }) else {
+            return Ok(None);
+        };
+        let matches_canonical = (0..pyre_object::interp_exceptions::EXC_KIND_COUNT).any(|disc| {
+            // ExcKind is repr(u8) with contiguous discriminants through
+            // EXC_KIND_COUNT, as required by the kind-indexed registry.
+            let candidate_kind: pyre_object::interp_exceptions::ExcKind =
+                unsafe { std::mem::transmute(disc as u8) };
+            let candidate =
+                pyre_object::interp_exceptions::lookup_exc_class_for_kind(candidate_kind);
+            if candidate.is_null() {
+                return false;
+            }
+            unsafe {
+                pyre_interpreter::baseobjspace::lookup_in_type(candidate, "__new__")
+                    == Some(class_new)
+                    && pyre_interpreter::baseobjspace::lookup_in_type(candidate, "__init__")
+                        == Some(class_init)
+            }
+        });
+        if !matches_canonical {
+            return Ok(None);
+        }
+        subclass_lookups = Some((class_new, class_init));
+        Some(version_tag)
+    };
     // Build the exception concretely on the plain eval loop (no tracer
     // re-entry) to read its kind and confirm a flat builtin instance.
     // Trace-time only; discarded after the read.
@@ -21288,9 +21374,41 @@ fn try_walker_trace_exception_new(
         }
         pyre_object::interp_exceptions::w_exception_get_kind(exc)
     };
-    // Only the canonical per-kind builtin class maps to the flat
-    // NewWithVtable layout.
-    if pyre_object::interp_exceptions::lookup_exc_class_for_kind(kind) != concrete_callable {
+    let canonical_class = pyre_object::interp_exceptions::lookup_exc_class_for_kind(kind);
+    if is_canonical {
+        // Preserve the canonical arm's registry identity check.
+        if canonical_class != concrete_callable {
+            return Ok(None);
+        }
+    } else {
+        // The pre-construction descriptor check excludes Python execution;
+        // repeat it for the concrete result's eventual kind so aliases whose
+        // builtin wrapper produces a different physical kind still decline.
+        let Some((class_new, class_init)) = subclass_lookups else {
+            return Ok(None);
+        };
+        if canonical_class.is_null()
+            || unsafe {
+                pyre_interpreter::baseobjspace::lookup_in_type(canonical_class, "__new__")
+                    != Some(class_new)
+                    || pyre_interpreter::baseobjspace::lookup_in_type(canonical_class, "__init__")
+                        != Some(class_init)
+            }
+        {
+            return Ok(None);
+        }
+    }
+    // `exc_new_wrapper` retags only `w_class`; the physical layout remains
+    // the eventual kind's builtin pytype for canonical classes and subclasses.
+    let exc_type_ptr = unsafe {
+        (*(exc as *const pyre_object::interp_exceptions::W_BaseException))
+            .ob_header
+            .ob_type
+    };
+    if !std::ptr::eq(
+        exc_type_ptr,
+        pyre_object::interp_exceptions::exc_kind_to_pytype(kind),
+    ) {
         return Ok(None);
     }
     // Kinds whose `descr_init` stores extra fields (OSError errno /
@@ -21299,19 +21417,6 @@ fn try_walker_trace_exception_new(
     if !kind.has_trivial_args_constructor() {
         return Ok(None);
     }
-    // The walker builds `args_w` inline only for the Object strategy (the
-    // whole list virtualizes alongside the exception).  Empty / Integer /
-    // Float strategies would need a residual `trace_build_list` (a fresh
-    // may-force) the walker has no helper for, so decline them BEFORE
-    // emitting any IR — they fall through to the generic constructor
-    // residual (SAFE, just unoptimized).  `ValueError("msg")` and the
-    // common message-bearing builtins use the Object strategy.
-    if pyre_object::listobject::list_strategy_for(&concrete_args)
-        != pyre_object::listobject::ListStrategy::Object
-    {
-        return Ok(None);
-    }
-
     // --- commit to the specialization: emit IR (no further declines) ---
     // Pin the callable identity so the trace-time kind / vtable stay
     // valid across iterations (`implement_guard_value`).
@@ -21325,10 +21430,52 @@ fn try_walker_trace_exception_new(
             .heap_cache_mut()
             .replace_box(callable_op, expected);
     }
+    if let Some(version_tag) = subclass_version_tag {
+        // Guard the promoted class version that made both MRO descriptor
+        // identities constant.  `W_TypeObject.mutated` recursively changes
+        // subclass tags (`typeobject.py:266-291`), so mutating this class or a
+        // base side-exits before reusing the folded constructor.
+        let class_const = ctx.trace_ctx.const_ref(concrete_callable as i64);
+        let live_version = crate::state::opimpl_getfield_gc_i(
+            ctx.trace_ctx,
+            class_const,
+            crate::descr::type_version_tag_descr(),
+        );
+        let version_const = ctx.trace_ctx.const_int(version_tag as i64);
+        walker_emit_fold_guard_with_snapshot(
+            ctx,
+            op.pc,
+            OpCode::GuardValue,
+            &[live_version, version_const],
+        )?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(live_version, version_const);
+    }
 
-    // Build `args_w` inline (Object strategy) so the whole list
-    // (W_ListObject + ItemsBlock) virtualizes alongside the exception.
-    let args_list = crate::helpers::emit_object_list_inline(ctx.trace_ctx, args);
+    // Build `args_w` inline so its wrapper and backing block virtualize
+    // alongside the exception.
+    let args_list = match args_emit {
+        ArgsEmit::Object => crate::helpers::emit_object_list_inline(ctx.trace_ctx, args),
+        ArgsEmit::Int(values) => {
+            let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+            let mut raws = Vec::with_capacity(args.len());
+            for (&arg, value) in args.iter().zip(values) {
+                let raw = walker_unbox_int(ctx, op.pc, arg, int_type_addr)?;
+                ctx.trace_ctx
+                    .set_opref_concrete(raw, majit_ir::Value::Int(value));
+                raws.push(raw);
+            }
+            crate::helpers::emit_typed_list_inline(
+                ctx.trace_ctx,
+                &raws,
+                crate::state::int_gcarray_descr(),
+                crate::descr::list_int_items_len_descr(),
+                crate::descr::list_int_items_block_descr(),
+                pyre_object::listobject::ListStrategy::Integer,
+            )
+        }
+    };
 
     let new_op =
         crate::helpers::emit_exception_new_inline(ctx.trace_ctx, kind, callable_op, args_list);
@@ -21338,14 +21485,9 @@ fn try_walker_trace_exception_new(
     // `heapcache.class_now_known`).  The vtable on the NewWithVtable
     // already pins the class for the optimizer; this keeps the heapcache
     // model in agreement.
-    let exc_class_ptr = unsafe {
-        (*(exc as *const pyre_object::interp_exceptions::W_BaseException))
-            .ob_header
-            .ob_type
-    };
     ctx.trace_ctx
         .heap_cache_mut()
-        .class_now_known(new_op, exc_class_ptr as usize as i64);
+        .class_now_known(new_op, exc_type_ptr as usize as i64);
 
     // Record the fresh instance so a following `RaiseVarargs` recovers
     // the concrete and takes the instance fast path; stamp the dst shadow
