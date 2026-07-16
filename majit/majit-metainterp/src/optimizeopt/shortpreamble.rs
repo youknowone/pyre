@@ -2711,14 +2711,27 @@ impl ExtendedShortPreambleBuilder {
                 jump_args.push(target.to_opref());
                 jump_args_operand.push(target.clone());
             } else {
-                // Unmapped Phase 1 jump arg (no rename): resolve the Phase-2
-                // producer registered at this position — the inlined short box
-                // op or the label inputarg — so the emitted JUMP keeps the
-                // producer binding while `short_jump_args` stores only positions.
+                // Unmapped Phase 1 jump arg (no rename): keep the STATIC short
+                // preamble position in `short_jump_args`. That position is
+                // exactly the replay key that `inline_short_preamble` registers
+                // in `mapping` (`mapping[sp_op.pos] = new_ref`, unroll.rs:3963)
+                // or a seeded short-inputarg — mirroring RPython where
+                // `short_jump_args = short[-1].getarglist()` references the same
+                // Box identities as the short-op results (unroll.py:374).
+                // Applying `get_box_replacement` here would diverge that
+                // identity: under the tagged-int flip a loop-carried raw-Int
+                // jump arg (e.g. IntOp(36)) box-forwards to its Phase-2
+                // SameAsI alias (IntOp(247)), which is neither a replay key nor
+                // a seeded inputarg, so `_map_args` (unroll.rs force loop) then
+                // reads an unmapped key and panics. Forwarding is applied later,
+                // AFTER the mapping lookup, via `get_replacement_opref` — the
+                // orthodox `get_box_replacement(mapping[box])` order. Keep the
+                // resolved operand only for the emitted JUMP sentinel's producer
+                // binding.
                 let operand = ctx
                     .get_box_replacement_operand_opt(*arg)
                     .unwrap_or_else(|| ctx.materialize_operand_at(*arg));
-                jump_args.push(operand.to_opref());
+                jump_args.push(*arg);
                 jump_args_operand.push(operand);
             }
         }
