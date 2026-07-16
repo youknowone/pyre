@@ -2759,6 +2759,24 @@ impl<M: Clone> MetaInterp<M> {
         self.result_type
     }
 
+    /// `call.py:46-47` `jd.index = idx; self.jitdrivers_sd.append(jd)` —
+    /// register a real portal `JitDriverStaticData` (greens/reds/virtualizable
+    /// + `portal_runner_adr`) so `compile_tmp_callback` / `do_recursive_call`
+    /// have a populated slot.  Wraps
+    /// [`MetaInterpStaticData::register_jitdriver_sd`] with the disjoint
+    /// `staticdata`/`backend` field borrow (mirrors `set_result_type`) so the
+    /// `finish_setup_descrs_for_jitdrivers` tail sees the backend half.
+    pub fn register_jitdriver_sd(&mut self, jd: crate::jitdriver::JitDriverStaticData) -> usize {
+        let Self {
+            staticdata,
+            backend,
+            ..
+        } = self;
+        let sd = std::sync::Arc::get_mut(staticdata)
+            .expect("register_jitdriver_sd: staticdata has other owners");
+        sd.register_jitdriver_sd(jd, backend)
+    }
+
     /// pyjitpl.py:2289 / descr.py:25-47 parity: take back all_descrs from
     /// optimizer after compilation. Optimizer.ensure_descr_index() assigns
     /// sequential descr_index during collect_optimizer_knowledge_for_resume().
@@ -13510,6 +13528,65 @@ impl<M: Clone> MetaInterp<M> {
         // pyjitpl.py:3604-3608 return vablebox per jd.index_of_virtualizable.
         let vablebox = vable_index.and_then(|idx| args.get(idx).map(|(_, opref, _)| *opref));
         (vablebox, Some(op_ref))
+    }
+
+    /// Walker-side analog of [`Self::direct_assembler_call`]'s token branch
+    /// (pyjitpl.py:3597-3599, warmstate.py:714-723): resolve — or synthesise
+    /// via `compile_tmp_callback` — the CALL_ASSEMBLER token number for a
+    /// recursive callee whose own loop has not finished compiling.  Returns the
+    /// token number to key the backend target on, or `None` when the real
+    /// portal driver is unregistered (cutover off) or `compile_tmp_callback`
+    /// fails.
+    ///
+    /// `greenboxes` carries the portal greens in `build_portal_calldescr`
+    /// declaration order (`[next_instr, is_being_profiled, pycode]`);
+    /// `red_arg_types` the reds (`[frame, ec]` → `[Ref, Ref]`).
+    pub fn get_or_make_portal_assembler_token_number(
+        &mut self,
+        green_key: u64,
+        greenboxes: &[Value],
+        red_arg_types: &[Type],
+    ) -> Option<u64> {
+        // The real portal driver has greens; the empty
+        // `ensure_default_driver_sd` placeholder (jitdrivers_sd[0]) has none.
+        let idx = self
+            .staticdata
+            .jitdrivers_sd
+            .iter()
+            .position(|jd| jd.num_greens() > 0)?;
+        let target_sd = self.staticdata.jitdrivers_sd.get(idx).cloned()?;
+        // `compile.py:187` parity: an already-compiled loop token wins.
+        if let Some(arc) = self.get_loop_token_arc(green_key) {
+            return Some(arc.number);
+        }
+        // warmstate.py:714-723 — cell has no procedure_token yet, so synthesise
+        // one via `compile_tmp_callback`.  Reuse an already-allocated pending
+        // token number when present so the backend's pending-target registry
+        // stays consistent.
+        let token_number = self
+            .get_pending_token_number(green_key)
+            .unwrap_or_else(|| self.warm_state.alloc_token_number());
+        let backend = &mut self.backend;
+        match self.warm_state.get_assembler_token(green_key, || {
+            compile::compile_tmp_callback(
+                backend,
+                &target_sd,
+                token_number,
+                green_key,
+                greenboxes,
+                red_arg_types,
+            )
+        }) {
+            Ok(token) => Some(token.number),
+            Err(err) => {
+                if crate::majit_log_enabled() {
+                    eprintln!(
+                        "[jit][walker-ca] compile_tmp_callback failed for key={green_key}: {err:?}"
+                    );
+                }
+                None
+            }
+        }
     }
 
     /// pyjitpl.py:3317-3335 `MetaInterp.vable_and_vrefs_before_residual_call`.

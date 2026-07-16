@@ -2693,6 +2693,24 @@ thread_local! {
     static JIT_DRIVER: UnsafeCell<Option<JitDriverPair>> = const { UnsafeCell::new(None) };
 }
 
+/// Gate for the full-portal recursive-call cutover — the PyPy tmp-token
+/// CALL_ASSEMBLER path (`warmstate.py:714-723 get_assembler_token` +
+/// `compile.py:1101-1150 compile_tmp_callback`) that replaces pyre's local
+/// pending-token / `CA_FORCE_FN` mechanism.  Default OFF while the migration
+/// lands slice by slice; `PYRE_FBW_REC_MUTUAL_CUTOVER=1` opts in.
+pub(crate) fn rec_mutual_cutover_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(
+        || match std::env::var_os("PYRE_FBW_REC_MUTUAL_CUTOVER") {
+            Some(v) => {
+                let v = v.to_string_lossy();
+                v != "0" && !v.eq_ignore_ascii_case("false")
+            }
+            None => false,
+        },
+    )
+}
+
 fn build_jit_driver_pair() -> JitDriverPair {
     let info = build_pyframe_virtualizable_info();
     let mut d = JitDriver::new(JIT_THRESHOLD);
@@ -2770,6 +2788,21 @@ fn build_jit_driver_pair() -> JitDriverPair {
     // warmspot.py:449 — jd.result_type = getkind(portal.getreturnvar().concretetype)[0]
     // PyPy dispatch() returns W_Root → Ref.
     d.set_result_type(majit_ir::Type::Ref);
+    // Full-portal cutover (gated, PYRE_FBW_REC_MUTUAL_CUTOVER): register the
+    // real portal `JitDriverStaticData` so `get_assembler_token` /
+    // `compile_tmp_callback` (warmstate.py:714-723, compile.py:1101-1150) have
+    // a slot with `portal_runner_adr` + `portal_calldescr` populated.
+    // Production otherwise carries only the empty `ensure_default_driver_sd`
+    // placeholder (jitdrivers_sd[0], adr=0); this pushes the greens/reds portal
+    // schema at index 1+ per the documented `register_jitdriver_sd` contract.
+    // warmspot.py:1010-1012 `jd.portal_runner_adr = adr_of(ll_portal_runner)`.
+    if rec_mutual_cutover_enabled() {
+        let mut jd = PyreJitState::pypyjit_driver_descriptor();
+        jd.result_type = majit_ir::Type::Ref;
+        jd.virtualizable_info = Some(info.clone());
+        jd.portal_runner_adr = crate::call_jit::ll_portal_runner_shim as *const () as i64;
+        d.meta_interp_mut().register_jitdriver_sd(jd);
+    }
     // rlib/jit.py:842 set_user_param — the translation-time `--jit STR`
     // option's analog. `PYRE_JIT="vec_all=1"` opts vectorization in the
     // PyPy way (parameter; the defaults stay off). `PYRE_JIT=0` keeps its

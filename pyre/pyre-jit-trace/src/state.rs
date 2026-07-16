@@ -4969,8 +4969,13 @@ pub(crate) fn opimpl_virtual_ref_finish(ctx: &mut TraceCtx, sym: &mut PyreSym, v
 
 impl PyreJitState {
     /// Canonical PyPy portal driver layout from `interp_jit.py:67-74`.
-    #[cfg_attr(not(test), allow(dead_code))]
-    fn pypyjit_driver_descriptor() -> JitDriverStaticData {
+    ///
+    /// Single source of truth for the portal greens/reds/virtualizable shape:
+    /// used both trace-locally (`driver_descriptor` for merge-point payload
+    /// validation) and by the production driver registration in
+    /// `build_jit_driver_pair`, so the `portal_calldescr` ABI stays consistent
+    /// with the descriptor the walker validates against.
+    pub fn pypyjit_driver_descriptor() -> JitDriverStaticData {
         let mut descriptor = JitDriverStaticData::with_virtualizable(
             vec![
                 ("next_instr", Type::Int),

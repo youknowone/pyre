@@ -612,13 +612,20 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
     if let Some(raw_local0) = pending {
         return jit_force_self_recursive_call_raw_1(frame_ptr, raw_local0);
     }
-    // Nursery-safe force: read code/namespace/exec_ctx via raw offsets
-    // (valid for both arena PyFrame AND nursery-allocated raw blocks).
-    // Then create a proper PyFrame for the interpreter.
-    //
-    // warmspot.py:1021 assembler_call_helper parity: the callee frame
-    // (deadframe) may be a nursery-allocated JitFrame-like block. We
-    // reconstruct a proper interpreter frame from its raw fields.
+    portal_runner_from_raw_frame_ptr(frame_ptr)
+}
+
+/// warmspot.py:941-959 `ll_portal_runner` core — reconstruct a proper
+/// interpreter frame from a raw JitFrame-like block pointer and run it
+/// through the portal.
+///
+/// Nursery-safe force: read code/namespace/exec_ctx via raw offsets (valid
+/// for both arena `PyFrame` AND nursery-allocated raw blocks), build a proper
+/// `PyFrame`, then hand it to `portal_runner` (`maybe_compile_and_run` +
+/// interpreter main loop; ContinueRunningNormally re-enters the JIT via the
+/// portal, warmspot.py:961-983). The callee frame may be a nursery-allocated
+/// JitFrame-like block, so the fields are recovered from raw offsets.
+fn portal_runner_from_raw_frame_ptr(frame_ptr: i64) -> i64 {
     let (code, w_globals, exec_ctx) = unsafe {
         use pyre_interpreter::pyframe::*;
         let p = frame_ptr as *const u8;
@@ -631,16 +638,41 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
     let mut func_frame = PyFrame::new_for_call_with_globals_obj(code, &[], w_globals, exec_ctx);
     func_frame.fix_array_ptrs();
 
-    // warmspot.py:1021-1028 assembler_call_helper:
-    //   fail_descr.handle_fail(deadframe, metainterp_sd, jd)
-    //   except JitException as e: return handle_jitexception(e)
-    //
-    // handle_jitexception (warmspot.py:961) handles ContinueRunningNormally
-    // by calling portal_ptr(*args) — the JIT-aware portal. RPython does
-    // NOT prevent JIT re-entry here. The callee can enter compiled code
-    // through maybe_compile_and_run in the portal runner.
     let result = crate::eval::portal_runner(&mut func_frame);
 
+    // warmspot.py:449 result_type=REF: always boxed Ref
+    result as i64
+}
+
+/// warmspot.py:941-959 `ll_portal_runner` — the raw-address portal entry whose
+/// address is stored in `jd.portal_runner_adr` (warmspot.py:1010-1012) and
+/// called by the synthetic callback loop that `compile_tmp_callback`
+/// (compile.py:1125-1132) builds for a not-yet-compiled recursive callee.
+///
+/// The call uses the `jd.portal_calldescr` ABI —
+/// `JitDriverStaticData::build_portal_calldescr` lays the args out in `vars`
+/// declaration order: greens `[next_instr, is_being_profiled, pycode]` then
+/// reds `[frame, ec]`. The callee `frame` red already carries `pycode` /
+/// `next_instr` baked in by the caller that built it, so only the frame
+/// pointer is needed to resume; the greens are consumed implicitly through the
+/// reconstructed frame, matching the frame-only `assembler_call_helper` entry.
+#[majit_macros::jit_may_force]
+pub extern "C" fn ll_portal_runner_shim(
+    _next_instr: i64,
+    _is_being_profiled: i64,
+    _pycode: i64,
+    frame_ptr: i64,
+    _ec: i64,
+) -> i64 {
+    // The callback loop `compile_tmp_callback` builds (compile.py:1125-1132)
+    // passes the callee `frame` red that `emit_new_pyframe_inline_with_params`
+    // constructed — a proper `PyFrame` with `locals_cells_stack_w` already
+    // populated (NewWithVtable + SetfieldGc).  Run it directly; the greens
+    // (`next_instr` / `pycode`) are redundant because the frame carries them.
+    // (Contrast `jit_force_callee_frame`, whose CA_FORCE_FN deadframe is a raw
+    // JitFrame-like block that must be reconstructed with fresh fields.)
+    let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
+    let result = crate::eval::portal_runner(frame);
     // warmspot.py:449 result_type=REF: always boxed Ref
     result as i64
 }
