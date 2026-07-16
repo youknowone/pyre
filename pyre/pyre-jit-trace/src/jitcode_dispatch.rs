@@ -21545,17 +21545,31 @@ fn try_walker_specialize_for_iter_next(
     // guard_class W_IntRangeIterator, unless the operand is already known.
     let range_iter_type_addr = &pyre_object::functional::RANGE_ITER_TYPE as *const _ as i64;
     if !iter_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(iter_op) {
-        let guard_fail_index = ctx.trace_ctx.num_guards() as u32;
         let type_const = ctx.trace_ctx.const_int(range_iter_type_addr);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardClass, &[iter_op, type_const], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
-        // `handle_fail` receives only the compiled guard's synthesized
-        // FailDescr. Keep this trace's guard ordinal with the corresponding
-        // FOR_ITER loop key so its failure can demote the specialization.
-        if let Some(green_key) = range_green_key {
-            crate::trace::record_range_foriter_specialization(green_key, guard_fail_index);
+        // Pre-mint the guard's FailDescr tagged with this FOR_ITER green key
+        // so its runtime failure — a definitive polymorphism witness —
+        // demotes the specialization by descr identity, independent of the
+        // guard's per-trace fail index.  `store_final_boxes_in_guard`
+        // preserves an existing ResumeGuardDescr (only refreshing
+        // fail_arg_types), so the tag survives optimizer guard-folding and
+        // unroll; a copied guard chases `prev` to this donor.  With no green
+        // key available (e.g. inline sub-walk) the guard is untagged and the
+        // site is simply never demoted, matching the prior behavior.
+        match range_green_key {
+            Some(green_key) => {
+                let descr = majit_metainterp::make_resume_guard_descr_range_foriter(green_key);
+                ctx.trace_ctx.record_guard_with_descr(
+                    OpCode::GuardClass,
+                    &[iter_op, type_const],
+                    descr,
+                );
+            }
+            None => {
+                ctx.trace_ctx
+                    .record_guard(OpCode::GuardClass, &[iter_op, type_const], 0);
+            }
         }
+        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
     }
     ctx.trace_ctx
         .heap_cache_mut()

@@ -253,6 +253,13 @@ pub struct ResumeGuardDescr {
     /// reclaimed by the owning crate.  `OnceLock` so the registration
     /// is idempotent across re-attach.
     pub bridge_dispatch_drop_fn: OnceLock<unsafe fn(*mut ())>,
+    /// Pyre-only: FOR_ITER green key protected by a walker-native range
+    /// class guard.  `handle_fail` reads it off the failing descr
+    /// (`Descr::range_foriter_green_key`) to demote the range
+    /// specialization on the first class mismatch, so the demotion no
+    /// longer depends on the guard's per-trace fail index.  `0` = not a
+    /// range guard.
+    pub range_foriter_key: AtomicU64,
 }
 
 // Safety: single-threaded JIT (RPython GIL parity).
@@ -271,6 +278,12 @@ impl Descr for ResumeGuardDescr {
     }
     fn is_resume_guard(&self) -> bool {
         true
+    }
+    fn range_foriter_green_key(&self) -> Option<u64> {
+        match self.range_foriter_key.load(Ordering::Relaxed) {
+            0 => None,
+            key => Some(key),
+        }
     }
     /// compile.py:844-846: ResumeGuardDescr.clone()
     fn clone_descr(&self) -> Option<DescrRef> {
@@ -298,6 +311,9 @@ impl Descr for ResumeGuardDescr {
             bridge_body_ptr_cache: Box::new(AtomicUsize::new(0)),
             bridge_dispatch_cell: AtomicPtr::new(std::ptr::null_mut()),
             bridge_dispatch_drop_fn: OnceLock::new(),
+            // The clone guards the same range site; preserve the tag so a
+            // cloned range class guard still demotes on failure.
+            range_foriter_key: AtomicU64::new(self.range_foriter_key.load(Ordering::Relaxed)),
         }))
     }
 }
@@ -571,6 +587,7 @@ pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
         bridge_body_ptr_cache: Box::new(AtomicUsize::new(0)),
         bridge_dispatch_cell: AtomicPtr::new(std::ptr::null_mut()),
         bridge_dispatch_drop_fn: OnceLock::new(),
+        range_foriter_key: AtomicU64::new(0),
     })
 }
 

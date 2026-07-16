@@ -5179,7 +5179,7 @@ fn handle_fail(
     frame: &mut PyFrame,
     green_key: u64,
     _trace_id: u64,
-    fail_index: u32,
+    _fail_index: u32,
     descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
     should_bridge: bool,
     _owning_key: u64,
@@ -5189,11 +5189,16 @@ fn handle_fail(
     _info: &majit_metainterp::virtualizable::VirtualizableInfo,
 ) -> HandleFailOutcome {
     // The range FOR_ITER `GuardClass(RANGE_ITER)` proves its own site
-    // polymorphic on the first failure.  Demote before `should_bridge` can
-    // spend another retrace-limit cycle trying to close a bridge at the same
-    // failing loop header; blackhole resumes this invocation without the
-    // invalidated compiled loop.
-    if pyre_jit_trace::trace::range_foriter_guard_failed(green_key, fail_index) {
+    // polymorphic on the first failure.  The failing descr carries the
+    // FOR_ITER green key it protects (`range_foriter_green_key`), stamped
+    // when the guard was minted, so the demotion is keyed on descr identity
+    // rather than a per-trace fail index the optimizer can shift.  Demote
+    // before `should_bridge` can spend another retrace-limit cycle trying to
+    // close a bridge at the same failing loop header; blackhole resumes this
+    // invocation without the invalidated compiled loop.
+    if descr_arc.range_foriter_green_key().is_some()
+        && pyre_jit_trace::trace::range_foriter_demote_once(green_key)
+    {
         let (driver, _) = driver_pair();
         driver.invalidate_loop(green_key);
         // This is an intentional replacement, unlike ordinary

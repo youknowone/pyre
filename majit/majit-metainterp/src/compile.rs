@@ -3000,6 +3000,7 @@ pub fn make_fail_descr_with_index(fail_index: u32, num_live: usize) -> DescrRef 
         bridge_body_ptr_cache: Box::new(AtomicUsize::new(0)),
         bridge_dispatch_cell: AtomicPtr::new(std::ptr::null_mut()),
         bridge_dispatch_drop_fn: OnceLock::new(),
+        range_foriter_key: AtomicU64::new(0),
     })
 }
 
@@ -3091,7 +3092,27 @@ pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
         bridge_body_ptr_cache: Box::new(AtomicUsize::new(0)),
         bridge_dispatch_cell: AtomicPtr::new(std::ptr::null_mut()),
         bridge_dispatch_drop_fn: OnceLock::new(),
+        range_foriter_key: AtomicU64::new(0),
     })
+}
+
+/// `make_resume_guard_descr_typed` variant that tags the descr with the
+/// FOR_ITER `green_key` its walker-native range class guard protects.
+/// `handle_fail` reads the tag (`Descr::range_foriter_green_key`) off the
+/// failing descr to demote the range specialization on the first class
+/// mismatch, so the demotion no longer depends on the guard's per-trace
+/// fail index (which optimizer guard-folding / unroll can shift).  Types
+/// start empty; `store_final_boxes_in_guard` fills them from numbering
+/// while preserving this descr (its `op.getdescr().is_some()` arm).
+pub fn make_resume_guard_descr_range_foriter(green_key: u64) -> DescrRef {
+    let descr = make_resume_guard_descr_typed(Vec::new());
+    descr
+        .as_any()
+        .and_then(|any| any.downcast_ref::<ResumeGuardDescr>())
+        .expect("make_resume_guard_descr_typed constructs a ResumeGuardDescr")
+        .range_foriter_key
+        .store(green_key, Ordering::Relaxed);
+    descr
 }
 
 /// compile.py:892: ResumeAtPositionDescr(ResumeGuardDescr) — subclass
@@ -3351,6 +3372,7 @@ pub fn make_resume_at_position_descr_typed(types: Vec<Type>) -> DescrRef {
             bridge_body_ptr_cache: Box::new(AtomicUsize::new(0)),
             bridge_dispatch_cell: AtomicPtr::new(std::ptr::null_mut()),
             bridge_dispatch_drop_fn: OnceLock::new(),
+            range_foriter_key: AtomicU64::new(0),
         },
     })
 }
@@ -3617,6 +3639,7 @@ pub fn make_resume_guard_forced_descr_typed(types: Vec<Type>) -> DescrRef {
             bridge_body_ptr_cache: Box::new(AtomicUsize::new(0)),
             bridge_dispatch_cell: AtomicPtr::new(std::ptr::null_mut()),
             bridge_dispatch_drop_fn: OnceLock::new(),
+            range_foriter_key: AtomicU64::new(0),
         },
     })
 }
@@ -3867,6 +3890,7 @@ pub fn make_resume_guard_exc_descr_typed(types: Vec<Type>) -> DescrRef {
             bridge_body_ptr_cache: Box::new(AtomicUsize::new(0)),
             bridge_dispatch_cell: AtomicPtr::new(std::ptr::null_mut()),
             bridge_dispatch_drop_fn: OnceLock::new(),
+            range_foriter_key: AtomicU64::new(0),
         },
     })
 }
@@ -4826,6 +4850,7 @@ impl majit_ir::Descr for CompileLoopVersionDescr {
                 bridge_body_ptr_cache: Box::new(AtomicUsize::new(0)),
                 bridge_dispatch_cell: AtomicPtr::new(std::ptr::null_mut()),
                 bridge_dispatch_drop_fn: OnceLock::new(),
+                range_foriter_key: AtomicU64::new(0),
             },
         }))
     }
@@ -5045,6 +5070,7 @@ fn make_compile_loop_version_descr_with_payload(types: Vec<Type>, payload: RdPay
             bridge_body_ptr_cache: Box::new(AtomicUsize::new(0)),
             bridge_dispatch_cell: AtomicPtr::new(std::ptr::null_mut()),
             bridge_dispatch_drop_fn: OnceLock::new(),
+            range_foriter_key: AtomicU64::new(0),
         },
     })
 }
@@ -5509,6 +5535,7 @@ mod fail_descr_tests {
                 bridge_body_ptr_cache: Box::new(AtomicUsize::new(0)),
                 bridge_dispatch_cell: AtomicPtr::new(std::ptr::null_mut()),
                 bridge_dispatch_drop_fn: OnceLock::new(),
+                range_foriter_key: AtomicU64::new(0),
             },
         }) as DescrRef;
         let lv_fi = lv.index();

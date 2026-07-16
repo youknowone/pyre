@@ -105,17 +105,12 @@ thread_local! {
     /// FOR_ITER green keys whose range-only specialization observed a class
     /// mismatch.  This gates only the specialization; the full-body walk must
     /// still retrace and compile its generic residual.
-    static RANGE_FORITER_DEMOTED: std::cell::RefCell<std::collections::HashSet<u64>> =
-        std::cell::RefCell::new(std::collections::HashSet::new());
-    /// Current per-trace fail index for each walker-emitted range-iterator
-    /// class guard, keyed by its FOR_ITER green key. A retrace replaces the
-    /// prior ordinal for that key.
     ///
     /// This is deliberately per-thread, like `FBW_DECLINED_KEYS` and the JIT
     /// driver itself.  A guard failure proves polymorphism only for the
     /// executing thread's trace; no cross-thread mutable JIT state is needed.
-    static RANGE_FORITER_SPECIALIZED_GUARDS: std::cell::RefCell<std::collections::HashMap<u64, u32>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
+    static RANGE_FORITER_DEMOTED: std::cell::RefCell<std::collections::HashSet<u64>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
 }
 
 pub(crate) fn fbw_declined(key: u64) -> bool {
@@ -132,36 +127,16 @@ pub(crate) fn range_foriter_demoted(key: u64) -> bool {
     RANGE_FORITER_DEMOTED.with(|s| s.borrow().contains(&key))
 }
 
-/// Record the current trace's range FOR_ITER class guard ordinal.
+/// Demote a range FOR_ITER site on the first failure of its class guard —
+/// a definitive polymorphism witness.
 ///
-/// A retrace overwrites any stale ordinal for the same green key. A range key
-/// can cease being a range site only through this guard's class-mismatch
-/// demotion, after which a lingering entry is harmless because the key is
-/// already demoted. Thus a non-range body guard from an earlier trace cannot
-/// be mistaken for the range specialization without pre-stamping its descr.
-pub(crate) fn record_range_foriter_specialization(green_key: u64, fail_index: u32) {
-    RANGE_FORITER_SPECIALIZED_GUARDS.with(|s| {
-        s.borrow_mut().insert(green_key, fail_index);
-    });
-}
-
-/// Return whether this exact range FOR_ITER guard failure should demote its
-/// loop.
-///
-/// The mapping holds only the current trace's ordinal for this green key, so
-/// an unrelated guard from a stale trace cannot trigger demotion.
-pub fn range_foriter_guard_failed(green_key: u64, fail_index: u32) -> bool {
-    let specialized =
-        RANGE_FORITER_SPECIALIZED_GUARDS.with(|s| s.borrow().get(&green_key) == Some(&fail_index));
-    if specialized {
-        RANGE_FORITER_SPECIALIZED_GUARDS.with(|s| {
-            s.borrow_mut().remove(&green_key);
-        });
-        RANGE_FORITER_DEMOTED.with(|s| {
-            s.borrow_mut().insert(green_key);
-        });
-    }
-    specialized
+/// Returns `true` when this call performs the demotion (first class
+/// mismatch), `false` when the site was already demoted (idempotent
+/// re-failure).  `handle_fail` calls this only after confirming the failing
+/// descr carries the range marker (`Descr::range_foriter_green_key`), so an
+/// unrelated body guard at the same loop can never demote the site.
+pub fn range_foriter_demote_once(green_key: u64) -> bool {
+    RANGE_FORITER_DEMOTED.with(|s| s.borrow_mut().insert(green_key))
 }
 
 fn midbody_post_marker_is_effect_free(code: &CodeObject, start_pc: usize) -> bool {

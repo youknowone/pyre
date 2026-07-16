@@ -6130,6 +6130,22 @@ impl OptContext {
             op.getdescr().map_or(false, |d| d.is_resume_guard_copied())
         );
 
+        // A walker-native range FOR_ITER class guard carries a pre-minted
+        // marker descr (`range_foriter_green_key`) so its failure can demote
+        // the specialization by descr identity.  `Op::clone` shares the descr
+        // Arc, so unroll's phase-1/phase-2 emissions of the guard reach this
+        // function on the same, already-finalized descr.  Mint a fresh marked
+        // descr for this emission — mirroring the `op.descr.is_none()` arm's
+        // fresh-per-emission descr — so the once-per-descr `finish()`
+        // invariant below still holds for it (and for every other guard).
+        let refinalize_marked_key = op
+            .getdescr()
+            .and_then(|d| d.range_foriter_green_key())
+            .filter(|_| op.resolved_rd_numb().is_some());
+        if let Some(key) = refinalize_marked_key {
+            op.setdescr(crate::compile::make_resume_guard_descr_range_foriter(key));
+        }
+
         // resume.py:397 `assert not storage.rd_numb` — finish() runs at
         // most once per ResumeGuardDescr.  RPython makes this invariant
         // load-bearing: a second call would clobber an already-numbered

@@ -2430,6 +2430,21 @@ impl TraceCtx {
         Self::do_record_guard(&mut self.recorder, opcode, args, None)
     }
 
+    /// Record a guard carrying a pre-minted `ResumeGuardDescr`.
+    /// `store_final_boxes_in_guard` preserves an existing descr (only
+    /// refreshing its `fail_arg_types`), so a marker stamped on `descr`
+    /// survives optimization guard-folding and unroll — used by the
+    /// walker-native range FOR_ITER specialization to tag its class guard
+    /// for demotion by descr identity (`Descr::range_foriter_green_key`).
+    pub fn record_guard_with_descr(
+        &mut self,
+        opcode: OpCode,
+        args: &[OpRef],
+        descr: DescrRef,
+    ) -> OpRef {
+        Self::do_record_guard(&mut self.recorder, opcode, args, Some(descr))
+    }
+
     /// `pyjitpl.py:2548 generate_guard()` parity: tracer-stage typed
     /// guards carry `descr=None`. The `fail_arg_types` are stamped onto
     /// `op.fail_arg_types` directly so the optimizer's
