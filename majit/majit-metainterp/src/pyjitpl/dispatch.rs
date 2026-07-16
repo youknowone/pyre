@@ -939,9 +939,7 @@ where
                 .iter()
                 .zip(frame.ref_values.iter())
                 .find_map(|(slot, concrete)| {
-                    (*slot == Some(vable_opref))
-                        .then_some(*concrete)
-                        .flatten()
+                    (*slot == Some(vable_opref)).then_some(*concrete).flatten()
                 })
         })?;
         let root_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
@@ -959,9 +957,7 @@ where
     ) -> Option<ActiveStandardVirtualizable> {
         let mut active = self.active_standard_virtualizable(ctx)?;
         unsafe {
-            majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_mut(
-                &mut *active.obj,
-            ));
+            majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_mut(&mut *active.obj));
             active.info.tracing_before_residual_call(active.obj_ptr());
         }
         let force_token = ctx.force_token();

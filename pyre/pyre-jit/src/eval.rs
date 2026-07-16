@@ -2700,15 +2700,13 @@ thread_local! {
 /// lands slice by slice; `PYRE_FBW_REC_MUTUAL_CUTOVER=1` opts in.
 pub(crate) fn rec_mutual_cutover_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(
-        || match std::env::var_os("PYRE_FBW_REC_MUTUAL_CUTOVER") {
-            Some(v) => {
-                let v = v.to_string_lossy();
-                v != "0" && !v.eq_ignore_ascii_case("false")
-            }
-            None => false,
-        },
-    )
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_REC_MUTUAL_CUTOVER") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => false,
+    })
 }
 
 fn build_jit_driver_pair() -> JitDriverPair {

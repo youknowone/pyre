@@ -8239,15 +8239,13 @@ pub(crate) fn fbw_rec_multiframe_enabled() -> bool {
 /// gate of the same name (eval.rs); default OFF while the migration lands.
 pub(crate) fn fbw_rec_mutual_cutover_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(
-        || match std::env::var_os("PYRE_FBW_REC_MUTUAL_CUTOVER") {
-            Some(v) => {
-                let v = v.to_string_lossy();
-                v != "0" && !v.eq_ignore_ascii_case("false")
-            }
-            None => false,
-        },
-    )
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_REC_MUTUAL_CUTOVER") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => false,
+    })
 }
 
 /// `PYRE_FBW_LOOP_CALLEE_CA` (gap-10, general loop-bearing-callee →

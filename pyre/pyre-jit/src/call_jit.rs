@@ -91,9 +91,7 @@ struct FrameRoot {
 impl FrameRoot {
     fn new(frame: &mut PyFrame) -> Self {
         Self {
-            depth: majit_gc::shadow_stack::push(majit_ir::GcRef(
-                frame as *mut PyFrame as usize,
-            )),
+            depth: majit_gc::shadow_stack::push(majit_ir::GcRef(frame as *mut PyFrame as usize)),
         }
     }
 
