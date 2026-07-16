@@ -405,61 +405,25 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             2,
         ),
     );
-    // takewhile(predicate, iterable) — W_TakeWhile.__init__: store the
-    // predicate and `space.iter(w_iterable)`; elements are pulled lazily
-    // by W_TakeWhile.next_w (baseobjspace::next).
+    // PyPy exposes these W_Root subclasses through their TypeDefs.  Their
+    // `__new__` slots retain the two-argument/subclass-init gateway behavior.
     crate::module_ns_store(
         ns,
         "takewhile",
-        crate::make_builtin_function_with_arity(
-            "takewhile",
-            |args| {
-                let iterator = crate::baseobjspace::iter(args[1])?;
-                Ok(pyre_object::interp_itertools::w_takewhile_new(
-                    args[0], iterator,
-                ))
-            },
-            2,
-        ),
+        crate::typedef::gettypefor(&pyre_object::interp_itertools::TAKEWHILE_TYPE)
+            .expect("itertools.takewhile TypeDef initialized"),
     );
-    // dropwhile(predicate, iterable) — W_DropWhile.__init__: store the
-    // predicate and `space.iter(w_iterable)`; the drop phase runs lazily
-    // inside W_DropWhile.next_w (baseobjspace::next).
     crate::module_ns_store(
         ns,
         "dropwhile",
-        crate::make_builtin_function_with_arity(
-            "dropwhile",
-            |args| {
-                let iterator = crate::baseobjspace::iter(args[1])?;
-                Ok(pyre_object::interp_itertools::w_dropwhile_new(
-                    args[0], iterator,
-                ))
-            },
-            2,
-        ),
+        crate::typedef::gettypefor(&pyre_object::interp_itertools::DROPWHILE_TYPE)
+            .expect("itertools.dropwhile TypeDef initialized"),
     );
-    // filterfalse(predicate, iterable) — W_FilterFalse (W_Filter with
-    // reverse=True).  W_Filter.__init__ normalizes a None predicate to
-    // null; elements are filtered lazily in next_w (baseobjspace::next).
     crate::module_ns_store(
         ns,
         "filterfalse",
-        crate::make_builtin_function_with_arity(
-            "filterfalse",
-            |args| {
-                let predicate = if unsafe { pyre_object::is_none(args[0]) } {
-                    pyre_object::PY_NULL
-                } else {
-                    args[0]
-                };
-                let iterator = crate::baseobjspace::iter(args[1])?;
-                Ok(pyre_object::interp_itertools::w_filterfalse_new(
-                    predicate, iterator,
-                ))
-            },
-            2,
-        ),
+        crate::typedef::gettypefor(&pyre_object::interp_itertools::FILTERFALSE_TYPE)
+            .expect("itertools.filterfalse TypeDef initialized"),
     );
     // pairwise(iterable) — W_Pairwise__new__: store `space.iter(w_iterable)`;
     // pairs are produced lazily by W_Pairwise.next_w (baseobjspace::next).

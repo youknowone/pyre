@@ -3675,10 +3675,9 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
             let entry: Option<(fn(&[PyObjectRef]) -> PyResult, &str, u16)> = match name {
                 "__next__" => Some((iter_next_method, "__next__", 1)),
                 "__iter__" => Some((iter_self_method, "__iter__", 1)),
-                // takewhile/dropwhile expose `__reduce__` + `__setstate__`,
-                // filterfalse `__reduce__` only (interp_itertools.py
-                // W_TakeWhile/W_DropWhile/W_FilterFalse typedefs); pairwise
-                // exposes neither.  cycle exposes both (W_Cycle typedef).
+                // pairwise exposes no additional methods; cycle and chain
+                // still use the old PyPy pickle fallbacks until their own
+                // TypeDefs are ported.
                 "__reduce__" if pyre_object::interp_itertools::is_cycle(obj) => {
                     Some((cycle_reduce_method, "__reduce__", 1))
                 }
@@ -3690,21 +3689,6 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
                 }
                 "__setstate__" if pyre_object::interp_itertools::is_chain(obj) => {
                     Some((chain_setstate_method, "__setstate__", 2))
-                }
-                "__reduce__" if pyre_object::interp_itertools::is_takewhile(obj) => {
-                    Some((takewhile_reduce_method, "__reduce__", 1))
-                }
-                "__setstate__" if pyre_object::interp_itertools::is_takewhile(obj) => {
-                    Some((takewhile_setstate_method, "__setstate__", 2))
-                }
-                "__reduce__" if pyre_object::interp_itertools::is_dropwhile(obj) => {
-                    Some((dropwhile_reduce_method, "__reduce__", 1))
-                }
-                "__setstate__" if pyre_object::interp_itertools::is_dropwhile(obj) => {
-                    Some((dropwhile_setstate_method, "__setstate__", 2))
-                }
-                "__reduce__" if pyre_object::interp_itertools::is_filterfalse(obj) => {
-                    Some((filterfalse_reduce_method, "__reduce__", 1))
                 }
                 _ => None,
             };
@@ -11256,59 +11240,6 @@ pub(crate) fn iter_self_method(args: &[PyObjectRef]) -> PyResult {
         args[0]
     };
     Ok(obj)
-}
-
-/// `takewhile.__reduce__` — `interp_itertools.py W_TakeWhile.descr_reduce`:
-/// `(type(self), (predicate, iterable), stopped)`.
-fn takewhile_reduce_method(args: &[PyObjectRef]) -> PyResult {
-    let it = unsafe { &*(args[0] as *const pyre_object::interp_itertools::W_TakeWhile) };
-    let w_type = crate::typedef::r#type(args[0]).unwrap_or(PY_NULL);
-    let state = w_tuple_new(vec![it.w_predicate, it.w_iterable]);
-    Ok(w_tuple_new(vec![w_type, state, w_bool_from(it.stopped)]))
-}
-
-/// `takewhile.__setstate__` — `interp_itertools.py W_TakeWhile.descr_setstate`:
-/// `self.stopped = space.bool_w(w_state)`.  `space.bool_w(w)` is
-/// `bool(int_w(w))` (baseobjspace.py:1944): it unwraps an int and
-/// rejects non-ints, NOT the general `is_true` truth test, so
-/// `int_w(...)? != 0` is the exact equivalent (raises on a non-int
-/// state just as `bool_w` does).
-fn takewhile_setstate_method(args: &[PyObjectRef]) -> PyResult {
-    let it = unsafe { &mut *(args[0] as *mut pyre_object::interp_itertools::W_TakeWhile) };
-    it.stopped = int_w(if args.len() > 1 { args[1] } else { w_none() })? != 0;
-    Ok(w_none())
-}
-
-/// `dropwhile.__reduce__` — `interp_itertools.py W_DropWhile.descr_reduce`:
-/// `(type(self), (predicate, iterable), started)`.
-fn dropwhile_reduce_method(args: &[PyObjectRef]) -> PyResult {
-    let it = unsafe { &*(args[0] as *const pyre_object::interp_itertools::W_DropWhile) };
-    let w_type = crate::typedef::r#type(args[0]).unwrap_or(PY_NULL);
-    let state = w_tuple_new(vec![it.w_predicate, it.w_iterable]);
-    Ok(w_tuple_new(vec![w_type, state, w_bool_from(it.started)]))
-}
-
-/// `dropwhile.__setstate__` — `interp_itertools.py W_DropWhile.descr_setstate`:
-/// `self.started = space.bool_w(w_state)` (= `bool(int_w(w))`; see
-/// `takewhile_setstate_method` for the `int_w(...)? != 0` equivalence).
-fn dropwhile_setstate_method(args: &[PyObjectRef]) -> PyResult {
-    let it = unsafe { &mut *(args[0] as *mut pyre_object::interp_itertools::W_DropWhile) };
-    it.started = int_w(if args.len() > 1 { args[1] } else { w_none() })? != 0;
-    Ok(w_none())
-}
-
-/// `filterfalse.__reduce__` — `interp_itertools.py W_FilterFalse.descr_reduce`:
-/// `(type(self), (None-or-predicate, iterable))` — no state element.
-fn filterfalse_reduce_method(args: &[PyObjectRef]) -> PyResult {
-    let it = unsafe { &*(args[0] as *const pyre_object::interp_itertools::W_FilterFalse) };
-    let w_type = crate::typedef::r#type(args[0]).unwrap_or(PY_NULL);
-    let w_pred = if it.w_predicate.is_null() {
-        w_none()
-    } else {
-        it.w_predicate
-    };
-    let state = w_tuple_new(vec![w_pred, it.w_iterable]);
-    Ok(w_tuple_new(vec![w_type, state]))
 }
 
 /// `cycle.__reduce__` — `interp_itertools.py W_Cycle.descr_reduce`:

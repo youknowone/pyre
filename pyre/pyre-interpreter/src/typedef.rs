@@ -884,15 +884,30 @@ pub fn init_typeobjects() {
         );
         reg.insert(
             &pyre_object::interp_itertools::TAKEWHILE_TYPE as *const PyType as usize,
-            new_typeobject_with_base("itertools.takewhile", |_| {}, object_type) as usize,
+            new_typeobject_with_base_and_layout(
+                "itertools.takewhile",
+                init_takewhile_type,
+                object_type,
+                &pyre_object::interp_itertools::TAKEWHILE_TYPE as *const PyType,
+            ) as usize,
         );
         reg.insert(
             &pyre_object::interp_itertools::DROPWHILE_TYPE as *const PyType as usize,
-            new_typeobject_with_base("itertools.dropwhile", |_| {}, object_type) as usize,
+            new_typeobject_with_base_and_layout(
+                "itertools.dropwhile",
+                init_dropwhile_type,
+                object_type,
+                &pyre_object::interp_itertools::DROPWHILE_TYPE as *const PyType,
+            ) as usize,
         );
         reg.insert(
             &pyre_object::interp_itertools::FILTERFALSE_TYPE as *const PyType as usize,
-            new_typeobject_with_base("itertools.filterfalse", |_| {}, object_type) as usize,
+            new_typeobject_with_base_and_layout(
+                "itertools.filterfalse",
+                init_filterfalse_type,
+                object_type,
+                &pyre_object::interp_itertools::FILTERFALSE_TYPE as *const PyType,
+            ) as usize,
         );
         reg.insert(
             &pyre_object::interp_itertools::PAIRWISE_TYPE as *const PyType as usize,
@@ -18075,6 +18090,147 @@ fn init_repeat_type(ns: PyObjectRef) {
             "__doc__",
             w_str_new(
                 "repeat(object [,times]) -> create an iterator which returns the object\nfor the specified number of times.  If not specified, returns the object\nendlessly.",
+            ),
+        ),
+    ];
+    for (name, value) in entries {
+        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+    }
+}
+
+// ── itertools predicate iterator TypeDefs ────────────────────────────
+// PyPy W_TakeWhile / W_DropWhile / W_FilterFalse.  Python 3.14 keeps the
+// constructor/iterator shape but no longer exposes PyPy 3.11's pickle state
+// methods on these concrete types.
+
+fn itertools_twoarg_new(
+    args: &[PyObjectRef],
+    exact_type: PyObjectRef,
+    name: &str,
+) -> Result<(PyObjectRef, PyObjectRef, PyObjectRef), crate::PyError> {
+    // interp_itertools.py W_Twoarg__new__, kept in source order.
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let cls = positional.first().copied().unwrap_or(PY_NULL);
+    let args_w = positional.get(1..).unwrap_or(&[]);
+    let init_matches = std::ptr::eq(cls, exact_type)
+        || unsafe {
+            match (
+                crate::baseobjspace::lookup_in_type(cls, "__init__"),
+                crate::baseobjspace::lookup_in_type(exact_type, "__init__"),
+            ) {
+                (Some(sub), Some(base)) => std::ptr::eq(sub, base),
+                (None, None) => true,
+                _ => false,
+            }
+        };
+    if init_matches && crate::builtins::has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(format!(
+            "{name}() takes no keyword arguments"
+        )));
+    }
+    if args_w.len() != 2 {
+        return Err(crate::PyError::type_error(format!(
+            "{name} expected 2 arguments, got {}",
+            args_w.len()
+        )));
+    }
+    Ok((cls, args_w[0], args_w[1]))
+}
+
+fn takewhile_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let exact = gettypefor(&pyre_object::interp_itertools::TAKEWHILE_TYPE).unwrap_or(PY_NULL);
+    let (cls, predicate, iterable) = itertools_twoarg_new(args, exact, "takewhile")?;
+    let iterator = crate::baseobjspace::iter(iterable)?;
+    let obj = pyre_object::interp_itertools::w_takewhile_new(predicate, iterator);
+    itertools_alloc_for_class(cls, exact, obj)
+}
+
+fn dropwhile_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let exact = gettypefor(&pyre_object::interp_itertools::DROPWHILE_TYPE).unwrap_or(PY_NULL);
+    let (cls, predicate, iterable) = itertools_twoarg_new(args, exact, "dropwhile")?;
+    let iterator = crate::baseobjspace::iter(iterable)?;
+    let obj = pyre_object::interp_itertools::w_dropwhile_new(predicate, iterator);
+    itertools_alloc_for_class(cls, exact, obj)
+}
+
+fn filterfalse_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let exact = gettypefor(&pyre_object::interp_itertools::FILTERFALSE_TYPE).unwrap_or(PY_NULL);
+    let (cls, predicate, iterable) = itertools_twoarg_new(args, exact, "filterfalse")?;
+    let predicate = if unsafe { pyre_object::is_none(predicate) } {
+        PY_NULL
+    } else {
+        predicate
+    };
+    let iterator = crate::baseobjspace::iter(iterable)?;
+    let obj = pyre_object::interp_itertools::w_filterfalse_new(predicate, iterator);
+    itertools_alloc_for_class(cls, exact, obj)
+}
+
+fn init_takewhile_type(ns: PyObjectRef) {
+    // W_TakeWhile.typedef, in source order (minus the 3.14-removed pickle
+    // entries between __next__ and __doc__).
+    let entries = [
+        ("__new__", make_new_descr(takewhile_descr_new)),
+        (
+            "__iter__",
+            make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1),
+        ),
+        (
+            "__next__",
+            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1),
+        ),
+        (
+            "__doc__",
+            w_str_new(
+                "Return successive entries from an iterable as long as the predicate evaluates to true for each entry.",
+            ),
+        ),
+    ];
+    for (name, value) in entries {
+        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+    }
+}
+
+fn init_dropwhile_type(ns: PyObjectRef) {
+    // W_DropWhile.typedef, in source order.
+    let entries = [
+        ("__new__", make_new_descr(dropwhile_descr_new)),
+        (
+            "__iter__",
+            make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1),
+        ),
+        (
+            "__next__",
+            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1),
+        ),
+        (
+            "__doc__",
+            w_str_new(
+                "Drop items from the iterable while predicate(item) is true.\n\nAfterwards, return every element until the iterable is exhausted.",
+            ),
+        ),
+    ];
+    for (name, value) in entries {
+        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+    }
+}
+
+fn init_filterfalse_type(ns: PyObjectRef) {
+    // W_FilterFalse.typedef, in source order.
+    let entries = [
+        ("__new__", make_new_descr(filterfalse_descr_new)),
+        (
+            "__iter__",
+            make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1),
+        ),
+        (
+            "__next__",
+            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1),
+        ),
+        (
+            "__doc__",
+            w_str_new(
+                "Return those items of iterable for which function(item) is false.\n\nIf function is None, return the items that are false.",
             ),
         ),
     ];
