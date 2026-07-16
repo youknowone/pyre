@@ -2222,24 +2222,24 @@ mod tests {
 
     /// pypy/module/_weakref/interp__weakref.py:390-391 — comparison ops
     /// land on `proxy_typedef_dict` only, never on
-    /// `callable_proxy_typedef_dict`. `__lt__`/`__le__`/`__gt__`/`__ge__`
-    /// are not on `object`, so an MRO lookup is enough to tell the two
-    /// typedefs apart. (`__eq__`/`__ne__` are inherited from `object`
-    /// regardless and so cannot be tested by name lookup alone.)
+    /// `callable_proxy_typedef_dict`.  The complete object TypeDef exposes
+    /// the four ordering slots too, so test the class that supplied the MRO
+    /// hit: the ordinary proxy supplies its forwarding operation, while the
+    /// callable proxy reaches `object`'s NotImplemented operation.
     #[test]
     fn test_comparison_ops_only_on_weakproxy() {
         crate::typedef::init_typeobjects();
         let weakproxy = proxy_type();
         let callable = callable_proxy_type();
         unsafe {
-            assert!(crate::baseobjspace::lookup_in_type(weakproxy, "__lt__").is_some());
-            assert!(crate::baseobjspace::lookup_in_type(weakproxy, "__le__").is_some());
-            assert!(crate::baseobjspace::lookup_in_type(weakproxy, "__gt__").is_some());
-            assert!(crate::baseobjspace::lookup_in_type(weakproxy, "__ge__").is_some());
-            assert!(crate::baseobjspace::lookup_in_type(callable, "__lt__").is_none());
-            assert!(crate::baseobjspace::lookup_in_type(callable, "__le__").is_none());
-            assert!(crate::baseobjspace::lookup_in_type(callable, "__gt__").is_none());
-            assert!(crate::baseobjspace::lookup_in_type(callable, "__ge__").is_none());
+            for name in ["__lt__", "__le__", "__gt__", "__ge__"] {
+                let (weak_source, _) =
+                    crate::baseobjspace::lookup_where_pair(weakproxy, name).unwrap();
+                assert!(std::ptr::eq(weak_source, weakproxy));
+                let (callable_source, _) =
+                    crate::baseobjspace::lookup_where_pair(callable, name).unwrap();
+                assert!(std::ptr::eq(callable_source, crate::typedef::w_object()));
+            }
             // Forwarded ops should land on both typedefs.
             assert!(crate::baseobjspace::lookup_in_type(weakproxy, "__add__").is_some());
             assert!(crate::baseobjspace::lookup_in_type(callable, "__add__").is_some());
