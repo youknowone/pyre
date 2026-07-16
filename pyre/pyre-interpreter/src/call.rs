@@ -756,6 +756,29 @@ pub fn call_kw(
         callable_unwrapped
     };
 
+    // function.py:712-713 `StaticMethod.descr_call` receives the original
+    // Arguments object.  Preserve the positional/keyword split before the
+    // generic signature resolver (a staticmethod wrapper has no Python
+    // signature of its own) and forward both collections unchanged.
+    if unsafe { pyre_object::is_staticmethod(callable_unwrapped) } {
+        let nkw = if unsafe { pyre_object::is_tuple(kwarg_names) } {
+            unsafe { pyre_object::w_tuple_len(kwarg_names) }
+        } else {
+            0
+        };
+        let n_pos = args.len().saturating_sub(nkw);
+        let pos_args = args[..n_pos].to_vec();
+        let mut kw_entries = Vec::with_capacity(nkw);
+        for ki in 0..nkw {
+            if let Some(name_obj) = unsafe { pyre_object::w_tuple_getitem(kwarg_names, ki as i64) }
+            {
+                let key = unsafe { pyre_object::w_str_get_wtf8(name_obj) }.to_owned();
+                kw_entries.push((key, args[n_pos + ki]));
+            }
+        }
+        return call_with_kwargs(frame, callable_unwrapped, &pos_args, &kw_entries);
+    }
+
     // For type objects with kwargs: use call_with_kwargs which handles
     // __new__/__init__ kwargs forwarding correctly.
     if unsafe { pyre_object::is_type(callable_unwrapped) } {
@@ -1598,6 +1621,14 @@ pub fn call_with_kwargs(
     pos_args: &[PyObjectRef],
     kwargs: &[(Wtf8Buf, PyObjectRef)],
 ) -> PyResult {
+    // function.py:712-713 StaticMethod.descr_call — the wrapper contributes
+    // no implicit argument; forward the original positional and keyword
+    // collections unchanged to its w_function.
+    if unsafe { pyre_object::is_staticmethod(callable) } {
+        let func = unsafe { pyre_object::w_staticmethod_get_func(callable) };
+        return call_with_kwargs(frame, func, pos_args, kwargs);
+    }
+
     // Unwrap bound methods: prepend receiver to pos_args.
     if unsafe { pyre_object::is_method(callable) } {
         let func = unsafe { pyre_object::w_method_get_func(callable) };

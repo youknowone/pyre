@@ -3288,6 +3288,11 @@ pub(crate) fn len_slot(obj: PyObjectRef) -> PyResult {
 /// it to call `_obj_getdict`. pyre dispatches at runtime via the type's
 /// hasdict flag because Rust has no per-class virtual table.
 pub fn getdict(obj: PyObjectRef) -> PyObjectRef {
+    // function.py:678-681 StaticMethod.getdict — the dictionary is a
+    // real field on the descriptor object, not mapdict side storage.
+    if unsafe { pyre_object::function::is_staticmethod(obj) } {
+        return unsafe { pyre_object::function::w_staticmethod_getdict(obj) };
+    }
     // exceptions/interp_exceptions.py:222-225 W_BaseException.getdict
     // override — lazily allocates the instance dict on the typed slot.
     if unsafe { pyre_object::is_exception(obj) } {
@@ -3351,6 +3356,18 @@ pub(crate) fn native_slot_del(obj: PyObjectRef, name: &str) -> bool {
 /// objspace/std/mapdict.py:820-821 MapdictDictSupport.setdict overrides
 /// it to call `_obj_setdict`.
 pub fn setdict(obj: PyObjectRef, w_dict: PyObjectRef) -> Result<(), PyError> {
+    // function.py:683-688 StaticMethod.setdict.
+    if unsafe { pyre_object::function::is_staticmethod(obj) } {
+        let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
+        if !unsafe { isinstance_w(w_dict, w_dict_type) } {
+            return Err(PyError::type_error(format!(
+                "__dict__ must be set to a dictionary, not a '{}'",
+                object_functionstr_type_name(w_dict),
+            )));
+        }
+        unsafe { pyre_object::function::w_staticmethod_setdict(obj, w_dict) };
+        return Ok(());
+    }
     // exceptions/interp_exceptions.py:227-231 W_BaseException.setdict
     // override — validates the value is a dict, then writes the slot.
     // `space.isinstance_w(w_dict, space.w_dict)` accepts dict subclasses.

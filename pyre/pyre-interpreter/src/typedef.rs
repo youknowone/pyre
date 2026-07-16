@@ -9382,138 +9382,290 @@ fn init_cell_type(ns: PyObjectRef) {
     };
 }
 
-/// `staticmethod.__new__(cls, func)` — PyPy: function.py StaticMethod.descr__new__
-fn init_staticmethod_type(ns: PyObjectRef) {
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__new__",
-            make_builtin_function("__new__", |args| {
-                // staticmethod(func) — args[0] is cls (staticmethod type), args[1] is func
-                let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-                let func = if args.len() > 1 {
-                    args[1]
-                } else {
-                    pyre_object::w_none()
-                };
-                let sm = pyre_object::function::w_staticmethod_new(func);
-                // function.py `allocate_instance(StaticMethod, w_subtype)` —
-                // honour the subtype so `abstractstaticmethod(func)` yields an
-                // `abstractstaticmethod` instance, not a bare `staticmethod`.
-                let staticmethod_type =
-                    crate::typedef::gettypeobject(&pyre_object::function::STATICMETHOD_TYPE);
-                if !cls.is_null() && !std::ptr::eq(cls, staticmethod_type) {
-                    check_user_subclass(staticmethod_type, cls)?;
-                    unsafe {
-                        (*sm).w_class = cls;
-                    }
-                }
-                Ok(sm)
-            }),
-        )
-    };
-    // `typedef.py:866 __get__ = interp2app(
-    //     StaticMethod.descr_staticmethod_get)`.  `function.py:691-693`:
-    //
-    //     def descr_staticmethod_get(self, w_obj, w_cls=None):
-    //         """staticmethod(x).__get__(obj[, type]) -> x"""
-    //         return self.w_function
-    //
-    // Arity 3 covers `__get__(self, obj, cls=None)`.  `args[0]` is the
-    // staticmethod instance; the remaining slots are ignored beyond the
-    // type guard.  Returning `w_function` without binding is the
-    // canonical staticmethod semantic (`function.py:864 …does not
-    // receive an implicit first argument`).
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__get__",
-            make_builtin_function_with_arity(
-                "__get__",
-                |args| {
-                    let sm = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-                    if !unsafe { pyre_object::function::is_staticmethod(sm) } {
-                        return Err(crate::PyError::type_error(
-                            "descriptor '__get__' requires a 'staticmethod' object",
-                        ));
-                    }
-                    let w_func = unsafe { pyre_object::function::w_staticmethod_get_func(sm) };
-                    if w_func.is_null() {
-                        Ok(pyre_object::w_none())
-                    } else {
-                        Ok(w_func)
-                    }
-                },
-                3,
-            ),
-        )
-    };
-    // typedef.py:870-871 ─
-    //   __func__ = interp_attrproperty_w('w_function', cls=StaticMethod),
-    //   __wrapped__ = interp_attrproperty_w('w_function', cls=StaticMethod),
-    // — same `w_function` slot, two aliases, both routed through
-    // the interp_attrproperty_w fget shape (typedef.py:465-474):
-    // substitute w_None when the fetched slot is None.
-    fn staticmethod_func_attr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        let obj = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-        if !unsafe { pyre_object::function::is_staticmethod(obj) } {
-            return Ok(pyre_object::w_none());
-        }
-        let w_value = unsafe { pyre_object::function::w_staticmethod_get_func(obj) };
-        if w_value.is_null() {
-            Ok(pyre_object::w_none())
-        } else {
-            Ok(w_value)
+fn staticmethod_require(obj: PyObjectRef, name: &str) -> Result<PyObjectRef, crate::PyError> {
+    if obj.is_null() || !unsafe { pyre_object::function::is_staticmethod(obj) } {
+        return Err(crate::PyError::type_error(format!(
+            "descriptor '{name}' requires a 'staticmethod' object"
+        )));
+    }
+    Ok(obj)
+}
+
+/// function.py:695-698 `StaticMethod.descr_staticmethod__new__` / CPython
+/// 3.14 `sm_new`: allocate first with a None callable; `__init__` installs
+/// the user argument and copies presentation attributes.
+fn staticmethod_descr_new(args: &[PyObjectRef]) -> crate::PyResult {
+    let cls = args.first().copied().unwrap_or(PY_NULL);
+    let staticmethod_type = gettypeobject(&pyre_object::function::STATICMETHOD_TYPE);
+    check_user_subclass(staticmethod_type, cls)?;
+    let sm = pyre_object::function::w_staticmethod_new(w_none());
+    if !std::ptr::eq(cls, staticmethod_type) {
+        unsafe { (*sm).w_class = cls };
+    }
+    Ok(sm)
+}
+
+/// function.py:700-703 `StaticMethod.descr_init`, adjusted to CPython 3.14:
+/// `functools_wraps` copies the four presentation attributes while
+/// `__annotations__` and `__annotate__` remain lazy proxy descriptors.
+fn staticmethod_descr_init(args: &[PyObjectRef]) -> crate::PyResult {
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    if crate::builtins::has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(
+            "staticmethod() takes no keyword arguments",
+        ));
+    }
+    let sm = staticmethod_require(positional.first().copied().unwrap_or(PY_NULL), "__init__")?;
+    let supplied = positional.len().saturating_sub(1);
+    if supplied != 1 {
+        return Err(crate::PyError::type_error(format!(
+            "staticmethod expected 1 argument, got {supplied}"
+        )));
+    }
+    let function = positional[1];
+    unsafe { pyre_object::function::w_staticmethod_set_func(sm, function) };
+    let w_dict = unsafe { pyre_object::function::w_staticmethod_getdict(sm) };
+    for name in ["__module__", "__name__", "__qualname__", "__doc__"] {
+        match crate::baseobjspace::getattr_str(function, name) {
+            Ok(value) => {
+                crate::baseobjspace::setitem(w_dict, w_str_new(name), value)?;
+            }
+            Err(err) if err.kind == crate::PyErrorKind::AttributeError => {}
+            Err(err) => return Err(err),
         }
     }
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+    Ok(w_none())
+}
+
+/// function.py:691-693 `descr_staticmethod_get`.
+fn staticmethod_descr_get(args: &[PyObjectRef]) -> crate::PyResult {
+    let sm = staticmethod_require(args.first().copied().unwrap_or(PY_NULL), "__get__")?;
+    let function = unsafe { pyre_object::function::w_staticmethod_get_func(sm) };
+    Ok(if function.is_null() {
+        w_none()
+    } else {
+        function
+    })
+}
+
+/// function.py:712-713 `descr_call` / CPython 3.14 `sm_call`.
+fn staticmethod_descr_call(args: &[PyObjectRef]) -> crate::PyResult {
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let sm = staticmethod_require(positional.first().copied().unwrap_or(PY_NULL), "__call__")?;
+    let function = unsafe { pyre_object::function::w_staticmethod_get_func(sm) };
+    let call_args = positional.get(1..).unwrap_or(&[]);
+    if !crate::builtins::has_real_kwargs(kwargs) {
+        return crate::call::call_function_impl_result(function, call_args);
+    }
+    let keyword_args: Vec<(Wtf8Buf, PyObjectRef)> = unsafe {
+        pyre_object::w_dict_str_entries(kwargs.unwrap())
+            .into_iter()
+            .filter(|(name, _)| name != "__pyre_kw__")
+            .map(|(name, value)| (Wtf8Buf::from_string(name), value))
+            .collect()
+    };
+    crate::eval::CURRENT_FRAME.with(|current| {
+        let frame = current.get();
+        if frame.is_null() {
+            return Err(crate::PyError::runtime_error(
+                "staticmethod call has no current frame",
+            ));
+        }
+        crate::call::call_with_kwargs(unsafe { &mut *frame }, function, call_args, &keyword_args)
+    })
+}
+
+fn staticmethod_func_attr(args: &[PyObjectRef]) -> crate::PyResult {
+    let sm = staticmethod_require(args.get(1).copied().unwrap_or(PY_NULL), "__func__")?;
+    let value = unsafe { pyre_object::function::w_staticmethod_get_func(sm) };
+    Ok(if value.is_null() { w_none() } else { value })
+}
+
+fn staticmethod_isabstract(args: &[PyObjectRef]) -> crate::PyResult {
+    let sm = staticmethod_require(
+        args.get(1).copied().unwrap_or(PY_NULL),
+        "__isabstractmethod__",
+    )?;
+    let function = unsafe { pyre_object::function::w_staticmethod_get_func(sm) };
+    Ok(w_bool_from(crate::baseobjspace::isabstractmethod_w(
+        function,
+    )?))
+}
+
+fn staticmethod_wrapped_attr_get(obj: PyObjectRef, name: &str) -> crate::PyResult {
+    let sm = staticmethod_require(obj, name)?;
+    let w_dict = unsafe { pyre_object::function::w_staticmethod_getdict(sm) };
+    if let Some(value) = crate::baseobjspace::finditem_str(w_dict, name)? {
+        return Ok(value);
+    }
+    let function = unsafe { pyre_object::function::w_staticmethod_get_func(sm) };
+    let value = crate::baseobjspace::getattr_str(function, name)?;
+    crate::baseobjspace::setitem(w_dict, w_str_new(name), value)?;
+    Ok(value)
+}
+
+fn staticmethod_annotations_get(args: &[PyObjectRef]) -> crate::PyResult {
+    staticmethod_wrapped_attr_get(args.get(1).copied().unwrap_or(PY_NULL), "__annotations__")
+}
+
+fn staticmethod_annotate_get(args: &[PyObjectRef]) -> crate::PyResult {
+    staticmethod_wrapped_attr_get(args.get(1).copied().unwrap_or(PY_NULL), "__annotate__")
+}
+
+fn staticmethod_wrapped_attr_set(args: &[PyObjectRef], name: &str) -> crate::PyResult {
+    let sm = staticmethod_require(args.get(1).copied().unwrap_or(PY_NULL), name)?;
+    let value = args.get(2).copied().unwrap_or(PY_NULL);
+    let w_dict = unsafe { pyre_object::function::w_staticmethod_getdict(sm) };
+    crate::baseobjspace::setitem(w_dict, w_str_new(name), value)?;
+    Ok(w_none())
+}
+
+fn staticmethod_annotations_set(args: &[PyObjectRef]) -> crate::PyResult {
+    staticmethod_wrapped_attr_set(args, "__annotations__")
+}
+
+fn staticmethod_annotate_set(args: &[PyObjectRef]) -> crate::PyResult {
+    staticmethod_wrapped_attr_set(args, "__annotate__")
+}
+
+fn staticmethod_wrapped_attr_del(args: &[PyObjectRef], name: &str) -> crate::PyResult {
+    let sm = staticmethod_require(args.get(1).copied().unwrap_or(PY_NULL), name)?;
+    let w_dict = unsafe { pyre_object::function::w_staticmethod_getdict(sm) };
+    if let Err(err) = crate::baseobjspace::delitem(w_dict, w_str_new(name)) {
+        if err.kind == crate::PyErrorKind::KeyError {
+            return Err(crate::PyError::attribute_error(format!(
+                "'staticmethod' object has no attribute '{name}'"
+            )));
+        }
+        return Err(err);
+    }
+    Ok(w_none())
+}
+
+fn staticmethod_annotations_del(args: &[PyObjectRef]) -> crate::PyResult {
+    staticmethod_wrapped_attr_del(args, "__annotations__")
+}
+
+fn staticmethod_annotate_del(args: &[PyObjectRef]) -> crate::PyResult {
+    staticmethod_wrapped_attr_del(args, "__annotate__")
+}
+
+fn staticmethod_dict_del(_args: &[PyObjectRef]) -> crate::PyResult {
+    Err(crate::PyError::type_error("cannot delete __dict__"))
+}
+
+/// function.py:715-716 / CPython 3.14 `sm_repr`.
+fn staticmethod_descr_repr(args: &[PyObjectRef]) -> crate::PyResult {
+    let sm = staticmethod_require(args.first().copied().unwrap_or(PY_NULL), "__repr__")?;
+    let function = unsafe { pyre_object::function::w_staticmethod_get_func(sm) };
+    let repr = if function.is_null() {
+        "<NULL>".to_string()
+    } else {
+        unsafe { crate::display::py_repr(function)? }
+    };
+    Ok(w_str_new(&format!("<staticmethod({repr})>")))
+}
+
+/// PyPy `typedef.py:852-877 StaticMethod.typedef`, with the CPython 3.14
+/// surface taking precedence: PEP 649 proxy descriptors and generic alias
+/// support are present, while PyPy 3.11's `__reduce_ex__` is absent.
+fn init_staticmethod_type(ns: PyObjectRef) {
+    let dict_getter = make_builtin_function_with_arity("__dict__", descr_get_dict, 2);
+    let dict_setter = make_builtin_function_with_arity("__dict__", descr_set_dict, 3);
+    let dict_deleter = make_builtin_function_with_arity("__dict__", staticmethod_dict_del, 2);
+    let annotations_getter =
+        make_builtin_function_with_arity("__annotations__", staticmethod_annotations_get, 2);
+    let annotations_setter =
+        make_builtin_function_with_arity("__annotations__", staticmethod_annotations_set, 3);
+    let annotations_deleter =
+        make_builtin_function_with_arity("__annotations__", staticmethod_annotations_del, 2);
+    let annotate_getter =
+        make_builtin_function_with_arity("__annotate__", staticmethod_annotate_get, 2);
+    let annotate_setter =
+        make_builtin_function_with_arity("__annotate__", staticmethod_annotate_set, 3);
+    let annotate_deleter =
+        make_builtin_function_with_arity("__annotate__", staticmethod_annotate_del, 2);
+    let entries = [
+        (
+            "__doc__",
+            w_str_new(
+                "Convert a function to be a static method.\n\nA static method does not receive an implicit first argument.\nTo declare a static method, use this idiom:\n\n     class C:\n         @staticmethod\n         def f(arg1, arg2, argN):\n             ...\n\nIt can be called either on the class (e.g. C.f()) or on an instance\n(e.g. C().f()). Both the class and the instance are ignored, and\nneither is passed implicitly as the first argument to the method.\n\nStatic methods in Python are similar to those found in Java or C++.\nFor a more advanced concept, see the classmethod builtin.",
+            ),
+        ),
+        (
+            "__get__",
+            make_builtin_function("__get__", staticmethod_descr_get),
+        ),
+        ("__new__", make_new_descr(staticmethod_descr_new)),
+        (
+            "__init__",
+            make_builtin_function("__init__", staticmethod_descr_init),
+        ),
+        (
+            "__call__",
+            make_builtin_function("__call__", staticmethod_descr_call),
+        ),
+        (
             "__func__",
             make_getset_descriptor(make_builtin_function_with_arity(
                 "__func__",
                 staticmethod_func_attr,
                 2,
             )),
-        )
-    };
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        ),
+        (
             "__wrapped__",
             make_getset_descriptor(make_builtin_function_with_arity(
                 "__wrapped__",
                 staticmethod_func_attr,
                 2,
             )),
-        )
-    };
-    // typedef.py:872 `__isabstractmethod__ = GetSetProperty(
-    //     StaticMethod.descr_isabstract)`.  function.py:705-706:
-    //
-    //     def descr_isabstract(self, space):
-    //         return space.newbool(space.isabstractmethod_w(self.w_function))
-    //
-    // `baseobjspace.isabstractmethod_w` already factored above.
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        ),
+        (
             "__isabstractmethod__",
             make_getset_descriptor(make_builtin_function_with_arity(
                 "__isabstractmethod__",
-                |args| {
-                    let sm = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-                    if !unsafe { pyre_object::function::is_staticmethod(sm) } {
-                        return Ok(pyre_object::w_bool_from(false));
-                    }
-                    let func = unsafe { pyre_object::function::w_staticmethod_get_func(sm) };
-                    let result = crate::baseobjspace::isabstractmethod_w(func)?;
-                    Ok(pyre_object::w_bool_from(result))
-                },
+                staticmethod_isabstract,
                 2,
             )),
-        )
-    };
+        ),
+        (
+            "__dict__",
+            make_getset_property_named(dict_getter, dict_setter, dict_deleter, "__dict__"),
+        ),
+        (
+            "__annotations__",
+            make_getset_property_named(
+                annotations_getter,
+                annotations_setter,
+                annotations_deleter,
+                "__annotations__",
+            ),
+        ),
+        (
+            "__annotate__",
+            make_getset_property_named(
+                annotate_getter,
+                annotate_setter,
+                annotate_deleter,
+                "__annotate__",
+            ),
+        ),
+        (
+            "__class_getitem__",
+            pyre_object::function::w_classmethod_new(make_builtin_function(
+                "__class_getitem__",
+                crate::_pypy_generic_alias::generic_alias_class_getitem,
+            )),
+        ),
+        (
+            "__repr__",
+            make_builtin_function("__repr__", staticmethod_descr_repr),
+        ),
+    ];
+    for (name, value) in entries {
+        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+    }
 }
 
 /// `classmethod.__new__(cls, func)` — PyPy: function.py ClassMethod.descr__new__

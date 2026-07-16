@@ -108,6 +108,10 @@ pub unsafe fn w_method_get_class(obj: PyObjectRef) -> PyObjectRef {
 #[pyre_class("staticmethod", type_id = 20, static_name = "STATICMETHOD")]
 pub struct StaticMethod {
     pub w_function: PyObjectRef,
+    /// function.py:676 `self.w_dict = None` — lazily allocated by
+    /// `StaticMethod.getdict`, then populated by `descr_init` with the
+    /// wrapped function's presentation attributes.
+    pub w_dict: PyObjectRef,
 }
 
 pub fn w_staticmethod_new(func: PyObjectRef) -> PyObjectRef {
@@ -133,6 +137,7 @@ pub fn w_staticmethod_new(func: PyObjectRef) -> PyObjectRef {
                 StaticMethod {
                     ob: header,
                     w_function: func,
+                    w_dict: PY_NULL,
                 },
             );
         }
@@ -142,11 +147,45 @@ pub fn w_staticmethod_new(func: PyObjectRef) -> PyObjectRef {
     StaticMethod::allocate(StaticMethod {
         ob: header,
         w_function: func,
+        w_dict: PY_NULL,
     })
 }
 
 pub unsafe fn w_staticmethod_get_func(obj: PyObjectRef) -> PyObjectRef {
     (*(obj as *const StaticMethod)).w_function
+}
+
+/// function.py:697 `self.w_function = w_function`.
+#[inline]
+pub unsafe fn w_staticmethod_set_func(obj: PyObjectRef, func: PyObjectRef) {
+    unsafe {
+        (*(obj as *mut StaticMethod)).w_function = func;
+        crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    }
+}
+
+/// function.py:678-681 `StaticMethod.getdict` — allocate the instance
+/// dictionary on first access and retain its identity.
+#[inline]
+pub unsafe fn w_staticmethod_getdict(obj: PyObjectRef) -> PyObjectRef {
+    unsafe {
+        let sm = obj as *mut StaticMethod;
+        if (*sm).w_dict.is_null() {
+            (*sm).w_dict = crate::w_dict_new();
+            crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+        }
+        (*sm).w_dict
+    }
+}
+
+/// function.py:683-688 `StaticMethod.setdict`; the caller performs the
+/// dict type check before replacing this field.
+#[inline]
+pub unsafe fn w_staticmethod_setdict(obj: PyObjectRef, w_dict: PyObjectRef) {
+    unsafe {
+        (*(obj as *mut StaticMethod)).w_dict = w_dict;
+        crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    }
 }
 
 #[inline]
