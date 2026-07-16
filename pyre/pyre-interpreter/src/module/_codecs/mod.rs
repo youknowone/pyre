@@ -101,24 +101,8 @@ fn normalize(encoding: &str) -> String {
 }
 
 fn is_callable(obj: PyObjectRef) -> bool {
-    if obj.is_null() {
-        return false;
-    }
-    unsafe {
-        if crate::is_function(obj)
-            || pyre_object::is_method(obj)
-            || pyre_object::is_type(obj)
-            || pyre_object::is_staticmethod(obj)
-            || pyre_object::is_classmethod(obj)
-        {
-            return true;
-        }
-        if pyre_object::is_instance(obj) {
-            let w_type = pyre_object::w_instance_get_type(obj);
-            return crate::baseobjspace::lookup_in_type(w_type, "__call__").is_some();
-        }
-    }
-    false
+    // interp_codecs.py:151/663 `space.is_true(space.callable(...))`.
+    !obj.is_null() && crate::baseobjspace::callable_w(obj)
 }
 
 struct CodecException {

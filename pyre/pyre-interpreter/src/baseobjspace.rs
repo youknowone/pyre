@@ -3293,6 +3293,10 @@ pub fn getdict(obj: PyObjectRef) -> PyObjectRef {
     if unsafe { pyre_object::function::is_staticmethod(obj) } {
         return unsafe { pyre_object::function::w_staticmethod_getdict(obj) };
     }
+    // function.py:726-729 ClassMethod.getdict.
+    if unsafe { pyre_object::function::is_classmethod(obj) } {
+        return unsafe { pyre_object::function::w_classmethod_getdict(obj) };
+    }
     // exceptions/interp_exceptions.py:222-225 W_BaseException.getdict
     // override — lazily allocates the instance dict on the typed slot.
     if unsafe { pyre_object::is_exception(obj) } {
@@ -3366,6 +3370,18 @@ pub fn setdict(obj: PyObjectRef, w_dict: PyObjectRef) -> Result<(), PyError> {
             )));
         }
         unsafe { pyre_object::function::w_staticmethod_setdict(obj, w_dict) };
+        return Ok(());
+    }
+    // function.py:731-736 ClassMethod.setdict.
+    if unsafe { pyre_object::function::is_classmethod(obj) } {
+        let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
+        if !unsafe { isinstance_w(w_dict, w_dict_type) } {
+            return Err(PyError::type_error(format!(
+                "__dict__ must be set to a dictionary, not a '{}'",
+                object_functionstr_type_name(w_dict),
+            )));
+        }
+        unsafe { pyre_object::function::w_classmethod_setdict(obj, w_dict) };
         return Ok(());
     }
     // exceptions/interp_exceptions.py:227-231 W_BaseException.setdict
@@ -8425,7 +8441,7 @@ pub fn call_function(callable: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef
 /// PyPy: baseobjspace.py `callable_w`.
 pub fn callable_w(obj: PyObjectRef) -> bool {
     // `PyCallable_Check` — the builtin callable kinds (function / builtin
-    // function, bound method, static- and classmethod, type) dispatch through
+    // function, bound method, staticmethod, type) dispatch through
     // dedicated slots rather than a `__call__` dict entry, so each is
     // recognised directly; any other object is callable iff its type defines
     // `__call__`.  Mirrors `builtins::builtin_callable`.
@@ -8434,7 +8450,6 @@ pub fn callable_w(obj: PyObjectRef) -> bool {
             || is_type(obj)
             || pyre_object::is_method(obj)
             || pyre_object::function::is_staticmethod(obj)
-            || pyre_object::function::is_classmethod(obj)
             || crate::typedef::r#type(obj)
                 .and_then(|t| lookup_in_type(t, "__call__"))
                 .is_some()

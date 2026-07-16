@@ -6196,8 +6196,8 @@ fn builtin_next(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 fn builtin_callable(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let obj = args[0];
     // `PyCallable_Check` — true when `type(obj)` has `tp_call`.  The builtin
-    // callable kinds (function / builtin function, bound method, static- and
-    // classmethod, type) are dispatched through dedicated slots in `call.rs`
+    // callable kinds (function / builtin function, bound method,
+    // staticmethod, type) are dispatched through dedicated slots in `call.rs`
     // rather than a `__call__` dict entry, so each is recognised directly;
     // any other object is callable iff its type defines `__call__`.
     let is_callable = unsafe {
@@ -6205,7 +6205,6 @@ fn builtin_callable(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
             || pyre_object::is_type(obj)
             || pyre_object::is_method(obj)
             || pyre_object::function::is_staticmethod(obj)
-            || pyre_object::function::is_classmethod(obj)
             || crate::typedef::r#type(obj)
                 .and_then(|t| crate::baseobjspace::lookup_in_type(t, "__call__"))
                 .is_some()

@@ -202,6 +202,9 @@ pub unsafe fn is_staticmethod(obj: PyObjectRef) -> bool {
 #[pyre_class("classmethod", type_id = 21, static_name = "CLASSMETHOD")]
 pub struct ClassMethod {
     pub w_function: PyObjectRef,
+    /// function.py:724 `self.w_dict = None` — a real per-wrapper field,
+    /// allocated lazily by `ClassMethod.getdict`.
+    pub w_dict: PyObjectRef,
 }
 
 pub fn w_classmethod_new(func: PyObjectRef) -> PyObjectRef {
@@ -227,6 +230,7 @@ pub fn w_classmethod_new(func: PyObjectRef) -> PyObjectRef {
                 ClassMethod {
                     ob: header,
                     w_function: func,
+                    w_dict: PY_NULL,
                 },
             );
         }
@@ -236,11 +240,44 @@ pub fn w_classmethod_new(func: PyObjectRef) -> PyObjectRef {
     ClassMethod::allocate(ClassMethod {
         ob: header,
         w_function: func,
+        w_dict: PY_NULL,
     })
 }
 
 pub unsafe fn w_classmethod_get_func(obj: PyObjectRef) -> PyObjectRef {
     (*(obj as *const ClassMethod)).w_function
+}
+
+/// function.py:752 `self.w_function = w_function`.
+#[inline]
+pub unsafe fn w_classmethod_set_func(obj: PyObjectRef, func: PyObjectRef) {
+    unsafe {
+        (*(obj as *mut ClassMethod)).w_function = func;
+        crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    }
+}
+
+/// function.py:726-729 `ClassMethod.getdict`.
+#[inline]
+pub unsafe fn w_classmethod_getdict(obj: PyObjectRef) -> PyObjectRef {
+    unsafe {
+        let cm = obj as *mut ClassMethod;
+        if (*cm).w_dict.is_null() {
+            (*cm).w_dict = crate::w_dict_new();
+            crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+        }
+        (*cm).w_dict
+    }
+}
+
+/// function.py:731-736 `ClassMethod.setdict`; the object-space layer checks
+/// for dict or a dict subclass before replacing the field.
+#[inline]
+pub unsafe fn w_classmethod_setdict(obj: PyObjectRef, w_dict: PyObjectRef) {
+    unsafe {
+        (*(obj as *mut ClassMethod)).w_dict = w_dict;
+        crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    }
 }
 
 #[inline]

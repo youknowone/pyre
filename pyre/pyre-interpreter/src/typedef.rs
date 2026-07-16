@@ -9668,141 +9668,262 @@ fn init_staticmethod_type(ns: PyObjectRef) {
     }
 }
 
-/// `classmethod.__new__(cls, func)` — PyPy: function.py ClassMethod.descr__new__
-fn init_classmethod_type(ns: PyObjectRef) {
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__new__",
-            make_builtin_function("__new__", |args| {
-                let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-                let func = if args.len() > 1 {
-                    args[1]
-                } else {
-                    pyre_object::w_none()
-                };
-                let cm = pyre_object::function::w_classmethod_new(func);
-                // function.py `allocate_instance(ClassMethod, w_subtype)` —
-                // honour the subtype so `abstractclassmethod(func)` yields an
-                // `abstractclassmethod` instance, not a bare `classmethod`.
-                let classmethod_type =
-                    crate::typedef::gettypeobject(&pyre_object::function::CLASSMETHOD_TYPE);
-                if !cls.is_null() && !std::ptr::eq(cls, classmethod_type) {
-                    check_user_subclass(classmethod_type, cls)?;
-                    unsafe {
-                        (*cm).w_class = cls;
-                    }
-                }
-                Ok(cm)
-            }),
-        )
-    };
-    // `typedef.py:883 __get__ = interp2app(
-    //     ClassMethod.descr_classmethod_get)`.  `function.py:738-748`:
-    //
-    //     def descr_classmethod_get(self, space, w_obj, w_klass=None):
-    //         if space.is_none(w_klass):
-    //             w_klass = space.type(w_obj)
-    //         w_func = self.w_function
-    //         w_bound = space.get(w_func, w_klass, w_klass)
-    //         if w_bound is not w_func:
-    //             return w_bound
-    //         # the object doesn't have a get, but it might still be
-    //         # callable, so make a Method object
-    //         return Method(space, w_func, w_klass)
-    //
-    // The two branches collapse into a single `Method(func, klass)`
-    // construction because pyre's `w_method_new` is the same shape
-    // that `Function.descr_function_get` would return when
-    // `w_func.__get__(klass, klass)` fires.  This matches the
-    // pre-existing hardcoded classmethod arm in
-    // `baseobjspace::get` (`baseobjspace.rs:5420-5427`).
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__get__",
-            make_builtin_function_with_arity(
-                "__get__",
-                |args| {
-                    let cm = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-                    if !unsafe { pyre_object::function::is_classmethod(cm) } {
-                        return Err(crate::PyError::type_error(
-                            "descriptor '__get__' requires a 'classmethod' object",
-                        ));
-                    }
-                    let w_obj = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-                    let mut w_klass = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
-                    if w_klass.is_null() || unsafe { pyre_object::is_none(w_klass) } {
-                        w_klass = crate::typedef::r#type(w_obj).unwrap_or(pyre_object::PY_NULL);
-                    }
-                    let w_func = unsafe { pyre_object::function::w_classmethod_get_func(cm) };
-                    Ok(pyre_object::w_method_new(w_func, w_klass, w_klass))
-                },
-                3,
-            ),
-        )
-    };
-    // typedef.py:884-885 ─
-    //   __func__ = interp_attrproperty_w('w_function', cls=ClassMethod),
-    //   __wrapped__ = interp_attrproperty_w('w_function', cls=ClassMethod),
-    fn classmethod_func_attr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        let obj = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-        if !unsafe { pyre_object::function::is_classmethod(obj) } {
-            return Ok(pyre_object::w_none());
-        }
-        let w_value = unsafe { pyre_object::function::w_classmethod_get_func(obj) };
-        if w_value.is_null() {
-            Ok(pyre_object::w_none())
-        } else {
-            Ok(w_value)
+fn classmethod_require(obj: PyObjectRef, name: &str) -> Result<PyObjectRef, crate::PyError> {
+    if obj.is_null() || !unsafe { pyre_object::function::is_classmethod(obj) } {
+        return Err(crate::PyError::type_error(format!(
+            "descriptor '{name}' requires a 'classmethod' object"
+        )));
+    }
+    Ok(obj)
+}
+
+/// function.py:750-753 `ClassMethod.descr_classmethod__new__` / CPython
+/// 3.14 `cm_new`: allocate the requested subtype with a temporary None
+/// callable; `__init__` installs the actual callable.
+fn classmethod_descr_new(args: &[PyObjectRef]) -> crate::PyResult {
+    let cls = args.first().copied().unwrap_or(PY_NULL);
+    let classmethod_type = gettypeobject(&pyre_object::function::CLASSMETHOD_TYPE);
+    check_user_subclass(classmethod_type, cls)?;
+    let cm = pyre_object::function::w_classmethod_new(w_none());
+    if !std::ptr::eq(cls, classmethod_type) {
+        unsafe { (*cm).w_class = cls };
+    }
+    Ok(cm)
+}
+
+/// function.py:755-758 `ClassMethod.descr_init`, adjusted to CPython 3.14's
+/// `functools_wraps`: copy the four eager presentation attributes while the
+/// two annotation attributes remain lazy proxy descriptors.
+fn classmethod_descr_init(args: &[PyObjectRef]) -> crate::PyResult {
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    if crate::builtins::has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(
+            "classmethod() takes no keyword arguments",
+        ));
+    }
+    let cm = classmethod_require(positional.first().copied().unwrap_or(PY_NULL), "__init__")?;
+    let supplied = positional.len().saturating_sub(1);
+    if supplied != 1 {
+        return Err(crate::PyError::type_error(format!(
+            "classmethod expected 1 argument, got {supplied}"
+        )));
+    }
+    let function = positional[1];
+    unsafe { pyre_object::function::w_classmethod_set_func(cm, function) };
+    let w_dict = unsafe { pyre_object::function::w_classmethod_getdict(cm) };
+    for name in ["__module__", "__name__", "__qualname__", "__doc__"] {
+        match crate::baseobjspace::getattr_str(function, name) {
+            Ok(value) => {
+                crate::baseobjspace::setitem(w_dict, w_str_new(name), value)?;
+            }
+            Err(err) if err.kind == crate::PyErrorKind::AttributeError => {}
+            Err(err) => return Err(err),
         }
     }
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+    Ok(w_none())
+}
+
+/// function.py:738-748 `descr_classmethod_get`. Python 3.14's `cm_descr_get`
+/// binds the stored callable directly to the selected class; it no longer
+/// invokes a descriptor nested inside classmethod.
+fn classmethod_descr_get(args: &[PyObjectRef]) -> crate::PyResult {
+    let cm = classmethod_require(args.first().copied().unwrap_or(PY_NULL), "__get__")?;
+    let w_obj = args.get(1).copied().unwrap_or(PY_NULL);
+    let mut w_klass = args.get(2).copied().unwrap_or(PY_NULL);
+    if w_klass.is_null() || unsafe { pyre_object::is_none(w_klass) } {
+        w_klass = r#type(w_obj).unwrap_or(PY_NULL);
+    }
+    let function = unsafe { pyre_object::function::w_classmethod_get_func(cm) };
+    Ok(pyre_object::w_method_new(function, w_klass, w_klass))
+}
+
+fn classmethod_func_attr(args: &[PyObjectRef]) -> crate::PyResult {
+    let cm = classmethod_require(args.get(1).copied().unwrap_or(PY_NULL), "__func__")?;
+    let value = unsafe { pyre_object::function::w_classmethod_get_func(cm) };
+    Ok(if value.is_null() { w_none() } else { value })
+}
+
+fn classmethod_isabstract(args: &[PyObjectRef]) -> crate::PyResult {
+    let cm = classmethod_require(
+        args.get(1).copied().unwrap_or(PY_NULL),
+        "__isabstractmethod__",
+    )?;
+    let function = unsafe { pyre_object::function::w_classmethod_get_func(cm) };
+    Ok(w_bool_from(crate::baseobjspace::isabstractmethod_w(
+        function,
+    )?))
+}
+
+fn classmethod_wrapped_attr_get(obj: PyObjectRef, name: &str) -> crate::PyResult {
+    let cm = classmethod_require(obj, name)?;
+    let w_dict = unsafe { pyre_object::function::w_classmethod_getdict(cm) };
+    if let Some(value) = crate::baseobjspace::finditem_str(w_dict, name)? {
+        return Ok(value);
+    }
+    let function = unsafe { pyre_object::function::w_classmethod_get_func(cm) };
+    let value = crate::baseobjspace::getattr_str(function, name)?;
+    crate::baseobjspace::setitem(w_dict, w_str_new(name), value)?;
+    Ok(value)
+}
+
+fn classmethod_annotations_get(args: &[PyObjectRef]) -> crate::PyResult {
+    classmethod_wrapped_attr_get(args.get(1).copied().unwrap_or(PY_NULL), "__annotations__")
+}
+
+fn classmethod_annotate_get(args: &[PyObjectRef]) -> crate::PyResult {
+    classmethod_wrapped_attr_get(args.get(1).copied().unwrap_or(PY_NULL), "__annotate__")
+}
+
+fn classmethod_wrapped_attr_set(args: &[PyObjectRef], name: &str) -> crate::PyResult {
+    let cm = classmethod_require(args.get(1).copied().unwrap_or(PY_NULL), name)?;
+    let value = args.get(2).copied().unwrap_or(PY_NULL);
+    let w_dict = unsafe { pyre_object::function::w_classmethod_getdict(cm) };
+    crate::baseobjspace::setitem(w_dict, w_str_new(name), value)?;
+    Ok(w_none())
+}
+
+fn classmethod_annotations_set(args: &[PyObjectRef]) -> crate::PyResult {
+    classmethod_wrapped_attr_set(args, "__annotations__")
+}
+
+fn classmethod_annotate_set(args: &[PyObjectRef]) -> crate::PyResult {
+    classmethod_wrapped_attr_set(args, "__annotate__")
+}
+
+fn classmethod_wrapped_attr_del(args: &[PyObjectRef], name: &str) -> crate::PyResult {
+    let cm = classmethod_require(args.get(1).copied().unwrap_or(PY_NULL), name)?;
+    let w_dict = unsafe { pyre_object::function::w_classmethod_getdict(cm) };
+    if let Err(err) = crate::baseobjspace::delitem(w_dict, w_str_new(name)) {
+        if err.kind == crate::PyErrorKind::KeyError {
+            return Err(crate::PyError::attribute_error(format!(
+                "'classmethod' object has no attribute '{name}'"
+            )));
+        }
+        return Err(err);
+    }
+    Ok(w_none())
+}
+
+fn classmethod_annotations_del(args: &[PyObjectRef]) -> crate::PyResult {
+    classmethod_wrapped_attr_del(args, "__annotations__")
+}
+
+fn classmethod_annotate_del(args: &[PyObjectRef]) -> crate::PyResult {
+    classmethod_wrapped_attr_del(args, "__annotate__")
+}
+
+fn classmethod_dict_del(_args: &[PyObjectRef]) -> crate::PyResult {
+    Err(crate::PyError::type_error("cannot delete __dict__"))
+}
+
+/// function.py:767-768 `descr_repr` / CPython 3.14 `cm_repr`.
+fn classmethod_descr_repr(args: &[PyObjectRef]) -> crate::PyResult {
+    let cm = classmethod_require(args.first().copied().unwrap_or(PY_NULL), "__repr__")?;
+    let function = unsafe { pyre_object::function::w_classmethod_get_func(cm) };
+    let repr = if function.is_null() {
+        "<NULL>".to_string()
+    } else {
+        unsafe { crate::display::py_repr(function)? }
+    };
+    Ok(w_str_new(&format!("<classmethod({repr})>")))
+}
+
+/// PyPy `typedef.py:878-908 ClassMethod.typedef`, with the Python 3.14
+/// surface taking precedence: PEP 649 proxy descriptors and generic alias
+/// support replace PyPy 3.11's eager annotations copy and `__reduce_ex__`.
+fn init_classmethod_type(ns: PyObjectRef) {
+    let dict_getter = make_builtin_function_with_arity("__dict__", descr_get_dict, 2);
+    let dict_setter = make_builtin_function_with_arity("__dict__", descr_set_dict, 3);
+    let dict_deleter = make_builtin_function_with_arity("__dict__", classmethod_dict_del, 2);
+    let annotations_getter =
+        make_builtin_function_with_arity("__annotations__", classmethod_annotations_get, 2);
+    let annotations_setter =
+        make_builtin_function_with_arity("__annotations__", classmethod_annotations_set, 3);
+    let annotations_deleter =
+        make_builtin_function_with_arity("__annotations__", classmethod_annotations_del, 2);
+    let annotate_getter =
+        make_builtin_function_with_arity("__annotate__", classmethod_annotate_get, 2);
+    let annotate_setter =
+        make_builtin_function_with_arity("__annotate__", classmethod_annotate_set, 3);
+    let annotate_deleter =
+        make_builtin_function_with_arity("__annotate__", classmethod_annotate_del, 2);
+    let entries = [
+        (
+            "__doc__",
+            w_str_new(
+                "Convert a function to be a class method.\n\nA class method receives the class as implicit first argument,\njust like an instance method receives the instance.\nTo declare a class method, use this idiom:\n\n  class C:\n      @classmethod\n      def f(cls, arg1, arg2, argN):\n          ...\n\nIt can be called either on the class (e.g. C.f()) or on an instance\n(e.g. C().f()).  The instance is ignored except for its class.\nIf a class method is called for a derived class, the derived class\nobject is passed as the implied first argument.\n\nClass methods are different than C++ or Java static methods.\nIf you want those, see the staticmethod builtin.",
+            ),
+        ),
+        (
+            "__get__",
+            make_builtin_function("__get__", classmethod_descr_get),
+        ),
+        ("__new__", make_new_descr(classmethod_descr_new)),
+        (
+            "__init__",
+            make_builtin_function("__init__", classmethod_descr_init),
+        ),
+        (
             "__func__",
             make_getset_descriptor(make_builtin_function_with_arity(
                 "__func__",
                 classmethod_func_attr,
                 2,
             )),
-        )
-    };
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        ),
+        (
             "__wrapped__",
             make_getset_descriptor(make_builtin_function_with_arity(
                 "__wrapped__",
                 classmethod_func_attr,
                 2,
             )),
-        )
-    };
-    // typedef.py:886 `__isabstractmethod__ = GetSetProperty(
-    //     ClassMethod.descr_isabstract)`.  function.py:760-761:
-    //
-    //     def descr_isabstract(self, space):
-    //         return space.newbool(space.isabstractmethod_w(self.w_function))
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        ),
+        (
             "__isabstractmethod__",
             make_getset_descriptor(make_builtin_function_with_arity(
                 "__isabstractmethod__",
-                |args| {
-                    let cm = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-                    if !unsafe { pyre_object::function::is_classmethod(cm) } {
-                        return Ok(pyre_object::w_bool_from(false));
-                    }
-                    let func = unsafe { pyre_object::function::w_classmethod_get_func(cm) };
-                    let result = crate::baseobjspace::isabstractmethod_w(func)?;
-                    Ok(pyre_object::w_bool_from(result))
-                },
+                classmethod_isabstract,
                 2,
             )),
-        )
-    };
+        ),
+        (
+            "__dict__",
+            make_getset_property_named(dict_getter, dict_setter, dict_deleter, "__dict__"),
+        ),
+        (
+            "__annotations__",
+            make_getset_property_named(
+                annotations_getter,
+                annotations_setter,
+                annotations_deleter,
+                "__annotations__",
+            ),
+        ),
+        (
+            "__annotate__",
+            make_getset_property_named(
+                annotate_getter,
+                annotate_setter,
+                annotate_deleter,
+                "__annotate__",
+            ),
+        ),
+        (
+            "__class_getitem__",
+            pyre_object::function::w_classmethod_new(make_builtin_function(
+                "__class_getitem__",
+                crate::_pypy_generic_alias::generic_alias_class_getitem,
+            )),
+        ),
+        (
+            "__repr__",
+            make_builtin_function("__repr__", classmethod_descr_repr),
+        ),
+    ];
+    for (name, value) in entries {
+        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+    }
 }
 
 /// `property.__new__(cls, fget=None, fset=None, fdel=None, doc=None)`

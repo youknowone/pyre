@@ -779,6 +779,28 @@ pub fn call_kw(
         return call_with_kwargs(frame, callable_unwrapped, &pos_args, &kw_entries);
     }
 
+    // A base classmethod has no tp_call, but a user subtype may define
+    // `__call__`. Split the keyword tail before generic signature handling;
+    // call_with_kwargs performs the special-method descriptor binding.
+    if unsafe { pyre_object::is_classmethod(callable_unwrapped) } {
+        let nkw = if unsafe { pyre_object::is_tuple(kwarg_names) } {
+            unsafe { pyre_object::w_tuple_len(kwarg_names) }
+        } else {
+            0
+        };
+        let n_pos = args.len().saturating_sub(nkw);
+        let pos_args = args[..n_pos].to_vec();
+        let mut kw_entries = Vec::with_capacity(nkw);
+        for ki in 0..nkw {
+            if let Some(name_obj) = unsafe { pyre_object::w_tuple_getitem(kwarg_names, ki as i64) }
+            {
+                let key = unsafe { pyre_object::w_str_get_wtf8(name_obj) }.to_owned();
+                kw_entries.push((key, args[n_pos + ki]));
+            }
+        }
+        return call_with_kwargs(frame, callable_unwrapped, &pos_args, &kw_entries);
+    }
+
     // For type objects with kwargs: use call_with_kwargs which handles
     // __new__/__init__ kwargs forwarding correctly.
     if unsafe { pyre_object::is_type(callable_unwrapped) } {
@@ -935,6 +957,26 @@ fn metaclass_call_override(callable: PyObjectRef) -> Option<PyObjectRef> {
     Some(bound)
 }
 
+/// Resolve a `__call__` introduced by a classmethod *subtype*. The base
+/// classmethod has no such slot in PyPy or CPython 3.14. Descriptor binding
+/// is essential here: an ordinary function receives the wrapper, while a
+/// staticmethod override does not.
+fn classmethod_call_override(callable: PyObjectRef) -> Result<Option<PyObjectRef>, PyError> {
+    if !unsafe { pyre_object::is_classmethod(callable) } {
+        return Ok(None);
+    }
+    let Some(w_type) = crate::typedef::r#type(callable) else {
+        return Ok(None);
+    };
+    let Some(call_descr) = (unsafe { crate::baseobjspace::lookup_in_type(w_type, "__call__") })
+    else {
+        return Ok(None);
+    };
+    let bound =
+        unsafe { crate::baseobjspace::get(call_descr, callable, w_type) }?.unwrap_or(call_descr);
+    Ok(Some(bound))
+}
+
 fn call_callable_with_mode(
     frame: &mut PyFrame,
     callable: PyObjectRef,
@@ -971,8 +1013,11 @@ fn call_callable_with_mode(
         let func = unsafe { pyre_object::w_staticmethod_get_func(callable) };
         return call_callable_with_mode(frame, func, args, mode);
     }
-    // ClassMethod defines no descr_call (function.py), so a raw classmethod
-    // object is not callable; it falls through to the not-callable error.
+    if let Some(bound) = classmethod_call_override(callable)? {
+        return call_callable_with_mode(frame, bound, args, mode);
+    }
+    // The base ClassMethod defines no descr_call (function.py), so a raw
+    // classmethod object falls through to the not-callable error.
 
     // Instance with __call__ — PyPy: descroperation.py descr_call
     if unsafe { pyre_object::is_instance(callable) } {
@@ -1629,6 +1674,13 @@ pub fn call_with_kwargs(
         return call_with_kwargs(frame, func, pos_args, kwargs);
     }
 
+    if unsafe { pyre_object::is_classmethod(callable) } {
+        if let Some(bound) = classmethod_call_override(callable)? {
+            return call_with_kwargs(frame, bound, pos_args, kwargs);
+        }
+        return Err(PyError::type_error("'classmethod' object is not callable"));
+    }
+
     // Unwrap bound methods: prepend receiver to pos_args.
     if unsafe { pyre_object::is_method(callable) } {
         let func = unsafe { pyre_object::w_method_get_func(callable) };
@@ -2262,12 +2314,12 @@ pub fn call_function_impl_result(
             let func = pyre_object::w_staticmethod_get_func(callable);
             return call_function_impl_result(func, args);
         }
-        // classmethod → unwrap and call the wrapped function
-        // PyPy: function.py ClassMethod.descr_classmethod__call__
-        if pyre_object::is_classmethod(callable) {
-            let func = pyre_object::w_classmethod_get_func(callable);
-            return call_function_impl_result(func, args);
+        if let Some(bound) = classmethod_call_override(callable)? {
+            return call_function_impl_result(bound, args);
         }
+        // ClassMethod has no descr_call (function.py:718-768; CPython 3.14
+        // `PyClassMethod_Type.tp_call = 0`), so a raw wrapper falls through
+        // to the ordinary not-callable error.
         // GenericAlias.__call__ (`_pypy_generic_alias.py:41`) —
         // `self.__origin__(*args, **kwargs)`, then best-effort
         // `result.__orig_class__ = self`.  Resolved here because the call
