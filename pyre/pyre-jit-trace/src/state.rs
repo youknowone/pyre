@@ -1195,7 +1195,6 @@ pub fn frame_liveness_reg_indices_by_bank_at(
 /// the SAME carried word so their register color sets agree.
 pub fn frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
     jitcode_index: i32,
-    pc: i32,
     carried_jitcode_pc: i32,
 ) -> FrameLivenessRegIndices {
     ensure_finish_setup();
@@ -1254,7 +1253,7 @@ pub(crate) fn frame_liveness_reg_indices_by_bank_from_pc(
     jitcode_index: i32,
     pc: i32,
 ) -> FrameLivenessRegIndices {
-    frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(jitcode_index, pc, pc)
+    frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(jitcode_index, pc)
 }
 
 /// Whether the resume frame's pc word names a resolved JitCode `-live-` offset
