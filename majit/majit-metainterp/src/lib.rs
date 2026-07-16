@@ -87,10 +87,8 @@ pub use call_descr::{
     ELIDABLE_OR_MEMERROR_EFFECT_INFO, EffectInfoSlot, INT_PY_DIV_EFFECT_INFO,
     INT_PY_MOD_EFFECT_INFO, LOOPINVARIANT_EFFECT_INFO, cannot_raise_effect_info,
     default_effect_info, effect_info_for_slot, forces_virtual_or_virtualizable_effect_info,
-    make_call_assembler_descr, make_call_assembler_descr_by_number,
-    make_call_assembler_descr_with_vable, make_call_assembler_descr_with_vable_by_number,
-    make_call_descr, make_call_descr_from_target_slot, make_call_descr_with_effect,
-    nursery_alloc_effect_info,
+    make_call_assembler_descr, make_call_assembler_descr_with_vable, make_call_descr,
+    make_call_descr_from_target_slot, make_call_descr_with_effect, nursery_alloc_effect_info,
 };
 pub use compile::{
     make_fail_descr, make_fail_descr_typed, make_finish_fail_descr_typed,

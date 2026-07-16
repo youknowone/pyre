@@ -4471,12 +4471,28 @@ impl<S: JitState> JitDriver<S> {
         self.meta.get_loop_token(green_key).map(|t| t.number)
     }
 
+    /// Get the owning token object for a compiled loop.
+    pub fn get_loop_token_arc(
+        &self,
+        green_key: u64,
+    ) -> Option<std::sync::Arc<majit_backend::JitCellToken>> {
+        self.meta.get_loop_token_arc(green_key).cloned()
+    }
+
     /// Get the pre-allocated token number for the trace being recorded.
     ///
     /// Returns `Some(number)` if `green_key` matches the current trace's
     /// target, enabling self-recursive call_assembler emission.
     pub fn get_pending_token_number(&self, green_key: u64) -> Option<u64> {
         self.meta.get_pending_token_number(green_key)
+    }
+
+    /// Get the pre-allocated token object for the trace being recorded.
+    pub fn get_pending_token_arc(
+        &self,
+        green_key: u64,
+    ) -> Option<std::sync::Arc<majit_backend::JitCellToken>> {
+        self.meta.get_pending_token_arc(green_key).cloned()
     }
 
     /// Decide how to handle a function call during tracing.

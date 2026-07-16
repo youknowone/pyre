@@ -4443,6 +4443,7 @@ impl TraceCtx {
 
     // ── CALL_ASSEMBLER ────────────────────────────────────────────
 
+    #[cfg(test)]
     fn call_assembler_typed(
         &mut self,
         opcode: OpCode,
@@ -4451,11 +4452,9 @@ impl TraceCtx {
         arg_types: &[Type],
         ret_type: Type,
     ) -> OpRef {
-        // Test/dispatch callers pass a stack-synthesised `JitCellToken`
-        // (no `Arc` identity). Route through the number-only factory; the
-        // keepalive walker recovers the real Arc via
-        // `jitcell_token_by_number` (transitional fallback in
-        // `record_loop_or_bridge`) until callers thread Arc identity.
+        // Test callers can pass a stack-synthesised `JitCellToken` with no
+        // Arc identity. Production CALL_ASSEMBLER emission uses the Arc-typed
+        // helpers above.
         let descr = crate::call_descr::make_call_assembler_descr_by_number(
             target.number,
             arg_types,
@@ -4468,6 +4467,7 @@ impl TraceCtx {
     /// Emit CALL_ASSEMBLER_<type> by token number with explicit arg types.
     /// resoperation.py:1251 `call_assembler_for_descr`: opcode is selected
     /// from `result_type` per `OpCode::call_assembler_for_type`.
+    #[cfg(test)]
     fn call_assembler_typed_by_number(
         &mut self,
         target_number: u64,
@@ -4507,6 +4507,7 @@ impl TraceCtx {
         result
     }
 
+    #[cfg(test)]
     pub fn call_assembler_void_by_number_typed(
         &mut self,
         target_number: u64,
@@ -4516,6 +4517,7 @@ impl TraceCtx {
         let _ = self.call_assembler_typed_by_number(target_number, args, arg_types, Type::Void);
     }
 
+    #[cfg(test)]
     pub fn call_assembler_int_by_number_typed(
         &mut self,
         target_number: u64,
@@ -4525,6 +4527,7 @@ impl TraceCtx {
         self.call_assembler_typed_by_number(target_number, args, arg_types, Type::Int)
     }
 
+    #[cfg(test)]
     pub fn call_assembler_ref_by_number_typed(
         &mut self,
         target_number: u64,
@@ -4534,6 +4537,7 @@ impl TraceCtx {
         self.call_assembler_typed_by_number(target_number, args, arg_types, Type::Ref)
     }
 
+    #[cfg(test)]
     pub fn call_assembler_float_by_number_typed(
         &mut self,
         target_number: u64,
@@ -4613,6 +4617,7 @@ impl TraceCtx {
     /// rewrite.py:665-695 handle_call_assembler parity.
     /// Emit CALL_ASSEMBLER with only the frame reference as arg; the backend
     /// expands to the full callee inputarg layout via `VableExpansion`.
+    #[cfg(test)]
     pub fn call_assembler_with_vable_expansion(
         &mut self,
         target_number: u64,
@@ -4633,6 +4638,7 @@ impl TraceCtx {
     /// Emit CALL_ASSEMBLER with multiple red args + VableExpansion.
     /// The backend reads some fields from args[0] (frame) and uses
     /// arg_overrides/const_overrides for callee-specific values.
+    #[cfg(test)]
     pub fn call_assembler_with_vable_expansion_args(
         &mut self,
         target_number: u64,
@@ -4669,6 +4675,7 @@ impl TraceCtx {
     ///
     /// Covered by `call_assembler_red_only_ref_emits_no_vable_expansion`
     /// to verify the emitted descriptor shape.
+    #[cfg(test)]
     pub fn call_assembler_red_only_ref(
         &mut self,
         target_number: u64,
@@ -4686,30 +4693,49 @@ impl TraceCtx {
         self.record_op_with_descr(OpCode::CallAssemblerR, args, descr)
     }
 
+    /// Arc-carrying sibling of [`Self::call_assembler_red_only_ref`].
+    /// RPython records the target `JitCellToken` object directly on
+    /// CALL_ASSEMBLER ops (`compile.py:187`), so production walker paths use
+    /// this once they have resolved or synthesized the token object.
+    pub fn call_assembler_red_only_ref_arc(
+        &mut self,
+        target_arc: std::sync::Arc<JitCellToken>,
+        args: &[OpRef],
+        arg_types: &[Type],
+    ) -> OpRef {
+        let descr = crate::call_descr::make_call_assembler_descr(target_arc, arg_types, Type::Ref);
+        self.record_op_with_descr(OpCode::CallAssemblerR, args, descr)
+    }
+
     /// Emit CALL_ASSEMBLER_N (void), inferring arg types from the current boxes.
+    #[cfg(test)]
     pub fn call_assembler_void(&mut self, target: &JitCellToken, args: &[OpRef]) {
         let arg_types = self.infer_arg_types(args);
         self.call_assembler_void_typed(target, args, &arg_types);
     }
 
     /// Emit CALL_ASSEMBLER_I, inferring arg types from the current boxes.
+    #[cfg(test)]
     pub fn call_assembler_int(&mut self, target: &JitCellToken, args: &[OpRef]) -> OpRef {
         let arg_types = self.infer_arg_types(args);
         self.call_assembler_int_typed(target, args, &arg_types)
     }
 
     /// Emit CALL_ASSEMBLER_R, inferring arg types from the current boxes.
+    #[cfg(test)]
     pub fn call_assembler_ref(&mut self, target: &JitCellToken, args: &[OpRef]) -> OpRef {
         let arg_types = self.infer_arg_types(args);
         self.call_assembler_ref_typed(target, args, &arg_types)
     }
 
     /// Emit CALL_ASSEMBLER_F, inferring arg types from the current boxes.
+    #[cfg(test)]
     pub fn call_assembler_float(&mut self, target: &JitCellToken, args: &[OpRef]) -> OpRef {
         let arg_types = self.infer_arg_types(args);
         self.call_assembler_float_typed(target, args, &arg_types)
     }
 
+    #[cfg(test)]
     pub fn call_assembler_void_typed(
         &mut self,
         target: &JitCellToken,
@@ -4725,6 +4751,7 @@ impl TraceCtx {
         );
     }
 
+    #[cfg(test)]
     pub fn call_assembler_int_typed(
         &mut self,
         target: &JitCellToken,
@@ -4740,6 +4767,7 @@ impl TraceCtx {
         )
     }
 
+    #[cfg(test)]
     pub fn call_assembler_ref_typed(
         &mut self,
         target: &JitCellToken,
@@ -4755,6 +4783,7 @@ impl TraceCtx {
         )
     }
 
+    #[cfg(test)]
     pub fn call_assembler_float_typed(
         &mut self,
         target: &JitCellToken,

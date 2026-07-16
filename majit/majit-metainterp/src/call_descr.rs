@@ -742,17 +742,14 @@ pub fn make_call_assembler_descr(
     })
 }
 
-/// Number-only factory for callers that have not yet been threaded an
-/// `Arc<JitCellToken>` (jitcode dispatch in `dispatch.rs`, test fixtures).
+/// Test-only number factory for fixtures that do not have an
+/// `Arc<JitCellToken>`.
 ///
 /// Synthesises a fresh stand-alone `Arc<JitCellToken>` with the requested
 /// `target_number` so the descr keeps the same shape as the identity-preserving
-/// path. Identity is **not** preserved — the keepalive walker recovers the
-/// real Arc via `jitcell_token_by_number(target_number)` for these descrs
-/// (`pyjitpl.rs:record_loop_or_bridge` Arc-fallback inside the
-/// CALL_ASSEMBLER branch). Sites transitioning to
-/// `make_call_assembler_descr` once the Arc is available upstream remove
-/// the lookup.
+/// path. Identity is not preserved, so production callers must use
+/// `make_call_assembler_descr`.
+#[cfg(test)]
 pub fn make_call_assembler_descr_by_number(
     target_number: u64,
     arg_types: &[Type],
@@ -781,8 +778,8 @@ pub fn make_call_assembler_descr_with_vable(
     })
 }
 
-/// Number-only sibling of `make_call_assembler_descr_with_vable` for transitional
-/// callers (jitcode dispatch). See `make_call_assembler_descr_by_number`.
+/// Test-only number sibling of `make_call_assembler_descr_with_vable`.
+#[cfg(test)]
 pub fn make_call_assembler_descr_with_vable_by_number(
     target_number: u64,
     arg_types: &[Type],

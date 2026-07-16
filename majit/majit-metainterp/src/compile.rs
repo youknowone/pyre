@@ -68,6 +68,22 @@ pub fn make_jitcell_token(number: u64, jd_index: Option<usize>) -> Arc<JitCellTo
     Arc::new(token)
 }
 
+/// Mutable access to the single `JitCellToken` object while a real loop is
+/// being finalized.
+///
+/// RPython carries the same token object through `compile.py:266` and
+/// CALL_ASSEMBLER descrs (`compile.py:187`). During self-recursive tracing,
+/// pyre's trace ops can already hold `Arc` clones of that pending token before
+/// `backend.compile_loop` fills backend fields on the token. The JIT compile
+/// phase is single-threaded and the descr-held clones are not dereferenced
+/// while the backend mutates the token.
+pub(crate) fn jitcell_token_mut_for_compile(token: &mut Arc<JitCellToken>) -> &mut JitCellToken {
+    // Safety: see the function-level contract. This is the Rust-side
+    // equivalent of mutating the one upstream token object after it has been
+    // attached to recorded CALL_ASSEMBLER ops.
+    unsafe { &mut *(Arc::as_ptr(token) as *mut JitCellToken) }
+}
+
 /// `compile.py:180-181` `wref = weakref.ref(original_jitcell_token);
 /// clt.loop_token_wref = wref` parity. Must be called *after* every
 /// `Arc::get_mut(&mut token)` mutation has settled, because creating

@@ -1132,10 +1132,10 @@ pub struct MetaInterp<M: Clone> {
     pub(crate) next_trace_id: u64,
     /// JIT hooks for profiling and debugging.
     pub(crate) hooks: JitHooks,
-    /// Pre-allocated token number for the trace currently being recorded.
+    /// Pre-allocated token object for the trace currently being recorded.
     /// Set when tracing starts so that self-recursive calls can emit
     /// call_assembler targeting this token before the trace is compiled.
-    pub(crate) pending_token: Option<(u64, u64)>,
+    pub(crate) pending_token: Option<(u64, Arc<JitCellToken>)>,
     /// Cumulative statistics counters.
     pub(crate) stats: JitStatsCounters,
     /// Pointer to the live virtualizable object at trace entry.
@@ -3708,8 +3708,10 @@ impl<M: Clone> MetaInterp<M> {
                         meta.portal_call_depth
                     }));
                 }
-                let pending_num = self.warm_state.alloc_token_number();
-                self.pending_token = Some((green_key, pending_num));
+                let pending_token =
+                    self.make_pending_trace_token(green_key, driver_descriptor.as_ref());
+                let pending_num = pending_token.number;
+                self.pending_token = Some((green_key, pending_token));
                 // RPython compile_tmp_callback parity: register a placeholder
                 // target so call_assembler can resolve the pending token at
                 // runtime. call_assembler_fast_path detects null code_ptr and
@@ -3985,8 +3987,9 @@ impl<M: Clone> MetaInterp<M> {
                 meta.portal_call_depth
             }));
         }
-        let pending_num = self.warm_state.alloc_token_number();
-        self.pending_token = Some((green_key, pending_num));
+        let pending_token = self.make_pending_trace_token(green_key, driver_descriptor.as_ref());
+        let pending_num = pending_token.number;
+        self.pending_token = Some((green_key, pending_token));
         self.backend.register_pending_target(
             pending_num,
             input_types,
@@ -4043,7 +4046,7 @@ impl<M: Clone> MetaInterp<M> {
         let warm_state = &self.warm_state;
         let backend = &self.backend;
         let staticdata = &self.staticdata;
-        let pending_token = self.pending_token;
+        let pending_green_key = self.pending_token.as_ref().map(|(k, _)| *k);
         let max_unroll = self.max_unroll_recursion;
         let resolver = |n: u64| -> Option<Arc<JitCellToken>> {
             for compiled in compiled_loops.values() {
@@ -4092,8 +4095,8 @@ impl<M: Clone> MetaInterp<M> {
                 return InlineDecision::ResidualCall;
             };
             let green_key = crate::green_key_hash_typed(green_values, &jd.green_args_spec());
-            let callee_compiled = compiled_loops.contains_key(&green_key)
-                || pending_token.map_or(false, |(k, _)| k == green_key);
+            let callee_compiled =
+                compiled_loops.contains_key(&green_key) || pending_green_key == Some(green_key);
             let can_inline = warm_state.can_inline_callable(green_key);
             let (decision, _should_disable) = decide_recursive_inline(
                 callee_compiled,
@@ -5019,6 +5022,25 @@ impl<M: Clone> MetaInterp<M> {
             driver_descriptor.and_then(JitDriverStaticData::virtualizable_arg_index);
     }
 
+    /// Allocate the real pending token object at trace start. RPython stores
+    /// the scheduled procedure token on the warm cell before calls can emit
+    /// CALL_ASSEMBLER (`warmstate.py:674-687`); pyre keeps the same object in
+    /// `pending_token` until the trace is finalized.
+    fn make_pending_trace_token(
+        &mut self,
+        green_key: u64,
+        driver_descriptor: Option<&JitDriverStaticData>,
+    ) -> Arc<JitCellToken> {
+        let token_num = self.warm_state.alloc_token_number();
+        let mut token = make_jitcell_token(token_num, driver_descriptor.and_then(|d| d.index));
+        self.configure_loop_token_for_driver(
+            Arc::get_mut(&mut token).expect("fresh pending JitCellToken must be uniquely owned"),
+            green_key,
+            driver_descriptor,
+        );
+        token
+    }
+
     /// Close the current trace, optimize, and compile.
     ///
     /// `jump_args` are the symbolic values (OpRefs) at the end of the loop,
@@ -5861,25 +5883,29 @@ impl<M: Clone> MetaInterp<M> {
         // resume.py parity: rd_numb is now produced inline during optimization
         // (ctx.emit → store_final_boxes_in_guard) rather than post-assembly.
 
-        // Use pre-allocated token number if available (for self-recursion
+        // Use the pre-allocated token object if available (for self-recursion
         // support), otherwise allocate a fresh one.
-        let token_num = if let Some((pk, pn)) = self.pending_token.take() {
+        let mut token = if let Some((pk, token)) = self.pending_token.take() {
             if pk == green_key {
-                pn
+                token
             } else {
-                self.warm_state.alloc_token_number()
+                make_jitcell_token(
+                    self.warm_state.alloc_token_number(),
+                    driver_descriptor.as_ref().and_then(|d| d.index),
+                )
             }
         } else {
-            self.warm_state.alloc_token_number()
+            make_jitcell_token(
+                self.warm_state.alloc_token_number(),
+                driver_descriptor.as_ref().and_then(|d| d.index),
+            )
         };
-        // `compile.py:266 jitcell_token = make_jitcell_token(jitdriver_sd)`.
-        let mut token =
-            make_jitcell_token(token_num, driver_descriptor.as_ref().and_then(|d| d.index));
         self.configure_loop_token_for_driver(
-            Arc::get_mut(&mut token).expect("fresh JitCellToken must be uniquely owned"),
+            compile::jitcell_token_mut_for_compile(&mut token),
             green_key,
             driver_descriptor.as_ref(),
         );
+        let token_num = token.number;
         // `compile.py:180-181` wref wiring — done inside
         // `record_loop_or_bridge` once all `Arc::get_mut` writes settle.
         let trace_id = self.alloc_trace_id();
@@ -6010,8 +6036,7 @@ impl<M: Clone> MetaInterp<M> {
                 self.backend.compile_loop(
                     &inputargs,
                     &compiled_ops,
-                    Arc::get_mut(&mut token)
-                        .expect("JitCellToken must stay uniquely owned until backend compile"),
+                    compile::jitcell_token_mut_for_compile(&mut token),
                 )
             }))
         };
@@ -7433,25 +7458,29 @@ impl<M: Clone> MetaInterp<M> {
             eprint!("{}", majit_ir::format_trace(&optimized_ops, &constants));
         }
 
-        // Use pre-allocated token number if available (for self-recursion
+        // Use the pre-allocated token object if available (for self-recursion
         // support), otherwise allocate a fresh one.
-        let token_num = if let Some((pk, pn)) = self.pending_token.take() {
+        let mut token = if let Some((pk, token)) = self.pending_token.take() {
             if pk == green_key {
-                pn
+                token
             } else {
-                self.warm_state.alloc_token_number()
+                make_jitcell_token(
+                    self.warm_state.alloc_token_number(),
+                    driver_descriptor.as_ref().and_then(|d| d.index),
+                )
             }
         } else {
-            self.warm_state.alloc_token_number()
+            make_jitcell_token(
+                self.warm_state.alloc_token_number(),
+                driver_descriptor.as_ref().and_then(|d| d.index),
+            )
         };
-        // `compile.py:266 jitcell_token = make_jitcell_token(jitdriver_sd)`.
-        let mut token =
-            make_jitcell_token(token_num, driver_descriptor.as_ref().and_then(|d| d.index));
         self.configure_loop_token_for_driver(
-            Arc::get_mut(&mut token).expect("fresh JitCellToken must be uniquely owned"),
+            compile::jitcell_token_mut_for_compile(&mut token),
             green_key,
             driver_descriptor.as_ref(),
         );
+        let token_num = token.number;
         // `compile.py:180-181` wref wiring — done inside
         // `record_loop_or_bridge` once all `Arc::get_mut` writes settle.
         let trace_id = self.alloc_trace_id();
@@ -7528,8 +7557,7 @@ impl<M: Clone> MetaInterp<M> {
             self.backend.compile_loop(
                 &inputargs,
                 &optimized_ops,
-                Arc::get_mut(&mut token)
-                    .expect("JitCellToken must stay uniquely owned until backend compile"),
+                compile::jitcell_token_mut_for_compile(&mut token),
             )
         };
         match compile_loop_result {
@@ -9027,8 +9055,19 @@ impl<M: Clone> MetaInterp<M> {
     /// emit call_assembler targeting the pending token.
     pub fn get_pending_token_number(&self, green_key: u64) -> Option<u64> {
         self.pending_token
-            .filter(|&(pk, _)| pk == green_key)
-            .map(|(_, num)| num)
+            .as_ref()
+            .filter(|(pk, _)| *pk == green_key)
+            .map(|(_, token)| token.number)
+    }
+
+    /// Return the real pending `JitCellToken` object for a trace currently
+    /// being recorded. This is the identity-preserving path used by
+    /// CALL_ASSEMBLER descrs before the loop body has been installed.
+    pub fn get_pending_token_arc(&self, green_key: u64) -> Option<&Arc<JitCellToken>> {
+        self.pending_token
+            .as_ref()
+            .filter(|(pk, _)| *pk == green_key)
+            .map(|(_, token)| token)
     }
 
     /// Redirect existing call_assembler calls from one loop to another.
@@ -9180,13 +9219,11 @@ impl<M: Clone> MetaInterp<M> {
             //
             // pyre exposes the owning `Arc<JitCellToken>` carried by
             // `MetaCallAssemblerDescr` through
-            // `LoopTokenDescr::token_handle_any` (Slice X-D). All
-            // production CALL_ASSEMBLER descrs are constructed via
-            // `make_call_assembler_descr` with the real Arc; jitcode
-            // dispatch sites (`trace_ctx.rs`) and tests use
-            // `make_call_assembler_descr_by_number`, which builds a synth
-            // Arc with `compiled.is_none()` — those fall back to the
-            // number-keyed lookup via `jitcell_token_by_number`.
+            // `LoopTokenDescr::token_handle_any`. Production
+            // CALL_ASSEMBLER descrs are constructed via
+            // `make_call_assembler_descr` with the real Arc, including
+            // pending self-recursive tokens whose compiled body is filled
+            // later by `compile_loop`.
             //
             // The `is_call_assembler()` opcode test mirrors RPython's
             // `isinstance(descr, JitCellToken)`: in upstream, the
@@ -9201,26 +9238,13 @@ impl<M: Clone> MetaInterp<M> {
                     if target_number != original.number {
                         // `compile.py:190` `original_jitcell_token.record_jump_to(descr)`.
                         // RPython's `descr` IS the `JitCellToken` object,
-                        // so the call is unconditional.  Pyre's descr
-                        // carries the real owning `Arc<JitCellToken>` for
-                        // production CALL_ASSEMBLER paths (`make_call_assembler_descr`,
-                        // Slice X-D); the by-number factory
-                        // (`make_call_assembler_descr_by_number`) used by
-                        // jitcode dispatch and tests builds a synth Arc
-                        // with `compiled.is_none()` and falls back to
-                        // `jitcell_token_by_number`. Empirical probe
-                        // `MAJIT_PROBE_CA_TARGET_MISS` against full
-                        // pyre/check.py + cargo test recorded zero misses,
-                        // matching `compile.py:187`'s no-fallback shape.
-                        // Promote to `expect` so any future regression
-                        // surfaces fail-loud rather than silently dropping
-                        // a `record_jump_to`.
+                        // so the call is unconditional.
                         let direct_arc = loop_descr
                             .token_handle_any()
                             .and_then(|any| any.downcast_ref::<std::sync::Arc<JitCellToken>>())
-                            .filter(|arc| arc.compiled.is_some());
+                            .cloned();
                         let target = match direct_arc {
-                            Some(real_arc) => std::sync::Arc::clone(real_arc),
+                            Some(real_arc) => real_arc,
                             None => self.jitcell_token_by_number(target_number).expect(
                                 "compile.py:187 — CALL_ASSEMBLER descr's \
                                  JitCellToken must be reachable through \
@@ -11561,7 +11585,10 @@ impl<M: Clone> MetaInterp<M> {
         // the pending-token entry stands in for an already-installed
         // token for inlining-decision purposes only.
         let callee_compiled = self.compiled_loops.contains_key(&callee_key)
-            || self.pending_token.map_or(false, |(k, _)| k == callee_key);
+            || self
+                .pending_token
+                .as_ref()
+                .is_some_and(|(k, _)| *k == callee_key);
 
         // Not tracing: pyjitpl.py:1381 `warmrunnerstate.inlining`
         // is only meaningful inside a trace. Route compiled
@@ -13455,9 +13482,10 @@ impl<M: Clone> MetaInterp<M> {
             std::sync::Arc::clone(arc)
         } else {
             // warmstate.py:714-723 — cell has no procedure_token yet, so
-            // synthesise one via `compile_tmp_callback`.  Reuses the
-            // already-allocated pending token number when available so
-            // the backend's pending-target registry stays consistent.
+            // synthesise one via `compile_tmp_callback`. If the real loop is
+            // already pending, allocate a distinct temporary token; upstream's
+            // `compile_tmp_callback` creates a different JitCellToken object
+            // than the later real loop (`compile.py:1101-1150`).
             let greenboxes: Vec<Value> = greenargs
                 .iter()
                 .map(|(kind, _, value)| match kind {
@@ -13468,9 +13496,7 @@ impl<M: Clone> MetaInterp<M> {
                     }
                 })
                 .collect();
-            let token_number = self
-                .get_pending_token_number(green_key)
-                .unwrap_or_else(|| self.warm_state.alloc_token_number());
+            let token_number = self.warm_state.alloc_token_number();
             let backend = &mut self.backend;
             match self.warm_state.get_assembler_token(green_key, || {
                 compile::compile_tmp_callback(
@@ -13522,21 +13548,34 @@ impl<M: Clone> MetaInterp<M> {
 
     /// Walker-side analog of [`Self::direct_assembler_call`]'s token branch
     /// (pyjitpl.py:3597-3599, warmstate.py:714-723): resolve — or synthesise
-    /// via `compile_tmp_callback` — the CALL_ASSEMBLER token number for a
+    /// via `compile_tmp_callback` — the CALL_ASSEMBLER token object for a
     /// recursive callee whose own loop has not finished compiling.  Returns the
-    /// token number to key the backend target on, or `None` when the real
+    /// token Arc to carry in the descr, or `None` when the real
     /// portal driver is unregistered (cutover off) or `compile_tmp_callback`
     /// fails.
     ///
     /// `greenboxes` carries the portal greens in `build_portal_calldescr`
     /// declaration order (`[next_instr, is_being_profiled, pycode]`);
     /// `red_arg_types` the reds (`[frame, ec]` → `[Ref, Ref]`).
-    pub fn get_or_make_portal_assembler_token_number(
+    pub fn get_or_make_portal_assembler_token_arc(
         &mut self,
         green_key: u64,
         greenboxes: &[Value],
         red_arg_types: &[Type],
-    ) -> Option<u64> {
+    ) -> Option<Arc<JitCellToken>> {
+        // `compile.py:187` parity: an already-compiled loop token wins.
+        // Resolved before the portal-driver lookup — neither an installed
+        // nor a pending token needs the portal staticdata, and the real
+        // portal driver is only registered under the mutual cutover.
+        if let Some(arc) = self.get_loop_token_arc(green_key) {
+            return Some(Arc::clone(arc));
+        }
+        // The real loop's pending token object wins over a tmp callback for
+        // self-recursion. This is the token whose `_ll_function_addr` will be
+        // filled by the later real-loop install.
+        if let Some(arc) = self.get_pending_token_arc(green_key) {
+            return Some(Arc::clone(arc));
+        }
         // The real portal driver has greens; the empty
         // `ensure_default_driver_sd` placeholder (jitdrivers_sd[0]) has none.
         let idx = self
@@ -13545,17 +13584,11 @@ impl<M: Clone> MetaInterp<M> {
             .iter()
             .position(|jd| jd.num_greens() > 0)?;
         let target_sd = self.staticdata.jitdrivers_sd.get(idx).cloned()?;
-        // `compile.py:187` parity: an already-compiled loop token wins.
-        if let Some(arc) = self.get_loop_token_arc(green_key) {
-            return Some(arc.number);
-        }
         // warmstate.py:714-723 — cell has no procedure_token yet, so synthesise
-        // one via `compile_tmp_callback`.  Reuse an already-allocated pending
-        // token number when present so the backend's pending-target registry
-        // stays consistent.
-        let token_number = self
-            .get_pending_token_number(green_key)
-            .unwrap_or_else(|| self.warm_state.alloc_token_number());
+        // one via `compile_tmp_callback`. The temporary callback token is a
+        // distinct object from any later real-loop token (`compile.py:1101-
+        // 1150`).
+        let token_number = self.warm_state.alloc_token_number();
         let backend = &mut self.backend;
         match self.warm_state.get_assembler_token(green_key, || {
             compile::compile_tmp_callback(
@@ -13567,7 +13600,7 @@ impl<M: Clone> MetaInterp<M> {
                 red_arg_types,
             )
         }) {
-            Ok(token) => Some(token.number),
+            Ok(token) => Some(token),
             Err(err) => {
                 if crate::majit_log_enabled() {
                     eprintln!(

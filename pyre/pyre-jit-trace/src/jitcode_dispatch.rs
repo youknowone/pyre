@@ -864,7 +864,7 @@ pub struct WalkContext<'frame, 'static_a: 'frame> {
 /// Not `Copy`: the `CloseLoop` variant carries a `Vec<OpRef>` of merge-point
 /// jump args, mirroring `TraceAction::CloseLoopWithArgs` (`lib.rs:145`)
 /// which is likewise non-`Copy`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum DispatchOutcome {
     /// Step succeeded, continue with the next opcode at the returned pc.
     Continue,
@@ -968,7 +968,71 @@ pub enum DispatchOutcome {
     /// CALL_ASSEMBLER `[frame, ec]` red arg (forcing the virtual
     /// materializes the locals). Gated `PYRE_FBW_LOOP_CALLEE_CA`
     /// (default-OFF); surfaced only from an inlined sub-walk.
-    SubLoopCalleeCallAssembler { token_number: u64, target_pc: usize },
+    SubLoopCalleeCallAssembler {
+        token: std::sync::Arc<majit_backend::JitCellToken>,
+        target_pc: usize,
+    },
+}
+
+impl PartialEq for DispatchOutcome {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Continue, Self::Continue) => true,
+            (Self::Terminate, Self::Terminate) => true,
+            (Self::SubReturn { result: a }, Self::SubReturn { result: b }) => a == b,
+            (
+                Self::SubRaise {
+                    exc: a_exc,
+                    exc_concrete: a_concrete,
+                },
+                Self::SubRaise {
+                    exc: b_exc,
+                    exc_concrete: b_concrete,
+                },
+            ) => a_exc == b_exc && a_concrete == b_concrete,
+            (
+                Self::SwitchToBlackhole {
+                    reason: a_reason,
+                    raising_exception: a_raising,
+                },
+                Self::SwitchToBlackhole {
+                    reason: b_reason,
+                    raising_exception: b_raising,
+                },
+            ) => a_reason == b_reason && a_raising == b_raising,
+            (
+                Self::CloseLoop {
+                    jump_args: a_args,
+                    loop_header_pc: a_pc,
+                    loop_header_marker_jit_pc: a_marker,
+                },
+                Self::CloseLoop {
+                    jump_args: b_args,
+                    loop_header_pc: b_pc,
+                    loop_header_marker_jit_pc: b_marker,
+                },
+            ) => a_args == b_args && a_pc == b_pc && a_marker == b_marker,
+            (
+                Self::CompileTracePending {
+                    loop_header_pc: a_pc,
+                },
+                Self::CompileTracePending {
+                    loop_header_pc: b_pc,
+                },
+            ) => a_pc == b_pc,
+            (
+                Self::SubLoopCalleeCallAssembler {
+                    token: a_token,
+                    target_pc: a_pc,
+                },
+                Self::SubLoopCalleeCallAssembler {
+                    token: b_token,
+                    target_pc: b_pc,
+                },
+            ) => a_token.number == b_token.number && a_pc == b_pc,
+            _ => false,
+        }
+    }
 }
 
 /// Errors surfaced by the trace-side walker.
@@ -14741,68 +14805,43 @@ fn try_walker_call_assembler_self_recursive(
     }
     // Resolve the callee's own loop / pending assembler token
     // (`trace_opcode.rs:5954` + `6138`: `make_green_key(w_callee_code, 0)`,
-    // `pc = 0` = function entry).  `get_loop_token_number` first, else the
+    // `pc = 0` = function entry).  `get_loop_token_arc` first, else the
     // pending token `fib` hits before its loop finishes compiling
     // (`trace_opcode.rs:6035-6036`).  A key miss returns `None` here =
     // safe bail to residual.
-    //
-    // The self-recursion token is the callee's OWN reserved pending number,
-    // used directly — NOT re-synthesised through `compile_tmp_callback`.  Under
-    // pyre's number-keyed backend `_ll_function_addr` registry a
-    // `compile_tmp_callback` at the pending number and the later real-loop
-    // install collide on that same number, leaving a stale/garbage address the
-    // CALL_ASSEMBLER jumps to (SIGSEGV).  Converging the self path onto
-    // `get_assembler_token` (as `direct_assembler_call` already is) is blocked
-    // on the descr-identity cutover (Task #211) that re-roots address
-    // resolution on the descr-carried `Arc<JitCellToken>`; until it lands the
-    // reserved pending number resolved through `register_pending_target` +
-    // CA_FORCE_FN is the pyre-orthodox self-recursion path.
     let (driver, _) = crate::driver::driver_pair();
     let callee_key = crate::driver::make_green_key(w_code, 0);
-    // `get_loop_token_number` first (compiled loop), else the pending token the
-    // callee hits before its loop finishes compiling.  These take `&self`, so
-    // resolve to an owned `Option<u64>` before the `&mut` synth borrow below.
-    let existing = driver
-        .get_loop_token_number(callee_key)
-        .or_else(|| driver.get_pending_token_number(callee_key));
-    let token_number = match existing {
-        Some(n) => n,
-        // Full-portal cutover: no token yet (typically the mutual callee, whose
-        // pending slot the current self-key trace never filled).  Synthesise a
-        // tmp-callback token via `get_assembler_token` → `compile_tmp_callback`
-        // (warmstate.py:714-723, compile.py:1101-1150).  greenboxes carry the
-        // portal greens in `build_portal_calldescr` order
-        // (`[next_instr, is_being_profiled, pycode]`); reds are `[frame, ec]`.
-        None if fbw_rec_mutual_cutover_enabled() => {
-            let greenboxes = [
-                majit_ir::Value::Int(0),
-                majit_ir::Value::Int(0),
-                majit_ir::Value::Ref(majit_ir::GcRef(w_code as usize)),
-            ];
-            let red_types = [Type::Ref, Type::Ref];
-            match driver
-                .meta_interp_mut()
-                .get_or_make_portal_assembler_token_number(callee_key, &greenboxes, &red_types)
-            {
-                Some(n) => n,
-                None => {
-                    if std::env::var_os("PYRE_P2_DIAG").is_some() {
-                        eprintln!("[p2-ca] decline pc={} reason=synth-failed", op.pc);
-                    }
-                    return Ok(None);
-                }
-            }
+    let has_existing = driver.get_loop_token_arc(callee_key).is_some()
+        || driver.get_pending_token_arc(callee_key).is_some();
+    if !has_existing && !fbw_rec_mutual_cutover_enabled() {
+        if std::env::var_os("PYRE_P2_DIAG").is_some() {
+            eprintln!("[p2-ca] decline pc={} reason=no-token", op.pc);
         }
-        // A key miss without cutover is a safe bail to the residual path.
+        return Ok(None);
+    }
+    // warmstate.py:714-723 / compile.py:1101-1150: resolve an installed
+    // procedure token, the real pending token, or synthesize a tmp callback
+    // token for full-portal cutover.
+    let greenboxes = [
+        majit_ir::Value::Int(0),
+        majit_ir::Value::Int(0),
+        majit_ir::Value::Ref(majit_ir::GcRef(w_code as usize)),
+    ];
+    let red_types = [Type::Ref, Type::Ref];
+    let token = match driver
+        .meta_interp_mut()
+        .get_or_make_portal_assembler_token_arc(callee_key, &greenboxes, &red_types)
+    {
+        Some(token) => token,
         None => {
             if std::env::var_os("PYRE_P2_DIAG").is_some() {
-                eprintln!("[p2-ca] decline pc={} reason=no-token", op.pc);
+                eprintln!("[p2-ca] decline pc={} reason=synth-failed", op.pc);
             }
             return Ok(None);
         }
     };
     if std::env::var_os("PYRE_P2_DIAG").is_some() {
-        eprintln!("[p2-ca] EMIT pc={} token={token_number}", op.pc);
+        eprintln!("[p2-ca] EMIT pc={} token={}", op.pc, token.number);
     }
 
     // ---- emission (mirror of `trace_opcode.rs:6146-6204`) ----
@@ -14861,8 +14900,8 @@ fn try_walker_call_assembler_self_recursive(
     // SETFIELD_GC(vable_token) before the assembler call.
     maybe_walker_vable_and_vrefs_before_residual_call(ctx);
 
-    let ca_result = ctx.trace_ctx.call_assembler_red_only_ref(
-        token_number,
+    let ca_result = ctx.trace_ctx.call_assembler_red_only_ref_arc(
+        token,
         &[callee_frame, ec],
         &[Type::Ref, Type::Ref],
     );
@@ -15015,7 +15054,7 @@ fn emit_walker_loop_callee_call_assembler(
     callee_frame: OpRef,
     callee_ec: OpRef,
     nlocals: usize,
-    token_number: u64,
+    token: std::sync::Arc<majit_backend::JitCellToken>,
     target_pc: usize,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     debug_assert!(callee_frame != OpRef::NONE && callee_ec != OpRef::NONE);
@@ -15053,10 +15092,10 @@ fn emit_walker_loop_callee_call_assembler(
         // per-call frame-array build. S0 scaffolding: the emitter currently
         // produces the identical red-only CA; the vable_expansion routing lands
         // in S2.
-        emit_loop_callee_ca_vable_scalar(ctx, callee_frame, callee_ec, token_number)
+        emit_loop_callee_ca_vable_scalar(ctx, callee_frame, callee_ec, token)
     } else {
-        ctx.trace_ctx.call_assembler_red_only_ref(
-            token_number,
+        ctx.trace_ctx.call_assembler_red_only_ref_arc(
+            token,
             &[callee_frame, callee_ec],
             &[Type::Ref, Type::Ref],
         )
@@ -15141,10 +15180,10 @@ fn emit_loop_callee_ca_vable_scalar(
     ctx: &mut WalkContext<'_, '_>,
     callee_frame: OpRef,
     callee_ec: OpRef,
-    token_number: u64,
+    token: std::sync::Arc<majit_backend::JitCellToken>,
 ) -> OpRef {
-    ctx.trace_ctx.call_assembler_red_only_ref(
-        token_number,
+    ctx.trace_ctx.call_assembler_red_only_ref_arc(
+        token,
         &[callee_frame, callee_ec],
         &[Type::Ref, Type::Ref],
     )
@@ -16306,10 +16345,7 @@ fn try_walker_inline_resolved_user_call(
                 )))
             }
         }
-        DispatchOutcome::SubLoopCalleeCallAssembler {
-            token_number,
-            target_pc,
-        } => {
+        DispatchOutcome::SubLoopCalleeCallAssembler { token, target_pc } => {
             // CODEX1 parity: decline the CA inline when the prologue sub-walk
             // mutated the heap (a journaled list store, or an unjournaled
             // effect newly set during the sub-walk).  Emitting the CA here
@@ -16332,7 +16368,7 @@ fn try_walker_inline_resolved_user_call(
                 ca_callee_frame,
                 ca_callee_ec,
                 ca_nlocals,
-                token_number,
+                token,
                 target_pc,
             )
         }
@@ -26643,13 +26679,13 @@ fn handle(
                     let callee_key =
                         crate::driver::make_green_key(callee_code as *const (), next_instr);
                     let (driver, _) = crate::driver::driver_pair();
-                    if let Some(token_number) = driver
-                        .get_loop_token_number(callee_key)
-                        .or_else(|| driver.get_pending_token_number(callee_key))
+                    if let Some(token) = driver
+                        .get_loop_token_arc(callee_key)
+                        .or_else(|| driver.get_pending_token_arc(callee_key))
                     {
                         return Ok((
                             DispatchOutcome::SubLoopCalleeCallAssembler {
-                                token_number,
+                                token,
                                 target_pc: next_instr,
                             },
                             op.next_pc,
@@ -26681,13 +26717,13 @@ fn handle(
                             let callee_key =
                                 crate::driver::make_green_key(callee_code as *const (), next_instr);
                             let (driver, _) = crate::driver::driver_pair();
-                            if let Some(token_number) = driver
-                                .get_loop_token_number(callee_key)
-                                .or_else(|| driver.get_pending_token_number(callee_key))
+                            if let Some(token) = driver
+                                .get_loop_token_arc(callee_key)
+                                .or_else(|| driver.get_pending_token_arc(callee_key))
                             {
                                 return Ok((
                                     DispatchOutcome::SubLoopCalleeCallAssembler {
-                                        token_number,
+                                        token,
                                         target_pc: next_instr,
                                     },
                                     op.next_pc,

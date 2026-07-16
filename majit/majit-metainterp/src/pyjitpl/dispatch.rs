@@ -6047,12 +6047,10 @@ where
                 ctx.vrefs_after_residual_call();
                 // 5. record CALL_ASSEMBLER_N (pyjitpl.py:2053-2055
                 //    direct_assembler_call → history.record_nospec)
-                match _runtime.jitcell_token_arc_for_number(token_number) {
-                    Some(arc) => ctx.call_assembler_void_arc_typed(arc, &args, &arg_types),
-                    None => {
-                        ctx.call_assembler_void_by_number_typed(token_number, &args, &arg_types)
-                    }
-                }
+                let arc = _runtime.jitcell_token_arc_for_number(token_number).expect(
+                    "compile.py:187 — CALL_ASSEMBLER target must resolve to a JitCellToken object",
+                );
+                ctx.call_assembler_void_arc_typed(arc, &args, &arg_types);
                 // 6. vable_after_residual_call + GUARD_NOT_FORCED
                 //    (pyjitpl.py:2078-2079)
                 let vable_opref = active_vable.as_ref().map(|a| a.vable_opref);
@@ -6281,10 +6279,10 @@ where
                 let concrete = call_int_function(concrete_ptr, &concrete_args);
                 // `pyjitpl.py:2046-2049 vrefs_after_residual_call`.
                 ctx.vrefs_after_residual_call();
-                let traced = match _runtime.jitcell_token_arc_for_number(token_number) {
-                    Some(arc) => ctx.call_assembler_int_arc_typed(arc, &args, &arg_types),
-                    None => ctx.call_assembler_int_by_number_typed(token_number, &args, &arg_types),
-                };
+                let arc = _runtime.jitcell_token_arc_for_number(token_number).expect(
+                    "compile.py:187 — CALL_ASSEMBLER target must resolve to a JitCellToken object",
+                );
+                let traced = ctx.call_assembler_int_arc_typed(arc, &args, &arg_types);
                 self.set_int_reg(dst, Some(traced), Some(concrete));
                 let vable_opref = active_vable.as_ref().map(|a| a.vable_opref);
                 if matches!(
@@ -6351,10 +6349,10 @@ where
                 let concrete = call_int_function(concrete_ptr, &concrete_args);
                 // `pyjitpl.py:2046-2049 vrefs_after_residual_call`.
                 ctx.vrefs_after_residual_call();
-                let traced = match _runtime.jitcell_token_arc_for_number(token_number) {
-                    Some(arc) => ctx.call_assembler_ref_arc_typed(arc, &args, &arg_types),
-                    None => ctx.call_assembler_ref_by_number_typed(token_number, &args, &arg_types),
-                };
+                let arc = _runtime.jitcell_token_arc_for_number(token_number).expect(
+                    "compile.py:187 — CALL_ASSEMBLER target must resolve to a JitCellToken object",
+                );
+                let traced = ctx.call_assembler_ref_arc_typed(arc, &args, &arg_types);
                 self.set_ref_reg(dst, Some(traced), Some(concrete));
                 let vable_opref = active_vable.as_ref().map(|a| a.vable_opref);
                 if matches!(
@@ -6432,12 +6430,10 @@ where
                 let concrete = call_int_function(concrete_ptr, &concrete_args);
                 // `pyjitpl.py:2046-2049 vrefs_after_residual_call`.
                 ctx.vrefs_after_residual_call();
-                let traced = match _runtime.jitcell_token_arc_for_number(token_number) {
-                    Some(arc) => ctx.call_assembler_float_arc_typed(arc, &args, &arg_types),
-                    None => {
-                        ctx.call_assembler_float_by_number_typed(token_number, &args, &arg_types)
-                    }
-                };
+                let arc = _runtime.jitcell_token_arc_for_number(token_number).expect(
+                    "compile.py:187 — CALL_ASSEMBLER target must resolve to a JitCellToken object",
+                );
+                let traced = ctx.call_assembler_float_arc_typed(arc, &args, &arg_types);
                 self.set_float_reg(dst, Some(traced), Some(concrete));
                 let vable_opref = active_vable.as_ref().map(|a| a.vable_opref);
                 if matches!(

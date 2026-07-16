@@ -6061,8 +6061,8 @@ impl MIFrame {
                     && !recursion_exceeded
                 {
                     driver
-                        .get_loop_token_number(callee_key)
-                        .or_else(|| driver.get_pending_token_number(callee_key))
+                        .get_loop_token_arc(callee_key)
+                        .or_else(|| driver.get_pending_token_arc(callee_key))
                         .is_some()
                 } else {
                     // pyjitpl.py:1417 `assembler_call = True` after the
@@ -6164,7 +6164,7 @@ impl MIFrame {
                         is_self_recursive
                     );
                 }
-                if let Some(token_number) = driver.get_pending_token_number(callee_key) {
+                if let Some(token) = driver.get_pending_token_arc(callee_key) {
                     if nargs == 1 || (crate::callbacks::get().callee_frame_helper)(nargs).is_some()
                     {
                         let call_pc = self.fallthrough_pc.saturating_sub(1);
@@ -6195,8 +6195,8 @@ impl MIFrame {
                             // pyjitpl.py:2017: do_residual_call step 1
                             this.vable_and_vrefs_before_residual_call(ctx);
                             let ec = this.ensure_execution_context(ctx);
-                            let ca_result = ctx.call_assembler_red_only_ref(
-                                token_number,
+                            let ca_result = ctx.call_assembler_red_only_ref_arc(
+                                token,
                                 &[callee_frame, ec],
                                 &[Type::Ref, Type::Ref],
                             );
@@ -6267,23 +6267,13 @@ impl MIFrame {
                             }
                         }
                         // pyjitpl.py:1417 `assembler_call = True` route:
-                        // `should_inline_core` already accepts both compiled
-                        // and pending tokens (`callee_compiled` predicate),
-                        // but the emit path here requires the callee to be
-                        // fully compiled — `compiled_loops[callee_key]` must
-                        // resolve, and the descr we build threads through
-                        // `make_call_assembler_descr_by_number`'s number
-                        // factory which then keys back to compiled_loops.
-                        // Including the pending-token slot here regresses
-                        // against main: when the callee is mid-compilation
-                        // (pending only), `get_compiled_meta` returns None
-                        // and the downstream consumers fail.  RPython's
-                        // `get_assembler_token` (warmstate.py:714) handles
-                        // the pending case by synthesising a
-                        // `compile_tmp_callback` token; that path is not
-                        // yet ported.  Until it is, mirror
-                        // main and gate strictly on compiled presence.
-                        let Some(token_number) = driver.get_loop_token_number(callee_key) else {
+                        // This non-self CallAssembler branch still needs a
+                        // compiled token: the residual fallback below depends
+                        // on `get_compiled_meta(callee_key)` data that exists
+                        // only after loop installation. Pending-token
+                        // recursion is handled by the earlier
+                        // `get_pending_token_arc` branch.
+                        let Some(token) = driver.get_loop_token_arc(callee_key) else {
                             let call_pc = self.fallthrough_pc.saturating_sub(1);
                             return self.with_ctx(|this, ctx| {
                                 this.implement_guard_value(ctx, callable, concrete_callable as i64);
@@ -6338,8 +6328,8 @@ impl MIFrame {
                                 // pyjitpl.py:2017: do_residual_call step 1
                                 this.vable_and_vrefs_before_residual_call(ctx);
                                 let ec = this.ensure_execution_context(ctx);
-                                let ca_result = ctx.call_assembler_red_only_ref(
-                                    token_number,
+                                let ca_result = ctx.call_assembler_red_only_ref_arc(
+                                    token,
                                     &[callee_frame, ec],
                                     &[Type::Ref, Type::Ref],
                                 );
@@ -6838,7 +6828,7 @@ impl MIFrame {
     /// boxed return value).
     pub(crate) fn do_recursive_call_assembler(
         &mut self,
-        token_number: u64,
+        token: std::sync::Arc<majit_backend::JitCellToken>,
         callee_frame: OpRef,
         replay_callable: OpRef,
         replay_args: &[OpRef],
@@ -6848,8 +6838,8 @@ impl MIFrame {
             // pyjitpl.py:2017: do_residual_call step 1
             this.vable_and_vrefs_before_residual_call(ctx);
             let ec = this.ensure_execution_context(ctx);
-            let ca_result = ctx.call_assembler_red_only_ref(
-                token_number,
+            let ca_result = ctx.call_assembler_red_only_ref_arc(
+                token,
                 &[callee_frame, ec],
                 &[Type::Ref, Type::Ref],
             );
@@ -6937,12 +6927,12 @@ impl MIFrame {
                     // Token lookup happens AFTER the decision, not before.
                     let ca_token = if assembler_call {
                         driver
-                            .get_loop_token_number(callee_key)
-                            .or_else(|| driver.get_pending_token_number(callee_key))
+                            .get_loop_token_arc(callee_key)
+                            .or_else(|| driver.get_pending_token_arc(callee_key))
                     } else {
                         None
                     };
-                    let raw_result = if let Some(token_number) = ca_token {
+                    let raw_result = if let Some(token) = ca_token.as_ref() {
                         let w_callee_code = unsafe { pyre_interpreter::getcode(concrete_callable) };
                         let callee_code = unsafe {
                             &*(pyre_interpreter::w_code_get_ptr(w_callee_code as PyObjectRef)
@@ -6967,8 +6957,8 @@ impl MIFrame {
                         // pyjitpl.py:2017: do_residual_call step 1
                         this.vable_and_vrefs_before_residual_call(ctx);
                         let ec = this.ensure_execution_context(ctx);
-                        let ca_result = ctx.call_assembler_red_only_ref(
-                            token_number,
+                        let ca_result = ctx.call_assembler_red_only_ref_arc(
+                            std::sync::Arc::clone(token),
                             &[callee_frame, ec],
                             &[Type::Ref, Type::Ref],
                         );
