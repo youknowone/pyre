@@ -2379,8 +2379,9 @@ pub struct MIFrame {
     /// `None` keeps the legacy `fallthrough_pc` liveness.
     pub residual_call_pc: Option<usize>,
     /// Resume-marker twin for the loop-close guards' snapshot word.
-    /// `close_loop_args_at` sets and clears it around the `GuardEvalBreaker`
-    /// and `GuardFutureCondition` emits; it is `None` outside that window.
+    /// `close_loop_args_at` sets and clears it around the back-edge
+    /// eval-breaker poll and `GuardFutureCondition` emits; it is `None`
+    /// outside that window.
     pub(crate) loop_close_marker_jit_pc: Option<usize>,
 }
 

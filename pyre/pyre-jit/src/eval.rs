@@ -2558,8 +2558,8 @@ fn build_gc_global() {
     // Publish the eval-breaker word address before store_singleton flips the
     // GC-initialized flag (Release). A concurrent initializer that observes the
     // flag set (Acquire) early-returns above; ordering the publish first makes
-    // that observer also see a non-zero poll address, so its compiled
-    // GuardEvalBreaker ops are not baked inert.
+    // that observer also sees a non-zero address when recording the
+    // back-edge eval-breaker poll.
     majit_ir::eval_breaker_word::publish_addr();
     majit_gc::gc_sync::store_singleton(gc);
 }

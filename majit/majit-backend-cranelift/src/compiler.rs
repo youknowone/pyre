@@ -10405,50 +10405,6 @@ impl CraneliftBackend {
                     }
                 }
 
-                OpCode::GuardEvalBreaker => {
-                    let info = &guard_infos[guard_idx];
-                    guard_idx += 1;
-
-                    let bitmask_addr = majit_ir::eval_breaker_word::eval_breaker_word_addr();
-                    if bitmask_addr != 0 {
-                        let addr = builder.ins().iconst(cl_types::I64, bitmask_addr as i64);
-                        let word = builder
-                            .ins()
-                            .load(cl_types::I64, MemFlags::trusted(), addr, 0);
-                        let zero = builder.ins().iconst(cl_types::I64, 0);
-                        let cond = builder.ins().icmp(IntCC::NotEqual, word, zero);
-
-                        // Both back-edge reasons share this one guard exit and
-                        // its existing resume snapshot.
-                        let exit_block = builder.create_block();
-                        builder.set_cold_block(exit_block);
-                        let cont_block = builder.create_block();
-                        if preamble_phase {
-                            builder.set_cold_block(cont_block);
-                        }
-                        builder.ins().brif(cond, exit_block, &[], cont_block, &[]);
-
-                        builder.switch_to_block(exit_block);
-                        builder.seal_block(exit_block);
-                        let cur_jf = builder.ins().get_pinned_reg(ptr_type);
-                        emit_guard_exit(
-                            &mut builder,
-                            &constants,
-                            cur_jf,
-                            info,
-                            &ref_root_slots,
-                            &stale_ref_vars,
-                            &demoted_failarg_slots,
-                            ref_root_base_ofs,
-                            ptr_type,
-                            call_conv,
-                        );
-
-                        builder.switch_to_block(cont_block);
-                        builder.seal_block(cont_block);
-                    }
-                }
-
                 OpCode::GuardFutureCondition => {
                     // Future condition: the guard condition is computed lazily.
                     // For now, behave like GuardTrue on args[0].
@@ -17190,14 +17146,6 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    struct ClearEvalBreakerAddrOverride;
-
-    impl Drop for ClearEvalBreakerAddrOverride {
-        fn drop(&mut self) {
-            majit_ir::eval_breaker_word::set_addr_override_for_test(0);
-        }
-    }
-
     fn mk_op(opcode: OpCode, args: &[OpRef], pos: u32) -> majit_ir::OpRc {
         let bx: Vec<Operand> = args.iter().map(|a| rb(*a)).collect();
         let o = Op::new(opcode, &bx);
@@ -17205,32 +17153,38 @@ mod tests {
         std::rc::Rc::new(o)
     }
 
-    fn compile_eval_breaker_guard_trace(trace_id: u64) -> (CraneliftBackend, JitCellToken) {
+    fn compile_eval_breaker_poll_trace(
+        trace_id: u64,
+        word_addr: usize,
+    ) -> (CraneliftBackend, JitCellToken) {
         let mut backend = CraneliftBackend::new();
-        let guard = Op::new(OpCode::GuardEvalBreaker, &[]);
-        guard.pos.set(OpRef::void_op(0));
+        let word = mk_op_with_descr(
+            OpCode::RawLoadI,
+            &[OpRef::const_int(word_addr as i64), OpRef::const_int(0)],
+            0,
+            majit_ir::make_array_descr_signed(0, 8, Type::Int, true),
+        );
+        let armed = std::rc::Rc::new(Op::new(OpCode::IntIsTrue, &[Operand::from_bound_op(&word)]));
+        armed.pos.set(OpRef::int_op(1));
+        let guard = Op::new(OpCode::GuardFalse, &[Operand::from_bound_op(&armed)]);
+        guard.pos.set(OpRef::void_op(2));
         guard.set_fail_arg_types(vec![]);
         guard.setfailargs(vec![].into());
         let finish = Op::new(OpCode::Finish, &[]);
-        finish.pos.set(OpRef::void_op(1));
+        finish.pos.set(OpRef::void_op(3));
         finish.set_fail_arg_types(vec![]);
         finish.setfailargs(vec![].into());
-        let ops = vec![std::rc::Rc::new(guard), std::rc::Rc::new(finish)];
+        let ops = vec![
+            word,
+            armed,
+            std::rc::Rc::new(guard),
+            std::rc::Rc::new(finish),
+        ];
         let mut token = JitCellToken::new(trace_id);
         backend
             .compile_loop(&[], &ops, &mut token)
-            .expect("compile GuardEvalBreaker");
+            .expect("compile eval-breaker poll IR");
         (backend, token)
-    }
-
-    fn assert_inert_eval_breaker_guard() {
-        majit_ir::eval_breaker_word::set_addr_override_for_test(0);
-        let (backend, token) = compile_eval_breaker_guard_trace(517);
-        let frame = backend.execute_token(&token, &[]);
-        assert!(
-            backend.get_latest_descr(&frame).is_finish(),
-            "an unpublished bitmask address must leave the guard inert"
-        );
     }
 
     use majit_ir::forwarding::bound_operand_from_opref as rb;
@@ -24815,16 +24769,11 @@ mod tests {
     }
 
     #[test]
-    fn guard_eval_breaker_deopts_when_bitmask_set() {
-        assert_inert_eval_breaker_guard();
-
+    fn eval_breaker_poll_deopts_when_bitmask_set() {
         let test_word = AtomicUsize::new(0);
-        majit_ir::eval_breaker_word::set_addr_override_for_test(
-            &test_word as *const AtomicUsize as usize,
-        );
-        let _clear_override = ClearEvalBreakerAddrOverride;
+        let word_addr = &test_word as *const AtomicUsize as usize;
 
-        let (backend, token) = compile_eval_breaker_guard_trace(518);
+        let (backend, token) = compile_eval_breaker_poll_trace(518, word_addr);
         let frame = backend.execute_token(&token, &[]);
         assert!(
             backend.get_latest_descr(&frame).is_finish(),
@@ -24843,7 +24792,8 @@ mod tests {
         );
         test_word.fetch_and(!majit_ir::eval_breaker_word::EB_STW, Ordering::Relaxed);
 
-        let (backend_after_clear, token_after_clear) = compile_eval_breaker_guard_trace(519);
+        let (backend_after_clear, token_after_clear) =
+            compile_eval_breaker_poll_trace(519, word_addr);
         let frame = backend_after_clear.execute_token(&token_after_clear, &[]);
         assert!(
             backend_after_clear.get_latest_descr(&frame).is_finish(),
@@ -24859,16 +24809,13 @@ mod tests {
     }
 
     #[test]
-    fn guard_eval_breaker_cross_trace_inherits_bitmask() {
+    fn eval_breaker_poll_cross_trace_uses_same_word() {
         let test_word = AtomicUsize::new(0);
-        majit_ir::eval_breaker_word::set_addr_override_for_test(
-            &test_word as *const AtomicUsize as usize,
-        );
-        let _clear_override = ClearEvalBreakerAddrOverride;
+        let word_addr = &test_word as *const AtomicUsize as usize;
 
-        let (backend_a, token_a) = compile_eval_breaker_guard_trace(520);
+        let (backend_a, token_a) = compile_eval_breaker_poll_trace(520, word_addr);
         test_word.fetch_or(majit_ir::eval_breaker_word::EB_ASYNC, Ordering::Relaxed);
-        let (backend_b, token_b) = compile_eval_breaker_guard_trace(521);
+        let (backend_b, token_b) = compile_eval_breaker_poll_trace(521, word_addr);
 
         let frame_a = backend_a.execute_token(&token_a, &[]);
         assert!(

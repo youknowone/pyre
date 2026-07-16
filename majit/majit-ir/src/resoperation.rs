@@ -1841,7 +1841,6 @@ pub enum OpCode {
     GuardNotForced,
     GuardNotForced2,
     GuardNotInvalidated,
-    GuardEvalBreaker,
     GuardFutureCondition,
     GuardAlwaysFails,
 
@@ -2882,7 +2881,6 @@ static OPARITY: [Option<u8>; OPCODE_COUNT] = {
     set!(GuardNotForced, 0);
     set!(GuardNotForced2, 0);
     set!(GuardNotInvalidated, 0);
-    set!(GuardEvalBreaker, 0);
     set!(GuardFutureCondition, 0);
     set!(GuardAlwaysFails, 0);
     // Arithmetic (binary)
@@ -3121,7 +3119,6 @@ static OPWITHDESCR: [bool; OPCODE_COUNT] = {
         GuardNotForced,
         GuardNotForced2,
         GuardNotInvalidated,
-        GuardEvalBreaker,
         GuardFutureCondition,
         GuardAlwaysFails,
         // Array/field access
@@ -3481,7 +3478,6 @@ static OPNAME: [&str; OPCODE_COUNT] = {
         GuardNotForced,
         GuardNotForced2,
         GuardNotInvalidated,
-        GuardEvalBreaker,
         GuardFutureCondition,
         GuardAlwaysFails,
         IntAdd,
@@ -3810,7 +3806,6 @@ mod tests {
             OpCode::GuardNotForced,
             OpCode::GuardNotForced2,
             OpCode::GuardNotInvalidated,
-            OpCode::GuardEvalBreaker,
             OpCode::GuardFutureCondition,
             OpCode::GuardAlwaysFails,
             OpCode::VecI,
@@ -4244,7 +4239,6 @@ mod tests {
             OpCode::GuardNotForced,
             OpCode::GuardNotForced2,
             OpCode::GuardNotInvalidated,
-            OpCode::GuardEvalBreaker,
             OpCode::GuardFutureCondition,
             OpCode::GuardAlwaysFails,
         ];
@@ -4281,7 +4275,6 @@ mod tests {
             OpCode::GuardNoException,
             OpCode::GuardNotForced,
             OpCode::GuardNotInvalidated,
-            OpCode::GuardEvalBreaker,
             OpCode::GuardAlwaysFails,
         ];
         for op in &non_foldable {
@@ -4301,6 +4294,15 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_raw_load_i_stays_non_pure_for_eval_breaker_poll() {
+        // The back-edge eval-breaker poll depends on this classification. If
+        // RawLoadI becomes always-pure, optimize_guard_false deletes the poll
+        // from the loop body and compiled loops stop responding to signals/STW.
+        assert!(!OpCode::RawLoadI.is_always_pure());
+        assert!(OpCode::RawLoadI.has_no_side_effect());
     }
 
     #[test]

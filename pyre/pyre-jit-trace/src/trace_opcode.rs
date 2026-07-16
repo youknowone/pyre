@@ -6,6 +6,7 @@
 use crate::state::*;
 
 use std::borrow::Cow;
+use std::sync::OnceLock;
 
 use majit_ir::{DescrRef, GcRef, OpCode, OpRef, Type, Value};
 use majit_metainterp::{
@@ -13,6 +14,13 @@ use majit_metainterp::{
 };
 
 use pyre_interpreter::bytecode::{BinaryOperator, CodeObject, ComparisonOperator, Instruction};
+
+fn eval_breaker_word_descr() -> DescrRef {
+    static DESCR: OnceLock<DescrRef> = OnceLock::new();
+    DESCR
+        .get_or_init(|| majit_ir::descr::make_array_descr_signed(0, 8, Type::Int, true))
+        .clone()
+}
 
 extern "C" fn trace_function_get_defaults(func: i64) -> i64 {
     unsafe { function_get_defaults(func as PyObjectRef) as i64 }
@@ -2976,15 +2984,33 @@ impl MIFrame {
         header_marker_jit_pc: Option<usize>,
     ) -> Vec<OpRef> {
         self.loop_close_marker_jit_pc = header_marker_jit_pc;
-        // `JUMP_BACKWARD` eval-breaker poll (`CHECK_EVAL_BREAKER`): emit
-        // a `GuardEvalBreaker` in the loop body before the closing JUMP so the
-        // compiled loop polls the async-action ticker at the back-edge and
-        // deopts when a signal / async action is pending, instead of running
-        // uninterruptibly until natural loop exit. Nullary guard: no data
-        // operands, so its resume snapshot is the ordinary loop-body liveness
-        // (like GuardNotInvalidated). Captured before the flush/materialize
-        // below so the snapshot reflects the pre-close loop-body state.
-        self.generate_guard(ctx, OpCode::GuardEvalBreaker, &[]);
+        // Mirror pypy/module/pypyjit/test_pypy_c/model.py's `--TICK--` shape:
+        // load a process-global raw word through a baked constant address,
+        // compare it, then guard the result. The folded eval-breaker word is a
+        // bitmask, so this uses a nonzero test rather than upstream's
+        // `int_lt(ticker, 0)`.
+        //
+        // Load-bearing invariant: RawLoadI must remain outside the always-pure
+        // range and this descriptor must remain non-pure. Otherwise CSE can
+        // forward the preamble's guarded-zero value into the loop body and
+        // `optimize_guard_false` deletes the body's poll, leaving compiled
+        // loops unable to respond to signals or stop-the-world requests.
+        //
+        // Captured before the flush/materialize below so the guard snapshot
+        // reflects the pre-close loop-body state. A zero address means the
+        // poll is simply not recorded; startup publishes it before tracing.
+        let eb_addr = majit_ir::eval_breaker_word::eval_breaker_word_addr();
+        if eb_addr != 0 {
+            let base = ctx.const_int(eb_addr as i64);
+            let offset = ctx.const_int(0);
+            let word = ctx.record_op_with_descr(
+                OpCode::RawLoadI,
+                &[base, offset],
+                eval_breaker_word_descr(),
+            );
+            let armed = ctx.record_op(OpCode::IntIsTrue, &[word]);
+            self.generate_guard(ctx, OpCode::GuardFalse, &[armed]);
+        }
         // pyjitpl.py:2954-2965 reached_loop_header: virtualizable_boxes
         // (read from locals_cells_stack_w[*] by virtualizable.py:86-98
         // read_boxes) are carried into the JUMP unchanged, including

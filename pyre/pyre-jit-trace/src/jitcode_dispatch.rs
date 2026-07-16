@@ -10715,8 +10715,8 @@ pub(crate) fn m73_armpath_carry_enabled() -> bool {
 }
 
 /// `PYRE_M73_LOOPCLOSE_CARRY` (#73 S5 phase-3 slice-6, default ON): carry
-/// the merge-point resume-marker twin into the `GuardEvalBreaker` and
-/// `GuardFutureCondition` loop-close snapshot words. Certified by the
+/// the merge-point resume-marker twin into the back-edge eval-breaker poll
+/// and `GuardFutureCondition` loop-close snapshot words. Certified by the
 /// `M73_LOOPCLOSE` census (362 captures across pyre/bench + synth, 100%
 /// eq=1) and check.py (162×2, on and off). Disable with
 /// `PYRE_M73_LOOPCLOSE_CARRY=0`.

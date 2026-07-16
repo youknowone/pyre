@@ -76,59 +76,55 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use majit_backend::{Backend, JitCellToken};
-    use majit_ir::{Op, OpCode, OpRef};
+    use majit_ir::operand::Operand;
+    use majit_ir::{Op, OpCode, OpRef, Type, make_array_descr_signed};
 
     use crate::runner::DynasmBackend;
 
-    struct ClearEvalBreakerAddrOverride;
-
-    impl Drop for ClearEvalBreakerAddrOverride {
-        fn drop(&mut self) {
-            majit_ir::eval_breaker_word::set_addr_override_for_test(0);
-        }
-    }
-
-    fn compile_guard_trace(trace_id: u64) -> (DynasmBackend, JitCellToken) {
+    fn compile_eval_breaker_poll_trace(
+        trace_id: u64,
+        word_addr: usize,
+    ) -> (DynasmBackend, JitCellToken) {
         let mut backend = DynasmBackend::new();
         backend.attach_default_test_descrs();
         let mut token = JitCellToken::new(trace_id);
 
-        let guard = Op::new(OpCode::GuardEvalBreaker, &[]);
-        guard.pos.set(OpRef::void_op(0));
+        let word = Rc::new(Op::with_descr(
+            OpCode::RawLoadI,
+            &[
+                Operand::from_opref(OpRef::const_int(word_addr as i64)),
+                Operand::from_opref(OpRef::const_int(0)),
+            ],
+            make_array_descr_signed(0, 8, Type::Int, true),
+        ));
+        word.pos.set(OpRef::int_op(0));
+        let armed = Rc::new(Op::new(OpCode::IntIsTrue, &[Operand::from_bound_op(&word)]));
+        armed.pos.set(OpRef::int_op(1));
+        let guard = Op::new(OpCode::GuardFalse, &[Operand::from_bound_op(&armed)]);
+        guard.pos.set(OpRef::void_op(2));
         guard.set_fail_arg_types(vec![]);
         guard.setfailargs(vec![].into());
         let finish = Op::new(OpCode::Finish, &[]);
-        finish.pos.set(OpRef::void_op(1));
+        finish.pos.set(OpRef::void_op(3));
         finish.set_fail_arg_types(vec![]);
         finish.setfailargs(vec![].into());
 
         backend
-            .compile_loop(&[], &[Rc::new(guard), Rc::new(finish)], &mut token)
-            .expect("compile GuardEvalBreaker");
+            .compile_loop(
+                &[],
+                &[word, armed, Rc::new(guard), Rc::new(finish)],
+                &mut token,
+            )
+            .expect("compile eval-breaker poll IR");
         (backend, token)
     }
 
-    fn assert_inert_guard() {
-        majit_ir::eval_breaker_word::set_addr_override_for_test(0);
-        let (backend, token) = compile_guard_trace(517);
-        let frame = backend.execute_token(&token, &[]);
-        assert!(
-            backend.get_latest_descr(&frame).is_finish(),
-            "an unpublished bitmask address must leave the guard inert"
-        );
-    }
-
     #[test]
-    fn guard_eval_breaker_deopts_when_bitmask_set() {
-        assert_inert_guard();
-
+    fn eval_breaker_poll_deopts_when_bitmask_set() {
         let test_word = AtomicUsize::new(0);
-        majit_ir::eval_breaker_word::set_addr_override_for_test(
-            &test_word as *const AtomicUsize as usize,
-        );
-        let _clear_override = ClearEvalBreakerAddrOverride;
+        let word_addr = &test_word as *const AtomicUsize as usize;
 
-        let (backend, token) = compile_guard_trace(518);
+        let (backend, token) = compile_eval_breaker_poll_trace(518, word_addr);
         let frame = backend.execute_token(&token, &[]);
         assert!(backend.get_latest_descr(&frame).is_finish());
 
@@ -137,7 +133,8 @@ mod tests {
         assert!(!backend.get_latest_descr(&frame).is_finish());
         test_word.fetch_and(!majit_ir::eval_breaker_word::EB_STW, Ordering::Relaxed);
 
-        let (backend_after_clear, token_after_clear) = compile_guard_trace(519);
+        let (backend_after_clear, token_after_clear) =
+            compile_eval_breaker_poll_trace(519, word_addr);
         let frame = backend_after_clear.execute_token(&token_after_clear, &[]);
         assert!(backend_after_clear.get_latest_descr(&frame).is_finish());
 
@@ -147,16 +144,13 @@ mod tests {
     }
 
     #[test]
-    fn guard_eval_breaker_cross_trace_inherits_bitmask() {
+    fn eval_breaker_poll_cross_trace_uses_same_word() {
         let test_word = AtomicUsize::new(0);
-        majit_ir::eval_breaker_word::set_addr_override_for_test(
-            &test_word as *const AtomicUsize as usize,
-        );
-        let _clear_override = ClearEvalBreakerAddrOverride;
+        let word_addr = &test_word as *const AtomicUsize as usize;
 
-        let (backend_a, token_a) = compile_guard_trace(520);
+        let (backend_a, token_a) = compile_eval_breaker_poll_trace(520, word_addr);
         test_word.fetch_or(majit_ir::eval_breaker_word::EB_ASYNC, Ordering::Relaxed);
-        let (backend_b, token_b) = compile_guard_trace(521);
+        let (backend_b, token_b) = compile_eval_breaker_poll_trace(521, word_addr);
 
         let frame_a = backend_a.execute_token(&token_a, &[]);
         assert!(!backend_a.get_latest_descr(&frame_a).is_finish());
@@ -4607,21 +4601,6 @@ impl<'a> Assembler386<'a> {
             }
             OpCode::GuardNotInvalidated => {
                 self.implement_guard_nojump_with_faillocs(op, op_index, fail_index, faillocs);
-            }
-            OpCode::GuardEvalBreaker => {
-                let bitmask_addr = majit_ir::eval_breaker_word::eval_breaker_word_addr();
-                if bitmask_addr != 0 {
-                    let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-                    dynasm!(self.mc ; .arch x64
-                        ; mov Rq(scratch), QWORD bitmask_addr as i64
-                        ; cmp QWORD [Rq(scratch)], 0);
-                    let label = self.emit_guard_jcc(CC_NE);
-                    self.append_guard_token_with_faillocs(
-                        op, op_index, fail_index, label, faillocs,
-                    );
-                } else {
-                    self.implement_guard_nojump_with_faillocs(op, op_index, fail_index, faillocs);
-                }
             }
             OpCode::GuardAlwaysFails => {
                 self.implement_guard_always_fails_with_faillocs(op, op_index, fail_index, faillocs);

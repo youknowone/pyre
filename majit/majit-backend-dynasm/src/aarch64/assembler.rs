@@ -3473,20 +3473,6 @@ impl<'a> AssemblerARM64<'a> {
             OpCode::GuardNotInvalidated => {
                 self.implement_guard_nojump_with_faillocs(op, op_index, fail_index, faillocs);
             }
-            OpCode::GuardEvalBreaker => {
-                let bitmask_addr = majit_ir::eval_breaker_word::eval_breaker_word_addr();
-                if bitmask_addr != 0 {
-                    // Bitmask address is loop-invariant, baked into x24 by the
-                    // trace prologue; load the word and deopt if any bit is set.
-                    dynasm!(self.mc ; .arch aarch64 ; ldr X(16), [x24] ; cmp X(16), xzr);
-                    let label = self.emit_guard_jcc(CC_NE);
-                    self.append_guard_token_with_faillocs(
-                        op, op_index, fail_index, label, faillocs,
-                    );
-                } else {
-                    self.implement_guard_nojump_with_faillocs(op, op_index, fail_index, faillocs);
-                }
-            }
             OpCode::GuardAlwaysFails => {
                 self.implement_guard_always_fails_with_faillocs(op, op_index, fail_index, faillocs);
             }
@@ -7187,61 +7173,61 @@ mod tests {
     use std::time::Duration;
 
     use majit_backend::{Backend, JitCellToken};
-    use majit_ir::{Op, OpCode, OpRef, make_loop_target_descr};
+    use majit_ir::operand::Operand;
+    use majit_ir::{Op, OpCode, OpRef, Type, make_array_descr_signed, make_loop_target_descr};
 
     use crate::runner::DynasmBackend;
 
-    struct ClearEvalBreakerAddrOverride;
-
-    impl Drop for ClearEvalBreakerAddrOverride {
-        fn drop(&mut self) {
-            majit_ir::eval_breaker_word::set_addr_override_for_test(0);
-        }
+    fn eval_breaker_poll_ops(word_addr: usize, first_pos: u32) -> (Rc<Op>, Rc<Op>, Rc<Op>) {
+        let word = Rc::new(Op::with_descr(
+            OpCode::RawLoadI,
+            &[
+                Operand::from_opref(OpRef::const_int(word_addr as i64)),
+                Operand::from_opref(OpRef::const_int(0)),
+            ],
+            make_array_descr_signed(0, 8, Type::Int, true),
+        ));
+        word.pos.set(OpRef::int_op(first_pos));
+        let armed = Rc::new(Op::new(OpCode::IntIsTrue, &[Operand::from_bound_op(&word)]));
+        armed.pos.set(OpRef::int_op(first_pos + 1));
+        let guard = Rc::new(Op::new(
+            OpCode::GuardFalse,
+            &[Operand::from_bound_op(&armed)],
+        ));
+        guard.pos.set(OpRef::void_op(first_pos + 2));
+        guard.set_fail_arg_types(vec![]);
+        guard.setfailargs(vec![].into());
+        (word, armed, guard)
     }
 
-    fn compile_guard_trace(trace_id: u64) -> (DynasmBackend, JitCellToken) {
+    fn compile_eval_breaker_poll_trace(
+        trace_id: u64,
+        word_addr: usize,
+    ) -> (DynasmBackend, JitCellToken) {
         let mut backend = DynasmBackend::new();
         backend.attach_default_test_descrs();
         let mut token = JitCellToken::new(trace_id);
 
-        let guard = Op::new(OpCode::GuardEvalBreaker, &[]);
-        guard.pos.set(OpRef::void_op(0));
-        guard.set_fail_arg_types(vec![]);
-        guard.setfailargs(vec![].into());
+        let (word, armed, guard) = eval_breaker_poll_ops(word_addr, 0);
 
         let finish = Op::new(OpCode::Finish, &[]);
-        finish.pos.set(OpRef::void_op(1));
+        finish.pos.set(OpRef::void_op(3));
         finish.set_fail_arg_types(vec![]);
         finish.setfailargs(vec![].into());
 
-        let ops = vec![Rc::new(guard), Rc::new(finish)];
+        let ops = vec![word, armed, guard, Rc::new(finish)];
         backend
             .compile_loop(&[], &ops, &mut token)
-            .expect("compile GuardEvalBreaker");
+            .expect("compile eval-breaker poll IR");
         (backend, token)
     }
 
-    fn assert_inert_guard() {
-        majit_ir::eval_breaker_word::set_addr_override_for_test(0);
-        let (backend, token) = compile_guard_trace(517);
-        let frame = backend.execute_token(&token, &[]);
-        assert!(
-            backend.get_latest_descr(&frame).is_finish(),
-            "an unpublished bitmask address must leave the guard inert"
-        );
-    }
-
     #[test]
-    fn guard_eval_breaker_deopts_when_bitmask_set() {
-        assert_inert_guard();
-
+    fn eval_breaker_poll_deopts_when_bitmask_set() {
         let test_word = AtomicUsize::new(0);
-        majit_ir::eval_breaker_word::set_addr_override_for_test(
-            &test_word as *const AtomicUsize as usize,
-        );
-        let _clear_override = ClearEvalBreakerAddrOverride;
+        let word_addr = &test_word as *const AtomicUsize as usize;
 
-        let (backend, token) = compile_guard_trace(518);
+        let (backend, token) = compile_eval_breaker_poll_trace(518, word_addr);
         let frame = backend.execute_token(&token, &[]);
         assert!(
             backend.get_latest_descr(&frame).is_finish(),
@@ -7256,7 +7242,8 @@ mod tests {
         );
         test_word.fetch_and(!majit_ir::eval_breaker_word::EB_STW, Ordering::Relaxed);
 
-        let (backend_after_clear, token_after_clear) = compile_guard_trace(519);
+        let (backend_after_clear, token_after_clear) =
+            compile_eval_breaker_poll_trace(519, word_addr);
         let frame = backend_after_clear.execute_token(&token_after_clear, &[]);
         assert!(
             backend_after_clear.get_latest_descr(&frame).is_finish(),
@@ -7272,12 +7259,9 @@ mod tests {
     }
 
     #[test]
-    fn guard_eval_breaker_cross_trace_inherits_bitmask() {
+    fn eval_breaker_poll_cross_trace_uses_same_word() {
         let test_word = AtomicUsize::new(0);
-        majit_ir::eval_breaker_word::set_addr_override_for_test(
-            &test_word as *const AtomicUsize as usize,
-        );
-        let _clear_override = ClearEvalBreakerAddrOverride;
+        let word_addr = &test_word as *const AtomicUsize as usize;
 
         let mut backend = DynasmBackend::new();
         backend.attach_default_test_descrs();
@@ -7289,13 +7273,10 @@ mod tests {
         label.pos.set(OpRef::void_op(0));
         label.setdescr(target_descr.clone());
 
-        let guard = Op::new(OpCode::GuardEvalBreaker, &[]);
-        guard.pos.set(OpRef::void_op(1));
-        guard.set_fail_arg_types(vec![]);
-        guard.setfailargs(vec![].into());
+        let (word, armed, guard) = eval_breaker_poll_ops(word_addr, 1);
 
         let finish = Op::new(OpCode::Finish, &[]);
-        finish.pos.set(OpRef::void_op(2));
+        finish.pos.set(OpRef::void_op(4));
         finish.set_fail_arg_types(vec![]);
         finish.setfailargs(vec![].into());
 
@@ -7303,15 +7284,15 @@ mod tests {
         backend
             .compile_loop(
                 &[],
-                &[Rc::new(label), Rc::new(guard), Rc::new(finish)],
+                &[Rc::new(label), word, armed, guard, Rc::new(finish)],
                 &mut target_token,
             )
             .expect("compile cross-trace bitmask target");
 
         test_word.fetch_or(majit_ir::eval_breaker_word::EB_STW, Ordering::Relaxed);
 
-        // Enter the target loop body through an external BR. Its prologue is
-        // skipped, so the target poll must inherit x24 from this source entry.
+        // Enter the target loop body through an external branch. The ordinary
+        // IR poll must still load the same constant-address word.
         let jump = Op::new(OpCode::Jump, &[]);
         jump.pos.set(OpRef::void_op(0));
         jump.setdescr(target_descr);
@@ -7329,7 +7310,7 @@ mod tests {
         let frame = backend.execute_token(&source_token, &[]);
         assert!(
             !backend.get_latest_descr(&frame).is_finish(),
-            "external entry must inherit x24 and deopt on the same bitmask"
+            "external entry must deopt on the same bitmask word"
         );
     }
 
@@ -7351,29 +7332,22 @@ mod tests {
         let worker_test_word = test_word.clone();
         let worker = std::thread::spawn(move || {
             majit_gc::gc_sync::register_thread();
-            majit_ir::eval_breaker_word::set_addr_override_for_test(
-                Arc::as_ptr(&worker_test_word) as usize
-            );
-            let _clear_override = ClearEvalBreakerAddrOverride;
-
             let mut backend = DynasmBackend::new();
             backend.attach_default_test_descrs();
             let target_descr = make_loop_target_descr(522, false);
             let label = Op::new(OpCode::Label, &[]);
             label.pos.set(OpRef::void_op(0));
             label.setdescr(target_descr.clone());
-            let guard = Op::new(OpCode::GuardEvalBreaker, &[]);
-            guard.pos.set(OpRef::void_op(1));
-            guard.set_fail_arg_types(vec![]);
-            guard.setfailargs(vec![].into());
+            let (word, armed, guard) =
+                eval_breaker_poll_ops(Arc::as_ptr(&worker_test_word) as usize, 1);
             let jump = Op::new(OpCode::Jump, &[]);
-            jump.pos.set(OpRef::void_op(2));
+            jump.pos.set(OpRef::void_op(4));
             jump.setdescr(target_descr);
             let mut token = JitCellToken::new(522);
             backend
                 .compile_loop(
                     &[],
-                    &[Rc::new(label), Rc::new(guard), Rc::new(jump)],
+                    &[Rc::new(label), word, armed, guard, Rc::new(jump)],
                     &mut token,
                 )
                 .expect("compile polling loop on worker");
