@@ -2695,22 +2695,6 @@ fn loop_inlines_abort_permanent_callee(w_code: *const (), cf_addr: usize) -> boo
     false
 }
 
-/// Issue #73 production full-body tracer (Phase 5 flip, gated).
-///
-/// `PYRE_FULL_BODY_WALK=1` drives the per-CodeObject JitCode body via
-/// [`run_perfn_walk`] in authoritative mode AS the production trace — the
-/// walk IS the concrete execution, so unlike the probe it keeps the
-/// recorded trace.  Maps the walk outcome to a [`TraceAction`] for the
-/// caller to compile.
-///
-/// Conservative mapping (first slice): only `CloseLoop` — the validated
-/// end-to-end case (the four loop benches close under authoritative) — is
-/// mapped to a real `CloseLoopWithArgs`; every other outcome (`Terminate`
-/// finish-arg recovery, `SubReturn`/`SubRaise`, `SwitchToBlackhole`, any
-/// `DispatchError`) aborts the trace so the portal falls back to the trait
-/// tracer.  Default-off → the trait `metainterp.interpret` path is
-/// untouched.  The remaining flip blocker is guard-snapshot/resume
-/// correctness, which this harness exists to validate.
 /// Whether [`full_body_walk_trace`] starts a fresh walk or continues one that
 /// has already applied eager stores.
 enum WalkJournals {
@@ -2728,6 +2712,22 @@ enum WalkJournals {
     Keep,
 }
 
+/// Issue #73 production full-body tracer (Phase 5 flip, gated).
+///
+/// `PYRE_FULL_BODY_WALK=1` drives the per-CodeObject JitCode body via
+/// [`run_perfn_walk`] in authoritative mode AS the production trace — the
+/// walk IS the concrete execution, so unlike the probe it keeps the
+/// recorded trace.  Maps the walk outcome to a [`TraceAction`] for the
+/// caller to compile.
+///
+/// Conservative mapping (first slice): only `CloseLoop` — the validated
+/// end-to-end case (the four loop benches close under authoritative) — is
+/// mapped to a real `CloseLoopWithArgs`; every other outcome (`Terminate`
+/// finish-arg recovery, `SubReturn`/`SubRaise`, `SwitchToBlackhole`, any
+/// `DispatchError`) aborts the trace so the portal falls back to the trait
+/// tracer.  Default-off → the trait `metainterp.interpret` path is
+/// untouched.  The remaining flip blocker is guard-snapshot/resume
+/// correctness, which this harness exists to validate.
 fn full_body_walk_trace(
     ctx: &mut TraceCtx,
     sym: &mut PyreSym,
