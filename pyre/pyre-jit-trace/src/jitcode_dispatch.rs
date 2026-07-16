@@ -7488,15 +7488,57 @@ fn collect_outer_active_boxes(
             } else {
                 unsafe {
                     let jc = &*sym.jitcode;
-                    let entries = jc
-                        .payload
-                        .metadata
-                        .pcdep_color_slots
-                        .get(gpc as usize)
-                        .cloned()
-                        .unwrap_or_default();
+                    let cjc = carried_jitcode_pc;
+                    if pcmap_guard_kept_audit_enabled() && cjc >= 0 {
+                        let twin_pcdep = jc
+                            .payload
+                            .pcdep_for_jitcode_pc(cjc as usize)
+                            .unwrap_or_default();
+                        let table_pcdep = jc
+                            .payload
+                            .metadata
+                            .pcdep_color_slots
+                            .get(gpc as usize)
+                            .cloned()
+                            .unwrap_or_default();
+                        assert_eq!(
+                            twin_pcdep, table_pcdep,
+                            "PCMAP_COAB pcdep mismatch cjc={cjc} gpc={gpc}"
+                        );
+                        if !jc.payload.code_ptr.is_null() {
+                            let twin_d = jc
+                                .payload
+                                .depth_for_jitcode_pc_pred(cjc as usize)
+                                .unwrap_or(0);
+                            let table_d = crate::liveness::liveness_for(jc.payload.code_ptr)
+                                .depth_at_py_pc()
+                                .get(gpc as usize)
+                                .copied()
+                                .unwrap_or(0);
+                            assert_eq!(
+                                twin_d, table_d,
+                                "PCMAP_COAB depth mismatch cjc={cjc} gpc={gpc}"
+                            );
+                        }
+                    }
+                    let entries = if cjc >= 0 {
+                        jc.payload
+                            .pcdep_for_jitcode_pc(cjc as usize)
+                            .unwrap_or_default()
+                    } else {
+                        jc.payload
+                            .metadata
+                            .pcdep_color_slots
+                            .get(gpc as usize)
+                            .cloned()
+                            .unwrap_or_default()
+                    };
                     let depth = if jc.payload.code_ptr.is_null() {
                         0usize
+                    } else if cjc >= 0 {
+                        jc.payload
+                            .depth_for_jitcode_pc_pred(cjc as usize)
+                            .unwrap_or(0) as usize
                     } else {
                         crate::liveness::liveness_for(jc.payload.code_ptr)
                             .depth_at_py_pc()
