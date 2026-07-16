@@ -17158,7 +17158,17 @@ fn dispatch_residual_call_iRd_kind(
     {
         if try_walker_specialize_store_subscr(ctx, op.pc, &r_args)?.is_some() {
             return Ok((DispatchOutcome::Continue, op.next_pc));
-        } else if ctx.trace_ctx.is_bridge_trace && fbw_debug_abort_enabled() {
+        }
+        // #171 setslice inline: `target[const_slice] = source` for a
+        // same-length, step-1, Integer↔Integer slice — fold the assignment
+        // into per-element getarrayitem/setarrayitem on the int_items blocks so
+        // a virtualizable BUILD_LIST source temp is consumed without forcing.
+        // Gated on `PYRE_NEWLIST_VIRT`; declines to the opaque residual
+        // otherwise (SAFE — always byte-correct).
+        if newlist_virt_enabled() && try_walker_specialize_setslice(ctx, op.pc, &r_args)?.is_some() {
+            return Ok((DispatchOutcome::Continue, op.next_pc));
+        }
+        if ctx.trace_ctx.is_bridge_trace && fbw_debug_abort_enabled() {
             eprintln!(
                 "[fbw-store-fallthrough] bridge STORE_SUBSCR fell to GENERIC residual at pc={} \
                  (specialization declined — unjournaled concrete store)",
@@ -23145,6 +23155,244 @@ fn walker_foriter_green_key(ctx: &WalkContext<'_, '_>, op_pc: usize) -> Option<u
     }
     let foriter_start_pc = python_pc_for_jitcode_pc(&jitcode.payload.metadata, op_pc) as usize;
     Some(crate::driver::make_green_key(w_code, foriter_start_pc))
+}
+
+/// Specialize `STORE_SUBSCR target[const_slice] = source` for a same-length,
+/// step-1 slice between two Integer-strategy exact lists, eliding the
+/// `CALL_MAY_FORCE` `store_subscr` residual that would force the virtualizable
+/// source list (the freshly built BUILD_LIST temp from
+/// [`try_walker_specialize_newlist`]) every iteration.  The same-length gate
+/// makes the assignment `slice_len` independent in-bounds setitems —
+/// `target[start + j] = source[j]` — with no resize and no strategy change, so
+/// it rides the existing `FBW_STORE_JOURNAL` per-element undo log.
+///
+/// Reads the source elements through `getfield_gc(int_items)` +
+/// `getarrayitem_gc` ops keyed on the source `OpRef`, so when the source is the
+/// freshly built virtual list the optimizer folds the reads against its
+/// recorded `SetarrayitemGc` stores and removes the whole temporary.
+///
+/// The slice key must be a trace constant (a `slice(...)` from `co_consts`);
+/// `start` / `stop` are read off the slice object and baked into the emitted
+/// index constants.  Falls through to the generic residual (returns `Ok(None)`)
+/// for anything outside the gate: a non-constant / `None` / negative bound, a
+/// non-unit step, a resizing (length-changing) slice, an empty slice, a
+/// non-Integer-storage target or source, or a list subclass (which may override
+/// `__setitem__` / `__iter__`).
+fn try_walker_specialize_setslice(
+    ctx: &mut WalkContext<'_, '_>,
+    op_pc: usize,
+    r_args: &[OpRef],
+) -> Result<Option<()>, DispatchError> {
+    if !ctx.is_authoritative_executor || !ctx.is_full_body_walk || r_args.len() != 3 {
+        return Ok(None);
+    }
+    let list_op = r_args[0];
+    let key_op = r_args[1];
+    let value_op = r_args[2];
+    // The slice key must be a trace constant (a `slice(...)` from `co_consts`):
+    // its `start` / `stop` are baked into the emitted index constants, so a
+    // non-constant slice (whose bounds could differ at runtime) cannot be
+    // specialized this way.
+    if !key_op.is_constant() {
+        return Ok(None);
+    }
+    let (Some(list_obj), Some(key_obj), Some(value_obj)) = (
+        walker_concrete_ref_object(ctx, list_op),
+        walker_concrete_ref_object(ctx, key_op),
+        walker_concrete_ref_object(ctx, value_op),
+    ) else {
+        return Ok(None);
+    };
+
+    // Gate, all read from the concrete shadows: `target[start:stop:1] =
+    // source`, both exact-list Integer storage, `stop - start == len(source)`
+    // (no resize), `1 <= slice_len`, `0 <= start <= stop <= len(target)`.
+    let (start, slice_len) = unsafe {
+        // EXACT list for BOTH target and source: a list subclass shares
+        // `ob_type == &LIST_TYPE` but retags `w_class` and may override
+        // `__setitem__` (target) or `__iter__` (source); both must route
+        // through the generic residual.
+        if !pyre_object::pyobject::is_exact_list(list_obj)
+            || !pyre_object::is_slice(key_obj)
+            || !pyre_object::pyobject::is_exact_list(value_obj)
+        {
+            return Ok(None);
+        }
+        // step == 1 (None defaults to 1; an explicit non-1 step needs the
+        // strided path).
+        let step_o = pyre_object::w_slice_get_step(key_obj);
+        let step_is_one = pyre_object::is_none(step_o)
+            || (pyre_object::is_int(step_o)
+                && !pyre_object::is_bool(step_o)
+                && pyre_object::w_int_get_value(step_o) == 1);
+        if !step_is_one {
+            return Ok(None);
+        }
+        // start / stop must be explicit non-negative plain ints (None bounds and
+        // negative indices route through the generic residual, which normalises
+        // them).
+        let start_o = pyre_object::w_slice_get_start(key_obj);
+        let stop_o = pyre_object::w_slice_get_stop(key_obj);
+        if !(pyre_object::is_int(start_o)
+            && !pyre_object::is_bool(start_o)
+            && pyre_object::is_int(stop_o)
+            && !pyre_object::is_bool(stop_o))
+        {
+            return Ok(None);
+        }
+        let start = pyre_object::w_int_get_value(start_o);
+        let stop = pyre_object::w_int_get_value(stop_o);
+        let target_len = pyre_object::w_list_len(list_obj) as i64;
+        if start < 0 || stop < start || stop > target_len {
+            return Ok(None);
+        }
+        let slice_len = stop - start;
+        let src_len = pyre_object::w_list_len(value_obj) as i64;
+        // Same-length only — a resizing slice changes the target length and can
+        // switch strategy.
+        if slice_len != src_len || slice_len < 1 {
+            return Ok(None);
+        }
+        if !(pyre_object::w_list_uses_int_storage(list_obj)
+            && pyre_object::w_list_uses_int_storage(value_obj))
+        {
+            return Ok(None);
+        }
+        (start, slice_len)
+    };
+
+    // --- emit the specialized IR (walker-native) ---
+    // For BOTH target (`list_op`) and source (`value_op`): guard_class LIST +
+    // exact `w_class` (a list subclass sharing `ob_type == &LIST_TYPE` but with
+    // an overridden `__setitem__` / `__iter__` side-exits to the generic
+    // residual) + guard strategy == Integer.  Folds away when the operand is the
+    // just-built virtual list.
+    let list_type_addr = &pyre_object::pyobject::LIST_TYPE as *const _ as i64;
+    let list_instantiate = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::LIST_TYPE);
+    let sid_const_val = pyre_object::listobject::ListStrategy::Integer as i64;
+    for &lst_op in &[list_op, value_op] {
+        if !lst_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(lst_op) {
+            let type_const = ctx.trace_ctx.const_int(list_type_addr);
+            ctx.trace_ctx
+                .record_guard(OpCode::GuardClass, &[lst_op, type_const], 0);
+            walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
+        }
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .class_now_known(lst_op, list_type_addr);
+        walker_guard_exact_w_class(ctx, op_pc, lst_op, list_instantiate)?;
+
+        let strategy = crate::state::opimpl_getfield_gc_i(
+            ctx.trace_ctx,
+            lst_op,
+            crate::descr::list_strategy_descr(),
+        );
+        let sid_const = ctx.trace_ctx.const_int(sid_const_val);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardValue, &[strategy, sid_const], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(strategy, sid_const);
+    }
+
+    // Bounds guard on the target: the highest written index `start + slice_len -
+    // 1` must be in range.  For an Integer-strategy list the `W_ListObject`
+    // `length` field is 0 — the authoritative length is `int_items.len`, so read
+    // it via `list_int_items_len_descr` (exactly as store_subscr's bounds
+    // guard).  IntLt(start+slice_len-1, target.int_items.len).
+    let tgt_len_box = crate::state::opimpl_getfield_gc_i(
+        ctx.trace_ctx,
+        list_op,
+        crate::descr::list_int_items_len_descr(),
+    );
+    let last_idx_const = ctx.trace_ctx.const_int(start + slice_len - 1);
+    let in_bounds = ctx
+        .trace_ctx
+        .record_op(OpCode::IntLt, &[last_idx_const, tgt_len_box]);
+    let concrete_target_len = unsafe { pyre_object::w_list_len(list_obj) as i64 };
+    ctx.trace_ctx.set_opref_concrete(
+        in_bounds,
+        majit_ir::Value::Int(((start + slice_len - 1) < concrete_target_len) as i64),
+    );
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[in_bounds])?;
+
+    // Length guard on the source: source.int_items.len == slice_len (folds for
+    // the virtual temp; protects a non-virtual source).
+    let src_len_box = crate::state::opimpl_getfield_gc_i(
+        ctx.trace_ctx,
+        value_op,
+        crate::descr::list_int_items_len_descr(),
+    );
+    let src_len_const = ctx.trace_ctx.const_int(slice_len);
+    ctx.trace_ctx
+        .record_guard(OpCode::GuardValue, &[src_len_box, src_len_const], 0);
+    walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .replace_box(src_len_box, src_len_const);
+
+    // items[start + j] = source.items[j] for j in 0..slice_len, through the
+    // int_items blocks (`list_int_items_block_descr`, matching slice-1's
+    // `emit_typed_list_inline` `SetfieldGc`), so a virtual source temp's
+    // `SetarrayitemGc` stores fold against these reads.
+    let src_block = crate::state::opimpl_getfield_gc_r(
+        ctx.trace_ctx,
+        value_op,
+        crate::descr::list_int_items_block_descr(),
+    );
+    let tgt_block = crate::state::opimpl_getfield_gc_r(
+        ctx.trace_ctx,
+        list_op,
+        crate::descr::list_int_items_block_descr(),
+    );
+    for j in 0..slice_len {
+        let src_idx = ctx.trace_ctx.const_int(j);
+        let src_raw = crate::state::trace_int_block_getitem_value(ctx.trace_ctx, src_block, src_idx);
+        let tgt_idx = ctx.trace_ctx.const_int(start + j);
+        crate::state::trace_int_block_setitem_value(ctx.trace_ctx, tgt_block, tgt_idx, src_raw);
+    }
+
+    // Tracing is execution (pyjitpl.py:2095 execute_and_record): apply the
+    // assignment to the concrete lists now as `slice_len` in-bounds setitems,
+    // journaling each displaced element first so a non-committing walk's legacy
+    // replay re-executes against the pre-walk heap (FBW_STORE_JOURNAL).  Each
+    // `w_list_getitem` / `w_int_new` boxes (a minor collection there can move the
+    // operands), so pin fresh boxes and re-read the forwarded operand refs from
+    // the shadow after every allocation.
+    {
+        let _roots = pyre_object::gc_roots::push_roots();
+        for j in 0..slice_len {
+            let tgt_index = start + j;
+            let (Some(list_obj), Some(value_obj)) = (
+                walker_concrete_ref_object(ctx, list_op),
+                walker_concrete_ref_object(ctx, value_op),
+            ) else {
+                unreachable!("setslice specialization: operand concrete vanished from the shadow");
+            };
+            let Some(src_item) = (unsafe { pyre_object::w_list_getitem(value_obj, j) }) else {
+                unreachable!("setslice specialization: source index {j} has no element");
+            };
+            pyre_object::gc_roots::pin_root(src_item);
+            let Some(displaced) = (unsafe { pyre_object::w_list_getitem(list_obj, tgt_index) })
+            else {
+                unreachable!(
+                    "setslice specialization: target index {tgt_index} has no element \
+                     (bounds gate admitted it)"
+                );
+            };
+            pyre_object::gc_roots::pin_root(displaced);
+            let key_box = pyre_object::w_int_new(tgt_index);
+            pyre_object::gc_roots::pin_root(key_box);
+            let Some(list_obj) = walker_concrete_ref_object(ctx, list_op) else {
+                unreachable!("setslice specialization: list concrete vanished mid-apply");
+            };
+            fbw_store_journal_push(list_obj, key_box, displaced);
+            let stored = unsafe { pyre_object::w_list_setitem(list_obj, tgt_index, src_item) };
+            debug_assert!(stored, "setslice specialization: in-bounds store failed");
+        }
+    }
+    Ok(Some(()))
 }
 
 /// #57 SLICE 3c (compare): walker-native speculative float specialization
