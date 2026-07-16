@@ -49,6 +49,8 @@ fn stat_value(stderr: &str, name: &str) -> u64 {
 }
 
 #[test]
+#[ignore = "runtime integration test: needs the release pyre-dynasm, pyre-wasm-runner, and wasm-host module; \
+            run via `cargo test -- --ignored` in the check.py job, which builds them"]
 fn global_reassign_retraces_non_last_label_backedge_at_runtime() {
     let root = workspace_root();
     let dynasm = root.join("target/release/pyre-dynasm");
@@ -108,6 +110,8 @@ fn global_reassign_retraces_non_last_label_backedge_at_runtime() {
 }
 
 #[test]
+#[ignore = "runtime integration test: needs the release pyre-dynasm, pyre-wasm-runner, and wasm-host module; \
+            run via `cargo test -- --ignored` in the check.py job, which builds them"]
 fn terminal_declined_call_assembler_matches_dynasm_at_runtime() {
     let root = workspace_root();
     let dynasm = root.join("target/release/pyre-dynasm");

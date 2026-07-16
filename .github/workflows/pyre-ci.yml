@@ -410,6 +410,16 @@ jobs:
             echo '```'
           done
         } >> "$GITHUB_STEP_SUMMARY"
+    - name: Run wasm runtime codegen regression tests (Linux only)
+      # majit-backend-wasm/tests/codegen_test.rs holds two #[ignore]d runtime
+      # integration tests that run a bench on both the dynasm and wasm backends
+      # and compare, so they need the release pyre-dynasm + pyre-wasm-runner and
+      # the wasm-host module. check.py has just built all three on Linux (it adds
+      # the wasm32 target above; WASM_MODULE_PATH is the .wasm-host.wasm the test
+      # loads), so run the ignored tests against them here. The plain
+      # `cargo test --all` job cannot: it never builds those artifacts.
+      if: runner.os == 'Linux'
+      run: cargo test -p majit-backend-wasm --test codegen_test -- --ignored
 
   pyre-check-macos:
     name: pyre/check.py (macos-latest)
