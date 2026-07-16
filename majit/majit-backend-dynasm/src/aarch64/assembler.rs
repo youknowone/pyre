@@ -17,7 +17,7 @@ use std::sync::Arc;
 use dynasmrt::aarch64::Assembler;
 use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, ExecutableBuffer, dynasm};
 
-use majit_backend::BackendError;
+use majit_backend::{BackendError, JitCellToken};
 use majit_ir::{FailDescr, InputArg, Op, OpCode, OpRef, OpTypeIndex, TargetArgLoc, Type};
 
 use crate::arch::*;
@@ -52,6 +52,18 @@ enum ResolvedArg {
     Slot(i32),
     /// Immediate constant value.
     Const(i64),
+}
+
+#[derive(Clone, Copy)]
+struct CallAssemblerTargetAddr {
+    immediate: Option<usize>,
+    addr_slot: Option<usize>,
+}
+
+impl CallAssemblerTargetAddr {
+    fn is_available(self) -> bool {
+        self.immediate.is_some() || self.addr_slot.is_some()
+    }
 }
 
 /// Pointer-identity key for `target_tokens_currently_compiling`. PyPy
@@ -1821,6 +1833,50 @@ impl<'a> AssemblerARM64<'a> {
     /// `GUARD_NOT_INVALIDATED` reads it live at runtime.
     pub(crate) fn set_invalidated_flag_addr(&mut self, addr: usize) {
         self.invalidated_flag_addr = addr;
+    }
+
+    fn resolve_call_assembler_target_addr(
+        &self,
+        descr: Option<&majit_ir::DescrRef>,
+    ) -> CallAssemblerTargetAddr {
+        if let Some(token) = descr
+            .and_then(|d| d.as_loop_token_descr())
+            .and_then(|ltd| ltd.token_handle_any())
+            .and_then(|any| any.downcast_ref::<Arc<JitCellToken>>())
+        {
+            let descr_addr = token.ll_function_addr();
+            if descr_addr != 0 {
+                return CallAssemblerTargetAddr {
+                    immediate: Some(descr_addr),
+                    addr_slot: None,
+                };
+            }
+            if let Some(registry_addr) = self
+                .call_assembler_targets
+                .get(&token.number)
+                .copied()
+                .filter(|&addr| addr != 0)
+            {
+                return CallAssemblerTargetAddr {
+                    immediate: Some(registry_addr),
+                    addr_slot: None,
+                };
+            }
+            return CallAssemblerTargetAddr {
+                immediate: None,
+                addr_slot: None,
+            };
+        }
+
+        let immediate = descr
+            .and_then(|d| d.as_call_descr())
+            .and_then(|cd| cd.call_target_token())
+            .and_then(|token| self.call_assembler_targets.get(&token).copied())
+            .filter(|&addr| addr != 0);
+        CallAssemblerTargetAddr {
+            immediate,
+            addr_slot: None,
+        }
     }
 
     /// llsupport/assembler.py:201 rebuild_faillocs_from_descr — reconstruct
@@ -5672,12 +5728,9 @@ impl<'a> AssemblerARM64<'a> {
             dynasm!(self.mc ; .arch aarch64 ; mov x19, x29);
             self.emit_load_to_rax(frame_loc);
 
-            let target_addr: Option<usize> = op
-                .with_call_descr(|cd| cd.call_target_token())
-                .flatten()
-                .and_then(|token| self.call_assembler_targets.get(&token).copied())
-                .filter(|&addr| addr != 0);
-            let is_resolved = target_addr.is_some() || self.self_entry_label.is_some();
+            let descr_arc = op.getdescr();
+            let target_addr = self.resolve_call_assembler_target_addr(descr_arc.as_ref());
+            let is_resolved = target_addr.is_available() || self.self_entry_label.is_some();
             let result_type = op.opcode.result_type();
             let done_descr_ptr = self.done_with_this_frame_descr_ptr_for_type(result_type);
             let helper_addr = crate::call_assembler_helper_addr() as i64;
@@ -5720,10 +5773,16 @@ impl<'a> AssemblerARM64<'a> {
             // pre-existing adaptation; it is not part of the RPython fast
             // path and is too expensive for recursive CALL_ASSEMBLER.
             let pushed_gcmap = self.push_pending_call_gcmap();
-            if let Some(addr) = target_addr {
+            if let Some(addr) = target_addr.immediate {
                 let addr = addr as i64;
                 self.emit_mov_imm64(1, addr);
                 dynasm!(self.mc ; .arch aarch64 ; blr x1);
+            } else if let Some(addr_slot) = target_addr.addr_slot {
+                self.emit_mov_imm64(1, addr_slot as i64);
+                dynasm!(self.mc ; .arch aarch64
+                    ; ldr x1, [x1]
+                    ; blr x1
+                );
             } else if let Some(entry_label) = self.self_entry_label {
                 dynasm!(self.mc ; .arch aarch64 ; bl =>entry_label);
             }

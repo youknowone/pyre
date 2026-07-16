@@ -16,7 +16,9 @@ use std::sync::Arc;
 use dynasmrt::x64::Assembler;
 use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, ExecutableBuffer, dynasm};
 
-use majit_backend::{BackendError, ExitFrameLayout, ExitRecoveryLayout, ExitValueSourceLayout};
+use majit_backend::{
+    BackendError, ExitFrameLayout, ExitRecoveryLayout, ExitValueSourceLayout, JitCellToken,
+};
 use majit_ir::{FailDescr, InputArg, Op, OpCode, OpRc, OpRef, OpTypeIndex, TargetArgLoc, Type};
 
 use crate::arch::*;
@@ -68,6 +70,18 @@ enum ResolvedArg {
     Slot(i32),
     /// Immediate constant value.
     Const(i64),
+}
+
+#[derive(Clone, Copy)]
+struct CallAssemblerTargetAddr {
+    immediate: Option<usize>,
+    addr_slot: Option<usize>,
+}
+
+impl CallAssemblerTargetAddr {
+    fn is_available(self) -> bool {
+        self.immediate.is_some() || self.addr_slot.is_some()
+    }
 }
 
 #[cfg(test)]
@@ -2595,6 +2609,50 @@ impl<'a> Assembler386<'a> {
     /// `GUARD_NOT_INVALIDATED` reads it live at runtime.
     pub(crate) fn set_invalidated_flag_addr(&mut self, addr: usize) {
         self.invalidated_flag_addr = addr;
+    }
+
+    fn resolve_call_assembler_target_addr(
+        &self,
+        descr: Option<&majit_ir::DescrRef>,
+    ) -> CallAssemblerTargetAddr {
+        if let Some(token) = descr
+            .and_then(|d| d.as_loop_token_descr())
+            .and_then(|ltd| ltd.token_handle_any())
+            .and_then(|any| any.downcast_ref::<Arc<JitCellToken>>())
+        {
+            let descr_addr = token.ll_function_addr();
+            if descr_addr != 0 {
+                return CallAssemblerTargetAddr {
+                    immediate: Some(descr_addr),
+                    addr_slot: None,
+                };
+            }
+            if let Some(registry_addr) = self
+                .call_assembler_targets
+                .get(&token.number)
+                .copied()
+                .filter(|&addr| addr != 0)
+            {
+                return CallAssemblerTargetAddr {
+                    immediate: Some(registry_addr),
+                    addr_slot: None,
+                };
+            }
+            return CallAssemblerTargetAddr {
+                immediate: None,
+                addr_slot: None,
+            };
+        }
+
+        let immediate = descr
+            .and_then(|d| d.as_call_descr())
+            .and_then(|cd| cd.call_target_token())
+            .and_then(|token| self.call_assembler_targets.get(&token).copied())
+            .filter(|&addr| addr != 0);
+        CallAssemblerTargetAddr {
+            immediate,
+            addr_slot: None,
+        }
     }
 
     /// llsupport/assembler.py:201 rebuild_faillocs_from_descr — reconstruct
@@ -7351,13 +7409,9 @@ impl<'a> Assembler386<'a> {
                 .expect("call_assembler missing rewritten jitframe arg");
             let vable_loc = arglocs.get(1).copied();
 
-            let target_addr: Option<usize> = __descr_arc_call_descr
-                .as_ref()
-                .and_then(|d| d.as_call_descr())
-                .and_then(|cd| cd.call_target_token())
-                .and_then(|token| self.call_assembler_targets.get(&token).copied())
-                .filter(|&addr| addr != 0);
-            let is_resolved = target_addr.is_some() || self.self_entry_label.is_some();
+            let target_addr =
+                self.resolve_call_assembler_target_addr(__descr_arc_call_descr.as_ref());
+            let is_resolved = target_addr.is_available() || self.self_entry_label.is_some();
             let result_type = op.opcode.result_type();
             let done_descr_ptr = self.done_with_this_frame_descr_ptr_for_type(result_type);
             let helper_addr = crate::call_assembler_helper_addr() as i64;
@@ -7401,8 +7455,14 @@ impl<'a> Assembler386<'a> {
             let pushed_gcmap = self.push_pending_call_gcmap();
             self.emit_load_to_rax(frame_loc); // rax = callee jf_ptr
             self.emit_abi_int_arg_from_reg(0, 0); // arg0 = jf (Windows: rcx = rax)
-            if let Some(addr) = target_addr {
+            if let Some(addr) = target_addr.immediate {
                 dynasm!(self.mc ; .arch x64 ; mov rax, QWORD addr as i64);
+                self.emit_abi_call_rax_aligned();
+            } else if let Some(addr_slot) = target_addr.addr_slot {
+                dynasm!(self.mc ; .arch x64
+                    ; mov rax, QWORD addr_slot as i64
+                    ; mov rax, [rax]
+                );
                 self.emit_abi_call_rax_aligned();
             } else {
                 let addr_ptr = self.self_entry_addr_ptr as i64;
@@ -7601,15 +7661,8 @@ impl<'a> Assembler386<'a> {
         // assembler.py:320 _call_assembler_emit_call(descr._ll_function_addr, ...)
         // Resolve target address from descr.call_target_token() or self_entry_label.
         let descr_arc = op.getdescr();
-        let target_addr: Option<usize> = descr_arc
-            .as_ref()
-            .and_then(|d| d.as_call_descr())
-            .and_then(|cd| cd.call_target_token())
-            .and_then(|token| self.call_assembler_targets.get(&token).copied());
-
-        // Exclude address 0 (pending token placeholder) to avoid calling null.
-        let target_addr = target_addr.filter(|&a| a != 0);
-        let is_resolved = target_addr.is_some() || self.self_entry_label.is_some();
+        let target_addr = self.resolve_call_assembler_target_addr(descr_arc.as_ref());
+        let is_resolved = target_addr.is_available() || self.self_entry_label.is_some();
 
         // assembler.py:324-336 call_assembler: select done_descr by op.type.
         let result_type = op.opcode.result_type();
@@ -7653,8 +7706,14 @@ impl<'a> Assembler386<'a> {
             // entry.  The previous trampoline indirection re-read
             // MAJIT_LOG on every recursive call (Win32 env lookup is
             // slow); a direct call matches cranelift's dispatch.
-            if let Some(addr) = target_addr {
+            if let Some(addr) = target_addr.immediate {
                 dynasm!(self.mc ; .arch x64 ; mov rax, QWORD addr as i64);
+                self.emit_abi_call_rax_aligned();
+            } else if let Some(addr_slot) = target_addr.addr_slot {
+                dynasm!(self.mc ; .arch x64
+                    ; mov rax, QWORD addr_slot as i64
+                    ; mov rax, [rax]
+                );
                 self.emit_abi_call_rax_aligned();
             } else if self.self_entry_label.is_some() {
                 let addr_ptr = self.self_entry_addr_ptr as i64;

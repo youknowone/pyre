@@ -2558,6 +2558,7 @@ fn register_call_assembler_target(
     attached_descrs: majit_backend::AttachedDescrPtrs,
 ) -> Result<(), BackendError> {
     invalidate_ca_thread_cache(token.number);
+    token.set_ll_function_addr(compiled.code_ptr as usize);
     let depth = (compiled.max_output_slots + compiled.num_ref_roots) as i64;
     let base_ofs = JF_FRAME_ITEM0_OFS as i64;
     let num_scalar_inputargs = if token.num_scalar_inputargs > 0 {
@@ -4634,19 +4635,39 @@ fn validate_call_assembler_rewrite_prereqs(ops: &[Op]) -> Result<(), BackendErro
     Ok(())
 }
 
+fn call_assembler_jitcell_token(descr: &DescrRef) -> Option<&Arc<JitCellToken>> {
+    descr
+        .as_loop_token_descr()?
+        .token_handle_any()?
+        .downcast_ref::<Arc<JitCellToken>>()
+}
+
 fn resolve_call_assembler_target(
     opcode: OpCode,
     call_descr: &dyn CallDescr,
+    descr_token: Option<&JitCellToken>,
 ) -> Result<Option<RegisteredLoopTarget>, BackendError> {
-    let target_token = call_descr.call_target_token().ok_or_else(|| {
-        unsupported_semantics(
-            opcode,
-            "call-assembler descriptor must provide a compiled target token",
-        )
-    })?;
+    let target_token = descr_token
+        .map(|token| token.number)
+        .or_else(|| call_descr.call_target_token())
+        .ok_or_else(|| {
+            unsupported_semantics(
+                opcode,
+                "call-assembler descriptor must provide a compiled target token",
+            )
+        })?;
     let Some(target) = lookup_call_assembler_target(target_token) else {
         return Ok(None);
     };
+    if let Some(token) = descr_token {
+        let descr_addr = token.ll_function_addr();
+        if descr_addr != 0 && !target.code_ptr.is_null() {
+            debug_assert_eq!(
+                descr_addr, target.code_ptr as usize,
+                "CALL_ASSEMBLER descr token address disagrees with registry target"
+            );
+        }
+    }
 
     // Pending targets (null code_ptr) are placeholders — no compiled code
     // or finish descriptors yet. Return None so codegen uses shim fallback.
@@ -10956,7 +10977,12 @@ impl CraneliftBackend {
                             "call-assembler descriptor must be a CallDescr",
                         )
                     })?;
-                    let resolved_target = resolve_call_assembler_target(op.opcode, call_descr)?;
+                    let descr_token = call_assembler_jitcell_token(&descr);
+                    let resolved_target = resolve_call_assembler_target(
+                        op.opcode,
+                        call_descr,
+                        descr_token.map(|token| token.as_ref()),
+                    )?;
                     // rewrite.py:685-695 handle_call_assembler replaces the
                     // original red-arg list with [callee_jitframe] plus the
                     // optional virtualizable.  The descriptor's arg_types are
@@ -11106,10 +11132,16 @@ impl CraneliftBackend {
                                 builder.ins().iadd_imm(args_ptr, JF_FRAME_ITEM0_OFS as i64);
                             (args_ptr, args_data_ptr)
                         };
-                    let target_token = builder.ins().iconst(
-                        cl_types::I64,
-                        call_descr.call_target_token().unwrap() as i64,
-                    );
+                    let token_val = descr_token
+                        .map(|token| token.number)
+                        .or_else(|| call_descr.call_target_token())
+                        .ok_or_else(|| {
+                            unsupported_semantics(
+                                op.opcode,
+                                "call-assembler descriptor must provide a compiled target token",
+                            )
+                        })?;
+                    let target_token = builder.ins().iconst(cl_types::I64, token_val as i64);
                     let args_ptr_i64 = ptr_arg_as_i64(&mut builder, args_data_ptr, ptr_type);
                     let outcome_slot = builder.create_sized_stack_slot(StackSlotData::new(
                         StackSlotKind::ExplicitSlot,
@@ -11130,8 +11162,14 @@ impl CraneliftBackend {
                     // stable slot (AtomicPtr). For self-recursion (target not
                     // yet registered), pre-create the slot with null — compile
                     // completion fills it. Runtime null check falls back to shim.
-                    let token_val = call_descr.call_target_token().unwrap_or(0);
-                    let dispatch_slot_addr = if token_val != 0 {
+                    let descr_addr_slot = if resolved_target.is_some()
+                        && descr_token.is_some_and(|token| token.ll_function_addr() != 0)
+                    {
+                        descr_token.map(|token| token.ll_function_addr_slot() as usize)
+                    } else {
+                        None
+                    };
+                    let dispatch_slot_addr = if descr_addr_slot.is_none() && token_val != 0 {
                         let code_ptr = resolved_target
                             .as_ref()
                             .map(|target| target.code_ptr)
@@ -11147,10 +11185,10 @@ impl CraneliftBackend {
                         None
                     };
 
-                    let use_direct = dispatch_slot_addr.is_some();
+                    let use_direct = descr_addr_slot.is_some() || dispatch_slot_addr.is_some();
 
                     if use_direct {
-                        let slot_addr = dispatch_slot_addr.unwrap();
+                        let slot_addr = dispatch_slot_addr.unwrap_or(0);
 
                         // No separate out_slot: callee writes outputs to args_slot (shared).
 
@@ -11163,11 +11201,17 @@ impl CraneliftBackend {
                         // recursive call.
                         // RPython done_with_this_frame parity: compare jf_descr
                         // with the finish FailDescr pointer directly.
-                        let entry_ptr = builder.ins().iconst(ptr_type, slot_addr as i64);
-                        let code_addr =
+                        let code_addr = if let Some(addr_slot) = descr_addr_slot {
+                            let entry_ptr = builder.ins().iconst(ptr_type, addr_slot as i64);
                             builder
                                 .ins()
-                                .load(ptr_type, MemFlags::trusted(), entry_ptr, 0);
+                                .load(ptr_type, MemFlags::trusted(), entry_ptr, 0)
+                        } else {
+                            let entry_ptr = builder.ins().iconst(ptr_type, slot_addr as i64);
+                            builder
+                                .ins()
+                                .load(ptr_type, MemFlags::trusted(), entry_ptr, 0)
+                        };
                         let expected_finish_descr_ptr = self
                             .attached_descr_ptrs()
                             .done_with_this_frame_descr_ptr_for_type(op.opcode.result_type())
@@ -16554,6 +16598,10 @@ impl majit_backend::Backend for CraneliftBackend {
         old: &JitCellToken,
         new: &JitCellToken,
     ) -> Result<(), BackendError> {
+        let new_addr = new.ll_function_addr();
+        if new_addr != 0 {
+            old.set_ll_function_addr(new_addr);
+        }
         redirect_call_assembler_target(old.number, new.number)
     }
 

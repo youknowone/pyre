@@ -1192,9 +1192,18 @@ pub struct JitCellToken {
     pub compiled_loop_token: Option<Arc<CompiledLoopToken>>,
     /// `rpython/jit/backend/x86/assembler.py:599`
     /// `looptoken._ll_function_addr = rawstart + functionpos` —
-    /// address of the compiled loop entry. 0 until `compile_loop`
-    /// assigns it.
-    pub _ll_function_addr: usize,
+    /// address of the compiled loop entry.
+    ///
+    /// RPython's `compile_tmp_callback` (`metainterp/compile.py:1101-
+    /// 1150`) gives every `CALL_ASSEMBLER` token a real body before
+    /// emission, so x86 can bake `descr._ll_function_addr` as an
+    /// immediate at `assembler.py:320`.  Pyre still has a pending-token
+    /// window until that callback identity is ported, so emitted call
+    /// thunks may read this shared slot after `compile_loop` stores the
+    /// real entry.  Redirects still follow the backend mechanism:
+    /// dynasm patches the old entry (`assembler.py:1138`), while
+    /// cranelift updates its indirect dispatch state.
+    pub _ll_function_addr: AtomicUsize,
     /// `memmgr.py:59-60` `looptoken.generation`. Updated by
     /// `MemoryManager.keep_loop_alive` and read by
     /// `_kill_old_loops_now`. Default `0` means "not yet seen by
@@ -1315,7 +1324,7 @@ impl JitCellToken {
             // i.e., lazily when the backend compiles the token. pyre
             // initializes it eagerly here so the field is always present.
             compiled_loop_token: Some(Arc::new(CompiledLoopToken::new(number))),
-            _ll_function_addr: 0,
+            _ll_function_addr: AtomicUsize::new(0),
             // memmgr.py:38 default; first keep_loop_alive overwrites this.
             generation: Cell::new(0),
             // history.py:435 `retraced_count = 0` (class attribute default).
@@ -1377,6 +1386,28 @@ impl JitCellToken {
     /// GUARD_NOT_INVALIDATED in the compiled code will fail.
     pub fn invalidate(&self) {
         self.invalidated.store(true, Ordering::Release);
+    }
+
+    /// Load the compiled entry address written at backend `compile_loop`
+    /// completion (`x86/assembler.py:599`).  A zero value means the token
+    /// is still pending.
+    #[inline]
+    pub fn ll_function_addr(&self) -> usize {
+        self._ll_function_addr.load(Ordering::Acquire)
+    }
+
+    /// Store the compiled entry address for descr-carried
+    /// `CALL_ASSEMBLER` resolution.
+    #[inline]
+    pub fn set_ll_function_addr(&self, addr: usize) {
+        self._ll_function_addr.store(addr, Ordering::Release);
+    }
+
+    /// Address of the atomic slot used by backend call thunks for pyre's
+    /// pending-token window.
+    #[inline]
+    pub fn ll_function_addr_slot(&self) -> *const AtomicUsize {
+        &self._ll_function_addr as *const AtomicUsize
     }
 
     /// Check whether this loop has been invalidated.

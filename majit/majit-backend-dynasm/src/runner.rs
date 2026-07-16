@@ -2142,7 +2142,7 @@ impl Backend for DynasmBackend {
         // `x86/assembler.py:599` `looptoken._ll_function_addr =
         // rawstart + functionpos`. pyre stores the single entry point
         // so `_ll_function_addr` = compiled-code base.
-        token._ll_function_addr = code_addr;
+        token.set_ll_function_addr(code_addr);
         token.compiled = Some(Box::new(compiled));
 
         Ok(AsmInfo {
