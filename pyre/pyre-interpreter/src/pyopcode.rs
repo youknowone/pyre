@@ -1452,7 +1452,9 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
             IntrinsicFunction2::SetFunctionTypeParams => {
                 // arg2 = type_params, arg1 = function
                 // Set __type_params__ attribute on the function; push function back
-                let _type_params = self.pop_value()?;
+                let type_params = self.pop_value()?;
+                let function = self.peek_at(0)?;
+                self.set_function_typeparams(function, type_params)?;
                 // just leave the function on the stack
                 Ok(())
             }

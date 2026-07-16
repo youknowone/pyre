@@ -14,6 +14,13 @@ pub trait SharedOpcodeHandler {
     }
 
     fn make_function(&mut self, code_obj: Self::Value) -> OpcodeResult<Self::Value>;
+    fn set_function_typeparams(
+        &mut self,
+        function: Self::Value,
+        typeparams: Self::Value,
+    ) -> OpcodeResult<()> {
+        self.store_attr(function, "__type_params__", typeparams)
+    }
     fn call_callable(
         &mut self,
         callable: Self::Value,

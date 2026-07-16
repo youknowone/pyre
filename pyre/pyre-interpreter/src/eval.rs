@@ -199,6 +199,8 @@ unsafe fn walk_raw_function_roots(
         visitor(&mut *(&mut func.w_func_globals_obj as *mut PyObjectRef as *mut majit_ir::GcRef));
         visitor(&mut *(&mut func.w_ann as *mut PyObjectRef as *mut majit_ir::GcRef));
         visitor(&mut *(&mut func.w_annotate as *mut PyObjectRef as *mut majit_ir::GcRef));
+        visitor(&mut *(&mut func.w_func_dict as *mut PyObjectRef as *mut majit_ir::GcRef));
+        visitor(&mut *(&mut func.w_typeparams as *mut PyObjectRef as *mut majit_ir::GcRef));
         visitor(&mut *(&mut func.w_doc as *mut PyObjectRef as *mut majit_ir::GcRef));
         visitor(&mut *(&mut func.w_qualname as *mut PyObjectRef as *mut majit_ir::GcRef));
         visitor(&mut *(&mut func.w_objclass as *mut PyObjectRef as *mut majit_ir::GcRef));

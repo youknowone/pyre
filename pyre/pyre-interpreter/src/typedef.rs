@@ -8473,8 +8473,128 @@ fn init_function_type_common(ns: PyObjectRef) {
     };
 }
 
+/// PyPy `Function.descr_function_call(self, __args__)`: forward the complete
+/// Arguments object, including keyword names, to the wrapped function.
+fn function_descr_call(args: &[PyObjectRef]) -> crate::PyResult {
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let function = positional.first().copied().unwrap_or(pyre_object::PY_NULL);
+    let call_args = positional.get(1..).unwrap_or(&[]);
+    if !crate::builtins::has_real_kwargs(kwargs) {
+        return crate::call::call_function_impl_result(function, call_args);
+    }
+    let keyword_args: Vec<(Wtf8Buf, PyObjectRef)> = unsafe {
+        pyre_object::w_dict_str_entries(kwargs.unwrap())
+            .into_iter()
+            .filter(|(name, _)| name != "__pyre_kw__")
+            .map(|(name, value)| (Wtf8Buf::from_string(name), value))
+            .collect()
+    };
+    crate::eval::CURRENT_FRAME.with(|current| {
+        let frame = current.get();
+        if frame.is_null() {
+            return Err(crate::PyError::runtime_error(
+                "function call has no current frame",
+            ));
+        }
+        crate::call::call_with_kwargs(unsafe { &mut *frame }, function, call_args, &keyword_args)
+    })
+}
+
 fn init_function_type(ns: PyObjectRef) {
     init_function_type_common(ns);
+    // CPython 3.14 `PyFunction_Type.tp_call = _PyObject_MakeTpCall` and
+    // PyPy `Function.typedef.__call__ = descr_function_call`.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__call__",
+            make_builtin_function("__call__", function_descr_call),
+        )
+    };
+    // CPython 3.14 func_repr: `<function {qualname} at {address}>`.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__repr__",
+            make_builtin_function_with_arity(
+                "__repr__",
+                |args| {
+                    let function = args[0];
+                    let qualname = unsafe { crate::function::function_get_qualname(function) };
+                    Ok(pyre_object::w_str_new(&format!(
+                        "<function {qualname} at {function:p}>"
+                    )))
+                },
+                1,
+            ),
+        )
+    };
+    // PyPy typedef.py:796 `getset_func_dict = GetSetProperty(
+    // descr_get_dict, descr_set_dict, cls=Function)` — storage is the
+    // typed `Function.w_func_dict` field from function.py:68.
+    let dict_getter = make_builtin_function_with_arity("__dict__", descr_get_dict, 2);
+    let dict_setter = make_builtin_function_with_arity("__dict__", descr_set_dict, 3);
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__dict__",
+            make_getset_property(dict_getter, dict_setter, pyre_object::PY_NULL),
+        )
+    };
+    // CPython 3.14 `function.__annotate__`: callable-or-None, not deletable.
+    let annotate_getter = make_builtin_function("__annotate__", |args| {
+        let function = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        Ok(unsafe { crate::function::function_get_annotate(function) })
+    });
+    let annotate_setter = make_builtin_function("__annotate__", |args| {
+        let function = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        let value = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
+        unsafe { crate::function::function_set_annotate(function, value)? };
+        Ok(pyre_object::w_none())
+    });
+    let annotate_deleter = make_builtin_function("__annotate__", |args| {
+        let function = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        unsafe { crate::function::function_set_annotate(function, pyre_object::PY_NULL)? };
+        Ok(pyre_object::w_none())
+    });
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__annotate__",
+            make_getset_property(annotate_getter, annotate_setter, annotate_deleter),
+        )
+    };
+    // CPython 3.14 `function.__type_params__`: tuple-only and not deletable.
+    let typeparams_getter = make_builtin_function("__type_params__", |args| {
+        let function = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        Ok(unsafe { crate::function::function_get_typeparams(function) })
+    });
+    let typeparams_setter = make_builtin_function("__type_params__", |args| {
+        let function = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        let value = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
+        unsafe { crate::function::function_set_typeparams(function, value)? };
+        Ok(pyre_object::w_none())
+    });
+    let typeparams_deleter = make_builtin_function("__type_params__", |args| {
+        let function = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+        unsafe { crate::function::function_set_typeparams(function, pyre_object::PY_NULL)? };
+        Ok(pyre_object::w_none())
+    });
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__type_params__",
+            make_getset_property(typeparams_getter, typeparams_setter, typeparams_deleter),
+        )
+    };
+    // The shared rawdict mirrors PyPy and is still used by
+    // BuiltinFunction.  Python 3.14's user `function` type omits these
+    // PyPy-only introspection extensions.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_delitem_str_no_proxy(ns, "__objclass__");
+        pyre_object::dictmultiobject::w_dict_delitem_str_no_proxy(ns, "__text_signature__");
+        pyre_object::dictmultiobject::w_dict_delitem_str_no_proxy(ns, "__defaults_count__");
+    }
     // `funcobject.c func_new` — `FunctionType(code, globals, name=None,
     // argdefs=None, closure=None, kwdefaults=None)`.
     unsafe {

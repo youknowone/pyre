@@ -73,6 +73,13 @@ pub struct Function {
     /// PEP 649); the typed slot mirrors how `w_ann` sits on the
     /// function object rather than a side table.
     pub w_annotate: PyObjectRef,
+    /// `function.py:68 self.w_func_dict = None` — lazily allocated
+    /// per-function attribute dictionary.  This is a field on the function,
+    /// not mapdict side storage, matching PyPy's `Function.getdict`.
+    pub w_func_dict: PyObjectRef,
+    /// CPython 3.14 `PyFunctionObject.func_typeparams` — the declared type
+    /// parameters tuple.  `PY_NULL` represents the default empty tuple.
+    pub w_typeparams: PyObjectRef,
     /// `function.py:375 self.w_doc = w_doc` constructor slot plus
     /// `function.py:446-449 fget_func_doc` cache:
     ///
@@ -182,6 +189,10 @@ pub const FUNCTION_W_ANN_OFFSET: usize = std::mem::offset_of!(Function, w_ann);
 /// Field offset of `w_annotate` within `Function` — the PEP 649
 /// `__annotate__` callable slot.
 pub const FUNCTION_W_ANNOTATE_OFFSET: usize = std::mem::offset_of!(Function, w_annotate);
+/// Field offset of PyPy `Function.w_func_dict`.
+pub const FUNCTION_W_FUNC_DICT_OFFSET: usize = std::mem::offset_of!(Function, w_func_dict);
+/// Field offset of CPython 3.14 `func_typeparams`.
+pub const FUNCTION_W_TYPEPARAMS_OFFSET: usize = std::mem::offset_of!(Function, w_typeparams);
 /// Field offset of `w_doc` within `Function` — the
 /// `function.py:375 w_doc` docstring cache slot.
 pub const FUNCTION_W_DOC_OFFSET: usize = std::mem::offset_of!(Function, w_doc);
@@ -233,7 +244,7 @@ pub const FUNCTION_OBJECT_SIZE: usize = std::mem::size_of::<Function>();
 /// W_FloatObject leave the typeptr-shaped header field out of their
 /// `gc_ptr_offsets`. W_TypeObject instances are static-region and
 /// not subject to nursery relocation.
-pub const FUNCTION_GC_PTR_OFFSETS: [usize; 12] = [
+pub const FUNCTION_GC_PTR_OFFSETS: [usize; 14] = [
     FUNCTION_CODE_OFFSET,
     FUNCTION_CLOSURE_OFFSET,
     FUNCTION_DEFS_W_OFFSET,
@@ -250,6 +261,10 @@ pub const FUNCTION_GC_PTR_OFFSETS: [usize; 12] = [
     // Annotate flag; live until the first `__annotations__` read
     // materialises `w_ann`.
     FUNCTION_W_ANNOTATE_OFFSET,
+    // `function.py:68 w_func_dict` — lazily allocated instance dict.
+    FUNCTION_W_FUNC_DICT_OFFSET,
+    // CPython 3.14 `func_typeparams` — tuple or null for the empty default.
+    FUNCTION_W_TYPEPARAMS_OFFSET,
     // `function.py:375 w_doc` — docstring slot cached on first read.
     FUNCTION_W_DOC_OFFSET,
     // `function.py:54 qualname` — qualified name slot stamped at
@@ -369,6 +384,8 @@ pub(crate) fn function_new_impl(
         w_func_globals_obj,
         w_ann: PY_NULL,
         w_annotate: PY_NULL,
+        w_func_dict: PY_NULL,
+        w_typeparams: PY_NULL,
         w_doc: PY_NULL,
         w_qualname: PY_NULL,
         w_objclass: PY_NULL,
@@ -786,7 +803,14 @@ pub unsafe fn function_set_kwdefaults(obj: PyObjectRef, kwdefaults: PyObjectRef)
 /// PyPy-compatible `__dict__` storage field alias.
 #[inline]
 pub unsafe fn function_getdict(obj: PyObjectRef) -> PyObjectRef {
-    crate::baseobjspace::getattr_str(obj, "__dict__").unwrap_or(pyre_object::w_none())
+    unsafe {
+        let func = obj as *mut Function;
+        if (*func).w_func_dict.is_null() {
+            function_write_barrier(obj);
+            (*func).w_func_dict = pyre_object::w_dict_new();
+        }
+        (*func).w_func_dict
+    }
 }
 
 /// `function.py:238 Function.setdict` — replace the function's instance
@@ -795,7 +819,79 @@ pub unsafe fn function_getdict(obj: PyObjectRef) -> PyObjectRef {
 /// "__dict__", ..)` which would store a literal `"__dict__"` dict entry.
 #[inline]
 pub unsafe fn function_setdict(obj: PyObjectRef, value: PyObjectRef) -> Result<(), crate::PyError> {
-    crate::baseobjspace::setdict(obj, value)
+    let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
+    if !unsafe { crate::baseobjspace::isinstance_w(value, w_dict_type) } {
+        return Err(crate::PyError::type_error(
+            "setting function's dictionary to a non-dict",
+        ));
+    }
+    unsafe {
+        function_write_barrier(obj);
+        (*(obj as *mut Function)).w_func_dict = value;
+    }
+    Ok(())
+}
+
+/// CPython 3.14 `function.__annotate__` getter.
+pub unsafe fn function_get_annotate(obj: PyObjectRef) -> PyObjectRef {
+    let value = unsafe { (*(obj as *const Function)).w_annotate };
+    if value.is_null() {
+        pyre_object::w_none()
+    } else {
+        value
+    }
+}
+
+/// CPython 3.14 `function.__annotate__` setter.
+pub unsafe fn function_set_annotate(
+    obj: PyObjectRef,
+    value: PyObjectRef,
+) -> Result<(), crate::PyError> {
+    if value.is_null() {
+        return Err(crate::PyError::type_error("__annotate__ cannot be deleted"));
+    }
+    if !pyre_object::is_none(value) && !crate::baseobjspace::callable_w(value) {
+        return Err(crate::PyError::type_error(
+            "__annotate__ must be callable or None",
+        ));
+    }
+    unsafe {
+        function_write_barrier(obj);
+        let func = obj as *mut Function;
+        (*func).w_annotate = value;
+        if !pyre_object::is_none(value) {
+            (*func).w_ann = PY_NULL;
+        }
+    }
+    Ok(())
+}
+
+/// CPython 3.14 `function.__type_params__` getter.
+pub unsafe fn function_get_typeparams(obj: PyObjectRef) -> PyObjectRef {
+    let value = unsafe { (*(obj as *const Function)).w_typeparams };
+    if value.is_null() {
+        pyre_object::w_tuple_new(vec![])
+    } else {
+        value
+    }
+}
+
+/// CPython 3.14 `function.__type_params__` setter and
+/// `_Py_set_function_type_params` opcode helper.
+pub unsafe fn function_set_typeparams(
+    obj: PyObjectRef,
+    value: PyObjectRef,
+) -> Result<(), crate::PyError> {
+    if value.is_null() || !pyre_object::is_tuple(value) {
+        return Err(crate::PyError::type_error(
+            "__type_params__ must be set to a tuple",
+        ));
+    }
+    unsafe {
+        function_write_barrier(obj);
+        (*(obj as *mut Function)).w_typeparams = value;
+    }
+    Ok(())
 }
 
 /// PyPy-compatible `getdict()` descriptor helper.
@@ -982,7 +1078,9 @@ pub unsafe fn function_set_annotations(obj: PyObjectRef, w_ann: PyObjectRef) {
             return;
         }
         function_write_barrier(obj);
-        (*(obj as *mut Function)).w_ann = w_ann;
+        let func = obj as *mut Function;
+        (*func).w_ann = w_ann;
+        (*func).w_annotate = PY_NULL;
     }
 }
 
@@ -1019,7 +1117,11 @@ pub unsafe fn fset_func_annotations(
             return Err(crate::PyError::type_error("__annotations__ must be a dict"));
         };
         function_write_barrier(obj);
-        (*(obj as *mut Function)).w_ann = stored;
+        let func = obj as *mut Function;
+        (*func).w_ann = stored;
+        // CPython 3.14 function___annotations___set_impl clears the lazy
+        // annotation callable whenever eager annotations are assigned.
+        (*func).w_annotate = PY_NULL;
         Ok(())
     }
 }
@@ -1041,7 +1143,9 @@ pub unsafe fn fdel_func_annotations(obj: PyObjectRef) -> Result<(), crate::PyErr
             return Ok(());
         }
         function_write_barrier(obj);
-        (*(obj as *mut Function)).w_ann = PY_NULL;
+        let func = obj as *mut Function;
+        (*func).w_ann = PY_NULL;
+        (*func).w_annotate = PY_NULL;
         Ok(())
     }
 }

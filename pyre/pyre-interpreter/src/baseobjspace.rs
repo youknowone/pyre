@@ -3288,6 +3288,12 @@ pub(crate) fn len_slot(obj: PyObjectRef) -> PyResult {
 /// it to call `_obj_getdict`. pyre dispatches at runtime via the type's
 /// hasdict flag because Rust has no per-class virtual table.
 pub fn getdict(obj: PyObjectRef) -> PyObjectRef {
+    // function.py:231-234 Function.getdict — typed `w_func_dict` field.
+    if unsafe { crate::is_function(obj) }
+        && unsafe { std::ptr::eq((*obj).ob_type, &crate::function::FUNCTION_TYPE) }
+    {
+        return unsafe { crate::function::function_getdict(obj) };
+    }
     // function.py:678-681 StaticMethod.getdict — the dictionary is a
     // real field on the descriptor object, not mapdict side storage.
     if unsafe { pyre_object::function::is_staticmethod(obj) } {
@@ -3360,6 +3366,12 @@ pub(crate) fn native_slot_del(obj: PyObjectRef, name: &str) -> bool {
 /// objspace/std/mapdict.py:820-821 MapdictDictSupport.setdict overrides
 /// it to call `_obj_setdict`.
 pub fn setdict(obj: PyObjectRef, w_dict: PyObjectRef) -> Result<(), PyError> {
+    // function.py:236-241 Function.setdict — replace the typed field.
+    if unsafe { crate::is_function(obj) }
+        && unsafe { std::ptr::eq((*obj).ob_type, &crate::function::FUNCTION_TYPE) }
+    {
+        return unsafe { crate::function::function_setdict(obj, w_dict) };
+    }
     // function.py:683-688 StaticMethod.setdict.
     if unsafe { pyre_object::function::is_staticmethod(obj) } {
         let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
