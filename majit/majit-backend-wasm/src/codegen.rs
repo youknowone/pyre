@@ -1161,24 +1161,13 @@ fn alloc_bridge_cells(num_guards: usize) -> (u32, Option<Box<[u32]>>) {
 /// Parameters for the guest→guest `CALL_ASSEMBLER` `call_indirect` arm.
 /// `emit_ca == false` (the default) keeps every emitted module byte-identical
 /// to the pre-feature backend.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub struct CaParams {
-    /// Emit the dedicated `CALL_ASSEMBLER` arm into `callee_slot`.
+    /// Emit the dedicated `CALL_ASSEMBLER` arm.
     pub emit_ca: bool,
-    /// Table slot of the compiled callee loop.
-    pub callee_slot: u32,
-    /// Bytes to reserve per CA callee frame (the GC `JitFrame`'s data region,
-    /// i.e. its Signed item area). This is the source geometry's prefix through
-    /// the Ref homes, excluding its tail call area. The trampoline-decline
-    /// floor in `WasmBackend::compile_bridge` (`source_ca_active &&
-    /// bridge_has_trampoline_calls`) guarantees that no trampoline-lowered op
-    /// runs on this movable frame, so the omitted tail is unreachable. The alloc
-    /// trampoline derives the JitFrame item count from this exact byte count.
-    pub callee_frame_bytes: u32,
-    /// `fail_index` the callee loop's DoneWithThisFrame Finish writes to frame[0]
-    /// on the base-case return. The CA arm treats this — or this bridge's own
-    /// finish index — as a clean callee finish; anything else is a deopt.
-    pub loop_finish_fi: u32,
+    /// Geometry and entry metadata, keyed by the CALL_ASSEMBLER callee token.
+    /// Every entry describes exactly the JitFrame allocated for that target.
+    pub targets: HashMap<u64, CaTarget>,
     /// `__indirect_function_table` slot of `wasm_ca_resume_deopt`
     /// (`lib.rs::ca_deopt_helper_slot`). When a callee `call_indirect` returns a
     /// non-finish `fail_index` (a guard deopt), the CA arm `call_indirect`s this
@@ -1186,10 +1175,6 @@ pub struct CaParams {
     /// instead of trapping. `0` (unset) ⇒ no helper, so `compile_bridge` declines
     /// the CA lift before reaching codegen.
     pub deopt_helper_slot: u32,
-    /// Address of the callee loop's `CompiledWasmLoop`, baked as the first
-    /// argument to the deopt helper so it can resolve the deopted callee frame's
-    /// `fail_descrs`.
-    pub callee_compiled_ptr: u64,
     /// `__indirect_function_table` slot (`fn as usize`) of
     /// `lib.rs::wasm_jit_ca_alloc_frame`, which allocates each callee frame as
     /// a young nursery GC-managed `JitFrame` (push_jf-rooted, traced by its own
@@ -1213,13 +1198,33 @@ pub struct CaParams {
     /// `lib.rs::wasm_jit_ca_reload_caller_frame`, called while the callee is
     /// still pushed to recover this invocation's possibly-moved local-0 frame.
     pub ca_reload_caller_fn_ptr: i64,
+    /// Active-GC state for the direct CA-only inline allocation/frame path.
+    /// `None` retains the helpers (including under gc_stress).
+    pub inline: Option<CaInlineParams>,
+}
+
+/// Per-CALL_ASSEMBLER target geometry baked into the corresponding wasm arm.
+/// In particular, `callee_gcmap_ptr` must match the allocated frame's layout:
+/// the moving GC uses it to trace that frame while deeper calls collect.
+#[derive(Clone)]
+pub struct CaTarget {
+    /// Stable guest-memory [`WasmCaDispatchEntry`](crate::failguard::WasmCaDispatchEntry)
+    /// address.  The call slot, finish index, and deopt metadata are loaded
+    /// through it at runtime so pending->real install and redirects do not
+    /// require patching an already-compiled wasm module.
+    pub dispatch_entry: u32,
+    /// Bytes to reserve per CA callee frame (the GC `JitFrame`'s data region,
+    /// i.e. its Signed item area). This is the source geometry's prefix through
+    /// the Ref homes, excluding its tail call area. The trampoline-decline
+    /// floor in `WasmBackend::compile_bridge` (`source_ca_active &&
+    /// bridge_has_trampoline_calls`) guarantees that no trampoline-lowered op
+    /// runs on this movable frame, so the omitted tail is unreachable. The alloc
+    /// trampoline derives the JitFrame item count from this exact byte count.
+    pub callee_frame_bytes: u32,
     /// Leaked per-bridge `jf_gcmap` (`lib.rs::build_callee_gcmap`) marking the
     /// callee frame's CA input + home Ref slots; baked into each frame's
     /// `jf_gcmap` field at alloc time.
     pub callee_gcmap_ptr: i64,
-    /// Active-GC state for the direct CA-only inline allocation/frame path.
-    /// `None` retains the helpers (including under gc_stress).
-    pub inline: Option<CaInlineParams>,
 }
 
 /// Direct CA fast-path values baked at bridge compilation time.
@@ -3022,7 +3027,18 @@ fn build_function(
             // reload them from the (forwarded) homes after the call.
             opcode if opcode.is_call_assembler() && ca.emit_ca => {
                 let vi = op.pos.get().raw();
-                let callee_slot = ca.callee_slot as i32;
+                let descr = op
+                    .getdescr()
+                    .expect("CALL_ASSEMBLER op must carry a descriptor");
+                let op_token = descr
+                    .as_call_descr()
+                    .and_then(|descr| descr.call_target_token())
+                    .expect("CALL_ASSEMBLER op must carry a callee token");
+                let tgt = ca
+                    .targets
+                    .get(&op_token)
+                    .expect("CA op target must be registered");
+                let dispatch_entry = tgt.dispatch_entry as i32;
 
                 // A terminally-declined target cannot be restarted from the
                 // CALL_ASSEMBLER reds: these are loop-header live-ins, not a
@@ -3044,7 +3060,7 @@ fn build_function(
                 // `ca_cfp_local = frame_base + FIRST_ITEM_OFFSET` is the
                 // bespoke-layout frame pointer — every `mem64(OFS)` below is
                 // relative to it, exactly as the source loop reads its local 0.
-                let ca_depth = ca.callee_frame_bytes as usize / std::mem::size_of::<isize>();
+                let ca_depth = tgt.callee_frame_bytes as usize / std::mem::size_of::<isize>();
                 let ca_payload_size = majit_backend::jitframe::JitFrame::alloc_size(ca_depth);
                 let ca_total_size =
                     ((GcHeader::SIZE + ca_payload_size).max(GcHeader::MIN_NURSERY_OBJ_SIZE) + 7)
@@ -3074,8 +3090,8 @@ fn build_function(
                     sink.i32_or();
                     sink.if_(BlockType::Result(ValType::I64));
                     // Slow path collects/allocates and performs init + push.
-                    sink.i64_const(ca.callee_frame_bytes as i64);
-                    sink.i64_const(ca.callee_gcmap_ptr);
+                    sink.i64_const(tgt.callee_frame_bytes as i64);
+                    sink.i64_const(tgt.callee_gcmap_ptr);
                     sink.i32_const(ca.ca_alloc_fn_ptr as i32);
                     sink.call_indirect(0, base + 2);
                     sink.else_();
@@ -3110,7 +3126,7 @@ fn build_function(
                         sink.i32_store(mem32(GcHeader::SIZE as u64 + offset as u64));
                     }
                     sink.local_get(alloc_scratch_local);
-                    sink.i32_const(ca.callee_gcmap_ptr as i32);
+                    sink.i32_const(tgt.callee_gcmap_ptr as i32);
                     sink.i32_store(mem32(
                         GcHeader::SIZE as u64 + majit_backend::jitframe::JF_GCMAP_OFS as u64,
                     ));
@@ -3141,8 +3157,8 @@ fn build_function(
                     sink.i64_extend_i32_u();
                     sink.end();
                 } else if let Some(base) = residual_type_base {
-                    sink.i64_const(ca.callee_frame_bytes as i64);
-                    sink.i64_const(ca.callee_gcmap_ptr);
+                    sink.i64_const(tgt.callee_frame_bytes as i64);
+                    sink.i64_const(tgt.callee_gcmap_ptr);
                     sink.i32_const(ca.ca_alloc_fn_ptr as i32);
                     sink.call_indirect(0, base + 2);
                 } else {
@@ -3155,10 +3171,10 @@ fn build_function(
                     sink.i64_const(2);
                     sink.i64_store(mem64(frame.call_nargs_ofs));
                     sink.local_get(0);
-                    sink.i64_const(ca.callee_frame_bytes as i64);
+                    sink.i64_const(tgt.callee_frame_bytes as i64);
                     sink.i64_store(mem64(frame.call_args_ofs));
                     sink.local_get(0);
-                    sink.i64_const(ca.callee_gcmap_ptr);
+                    sink.i64_const(tgt.callee_gcmap_ptr);
                     sink.i64_store(mem64(frame.call_args_ofs + SLOT_SIZE));
                     sink.local_get(0);
                     emit_jit_call(&mut sink, jit_call, frame);
@@ -3199,7 +3215,18 @@ fn build_function(
                 }
                 // Run the callee loop on F'; discard the returned frame_ptr.
                 sink.local_get(ca_cfp_local);
-                sink.i32_const(callee_slot);
+                // The table slot is mutable dispatch state, not an immediate:
+                // a pending self target is filled after this module installs,
+                // and redirect_call_assembler replaces it without patching
+                // this caller. A zero slot must never be dispatched.
+                sink.i32_const(dispatch_entry);
+                sink.i32_load(mem32(crate::failguard::WASM_CA_DISPATCH_FUNC_HANDLE_OFS));
+                sink.local_tee(ca_fi_local);
+                sink.i32_eqz();
+                sink.if_(BlockType::Empty);
+                sink.unreachable();
+                sink.end();
+                sink.local_get(ca_fi_local);
                 sink.call_indirect(0, 0);
                 sink.drop();
                 // The recursive call may minor-collect and move this nursery
@@ -3241,7 +3268,8 @@ fn build_function(
                 sink.local_set(ca_fi_local);
                 // is_finish = (fi == loop_finish_fi) | (fi == bridge_finish_fi)
                 sink.local_get(ca_fi_local);
-                sink.i32_const(ca.loop_finish_fi as i32);
+                sink.i32_const(dispatch_entry);
+                sink.i32_load(mem32(crate::failguard::WASM_CA_DISPATCH_LOOP_FINISH_FI_OFS));
                 sink.i32_eq();
                 sink.local_get(ca_fi_local);
                 sink.i32_const(bridge_finish_fi as i32);
@@ -3255,7 +3283,9 @@ fn build_function(
                 // deopt: wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64).
                 sink.local_get(ca_cfp_local);
                 sink.i64_extend_i32_u();
-                sink.i64_const(ca.callee_compiled_ptr as i64);
+                sink.i32_const(dispatch_entry);
+                sink.i32_load(mem32(crate::failguard::WASM_CA_DISPATCH_COMPILED_PTR_OFS));
+                sink.i64_extend_i32_u();
                 sink.i32_const(ca.deopt_helper_slot as i32);
                 // call_indirect(table_index, type_index): the shared table is 0.
                 sink.call_indirect(0, ca_helper_type_idx);

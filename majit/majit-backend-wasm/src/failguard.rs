@@ -3,6 +3,7 @@
 /// Simplified from CraneliftFailDescr — no bridge data, GC maps, or force tokens.
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use majit_ir::{Descr, DescrRef, FailDescr, Type};
 
@@ -114,6 +115,101 @@ pub static CALL_ASSEMBLER_TARGETS: std::sync::Mutex<
     Option<std::collections::HashMap<u64, CallAssemblerTarget>>,
 > = std::sync::Mutex::new(None);
 
+// ── CALL_ASSEMBLER dispatch table ──
+//
+// A trace module imports the guest's linear memory, so a boxed wasm-side
+// allocation is addressable by every trace with an ordinary i32.load.  The
+// box keeps that address stable while the map grows; the emitted code must
+// never bake a table slot because redirects and the pending->real transition
+// replace it after the caller module was compiled.
+#[repr(C)]
+pub struct WasmCaDispatchEntry {
+    /// `__indirect_function_table` slot. Zero means pending/unavailable.
+    pub func_handle: AtomicU32,
+    /// Callee DoneWithThisFrame fail index. `u32::MAX` means not installed.
+    pub loop_finish_fi: AtomicU32,
+    /// `CompiledWasmLoop` address for the deopt helper, in wasm32 memory.
+    pub compiled_ptr: AtomicU32,
+}
+
+pub const WASM_CA_DISPATCH_FUNC_HANDLE_OFS: u64 = 0;
+pub const WASM_CA_DISPATCH_LOOP_FINISH_FI_OFS: u64 = 4;
+pub const WASM_CA_DISPATCH_COMPILED_PTR_OFS: u64 = 8;
+pub const WASM_CA_FINISH_FI_UNKNOWN: u32 = u32::MAX;
+
+/// Stable, guest-memory dispatch entries, keyed by CALL_ASSEMBLER token.
+/// `Box` is intentional: an emitted module bakes the entry address.
+pub static WASM_CA_DISPATCH: std::sync::Mutex<
+    Option<std::collections::HashMap<u64, Box<WasmCaDispatchEntry>>>,
+> = std::sync::Mutex::new(None);
+
+/// Return the stable guest-memory address for `number`, creating a pending
+/// (zero-slot) entry when needed.
+pub fn ca_dispatch_slot(number: u64) -> u32 {
+    let mut table = WASM_CA_DISPATCH.lock().unwrap();
+    let entry = table
+        .get_or_insert_with(Default::default)
+        .entry(number)
+        .or_insert_with(|| {
+            Box::new(WasmCaDispatchEntry {
+                func_handle: AtomicU32::new(0),
+                loop_finish_fi: AtomicU32::new(WASM_CA_FINISH_FI_UNKNOWN),
+                compiled_ptr: AtomicU32::new(0),
+            })
+        });
+    (&**entry as *const WasmCaDispatchEntry as usize) as u32
+}
+
+pub fn ca_dispatch_exists(number: u64) -> bool {
+    WASM_CA_DISPATCH
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|table| table.contains_key(&number))
+}
+
+/// Publish an installed loop after its module has acquired a shared-table
+/// slot. Release stores pair with the runtime loads in emitted trace modules;
+/// wasm execution cannot begin until this compile call returns.
+pub fn ca_dispatch_publish(number: u64, func_handle: u32, loop_finish_fi: u32, compiled_ptr: u32) {
+    let _ = ca_dispatch_slot(number);
+    let table = WASM_CA_DISPATCH.lock().unwrap();
+    let entry = table
+        .as_ref()
+        .and_then(|table| table.get(&number))
+        .expect("CALL_ASSEMBLER dispatch entry disappeared while publishing");
+    entry.compiled_ptr.store(compiled_ptr, Ordering::Release);
+    entry
+        .loop_finish_fi
+        .store(loop_finish_fi, Ordering::Release);
+    entry.func_handle.store(func_handle, Ordering::Release);
+}
+
+/// Redirect existing callers of `old_number` to the installed target.
+pub fn ca_dispatch_redirect(
+    old_number: u64,
+    func_handle: u32,
+    loop_finish_fi: u32,
+    compiled_ptr: u32,
+) {
+    ca_dispatch_publish(old_number, func_handle, loop_finish_fi, compiled_ptr);
+}
+
+/// Remove every dispatch entry that still resolves to `compiled_ptr`.  This
+/// also retracts redirects into a dropped replacement loop, while preserving
+/// an old token whose entry has already been redirected elsewhere.
+pub fn ca_dispatch_remove_compiled_ptr(compiled_ptr: u32) {
+    if let Some(table) = WASM_CA_DISPATCH.lock().unwrap().as_mut() {
+        table.retain(|_, entry| entry.compiled_ptr.load(Ordering::Acquire) != compiled_ptr);
+    }
+}
+
+pub fn ca_dispatch_remove(number: u64) {
+    if let Some(table) = WASM_CA_DISPATCH.lock().unwrap().as_mut() {
+        table.remove(&number);
+    }
+}
+
 pub fn call_assembler_target(number: u64) -> Option<CallAssemblerTarget> {
     CALL_ASSEMBLER_TARGETS
         .lock()
@@ -128,6 +224,44 @@ pub fn publish_call_assembler_target(number: u64, target: CallAssemblerTarget) {
         .unwrap()
         .get_or_insert_with(Default::default)
         .insert(number, target);
+}
+
+/// Register the frontend's compile_tmp_callback placeholder.  The geometry is
+/// deliberately zero: Stage-1 admission continues to require a fully live
+/// target, while the stable dispatch entry lets a later self-recursive compile
+/// use this token without baking a transient table slot.
+pub fn register_pending_call_assembler_target(number: u64, input_types: Vec<Type>) {
+    ca_dispatch_remove(number);
+    let _ = ca_dispatch_slot(number);
+    publish_call_assembler_target(
+        number,
+        CallAssemblerTarget {
+            token_number: number,
+            func_handle: 0,
+            input_types,
+            callee_frame_bytes: 0,
+            callee_gcmap_ptr: 0,
+            loop_finish_fi: WASM_CA_FINISH_FI_UNKNOWN,
+            compiled_ptr: 0,
+            has_trampoline_calls: false,
+        },
+    );
+}
+
+/// Remove metadata and the dispatch entry for an invalidated token.
+pub fn remove_call_assembler_target(number: u64) {
+    if let Some(targets) = CALL_ASSEMBLER_TARGETS.lock().unwrap().as_mut() {
+        targets.remove(&number);
+    }
+    ca_dispatch_remove(number);
+}
+
+/// Retract all metadata aliases which point at a dropped compiled loop.
+pub fn remove_call_assembler_targets_for_compiled_ptr(compiled_ptr: u32) {
+    if let Some(targets) = CALL_ASSEMBLER_TARGETS.lock().unwrap().as_mut() {
+        targets.retain(|_, target| target.compiled_ptr as u32 != compiled_ptr);
+    }
+    ca_dispatch_remove_compiled_ptr(compiled_ptr);
 }
 
 /// Global `frame[0]` fail-index space.
@@ -353,16 +487,10 @@ impl CompiledWasmLoop {
 
 impl Drop for CompiledWasmLoop {
     fn drop(&mut self) {
-        let mut ca_targets = CALL_ASSEMBLER_TARGETS.lock().unwrap();
-        if let Some(targets) = ca_targets.as_mut() {
-            let this = self as *const Self as usize as u64;
-            if targets
-                .get(&self.token_number)
-                .is_some_and(|target| target.compiled_ptr == this)
-            {
-                targets.remove(&self.token_number);
-            }
-        }
+        // Remove every token alias still targeting this module, including a
+        // redirect source. A source redirected to a newer module survives an
+        // old-loop drop because its dispatch `compiled_ptr` no longer matches.
+        remove_call_assembler_targets_for_compiled_ptr(self as *const Self as usize as u32);
         // Retract this loop's published label targets so a later bridge
         // cannot chain into a dropped loop's stale table slot. Guarded by
         // `func_handle`: a recompile that re-stamped the same descr onto its
