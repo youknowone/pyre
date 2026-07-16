@@ -14193,9 +14193,14 @@ fn fbw_callee_body_side_effect_free(
                 return false;
             };
             let ei = call_descr.get_extra_info();
-            let provably_side_effect_free = ei.check_is_elidable()
-                || ei.extraeffect == majit_ir::ExtraEffect::LoopInvariant
-                || ei.pyre_helper == majit_ir::PyreHelperKind::ForIterNext;
+            // `ForIterNext` is deliberately not accepted here: it advances the
+            // shared heap iterator irreversibly (no journal undo), so replaying
+            // a callee that contains it from the caller's CALL boundary would
+            // double-consume.  A FOR_ITER-bearing body is declined anyway — its
+            // mandatory `GET_ITER` (`MayForce`) predecessor fails this scan
+            // first — so this only removes a latent landmine, not live inlines.
+            let provably_side_effect_free =
+                ei.check_is_elidable() || ei.extraeffect == majit_ir::ExtraEffect::LoopInvariant;
             if !provably_side_effect_free
                 && !residual_call_is_specialized_plain_int_add(
                     body_code,
