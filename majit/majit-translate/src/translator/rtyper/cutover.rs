@@ -1702,40 +1702,66 @@ pub(crate) fn populate_call_registry_from_call_graphs(
         // the residual call via the fn's registered C ABI address
         // (`pyre/jit_fnaddr.rs`).  The FUNC.RESULT token is the
         // canonical spelling `front::mir::dont_look_inside_return_token`
-        // stamps from the callee's return `ValueType`, so each token
-        // decodes to the lltype whose `getkind` equals the legacy
-        // walker's `valuetype_to_concrete(result_ty)`: scalar tokens to
-        // their primitive lltype, `ref` to the generic `GCREF` Ptr
-        // (`getkind = 'ref'`).  The object-pointer marker
-        // (`OBJECTPTR_RETURN_TYPE`, stamped by `merge_hints_from_llbcs`
-        // for a `*mut PyObject`-returning opaque callee the front-end
-        // left untokened) projects to the typed `OBJECTPTR` — the
-        // `default_someshell_for_lltype` → `lltype_to_annotation` path
-        // already covers `Ptr(_)`.  An unrecognized token (none
-        // currently emitted) falls through to the normal lift.
+        // stamps from the callee's return `ValueType`.  Scalar tokens
+        // decode to their primitive lltype (`getkind` equals the legacy
+        // walker's `valuetype_to_concrete(result_ty)`).
+        //
+        // The `ref` token (a non-`*mut PyObject` heap result — e.g. a
+        // `*mut BigInt`) carries a classdef-less `SomeInstance` result
+        // shell (`valuetype_to_someshell(Ref(None))`), NOT a
+        // `SomePtr(GCREF)`.  A residual result is an annotation-stage
+        // value; the annotation-stage projection of every `Ref` is the
+        // classdef-less `SomeInstance` (`annotation_state.rs` doc-table),
+        // with `SomePtr` reserved for a producer writing
+        // `Variable.annotation` at the rtyper stage.  Emitting a
+        // `SomePtr(GCREF)` here made the result collide with the
+        // `SomeInstance(None)` an ordinary `Ref` merge partner carries
+        // (`_ptr ∪ <other>` UnionError in `mergeinputargs`, the union
+        // has no `SomePtr ∪ SomeInstance` arm).  The `SomeInstance(None)`
+        // shell unions cleanly (the classdef-less widen arm) and is the
+        // same shell the sibling `register_foreign_opaque_method_externals`
+        // path already gives a `BigInt`-returning method residual.  Both
+        // spellings rtype to `getkind = GcRef`, so the emitted
+        // `residual_call_*_r` opcode and C ABI are byte-identical.
+        //
+        // The object-pointer marker (`OBJECTPTR_RETURN_TYPE`, stamped by
+        // `merge_hints_from_llbcs` for a `*mut PyObject`-returning opaque
+        // callee the front-end left untokened) keeps the typed `OBJECTPTR`
+        // lltype so a caller reading the returned object's fields rtypes
+        // against the real struct.  An unrecognized token (none currently
+        // emitted) falls through to the normal lift.
         let residualize = graph.hints.iter().any(|h| h == "dont_look_inside")
             || (crate::front::mir::elidable_residualize_enabled()
                 && graph.hints.iter().any(|h| h == "elidable"));
         if residualize {
-            let return_lltype = match graph.return_type.as_deref() {
-                None | Some("()") => Some(LowLevelType::Void),
-                Some("bool") => Some(LowLevelType::Bool),
-                Some("i64") => Some(LowLevelType::Signed),
-                Some("u64") => Some(LowLevelType::Unsigned),
-                Some("f64") => Some(LowLevelType::Float),
-                Some("ref") => Some(crate::translator::rtyper::lltypesystem::lltype::GCREF.clone()),
-                Some(s) if s == OBJECTPTR_RETURN_TYPE => {
-                    Some(crate::translator::rtyper::rclass::OBJECTPTR.clone())
+            let result_shell = match graph.return_type.as_deref() {
+                Some("ref") => Some(
+                    crate::codewriter::annotation_state::valuetype_to_someshell(
+                        &crate::model::ValueType::Ref(None),
+                    )
+                    .expect("Ref(None) shells to a definite SomeInstance"),
+                ),
+                token => {
+                    let return_lltype = match token {
+                        None | Some("()") => Some(LowLevelType::Void),
+                        Some("bool") => Some(LowLevelType::Bool),
+                        Some("i64") => Some(LowLevelType::Signed),
+                        Some("u64") => Some(LowLevelType::Unsigned),
+                        Some("f64") => Some(LowLevelType::Float),
+                        Some(s) if s == OBJECTPTR_RETURN_TYPE => {
+                            Some(crate::translator::rtyper::rclass::OBJECTPTR.clone())
+                        }
+                        _ => None,
+                    };
+                    return_lltype.and_then(|ll| default_someshell_for_lltype(&ll))
                 }
-                _ => None,
             };
-            if let Some(return_lltype) = return_lltype
-                && let Some(stub) = build_stub_pygraph_for_unsafe_fn(
+            if let Some(result_shell) = result_shell {
+                let stub = build_stub_pygraph_with_result_shell(
                     graph.name.clone(),
                     signature_for_graph(graph),
-                    return_lltype,
-                )
-            {
+                    result_shell,
+                );
                 entry.prefill_default_cache(stub);
                 continue;
             }

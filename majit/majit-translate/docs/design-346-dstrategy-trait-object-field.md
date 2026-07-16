@@ -265,3 +265,46 @@ other census "polymorphic-field" symptoms — `message`, `start`/`end`, `save_po
 are four unrelated root causes: PyError classdef-identity dup, Rust stdlib `Range` monomorph
 collapse, signedness, mir-walker synthetic positional fields). This epic is `dstrategy` alone;
 the others are separate.
+
+## ✅ SIBLING FIX (7/16) — residual `ref` result annotates as `SomeInstance`, not `SomePtr`
+
+After the `dstrategy` static-read narrow (B), the residual `_ptr ∪ <other>` panics that remained
+were NOT static/field reads — they were **residual CALL RESULTS**. A `PYRE_UNION_DUMP` probe
+(temporary `eprintln!` in `annrpython.rs` `mergeinputargs` error arm) captured every union operand
+and revealed two residual-registration paths disagreeing on the result-annotation representation:
+
+- `register_foreign_opaque_method_externals` (cutover.rs:2220): `valuetype_to_someshell(result_ty)`
+  → classdef-less `SomeInstance` for a `Ref` return — the faithful annotation-stage projection.
+  `<BigInt as Add>::add` (a method residual) already uses it.
+- The `dont_look_inside` prefill (cutover.rs:1719): the `ref` return token → `GCREF` lltype →
+  `default_someshell_for_lltype` → `lltype_to_annotation(GCREF)` = `SomePtr(GCREF)`. Every
+  `#[dont_look_inside]` **free** fn returning a non-`*mut PyObject` heap pointer (`jit_bigint_*`,
+  `w_long_new`, …) got this — a low-level `SomePtr` at annotation stage.
+
+When a residual result from the prefill path (`SomePtr(GCREF)`) phi-merges with an ordinary `Ref`
+value (`SomeInstance(None)` shell), `model::union` (model.rs:3424 `_` fallback) has no
+`SomePtr ∪ SomeInstance` arm → `_ptr ∪ <other>` UnionError in `mergeinputargs`.
+
+**Orthodoxy:** Adding the union arm (Fix A) is FORBIDDEN — RPython's annotator runs on high-level
+types (`SomeInstance`); the rtyper LATER lowers to lltype (`SomePtr`). They live at different
+PHASES and never phi-merge during annotation, so `binaryop.py` has no such pairtype. The prefill
+path conflated the two phases. Orthodox fix = the prefill's `ref` token builds its stub with the
+`SomeInstance(None)` shell (`valuetype_to_someshell(Ref(None))`), unifying the two residual paths
+on the faithful representation (annotation_state.rs doc-table: every `Ref` → classdef-less
+`SomeInstance`; `SomePtr` reserved for producer-written rtyper-stage annotations).
+
+**Bit-exact safe:** both `SomeInstance(None)→OBJECTPTR` and `SomePtr(GCREF)→GCREF` map through
+`getkind` (model.rs:4054) to `ConcreteType::GcRef`, so the emitted `residual_call_*_r` opcode and
+the fn's C ABI (`jit_fnaddr.rs`) are byte-identical. The `OBJECTPTR_RETURN_TYPE` (`*mut PyObject`)
+token is unchanged — a caller reading the returned object's fields still rtypes against the real
+struct via the typed `OBJECTPTR`.
+
+**Result (same-LLBC census set-diff): 279 → 268 (net −11).** REMOVED: `setdict`, `range_length_big`,
+`w_range_compute_item`, and the entire int/long arithmetic family (`int_add`/`int_sub`/`int_lshift`,
+`long_add`/`long_sub`/`long_bitand`/`long_floordiv`/`long_mod`/`long_lshift`/`long_rshift`) plus
+their domino tails. ADDED: only the `typing_intrinsic_1/2` concurrent-build flicker (±2, unrelated).
+The 8 residual `_ptr` unions that remain are separate roots (`getcode` = `PYRE_REF_OPAQUE` from
+`cast_int_to_ptr`; `truth_value`/`unary_not`/`get`/`setitem_instance` = primitive-side or
+genuinely-heterogeneous — `Int`/`Bool`∪`Instance` won't union regardless).
+
+Implemented at cutover.rs:1719 residualize block. `cargo test -p majit-translate` 2984/0.
