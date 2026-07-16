@@ -122,7 +122,7 @@ mod super_tests {
 
 /// Python property descriptor object.
 ///
-/// Layout: `[ob_type | fget | fset | fdel | w_doc | getter_doc]`
+/// Layout: `[ob_type | fget | fset | fdel | w_doc | w_name | getter_doc]`
 #[pyre_class("property", type_id = 19, static_name = "PROPERTY")]
 pub struct W_Property {
     pub fget: PyObjectRef,
@@ -209,6 +209,29 @@ pub unsafe fn w_property_get_fdel(obj: PyObjectRef) -> PyObjectRef {
     (*(obj as *const W_Property)).fdel
 }
 
+/// Re-run `property.__init__` on an existing allocation.
+///
+/// PyPy `descriptor.py:W_Property.init` assigns the three accessors and
+/// resets `w_doc` / `getter_doc` before deriving a docstring from the new
+/// getter.  CPython 3.14 additionally clears `prop_name` on every init.  Keep
+/// those object-resident fields together here instead of maintaining an
+/// interpreter-side shadow table.
+pub unsafe fn w_property_reinit(
+    obj: PyObjectRef,
+    fget: PyObjectRef,
+    fset: PyObjectRef,
+    fdel: PyObjectRef,
+) {
+    let prop = obj as *mut W_Property;
+    (*prop).fget = fget;
+    (*prop).fset = fset;
+    (*prop).fdel = fdel;
+    (*prop).w_doc = PY_NULL;
+    (*prop).w_name = PY_NULL;
+    (*prop).getter_doc = false;
+    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+}
+
 /// `descriptor.py:249-250 W_Property.get_doc` — returns the raw slot
 /// (NULL plays None; the caller wraps).
 pub unsafe fn w_property_get_doc(obj: PyObjectRef) -> PyObjectRef {
@@ -233,6 +256,14 @@ pub unsafe fn w_property_set_getter_doc(obj: PyObjectRef, w_doc: PyObjectRef) {
     (*prop).w_doc = w_doc;
     (*prop).getter_doc = true;
     crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+}
+
+/// Mark that a property subclass obtained its visible `__doc__` from the
+/// getter.  CPython 3.14 stores that visible value in the subclass instance
+/// dict (because the subclass class dict shadows property's member), while
+/// `_copy` still consults the flag on the native property payload.
+pub unsafe fn w_property_mark_getter_doc(obj: PyObjectRef) {
+    (*(obj as *mut W_Property)).getter_doc = true;
 }
 
 /// `self.w_name` — NULL plays unset.
@@ -263,6 +294,27 @@ mod property_tests {
         unsafe {
             assert!(is_property(obj));
             assert!(!is_int(obj));
+        }
+    }
+
+    #[test]
+    fn property_reinit_replaces_accessors_and_clears_metadata() {
+        let obj = w_property_new(PY_NULL, PY_NULL, PY_NULL);
+        let old_doc = crate::w_int_new(10);
+        let old_name = crate::w_int_new(11);
+        let fget = crate::w_int_new(1);
+        let fset = crate::w_int_new(2);
+        let fdel = crate::w_int_new(3);
+        unsafe {
+            w_property_set_getter_doc(obj, old_doc);
+            w_property_set_name(obj, old_name);
+            w_property_reinit(obj, fget, fset, fdel);
+            assert_eq!(w_property_get_fget(obj), fget);
+            assert_eq!(w_property_get_fset(obj), fset);
+            assert_eq!(w_property_get_fdel(obj), fdel);
+            assert!(w_property_get_doc(obj).is_null());
+            assert!(w_property_get_name(obj).is_null());
+            assert!(!(*(obj as *const W_Property)).getter_doc);
         }
     }
 

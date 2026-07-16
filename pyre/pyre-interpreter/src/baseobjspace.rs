@@ -3869,55 +3869,6 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
         }
     }
 
-    // Property descriptor methods — PyPy: descriptor.py W_Property.setter / getter / deleter
-    // Returns a bound method (W_Method) that captures the property via w_self,
-    // so the static handler can extract the property from args[0].
-    unsafe {
-        if is_property(obj) {
-            let static_name: Option<(
-                &'static str,
-                fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
-                u16,
-            )> = match name {
-                "setter" => Some(("setter", property_setter_impl, 2)),
-                "getter" => Some(("getter", property_getter_impl, 2)),
-                "deleter" => Some(("deleter", property_deleter_impl, 2)),
-                "__set_name__" => Some(("__set_name__", property_set_name_impl, 3)),
-                _ => None,
-            };
-            if let Some((sname, func, arity)) = static_name {
-                let builtin = crate::make_builtin_function_with_arity(sname, func, arity);
-                return Ok(pyre_object::function::w_method_new(
-                    builtin,
-                    obj,
-                    pyre_object::PY_NULL,
-                ));
-            }
-            match name {
-                "fget" => return Ok(w_property_get_fget(obj)),
-                "fset" => return Ok(w_property_get_fset(obj)),
-                "fdel" => return Ok(w_property_get_fdel(obj)),
-                "__name__" => {
-                    // descriptor.py exposes the name set by `__set_name__`;
-                    // an unset name falls through to the normal
-                    // `'property' object has no attribute '__name__'`.
-                    let w_name = pyre_object::descriptor::w_property_get_name(obj);
-                    if !w_name.is_null() {
-                        return Ok(w_name);
-                    }
-                }
-                "__doc__" => {
-                    // descriptor.py:316-318 `__doc__ = GetSetProperty(
-                    // W_Property.get_doc, W_Property.set_doc)` → :249-250
-                    // get_doc returns the `w_doc` slot.
-                    let stored = pyre_object::descriptor::w_property_get_doc(obj);
-                    return Ok(if stored.is_null() { w_none() } else { stored });
-                }
-                _ => {}
-            }
-        }
-    }
-
     // Member descriptor attributes — typedef.py:443 Member.__name__, __objclass__
     unsafe {
         if pyre_object::typedef::is_member(obj) {
@@ -4880,6 +4831,19 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                     call_getattr,
                 );
             }
+            // PyPy replaces `W_Property.typedef.rawdict['__doc__']` with the
+            // instance descriptor while retaining the TypeDef doc separately;
+            // CPython likewise keeps `tp_doc` beside a member descriptor under
+            // the same dict key.  Pyre has no separate type-doc slot, so serve
+            // that exact builtin split here without affecting subclasses.
+            if name == "__doc__"
+                && std::ptr::eq(
+                    obj,
+                    crate::typedef::gettypeobject(&pyre_object::descriptor::PROPERTY_TYPE),
+                )
+            {
+                return Ok(w_str_new(crate::typedef::PROPERTY_DOC));
+            }
             if name == "__doc__"
                 || name == "__code__"
                 || name == "__func__"
@@ -4993,6 +4957,44 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
             obj,
             pyre_object::PY_NULL,
         ));
+    }
+
+    // W_Property is a native W_Root allocation, but a property subclass is a
+    // normal heap type with an instance dict.  Run the same five-step
+    // descriptor protocol as `W_ObjectObject` before the generic builtin
+    // TypeDef shortcut below: data descriptor, instance dict, non-data
+    // descriptor.  This is the structural consequence of PyPy's
+    // `W_Property(W_Root)` + `getclass(space)`, and is what lets the subclass
+    // class's `__doc__ = None` entry be shadowed by the doc value that
+    // property.__init__ writes into the subclass instance dict.
+    unsafe {
+        if is_property(obj) {
+            if let Some(w_type) = crate::typedef::r#type(obj) {
+                let w_descr = lookup_in_type_where(w_type, name);
+                if let Some(descr) = w_descr {
+                    if is_data_descr(descr) {
+                        if let Some(result) = get(descr, obj, w_type)? {
+                            return Ok(result);
+                        }
+                    }
+                }
+                let w_dict = getdict_backing(obj);
+                if !w_dict.is_null() {
+                    if let Some(value) = pyre_object::w_dict_getitem_str(w_dict, name) {
+                        return Ok(value);
+                    }
+                }
+                if let Some(descr) = w_descr {
+                    if crate::is_function(descr) {
+                        return Ok(pyre_object::w_method_new(descr, obj, w_type));
+                    }
+                    if let Some(result) = get(descr, obj, w_type)? {
+                        return Ok(result);
+                    }
+                    return Ok(descr);
+                }
+            }
+        }
     }
 
     // Builtin type method lookup via TypeDef registry.
@@ -7243,7 +7245,7 @@ pub(crate) unsafe fn get(
         }
         let fget = w_property_get_fget(descr);
         if fget.is_null() || is_none(fget) {
-            return Err(property_no_accessor(descr, obj, "getter"));
+            return Err(property_no_accessor(descr, obj, "getter")?);
         }
         // W_Property.get → `space.call_function(self.fget, w_obj)`: the
         // getter's exception propagates rather than being swallowed.
@@ -7331,7 +7333,7 @@ unsafe fn set(
     if is_property(descr) {
         let fset = w_property_get_fset(descr);
         if fset.is_null() || is_none(fset) {
-            return Err(property_no_accessor(descr, obj, "setter"));
+            return Err(property_no_accessor(descr, obj, "setter")?);
         }
         // descriptor.py:228 W_Property.set → `space.call_function(self.fset,
         // w_obj, w_value)`: the setter's exception propagates rather than
@@ -7407,7 +7409,7 @@ unsafe fn delete(descr: PyObjectRef, obj: PyObjectRef) -> Result<(), crate::PyEr
     if is_property(descr) {
         let fdel = w_property_get_fdel(descr);
         if fdel.is_null() || is_none(fdel) {
-            return Err(property_no_accessor(descr, obj, "deleter"));
+            return Err(property_no_accessor(descr, obj, "deleter")?);
         }
         crate::call::call_function_impl_result(fdel, &[obj])?;
         return Ok(());
@@ -7681,23 +7683,6 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
             let w_dict = pyre_object::w_module_get_w_dict(obj);
             if !w_dict.is_null() {
                 setitem(w_dict, w_str_new(name), value)?;
-                return Ok(w_none());
-            }
-        }
-    }
-    // descriptor.py:316-318 `__doc__ = GetSetProperty(W_Property.get_doc,
-    // W_Property.set_doc)` — the only writable property attribute;
-    // `property.__doc__ = "..."` is common in stdlib (dis.py, etc.).
-    // Other names (and member descriptors, which expose no setter,
-    // typedef.py:533-540) fall through to raiseattrerror.
-    unsafe {
-        if is_property(obj) {
-            if name == "__doc__" {
-                pyre_object::descriptor::w_property_set_doc(obj, value);
-                return Ok(w_none());
-            }
-            if name == "__name__" {
-                pyre_object::descriptor::w_property_set_name(obj, value);
                 return Ok(w_none());
             }
         }
@@ -8083,21 +8068,6 @@ pub fn delattr_str(obj: PyObjectRef, name: &str) -> PyResult {
 /// Terminal `object.__delattr__` — bypasses user override.
 pub fn object_delattr(obj: PyObjectRef, name: &str) -> PyResult {
     let obj = crate::module::_weakref::interp__weakref::force(obj)?;
-    // `property.__name__` is a writable/deletable slot; deleting clears
-    // the name recorded by `__set_name__`, and deleting when unset
-    // raises like a missing attribute.
-    unsafe {
-        if is_property(obj) && name == "__name__" {
-            let w_name = pyre_object::descriptor::w_property_get_name(obj);
-            if w_name.is_null() {
-                return Err(crate::PyError::attribute_error(
-                    "'property' object has no attribute '__name__'",
-                ));
-            }
-            pyre_object::descriptor::w_property_set_name(obj, pyre_object::PY_NULL);
-            return Ok(w_none());
-        }
-    }
     // descroperation.py:131-140 descr__delattr__: a data descriptor's
     // `__delete__` takes priority over the namespace delete. PyPy walks
     // `space.type(obj)`, so the lookup must run for any object whose type
@@ -10762,6 +10732,15 @@ pub fn next(obj: PyObjectRef) -> PyResult {
 /// one accessor replaced.  A getter-inherited doc (`getter_doc`) does
 /// not survive a getter replacement (descriptor.py:263-266); the
 /// constructor's doc capture then re-derives it from the new getter.
+fn property_require_obj(obj: PyObjectRef, name: &str) -> Result<PyObjectRef, crate::PyError> {
+    if obj.is_null() || !unsafe { is_property(obj) } {
+        return Err(crate::PyError::type_error(format!(
+            "descriptor '{name}' requires a 'property' object"
+        )));
+    }
+    Ok(obj)
+}
+
 unsafe fn property_copy(
     prop: PyObjectRef,
     w_getter: Option<PyObjectRef>,
@@ -10770,7 +10749,12 @@ unsafe fn property_copy(
 ) -> PyResult {
     let w_none = pyre_object::w_none();
     let resolve = |slot: Option<PyObjectRef>, get: unsafe fn(PyObjectRef) -> PyObjectRef| {
-        let v = slot.unwrap_or_else(|| unsafe { get(prop) });
+        // CPython 3.14 property_copy treats an explicit None like an omitted
+        // replacement; `p.getter(None)` therefore keeps `p.fget`.
+        let v = match slot {
+            Some(v) if !v.is_null() && !unsafe { is_none(v) } => v,
+            _ => unsafe { get(prop) },
+        };
         if v.is_null() { w_none } else { v }
     };
     let getter = resolve(w_getter, w_property_get_fget);
@@ -10807,7 +10791,11 @@ unsafe fn property_copy(
 
 /// `descriptor.py:206-217 W_Property._properror` — AttributeError naming
 /// the missing accessor and, when known, the property's `__name__`.
-unsafe fn property_no_accessor(prop: PyObjectRef, obj: PyObjectRef, kind: &str) -> crate::PyError {
+unsafe fn property_no_accessor(
+    prop: PyObjectRef,
+    obj: PyObjectRef,
+    kind: &str,
+) -> Result<crate::PyError, crate::PyError> {
     let qualname = match crate::typedef::r#type(obj) {
         Some(w_type) => match getattr_str(w_type, "__qualname__") {
             Ok(q) if !q.is_null() && is_str(q) => pyre_object::w_str_get_value(q).to_string(),
@@ -10815,42 +10803,59 @@ unsafe fn property_no_accessor(prop: PyObjectRef, obj: PyObjectRef, kind: &str) 
         },
         None => (*(*obj).ob_type).name.to_string(),
     };
-    let w_name = pyre_object::descriptor::w_property_get_name(prop);
+    // CPython 3.14 property_name: an explicitly assigned/set_name value wins;
+    // otherwise fall back to fget.__name__.  PyPy's object-resident name slot
+    // shape is retained; only the 3.14 lookup extension is added.
+    let mut w_name = pyre_object::descriptor::w_property_get_name(prop);
+    if w_name.is_null() {
+        let fget = w_property_get_fget(prop);
+        if !fget.is_null() && !is_none(fget) {
+            match getattr_str(fget, "__name__") {
+                Ok(name) => w_name = name,
+                Err(err) if err.kind == PyErrorKind::AttributeError => {}
+                Err(err) => return Err(err),
+            }
+        }
+    }
     let msg = if !w_name.is_null() {
         let name_repr = crate::display::py_repr(w_name).unwrap_or_else(|_| "<name>".to_string());
         format!("property {name_repr} of '{qualname}' object has no {kind}")
     } else {
         format!("property of '{qualname}' object has no {kind}")
     };
-    crate::PyError::attribute_error(msg)
+    Ok(crate::PyError::attribute_error(msg))
 }
 
-fn property_set_name_impl(args: &[PyObjectRef]) -> PyResult {
+pub(crate) fn property_set_name_impl(args: &[PyObjectRef]) -> PyResult {
     // descriptor.py:274-276 `set_name(self, w_type, w_name)` — the bound
     // method receives `[property, owner, name]`.
+    let prop = property_require_obj(args.first().copied().unwrap_or(PY_NULL), "__set_name__")?;
     if args.len() > 2 {
         let w_name = args[2];
-        unsafe { pyre_object::descriptor::w_property_set_name(args[0], w_name) };
+        unsafe { pyre_object::descriptor::w_property_set_name(prop, w_name) };
     }
     Ok(pyre_object::w_none())
 }
 
-fn property_setter_impl(args: &[PyObjectRef]) -> PyResult {
+pub(crate) fn property_setter_impl(args: &[PyObjectRef]) -> PyResult {
     // descriptor.py:243-244 `setter` → `_copy(space, w_setter=w_setter)`
     let w_setter = if args.len() > 1 { Some(args[1]) } else { None };
-    unsafe { property_copy(args[0], None, w_setter, None) }
+    let prop = property_require_obj(args.first().copied().unwrap_or(PY_NULL), "setter")?;
+    unsafe { property_copy(prop, None, w_setter, None) }
 }
 
-fn property_getter_impl(args: &[PyObjectRef]) -> PyResult {
+pub(crate) fn property_getter_impl(args: &[PyObjectRef]) -> PyResult {
     // descriptor.py:240-241 `getter` → `_copy(space, w_getter=w_getter)`
     let w_getter = if args.len() > 1 { Some(args[1]) } else { None };
-    unsafe { property_copy(args[0], w_getter, None, None) }
+    let prop = property_require_obj(args.first().copied().unwrap_or(PY_NULL), "getter")?;
+    unsafe { property_copy(prop, w_getter, None, None) }
 }
 
-fn property_deleter_impl(args: &[PyObjectRef]) -> PyResult {
+pub(crate) fn property_deleter_impl(args: &[PyObjectRef]) -> PyResult {
     // descriptor.py:246-247 `deleter` → `_copy(space, w_deleter=w_deleter)`
     let w_deleter = if args.len() > 1 { Some(args[1]) } else { None };
-    unsafe { property_copy(args[0], None, None, w_deleter) }
+    let prop = property_require_obj(args.first().copied().unwrap_or(PY_NULL), "deleter")?;
+    unsafe { property_copy(prop, None, None, w_deleter) }
 }
 
 /// `descriptor.py W_Property.get` as the type-dict `__get__` entry — args
@@ -10860,7 +10865,7 @@ fn property_deleter_impl(args: &[PyObjectRef]) -> PyResult {
 /// introspection see it.
 pub(crate) fn property_descr_get_impl(args: &[PyObjectRef]) -> PyResult {
     unsafe {
-        let prop = args[0];
+        let prop = property_require_obj(args.first().copied().unwrap_or(PY_NULL), "__get__")?;
         let obj = if args.len() > 1 {
             args[1]
         } else {
@@ -10872,7 +10877,7 @@ pub(crate) fn property_descr_get_impl(args: &[PyObjectRef]) -> PyResult {
         }
         let fget = w_property_get_fget(prop);
         if fget.is_null() || is_none(fget) {
-            return Err(property_no_accessor(prop, obj, "getter"));
+            return Err(property_no_accessor(prop, obj, "getter")?);
         }
         crate::call::call_function_impl_result(fget, &[obj])
     }
@@ -10881,7 +10886,7 @@ pub(crate) fn property_descr_get_impl(args: &[PyObjectRef]) -> PyResult {
 /// `descriptor.py W_Property.set` — args `[property, obj, value]`.
 pub(crate) fn property_descr_set_impl(args: &[PyObjectRef]) -> PyResult {
     unsafe {
-        let prop = args[0];
+        let prop = property_require_obj(args.first().copied().unwrap_or(PY_NULL), "__set__")?;
         let obj = args[1];
         let value = if args.len() > 2 {
             args[2]
@@ -10890,7 +10895,7 @@ pub(crate) fn property_descr_set_impl(args: &[PyObjectRef]) -> PyResult {
         };
         let fset = w_property_get_fset(prop);
         if fset.is_null() || is_none(fset) {
-            return Err(property_no_accessor(prop, obj, "setter"));
+            return Err(property_no_accessor(prop, obj, "setter")?);
         }
         crate::call::call_function_impl_result(fset, &[obj, value])?;
         Ok(pyre_object::w_none())
@@ -10900,11 +10905,11 @@ pub(crate) fn property_descr_set_impl(args: &[PyObjectRef]) -> PyResult {
 /// `descriptor.py W_Property.delete` — args `[property, obj]`.
 pub(crate) fn property_descr_delete_impl(args: &[PyObjectRef]) -> PyResult {
     unsafe {
-        let prop = args[0];
+        let prop = property_require_obj(args.first().copied().unwrap_or(PY_NULL), "__delete__")?;
         let obj = args[1];
         let fdel = w_property_get_fdel(prop);
         if fdel.is_null() || is_none(fdel) {
-            return Err(property_no_accessor(prop, obj, "deleter"));
+            return Err(property_no_accessor(prop, obj, "deleter")?);
         }
         crate::call::call_function_impl_result(fdel, &[obj])?;
         Ok(pyre_object::w_none())
